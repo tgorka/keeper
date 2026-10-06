@@ -16,7 +16,7 @@
 //!
 //! Every read — the config, a listing, a bundle's folder, a ranked or listed
 //! document, a scanned file — is admitted where it is asked for AND where it
-//! lands ([`bots_fs::search_landing`]) before it is made, and made by
+//! lands ([`browse::resolve_known`]) before it is made, and made by
 //! keeper-sync's no-follow reader on that landing alone
 //! ([`ScanBudget::read`], [`bots_fs::search_walk`]): what a bundle excludes
 //! is never opened, and keeper's own rules hold whatever the config says — a
@@ -46,6 +46,7 @@ use keeper_core::notes::search_index::{
 };
 use keeper_ported::okf::{self, Config, Doc, Link};
 use keeper_sync::bots_fs::{self, Clock, ScanBudget, Scanned, SearchEntry, Step, Unread};
+use keeper_sync::browse;
 use serde_json::{json, Value};
 
 use crate::turn::TurnEnv;
@@ -368,6 +369,16 @@ impl Done {
     }
 }
 
+/// Where `rel` of `drive` lands, root-relative and `/`-joined
+/// ([`browse::resolve_known`]): `None` only where the disk says nothing is
+/// there under a checkout that is; a checkout that is gone, and anything
+/// the disk cannot vouch for, is refused.
+fn landing(drive: &SearchDrive, rel: &str) -> Result<Option<String>, browse::BrowseRefusal> {
+    Ok(browse::resolve_known(&drive.root, rel)?
+        .under_root()?
+        .map(|landing| landing.relative()))
+}
+
 /// Read `rel` of `drive` by `read`, where `admit` admits it both as asked
 /// for and where it lands — nothing is read otherwise, nor where nothing
 /// is. A landing this drive's call read already (`done`) is not read
@@ -385,7 +396,7 @@ fn read_admitted(
     if !admit(rel) {
         return None;
     }
-    let landed = match bots_fs::search_landing(&drive.root, rel) {
+    let landed = match landing(drive, rel) {
         Ok(Some(landed)) => landed,
         Ok(None) => return None,
         Err(_) => {
@@ -486,10 +497,10 @@ fn scan_hit(drive: &SearchDrive, read: &Read, query: &Query) -> Option<Hit> {
 /// cannot read or interpret, one that lands where keeper never reads, one
 /// the call's bounds left cannot hold, or where whether it has one cannot
 /// be established — a folder on the way that may not be searched, a link
-/// to nothing ([`bots_fs::search_landing`]).
+/// to nothing ([`browse::resolve_known`]).
 fn read_config(drive: &SearchDrive, budget: &mut ScanBudget) -> Result<Option<Config>, String> {
     const AT: &str = ".okf/config.yaml";
-    let landed = match bots_fs::search_landing(&drive.root, AT) {
+    let landed = match landing(drive, AT) {
         Ok(Some(landed)) => landed,
         Ok(None) => return Ok(None),
         Err(refusal) => return Err(refusal.to_string()),
@@ -533,7 +544,7 @@ fn open_index(drive: &SearchDrive, budget: &mut ScanBudget) -> Result<Option<Sea
     let Some(vault) = drive.vault.as_deref() else {
         return Ok(None);
     };
-    let vault_landed = match bots_fs::search_landing(&drive.root, vault) {
+    let vault_landed = match landing(drive, vault) {
         Ok(Some(landed)) => landed,
         Ok(None) => return Ok(None),
         Err(refusal) => return Err(unusable(refusal.to_string())),
@@ -544,7 +555,7 @@ fn open_index(drive: &SearchDrive, budget: &mut ScanBudget) -> Result<Option<Sea
         )));
     }
     let db = join(&join(&vault_landed, ".keeper"), SEARCH_DB_FILE);
-    match bots_fs::search_landing(&drive.root, &db) {
+    match landing(drive, &db) {
         Ok(None) => Ok(None),
         Ok(Some(landed)) if landed == db => {
             let path = bots_fs::search_file(&drive.root, &landed).map_err(|_| {
@@ -750,7 +761,7 @@ impl Searching<'_, '_> {
                 walk_capped = true;
                 break;
             }
-            let landed = match bots_fs::search_landing(&drive.root, start) {
+            let landed = match landing(drive, start) {
                 Ok(Some(landed)) => landed,
                 Ok(None) => continue,
                 // A bundle whose landing cannot be asked about is not an

@@ -31,6 +31,17 @@ pub enum PlanStep {
     MkDir { path: String },
     /// Copy one file, overwriting the target.
     CopyFile { from: String, to: String },
+    /// Copy one file whose bytes are exactly the ones a stability check
+    /// read — their SHA-256 is `sha256` — over the target, atomically: the
+    /// copy is staged beside the target while hashing what is read, and a
+    /// source that no longer hashes to `sha256` is refused with the target
+    /// as it was. Succeeds when the target already holds those bytes (a
+    /// resume finding its own copy).
+    CopyChecked {
+        from: String,
+        to: String,
+        sha256: String,
+    },
     /// Write these exact bytes to a file, atomically, overwriting.
     WriteFile { path: String, content: String },
     /// Write these exact bytes to a file that is not there, atomically: a
@@ -115,6 +126,18 @@ impl PlanStep {
 pub fn sha256_hex(text: &str) -> String {
     use sha2::{Digest, Sha256};
     hex::encode(Sha256::digest(text.as_bytes()))
+}
+
+/// The lowercase hex SHA-256 of everything `reader` holds, streamed — what
+/// [`PlanStep::CopyChecked`] compares its staged bytes by.
+///
+/// # Errors
+/// The reader's.
+pub fn sha256_hex_of(mut reader: impl std::io::Read) -> std::io::Result<String> {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut reader, &mut hasher)?;
+    Ok(hex::encode(hasher.finalize()))
 }
 
 /// A compiled verb: its steps, in execution order.

@@ -26,6 +26,7 @@ pub mod helper;
 pub mod home;
 pub mod host;
 pub mod index;
+pub mod knowledge;
 pub mod label;
 pub mod log;
 pub mod matrix;

@@ -6567,6 +6567,8 @@ async fn run_agent_turn(
             drive_readers: Readers::Only(deps.home.drive.readers.clone()),
             view: &log,
             allow: &allow,
+            signer: keeper_core::agents::knowledge::agent_actor(&config.id, deps.host.as_str()),
+            drive_root: deps.drive_root.clone(),
         },
         bmad,
         grants,

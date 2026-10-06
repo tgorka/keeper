@@ -8405,6 +8405,80 @@ location: `src-tauri/crates/keeper-agent/src/hosts.rs` (`one_maintenance_job_per
 reason: both jobs take the one claim through `maintain::maintain`; the test starts two at once on two hosts and each interleaving. The curator's scheduler lives on rung 3 and is restacked onto this one; agentd's tick starting both is not driven here.
 status: open
 
+### DW-730: A harvested note's `log/<chunk>#<line id>` source resolves to its chunk only.
+
+origin: epic 95, story 95.5 (rung `agents-95-knowledge`, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/cards.rs` (`CardTools::harvested`), `src-tauri/crates/keeper-core/src/agents/knowledge.rs` (`source_file`)
+reason: The host checks that the chunk file is in the closed session's `log/`; the line id after `#` is required but not looked up in the chunk, so a made-up id in a real chunk is stored. Close with a bounded scan of the chunk for a line with that id.
+status: open
+
+### DW-731: The promote panel tells "newer" by mtime on this disk, not by commit time.
+
+origin: epic 95, story 95.5 (rung `agents-95-knowledge`, 2026-10-06)
+location: `src-tauri/crates/keeper-core/src/sessions/promote.rs` (`row_vm`), `src-tauri/crates/keeper-agent/src/promote.rs` (`panel`)
+reason: The epic asks for commit time for synced files and mtime for `workspace/`; every row uses mtime, which a pull or checkout rewrites, so after a fresh clone an older source can read as newer. Close with `git::history::file_log` times for synced cells.
+status: done 2026-10-06
+resolution: closed by rung `agents-95-knowledge`'s review fixes (R95K-11, R212): `FileFact.changed_ms` is a synced file's commit time by `git::history` (the oldest of its newest commits holding today's content, review keys aside), mtime only for `workspace/` and uncommitted content; `staleness_is_by_what_changed_not_by_mtime`.
+
+### DW-732: A promotion out whose README write fails leaves an unrecorded vault copy.
+
+origin: epic 95, story 95.5 (rung `agents-95-knowledge`, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/promote.rs` (`promote_out`)
+reason: The vault copy is written through `VaultWriter` first and the row second, in two writers; a README changed in between (guarded write refused) leaves the copy with no row, and promoting again is then refused as a taken name. Close with a re-promotion that adopts a byte-identical copy, or a retry of the row.
+status: done 2026-10-06
+resolution: closed by R95K-07 (R212): `promote::record_then` records the row first in the same held, journaled plan, re-splicing over a concurrent README edit; a publication that fails after it leaves a row a re-promotion finishes; `a_failed_publication_leaves_a_row_promoting_again_finishes`.
+
+### DW-733: "Reviewed by me" is required before "Promote to notes…" only in the panel.
+
+origin: epic 95, story 95.5 (rung `agents-95-knowledge`, R139, 2026-10-06)
+location: `src-tauri/crates/keeper/src/sessions_ipc.rs` (`sessions_promote`, `sessions_knowledge_review`)
+reason: The tick lands in the vault copy, so the commands run promote then review; a review that fails after a promotion leaves an unreviewed copy in the vault (it reads "nobody has reviewed it", never more). Rung `agents-95-panel` sequences the two and says so on a failure.
+status: done 2026-10-06
+resolution: closed by R95K-06 (R212, R-NEW-2 rejected): promoting a harvested note is the person's review, in Rust — `promote_out` takes the revision they read (`expected`) and a `Reviewer` and writes the vault copy already reviewed; `a_harvested_note_is_promoted_only_as_it_was_read`.
+
+### DW-734: A promotion into the session copies after its stability read, not from it.
+
+origin: epic 95, story 95.5 (rung `agents-95-knowledge`, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/promote.rs` (`promote_in`), `src-tauri/crates/keeper-agent/src/sessions/exec.rs` (`CopyFile`)
+reason: The source must be still for the settle window and read whole by `read_verified`, then the plan's `CopyFile` (`std::fs::copy`) copies it; a writer starting in that gap is copied torn. Close with a `CopyFile` that checks the source's `FileSample` before and after, as `read_verified` does.
+status: done 2026-10-06
+resolution: closed by R95K-05 (R212): `PlanStep::CopyChecked` copies only bytes hashing to what `verify_while_reading` read, staged and renamed, the target untouched otherwise; `a_checked_copy_copies_only_what_was_read`.
+
+### DW-735: Commit-time staleness walks a file's history from HEAD for each row cell.
+
+origin: epic 95, story 95.5 (rung `agents-95-knowledge`, review fix R95K-11, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/promote.rs` (`committed_ms`), `src-tauri/crates/keeper-sync/src/git/history.rs` (`file_log`)
+reason: `file_log` walks every commit from HEAD until it has 16 that touched the path, and `blob_at` reopens the repository per revision; a drive with a long history and a file touched rarely pays a whole walk per row cell on every panel open. Close with one walk per panel that collects every cell's revisions, or a cache keyed by HEAD.
+status: open
+
+### DW-736: A link swapped into the vault between the landing check and the shell's write is followed.
+
+origin: epic 95, story 95.5 (rung `agents-95-knowledge`, review fix R95K-04, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/promote.rs` (`lands_as_named`), `src-tauri/crates/keeper/src/notes_vault.rs` (`write_vault_file`, `contained`)
+reason: `promote_out` and `review` refuse a target whose landing differs from its path, then the shell writes through the lexical `contained` path; a folder replaced by a link in that window still carries the write. Close by writing with the directory chain opened no-follow (`openat`), or by checking the landing again inside the vault writer.
+status: open
+
+### DW-737: On a case-insensitive volume a promote target typed in another case is refused as a link.
+
+origin: epic 95, story 95.5 (rung `agents-95-knowledge`, review fix R95K-04, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/promote.rs` (`lands_as_named`)
+reason: The landing is compared byte for byte with the typed path, so `10-Notes/knowledge/x.md` against a folder `10-notes/` on APFS is refused with "leads through a link". Close by comparing the existing part with `names::same_entry_folded`, as `sessions::write::land` does.
+status: open
+
+### DW-738: A host appending to an agent's log right now refuses a promotion out of it.
+
+origin: epic 95, story 95.5 (rung `agents-95-knowledge`, review fix R95K-03, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/promote.rs` (`audience`)
+reason: Any problem the log reader reports — a torn last line included — leaves the label not established, so a promotion while the session's host is mid-append is refused (and the panel says so) until the line is whole; a retry succeeds. Close by telling a live writer's in-progress tail of its newest chunk from a corrupt line.
+status: open
+
+### DW-739: Re-promoting a harvested note replaces an edit a person made to its vault copy.
+
+origin: epic 95, story 95.5 (rung `agents-95-knowledge`, review fix R95K-06/07, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/promote.rs` (`promote_out`), `src-tauri/crates/keeper-agent/src/ports.rs` (`VaultWriter::write`)
+reason: A row naming the target makes a re-promotion replace the vault copy whole (FR-243's "re-promotion overwrites the target"); a person's edit to the copy since the last promotion is gone, recoverable only from history. Close with a replace guarded on the copy as last promoted, writing a conflict copy otherwise.
+status: open
+
 ### DW-740: A workflow file or agent folder committed after the sweep's plan is not guarded.
 
 origin: epic 95, story 95.3 (rung `agents-95-curate`, R208 / R95U-05, 2026-10-06)
@@ -8520,8 +8594,43 @@ status: open
 ### DW-834: A config path through a file where a folder should be refuses the drive.
 
 origin: epic 95, story 95.4 (rung `agents-95-search`, re-review R95S2, R218, 2026-10-07)
-location: `src-tauri/crates/keeper-sync/src/bots_fs.rs` (`search_landing`)
+location: `src-tauri/crates/keeper-sync/src/browse.rs` (`resolve_known`, the one resolver `bots_fs::search_landing` was folded into at the knowledge restack, R-NEW-1 — so a declaration or a row file behind a file is refused the same way)
 reason: Only `NotFound` is taken for an absent config (R218); `ENOTDIR` — a file named `.okf` — is refused as unknown, so that drive is not searched at all where it arguably has no config. Accepted as the strict side; revisit if a drive is found with a `.okf` file.
+status: open
+
+### DW-835: An interrupted promotion out is finished only by the zone's next promotion out or review.
+
+origin: epic 95, story 95.5 (rung `agents-95-knowledge`, re-review fix R95K2-03, 2026-10-07)
+location: `src-tauri/crates/keeper-agent/src/promote.rs` (`finish_pending`), `src-tauri/crates/keeper-agent/src/sessions/mod.rs` (`resume_all`)
+reason: The vault write is the shell's (`VaultWriter`), which `exec::resume_all` at host start does not hold, so a crash after `.keeper/promote-out.json` is kept leaves the row `missing target` until someone promotes out of, or reviews in, that zone again. Close by finishing pending promotions at app start where the vault writer is installed.
+status: open
+
+### DW-836: Another process's save between `write_note_if`'s check and its rename is overwritten.
+
+origin: epic 95, story 95.5 (rung `agents-95-knowledge`, re-review fix R95K2-04, 2026-10-07)
+location: `src-tauri/crates/keeper/src/notes_vault.rs` (`write_note_if`, `atomic_write`)
+reason: The striped write lock orders keeper's own writes; an external editor, another keeper or a sync pull that writes the note between the compare and the rename is replaced. Close with a compare after staging and an exchange-rename (`renameat2(RENAME_EXCHANGE)` / `renamex_np(RENAME_SWAP)`) that restores and retries when the swapped-out bytes are not the expected ones.
+status: open
+
+### DW-837: A staging name swapped after `publish_stage`'s check is still renamed into place.
+
+origin: epic 95, story 95.5 (rung `agents-95-knowledge`, re-review fix R95K2-02, 2026-10-07)
+location: `src-tauri/crates/keeper-agent/src/sessions/exec.rs` (`stage_beside`, `publish_stage`)
+reason: The stage is created exclusively and its device/inode checked before the rename, but a link put at the staging name in that instant is what `rename` moves (the planted-before-the-run case is closed). Close with an unnamed stage linked in place (`O_TMPFILE` + `linkat` on Linux, a directory-fd `renameat` on macOS) — the same window class as DW-736.
+status: open
+
+### DW-838: A promoted note shows `unknown` freshness until its vault copy's first commit.
+
+origin: epic 95, story 95.5 (rung `agents-95-knowledge`, re-review fix R95K2-06, 2026-10-07)
+location: `src-tauri/crates/keeper-agent/src/promote.rs` (`file_fact`, `history_of`)
+reason: A vault copy is dated by its commits only, since a tick moves its mtime; before the cadence commits it (or when its 16 newest commits are all reviews), a candidate edited since reads `unknown` rather than `stale`. Close by recording the promoted content's digest and time when the copy is published (the promotion's own content fact), and reading further back when every commit read is a review.
+status: open
+
+### DW-839: `browse::resolve` still reads an unsearchable folder as absence for its other callers.
+
+origin: epic 95, story 95.5 (rung `agents-95-knowledge`, re-review fix R95K2-01/07, 2026-10-07)
+location: `src-tauri/crates/keeper-sync/src/browse.rs` (`resolve`), its ~40 callers across keeper-sync, keeper-agent and the shell
+reason: R219 added `resolve_known` for the promotion path and `zone::read_text`; `resolve` keeps turning every canonicalization error into `Ok(None)`, so other callers (file serving, exports, bots_fs, media, skills) still say "missing" for a file behind a folder that may not be searched. Close by moving `resolve` to `resolve_known`'s semantics after auditing each caller's `Ok(None)` branch.
 status: open
 
 ### DW-885: A file the drive ignores inside an archivable skill folder holds its archive, retried every claim lapse.
@@ -8573,6 +8682,27 @@ location: `src-tauri/crates/keeper-agent/src/maintain.rs` (`record`, `record_hel
 reason: Matrix state has no compare-and-swap. The completion is read, the claim taken again is asked (`Lease::may_write`) right before the send, and the run is not counted recorded when the claim lapsed before the send or its release was refused after it. That is not unconditional monotonicity: a send held up after the last ask — past the claim's 60 s margin (`claim::STOP_WITHOUT_RENEWAL`), while another host takes the drive and records a later window — can still land after that later completion and replace it with an older window, and that night is then run again. `recorded` is the host's local answer; it says nothing about whether a send already made reached the server. This is the claim protocol's own residual, as for every fenced effect; `docs/agents.md` states these boundaries and cites this entry (R246 / R95C5-03).
 status: open
 
+### DW-920: A file put at a promotion's target between recovery's read of it and the writer's rename is replaced.
+
+origin: epic 95, story 95.5 (rung `agents-95-knowledge`, re-review fix R95K3-03, 2026-10-07)
+location: `src-tauri/crates/keeper-agent/src/promote.rs` (`publish`), `src-tauri/crates/keeper/src/notes_vault.rs` (`write_vault_file_durable`)
+reason: `publish` establishes absence (or an authorised replacement) by reading the target, then the shell's writer renames its temp over the path; another process's file landing in that instant is replaced. Close with a no-replace publish for a target established absent (`renameat2(RENAME_NOREPLACE)` / `renamex_np(RENAME_EXCL)`, or `link` + `unlink` of the temp) — the same window class as DW-836/837.
+status: open
+
+### DW-921: An interrupted promotion out of a session that was archived is retired, not finished.
+
+origin: epic 95, story 95.5 (rung `agents-95-knowledge`, re-review fix R95K3-05, 2026-10-07)
+location: `src-tauri/crates/keeper-agent/src/promote.rs` (`finish_pending`)
+reason: A pending record whose session is not at its recorded path is refused terminally (its record cleared) rather than followed by the session's id to its new place, so a person who archives a session with an unfinished promotion promotes it again after unarchiving. Close by resolving `Pending.session_id` with `verbs::find` and finishing it for an active session, refusing only for an archived or trashed one.
+status: open
+
+### DW-922: Promotion records set aside as unreadable stay in `.keeper/` with nothing that shows them.
+
+origin: epic 95, story 95.5 (rung `agents-95-knowledge`, re-review fix R95K3-06, 2026-10-07)
+location: `src-tauri/crates/keeper-agent/src/promote.rs` (`set_aside`)
+reason: The refusal names `.keeper/promote-out.<ulid>.unreadable.json` once; afterwards only a person looking in the never-synced `.keeper/` finds it, and nothing prunes such files. Close with a panel line for set-aside records and a way to dismiss them.
+status: open
+
 ### DW-930: A listing that fails part way through is proved by inspection only.
 
 origin: epic 95, story 95.4 (rung `agents-95-search`, re-review R95S3, R236, 2026-10-07)
@@ -8608,6 +8738,41 @@ location: `src-tauri/crates/keeper-agent/src/search.rs` (`Searching::index_hits`
 reason: R236 asks the bounds before every ranked note, listing and listing line, before it is matched or resolved, so a drive whose bounds ran out exactly as its last read finished says it is incomplete even where every remaining line would not have matched or every remaining note is gone. Accepted as the strict side: matching or resolving is the work the check bounds.
 status: open
 
+### DW-960: A vault copy a person edited after its promotion is no longer the note's copy.
+
+origin: epic 95, story 95.5 (rung `agents-95-knowledge`, re-review fix R95K4-02…04 / R244, 2026-10-08)
+location: `src-tauri/crates/keeper-core/src/sessions/promote.rs` (`standing`, `copy_digest`, `CopyLoss`, `promote_panel`), `src-tauri/crates/keeper-agent/src/promote.rs` (`promote_out`, `review`)
+reason: R244/R252/R253 grant replacement and review only to the copy whose `copy_digest` (review keys aside) the row's fourth cell records. A person who edits the vault copy makes it another file to keeper: promoting the note again and *Reviewed by me* are refused — saying the copy changed since it was published (`CopyLoss::Changed`), the panel's `foreign_copy` the same — and the panel shows no review of it, until the copy is moved away (kept) or the note is promoted under another name. A row written before R244 (three cells) grants nothing either (`CopyLoss::Unrecorded`). Close by recording the copy's later revisions the person made (e.g. the row's digest followed through the vault copy's own commits), or by offering "this copy is the note's" as a person's explicit act.
+status: open
+
+### DW-961: The journal executor's `make_dirs` resume syncs only the leaf folder's entry.
+
+origin: epic 95, story 95.5 (rung `agents-95-knowledge`, re-review fix R95K4-06 / R244, 2026-10-08)
+location: `src-tauri/crates/keeper-agent/src/sessions/exec.rs` (`make_dirs`)
+reason: `make_dirs` syncs the entries of the folders it made itself; a resume after a crash between `create_dir_all` and those syncs finds every folder there and syncs only the leaf's entry, so a new ancestor's entry may never be synced. R244 added `make_dirs_within` (since R253 `make_dirs_within(drive, vault, dir)`, syncing every entry from the drive's child down on every call) for the shell's durable vault write only. Close by giving the executor's `MkDir`/`write_durable`/`copy_checked` the zone as root and calling it.
+status: open
+
+### DW-962: The promote panel reads a harvested note's vault copy only up to 1 MiB.
+
+origin: epic 95, story 95.5 (rung `agents-95-knowledge`, re-review fix R95K5-01/02 / R253, 2026-10-08)
+location: `src-tauri/crates/keeper-agent/src/promote.rs` (`COPY_BYTES`, `copy_fact`, `promote_out`)
+reason: Whether a copy is still the note's (`copy_digest`) needs its whole text, so the panel reads it whole, up to `COPY_BYTES` (16 × `MAX_NOTE_BYTES`); a larger file shows no review and says the panel did not read it (`foreign_copy`), while a re-promotion and a review, which read the copy whole, still decide by it. `promote_out` does not refuse a harvested note larger than `MAX_NOTE_BYTES` (the panel offers no revision for one, so the UI cannot ask). Close by refusing such a promotion, which bounds every copy below the panel's read.
+status: open
+
+### DW-963: Bytes identical to a pending promotion's that land at its target before it finishes are taken as its own.
+
+origin: epic 95, story 95.5 (rung `agents-95-knowledge`, re-review fix R95K5-03 / R253, 2026-10-08)
+location: `src-tauri/crates/keeper-agent/src/promote.rs` (`publish`)
+reason: A pending promotion is admitted only onto an absent target or the copy its row records (`promote::standing`); `publish` accepts its own exact bytes at the target as the operation's write done before a crash, and records the receipt. A file synced from another device between the admission and the finish holding exactly those bytes cannot be told from that write — the same window as DW-920's absent-target race. Close with DW-920 (a create-new write, or the operation's own marker written durably after its write).
+status: open
+
+### DW-964: The promote panel does not show a note's `foreignCopy` yet.
+
+origin: epic 95, story 95.5 (rung `agents-95-knowledge`, re-review fix R95K5-05 / R253, 2026-10-08)
+location: `src/lib/ipc/gen/KnowledgeNoteVm.ts` (`foreignCopy`); the promote panel (rung `agents-95-panel`)
+reason: Rust and the dev mock fill `KnowledgeNoteVm.foreignCopy` with why the note's vault copy is not its own and what the person can do; this rung ships no panel UI. Close in the panel rung by showing it beside the note's review state.
+status: open
+
 ### DW-970: A settling that cannot tell whose a file is holds the folder until a person settles the path.
 
 origin: epic 95, story 95.2 (rung `agents-95-consolidate`, R246 / R95C5-02, 2026-10-08; widened by R250 / R95C6-01…03, R264 / R95C7-01…03 and R268 / R95C8-01…03)
@@ -8634,6 +8799,34 @@ status: open
 origin: epic 95, story 95.4 (rung `agents-95-search`, re-review R95S4, R248, 2026-10-08)
 location: `src-tauri/crates/keeper-core/src/notes/search_index.rs` (`SearchIndex::reader`, `SearchIndex::open`)
 reason: R248 reads `PRAGMA encoding` once when a reader opens and refuses any answer but `UTF-8` (`SearchIndexError::Encoding`), since a value is admitted by the length SQLite stores for it. `open_read_only` shares that reader, so the Mac's own notes search refuses such an index too, while `SearchIndex::open` (the writer) keeps it. keeper's writer only ever creates UTF-8 indexes, so only a foreign tool can produce one; if one is met, the writer should discard it as it discards an incompatible schema.
+status: open
+
+### DW-1040: A review's write trusts `knowledge::review` to keep the copy the note's; nothing re-checks it.
+
+origin: epic 95, story 95.5 (rung `agents-95-knowledge`, re-review fix R95K6-01 / R263, 2026-10-08)
+location: `src-tauri/crates/keeper-agent/src/promote.rs` (`review`, the `amend` closure)
+reason: `review` checks `promote::standing` on the copy before composing the tick or untick, then writes `knowledge::review`'s output without asking whether that output still has the receipt's `copy_digest`. R263 makes the writer keep the body and the frontmatter boundary (`Frontmatter::remove_in` keeps an emptied block in front of a block-shaped body), proven by the review-cycle fixtures; a future writer change that broke it again would write the copy and only then lose its authority. R263 does not hold for every shape: a body-leading U+FEFF (`---\nhuman_reviewed: true\n---\n\uFEFFBody.\n`) moves into the header when the review empties the first block — DW-1041 is that counterexample. Close by refusing, inside the `amend` closure, a composition whose `copy_digest` differs from the text it was composed from (never by refreshing the receipt).
+status: open
+
+### DW-1041: A review that empties the first block moves a body-leading byte order mark into the header.
+
+origin: epic 95, story 95.5 (rung `agents-95-knowledge`, review-95know-7 R95K7-01, R266, 2026-10-08)
+location: `src-tauri/crates/keeper-core/src/agents/knowledge.rs` (`review`), `src-tauri/crates/keeper-core/src/notes/frontmatter.rs` (`Frontmatter::remove_in`); the shell's `live_editor::amend_block`
+reason: for `---\nhuman_reviewed: true\n---\n\uFEFFBody.\n` the untick empties the first block and the body-leading U+FEFF is then read as part of the header; the shell's `live_editor::amend_block` refuses that untick, so nothing is corrupted — a person's review is refused. Fix: keep the byte order mark / frontmatter / body partition through the review's composition, with a body-leading-BOM review-cycle test.
+status: open
+
+### DW-1042: The properties panel does not see a frontmatter block behind a byte order mark.
+
+origin: epic 95, story 95.5 (rung `agents-95-knowledge`, review-95know-7 R95K7-02, R266, 2026-10-08)
+location: `src/components/notes/properties-panel.tsx` (`readFrontmatter`, `addProperty`)
+reason: a BOM-prefixed block (the retained empty `\uFEFF---\n---\n` included) is not read as frontmatter, so `addProperty` prepends a second block and the old one becomes body. Pre-existing, and only a person's action reaches it. Fix: a BOM-aware parser and splicer with a body-preservation test.
+status: open
+
+### DW-1043: The mock shell's review rewrite ignores the first block's boundary.
+
+origin: epic 95, story 95.5 (rung `agents-95-knowledge`, review-95know-7 R95K7-03, R266, 2026-10-08)
+location: `dev/mock-shell.ts` (`promoteFileText`)
+reason: the mock replaces the first literal `human_reviewed: false\n` anywhere in the text, so a note with two frontmatter-shaped blocks reads back without `verified` or with its body edited; the Rust path does not. Fix: respect the first-block boundary in the mock; until then these shapes are excluded from mock/Rust parity claims.
 status: open
 
 ### DW-1060: A change to the old file in the instant between the settling's last look at it and its unlink is not seen.
@@ -8671,3 +8864,23 @@ location: `src-tauri/crates/keeper-agent/src/search.rs` (`Plan::reads_listing` ~
 reason: an allowed bundle's `index.md` symlinked to a `.keeper-displaced-<request>-<n>` left by a stopped commit is admitted by `reads_listing` and opened, so a `## Documents` list in those bytes can steer hits. Separately, search can see some of a multi-file commit's final `.md` paths and not others. Search writes nothing, so nothing is lost; the result may be stale or partial. Fix: apply the transient-name families to listing and configuration admission (with a listing-alias regression), and either document or isolate the multi-file-commit read.
 status: open
 
+### DW-1093: The Files surface's create asks only the vault, so with the vault at the drive's root a person can create an empty file inside a session's workspace.
+
+origin: epic 95, story 95.5 (rung `agents-95-knowledge`, review-95know-8 R95K8-02, R292, 2026-10-10); pre-existing (Phase 7 / story 46.14), a person's own action, not an agent write
+location: `src-tauri/crates/keeper/src/sync_ipc.rs` (`vault_and_scope` ~4762–4780, `sync_create_entry` ~5475–5520); `src-tauri/crates/keeper-sync/src/files_write.rs` (`WriteScope::create` ~568–582, `WriteScope::fenced` ~769–792)
+reason: `sync_create_entry` composes the target with `scope.create(&subpath, &name)`, resolves the directory, checks a collision and calls `write_vault_file` — it never asks `fenced`, `owner` or `route`, and `create` tests only the vault (R291). Its scope (`vault_and_scope`) arms `with_sessions` but deliberately not `with_agents`: the Files surface is a person's, and a person edits an agent's home. So where the live vault contains the sessions zone (a vault at the drive's root, or any vault around `60-sessions/`), the Files "create" can make an empty file under `<zone>/active/<session>/workspace/` or `<zone>/archive/<year>/<session>/workspace/`, which the zone's contract keeps as scratch keeper never touches; nothing is overwritten (the collision check stands). Fix: enforce the zones' fence in the shared create path (`WriteScope::create` asking `fenced` on the composed profile-relative path), or have `sync_create_entry` check `fenced(&target.profile_relative)` before writing; either way document that the shell scope arms no agents fence (the person's edit policy for agent homes) rather than implying it. Behavioural test: create under a session's workspace refused and a permitted sibling (the session's `artifacts/`, or a vault folder beside the zone) created. Gate: the shell crate compiles and runs only on macOS (`scripts/check-macos.sh`, CI's macOS job).
+status: open
+
+### DW-1094: The session tree and reference candidates compose the sessions zone's raw spelling, so a zone configured `./60-sessions` loses its workspace lock and promotable flag.
+
+origin: epic 95, story 95.5 (rung `agents-95-knowledge`, review-95know-9 R95K9-02, R295, 2026-10-10)
+location: `src-tauri/crates/keeper/src/sessions_ipc.rs` (`sessions_tree` ~197–201 zone, ~243 subpath, ~277–284 `session_workspace_lock`; `sessions_ref_candidates` ~4216–4221 zone, ~4251 `in_session_workspace`); `src-tauri/crates/keeper-sync/src/files_write.rs` (`WriteScope::workspace_position`, exact `strip_prefix` of the stored prefix)
+reason: both commands build `format!("{zone}/…")` from `sessions.subfolder.trim()`, while the scope from `sync_ipc::sessions_scope` stores the native prefix (`./60-sessions` → `60-sessions`, R292/R295). `workspace_position`'s exact strip then fails for any spelling the prefix rewrites: the tree omits the scratch lock and its sentence, and a workspace file's candidate reports `promotable: false`. View-model facts only — the session file and directory commands keep their own session-relative workspace refusal (`sessions_ipc.rs` ~3206, ~3377–3405; `core/sessions/files.rs` ~224–225, ~339–357). Fix: compose the profile-relative path through the scope's shared interpretation (no shell-local normalisation rule); cover the rendered lock and the candidate's flag for `./60-sessions` and an ordinary sibling; macOS gate.
+status: open
+
+### DW-1095: Vault links keep their own subfolder matching, so a vault configured `./notes` or ` notes ` is not recognised from `notes/x.md`.
+
+origin: epic 95, story 95.5 (rung `agents-95-knowledge`, review-95know-9 fixer's R-NEW-1, R295, 2026-10-10); pre-existing
+location: `src-tauri/crates/keeper-core/src/vault_link.rs` (`subfolder_components` ~111–118 and its use in `note_path_for_file` ~191–201; `file_path_for_note` ~234–246); TS mirror `src/lib/vault-link/rule.ts` and its shared vectors
+reason: both directions split the configured subfolder on `/` and `\` and drop only empty parts, untrimmed and keeping `.`; forward matching (`core/vault_link.rs` ~111–116, 191–201) folds case, while the reverse composition (~231–250, TS mirror `src/lib/vault-link/rule.ts` ~201–217) builds the prefix from the configured components without folding (keeps `Notes`) — a third reading beside the profile's (`subfolder_components`) and the write scope's (`native_prefix`, R295). A vault configured `./notes` or ` notes ` is not matched from the real `notes/x.md`, and the reverse mapping composes `./notes/…`; on Unix a backslash is split where the registered root keeps it. Missing or misdirected link affordances; this module writes nothing and is not the write fence. Fix: one shared interpretation for both directions and the TS mirror, with shared vectors for `./notes`, ` notes `, `notes/.` and (Unix) a backslash name.
+status: open

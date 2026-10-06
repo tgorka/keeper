@@ -12,6 +12,8 @@
 //! - [`task`] is the scheduled bot task, over the same arming.
 //! - [`sessions`] is the sessions runtime: one plan at a time per zone.
 //! - [`ports`] is what a host process supplies.
+//! - [`promote`] promotes a session's files into its artifacts and its
+//!   harvested notes into the drive's vault, and renders the promote panel.
 //! - [`approval`] is the ask-and-wait a host with a person at it plugs in.
 //! - [`grants`] is where a turn's grants come from: the app's rows or an
 //!   agent's own `agent.toml`.
@@ -70,6 +72,7 @@ pub mod maintain;
 pub mod matrix_sink;
 pub mod memory;
 pub mod ports;
+pub mod promote;
 pub mod rooms;
 #[cfg(unix)]
 pub mod runtime;

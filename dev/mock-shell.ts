@@ -109,16 +109,19 @@ import type {
   InboxBatch,
   InboxRoomVm,
   IpcError,
+  LabelVm,
   NetworksSnapshot,
   NoteBodyBatch,
   OrgAccountVm,
   PacedWorkVm,
+  PromoteState,
   ProxyRoomVm,
   RecordingCaptureSourcesVm,
   RecordingRemovalPreviewVm,
   RecordingRemovedVm,
   RecordingSearchVm,
   RecordingSettingsVm,
+  SessionPromoteVm,
   SessionSpaceFilesVm,
   SessionSpaceFileVm,
   SessionSpaceVm,
@@ -1912,6 +1915,477 @@ function fallback(command: string): unknown {
  * relationship the app relies on (FR-98: a note's title IS its first body
  * line). A fixture whose body and title disagree tests the mock, not the app.
  */
+/**
+ * The promote panel's fixture (FR-244, UX-DR137), as Rust reads it from disk:
+ * per root and session, the README's `## Promote` rows, the session's files
+ * with their bytes and when each last changed, the files that cannot be read,
+ * and the drive's vault copies with the persons whose review each carries.
+ * `sessions_promote_panel` derives the panel from it as
+ * `keeper_core::sessions::promote::promote_panel` does, and the two writes
+ * change it as `keeper_agent::promote` does, so a promotion or a tick
+ * re-renders the way the app would. Only the flat fixture session holds one:
+ * a row in every state, two unlisted workspace files and two harvested notes —
+ * one exactly 64 KiB, whose bytes `sync_read_text` serves whole (S-32), one
+ * promoted into the vault and reviewed.
+ */
+export type PromoteRowFixture =
+  | {
+      source: string;
+      target: string;
+      note: string;
+      /**
+       * The copy this row records as the one its source published, review
+       * keys aside — Rust's fourth cell records its digest. Only a vault copy
+       * that is exactly this may be replaced by a promotion or reviewed.
+       */
+      published?: string;
+    }
+  | { raw: string; line: number };
+
+export type PromoteFixture = {
+  table: boolean;
+  rows: PromoteRowFixture[];
+  /** Session-relative. */
+  files: Map<string, { text: string; changed: number }>;
+  unreadable: Record<string, true>;
+  /** Drive-relative: each copy as promoted, review keys aside. */
+  vault: Map<string, { text: string; reviewers: string[]; changed: number }>;
+  /** Why a promotion out is refused (`SessionPromoteVm.outRefused`). */
+  outRefused: string | null;
+  /** The label chip of an agent's session (`SessionPromoteVm.label`). */
+  label: LabelVm | null;
+  /** What the listing could not see (`SessionPromoteVm.problems`). */
+  problems: string[];
+};
+
+const PROMOTE_SESSION = "01J8SESSIONAAAAAAAAAAAAAAA";
+const PROMOTE_SESSION_IN_DRIVE = "60-sessions/active/2026-08-12-keeper-sessions";
+const PROMOTE_VAULT = "10-notes";
+const PROMOTE_ME = "human:tgorka";
+
+/** A harvested note as the steward's host stores it. */
+function harvestedNote(title: string, body: string): string {
+  return `---\ntype: Reference\ntitle: ${title}\ngenerated:\n  by: agent:tola-grey@electra\n  at: 2026-10-05T18:00:00Z\nhuman_reviewed: false\nstatus: draft\n---\n\n${body}`;
+}
+
+function seededPromote(): PromoteFixture {
+  const knowledge = "artifacts/knowledge/2026-10-05-taxes";
+  const bring = harvestedNote(
+    "What the tax office wants",
+    "Bring the PIT-37, the receipts and the ID.\n",
+  );
+  // A ledger of exactly 64 KiB, every byte of which the panel shows.
+  const head = harvestedNote("The whole ledger", "");
+  let body = "";
+  for (let n = 1; head.length + body.length < 65_536 - 64; n += 1) {
+    body += `- ${String(n).padStart(4, "0")} receipt, kept for the tax office\n`;
+  }
+  const tail = "The last line of the ledger.\n";
+  const ledger = `${head}${body}${"-".repeat(65_536 - head.length - body.length - tail.length - 1)}\n${tail}`;
+  return {
+    table: true,
+    rows: [
+      { source: "workspace/draft.md", target: "artifacts/report.md", note: "weekly report" },
+      { source: "workspace/figures.csv", target: "artifacts/figures.csv", note: "" },
+      { source: "workspace/scratch.md", target: "artifacts/summary.md", note: "cleaned up" },
+      { source: "workspace/plan.md", target: "artifacts/plan.md", note: "" },
+      { raw: "| workspace/half a row |", line: 17 },
+      { source: "workspace/locked.md", target: "artifacts/locked.md", note: "" },
+      {
+        source: `${knowledge}/what-to-bring.md`,
+        target: `${PROMOTE_VAULT}/knowledge/what-to-bring.md`,
+        note: "knowledge",
+        published: bring,
+      },
+    ],
+    files: new Map([
+      ["workspace/draft.md", { text: "# Weekly report\n", changed: 10 }],
+      ["artifacts/report.md", { text: "# Weekly report\n", changed: 20 }],
+      ["workspace/figures.csv", { text: "a,b\n1,3\n", changed: 30 }],
+      ["artifacts/figures.csv", { text: "a,b\n1,2\n", changed: 20 }],
+      ["artifacts/summary.md", { text: "# Summary\n", changed: 20 }],
+      ["workspace/plan.md", { text: "# Plan\n", changed: 20 }],
+      ["workspace/locked.md", { text: "# Locked\n", changed: 20 }],
+      ["artifacts/locked.md", { text: "# Locked\n", changed: 20 }],
+      ["workspace/notes.md", { text: "# Notes, still being written\n", changed: 40 }],
+      ["workspace/data/run.json", { text: "{}\n", changed: 5 }],
+      [`${knowledge}/what-to-bring.md`, { text: bring, changed: 10 }],
+      [`${knowledge}/the-whole-ledger.md`, { text: ledger, changed: 10 }],
+    ]),
+    unreadable: { "artifacts/locked.md": true },
+    vault: new Map([
+      [
+        `${PROMOTE_VAULT}/knowledge/what-to-bring.md`,
+        { text: bring, reviewers: [PROMOTE_ME], changed: 20 },
+      ],
+    ]),
+    outRefused: null,
+    label: {
+      readers: ["@tgorka:h"],
+      anyone: false,
+      integrity: "agent",
+      localOnly: false,
+      sentence: "What you read here may be shown only to: @tgorka:h.",
+    },
+    problems: [],
+  };
+}
+
+const PROMOTE_FIXTURES = new Map<string, PromoteFixture>();
+
+/**
+ * Where each fixture session lies in its drive, by session id: the mock's
+ * sessions are the same under every root, as `sessions_list` answers them.
+ */
+const PROMOTE_SESSIONS_IN_DRIVE: Record<string, string> = {
+  [PROMOTE_SESSION]: PROMOTE_SESSION_IN_DRIVE,
+};
+
+/**
+ * The one identity every promote handler and every file read of a fixture
+ * resolves through: a root (a sessions root is its drive's profile, by id)
+ * and a session of it.
+ */
+function promoteKey(rootId: unknown, sessionId: unknown): string {
+  return `${String(rootId)}/${String(sessionId)}`;
+}
+
+/** The fixture of the payload's root and session, made on first ask. */
+function promoteFixture(payload: Record<string, unknown>): PromoteFixture {
+  const key = promoteKey(payload.rootId, payload.sessionId);
+  let fixture = PROMOTE_FIXTURES.get(key);
+  if (fixture === undefined) {
+    fixture =
+      payload.sessionId === PROMOTE_SESSION
+        ? seededPromote()
+        : {
+            table: false,
+            rows: [],
+            files: new Map(),
+            unreadable: {},
+            vault: new Map(),
+            outRefused: null,
+            label: null,
+            problems: [],
+          };
+    PROMOTE_FIXTURES.set(key, fixture);
+  }
+  return fixture;
+}
+
+/**
+ * Test seam: the promote fixture of `rootId`/`sessionId`, the seeded one
+ * again — or `stage` applied to it — so a panel test stages a stale row, a
+ * refused audience or an empty session, and the handlers derive the panel
+ * from it as Rust would.
+ */
+export function stagePromoteFixture(
+  rootId: string,
+  sessionId: string,
+  stage?: (fixture: PromoteFixture) => void,
+): PromoteFixture {
+  PROMOTE_FIXTURES.delete(promoteKey(rootId, sessionId));
+  const fixture = promoteFixture({ rootId, sessionId });
+  stage?.(fixture);
+  return fixture;
+}
+
+const utf8 = new TextEncoder();
+
+/** `KnowledgeNoteVm.revision`: the lowercase hex SHA-256 of the bytes. */
+async function sha256Hex(text: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", utf8.encode(text));
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function promoteRefusal(message: string): never {
+  throw { code: "internal", message, accountId: null, retriable: false };
+}
+
+/**
+ * `keeper_core::sessions::promote::CopyLoss::explain`: why the file at a
+ * note's row's target is not the copy it published — the row records no
+ * publication (`unrecorded`), or the file changed since — and what the
+ * person can do that keeps it.
+ */
+function copyLoss(loss: "unrecorded" | "changed", source: string, target: string): string {
+  const why =
+    loss === "unrecorded"
+      ? `${target} is not known to be the copy ${source} published: its row records no publication — written before keeper recorded one, or one that did not finish`
+      : `${target} was changed since ${source} published it there — edited, or replaced by another file — so it is no longer that copy`;
+  return `${why}. keeper neither replaces it nor writes a review of the note into it, and promoting again does not make it the note's copy. The file stays as it is, every edit kept; to publish the note, promote it under another name, or first move that file elsewhere in the vault, keeping it.`;
+}
+
+/**
+ * `keeper_core::sessions::promote::standing`: whether the vault copy `there`
+ * is the one the row records its source published — never because it holds
+ * the same bytes — or why not.
+ */
+function standing(
+  row: { published?: string },
+  there: { text: string },
+): "unrecorded" | "changed" | null {
+  if (row.published === undefined) {
+    return "unrecorded";
+  }
+  return there.text === row.published ? null : "changed";
+}
+
+/** The panel of `fixture`, composed as Rust composes it. */
+async function promotePanel(fixture: PromoteFixture): Promise<SessionPromoteVm> {
+  const rows = fixture.rows.map((row) => {
+    if ("raw" in row) {
+      return {
+        state: "unreadable" as const,
+        source: "",
+        target: "",
+        note: "",
+        out: false,
+        raw: row.raw,
+        line: row.line,
+        problem: null,
+      };
+    }
+    const out = !row.target.startsWith("artifacts/");
+    const from = fixture.files.get(row.source);
+    const to = out ? fixture.vault.get(row.target) : fixture.files.get(row.target);
+    const unread = [row.source, row.target].find((cell) => fixture.unreadable[cell] === true);
+    const problem =
+      unread === undefined ? null : `${unread} could not be read: Permission denied (os error 13)`;
+    let state: PromoteState = "ok";
+    if (problem !== null) {
+      state = "unknown";
+    } else if (to === undefined) {
+      state = "missingTarget";
+    } else if (from === undefined) {
+      state = "missingSource";
+    } else if (from.text !== to.text && from.changed > to.changed) {
+      state = "stale";
+    }
+    const { source, target, note } = row;
+    return { state, source, target, note, out, raw: null, line: null, problem };
+  });
+  const paths = [...fixture.files.keys()].sort();
+  const knowledge = await Promise.all(
+    paths
+      .filter((path) => path.startsWith("artifacts/knowledge/") && path.endsWith(".md"))
+      .map(async (path) => {
+        const text = fixture.files.get(path)?.text ?? "";
+        const bytes = utf8.encode(text).length;
+        const problem =
+          fixture.unreadable[path] === true
+            ? `${path} could not be read: Permission denied (os error 13)`
+            : bytes > 65_536
+              ? `${path} holds ${bytes} bytes, more than the 65536 a knowledge note holds, so it is not shown`
+              : null;
+        const read = problem === null ? text : "";
+        const row = rows.find((candidate) => candidate.raw === null && candidate.source === path);
+        const entry = fixture.rows.find(
+          (candidate) => "source" in candidate && candidate.source === path,
+        );
+        const copy = row === undefined || !row.out ? undefined : fixture.vault.get(row.target);
+        const loss =
+          row === undefined ||
+          copy === undefined ||
+          fixture.unreadable[row.target] === true ||
+          entry === undefined ||
+          !("source" in entry)
+            ? undefined
+            : standing(entry, copy);
+        const reviewers = loss === null && copy !== undefined ? copy.reviewers : [];
+        const signer = /\n {2}by: agent:([^@\n]+)@([^\n]+)\n/.exec(read);
+        return {
+          path,
+          title: /\ntitle: ([^\n]+)\n/.exec(read)?.[1] ?? null,
+          agent: signer?.[1] ?? null,
+          host: signer?.[2] ?? null,
+          bytes,
+          revision: problem === null ? await sha256Hex(text) : null,
+          promotedTo: row?.target ?? null,
+          state: row?.state ?? null,
+          reviewedBy: reviewers[reviewers.length - 1] ?? null,
+          reviewedByMe: reviewers.includes(PROMOTE_ME),
+          problem,
+          foreignCopy:
+            loss === undefined || loss === null || row === undefined
+              ? null
+              : copyLoss(loss, path, row.target),
+        };
+      }),
+  );
+  return {
+    hasTable: fixture.table,
+    rows,
+    unlisted: paths.filter(
+      (path) =>
+        path.startsWith("workspace/") &&
+        !rows.some((row) => row.raw === null && row.source === path),
+    ),
+    knowledge,
+    label: fixture.label,
+    vault: PROMOTE_VAULT,
+    outRefused: fixture.outRefused,
+    problems: fixture.problems,
+  };
+}
+
+/** `sessions_promote`, as `keeper_agent::promote` decides it. */
+async function promoteInFixture(payload: Record<string, unknown>): Promise<null> {
+  const fixture = promoteFixture(payload);
+  const source = String(payload.source);
+  const target = String(payload.target);
+  const note = String(payload.note ?? "");
+  if (!fixture.table) {
+    promoteRefusal(
+      "this session's README has no ## Promote table, so nothing records a promotion; add the section first.",
+    );
+  }
+  for (const cell of [source, target, note]) {
+    if (/[|\p{Cc}]/u.test(cell) || cell.trim() !== cell) {
+      promoteRefusal(
+        `\`${cell}\` cannot be a cell of the ## Promote table — a \`|\`, a line break or padding would make the row read back as something else — so nothing was promoted.`,
+      );
+    }
+  }
+  const text = fixture.files.get(source)?.text;
+  if (text === undefined) {
+    promoteRefusal(`${source} is not in this session any more.`);
+  }
+  const out = !target.startsWith("artifacts/");
+  const harvested = source.startsWith("artifacts/knowledge/");
+  if (!out) {
+    if (!source.startsWith("workspace/")) {
+      promoteRefusal(
+        `a promotion copies a file of workspace/ into artifacts/; ${source} → ${target} is not one.`,
+      );
+    }
+    if (source === "workspace/notes.md") {
+      promoteRefusal(`${source} is still being written; try again in a moment.`);
+    }
+  } else {
+    if (fixture.outRefused !== null) {
+      promoteRefusal(fixture.outRefused);
+    }
+    if (!source.startsWith("artifacts/")) {
+      promoteRefusal(
+        `only an artifact is promoted into the notes vault; ${source} is not under artifacts/.`,
+      );
+    }
+    if (!target.startsWith(`${PROMOTE_VAULT}/`)) {
+      promoteRefusal(
+        `${target} is outside tgdrive's notes vault (${PROMOTE_VAULT}), and keeper creates new files only inside the vault it manages. Files already there can still be edited and deleted.`,
+      );
+    }
+    // The source's row — its first — and only when it names this target and
+    // records the copy there as the one it published (R244, R253).
+    const named = fixture.rows.find((row) => "source" in row && row.source === source);
+    const there = fixture.vault.get(target);
+    if (there !== undefined) {
+      if (named === undefined || !("source" in named) || named.target !== target) {
+        promoteRefusal(
+          `"${target.slice(target.lastIndexOf("/") + 1)}" is already in this folder. Pick another name — keeper will not write over a file you did not name.`,
+        );
+      }
+      const loss = standing(named, there);
+      if (loss !== null) {
+        promoteRefusal(copyLoss(loss, source, target));
+      }
+    }
+    const expected = payload.expected ?? null;
+    if (harvested && expected === null) {
+      promoteRefusal(
+        "promoting a harvested note into the notes vault is a person's review of the version they read, and this one names no version; open it and promote it from there.",
+      );
+    }
+    if (expected !== null && expected !== (await sha256Hex(text))) {
+      promoteRefusal(
+        `${source} changed since it was read for this promotion; read it again before promoting it.`,
+      );
+    }
+  }
+  const at = fixture.rows.findIndex((row) => "source" in row && row.source === source);
+  const recorded = { source, target, note, ...(out ? { published: text } : {}) };
+  if (at < 0) {
+    fixture.rows.push(recorded);
+  } else {
+    fixture.rows[at] = recorded;
+  }
+  const changed = Math.max(...[...fixture.files.values()].map((file) => file.changed)) + 1;
+  if (out) {
+    fixture.vault.set(target, { text, reviewers: harvested ? [PROMOTE_ME] : [], changed });
+  } else {
+    fixture.files.set(target, { text, changed });
+  }
+  return null;
+}
+
+/**
+ * `sessions_knowledge_review`: the tick lands in the vault copy only, and
+ * only in the copy its row records as the note's.
+ */
+function reviewInFixture(payload: Record<string, unknown>): null {
+  const fixture = promoteFixture(payload);
+  const first = fixture.rows.find(
+    (candidate) => "source" in candidate && candidate.source === payload.path,
+  );
+  const row =
+    first !== undefined && "source" in first && !first.target.startsWith("artifacts/")
+      ? first
+      : undefined;
+  const copy = row === undefined ? undefined : fixture.vault.get(row.target);
+  if (row === undefined || copy === undefined) {
+    promoteRefusal(
+      "a person's review is written into the vault's copy of a note; promote it to notes first.",
+    );
+  }
+  const loss = standing(row, copy);
+  if (loss !== null) {
+    promoteRefusal(copyLoss(loss, row.source, row.target));
+  }
+  copy.reviewers = copy.reviewers.filter((by) => by !== PROMOTE_ME);
+  if (payload.reviewed === true) {
+    copy.reviewers.push(PROMOTE_ME);
+  }
+  return null;
+}
+
+/**
+ * A promote fixture's file by its path in the drive of `profileId`, as
+ * `sync_read_text` reads it from disk: a session file's exact bytes from that
+ * root's fixture of the session, or a vault copy — the drive's, whichever of
+ * its sessions promoted it — with each review written in.
+ */
+function promoteFileText(profileId: string, subpath: string): string | undefined {
+  for (const [sessionId, inDrive] of Object.entries(PROMOTE_SESSIONS_IN_DRIVE)) {
+    if (subpath.startsWith(`${inDrive}/`)) {
+      return promoteFixture({ rootId: profileId, sessionId }).files.get(
+        subpath.slice(inDrive.length + 1),
+      )?.text;
+    }
+  }
+  if (!subpath.startsWith(`${PROMOTE_VAULT}/`)) {
+    return undefined;
+  }
+  const roots = [...PROMOTE_FIXTURES.entries()].filter(([key]) =>
+    key.startsWith(promoteKey(profileId, "")),
+  );
+  const copy =
+    roots.map(([, fixture]) => fixture.vault.get(subpath)).find((found) => found !== undefined) ??
+    (roots.length === 0
+      ? promoteFixture({ rootId: profileId, sessionId: PROMOTE_SESSION }).vault.get(subpath)
+      : undefined);
+  if (copy === undefined) {
+    return undefined;
+  }
+  const entries = copy.reviewers.map((by) => `  - by: ${by}\n    at: 2026-10-06T10:00:00Z\n`);
+  return copy.reviewers.length === 0
+    ? copy.text
+    : copy.text.replace(
+        "human_reviewed: false\n",
+        `verified:\n${entries.join("")}human_reviewed: true\n`,
+      );
+}
+
 /**
  * The pre-flat session, as `pool.rs` never sees it: `log` comes from the
  * README's `### ` entries, `tasks` is empty because no task file exists before
@@ -6246,6 +6720,9 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
   // the folder-shaped row would render as something it is not.
   sessions_detail: (payload) =>
     payload.sessionId === FOLDER_DETAIL.id ? FOLDER_DETAIL : ANSWERS.sessions_detail,
+  sessions_promote_panel: (payload) => promotePanel(promoteFixture(payload)),
+  sessions_promote: promoteInFixture,
+  sessions_knowledge_review: reviewInFixture,
   // `needed: false` is not an error and not an empty preview — it is the answer
   // for every session that already holds the contract, which is most of them.
   sessions_migrate_preview: (payload) =>
@@ -6842,18 +7319,25 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
   // document reader). Answered so the phone's Files surface (Story 66.3) can
   // be looked at full-screen here — and measured by `dev/measure-files.ts` —
   // rather than stopping on the fallback's `null`, which the viewer renders as
-  // a thrown property read. One markdown body for every text path, one
-  // page-count probe for every document; the `keeper-file://` bytes behind a
-  // PDF's `<embed>` are not served here, so the frame draws its facts over an
+  // a thrown property read. One markdown body for every text path but the
+  // promote fixture's files, whose exact bytes are served; one page-count
+  // probe for every document; the `keeper-file://` bytes behind a PDF's
+  // `<embed>` are not served here, so the frame draws its facts over an
   // empty plugin.
-  sync_read_text: (payload): TextFileVm => ({
-    text: `# ${String(payload.subpath ?? "file")}\n\nA note read from the folder keeper syncs, over the mock shell.\n\n- one item\n- another, with a [[wikilink]]\n\n> A quotation, because a body with only headings measures nothing.\n`,
-    sizeBytes: 3_380,
-    sizeLabel: "3.4 kB",
-    oversize: false,
-    binary: false,
-    detail: null,
-  }),
+  sync_read_text: (payload): TextFileVm => {
+    const text =
+      promoteFileText(String(payload.id ?? "p1"), String(payload.subpath ?? "")) ??
+      `# ${String(payload.subpath ?? "file")}\n\nA note read from the folder keeper syncs, over the mock shell.\n\n- one item\n- another, with a [[wikilink]]\n\n> A quotation, because a body with only headings measures nothing.\n`;
+    const sizeBytes = utf8.encode(text).length;
+    return {
+      text,
+      sizeBytes,
+      sizeLabel: `${(sizeBytes / 1000).toFixed(1)} kB`,
+      oversize: false,
+      binary: false,
+      detail: null,
+    };
+  },
   sync_read_document: (): DocumentVm => ({
     format: "pdf",
     sizeBytes: 8_400_000,

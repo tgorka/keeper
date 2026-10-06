@@ -495,6 +495,7 @@ export type { IncognitoScope } from "./gen/IncognitoScope";
 export type { IncognitoVm } from "./gen/IncognitoVm";
 export type { IpcError } from "./gen/IpcError";
 export type { IpcErrorCode } from "./gen/IpcErrorCode";
+export type { KnowledgeNoteVm } from "./gen/KnowledgeNoteVm";
 export type { LabelVm } from "./gen/LabelVm";
 export type { LifecyclePhase } from "./gen/LifecyclePhase";
 export type { LineSpan } from "./gen/LineSpan";
@@ -589,6 +590,8 @@ export type { PanelTargetVm } from "./gen/PanelTargetVm";
 // begin by narrowing a type it was handed already narrowed.
 export type { PdfProbeVm } from "./gen/PdfProbeVm";
 export type { PingVm } from "./gen/PingVm";
+export type { PromoteRowVm } from "./gen/PromoteRowVm";
+export type { PromoteState } from "./gen/PromoteState";
 export type { Provider } from "./gen/Provider";
 export type { ProviderKind } from "./gen/ProviderKind";
 export type { ProviderOfferVm } from "./gen/ProviderOfferVm";
@@ -639,6 +642,7 @@ export type { SessionMigrationVm } from "./gen/SessionMigrationVm";
 export type { SessionPatternFileVm } from "./gen/SessionPatternFileVm";
 export type { SessionPatternSkipVm } from "./gen/SessionPatternSkipVm";
 export type { SessionPatternVm } from "./gen/SessionPatternVm";
+export type { SessionPromoteVm } from "./gen/SessionPromoteVm";
 export type { SessionPropertyVm } from "./gen/SessionPropertyVm";
 export type { SessionRecordMigrateVm } from "./gen/SessionRecordMigrateVm";
 export type { SessionRecordSkipVm } from "./gen/SessionRecordSkipVm";
@@ -876,6 +880,7 @@ import type { SearchHitVm } from "./gen/SearchHitVm";
 import type { SessionDetailVm } from "./gen/SessionDetailVm";
 import type { SessionMigrationVm } from "./gen/SessionMigrationVm";
 import type { SessionPatternVm } from "./gen/SessionPatternVm";
+import type { SessionPromoteVm } from "./gen/SessionPromoteVm";
 import type { SessionRecordMigrateVm } from "./gen/SessionRecordMigrateVm";
 import type { SessionRefAddedVm } from "./gen/SessionRefAddedVm";
 import type { SessionRefAddReq } from "./gen/SessionRefAddReq";
@@ -7074,6 +7079,63 @@ export async function sessionsArchive(
   emptyWorkspace: boolean,
 ): Promise<void> {
   await invoke<void>("sessions_archive", { rootId, sessionId, promotes, emptyWorkspace });
+}
+
+/**
+ * One session's promote panel (FR-243, FR-244, UX-DR90, UX-DR137): every row
+ * of its README's `## Promote` table with its state, the workspace files no
+ * row names, its harvested notes, the label chip, the drive's notes vault and
+ * why a promotion into it is refused. Rust composes every field.
+ *
+ * Rejects with: `internal` (unknown root or session), `unsupported`.
+ */
+export async function sessionsPromotePanel(
+  rootId: string,
+  sessionId: string,
+): Promise<SessionPromoteVm> {
+  return invoke<SessionPromoteVm>("sessions_promote_panel", { rootId, sessionId });
+}
+
+/**
+ * Promote `source` to `target` and record its one row (FR-243, FR-808): a
+ * target under `artifacts/` copies a settled `workspace/` file into the
+ * session; any other target is drive-relative and copies an artifact into the
+ * drive's notes vault, refused outside the vault, wider than the session's
+ * label, or where who reads the session or the drive cannot be established.
+ * `expected` is the SHA-256 of the source as the person read it
+ * (`KnowledgeNoteVm.revision`): promoting a harvested note is this person's
+ * review of that version, written into the vault copy; it is refused without
+ * one, or when the note changed since.
+ *
+ * Rejects with: `internal` (the refusal's sentence, e.g. "still being written;
+ * try again in a moment"), `unsupported`.
+ */
+export async function sessionsPromote(
+  rootId: string,
+  sessionId: string,
+  source: string,
+  target: string,
+  note: string,
+  expected: string | null,
+): Promise<void> {
+  await invoke<void>("sessions_promote", { rootId, sessionId, source, target, note, expected });
+}
+
+/**
+ * A person's *Reviewed by me* (or its untick) on a promoted harvested note at
+ * `path`: written into the vault copy its row names, never the session's
+ * candidate, keeping any edit that landed in the copy meanwhile.
+ *
+ * Rejects with: `internal` (not promoted to notes yet; no account to record),
+ * `unsupported`.
+ */
+export async function sessionsKnowledgeReview(
+  rootId: string,
+  sessionId: string,
+  path: string,
+  reviewed: boolean,
+): Promise<void> {
+  await invoke<void>("sessions_knowledge_review", { rootId, sessionId, path, reviewed });
 }
 
 /**
