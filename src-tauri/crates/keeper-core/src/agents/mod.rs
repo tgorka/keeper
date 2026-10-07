@@ -29,6 +29,7 @@ pub mod index;
 pub mod knowledge;
 pub mod label;
 pub mod log;
+pub mod mac_tables;
 pub mod matrix;
 pub mod mcp;
 pub mod memory;

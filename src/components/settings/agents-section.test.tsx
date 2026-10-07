@@ -21,6 +21,8 @@ import {
   agentsCopies,
   agentsCopySignIn,
   agentsDriveRepin,
+  agentsMcpList,
+  agentsMcpRemove,
   agentsSeedApply,
   agentsSeedOffer,
   agentsSeedPlan,
@@ -33,6 +35,14 @@ vi.mock("@/lib/ipc/client", () => ({
   agentsSeedOffer: vi.fn(),
   agentsSeedPlan: vi.fn(),
   agentsSeedApply: vi.fn(),
+  agentsMcpList: vi.fn(),
+  agentsMcpRemove: vi.fn(),
+  agentsMcpDraft: vi.fn(() =>
+    Promise.resolve({ floor: null, fixed: null, tools: [], conflicts: [], drop: null }),
+  ),
+  agentsSandboxGet: vi.fn(() =>
+    Promise.resolve({ readExec: [], env: [], status: "", refusal: null }),
+  ),
 }));
 
 const OWNER: AgentPersonVm = { matrixId: "@tgorka:tgorka.org", displayName: "Tomasz Gorka" };
@@ -95,6 +105,7 @@ const NO_FOLDERS: AgentSeedOfferVm = { folders: [], catalogue: [], bots: [], acc
 beforeEach(() => {
   vi.clearAllMocks();
   vi.mocked(agentsSeedOffer).mockResolvedValue(NO_FOLDERS);
+  vi.mocked(agentsMcpList).mockResolvedValue({ servers: [], tiers: [] });
 });
 
 afterEach(() => {
@@ -107,6 +118,34 @@ describe("Settings › Agents", () => {
     const { container } = render(<AgentsSection open />);
     await waitFor(() => expect(agentsCopies).toHaveBeenCalled());
     expect(container).toBeEmptyDOMElement();
+  });
+
+  it("stays reachable with no flagged folder while this Mac keeps an MCP server, which can be removed", async () => {
+    vi.mocked(agentsCopies).mockResolvedValue([]);
+    const kept = {
+      name: "notes",
+      url: "https://notes.example.org/mcp",
+      command: [],
+      role: null,
+      fingerprint: null,
+      readers: [],
+      anyone: true,
+      trustAnnotations: false,
+      token: true,
+      rows: [],
+      floor: null,
+      fixed: null,
+      answers: false,
+      answer: "does not answer",
+      started: null,
+      refusal: null,
+    };
+    vi.mocked(agentsMcpList).mockResolvedValue({ servers: [kept], tiers: [] });
+    vi.mocked(agentsMcpRemove).mockResolvedValue({ servers: [], tiers: [] });
+    render(<AgentsSection open />);
+    fireEvent.click(await screen.findByRole("button", { name: "Remove notes" }));
+    await waitFor(() => expect(agentsMcpRemove).toHaveBeenCalledWith("notes"));
+    await waitFor(() => expect(screen.queryByRole("listitem", { name: "notes" })).toBeNull());
   });
 
   it("shows the owner, readers and local-only setting the first sign-in pins, pins exactly those, and then says who is signed in", async () => {

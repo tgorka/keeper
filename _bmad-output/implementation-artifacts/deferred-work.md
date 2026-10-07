@@ -9048,7 +9048,7 @@ status: open
 origin: epic 96, story 96.1 (rung `agents-96-run`, R148, 2026-10-06)
 location: `src-tauri/crates/keeper-agent/src/desktop.rs` (`desktop_sandbox`)
 reason: R148 keeps the same `read_exec`/`env` table device-local on the Mac; this rung grants the Mac only the system folders and the folder `xcode-select -p` names, so a toolchain under the person's home (rustup, nvm) is not reachable there. Close with the table in the Mac's device-local agent store (Q9's pins-style store) and Settings › Agents.
-status: moved 2026-10-07
+status: done 2026-10-07 — rung `agents-96-mcp-mac` (R213's Mac half): `keeper_core::agents::mac_tables` keeps the table in `keeper.db` (`agent_sandbox`, `agent_sandbox_read_exec`, `agent_sandbox_env`), checked by `SandboxTable::check`; Settings › Agents › *Sandbox* edits it and `desktop_sandbox` probes it (`the_mac_sandbox_table_round_trip`, `a_saved_table_builds_the_host_again`); a toolchain run without downloading into the fresh HOME is owed on hesperia
 resolution: Scope moved by R213 (R96R-19): the validation is `run::SandboxTable::check`, used by agentd and the Mac now; the Mac's device-local store, its Settings section and the desktop host reading it land in rung 3 `agents-96-mcp-mac` with the MCP table (Q9(a)). Until then the Mac runs the default table and its status says no `[sandbox]` table is configurable there.
 
 ### DW-756: A person's stop does not stop a `run` that is under way.
@@ -9249,4 +9249,88 @@ status: open
 origin: epic 96, story 96.2 (rung `agents-96-mcp`, restack onto 02827329, 2026-10-10)
 location: `src-tauri/crates/keeper-agent/src/mcp.rs` (`Connection::end`'s `writes.end()`, `Writes::end`'s `drop(self.stdin().take())`); `src-tauri/crates/keeper-agent/tests/agent_turns.rs` (`parks::mcp::mcp_a_stopped_call_never_leaves_a_blocked_pipe`)
 reason: `mut-96mcp-5.py`'s `03-pipe-left-open` (no `writes.end()` at a connection's end) and `03-stdin-kept` (stdin not taken at `Writes::end`) were killed in round 5 by `mcp_a_stopped_call_never_leaves_a_blocked_pipe` (`mut-96mcp-5.log`); after R267 (keeper the child pipe's one writer) and R272 (the first write checked again at each attempt) both survive it, on 2ecf08d6 as on the restacked tree (`/tmp/agents-salvage/mut-96mcp-rs-pre.log`, `mut-96mcp-rs5.log`). What the test observes is that, after the stopped call ended, the queued call was refused and the stalled child resumed reading for a second, the child's completed-call log holds only `stall` — not that zero bytes of the half-written frame reached it, and not which close stopped the frame; it no longer proves that each of these two closes is needed. `Writes.ended` is no guard on every write: `Writes::begin` reads it once, at a frame's first write (admission), while the remainder of a frame is written through `Pipe::poll_write`, which checks only whether stdin is still there (`src-tauri/crates/keeper-agent/src/mcp.rs:334–336,405–418`). Which path stops the frame in the survivors' runs — the writer dropped with its connection, or another — is not established (inference from the source, not a controlled run); the survivors alone do not show that either close is redundant. Close by deciding whether the stdin drop is the one cutoff R254 says it is — then a test in which only that close can stop the frame, observing the bytes the child received, kills both mutants — or by removing a close proved redundant (R306).
+status: open
+
+### DW-1088: Settings' one-listing proof for an MCP server is a contention test, not a handshake.
+
+origin: epic 96, story 96.2 (rung `agents-96-mcp-mac`, restack onto 2ecf08d6, R258, 2026-10-09)
+location: `src-tauri/crates/keeper-agent/src/mcp.rs` (`McpServers::heard`, `tests::what_is_heard_is_one_listing_however_the_connection_changes`)
+reason: a `heard` that reads the program and the tools under separate locks differs from the one-snapshot read only when `Server::end` or a failed listing lands between those locks: under the state mutex `Listing::Answered(c)` always pairs with `connection == Some(c.connection)` (Answered is written only after the `ptr_eq` check in `Server::refresh`, every `connection = None` pairs with `Silent`, refreshes are serialized by `refreshing`). The test ends and relists the live connection 1000 times while three threads read `heard()`, so it kills that mutant only when a retirement falls inside the window (`/tmp/agents-salvage/mut-96mcpmac-5b.log`, `-5d.log`); it never fails on the one-snapshot code. Close with a test-only hold between `heard`'s reads, or by making a second-lock read unrepresentable.
+status: open — re-confirmed by R276 (2026-10-09): the rung's R258 rebuild regression now counts the child's calls, but this one-listing proof still rests on contention; a controlled interleaving (a test-only hold between `heard`'s reads) is still owed.
+
+### DW-840: Saving a Mac MCP server or `[sandbox]` table stops the Mac's running turns.
+
+origin: epic 96, story 96.2 (rung `agents-96-mcp-mac`, 2026-10-07)
+location: `src-tauri/crates/keeper-agent/src/desktop.rs` (`BuildKey.tables`, `DesktopHost::scan`)
+reason: the Mac's servers and sandbox are held by each copy's `AgentDeps` and by `HostRuntime` as immutable `Arc`s, so a save is applied by building the host again: the scan after it stops every running turn (each gets its final edit), releases the claims and builds anew, and another host may take a session over meanwhile. Close by swapping the servers and the sandbox in place (one shared cell both read) so only new calls see the new table.
+status: open
+
+### DW-841: A Mac MCP server's row and its keychain token are not written as one.
+
+origin: epic 96, story 96.2 (rung `agents-96-mcp-mac`, 2026-10-07)
+location: `src-tauri/crates/keeper-core/src/agents/mac_tables.rs` (`save_server`, `remove_server`)
+reason: the row is committed to `keeper.db` before the token is set in (or removed from) the keychain; a keychain failure leaves the row saved without the new token (or a removed server's token behind), and the refusal says so. Close by writing the token first and rolling it back when the row's transaction fails.
+status: done 2026-10-09 — R276 (rung `agents-96-mcp-mac`, R96MM2-01/02). The 2026-10-07 R228 closure claimed too much: the token was still kept under the server's name (`agent_mcp_token/<name>`), so a read taken before a successful save that moved the server and gave it a new token connected the old URL with the new token (R96MM2-01), an older Forget/Remove/URL→command whose delete ran after a newer save deleted that save's token (R96MM2-02), and a failed put-back left the new token usable under the old row — its "one window left" (DW-870) was not the only one, and "a refusal changes neither" was not true of a failed compensation. Now each token is staged under its own generation's key (`token_key(<generation>)`), the row names that generation (`agent_mcp_servers.token_ref`) in the same transaction, `bearer` reads only the generation the read published, and an operation deletes only the generation it retired; a save that does not commit published nothing, whatever the keychain then does. Tests `mac_tables::tests::a_read_sends_only_the_token_its_rows_published`, `a_save_that_does_not_commit_publishes_nothing`, `an_older_forget_or_remove_never_deletes_a_newer_token`, `keychain_errors_are_errors`, `desktop::tests::a_saved_server_is_used_with_its_saved_token`. What a failed delete leaves behind is DW-1111.
+
+### DW-842: The Mac asks its MCP servers only while it hosts an agent that found its control room.
+
+origin: epic 96, story 96.2 (rung `agents-96-mcp-mac`, 2026-10-07)
+location: `src-tauri/crates/keeper-agent/src/hosts.rs` (`HostRuntime::tick`), `src-tauri/crates/keeper-agent/src/desktop.rs` (`DesktopHost::tick`)
+reason: servers are listed at the manifest's renewal, which the desktop runs only after a copy has found the principal's control room; before that, and on a Mac hosting no agent, Settings shows each server as *does not answer — This Mac has not asked it yet…* (`mac_tables::NOT_ASKED`), so a person cannot test a server they just added. Close with a *Check now* that lists one server's tools outside the host.
+status: open
+
+### DW-870: A token rotation whose commit fails can leave a host built in between on the new token.
+
+origin: R228 (rung `agents-96-mcp-mac`, R96MM-03, 2026-10-07)
+location: `src-tauri/crates/keeper-core/src/agents/mac_tables.rs` (`save_server`, `restore`)
+reason: a rotation sets the new token in the keychain, then commits the row and the new revision; when that commit fails the old token is put back, but a scan that built the host between the keychain write and the failed commit read the new token under the old revision, and nothing builds it again until the next save. Only a failed SQLite commit (disk full, I/O error) opens it. Close by making a failed commit's compensation bump the revision in a second transaction, or by recording an unpublished generation the host refuses.
+status: done 2026-10-09 — R276: a rotation stages the new token under a new generation's key that only the committed row names, so a host built between the keychain write and a failed commit read the old row, which names the old generation — it never held the new token (`mac_tables::tests::a_save_that_does_not_commit_publishes_nothing`, `a_read_sends_only_the_token_its_rows_published`). No revision bump is needed for it.
+
+### DW-935: A Mac program server saved by a bare name resolves on the app's own `PATH`.
+
+origin: restack of rung `agents-96-mcp-mac` onto rung 2's R225 (2026-10-08)
+location: `src-tauri/crates/keeper-agent/src/mcp.rs` (`resolve`), `src-tauri/crates/keeper-core/src/agents/mac_tables.rs` (`save_server`)
+reason: the Mac's servers are now connected the way agentd's are — argv[0] resolved on the host's `PATH`, canonicalised and hashed at connection — and Settings shows the program started and its SHA-256 once it answers. A `command` saved as `peekaboo` (bare) is resolved on keeper.app's environment `PATH`, which for an app launched from Finder is launchd's short default, not the shell's, so a Homebrew program may not be found [INFERENCE, unverified on hesperia]; and the hash is shown only after the server answered, not when it is saved. Codemap Q10(a) wants the screen role's argv pinned to an absolute path with its SHA-256 shown; close in `agents-96-screen` by refusing a bare argv[0] for `role = "screen"` on the Mac (or resolving it at save and storing the absolute path) and showing the file's SHA-256 in the sheet before the first connection.
+status: open
+
+### DW-1108: A Mac MCP server left out for an unreadable keychain comes back only with a table change.
+
+origin: epic 96, story 96.2 (rung `agents-96-mcp-mac`, re-audit R96MM2 candidate, R276, 2026-10-09)
+location: `src-tauri/crates/keeper-agent/src/desktop.rs` (`mac_servers`, `BuildKey`, `DesktopHost::scan`)
+reason: `mac_servers` leaves out a server whose token cannot be read (the keychain locked, or its generation missing), while a scan whose `BuildKey` is unchanged keeps the registry it built. Unlocking the keychain without another save does not reinsert the server; Settings can stop showing the keychain's refusal while the host still has no entry for it [INFERENCE from source, unexercised]. Today the person saves the server again (or restarts keeper) to bring it back; docs/agents.md says so. Close with a bounded recovery — the scan reading each left-out server's token again and building the host anew when one becomes readable — and an observed reconnect test.
+status: open
+
+### DW-1109: An MCP refresh started by the Mac's old host can outlive the rebuild that retired it.
+
+origin: epic 96, story 96.2 (rung `agents-96-mcp-mac`, re-audit R96MM2 candidate, R276, 2026-10-09)
+location: `src-tauri/crates/keeper-agent/src/hosts.rs` (the spawned `McpServers::refresh` in `HostRuntime::tick`, `release_all`), `src-tauri/crates/keeper-agent/src/desktop.rs` (the old runtime dropped after release)
+reason: the refresh the host spawns holds the old registry and `release_all` does not abort it, so a listing or a connection begun for the configuration a save retired can run on after the host built on the new one [INFERENCE from source]. Calls are not at stake (R258's admission refuses the old registry's tools on the new one, `desktop::tests::a_tool_listed_before_a_rebuild_is_never_sent_after_it`, which does not prove teardown). Close by aborting the old runtime's refresh on release and a teardown test that tells already-dispatched work from new connection or listing work after removal and rebuild.
+status: open
+
+### DW-1110: The Mac's saved tables have no proof through the full host and under `sandbox-exec`.
+
+origin: epic 96, story 96.2 (rung `agents-96-mcp-mac`, R96MM-12 retained, R276, 2026-10-09)
+location: `src-tauri/crates/keeper-agent/src/desktop.rs` (`DesktopHost::build` → `AgentDeps.mcp`), `src-tauri/crates/keeper-agent/src/run/` (the Mac's `sandbox-exec` profile from the saved `[sandbox]` table)
+reason: Linux tests prove store → transport (`a_saved_server_is_used_with_its_saved_token` observes real requests and bearers, rotation and removal included) and synthetic-host invalidation, but not a saved table driving a rebuilt `DesktopHost` with signed-in copies to an observed tool call, nor a home-installed toolchain running under the saved sandbox grants without downloading. Owed on hesperia (device run) or CI's macOS job; never claimed from Linux.
+status: open
+
+### DW-1111: A token the keychain would not delete stays in it under a key no row names.
+
+origin: epic 96, story 96.2 (rung `agents-96-mcp-mac`, R276, 2026-10-09)
+location: `src-tauri/crates/keeper-core/src/agents/mac_tables.rs` (`discard`, `save_server_with`, `remove_server`)
+reason: a token staged for a save that did not commit, or retired by Forget/Remove/URL→command/a replacement, is deleted from the keychain; when the keychain refuses, it stays under its generation's key (or an earlier keeper's `agent_mcp_token/<name>`). No row names that key, so it is never sent (`mac_tables::tests::a_save_that_does_not_commit_publishes_nothing`), and a refused retirement is said to the person, a refused discard only logged. Nothing sweeps such keys later. Close with a sweep of `agent_mcp_bearer/*` keys no row names, if the keychain port gains a listing.
+status: open
+
+### DW-1118: A keychain write that stores the token and then reports failure, with its discard refused, is not exercised.
+
+origin: epic 96, story 96.2 (rung `agents-96-mcp-mac`, re-audit R96MM3 candidate, R278, 2026-10-09)
+location: `src-tauri/crates/keeper-core/src/agents/mac_tables.rs` (`save_server_with`, `discard`; the test platform's `fail_set`)
+reason: the test platform's `fail_set` refuses before it writes, so a save whose keychain set stores the new generation and then errors is never driven — let alone with the discard that follows refused too. By inspection the outcome is the one `a_save_that_does_not_commit_publishes_nothing` proves for a failed commit: the staged generation is under a key no row names, so nothing sends it and the published row keeps its own (DW-1111's unswept key). This is extra port-failure proof, not a known defect. Close with a fake whose set writes then errors, and a test that a refused discard after it leaves the published endpoint/bearer pair unchanged.
+status: open
+
+### DW-1119: Equal form inputs reuse a settled draft answer while a newer request for them is unanswered.
+
+origin: epic 96, story 96.2, R284; from R96MM4-01
+location: `src/components/settings/agents-mcp-section.tsx`
+reason: draft readiness identifies request contents, not request generation. The draft answer is keyed with `JSON.stringify(request)` (~:292–309); a `live` host refresh (~:321–336) issues a new request without invalidating the answer or entering its generation in the key, and readiness is `answer.key === key` (~:369–373), which drives `aria-busy` and Save (~:535, :658). So an unanswered same-input refresh leaves the previous draft enabled with `aria-busy=false`, and A→B→A reuses A's earlier answer while the new A request is unanswered. Not HIGH: the restored form is a policy the person already saw; no secret, data loss or runtime-admission bypass is shown. Fix: track pending ownership per request generation (same-input refreshes included), keep the previous VM only as inert presentation; controlled-promise tests for a held `live` refresh and A→B→A before the latest A resolves (busy, disabled controls and Save, then recovery). No policy computation in TypeScript.
 status: open

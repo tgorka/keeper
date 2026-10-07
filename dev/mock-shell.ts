@@ -57,9 +57,15 @@ import type {
   AccountVm,
   AgentCopyVm,
   AgentFocusReq,
+  AgentMcpDraftVm,
+  AgentMcpListVm,
+  AgentMcpServerReq,
+  AgentMcpServerVm,
   AgentPersonVm,
   AgentPinVm,
   AgentRoomHeaderVm,
+  AgentSandboxReq,
+  AgentSandboxVm,
   AgentSeedOfferVm,
   AgentSeedPlanVm,
   AgentSeedReq,
@@ -5523,6 +5529,264 @@ function seedApply(req: AgentSeedReq): AgentSeedResultVm {
   return { profileId: req.profileId, written: plan.write, left: plan.left, agents };
 }
 
+// --- This Mac's MCP servers and sandbox table (story 96.2, R213) -----------
+//
+// `?mcp=none` opens on no server. The default lists one server that answers
+// (one of its tools cannot travel, one is named like a GitHub token), a program
+// keeper starts that did not answer, and Paseo's role server answering with its
+// broker's verbs. Every sentence is copied from `keeper_core::agents::mac_tables`,
+// `mcp` and `approval_card::tier_word`; the two refusals the mock reproduces are
+// Rust's own: neither or both of a URL and a program, and a relative `read_exec`
+// folder. As in Rust, a save shows the "since the save" sentences until the
+// host is built on it — the mock's sandbox is probed again three seconds later
+// — and *Forget the token* wins over a typed token. A name Rust would redact is
+// shown, in a tool, a row and a refusal alike, as the host heard it shown.
+// `?mcpdraft=fails-on-role` makes every draft whose role is not the saved
+// server's fail as an unreadable `keeper.db` would.
+const mcpParam = new URLSearchParams(window.location.search).get("mcp");
+const mcpDraftFails =
+  new URLSearchParams(window.location.search).get("mcpdraft") === "fails-on-role";
+const MCP_NOT_ASKED =
+  "This Mac has not asked it yet: it asks once an agent signed in here has found its control room, and again every minute.";
+const MCP_NOT_ASKED_SINCE_SAVE =
+  "This Mac asks it again once its host is built on what was saved, within seconds.";
+const SANDBOX_NOT_PROBED_SINCE_SAVE =
+  "This Mac probes it again once its host is built on what was saved, within seconds.";
+const MCP_COMMAND_FLOOR =
+  "Never below T2: a program keeper starts runs with this Mac's rights, so each of its tools asks before it changes anything.";
+const MCP_ROLE_TABLE = "A role server's tools take its role's table; their tiers are not set here.";
+const MCP_ROLE_DROPS =
+  "A role server's tools take its role's table, so these tier rows cannot be saved with it: drop them to save it with this role, or set the role back to keep them.";
+const tierWord = (n: number): string =>
+  `T${n}: ${
+    n <= 1
+      ? "it only reads or changes what can be put back"
+      : n === 2
+        ? "it changes something that can be put back"
+        : n === 3
+          ? "it reaches beyond this session: it sends, or changes what runs"
+          : "it cannot be undone"
+  }`;
+const MCP_TIERS = [0, 1, 2, 3, 4, 5].map((n) => ({ code: `T${n}`, word: tierWord(n) }));
+const mcpServer = (over: Partial<AgentMcpServerVm> & { name: string }): AgentMcpServerVm => ({
+  url: null,
+  command: [],
+  role: null,
+  fingerprint: null,
+  readers: [],
+  anyone: true,
+  trustAnnotations: false,
+  token: false,
+  rows: [],
+  floor: null,
+  fixed: null,
+  answers: false,
+  answer: `does not answer — ${MCP_NOT_ASKED}`,
+  started: null,
+  refusal: null,
+  ...over,
+});
+let mcpServers: AgentMcpServerVm[] =
+  mcpParam === "none"
+    ? []
+    : [
+        mcpServer({
+          name: "kid",
+          command: ["/opt/homebrew/bin/kid-mcp", "--stdio"],
+          readers: [AGENT_OWNER],
+          anyone: false,
+          rows: [{ tool: "echo", tier: "T0" }],
+          floor: MCP_COMMAND_FLOOR,
+          answer: "does not answer — it did not answer within 10 s",
+        }),
+        mcpServer({
+          name: "notes",
+          url: "https://notes.example.org/mcp",
+          token: true,
+          rows: [{ tool: "search", tier: "T1" }],
+          answers: true,
+          answer: "answers",
+        }),
+        mcpServer({
+          name: "paseo",
+          url: "http://172.17.0.1:8765/mcp",
+          role: "paseo",
+          fixed: MCP_ROLE_TABLE,
+          answers: true,
+          answer: "answers",
+        }),
+        mcpServer({
+          name: "screen",
+          command: ["peekaboo", "mcp"],
+          role: "screen",
+          fixed: MCP_ROLE_TABLE,
+          answers: true,
+          answer: "answers",
+          started: {
+            path: "/opt/homebrew/Cellar/peekaboo/3.9.8/bin/peekaboo",
+            sha256: "9c1f0e7d4b2a8836f5e1c0b7a9d4e2f61b8c3a5d7e9f0a1b2c3d4e5f60718293",
+          },
+        }),
+      ];
+/**
+ * What the host heard each server list, by name: an exact name when it can
+ * travel, else `null` and the name as Rust shows it — redacted and bounded.
+ */
+const mcpHeard: Record<string, { tool: string | null; shown: string }[]> = {
+  notes: [
+    { tool: "search", shown: "search" },
+    { tool: "delete", shown: "delete" },
+    { tool: null, shown: "get file" },
+    { tool: null, shown: "read [REDACTED github_token]" },
+    { tool: "ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789", shown: "[REDACTED github_token]" },
+  ],
+  paseo: ["list_agents", "get_agent_status", "create_agent", "send_agent_prompt"].map((tool) => ({
+    tool,
+    shown: tool,
+  })),
+  screen: [{ tool: "see", shown: "see" }],
+};
+const PASEO_TABLE: Record<string, number> = {
+  list_agents: 0,
+  get_agent_status: 0,
+  create_agent: 3,
+  send_agent_prompt: 3,
+};
+const mcpList = (): AgentMcpListVm => ({ servers: mcpServers, tiers: MCP_TIERS });
+/** `mac_tables::draft`, as far as a mock can say it. */
+function mcpDraft(req: AgentMcpServerReq): AgentMcpDraftVm {
+  const url = req.url?.trim() ? req.url : null;
+  const role = req.role?.trim() ? req.role : null;
+  const saved = mcpServers.find((server) => server.name === req.name);
+  if (mcpDraftFails && saved !== undefined && (saved.role ?? null) !== role) {
+    throw {
+      code: "internal",
+      message: "keeper.db could not be read: database is locked",
+      accountId: null,
+      retriable: false,
+    };
+  }
+  const sameServer =
+    saved !== undefined &&
+    saved.url === url &&
+    saved.command.join("\u0000") === req.command.join("\u0000");
+  const kept = role === null ? req.rows : [];
+  const shownOf = (tool: string): string =>
+    mcpHeard[req.name]?.find((heard) => heard.tool === tool)?.shown ?? tool;
+  const tierOf = (tool: string): { word: string | null; refusal: string | null } => {
+    if (role !== null) {
+      const tier = role === "paseo" ? PASEO_TABLE[tool] : undefined;
+      return tier === undefined
+        ? {
+            word: null,
+            refusal: `\`${req.name}\` is a role server, and its role has no tool \`${shownOf(tool)}\``,
+          }
+        : { word: tierWord(tier), refusal: null };
+    }
+    const row = kept.find((r) => r.tool === tool);
+    const tier = row === undefined ? 3 : Number(row.tier.slice(1));
+    return { word: tierWord(req.command.length > 0 ? Math.max(tier, 2) : tier), refusal: null };
+  };
+  const listed = sameServer ? (mcpHeard[req.name] ?? []) : [];
+  const tools: AgentMcpDraftVm["tools"] = listed.map((heard) =>
+    heard.tool === null
+      ? {
+          tool: null,
+          shown: heard.shown,
+          word: null,
+          refusal: `${heard.shown} cannot travel as a function name`,
+        }
+      : { tool: heard.tool, shown: heard.shown, ...tierOf(heard.tool) },
+  );
+  for (const row of kept) {
+    if (!tools.some((t) => t.tool === row.tool)) {
+      tools.push({ tool: row.tool, shown: shownOf(row.tool), ...tierOf(row.tool) });
+    }
+  }
+  const conflicts =
+    role === null ? [] : req.rows.map((row) => ({ ...row, shown: shownOf(row.tool) }));
+  return {
+    floor: req.command.length > 0 ? MCP_COMMAND_FLOOR : null,
+    fixed: role !== null ? MCP_ROLE_TABLE : null,
+    tools,
+    conflicts,
+    drop: conflicts.length > 0 ? MCP_ROLE_DROPS : null,
+  };
+}
+function mcpSave(req: AgentMcpServerReq): AgentMcpListVm {
+  const url = req.url?.trim() ? req.url : null;
+  if ((url === null) === (req.command.length === 0)) {
+    throw {
+      code: "internal",
+      message: `[[mcp]] "${req.name}" is refused: it names exactly one of \`url\` and \`command\``,
+      accountId: null,
+      retriable: false,
+    };
+  }
+  if (req.role?.trim() && req.rows.length > 0) {
+    throw {
+      code: "internal",
+      message: `[[mcp]] "${req.name}" [[mcp.tier]] is refused: a role's tiers are fixed; a server with a \`role\` takes no [[mcp.tier]] rows`,
+      accountId: null,
+      retriable: false,
+    };
+  }
+  const floor = req.command.length > 0 ? MCP_COMMAND_FLOOR : null;
+  const fixed = req.role?.trim() ? MCP_ROLE_TABLE : null;
+  const before = mcpServers.find((server) => server.name === req.name);
+  const people = [AGENT_OWNER, ...AGENT_READERS];
+  const saved = mcpServer({
+    name: req.name,
+    url,
+    command: req.command,
+    role: req.role,
+    fingerprint: req.fingerprint,
+    readers: req.readers.map(
+      (id) =>
+        people.find((person) => person.matrixId === id) ?? { matrixId: id, displayName: null },
+    ),
+    anyone: req.readers.length === 0 || req.readers.includes("*"),
+    trustAnnotations: req.trustAnnotations,
+    token: url !== null && !req.forgetToken && (req.token !== null || (before?.token ?? false)),
+    rows: req.rows,
+    floor,
+    fixed,
+    answer: `does not answer — ${MCP_NOT_ASKED_SINCE_SAVE}`,
+  });
+  mcpServers = [...mcpServers.filter((server) => server.name !== req.name), saved].sort((a, b) =>
+    a.name.localeCompare(b.name),
+  );
+  return mcpList();
+}
+let sandboxTable: AgentSandboxVm = {
+  readExec: ["/opt/homebrew/bin"],
+  env: [{ name: "CARGO_HOME", path: "/Users/tgorka/.cargo" }],
+  status: "sandbox-exec ok",
+  refusal: null,
+};
+function sandboxSave(req: AgentSandboxReq): AgentSandboxVm {
+  const relative = req.readExec.find((path) => !path.startsWith("/"));
+  if (relative !== undefined) {
+    throw {
+      code: "internal",
+      message: `[sandbox] \`read_exec\` is refused: "${relative}" is not an absolute path`,
+      accountId: null,
+      retriable: false,
+    };
+  }
+  sandboxTable = {
+    ...sandboxTable,
+    readExec: req.readExec,
+    env: req.env,
+    status: SANDBOX_NOT_PROBED_SINCE_SAVE,
+  };
+  // The host built again on the saved table probes it.
+  setTimeout(() => {
+    sandboxTable = { ...sandboxTable, status: "sandbox-exec ok" };
+  }, 3000);
+  return sandboxTable;
+}
+
 /** Answer after `ms`, so a loading state is on screen long enough to look at. */
 function later<T>(ms: number, answer: () => T): Promise<T> {
   return new Promise((resolve) => setTimeout(() => resolve(answer()), ms));
@@ -6846,6 +7110,15 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
     return agentRows.find((row) => row.agent === payload.agent);
   },
   agents_seed_offer: () => seedOffer(),
+  agents_mcp_list: () => mcpList(),
+  agents_mcp_draft: (payload) => mcpDraft(payload.req as AgentMcpServerReq),
+  agents_mcp_save: (payload) => mcpSave(payload.req as AgentMcpServerReq),
+  agents_mcp_remove: (payload) => {
+    mcpServers = mcpServers.filter((server) => server.name !== payload.name);
+    return mcpList();
+  },
+  agents_sandbox_get: () => sandboxTable,
+  agents_sandbox_save: (payload) => sandboxSave(payload.req as AgentSandboxReq),
   agents_seed_plan: (payload) => seedPlan(payload.req as AgentSeedReq),
   agents_seed_apply: (payload) => seedApply(payload.req as AgentSeedReq),
   agents_drive_repin: (payload) => {

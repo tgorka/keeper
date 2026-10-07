@@ -33,10 +33,12 @@ use keeper_core::agents::home::AgentKind;
 use keeper_core::agents::host::Materialized;
 use keeper_core::agents::index::Index;
 use keeper_core::agents::log::HostSlug;
+use keeper_core::agents::mac_tables::{self, Heard, HeardTool, MacTables};
 use keeper_core::agents::matrix::{self, AgentClient, AgentMatrixError};
 use keeper_core::agents::mount::pin_matches;
 use keeper_core::agents::proxy::ProxyFacts;
 use keeper_core::agents::room::ScopeDriveVm;
+use keeper_core::agents::run::SandboxTable;
 use keeper_core::agents::soul;
 use keeper_core::agents::trust::{Anchor, OwnAccount};
 use keeper_core::bots::chat::{self, CancelHandle, CancelSignal};
@@ -51,6 +53,7 @@ use crate::agent::{bot_for, AgentDeps};
 use crate::deciding::ClientDecisions;
 use crate::doorbell::{Doorbell, DriveEngine, Ringer, RING_FINISH};
 use crate::hosts::{HostRuntime, RELEASE_BOUND};
+use crate::mcp::McpServers;
 use crate::rooms::{Known, KnownAgent};
 use crate::runtime::{
     deps_over, known_agents, known_with, open_copy, sessions_of, start_copy, view, Copy, DriveView,
@@ -115,6 +118,10 @@ pub struct DesktopFacts {
     /// Mac's trust anchor (R87). Only these people decide a run this Mac
     /// hosts, each while verified here; hosting a room trusts nobody.
     pub accounts: Vec<OwnAccount>,
+    /// This Mac's own `[[mcp]]` servers and `[sandbox]` table, from
+    /// Settings › Agents (96.2 #11, R213): a save is read at the next scan
+    /// and the host is built again on it.
+    pub tables: MacTables,
 }
 
 /// One flagged folder as this host reads it.
@@ -191,6 +198,26 @@ pub fn desktop_drives(
             }
         })
         .collect()
+}
+
+/// Every checkout this app syncs, flagged for agents or not, by its
+/// folder's name and where it resolves now, sorted: what no sandbox grant
+/// may reach (R148, R213, R228). A host's sandbox is built on these; when
+/// one moves, comes or goes, the host is built again.
+pub fn checkouts(profiles: &[SyncProfile]) -> Vec<(String, PathBuf)> {
+    let mut roots: Vec<(String, PathBuf)> = profiles
+        .iter()
+        .map(|profile| {
+            let root = profile
+                .local_path
+                .canonicalize()
+                .unwrap_or_else(|_| profile.local_path.clone());
+            (profile.name.clone(), root)
+        })
+        .collect();
+    roots.sort();
+    roots.dedup();
+    roots
 }
 
 /// What the doorbell is set with (R162): each pinned drive by its pin's id
@@ -543,6 +570,11 @@ struct BuildKey {
     /// verifies this device, or whose identity moves, rebuilds the host, so
     /// no copy decides on what was true before (R87).
     trust: Vec<OwnAccount>,
+    /// The Mac's tables, of one revision: a saved server, token or sandbox
+    /// table builds it again.
+    tables: MacTables,
+    /// Every checkout its sandbox may never grant, as they resolved.
+    checkouts: Vec<(String, PathBuf)>,
 }
 
 /// A running desktop host.
@@ -555,6 +587,10 @@ struct Built {
     runtime: HostRuntime,
     stop: CancelHandle,
     signal: CancelSignal,
+    /// This Mac's MCP servers, offered while each answers (96.2 #3).
+    mcp: Arc<McpServers>,
+    /// What the sandbox's probe found: its status, or `unavailable — why`.
+    sandbox: String,
 }
 
 /// The app's host: built from a scan's facts, rebuilt when they change,
@@ -614,6 +650,22 @@ impl DesktopHost {
             .as_ref()
             .map(|built| built.runtime.held())
             .unwrap_or_default()
+    }
+
+    /// This Mac's MCP servers while it hosts, for Settings, and the
+    /// revision of the tables they were built on.
+    pub fn mcp(&self) -> Option<(i64, Arc<McpServers>)> {
+        self.built
+            .as_ref()
+            .map(|built| (built.key.tables.revision, Arc::clone(&built.mcp)))
+    }
+
+    /// What this Mac's sandbox probe found while it hosts, for Settings,
+    /// and the revision of the table it probed.
+    pub fn sandbox_status(&self) -> Option<(i64, String)> {
+        self.built
+            .as_ref()
+            .map(|built| (built.key.tables.revision, built.sandbox.clone()))
     }
 
     /// One tick of the app's interval. With `facts` (a scan), the host is
@@ -680,10 +732,23 @@ impl DesktopHost {
             tracing::info!("agents: this Mac's verified accounts changed; its host stops before it is built again");
             self.stop().await;
         }
+        // The person's servers and sandbox table, likewise: a server
+        // removed, a tier raised, a grant taken back stops the host built
+        // on what was before a provider read below can fail and return
+        // (R228), so the old effect is never kept in use.
+        if self
+            .built
+            .as_ref()
+            .is_some_and(|built| built.key.tables != facts.tables)
+        {
+            tracing::info!("agents: this Mac's MCP servers or sandbox table changed; its host stops before it is built again");
+            self.stop().await;
+        }
         let platform = Arc::clone(&self.platform);
         let data_dir = self.data_dir.clone();
         let read = tokio::task::spawn_blocking(move || {
             let drives = desktop_drives(&facts.profiles, &facts.pins, &login);
+            let checkouts = checkouts(&facts.profiles);
             let rows = store::list_providers(&data_dir).map(|listing| listing.rows);
             let homes: Vec<AgentHome> = drives
                 .iter()
@@ -697,13 +762,23 @@ impl DesktopHost {
                     signed_in_device(platform.as_ref(), &home.config.matrix_user).is_some()
                 })
                 .collect();
-            (facts, login, drives, rows, signed)
+            (facts, login, drives, checkouts, rows, signed)
         })
         .await;
-        let Ok((facts, login, drives, rows, signed)) = read else {
+        let Ok((facts, login, drives, checkouts, rows, signed)) = read else {
             tracing::error!("agents: the desktop's zones could not be read");
             return;
         };
+        // A checkout moved, came or went: the sandbox built on the old set
+        // could grant a folder that now holds one (R228).
+        if self
+            .built
+            .as_ref()
+            .is_some_and(|built| built.key.checkouts != checkouts)
+        {
+            tracing::info!("agents: this Mac's checkouts changed; its host stops before its sandbox is built again");
+            self.stop().await;
+        }
         let rows = match rows {
             Ok(rows) => rows,
             Err(error) => {
@@ -728,6 +803,8 @@ impl DesktopHost {
             hosting,
             signed_in: signed_keys,
             trust: facts.accounts.clone(),
+            tables: facts.tables.clone(),
+            checkouts,
         };
 
         let views: Vec<DriveView> = drives.iter().map(|drive| drive.view.clone()).collect();
@@ -778,9 +855,20 @@ impl DesktopHost {
         let mut copies = Vec::new();
         let mut syncs = Vec::new();
         let doors = Arc::new(ClientDoors::default());
-        let sandbox =
-            crate::agent::off_the_runtime(|| desktop_sandbox(&views, &self.data_dir, &host))
-                .map(Arc::new);
+        let probed = crate::agent::off_the_runtime(|| {
+            desktop_sandbox(&key.checkouts, &self.data_dir, &host, &facts.tables.sandbox)
+        });
+        let sandbox_line = match &probed {
+            Ok(sandbox) => sandbox.status.clone(),
+            Err(reason) => format!("unavailable — {reason}"),
+        };
+        let sandbox = probed.ok().map(Arc::new);
+        // The Mac's `[[mcp]]` servers, each with its token from the
+        // keychain; connected and listed at the manifest's first renewal and
+        // every one after (96.2 #3, #11).
+        let mcp = Arc::new(crate::agent::off_the_runtime(|| {
+            mac_servers(self.platform.as_ref(), &facts.tables)
+        }));
         for home in &signed {
             let user = home.config.matrix_user.clone();
             let Some(homeserver) = homeserver_for(&user, &facts.homeservers) else {
@@ -810,6 +898,7 @@ impl DesktopHost {
                         anchor: Anchor::Desktop(key.trust.clone()),
                     })),
                     sandbox: sandbox.clone(),
+                    mcp: Some(Arc::clone(&mcp)),
                     ..deps
                 }),
                 Err(sentence) => {
@@ -842,7 +931,8 @@ impl DesktopHost {
             &manifest,
             copies.clone(),
             sandbox.is_some(),
-        );
+        )
+        .with_mcp(Arc::clone(&mcp));
         self.doorbell
             .set_principal_agents(runtime.principal_agents());
         let (stop, signal) = chat::cancellation();
@@ -856,6 +946,8 @@ impl DesktopHost {
             runtime,
             stop,
             signal,
+            mcp,
+            sandbox: sandbox_line,
         };
         offer_sessions(&mut built);
         self.built = Some(built);
@@ -910,63 +1002,101 @@ impl DesktopHost {
     }
 }
 
-/// This Mac's sandbox (96.1 #11): `/usr/bin/sandbox-exec`, with the
-/// developer folder `xcode-select -p` names read-and-execute (R148, where
-/// `/usr/bin/git`'s tools live), probed; `None` off macOS or when the
-/// probe fails — `run` is then not offered here. Its `[sandbox]` table is
-/// the default one, through the check agentd's goes through: the Mac's
-/// device-local table lands with its MCP store (R213, rung
-/// `agents-96-mcp-mac`), and its status line says so.
+/// This Mac's sandbox (96.1 #11): `/usr/bin/sandbox-exec` over the Mac's
+/// own `[sandbox]` table, checked by the check agentd's goes through
+/// (R148, R213), with the developer folder `xcode-select -p` names added
+/// read-and-execute (where `/usr/bin/git`'s tools live), probed. No grant
+/// reaches any of `checkouts` — every checkout this app syncs, flagged for
+/// agents or not (R228). `Err` — a table that does not check, a folder it
+/// may not grant, off macOS, or a failed probe — is why `run` is not
+/// offered here.
 fn desktop_sandbox(
-    views: &[DriveView],
+    checkouts: &[(String, PathBuf)],
     data_dir: &Path,
     host: &HostSlug,
-) -> Option<crate::run::SandboxHost> {
-    if !cfg!(target_os = "macos") {
-        return None;
-    }
-    let developer: Vec<PathBuf> = std::process::Command::new("/usr/bin/xcode-select")
+    table: &Result<SandboxTable, String>,
+) -> Result<crate::run::SandboxHost, String> {
+    let mut table = table.clone()?;
+    let developer = std::process::Command::new("/usr/bin/xcode-select")
         .arg("-p")
         .output()
         .ok()
         .filter(|out| out.status.success())
         .and_then(|out| String::from_utf8(out.stdout).ok())
         .map(|text| PathBuf::from(text.trim()))
-        .filter(|path| path.is_absolute())
-        .into_iter()
-        .collect();
-    let mut table = match keeper_core::agents::run::SandboxTable::check(Vec::new(), BTreeMap::new())
-    {
-        Ok(table) => table,
-        Err((at, reason)) => {
-            tracing::warn!(%at, %reason, "agents: this Mac's [sandbox] table does not read");
-            return None;
-        }
-    };
+        .filter(|path| path.is_absolute());
     table.read_exec.extend(developer);
     let forbidden = crate::run::Forbidden {
-        drives: views
-            .iter()
-            .map(|view| (view.id.clone(), view.profile.local_path.clone()))
-            .collect(),
+        drives: checkouts.to_vec(),
         secrets: vec![data_dir.to_path_buf()],
         home: std::env::var_os("HOME").map(PathBuf::from),
     };
-    match crate::run::SandboxHost::probe(
+    let probed = crate::run::SandboxHost::probe(
         crate::run::Kind::SandboxExec,
         host.as_str(),
         &table,
         &forbidden,
-    ) {
-        Ok(sandbox) => {
-            tracing::info!(sandbox = %sandbox.status, "agents: this Mac's sandbox");
-            Some(sandbox)
-        }
+    );
+    match &probed {
+        Ok(sandbox) => tracing::info!(sandbox = %sandbox.status, "agents: this Mac's sandbox"),
         Err(reason) => {
-            tracing::warn!(%reason, "agents: no sandbox on this Mac; agents that need `sandbox` wait for another host");
-            None
+            tracing::warn!(%reason, "agents: no sandbox on this Mac; agents that need `sandbox` wait for another host")
         }
     }
+    probed
+}
+
+/// This Mac's `[[mcp]]` servers from its saved tables, each with its token
+/// from the keychain (96.2 #3, #11): what the host installs in every copy's
+/// `AgentDeps` and its manifest. A server whose token cannot be read is
+/// left out, never connected without the token its row names (R228).
+pub fn mac_servers(platform: &dyn Platform, tables: &MacTables) -> McpServers {
+    McpServers::new(
+        tables
+            .mcp
+            .iter()
+            .filter_map(|entry| match mac_tables::bearer(platform, entry) {
+                Ok(token) => Some((entry.clone(), token)),
+                Err(sentence) => {
+                    tracing::warn!(%sentence, "agents: a server of this Mac's is not connected");
+                    None
+                }
+            })
+            .collect(),
+    )
+}
+
+/// What this Mac's servers last answered, for Settings: each that answered
+/// with the program it was started as and every tool it listed — its exact
+/// name only when it travels as a function name, and whatever else the
+/// server wrote of it, name and refusal, as a [`crate::mcp::diagnostic`]:
+/// redacted and bounded, as the host's status writes it (R225, R276) —
+/// each that did not with why. A server not asked yet is absent.
+pub fn heard(servers: &McpServers) -> BTreeMap<String, Heard> {
+    servers
+        .heard()
+        .into_iter()
+        .filter_map(|(name, heard)| {
+            let heard = match heard? {
+                Ok((started, listed)) => Heard::Answers {
+                    started,
+                    tools: listed
+                        .into_iter()
+                        .map(|(listed, hints)| HeardTool {
+                            tool: match listed.wire {
+                                Ok(_) => Ok(listed.tool.clone()),
+                                Err(why) => Err(crate::mcp::diagnostic(&why)),
+                            },
+                            shown: crate::mcp::diagnostic(&listed.tool),
+                            hints,
+                        })
+                        .collect(),
+                },
+                Err(why) => Heard::Silent(why),
+            };
+            Some((name, heard))
+        })
+        .collect()
 }
 
 /// Offer every active session of each copy's agent to placement.
@@ -1312,9 +1442,9 @@ mod tests {
         assert!(gate.enter().is_some(), "the gate is open after the panic");
     }
 
-    /// A host built under `trust`, hosting nothing: what a scan finds
-    /// running.
-    fn built_under(trust: Vec<OwnAccount>) -> Built {
+    /// A host built under `trust` and `tables` over no checkout, hosting
+    /// nothing: what a scan finds running.
+    fn built_under(trust: Vec<OwnAccount>, tables: MacTables) -> Built {
         let host = HostSlug::new("hesperia").expect("slug");
         let (stop, signal) = chat::cancellation();
         Built {
@@ -1324,6 +1454,8 @@ mod tests {
                 hosting: Vec::new(),
                 signed_in: Vec::new(),
                 trust,
+                tables,
+                checkouts: Vec::new(),
             },
             drives: Vec::new(),
             copies: Vec::new(),
@@ -1332,7 +1464,648 @@ mod tests {
             runtime: HostRuntime::desktop(host, "tgorka", "test", &[], Vec::new(), false),
             stop,
             signal,
+            mcp: Arc::new(McpServers::new(Vec::new())),
+            sandbox: String::new(),
         }
+    }
+
+    /// Tables of `revision` whose sandbox grants `read_exec`.
+    fn saved(revision: i64, read_exec: &[&str]) -> MacTables {
+        MacTables {
+            sandbox: Ok(SandboxTable {
+                read_exec: read_exec.iter().map(PathBuf::from).collect(),
+                env: Vec::new(),
+            }),
+            revision,
+            ..MacTables::default()
+        }
+    }
+
+    /// 96.2 #11, R213: a scan that reads tables of another revision — a
+    /// token rotated with nothing else changed included — stops the host
+    /// built on the old ones, so no copy keeps serving the servers or the
+    /// sandbox that were; a scan of the same tables keeps it. That the host
+    /// built again uses what was saved is
+    /// `a_saved_server_is_used_with_its_saved_token`'s.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_saved_table_stops_the_host_built_on_the_old_one() {
+        for (tables, kept, what) in [
+            (saved(1, &["/opt/bin"]), true, "the same tables"),
+            (
+                saved(2, &["/opt/bin"]),
+                false,
+                "a save of the same rows, a token replaced",
+            ),
+            (saved(1, &["/opt/other"]), false, "another sandbox table"),
+        ] {
+            let root = tempfile::tempdir().expect("tempdir");
+            let data_dir = root.path().join("data");
+            let mut host = DesktopHost::new(
+                TurnEnv::new(Arc::new(platform(root.path()))),
+                data_dir,
+                "test",
+            );
+            host.built = Some(built_under(Vec::new(), saved(1, &["/opt/bin"])));
+            host.scan(DesktopFacts {
+                login: Some("tgorka".to_owned()),
+                device: Some("hesperia".to_owned()),
+                tables,
+                ..DesktopFacts::default()
+            })
+            .await;
+            assert_eq!(host.built.is_some(), kept, "{what}");
+        }
+    }
+
+    /// R96MM-06: a server removed, a tier raised or a grant taken back
+    /// stops the host built on the old tables even when the provider rows
+    /// cannot be read in the same scan, and so does a checkout that moved;
+    /// the same failing read with nothing changed keeps the host.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_revoked_policy_stops_the_host_however_the_scan_fails() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let moved = root.path().join("moved");
+        std::fs::create_dir_all(&moved).expect("moved");
+        let notes = SyncProfile::new("p2", "notes", &moved, "git@forge:tgorka/notes.git");
+        for (tables, profiles, kept, what) in [
+            (saved(1, &["/opt/bin"]), Vec::new(), true, "unchanged"),
+            (
+                saved(2, &["/opt/bin"]),
+                Vec::new(),
+                false,
+                "a server removed",
+            ),
+            (saved(1, &[]), Vec::new(), false, "a grant taken back"),
+            (
+                saved(1, &["/opt/bin"]),
+                vec![notes.clone()],
+                false,
+                "a checkout that came",
+            ),
+        ] {
+            // `keeper.db` cannot be opened under a file: the provider rows
+            // do not read, and the scan returns there.
+            let data_dir = root.path().join("not-a-folder");
+            std::fs::write(&data_dir, "").expect("a file");
+            let mut host = DesktopHost::new(
+                TurnEnv::new(Arc::new(platform(root.path()))),
+                data_dir.clone(),
+                "test",
+            );
+            assert!(store::list_providers(&data_dir).is_err(), "{what}");
+            host.built = Some(built_under(Vec::new(), saved(1, &["/opt/bin"])));
+            host.scan(DesktopFacts {
+                login: Some("tgorka".to_owned()),
+                device: Some("hesperia".to_owned()),
+                profiles,
+                tables,
+                ..DesktopFacts::default()
+            })
+            .await;
+            assert_eq!(host.built.is_some(), kept, "{what}");
+            assert_eq!(host.mcp().is_some(), kept, "{what}");
+        }
+    }
+
+    /// R96MM-02: no sandbox grant reaches a checkout this app syncs,
+    /// flagged for agents or not. A toolchain folder holding an unflagged
+    /// checkout is refused; a flagged checkout that moved beneath an
+    /// already granted folder is refused once the host is built on where it
+    /// is now, and the move itself builds the host again; a toolchain
+    /// folder holding no checkout passes the grant check.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn every_checkout_is_never_granted() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let path = |rel: &str| {
+            let path = root.path().join(rel);
+            std::fs::create_dir_all(&path).expect("mkdir");
+            path
+        };
+        let (tools, toolchain) = (path("tools"), path("toolchain/bin"));
+        let data = path("data");
+        let host = HostSlug::new("hesperia").expect("slug");
+        let table = |dir: &Path| {
+            Ok(SandboxTable {
+                read_exec: vec![dir.to_path_buf()],
+                env: Vec::new(),
+            })
+        };
+        let granted = |checkouts: &[(String, PathBuf)], dir: &Path| {
+            desktop_sandbox(checkouts, &data, &host, &table(dir))
+                .err()
+                .filter(|why| why.contains("cannot grant it"))
+        };
+
+        // An unflagged checkout under a toolchain folder.
+        let unflagged = SyncProfile::new(
+            "p2",
+            "notes",
+            path("tools/notes"),
+            "git@forge:tgorka/notes.git",
+        );
+        assert!(unflagged.agents.is_none());
+        let refused = granted(&checkouts(std::slice::from_ref(&unflagged)), &tools)
+            .expect("a folder holding a checkout is refused");
+        assert!(refused.contains("notes"), "{refused}");
+        assert_eq!(
+            granted(&checkouts(std::slice::from_ref(&unflagged)), &toolchain),
+            None,
+            "a toolchain folder holding no checkout"
+        );
+
+        // A flagged checkout moves beneath the granted folder.
+        let mut tgdrive = profile(&path("drives/tgdrive"));
+        let before = checkouts(std::slice::from_ref(&tgdrive));
+        assert_eq!(granted(&before, &tools), None, "before the move");
+        tgdrive.local_path = path("tools/tgdrive");
+        let after = checkouts(std::slice::from_ref(&tgdrive));
+        assert!(granted(&after, &tools).is_some(), "after the move");
+
+        let mut built = built_under(Vec::new(), saved(1, &[]));
+        built.key.checkouts = before;
+        let mut desktop = DesktopHost::new(
+            TurnEnv::new(Arc::new(platform(root.path()))),
+            data.clone(),
+            "test",
+        );
+        desktop.built = Some(built);
+        desktop
+            .scan(DesktopFacts {
+                login: Some("tgorka".to_owned()),
+                device: Some("hesperia".to_owned()),
+                profiles: vec![tgdrive],
+                tables: saved(1, &[]),
+                ..DesktopFacts::default()
+            })
+            .await;
+        assert!(desktop.built.is_none(), "the move builds the host again");
+    }
+
+    /// What a fixture HTTP endpoint was asked: each request's path and its
+    /// `Authorization` header.
+    type Asked = Arc<std::sync::Mutex<Vec<(String, Option<String>)>>>;
+
+    /// An endpoint that records every request and answers 401: its base
+    /// URL and what it was asked.
+    async fn recording_endpoint() -> (String, Asked) {
+        use axum::http::{header::AUTHORIZATION, HeaderMap, StatusCode, Uri};
+        let asked = Asked::default();
+        let log = Arc::clone(&asked);
+        let router = axum::Router::new().fallback(move |uri: Uri, headers: HeaderMap| {
+            let log = Arc::clone(&log);
+            async move {
+                let bearer = headers
+                    .get(AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned);
+                log.lock()
+                    .expect("log")
+                    .push((uri.path().to_owned(), bearer));
+                StatusCode::UNAUTHORIZED
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("address");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        (format!("http://{address}"), asked)
+    }
+
+    /// Build this Mac's servers from `tables` as the host does, ask each
+    /// once, and say where each request went and with which bearer.
+    async fn used(
+        platform: &dyn Platform,
+        tables: &MacTables,
+        asked: &Asked,
+    ) -> Vec<(String, Option<String>)> {
+        asked.lock().expect("asked").clear();
+        mac_servers(platform, tables).refresh().await;
+        let mut seen = asked.lock().expect("asked").clone();
+        seen.sort();
+        seen.dedup();
+        seen
+    }
+
+    /// R96MM-12, R96MM2-01: from the store to the server. A server saved in
+    /// Settings is asked at the URL saved, with the token saved; a rotated
+    /// token makes a new revision, which stops the host built on the old
+    /// one, and the servers built again send the new token; a moved URL is
+    /// asked where it moved; a removed server is asked nothing. Servers
+    /// built from a read taken before a save never send that save's token:
+    /// not after a rotation, and not to the old URL after a move with a new
+    /// token — they send nothing. The full host — copies signed in to a
+    /// homeserver — is the Mac device run's.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_saved_server_is_used_with_its_saved_token() {
+        use keeper_core::agents::mac_tables::AgentMcpServerReq;
+        let root = tempfile::tempdir().expect("tempdir");
+        let platform = platform(root.path());
+        let data = root.path().join("data");
+        let (base, asked) = recording_endpoint().await;
+        let save = |path: &str, token: Option<&str>| {
+            mac_tables::save_server(
+                &data,
+                &platform,
+                AgentMcpServerReq {
+                    name: "notes".to_owned(),
+                    url: Some(format!("{base}{path}")),
+                    command: Vec::new(),
+                    role: None,
+                    fingerprint: None,
+                    readers: Vec::new(),
+                    trust_annotations: false,
+                    rows: Vec::new(),
+                    token: token.map(str::to_owned),
+                    forget_token: false,
+                },
+            )
+            .expect("saved");
+        };
+        let sent =
+            |path: &str, token: &str| vec![(path.to_owned(), Some(format!("Bearer {token}")))];
+
+        save("/one", Some("tok-1"));
+        let first = mac_tables::read(&data);
+        assert_eq!(used(&platform, &first, &asked).await, sent("/one", "tok-1"));
+
+        save("/one", Some("tok-2"));
+        let rotated = mac_tables::read(&data);
+        assert!(
+            used(&platform, &first, &asked).await.is_empty(),
+            "the read before the rotation never sends its token"
+        );
+        assert_ne!(rotated.mcp, first.mcp, "a new token is a new entry");
+        let mut host = DesktopHost::new(
+            TurnEnv::new(Arc::new(self::platform(root.path()))),
+            data.clone(),
+            "test",
+        );
+        host.built = Some(built_under(Vec::new(), first.clone()));
+        host.scan(DesktopFacts {
+            login: Some("tgorka".to_owned()),
+            device: Some("hesperia".to_owned()),
+            tables: rotated.clone(),
+            ..DesktopFacts::default()
+        })
+        .await;
+        assert!(host.built.is_none(), "the rotation stops the old host");
+        assert_eq!(
+            used(&platform, &rotated, &asked).await,
+            sent("/one", "tok-2")
+        );
+
+        save("/two", None);
+        let moved = mac_tables::read(&data);
+        assert_eq!(used(&platform, &moved, &asked).await, sent("/two", "tok-2"));
+
+        save("/three", Some("tok-3"));
+        let again = mac_tables::read(&data);
+        assert_eq!(
+            used(&platform, &again, &asked).await,
+            sent("/three", "tok-3")
+        );
+        assert!(
+            used(&platform, &moved, &asked).await.is_empty(),
+            "the old URL never gets the new token"
+        );
+
+        mac_tables::remove_server(&data, &platform, "notes").expect("removed");
+        let removed = mac_tables::read(&data);
+        assert!(used(&platform, &removed, &asked).await.is_empty());
+    }
+
+    /// The argument that makes this test binary [`mcp_child_server`].
+    const MCP_CHILD: &str = "keeper-desktop-mcp-child";
+    /// `<this><file>`: the child appends a line to `file` for every call.
+    const MCP_CHILD_CALLS: &str = "keeper-desktop-mcp-calls=";
+    /// The child also lists a tool named with a secret, one named a secret
+    /// alone — a name that travels — and one too long.
+    const MCP_CHILD_ODD: &str = "keeper-desktop-mcp-odd";
+    /// The secret [`MCP_CHILD_ODD`]'s tools are named with.
+    const ODD_SECRET: &str = "ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789";
+
+    /// This test binary as an MCP server over its stdio, when it was
+    /// started with [`MCP_CHILD`]: one tool, `echo`, and with
+    /// [`MCP_CHILD_ODD`] three more — [`ODD_SECRET`], and two whose names
+    /// cannot travel; with [`MCP_CHILD_CALLS`] each call recorded.
+    /// Otherwise nothing.
+    #[test]
+    fn mcp_child_server() {
+        use rmcp::model::{
+            CallToolRequestParams, CallToolResult, ContentBlock, ListToolsResult,
+            PaginatedRequestParams, ServerCapabilities, ServerConfig, Tool,
+        };
+        use rmcp::service::RequestContext;
+        use rmcp::ServiceExt;
+        #[derive(Clone)]
+        struct Child {
+            calls: Option<PathBuf>,
+            odd: bool,
+        }
+        impl rmcp::ServerHandler for Child {
+            fn get_info(&self) -> ServerConfig {
+                ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+            }
+            async fn list_tools(
+                &self,
+                _request: Option<PaginatedRequestParams>,
+                _context: RequestContext<rmcp::RoleServer>,
+            ) -> Result<ListToolsResult, rmcp::ErrorData> {
+                let mut names = vec!["echo".to_owned()];
+                if self.odd {
+                    names.push(format!("read {ODD_SECRET}"));
+                    names.push(ODD_SECRET.to_owned());
+                    names.push("x".repeat(4096));
+                }
+                Ok(ListToolsResult::with_all_items(
+                    names
+                        .into_iter()
+                        .map(|name| Tool::new(name, "Echoes.", Arc::new(serde_json::Map::new())))
+                        .collect(),
+                ))
+            }
+
+            #[allow(deprecated)]
+            async fn call_tool(
+                &self,
+                _request: CallToolRequestParams,
+                _context: RequestContext<rmcp::RoleServer>,
+            ) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
+                if let Some(calls) = &self.calls {
+                    use std::io::Write;
+                    let mut file = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(calls)
+                        .expect("calls");
+                    writeln!(file, "call").expect("recorded");
+                }
+                Ok(CallToolResult::success(vec![ContentBlock::text("echoed")]).into())
+            }
+        }
+        if !std::env::args().any(|arg| arg == MCP_CHILD) {
+            return;
+        }
+        let child = Child {
+            calls: std::env::args()
+                .find_map(|arg| arg.strip_prefix(MCP_CHILD_CALLS).map(PathBuf::from)),
+            odd: std::env::args().any(|arg| arg == MCP_CHILD_ODD),
+        };
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let served = child.serve(rmcp::transport::stdio()).await.expect("served");
+            let _ = served.waiting().await;
+        });
+        std::process::exit(0);
+    }
+
+    /// Save `kid`, this test binary at `program` as [`mcp_child_server`]
+    /// with `extra` arguments, in Settings: the argv saved.
+    fn save_kid(
+        data: &Path,
+        platform: &dyn Platform,
+        program: &Path,
+        extra: &[String],
+    ) -> Vec<String> {
+        use keeper_core::agents::mac_tables::AgentMcpServerReq;
+        let mut argv = vec![
+            program.to_string_lossy().into_owned(),
+            "desktop::tests::mcp_child_server".to_owned(),
+            "--exact".to_owned(),
+            "--nocapture".to_owned(),
+            "--quiet".to_owned(),
+            "--test-threads".to_owned(),
+            "1".to_owned(),
+            MCP_CHILD.to_owned(),
+        ];
+        argv.extend_from_slice(extra);
+        mac_tables::save_server(
+            data,
+            platform,
+            AgentMcpServerReq {
+                name: "kid".to_owned(),
+                url: None,
+                command: argv.clone(),
+                role: None,
+                fingerprint: None,
+                readers: Vec::new(),
+                trust_annotations: false,
+                rows: Vec::new(),
+                token: None,
+                forget_token: false,
+            },
+        )
+        .expect("saved");
+        argv
+    }
+
+    /// Q10, R225: a program saved on this Mac is known the way agentd's
+    /// are — its argv's program resolved to an absolute path and hashed as
+    /// it is started — and Settings lists it as that very program, the one
+    /// an approval of its tools binds: saved through a link, it is listed
+    /// by the file the link resolves to and that file's SHA-256.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_saved_program_is_listed_as_it_was_started() {
+        use keeper_core::agents::mac_tables::{AgentMcpStartedVm, Hosted};
+        let root = tempfile::tempdir().expect("tempdir");
+        let platform = platform(root.path());
+        let data = root.path().join("data");
+        let real = root.path().join("bin").join("kid");
+        std::fs::create_dir_all(real.parent().expect("bin")).expect("bin");
+        std::fs::copy(std::env::current_exe().expect("this test binary"), &real).expect("copy");
+        let real = std::fs::canonicalize(real).expect("real");
+        let link = root.path().join("kid-link");
+        std::os::unix::fs::symlink(&real, &link).expect("link");
+        let sha256 =
+            keeper_core::agents::approval::sha256_hex(&std::fs::read(&real).expect("bytes"));
+        let argv = save_kid(&data, &platform, &link, &[]);
+        let tables = mac_tables::read(&data);
+        let servers = mac_servers(&platform, &tables);
+        servers.refresh().await;
+
+        let binding = servers
+            .listed(&["kid".to_owned()])
+            .into_iter()
+            .find(|listed| listed.tool == "echo")
+            .and_then(|listed| listed.binding())
+            .expect("offered");
+        assert_eq!(binding["program"], real.to_string_lossy().as_ref());
+        assert_eq!(binding["program_sha256"], sha256.as_str());
+        let heard = heard(&servers);
+        let listed = mac_tables::listing(
+            &data,
+            &platform,
+            Some(Hosted {
+                revision: tables.revision,
+                heard: &heard,
+            }),
+            &|_| None,
+        )
+        .expect("listing");
+        let kid = &listed.servers[0];
+        assert!(kid.answers, "{kid:?}");
+        assert_eq!(kid.command, argv, "the argv as saved");
+        assert_eq!(
+            kid.started,
+            Some(AgentMcpStartedVm {
+                path: real.to_string_lossy().into_owned(),
+                sha256,
+            }),
+            "listed as the program the approval binds"
+        );
+    }
+
+    /// R258: the Mac's calls go through rung 2's admission like agentd's.
+    /// A save builds the host's servers again; the tool the servers built
+    /// before it listed — the same program, tool, definition and tier — is
+    /// refused by the servers built after: no child is called at all. Their
+    /// own listing of it is sent, and called exactly once.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_tool_listed_before_a_rebuild_is_never_sent_after_it() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let platform = platform(root.path());
+        let data = root.path().join("data");
+        let calls = root.path().join("calls");
+        save_kid(
+            &data,
+            &platform,
+            &std::env::current_exe().expect("this test binary"),
+            &[format!("{MCP_CHILD_CALLS}{}", calls.display())],
+        );
+        let called = || {
+            std::fs::read_to_string(&calls)
+                .unwrap_or_default()
+                .lines()
+                .count()
+        };
+        let tables = mac_tables::read(&data);
+        let echo = |servers: &McpServers| {
+            servers
+                .listed(&["kid".to_owned()])
+                .into_iter()
+                .find(|listed| listed.tool == "echo")
+                .expect("offered")
+        };
+        let before = mac_servers(&platform, &tables);
+        before.refresh().await;
+        let after = mac_servers(&platform, &tables);
+        after.refresh().await;
+        let (stale, own) = (echo(&before), echo(&after));
+        assert_eq!(
+            stale.binding(),
+            own.binding(),
+            "only the connection differs"
+        );
+
+        let (_keep, signal) = keeper_core::bots::chat::cancellation();
+        after
+            .call(&stale, serde_json::Map::new(), signal)
+            .await
+            .expect_err("listed over another connection");
+        assert_eq!(called(), 0, "the stale listing reached no child");
+        let (_keep, signal) = keeper_core::bots::chat::cancellation();
+        after
+            .call(&own, serde_json::Map::new(), signal)
+            .await
+            .expect("its own connection");
+        assert_eq!(called(), 1, "its own listing is called once");
+    }
+
+    /// R225, R96MM2-03, R96MM3-01: what a server writes of its tools
+    /// reaches Settings as the host's status writes it. A live listing with
+    /// a tool named with a secret, one named that secret alone — a name
+    /// that travels — and one of 4 KiB. In the sheet of the entry with a
+    /// row on the secret-named tool, of it made a role server, and of it
+    /// read with no host built on its tables, neither the secret nor the
+    /// long name is in a name, refusal or conflict Settings shows, nor in
+    /// the serialized listing; the secret-named tool's exact name still
+    /// picks its row, and the untravelled ones carry none; `echo` reads as
+    /// listed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_listed_tool_reaches_settings_redacted_and_bounded() {
+        use keeper_core::agents::mac_tables::{AgentMcpRowVm, AgentMcpServerReq, Hosted};
+        let root = tempfile::tempdir().expect("tempdir");
+        let platform = platform(root.path());
+        let data = root.path().join("data");
+        let argv = save_kid(
+            &data,
+            &platform,
+            &std::env::current_exe().expect("this test binary"),
+            &[MCP_CHILD_ODD.to_owned()],
+        );
+        let tables = mac_tables::read(&data);
+        let servers = mac_servers(&platform, &tables);
+        servers.refresh().await;
+        let heard = heard(&servers);
+        let hosted = Hosted {
+            revision: tables.revision,
+            heard: &heard,
+        };
+        let listed =
+            mac_tables::listing(&data, &platform, Some(hosted), &|_| None).expect("listing");
+        assert!(listed.servers[0].answers, "{:?}", listed.servers[0]);
+        let sheet = |hosted: Option<Hosted<'_>>, role: Option<&str>| {
+            let req = AgentMcpServerReq {
+                name: "kid".to_owned(),
+                url: None,
+                command: argv.clone(),
+                role: role.map(str::to_owned),
+                fingerprint: None,
+                readers: Vec::new(),
+                trust_annotations: false,
+                rows: vec![AgentMcpRowVm {
+                    tool: ODD_SECRET.to_owned(),
+                    tier: "T1".to_owned(),
+                }],
+                token: None,
+                forget_token: false,
+            };
+            mac_tables::draft(&data, hosted, req, &crate::mcp::diagnostic).expect("draft")
+        };
+
+        let ordinary = sheet(Some(hosted), None);
+        assert_eq!(ordinary.tools.len(), 4, "{ordinary:?}");
+        assert_eq!(ordinary.tools[0].tool.as_deref(), Some("echo"));
+        assert_eq!(ordinary.tools[0].shown, "echo");
+        assert!(ordinary.tools[0].word.is_some());
+        assert_eq!(
+            ordinary.tools[2].tool.as_deref(),
+            Some(ODD_SECRET),
+            "its row's"
+        );
+        assert!(ordinary.tools[2].word.is_some(), "{ordinary:?}");
+        for refused in [&ordinary.tools[1], &ordinary.tools[3]] {
+            assert_eq!(refused.tool, None);
+            assert!(refused.refusal.is_some());
+        }
+        let as_role = sheet(Some(hosted), Some("paseo"));
+        assert_eq!(as_role.tools[2].tool.as_deref(), Some(ODD_SECRET));
+        assert!(as_role.tools[2].refusal.is_some(), "{as_role:?}");
+        assert_eq!(as_role.conflicts.len(), 1, "{as_role:?}");
+        assert_eq!(as_role.conflicts[0].tool, ODD_SECRET, "what Drop matches");
+        let unhosted = sheet(None, None);
+        assert_eq!(unhosted.tools.len(), 1, "{unhosted:?}");
+        assert_eq!(unhosted.tools[0].tool.as_deref(), Some(ODD_SECRET));
+
+        let long = "x".repeat(600);
+        for sheet in [&ordinary, &as_role, &unhosted] {
+            let shown = sheet
+                .tools
+                .iter()
+                .flat_map(|tool| [Some(tool.shown.as_str()), tool.refusal.as_deref()])
+                .flatten()
+                .chain(sheet.conflicts.iter().map(|row| row.shown.as_str()));
+            for text in shown {
+                assert!(!text.contains(ODD_SECRET), "{text}");
+                assert!(!text.contains(&long), "unbounded: {} bytes", text.len());
+            }
+        }
+        let json = serde_json::to_string(&listed).expect("json");
+        assert!(!json.contains(ODD_SECRET), "{json}");
+        assert!(!json.contains(&long), "unbounded: {} bytes", json.len());
     }
 
     /// R87, R194: the trust anchor is judged before anything a scan reads
@@ -1364,7 +2137,7 @@ mod tests {
                 "test",
             );
             assert!(store::list_providers(&data_dir).is_err(), "{what}");
-            host.built = Some(built_under(vec![tgorka(true)]));
+            host.built = Some(built_under(vec![tgorka(true)], MacTables::default()));
             host.scan(DesktopFacts {
                 login: Some("tgorka".to_owned()),
                 device: Some("hesperia".to_owned()),
