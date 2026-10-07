@@ -305,6 +305,7 @@ async fn ask_human_round_trip_on_synapse() {
         title: "smoke".to_owned(),
         requested_by: person.clone(),
         parent: None,
+        reply: None,
         room: dm.clone(),
         drives: vec!["smoke".to_owned()],
         label: Label::opening(&decl, Integrity::Owner),

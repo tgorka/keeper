@@ -434,7 +434,7 @@ pub fn steward_session_id(drive: &str, agent: &str, duty: &str) -> Ulid {
     derived_session_id(drive, agent, duty)
 }
 
-fn derived_session_id(drive: &str, agent: &str, name: &str) -> Ulid {
+pub(crate) fn derived_session_id(drive: &str, agent: &str, name: &str) -> Ulid {
     let digest =
         Sha256::digest(format!("keeper.agents.session\n{drive}\n{agent}\n{name}").as_bytes());
     let mut bytes = [0u8; 16];

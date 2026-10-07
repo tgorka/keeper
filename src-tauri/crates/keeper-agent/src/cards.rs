@@ -145,6 +145,31 @@ pub fn write_run(
     )
 }
 
+/// Take `schedule:` off the card at `rel` of the session at `session`, so
+/// it runs no more: what the host writes when the work it followed has
+/// ended. Whether it wrote: a card with no schedule is left as it is.
+pub fn end_schedule(
+    zone: &Path,
+    session: &str,
+    rel: &str,
+    may_write: &dyn Fn() -> bool,
+) -> Result<bool, VerbError> {
+    let held = exec::hold(zone)?;
+    rewrite(
+        &held,
+        session,
+        rel,
+        "card-end-schedule",
+        |text| {
+            let (frontmatter, _) = Frontmatter::parse(text);
+            let scheduled = frontmatter.keys().any(|key| key == card::SCHEDULE);
+            Ok(scheduled.then(|| Frontmatter::remove_all_in(text, card::SCHEDULE)))
+        },
+        may_write,
+        &mut |_| {},
+    )
+}
+
 /// [`write_run`] of `run: blocked` alone, saying the card's exact bytes
 /// before and after the write — what a park re-pins by (R178); `None` when
 /// the card said so already.
@@ -1014,6 +1039,12 @@ mod tests {
         fn session_budget(&self) -> Option<(u64, u64)> {
             None
         }
+        fn paseo_started(&self, _: &str) -> std::collections::BTreeSet<String> {
+            std::collections::BTreeSet::new()
+        }
+        fn paseo_ended(&self) -> Option<keeper_core::agents::log::PaseoBody> {
+            None
+        }
     }
 
     fn view(integrity: Integrity) -> View {
@@ -1808,6 +1839,7 @@ mod tests {
             title: "schedule".to_owned(),
             requested_by: tgorka(),
             parent: None,
+            reply: None,
             room: OwnedRoomId::try_from("!r:h").expect("room"),
             drives: vec!["tgdrive".to_owned()],
             label: Label::opening(&decl, Integrity::Owner),

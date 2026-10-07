@@ -1,0 +1,79 @@
+{
+  "provenance": {
+    "source": "makistack docker/superset-host/paseo-mcp.py, VERBS (lines 487-538), served by Handler._dispatch's tools/list (lines 859-874); the four asserted at line 541",
+    "commit": "82e4f8ce53180f3435a9b224f8e20f85daea1830",
+    "server": {
+      "name": "paseo-mcp",
+      "version": "1.0.0",
+      "protocolVersion": "2025-06-18"
+    },
+    "how": "the broker module imported and its VERBS table serialised exactly as tools/list answers it, sorted by name; nothing edited",
+    "recorded": "2026-10-07"
+  },
+  "result": {
+    "tools": [
+      {
+        "name": "create_agent",
+        "description": "Start a Paseo coding agent whose product is a pull request. The provider is pinned by the broker; supplying provider, model, argv or cwd is rejected.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "prompt": {
+              "type": "string",
+              "description": "what the agent should do"
+            },
+            "workspace": {
+              "type": "string",
+              "description": "workspaceId or workspace name; omit for the current workspace"
+            }
+          },
+          "required": ["prompt"],
+          "additionalProperties": false
+        }
+      },
+      {
+        "name": "get_agent_status",
+        "description": "Metadata for one Paseo agent. Returns no logs and no repository content.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "agentId": {
+              "type": "string",
+              "description": "id from list_agents"
+            }
+          },
+          "required": ["agentId"],
+          "additionalProperties": false
+        }
+      },
+      {
+        "name": "list_agents",
+        "description": "List the Paseo agents on this host as metadata only (id, workspace, title, status, provider, timestamps, PR url).",
+        "inputSchema": {
+          "type": "object",
+          "properties": {},
+          "additionalProperties": false
+        }
+      },
+      {
+        "name": "send_agent_prompt",
+        "description": "Send a follow-up prompt to an existing Paseo agent.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "agentId": {
+              "type": "string",
+              "description": "id from list_agents"
+            },
+            "prompt": {
+              "type": "string",
+              "description": "the follow-up"
+            }
+          },
+          "required": ["agentId", "prompt"],
+          "additionalProperties": false
+        }
+      }
+    ]
+  }
+}

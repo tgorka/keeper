@@ -345,10 +345,9 @@ pub struct Hints {
 /// screen's and a KVM's tables are their stories' (96.4, 96.5), and until
 /// they are built no tool of theirs is offered.
 fn role_row(role: &McpRole, tool: &str) -> Option<Tier> {
-    match (role, tool) {
-        (McpRole::Paseo, "list_agents" | "get_agent_status") => Some(Tier::T0),
-        (McpRole::Paseo, "create_agent" | "send_agent_prompt") => Some(Tier::T3),
-        (McpRole::Paseo | McpRole::Screen | McpRole::Kvm(_), _) => None,
+    match role {
+        McpRole::Paseo => crate::agents::paseo::row(tool),
+        McpRole::Screen | McpRole::Kvm(_) => None,
     }
 }
 
@@ -363,11 +362,16 @@ fn role_row(role: &McpRole, tool: &str) -> Option<Tier> {
 /// `Err` is why the tool is not offered.
 pub fn tier(entry: &McpEntry, tool: &str, hints: Option<Hints>) -> Result<Tier, String> {
     let tier = match &entry.role {
-        Some(role) => role_row(role, tool).ok_or_else(|| {
-            format!(
+        Some(role) => role_row(role, tool).ok_or_else(|| match role {
+            McpRole::Paseo => format!(
+                "`{}` is Paseo's broker, and {}: `{tool}` is not one of them",
+                entry.name,
+                crate::agents::paseo::FOUR_VERBS
+            ),
+            McpRole::Screen | McpRole::Kvm(_) => format!(
                 "`{}` is a role server, and its role has no tool `{tool}`",
                 entry.name
-            )
+            ),
         })?,
         None => match entry.tiers.iter().find(|(named, _)| named == tool) {
             Some((_, tier)) => *tier,
@@ -412,10 +416,17 @@ pub struct Program {
 /// transport and, for a `url` server, the whole URL as parsed — scheme,
 /// host, port, path and query — or, for a `command` server, its argv, the
 /// absolute program it resolved to and that program's SHA-256; and its
-/// pinned certificate. `Err` for a `command` server without its program:
-/// no identity is made up.
+/// pinned certificate; and its role, which decides what its calls are. `Err`
+/// for a `command` server without its program: no identity is made up.
 pub fn identity(entry: &McpEntry, program: Option<&Program>) -> Result<Value, String> {
     let mut out = json!({ "server": entry.name });
+    if let Some(role) = &entry.role {
+        out["role"] = json!(match role {
+            McpRole::Paseo => "paseo".to_owned(),
+            McpRole::Screen => "screen".to_owned(),
+            McpRole::Kvm(id) => format!("kvm:{id}"),
+        });
+    }
     match &entry.transport {
         McpTransport::Url(url) => {
             out["transport"] = json!("url");
@@ -496,7 +507,8 @@ pub fn untrusted_refusal(entry: &McpEntry, tool: &str, integrity: Integrity) -> 
 /// words and schema, never the server's (S-14), so offering it brings no
 /// outside text into the prompt. `None` for a tool the role has no row for.
 pub fn role_spec(role: &McpRole, tool: &str) -> Option<(&'static str, Value)> {
-    let agent_id = json!({"type": "string", "description": "an agentId list_agents returned"});
+    let own_run = json!({"type": "string", "description": "the agentId this session's own create_agent on this broker was answered with — a follow session's own run; any other run's status is not asked for"});
+    let agent_id = json!({"type": "string", "description": "the agentId of the run to steer"});
     let prompt = json!({"type": "string", "description": "what the coding agent should do"});
     let (description, properties, required) = match (role, tool) {
         (McpRole::Paseo, "list_agents") => (
@@ -505,12 +517,12 @@ pub fn role_spec(role: &McpRole, tool: &str) -> Option<(&'static str, Value)> {
             json!([]),
         ),
         (McpRole::Paseo, "get_agent_status") => (
-            "One Paseo coding run's status and pull request link, no logs.",
-            json!({"agentId": agent_id}),
+            "One Paseo coding run's status and pull request link, no logs: only for a run this session's own create_agent started on this broker.",
+            json!({"agentId": own_run}),
             json!(["agentId"]),
         ),
         (McpRole::Paseo, "create_agent") => (
-            "Start a Paseo coding run whose product is a pull request a person reviews; a person approves each start.",
+            "Start a Paseo coding run whose product is a pull request a person reviews; a person approves each start, and following the run waits for a person to allow its follow card.",
             json!({
                 "prompt": prompt,
                 "workspace": {"type": "string", "description": "a workspaceId or name; omit for the current workspace"},
@@ -518,7 +530,7 @@ pub fn role_spec(role: &McpRole, tool: &str) -> Option<(&'static str, Value)> {
             json!(["prompt"]),
         ),
         (McpRole::Paseo, "send_agent_prompt") => (
-            "Send a follow-up prompt to a Paseo coding run; a person approves each prompt.",
+            "Send a follow-up prompt to a Paseo coding run; a person approves each prompt. A session that read Paseo's answers cannot steer: steer from a fresh session or main.",
             json!({"agentId": agent_id, "prompt": prompt}),
             json!(["agentId", "prompt"]),
         ),
@@ -538,12 +550,20 @@ pub fn role_spec(role: &McpRole, tool: &str) -> Option<(&'static str, Value)> {
 /// The card's sentence for a call (96.2 #12, S-10): *`<server>`: `<tool>`*
 /// and the names of its arguments, from what keeper bound — never a value,
 /// which the payload shows, nor the tool's description or the model's
-/// words.
+/// words. A Paseo broker's call says what it starts or steers and, for a
+/// mutation, who the prompt goes to as the binding holds it (96.3 #2).
 pub fn summary(args: &Value, exec_binding: &Value) -> String {
     let shown = crate::agents::run::shown;
     let Some((server, tool)) = bound_tool(exec_binding) else {
         return "Call a tool of an MCP server".to_owned();
     };
+    if exec_binding["role"] == "paseo" {
+        if let Some(summary) =
+            crate::agents::paseo::summary(tool, args, exec_binding.get("readers"))
+        {
+            return summary;
+        }
+    }
     let mut out = format!("`{}`: `{}`", shown(server), shown(tool));
     let names: Vec<String> = args
         .as_object()
