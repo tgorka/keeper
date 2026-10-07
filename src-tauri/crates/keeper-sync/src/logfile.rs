@@ -44,18 +44,50 @@ pub const LOG_GENERATIONS: u32 = 2;
 /// is per path per lookup and says the same thing every time; an `ERROR` is
 /// still one line a person needs), and `gix_dir`, the directory walker, to
 /// `warn` — it emits an `INFO` per pruned directory on a walk that visits
-/// 155 626 entries. Keeper's own targets are untouched, and `RUST_LOG`, when
-/// set, replaces the whole string: a person debugging gix wants gix.
+/// 155 626 entries. `rmcp`, the MCP client, is off: at every level it may
+/// write a message an MCP server sent, whole and unredacted, and keeper's
+/// own lines say what a person needs of each server, redacted. Keeper's own
+/// targets are untouched, and `RUST_LOG`, when set, replaces the rest of
+/// the string ([`filter`]): a person debugging gix wants gix.
 pub const LOG_TARGET_DIRECTIVES: &str =
-    "gix_attributes=error,gix_worktree_state=error,gix_dir=warn";
+    "gix_attributes=error,gix_worktree_state=error,gix_dir=warn,rmcp=off";
+
+/// What `rmcp` is held to whatever a person asks for.
+const RMCP_OFF: &str = "rmcp=off";
 
 /// The default `EnvFilter` directive for a host whose base level is `level`.
 ///
-/// `RUST_LOG` is still consulted first by every caller and wins whole; this
-/// is only what a host starts from when nobody said otherwise. Keeper's own
-/// crates read at `level`; the gitoxide targets above are held down.
+/// Only what a host starts from when nobody said otherwise ([`filter`]).
+/// Keeper's own crates read at `level`; the gitoxide targets above are held
+/// down.
 pub fn default_filter(level: &str) -> String {
     format!("{level},{LOG_TARGET_DIRECTIVES}")
+}
+
+/// The `EnvFilter` directives a host installs: `rust_log` (its `RUST_LOG`)
+/// when it is set, else [`default_filter`] at `level`. Either way `rmcp`
+/// stays off — a directive of `rust_log` naming it is dropped, and so is a
+/// span directive whose target could be rmcp's, since a matched span turns
+/// on every event inside it past any target's `off` — since verbosity a
+/// person asks for is not leave to write what an MCP server sent,
+/// unredacted, into a log.
+pub fn filter(rust_log: Option<&str>, level: &str) -> String {
+    let Some(asked) = rust_log.filter(|asked| !asked.trim().is_empty()) else {
+        return default_filter(level);
+    };
+    let mut kept: Vec<&str> = asked
+        .split(',')
+        .filter(|directive| {
+            let directive = directive.trim();
+            let target = directive.split(['[', '=']).next().unwrap_or_default();
+            // A directive's target matches every target it begins.
+            let names_rmcp = target.starts_with("rmcp");
+            let spans_rmcp = directive.contains('[') && "rmcp".starts_with(target);
+            !names_rmcp && !spans_rmcp
+        })
+        .collect();
+    kept.push(RMCP_OFF);
+    kept.join(",")
 }
 
 /// One open handle on a log file that rotates itself past
@@ -294,30 +326,14 @@ mod tests {
         assert_eq!(std::fs::read(&path).expect("the log came back"), b"two\n");
     }
 
-    /// The daemon's and the app's default filter holds the two chattering
-    /// gitoxide targets down while keeper's own `INFO` still passes
-    /// (Epic 70, F-db-8).
-    #[test]
-    fn the_default_filter_silences_gix_attributes_warnings_and_keeps_keepers_info() {
+    /// Whether `directives`, as a host installs them, let an event of
+    /// `target` at `level` through.
+    fn lets_through(directives: &str, target: &'static str, level: tracing::Level) -> bool {
         use tracing_subscriber::layer::SubscriberExt as _;
 
-        let filter: tracing_subscriber::EnvFilter = default_filter("info")
-            .parse()
-            .expect("the default filter is a valid directive set");
+        let filter: tracing_subscriber::EnvFilter =
+            directives.parse().expect("a valid directive set");
         let registry = tracing_subscriber::registry().with(filter);
-
-        fn metadata(target: &'static str, level: tracing::Level) -> tracing::Metadata<'static> {
-            tracing::Metadata::new(
-                "event",
-                target,
-                level,
-                None,
-                None,
-                None,
-                tracing::field::FieldSet::new(&[], tracing::callsite::Identifier(&CALLSITE)),
-                tracing::metadata::Kind::EVENT,
-            )
-        }
         struct Callsite;
         impl tracing::callsite::Callsite for Callsite {
             fn set_interest(&self, _: tracing::subscriber::Interest) {}
@@ -326,11 +342,26 @@ mod tests {
             }
         }
         static CALLSITE: Callsite = Callsite;
+        let meta = tracing::Metadata::new(
+            "event",
+            target,
+            level,
+            None,
+            None,
+            None,
+            tracing::field::FieldSet::new(&[], tracing::callsite::Identifier(&CALLSITE)),
+            tracing::metadata::Kind::EVENT,
+        );
+        tracing::Subscriber::enabled(&registry, &meta)
+    }
 
-        let enabled = |target, level| {
-            let meta = metadata(target, level);
-            tracing::Subscriber::enabled(&registry, &meta)
-        };
+    /// The daemon's and the app's default filter holds the two chattering
+    /// gitoxide targets down while keeper's own `INFO` still passes
+    /// (Epic 70, F-db-8).
+    #[test]
+    fn the_default_filter_silences_gix_attributes_warnings_and_keeps_keepers_info() {
+        let directives = default_filter("info");
+        let enabled = |target, level| lets_through(&directives, target, level);
         assert!(
             !enabled("gix_attributes::search::attributes", tracing::Level::WARN),
             "the 1 314 669-line target is held to error"
@@ -350,5 +381,72 @@ mod tests {
             "keeper's own lines are untouched"
         );
         assert!(!enabled("keeper_sync::engine", tracing::Level::DEBUG));
+        // An MCP server's message, as rmcp would log it, reaches no log.
+        assert!(!enabled("rmcp::service", tracing::Level::ERROR));
+    }
+
+    /// The targets of the two `INFO` events `directives` let through, both
+    /// inside the span rmcp serves a connection in (`serve_inner`): rmcp's,
+    /// as it logs a server's notification whole, and keeper's own.
+    fn through_in_rmcps_span(directives: &str) -> Vec<String> {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        #[derive(Clone, Default)]
+        struct Seen(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Seen {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                self.0
+                    .lock()
+                    .expect("seen")
+                    .push(event.metadata().target().to_owned());
+            }
+        }
+        let seen = Seen::default();
+        let filter: tracing_subscriber::EnvFilter =
+            directives.parse().expect("a valid directive set");
+        let subscriber = tracing_subscriber::registry()
+            .with(filter)
+            .with(seen.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!(target: "rmcp::service", "serve_inner");
+            let _in = span.enter();
+            tracing::info!(target: "rmcp::service", "a server's notification");
+            tracing::info!(target: "keeper_agent::mcp", "keeper's own line");
+        });
+        let through = seen.0.lock().expect("seen").clone();
+        through
+    }
+
+    /// R225, R238: a person's `RUST_LOG` replaces the default — gix at
+    /// trace if they ask — but never lets `rmcp` write an MCP server's
+    /// messages: not when it names `rmcp`, nor through a span directive
+    /// that matches rmcp's own span.
+    #[test]
+    fn rust_log_never_turns_rmcp_on() {
+        for asked in [
+            "info",
+            "trace",
+            "rmcp=trace,info",
+            "info,rmcp::service=info",
+            "info,rmcp[serve_inner]=info",
+            "info,[serve_inner]=trace",
+            "info,rm[serve_inner]=trace",
+        ] {
+            let directives = filter(Some(asked), "warn");
+            assert_eq!(
+                through_in_rmcps_span(&directives),
+                ["keeper_agent::mcp"],
+                "{asked}: {directives}"
+            );
+        }
+        assert!(lets_through(
+            &filter(Some("gix_attributes=trace,info"), "warn"),
+            "gix_attributes::search::attributes",
+            tracing::Level::TRACE
+        ));
     }
 }

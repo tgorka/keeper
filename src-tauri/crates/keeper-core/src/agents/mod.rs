@@ -30,6 +30,7 @@ pub mod knowledge;
 pub mod label;
 pub mod log;
 pub mod matrix;
+pub mod mcp;
 pub mod memory;
 pub mod mount;
 pub mod nudge;

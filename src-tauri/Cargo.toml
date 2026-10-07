@@ -324,6 +324,21 @@ libc = "0.2"
 # raw number safely, which std and rustix do not, so keeper's code stays free
 # of `unsafe` (R141). No feature: `unistd` is always built. MIT.
 nix = { version = "0.31", default-features = false }
+# An agent's MCP servers (AD-406): keeper is a client only. The streamable HTTP
+# transport rides the workspace's reqwest 0.13 (rmcp's own `reqwest` TLS feature
+# stays off, so rustls is the one TLS stack); the child-process transport is
+# compiled everywhere and refused at use where the host may not spawn.
+# `Apache-2.0`; `cargo deny check licenses bans sources` from `src-tauri/`
+# passes with it (R157). The server half and its HTTP service are
+# keeper-agent's dev-dependencies only, for in-test servers.
+rmcp = { version = "3.5", default-features = false }
+# The event-stream parser rmcp itself uses, under keeper's own bounded MCP HTTP
+# client (every body and event read only up to a bound). Already in Cargo.lock
+# at 0.2.6; `MIT OR Apache-2.0`.
+sse-stream = "0.2"
+# Serves an in-test MCP server's tower service over HTTP. Already in Cargo.lock
+# at 0.8.9; MIT.
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 # Exact-length streaming request bodies for LFS uploads (Story 25.3). This is
 # not optional sugar: `reqwest::Body::wrap_stream` and `Body::from(File)` both
 # yield an unknown-size body and therefore `Transfer-Encoding: chunked`, which

@@ -692,6 +692,15 @@ pub fn label_outside() -> Label {
     }
 }
 
+/// Content from outside whose audience is configured: an MCP server's
+/// answer, read by the server's `readers` (AD-406, R24(1)).
+pub fn label_outside_read_by(readers: Readers) -> Label {
+    Label {
+        readers,
+        ..label_outside()
+    }
+}
+
 /// Why a session's label changed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

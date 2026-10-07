@@ -286,7 +286,8 @@ pub(crate) struct Parking {
     /// A flow its sinks blocked: the `declassify` action's arguments, the
     /// call itself added once its wire is known (R89).
     pub declassify: Option<Value>,
-    /// A `run`'s `exec_binding` (AD-393); `null` for every other call.
+    /// A `run`'s or an MCP call's `exec_binding` (AD-393, R144); `null` for
+    /// every other call.
     pub exec_binding: Value,
     /// A networked `run`'s workspace set, its `preconditions.workspace`
     /// (S-03).
@@ -1693,14 +1694,20 @@ impl ServedSession {
         );
         let checked: Result<Checked, (String, ApprovalState)> = match self.read_record(deps, id) {
             Err(reason) => Err((reason, ApprovalState::Refused)),
-            Ok((record, args)) => self
-                .preconditions(deps, pending, &record, &args, decision)
-                .map(|()| {
-                    let run = approved_run(&record);
-                    let allowance = run_allowance(&record, decision);
-                    let (call, released) = bound_call(&record, args);
-                    (call, released, run, allowance)
-                }),
+            Ok((record, args)) => match self.preconditions(deps, pending, &record, &args, decision)
+            {
+                Err(drifted) => Err(drifted),
+                // The MCP server is asked again now, before `consumed`.
+                Ok(()) => match mcp_moved(deps, &record).await {
+                    Some(reason) => Err((reason, ApprovalState::Refused)),
+                    None => {
+                        let run = approved_run(&record);
+                        let allowance = run_allowance(&record, decision);
+                        let (call, released) = bound_call(&record, args);
+                        Ok((call, released, run, allowance))
+                    }
+                },
+            },
         };
         let call = match checked {
             Ok(call) => call,
@@ -2219,10 +2226,12 @@ impl ServedSession {
     }
 }
 
-/// What a consumed `run` record was checked against; `None` for every
-/// other tool.
+/// What a consumed `run` or MCP record was checked against; `None` for
+/// every other tool.
 fn approved_run(record: &ApprovalRecord) -> Option<Box<ApprovedRun>> {
-    (record.action.tool == AgentTool::Run.as_wire()).then(|| {
+    (record.action.tool == AgentTool::Run.as_wire()
+        || record.action.tool == AgentTool::Mcp.as_wire())
+    .then(|| {
         Box::new(ApprovedRun {
             exec_binding: record.action.exec_binding.clone(),
             workspace: record.preconditions.workspace.clone(),
@@ -2273,13 +2282,57 @@ fn bound_call(record: &ApprovalRecord, args: Value) -> (chat::ToolCall, Option<R
         };
         return (call, Some(released));
     }
+    // An MCP call is rebuilt under the wire name of the server and tool its
+    // record bound (R144).
+    let name = if record.action.tool == AgentTool::Mcp.as_wire() {
+        keeper_core::agents::mcp::bound_tool(&record.action.exec_binding)
+            .and_then(|(server, tool)| keeper_core::agents::mcp::wire_name(server, tool).ok())
+            .unwrap_or_default()
+    } else {
+        record.action.tool.clone()
+    };
     let call = chat::ToolCall {
         id: record.call.call_id.clone(),
-        name: record.action.tool.clone(),
+        name,
         arguments_raw: args.to_string(),
         arguments: Some(args),
     };
     (call, None)
+}
+
+/// What an MCP call's record relied on, read from the server itself before
+/// its approval is consumed (R144's MCP part): the agent still lists the
+/// server, the host still names it, and the server — asked for its tools
+/// again now, connected anew if its connection is gone — answers, offers
+/// the tool, and binds what the record bound: the same server identity
+/// (endpoint, or argv and program bytes), the same tool definition, the
+/// same tier. Anything else, a record naming no server included, is drift.
+async fn mcp_moved(deps: &AgentDeps, record: &ApprovalRecord) -> Option<String> {
+    if record.action.tool != AgentTool::Mcp.as_wire() {
+        return None;
+    }
+    let bound = &record.action.exec_binding;
+    let moved = |what: &str| {
+        tracing::warn!(approval = %record.id, "agents: an MCP call's server changed after its approval");
+        Some(what.to_owned())
+    };
+    let Some((server, tool)) = keeper_core::agents::mcp::bound_tool(bound) else {
+        return moved("its record names no MCP server and tool");
+    };
+    let Some(servers) = deps
+        .mcp
+        .as_ref()
+        .filter(|_| deps.home.config.mcp.iter().any(|name| name == server))
+    else {
+        return moved("this host or this agent no longer names its MCP server");
+    };
+    match servers.fresh_binding(server, tool).await {
+        Err(reason) => moved(&reason),
+        Ok(now) if &now != bound => moved(
+            "which MCP server it reaches, or what the server says the tool takes or is, changed after it was approved",
+        ),
+        Ok(_) => None,
+    }
 }
 
 /// What the model is told of an approval consumed on `host` whose call has

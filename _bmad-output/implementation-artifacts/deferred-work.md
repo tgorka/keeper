@@ -9116,3 +9116,137 @@ location: `src-tauri/crates/keeper-core/src/agents/run.rs` (`tests::busybox_nice
 reason: the parser tables do not exercise the shortest unset abbreviation `--u`, and their BusyBox `nice` `--` row puts `--` after an adjustment, never first (BusyBox 1.37's `nice_main` does not take a first `--` as an option terminator; it reaches the numeric adjustment parse). The real-process test exercises three unset spellings (separate, attached, long), not every cluster or abbreviation. The omitted forms were checked by source inspection only (review-96run-6.md), not executed; no bypass is established. The R269 As-built row 02 says "every spelling refused" where the table covers a named matrix.
 fix: Add `--u NAME=value` and `--u=NAME=value` rows to `an_unset_name_holding_a_value_is_refused` and a first-position `busybox nice -- …` row to `busybox_nice_reads_one_adjustment_then_its_program`; narrow the As-built phrase to the forms the tables name.
 status: open (R301: low, coverage only, under the convergence policy)
+
+### DW-810: An MCP server with a pinned certificate (`fingerprint`) is not connected to.
+
+origin: epic 96, story 96.2 (rung `agents-96-mcp`, 2026-10-07)
+location: `src-tauri/crates/keeper-agent/src/mcp.rs` (`Server::connect`)
+reason: `[[mcp]] fingerprint` parses (`sha256:` and 64 hex), but keeper-agent has no rustls verifier that accepts exactly the pinned certificate yet (codemap §1.2 names 96.5's KVM verifier for it). Rather than connect over the system roots and ignore the pin, a server with a `fingerprint` is reported as not answering ("a pinned certificate is not yet checked for MCP servers") and never offered. Close with the pinned verifier (96.5's, `dangerous()` builder, no `danger_accept_invalid_certs`) handed to the reqwest client of that server, and an in-test TLS server with a self-signed certificate.
+status: open
+
+### DW-811: An MCP call its sink blocks is refused, never parked as a declassification.
+
+origin: epic 96, story 96.2 (rung `agents-96-mcp`, 2026-10-07)
+location: `src-tauri/crates/keeper-agent/src/agent.rs` (`AllowedTools::mcp_call`), `src-tauri/crates/keeper-core/src/agents/label.rs` (`Destination`)
+reason: 96.2 #8 asks that a call to a server whose `readers` the session's label does not reach be blocked with the reason and nothing sent; R145 keeps a call to a `*` server blocked. A server with finite readers wider than the label could be let through by a person (R191's `declassify` park), but `Destination` has no external-server arm and the call's bytes have no canonical effect yet, so the call is refused with the sink's sentence. Close with a `Destination::External { name }`, the call's canonical bytes as the effect, and `CallAudit::lifting` on the MCP path.
+status: open
+
+### DW-812: A `screen` or `kvm:<id>` role server offers no tool until its table is built.
+
+origin: epic 96, story 96.2 (rung `agents-96-mcp`, 2026-10-07)
+location: `src-tauri/crates/keeper-core/src/agents/mcp.rs` (`role_row`)
+reason: a role server takes its role's table and nothing else (96.2 #6). Paseo's four rows are here (R24(2)); the screen table over Peekaboo's 27 tools is 96.4's (Q11, R151) and a KVM's MCP table is 96.5's, so until those rungs every tool of such a server is listed as not offered, with why. Close in `agents-96-screen` and `agents-96-kvm`.
+status: open
+
+### DW-813: An MCP call does not read the turn's stop.
+
+origin: epic 96, story 96.2 (rung `agents-96-mcp`, 2026-10-07)
+location: `src-tauri/crates/keeper-agent/src/mcp.rs` (`McpServers::call`)
+reason: a call ends at the server's answer or after `CALL_WITHIN` (120 s); the turn's cancel signal is not read while it waits, as DW-756 says of `run`. Close by racing the call against the turn's `CancelSignal` and sending `notifications/cancelled`.
+status: closed (rung `agents-96-mcp`, R225: `McpServers::call` races the turn's stop and the deadline, and sends `notifications/cancelled` for the request in flight; proved by `parks::mcp::mcp_stop_cancels_the_call`)
+
+### DW-850: A `command` MCP server's program is hashed, then started by its path.
+
+origin: epic 96, story 96.2 (rung `agents-96-mcp`, audit fixes R225, 2026-10-07)
+location: `src-tauri/crates/keeper-agent/src/mcp.rs` (`Server::connect`, `hashed`)
+reason: the program is resolved to an absolute path, read and hashed, then that path is executed; a replacement in the instant between the read and the `exec` would run other bytes than the identity records. Close by executing from an open file descriptor of the bytes hashed (`fexecve`, Linux) or by re-reading `/proc/<pid>/exe` after the spawn and refusing a mismatch.
+status: open
+
+### DW-851: The MCP path's refusal when its audit row cannot be written is not proved by a test.
+
+origin: epic 96, story 96.2 (rung `agents-96-mcp`, audit fixes R225, 2026-10-07)
+location: `src-tauri/crates/keeper-agent/src/agent.rs` (`AllowedTools::mcp_call`, `CallAudit::admit`)
+reason: `mcp_call` sends only after `CallAudit::admit` succeeds (source order, and `parks::mcp::mcp_call_follows_its_audit_row_and_consumption` shows the row exists when the server acts), but no fixture makes `keeper.db` unwritable and asserts that nothing reaches the server. Close with that fixture.
+status: open
+
+### DW-940: A listing that answers on an MCP connection ended while it listed is dropped by a check no test reaches.
+
+origin: epic 96, story 96.2 (rung `agents-96-mcp`, re-audit fixes R238, 2026-10-08)
+location: `src-tauri/crates/keeper-agent/src/mcp.rs` (`Server::refresh`, the `live` check; `Server::end`)
+reason: `Server::end` (a child call half written past its stop or deadline) can drop the live connection while a listing on it is outstanding; `refresh` then keeps nobody's answer rather than offering tools of a dead connection. The window is the instant between the child's answer arriving and `end` taking the state lock, so no fixture reaches it, and mutant `02-ended-connection-kept` (`mut-96mcp-4.log`) survives. Since R254, `end` closes the child's stdin but not its stdout: a launcher's descendant that still holds stdout can answer a listing already written after the launcher is killed, which widens the window; the guard rejects that answer too, still unproved. Close with a seam that holds a listing's answer in the client until `end` has run.
+status: open
+
+### DW-1020: A `command` MCP server's descendants are not killed when keeper ends its connection.
+
+origin: epic 96, story 96.2 (rung `agents-96-mcp`, re-audit fixes R254, 2026-10-08)
+location: `src-tauri/crates/keeper-agent/src/mcp.rs` (`Connection::end`, `Server::connect`)
+reason: `Connection::end` closes keeper's end of the child's stdin (the cutoff R254 requires, proved with a launcher and its descendant by `parks::mcp::mcp_a_stopped_call_never_leaves_a_blocked_pipe`) and kills the immediate child only. A process the child started gets end-of-input on its stdin and an MCP server then stops, but one that ignores end-of-input keeps running, orphaned, after keeper is done with it. No request reaches it; the process does. Close by starting the child in its own process group and ending the group, with a fixture that observes the descendant gone.
+status: open
+
+### DW-1021: An MCP child frame queued behind `Writes::end` is refused by a guard no test isolates.
+
+origin: epic 96, story 96.2 (rung `agents-96-mcp`, re-audit fixes R254, 2026-10-08)
+location: `src-tauri/crates/keeper-agent/src/mcp.rs` (`Writes::begin`, its `ended` check)
+reason: after `Connection::end` closes the pipe, `Server::end` clears the live connection, and a queued call's frame is refused by its `Admission` before `Writes::begin` runs; `begin`'s own `ended` check refuses one that took the pipe's turn in the instant between the two. `mcp_a_stopped_call_never_leaves_a_blocked_pipe` shows the queued call never written, but removing the `ended` check alone would not fail it, because the admission refuses first. Close with a seam that holds `Server::end` between closing the pipe and clearing the state.
+status: open
+
+### DW-1055: The MCP dispatch-window tests prove the hold only for a change that lands inside their window.
+
+origin: epic 96, story 96.2 (rung `agents-96-mcp`, re-audit fixes R267, 2026-10-08)
+location: `src-tauri/crates/keeper-agent/src/mcp.rs` (`tests::Boundary::pause`, `a_call_leaves_only_under_the_check_it_passed`, `a_childs_call_leaves_only_under_the_check_it_passed`)
+reason: between the final check and the dispatch a test-only pause (500 ms over HTTP, 1.5 s for a child) gives a retirement or a listing the chance to land, and the test asserts it had not when the call dispatched. With the commit moved outside the hold (mutant `01-commit-outside-hold`) the change lands within milliseconds — but a host so loaded that it does not land within the window would let that mutant pass. The test is also not deterministic for correct code: the child test's delayed listing can finish before a heavily delayed call reaches its admission, and the phase then fails without the listing ever having landed in the window — a false failure, not a pass (amended R272: the earlier "correct code never fails" was an assertion, not evidence). Neither window test covers a call whose first write the pipe took nothing of; that case (R96M5-01) is proved by `a_call_waiting_on_a_full_pipe_is_checked_again_before_it_is_written`, not by these. The pause also marks where the dispatch is in the source: a dispatch that is moved past the hold while leaving a no-op in its place is caught by review, not by these tests (no test can see the instant a request is committed rather than when its bytes arrive). Close only if a deterministic seam is found that observes the commit itself without becoming a wiring test.
+status: open
+
+### DW-1056: The HTTP dispatch-window phase retires its connection through `Server::end`, not a failing listing.
+
+origin: epic 96, story 96.2 (rung `agents-96-mcp`, re-audit fixes R267, 2026-10-08)
+location: `src-tauri/crates/keeper-agent/src/mcp.rs` (`tests::a_call_leaves_only_under_the_check_it_passed`, its last phase)
+reason: over HTTP a connection is retired in production by a listing that fails. In the window between the final check and the dispatch the paused dispatch runs inside rmcp's HTTP worker task, which also carries that listing's POST, so a failing listing cannot complete there in a test even with the commit outside the hold. The phase retires the connection with `Server::end` from another thread instead — the same state change under the same lock. The listing and failed-listing races before the final check are covered with the real refresh in the same test's first phases, and the child test lands a real listing in its window.
+status: open
+
+### DW-1057: `mcp_diagnostics_are_redacted` sometimes captures no event from a branch that ran, when run beside the other MCP tests.
+
+origin: epic 96, story 96.2 (rung `agents-96-mcp`, re-audit fixes R267, 2026-10-08)
+location: `src-tauri/crates/keeper-agent/tests/agent_turns.rs` (`parks::mcp::mcp_diagnostics_are_redacted`, its `Catcher` under `tracing::subscriber::set_default`)
+reason: evidenced: in one of three runs of `parks::mcp::` (`dbg-96mcp-6-2.log`; `dbg-96mcp-6-1.log` passed) and once in the full gate (`gate-96mcp-6-test-agent.log`) the input-required step's captured event set was empty although the call's own answer — "`keys` asked for more than the call's arguments, …", returned only from the branch of `McpServers::answered` whose first statement is that `tracing::warn!` — shows that branch ran. Not evidenced (amended R272): that the subscriber received an emitted event and lost it, or that `tracing`'s callsite-interest caching is the cause. The test catches events through a thread-local default subscriber (`set_default`) while other tests' threads register the same callsites with none, and callsite interest computed there could skip the event for the catching thread — a hypothesis no controlled run attributed, and no isolated passing round-6 diagnostic log exists. The failure is a missing capture, not evidence of a secret leak. Neither the event nor the path changed in R267 or R272. Close by catching through a subscriber that does not depend on per-thread interest (a process-wide one filtered by the test's span, or running the test in its own binary), and confirm the cause by a controlled run of the old and new capture side by side.
+evidence (restack onto 02827329, 2026-10-10): run alone it passes (`/tmp/agents-salvage/gate-96mcp-rs2-diagnostics-alone.log`); beside the other `parks::mcp::` tests it failed twice with the same empty capture, "the call that asked for input: []" (`gate-96mcp-rs-test-agent.log`, `gate-96mcp-rs2-diagnostics-module.log`). Its group failure also kills mutants by chance: a restack mutant killed only by this test in its group was re-run with it alone or skipped (`mut-96mcp-rs9.log`).
+status: open
+
+### DW-1080: An MCP HTTP call's spawned request outlives the POST that awaits it.
+
+origin: epic 96, story 96.2 (rung `agents-96-mcp`, re-audit R96M5 DW candidate, R272, 2026-10-09)
+location: `src-tauri/crates/keeper-agent/src/mcp/http.rs` (`BoundedHttp::post_message`, the `tokio::spawn(self.client.execute(request))` under `admitted` and its awaited handle)
+reason: R267 hands the built request to a task spawned under the server's state hold and awaits its join handle outside it. When rmcp drops the enclosing POST future — the call cancelled, the connection torn down — the await is dropped and the spawned task is detached: the request still goes, and its response is read by no one. The turn already reports such a call as effect-unknown (`McpServers::call`, the stop and deadline arms), so this is no unchecked dispatch and no hang, but the request's lifetime is not its owner's. Close by tying the task to the POST (abort on drop of a guard holding the `JoinHandle`) and prove with a server that stalls before response headers: a call cancelled there leaves no request in flight.
+status: open
+
+### DW-1081: Every malformed ID-bearing line from an MCP child spawns another response task, unbounded.
+
+origin: epic 96, story 96.2 (rung `agents-96-mcp`, re-audit R96M5 DW candidate, R272, 2026-10-09)
+location: `src-tauri/crates/keeper-agent/src/mcp.rs` (`ChildTransport::receive`, its `Unread::Invalid` arm)
+reason: an ID-bearing line keeper cannot read is answered `Invalid request` by a task spawned per line, each waiting for the pipe's writer (`Writes::turn`). The common writer keeps the frames from interleaving, but a child that floods such lines while not reading its stdin piles up waiting tasks without bound. No hang of the convergence class was shown. Close by serializing these answers through one bounded owner (drop or coalesce beyond the bound) and test with a non-reading peer that floods malformed lines.
+status: open
+
+### DW-1082: The MCP child transport's receive and fault paths have no focused proofs.
+
+origin: epic 96, story 96.2 (rung `agents-96-mcp`, re-audit R96M5 DW candidate, R272, 2026-10-09)
+location: `src-tauri/crates/keeper-agent/src/mcp.rs` (`ChildTransport::receive`, `ChildTransport.line`, `line`/`Unread`); `src-tauri/crates/keeper-agent/src/mcp/http.rs` (the `TokioJoinError` arm of `BoundedHttp::post_message`)
+reason: the reviewed code supports each path, but no test exercises it on its own: a `receive` cancelled part way through a line resuming with the bytes kept in `line`; a malformed line followed by a good one (recovery); end-of-file and a read failure ending receive; and the HTTP join-error path mapping to a transport failure, not a server-authored result. Close with one test per path, each mutation-proved.
+status: open
+
+### DW-1085: The MCP full-pipe regression's synchronisation rests on wall-clock windows and a fixture delay, not a handshake.
+
+origin: epic 96, story 96.2 (rung `agents-96-mcp`, re-audit R96M5 DW candidate, R274, 2026-10-09)
+location: `src-tauri/crates/keeper-agent/src/mcp.rs` (`tests::Boundary.checked` in `a_call_waiting_on_a_full_pipe_is_checked_again_before_it_is_written`, `tests::filled`, `tests::waiting`)
+reason: `waiting` watches `Boundary.checked` (`src-tauri/crates/keeper-agent/src/mcp.rs:1709,2133–2141`), which increments before `begin`, not after an observed `Pending`; it has no timeout and no early-failure exit. `filled` settles with timed waits, and the relist phase depends on a 500 ms fixture delay (`src-tauri/crates/keeper-agent/src/mcp.rs:1726,2094–2113,2187–2193,2205–2209`). A sufficiently delayed setup can miss the window, and a call refused before reaching the counter can leave the test waiting indefinitely. The retained mutant kills establish genuine backpressure discrimination, not deterministic scheduling. Close with an explicit fixture handshake, bounded waits and direct observation of a pending first attempt.
+status: open
+
+### DW-1086: A withdrawn MCP child call's unsent transport task is not woken and keeps the writer and frame.
+
+origin: epic 96, story 96.2 (rung `agents-96-mcp`, re-audit R96M5 DW candidate, R274, 2026-10-09)
+location: `src-tauri/crates/keeper-agent/src/mcp.rs` (`Server::call`'s `withdraw`, `Writes::waker`, `ChildTransport::send`'s pending first write)
+reason: `withdraw` records `Withdrawn` without waking `Writes::waker` (`src-tauri/crates/keeper-agent/src/mcp.rs:367–377`), while the pending send keeps the connection-local writer and frame (`src-tauri/crates/keeper-agent/src/mcp.rs:509–528`); rmcp owns that send in a separate task (`rmcp-3.5.1/src/service.rs:1527–1536`), so returning the outer call does not drop it. Absent another readiness event or teardown, the already-withdrawn task can retain the writer and frame until the pipe changes; the turn itself returns through `NotWritten` without waiting (`src-tauri/crates/keeper-agent/src/mcp.rs:1489–1494`), so this is no convergence-class hang or unchecked send. Close by waking the owner once withdrawal is recorded and proving prompt release without making the child readable.
+status: open
+
+### DW-1087: The MCP first-write fault and wake paths have no focused proofs.
+
+origin: epic 96, story 96.2 (rung `agents-96-mcp`, re-audit R96M5 DW candidate, R274, 2026-10-09)
+location: `src-tauri/crates/keeper-agent/src/mcp.rs` (`Writes::end`'s wake, `ChildTransport::send`'s first write, `McpServers::call`'s effect-unknown arms)
+reason: the supplied test does not isolate `Writes::end` waking a zero-byte first-write waiter, `Ready(Ok(0))`, an immediate write error, or the deadline while the first write is pending; the existing partial-frame cutoff and HTTP deadline tests cover different paths. First-write I/O faults take the conservative effect-unknown mapping, not `Unsent` (`src-tauri/crates/keeper-agent/src/mcp.rs:343–349,1554–1585`). Retain these as focused proof candidates; the five R272 mutants do not cover them. Close with one focused, mutation-proved test per path.
+status: open
+
+### DW-1148: Two of R254's pipe-closing mutants survive since R267/R272: no test tells which of the connection's close paths stopped a half-written frame.
+
+origin: epic 96, story 96.2 (rung `agents-96-mcp`, restack onto 02827329, 2026-10-10)
+location: `src-tauri/crates/keeper-agent/src/mcp.rs` (`Connection::end`'s `writes.end()`, `Writes::end`'s `drop(self.stdin().take())`); `src-tauri/crates/keeper-agent/tests/agent_turns.rs` (`parks::mcp::mcp_a_stopped_call_never_leaves_a_blocked_pipe`)
+reason: `mut-96mcp-5.py`'s `03-pipe-left-open` (no `writes.end()` at a connection's end) and `03-stdin-kept` (stdin not taken at `Writes::end`) were killed in round 5 by `mcp_a_stopped_call_never_leaves_a_blocked_pipe` (`mut-96mcp-5.log`); after R267 (keeper the child pipe's one writer) and R272 (the first write checked again at each attempt) both survive it, on 2ecf08d6 as on the restacked tree (`/tmp/agents-salvage/mut-96mcp-rs-pre.log`, `mut-96mcp-rs5.log`). What the test observes is that, after the stopped call ended, the queued call was refused and the stalled child resumed reading for a second, the child's completed-call log holds only `stall` — not that zero bytes of the half-written frame reached it, and not which close stopped the frame; it no longer proves that each of these two closes is needed. `Writes.ended` is no guard on every write: `Writes::begin` reads it once, at a frame's first write (admission), while the remainder of a frame is written through `Pipe::poll_write`, which checks only whether stdin is still there (`src-tauri/crates/keeper-agent/src/mcp.rs:334–336,405–418`). Which path stops the frame in the survivors' runs — the writer dropped with its connection, or another — is not established (inference from the source, not a controlled run); the survivors alone do not show that either close is redundant. Close by deciding whether the stdin drop is the one cutoff R254 says it is — then a test in which only that close can stop the frame, observing the bytes the child received, kills both mutants — or by removing a close proved redundant (R306).
+status: open
