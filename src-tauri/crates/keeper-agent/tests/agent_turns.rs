@@ -5180,7 +5180,7 @@ fn archived_session(world: &World, title: &str) -> (String, String) {
         },
     )
     .expect("created");
-    verbs::archive(zone, &id.to_string(), Vec::new(), false, 2026).expect("closed");
+    verbs::archive(zone, &id.to_string(), false, 2026).expect("closed");
     let path = verbs::find(zone, &id.to_string()).expect("found").path;
     (id.to_string(), path)
 }

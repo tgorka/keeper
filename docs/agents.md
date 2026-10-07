@@ -2963,8 +2963,9 @@ or is larger than 64 KiB is listed with why; a folder that would not list, and a
 files, are said in `problems`.
 `sessions_promote` copies a settled `workspace/` file into `artifacts/` — exactly the bytes the
 stability check read; a file written within the profile's settle window is refused: "still being
-written; try again in a moment" — or an artifact out into the drive's own notes vault, and records one
-row either way, first, so a promotion that fails after it shows as `missing target` (or `unknown`, with
+written; try again in a moment" — and `sessions_promote_to` copies an artifact out into the drive's own
+notes vault at the folder and filename the person chose, the target composed and fenced in Rust; each
+records one row, first, so a promotion that fails after it shows as `missing target` (or `unknown`, with
 why, when a file stands where the target's folder belongs: only a target the disk says is not there is
 missing) and promoting again finishes it. A copy is staged under a fresh name of its own — whatever
 was planted at the staging name, a link or a second name of another file, is removed, never written
@@ -2990,7 +2991,8 @@ vault is no longer the note's (R252, DW-960): promoting the note there again and
 refused saying so — "… was changed since … published it there …", or, for a row that records no
 publication, "… is not known to be the copy … published …" — with what to do that keeps the file:
 promote the note under another name, or move that file elsewhere in the vault first. The panel shows
-no review of such a copy and says the same in the note's `foreignCopy`. A record that does not read is
+no review of such a copy, offers no promotion to it, and says the same in the note's `foreignCopy` and
+as why it may not be promoted. A record that does not read is
 refused with why and kept beside it as `.keeper/promote-out.<id>.unreadable.json`, written to the disk
 before the record goes; until it can be, every promotion out of the zone and every review is refused,
 none writes over it. A row appended to a table that ends the file without a
@@ -3006,15 +3008,24 @@ read what only @tgorka:h may read."). It is refused as well whenever who reads t
 cannot be established: an `agent.toml` or `_drive.toml` that does not read — or that may be there, behind
 a folder that may not be searched — a drive whose readers are not pinned on this Mac or whose
 `_drive.toml` differs from the pin, an agent's log with a line that does not read or a `log/` that cannot
-be looked at or listed whole, an agents folder that is a link to nothing or a file — however the profile spells it, `80-agents/` or `./80-agents`. Only a declaration the disk says is not there, with no pin, is anyone's. The panel shows the same refusal. The panel itself is the next rung's.
+be looked at or listed whole, an agents folder that is a link to nothing or a file — however the profile spells it, `80-agents/` or `./80-agents`. Only a declaration the disk says is not there, with no pin, is anyone's. The panel shows the same refusal. Open the panel
+with **Promote…** in session detail. It opens each knowledge note whole, names its author and host,
+and offers only this drive's vault folders; a label refusal removes the promote-out controls.
 
 **Reviewed by me.** Promoting a harvested note to notes *is* the person's review: the command carries
-the revision they read, refuses a candidate that has changed since, and writes the vault's copy with a
+the revision they read (`sessions_knowledge_read` answers the text with the revision of exactly those
+bytes), refuses a candidate that has changed since, and writes the vault's copy with a
 canonical `verified: - by: human:<them>, at: …` entry and `human_reviewed: true` — never into the
 candidate, which the steward's host also writes. `sessions_knowledge_review` then unticks or ticks the
-promoted copy again, through the notes editor's guarded amend — written only over the text it was
-composed from, the check and the write one step to every other write keeper makes to the note, whether
-an editor has it open or not — so an edit or another review that landed meanwhile is kept; the untick takes that entry out and sets `human_reviewed` to whether another person's
+promoted copy again as the person read it, through the notes editor's guarded amend — written only
+over the text it was composed from, the check and the write one step to every other write keeper makes
+to the note, whether an editor has it open or not. The copy's revision names its path and its bytes, and
+it is compared with each text the amend hands over, inside the sessions zone's lock: an edit, a pending
+promotion out finished first, a row retargeted to another file, or an amend's retry after an editor's
+save landed between its read and its write, refuses the review — the copy is kept as it is, never
+reviewed unread; read it again. A copy keeper publishes or ticks stays within 80 KiB (the 64 KiB note
+plus 16 KiB of reviews), so a note at the cap can still be read whole and its review changed; a tick
+that would pass that is refused. The untick takes that entry out and sets `human_reviewed` to whether another person's
 review is left, and a legacy `verified: true` beside `verified_by`, or one review written as a map
 (`verified: {by: …}`) rather than a list item, is written canonical. A tick or an untick changes only
 the copy's frontmatter and leaves its body byte for byte — a body that opens with a `---` block of its
@@ -3025,6 +3036,17 @@ signed in on this Mac, the drive's owner, else the only one. What *reviewed by a
 a reader's keeper committed the tick, not that the person typed it (R28 S-31) — the same reading as
 `owner` integrity. A candidate edited after promotion shows `stale` on its row; the review keys never
 count as a change.
+
+In the panel a person first reads the note whole, then ticks **I reviewed this version**, which
+binds their consent to the revision they read: the panel forwards what the person read and
+consented to with each read, and Rust decides whether it holds (`KnowledgeNoteVm.candidateRead`,
+`copyRead`, `consented`). If the candidate changes, the text they read is marked as an older
+version and the tick clears; **Promote to notes…** sends that revision as
+`expected`, so the copy and the person's review land in one write. A note already in the vault
+shows its notes copy separately: **Read notes copy** opens the vault's file, and **Reviewed by
+me in notes** is ticked from the VM's `reviewedByMe`, never from another person's review, and
+changes only the copy the person has open. A notes copy that is missing offers no review; the
+VM offers its row's target, and **Restore the notes copy** promotes the note again there.
 
 **Proven:** `a_harvested_note_never_claims_a_person`, `harvest_never_writes_the_closed_session`
 (`cards.rs`); `promote_copies_and_records_one_row`, `promote_out_into_the_vault`,
@@ -3063,11 +3085,11 @@ count as a change.
 `a_row_is_written_only_as_it_reads_back`, `a_row_appended_where_the_file_ends_reads_back`,
 `a_published_copy_is_recorded_kept_and_dropped`,
 `an_unknown_content_time_is_never_read_as_in_order`, `what_could_not_be_read_is_said_not_absent`,
-`a_digest_streams_and_ignores_only_review_keys` (`sessions/promote.rs`, keeper-core). **Owed:** the
-three commands compile only on macOS (CI's macOS
-job); the panel and a real WKWebView proof (rung `agents-95-panel`); on hesperia, a delegated session
-closing in tgdrive, Dr Tola Grey's candidate in the panel, ticked and promoted, read back as "reviewed
-by a person (human:tgorka)".
+`a_digest_streams_and_ignores_only_review_keys` (`sessions/promote.rs`, keeper-core). The UI behavior
+is covered through the mock shell in `promote-panel.test.tsx`.
+**Owed:** the three commands compile only on macOS (CI's macOS job); real WKWebView proof on
+hesperia (DW-780), where a delegated session closing in tgdrive must leave Dr Tola Grey's
+candidate in the panel, ticked and promoted, read back as "reviewed by a person (human:tgorka)".
 
 ## Which host answers
 

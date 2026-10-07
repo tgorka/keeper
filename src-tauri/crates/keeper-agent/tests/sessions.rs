@@ -267,7 +267,7 @@ fn a_verb_on_an_id_two_folders_carry_acts_on_the_one_the_board_lists_first() {
         record(&format!("copy-{copy}"), false);
     }
     record("pinned", true);
-    verbs::archive(zone.path(), id, Vec::new(), false, 2026).expect("archive");
+    verbs::archive(zone.path(), id, false, 2026).expect("archive");
     assert!(zone.path().join("archive/2026/pinned").is_dir());
     assert!(!zone.path().join("active/pinned").exists());
     for copy in 0..6 {
@@ -286,7 +286,7 @@ fn a_verb_right_after_create_finds_the_session_by_id() {
     else {
         panic!("created");
     };
-    verbs::archive(zone.path(), id, Vec::new(), true, 2026).expect("archive finds it");
+    verbs::archive(zone.path(), id, true, 2026).expect("archive finds it");
     let name = path.rsplit('/').next().expect("folder name");
     assert!(zone.path().join("archive/2026").join(name).is_dir());
     assert!(!zone.path().join(&path).exists());

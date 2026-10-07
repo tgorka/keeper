@@ -8884,3 +8884,122 @@ origin: epic 95, story 95.5 (rung `agents-95-knowledge`, review-95know-9 fixer's
 location: `src-tauri/crates/keeper-core/src/vault_link.rs` (`subfolder_components` ~111–118 and its use in `note_path_for_file` ~191–201; `file_path_for_note` ~234–246); TS mirror `src/lib/vault-link/rule.ts` and its shared vectors
 reason: both directions split the configured subfolder on `/` and `\` and drop only empty parts, untrimmed and keeping `.`; forward matching (`core/vault_link.rs` ~111–116, 191–201) folds case, while the reverse composition (~231–250, TS mirror `src/lib/vault-link/rule.ts` ~201–217) builds the prefix from the configured components without folding (keeps `Notes`) — a third reading beside the profile's (`subfolder_components`) and the write scope's (`native_prefix`, R295). A vault configured `./notes` or ` notes ` is not matched from the real `notes/x.md`, and the reverse mapping composes `./notes/…`; on Unix a backslash is split where the registered root keeps it. Missing or misdirected link affordances; this module writes nothing and is not the write fence. Fix: one shared interpretation for both directions and the TS mirror, with shared vectors for `./notes`, ` notes `, `notes/.` and (Unix) a backslash name.
 status: open
+
+### DW-780: The promote panel still needs a real WKWebView and harvested-note run on hesperia.
+
+origin: epic 95, story 95.5 (rung `agents-95-panel`, 2026-10-06)
+location: `src/components/sessions/promote-panel.tsx`, `session-detail.tsx`, `session-actions.tsx`
+reason: Linux Chromium over the mock shell proves rendering and interaction, not Tauri IPC, the installed WKWebView or the live drive. Close by opening a steward's harvested note on hesperia, reading it whole, promoting with a review, unticking and reticking the vault copy, and archiving with a chosen promotion plus a skipped row; read back the provenance through a real tool read. CI's macOS build remains the shell rung's gate.
+status: open
+
+### DW-781: The existing phone stack has no Sessions route, including a desktop window narrowed below 768 px.
+
+origin: epic 95, story 95.5 browser proof (rung `agents-95-panel`, 2026-10-06)
+location: `src/lib/phone-surfaces.ts` (`PhoneSurface`, `phoneSurfaceFor`), `src/hooks/use-shell-layout.ts`
+reason: At 420 px the full app renders the Inbox and filters Sessions out of its navigation; this predates the promote panel. The panel and archive dialog are verified at that width by mounting the real SessionsPane with shipped CSS and the mock shell, not by pretending the full app has a route. Close in a phone-sessions story with capability-gated navigation and full-stack browser/device proof.
+status: open
+
+### DW-782: The archive checklist's revision sees a workspace file by its length and modification time, not its bytes.
+
+origin: epic 95, story 95.5 (rung `agents-95-panel`, review fix R95P-05/06, R216, 2026-10-07)
+location: `src-tauri/crates/keeper-agent/src/promote/offer.rs` (`stamps`), `src-tauri/crates/keeper-core/src/sessions/offer.rs` (`snapshot_revision`, `row_revision`)
+reason: Hashing every `workspace/` file on each panel read would read the whole scratch area on every root event, which is the listing-only posture of FR-243. A rewrite that keeps the length and lands within the filesystem's mtime resolution of the read is not seen as a change; a chosen promotion still runs `promote_in`'s stability admission and copies only the bytes it verified, so what is lost is only the skip of a file rewritten that way. Close if a content-addressed workspace index (or a cheap per-file fingerprint the sync engine already keeps) becomes available.
+status: open
+
+### DW-783: Every sessions-root event rereads the whole promote panel.
+
+origin: epic 95, story 95.5 (rung `agents-95-panel`, review fix R95P-06, R216, 2026-10-07)
+location: `src/components/sessions/promote-panel.tsx` (`listenSessionsChanged`), `src-tauri/crates/keeper/src/sessions_root.rs` (rescan trigger)
+reason: R216 keeps the choices of rows whose Rust revision did not change, so activity in another session no longer wipes a checklist, but the event names only the root: each one costs a full panel read — up to 4096 note hashes and an `is_text` pass over the session's artifacts — and briefly withdraws Archive. Close by carrying the changed session (or path) in `sessions-changed` and rereading only for this session.
+status: open
+
+### DW-784: Ticking a notes copy after one's own review needs the copy read again.
+
+origin: epic 95, story 95.5 (rung `agents-95-panel`, review fix R95P-03, R216, 2026-10-07)
+location: `src-tauri/crates/keeper-agent/src/promote.rs` (`review`; `review_as_read` until R234), `src/components/sessions/promote-panel.tsx` (`KnowledgeCard`)
+reason: A review is bound to the copy's revision as read; the review write itself changes the copy's bytes, so the person's next tick on the same card asks for **Read the notes copy again**. Correct but one step more than needed. Close by having `sessions_knowledge_review` answer the copy as it wrote it (`NoteTextVm`), so the panel keeps showing exactly what is on disk.
+status: open
+
+### DW-785: The R216 promote and archive commands need a macOS build and a live drive run.
+
+origin: epic 95, story 95.5 (rung `agents-95-panel`, R216, 2026-10-07)
+location: `src-tauri/crates/keeper/src/sessions_ipc.rs` (`sessions_archive`, `sessions_promote`, `sessions_promote_to`, `sessions_knowledge_read`, `sessions_knowledge_review`), `src-tauri/crates/keeper/src/lib.rs` (handler list)
+reason: The shell crate does not compile on Linux; these commands were changed by inspection, every caller grepped. Close with CI's macOS job (or `scripts/check-macos.sh mac`) and, with DW-780, on hesperia: archive a session with a chosen promotion and a retargeted row, restore a deleted notes copy, and review a notes copy edited in Obsidian.
+status: open
+
+### DW-910: Every choice, read and consent in the promote panel rereads the whole panel.
+
+origin: epic 95, story 95.5 (rung `agents-95-panel`, review fix R95P2-06, R234, 2026-10-07)
+location: `src/components/sessions/promote-panel.tsx` (`PromotePanel.choose`, `changeNote`), `src-tauri/crates/keeper-agent/src/promote/offer.rs` (`panel_for`)
+reason: Rust decides what of the person's intent holds, so the panel forwards each change with a full `sessions_promote_panel` read (inventory, row digests, note reads, history). Correct, and Archive waits for the read, but a session with thousands of workspace entries pays that per click. Close with a decide-only command over the last read's facts (still Rust's `offer::decisions`), or with DW-783's per-session events.
+status: open
+
+### DW-911: The R234 promote and archive commands need a macOS build and a live drive run.
+
+origin: epic 95, story 95.5 (rung `agents-95-panel`, R234, 2026-10-07)
+location: `src-tauri/crates/keeper/src/sessions_ipc.rs` (`sessions_promote_panel` + `intent`, `sessions_archive` + `choices`/`root`, `sessions_knowledge_review` → `promote::review`, and their `#[cfg(not(desktop))]` twins)
+reason: The shell crate does not compile on Linux; changed by inspection, every caller grepped. Close with DW-785: CI's macOS job, then on hesperia archive a session whose workspace holds a hidden file and a link, delete a promoted target after skipping its row, and tick a notes copy while Obsidian saves it.
+status: open
+
+### DW-912: A workspace with more than 4096 entries cannot be archived with its emptying.
+
+origin: epic 95, story 95.5 (rung `agents-95-panel`, review fix R95P2-03, R234, 2026-10-07)
+location: `src-tauri/crates/keeper-agent/src/sessions/exec.rs` (`inventory`, `INVENTORY_CAP`)
+reason: The emptying's guard needs the whole inventory, and every entry is a checklist item; past the cap the inventory says so and the archive is refused rather than deleting what nobody decided about. A bulk choice ("skip everything under this folder") would lift it.
+status: open
+
+### DW-913: A link or special file in the workspace can only be skipped.
+
+origin: epic 95, story 95.5 (rung `agents-95-panel`, review fix R95P2-03, R234, 2026-10-07)
+location: `src-tauri/crates/keeper-core/src/sessions/offer.rs` (`refused_unlisted`)
+reason: Promotion copies a regular file; a link is never followed, so keeping what it points at means copying that file into `workspace/` first. Fine for now; say so in the row (it does) and revisit if agents start leaving links.
+status: open
+
+### DW-914: Past some fifty reviewers a notes copy's tick is refused.
+
+origin: epic 95, story 95.5 (rung `agents-95-panel`, review fix R95P2-02, R234, 2026-10-07)
+location: `src-tauri/crates/keeper-core/src/agents/knowledge.rs` (`MAX_REVIEWED_BYTES`), `src-tauri/crates/keeper-agent/src/promote.rs` (`review`)
+reason: The reader's bound is the 64 KiB note plus 16 KiB of review blocks, so every copy keeper writes stays readable whole; a tick that would pass it is refused with the sentence. A copy edited past the bound in Obsidian is shown with why, not read.
+status: open
+
+### DW-1000: The command vectors run without drive history.
+
+origin: epic 95, story 95.5 (rung `agents-95-panel`, review fix R95P3-06, R249, 2026-10-08)
+location: `src-tauri/crates/keeper-agent/src/promote/command-vectors.json`, `dev/mock-shell.ts` (`promotePanel`'s row state)
+reason: Rust dates a vault copy by the drive's git history and the vectors' drive has none, so a harvested note that differs from its copy is `unknown` there while the mock, which models history as `changed`, says `stale`. The scenarios keep candidates equal to their copies (review keys aside). Close by committing the scenario's vault into a repository in `every_command_vector_holds` and adding a newer-candidate scenario.
+status: open
+
+### DW-1001: What the emptying can still remove that it was not decided on.
+
+origin: epic 95, story 95.5 (rung `agents-95-panel`, review fix R95P3-02, R249, 2026-10-08; corrected by R95P4-01, R265, 2026-10-08)
+location: `src-tauri/crates/keeper-agent/src/sessions/exec.rs` (`empty_as_decided`, `Folder`, `walk`, `down`)
+reason: On Unix the emptying holds the workspace folder by descriptor from its check on (reached from the zone with `O_NOFOLLOW` opens), walks and removes relative to it (`statat`/`unlinkat`, `AT_REMOVEDIR` for folders), and binds each folder below it to the identity the check found, so a root or folder swapped for a link or another folder after the check is never reached and nothing outside the held workspace can be removed. What remains, all inside that held folder: (1) a file name rewritten or renamed over in the instant between its re-stamp and its `unlinkat` is removed whatever its length and mtime — the bytes lost are what was put in the workspace in that instant; (2) folders below the workspace are bound only from the check, not from the decision (`Emptying.entries` stamps a folder `dir`), so a real folder holding the same names with the same stamps, moved into a decided folder's place between the decision and the check, is emptied; (3) a target changed after the target check; (4) a decided directory entry is removed checking only its holder's identity, so an EMPTY leaf directory substituted after the check, or recreated after it was absent at the walk, is removed and the archive completes instead of refusing as `PlanStep::EmptyDirKeep` promises (DW-1050; an empty folder holds no bytes, so nothing a person wrote is lost). Off Unix (DW-1002) every removal is by path, so R95P4-01's redirect through a root or folder replaced by a link after the check stands there. Close (1) with a rename into a quarantine checked afterwards, (2) by recording folder identities in `Emptying`, (3) by holding the targets, (4) as DW-1050 says.
+status: open
+
+### DW-1002: Off Unix a replaced workspace folder is told only by its place and contents.
+
+origin: epic 95, story 95.5 (rung `agents-95-panel`, review fix R95P3-04, R249, 2026-10-08)
+location: `src-tauri/crates/keeper-agent/src/sessions/exec.rs` (`identity`)
+reason: `identity` is `<dev>:<ino>` on Unix (macOS, iOS, Linux, Android); elsewhere it is only "a real folder", so a workspace replaced by a twin with the same names and stamps would be emptied. No Windows host runs sessions today. Close with the file index (`GetFileInformationByHandle`) when one does.
+status: open
+
+### DW-1050: An empty folder put in a decided folder's place during the emptying is removed instead of refused.
+
+origin: epic 95, story 95.5 (rung `agents-95-panel`, review-95panel-5 R95P5-01, deferred under the convergence policy by R270, 2026-10-08)
+location: `src-tauri/crates/keeper-agent/src/sessions/exec.rs` (`empty_as_decided`, the `unlinkat(AT_REMOVEDIR)` of a decided folder)
+reason: `sessions/exec.rs` removes a decided directory entry checking only its holder's identity, so an EMPTY leaf directory substituted after the check (or recreated after being absent at the walk) is removed and the archive completes instead of refusing (`PlanStep::EmptyDirKeep` promises refusal). `AT_REMOVEDIR` cannot remove a non-empty folder, so no person's bytes are lost. Fix: compare the entry's own identity with the walk's record before `unlinkat(AT_REMOVEDIR)`; absent-at-walk but present-now refuses; keep the NotFound recovery. Regression: an empty child replaced by another empty folder; an absent child recreated. DW-1001 (4) names this case.
+status: open
+
+### DW-1141: An artifact's "Promote again" is offered over a vault file that is not its copy.
+
+origin: epic 95, story 95.5 (rung `agents-95-panel` restack onto rung 5's fe760de0, 2026-10-10)
+location: `src-tauri/crates/keeper-agent/src/promote/offer.rs` (`complete`, `vm.artifacts`); `keeper-core` `sessions::promote::PanelFacts::copies`
+reason: knowledge's `promote_panel` tells a harvested note's copy standing (`foreign_copy`, from `PanelFacts::copies`, which `panel` reads for harvested notes only), and the panel now offers nothing over a note's foreign copy (R-NEW-1). An ordinary artifact promoted out has no such fact: its fixed "Promote again to …" is still offered when the file at its row's target is edited or unrecorded, and `promote_out` then refuses it with the `CopyLoss` sentence — nothing is written over, but the panel offers an action Rust refuses. Close by reading `copy_fact` for every out row's target, not only harvested notes', and folding it into `ArtifactOfferVm.unavailable`.
+status: open
+
+### DW-1142: The dev mock's publication-receipt digest is a second frontmatter parser that disagrees with Rust's `Frontmatter`.
+
+origin: epic 95, story 95.5 panel restack (R300; from R95P6-01, review-95panel-6.md), 2026-10-10
+location: `dev/mock-shell.ts` ~:2496–2507 (README's fourth cell; archive snapshot ~:2530–2541, ~:2825–2828); Rust reference `keeper-core` `sessions::promote.rs` ~:345–350, 375–402 and `notes/frontmatter.rs` ~:261–285, 505–520, 710–716, 823–842
+reason: the dev mock's publication-receipt digest (`dev/mock-shell.ts` ~:2496–2507, used for the README's fourth cell and the archive snapshot ~:2530–2541, ~:2825–2828) is a second frontmatter parser that disagrees with Rust's `Frontmatter` (`keeper-core/src/sessions/promote.rs` ~:345–350, 375–402; `notes/frontmatter.rs` ~:261–285, 505–520, 710–716, 823–842): it accepts only an unpadded opening `---` and a `---` close (Rust also accepts trailing whitespace on the opening fence and `...` as a close), drops a comment line following the removed review entry (Rust keeps comments outside the entry's span), and keeps a quoted `"human_reviewed": false` (Rust unquotes/trims keys). So the mock's receipts and snapshot revisions can differ from the built app's for those inputs; the nine command-vector scenarios cover only canonical inputs. Dev-only: no production write. Fix: carry Rust-recorded receipts in the viewing fixtures instead of a TS parser; or, if dynamic computation stays, match Rust's span/fence semantics and add shared Rust/TS vectors for the three counterexamples (comment after a review block, quoted/padded review key, alternate/padded fences) — never re-record expectations from the TS side.
+status: open

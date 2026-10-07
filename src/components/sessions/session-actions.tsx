@@ -9,6 +9,7 @@
  */
 import { MoreHorizontal } from "lucide-react";
 import { useState } from "react";
+import { type ArchiveReview, PromotePanel } from "@/components/sessions/promote-panel";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -39,6 +40,7 @@ import {
 } from "@/lib/ipc/client";
 import { useCapabilitiesStore } from "@/lib/stores/capabilities";
 import { sessionsListStore } from "@/lib/stores/sessions-list";
+import { syncErrorMessage } from "@/lib/stores/sync";
 
 export const SESSION_ACTIONS_LABEL = "Session actions";
 export const SESSION_PIN_LABEL = "Pin";
@@ -56,11 +58,7 @@ export const SESSION_DELETE_BODY =
   "The whole folder — workspace included — moves into the zone's own trash (.keeper/trash), where it can be brought back. Nothing is erased.";
 export const SESSION_DELETE_CONFIRM = "Delete session";
 
-/**
- * The archive dialog's words, quoting the zone's own checklist. This story
- * runs the two fs steps (empty the workspace, file under archive/<year>); the
- * per-row promote review arrives with the promote panel story.
- */
+/** The archive reviews every promotion before its destructive workspace step. */
 export const SESSION_ARCHIVE_TITLE = "Archive this session?";
 export const SESSION_ARCHIVE_BODY =
   "Per the zone's rules: the workspace is emptied (a .gitkeep stays), and the folder is filed under archive by the year it closed. Promote anything still in the workspace first — its contents do not survive archiving.";
@@ -77,6 +75,9 @@ export function SessionActions({ rootId, rootPath, row }: SessionActionsProps) {
   const canReveal = useCapabilitiesStore((s) => s.capabilities.revealInFileManager);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [confirmArchive, setConfirmArchive] = useState(false);
+  const [review, setReview] = useState<ArchiveReview>({ ready: false, choices: [], revision: "" });
+  const [archiving, setArchiving] = useState(false);
+  const [archiveError, setArchiveError] = useState<string | null>(null);
 
   return (
     <>
@@ -111,7 +112,13 @@ export function SessionActions({ rootId, rootPath, row }: SessionActionsProps) {
           </DropdownMenuItem>
           <DropdownMenuSeparator />
           {row.status === "active" ? (
-            <DropdownMenuItem onSelect={() => setConfirmArchive(true)}>
+            <DropdownMenuItem
+              onSelect={() => {
+                setReview({ ready: false, choices: [], revision: "" });
+                setArchiveError(null);
+                setConfirmArchive(true);
+              }}
+            >
               {SESSION_ARCHIVE_LABEL}
             </DropdownMenuItem>
           ) : (
@@ -131,17 +138,49 @@ export function SessionActions({ rootId, rootPath, row }: SessionActionsProps) {
         </DropdownMenuContent>
       </DropdownMenu>
 
-      <AlertDialog open={confirmArchive} onOpenChange={setConfirmArchive}>
-        <AlertDialogContent>
-          <AlertDialogHeader>
+      <AlertDialog
+        open={confirmArchive}
+        onOpenChange={(open) => {
+          if (!archiving) setConfirmArchive(open);
+        }}
+      >
+        <AlertDialogContent className="flex max-h-[90dvh] flex-col data-[size=default]:max-w-[calc(100%-2rem)] data-[size=default]:sm:max-w-3xl">
+          <AlertDialogHeader className="shrink-0">
             <AlertDialogTitle>{SESSION_ARCHIVE_TITLE}</AlertDialogTitle>
             <AlertDialogDescription>{SESSION_ARCHIVE_BODY}</AlertDialogDescription>
           </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction onClick={() => void sessionsArchive(rootId, row.id, [], true)}>
-              {SESSION_ARCHIVE_CONFIRM}
-            </AlertDialogAction>
+          <div className="min-h-0 min-w-0 overflow-y-auto">
+            <fieldset disabled={archiving} className="min-w-0">
+              <PromotePanel
+                key={`${rootId}:${row.id}`}
+                rootId={rootId}
+                sessionId={row.id}
+                onArchiveReview={setReview}
+              />
+            </fieldset>
+          </div>
+          {archiveError && (
+            <p role="alert" className="text-destructive text-sm">
+              {archiveError}
+            </p>
+          )}
+          <AlertDialogFooter className="shrink-0">
+            <AlertDialogCancel disabled={archiving}>Cancel</AlertDialogCancel>
+            <Button
+              disabled={!review.ready || archiving}
+              onClick={() => {
+                setArchiving(true);
+                setArchiveError(null);
+                void sessionsArchive(rootId, row.id, review.choices, true, review.revision)
+                  .then(() => setConfirmArchive(false))
+                  .catch((raw: unknown) =>
+                    setArchiveError(syncErrorMessage(raw, "Could not archive this session.")),
+                  )
+                  .finally(() => setArchiving(false));
+              }}
+            >
+              {archiving ? "Archiving…" : SESSION_ARCHIVE_CONFIRM}
+            </Button>
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>

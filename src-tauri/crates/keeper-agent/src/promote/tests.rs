@@ -10,6 +10,7 @@ use keeper_core::agents::label::{
 };
 use keeper_core::agents::log::{HostSlug, LineBody, LogLine, LINE_VERSION};
 use keeper_core::agents::session::{compose_session_agent_toml, SessionAgent, SessionKind};
+use keeper_core::sessions::offer::{ChoiceVm, NoteIntentVm, PanelIntentVm};
 use keeper_core::sessions::promote::PromoteState;
 use keeper_sync::SyncProfile;
 use matrix_sdk::ruma::{OwnedRoomId, OwnedUserId};
@@ -320,7 +321,13 @@ fn promote_copies_and_records_one_row() {
     let vm = panel(&zone, SESSION, &out, None).expect("panel");
     assert_eq!(vm.rows.len(), 1);
     assert_eq!(vm.rows[0].state, PromoteState::Ok);
-    assert_eq!(vm.unlisted, ["workspace/other.csv"]);
+    assert_eq!(
+        vm.unlisted
+            .iter()
+            .map(|file| file.source.as_str())
+            .collect::<Vec<_>>(),
+        ["workspace/other.csv"]
+    );
 
     // Later than the copy by more than the mtime resolution.
     std::thread::sleep(Duration::from_millis(20));
@@ -440,6 +447,22 @@ fn tgorka() -> Reviewer<'static> {
     }
 }
 
+/// `person`'s tick (`reviewed`) or untick of [`NOTE_REL`]'s vault copy as
+/// read just before, the way the panel reads it first.
+fn tick(zone: &Path, person: &str, reviewed: bool, out: &OutOf) -> Result<(), VerbError> {
+    let read = offer::read_note(zone, SESSION, NOTE_REL, true, out)?;
+    review(
+        zone,
+        SESSION,
+        NOTE_REL,
+        person,
+        AT,
+        reviewed,
+        &read.revision,
+        out,
+    )
+}
+
 fn request<'a>(target: &'a str, expected: Option<&'a str>) -> Request<'a> {
     Request {
         source: NOTE_REL,
@@ -511,7 +534,7 @@ fn promote_out_into_the_vault() {
     assert!(vm.knowledge[0].reviewed_by_me);
     assert_eq!(vm.knowledge[0].state, Some(PromoteState::Ok));
 
-    review(&zone, SESSION, NOTE_REL, "tgorka", AT, false, &out).expect("unticked");
+    tick(&zone, "tgorka", false, &out).expect("unticked");
     assert_eq!(
         std::fs::read_to_string(drive.path().join(TARGET))
             .ok()
@@ -520,7 +543,7 @@ fn promote_out_into_the_vault() {
     );
     let vm = panel(&zone, SESSION, &out, Some(ME)).expect("panel");
     assert!(!vm.knowledge[0].reviewed_by_me);
-    review(&zone, SESSION, NOTE_REL, "tgorka", AT, true, &out).expect("ticked");
+    tick(&zone, "tgorka", true, &out).expect("ticked");
     assert_eq!(
         std::fs::read_to_string(drive.path().join(TARGET)).ok(),
         Some(reviewed)
@@ -540,6 +563,7 @@ fn promote_out_into_the_vault() {
         "tgorka",
         "x",
         true,
+        "",
         &out,
     );
     assert!(
@@ -666,13 +690,18 @@ fn a_row_the_table_cannot_hold_is_refused_before_any_copy() {
     assert_eq!(readme(&zone), README_TEXT);
 }
 
-/// R95K-08: a tick composes from the vault copy as it is at the write, so
-/// another person's review that landed after the copy was read is kept
-/// beside it, never written over. R244: an editor's save that changed what
-/// the copy says, landing in the same window, is kept too, and the review
-/// refused — that file is no longer the copy the note published (DW-960).
+/// R234 (R95P2-01) with R95K-08 and R244: a review lands only on the vault
+/// copy as the person read it, checked inside the guarded amend in the held
+/// zone, and only on the copy the note's row records it published. Another
+/// person's review that lands between the read and the write refuses with
+/// `COPY_CHANGED`, theirs kept, never written over; read again, the tick
+/// lands beside it. An editor's save landing in that window is kept and the
+/// review refused as no longer the note's copy (DW-960). A promotion out
+/// left pending is published first and refuses a review of the copy before
+/// it; a row retargeted to another file holding the same bytes refuses a
+/// review of the copy that was read. Read again, it lands.
 #[test]
-fn a_tick_keeps_an_edit_that_landed_meanwhile() {
+fn a_review_lands_only_on_the_copy_as_read() {
     let (drive, zone) = drive();
     put(&zone, NOTE_REL, NOTE.as_bytes(), AN_HOUR);
     let profile = profile(drive.path());
@@ -688,21 +717,173 @@ fn a_tick_keeps_an_edit_that_landed_meanwhile() {
         &out,
     )
     .expect("promoted");
-    review(&zone, SESSION, NOTE_REL, "tgorka", AT, false, &out).expect("unticked");
+    let copy = || std::fs::read_to_string(drive.path().join(TARGET)).expect("copy");
+    let changed = |result: Result<(), VerbError>| {
+        assert!(
+            matches!(&result, Err(VerbError::Refused(sentence)) if sentence == COPY_CHANGED),
+            "{result:?}"
+        );
+    };
+
+    tick(&zone, "tgorka", false, &out).expect("unticked");
+    let read = offer::read_note(&zone, SESSION, NOTE_REL, true, &out).expect("read");
     let by_marta = knowledge::review(NOTE, "marta", AT, true);
     *vault.meanwhile.lock().expect("lock") = Some(by_marta.clone());
-    review(&zone, SESSION, NOTE_REL, "tgorka", AT, true, &out).expect("ticked");
-    let copy = std::fs::read_to_string(drive.path().join(TARGET)).expect("copy");
-    assert_eq!(copy, knowledge::review(&by_marta, "tgorka", AT, true));
+    changed(review(
+        &zone,
+        SESSION,
+        NOTE_REL,
+        "tgorka",
+        AT,
+        true,
+        &read.revision,
+        &out,
+    ));
+    assert_eq!(copy(), by_marta, "their review kept, never written over");
+    tick(&zone, "tgorka", true, &out).expect("read again, it lands beside theirs");
+    assert_eq!(copy(), knowledge::review(&by_marta, "tgorka", AT, true));
 
-    let edited = copy.replace("Three papers.", "Three papers, and the ID.");
+    let read = offer::read_note(&zone, SESSION, NOTE_REL, true, &out).expect("read");
+    let before = copy();
+    let edited = before.replace("Three papers.", "Three papers, and the ID.");
     *vault.meanwhile.lock().expect("lock") = Some(edited.clone());
-    let refused = review(&zone, SESSION, NOTE_REL, "tgorka", AT, false, &out);
-    assert!(matches!(refused, Err(VerbError::Refused(_))), "{refused:?}");
+    let refused = review(
+        &zone,
+        SESSION,
+        NOTE_REL,
+        "tgorka",
+        AT,
+        false,
+        &read.revision,
+        &out,
+    );
+    assert!(
+        matches!(&refused, Err(VerbError::Refused(sentence))
+            if *sentence == promote::CopyLoss::Changed.explain(NOTE_REL, TARGET)),
+        "{refused:?}"
+    );
+    assert_eq!(copy(), edited, "the edit kept, no review composed on it");
+    let vm = panel(&zone, SESSION, &out, Some(ME)).expect("panel");
+    assert_eq!(
+        vm.knowledge[0].foreign_copy,
+        Some(promote::CopyLoss::Changed.explain(NOTE_REL, TARGET)),
+        "the panel says the edited file is no longer the note's copy"
+    );
+    assert_eq!(vm.knowledge[0].destination, None);
+    std::fs::write(drive.path().join(TARGET), &before).expect("the edit undone");
+
+    let read = offer::read_note(&zone, SESSION, NOTE_REL, true, &out).expect("read");
+    let newer = knowledge::review(
+        &NOTE.replace("Three papers.", "Four papers."),
+        "tgorka",
+        AT,
+        true,
+    );
+    keep_pending(&zone, &pending(&newer)).expect("pending");
+    changed(review(
+        &zone,
+        SESSION,
+        NOTE_REL,
+        "marta",
+        AT,
+        true,
+        &read.revision,
+        &out,
+    ));
+    assert_eq!(copy(), newer, "published as admitted, not reviewed unread");
+
+    let read = offer::read_note(&zone, SESSION, NOTE_REL, true, &out).expect("read");
+    let moved = "10-notes/knowledge/moved.md";
+    std::fs::write(drive.path().join(moved), copy()).expect("the same bytes elsewhere");
+    std::fs::write(
+        zone.join(SESSION).join("README.md"),
+        readme(&zone).replace(TARGET, moved),
+    )
+    .expect("retargeted");
+    changed(review(
+        &zone,
+        SESSION,
+        NOTE_REL,
+        "marta",
+        AT,
+        true,
+        &read.revision,
+        &out,
+    ));
+    assert_eq!(
+        std::fs::read_to_string(drive.path().join(moved)).ok(),
+        Some(newer.clone())
+    );
+
+    tick(&zone, "marta", true, &out).expect("read again, it lands");
+    assert_eq!(
+        std::fs::read_to_string(drive.path().join(moved)).ok(),
+        Some(knowledge::review(&newer, "marta", AT, true))
+    );
+}
+
+/// R234 (R95P2-02): a candidate at a knowledge note's 64 KiB cap is read,
+/// promoted with the person's review — its vault copy then larger than
+/// the cap — and that copy is read whole, unticked and ticked again; a
+/// copy at the reviewed bound is still read, one byte past it is not.
+#[test]
+fn a_note_at_the_cap_is_read_and_reviewed_after_promotion() {
+    let (drive, zone) = drive();
+    let tail = "The last line.\n";
+    let fill = knowledge::MAX_NOTE_BYTES - NOTE.len() - tail.len();
+    let candidate = format!("{NOTE}{}{tail}", "x".repeat(fill));
+    assert_eq!(candidate.len(), knowledge::MAX_NOTE_BYTES);
+    put(&zone, NOTE_REL, candidate.as_bytes(), AN_HOUR);
+    let profile = profile(drive.path());
+    declare(&profile, &[TG]);
+    let pinned = pin(&[TG]);
+    let vault = Vault::at(drive.path());
+    let out = out(&profile, &vault, Some(&pinned));
+    let read = offer::read_note(&zone, SESSION, NOTE_REL, false, &out).expect("the candidate");
+    assert_eq!(read.text, candidate);
+    offer::promote_to(
+        &zone,
+        SESSION,
+        NOTE_REL,
+        "10-notes/knowledge",
+        "short.md",
+        Some(&read.revision),
+        Some(&tgorka()),
+        &out,
+    )
+    .expect("promoted");
+    let reviewed = knowledge::review(&candidate, "tgorka", AT, true);
+    assert!(reviewed.len() > knowledge::MAX_NOTE_BYTES);
+
+    let copy = offer::read_note(&zone, SESSION, NOTE_REL, true, &out).expect("the copy whole");
+    assert_eq!(copy.text, reviewed);
+    let vm = panel(&zone, SESSION, &out, Some(ME)).expect("panel");
+    assert_eq!(
+        vm.knowledge[0]
+            .copy
+            .as_ref()
+            .and_then(|copy| copy.revision.clone()),
+        Some(copy.revision.clone())
+    );
+    tick(&zone, "tgorka", false, &out).expect("unticked");
     assert_eq!(
         std::fs::read_to_string(drive.path().join(TARGET)).ok(),
-        Some(edited)
+        Some(candidate.clone())
     );
+    tick(&zone, "tgorka", true, &out).expect("ticked again");
+    assert_eq!(
+        std::fs::read_to_string(drive.path().join(TARGET)).ok(),
+        Some(reviewed.clone())
+    );
+
+    let at_bound = format!(
+        "{reviewed}{}",
+        "y".repeat(knowledge::MAX_REVIEWED_BYTES - reviewed.len())
+    );
+    std::fs::write(drive.path().join(TARGET), &at_bound).expect("at the bound");
+    assert!(offer::read_note(&zone, SESSION, NOTE_REL, true, &out).is_ok());
+    std::fs::write(drive.path().join(TARGET), format!("{at_bound}y")).expect("past it");
+    assert!(offer::read_note(&zone, SESSION, NOTE_REL, true, &out).is_err());
 }
 
 /// 95.5 acceptance 6, a wider audience (AD-391, NFR-115): an agent's
@@ -1184,8 +1365,8 @@ fn staleness_is_by_what_changed_not_by_mtime() {
     // Edited again here, then the copy unticked and ticked: review only.
     std::fs::write(&candidate, NOTE.replace("Three", "Five")).expect("edited");
     set_mtime(&candidate, AN_HOUR);
-    review(&zone, SESSION, NOTE_REL, "tgorka", AT, false, &out).expect("unticked");
-    review(&zone, SESSION, NOTE_REL, "tgorka", AT, true, &out).expect("ticked");
+    tick(&zone, "tgorka", false, &out).expect("unticked");
+    tick(&zone, "tgorka", true, &out).expect("ticked");
     let vm = panel(&zone, SESSION, &out, None).expect("panel");
     assert_eq!(vm.knowledge[0].state, Some(PromoteState::Stale));
     git(root, &["commit", "-q", "-am", "ticked"], t0 + 120);
@@ -1228,7 +1409,7 @@ fn review_commits_past_the_history_read_never_date_the_copy() {
     .expect("edited");
     git(root, &["commit", "-q", "-am", "edited"], t0 + 60);
     for n in 0..16 {
-        review(&zone, SESSION, NOTE_REL, "tgorka", AT, n % 2 == 1, &out).expect("review");
+        tick(&zone, "tgorka", n % 2 == 1, &out).expect("review");
         git(root, &["commit", "-q", "-am", "review"], t0 + 120 + n);
     }
     let vm = panel(&zone, SESSION, &out, None).expect("panel");
@@ -1259,7 +1440,7 @@ fn a_tick_before_the_first_commit_never_dates_the_copy() {
     std::fs::write(&candidate, NOTE.replace("Three", "Four")).expect("edited");
     set_mtime(&candidate, Duration::from_secs(60));
     set_mtime(&drive.path().join(TARGET), AN_HOUR);
-    review(&zone, SESSION, NOTE_REL, "tgorka", AT, false, &out).expect("unticked");
+    tick(&zone, "tgorka", false, &out).expect("unticked");
     let vm = panel(&zone, SESSION, &out, None).expect("panel");
     assert_eq!(vm.knowledge[0].state, Some(PromoteState::Unknown));
 }
@@ -1790,13 +1971,9 @@ fn a_session_moved_away_never_blocks_the_zone() {
         .expect("readme");
         std::fs::write(second.join("artifacts/other.md"), "other\n").expect("other");
         match gone {
-            "archive" => crate::sessions::verbs::archive(
-                &zone,
-                "01J5AAAAAAAAAAAAAAAAAAAAAA",
-                Vec::new(),
-                false,
-                2026,
-            ),
+            "archive" => {
+                crate::sessions::verbs::archive(&zone, "01J5AAAAAAAAAAAAAAAAAAAAAA", false, 2026)
+            }
             _ => crate::sessions::verbs::delete(&zone, "01J5AAAAAAAAAAAAAAAAAAAAAA"),
         }
         .expect(gone);
@@ -1812,7 +1989,7 @@ fn a_session_moved_away_never_blocks_the_zone() {
         assert!(!zone.join(PENDING_REL).exists(), "{gone}");
         promote_out(&zone, SECOND, &OTHER, None, &out).expect("the zone is usable");
         assert!(drive.path().join("10-notes/other.md").is_file(), "{gone}");
-        let review = review(&zone, SECOND, NOTE_REL, "tgorka", AT, true, &out);
+        let review = review(&zone, SECOND, NOTE_REL, "tgorka", AT, true, "", &out);
         assert!(
             matches!(&review, Err(VerbError::Refused(sentence)) if sentence == NOT_PROMOTED),
             "{gone}: {review:?}"
@@ -2071,8 +2248,14 @@ fn a_review_never_writes_into_a_file_the_note_did_not_publish() {
     let vm = panel(&zone, SESSION, &out, Some("human:marta")).expect("panel");
     assert_eq!(vm.knowledge[0].reviewed_by, None);
     assert!(!vm.knowledge[0].reviewed_by_me);
+    // R298: what the panel offers agrees with what promoting would do —
+    // nothing is offered at a file that is not the note's copy, and the
+    // note says why.
+    assert!(vm.knowledge[0].foreign_copy.is_some());
+    assert_eq!(vm.knowledge[0].destination, None);
+    assert_eq!(vm.knowledge[0].unavailable, vm.knowledge[0].foreign_copy);
     for reviewed in [true, false] {
-        let refused = review(&zone, SESSION, NOTE_REL, "tgorka", AT, reviewed, &out);
+        let refused = tick(&zone, "tgorka", reviewed, &out);
         assert!(
             matches!(refused, Err(VerbError::Refused(_))),
             "reviewed {reviewed}: {refused:?}"
@@ -2093,17 +2276,60 @@ fn a_review_never_writes_into_a_file_the_note_did_not_publish() {
         &out,
     )
     .expect("published");
-    review(&zone, SESSION, NOTE_REL, "tgorka", AT, false, &out).expect("unticked");
+    tick(&zone, "tgorka", false, &out).expect("unticked");
     assert_eq!(
         std::fs::read_to_string(drive.path().join(TARGET))
             .ok()
             .as_deref(),
         Some(NOTE)
     );
-    review(&zone, SESSION, NOTE_REL, "tgorka", AT, true, &out).expect("ticked");
+    tick(&zone, "tgorka", true, &out).expect("ticked");
     assert_eq!(
         std::fs::read_to_string(drive.path().join(TARGET)).ok(),
         Some(knowledge::review(NOTE, "tgorka", AT, true))
+    );
+}
+
+/// R298: the panel reads a note's vault copy from its one row
+/// ([`promote::entry_of`]), as review and promotion do: a first row naming
+/// the note into the session is its row, so a later row out lends the panel
+/// no copy to read or review.
+#[test]
+fn the_panel_takes_a_notes_copy_from_its_one_row() {
+    let (drive, zone) = drive();
+    put(&zone, NOTE_REL, NOTE.as_bytes(), AN_HOUR);
+    let profile = profile(drive.path());
+    declare(&profile, &[TG]);
+    let pinned = pin(&[TG]);
+    let vault = Vault::at(drive.path());
+    let out = out(&profile, &vault, Some(&pinned));
+    promote_out(
+        &zone,
+        SESSION,
+        &request(TARGET, Some(&sha256_hex(NOTE))),
+        Some(&tgorka()),
+        &out,
+    )
+    .expect("promoted");
+    assert!(panel(&zone, SESSION, &out, Some(ME))
+        .expect("panel")
+        .knowledge[0]
+        .copy
+        .is_some());
+    let first = format!("| {NOTE_REL} | artifacts/kept.md | kept |\n");
+    let readme = readme(&zone);
+    let at = readme.find(&format!("| {NOTE_REL} |")).expect("its row");
+    std::fs::write(
+        zone.join(SESSION).join("README.md"),
+        format!("{}{first}{}", &readme[..at], &readme[at..]),
+    )
+    .expect("a first row into the session");
+    let vm = panel(&zone, SESSION, &out, Some(ME)).expect("panel");
+    assert_eq!(vm.knowledge[0].copy, None);
+    let read = offer::read_note(&zone, SESSION, NOTE_REL, true, &out);
+    assert!(
+        matches!(&read, Err(VerbError::Refused(sentence)) if sentence == NOT_PROMOTED),
+        "{read:?}"
     );
 }
 
@@ -2122,7 +2348,6 @@ fn a_session_at_a_reused_path_is_never_finished_into() {
                 "archive" => crate::sessions::verbs::archive(
                     &zone,
                     "01J5AAAAAAAAAAAAAAAAAAAAAA",
-                    Vec::new(),
                     false,
                     2026,
                 ),
@@ -2195,7 +2420,7 @@ fn a_record_is_set_aside_only_once_its_copy_is_durable() {
     std::fs::set_permissions(&keeper, std::fs::Permissions::from_mode(0o300)).expect("chmod");
     let stuck = [
         promote_out(&zone, SESSION, &OTHER, None, &out),
-        review(&zone, SESSION, NOTE_REL, "tgorka", AT, true, &out),
+        tick(&zone, "tgorka", true, &out),
         promote_out(&zone, SESSION, &OTHER, None, &out),
     ];
     std::fs::set_permissions(&keeper, std::fs::Permissions::from_mode(0o755)).expect("chmod");
@@ -2385,7 +2610,7 @@ fn a_copy_that_lost_its_authority_says_why() {
     let changed = promote::CopyLoss::Changed.explain(NOTE_REL, TARGET);
     let refusals = [
         promote_note(&zone, TARGET, NOTE, &out),
-        review(&zone, SESSION, NOTE_REL, "tgorka", AT, false, &out),
+        tick(&zone, "tgorka", false, &out),
     ];
     for refused in refusals {
         assert_eq!(refusal(refused), Some(changed.clone()));
@@ -2438,7 +2663,7 @@ fn a_copy_whose_frontmatter_moved_is_not_the_notes() {
         matches!(replaced, Err(VerbError::Refused(_))),
         "{replaced:?}"
     );
-    let reviewed = review(&zone, SESSION, NOTE_REL, "tgorka", AT, false, &out);
+    let reviewed = tick(&zone, "tgorka", false, &out);
     assert!(
         matches!(reviewed, Err(VerbError::Refused(_))),
         "{reviewed:?}"
@@ -2486,7 +2711,7 @@ fn a_review_never_unseats_its_own_copy() {
         let out = out(&profile, &vault, Some(&pinned));
         promote_note(&zone, target, &note, &out).expect("published");
         for reviewed in [false, true] {
-            review(&zone, SESSION, NOTE_REL, "tgorka", AT, reviewed, &out)
+            tick(&zone, "tgorka", reviewed, &out)
                 .unwrap_or_else(|error| panic!("{target} {reviewed}: {error:?}"));
             let vm = panel(&zone, SESSION, &out, Some(ME)).expect("panel");
             assert_eq!(vm.knowledge[0].reviewed_by_me, reviewed, "{note:?}");
@@ -2540,13 +2765,1203 @@ fn a_second_row_lends_the_first_nothing() {
     assert_eq!(vm.knowledge[0].reviewed_by, None);
     assert!(!vm.knowledge[0].reviewed_by_me);
     assert_eq!(vm.knowledge[0].foreign_copy.as_ref(), Some(&why));
-    assert_eq!(
-        refusal(review(&zone, SESSION, NOTE_REL, "marta", AT, true, &out)),
-        Some(why)
-    );
+    assert_eq!(refusal(tick(&zone, "marta", true, &out)), Some(why));
     assert_eq!(
         std::fs::read_to_string(drive.path().join(A)).ok(),
         Some(by_marta)
     );
     assert_eq!(std::fs::read_to_string(drive.path().join(B)).ok(), Some(b));
+}
+
+// ---- What the panel offers and how an archive promotes (R216, R95P) ----
+
+/// Where the archived fixture session lands.
+const ARCHIVED: &str = "archive/2026/2026-10-06-harvest";
+
+/// Every item of the checklist `vm` decided: each of `promotes`' sources
+/// promoted to its target, every other row and file skipped.
+fn decide_all(vm: &SessionPromoteVm, promotes: &[(&str, &str)]) -> Vec<ChoiceVm> {
+    vm.rows
+        .iter()
+        .map(|row| (&row.revision, &row.source))
+        .chain(
+            vm.unlisted
+                .iter()
+                .map(|file| (&file.revision, &file.source)),
+        )
+        .map(|(revision, source)| {
+            let to = promotes.iter().find(|(from, _)| from == source);
+            ChoiceVm {
+                revision: revision.clone(),
+                promote: to.is_some(),
+                target: to.map(|(_, to)| (*to).to_owned()).unwrap_or_default(),
+            }
+        })
+        .collect()
+}
+
+fn archive_with(zone: &Path, choices: &[ChoiceVm], revision: &str) -> Result<(), VerbError> {
+    offer::archive(
+        zone,
+        "01J5AAAAAAAAAAAAAAAAAAAAAA",
+        &offer::Archive {
+            choices,
+            revision,
+            empty_workspace: true,
+            year: 2026,
+            root: zone.parent().expect("the drive"),
+        },
+        SETTLE_MS,
+        now_ms(),
+    )
+}
+
+/// R95P-01: an archive's promotion is the panel's promotion — admitted as
+/// a settled `workspace/` file into `artifacts/`, its row recorded where
+/// the table reads it back (a row already there retargeted, never a second
+/// one), its verified bytes copied — in the archive's one plan before the
+/// workspace is emptied and the folder moved.
+#[test]
+fn an_archive_promotes_as_the_panel_does() {
+    let (drive, zone) = drive();
+    let profile = profile(drive.path());
+    let vault = Vault::at(drive.path());
+    let out = out(&profile, &vault, None);
+    let draft: &[u8] = b"# Report\n\x00\xffbinary tail\n";
+    put(&zone, "workspace/draft.md", draft, AN_HOUR);
+    put(&zone, "workspace/skipped.md", b"scratch\n", AN_HOUR);
+    promote_in(
+        &zone,
+        SESSION,
+        "workspace/draft.md",
+        "artifacts/old.md",
+        "weekly",
+        SETTLE_MS,
+        now_ms(),
+    )
+    .expect("promoted");
+    let vm = panel(&zone, SESSION, &out, None).expect("panel");
+
+    archive_with(
+        &zone,
+        &decide_all(&vm, &[("workspace/draft.md", "artifacts/report.md")]),
+        &vm.revision,
+    )
+    .expect("archived");
+    let archived = zone.join(ARCHIVED);
+    assert!(!zone.join(SESSION).exists());
+    assert_eq!(
+        std::fs::read(archived.join("artifacts/report.md"))
+            .ok()
+            .as_deref(),
+        Some(draft)
+    );
+    let readme = std::fs::read_to_string(archived.join("README.md")).expect("readme");
+    assert_eq!(
+        promote::parse(&readme).expect("table").rows,
+        [promote::PromoteRow::Entry {
+            source: "workspace/draft.md".to_owned(),
+            target: "artifacts/report.md".to_owned(),
+            note: "weekly".to_owned(),
+            published: None,
+        }]
+    );
+    assert!(!archived.join("workspace/draft.md").exists());
+    assert!(!archived.join("workspace/skipped.md").exists());
+}
+
+/// R95P-01: what a promotion refuses an archive refuses, with nothing
+/// changed — a target in `workspace/` (copied, then emptied), the README,
+/// outside the session, and a source still being written.
+#[test]
+fn an_archive_refuses_what_a_promotion_refuses() {
+    let (drive, zone) = drive();
+    let profile = profile(drive.path());
+    let vault = Vault::at(drive.path());
+    let out = out(&profile, &vault, None);
+    put(&zone, "workspace/draft.md", b"draft\n", AN_HOUR);
+    let vm = panel(&zone, SESSION, &out, None).expect("panel");
+    for target in [
+        "workspace/keep.md",
+        "README.md",
+        "../elsewhere.md",
+        "artifacts",
+    ] {
+        let refused = archive_with(
+            &zone,
+            &decide_all(&vm, &[("workspace/draft.md", target)]),
+            &vm.revision,
+        );
+        assert!(
+            matches!(refused, Err(VerbError::Refused(_))),
+            "{target}: {refused:?}"
+        );
+        assert_eq!(readme(&zone), README_TEXT, "{target}");
+        assert_eq!(
+            read(&zone, "workspace/draft.md").as_deref(),
+            Some(&b"draft\n"[..])
+        );
+    }
+
+    put(
+        &zone,
+        "workspace/draft.md",
+        b"draft, mid-write\n",
+        Duration::ZERO,
+    );
+    let vm = panel(&zone, SESSION, &out, None).expect("panel");
+    let still = archive_with(
+        &zone,
+        &decide_all(&vm, &[("workspace/draft.md", "artifacts/draft.md")]),
+        &vm.revision,
+    );
+    assert!(
+        matches!(&still, Err(VerbError::Refused(sentence)) if sentence.ends_with(&format!("{STILL_WRITING}."))),
+        "{still:?}"
+    );
+    assert!(zone.join(SESSION).join("workspace/draft.md").exists());
+    assert!(!zone.join(SESSION).join("artifacts/draft.md").exists());
+}
+
+/// R95P-05/06: the archive is bound to the checklist the person read: a
+/// workspace file that arrived or was written since, or a row changed, is
+/// refused with nothing archived; an unchanged reread keeps the revisions,
+/// and only the row that changed gets a new one.
+#[test]
+fn an_archive_refuses_a_checklist_that_changed() {
+    let (drive, zone) = drive();
+    let profile = profile(drive.path());
+    let vault = Vault::at(drive.path());
+    let out = out(&profile, &vault, None);
+    put(&zone, "workspace/a.md", b"a\n", AN_HOUR);
+    put(&zone, "workspace/b.md", b"b\n", AN_HOUR);
+    let read_at = panel(&zone, SESSION, &out, None).expect("panel");
+    let again = panel(&zone, SESSION, &out, None).expect("panel");
+    assert_eq!(again.revision, read_at.revision);
+    assert_eq!(again.unlisted, read_at.unlisted);
+
+    put(&zone, "workspace/arrived.md", b"new\n", AN_HOUR);
+    let refused = archive_with(&zone, &[], &read_at.revision);
+    assert!(
+        matches!(&refused, Err(VerbError::Refused(sentence)) if sentence == keeper_core::sessions::offer::SNAPSHOT_CHANGED),
+        "{refused:?}"
+    );
+    assert!(zone.join(SESSION).join("workspace/a.md").exists());
+
+    let before = panel(&zone, SESSION, &out, None).expect("panel");
+    put(&zone, "workspace/b.md", b"b, longer\n", AN_HOUR);
+    let after = panel(&zone, SESSION, &out, None).expect("panel");
+    let revision = |vm: &SessionPromoteVm, source: &str| {
+        vm.unlisted
+            .iter()
+            .find(|file| file.source == source)
+            .map(|file| file.revision.clone())
+    };
+    assert_eq!(
+        revision(&after, "workspace/a.md"),
+        revision(&before, "workspace/a.md")
+    );
+    assert_ne!(
+        revision(&after, "workspace/b.md"),
+        revision(&before, "workspace/b.md")
+    );
+    assert!(matches!(
+        archive_with(&zone, &[], &before.revision),
+        Err(VerbError::Refused(_))
+    ));
+    archive_with(&zone, &decide_all(&after, &[]), &after.revision).expect("archived as read");
+    assert!(zone.join(ARCHIVED).is_dir());
+}
+
+/// R95P-02/03: the candidate and the vault copy are read separately, each
+/// with the revision of what was read; a review names the copy's version
+/// and is refused for any other; a missing copy offers its row's target
+/// fixed, and promoting there restores it reviewed without a review of an
+/// absent file.
+#[test]
+fn a_note_is_read_reviewed_and_restored_as_the_version_read() {
+    let (drive, zone) = drive();
+    put(&zone, NOTE_REL, NOTE.as_bytes(), AN_HOUR);
+    let profile = profile(drive.path());
+    declare(&profile, &[TG]);
+    let pinned = pin(&[TG]);
+    let vault = Vault::at(drive.path());
+    let out = out(&profile, &vault, Some(&pinned));
+    let vm = panel(&zone, SESSION, &out, Some(ME)).expect("panel");
+    let offered = vm.knowledge[0].destination.clone().expect("a destination");
+    assert_eq!(
+        (
+            offered.folder.as_str(),
+            offered.name.as_str(),
+            offered.fixed
+        ),
+        ("10-notes", "short.md", false)
+    );
+    offer::promote_to(
+        &zone,
+        SESSION,
+        NOTE_REL,
+        "10-notes/knowledge",
+        "short.md",
+        Some(&sha256_hex(NOTE)),
+        Some(&tgorka()),
+        &out,
+    )
+    .expect("promoted");
+
+    // Another person's review in notes: the copy differs from the candidate
+    // and is still the one the note published (R252 refuses an edit).
+    let edited = knowledge::review(
+        &knowledge::review(NOTE, "tgorka", AT, true),
+        "marta",
+        AT,
+        true,
+    );
+    std::fs::write(drive.path().join(TARGET), &edited).expect("marta reviews the copy");
+    let candidate = offer::read_note(&zone, SESSION, NOTE_REL, false, &out).expect("candidate");
+    let copy = offer::read_note(&zone, SESSION, NOTE_REL, true, &out).expect("copy");
+    assert_eq!(
+        (candidate.text.as_str(), candidate.revision.as_str()),
+        (NOTE, sha256_hex(NOTE).as_str())
+    );
+    assert_eq!(copy.text, edited);
+    let vm = panel(&zone, SESSION, &out, Some(ME)).expect("panel");
+    assert_eq!(
+        vm.knowledge[0]
+            .copy
+            .as_ref()
+            .and_then(|copy| copy.revision.clone()),
+        Some(copy.revision.clone())
+    );
+    let wrong = review(
+        &zone,
+        SESSION,
+        NOTE_REL,
+        "tgorka",
+        AT,
+        false,
+        &candidate.revision,
+        &out,
+    );
+    assert!(
+        matches!(&wrong, Err(VerbError::Refused(sentence)) if sentence == COPY_CHANGED),
+        "{wrong:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(drive.path().join(TARGET)).ok(),
+        Some(edited.clone())
+    );
+    review(
+        &zone,
+        SESSION,
+        NOTE_REL,
+        "tgorka",
+        AT,
+        false,
+        &copy.revision,
+        &out,
+    )
+    .expect("unticked as read");
+    assert!(
+        !panel(&zone, SESSION, &out, Some(ME))
+            .expect("panel")
+            .knowledge[0]
+            .reviewed_by_me
+    );
+
+    std::fs::remove_file(drive.path().join(TARGET)).expect("lose the copy");
+    let vm = panel(&zone, SESSION, &out, Some(ME)).expect("panel");
+    let note = &vm.knowledge[0];
+    assert_eq!(note.state, Some(PromoteState::MissingTarget));
+    assert!(!note.copy.as_ref().expect("its copy").there);
+    let repair = note.destination.clone().expect("a repair");
+    assert_eq!(
+        (repair.folder.as_str(), repair.name.as_str(), repair.fixed),
+        ("10-notes/knowledge", "short.md", true)
+    );
+    offer::promote_to(
+        &zone,
+        SESSION,
+        NOTE_REL,
+        &repair.folder,
+        &repair.name,
+        Some(&candidate.revision),
+        Some(&tgorka()),
+        &out,
+    )
+    .expect("restored");
+    assert_eq!(
+        std::fs::read_to_string(drive.path().join(TARGET)).ok(),
+        Some(knowledge::review(NOTE, "tgorka", AT, true))
+    );
+    let vm = panel(&zone, SESSION, &out, Some(ME)).expect("panel");
+    assert!(vm.knowledge[0].reviewed_by_me);
+    assert_eq!(vm.knowledge[0].destination, None);
+}
+
+/// R95P-07/08: the panel offers out only what the promotion takes — a
+/// text artifact under its own name in the vault, not a binary one, nothing
+/// without a table to record it — and the target is composed in Rust from
+/// the folder and filename, inside the vault only.
+#[test]
+fn the_panel_offers_only_what_the_promotion_takes() {
+    let (drive, zone) = drive();
+    let profile = profile(drive.path());
+    declare(&profile, &[TG]);
+    let pinned = pin(&[TG]);
+    let vault = Vault::at(drive.path());
+    let out = out(&profile, &vault, Some(&pinned));
+    put(
+        &zone,
+        "artifacts/report.md",
+        "# Report — é\n".as_bytes(),
+        AN_HOUR,
+    );
+    put(&zone, "artifacts/data.bin", b"\x00\xff\xfe binary", AN_HOUR);
+    put(&zone, NOTE_REL, NOTE.as_bytes(), AN_HOUR);
+    let vm = panel(&zone, SESSION, &out, Some(ME)).expect("panel");
+    let offers: Vec<_> = vm
+        .artifacts
+        .iter()
+        .map(|offer| {
+            (
+                offer.path.as_str(),
+                offer
+                    .destination
+                    .as_ref()
+                    .map(|to| (to.folder.as_str(), to.name.as_str())),
+                offer.unavailable.is_some(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        offers,
+        [
+            ("artifacts/data.bin", None, true),
+            (
+                "artifacts/report.md",
+                Some(("10-notes", "report.md")),
+                false
+            ),
+        ]
+    );
+    for (folder, name) in [
+        ("30-work", "report.md"),
+        ("10-notes", "../report.md"),
+        ("10-notes/../30-work", "report.md"),
+    ] {
+        let refused = offer::promote_to(
+            &zone,
+            SESSION,
+            "artifacts/report.md",
+            folder,
+            name,
+            None,
+            None,
+            &out,
+        );
+        assert!(
+            matches!(refused, Err(VerbError::Refused(_))),
+            "{folder} + {name}: {refused:?}"
+        );
+    }
+    assert!(!drive.path().join("30-work").exists());
+    offer::promote_to(
+        &zone,
+        SESSION,
+        "artifacts/report.md",
+        "10-notes",
+        "report.md",
+        None,
+        None,
+        &out,
+    )
+    .expect("promoted out");
+    assert!(drive.path().join("10-notes/report.md").is_file());
+
+    std::fs::write(
+        zone.join(SESSION).join("README.md"),
+        "---\nid: 01J5AAAAAAAAAAAAAAAAAAAAAA\n---\n# Harvest\n",
+    )
+    .expect("no table");
+    put(&zone, "workspace/draft.md", b"d\n", AN_HOUR);
+    let vm = panel(&zone, SESSION, &out, Some(ME)).expect("panel");
+    assert!(vm.unlisted.iter().all(|file| file.refused.is_some()));
+    assert!(vm.artifacts.iter().all(|offer| offer.destination.is_none()));
+    assert!(vm.knowledge[0].destination.is_none() && vm.knowledge[0].unavailable.is_some());
+}
+
+/// R234 (R95P2-03): the archive checklist holds everything the emptying
+/// removes. From an empty checklist, a hidden file and a file in a hidden
+/// folder arriving refuse the archive decided before them, nothing
+/// removed; read again, each is an item that needs a choice, and an
+/// archive without one is refused; a link is an item that may only be
+/// skipped. Decided, the archive removes them.
+#[test]
+fn the_archive_checklist_holds_everything_the_emptying_removes() {
+    let (drive, zone) = drive();
+    let profile = profile(drive.path());
+    let vault = Vault::at(drive.path());
+    let out = out(&profile, &vault, None);
+    let empty = panel(&zone, SESSION, &out, None).expect("panel");
+    assert!(empty.unlisted.is_empty() && empty.complete);
+
+    put(&zone, "workspace/.draft.md", b"hidden work\n", AN_HOUR);
+    put(&zone, "workspace/.staging/output.md", b"staged\n", AN_HOUR);
+    let refused = archive_with(&zone, &[], &empty.revision);
+    assert!(
+        matches!(&refused, Err(VerbError::Refused(sentence)) if sentence == keeper_core::sessions::offer::SNAPSHOT_CHANGED),
+        "{refused:?}"
+    );
+    assert!(zone.join(SESSION).join("workspace/.draft.md").is_file());
+
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("/etc/hostname", zone.join(SESSION).join("workspace/link"))
+        .expect("link");
+    let vm = panel(&zone, SESSION, &out, None).expect("panel");
+    let unlisted: Vec<_> = vm
+        .unlisted
+        .iter()
+        .map(|file| (file.source.as_str(), file.refused.is_some()))
+        .collect();
+    let mut expected = vec![
+        ("workspace/.draft.md", false),
+        ("workspace/.staging/output.md", false),
+    ];
+    if cfg!(unix) {
+        expected.push(("workspace/link", true));
+    }
+    assert_eq!(unlisted, expected);
+    let refused = archive_with(&zone, &[], &vm.revision);
+    assert!(
+        matches!(&refused, Err(VerbError::Refused(sentence)) if sentence.contains("has no choice")),
+        "{refused:?}"
+    );
+    assert!(zone
+        .join(SESSION)
+        .join("workspace/.staging/output.md")
+        .is_file());
+    archive_with(&zone, &decide_all(&vm, &[]), &vm.revision).expect("archived as decided");
+    assert!(!zone.join(ARCHIVED).join("workspace/.draft.md").exists());
+    assert!(!zone.join(ARCHIVED).join("workspace/.staging").exists());
+}
+
+/// R234 (R95P2-05): what a row says of its target is part of its choice.
+/// A target deleted after a Skip takes that row's choice with it — the
+/// other choices stay and the checklist is no longer complete — and a
+/// target replaced between the checklist and the archive refuses the
+/// archive, the source kept.
+#[test]
+fn losing_a_target_takes_the_choice_with_it() {
+    let (drive, zone) = drive();
+    let profile = profile(drive.path());
+    let vault = Vault::at(drive.path());
+    let out = out(&profile, &vault, None);
+    put(&zone, "workspace/report.md", b"report\n", AN_HOUR);
+    put(&zone, "workspace/other.md", b"other\n", AN_HOUR);
+    promote_in(
+        &zone,
+        SESSION,
+        "workspace/report.md",
+        "artifacts/report.md",
+        "",
+        SETTLE_MS,
+        now_ms(),
+    )
+    .expect("promoted");
+    let shown = panel(&zone, SESSION, &out, None).expect("panel");
+    let skipped = PanelIntentVm {
+        choices: decide_all(&shown, &[]),
+        notes: Vec::new(),
+    };
+    let decided = offer::panel_for(&zone, SESSION, &out, None, &skipped).expect("panel");
+    assert!(decided.complete);
+
+    std::fs::remove_file(zone.join(SESSION).join("artifacts/report.md")).expect("lost");
+    let after = offer::panel_for(&zone, SESSION, &out, None, &decided.intent).expect("panel");
+    assert_eq!(after.rows[0].state, PromoteState::MissingTarget);
+    assert_eq!(after.rows[0].choice, None, "the Skip went with the target");
+    assert!(after.unlisted[0].choice.is_some(), "the other choice stays");
+    assert!(!after.complete);
+    let refused = archive_with(&zone, &decided.intent.choices, &after.revision);
+    assert!(matches!(refused, Err(VerbError::Refused(_))), "{refused:?}");
+
+    put(&zone, "artifacts/report.md", b"report\n", AN_HOUR);
+    let shown = panel(&zone, SESSION, &out, None).expect("panel");
+    let choices = decide_all(&shown, &[]);
+    put(&zone, "artifacts/report.md", b"someone else's\n", AN_HOUR);
+    let refused = archive_with(&zone, &choices, &shown.revision);
+    assert!(
+        matches!(&refused, Err(VerbError::Refused(sentence)) if sentence == keeper_core::sessions::offer::SNAPSHOT_CHANGED),
+        "{refused:?}"
+    );
+    assert!(zone.join(SESSION).join("workspace/report.md").is_file());
+}
+
+/// R234 (R95P2-06): the archive is told an explicitly decided checklist
+/// from one with no decisions: no choices, a choice missing, a choice
+/// about a row the checklist does not hold or two about one row are each
+/// refused, nothing archived; a promotion of a row that offers none is
+/// refused with that row's reason; every row explicitly skipped archives.
+#[test]
+fn an_archive_needs_one_choice_for_every_row() {
+    let (drive, zone) = drive();
+    let profile = profile(drive.path());
+    let vault = Vault::at(drive.path());
+    let out = out(&profile, &vault, None);
+    put(&zone, "workspace/a.md", b"a\n", AN_HOUR);
+    put(&zone, "workspace/b.md", b"b\n", AN_HOUR);
+    std::fs::write(
+        zone.join(SESSION).join("README.md"),
+        README_TEXT.replace(
+            "| --------- | ----------- | ---- |\n",
+            "| --------- | ----------- | ---- |\n| workspace/gone.md | artifacts/gone.md | |\n",
+        ),
+    )
+    .expect("a row whose source is gone");
+    let vm = panel(&zone, SESSION, &out, None).expect("panel");
+    let all = decide_all(&vm, &[]);
+    let stranger = ChoiceVm {
+        revision: "not a row".to_owned(),
+        promote: false,
+        target: String::new(),
+    };
+    let mut gone = all.clone();
+    gone[0].promote = true;
+    gone[0].target = "artifacts/gone.md".to_owned();
+    for (name, choices) in [
+        ("none", Vec::new()),
+        ("one missing", all[1..].to_vec()),
+        ("a stranger", [all.clone(), vec![stranger]].concat()),
+        ("twice", [all.clone(), all[..1].to_vec()].concat()),
+        ("a refused promotion", gone),
+    ] {
+        let refused = archive_with(&zone, &choices, &vm.revision);
+        assert!(
+            matches!(refused, Err(VerbError::Refused(_))),
+            "{name}: {refused:?}"
+        );
+        assert!(
+            zone.join(SESSION).join("workspace/a.md").is_file(),
+            "{name}"
+        );
+    }
+    archive_with(&zone, &all, &vm.revision).expect("every row skipped");
+    assert!(zone.join(ARCHIVED).is_dir());
+}
+
+/// R234 (R95P2-06): the panel decides the person's reads and consent:
+/// a candidate read and consented to is current and consented; a newer
+/// candidate makes the read stale and drops the consent from the intent
+/// the panel keeps.
+#[test]
+fn the_panel_decides_reads_and_consent() {
+    let (drive, zone) = drive();
+    put(&zone, NOTE_REL, NOTE.as_bytes(), AN_HOUR);
+    let profile = profile(drive.path());
+    declare(&profile, &[TG]);
+    let pinned = pin(&[TG]);
+    let vault = Vault::at(drive.path());
+    let out = out(&profile, &vault, Some(&pinned));
+    let read = offer::read_note(&zone, SESSION, NOTE_REL, false, &out).expect("read");
+    let intent = PanelIntentVm {
+        choices: Vec::new(),
+        notes: vec![NoteIntentVm {
+            path: NOTE_REL.to_owned(),
+            read: Some(read.revision.clone()),
+            copy: None,
+            consent: Some(read.revision.clone()),
+        }],
+    };
+    let vm = offer::panel_for(&zone, SESSION, &out, Some(ME), &intent).expect("panel");
+    assert!(vm.knowledge[0].consented);
+    assert_eq!(
+        vm.knowledge[0].candidate_read,
+        keeper_core::sessions::offer::ReadState::Current
+    );
+    put(
+        &zone,
+        NOTE_REL,
+        NOTE.replace("Three", "Four").as_bytes(),
+        AN_HOUR,
+    );
+    let vm = offer::panel_for(&zone, SESSION, &out, Some(ME), &vm.intent).expect("panel");
+    assert!(!vm.knowledge[0].consented);
+    assert_eq!(
+        vm.knowledge[0].candidate_read,
+        keeper_core::sessions::offer::ReadState::Stale
+    );
+    assert_eq!(vm.intent.notes[0].consent, None);
+}
+
+/// R234 (R95P2-07): the panel's text test agrees with every verdict of
+/// `promote-vectors.json`, which the mock shell's test loads as well:
+/// invalid UTF-8 is not text, valid UTF-8 holding a NUL is.
+#[test]
+fn every_text_vector_matches() {
+    let vectors: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../keeper-core/src/sessions/promote-vectors.json"
+    ))
+    .expect("vectors");
+    let dir = tempfile::tempdir().expect("dir");
+    for case in vectors["isText"].as_array().expect("cases") {
+        let path = dir.path().join("file");
+        let hex = case["hex"].as_str().expect("hex");
+        let bytes: Vec<u8> = (0..hex.len())
+            .step_by(2)
+            .map(|at| u8::from_str_radix(&hex[at..at + 2], 16).expect("hex"))
+            .collect();
+        std::fs::write(&path, bytes).expect("write");
+        assert_eq!(offer::is_text(&path).ok(), case["text"].as_bool(), "{case}");
+    }
+}
+
+/// The archive of the checklist `revision` with `choices`, run up to its
+/// emptying's last check and stopped there as a crash stops it: its journal
+/// kept, every step before the emptying done.
+fn crash_at_the_emptying(zone: &Path, choices: &[ChoiceVm], revision: &str) {
+    crate::sessions::exec::seam::after_check(|| panic!("the process is gone"));
+    let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        archive_with(zone, choices, revision)
+    }));
+    assert!(crashed.is_err(), "the archive stopped at its emptying");
+    assert!(zone.join(".keeper/sessions-journal.json").is_file());
+}
+
+/// R249 (R95P3-03): what a target said when a person's choice let the
+/// emptying remove its source travels with the archive's journal. Every
+/// row skipped, or a row promoted by the plan's own checked copy, the
+/// archive crashes before its emptying; a target deleted or replaced
+/// before the resume refuses it — the source kept, the session not moved,
+/// the old choice no longer making the checklist complete. Nothing
+/// changed, the plan's own copy is no drift: the resume archives.
+#[test]
+fn a_resumed_archive_empties_only_while_its_targets_say_what_they_said() {
+    for (name, promote, change) in [
+        ("skipped, the target deleted", false, Some(None)),
+        (
+            "skipped, the target replaced",
+            false,
+            Some(Some(&b"another\n"[..])),
+        ),
+        ("promoted, the copy deleted", true, Some(None)),
+        (
+            "promoted, the copy replaced",
+            true,
+            Some(Some(&b"another\n"[..])),
+        ),
+        ("promoted, nothing changed", true, None),
+    ] {
+        let (drive, zone) = drive();
+        let profile = profile(drive.path());
+        let vault = Vault::at(drive.path());
+        let out = out(&profile, &vault, None);
+        put(&zone, "workspace/report.md", b"report\n", AN_HOUR);
+        promote_in(
+            &zone,
+            SESSION,
+            "workspace/report.md",
+            "artifacts/report.md",
+            "",
+            SETTLE_MS,
+            now_ms(),
+        )
+        .expect("promoted");
+        if promote {
+            put(&zone, "workspace/report.md", b"report, v2\n", AN_HOUR);
+        }
+        let shown = panel(&zone, SESSION, &out, None).expect("panel");
+        let promotes: &[(&str, &str)] = if promote {
+            &[("workspace/report.md", "artifacts/report.md")]
+        } else {
+            &[]
+        };
+        let intent = PanelIntentVm {
+            choices: decide_all(&shown, promotes),
+            notes: Vec::new(),
+        };
+        crash_at_the_emptying(&zone, &intent.choices, &shown.revision);
+        let target = zone.join(SESSION).join("artifacts/report.md");
+        match change {
+            Some(None) => std::fs::remove_file(&target).expect("deleted"),
+            Some(Some(bytes)) => std::fs::write(&target, bytes).expect("replaced"),
+            None => {}
+        }
+        let resumed = crate::sessions::exec::resume(&zone);
+        if change.is_none() {
+            resumed.expect("resumed");
+            assert_eq!(
+                std::fs::read(zone.join(ARCHIVED).join("artifacts/report.md")).ok(),
+                Some(b"report, v2\n".to_vec()),
+                "{name}"
+            );
+            continue;
+        }
+        assert!(
+            matches!(resumed, Err(crate::sessions::exec::ExecError::Refused(_))),
+            "{name}: {resumed:?}"
+        );
+        assert!(
+            read(&zone, "workspace/report.md").is_some(),
+            "{name}: the source kept"
+        );
+        assert!(!zone.join(ARCHIVED).exists(), "{name}");
+        let again = offer::panel_for(&zone, SESSION, &out, None, &intent).expect("panel");
+        assert!(!again.complete, "{name}: decided again");
+    }
+}
+
+/// R249 (R95P3-04): a session whose `workspace/` is a link — to another
+/// session's workspace in the zone, or to a folder outside it — is not
+/// listed through it: the panel says so, an archive that empties is
+/// refused, and the folder it leads to keeps every byte.
+#[cfg(unix)]
+#[test]
+fn a_linked_workspace_is_never_listed_or_emptied() {
+    let outside = tempfile::tempdir().expect("outside");
+    for name in ["in the zone", "out of it"] {
+        let (drive, zone) = drive();
+        let profile = profile(drive.path());
+        let vault = Vault::at(drive.path());
+        let out = out(&profile, &vault, None);
+        let other = if name == "in the zone" {
+            zone.join("active/2026-10-01-other/workspace")
+        } else {
+            outside.path().join("workspace")
+        };
+        std::fs::create_dir_all(&other).expect("other");
+        std::fs::write(other.join("theirs.md"), "their work\n").expect("theirs");
+        let workspace = zone.join(SESSION).join("workspace");
+        std::fs::remove_dir(&workspace).expect("empty workspace");
+        std::os::unix::fs::symlink(&other, &workspace).expect("link");
+
+        let vm = panel(&zone, SESSION, &out, None).expect("panel");
+        assert!(vm.unlisted.is_empty(), "{name}: {:?}", vm.unlisted);
+        assert!(
+            vm.problems.iter().any(|problem| problem.contains("link")),
+            "{name}: {:?}",
+            vm.problems
+        );
+        let refused = archive_with(&zone, &decide_all(&vm, &[]), &vm.revision);
+        assert!(
+            matches!(refused, Err(VerbError::Refused(_))),
+            "{name}: {refused:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(other.join("theirs.md"))
+                .ok()
+                .as_deref(),
+            Some("their work\n"),
+            "{name}"
+        );
+        assert!(zone.join(SESSION).exists(), "{name}");
+        std::fs::remove_dir_all(&other).expect("cleaned");
+    }
+}
+
+/// R249 (R95P3-05): a line of the `## Promote` table written twice is two
+/// items of the checklist, each with its own revision and choice: one
+/// skipped leaves the checklist incomplete; the repeat offers no promotion
+/// of its own; both decided, the intent the panel returns as complete is
+/// one the archive takes — the first promoted, the repeat skipped.
+#[test]
+fn a_row_written_twice_is_two_choices_the_archive_takes() {
+    let (drive, zone) = drive();
+    let profile = profile(drive.path());
+    let vault = Vault::at(drive.path());
+    let out = out(&profile, &vault, None);
+    put(&zone, "workspace/a.md", b"a\n", AN_HOUR);
+    let row = "| workspace/a.md | artifacts/a.md | |\n";
+    std::fs::write(
+        zone.join(SESSION).join("README.md"),
+        README_TEXT.replace("| ---- |\n", &format!("| ---- |\n{row}{row}")),
+    )
+    .expect("a row written twice");
+    let vm = panel(&zone, SESSION, &out, None).expect("panel");
+    assert_eq!(vm.rows.len(), 2);
+    assert_ne!(vm.rows[0].revision, vm.rows[1].revision);
+    assert_eq!(vm.rows[0].refused, None);
+    assert!(vm.rows[1].refused.is_some(), "the repeat promotes nothing");
+
+    let skip = |at: usize| ChoiceVm {
+        revision: vm.rows[at].revision.clone(),
+        promote: false,
+        target: String::new(),
+    };
+    let one = offer::panel_for(
+        &zone,
+        SESSION,
+        &out,
+        None,
+        &PanelIntentVm {
+            choices: vec![skip(0)],
+            notes: Vec::new(),
+        },
+    )
+    .expect("panel");
+    assert!(!one.complete, "the repeat still needs its choice");
+    assert_eq!(
+        one.rows
+            .iter()
+            .map(|row| row.choice.is_some())
+            .collect::<Vec<_>>(),
+        [true, false]
+    );
+
+    let promote_first = ChoiceVm {
+        promote: true,
+        target: "artifacts/a.md".to_owned(),
+        ..skip(0)
+    };
+    let both = offer::panel_for(
+        &zone,
+        SESSION,
+        &out,
+        None,
+        &PanelIntentVm {
+            choices: vec![promote_first, skip(1)],
+            notes: Vec::new(),
+        },
+    )
+    .expect("panel");
+    assert!(both.complete);
+    archive_with(&zone, &both.intent.choices, &both.revision).expect("archived as decided");
+    assert_eq!(
+        std::fs::read(zone.join(ARCHIVED).join("artifacts/a.md")).ok(),
+        Some(b"a\n".to_vec())
+    );
+}
+
+/// R249 (R95P3-07): a reviewed copy stays one keeper reads whole. Read at
+/// a length where another person's review lands exactly at the bound, the
+/// review lands and the copy is read whole; one byte longer, that review is
+/// refused and the copy keeps every byte.
+#[test]
+fn a_review_never_grows_the_copy_past_what_keeper_reads() {
+    let (drive, zone) = drive();
+    put(&zone, NOTE_REL, NOTE.as_bytes(), AN_HOUR);
+    let profile = profile(drive.path());
+    declare(&profile, &[TG]);
+    let pinned = pin(&[TG]);
+    let vault = Vault::at(drive.path());
+    let out = out(&profile, &vault, Some(&pinned));
+    let read = offer::read_note(&zone, SESSION, NOTE_REL, false, &out).expect("the candidate");
+    offer::promote_to(
+        &zone,
+        SESSION,
+        NOTE_REL,
+        "10-notes/knowledge",
+        "short.md",
+        Some(&read.revision),
+        Some(&tgorka()),
+        &out,
+    )
+    .expect("promoted");
+    let reviewed = std::fs::read_to_string(drive.path().join(TARGET)).expect("the copy");
+    let growth = knowledge::review(&reviewed, "marta", AT, true).len() - reviewed.len();
+    // The copy is filled with a long-named reviewer's entry, not an edit: it
+    // stays the copy the note published (R252), only its review keys grow.
+    let one = knowledge::review(&reviewed, "p", AT, true).len();
+    for (name, over) in [("at the bound", 0), ("one byte past it", 1)] {
+        let length = knowledge::MAX_REVIEWED_BYTES - growth + over;
+        let copy = knowledge::review(&reviewed, &"p".repeat(1 + length - one), AT, true);
+        assert_eq!(copy.len(), length, "{name}");
+        std::fs::write(drive.path().join(TARGET), &copy).expect("the copy");
+        let landed = tick(&zone, "marta", true, &out);
+        let now = std::fs::read_to_string(drive.path().join(TARGET)).expect("the copy");
+        if over == 0 {
+            landed.expect(name);
+            assert_eq!(now.len(), knowledge::MAX_REVIEWED_BYTES, "{name}");
+            let whole = offer::read_note(&zone, SESSION, NOTE_REL, true, &out).expect(name);
+            assert_eq!(whole.text, now, "{name}");
+        } else {
+            assert!(
+                matches!(&landed, Err(VerbError::Refused(why)) if why.contains("would hold more than")),
+                "{name}: {landed:?}"
+            );
+            assert_eq!(now, copy, "{name}: every byte kept");
+        }
+    }
+}
+
+/// The command vectors: Unix only, for the closed files their scenarios
+/// make (`Permissions::from_mode`).
+#[cfg(unix)]
+mod command_vectors {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    use super::*;
+
+    /// R249 (R95P3-06): the outcomes of the panel's commands over real files —
+    /// every panel, read, promotion out, review and archive of each scenario of
+    /// `command-vectors.json` — are the ones recorded there, which the dev
+    /// harness's test replays through its own handlers. With
+    /// `KEEPER_WRITE_VECTORS` set, this records them instead.
+    #[test]
+    fn every_command_vector_holds() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/promote/command-vectors.json");
+        let mut vectors: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("vectors")).expect("json");
+        let record = std::env::var_os("KEEPER_WRITE_VECTORS").is_some();
+        for scenario in vectors["scenarios"].as_array_mut().expect("scenarios") {
+            let outcomes = command_outcomes(scenario);
+            let name = scenario["name"].clone();
+            for (step, outcome) in scenario["steps"]
+                .as_array_mut()
+                .expect("steps")
+                .iter_mut()
+                .zip(outcomes)
+            {
+                if record {
+                    step["expect"] = outcome;
+                } else {
+                    let asked = step.get("expect").cloned().unwrap_or_default();
+                    assert_eq!(asked, outcome, "{name}: {step}");
+                }
+            }
+        }
+        if record {
+            let text = serde_json::to_string_pretty(&vectors).expect("json");
+            std::fs::write(&path, format!("{text}\n")).expect("recorded");
+        }
+    }
+
+    /// The bytes a vector's file stands for: its `text` or `hex`, padded with
+    /// `pad.with` to `pad.to` bytes.
+    fn vector_bytes(file: &serde_json::Value) -> Vec<u8> {
+        let mut bytes = match file["hex"].as_str() {
+            Some(hex) => (0..hex.len())
+                .step_by(2)
+                .map(|at| u8::from_str_radix(&hex[at..at + 2], 16).expect("hex"))
+                .collect(),
+            None => file["text"].as_str().expect("text").as_bytes().to_vec(),
+        };
+        if let Some(to) = file["pad"]["to"].as_u64() {
+            let with = file["pad"]["with"].as_str().expect("with").as_bytes()[0];
+            bytes.resize(usize::try_from(to).expect("length"), with);
+        }
+        bytes
+    }
+
+    /// Write `bytes` at `path`, last changed `changed` ms after the epoch.
+    fn put_at(path: &Path, bytes: &[u8], changed: &serde_json::Value) {
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+        std::fs::write(path, bytes).expect("write");
+        let at = UNIX_EPOCH + Duration::from_millis(changed.as_u64().expect("changed"));
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .and_then(|file| file.set_modified(at))
+            .expect("mtime");
+    }
+
+    /// A command's outcome as a vector records it: `ok`, or the refusal.
+    fn outcome_of<T>(result: Result<T, VerbError>) -> Result<T, serde_json::Value> {
+        result.map_err(|error| {
+            let sentence = match error {
+                VerbError::Refused(sentence) => sentence,
+                other => other.to_string(),
+            };
+            serde_json::json!({ "refused": sentence })
+        })
+    }
+
+    /// The choices a step names: `"intent"`, the last panel's kept intent;
+    /// otherwise each by the `item` of the last panel (its rows, then its
+    /// unlisted files) or by a `revision` of its own.
+    fn vector_choices(asked: &serde_json::Value, shown: &SessionPromoteVm) -> Vec<ChoiceVm> {
+        if asked.as_str() == Some("intent") {
+            return shown.intent.choices.clone();
+        }
+        let items: Vec<&String> = shown
+            .rows
+            .iter()
+            .map(|row| &row.revision)
+            .chain(shown.unlisted.iter().map(|file| &file.revision))
+            .collect();
+        asked
+            .as_array()
+            .expect("choices")
+            .iter()
+            .map(|choice| ChoiceVm {
+                revision: match choice["item"].as_u64() {
+                    Some(item) => items[usize::try_from(item).expect("item")].clone(),
+                    None => choice["revision"].as_str().expect("revision").to_owned(),
+                },
+                promote: choice["promote"].as_bool().unwrap_or(false),
+                target: choice["target"].as_str().unwrap_or_default().to_owned(),
+            })
+            .collect()
+    }
+
+    /// Every step's outcome of the vector `scenario`, run over real files.
+    fn command_outcomes(scenario: &serde_json::Value) -> Vec<serde_json::Value> {
+        let (drive, zone) = drive();
+        let profile = profile(drive.path());
+        declare(&profile, &[TG]);
+        let pinned = pin(&[TG]);
+        let vault = Vault::at(drive.path());
+        let out = out(&profile, &vault, Some(&pinned));
+        let session = zone.join(SESSION);
+        // A vault copy's text as written: its bytes, each review in.
+        let copy_text = |copy: &serde_json::Value| {
+            let mut text = String::from_utf8(vector_bytes(copy)).expect("text");
+            for by in copy["reviewers"].as_array().expect("reviewers") {
+                let person = by.as_str().and_then(|by| by.strip_prefix("human:"));
+                text = knowledge::review(&text, person.expect("a person"), AT, true);
+            }
+            text
+        };
+        let rows: String = scenario["rows"]
+            .as_array()
+            .expect("rows")
+            .iter()
+            .map(|row| {
+                let (source, target) = (
+                    row["source"].as_str().expect("source"),
+                    row["target"].as_str().expect("target"),
+                );
+                // `"published": true`: the row records the scenario's copy at
+                // its target as the one its source published.
+                let published = (row["published"].as_bool() == Some(true)).then(|| {
+                    let copy = scenario["vault"]
+                        .as_array()
+                        .expect("vault")
+                        .iter()
+                        .find(|copy| copy["path"] == target)
+                        .expect("the copy it published");
+                    promote::copy_digest(source, copy_text(copy).as_bytes())
+                });
+                promote::render_row(
+                    source,
+                    target,
+                    row["note"].as_str().expect("note"),
+                    published.as_deref(),
+                )
+            })
+            .collect();
+        std::fs::write(
+            session.join("README.md"),
+            format!("---\nid: 01J5AAAAAAAAAAAAAAAAAAAAAA\n---\n# Session\n\n## Promote\n\n| workspace | → artifacts | note |\n| --- | --- | --- |\n{rows}"),
+        )
+        .expect("readme");
+        for dir in scenario["dirs"].as_array().into_iter().flatten() {
+            std::fs::create_dir_all(session.join(dir.as_str().expect("dir"))).expect("dir");
+        }
+        for file in scenario["files"].as_array().expect("files") {
+            let rel = file["path"].as_str().expect("path");
+            put_at(&session.join(rel), &vector_bytes(file), &file["changed"]);
+        }
+        for copy in scenario["vault"].as_array().expect("vault") {
+            let text = copy_text(copy);
+            let rel = copy["path"].as_str().expect("path");
+            put_at(&drive.path().join(rel), text.as_bytes(), &copy["changed"]);
+        }
+        let at = |rel: &str| {
+            if rel.starts_with("10-notes/") {
+                drive.path().join(rel)
+            } else {
+                session.join(rel)
+            }
+        };
+        let unreadable: Vec<PathBuf> = scenario["unreadable"]
+            .as_array()
+            .expect("unreadable")
+            .iter()
+            .map(|rel| at(rel.as_str().expect("path")))
+            .collect();
+        for path in &unreadable {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000)).expect("closed");
+        }
+
+        let mut shown = None::<SessionPromoteVm>;
+        let mut candidates = std::collections::HashMap::<String, String>::new();
+        let mut copies = std::collections::HashMap::<String, String>::new();
+        let mut outcomes = Vec::new();
+        for step in scenario["steps"].as_array().expect("steps") {
+            let ok = serde_json::json!({ "ok": true });
+            let outcome = if let Some(asked) = step.get("panel") {
+                let intent = match (&asked["intent"], &shown) {
+                    (serde_json::Value::Null, _) => PanelIntentVm::default(),
+                    (choices, Some(shown)) => PanelIntentVm {
+                        choices: vector_choices(choices, shown),
+                        notes: Vec::new(),
+                    },
+                    (_, None) => panic!("an intent needs a panel first"),
+                };
+                match outcome_of(offer::panel_for(&zone, SESSION, &out, Some(ME), &intent)) {
+                    Ok(vm) => {
+                        let value = serde_json::to_value(&vm).expect("vm");
+                        shown = Some(vm);
+                        value
+                    }
+                    Err(refused) => refused,
+                }
+            } else if let Some(asked) = step.get("read") {
+                let path = asked["path"].as_str().expect("path");
+                let copy = asked["copy"].as_bool().expect("copy");
+                match outcome_of(offer::read_note(&zone, SESSION, path, copy, &out)) {
+                    Ok(read) => {
+                        let reads = if copy { &mut copies } else { &mut candidates };
+                        reads.insert(path.to_owned(), read.revision.clone());
+                        let mut value = serde_json::json!({
+                            "revision": read.revision,
+                            "bytes": read.text.len(),
+                        });
+                        if read.text.len() <= 4096 {
+                            value["text"] = read.text.into();
+                        }
+                        value
+                    }
+                    Err(refused) => refused,
+                }
+            } else if let Some(asked) = step.get("promoteTo") {
+                let source = asked["source"].as_str().expect("source");
+                let expected = asked["expected"]
+                    .as_bool()
+                    .filter(|expected| *expected)
+                    .and_then(|_| candidates.get(source));
+                outcome_of(offer::promote_to(
+                    &zone,
+                    SESSION,
+                    source,
+                    asked["folder"].as_str().expect("folder"),
+                    asked["name"].as_str().expect("name"),
+                    expected.map(String::as_str),
+                    Some(&tgorka()),
+                    &out,
+                ))
+                .map_or_else(|refused| refused, |()| ok)
+            } else if let Some(asked) = step.get("review") {
+                let path = asked["path"].as_str().expect("path");
+                outcome_of(review(
+                    &zone,
+                    SESSION,
+                    path,
+                    "tgorka",
+                    AT,
+                    asked["reviewed"].as_bool().expect("reviewed"),
+                    copies.get(path).map_or("", String::as_str),
+                    &out,
+                ))
+                .map_or_else(|refused| refused, |()| ok)
+            } else if let Some(asked) = step.get("archive") {
+                let shown = shown.as_ref().expect("an archive needs a panel first");
+                let choices = vector_choices(&asked["choices"], shown);
+                outcome_of(archive_with(&zone, &choices, &shown.revision))
+                    .map_or_else(|refused| refused, |()| ok)
+            } else if let Some(asked) = step.get("write") {
+                let rel = asked["path"].as_str().expect("path");
+                put_at(&session.join(rel), &vector_bytes(asked), &asked["changed"]);
+                serde_json::Value::Null
+            } else {
+                panic!("a step this test does not know: {step}");
+            };
+            outcomes.push(outcome);
+        }
+        for path in &unreadable {
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755));
+        }
+        outcomes
+    }
 }

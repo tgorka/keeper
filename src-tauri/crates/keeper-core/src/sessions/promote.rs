@@ -38,7 +38,11 @@ use ts_rs::TS;
 use crate::agents::knowledge;
 use crate::notes::frontmatter::Frontmatter;
 use crate::notes::okf;
-use crate::sessions::model::ARTIFACTS_DIR;
+use crate::sessions::model::{ARTIFACTS_DIR, WORKSPACE_DIR};
+use crate::sessions::offer::{
+    self, ArtifactOfferVm, ChoiceVm, DestinationVm, PanelIntentVm, ReadState, UnlistedVm,
+    VaultCopyVm,
+};
 use crate::sessions::plan::sha256_hex;
 
 /// One row of the promote table.
@@ -514,8 +518,14 @@ pub struct PanelFacts {
     /// drive-relative for a target out of the session — with its fact, or
     /// why it could not be read. A file that is not there is not here.
     pub files: BTreeMap<String, Result<FileFact, String>>,
-    /// Every file under `workspace/`, session-relative.
+    /// Every entry under `workspace/` but a folder, session-relative —
+    /// hidden ones, links and special files too: what an archive's emptying
+    /// removes, each a choice of the checklist.
     pub workspace: Vec<String>,
+    /// Every entry under `workspace/`, folders too, with its stamp
+    /// ([`offer::is_regular`]) that a choice about it and the archive
+    /// checklist are bound to ([`offer::snapshot_revision`]).
+    pub stamps: BTreeMap<String, String>,
     /// Every note under `artifacts/knowledge/`.
     pub knowledge: Vec<KnowledgeFile>,
     /// For each harvested note whose row records a publication out of the
@@ -569,6 +579,14 @@ pub struct PromoteRowVm {
     pub line: Option<u32>,
     /// Why an `unknown` row's file could not be read.
     pub problem: Option<String>,
+    /// What a choice about this row is bound to ([`offer::row_revision`]).
+    pub revision: String,
+    /// Why this row offers no promotion into the session, or `None`
+    /// ([`offer::refused_in`]).
+    pub refused: Option<String>,
+    /// The person's choice about this row, while it still holds
+    /// ([`offer::decide`]).
+    pub choice: Option<ChoiceVm>,
 }
 
 /// One harvested note of the session (UX-DR137).
@@ -612,6 +630,23 @@ pub struct KnowledgeNoteVm {
     /// that could not be told. `None` when it is the copy, or nothing is
     /// there.
     pub foreign_copy: Option<String>,
+    /// The vault copy its row names, when it was promoted out.
+    pub copy: Option<VaultCopyVm>,
+    /// Where promoting it goes — the vault for a note not promoted yet,
+    /// its row's target to repair a missing copy or to publish a newer
+    /// candidate — or `None` when there is nothing to promote or it may
+    /// not be.
+    pub destination: Option<DestinationVm>,
+    /// Why this note may not be promoted, when it is the note's own reason.
+    pub unavailable: Option<String>,
+    /// Whether the candidate the person read is the version shown
+    /// ([`offer::decide`]).
+    pub candidate_read: ReadState,
+    /// Whether the vault copy the person read is the version shown.
+    pub copy_read: ReadState,
+    /// Whether the person said they reviewed the candidate version they
+    /// read and that is shown: what a promotion of it needs.
+    pub consented: bool,
 }
 
 /// The promote panel of one session (FR-243, FR-244, UX-DR90, UX-DR137).
@@ -623,9 +658,12 @@ pub struct SessionPromoteVm {
     /// Whether the README has a `## Promote` table at all.
     pub has_table: bool,
     pub rows: Vec<PromoteRowVm>,
-    /// `workspace/` files no row names, session-relative: promotable.
-    pub unlisted: Vec<String>,
+    /// `workspace/` files no row names: promotable.
+    pub unlisted: Vec<UnlistedVm>,
     pub knowledge: Vec<KnowledgeNoteVm>,
+    /// The session's other artifacts, each with what promoting it out
+    /// offers.
+    pub artifacts: Vec<ArtifactOfferVm>,
     /// The session's label chip, for an agent's session.
     pub label: Option<crate::agents::label::LabelVm>,
     /// The drive's notes vault, drive-relative: where a note may be
@@ -638,6 +676,13 @@ pub struct SessionPromoteVm {
     /// What the panel could not see, said rather than left out: a folder
     /// that would not list, a listing cut at its cap.
     pub problems: Vec<String>,
+    /// What the archive checklist is bound to ([`offer::snapshot_revision`]).
+    pub revision: String,
+    /// What the person did in the panel, as much of it as still holds: the
+    /// panel forwards it back with its next read ([`offer::decide`]).
+    pub intent: PanelIntentVm,
+    /// Every row and unlisted file has a choice: the checklist may archive.
+    pub complete: bool,
 }
 
 /// The panel for the README `readme` over `facts`: each row with its
@@ -651,10 +696,23 @@ pub struct SessionPromoteVm {
 /// refused are the caller's.
 pub fn promote_panel(readme: &str, facts: &PanelFacts, me: Option<&str>) -> SessionPromoteVm {
     let table = parse(readme);
-    let rows: Vec<PromoteRowVm> = table
+    let mut rows: Vec<PromoteRowVm> = table
         .as_ref()
         .map(|table| table.rows.iter().map(|row| row_vm(row, facts)).collect())
         .unwrap_or_default();
+    // A line written twice is two items of the checklist, each with a
+    // choice of its own: every repeat after the first is told apart by
+    // where it falls among them, and offers no promotion of its own.
+    let mut seen: BTreeMap<String, usize> = BTreeMap::new();
+    for row in &mut rows {
+        let earlier = seen.entry(row.revision.clone()).or_insert(0);
+        if *earlier > 0 {
+            row.revision = offer::occurrence(&row.revision, *earlier);
+            row.refused
+                .get_or_insert_with(|| offer::repeated(&row.source, &row.target));
+        }
+        *earlier += 1;
+    }
     let listed = |path: &str| {
         rows.iter()
             .any(|row| row.raw.is_none() && row.source == path)
@@ -662,8 +720,19 @@ pub fn promote_panel(readme: &str, facts: &PanelFacts, me: Option<&str>) -> Sess
     let unlisted = facts
         .workspace
         .iter()
-        .filter(|path| path.rsplit('/').next() != Some(".gitkeep") && !listed(path))
-        .cloned()
+        // The emptying keeps `workspace/.gitkeep`, and only that one.
+        .filter(|path| path.strip_prefix(WORKSPACE_DIR) != Some("/.gitkeep") && !listed(path))
+        .map(|path| {
+            let stamp = facts.stamps.get(path).map(String::as_str);
+            UnlistedVm {
+                source: path.clone(),
+                suggested: offer::suggested_artifact(path),
+                revision: offer::row_revision(path, "", "", stamp, None),
+                refused: offer::refused_unlisted(path, stamp)
+                    .or_else(|| table.is_none().then(|| RowRefusal::NoTable.to_string())),
+                choice: None,
+            }
+        })
         .collect();
     let knowledge = facts
         .knowledge
@@ -712,7 +781,23 @@ pub fn promote_panel(readme: &str, facts: &PanelFacts, me: Option<&str>) -> Sess
                 reviewed_by_me: me.is_some_and(|me| reviewers.iter().any(|by| by == me)),
                 problem: file.text.as_ref().err().cloned(),
                 foreign_copy,
+                copy: None,
+                destination: None,
+                unavailable: None,
+                candidate_read: ReadState::Unread,
+                copy_read: ReadState::Unread,
+                consented: false,
             }
+        })
+        .collect();
+    let targets = table
+        .iter()
+        .flat_map(|table| &table.rows)
+        .filter_map(|row| match row {
+            PromoteRow::Entry { target, .. } => {
+                Some((target.clone(), offer::target_fact(facts.files.get(target))))
+            }
+            PromoteRow::Unreadable { .. } => None,
         })
         .collect();
     SessionPromoteVm {
@@ -720,15 +805,19 @@ pub fn promote_panel(readme: &str, facts: &PanelFacts, me: Option<&str>) -> Sess
         rows,
         unlisted,
         knowledge,
+        artifacts: Vec::new(),
         label: None,
         vault: None,
         out_refused: None,
         problems: facts.problems.clone(),
+        revision: offer::snapshot_revision(readme, &facts.stamps, &targets),
+        intent: PanelIntentVm::default(),
+        complete: false,
     }
 }
 
 fn row_vm(row: &PromoteRow, facts: &PanelFacts) -> PromoteRowVm {
-    match row {
+    let mut vm = match row {
         PromoteRow::Entry {
             source,
             target,
@@ -765,6 +854,15 @@ fn row_vm(row: &PromoteRow, facts: &PanelFacts) -> PromoteRowVm {
                 raw: None,
                 line: None,
                 problem,
+                revision: offer::row_revision(
+                    source,
+                    target,
+                    note,
+                    facts.stamps.get(source).map(String::as_str),
+                    Some(&offer::target_fact(facts.files.get(target))),
+                ),
+                refused: None,
+                choice: None,
             }
         }
         PromoteRow::Unreadable { raw, line } => PromoteRowVm {
@@ -776,8 +874,13 @@ fn row_vm(row: &PromoteRow, facts: &PanelFacts) -> PromoteRowVm {
             raw: Some(raw.clone()),
             line: Some(u32::try_from(*line).unwrap_or(u32::MAX)),
             problem: None,
+            revision: offer::row_revision("", "", raw, Some(&line.to_string()), None),
+            refused: None,
+            choice: None,
         },
-    }
+    };
+    vm.refused = offer::refused_in(&vm, facts.files.contains_key(&vm.source));
+    vm
 }
 
 /// Byte offset of a `## ` heading line in a body, at a line start.
@@ -1041,6 +1144,13 @@ mod tests {
                 .filter(|(rel, _, _)| rel.starts_with("workspace/"))
                 .map(|(rel, _, _)| (*rel).to_owned())
                 .collect(),
+            stamps: files
+                .iter()
+                .filter(|(rel, _, _)| rel.starts_with("workspace/"))
+                .map(|(rel, text, changed)| {
+                    ((*rel).to_owned(), format!("file:{}:{changed}", text.len()))
+                })
+                .collect(),
             knowledge: files
                 .iter()
                 .filter(|(rel, _, _)| knowledge.contains(rel))
@@ -1132,8 +1242,28 @@ mod tests {
             [false, false, false, false, false, false, false, true]
         );
         assert_eq!(
-            vm.unlisted,
-            ["workspace/draft.md", "workspace/data/run.csv"]
+            vm.unlisted
+                .iter()
+                .map(|file| (
+                    file.source.as_str(),
+                    file.suggested.as_str(),
+                    file.refused.is_some()
+                ))
+                .collect::<Vec<_>>(),
+            [
+                ("workspace/draft.md", "artifacts/draft.md", false),
+                ("workspace/data/run.csv", "artifacts/run.csv", false)
+            ]
+        );
+        // R95P-08: a row offers promotion into the session only where
+        // Rust's admission can take it: not an unreadable line, not a row
+        // out into the drive, not a source that is gone.
+        assert_eq!(
+            vm.rows
+                .iter()
+                .map(|row| row.refused.is_none())
+                .collect::<Vec<_>>(),
+            [true, true, false, true, false, false, true, false]
         );
         assert_eq!(
             vm.knowledge,
@@ -1150,6 +1280,12 @@ mod tests {
                 reviewed_by_me: true,
                 problem: None,
                 foreign_copy: None,
+                copy: None,
+                destination: None,
+                unavailable: None,
+                candidate_read: ReadState::Unread,
+                copy_read: ReadState::Unread,
+                consented: false,
             }]
         );
         let theirs = promote_panel(&readme, &with_copy(&files), Some("human:marta"));
