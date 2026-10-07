@@ -104,9 +104,58 @@ pub enum PlanStep {
     /// under the key is what makes the recovery obvious — `.keeper/trash/<id>/`
     /// holds `tasks.md`, not an extension-less blob named after a ULID.
     TrashFile { path: String, trash_key: String },
-    /// Remove every entry under a directory except `.gitkeep`, writing one if
-    /// absent — the zone's "empty the workspace" (FR-245 step 3).
-    EmptyDirKeep { path: String },
+    /// Remove from a directory exactly what an archive decided to remove,
+    /// keeping `.gitkeep` and writing one if absent — the zone's "empty the
+    /// workspace" (FR-245 step 3). `decided` ([`Emptying`]) is that
+    /// decision: the entries removed, the directory they were listed in, and
+    /// the targets the choices that let them go lean on. Nothing is removed
+    /// unless the directory is still that real directory at its own place,
+    /// those targets still say what they said, and every entry there is one
+    /// of those with the same stamp; then only those entries are removed,
+    /// each looked at again first, from the directory as it was checked
+    /// (held open on Unix, so a directory linked or moved into its place, or
+    /// into one inside it, is never reached), and anything else there — work
+    /// that arrived since, before the step, during it or before a resume —
+    /// refuses the step and is kept. What this cannot catch is
+    /// `deferred-work.md` DW-1001. A resume finding part of the entries
+    /// already gone removes the rest. Without `decided` — a journal an
+    /// earlier keeper wrote — nothing is removed.
+    EmptyDirKeep {
+        path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        decided: Option<Emptying>,
+    },
+}
+
+/// What an archive's emptying of a directory was decided on (R234, R249):
+/// what it removes, where those entries were, and what the person's choices
+/// that let them go lean on.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Emptying {
+    /// Every entry below the directory's parent, `/`-joined from the
+    /// directory's own name, with its stamp, links not followed: exactly
+    /// what the emptying removes.
+    #[serde(default)]
+    pub entries: std::collections::BTreeMap<String, String>,
+    /// The directory as it was listed — its identity on the disk where the
+    /// platform tells one — or `None` when it was not there.
+    #[serde(default)]
+    pub root: Option<String>,
+    /// Every file a choice that lets the emptying remove its source leans
+    /// on — a skipped row's target, or a promoted one's — zone-relative,
+    /// with what it must say: what the checklist read
+    /// ([`crate::sessions::offer::target_fact`]), or `sha256:<hex>` for a
+    /// target this plan's own checked copy writes.
+    #[serde(default)]
+    pub targets: std::collections::BTreeMap<String, String>,
+    /// The same for targets out of the session, drive-relative.
+    #[serde(default)]
+    pub drive_targets: std::collections::BTreeMap<String, String>,
+    /// The zone's own path in its drive, `/`-joined (empty when the zone is
+    /// the drive): where a drive-relative target is found from the zone.
+    /// `None` when it is not known, which refuses a drive-relative target.
+    #[serde(default)]
+    pub zone_in_drive: Option<String>,
 }
 
 impl PlanStep {
@@ -457,32 +506,33 @@ pub fn compile_log_today(session: &str, readme: &str, date: &str) -> Option<(Pla
 /// warnings with the user; this compiles the *fs half* it settled on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArchiveDecision {
-    /// Promote copies to run first: `(workspace source, artifacts target)`,
-    /// session-relative. Skipped rows are simply absent.
-    pub promotes: Vec<(String, String)>,
+    /// The promotions to run first, as the session runtime's promotion
+    /// compiled them — the README's rows and the checked copies — so an
+    /// archive promotes exactly as the panel does (R216). Skipped rows are
+    /// simply absent.
+    pub before: Vec<PlanStep>,
     /// Whether to empty `workspace/` (leave `.gitkeep`). Skippable-with-
     /// warning per the checklist; the move is not.
     pub empty_workspace: bool,
+    /// What the emptying was decided on — the `workspace/` inventory, the
+    /// folder it was listed in and the targets the choices lean on — its
+    /// guard ([`PlanStep::EmptyDirKeep`]).
+    pub emptying: Emptying,
     /// The close year — `archive/<year>/` is the destination.
     pub year: i32,
 }
 
-/// Compile an **archive** (FR-245, AD-111): promotes, then the workspace
-/// emptying, then — last, always last — the folder move. The executor runs
-/// promote copies through the stability gate; a parked copy pauses the plan
-/// rather than half-copying (AD-111 detail).
-pub fn compile_archive(session: &str, decision: &ArchiveDecision) -> Plan {
+/// Compile an **archive** (FR-245, AD-111): the promotions, then the
+/// workspace emptying, then — last, always last — the folder move. A
+/// promotion's checked copy that finds its source changed refuses the plan
+/// before anything is emptied or moved.
+pub fn compile_archive(session: &str, decision: ArchiveDecision) -> Plan {
     let name = session.rsplit('/').next().unwrap_or(session);
-    let mut steps = Vec::new();
-    for (from, to) in &decision.promotes {
-        steps.push(PlanStep::CopyFile {
-            from: format!("{session}/{from}"),
-            to: format!("{session}/{to}"),
-        });
-    }
+    let mut steps = decision.before;
     if decision.empty_workspace {
         steps.push(PlanStep::EmptyDirKeep {
             path: format!("{session}/workspace"),
+            decided: Some(decision.emptying),
         });
     }
     steps.push(PlanStep::MkDir {
@@ -779,27 +829,24 @@ mod tests {
         assert!(!out.contains("2026-01-01"), "old log entries never travel");
     }
 
-    /// An archive plan runs promotes, then the emptying, then the move —
+    /// An archive plan runs its promotions, then the emptying, then the move —
     /// and the move is LAST, which is the whole crash-safety argument
     /// (NFR-38): everything before it re-runs; after it the verb is done.
     #[test]
     fn an_archive_plan_moves_the_folder_last() {
         let plan = compile_archive(
             "active/2026-08-10-keeper",
-            &ArchiveDecision {
-                promotes: vec![(
-                    "workspace/draft.md".to_owned(),
-                    "artifacts/report.md".to_owned(),
-                )],
+            ArchiveDecision {
+                before: vec![PlanStep::CopyFile {
+                    from: "active/2026-08-10-keeper/workspace/draft.md".to_owned(),
+                    to: "active/2026-08-10-keeper/artifacts/report.md".to_owned(),
+                }],
                 empty_workspace: true,
+                emptying: Emptying::default(),
                 year: 2026,
             },
         );
-        assert_eq!(plan.verb, "archive");
-        assert!(matches!(&plan.steps[0], PlanStep::CopyFile { from, to }
-            if from == "active/2026-08-10-keeper/workspace/draft.md"
-            && to == "active/2026-08-10-keeper/artifacts/report.md"));
-        assert!(matches!(&plan.steps[1], PlanStep::EmptyDirKeep { path }
+        assert!(matches!(&plan.steps[1], PlanStep::EmptyDirKeep { path, .. }
             if path == "active/2026-08-10-keeper/workspace"));
         assert!(
             matches!(plan.steps.last(), Some(PlanStep::MoveDir { from, to })

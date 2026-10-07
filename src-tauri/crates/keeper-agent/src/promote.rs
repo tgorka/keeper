@@ -32,6 +32,7 @@ use keeper_core::agents::log::{LineBody, LOG_DIR};
 use keeper_core::agents::mount::pin_matches;
 use keeper_core::agents::session::{self as agent_session, parse_session_agent_toml};
 use keeper_core::sessions::model::{ARTIFACTS_DIR, README, WORKSPACE_DIR};
+use keeper_core::sessions::offer as offers;
 use keeper_core::sessions::plan::{sha256_hex, Plan, PlanStep};
 use keeper_core::sessions::promote::{self, KnowledgeFile, PanelFacts, SessionPromoteVm};
 use keeper_sync::browse;
@@ -307,52 +308,18 @@ pub fn panel(
     let readme = read_readme(zone, session)?;
     let dir = browse::lexical_join(zone, session)
         .map_err(|_| VerbError::NoSuchSession(session.to_owned()))?;
+    let root = out.profile.local_path.as_path();
     let mut facts = PanelFacts::default();
-    facts.workspace = walk(&dir, WORKSPACE_DIR, &mut facts.problems);
+    let entries = exec::inventory(&dir, WORKSPACE_DIR, &mut facts.problems);
+    workspace_facts(&mut facts, entries);
     let notes = walk(&dir, knowledge::KNOWLEDGE_DIR, &mut facts.problems);
     facts.knowledge = notes
         .into_iter()
         .filter(|rel| rel.ends_with(".md"))
         .map(|rel| knowledge_file(zone, session, rel))
         .collect();
-    let root = out.profile.local_path.as_path();
-    let zone_in_drive = zone
-        .strip_prefix(root)
-        .ok()
-        .and_then(Path::to_str)
-        .map(|prefix| prefix.replace('\\', "/"));
+    facts.files = row_files(zone, session, root, &readme, true);
     if let Some(table) = promote::parse(&readme) {
-        for row in &table.rows {
-            let promote::PromoteRow::Entry { source, target, .. } = row else {
-                continue;
-            };
-            for (cell, in_session) in [
-                (source.clone(), true),
-                (target.clone(), promote::target_in_session(target)),
-            ] {
-                if facts.files.contains_key(&cell) {
-                    continue;
-                }
-                let (found, in_drive) = if in_session {
-                    (
-                        locate(zone, &format!("{session}/{cell}")),
-                        zone_in_drive
-                            .as_ref()
-                            .map(|prefix| format!("{prefix}/{session}/{cell}")),
-                    )
-                } else {
-                    (locate(root, &cell), Some(cell.clone()))
-                };
-                let fact = match found {
-                    Ok(None) => continue,
-                    Ok(Some(path)) => {
-                        file_fact(&cell, &path, root, in_drive.as_deref(), !in_session)
-                    }
-                    Err(why) => Err(why),
-                };
-                facts.files.insert(cell, fact);
-            }
-        }
         for note in &facts.knowledge {
             let Some((_, target, Some(_))) = promote::entry_of(&table, &note.path) else {
                 continue;
@@ -378,7 +345,92 @@ pub fn panel(
         }
         Err(why) => vm.out_refused = Some(why),
     }
+    offer::complete(&mut vm, &readme, zone, session, out);
+    offers::decide(&mut vm, &offers::PanelIntentVm::default());
     Ok(vm)
+}
+
+/// A session's `workspace/` inventory `entries` ([`exec::inventory`]) into
+/// `facts`: every entry with its stamp, and every one but a folder as an
+/// item of the checklist — what an archive's emptying would remove.
+fn workspace_facts(facts: &mut PanelFacts, entries: std::collections::BTreeMap<String, String>) {
+    facts.workspace = entries
+        .iter()
+        .filter(|(_, stamp)| stamp.as_str() != "dir")
+        .map(|(path, _)| path.clone())
+        .collect();
+    facts.stamps = entries;
+}
+
+/// Every file the README `readme`'s rows name that is there, by the cell's
+/// spelling, with its fact or why it could not be read
+/// ([`PanelFacts::files`]) — when what it says last changed only where
+/// `dated`, the rest the same either way, so an archive binds a choice to
+/// a target exactly as the panel showed it.
+fn row_files(
+    zone: &Path,
+    session: &str,
+    root: &Path,
+    readme: &str,
+    dated: bool,
+) -> std::collections::BTreeMap<String, Result<promote::FileFact, String>> {
+    let mut files = std::collections::BTreeMap::new();
+    let zone_in_drive = zone_in_drive(zone, root);
+    let Some(table) = promote::parse(readme) else {
+        return files;
+    };
+    for row in table.rows {
+        let promote::PromoteRow::Entry { source, target, .. } = row else {
+            continue;
+        };
+        for (cell, in_session) in [
+            (source, true),
+            (target.clone(), promote::target_in_session(&target)),
+        ] {
+            if files.contains_key(&cell) {
+                continue;
+            }
+            let (found, in_drive) = if in_session {
+                (
+                    locate(zone, &format!("{session}/{cell}")),
+                    zone_in_drive
+                        .as_ref()
+                        .map(|prefix| format!("{prefix}/{session}/{cell}")),
+                )
+            } else {
+                (locate(root, &cell), Some(cell.clone()))
+            };
+            let fact = match found {
+                Ok(None) => continue,
+                Ok(Some(path)) => file_fact(
+                    &cell,
+                    &path,
+                    root,
+                    in_drive.as_deref().filter(|_| dated),
+                    !in_session,
+                ),
+                Err(why) => Err(why),
+            };
+            files.insert(cell, fact);
+        }
+    }
+    files
+}
+
+/// The zone's path in the drive at `root`, `/`-joined: how a session file
+/// is named in the drive's history, and how a drive-relative target is
+/// found again from the zone. `None` when the zone is not inside it — as
+/// named, or as the disk resolves the drive (a held zone is canonical).
+fn zone_in_drive(zone: &Path, root: &Path) -> Option<String> {
+    let inside = zone
+        .strip_prefix(root)
+        .ok()
+        .map(Path::to_owned)
+        .or_else(|| {
+            let root = root.canonicalize().ok()?;
+            zone.strip_prefix(root).ok().map(Path::to_owned)
+        })?;
+    inside.to_str().map(|prefix| prefix.replace('\\', "/"))
 }
 
 /// The file `rel` under `root`, resolved inside it: `None` only when the
@@ -684,6 +736,29 @@ pub fn promote_in(
     now_ms: i64,
 ) -> Result<(), VerbError> {
     let held = exec::hold(zone)?;
+    let (source, target, then) = admit_in(&held, session, source, target, note, settle_ms, now_ms)?;
+    record_then(
+        &held,
+        session,
+        "promote",
+        (&source, &target, note, None),
+        &then,
+    )
+}
+
+/// [`promote_in`]'s admission in the held zone: `source → target` as they
+/// land, refused unless a settled `workspace/` file into `artifacts/` whose
+/// row the table can hold, and the steps that copy exactly the bytes that
+/// read verified. The row is the caller's to record, before the steps.
+fn admit_in(
+    held: &ZoneLock,
+    session: &str,
+    source: &str,
+    target: &str,
+    note: &str,
+    settle_ms: u64,
+    now_ms: i64,
+) -> Result<(String, String, Vec<PlanStep>), VerbError> {
     let source = landing(held.zone(), session, source)?;
     let target = landing(held.zone(), session, target)?;
     let under = |rel: &str, top: &str| {
@@ -726,13 +801,7 @@ pub fn promote_in(
         to: format!("{session}/{target}"),
         sha256,
     });
-    record_then(
-        &held,
-        session,
-        "promote",
-        (&source, &target, note, None),
-        &then,
-    )
+    Ok((source, target, then))
 }
 
 /// What a promotion out names.
@@ -1179,6 +1248,9 @@ pub fn promote_out(
         (true, None) => return Err(VerbError::Refused(NO_REVIEWER.to_owned())),
         (false, _) => text,
     };
+    if harvested && published.len() > knowledge::MAX_REVIEWED_BYTES {
+        return Err(VerbError::Refused(too_large_reviewed(&source)));
+    }
     let readme = read_readme(held.zone(), session)?;
     recorded(&readme, &source, target, request.note, None)?;
     let refused = |refusal: WriteRefusal| VerbError::Refused(refusal.to_string());
@@ -1246,19 +1318,40 @@ pub fn promote_out(
     publish(&held, out, &subfolder, &pending)
 }
 
+/// What a review of a notes copy that changed since it was read says.
+pub const COPY_CHANGED: &str =
+    "the notes copy changed since you read it; read it again before recording your review.";
+
+/// What a promotion or a tick whose vault copy would hold more than keeper
+/// reads whole says ([`knowledge::MAX_REVIEWED_BYTES`]).
+fn too_large_reviewed(rel: &str) -> String {
+    format!(
+        "{rel} would hold more than the {} bytes keeper reads of a reviewed note, so nothing was written.",
+        knowledge::MAX_REVIEWED_BYTES
+    )
+}
+
 /// A person's *Reviewed by me* (`reviewed`) or its untick on the harvested
-/// note at `path` (session-relative), after its promotion: written into the
-/// vault copy its row names (R139), by [`knowledge::review`] as `person` (a
-/// Matrix localpart) at `at`, through the vault's guarded amend — composed
-/// from the copy as it is at the write, so an edit or another review that
-/// landed meanwhile is kept, never written over. The candidate the agent's
-/// host writes is never touched. A promotion out the zone has not finished
-/// is finished first ([`finish_pending`]). Refused with [`NOT_PROMOTED`]
-/// before the note is promoted into the vault, wherever a link would carry
-/// it, and when what is at the row's target is not the copy the row records
-/// as the one it published ([`promote::standing`]), as it is at the write —
-/// refused with why ([`promote::CopyLoss::explain`]): a review is never
-/// written into a file the note did not put there (R244, R252).
+/// note at `path` (session-relative), after its promotion, of the vault
+/// copy as they read it — `expected`, its [`offers::copy_revision`]:
+/// written into the vault copy its row names (R139), by
+/// [`knowledge::review`] as `person` (a Matrix localpart) at `at`, through
+/// the vault's guarded amend, all in the held zone (R234). Each text the
+/// amend hands over must first be the copy the row records as the one it
+/// published ([`promote::standing`]) — else refused with why
+/// ([`promote::CopyLoss::explain`]): a review is never written into a file
+/// the note did not put there (R244, R252) — and is then compared with
+/// `expected` before a review is composed from it, so an edit, a pending
+/// publication or another row target that landed after the read refuses
+/// with [`COPY_CHANGED`] — the copy as it is, never reviewed unread — and
+/// so does an amend's retry after an edit landed between its read and its
+/// write. A tick whose copy would grow past [`knowledge::MAX_REVIEWED_BYTES`]
+/// is refused, so the copy stays one keeper reads whole. The candidate the
+/// agent's host writes is never touched. A promotion out the zone has not
+/// finished is finished first ([`finish_pending`]). Refused with
+/// [`NOT_PROMOTED`] before the note is promoted into the vault, and wherever
+/// a link would carry it.
+#[allow(clippy::too_many_arguments)]
 pub fn review(
     zone: &Path,
     session: &str,
@@ -1266,6 +1359,7 @@ pub fn review(
     person: &str,
     at: &str,
     reviewed: bool,
+    expected: &str,
     out: &OutOf,
 ) -> Result<(), VerbError> {
     let held: ZoneLock = exec::hold(zone)?;
@@ -1285,7 +1379,6 @@ pub fn review(
                 .map(|(_, target, published)| (target.to_owned(), published.map(str::to_owned)))
         })
         .ok_or_else(|| VerbError::Refused(NOT_PROMOTED.to_owned()))?;
-    drop(held);
     let subfolder = out.vault.subfolder(&out.profile.id);
     let scope = scope(out.profile, subfolder.as_deref());
     let root = out.profile.local_path.as_path();
@@ -1307,22 +1400,35 @@ pub fn review(
         )));
     }
     lands_as_named(root, &target)?;
-    let lost = std::cell::Cell::new(None);
-    out.vault
+    let refusal = std::cell::RefCell::new(None);
+    let amended = out
+        .vault
         .amend(&out.profile.id, vault_path.as_str(), &|text| {
-            lost.set(promote::standing(&path, recorded.as_deref(), text.as_bytes()).err());
-            if lost.get().is_some() {
+            if let Err(loss) = promote::standing(&path, recorded.as_deref(), text.as_bytes()) {
+                *refusal.borrow_mut() = Some(loss.explain(&path, &target));
+                return None;
+            }
+            if offers::copy_revision(&target, text) != expected {
+                *refusal.borrow_mut() = Some(COPY_CHANGED.to_owned());
                 return None;
             }
             let updated = knowledge::review(text, person, at, reviewed);
+            if updated.len() > knowledge::MAX_REVIEWED_BYTES && updated.len() > text.len() {
+                *refusal.borrow_mut() = Some(too_large_reviewed(&target));
+                return None;
+            }
+            *refusal.borrow_mut() = None;
             (updated != text).then_some(updated)
-        })
-        .map_err(VerbError::Refused)?;
-    if let Some(loss) = lost.get() {
-        return Err(VerbError::Refused(loss.explain(&path, &target)));
+        });
+    drop(held);
+    amended.map_err(VerbError::Refused)?;
+    match refusal.into_inner() {
+        Some(why) => Err(VerbError::Refused(why)),
+        None => Ok(()),
     }
-    Ok(())
 }
+
+pub mod offer;
 
 #[cfg(test)]
 mod tests;

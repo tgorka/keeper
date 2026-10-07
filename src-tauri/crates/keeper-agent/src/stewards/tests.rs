@@ -156,7 +156,7 @@ fn opened(zone: &Path, title: &str, now: chrono::DateTime<chrono::Local>) -> Str
 
 /// The session `id` archived: its id and path.
 fn archive(zone: &Path, id: &str) -> (String, String) {
-    verbs::archive(zone, id, Vec::new(), false, 2026).expect("archived");
+    verbs::archive(zone, id, false, 2026).expect("archived");
     let path = verbs::find(zone, id).expect("found").path;
     (id.to_owned(), path)
 }

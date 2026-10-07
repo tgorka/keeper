@@ -9,8 +9,10 @@
 //! first attempt made rather than making a second (FR-778). The clock is the
 //! caller's too (AD-56): a verb is handed its moment.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
+use keeper_core::sessions::plan::{self, PlanStep};
 use keeper_core::sessions::vm::SessionRowVm;
 
 use super::exec::{self, ExecError};
@@ -498,17 +500,52 @@ fn create_with(
     })
 }
 
-/// Archive a session (FR-245, AD-111): the compiled checklist decision —
-/// promotes to run, whether to empty the workspace — executed with the move
-/// last, journaled, resumable. `year` is the caller's clock.
+/// Archive a session (FR-245, AD-111) with nothing promoted: whether to
+/// empty the workspace, then the move last, journaled, resumable. `year`
+/// is the caller's clock.
 pub fn archive(
     zone: &Path,
     session_id: &str,
-    promotes: Vec<(String, String)>,
     empty_workspace: bool,
     year: i32,
 ) -> Result<(), VerbError> {
-    use keeper_core::sessions::plan;
+    archive_with(zone, session_id, empty_workspace, year, |_, _, _| {
+        Ok((Vec::new(), plan::Emptying::default()))
+    })
+}
+
+/// The `workspace/` of a session folder as an archive finds it in the held
+/// zone: every entry with its stamp ([`exec::inventory`]), what could not
+/// be looked at, and the folder itself ([`exec::identity`]).
+#[derive(Debug, Default)]
+pub struct Workspace {
+    pub entries: BTreeMap<String, String>,
+    pub problems: Vec<String>,
+    pub root: Option<String>,
+}
+
+/// Archive a session (FR-245, AD-111) after the steps `before` compiles in
+/// the held zone for the session at its zone-relative path and its
+/// workspace as found — the archive's promotions, and the targets the
+/// person's choices lean on ([`plan::Emptying`]'s) — in one plan: those
+/// steps, the workspace emptying, the move last, journaled, resumable. The
+/// emptying removes only that inventory, from that folder, while those
+/// targets say what they said ([`PlanStep::EmptyDirKeep`]): what arrives
+/// or changes after it, before the step runs, while it runs or before a
+/// crashed run resumes, refuses it and is kept. A workspace that cannot be
+/// looked at whole is not emptied.
+pub fn archive_with(
+    zone: &Path,
+    session_id: &str,
+    empty_workspace: bool,
+    year: i32,
+    before: impl FnOnce(
+        &super::lock::ZoneLock,
+        &str,
+        &Workspace,
+    ) -> Result<(Vec<PlanStep>, plan::Emptying), VerbError>,
+) -> Result<(), VerbError> {
+    use keeper_core::sessions::model::WORKSPACE_DIR;
 
     let held = exec::hold(zone)?;
     let row =
@@ -518,11 +555,28 @@ pub fn archive(
             "only an active session can be archived".to_owned(),
         ));
     }
+    let dir = keeper_sync::browse::lexical_join(held.zone(), &row.path)
+        .map_err(|_| VerbError::NoSuchSession(session_id.to_owned()))?;
+    let mut workspace = Workspace {
+        root: exec::identity(&dir.join(WORKSPACE_DIR)),
+        ..Workspace::default()
+    };
+    workspace.entries = exec::inventory(&dir, WORKSPACE_DIR, &mut workspace.problems);
+    if empty_workspace && !workspace.problems.is_empty() {
+        return Err(VerbError::Refused(format!(
+            "{}; the workspace cannot be checked whole, so nothing was archived.",
+            workspace.problems.join("; ")
+        )));
+    }
+    let (steps, mut emptying) = before(&held, &row.path, &workspace)?;
+    emptying.entries = workspace.entries;
+    emptying.root = workspace.root;
     let compiled = plan::compile_archive(
         &row.path,
-        &plan::ArchiveDecision {
-            promotes,
+        plan::ArchiveDecision {
+            before: steps,
             empty_workspace,
+            emptying,
             year,
         },
     );

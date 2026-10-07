@@ -30,6 +30,7 @@
  */
 import { ArrowLeft, Pencil, Pin } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
+import { PromotePanel } from "@/components/sessions/promote-panel";
 import { SessionAddRef } from "@/components/sessions/session-add-ref";
 import { SessionBoard } from "@/components/sessions/session-board";
 import { SessionFileActions } from "@/components/sessions/session-file-actions";
@@ -38,6 +39,14 @@ import { SessionSpaces } from "@/components/sessions/session-spaces";
 import { SessionTree } from "@/components/sessions/session-tree";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+  DialogTrigger,
+} from "@/components/ui/dialog";
 import type {
   SessionDetailVm,
   SessionEntryVm,
@@ -495,6 +504,28 @@ export function SessionDetail({ rootId, subfolder, sessionId, onBack }: SessionD
               ))}
             </div>
           </header>
+          <Dialog>
+            <DialogTrigger asChild>
+              <Button type="button" variant="outline" size="sm" className="self-start">
+                Promote…
+              </Button>
+            </DialogTrigger>
+            <DialogContent className="flex max-h-[90dvh] flex-col sm:max-w-3xl">
+              <DialogHeader className="pr-8">
+                <DialogTitle>Promote from {detail.title}</DialogTitle>
+                <DialogDescription>
+                  Keep workspace files and review knowledge for the drive.
+                </DialogDescription>
+              </DialogHeader>
+              <div className="min-h-0 min-w-0 overflow-y-auto">
+                <PromotePanel
+                  key={`${rootId}:${sessionId}`}
+                  rootId={rootId}
+                  sessionId={sessionId}
+                />
+              </div>
+            </DialogContent>
+          </Dialog>
 
           {/* The record's own name, where a session still keeps the old one
               (Story 52.1, FR-300). A notice rather than a bare button: the

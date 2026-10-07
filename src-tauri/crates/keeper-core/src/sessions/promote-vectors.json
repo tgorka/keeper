@@ -1,0 +1,479 @@
+{
+  "maxNoteBytes": 65536,
+  "maxReviewedBytes": 81920,
+  "sha256": [
+    {
+      "text": "",
+      "repeat": 1,
+      "digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "text": "abc",
+      "repeat": 1,
+      "digest": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    },
+    {
+      "text": "a",
+      "repeat": 55,
+      "digest": "9f4390f8d30c2dd92ec9f095b65e2b9ae9b0a925a5258e241c9f1e910f734318"
+    },
+    {
+      "text": "a",
+      "repeat": 56,
+      "digest": "b35439a4ac6f0948b6d6f9e3c6af0f5f590ce20f1bde7090ef7970686ec6738a"
+    },
+    {
+      "text": "a",
+      "repeat": 64,
+      "digest": "ffe054fe7ae0cb6dc65c3af9b61d5209f439851db43d0ba5997337df154668eb"
+    },
+    {
+      "text": "ü",
+      "repeat": 1000,
+      "digest": "dabd53845cfba11cd585ac2a4e9196ba1e7f225507e5f85dd84d0389629e7927"
+    },
+    {
+      "text": "x",
+      "repeat": 65536,
+      "digest": "1f8745f0d2d1387ec1af2211a3cf417b2e9e885e853472649c1d979d0e9370e3"
+    }
+  ],
+  "rowRevision": [
+    {
+      "source": "workspace/draft.md",
+      "target": "artifacts/report.md",
+      "note": "weekly report",
+      "stamp": "file:16:10",
+      "targetFact": "digest:ab",
+      "revision": "385652d92653b380ca1ebfebd0e4b875a873e741e4e91d75dd536b47f618bed3"
+    },
+    {
+      "source": "workspace/data/run.json",
+      "target": "",
+      "note": "",
+      "stamp": "file:3:5",
+      "targetFact": null,
+      "revision": "a6119d7577cf7527014e61ed125f0e9a289ffabf7bdbc57bbb71ff65b3cb7429"
+    },
+    {
+      "source": "",
+      "target": "",
+      "note": "| workspace/half a row |",
+      "stamp": "17",
+      "targetFact": null,
+      "revision": "dc4c5958ba01c99f0fe5365afc9be1bc8fe08a63499bc778a718a8422ff820d7"
+    },
+    {
+      "source": "workspace/é.md",
+      "target": "artifacts/é.md",
+      "note": "",
+      "stamp": "file:3:1",
+      "targetFact": "absent",
+      "revision": "97c5c690e296da5959584fa36a612f52de8f30aae0c767c18547b61132dd7f79"
+    },
+    {
+      "source": "workspace/gone.md",
+      "target": "artifacts/gone.md",
+      "note": "",
+      "stamp": null,
+      "targetFact": "unreadable",
+      "revision": "90e1d3f2065a62045775fbb54665caa6b9e4909b60a89cc72f1a67fe4460d1ed"
+    }
+  ],
+  "snapshotRevision": [
+    {
+      "readme": "# r\n",
+      "stamps": {},
+      "targets": {},
+      "revision": "f8ff670857e9c234775ccefa9a03c0429f0b8fcfe6b5d63ce0b61f2603db5db1"
+    },
+    {
+      "readme": "---\nid: x\n---\n## Promote\n",
+      "stamps": {
+        "workspace/a.md": "file:2:1",
+        "workspace/.draft.md": "file:4:7",
+        "workspace/sub": "dir",
+        "workspace/sub/x.md": "file:1:3",
+        "workspace/link": "link:/etc/hostname"
+      },
+      "targets": {
+        "artifacts/a.md": "digest:ff",
+        "10-notes/k.md": "absent"
+      },
+      "revision": "7826393cfbbccc4ce2cac1bb5ca2aaacac20aa66838cf56452a143f46e4aea12"
+    },
+    {
+      "readme": "ü\n",
+      "stamps": {
+        "workspace/b": "other"
+      },
+      "targets": {},
+      "revision": "7962ef370311fc9a76bc1e5b1a7c28e8a1e7ad324db6d703a3c7a064f5e57cab"
+    }
+  ],
+  "copyRevision": [
+    {
+      "target": "10-notes/knowledge/a.md",
+      "text": "---\ntitle: A\n---\nBody.\n",
+      "revision": "e7a6f9773b210197b3e253b9e27cb619c4f9f6f5007687d5beb7265a78282915"
+    },
+    {
+      "target": "10-notes/b.md",
+      "text": "",
+      "revision": "90a0213140039d4dcb1a2c2737c1c006f3fdcd591b42dd3d8fa929dd8bcff47c"
+    },
+    {
+      "target": "10-notes/knowledge/moved.md",
+      "text": "---\ntitle: A\n---\nBody.\n",
+      "revision": "5f071bbac666f7011e5339a4e9180198c9a9a7c870d6519570780040fed90330"
+    }
+  ],
+  "isText": [
+    {
+      "hex": "89504e470d0a1a0a0000000d",
+      "text": false
+    },
+    {
+      "hex": "6c696e65007461696c0a",
+      "text": true
+    },
+    {
+      "hex": "c289",
+      "text": true
+    },
+    {
+      "hex": "e282",
+      "text": false
+    },
+    {
+      "hex": "",
+      "text": true
+    },
+    {
+      "hex": "c3a9",
+      "text": true
+    },
+    {
+      "hex": "ffd8ffe0",
+      "text": false
+    }
+  ],
+  "decisions": [
+    {
+      "items": [
+        {
+          "revision": "a",
+          "refused": false
+        },
+        {
+          "revision": "b",
+          "refused": true
+        }
+      ],
+      "notes": [],
+      "intent": {
+        "choices": [
+          {
+            "revision": "a",
+            "promote": false,
+            "target": ""
+          },
+          {
+            "revision": "a",
+            "promote": true,
+            "target": "artifacts/a.md"
+          },
+          {
+            "revision": "b",
+            "promote": true,
+            "target": "artifacts/b.md"
+          },
+          {
+            "revision": "gone",
+            "promote": false,
+            "target": ""
+          }
+        ],
+        "notes": []
+      },
+      "expected": {
+        "intent": {
+          "choices": [
+            {
+              "revision": "a",
+              "promote": true,
+              "target": "artifacts/a.md"
+            }
+          ],
+          "notes": []
+        },
+        "notes": [],
+        "complete": false
+      }
+    },
+    {
+      "items": [
+        {
+          "revision": "a",
+          "refused": false
+        },
+        {
+          "revision": "b",
+          "refused": true
+        }
+      ],
+      "notes": [],
+      "intent": {
+        "choices": [
+          {
+            "revision": "b",
+            "promote": false,
+            "target": ""
+          },
+          {
+            "revision": "a",
+            "promote": true,
+            "target": "artifacts/a.md"
+          }
+        ],
+        "notes": []
+      },
+      "expected": {
+        "intent": {
+          "choices": [
+            {
+              "revision": "a",
+              "promote": true,
+              "target": "artifacts/a.md"
+            },
+            {
+              "revision": "b",
+              "promote": false,
+              "target": ""
+            }
+          ],
+          "notes": []
+        },
+        "notes": [],
+        "complete": true
+      }
+    },
+    {
+      "items": [],
+      "notes": [],
+      "intent": {
+        "choices": [],
+        "notes": []
+      },
+      "expected": {
+        "intent": {
+          "choices": [],
+          "notes": []
+        },
+        "notes": [],
+        "complete": true
+      }
+    },
+    {
+      "items": [],
+      "notes": [
+        {
+          "path": "artifacts/knowledge/n.md",
+          "revision": "v1",
+          "copy": "c1"
+        }
+      ],
+      "intent": {
+        "choices": [],
+        "notes": [
+          {
+            "path": "artifacts/knowledge/n.md",
+            "read": "v1",
+            "copy": "c1",
+            "consent": "v1"
+          }
+        ]
+      },
+      "expected": {
+        "intent": {
+          "choices": [],
+          "notes": [
+            {
+              "path": "artifacts/knowledge/n.md",
+              "read": "v1",
+              "copy": "c1",
+              "consent": "v1"
+            }
+          ]
+        },
+        "notes": [
+          {
+            "path": "artifacts/knowledge/n.md",
+            "candidateRead": "current",
+            "copyRead": "current",
+            "consented": true
+          }
+        ],
+        "complete": true
+      }
+    },
+    {
+      "items": [],
+      "notes": [
+        {
+          "path": "artifacts/knowledge/n.md",
+          "revision": "v2",
+          "copy": "c2"
+        }
+      ],
+      "intent": {
+        "choices": [],
+        "notes": [
+          {
+            "path": "artifacts/knowledge/n.md",
+            "read": "v1",
+            "copy": "c1",
+            "consent": "v1"
+          }
+        ]
+      },
+      "expected": {
+        "intent": {
+          "choices": [],
+          "notes": [
+            {
+              "path": "artifacts/knowledge/n.md",
+              "read": "v1",
+              "copy": "c1",
+              "consent": null
+            }
+          ]
+        },
+        "notes": [
+          {
+            "path": "artifacts/knowledge/n.md",
+            "candidateRead": "stale",
+            "copyRead": "stale",
+            "consented": false
+          }
+        ],
+        "complete": true
+      }
+    },
+    {
+      "items": [],
+      "notes": [
+        {
+          "path": "artifacts/knowledge/n.md",
+          "revision": "v1",
+          "copy": null
+        }
+      ],
+      "intent": {
+        "choices": [],
+        "notes": [
+          {
+            "path": "artifacts/knowledge/n.md",
+            "read": null,
+            "copy": null,
+            "consent": "v1"
+          },
+          {
+            "path": "artifacts/knowledge/gone.md",
+            "read": "v1",
+            "copy": null,
+            "consent": "v0"
+          }
+        ]
+      },
+      "expected": {
+        "intent": {
+          "choices": [],
+          "notes": [
+            {
+              "path": "artifacts/knowledge/n.md",
+              "read": null,
+              "copy": null,
+              "consent": null
+            }
+          ]
+        },
+        "notes": [
+          {
+            "path": "artifacts/knowledge/n.md",
+            "candidateRead": "unread",
+            "copyRead": "unread",
+            "consented": false
+          }
+        ],
+        "complete": true
+      }
+    },
+    {
+      "items": [],
+      "notes": [
+        {
+          "path": "artifacts/knowledge/n.md",
+          "revision": null,
+          "copy": null
+        },
+        {
+          "path": "artifacts/knowledge/m.md",
+          "revision": "m1",
+          "copy": null
+        }
+      ],
+      "intent": {
+        "choices": [],
+        "notes": [
+          {
+            "path": "artifacts/knowledge/n.md",
+            "read": "v1",
+            "copy": "c1",
+            "consent": "v1"
+          },
+          {
+            "path": "artifacts/knowledge/m.md",
+            "read": "m1",
+            "copy": null,
+            "consent": "m0"
+          }
+        ]
+      },
+      "expected": {
+        "intent": {
+          "choices": [],
+          "notes": [
+            {
+              "path": "artifacts/knowledge/n.md",
+              "read": "v1",
+              "copy": "c1",
+              "consent": null
+            },
+            {
+              "path": "artifacts/knowledge/m.md",
+              "read": "m1",
+              "copy": null,
+              "consent": null
+            }
+          ]
+        },
+        "notes": [
+          {
+            "path": "artifacts/knowledge/n.md",
+            "candidateRead": "stale",
+            "copyRead": "stale",
+            "consented": false
+          },
+          {
+            "path": "artifacts/knowledge/m.md",
+            "candidateRead": "current",
+            "copyRead": "unread",
+            "consented": false
+          }
+        ],
+        "complete": true
+      }
+    }
+  ]
+}

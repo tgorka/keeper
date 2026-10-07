@@ -1232,21 +1232,44 @@ pub fn sessions_set_pinned(
     Err(unsupported())
 }
 
-/// Archive a session (FR-245, AD-111): the compiled checklist decision —
-/// promotes to run, whether to empty the workspace — executed with the move
-/// last, journaled, resumable.
+/// Archive a session (FR-245, AD-111) with the checklist's decision: a
+/// choice about every row and unlisted file (`SessionPromoteVm.intent`'s
+/// `choices`), the promotions chosen each run as the promote panel runs
+/// one, and whether to empty the workspace — one journaled, resumable plan
+/// with the guarded emptying and the move last — refused when a row has no
+/// choice, or the workspace, the `## Promote` table or a row's target is not
+/// the checklist `revision` (`SessionPromoteVm.revision`) the person
+/// reviewed. Decided in `keeper_agent::promote::offer::archive`.
+///
+/// Rejects with: `internal` (unknown root, a refusal with its sentence),
+/// `unsupported` (mobile).
 #[cfg(desktop)]
 #[tauri::command]
 pub async fn sessions_archive(
+    state: tauri::State<'_, crate::ipc::AppState>,
     root_id: String,
     session_id: String,
-    promotes: Vec<(String, String)>,
+    choices: Vec<keeper_core::sessions::offer::ChoiceVm>,
     empty_workspace: bool,
+    revision: String,
 ) -> Result<(), IpcError> {
     let zone = crate::sessions_root::zone_of(&root_id).ok_or_else(|| root_error(&root_id))?;
+    let profile = crate::sync_ipc::sessions_profile(&state, &root_id)?;
     let year = today()[..4].parse::<i32>().unwrap_or(1970);
     tauri::async_runtime::spawn_blocking(move || {
-        keeper_agent::sessions::verbs::archive(&zone, &session_id, promotes, empty_workspace, year)
+        keeper_agent::promote::offer::archive(
+            &zone,
+            &session_id,
+            &keeper_agent::promote::offer::Archive {
+                choices: &choices,
+                revision: &revision,
+                empty_workspace,
+                year,
+                root: &profile.local_path,
+            },
+            profile.effective_settle_ms(),
+            chrono::Utc::now().timestamp_millis(),
+        )
     })
     .await
     .map_err(|join| IpcError {
@@ -1265,10 +1288,11 @@ pub async fn sessions_archive(
 pub fn sessions_archive(
     root_id: String,
     session_id: String,
-    promotes: Vec<(String, String)>,
+    choices: Vec<keeper_core::sessions::offer::ChoiceVm>,
     empty_workspace: bool,
+    revision: String,
 ) -> Result<(), IpcError> {
-    let _ = (root_id, session_id, promotes, empty_workspace);
+    let _ = (root_id, session_id, choices, empty_workspace, revision);
     Err(unsupported())
 }
 
@@ -1311,8 +1335,10 @@ fn drive_pin(
 /// `## Promote` table row by row with each row's state, the workspace files
 /// no row names, its harvested notes and whether this device's person
 /// reviewed each, the label chip of an agent's session, the drive's notes
-/// vault and why a promotion into it is refused, if it is. Composed and
-/// decided by `keeper_agent::promote::panel`.
+/// vault and why a promotion into it is refused, if it is — and what of
+/// the person's `intent` (their choices, reads and consent, as the panel
+/// forwards them) still holds, with whether the checklist is complete.
+/// Composed and decided by `keeper_agent::promote::offer::panel_for`.
 ///
 /// Rejects with: `internal` (unknown root or session, an unreadable
 /// README), `unsupported` (mobile).
@@ -1322,6 +1348,7 @@ pub async fn sessions_promote_panel(
     state: tauri::State<'_, crate::ipc::AppState>,
     root_id: String,
     session_id: String,
+    intent: keeper_core::sessions::offer::PanelIntentVm,
 ) -> Result<keeper_core::sessions::promote::SessionPromoteVm, IpcError> {
     let data_dir = state
         .platform
@@ -1336,7 +1363,7 @@ pub async fn sessions_promote_panel(
         let me = reviewing_person(&data_dir, &profile)
             .ok()
             .map(|person| format!("human:{person}"));
-        keeper_agent::promote::panel(
+        keeper_agent::promote::offer::panel_for(
             &zone,
             &row.path,
             &keeper_agent::promote::OutOf {
@@ -1345,6 +1372,7 @@ pub async fn sessions_promote_panel(
                 pin: pin.as_ref().map(Option::as_ref).map_err(Clone::clone),
             },
             me.as_deref(),
+            &intent,
         )
     })
     .await
@@ -1359,22 +1387,19 @@ pub async fn sessions_promote_panel(
 
 #[cfg(not(desktop))]
 #[tauri::command]
-pub fn sessions_promote_panel(root_id: String, session_id: String) -> Result<(), IpcError> {
-    let _ = (root_id, session_id);
+pub fn sessions_promote_panel(
+    root_id: String,
+    session_id: String,
+    intent: keeper_core::sessions::offer::PanelIntentVm,
+) -> Result<(), IpcError> {
+    let _ = (root_id, session_id, intent);
     Err(unsupported())
 }
 
-/// Promote one file and record its row (FR-243, FR-808). A target under
-/// `artifacts/` is a promotion into the session: `source` (`workspace/…`)
-/// copied once it has been still for the profile's settle window, else
-/// refused as still being written. Any other target is drive-relative, a
-/// promotion of an artifact out into the drive's notes vault, refused where
-/// who reads the session or the drive cannot be established, where the
-/// session's label may not reach the drive's readers and outside the vault
-/// (R138). `expected` is the SHA-256 of the source as the person read it
-/// (`KnowledgeNoteVm.revision`): promoting a harvested note is this
-/// device's person's review of that version, written into the vault copy
-/// (R212). Decided in `keeper_agent::promote`.
+/// Promote one `workspace/` file of the session into its `artifacts/` and
+/// record its row (FR-243): `source` copied once it has been still for the
+/// profile's settle window, else refused as still being written. Decided in
+/// `keeper_agent::promote::promote_in`.
 ///
 /// Rejects with: `internal` (unknown root or session, a refused or failed
 /// promotion, with its sentence), `unsupported` (mobile).
@@ -1387,57 +1412,20 @@ pub async fn sessions_promote(
     source: String,
     target: String,
     note: String,
-    expected: Option<String>,
 ) -> Result<(), IpcError> {
-    let data_dir = state
-        .platform
-        .data_dir()
-        .map_err(crate::ipc::to_ipc_error)?;
     let zone = crate::sessions_root::zone_of(&root_id).ok_or_else(|| root_error(&root_id))?;
     let row = crate::sessions_root::row_of(&root_id, &session_id)
         .ok_or_else(|| session_error(&session_id))?;
     let profile = crate::sync_ipc::sessions_profile(&state, &root_id)?;
     tauri::async_runtime::spawn_blocking(move || {
-        use keeper_agent::sessions::verbs::VerbError;
-        if keeper_core::sessions::promote::target_in_session(&target) {
-            let now_ms = chrono::Utc::now().timestamp_millis();
-            return keeper_agent::promote::promote_in(
-                &zone,
-                &row.path,
-                &source,
-                &target,
-                &note,
-                profile.effective_settle_ms(),
-                now_ms,
-            );
-        }
-        let person = match reviewing_person(&data_dir, &profile) {
-            Ok(person) => Some(person),
-            Err(why) if keeper_core::agents::knowledge::is_note(&source) => {
-                return Err(VerbError::Refused(why))
-            }
-            Err(_) => None,
-        };
-        let at = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-        let reviewer = person
-            .as_deref()
-            .map(|person| keeper_agent::promote::Reviewer { person, at: &at });
-        let pin = drive_pin(&data_dir, &profile);
-        keeper_agent::promote::promote_out(
+        keeper_agent::promote::promote_in(
             &zone,
             &row.path,
-            &keeper_agent::promote::Request {
-                source: &source,
-                target: &target,
-                note: &note,
-                expected: expected.as_deref(),
-            },
-            reviewer.as_ref(),
-            &keeper_agent::promote::OutOf {
-                profile: &profile,
-                vault: &crate::agent_ports::drive::NotesVaultWriter,
-                pin: pin.as_ref().map(Option::as_ref).map_err(Clone::clone),
-            },
+            &source,
+            &target,
+            &note,
+            profile.effective_settle_ms(),
+            chrono::Utc::now().timestamp_millis(),
         )
     })
     .await
@@ -1460,9 +1448,154 @@ pub fn sessions_promote(
     source: String,
     target: String,
     note: String,
+) -> Result<(), IpcError> {
+    let _ = (root_id, session_id, source, target, note);
+    Err(unsupported())
+}
+
+/// Promote the session's artifact `source` out into the drive's notes vault
+/// at the `folder` and `name` the person chose, the target composed and
+/// fenced in Rust (FR-808, R216): refused where who reads the session or
+/// the drive cannot be established, where the session's label may not
+/// reach the drive's readers and outside the vault (R138). `expected` is
+/// the SHA-256 of the source as the person read it
+/// (`sessions_knowledge_read`): promoting a harvested note is this
+/// device's person's review of that version, written into the vault copy
+/// (R212). Decided in `keeper_agent::promote::offer::promote_to`.
+///
+/// Rejects with: `internal` (unknown root or session, a refused or failed
+/// promotion, with its sentence), `unsupported` (mobile).
+#[cfg(desktop)]
+#[tauri::command]
+pub async fn sessions_promote_to(
+    state: tauri::State<'_, crate::ipc::AppState>,
+    root_id: String,
+    session_id: String,
+    source: String,
+    folder: String,
+    name: String,
     expected: Option<String>,
 ) -> Result<(), IpcError> {
-    let _ = (root_id, session_id, source, target, note, expected);
+    let data_dir = state
+        .platform
+        .data_dir()
+        .map_err(crate::ipc::to_ipc_error)?;
+    let zone = crate::sessions_root::zone_of(&root_id).ok_or_else(|| root_error(&root_id))?;
+    let row = crate::sessions_root::row_of(&root_id, &session_id)
+        .ok_or_else(|| session_error(&session_id))?;
+    let profile = crate::sync_ipc::sessions_profile(&state, &root_id)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        use keeper_agent::sessions::verbs::VerbError;
+        let person = match reviewing_person(&data_dir, &profile) {
+            Ok(person) => Some(person),
+            Err(why) if keeper_core::agents::knowledge::is_note(&source) => {
+                return Err(VerbError::Refused(why))
+            }
+            Err(_) => None,
+        };
+        let at = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        let reviewer = person
+            .as_deref()
+            .map(|person| keeper_agent::promote::Reviewer { person, at: &at });
+        let pin = drive_pin(&data_dir, &profile);
+        keeper_agent::promote::offer::promote_to(
+            &zone,
+            &row.path,
+            &source,
+            &folder,
+            &name,
+            expected.as_deref(),
+            reviewer.as_ref(),
+            &keeper_agent::promote::OutOf {
+                profile: &profile,
+                vault: &crate::agent_ports::drive::NotesVaultWriter,
+                pin: pin.as_ref().map(Option::as_ref).map_err(Clone::clone),
+            },
+        )
+    })
+    .await
+    .map_err(|join| IpcError {
+        code: IpcErrorCode::Internal,
+        message: format!("promote task failed: {join}"),
+        account_id: None,
+        retriable: false,
+    })?
+    .map_err(verb_error)?;
+    crate::sessions_root::rescan(&root_id);
+    Ok(())
+}
+
+#[cfg(not(desktop))]
+#[tauri::command]
+pub fn sessions_promote_to(
+    root_id: String,
+    session_id: String,
+    source: String,
+    folder: String,
+    name: String,
+    expected: Option<String>,
+) -> Result<(), IpcError> {
+    let _ = (root_id, session_id, source, folder, name, expected);
+    Err(unsupported())
+}
+
+/// A harvested note read whole for the person (R216): its candidate, or —
+/// `copy` — the vault copy its row names, with the SHA-256 of exactly the
+/// bytes read, which a promotion or a review then names. Decided in
+/// `keeper_agent::promote::offer::read_note`.
+///
+/// Rejects with: `internal` (unknown root or session, not a harvested note,
+/// no copy, larger than a note holds), `unsupported` (mobile).
+#[cfg(desktop)]
+#[tauri::command]
+pub async fn sessions_knowledge_read(
+    state: tauri::State<'_, crate::ipc::AppState>,
+    root_id: String,
+    session_id: String,
+    path: String,
+    copy: bool,
+) -> Result<keeper_core::sessions::offer::NoteTextVm, IpcError> {
+    let data_dir = state
+        .platform
+        .data_dir()
+        .map_err(crate::ipc::to_ipc_error)?;
+    let zone = crate::sessions_root::zone_of(&root_id).ok_or_else(|| root_error(&root_id))?;
+    let row = crate::sessions_root::row_of(&root_id, &session_id)
+        .ok_or_else(|| session_error(&session_id))?;
+    let profile = crate::sync_ipc::sessions_profile(&state, &root_id)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let pin = drive_pin(&data_dir, &profile);
+        keeper_agent::promote::offer::read_note(
+            &zone,
+            &row.path,
+            &path,
+            copy,
+            &keeper_agent::promote::OutOf {
+                profile: &profile,
+                vault: &crate::agent_ports::drive::NotesVaultWriter,
+                pin: pin.as_ref().map(Option::as_ref).map_err(Clone::clone),
+            },
+        )
+    })
+    .await
+    .map_err(|join| IpcError {
+        code: IpcErrorCode::Internal,
+        message: format!("knowledge-read task failed: {join}"),
+        account_id: None,
+        retriable: false,
+    })?
+    .map_err(verb_error)
+}
+
+#[cfg(not(desktop))]
+#[tauri::command]
+pub fn sessions_knowledge_read(
+    root_id: String,
+    session_id: String,
+    path: String,
+    copy: bool,
+) -> Result<(), IpcError> {
+    let _ = (root_id, session_id, path, copy);
     Err(unsupported())
 }
 
@@ -1473,11 +1606,15 @@ pub fn sessions_promote(
 /// that landed meanwhile is kept, and the note reads "reviewed by a person
 /// (human:<them>)". The person is [`reviewing_person`]. What the tick proves
 /// is that a reader's keeper wrote it, not that the person typed it (R28
-/// S-31).
+/// S-31). `expected` is the revision of the vault copy as the person read
+/// it (`sessions_knowledge_read` with `copy`), checked inside the guarded
+/// amend in the held zone (`keeper_agent::promote::review`); a copy that
+/// changed since, or an amend's retry after an edit, is
+/// refused, so the review is of what they read (R216).
 ///
 /// Rejects with: `internal` (no account to record, unknown root or session,
-/// a note not promoted into the vault yet, a refused write), `unsupported`
-/// (mobile).
+/// a note not promoted into the vault yet, a copy changed since it was
+/// read, a refused write), `unsupported` (mobile).
 #[cfg(desktop)]
 #[tauri::command]
 pub async fn sessions_knowledge_review(
@@ -1486,6 +1623,7 @@ pub async fn sessions_knowledge_review(
     session_id: String,
     path: String,
     reviewed: bool,
+    expected: String,
 ) -> Result<(), IpcError> {
     let internal = |message: String| IpcError {
         code: IpcErrorCode::Internal,
@@ -1512,6 +1650,7 @@ pub async fn sessions_knowledge_review(
             &localpart,
             &at,
             reviewed,
+            &expected,
             &keeper_agent::promote::OutOf {
                 profile: &profile,
                 vault: &crate::agent_ports::drive::NotesVaultWriter,
@@ -1534,8 +1673,9 @@ pub fn sessions_knowledge_review(
     session_id: String,
     path: String,
     reviewed: bool,
+    expected: String,
 ) -> Result<(), IpcError> {
-    let _ = (root_id, session_id, path, reviewed);
+    let _ = (root_id, session_id, path, reviewed, expected);
     Err(unsupported())
 }
 

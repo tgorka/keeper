@@ -360,6 +360,7 @@ export type { ApprovalPersonVm } from "./gen/ApprovalPersonVm";
 export type { ApprovalScope } from "./gen/ApprovalScope";
 export type { ApprovalStateVm } from "./gen/ApprovalStateVm";
 export type { ApprovalVm } from "./gen/ApprovalVm";
+export type { ArtifactOfferVm } from "./gen/ArtifactOfferVm";
 export type { AuditOutcome } from "./gen/AuditOutcome";
 export type { AuditVerdict } from "./gen/AuditVerdict";
 export type { AutoUpdateHold } from "./gen/AutoUpdateHold";
@@ -426,6 +427,7 @@ export type { CaptureWindowVm } from "./gen/CaptureWindowVm";
 export type { CardAgentVm } from "./gen/CardAgentVm";
 export type { CardKeyVm } from "./gen/CardKeyVm";
 export type { ChatNotifyMode } from "./gen/ChatNotifyMode";
+export type { ChoiceVm } from "./gen/ChoiceVm";
 export type { ConfigFaultVm } from "./gen/ConfigFaultVm";
 export type { ConfigLayersVm } from "./gen/ConfigLayersVm";
 export type { ConfigOverrideVm } from "./gen/ConfigOverrideVm";
@@ -442,6 +444,7 @@ export type { DaemonPresence } from "./gen/DaemonPresence";
 export type { DeclassifyVm } from "./gen/DeclassifyVm";
 export type { DemoBatch } from "./gen/DemoBatch";
 export type { DemoItem } from "./gen/DemoItem";
+export type { DestinationVm } from "./gen/DestinationVm";
 export type { DeviceClassVm } from "./gen/DeviceClassVm";
 export type { DeviceCodeVm } from "./gen/DeviceCodeVm";
 export type { DiscoveredBridgeVm } from "./gen/DiscoveredBridgeVm";
@@ -536,6 +539,7 @@ export type { NoteGalleryVm } from "./gen/NoteGalleryVm";
 export type { NoteHitVm } from "./gen/NoteHitVm";
 export type { NoteHunkVm } from "./gen/NoteHunkVm";
 export type { NoteIndexProgressVm } from "./gen/NoteIndexProgressVm";
+export type { NoteIntentVm } from "./gen/NoteIntentVm";
 export type { NoteLinkTargetVm } from "./gen/NoteLinkTargetVm";
 export type { NoteListOp } from "./gen/NoteListOp";
 export type { NoteListVm } from "./gen/NoteListVm";
@@ -566,6 +570,7 @@ export type { NoteTagNodeVm } from "./gen/NoteTagNodeVm";
 export type { NoteTagTerm } from "./gen/NoteTagTerm";
 export type { NoteTagTreeVm } from "./gen/NoteTagTreeVm";
 export type { NoteTemplateVm } from "./gen/NoteTemplateVm";
+export type { NoteTextVm } from "./gen/NoteTextVm";
 export type { NoteVaultSettingsReq } from "./gen/NoteVaultSettingsReq";
 export type { NoteVaultVm } from "./gen/NoteVaultVm";
 export type { NoteWriteVm } from "./gen/NoteWriteVm";
@@ -582,6 +587,7 @@ export type { PaletteActionVm } from "./gen/PaletteActionVm";
 export type { PaletteChatVm } from "./gen/PaletteChatVm";
 export type { PaletteMode } from "./gen/PaletteMode";
 export type { PaletteResultsVm } from "./gen/PaletteResultsVm";
+export type { PanelIntentVm } from "./gen/PanelIntentVm";
 export type { PanelTargetVm } from "./gen/PanelTargetVm";
 // Story 45.8's document bodies. Exported beside `DocumentVm` rather than left
 // reachable only through it, because a viewer that renders one sheet or one
@@ -597,6 +603,7 @@ export type { ProviderKind } from "./gen/ProviderKind";
 export type { ProviderOfferVm } from "./gen/ProviderOfferVm";
 export type { ProxyRoomVm } from "./gen/ProxyRoomVm";
 export type { ReactionGroupVm } from "./gen/ReactionGroupVm";
+export type { ReadState } from "./gen/ReadState";
 export type { RecordingApplicationVm } from "./gen/RecordingApplicationVm";
 export type { RecordingCaptureSourcesPatchVm } from "./gen/RecordingCaptureSourcesPatchVm";
 export type { RecordingCaptureSourcesVm } from "./gen/RecordingCaptureSourcesVm";
@@ -726,6 +733,8 @@ export type { TypingBatch } from "./gen/TypingBatch";
 export type { TypistVm } from "./gen/TypistVm";
 export type { UnknownBotGrantVm } from "./gen/UnknownBotGrantVm";
 export type { UnknownTaskVm } from "./gen/UnknownTaskVm";
+export type { UnlistedVm } from "./gen/UnlistedVm";
+export type { VaultCopyVm } from "./gen/VaultCopyVm";
 export type { VerificationFlowVm } from "./gen/VerificationFlowVm";
 export type { VerificationPhase } from "./gen/VerificationPhase";
 export type { VoiceAgentTargetVm } from "./gen/VoiceAgentTargetVm";
@@ -786,6 +795,7 @@ import type { BridgeNetworkVm } from "./gen/BridgeNetworkVm";
 import type { CapabilitiesVm } from "./gen/CapabilitiesVm";
 import type { CaptureTargetVm } from "./gen/CaptureTargetVm";
 import type { CaptureWindowVm } from "./gen/CaptureWindowVm";
+import type { ChoiceVm } from "./gen/ChoiceVm";
 import type { ConfigLayersVm } from "./gen/ConfigLayersVm";
 import type { ConnectionStatusBatch } from "./gen/ConnectionStatusBatch";
 import type { CopyJobVm } from "./gen/CopyJobVm";
@@ -848,6 +858,7 @@ import type { NoteSpaceTermsVm } from "./gen/NoteSpaceTermsVm";
 import type { NoteSpaceVm } from "./gen/NoteSpaceVm";
 import type { NoteTagTreeVm } from "./gen/NoteTagTreeVm";
 import type { NoteTemplateVm } from "./gen/NoteTemplateVm";
+import type { NoteTextVm } from "./gen/NoteTextVm";
 import type { NoteVaultSettingsReq } from "./gen/NoteVaultSettingsReq";
 import type { NoteVaultVm } from "./gen/NoteVaultVm";
 import type { NoteWriteVm } from "./gen/NoteWriteVm";
@@ -857,6 +868,7 @@ import type { PacedWorkVm } from "./gen/PacedWorkVm";
 import type { PaginationStatusBatch } from "./gen/PaginationStatusBatch";
 import type { PaletteMode } from "./gen/PaletteMode";
 import type { PaletteResultsVm } from "./gen/PaletteResultsVm";
+import type { PanelIntentVm } from "./gen/PanelIntentVm";
 import type { ProxyRoomVm } from "./gen/ProxyRoomVm";
 import type { RecordingCaptureSourcesPatchVm } from "./gen/RecordingCaptureSourcesPatchVm";
 import type { RecordingCaptureSourcesVm } from "./gen/RecordingCaptureSourcesVm";
@@ -7066,46 +7078,55 @@ export async function sessionsSetPinned(
 }
 
 /**
- * Archive a session (FR-245): run the checklist's settled decision — the
- * promote copies, optionally the workspace emptying — and move the folder to
+ * Archive a session (FR-245): run the checklist's settled decision — a
+ * choice about every row and unlisted file (`SessionPromoteVm.intent.choices`,
+ * as Rust kept them), each chosen promotion run as the promote panel runs
+ * one, optionally the guarded workspace emptying — and move the folder to
  * `archive/<year>/` as the last, journaled, crash-resumable step (NFR-38).
+ * `revision` is the checklist's `SessionPromoteVm.revision`: a workspace,
+ * table or row target that changed since, or a row without a choice, is
+ * refused, nothing archived.
  *
  * Rejects with: `internal` (not active; a refusal — retriable), `unsupported`.
  */
 export async function sessionsArchive(
   rootId: string,
   sessionId: string,
-  promotes: [string, string][],
+  choices: ChoiceVm[],
   emptyWorkspace: boolean,
+  revision: string,
 ): Promise<void> {
-  await invoke<void>("sessions_archive", { rootId, sessionId, promotes, emptyWorkspace });
+  await invoke<void>("sessions_archive", {
+    rootId,
+    sessionId,
+    choices,
+    emptyWorkspace,
+    revision,
+  });
 }
 
 /**
  * One session's promote panel (FR-243, FR-244, UX-DR90, UX-DR137): every row
  * of its README's `## Promote` table with its state, the workspace files no
  * row names, its harvested notes, the label chip, the drive's notes vault and
- * why a promotion into it is refused. Rust composes every field.
+ * why a promotion into it is refused. Rust composes every field, and decides
+ * what of `intent` — the person's choices, reads and consent, as the panel
+ * holds them — still holds (`SessionPromoteVm.intent`, `complete`, each row's
+ * `choice`, each note's `candidateRead`/`copyRead`/`consented`).
  *
  * Rejects with: `internal` (unknown root or session), `unsupported`.
  */
 export async function sessionsPromotePanel(
   rootId: string,
   sessionId: string,
+  intent: PanelIntentVm,
 ): Promise<SessionPromoteVm> {
-  return invoke<SessionPromoteVm>("sessions_promote_panel", { rootId, sessionId });
+  return invoke<SessionPromoteVm>("sessions_promote_panel", { rootId, sessionId, intent });
 }
 
 /**
- * Promote `source` to `target` and record its one row (FR-243, FR-808): a
- * target under `artifacts/` copies a settled `workspace/` file into the
- * session; any other target is drive-relative and copies an artifact into the
- * drive's notes vault, refused outside the vault, wider than the session's
- * label, or where who reads the session or the drive cannot be established.
- * `expected` is the SHA-256 of the source as the person read it
- * (`KnowledgeNoteVm.revision`): promoting a harvested note is this person's
- * review of that version, written into the vault copy; it is refused without
- * one, or when the note changed since.
+ * Promote the settled `workspace/` file `source` into the session's
+ * `artifacts/` at `target` and record its one row (FR-243).
  *
  * Rejects with: `internal` (the refusal's sentence, e.g. "still being written;
  * try again in a moment"), `unsupported`.
@@ -7116,26 +7137,77 @@ export async function sessionsPromote(
   source: string,
   target: string,
   note: string,
+): Promise<void> {
+  await invoke<void>("sessions_promote", { rootId, sessionId, source, target, note });
+}
+
+/**
+ * Promote the artifact `source` out into the drive's notes vault at the
+ * `folder` and `name` the person chose (a `DestinationVm`'s), the target
+ * composed in Rust (FR-808). `expected` is the revision of the note the
+ * person read (`sessionsKnowledgeRead`): promoting a harvested note is this
+ * person's review of that version, written into the vault copy; it is
+ * refused without one, or when the note changed since.
+ *
+ * Rejects with: `internal` (the refusal's sentence), `unsupported`.
+ */
+export async function sessionsPromoteTo(
+  rootId: string,
+  sessionId: string,
+  source: string,
+  folder: string,
+  name: string,
   expected: string | null,
 ): Promise<void> {
-  await invoke<void>("sessions_promote", { rootId, sessionId, source, target, note, expected });
+  await invoke<void>("sessions_promote_to", {
+    rootId,
+    sessionId,
+    source,
+    folder,
+    name,
+    expected,
+  });
+}
+
+/**
+ * A harvested note at `path` read whole: its candidate, or — `copy` — the
+ * vault copy its row names, with the revision of exactly the bytes read.
+ *
+ * Rejects with: `internal` (not a harvested note, no copy, too large),
+ * `unsupported`.
+ */
+export async function sessionsKnowledgeRead(
+  rootId: string,
+  sessionId: string,
+  path: string,
+  copy: boolean,
+): Promise<NoteTextVm> {
+  return invoke<NoteTextVm>("sessions_knowledge_read", { rootId, sessionId, path, copy });
 }
 
 /**
  * A person's *Reviewed by me* (or its untick) on a promoted harvested note at
  * `path`: written into the vault copy its row names, never the session's
- * candidate, keeping any edit that landed in the copy meanwhile.
+ * candidate. `expected` is the copy's revision as the person read it; a copy
+ * that changed since is refused.
  *
- * Rejects with: `internal` (not promoted to notes yet; no account to record),
- * `unsupported`.
+ * Rejects with: `internal` (not promoted to notes yet; the copy changed; no
+ * account to record), `unsupported`.
  */
 export async function sessionsKnowledgeReview(
   rootId: string,
   sessionId: string,
   path: string,
   reviewed: boolean,
+  expected: string,
 ): Promise<void> {
-  await invoke<void>("sessions_knowledge_review", { rootId, sessionId, path, reviewed });
+  await invoke<void>("sessions_knowledge_review", {
+    rootId,
+    sessionId,
+    path,
+    reviewed,
+    expected,
+  });
 }
 
 /**

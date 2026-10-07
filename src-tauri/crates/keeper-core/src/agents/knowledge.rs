@@ -29,6 +29,15 @@ pub const KNOWLEDGE_DIR: &str = "artifacts/knowledge";
 /// The most a knowledge note holds, in bytes, as stored (R28 S-32).
 pub const MAX_NOTE_BYTES: usize = 64 * 1024;
 
+/// The most a vault copy of a knowledge note holds that keeper reads whole
+/// and writes a review into: a note at [`MAX_NOTE_BYTES`] with the review
+/// blocks of the persons who tick it (`verified: - by: human:<localpart>`,
+/// `at:`, and `human_reviewed`) — about 330 bytes each at a Matrix
+/// localpart's longest, so 16 KiB holds some fifty. A promotion or a tick
+/// whose copy would hold more is refused, so every copy keeper published
+/// can still be read whole and have its review changed.
+pub const MAX_REVIEWED_BYTES: usize = MAX_NOTE_BYTES + 16 * 1024;
+
 /// The `type` a note gets when the drive's registry does not hold the one
 /// it named.
 pub const DEFAULT_TYPE: &str = "Note";

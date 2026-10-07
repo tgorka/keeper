@@ -22,10 +22,10 @@
 //! Nothing here decides. A plan arrives compiled; refusals (`GuardedWrite`
 //! mismatch, a missing source) surface as errors the caller sentences.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
-use keeper_core::sessions::plan::{Plan, PlanStep};
+use keeper_core::sessions::plan::{Emptying, Plan, PlanStep};
 
 use super::lock::ZoneLock;
 
@@ -161,6 +161,379 @@ fn run_from(zone: &Path, journal: &Path, plan: Plan, from: usize) -> Result<(), 
     // The removal on the disk too, or a power cut brings back a journal
     // whose remaining steps run over what came after.
     sync_dir(journal.parent().unwrap_or(zone)).map_err(cleared)
+}
+
+/// The most entries [`inventory`] lists before it says it stopped.
+pub const INVENTORY_CAP: usize = 4096;
+
+/// Every entry under `top` of the folder `dir` — `top`-relative paths
+/// `/`-joined from `top`, hidden ones, links and special files too, with
+/// `top`'s own `.gitkeep` (which an emptying keeps) aside — each with its
+/// stamp ([`Folder::stamp`]). What an emptying of `top` removes, and what a
+/// choice about it is bound to. `top` itself must be a real folder: a link
+/// there is told, never followed, and so is anything else that is not a
+/// folder. What could not be listed or looked at, and a listing cut at
+/// [`INVENTORY_CAP`], is told in `problems`, never left out silently; `top`
+/// absent is no entries.
+pub fn inventory(dir: &Path, top: &str, problems: &mut Vec<String>) -> BTreeMap<String, String> {
+    match std::fs::symlink_metadata(dir.join(top)) {
+        Ok(meta) if meta.file_type().is_dir() => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return BTreeMap::new(),
+        Ok(meta) if meta.file_type().is_symlink() => {
+            problems.push(format!(
+                "{top}/ is a link, and keeper does not follow it to list what it holds"
+            ));
+            return BTreeMap::new();
+        }
+        Ok(_) => {
+            problems.push(format!("{top} is not a folder"));
+            return BTreeMap::new();
+        }
+        Err(error) => {
+            problems.push(format!("{top}/ could not be looked at: {error}"));
+            return BTreeMap::new();
+        }
+    }
+    match Folder::open(dir).and_then(|dir| dir.child(top)) {
+        Ok(root) => walk(&root, top, problems, &mut BTreeMap::new()),
+        Err(error) => {
+            problems.push(format!("{top}/ could not be looked at: {error}"));
+            BTreeMap::new()
+        }
+    }
+}
+
+/// [`inventory`] of the held folder `root`, named `top`. Every folder below
+/// it is reached from `root` one real folder at a time ([`down`]), never
+/// through a link, and recorded in `folders` with its identity; one found
+/// again as another folder is told, not listed.
+fn walk(
+    root: &Folder,
+    top: &str,
+    problems: &mut Vec<String>,
+    folders: &mut BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    let mut todo = vec![top.to_owned()];
+    while let Some(rel) = todo.pop() {
+        let folder = match down(root, &rel, folders) {
+            Ok(Some(folder)) => folder,
+            Ok(None) => {
+                problems.push(format!("{rel}/ changed while it was being looked at"));
+                continue;
+            }
+            Err(error) => {
+                problems.push(format!("{rel}/ could not be listed: {error}"));
+                continue;
+            }
+        };
+        if let Some(identity) = folder.identity() {
+            folders.insert(rel.clone(), identity);
+        }
+        let entries = match folder.names() {
+            Ok(entries) => entries,
+            Err(error) => {
+                problems.push(format!("{rel}/ could not be listed: {error}"));
+                continue;
+            }
+        };
+        for name in entries {
+            let name = match name {
+                Ok(name) => name,
+                Err(error) => {
+                    problems.push(format!("an entry of {rel}/ could not be read: {error}"));
+                    continue;
+                }
+            };
+            let Ok(name) = name.into_string() else {
+                problems.push(format!("{rel}/ holds a name that is not UTF-8"));
+                continue;
+            };
+            if rel == top && name == ".gitkeep" {
+                continue;
+            }
+            if out.len() >= INVENTORY_CAP {
+                problems.push(format!(
+                    "{top}/ holds more than {INVENTORY_CAP} entries; only {INVENTORY_CAP} were looked at."
+                ));
+                return out;
+            }
+            let child = format!("{rel}/{name}");
+            match folder.stamp(&name) {
+                Ok(stamp) => {
+                    if stamp == "dir" {
+                        todo.push(child.clone());
+                    }
+                    out.insert(child, stamp);
+                }
+                Err(error) => problems.push(format!("{child} could not be looked at: {error}")),
+            }
+        }
+    }
+    out
+}
+
+/// The folder `rel` — `/`-joined from `root`'s own name — reached from
+/// `root` one real folder at a time, a link on the way refused, never
+/// followed; `Ok(None)` when a folder on the way is not the one `folders`
+/// recorded under its name.
+fn down(
+    root: &Folder,
+    rel: &str,
+    folders: &BTreeMap<String, String>,
+) -> std::io::Result<Option<Folder>> {
+    let mut parts = rel.split('/');
+    let mut so_far = parts.next().unwrap_or_default().to_owned();
+    let mut at = root.dup()?;
+    for part in parts {
+        at = at.child(part)?;
+        so_far.push('/');
+        so_far.push_str(part);
+        if folders
+            .get(&so_far)
+            .is_some_and(|was| at.identity().as_ref() != Some(was))
+        {
+            return Ok(None);
+        }
+    }
+    Ok(Some(at))
+}
+
+/// A regular file's stamp, `file:<length>:<mtime ns>`; `since_epoch` is
+/// `None` for a file changed before 1970.
+fn file_stamp(len: u64, since_epoch: Option<std::time::Duration>) -> std::io::Result<String> {
+    let at = since_epoch
+        .ok_or_else(|| std::io::Error::other("it was changed before 1970"))?
+        .as_nanos();
+    Ok(format!("file:{len}:{at}"))
+}
+
+/// A folder an emptying or an inventory holds. On Unix an open descriptor:
+/// every look, listing and removal below it is relative to the folder that
+/// was opened, each folder further down opened without following a link,
+/// so a folder renamed or linked into its place afterwards is never
+/// reached. Elsewhere its path (DW-1002).
+#[cfg(unix)]
+struct Folder(std::os::fd::OwnedFd);
+
+#[cfg(unix)]
+impl Folder {
+    const DIR: rustix::fs::OFlags = rustix::fs::OFlags::RDONLY
+        .union(rustix::fs::OFlags::DIRECTORY)
+        .union(rustix::fs::OFlags::CLOEXEC);
+
+    /// The folder at `path`, links on the way followed: for a place keeper
+    /// itself names (the zone, a session folder it holds).
+    fn open(path: &Path) -> std::io::Result<Folder> {
+        Ok(Folder(rustix::fs::open(
+            path,
+            Self::DIR,
+            rustix::fs::Mode::empty(),
+        )?))
+    }
+
+    /// The folder `name` in this one, refused when it is a link or not a
+    /// folder.
+    fn child(&self, name: &str) -> std::io::Result<Folder> {
+        let flags = Self::DIR | rustix::fs::OFlags::NOFOLLOW;
+        Ok(Folder(rustix::fs::openat(
+            &self.0,
+            name,
+            flags,
+            rustix::fs::Mode::empty(),
+        )?))
+    }
+
+    fn dup(&self) -> std::io::Result<Folder> {
+        Ok(Folder(self.0.try_clone()?))
+    }
+
+    /// [`identity`] of the folder held.
+    fn identity(&self) -> Option<String> {
+        rustix::fs::fstat(&self.0)
+            .ok()
+            .map(|stat| identity_of(&stat))
+    }
+
+    /// The stamp of the entry `name` here, never following a link: a regular
+    /// file's `file:<length>:<mtime ns>`, a link's `link:<where it points>`,
+    /// a folder's `dir`, anything else `other`.
+    #[allow(clippy::unnecessary_cast)] // `stat`'s field types differ between targets
+    fn stamp(&self, name: &str) -> std::io::Result<String> {
+        use rustix::fs::{AtFlags, FileType, RawMode};
+        let stat = rustix::fs::statat(&self.0, name, AtFlags::SYMLINK_NOFOLLOW)?;
+        Ok(match FileType::from_raw_mode(stat.st_mode as RawMode) {
+            FileType::Directory => "dir".to_owned(),
+            FileType::Symlink => {
+                let to = rustix::fs::readlinkat(&self.0, name, Vec::new())?;
+                format!("link:{}", to.to_string_lossy())
+            }
+            FileType::RegularFile => {
+                let since_epoch = u64::try_from(stat.st_mtime as i64)
+                    .ok()
+                    .map(|secs| std::time::Duration::new(secs, stat.st_mtime_nsec as u32));
+                return file_stamp(stat.st_size as u64, since_epoch);
+            }
+            _ => "other".to_owned(),
+        })
+    }
+
+    /// The names this folder holds, `.` and `..` aside.
+    fn names(&self) -> std::io::Result<impl Iterator<Item = std::io::Result<std::ffi::OsString>>> {
+        use std::os::unix::ffi::OsStrExt as _;
+        let mut dir = rustix::fs::Dir::read_from(&self.0)?;
+        Ok(
+            std::iter::from_fn(move || dir.read()).filter_map(|entry| match entry {
+                Ok(entry) => match entry.file_name().to_bytes() {
+                    b"." | b".." => None,
+                    name => Some(Ok(std::ffi::OsStr::from_bytes(name).to_owned())),
+                },
+                Err(error) => Some(Err(error.into())),
+            }),
+        )
+    }
+
+    /// Unlink `name` here — a folder only when `folder`, and only empty.
+    fn remove(&self, name: &str, folder: bool) -> std::io::Result<()> {
+        let flags = if folder {
+            rustix::fs::AtFlags::REMOVEDIR
+        } else {
+            rustix::fs::AtFlags::empty()
+        };
+        Ok(rustix::fs::unlinkat(&self.0, name, flags)?)
+    }
+
+    /// This folder's entry list made durable.
+    fn sync(&self) -> std::io::Result<()> {
+        Ok(rustix::fs::fsync(&self.0)?)
+    }
+
+    /// An empty file `name` here unless something by that name is there —
+    /// never written through a link.
+    fn keep(&self, name: &str) -> std::io::Result<()> {
+        use rustix::fs::{Mode, OFlags};
+        let flags =
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        let mode = Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::ROTH;
+        match rustix::fs::openat(&self.0, name, flags, mode) {
+            Ok(_) | Err(rustix::io::Errno::EXIST) => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+}
+
+#[cfg(not(unix))]
+struct Folder(PathBuf);
+
+#[cfg(not(unix))]
+impl Folder {
+    fn open(path: &Path) -> std::io::Result<Folder> {
+        if std::fs::metadata(path)?.is_dir() {
+            Ok(Folder(path.to_owned()))
+        } else {
+            Err(std::io::Error::other("not a folder"))
+        }
+    }
+
+    fn child(&self, name: &str) -> std::io::Result<Folder> {
+        let path = self.0.join(name);
+        if std::fs::symlink_metadata(&path)?.file_type().is_dir() {
+            Ok(Folder(path))
+        } else {
+            Err(std::io::Error::other(format!(
+                "{name} is a link or not a folder"
+            )))
+        }
+    }
+
+    fn dup(&self) -> std::io::Result<Folder> {
+        Ok(Folder(self.0.clone()))
+    }
+
+    fn identity(&self) -> Option<String> {
+        identity(&self.0)
+    }
+
+    fn stamp(&self, name: &str) -> std::io::Result<String> {
+        let path = self.0.join(name);
+        let meta = std::fs::symlink_metadata(&path)?;
+        let kind = meta.file_type();
+        Ok(if kind.is_dir() {
+            "dir".to_owned()
+        } else if kind.is_symlink() {
+            format!("link:{}", std::fs::read_link(&path)?.to_string_lossy())
+        } else if kind.is_file() {
+            let since_epoch = meta.modified()?.duration_since(std::time::UNIX_EPOCH).ok();
+            return file_stamp(meta.len(), since_epoch);
+        } else {
+            "other".to_owned()
+        })
+    }
+
+    fn names(&self) -> std::io::Result<impl Iterator<Item = std::io::Result<std::ffi::OsString>>> {
+        Ok(std::fs::read_dir(&self.0)?.map(|entry| entry.map(|entry| entry.file_name())))
+    }
+
+    fn remove(&self, name: &str, folder: bool) -> std::io::Result<()> {
+        let path = self.0.join(name);
+        if folder {
+            std::fs::remove_dir(path)
+        } else {
+            std::fs::remove_file(path)
+        }
+    }
+
+    fn sync(&self) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn keep(&self, name: &str) -> std::io::Result<()> {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(self.0.join(name))
+        {
+            Ok(_) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+impl Folder {
+    /// The folder at the zone-relative `path` of `zone`, reached from the
+    /// zone one real folder at a time — a link on the way refused.
+    fn reach(zone: &Path, path: &str) -> std::io::Result<Folder> {
+        path.split('/')
+            .try_fold(Folder::open(zone)?, |at, part| at.child(part))
+    }
+}
+
+/// What the folder at `path` is on the disk, for an emptying to be bound
+/// to ([`keeper_core::sessions::plan::Emptying::root`]): a real folder's
+/// identity — `<device>:<inode>` where the platform tells one — or `None`
+/// when no real folder is there (absent, a link, a file).
+pub fn identity(path: &Path) -> Option<String> {
+    #[cfg(unix)]
+    {
+        use rustix::fs::{FileType, RawMode};
+        let stat = rustix::fs::lstat(path).ok()?;
+        #[allow(clippy::unnecessary_cast)] // `stat`'s field types differ between targets
+        let kind = FileType::from_raw_mode(stat.st_mode as RawMode);
+        (kind == FileType::Directory).then(|| identity_of(&stat))
+    }
+    #[cfg(not(unix))]
+    {
+        let meta = std::fs::symlink_metadata(path).ok()?;
+        meta.file_type().is_dir().then(|| "dir".to_owned())
+    }
+}
+
+/// `<device>:<inode>` of what `stat` describes, as [`identity`] tells it.
+#[cfg(unix)]
+#[allow(clippy::unnecessary_cast)] // `stat`'s field types differ between targets
+fn identity_of(stat: &rustix::fs::Stat) -> String {
+    format!("{}:{}", stat.st_dev as u64, stat.st_ino as u64)
 }
 
 /// One idempotent step. The idempotency table is the resume contract:
@@ -390,31 +763,237 @@ fn run_step(zone: &Path, step: &PlanStep) -> Result<(), ExecError> {
             std::fs::create_dir_all(&dir).map_err(|e| failed(format!("trash {path}: {e}")))?;
             std::fs::rename(&source, &target).map_err(|e| failed(format!("trash {path}: {e}")))
         }
-        PlanStep::EmptyDirKeep { path } => {
-            let dir = rel(zone, path)?;
-            if !dir.exists() {
-                std::fs::create_dir_all(&dir).map_err(|e| failed(format!("mkdir {path}: {e}")))?;
+        PlanStep::EmptyDirKeep { path, decided } => empty_as_decided(zone, path, decided.as_ref()),
+    }
+}
+
+/// What a refused emptying adds: nothing more happened, and what to do.
+const NOT_EMPTIED: &str = "so the workspace was not emptied and the session not moved; archive it again to decide about it.";
+
+/// [`PlanStep::EmptyDirKeep`]: remove from the folder at `path` exactly
+/// the entries `decided` names, after checking that the folder is the one
+/// they were listed in — the same real folder, reached from the zone
+/// without following a link — that every target the choices lean on still
+/// says what it said, and that the folder holds nothing else. From that
+/// check on the folder is held ([`Folder`]): every look and removal is
+/// relative to it and to the folders below it as the check found them, so
+/// a folder linked, renamed or moved into the place of it or of one inside
+/// it later is never reached — the step refuses, and a held folder taken
+/// from its place refuses once emptied. Each entry is looked at again as
+/// it is removed, deepest first, and a folder is removed only once empty,
+/// so work arriving in the held folders is never removed: it refuses the
+/// step and is kept. Entries already gone — a crash inside an earlier run
+/// of this step — are passed over. Without `decided` nothing is removed.
+fn empty_as_decided(zone: &Path, path: &str, decided: Option<&Emptying>) -> Result<(), ExecError> {
+    let refuse = |why: String| ExecError::Refused(why);
+    let Some(decided) = decided else {
+        return Err(refuse(format!(
+            "this archive was decided by an earlier keeper that did not record what {path} held, {NOT_EMPTIED}"
+        )));
+    };
+    let dir = rel(zone, path)?;
+    let Some(top) = dir.file_name().and_then(|n| n.to_str()) else {
+        return Err(refuse(format!("empty {path}: not a folder's path")));
+    };
+    let not_it = || {
+        refuse(format!(
+            "{path} is not the folder this archive was decided on — it was replaced, removed or reached through a link since — {NOT_EMPTIED}"
+        ))
+    };
+    let held = match Folder::reach(zone, path) {
+        Ok(held) => Some(held),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => return Err(not_it()),
+    };
+    if let Some(was) = &decided.root {
+        if held.as_ref().and_then(Folder::identity).as_ref() != Some(was) {
+            return Err(not_it());
+        }
+    }
+    if let Some(target) = moved_target(zone, decided) {
+        return Err(refuse(format!(
+            "{target}, which a choice about the workspace leans on, changed or went after this archive was decided, {NOT_EMPTIED}"
+        )));
+    }
+    let mut problems = Vec::new();
+    let mut folders = BTreeMap::new();
+    let found = held
+        .as_ref()
+        .map(|held| walk(held, top, &mut problems, &mut folders))
+        .unwrap_or_default();
+    if !problems.is_empty() {
+        return Err(refuse(format!(
+            "{}; the workspace cannot be checked whole, so it was not emptied.",
+            problems.join("; ")
+        )));
+    }
+    if let Some((entry, _)) = found
+        .iter()
+        .find(|(entry, stamp)| decided.entries.get(*entry) != Some(stamp))
+    {
+        return Err(refuse(format!(
+            "{entry} arrived or changed after this archive was decided, {NOT_EMPTIED}"
+        )));
+    }
+    #[cfg(test)]
+    seam::reached();
+    let held = match held {
+        Some(held) => held,
+        None => {
+            std::fs::create_dir_all(&dir).map_err(|e| refuse(format!("mkdir {path}: {e}")))?;
+            let made = Folder::reach(zone, path).map_err(|_| not_it())?;
+            if let Some(identity) = made.identity() {
+                folders.insert(top.to_owned(), identity);
             }
-            let entries =
-                std::fs::read_dir(&dir).map_err(|e| failed(format!("read {path}: {e}")))?;
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                if name.to_string_lossy() == ".gitkeep" {
-                    continue;
-                }
-                let target = entry.path();
-                let removed = if target.is_dir() {
-                    std::fs::remove_dir_all(&target)
-                } else {
-                    std::fs::remove_file(&target)
-                };
-                removed.map_err(|e| failed(format!("empty {path}: {e}")))?;
+            made
+        }
+    };
+    let kept = |entry: &str| {
+        refuse(format!(
+            "{entry} arrived or changed while the workspace was being emptied; it was kept, and the session not moved; archive it again to decide about it."
+        ))
+    };
+    let mut deepest_first: Vec<_> = decided.entries.iter().collect();
+    deepest_first.sort_by_key(|(entry, _)| std::cmp::Reverse(entry.matches('/').count()));
+    for (entry, stamp) in deepest_first {
+        let mut parts = entry.split('/');
+        let inside =
+            parts.next() == Some(top) && parts.all(|part| !matches!(part, "" | "." | ".."));
+        let Some((holder, name)) = entry.rsplit_once('/').filter(|_| inside) else {
+            return Err(refuse(format!(
+                "{entry} is not an entry of {path}, {NOT_EMPTIED}"
+            )));
+        };
+        // A folder the check did not find held nothing then: whatever is
+        // in it now arrived since.
+        let found_then = folders.contains_key(holder);
+        let removed = match down(&held, holder, &folders) {
+            Ok(Some(_)) if !found_then => return Err(kept(entry)),
+            Ok(Some(holder)) if stamp == "dir" => holder.remove(name, true),
+            Ok(Some(holder)) => match holder.stamp(name) {
+                Ok(now) if now == *stamp => holder.remove(name, false),
+                Ok(_) => return Err(kept(entry)),
+                Err(error) => Err(error),
+            },
+            Ok(None) => return Err(kept(entry)),
+            Err(error) => Err(error),
+        };
+        match removed {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(refuse(format!(
+                    "{entry} could not be removed ({error}); what the workspace still holds was kept, and the session not moved; archive it again to decide about it."
+                )))
             }
-            let keep = dir.join(".gitkeep");
-            if !keep.exists() {
-                std::fs::write(&keep, b"").map_err(|e| failed(format!("gitkeep {path}: {e}")))?;
-            }
-            Ok(())
+        }
+    }
+    let unread = |e: std::io::Error| refuse(format!("read {path}: {e}"));
+    for name in held.names().map_err(unread)? {
+        let name = name.map_err(unread)?;
+        if name != ".gitkeep" {
+            return Err(kept(&format!("{top}/{}", name.to_string_lossy())));
+        }
+    }
+    // What was emptied must still be the folder at its place: one put
+    // there since was never looked at, and is left as it is.
+    let there = Folder::reach(zone, path)
+        .ok()
+        .and_then(|now| now.identity());
+    if there.is_none() || there != held.identity() {
+        return Err(refuse(format!(
+            "{path} was replaced, moved or reached through a link while it was being emptied; what was decided was removed from the folder it was decided on, whatever is there now was not touched, and the session was not moved; archive it again to decide about it."
+        )));
+    }
+    held.sync()
+        .map_err(|e| refuse(format!("empty {path}: {e}")))?;
+    held.keep(".gitkeep")
+        .map_err(|e| refuse(format!("gitkeep {path}: {e}")))
+}
+
+/// The first target `decided` names that no longer says what the choices
+/// leaning on it were made on, or `None`.
+fn moved_target<'d>(zone: &Path, decided: &'d Emptying) -> Option<&'d str> {
+    let drive = decided
+        .zone_in_drive
+        .as_deref()
+        .and_then(|inside| drive_of(zone, inside));
+    decided
+        .targets
+        .iter()
+        .map(|(rel, said)| (Some(zone), rel, said))
+        .chain(
+            decided
+                .drive_targets
+                .iter()
+                .map(|(rel, said)| (drive.as_deref(), rel, said)),
+        )
+        .find(|(base, rel, said)| !base.is_some_and(|base| still_says(base, rel, said)))
+        .map(|(_, rel, _)| rel.as_str())
+}
+
+/// The drive holding `zone`, whose path in it is `inside`.
+fn drive_of(zone: &Path, inside: &str) -> Option<PathBuf> {
+    let mut drive = zone.to_path_buf();
+    for part in inside.split('/').filter(|part| !part.is_empty()).rev() {
+        if drive.file_name()? != part {
+            return None;
+        }
+        drive.pop();
+    }
+    Some(drive)
+}
+
+/// Whether the file `rel` of `base` says `said`: `sha256:<hex>`, its bytes
+/// hash to that; anything else, it is that target fact
+/// ([`keeper_core::sessions::offer::target_fact`]) as the panel reads it.
+fn still_says(base: &Path, rel: &str, said: &str) -> bool {
+    let found = keeper_sync::browse::resolve_known(base, rel)
+        .map(|known| known.landed().map(keeper_sync::browse::Landing::into_path));
+    if let Some(sha256) = said.strip_prefix("sha256:") {
+        return matches!(found, Ok(Some(path)) if hash_file(&path).is_ok_and(|held| held == sha256));
+    }
+    let fact = match found {
+        Ok(None) => None,
+        Err(refusal) => Some(Err(refusal.to_string())),
+        Ok(Some(path)) => Some(target_fact_at(rel, &path)),
+    };
+    keeper_core::sessions::offer::target_fact(fact.as_ref()) == said
+}
+
+/// What the file `rel` at `path` says, as the panel's row facts read it.
+fn target_fact_at(
+    rel: &str,
+    path: &Path,
+) -> Result<keeper_core::sessions::promote::FileFact, String> {
+    let unread = |error: std::io::Error| format!("{rel} could not be read: {error}");
+    if !std::fs::metadata(path).map_err(unread)?.is_file() {
+        return Err(format!("{rel} is not a file"));
+    }
+    let file = std::fs::File::open(path).map_err(unread)?;
+    keeper_core::sessions::promote::fact_of(rel, file, None).map_err(unread)
+}
+
+/// A test's hold on the moment between an emptying's last check and its
+/// first removal.
+#[cfg(test)]
+pub(crate) mod seam {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static AFTER_CHECK: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+    }
+
+    /// Run `then` on this thread once the next emptying has checked
+    /// everything and before it removes anything.
+    pub(crate) fn after_check(then: impl FnOnce() + 'static) {
+        AFTER_CHECK.with(|hold| *hold.borrow_mut() = Some(Box::new(then)));
+    }
+
+    /// The emptying has checked everything: run what a test holds there.
+    pub(super) fn reached() {
+        if let Some(then) = AFTER_CHECK.with(|hold| hold.borrow_mut().take()) {
+            then();
         }
     }
 }
@@ -853,12 +1432,20 @@ mod tests {
 
         let plan = compile_archive(
             "active/2026-08-10-keeper",
-            &ArchiveDecision {
-                promotes: vec![(
-                    "workspace/draft.md".to_owned(),
-                    "artifacts/report.md".to_owned(),
-                )],
+            ArchiveDecision {
+                before: vec![PlanStep::CopyFile {
+                    from: "active/2026-08-10-keeper/workspace/draft.md".to_owned(),
+                    to: "active/2026-08-10-keeper/artifacts/report.md".to_owned(),
+                }],
                 empty_workspace: true,
+                emptying: Emptying {
+                    entries: BTreeMap::from([(
+                        "workspace/draft.md".to_owned(),
+                        stamp(&session.join("workspace/draft.md")),
+                    )]),
+                    root: identity(&session.join("workspace")),
+                    ..Emptying::default()
+                },
                 year: 2026,
             },
         );
@@ -896,6 +1483,418 @@ mod tests {
         assert!(!moved.join("workspace/draft.md").exists());
         assert!(!zone.path().join("active/2026-08-10-keeper").exists());
         assert!(!journal.exists(), "journal cleared after resume");
+    }
+
+    /// An inventory stamp of the file at `path`, as [`inventory`] writes it.
+    fn stamp(path: &Path) -> String {
+        let mut problems = Vec::new();
+        let parent = path.parent().expect("parent");
+        let top = parent.file_name().and_then(|n| n.to_str()).expect("top");
+        let name = path.file_name().and_then(|n| n.to_str()).expect("name");
+        inventory(parent.parent().expect("dir"), top, &mut problems)
+            .remove(&format!("{top}/{name}"))
+            .expect("stamped")
+    }
+
+    /// An archive of `active/2026-08-10-keeper` decided on its workspace as
+    /// it is now — `draft.md` promoted by a checked copy, then the guarded
+    /// emptying, then the move — journaled with its first `done` steps run,
+    /// as a crash leaves it.
+    fn crashed_archive(zone: &Path, done: usize) -> PathBuf {
+        let session = zone.join("active/2026-08-10-keeper");
+        let draft = keeper_core::sessions::plan::sha256_hex("the draft");
+        let mut problems = Vec::new();
+        let emptying = Emptying {
+            entries: inventory(&session, "workspace", &mut problems),
+            root: identity(&session.join("workspace")),
+            targets: BTreeMap::from([(
+                "active/2026-08-10-keeper/artifacts/report.md".to_owned(),
+                format!("sha256:{draft}"),
+            )]),
+            ..Emptying::default()
+        };
+        assert!(problems.is_empty(), "{problems:?}");
+        let plan = compile_archive(
+            "active/2026-08-10-keeper",
+            ArchiveDecision {
+                before: vec![PlanStep::CopyChecked {
+                    from: "active/2026-08-10-keeper/workspace/draft.md".to_owned(),
+                    to: "active/2026-08-10-keeper/artifacts/report.md".to_owned(),
+                    sha256: draft,
+                }],
+                empty_workspace: true,
+                emptying,
+                year: 2026,
+            },
+        );
+        let journal = zone.join(JOURNAL_REL);
+        for step in &plan.steps[..done] {
+            run_step(zone, step).expect("a step before the crash");
+        }
+        write_journal(&journal, &JournalRow { plan, done }).expect("journal");
+        session
+    }
+
+    fn keeper_session(zone: &Path) -> PathBuf {
+        let session = zone.join("active/2026-08-10-keeper");
+        std::fs::create_dir_all(session.join("workspace/sub")).expect("mkdir");
+        std::fs::create_dir_all(session.join("artifacts")).expect("mkdir");
+        std::fs::write(session.join("README.md"), "# keeper\n").expect("write");
+        std::fs::write(session.join("workspace/draft.md"), "the draft").expect("write");
+        std::fs::write(session.join("workspace/sub/x.md"), "x").expect("write");
+        session
+    }
+
+    /// R234 (R95P2-04): the archive's emptying is guarded by the workspace
+    /// it was decided on, at the step and on a resume. A file arriving
+    /// after a completed checked copy, or a decided file written before the
+    /// emptying, refuses the resumed run: that work is kept, the session
+    /// not moved, the journal cleared, the promotion's copy kept. A resume
+    /// finding part of the decided workspace already removed — a crash
+    /// inside the emptying — empties the rest and moves the session.
+    #[test]
+    fn an_archive_resumed_after_a_crash_keeps_work_that_arrived_since() {
+        for (name, done, change) in [
+            (
+                "a file arrived after the checked copy",
+                1,
+                &(|session: &Path| {
+                    std::fs::write(session.join("workspace/.late.md"), "new work").expect("late");
+                }) as &dyn Fn(&Path),
+            ),
+            (
+                "a decided file written before the emptying",
+                1,
+                &|session: &Path| {
+                    std::fs::write(session.join("workspace/sub/x.md"), "x, and more")
+                        .expect("edit");
+                },
+            ),
+            (
+                "a folder arrived before anything ran",
+                0,
+                &|session: &Path| {
+                    std::fs::create_dir(session.join("workspace/.staging")).expect("dir");
+                },
+            ),
+        ] {
+            let zone = zone();
+            let session = keeper_session(zone.path());
+            crashed_archive(zone.path(), done);
+            change(&session);
+            let refused = resume(zone.path());
+            assert!(
+                matches!(refused, Err(ExecError::Refused(_))),
+                "{name}: {refused:?}"
+            );
+            assert!(session.join("workspace/draft.md").is_file(), "{name}");
+            assert!(session.join("workspace/sub/x.md").is_file(), "{name}");
+            // The checked copy of unchanged bytes runs (or ran) before the
+            // guarded emptying refuses: the promotion is kept either way.
+            assert_eq!(
+                std::fs::read_to_string(session.join("artifacts/report.md")).ok(),
+                Some("the draft".to_owned()),
+                "{name}"
+            );
+            assert!(
+                !zone.path().join("archive/2026/2026-08-10-keeper").exists(),
+                "{name}"
+            );
+            assert!(!zone.path().join(JOURNAL_REL).exists(), "{name}");
+        }
+
+        for (name, half) in [
+            ("a folder of it removed", "workspace/sub"),
+            ("a file of it removed", "workspace/draft.md"),
+        ] {
+            let zone = zone();
+            let session = keeper_session(zone.path());
+            crashed_archive(zone.path(), 1);
+            let half = session.join(half);
+            if half.is_dir() {
+                std::fs::remove_dir_all(half).expect("half emptied");
+            } else {
+                std::fs::remove_file(half).expect("half emptied");
+            }
+            resume(zone.path()).expect("the rest emptied");
+            let moved = zone.path().join("archive/2026/2026-08-10-keeper");
+            assert!(moved.join("artifacts/report.md").is_file(), "{name}");
+            assert_eq!(
+                std::fs::read_dir(moved.join("workspace"))
+                    .expect("workspace")
+                    .map(|entry| entry.expect("entry").file_name())
+                    .collect::<Vec<_>>(),
+                [".gitkeep"],
+                "{name}"
+            );
+        }
+    }
+
+    /// R249 (R95P3-01): a journal an earlier keeper wrote — its emptying
+    /// recorded without what it was decided on (the build before R234), or
+    /// with only the inventory (R234's) — resumes without any authority to
+    /// remove: its emptying refuses, every byte of the workspace and what
+    /// arrived since is kept, the session is not moved and the journal
+    /// clears, so the archive is decided again.
+    #[test]
+    fn an_earlier_keepers_archive_journal_removes_nothing() {
+        let draft = "active/2026-08-10-keeper/workspace/draft.md";
+        let steps = |emptying: &str| {
+            format!(
+                r#"{{"plan":{{"verb":"archive","session":"active/2026-08-10-keeper","steps":[{{"op":"copyFile","from":"{draft}","to":"active/2026-08-10-keeper/artifacts/report.md"}},{{"op":"emptyDirKeep","path":"active/2026-08-10-keeper/workspace"{emptying}}},{{"op":"mkDir","path":"archive/2026"}},{{"op":"moveDir","from":"active/2026-08-10-keeper","to":"archive/2026/2026-08-10-keeper"}}]}},"done":1}}"#
+            )
+        };
+        for (name, emptying) in [
+            ("no record", String::new()),
+            (
+                "an inventory only",
+                r#","accepted":{"workspace/draft.md":"file:9:1","workspace/sub":"dir","workspace/sub/x.md":"file:1:1"}"#.to_owned(),
+            ),
+        ] {
+            let zone = zone();
+            let session = keeper_session(zone.path());
+            let journal = zone.path().join(JOURNAL_REL);
+            std::fs::create_dir_all(journal.parent().expect(".keeper")).expect(".keeper");
+            std::fs::write(&journal, steps(&emptying)).expect("journal");
+            std::fs::write(session.join("workspace/late.md"), "new work").expect("late");
+            let refused = resume(zone.path());
+            assert!(
+                matches!(&refused, Err(ExecError::Refused(why)) if why.contains("earlier keeper")),
+                "{name}: {refused:?}"
+            );
+            for (rel, bytes) in [
+                ("workspace/draft.md", "the draft"),
+                ("workspace/sub/x.md", "x"),
+                ("workspace/late.md", "new work"),
+            ] {
+                assert_eq!(
+                    std::fs::read_to_string(session.join(rel)).ok().as_deref(),
+                    Some(bytes),
+                    "{name}: {rel}"
+                );
+            }
+            assert!(
+                !zone.path().join("archive/2026/2026-08-10-keeper").exists(),
+                "{name}"
+            );
+            assert!(!zone.path().join(JOURNAL_REL).exists(), "{name}");
+        }
+    }
+
+    /// R249 (R95P3-02): the emptying removes only what it was decided on.
+    /// Work arriving after its last check — a file at the top of the
+    /// workspace, one inside a decided folder — or a decided file written
+    /// then, is never removed: the step refuses, that work is kept with its
+    /// bytes, the session is not moved.
+    #[test]
+    fn work_arriving_while_the_workspace_is_emptied_is_kept() {
+        for (name, rel, bytes) in [
+            ("a file at the top", "workspace/late.md", "new work"),
+            (
+                "a file in a decided folder",
+                "workspace/sub/late.md",
+                "new work",
+            ),
+            (
+                "a decided file written",
+                "workspace/sub/x.md",
+                "x, and more",
+            ),
+        ] {
+            let zone = zone();
+            let session = keeper_session(zone.path());
+            crashed_archive(zone.path(), 1);
+            let arrival = session.join(rel);
+            let written = arrival.clone();
+            seam::after_check(move || std::fs::write(written, bytes).expect("arrives"));
+            let refused = resume(zone.path());
+            assert!(
+                matches!(refused, Err(ExecError::Refused(_))),
+                "{name}: {refused:?}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&arrival).ok().as_deref(),
+                Some(bytes),
+                "{name}"
+            );
+            assert!(
+                !zone.path().join("archive/2026/2026-08-10-keeper").exists(),
+                "{name}"
+            );
+        }
+    }
+
+    /// Copies of `rels` of the folder `of` into `into`, each with the same
+    /// length and mtime — the same stamps.
+    #[cfg(unix)]
+    fn twin(of: &Path, into: &Path, rels: &[&str]) {
+        for rel in rels {
+            let to = into.join(rel);
+            std::fs::create_dir_all(to.parent().expect("parent")).expect("twin");
+            std::fs::copy(of.join(rel), &to).expect("copy");
+            let at = std::fs::metadata(of.join(rel))
+                .and_then(|meta| meta.modified())
+                .expect("mtime");
+            std::fs::File::options()
+                .write(true)
+                .open(&to)
+                .and_then(|file| file.set_modified(at))
+                .expect("same stamp");
+        }
+    }
+
+    /// R249 (R95P3-04): the emptying is bound to the folder it was decided
+    /// on, at its own place. Replaced before a resume by another folder —
+    /// even one holding the same names with the same stamps — by a link to
+    /// another session's workspace in the zone or to a folder outside it,
+    /// or reached through a link on the way, it refuses and the other
+    /// folder keeps every byte.
+    #[cfg(unix)]
+    #[test]
+    fn an_emptying_is_bound_to_the_folder_it_was_decided_on() {
+        let outside = tempfile::tempdir().expect("outside");
+        for name in [
+            "replaced",
+            "a link in the zone",
+            "a link out of it",
+            "a link on the way",
+        ] {
+            let zone = zone();
+            let session = keeper_session(zone.path());
+            crashed_archive(zone.path(), 1);
+            let workspace = session.join("workspace");
+            let other = match name {
+                "a link out of it" => outside.path().join(name),
+                "a link on the way" => zone.path().join("active/elsewhere"),
+                _ => zone.path().join("active/other/workspace"),
+            };
+            if name == "a link on the way" {
+                std::fs::rename(&session, &other).expect("moved away");
+                std::os::unix::fs::symlink(&other, &session).expect("link");
+            } else {
+                twin(&workspace, &other, &["draft.md", "sub/x.md"]);
+                std::fs::rename(&workspace, session.join("decided")).expect("aside");
+                if name == "replaced" {
+                    std::fs::rename(&other, &workspace).expect("replaced");
+                } else {
+                    std::os::unix::fs::symlink(&other, &workspace).expect("link");
+                }
+            }
+            let refused = resume(zone.path());
+            assert!(
+                matches!(refused, Err(ExecError::Refused(_))),
+                "{name}: {refused:?}"
+            );
+            let kept = if name == "replaced" {
+                workspace
+            } else if name == "a link on the way" {
+                other.join("workspace")
+            } else {
+                other
+            };
+            for (rel, bytes) in [("draft.md", "the draft"), ("sub/x.md", "x")] {
+                assert_eq!(
+                    std::fs::read_to_string(kept.join(rel)).ok().as_deref(),
+                    Some(bytes),
+                    "{name}: {rel}"
+                );
+            }
+        }
+    }
+
+    /// R265 (R95P4-01): the same replacements after the emptying's last
+    /// check (the seam), before it removes anything — the workspace or a
+    /// folder in it swapped for a link to a twin holding the same names
+    /// with the same stamps, in the zone or out of it, or swapped for such a
+    /// twin itself — never carry a removal into the
+    /// twin: the step refuses, every byte of the twin is kept, the session
+    /// is not moved.
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_swapped_in_after_the_check_is_never_emptied() {
+        let outside = tempfile::tempdir().expect("outside");
+        for (name, swapped, rels, linked, out) in [
+            (
+                "the workspace, a link in the zone",
+                "workspace",
+                &["draft.md", "sub/x.md"][..],
+                true,
+                false,
+            ),
+            (
+                "the workspace, a link out of it",
+                "workspace",
+                &["draft.md", "sub/x.md"][..],
+                true,
+                true,
+            ),
+            (
+                "the workspace, a twin folder",
+                "workspace",
+                &["draft.md", "sub/x.md"][..],
+                false,
+                false,
+            ),
+            (
+                "a folder in it, a link in the zone",
+                "workspace/sub",
+                &["x.md"][..],
+                true,
+                false,
+            ),
+            (
+                "a folder in it, a link out of it",
+                "workspace/sub",
+                &["x.md"][..],
+                true,
+                true,
+            ),
+            (
+                "a folder in it, a twin folder",
+                "workspace/sub",
+                &["x.md"][..],
+                false,
+                false,
+            ),
+        ] {
+            let zone = zone();
+            let session = keeper_session(zone.path());
+            crashed_archive(zone.path(), 1);
+            let at = session.join(swapped);
+            let other = if out {
+                outside.path().join(name)
+            } else {
+                zone.path().join("active/other").join(name)
+            };
+            twin(&at, &other, rels);
+            let (place, aside, twin_dir) = (at.clone(), session.join("decided"), other.clone());
+            seam::after_check(move || {
+                std::fs::rename(&place, aside).expect("aside");
+                if linked {
+                    std::os::unix::fs::symlink(&twin_dir, &place).expect("link");
+                } else {
+                    std::fs::rename(&twin_dir, &place).expect("twin in its place");
+                }
+            });
+            let refused = resume(zone.path());
+            assert!(
+                matches!(refused, Err(ExecError::Refused(_))),
+                "{name}: {refused:?}"
+            );
+            let kept = if linked { &other } else { &at };
+            for rel in rels {
+                let want = if *rel == "draft.md" { "the draft" } else { "x" };
+                assert_eq!(
+                    std::fs::read_to_string(kept.join(rel)).ok().as_deref(),
+                    Some(want),
+                    "{name}: {rel}"
+                );
+            }
+            assert!(
+                !zone.path().join("archive/2026/2026-08-10-keeper").exists(),
+                "{name}"
+            );
+        }
     }
 
     /// A delete is a recoverable trash move — the folder, workspace and all,

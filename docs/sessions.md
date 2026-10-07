@@ -1133,9 +1133,77 @@ contents with the review keys out and its body, kept apart, so a review never ch
 at the target is replaced, or reviewed, only while it is that copy, never because it holds the
 same bytes, and only the source's first row counts. One that is not — a person edited it, or the
 row records no publication — is refused saying why and what to do that keeps the file (R252).
-A renamed file keeps its row and that cell:
-the rename rewrites the session's cells, never a drive-relative target. The panel's screen is the
-next rung's (`agents-95-panel`).
+A renamed file keeps its row and that cell: the rename rewrites the session's cells, never a
+drive-relative target.
+
+Open **Promote…** from session detail. Each table row retains its source and destination;
+**Newer here** is amber, **Source gone** is quiet and has no copy action, and **Target missing**
+is red. An unreadable row is shown verbatim. An unlisted workspace file asks for its artifact
+target, prefilled with the filename Rust suggests. Refusals stay beside the file so the target
+can be corrected or the source given time to settle. Rust decides every offer
+(`SessionPromoteVm`): a row or file that cannot be promoted carries its reason
+(`refused`/`unavailable` — no `## Promote` table, a row out into the drive, a non-text
+artifact) instead of an action, and a promotion out names a folder and a filename that Rust
+composes into the target, inside the vault only (`sessions_promote_to`).
+
+The knowledge group reads each note whole through Rust (`sessions_knowledge_read`), up to the
+64 KiB contract for a candidate and 80 KiB for its notes copy (the note with its reviews), with
+the revision of exactly the bytes read. **I reviewed this version** is consent to that
+revision: a newer candidate clears it and marks the open text stale, and the promotion names
+the revision read. A promoted note also shows its **Notes copy**, read separately; **Reviewed
+by me in notes** applies to the copy as read — checked inside the write itself — and is
+refused when the copy changed since, even between the write's own read and its save: another
+person's review landing meanwhile is kept, and reading the copy again lets the tick land beside
+it. A copy that is no longer the note's — a person edited it, or its row records no
+publication — shows no review and offers no promotion there; the note says why and what keeps
+the file. A missing copy offers **Restore the notes copy** to its row's target,
+never a review of an absent file. The folder picker starts in this drive's vault, browses its
+children and cannot navigate above it. A label refusal replaces all promote-out actions with
+its reason. Other artifacts use the same vault picker without inventing a knowledge review.
+Focus moves into an editor or picker when it opens and back to its row's action when it
+closes or completes; after a note is promoted, restored or promoted again it moves to that
+note's **Read notes copy** (its heading if there is no copy).
+
+The panel holds no rule of its own: what the person did — each row's choice, each note's reads
+and consent — goes back to Rust with every read (`sessions_promote_panel`'s `intent`), and Rust
+answers what still holds (`SessionPromoteVm.intent`, each row's `choice`, each note's
+`candidateRead`/`copyRead`/`consented`, and `complete` when every row has a choice).
+
+The archive dialog uses this same panel. Choose a target and **Promote before archiving**, or
+explicitly **Skip this row**, for every recorded row and unlisted workspace entry — hidden
+files and files in hidden folders too, and links or special files, which can only be skipped,
+since the emptying removes them all. Only then can **Archive session** run, and the archive
+carries every choice: Rust refuses one where a row has no choice, two, or a choice about a row
+it does not hold. Each chosen promotion runs as `sessions_promote` runs one —
+admitted only from a settled `workspace/` file into `artifacts/` (never `workspace/`, the
+README or outside the session), its row recorded where the table reads it back, its verified
+bytes copied — inside the archive's one journaled plan, before the workspace is emptied and
+the folder moved. The archive carries the checklist's revision (`SessionPromoteVm.revision`:
+the README, every workspace entry with its kind, length and modification time, and what each
+row's target says); a workspace, table or target that changed since is refused with nothing
+archived, and a Skip of a row whose target was then deleted or replaced is dropped. A line of
+the `## Promote` table written twice is two rows of the checklist, each with its own choice;
+the repeat promotes nothing of its own and is skipped. The emptying removes exactly what the
+archive was decided on, and nothing else: it is bound to that `workspace/` folder at its own
+place (a `workspace/` that is a link, or a folder replaced since, is never emptied — and is
+never listed through the link either), it holds while every target a choice leaned on says what
+it said (or, for a promotion, holds the bytes the archive copied), and it removes only the
+decided entries, each looked at again and a folder only once empty. Once checked, the folder is
+held open: every removal happens in it and in the folders it held when checked, so a
+`workspace/`, or a folder in it, swapped for a link or for another folder while it is being
+emptied is never followed — the emptying stops, the session is not moved, and the other folder
+keeps every byte. Work that arrives or changes before it runs, while it runs, or before a
+crashed archive resumes is kept: the emptying refuses, that work stays and the session is not
+moved; archive again to decide about it. The one exception is a file rewritten in the instant
+between its last look and its removal, which goes with it (on Windows, where the folder is not
+held open, the swaps above are not caught either). A crash inside the emptying resumes by
+removing what is left of the decided entries.
+An archive interrupted under an earlier keeper resumes without removing anything and asks for
+a new checklist. Archive is not ready while a reread or
+a panel write is in flight. A reread keeps the choices of rows whose Rust revision did not
+change and drops only the changed ones, so activity elsewhere in the sessions root does not
+wipe a checklist. A refusal keeps the dialog and choices open; nothing says the session was
+archived on an error.
 
 ## What is not here yet
 
