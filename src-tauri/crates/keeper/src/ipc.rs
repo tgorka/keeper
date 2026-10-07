@@ -12530,6 +12530,12 @@ pub async fn egress_list(
         descriptor.as_ref(),
         keeper_core::forges::BUILTIN_GITHUB_CLIENT_ID,
     ));
+    // This Mac's MCP servers (96.2 #10): the table Settings › Agents
+    // writes, read on every call, each server's host or program once.
+    #[cfg(desktop)]
+    destinations.extend(keeper_core::egress::agent_egress(
+        &keeper_core::agents::mac_tables::read(&data_dir).mcp,
+    ));
     Ok(destinations)
 }
 

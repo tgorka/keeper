@@ -354,9 +354,7 @@ impl SandboxHost {
             (Kind::Trampoline { .. }, None) => {
                 return Err("the trampoline never said the sandbox held".to_owned())
             }
-            (Kind::SandboxExec, _) => {
-                "sandbox-exec ok; no [sandbox] table is configurable on this Mac yet".to_owned()
-            }
+            (Kind::SandboxExec, _) => "sandbox-exec ok".to_owned(),
         };
         Ok(sandbox)
     }

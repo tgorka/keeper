@@ -668,6 +668,12 @@ fn unsent(error: &ServiceError) -> Option<&str> {
     }
 }
 
+/// What a server answered its last `tools/list`: the program its live
+/// connection started — a `command` server's, as its identity binds it —
+/// and every tool it listed with what its annotations hint; or why it did
+/// not answer.
+pub type Heard = Result<(Option<core_mcp::Program>, Vec<(Listed, Option<Hints>)>), String>;
+
 /// One listed tool as an agent may be offered it, from one [`Catalog`]: its
 /// tier, its binding and the call made of it all come from that answer.
 #[derive(Debug, Clone)]
@@ -1619,6 +1625,41 @@ impl McpServers {
             })
             .collect()
     }
+
+    /// What each server last answered, by name: the program the connection
+    /// that listed it was started as and every tool it listed there,
+    /// offered or not — both from that one answer; why it did not answer;
+    /// or `None` before it was asked.
+    pub fn heard(&self) -> Vec<(String, Option<Heard>)> {
+        self.servers
+            .iter()
+            .map(|server| {
+                let heard = match server.listing() {
+                    Listing::Answered(catalog) => Some(Ok((
+                        started(&catalog.connection.identity),
+                        catalog
+                            .tools
+                            .iter()
+                            .map(|tool| (server.listed_tool(&catalog, tool), hints(tool)))
+                            .collect(),
+                    ))),
+                    Listing::Silent(why) => Some(Err(why)),
+                    Listing::NotAsked => None,
+                };
+                (server.entry.name.clone(), heard)
+            })
+            .collect()
+    }
+}
+
+/// The program a connection's [`core_mcp::identity`] names: the absolute
+/// path a `command` server was started from and its SHA-256; `None` for a
+/// `url` server.
+fn started(identity: &Value) -> Option<core_mcp::Program> {
+    Some(core_mcp::Program {
+        path: identity["program"].as_str()?.to_owned(),
+        sha256: identity["program_sha256"].as_str()?.to_owned(),
+    })
 }
 
 /// A result's content as the model reads it — text verbatim; an image, a
@@ -2259,6 +2300,56 @@ mod tests {
             .expect("its own connection");
         assert_eq!(second.calls.load(Ordering::SeqCst), 1, "sent");
         assert_eq!(first.calls.load(Ordering::SeqCst), 0, "not sent there");
+    }
+
+    /// R258: what Settings is told of a server is one answer — the program
+    /// of the connection that listed the tools it shows, and those tools.
+    /// While the live connection ends and a new one lists again, over and
+    /// over, no reader ever hears an answer without the tools its listing
+    /// held.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn what_is_heard_is_one_listing_however_the_connection_changes() {
+        let servers = Arc::new(registry(&notes_at(&serve(Peek::default()).await), None));
+        servers.refresh().await;
+        let stop = Arc::new(AtomicBool::new(false));
+        let readers: Vec<_> = (0..3)
+            .map(|_| {
+                let (servers, stop) = (Arc::clone(&servers), Arc::clone(&stop));
+                std::thread::spawn(move || {
+                    let (mut answered, mut silent, mut torn) = (0, 0, 0);
+                    while !stop.load(Ordering::SeqCst) {
+                        for (_, heard) in servers.heard() {
+                            match heard {
+                                Some(Ok((_, tools))) if tools.is_empty() => torn += 1,
+                                Some(Ok(_)) => answered += 1,
+                                Some(Err(_)) => silent += 1,
+                                None => {}
+                            }
+                        }
+                    }
+                    (answered, silent, torn)
+                })
+            })
+            .collect();
+        let server = Arc::clone(&servers.servers[0]);
+        for _ in 0..1000 {
+            let live = server.connected().expect("connected");
+            server.end(&live, "ended to be listed again");
+            servers.refresh().await;
+        }
+        stop.store(true, Ordering::SeqCst);
+        let (answered, silent, torn) = readers.into_iter().fold((0, 0, 0), |sum, reader| {
+            let (answered, silent, torn) = reader.join().expect("reader");
+            (sum.0 + answered, sum.1 + silent, sum.2 + torn)
+        });
+        assert!(
+            answered > 0 && silent > 0,
+            "heard both ways: {answered} answered, {silent} silent"
+        );
+        assert_eq!(
+            torn, 0,
+            "an answer heard without the tools its listing held"
+        );
     }
 
     /// R144 (R225): a bare program name resolves to the first executable

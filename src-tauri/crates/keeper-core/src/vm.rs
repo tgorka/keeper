@@ -1625,6 +1625,11 @@ pub enum EgressKind {
     /// a device-flow connection exists, and the organisation's GitHub broker
     /// plus GitHub's API while the descriptor names one.
     Forge,
+    /// An MCP server this Mac's agents use (96.2 #10): a `url` server's host
+    /// and port, never its path or token; a `command` server as the program
+    /// keeper starts, which reaches what it reaches with this Mac's rights.
+    /// Present only while Settings › Agents names one.
+    McpServer,
 }
 
 /// One network destination keeper contacts, derived from live app state (Story

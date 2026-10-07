@@ -20,6 +20,10 @@ use keeper_agent::desktop::{self, DesktopFacts, DesktopHost, TickGate};
 use keeper_agent::seed as seeding;
 use keeper_core::agents::approval_card::HostedRooms;
 use keeper_core::agents::copy::{self, AgentCopyVm, AgentPinReq};
+use keeper_core::agents::mac_tables::{
+    self, AgentMcpDraftVm, AgentMcpListVm, AgentMcpServerReq, AgentSandboxReq, AgentSandboxVm,
+    Heard, Hosted,
+};
 use keeper_core::agents::pins;
 use keeper_core::agents::proxy::AgentProxies;
 use keeper_core::agents::room::AgentIcons;
@@ -69,6 +73,11 @@ struct Runtime {
     ticks: AtomicU64,
     /// What the running host last found about each copy, for the rows.
     problems: Mutex<desktop::Problems>,
+    /// The running host's MCP servers and its sandbox's line, each with the
+    /// revision of the tables it was built on, for Settings › Agents;
+    /// `None` while this Mac hosts nothing.
+    mcp: Mutex<Option<(i64, Arc<keeper_agent::mcp::McpServers>)>>,
+    sandbox: Mutex<Option<(i64, String)>>,
 }
 
 static RUNTIME: LazyLock<Runtime> = LazyLock::new(Runtime::default);
@@ -170,6 +179,11 @@ pub fn tick(app: &tauri::AppHandle) {
                     .problems
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner) = host.problems().clone();
+                *RUNTIME.mcp.lock().unwrap_or_else(PoisonError::into_inner) = host.mcp();
+                *RUNTIME
+                    .sandbox
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = host.sandbox_status();
                 // The rooms whose claim this Mac holds: a T4 card there is
                 // never decided from this app (93.3, S-22).
                 if let Some(hosted) = RUNTIME.hosted.get() {
@@ -234,6 +248,12 @@ fn facts(platform: &dyn Platform) -> DesktopFacts {
         .into_iter()
         .map(|row| (row.user_id, row.homeserver_url))
         .collect();
+    // This Mac's own `[[mcp]]` and `[sandbox]` tables (96.2 #11, R213),
+    // checked as agentd's are, of one revision.
+    let tables = data_dir
+        .as_deref()
+        .map(mac_tables::read)
+        .unwrap_or_default();
     DesktopFacts {
         login,
         device,
@@ -241,6 +261,7 @@ fn facts(platform: &dyn Platform) -> DesktopFacts {
         pins,
         homeservers,
         accounts: Vec::new(),
+        tables,
     }
 }
 
@@ -495,6 +516,155 @@ pub async fn agents_seed_apply(
     })
     .await
     .map_err(|error| refusal(error.to_string()))?
+}
+
+/// The next tick scans: a saved table is hosted within a second, not at
+/// the next five-second scan.
+fn scan_next_tick() {
+    RUNTIME.ticks.store(0, Ordering::Relaxed);
+}
+
+/// Settings › Agents › *MCP servers* (UX-DR140): this Mac's servers as
+/// stored, whether each answers a running host built on these very tables
+/// and what it lists, with the people its readers name by display name.
+/// Never a token.
+#[tauri::command]
+pub async fn agents_mcp_list(state: State<'_, AppState>) -> Result<AgentMcpListVm, IpcError> {
+    let platform = platform_of(&state);
+    let dir = data_dir(platform.as_ref())?;
+    let people = {
+        let dir = dir.clone();
+        tokio::task::spawn_blocking(move || mac_tables::people(&dir))
+            .await
+            .map_err(|error| refusal(error.to_string()))?
+    };
+    let names = if people.is_empty() {
+        desktop::Names::new()
+    } else {
+        state.accounts.display_names(&people, NAMES_WITHIN).await
+    };
+    let heard = heard_now();
+    tokio::task::spawn_blocking(move || {
+        let hosted = heard.as_ref().map(|(revision, heard)| Hosted {
+            revision: *revision,
+            heard,
+        });
+        mac_tables::listing(&dir, platform.as_ref(), hosted, &|user| {
+            names.get(user).cloned()
+        })
+        .map_err(refusal)
+    })
+    .await
+    .map_err(|error| refusal(error.to_string()))?
+}
+
+/// What the running host last heard from this Mac's servers, and the
+/// revision of the tables it was built on; `None` while it hosts nothing.
+fn heard_now() -> Option<(i64, BTreeMap<String, Heard>)> {
+    RUNTIME
+        .mcp
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .as_ref()
+        .map(|(revision, servers)| (*revision, desktop::heard(servers)))
+}
+
+/// What a server's sheet says for the entry being edited (UX-DR140,
+/// R276): Rust's floor and fixed table for the draft, each tool the
+/// running host heard the saved server list while the draft still reaches
+/// it, and every row, with the tier a save of the draft would give it, and
+/// the rows its role does not take — every name and refusal as the host's
+/// status writes it (R278). The draft's token is not looked at.
+#[tauri::command]
+pub async fn agents_mcp_draft(
+    state: State<'_, AppState>,
+    req: AgentMcpServerReq,
+) -> Result<AgentMcpDraftVm, IpcError> {
+    let dir = data_dir(platform_of(&state).as_ref())?;
+    let heard = heard_now();
+    tokio::task::spawn_blocking(move || {
+        let hosted = heard.as_ref().map(|(revision, heard)| Hosted {
+            revision: *revision,
+            heard,
+        });
+        mac_tables::draft(&dir, hosted, req, &keeper_agent::mcp::diagnostic).map_err(refusal)
+    })
+    .await
+    .map_err(|error| refusal(error.to_string()))?
+}
+
+/// Add or replace one of this Mac's MCP servers, checked by the one
+/// `[[mcp]]` check before anything is written; its token goes to the
+/// keychain. `keeper.db` only: no file under the account's clone. A
+/// refusal is Rust's sentence. The host is built again on it at the next
+/// tick.
+#[tauri::command]
+pub async fn agents_mcp_save(
+    state: State<'_, AppState>,
+    req: AgentMcpServerReq,
+) -> Result<AgentMcpListVm, IpcError> {
+    let platform = platform_of(&state);
+    let dir = data_dir(platform.as_ref())?;
+    tokio::task::spawn_blocking(move || {
+        mac_tables::save_server(&dir, platform.as_ref(), req).map_err(refusal)
+    })
+    .await
+    .map_err(|error| refusal(error.to_string()))??;
+    scan_next_tick();
+    agents_mcp_list(state).await
+}
+
+/// Remove one of this Mac's MCP servers and its token.
+#[tauri::command]
+pub async fn agents_mcp_remove(
+    state: State<'_, AppState>,
+    name: String,
+) -> Result<AgentMcpListVm, IpcError> {
+    let platform = platform_of(&state);
+    let dir = data_dir(platform.as_ref())?;
+    tokio::task::spawn_blocking(move || {
+        mac_tables::remove_server(&dir, platform.as_ref(), &name).map_err(refusal)
+    })
+    .await
+    .map_err(|error| refusal(error.to_string()))??;
+    scan_next_tick();
+    agents_mcp_list(state).await
+}
+
+/// Settings › Agents › *Sandbox*: this Mac's `[sandbox]` table and what the
+/// running host's probe of that very table found (R213).
+#[tauri::command]
+pub async fn agents_sandbox_get(state: State<'_, AppState>) -> Result<AgentSandboxVm, IpcError> {
+    let dir = data_dir(platform_of(&state).as_ref())?;
+    let probed = RUNTIME
+        .sandbox
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
+    tokio::task::spawn_blocking(move || {
+        let probed = probed
+            .as_ref()
+            .map(|(revision, line)| (*revision, line.as_str()));
+        mac_tables::sandbox_listing(&dir, probed).map_err(refusal)
+    })
+    .await
+    .map_err(|error| refusal(error.to_string()))?
+}
+
+/// Replace this Mac's `[sandbox]` table, checked by the one `[sandbox]`
+/// check before anything is written. A refusal is Rust's sentence. The
+/// host probes it again at the next tick.
+#[tauri::command]
+pub async fn agents_sandbox_save(
+    state: State<'_, AppState>,
+    req: AgentSandboxReq,
+) -> Result<AgentSandboxVm, IpcError> {
+    let dir = data_dir(platform_of(&state).as_ref())?;
+    tokio::task::spawn_blocking(move || mac_tables::save_sandbox(&dir, req).map_err(refusal))
+        .await
+        .map_err(|error| refusal(error.to_string()))??;
+    scan_next_tick();
+    agents_sandbox_get(state).await
 }
 
 fn now_ms() -> i64 {

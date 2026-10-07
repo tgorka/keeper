@@ -1817,8 +1817,7 @@ pub fn grant_refusal(
 /// A host's `[sandbox]` table, checked (R148, R213): `read_exec` folders
 /// and `env` variables whose values are absolute paths a run may read and
 /// execute. One check for both hosts: agentd's `agentd.toml` and the Mac's
-/// (whose device-local table lands with the Mac's MCP store, rung
-/// `agents-96-mcp-mac`).
+/// device-local table ([`crate::agents::mac_tables`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SandboxTable {
     pub read_exec: Vec<PathBuf>,

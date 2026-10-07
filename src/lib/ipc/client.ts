@@ -337,6 +337,15 @@ export type { AccountStateVm } from "./gen/AccountStateVm";
 export type { AccountVm } from "./gen/AccountVm";
 export type { AgentCopyVm } from "./gen/AgentCopyVm";
 export type { AgentFocusReq } from "./gen/AgentFocusReq";
+export type { AgentMcpConflictVm } from "./gen/AgentMcpConflictVm";
+export type { AgentMcpDraftVm } from "./gen/AgentMcpDraftVm";
+export type { AgentMcpListVm } from "./gen/AgentMcpListVm";
+export type { AgentMcpRowVm } from "./gen/AgentMcpRowVm";
+export type { AgentMcpServerReq } from "./gen/AgentMcpServerReq";
+export type { AgentMcpServerVm } from "./gen/AgentMcpServerVm";
+export type { AgentMcpStartedVm } from "./gen/AgentMcpStartedVm";
+export type { AgentMcpTierVm } from "./gen/AgentMcpTierVm";
+export type { AgentMcpToolVm } from "./gen/AgentMcpToolVm";
 export type { AgentPersonVm } from "./gen/AgentPersonVm";
 export type { AgentPinReq } from "./gen/AgentPinReq";
 export type { AgentPinState } from "./gen/AgentPinState";
@@ -344,6 +353,9 @@ export type { AgentPinVm } from "./gen/AgentPinVm";
 export type { AgentRoomHeaderVm } from "./gen/AgentRoomHeaderVm";
 export type { AgentRoomKindVm } from "./gen/AgentRoomKindVm";
 export type { AgentRunVm } from "./gen/AgentRunVm";
+export type { AgentSandboxEnvVm } from "./gen/AgentSandboxEnvVm";
+export type { AgentSandboxReq } from "./gen/AgentSandboxReq";
+export type { AgentSandboxVm } from "./gen/AgentSandboxVm";
 export type { AgentSeedAgentVm } from "./gen/AgentSeedAgentVm";
 export type { AgentSeedBotVm } from "./gen/AgentSeedBotVm";
 export type { AgentSeedFolderVm } from "./gen/AgentSeedFolderVm";
@@ -756,7 +768,12 @@ import type { AccountShareVm } from "./gen/AccountShareVm";
 import type { AccountVm } from "./gen/AccountVm";
 import type { AgentCopyVm } from "./gen/AgentCopyVm";
 import type { AgentFocusReq } from "./gen/AgentFocusReq";
+import type { AgentMcpDraftVm } from "./gen/AgentMcpDraftVm";
+import type { AgentMcpListVm } from "./gen/AgentMcpListVm";
+import type { AgentMcpServerReq } from "./gen/AgentMcpServerReq";
 import type { AgentPinReq } from "./gen/AgentPinReq";
+import type { AgentSandboxReq } from "./gen/AgentSandboxReq";
+import type { AgentSandboxVm } from "./gen/AgentSandboxVm";
 import type { AgentSeedOfferVm } from "./gen/AgentSeedOfferVm";
 import type { AgentSeedPlanVm } from "./gen/AgentSeedPlanVm";
 import type { AgentSeedReq } from "./gen/AgentSeedReq";
@@ -7527,6 +7544,75 @@ export async function agentsSeedPlan(req: AgentSeedReq): Promise<AgentSeedPlanVm
  */
 export async function agentsSeedApply(req: AgentSeedReq): Promise<AgentSeedResultVm> {
   return await invoke<AgentSeedResultVm>("agents_seed_apply", { req });
+}
+
+/**
+ * Settings › Agents › *MCP servers* (story 96.2, UX-DR140): this Mac's own
+ * servers as stored in `keeper.db`, whether each answers a running host built
+ * on these very settings (`answer` is the sentence to show), and the tiers a
+ * row may set as the cards name them; what each lists is its sheet's
+ * (`agentsMcpDraft`). Never a token: `token`
+ * only says the server is saved with one.
+ *
+ * Rejects with: `internal`.
+ */
+export async function agentsMcpList(): Promise<AgentMcpListVm> {
+  return await invoke<AgentMcpListVm>("agents_mcp_list");
+}
+
+/**
+ * What the sheet says for the server being edited, as a save of the draft
+ * would be: a program's floor, a role's fixed table, every tool the saved
+ * server listed while the draft still reaches it and every row, each with the
+ * tier Rust gives it (a name that cannot travel redacted and bounded, with no
+ * row key), and the rows a role does not take. Send it with `token: null`: the
+ * draft's token is not read.
+ *
+ * Rejects with: `internal`, when this Mac's settings cannot be read.
+ */
+export async function agentsMcpDraft(req: AgentMcpServerReq): Promise<AgentMcpDraftVm> {
+  return await invoke<AgentMcpDraftVm>("agents_mcp_draft", { req });
+}
+
+/**
+ * Add or replace the server `req.name`, checked by the same `[[mcp]]` check
+ * agentd's servers go through. `req.token` is write-only (`null` keeps the
+ * saved one); `req.forgetToken` forgets it, whatever `req.token` says. Answers
+ * the list again.
+ *
+ * Rejects with: `internal`, its message Rust's refusal to show verbatim.
+ */
+export async function agentsMcpSave(req: AgentMcpServerReq): Promise<AgentMcpListVm> {
+  return await invoke<AgentMcpListVm>("agents_mcp_save", { req });
+}
+
+/**
+ * Remove the server `name` and its token. Answers the list again.
+ *
+ * Rejects with: `internal`.
+ */
+export async function agentsMcpRemove(name: string): Promise<AgentMcpListVm> {
+  return await invoke<AgentMcpListVm>("agents_mcp_remove", { name });
+}
+
+/**
+ * This Mac's `[sandbox]` table (`read_exec`, `env`) and the line a probe of
+ * that very table wrote (R213).
+ *
+ * Rejects with: `internal`.
+ */
+export async function agentsSandboxGet(): Promise<AgentSandboxVm> {
+  return await invoke<AgentSandboxVm>("agents_sandbox_get");
+}
+
+/**
+ * Replace this Mac's `[sandbox]` table, checked by the same `[sandbox]` check
+ * agentd's goes through.
+ *
+ * Rejects with: `internal`, its message Rust's refusal to show verbatim.
+ */
+export async function agentsSandboxSave(req: AgentSandboxReq): Promise<AgentSandboxVm> {
+  return await invoke<AgentSandboxVm>("agents_sandbox_save", { req });
 }
 
 // ---------------------------------------------------------------------------
