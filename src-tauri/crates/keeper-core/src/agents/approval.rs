@@ -409,6 +409,7 @@ pub fn summary_of(tool: AgentTool, args: &Value, exec_binding: &Value) -> String
             )
         }
         AgentTool::Run => crate::agents::run::summary(args, exec_binding),
+        AgentTool::Mcp => crate::agents::mcp::summary(args, exec_binding),
     }
 }
 
@@ -442,8 +443,9 @@ pub struct Action {
     /// arguments, when they are over [`ARGS_INLINE_MAX`] (R86).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub args_blob: Option<String>,
-    /// A `run`'s argv, cwd, env, executable and operand hashes; `null` for
-    /// every other tool (R79).
+    /// A `run`'s argv, cwd, env, executable and operand hashes; an MCP
+    /// call's server, tool and where the server is (R144); `null` for every
+    /// other tool (R79).
     pub exec_binding: Value,
     pub summary: String,
     pub preview: Option<Value>,
@@ -534,8 +536,8 @@ pub struct Parking<'a> {
     pub dispatch_chain: Vec<String>,
     pub checkpoint: Checkpoint,
     pub args: &'a Value,
-    /// What a `run` binds beyond its arguments; `null` for every other
-    /// tool.
+    /// What a `run` or an MCP call binds beyond its arguments; `null` for
+    /// every other tool.
     pub exec_binding: Value,
     pub classification: &'a Classification,
     pub label: &'a Label,
@@ -600,7 +602,13 @@ impl ApprovalRecord {
             },
             label: parking.label.clone(),
             preconditions: parking.preconditions,
-            scopes: scopes(classification.tier, parking.session_kind),
+            // No host keeps a `session` allowance for an MCP tool: its
+            // approval is for the one call.
+            scopes: if classification.tool == AgentTool::Mcp {
+                vec![Scope::Once]
+            } else {
+                scopes(classification.tier, parking.session_kind)
+            },
             binding_digest,
             matrix_event: None,
         })
@@ -1419,5 +1427,47 @@ mod tests {
         let mut inline = record_of(&small, &json!({"argv": ["ls"]}), &json!({}));
         assert!(inline.externalise_args().is_none());
         assert_eq!(inline.action.exec_binding, json!({"argv": ["ls"]}));
+    }
+
+    /// R222: a T2 MCP record in a session that is not `main` offers only
+    /// `once`; a T2 drive write there offers `session` too.
+    #[test]
+    fn an_mcp_approval_is_for_the_one_call() {
+        let scopes_of = |tool: AgentTool| {
+            let classified = classification(tool, Tier::T2);
+            let label = label();
+            ApprovalRecord::new(Parking {
+                id: "01JMCP",
+                created_at: at("2026-10-05T10:00:00Z"),
+                session: "60-sessions/active/2026-10-05-chat",
+                session_kind: SessionKind::Conversation,
+                agent: "nixi",
+                drive: "tgdrive",
+                host: "electra",
+                epoch: 4,
+                call: CallRef {
+                    line: "01JLINE".to_owned(),
+                    call_id: "m1".to_owned(),
+                },
+                dispatch_chain: vec!["@tgorka:h".to_owned()],
+                checkpoint: Checkpoint {
+                    chunk: "log/2026-10-05.electra.1.jsonl".to_owned(),
+                    through: "01JLINE".to_owned(),
+                    sha256: "c".repeat(64),
+                },
+                args: &json!({"q": "x"}),
+                exec_binding: json!({"server": "notes", "tool": "search"}),
+                classification: &classified,
+                label: &label,
+                preconditions: Preconditions::default(),
+            })
+            .expect("record")
+            .scopes
+        };
+        assert_eq!(scopes_of(AgentTool::Mcp), [Scope::Once]);
+        assert_eq!(
+            scopes_of(AgentTool::DriveWrite),
+            [Scope::Once, Scope::Session]
+        );
     }
 }

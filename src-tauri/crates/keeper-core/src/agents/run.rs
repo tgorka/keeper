@@ -1567,7 +1567,7 @@ pub fn result_label(
 
 /// `text` safe on one line of a card: control characters, bidirectional
 /// overrides and backticks escaped (`\n`, `\u{202e}`).
-fn shown(text: &str) -> String {
+pub(crate) fn shown(text: &str) -> String {
     text.chars()
         .map(|c| {
             let bidi = matches!(c, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}');

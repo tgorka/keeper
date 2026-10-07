@@ -1019,6 +1019,9 @@ pub struct AgentDeps {
     /// This host's sandbox, when its probe passed (96.1 #11): `run` is
     /// offered only with it, and never runs without it.
     pub sandbox: Option<Arc<crate::run::SandboxHost>>,
+    /// The MCP servers this host names (96.2): an agent is offered the
+    /// tools of those its `[tools].mcp` lists while they answer.
+    pub mcp: Option<Arc<crate::mcp::McpServers>>,
 }
 
 impl AgentDeps {
@@ -1057,6 +1060,9 @@ struct AllowedTools<'t> {
     /// `run` (96.1): this host's sandbox and where this session's runs
     /// work; `None` where the host offers no `sandbox`.
     runs: Option<RunTools>,
+    /// The agent's MCP servers on this host (96.2); `None` where it names
+    /// none.
+    mcp: Option<McpTools>,
     view: &'t dyn TurnView,
     sinks: &'t Sinks,
     /// The declarations of the drives this host mounts: a write's audience.
@@ -1091,7 +1097,8 @@ struct AllowedTools<'t> {
 
 /// A consumed approval as the one execution of its call holds it: the
 /// call's wire id and tool, the record, the flow a `declassify` approval
-/// releases (R89), and what a `run` approval was checked against (R213).
+/// releases (R89), and what a `run` or an MCP approval was checked against
+/// before it was consumed (R213, R144).
 struct Bound {
     call: String,
     tool: String,
@@ -1213,11 +1220,18 @@ impl AllowedTools<'_> {
     /// What the consumed approval call `id`, a `run`, runs on was checked
     /// against, while it is the bound call's execution.
     fn bound_run(&self, id: &str) -> Option<Box<crate::approvals::ApprovedRun>> {
+        self.bound_checked(id, keeper_core::agents::run::RUN)
+    }
+
+    /// What the consumed approval call `id` of `tool` — a `run` or an MCP
+    /// call — runs on was checked against before it was consumed, while it
+    /// is the bound call's execution.
+    fn bound_checked(&self, id: &str, tool: &str) -> Option<Box<crate::approvals::ApprovedRun>> {
         self.bound
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .as_ref()
-            .filter(|bound| bound.call == id && bound.tool == keeper_core::agents::run::RUN)
+            .filter(|bound| bound.call == id && bound.tool == tool)
             .and_then(|bound| bound.run.clone())
     }
 
@@ -1283,6 +1297,16 @@ impl AllowedTools<'_> {
     /// its facts read as [`ToolHost::run`] and [`ToolHost::run_named`] read
     /// them when it runs.
     fn table_tier(&self, wire: &chat::ToolCall, default_profile_id: &str) -> u8 {
+        let context = self.context();
+        if let Some(listed) = self.mcp_offered(&wire.name) {
+            let facts = CallFacts {
+                mcp: listed.tier.ok(),
+                ..CallFacts::default()
+            };
+            return tier::classify(AgentTool::Mcp, &facts, &context)
+                .tier
+                .as_u8();
+        }
         let Some(tool) = AgentTool::from_wire(&wire.name) else {
             return 0;
         };
@@ -1298,7 +1322,7 @@ impl AllowedTools<'_> {
             }
             Err(_) => tier::named_facts(tool, args, CallFacts::default()),
         };
-        let context = self.context();
+
         tier::classify(tool, &facts, &context).tier.as_u8()
     }
 
@@ -1542,6 +1566,32 @@ impl RunTools {
     }
 }
 
+/// What a turn's MCP calls work with (96.2): the host's servers, the ones
+/// the agent's `[tools].mcp` names, the turn's stop, which cancels a call
+/// in flight, and what each answer that just came back is labelled and how
+/// much of it was shown.
+struct McpTools {
+    servers: Arc<crate::mcp::McpServers>,
+    names: Vec<String>,
+    stop: CancelSignal,
+    answers: Mutex<Vec<McpAnswered>>,
+}
+
+/// One answer a call just got: the label it joins and, when it was cut,
+/// how much of it was shown.
+struct McpAnswered {
+    label: Label,
+    at: String,
+    truncated: Option<Truncated>,
+}
+
+impl McpTools {
+    /// The answer the call that just ended got, if it got one.
+    fn take(&self) -> Option<McpAnswered> {
+        self.answers.lock().unwrap_or_else(|p| p.into_inner()).pop()
+    }
+}
+
 /// The drives a run of `context`'s session may mount on this host: in its
 /// scope, checked out here, and readable under the agent's grants exactly
 /// as a `drive_read` of the drive is (NFR-115, R213).
@@ -1716,6 +1766,175 @@ impl AllowedTools<'_> {
                         &crate::run::mounted_labels(&prepared.mounted, self.drives),
                     ));
                 ToolOutcome::Answered { text: ran.render() }
+            }
+            Err(reason) => ToolOutcome::Refused { reason },
+        };
+        audit.finish(&outcome);
+        outcome
+    }
+}
+
+impl AllowedTools<'_> {
+    /// The tool `wire` names among this agent's servers on this host, while
+    /// its server answers and the tool is offered.
+    fn mcp_offered(&self, wire: &str) -> Option<crate::mcp::Listed> {
+        let tools = self.mcp.as_ref()?;
+        tools.servers.offered(&tools.names, wire)
+    }
+
+    /// An MCP call (96.2, AD-406), in the order every call keeps (R82,
+    /// R90), every fact of it read from one listing of its server, taken
+    /// once here: its tier by its server's rule; arguments that are not a
+    /// JSON object refused, never sent as another call (R225); Paseo's
+    /// mutations refused outright in an `untrusted` session (R143/Q3); T5
+    /// refused; a send to the server's readers checked before anything
+    /// reaches it (#8, AD-391); a call that needs a person parks on a
+    /// record binding which server that listing's connection reached and
+    /// the tool's definition and tier there (R144); a call an approval let
+    /// through runs only while that binding is still what the consume path
+    /// checked; its one audit row before the call; then the call on its
+    /// own task, sent on that listing's connection only while it is the
+    /// live one and the tool unchanged, cancelled by the turn's stop, its
+    /// answer — a result or the server's error — outside content labelled
+    /// `untrusted` and read by the server's readers (#7).
+    fn mcp_call(&self, wire: &chat::ToolCall) -> ToolOutcome {
+        use keeper_core::agents::mcp as core_mcp;
+        let name = wire.name.as_str();
+        let at = core_mcp::decode(name)
+            .map(|(server, tool)| format!("{}{server}/{tool}", core_mcp::CAPABILITY_PREFIX))
+            .unwrap_or_default();
+        let offered = self.mcp_offered(name);
+        let facts = CallFacts {
+            mcp: offered.as_ref().and_then(|listed| listed.tier.clone().ok()),
+            ..CallFacts::default()
+        };
+        let classification = self.classify(&wire.id, AgentTool::Mcp, &facts, None);
+        let refused = |reason: String| {
+            CallAudit::new(
+                self.sinks,
+                name,
+                Effect::Write,
+                &classification,
+                Gated::Run(self.bound_approval(&wire.id, name).map(Approval::Approved)),
+                ("", &at),
+            )
+            .refuse(reason)
+        };
+        let (Some(tools), Some(listed)) = (self.mcp.as_ref(), offered) else {
+            return refused(format!(
+                "{name} is not one of this agent's tools on this host."
+            ));
+        };
+        let Some(entry) = tools.servers.entry(&listed.server) else {
+            return refused(format!(
+                "{name} is not one of this agent's tools on this host."
+            ));
+        };
+        let Some(Value::Object(args)) = wire.arguments.as_ref() else {
+            return refused(format!(
+                "The arguments of {name} are not a JSON object, so the call was not made; nothing was sent."
+            ));
+        };
+        if let Some(reason) =
+            core_mcp::untrusted_refusal(entry, &listed.tool, self.view.label().integrity)
+        {
+            return refused(reason);
+        }
+        if classification.gate() == Gate::Refuse {
+            return refused(FORBIDDEN.to_owned());
+        }
+        if let SinkVerdict::Block { reason, .. } =
+            check_sink(&self.view.label(), &core_mcp::sink(entry))
+        {
+            return refused(format!(
+                "{reason} The MCP server `{}` is read by {}. Nothing was sent to it.",
+                listed.server,
+                match &entry.readers {
+                    Readers::Anyone => "anyone".to_owned(),
+                    Readers::Only(readers) => readers
+                        .iter()
+                        .map(|user| user.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                }
+            ));
+        }
+        let Some(binding) = listed.binding() else {
+            return refused(format!(
+                "`{}` does not answer here now; nothing was sent to it.",
+                listed.server
+            ));
+        };
+        let gated = match self.gated(&wire.id, name, &classification, &[], Vec::new()) {
+            Gated::Park(approval) => {
+                if let Some(parking) = self
+                    .parked
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .as_mut()
+                {
+                    parking.exec_binding = binding;
+                }
+                Gated::Park(approval)
+            }
+            Gated::Run(Some(approved)) => {
+                // What the consume path checked against the server is what
+                // runs: a list change since then is drift.
+                let checked = self.bound_checked(&wire.id, name);
+                if checked.as_ref().map(|run| &run.exec_binding) != Some(&binding) {
+                    return refused(format!(
+                        "It was not done: the MCP server `{}` or its tool changed after it was approved. Nothing was sent to it.",
+                        listed.server
+                    ));
+                }
+                Gated::Run(Some(approved))
+            }
+            gated => gated,
+        };
+        let audit = CallAudit::new(
+            self.sinks,
+            name,
+            Effect::Write,
+            &classification,
+            gated,
+            ("", &at),
+        );
+        if let Err(withheld) = audit.admit("", &at) {
+            let outcome = withheld.into();
+            audit.finish(&outcome);
+            return outcome;
+        }
+        let call = {
+            let servers = Arc::clone(&tools.servers);
+            let (listed, args) = (listed.clone(), args.clone());
+            let stop = tools.stop.clone();
+            tokio::spawn(async move { servers.call(&listed, args, stop).await })
+        };
+        let answered = delegate::block_on(call).unwrap_or_else(|_| {
+            Err(format!(
+                "The call to `{}` ended without an answer; whether it took effect is unknown.",
+                listed.server
+            ))
+        });
+        let outcome = match answered {
+            Ok(answer) => {
+                let (text, cut) = core_mcp::render(
+                    &listed.server,
+                    &listed.tool,
+                    &answer.text,
+                    answer.total,
+                    answer.error,
+                );
+                tools
+                    .answers
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push(McpAnswered {
+                        label: core_mcp::result_label(entry),
+                        at: at.clone(),
+                        truncated: cut.map(|(shown, total)| Truncated { shown, total }),
+                    });
+                ToolOutcome::Answered { text }
             }
             Err(reason) => ToolOutcome::Refused { reason },
         };
@@ -2262,6 +2481,9 @@ impl AllowedTools<'_> {
         }
         if wire.name == keeper_core::agents::run::RUN {
             return Some(self.run_command(wire));
+        }
+        if keeper_core::agents::mcp::decode(&wire.name).is_some() {
+            return Some(self.mcp_call(wire));
         }
         if !crate::surface::is_surface(&wire.name) {
             return None;
@@ -6329,9 +6551,12 @@ fn reply_offer(session: SessionKind, relays_waiting: bool, kind: AgentKind) -> R
 /// says (R105), `ask_human` by the session's kind (R102),
 /// `workflow_start` outside a proxy's own conversation (AD-380) and the
 /// memory tools `allow` names, by the session's kind (R127),
-/// `drive_search` as `allow` says (95.4), and `run` as `allow` says where
-/// this host's sandbox passed its probe, `sandboxed` (96.1 #11). Arming and
-/// a workflow's start check both ask it (R202).
+/// `drive_search` as `allow` says (95.4), `run` as `allow` says where
+/// this host's sandbox passed its probe, `sandboxed` (96.1 #11), and the
+/// tools of each server `[tools].mcp` names that answered its last
+/// `tools/list` on this host, `mcp`, each that can travel and has a tier
+/// (96.2 #3, #5). Arming and a workflow's start check both ask it (R202).
+#[allow(clippy::too_many_arguments)]
 fn agent_offer(
     config: &keeper_core::agents::home::AgentConfig,
     session: SessionKind,
@@ -6339,6 +6564,7 @@ fn agent_offer(
     grants: &dyn GrantSource,
     home: &str,
     sandboxed: bool,
+    mcp: Option<&crate::mcp::McpServers>,
     mut tools: Vec<chat::ToolSpec>,
 ) -> Vec<chat::ToolSpec> {
     // Whether this model is offered tools at all: the surface tools ride on
@@ -6386,6 +6612,9 @@ fn agent_offer(
     {
         tools.push(keeper_core::agents::run::spec());
     }
+    if let Some(servers) = mcp {
+        tools.extend(servers.specs(&config.mcp));
+    }
     tools
 }
 
@@ -6413,6 +6642,7 @@ fn workflow_offer(
         &grants,
         &deps.home.drive.id,
         deps.sandbox.is_some(),
+        deps.mcp.as_deref(),
         model_tools.to_vec(),
     )
     .into_iter()
@@ -6467,6 +6697,7 @@ async fn arm_session(
         grants.as_ref(),
         &deps.home.drive.id,
         deps.sandbox.is_some(),
+        deps.mcp.as_deref(),
         model_tools.clone(),
     );
     (armed, model_tools)
@@ -6897,6 +7128,18 @@ async fn run_agent_turn(
             stop.clone(),
         ),
         runs,
+        // A review pass reads and proposes: offered no MCP tool, it is given
+        // none to call either, so one it names anyway is refused unsent.
+        mcp: deps
+            .mcp
+            .as_ref()
+            .filter(|_| !config.mcp.is_empty() && review.is_none())
+            .map(|servers| McpTools {
+                servers: Arc::clone(servers),
+                names: config.mcp.clone(),
+                stop: stop.clone(),
+                answers: Mutex::new(Vec::new()),
+            }),
     };
     let tool_loop = ToolLoop {
         client: &client,
@@ -6969,6 +7212,8 @@ async fn run_agent_turn(
         // label joined with its reads. A run's result is labelled by what it
         // could read (96.1 #14).
         let ran = host.runs.as_ref().and_then(RunTools::take_label);
+        // An MCP answer is outside content, read by its server's readers.
+        let fetched = host.mcp.as_ref().and_then(McpTools::take);
         let result_label = if helped.is_some() {
             reads
                 .iter()
@@ -6980,10 +7225,18 @@ async fn run_agent_turn(
                 .iter()
                 .map(|(label, _)| label.clone())
                 .chain(ran.clone())
+                .chain(fetched.as_ref().map(|answer| answer.label.clone()))
                 .reduce(|joined, label| joined.join(&label))
                 .unwrap_or_else(|| log.context.label.clone())
         };
-        let (word, truncated) = result_word(outcome);
+        // An MCP answer cut to its bound says so where nothing else did.
+        let (word, truncated) = match result_word(outcome) {
+            (ToolOutcomeWord::Ok, None) => (
+                ToolOutcomeWord::Ok,
+                fetched.as_ref().and_then(|answer| answer.truncated),
+            ),
+            worded => worded,
+        };
         log.last_line = log.write(
             call_line,
             LineBody::ToolResult(ToolResultBody {
@@ -7039,6 +7292,21 @@ async fn run_agent_turn(
                 );
             }
             log.progress.reads += 1;
+        }
+        if let Some(answer) = fetched {
+            let joined = log.context.label.join(&answer.label);
+            if joined != log.context.label {
+                log.write(
+                    None,
+                    LineBody::Label(LabelBody::new(
+                        &joined,
+                        LabelCause {
+                            kind: LabelCauseKind::Outside,
+                            reference: answer.at,
+                        },
+                    )),
+                );
+            }
         }
         if let Some(label) = ran {
             let joined = log.context.label.join(&label);
@@ -7491,6 +7759,10 @@ fn drive_read_label(
 /// declaration, and each context file arming loaded, under its drive's
 /// declaration and its own facts, as a read of it would be. A context file
 /// of a drive this host holds no declaration for is left out of the prompt.
+/// The descriptions and schemas an MCP server wrote of the tools offered
+/// are outside content as its answers are (R225): each such server's
+/// result label joins here, before any request carries them — a role
+/// server's tools are described by keeper and join nothing.
 fn join_prompt_sources(
     context: &mut SessionContext,
     writer: &mut SessionWriter,
@@ -7505,6 +7777,7 @@ fn join_prompt_sources(
             local_only: home.local_only,
         },
         format!("{}/{}", deps.home.config.drive, deps.home.config.id),
+        LabelCauseKind::DriveRead,
     )];
     if let Some(bundle) = armed.context.as_mut() {
         let profiles = &armed.profiles;
@@ -7526,7 +7799,7 @@ fn join_prompt_sources(
                     card_untrusted: keeper_core::agents::card::marked_untrusted(&head),
                 },
             );
-            sources.push((label, file.subpath.clone()));
+            sources.push((label, file.subpath.clone(), LabelCauseKind::DriveRead));
             true
         });
         bundle.total_bytes = bundle
@@ -7535,20 +7808,34 @@ fn join_prompt_sources(
             .map(|file| usize::try_from(file.bytes).unwrap_or(usize::MAX))
             .sum();
     }
-    for (label, reference) in sources {
+    if let Some(servers) = &deps.mcp {
+        let mut offering: Vec<&str> = armed
+            .request
+            .tools
+            .iter()
+            .filter_map(|spec| keeper_core::agents::mcp::decode(&spec.name))
+            .map(|(server, _)| server)
+            .collect();
+        offering.sort_unstable();
+        offering.dedup();
+        for server in offering {
+            if let Some(entry) = servers.entry(server).filter(|entry| entry.role.is_none()) {
+                sources.push((
+                    keeper_core::agents::mcp::result_label(entry),
+                    format!("{}{server}", keeper_core::agents::mcp::CAPABILITY_PREFIX),
+                    LabelCauseKind::Outside,
+                ));
+            }
+        }
+    }
+    for (label, reference, kind) in sources {
         let joined = context.label.join(&label);
         if joined != context.label {
             writer.write(
                 context,
                 None,
                 None,
-                LineBody::Label(LabelBody::new(
-                    &joined,
-                    LabelCause {
-                        kind: LabelCauseKind::DriveRead,
-                        reference,
-                    },
-                )),
+                LineBody::Label(LabelBody::new(&joined, LabelCause { kind, reference })),
             )?;
         }
     }

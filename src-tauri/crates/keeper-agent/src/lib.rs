@@ -70,6 +70,7 @@ pub mod host;
 pub mod hosts;
 pub mod maintain;
 pub mod matrix_sink;
+pub mod mcp;
 pub mod memory;
 pub mod ports;
 pub mod promote;

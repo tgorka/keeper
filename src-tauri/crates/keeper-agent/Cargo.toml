@@ -32,8 +32,17 @@ matrix-sdk = { workspace = true }
 # drive's install through them, and print what they print in key order.
 keeper-ported = { path = "../keeper-ported" }
 toml = { workspace = true }
-# A round's helpers run side by side on the turn's thread (R110).
+# A round's helpers run side by side on the turn's thread (R110). The MCP
+# servers a host names for its agents (AD-406): one client per
+# server, over streamable HTTP or, where the host may spawn, a child. The
+# HTTP side is keeper's own bounded client over the workspace's reqwest
+# (`mcp::http`), the child's pipes keeper's own transport with its output
+# read through a bound, so no feature of rmcp's own HTTP, process or pipe
+# layer is built. Every server is listed at once beside the manifest's
+# renewal.
 futures-util = { workspace = true }
+rmcp = { workspace = true, features = ["client", "transport-streamable-http-client"] }
+sse-stream = { workspace = true }
 
 # The headless host's process layer: no secret variable and no core dump
 # after start (S-07), `prctl` on Linux; a `run`'s own process group, killed
@@ -64,3 +73,6 @@ tracing-subscriber = { workspace = true }
 # An index that opens and cannot answer, made by renaming its table
 # (drive_search). keeper-core already links it: no new crate.
 rusqlite = { workspace = true }
+# In-test MCP servers, spoken to over a real HTTP port and a real child.
+rmcp = { workspace = true, features = ["server", "elicitation", "transport-io", "transport-streamable-http-server"] }
+axum = { workspace = true }

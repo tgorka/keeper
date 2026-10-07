@@ -11,8 +11,8 @@
 //! |---|---|---|
 //! | T0 | reads | runs it |
 //! | T1 | reversible inside the session, the surface, `delegate`, `reply`, `bmad_render`, `bmad_memlog`, `ask_human`, `journal_append`, `memory_propose`, `skill_propose` | runs it |
-//! | T2 | a drive write outside the session, a first write the grant asks for, a sandboxed `run` | asks a person |
-//! | T3 | a schedule or workflow set by an agent, a declassification, a `run` with network | asks a person, once |
+//! | T2 | a drive write outside the session, a first write the grant asks for, a sandboxed `run`, an MCP tool of a server keeper starts | asks a person |
+//! | T3 | a schedule or workflow set by an agent, a declassification, a `run` with network, an MCP tool nobody vouched for | asks a person, once |
 //! | T4 | a `run` of code the session holds or given inline, a `git push --force` | the requester decides |
 //! | T5 | a write to the agent's own machine files or to `approvals/`, a `run` of `sudo` and its kin | refuses |
 //!
@@ -125,11 +125,15 @@ pub enum AgentTool {
     /// The same for a skill under `_skills/`.
     SkillApply,
     Run,
+    /// A tool of an MCP server the host names (AD-406): its server and tool
+    /// travel in the call's wire name and in what its approval binds, its
+    /// row's tier in [`CallFacts::mcp`].
+    Mcp,
 }
 
 impl AgentTool {
     /// Every tool, in the table's order.
-    pub const ALL: [AgentTool; 33] = [
+    pub const ALL: [AgentTool; 34] = [
         AgentTool::DriveList,
         AgentTool::DriveRead,
         AgentTool::DriveGlob,
@@ -163,6 +167,7 @@ impl AgentTool {
         AgentTool::MemoryApply,
         AgentTool::SkillApply,
         AgentTool::Run,
+        AgentTool::Mcp,
     ];
 
     /// The name the model calls (an action's own word for the actions).
@@ -201,6 +206,7 @@ impl AgentTool {
             AgentTool::MemoryApply => "memory_apply",
             AgentTool::SkillApply => "skill_apply",
             AgentTool::Run => "run",
+            AgentTool::Mcp => "mcp",
         }
     }
 
@@ -233,6 +239,9 @@ pub struct CallFacts {
     pub force_push: bool,
     /// A `run` of `sudo`, `doas`, `su` or `pkexec`.
     pub privileged: bool,
+    /// An MCP tool's tier by its server's rule (`mcp::tier`, S-14); T3 when
+    /// nothing gave it one.
+    pub mcp: Option<Tier>,
 }
 
 /// The grant's answer for a drive verb, without its payload.
@@ -434,6 +443,7 @@ fn row(tool: AgentTool, facts: &CallFacts) -> Tier {
         AgentTool::Run if facts.held_code || facts.force_push => Tier::T4,
         AgentTool::Run if facts.network => Tier::T3,
         AgentTool::Run => Tier::T2,
+        AgentTool::Mcp => facts.mcp.unwrap_or(Tier::T3),
     }
 }
 
@@ -792,6 +802,16 @@ mod tests {
                 // Its facts' rows are `run::tests::run_tier_table`'s.
                 AgentTool::Run => {
                     assert_eq!(tier(tool, CallFacts::default()), Tier::T2);
+                }
+                // The server's rule decides (`mcp::tests::mcp_tier_rows`);
+                // a call it gave no tier is T3.
+                AgentTool::Mcp => {
+                    assert_eq!(tier(tool, CallFacts::default()), Tier::T3);
+                    let row = CallFacts {
+                        mcp: Some(Tier::T0),
+                        ..CallFacts::default()
+                    };
+                    assert_eq!(tier(tool, row), Tier::T0);
                 }
             }
         }
