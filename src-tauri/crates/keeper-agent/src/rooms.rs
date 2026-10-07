@@ -388,6 +388,12 @@ pub enum Arrival {
     /// The target agent's reply in a room this session delegated into,
     /// routed here the same way.
     Replied,
+    /// An event in a room this session delegated into that this copy could
+    /// not decrypt, or decrypted from a device it cannot link to the event's
+    /// sender, routed here the same way: it may be the target's end of a
+    /// Paseo run, so none told after it is taken before the room is read
+    /// back past it (R283, R293).
+    Unreadable,
     /// Another agent's question for this proxy's person (R99): an
     /// `m.room.message` carrying `dev.keeper.agent.ask`, routed here by the
     /// host from the room it was asked in once [`admit_ask`] admitted it.
@@ -515,8 +521,9 @@ pub fn classify(served: &Served<'_>, sender: &UserId, arrival: Arrival) -> Dispo
         Arrival::Workflow => return Disposition::Workflow,
         // Made only by this host, from the room the session delegated into;
         // the worker checks the sender against the delegation it made — a
-        // workflow's run this agent started replies in its own name (R104).
-        Arrival::Joined | Arrival::Replied => return Disposition::Delegation,
+        // workflow's run this agent started replies in its own name (R104),
+        // and its event this copy cannot read may be its end (R283).
+        Arrival::Joined | Arrival::Replied | Arrival::Unreadable => return Disposition::Delegation,
         _ => {}
     }
     if sender == served.agent_user {
@@ -536,7 +543,7 @@ pub fn classify(served: &Served<'_>, sender: &UserId, arrival: Arrival) -> Dispo
                 Disposition::Ignored(NOT_THE_REQUESTER)
             }
         }
-        Arrival::Joined | Arrival::Replied => Disposition::Delegation,
+        Arrival::Joined | Arrival::Replied | Arrival::Unreadable => Disposition::Delegation,
         // Made only by this host, from the room it was asked in.
         Arrival::Ask if conversation => Disposition::Ask,
         Arrival::Ask => Disposition::Ignored(NOT_ASKED_HERE),
@@ -1186,6 +1193,30 @@ mod tests {
             classify(&stewards, &tola, Arrival::Answer),
             Disposition::Ignored(OWN_EVENT)
         );
+    }
+
+    /// R104, R283: what a delegated room tells — its target's join, its
+    /// reply, or an event this copy cannot read that may be its end — goes
+    /// to the worker whoever sent it, the agent's own user included: a
+    /// workflow's run this agent started answers in its own name, and the
+    /// worker checks the sender against the delegation it made.
+    #[test]
+    fn a_delegated_rooms_event_reaches_the_worker_even_in_the_agents_own_name() {
+        let tgorka = user(TGORKA);
+        let nixi = user("@nixi:example.org");
+        let room = readers(&[TGORKA]);
+        for kind in SessionKind::ALL {
+            let session = served(AgentKind::Proxy, Some(&tgorka), kind, &nixi, &room);
+            for arrival in [Arrival::Joined, Arrival::Replied, Arrival::Unreadable] {
+                for sender in [&nixi, &tgorka] {
+                    assert_eq!(
+                        classify(&session, sender, arrival),
+                        Disposition::Delegation,
+                        "{kind:?} {arrival:?} {sender}"
+                    );
+                }
+            }
+        }
     }
 
     /// A room's power levels as `events::power_levels` makes them for

@@ -517,6 +517,7 @@ mod dm {
             title: MAIN_TITLE.to_owned(),
             requested_by: human.to_owned(),
             parent: None,
+            reply: None,
             room: room.to_owned(),
             drives: vec![proxy.drive.clone()],
             label,

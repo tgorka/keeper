@@ -449,6 +449,7 @@ pub(crate) async fn run(helpers: &Helpers<'_>, parent: &dyn Parent, launch: Laun
                 content: tools::render_result(outcome),
                 truncated,
                 label: result_label,
+                paseo: None,
             },
         ));
         state.reads.extend(read);

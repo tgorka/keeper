@@ -182,6 +182,7 @@ pub enum LineKind {
     Surface,
     Heard,
     Told,
+    Paseo,
     Memory,
     Compact,
     Error,
@@ -190,7 +191,7 @@ pub enum LineKind {
 
 impl LineKind {
     /// Every kind, in the documented order.
-    pub const ALL: [LineKind; 20] = [
+    pub const ALL: [LineKind; 21] = [
         Self::Open,
         Self::Claim,
         Self::User,
@@ -207,6 +208,7 @@ impl LineKind {
         Self::Surface,
         Self::Heard,
         Self::Told,
+        Self::Paseo,
         Self::Memory,
         Self::Compact,
         Self::Error,
@@ -232,6 +234,7 @@ impl LineKind {
             Self::Surface => "surface",
             Self::Heard => "heard",
             Self::Told => "told",
+            Self::Paseo => "paseo",
             Self::Memory => "memory",
             Self::Compact => "compact",
             Self::Error => "error",
@@ -392,6 +395,9 @@ pub struct Truncated {
 }
 
 /// `tool_result`: the result as the model received it, with its label.
+/// `paseo` is the host's own record of the run a successful Paseo
+/// `create_agent` started — the only thing a later poll's authority is
+/// read from (Q14), never the result's text.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ToolResultBody {
@@ -401,6 +407,8 @@ pub struct ToolResultBody {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub truncated: Option<Truncated>,
     pub label: Label,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paseo: Option<crate::agents::paseo::Started>,
 }
 
 /// Where an approval stands (R80). Terminal: `consumed`, `expired`,
@@ -517,6 +525,11 @@ pub struct DelegateReply {
     pub artifacts: Vec<String>,
     /// The replying session's label when it replied (R94).
     pub label: Label,
+    /// A Paseo run's end its follow session told the delegated session's
+    /// room (R96PA2-05): that completion's id. Such a reply is taken beside
+    /// the delegation's own and closes no round of it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion: Option<String>,
 }
 
 /// Where an ask stands (R99): `asked` when the call made it — its intent,
@@ -733,6 +746,49 @@ pub struct ToldBody {
     pub room: OwnedRoomId,
 }
 
+/// Where a Paseo run's end stands in the session that follows it (R275).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PaseoState {
+    /// The record's bytes and the notice are fixed, before the notice is
+    /// sent.
+    Pending,
+    /// The homeserver acknowledged the notice.
+    Delivered,
+}
+
+/// `paseo`: a follow session's run ended (R275, R277). `pending` is the
+/// immutable capture — the record's bytes, their SHA-256, the notice's
+/// content and with it the label it was admitted under, under the
+/// completion's transaction id — and is the first durable step of the
+/// end, written before the record is materialized, the capture is published
+/// in the room or anything is sent; every later step, on this host or one that
+/// takes the session over, is made from those same bytes, with no other
+/// poll of the broker. `delivered` holds the event the homeserver answered
+/// with.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PaseoBody {
+    /// The notice's transaction id: one per follow session.
+    pub completion: String,
+    pub state: PaseoState,
+    /// The starting conversation's room, where the notice goes.
+    pub room: OwnedRoomId,
+    /// The record's path, session-relative.
+    pub artifact: String,
+    /// The SHA-256 of the record's bytes.
+    pub sha256: String,
+    /// `pending`: the record's bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record: Option<String>,
+    /// `pending`: the notice's content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<Value>,
+    /// `delivered`: the notice's event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event: Option<OwnedEventId>,
+}
+
 /// Why a session closed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -780,6 +836,7 @@ pub enum LineBody {
     Surface(SurfaceBody),
     Heard(HeardBody),
     Told(ToldBody),
+    Paseo(PaseoBody),
     Memory(MemoryBody),
     Compact(CompactBody),
     Error(ErrorBody),
@@ -808,6 +865,7 @@ impl LineBody {
             Self::Surface(_) => LineKind::Surface,
             Self::Heard(_) => LineKind::Heard,
             Self::Told(_) => LineKind::Told,
+            Self::Paseo(_) => LineKind::Paseo,
             Self::Memory(_) => LineKind::Memory,
             Self::Compact(_) => LineKind::Compact,
             Self::Error(_) => LineKind::Error,
@@ -836,6 +894,7 @@ impl LineBody {
             LineKind::Surface => Self::Surface(from(value)?),
             LineKind::Heard => Self::Heard(from(value)?),
             LineKind::Told => Self::Told(from(value)?),
+            LineKind::Paseo => Self::Paseo(from(value)?),
             LineKind::Memory => Self::Memory(from(value)?),
             LineKind::Compact => Self::Compact(from(value)?),
             LineKind::Error => Self::Error(from(value)?),
@@ -863,6 +922,7 @@ impl Serialize for LineBody {
             Self::Surface(b) => b.serialize(s),
             Self::Heard(b) => b.serialize(s),
             Self::Told(b) => b.serialize(s),
+            Self::Paseo(b) => b.serialize(s),
             Self::Memory(b) => b.serialize(s),
             Self::Compact(b) => b.serialize(s),
             Self::Error(b) => b.serialize(s),
@@ -1132,6 +1192,7 @@ mod tests {
                     total: 20,
                 }),
                 label: label(),
+                paseo: None,
             }),
             LineBody::Approval(ApprovalBody {
                 id: "01J".into(),
@@ -1156,6 +1217,7 @@ mod tests {
                     text: "Done.".into(),
                     artifacts: vec!["tgdrive/60-sessions/active/x/artifacts/a.md".into()],
                     label: label(),
+                    completion: Some("paseo-ended-01J".into()),
                 }),
                 window: None,
             }),
@@ -1204,6 +1266,16 @@ mod tests {
             LineBody::Told(ToldBody {
                 person: user("@tgorka:h"),
                 room: OwnedRoomId::try_from("!dm:h").expect("room"),
+            }),
+            LineBody::Paseo(PaseoBody {
+                completion: "paseo-ended-01J".into(),
+                state: PaseoState::Pending,
+                room: OwnedRoomId::try_from("!coding:h").expect("room"),
+                artifact: "artifacts/paseo-r1.md".into(),
+                sha256: "c".repeat(64),
+                record: Some("# Paseo run `r1`\n".into()),
+                content: Some(serde_json::json!({"msgtype": "m.text", "body": "ended"})),
+                event: None,
             }),
             LineBody::Memory(MemoryBody {
                 op: MemoryOp::Journal,

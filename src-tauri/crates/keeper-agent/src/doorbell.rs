@@ -1010,6 +1010,7 @@ mod tests {
             title: "work".to_owned(),
             requested_by: user("@tgorka:example.org"),
             parent: None,
+            reply: None,
             room: room.clone(),
             drives: vec!["tgdrive".to_owned()],
             label: Label::top(),

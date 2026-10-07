@@ -182,6 +182,7 @@ async fn host(
         title: "smoke".to_owned(),
         requested_by: person.clone(),
         parent: None,
+        reply: None,
         room: room.clone(),
         drives: vec!["smoke".to_owned()],
         label: Label {

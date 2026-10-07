@@ -1678,6 +1678,17 @@ impl HostRuntime {
             .into_iter()
             .find(|(key, _)| key.is_empty())
             .and_then(|(_, state)| ServerClaim::read(&state).ok());
+        // A follow session whose run's end is captured — on this checkout's
+        // log, or in its room's index another host put there — tells that
+        // capture and calls no tool again: it is placed without any
+        // `mcp:<server>` (R277). The index is a hint only: the worker reads
+        // which capture binds from the room's timeline (R279).
+        let captured = slot.session.paseo_captured
+            || copy
+                .cached_states(room, keeper_core::agents::paseo::CAPTURED)
+                .await
+                .into_iter()
+                .any(|(_, state)| state.sender == copy.config().matrix_user);
         let server_now = self.clock.now();
         let config = copy.config();
         let principal = copy
@@ -1686,11 +1697,14 @@ impl HostRuntime {
         let Some(slot) = self.slots.get_mut(room) else {
             return;
         };
-        let needs = slot
+        let mut needs = slot
             .agent
             .needs
             .clone()
             .unwrap_or_else(|| config.host.needs.clone());
+        if captured {
+            needs.retain(|need| !need.starts_with(keeper_core::agents::mcp::CAPABILITY_PREFIX));
+        }
         // A scheduled card's `host:` is its session's pin (R57).
         let card_pin = cards::session_schedule(Some(&slot.agent), &slot.session.scheduled)
             .ok()
@@ -3011,6 +3025,51 @@ mod tests {
             Box::pin(async { Ok(Vec::new()) })
         }
 
+        fn completions<'a>(
+            &'a self,
+            _room: &'a RoomId,
+            _after: Option<&'a matrix_sdk::ruma::EventId>,
+            _teller: &'a matrix_sdk::ruma::UserId,
+        ) -> crate::delegate::EventsFuture<'a> {
+            unreachable!("opening a run reads no Paseo run's end")
+        }
+
+        fn upload(&self, _bytes: Vec<u8>) -> crate::delegate::FileFuture<'_> {
+            unreachable!("opening a run uploads nothing")
+        }
+
+        fn download<'a>(&'a self, _file: &'a Value) -> crate::delegate::BytesFuture<'a> {
+            unreachable!("opening a run downloads nothing")
+        }
+
+        fn put_state<'a>(
+            &'a self,
+            _room: &'a RoomId,
+            _event_type: &'a str,
+            _key: &'a str,
+            _content: Value,
+        ) -> crate::matrix_sink::SendFuture<'a> {
+            unreachable!("opening a run puts no state")
+        }
+
+        fn state<'a>(
+            &'a self,
+            _room: &'a RoomId,
+            _event_type: &'a str,
+            _key: &'a str,
+        ) -> crate::delegate::StateFuture<'a> {
+            unreachable!("opening a run reads no state")
+        }
+
+        fn captures<'a>(
+            &'a self,
+            _room: &'a RoomId,
+            _completion: &'a str,
+            _agent: &'a matrix_sdk::ruma::UserId,
+        ) -> crate::delegate::EventsFuture<'a> {
+            unreachable!("opening a run reads no Paseo capture")
+        }
+
         fn brief_room<'a>(&'a self, _room: &'a RoomId) -> crate::delegate::BriefRoomFuture<'a> {
             Box::pin(async { None })
         }
@@ -3641,6 +3700,7 @@ mod tests {
                 title: "main".to_owned(),
                 requested_by: user(PERSON),
                 parent: None,
+                reply: None,
                 room: room.clone(),
                 drives: vec!["tgdrive".to_owned()],
                 label: Label::opening(&decl, Integrity::Owner),
@@ -3661,6 +3721,7 @@ mod tests {
                 dir,
                 agent: Ok(agent.clone()),
                 scheduled: cards::ScheduledScan::default(),
+                paseo_captured: false,
             };
             self.rt.offer(&self.copy, &session, &agent);
         }
@@ -3759,6 +3820,7 @@ mod tests {
                 dir,
                 agent: Ok(agent.clone()),
                 scheduled: cards::ScheduledScan::default(),
+                paseo_captured: false,
             };
             self.rt.offer(&self.copy, &session, &agent);
         }
@@ -4189,6 +4251,7 @@ mod tests {
             title: "work".to_owned(),
             requested_by: user(PERSON),
             parent: None,
+            reply: None,
             room: room.clone(),
             drives: vec!["tgdrive".to_owned()],
             label: Label::opening(&decl, Integrity::Owner),
@@ -5065,6 +5128,17 @@ mod tests {
 
         /// [`World::offer_scheduled`], the session needing `needs`.
         fn offer_scheduled_needing(&mut self, room: &OwnedRoomId, needs: Option<Vec<String>>) {
+            self.offer_scheduled_as(room, needs, None);
+        }
+
+        /// [`World::offer_scheduled_needing`], the session answering
+        /// `reply` — a follow session when it names a run.
+        fn offer_scheduled_as(
+            &mut self,
+            room: &OwnedRoomId,
+            needs: Option<Vec<String>>,
+            reply: Option<keeper_core::agents::session::SessionReply>,
+        ) {
             self.copy.joined.lock().expect("lock").insert(room.clone());
             self.copy
                 .members
@@ -5082,6 +5156,7 @@ mod tests {
                 title: "sort".to_owned(),
                 requested_by: user(PERSON),
                 parent: None,
+                reply,
                 room: room.clone(),
                 drives: vec!["tgdrive".to_owned()],
                 label: Label::opening(&decl, Integrity::Owner),
@@ -5101,6 +5176,7 @@ mod tests {
                 dir: dir.clone(),
                 agent: Ok(agent.clone()),
                 scheduled: cards::scheduled_cards(SCHEDULED, &dir),
+                paseo_captured: crate::zone::paseo_captured(&agent, &dir),
             };
             self.rt.offer(&self.copy, &session, &agent);
         }
@@ -5647,6 +5723,112 @@ mod tests {
         let card = card_in(zone.path());
         assert!(ran_in(&card, "2026-10-05T09:00:00Z"), "{card:?}");
         assert_eq!(run_of(&card), Some(keeper_core::agents::card::Run::Waiting));
+    }
+
+    /// A `paseo` line of a captured run end, as a follow session's worker
+    /// logs it, written into the session `dir`.
+    fn capture_logged(dir: &Path) {
+        use keeper_core::agents::log::{
+            writer::{rotate_at, ChunkWriter},
+            HostSlug, LineBody, LogLine, PaseoBody, PaseoState, LINE_VERSION,
+        };
+        let host = HostSlug::new(ME).expect("slug");
+        let now = chrono::Utc::now();
+        ChunkWriter::open(dir, &host, rotate_at(1 << 20), now.date_naive())
+            .expect("chunk")
+            .append(&LogLine {
+                v: LINE_VERSION,
+                id: ulid::Ulid::new(),
+                parent: None,
+                ts: chrono::DateTime::from_timestamp_millis(now.timestamp_millis()).expect("ts"),
+                host,
+                epoch: 0,
+                claim: None,
+                matrix_event: None,
+                body: LineBody::Paseo(PaseoBody {
+                    completion: "paseo-ended-01".to_owned(),
+                    state: PaseoState::Pending,
+                    room: room(2),
+                    artifact: "artifacts/paseo-run-1.md".to_owned(),
+                    sha256: "c".repeat(64),
+                    record: Some("# Paseo run `run-1`\n".to_owned()),
+                    content: Some(json!({"msgtype": "m.text", "body": "ended"})),
+                    event: None,
+                }),
+            })
+            .expect("append");
+    }
+
+    /// R277 (R96PA3-02): a session following a Paseo run needs its broker's
+    /// `mcp:paseo`, which no live host offers, so placement waits and no
+    /// window runs — until the run's end is captured: on this checkout's
+    /// log, or, for a host taking the session over whose checkout holds no
+    /// such line, in the room's evidence the agent put there. Then its
+    /// window is a run, with no host offering the broker.
+    #[tokio::test(start_paused = true)]
+    async fn a_captured_follow_session_is_placed_without_its_broker() {
+        let server = Arc::new(Server::default());
+        let (here_zone, there_zone) = (
+            tempfile::tempdir().expect("zone"),
+            tempfile::tempdir().expect("zone"),
+        );
+        let follow = Some(keeper_core::agents::session::SessionReply {
+            session: "active/2026-10-05-chat".to_owned(),
+            room: room(2),
+            run: Some("run-1".to_owned()),
+        });
+        let needs = Some(vec!["mcp:paseo".to_owned()]);
+        let a = room(1);
+        put_card(
+            here_zone.path(),
+            &hourly("last_run: \"2026-10-05T08:00:00Z\"\n"),
+        );
+        let mut here = world_over(copy_over(&server, here_zone.path()), true);
+        here.at("2026-10-05T09:30:00Z");
+        here.offer_scheduled_as(&a, needs.clone(), follow.clone());
+        for _ in 0..3 {
+            here.tick().await;
+            tokio::time::advance(Duration::from_secs(1)).await;
+        }
+        assert_eq!(here.copy.runs(), 0, "{:?}", here.copy.routed());
+
+        capture_logged(&here_zone.path().join(SCHEDULED));
+        here.offer_scheduled_as(&a, needs.clone(), follow.clone());
+        for _ in 0..3 {
+            here.tick().await;
+            tokio::time::advance(Duration::from_secs(1)).await;
+        }
+        assert_eq!(here.copy.runs(), 1, "{:?}", here.copy.routed());
+
+        // Hesperia is gone; electra's checkout holds the card, not the line.
+        drop(here);
+        lapse(&server, &a);
+        put_card(
+            there_zone.path(),
+            &hourly("last_run: \"2026-10-05T08:00:00Z\"\n"),
+        );
+        let mut there = world_over(copy_over(&server, there_zone.path()), true);
+        there.rt.host = HostSlug::new(OTHER).expect("slug");
+        there.lapse_manifest(ME);
+        there.at("2026-10-05T10:30:00Z");
+        there.offer_scheduled_as(&a, needs.clone(), follow.clone());
+        for _ in 0..3 {
+            there.tick().await;
+            tokio::time::advance(Duration::from_secs(1)).await;
+        }
+        assert_eq!(there.copy.runs(), 0, "{:?}", there.copy.routed());
+        server.put(
+            &a,
+            keeper_core::agents::paseo::CAPTURED,
+            "paseo-ended-01",
+            &config().matrix_user,
+            json!({"v": 1, "completion": "paseo-ended-01", "digest": "d", "capture": "$c:example.org"}),
+        );
+        for _ in 0..3 {
+            there.tick().await;
+            tokio::time::advance(Duration::from_secs(1)).await;
+        }
+        assert_eq!(there.copy.runs(), 1, "{:?}", there.copy.routed());
     }
 
     /// R164: a run its host died in — after the card said `running`, before

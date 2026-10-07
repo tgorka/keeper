@@ -209,6 +209,7 @@ fn agent_session(zone: &Path, opening: &[&str]) {
         title: "harvest".to_owned(),
         requested_by: user(TG),
         parent: None,
+        reply: None,
         room: OwnedRoomId::try_from("!harvest:h").expect("room"),
         drives: vec!["tgdrive".to_owned()],
         label: label(opening),

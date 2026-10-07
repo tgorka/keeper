@@ -944,6 +944,7 @@ pub fn add_review(
                 title: format!("Memory review — {}", home.config.name),
                 requested_by: home.decl.owner.clone(),
                 parent: None,
+                reply: None,
                 room: room.clone(),
                 drives: vec![home.drive.clone()],
                 label: Label::opening(&home.decl, Integrity::Owner),

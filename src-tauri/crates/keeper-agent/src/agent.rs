@@ -296,6 +296,25 @@ pub struct SessionContext {
     /// in memory only, so they end when the session closes or this host
     /// lets it go — a run then asks again.
     pub(crate) run_allowances: Vec<keeper_core::agents::run::RunAllowance>,
+    /// The Paseo runs this session's own successful `create_agent` calls
+    /// started, from the host's records on their results — every line's,
+    /// a blob's hydrated — by broker (Q14).
+    pub(crate) paseo_runs: std::collections::BTreeSet<keeper_core::agents::paseo::Started>,
+    /// This follow session's run end, from its `paseo` lines: the capture
+    /// to finish while `pending` — the latest, so one adopted from the
+    /// capture its room binds stands for an earlier one that does not bind
+    /// — or what was delivered (R275, R277, R279).
+    pub paseo_ended: Option<keeper_core::agents::log::PaseoBody>,
+    /// The Paseo completions a delegated session's room told this session,
+    /// by completion id: each is taken once (R96PA2-05).
+    pub(crate) paseo_heard: HashSet<String>,
+    /// By delegation, the event of the newest completion this session took
+    /// from its room: where reading the room back for completions stops,
+    /// whatever the latest brief is (R277). A live completion moves it only
+    /// while no readback of that room is owed; one that arrives while a
+    /// readback failed waits for it, so the cursor never passes a
+    /// completion that readback has not reached (R279).
+    pub(crate) paseo_cursor: HashMap<String, OwnedEventId>,
 }
 
 impl SessionContext {
@@ -369,6 +388,10 @@ impl SessionContext {
             last_result: None,
             nudges: Default::default(),
             run_allowances: Vec::new(),
+            paseo_runs: std::collections::BTreeSet::new(),
+            paseo_ended: None,
+            paseo_heard: HashSet::new(),
+            paseo_cursor: HashMap::new(),
         };
         for stored in &log.lines {
             match &stored.body {
@@ -570,6 +593,16 @@ impl SessionContext {
     /// exchange, the delegations, the asks, the run.
     fn keep(&mut self, line: &LogLine) {
         match &line.body {
+            // A delivered end stands; a later capture — one adopted from the
+            // capture the room binds — stands for an earlier pending one.
+            LineBody::Paseo(ended) => {
+                let delivered = self.paseo_ended.as_ref().is_some_and(|held| {
+                    held.state == keeper_core::agents::log::PaseoState::Delivered
+                });
+                if !delivered {
+                    self.paseo_ended = Some(ended.clone());
+                }
+            }
             LineBody::Assistant(_) => self.tokens_spent += tokens_of(line),
             LineBody::ToolCall(call) if call.tool == delegate::DELEGATE => {
                 self.delegate_calls.insert(line.id, call.args.clone());
@@ -578,6 +611,9 @@ impl SessionContext {
                 self.renders.insert(call.call_id.clone(), call.args.clone());
             }
             LineBody::ToolResult(result) => {
+                if let Some(started) = &result.paseo {
+                    self.paseo_runs.insert(started.clone());
+                }
                 if let Some(args) = self.renders.remove(&result.call_id) {
                     let rendered = (args, result.content.clone());
                     if result.outcome == ToolOutcomeWord::Ok
@@ -691,9 +727,26 @@ impl SessionContext {
                     self.exchange_rounds = 0;
                 }
                 DelegateState::Replied => {
-                    if let Some(open) = self.delegations.get_mut(&body.id) {
-                        open.replied = true;
-                        open.rounds = 0;
+                    // A run's end the delegated session's room was told is
+                    // taken beside the delegation's own reply: it closes no
+                    // round of the exchange.
+                    match body
+                        .reply
+                        .as_ref()
+                        .and_then(|reply| reply.completion.clone())
+                    {
+                        Some(completion) => {
+                            self.paseo_heard.insert(completion);
+                            if let Some(event) = &line.matrix_event {
+                                self.paseo_cursor.insert(body.id.clone(), event.clone());
+                            }
+                        }
+                        None => {
+                            if let Some(open) = self.delegations.get_mut(&body.id) {
+                                open.replied = true;
+                                open.rounds = 0;
+                            }
+                        }
                     }
                     if body.reply.is_some() {
                         self.reply_unpeered =
@@ -791,6 +844,20 @@ impl SessionContext {
     /// The delegation this session made into `room`.
     pub fn delegation_in(&self, room: &RoomId) -> Option<&Delegation> {
         self.delegations.values().find(|open| open.room == room)
+    }
+
+    /// Whether a reply `content` from `open`'s target is one this session
+    /// takes now: the delegation's own while its latest round waits for
+    /// one; or a Paseo run's end the delegated session's follow session
+    /// told, answering that very session — the delegation's id — and not
+    /// taken before, whatever the delegation's own reply did (R96PA2-05).
+    pub fn takes_reply(&self, open: &Delegation, content: &Value) -> bool {
+        match keeper_core::agents::paseo::completion_of(content) {
+            Some((completion, session)) => {
+                open.sent && session == open.id && !self.paseo_heard.contains(completion)
+            }
+            None => open.sent && !open.replied,
+        }
     }
 
     /// The agents this session's room sends pass between, left out of its
@@ -1577,12 +1644,16 @@ struct McpTools {
     answers: Mutex<Vec<McpAnswered>>,
 }
 
-/// One answer a call just got: the label it joins and, when it was cut,
-/// how much of it was shown.
+/// One answer a call just got: the label it joins, when it was cut how
+/// much of it was shown, the Paseo run it started, which its result's line
+/// records, and the Paseo run end it captured, which the line after it
+/// does (R275).
 struct McpAnswered {
     label: Label,
     at: String,
     truncated: Option<Truncated>,
+    started: Option<keeper_core::agents::paseo::Started>,
+    ended: Option<keeper_core::agents::log::PaseoBody>,
 }
 
 impl McpTools {
@@ -1788,17 +1859,22 @@ impl AllowedTools<'_> {
     /// JSON object refused, never sent as another call (R225); Paseo's
     /// mutations refused outright in an `untrusted` session (R143/Q3); T5
     /// refused; a send to the server's readers checked before anything
-    /// reaches it (#8, AD-391); a call that needs a person parks on a
-    /// record binding which server that listing's connection reached and
-    /// the tool's definition and tier there (R144); a call an approval let
-    /// through runs only while that binding is still what the consume path
-    /// checked; its one audit row before the call; then the call on its
-    /// own task, sent on that listing's connection only while it is the
-    /// live one and the tool unchanged, cancelled by the turn's stop, its
-    /// answer — a result or the server's error — outside content labelled
-    /// `untrusted` and read by the server's readers (#7).
+    /// reaches it (#8, AD-391) — for Paseo's broker by what the call sends
+    /// of the session (96.3 #7): a read that carries nothing passes, a run
+    /// this session did not start is blocked, and starting or steering one
+    /// parks, its approval the declassification of the prompt (R145/Q5);
+    /// a call that needs a person parks on a record binding which server
+    /// that listing's connection reached and the tool's definition and tier
+    /// there (R144); a call an approval let through runs only while that
+    /// binding is still what the consume path checked; its one audit row
+    /// before the call; then the call on its own task, sent on that
+    /// listing's connection only while it is the live one and the tool
+    /// unchanged, cancelled by the turn's stop, its answer — a result or the
+    /// server's error — outside content labelled `untrusted` and read by the
+    /// server's readers (#7).
     fn mcp_call(&self, wire: &chat::ToolCall) -> ToolOutcome {
         use keeper_core::agents::mcp as core_mcp;
+        use keeper_core::agents::paseo as core_paseo;
         let name = wire.name.as_str();
         let at = core_mcp::decode(name)
             .map(|(server, tool)| format!("{}{server}/{tool}", core_mcp::CAPABILITY_PREFIX))
@@ -1843,10 +1919,24 @@ impl AllowedTools<'_> {
         if classification.gate() == Gate::Refuse {
             return refused(FORBIDDEN.to_owned());
         }
+        // Which broker this is, and whose runs it may be asked about, come
+        // from the one listing this call is classified, bound and sent from.
+        let broker = (listed.role() == Some(&core_mcp::McpRole::Paseo))
+            .then(|| core_paseo::broker(listed.identity()));
+        let paseo = broker
+            .as_ref()
+            .map(|broker| core_paseo::reach(&listed.tool, args, &self.paseo_polled(broker)));
+        if let Some(core_paseo::Reach::Blocked(why)) = paseo {
+            return refused(format!("{why} Nothing was sent to `{}`.", listed.server));
+        }
+        let bound = self.bound_approval(&wire.id, name);
+        // A declassifying call that nobody approved yet waits for its
+        // approval, and is refused with this when nobody can be asked.
+        let mut blocked = None;
         if let SinkVerdict::Block { reason, .. } =
             check_sink(&self.view.label(), &core_mcp::sink(entry))
         {
-            return refused(format!(
+            let sentence = format!(
                 "{reason} The MCP server `{}` is read by {}. Nothing was sent to it.",
                 listed.server,
                 match &entry.readers {
@@ -1857,14 +1947,23 @@ impl AllowedTools<'_> {
                         .collect::<Vec<_>>()
                         .join(", "),
                 }
-            ));
+            );
+            match paseo {
+                Some(core_paseo::Reach::Nothing) => {}
+                // The approval released the prompt to the audience its
+                // binding names; one that reaches another drifts below.
+                Some(core_paseo::Reach::Prompt) if bound.is_some() => {}
+                Some(core_paseo::Reach::Prompt) => blocked = Some(sentence),
+                _ => return refused(sentence),
+            }
         }
-        let Some(binding) = listed.binding() else {
+        let Some(mut binding) = listed.binding() else {
             return refused(format!(
                 "`{}` does not answer here now; nothing was sent to it.",
                 listed.server
             ));
         };
+        core_paseo::bind_audience(&mut binding, &entry.readers);
         let gated = match self.gated(&wire.id, name, &classification, &[], Vec::new()) {
             Gated::Park(approval) => {
                 if let Some(parking) = self
@@ -1888,6 +1987,11 @@ impl AllowedTools<'_> {
                     ));
                 }
                 Gated::Run(Some(approved))
+            }
+            // Nobody can be asked: a declassifying call says what blocks it.
+            Gated::Refuse(reason) => Gated::Refuse(blocked.clone().unwrap_or(reason)),
+            Gated::Run(None) if blocked.is_some() => {
+                return refused(blocked.unwrap_or_default());
             }
             gated => gated,
         };
@@ -1918,13 +2022,39 @@ impl AllowedTools<'_> {
         });
         let outcome = match answered {
             Ok(answer) => {
-                let (text, cut) = core_mcp::render(
-                    &listed.server,
-                    &listed.tool,
-                    &answer.text,
-                    answer.total,
-                    answer.error,
-                );
+                // A broker's answer reaches the model, the log and anything
+                // after them only as keeper's projection of it (96.3 #6),
+                // made from the whole answer before any cut for display
+                // (R96PA2-01): the eight fields of a run, an error's words
+                // with no credential, nothing of any other answer.
+                let projected = broker.as_ref().map(|_| {
+                    if answer.error {
+                        core_paseo::Answer {
+                            text: core_paseo::sanitized(&answer.text),
+                            runs: Vec::new(),
+                        }
+                    } else {
+                        core_paseo::answer(&answer.text)
+                    }
+                });
+                let (shown, total) = match &projected {
+                    Some(projected) => (projected.text.as_str(), projected.text.len() as u64),
+                    None => (answer.text.as_str(), answer.total),
+                };
+                let (text, cut) =
+                    core_mcp::render(&listed.server, &listed.tool, shown, total, answer.error);
+                // What keeper did with Paseo's answer is keeper's own
+                // sentence, above the broker's words.
+                let done = match (broker.as_ref(), projected.as_ref()) {
+                    (Some(broker), Some(shown)) if !answer.error => {
+                        self.paseo_answered(entry, broker, &listed.tool, args, shown)
+                    }
+                    _ => PaseoDone::default(),
+                };
+                let text = match done.said {
+                    Some(said) => format!("{said}\n{text}"),
+                    None => text,
+                };
                 tools
                     .answers
                     .lock()
@@ -1933,6 +2063,8 @@ impl AllowedTools<'_> {
                         label: core_mcp::result_label(entry),
                         at: at.clone(),
                         truncated: cut.map(|(shown, total)| Truncated { shown, total }),
+                        started: done.started,
+                        ended: done.ended,
                     });
                 ToolOutcome::Answered { text }
             }
@@ -1941,6 +2073,303 @@ impl AllowedTools<'_> {
         audit.finish(&outcome);
         outcome
     }
+}
+
+/// What keeper did with a Paseo broker's answer: its own sentence above
+/// the broker's words, the run a successful `create_agent` started, which
+/// the result's log line records (Q14), and the run end a follow session's
+/// poll captured, which the line after it records (R275).
+#[derive(Default)]
+struct PaseoDone {
+    said: Option<String>,
+    started: Option<keeper_core::agents::paseo::Started>,
+    ended: Option<keeper_core::agents::log::PaseoBody>,
+}
+
+impl AllowedTools<'_> {
+    /// The Paseo runs this session may ask `broker` about (Q14): those its
+    /// own successful `create_agent` on that broker was answered with — the
+    /// host's records on its results, as the held context replays them —
+    /// and, for the follow session keeper made for a run of that broker,
+    /// that run.
+    fn paseo_polled(&self, broker: &str) -> std::collections::BTreeSet<String> {
+        use keeper_core::agents::paseo as core_paseo;
+        let mut polled = self.view.paseo_started(broker);
+        if let Some(id) = core_paseo::followed(&self.agent, broker) {
+            polled.insert(id.to_owned());
+        }
+        polled
+    }
+
+    /// What keeper does with the projected answer `shown` of `broker` to
+    /// `tool` called with `args`, in its own words: a run `create_agent`
+    /// started is this session's to poll and gets a follow card (96.3 #5);
+    /// a status a follow session asked for that says its run ended is
+    /// captured once — recorded, and its notice fixed — to be told and
+    /// the card's schedule ended once this run of the card is over (R275).
+    fn paseo_answered(
+        &self,
+        entry: &keeper_core::agents::mcp::McpEntry,
+        broker: &str,
+        tool: &str,
+        args: &serde_json::Map<String, Value>,
+        shown: &keeper_core::agents::paseo::Answer,
+    ) -> PaseoDone {
+        use keeper_core::agents::paseo as core_paseo;
+        let label = self
+            .view
+            .label()
+            .join(&keeper_core::agents::mcp::result_label(entry));
+        let said = |said: String| PaseoDone {
+            said: Some(said),
+            ..PaseoDone::default()
+        };
+        match tool {
+            "create_agent" => {
+                let Some(id) = shown.runs.first().and_then(|run| run.id()) else {
+                    return said("keeper found no run id it can follow in Paseo's answer, so no follow card was made.".to_owned());
+                };
+                let started = core_paseo::Started {
+                    broker: broker.to_owned(),
+                    id: id.to_owned(),
+                };
+                let made = match self.paseo_follow(&entry.name, broker, id, label) {
+                    Ok(path) => format!("keeper made the follow card of Paseo run `{id}` in {path}: it asks for the run's status every 10 minutes once a person allows its schedule."),
+                    Err(why) => format!("keeper could not make the follow card of Paseo run `{id}`: {why}"),
+                };
+                PaseoDone {
+                    said: Some(made),
+                    started: Some(started),
+                    ended: None,
+                }
+            }
+            "get_agent_status" => {
+                let Some(followed) = core_paseo::followed(&self.agent, broker) else {
+                    return PaseoDone::default();
+                };
+                let Some(run) = shown.runs.first() else {
+                    return PaseoDone::default();
+                };
+                let asked = args.get("agentId").and_then(Value::as_str);
+                if run.id() != Some(followed)
+                    || asked != Some(followed)
+                    || !run.status().is_some_and(core_paseo::is_terminal)
+                {
+                    return PaseoDone::default();
+                }
+                if let Some(held) = self.view.paseo_ended() {
+                    return said(format!("keeper already captured the ended run, recorded in {}; it is told from that capture, not from this answer.", held.artifact));
+                }
+                match self.paseo_capture(run, label) {
+                    Ok(ended) => PaseoDone {
+                        said: Some(format!("keeper captured the ended run: it records it in {}, tells the conversation that started it and ends this card's schedule once this run of the card is over.", ended.artifact)),
+                        started: None,
+                        ended: Some(ended),
+                    },
+                    Err(why) => said(format!("keeper could not finish following the run, and asks again at the card's next run: {why}")),
+                }
+            }
+            _ => PaseoDone::default(),
+        }
+    }
+
+    /// Make the session that follows run `id` of `broker`, reached as
+    /// `server` (Q14, R241): a scheduled session of this agent, labelled
+    /// `label`, in a room this host makes for the session's readers,
+    /// holding the follow card and answering this session when the run
+    /// ends. Its zone-relative path.
+    fn paseo_follow(
+        &self,
+        server: &str,
+        broker: &str,
+        id: &str,
+        label: Label,
+    ) -> Result<String, String> {
+        use keeper_core::agents::paseo as core_paseo;
+        let from = &self.delegation.from;
+        let session =
+            core_paseo::follow_session_id(&self.agent.drive, &self.agent.agent, broker, id);
+        if let Some(found) = verbs::find(&from.zone, &session.to_string()) {
+            return Ok(found.path);
+        }
+        let port = self
+            .delegation
+            .port
+            .clone()
+            .ok_or_else(|| "this host has no rooms for it".to_owned())?;
+        let invites: Vec<OwnedUserId> = match &label.readers {
+            Readers::Only(readers) => readers
+                .iter()
+                .filter(|reader| **reader != from.user)
+                .cloned()
+                .collect(),
+            Readers::Anyone => vec![self.agent.requested_by.clone()],
+        };
+        let title = format!("Follow Paseo run {id}");
+        let room = delegate::block_on(port.create(
+            SessionKind::Scheduled,
+            &title,
+            invites,
+            vec![from.user.clone()],
+        ))
+        .map_err(|error| format!("its room could not be made: {error}"))?;
+        let agent = core_paseo::follow_session(
+            &self.agent,
+            &from.session,
+            label,
+            broker,
+            id,
+            room,
+            chrono::Utc::now(),
+        );
+        let card = core_paseo::follow_card(
+            id,
+            server,
+            &self.agent.agent,
+            &from.user,
+            &self.agent.requested_by,
+        );
+        match verbs::create_carded_session(
+            &from.zone,
+            &agent,
+            vec![(core_paseo::FOLLOW_CARD.to_owned(), card)],
+            chrono::Local::now(),
+        ) {
+            Ok(CreateOutcome::Created { path, .. } | CreateOutcome::Existed { path, .. }) => {
+                Ok(path)
+            }
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    /// Capture the end of `run` in this follow session, labelled `label`,
+    /// once (R96PA-09, R275, R277). Every sink the end will reach is asked
+    /// first, so none gets anything when one refuses: the home drive's
+    /// readers must read what the record holds (R96PA-08); the room of the
+    /// conversation that started the run takes the notice as its own gate
+    /// counts that room — every person in it, the requester included
+    /// (R96PA-08, R96PA-10); and this session's own
+    /// room takes the capture's publication. What is returned is
+    /// the capture: the record's bytes, stamped as written from outside
+    /// content (R96PA-07), their SHA-256, and the notice — marked as this
+    /// session's completion, answering the starting session (R96PA2-05),
+    /// carrying the label it was admitted under — as the `pending` line,
+    /// the end's first durable step, written before the call's result.
+    /// Nothing is written or sent here: the record, the publication, the
+    /// notice and the end of the schedule are made from that line
+    /// ([`ServedSession::finish_paseo`]).
+    fn paseo_capture(
+        &self,
+        run: &keeper_core::agents::paseo::Projected,
+        label: Label,
+    ) -> Result<keeper_core::agents::log::PaseoBody, String> {
+        use keeper_core::agents::paseo as core_paseo;
+        let from = &self.delegation.from;
+        let id = run.id().unwrap_or_default();
+        let rel = core_paseo::artifact_path(id);
+        if let SinkVerdict::Block { reason, .. } = check_sink(
+            &label,
+            &keeper_core::agents::label::Sink::DriveWrite {
+                drive_readers: self.cards.drive_readers.clone(),
+            },
+        ) {
+            return Err(format!("its record was not written: {reason}"));
+        }
+        let reply = self
+            .agent
+            .reply
+            .as_ref()
+            .ok_or_else(|| "this session names no conversation to tell".to_owned())?;
+        let origin = paseo_origin(&from.zone, reply);
+        let port = self
+            .delegation
+            .port
+            .clone()
+            .ok_or_else(|| delegate::NO_ROOMS.to_owned())?;
+        let completion = core_paseo::completion_id(&self.agent.id);
+        let mut content = delegate::reply_content(
+            &core_paseo::ended(run),
+            vec![json!({
+                "drive": from.drive,
+                "path": format!("{}/{}/{rel}", from.subfolder, from.session),
+            })],
+            &label,
+        );
+        if let Some(origin) = &origin {
+            core_paseo::mark_completion(&mut content, &completion, &origin.id.to_string());
+        }
+        delegate::block_on(delegate::admit_reply(
+            port.as_ref(),
+            self.sinks,
+            &reply.room,
+            [&from.user, paseo_delegating(origin.as_ref(), &from.user)],
+            &label,
+            &content,
+        ))?;
+        delegate::block_on(delegate::admit_reply(
+            port.as_ref(),
+            self.sinks,
+            &from.room,
+            [&from.user, &from.user],
+            &label,
+            &content,
+        ))?;
+        let record = keeper_core::agents::card::stamp_agent_write(
+            None,
+            &core_paseo::artifact(run),
+            &from.user,
+            label.integrity,
+        );
+        Ok(keeper_core::agents::log::PaseoBody {
+            completion,
+            state: keeper_core::agents::log::PaseoState::Pending,
+            room: reply.room.clone(),
+            artifact: rel,
+            sha256: keeper_core::agents::approval::sha256_hex(record.as_bytes()),
+            record: Some(record),
+            content: Some(content),
+            event: None,
+        })
+    }
+}
+
+/// Whether `agent` is a session keeper made to follow a Paseo run: a
+/// scheduled one whose `[reply]` names the run.
+pub(crate) fn follows_a_run(agent: &SessionAgent) -> bool {
+    agent.kind == SessionKind::Scheduled
+        && agent
+            .reply
+            .as_ref()
+            .is_some_and(|reply| reply.run.is_some())
+}
+
+/// The session a follow session answers, read from its `[reply]` path in
+/// `zone`, when it can be.
+fn paseo_origin(
+    zone: &Path,
+    reply: &keeper_core::agents::session::SessionReply,
+) -> Option<SessionAgent> {
+    crate::zone::read_text(
+        zone,
+        &format!(
+            "{}/{}",
+            reply.session,
+            keeper_core::agents::session::FILE_NAME
+        ),
+    )
+    .ok()
+    .flatten()
+    .and_then(|text| keeper_core::agents::session::parse_session_agent_toml(&text).ok())
+}
+
+/// The second agent a run's end notice passes between beside the follow
+/// session's own, `me`: a delegated starting session's delegating agent,
+/// whose session joins the label the notice carries (R94); else `me`, so
+/// anyone else in that room is counted, the person who asked included.
+fn paseo_delegating<'a>(origin: Option<&'a SessionAgent>, me: &'a UserId) -> &'a UserId {
+    origin
+        .filter(|origin| origin.kind == SessionKind::Delegated)
+        .map_or(me, |origin| &*origin.requested_by)
 }
 
 impl crate::sinks::Lift for AllowedTools<'_> {
@@ -2624,6 +3053,9 @@ struct Retry {
     briefs: std::collections::BTreeSet<String>,
     /// Delegations whose room could not be read back for a reply.
     replies: std::collections::BTreeSet<String>,
+    /// Delegations whose room could not be read back, as far as their
+    /// completion cursor, for a Paseo run's completion (R277).
+    completions: std::collections::BTreeSet<String>,
     /// The session's person was not told yet that its work narrowed.
     tell: bool,
     /// An ask of the session is not in its room yet: its proxy has not
@@ -2636,7 +3068,11 @@ struct Retry {
 
 impl Retry {
     fn is_empty(&self) -> bool {
-        self.briefs.is_empty() && self.replies.is_empty() && !self.tell && !self.asks
+        self.briefs.is_empty()
+            && self.replies.is_empty()
+            && self.completions.is_empty()
+            && !self.tell
+            && !self.asks
     }
 }
 
@@ -2736,6 +3172,16 @@ pub struct Arrived {
 pub const NOT_THIS_DELEGATION: &str = "a brief for another delegation is not a turn here";
 /// A join or a reply no delegation of this session waits for.
 pub const NOT_A_DELEGATION: &str = "no delegation of this session waits for this";
+/// A Paseo run's completion that arrived while its room's readback is
+/// owed: taken when that readback reaches it, in the room's order, so the
+/// cursor never passes an older completion not yet taken (R279).
+pub const COMPLETION_HELD: &str =
+    "a Paseo run's end waits until its room is read back as far as it";
+/// A Paseo run's end told into the room of a workflow's run this agent
+/// started: the run's own news, for the run's readers, never the run's
+/// reply to the session that started it (R311).
+pub const RUNS_OWN_END: &str =
+    "a Paseo run's end told in a workflow's run is the run's own, not its reply";
 /// A brief that arrived after the exchange's last round, before a reply.
 pub const ROUNDS_SPENT: &str =
     "this exchange has had its rounds; a brief is not a turn here until this session replies";
@@ -2819,6 +3265,18 @@ pub const NOT_SCHEDULED: &str = "the host's clock sent nothing this host reads";
 /// A scheduled card that could not be read or written.
 pub const CARD_UNWRITTEN: &str =
     "the scheduled card could not be read or written; it is tried at its next window";
+/// A follow session's window once its run's end was told: the follow card's
+/// schedule is ended, and nothing is polled.
+pub const PASEO_TOLD: &str =
+    "the Paseo run's end was told to the conversation that started it; the follow card's schedule is ended";
+/// A follow session's window while its run's end waits to be told: tried
+/// again from its record at the next window, with no poll of the broker.
+pub const PASEO_UNTOLD: &str =
+    "the Paseo run's end is recorded and waits to be told; it is tried again at the card's next window";
+/// A follow session's window when its room could not be read for a
+/// captured end: nothing is polled until it can be.
+pub const PASEO_UNCHECKED: &str =
+    "whether the Paseo run's end was captured could not be read from the follow session's room; nothing is polled, and it is read again at the card's next window";
 
 /// The arrival the host's clock routes to a scheduled session's worker
 /// (92.3), in the agent's own name. A window's run has an id derived from
@@ -3621,6 +4079,27 @@ impl ServedSession {
         if matches!(scheduled, Scheduled::Run { .. }) && self.holds_windows() {
             return Ok(Outcome::Ignored(ASK_WAITS));
         }
+        // A follow session whose run's end is captured asks the broker
+        // nothing more: each window finishes the end from its capture
+        // (R275). One that holds none yet first reads its room — the
+        // index a host that captured it put there, then the timeline that
+        // says which capture binds (R279) — however far this checkout lags
+        // behind that host's lines (R277).
+        if matches!(scheduled, Scheduled::Run { .. }) {
+            if self.context.paseo_ended.is_some() {
+                return self.finish_paseo(deps).await;
+            }
+            if follows_a_run(&self.context.agent) {
+                match self.adopt_paseo(deps).await {
+                    Ok(true) => return self.finish_paseo(deps).await,
+                    Ok(false) => {}
+                    Err(why) => {
+                        tracing::warn!(session = %self.context.session.path, %why, "agents: a follow session's room could not be read for a captured end; nothing is polled");
+                        return Ok(Outcome::Ignored(PASEO_UNCHECKED));
+                    }
+                }
+            }
+        }
         let session = self.context.session.path.clone();
         let lease = self.writer.lease();
         // A window begins only while the claim names it (R56): a run routed
@@ -3726,6 +4205,10 @@ impl ServedSession {
         let ran = self.turn(deps, port, arrived, stop).await;
         self.scheduled_card = None;
         self.finish_scheduled(deps, &card, ran.as_ref().ok().map(|report| report.ending))?;
+        // A run's end this window captured is told now, not a window later.
+        if self.context.paseo_ended.is_some() {
+            self.finish_paseo(deps).await?;
+        }
         ran.map(Outcome::Answered)
     }
 
@@ -3813,6 +4296,310 @@ impl ServedSession {
         Ok(Outcome::Scheduled(LogRun::Failed))
     }
 
+    /// Finish this follow session's captured run end (R275, R277), asking
+    /// the broker nothing: a `pending` capture is delivered
+    /// ([`Self::deliver_paseo`]); then the follow card's schedule ends,
+    /// while this host still holds the session. A failure leaves the end as
+    /// it is, and the card's next window comes back here.
+    async fn finish_paseo(&mut self, deps: &AgentDeps) -> Result<Outcome, ServeError> {
+        use keeper_core::agents::log::PaseoState;
+        let Some(ended) = self.context.paseo_ended.clone() else {
+            return Ok(Outcome::Ignored(PASEO_UNTOLD));
+        };
+        let session = self.context.session.path.clone();
+        if ended.state == PaseoState::Pending {
+            if let Err(why) = self.deliver_paseo(deps).await {
+                tracing::warn!(%session, completion = %ended.completion, %why, "agents: a Paseo run's end could not be told; it is tried again at the card's next window");
+                return Ok(Outcome::Ignored(PASEO_UNTOLD));
+            }
+        }
+        let zone = deps.sessions_zone.clone();
+        let lease = self.writer.lease();
+        let may_write = move || lease.as_ref().is_none_or(|lease| lease.may_write());
+        match off_the_runtime(|| {
+            cards::end_schedule(
+                &zone,
+                &session,
+                keeper_core::agents::paseo::FOLLOW_CARD,
+                &may_write,
+            )
+        }) {
+            Ok(_) => Ok(Outcome::Ignored(PASEO_TOLD)),
+            Err(error) => {
+                tracing::warn!(%session, %error, "agents: a told Paseo run's follow card kept its schedule; it is ended at the card's next window");
+                Ok(Outcome::Ignored(PASEO_UNTOLD))
+            }
+        }
+    }
+
+    /// Whether `room`'s index says `me` published a capture of
+    /// `completion` (`keeper_core::agents::paseo::CAPTURED`), as the
+    /// homeserver holds it now: a lookup only — which capture binds the
+    /// end, and whether it was delivered, the timeline says
+    /// ([`Self::paseo_authority`]).
+    async fn paseo_indexed(
+        port: &dyn DelegationPort,
+        room: &RoomId,
+        me: &UserId,
+        completion: &str,
+    ) -> Result<bool, String> {
+        use keeper_core::agents::paseo as core_paseo;
+        let state = port.state(room, core_paseo::CAPTURED, completion).await?;
+        Ok(state
+            .filter(|(sender, _)| sender == me)
+            .and_then(|(_, content)| serde_json::from_value::<core_paseo::Captured>(content).ok())
+            .is_some_and(|captured| captured.completion == completion))
+    }
+
+    /// What `room`'s timeline establishes of `completion` as `me` wrote it
+    /// there: the first capture, which binds the end, and any delivery
+    /// (R279).
+    async fn paseo_authority(
+        port: &dyn DelegationPort,
+        room: &RoomId,
+        me: &UserId,
+        completion: &str,
+    ) -> Result<keeper_core::agents::paseo::Authority, String> {
+        let events = port.captures(room, completion, me).await?;
+        Ok(keeper_core::agents::paseo::authority(
+            &events, me, completion,
+        ))
+    }
+
+    /// The capture `binding` names, read back: the bytes of its encrypted
+    /// file, which hash to the digest its message names.
+    async fn paseo_captured(
+        port: &dyn DelegationPort,
+        binding: &keeper_core::agents::paseo::Binding,
+        completion: &str,
+    ) -> Result<keeper_core::agents::log::PaseoBody, String> {
+        let bytes = port.download(&binding.file).await?;
+        keeper_core::agents::paseo::capture_of(&bytes, &binding.digest, completion)
+            .ok_or_else(|| "the room's capture is not the one its message names".to_owned())
+    }
+
+    /// The label of `ended`'s notice, when the home drive's readers as they
+    /// are now may hold its record (NFR-115, AD-391, R96PA-08): asked before
+    /// a capture's bytes are logged or materialized here — an adopted
+    /// capture's too, whose label was admitted where it was captured, not
+    /// where it goes now (R279).
+    fn paseo_admitted(
+        deps: &AgentDeps,
+        ended: &keeper_core::agents::log::PaseoBody,
+    ) -> Result<Label, String> {
+        let label = ended
+            .content
+            .as_ref()
+            .and_then(delegate::reply_label)
+            .ok_or_else(|| "its notice carries no label".to_owned())?;
+        if let SinkVerdict::Block { reason, .. } = check_sink(
+            &label,
+            &keeper_core::agents::label::Sink::DriveWrite {
+                drive_readers: Readers::Only(deps.home.drive.readers.clone()),
+            },
+        ) {
+            return Err(format!("its record may not be written now: {reason}"));
+        }
+        Ok(label)
+    }
+
+    /// A follow session that holds no capture — its checkout may lag
+    /// behind the host that captured the end — adopts the one its room
+    /// binds, delivered too when the room says so: whether it did. Only
+    /// when the room's index names no capture may the broker be polled
+    /// (R277); one it names is read from the timeline (R279) and admitted
+    /// to the home drive as its readers are now before any of it is logged.
+    async fn adopt_paseo(&mut self, deps: &AgentDeps) -> Result<bool, String> {
+        let Some(port) = self.delegations.clone() else {
+            return Ok(false);
+        };
+        let me = deps.home.config.matrix_user.clone();
+        let own = self.context.agent.room.clone();
+        let completion = keeper_core::agents::paseo::completion_id(&self.context.agent.id);
+        if !Self::paseo_indexed(port.as_ref(), &own, &me, &completion).await? {
+            return Ok(false);
+        }
+        let authority = Self::paseo_authority(port.as_ref(), &own, &me, &completion).await?;
+        let binding = authority.capture.ok_or_else(|| {
+            "the room's index names a capture its timeline does not hold".to_owned()
+        })?;
+        let adopted = Self::paseo_captured(port.as_ref(), &binding, &completion).await?;
+        Self::paseo_admitted(deps, &adopted)?;
+        self.write_paseo(adopted.clone())?;
+        if let Some(event) = authority.delivered {
+            self.write_paseo(keeper_core::agents::log::PaseoBody {
+                state: keeper_core::agents::log::PaseoState::Delivered,
+                record: None,
+                content: None,
+                event: Some(event),
+                ..adopted
+            })?;
+        }
+        Ok(true)
+    }
+
+    /// Log a `paseo` line, synced before anything is done after it.
+    fn write_paseo(&mut self, body: keeper_core::agents::log::PaseoBody) -> Result<(), String> {
+        self.writer
+            .write(&mut self.context, None, None, LineBody::Paseo(body))
+            .map_err(|error| error.to_string())?;
+        off_the_runtime(|| self.writer.sync()).map_err(|error| error.to_string())
+    }
+
+    /// Deliver the `pending` capture, every step made from its bytes (R277).
+    /// The room's timeline first (R279): with no capture there, this one is
+    /// published as an encrypted file in the session's own room, admitted
+    /// there for its label, and the timeline read again — whichever host's
+    /// capture the homeserver took first binds the end, and a different
+    /// one is adopted in this one's place, once the home drive's readers
+    /// now read its label. A delivery message there ends it: only logged.
+    /// Then the room's index is put, the record materialized under the
+    /// same admission, the notice admitted to the starting room as it is
+    /// now and sent under the completion's transaction id — a send the
+    /// homeserver took but did not acknowledge is the same event sent
+    /// again — and its delivery appended to the timeline and logged.
+    /// Uploading, publishing, adopting, indexing, materializing and telling
+    /// each happen only while this host still holds the session, checked
+    /// right before them, after every wait; the delivery message is not:
+    /// it says what the homeserver already took, and being appended it
+    /// replaces nothing.
+    async fn deliver_paseo(&mut self, deps: &AgentDeps) -> Result<(), String> {
+        use keeper_core::agents::paseo as core_paseo;
+        let port = self
+            .delegations
+            .clone()
+            .ok_or_else(|| delegate::NO_ROOMS.to_owned())?;
+        let lease = self.writer.lease();
+        let holds = move |step: &str| {
+            if lease.as_ref().is_none_or(|lease| lease.may_write()) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "this host no longer holds the session, so {step} was not done"
+                ))
+            }
+        };
+        let me = deps.home.config.matrix_user.clone();
+        let own = self.context.agent.room.clone();
+        let sinks = self.sinks(deps);
+        off_the_runtime(|| self.writer.sync()).map_err(|error| error.to_string())?;
+        let Some(mut ended) = self.context.paseo_ended.clone() else {
+            return Err("no run end is captured".to_owned());
+        };
+        let digest = keeper_core::agents::approval::sha256_hex(&core_paseo::capture_bytes(&ended));
+        let mut authority =
+            Self::paseo_authority(port.as_ref(), &own, &me, &ended.completion).await?;
+        if authority.capture.is_none() {
+            let label = ended
+                .content
+                .as_ref()
+                .and_then(delegate::reply_label)
+                .ok_or_else(|| "its notice carries no label".to_owned())?;
+            holds("uploading the capture")?;
+            let file = port.upload(core_paseo::capture_bytes(&ended)).await?;
+            let message = core_paseo::capture_message(&ended.completion, &digest, file);
+            delegate::admit_reply(port.as_ref(), &sinks, &own, [&me, &me], &label, &message)
+                .await?;
+            holds("publishing the capture")?;
+            let txn =
+                matrix_sdk::ruma::OwnedTransactionId::from(format!("{}-capture", ended.completion));
+            port.send(&own, message, txn)
+                .await
+                .map_err(|error| format!("its capture could not be published: {error}"))?;
+            authority = Self::paseo_authority(port.as_ref(), &own, &me, &ended.completion).await?;
+        }
+        let binding = authority.capture.ok_or_else(|| {
+            "the room's timeline does not hold the published capture yet".to_owned()
+        })?;
+        if binding.digest != digest {
+            let adopted = Self::paseo_captured(port.as_ref(), &binding, &ended.completion).await?;
+            Self::paseo_admitted(deps, &adopted)?;
+            holds("adopting the room's capture")?;
+            self.write_paseo(adopted.clone())?;
+            ended = adopted;
+        }
+        let delivered = |event| keeper_core::agents::log::PaseoBody {
+            state: keeper_core::agents::log::PaseoState::Delivered,
+            record: None,
+            content: None,
+            event: Some(event),
+            ..ended.clone()
+        };
+        if let Some(event) = authority.delivered {
+            return self.write_paseo(delivered(event));
+        }
+        holds("indexing the capture")?;
+        port.put_state(
+            &own,
+            core_paseo::CAPTURED,
+            &ended.completion,
+            serde_json::to_value(core_paseo::Captured {
+                v: keeper_core::agents::events::CONTENT_VERSION,
+                completion: ended.completion.clone(),
+                digest: binding.digest.clone(),
+                capture: binding.event.clone(),
+            })
+            .map_err(|error| error.to_string())?,
+        )
+        .await
+        .map_err(|error| format!("its index could not be put: {error}"))?;
+        let (Some(record), Some(content)) = (&ended.record, &ended.content) else {
+            return Err("its capture holds no record or notice".to_owned());
+        };
+        let label = Self::paseo_admitted(deps, &ended)?;
+        let zone = deps.sessions_zone.clone();
+        let session = self.context.session.path.clone();
+        let on_disk = crate::zone::read_text(&zone, &format!("{session}/{}", ended.artifact))
+            .ok()
+            .flatten();
+        if on_disk.as_deref() != Some(record.as_str()) {
+            let lease = self.writer.lease();
+            let may_write = move || lease.as_ref().is_none_or(|lease| lease.may_write());
+            off_the_runtime(|| {
+                crate::sessions::write::session_write(
+                    &zone,
+                    &session,
+                    &ended.artifact,
+                    record,
+                    &may_write,
+                )
+            })
+            .map_err(|error| format!("its record could not be written: {error}"))?;
+        }
+        let reply = self
+            .context
+            .agent
+            .reply
+            .clone()
+            .ok_or_else(|| "this session names no conversation to tell".to_owned())?;
+        let origin = paseo_origin(&zone, &reply);
+        delegate::admit_reply(
+            port.as_ref(),
+            &sinks,
+            &ended.room,
+            [&me, paseo_delegating(origin.as_ref(), &me)],
+            &label,
+            content,
+        )
+        .await?;
+        holds("telling the conversation")?;
+        let txn = matrix_sdk::ruma::OwnedTransactionId::from(ended.completion.as_str());
+        let event = port
+            .send(&ended.room, content.clone(), txn)
+            .await
+            .map_err(|error| format!("the conversation could not be told: {error}"))?;
+        // What was sent is said whoever holds the session now: no new
+        // effect, and appended, it replaces nothing; a taker reads it and
+        // never tells the end again.
+        port.send(
+            &own,
+            core_paseo::delivered_message(&ended.completion, &binding.event, &event),
+            matrix_sdk::ruma::OwnedTransactionId::from(format!("{}-delivered", ended.completion)),
+        )
+        .await
+        .map_err(|error| format!("the room could not be told it was delivered: {error}"))?;
+        self.write_paseo(delivered(event))
+    }
     /// End the run of the scheduled card `card` as its turn — the run's own
     /// or a parked run's continuation — ended (`None`: it failed), on the
     /// card and as a `run` line: `review`, `failed`, or `blocked` — a run
@@ -4499,8 +5286,18 @@ impl ServedSession {
 
     /// A delegation this session made moved (R55): its target joined — the
     /// brief goes in now — or replied, which is logged with what it said and
-    /// answered by a turn of this session's agent. Anyone else's event from
-    /// that room, and one for a delegation in another state, changes nothing.
+    /// answered by a turn of this session's agent; a Paseo run's end its
+    /// follow session told the delegated session's room is taken the same
+    /// way, once, whether or not the delegation's own reply came first
+    /// (R96PA2-05). An event of the target's this copy could not decrypt,
+    /// or could not link to the target's device, may be such an end: the
+    /// room's readback is owed from then on, so no later end is taken
+    /// before it (R283, R293). A workflow's run this agent started is a
+    /// delegation to the agent itself: a Paseo run that run started ends in
+    /// the run's room, its own news, so there such an end is never taken
+    /// and nothing unreadable holds anything (R311). Anyone else's event
+    /// from that room, and one for a delegation in another state, changes
+    /// nothing.
     async fn delegation_moved(
         &mut self,
         deps: &AgentDeps,
@@ -4517,14 +5314,35 @@ impl ServedSession {
         else {
             return Ok(Outcome::Ignored(NOT_A_DELEGATION));
         };
+        let own_run = open.to == deps.home.config.matrix_user;
         match arrived.arrival {
             Arrival::Joined if !open.sent => {
                 self.send_brief(deps, &open, Some(arrived.event_id)).await
             }
-            Arrival::Replied if open.sent && !open.replied => {
+            Arrival::Unreadable if open.sent && !own_run => {
+                tracing::info!(delegation = %open.id, event = %arrived.event_id, "agents: a delegation's room holds an event this copy cannot decrypt or link to its sender; its ends wait for the room to be read back past it");
+                self.retry.completions.insert(open.id.clone());
+                Ok(Outcome::Ignored(COMPLETION_HELD))
+            }
+            Arrival::Replied
+                if own_run
+                    && keeper_core::agents::paseo::completion_of(&arrived.content).is_some() =>
+            {
+                Ok(Outcome::Ignored(RUNS_OWN_END))
+            }
+            Arrival::Replied if self.context.takes_reply(&open, &arrived.content) => {
                 let Some(label) = delegate::reply_label(&arrived.content) else {
                     return Ok(Outcome::Ignored(NOT_A_DELEGATION));
                 };
+                // Completions are taken in their room's order: while that
+                // room's readback is owed, a live one waits for it — the
+                // readback reads it too — and so moves no cursor past an
+                // older one not yet taken (R279).
+                if keeper_core::agents::paseo::completion_of(&arrived.content).is_some()
+                    && self.retry.completions.contains(&open.id)
+                {
+                    return Ok(Outcome::Ignored(COMPLETION_HELD));
+                }
                 // The receipt carries the reply: a crash before its `peer`
                 // line loses nothing (`peer_the_reply`).
                 self.writer.write(
@@ -4542,6 +5360,8 @@ impl ServedSession {
                             text: arrived.text.clone(),
                             artifacts: handed_over(&arrived.content),
                             label,
+                            completion: keeper_core::agents::paseo::completion_of(&arrived.content)
+                                .map(|(completion, _)| completion.to_owned()),
                         }),
                         window: None,
                     }),
@@ -4797,8 +5617,10 @@ impl ServedSession {
     }
 
     /// The replies `open`'s target sent since its latest round that this
-    /// session has not logged, read back from the room; a room that could
-    /// not be read is tried again on the clock.
+    /// session has not logged and takes now ([`SessionContext::takes_reply`]),
+    /// read back from the room; a room that could not be read is tried again
+    /// on the clock. A Paseo run's completion is not read here: it may
+    /// precede the latest round ([`Self::read_completions`]).
     async fn read_replies(&mut self, open: &Delegation, me: &UserId) -> Vec<Arrived> {
         let Some(rooms) = self.delegations.clone() else {
             return Vec::new();
@@ -4816,6 +5638,39 @@ impl ServedSession {
         events
             .iter()
             .filter_map(|event| reply_of(event, &open.to, &open.room, now))
+            .filter(|arrived| keeper_core::agents::paseo::completion_of(&arrived.content).is_none())
+            .filter(|arrived| self.context.takes_reply(open, &arrived.content))
+            .filter(|arrived| !self.writer.seen(&arrived.event_id).unwrap_or(true))
+            .collect()
+    }
+
+    /// The Paseo run completions `open`'s target told its room that this
+    /// session has not taken, read back as far as the newest completion it
+    /// took from that room — its own cursor, whatever round the exchange is
+    /// in — or to the room's beginning (R277). A history that could not be
+    /// read back that far is no recovery: it is read again on the clock.
+    async fn read_completions(&mut self, open: &Delegation) -> Vec<Arrived> {
+        let Some(rooms) = self.delegations.clone() else {
+            return Vec::new();
+        };
+        let cursor = self.context.paseo_cursor.get(&open.id).cloned();
+        let events = match rooms
+            .completions(&open.room, cursor.as_deref(), &open.to)
+            .await
+        {
+            Ok(events) => events,
+            Err(error) => {
+                tracing::warn!(delegation = %open.id, %error, "agents: a delegation's room could not be read back for a Paseo run's end; it is read again on the clock");
+                self.retry.completions.insert(open.id.clone());
+                return Vec::new();
+            }
+        };
+        self.retry.completions.remove(&open.id);
+        let now = Instant::now();
+        events
+            .iter()
+            .filter_map(|event| reply_of(event, &open.to, &open.room, now))
+            .filter(|arrived| self.context.takes_reply(open, &arrived.content))
             .filter(|arrived| !self.writer.seen(&arrived.event_id).unwrap_or(true))
             .collect()
     }
@@ -4823,8 +5678,10 @@ impl ServedSession {
     /// On a worker's start: every delegation's room is watched again —
     /// replied ones too, since a later round's reply must come back here; a
     /// brief whose target joined while this host was down is sent now; a
-    /// reply that came meanwhile is returned, to be served like one that
-    /// arrives (R55).
+    /// reply that came meanwhile, or a Paseo run's end told after the
+    /// delegation replied, is returned, to be served like one that arrives
+    /// (R55, R96PA2-05). A workflow's run this agent started is never read
+    /// back for ends: none there is its starter's (R311).
     pub async fn resume_delegations(&mut self, deps: &AgentDeps) -> Vec<Arrived> {
         let Some(rooms) = self.delegations.clone() else {
             return Vec::new();
@@ -4844,8 +5701,13 @@ impl ServedSession {
                         tracing::warn!(delegation = %open.id, %error, "agents: a brief could not be logged");
                     }
                 }
-            } else if !open.replied {
-                replies.extend(self.read_replies(&open, &me).await);
+            } else {
+                if !open.replied {
+                    replies.extend(self.read_replies(&open, &me).await);
+                }
+                if open.to != me {
+                    replies.extend(self.read_completions(&open).await);
+                }
             }
         }
         replies
@@ -4866,16 +5728,18 @@ impl ServedSession {
             }
         }
         for id in std::mem::take(&mut self.retry.replies) {
-            let Some(open) = self
-                .context
-                .delegations
-                .get(&id)
-                .filter(|open| open.sent && !open.replied)
-            else {
+            let Some(open) = self.context.delegations.get(&id).filter(|open| open.sent) else {
                 continue;
             };
             let open = open.clone();
             replies.extend(self.read_replies(&open, &me).await);
+        }
+        for id in std::mem::take(&mut self.retry.completions) {
+            let Some(open) = self.context.delegations.get(&id).filter(|open| open.sent) else {
+                continue;
+            };
+            let open = open.clone();
+            replies.extend(self.read_completions(&open).await);
         }
         if self.retry.tell {
             self.tell_the_requester(deps).await;
@@ -5051,6 +5915,7 @@ impl ServedSession {
             title: title.clone(),
             requested_by: person.clone(),
             parent: None,
+            reply: None,
             room: room.clone(),
             drives: self.context.scope.clone(),
             label: self.context.agent.label.clone(),
@@ -6401,6 +7266,25 @@ impl TurnView for Mutex<TurnLog<'_>> {
         let limits = log.context.agent.limits.as_ref()?;
         Some((log.context.tokens_spent + log.open_round(), limits.tokens))
     }
+
+    fn paseo_started(&self, broker: &str) -> std::collections::BTreeSet<String> {
+        self.lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .context
+            .paseo_runs
+            .iter()
+            .filter(|started| started.broker == broker)
+            .map(|started| started.id.clone())
+            .collect()
+    }
+
+    fn paseo_ended(&self) -> Option<keeper_core::agents::log::PaseoBody> {
+        self.lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .context
+            .paseo_ended
+            .clone()
+    }
 }
 
 /// A session's own log, written by its worker outside a turn: what a
@@ -7237,6 +8121,12 @@ async fn run_agent_turn(
             ),
             worded => worded,
         };
+        // A run's end the call captured is the end's first durable step:
+        // on the log before its result, before anything of it is made or
+        // sent (R277).
+        if let Some(ended) = fetched.as_ref().and_then(|answer| answer.ended.clone()) {
+            log.write(call_line, LineBody::Paseo(ended));
+        }
         log.last_line = log.write(
             call_line,
             LineBody::ToolResult(ToolResultBody {
@@ -7245,6 +8135,7 @@ async fn run_agent_turn(
                 content: tools::render_result(outcome),
                 truncated,
                 label: result_label,
+                paseo: fetched.as_ref().and_then(|answer| answer.started.clone()),
             }),
         );
         let surfaced = host

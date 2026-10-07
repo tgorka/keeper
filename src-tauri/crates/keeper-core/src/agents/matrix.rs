@@ -584,6 +584,23 @@ impl AgentClient {
             .map_err(|err| AgentMatrixError::Other(format!("could not encode the file: {err}")))
     }
 
+    /// The bytes of the encrypted file `file` ([`Self::upload_encrypted`]'s
+    /// `EncryptedFile`), downloaded and decrypted, never cached.
+    pub async fn download_encrypted(&self, file: &Value) -> Result<Vec<u8>, AgentMatrixError> {
+        let file: matrix_sdk::ruma::events::room::EncryptedFile =
+            serde_json::from_value(file.clone())
+                .map_err(|err| AgentMatrixError::Other(format!("not an encrypted file: {err}")))?;
+        let request = matrix_sdk::media::MediaRequestParameters {
+            source: matrix_sdk::ruma::events::room::MediaSource::Encrypted(Box::new(file)),
+            format: matrix_sdk::media::MediaFormat::File,
+        };
+        self.client
+            .media()
+            .get_media_content(&request, false)
+            .await
+            .map_err(from_sdk)
+    }
+
     /// What `user`'s homeserver publishes now of their `device` and their
     /// identity (93.3's adapter, R182): one `/keys/query` asked for this
     /// call alone, judged on its own answer by

@@ -166,6 +166,7 @@ fn session_agent(room: &OwnedRoomId, person: &OwnedUserId, mac: bool) -> Session
         title: if mac { "mac" } else { "main" }.to_owned(),
         requested_by: person.clone(),
         parent: None,
+        reply: None,
         room: room.clone(),
         drives: vec!["smoke".to_owned()],
         label: Label {
