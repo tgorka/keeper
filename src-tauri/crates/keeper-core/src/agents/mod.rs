@@ -35,6 +35,7 @@ pub mod mcp;
 pub mod memory;
 pub mod mount;
 pub mod nudge;
+pub mod paseo;
 pub mod pins;
 pub mod placement;
 pub mod presence;

@@ -142,6 +142,7 @@ pub fn session(
         title: duty.name().to_owned(),
         requested_by: decl.owner.clone(),
         parent: None,
+        reply: None,
         room: room.to_owned(),
         drives: vec![config.drive.clone()],
         label: Label::opening(decl, Integrity::Owner),

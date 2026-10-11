@@ -341,6 +341,7 @@ fn result_line(seq: u64, content: String) -> LogLine {
             content,
             truncated: None,
             label: tg_label(),
+            paseo: None,
         }),
     )
 }
@@ -1005,6 +1006,7 @@ async fn logged_turn(session: &Path, secret: Option<&str>) -> (String, String) {
                 content: render_result(outcome),
                 truncated: None,
                 label: tg_label(),
+                paseo: None,
             }),
         );
     };
@@ -1829,6 +1831,7 @@ fn helper_steps_are_in_the_log_and_out_of_the_replay() {
             content: content.to_owned(),
             truncated: None,
             label: tg_label(),
+            paseo: None,
         })
     };
     next(

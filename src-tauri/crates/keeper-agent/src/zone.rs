@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 
 use keeper_core::agents::drive::{self, DriveDecl};
 use keeper_core::agents::home::{self, AgentConfig, HomeRefusal};
+use keeper_core::agents::log::reader::read_session;
+use keeper_core::agents::log::LineKind;
 use keeper_core::agents::session::{self, SessionAgent};
 use keeper_core::agents::skills::{self, SkillFilter, SkillsIndex};
 use keeper_core::agents::zone::{self, ZoneAssessment, ZoneEntry};
@@ -53,6 +55,10 @@ pub struct FoundSession {
     /// whether the bounded read found them all, read at the rescan (92.3);
     /// empty for any other session, whose cards are not read for a schedule.
     pub scheduled: crate::cards::ScheduledScan,
+    /// Whether this checkout's log of a session following a Paseo run holds
+    /// the run's captured end, read at the rescan (R277); `false` for any
+    /// other session, whose log is not read here.
+    pub paseo_captured: bool,
 }
 
 /// A file's text under `root`, reached through `browse::resolve_known`;
@@ -196,20 +202,32 @@ pub fn active_sessions(profile: &SyncProfile) -> Vec<FoundSession> {
             Err(sentence) => Err(sentence),
         };
         let dir = zone_dir.join(&path);
-        let scheduled = match &agent {
-            Ok(agent) if agent.kind == session::SessionKind::Scheduled => {
-                crate::cards::scheduled_cards(&path, &dir)
-            }
-            _ => crate::cards::ScheduledScan::default(),
+        let (scheduled, paseo_captured) = match &agent {
+            Ok(agent) if agent.kind == session::SessionKind::Scheduled => (
+                crate::cards::scheduled_cards(&path, &dir),
+                paseo_captured(agent, &dir),
+            ),
+            _ => (crate::cards::ScheduledScan::default(), false),
         };
         found.push(FoundSession {
             dir,
             path,
             agent,
             scheduled,
+            paseo_captured,
         });
     }
     found
+}
+
+/// Whether `agent`, a session in `dir`, follows a Paseo run whose end its
+/// log there holds captured (R277).
+pub fn paseo_captured(agent: &SessionAgent, dir: &Path) -> bool {
+    crate::agent::follows_a_run(agent)
+        && read_session(dir)
+            .lines
+            .iter()
+            .any(|line| line.kind() == LineKind::Paseo)
 }
 
 /// The zone's `_skills/<name>/SKILL.md`, offered as the agent's

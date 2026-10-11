@@ -64,7 +64,7 @@ use keeper_core::bots::tools::ToolOutcome;
 use keeper_core::sessions::model::ARTIFACTS_DIR;
 use keeper_sync::browse;
 use matrix_sdk::ruma::{
-    OwnedRoomId, OwnedTransactionId, OwnedUserId, RoomId, TransactionId, UserId,
+    EventId, OwnedRoomId, OwnedTransactionId, OwnedUserId, RoomId, TransactionId, UserId,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -182,14 +182,22 @@ pub type MembersFuture<'a> =
     Pin<Box<dyn Future<Output = Result<BTreeSet<OwnedUserId>, String>> + Send + 'a>>;
 /// A boxed future of what a host reads of a room a brief arrived in.
 pub type BriefRoomFuture<'a> = Pin<Box<dyn Future<Output = Option<BriefRoom>> + Send + 'a>>;
+/// A boxed future of an encrypted upload's `EncryptedFile` JSON.
+pub type FileFuture<'a> = Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>>;
+/// A boxed future of the bytes an encrypted file decrypts to.
+pub type BytesFuture<'a> = Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send + 'a>>;
+/// A boxed future of a state event as the homeserver holds it now: its
+/// sender and content, `None` when there is none.
+pub type StateFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Option<(OwnedUserId, Value)>, String>> + Send + 'a>>;
 
 /// The rooms a delegation goes through.
 pub trait DelegationPort: Send + Sync {
     /// Every agent of a drive this host mounts.
     fn known(&self) -> Arc<Known>;
-    /// A session room of `kind` — a delegation's, or a workflow's run
-    /// (R104) — named `name`, made by the agent, `invite` invited and
-    /// `agents` at power 50.
+    /// A session room of `kind` — a delegation's, a workflow's run, or a
+    /// session its host makes for its own agent (R104) — named `name`, made
+    /// by the agent, `invite` invited and `agents` at power 50.
     fn create<'a>(
         &'a self,
         kind: SessionKind,
@@ -212,6 +220,45 @@ pub trait DelegationPort: Send + Sync {
     /// first: paged back as far as that brief, so a reply behind any number
     /// of later events is found (R55).
     fn since_brief<'a>(&'a self, room: &'a RoomId, me: &'a UserId) -> EventsFuture<'a>;
+    /// `room`'s events after `after` — after its first when `None` — that
+    /// carry a Paseo run's completion and whose senders' devices sealed
+    /// them, oldest first, paged back as far as `after` or the room's
+    /// beginning: never a partial list — a history that could not be read
+    /// back that far, or that holds an event of `teller`'s this copy cannot
+    /// decrypt, is an error (R277, R283).
+    fn completions<'a>(
+        &'a self,
+        room: &'a RoomId,
+        after: Option<&'a EventId>,
+        teller: &'a UserId,
+    ) -> EventsFuture<'a>;
+    /// Encrypt `bytes` and upload them: their `EncryptedFile` JSON.
+    fn upload(&self, bytes: Vec<u8>) -> FileFuture<'_>;
+    /// The bytes of the encrypted file `file`.
+    fn download<'a>(&'a self, file: &'a Value) -> BytesFuture<'a>;
+    /// Put the state event `(event_type, key)` of `room`.
+    fn put_state<'a>(
+        &'a self,
+        room: &'a RoomId,
+        event_type: &'a str,
+        key: &'a str,
+        content: Value,
+    ) -> SendFuture<'a>;
+    /// The state event `(event_type, key)` of `room` as the homeserver holds
+    /// it now, never a sync's cached copy.
+    fn state<'a>(&'a self, room: &'a RoomId, event_type: &'a str, key: &'a str) -> StateFuture<'a>;
+    /// `room`'s events that publish a capture of the Paseo run end
+    /// `completion` or say it was delivered, whose senders' devices sealed
+    /// them, oldest first, read back to the room's beginning: never a
+    /// partial list — a history that could not be read back that far, or
+    /// that holds an event of `agent`'s this copy cannot decrypt or link to
+    /// it, is an error (R279, R283, R293).
+    fn captures<'a>(
+        &'a self,
+        room: &'a RoomId,
+        completion: &'a str,
+        agent: &'a UserId,
+    ) -> EventsFuture<'a>;
     /// What `room` is now, as a brief's admission reads it (R93).
     fn brief_room<'a>(&'a self, room: &'a RoomId) -> BriefRoomFuture<'a>;
     /// Route `child`'s joins and replies to `parent`'s worker from now on;
@@ -302,6 +349,11 @@ pub trait TurnView: Sync {
     /// included — and its limit. A helper stops at it as the run's next
     /// round would (Q12, R111, R214).
     fn session_budget(&self) -> Option<(u64, u64)>;
+    /// The ids of the Paseo runs this session's own successful
+    /// `create_agent` calls started on `broker` (Q14).
+    fn paseo_started(&self, broker: &str) -> std::collections::BTreeSet<String>;
+    /// This follow session's run end, once captured (R275).
+    fn paseo_ended(&self) -> Option<keeper_core::agents::log::PaseoBody>;
 }
 
 #[derive(Debug, Deserialize)]

@@ -714,6 +714,17 @@ impl Listed {
         self.role.is_none()
     }
 
+    /// Its server's role, as the listing it came from holds it.
+    pub fn role(&self) -> Option<&McpRole> {
+        self.role.as_ref()
+    }
+
+    /// [`core_mcp::identity`] of the connection it was listed over: which
+    /// server that listing reached (R144, R238).
+    pub fn identity(&self) -> &Value {
+        &self.catalog.connection.identity
+    }
+
     /// What an approval of it binds (R144): the identity of the connection
     /// it was listed over, its definition and its tier as listed there.
     /// `None` when it is not offered.
@@ -762,7 +773,9 @@ impl Listed {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Answer {
     /// Its content as text — text blocks verbatim, anything else named —
-    /// at most [`core_mcp::SHOWN_MAX`] bytes of it.
+    /// at most [`core_mcp::SHOWN_MAX`] bytes of it; a Paseo broker's whole,
+    /// as the transport bounded it at [`MESSAGE_MAX`], for keeper projects
+    /// it before anything is cut for display (R96PA2-01).
     pub text: String,
     /// How many bytes it was before that.
     pub total: u64,
@@ -1213,6 +1226,17 @@ impl Server {
         Ok(live)
     }
 
+    /// How much of an answer of this server is kept: a Paseo broker's whole,
+    /// as the transport bounded it, so keeper projects it before any cut
+    /// for display (R96PA2-01); any other server's what the model is shown.
+    fn kept_max(&self) -> usize {
+        if self.entry.role == Some(McpRole::Paseo) {
+            MESSAGE_MAX
+        } else {
+            core_mcp::SHOWN_MAX
+        }
+    }
+
     fn listing(&self) -> Listing {
         self.state().listing.clone()
     }
@@ -1256,9 +1280,9 @@ fn effect_unknown(server: &str, why: &str) -> String {
     format!("The call to the MCP server `{server}` was sent, and {why}; whether it took effect is unknown. Check before proposing it again.")
 }
 
-/// A call's answer, at most [`core_mcp::SHOWN_MAX`] bytes of text kept.
-fn answer(result: &CallToolResult) -> Answer {
-    let (text, total) = text_of(&result.content, result.structured_content.as_ref());
+/// A call's answer, at most `max` bytes of text kept.
+fn answer(result: &CallToolResult, max: usize) -> Answer {
+    let (text, total) = text_of(&result.content, result.structured_content.as_ref(), max);
     Answer {
         text,
         total,
@@ -1266,19 +1290,25 @@ fn answer(result: &CallToolResult) -> Answer {
     }
 }
 
-/// A JSON-RPC error a server answered: its own words, outside content.
-fn answer_error(error: &ErrorData) -> Answer {
+/// A JSON-RPC error a server answered: its own words, outside content. A
+/// Paseo broker's structured `data` has every string sanitized before it is
+/// serialized, so no escape the serializer writes hides a link (R277).
+fn answer_error(error: &ErrorData, max: usize, paseo: bool) -> Answer {
     let mut text = format!("JSON-RPC error {}: {}", error.code.0, error.message);
     if let Some(data) = &error.data {
         text.push('\n');
-        text.push_str(&data.to_string());
+        if paseo {
+            text.push_str(&keeper_core::agents::paseo::sanitized_value(data).to_string());
+        } else {
+            text.push_str(&data.to_string());
+        }
     }
-    kept(text, true)
+    kept(text, true, max)
 }
 
-fn kept(text: String, error: bool) -> Answer {
+fn kept(text: String, error: bool, max: usize) -> Answer {
     let total = text.len() as u64;
-    let mut end = text.len().min(core_mcp::SHOWN_MAX);
+    let mut end = text.len().min(max);
     while !text.is_char_boundary(end) {
         end -= 1;
     }
@@ -1536,7 +1566,7 @@ impl McpServers {
     ) -> Result<Answer, String> {
         let server = found.entry.name.as_str();
         match answered {
-            Ok(ServerResult::CallToolResult(result)) => Ok(answer(&result)),
+            Ok(ServerResult::CallToolResult(result)) => Ok(answer(&result, found.kept_max())),
             Ok(ServerResult::InputRequiredResult(_)) => {
                 tracing::warn!(
                     server,
@@ -1571,7 +1601,13 @@ impl McpServers {
             return Err(effect_unknown(server, &too_large()));
         }
         let fault = match &error {
-            ServiceError::McpError(data) => return Ok(answer_error(data)),
+            ServiceError::McpError(data) => {
+                return Ok(answer_error(
+                    data,
+                    found.kept_max(),
+                    found.entry.role == Some(McpRole::Paseo),
+                ))
+            }
             ServiceError::TransportSend(sent) => sent
                 .error
                 .downcast_ref::<StreamableHttpError<http::HttpFault>>(),
@@ -1579,7 +1615,19 @@ impl McpServers {
         };
         if let Some(StreamableHttpError::Client(http::HttpFault::Answered { status, body })) = fault
         {
-            return Ok(kept(format!("HTTP {status}\n{body}"), true));
+            // A Paseo broker's JSON body is sanitized as values, as its
+            // JSON-RPC error's `data` is.
+            let body = match serde_json::from_str::<Value>(body) {
+                Ok(json) if found.entry.role == Some(McpRole::Paseo) => {
+                    keeper_core::agents::paseo::sanitized_value(&json).to_string()
+                }
+                _ => body.clone(),
+            };
+            return Ok(kept(
+                format!("HTTP {status}\n{body}"),
+                true,
+                found.kept_max(),
+            ));
         }
         tracing::warn!(server, error = %diagnostic(&error.to_string()), "agents: an MCP call failed");
         Err(effect_unknown(
@@ -1664,20 +1712,20 @@ fn started(identity: &Value) -> Option<core_mcp::Program> {
 
 /// A result's content as the model reads it — text verbatim; an image, a
 /// sound or a binary resource named, never decoded; a link by its URI —
-/// kept to [`core_mcp::SHOWN_MAX`] bytes as it is put together, and how
-/// many bytes it was in all.
-fn text_of(content: &[ContentBlock], structured: Option<&Value>) -> (String, u64) {
+/// kept to `max` bytes as it is put together, and how many bytes it was in
+/// all.
+fn text_of(content: &[ContentBlock], structured: Option<&Value>, max: usize) -> (String, u64) {
     let mut out = String::new();
     let mut total = 0u64;
     let mut push = |part: &str| {
         if total > 0 {
             total += 1;
-            if out.len() < core_mcp::SHOWN_MAX {
+            if out.len() < max {
                 out.push('\n');
             }
         }
         total += part.len() as u64;
-        let room = core_mcp::SHOWN_MAX.saturating_sub(out.len());
+        let room = max.saturating_sub(out.len());
         let mut end = part.len().min(room);
         while !part.is_char_boundary(end) {
             end -= 1;

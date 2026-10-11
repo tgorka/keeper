@@ -98,6 +98,7 @@ fn body(i: u64) -> LineBody {
             content: prose(200 + (i * 31 % 6000) as usize),
             truncated: None,
             label,
+            paseo: None,
         }),
     }
 }

@@ -2073,6 +2073,7 @@ impl ServedSession {
                 }),
                 truncated: None,
                 label: self.context.label.clone(),
+                paseo: None,
             });
             if let Err(error) = self
                 .writer
@@ -2306,7 +2307,9 @@ fn bound_call(record: &ApprovalRecord, args: Value) -> (chat::ToolCall, Option<R
 /// again now, connected anew if its connection is gone — answers, offers
 /// the tool, and binds what the record bound: the same server identity
 /// (endpoint, or argv and program bytes), the same tool definition, the
-/// same tier. Anything else, a record naming no server included, is drift.
+/// same tier and, for a Paseo mutation, the same audience its prompt goes
+/// to (R96PA-04). Anything else, a record naming no server included, is
+/// drift.
 async fn mcp_moved(deps: &AgentDeps, record: &ApprovalRecord) -> Option<String> {
     if record.action.tool != AgentTool::Mcp.as_wire() {
         return None;
@@ -2326,12 +2329,19 @@ async fn mcp_moved(deps: &AgentDeps, record: &ApprovalRecord) -> Option<String> 
     else {
         return moved("this host or this agent no longer names its MCP server");
     };
-    match servers.fresh_binding(server, tool).await {
-        Err(reason) => moved(&reason),
-        Ok(now) if &now != bound => moved(
-            "which MCP server it reaches, or what the server says the tool takes or is, changed after it was approved",
-        ),
-        Ok(_) => None,
+    let readers = servers.entry(server).map(|entry| entry.readers.clone());
+    match (servers.fresh_binding(server, tool).await, readers) {
+        (Err(reason), _) => moved(&reason),
+        (Ok(_), None) => moved("this host no longer names its MCP server"),
+        (Ok(mut now), Some(readers)) => {
+            keeper_core::agents::paseo::bind_audience(&mut now, &readers);
+            if &now != bound {
+                return moved(
+                    "which MCP server it reaches, who it reaches through it, or what the server says the tool takes or is, changed after it was approved",
+                );
+            }
+            None
+        }
     }
 }
 

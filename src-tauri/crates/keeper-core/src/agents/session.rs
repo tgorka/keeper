@@ -31,7 +31,7 @@ pub const TITLE_MAX: usize = 120;
 /// The deepest delegation hop.
 pub const HOP_MAX: i64 = 3;
 
-const ROOT_KEYS: [&str; 20] = [
+const ROOT_KEYS: [&str; 21] = [
     "version",
     "id",
     "agent",
@@ -40,6 +40,7 @@ const ROOT_KEYS: [&str; 20] = [
     "title",
     "requested_by",
     "parent",
+    "reply",
     "room",
     "drives",
     "label",
@@ -54,6 +55,7 @@ const ROOT_KEYS: [&str; 20] = [
     "created_at",
 ];
 const PARENT_KEYS: [&str; 3] = ["drive", "session", "room"];
+const REPLY_KEYS: [&str; 3] = ["session", "room", "run"];
 const LABEL_KEYS: [&str; 3] = ["readers", "integrity", "local_only"];
 const LIMITS_KEYS: [&str; 2] = ["rounds_per_exchange", "tokens"];
 
@@ -160,6 +162,21 @@ pub struct SessionParent {
     pub room: OwnedRoomId,
 }
 
+/// The conversation a session that is no delegation answers when its work
+/// ends: a follow session's starting session (R96PA-10), in the same home
+/// drive. Not a parent: nothing is delegated, and no budget or reply tool
+/// follows from it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionReply {
+    /// The starting session's zone-relative path.
+    pub session: String,
+    /// Its room.
+    pub room: OwnedRoomId,
+    /// The Paseo run whose end it answers with, its id whole as the broker
+    /// gave it (R96PA2-06): the session's title may be cut, this never is.
+    pub run: Option<String>,
+}
+
 /// A delegated session's bounds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionLimits {
@@ -186,6 +203,9 @@ pub struct SessionAgent {
     pub requested_by: OwnedUserId,
     /// The delegating session, for a delegated one.
     pub parent: Option<SessionParent>,
+    /// The conversation it answers when its work ends, for a session the
+    /// host made to follow work another started.
+    pub reply: Option<SessionReply>,
     /// The session's Matrix room.
     pub room: OwnedRoomId,
     /// Drives in scope at opening; the home drive when the file names none.
@@ -455,6 +475,31 @@ fn parent(table: &toml::Table) -> Result<Option<SessionParent>, SessionRefusal> 
     }))
 }
 
+fn reply(table: &toml::Table) -> Result<Option<SessionReply>, SessionRefusal> {
+    let Some(value) = table.get("reply") else {
+        return Ok(None);
+    };
+    let toml::Value::Table(reply) = value else {
+        return Err(wrong("reply", "a table, [reply]"));
+    };
+    unknown_keys(reply, &REPLY_KEYS, "reply.")?;
+    let session = required_text(reply, "session", "reply.session")?;
+    if session.is_empty() {
+        return Err(invalid(
+            "reply.session",
+            "empty",
+            "it names the starting session's folder.",
+        ));
+    }
+    let room = room("reply.room", &required_text(reply, "room", "reply.room")?)?;
+    let run = match reply.get("run") {
+        None => None,
+        Some(toml::Value::String(run)) if !run.is_empty() => Some(run.clone()),
+        Some(_) => return Err(wrong("reply.run", "a run's id, a string")),
+    };
+    Ok(Some(SessionReply { session, room, run }))
+}
+
 fn limits(table: &toml::Table) -> Result<Option<SessionLimits>, SessionRefusal> {
     let Some(value) = table.get("limits") else {
         return Ok(None);
@@ -567,6 +612,7 @@ pub fn parse_session_agent_toml(text_in: &str) -> Result<SessionAgent, SessionRe
         title,
         requested_by,
         parent: parent(&table)?,
+        reply: reply(&table)?,
         room,
         drives,
         label: label(&table)?,
@@ -660,6 +706,14 @@ pub fn compose_session_agent_toml(session: &SessionAgent) -> String {
         out.push_str(&format!("drive = {}\n", quoted(&parent.drive)));
         out.push_str(&format!("session = {}\n", quoted(&parent.session)));
         out.push_str(&format!("room = {}\n", quoted(parent.room.as_str())));
+    }
+    if let Some(reply) = &session.reply {
+        out.push_str("\n[reply]\n");
+        out.push_str(&format!("session = {}\n", quoted(&reply.session)));
+        out.push_str(&format!("room = {}\n", quoted(reply.room.as_str())));
+        if let Some(run) = &reply.run {
+            out.push_str(&format!("run = {}\n", quoted(run)));
+        }
     }
     out.push_str("\n[label]\n");
     let readers = match &session.label.readers {
@@ -784,6 +838,44 @@ local_only = true
         .expect("conversation");
         assert_eq!(conversation.kind, SessionKind::Conversation);
         assert!(compose_session_agent_toml(&conversation).contains("kind = \"conversation\"\n"));
+    }
+
+    /// R241, R243, R96PA2-06: a follow session's `[reply]` — the
+    /// conversation it answers, and the run it follows whole — survives a
+    /// write and a read, beside no `[parent]`; one missing its room or
+    /// naming another key is refused by that key.
+    #[test]
+    fn a_reply_origin_round_trips() {
+        let run = format!("claude:{}", "r".repeat(121));
+        let follow = format!(
+            "{}\n[reply]\nsession = \"active/2026-10-07-coding\"\nroom = \"!coding:h\"\nrun = \"{run}\"\n",
+            GOOD.replace(
+                "\n[parent]\ndrive = \"tgdrive\"\nsession = \"active/2026-09-30-triage\"\nroom = \"!parent:h\"\n",
+                ""
+            )
+        );
+        let session = parse_session_agent_toml(&follow).expect("parse");
+        assert_eq!(session.parent, None);
+        assert_eq!(
+            session.reply,
+            Some(SessionReply {
+                session: "active/2026-10-07-coding".to_owned(),
+                room: RoomId::parse("!coding:h").expect("room"),
+                run: Some(run.clone()),
+            })
+        );
+        let again = parse_session_agent_toml(&compose_session_agent_toml(&session)).expect("again");
+        assert_eq!(again, session);
+        assert_eq!(
+            refused_key(&follow.replace("room = \"!coding:h\"\n", "")),
+            "reply.room"
+        );
+        assert_eq!(
+            refused_key(
+                &follow.replace("room = \"!coding:h\"\n", "room = \"!coding:h\"\nkind = 1\n")
+            ),
+            "reply.kind"
+        );
     }
 
     #[test]

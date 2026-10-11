@@ -1416,6 +1416,165 @@ sentence that it is data, not instructions, cut at 79 KiB with how much there wa
 and a secret-shaped string in it reaches the log redacted. keeper's client declares no roots,
 sampling or elicitation, and a server that asks for any is refused and logged.
 
+### Coding through Paseo
+
+A coding agent hands work to Paseo through makistack's broker (`paseo-mcp.py`), named on the host
+as a `role = "paseo"` server and listed in the agent's `[tools].mcp`:
+
+```toml
+# agentd.toml
+[[mcp]]
+name       = "paseo"
+url        = "http://<broker host>:5189/mcp"
+credential = "secret:paseo"   # the broker's bearer token: the only Paseo secret keeper holds
+role       = "paseo"          # readers default to ["*"]: a pull request is read by the repository's audience
+
+# the coding agent's agent.toml
+[tools]
+mcp = ["paseo"]
+```
+
+- **Four verbs, fixed tiers.** `list_agents` and `get_agent_status` are T0, `create_agent` and
+  `send_agent_prompt` T3 (T4 in a delegated or scheduled session), whatever the broker says of
+  them. Any other tool it lists is not offered — `keeper-agentd status` says "the broker has exactly
+  four verbs".
+- **Starting work is a person's decision, every time.** Each `create_agent` and `send_agent_prompt`
+  waits for its own approval, `once` only. The card says *Start a coding run through Paseo in
+  `<workspace>`; the prompt goes to `<who reads the broker>`; following the run waits for a person
+  to allow its follow card* or *Send a prompt to Paseo run `<agentId>`; the prompt goes to …*; the
+  prompt is what the card shows, and approving it is releasing exactly that prompt to exactly that
+  audience. A host that names the broker with other readers by the time the approval is used — a
+  restart, another host — does not send it: the approval is refused as changed. Nobody to ask: the
+  call is refused saying the label blocks it. In a session that read something `untrusted` —
+  Paseo's own answers, or a Paseo run's record, included — both are refused outright, so a run is
+  started, or steered, from a session that has not read outside content (in a proxy's `main`, every
+  turn).
+- **The reads carry nothing of the session.** `list_agents` takes no argument; `get_agent_status`
+  takes only the `agentId` of a run this session's own successful `create_agent` started **on that
+  same broker** — keeper writes which run on that call's result line in the session's log (its own
+  record, never the answer's words) and reads it back whenever the session is opened. Any other id,
+  the same id on another broker, the same name now pointing at another endpoint, or anything more,
+  is blocked, not asked, and nothing reaches the broker. A run's id is the broker's, `:` and all;
+  where it names a file, each `:` is written `~`.
+- **What the broker answers is cut to its eight fields.** keeper reads the broker's whole answer —
+  bounded only by the transport's 4 MiB message limit, never by what the model is shown — and the
+  model, the log and everything after them see a run only as `agentId`, `workspaceId`, `title`,
+  `status`, `provider`, `createdAt`, `updatedAt` and `prUrl`. A successful answer that is not the
+  broker's `agent` or `agents` record — another shape, or not JSON — is replaced by keeper's
+  sentence that it was not passed on; none of its words reach the model. A value carrying a secret
+  or a link with a user or password is `withheld`; a link is read as the URL parser reads it (tabs
+  and newlines dropped, a quote or a space ending nothing, and after `http`, `https`, `ws`, `wss`
+  or `ftp` and its `:` any number of `/` and `\` — none too — before the user and host), and a
+  link holding `@` the parser cannot read is withheld too. `prUrl` is shown only as the canonical
+  form of a plain `http(s)` link: one with a control character, a space, an angle bracket, a quote
+  or a backslash is withheld, and so is one whose decoded query or fragment has a parameter named
+  for a credential — `token`, `auth`,
+  `authorization`, `key`, `secret`, `password`, `passwd`, `pwd`, `sig`, `signature`,
+  `credential`, `credentials`, or a name ending in one, read without case or punctuation
+  (`access_token`, `api-key`, `X-Amz-Signature`) — or holds a link that has one
+  (`?next=https://…/r?token=…`). The same parameter names withhold a link in
+  every other field too — the whole field is `withheld` — and in every error keeper passes on or
+  writes itself, where the link is withheld from its start to the error's end, since the URL
+  parser reads a query on past a space; a link with ordinary parameters (`?ref=main&page=2`)
+  stays. An error keeps its other words, without secrets or credentialed links; its structured
+  `data` (and a JSON error body) has each string — keys too — cleaned before it is written out as
+  JSON, so an escape the JSON writer adds (`\t`) hides no link.
+- **The broker's refusals are its words.** Its ceilings (429), a field it does not take (400) and
+  its kill switch (503) reach the model and the log as the broker's answer, outside content; nothing
+  is tried again by itself.
+- **Following a run.** After an approved `create_agent`, keeper makes a scheduled session of the
+  same agent in a room for the session's readers, holding the card `follow.md`: every 10 minutes,
+  assigned to the agent, `scheduled_by` it — so it runs only once you allow its schedule on the
+  board. The session is titled `paseo-<agentId>` (cut with `…` past a title's 120 characters); the
+  run it follows is the one its `agent.toml` names whole (`[reply] run`), beside the conversation
+  that started it (`[reply] session`, `room`). Each run asks `get_agent_status`, automatic. When
+  the run has ended (`completed`, `failed`, `cancelled` and the like), keeper first checks that the
+  home drive's readers, everyone in the starting conversation's room — the person who asked
+  included — and the follow session's own room may read what the follow session read; if not,
+  nothing is written or sent and the card keeps asking. Otherwise it **captures** the end: one
+  `paseo` line `pending`, written by the session's holder before the call's result, holding the
+  record's bytes (the eight fields, marked `integrity: untrusted`), their SHA-256 and the notice
+  with the label it was admitted under. That line is the end's first durable step; after it this
+  checkout's session never asks the broker again and never sends `create_agent` again, and
+  everything else is made from it, each step resumed by the next window when one fails or the
+  host stops:
+  1. **Published in the follow room.** The follow room's timeline is read first. When it holds
+     no capture, this one is uploaded as an encrypted file and sent into the follow session's own
+     room (admitted there for its label) as a message marked `dev.keeper.agent.paseo_capture`
+     with the completion id `paseo-ended-<follow session id>` and the capture's SHA-256, and the
+     timeline is read again. **The first capture message the agent sent for that completion, in
+     the homeserver's timeline order, is the end** — whichever host sent it: a capture that lands
+     later, however delayed, never replaces it. When it is not this host's, this host adopts it
+     (below). The state event `dev.keeper.agent.paseo_captured`, keyed by the completion id, is
+     then put as an index naming it — only an index: it tells placement and a host with no capture
+     to read the timeline, and is never trusted over it.
+  2. **The record.** `artifacts/paseo-<agentId>.md` is written from the capture — put back as
+     captured when its bytes changed — only while the home drive's readers *now* may read the
+     capture's label; a drive whose readers grew since gets nothing, and the end stays pending.
+  3. **The notice.** The starting conversation's room is admitted as it is now, then the notice
+     is sent under the completion id as its transaction id, the record attached.
+  4. **Delivered.** A message marked `dev.keeper.agent.paseo_delivered`, naming the capture and
+     the event the homeserver answered with, is appended to the follow room's timeline, the log
+     says `delivered`, and only then is `schedule:` taken off the card. Once any such message is
+     there, the end is delivered for good: nothing that lands after it makes it pending again.
+
+  Uploading, publishing, adopting, indexing, writing the record and telling each happen only
+  while this host holds the session, checked right before them after every wait: a host that lost
+  the session's claim meanwhile — while it read the room, say — starts no upload, does nothing
+  more and leaves the capture pending for the holder. The delivery message is the one write after
+  the notice not checked that way: it says what the homeserver already took, and, appended, it
+  replaces nothing. A follow session holding a capture asks no broker, so placement no longer needs
+  a host offering its `mcp:<server>`: the capture on the checkout's log, or the room's index,
+  places it anywhere.
+- **One end, whichever host finishes it.** A window that holds no capture reads the follow room's
+  index before it polls. When the index is there — another host published a capture and this
+  checkout has not received its lines yet — the room's timeline is read and its first capture is
+  fetched, checked against its SHA-256, admitted to the home drive as its readers are now, and
+  logged as this session's; if the timeline holds a delivery message, nothing is sent again. A
+  capture whose label the home drive's readers can no longer read is not taken: nothing of it is
+  written on this host and nobody is told. A window whose room cannot be read — the index, or the
+  timeline back to its beginning — polls nothing. A capture this host holds that differs from the
+  room's first is replaced by it, under the same admission. So the same completion id always
+  carries the same bytes, and a told end stays told. Two limits stay. Between a capture's line and
+  its index in the room, another host whose checkout lacks that line polls again and may capture
+  an end of its own; only the first one published is told (DW-1123). And the homeserver's own
+  deduplication: a notice another device sent but whose delivery message never followed can be
+  sent once more by the taker, with the same content (DW-953). The timeline is read back to the
+  room's beginning within the page budget (20 pages of 50 events): a follow room grown past that
+  cannot be read for its end — a host holding a capture publishes and tells nothing, and one
+  without polls nothing once the index names a capture — and every window tries again (DW-1127).
+  Only the homeserver's missing page token is the room's beginning: an empty page that names the
+  next is read past, and a token that does not move on is a room not read. A message of the
+  agent's in the follow room that this host did not decrypt — its room key not here yet, its
+  decryption failed, or the message was redacted or is malformed, still an encrypted envelope — or
+  decrypted with a key it cannot link to the agent's device (one from a key backup or a forward, a
+  device it does not know, another user's session) is never taken for no capture or no delivery,
+  and never taken as one either: nothing is published, uploaded or told until it can be read and
+  linked, and every window tries again; a key that never arrives, a redacted message, or one that
+  is never linked holds that end for good — so can a forged message claiming to be the agent's,
+  though it can never stand for a capture or a delivery — and only the host's log says so
+  (DW-1129).
+  Follow sessions captured by a build before R279 (never released) are not read.
+- **A delegated start hears its end.** When the session that started the run is a delegated one,
+  the notice goes into the delegation's room marked as the follow session's completion answering
+  that delegated session. The delegating session takes it beside the delegation's own reply —
+  whether or not that reply already came, and without closing a round of a new exchange — logs it,
+  joins the label it carries and answers it in a turn; the same completion is taken once. A
+  session opened again reads completions back from the room up to the newest completion it took
+  there — not only since its latest brief, so one told before a later round is found — and a
+  history it cannot read back that far within the page budget recovers nothing until it can.
+  Completions are taken in the room's order: one that arrives while such a readback is owed waits
+  for it, so a newer end never moves the session past an older one it has not taken. An event of
+  the delegation's target that this host did not decrypt, or decrypted but cannot link to the
+  target's device — read back after the newest completion taken, or arriving live — may be such an
+  end: the completions after it wait until it can be read and linked, and it is never taken as
+  one. A message anyone sends in clear is no such event.
+- **A workflow's run keeps its own end.** When the session that started the run is a workflow's
+  run, the notice goes into that run's room, for the people who read it; neither the run nor the session that opened it takes it. It is never the run's
+  reply: the session that opened the run does not take it, its card keeps reading `running` until
+  the run itself replies, and no turn follows. That room is never read back for completions, and an
+  event there this host cannot read holds nothing.
+
 ## When an action waits
 
 On agentd and on the Mac — each installs a decision source: agentd over the master keys its
@@ -1753,15 +1912,16 @@ per date and host, compared as a number. Each host writes only its own chunks an
 | `peer` | `sender, text`, optional `ask {id, question, room, label}` (another agent's question for the proxy's person, in the proxy's session), `answers {id, choice}` (the person's answer to this session's ask, relayed by their proxy; `choice` is `null` when the answer picks none) and `artifacts` |
 | `assistant` | `text, model, finish, usage {prompt, completion}, ttft_ms, duration_ms, anchor_event`; a round that called tools carries that round's own usage |
 | `tool_call` | `call_id, tool, args, tier`, optional `grant_id`; `args` is the string the model sent, verbatim |
-| `tool_result` | `call_id, outcome` (`ok`, `refused`, `failed`), `content`, optional `truncated {shown, total}`, `label` |
+| `tool_result` | `call_id, outcome` (`ok`, `refused`, `failed`), `content`, optional `truncated {shown, total}`, `label`, optional `paseo {broker, id}` (the run a successful Paseo `create_agent` started) |
 | `approval` | `id, state` (`requested`, `decided`, `consumed`, `expired`, `refused`), optional `decision, by, result, reason, scope`; terminal: `consumed`, `expired`, `refused`, and `decided` with `decision: "deny"`; a `decided` line without `decision` is a decision ignored, `reason` saying why |
-| `delegate` | `id, to`, optional `room` (absent on a refusal made before the room existed), optional `child {drive, session}`, `state` (`opened`, `sent`, `accepted`, `replied`, `refused`), optional `reason` |
+| `delegate` | `id, to`, optional `room` (absent on a refusal made before the room existed), optional `child {drive, session}`, `state` (`opened`, `sent`, `accepted`, `replied`, `refused`), optional `reason`, optional `reply {text, artifacts, label, completion}` (`completion`: a Paseo run's end told into the delegation's room) |
 | `ask` | `id, state` (`asked`, `sent`, `answered`, `defaulted`, `refused`), optional `to, via, room, question, choices, default, card, answer, choice, reason`; in the asking session `asked` → `sent` → `answered`, `asked` → `refused` when the send was refused, or `defaulted`/`refused` at once; `card` names the scheduled card whose run asked; in the proxy's session one `answered` carrying the person's message it relayed |
 | `label` | `readers, integrity`, optional `local_only`, `cause {kind, ref}` |
 | `scope` | `drives, set_by` |
 | `run` | `state` (`queued`, `running`, `waiting`, `blocked`, `review`, `failed`, `idle`), optional `detail` |
 | `surface` | `id, tool, device`, optional `outcome` |
 | `told` | `person, room` — the person a narrowed session's detail was sent to, and their proxy DM it went into |
+| `paseo` | `completion, state` (`pending`, `delivered`), `room, artifact, sha256`; `pending` also `record` (the record's bytes) and `content` (the notice), `delivered` also `event` |
 | `heard` | `assistant, heard_until, sentence, reason` (`barge_in`, `stop`) |
 | `memory` | `op` (`journal`, `proposal`), `ref` |
 | `compact` | `summary, replaces_through` |
@@ -2204,9 +2364,12 @@ own log and never sent to the model.
 
 **Sends.** Every send disables matrix-sdk's own retry, so a `M_LIMIT_EXCEEDED` reaches the caller
 with its `retry_after_ms` and the caller decides how to pace; a retried send reuses its
-transaction id so the server keeps one copy. State events (claims, host manifests) are not
-encrypted and carry no content — no title, no path, no text. A claim is read back from the server
-(`GET /rooms/{id}/state`), never from the client's cache, which can be a sync behind.
+transaction id so the server keeps one copy. State events (claims, host manifests, a follow
+session's capture evidence) are not encrypted and carry no content — no title, no path, no text:
+the evidence holds only ids and a SHA-256, the capture itself travels as an encrypted file. A claim
+— and a capture's evidence, before a worker acts on it — is read back from the server
+(`GET /rooms/{id}/state`), never from the client's cache, which can be a sync behind; placement
+reads the cache, as it does for claims.
 
 **Run the live tests** against the Synapse test homeserver (its users and the secrets file are the
 operator's; the file holds `SERVER_NAME`, `ADMIN_TOKEN`, `NIXI_SMOKE_PASSWORD`,
