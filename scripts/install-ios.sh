@@ -38,7 +38,8 @@
 #                               the line to export, rather than guessing.
 #   KEEPER_IOS_FREE_TEAM=1      the team is a free Personal Team: drop every
 #                               entitlement (data protection, App Group,
-#                               keychain group, push) from the REMOTE copy of
+#                               keychain group, push) and the KeeperNotify
+#                               notification extension from the REMOTE copy of
 #                               gen/apple/project.yml and regenerate.
 #   KEEPER_IOS_REGISTER_DEVICE=1
 #                               first install from this Mac: register the phone
@@ -46,9 +47,9 @@
 #                               exists to sign against (a headless build never
 #                               does this itself). The one xcodebuild builds
 #                               the keeper_iOS scheme, whose graph includes the
-#                               KeeperIsland extension (Story 65.5), so it
-#                               mints both App IDs and both profiles — the
-#                               extension has no step of its own.
+#                               KeeperIsland and KeeperNotify extensions
+#                               (Story 65.5, Epic 98), so it mints every App ID
+#                               and profile — no extension has a step of its own.
 #   KEEPER_IOS_DEVICE=<udid>    pick the phone when several are cabled.
 #   KEEPER_IOS_BUILD_ONLY=1     build, gate and stop before the phone.
 #   KEEPER_IOS_NO_ISLAND=1      drop the Live Activity extension: a Mac whose
@@ -320,31 +321,41 @@ grep -q 'KeeperIsland.swift' keeper.xcodeproj/project.pbxproj || { echo "error: 
 echo "==> Regenerated without the extension; the bridge stays in the app target."
 EOF
 )" || fail "could not drop the island on $HOST (output above)."
-else
-  # The extension's team. tauri-cli writes DEVELOPMENT_TEAM into the APP
-  # target's pbxproj at build time and touches no other target, and
-  # `$(APPLE_DEVELOPMENT_TEAM)` in project.yml does not survive xcodebuild's
-  # signing check (measured 2026-09-05: "Signing for KeeperIsland requires a
-  # development team" both ways). So the team is stamped into the REMOTE copy
-  # of project.yml here, the way the entitlement is stripped below - the
-  # committed file keeps the placeholder and no team id (AD-32). The
-  # regeneration that follows (free team or not) then carries it.
-  say "stamping team $APPLE_DEVELOPMENT_TEAM into the remote project's extension target"
-  remote "cd \$HOME/$REMOTE_DIR/$APPLE_DIR && $REMOTE_ENV && $(cat <<EOF
+fi
+
+# The extensions' team (KeeperIsland, unless dropped above, and
+# KeeperNotify, Epic 98). tauri-cli writes DEVELOPMENT_TEAM into the APP
+# target's pbxproj at build time and touches no other target, and
+# `$(APPLE_DEVELOPMENT_TEAM)` in project.yml does not survive xcodebuild's
+# signing check (measured 2026-09-05: "Signing for KeeperIsland requires a
+# development team" both ways). So the team is stamped into the REMOTE copy
+# of project.yml here, the way the entitlement is stripped below - the
+# committed file keeps the placeholder and no team id (AD-32). The
+# regeneration that follows (free team or not) then carries it.
+say "stamping team $APPLE_DEVELOPMENT_TEAM into the remote project's extension targets"
+remote "cd \$HOME/$REMOTE_DIR/$APPLE_DIR && $REMOTE_ENV && $(cat <<EOF
 set -euo pipefail
 sed -i '' 's/DEVELOPMENT_TEAM: \\\$(APPLE_DEVELOPMENT_TEAM)/DEVELOPMENT_TEAM: $APPLE_DEVELOPMENT_TEAM/' project.yml
 grep -q 'DEVELOPMENT_TEAM: $APPLE_DEVELOPMENT_TEAM' project.yml || { echo "error: the extension target's DEVELOPMENT_TEAM placeholder was not found in project.yml" >&2; exit 1; }
 mkdir -p Externals assets
 xcodegen generate >/dev/null
 grep -q 'DEVELOPMENT_TEAM = $APPLE_DEVELOPMENT_TEAM' keeper.xcodeproj/project.pbxproj || grep -q 'DEVELOPMENT_TEAM = "$APPLE_DEVELOPMENT_TEAM"' keeper.xcodeproj/project.pbxproj || { echo "error: project.pbxproj carries no DEVELOPMENT_TEAM after xcodegen generate" >&2; exit 1; }
+grep -q 'KeeperNotify.appex' keeper.xcodeproj/project.pbxproj || { echo "error: project.pbxproj does not embed KeeperNotify.appex after xcodegen generate; the notification extension was dropped" >&2; exit 1; }
 EOF
 )" || fail "could not stamp the team into the remote project (output above)."
-fi
 
 if [ -n "${KEEPER_IOS_FREE_TEAM:-}" ]; then
-  say "free Personal Team: dropping every entitlement (data protection, App Group, keychain group, push) from the remote project.yml"
+  say "free Personal Team: dropping every entitlement (data protection, App Group, keychain group, push) and the KeeperNotify extension from the remote project.yml"
   remote "cd \$HOME/$REMOTE_DIR/$APPLE_DIR && $REMOTE_ENV && NO_ISLAND='$NO_ISLAND' && $(cat <<'EOF'
 set -euo pipefail
+# The notification extension (Epic 98): its App ID and App Group need the
+# paid program, and without the App Group it has no store to open, so a
+# free Personal Team builds without it, as KEEPER_IOS_NO_ISLAND drops the
+# island.
+command -v yq >/dev/null || { echo "error: yq is not installed on this Mac (brew install yq); it edits project.yml for KEEPER_IOS_FREE_TEAM" >&2; exit 1; }
+yq -i 'del(.targets.KeeperNotify) | del(.targets.keeper_iOS.dependencies[] | select(.target == "KeeperNotify"))' project.yml
+grep -q '^  KeeperNotify:' project.yml && { echo "error: the KeeperNotify target is still in project.yml after the edit" >&2; exit 1; }
+grep -q 'target: KeeperNotify' project.yml && { echo "error: keeper_iOS still depends on KeeperNotify after the edit" >&2; exit 1; }
 awk 'skip && /^    [^ ]/ { skip = 0 } /^    entitlements:/ { skip = 1 } !skip' project.yml > project.yml.free
 mv project.yml.free project.yml
 grep -q '^    entitlements:' project.yml && { echo "error: the entitlements: block is still in project.yml after the edit" >&2; exit 1; }
@@ -378,6 +389,10 @@ if [ -z "$NO_ISLAND" ] && [ "$appex" -eq 0 ]; then
 fi
 if [ -n "$NO_ISLAND" ] && [ "$appex" -ne 0 ]; then
   echo "error: project.pbxproj still references KeeperIsland.appex although KEEPER_IOS_NO_ISLAND was set" >&2
+  exit 1
+fi
+if grep -q 'KeeperNotify.appex' keeper.xcodeproj/project.pbxproj; then
+  echo "error: project.pbxproj still embeds KeeperNotify.appex on a free Personal Team" >&2
   exit 1
 fi
 if ! grep -q 'NSSupportsLiveActivities' keeper_iOS/Info.plist; then

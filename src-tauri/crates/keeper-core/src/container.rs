@@ -45,6 +45,27 @@ pub const MOVE_DONE: &str = ".keeper-moved";
 /// [`MOVE_DONE`] is written. Holds the old path.
 pub const MOVE_JOURNAL: &str = ".keeper-moving";
 
+/// The App Group the app and its notification extension share
+/// (`gen/apple/project.yml`, pinned for every target by
+/// `tests/apple_entitlements.rs`).
+pub const APP_GROUP: &str = "group.dev.tgorka.keeper";
+
+/// The one folder every account, store and phone folder lives under, in
+/// whichever container holds it.
+pub const DATA_DIR_NAME: &str = "dev.tgorka.keeper";
+
+/// The data directory inside the App Group container whose root is `group`:
+/// where the move puts it, and the only place the notification extension
+/// looks — and only once [`MOVE_DONE`] is there (a build without the group,
+/// or a move not yet finished, keeps the data in the app's own container,
+/// which the extension cannot open).
+pub fn group_data_dir(group: &Path) -> PathBuf {
+    group
+        .join("Library")
+        .join("Application Support")
+        .join(DATA_DIR_NAME)
+}
+
 /// What a run did, when keeper may use the destination afterwards.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Moved {

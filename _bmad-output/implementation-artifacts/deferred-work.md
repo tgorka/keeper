@@ -9952,4 +9952,61 @@ status: open
 origin: epic 98, story 98.1 (rung `agents-98-group` fix round 1, 2026-10-11; R335, `review-98group-1.md` DW candidate 3) — a contract for rung 3 (`agents-98-nse`)
 location: rung 3's `KeeperNotify` (Swift NSE and any Rust it links), `keeper_core::container` (`DestinationNotEmpty`)
 reason: The app's move refuses a destination that holds anything without its journal — before anything is moved or marked, a fresh install included (R332). `<group container>/Library/Application Support/dev.tgorka.keeper` is the app's data directory only once `.keeper-moved` is in it; if `KeeperNotify` creates a file there first — a log, a crash file, a store opened "to see" — the app's first move becomes `DestinationNotEmpty` on every start, for good. The NSE checks for `.keeper-moved` and, without it, opens nothing and writes nothing under that directory (its own logs go elsewhere, e.g. the extension's own container). Close when rung 3 lands with that check and a test or an inspection note naming it.
+status: done 2026-10-11
+resolution: rung `agents-98-nse` (R337): the extension touches the group's data directory only through `keeper_nse::store_of`, which reads `.keeper-moved`, the account's `sdk` directory and the registry row (`registry::homeserver_of_existing`, read-only) and creates nothing; any miss is the gateway's notification. Tests `keeper_nse::tests::nothing_is_touched_before_the_move_finished` (no data directory; a move under way with its journal — the tree unchanged) and `the_store_is_the_moved_accounts_own` (no `keeper.db` created; a row whose store did not move is not opened); mutants N01–N04 killed. The Swift writes nothing there.
+
+### DW-1250: The notification extension never refreshes a token, so an expired one shows the gateway's notification.
+
+origin: epic 98, story 98.1 (rung `agents-98-nse`, 2026-10-11; codemap §0 item 8, Q7 (a))
+location: `src-tauri/crates/keeper-nse/src/lib.rs` (`decide`: no `handle_refresh_tokens`), `src-tauri/crates/keeper-core/src/account.rs` (`activate`)
+reason: An OAuth refresh token is used once; a refresh in the extension would leave the app holding a spent one, so the extension's client is built without `handle_refresh_tokens()` and a 401 is a generic notification. The codemap's Q7 (a) also names `OAuth::enable_cross_process_refresh_lock` in app and extension; doing it right needs the SDK's session callbacks (reload the rotated session from the keychain in each process) in `account::activate` on every target, which this rung does not touch. How often an approval push arrives while the access token is expired is a device measurement (98.1 #12); if it shows, enable the lock in both processes with the callbacks.
+status: open
+
+### DW-1251: An answer's notification waits the whole budget, and the proxy-room check may page back history inside the extension.
+
+origin: epic 98, story 98.1 (rung `agents-98-nse`, 2026-10-11; acceptance 2, 12)
+location: `src-tauri/crates/keeper-nse/src/lib.rs` (`newest_words`, `decide`), `keeper_core::account::proxy_answer_agent`
+reason: The extension asks for the anchor's edits every 1.5 s until `push::ANSWER_BUDGET` (6 s) has passed, even when the final edit came in the first poll (an answer's end is its status going `idle`, which it does not read); and `proxy_answer_agent` reuses the dock's admission (`proxy_row` → `HeaderReader::open`), which pages back up to four pages of fifty events when the store holds no status for the room. Both are correct and both cost time and memory under the 24 MB ceiling that only the device run measures (98.1 #12: peak memory over twenty notifications, p95 latency). If either shows, stop at the status's `idle` and give the extension a status-only header read.
+status: open
+
+### DW-1252: A homeserver without simplified sliding sync makes every push the gateway's notification.
+
+origin: epic 98, story 98.1 (rung `agents-98-nse` fix round 1, 2026-10-12; `review-98nse-1.md`, R339)
+location: `src-tauri/crates/keeper-nse/src/lib.rs` (`decide`: `NotificationClient::get_notification`)
+reason: matrix-sdk-ui 0.18's `get_notification` falls back to `/context` only on `EventNotFound`; when the sliding-sync request itself fails (a server without simplified sliding sync) the error propagates and `decide` answers generic. Synapse serves it (the live test ran there); tuwunel's support is unverified (epic Q5). A fix tries `get_notification_with_context` once before answering generic. Trigger: a push on kalypso against a tuwunel homeserver (or any without sliding sync) showing the gateway's text.
+status: open
+
+### DW-1253: The extension builds a new client for every notification instead of keeping one per account.
+
+origin: epic 98, story 98.1 (rung `agents-98-nse` fix round 1, 2026-10-12; `review-98nse-1.md`, R339)
+location: `src-tauri/crates/keeper-nse/src/lib.rs` (`handle_json`, `decide`)
+reason: R339 serialises notifications (one Swift serial queue, one Rust `Mutex`), so one client lives at a time; each still opens the SQLite state and crypto stores, builds an OlmMachine and a sliding sync, and drops them. Element X keeps one process-wide client per account and a live runtime across notifications. Worth it only if the device numbers say so. Trigger: 98.1 #12's memory row (peak over twenty notifications near 24 MB) or the latency row (p95) on kalypso.
+status: open
+
+### DW-1254: The KeeperNotify pre-build compiles keeper-nse for a newer iOS than the extension links.
+
+origin: epic 98, story 98.1 (rung `agents-98-nse` fix round 1, 2026-10-12; `review-98nse-1.md`, R339)
+location: `src-tauri/crates/keeper/gen/apple/project.yml` (`KeeperNotify` pre-build script)
+reason: On hesperia ld warned the object was "built for newer iOS (27.0) than being linked (16.0)" (`mac-98nse.log`): the cargo step runs without `IPHONEOS_DEPLOYMENT_TARGET`, so rustc targets the SDK's version. Export the target's `$IPHONEOS_DEPLOYMENT_TARGET` to cargo in the pre-build step. Trigger: the paid-team `install:ios` on hesperia, or a launch failure of the extension on an iOS older than the SDK.
+status: open
+
+### DW-1255: The extension reads the pushed event and its anchor again after the notification client already fetched them.
+
+origin: epic 98, story 98.1 (rung `agents-98-nse` fix round 1, 2026-10-12; `review-98nse-1.md`, R339)
+location: `src-tauri/crates/keeper-nse/src/lib.rs` (`decide`: `room.event` for the event and for the replaced anchor)
+reason: `NotificationItem` carries no `EncryptionInfo`, so `decide` re-reads the event (and, for an edit, its anchor) to learn who sealed it: up to two more round trips inside the extension's budget. Trigger: 98.1 #12's latency row on kalypso.
+status: open
+
+### DW-1256: The notification extension has no log sink: a generic notification's reason goes nowhere on the phone.
+
+origin: epic 98, story 98.1 (rung `agents-98-nse` fix round 1, 2026-10-12; `review-98nse-1.md`, R339)
+location: `src-tauri/crates/keeper-nse/src/lib.rs` (`handle_json` warns `Generic.why` through `tracing`), `gen/apple/KeeperNotify/NotificationService.swift`
+reason: R339 (08) keeps `tracing` and warns every generic answer's `why`, but the extension installs no subscriber, so on kalypso the reason is lost. A subscriber writing to os_log (a dependency that passes `check:nse-lean` and the licence firewall) would make it readable in Console. Trigger: the first generic notification on kalypso whose cause is not obvious.
+status: open
+
+### DW-1257: The free-team drop of KeeperNotify and the `$(AppIdentifierPrefix)` keychain group have not been run.
+
+origin: epic 98, story 98.1 (rung `agents-98-nse` fix round 1, 2026-10-12; `review-98nse-1.md`, R339)
+location: `scripts/install-ios.sh` (`KEEPER_IOS_FREE_TEAM` yq drop), `gen/apple/KeeperNotify/Info.plist` (`KeeperKeychainGroup`)
+reason: Both are written by inspection and `bash -n`: the yq removal of the target and the app's dependency mirrors the island's proven shape, and the keychain group relies on Xcode expanding `$(AppIdentifierPrefix)` in Info.plist; neither has run in an install. Trigger: `install:ios` on hesperia with `KEEPER_IOS_FREE_TEAM=1`, and the paid-team install.
 status: open

@@ -3344,6 +3344,36 @@ pub fn list_accounts(data_dir: &Path) -> Result<Vec<AccountRow>, CoreError> {
     Ok(accounts)
 }
 
+/// The homeserver of `account_id`, read without writing anything: `None`
+/// when there is no `keeper.db` in `data_dir` or no such account. The
+/// notification extension reads it this way — it is a second process beside
+/// the app, so it neither creates the registry nor runs [`open`]'s
+/// migrations (98.1).
+pub fn homeserver_of_existing(
+    data_dir: &Path,
+    account_id: &str,
+) -> Result<Option<String>, CoreError> {
+    let path = db_path(data_dir);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let conn = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|e| CoreError::Internal(format!("could not read keeper.db: {e}")))?;
+    conn.busy_timeout(BUSY_TIMEOUT)
+        .map_err(|e| CoreError::Internal(format!("could not set busy timeout: {e}")))?;
+    match conn.query_row(
+        "SELECT homeserver_url FROM accounts WHERE account_id = ?1",
+        rusqlite::params![account_id],
+        |r| r.get::<_, String>(0),
+    ) {
+        Ok(url) => Ok(Some(url)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(CoreError::Internal(format!(
+            "could not read the account row: {e}"
+        ))),
+    }
+}
+
 /// Fetch a single account row by id, if present.
 pub fn get_account(data_dir: &Path, account_id: &str) -> Result<Option<AccountRow>, CoreError> {
     let conn = open(data_dir)?;

@@ -25,6 +25,9 @@ pub const CONTROL_ROOM_TYPE: &str = "dev.keeper.agent.control";
 pub const STATUS: &str = "dev.keeper.agent.status";
 /// The key inside a streamed answer's anchor content naming its log line.
 pub const TURN: &str = "dev.keeper.agent.turn";
+/// What a streamed answer's anchor says before its first edit: the agent's
+/// host sends it, and a notification never shows it (98.1 #2).
+pub const PLACEHOLDER: &str = "…";
 /// The drives in scope and the label (people may send it in a proxy's rooms).
 pub const SCOPE: &str = "dev.keeper.agent.scope";
 /// An action that waits for a person: the record's payload (AD-393).

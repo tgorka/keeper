@@ -605,6 +605,43 @@ fn person(user: &str, name: &dyn Fn(&UserId) -> String) -> ApprovalPersonVm {
     }
 }
 
+/// Why a person cannot decide a request from what it shows ([`undecidable`]).
+enum Undecidable<'a> {
+    Unbound,
+    NotAnApprover,
+    NoRequester,
+    /// At T4: only the requester decides.
+    OnlyRequester(&'a str),
+}
+
+/// Why nobody signed in as `own` can decide `request` from what it shows,
+/// on any device of theirs: the card's three rules, which the lock screen's
+/// actions follow too (R336) — the digest binds what is shown, `own` is an
+/// approver (anyone when the request names none), and at T4 `own` is the
+/// requester. `None` when `own` may decide.
+fn undecidable<'a>(request: &'a ApprovalRequestContent, own: &str) -> Option<Undecidable<'a>> {
+    if binding(request) == Binding::Unbound {
+        return Some(Undecidable::Unbound);
+    }
+    if !request.approvers.is_empty() && !request.approvers.iter().any(|a| a == own) {
+        return Some(Undecidable::NotAnApprover);
+    }
+    if request.tier >= 4 {
+        match requester(request) {
+            None => return Some(Undecidable::NoRequester),
+            Some(asked) if asked != own => return Some(Undecidable::OnlyRequester(asked)),
+            Some(_) => {}
+        }
+    }
+    None
+}
+
+/// Whether `own` may decide `request` by what it shows, wherever they read
+/// it: the rules of [`refusal`] that do not depend on the device (R336).
+pub fn decidable_by(request: &ApprovalRequestContent, own: &str) -> bool {
+    undecidable(request, own).is_none()
+}
+
 /// Why `viewer` cannot decide `request` now, and whether verifying this
 /// device would let them; `None` when they can.
 pub fn refusal(
@@ -612,21 +649,15 @@ pub fn refusal(
     viewer: &Viewer,
     name: &dyn Fn(&UserId) -> String,
 ) -> Option<(String, bool)> {
-    if binding(request) == Binding::Unbound {
-        return Some((UNBOUND.to_owned(), false));
-    }
-    let own = viewer.own.as_str();
-    if !request.approvers.is_empty() && !request.approvers.iter().any(|a| a == own) {
-        return Some((NOT_AN_APPROVER.to_owned(), false));
-    }
-    if request.tier >= 4 {
-        match requester(request) {
-            None => return Some((NO_REQUESTER.to_owned(), false)),
-            Some(asked) if asked != own => {
-                return Some((only(&person(asked, name).name), false));
-            }
-            Some(_) => {}
-        }
+    let why = match undecidable(request, viewer.own.as_str()) {
+        Some(Undecidable::Unbound) => Some(UNBOUND.to_owned()),
+        Some(Undecidable::NotAnApprover) => Some(NOT_AN_APPROVER.to_owned()),
+        Some(Undecidable::NoRequester) => Some(NO_REQUESTER.to_owned()),
+        Some(Undecidable::OnlyRequester(asked)) => Some(only(&person(asked, name).name)),
+        None => None,
+    };
+    if let Some(why) = why {
+        return Some((why, false));
     }
     if !viewer.device_cross_signed {
         return Some((UNVERIFIED.to_owned(), true));

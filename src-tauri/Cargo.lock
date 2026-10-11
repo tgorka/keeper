@@ -4525,6 +4525,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "keeper-nse"
+version = "0.9.0"
+dependencies = [
+ "keeper-core",
+ "matrix-sdk",
+ "matrix-sdk-ui",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "ulid",
+]
+
+[[package]]
 name = "keeper-ported"
 version = "0.9.0"
 dependencies = [

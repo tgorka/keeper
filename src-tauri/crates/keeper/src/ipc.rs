@@ -818,16 +818,10 @@ pub struct IosPlatform {
     data_dir: Option<PathBuf>,
 }
 
-/// The App Group the app and its notification extension share (Epic 98,
-/// story 98.1; `group.dev.tgorka.keeper` in `gen/apple/project.yml`, pinned
-/// for every target by `keeper-core/tests/apple_entitlements.rs`).
+// The App Group and the data directory's name are keeper-core's, so the
+// notification extension (`keeper-nse`) opens exactly where this moves to.
 #[cfg(target_os = "ios")]
-const APP_GROUP: &str = "group.dev.tgorka.keeper";
-
-/// The one folder every account, store and phone folder lives under, in
-/// whichever container holds it.
-#[cfg(target_os = "ios")]
-const DATA_DIR_NAME: &str = "dev.tgorka.keeper";
+use keeper_core::container::{APP_GROUP, DATA_DIR_NAME};
 
 #[cfg(target_os = "ios")]
 impl IosPlatform {
@@ -871,10 +865,7 @@ impl IosPlatform {
                 data_dir: Some(own),
             };
         };
-        let shared = group
-            .join("Library")
-            .join("Application Support")
-            .join(DATA_DIR_NAME);
+        let shared = keeper_core::container::group_data_dir(&group);
         if let Err(err) = keeper_sync::db::store_folder_paths_relative_at(&own) {
             tracing::error!(
                 %err,

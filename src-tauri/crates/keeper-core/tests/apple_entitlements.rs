@@ -27,7 +27,9 @@
 //!   that merely needs an entitlement of its own. The Live Activity extension
 //!   declares no entitlements block at all, which `scripts/install-ios.sh`'s
 //!   free-team strip relies on.
-//! - **Push, on the app.** `aps-environment` on `keeper_iOS`.
+//! - **Push, on the app.** `aps-environment` on `keeper_iOS`, and on no
+//!   extension: the notification extension (`KeeperNotify`) is handed the
+//!   push, it does not register for one.
 //!
 //! Both readers are structural (key → value), never substring scans: the right
 //! protection class *contains* the banned one as a prefix.
@@ -48,9 +50,11 @@ const KEYCHAIN_GROUP: &str = "$(AppIdentifierPrefix)dev.tgorka.keeper";
 const APS: &str = "aps-environment";
 
 const APP_TARGET: &str = "keeper_iOS";
+/// The notification extension (98.1): it opens the app's store.
+const NOTIFY_TARGET: &str = "KeeperNotify";
 /// The targets that open the app's store with the app's session: the app and
 /// its notification extension (Epic 98, story 98.1).
-const SHARING_TARGETS: [&str; 2] = [APP_TARGET, "KeeperNotify"];
+const SHARING_TARGETS: [&str; 2] = [APP_TARGET, NOTIFY_TARGET];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Value {
@@ -302,5 +306,26 @@ fn only_the_app_and_its_notification_extension_share_the_store() {
         app.properties.get(APS),
         Some(&Value::Text("development".to_owned())),
         "{APP_TARGET} must carry {APS} for APNs to issue it a token"
+    );
+}
+
+/// The notification extension opens the app's store with the app's session
+/// (98.1 #5), so it signs with entitlements — which puts it under the two
+/// tests above — and takes no push environment of its own.
+#[test]
+fn the_notification_extension_shares_the_store_and_takes_no_push() {
+    let targets = targets();
+    let notify = targets
+        .iter()
+        .find(|t| t.name == NOTIFY_TARGET)
+        .unwrap_or_else(|| panic!("{NOTIFY_TARGET} must declare entitlements in project.yml"));
+    assert_eq!(
+        notify.properties.get(APP_GROUPS),
+        Some(&Value::List(vec![APP_GROUP.to_owned()]))
+    );
+    assert_eq!(
+        notify.properties.get(APS),
+        None,
+        "{NOTIFY_TARGET} carries no {APS}"
     );
 }

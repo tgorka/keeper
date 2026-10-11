@@ -367,11 +367,24 @@ impl StoredSession {
     /// Restore this session into `client` (rebuilding the SDK auth state),
     /// loading rooms with `RoomLoadSettings::default()`. OAuth sessions restore
     /// via `client.oauth().restore_session`; password sessions via
-    /// `client.restore_session`.
+    /// `client.matrix_auth().restore_session`.
     pub async fn restore_into(self, client: &Client) -> Result<(), CoreError> {
+        self.restore_into_loading(client, RoomLoadSettings::default())
+            .await
+    }
+
+    /// [`Self::restore_into`], loading only the rooms `rooms` names from the
+    /// store: the notification extension (`keeper-nse`) loads the one room a
+    /// push names, inside its 24 MB.
+    pub async fn restore_into_loading(
+        self,
+        client: &Client,
+        rooms: RoomLoadSettings,
+    ) -> Result<(), CoreError> {
         match self {
             StoredSession::Password(m) => client
-                .restore_session(m)
+                .matrix_auth()
+                .restore_session(m, rooms)
                 .await
                 .map_err(|e| CoreError::Internal(format!("could not restore session: {e}"))),
             StoredSession::Oauth { client_id, user } => {
@@ -381,7 +394,7 @@ impl StoredSession {
                 };
                 client
                     .oauth()
-                    .restore_session(session, RoomLoadSettings::default())
+                    .restore_session(session, rooms)
                     .await
                     .map_err(|e| {
                         CoreError::Internal(format!("could not restore OAuth session: {e}"))

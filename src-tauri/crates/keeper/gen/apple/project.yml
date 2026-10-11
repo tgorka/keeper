@@ -207,6 +207,11 @@ targets:
       # ProjectSpec.md, "Dependency"). Its shared attributes file is compiled
       # into this target through `sources` above.
       - target: KeeperIsland
+      # The notification extension (Epic 98, story 98.1), embedded under
+      # PlugIns/ the same way. A free Personal Team cannot sign its App Group,
+      # so `KEEPER_IOS_FREE_TEAM` removes the target and this line from the
+      # remote copy (scripts/install-ios.sh).
+      - target: KeeperNotify
     preBuildScripts:
       - script: bun tauri ios xcode-script -v --platform ${PLATFORM_DISPLAY_NAME:?} --sdk-root ${SDKROOT:?} --framework-search-paths "${FRAMEWORK_SEARCH_PATHS:?}" --header-search-paths "${HEADER_SEARCH_PATHS:?}" --gcc-preprocessor-definitions "${GCC_PREPROCESSOR_DEFINITIONS:-}" --configuration ${CONFIGURATION:?} ${FORCE_COLOR} ${ARCHS:?}
         name: Build Rust Code
@@ -266,3 +271,81 @@ targets:
       - sdk: SwiftUI.framework
       - sdk: WidgetKit.framework
       - sdk: ActivityKit.framework
+  # The notification extension (Epic 98, story 98.1; AD-412, R24(14)). A push
+  # names an event id and nothing else; iOS starts this second process, under
+  # a 24 MB ceiling, and `NotificationService.swift` hands the event, the App
+  # Group's root and the account's keychain items to `keeper_nse_handle` in
+  # `libkeeper_nse.a` (`src-tauri/crates/keeper-nse`), which decides what the
+  # lock screen shows. It opens the app's store only after the app's one-time
+  # move into the App Group has finished there (`keeper_nse::store_of`).
+  # Its entitlements are the app's minus push: the same App Group and keychain
+  # group, and the same data protection, which `keeper-core/tests/
+  # apple_entitlements.rs` holds it to. Its own App ID, `dev.tgorka.keeper.notify`,
+  # needs the paid program; a free Personal Team drops this target
+  # (scripts/install-ios.sh, `KEEPER_IOS_FREE_TEAM`). Regenerate with
+  # `xcodegen generate` after editing, and check project.pbxproj lists
+  # `KeeperNotify.appex` under Embed Foundation Extensions.
+  KeeperNotify:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: KeeperNotify
+    info:
+      path: KeeperNotify/Info.plist
+      properties:
+        CFBundleDisplayName: keeper
+        CFBundleShortVersionString: 0.1.0
+        CFBundleVersion: "0.1.0"
+        # The keychain group with this build's team prefix, which only the
+        # build knows; the extension reads its keychain items under it.
+        KeeperKeychainGroup: $(AppIdentifierPrefix)dev.tgorka.keeper
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.usernotifications.service
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).NotificationService
+    entitlements:
+      path: KeeperNotify/KeeperNotify.entitlements
+      properties:
+        com.apple.developer.default-data-protection: NSFileProtectionCompleteUntilFirstUserAuthentication
+        com.apple.security.application-groups: [group.dev.tgorka.keeper]
+        keychain-access-groups: [$(AppIdentifierPrefix)dev.tgorka.keeper]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.tgorka.keeper.notify
+        # The team, as for KeeperIsland: install-ios.sh stamps it into the
+        # remote copy.
+        DEVELOPMENT_TEAM: $(APPLE_DEVELOPMENT_TEAM)
+        CODE_SIGN_STYLE: Automatic
+        ARCHS: [arm64]
+        EXCLUDED_ARCHS[sdk=iphoneos*]: x86_64
+        SKIP_INSTALL: true
+        SWIFT_OBJC_BRIDGING_HEADER: KeeperNotify/keeper_nse.h
+        LIBRARY_SEARCH_PATHS[arch=arm64]: $(inherited) $(PROJECT_DIR)/Externals/arm64/$(CONFIGURATION)
+    dependencies:
+      - framework: libkeeper_nse.a
+        embed: false
+      - sdk: UserNotifications.framework
+      - sdk: Security.framework
+      - sdk: SystemConfiguration.framework
+      - sdk: CoreFoundation.framework
+    preBuildScripts:
+      # The Rust half: `keeper-nse` as a static library for the platform being
+      # built, copied where LIBRARY_SEARCH_PATHS looks. It depends on
+      # keeper-core only (`bun run check:nse-lean`).
+      - script: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cd "$SRCROOT/../../../.."
+          case "$PLATFORM_NAME" in
+            iphonesimulator) triple=aarch64-apple-ios-sim ;;
+            *) triple=aarch64-apple-ios ;;
+          esac
+          profile=debug
+          flag=""
+          if [ "$CONFIGURATION" = release ]; then profile=release; flag=--release; fi
+          cargo build --manifest-path Cargo.toml -p keeper-nse --lib --target "$triple" $flag
+          mkdir -p "$SRCROOT/Externals/arm64/$CONFIGURATION"
+          cp "${CARGO_TARGET_DIR:-$PWD/target}/$triple/$profile/libkeeper_nse.a" "$SRCROOT/Externals/arm64/$CONFIGURATION/libkeeper_nse.a"
+        name: Build keeper-nse
+        basedOnDependencyAnalysis: false
+        outputFiles:
+          - $(SRCROOT)/Externals/arm64/${CONFIGURATION}/libkeeper_nse.a

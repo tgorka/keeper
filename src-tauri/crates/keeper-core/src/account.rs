@@ -5616,6 +5616,18 @@ async fn admit_proxy_room(
     Ok((admitted.kind, admitted.agent.to_owned()))
 }
 
+/// The agent `room` admits as its own user's proxy, when it is one of their
+/// proxy conversations by what this client alone can read
+/// ([`proxy::admits`], R72) — a device with no agents zone, as the
+/// notification extension is. A push shows an answer there only from this
+/// agent (98.1 #1, R336).
+pub async fn proxy_answer_agent(room: &Room) -> Option<matrix_sdk::ruma::OwnedUserId> {
+    admit_proxy_room(room, &AgentKinds::default(), &AgentProxies::default())
+        .await
+        .ok()
+        .map(|(_, agent)| agent)
+}
+
 /// Send what the voice turn heard into `room`, its own user's proxy
 /// conversation, as their message (AD-384) — through the single dispatch
 /// gate with [`SendTrigger::SpokenToAgent`], legal only there (ruling R31,

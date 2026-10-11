@@ -23,7 +23,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use keeper_core::agents::events::{
-    self, RunState, StatusContent, TurnRef, CONTENT_VERSION, FINAL_CUT_BYTES, STATUS, TURN,
+    self, RunState, StatusContent, TurnRef, CONTENT_VERSION, FINAL_CUT_BYTES, PLACEHOLDER, STATUS,
+    TURN,
 };
 use keeper_core::agents::matrix::{AgentClient, AgentMatrixError};
 use keeper_core::agents::redact::redact_secrets;
@@ -41,9 +42,6 @@ use crate::sinks::{RoomGate, NARROWED_STATUS};
 
 /// No two edits of one anchor are closer than this (R18, NFR-113).
 pub const MIN_EDIT_GAP: Duration = Duration::from_millis(400);
-
-/// What an anchor says before the first edit.
-pub const PLACEHOLDER: &str = "…";
 
 /// How long one send may take before it counts as failed.
 const SEND_TIMEOUT: Duration = Duration::from_secs(10);

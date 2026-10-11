@@ -156,8 +156,9 @@ Developer Program membership are real but livable for a personal build:
   What is lost: the pin (iOS already defaults a third-party app's container files to
   that same protection class), and everything push needs — without the App Group keeper
   keeps its data in the app's own container (see
-  [Where keeper keeps its data](#where-keeper-keeps-its-data)). A paid team keeps them
-  all. Note that an `XCODE_XCCONFIG_FILE` override does **not** work here — target-level
+  [Where keeper keeps its data](#where-keeper-keeps-its-data)), and the notification
+  extension, which the same switch removes. A paid team keeps them all. Note that an
+  `XCODE_XCCONFIG_FILE` override does **not** work here — target-level
   build settings beat a project-level xcconfig.
 
 ### Set your team, without committing any secret
@@ -582,6 +583,46 @@ outside the data directory (every desktop folder) is stored as it was.
 Secrets stay in the keychain, never in either container. The keychain group is the
 app's own application identifier, so the items written before the entitlement existed
 are already in it, and the extension reads them by naming the same group.
+
+### The notification extension
+
+`KeeperNotify` (`gen/apple/KeeperNotify/`, bundle id `dev.tgorka.keeper.notify`; Epic 98,
+story 98.1) is the second process iOS starts when a push arrives. A push names one room
+and one event and nothing else; the extension's Swift reads the account's session and
+store passphrase from the shared keychain group and hands them, with the App Group's
+root, to `keeper_nse_handle` in `libkeeper_nse.a` (`src-tauri/crates/keeper-nse`, which
+depends on `keeper-core` alone — `bun run check:nse-lean`). Rust decides what the lock
+screen shows (`keeper_core::agents::push::classify_notification`): an agent's approval
+request in keeper's own words, an answer of your own agent, or nothing.
+
+- **Its buttons are the card's.** An approval offers *Approve once* and *Deny* only when
+  you could press them on its card: the record is bound, you are one of its approvers,
+  and at T4 you are the one who asked — and *Approve once* only when the whole request
+  fits in the notification and is below T4. Otherwise it offers *Deny* alone, or nothing
+  and opens the card, which says why.
+- **No title says what its sender typed into it.** A summary or a display name holding a
+  line break or a direction override is replaced by keeper's words or the sender's user
+  id.
+- **Only your proxy answers.** An answer is shown only from the agent keeper admits as
+  your proxy in that conversation, not from another agent in it.
+- **It opens nothing before the move.** It reads the group's data directory only once
+  `.keeper-moved` is there (`keeper_nse::store_of`), and creates nothing in it; until
+  then — a free team's build, or a move not yet finished — and on any failure, the
+  notification stays as the gateway sent it.
+- **One account, one room.** The push's payload names keeper's account id
+  (`keeper_account`); the extension opens that account's store alone, loads only the
+  room the push names, and takes its own cross-process lock holder (`nse`) beside the
+  app's. It reads one notification at a time, so several arriving together never open
+  several stores at once under the extension's memory ceiling.
+- **It never refreshes a token.** An OAuth refresh token is used once, and a refresh in
+  the extension would strand the app's; an expired token shows the gateway's
+  notification instead.
+- **A free Personal Team builds without it.** Its App ID and App Group need the paid
+  program, so `KEEPER_IOS_FREE_TEAM=1` removes the target from the remote copy of
+  `project.yml` with the entitlements.
+
+Its memory under the 24 MB ceiling and its decryption on the phone are measured on the
+device after enrolment (98.1 #12), not here.
 
 **Proved on Linux:** the move (`keeper-core/src/container.rs`, its tests) and the folder
 rewrite (`keeper-sync/src/db.rs`, `a_folder_under_the_data_directory_follows_it_…`,

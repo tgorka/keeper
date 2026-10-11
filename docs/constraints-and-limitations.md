@@ -367,3 +367,14 @@ safe binding. Current inventory:
   load only by path from `<data_dir>/models/` after the turn group's completion marker; the
   runtime's model download (`fetch-models`) is not compiled in, and its call is a forbidden
   token in `keeper-core/tests/voice_on_device.rs`.
+- The notification extension's C ABI, iOS (Epic 98, story 98.1, R24(14); the one
+  exception outside the shell crate, ruling of rung `agents-98-nse`): the extension's
+  Swift (`gen/apple/KeeperNotify/NotificationService.swift`) calls Rust, so
+  `crates/keeper-nse/src/lib.rs` exports two `#[no_mangle] pub unsafe extern "C"` fns,
+  each function-level `#[allow(unsafe_code)]` with a `// SAFETY:` comment —
+  `keeper_nse_handle` (reads the NUL-terminated request with `CStr::from_ptr`; the
+  buffer is Swift's `withCString` and lives for the call) and `keeper_nse_free`
+  (`CString::from_raw` of the answer `keeper_nse_handle` returned, released once by
+  Swift). Both stop a panic with `catch_unwind` before it reaches the C ABI (a panic
+  is the generic notification). Everything between is safe Rust taking and returning
+  JSON (`keeper_nse::handle_json`), tested on Linux; `keeper-core` stays without `unsafe`.
