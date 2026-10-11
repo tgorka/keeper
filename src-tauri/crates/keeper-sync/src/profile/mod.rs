@@ -1172,7 +1172,9 @@ pub struct SyncProfile {
     pub id: String,
     /// Human label, shown in the tray and used in commit subjects.
     pub name: String,
-    /// Absolute path to the synced folder.
+    /// Absolute path to the synced folder. A folder under the data directory
+    /// (a phone's) is *stored* relative to it and read back absolute
+    /// (`db::upsert_profile`, Epic 98), so it follows the directory if it moves.
     pub local_path: PathBuf,
     /// Remote repository URL (https, ssh or a local path).
     pub remote_url: String,

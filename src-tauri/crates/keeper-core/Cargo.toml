@@ -122,3 +122,6 @@ rsa = "0.9"
 # The region difference hash's bounds are proved over real screenshots of
 # the Mac (PNG fixtures, 96.4 #5); the hash itself takes grey bytes.
 image = { workspace = true }
+# The container move's tests (Epic 98) move real directories; already in the
+# graph through keeper-sync.
+tempfile = { workspace = true }

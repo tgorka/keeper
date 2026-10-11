@@ -24,7 +24,10 @@ oversight and not a purchase — recorded here because the deferral is load-bear
   infrastructure would break that invariant.
 - **Cheap-now mitigations already paid for:** the single `Platform::data_dir()` root keeps all
   account state under one path, so a future App Group container move (NSE era) is a path change,
-  not a data migration. (AD-29; FR-65) Plan B (UniFFI + native SwiftUI shell) stays shelved with
+  not a data migration. (AD-29; FR-65) *Corrected by Epic 98 (story 98.1):* it is a data
+  migration — the bytes move once, and a phone folder's absolute path was stored in `sync.db`
+  (Epic 66) — so the move is journaled (`keeper_core::container`) and phone folders are stored
+  relative to the data directory; `docs/ios.md`, *Where keeper keeps its data*. Plan B (UniFFI + native SwiftUI shell) stays shelved with
   its revisit triggers recorded — the blank-webview bug class proving unfixable across Tauri
   releases, or NSE work beginning. (PRD §13.8)
 - **Status / owner:** deferred. Revisit is owned by the PM/owner, when push demand is real.

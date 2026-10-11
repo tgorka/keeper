@@ -58,7 +58,146 @@ pub fn open(data_dir: &Path) -> Result<Connection> {
     // answers `SQLITE_BUSY_SNAPSHOT` without consulting the handler, so a write
     // here can be delayed but never hangs.
     migrate(&conn)?;
+    remember_folder_base(&conn, data_dir)?;
+    store_folder_paths_relative(&conn, data_dir)?;
     Ok(conn)
+}
+
+/// Store every folder this data directory holds relative to it, in the
+/// `sync.db` at `data_dir`, without creating one that is not there.
+///
+/// [`open`] does this to every row it finds, so this is only for the one
+/// caller that must have it done *before* the directory moves (Epic 98, Q8):
+/// the iPhone, moving its data into the App Group container, rewrites the rows
+/// while they still name the old directory, so after the move they name the
+/// new one. A missing database has no rows and is not created.
+pub fn store_folder_paths_relative_at(data_dir: &Path) -> Result<()> {
+    if db_path(data_dir).is_file() {
+        open(data_dir)?;
+    }
+    Ok(())
+}
+
+/// Remember, for this connection only, the directory [`open`] was given — the
+/// base a folder stored relative to it is read back against.
+///
+/// A `TEMP` table because it is a fact about this connection, not about the
+/// file: the file is shared by two processes and may be opened from a new
+/// directory after a move, and a base written into it would be the old one.
+/// The path is kept exactly as given (not SQLite's resolved file name, which
+/// follows symlinks — `/var` is one on iOS), so a folder read back is the same
+/// string every other path built from the data directory is.
+fn remember_folder_base(conn: &Connection, data_dir: &Path) -> Result<()> {
+    let Some(dir) = data_dir.to_str() else {
+        return Ok(());
+    };
+    conn.execute_batch(
+        "CREATE TEMP TABLE IF NOT EXISTS folder_base (dir TEXT NOT NULL);
+         DELETE FROM temp.folder_base;",
+    )?;
+    conn.execute("INSERT INTO temp.folder_base (dir) VALUES (?1)", [dir])?;
+    Ok(())
+}
+
+/// The directory this connection's folders are relative to, when [`open`]
+/// knew one. An in-memory database has none, and its folders stay as written.
+fn folder_base(conn: &Connection) -> Option<PathBuf> {
+    conn.query_row("SELECT dir FROM temp.folder_base", [], |row| {
+        row.get::<_, String>(0)
+    })
+    .ok()
+    .map(PathBuf::from)
+}
+
+/// The form a folder is stored in: relative to `base` when it lies under it
+/// (a phone's folder, `<data dir>/sync/<id>`), `None` — store it as it is —
+/// otherwise. A desktop folder a person chose is never under the data
+/// directory, so its row is unchanged.
+///
+/// Why (Epic 98, Q8(b)): an iPhone's data directory is not one fixed path. It
+/// moves once into the App Group container, and the app container's own path
+/// is not promised to survive an update. A phone folder stored absolute would
+/// point, after either, at a directory that is no longer there.
+fn relative_folder(local_path: &Path, base: Option<&Path>) -> Option<PathBuf> {
+    let relative = local_path.strip_prefix(base?).ok()?;
+    (!relative.as_os_str().is_empty()).then(|| relative.to_path_buf())
+}
+
+/// A stored profile with its folder made absolute again against `base`.
+fn with_absolute_folder(mut profile: SyncProfile, base: Option<&Path>) -> SyncProfile {
+    if let Some(base) = base.filter(|_| profile.local_path.is_relative()) {
+        profile.local_path = base.join(&profile.local_path);
+    }
+    profile
+}
+
+/// Rewrite every row whose folder is an absolute path under `data_dir` to the
+/// relative form [`upsert_profile`] writes — the rows an older keeper wrote.
+/// A phone row an older keeper wrote under a *previous* app container (see
+/// [`previous_container_phone_folder`]) is rewritten the same way. `json_set`,
+/// like [`ensure_prune_default`], so every other key survives byte for byte.
+/// Idempotent: a relative path is not under anything.
+fn store_folder_paths_relative(conn: &Connection, data_dir: &Path) -> Result<usize> {
+    let rows = {
+        let mut stmt = conn.prepare(
+            "SELECT id, json_extract(json, '$.localPath') FROM profiles
+              WHERE json_valid(json) AND json_type(json, '$.localPath') = 'text'",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    let mut rewritten = 0;
+    for (id, path) in rows {
+        let path = Path::new(&path);
+        let Some(relative) = relative_folder(path, Some(data_dir))
+            .or_else(|| previous_container_phone_folder(path, &id, data_dir))
+        else {
+            continue;
+        };
+        let Some(relative) = relative.to_str() else {
+            continue;
+        };
+        rewritten += conn.execute(
+            "UPDATE profiles SET json = json_set(json, '$.localPath', ?2) WHERE id = ?1",
+            (&id, relative),
+        )?;
+    }
+    if rewritten > 0 {
+        tracing::info!(
+            profiles = rewritten,
+            "folders under the data directory are now stored relative to it"
+        );
+    }
+    Ok(rewritten)
+}
+
+/// The subfolder of the data directory a phone's folders live under — the
+/// shell's `PHONE_FOLDERS_DIR` (`sync_ipc.rs`), which composes
+/// `<data dir>/sync/<profile id>`.
+const PHONE_FOLDERS_DIR: &str = "sync";
+
+/// `sync/<id>` for a phone folder an older keeper stored absolute under a data
+/// directory that is no longer this one: `<…>/<data dir's name>/sync/<id>`,
+/// where `<id>` is the row's own. iOS gives the app container a new path
+/// across a reinstall or an update (`…/Application/<UUID>/…`), so such a row
+/// does not lie under today's directory, yet the folder's bytes moved with
+/// the rest of it. `None` for anything else — a desktop folder a person chose
+/// is not named after its own profile id under a `sync` folder of a directory
+/// named like keeper's data directory.
+fn previous_container_phone_folder(
+    local_path: &Path,
+    id: &str,
+    data_dir: &Path,
+) -> Option<PathBuf> {
+    let mut tail = local_path.components().rev();
+    let (Some(leaf), Some(folders), Some(dir)) = (tail.next(), tail.next(), tail.next()) else {
+        return None;
+    };
+    (local_path.is_absolute()
+        && leaf.as_os_str() == id
+        && folders.as_os_str() == PHONE_FOLDERS_DIR
+        && Some(dir.as_os_str()) == data_dir.file_name())
+    .then(|| Path::new(PHONE_FOLDERS_DIR).join(id))
 }
 
 /// An in-memory database, for tests.
@@ -1716,9 +1855,15 @@ pub fn clear_file_state(conn: &Connection, profile_id: &str) -> Result<usize> {
 /// later would reveal a copy of it rather than the value the user chose. That
 /// is the `config.json` failure AD-98 exists to end, and this is the one write
 /// funnel it can be prevented at.
+///
+/// It is also where a folder under the data directory becomes relative to it
+/// ([`relative_folder`], Epic 98) — after validation, which wants it absolute.
 pub fn upsert_profile(conn: &Connection, profile: &SyncProfile, now_ms: i64) -> Result<()> {
     profile.validate()?;
-    let profile = profile::as_stored(profile, stored_profile(conn, &profile.id)?.as_ref());
+    let mut profile = profile::as_stored(profile, stored_profile(conn, &profile.id)?.as_ref());
+    if let Some(relative) = relative_folder(&profile.local_path, folder_base(conn).as_deref()) {
+        profile.local_path = relative;
+    }
     let json = serde_json::to_string(&profile)
         .map_err(|e| SyncError::Config(format!("profile is not serializable: {e}")))?;
     conn.execute(
@@ -1738,13 +1883,17 @@ pub fn upsert_profile(conn: &Connection, profile: &SyncProfile, now_ms: i64) -> 
 /// verdict turns on "absent" versus "unreadable" must ask, and must not read
 /// this function's silence as "no such folder".
 pub fn list_profiles(conn: &Connection) -> Result<Vec<SyncProfile>> {
+    let base = folder_base(conn);
     let mut stmt = conn.prepare("SELECT json FROM profiles ORDER BY id")?;
     let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
     let mut out = Vec::new();
     for row in rows {
         let json = row?;
         match serde_json::from_str::<SyncProfile>(&json) {
-            Ok(profile) => out.push(profile::in_force(profile)),
+            Ok(profile) => out.push(profile::in_force(with_absolute_folder(
+                profile,
+                base.as_deref(),
+            ))),
             // A profile written by a newer keeper must not brick an older one.
             // Skip it loudly rather than failing the whole listing.
             Err(err) => tracing::warn!(error = %err, "skipping unreadable sync profile row"),
@@ -1801,7 +1950,7 @@ fn stored_profile(conn: &Connection, id: &str) -> Result<Option<SyncProfile>> {
         .optional()?;
     match json {
         Some(json) => serde_json::from_str(&json)
-            .map(Some)
+            .map(|profile| Some(with_absolute_folder(profile, folder_base(conn).as_deref())))
             .map_err(|e| SyncError::Config(format!("stored profile is unreadable: {e}"))),
         None => Ok(None),
     }
@@ -4878,6 +5027,138 @@ mod tests {
 
     fn profile(id: &str) -> SyncProfile {
         SyncProfile::new(id, "n", "/tmp/x", "https://git.example/r.git")
+    }
+
+    /// Epic 98, Q8(b): a phone's folder lives under the data directory, and the
+    /// data directory moves (into the App Group container, once). The folder
+    /// read back after the move is under the new directory; a folder outside
+    /// the data directory — every desktop folder — is read back exactly as it
+    /// was written.
+    #[test]
+    fn a_folder_under_the_data_directory_follows_it_when_the_directory_moves() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let old = root.path().join("container/dev.tgorka.keeper");
+        let new = root.path().join("group/dev.tgorka.keeper");
+        let elsewhere = root.path().join("Documents/drive");
+        {
+            let c = open(&old).expect("open at the old directory");
+            let mut phone = profile("phone");
+            phone.local_path = old.join("sync/phone");
+            upsert_profile(&c, &phone, 1).expect("phone folder");
+            let mut desk = profile("desk");
+            desk.local_path = elsewhere.clone();
+            upsert_profile(&c, &desk, 1).expect("desktop folder");
+            assert_eq!(
+                get_profile(&c, "phone")
+                    .expect("read")
+                    .map(|p| p.local_path),
+                Some(old.join("sync/phone"))
+            );
+        }
+        std::fs::create_dir_all(new.parent().expect("parent")).expect("group");
+        std::fs::rename(&old, &new).expect("move the directory");
+        let c = open(&new).expect("open at the new directory");
+        let folders: Vec<_> = list_profiles(&c)
+            .expect("list")
+            .into_iter()
+            .map(|p| (p.id, p.local_path))
+            .collect();
+        assert_eq!(
+            folders,
+            vec![
+                ("desk".to_owned(), elsewhere),
+                ("phone".to_owned(), new.join("sync/phone")),
+            ]
+        );
+        assert_eq!(
+            get_profile(&c, "phone")
+                .expect("read")
+                .map(|p| p.local_path),
+            Some(new.join("sync/phone"))
+        );
+    }
+
+    /// The rows an older keeper wrote hold the folder absolute. The iPhone
+    /// rewrites them where they are before it moves the directory, so the move
+    /// carries them along; without the rewrite they would name the old one.
+    #[test]
+    fn an_older_absolute_folder_is_made_relative_before_the_directory_moves() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let old = root.path().join("container/dev.tgorka.keeper");
+        let new = root.path().join("group/dev.tgorka.keeper");
+        {
+            let c = open(&old).expect("open");
+            upsert_profile(&c, &profile("phone"), 1).expect("profile");
+            // What a keeper before Epic 98 stored: the absolute path.
+            c.execute(
+                "UPDATE profiles SET json = json_set(json, '$.localPath', ?1)",
+                [old.join("sync/phone").to_str().expect("utf-8")],
+            )
+            .expect("an older row");
+        }
+        store_folder_paths_relative_at(&old).expect("rewrite before the move");
+        std::fs::create_dir_all(new.parent().expect("parent")).expect("group");
+        std::fs::rename(&old, &new).expect("move the directory");
+        let c = open(&new).expect("open at the new directory");
+        assert_eq!(
+            get_profile(&c, "phone")
+                .expect("read")
+                .map(|p| p.local_path),
+            Some(new.join("sync/phone"))
+        );
+        // Nothing to rewrite is nothing created.
+        let empty = root.path().join("never-opened");
+        store_folder_paths_relative_at(&empty).expect("no database");
+        assert!(!db_path(&empty).exists());
+    }
+
+    /// A phone row an older keeper stored under a previous app container's
+    /// path (iOS gives the container a new UUID across a reinstall or update)
+    /// does not lie under today's directory, but its folder moved with the
+    /// rest: the one-time rewrite recognises `<data dir>/sync/<its id>` there
+    /// too. A folder of that shape that is not named after its own profile, or
+    /// not under a directory named like the data directory, is kept as it was.
+    #[test]
+    fn a_phone_folder_under_a_previous_app_container_is_made_relative() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let support = "Library/Application Support/dev.tgorka.keeper";
+        let stale = root.path().join("Application/0A1B-OLD-UUID").join(support);
+        let today = root.path().join("Application/9F8E-NEW-UUID").join(support);
+        let elsewhere = root.path().join("Documents/sync/desk");
+        let other_id = stale.join("sync/someone-else");
+        {
+            let c = open(&today).expect("open");
+            for id in ["phone", "desk", "other"] {
+                upsert_profile(&c, &profile(id), 1).expect("profile");
+            }
+            // What a keeper before Epic 98 stored, in an earlier container.
+            for (id, path) in [
+                ("phone", stale.join("sync/phone")),
+                ("desk", elsewhere.clone()),
+                ("other", other_id.clone()),
+            ] {
+                c.execute(
+                    "UPDATE profiles SET json = json_set(json, '$.localPath', ?2) WHERE id = ?1",
+                    (id, path.to_str().expect("utf-8")),
+                )
+                .expect("an older row");
+            }
+        }
+        store_folder_paths_relative_at(&today).expect("rewrite");
+        let c = open(&today).expect("reopen");
+        let folders: Vec<_> = list_profiles(&c)
+            .expect("list")
+            .into_iter()
+            .map(|p| (p.id, p.local_path))
+            .collect();
+        assert_eq!(
+            folders,
+            vec![
+                ("desk".to_owned(), elsewhere),
+                ("other".to_owned(), other_id),
+                ("phone".to_owned(), today.join("sync/phone")),
+            ]
+        );
     }
 
     #[test]

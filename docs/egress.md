@@ -402,8 +402,9 @@ read back by the `voice_events` command in `src-tauri/crates/keeper/src/voice_lo
 shown under Settings → Bots on the phone with the sentence "Kept in memory only — nothing is
 written or sent", `src/components/settings/bots-section.tsx:188-189`), and the Live Activity
 is started, updated and ended from the app process with `pushType: nil`
-(`src-tauri/crates/keeper/gen/apple/Sources/keeper/KeeperIsland.swift:76`) — no APNs, no push
-entitlement, no App Group, no token — so nothing about what the phone heard leaves the device
+(`src-tauri/crates/keeper/gen/apple/Sources/keeper/KeeperIsland.swift:76`) — no APNs push
+for the activity and no push token for it; the app's push entitlement and App Group (Epic 98)
+are for the approval notifications, never the island — so nothing about what the phone heard leaves the device
 (Apple, `Activity.request(attributes:content:pushType:)`,
 `https://developer.apple.com/documentation/activitykit/activity`, and *Displaying live data
 with Live Activities*, both read 2026-09-05; Epic 65, AD-194, AD-196). The `voice_on_device`

@@ -464,7 +464,7 @@ impl AppState {
         #[cfg(desktop)]
         let platform: Arc<dyn Platform> = Arc::new(DesktopPlatform);
         #[cfg(target_os = "ios")]
-        let platform: Arc<dyn Platform> = Arc::new(IosPlatform);
+        let platform: Arc<dyn Platform> = Arc::new(IosPlatform::resolve());
         // Story 12.2's compile seam supports desktop and iOS only. A non-iOS mobile
         // target (e.g. Android) is `mobile` — so `run()` still reaches this via the
         // `#[cfg_attr(mobile, ...)]` entry point — but binds no `platform` above.
@@ -804,15 +804,116 @@ impl Platform for DesktopPlatform {
 
 /// Concrete [`Platform`] implementation for the iOS shell (Story 12.2).
 ///
-/// The Apple-shared ports (data dir via `dirs`, keychain via `keyring`'s
-/// `apple-native` backend, browser-open via the opener plugin, notifications via
-/// the notification plugin) mirror the desktop bodies. The desktop-only ports are
-/// honest about their absence: `sidecar_path` returns [`CoreError::Unsupported`]
-/// (no child processes / sidecars on iOS — ever), and `set_badge_count` is a
-/// no-op (the desktop dock badge does not exist; an iOS app badge arrives with
-/// the push/notification work in a later story, never here).
+/// The Apple-shared ports (keychain via the Security framework, browser-open
+/// via the opener plugin, notifications via the notification plugin) mirror the
+/// desktop bodies. The data directory is decided once, at start
+/// ([`IosPlatform::resolve`]): the App Group container's when the build has
+/// one, the app's own container's otherwise. The desktop-only ports are honest
+/// about their absence: `sidecar_path` returns [`CoreError::Unsupported`]
+/// (no child processes / sidecars on iOS — ever), and `set_badge_count` goes
+/// through `UNUserNotificationCenter` rather than a dock.
 #[cfg(target_os = "ios")]
-pub struct IosPlatform;
+pub struct IosPlatform {
+    /// `None` only when iOS answered no data directory at all.
+    data_dir: Option<PathBuf>,
+}
+
+/// The App Group the app and its notification extension share (Epic 98,
+/// story 98.1; `group.dev.tgorka.keeper` in `gen/apple/project.yml`, pinned
+/// for every target by `keeper-core/tests/apple_entitlements.rs`).
+#[cfg(target_os = "ios")]
+const APP_GROUP: &str = "group.dev.tgorka.keeper";
+
+/// The one folder every account, store and phone folder lives under, in
+/// whichever container holds it.
+#[cfg(target_os = "ios")]
+const DATA_DIR_NAME: &str = "dev.tgorka.keeper";
+
+#[cfg(target_os = "ios")]
+impl IosPlatform {
+    /// Decide the data directory, moving it into the App Group container the
+    /// first time there is one (Epic 98, story 98.1 #6; the plan's Q3).
+    ///
+    /// Runs in [`AppState::new`] before anything opens a store, which is the
+    /// whole of what makes the move safe: nothing holds a file in either
+    /// directory while it moves. Three outcomes:
+    /// - **No group container** — a free Personal Team strips every
+    ///   entitlement (`scripts/install-ios.sh`, `KEEPER_IOS_FREE_TEAM`), so iOS
+    ///   answers nil: the app's own `Library/Application Support/
+    ///   dev.tgorka.keeper`, exactly as before.
+    /// - **The move finished** (now, earlier, or there was nothing to move) —
+    ///   the group container's `Library/Application Support/dev.tgorka.keeper`,
+    ///   even when only its done marker could not be written (the next start
+    ///   writes it).
+    /// - **The move refused or failed** — the app's own directory, kept whole
+    ///   by `keeper_core::container` (a put-back that itself failed says it is
+    ///   not), and the refusal's sentence in the log. The next start tries
+    ///   again, except after a clash — a name on both sides — which the
+    ///   refusal says will not resolve itself (DW-1241).
+    ///
+    /// Before the move, the phone folders in `sync.db` are rewritten relative
+    /// to the old directory (`keeper_sync::db::store_folder_paths_relative_at`,
+    /// Q8(b)), so after it they resolve under the new one. If that rewrite
+    /// fails the move does not happen: a folder still stored absolute would
+    /// point into the emptied old directory.
+    pub fn resolve() -> Self {
+        let Some(own) = dirs::data_dir().map(|base| base.join(DATA_DIR_NAME)) else {
+            tracing::error!("iOS answered no data directory");
+            return Self { data_dir: None };
+        };
+        let Some(group) = app_group_container() else {
+            tracing::info!(
+                group = APP_GROUP,
+                "no App Group container (this build carries no App Group entitlement); \
+                 keeper keeps its data in the app's own container"
+            );
+            return Self {
+                data_dir: Some(own),
+            };
+        };
+        let shared = group
+            .join("Library")
+            .join("Application Support")
+            .join(DATA_DIR_NAME);
+        if let Err(err) = keeper_sync::db::store_folder_paths_relative_at(&own) {
+            tracing::error!(
+                %err,
+                path = %own.display(),
+                "keeper did not move its data into the App Group container because it could \
+                 not first store the phone's folders relative to it; it keeps using its own \
+                 container"
+            );
+            return Self {
+                data_dir: Some(own),
+            };
+        }
+        let data_dir = match keeper_core::container::move_into_group_container(&own, &shared) {
+            Ok(moved) => {
+                tracing::info!(?moved, path = %shared.display(), "data directory: the App Group container");
+                shared
+            }
+            Err(refusal) => {
+                tracing::error!(%refusal, "data directory: the app's own container");
+                own
+            }
+        };
+        Self {
+            data_dir: Some(data_dir),
+        }
+    }
+}
+
+/// The App Group container's root, or `None` when this build's signature
+/// carries no App Group entitlement — iOS answers nil then, never a path the
+/// sandbox would refuse.
+#[cfg(target_os = "ios")]
+fn app_group_container() -> Option<PathBuf> {
+    use objc2_foundation::{NSFileManager, NSString};
+
+    let url = NSFileManager::defaultManager()
+        .containerURLForSecurityApplicationGroupIdentifier(&NSString::from_str(APP_GROUP))?;
+    Some(PathBuf::from(url.path()?.to_string()))
+}
 
 /// `errSecItemNotFound` (`-25300`) — the Security Framework status returned when no
 /// keychain item matches. `security_framework` does not re-export it, and although
@@ -825,19 +926,14 @@ const ERR_SEC_ITEM_NOT_FOUND: i32 = -25300;
 
 #[cfg(target_os = "ios")]
 impl Platform for IosPlatform {
-    /// The single app-container root for all account state on iOS.
-    ///
-    /// Inside the iOS sandbox `dirs::data_dir()` resolves to the app container's
-    /// `Library/Application Support`, so this returns
-    /// `{container}/Library/Application Support/dev.tgorka.keeper` — the one root under
-    /// which `accounts/<ulid>/sdk`, `keeper.db`, and `archive.db` all live (Story 12.3).
-    /// A future App Group move relocates this single path; it is a path change, not a
-    /// data migration (`NSFileProtection*` / `isExcludedFromBackup` are Epic 14 / 14.7).
+    /// The single root for all account state on iOS, decided once by
+    /// [`IosPlatform::resolve`]: `accounts/<ulid>/sdk`, `keeper.db`,
+    /// `archive.db`, `sync.db` and the phone's folders under `sync/` all live
+    /// here (Story 12.3; Epic 98 for the App Group container).
     fn data_dir(&self) -> Result<PathBuf, CoreError> {
-        let base = dirs::data_dir().ok_or_else(|| {
-            PlatformError::DirUnavailable("no OS data directory available".to_owned())
-        })?;
-        Ok(base.join("dev.tgorka.keeper"))
+        self.data_dir.clone().ok_or_else(|| {
+            PlatformError::DirUnavailable("no OS data directory available".to_owned()).into()
+        })
     }
 
     fn keychain_set(&self, key: &str, value: &str) -> Result<(), CoreError> {
@@ -850,6 +946,14 @@ impl Platform for IosPlatform {
         // access control (flags = 0, no biometry/passcode/user-presence): readable
         // headless by the resumed sync loop, never iCloud-synced, invisible to other
         // apps (Story 12.3, AD-29).
+        //
+        // No `kSecAttrAccessGroup` (Epic 98): the item lands in the first entry of
+        // `keychain-access-groups`, `$(AppIdentifierPrefix)dev.tgorka.keeper` — the
+        // app's own application identifier, which is where every item written before
+        // that entitlement already lives — and the notification extension names the
+        // same group to read it. A free Personal Team strips the entitlement and the
+        // default is that same identifier, so naming the group here would only make
+        // those installs fail with `errSecMissingEntitlement`.
         let access_control = SecAccessControl::create_with_protection(
             Some(ProtectionMode::AccessibleAfterFirstUnlockThisDeviceOnly),
             0,

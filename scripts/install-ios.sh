@@ -18,8 +18,9 @@
 #      wake phrase, no way to change it. lib/bundle-guard.sh refuses that
 #      bundle before it reaches the phone, and this script runs it.
 #   2. The free Personal Team entitlement wall. The generated project pins
-#      `com.apple.developer.default-data-protection`, and Apple does not grant
-#      that capability to a Personal Team, so signing fails until the
+#      `com.apple.developer.default-data-protection` and (Epic 98) names an App
+#      Group, a keychain group and `aps-environment`; Apple grants none of
+#      those capabilities to a Personal Team, so signing fails until the
 #      `entitlements:` block is removed from the generated project.yml and the
 #      project regenerated. That is a stated decision here (`KEEPER_IOS_FREE_TEAM`),
 #      applied to the remote copy only and verified after the fact.
@@ -35,9 +36,10 @@
 #                               (docs/ios.md). Unset: the script reads it off
 #                               the Apple Development certificate and prints
 #                               the line to export, rather than guessing.
-#   KEEPER_IOS_FREE_TEAM=1      the team is a free Personal Team: drop the
-#                               data-protection entitlement from the REMOTE
-#                               copy of gen/apple/project.yml and regenerate.
+#   KEEPER_IOS_FREE_TEAM=1      the team is a free Personal Team: drop every
+#                               entitlement (data protection, App Group,
+#                               keychain group, push) from the REMOTE copy of
+#                               gen/apple/project.yml and regenerate.
 #   KEEPER_IOS_REGISTER_DEVICE=1
 #                               first install from this Mac: register the phone
 #                               with the team before building, so a profile
@@ -272,14 +274,18 @@ remote "cd \$HOME/$REMOTE_DIR && $REMOTE_ENV && bun install --frozen-lockfile --
 # to NSFileProtectionCompleteUntilFirstUserAuthentication, and a free Personal
 # Team's automatic profile cannot carry that capability, so signing fails with
 # `doesn't match the entitlements file's value for the
-# com.apple.developer.default-data-protection entitlement`. Apple cannot be
-# asked which kind of team an id is, so this is a decision the operator
-# states: with `KEEPER_IOS_FREE_TEAM=1` the `entitlements:` block is removed
-# from the REMOTE copy of project.yml and the project regenerated. The
-# committed value stays as it is, on purpose: `crates/keeper/tests/
-# entitlements_protection.rs` pins it, and iOS already defaults a third-party
-# app's container to that same protection class, so a Personal-Team build
-# loses nothing but the pin (docs/ios.md, "Signing on a free Personal Team").
+# com.apple.developer.default-data-protection entitlement`. The same block
+# names the App Group, the keychain group and `aps-environment` (Epic 98),
+# which a Personal Team cannot carry either. Apple cannot be asked which kind
+# of team an id is, so this is a decision the operator states: with
+# `KEEPER_IOS_FREE_TEAM=1` the `entitlements:` block is removed from the
+# REMOTE copy of project.yml and the project regenerated. The committed values
+# stay as they are, on purpose: `crates/keeper-core/tests/apple_entitlements.rs`
+# pins them, iOS already defaults a third-party app's container to that same
+# protection class, and without the App Group iOS answers no group container,
+# so keeper keeps its data in the app's own container (`IosPlatform::resolve`)
+# — a Personal-Team build loses the pin, push and the notification extension's
+# store, nothing it had before (docs/ios.md, "Signing on a free Personal Team").
 #
 # The regeneration is then verified rather than trusted: `xcodegen generate`
 # is what once produced a project without Speech.framework (project.yml
@@ -336,7 +342,7 @@ EOF
 fi
 
 if [ -n "${KEEPER_IOS_FREE_TEAM:-}" ]; then
-  say "free Personal Team: dropping the data-protection entitlement from the remote project.yml"
+  say "free Personal Team: dropping every entitlement (data protection, App Group, keychain group, push) from the remote project.yml"
   remote "cd \$HOME/$REMOTE_DIR/$APPLE_DIR && $REMOTE_ENV && NO_ISLAND='$NO_ISLAND' && $(cat <<'EOF'
 set -euo pipefail
 awk 'skip && /^    [^ ]/ { skip = 0 } /^    entitlements:/ { skip = 1 } !skip' project.yml > project.yml.free
@@ -421,8 +427,8 @@ $REGISTER
 # because it only has to find the project, not merge a platform overlay.
 bun run tauri ios build --export-method debugging
 PAYLOAD" 2>&1 | tee "$BUILD_LOG"; then
-  if grep -q 'com.apple.developer.default-data-protection entitlement' "$BUILD_LOG"; then
-    fail "signing failed on the data-protection entitlement: team $APPLE_DEVELOPMENT_TEAM is a free Personal Team and Apple does not grant it that capability. Re-run with KEEPER_IOS_FREE_TEAM=1, which drops the entitlement from the remote copy of the generated project (the committed value stays)."
+  if grep -qE 'com.apple.developer.default-data-protection entitlement|do not support the .* capability' "$BUILD_LOG"; then
+    fail "signing failed on an entitlement: team $APPLE_DEVELOPMENT_TEAM is a free Personal Team and Apple does not grant it data protection, App Groups, keychain sharing or push. Re-run with KEEPER_IOS_FREE_TEAM=1, which drops every entitlement from the remote copy of the generated project (the committed values stay; keeper then keeps its data in the app's own container)."
   fi
   if grep -q "couldn't find any iOS App Development provisioning profiles" "$BUILD_LOG"; then
     fail "no provisioning profile for $BUNDLE_ID or for the KeeperIsland extension ($BUNDLE_ID.island): this phone is not registered with team $APPLE_DEVELOPMENT_TEAM from this Mac, or the extension's App ID has not been minted yet. Re-run with KEEPER_IOS_REGISTER_DEVICE=1, which mints both profiles before building (the transcript above names which bundle id lacked one)."

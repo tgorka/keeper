@@ -133,9 +133,23 @@ targets:
       # value placed only in the checked-in .entitlements file would be silently reverted.
       # Default data protection MUST stay CompleteUntilFirstUserAuthentication — never
       # NSFileProtectionComplete, which would lock the SQLite WAL after screen lock and
-      # stall a resumed sync loop. Pinned by crates/keeper/tests/entitlements_protection.rs.
+      # stall a resumed sync loop. Every target's block, and its mirror, is pinned by
+      # crates/keeper-core/tests/apple_entitlements.rs (it builds on Linux).
+      #
+      # Push (Epic 98, story 98.1; all three need the paid program — a free Personal
+      # Team's install strips this whole block, scripts/install-ios.sh):
+      # - the App Group is the container the notification extension opens the same
+      #   store in; `IosPlatform::resolve` moves the data directory into it once and
+      #   falls back to the app's own container when iOS answers no group container;
+      # - the keychain group is the app's own application identifier, so the items
+      #   written before it existed are already in it, and the extension names it too;
+      # - `aps-environment` is development; an App Store or ad-hoc export rewrites it
+      #   to production from the distribution profile.
       properties:
         com.apple.developer.default-data-protection: NSFileProtectionCompleteUntilFirstUserAuthentication
+        com.apple.security.application-groups: [group.dev.tgorka.keeper]
+        keychain-access-groups: [$(AppIdentifierPrefix)dev.tgorka.keeper]
+        aps-environment: development
     scheme:
       environmentVariables:
         RUST_BACKTRACE: full

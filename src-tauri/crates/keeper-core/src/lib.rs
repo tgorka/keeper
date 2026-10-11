@@ -20,6 +20,7 @@ pub mod bridge;
 pub mod bridges;
 pub mod capture;
 pub mod config;
+pub mod container;
 pub mod demo;
 pub mod document;
 pub mod drafts;

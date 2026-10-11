@@ -138,21 +138,27 @@ Developer Program membership are real but livable for a personal build:
 - There is **no TestFlight and no App Store** distribution. Sharing a build means
   handing someone an IPA they re-sign themselves (see
   [Sharing a build without Xcode](#sharing-a-build-without-xcode)).
-- The **Data Protection entitlement cannot be granted**. keeper's iOS target pins
+- The **entitlements cannot be granted**. keeper's iOS target pins
   `com.apple.developer.default-data-protection` to
-  `NSFileProtectionCompleteUntilFirstUserAuthentication` (source of truth:
-  `gen/apple/project.yml`, FR-65, guarded by `crates/keeper/tests/entitlements_protection.rs`),
-  and a Personal Team's automatic profile does not carry that capability, so the build
-  fails at signing with `Provisioning profile "iOS Team Provisioning Profile:
+  `NSFileProtectionCompleteUntilFirstUserAuthentication` and (Epic 98) names the App
+  Group `group.dev.tgorka.keeper`, the keychain group
+  `$(AppIdentifierPrefix)dev.tgorka.keeper` and `aps-environment` (source of truth:
+  `gen/apple/project.yml`, FR-65, guarded by
+  `crates/keeper-core/tests/apple_entitlements.rs`, which runs on Linux),
+  and a Personal Team's automatic profile carries none of those capabilities, so the
+  build fails at signing with `Provisioning profile "iOS Team Provisioning Profile:
   dev.tgorka.keeper" doesn't match the entitlements file's value for the
   com.apple.developer.default-data-protection entitlement` (measured 2026-09-03,
   Xcode 26.6, iOS 26.6.1). To sideload on a free team, delete the `entitlements:`
   block from `gen/apple/project.yml` and re-run `xcodegen generate` in that directory —
-  a local edit to a generated file; the committed value stays as it is and its test
-  keeps passing. Nothing is lost in practice: iOS already defaults a third-party app's
-  container files to that same protection class, and the entitlement exists to pin it
-  so it cannot drift. A paid team keeps it. Note that an `XCODE_XCCONFIG_FILE` override
-  does **not** work here — target-level build settings beat a project-level xcconfig.
+  a local edit to a generated file; the committed values stay as they are and their
+  test keeps passing (`bun run install:ios` does this with `KEEPER_IOS_FREE_TEAM=1`).
+  What is lost: the pin (iOS already defaults a third-party app's container files to
+  that same protection class), and everything push needs — without the App Group keeper
+  keeps its data in the app's own container (see
+  [Where keeper keeps its data](#where-keeper-keeps-its-data)). A paid team keeps them
+  all. Note that an `XCODE_XCCONFIG_FILE` override does **not** work here — target-level
+  build settings beat a project-level xcconfig.
 
 ### Set your team, without committing any secret
 
@@ -524,6 +530,65 @@ CI enforces a compile-only gate for iOS (`cargo check --workspace --target
 aarch64-apple-ios` in `.github/workflows/ci.yml`); it does not build, sign, or run a
 device app — signing and on-device install remain a local, human-driven flow as
 documented above.
+
+## Where keeper keeps its data
+
+Everything keeper stores on the phone — every account's matrix-sdk store under
+`accounts/<id>/sdk`, `keeper.db`, `archive.db`, `sync.db` and the phone's folders under
+`sync/<profile id>` — lives under one directory, `dev.tgorka.keeper`, in
+`Library/Application Support` of one of two containers. Which one is decided once, when
+keeper starts and before anything opens a store (`IosPlatform::resolve`,
+`src-tauri/crates/keeper/src/ipc.rs`; Epic 98, story 98.1):
+
+- **The App Group container** (`group.dev.tgorka.keeper`) when the build carries the
+  App Group entitlement — a paid team's build. The notification extension (Epic 98)
+  opens the same store there.
+- **The app's own container** when it does not — a free Personal Team's build, whose
+  entitlements `install:ios` strips. iOS answers no group container, and keeper keeps
+  its data where it always has.
+
+The first start with a group container **moves** the data, once
+(`keeper_core::container::move_into_group_container`). It is a data migration, not a
+path change, so it is journaled:
+
+- Before the first entry moves, a journal (`.keeper-moving`) is written into the
+  destination; each top-level entry then moves by one rename, so it is in one container
+  or the other, never half in each. A start that finds the journal finishes the move.
+- A finished move leaves `.keeper-moved`; every later start moves nothing.
+- A destination that already holds files keeper did not put there (no journal) is
+  refused, and nothing moves or is marked — on a fresh install too.
+- An entry that cannot move puts back the ones that did. keeper keeps using the app's
+  own container for that start, writes the reason to the log, and tries again at the
+  next start.
+- **A name in both containers is a clash, and it does not resolve itself.** keeper
+  cannot tell which copy is right, so it moves nothing, puts back what an earlier start
+  moved, keeps using the app's own container, and the log names the entry and says the
+  move will not finish while it is in both. Every later start answers the same, without
+  moving anything. Nothing on the phone shows it yet (DW-1241).
+- Once every entry has moved, the group container is the data directory even if the
+  done marker could not be written; the next start writes it.
+
+A phone folder is stored in `sync.db` **relative to the data directory**
+(`keeper_sync::db::upsert_profile`), and read back absolute against wherever the
+directory is now, so the move — and any change of the app container's own path across
+an update — carries the folders along. Rows an older keeper stored absolute are
+rewritten when `sync.db` opens, and once more just before the move, while they still
+name the old directory; if that rewrite fails, the move does not happen. A phone row
+stored under a *previous* app container's path (`…/<UUID>/…/dev.tgorka.keeper/sync/<its
+id>` — iOS can give the container a new path across a reinstall or an update) is
+rewritten the same way, because its folder moved with the rest. A folder a person chose
+outside the data directory (every desktop folder) is stored as it was.
+
+Secrets stay in the keychain, never in either container. The keychain group is the
+app's own application identifier, so the items written before the entitlement existed
+are already in it, and the extension reads them by naming the same group.
+
+**Proved on Linux:** the move (`keeper-core/src/container.rs`, its tests) and the folder
+rewrite (`keeper-sync/src/db.rs`, `a_folder_under_the_data_directory_follows_it_…`,
+`an_older_absolute_folder_is_made_relative_…`,
+`a_phone_folder_under_a_previous_app_container_…`). **Not yet proved anywhere:** that iOS
+answers nil without the entitlement and a path with it, and that the move keeps an
+existing install's accounts, messages and folder — the kalypso runs owed in the epic.
 
 ## The folder on the phone
 
@@ -934,8 +999,10 @@ What it is made of, all under `src-tauri/crates/keeper/gen/apple/` unless stated
   the app's own Swift objects at link time; the `extern` block compiles on the Linux
   host and only the Mac link proves it.
 - `KeeperIsland/KeeperIslandAttributes.swift` — the `ActivityAttributes`, a member of
-  **both** targets (no App Group: data flows through ActivityKit, and an App Group is
-  needed only if the extension read the app's files, which it does not).
+  **both** targets (the island takes no App Group: data flows through ActivityKit, and
+  an App Group is needed only by an extension that reads the app's files — the
+  notification extension does, the island does not; the app's own App Group is
+  [Where keeper keeps its data](#where-keeper-keeps-its-data)).
 - `KeeperIsland/KeeperIslandBundle.swift`, `KeeperIsland/KeeperIslandLiveActivity.swift`,
   `KeeperIsland/Info.plist` — the widget-extension target `KeeperIsland`
   (`com.apple.widgetkit-extension`, bundle id `dev.tgorka.keeper.island`,

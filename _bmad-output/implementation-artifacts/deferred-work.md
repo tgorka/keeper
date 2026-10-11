@@ -9932,3 +9932,24 @@ origin: epic 98, story 98.1 (rung `agents-98-push-setting`, 2026-10-11; `review-
 location: `/tmp/agents-salvage/delectra-gate.sh` (coordinator tooling, not the repo)
 reason: Given `HEAD`, the script's bundle carries no `refs/*`, so delectra fetches nothing and fails with `fatal: unable to read tree <sha>`; passing the branch name works. The script should bundle a named ref (or resolve `HEAD` to the branch) before it fetches.
 status: open
+
+### DW-1240: The free-team install may never see the App Group move.
+
+origin: epic 98, story 98.1 (rung `agents-98-group`, 2026-10-11; acceptance 6, codemap Q8)
+location: `src-tauri/crates/keeper/src/ipc.rs` (`IosPlatform::resolve`), `src-tauri/crates/keeper-core/src/container.rs`
+reason: The move runs when a build that carries the App Group starts over an install that kept its data in the app's own container. The owner's kalypso install is signed by a free Personal Team; the paid program issues a different team id, and iOS may refuse to install a build of the same bundle id signed by another team over it (and the keychain items carry the old team's application-identifier prefix) `[INFERENCE: not measured]`. If it does, the old install is deleted first and nothing is moved: accounts are signed in again and phone folders cloned again. The device run after enrolment decides; if the install goes over, "the existing install's accounts, messages and phone folder are intact" is the check that proves the move.
+status: open
+
+### DW-1241: A refused or failed container move is said only in the log.
+
+origin: epic 98, story 98.1 (rung `agents-98-group`, 2026-10-11; the plan's Q3 "failure leaves the old directory in use and says so")
+location: `src-tauri/crates/keeper/src/ipc.rs` (`IosPlatform::resolve`), `keeper_core::container::MoveRefusal`
+reason: `MoveRefusal`'s sentence names the folder keeper keeps using, and `IosPlatform::resolve` writes it to the log; no view model carries it, so a person whose move was refused sees push not working rather than why. A line in Settings › Notifications on the phone (beside the push gateway field) would say it; it needs a `MoveRefusal` kept on the platform and an IPC read, which belongs with rung 4's push disclosures. Extended by R335 (02): `MoveRefusal::Clash` is the first thing that disclosure must say, with the entry's name — a clash is a permanent refusal, not a retry (every start answers it again without moving anything), so until it reaches a view model the phone never gets push and nothing but the log says why. Resolving a clash automatically (the journal proves the destination's copy is keeper's own earlier state, the old directory's is newer) is a design decision for that disclosure, not for the move.
+status: open
+
+### DW-1242: The notification extension must create nothing under the group data directory before the move is marked.
+
+origin: epic 98, story 98.1 (rung `agents-98-group` fix round 1, 2026-10-11; R335, `review-98group-1.md` DW candidate 3) — a contract for rung 3 (`agents-98-nse`)
+location: rung 3's `KeeperNotify` (Swift NSE and any Rust it links), `keeper_core::container` (`DestinationNotEmpty`)
+reason: The app's move refuses a destination that holds anything without its journal — before anything is moved or marked, a fresh install included (R332). `<group container>/Library/Application Support/dev.tgorka.keeper` is the app's data directory only once `.keeper-moved` is in it; if `KeeperNotify` creates a file there first — a log, a crash file, a store opened "to see" — the app's first move becomes `DestinationNotEmpty` on every start, for good. The NSE checks for `.keeper-moved` and, without it, opens nothing and writes nothing under that directory (its own logs go elsewhere, e.g. the extension's own container). Close when rung 3 lands with that check and a test or an inspection note naming it.
+status: open
