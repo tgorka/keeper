@@ -157,3 +157,22 @@ describe("timelineStore approvals", () => {
     expect(timelineStore.getState().approvals).toEqual([]);
   });
 });
+
+describe("timelineStore heard marks (97.3, UX-DR143)", () => {
+  it("keeps the last marks through batches that carry none, an empty list clears them, and so does the room's clear", () => {
+    timelineStore.getState().applyBatch({
+      ops: [{ op: "reset", items: [message("answer")] }],
+      heard: [{ key: "answer", splitUtf16: 6 }],
+    });
+    timelineStore.getState().applyBatch(batch([{ op: "pushBack", item: message("b") }]));
+    expect(timelineStore.getState().heard).toEqual([{ key: "answer", splitUtf16: 6 }]);
+    // The answer grew past the mark: Rust sends the new list with no ops.
+    timelineStore.getState().applyBatch({ ops: [], heard: [{ key: "answer", splitUtf16: 12 }] });
+    expect(timelineStore.getState().heard).toEqual([{ key: "answer", splitUtf16: 12 }]);
+    timelineStore.getState().applyBatch({ ops: [], heard: [] });
+    expect(timelineStore.getState().heard).toEqual([]);
+    timelineStore.getState().applyBatch({ ops: [], heard: [{ key: "answer", splitUtf16: 6 }] });
+    timelineStore.getState().clear();
+    expect(timelineStore.getState().heard).toEqual([]);
+  });
+});

@@ -766,3 +766,38 @@ describe("MessageBubble — a brief (UX-DR135)", () => {
     expect(screen.queryByText(/Brief for/)).toBeNull();
   });
 });
+
+// Story 97.3 #9, UX-DR143: where the person stopped listening to a spoken answer.
+describe("MessageBubble — where the person stopped listening", () => {
+  // "Hi 😀." is five characters and six UTF-16 units: Rust's split is in units.
+  const body = "Hi 😀. Zażółć gęślą!\nFour.";
+  const rule = (container: HTMLElement) => container.querySelector('[data-slot="heard-mark"]');
+
+  it("draws the rule at Rust's UTF-16 split, the heard text before it and the rest dimmed", () => {
+    const { container } = render(
+      <MessageBubble item={msg({ body })} grouped={false} heardUntil={6} />,
+    );
+    const mark = rule(container);
+    expect(mark?.previousSibling?.textContent).toBe("Hi 😀.");
+    expect(mark?.nextSibling?.textContent).toBe("Zażółć gęślą!\nFour.");
+    expect(mark?.nextSibling).toHaveClass("opacity-60");
+  });
+
+  it("opens the answer with the rule when no sentence was heard", () => {
+    const { container } = render(
+      <MessageBubble item={msg({ body })} grouped={false} heardUntil={0} />,
+    );
+    const mark = rule(container);
+    expect(mark?.previousSibling?.textContent ?? "").toBe("");
+    expect(mark?.nextSibling?.textContent).toBe(body);
+    expect(mark?.nextSibling).toHaveClass("opacity-60");
+  });
+
+  it("draws the answer whole and undimmed without a mark", () => {
+    const { container } = render(<MessageBubble item={msg({ body })} grouped={false} />);
+    expect(rule(container)).toBeNull();
+    const whole = screen.getByText(/Hi 😀\./);
+    expect(whole.textContent).toBe(body);
+    expect(whole).not.toHaveClass("opacity-60");
+  });
+});

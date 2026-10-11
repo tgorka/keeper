@@ -139,6 +139,13 @@ interface MessageBubbleProps {
    * says so to a screen reader, until the run leaves `running`.
    */
   growing?: boolean;
+  /**
+   * Where the person stopped listening to this spoken answer (97.3,
+   * UX-DR143): the body's UTF-16 index Rust computed. A thin rule with
+   * "You stopped listening here" is drawn there and the text after it is
+   * dimmed; absent when the answer was not stopped or was heard to its end.
+   */
+  heardUntil?: number;
 }
 
 /**
@@ -174,6 +181,7 @@ export function MessageBubble({
   onOpenPreview,
   onCancelSend,
   growing = false,
+  heardUntil,
 }: MessageBubbleProps) {
   const displayName = item.senderDisplayName ?? item.sender;
   const time = formatMessageTime(item.timestamp);
@@ -234,7 +242,17 @@ export function MessageBubble({
           may carry an empty caption) or an answer is still growing into one. */}
       {(item.body !== "" || growing) && (
         <p className="whitespace-pre-wrap break-words">
-          {item.body}
+          {heardUntil === undefined ? (
+            item.body
+          ) : (
+            <>
+              {item.body.slice(0, heardUntil)}
+              <HeardRule />
+              <span data-slot="unheard" className="opacity-60">
+                {item.body.slice(heardUntil).trimStart()}
+              </span>
+            </>
+          )}
           {growing && (
             <>
               <span
@@ -407,6 +425,19 @@ export function MessageBubble({
         <ReadReceipts readers={item.readers} isOwn={isOwn} />
       </div>
     </div>
+  );
+}
+
+/**
+ * Where the person stopped listening to a spoken answer (UX-DR143): a thin rule
+ * with its words, on its own line inside the answer's text.
+ */
+function HeardRule() {
+  return (
+    <span data-slot="heard-mark" className="my-1.5 flex items-center gap-2 text-xs opacity-70">
+      <span className="shrink-0">You stopped listening here</span>
+      <span aria-hidden="true" className="h-px min-w-4 flex-1 bg-current opacity-50" />
+    </span>
   );
 }
 

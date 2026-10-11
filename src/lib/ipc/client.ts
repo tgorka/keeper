@@ -502,6 +502,7 @@ export type { ForgeSourceVm } from "./gen/ForgeSourceVm";
 export type { ForgeStateVm } from "./gen/ForgeStateVm";
 export type { GrantMode } from "./gen/GrantMode";
 export type { GrantScope } from "./gen/GrantScope";
+export type { HeardMarkVm } from "./gen/HeardMarkVm";
 export type { HeldSendVm } from "./gen/HeldSendVm";
 export type { HotkeyVm } from "./gen/HotkeyVm";
 export type { InboxBatch } from "./gen/InboxBatch";

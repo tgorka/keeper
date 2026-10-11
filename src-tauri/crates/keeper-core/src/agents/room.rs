@@ -40,8 +40,10 @@ use crate::agents::approval_card::{ApprovalFold, ApprovalVm, Senders, Viewer};
 use crate::agents::delegation::{enveloped_brief, trusted_brief, DelegateContent};
 use crate::agents::events::{
     RunState, StatusContent, APPROVAL_CONSUMED, APPROVAL_DECISION, APPROVAL_REQUEST, CLAIM,
-    CONTENT_VERSION, CONTROL_ROOM_TYPE, DELEGATE, HOST, SCOPE, SESSION_ROOM_TYPE, STATUS, TURN,
+    CONTENT_VERSION, CONTROL_ROOM_TYPE, DELEGATE, HEARD, HOST, SCOPE, SESSION_ROOM_TYPE, STATUS,
+    TURN,
 };
+use crate::agents::heard::RoomMarks;
 use crate::agents::label::{Label, LabelVm, Readers};
 use crate::agents::proxy::ProxyListEventContent;
 use crate::agents::session::SessionKind;
@@ -1084,6 +1086,9 @@ pub struct HeaderReader {
     /// Whether the event cache changed under the fold other than by an
     /// append it took: it is folded again from the cache before it is read.
     approvals_stale: bool,
+    /// Where the person stopped listening to the room's answers (97.3,
+    /// UX-DR143), as their own devices marked it.
+    marks: RoomMarks,
 }
 
 impl HeaderReader {
@@ -1103,12 +1108,15 @@ impl HeaderReader {
             names: HashMap::new(),
             approvals: ApprovalFold::default(),
             approvals_stale: false,
+            marks: RoomMarks::default(),
         };
         if let Ok((cache, _handles)) = reader.room.event_cache().await {
             if let Ok(events) = cache.events().await {
                 for event in &events {
                     if let Some(value) = header_event(event.raw()) {
                         reader.apply(&value);
+                    } else if event_type(event.raw()) == Some(HEARD) {
+                        reader.mark(event);
                     }
                 }
             }
@@ -1153,6 +1161,16 @@ impl HeaderReader {
             }
         }
         true
+    }
+
+    /// Fold the person's mark of where they stopped listening, if `event`
+    /// is one; returns whether the marks changed.
+    fn mark(&mut self, event: &matrix_sdk::deserialized_responses::TimelineEvent) -> bool {
+        let Ok(value) = event.raw().deserialize_as::<Value>() else {
+            return false;
+        };
+        let sealed = sealed_by_sender(event.encryption_info().map(|info| &**info));
+        self.marks.apply(&value, self.room.own_user_id(), sealed)
     }
 
     fn apply(&mut self, event: &Value) -> bool {
@@ -1255,6 +1273,7 @@ impl HeaderReader {
                         self.names.clear();
                         changed = true;
                     }
+                    Some(HEARD) => changed |= self.mark(event),
                     _ => {}
                 }
             }
@@ -1294,6 +1313,11 @@ impl HeaderReader {
     /// When the next waiting card turns expired, after `now`.
     pub fn next_expiry(&self, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
         self.approvals.next_expiry(now)
+    }
+
+    /// The person's marks of where they stopped listening, as folded.
+    pub fn marks(&self) -> &RoomMarks {
+        &self.marks
     }
 
     /// Resolve the display names of `users` not resolved yet.
@@ -1600,6 +1624,16 @@ mod tests {
                 event(base("dev.keeper.agent.surface.result", json!({"v": 1}))),
             ),
             (
+                "heard",
+                event(base(
+                    HEARD,
+                    json!({
+                        "v": 1, "anchor": "$a", "heard_until": 4, "sentence": 1,
+                        "reason": "stop",
+                    }),
+                )),
+            ),
+            (
                 "claim",
                 event(state(CLAIM, "", json!({"v": 1, "epoch": 1}))),
             ),
@@ -1658,12 +1692,13 @@ mod tests {
                 };
                 assert_eq!(filter(&event, &rules), expected, "{kind:?} {name}");
             }
-            // Status, scope and surface results are read beside the stream,
-            // never drawn as items (R33).
+            // Status, scope, surface results and the person's mark of where
+            // they stopped listening (97.3, UX-DR143) are read beside the
+            // stream, never drawn as items (R33).
             for (name, event) in fixtures() {
                 if matches!(
                     name,
-                    "status" | "scope" | "surface.result" | "claim" | "host"
+                    "status" | "scope" | "surface.result" | "heard" | "claim" | "host"
                 ) {
                     assert!(!filter(&event, &rules), "{kind:?} {name}");
                 }

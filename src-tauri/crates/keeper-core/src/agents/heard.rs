@@ -26,16 +26,22 @@
 //!   [`STOPPED_LISTENING`] after it, later rounds lose their text and keep
 //!   their tool calls. The log line keeps the whole answer; only the
 //!   replayed message is cut.
+//! - **The room draws it.** An agent room's header reader folds the person's
+//!   own sealed marks ([`RoomMarks`]); the timeline sends, beside the
+//!   stream, where each marked answer's heard text ends in the body it shows
+//!   ([`HeardMarkVm`], [`split_utf16`]) — recounted from `sentence` like the
+//!   host's, in UTF-16 so the front slices and counts nothing (UX-DR143).
 
 use std::borrow::Cow;
 use std::collections::HashMap;
 
-use matrix_sdk::ruma::OwnedEventId;
+use matrix_sdk::ruma::{EventId, OwnedEventId, UserId};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use ts_rs::TS;
 use ulid::Ulid;
 
-use crate::agents::events::CONTENT_VERSION;
+use crate::agents::events::{CONTENT_VERSION, HEARD};
 use crate::agents::log::{
     ApprovalState, HeardBody, HeardReason, LineBody, LogLine, NARROWER_THAN_ROOM, WITHHELD_CODE,
 };
@@ -361,6 +367,94 @@ pub fn cut_rounds<S: AsRef<str>>(rounds: &[S], heard_until: u64) -> Option<Vec<S
         };
     }
     Some(kept)
+}
+
+/// Where the person stopped listening to an answer, as its agent room draws
+/// it (UX-DR143): the answer's render key and where what was heard ends in
+/// the body the room shows, in UTF-16 code units — what a JS string slices
+/// by, so the front counts nothing. Sent beside the stream
+/// (`TimelineBatch::heard`), never as an item (R33).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct HeardMarkVm {
+    /// The answer's stable opaque render key (its item's `unique_id`).
+    pub key: String,
+    /// The body's UTF-16 length of what was heard: the rule goes here and
+    /// the text after it is dimmed.
+    pub split_utf16: u32,
+}
+
+/// The marks the person's own devices left in a session room, by the
+/// answer's anchor: how many of its sentences were finished aloud. Only an
+/// event from the room's own user, sealed by a device of theirs
+/// ([`crate::agents::room::sealed_by_sender`], R185), that reads as
+/// [`HeardContent`] counts; of two marks of one answer the one with the
+/// smaller `origin_server_ts` stands — the room's order, as the host logs
+/// only the first ([`ALREADY_MARKED`]) — whichever the room folded first:
+/// back-pagination can bring the older mark after the newer (R327).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RoomMarks {
+    /// Each answer's mark: its `origin_server_ts` and its `sentence`.
+    by_anchor: HashMap<OwnedEventId, (u64, u32)>,
+}
+
+impl RoomMarks {
+    /// Fold one event (decrypted, as JSON) `own` reads, `sealed` whether a
+    /// device of its sender sealed it. Returns whether the marks changed.
+    pub fn apply(&mut self, event: &Value, own: &UserId, sealed: bool) -> bool {
+        if event["type"] != HEARD || event["sender"].as_str() != Some(own.as_str()) || !sealed {
+            return false;
+        }
+        let Some(heard) = HeardContent::read(&event["content"]) else {
+            return false;
+        };
+        let at = event["origin_server_ts"].as_u64().unwrap_or(u64::MAX);
+        match self.by_anchor.entry(heard.anchor) {
+            std::collections::hash_map::Entry::Occupied(mut entry) if at < entry.get().0 => {
+                entry.insert((at, heard.sentence));
+                true
+            }
+            std::collections::hash_map::Entry::Occupied(_) => false,
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert((at, heard.sentence));
+                true
+            }
+        }
+    }
+
+    /// How many sentences of the answer anchored at `anchor` were heard,
+    /// if the person marked it.
+    pub fn sentence(&self, anchor: &EventId) -> Option<u32> {
+        self.by_anchor.get(anchor).map(|(_, sentence)| *sentence)
+    }
+
+    /// Whether no answer of the room is marked.
+    pub fn is_empty(&self) -> bool {
+        self.by_anchor.is_empty()
+    }
+}
+
+/// Where the room draws the mark in an answer whose body is `body` once
+/// `sentence` of its sentences were finished aloud: the end of that
+/// sentence by the speech segmenter's own cut ([`sentence_ends`]), as the
+/// host counts it — so the mark does not depend on which edit the device
+/// saw last — converted from Unicode scalar values to UTF-16 code units;
+/// `0` when none was finished. `None` when nothing but whitespace follows
+/// it (the answer was heard to its end) or the body does not hold that
+/// many sentences (yet).
+pub fn split_utf16(body: &str, sentence: u32) -> Option<u32> {
+    let ends = sentence_ends(body);
+    let end = match usize::try_from(sentence).ok()? {
+        0 => 0,
+        n => *ends.get(n - 1)?,
+    };
+    let mut heard = body.chars();
+    let units: usize = heard.by_ref().take(end).map(char::len_utf16).sum();
+    if heard.as_str().trim().is_empty() {
+        return None;
+    }
+    u32::try_from(units).ok()
 }
 
 #[cfg(test)]
@@ -834,5 +928,100 @@ mod tests {
         let before = shape(&withheld.replayed());
         withheld.heard(closing, 4, 1);
         assert_eq!(shape(&withheld.replayed()), before);
+    }
+
+    const PERSON: &str = "@tgorka:example.org";
+
+    fn mark_event(sender: &str, anchor: &str, sentence: u32) -> Value {
+        mark_at(sender, anchor, sentence, 1)
+    }
+
+    fn mark_at(sender: &str, anchor: &str, sentence: u32, origin_server_ts: u64) -> Value {
+        json!({
+            "type": HEARD, "event_id": format!("$mark-{anchor}-{sentence}"), "sender": sender,
+            "origin_server_ts": origin_server_ts,
+            "content": {
+                "v": 1, "anchor": anchor, "heard_until": 0, "sentence": sentence,
+                "reason": "stop",
+            },
+        })
+    }
+
+    /// The room draws only the person's own marks, sealed by a device of
+    /// theirs, readable as this version's, and of one answer's the first in
+    /// the room's order, whichever was folded first (R327).
+    #[test]
+    fn the_room_folds_the_persons_own_sealed_marks() {
+        let own = UserId::parse(PERSON).expect("user");
+        let anchor = |id: &str| EventId::parse(id).expect("event");
+        let mut marks = RoomMarks::default();
+        assert!(marks.is_empty());
+
+        // Anyone else's, an unsealed one and another type are not marks.
+        assert!(!marks.apply(&mark_event("@nixi:example.org", "$a", 1), &own, true));
+        assert!(!marks.apply(&mark_event(PERSON, "$a", 1), &own, false));
+        let mut other = mark_event(PERSON, "$a", 1);
+        other["type"] = json!("dev.keeper.agent.surface.result");
+        assert!(!marks.apply(&other, &own, true));
+        // Unreadable: a newer version, an unknown field.
+        let mut newer = mark_event(PERSON, "$a", 1);
+        newer["content"]["v"] = json!(2);
+        assert!(!marks.apply(&newer, &own, true));
+        let mut extra = mark_event(PERSON, "$a", 1);
+        extra["content"]["cancel"] = json!(true);
+        assert!(!marks.apply(&extra, &own, true));
+        assert!(marks.is_empty());
+        assert_eq!(marks.sentence(&anchor("$a")), None);
+
+        assert!(marks.apply(&mark_event(PERSON, "$a", 2), &own, true));
+        assert!(marks.apply(&mark_event(PERSON, "$b", 0), &own, true));
+        // A second mark of one answer: the first stands.
+        assert!(!marks.apply(&mark_event(PERSON, "$a", 5), &own, true));
+        assert_eq!(marks.sentence(&anchor("$a")), Some(2));
+        assert_eq!(marks.sentence(&anchor("$b")), Some(0));
+        assert_eq!(marks.sentence(&anchor("$c")), None);
+
+        // R327 (01): the first in the room's order stands, though the newer
+        // mark was folded first (back-pagination brings the older later);
+        // a later one, or one at the same time, does not replace it.
+        let mut marks = RoomMarks::default();
+        assert!(marks.apply(&mark_at(PERSON, "$d", 5, 20), &own, true));
+        assert!(marks.apply(&mark_at(PERSON, "$d", 2, 10), &own, true));
+        assert_eq!(marks.sentence(&anchor("$d")), Some(2));
+        assert!(!marks.apply(&mark_at(PERSON, "$d", 7, 30), &own, true));
+        assert!(!marks.apply(&mark_at(PERSON, "$d", 9, 10), &own, true));
+        assert_eq!(marks.sentence(&anchor("$d")), Some(2));
+    }
+
+    /// The mark sits where the heard sentences end by the segmenter's cut,
+    /// in UTF-16 code units of the body (an astral character is two, a
+    /// combining mark one), and nowhere when the answer was heard to its end
+    /// or does not hold that many sentences.
+    #[test]
+    fn a_mark_splits_the_body_in_utf16_where_the_heard_sentences_end() {
+        let body = "Hi e\u{301} 😀. Zażółć gęślą!\nFour.\n";
+        let heard = |split: u32| {
+            let units: Vec<u16> = body.encode_utf16().collect();
+            String::from_utf16(&units[..split as usize]).expect("a split between characters")
+        };
+        assert_eq!(sentence_ends(body).len(), 3);
+
+        let first = split_utf16(body, 1).expect("one heard");
+        assert_eq!(
+            first, 9,
+            "eight scalar values: the combining acute one unit, the emoji two"
+        );
+        assert_eq!(heard(first), "Hi e\u{301} 😀.");
+        let second = split_utf16(body, 2).expect("two heard");
+        assert_eq!(heard(second), "Hi e\u{301} 😀. Zażółć gęślą!");
+        // None finished: the rule opens the answer.
+        assert_eq!(split_utf16(body, 0), Some(0));
+        // Heard to its end (trailing whitespace is nothing left), and past it.
+        assert_eq!(split_utf16(body, 3), None);
+        assert_eq!(split_utf16(body, 4), None);
+        assert_eq!(split_utf16(body, u32::MAX), None);
+        // A body still growing shows the mark once more of it follows.
+        assert_eq!(split_utf16("Hi 😀.", 1), None);
+        assert_eq!(split_utf16("Hi 😀. Zaż", 1), Some(6));
     }
 }

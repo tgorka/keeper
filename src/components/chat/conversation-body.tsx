@@ -264,6 +264,9 @@ export function ConversationBody({
   // An agent room's approval requests, by id; the stream's `approval` items say
   // where each is drawn.
   const approvals = useConversationTimeline((s) => s.approvals);
+  // Where the person stopped listening to a spoken answer, by its key: Rust
+  // sends the split already in the body's UTF-16 units (UX-DR143).
+  const heard = useConversationTimeline((s) => s.heard);
   // The answer that draws the growing caret: Rust names it only while the run
   // is `running`, and the run is checked here as well so a header that moved
   // on to `done` can never leave a caret behind.
@@ -1323,6 +1326,7 @@ export function ConversationBody({
                     onOpenPreview={onOpenPreview}
                     onCancelSend={onCancelSend}
                     growing={caretKey === row.item.key}
+                    heardUntil={heard.find((mark) => mark.key === row.item.key)?.splitUtf16}
                   />
                 </li>
               ),

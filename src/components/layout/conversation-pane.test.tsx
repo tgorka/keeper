@@ -2244,4 +2244,36 @@ describe("ConversationPane — an agent room", () => {
     expect(screen.queryByRole("region", { name: "Agent status" })).not.toBeInTheDocument();
     expect(caretOwners()).toEqual([]);
   });
+
+  /** The message bubbles (by render key) that draw the heard mark (UX-DR143). */
+  function markOwners(): string[] {
+    return Array.from(document.querySelectorAll('[data-slot="heard-mark"]')).map(
+      (mark) => mark.closest("[data-msg-key]")?.getAttribute("data-msg-key") ?? "",
+    );
+  }
+
+  it("draws where the person stopped listening in the answer the mark names, and moves it as Rust does", async () => {
+    open();
+    push({
+      ops: [
+        {
+          op: "reset",
+          items: [
+            ...items.slice(0, 2),
+            messageItem("answer", NIXI, "Synapse took it. The cut sits at 45 KiB."),
+          ],
+        },
+      ],
+      header: agentHeader("done", null),
+      heard: [{ key: "answer", splitUtf16: 16 }],
+    });
+    await screen.findByText("Earlier answer");
+    expect(markOwners()).toEqual(["answer"]);
+    expect(screen.getByText("The cut sits at 45 KiB.")).toHaveClass("opacity-60");
+
+    // A batch beside the stream that names no answer clears it.
+    push({ ops: [], heard: [] });
+    await waitFor(() => expect(markOwners()).toEqual([]));
+    expect(screen.getByText("Synapse took it. The cut sits at 45 KiB.")).toBeInTheDocument();
+  });
 });

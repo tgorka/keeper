@@ -1086,3 +1086,117 @@ async fn an_agent_room_reads_as_one_header_and_one_growing_answer() {
         Some(AgentRoomKindVm::Control)
     );
 }
+
+/// 97.3 #9 (UX-DR143): the person's own mark of where they stopped listening
+/// rides beside the stream of a real encrypted agent room — sealed by their
+/// device, split in UTF-16 units of the answer's latest body — while the
+/// agent's mark of the same answer and the mark event itself are no item.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "live: Synapse on delectra"]
+async fn the_persons_heard_mark_is_drawn_beside_the_stream() {
+    use keeper_core::agents::heard::HeardMarkVm;
+    use keeper_core::agents::room::{AgentIcons, AgentKinds};
+    use keeper_core::timeline;
+    use keeper_core::vm::{TimelineBatch, TimelineItemVm, TimelineOp};
+
+    let smoke = Smoke::setup().await;
+    let root = TempDir::new();
+    let (nixi, person, room) = joined_pair(&smoke, SessionKind::Main, root.path()).await;
+    person
+        .client()
+        .event_cache()
+        .subscribe()
+        .expect("event cache");
+    let answer = nixi
+        .send(
+            &room,
+            "m.room.message",
+            json!({
+                "msgtype": "m.text", "body": "…",
+                "dev.keeper.agent.turn": {"session": "sessions/nixi/main", "line": "01J"},
+            }),
+            None,
+        )
+        .await
+        .expect("answer anchor");
+    nixi.send(
+        &room,
+        "m.room.message",
+        events::edit_content(&answer, "Hi 😀. Two three! Four."),
+        None,
+    )
+    .await
+    .expect("answer edit");
+    let mark = |sentence: u32| {
+        json!({
+            "v": 1, "anchor": answer, "heard_until": 0, "sentence": sentence, "reason": "stop",
+        })
+    };
+    // The agent's mark is no one's: it comes first and is ignored.
+    nixi.send(&room, events::HEARD, mark(2), None)
+        .await
+        .expect("the agent's mark");
+    person
+        .send(&room, events::HEARD, mark(1), None)
+        .await
+        .expect("the person's mark");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let events = cached_events(&person, &room).await;
+        let marks = events.iter().filter(|e| e["type"] == events::HEARD).count();
+        if marks == 2 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the marks never arrived");
+        person.sync_once().await.expect("sync");
+    }
+
+    let open = timeline::open_timeline(person.client(), &room, "acct")
+        .await
+        .expect("timeline");
+    let batches: Arc<Mutex<Vec<TimelineBatch>>> = Arc::default();
+    let sink = Arc::clone(&batches);
+    let producer = tokio::spawn(timeline::forward_timeline(
+        open,
+        room.clone(),
+        Box::new(move |batch| {
+            sink.lock().expect("lock").push(batch);
+            true
+        }),
+        Arc::new(AgentKinds::default()),
+        Arc::new(AgentIcons::default()),
+        Arc::new(keeper_core::agents::approval_card::HostedRooms::default()),
+    ));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while batches.lock().expect("lock").is_empty() {
+        assert!(Instant::now() < deadline, "no first batch");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    producer.abort();
+    let first = batches.lock().expect("lock")[0].clone();
+    let TimelineOp::Reset { items } = &first.ops[0] else {
+        panic!("the first batch is a reset");
+    };
+    let answer_key = items
+        .iter()
+        .find_map(|item| match item {
+            TimelineItemVm::Message { key, body, .. } if body == "Hi 😀. Two three! Four." => {
+                Some(key.clone())
+            }
+            _ => None,
+        })
+        .expect("the answer's item");
+    let messages = items
+        .iter()
+        .filter(|item| matches!(item, TimelineItemVm::Message { .. }))
+        .count();
+    assert_eq!(messages, 1, "a mark is no item: {items:?}");
+    assert_eq!(
+        first.heard,
+        Some(vec![HeardMarkVm {
+            key: answer_key,
+            split_utf16: 6,
+        }]),
+        "the person's mark, one sentence heard, the emoji two units"
+    );
+}

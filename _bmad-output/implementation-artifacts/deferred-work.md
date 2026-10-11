@@ -9884,3 +9884,30 @@ origin: epic 97, story 97.3 fix round 1 (rung `agents-97-pause`, 2026-10-11; `ma
 location: `src-tauri/crates/keeper/src/voice_ipc.rs` (`tests::the_button_the_tray_and_the_hotkey_each_stop_the_voice_once`, `tests::three_chunks_become_two_utterances_and_a_stop_leaves_the_second_unspoken`)
 reason: Both tests replace the one `voice()` state's turn and port and drive it, each taking the lock per call, and the test harness runs them on parallel threads; when the other test swaps the port between `speaking_on` and the press, the counting port sees no stop ("the tray item: how often the synthesiser is told to stop", left 0). Seen on hesperia in `mac-97pause-fix1.log` and before this rung in `mac-96screen-1.log` and `mac92r4-tests.log`; the pair passes single-threaded and three whole-lib reruns passed (`mac-97pause-fix1-rerun.log`). Revisit: hold one test-wide guard (a `static` mutex both tests take first) so the two run in turn.
 status: open
+
+### DW-1220: The room can draw a mark the host refused.
+
+origin: epic 97, story 97.3 (rung `agents-97-mark`, 2026-10-11; acceptance 9, codemap Q16)
+location: `src-tauri/crates/keeper-core/src/agents/room.rs` (`HeaderReader::mark`), `src-tauri/crates/keeper-core/src/agents/heard.rs` (`RoomMarks`, `split_utf16`)
+reason: The room draws the person's own sealed mark over the body it shows; the host logs a mark only from a device the person's identity signed, over the answer's prose, and refuses one past the prose (DW-1200), one of a parked turn's first message (DW-1201) or one from an unsigned device. In those cases the rule says where the person stopped although the agent was told nothing and its next turn reads the answer whole. Nothing in the room says what the host did with a mark. Revisit if the device run shows refusals in the host's log: have the host answer a mark (logged or refused) and draw only a logged one.
+also (review-97mark-1 R97M1-02 / R327, 2026-10-11): a mark the person redacts still draws its rule — `RoomMarks` only adds — as the host still cut the answer at it (R317 never unmarks); the two agree, but nothing in the room says the mark was taken back. Documented in `docs/agents.md` § *Where you stopped listening (the room)*.
+status: open
+
+### DW-1221: A mark past the shown body's cap draws nothing though the host cut the answer.
+
+origin: epic 97, story 97.3 (rung `agents-97-mark`, review-97mark-1 / R327, 2026-10-11)
+location: `src-tauri/crates/keeper-core/src/timeline.rs` (`heard_mark`, `truncate_body(…, MAX_TURN_BODY_CHARS)`), `src-tauri/crates/keeper-core/src/agents/heard.rs` (`Answers::mark`, `split_utf16`)
+reason: the room counts a mark's `sentence` over the body it shows, capped at `MAX_TURN_BODY_CHARS`; the host counts it over the whole answer. A mark whose sentence ends past the cap finds no such end in the shown body, so the room draws no rule while the host cut the replay there. Bounded by R42 (the host's own cut of an answer is below the cap), so only a malformed or oversized answer reaches it. Close by counting over the uncapped body and drawing the rule at the cap's end, or by refusing such a mark on the host, with a test of an answer longer than the cap.
+status: open
+
+### DW-1222: A window whose title changes on its own drifts every screen pin.
+
+origin: epic 96, story 96.4 (rung `agents-96-screen`, review-96tail-fix1 / R328, 2026-10-11; recorded at rung `agents-97-mark` by the coordinator to avoid re-cascading seven rungs for a ledger line)
+location: `src-tauri/crates/keeper-core/src/agents/screen.rs` (`named_holds`, `Windows::holding`)
+reason: a pin names its window by title; a window that retitles itself (a browser tab, Mail's compose window taking its subject) no longer holds at consume, so every approval drifts and is re-asked. Fails closed (a refusal, never a wrong action). Close by pinning by `window_id` from Peekaboo's `list … ids` once its output format is confirmed on hesperia, with a test of a retitled window.
+
+### DW-1223: Another session can evict this session's kept screen reads.
+
+origin: epic 96, story 96.4 (rung `agents-96-screen`, review-96tail-fix1 / R328, 2026-10-11; recorded at rung `agents-97-mark` by the coordinator)
+location: `src-tauri/crates/keeper-agent/src/mcp.rs` (`READS_KEPT_ALL`)
+reason: reads are kept per session but under one host-wide cap, so a busy session can evict another's reads; that session's next element action is refused for want of a read. Fails closed — a denial of service only, never misuse. Close with a per-session share of the cap, with a test of two sessions.

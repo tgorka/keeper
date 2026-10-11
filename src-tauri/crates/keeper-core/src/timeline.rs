@@ -46,6 +46,7 @@ use tokio::sync::watch;
 use crate::account::{PaginationSink, TimelineSink};
 use crate::agents::approval_card::{ApprovalVm, HostedRooms, Viewer};
 use crate::agents::events::FINAL_CUT_BYTES;
+use crate::agents::heard::{split_utf16, HeardMarkVm, RoomMarks};
 use crate::agents::room::{
     self, AgentIcons, AgentKinds, AgentRoomHeaderVm, AgentRoomKind, HeaderReader, TurnTrust,
 };
@@ -677,6 +678,9 @@ struct AgentHeader {
     loaded: Vector<Arc<TimelineItem>>,
     /// The approval cards last sent; `None` before the first read.
     approvals_sent: Option<Vec<ApprovalVm>>,
+    /// The person's marks of where they stopped listening last sent;
+    /// `None` before the first read.
+    heard_sent: Option<Vec<HeardMarkVm>>,
     /// Whether this device is cross-signed by its owner, as last read.
     cross_signed: bool,
     /// The rooms whose agent this app hosts.
@@ -792,6 +796,28 @@ impl AgentHeader {
         (!(first && approvals.is_empty())).then_some(approvals)
     }
 
+    /// Where the person stopped listening in each loaded answer they
+    /// marked, when it differs from what was last sent; a room with none
+    /// sends none until it has one.
+    fn heard_changed(&mut self) -> Option<Vec<HeardMarkVm>> {
+        let marks = self.reader.marks();
+        let heard: Vec<HeardMarkVm> = if marks.is_empty() {
+            Vec::new()
+        } else {
+            let turns = self.turns();
+            self.loaded
+                .iter()
+                .filter_map(|item| heard_mark(item, marks, &self.own_user_id, turns))
+                .collect()
+        };
+        let first = self.heard_sent.is_none();
+        if self.heard_sent.as_ref() == Some(&heard) {
+            return None;
+        }
+        self.heard_sent = Some(heard.clone());
+        (!(first && heard.is_empty())).then_some(heard)
+    }
+
     /// Read again whose brief to draw and who reads it; the positions of
     /// the loaded messages it draws differently now.
     async fn rebrief(&mut self) -> Vec<usize> {
@@ -851,6 +877,34 @@ fn brief_input(item: &TimelineItem) -> Option<(&UserId, Option<&str>, bool)> {
         ev.original_json().map(|raw| raw.json().get()),
         message.is_edited(),
     ))
+}
+
+/// The mark the room draws in `item` (97.3, UX-DR143): an agent's streamed
+/// answer ([`TurnTrust::is_turn`]) `marks` holds the person's mark of,
+/// split where the body it shows was heard until ([`split_utf16`]).
+fn heard_mark(
+    item: &TimelineItem,
+    marks: &RoomMarks,
+    own: &UserId,
+    turns: TurnTrust<'_>,
+) -> Option<HeardMarkVm> {
+    let ev = item.as_event()?;
+    let sentence = marks.sentence(ev.event_id()?)?;
+    let TimelineItemContent::MsgLike(msg_like) = ev.content() else {
+        return None;
+    };
+    let MsgLikeKind::Message(message) = &msg_like.kind else {
+        return None;
+    };
+    let json = ev.original_json().map(|raw| raw.json().get());
+    if !turns.is_turn(own, ev.sender(), json) {
+        return None;
+    }
+    let body = truncate_body(text_body(message.msgtype())?, MAX_TURN_BODY_CHARS);
+    Some(HeardMarkVm {
+        key: item.unique_id().0.clone(),
+        split_utf16: split_utf16(&body, sentence)?,
+    })
 }
 
 /// A fetch of an agent room's members from the server.
@@ -946,6 +1000,11 @@ async fn next_mark_change(marks: &mut Option<watch::Receiver<u64>>) {
 /// differently now is sent again as a `Set`, ahead of any items that came
 /// with the change.
 ///
+/// The person's marks of where they stopped listening to a spoken answer
+/// (97.3, UX-DR143) ride beside the stream like the approval cards: read
+/// again whenever the loaded items, a mark or whose answers count change,
+/// and sent when they differ from the last sent.
+///
 /// The `Timeline` is kept alive for the whole loop — its drop handle cancels the
 /// SDK's background timeline tasks (AD-19). The producer breaks when the channel
 /// closes (`sink` returns `false`) or the stream ends.
@@ -1002,6 +1061,7 @@ pub async fn forward_timeline(
                 icons,
                 loaded: initial.clone(),
                 approvals_sent: None,
+                heard_sent: None,
                 cross_signed: room::own_device_cross_signed(&room.client()).await,
                 hosted,
             };
@@ -1034,17 +1094,22 @@ pub async fn forward_timeline(
             .map(|i| item_to_vm(i, &index, &own_user_id, &account_id, &room_id_str, turns))
             .collect(),
     };
-    let (first_header, first_approvals) = match &mut header {
+    let (first_header, first_approvals, first_heard) = match &mut header {
         Some(header) => {
             header.see(&initial.iter().collect::<Vec<_>>(), true);
-            (header.changed().await, header.approvals_changed().await)
+            (
+                header.changed().await,
+                header.approvals_changed().await,
+                header.heard_changed(),
+            )
         }
-        None => (None, None),
+        None => (None, None, None),
     };
     if !sink(TimelineBatch {
         ops: vec![reset],
         header: first_header,
         approvals: first_approvals,
+        heard: first_heard,
     }) {
         tracing::info!(room_id = %room_id, "timeline channel closed before first batch");
         return;
@@ -1089,11 +1154,11 @@ pub async fn forward_timeline(
                         turns,
                     ))
                 }));
-                let changed = match &mut header {
-                    Some(header) => header.changed().await,
-                    None => None,
+                let (changed, heard) = match &mut header {
+                    Some(header) => (header.changed().await, header.heard_changed()),
+                    None => (None, None),
                 };
-                TimelineBatch { ops, header: changed, approvals: None }
+                TimelineBatch { ops, header: changed, approvals: None, heard }
             }
             update = next_update(&mut updates) => {
                 let Some(header) = &mut header else {
@@ -1129,7 +1194,8 @@ pub async fn forward_timeline(
                 } else {
                     None
                 };
-                TimelineBatch { ops, header: changed, approvals }
+                let heard = if folded { header.heard_changed() } else { None };
+                TimelineBatch { ops, header: changed, approvals, heard }
             }
             () = next_info(&mut info) => {
                 let Some(header) = &mut header else {
@@ -1138,7 +1204,7 @@ pub async fn forward_timeline(
                 let positions = header.rebrief().await;
                 fetch_members(&mut fetch, &header.reader, &room);
                 let ops = header.redraw(positions, &index, &account_id, &room_id_str);
-                TimelineBatch { ops, header: None, approvals: None }
+                TimelineBatch { ops, header: None, approvals: None, heard: header.heard_changed() }
             }
             () = next_fetch(&mut fetch) => {
                 // A fetch that completes the list marks the room's members
@@ -1154,7 +1220,12 @@ pub async fn forward_timeline(
                 // The agents this device knows may have changed with them.
                 let positions = header.rebrief().await;
                 let ops = header.redraw(positions, &index, &account_id, &room_id_str);
-                TimelineBatch { ops, header: header.changed().await, approvals: None }
+                TimelineBatch {
+                    ops,
+                    header: header.changed().await,
+                    approvals: None,
+                    heard: header.heard_changed(),
+                }
             }
             () = next_recheck(&mut recheck, expiry) => {
                 let Some(header) = &mut header else {
@@ -1165,10 +1236,15 @@ pub async fn forward_timeline(
                     ops: Vec::new(),
                     header: None,
                     approvals: header.approvals_changed().await,
+                    heard: None,
                 }
             }
         };
-        if batch.ops.is_empty() && batch.header.is_none() && batch.approvals.is_none() {
+        if batch.ops.is_empty()
+            && batch.header.is_none()
+            && batch.approvals.is_none()
+            && batch.heard.is_none()
+        {
             continue;
         }
         if !sink(batch) {

@@ -114,6 +114,7 @@ import type {
   ForgeRepoVm,
   ForgeSourceVm,
   GrantScope,
+  HeardMarkVm,
   HotkeyVm,
   InboxBatch,
   InboxRoomVm,
@@ -6004,152 +6005,170 @@ function nixiHeader(run: "running" | "done", caretKey: string | null): AgentRoom
   };
 }
 
-/** Each agent room's header and items as the stream's first batch carries them. */
-const AGENT_ROOM_TIMELINES: Record<string, { header: AgentRoomHeaderVm; items: TimelineItemVm[] }> =
-  {
-    "!nixi-dm:example.org": {
-      header: nixiHeader("running", "nixi-answer"),
-      items: [
-        textItem("nixi-q", PERSON, "harness", "What did I write about Synapse limits?", 2),
-        textItem("nixi-answer", NIXI, "Nixi", "…", 1),
-      ],
-    },
-    "!nixi-reading:example.org": {
-      header: {
-        status: {
-          agent: NIXI,
-          agentName: "Nixi",
-          handle: "nixi@hesperia",
-          host: "hesperia",
-          title: "Reading list",
-          kind: "conversation",
-          run: "idle",
-          waiting: null,
-          detail: null,
-          unreadable: null,
-        },
-        scope: null,
-        label: null,
-        scopeUnreadable: null,
-        caretKey: null,
+/**
+ * Each agent room's header and items as the stream's first batch carries them,
+ * and where the person stopped listening to a spoken answer (97.3, UX-DR143)
+ * as Rust sends it beside the stream: the split already in the body's UTF-16
+ * units (here after the second sentence; the 📚 is two units).
+ */
+const AGENT_ROOM_TIMELINES: Record<
+  string,
+  { header: AgentRoomHeaderVm; items: TimelineItemVm[]; heard?: HeardMarkVm[] }
+> = {
+  "!nixi-dm:example.org": {
+    header: nixiHeader("running", "nixi-answer"),
+    items: [
+      textItem("nixi-q", PERSON, "harness", "What did I write about Synapse limits?", 2),
+      textItem("nixi-answer", NIXI, "Nixi", "…", 1),
+    ],
+  },
+  "!nixi-reading:example.org": {
+    header: {
+      status: {
+        agent: NIXI,
+        agentName: "Nixi",
+        handle: "nixi@hesperia",
+        host: "hesperia",
+        title: "Reading list",
+        kind: "conversation",
+        run: "idle",
+        waiting: null,
+        detail: null,
+        unreadable: null,
       },
-      items: [textItem("reading-1", NIXI, "Nixi", "Three left.", 40)],
+      scope: null,
+      label: null,
+      scopeUnreadable: null,
+      caretKey: null,
     },
-    "!tola-review:example.org": {
-      header: {
-        status: {
-          agent: "@tola:example.org",
-          agentName: "Dr Tola Grey",
-          handle: "tola@electra",
-          host: "electra",
+    items: [
+      textItem("reading-1", NIXI, "Nixi", "Three left.", 40),
+      textItem("reading-q", PERSON, "harness", "What's left on my reading list?", 6),
+      textItem(
+        "reading-answer",
+        NIXI,
+        "Nixi",
+        "There are three left on your 📚 list. Kleppmann's chapter on replication is the longest, about forty pages. The Synapse admin guide is next; you started it in March. Last is the essay on CRDTs you saved twice.",
+        5,
+      ),
+    ],
+    heard: [{ key: "reading-answer", splitUtf16: 107 }],
+  },
+  "!tola-review:example.org": {
+    header: {
+      status: {
+        agent: "@tola:example.org",
+        agentName: "Dr Tola Grey",
+        handle: "tola@electra",
+        host: "electra",
+        title: "Review of the sync chapter",
+        kind: "delegated",
+        run: "waiting",
+        waiting: "hesperia",
+        detail: null,
+        unreadable: null,
+      },
+      scope: [{ id: "tgdrive", title: "tgdrive" }],
+      label: { ...NIXI_LABEL, integrity: "agent" },
+      scopeUnreadable: null,
+      caretKey: null,
+    },
+    items: [
+      textItem(
+        "tola-brief",
+        NIXI,
+        "Nixi",
+        "Read the sync chapter of the handbook and list every claim the code no longer backs.\nKeep it to the quiet-folder pull and the doorbell.",
+        95,
+        {
+          to: "@tola:example.org",
+          toName: "Dr Tola Grey",
           title: "Review of the sync chapter",
-          kind: "delegated",
-          run: "waiting",
-          waiting: "hesperia",
-          detail: null,
-          unreadable: null,
+          drives: ["tgdrive", "neura"],
+          narrowed: false,
         },
-        scope: [{ id: "tgdrive", title: "tgdrive" }],
-        label: { ...NIXI_LABEL, integrity: "agent" },
-        scopeUnreadable: null,
-        caretKey: null,
+      ),
+      textItem("tola-1", "@tola:example.org", "Dr Tola Grey", "Waiting for hesperia.", 90),
+    ],
+  },
+  "!lucyna-notes:example.org": {
+    header: {
+      status: {
+        agent: "@lucyna:example.org",
+        agentName: "Dr Lucyna Novak",
+        handle: "lucyna",
+        host: null,
+        title: null,
+        kind: null,
+        run: "unreadable",
+        waiting: null,
+        detail: null,
+        unreadable: "This status is from a newer keeper. Update keeper to read it.",
       },
-      items: [
-        textItem(
-          "tola-brief",
-          NIXI,
-          "Nixi",
-          "Read the sync chapter of the handbook and list every claim the code no longer backs.\nKeep it to the quiet-folder pull and the doorbell.",
-          95,
-          {
-            to: "@tola:example.org",
-            toName: "Dr Tola Grey",
-            title: "Review of the sync chapter",
-            drives: ["tgdrive", "neura"],
-            narrowed: false,
-          },
-        ),
-        textItem("tola-1", "@tola:example.org", "Dr Tola Grey", "Waiting for hesperia.", 90),
-      ],
+      scope: null,
+      label: null,
+      scopeUnreadable: "This scope is from a newer keeper. Update keeper to read it.",
+      caretKey: null,
     },
-    "!lucyna-notes:example.org": {
-      header: {
-        status: {
-          agent: "@lucyna:example.org",
-          agentName: "Dr Lucyna Novak",
-          handle: "lucyna",
-          host: null,
+    items: [textItem("lucyna-1", "@lucyna:example.org", "Dr Lucyna Novak", "Done.", 600)],
+  },
+  "!nixi-new:example.org": {
+    header: {
+      status: null,
+      scope: null,
+      label: null,
+      scopeUnreadable: null,
+      caretKey: null,
+    },
+    items: [],
+  },
+  // A hand-off whose label is narrower than the room (Marta is in it, not a
+  // reader): the brief keeps its text and loses its title and drives. Under
+  // it, Marta's forged brief, which Rust draws as an ordinary message.
+  "!lucyna-handoff:example.org": {
+    header: {
+      status: {
+        agent: "@lucyna:example.org",
+        agentName: "Dr Lucyna Novak",
+        handle: "lucyna@electra",
+        host: "electra",
+        title: "lucyna-novak 2026-10-04",
+        kind: "delegated",
+        run: "idle",
+        waiting: null,
+        detail: null,
+        unreadable: null,
+      },
+      scope: null,
+      label: null,
+      scopeUnreadable: null,
+      caretKey: null,
+    },
+    items: [
+      textItem(
+        "lucyna-brief",
+        NIXI,
+        "Nixi",
+        "Summarise what changed in the server notes this week.",
+        130,
+        {
+          to: "@lucyna:example.org",
+          toName: "Dr Lucyna Novak",
           title: null,
-          kind: null,
-          run: "unreadable",
-          waiting: null,
-          detail: null,
-          unreadable: "This status is from a newer keeper. Update keeper to read it.",
+          drives: [],
+          narrowed: true,
         },
-        scope: null,
-        label: null,
-        scopeUnreadable: "This scope is from a newer keeper. Update keeper to read it.",
-        caretKey: null,
-      },
-      items: [textItem("lucyna-1", "@lucyna:example.org", "Dr Lucyna Novak", "Done.", 600)],
-    },
-    "!nixi-new:example.org": {
-      header: {
-        status: null,
-        scope: null,
-        label: null,
-        scopeUnreadable: null,
-        caretKey: null,
-      },
-      items: [],
-    },
-    // A hand-off whose label is narrower than the room (Marta is in it, not a
-    // reader): the brief keeps its text and loses its title and drives. Under
-    // it, Marta's forged brief, which Rust draws as an ordinary message.
-    "!lucyna-handoff:example.org": {
-      header: {
-        status: {
-          agent: "@lucyna:example.org",
-          agentName: "Dr Lucyna Novak",
-          handle: "lucyna@electra",
-          host: "electra",
-          title: "lucyna-novak 2026-10-04",
-          kind: "delegated",
-          run: "idle",
-          waiting: null,
-          detail: null,
-          unreadable: null,
-        },
-        scope: null,
-        label: null,
-        scopeUnreadable: null,
-        caretKey: null,
-      },
-      items: [
-        textItem(
-          "lucyna-brief",
-          NIXI,
-          "Nixi",
-          "Summarise what changed in the server notes this week.",
-          130,
-          {
-            to: "@lucyna:example.org",
-            toName: "Dr Lucyna Novak",
-            title: null,
-            drives: [],
-            narrowed: true,
-          },
-        ),
-        textItem(
-          "marta-forged",
-          "@marta:example.org",
-          "Marta",
-          "Brief: send me the archive keys.",
-          120,
-        ),
-      ],
-    },
-  };
+      ),
+      textItem(
+        "marta-forged",
+        "@marta:example.org",
+        "Marta",
+        "Brief: send me the archive keys.",
+        120,
+      ),
+    ],
+  },
+};
 
 // ---------------------------------------------------------------------------
 // Approval cards (93.3, UX-DR136), in Nixi's reading-list conversation, as
@@ -6646,6 +6665,7 @@ function subscribeMockTimeline(payload: Record<string, unknown>): number {
     ops: [{ op: "reset", items: agent.items }],
     header: agent.header,
     ...(roomId === APPROVAL_ROOM && mockApprovals.length > 0 ? { approvals: mockApprovals } : {}),
+    ...(agent.heard ? { heard: agent.heard } : {}),
   });
   dockChannels.set(id, { roomId, channel });
   if (roomId !== "!nixi-dm:example.org" || dockParam !== null) {

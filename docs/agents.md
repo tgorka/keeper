@@ -3079,6 +3079,17 @@ as chosen ("not listed yet") and is looked for again, never rewritten. What happ
   already reads the answer cut where you stopped. A mark that has not come back in ten seconds
   is not waited for: the question goes, and the mark cuts the turns after it. An answer heard to
   its end, or one a failure ended, is marked nowhere.
+- **Where you stopped listening (the room).** The agent room shows it in the answer itself, in
+  the conversation pane and in the notes view's dock alike: a thin rule with *You stopped
+  listening here* after the last sentence you heard, and the rest of the answer after it,
+  dimmed (UX-DR143). It is drawn only from your own mark — sent by you, sealed by a device of
+  yours — and only in an agent's answer; of two marks of one answer the first in the room's order
+  stands, as on the host. A mark cannot be taken back: one you redact still draws its rule, as
+  the host still cut the answer at it.
+  keeper counts the mark's `sentence` over the answer the room shows with the speech segmenter's
+  own cut, as the host does, so the rule does not depend on which edit your device saw last;
+  an answer that shows no more than that is drawn whole. The mark itself is never an item in
+  the timeline.
 - **When you talk over an answer.** The answer pauses, mid-word, the moment you speak — at the
   voice activity model's onset (three frames, 96 ms) with the turn models, at the recogniser's
   first words without them — and what you said decides: "mhm", "yeah", "okay" (English) or

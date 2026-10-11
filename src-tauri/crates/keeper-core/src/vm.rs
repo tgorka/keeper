@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
 use crate::agents::approval_card::ApprovalVm;
+use crate::agents::heard::HeardMarkVm;
 use crate::agents::room::{AgentRoomHeaderVm, AgentRoomKindVm, BriefVm};
 use crate::bots::{BotHealthState, ProviderKind};
 use crate::notes::export::NoteExportPlan;
@@ -1454,6 +1455,15 @@ pub struct TimelineBatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub approvals: Option<Vec<ApprovalVm>>,
+    /// An agent session room's marks of where the person stopped listening
+    /// to a spoken answer (97.3, UX-DR143), one per marked answer that is
+    /// loaded and was not heard to its end: sent on the first batch when
+    /// there are any and on every batch after they changed — a mark, or
+    /// the answer's body or its loading. Absent where nothing changed; the
+    /// last list stands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub heard: Option<Vec<HeardMarkVm>>,
 }
 
 /// One member currently typing in the open room (Story 3.9, typing, AD-14,
@@ -9297,6 +9307,7 @@ mod tests {
             ],
             header: None,
             approvals: None,
+            heard: None,
         };
         let json = serde_json::to_string(&batch).expect("serialize batch");
         assert!(json.contains("\"ops\":"), "json was: {json}");
