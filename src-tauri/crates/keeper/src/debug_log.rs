@@ -130,7 +130,13 @@ pub fn init(data_dir: &Path) {
         .with_ansi(false)
         .with_writer(GatedMakeWriter)
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+            tracing_subscriber::EnvFilter::try_new(keeper_sync::logfile::filter(
+                std::env::var(tracing_subscriber::EnvFilter::DEFAULT_ENV)
+                    .ok()
+                    .as_deref(),
+                "info",
+            ))
+            .unwrap_or_else(|_| {
                 tracing_subscriber::EnvFilter::new(keeper_sync::logfile::default_filter("info"))
             }),
         )

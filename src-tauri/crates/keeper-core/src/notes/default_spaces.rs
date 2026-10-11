@@ -352,8 +352,8 @@ pub enum SeedOutcome {
 
 /// The lowest level the desktop app's own subscriber will print.
 ///
-/// `debug_log::init` installs `EnvFilter::try_from_default_env()` falling back
-/// to `EnvFilter::new("info")`, and nothing sets `RUST_LOG` for the macOS app —
+/// `debug_log::init` installs `keeper_sync::logfile::filter` of `RUST_LOG` at
+/// base level `info`, and nothing sets `RUST_LOG` for the macOS app —
 /// a GUI process launched from Finder inherits none. So **`tracing::debug!` is
 /// dead code in production**, on stderr and in `keeper.log` alike.
 ///

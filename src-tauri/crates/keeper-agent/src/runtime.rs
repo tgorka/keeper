@@ -454,6 +454,7 @@ pub(crate) fn deps_over(
         lfs_threshold_bytes: home_drive.profile.lfs_threshold_bytes,
         decisions: None,
         sandbox: None,
+        mcp: None,
     })
 }
 
@@ -838,6 +839,21 @@ pub async fn run(
         }
     };
     let sandbox = sandbox.ok().map(Arc::new);
+    // The `[[mcp]]` servers, each with its bearer token; connected and
+    // listed at the manifest's first renewal and every one after (96.2 #3).
+    let mcp = Arc::new(crate::mcp::McpServers::new(
+        config
+            .mcp
+            .iter()
+            .map(|entry| {
+                let token = entry
+                    .credential
+                    .as_ref()
+                    .and_then(|secret| secrets.get(secret.name()).ok().flatten());
+                (entry.clone(), token)
+            })
+            .collect(),
+    ));
 
     let sessions_zones: Vec<PathBuf> = drives
         .iter()
@@ -901,6 +917,7 @@ pub async fn run(
                     anchor: Anchor::Pinned(config.trust.clone()),
                 })),
                 sandbox: sandbox.clone(),
+                mcp: Some(Arc::clone(&mcp)),
                 ..deps
             }),
             Err(sentence) => {
@@ -926,7 +943,8 @@ pub async fn run(
         &drives,
         copies.clone(),
         sandbox.is_some(),
-    );
+    )
+    .with_mcp(Arc::clone(&mcp));
     doorbell.set_principal_agents(hosts.principal_agents());
     // Each steward's triage and harvest sessions are made from the first
     // tick on, beside the lease clock (R66, R165).
@@ -951,7 +969,11 @@ pub async fn run(
     let engine = Arc::clone(&agentd.engine);
     let mut supervisor = tokio::spawn(async move { engine.run(engine_shutdown).await });
 
-    let mut status = StatusFile::new(dirs.state.join(STATUS_FILE), sandbox_status);
+    let mut status = StatusFile::new(
+        dirs.state.join(STATUS_FILE),
+        sandbox_status,
+        Arc::clone(&mcp),
+    );
     let trust = Arc::new(Mutex::new(Vec::<Value>::new()));
     let trust_reader = tokio::spawn(read_trust(
         config.trust.clone(),
@@ -2552,15 +2574,19 @@ struct StatusFile {
     /// What the start's probe found: `landlock ABI 7, seccomp ok`, or
     /// `unavailable — <reason>` (96.1 #11).
     sandbox: String,
+    /// Each MCP server as it last answered, and each tool not offered with
+    /// why (96.2 #3, #5).
+    mcp: Arc<crate::mcp::McpServers>,
     /// The last body written, without its time, and when.
     last: Option<(String, Instant)>,
 }
 
 impl StatusFile {
-    fn new(path: PathBuf, sandbox: String) -> StatusFile {
+    fn new(path: PathBuf, sandbox: String, mcp: Arc<crate::mcp::McpServers>) -> StatusFile {
         StatusFile {
             path,
             sandbox,
+            mcp,
             last: None,
         }
     }
@@ -2623,6 +2649,7 @@ impl StatusFile {
             "claims": hosts.held(),
             "trust": trust,
             "sandbox": self.sandbox,
+            "mcp": self.mcp.status(),
         });
         let body = status.to_string();
         let fresh = self

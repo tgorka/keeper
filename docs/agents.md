@@ -503,7 +503,8 @@ line `{op: review, ref: memory | skill | memory,skill}`, then one more model run
 conversation and Hermes' review prompt (adapted to these tools; `keeper-ported/src/hermes/
 UPSTREAM.md` lists every change). The review is offered the drive reads, `drive_search`,
 `skills_list`, `skill_view`, and `memory_propose` for the memory nudge or `skill_propose` for the
-skill nudge — nothing else that writes, sends or delegates, no `helper`, and nothing it says
+skill nudge — nothing else that writes, sends or delegates, no `helper`, no MCP server's tool
+(one it calls anyway is refused and nothing reaches the server), and nothing it says
 reaches the room. Its lines hang under its `memory` line and are never replayed as the
 conversation; its tokens count, and are charged to the turn's `[limits].tokens_per_turn` with the
 answer's rounds and its helpers': a pass starts only when they left some of it, no review round
@@ -900,7 +901,8 @@ may read or raises trust, so a summary of a private file is as private as the fi
 | a message from another reader | the sender and the room's readers | `peer` |
 | a message from anyone else | the sender and the room's readers | `untrusted` |
 | another agent's message | that agent's session label | that label's |
-| anything from outside: a fetched page, an MCP result, a screen | anyone | `untrusted` |
+| an MCP server's answer | the server's configured `readers` | `untrusted` |
+| anything else from outside: a fetched page, a screen | anyone | `untrusted` |
 
 `owner` means "committed by a reader's keeper", not "written by that person": a reader's keeper
 syncs whatever lands in the drive, including words pasted from elsewhere. That is why the
@@ -1265,6 +1267,103 @@ profile and keeping every grant the run had: the workspace, read and write; the 
 asked to read, read-only, for a run without network (a networked run reads no drive); no secret,
 no other drive, and no network the run did not have (DW-757). Without a sandbox `run` is not
 offered and nothing runs unsandboxed. ⌘9 bots and scheduled tasks never have `run`.
+
+## MCP servers
+
+An agent can use the tools of an MCP server its **host** names for it — never one a drive, a
+session or a project file names: a `.mcp.json`, a `.cursor/mcp.json` or an `opencode.json` anywhere
+is never read. keeper is an MCP client only. On a Linux host the servers are `agentd.toml`'s
+`[[mcp]]` tables; an agent uses those its `agent.toml` lists in `[tools].mcp`:
+
+```toml
+[[mcp]]
+name       = "notes"                         # letters, digits, - and _; never __, nor _ at an end
+url        = "https://notes.example.org/mcp" # or command = ["/usr/local/bin/notes-mcp", "--stdio"]
+credential = "secret:notes"                  # optional; the bearer token a url server is sent
+readers    = ["@tgorka:<homeserver>"]        # who reads what reaches it; ["*"] by default
+trust_annotations = false                    # optional; only you set it
+
+[[mcp.tier]]                                 # optional; only you write these
+tool = "search"
+tier = "T0"
+```
+
+The grammar is closed: an unknown key, `url` and `command` together or neither, an empty or (on a
+phone) any `command`, a `credential` beside `command` (a program you start reads its own secrets),
+a URL that is not `http(s)://` with a host or that carries a user or password, a `readers` entry
+that is not a Matrix user id or `"*"`, a `fingerprint` that is not `sha256:` and 64 hex digits, a
+`role` outside `paseo`, `kvm:<id>` (and, on the Mac only, `screen`), a `[[mcp.tier]]` row whose
+`tier` is not `T0`…`T5` or whose `tool` repeats, a row on a `role` server, and two servers of one
+name are each refused naming the entry. A server with a `fingerprint` is not connected to yet:
+keeper does not check a pinned certificate for MCP servers in this version (DW-810).
+
+**Offered while it answers.** At start and at every renewal of its manifest (60 s) the host connects
+to each server it is not connected to and asks for its tools — beside the renewal, never holding
+it: a server that does not answer cannot delay the manifest or a session's claim. A server that
+answered offers its tools to the agents that list it, and the manifest says `mcp:<name>`, renewed
+as soon as a server comes to answer or stops. What the host offers — to placement here and in the
+manifest — is read again at every tick; a renewal that failed, even one whose send reached the
+homeserver and only its read-back failed, is tried again at the next tick whatever the servers did
+meanwhile, until one succeeds. One that did not answer is left out, so an agent whose
+`[host].needs` names it waits for a host where it answers. A server that says its tools changed is
+asked again at once — one listing of a server at a time, however many times it says so, and an
+older answer never replaces a newer one. A server whose list is over 512 tools or 32 pages, that
+names one tool twice (on one page or across pages), or that sends one message over 4 MiB, is
+refused, not offered in part. `keeper-agentd status` lists each server an agent names: answering
+and how many tools it offers, each tool it does not offer and why, or why it does not answer —
+every reason redacted like the session log, and keeper's log never holds what a server sent,
+whatever `RUST_LOG` says.
+
+**Names on the wire.** A tool travels to the model as `mcp__<server>__<tool>`; the log, the audit
+row and the card name it `mcp:<server>/<tool>`. A tool whose name would be over 64 characters, or
+holds a character outside letters, digits, `-` and `_`, or a `__`, is not offered — it is listed in
+`status` with why.
+
+**Tiers.** A tool is T3 unless you said otherwise: a `[[mcp.tier]]` row sets its tier; with
+`trust_annotations = true` a tool the server marks `readOnlyHint` without `destructiveHint` or
+`openWorldHint` is T0 and any other T3 — annotations are what a server says about itself, read
+only when you vouch for it. A `command` server runs with the host's rights, so its tools are never
+below T2. A `role` server takes its role's table and nothing else: Paseo's four verbs, described to
+the model in keeper's words; the Mac's screen and a KVM's tables come with those features, and
+until then none of their tools is offered. In a session that read something `untrusted`, Paseo's
+`create_agent` and `send_agent_prompt` are refused outright, never asked.
+
+**What an approval binds.** An MCP approval is for the one call, never for the session. It binds
+which server the connection reached — its name, its whole URL (scheme, host, port, path and query),
+or its argv, the program it resolved to and that program's SHA-256 as it was started, and its pinned
+certificate — and the tool's schema, annotations and tier as listed. Before the approval is used,
+keeper asks the server for its tools again: a server gone, moved, started anew from changed bytes,
+or whose tool changed is refused, never consumed; and a tool that changes while the approval is
+being used is not sent. A call is sent exactly as it was checked: on the connection whose list the
+tool was offered from — that connection itself, never another that looks like it — and only while
+the server still lists the tool as it did. It is checked as the turn sends it and again in the one
+step that dispatches it, the request already built and the connection's writer already had: a list
+or a lost connection that lands before that step sends nothing, and one that lands after it finds
+the call already on its way — otherwise it is refused and nothing is sent. A child server that is
+not reading what keeper writes leaves the call waiting with nothing of it sent, and the call is
+checked again each time keeper tries the pipe, until the pipe takes its first byte. A program
+keeper cannot read is never started. Arguments that are not a JSON object are refused, never sent
+as another call.
+
+**A send to its readers.** A call is a send of what the session holds to the server's `readers`,
+checked before anything reaches the server: a session read by tgorka and marta cannot call a
+server read by anyone, and the call is refused saying so. A call runs on its own, for at most
+120 s, and is sent once: a server that answers HTTP 404 because it forgot the session gets no new
+session and no second copy of the call — its answer reaches the model like any error. A stop or
+the deadline before a child server's pipe took any of the call withdraws it, and nothing is
+sent; one stopped while still being written ends that child's connection — keeper closes its end of
+the pipe under the call, so the rest never arrives even at a process the child started that still
+holds the pipe, and no call queued behind it is written; a call already sent is cancelled with the
+server, and the model is told it is unknown whether it took effect and whether keeper could tell
+the server.
+
+**Outside content.** Everything a server wrote is outside content: the descriptions and schemas of
+the tools offered — their server's label joins the session's before the model is asked, whether or
+not a tool is called — and every answer, an error included. An answer reaches the model under the
+sentence that it is data, not instructions, cut at 79 KiB with how much there was; it is labelled
+`untrusted` and read by the server's `readers`, joined into the session's label (a `label` line),
+and a secret-shaped string in it reaches the log redacted. keeper's client declares no roots,
+sampling or elicitation, and a server that asks for any is refused and logged.
 
 ## When an action waits
 
@@ -1962,8 +2061,9 @@ the bots' URL rules; an `[[agents]] drive` must be a `[[drives]] id`. Two `[[dri
 one `remote`. `[[trust]]` needs `user`;
 `master_key` (`ed25519:<unpadded base64>`) is written by a person after comparing the fingerprint
 with the person's own device, never by keeper, and without it the person is not pinned and no
-decision of theirs is accepted (*Deciding*). `[[mcp]]` and `[[kvm]]` are read and checked now and
-used by later epics; an `[[mcp]] role = "kvm:<id>"` must name a `[[kvm]] id`. `[sandbox]` is
+decision of theirs is accepted (*Deciding*). `[[mcp]]` names the agents' MCP servers (§ *MCP
+servers*); `[[kvm]]` is read and checked now and used by a later epic, each `id` once, and an
+`[[mcp]] role = "kvm:<id>"` must name a `[[kvm]] id`. `[sandbox]` is
 `run`'s (§ *Running a command*):
 
 ```toml
@@ -3294,7 +3394,8 @@ Mac — and every copy is in the session's room. Exactly one host writes a sessi
 that holds its **claim**.
 
 **Each host's manifest.** Every host keeps `dev.keeper.agent.host` in its principal's control room,
-under its slug: its capabilities (`mcp:<name>`, `kvm:<id>`; the Mac offers none yet), its drives
+under its slug: its capabilities (`sandbox`; `mcp:<name>` for each MCP server that answered its last
+`tools/list`; `kvm:<id>`; the Mac offers `sandbox` only yet), its drives
 with whether each is checked out and how much of it is on disk (`full`, `partial`, `virtual`), the
 bots it resolves, the agents it hosts, `always_on`, and its version. It is renewed every 60 s and
 lapses 180 s after its last renewal by the homeserver's clock. A state event is not encrypted, so a

@@ -97,7 +97,8 @@ fn served_as_lfs_filter() -> bool {
 }
 
 /// stderr only, no ANSI: journald keeps it, and a log file would be a second
-/// copy of what the journal already holds. `RUST_LOG` beats `--verbose`.
+/// copy of what the journal already holds. `RUST_LOG` beats `--verbose`,
+/// never what keeps MCP servers' messages out ([`keeper_sync::logfile::filter`]).
 fn init_logging(verbose: u8) {
     use tracing_subscriber::filter::EnvFilter;
 
@@ -106,7 +107,8 @@ fn init_logging(verbose: u8) {
         1 => "debug",
         _ => "trace",
     };
-    let filter = EnvFilter::try_from_default_env()
+    let asked = std::env::var(EnvFilter::DEFAULT_ENV).ok();
+    let filter = EnvFilter::try_new(keeper_sync::logfile::filter(asked.as_deref(), level))
         .unwrap_or_else(|_| EnvFilter::new(keeper_sync::logfile::default_filter(level)));
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
