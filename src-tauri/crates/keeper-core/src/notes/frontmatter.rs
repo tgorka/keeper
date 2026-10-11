@@ -256,7 +256,8 @@ impl Frontmatter {
     }
 
     /// Delete `key` and its lines. Unknown key, or no block at all, returns the
-    /// source unchanged.
+    /// source unchanged. The body's bytes stay the body's: an emptied block is
+    /// taken out only when what follows it would not then be read as one.
     pub fn remove_in(source: &str, key: &str) -> String {
         let (fm, body_offset) = Self::parse(source);
         let Some(entry) = fm.entry(key) else {
@@ -265,12 +266,17 @@ impl Frontmatter {
 
         // If only whitespace would be left between the fences, take the block
         // with it: `---\n---\n` is noise Obsidian renders as an empty property
-        // list. Comments count as content and keep the block alive.
+        // list. Comments count as content and keep the block alive. So does a
+        // body that opens with a block of its own: without the empty one in
+        // front, its lines would turn from body into frontmatter.
         let head = &source[fm.inner.0..entry.line_span.0];
         let tail = &source[entry.line_span.1.min(fm.inner.1)..fm.inner.1];
         if head.trim().is_empty() && tail.trim().is_empty() {
             let bom = bom_len(source);
-            return format!("{}{}", &source[..bom], &source[body_offset..]);
+            let dropped = format!("{}{}", &source[..bom], &source[body_offset..]);
+            if !Self::parse(&dropped).0.has_block() {
+                return dropped;
+            }
         }
 
         splice(source, entry.line_span, "")
@@ -443,6 +449,41 @@ impl Frontmatter {
     /// keys in it still counts.
     pub fn has_block(&self) -> bool {
         !self.block.is_empty()
+    }
+
+    /// What lies between the fences, verbatim: `""` when there is no block.
+    pub fn inner_text(&self) -> &str {
+        &self.block[self.inner.0..self.inner.1]
+    }
+
+    /// Every line between the fences that no key claims — blank lines and
+    /// comments aside — verbatim: what the subset skipped whole (an explicit
+    /// `? key`, a flow map, an anchor, a merge key, a stray indented line),
+    /// so that a key it holds is neither in [`Frontmatter::keys`] nor counted
+    /// by [`Frontmatter::count`]. A writer that must vouch for every key a
+    /// YAML reader would see reads these as keys it cannot name.
+    pub fn unclaimed_lines(&self) -> Vec<&str> {
+        let mut out = Vec::new();
+        let mut at = self.inner.0;
+        while at < self.inner.1 {
+            let Some((start, end, next)) = line_bounds(&self.block, at) else {
+                break;
+            };
+            at = next;
+            let line = &self.block[start..end];
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            if !self
+                .entries
+                .iter()
+                .any(|entry| entry.line_span.0 <= start && end <= entry.line_span.1)
+            {
+                out.push(line);
+            }
+        }
+        out
     }
 
     fn entry(&self, key: &str) -> Option<&Entry> {
@@ -1473,6 +1514,15 @@ Body text that must not move.
             Frontmatter::remove_in("---\n# why\npinned: true\n---\nbody\n", "pinned"),
             "---\n# why\n---\nbody\n"
         );
+        // …and so does a body that opens with a block, which would otherwise
+        // be read as the frontmatter.
+        for bom in ["", "\u{feff}"] {
+            let body = "---\ntitle: T\n---\nbody\n";
+            assert_eq!(
+                Frontmatter::remove_in(&format!("{bom}---\npinned: true\n---\n{body}"), "pinned"),
+                format!("{bom}---\n---\n{body}")
+            );
+        }
     }
 
     #[test]

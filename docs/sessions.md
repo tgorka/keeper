@@ -1098,12 +1098,50 @@ they are what keeper tried. A path written from the drive root (`40-media/clip.m
 resolves against the synced folder, not against your home directory, and a path with `..`
 in it is refused rather than followed out of the folder.
 
+## The promote panel
+
+The record's `## Promote` table is the promotion contract, and the panel renders it without
+owning it (FR-243, FR-244). `sessions_promote_panel` answers every row with its state — `ok`;
+`stale` when the source's content differs from the target's and changed later (by commit time
+for a synced file, so a checkout or a review-only edit does not move it; by mtime for
+`workspace/` and for a session file's change not committed yet; a vault copy by its commits
+alone); a quiet `missing source`, which is what a workspace cleaned up at archive leaves; a loud
+`missing target`, only where the disk says the file is not there; `unknown`, with why, for a
+file that is there but could not be read, one behind a folder that may not be searched, or two
+that differ when which changed last is not known; and an unreadable line, shown exactly as written — plus
+the `workspace/` files no row names, each one action from promotion (listed, never read), and
+the session's harvested notes (`artifacts/knowledge/`, see `docs/agents.md` § *Knowledge from
+sessions*). What it could not see — a folder that would not list, more than 4096 files — it
+says. `sessions_promote` copies a `workspace/` file into `artifacts/` once it has been still
+for the profile's settle window and read whole as one version — otherwise "still being written;
+try again in a moment" — copying exactly the bytes that were read, and records its one row in
+the same journaled plan, the row first, every other byte of the README kept; a copy that fails
+after the row leaves `missing target`, and promoting again finishes it. The copy and the
+README are staged under fresh names of their own, never written through an entry planted at the
+staging name; a row appended to a table that ends the file without a line break goes on a line
+of its own. A promotion out keeps the version it admitted in `.keeper/promote-out.json` until
+its row and its copy have both landed, and the zone's next promotion out finishes it with that
+version or refuses it with why. A second promotion of
+the same source replaces the target and keeps one row; a note a table cell cannot hold (a `|`,
+a line break) is refused before anything is copied. A target outside `artifacts/` is the
+drive's, drive-relative: an artifact promoted into the drive's notes vault
+(`| artifacts/knowledge/<…>.md | 10-notes/knowledge/<note>.md | knowledge | <digest> |`), only inside the
+vault, never through a folder link, only in the same drive, and only when the session's label
+reaches every reader of the drive as this Mac pinned them. Its fourth cell, written once the copy
+has landed, is the digest of what was published — for a harvested note, its frontmatter's
+contents with the review keys out and its body, kept apart, so a review never changes it: a file
+at the target is replaced, or reviewed, only while it is that copy, never because it holds the
+same bytes, and only the source's first row counts. One that is not — a person edited it, or the
+row records no publication — is refused saying why and what to do that keeps the file (R252).
+A renamed file keeps its row and that cell:
+the rename rewrites the session's cells, never a drive-relative target. The panel's screen is the
+next rung's (`agents-95-panel`).
+
 ## What is not here yet
 
-The promote panel (per-row promote review with staleness badges), unread marks and
-per-file history projections on rows, capture-into-session-log, the sticky current
-session in the tray, and wikilinking a session from a note. All specified
-(FR-229/235/236/241) and scheduled; none implemented. Sessions on iOS are out of scope
+Unread marks and per-file history projections on rows, capture-into-session-log, the
+sticky current session in the tray, and wikilinking a session from a note (FR-235, FR-236,
+FR-241, DW-391). All specified and scheduled; none implemented. Sessions on iOS are out of scope
 with the rest of the sync surface.
 
 Two things that were on this list are now shipped, and are listed here only because the

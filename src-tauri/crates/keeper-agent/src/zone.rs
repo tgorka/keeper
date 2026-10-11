@@ -55,13 +55,15 @@ pub struct FoundSession {
     pub scheduled: crate::cards::ScheduledScan,
 }
 
-/// A file's text under `root`, reached through `browse::resolve`; `None`
-/// when it is not there. A link out of `root`, or anything but a regular
-/// file (a pipe would never end a read), is refused.
+/// A file's text under `root`, reached through `browse::resolve_known`;
+/// `None` only when the disk says it is not there. A link out of `root`, a
+/// dangling link, a folder on the way that cannot be searched, or anything
+/// but a regular file (a pipe would never end a read), is refused: what is
+/// there is not known, which is not the same as nothing.
 pub fn read_text(root: &Path, rel: &str) -> Result<Option<String>, String> {
-    match browse::resolve(root, rel) {
-        Ok(Some(path)) if !path.is_file() => Err(format!("{rel} is not a file")),
-        Ok(Some(path)) => match std::fs::read_to_string(&path) {
+    match browse::resolve_known(root, rel).map(browse::Known::landed) {
+        Ok(Some(landing)) if !landing.path().is_file() => Err(format!("{rel} is not a file")),
+        Ok(Some(landing)) => match std::fs::read_to_string(landing.path()) {
             Ok(text) => Ok(Some(text)),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(format!("{rel} could not be read: {error}")),

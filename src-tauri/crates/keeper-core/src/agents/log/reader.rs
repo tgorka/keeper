@@ -87,7 +87,16 @@ pub fn read_session(session_dir: &Path) -> SessionLog {
             return log;
         }
         Ok(_) => {}
-        Err(_) => return log,
+        // No log yet: a session that has written nothing.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return log,
+        Err(error) => {
+            log.problems.push(LogProblem {
+                chunk: format!("{LOG_DIR}/"),
+                line: None,
+                sentence: format!("log/ could not be looked at: {error}."),
+            });
+            return log;
+        }
     }
     let entries = match fs::read_dir(&log_dir) {
         Ok(entries) => entries,
@@ -100,24 +109,40 @@ pub fn read_session(session_dir: &Path) -> SessionLog {
             return log;
         }
     };
-    let mut names: Vec<ChunkName> = entries
-        .filter_map(Result::ok)
-        .filter_map(|entry| {
-            let name: ChunkName = entry.file_name().to_str()?.parse().ok()?;
-            if entry.file_type().is_ok_and(|t| t.is_file()) {
-                Some(name)
-            } else {
-                // A link or a folder under a chunk's name is not read, and
-                // says so rather than vanishing from the session.
+    let mut names: Vec<ChunkName> = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                // An entry the listing could not read may be a chunk: the
+                // log is not whole, and says so.
                 log.problems.push(LogProblem {
-                    chunk: name.to_string(),
+                    chunk: format!("{LOG_DIR}/"),
                     line: None,
-                    sentence: "It is not a regular file, so it was not read.".to_owned(),
+                    sentence: format!("An entry of log/ could not be read: {error}."),
                 });
-                None
+                continue;
             }
-        })
-        .collect();
+        };
+        let Some(name) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<ChunkName>().ok())
+        else {
+            continue;
+        };
+        if entry.file_type().is_ok_and(|t| t.is_file()) {
+            names.push(name);
+        } else {
+            // A link or a folder under a chunk's name is not read, and
+            // says so rather than vanishing from the session.
+            log.problems.push(LogProblem {
+                chunk: name.to_string(),
+                line: None,
+                sentence: "It is not a regular file, so it was not read.".to_owned(),
+            });
+        }
+    }
     names.sort();
 
     let mut lines = Vec::new();
@@ -281,4 +306,34 @@ pub fn hydrate_blob(session_dir: &Path, sha256: &str) -> Result<Value, LogError>
         name: sha256.to_owned(),
         detail: e.to_string(),
     })
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    use super::*;
+
+    /// R95K2-01: a session whose `log/` cannot be looked at is a log with
+    /// a problem, never an empty one — a reader deciding from it must know
+    /// it is not whole; a session with no `log/` at all has written
+    /// nothing and says nothing.
+    #[test]
+    fn a_log_that_cannot_be_looked_at_is_not_an_empty_log() {
+        let session = std::env::temp_dir().join(format!("keeper-log-{}", ulid::Ulid::new()));
+        fs::create_dir(&session).expect("session");
+        assert_eq!(read_session(&session), SessionLog::default());
+        fs::create_dir(session.join(LOG_DIR)).expect("log");
+        fs::set_permissions(&session, fs::Permissions::from_mode(0o600)).expect("chmod");
+        let log = read_session(&session);
+        fs::set_permissions(&session, fs::Permissions::from_mode(0o755)).expect("chmod");
+        fs::remove_dir_all(&session).expect("cleaned");
+        assert_eq!(
+            log.problems
+                .iter()
+                .map(|problem| problem.chunk.as_str())
+                .collect::<Vec<_>>(),
+            ["log/"]
+        );
+    }
 }

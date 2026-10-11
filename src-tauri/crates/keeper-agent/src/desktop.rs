@@ -1313,8 +1313,17 @@ mod tests {
             Some("vault".to_owned())
         }
 
-        fn write(&self, _: &str, _: &str, _: &str) -> Result<(), String> {
+        fn write(&self, _: &str, _: &str, _: &str, _: &str) -> Result<(), String> {
             Ok(())
+        }
+
+        fn amend(
+            &self,
+            _: &str,
+            _: &str,
+            _: &dyn Fn(&str) -> Option<String>,
+        ) -> Result<bool, String> {
+            Ok(false)
         }
     }
 

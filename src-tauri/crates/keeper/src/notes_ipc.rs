@@ -4812,16 +4812,21 @@ const AMEND_ATTEMPTS: usize = 3;
 ///
 /// Every live editor on the note is held for the whole operation — its
 /// `released` gate, so no save of its interleaves, then its state — and the
-/// note is read, amended, read again to check nothing moved, and written. An
-/// editor whose base body is the disk's then adopts the new block and revision
-/// and is sent [`NoteBodyBatch::Block`]; a save it already composed against the
-/// revision before counts as current (`LiveEditor::save_base`), so the tags
-/// survive its next autosave and no conflict copy is written. An editor with
-/// an external change pending gets nothing extra: the watcher's usual answer
-/// covers keeper's write too.
+/// note is read, amended, and written only over exactly the text it was
+/// composed from ([`notes_vault::write_note_if`]): the check and the write
+/// are one step to every other write keeper makes to the note, so with no
+/// editor open two amendments, or an amendment and any other keeper write,
+/// cannot overwrite one another — the one that finds the note moved reads
+/// it again and recomposes. An editor whose base body is the disk's then
+/// adopts the new block and revision and is sent [`NoteBodyBatch::Block`];
+/// a save it already composed against the revision before counts as current
+/// (`LiveEditor::save_base`), so the tags survive its next autosave and no
+/// conflict copy is written. An editor with an external change pending gets
+/// nothing extra: the watcher's usual answer covers keeper's write too.
 ///
-/// Lock order: the gates, then the states, each in address order, and
-/// `SUBSCRIPTIONS` only to list the editors, never while holding either.
+/// Lock order: the gates, then the states, each in address order, then the
+/// note's write lock for the check and the write alone; `SUBSCRIPTIONS`
+/// only to list the editors, never while holding any of them.
 pub(crate) fn amend_block(
     vault: &Vault,
     rel: &str,
@@ -4846,11 +4851,9 @@ pub(crate) fn amend_block(
         let Some(next) = live_editor::amend_block(&disk, &amend)? else {
             return Ok(false);
         };
-        let disk_rev = notes_vault::content_rev(&disk);
-        if notes_vault::content_rev(&notes_vault::read_note(vault, rel)?) != disk_rev {
+        if !notes_vault::write_note_if(vault, rel, &disk, &next)? {
             continue;
         }
-        notes_vault::write_note(vault, rel, &next)?;
         let next_rev = notes_vault::content_rev(&next);
         let block = split_note(&next).0;
         for (sub, state) in &mut open {
@@ -7941,6 +7944,68 @@ mod tests {
         assert!(disk.contains("recording/hesperia"), "{disk}");
         assert_eq!(split_note(&disk).1, "Agenda.\n");
         assert!(amend_block(&vault, rel, |text| Some(format!("{text}More.\n"))).is_err());
+        std::fs::remove_dir_all(&vault.root).ok();
+    }
+
+    /// R95K2-04: with no editor open, another amendment made after an
+    /// amendment's check has passed and before its write lands — on
+    /// another thread, in the window the note's write lock closes — waits
+    /// for that write, finds the note moved, and is composed again from
+    /// it: both edits land, neither over the other. R244: the outer write
+    /// goes on only once the other amendment is seen stopped at the note's
+    /// write lock ([`notes_vault::WAITING`]) — or, without the lock, landed
+    /// — and a wait for neither is a watchdog that fails the test, never a
+    /// schedule that lets the two run one after the other.
+    #[test]
+    fn two_amendments_of_a_closed_note_both_land() {
+        use std::sync::mpsc;
+        let vault = test_vault("amend-race");
+        let rel = "amend-race-standup.md";
+        std::fs::write(vault.root.join(rel), "---\ntitle: Standup\n---\nAgenda.\n").expect("note");
+        let other = Arc::new(Mutex::new(None));
+        let (seen, saw) = mpsc::channel();
+        let (racing, raced) = (vault.clone(), Arc::clone(&other));
+        notes_vault::CHECKED.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                let waits = seen.clone();
+                let handle = std::thread::spawn(move || {
+                    notes_vault::WAITING.with(|hook| {
+                        *hook.borrow_mut() = Some(Box::new(move || {
+                            let _ = waits.send("waiting on the lock");
+                        }));
+                    });
+                    let amended = amend_block(&racing, rel, |text| {
+                        Some(text.replacen(
+                            "title: Standup\n",
+                            "title: Standup\nproject: taxes\n",
+                            1,
+                        ))
+                    });
+                    let _ = seen.send("landed");
+                    amended
+                });
+                let first = saw
+                    .recv_timeout(Duration::from_secs(60))
+                    .expect("the other amendment neither reached the note's write lock nor landed");
+                *raced.lock().expect("slot") = Some((handle, first));
+            }));
+        });
+
+        assert!(amend_block(&vault, rel, |text| {
+            Some(keeper_core::notes::note_recording::with_recording_tags(
+                text, "hesperia",
+            ))
+        })
+        .expect("tagged"));
+        let (handle, first) = other.lock().expect("slot").take().expect("raced");
+        assert!(handle
+            .join()
+            .expect("the other amendment")
+            .expect("amended"));
+        let disk = notes_vault::read_note(&vault, rel).expect("note");
+        assert!(disk.contains("project: taxes"), "{disk}");
+        assert!(disk.contains("recording/hesperia"), "{disk}");
+        assert_eq!(first, "waiting on the lock", "{disk}");
         std::fs::remove_dir_all(&vault.root).ok();
     }
 

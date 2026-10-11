@@ -160,12 +160,14 @@ pub enum VerifiedShape {
     /// No `verified:` key at all. Not the same as an empty list.
     #[default]
     Absent,
-    /// The v0.2 form: a list of `{by, at}` entries, every one of them naming an
-    /// actor under `by:`.
+    /// The v0.2 form: a block list of `{by, at}` entries, each item opened by
+    /// `-` and naming an actor under `by:`.
     Canonical,
     /// Anything else that still means "verified": `verified: true` with a
-    /// `verified_by:` actor beside it, `verified: false`, or a list of bare
-    /// actor strings. Read, normalised, and flagged for rewriting.
+    /// `verified_by:` actor beside it, `verified: false`, a list of bare
+    /// actor strings, or one entry written as a map rather than a list item
+    /// (`verified: {by: …}`, or `by:` indented under `verified:` with no
+    /// `-`). Read, normalised, and flagged for rewriting.
     Simplified,
 }
 
@@ -350,6 +352,67 @@ pub fn read(fm: &Frontmatter) -> OkfDoc {
     }
 }
 
+/// `source` with its reviews written as `entries`, in the canonical form
+/// whatever spelling it had: a block list of `{by, at}` maps under
+/// `verified:` in place of every `verified:` line there was, and no
+/// `verified_by:` beside it. An empty `entries` writes no `verified:` at
+/// all. Every other byte is kept, and [`read`] reads back exactly
+/// `entries` — so a flow map, which [`Frontmatter::set_in`] would render
+/// and the block reader would not, is never what keeper writes.
+pub fn write_verified(source: &str, entries: &[Verification]) -> String {
+    let (fm, _) = Frontmatter::parse(source);
+    let newline = if fm.raw_block().contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
+    let mut lines = String::new();
+    if !entries.is_empty() {
+        lines.push_str("verified:");
+        lines.push_str(newline);
+        for entry in entries {
+            lines.push_str(&format!("  - by: {}{newline}", yaml_scalar(&entry.by)));
+            if let Some(at) = &entry.at {
+                lines.push_str(&format!("    at: {}{newline}", yaml_scalar(at)));
+            }
+        }
+    }
+    let source = Frontmatter::remove_all_in(source, "verified_by");
+    Frontmatter::replace_lines_in(&source, "verified", &lines, &["generated"])
+}
+
+/// A scalar as a block entry writes it: bare when the reader takes it back
+/// unchanged, double-quoted otherwise — a `: ` or ` #` inside, a leading
+/// indicator, padding or an empty string. A control character has no
+/// spelling the reader decodes, so it is written as a space.
+fn yaml_scalar(text: &str) -> String {
+    let plain = !text.is_empty()
+        && text.trim() == text
+        && !text.starts_with([
+            '-', '?', ':', ',', '[', ']', '{', '}', '#', '&', '*', '!', '|', '>', '\'', '"', '%',
+            '@', '`',
+        ])
+        && !text.contains(": ")
+        && !text.contains(" #")
+        && !text.ends_with(':')
+        && !text.chars().any(char::is_control);
+    if plain {
+        return text.to_owned();
+    }
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('"');
+    for c in text.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if c.is_control() => out.push(' '),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 /// Keys the standardized section claims, and which therefore do not appear in
 /// [`OkfDoc::retained`]. `verified_by` and `timestamp` are here because they are
 /// *read* — a key this module consumes is not an unknown key.
@@ -396,6 +459,11 @@ fn read_verified(fm: &Frontmatter, block: &str) -> (Vec<Verification>, VerifiedS
         let mut shape = VerifiedShape::Canonical;
         let mut out = Vec::with_capacity(entries.len());
         for entry in entries {
+            // A map where a list item belongs is read, and not the form a
+            // writer leaves: one entry or not, the canonical form is a list.
+            if !entry.listed {
+                shape = VerifiedShape::Simplified;
+            }
             match pick(&entry.pairs, "by") {
                 Some(by) => out.push(Verification {
                     by,
@@ -487,6 +555,132 @@ fn read_sources(fm: &Frontmatter, block: &str) -> Vec<Source> {
         .collect()
 }
 
+/// `sources:` read strictly, for a writer that vouches for every source
+/// before it stores a document: no `sources:` is no sources; otherwise one
+/// `sources:` key whose value is a block list, every item a bare scalar or a
+/// map of plain `key: value` lines with one `resource:` and no key twice.
+/// Anything [`read`] would drop, flatten or not see — a flow list or map, an
+/// inline value, a second level of nesting, an item with no resource, an
+/// anchor, a tag or an explicit key — is refused with the line it stops at.
+/// What it returns is exactly what [`read`] reads.
+///
+/// # Errors
+/// The line, verbatim and trimmed, that keeps the list from being read
+/// whole.
+pub fn strict_sources(fm: &Frontmatter) -> Result<Vec<Source>, String> {
+    match fm.count("sources") {
+        0 => return Ok(Vec::new()),
+        1 => {}
+        _ => return Err("sources: (written more than once)".to_owned()),
+    }
+    let lines = fm.lines_of("sources");
+    let opaque = |text: &str| {
+        text.starts_with([
+            '{', '[', '|', '>', '&', '*', '!', '%', '?', '@', '`', ',', ']', '}',
+        ])
+    };
+    let mut items: Vec<BlockEntry> = Vec::new();
+    let mut item_indent = None;
+    let mut pair_indent = None;
+    let mut at = 0usize;
+    let mut first = true;
+    while let Some((start, end, next)) = line_bounds(&lines, at) {
+        at = next;
+        let line = &lines[start..end];
+        let trimmed = line.trim_start();
+        let refused = || Err(line.trim().to_owned());
+        if first {
+            first = false;
+            let Some((_, colon)) = split_key(trimmed) else {
+                return refused();
+            };
+            if !scalar_text(&trimmed[colon + 1..]).is_empty() {
+                return refused();
+            }
+            continue;
+        }
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let indent = line.len() - trimmed.len();
+        let pair = match dash_rest(trimmed) {
+            Some(rest) => {
+                if *item_indent.get_or_insert(indent) != indent {
+                    return refused();
+                }
+                items.push(BlockEntry::default());
+                pair_indent = (!rest.is_empty()).then(|| indent + (trimmed.len() - rest.len()));
+                rest
+            }
+            None if item_indent.is_some_and(|items_at| indent > items_at)
+                && *pair_indent.get_or_insert(indent) == indent =>
+            {
+                trimmed
+            }
+            None => return refused(),
+        };
+        if pair.is_empty() {
+            continue;
+        }
+        let Some(entry) = items.last_mut() else {
+            return refused();
+        };
+        if opaque(pair) {
+            return refused();
+        }
+        match split_key(pair) {
+            Some((name, colon)) => {
+                let raw = trimmed_value(&pair[colon + 1..]);
+                let Some(value) = scalar(raw) else {
+                    return refused();
+                };
+                if value.is_empty()
+                    || opaque(raw)
+                    || name.contains('\\')
+                    || entry.pairs.iter().any(|(seen, _)| seen == name)
+                    || entry.bare.is_some()
+                {
+                    return refused();
+                }
+                entry.pairs.push((name.to_owned(), value));
+            }
+            None if entry.bare.is_none() && entry.pairs.is_empty() && !pair.contains(": ") => {
+                let Some(bare) = scalar(pair) else {
+                    return refused();
+                };
+                entry.bare = Some(bare);
+            }
+            None => return refused(),
+        }
+    }
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let source = match item.bare {
+            Some(resource) if !resource.is_empty() => Source {
+                resource,
+                ..Source::default()
+            },
+            Some(_) => return Err("sources: (an empty item)".to_owned()),
+            None => source_of(&item.pairs)
+                .ok_or_else(|| "sources: (an item with no resource)".to_owned())?,
+        };
+        out.push(source);
+    }
+    if read_sources(fm, fm.raw_block()) != out {
+        return Err("sources: (read two ways)".to_owned());
+    }
+    Ok(out)
+}
+
+/// A value's text with its trailing comment and padding off, quotes kept.
+fn trimmed_value(text: &str) -> &str {
+    let text = text.trim();
+    if text.starts_with(['"', '\'']) {
+        return text;
+    }
+    strip_comment(text).trim_end()
+}
+
 /// An entry map with no `resource:` is dropped: it is the only field OKF
 /// requires inside an entry, and a source that does not say what it is has
 /// nothing a reader could follow.
@@ -522,6 +716,9 @@ struct BlockEntry {
     bare: Option<String>,
     /// `- key: value`, plus the indented `key: value` lines beneath it.
     pairs: Vec<(String, String)>,
+    /// Whether a `-` opened it: a list item, not a lone map — a flow map or
+    /// indented pairs with no `-` above them.
+    listed: bool,
 }
 
 /// The pairs of a one-level map, from wherever the document put them.
@@ -586,7 +783,11 @@ fn block_entries(block: &str, key: &str) -> Vec<BlockEntry> {
             }
             let text = scalar_text(&trimmed[colon + 1..]);
             if let Some(pairs) = flow_map(&text) {
-                out.push(BlockEntry { bare: None, pairs });
+                out.push(BlockEntry {
+                    bare: None,
+                    pairs,
+                    listed: false,
+                });
                 return out;
             }
             if text.is_empty() {
@@ -607,7 +808,10 @@ fn block_entries(block: &str, key: &str) -> Vec<BlockEntry> {
 
         let item = match dash_rest(trimmed) {
             Some(rest) => {
-                out.push(BlockEntry::default());
+                out.push(BlockEntry {
+                    listed: true,
+                    ..BlockEntry::default()
+                });
                 rest
             }
             None => {
@@ -665,13 +869,23 @@ fn split_key(trimmed: &str) -> Option<(&str, usize)> {
 }
 
 /// One scalar as a human wrote it, read back as its text: padding, a trailing
-/// comment and surrounding quotes removed.
+/// comment and surrounding quotes removed, a double-quoted value's escapes
+/// decoded as YAML decodes them ([`scalar`]); one YAML does not define is
+/// left as written.
 ///
 /// A `#` only opens a comment when whitespace precedes it — the same rule the
 /// frontmatter scanner uses — so `resource: https://example.com/a#frag` keeps
 /// its fragment. Inside a quoted value nothing is stripped but the quotes and
 /// their escapes.
 fn scalar_text(text: &str) -> String {
+    scalar(text).unwrap_or_else(|| text.trim().to_owned())
+}
+
+/// [`scalar_text`], or `None` for a double-quoted value whose meaning a
+/// YAML reader would not agree on: an escape YAML does not define, or a
+/// quote left unescaped inside it. Every escape YAML defines is decoded —
+/// `"\u0068uman:x"` is `human:x` to every reader, so it is here too.
+fn scalar(text: &str) -> Option<String> {
     let text = text.trim();
     for quote in ['"', '\''] {
         if let Some(rest) = text.strip_prefix(quote) {
@@ -680,12 +894,61 @@ fn scalar_text(text: &str) -> String {
             };
             let inner = &rest[..close];
             return match quote {
-                '"' => inner.replace("\\\"", "\"").replace("\\\\", "\\"),
-                _ => inner.replace("''", "'"),
+                '"' => unescape_double(inner),
+                _ => Some(inner.replace("''", "'")),
             };
         }
     }
-    strip_comment(text).trim_end().to_owned()
+    Some(strip_comment(text).trim_end().to_owned())
+}
+
+/// The text of a double-quoted YAML scalar's inside, its escapes decoded
+/// (YAML 1.2 §5.7); `None` for an escape YAML does not define or an
+/// unescaped `"`.
+fn unescape_double(inner: &str) -> Option<String> {
+    fn code(chars: &mut std::str::Chars<'_>, digits: usize) -> Option<char> {
+        let mut value = 0u32;
+        for _ in 0..digits {
+            value = value * 16 + chars.next()?.to_digit(16)?;
+        }
+        char::from_u32(value)
+    }
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => return None,
+            '\\' => {}
+            c => {
+                out.push(c);
+                continue;
+            }
+        }
+        out.push(match chars.next()? {
+            '0' => '\0',
+            'a' => '\u{7}',
+            'b' => '\u{8}',
+            't' | '\t' => '\t',
+            'n' => '\n',
+            'v' => '\u{b}',
+            'f' => '\u{c}',
+            'r' => '\r',
+            'e' => '\u{1b}',
+            ' ' => ' ',
+            '"' => '"',
+            '/' => '/',
+            '\\' => '\\',
+            'N' => '\u{85}',
+            '_' => '\u{a0}',
+            'L' => '\u{2028}',
+            'P' => '\u{2029}',
+            'x' => code(&mut chars, 2)?,
+            'u' => code(&mut chars, 4)?,
+            'U' => code(&mut chars, 8)?,
+            _ => return None,
+        });
+    }
+    Some(out)
 }
 
 fn strip_comment(text: &str) -> &str {

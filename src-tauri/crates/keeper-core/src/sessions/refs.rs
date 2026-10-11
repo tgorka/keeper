@@ -759,7 +759,8 @@ fn markdown_dest(inner: &str) -> Option<(usize, usize)> {
 /// A touched row is re-rendered in [`super::promote::render_row`]'s canonical
 /// spelling, which is what [`super::promote::upsert_row`] already does to a row
 /// it updates — so the table has one writer and one shape, rather than two that
-/// disagree about padding.
+/// disagree about padding. The copy a row records as published goes with it:
+/// a renamed source is the same source, and a drive target is never renamed here.
 fn promote_edits(body: &str, from: &str, to: &str, out: &mut Vec<(usize, usize, String)>) {
     let Some(table) = super::promote::parse(body) else {
         return;
@@ -769,6 +770,7 @@ fn promote_edits(body: &str, from: &str, to: &str, out: &mut Vec<(usize, usize, 
             source,
             target,
             note,
+            published,
         } = row
         else {
             continue;
@@ -786,7 +788,12 @@ fn promote_edits(body: &str, from: &str, to: &str, out: &mut Vec<(usize, usize, 
             }
             renamed_target(cell, from, to)
         };
-        let (new_source, new_target) = (moved(source), moved(target));
+        // A target out of the session is drive-relative (R138): a session
+        // file of the same spelling moving says nothing about it.
+        let new_source = moved(source);
+        let new_target = super::promote::target_in_session(target)
+            .then(|| moved(target))
+            .flatten();
         if new_source.is_none() && new_target.is_none() {
             continue;
         }
@@ -797,6 +804,7 @@ fn promote_edits(body: &str, from: &str, to: &str, out: &mut Vec<(usize, usize, 
                 new_source.as_deref().unwrap_or(source),
                 new_target.as_deref().unwrap_or(target),
                 note,
+                published.as_deref(),
             ),
         ));
     }

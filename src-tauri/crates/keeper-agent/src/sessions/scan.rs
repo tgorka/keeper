@@ -166,10 +166,14 @@ pub fn dir_names(path: &Path) -> Vec<String> {
 /// layer's job (it owns the one writer) — until then the row is honest about
 /// indexing by path, exactly as notes treat a foreign id (FR-226).
 fn id_of(fm: &Frontmatter, rel: &str) -> String {
+    named_id(fm).unwrap_or_else(|| format!("path:{rel}"))
+}
+
+/// The record's frontmatter `id`, when it names one.
+fn named_id(fm: &Frontmatter) -> Option<String> {
     fm.as_string("id")
         .map(str::to_owned)
         .filter(|id| !id.trim().is_empty())
-        .unwrap_or_else(|| format!("path:{rel}"))
 }
 
 /// The id [`row_for`] would give this session, from its record alone — what a
@@ -178,6 +182,15 @@ pub fn session_id(dir: &Path, rel: &str) -> String {
     let readme = std::fs::read_to_string(dir.join(README)).unwrap_or_default();
     let (fm, _) = Frontmatter::parse(&readme);
     id_of(&fm, rel)
+}
+
+/// The id the session record in `dir` names, `None` when it names none —
+/// where [`session_id`] stands in a path-derived one — or why the record
+/// could not be read: for a caller that acts on which session is at a path,
+/// to whom a path stand-in or an unread record is never an identity.
+pub fn recorded_id(dir: &Path) -> std::io::Result<Option<String>> {
+    let readme = std::fs::read_to_string(dir.join(README))?;
+    Ok(named_id(&Frontmatter::parse(&readme).0))
 }
 
 /// Project one session directory into its board row. `None` only when the

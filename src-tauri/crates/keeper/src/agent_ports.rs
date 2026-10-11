@@ -220,7 +220,7 @@ pub(crate) fn task_env(platform: Arc<dyn Platform>) -> TurnEnv {
 }
 
 #[cfg(desktop)]
-mod drive {
+pub(crate) mod drive {
     use std::sync::Arc;
 
     use keeper_agent::ports::{ApprovalPort, ProfileSource, VaultWriter};
@@ -239,23 +239,53 @@ mod drive {
         }
     }
 
-    /// A write that lands in a registered notes vault: written, then the
-    /// reconciler and the dirty mark told, as an edit in the editor would be.
-    struct NotesVaultWriter;
+    /// A write that lands in a registered notes vault: written durably,
+    /// then the reconciler and the dirty mark told, as an edit in the
+    /// editor would be.
+    pub(crate) struct NotesVaultWriter;
 
     impl VaultWriter for NotesVaultWriter {
         fn subfolder(&self, profile_id: &str) -> Option<String> {
             crate::notes_vault::vault(profile_id).map(|vault| vault.config.subfolder)
         }
 
-        fn write(&self, profile_id: &str, rel: &str, text: &str) -> Result<(), String> {
+        fn write(
+            &self,
+            profile_id: &str,
+            subfolder: &str,
+            rel: &str,
+            text: &str,
+        ) -> Result<(), String> {
             let vault = crate::notes_vault::vault(profile_id)
                 .ok_or_else(|| format!("the notes vault in {profile_id} is no longer open"))?;
-            crate::notes_vault::write_vault_file(&vault, rel, text)
+            if vault.config.subfolder != subfolder {
+                return Err(format!(
+                    "the notes vault in {profile_id} is at {} now, not at {subfolder} where this write was checked, so nothing was written",
+                    vault.config.subfolder
+                ));
+            }
+            crate::notes_vault::write_vault_file_durable(&vault, rel, text)
                 .map_err(|error| error.to_string())?;
             crate::notes_vault::touch(&vault.id, vec![rel.to_owned()]);
             crate::notes_vault::mark_dirty(&vault.id);
             Ok(())
+        }
+
+        /// Through the notes editor's own guarded amend: every live editor
+        /// on the note held, the note read, amended and written only over
+        /// exactly the text it read — the check and the write one step to
+        /// every other write keeper makes to it, open in an editor or not
+        /// (`notes_vault::write_note_if`) — and an editor that has it open
+        /// adopts the new block.
+        fn amend(
+            &self,
+            profile_id: &str,
+            rel: &str,
+            amend: &dyn Fn(&str) -> Option<String>,
+        ) -> Result<bool, String> {
+            let vault = crate::notes_vault::vault(profile_id)
+                .ok_or_else(|| format!("the notes vault in {profile_id} is no longer open"))?;
+            crate::notes_ipc::amend_block(&vault, rel, amend).map_err(|error| error.to_string())
         }
     }
 
