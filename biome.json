@@ -18,7 +18,8 @@
       "!skills",
       "!bun.lock",
       "!src/index.css",
-      "!src-tauri/crates/keeper-core/tests/fixtures/agents/sessions/**/log/blobs"
+      "!src-tauri/crates/keeper-core/tests/fixtures/agents/sessions/**/log/blobs",
+      "!src-tauri/crates/keeper-ported/tests/fixtures/okf"
     ]
   },
   "formatter": {
