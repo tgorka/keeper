@@ -14,9 +14,10 @@
 import { clearMocks } from "@tauri-apps/api/mocks";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
+  sessionsKnowledgeRead,
   sessionsKnowledgeReview,
-  sessionsPromote,
   sessionsPromotePanel,
+  sessionsPromoteTo,
   syncReadText,
 } from "@/lib/ipc/client";
 import { installMockShell, stagePromoteFixture } from "../../dev/mock-shell";
@@ -61,7 +62,7 @@ describe("the dev harness's promote reads", () => {
     for (const [root, line] of Object.entries(bring)) {
       const read = await syncReadText(root, `${IN_DRIVE}/${NOTE}`);
       expect(read.text).toContain(line);
-      const panel = await sessionsPromotePanel(root, SESSION);
+      const panel = await sessionsPromotePanel(root, SESSION, { choices: [], notes: [] });
       const note = panel.knowledge.find((candidate) => candidate.path === NOTE);
       expect(note?.revision).toBe(await sha256Hex(read.text ?? ""));
       revisions.add(note?.revision ?? "");
@@ -73,14 +74,15 @@ describe("the dev harness's promote reads", () => {
     stagePromoteFixture("p1", SESSION);
     stagePromoteFixture("p2", SESSION);
 
-    await sessionsKnowledgeReview("p2", SESSION, NOTE, false);
+    const read = await sessionsKnowledgeRead("p2", SESSION, NOTE, true);
+    await sessionsKnowledgeReview("p2", SESSION, NOTE, false, read.revision);
 
     const ticked = await syncReadText("p1", COPY);
     const unticked = await syncReadText("p2", COPY);
     expect(ticked.text).toContain("  - by: human:tgorka\n");
     expect(unticked.text).not.toContain("verified:");
     const panels = await Promise.all(
-      ["p1", "p2"].map((root) => sessionsPromotePanel(root, SESSION)),
+      ["p1", "p2"].map((root) => sessionsPromotePanel(root, SESSION, { choices: [], notes: [] })),
     );
     expect(
       panels.map((panel) => panel.knowledge.find((note) => note.path === NOTE)?.reviewedByMe),
@@ -93,20 +95,42 @@ describe("the dev harness's promote reads", () => {
     for (const row of ["none", "three cells"]) {
       const fixture = stagePromoteFixture("p1", SESSION, (staged) => {
         const text = staged.files.get(ledger)?.text ?? "";
-        staged.vault.set(target, { text, reviewers: [], changed: 1 });
         if (row === "three cells") {
+          // A person's line in the vault file: the note is newer here, and
+          // still nothing is offered over a file that is not its copy.
+          staged.vault.set(target, { text: `${text}A person's line.\n`, reviewers: [], changed: 1 });
           staged.rows.push({ source: ledger, target, note: "knowledge" });
+        } else {
+          staged.vault.set(target, { text, reviewers: [], changed: 1 });
         }
       });
       const text = fixture.files.get(ledger)?.text ?? "";
       await expect(
-        sessionsPromote("p1", SESSION, ledger, target, "knowledge", await sha256Hex(text)),
+        sessionsPromoteTo(
+          "p1",
+          SESSION,
+          ledger,
+          "10-notes/knowledge",
+          "the-whole-ledger.md",
+          await sha256Hex(text),
+        ),
       ).rejects.toMatchObject({ code: "internal" });
       expect(fixture.vault.get(target)?.reviewers).toEqual([]);
-      const panel = await sessionsPromotePanel("p1", SESSION);
+      const panel = await sessionsPromotePanel("p1", SESSION, { choices: [], notes: [] });
       const note = panel.knowledge.find((candidate) => candidate.path === ledger);
       expect(note?.reviewedByMe).toBe(false);
       expect(note?.foreignCopy !== null).toBe(row === "three cells");
+      if (row === "three cells") {
+        // A file that is not the note's copy is never offered as a target.
+        expect(note?.destination).toBeNull();
+        expect(note?.unavailable).toBe(note?.foreignCopy);
+        // Read as it is, it still takes no review: it is not the note's copy.
+        const read = await sessionsKnowledgeRead("p1", SESSION, ledger, true);
+        await expect(
+          sessionsKnowledgeReview("p1", SESSION, ledger, true, read.revision),
+        ).rejects.toMatchObject({ message: note?.foreignCopy });
+        expect(fixture.vault.get(target)?.reviewers).toEqual([]);
+      }
     }
   });
 });

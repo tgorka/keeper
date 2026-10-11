@@ -1,0 +1,1953 @@
+{
+  "about": "Rust-produced outcomes of the promote panel's commands over real files (keeper_agent::promote, test every_command_vector_holds; KEEPER_WRITE_VECTORS=1 writes each step's expect, then biome formats the file), which src/test/mock-shell-promote-commands.test.ts replays through the dev harness's own handlers. A file's changed is its mtime in ms; a vault copy is its text with each reviewer's review written in by keeper; a step's item is the index of a row, then of an unlisted file, of the last panel.",
+  "scenarios": [
+    {
+      "files": [
+        {
+          "changed": 10,
+          "path": "workspace/draft.md",
+          "text": "# Weekly report\n"
+        },
+        {
+          "changed": 20,
+          "path": "artifacts/report.md",
+          "text": "# Weekly report\n"
+        },
+        {
+          "changed": 30,
+          "path": "workspace/figures.csv",
+          "text": "a,b\n1,3\n"
+        },
+        {
+          "changed": 20,
+          "path": "artifacts/figures.csv",
+          "text": "a,b\n1,2\n"
+        },
+        {
+          "changed": 20,
+          "path": "artifacts/summary.md",
+          "text": "# Summary\n"
+        },
+        {
+          "changed": 20,
+          "path": "workspace/plan.md",
+          "text": "# Plan\n"
+        },
+        {
+          "changed": 20,
+          "path": "workspace/locked.md",
+          "text": "# Locked\n"
+        },
+        {
+          "changed": 20,
+          "path": "artifacts/locked.md",
+          "text": "# Locked\n"
+        },
+        {
+          "changed": 40,
+          "path": "workspace/notes.md",
+          "text": "# Notes\n"
+        },
+        {
+          "changed": 5,
+          "path": "workspace/data/run.json",
+          "text": "{}\n"
+        },
+        {
+          "changed": 45,
+          "path": "artifacts/flat-contract.md",
+          "text": "# The flat contract\n"
+        },
+        {
+          "changed": 45,
+          "hex": "89504e470d0a1a0a0000000d",
+          "path": "artifacts/chart.png"
+        },
+        {
+          "changed": 45,
+          "path": "artifacts/trace.log",
+          "text": "started\u0000stopped\n"
+        },
+        {
+          "changed": 45,
+          "hex": "5a61c5bcc3b3c582c4872067c499c59b6cc485206a61c5bac5840a",
+          "path": "artifacts/zazolc.md"
+        },
+        {
+          "changed": 10,
+          "path": "artifacts/knowledge/2026-10-05-taxes/what-to-bring.md",
+          "text": "---\ntype: Reference\ntitle: What the tax office wants\ngenerated:\n  by: agent:tola-grey@electra\n  at: 2026-10-05T18:00:00Z\nhuman_reviewed: false\nstatus: draft\n---\n\nBring the PIT-37, the receipts and the ID.\n"
+        },
+        {
+          "changed": 10,
+          "path": "artifacts/knowledge/2026-10-05-taxes/fresh.md",
+          "text": "---\ntype: Reference\ntitle: Fresh\ngenerated:\n  by: agent:tola-grey@electra\n  at: 2026-10-05T18:00:00Z\nhuman_reviewed: false\nstatus: draft\n---\n\nA fresh note.\n"
+        }
+      ],
+      "name": "offers, target facts and reads",
+      "rows": [
+        {
+          "note": "weekly report",
+          "source": "workspace/draft.md",
+          "target": "artifacts/report.md"
+        },
+        {
+          "note": "",
+          "source": "workspace/figures.csv",
+          "target": "artifacts/figures.csv"
+        },
+        {
+          "note": "cleaned up",
+          "source": "workspace/scratch.md",
+          "target": "artifacts/summary.md"
+        },
+        {
+          "note": "",
+          "source": "workspace/plan.md",
+          "target": "artifacts/plan.md"
+        },
+        {
+          "note": "",
+          "source": "workspace/locked.md",
+          "target": "artifacts/locked.md"
+        },
+        {
+          "note": "knowledge",
+          "published": true,
+          "source": "artifacts/knowledge/2026-10-05-taxes/what-to-bring.md",
+          "target": "10-notes/knowledge/what-to-bring.md"
+        }
+      ],
+      "steps": [
+        {
+          "expect": {
+            "artifacts": [
+              {
+                "destination": null,
+                "path": "artifacts/chart.png",
+                "unavailable": "artifacts/chart.png is not a text file, and the notes vault takes text."
+              },
+              {
+                "destination": {
+                  "fixed": false,
+                  "folder": "10-notes",
+                  "name": "figures.csv"
+                },
+                "path": "artifacts/figures.csv",
+                "unavailable": null
+              },
+              {
+                "destination": {
+                  "fixed": false,
+                  "folder": "10-notes",
+                  "name": "flat-contract.md"
+                },
+                "path": "artifacts/flat-contract.md",
+                "unavailable": null
+              },
+              {
+                "destination": null,
+                "path": "artifacts/locked.md",
+                "unavailable": "artifacts/locked.md could not be read: Permission denied (os error 13)"
+              },
+              {
+                "destination": {
+                  "fixed": false,
+                  "folder": "10-notes",
+                  "name": "report.md"
+                },
+                "path": "artifacts/report.md",
+                "unavailable": null
+              },
+              {
+                "destination": {
+                  "fixed": false,
+                  "folder": "10-notes",
+                  "name": "summary.md"
+                },
+                "path": "artifacts/summary.md",
+                "unavailable": null
+              },
+              {
+                "destination": {
+                  "fixed": false,
+                  "folder": "10-notes",
+                  "name": "trace.log"
+                },
+                "path": "artifacts/trace.log",
+                "unavailable": null
+              },
+              {
+                "destination": {
+                  "fixed": false,
+                  "folder": "10-notes",
+                  "name": "zazolc.md"
+                },
+                "path": "artifacts/zazolc.md",
+                "unavailable": null
+              }
+            ],
+            "complete": false,
+            "hasTable": true,
+            "intent": {
+              "choices": [],
+              "notes": []
+            },
+            "knowledge": [
+              {
+                "agent": "tola-grey",
+                "bytes": 156,
+                "candidateRead": "unread",
+                "consented": false,
+                "copy": null,
+                "copyRead": "unread",
+                "destination": {
+                  "fixed": false,
+                  "folder": "10-notes",
+                  "name": "fresh.md"
+                },
+                "foreignCopy": null,
+                "host": "electra",
+                "path": "artifacts/knowledge/2026-10-05-taxes/fresh.md",
+                "problem": null,
+                "promotedTo": null,
+                "reviewedBy": null,
+                "reviewedByMe": false,
+                "revision": "f6cc3103754f647e436ed2a9ad40de4163008163bc23ce7303a8dad8a9ce6cda",
+                "state": null,
+                "title": "Fresh",
+                "unavailable": null
+              },
+              {
+                "agent": "tola-grey",
+                "bytes": 205,
+                "candidateRead": "unread",
+                "consented": false,
+                "copy": {
+                  "path": "10-notes/knowledge/what-to-bring.md",
+                  "problem": null,
+                  "revision": "4c96b3f34d51332d11f14917b5bcffc2be40709ba42515aa6335d7a6db315b87",
+                  "there": true
+                },
+                "copyRead": "unread",
+                "destination": null,
+                "foreignCopy": null,
+                "host": "electra",
+                "path": "artifacts/knowledge/2026-10-05-taxes/what-to-bring.md",
+                "problem": null,
+                "promotedTo": "10-notes/knowledge/what-to-bring.md",
+                "reviewedBy": "human:tgorka",
+                "reviewedByMe": true,
+                "revision": "7043961e8322db525eedb0267cf6fcb77437b4288f8eb33aa000058a38d7f7e0",
+                "state": "ok",
+                "title": "What the tax office wants",
+                "unavailable": null
+              }
+            ],
+            "label": null,
+            "outRefused": null,
+            "problems": [],
+            "revision": "86d83675681fd870082a772b96fd93dd291e5c40102b683979bea20a6e08889e",
+            "rows": [
+              {
+                "choice": null,
+                "line": null,
+                "note": "weekly report",
+                "out": false,
+                "problem": null,
+                "raw": null,
+                "refused": null,
+                "revision": "32ce94b4597b2909e2488f3d25fa4e79dadd266152af872ef3095f96c22829f5",
+                "source": "workspace/draft.md",
+                "state": "ok",
+                "target": "artifacts/report.md"
+              },
+              {
+                "choice": null,
+                "line": null,
+                "note": "",
+                "out": false,
+                "problem": null,
+                "raw": null,
+                "refused": null,
+                "revision": "bd1adb2b5250762ace8e87b1c95dc26a1ca9451a06e76bb8f15e3a834a002eb0",
+                "source": "workspace/figures.csv",
+                "state": "stale",
+                "target": "artifacts/figures.csv"
+              },
+              {
+                "choice": null,
+                "line": null,
+                "note": "cleaned up",
+                "out": false,
+                "problem": null,
+                "raw": null,
+                "refused": "workspace/scratch.md is not in this session any more.",
+                "revision": "954d74839243e4871528e3f0e03ba7655a0e174e34a45921e105a5fb443e8d8f",
+                "source": "workspace/scratch.md",
+                "state": "missingSource",
+                "target": "artifacts/summary.md"
+              },
+              {
+                "choice": null,
+                "line": null,
+                "note": "",
+                "out": false,
+                "problem": null,
+                "raw": null,
+                "refused": null,
+                "revision": "cebd30db470325fb79d75e7e09d15d8947b813d65726cb82b8331e465713ba8d",
+                "source": "workspace/plan.md",
+                "state": "missingTarget",
+                "target": "artifacts/plan.md"
+              },
+              {
+                "choice": null,
+                "line": null,
+                "note": "",
+                "out": false,
+                "problem": "artifacts/locked.md could not be read: Permission denied (os error 13)",
+                "raw": null,
+                "refused": null,
+                "revision": "0ec47753eb26d1f28d030aa82d8508e207731e33608568ba6231fd9b79304a44",
+                "source": "workspace/locked.md",
+                "state": "unknown",
+                "target": "artifacts/locked.md"
+              },
+              {
+                "choice": null,
+                "line": null,
+                "note": "knowledge",
+                "out": true,
+                "problem": null,
+                "raw": null,
+                "refused": "artifacts/knowledge/2026-10-05-taxes/what-to-bring.md was promoted into the drive's notes; promote it again from its notes section.",
+                "revision": "621f81c980dc3f3b4e83c09987ff6a695b6c0bbe8f8e308e7c38209f54828c01",
+                "source": "artifacts/knowledge/2026-10-05-taxes/what-to-bring.md",
+                "state": "ok",
+                "target": "10-notes/knowledge/what-to-bring.md"
+              }
+            ],
+            "unlisted": [
+              {
+                "choice": null,
+                "refused": null,
+                "revision": "4420bbc1f848413ce4c44d1f6e4e58506d0588d783503322ce2940319991f651",
+                "source": "workspace/data/run.json",
+                "suggested": "artifacts/run.json"
+              },
+              {
+                "choice": null,
+                "refused": null,
+                "revision": "c1228b54a9ffdc7be72e750577daf5f501bd27a7b1e1ae2748f48e40ab14deb9",
+                "source": "workspace/notes.md",
+                "suggested": "artifacts/notes.md"
+              }
+            ],
+            "vault": "10-notes"
+          },
+          "panel": {}
+        },
+        {
+          "expect": {
+            "bytes": 205,
+            "revision": "7043961e8322db525eedb0267cf6fcb77437b4288f8eb33aa000058a38d7f7e0",
+            "text": "---\ntype: Reference\ntitle: What the tax office wants\ngenerated:\n  by: agent:tola-grey@electra\n  at: 2026-10-05T18:00:00Z\nhuman_reviewed: false\nstatus: draft\n---\n\nBring the PIT-37, the receipts and the ID.\n"
+          },
+          "read": {
+            "copy": false,
+            "path": "artifacts/knowledge/2026-10-05-taxes/what-to-bring.md"
+          }
+        },
+        {
+          "expect": {
+            "bytes": 264,
+            "revision": "4c96b3f34d51332d11f14917b5bcffc2be40709ba42515aa6335d7a6db315b87",
+            "text": "---\ntype: Reference\ntitle: What the tax office wants\ngenerated:\n  by: agent:tola-grey@electra\n  at: 2026-10-05T18:00:00Z\nverified:\n  - by: human:tgorka\n    at: 2026-10-06T10:00:00Z\nhuman_reviewed: true\nstatus: draft\n---\n\nBring the PIT-37, the receipts and the ID.\n"
+          },
+          "read": {
+            "copy": true,
+            "path": "artifacts/knowledge/2026-10-05-taxes/what-to-bring.md"
+          }
+        },
+        {
+          "expect": {
+            "bytes": 156,
+            "revision": "f6cc3103754f647e436ed2a9ad40de4163008163bc23ce7303a8dad8a9ce6cda",
+            "text": "---\ntype: Reference\ntitle: Fresh\ngenerated:\n  by: agent:tola-grey@electra\n  at: 2026-10-05T18:00:00Z\nhuman_reviewed: false\nstatus: draft\n---\n\nA fresh note.\n"
+          },
+          "read": {
+            "copy": false,
+            "path": "artifacts/knowledge/2026-10-05-taxes/fresh.md"
+          }
+        },
+        {
+          "expect": {
+            "refused": "a person's review is written into the vault's copy of a note; promote it to notes first."
+          },
+          "read": {
+            "copy": true,
+            "path": "artifacts/knowledge/2026-10-05-taxes/fresh.md"
+          }
+        },
+        {
+          "expect": {
+            "refused": "artifacts/report.md is not a harvested note: those live under artifacts/knowledge/."
+          },
+          "read": {
+            "copy": false,
+            "path": "artifacts/report.md"
+          }
+        }
+      ],
+      "unreadable": ["artifacts/locked.md"],
+      "vault": [
+        {
+          "changed": 20,
+          "path": "10-notes/knowledge/what-to-bring.md",
+          "reviewers": ["human:tgorka"],
+          "text": "---\ntype: Reference\ntitle: What the tax office wants\ngenerated:\n  by: agent:tola-grey@electra\n  at: 2026-10-05T18:00:00Z\nhuman_reviewed: false\nstatus: draft\n---\n\nBring the PIT-37, the receipts and the ID.\n"
+        }
+      ]
+    },
+    {
+      "files": [
+        {
+          "changed": 10,
+          "hex": "2d2d2d0a747970653a205265666572656e63650a7469746c653a205a61c5bcc3b3c582c4872c20696e2073686f72740a67656e6572617465643a0a202062793a206167656e743a746f6c612d6772657940656c65637472610a202061743a20323032362d31302d30355431383a30303a30305a0a68756d616e5f72657669657765643a2066616c73650a7374617475733a2064726166740a2d2d2d0a0a47c499c59b6cc485206a61c5bac5843a207468726565207061706572732e0a",
+          "path": "artifacts/knowledge/2026-10-05-taxes/zazolc.md"
+        },
+        {
+          "changed": 10,
+          "hex": "5a61c5bcc3b3c582c4872067c499c59b6cc485206a61c5bac5840a",
+          "path": "artifacts/zazolc.md"
+        }
+      ],
+      "name": "publication of exact bytes and the reviews of the copy",
+      "rows": [],
+      "steps": [
+        {
+          "expect": {
+            "artifacts": [
+              {
+                "destination": {
+                  "fixed": false,
+                  "folder": "10-notes",
+                  "name": "zazolc.md"
+                },
+                "path": "artifacts/zazolc.md",
+                "unavailable": null
+              }
+            ],
+            "complete": true,
+            "hasTable": true,
+            "intent": {
+              "choices": [],
+              "notes": []
+            },
+            "knowledge": [
+              {
+                "agent": "tola-grey",
+                "bytes": 188,
+                "candidateRead": "unread",
+                "consented": false,
+                "copy": null,
+                "copyRead": "unread",
+                "destination": {
+                  "fixed": false,
+                  "folder": "10-notes",
+                  "name": "zazolc.md"
+                },
+                "foreignCopy": null,
+                "host": "electra",
+                "path": "artifacts/knowledge/2026-10-05-taxes/zazolc.md",
+                "problem": null,
+                "promotedTo": null,
+                "reviewedBy": null,
+                "reviewedByMe": false,
+                "revision": "4f591576eb2785919b625a4b8953630ae97b3dbb672f31a5f9423b17f498ccf3",
+                "state": null,
+                "title": "Zażółć, in short",
+                "unavailable": null
+              }
+            ],
+            "label": null,
+            "outRefused": null,
+            "problems": [],
+            "revision": "0870094d7a92807f233afaa1fbbfa7f97f22549a6863ac1ac301aa76bf9c2f27",
+            "rows": [],
+            "unlisted": [],
+            "vault": "10-notes"
+          },
+          "panel": {}
+        },
+        {
+          "expect": {
+            "refused": "promoting a harvested note into the notes vault is a person's review of the version they read, and this one names no version; open it and promote it from there."
+          },
+          "promoteTo": {
+            "expected": true,
+            "folder": "10-notes/knowledge",
+            "name": "zazolc.md",
+            "source": "artifacts/knowledge/2026-10-05-taxes/zazolc.md"
+          }
+        },
+        {
+          "expect": {
+            "bytes": 188,
+            "revision": "4f591576eb2785919b625a4b8953630ae97b3dbb672f31a5f9423b17f498ccf3",
+            "text": "---\ntype: Reference\ntitle: Zażółć, in short\ngenerated:\n  by: agent:tola-grey@electra\n  at: 2026-10-05T18:00:00Z\nhuman_reviewed: false\nstatus: draft\n---\n\nGęślą jaźń: three papers.\n"
+          },
+          "read": {
+            "copy": false,
+            "path": "artifacts/knowledge/2026-10-05-taxes/zazolc.md"
+          }
+        },
+        {
+          "expect": {
+            "ok": true
+          },
+          "promoteTo": {
+            "expected": true,
+            "folder": "10-notes/knowledge",
+            "name": "zazolc.md",
+            "source": "artifacts/knowledge/2026-10-05-taxes/zazolc.md"
+          }
+        },
+        {
+          "expect": {
+            "ok": true
+          },
+          "promoteTo": {
+            "expected": false,
+            "folder": "10-notes",
+            "name": "zazolc.md",
+            "source": "artifacts/zazolc.md"
+          }
+        },
+        {
+          "expect": {
+            "artifacts": [
+              {
+                "destination": {
+                  "fixed": true,
+                  "folder": "10-notes",
+                  "name": "zazolc.md"
+                },
+                "path": "artifacts/zazolc.md",
+                "unavailable": null
+              }
+            ],
+            "complete": false,
+            "hasTable": true,
+            "intent": {
+              "choices": [],
+              "notes": []
+            },
+            "knowledge": [
+              {
+                "agent": "tola-grey",
+                "bytes": 188,
+                "candidateRead": "unread",
+                "consented": false,
+                "copy": {
+                  "path": "10-notes/knowledge/zazolc.md",
+                  "problem": null,
+                  "revision": "334934defbe367522e810d9f5daa6cf7c6469a995d91fbe168935bb8cdcb2d4d",
+                  "there": true
+                },
+                "copyRead": "unread",
+                "destination": null,
+                "foreignCopy": null,
+                "host": "electra",
+                "path": "artifacts/knowledge/2026-10-05-taxes/zazolc.md",
+                "problem": null,
+                "promotedTo": "10-notes/knowledge/zazolc.md",
+                "reviewedBy": "human:tgorka",
+                "reviewedByMe": true,
+                "revision": "4f591576eb2785919b625a4b8953630ae97b3dbb672f31a5f9423b17f498ccf3",
+                "state": "ok",
+                "title": "Zażółć, in short",
+                "unavailable": null
+              }
+            ],
+            "label": null,
+            "outRefused": null,
+            "problems": [],
+            "revision": "a000a696996db7546841078feeb515f339120068047697af427594094a9b661c",
+            "rows": [
+              {
+                "choice": null,
+                "line": null,
+                "note": "knowledge",
+                "out": true,
+                "problem": null,
+                "raw": null,
+                "refused": "artifacts/knowledge/2026-10-05-taxes/zazolc.md was promoted into the drive's notes; promote it again from its notes section.",
+                "revision": "8cd65c25dbe0e6b1bd02b6e320d33a120366b3e251b7431d96f8aa27f192f07b",
+                "source": "artifacts/knowledge/2026-10-05-taxes/zazolc.md",
+                "state": "ok",
+                "target": "10-notes/knowledge/zazolc.md"
+              },
+              {
+                "choice": null,
+                "line": null,
+                "note": "",
+                "out": true,
+                "problem": null,
+                "raw": null,
+                "refused": "artifacts/zazolc.md was promoted into the drive's notes; promote it again from its notes section.",
+                "revision": "f67f355a0268a1ba61f51f8ecbbe5a95eb6bf6f952d719b2e3fedbaa12e64574",
+                "source": "artifacts/zazolc.md",
+                "state": "ok",
+                "target": "10-notes/zazolc.md"
+              }
+            ],
+            "unlisted": [],
+            "vault": "10-notes"
+          },
+          "panel": {}
+        },
+        {
+          "expect": {
+            "bytes": 247,
+            "revision": "334934defbe367522e810d9f5daa6cf7c6469a995d91fbe168935bb8cdcb2d4d",
+            "text": "---\ntype: Reference\ntitle: Zażółć, in short\ngenerated:\n  by: agent:tola-grey@electra\n  at: 2026-10-05T18:00:00Z\nverified:\n  - by: human:tgorka\n    at: 2026-10-06T10:00:00Z\nhuman_reviewed: true\nstatus: draft\n---\n\nGęślą jaźń: three papers.\n"
+          },
+          "read": {
+            "copy": true,
+            "path": "artifacts/knowledge/2026-10-05-taxes/zazolc.md"
+          }
+        },
+        {
+          "expect": {
+            "ok": true
+          },
+          "review": {
+            "path": "artifacts/knowledge/2026-10-05-taxes/zazolc.md",
+            "reviewed": false
+          }
+        },
+        {
+          "expect": {
+            "bytes": 188,
+            "revision": "079a9dd2df253857fd656273299f5739a9951d0d8483b7b84c95975b07e1c0cf",
+            "text": "---\ntype: Reference\ntitle: Zażółć, in short\ngenerated:\n  by: agent:tola-grey@electra\n  at: 2026-10-05T18:00:00Z\nhuman_reviewed: false\nstatus: draft\n---\n\nGęślą jaźń: three papers.\n"
+          },
+          "read": {
+            "copy": true,
+            "path": "artifacts/knowledge/2026-10-05-taxes/zazolc.md"
+          }
+        },
+        {
+          "expect": {
+            "ok": true
+          },
+          "review": {
+            "path": "artifacts/knowledge/2026-10-05-taxes/zazolc.md",
+            "reviewed": true
+          }
+        },
+        {
+          "expect": {
+            "bytes": 247,
+            "revision": "334934defbe367522e810d9f5daa6cf7c6469a995d91fbe168935bb8cdcb2d4d",
+            "text": "---\ntype: Reference\ntitle: Zażółć, in short\ngenerated:\n  by: agent:tola-grey@electra\n  at: 2026-10-05T18:00:00Z\nverified:\n  - by: human:tgorka\n    at: 2026-10-06T10:00:00Z\nhuman_reviewed: true\nstatus: draft\n---\n\nGęślą jaźń: three papers.\n"
+          },
+          "read": {
+            "copy": true,
+            "path": "artifacts/knowledge/2026-10-05-taxes/zazolc.md"
+          }
+        },
+        {
+          "expect": {
+            "artifacts": [
+              {
+                "destination": {
+                  "fixed": true,
+                  "folder": "10-notes",
+                  "name": "zazolc.md"
+                },
+                "path": "artifacts/zazolc.md",
+                "unavailable": null
+              }
+            ],
+            "complete": false,
+            "hasTable": true,
+            "intent": {
+              "choices": [],
+              "notes": []
+            },
+            "knowledge": [
+              {
+                "agent": "tola-grey",
+                "bytes": 188,
+                "candidateRead": "unread",
+                "consented": false,
+                "copy": {
+                  "path": "10-notes/knowledge/zazolc.md",
+                  "problem": null,
+                  "revision": "334934defbe367522e810d9f5daa6cf7c6469a995d91fbe168935bb8cdcb2d4d",
+                  "there": true
+                },
+                "copyRead": "unread",
+                "destination": null,
+                "foreignCopy": null,
+                "host": "electra",
+                "path": "artifacts/knowledge/2026-10-05-taxes/zazolc.md",
+                "problem": null,
+                "promotedTo": "10-notes/knowledge/zazolc.md",
+                "reviewedBy": "human:tgorka",
+                "reviewedByMe": true,
+                "revision": "4f591576eb2785919b625a4b8953630ae97b3dbb672f31a5f9423b17f498ccf3",
+                "state": "ok",
+                "title": "Zażółć, in short",
+                "unavailable": null
+              }
+            ],
+            "label": null,
+            "outRefused": null,
+            "problems": [],
+            "revision": "a000a696996db7546841078feeb515f339120068047697af427594094a9b661c",
+            "rows": [
+              {
+                "choice": null,
+                "line": null,
+                "note": "knowledge",
+                "out": true,
+                "problem": null,
+                "raw": null,
+                "refused": "artifacts/knowledge/2026-10-05-taxes/zazolc.md was promoted into the drive's notes; promote it again from its notes section.",
+                "revision": "8cd65c25dbe0e6b1bd02b6e320d33a120366b3e251b7431d96f8aa27f192f07b",
+                "source": "artifacts/knowledge/2026-10-05-taxes/zazolc.md",
+                "state": "ok",
+                "target": "10-notes/knowledge/zazolc.md"
+              },
+              {
+                "choice": null,
+                "line": null,
+                "note": "",
+                "out": true,
+                "problem": null,
+                "raw": null,
+                "refused": "artifacts/zazolc.md was promoted into the drive's notes; promote it again from its notes section.",
+                "revision": "f67f355a0268a1ba61f51f8ecbbe5a95eb6bf6f952d719b2e3fedbaa12e64574",
+                "source": "artifacts/zazolc.md",
+                "state": "ok",
+                "target": "10-notes/zazolc.md"
+              }
+            ],
+            "unlisted": [],
+            "vault": "10-notes"
+          },
+          "panel": {}
+        }
+      ],
+      "unreadable": [],
+      "vault": []
+    },
+    {
+      "files": [
+        {
+          "changed": 10,
+          "hex": "efbbbf2d2d2d0a747970653a205265666572656e63650a7469746c653a2041206d61726b2066697273740a67656e6572617465643a0a202062793a206167656e743a746f6c612d6772657940656c65637472610a202061743a20323032362d31302d30355431383a30303a30305a0a68756d616e5f72657669657765643a2066616c73650a7374617475733a2064726166740a2d2d2d0a0a49747320666972737420627974657320617265206120627974652d6f72646572206d61726b2e0a",
+          "path": "artifacts/knowledge/2026-10-05-taxes/marked.md"
+        },
+        {
+          "changed": 10,
+          "hex": "efbbbf41206d61726b2c207468656e2061206c696e652e0a",
+          "path": "artifacts/marked.md"
+        },
+        {
+          "changed": 10,
+          "hex": "2d2d2d0a747970653a205265666572656e63650a7469746c653a204e6f7420746578740a67656e6572617465643a0a202062793a206167656e743a746f6c612d6772657940656c65637472610a202061743a20323032362d31302d30355431383a30303a30305a0a68756d616e5f72657669657765643a2066616c73650a7374617475733a2064726166740a2d2d2d0a0a4120627974652074686174206973206e6f74205554462d383a20ff0a",
+          "path": "artifacts/knowledge/2026-10-05-taxes/broken.md"
+        },
+        {
+          "changed": 10,
+          "hex": "2d2d2d0a747970653a205265666572656e63650a7469746c653a20546f6f206c617267650a67656e6572617465643a0a202062793a206167656e743a746f6c612d6772657940656c65637472610a202061743a20323032362d31302d30355431383a30303a30305a0a68756d616e5f72657669657765643a2066616c73650a7374617475733a2064726166740a2d2d2d0a0aff0a",
+          "pad": {
+            "to": 65537,
+            "with": "x"
+          },
+          "path": "artifacts/knowledge/2026-10-05-taxes/broken-and-large.md"
+        }
+      ],
+      "name": "a byte-order mark kept, and a candidate that is not UTF-8",
+      "rows": [],
+      "steps": [
+        {
+          "expect": {
+            "artifacts": [
+              {
+                "destination": {
+                  "fixed": false,
+                  "folder": "10-notes",
+                  "name": "marked.md"
+                },
+                "path": "artifacts/marked.md",
+                "unavailable": null
+              }
+            ],
+            "complete": true,
+            "hasTable": true,
+            "intent": {
+              "choices": [],
+              "notes": []
+            },
+            "knowledge": [
+              {
+                "agent": null,
+                "bytes": 65537,
+                "candidateRead": "unread",
+                "consented": false,
+                "copy": null,
+                "copyRead": "unread",
+                "destination": null,
+                "foreignCopy": null,
+                "host": null,
+                "path": "artifacts/knowledge/2026-10-05-taxes/broken-and-large.md",
+                "problem": "artifacts/knowledge/2026-10-05-taxes/broken-and-large.md holds 65537 bytes, more than the 65536 a knowledge note holds, so it is not shown",
+                "promotedTo": null,
+                "reviewedBy": null,
+                "reviewedByMe": false,
+                "revision": null,
+                "state": null,
+                "title": null,
+                "unavailable": null
+              },
+              {
+                "agent": null,
+                "bytes": 173,
+                "candidateRead": "unread",
+                "consented": false,
+                "copy": null,
+                "copyRead": "unread",
+                "destination": null,
+                "foreignCopy": null,
+                "host": null,
+                "path": "artifacts/knowledge/2026-10-05-taxes/broken.md",
+                "problem": "artifacts/knowledge/2026-10-05-taxes/broken.md could not be read: stream did not contain valid UTF-8",
+                "promotedTo": null,
+                "reviewedBy": null,
+                "reviewedByMe": false,
+                "revision": null,
+                "state": null,
+                "title": null,
+                "unavailable": null
+              },
+              {
+                "agent": "tola-grey",
+                "bytes": 191,
+                "candidateRead": "unread",
+                "consented": false,
+                "copy": null,
+                "copyRead": "unread",
+                "destination": {
+                  "fixed": false,
+                  "folder": "10-notes",
+                  "name": "marked.md"
+                },
+                "foreignCopy": null,
+                "host": "electra",
+                "path": "artifacts/knowledge/2026-10-05-taxes/marked.md",
+                "problem": null,
+                "promotedTo": null,
+                "reviewedBy": null,
+                "reviewedByMe": false,
+                "revision": "723973eeea6b643f153ee33ba70e45a45663277a2097e4326dadd391532585fb",
+                "state": null,
+                "title": "A mark first",
+                "unavailable": null
+              }
+            ],
+            "label": null,
+            "outRefused": null,
+            "problems": [],
+            "revision": "0870094d7a92807f233afaa1fbbfa7f97f22549a6863ac1ac301aa76bf9c2f27",
+            "rows": [],
+            "unlisted": [],
+            "vault": "10-notes"
+          },
+          "panel": {}
+        },
+        {
+          "expect": {
+            "bytes": 191,
+            "revision": "723973eeea6b643f153ee33ba70e45a45663277a2097e4326dadd391532585fb",
+            "text": "﻿---\ntype: Reference\ntitle: A mark first\ngenerated:\n  by: agent:tola-grey@electra\n  at: 2026-10-05T18:00:00Z\nhuman_reviewed: false\nstatus: draft\n---\n\nIts first bytes are a byte-order mark.\n"
+          },
+          "read": {
+            "copy": false,
+            "path": "artifacts/knowledge/2026-10-05-taxes/marked.md"
+          }
+        },
+        {
+          "expect": {
+            "refused": "artifacts/knowledge/2026-10-05-taxes/broken.md could not be read: stream did not contain valid UTF-8"
+          },
+          "read": {
+            "copy": false,
+            "path": "artifacts/knowledge/2026-10-05-taxes/broken.md"
+          }
+        },
+        {
+          "expect": {
+            "refused": "artifacts/knowledge/2026-10-05-taxes/broken-and-large.md holds 65537 bytes, more than the 65536 keeper reads of a knowledge note, so it is not shown"
+          },
+          "read": {
+            "copy": false,
+            "path": "artifacts/knowledge/2026-10-05-taxes/broken-and-large.md"
+          }
+        },
+        {
+          "expect": {
+            "refused": "artifacts/knowledge/2026-10-05-taxes/broken.md is not a text file of this session, and the notes vault takes text."
+          },
+          "promoteTo": {
+            "expected": true,
+            "folder": "10-notes/knowledge",
+            "name": "broken.md",
+            "source": "artifacts/knowledge/2026-10-05-taxes/broken.md"
+          }
+        },
+        {
+          "expect": {
+            "ok": true
+          },
+          "promoteTo": {
+            "expected": true,
+            "folder": "10-notes/knowledge",
+            "name": "marked.md",
+            "source": "artifacts/knowledge/2026-10-05-taxes/marked.md"
+          }
+        },
+        {
+          "expect": {
+            "ok": true
+          },
+          "promoteTo": {
+            "expected": false,
+            "folder": "10-notes",
+            "name": "marked.md",
+            "source": "artifacts/marked.md"
+          }
+        },
+        {
+          "expect": {
+            "bytes": 250,
+            "revision": "0b5f9d24e450b78b4a2d1727a55edebca779866b623f9912cbf344b18752f99f",
+            "text": "﻿---\ntype: Reference\ntitle: A mark first\ngenerated:\n  by: agent:tola-grey@electra\n  at: 2026-10-05T18:00:00Z\nverified:\n  - by: human:tgorka\n    at: 2026-10-06T10:00:00Z\nhuman_reviewed: true\nstatus: draft\n---\n\nIts first bytes are a byte-order mark.\n"
+          },
+          "read": {
+            "copy": true,
+            "path": "artifacts/knowledge/2026-10-05-taxes/marked.md"
+          }
+        },
+        {
+          "expect": {
+            "artifacts": [
+              {
+                "destination": {
+                  "fixed": true,
+                  "folder": "10-notes",
+                  "name": "marked.md"
+                },
+                "path": "artifacts/marked.md",
+                "unavailable": null
+              }
+            ],
+            "complete": false,
+            "hasTable": true,
+            "intent": {
+              "choices": [],
+              "notes": []
+            },
+            "knowledge": [
+              {
+                "agent": null,
+                "bytes": 65537,
+                "candidateRead": "unread",
+                "consented": false,
+                "copy": null,
+                "copyRead": "unread",
+                "destination": null,
+                "foreignCopy": null,
+                "host": null,
+                "path": "artifacts/knowledge/2026-10-05-taxes/broken-and-large.md",
+                "problem": "artifacts/knowledge/2026-10-05-taxes/broken-and-large.md holds 65537 bytes, more than the 65536 a knowledge note holds, so it is not shown",
+                "promotedTo": null,
+                "reviewedBy": null,
+                "reviewedByMe": false,
+                "revision": null,
+                "state": null,
+                "title": null,
+                "unavailable": null
+              },
+              {
+                "agent": null,
+                "bytes": 173,
+                "candidateRead": "unread",
+                "consented": false,
+                "copy": null,
+                "copyRead": "unread",
+                "destination": null,
+                "foreignCopy": null,
+                "host": null,
+                "path": "artifacts/knowledge/2026-10-05-taxes/broken.md",
+                "problem": "artifacts/knowledge/2026-10-05-taxes/broken.md could not be read: stream did not contain valid UTF-8",
+                "promotedTo": null,
+                "reviewedBy": null,
+                "reviewedByMe": false,
+                "revision": null,
+                "state": null,
+                "title": null,
+                "unavailable": null
+              },
+              {
+                "agent": "tola-grey",
+                "bytes": 191,
+                "candidateRead": "unread",
+                "consented": false,
+                "copy": {
+                  "path": "10-notes/knowledge/marked.md",
+                  "problem": null,
+                  "revision": "0b5f9d24e450b78b4a2d1727a55edebca779866b623f9912cbf344b18752f99f",
+                  "there": true
+                },
+                "copyRead": "unread",
+                "destination": null,
+                "foreignCopy": null,
+                "host": "electra",
+                "path": "artifacts/knowledge/2026-10-05-taxes/marked.md",
+                "problem": null,
+                "promotedTo": "10-notes/knowledge/marked.md",
+                "reviewedBy": "human:tgorka",
+                "reviewedByMe": true,
+                "revision": "723973eeea6b643f153ee33ba70e45a45663277a2097e4326dadd391532585fb",
+                "state": "ok",
+                "title": "A mark first",
+                "unavailable": null
+              }
+            ],
+            "label": null,
+            "outRefused": null,
+            "problems": [],
+            "revision": "2ffa5aab78a20335e593c25c240c03a4a2f733b14d35ba1c8367a2089e479ea4",
+            "rows": [
+              {
+                "choice": null,
+                "line": null,
+                "note": "knowledge",
+                "out": true,
+                "problem": null,
+                "raw": null,
+                "refused": "artifacts/knowledge/2026-10-05-taxes/marked.md was promoted into the drive's notes; promote it again from its notes section.",
+                "revision": "edf5c6b89b8a9a31a99fc38d21c383a1fc8d086b97b741196b3224532ddba053",
+                "source": "artifacts/knowledge/2026-10-05-taxes/marked.md",
+                "state": "ok",
+                "target": "10-notes/knowledge/marked.md"
+              },
+              {
+                "choice": null,
+                "line": null,
+                "note": "",
+                "out": true,
+                "problem": null,
+                "raw": null,
+                "refused": "artifacts/marked.md was promoted into the drive's notes; promote it again from its notes section.",
+                "revision": "77457f04609040a348ed1e7a915630aa8299899c1e79ac9d4ab8135cfaaf08aa",
+                "source": "artifacts/marked.md",
+                "state": "ok",
+                "target": "10-notes/marked.md"
+              }
+            ],
+            "unlisted": [],
+            "vault": "10-notes"
+          },
+          "panel": {}
+        }
+      ],
+      "unreadable": [],
+      "vault": []
+    },
+    {
+      "files": [],
+      "name": "a review that lands exactly at the reviewed bound",
+      "rows": [
+        {
+          "note": "knowledge",
+          "published": true,
+          "source": "artifacts/knowledge/2026-10-05-taxes/long.md",
+          "target": "10-notes/knowledge/long.md"
+        }
+      ],
+      "steps": [
+        {
+          "expect": {
+            "bytes": 81861,
+            "revision": "7570dc2728af178b24b64c82894b111c02d3f26f9fc3ddcd9f89c427fbf00797"
+          },
+          "read": {
+            "copy": true,
+            "path": "artifacts/knowledge/2026-10-05-taxes/long.md"
+          }
+        },
+        {
+          "expect": {
+            "ok": true
+          },
+          "review": {
+            "path": "artifacts/knowledge/2026-10-05-taxes/long.md",
+            "reviewed": true
+          }
+        },
+        {
+          "expect": {
+            "bytes": 81920,
+            "revision": "85e7cb86aa675ead9044e42c6d076219785b66bc9cd6ab6544504f45fa069711"
+          },
+          "read": {
+            "copy": true,
+            "path": "artifacts/knowledge/2026-10-05-taxes/long.md"
+          }
+        }
+      ],
+      "unreadable": [],
+      "vault": [
+        {
+          "changed": 20,
+          "pad": {
+            "to": 81861,
+            "with": "y"
+          },
+          "path": "10-notes/knowledge/long.md",
+          "reviewers": [],
+          "text": "---\ntype: Reference\ntitle: The long one\ngenerated:\n  by: agent:tola-grey@electra\n  at: 2026-10-05T18:00:00Z\nhuman_reviewed: false\nstatus: draft\n---\n\n"
+        }
+      ]
+    },
+    {
+      "files": [],
+      "name": "a review that would cross the reviewed bound",
+      "rows": [
+        {
+          "note": "knowledge",
+          "published": true,
+          "source": "artifacts/knowledge/2026-10-05-taxes/long.md",
+          "target": "10-notes/knowledge/long.md"
+        }
+      ],
+      "steps": [
+        {
+          "expect": {
+            "bytes": 81862,
+            "revision": "ae780aa95746e1e69ee84965844b3a972b253da07a1cc7fe37631ae0a78a3a09"
+          },
+          "read": {
+            "copy": true,
+            "path": "artifacts/knowledge/2026-10-05-taxes/long.md"
+          }
+        },
+        {
+          "expect": {
+            "refused": "10-notes/knowledge/long.md would hold more than the 81920 bytes keeper reads of a reviewed note, so nothing was written."
+          },
+          "review": {
+            "path": "artifacts/knowledge/2026-10-05-taxes/long.md",
+            "reviewed": true
+          }
+        },
+        {
+          "expect": {
+            "bytes": 81862,
+            "revision": "ae780aa95746e1e69ee84965844b3a972b253da07a1cc7fe37631ae0a78a3a09"
+          },
+          "read": {
+            "copy": true,
+            "path": "artifacts/knowledge/2026-10-05-taxes/long.md"
+          }
+        }
+      ],
+      "unreadable": [],
+      "vault": [
+        {
+          "changed": 20,
+          "pad": {
+            "to": 81862,
+            "with": "y"
+          },
+          "path": "10-notes/knowledge/long.md",
+          "reviewers": [],
+          "text": "---\ntype: Reference\ntitle: The long one\ngenerated:\n  by: agent:tola-grey@electra\n  at: 2026-10-05T18:00:00Z\nhuman_reviewed: false\nstatus: draft\n---\n\n"
+        }
+      ]
+    },
+    {
+      "files": [
+        {
+          "changed": 10,
+          "path": "artifacts/knowledge/2026-10-05-taxes/gone.md",
+          "text": "---\ntype: Reference\ntitle: Gone\ngenerated:\n  by: agent:tola-grey@electra\n  at: 2026-10-05T18:00:00Z\nhuman_reviewed: false\nstatus: draft\n---\n\nIts copy went.\n"
+        },
+        {
+          "changed": 10,
+          "path": "artifacts/knowledge/2026-10-05-taxes/closed.md",
+          "text": "---\ntype: Reference\ntitle: Closed\ngenerated:\n  by: agent:tola-grey@electra\n  at: 2026-10-05T18:00:00Z\nhuman_reviewed: false\nstatus: draft\n---\n\nIts copy is shut.\n"
+        }
+      ],
+      "name": "oversized, unreadable and missing copies",
+      "rows": [
+        {
+          "note": "knowledge",
+          "published": true,
+          "source": "artifacts/knowledge/2026-10-05-taxes/long.md",
+          "target": "10-notes/knowledge/long.md"
+        },
+        {
+          "note": "knowledge",
+          "source": "artifacts/knowledge/2026-10-05-taxes/gone.md",
+          "target": "10-notes/knowledge/gone.md"
+        },
+        {
+          "note": "knowledge",
+          "published": true,
+          "source": "artifacts/knowledge/2026-10-05-taxes/closed.md",
+          "target": "10-notes/knowledge/closed.md"
+        }
+      ],
+      "steps": [
+        {
+          "expect": {
+            "artifacts": [],
+            "complete": false,
+            "hasTable": true,
+            "intent": {
+              "choices": [],
+              "notes": []
+            },
+            "knowledge": [
+              {
+                "agent": "tola-grey",
+                "bytes": 161,
+                "candidateRead": "unread",
+                "consented": false,
+                "copy": {
+                  "path": "10-notes/knowledge/closed.md",
+                  "problem": "10-notes/knowledge/closed.md could not be read: Permission denied (os error 13)",
+                  "revision": null,
+                  "there": true
+                },
+                "copyRead": "unread",
+                "destination": null,
+                "foreignCopy": null,
+                "host": "electra",
+                "path": "artifacts/knowledge/2026-10-05-taxes/closed.md",
+                "problem": null,
+                "promotedTo": "10-notes/knowledge/closed.md",
+                "reviewedBy": null,
+                "reviewedByMe": false,
+                "revision": "1440708114dac1c8cc602b8b67999dc98bff17975d7f33a6b4e4539ed4a4c67e",
+                "state": "unknown",
+                "title": "Closed",
+                "unavailable": null
+              },
+              {
+                "agent": "tola-grey",
+                "bytes": 156,
+                "candidateRead": "unread",
+                "consented": false,
+                "copy": {
+                  "path": "10-notes/knowledge/gone.md",
+                  "problem": null,
+                  "revision": null,
+                  "there": false
+                },
+                "copyRead": "unread",
+                "destination": {
+                  "fixed": true,
+                  "folder": "10-notes/knowledge",
+                  "name": "gone.md"
+                },
+                "foreignCopy": null,
+                "host": "electra",
+                "path": "artifacts/knowledge/2026-10-05-taxes/gone.md",
+                "problem": null,
+                "promotedTo": "10-notes/knowledge/gone.md",
+                "reviewedBy": null,
+                "reviewedByMe": false,
+                "revision": "8747a43956ea8bbe47652833fdb257f9b93acc7720d29bddcccdbf2388db6665",
+                "state": "missingTarget",
+                "title": "Gone",
+                "unavailable": null
+              }
+            ],
+            "label": null,
+            "outRefused": null,
+            "problems": [],
+            "revision": "e615def9eb5556e98a187d1bf397122be5086f0eaea2cf99d2acb59b078decfb",
+            "rows": [
+              {
+                "choice": null,
+                "line": null,
+                "note": "knowledge",
+                "out": true,
+                "problem": null,
+                "raw": null,
+                "refused": "artifacts/knowledge/2026-10-05-taxes/long.md was promoted into the drive's notes; promote it again from its notes section.",
+                "revision": "e873a9ab3947943f0172b1eb6f571c24e160461324c5527cf5500d20f7c556ba",
+                "source": "artifacts/knowledge/2026-10-05-taxes/long.md",
+                "state": "missingSource",
+                "target": "10-notes/knowledge/long.md"
+              },
+              {
+                "choice": null,
+                "line": null,
+                "note": "knowledge",
+                "out": true,
+                "problem": null,
+                "raw": null,
+                "refused": "artifacts/knowledge/2026-10-05-taxes/gone.md was promoted into the drive's notes; promote it again from its notes section.",
+                "revision": "205cf94bc7068bf2c4eaa3324fa1d970e6cf64fab65f5a30774a5cc17deba4bf",
+                "source": "artifacts/knowledge/2026-10-05-taxes/gone.md",
+                "state": "missingTarget",
+                "target": "10-notes/knowledge/gone.md"
+              },
+              {
+                "choice": null,
+                "line": null,
+                "note": "knowledge",
+                "out": true,
+                "problem": "10-notes/knowledge/closed.md could not be read: Permission denied (os error 13)",
+                "raw": null,
+                "refused": "artifacts/knowledge/2026-10-05-taxes/closed.md was promoted into the drive's notes; promote it again from its notes section.",
+                "revision": "914bdf139d929f1a93544490b5da8b24d0c522cece57f475ff4bd59c51956c29",
+                "source": "artifacts/knowledge/2026-10-05-taxes/closed.md",
+                "state": "unknown",
+                "target": "10-notes/knowledge/closed.md"
+              }
+            ],
+            "unlisted": [],
+            "vault": "10-notes"
+          },
+          "panel": {}
+        },
+        {
+          "expect": {
+            "refused": "10-notes/knowledge/long.md holds 81921 bytes, more than the 81920 keeper reads of a knowledge note, so it is not shown"
+          },
+          "read": {
+            "copy": true,
+            "path": "artifacts/knowledge/2026-10-05-taxes/long.md"
+          }
+        },
+        {
+          "expect": {
+            "refused": "10-notes/knowledge/gone.md is not there any more."
+          },
+          "read": {
+            "copy": true,
+            "path": "artifacts/knowledge/2026-10-05-taxes/gone.md"
+          }
+        },
+        {
+          "expect": {
+            "refused": "10-notes/knowledge/closed.md could not be read: Permission denied (os error 13)"
+          },
+          "read": {
+            "copy": true,
+            "path": "artifacts/knowledge/2026-10-05-taxes/closed.md"
+          }
+        },
+        {
+          "expect": {
+            "bytes": 156,
+            "revision": "8747a43956ea8bbe47652833fdb257f9b93acc7720d29bddcccdbf2388db6665",
+            "text": "---\ntype: Reference\ntitle: Gone\ngenerated:\n  by: agent:tola-grey@electra\n  at: 2026-10-05T18:00:00Z\nhuman_reviewed: false\nstatus: draft\n---\n\nIts copy went.\n"
+          },
+          "read": {
+            "copy": false,
+            "path": "artifacts/knowledge/2026-10-05-taxes/gone.md"
+          }
+        }
+      ],
+      "unreadable": ["10-notes/knowledge/closed.md"],
+      "vault": [
+        {
+          "changed": 20,
+          "pad": {
+            "to": 81921,
+            "with": "y"
+          },
+          "path": "10-notes/knowledge/long.md",
+          "reviewers": [],
+          "text": "---\ntype: Reference\ntitle: The long one\ngenerated:\n  by: agent:tola-grey@electra\n  at: 2026-10-05T18:00:00Z\nhuman_reviewed: false\nstatus: draft\n---\n\n"
+        },
+        {
+          "changed": 20,
+          "path": "10-notes/knowledge/closed.md",
+          "reviewers": [],
+          "text": "---\ntype: Reference\ntitle: Closed\ngenerated:\n  by: agent:tola-grey@electra\n  at: 2026-10-05T18:00:00Z\nhuman_reviewed: false\nstatus: draft\n---\n\nIts copy is shut.\n"
+        }
+      ]
+    },
+    {
+      "files": [
+        {
+          "changed": 10,
+          "path": "workspace/a.md",
+          "text": "a\n"
+        }
+      ],
+      "name": "a row written twice, through the intent to the archive",
+      "rows": [
+        {
+          "note": "",
+          "source": "workspace/a.md",
+          "target": "artifacts/a.md"
+        },
+        {
+          "note": "",
+          "source": "workspace/a.md",
+          "target": "artifacts/a.md"
+        }
+      ],
+      "steps": [
+        {
+          "expect": {
+            "artifacts": [],
+            "complete": false,
+            "hasTable": true,
+            "intent": {
+              "choices": [],
+              "notes": []
+            },
+            "knowledge": [],
+            "label": null,
+            "outRefused": null,
+            "problems": [],
+            "revision": "bdda8ab22a1dc9266504a12f4a23f4e72afd3387aff839980491732802b866ed",
+            "rows": [
+              {
+                "choice": null,
+                "line": null,
+                "note": "",
+                "out": false,
+                "problem": null,
+                "raw": null,
+                "refused": null,
+                "revision": "5beb281f613f5e57bd27c073a6f2976c2ec3a8ec91a4304ba4f2df516fb1760c",
+                "source": "workspace/a.md",
+                "state": "missingTarget",
+                "target": "artifacts/a.md"
+              },
+              {
+                "choice": null,
+                "line": null,
+                "note": "",
+                "out": false,
+                "problem": null,
+                "raw": null,
+                "refused": "this line repeats an earlier row of the ## Promote table, workspace/a.md → artifacts/a.md, so it promotes nothing of its own; the earlier row's choice decides it.",
+                "revision": "04022f2d4371c688da7cb85ad5c54f94d9d32bc922a0fd3e738fe55a75e488d0",
+                "source": "workspace/a.md",
+                "state": "missingTarget",
+                "target": "artifacts/a.md"
+              }
+            ],
+            "unlisted": [],
+            "vault": "10-notes"
+          },
+          "panel": {}
+        },
+        {
+          "expect": {
+            "artifacts": [],
+            "complete": false,
+            "hasTable": true,
+            "intent": {
+              "choices": [
+                {
+                  "promote": false,
+                  "revision": "5beb281f613f5e57bd27c073a6f2976c2ec3a8ec91a4304ba4f2df516fb1760c",
+                  "target": ""
+                }
+              ],
+              "notes": []
+            },
+            "knowledge": [],
+            "label": null,
+            "outRefused": null,
+            "problems": [],
+            "revision": "bdda8ab22a1dc9266504a12f4a23f4e72afd3387aff839980491732802b866ed",
+            "rows": [
+              {
+                "choice": {
+                  "promote": false,
+                  "revision": "5beb281f613f5e57bd27c073a6f2976c2ec3a8ec91a4304ba4f2df516fb1760c",
+                  "target": ""
+                },
+                "line": null,
+                "note": "",
+                "out": false,
+                "problem": null,
+                "raw": null,
+                "refused": null,
+                "revision": "5beb281f613f5e57bd27c073a6f2976c2ec3a8ec91a4304ba4f2df516fb1760c",
+                "source": "workspace/a.md",
+                "state": "missingTarget",
+                "target": "artifacts/a.md"
+              },
+              {
+                "choice": null,
+                "line": null,
+                "note": "",
+                "out": false,
+                "problem": null,
+                "raw": null,
+                "refused": "this line repeats an earlier row of the ## Promote table, workspace/a.md → artifacts/a.md, so it promotes nothing of its own; the earlier row's choice decides it.",
+                "revision": "04022f2d4371c688da7cb85ad5c54f94d9d32bc922a0fd3e738fe55a75e488d0",
+                "source": "workspace/a.md",
+                "state": "missingTarget",
+                "target": "artifacts/a.md"
+              }
+            ],
+            "unlisted": [],
+            "vault": "10-notes"
+          },
+          "panel": {
+            "intent": [
+              {
+                "item": 0,
+                "promote": false,
+                "target": ""
+              }
+            ]
+          }
+        },
+        {
+          "expect": {
+            "artifacts": [],
+            "complete": true,
+            "hasTable": true,
+            "intent": {
+              "choices": [
+                {
+                  "promote": true,
+                  "revision": "5beb281f613f5e57bd27c073a6f2976c2ec3a8ec91a4304ba4f2df516fb1760c",
+                  "target": "artifacts/a.md"
+                },
+                {
+                  "promote": false,
+                  "revision": "04022f2d4371c688da7cb85ad5c54f94d9d32bc922a0fd3e738fe55a75e488d0",
+                  "target": ""
+                }
+              ],
+              "notes": []
+            },
+            "knowledge": [],
+            "label": null,
+            "outRefused": null,
+            "problems": [],
+            "revision": "bdda8ab22a1dc9266504a12f4a23f4e72afd3387aff839980491732802b866ed",
+            "rows": [
+              {
+                "choice": {
+                  "promote": true,
+                  "revision": "5beb281f613f5e57bd27c073a6f2976c2ec3a8ec91a4304ba4f2df516fb1760c",
+                  "target": "artifacts/a.md"
+                },
+                "line": null,
+                "note": "",
+                "out": false,
+                "problem": null,
+                "raw": null,
+                "refused": null,
+                "revision": "5beb281f613f5e57bd27c073a6f2976c2ec3a8ec91a4304ba4f2df516fb1760c",
+                "source": "workspace/a.md",
+                "state": "missingTarget",
+                "target": "artifacts/a.md"
+              },
+              {
+                "choice": {
+                  "promote": false,
+                  "revision": "04022f2d4371c688da7cb85ad5c54f94d9d32bc922a0fd3e738fe55a75e488d0",
+                  "target": ""
+                },
+                "line": null,
+                "note": "",
+                "out": false,
+                "problem": null,
+                "raw": null,
+                "refused": "this line repeats an earlier row of the ## Promote table, workspace/a.md → artifacts/a.md, so it promotes nothing of its own; the earlier row's choice decides it.",
+                "revision": "04022f2d4371c688da7cb85ad5c54f94d9d32bc922a0fd3e738fe55a75e488d0",
+                "source": "workspace/a.md",
+                "state": "missingTarget",
+                "target": "artifacts/a.md"
+              }
+            ],
+            "unlisted": [],
+            "vault": "10-notes"
+          },
+          "panel": {
+            "intent": [
+              {
+                "item": 0,
+                "promote": true,
+                "target": "artifacts/a.md"
+              },
+              {
+                "item": 1,
+                "promote": false,
+                "target": ""
+              }
+            ]
+          }
+        },
+        {
+          "archive": {
+            "choices": "intent"
+          },
+          "expect": {
+            "ok": true
+          }
+        }
+      ],
+      "unreadable": [],
+      "vault": []
+    },
+    {
+      "files": [
+        {
+          "changed": 10,
+          "path": "workspace/a.md",
+          "text": "a\n"
+        },
+        {
+          "changed": 10,
+          "path": "workspace/b.md",
+          "text": "b\n"
+        }
+      ],
+      "name": "archive refusals",
+      "rows": [
+        {
+          "note": "",
+          "source": "workspace/gone.md",
+          "target": "artifacts/gone.md"
+        }
+      ],
+      "steps": [
+        {
+          "expect": {
+            "artifacts": [],
+            "complete": false,
+            "hasTable": true,
+            "intent": {
+              "choices": [],
+              "notes": []
+            },
+            "knowledge": [],
+            "label": null,
+            "outRefused": null,
+            "problems": [],
+            "revision": "743efaaf9e7bae612e0ac72f6de4df7aa85c0528c51684f5993ff44fd288be14",
+            "rows": [
+              {
+                "choice": null,
+                "line": null,
+                "note": "",
+                "out": false,
+                "problem": null,
+                "raw": null,
+                "refused": "workspace/gone.md is not in this session any more.",
+                "revision": "6f483abefb0193541308d9fcf373f0b48a367d60e5376c44173284f211922d49",
+                "source": "workspace/gone.md",
+                "state": "missingTarget",
+                "target": "artifacts/gone.md"
+              }
+            ],
+            "unlisted": [
+              {
+                "choice": null,
+                "refused": null,
+                "revision": "afb9268644ab04ca9c08f2456f1567da8e13f6b51aee68b31bc9038858d5d99a",
+                "source": "workspace/a.md",
+                "suggested": "artifacts/a.md"
+              },
+              {
+                "choice": null,
+                "refused": null,
+                "revision": "440bf05d877ef95f97a9e6528cb4d90a478b85aeaa0fe5c3910dc4994c0d060a",
+                "source": "workspace/b.md",
+                "suggested": "artifacts/b.md"
+              }
+            ],
+            "vault": "10-notes"
+          },
+          "panel": {}
+        },
+        {
+          "archive": {
+            "choices": []
+          },
+          "expect": {
+            "refused": "workspace/gone.md has no choice yet; promote or skip every row before archiving, so nothing was archived."
+          }
+        },
+        {
+          "archive": {
+            "choices": [
+              {
+                "item": 0
+              },
+              {
+                "item": 1
+              }
+            ]
+          },
+          "expect": {
+            "refused": "workspace/b.md has no choice yet; promote or skip every row before archiving, so nothing was archived."
+          }
+        },
+        {
+          "archive": {
+            "choices": [
+              {
+                "item": 0
+              },
+              {
+                "item": 1
+              },
+              {
+                "item": 2
+              },
+              {
+                "promote": false,
+                "revision": "not a row",
+                "target": ""
+              }
+            ]
+          },
+          "expect": {
+            "refused": "the session's workspace or its ## Promote table changed since this checklist was read, so nothing was archived; review it again."
+          }
+        },
+        {
+          "archive": {
+            "choices": [
+              {
+                "item": 0
+              },
+              {
+                "item": 0
+              },
+              {
+                "item": 1
+              },
+              {
+                "item": 2
+              }
+            ]
+          },
+          "expect": {
+            "refused": "the session's workspace or its ## Promote table changed since this checklist was read, so nothing was archived; review it again."
+          }
+        },
+        {
+          "archive": {
+            "choices": [
+              {
+                "item": 0,
+                "promote": true,
+                "target": "artifacts/gone.md"
+              },
+              {
+                "item": 1
+              },
+              {
+                "item": 2
+              }
+            ]
+          },
+          "expect": {
+            "refused": "workspace/gone.md is not in this session any more."
+          }
+        },
+        {
+          "archive": {
+            "choices": [
+              {
+                "item": 0
+              },
+              {
+                "item": 1,
+                "promote": true,
+                "target": "workspace/a2.md"
+              },
+              {
+                "item": 2
+              }
+            ]
+          },
+          "expect": {
+            "refused": "a promotion copies a file of workspace/ into artifacts/; workspace/a.md → workspace/a2.md is not one."
+          }
+        },
+        {
+          "expect": null,
+          "write": {
+            "changed": 20,
+            "path": "workspace/b.md",
+            "text": "b, and more\n"
+          }
+        },
+        {
+          "archive": {
+            "choices": [
+              {
+                "item": 0
+              },
+              {
+                "item": 1
+              },
+              {
+                "item": 2
+              }
+            ]
+          },
+          "expect": {
+            "refused": "the session's workspace or its ## Promote table changed since this checklist was read, so nothing was archived; review it again."
+          }
+        },
+        {
+          "expect": {
+            "artifacts": [],
+            "complete": false,
+            "hasTable": true,
+            "intent": {
+              "choices": [],
+              "notes": []
+            },
+            "knowledge": [],
+            "label": null,
+            "outRefused": null,
+            "problems": [],
+            "revision": "dc2e2149393efb75cb45d6d97a0f2f6260cfa8399227e825775649f13cec7d0a",
+            "rows": [
+              {
+                "choice": null,
+                "line": null,
+                "note": "",
+                "out": false,
+                "problem": null,
+                "raw": null,
+                "refused": "workspace/gone.md is not in this session any more.",
+                "revision": "6f483abefb0193541308d9fcf373f0b48a367d60e5376c44173284f211922d49",
+                "source": "workspace/gone.md",
+                "state": "missingTarget",
+                "target": "artifacts/gone.md"
+              }
+            ],
+            "unlisted": [
+              {
+                "choice": null,
+                "refused": null,
+                "revision": "afb9268644ab04ca9c08f2456f1567da8e13f6b51aee68b31bc9038858d5d99a",
+                "source": "workspace/a.md",
+                "suggested": "artifacts/a.md"
+              },
+              {
+                "choice": null,
+                "refused": null,
+                "revision": "7c73f980c3a809ccbfbdaaca3895f8b7a352dd8896b7d5530d6bb6bbab6a2a19",
+                "source": "workspace/b.md",
+                "suggested": "artifacts/b.md"
+              }
+            ],
+            "vault": "10-notes"
+          },
+          "panel": {}
+        },
+        {
+          "archive": {
+            "choices": [
+              {
+                "item": 0
+              },
+              {
+                "item": 1,
+                "promote": true,
+                "target": "artifacts/a.md"
+              },
+              {
+                "item": 2
+              }
+            ]
+          },
+          "expect": {
+            "ok": true
+          }
+        }
+      ],
+      "unreadable": [],
+      "vault": []
+    },
+    {
+      "dirs": ["workspace/sub"],
+      "files": [
+        {
+          "changed": 10,
+          "path": "workspace/a.md",
+          "text": "a\n"
+        }
+      ],
+      "name": "a workspace that cannot be listed whole",
+      "rows": [],
+      "steps": [
+        {
+          "expect": {
+            "artifacts": [],
+            "complete": false,
+            "hasTable": true,
+            "intent": {
+              "choices": [],
+              "notes": []
+            },
+            "knowledge": [],
+            "label": null,
+            "outRefused": null,
+            "problems": ["workspace/sub/ could not be listed: Permission denied (os error 13)"],
+            "revision": "e044ab15f94040325b22edb9878723c01e4ab7e77264b021aadab5a9029f69a2",
+            "rows": [],
+            "unlisted": [
+              {
+                "choice": null,
+                "refused": null,
+                "revision": "afb9268644ab04ca9c08f2456f1567da8e13f6b51aee68b31bc9038858d5d99a",
+                "source": "workspace/a.md",
+                "suggested": "artifacts/a.md"
+              }
+            ],
+            "vault": "10-notes"
+          },
+          "panel": {}
+        },
+        {
+          "archive": {
+            "choices": [
+              {
+                "item": 0
+              }
+            ]
+          },
+          "expect": {
+            "refused": "workspace/sub/ could not be listed: Permission denied (os error 13); the workspace cannot be checked whole, so nothing was archived."
+          }
+        }
+      ],
+      "unreadable": ["workspace/sub"],
+      "vault": []
+    }
+  ]
+}

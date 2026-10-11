@@ -1452,6 +1452,8 @@ pub fn run() {
                 sessions_ipc::sessions_archive,
                 sessions_ipc::sessions_promote_panel,
                 sessions_ipc::sessions_promote,
+                sessions_ipc::sessions_promote_to,
+                sessions_ipc::sessions_knowledge_read,
                 sessions_ipc::sessions_knowledge_review,
                 sessions_ipc::sessions_delete,
                 sessions_ipc::sessions_unarchive,

@@ -966,6 +966,302 @@ Deferred: DW-1040 (a review's write does not re-check that the composition keeps
 
 - **As built (restack onto `8d8639c1`, 2026-10-09…10).** Restacked onto rung 4's final search round; R266 recorded (converged at e72d3348; R95K7-01…03 deferred as DW-1041…1043, DW-1040 names DW-1041's counterexample). Conflicts: `deferred-work.md` and the decisions file, each a union (DWs in number order, every `**R…**` line where it sat); promote tests gained `SessionAgent.{checkpoints, outputs}` from the workflows rung. **One resolver (R288):** keeper-sync `browse::resolve_known(root, subpath) -> Result<Known, BrowseRefusal>` (`Known::{Landed(Landing), Absent, RootAbsent}`, `Landing::{path, into_path, relative}`) is the one "not there vs not known" resolver; `bots_fs::search_landing` is deleted. It keeps the stricter half of each: absence only on `NotFound` (search's R218 — `ENOTDIR` now refuses for knowledge's readers too, DW-834), a dangling link refused, the root asked about in its plain spelling and positively absent only under a folder (knowledge's R235/R244), the landing under the canonical root and spellable; knowledge's callers (`zone::read_text`, `promote::locate`, `finish_pending`, `review`) read a root that is not there as an absence (`Known::landed`), search's (`search::landing`) refuse it (`Known::under_root`, a drive's checkout that is gone). Tests: `browse::tests::{a_root_the_disk_cannot_vouch_for_is_no_absence, only_not_found_is_an_absence}`, keeper-sync `bots_fs::a_link_put_in_an_offered_entrys_place_is_never_followed`, and both sides' existing landing/absence regressions; per-caller bypass mutants in `mut-95know-rs.py`. **Interactions:** R289 — knowledge makes no commit and calls no `commit_paths`: its writes (the harvest's `session_write`, the session journal, the vault writer, `.keeper/promote-out*.json`) are a session's or a person's working-tree writes, committed by the watcher like a person's (`.keeper/` stays out of git), and a promotion never lands where a maintenance commit writes — `_skills/`, a home's memory files and proposals — wherever the vault is (`WriteScope::with_agents`; `promote::tests::a_promotion_never_lands_where_maintenance_commits`), so curate's sweep and consolidate's guarded commits meet knowledge's files only as a person's edits (R207, R246…R268). R290 — neither the helper (R203) nor a nudge's review pass gains `session_write`, the only agent-side knowledge writer (`helpers::a_helper_cannot_write_send_or_delegate`, `the_review_pass_never_gains_the_session_writer`). R291 — `WriteScope::create` asks only the vault, so a vault at the drive's root let a promotion write `_skills/`, a home or a session's `workspace/`: keeper-sync `WriteScope::fenced(subpath)` is the zones' fences alone (`classify` asks it first), and `promote_out` asks it of the target, `finish_pending` of an interrupted promotion's recorded target (refused, record cleared, nothing written; same test, its second half). Mutation rerun of every round's script plus the restack's own (resolver bypass per caller, `int-create-unfenced`, `int-finish-unfenced`): `mut-95know-rs-run.log`, `mut-95know-rs-*.log`. **Round 8 (R292, `review-95know-8.md`):** (R95K8-01) the fence's zones are read by the profile's own component rule — keeper-sync `files_write::normalise_subfolder` joins `profile::subfolder_components` (now `pub(crate)`: trimmed, `.` and empty parts dropped), so a zone configured `./80-agents`, ` 80-agents `, `./60-sessions` or ` ./60-sessions` is the folder the profile's `agents_root`/`sessions_root` open; `a_promotion_never_lands_where_maintenance_commits` runs every target, fresh and as an interrupted promotion's record, under four zone spellings with the targets in their physical spelling (refused, nothing written, the record cleared; mutant `r8/zone-normalise-old`). (R95K8-02) the shell's `sync_create_entry` creates through `WriteScope::create` without `fenced`: pre-existing and a person's own action, DW-1093. (R95K8-03) `helpers::a_helper_cannot_write_send_or_delegate` no longer pins the refusal's sentence; mutants `r8/int-helper-unknown-not-refused`, `r8/helper-dispatches-session-write` and `r8/review-allows-session-write` (`mut-95know-rs-r8-*.log`). No shell edit (no shell caller of either resolver or of `WriteScope::fenced`; keeper-core and the shell are as rung 5 left them); no TypeScript touched. **Round 9 (R295, `review-95know-9.md`):** (R95K9-01) the write scope reads its vault and zone prefixes as the native path their roots are joined at (keeper-sync `files_write::native_prefix`; a parent, root or prefix component refuses every write), so a Unix vault `notes\.` is that one folder — `promote::tests::a_promotion_lands_only_where_it_was_checked` and `a_recovered_promotion_lands_only_where_it_was_checked` (fresh promotion and recovery to `notes/keep.md` refused, `notes\./keep.md` unchanged), `host::tests::an_agent_hosts_write_lands_only_where_it_was_routed`, `files_write` `a_backslash_in_a_unix_subfolder_is_part_of_the_folders_name` and `a_subfolder_naming_no_folder_in_the_profile_refuses_every_write`, mutants `mut-95know-rs-r9-*.log`; (R95K9-02) DW-1094, (R-NEW-1) DW-1095; no shell or TypeScript edit. Converged at d68890ef (review-95know-10.md, R297).
 
+### As built (rung `agents-95-panel`, 2026-10-06) — 95.5, the UI half
+
+`PromotePanel` in `src/components/sessions/promote-panel.tsx` renders the knowledge rung's VM,
+refreshing it after writes and session changes. `PromotionRow` keeps per-file refusals beside
+the target; `KnowledgeCard` opens the whole note and records the person's review;
+`VaultDestination` browses only beneath the VM's vault through `syncBrowse`. `SessionDetail`
+opens the panel in its **Promote…** dialog. `SessionActions` embeds it in the archive dialog,
+requires explicit per-row promotion/skip decisions and passes the selected pairs to
+`sessionsArchive`; a refusal leaves the dialog open, and a fresh table read invalidates prior
+choices. No Rust, generated bindings or IPC signatures changed in this rung.
+
+The frontend tests are colocated in `promote-panel.test.tsx` and use the real typed client over
+the stateful mock shell rather than a second set of command mocks:
+
+- **AC4, table truth:** `keeps missing sources unpromotable, repairs missing targets and replaces a stale row once` covers quiet source-gone, loud target-missing, unreadable rows, a newer knowledge note, refreshed repaired rows and the target form following a renamed table cell. The backend's existing rename test still owns rewriting cells; the renderer has no second path map.
+- **AC5, promote in:** `keeps a refused workspace file editable in place and promotes an unlisted file to its chosen target` covers the stability refusal, editable target and unlisted-to-recorded transition.
+- **AC6, promote out:** `opens all 64 KiB and offers only this drive's vault after a person's review`, `promotes an ordinary artifact without inventing a knowledge review`, and `does not offer a destination outside the label, or hide a failed panel read behind an empty list` cover the vault picker, generic artifacts, unavailable destinations and failed reads.
+- **AC7, the person's tick:** `waits for the saved review and preserves it when Rust refuses an untick` covers the mixed prior-review state, explicit own review, rejection and tick/untick. `keeps an unreviewed copy visible when the second write fails and lets the person finish its review` covers DW-733 on this base's two-command contract.
+- **AC8, screen and entry:** the whole-note test asserts all 65,536 bytes and the final marker; `opens the promote review from the session detail` exercises the actual entry and full-note open. `requires every archive choice, passes chosen promotions and retains the dialog on refusal` proves the archive gate, selected copy list and failure recovery.
+
+**Visual decisions:** existing shadcn primitives and Keeper tokens only; source/destination
+columns at wide widths become stacked paths below 640 px, with wrapping rather than ellipses.
+Amber `held` ink means **Newer here**, destructive ink means **Target missing**, and muted ink
+means **Source gone**. The session label leads, knowledge has its own group, whole-note text is
+a keyboard-scrollable read-only field, and the archive's destructive action stays outside its
+scrolling review body. Loading, unavailable, empty, read-error, partial-success and long-path
+states have explicit sentences instead of an empty spinner or a silent missing control.
+
+**R139:** this base records the review after copying. The panel requires consent first and
+reports a second-write failure honestly; the knowledge rung's reviewed fixes must replace this
+sequence with its atomic, revision-bound promotion when the coordinator restacks. Its new
+`reviewedByMe` also replaces the base VM's explicitly mixed prior-review state.
+
+**Proof on Linux Chromium (mock shell):** the full app's Sessions → detail → Promote entry
+at 1280 px, and the real SessionsPane harness at 420 px. Dialog widths were 768/388 px,
+each equal to its scroll width; archive footers stayed inside the dialog while the review body
+scrolled. Both opened all 65,536 note bytes including the final marker; only vault folders were
+offered; tick/untick, workspace promotion, generic-artifact promotion, audience refusal,
+copied-but-unreviewed recovery, empty/loading/read-failure and long-string states were exercised.
+ARIA snapshots named all five row states and explicit archive skips/queued targets. Final runs
+had no console errors or failed network requests. `/healthz` returned 200. Evidence:
+`/tmp/agents-salvage/panel95-browser/{results,edges}.json` and the adjacent ARIA snapshots/PNGs.
+Ten mutants in `/tmp/agents-salvage/mut-95panel.py` were killed by assertions; the whole-note
+mutant also failed the detail-entry test. Removing the archive reread invalidation failed the
+disabled-archive assertion; retaining an old row's target form failed the renamed-target value
+assertion. Restoring the exact source passed all nine tests.
+
+The required full `vitest run --maxWorkers=1` run passed 6,570 tests in 393 files; its one failed
+suite was the known symlinked-worktree load failure in `setup-code-scanner.test.tsx` (denied
+`zxing_reader.wasm?url` outside the worktree), with no test executed in that suite.
+After the final row-identity and archive-reread guards, the three affected frontend suites
+(`promote-panel`, `session-detail`, `sessions-pane`) passed all 61 tests. `tsc --noEmit` exited 0;
+`biome ci .` checked 961 files, exited 0, and reported four unused-suppression warnings in
+untouched files. Logs: `/tmp/agents-salvage/gate-95panel-{biome,tsc,vitest-scoped}.log`.
+Browser tabs and the dev server were closed, and all throwaway harness/config files were removed.
+
+**Owed:** real WKWebView / harvested-note verification on hesperia (DW-780). The existing phone
+stack has no Sessions route (DW-781); narrow component proof is not a claim that phone navigation
+ships here. No Rust target directory or cargo run was needed.
+
+### As built (rung `agents-95-panel`, 2026-10-07) — restack onto 7f964245; review fixes R95P-01…10, R216
+
+Restacked onto the knowledge rung's round-2 fixes (7f964245). Rust now decides every offer and
+the panel renders it; the base paragraph's "no Rust, bindings or IPC changed" no longer holds.
+`keeper_core::sessions::offer` (new: `DestinationVm`, `VaultCopyVm`, `UnlistedVm`,
+`ArtifactOfferVm`, `NoteTextVm`, `compose_target`, `row_revision`, `snapshot_revision`,
+`refused_in`); `PromoteRowVm.{revision,refused}`, `KnowledgeNoteVm.{copy,destination,unavailable}`,
+`SessionPromoteVm.{unlisted: UnlistedVm[], artifacts, revision}`, `ArchiveDecision.before`
+(bindings regenerated). `keeper_agent::promote::offer` (new: `complete`, `read_note`,
+`promote_to`, `review_as_read`, `archive`), `promote::admit_in` shared by `promote_in` and the
+archive, `sessions::verbs::archive_with`. Shell (by inspection): `sessions_archive` (+`revision`,
+runs `offer::archive`), `sessions_promote` (into the session only), new `sessions_promote_to` and
+`sessions_knowledge_read`, `sessions_knowledge_review` (+`expected`); `lib.rs` handler list.
+
+- **01** archive promotions are the panel's: `an_archive_promotes_as_the_panel_does` (README row
+  retargeted, retained bytes), `an_archive_refuses_what_a_promotion_refuses` (`workspace/keep.md`,
+  `README.md`, `../elsewhere.md`, a source still being written).
+- **02/03** candidate vs vault copy, review as read, missing-copy restore:
+  `a_note_is_read_reviewed_and_restored_as_the_version_read`; panel `restores a missing notes copy
+  by promoting the note again, never by reviewing an absent file`, `reads the candidate and the
+  notes copy separately when they differ`, `reviews only the notes copy as read, and keeps Rust's
+  last saved review when a write is refused`.
+- **04** `binds consent to the version read: a newer candidate clears it and a late read shows stale`.
+- **05/06** `an_archive_refuses_a_checklist_that_changed`, `revisions_move_only_with_what_they_bind`;
+  panel `is not ready while a reread is out, keeps choices an unchanged reread confirms and drops
+  changed ones` (ends with an archive of the checklist as read), `is not ready while a panel write is out`.
+- **07/08** `the_panel_offers_only_what_the_promotion_takes`, `a_target_is_composed_only_inside_the_vault`;
+  panel `says why a file is not offered, and what the panel could not see, with nothing to click`.
+- **09** `moves focus into each editor and back to its row action`; browser keyboard pass.
+- **10** the mock-echo assertions are gone; rendered outcomes only.
+
+The mock shell serves the same VM (and a plain-TypeScript SHA-256 for a dev server reached over
+plain http, where `crypto.subtle` is absent). Browser proof at 1280 px (full app) and 420 px (real
+SessionsPane harness, DW-781): `/tmp/agents-salvage/panel95-browser-2/`. Deferred: DW-782…785.
+
+### As built (rung `agents-95-panel`, 2026-10-07) — re-review fixes (round 2: R95P2-01…09, R234)
+
+Ruling R234 (`review-95panel-2.md`). Per finding — symbol, then the test that fails without it:
+- **01** — `keeper_agent::promote::review(…, expected, …)` (`offer::review_as_read` removed):
+  `expected` is `keeper_core::sessions::offer::copy_revision` (the copy's path and bytes), compared
+  with each text the guarded amend hands over, in the held zone after `finish_pending`; drift
+  refuses with `promote::COPY_CHANGED`. Test: `a_review_lands_only_on_the_copy_as_read` (an
+  edit landing inside the amend's retry via `Vault.meanwhile`, a pending publication, a retarget
+  to identical bytes).
+- **02** — `knowledge::MAX_REVIEWED_BYTES` (64 KiB + 16 KiB): `offer::vault_copy`/`read_note`'s
+  copy bound; `promote_out` and `review` refuse a copy that would pass it. Test:
+  `a_note_at_the_cap_is_read_and_reviewed_after_promotion` (65,536-byte candidate → promote →
+  read copy → untick → tick; a copy at the bound read, one byte past refused).
+- **03** — `sessions::exec::inventory` (every entry, kind-tagged stamp, links not followed,
+  problems said, `INVENTORY_CAP`), `promote::workspace_facts`, `offer::refused_unlisted`,
+  `snapshot_revision(readme, stamps, targets)`. Test:
+  `the_archive_checklist_holds_everything_the_emptying_removes` (empty checklist, then
+  `.draft.md`, `.staging/output.md`, a link).
+- **04** — `PlanStep::EmptyDirKeep.accepted`, `ArchiveDecision.accepted`,
+  `verbs::archive_with` (inventory under the held zone, passed to `before` as `Workspace`); the
+  executor refuses an emptying whose directory holds anything not accepted at its stamp, at the
+  step and on resume. Test: `an_archive_resumed_after_a_crash_keeps_work_that_arrived_since`
+  (after a completed checked copy; a decided file rewritten; a folder arriving before any step;
+  a half-emptied workspace completes).
+- **05** — `offer::target_fact`, `row_revision(…, target_fact)`, `promote::row_files(…, dated)`
+  shared by the panel and the archive. Test: `losing_a_target_takes_the_choice_with_it`
+  (refresh after deletion; drift between checklist and archive); core
+  `revisions_move_only_with_what_they_bind`.
+- **06** — `offer::{ChoiceVm, NoteIntentVm, PanelIntentVm, ReadState, decisions, decide,
+  archive_promotions}`, `promote::offer::panel_for`; `PromoteRowVm.choice`, `UnlistedVm.choice`,
+  `KnowledgeNoteVm.{candidateRead, copyRead, consented}`, `SessionPromoteVm.{intent, complete}`;
+  `offer::Archive.{choices, root}`. `promote-panel.tsx` forwards intent and renders (no
+  synthetic rows, no revision comparison, no completeness rule). Tests: core
+  `a_choice_holds_only_for_the_item_it_was_made_on`, `consent_holds_only_to_the_version_read_and_shown`;
+  agent `an_archive_needs_one_choice_for_every_row`, `the_panel_decides_reads_and_consent`;
+  the panel tests keep their outcomes, now waiting for Rust's answer before a read enables
+  consent, consent enables promotion or a copy read enables the tick.
+- **07** — `keeper-core/src/sessions/promote-vectors.json` (digests computed independently with
+  Python's hashlib) loaded by core `every_promote_vector_matches`, agent `every_text_vector_matches`
+  and `src/test/mock-shell-promote-contract.test.ts` (WebCrypto present and stubbed away);
+  `dev/mock-shell.ts`: byte-accurate `bytes` (PNG signature; `artifacts/trace.log`, valid UTF-8
+  with a NUL), `promoteRowRevision`/`promoteSnapshotRevision`/`promoteCopyRevision`/
+  `promoteIsText`/`promoteDecisions`, the reader bounds and refusals, archive admission as Rust's.
+- **08** — `KnowledgeCard`'s post-promotion focus to **Read notes copy** (heading fallback).
+  Test: `keeps focus in a knowledge card after its promotion: on its notes-copy reader`
+  (keyboard: new publication, missing-copy restore, re-promotion).
+- **09** — the archive test's captured-payload assertion deleted; it asserts the rendered
+  queued target and the refusal.
+
+Shell (by inspection): `sessions_promote_panel` (+`intent` → `offer::panel_for`),
+`sessions_archive` (`choices`, `root: &profile.local_path`), `sessions_knowledge_review`
+(→ `promote::review`), each `#[cfg(not(desktop))]` twin; macOS awaits CI (hesperia had 12 GB
+free). Deferred: DW-910…914.
+
+Browser proof (2026-10-08, mock shell serving the contract above): 1280 px full app and a real
+420 px viewport over the real `SessionsPane` in a throwaway harness (DW-781 stands),
+`/tmp/agents-salvage/panel95-browser-3/`. At both widths: dialog 768/388 px equal to its scroll
+width, no page overflow; `chart.png` (PNG bytes) "not a text file" with no button,
+`trace.log` (UTF-8 with a NUL) offered; candidate and notes copy read apart, the copy's untick
+lands; keyboard: row editor in/cancel/back/complete, then **Read notes copy** focused after a
+new publication and after a missing-copy restore; Archive disabled until all nine items are
+chosen, disabled while a reread is held, kept after an unchanged reread, archived. Only the
+two dev-server font 403s (symlinked `node_modules`) as errors.
+
+Mutation (`/tmp/agents-salvage/mut-95panel-4-*.log`, the script restores on SIGTERM/SIGHUP/SIGINT):
+13/13 killed by assertion in the tests named above — 01 amend unbound, 02 copy read at the
+candidate cap, 03 hidden entries skipped, 04 emptying ignores its inventory, 05 row revision
+without the target, 06 refused item keeps a promotion / consent without a current read /
+undecided row skipped / ready without Rust's `complete`, 07 mock row revision without the
+target / NUL not text / fallback SHA padding, 08 focus not moved after a knowledge promotion.
+
+### As built (rung `agents-95-panel`, 2026-10-08) — re-review fixes (round 3: R95P3-01…08, R249)
+
+Ruling R249 (`review-95panel-3.md`). Per finding — symbol, then the test that fails without it:
+- **01** — `PlanStep::EmptyDirKeep { path, decided: Option<Emptying> }` (the field is new, so a
+  journal written before it — no record, or R234's bare `accepted` inventory — deserialises with
+  `decided: None`); `exec::empty_as_decided` refuses `None` before touching anything: the plan is
+  abandoned, the workspace kept, the session not moved, a new checklist needed. Test:
+  `an_earlier_keepers_archive_journal_removes_nothing` (exec; both older journal shapes, verbatim
+  JSON, with work arriving before the resume).
+- **02 + 04** — `plan::Emptying { entries, root, targets, drive_targets, zone_in_drive }`;
+  `exec::identity` (`<dev>:<ino>` of a real folder); `exec::inventory` refuses to list a `top`
+  that is a link or not a folder; `exec::empty_as_decided` checks the folder is the decided one
+  (`identity`) at its own place (`at_its_place`: canonical path = zone + plan path), then the
+  targets, then the inventory, then (test seam `exec::seam::after_check`) removes only
+  `entries`, deepest first, each file/link re-stamped (`stamp_of`) before `remove_file`, each
+  folder by `remove_dir` (never recursive), then refuses if anything but `.gitkeep` is left.
+  `verbs::Workspace.root`, `verbs::archive_with` (the `before` closure now returns the steps and
+  the `Emptying` targets). Tests: `work_arriving_while_the_workspace_is_emptied_is_kept` (seam:
+  a top-level arrival, one inside a decided folder, a decided file rewritten),
+  `an_emptying_is_bound_to_the_folder_it_was_decided_on` (replaced by a twin with the same
+  names and stamps; a link in the zone; a link out of it; a link on the way),
+  `an_archive_resumed_after_a_crash_keeps_work_that_arrived_since` (half-emptied: a folder, a
+  file — recovers), agent `a_linked_workspace_is_never_listed_or_emptied` (a root link in the
+  zone and out of it: problem, archive refused, the other folder intact).
+- **03** — `promote::offer::archive` records in `Emptying.targets`/`drive_targets` what each
+  row whose source is in the workspace said of its target (`offer::target_fact`), then
+  `sha256:<hex>` for every target the plan's own `CopyChecked` writes; `zone_in_drive` (shared
+  with `row_files`, now also trying the canonical drive) finds drive-relative targets again;
+  `exec::moved_target`/`still_says` revalidate at the emptying and every resume. Test:
+  `a_resumed_archive_empties_only_while_its_targets_say_what_they_said` (all skipped / promoted,
+  crash at the emptying via the seam, the target deleted or replaced → refused, source kept,
+  the old intent incomplete; nothing changed → archives).
+- **05** — `promote::promote_panel` gives every repeat of a line its own revision
+  (`offer::occurrence`) and refusal (`offer::repeated`); `decide` and `archive_promotions` then
+  agree. Tests: agent `a_row_written_twice_is_two_choices_the_archive_takes` (real README, one
+  skip incomplete, both decided → archived); panel `keeps a row written twice as two rows, each
+  archived only on its own choice`; vector scenario "a row written twice".
+- **06** — `keeper-agent/src/promote/command-vectors.json`, recorded by
+  `every_command_vector_holds` over real files (`KEEPER_WRITE_VECTORS=1` records) and replayed
+  through the mock's handlers over IPC by `src/test/mock-shell-promote-commands.test.ts`: whole
+  panel VMs (offers, target facts, revisions, copies, problems), candidate/copy reads,
+  publication of a byte-backed note and artifact, reviews, oversized/unreadable/missing copies
+  (scenario "oversized, unreadable and missing copies": a vault copy keeper may not read is
+  the panel's copy problem and the read's refusal),
+  archive refusals (undecided, stranger, twice, refused row, admission, stale snapshot,
+  unlistable workspace) and success. `dev/mock-shell.ts`: `promoteDigest` (review keys aside),
+  `cellBytes`, `fileText` for every text read and publication, `file:<len>:<mtime ns>` stamps,
+  `dirs`, `promoteProblems`, unreadable ordinary artifacts, a missing copy's own sentences,
+  the archive's listing refusal, repeat identities, `head`. The independent SHA/fallback
+  vectors stay.
+- **07** — `promote::review`'s growth guard. Tests: `a_review_never_grows_the_copy_past_what_keeper_reads`
+  (lands exactly at 81,920 and reads whole; one byte longer refused, bytes kept); vector
+  scenarios "a review that lands exactly at the reviewed bound" / "…would cross…" against the
+  mock's guard.
+- **08** — deleted: `an_archive_plan_moves_the_folder_last`'s copied-step and verb echo,
+  `every_promote_vector_matches`' and `every_text_vector_matches`' non-empty checks, and the
+  contract test's two `length > 0` checks.
+
+Shell crate: unchanged (no keeper-core/agent signature it calls changed). Deferred:
+DW-1000…1002.
+
+Browser proof (2026-10-08, the mock shell above): 1280 px full app and a real 420 px viewport over
+the real `SessionsPane` in a throwaway harness (removed; DW-781 stands),
+`/tmp/agents-salvage/panel95-browser-6/` (rerun of `panel95-browser-5`). At both widths: dialog
+768/388 px equal to its scroll width, no page overflow; `artifacts/locked.md` (unreadable) says
+"could not be read" with no button, `trace.log` still offered; a `## Promote` line written twice
+shows two rows, the repeat saying why it promotes nothing; with every other item skipped and the
+first row skipped, the repeat stays undecided and **Archive session** disabled; skipped too, it
+enables and archives. Only the two dev-server font 403s (symlinked `node_modules`) as errors.
+
+Mutation (`/tmp/agents-salvage/mut-95panel-5-*.log`, `mut-95panel-5b-*.log`; both scripts restore
+on SIGTERM/SIGHUP/SIGINT, no mutant text left): 26/26 killed by assertion in the tests named
+above — 01 an earlier journal empties everything; 02 a decided folder removed recursively / what
+is left not checked / a half-done emptying not resumed; 03 targets not revalidated / the plan's
+own promotion taken for drift / no target recorded; 04 folder identity ignored / place not
+checked / inventory follows a root link; 05 a repeat shares its revision (Rust and mock); 06 mock
+target fact hashes raw bytes / unreadable artifact offered / publication reads text not bytes /
+missing copy reads as unpromoted / archive ignores listing problems / stamps in ms / unreadable
+copy read / unreadable copy in the panel; 07 review growth unbounded / guard refuses at the
+bound / guard lets one byte past (Rust and mock, the mock's off-by-one both ways).
+
+### As built (rung `agents-95-panel`, 2026-10-08) — re-review fixes (round 4: R95P4-01…03, R265)
+
+Ruling R265 (`review-95panel-4.md`). Per finding — symbol, then the test that fails without it:
+- **01** — `exec::Folder` (Unix: an `OwnedFd`; `reach` opens the zone, then each part of the plan
+  path with `O_NOFOLLOW|O_DIRECTORY`; `child`, `stamp` = `statat(AT_SYMLINK_NOFOLLOW)` +
+  `readlinkat`, `names` = `Dir::read_from`, `remove` = `unlinkat`/`AT_REMOVEDIR`, `sync`, `keep`
+  = `O_CREAT|O_EXCL|O_NOFOLLOW`; off Unix a path, DW-1002); `exec::walk` (the inventory over a
+  held folder, recording each folder's identity), `exec::down` (a folder reached from the held
+  root, each folder on the way the one the check recorded), `exec::identity`/`identity_of`
+  (`<dev>:<ino>` from one `stat` formatter). `exec::empty_as_decided` reaches and holds the
+  workspace before its checks, binds it to `Emptying.root`, walks it held, and after the seam
+  re-stamps and unlinks every decided entry relative to its held parent; a held folder no longer
+  at its place once emptied refuses. `exec::inventory` (the panel's and the planner's) shares
+  `walk`; `at_its_place`/`stamp_of` are gone. Test: `a_folder_swapped_in_after_the_check_is_never_emptied`
+  (exec, Unix; at `seam::after_check` the workspace, or `workspace/sub`, swapped for a link to a
+  same-stamp twin in the zone or outside it, or for the twin itself → refused, every twin byte
+  kept, the session not moved); `an_emptying_is_bound_to_the_folder_it_was_decided_on` keeps the
+  before-resume cases. DW-1001 rewritten to the exact remaining exposure; `PlanStep::EmptyDirKeep`'s
+  doc and `docs/sessions.md` no longer claim more.
+- **02** — `dev/mock-shell.ts`: `utf8Text` (`TextDecoder("utf-8", { ignoreBOM: true, fatal: true })`,
+  `null` when not UTF-8) behind `fileText`, `promoteIsText`, the candidate read
+  (`readNoteFixture`: cap on stored bytes, then unreadable, then `… could not be read: stream did
+  not contain valid UTF-8`), the panel's knowledge rows (Rust's order: size, then the read),
+  publication (`promoteInFixture` publishes only exact text) and `sync_read_text` (a not-UTF-8 file
+  is `binary` with `text_file`'s sentence); `readRefusal` takes stored bytes; `promoteDigest`
+  decodes the head with `utf8Prefix` (the valid UTF-8 prefix, exactly) and finds its fence after
+  a BOM. Test: vector scenario "a byte-order mark kept, and a candidate that is not UTF-8"
+  (recorded by `every_command_vector_holds`: a BOM-prefixed harvested note and artifact read,
+  published and re-read with the review in; a malformed candidate's panel problem, read and
+  promotion refusals; a malformed oversize candidate refused for its size), replayed by
+  `src/test/mock-shell-promote-commands.test.ts`.
+- **03** — `promote/tests.rs`: `every_command_vector_holds` and its helpers (`vector_bytes`,
+  `put_at`, `outcome_of`, `vector_choices`, `command_outcomes`) in one `#[cfg(unix)] mod
+  command_vectors`. No behaviour; no Windows build run (none here).
+
+Shell crate: unchanged (no keeper-core/agent signature it calls changed: `exec::inventory` and
+`exec::identity` keep theirs). No rendered surface changed, so no browser run. No new DW.
+
+Mutation (`/tmp/agents-salvage/mut-95panel-6.py`, logs `mut-95panel-6-*.log`, runs
+`mut-95panel-6-run-{ts,a,b}.log`; restores on SIGTERM/SIGHUP/SIGINT, files byte-identical after):
+9/9 killed by assertion — 01 (in `a_folder_swapped_in_after_the_check_is_never_emptied`) unlink by
+path / the holder reached by path / the place not checked after / a folder's identity ignored;
+02 (in the vector scenario above) BOM dropped / malformed read as U+FFFD / cap on decoded text /
+the digest head loses the BOM / the digest fence ignores the BOM.
+
+### As built (rung `agents-95-panel`, 2026-10-10) — restack onto fe760de0 (R270)
+
+Restacked onto knowledge's final commit as a semantic union on its API: `promote::panel` takes the row files from `row_files` and each harvested note's copy fact (`PanelFacts::copies`, `copy_fact`) so the panel tells `foreign_copy`; `promote::review` refuses a copy that is not the note's (`promote::standing`, `CopyLoss::explain`) before its as-read check (`offers::copy_revision`, `COPY_CHANGED`) inside the guarded amend; `offer::out_target` reads a note's one row (`promote::entry_of`); a foreign copy offers no promotion and says why (`unavailable`, R298); `exec::still_says` uses `browse::resolve_known`'s `Known`; the mock mirrors all of it (`standing`, `copyLoss`, `promoteCopyDigest` for a published row's fourth cell). Tests: `a_review_lands_only_on_the_copy_as_read`, `a_review_never_writes_into_a_file_the_note_did_not_publish`, `the_panel_takes_a_notes_copy_from_its_one_row`, `every_command_vector_holds` (rows recording their copy's publication), `mock-shell-promote-reads.test.ts`; mutation `mut-95panel-rs.py` (`mut-95panel-rs-*.log`): 31 inherited mutants killed (4 round-5 mutants superseded by round 6's 6-01, not re-run) plus 8 reconciliation mutants killed. R95P5-01 deferred as DW-1050 (R270); DW-1141 opened. Converged after restack (review-95panel-6.md, R300); R95P6-01 deferred as DW-1142. keeper-core's lib tests and the bindings regeneration check await delectra; macOS awaits CI.
+
 ## UX decisions
 
 UX-DR137 is the architecture's; UX-DR138 is this epic's.
