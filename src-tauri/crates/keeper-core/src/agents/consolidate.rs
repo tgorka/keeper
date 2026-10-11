@@ -1168,7 +1168,7 @@ impl ApplyArgs {
             (After::Text(_), None) => [MemoryTarget::User, MemoryTarget::Memory]
                 .iter()
                 .any(|target| self.change.path == format!("{home}/{}", target.file())),
-            (After::Text(_), Some(rest)) => rest.strip_suffix("/SKILL.md").is_some_and(&plain),
+            (After::Text(_), Some(rest)) => rest.strip_suffix("/SKILL.md").is_some_and(plain),
             (After::MovedTo(to), Some(name)) => {
                 plain(name) && *to == format!("_skills/{ARCHIVE_DIR}/{name}")
             }
