@@ -4616,6 +4616,45 @@ pub fn notify_set_preview_enabled(
         .map_err(to_ipc_error)
 }
 
+/// Read `push.gateway_url` (98.1, Q4) as Settings shows it: the stored
+/// address, and Rust's sentence when what is stored is one keeper will not
+/// register. Every target, so the command list is identical everywhere; only
+/// the phones draw the field.
+#[tauri::command]
+pub fn push_gateway_get(
+    state: State<'_, AppState>,
+) -> Result<keeper_core::agents::push::PushGatewayVm, IpcError> {
+    let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
+    let stored = keeper_core::registry::get_push_gateway_url(&data_dir).map_err(to_ipc_error)?;
+    Ok(keeper_core::agents::push::PushGatewayVm::of(
+        stored.as_deref(),
+    ))
+}
+
+/// Set `push.gateway_url` (98.1, Q4): blank clears it (no push); anything
+/// else is stored only as `Gateway::parse` normalises it, and a refusal is
+/// returned as its sentence with nothing written. Returns what was stored.
+#[tauri::command]
+pub fn push_gateway_set(
+    state: State<'_, AppState>,
+    url: String,
+) -> Result<keeper_core::agents::push::PushGatewayVm, IpcError> {
+    let gateway = keeper_core::agents::push::Gateway::parse(&url).map_err(|why| IpcError {
+        code: IpcErrorCode::Internal,
+        message: why.to_string(),
+        account_id: None,
+        retriable: false,
+    })?;
+    let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
+    keeper_core::registry::set_push_gateway_url(&data_dir, gateway.as_ref())
+        .map_err(to_ipc_error)?;
+    Ok(keeper_core::agents::push::PushGatewayVm::of(
+        gateway
+            .as_ref()
+            .map(keeper_core::agents::push::Gateway::as_str),
+    ))
+}
+
 /// Read the global Do-Not-Disturb switch (Story 10.2). Returns the in-memory
 /// [`NotifyConfig`](keeper_core::notify::NotifyConfig) value (seeded from the persisted
 /// registry at startup; default off). Infallible — reads process state, never fails.

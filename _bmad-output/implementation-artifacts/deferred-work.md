@@ -9911,3 +9911,24 @@ reason: a pin names its window by title; a window that retitles itself (a browse
 origin: epic 96, story 96.4 (rung `agents-96-screen`, review-96tail-fix1 / R328, 2026-10-11; recorded at rung `agents-97-mark` by the coordinator)
 location: `src-tauri/crates/keeper-agent/src/mcp.rs` (`READS_KEPT_ALL`)
 reason: reads are kept per session but under one host-wide cap, so a busy session can evict another's reads; that session's next element action is refused for want of a read. Fails closed — a denial of service only, never misuse. Close with a per-session share of the cap, with a test of two sessions.
+
+### DW-1230: Rung 4's pusher must be built only through `Gateway::parse`.
+
+origin: epic 98, story 98.1 fix round 1 (rung `agents-98-push-setting`, 2026-10-11; `review-98pushsetting-1.md` DW-a, R331)
+location: `src-tauri/crates/keeper-core/src/agents/push.rs` (`Gateway::parse`), `src-tauri/crates/keeper-core/src/registry.rs` (`get_push_gateway_url`); rung 4 (`agents-98-apns`) `PusherSpec`
+reason: `get_push_gateway_url` returns the raw stored text, and a synced `settings.toml` can carry any text. The setter and the egress row read it through `Gateway::parse`; the pusher rung 4 registers must too, and register no pusher when it refuses — never hand the raw string to the homeserver. Rung 4 also adds the `egress_list` append (`cfg(not(desktop))`) and the `docs/egress.md` row that moved out of rung 1 (R330), and rewrites `PUSH_GATEWAY_NOTE` with `NO_BACKGROUND_SYNC_SENTENCE` and `docs/ios.md` (codemap Q16).
+status: open
+
+### DW-1231: One host-vs-port rule for every egress row.
+
+origin: epic 98, story 98.1 fix round 1 (rung `agents-98-push-setting`, 2026-10-11; `review-98pushsetting-1.md` R98PUSHSETTING1-04, DW-c)
+location: `src-tauri/crates/keeper-core/src/egress.rs` (`remote_host` and its callers), `src-tauri/crates/keeper-core/src/agents/mcp.rs` (`url_host`), `docs/egress.md`
+reason: The MCP and push gateway rows show `host:port` when the address names a port (`url_host`); the sync-remote and forge rows show the host only (`remote_host`), so `forge.example.org:8443` and `forge.example.org` read as one destination. `docs/egress.md` says "one entry per distinct host and port" for one table and "only the host" for others. Pick one rule and apply it to every row.
+status: open
+
+### DW-1232: `delectra-gate.sh … HEAD` cannot fetch its bundle.
+
+origin: epic 98, story 98.1 (rung `agents-98-push-setting`, 2026-10-11; `review-98pushsetting-1.md` DW-d)
+location: `/tmp/agents-salvage/delectra-gate.sh` (coordinator tooling, not the repo)
+reason: Given `HEAD`, the script's bundle carries no `refs/*`, so delectra fetches nothing and fails with `fatal: unable to read tree <sha>`; passing the branch name works. The script should bundle a named ref (or resolve `HEAD` to the branch) before it fetches.
+status: open

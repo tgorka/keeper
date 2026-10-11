@@ -22,6 +22,7 @@ import {
   BADGE_NOT_LIVE_SENTENCE,
   NO_BACKGROUND_SYNC_SENTENCE,
 } from "@/components/settings/no-background-sync-disclosure";
+import { PushGatewayField } from "@/components/settings/push-gateway-field";
 import { RecordingSettingsControls } from "@/components/settings/recording-settings-controls";
 import { SyncGitRow } from "@/components/settings/sync-git-row";
 import { DeviceSection, SyncSection } from "@/components/settings/sync-section";
@@ -554,6 +555,7 @@ function NotificationsSection({ open }: { open: boolean }) {
               ))}
             </RadioGroup>
           </div>
+          <PushGatewayField open={open} />
           <p className="text-muted-foreground">{NO_BACKGROUND_SYNC_SENTENCE}</p>
           <p className="text-muted-foreground">{BADGE_NOT_LIVE_SENTENCE}</p>
           {permission === "denied" && (

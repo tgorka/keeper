@@ -39,6 +39,7 @@ import type { NavState } from "./gen/NavState";
 import type { NotificationPermission } from "./gen/NotificationPermission";
 import type { NotifyTarget } from "./gen/NotifyTarget";
 import type { PersonVm } from "./gen/PersonVm";
+import type { PushGatewayVm } from "./gen/PushGatewayVm";
 import type { TelemetryConsentVm } from "./gen/TelemetryConsentVm";
 import type { TelemetryEventReq } from "./gen/TelemetryEventReq";
 import type { TelemetryRemoteConfigVm } from "./gen/TelemetryRemoteConfigVm";
@@ -616,6 +617,7 @@ export type { Provider } from "./gen/Provider";
 export type { ProviderKind } from "./gen/ProviderKind";
 export type { ProviderOfferVm } from "./gen/ProviderOfferVm";
 export type { ProxyRoomVm } from "./gen/ProxyRoomVm";
+export type { PushGatewayVm } from "./gen/PushGatewayVm";
 export type { ReactionGroupVm } from "./gen/ReactionGroupVm";
 export type { ReadState } from "./gen/ReadState";
 export type { RecordingApplicationVm } from "./gen/RecordingApplicationVm";
@@ -2510,6 +2512,22 @@ export async function notifyGetPreviewEnabled(): Promise<boolean> {
  */
 export async function notifySetPreviewEnabled(enabled: boolean): Promise<void> {
   await invoke<void>("notify_set_preview_enabled", { enabled });
+}
+
+/**
+ * Read `push.gateway_url` (98.1): the stored address, and Rust's sentence when what is
+ * stored is one keeper will not register.
+ */
+export async function pushGatewayGet(): Promise<PushGatewayVm> {
+  return await invoke<PushGatewayVm>("push_gateway_get");
+}
+
+/**
+ * Set `push.gateway_url` (98.1): `""` clears it. Rejects with Rust's sentence, writing
+ * nothing, when the address is not one keeper registers; resolves with what was stored.
+ */
+export async function pushGatewaySet(url: string): Promise<PushGatewayVm> {
+  return await invoke<PushGatewayVm>("push_gateway_set", { url });
 }
 
 /**

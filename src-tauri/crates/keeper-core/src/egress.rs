@@ -430,6 +430,34 @@ pub fn agent_egress(servers: &[crate::agents::mcp::McpEntry]) -> Vec<EgressEndpo
     endpoints
 }
 
+/// The row an egress list carries for the push gateway (98.1 #8, Q6).
+pub const PUSH_GATEWAY_LABEL: &str =
+    "Push gateway — your homeserver sends it event ids for this device";
+
+/// The push gateway the person named (98.1 #8, Q6; NFR-121), as one
+/// [`EgressKind::PushGateway`] row: its host, and its port when the address
+/// names one — the way an MCP server's row is composed
+/// ([`url_host`](crate::agents::mcp::url_host)), so `:8443` and `:443` are
+/// two destinations — never its path. `stored` is `push.gateway_url` as the
+/// settings table holds it; blank, absent, or an address
+/// [`Gateway::parse`](crate::agents::push::Gateway::parse) refuses (keeper
+/// registers no pusher with it) is no row. Kept beside [`compute_egress`] for
+/// [`forge_egress`]'s reason: the shell appends it on the phones, from the
+/// rung that registers the pusher (epic 98 rung 4, `agents-98-apns`).
+pub fn push_egress(stored: Option<&str>) -> Vec<EgressEndpointVm> {
+    let Some(Ok(Some(gateway))) = stored.map(crate::agents::push::Gateway::parse) else {
+        return Vec::new();
+    };
+    crate::agents::mcp::url_host(gateway.as_str())
+        .map(|host| EgressEndpointVm {
+            url: host,
+            kind: EgressKind::PushGateway,
+            label: PUSH_GATEWAY_LABEL.to_owned(),
+        })
+        .into_iter()
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -972,6 +1000,7 @@ mod tests {
             EgressKind::Account,
             EgressKind::Forge,
             EgressKind::McpServer,
+            EgressKind::PushGateway,
         ];
 
         // Wildcard-free exhaustive match: a new `EgressKind` variant makes this
@@ -987,6 +1016,7 @@ mod tests {
                 EgressKind::Account => {}
                 EgressKind::Forge => {}
                 EgressKind::McpServer => {}
+                EgressKind::PushGateway => {}
             }
         }
 
@@ -1016,6 +1046,7 @@ mod tests {
             "notes",
             "https://notes.example.org/mcp",
         )])));
+        out.extend(push_egress(Some("https://push.example.org")));
 
         for kind in ALL_KINDS {
             assert!(
@@ -1107,6 +1138,41 @@ mod tests {
             !shown.contains("/mcp") && !shown.contains("key=") && !shown.contains("secret"),
             "{shown}"
         );
+    }
+
+    /// 98.1 #8: the gateway the person set is one row, its host — and its
+    /// port when the address names one — labelled as the homeserver's
+    /// destination; blank, absent, or an address keeper would not register
+    /// is no row.
+    #[test]
+    fn the_push_gateway_is_disclosed_by_host_once_and_nothing_when_blank() {
+        let row = |url: &str| {
+            vec![EgressEndpointVm {
+                url: url.to_owned(),
+                kind: EgressKind::PushGateway,
+                label: PUSH_GATEWAY_LABEL.to_owned(),
+            }]
+        };
+        assert_eq!(
+            push_egress(Some(
+                " https://Push.Example.org:8443/_matrix/push/v1/notify "
+            )),
+            row("push.example.org:8443")
+        );
+        // The default port is the address without one: one destination.
+        assert_eq!(
+            push_egress(Some("https://push.example.org:443")),
+            row("push.example.org")
+        );
+        for nothing in [
+            None,
+            Some(""),
+            Some("  "),
+            Some("http://push.example.org/_matrix/push/v1/notify"),
+            Some("https://me:pw@push.example.org"),
+        ] {
+            assert!(push_egress(nothing).is_empty(), "{nothing:?}");
+        }
     }
 
     /// R96MM2-05: a URL's host and a program of the same name are two

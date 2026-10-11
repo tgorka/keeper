@@ -69,6 +69,8 @@ vi.mock("@/lib/ipc/client", () => ({
   dockBadgeModeSet: vi.fn(() => Promise.resolve()),
   notificationPermissionState: vi.fn(() => Promise.resolve("granted")),
   iosOpenAppSettings: vi.fn(() => Promise.resolve()),
+  pushGatewayGet: vi.fn(() => Promise.resolve({ url: null, refusal: null })),
+  pushGatewaySet: vi.fn(() => Promise.resolve({ url: null, refusal: null })),
   launchAtLoginGet: vi.fn(() => Promise.resolve(false)),
   launchAtLoginSet: vi.fn(() => Promise.resolve()),
   menuBarPresenceGet: vi.fn(() => Promise.resolve(false)),
@@ -265,6 +267,7 @@ import {
   BADGE_NOT_LIVE_SENTENCE,
   NO_BACKGROUND_SYNC_SENTENCE,
 } from "@/components/settings/no-background-sync-disclosure";
+import { PUSH_GATEWAY_LABEL } from "@/components/settings/push-gateway-field";
 import {
   OWN_FINGERPRINT_NONE,
   SettingsDialog,
@@ -1024,6 +1027,8 @@ describe("SettingsDialog", () => {
     // No iOS lifecycle-honesty copy on desktop (Story 14.2).
     expect(screen.queryByText(NO_BACKGROUND_SYNC_SENTENCE)).not.toBeInTheDocument();
     expect(screen.queryByText(BADGE_NOT_LIVE_SENTENCE)).not.toBeInTheDocument();
+    // The push gateway is a phone's setting (98.1): no field on the Mac.
+    expect(screen.queryByLabelText(PUSH_GATEWAY_LABEL)).not.toBeInTheDocument();
   });
 
   it("iOS: hides the Shortcuts section and the whole Background & dock section, and shows the Archive backup line", async () => {
@@ -1054,6 +1059,8 @@ describe("SettingsDialog", () => {
 
     expect(await screen.findByText(NO_BACKGROUND_SYNC_SENTENCE)).toBeInTheDocument();
     expect(screen.getByText(BADGE_NOT_LIVE_SENTENCE)).toBeInTheDocument();
+    // 98.1: the phone takes the push gateway's address here.
+    expect(await screen.findByLabelText(PUSH_GATEWAY_LABEL)).toBeInTheDocument();
   });
 
   // ── Story 14.3: iOS app-icon badge radio + permission-denied surface ─────────

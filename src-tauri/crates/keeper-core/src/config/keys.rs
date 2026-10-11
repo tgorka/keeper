@@ -719,6 +719,22 @@ pub const KEYS: &[KeySpec] = &[
         summary: "What the dock badge counts.",
         example: "\"mentions\"",
     },
+    // ---- push ------------------------------------------------------------
+    KeySpec {
+        key: "push.gateway_url",
+        family: false,
+        scope: Scope::UserGlobal,
+        settable: Settable::Never(
+            "it names where your homeserver sends this phone's event ids, which is the \
+             person's choice in Settings on the device — it roams to their other phones \
+             through settings.toml, and no file, this machine's, the account's or a folder's, \
+             may choose it for them",
+        ),
+        shape: Shape::Text,
+        default: "",
+        summary: "The push gateway you run (`https://…/_matrix/push/v1/notify`) that your homeserver sends event ids to for your phones; absent means no push.",
+        example: "",
+    },
     // ---- recording -------------------------------------------------------
     KeySpec {
         key: "recording.destination_dir",

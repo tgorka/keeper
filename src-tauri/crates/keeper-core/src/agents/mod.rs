@@ -44,6 +44,7 @@ pub mod presence;
 pub mod prompt;
 pub mod proposal;
 pub mod proxy;
+pub mod push;
 pub mod redact;
 pub mod room;
 pub mod run;

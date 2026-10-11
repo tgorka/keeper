@@ -6945,7 +6945,46 @@ function mockSurfaceSubscribe(payload: Record<string, unknown>): null {
   return null;
 }
 
+/**
+ * `push.gateway_url` (98.1): what the phone's Settings field saved. The real grammar is
+ * Rust's (`agents::push::Gateway::parse`); this answers its common shapes — a bare host
+ * gains the push path, a value with no `scheme://` is told to start with `https://`,
+ * anything else not `https://` is refused — so the field's states can be looked at.
+ * `?push=refused` starts with a stored `http://` value keeper will not register, as a
+ * synced `settings.toml` could carry it, so the stored-refusal state can be seen too.
+ */
+const PUSH_NOT_HTTPS = (scheme: string) =>
+  `keeper registers a push gateway only over https://, and this address starts with ${scheme}://.`;
+let pushGateway: { url: string | null; refusal: string | null } =
+  new URLSearchParams(window.location.search).get("push") === "refused"
+    ? { url: "http://push.example.org", refusal: PUSH_NOT_HTTPS("http") }
+    : { url: null, refusal: null };
+
+function mockPushGatewaySet(payload: Record<string, unknown>) {
+  const typed = String(payload.url ?? "").trim();
+  const refuse = (message: string) => {
+    throw { code: "internal", message, accountId: null, retriable: false };
+  };
+  if (typed === "") {
+    pushGateway = { url: null, refusal: null };
+  } else if (!typed.includes("://")) {
+    refuse("A push gateway address starts with https://, as in https://push.example.org.");
+  } else if (!typed.startsWith("https://")) {
+    refuse(PUSH_NOT_HTTPS(typed.split("://")[0]));
+  } else {
+    pushGateway = {
+      url: /^https:\/\/[^/]+\/?$/.test(typed)
+        ? `${typed.replace(/\/$/, "")}/_matrix/push/v1/notify`
+        : typed,
+      refusal: null,
+    };
+  }
+  return pushGateway;
+}
+
 const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = {
+  push_gateway_get: () => pushGateway,
+  push_gateway_set: mockPushGatewaySet,
   inbox_subscribe: subscribeMockInbox,
   agent_approval_decide: mockApprovalDecide,
   agent_approval_payload: mockApprovalPayload,

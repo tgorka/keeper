@@ -1640,6 +1640,11 @@ pub enum EgressKind {
     /// keeper starts, which reaches what it reaches with this Mac's rights.
     /// Present only while Settings › Agents names one.
     McpServer,
+    /// The host of the push gateway the person named in `push.gateway_url`
+    /// (98.1 #8, Q6). keeper never contacts it: the homeserver does, with
+    /// event ids for this device. Present only on a phone, and only while
+    /// the setting holds an address keeper registers.
+    PushGateway,
 }
 
 /// One network destination keeper contacts, derived from live app state (Story

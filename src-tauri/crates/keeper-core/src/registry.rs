@@ -1062,6 +1062,36 @@ pub fn set_bots_stop_phrase(data_dir: &Path, phrase: &str) -> Result<(), CoreErr
     set_setting(data_dir, BOTS_STOP_PHRASE_KEY, phrase)
 }
 
+/// The `settings` key holding the push gateway the person runs (Epic 98,
+/// story 98.1, Q4; AD-412). Absent or blank = no push. User-global, so both
+/// of a person's phones register with the same gateway.
+const PUSH_GATEWAY_URL_KEY: &str = "push.gateway_url";
+
+/// Read `push.gateway_url` as stored, trimmed; absent or blank ⇒ `None`.
+/// Raw, not parsed: a layer file can set any text, and what Settings shows
+/// of a value keeper will not register is `agents::push::PushGatewayVm`'s
+/// answer.
+pub fn get_push_gateway_url(data_dir: &Path) -> Result<Option<String>, CoreError> {
+    Ok(get_setting(data_dir, PUSH_GATEWAY_URL_KEY)?
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty()))
+}
+
+/// Write `push.gateway_url`: a parsed gateway, or `None` to clear it — so
+/// nothing but an address keeper would register is ever written by keeper.
+pub fn set_push_gateway_url(
+    data_dir: &Path,
+    gateway: Option<&crate::agents::push::Gateway>,
+) -> Result<(), CoreError> {
+    set_setting(
+        data_dir,
+        PUSH_GATEWAY_URL_KEY,
+        gateway
+            .map(crate::agents::push::Gateway::as_str)
+            .unwrap_or_default(),
+    )
+}
+
 /// The boot-time config-override file's name (Story 22.6, FR-80): lives beside
 /// `keeper.db` in the data dir.
 pub const CONFIG_FILE_NAME: &str = "config.json";

@@ -1944,6 +1944,33 @@ mod tests {
         }
     }
 
+    /// R329: where this phone's event ids go is the person's choice on the
+    /// device. No file — this machine's, the account's or the main folder's,
+    /// shared or per-machine — names the push gateway; each is refused by
+    /// name and never reaches the resolved settings.
+    #[test]
+    fn no_layer_may_name_the_push_gateway() {
+        let text = "[settings]\n\"push.gateway_url\" = \
+                    \"https://push.example.org/_matrix/push/v1/notify\"\n";
+        for tier in [
+            LayerTier::UserGlobal,
+            LayerTier::UserGlobalMachine,
+            LayerTier::AccountShared,
+            LayerTier::AccountDevice,
+            LayerTier::MainShared,
+            LayerTier::MainMachine,
+        ] {
+            let file = parse_layer_file(Path::new("/x/keeper.testbox.toml"), tier, None, text);
+            assert!(!file.settings.contains_key("push.gateway_url"), "{tier:?}");
+            let refusal = file
+                .faults
+                .iter()
+                .find(|f| f.kind == LayerFaultKind::KeyRefused)
+                .unwrap_or_else(|| panic!("{tier:?} must refuse it"));
+            assert_eq!(refusal.key.as_deref(), Some("push.gateway_url"));
+        }
+    }
+
     // -- paths and the host label ------------------------------------------
 
     #[test]

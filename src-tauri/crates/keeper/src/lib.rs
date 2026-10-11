@@ -1256,6 +1256,8 @@ pub fn run() {
                 ipc::mark_room_unread,
                 ipc::notify_get_preview_enabled,
                 ipc::notify_set_preview_enabled,
+                ipc::push_gateway_get,
+                ipc::push_gateway_set,
                 ipc::dnd_get_global,
                 ipc::dnd_set_global,
                 ipc::network_mute_get,
