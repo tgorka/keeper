@@ -242,6 +242,10 @@ struct Stub {
     requests: Arc<Mutex<Vec<Value>>>,
     /// When each chat request arrived, in `requests`' order.
     arrived: Arc<Mutex<Vec<std::time::Instant>>>,
+    /// For each response held by an `{"after_requests": n}` entry, in the
+    /// order they were let go: whether the n-th chat request had arrived
+    /// (`false`: the hold ran out first).
+    gated: Arc<Mutex<Vec<bool>>>,
     hits: Arc<AtomicUsize>,
 }
 
@@ -251,9 +255,11 @@ impl Stub {
         let url = format!("http://{}", listener.local_addr().expect("addr"));
         let requests = Arc::new(Mutex::new(Vec::new()));
         let arrived = Arc::new(Mutex::new(Vec::new()));
+        let gated = Arc::new(Mutex::new(Vec::new()));
         let hits = Arc::new(AtomicUsize::new(0));
         let seen = Arc::clone(&requests);
         let at = Arc::clone(&arrived);
+        let opened = Arc::clone(&gated);
         let counted = Arc::clone(&hits);
         let script = Arc::new(Mutex::new(script.into_iter().rev().collect::<Vec<_>>()));
         std::thread::spawn(move || {
@@ -261,7 +267,9 @@ impl Stub {
                 let Ok(mut socket) = socket else { continue };
                 counted.fetch_add(1, Ordering::SeqCst);
                 let seen = Arc::clone(&seen);
+                let all = Arc::clone(&seen);
                 let at = Arc::clone(&at);
+                let opened = Arc::clone(&opened);
                 let script = Arc::clone(&script);
                 std::thread::spawn(move || {
                     let _ = socket.set_read_timeout(Some(Duration::from_secs(10)));
@@ -312,10 +320,13 @@ impl Stub {
                     // A `{"pause_ms": n}` entry is no frame: the stream
                     // waits there, so the edits in between are paced. A
                     // `{"hold_ms": n}` holds the response's headers that
-                    // long; a `{"status": s, "retry_after": secs}` answers
-                    // with that status and no body at all.
+                    // long; an `{"after_requests": n}` holds them until the
+                    // stub has received n chat requests in all; a
+                    // `{"status": s, "retry_after": secs}` answers with that
+                    // status and no body at all.
                     let mut parts: Vec<(String, u64)> = Vec::new();
                     let mut hold = 0;
+                    let mut after = None;
                     for data in completion {
                         if let Some(status) = data["status"].as_u64() {
                             let after = data["retry_after"].as_u64().unwrap_or(0);
@@ -324,6 +335,10 @@ impl Stub {
                         }
                         if let Some(ms) = data["hold_ms"].as_u64() {
                             hold = ms;
+                            continue;
+                        }
+                        if let Some(n) = data["after_requests"].as_u64() {
+                            after = Some(n as usize);
                             continue;
                         }
                         match data["pause_ms"].as_u64() {
@@ -343,6 +358,23 @@ impl Stub {
                     parts.push(("data: [DONE]\n\n".to_owned(), 0));
                     let length: usize = parts.iter().map(|(frame, _)| frame.len()).sum();
                     std::thread::sleep(Duration::from_millis(hold));
+                    if let Some(n) = after {
+                        // The bound is no verdict on speed: it only ends
+                        // the wait a client that sends its requests one
+                        // after another would never end, and records that
+                        // the n-th request had not come.
+                        let until = std::time::Instant::now() + Duration::from_secs(10);
+                        let reached = loop {
+                            if all.lock().expect("lock").len() >= n {
+                                break true;
+                            }
+                            if std::time::Instant::now() >= until {
+                                break false;
+                            }
+                            std::thread::sleep(Duration::from_millis(5));
+                        };
+                        opened.lock().expect("lock").push(reached);
+                    }
                     let _ = write!(
                         socket,
                         "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n"
@@ -359,6 +391,7 @@ impl Stub {
             url,
             requests,
             arrived,
+            gated,
             hits,
         }
     }
@@ -369,6 +402,10 @@ impl Stub {
 
     fn arrived(&self) -> Vec<std::time::Instant> {
         self.arrived.lock().expect("lock").clone()
+    }
+
+    fn gated(&self) -> Vec<bool> {
+        self.gated.lock().expect("lock").clone()
     }
 }
 
@@ -15270,14 +15307,16 @@ mod helpers {
         assert_eq!(offered(request), ["drive_read"]);
     }
 
-    /// 94.4 acceptance 3: three helpers of one round, each answered after
-    /// 300 ms, are launched together and all awaited: the next request
-    /// leaves less than 600 ms after the first helper's, carrying all
-    /// three answers.
+    /// 94.4 acceptance 3: three helpers of one round are launched together
+    /// and all awaited: the next request leaves after all three, carrying
+    /// all three answers. "Together" is proved by the stub, not a clock: it
+    /// answers no helper until the turn's own request and all three
+    /// helpers' have arrived, which a launcher awaiting each helper before
+    /// the next never lets happen.
     #[tokio::test(flavor = "multi_thread")]
     async fn review_layers_run_in_parallel_and_are_all_awaited() {
         let slow = |text: &str| {
-            let mut completion = vec![json!({"pause_ms": 300})];
+            let mut completion = vec![json!({"after_requests": 4})];
             completion.extend(prose(text));
             completion
         };
@@ -15308,24 +15347,18 @@ mod helpers {
             .map(|(_, at)| *at)
             .collect();
         assert_eq!(launched.len(), 3);
-        let first = *launched.iter().min().expect("first");
-        let last = *launched.iter().max().expect("last");
-        assert!(
-            last - first < Duration::from_millis(300),
-            "each launched before any answered: {:?}",
-            last - first
+        assert_eq!(
+            world.stub.gated(),
+            [true, true, true],
+            "each helper answered only once all three were asking"
         );
+        let last = *launched.iter().max().expect("last");
         let next = requests
             .iter()
             .zip(&arrived)
             .rposition(|(request, _)| !is_helper(request))
             .expect("the next request");
         assert!(arrived[next] > last);
-        assert!(
-            arrived[next] - first < Duration::from_millis(600),
-            "{:?}",
-            arrived[next] - first
-        );
         let after = requests[next].to_string();
         for id in ["h1", "h2", "h3"] {
             assert!(

@@ -1931,10 +1931,17 @@ mod tests {
         assert_eq!(remote.hits.load(Ordering::SeqCst), 1);
     }
 
+    /// `git` in the fixture drive, with no configuration but the
+    /// repository's own: a person's global or system config may hand every
+    /// command's trace to a program that writes into `.git` after the
+    /// command returned (git-ai's `trace2.eventtarget` on hesperia does),
+    /// which no snapshot of the drive could tell from a search's write.
     fn git(root: &Path, args: &[&str]) -> String {
         let out = std::process::Command::new("git")
             .args(args)
             .current_dir(root)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_AUTHOR_NAME", "t")
             .env("GIT_AUTHOR_EMAIL", "t@example.org")
             .env("GIT_COMMITTER_NAME", "t")
