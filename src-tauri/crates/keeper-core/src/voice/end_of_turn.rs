@@ -15,6 +15,14 @@
 //! current one. The audio goes from the tap to this thread and the two
 //! models, and nowhere else.
 //!
+//! The same listener hears the person speak over an answer (AD-411, story
+//! 97.3) — while the turn is `Speaking` or `Paused`, and only on a capture
+//! that keeps keeper's own voice out ([`hears_over_the_answer`]). There an
+//! onset is the turn's [`super::TurnEvent::SpeechDetected`] with no words
+//! yet, which pauses the answer, and a speech end is
+//! [`super::TurnEvent::SpeechEnded`] with how long the speech lasted, which
+//! the backchannel rule's duration reads.
+//!
 //! The detector's rules are Silero VAD's defaults and Smart Turn's: an onset
 //! is [`ONSET_FRAMES`] frames running at a probability of at least
 //! [`ONSET_PROBABILITY`]; speech ends at the first frame under
@@ -24,7 +32,7 @@
 //! the turn's speech from [`PRE_SPEECH`] before its first onset, at most
 //! the last 8 s.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex, PoisonError, TryLockError};
 use std::time::Duration;
@@ -79,6 +87,20 @@ const HANGOVER_FRAMES: u64 = (HANGOVER.as_millis() as u64).div_ceil(FRAME_MS);
 pub fn hears_end_of_turn(state: &TurnState) -> bool {
     matches!(state, TurnState::Listening { .. })
 }
+
+/// Whether the turn in `state` is one the voice activity model listens
+/// over the answer in (AD-411): `Speaking` and `Paused`, on a capture that
+/// keeps keeper's own voice out (`echo_free`) — on one that does not, an
+/// onset would be keeper hearing itself, and the answer would pause for its
+/// own words (Q11).
+pub fn hears_over_the_answer(state: &TurnState, echo_free: bool) -> bool {
+    echo_free && matches!(state, TurnState::Speaking | TurnState::Paused { .. })
+}
+
+/// What the ear listens for.
+const RESTING: u8 = 0;
+const END_OF_TURN: u8 = 1;
+const OVER_THE_ANSWER: u8 = 2;
 
 /// Whether a score says the sentence is finished.
 pub fn utterance_ends(score: f32) -> bool {
@@ -499,6 +521,9 @@ pub struct Ear {
     line: Mutex<Option<Line>>,
     /// Odd while the turn listens, even while it rests.
     generation: AtomicU64,
+    /// What the current generation listens for: the end of the person's
+    /// turn, or the person over the answer.
+    mode: AtomicU8,
     fresh: AtomicBool,
     dropped: AtomicU64,
 }
@@ -514,6 +539,7 @@ impl Ear {
         Self {
             line: Mutex::new(None),
             generation: AtomicU64::new(0),
+            mode: AtomicU8::new(RESTING),
             fresh: AtomicBool::new(true),
             dropped: AtomicU64::new(0),
         }
@@ -523,16 +549,33 @@ impl Ear {
         self.line.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Follow the turn: listen while [`hears_end_of_turn`] says so for
-    /// `state`, rest otherwise. Starting or stopping moves the generation
-    /// on. Called under the lock the turn moves under, so a generation
-    /// [`Ear::admit`] accepts there is the turn's current listening.
-    pub fn follow(&self, state: &TurnState) {
-        let listening = u64::from(hears_end_of_turn(state));
+    /// Follow the turn: listen for the end of its turn while
+    /// [`hears_end_of_turn`] says so for `state`, over the answer while
+    /// [`hears_over_the_answer`] does (`echo_free`: the capture keeps
+    /// keeper's own voice out), rest otherwise. Every change of what it
+    /// listens for moves the generation on. Called under the lock the turn
+    /// moves under, so a generation [`Ear::admit`] accepts there is the
+    /// turn's current listening.
+    pub fn follow(&self, state: &TurnState, echo_free: bool) {
+        let mode = if hears_end_of_turn(state) {
+            END_OF_TURN
+        } else if hears_over_the_answer(state, echo_free) {
+            OVER_THE_ANSWER
+        } else {
+            RESTING
+        };
+        if self.mode.swap(mode, Ordering::SeqCst) == mode {
+            return;
+        }
+        let listening = u64::from(mode != RESTING);
         let _ = self
             .generation
             .try_update(Ordering::SeqCst, Ordering::SeqCst, |generation| {
-                (generation % 2 != listening).then_some(generation + 1)
+                Some(if generation % 2 == listening {
+                    generation + 2
+                } else {
+                    generation + 1
+                })
             });
     }
 
@@ -544,10 +587,12 @@ impl Ear {
 
     /// What the listener heard in `generation` does to the turn: its clock
     /// points go to `clock`, and a finished sentence is the event to move
-    /// the turn with. Nothing at all when that listening is over — its
-    /// clock points would land on another turn's record, and its verdict
-    /// would end a sentence nobody finished. Called under the turn's lock,
-    /// with the move it returns made before the lock is let go.
+    /// the turn with — or, over the answer, an onset that pauses it and a
+    /// speech end that measures what paused it. Nothing at all when that
+    /// listening is over — its clock points would land on another turn's
+    /// record, and its verdict would end a sentence nobody finished. Called
+    /// under the turn's lock, with the move it returns made before the lock
+    /// is let go.
     pub fn admit(
         &self,
         generation: u64,
@@ -556,6 +601,18 @@ impl Ear {
     ) -> Option<TurnEvent> {
         if !self.hears(generation) {
             return None;
+        }
+        if self.mode.load(Ordering::SeqCst) == OVER_THE_ANSWER {
+            return match *heard {
+                Heard::Onset { at_ms } => {
+                    clock.paused_onset(at_ms);
+                    Some(TurnEvent::SpeechDetected(String::new()))
+                }
+                Heard::SpeechEnd { at_ms } => clock
+                    .paused_speech_end(at_ms)
+                    .map(|speech_ms| TurnEvent::SpeechEnded { speech_ms }),
+                Heard::UtteranceEnd { .. } | Heard::Unfinished { .. } | Heard::Failed(_) => None,
+            };
         }
         match *heard {
             Heard::Onset { .. } => clock.onset(),
@@ -712,9 +769,12 @@ mod tests {
     #[test]
     fn the_tap_drops_rather_than_waits_for_the_line() {
         static EAR: Ear = Ear::new();
-        EAR.follow(&TurnState::Listening {
-            heard: String::new(),
-        });
+        EAR.follow(
+            &TurnState::Listening {
+                heard: String::new(),
+            },
+            true,
+        );
         let held = EAR.line();
         let (done, finished) = mpsc::channel();
         std::thread::spawn(move || {

@@ -53,6 +53,7 @@ use crate::agents::events::{
 };
 use crate::agents::events::{PresencePlatform, SurfaceResultContent};
 use crate::agents::focus::{FocusLanes, FocusPort, Named, SendFuture};
+use crate::agents::heard::HeardContent;
 use crate::agents::proxy::{
     self, AgentOutbound, AgentProxies, KnownProxies, ProxyListEventContent, ProxyRoomRow,
     ProxyRoomVm,
@@ -4044,6 +4045,22 @@ impl AccountManager {
                 .filter(|title| !title.is_empty()),
         };
         send_agent_event(&room, AgentOutbound::ConversationRequest(content)).await
+    }
+
+    /// Tell the agent in the person's proxy room `room_id` where they stopped
+    /// listening to its spoken answer (97.3, AD-411): `content` names the
+    /// answer's anchor and the sentences the synthesiser finished. Only a
+    /// proxy room of this account's is written to; the owning host decides
+    /// whether the mark counts. Returns the event's id, which the next
+    /// spoken question waits for, so the mark reaches the room first (Q10).
+    pub async fn agent_heard_send(
+        &self,
+        account_id: &str,
+        room_id: &str,
+        content: HeardContent,
+    ) -> Result<String, CoreError> {
+        let (room, _, _) = self.proxy_room(account_id, room_id).await?;
+        send_agent_event(&room, AgentOutbound::Heard(content)).await
     }
 
     /// Send the person's decision `req` on the approval card it names in the

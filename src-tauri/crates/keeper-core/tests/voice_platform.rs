@@ -25,6 +25,8 @@ enum Call {
     Speak(String),
     Enqueue(String),
     StopSpeaking,
+    PauseSpeaking,
+    ContinueSpeaking,
 }
 
 struct FakePort {
@@ -85,6 +87,12 @@ impl VoicePort for FakePort {
     fn stop_speaking(&self) {
         self.record(Call::StopSpeaking);
     }
+    fn pause_speaking(&self) {
+        self.record(Call::PauseSpeaking);
+    }
+    fn continue_speaking(&self) {
+        self.record(Call::ContinueSpeaking);
+    }
     fn finish_recognition(&self, _finish: u64) {}
 }
 
@@ -107,6 +115,10 @@ fn every_state() -> Vec<TurnState> {
         },
         TurnState::Sending { answering: false },
         TurnState::Speaking,
+        TurnState::Paused {
+            heard: "mhm".to_owned(),
+            speech_ms: None,
+        },
         TurnState::Failed {
             reason: "boom".to_owned(),
         },
@@ -220,15 +232,16 @@ fn voice_may_record_agrees_with_the_ios_port_in_every_state() {
             "the walk never reached {state:?}"
         );
     }
-    // And the iOS path is the one epic 62 pinned: the answer is spoken over
-    // an open microphone, and barge-in restarts recognition on it.
+    // And the iOS path: the answer is spoken over an open microphone, a
+    // barge-in pauses it on that same recognition (AD-411), and the failure
+    // stops the paused answer before the device goes.
     assert_eq!(
         port.calls(),
         vec![
             Call::Start,
             Call::Speak("noon".to_owned()),
+            Call::PauseSpeaking,
             Call::StopSpeaking,
-            Call::Start,
             Call::Stop,
         ]
     );
@@ -313,15 +326,23 @@ fn voice_half_duplex_turn_never_records_while_speaking() {
     );
 }
 
-/// A half-duplex platform still stops the speech first when the port does
-/// report speech — and only then opens the device to listen.
+/// A half-duplex platform still pauses the speech first when the port does
+/// report speech — never stops it — and only then opens the device, so the
+/// utterance can be heard to decide; a backchannel resumes the answer with
+/// the device closed again first (AD-175's rule is unchanged).
 #[test]
-fn voice_half_duplex_barge_in_still_stops_speech_before_listening() {
+fn voice_half_duplex_barge_in_still_pauses_speech_before_listening() {
     let mut turn = Turn::new(VoicePlatform::ABSENT);
     turn.apply(TurnEvent::AnswerDone("long".to_owned()));
-    let effects = turn.apply(TurnEvent::SpeechDetected("hey".to_owned()));
-    assert_eq!(effects, vec![Effect::StopSpeaking, Effect::OpenMicrophone]);
+    let effects = turn.apply(TurnEvent::SpeechDetected("mhm".to_owned()));
+    assert_eq!(effects, vec![Effect::PauseSpeaking, Effect::OpenMicrophone]);
     assert!(turn.microphone_open());
+    let effects = turn.apply(TurnEvent::Silence);
+    assert_eq!(
+        effects,
+        vec![Effect::ReleaseMicrophone, Effect::ContinueSpeaking]
+    );
+    assert!(!turn.microphone_open());
 }
 
 // ---------------------------------------------------------------------------
@@ -571,6 +592,8 @@ fn voice_turn_failure_reason_uses_the_turn_platform() {
             Ok(())
         }
         fn stop_speaking(&self) {}
+        fn pause_speaking(&self) {}
+        fn continue_speaking(&self) {}
         fn finish_recognition(&self, _finish: u64) {}
     }
     let port = Refusing;

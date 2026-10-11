@@ -199,7 +199,7 @@ impl TurnSink for SpokenSink {
     fn ended(&self, end: TurnEnd) {
         match end {
             TurnEnd::Complete => {
-                let rest = self.segmenter().flush().unwrap_or_default();
+                let rest = self.segmenter().flush();
                 crate::voice_ipc::answer_complete(self.question, rest);
             }
             TurnEnd::Stopped => crate::voice_ipc::answer_stopped(self.question),

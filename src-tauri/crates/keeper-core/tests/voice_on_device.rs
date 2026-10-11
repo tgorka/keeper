@@ -86,11 +86,14 @@ fn voice_sources() -> Vec<PathBuf> {
         "voice on-device scan: no voice*.rs under {} — the iOS port is the file this guard exists for",
         shell_src.display()
     );
-    // The floor: the files that hold the turn models (D-36) are read by name,
-    // so renaming one out of the scan fails here instead of passing quietly.
+    // The floor: the files that hold the turn models (D-36) and the
+    // synthesiser the person talks over (AD-411) are read by name, so
+    // renaming one out of the scan fails here instead of passing quietly.
     for required in [
         core_voice.join("turn_models.rs"),
+        core_voice.join("backchannel.rs"),
         shell_src.join("voice_turn_models.rs"),
+        shell_src.join("voice_synthesizer.rs"),
         shell_src.join("voice_ios.rs"),
         shell_src.join("voice_macos.rs"),
     ] {

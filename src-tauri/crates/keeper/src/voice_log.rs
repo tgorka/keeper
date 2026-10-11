@@ -14,7 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use keeper_core::vm::{IpcError, VoiceEventVm};
 use keeper_core::voice::events::{self, VoiceEventKind, VoiceEvents};
-use keeper_core::voice::timings::TurnEnd;
+use keeper_core::voice::timings::{PauseRecord, Spoken, TurnEnd};
 use keeper_core::voice::{Effect, TurnEvent, TurnState, WakePhrase};
 
 /// The one ring for the process. Every target: a desktop with no port
@@ -51,7 +51,9 @@ pub fn record(kind: VoiceEventKind, detail: Option<String>) {
 /// event the port sent was a transcript and the match is `Turn`'s; the stop
 /// match that took a speaking turn straight to `Idle`, with the words that
 /// matched (Epic 67, AD-208 — the same reasoning: the port sent a
-/// barge-in, `Turn` decided it was the stop phrase); the manual stop that
+/// barge-in, `Turn` decided it was the stop phrase, which `table` — the
+/// event as the table was handed it — says; since AD-411 also from a
+/// paused answer); the manual stop that
 /// ended an open turn, with the state it left as the detail (Epic 68,
 /// AD-212 — `abandoned: speaking` followed by `turn:idle` is the button,
 /// the tray, the hotkey or the deep link cutting an answer, and the
@@ -64,6 +66,7 @@ pub fn record(kind: VoiceEventKind, detail: Option<String>) {
 pub fn transition(
     before: VoiceEventKind,
     event: &TurnEvent,
+    table: Option<&TurnEvent>,
     state: &TurnState,
     effects: &[Effect],
 ) {
@@ -73,8 +76,8 @@ pub fn transition(
     {
         record(VoiceEventKind::WakeMatched, None);
     }
-    if before == VoiceEventKind::turn(&TurnState::Speaking) && matches!(state, TurnState::Idle) {
-        if let TurnEvent::SpeechDetected(words) = event {
+    if table == Some(&TurnEvent::StopHeard) {
+        if let TurnEvent::SpeechDetected(words) | TurnEvent::FinalHeard(words) = event {
             record(VoiceEventKind::StopMatched, Some(words.clone()));
         }
     }
@@ -118,6 +121,21 @@ pub fn transition(
 pub fn turn_end(ended: &TurnEnd) {
     tracing::info!(target: "keeper::voice::timings", "{}", ended.log_line());
     record(VoiceEventKind::TurnEnd, Some(ended.detail()));
+}
+
+/// The person spoke over an answer and the utterance decided (AD-411,
+/// NFR-114): the pause's clock points go into the ring as a `pause` row and,
+/// as the same line, into the app log, which a device run is measured from
+/// (`keeper_core::voice::timings::pauses_from_log`).
+pub fn pause(paused: &PauseRecord) {
+    tracing::info!(target: "keeper::voice::timings", "{}", paused.log_line());
+    record(VoiceEventKind::Pause, Some(paused.detail()));
+}
+
+/// An answer's reading ended: how long it was read aloud, pauses excluded,
+/// into the app log only — what a run's false onsets are counted per.
+pub fn spoken(spoken: &Spoken) {
+    tracing::info!(target: "keeper::voice::timings", "{}", spoken.log_line());
 }
 
 /// The switch took effect on the port: armed for `wake`, or disarmed when

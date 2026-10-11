@@ -1067,8 +1067,14 @@ async fn a_spoken_question_is_one_message_and_its_answer_follows() {
     assert_eq!(anchors(&seen, &agent), 2, "answered once each");
     assert!(host.log_text().contains("a turn was answered"));
 
-    // What was heard: the first words, the closed sentence once, the tail.
-    let (first, rest) = steps.split_first().expect("something was heard");
+    // What was heard: the answer's anchor, the first words, the closed
+    // sentence once, the tail.
+    let (anchored, steps) = steps.split_first().expect("something was heard");
+    assert!(
+        matches!(anchored, SpokenStep::Anchored { .. }),
+        "{anchored:?}"
+    );
+    let (first, rest) = steps.split_first().expect("words were heard");
     assert!(
         matches!(first, SpokenStep::FirstText { after_ms } if *after_ms < 60_000),
         "{first:?}"
@@ -1081,16 +1087,17 @@ async fn a_spoken_question_is_one_message_and_its_answer_follows() {
     let sentences: Vec<&str> = sentences
         .iter()
         .map(|s| match s {
-            SpokenStep::Sentence(sentence) => sentence.as_str(),
+            SpokenStep::Sentence(sentence) => sentence.text.as_str(),
             other => panic!("a sentence, not {other:?}"),
         })
         .collect();
-    let SpokenStep::Complete(tail) = closing else {
-        panic!("the answer completes: {closing:?}");
+    let SpokenStep::Complete(Some(tail)) = closing else {
+        panic!("the answer completes with its tail: {closing:?}");
     };
     let (first_sentence, second) = ANSWER.split_once(". ").expect("two sentences");
     assert_eq!(sentences, [format!("{first_sentence}.")]);
-    assert_eq!(tail, second);
+    assert_eq!(tail.text, second);
+    assert_eq!(tail.end, ANSWER.chars().count());
     host.kill();
 }
 

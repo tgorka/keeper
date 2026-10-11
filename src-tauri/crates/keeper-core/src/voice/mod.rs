@@ -38,6 +38,7 @@
 //! the same name on a Mac as on a phone.
 
 pub mod authorization;
+pub mod backchannel;
 pub mod banner;
 pub mod end_of_turn;
 pub mod events;
@@ -59,7 +60,7 @@ pub use phrase::{PhraseRefused, WakePhrase};
 pub use platform::VoicePlatform;
 pub use turn::{
     advance, may_record, restarts_budget, silence_budget, Effect, TurnEvent, TurnState,
-    END_OF_UTTERANCE_PAUSE, FINAL_WORDS_WAIT, NOTHING_HEARD_TIMEOUT,
+    END_OF_UTTERANCE_PAUSE, FINAL_WORDS_WAIT, NOTHING_HEARD_TIMEOUT, PAUSE_DECISION_WAIT,
 };
 
 use crate::vm::{VoiceStateVm, VoiceUnavailableVm};
@@ -233,10 +234,12 @@ pub type EventSink = Arc<dyn Fn(TurnEvent) + Send + Sync>;
 ///
 /// A port reports back through the [`EventSink`] it was constructed with:
 /// [`TurnEvent::PartialHeard`] and [`TurnEvent::FinalHeard`] from
-/// recognition, [`TurnEvent::SpeechDetected`] with the transcript when a
-/// new one starts while it is speaking, [`TurnEvent::Silence`] when an
-/// utterance it was speaking ends, [`TurnEvent::Failed`] when the OS fails
-/// it. It never emits `WakeMatched` or `StopHeard` — matching is
+/// recognition, [`TurnEvent::SpeechDetected`] with the transcript while it
+/// is speaking or paused (and [`TurnEvent::FinalHeard`] for a final one),
+/// [`TurnEvent::SentenceSpoken`] each time the synthesiser reads an
+/// utterance to its end, [`TurnEvent::Silence`] when the answer it was
+/// speaking ends — never while paused — and [`TurnEvent::Failed`] when the
+/// OS fails it. It never emits `WakeMatched` or `StopHeard` — matching is
 /// [`Turn`]'s — and never runs a silence clock; that is the shell's,
 /// budgeted by [`silence_budget`].
 pub trait VoicePort: Send + Sync {
@@ -307,12 +310,30 @@ pub trait VoicePort: Send + Sync {
     /// `language`, spoken in its turn. Nothing else changes for it — no roll
     /// of the recogniser, no ducking, no new flag: those happened once at
     /// [`VoicePort::speak`] and hold for the answer. `stop_speaking` drops
-    /// the queue with the utterance. Refuses the way `speak` does.
+    /// the queue with the utterance. While paused
+    /// ([`VoicePort::pause_speaking`]) a queued sentence waits for
+    /// [`VoicePort::continue_speaking`] even when nothing was left to pause.
+    /// Refuses the way `speak` does.
     fn enqueue(&self, text: &str, language: &str) -> Result<(), VoiceUnavailable>;
 
     /// Stop reading aloud immediately, queued utterances included.
     /// Idempotent.
     fn stop_speaking(&self);
+
+    /// Pause reading aloud immediately, mid-word, keeping the utterance and
+    /// the queue (AD-411). While paused the port reports no
+    /// [`TurnEvent::Silence`]: an answer that ran out as the pause landed is
+    /// reported once [`VoicePort::continue_speaking`] finds nothing left to
+    /// read. Recognition goes on as it was. Returns once the synthesiser
+    /// has paused. Idempotent.
+    fn pause_speaking(&self);
+
+    /// Go on reading from where [`VoicePort::pause_speaking`] stopped, after
+    /// starting a fresh recognition request, so the next utterance over the
+    /// answer is not read with the one just decided. With nothing left to
+    /// read, the answer's end is reported as [`TurnEvent::Silence`] as
+    /// ever. Returns once the synthesiser has resumed.
+    fn continue_speaking(&self);
 
     /// Tell the recogniser the audio of this utterance has ended, so it
     /// delivers the final transcript of what it already heard as
@@ -344,7 +365,13 @@ pub trait VoicePort: Send + Sync {
 /// `Idle` is noise and is ignored. **Stopping** (AD-208): while `Speaking`
 /// with a stop phrase set, a barge-in whose words contain it becomes
 /// [`TurnEvent::StopHeard`] and ends the turn; any other barge-in keeps
-/// FR-403's shape and asks a new question. **Re-arming**: when a turn ends
+/// FR-403's shape and asks a new question; the same holds while `Paused`.
+/// **Pausing** (AD-411): while `Paused`, what the person said is
+/// [`backchannel`]'s to decide in the language recognition runs in — the
+/// recogniser's final words, or the decision window's
+/// [`TurnEvent::Silence`], settle it; the voice activity model's speech end
+/// settles a short wordless one at once — and the table is handed the
+/// verdict as [`TurnEvent::Resolved`]. **Re-arming**: when a turn ends
 /// — on its own (silence, an empty transcript, an empty answer, the spoken
 /// answer ending) or because the person stopped it, by the button or by the
 /// word — and a phrase is set, the microphone is released for the turn
@@ -405,6 +432,13 @@ pub struct Turn {
     question: Option<u64>,
     /// The last generation handed out.
     questions: u64,
+    /// The language recognition runs in (a subtag, `en`), asked of the port
+    /// by [`Turn::drive`] once as the answer pauses: the backchannel list's
+    /// key while the pause is decided.
+    language: String,
+    /// The event the table was handed for the last move, after the
+    /// driver's matching ([`Turn::table_event`]).
+    table_event: Option<TurnEvent>,
     /// Bumped by every move that starts the silence budget afresh
     /// ([`restarts_budget`]): a timer stamped with an older one is spent.
     budget: u64,
@@ -451,6 +485,8 @@ impl Turn {
             question: None,
             questions: 0,
             budget: 0,
+            language: String::new(),
+            table_event: None,
         }
     }
 
@@ -527,8 +563,23 @@ impl Turn {
     /// person stopped it, or asked again — moves nothing, whichever order
     /// the two sends finish in.
     pub fn owns_answer(&self, question: u64) -> bool {
-        self.question == Some(question)
-            && (self.awaiting_send() || matches!(self.state, TurnState::Speaking))
+        self.question == Some(question) && (self.awaiting_send() || self.reading())
+    }
+
+    /// Whether an answer is being read: spoken, or paused while the person
+    /// speaks over it.
+    fn reading(&self) -> bool {
+        matches!(self.state, TurnState::Speaking | TurnState::Paused { .. })
+    }
+
+    /// The event the table was handed for the last move, after the
+    /// driver's matching — a transcript that matched the stop phrase is
+    /// [`TurnEvent::StopHeard`], a pause's decision is
+    /// [`TurnEvent::Resolved`]. `None` before the first and after a
+    /// [`TurnEvent::Level`] or [`TurnEvent::SentenceSpoken`]. For the
+    /// shell's record of the move.
+    pub fn table_event(&self) -> Option<&TurnEvent> {
+        self.table_event.as_ref()
     }
 
     /// The request for what the turn heard has left (AD-215): to `bot`, at
@@ -563,7 +614,7 @@ impl Turn {
     /// Whether the answer being read has finished arriving (AD-214) — for
     /// the log, which records the close once.
     pub fn answer_closed(&self) -> bool {
-        matches!(self.state, TurnState::Speaking) && self.answer.closed
+        self.reading() && self.answer.closed
     }
 
     /// Whether the standing choice is in force (Epic 65, AD-190): a phrase
@@ -611,10 +662,14 @@ impl Turn {
     /// the snapshot where the device is open for a turn and dropped
     /// elsewhere, with no effects either way.
     pub fn apply(&mut self, event: TurnEvent) -> Vec<Effect> {
+        self.table_event = None;
         if let TurnEvent::Level(level) = event {
             if self.meters() {
                 self.level = Some(level.clamp(0.0, 1.0));
             }
+            return Vec::new();
+        }
+        if event == TurnEvent::SentenceSpoken {
             return Vec::new();
         }
         let event = match (&self.state, &self.wake, &self.stop, &event) {
@@ -624,12 +679,31 @@ impl Turn {
                 _,
                 TurnEvent::PartialHeard(t) | TurnEvent::FinalHeard(t),
             ) if wake.matches(t) => TurnEvent::WakeMatched,
-            (TurnState::Speaking, _, Some(stop), TurnEvent::SpeechDetected(t))
-                if stop.matches(t) =>
-            {
-                TurnEvent::StopHeard
-            }
+            (
+                TurnState::Speaking | TurnState::Paused { .. },
+                _,
+                Some(stop),
+                TurnEvent::SpeechDetected(t) | TurnEvent::FinalHeard(t),
+            ) if stop.matches(t) => TurnEvent::StopHeard,
             _ => event,
+        };
+        // AD-411, pausing: the utterance is decided here, in the language
+        // recognition runs in, and the table is handed the verdict.
+        let event = match (&self.state, event) {
+            (TurnState::Paused { heard, speech_ms }, TurnEvent::FinalHeard(text)) => {
+                let words = if text.trim().is_empty() { heard } else { &text };
+                TurnEvent::Resolved(backchannel::settle(words, *speech_ms, &self.language))
+            }
+            (TurnState::Paused { heard, speech_ms }, TurnEvent::Silence) => {
+                TurnEvent::Resolved(backchannel::settle(heard, *speech_ms, &self.language))
+            }
+            (TurnState::Paused { heard, .. }, TurnEvent::SpeechEnded { speech_ms }) => {
+                match backchannel::at_speech_end(heard, speech_ms) {
+                    Some(utterance) => TurnEvent::Resolved(utterance),
+                    None => TurnEvent::SpeechEnded { speech_ms },
+                }
+            }
+            (_, event) => event,
         };
         // AD-214, closing: the synthesiser's end is the turn's end only once
         // the answer is closed; before that the queue merely ran dry.
@@ -653,10 +727,13 @@ impl Turn {
                 | TurnEvent::AnswerDone(_)
                 | TurnEvent::Abandoned
                 | TurnEvent::StopHeard
+                | TurnEvent::Resolved(_)
         );
-        let clock_before = turn::finishing_clock(&self.state);
-        let (next, mut effects) = advance(std::mem::take(&mut self.state), event);
-        if turn::restarts(clock_before, turn::finishing_clock(&next)) {
+        self.table_event = Some(event.clone());
+        let before = std::mem::take(&mut self.state);
+        let restart_from = before.clone();
+        let (next, mut effects) = advance(before, event);
+        if restarts_budget(&restart_from, &next) {
             self.budget = self.budget.wrapping_add(1);
         }
         if matches!(next, TurnState::Idle)
@@ -675,6 +752,13 @@ impl Turn {
                 effects.insert(0, Effect::ReleaseMicrophone);
             }
         }
+        if matches!(next, TurnState::Paused { .. }) && !device_after(self.microphone_open, &effects)
+        {
+            // A pause is decided by what the person says, so the device
+            // listens — on a half-duplex platform it was released for the
+            // speech, and the answer is silent now.
+            effects.push(Effect::OpenMicrophone);
+        }
         if effects
             .iter()
             .any(|effect| matches!(effect, Effect::Speak(_)))
@@ -684,13 +768,17 @@ impl Turn {
         if closes {
             self.answer.closed = true;
         }
-        if effects
-            .iter()
-            .any(|effect| matches!(effect, Effect::Speak(_) | Effect::Enqueue(_)))
-        {
+        if effects.iter().any(|effect| {
+            matches!(
+                effect,
+                Effect::Speak(_) | Effect::Enqueue(_) | Effect::ContinueSpeaking
+            )
+        }) {
+            // A resumed answer owes its end again: the port reports it once
+            // it finds nothing left to read.
             self.answer.drained = false;
         }
-        if !matches!(next, TurnState::Speaking) {
+        if !matches!(next, TurnState::Speaking | TurnState::Paused { .. }) {
             self.answer = Answer::default();
         }
         if matches!(
@@ -707,7 +795,10 @@ impl Turn {
             self.question = Some(self.questions);
         } else if !matches!(
             next,
-            TurnState::Heard { .. } | TurnState::Sending { .. } | TurnState::Speaking
+            TurnState::Heard { .. }
+                | TurnState::Sending { .. }
+                | TurnState::Speaking
+                | TurnState::Paused { .. }
         ) {
             self.question = None;
         }
@@ -727,6 +818,7 @@ impl Turn {
     /// one, fail the turn — which releases the device — and carry that out
     /// too. Returns every effect that was attempted, for the caller's log.
     pub fn drive(&mut self, event: TurnEvent, port: &dyn VoicePort) -> Vec<Effect> {
+        let was_paused = matches!(self.state, TurnState::Paused { .. });
         let mut effects = self.apply(event);
         if let Err(why) = perform(
             &effects,
@@ -743,6 +835,11 @@ impl Turn {
                 &mut self.answer.language,
             );
             effects.extend(recovery);
+        }
+        // Asked once per pause, not per event heard over it: the port's
+        // answer is a round trip to its worker under the voice lock.
+        if !was_paused && matches!(self.state, TurnState::Paused { .. }) {
+            self.language = locale::language(&port.listening());
         }
         effects
     }
@@ -773,7 +870,9 @@ impl Turn {
                 sent_at_ms: self.sent.as_ref().map(|sent| sent.at_ms),
                 first_token_ms: self.sent.as_ref().and_then(|sent| sent.first_token_ms),
             },
-            TurnState::Speaking => VoiceStateVm::Speaking,
+            // A paused answer is drawn as speaking (Q11): it resumes or
+            // stops within a second, and no surface has a word for between.
+            TurnState::Speaking | TurnState::Paused { .. } => VoiceStateVm::Speaking,
             TurnState::Failed { reason } => VoiceStateVm::Failed {
                 reason: reason.clone(),
             },
@@ -843,6 +942,8 @@ pub fn perform(
                 *language = Some(chosen);
             }
             Effect::StopSpeaking => port.stop_speaking(),
+            Effect::PauseSpeaking => port.pause_speaking(),
+            Effect::ContinueSpeaking => port.continue_speaking(),
             Effect::FinishRecognition(finish) => port.finish_recognition(*finish),
         }
     }

@@ -28,11 +28,19 @@
 //!   Without the models, or when the model hears an unfinished sentence,
 //!   nothing reports `UtteranceEnd` and [`END_OF_UTTERANCE_PAUSE`] ends the
 //!   turn as it always has.
-//! - **Barge-in stops speech first.** `SpeechDetected` while `Speaking`
-//!   yields [`Effect::StopSpeaking`] before any other effect, because the
-//!   person started talking and nothing should still be talking over them.
-//!   What they said decides what follows (AD-208): the stop phrase ends the
-//!   turn ([`StopHeard`]); anything else asks a new question.
+//! - **Barge-in pauses speech first** (AD-411; AD-208 amended by ruling
+//!   R14). `SpeechDetected` while `Speaking` — the recogniser's words, or
+//!   with the turn models the voice activity model's onset — yields
+//!   [`Effect::PauseSpeaking`] and nothing else, and the turn is `Paused`:
+//!   the person started talking and nothing talks over them, but nothing is
+//!   thrown away before they have said what they meant. [`StopSpeaking`]
+//!   never comes before the pause. What they said then decides
+//!   ([`super::backchannel`], applied by [`super::Turn`] as [`Resolved`]): a
+//!   backchannel — "mhm", or a false onset — resumes the answer
+//!   ([`Effect::ContinueSpeaking`]); the stop phrase ends the turn
+//!   ([`StopHeard`]); anything else stops the answer and is sent as the next
+//!   question. A pause has a decision window ([`silence_budget`]): what was
+//!   heard when it runs out is the utterance.
 //! - **Nothing empty is sent.** A final transcript that is blank ends the turn
 //!   without a message; a partial transcript never sends at all.
 //! - **A failure releases the device too.** `Failed` is a state, but it is one
@@ -59,12 +67,15 @@
 //! [`AnswerDone`]: TurnEvent::AnswerDone
 //! [`Silence`]: TurnEvent::Silence
 //! [`StopHeard`]: TurnEvent::StopHeard
+//! [`Resolved`]: TurnEvent::Resolved
+//! [`StopSpeaking`]: Effect::StopSpeaking
 //! [`UtteranceEnd`]: TurnEvent::UtteranceEnd
 //! [`AudioEnded`]: TurnEvent::AudioEnded
 //! [`NothingToFinish`]: TurnEvent::NothingToFinish
 
 use std::time::Duration;
 
+use super::backchannel::Utterance;
 use super::VoicePlatform;
 
 /// How long `Listening` waits for the first word before giving up.
@@ -84,6 +95,11 @@ pub const END_OF_UTTERANCE_PAUSE: Duration = Duration::from_millis(1800);
 /// How long `Finishing` waits for the recogniser's final transcript after
 /// the request's audio ended, before it sends the last partial instead.
 pub const FINAL_WORDS_WAIT: Duration = Duration::from_millis(600);
+
+/// How long a pause waits, after the last thing it heard, for the
+/// utterance to say what it is when the voice activity model has not heard
+/// it end — without the turn models, the only window there is (Q11).
+pub const PAUSE_DECISION_WAIT: Duration = Duration::from_millis(800);
 
 /// Where a turn is.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -125,6 +141,18 @@ pub enum TurnState {
     /// The answer is being read aloud. Whether the microphone is open for
     /// barge-in meanwhile is [`may_record`]'s answer for the platform.
     Speaking,
+    /// The person spoke over the answer: it is paused, not stopped, until
+    /// what they say decides (AD-411). The answer keeps arriving and
+    /// queueing meanwhile; the surface draws it as speaking.
+    Paused {
+        /// What the recogniser has heard of the utterance, blank until it
+        /// hears words.
+        heard: String,
+        /// How long the utterance's speech lasted, once the voice activity
+        /// model heard it end; `None` without the turn models, and while
+        /// the person is still speaking.
+        speech_ms: Option<u32>,
+    },
     /// The turn ended on an error. The device is already released.
     Failed {
         /// Why, in a sentence the surface can show.
@@ -169,11 +197,27 @@ pub enum TurnEvent {
     /// sentence by sentence, nothing when the last sentence closed the
     /// answer.
     AnswerDone(String),
-    /// The person started speaking (barge-in while `Speaking`), with the
-    /// transcript that started it — so [`super::Turn`] can tell the stop
-    /// phrase from a question before the table sees it.
+    /// The person is speaking over the answer (barge-in while `Speaking`,
+    /// and every later partial while `Paused`), with the transcript so far —
+    /// so [`super::Turn`] can tell the stop phrase before the table sees it.
+    /// Blank when the voice activity model heard speech start before the
+    /// recogniser had words for it.
     SpeechDetected(String),
-    /// The person said the stop phrase while `Speaking` (AD-208). Never
+    /// The voice activity model heard the speech that paused the answer end,
+    /// after `speech_ms` of it. Reported through the end-of-turn listener,
+    /// never by a port.
+    SpeechEnded { speech_ms: u32 },
+    /// What the utterance that paused the answer turned out to be. Never
+    /// emitted by a port: [`super::Turn`] makes it out of the decision
+    /// window's `Silence`, the recogniser's final words, or a speech end,
+    /// with [`super::backchannel`]'s rule.
+    Resolved(Utterance),
+    /// The synthesiser read one utterance of the answer to its end. Not a
+    /// transition: the shell counts it for where the person stopped
+    /// listening, and the table never sees it.
+    SentenceSpoken,
+    /// The person said the stop phrase while `Speaking` or `Paused`
+    /// (AD-208). Never
     /// emitted by a port: [`super::Turn`] makes it out of a `SpeechDetected`
     /// whose words match `bots.stop_phrase`.
     StopHeard,
@@ -207,6 +251,12 @@ pub enum Effect {
     Enqueue(String),
     /// Stop reading aloud, now, mid-word.
     StopSpeaking,
+    /// Pause reading aloud, now, mid-word, keeping the queue (AD-411).
+    PauseSpeaking,
+    /// Go on reading from where [`Effect::PauseSpeaking`] left off. The
+    /// port starts a fresh recognition request with it, so the next
+    /// utterance over the answer is heard on its own.
+    ContinueSpeaking,
     /// Tell the recogniser the audio has ended, so it delivers its final
     /// transcript of what it already heard. The microphone stays open. The
     /// port acknowledges with [`TurnEvent::AudioEnded`] or
@@ -221,22 +271,25 @@ pub enum Effect {
 /// `Sent` while nothing was heard — and leave the state and the device as
 /// they were.
 pub fn advance(state: TurnState, event: TurnEvent) -> (TurnState, Vec<Effect>) {
-    use Effect::{FinishRecognition, OpenMicrophone, ReleaseMicrophone, StopSpeaking};
+    use Effect::{
+        ContinueSpeaking, FinishRecognition, OpenMicrophone, PauseSpeaking, ReleaseMicrophone,
+        StopSpeaking,
+    };
     use TurnEvent::{
         Abandoned, AnswerChunk, AnswerDone, AnswerSentence, AudioEnded, Failed, FinalHeard,
-        NothingToFinish, PartialHeard, Sent, Silence, SpeechDetected, StopHeard, UtteranceEnd,
-        WakeMatched,
+        NothingToFinish, PartialHeard, Resolved, Sent, Silence, SpeechDetected, SpeechEnded,
+        StopHeard, UtteranceEnd, WakeMatched,
     };
 
     match (state, event) {
         // -- Abandon and failure: the same answer from every state, first so
         //    no later arm can forget them (NFR-51). A manual stop while
         //    speaking stops the voice before the device is released (AD-212).
-        (TurnState::Speaking, Abandoned) => {
+        (TurnState::Speaking | TurnState::Paused { .. }, Abandoned) => {
             (TurnState::Idle, vec![StopSpeaking, ReleaseMicrophone])
         }
         (_, Abandoned) => (TurnState::Idle, vec![ReleaseMicrophone]),
-        (TurnState::Speaking, Failed(reason)) => (
+        (TurnState::Speaking | TurnState::Paused { .. }, Failed(reason)) => (
             TurnState::Failed { reason },
             vec![StopSpeaking, ReleaseMicrophone],
         ),
@@ -353,20 +406,26 @@ pub fn advance(state: TurnState, event: TurnEvent) -> (TurnState, Vec<Effect>) {
         (state @ TurnState::Sending { .. }, _) => (state, Vec::new()),
 
         // -- Speaking ---------------------------------------------------------
-        // Barge-in: stop talking before anything else, then listen again. On
-        // a full-duplex platform the microphone is already open and
-        // `OpenMicrophone` restarts recognition on a fresh request so the
-        // answer's tail is not transcribed as speech; on a half-duplex one it
-        // was released before the speech and this opens it.
-        (TurnState::Speaking, SpeechDetected(_)) => (
-            TurnState::Listening {
-                heard: String::new(),
-            },
-            vec![StopSpeaking, OpenMicrophone],
-        ),
+        // Barge-in: pause, and only pause, while the utterance decides. The
+        // request the words arrive on keeps running, so nothing they said is
+        // lost. A final transcript is the person too (Q12).
+        (TurnState::Speaking, SpeechDetected(heard) | FinalHeard(heard)) => {
+            let heard = if heard.trim().is_empty() {
+                String::new()
+            } else {
+                heard
+            };
+            (
+                TurnState::Paused {
+                    heard,
+                    speech_ms: None,
+                },
+                vec![PauseSpeaking],
+            )
+        }
         // The stop phrase ends the turn the way a stop button does: nothing
         // is asked afterwards, and the device is released for the turn.
-        (TurnState::Speaking, StopHeard) => {
+        (TurnState::Speaking | TurnState::Paused { .. }, StopHeard) => {
             (TurnState::Idle, vec![StopSpeaking, ReleaseMicrophone])
         }
         // The answer keeps arriving while the first of it is read: every
@@ -377,6 +436,46 @@ pub fn advance(state: TurnState, event: TurnEvent) -> (TurnState, Vec<Effect>) {
         // The synthesiser's own end: nothing is left to stop.
         (TurnState::Speaking, Silence) => (TurnState::Idle, vec![ReleaseMicrophone]),
         (TurnState::Speaking, _) => (TurnState::Speaking, Vec::new()),
+
+        // -- Paused -----------------------------------------------------------
+        // More of the utterance: words replace words, never with nothing; a
+        // blank one is the voice activity model hearing speech start again.
+        (TurnState::Paused { heard, speech_ms }, SpeechDetected(more)) => {
+            let next = if more.trim().is_empty() {
+                TurnState::Paused {
+                    heard,
+                    speech_ms: None,
+                }
+            } else {
+                TurnState::Paused {
+                    heard: more,
+                    speech_ms,
+                }
+            };
+            (next, Vec::new())
+        }
+        (TurnState::Paused { heard, .. }, SpeechEnded { speech_ms }) => (
+            TurnState::Paused {
+                heard,
+                speech_ms: Some(speech_ms),
+            },
+            Vec::new(),
+        ),
+        // A backchannel, or nothing at all: the answer goes on.
+        (TurnState::Paused { .. }, Resolved(utterance)) if utterance.resumes() => {
+            (TurnState::Speaking, vec![ContinueSpeaking])
+        }
+        // Anything else is the next question; the answer stops first.
+        (TurnState::Paused { .. }, Resolved(Utterance::Question(text))) => {
+            let (next, mut effects) = send_or_end(text);
+            effects.insert(0, StopSpeaking);
+            (next, effects)
+        }
+        // The answer keeps arriving while it is paused.
+        (state @ TurnState::Paused { .. }, AnswerSentence(text) | AnswerDone(text)) => {
+            (state, enqueue(text))
+        }
+        (state @ TurnState::Paused { .. }, _) => (state, Vec::new()),
     }
 }
 
@@ -428,6 +527,9 @@ fn enqueue(text: String) -> Vec<Effect> {
 /// [`FINAL_WORDS_WAIT`] from the moment it did — the port's own wait
 /// before it rolls the request runs from that same moment, so the two
 /// clocks end together however late the acknowledgement reached the turn.
+/// `Paused` has its decision window: [`FINAL_WORDS_WAIT`] for the last
+/// words once the voice activity model heard the speech end, otherwise
+/// [`PAUSE_DECISION_WAIT`] after the last thing it heard.
 /// `Speaking`'s `Silence` comes from the synthesiser finishing, not from a
 /// clock, and `Sending` is bounded by the conversation's own read timeout.
 pub fn silence_budget(state: &TurnState, now_ms: i64) -> Option<Duration> {
@@ -445,31 +547,40 @@ pub fn silence_budget(state: &TurnState, now_ms: i64) -> Option<Duration> {
             let spent = u64::try_from(now_ms.saturating_sub(*ended)).unwrap_or(0);
             Some(FINAL_WORDS_WAIT.saturating_sub(Duration::from_millis(spent)))
         }
+        TurnState::Paused {
+            speech_ms: Some(_), ..
+        } => Some(FINAL_WORDS_WAIT),
+        TurnState::Paused {
+            speech_ms: None, ..
+        } => Some(PAUSE_DECISION_WAIT),
         _ => None,
     }
 }
 
 /// Whether a move from `before` to `after` starts the silence budget
 /// afresh. Every move does — a partial in `Listening` is the person still
-/// talking — except one that stays in `Finishing` on the same clock: the
-/// wait for the last words runs from the moment the port ended the
-/// request's audio, and the partials it delivers meanwhile do not extend
-/// it. The acknowledgement itself starts that wait.
+/// talking — except one that stays in `Finishing` on the same clock, and
+/// one that leaves a pause as it was. The wait for the last words runs from
+/// the moment the port ended the request's audio, and the partials it
+/// delivers meanwhile do not extend it; the acknowledgement itself starts
+/// that wait. A pause's window runs from the last thing the utterance
+/// changed — words, or the speech's start or end — and a sentence of the
+/// answer queued meanwhile does not extend it.
 pub fn restarts_budget(before: &TurnState, after: &TurnState) -> bool {
-    restarts(finishing_clock(before), finishing_clock(after))
-}
-
-/// When `state` is `Finishing`, the moment its wait runs from.
-pub(crate) fn finishing_clock(state: &TurnState) -> Option<Option<i64>> {
-    match state {
-        TurnState::Finishing { audio_ended_ms, .. } => Some(*audio_ended_ms),
-        _ => None,
+    match (before, after) {
+        (
+            TurnState::Finishing {
+                audio_ended_ms: was,
+                ..
+            },
+            TurnState::Finishing {
+                audio_ended_ms: now,
+                ..
+            },
+        ) => was != now,
+        (TurnState::Paused { .. }, TurnState::Paused { .. }) => before != after,
+        _ => true,
     }
-}
-
-/// [`restarts_budget`] over the two states' [`finishing_clock`]s.
-pub(crate) fn restarts(before: Option<Option<i64>>, after: Option<Option<i64>>) -> bool {
-    !matches!((before, after), (Some(was), Some(now)) if was == now)
 }
 
 /// AD-175, the half-duplex rule: whether the port may have the microphone
@@ -482,8 +593,9 @@ pub(crate) fn restarts(before: Option<Option<i64>>, after: Option<Option<i64>>) 
 /// itself, and the first transcript it produced would stop its own speech —
 /// since AD-213 that is the absent port alone; both Apple ports keep
 /// keeper's voice out through the input node's voice processing. `true`
-/// everywhere else, including `Idle` (a wake phrase may hold the device)
-/// and `Speaking` where the OS arbitrates.
+/// everywhere else, including `Idle` (a wake phrase may hold the device),
+/// `Paused` (the answer is silent, and the utterance must be heard to be
+/// decided) and `Speaking` where the OS arbitrates.
 pub fn may_record(platform: &VoicePlatform, state: &TurnState) -> bool {
     match state {
         TurnState::Failed { .. } => false,
@@ -492,6 +604,7 @@ pub fn may_record(platform: &VoicePlatform, state: &TurnState) -> bool {
         | TurnState::Listening { .. }
         | TurnState::Finishing { .. }
         | TurnState::Heard { .. }
-        | TurnState::Sending { .. } => true,
+        | TurnState::Sending { .. }
+        | TurnState::Paused { .. } => true,
     }
 }

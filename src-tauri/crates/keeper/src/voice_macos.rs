@@ -74,8 +74,12 @@
 //!   microphone stays open while keeper speaks (`MACOS.full_duplex`).
 //! - **Barge-in by voice** therefore exists here as on the phone: a
 //!   transcript while the `speaking` flag is up is `SpeechDetected` with
-//!   its words, and the turn tells the stop phrase from a question
-//!   (AD-208). After an utterance the ears shut for [`TAIL_GATE`], and
+//!   its words (a final one `FinalHeard`), and the turn pauses the answer
+//!   and decides what the words were (AD-411): the port pauses and continues
+//!   the synthesiser when told ([`Worker::pause_speaking`],
+//!   [`Worker::continue_speaking`]), keeps the flag up while paused, and
+//!   reports each utterance read to its end through the synthesiser's
+//!   delegate (`voice_synthesizer`). After an utterance the ears shut for [`TAIL_GATE`], and
 //!   what arrives inside the gate is dropped and recorded as
 //!   `echo_dropped` with its words (AD-209) — the ring is the measurement
 //!   of what this Mac hears of itself.
@@ -303,6 +307,11 @@ enum Command {
         reply: SyncSender<Result<(), VoiceUnavailable>>,
     },
     StopSpeaking,
+    /// The turn's `PauseSpeaking` (AD-411), answered once the synthesiser
+    /// paused.
+    PauseSpeaking(SyncSender<()>),
+    /// The turn's `ContinueSpeaking`, answered once it resumed.
+    ContinueSpeaking(SyncSender<()>),
     /// The turn's `FinishRecognition` (AD-411): the request's audio ends, so
     /// its task delivers the final words.
     FinishRecognition(u64),
@@ -445,6 +454,14 @@ impl VoicePort for MacVoicePort {
         self.tell(Command::StopSpeaking);
     }
 
+    fn pause_speaking(&self) {
+        let _ = self.ask(Command::PauseSpeaking);
+    }
+
+    fn continue_speaking(&self) {
+        let _ = self.ask(Command::ContinueSpeaking);
+    }
+
     fn finish_recognition(&self, finish: u64) {
         self.tell(Command::FinishRecognition(finish));
     }
@@ -515,6 +532,11 @@ struct Worker {
     capture: Option<Capture>,
     recognition: Option<Recognition>,
     synthesizer: Option<Retained<AVSpeechSynthesizer>>,
+    /// The synthesiser's delegate, held because the property is weak.
+    delegate: Option<Retained<crate::voice_synthesizer::SpeechDelegate>>,
+    /// Whether the turn paused the answer: the flag stays up, and the end
+    /// of the answer is not looked for until it continues.
+    paused: bool,
     /// The serial of the current request; handlers from older serials are
     /// stale and dropped.
     current: Arc<AtomicU64>,
@@ -566,6 +588,8 @@ impl Worker {
             capture: None,
             recognition: None,
             synthesizer: None,
+            delegate: None,
+            paused: false,
             current: Arc::new(AtomicU64::new(0)),
             speaking: Arc::new(AtomicBool::new(false)),
             speaking_since: None,
@@ -642,6 +666,14 @@ impl Worker {
                     let _ = reply.send(self.enqueue(&text, &language));
                 }
                 Ok(Command::StopSpeaking) => self.stop_speaking(),
+                Ok(Command::PauseSpeaking(reply)) => {
+                    self.pause_speaking();
+                    let _ = reply.send(());
+                }
+                Ok(Command::ContinueSpeaking(reply)) => {
+                    self.continue_speaking();
+                    let _ = reply.send(());
+                }
                 Ok(Command::FinishRecognition(finish)) => self.finish_recognition(finish),
                 Ok(Command::HalfDuplex(reply)) => {
                     let _ = reply.send(self.capture.as_ref().and_then(|c| c.half_duplex.clone()));
@@ -899,12 +931,13 @@ impl Worker {
                 tracing::warn!(%error, "voice: could not roll the request before speaking");
             }
         }
-        let synthesizer = self.synthesizer.get_or_insert_with(new_synthesizer);
+        let synthesizer = self.synthesizer();
         // A new utterance: whatever the last one still owed is moot.
+        self.paused = false;
         self.silence_due = None;
         self.speaking.store(true, Ordering::SeqCst);
         self.speaking_since = Some(Instant::now());
-        speak_text(synthesizer, text, &voice);
+        speak_text(&synthesizer, text, &voice);
         Ok(())
     }
 
@@ -917,7 +950,7 @@ impl Worker {
     /// between two sentences; a stop clears the queue with the utterance.
     fn enqueue(&mut self, text: &str, language: &str) -> Result<(), VoiceUnavailable> {
         let voice = self.voice_for(language)?;
-        let synthesizer = self.synthesizer.get_or_insert_with(new_synthesizer);
+        let synthesizer = self.synthesizer();
         self.silence_due = None;
         if self.speaking_since.is_none() {
             // The queue had drained before this sentence arrived: it is a
@@ -925,7 +958,13 @@ impl Worker {
             self.speaking.store(true, Ordering::SeqCst);
             self.speaking_since = Some(Instant::now());
         }
-        speak_text(synthesizer, text, &voice);
+        speak_text(&synthesizer, text, &voice);
+        if self.paused {
+            // The turn paused the answer and keeps its queue (AD-411): on a
+            // synthesiser that had nothing left to pause, the utterance just
+            // queued would play at once, over the person.
+            crate::voice_synthesizer::pause_speech(&synthesizer);
+        }
         Ok(())
     }
 
@@ -951,11 +990,60 @@ impl Worker {
         Ok(voice)
     }
 
+    /// The synthesiser, made on first use with its delegate, which reports
+    /// every utterance read to its end to the turn as `SentenceSpoken`.
+    fn synthesizer(&mut self) -> Retained<AVSpeechSynthesizer> {
+        if let Some(synthesizer) = &self.synthesizer {
+            return synthesizer.clone();
+        }
+        let synthesizer = new_synthesizer();
+        self.delegate = Some(crate::voice_synthesizer::with_delegate(
+            &synthesizer,
+            Arc::clone(&self.sink),
+        ));
+        self.synthesizer = Some(synthesizer.clone());
+        synthesizer
+    }
+
     fn stop_speaking(&mut self) {
         if let Some(synthesizer) = &self.synthesizer {
             stop_speech(synthesizer);
         }
+        self.paused = false;
         self.speech_over();
+    }
+
+    /// The turn's `PauseSpeaking` (AD-411): the synthesiser pauses
+    /// mid-word with its queue kept, and the `speaking` flag stays up, so
+    /// what the person goes on saying is still `SpeechDetected` on the same
+    /// request. No `Silence` is owed while paused: an answer that ran out
+    /// as the pause landed is reported once it continues.
+    fn pause_speaking(&mut self) {
+        if let Some(synthesizer) = &self.synthesizer {
+            crate::voice_synthesizer::pause_speech(synthesizer);
+        }
+        self.paused = true;
+        self.silence_due = None;
+    }
+
+    /// The turn's `ContinueSpeaking`: a fresh request first, so the next
+    /// utterance over the answer is heard on its own (Q11), then the
+    /// synthesiser goes on. The grace clock starts again, so an answer with
+    /// nothing left to read ends through [`Worker::watch_speech_end`] as
+    /// any other does.
+    fn continue_speaking(&mut self) {
+        if self.capture.is_some() {
+            if let Err(error) = self.roll_request() {
+                tracing::warn!(%error, "voice: could not roll the request before continuing");
+            }
+        }
+        if let Some(synthesizer) = &self.synthesizer {
+            crate::voice_synthesizer::continue_speech(synthesizer);
+        }
+        self.paused = false;
+        self.silence_due = None;
+        self.speaking.store(true, Ordering::SeqCst);
+        self.speaking_since = Some(Instant::now());
     }
 
     /// The utterance is over, one way or another: the ears shut for
@@ -1094,6 +1182,9 @@ impl Worker {
         let Some(since) = self.speaking_since else {
             return;
         };
+        if self.paused {
+            return;
+        }
         if since.elapsed() < SPEAK_GRACE {
             return;
         }
@@ -1153,7 +1244,9 @@ impl Worker {
                             last_heard.store(now, Ordering::SeqCst);
                         }
                         if speaking.load(Ordering::SeqCst) {
-                            if heard_something && full_duplex {
+                            if heard_something && full_duplex && is_final {
+                                sink(TurnEvent::FinalHeard(text));
+                            } else if heard_something && full_duplex {
                                 sink(TurnEvent::SpeechDetected(text));
                             } else if heard_something {
                                 tracing::info!(%text, "voice: transcript while speaking on a half-duplex capture dropped");

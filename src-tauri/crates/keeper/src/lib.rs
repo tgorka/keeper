@@ -146,6 +146,10 @@ mod voice_reach;
 // silicon Macs, the iPhone). Every target, so the voice settings say the
 // same thing everywhere; elsewhere it answers "none here".
 mod voice_turn_models;
+// What both Apple ports do to the synthesiser beyond speaking: pause it,
+// continue it, and hear each utterance finish (AD-411, story 97.3).
+#[cfg(any(target_os = "ios", target_os = "macos"))]
+mod voice_synthesizer;
 // The voice pill (Story 64.4, AD-185): the floating window that shows a
 // turn hearing while keeper is behind another app. Desktop-only, and
 // created only when the port is a real answer — see the module doc.

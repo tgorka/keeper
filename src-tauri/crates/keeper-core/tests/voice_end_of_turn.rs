@@ -6,7 +6,8 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 use keeper_core::voice::end_of_turn::{
-    hears_end_of_turn, utterance_ends, Detected, Ear, EndOfTurn, Heard, Listener, Resampler,
+    hears_end_of_turn, hears_over_the_answer, utterance_ends, Detected, Ear, EndOfTurn, Heard,
+    Listener, Resampler,
 };
 use keeper_core::voice::timings::TurnClock;
 use keeper_core::voice::turn_models::{
@@ -387,15 +388,15 @@ fn ear_hears_only_while_the_turn_listens() {
     static EAR: Ear = Ear::new();
     let rate = 48_000;
     let audio = spoken(rate);
-    EAR.follow(&listening(""));
+    EAR.follow(&listening(""), true);
     feed(&EAR, &audio, rate); // nothing attached: dropped at once.
 
     let (heard, told) = telling();
     EAR.attach(FakeModels::scoring(0.9), heard)
         .expect("listener starts");
-    EAR.follow(&TurnState::Speaking);
+    EAR.follow(&TurnState::Speaking, false);
     feed(&EAR, &audio, rate);
-    EAR.follow(&listening(""));
+    EAR.follow(&listening(""), true);
     let generation = current(&EAR);
     feed(&EAR, &audio, rate);
 
@@ -473,7 +474,7 @@ fn ear_refuses_what_an_ended_listening_heard() {
     let mut clock = TurnClock::default();
 
     for leave in [TurnState::Idle, TurnState::Speaking] {
-        EAR.follow(&listening(""));
+        EAR.follow(&listening(""), true);
         let old = current(&EAR);
         feed(&EAR, &spoken(rate), rate);
         asked
@@ -484,8 +485,8 @@ fn ear_refuses_what_an_ended_listening_heard() {
         let heard_before = frames.load(Ordering::SeqCst);
 
         // The person abandons the turn and starts another, or barges in.
-        EAR.follow(&leave);
-        EAR.follow(&listening(""));
+        EAR.follow(&leave, true);
+        EAR.follow(&listening(""), true);
         let new = current(&EAR);
         assert_ne!(new, old);
         release.send(()).expect("release");
@@ -522,7 +523,7 @@ fn ear_refuses_what_an_ended_listening_heard() {
 
     // A replaced listener's verdict in flight is refused too, and while it
     // blocks the tap drops what it has no buffer for, without waiting.
-    EAR.follow(&listening(""));
+    EAR.follow(&listening(""), true);
     let old = current(&EAR);
     feed(&EAR, &spoken(rate), rate);
     asked
@@ -562,10 +563,10 @@ fn ear_keeps_late_clock_points_off_the_turn() {
         let (next, effects) = advance(state.clone(), event.clone());
         let record = clock.observe(state, &event, &next, &effects, now);
         *state = next;
-        ear.follow(state);
+        ear.follow(state, true);
         record
     };
-    ear.follow(&state);
+    ear.follow(&state, true);
     let first = current(&ear);
     assert_eq!(
         ear.admit(first, &Heard::SpeechEnd { at_ms: 1_000 }, &mut clock),
@@ -614,4 +615,68 @@ fn ear_keeps_late_clock_points_off_the_turn() {
     );
     let record = step(&mut clock, &mut state, TurnEvent::Silence, 4_000).expect("sent");
     assert_eq!(record.speech_end_ms, None);
+}
+
+/// 97.3 (AD-411, Q11): the ear listens over the answer — while the turn is
+/// `Speaking` or `Paused`, and only on a capture that keeps keeper's own
+/// voice out. There an onset is the barge-in that pauses the answer, with no
+/// words yet, and a speech end is how long the speech that paused it
+/// lasted; a verdict on the sentence is nothing. Listening over the answer
+/// is a listening of its own: the generation moves when the ear starts it,
+/// stays while the answer pauses, and what an earlier listening heard is
+/// refused.
+#[test]
+fn ear_hears_the_person_over_the_answer() {
+    let paused = TurnState::Paused {
+        heard: String::new(),
+        speech_ms: None,
+    };
+    assert!(hears_over_the_answer(&TurnState::Speaking, true));
+    assert!(hears_over_the_answer(&paused, true));
+    assert!(!hears_over_the_answer(&TurnState::Speaking, false));
+    assert!(!hears_over_the_answer(&paused, false));
+    assert!(!hears_over_the_answer(&listening(""), true));
+    assert!(!hears_over_the_answer(&TurnState::Idle, true));
+
+    let ear = Ear::new();
+    let mut clock = TurnClock::default();
+    ear.follow(&listening(""), true);
+    let question = current(&ear);
+    ear.follow(&TurnState::Speaking, true);
+    let over = current(&ear);
+    assert_ne!(over, question);
+    assert!(!ear.hears(question));
+    assert_eq!(
+        ear.admit(question, &Heard::Onset { at_ms: 900 }, &mut clock),
+        None
+    );
+    assert_eq!(
+        ear.admit(over, &Heard::Onset { at_ms: 1_000 }, &mut clock),
+        Some(TurnEvent::SpeechDetected(String::new()))
+    );
+    ear.follow(&paused, true);
+    assert!(ear.hears(over), "a pause is the same listening");
+    assert_eq!(
+        ear.admit(
+            over,
+            &Heard::UtteranceEnd {
+                speech_end_ms: 1_300,
+                score: 0.9
+            },
+            &mut clock
+        ),
+        None
+    );
+    assert_eq!(
+        ear.admit(over, &Heard::SpeechEnd { at_ms: 1_400 }, &mut clock),
+        Some(TurnEvent::SpeechEnded { speech_ms: 400 })
+    );
+    // A capture that hears keeper's own voice: the ear rests over the
+    // answer, and nothing it heard before moves the turn.
+    ear.follow(&TurnState::Speaking, false);
+    assert!(!ear.hears(over));
+    assert_eq!(
+        ear.admit(over, &Heard::Onset { at_ms: 2_000 }, &mut clock),
+        None
+    );
 }

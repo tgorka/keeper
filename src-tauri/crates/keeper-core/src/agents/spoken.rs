@@ -35,6 +35,12 @@
 //!   stops speech on this device (the voice turn's own rule) and the agent
 //!   finishes its answer in the room. The next question drops the watch —
 //!   [`FollowSlot`] keeps only the current question's.
+//! - **Where the person stopped (AD-411, Q17).** The agent is told, though:
+//!   [`HeardMark`] follows the answer outside the watch — its anchor, the
+//!   end of every sentence handed to the synthesiser, how many it read to
+//!   their end — and a stop, or a question asked over the answer, makes it
+//!   the `dev.keeper.agent.heard` content the device sends before anything
+//!   else. A mark, not a cancel (DW-419).
 //!
 //! [`SpokenAnswer`] is the watch over one room's event cache.
 
@@ -53,10 +59,14 @@ use matrix_sdk_ui::eyeball_im::{Vector, VectorDiff};
 use serde_json::Value;
 use tokio::sync::broadcast;
 
-use crate::agents::events::{RunState, StatusContent, TurnRef, STATUS, TURN};
+use crate::agents::events::{RunState, StatusContent, TurnRef, CONTENT_VERSION, STATUS, TURN};
+use crate::agents::heard::HeardContent;
+use crate::agents::log::HeardReason;
 use crate::agents::room::holds_agent_power;
 use crate::error::CoreError;
-use crate::voice::speech::AnswerFollower;
+use crate::voice::backchannel::Utterance;
+use crate::voice::speech::{AnswerFollower, Sentence};
+use crate::voice::{Effect, TurnEvent, TurnState};
 
 /// How long a spoken question waits for its answer to start.
 pub const ANSWER_START_WAIT: Duration = Duration::from_secs(60);
@@ -65,17 +75,26 @@ pub const ANSWER_START_WAIT: Duration = Duration::from_secs(60);
 /// on it. A tool call that runs long still edits the status, which counts.
 pub const ANSWER_QUIET_WAIT: Duration = Duration::from_secs(120);
 
+/// How long a spoken question waits for the heard mark sent before it (Q10)
+/// to be in the room. The mark is best-effort and the question is what the
+/// person is waiting on: past this the question goes, and the mark, still
+/// sending, cuts the turns after it.
+pub const HEARD_MARK_WAIT: Duration = Duration::from_secs(10);
+
 /// What the voice turn is told.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpokenStep {
     /// The answer's first words arrived, `after_ms` after the question was
     /// handed to the send queue.
     FirstText { after_ms: u64 },
-    /// One closed sentence of the answer, in order, once.
-    Sentence(String),
-    /// The answer is whole: the words after its last sentence, empty when
-    /// there are none.
-    Complete(String),
+    /// The agent's message `anchor` answers the question: where the person
+    /// stopped listening is marked against it ([`HeardMark`]).
+    Anchored { anchor: String },
+    /// One closed sentence of the answer, in order, once, with its end in
+    /// the answer's text as it read when the sentence closed.
+    Sentence(Sentence),
+    /// The answer is whole: the words after its last sentence, if any.
+    Complete(Option<Sentence>),
     /// No answer, or no more of one: the sentence the turn ends on.
     Failed(String),
 }
@@ -217,6 +236,9 @@ impl SpokenWatch {
                         answering: None,
                     };
                     self.heard_at = now;
+                    return vec![SpokenStep::Anchored {
+                        anchor: anchor.to_owned(),
+                    }];
                 }
                 Vec::new()
             }
@@ -268,9 +290,7 @@ impl SpokenWatch {
                     }
                     RunState::Idle | RunState::Done if ours => {
                         self.stage = Stage::Done;
-                        vec![SpokenStep::Complete(
-                            self.follower.finish().unwrap_or_default(),
-                        )]
+                        vec![SpokenStep::Complete(self.follower.finish())]
                     }
                     // `blocked` (its claim lost), `waiting`, another copy's
                     // word, or an end before this turn ran: not the answer's
@@ -305,6 +325,104 @@ impl SpokenWatch {
         } else {
             format!("{name} has not answered: no copy of it may be running right now.")
         }))
+    }
+}
+
+/// How far the person heard one spoken agent answer (AD-411, 97.3 #6;
+/// pure): the answer's room and anchor, the end of each sentence handed to
+/// the synthesiser in the order it was handed, and how many of them the
+/// synthesiser read to their end. A sentence it was cut off in does not
+/// count (Q3): an agent told the person heard less repeats a little; one
+/// told they heard more skips what they never heard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeardMark {
+    account_id: String,
+    room_id: String,
+    anchor: Option<String>,
+    ends: Vec<usize>,
+    finished: usize,
+}
+
+impl HeardMark {
+    /// A mark for a question asked in `room_id` on `account_id`.
+    pub fn new(account_id: String, room_id: String) -> Self {
+        HeardMark {
+            account_id,
+            room_id,
+            anchor: None,
+            ends: Vec::new(),
+            finished: 0,
+        }
+    }
+
+    /// The account the question was asked on.
+    pub fn account_id(&self) -> &str {
+        &self.account_id
+    }
+
+    /// The proxy room the question was asked in.
+    pub fn room_id(&self) -> &str {
+        &self.room_id
+    }
+
+    /// The agent's message `anchor` is the answer.
+    pub fn anchored(&mut self, anchor: &str) {
+        self.anchor = Some(anchor.to_owned());
+    }
+
+    /// A sentence ending at `end` in the answer's text was handed to the
+    /// synthesiser, after every one before it.
+    pub fn handed(&mut self, end: usize) {
+        self.ends.push(end);
+    }
+
+    /// The synthesiser read one more of the handed sentences to its end.
+    pub fn spoken(&mut self) {
+        self.finished = (self.finished + 1).min(self.ends.len());
+    }
+
+    /// The content that tells the agent where the person stopped, for
+    /// `reason` — `None` while no anchor names the answer, since then
+    /// nothing of it was heard and there is nothing to mark against.
+    pub fn content(&self, reason: HeardReason) -> Option<HeardContent> {
+        let anchor = self.anchor.as_deref()?.try_into().ok()?;
+        let heard_until = match self.finished {
+            0 => 0,
+            n => self.ends.get(n - 1).copied().unwrap_or(0),
+        };
+        Some(HeardContent {
+            v: CONTENT_VERSION,
+            anchor,
+            heard_until: u64::try_from(heard_until).unwrap_or(u64::MAX),
+            sentence: u32::try_from(self.finished).unwrap_or(u32::MAX),
+            reason,
+        })
+    }
+
+    /// Whether a voice turn's move — from `before` on `event` as the table
+    /// was handed it, handing out `effects` — stopped an answer the person
+    /// was hearing, and why: the stop phrase, a stop by hand, or speech
+    /// that stopped the answer with nothing to ask is `stop`, a question
+    /// asked over the answer `barge_in`. An answer heard to its end, or one
+    /// a failure ended, is marked nowhere.
+    pub fn reason(
+        before: &TurnState,
+        event: &TurnEvent,
+        effects: &[Effect],
+    ) -> Option<HeardReason> {
+        if !matches!(before, TurnState::Speaking | TurnState::Paused { .. })
+            || !effects.contains(&Effect::StopSpeaking)
+        {
+            return None;
+        }
+        match event {
+            TurnEvent::StopHeard | TurnEvent::Abandoned => Some(HeardReason::Stop),
+            TurnEvent::Resolved(Utterance::Question(text)) if !text.trim().is_empty() => {
+                Some(HeardReason::BargeIn)
+            }
+            TurnEvent::Resolved(Utterance::Question(_)) => Some(HeardReason::Stop),
+            _ => None,
+        }
     }
 }
 
@@ -690,10 +808,18 @@ mod tests {
         steps
             .iter()
             .filter_map(|step| match step {
-                SpokenStep::Sentence(sentence) => Some(sentence.clone()),
+                SpokenStep::Sentence(sentence) => Some(sentence.text.clone()),
                 _ => None,
             })
             .collect()
+    }
+
+    /// The answer completing with its tail, ending at `end`.
+    fn complete(text: &str, end: usize) -> SpokenStep {
+        SpokenStep::Complete(Some(Sentence {
+            text: text.to_owned(),
+            end,
+        }))
     }
 
     fn see_all(watch: &mut SpokenWatch, events: &[Value], now: Instant) -> Vec<SpokenStep> {
@@ -712,18 +838,25 @@ mod tests {
         let mut watch = watch(start);
         assert!(watch.asked("$q", start).is_empty());
         assert!(watch.see(&question("$q", ME, 10), true, start).is_empty());
-        assert!(see_all(
-            &mut watch,
-            &[anchor("$a", NIXI, "$q", 11), turn_status("running", 12)],
-            start
-        )
-        .is_empty());
+        assert_eq!(
+            see_all(
+                &mut watch,
+                &[anchor("$a", NIXI, "$q", 11), turn_status("running", 12)],
+                start
+            ),
+            vec![SpokenStep::Anchored {
+                anchor: "$a".to_owned()
+            }]
+        );
         let later = start + Duration::from_millis(1500);
         assert_eq!(
             watch.see(&edit("$a", NIXI, "The sky is blue. It", 13), true, later),
             vec![
                 SpokenStep::FirstText { after_ms: 1500 },
-                SpokenStep::Sentence("The sky is blue.".to_owned())
+                SpokenStep::Sentence(Sentence {
+                    text: "The sky is blue.".to_owned(),
+                    end: 16
+                })
             ]
         );
         let steps = watch.see(
@@ -734,7 +867,7 @@ mod tests {
         assert!(steps.is_empty(), "{steps:?}");
         assert_eq!(
             watch.see(&turn_status("idle", 15), true, later),
-            vec![SpokenStep::Complete("It is clear today.".to_owned())]
+            vec![complete("It is clear today.", 35)]
         );
         assert!(watch.is_done());
         assert_eq!(watch.deadline(), None);
@@ -776,7 +909,7 @@ mod tests {
             start,
         );
         assert_eq!(sentences(&steps), ["Answer two."]);
-        assert_eq!(steps.last(), Some(&SpokenStep::Complete("Done".to_owned())));
+        assert_eq!(steps.last(), Some(&complete("Done", 16)));
     }
 
     /// The same words asked from the phone and the Mac are two questions:
@@ -826,7 +959,7 @@ mod tests {
         assert_eq!(sentences(&watch.asked("$q", start)), ["Early."]);
         assert_eq!(
             watch.see(&turn_status("idle", 6), true, start),
-            vec![SpokenStep::Complete("Words".to_owned())]
+            vec![complete("Words", 12)]
         );
         let mut lost = self::watch(start);
         assert_eq!(
@@ -873,7 +1006,7 @@ mod tests {
         );
         assert_eq!(
             watch.see(&turn_status("idle", 7), true, start),
-            vec![SpokenStep::Complete("Really".to_owned())]
+            vec![complete("Really", 11)]
         );
     }
 
@@ -898,7 +1031,13 @@ mod tests {
             ],
             start,
         );
-        assert!(steps.is_empty() && !watch.is_done(), "{steps:?}");
+        assert_eq!(
+            steps,
+            [SpokenStep::Anchored {
+                anchor: "$a".to_owned()
+            }]
+        );
+        assert!(!watch.is_done());
         watch.see(&turn_status("running", 22), true, start);
         let steps = see_all(
             &mut watch,
@@ -922,7 +1061,7 @@ mod tests {
         assert!(!watch.is_done());
         assert_eq!(
             watch.see(&turn_status("idle", 30), true, start),
-            vec![SpokenStep::Complete("Three".to_owned())]
+            vec![complete("Three", 15)]
         );
     }
 
@@ -1027,7 +1166,7 @@ mod tests {
         assert_eq!(ids(&fresh), ["$a", "$s13", "$e14", "$s15"]);
         let steps = see_all(&mut watch, &fresh, start);
         assert_eq!(sentences(&steps), ["Late."]);
-        assert_eq!(steps.last(), Some(&SpokenStep::Complete("Key".to_owned())));
+        assert_eq!(steps.last(), Some(&complete("Key", 9)));
 
         // Handed out once: the cache moving one again hands out nothing,
         // and neither does an older page loaded in front; Marta's message,
@@ -1124,6 +1263,8 @@ mod tests {
         turn.apply(TurnEvent::AnswerSentence("Hello.".to_owned()));
         assert!(turn.owns_answer(a), "reading the answer is still A's");
         turn.apply(TurnEvent::SpeechDetected("wait".to_owned()));
+        assert!(turn.owns_answer(a), "a paused answer is still A's");
+        turn.apply(TurnEvent::Silence);
         assert!(!turn.owns_answer(a));
         assert_eq!(slot.keep_only(turn.question()), Some("A"));
     }

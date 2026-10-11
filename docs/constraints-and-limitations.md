@@ -275,6 +275,21 @@ safe binding. Current inventory:
   go nowhere else. The tap never allocates and never waits: it only tries the lock on the
   pool's line, and with the lock held (a listener being attached or detached) or no free
   buffer, the audio is dropped, counted (`Ear::dropped`) and the listener starts afresh.
+- Speaking over an answer, both ports (Epic 97, Story 97.3, AD-411): four function-level
+  `#[allow(unsafe_code)]` items in `crates/keeper/src/voice_synthesizer.rs`, which both
+  Apple ports share and which the ports' totals above do not count — the `class` module
+  around `define_class!` for `SpeechDelegate` (an `NSObject` subclass implementing
+  `AVSpeechSynthesizerDelegate`'s `speechSynthesizer:didFinishSpeechUtterance:` alone; its
+  one ivar is the port's event sink; the `web_auth_apple.rs` precedent), `set_delegate`
+  (`setDelegate:`, a weak property — the worker keeps the delegate as long as the
+  synthesiser), `pause_speech` (`pauseSpeakingAtBoundary:AVSpeechBoundaryImmediate`) and
+  `continue_speech` (`continueSpeaking`), each with its `// SAFETY:` comment, behind
+  `keeper_core::voice::VoicePort::{pause_speaking, continue_speaking}`. The delegate only
+  reports that an utterance was read to its end (`TurnEvent::SentenceSpoken`); whether to
+  pause, resume or stop, and how far the person heard, is `keeper_core::voice` and
+  `keeper_core::agents::spoken::HeardMark`'s. While the turn is `Speaking` or `Paused` the
+  same `Ear` listener hears the person over the answer on a capture with voice processing
+  (`half_duplex()` is `None`), and on no other; the samples still go nowhere else.
 - The account sign-in sheet, iOS (Epic 82, AD-311; macOS dropped it for the default browser):
   `ASWebAuthenticationSession` (`initWithURL:callback:completionHandler:` with
   `ASWebAuthenticationSessionCallback callbackWithCustomScheme:` behind

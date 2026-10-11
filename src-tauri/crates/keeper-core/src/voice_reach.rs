@@ -449,6 +449,8 @@ mod tests {
         fn stop_speaking(&self) {
             self.stopped_speaking.fetch_add(1, Ordering::SeqCst);
         }
+        fn pause_speaking(&self) {}
+        fn continue_speaking(&self) {}
         fn finish_recognition(&self, _finish: u64) {}
     }
 

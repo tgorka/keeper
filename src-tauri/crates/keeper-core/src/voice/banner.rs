@@ -110,6 +110,7 @@ fn first_sentence(text: &str) -> String {
         .into_iter()
         .next()
         .or_else(|| segmenter.flush())
+        .map(|sentence| sentence.text)
         .unwrap_or_default()
 }
 

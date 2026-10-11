@@ -21,6 +21,21 @@
 //! already watches and the stream events the shell forwards to it; it
 //! drives nothing.
 //!
+//! # Where the person stopped listening (AD-411, Q10, Q17)
+//!
+//! When the answer read aloud is an agent's, this module keeps the
+//! question's [`HeardMark`] — outside the follow task, so the next
+//! question's abort of that task loses nothing. Each sentence handed to
+//! the synthesiser adds its end; each utterance the port reports read to
+//! its end ([`TurnEvent::SentenceSpoken`]) counts. When a move stops the
+//! answer — the stop phrase, a stop by hand, a question asked over it —
+//! [`HeardMark::reason`] says so, and the mark's content goes into the
+//! agent's room through `agent_heard_send` before anything else: the next
+//! spoken question — asked over the answer, or after a stop — waits for the
+//! mark's event id before it is submitted, so the agent's next turn is cut
+//! where the person stopped; it waits at most [`HEARD_MARK_WAIT`], then goes
+//! without it. The mark is a mark, not a cancel (R44, DW-419).
+//!
 //! # The one lock, and who never takes it
 //!
 //! [`voice()`] is a mutex over the turn and its watcher. The port's callbacks
@@ -56,10 +71,12 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use keeper_core::agents::spoken::{HeardMark, HEARD_MARK_WAIT};
 use keeper_core::registry;
 use keeper_core::vm::{IpcError, IpcErrorCode, VoiceStateVm, VoiceUnavailableVm, VoiceWakeVm};
 use keeper_core::voice::end_of_turn::Heard;
 use keeper_core::voice::events::VoiceEventKind;
+use keeper_core::voice::speech::Sentence;
 use keeper_core::voice::timings::TurnClock;
 #[cfg(any(target_os = "ios", target_os = "macos"))]
 use keeper_core::voice::EventSink;
@@ -70,7 +87,7 @@ use keeper_core::voice::{
 #[cfg(not(any(target_os = "ios", target_os = "macos")))]
 use keeper_core::voice::{VoicePlatform, VoiceUnavailable};
 use tauri::ipc::Channel;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::ipc::{to_ipc_error, AppState};
 
@@ -88,6 +105,13 @@ struct Voice {
     /// The clock points of the spoken turn in progress (AD-411, NFR-114),
     /// written to the voice ring and the app log when it sends.
     clock: TurnClock,
+    /// How far the person heard the agent's answer to the question named,
+    /// while that question is the turn's (AD-411).
+    mark: Option<(u64, HeardMark)>,
+    /// The heard mark's send while it may still be in flight: the next
+    /// spoken question waits for it (Q10, [`after_mark`]), and so does a
+    /// later mark.
+    sending_mark: Option<tauri::async_runtime::JoinHandle<()>>,
     /// Where the registry is, kept from [`boot`] for the re-arm hooks
     /// (Epic 65, AD-190): a lifecycle event and the port's own resume arrive
     /// with no `State` in hand. `None` only before boot.
@@ -108,6 +132,8 @@ fn voice() -> MutexGuard<'static, Voice> {
             watcher: None,
             watch_serial: 0,
             clock: TurnClock::default(),
+            mark: None,
+            sending_mark: None,
             data_dir: None,
             app: None,
         })
@@ -218,6 +244,9 @@ impl VoicePort for AbsentPort {
         Err(VoiceUnavailable::Unsupported)
     }
     fn stop_speaking(&self) {}
+    /// No synthesiser, so nothing to pause.
+    fn pause_speaking(&self) {}
+    fn continue_speaking(&self) {}
     /// No recogniser, so nothing to finish.
     fn finish_recognition(&self, _finish: u64) {}
 }
@@ -251,9 +280,23 @@ fn deliver(event: TurnEvent) {
     tauri::async_runtime::spawn(async move {
         match event {
             TurnEvent::Level(level) => meter(level),
+            TurnEvent::SentenceSpoken => sentence_spoken(),
             event => transition(event),
         }
     });
+}
+
+/// The synthesiser read one utterance of the answer to its end: the
+/// question's mark counts it. Not a transition.
+#[cfg(any(target_os = "ios", target_os = "macos"))]
+fn sentence_spoken() {
+    let mut voice = voice();
+    let question = voice.turn.question();
+    if let Some((asked, mark)) = &mut voice.mark {
+        if Some(*asked) == question {
+            mark.spoken();
+        }
+    }
 }
 
 /// Record one level reading and stream the snapshot if it changed.
@@ -290,24 +333,65 @@ fn transition(event: TurnEvent) {
 fn transition_locked(mut voice: MutexGuard<'static, Voice>, event: TurnEvent) {
     let port = Arc::clone(&voice.port);
     let state_before = voice.turn.state().clone();
+    let question_before = voice.turn.question();
     let budget_before = voice.turn.budget();
     let before = VoiceEventKind::turn(&state_before);
     let logged = event.clone();
+    // When the event reached the turn, before the port carried anything out:
+    // where a pause's deciding words are stamped (97.3 #10).
+    let heard_ms = crate::voice_log::now_ms();
     let effects = voice.turn.drive(event, port.as_ref());
-    crate::voice_log::transition(before, &logged, voice.turn.state(), &effects);
-    let ended = {
+    let table = voice.turn.table_event().cloned();
+    crate::voice_log::transition(
+        before,
+        &logged,
+        table.as_ref(),
+        voice.turn.state(),
+        &effects,
+    );
+    let now_ms = crate::voice_log::now_ms();
+    let (ended, read) = {
         let Voice { turn, clock, .. } = &mut *voice;
-        clock.observe(
-            &state_before,
-            &logged,
-            turn.state(),
-            &effects,
-            crate::voice_log::now_ms(),
-        )
+        let ended = clock.observe(&state_before, &logged, turn.state(), &effects, now_ms);
+        let read = table.as_ref().map(|table| {
+            clock.observe_reading(
+                &state_before,
+                table,
+                turn.state(),
+                &effects,
+                heard_ms,
+                now_ms,
+            )
+        });
+        (ended, read)
     };
     if let Some(ended) = ended {
         crate::voice_log::turn_end(&ended);
     }
+    if let Some((pause, spoken)) = read {
+        if let Some(pause) = pause {
+            crate::voice_log::pause(&pause);
+        }
+        if let Some(spoken) = spoken {
+            crate::voice_log::spoken(&spoken);
+        }
+    }
+    // Where the person stopped: the mark of the question this move stopped
+    // the answer to, if it stopped one; a mark whose question is over
+    // otherwise is let go.
+    let reason = table
+        .as_ref()
+        .and_then(|table| HeardMark::reason(&state_before, table, &effects));
+    let stopped = match voice.mark.take() {
+        Some((asked, mark)) if reason.is_some() && Some(asked) == question_before => {
+            reason.and_then(|reason| mark.content(reason).map(|content| (mark, content)))
+        }
+        Some((asked, mark)) if Some(asked) == voice.turn.question() => {
+            voice.mark = Some((asked, mark));
+            None
+        }
+        _ => None,
+    };
     #[cfg(target_os = "ios")]
     crate::voice_notify::answer(&effects);
     tracing::debug!(state = ?voice.turn.state(), ?effects, "voice: transition");
@@ -317,16 +401,62 @@ fn transition_locked(mut voice: MutexGuard<'static, Voice>, event: TurnEvent) {
         Effect::SendText(text) => Some(text),
         _ => None,
     });
-    if let (Some(text), Some(question)) = (heard, voice.turn.question()) {
-        match voice.app.clone() {
-            Some(app) => {
-                drop(voice);
-                tauri::async_runtime::spawn(async move {
-                    crate::bots_ipc::send_spoken(&app, question, text).await;
-                });
+    let question = match (heard, voice.turn.question()) {
+        (Some(text), Some(question)) => Some((question, text)),
+        _ => None,
+    };
+    if stopped.is_none() && question.is_none() {
+        return;
+    }
+    let Some(app) = voice.app.clone() else {
+        tracing::warn!("voice: a question or a heard mark before boot; nothing to send it with");
+        return;
+    };
+    if let Some((mark, content)) = stopped {
+        let earlier = voice.sending_mark.take();
+        let app = app.clone();
+        voice.sending_mark = Some(tauri::async_runtime::spawn(async move {
+            after_mark(earlier).await;
+            let state = app.state::<AppState>();
+            match state
+                .accounts
+                .agent_heard_send(mark.account_id(), mark.room_id(), content)
+                .await
+            {
+                Ok(event) => {
+                    tracing::info!(%event, "voice: told the agent where the person stopped listening")
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "voice: could not tell the agent where the person stopped listening");
+                }
             }
-            None => tracing::warn!("voice: heard a question before boot; nothing to send it with"),
-        }
+        }));
+    }
+    if let Some((question, text)) = question {
+        // The mark first: a question — asked over the answer, or after a
+        // stop — is submitted only once the mark in flight is in the room
+        // (Q10), or once it has waited `HEARD_MARK_WAIT` for it.
+        let mark = voice.sending_mark.take();
+        drop(voice);
+        tauri::async_runtime::spawn(async move {
+            after_mark(mark).await;
+            crate::bots_ipc::send_spoken(&app, question, text).await;
+        });
+    }
+}
+
+/// Wait for the heard mark still being sent, if one is, at most
+/// [`HEARD_MARK_WAIT`]: past that what follows goes without it, and the
+/// mark goes on sending.
+async fn after_mark(sending: Option<tauri::async_runtime::JoinHandle<()>>) {
+    let Some(sending) = sending else {
+        return;
+    };
+    if tokio::time::timeout(HEARD_MARK_WAIT, sending)
+        .await
+        .is_err()
+    {
+        tracing::warn!("voice: the heard mark is still being sent; what follows goes without it");
     }
 }
 
@@ -341,9 +471,35 @@ pub fn question_now() -> Option<u64> {
 /// segmenter closes each one. The first takes the turn to `Speaking` with a
 /// `Speak`; every later one is an `Enqueue` behind it. Only the turn whose
 /// question it is moves.
-pub fn answer_sentence(question: u64, text: String) {
-    if voice().turn.owns_answer(question) {
-        transition(TurnEvent::AnswerSentence(text));
+pub fn answer_sentence(question: u64, sentence: Sentence) {
+    let mut voice = voice();
+    if voice.turn.owns_answer(question) {
+        hand(&mut voice, question, sentence.end);
+        transition_locked(voice, TurnEvent::AnswerSentence(sentence.text));
+    }
+}
+
+/// A sentence of the answer to `question`, ending at `end` in its text, is
+/// handed to the synthesiser: the question's mark keeps where it ends. Every
+/// sentence a turn that owns the answer is handed is spoken or queued — a
+/// segmenter's sentence is never blank.
+fn hand(voice: &mut Voice, question: u64, end: usize) {
+    if let Some((asked, mark)) = &mut voice.mark {
+        if *asked == question {
+            mark.handed(end);
+        }
+    }
+}
+
+/// The agent's message `anchor` in `room_id` on `account_id` answers
+/// `question` (AD-384): from here on, how far the person heard it is kept,
+/// while the question is the turn's.
+pub fn answer_anchored(question: u64, account_id: String, room_id: String, anchor: &str) {
+    let mut voice = voice();
+    if voice.turn.owns_answer(question) {
+        let mut mark = HeardMark::new(account_id, room_id);
+        mark.anchored(anchor);
+        voice.mark = Some((question, mark));
     }
 }
 
@@ -354,9 +510,14 @@ pub fn answer_sentence(question: u64, text: String) {
 /// when the last sentence closed it. The turn queues the rest, and from
 /// here the synthesiser's own end is the turn's end. Only the turn whose
 /// question it is moves; a typed conversation's close is nothing here.
-pub fn answer_complete(question: u64, rest: String) {
-    if voice().turn.owns_answer(question) {
-        transition(TurnEvent::AnswerDone(rest));
+pub fn answer_complete(question: u64, rest: Option<Sentence>) {
+    let mut voice = voice();
+    if voice.turn.owns_answer(question) {
+        let rest = rest.map_or_else(String::new, |rest| {
+            hand(&mut voice, question, rest.end);
+            rest.text
+        });
+        transition_locked(voice, TurnEvent::AnswerDone(rest));
     }
 }
 
@@ -464,7 +625,13 @@ pub fn spoken_turn(data_dir: &std::path::Path) -> Option<String> {
 /// budget if it has one.
 fn after_change(state: &mut Voice, restarts: bool) {
     push(state);
-    crate::voice_turn_models::ear().follow(state.turn.state());
+    // Over the answer the ear listens only on a capture that keeps keeper's
+    // voice out; the port is asked only where that matters.
+    let echo_free = matches!(
+        state.turn.state(),
+        TurnState::Speaking | TurnState::Paused { .. }
+    ) && state.port.half_duplex().is_none();
+    crate::voice_turn_models::ear().follow(state.turn.state(), echo_free);
     if !restarts {
         return;
     }
@@ -1147,6 +1314,8 @@ mod tests {
         fn stop_speaking(&self) {
             self.stopped_speaking.fetch_add(1, Ordering::SeqCst);
         }
+        fn pause_speaking(&self) {}
+        fn continue_speaking(&self) {}
         fn finish_recognition(&self, _finish: u64) {}
     }
 
@@ -1259,7 +1428,7 @@ mod tests {
             assert!(voice.turn.microphone_open(), "the phrase listens again");
         }
         // The stream's late close reaches an idle turn: nothing more is said.
-        answer_complete(question, segmenter.flush().unwrap_or_default());
+        answer_complete(question, segmenter.flush());
         assert_eq!(port.spoken.lock().expect("lock").len(), 2);
         assert_eq!(voice().turn.state(), &TurnState::Idle);
     }

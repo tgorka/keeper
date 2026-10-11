@@ -1059,6 +1059,45 @@ same line, `voice turn_end {…}`, in the app log while debug mode is on
 measure_a_device_run -- --ignored --nocapture` prints NFR-114's figures and refuses fewer than
 twenty turns ([agents.md](agents.md) § *Measured: a spoken turn's end*).
 
+### When you talk over an answer
+
+Speech over an answer pauses it; it never stops it first (AD-411; AD-208 amended by ruling R14).
+The turn moves to `Paused` with `PauseSpeaking` alone, and the port carries it out as
+`pauseSpeakingAtBoundary:` immediate — mid-word, the queue kept, the `speaking` flag up, so what
+you go on saying is still barge-in on the same recognition request. With the turn models, the
+same listener that ends a spoken question hears you over the answer — only on a capture with
+voice processing, since one without it hears keeper's own voice: its onset (three frames at
+≥ 0.5, the first of them `onset_ms`) pauses the answer before the recogniser has a word, and its
+speech end says how long you spoke. Without them the recogniser's first words pause it. What you
+said then decides (`keeper_core::voice::backchannel`), in the language recognition runs in:
+
+- **A backchannel resumes the answer** (`ContinueSpeaking`: a fresh recognition request, then
+  `continueSpeaking`). The whole utterance, folded like the stop phrase, is on the list —
+  English: mhm, uh-huh, yeah, yep, aha, okay, right; Polish: mhm, aha, tak, no, okej, jasne; any
+  other language: mhm, aha. With the turn models, wordless speech under 600 ms is one too, and
+  an onset that comes to no words in under 250 ms — or never comes to an end the model hears —
+  resumes as a false onset (echo or a click, counted apart). Words are the list's to judge, so a
+  short "no" in English is not a backchannel.
+- **The stop phrase ends the answer**, as it did while speaking.
+- **Anything else is your next question**: the answer stops (`StopSpeaking`), and the words are
+  sent — "no, wait" in English, "nie, czekaj" in Polish.
+
+Words are decided when the recogniser's final words come, or 600 ms after the voice activity
+model heard you stop, or 800 ms after the last thing heard (always, without the models). While
+paused the answer keeps arriving and queueing — a sentence that arrives when the synthesiser had
+nothing left to pause is paused again as it is queued, so it waits too — and the surface still
+draws it as speaking. The
+port reports no end of the answer while paused; one that ran out as the pause landed ends once it
+continues. Each utterance the synthesiser reads to its end is reported by its delegate
+(`voice_synthesizer.rs`), and when the answer was an agent's and you stopped it or asked over it,
+the agent is told where you stopped listening before your next question goes in
+([agents.md](agents.md) § *Talking to Nixi*). Every pause leaves one `pause` row in the ring and
+the line `voice pause {…}` in the app log — `decision` (`backchannel_duration`,
+`backchannel_words`, `stop`, `question`, `false_onset`), `onset_ms`, `pause_ms`, `speech_end_ms`,
+`final_words_ms`, `resume_ms` — and every answer read a `voice spoken {"spoken_ms":…}` line, which
+`measure_a_pause_run` turns into NFR-114's backchannel figures ([agents.md](agents.md) §
+*Measured: talking over an answer*).
+
 ### A turn that finishes without the screen
 
 Epics 62 to 65 designed the hands-free turn with the screen as a participant, and nobody
@@ -1169,8 +1208,9 @@ port ever emits (`turn.rs:109-112`), and `(Speaking, StopHeard)` is `Idle` with
 `[StopSpeaking, ReleaseMicrophone]` (`turn.rs:212-214`); because `StopHeard` counts as
 the turn ending (`mod.rs:476-483`), the wake phrase is re-armed on the way out
 (`:485-491`, `OpenMicrophone` pushed after the release — D-13's rule). Any other speech
-mid-answer keeps FR-403's shape, `Listening` with `[StopSpeaking, OpenMicrophone]`
-(`turn.rs:204-210`). The word is `WakePhrase::parse_stop` (`phrase.rs:112-114`): the wake
+mid-answer kept FR-403's shape, `Listening` with `[StopSpeaking, OpenMicrophone]`
+(`turn.rs:204-210`) — until story 97.3, which pauses first and lets the words decide (*When
+you talk over an answer*, above); the stop phrase is matched while `Paused` too. The word is `WakePhrase::parse_stop` (`phrase.rs:112-114`): the wake
 phrase's normalisation and word rules with a shorter letter minimum —
 `STOP_MIN_LETTERS = 3` (`:50`) instead of five — because the word people say to stop
 something must be allowed, and a false match costs the rest of an answer rather than an

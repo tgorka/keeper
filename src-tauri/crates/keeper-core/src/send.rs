@@ -592,7 +592,8 @@ mod tests {
         // `send_agent_event`, whose input is the closed `AgentOutbound` (a
         // scope, a request for a conversation, the device's surface result —
         // `agents::device` sends its `expired` answers through it too, so no
-        // other file holds a `send_raw` — and an approval decision). A second
+        // other file holds a `send_raw` — an approval decision, and a heard
+        // mark). A second
         // one would be an open door for any event type — a status, a claim, a
         // `consumed` — outside this airlock.
         let raw_calls = normalized.matches(".send_raw(").count();
@@ -602,7 +603,7 @@ mod tests {
              account.rs (`send_agent_event`, over the closed `AgentOutbound`); \
              found {raw_calls}."
         );
-        // And the set is exactly these four: a new variant is a new door, a
+        // And the set is exactly these five: a new variant is a new door, a
         // planning decision, not a refactor.
         let proxy = include_str!("agents/proxy.rs");
         let outbound = proxy
@@ -622,6 +623,7 @@ mod tests {
                 "ConversationRequest(ConversationRequestContent),",
                 "SurfaceResult(SurfaceResultContent),",
                 "Decision(ApprovalDecisionContent),",
+                "Heard(HeardContent),",
             ],
             "AD-13: `AgentOutbound` is the closed set of what the person's device sends into \
              an agent's room"

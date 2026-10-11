@@ -9814,3 +9814,73 @@ origin: epic 97, story 97.3 review (rung `agents-97-heard`, 2026-10-11; `review-
 location: `src-tauri/crates/keeper-core/src/agents/heard.rs` (`Answers::observe`)
 reason: `observe` starts a new stream only at a `user` or `peer` line or a requested approval; the `error: interrupted` line `recover` writes under a cut-off turn's question does not close it. In a proxy conversation the next turn always starts with the person's new `user` line, so the lost rounds never join a later answer; a turn kind that resumes without one (a workflow's `Resume`) is never a proxy conversation, so no heard mark reaches it. Revisit if a conversation turn ever resumes without a `user` or `peer` line: clear the open rounds on an `error` line whose parent is not a turn's closing line.
 status: open
+
+### DW-1210: A pause's decision window does not wait for speech the voice activity model has not heard end.
+
+origin: epic 97, story 97.3 (rung `agents-97-pause`, 2026-10-11; acceptance 2, 4)
+location: `src-tauri/crates/keeper-core/src/voice/turn.rs` (`silence_budget`, `PAUSE_DECISION_WAIT`), `src-tauri/crates/keeper-core/src/voice/backchannel.rs` (`settle`)
+reason: `Paused` waits 800 ms after the last thing it heard (an onset, a partial) unless the voice activity model heard the speech end. A click shorter than the detector's 256 ms minimum never ends (`EndOfTurn` reports no speech end for it), so the window must close without one — and so does a wordless sound longer than 0.8 s that is still going, which is then resumed and logged as `false_onset` although it was longer than 250 ms; a first partial slower than 0.8 s after the onset resumes the answer and pauses it again when it lands (two `pause` records). Revisit with the device run's `false_onset` count and pause records (97.3 #11): have the detector report a click's end, or hold the window while the model hears speech.
+status: open
+
+### DW-1211: Words that trail a pause resumed by its duration pause the answer again.
+
+origin: epic 97, story 97.3 (rung `agents-97-pause`, 2026-10-11; acceptance 2)
+location: `src-tauri/crates/keeper-core/src/voice/backchannel.rs` (`at_speech_end`)
+reason: The duration rule decides at the voice activity model's speech end, and only when the recogniser has no words yet; Apple's partials trail the audio by a few hundred milliseconds, so a short "no" (English) can be resumed by its duration and then arrive as words over the resumed answer, which pauses it again and stops it as a question — a brief resume over an objection, with two records. Revisit with the device run: if trailing words are common, wait a fixed beat for words after a short wordless speech end before resuming.
+status: open
+
+### DW-1212: A sentence finished at the moment of a stop can go uncounted.
+
+origin: epic 97, story 97.3 (rung `agents-97-pause`, 2026-10-11; acceptance 6)
+location: `src-tauri/crates/keeper/src/voice_ipc.rs` (`deliver`, `sentence_spoken`)
+reason: The synthesiser delegate's `SentenceSpoken` reaches the question's `HeardMark` through a task spawned per port event, like every port event (`deliver`), and nothing orders it against the stop phrase's transcript arriving within the same milliseconds. When the stop wins, the mark says one sentence less than was heard — the safe side (Q3), never more. Revisit if the device run shows marks short by one.
+status: open
+
+### DW-1213: `pause_ms` and `resume_ms` are when the port's call returned, not when the audio paused.
+
+origin: epic 97, story 97.3 (rung `agents-97-pause`, 2026-10-11; acceptance 10)
+location: `src-tauri/crates/keeper-core/src/voice/timings.rs` (`TurnClock::observe_reading`), `src-tauri/crates/keeper/src/voice_macos.rs`/`voice_ios.rs` (`pause_speaking`, `continue_speaking`)
+reason: Both ports answer `PauseSpeaking`/`ContinueSpeaking` once `pauseSpeakingAtBoundary:`/`continueSpeaking` returned on the worker, and the shell stamps them after the move (`final_words_ms` is read before it, when the deciding words reached the turn — R326(01)); the output's own latency to silence (and the delegate's `didPause`/`didContinue`) is not read. `onset_ms` is the tap buffer's time (DW-496's half). NFR-114's 150 ms is therefore measured to the call, not to the speaker. Revisit if the device run's figures sit near the bound: stamp from `didPauseSpeechUtterance:`.
+status: open
+
+### DW-1214: Over the answer the listener still asks the end-of-turn model after every speech end.
+
+origin: epic 97, story 97.3 (rung `agents-97-pause`, 2026-10-11)
+location: `src-tauri/crates/keeper-core/src/voice/end_of_turn.rs` (`Listener::frame_heard`, `Ear::admit`)
+reason: The `Listener` does not know what the ear listens for, so after a speech end over the answer it computes Smart Turn's features and scores them (36–49 ms on the dev host) like at the end of a question; `Ear::admit` then discards the verdict. Revisit if the phone's CPU during speech shows it: tell the listener its mode with the generation.
+status: open
+
+### DW-1215: A heard mark that fails to send leaves the next question uncut.
+
+origin: epic 97, story 97.3 (rung `agents-97-pause`, 2026-10-11; acceptance 6, Q10)
+location: `src-tauri/crates/keeper/src/voice_ipc.rs` (`transition_locked`)
+reason: The next spoken question waits for the mark's send (`Voice.sending_mark`) to return, at most `agents::spoken::HEARD_MARK_WAIT` (10 s, R326(03, 04)), then is sent whatever it returned; a refusal or a network failure is logged and not retried, and a mark still sending past the wait arrives after the question, so the agent's next turn reads the answer whole. Revisit if the device run or the app log shows refusals: queue the mark like the question, or say so beside the turn.
+status: open
+
+### DW-1216: The shell's heard-mark arms are untested and unmutated on Linux.
+
+origin: epic 97, story 97.3 review (rung `agents-97-pause`, 2026-10-11; `review-97pause-1.md` DW-D, R326)
+location: `src-tauri/crates/keeper/src/voice_ipc.rs` (`transition_locked`, `after_mark`, `hand`, `sentence_spoken`)
+reason: `transition_locked`'s `stopped` match (kept, dropped, sent), the wait of the next question and of a later mark on `Voice.sending_mark`, `hand` before the transition and `sentence_spoken`'s question check are in the shell crate, which does not compile on Linux; they are written by inspection and the rung's mutants cover core files only. Their proof is the device run's "stop" and "no, wait" steps. Revisit when the shell gains a test seam for `agent_heard_send` (a hook that returns the content instead of sending): pin the three arms and the wait with `CountingPort`.
+status: open
+
+### DW-1217: With the turn models a short word is decided by its duration before the recogniser spells it.
+
+origin: epic 97, story 97.3 review (rung `agents-97-pause`, 2026-10-11; `review-97pause-1.md` DW-E, R326)
+location: `src-tauri/crates/keeper-core/src/voice/backchannel.rs` (`at_speech_end`)
+reason: Apple's first partial trails the audio, so a 300 ms English "no" can end (`SpeechEnded`) before any `SpeechDetected("no")`; `at_speech_end` then resumes it as `backchannel_duration`, and the words pause the resumed answer again (DW-1211's symptom). The per-language list's "no" therefore holds for words heard before the speech end, or without the models. The device run's "no" (Polish) and "no, wait" (English) steps are the proof. Revisit if they resume an English "no".
+status: open
+
+### DW-1218: A sentence queued on an idle synthesiser while paused may sound for a few milliseconds.
+
+origin: epic 97, story 97.3 review (rung `agents-97-pause`, 2026-10-11; `review-97pause-1.md` R97P1-02, R326)
+location: `src-tauri/crates/keeper/src/voice_macos.rs`, `src-tauri/crates/keeper/src/voice_ios.rs` (`Worker::enqueue`)
+reason: When the queue had drained before the pause, `pauseSpeakingAtBoundary:` found nothing to pause; the next sentence is queued with `speakUtterance:` and paused again at once with `AVSpeechBoundaryImmediate`, so its first few milliseconds may play over the person. Written by inspection; not observed. Revisit if the device run hears it: hold the sentence in the port until `continue_speaking`.
+status: open
+
+### DW-1219: Two `voice_ipc` shell tests race for the process-wide turn.
+
+origin: epic 97, story 97.3 fix round 1 (rung `agents-97-pause`, 2026-10-11; `mac-97pause-fix1.log`)
+location: `src-tauri/crates/keeper/src/voice_ipc.rs` (`tests::the_button_the_tray_and_the_hotkey_each_stop_the_voice_once`, `tests::three_chunks_become_two_utterances_and_a_stop_leaves_the_second_unspoken`)
+reason: Both tests replace the one `voice()` state's turn and port and drive it, each taking the lock per call, and the test harness runs them on parallel threads; when the other test swaps the port between `speaking_on` and the press, the counting port sees no stop ("the tray item: how often the synthesiser is told to stop", left 0). Seen on hesperia in `mac-97pause-fix1.log` and before this rung in `mac-96screen-1.log` and `mac92r4-tests.log`; the pair passes single-threaded and three whole-lib reruns passed (`mac-97pause-fix1-rerun.log`). Revisit: hold one test-wide guard (a `static` mutex both tests take first) so the two run in turn.
+status: open

@@ -3051,8 +3051,9 @@ as chosen ("not listed yet") and is looked for again, never rewritten. What happ
   no copy of it may be running right now.") or nothing from the turn for two minutes once it
   answered ("Nixi stopped answering.") ends the turn; a question the send queue gave up on ends
   it at once ("Your question did not reach Nixi.").
-- **Stopping.** The stop phrase stops the speech on this device; nothing tells the agent, which
-  finishes its answer in the room (ruling R44; a turn-cancel event is DW-419). Every question
+- **Stopping.** The stop phrase stops the speech on this device; the agent is told where you
+  stopped listening, and its turn is not cancelled: it finishes its answer in the room (ruling
+  R44; a turn-cancel event is DW-419). Every question
   the voice turn sends is numbered before anything is sent: stopping it, or asking again, makes
   every later report of the earlier one — its send, its first words, its sentences, its end —
   move nothing, whichever finishes first; the earlier one's send and watch are stopped.
@@ -3064,8 +3065,34 @@ as chosen ("not listed yet") and is looked for again, never rewritten. What happ
   host counts where its `sentence`th sentence ends itself, with the speech segmenter's own cut,
   and logs one `heard` line carrying the event, so a redelivery is not logged twice. Nothing
   else: the answer is not cancelled and no turn runs (R44, DW-419); the next turn reads the answer
-  cut there (*Replay*, above). Anything else is ignored with a note in the host's log. This build's
-  voice does not send the event yet: the speaking device's half comes with the pause-first turn.
+  cut there (*Replay*, above). Anything else is ignored with a note in the host's log.
+- **Where you stopped listening (the speaking device's half).** The device keeps a mark per
+  question, beside the answer's follow and not inside it (so asking again loses nothing): the
+  answer's anchor, where each sentence handed to the synthesiser ends in the answer's text (in
+  Unicode scalar values, the segmenter's own cut), and how many the synthesiser read to their
+  end, as its delegate reports them. A sentence it was cut off in does not count: an agent told
+  you heard less repeats a little, one told you heard more skips what you never heard. When the
+  answer is stopped — the stop phrase, the mic button, the hotkey, the tray, or long speech with
+  no words in it (reason `stop`), or a question asked over it (`barge_in`) — the device sends
+  `dev.keeper.agent.heard` into the room first, and your next question, asked over the answer or
+  after the stop, goes in only once the mark's event id came back, so the agent's next turn
+  already reads the answer cut where you stopped. A mark that has not come back in ten seconds
+  is not waited for: the question goes, and the mark cuts the turns after it. An answer heard to
+  its end, or one a failure ended, is marked nowhere.
+- **When you talk over an answer.** The answer pauses, mid-word, the moment you speak — at the
+  voice activity model's onset (three frames, 96 ms) with the turn models, at the recogniser's
+  first words without them — and what you said decides: "mhm", "yeah", "okay" (English) or
+  "mhm", "tak", "no", "jasne" (Polish), the whole utterance and nothing else, resume it; with the
+  turn models, wordless speech under 600 ms resumes it too, and an onset that comes to no words
+  under 250 ms resumes it as a false onset. The stop phrase ends the answer. Anything else stops
+  it and is your next question — "no, wait" in English is a question. The list is the one for
+  the language recognition runs in; any other language has "mhm" and "aha". Words are decided
+  once the recogniser's last of them came or 600 ms after the voice activity model heard you
+  stop (800 ms after the last thing heard otherwise). On the Mac this is the same as on the
+  phone ([ios.md](ios.md) § *When you talk over an answer*); a capture without voice processing
+  (an aggregate input, AD-213) hears keeper's own voice, so there the voice activity model does
+  not listen while keeper speaks and your words still cannot pause the answer — the button, the
+  hotkey and the tray stop it.
 - **The wake phrase is unchanged.** Naming the proxy "Nixi" renames nothing; the wake phrase is
   the one you set.
 - **When your question ends.** Without the account's turn models it ends 1.8 s after the
@@ -3099,6 +3126,27 @@ word.
 | kalypso | — | — | owed | — | — | — | — | — | — |
 
 Both rows are owed: story 97.2 is done only when they are filled from real runs (97.2 #8).
+
+### Measured: talking over an answer
+
+NFR-114's backchannel half, per device, with the turn models present, over at least twenty
+pauses — "mhm" and "yeah" (English), "no" and "tak" (Polish) during long answers, "stop" and
+"no, wait" mid-answer, and ten minutes of an answer read with nobody speaking — from the app log
+of the run (debug mode on; `KEEPER_VOICE_LOG=<keeper.log> cargo test -p keeper-core --test
+voice_timings measure_a_pause_run -- --ignored --nocapture`): the p95 of `pause_ms − onset_ms`
+(≤ 150 ms), of `resume_ms − speech_end_ms` over pauses resumed by their duration and of
+`resume_ms − final_words_ms` over pauses resumed by their words (each ≤ 300 ms; `final_words_ms`
+is when the deciding words reached the turn, `resume_ms` when the synthesiser had continued),
+and the false
+onsets per ten minutes of reading aloud — more than one is reported to the coordinator before
+97.3 closes.
+
+| device | OS | build | date | n | pause p95 | duration resume p95 | words resume p95 | false onsets / 10 min |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| hesperia | — | — | owed | — | — | — | — | — |
+| kalypso | — | — | owed | — | — | — | — | — |
+
+Both rows are owed: story 97.3 is done only when they are filled from real runs (97.3 #11).
 
 ## Handing work on
 

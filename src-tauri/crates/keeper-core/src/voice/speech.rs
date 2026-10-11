@@ -166,12 +166,28 @@ const SENTENCE_MARKS: [char; 3] = ['.', '!', '?'];
 /// price, and no rule short of a dictionary tells `e.g.` from `etc.` at
 /// the end of a sentence.
 ///
+/// Each sentence comes with where it ends in the whole text fed since the
+/// segmenter started ([`Sentence::end`]), counted in Unicode scalar values:
+/// just past its last character — its marks, never the whitespace after
+/// them. A device counts how far the person heard an answer with it
+/// (AD-411).
+///
 /// A mark at the very end of the buffered text closes nothing yet: the next
 /// chunk may begin with the digit that makes it a number. Only `flush`
 /// treats the end of the text as the end of a word.
 #[derive(Debug, Default)]
 pub struct Segmenter {
     tail: String,
+    /// Unicode scalar values fed before `tail`.
+    before: usize,
+}
+
+/// One sentence a [`Segmenter`] handed out: its words, trimmed, and where
+/// it ends in the text fed, in Unicode scalar values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sentence {
+    pub text: String,
+    pub end: usize,
 }
 
 impl Segmenter {
@@ -180,27 +196,36 @@ impl Segmenter {
         Self::default()
     }
 
-    /// Feed `chunk` and take every sentence it closed, trimmed, in order.
-    /// Blank sentences — a run of line breaks — are not sentences.
-    pub fn push(&mut self, chunk: &str) -> Vec<String> {
+    /// Feed `chunk` and take every sentence it closed, in order. Blank
+    /// sentences — a run of line breaks — are not sentences.
+    pub fn push(&mut self, chunk: &str) -> Vec<Sentence> {
         self.tail.push_str(chunk);
         let mut sentences = Vec::new();
         while let Some(end) = boundary(&self.tail) {
             let rest = self.tail.split_off(end);
-            let sentence = std::mem::replace(&mut self.tail, rest);
-            let sentence = sentence.trim();
-            if !sentence.is_empty() {
-                sentences.push(sentence.to_owned());
-            }
+            let piece = std::mem::replace(&mut self.tail, rest);
+            sentences.extend(self.take(&piece));
         }
         sentences
     }
 
-    /// The stream is over: the tail, trimmed, when there is one.
-    pub fn flush(&mut self) -> Option<String> {
-        let tail = std::mem::take(&mut self.tail);
-        let tail = tail.trim();
-        (!tail.is_empty()).then(|| tail.to_owned())
+    /// The stream is over: the tail, when there is one.
+    pub fn flush(&mut self) -> Option<Sentence> {
+        let piece = std::mem::take(&mut self.tail);
+        self.take(&piece)
+    }
+
+    /// `piece`, the next stretch of the text fed, as a sentence unless it is
+    /// blank; counted either way.
+    fn take(&mut self, piece: &str) -> Option<Sentence> {
+        let said = piece.trim_end();
+        let end = self.before + said.chars().count();
+        self.before += piece.chars().count();
+        let text = said.trim_start();
+        (!text.is_empty()).then(|| Sentence {
+            text: text.to_owned(),
+            end,
+        })
     }
 }
 
@@ -214,7 +239,8 @@ impl Segmenter {
 /// the cut again from its beginning, and the sentences already handed out
 /// are skipped by position: what was said cannot be unsaid, and saying it
 /// twice is worse than a rewritten clause going unheard. A message other
-/// than the one followed starts over.
+/// than the one followed starts over. Every sentence's end is in the
+/// coordinates of the text the message reads as when it is handed out.
 #[derive(Debug, Default)]
 pub struct AnswerFollower {
     /// The message followed.
@@ -235,8 +261,9 @@ impl AnswerFollower {
     }
 
     /// `text` is the whole text `anchor` reads as now: every sentence it
-    /// closed that was not handed out before, in order.
-    pub fn edit(&mut self, anchor: &str, text: &str) -> Vec<String> {
+    /// closed that was not handed out before, in order, each with its end
+    /// in `text`.
+    pub fn edit(&mut self, anchor: &str, text: &str) -> Vec<Sentence> {
         if self.anchor.as_deref() != Some(anchor) {
             *self = Self {
                 anchor: Some(anchor.to_owned()),
@@ -267,7 +294,7 @@ impl AnswerFollower {
 
     /// The answer is complete: the words after its last closed sentence,
     /// unless they stand where a sentence was already handed out.
-    pub fn finish(&mut self) -> Option<String> {
+    pub fn finish(&mut self) -> Option<Sentence> {
         let tail = self.segmenter.flush()?;
         self.fed.clear();
         let position = self.closed + 1;
@@ -310,31 +337,15 @@ fn boundary(text: &str) -> Option<usize> {
 }
 
 /// Where each sentence of the whole of `text` ends, in Unicode scalar values
-/// from its start: the cut a [`Segmenter`] fed `text` in any chunks and then
-/// flushed makes, one end per sentence it hands out, each just past the
-/// sentence's last character (its marks, never the whitespace after them).
-/// A host counts the sentences a device says it finished with this, over
-/// the answer the room shows (AD-411).
+/// from its start: the ends a [`Segmenter`] fed `text` and then flushed
+/// reports, one per sentence it hands out. A host counts the sentences a
+/// device says it finished with this, over the answer the room shows
+/// (AD-411).
 pub fn sentence_ends(text: &str) -> Vec<usize> {
-    let mut ends = Vec::new();
-    let mut start = 0;
-    let mut before = 0;
-    loop {
-        let rest = &text[start..];
-        let (piece, closed) = match boundary(rest) {
-            Some(end) => (&rest[..end], true),
-            None => (rest, false),
-        };
-        let said = piece.trim_end();
-        if !said.is_empty() {
-            ends.push(before + said.chars().count());
-        }
-        if !closed {
-            return ends;
-        }
-        before += piece.chars().count();
-        start += piece.len();
-    }
+    let mut segmenter = Segmenter::new();
+    let mut sentences = segmenter.push(text);
+    sentences.extend(segmenter.flush());
+    sentences.into_iter().map(|sentence| sentence.end).collect()
 }
 
 /// The English name of a language subtag, for the languages Apple's
@@ -400,36 +411,6 @@ mod tests {
         match result {
             Err(VoiceUnavailable::NoVoice { language }) => language,
             other => panic!("expected a NoVoice refusal, got {other:?}"),
-        }
-    }
-
-    /// AD-411: the ends a host counts are the segmenter's own sentences,
-    /// in Unicode scalar values, each past its marks and before the space or
-    /// line break after them; a blank line is no sentence, a dot inside a
-    /// number closes nothing, and the unclosed tail is the last. Fed in any
-    /// chunks, the segmenter hands out exactly as many sentences.
-    #[test]
-    fn sentence_ends_count_what_the_segmenter_hands_out() {
-        for (text, ends) in [
-            ("One. Two three!\nFour", vec![4, 15, 20]),
-            ("Zażółć. Gęślą.", vec![7, 14]),
-            ("It costs 3.5 zł.\n\n\nNext 😀 one?  Yes", vec![16, 30, 35]),
-            ("A heading\nThen text.", vec![9, 20]),
-            ("  \n", vec![]),
-            ("", vec![]),
-        ] {
-            assert_eq!(sentence_ends(text), ends, "{text:?}");
-            for split in 0..=text.chars().count() {
-                let at = text
-                    .char_indices()
-                    .nth(split)
-                    .map_or(text.len(), |(i, _)| i);
-                let mut segmenter = Segmenter::new();
-                let mut said = segmenter.push(&text[..at]);
-                said.extend(segmenter.push(&text[at..]));
-                said.extend(segmenter.flush());
-                assert_eq!(said.len(), ends.len(), "{text:?} split at {split}");
-            }
         }
     }
 
@@ -545,10 +526,14 @@ mod tests {
         let mut segmenter = Segmenter::new();
         let mut sentences = Vec::new();
         for chunk in chunks {
-            sentences.extend(segmenter.push(chunk));
+            sentences.extend(texts(segmenter.push(chunk)));
         }
-        let rest = segmenter.flush();
+        let rest = segmenter.flush().map(|s| s.text);
         (sentences, rest)
+    }
+
+    fn texts(sentences: Vec<Sentence>) -> Vec<String> {
+        sentences.into_iter().map(|s| s.text).collect()
     }
 
     /// A sentence split across chunks is yielded once, whole, when its
@@ -556,17 +541,17 @@ mod tests {
     #[test]
     fn a_sentence_split_across_chunks_is_yielded_once_it_closes() {
         let mut segmenter = Segmenter::new();
-        assert_eq!(segmenter.push("Tomorrow is"), Vec::<String>::new());
-        assert_eq!(segmenter.push(" sunny."), Vec::<String>::new());
+        assert_eq!(texts(segmenter.push("Tomorrow is")), Vec::<String>::new());
+        assert_eq!(texts(segmenter.push(" sunny.")), Vec::<String>::new());
         assert_eq!(
-            segmenter.push(" Expect 24 degrees. And"),
+            texts(segmenter.push(" Expect 24 degrees. And")),
             vec![
                 "Tomorrow is sunny.".to_owned(),
                 "Expect 24 degrees.".to_owned()
             ]
         );
-        assert_eq!(segmenter.flush(), Some("And".to_owned()));
-        assert_eq!(segmenter.flush(), None);
+        assert_eq!(segmenter.flush().map(|s| s.text), Some("And".to_owned()));
+        assert_eq!(segmenter.flush().map(|s| s.text), None);
     }
 
     /// A dot inside a number closes nothing — including when the chunk ends
@@ -616,22 +601,25 @@ mod tests {
     #[test]
     fn an_answer_is_spoken_from_its_edits_once() {
         let mut follower = AnswerFollower::new();
-        assert_eq!(follower.edit("$a", "The sky"), Vec::<String>::new());
+        assert_eq!(texts(follower.edit("$a", "The sky")), Vec::<String>::new());
         assert_eq!(
-            follower.edit("$a", "The sky is blue. The"),
+            texts(follower.edit("$a", "The sky is blue. The")),
             list(&["The sky is blue."])
         );
         assert_eq!(
-            follower.edit("$a", "The sky is blue. The grass is green."),
+            texts(follower.edit("$a", "The sky is blue. The grass is green.")),
             Vec::<String>::new()
         );
         // The final replacement repeats the whole text: nothing again.
         assert_eq!(
-            follower.edit("$a", "The sky is blue. The grass is green."),
+            texts(follower.edit("$a", "The sky is blue. The grass is green.")),
             Vec::<String>::new()
         );
-        assert_eq!(follower.finish(), Some("The grass is green.".to_owned()));
-        assert_eq!(follower.finish(), None);
+        assert_eq!(
+            follower.finish().map(|s| s.text),
+            Some("The grass is green.".to_owned())
+        );
+        assert_eq!(follower.finish().map(|s| s.text), None);
     }
 
     /// A replacement that rewrites earlier text — shorter, or different —
@@ -641,36 +629,45 @@ mod tests {
     fn a_rewrite_resumes_at_the_first_unspoken_sentence() {
         let mut follower = AnswerFollower::new();
         assert_eq!(
-            follower.edit("$a", "One. Two. Thr"),
+            texts(follower.edit("$a", "One. Two. Thr")),
             list(&["One.", "Two."])
         );
         // Shorter: the agent took text back.
-        assert_eq!(follower.edit("$a", "One. Tw"), Vec::<String>::new());
+        assert_eq!(texts(follower.edit("$a", "One. Tw")), Vec::<String>::new());
         assert_eq!(
-            follower.edit("$a", "One. Two. Three. Four"),
+            texts(follower.edit("$a", "One. Two. Three. Four")),
             list(&["Three."])
         );
         // Different: the first sentence rewritten, already said, not again.
         assert_eq!(
-            follower.edit("$a", "Uno. Two. Three. Four. Five"),
+            texts(follower.edit("$a", "Uno. Two. Three. Four. Five")),
             list(&["Four."])
         );
-        assert_eq!(follower.finish(), Some("Five".to_owned()));
+        assert_eq!(follower.finish().map(|s| s.text), Some("Five".to_owned()));
 
         // A tail standing where a sentence was said is not said again.
         let mut follower = AnswerFollower::new();
-        assert_eq!(follower.edit("$a", "Yes. No. "), list(&["Yes.", "No."]));
-        assert_eq!(follower.edit("$a", "Yes. Maybe"), Vec::<String>::new());
-        assert_eq!(follower.finish(), None);
+        assert_eq!(
+            texts(follower.edit("$a", "Yes. No. ")),
+            list(&["Yes.", "No."])
+        );
+        assert_eq!(
+            texts(follower.edit("$a", "Yes. Maybe")),
+            Vec::<String>::new()
+        );
+        assert_eq!(follower.finish().map(|s| s.text), None);
     }
 
     /// Another message is another answer: it starts from nothing.
     #[test]
     fn a_new_anchor_starts_over() {
         let mut follower = AnswerFollower::new();
-        assert_eq!(follower.edit("$a", "Hello. Wor"), list(&["Hello."]));
-        assert_eq!(follower.edit("$b", "Hello. Again."), list(&["Hello."]));
-        assert_eq!(follower.finish(), Some("Again.".to_owned()));
+        assert_eq!(texts(follower.edit("$a", "Hello. Wor")), list(&["Hello."]));
+        assert_eq!(
+            texts(follower.edit("$b", "Hello. Again.")),
+            list(&["Hello."])
+        );
+        assert_eq!(follower.finish().map(|s| s.text), Some("Again.".to_owned()));
     }
 
     /// A detected language changes the voice mid-answer only on a sentence
