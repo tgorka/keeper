@@ -18,8 +18,7 @@ use std::time::Duration;
 use keeper_agent::agent::{
     arm_agent, reply_of, trail_of, AgentDeps, AgentProfiles, Arrived, ConversationPort, HeldFocus,
     Outcome, Probe, RoomFuture, ServedSession, SessionRef, Trail, TurnEnding, BRIEF_REFUSED,
-    BRIEF_UNSENT, BUDGET_SPENT, JOIN_POLL, LOCAL_ONLY_REFUSAL, NARROWER_THAN_ROOM,
-    NOT_THIS_DELEGATION, ROUNDS_SPENT,
+    BRIEF_UNSENT, BUDGET_SPENT, JOIN_POLL, LOCAL_ONLY_REFUSAL, NOT_THIS_DELEGATION, ROUNDS_SPENT,
 };
 use keeper_agent::claims::{blocked_status, conflict_line, conflict_of, Lease};
 use keeper_agent::delegate::{
@@ -42,13 +41,15 @@ use keeper_core::agents::events::{
     RunState, StatusContent, FINAL_CUT_BYTES, SCOPE, SESSION_ROOM_TYPE, STATUS,
 };
 use keeper_core::agents::focus::FOCUS_TTL;
+use keeper_core::agents::heard::{ALREADY_MARKED, NOT_AN_ANSWER, STOPPED_LISTENING};
 use keeper_core::agents::label::{Integrity, Label, Readers};
 use keeper_core::agents::log::reader::{hydrate_blob, read_session};
 use keeper_core::agents::log::replay::replay;
 use keeper_core::agents::log::writer::{rotate_at, ChunkWriter};
 use keeper_core::agents::log::{
-    AssistantBody, ClaimAction, ClaimBody, HostSlug, LineBody, LineKind, LogLine, ToolCallBody,
-    ToolOutcomeWord, ToolResultBody, UserBody, LINE_VERSION,
+    AssistantBody, ClaimAction, ClaimBody, HeardBody, HeardReason, HostSlug, LineBody, LineKind,
+    LogLine, ToolCallBody, ToolOutcomeWord, ToolResultBody, UserBody, LINE_VERSION,
+    NARROWER_THAN_ROOM,
 };
 use keeper_core::agents::log::{DelegateBody, DelegateReply, DelegateState, PeerBody};
 use keeper_core::agents::session::{compose_session_agent_toml, SessionAgent, SessionKind};
@@ -2094,6 +2095,148 @@ async fn the_context_equals_a_fresh_replay() {
         messages_text(&fresh.messages)
     );
     assert!(served.context.messages.len() >= 10);
+}
+
+/// 97.3 #7 and #8 (Q9, Q10): a two-round answer, "One. Two." with a read and
+/// then "Three. Four.", is spoken; the person stops it after its third
+/// sentence. Their mark is logged once — under the answer, with its event,
+/// at the offset counted here (17), not the device's (12) — and nothing
+/// else happens; a redelivery is a duplicate, a second mark, another
+/// reader's, an unsigned device's and one naming the question are not
+/// logged. The log keeps the whole answer; the context in memory, a fresh
+/// replay and a restarted host's all read it cut, and the next turn's model
+/// is sent the cut.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_heard_mark_is_logged_once_and_cuts_the_next_turns_answer_in_both_replays() {
+    let said_then_read = vec![
+        json!({"model":"model","choices":[{"index":0,"delta":{"content":"One. Two."},"finish_reason":null}]}),
+        calls(&[(
+            "r1",
+            "drive_read",
+            json!({"profile":"tgdrive","path":"notes/hello.md"}),
+        )])
+        .remove(0),
+    ];
+    let mut world = world(
+        ProviderKind::OpenAi,
+        &["drive_read"],
+        vec![said_then_read, prose("Three. Four."), prose("Next.")],
+    );
+    let mut served = world.open(SESSION);
+    report(world.ask(&mut served, "read it to me").await);
+    assert_eq!(final_edit(&world.room), "One. Two.\n\nThree. Four.");
+    let at = world
+        .room
+        .sent()
+        .iter()
+        .position(|(_, content)| content["dev.keeper.agent.turn"].is_object())
+        .expect("the anchor");
+    let anchor = format!("$sent{}:example.org", at + 1);
+    let question = world.lines(SESSION)[..]
+        .iter()
+        .find_map(|line| match &line.body {
+            LineBody::User(_) => line.matrix_event.clone(),
+            _ => None,
+        })
+        .expect("the question's event");
+    let mark = |anchor: &str| json!({"v": 1, "anchor": anchor, "heard_until": 12, "sentence": 3, "reason": "stop"});
+    let signed = Arrival::Heard { owner_signed: true };
+
+    for (arrived, note) in [
+        (world.event(MARTA, signed, mark(&anchor)), NOT_THE_PERSON),
+        (
+            world.event(
+                TGORKA,
+                Arrival::Heard {
+                    owner_signed: false,
+                },
+                mark(&anchor),
+            ),
+            UNSIGNED_DEVICE,
+        ),
+        (
+            world.event(TGORKA, signed, mark(question.as_str())),
+            NOT_AN_ANSWER,
+        ),
+    ] {
+        assert!(
+            matches!(world.serve(&mut served, arrived).await, Outcome::Ignored(said) if said == note),
+            "{note}"
+        );
+    }
+    let heard = world.event(TGORKA, signed, mark(&anchor));
+    assert!(matches!(
+        world.serve(&mut served, heard.clone()).await,
+        Outcome::Heard { heard_until: 17 }
+    ));
+    assert!(matches!(
+        world.serve(&mut served, heard.clone()).await,
+        Outcome::Duplicate
+    ));
+    let again = world.event(TGORKA, signed, mark(&anchor));
+    assert!(matches!(
+        world.serve(&mut served, again).await,
+        Outcome::Ignored(ALREADY_MARKED)
+    ));
+
+    let lines = world.lines(SESSION);
+    let closing = lines
+        .iter()
+        .find(|line| {
+            matches!(&line.body, LineBody::Assistant(body) if body.anchor_event.as_deref() == Some(anchor.as_str()))
+        })
+        .expect("the answer's closing line");
+    let marks = kinds(&lines, LineKind::Heard);
+    assert_eq!(marks.len(), 1, "one mark, logged once");
+    assert_eq!(marks[0].matrix_event.as_ref(), Some(&heard.event_id));
+    assert_eq!(marks[0].parent, Some(closing.id));
+    assert_eq!(
+        marks[0].body,
+        LineBody::Heard(HeardBody {
+            assistant: closing.id,
+            heard_until: 17,
+            sentence: 3,
+            reason: HeardReason::Stop,
+        })
+    );
+    assert!(
+        matches!(&closing.body, LineBody::Assistant(body) if body.text == "Three. Four."),
+        "the log keeps the whole answer"
+    );
+    assert_eq!(world.stub.requests().len(), 2, "no turn ran for a mark");
+
+    let cut = format!("Three.\n\n{STOPPED_LISTENING}");
+    let last_said = |messages: &[keeper_core::bots::chat::ChatMessage]| {
+        messages
+            .iter()
+            .rev()
+            .find(|m| m.role == keeper_core::bots::chat::Role::Assistant)
+            .map(keeper_core::agents::heard::message_text)
+    };
+    assert_eq!(last_said(&served.context.messages), Some(cut.clone()));
+    let dir = world.dir(SESSION);
+    let fresh = replay(&read_session(&dir), &|sha| hydrate_blob(&dir, sha)).expect("replay");
+    assert_eq!(
+        messages_text(&served.context.messages),
+        messages_text(&fresh.messages)
+    );
+    drop(served);
+    let mut restarted = world.open(SESSION);
+    assert_eq!(
+        messages_text(&restarted.context.messages),
+        messages_text(&fresh.messages)
+    );
+
+    report(world.ask(&mut restarted, "go on").await);
+    let sent = world
+        .stub
+        .requests()
+        .pop()
+        .expect("the next turn's request");
+    let sent = sent["messages"].to_string();
+    assert!(sent.contains("One. Two."), "{sent}");
+    assert!(sent.contains(STOPPED_LISTENING), "{sent}");
+    assert!(!sent.contains("Four."), "{sent}");
 }
 
 /// NFR-116: once a session is served, a turn opens no file under `log/`;

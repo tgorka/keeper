@@ -43,8 +43,8 @@ use keeper_core::agents::agentd::{AgentdConfig, DrivePin, TrustEntry};
 use keeper_core::agents::drive::{self, DriveDecl};
 use keeper_core::agents::events::{
     control_levels, ControlLevels, ANSWER, APPROVAL_DECISION, ASK, CONTROL_ROOM_TYPE,
-    CONVERSATION_REQUEST, DELEGATE, DOORBELL, PRESENCE, SCOPE, SESSION_ROOM_TYPE, SURFACE_REQUEST,
-    SURFACE_RESULT, TURN,
+    CONVERSATION_REQUEST, DELEGATE, DOORBELL, HEARD, PRESENCE, SCOPE, SESSION_ROOM_TYPE,
+    SURFACE_REQUEST, SURFACE_RESULT, TURN,
 };
 use keeper_core::agents::home::AgentKind;
 use keeper_core::agents::index::Index;
@@ -2749,6 +2749,12 @@ pub fn arrival_of(
         Arrival::ConversationRequest {
             owner_signed: owner_signed(encryption),
         }
+    } else if event_type == HEARD {
+        // Where the person stopped a spoken answer: theirs to send, as a
+        // scope is (R47), and queued behind the turn under way (AD-411).
+        Arrival::Heard {
+            owner_signed: owner_signed(encryption),
+        }
     } else if event_type.starts_with("dev.keeper.agent.") {
         Arrival::AgentEvent
     } else {
@@ -3017,12 +3023,13 @@ mod tests {
         }
     }
 
-    /// R47: a scope or a request for a conversation counts from a device its
-    /// owner's identity signed, verified here or not; from an unsigned,
-    /// unknown or mismatched device, or in clear, the person's own scope in
-    /// their own DM is ignored.
+    /// R47 (and Q10 for a heard mark): a scope, a request for a conversation
+    /// or where a spoken answer stopped counts from a device its owner's
+    /// identity signed, verified here or not; from an unsigned, unknown or
+    /// mismatched device, or in clear, the person's own event in their own
+    /// DM is ignored.
     #[test]
-    fn a_scope_counts_only_from_a_device_its_owner_signed() {
+    fn a_scope_or_a_heard_mark_counts_only_from_a_device_its_owner_signed() {
         use crate::rooms::{classify, Disposition, Served, UNSIGNED_DEVICE};
         use keeper_core::agents::home::AgentKind;
         use keeper_core::agents::session::SessionKind;
@@ -3046,6 +3053,10 @@ mod tests {
             json!({"v": 1, "drives": [], "set_by": tgorka.as_str()}),
         );
         let ask = event(CONVERSATION_REQUEST, json!({"v": 1}));
+        let heard = event(
+            HEARD,
+            json!({"v": 1, "anchor": "$a:example.org", "heard_until": 4, "sentence": 1, "reason": "stop"}),
+        );
         for (encryption, counts) in [
             (Some(sealed(None)), true),
             (
@@ -3081,18 +3092,32 @@ mod tests {
                 "{level:?}"
             );
             let asked = arrival_of(&ask, encryption.as_ref(), now).expect("a request");
-            let (scope_to, ask_to) = (
+            let marked = arrival_of(&heard, encryption.as_ref(), now).expect("a mark");
+            assert_eq!(
+                marked.arrival,
+                Arrival::Heard {
+                    owner_signed: counts
+                },
+                "{level:?}"
+            );
+            let (scope_to, ask_to, heard_to) = (
                 classify(&dm, &tgorka, scoped.arrival),
                 classify(&dm, &tgorka, asked.arrival),
+                classify(&dm, &tgorka, marked.arrival),
             );
             if counts {
                 assert_eq!(
-                    (scope_to, ask_to),
-                    (Disposition::Scope, Disposition::NewConversation)
+                    (scope_to, ask_to, heard_to),
+                    (
+                        Disposition::Scope,
+                        Disposition::NewConversation,
+                        Disposition::Heard
+                    )
                 );
             } else {
-                assert_eq!(scope_to, Disposition::Ignored(UNSIGNED_DEVICE), "{level:?}");
-                assert_eq!(ask_to, Disposition::Ignored(UNSIGNED_DEVICE), "{level:?}");
+                for to in [scope_to, ask_to, heard_to] {
+                    assert_eq!(to, Disposition::Ignored(UNSIGNED_DEVICE), "{level:?}");
+                }
             }
         }
     }

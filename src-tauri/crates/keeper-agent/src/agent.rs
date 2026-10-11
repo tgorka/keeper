@@ -40,6 +40,7 @@ use keeper_core::agents::events::{
     StatusContent, ARTIFACTS, CONTENT_VERSION, SCOPE, STATUS, TURN,
 };
 use keeper_core::agents::focus::FOCUS_TTL;
+use keeper_core::agents::heard::{message_text, Answers, HeardContent, HeardRefusal, Marked};
 use keeper_core::agents::helper;
 use keeper_core::agents::home::{serves_local_models, AgentKind, MenuItem};
 use keeper_core::agents::label::{
@@ -53,7 +54,7 @@ use keeper_core::agents::log::{
     ApprovalBody, ApprovalState, AskBody, AskState, AssistantBody, ChildSession, DelegateBody,
     DelegateReply, DelegateState, ErrorBody, HostSlug, LineBody, LogLine, MemoryBody, MemoryOp,
     OpenBody, PeerAnswer, PeerAsk, PeerBody, RunBody, ScopeBody, ToldBody, ToolCallBody,
-    ToolOutcomeWord, ToolResultBody, Truncated, Usage, UserBody,
+    ToolOutcomeWord, ToolResultBody, Truncated, Usage, UserBody, NARROWER_THAN_ROOM, WITHHELD_CODE,
 };
 use keeper_core::agents::matrix::AgentMatrixError;
 use keeper_core::agents::memory::{self, MemorySnapshot};
@@ -126,15 +127,6 @@ pub const LOCAL_ONLY_REFUSAL: &str = "This conversation has read something that 
 /// reason itself is in the session's log.
 pub const TURN_FAILED: &str =
     "I could not finish this answer. The reason is in this session's log.";
-
-/// What the room is told instead of an answer when the session's label no
-/// longer reaches everyone the session's `agent.toml` names (S-16): the
-/// answer drew on something narrower than the room. The log keeps the whole
-/// answer, with an `error` line whose code is [`LABEL_CODE`].
-pub const NARROWER_THAN_ROOM: &str = "This answer drew on something not everyone in this room may read, so it is not shown here. It is in this session's log.";
-
-/// The code of the `error` line of an answer withheld from its room.
-const LABEL_CODE: &str = "label";
 
 /// The `finish` of an `assistant` line written for a round that called
 /// tools: the turn goes on after it, so it answers nothing yet.
@@ -240,7 +232,7 @@ pub struct SessionContext {
     /// its work went on where only some of its room may read it (R169).
     pub told: bool,
     /// Whether an answer of the session was withheld from its room as the
-    /// room then was — an `error` line coded [`LABEL_CODE`] (R168).
+    /// room then was — an `error` line coded [`WITHHELD_CODE`] (R168).
     pub withheld: bool,
     /// The approvals whose call has no result yet, by id (93.2): a turn
     /// parked on one is waiting, not unanswered, and `recover` leaves it.
@@ -315,6 +307,9 @@ pub struct SessionContext {
     /// readback failed waits for it, so the cursor never passes a
     /// completion that readback has not reached (R279).
     pub(crate) paseo_cursor: HashMap<String, OwnedEventId>,
+    /// The session's anchored answers, followed as replay follows them: a
+    /// `heard` line cuts the answer it marks here as there (AD-411).
+    answers: Answers,
 }
 
 impl SessionContext {
@@ -392,6 +387,7 @@ impl SessionContext {
             paseo_ended: None,
             paseo_heard: HashSet::new(),
             paseo_cursor: HashMap::new(),
+            answers: Answers::default(),
         };
         for stored in &log.lines {
             match &stored.body {
@@ -436,6 +432,17 @@ impl SessionContext {
             if let LineBody::Label(body) = &line.body {
                 self.label = body.label();
             }
+            return;
+        }
+        // Where the person stopped listening cuts the answer it marks, as
+        // replay cuts it; the line stands for no message (AD-411).
+        if let Some(cut) = self.answers.observe(line) {
+            cut.apply(
+                self.placed
+                    .iter()
+                    .map(|(id, _)| *id)
+                    .zip(self.messages.iter_mut()),
+            );
             return;
         }
         match &line.body {
@@ -507,6 +514,23 @@ impl SessionContext {
             self.messages.push(message);
             self.placed.push((line.id, position));
         }
+    }
+
+    /// The `heard` line where the person stopped listening to the answer
+    /// `content` names, checked against that answer as the conversation
+    /// holds it and its offset counted here (Q9).
+    pub fn mark_heard(&self, content: &HeardContent) -> Result<Marked, HeardRefusal> {
+        self.answers.mark(content, |rounds| {
+            rounds
+                .iter()
+                .map(|round| {
+                    self.placed
+                        .iter()
+                        .position(|(id, _)| id == round)
+                        .map(|at| message_text(&self.messages[at]))
+                })
+                .collect()
+        })
     }
 
     /// The calls a parked round left open, and its approvals.
@@ -689,7 +713,7 @@ impl SessionContext {
                 }
             },
             LineBody::Told(_) => self.told = true,
-            LineBody::Error(error) if error.code == LABEL_CODE => self.withheld = true,
+            LineBody::Error(error) if error.code == WITHHELD_CODE => self.withheld = true,
             LineBody::Error(error) if error.code == INTERRUPTED => self.cut_off = true,
             LineBody::Delegate(body) => match body.state {
                 DelegateState::Opened => {
@@ -4316,6 +4340,9 @@ pub enum Outcome {
     /// A decision on a request another session sent into this DM, handed
     /// to that session (R89).
     Forwarded,
+    /// Where the person stopped listening to an answer: a `heard` line,
+    /// at the offset counted here.
+    Heard { heard_until: u64 },
 }
 
 /// How a turn ended.
@@ -4778,6 +4805,9 @@ impl ServedSession {
                 off_the_runtime(|| self.writer.sync())?;
                 Ok(Outcome::Decided)
             }
+            // Where the person stopped listening is logged whatever the
+            // session waits for, and starts nothing (R44, AD-411).
+            Disposition::Heard => self.heard(arrived),
             // While a call waits for a person (R74): in the person's own
             // `main` or `conversation` session their new message denies it
             // and then runs; anywhere else what would start a turn is held
@@ -6592,6 +6622,38 @@ impl ServedSession {
         replies
     }
 
+    /// Where the person stopped listening to a spoken answer (AD-411, Q9):
+    /// checked against the answer it names, its offset counted here from the
+    /// sentences the device finished, and logged as one `heard` line under
+    /// that answer, carrying the event — so a redelivery is a duplicate.
+    /// Nothing else: the turn is not cancelled (R44, DW-419), and only the
+    /// next turn's context reads the answer cut.
+    fn heard(&mut self, arrived: Arrived) -> Result<Outcome, ServeError> {
+        let marked = HeardContent::read(&arrived.content)
+            .ok_or(HeardRefusal::Unreadable)
+            .and_then(|content| self.context.mark_heard(&content));
+        let marked = match marked {
+            Ok(marked) => marked,
+            Err(refusal) => {
+                let note = refusal.note();
+                tracing::info!(session = %self.context.session.path, sender = %arrived.sender, event = %arrived.event_id, note, "agents: a heard mark was not logged");
+                return Ok(Outcome::Ignored(note));
+            }
+        };
+        if let Some(device) = marked.disagreed {
+            tracing::info!(session = %self.context.session.path, event = %arrived.event_id, device, counted = marked.body.heard_until, "agents: a heard mark's offset is the one counted here, not the device's");
+        }
+        let heard_until = marked.body.heard_until;
+        self.writer.write(
+            &mut self.context,
+            Some(marked.body.assistant),
+            Some(arrived.event_id.clone()),
+            LineBody::Heard(marked.body),
+        )?;
+        off_the_runtime(|| self.writer.sync())?;
+        Ok(Outcome::Heard { heard_until })
+    }
+
     /// The person's scope event (AD-382, R41): its focus replaces the held
     /// one; its drives, checked against `[tools].drives` with the home kept,
     /// become a `scope` line when they change the scope, and the accepted
@@ -7588,7 +7650,7 @@ impl ServedSession {
                 None,
                 LineBody::Error(ErrorBody {
                     sentence: NARROWER_THAN_ROOM.to_owned(),
-                    code: LABEL_CODE.to_owned(),
+                    code: WITHHELD_CODE.to_owned(),
                 }),
             )?;
         }

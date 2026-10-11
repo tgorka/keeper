@@ -739,6 +739,18 @@ pub struct ErrorBody {
     pub code: String,
 }
 
+/// The code of the `error` line, under the turn's closing line, of an answer
+/// withheld from its room because its label no longer reached the room
+/// (R168): the room showed a fixed sentence, never the answer.
+pub const WITHHELD_CODE: &str = "label";
+
+/// What the room is told instead of an answer when the session's label no
+/// longer reaches everyone the session's `agent.toml` names (S-16): the
+/// answer drew on something narrower than the room. The log keeps the whole
+/// answer, with an `error` line whose code is [`WITHHELD_CODE`]; a heard
+/// mark of such an answer is counted over this sentence (97.3).
+pub const NARROWER_THAN_ROOM: &str = "This answer drew on something not everyone in this room may read, so it is not shown here. It is in this session's log.";
+
 /// `told`: the session's person was told, in their proxy's DM, that its
 /// work went on where only some of its room may read it (R64, R169); the
 /// host tells them once, and a session with no such line is told again.

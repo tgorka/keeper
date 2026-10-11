@@ -2152,7 +2152,7 @@ per date and host, compared as a number. Each host writes only its own chunks an
 | `surface` | `id, tool, device`, optional `outcome` |
 | `told` | `person, room` — the person a narrowed session's detail was sent to, and their proxy DM it went into |
 | `paseo` | `completion, state` (`pending`, `delivered`), `room, artifact, sha256`; `pending` also `record` (the record's bytes) and `content` (the notice), `delivered` also `event` |
-| `heard` | `assistant, heard_until, sentence, reason` (`barge_in`, `stop`) |
+| `heard` | `assistant, heard_until, sentence, reason` (`barge_in`, `stop`) — under the answer's closing `assistant` line (`assistant`), carrying the person's `dev.keeper.agent.heard` event; `heard_until` is the end of the `sentence`th sentence as the host counts it in the answer the room showed (Unicode scalar values), never the device's own number |
 | `memory` | `op` (`journal`, `proposal`), `ref` |
 | `compact` | `summary, replaces_through` |
 | `error` | `sentence, code` |
@@ -2203,6 +2203,13 @@ session". Prefixed with the same system message, the replayed request is byte fo
 model received, except where a secret was replaced. Replay runs when a session opens, moves to
 another host or restarts; a host serving a session keeps its history in memory and never reads
 its log on a turn.
+An answer a `heard` line marks replays cut where the person stopped listening: its rounds keep
+their text up to `heard_until` (counted over the rounds joined as the room showed them, a blank
+line before each later round with text), the round holding the cut ends with "[The person stopped listening here.]", and
+later rounds keep their tool calls and lose their text. The first mark of an answer counts; an
+answer the room never showed (withheld, R168) is counted over the sentence the room showed
+instead and is not cut. The log line keeps the whole answer, and
+a served session cuts its context in memory exactly as replay does.
 
 **The index.** `<sessions zone>/.keeper/agents.db` answers the session list and the board: each
 session's agent, kind, label, scope, run state and that `run` line's detail, claim host and
@@ -2937,7 +2944,8 @@ like any other). What keeper and the proxy's host do for it:
   dock opens the new conversation when it appears. A room made but whose folder could not be
   written is left, your invite revoked. If the host stops between the room and the folder, that
   room is left with no session; ask again.
-- **Who may ask.** A scope or a new conversation counts only from the proxy's `human`, in the
+- **Who may ask.** A scope, a new conversation or a mark of where you stopped listening
+  (`dev.keeper.agent.heard`, *Talking to Nixi*) counts only from the proxy's `human`, in the
   proxy's own rooms (a new conversation in the DM only), and only from a device that person's
   cross-signing identity signed (ruling R47).
   Anyone else's, or one from a device its owner never signed, is ignored and logged as a note.
@@ -3048,6 +3056,16 @@ as chosen ("not listed yet") and is looked for again, never rewritten. What happ
   the voice turn sends is numbered before anything is sent: stopping it, or asking again, makes
   every later report of the earlier one — its send, its first words, its sentences, its end —
   move nothing, whichever finishes first; the earlier one's send and watch are stopped.
+- **Where you stopped listening (the host's half).** The proxy's host takes
+  `dev.keeper.agent.heard` — `{v, anchor, heard_until, sentence, reason}`, the answer's anchor
+  and how many of its sentences were finished aloud — from you alone, from a device your identity
+  signed, in the proxy's own rooms; it is served after the turn under way, like any arrival. The
+  answer must be one of the session's (its anchor), marked once, and no longer than it is; the
+  host counts where its `sentence`th sentence ends itself, with the speech segmenter's own cut,
+  and logs one `heard` line carrying the event, so a redelivery is not logged twice. Nothing
+  else: the answer is not cancelled and no turn runs (R44, DW-419); the next turn reads the answer
+  cut there (*Replay*, above). Anything else is ignored with a note in the host's log. This build's
+  voice does not send the event yet: the speaking device's half comes with the pause-first turn.
 - **The wake phrase is unchanged.** Naming the proxy "Nixi" renames nothing; the wake phrase is
   the one you set.
 - **When your question ends.** Without the account's turn models it ends 1.8 s after the

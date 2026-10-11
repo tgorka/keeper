@@ -379,6 +379,12 @@ pub enum Arrival {
         /// As for a scope (R47).
         owner_signed: bool,
     },
+    /// A `dev.keeper.agent.heard`: where the proxy's person stopped
+    /// listening to a spoken answer (AD-411).
+    Heard {
+        /// As for a scope (R47).
+        owner_signed: bool,
+    },
     /// A brief: an `m.room.message` carrying `dev.keeper.agent.delegate`
     /// (R53), the first round of a delegation or a later one (R49).
     Brief,
@@ -435,6 +441,9 @@ pub enum Disposition {
     Scope,
     /// The proxy's person asked, in its DM, for a new conversation.
     NewConversation,
+    /// The proxy's person stopped listening to an answer in its
+    /// conversation: a `heard` line, never a turn (R44).
+    Heard,
     /// A delegation this session made moved: its target joined or replied.
     Delegation,
     /// Another agent asked the proxy's person a question: a turn of its DM.
@@ -469,7 +478,8 @@ pub struct Served<'a> {
 /// A person's text in a session that is not a proxy conversation.
 pub const OBSERVER_TEXT: &str =
     "a person's free text in a session that is not their proxy's conversation is not a turn";
-/// A message from anyone but the proxy's person.
+/// A message, a scope, a request for a conversation or a heard mark from
+/// anyone but the proxy's person.
 pub const NOT_THE_PERSON: &str = "only the proxy's person starts a turn in its conversation";
 /// The agent's own events, echoed by sync.
 pub const OWN_EVENT: &str = "the agent's own event";
@@ -480,15 +490,16 @@ pub const UNTRUSTED_DECISION: &str =
 /// An agent's event or an edit sent by anyone but the agent itself.
 pub const FORGED: &str =
     "an agent's event or an edit is the agent's own to send; from anyone else it is ignored";
-/// A scope or a request for a conversation outside the proxy's own rooms.
+/// A scope, a request for a conversation or a heard mark outside the proxy's
+/// own rooms.
 pub const NOT_A_PROXY_ROOM: &str =
-    "a scope or a new conversation is the proxy's person's to ask for in the proxy's own rooms";
+    "a scope, a new conversation or where a spoken answer stopped is the proxy's person's to send in the proxy's own rooms";
 /// A request for a conversation outside the proxy's `main` DM.
 pub const NOT_THE_DM: &str = "a new conversation is asked for in the proxy's DM";
-/// A scope or a request for a conversation from a device its owner did not
-/// sign (R47).
+/// A scope, a request for a conversation or a heard mark from a device its
+/// owner did not sign (R47).
 pub const UNSIGNED_DEVICE: &str =
-    "a scope or a new conversation counts only from a device its owner's identity signed";
+    "a scope, a new conversation or where a spoken answer stopped counts only from a device its owner's identity signed";
 /// A brief from anyone but the delegating agent, or outside a delegated
 /// session.
 pub const NOT_THE_REQUESTER: &str =
@@ -507,11 +518,12 @@ pub const NOT_ASKED_HERE: &str = "an ask is taken only into a proxy's own rooms"
 /// checks the sender of each instead. Only the agent's own user sends those,
 /// and a decision counts only from a reader's verified device.
 ///
-/// Two agent events are the person's (AD-382, R36): a scope — the drives
-/// in scope and the docked note — in the proxy's `main` or `conversation`
-/// session, and a request for a new conversation in its `main` DM. Each
-/// counts only from the proxy's `human`, on a device that person's
-/// cross-signing identity signed (R47).
+/// Three agent events are the person's (AD-382, R36, AD-411): a scope — the
+/// drives in scope and the docked note — and where they stopped listening to
+/// a spoken answer, in the proxy's `main` or `conversation` session, and a
+/// request for a new conversation in its `main` DM. Each counts only from
+/// the proxy's `human`, on a device that person's cross-signing identity
+/// signed (R47).
 pub fn classify(served: &Served<'_>, sender: &UserId, arrival: Arrival) -> Disposition {
     // No event from the room is ever this kind: only the host's clock makes it.
     match arrival {
@@ -567,6 +579,17 @@ pub fn classify(served: &Served<'_>, sender: &UserId, arrival: Arrival) -> Dispo
                 Disposition::NewConversation
             } else {
                 Disposition::Ignored(NOT_THE_DM)
+            }
+        }
+        Arrival::Heard { owner_signed } => {
+            if !conversation {
+                Disposition::Ignored(NOT_A_PROXY_ROOM)
+            } else if served.human != Some(sender) {
+                Disposition::Ignored(NOT_THE_PERSON)
+            } else if !owner_signed {
+                Disposition::Ignored(UNSIGNED_DEVICE)
+            } else {
+                Disposition::Heard
             }
         }
         Arrival::Decision { sealed } => {
@@ -1126,6 +1149,62 @@ mod tests {
         );
         assert_eq!(
             classify(&delegated, &tgorka, ask),
+            Disposition::Ignored(NOT_A_PROXY_ROOM)
+        );
+    }
+
+    /// 97.3 #7 (Q10): where a spoken answer stopped counts from the proxy's
+    /// person alone, from a device their identity signed, in the proxy's
+    /// `main` or `conversation` session; never from a reader who is not the
+    /// person, the agent's own echo, an unsigned device or another session.
+    #[test]
+    fn a_heard_mark_counts_only_from_the_persons_signed_device_in_its_rooms() {
+        let tgorka = user(TGORKA);
+        let nixi = user("@nixi:example.org");
+        let room = readers(&[TGORKA, MARTA]);
+        let heard = Arrival::Heard { owner_signed: true };
+        for kind in [SessionKind::Main, SessionKind::Conversation] {
+            let session = served(AgentKind::Proxy, Some(&tgorka), kind, &nixi, &room);
+            assert_eq!(classify(&session, &tgorka, heard), Disposition::Heard);
+            assert_eq!(
+                classify(&session, &user(MARTA), heard),
+                Disposition::Ignored(NOT_THE_PERSON)
+            );
+            assert_eq!(
+                classify(&session, &nixi, heard),
+                Disposition::Ignored(OWN_EVENT)
+            );
+            assert_eq!(
+                classify(
+                    &session,
+                    &tgorka,
+                    Arrival::Heard {
+                        owner_signed: false
+                    }
+                ),
+                Disposition::Ignored(UNSIGNED_DEVICE)
+            );
+        }
+        let delegated = served(
+            AgentKind::Proxy,
+            Some(&tgorka),
+            SessionKind::Delegated,
+            &nixi,
+            &room,
+        );
+        assert_eq!(
+            classify(&delegated, &tgorka, heard),
+            Disposition::Ignored(NOT_A_PROXY_ROOM)
+        );
+        let stewards = served(
+            AgentKind::Steward,
+            None,
+            SessionKind::Conversation,
+            &nixi,
+            &room,
+        );
+        assert_eq!(
+            classify(&stewards, &tgorka, heard),
             Disposition::Ignored(NOT_A_PROXY_ROOM)
         );
     }

@@ -6,6 +6,9 @@
 //! cold path — a session opened, taken over or restarted — and is pure over a
 //! [`SessionLog`] already read: a host serving a session keeps the history in
 //! memory from the writer's receipts and never re-reads the log on a turn.
+//!
+//! An answer a `heard` line marks replays cut where the person stopped
+//! listening, in both replays alike ([`crate::agents::heard`]).
 
 use std::collections::{HashMap, HashSet};
 
@@ -14,6 +17,7 @@ use ulid::Ulid;
 
 use super::reader::SessionLog;
 use super::{LineBody, LogError, LogLine, OpenBody, PeerBody, ReviewLines, UserBody};
+use crate::agents::heard::Answers;
 use crate::agents::helper::HELPER;
 use crate::bots::chat::{ChatMessage, ContentPart, Role, ToolCall};
 
@@ -201,6 +205,7 @@ pub fn replay(
     let mut last_open = None;
     let mut helpers = HelperSteps::default();
     let mut review = ReviewLines::default();
+    let mut answers = Answers::default();
     for (position, stored) in log.lines.iter().enumerate() {
         let hydrated;
         let line = match &stored.body {
@@ -228,6 +233,12 @@ pub fn replay(
         }
         // A nudge's review pass read the conversation; it is not part of it.
         if review.take(line) {
+            continue;
+        }
+        // A `heard` line cuts the answer it marks where the person stopped
+        // listening (AD-411); the line itself stands for no message.
+        if let Some(cut) = answers.observe(line) {
+            cut.apply(placed.iter_mut().map(|p| (p.line, &mut p.message)));
             continue;
         }
 

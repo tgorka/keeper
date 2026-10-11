@@ -309,6 +309,34 @@ fn boundary(text: &str) -> Option<usize> {
     None
 }
 
+/// Where each sentence of the whole of `text` ends, in Unicode scalar values
+/// from its start: the cut a [`Segmenter`] fed `text` in any chunks and then
+/// flushed makes, one end per sentence it hands out, each just past the
+/// sentence's last character (its marks, never the whitespace after them).
+/// A host counts the sentences a device says it finished with this, over
+/// the answer the room shows (AD-411).
+pub fn sentence_ends(text: &str) -> Vec<usize> {
+    let mut ends = Vec::new();
+    let mut start = 0;
+    let mut before = 0;
+    loop {
+        let rest = &text[start..];
+        let (piece, closed) = match boundary(rest) {
+            Some(end) => (&rest[..end], true),
+            None => (rest, false),
+        };
+        let said = piece.trim_end();
+        if !said.is_empty() {
+            ends.push(before + said.chars().count());
+        }
+        if !closed {
+            return ends;
+        }
+        before += piece.chars().count();
+        start += piece.len();
+    }
+}
+
 /// The English name of a language subtag, for the languages Apple's
 /// dictation and synthesiser inventories cover. Not a locale database: a
 /// subtag missing here is still named by its tag.
@@ -372,6 +400,36 @@ mod tests {
         match result {
             Err(VoiceUnavailable::NoVoice { language }) => language,
             other => panic!("expected a NoVoice refusal, got {other:?}"),
+        }
+    }
+
+    /// AD-411: the ends a host counts are the segmenter's own sentences,
+    /// in Unicode scalar values, each past its marks and before the space or
+    /// line break after them; a blank line is no sentence, a dot inside a
+    /// number closes nothing, and the unclosed tail is the last. Fed in any
+    /// chunks, the segmenter hands out exactly as many sentences.
+    #[test]
+    fn sentence_ends_count_what_the_segmenter_hands_out() {
+        for (text, ends) in [
+            ("One. Two three!\nFour", vec![4, 15, 20]),
+            ("Zażółć. Gęślą.", vec![7, 14]),
+            ("It costs 3.5 zł.\n\n\nNext 😀 one?  Yes", vec![16, 30, 35]),
+            ("A heading\nThen text.", vec![9, 20]),
+            ("  \n", vec![]),
+            ("", vec![]),
+        ] {
+            assert_eq!(sentence_ends(text), ends, "{text:?}");
+            for split in 0..=text.chars().count() {
+                let at = text
+                    .char_indices()
+                    .nth(split)
+                    .map_or(text.len(), |(i, _)| i);
+                let mut segmenter = Segmenter::new();
+                let mut said = segmenter.push(&text[..at]);
+                said.extend(segmenter.push(&text[at..]));
+                said.extend(segmenter.flush());
+                assert_eq!(said.len(), ends.len(), "{text:?} split at {split}");
+            }
         }
     }
 

@@ -9786,3 +9786,31 @@ origin: epic 97, story 97.2 review fixes (rung `agents-97-turns`, 2026-10-05; R9
 location: `src-tauri/crates/keeper-core/src/voice/timings.rs` (`measure`)
 reason: `finish_recognition_ms` is now the moment the port reports `endAudio` ran, and is absent when it never reported it (no request to end, or no report within the 600 ms the turn waits for one). `measure` takes both figures over model turns that have the point, so such a turn is counted in `model_turns` but in neither p95. On a device run that is a failure the figures hide. Revisit with the device run (DW-495): if `model_turns` exceeds the turns with the point, list those turns' `sent_ms` the way `early_pauses` lists early pauses, and count them against NFR-114.
 status: open
+
+### DW-1200: A heard mark is measured on the answer's prose, not on the room's last message.
+
+origin: epic 97, story 97.3 (rung `agents-97-heard`, 2026-10-11; acceptance 7, codemap Q9)
+location: `src-tauri/crates/keeper-core/src/agents/heard.rs` (`answer_text`, `Answers::mark`)
+reason: The host counts the device's `sentence` over the turn's `assistant` lines joined as the stream joined them. The room's final message can say more than that prose: an answer over `FINAL_CUT_BYTES` ends with its artifact sentence, and a turn that failed, parked or was bounded ends with the host's note (`join_note`) or the shutdown suffix's own words. A device that finished one of those sentences counts past the prose and its mark is refused as past the answer, though the person heard all of it — the same cut as no mark. A turn that failed after its last round's prose was already on that round's line has no anchored `assistant` line at all, so its anchor is no answer and a mark of it is refused. Revisit if spoken answers that end in a note turn out to matter: keep the room's final text (or its sentence count) on the closing line.
+status: open
+
+### DW-1201: The first message of a parked turn cannot be marked.
+
+origin: epic 97, story 97.3 (rung `agents-97-heard`, 2026-10-11; acceptance 7)
+location: `src-tauri/crates/keeper-core/src/agents/heard.rs` (`Answers::observe`)
+reason: A turn parked on an approval ends its room message with the waiting note and writes no closing line; it resumes under a new anchor (`resume_turn`). Only the resumed anchor names an answer, so a person who stopped the spoken waiting message — the rounds before the park — leaves a mark that is refused as no answer, and the model's next turn reads those rounds whole. Revisit with the device half (rung `agents-97-pause`) if spoken turns park in practice: give the parked rounds their own answer under the first anchor.
+status: open
+
+### DW-1202: A device count past the final answer after a rewrite is refused, not clamped.
+
+origin: epic 97, story 97.3 review (rung `agents-97-heard`, 2026-10-11; `review-97heard-1.md` DW-A, R319)
+location: `src-tauri/crates/keeper-core/src/agents/heard.rs` (`Answers::mark`), `src-tauri/crates/keeper-core/src/voice/speech.rs` (`AnswerFollower::edit`)
+reason: After a mid-stream rewrite `AnswerFollower::edit` skips the sentences it already handed out by position, so the device may have finished more sentences than the final text holds. The host then refuses the mark as `PastTheAnswer` — the same as no mark: the next turn reads the answer whole — rather than clamping `sentence` to the last sentence and naming the device's count as `disagreed`. Rare (the agent rewrote earlier prose mid-answer). Revisit with the device half (rung `agents-97-pause`) if the device run logs `PastTheAnswer` refusals for answers that were rewritten while spoken.
+status: open
+
+### DW-1203: A cut-off turn's rounds stay open until the next `user` or `peer` line.
+
+origin: epic 97, story 97.3 review (rung `agents-97-heard`, 2026-10-11; `review-97heard-1.md` DW-B, R319)
+location: `src-tauri/crates/keeper-core/src/agents/heard.rs` (`Answers::observe`)
+reason: `observe` starts a new stream only at a `user` or `peer` line or a requested approval; the `error: interrupted` line `recover` writes under a cut-off turn's question does not close it. In a proxy conversation the next turn always starts with the person's new `user` line, so the lost rounds never join a later answer; a turn kind that resumes without one (a workflow's `Resume`) is never a proxy conversation, so no heard mark reaches it. Revisit if a conversation turn ever resumes without a `user` or `peer` line: clear the open rounds on an `error` line whose parent is not a turn's closing line.
+status: open
