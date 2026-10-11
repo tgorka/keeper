@@ -534,6 +534,7 @@ fn world_in(
         sessions_subfolder: "60-sessions".to_owned(),
         lfs_threshold_bytes: 1_000_000,
         decisions: None,
+        sandbox: None,
     };
     World {
         _root: root,
@@ -2457,6 +2458,7 @@ fn tolas_deps(world: &World) -> AgentDeps {
         sessions_subfolder: world.deps.sessions_subfolder.clone(),
         lfs_threshold_bytes: world.deps.lfs_threshold_bytes,
         decisions: None,
+        sandbox: None,
     }
 }
 
@@ -3056,6 +3058,7 @@ fn deps_of(world: &World, folder: &str, agent_toml: &str) -> AgentDeps {
         sessions_subfolder: world.deps.sessions_subfolder.clone(),
         lfs_threshold_bytes: world.deps.lfs_threshold_bytes,
         decisions: None,
+        sandbox: None,
     }
 }
 
@@ -7560,6 +7563,9 @@ mod parks {
         probe: Mutex<Option<Arc<keeper_agent::agent::Activity>>>,
         /// What the probe read, request by request.
         busy_seen: Mutex<Vec<bool>>,
+        /// Runs once, as the server takes the next `consumed`: what changes
+        /// between an approval's check and the call it lets go.
+        on_consume: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     }
 
     impl Approvals {
@@ -7608,6 +7614,9 @@ mod parks {
             Box::pin(async move {
                 tokio::task::yield_now().await;
                 self.look();
+                if let Some(change) = self.on_consume.lock().expect("lock").take() {
+                    change();
+                }
                 if self.down.load(Ordering::SeqCst) {
                     return Err(AgentMatrixError::Network("the server went away".to_owned()));
                 }
@@ -10328,6 +10337,7 @@ mod parks {
             sessions_subfolder: world.deps.sessions_subfolder.clone(),
             lfs_threshold_bytes: world.deps.lfs_threshold_bytes,
             decisions: world.deps.decisions.clone(),
+            sandbox: world.deps.sandbox.clone(),
         }
     }
 
@@ -11329,6 +11339,545 @@ mod parks {
                 "relayed: {relayed}"
             );
         }
+    }
+
+    /// A `run`'s sandbox for a test world on Linux: this test binary is the
+    /// trampoline — libtest runs only [`sandbox_trampoline`], which applies
+    /// the plan to itself and becomes the program, exactly as agentd's
+    /// `main` does.
+    #[cfg(target_os = "linux")]
+    pub(super) fn sandbox(
+        host: &str,
+        read_exec: &[std::path::PathBuf],
+    ) -> Arc<keeper_agent::run::SandboxHost> {
+        use keeper_agent::run::{Forbidden, Kind, SandboxHost, TRAMPOLINE_ARG};
+        let program = std::env::current_exe().expect("this test binary");
+        let args = [
+            "parks::sandbox_trampoline",
+            "--exact",
+            "--nocapture",
+            "--test-threads",
+            "1",
+            TRAMPOLINE_ARG,
+        ]
+        .map(std::ffi::OsString::from)
+        .to_vec();
+        Arc::new(
+            SandboxHost::probe(
+                Kind::Trampoline { program, args },
+                host,
+                &keeper_core::agents::run::SandboxTable {
+                    read_exec: read_exec.to_vec(),
+                    env: Vec::new(),
+                },
+                &Forbidden::default(),
+            )
+            .expect("this kernel enforces the sandbox"),
+        )
+    }
+
+    /// Not a test of its own: the trampoline, when a world's run starts
+    /// this binary as one; otherwise nothing.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sandbox_trampoline() {
+        let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+        let Some(at) = args
+            .iter()
+            .position(|arg| arg == keeper_agent::run::TRAMPOLINE_ARG)
+        else {
+            return;
+        };
+        let plan = std::path::PathBuf::from(&args[at + 1]);
+        let code = keeper_agent::run::linux::trampoline(&plan);
+        // Only a failure returns; the program never ran.
+        let _ = code;
+        std::process::exit(i32::from(keeper_agent::run::NOT_SANDBOXED));
+    }
+
+    /// Nixi offered `run` on a sandboxed host, with a decision source.
+    #[cfg(target_os = "linux")]
+    fn running(
+        script: Vec<Completion>,
+        read_exec: &[std::path::PathBuf],
+    ) -> (World, Arc<Approvals>, ServedSession) {
+        let mut world = world(ProviderKind::OpenAi, &["drive_read", "run"], script);
+        world.deps.decisions = Some(Admit::pinned());
+        world.deps.sandbox = Some(sandbox("electra", read_exec));
+        let approvals = Arc::new(Approvals::default());
+        let served = open(&world, &approvals);
+        (world, approvals, served)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn workspace(world: &World) -> std::path::PathBuf {
+        world.dir(SESSION).join("workspace")
+    }
+
+    /// 96.1 #15: a secret a run prints reaches the model's result and the
+    /// log only redacted; its bytes are in no file under `log/`.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_output_secret_is_redacted_in_the_log() {
+        const KEY: &str = "AKIAIOSFODNN7EXAMPLE";
+        let (mut world, approvals, mut served) = running(
+            vec![
+                calls(&[("r1", "run", json!({"argv": ["cat", "keys.txt"]}))]),
+                prose("Read it."),
+            ],
+            &[],
+        );
+        let dir = workspace(&world);
+        std::fs::create_dir_all(&dir).expect("workspace");
+        std::fs::write(dir.join("keys.txt"), format!("aws_access_key_id = {KEY}\n")).expect("keys");
+        let parked = report(world.ask(&mut served, "read the keys").await);
+        assert_eq!(parked.ending, TurnEnding::Parked);
+        let record = world.record();
+        assert_eq!(record.risk.tier, 2);
+        let decided = world.decision(&record, Decision::Approve);
+        world.serve(&mut served, decided).await;
+        assert_eq!(approvals.events().len(), 1, "consumed once");
+        let results = results(&world);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].outcome, ToolOutcomeWord::Ok, "{:?}", results[0]);
+        // The workspace alone, without network: an agent's word (96.1 #14).
+        assert_eq!(
+            results[0].label.integrity,
+            keeper_core::agents::label::Integrity::Agent
+        );
+        assert!(
+            results[0]
+                .content
+                .contains("[REDACTED secret-like: sha256:"),
+            "{}",
+            results[0].content
+        );
+        let mut logged = Vec::new();
+        for entry in std::fs::read_dir(world.dir(SESSION).join("log")).expect("log") {
+            logged.extend(std::fs::read(entry.expect("entry").path()).expect("chunk"));
+        }
+        assert!(!logged.is_empty());
+        assert!(
+            !String::from_utf8_lossy(&logged).contains(KEY),
+            "the key reached log/"
+        );
+    }
+
+    /// 96.1 #9, R144: the record binds the program's bytes; replaced before
+    /// the approval is consumed, the re-check refuses and the room holds no
+    /// `approval.consumed` for it.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_exec_binding_drift_refuses() {
+        let bin = tempfile::tempdir().expect("bin");
+        let tool = bin.path().join("mytool");
+        std::fs::copy("/usr/bin/true", &tool).expect("copy");
+        let (mut world, approvals, mut served) = running(
+            vec![
+                calls(&[("r1", "run", json!({"argv": ["mytool"], "network": true}))]),
+                prose("Done."),
+            ],
+            &[bin.path().to_path_buf()],
+        );
+        std::fs::create_dir_all(workspace(&world)).expect("workspace");
+        let parked = report(world.ask(&mut served, "run my tool").await);
+        assert_eq!(parked.ending, TurnEnding::Parked);
+        let record = world.record();
+        assert_eq!(record.risk.tier, 3);
+        assert_eq!(
+            record.action.exec_binding["exe_sha256"],
+            sha256_hex(&std::fs::read("/usr/bin/true").expect("true"))
+        );
+        std::fs::copy("/usr/bin/false", &tool).expect("replace");
+        let decided = world.decision(&record, Decision::Approve);
+        world.serve(&mut served, decided).await;
+        assert!(approvals.events().is_empty(), "nothing was consumed");
+        let refused = world.approval_lines().pop().expect("a line");
+        assert_eq!(refused.state, ApprovalState::Refused);
+        assert!(
+            refused
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("its program")),
+            "{refused:?}"
+        );
+        let results = results(&world);
+        assert_eq!(results[0].outcome, ToolOutcomeWord::Refused);
+    }
+
+    /// R96R-12, R213: the run an approval lets go goes only on the facts
+    /// that approval was checked against — a program replaced after the
+    /// check, as the approval is consumed, is refused at the effect. The
+    /// trampoline cannot see it: the run it is handed was prepared after
+    /// the change.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_program_replaced_as_its_approval_is_consumed_does_not_run() {
+        let bin = tempfile::tempdir().expect("bin");
+        let tool = bin.path().join("mytool");
+        std::fs::copy("/usr/bin/true", &tool).expect("copy");
+        let (mut world, approvals, mut served) = running(
+            vec![
+                calls(&[("r1", "run", json!({"argv": ["mytool"], "network": true}))]),
+                prose("Done."),
+            ],
+            &[bin.path().to_path_buf()],
+        );
+        std::fs::create_dir_all(workspace(&world)).expect("workspace");
+        let parked = report(world.ask(&mut served, "run my tool").await);
+        assert_eq!(parked.ending, TurnEnding::Parked);
+        let record = world.record();
+        let replaced = tool.clone();
+        *approvals.on_consume.lock().expect("lock") = Some(Box::new(move || {
+            std::fs::copy("/usr/bin/false", &replaced).expect("replace");
+        }));
+        let decided = world.decision(&record, Decision::Approve);
+        world.serve(&mut served, decided).await;
+        assert_eq!(approvals.events().len(), 1, "consumed after its check");
+        let results = results(&world);
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].outcome,
+            ToolOutcomeWord::Refused,
+            "{:?}",
+            results[0]
+        );
+        assert!(
+            results[0].content.contains("changed after it was approved"),
+            "{}",
+            results[0].content
+        );
+    }
+
+    /// 96.1 #12, S-03: a networked run's approval releases the workspace
+    /// exactly as its card listed it — a file added after the decision is
+    /// drift, never consumed — and the run it lets go sees no drive.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn networked_run_releases_only_the_workspace_it_showed() {
+        // From workspace/ up to the drive's root, then the note.
+        let note = format!("../../../../{NOTE}");
+        for grows in [true, false] {
+            let call = json!({"argv": ["cat", note], "network": true});
+            let (mut world, approvals, mut served) =
+                running(vec![calls(&[("r1", "run", call)]), prose("Done.")], &[]);
+            std::fs::write(world.tgdrive.join(NOTE), ORIGINAL).expect("note");
+            let dir = workspace(&world);
+            std::fs::create_dir_all(&dir).expect("workspace");
+            std::fs::write(dir.join("a.txt"), "shown").expect("a");
+            let parked = report(world.ask(&mut served, "send it").await);
+            assert_eq!(parked.ending, TurnEnding::Parked);
+            let record = world.record();
+            assert_eq!(record.risk.tier, 3);
+            let files = &record.preconditions.workspace.as_ref().expect("the set")["files"];
+            assert_eq!(
+                files,
+                &json!([{"path": "a.txt", "sha256": sha256_hex(b"shown")}])
+            );
+            if grows {
+                std::fs::write(dir.join("b.txt"), "added").expect("b");
+            }
+            let decided = world.decision(&record, Decision::Approve);
+            world.serve(&mut served, decided).await;
+            let results = results(&world);
+            if grows {
+                assert!(approvals.events().is_empty(), "nothing was consumed");
+                assert_eq!(results[0].outcome, ToolOutcomeWord::Refused);
+                assert!(
+                    results[0].content.contains("workspace changed"),
+                    "{}",
+                    results[0].content
+                );
+            } else {
+                assert_eq!(approvals.events().len(), 1);
+                // The run went, with network: what it returned is outside
+                // content, and it read no drive.
+                assert_eq!(
+                    results[0].label.integrity,
+                    keeper_core::agents::label::Integrity::Untrusted
+                );
+                assert!(
+                    results[0].content.contains("Permission denied"),
+                    "{}",
+                    results[0].content
+                );
+                assert!(
+                    !results[0].content.contains(ORIGINAL),
+                    "{}",
+                    results[0].content
+                );
+            }
+        }
+    }
+
+    /// R213 through the store's one strict reader: a networked run whose
+    /// payload is too large to ride inline is stored with its arguments,
+    /// binding and workspace set attached, and its approval is read back
+    /// whole, so the run it showed goes, once.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_attached_run_is_read_back_whole_and_runs() {
+        let call = json!({"argv": ["true"], "network": true});
+        let (mut world, approvals, mut served) =
+            running(vec![calls(&[("r1", "run", call)]), prose("Done.")], &[]);
+        let dir = workspace(&world);
+        std::fs::create_dir_all(&dir).expect("workspace");
+        for at in 0..250 {
+            std::fs::write(dir.join(format!("f{at:03}.txt")), at.to_string()).expect("file");
+        }
+        let parked = report(world.ask(&mut served, "send it").await);
+        assert_eq!(parked.ending, TurnEnding::Parked);
+        let record = world.record();
+        assert!(record.action.args_blob.is_some(), "the payload is attached");
+        assert_eq!(record.action.exec_binding, Value::Null);
+        assert_eq!(record.preconditions.workspace, None);
+        let decided = world.decision(&record, Decision::Approve);
+        world.serve(&mut served, decided).await;
+        let results = results(&world);
+        assert_eq!(approvals.events().len(), 1, "consumed once");
+        assert_eq!(
+            results[0].outcome,
+            ToolOutcomeWord::Ok,
+            "{}",
+            results[0].content
+        );
+    }
+
+    /// 96.1 #11 through `agent_offer`: a turn on a host whose sandbox passed
+    /// its probe is offered `run` when `allow` names it; the same agent on a
+    /// host with none is not.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_is_offered_only_on_a_sandboxed_host() {
+        for sandboxed in [true, false] {
+            let (mut world, _approvals, mut served) = running(vec![prose("Nothing to run.")], &[]);
+            if !sandboxed {
+                world.deps.sandbox = None;
+            }
+            report(world.ask(&mut served, "anything to run?").await);
+            let offered = super::offered_tools(&world.stub.requests()[0]);
+            assert_eq!(
+                offered.iter().any(|name| name == "run"),
+                sandboxed,
+                "{offered:?}"
+            );
+        }
+    }
+
+    /// R96R-11, R213: the host that resolved a run is in its digested
+    /// binding — another host with the same programs and workspace
+    /// re-prepares another binding, so the approval drifts there and nothing
+    /// is consumed.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_run_approved_on_one_host_does_not_run_on_another() {
+        let (mut world, approvals, mut served) = running(
+            vec![
+                calls(&[("r1", "run", json!({"argv": ["true"]}))]),
+                prose("Done."),
+            ],
+            &[],
+        );
+        std::fs::create_dir_all(workspace(&world)).expect("workspace");
+        let parked = report(world.ask(&mut served, "run it").await);
+        assert_eq!(parked.ending, TurnEnding::Parked);
+        let record = world.record();
+        assert_eq!(record.action.exec_binding["host"], "electra");
+        world.deps.sandbox = Some(sandbox("hesperia", &[]));
+        let decided = world.decision(&record, Decision::Approve);
+        world.serve(&mut served, decided).await;
+        assert!(approvals.events().is_empty(), "nothing was consumed");
+        let refused = world.approval_lines().pop().expect("a line");
+        assert_eq!(refused.state, ApprovalState::Refused);
+        assert!(
+            refused
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("where it runs")),
+            "{refused:?}"
+        );
+    }
+
+    /// R96R-14: a run mounts only a drive the agent's grants let it read —
+    /// a drive in the session's scope, checked out here, but no longer in
+    /// the agent's `[tools].drives` is refused, as `drive_read` would be.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_run_reads_only_a_drive_the_agent_may_read() {
+        let (mut world, _approvals, _served) = running(
+            vec![
+                calls(&[("r1", "run", json!({"argv": ["ls"], "read": ["private"]}))]),
+                prose("Done."),
+            ],
+            &[],
+        );
+        world.deps.home.config.drives = vec!["tgdrive".to_owned()];
+        let approvals = Arc::new(Approvals::default());
+        let mut served = open(&world, &approvals);
+        std::fs::create_dir_all(workspace(&world)).expect("workspace");
+        let ran = report(world.ask(&mut served, "list it").await);
+        assert_ne!(ran.ending, TurnEnding::Parked);
+        let results = results(&world);
+        assert_eq!(results[0].outcome, ToolOutcomeWord::Refused);
+        assert!(
+            results[0]
+                .content
+                .contains("private is not a drive this session may read"),
+            "{}",
+            results[0].content
+        );
+    }
+
+    /// R96R-15: a run writes its workspace on the session's home drive, so
+    /// one that would read a drive fewer people read is refused before
+    /// anything runs — no copy of the private drive into a shared one —
+    /// while one that reads the home drive itself asks as usual.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_run_never_copies_a_narrower_drive_into_the_workspace() {
+        let call =
+            |read: &str| json!({"argv": ["cp", "-r", "../../../../..", "copied"], "read": [read]});
+        let (mut world, _approvals, mut served) = running(
+            vec![
+                calls(&[("r1", "run", call("private"))]),
+                prose("No."),
+                calls(&[("r2", "run", call("tgdrive"))]),
+                prose("Asked."),
+            ],
+            &[],
+        );
+        std::fs::create_dir_all(workspace(&world)).expect("workspace");
+        let ran = report(world.ask(&mut served, "copy the diary").await);
+        assert_ne!(ran.ending, TurnEnding::Parked);
+        let results = results(&world);
+        assert_eq!(results[0].outcome, ToolOutcomeWord::Refused);
+        assert!(
+            results[0].content.contains("its workspace is on tgdrive"),
+            "{}",
+            results[0].content
+        );
+        assert!(!workspace(&world).join("copied").exists());
+        let asked = report(world.ask(&mut served, "copy the notes").await);
+        assert_eq!(asked.ending, TurnEnding::Parked);
+    }
+
+    /// R146, Q6(a): approving a T2 run for the session lets a later run of
+    /// the same program in the same folder, any arguments, go without
+    /// asking; once the session is opened again it asks — the allowance is
+    /// this host's, in memory. Expiry, drift and T3+ are
+    /// `run::tests::a_run_allowance_covers_only_its_kin`.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_session_approval_lets_the_same_program_run_again() {
+        let (mut world, approvals, mut served) = running(
+            vec![
+                calls(&[("r1", "run", json!({"argv": ["cat", "a.txt"]}))]),
+                prose("Read a."),
+                calls(&[("r2", "run", json!({"argv": ["cat", "b.txt"]}))]),
+                prose("Read b."),
+                calls(&[("r4", "run", json!({"argv": ["cat", "a.txt"]}))]),
+                prose("Asked again."),
+            ],
+            &[],
+        );
+        let dir = workspace(&world);
+        std::fs::create_dir_all(&dir).expect("workspace");
+        std::fs::write(dir.join("a.txt"), "aaa").expect("a");
+        std::fs::write(dir.join("b.txt"), "bbb").expect("b");
+        let parked = report(world.ask(&mut served, "read a").await);
+        assert_eq!(parked.ending, TurnEnding::Parked);
+        let record = world.record();
+        assert_eq!(record.risk.tier, 2);
+        assert!(record
+            .scopes
+            .contains(&keeper_core::agents::approval::Scope::Session));
+        let mut content = decision_content(&record, Decision::Approve, None);
+        content["scope"] = json!("session");
+        let decided = world.decision_from(TGORKA, "PHONE", content);
+        world.serve(&mut served, decided).await;
+        assert_eq!(approvals.events().len(), 1);
+        let again = report(world.ask(&mut served, "read b").await);
+        assert_eq!(again.ending, TurnEnding::Complete, "it asked again");
+        let read = results(&world);
+        assert!(
+            read.iter().any(|result| result.content.contains("bbb")),
+            "{read:?}"
+        );
+        let mut reopened = open(&world, &approvals);
+        let fresh = report(world.ask(&mut reopened, "read a").await);
+        assert_eq!(
+            fresh.ending,
+            TurnEnding::Parked,
+            "a reopened session asks again"
+        );
+    }
+
+    /// R96R2-07, R231: an approval and a `session` allowance bind the run's
+    /// folder itself, by device and inode — another folder put at the same
+    /// name is drift before the approval is consumed, is refused at the
+    /// effect when it is put there as the approval is consumed, and is
+    /// outside the allowance, so the run asks again.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_folder_replaced_at_its_path_never_runs_on_its_approval() {
+        let call = |id: &str| calls(&[(id, "run", json!({"argv": ["ls"], "cwd": "repo"}))]);
+        let replace = |repo: &std::path::Path| {
+            std::fs::rename(repo, repo.with_file_name("repo-old")).expect("move");
+            std::fs::create_dir(repo).expect("another folder");
+        };
+
+        // Before the approval is consumed.
+        let (mut world, approvals, mut served) = running(vec![call("r1"), prose("Done.")], &[]);
+        let repo = workspace(&world).join("repo");
+        std::fs::create_dir_all(&repo).expect("repo");
+        let parked = report(world.ask(&mut served, "list it").await);
+        assert_eq!(parked.ending, TurnEnding::Parked);
+        let record = world.record();
+        replace(&repo);
+        let decided = world.decision(&record, Decision::Approve);
+        world.serve(&mut served, decided).await;
+        assert!(approvals.events().is_empty(), "nothing was consumed");
+        let refused = world.approval_lines().pop().expect("a line");
+        assert_eq!(refused.state, ApprovalState::Refused, "{refused:?}");
+
+        // As it is consumed.
+        let (mut world, approvals, mut served) = running(vec![call("r1"), prose("Done.")], &[]);
+        let repo = workspace(&world).join("repo");
+        std::fs::create_dir_all(&repo).expect("repo");
+        let parked = report(world.ask(&mut served, "list it").await);
+        assert_eq!(parked.ending, TurnEnding::Parked);
+        let record = world.record();
+        let swapped = repo.clone();
+        *approvals.on_consume.lock().expect("lock") = Some(Box::new(move || replace(&swapped)));
+        let decided = world.decision(&record, Decision::Approve);
+        world.serve(&mut served, decided).await;
+        assert_eq!(approvals.events().len(), 1, "consumed after its check");
+        let results = results(&world);
+        assert_eq!(
+            results[0].outcome,
+            ToolOutcomeWord::Refused,
+            "{:?}",
+            results[0]
+        );
+
+        // Before a `session` allowance is used again.
+        let (mut world, approvals, mut served) = running(
+            vec![call("r1"), prose("Listed."), call("r2"), prose("Asked.")],
+            &[],
+        );
+        let repo = workspace(&world).join("repo");
+        std::fs::create_dir_all(&repo).expect("repo");
+        let parked = report(world.ask(&mut served, "list it").await);
+        assert_eq!(parked.ending, TurnEnding::Parked);
+        let record = world.record();
+        let mut content = decision_content(&record, Decision::Approve, None);
+        content["scope"] = json!("session");
+        let decided = world.decision_from(TGORKA, "PHONE", content);
+        world.serve(&mut served, decided).await;
+        assert_eq!(approvals.events().len(), 1);
+        replace(&repo);
+        let again = report(world.ask(&mut served, "list it again").await);
+        assert_eq!(again.ending, TurnEnding::Parked, "it asks again");
     }
 }
 
@@ -13088,6 +13637,7 @@ mod workflows {
             sessions_subfolder: deps.sessions_subfolder.clone(),
             lfs_threshold_bytes: deps.lfs_threshold_bytes,
             decisions: None,
+            sandbox: deps.sandbox.clone(),
         }
     }
 
@@ -13668,11 +14218,11 @@ mod workflows {
     }
 
     /// R202 (R94W-03): a run is admitted by what its turns would be
-    /// offered, not by `allow`. `run` is in Tola's `allow` but no turn is
-    /// offered it on this rung: a workflow naming it is refused. `helper`,
-    /// in her `allow`, is offered to a run's turns: a workflow naming it
-    /// starts. `reply` is not in her `allow`, but every run is offered it
-    /// by its kind: a workflow naming it starts.
+    /// offered, not by `allow`. `run` is in Tola's `allow` but no turn on a
+    /// host without a sandbox is offered it: a workflow naming it is
+    /// refused. `helper`, in her `allow`, is offered to a run's turns: a
+    /// workflow naming it starts. `reply` is not in her `allow`, but every
+    /// run is offered it by its kind: a workflow naming it starts.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_run_is_admitted_by_what_its_turns_are_offered() {
         let world = world(
@@ -13709,9 +14259,13 @@ mod workflows {
         let results = tool_results(&world.lines(DESK));
         let running = result_of(&results, "x1");
         assert_eq!(
-            running.content,
-            "Refused: `running` needs `run`, which `tola` is not allowed."
+            running.outcome,
+            ToolOutcomeWord::Refused,
+            "{}",
+            running.content
         );
+        let id = start_id(&desk.id(), "x1").to_string();
+        assert!(keeper_agent::sessions::verbs::find(&world.deps.sessions_zone, &id).is_none());
         for started in ["h1", "y1"] {
             let result = result_of(&results, started);
             assert_eq!(
@@ -13731,6 +14285,36 @@ mod workflows {
             "{folder}: {:?}",
             audit_list(&world, &desk.served)
         );
+    }
+
+    /// R202 on a host whose sandbox passed its probe: a run's turns there
+    /// are offered `run` when `allow` names it, so a workflow naming it
+    /// starts — a start is checked against the offer its turns get.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_sandboxed_host_admits_a_workflow_needing_run() {
+        let world = world(
+            ProviderKind::OpenAi,
+            &["drive_read"],
+            vec![
+                calls(&[("x1", "workflow_start", json!({"name": "running"}))]),
+                prose("Started."),
+            ],
+        );
+        put(
+            &world,
+            "running",
+            "version = 1\nname = \"running\"\ndescription = \"Runs.\"\ntools = [\"run\"]\n",
+        );
+        let mut allow = RUNS.to_vec();
+        allow.push("run");
+        let mut tola = tolas(&world, &allow);
+        tola.sandbox = Some(super::parks::sandbox("electra", &[]));
+        let mut desk = desk_of(&world, HOURLY, tola);
+        report(desk.serve(hour(9)).await);
+        let result = result_of(&tool_results(&world.lines(DESK)), "x1").clone();
+        assert_eq!(result.outcome, ToolOutcomeWord::Ok, "{}", result.content);
+        assert_eq!(desk.rooms.made().len(), 1);
     }
 
     /// R202 with 95.1 (R227): the memory tools are part of what a run's

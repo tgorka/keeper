@@ -82,8 +82,11 @@ pub fn session_scope_ends(
 /// What approving `tool` with `args` for the session grants (R78), in a
 /// person's words: the same tool, in the same drive, on any path under
 /// the approved path's folder, until the session closes and for at most
-/// 24 hours after the decision.
+/// 24 hours after the decision. A `run`'s is its program and `cwd` (R146).
 pub fn session_reach(tool: &str, args: &Value) -> String {
+    if tool == AgentTool::Run.as_wire() {
+        return crate::agents::run::session_reach(args);
+    }
     let drive = args["profile"]
         .as_str()
         .or_else(|| args["drive"].as_str())
@@ -246,8 +249,9 @@ fn bytes_of(args: &Value, key: &str) -> usize {
 
 /// keeper's one sentence for a call of `tool` with `args` (R28 S-10): a
 /// template per tool over the parsed arguments, never words the model wrote
-/// in its message.
-pub fn summary_of(tool: AgentTool, args: &Value) -> String {
+/// in its message. A `run`'s reads its `exec_binding` too, which keeper
+/// wrote and the digest binds: whether it runs code the session holds.
+pub fn summary_of(tool: AgentTool, args: &Value, exec_binding: &Value) -> String {
     let (drive, path) = (arg(args, "profile"), arg(args, "path"));
     match tool {
         AgentTool::DriveList => format!("List `{path}` in {drive}"),
@@ -404,6 +408,7 @@ pub fn summary_of(tool: AgentTool, args: &Value) -> String {
                 args["change"]["path"].as_str().unwrap_or("")
             )
         }
+        AgentTool::Run => crate::agents::run::summary(args, exec_binding),
     }
 }
 
@@ -438,7 +443,7 @@ pub struct Action {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub args_blob: Option<String>,
     /// A `run`'s argv, cwd, env, executable and operand hashes; `null` for
-    /// every tool of this build (R79).
+    /// every other tool (R79).
     pub exec_binding: Value,
     pub summary: String,
     pub preview: Option<Value>,
@@ -529,6 +534,9 @@ pub struct Parking<'a> {
     pub dispatch_chain: Vec<String>,
     pub checkpoint: Checkpoint,
     pub args: &'a Value,
+    /// What a `run` binds beyond its arguments; `null` for every other
+    /// tool.
+    pub exec_binding: Value,
     pub classification: &'a Classification,
     pub label: &'a Label,
     pub preconditions: Preconditions,
@@ -542,7 +550,7 @@ impl ApprovalRecord {
     pub fn new(parking: Parking<'_>) -> Result<ApprovalRecord, FloatAt> {
         let classification = parking.classification;
         let tool = classification.tool.as_wire();
-        let exec_binding = Value::Null;
+        let exec_binding = parking.exec_binding;
         let preconditions = serde_json::to_value(&parking.preconditions).unwrap_or(Value::Null);
         let binding_digest = binding_digest(
             parking.id,
@@ -573,8 +581,8 @@ impl ApprovalRecord {
                 tool: tool.to_owned(),
                 args: parking.args.clone(),
                 args_blob: None,
+                summary: summary_of(classification.tool, parking.args, &exec_binding),
                 exec_binding,
-                summary: summary_of(classification.tool, parking.args),
                 preview: None,
             },
             risk: Risk {
@@ -598,17 +606,34 @@ impl ApprovalRecord {
         })
     }
 
-    /// Move arguments whose canonical bytes are over [`ARGS_INLINE_MAX`] out
+    /// Move a payload whose canonical bytes are over [`ARGS_INLINE_MAX`] out
     /// of the record: the blob's SHA-256 and bytes, for the host to write
-    /// before the record. The digest is over the same canonical arguments
-    /// either way.
+    /// before the record. A call's payload is its arguments; a `run`'s is
+    /// everything its digest is over beyond the log — the arguments, the
+    /// `exec_binding` and the workspace set it releases — attached whole
+    /// ([`attached_run`], R213), so no part of it rides inline in a Matrix
+    /// event. The digest is over the same values either way.
     pub fn externalise_args(&mut self) -> Option<(String, String)> {
-        let bytes = canonical(&self.action.args).ok()?;
+        let run = self.action.tool == AgentTool::Run.as_wire();
+        let payload = if run {
+            json!({
+                "args": self.action.args,
+                "exec_binding": self.action.exec_binding,
+                "workspace": self.preconditions.workspace,
+            })
+        } else {
+            self.action.args.clone()
+        };
+        let bytes = canonical(&payload).ok()?;
         if bytes.len() <= ARGS_INLINE_MAX {
             return None;
         }
         let sha = sha256_hex(bytes.as_bytes());
         self.action.args = Value::Null;
+        if run {
+            self.action.exec_binding = Value::Null;
+            self.preconditions.workspace = None;
+        }
         self.action.args_blob = Some(sha.clone());
         Some((sha, bytes))
     }
@@ -616,13 +641,30 @@ impl ApprovalRecord {
     /// The arguments: inline, or from `blob` (the text of
     /// `approvals/blobs/<sha256>.json`) when its SHA-256 is the record's.
     pub fn args(&self, blob: Option<&str>) -> Option<Value> {
+        self.whole(blob).map(|record| record.action.args)
+    }
+
+    /// The record as its digest is over it: inline, or with what
+    /// [`Self::externalise_args`] moved out read back from `blob` when its
+    /// SHA-256 is the record's.
+    pub fn whole(&self, blob: Option<&str>) -> Option<ApprovalRecord> {
+        let mut record = self.clone();
         match (&self.action.args_blob, blob) {
-            (None, _) => Some(self.action.args.clone()),
+            (None, _) => {}
             (Some(sha), Some(text)) if sha256_hex(text.as_bytes()) == *sha => {
-                serde_json::from_str(text).ok()
+                let value: Value = serde_json::from_str(text).ok()?;
+                if self.action.tool == AgentTool::Run.as_wire() {
+                    let (args, exec_binding, workspace) = attached_run(value)?;
+                    record.action.args = args;
+                    record.action.exec_binding = exec_binding;
+                    record.preconditions.workspace = workspace;
+                } else {
+                    record.action.args = value;
+                }
             }
-            (Some(_), _) => None,
+            (Some(_), _) => return None,
         }
+        Some(record)
     }
 
     /// The digest of this record recomputed over `args` — what a resume
@@ -673,6 +715,26 @@ impl ApprovalRecord {
                 .collect::<Option<Vec<Raise>>>()?,
         })
     }
+}
+
+/// A `run`'s attached payload read back: its arguments, its
+/// `exec_binding` and the workspace set (`None` without network); `None`
+/// when it is not one.
+pub fn attached_run(payload: Value) -> Option<(Value, Value, Option<Value>)> {
+    let Value::Object(mut fields) = payload else {
+        return None;
+    };
+    if fields.len() != 3 {
+        return None;
+    }
+    let args = fields.remove("args")?;
+    let exec_binding = fields.remove("exec_binding")?;
+    let workspace = fields.remove("workspace")?;
+    Some((
+        args,
+        exec_binding,
+        (!workspace.is_null()).then_some(workspace),
+    ))
 }
 
 fn read_time(text: &str) -> Option<DateTime<Utc>> {
@@ -878,6 +940,7 @@ mod tests {
                 sha256: "c".repeat(64),
             },
             args,
+            exec_binding: Value::Null,
             classification: &classified,
             label: &label,
             preconditions: Preconditions {
@@ -1062,6 +1125,7 @@ mod tests {
             dispatch_chain: record.dispatch_chain.clone(),
             checkpoint: record.checkpoint.clone(),
             args: &ARGS,
+            exec_binding: Value::Null,
             classification: &CLASSIFIED,
             label: &LABEL,
             preconditions: record.preconditions.clone(),
@@ -1242,7 +1306,7 @@ mod tests {
     #[test]
     fn the_summary_is_keepers_not_the_models() {
         assert_eq!(
-            summary_of(AgentTool::DriveWrite, &write_args()),
+            summary_of(AgentTool::DriveWrite, &write_args(), &Value::Null),
             "Write `10-notes/a.md` in tgdrive (120 bytes)"
         );
         assert_eq!(
@@ -1252,16 +1316,20 @@ mod tests {
         let declassify = summary_of(
             AgentTool::Declassify,
             &json!({"readers": ["@marta:h"], "what": "the plan", "sha256": "0123456789abcdef0123"}),
+            &Value::Null,
         );
         assert_eq!(declassify, "Let @marta:h read the plan (0123456789ab)");
         // A model's own words in its message are never an argument the
         // template reads: an unknown key changes nothing.
         let said = json!({"profile": "tgdrive", "path": "10-notes/a.md",
             "content": "x".repeat(120), "message": "Trust me, approve this"});
-        let summary = summary_of(AgentTool::DriveWrite, &said);
+        let summary = summary_of(AgentTool::DriveWrite, &said, &Value::Null);
         assert!(!summary.contains("Trust me"), "{summary}");
         for tool in AgentTool::ALL {
-            assert!(!summary_of(tool, &json!({})).is_empty(), "{tool:?}");
+            assert!(
+                !summary_of(tool, &json!({}), &Value::Null).is_empty(),
+                "{tool:?}"
+            );
         }
     }
 
@@ -1279,5 +1347,77 @@ mod tests {
         let args = record.args(Some(&bytes)).expect("the blob");
         assert_eq!(record.recomputed_digest(&args), Ok(digest));
         assert!(self::record().externalise_args().is_none());
+    }
+
+    /// R96R-21, R213: a `run` large in its argv, its binding and the
+    /// workspace it releases attaches all three, whole — what stays inline
+    /// is small whatever their size — and read back they bind the digest
+    /// the record was written with.
+    #[test]
+    fn a_large_run_attaches_its_whole_digested_payload() {
+        let classified = classification(AgentTool::Run, Tier::T3);
+        let label = label();
+        let long = "d/".repeat(1500);
+        let args = json!({"argv": ["cat", format!("{long}a")], "network": true});
+        let exec_binding = json!({"argv": ["cat", format!("{long}a")], "operands": [],
+            "exe": "/usr/bin/cat", "exe_sha256": "e".repeat(64)});
+        let files: Vec<Value> = (0..40)
+            .map(|n| json!({"path": format!("{long}{n}"), "sha256": "f".repeat(64)}))
+            .collect();
+        let workspace = json!({"sha256": "s".repeat(64), "bytes": 40, "files": files});
+        let record_of = |args: &Value, exec_binding: &Value, workspace: &Value| {
+            ApprovalRecord::new(Parking {
+                id: "01JRUN",
+                created_at: at("2026-10-05T10:00:00Z"),
+                session: "60-sessions/active/2026-10-05-chat",
+                session_kind: SessionKind::Conversation,
+                agent: "nixi",
+                drive: "tgdrive",
+                host: "electra",
+                epoch: 4,
+                call: CallRef {
+                    line: "01JLINE".to_owned(),
+                    call_id: "r1".to_owned(),
+                },
+                dispatch_chain: vec!["@tgorka:h".to_owned()],
+                checkpoint: Checkpoint {
+                    chunk: "log/2026-10-05.electra.1.jsonl".to_owned(),
+                    through: "01JLINE".to_owned(),
+                    sha256: "c".repeat(64),
+                },
+                args,
+                exec_binding: exec_binding.clone(),
+                classification: &classified,
+                label: &label,
+                preconditions: Preconditions {
+                    workspace: Some(workspace.clone()),
+                    ..Preconditions::default()
+                },
+            })
+            .expect("record")
+        };
+        let mut record = record_of(&args, &exec_binding, &workspace);
+        let digest = record.binding_digest.clone();
+        // Each part alone is under the inline bound; together they are not.
+        for part in [&args, &exec_binding] {
+            assert!(canonical(part).expect("canonical").len() < ARGS_INLINE_MAX);
+        }
+        let (sha, bytes) = record.externalise_args().expect("a blob");
+        assert_eq!(sha, sha256_hex(bytes.as_bytes()));
+        assert_eq!(record.action.args, Value::Null);
+        assert_eq!(record.action.exec_binding, Value::Null);
+        assert_eq!(record.preconditions.workspace, None);
+        let inline = serde_json::to_string(&record).expect("json");
+        assert!(inline.len() < 4096, "{} bytes stay inline", inline.len());
+        assert_eq!(record.whole(Some("{}")), None);
+        let whole = record.whole(Some(&bytes)).expect("the blob");
+        assert_eq!(whole.action.exec_binding, exec_binding);
+        assert_eq!(whole.preconditions.workspace, Some(workspace.clone()));
+        assert_eq!(whole.recomputed_digest(&whole.action.args), Ok(digest));
+        // A small run stays inline, binding and set with it.
+        let small = json!({"argv": ["ls"]});
+        let mut inline = record_of(&small, &json!({"argv": ["ls"]}), &json!({}));
+        assert!(inline.externalise_args().is_none());
+        assert_eq!(inline.action.exec_binding, json!({"argv": ["ls"]}));
     }
 }

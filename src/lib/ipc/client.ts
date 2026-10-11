@@ -356,6 +356,7 @@ export type { ApprovalCardVm } from "./gen/ApprovalCardVm";
 export type { ApprovalDecideReq } from "./gen/ApprovalDecideReq";
 export type { ApprovalDecision } from "./gen/ApprovalDecision";
 export type { ApprovalDraftVm } from "./gen/ApprovalDraftVm";
+export type { ApprovalPayloadVm } from "./gen/ApprovalPayloadVm";
 export type { ApprovalPersonVm } from "./gen/ApprovalPersonVm";
 export type { ApprovalScope } from "./gen/ApprovalScope";
 export type { ApprovalStateVm } from "./gen/ApprovalStateVm";
@@ -762,6 +763,7 @@ import type { AgentSeedReq } from "./gen/AgentSeedReq";
 import type { AgentSeedResultVm } from "./gen/AgentSeedResultVm";
 import type { ApprovalDecideReq } from "./gen/ApprovalDecideReq";
 import type { ApprovalDraftVm } from "./gen/ApprovalDraftVm";
+import type { ApprovalPayloadVm } from "./gen/ApprovalPayloadVm";
 import type { BackupStatus } from "./gen/BackupStatus";
 import type { BbctlAvailabilityVm } from "./gen/BbctlAvailabilityVm";
 import type { BbctlProgressVm } from "./gen/BbctlProgressVm";
@@ -7624,9 +7626,10 @@ export async function agentApprovalDecide(
 
 /**
  * The attached action of the approval card `id` in the session room
- * `roomId` (a card whose `attachment` is set), as pretty-printed JSON: its
- * encrypted file fetched and checked against the card's digest in Rust.
- * Once shown, the action may be approved from this app.
+ * `roomId` (a card whose `attachment` is set): as pretty-printed JSON
+ * (`text`) and, for a `run`, the same typed run view an inline card draws
+ * (`run`), its encrypted file fetched and checked against the card's
+ * digest in Rust. Once shown, the action may be approved from this app.
  *
  * Rejects with `unsupported` and a sentence when the attachment is not the
  * action sent for approval, cannot be fetched now, or the card has none.
@@ -7635,8 +7638,8 @@ export async function agentApprovalPayload(
   accountId: string,
   roomId: string,
   id: string,
-): Promise<string> {
-  return await invoke<string>("agent_approval_payload", { accountId, roomId, id });
+): Promise<ApprovalPayloadVm> {
+  return await invoke<ApprovalPayloadVm>("agent_approval_payload", { accountId, roomId, id });
 }
 
 /**

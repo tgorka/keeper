@@ -1267,6 +1267,7 @@ pub fn review_record(
             sha256: String::new(),
         },
         args: &value,
+        exec_binding: serde_json::Value::Null,
         classification: &classification,
         label: &args.label,
         preconditions: Preconditions {

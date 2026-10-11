@@ -235,6 +235,46 @@ pub async fn consume_once(
     }
 }
 
+/// The request a person's card is drawn from for `record`, as written —
+/// its large payload already moved out ([`ApprovalRecord::externalise_args`])
+/// and uploaded as `file` (its `EncryptedFile` JSON) — in the session room
+/// `room`, decided by `approvers` (empty: anyone reading). Every field its
+/// digest is over is the record's own.
+pub(crate) fn request_content(
+    record: &ApprovalRecord,
+    room: &str,
+    approvers: Vec<String>,
+    file: Option<Value>,
+) -> ApprovalRequestContent {
+    ApprovalRequestContent {
+        v: CONTENT_VERSION,
+        id: record.id.clone(),
+        session: record.session.clone(),
+        room: room.to_owned(),
+        agent: record.agent.clone(),
+        tier: record.risk.tier,
+        summary: record.action.summary.clone(),
+        action: RequestAction {
+            tool: record.action.tool.clone(),
+            args: record.action.args.clone(),
+            exec_binding: record.action.exec_binding.clone(),
+        },
+        file_sha256: file.as_ref().and(record.action.args_blob.clone()),
+        file,
+        checkpoint_sha256: record.checkpoint.sha256.clone(),
+        preconditions: record.preconditions.clone(),
+        binding_digest: record.binding_digest.clone(),
+        scopes: record
+            .scopes
+            .iter()
+            .map(|scope| scope.as_word().to_owned())
+            .collect(),
+        expires_at: record.expires_at.clone(),
+        approvers,
+        dispatch_chain: record.dispatch_chain.clone(),
+    }
+}
+
 /// The call a turn's host parked: what the record needs beyond the wire.
 #[derive(Debug, Clone)]
 pub(crate) struct Parking {
@@ -246,6 +286,11 @@ pub(crate) struct Parking {
     /// A flow its sinks blocked: the `declassify` action's arguments, the
     /// call itself added once its wire is known (R89).
     pub declassify: Option<Value>,
+    /// A `run`'s `exec_binding` (AD-393); `null` for every other call.
+    pub exec_binding: Value,
+    /// A networked `run`'s workspace set, its `preconditions.workspace`
+    /// (S-03).
+    pub workspace: Option<Value>,
 }
 
 /// A parked turn, handed from the tool loop to the worker.
@@ -272,13 +317,24 @@ pub(crate) struct Released {
     pub readers: std::collections::BTreeSet<OwnedUserId>,
 }
 
+/// What a consumed `run` approval was checked against (R144, R213): its
+/// `exec_binding` and the workspace set it releases. The execution it lets
+/// go prepares again and runs only when both are still these — one fact set
+/// from the check before `consumed` to the program's start.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ApprovedRun {
+    pub exec_binding: Value,
+    pub workspace: Option<Value>,
+}
+
 /// What became of a parked call when it was settled.
 #[derive(Debug, Clone)]
 pub(crate) enum Settled {
     /// Its approval was consumed here: it runs as its record bound it —
     /// the tool and the exact arguments, never the log's redacted copy
-    /// (R174) — with the flow a `declassify` approval releases.
-    Run(chat::ToolCall, Option<Released>),
+    /// (R174) — with the flow a `declassify` approval releases, and a
+    /// `run`'s checked facts.
+    Run(chat::ToolCall, Option<Released>, Option<Box<ApprovedRun>>),
     /// It does not run; the model is told this.
     Refuse(String),
 }
@@ -425,6 +481,18 @@ pub(crate) fn read_stored_record(
     session_dir: &Path,
     id: &str,
 ) -> Result<(ApprovalRecord, Value), String> {
+    let (record, whole) = read_stored_whole(session_dir, id)?;
+    Ok((record, whole.action.args))
+}
+
+/// [`read_stored_record`]'s record `id` as it is stored — what its request
+/// is announced from, its large payload an attachment — and as its digest
+/// is over it, with what [`ApprovalRecord::externalise_args`] moved out read
+/// back.
+pub(crate) fn read_stored_whole(
+    session_dir: &Path,
+    id: &str,
+) -> Result<(ApprovalRecord, ApprovalRecord), String> {
     let unread = |error: std::io::Error| format!("the approval record could not be read: {error}");
     let dir = contained(&session_dir.join(APPROVALS_DIR), false).map_err(unread)?;
     let text = read_text_in(&dir, &format!("{id}.json")).map_err(unread)?;
@@ -440,10 +508,10 @@ pub(crate) fn read_stored_record(
         ),
         None => None,
     };
-    let args = record
-        .args(blob.as_deref())
+    let whole = record
+        .whole(blob.as_deref())
         .ok_or_else(|| "the approval's arguments do not match their digest".to_owned())?;
-    Ok((record, args))
+    Ok((record, whole))
 }
 
 /// The decision written beside `id`'s record in the store of the session at
@@ -606,9 +674,22 @@ impl ServedSession {
         approvals_dir(deps, &self.context.session.path, make)
     }
 
-    /// The record `id`, read strictly, with its arguments.
+    /// The record `id`, read strictly, as its digest is over it (its
+    /// attached payload read back), with its arguments.
     fn read_record(&self, deps: &AgentDeps, id: &str) -> Result<(ApprovalRecord, Value), String> {
-        read_stored_record(&deps.sessions_zone.join(&self.context.session.path), id)
+        let (_, whole) = self.read_stored(deps, id)?;
+        let args = whole.action.args.clone();
+        Ok((whole, args))
+    }
+
+    /// The record `id` as it is stored and as its digest is over it
+    /// ([`read_stored_whole`]).
+    fn read_stored(
+        &self,
+        deps: &AgentDeps,
+        id: &str,
+    ) -> Result<(ApprovalRecord, ApprovalRecord), String> {
+        read_stored_whole(&deps.sessions_zone.join(&self.context.session.path), id)
     }
 
     /// The round file of `id`: the parked round's later calls as the model
@@ -792,6 +873,7 @@ impl ServedSession {
                 sha256: sha,
             },
             args: &parked.args,
+            exec_binding: parked.parking.exec_binding.clone(),
             classification: &parked.parking.classification,
             label: &self.context.label,
             preconditions,
@@ -942,33 +1024,7 @@ impl ServedSession {
             Readers::Only(set) => set.iter().map(|user| user.to_string()).collect(),
             Readers::Anyone => Vec::new(),
         };
-        let content = ApprovalRequestContent {
-            v: CONTENT_VERSION,
-            id: record.id.clone(),
-            session: record.session.clone(),
-            room: self.context.agent.room.to_string(),
-            agent: record.agent.clone(),
-            tier: record.risk.tier,
-            summary: record.action.summary.clone(),
-            action: RequestAction {
-                tool: record.action.tool.clone(),
-                args: record.action.args.clone(),
-                exec_binding: record.action.exec_binding.clone(),
-            },
-            file_sha256: file.as_ref().and(record.action.args_blob.clone()),
-            file,
-            checkpoint_sha256: record.checkpoint.sha256.clone(),
-            preconditions: record.preconditions.clone(),
-            binding_digest: record.binding_digest.clone(),
-            scopes: record
-                .scopes
-                .iter()
-                .map(|scope| scope.as_word().to_owned())
-                .collect(),
-            expires_at: record.expires_at.clone(),
-            approvers,
-            dispatch_chain: record.dispatch_chain.clone(),
-        };
+        let content = request_content(record, self.context.agent.room.as_ref(), approvers, file);
         let value = serde_json::to_value(&content).map_err(failed)?;
         let gate = self.gate(deps, port);
         // A declassification is decided in its approvers' proxy DMs, never
@@ -1209,7 +1265,7 @@ impl ServedSession {
         self.adopt_records(deps);
         let pending: Vec<Pending> = self.context.parked.values().cloned().collect();
         for pending in pending {
-            let record = self.read_record(deps, &pending.id).ok();
+            let record = self.read_stored(deps, &pending.id).ok();
             if let Some((record, _)) = &record {
                 self.due.insert(pending.id.clone(), record.expires());
             }
@@ -1629,13 +1685,23 @@ impl ServedSession {
             None if !read.complete => return unknown(self, sent),
             _ => {}
         }
-        let checked: Result<(chat::ToolCall, Option<Released>), (String, ApprovalState)> =
-            match self.read_record(deps, id) {
-                Err(reason) => Err((reason, ApprovalState::Refused)),
-                Ok((record, args)) => self
-                    .preconditions(deps, pending, &record, &args, decision)
-                    .map(|()| bound_call(&record, args)),
-            };
+        type Checked = (
+            chat::ToolCall,
+            Option<Released>,
+            Option<Box<ApprovedRun>>,
+            Option<keeper_core::agents::run::RunAllowance>,
+        );
+        let checked: Result<Checked, (String, ApprovalState)> = match self.read_record(deps, id) {
+            Err(reason) => Err((reason, ApprovalState::Refused)),
+            Ok((record, args)) => self
+                .preconditions(deps, pending, &record, &args, decision)
+                .map(|()| {
+                    let run = approved_run(&record);
+                    let allowance = run_allowance(&record, decision);
+                    let (call, released) = bound_call(&record, args);
+                    (call, released, run, allowance)
+                }),
+        };
         let call = match checked {
             Ok(call) => call,
             Err((reason, state)) => {
@@ -1692,7 +1758,10 @@ impl ServedSession {
                 match mirrored {
                     Ok(()) => {
                         self.settling.remove(id);
-                        Some(Settled::Run(call.0, call.1))
+                        // A `session` approval of a T2 run lets its kin go
+                        // on this host until the session closes (R146).
+                        self.context.run_allowances.extend(call.3);
+                        Some(Settled::Run(call.0, call.1, call.2))
                     }
                     Err(_) => unknown(self, Some(ours)),
                 }
@@ -1763,7 +1832,48 @@ impl ServedSession {
         if let Some(reason) = self.sink_now_blocks(deps, record, args) {
             return drift(reason);
         }
+        if let Some(reason) = self.run_moved(deps, record, args) {
+            return drift(reason);
+        }
         Ok(())
+    }
+
+    /// What a `run` record relied on beyond its files, read again before
+    /// its approval is consumed (R144, R213): the binding recomputed whole
+    /// here — the host that resolves it (digested, so a record moved to or
+    /// edited for another host drifts), the folder `cwd` resolves to, the
+    /// programs' paths and SHA-256 and every operand's — over the drives
+    /// the agent's grants let it read now, and, with network, the workspace
+    /// set the card showed (S-03).
+    fn run_moved(&self, deps: &AgentDeps, record: &ApprovalRecord, args: &Value) -> Option<String> {
+        if record.action.tool != AgentTool::Run.as_wire() {
+            return None;
+        }
+        let Some(sandbox) = &deps.sandbox else {
+            return Some("this host no longer offers a sandbox".to_owned());
+        };
+        let drives = crate::agent::run_drives(&self.context, deps);
+        let session = crate::run::Session {
+            drive: &deps.drive_root,
+            zone: &deps.sessions_subfolder,
+            path: &self.context.session.path,
+        };
+        let now = match crate::agent::off_the_runtime(|| sandbox.prepare(args, session, &drives)) {
+            Ok(now) => now,
+            Err(reason) => return Some(reason),
+        };
+        if now.exec_binding != record.action.exec_binding {
+            tracing::warn!(approval = %record.id, "agents: a run's host, folder, program or the code it runs changed after its approval");
+            return Some(
+                "where it runs, its program, or the code it runs changed after it was approved"
+                    .to_owned(),
+            );
+        }
+        if now.workspace_set != record.preconditions.workspace {
+            tracing::warn!(approval = %record.id, "agents: a networked run's workspace changed after its approval");
+            return Some("its workspace changed after it was approved".to_owned());
+        }
+        None
     }
 
     /// Whether this host holds the session's claim now: its lease lets it
@@ -2107,6 +2217,35 @@ impl ServedSession {
             self.close_row(deps, &pending.id, AuditOutcome::Refused);
         }
     }
+}
+
+/// What a consumed `run` record was checked against; `None` for every
+/// other tool.
+fn approved_run(record: &ApprovalRecord) -> Option<Box<ApprovedRun>> {
+    (record.action.tool == AgentTool::Run.as_wire()).then(|| {
+        Box::new(ApprovedRun {
+            exec_binding: record.action.exec_binding.clone(),
+            workspace: record.preconditions.workspace.clone(),
+        })
+    })
+}
+
+/// The allowance a `session` decision on a T2 `run` record gives (R146):
+/// what its binding covers, until 24 hours after the decision; `None` for
+/// any other decision, tool or tier.
+fn run_allowance(
+    record: &ApprovalRecord,
+    decision: &DecisionRecord,
+) -> Option<keeper_core::agents::run::RunAllowance> {
+    let decided = chrono::DateTime::parse_from_rfc3339(&decision.decided_at).ok()?;
+    (record.action.tool == AgentTool::Run.as_wire()
+        && decision.scope == approval::Scope::Session
+        && record.risk.tier == 2)
+        .then(|| keeper_core::agents::run::RunAllowance {
+            approval: record.id.clone(),
+            key: keeper_core::agents::run::allowance_key(&record.action.exec_binding),
+            ends: approval::session_scope_ends(decided.with_timezone(&Utc), None),
+        })
 }
 
 /// The call `record` binds, as it runs after approval: its call id, its

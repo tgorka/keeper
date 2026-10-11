@@ -309,6 +309,21 @@ toml_edit = "0.25.12"
 # tempfile and tokio, so the tree gains no package.
 # `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT`.
 rustix = { version = "1.1", default-features = false, features = ["std", "fs", "process"] }
+# An agent's `run` on Linux (D-33, AD-405): agentd re-executes itself, applies a
+# landlock ruleset and a seccomp filter to itself and then execs the program —
+# no `unsafe`. Linux-only target dependencies of keeper-agent. landlock is
+# `MIT OR Apache-2.0`, seccompiler (Firecracker's) `Apache-2.0 OR BSD-3-Clause`;
+# both pass `cargo deny check`.
+landlock = "0.4"
+seccompiler = "0.5"
+# Syscall numbers and address families for that filter — constants only, no
+# call through it. Already in Cargo.lock; `MIT OR Apache-2.0`.
+libc = "0.2"
+# The trampoline closes every descriptor it inherited but the standard
+# streams before it execs a run's program (R213): `nix::unistd::close` takes a
+# raw number safely, which std and rustix do not, so keeper's code stays free
+# of `unsafe` (R141). No feature: `unistd` is always built. MIT.
+nix = { version = "0.31", default-features = false }
 # Exact-length streaming request bodies for LFS uploads (Story 25.3). This is
 # not optional sugar: `reqwest::Body::wrap_stream` and `Body::from(File)` both
 # yield an unknown-size body and therefore `Transfer-Encoding: chunked`, which

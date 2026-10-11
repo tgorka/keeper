@@ -9003,3 +9003,116 @@ origin: epic 95, story 95.5 panel restack (R300; from R95P6-01, review-95panel-6
 location: `dev/mock-shell.ts` ~:2496–2507 (README's fourth cell; archive snapshot ~:2530–2541, ~:2825–2828); Rust reference `keeper-core` `sessions::promote.rs` ~:345–350, 375–402 and `notes/frontmatter.rs` ~:261–285, 505–520, 710–716, 823–842
 reason: the dev mock's publication-receipt digest (`dev/mock-shell.ts` ~:2496–2507, used for the README's fourth cell and the archive snapshot ~:2530–2541, ~:2825–2828) is a second frontmatter parser that disagrees with Rust's `Frontmatter` (`keeper-core/src/sessions/promote.rs` ~:345–350, 375–402; `notes/frontmatter.rs` ~:261–285, 505–520, 710–716, 823–842): it accepts only an unpadded opening `---` and a `---` close (Rust also accepts trailing whitespace on the opening fence and `...` as a close), drops a comment line following the removed review entry (Rust keeps comments outside the entry's span), and keeps a quoted `"human_reviewed": false` (Rust unquotes/trims keys). So the mock's receipts and snapshot revisions can differ from the built app's for those inputs; the nine command-vector scenarios cover only canonical inputs. Dev-only: no production write. Fix: carry Rust-recorded receipts in the viewing fixtures instead of a TS parser; or, if dynamic computation stays, match Rust's span/fence semantics and add shared Rust/TS vectors for the three counterexamples (comment after a review block, quoted/padded review key, alternate/padded fences) — never re-record expectations from the TS side.
 status: open
+
+### DW-750: A `run` card does not draw its execution binding (UX-DR139).
+
+origin: epic 96, story 96.1 (rung `agents-96-run`, R155, 2026-10-06)
+location: `src-tauri/crates/keeper-core/src/agents/approval_card.rs` (`ApprovalCardVm`), `src/components/` (the approval card)
+reason: R155 (Q15's (b), epic 93 being cut) puts UX-DR139's payload — the argv one element per line, the resolved program with 12 hex digits of its SHA-256, each held file's hash, the *Network* chip with the workspace's file count, size and list — on the card through 96.1, with the design lane deciding before the rung. That decision has not been made, so this rung changes no view model or component: the card shows keeper's summary (*with network*, *with code the session holds*), the tier and the exact arguments; the binding is digested and re-checked at consume (R144) but not drawn. Close with the design lane's decision, an `exec` part of `ApprovalCardVm` (ts-rs) and the card's rendering, proved in a real browser at 1280 and 420 px.
+status: closed 2026-10-07
+resolution: Fixed by R213 (R96R-17): `ApprovalCardVm.run` (`RunCardVm`, `RunNetworkVm`, ts-rs) carries the argv as it runs, the program and a wrapped program with 12 hex digits of their SHA-256, the resolved folder, each held file's hash and, with network, the *Network* chip's sentence and file list; `approval-card.tsx` draws it. Proved by `approval_card` VM tests, `approval-card.test.tsx` ("draws a run as keeper bound it") and the mock-shell `run` card in a real browser.
+
+### DW-751: A `run`'s session allowance (R146) is described but no host applies a session allowance.
+
+origin: epic 96, story 96.1 (rung `agents-96-run`, R146, 2026-10-06)
+location: `src-tauri/crates/keeper-core/src/agents/run.rs` (`session_reach`), `src-tauri/crates/keeper-agent/src/approvals.rs`
+reason: A T2 `run` outside `main` offers `session`, and the card says what it would grant (the same program by SHA-256, the same `cwd`, any argv, no network, no held code). No host of this build reuses a `session` decision for a later call of any tool (R78's reuse is unbuilt for drive writes too), so every run still asks. Close with the reuse, matching on `exec_binding.exe_sha256` and `cwd` for `run`.
+status: closed 2026-10-07
+resolution: Fixed by R213 (R96R-18): a `session` decision on a T2 run gives the consuming host a `run::RunAllowance` (same host, program SHA-256s and resolved cwd, any argv, T2 only, never `main`, ≤ 24 h, in memory until the session closes). Proved by `run::tests::a_run_allowance_covers_only_its_kin` and `agent_turns parks::a_session_approval_lets_the_same_program_run_again`.
+
+### DW-752: Shell strings carried by programs outside the refusal table.
+
+origin: epic 96, story 96.1 (rung `agents-96-run`, D-33, 2026-10-06)
+location: `src-tauri/crates/keeper-core/src/agents/run.rs` (`shell_string`)
+reason: The table refuses a shell's `-c`, `--command` and standard-input script directly, behind `env` (and `env -S`), `nice`, `nohup`, `timeout`, `xargs`, `stdbuf`, `command`, `time`, `setsid`, `ionice`, `busybox`, and a shell named later with `-c` (`find -exec sh -c`). Other programs run text as a command line too: `watch`, `flock … -c`, `script -c`, `ssh host <command>`, a git alias `-c alias.x=!…`. Each runs inside the same sandbox and tier, so nothing escapes it, but D-33's letter is broader than the table. Close with those rows.
+status: closed 2026-10-07
+resolution: Fixed by R213 (R96R-07): `run::command_string` and the wrapper table refuse `watch`, `script`, `flock -c`, `ssh` remote commands and command options, `scp -S`, `sftp -b`, `rsync -e`, git's `-c`/`--config-env`/`--exec-path` and command-running subcommands (`COMMAND_STRING`). Proved by `run::tests::run_refuses_a_command_line_given_as_text`, one mutant per row. The table is not exhaustive.
+
+### DW-753: A repository's own `.git/config` inside `workspace/` can name programs git runs.
+
+origin: epic 96, story 96.1 (rung `agents-96-run`, S-08, 2026-10-06)
+location: `src-tauri/crates/keeper-core/src/agents/run.rs` (`held_files`)
+reason: S-08 counts hooks git would run and the workspace root's dotfiles as code the session holds; `workspace/repo/.git/config` is neither, yet `core.fsmonitor`, `core.sshCommand`, `diff.*.textconv` and filter drivers there name programs git starts (the run's `-c core.hooksPath=/dev/null` stops hooks only). The program still runs in the sandbox at the run's tier. Close by counting a nested repository's `.git/config` as held when it names a program-running key, or by passing `-c core.fsmonitor=false` and kin.
+status: closed 2026-10-07
+resolution: Fixed by R213 (R96R-09): a `.git/config` at any depth whose keys are not all descriptive (`run::git_config_runs_code`) is code the session holds (T4, hashed into the binding). Proved by `run::tests::a_repository_config_that_runs_a_program_is_held_code` and `keeper-agent run::tests::code_the_session_holds_is_found_on_the_disk`.
+
+### DW-754: A networked run of a workspace above 512 files is refused instead of attaching its set.
+
+origin: epic 96, story 96.1 (rung `agents-96-run`, S-03, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/run/mod.rs` (`prepare`)
+reason: The workspace set rides in the request's `preconditions`, inline, so a set of thousands of files would exceed a Matrix event; keeper refuses such a run with a sentence rather than sending a request no room carries. Close with the set as an encrypted attachment beside the arguments (R86's blob discipline), digested the same way.
+status: open
+
+### DW-755: The Mac's `[sandbox]` table (read_exec, env) has no home.
+
+origin: epic 96, story 96.1 (rung `agents-96-run`, R148, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/desktop.rs` (`desktop_sandbox`)
+reason: R148 keeps the same `read_exec`/`env` table device-local on the Mac; this rung grants the Mac only the system folders and the folder `xcode-select -p` names, so a toolchain under the person's home (rustup, nvm) is not reachable there. Close with the table in the Mac's device-local agent store (Q9's pins-style store) and Settings › Agents.
+status: moved 2026-10-07
+resolution: Scope moved by R213 (R96R-19): the validation is `run::SandboxTable::check`, used by agentd and the Mac now; the Mac's device-local store, its Settings section and the desktop host reading it land in rung 3 `agents-96-mcp-mac` with the MCP table (Q9(a)). Until then the Mac runs the default table and its status says no `[sandbox]` table is configurable there.
+
+### DW-756: A person's stop does not stop a `run` that is under way.
+
+origin: epic 96, story 96.1 (rung `agents-96-run`, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/run/mod.rs` (`execute_in`)
+reason: A run ends at its exit or its `timeout_s` (at most 1800 s), its whole process group killed either way; the turn's cancel signal is not read while it waits, so a stop takes effect when the run ends. Close by handing the turn's `CancelSignal` to `execute` and killing the group on it.
+status: open
+
+### DW-757: A process of a Mac run that left its group and rewrote its environment outlives the run.
+
+origin: epic 96, story 96.1 (rung `agents-96-run`, review R96R-06, R213, 2026-10-07)
+location: `src-tauri/crates/keeper-agent/src/run/macos.rs` (`sweep`)
+reason: A sandbox profile cannot refuse `setsid`, so after killing the run's group the Mac kills every process of the user whose environment names the run's own `TMPDIR`. A descendant that left the group and also cleared or rewrote `TMPDIR` in its own environment is not found and keeps running. Close with a set the kernel tracks: walk the run's process tree from its pid (`proc_listchildpids`, through the shell crate's Platform port) before the kill.
+status: accepted residual (R231, 2026-10-07; its description corrected by R247, 2026-10-08): the Mac gives no unforgeable descendant identity without privileges keeper does not hold. An escaped descendant stays inside the same SBPL profile and keeps every grant the run had after keeper returns its result — `workspace/` read and write, and for a run without network the drives it asked to read (`read`), read-only, since the profile is applied once and the sweep revokes nothing; a networked run reads no drive. It gets no secret, no other drive and no network the run did not have. The run's result says what was swept (`run::Reaped::Swept { found }`), never that every process ended. docs/agents.md § *Running a command* and `run/macos.rs` say the same.
+
+### DW-758: A Linux run cannot set a file's mode or times even inside `workspace/`.
+
+origin: epic 96, story 96.1 (rung `agents-96-run`, review R96R-03, R213, 2026-10-07)
+location: `src-tauri/crates/keeper-agent/src/run/linux.rs` (`refused`)
+reason: Landlock does not mediate the chmod/chown/xattr/utime families, so keeper's seccomp filter refuses them in every run with `EPERM`; `chmod +x`, `tar x` and `cp -p` therefore cannot set modes or times in the workspace either. Close, where unprivileged user namespaces exist, with a mount namespace whose view of everything but `workspace/`, `HOME` and `TMPDIR` is read-only, and the metadata calls allowed again.
+status: open
+
+### DW-759: A script, a held file or a workspace file changed by another writer after the last check is used as it is then; the Mac checks its program before `sandbox-exec` starts it by path.
+
+origin: epic 96, story 96.1 (rung `agents-96-run`, review R96R-12, R213, 2026-10-07; re-audit R96R2-08, R231)
+location: `src-tauri/crates/keeper-agent/src/run/{mod.rs (verify_program), linux.rs (exec), macos.rs (command)}`
+reason: Since R231 the Linux trampoline reads the program's bytes through one open handle and starts it by that handle (`execveat` on the descriptor), so an ELF program put at its path after the check does not run. What stays: a `#!` script is started by its path, since its interpreter opens it by name and the descriptor cannot reach it under landlock; the held files (scripts, configuration) and, for a networked run, the workspace it releases are read by the program as they are when it reads them, so a writer outside the run (sync, another process of the host) changing them after the trampoline's last check is not seen; and on the Mac the parent checks the program before `sandbox-exec` execs it by path. Close with a snapshot: the verified bytes copied into a folder of the run's own, read-only to it, and the program and held code run from there.
+status: accepted residual (R231, 2026-10-07; R245, 2026-10-08: a `#!` program outside the workspace that `read_exec` grants is started by its path too and belongs here; R247, 2026-10-08: a native program a wrapper starts — `env tool`, `env nice tool`, and each wrapper between — is no longer in this residual on Linux: the trampoline opens it, checks it through that handle and hands the wrapper a link to the handle, `run::started`, `Expected.programs`); docs/agents.md § *Running a command* says so.
+
+### DW-980: A `run` card names the program a wrapper runs, but not the wrappers between.
+
+origin: epic 96, story 96.1 (rung `agents-96-run`, re-audit R96R3-01, R247, 2026-10-08)
+location: `src-tauri/crates/keeper-core/src/agents/approval_card.rs` (`run_card`, `RunCardVm.wrapped`)
+reason: Since R247 `exec_binding.wrappers` binds each wrapper a wrapper starts (`env nice tool` binds `nice`) by path and SHA-256, and the digest covers it, but the card draws only the program started and the innermost program (`wrapped`); the wrappers between show only as argv elements, without their hash. Close by drawing `wrappers` as `wrapped` is drawn (a `RunCardVm` field, TS binding, mock shell, card component).
+status: closed 2026-10-08
+resolution: Fixed by R260 (R96R4-05): `RunCardVm.wrappers` draws each wrapper between, by path and the first 12 hex digits of its SHA-256, as `wrapped` is drawn, through `ApprovalCardVm::of` and `attached_payload`, the TS binding, `approval-card.tsx` ("Then starts") and the mock shell. Proved by `approval_card::tests::a_run_card_draws_the_drives_it_reads_when_it_stops_and_each_wrapper` and `approval-card.test.tsx` "tells apart two runs alike but for the drives they read, their time limit and a wrapper between". The card still does not draw the environment (the host's fixed one, docs/agents.md) nor the folders' device and inode, which the approval binds; docs/agents.md says so.
+
+### DW-981: A program a wrapper starts sees the link to its descriptor as its own name.
+
+origin: epic 96, story 96.1 (rung `agents-96-run`, re-audit R96R3-01, R247, 2026-10-08)
+location: `src-tauri/crates/keeper-agent/src/run/linux.rs` (`reserve`, `hand`)
+reason: The wrapper is given `<run folder>/program-<n>/<name>` in the program's place, so the program's `argv[0]` is that path: a multi-call program still finds its name, and one that resolves itself through `/proc/self/exe` its install, but one that finds its install from `argv[0]`'s folder looks in the run's own folder, and `command -v tool` prints the link. The program also inherits one read-only descriptor of each such program. Since R260 (R96R4-01) that descriptor is opened inside the sandbox, under the run's own grants (`run::linux::hand`): a program outside every grant refuses the run, so the descriptor is only ever of a file the run's grants let it read anyway — before R260 it was opened before landlock and could carry a file outside them. Close by teaching the trampoline each wrapper's semantics and starting the program itself with its own `argv[0]`.
+status: open (R259 accepts the changed `argv[0]` and the inherited read-only descriptors as narrowed by R260)
+
+### DW-1030: A program outside the wrapper table that starts another program starts it by its path, unbound.
+
+origin: epic 96, story 96.1 (rung `agents-96-run`, re-audit R96R4-02, R260, 2026-10-08)
+location: `src-tauri/crates/keeper-core/src/agents/run.rs` (`WRAPPERS`, `programs`, `started`)
+reason: keeper resolves, hashes, binds and hands on by descriptor the program each wrapper of its table starts (`env`, `nice`, `nohup`, `timeout`, `xargs`, `stdbuf`, `command`, `time`, `setsid`, `ionice`, `flock`, and BusyBox's `env`, `nice`, `nohup`). A program outside that table that starts one named in its argv — `taskset 1 ./tool`, `chrt`, `chroot`, `find -exec`, `make`, BusyBox's `chpst` or `setuidgid` — is bound and tiered as itself: the program it starts runs inside the same sandbox at the run's tier, but by its path, unhashed, and a `./tool` it names is not counted as code the session holds. Close by modelling each such program's grammar as a wrapper's, or by refusing those forms.
+status: open
+
+### DW-1065: `headref` takes for a repository's two `HEAD` shapes git rejects, so a project folder beside a link is refused.
+
+origin: epic 96, story 96.1 (rung `agents-96-run`, re-audit R96R5-03, R269, 2026-10-08)
+location: `src-tauri/crates/keeper-agent/src/run/mod.rs` (`headref`, `git_configs`'s `HEAD` arm)
+reason: `headref` reads the whole `HEAD` file and skips what follows `ref:` with Rust's `trim_ascii_start`, whose ASCII whitespace includes form feed (`0x0c`); git's `validate_headref` (`setup.c`) reads at most 255 bytes and skips with git's own `isspace` (`ctype.c`: space, `\t`, `\n`, `\r` — no form feed). So a `HEAD` of the bytes `72 65 66 3a 0c 72 65 66 73 2f 68 65 61 64 73 2f 6d 61 69 6e 0a` (`ref:\x0crefs/heads/main\n`), and one of `ref:` followed by 247 or more spaces (`0x20`) before `refs/` (so `refs/` does not end within git's 255 bytes), are a repository's `HEAD` to keeper and not to git. Beside such a `HEAD`, an `objects` or `refs` link refuses the run (`git_configs`' unconditional linked-entry refusal) although git would not take the folder for a repository. A false-positive refusal only: nothing more runs, is granted or escapes, and the person can rename the folder or the link.
+fix: Read at most 255 bytes and skip only git's `isspace` set; keep the executable-entry and valid-linked-repository controls of `a_folder_git_cannot_take_for_a_repository_refuses_nothing`, and add real-git non-repository controls (`git rev-parse --git-dir` refusing the folder) for both byte shapes.
+status: open (R269: DW-class under the convergence policy, no code change this round)
+
+### DW-1143: The BusyBox `nice` and `env -u` refusal tables do not name `--u` or a first-position `--`, and the As built says "every spelling".
+
+origin: epic 96, story 96.1 (rung `agents-96-run`, review-96run-6.md DW candidate, R301, 2026-10-10)
+location: `src-tauri/crates/keeper-core/src/agents/run.rs` (`tests::busybox_nice_reads_one_adjustment_then_its_program`, `tests::an_unset_name_holding_a_value_is_refused`), `src-tauri/crates/keeper-agentd/tests/run_linux.rs` (`what_busybox_would_run_or_set_unread_is_refused`), `_bmad-output/planning-artifacts/epic-96-agents-that-use-tools-and-the-computer.md` (R269 As-built row 02)
+reason: the parser tables do not exercise the shortest unset abbreviation `--u`, and their BusyBox `nice` `--` row puts `--` after an adjustment, never first (BusyBox 1.37's `nice_main` does not take a first `--` as an option terminator; it reaches the numeric adjustment parse). The real-process test exercises three unset spellings (separate, attached, long), not every cluster or abbreviation. The omitted forms were checked by source inspection only (review-96run-6.md), not executed; no bypass is established. The R269 As-built row 02 says "every spelling refused" where the table covers a named matrix.
+fix: Add `--u NAME=value` and `--u=NAME=value` rows to `an_unset_name_holding_a_value_is_refused` and a first-position `busybox nice -- …` row to `busybox_nice_reads_one_adjustment_then_its_program`; narrow the As-built phrase to the forms the tables name.
+status: open (R301: low, coverage only, under the convergence policy)
