@@ -78,6 +78,7 @@
 import type { LucideIcon } from "lucide-react";
 import {
   AudioLines,
+  Bot,
   Check,
   ChevronDown,
   ChevronRight,
@@ -639,6 +640,7 @@ const FOLDER_ROLE_ICON: Record<FilesFolderRoleVm, LucideIcon> = {
   recordings: Clapperboard,
   tasks: ListChecks,
   voices: AudioLines,
+  agents: Bot,
 };
 
 /** What a role-carrying folder's icon means, for the row's title. Two folders
@@ -648,6 +650,7 @@ const FOLDER_ROLE_TITLE: Record<FilesFolderRoleVm, string> = {
   recordings: "Where recordings are saved",
   tasks: "Where task ledgers are written",
   voices: "Where voices and the dictionary are kept",
+  agents: "Where this drive's agents live",
 };
 
 /** One `treeitem`: a profile root, or one entry inside one. */

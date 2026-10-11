@@ -17,35 +17,32 @@ mod account_restore;
 // providers and Matrix accounts as portable records, and where a pulled
 // setting is written. Every target, like the account itself.
 mod account_settings;
-// The Bots surface's sync-free commands (Epic 61, Story 61.4; split in Story
-// 62.1). On every target: a provider is a URL plus a credential and a
-// conversation two tables in the `keeper.db` every platform already opens.
-// The module imports nothing from `keeper_sync` and nothing from
-// `bots_tools`; what it needs of the drive it asks through a port with a
-// desktop body in `bots_drive_ipc` and a refusing body everywhere else. The
-// iOS compile check is what keeps this sentence true.
+// The app's side of `keeper_agent`'s ports (AD-367): the stream sinks, the
+// voice turn's hooks and the error mapping on every target; the approval
+// sheet, the notes vault and the sync profiles on desktop, chosen at compile
+// time so a phone's turn is armed with no drive.
+mod agent_ports;
+// This Mac as an agents host (story 90.6): the app's facts handed to
+// `keeper_agent::desktop`, ticked from the one interval below, and Settings ›
+// Agents' commands. Desktop-only: a phone is never a host.
+#[cfg(desktop)]
+mod agents_host;
+// The person's proxy beside the notes view (story 91.2): the dock's rooms,
+// scope, focus and new conversations. Every target: the phone shows the
+// proxy's rooms too.
+mod agents_ipc;
+// The Bots surface's commands that run on every target (Epic 61, Story 61.4;
+// split in Story 62.1). A provider is a URL plus a credential and a
+// conversation two tables in the `keeper.db` every platform already opens;
+// the turn loop itself is `keeper_agent` (AD-367).
 mod bots_ipc;
 // The drive half of the Bots surface (Story 62.1): grants, the audit log, the
-// approval answer, image staging and deliverable paths. Desktop-only because
-// every one of them reaches `keeper_sync` or `crate::bots_tools`, and
-// `keeper-sync` is not a dependency on iOS or Android. `CapabilitiesVm.botTools`
-// is false where this module is absent, so nothing on a phone calls it —
-// absence rather than a refusing twin (AD-27).
+// approval answer, image staging and deliverable paths. Desktop-only: the
+// phone has no drive for a bot to reach. `CapabilitiesVm.botTools` is false
+// where this module is absent, so nothing on a phone calls it — absence
+// rather than a refusing twin (AD-27).
 #[cfg(desktop)]
 mod bots_drive_ipc;
-// The unattended turn a scheduled `bot` task runs (Story 72.8, AD-244).
-// Desktop-only: it needs the drive, so it links where `keeper-sync` does, and
-// a phone lists the task row while the Mac runs it (AD-226). It builds the
-// turn `bots_ipc` builds minus the session, the channel and the voice, with no
-// approver, so every `Ask` a grant produces is a refusal it records.
-#[cfg(desktop)]
-mod bot_task;
-// The drive-as-tools host (Story 61.11). Desktop-only: it composes
-// `keeper_sync::bots_fs`, and `keeper-sync` is not a dependency on iOS or
-// Android. Every decision it sequences lives in `keeper-core` or
-// `keeper-sync` — this module is a call site by rule (AD-55/AD-56).
-#[cfg(desktop)]
-mod bots_tools;
 mod build_identity;
 // The copy engine drives `keeper_sync`, which links on every target since
 // Epic 66 (AD-198); its three commands sit in the shared handler list.
@@ -85,8 +82,6 @@ mod recorder;
 // embedded in notes a desktop syncs.
 #[cfg(desktop)]
 mod recording_protocol;
-#[cfg(desktop)]
-mod sessions_exec;
 mod sessions_ipc;
 #[cfg(desktop)]
 mod sessions_root;
@@ -720,6 +715,11 @@ pub fn run() {
                         // The recordings index's daily reconcile, the same
                         // way: a due-check here, the refresh on its own thread.
                         ipc::recordings_reconcile_tick(&handle);
+                        // This Mac's agents host rides the same clock (AD-62,
+                        // story 90.6): manifests, placement and claims, spawned
+                        // off the tick, a tick still running skipping this one;
+                        // its scan reads the accounts' trust anchor (R87).
+                        agents_host::tick(&handle);
                         // Voice rides the same clock (Story 63.5, FR-421): the
                         // tray's status line and verb follow Rust's own turn —
                         // `voice_snapshot`, not the webview's mirror — so the
@@ -800,6 +800,14 @@ pub fn run() {
             {
                 let state = app.state::<ipc::AppState>();
                 sync::start_supervisor(std::sync::Arc::clone(&state.platform));
+                // The agents host, once the engine whose drives it reads is
+                // running; it hosts from the next tick's scan (story 90.6).
+                agents_host::start(
+                    std::sync::Arc::clone(&state.platform),
+                    state.accounts.agent_icons(),
+                    state.accounts.agent_proxies(),
+                    state.accounts.agent_hosted(),
+                );
             }
             #[cfg(not(desktop))]
             sync::phone_sync_all(app.handle(), "open");
@@ -893,6 +901,17 @@ pub fn run() {
             // if the repository moved. Nothing without an account.
             account_ipc::kick(app.handle());
 
+            // The first presence (AD-383): tao need not report
+            // `Focused(true)` for a window created key at launch, and the
+            // publisher says nothing until the shell has said whether keeper
+            // is in front — so it is said here, as the phone says it on
+            // `RunEvent::Ready`.
+            #[cfg(desktop)]
+            agents_ipc::presence_focus(
+                app.handle(),
+                agents_ipc::any_window_focused(app.handle()),
+            );
+
             Ok(())
         });
 
@@ -935,15 +954,11 @@ pub fn run() {
                 // `config_layers`' reason: `keeper_core::bots` has no desktop
                 // gate — a provider is a URL and a credential, a conversation
                 // is two tables in `keeper.db` — so a phone can hold a
-                // conversation with a Hermes bot. These once sat in the
-                // desktop `$extra` because Story 61.11's tool loop gave
-                // `bots_ipc` `keeper_sync::bots_fs` through `crate::bots_tools`
-                // and the iOS compile check failed on `unresolved import
-                // keeper_sync`; what moved out to `bots_drive_ipc` (below, in
-                // the desktop splice) is every command that reaches
-                // `keeper-sync` — grants, audit, the approval answer, image
-                // staging, deliverable paths — and what stayed imports
-                // neither. `CapabilitiesVm.bots` is true wherever the pane
+                // conversation with a Hermes bot. The drive half — grants,
+                // audit, the approval answer, image staging, deliverable
+                // paths — is `bots_drive_ipc` (below, in the desktop splice),
+                // and a phone's turn is armed with no drive
+                // (`agent_ports::turn_env`). `CapabilitiesVm.bots` is true wherever the pane
                 // exists; `CapabilitiesVm.botTools` is what keeps the drive
                 // affordances off a phone.
                 bots_ipc::bots_providers_list,
@@ -1002,6 +1017,22 @@ pub fn run() {
                 // the shared literal for the same reason as the rest: the
                 // composer may always ask what a draft is.
                 bots_ipc::bots_command_preview,
+                // Story 91.2: the proxy beside the notes view, every target.
+                agents_ipc::agent_rooms_list,
+                agents_ipc::agent_scope_set,
+                agents_ipc::agent_focus,
+                agents_ipc::agent_conversation_new,
+                // Story 93.3: the approval card's decision and the own
+                // fingerprint, every target (the phone decides too).
+                agents_ipc::agent_approval_decide,
+                agents_ipc::agent_approval_payload,
+                agents_ipc::agent_own_fingerprint,
+                // Story 91.3: surface requests and presence, every target.
+                agents_ipc::agent_surface_subscribe,
+                agents_ipc::agent_surface_result,
+                agents_ipc::agent_presence_view,
+                // Story 91.4: the proxy conversations "Speak to" offers.
+                agents_ipc::voice_agent_targets,
                 // Voice (Story 62.4): every target, the port decides.
                 voice_ipc::voice_availability,
                 voice_ipc::voice_start,
@@ -1443,6 +1474,7 @@ pub fn run() {
                 sessions_ipc::sessions_file_rename,
                 sessions_ipc::sessions_file_path,
                 sessions_ipc::sessions_task_move,
+                sessions_ipc::sessions_task_allow_schedule,
                 sessions_ipc::sessions_ref_candidates,
                 sessions_ipc::sessions_ref_add,
                 sessions_ipc::sessions_search,
@@ -1590,6 +1622,14 @@ pub fn run() {
         // The Recordings pane's "Reconcile now": the pane itself is
         // desktop-only (the `recording` capability), so there is no twin.
         ipc::recordings_reconcile_now,
+        // Settings › Agents (story 90.6): this Mac as a host is desktop-only,
+        // and the section is absent where `botTools` is false.
+        agents_host::agents_copies,
+        agents_host::agents_copy_sign_in,
+        agents_host::agents_drive_repin,
+        agents_host::agents_seed_offer,
+        agents_host::agents_seed_plan,
+        agents_host::agents_seed_apply,
     );
     // The commands that touch a window or a file manager have `Unsupported`
     // twins so the handler list is identical on every target and
@@ -1616,6 +1656,17 @@ pub fn run() {
     // Desktop-only: on iOS the OS owns app lifecycle — there is no window close.
     #[cfg(desktop)]
     let builder = builder.on_window_event(|window, event| {
+        // Whether keeper is in front is any of its windows' focus, not the
+        // main window's alone: typing in the draft window or clicking the
+        // voice pill blurs main while keeper is plainly in front, and an
+        // agent's surface call would go elsewhere or be `unavailable`
+        // (AD-383). Every window's focus change is read the same way.
+        if matches!(event, WindowEvent::Focused(_)) {
+            agents_ipc::presence_focus(
+                window.app_handle(),
+                agents_ipc::any_window_focused(window.app_handle()),
+            );
+        }
         if window.label() == "main" {
             match event {
                 WindowEvent::Destroyed => {
@@ -1638,14 +1689,18 @@ pub fn run() {
                 // Losing focus is the weaker version of the same signal, and it is
                 // the one that fires when the user switches app without hiding
                 // anything. `push_on_blur` decides whether it reaches the network.
-                WindowEvent::Focused(false) => notes_vault::flush(),
+                WindowEvent::Focused(false) => {
+                    notes_vault::flush();
+                }
                 // Keeper back in front is one of the things that clear a
                 // refusal to listen for the phrase (Epic 65, AD-190): the
                 // person allowed the microphone in System Settings and came
                 // back. The rule is `keeper_core::voice::should_rearm`; an
                 // armed or switched-off phrase costs one probe and nothing
                 // else, and the probe runs off this thread.
-                WindowEvent::Focused(true) => voice_ipc::voice_rearm(),
+                WindowEvent::Focused(true) => {
+                    voice_ipc::voice_rearm();
+                }
                 // The voice pill sits on the main window's screen (Story
                 // 64.4): a drag onto another display takes it along. Per
                 // compositor frame, but `follow` returns on one lock while
@@ -1789,8 +1844,16 @@ pub fn run() {
                 // window and keeps the host (`WindowEvent::CloseRequested`
                 // above), so releasing there would stop tasks the user never
                 // asked to stop.
+                // The agents this Mac hosts stop first: running turns get
+                // their final edits and their log lines, which the sync quit
+                // below commits and pushes; only then are the claims released,
+                // so a taker reads a log that has them (AD-378).
+                #[cfg(desktop)]
+                agents_host::stop_turns_for_quit();
                 #[cfg(desktop)]
                 sync::finalize_for_quit();
+                #[cfg(desktop)]
+                agents_host::release_for_quit();
                 // A short, bounded graceful shutdown: `shutdown_all` awaits each
                 // account's `sync.stop()`. Bounding it keeps quit responsive even if a
                 // network teardown hangs.
@@ -1822,6 +1885,10 @@ pub fn run() {
             // The desktop's equivalent is the main window's focus, above.
             tauri::RunEvent::Resumed => {
                 voice_ipc::voice_rearm();
+                // The phone in front again is where an agent's surface call
+                // goes (AD-383); the desktop's is the main window's focus.
+                #[cfg(not(desktop))]
+                agents_ipc::presence_focus(app_handle, true);
                 // A Live Activity can be requested only with keeper in
                 // front (Story 65.5): one refused while it was not — the
                 // eight-hour renew, an arm from the port's own resume — is
@@ -1836,6 +1903,17 @@ pub fn run() {
                 #[cfg(not(desktop))]
                 sync::phone_sync_all(app_handle, "foreground");
             }
+            // The phone leaving the front (`applicationWillResignActive`):
+            // its presence stops naming it as the device in front.
+            #[cfg(not(desktop))]
+            tauri::RunEvent::WindowEvent {
+                event: tauri::WindowEvent::Suspended,
+                ..
+            } => agents_ipc::presence_focus(app_handle, false),
+            // keeper opened on the phone is in front; `Resumed` comes only
+            // on a return from the background.
+            #[cfg(not(desktop))]
+            tauri::RunEvent::Ready => agents_ipc::presence_focus(app_handle, true),
             // `RunEvent::Reopen` is an Apple-platform variant (there is no dock on
             // Linux/Windows), so this arm is gated on macOS specifically rather than on
             // `desktop` — the wider gate does not compile on the Linux desktop target.

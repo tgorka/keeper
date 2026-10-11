@@ -219,7 +219,7 @@ pub const RECORD_NEW: &str = "new";
 
 /// Read a body.
 pub fn parse(body: &str) -> Result<Block, BlockRefusal> {
-    let table: toml::Table = toml::from_str(body)
+    let table: toml::Table = crate::toml_order::from_str(body)
         .map_err(|error| BlockRefusal::Syntax(first_line(&error.to_string())))?;
     if let Some(version) = table.get("version") {
         match version {

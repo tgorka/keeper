@@ -17,6 +17,7 @@ import {
   TASKS_HEADER_PADDING_CLASS,
   TASKS_PANE_MIN_WIDTH_PX,
 } from "@/components/layout/tasks-pane";
+import { DOCK_FOLDS_RAIL_BELOW_PX } from "@/components/notes/notes-agent-dock";
 import { SIDEBAR_COLLAPSE_BREAKPOINT } from "@/hooks/use-shell-layout";
 import { columnMinWidth } from "@/lib/column-widths";
 
@@ -51,14 +52,41 @@ const windowMinWidth = (): number => {
 };
 
 describe("the window cannot be narrower than the layout's floor", () => {
-  it("keeps tauri's minWidth at or above sidebar + rail + list + one panel", () => {
+  it("keeps tauri's minWidth at or above sidebar + rail + list + one panel + the folded dock", () => {
+    // The assistant dock starts on its rail, so the floor counts its strip and
+    // not its open width: a person who opens it in a narrow window trades the
+    // other columns' width for it, down to their floors.
     const floor =
       px(SIDEBAR_WIDTH_CLASS.expanded) +
       columnMinWidth("notes-rail") +
       columnMinWidth("notes-list") +
-      px(PANEL_MIN_WIDTH_CLASS);
+      px(PANEL_MIN_WIDTH_CLASS) +
+      FOLD_STRIP.widthPx;
 
     expect(windowMinWidth()).toBeGreaterThanOrEqual(floor);
+  });
+
+  /**
+   * D5: open, the dock needs its own floor. With every column at its floor and the
+   * 156 px drawer that is DOCK_FOLDS_RAIL_BELOW_PX, wider than the window may be
+   * narrow — so below it opening the dock folds the notes rail to its strip, and
+   * with the rail folded the open dock fits at the window minimum (rail sidebar)
+   * and at the breakpoint (drawer back).
+   */
+  it("fits the open dock by folding the notes rail below the open floor", () => {
+    const open = (sidebar: number, rail: number) =>
+      sidebar +
+      rail +
+      columnMinWidth("notes-list") +
+      px(PANEL_MIN_WIDTH_CLASS) +
+      columnMinWidth("notes-agent");
+    expect(DOCK_FOLDS_RAIL_BELOW_PX).toBe(
+      open(px(SIDEBAR_WIDTH_CLASS.expanded), columnMinWidth("notes-rail")),
+    );
+    expect(windowMinWidth()).toBeGreaterThanOrEqual(open(FOLD_STRIP.widthPx, FOLD_STRIP.widthPx));
+    expect(SIDEBAR_COLLAPSE_BREAKPOINT).toBeGreaterThanOrEqual(
+      open(px(SIDEBAR_WIDTH_CLASS.expanded), FOLD_STRIP.widthPx),
+    );
   });
 
   /**

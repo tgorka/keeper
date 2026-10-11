@@ -545,11 +545,16 @@ pub fn grant_offer(kind: ProviderKind, tools_supported: Option<bool>) -> GrantOf
         (ProviderKind::Hermes, _) => GrantOffer::Absent {
             reason: HERMES_RUNS_ITS_OWN_TOOLS,
         },
-        (ProviderKind::Ollama, Some(true)) => GrantOffer::Offered { warning: None },
-        (ProviderKind::Ollama, Some(false)) => GrantOffer::Absent {
+        // An OpenAI-compatible endpoint hands keeper the pending call, as
+        // Ollama does; its `/v1/models` never states the capability, so it is
+        // always `None` in practice, but a stated answer is still honoured.
+        (ProviderKind::Ollama | ProviderKind::OpenAi, Some(true)) => {
+            GrantOffer::Offered { warning: None }
+        }
+        (ProviderKind::Ollama | ProviderKind::OpenAi, Some(false)) => GrantOffer::Absent {
             reason: MODEL_HAS_NO_TOOLS,
         },
-        (ProviderKind::Ollama, None) => GrantOffer::Offered {
+        (ProviderKind::Ollama | ProviderKind::OpenAi, None) => GrantOffer::Offered {
             warning: Some(TOOLS_CAPABILITY_UNKNOWN),
         },
     }
@@ -906,6 +911,18 @@ mod tests {
                 reason: MODEL_HAS_NO_TOOLS
             }
         );
+        // An OpenAI-compatible endpoint is keeper's to run tools for, as
+        // Ollama is: a stated yes offers, a stated no withholds.
+        assert_eq!(
+            grant_offer(ProviderKind::OpenAi, Some(true)),
+            GrantOffer::Offered { warning: None }
+        );
+        assert_eq!(
+            grant_offer(ProviderKind::OpenAi, Some(false)),
+            GrantOffer::Absent {
+                reason: MODEL_HAS_NO_TOOLS
+            }
+        );
     }
 
     /// A capability keeper could not read is `unknown`, never `false`: the
@@ -914,11 +931,13 @@ mod tests {
     /// capabilities.
     #[test]
     fn an_unreadable_tool_capability_offers_the_grant_with_a_warning() {
-        assert_eq!(
-            grant_offer(ProviderKind::Ollama, None),
-            GrantOffer::Offered {
-                warning: Some(TOOLS_CAPABILITY_UNKNOWN)
-            }
-        );
+        for kind in [ProviderKind::Ollama, ProviderKind::OpenAi] {
+            assert_eq!(
+                grant_offer(kind, None),
+                GrantOffer::Offered {
+                    warning: Some(TOOLS_CAPABILITY_UNKNOWN)
+                }
+            );
+        }
     }
 }

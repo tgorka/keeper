@@ -7,6 +7,7 @@ import {
   FlaskConical,
   FolderSync,
   FolderTree,
+  Hexagon,
   MessageSquare,
   MonitorDot,
   NotebookPen,
@@ -62,6 +63,12 @@ export interface SidebarView {
 const BASE_VIEWS: SidebarView[] = [
   { label: "Chats", icon: MessageSquare, view: "inbox" },
   { label: "Archive", icon: Archive, view: "archive" },
+  // `Hexagon` because an agent is drawn in the identity's hexagonal cell
+  // everywhere it appears, and this row lists exactly the rooms agents speak
+  // in. Beside Archive: it is the third window of the same chat list, not a
+  // surface of its own, and it needs no capability — an agent room is a
+  // Matrix room every tier can open.
+  { label: "Agents", icon: Hexagon, view: "agents" },
   // `Stamp`, not `Inbox`. Two things were wrong with the tray. Every other
   // entry here names its CONTENT — messages, an archive, files, notes — while
   // a tray names the box they arrive in, and approving is an act of consent

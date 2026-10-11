@@ -827,20 +827,27 @@ pub fn ensure_attributes(root: &Path, patterns: &[String], policy: &LfsPolicy) -
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(err) => return Err(SyncError::io("read .gitattributes", file, err)),
     };
-    let repaired = repair_managed_block(&existing, policy);
+    let Some(out) = attributes_text(&existing, patterns, policy) else {
+        return Ok(false);
+    };
+    std::fs::write(&file, out).map_err(|err| SyncError::io("write .gitattributes", file, err))?;
+    Ok(true)
+}
+
+/// What [`ensure_attributes`] makes of `existing`: the new text, or `None`
+/// when it stays as it is. Pure, so an authored commit can build it from
+/// `HEAD`'s file without touching the disk ([`prepare_authored`]).
+pub fn attributes_text(existing: &str, patterns: &[String], policy: &LfsPolicy) -> Option<String> {
+    let repaired = repair_managed_block(existing, policy);
 
     let mut wanted: Vec<&String> = Vec::new();
     for pattern in patterns {
-        let already = repaired
-            .as_deref()
-            .unwrap_or(&existing)
-            .lines()
-            .any(|line| {
-                let line = line.trim();
-                !line.starts_with('#')
-                    && attribute_pattern_matches(line, pattern)
-                    && line.contains("filter=lfs")
-            });
+        let already = repaired.as_deref().unwrap_or(existing).lines().any(|line| {
+            let line = line.trim();
+            !line.starts_with('#')
+                && attribute_pattern_matches(line, pattern)
+                && line.contains("filter=lfs")
+        });
         if !already && !wanted.contains(&pattern) {
             wanted.push(pattern);
         }
@@ -848,15 +855,13 @@ pub fn ensure_attributes(root: &Path, patterns: &[String], policy: &LfsPolicy) -
 
     let mut out = match repaired {
         Some(text) => text,
-        None if wanted.is_empty() => return Ok(false),
-        None => existing,
+        None if wanted.is_empty() => return None,
+        None => existing.to_owned(),
     };
     if wanted.is_empty() {
         // Repair only. Written back exactly as the repair produced it, so a
         // file that never ended in a newline does not silently acquire one.
-        std::fs::write(&file, out)
-            .map_err(|err| SyncError::io("write .gitattributes", file, err))?;
-        return Ok(true);
+        return Some(out);
     }
     if !out.is_empty() && !out.ends_with('\n') {
         out.push('\n');
@@ -872,8 +877,65 @@ pub fn ensure_attributes(root: &Path, patterns: &[String], policy: &LfsPolicy) -
         out.push_str(&keeper_line(pattern));
         out.push('\n');
     }
-    std::fs::write(&file, out).map_err(|err| SyncError::io("write .gitattributes", file, err))?;
-    Ok(true)
+    Some(out)
+}
+
+/// What an authored commit (`Engine::commit_paths`) routes through LFS.
+#[derive(Debug, Default)]
+pub struct AuthoredStaging {
+    /// The pointer committed for each routed path.
+    pub substitutions: BTreeMap<PathBuf, Vec<u8>>,
+    /// Their objects, in the local store already.
+    pub uploads: Vec<StagedObject>,
+    /// `.gitattributes` as the commit holds it, when routing needs a rule
+    /// `head_attributes` lacks.
+    pub attributes: Option<String>,
+}
+
+/// [`prepare`] for bytes a caller asks to commit rather than files on the
+/// disk: each of `writes` the policy or the attributes route goes into the
+/// store and is committed as its pointer, and the rules that routing needs
+/// are added to `head_attributes` — `HEAD`'s `.gitattributes`, never the
+/// disk's, which may hold a person's edit. A commit that routes nothing
+/// leaves the attributes alone: a managed block's repair waits for the
+/// watcher's next commit rather than riding this one.
+pub fn prepare_authored(
+    repo: &gix::Repository,
+    profile: &SyncProfile,
+    store: &LfsStore,
+    writes: &[(&Path, &[u8])],
+    head_attributes: &str,
+) -> Result<AuthoredStaging> {
+    let mut staging = AuthoredStaging::default();
+    if profile.lfs_mode == LfsMode::Disabled {
+        return Ok(staging);
+    }
+    let policy = LfsPolicy::from_profile(profile)?;
+    let mut patterns: Vec<String> = Vec::new();
+    for (rela, bytes) in writes {
+        if !policy.applies(rela, bytes.len() as u64) && !already_routed(repo, rela, &policy) {
+            continue;
+        }
+        store.ensure_layout()?;
+        let (oid, size) = store.insert_streaming(*bytes)?;
+        let pointer = Pointer::new(oid.clone(), size);
+        staging
+            .substitutions
+            .insert(rela.to_path_buf(), pointer.render().into_bytes());
+        staging.uploads.push(StagedObject {
+            path: rela.to_path_buf(),
+            oid,
+            size,
+        });
+        let pattern = pattern_for(rela);
+        if !patterns.contains(&pattern) {
+            patterns.push(pattern);
+        }
+    }
+    if !patterns.is_empty() {
+        staging.attributes = attributes_text(head_attributes, &patterns, &policy);
+    }
+    Ok(staging)
 }
 
 /// Move a file's content into the LFS store and return its pointer.

@@ -32,9 +32,9 @@ use keeper_sync::export::{self, ExportRefusal};
 use keeper_sync::files_write::{self, WriteRefusal, WriteRoute, WriteScope};
 use keeper_sync::lfs::hydrate::ContentRefusal;
 use keeper_sync::profile::{
-    LfsMode, ProfileState, SyncDirection, SyncLane, DEFAULT_POLL_INTERVAL_MS,
-    DEFAULT_RECORDINGS_SUBFOLDER, DEFAULT_SESSIONS_SUBFOLDER, DEFAULT_SETTLE_MS,
-    DEFAULT_VOICES_SUBFOLDER,
+    LfsMode, ProfileState, SyncDirection, SyncLane, DEFAULT_AGENTS_SUBFOLDER,
+    DEFAULT_POLL_INTERVAL_MS, DEFAULT_RECORDINGS_SUBFOLDER, DEFAULT_SESSIONS_SUBFOLDER,
+    DEFAULT_SETTLE_MS, DEFAULT_VOICES_SUBFOLDER,
 };
 use keeper_sync::progress::{format_bytes, SyncPhase, SyncStatus};
 use keeper_sync::provenance::SyncSource;
@@ -233,6 +233,14 @@ pub struct SyncProfileVm {
     /// this folder keeps voices, and `VoicesConfig`'s own default when it does
     /// not — `recordings_subfolder`'s rule, so `voices` is spelled once, in Rust.
     pub voices_subfolder: String,
+    /// Whether this folder keeps agents — their homes, souls and memory, and
+    /// the zone's `_drive.toml` (AD-361). Needs `sessions`: an agent's
+    /// sessions live in this folder's sessions zone.
+    pub agents: bool,
+    /// The agents subfolder that would be **in force**: the stored one when
+    /// this folder keeps agents, and `AgentsConfig`'s own default when it does
+    /// not — `voices_subfolder`'s rule, so `80-agents` is spelled once, in Rust.
+    pub agents_subfolder: String,
     /// The canonical camelCase profile keys a `.keeper/keeper.toml` layer
     /// currently sets for this folder, sorted (Story 56.12).
     ///
@@ -302,6 +310,11 @@ impl From<&SyncProfile> for SyncProfileVm {
             voices_subfolder: p.voices.as_ref().map_or_else(
                 || DEFAULT_VOICES_SUBFOLDER.to_owned(),
                 |voices| voices.subfolder.clone(),
+            ),
+            agents: p.agents.is_some(),
+            agents_subfolder: p.agents.as_ref().map_or_else(
+                || DEFAULT_AGENTS_SUBFOLDER.to_owned(),
+                |agents| agents.subfolder.clone(),
             ),
             // Last, because it describes the fields above rather than adding
             // one: the set of keys a folder file has taken out of this
@@ -816,6 +829,13 @@ pub struct SyncProfileReq {
     /// The voices subfolder to pin; `recordings_subfolder`'s verbatim rule.
     #[serde(default)]
     pub voices_subfolder: Option<String>,
+    /// Flag or unflag this folder as keeping agents (AD-361). `None` leaves
+    /// the flag alone under the rule `voices` follows.
+    #[serde(default)]
+    pub agents: Option<bool>,
+    /// The agents subfolder to pin; `recordings_subfolder`'s verbatim rule.
+    #[serde(default)]
+    pub agents_subfolder: Option<String>,
 }
 
 /// Mint an opaque, sortable, collision-free id.
@@ -1249,6 +1269,26 @@ fn parse_req(req: &SyncProfileReq, prior: Option<&SyncProfile>) -> Result<SyncPr
             }
         }
     }
+    // The agents flag (AD-361): the voices block's rule once more. Unflagging
+    // removes the block and no files — the homes stay on disk. A folder that
+    // keeps agents without sessions is refused by `validate` below, by name.
+    match req.agents {
+        Some(true) => {
+            let mut config = profile.agents.clone().unwrap_or_default();
+            if let Some(subfolder) = agents_subfolder(req) {
+                config.subfolder = subfolder;
+            }
+            profile.agents = Some(config);
+        }
+        Some(false) => profile.agents = None,
+        None => {
+            if let (Some(config), Some(subfolder)) =
+                (profile.agents.as_mut(), agents_subfolder(req))
+            {
+                config.subfolder = subfolder;
+            }
+        }
+    }
     // Validate here so a bad profile is rejected at the edge with an actionable
     // message rather than deep inside the engine.
     profile.validate().map_err(|err| sync_ipc_error(&err))?;
@@ -1301,6 +1341,14 @@ fn sessions_subfolder(req: &SyncProfileReq) -> Option<String> {
 /// Verbatim after a whitespace trim, for [`recordings_subfolder`]'s reason.
 fn voices_subfolder(req: &SyncProfileReq) -> Option<String> {
     req.voices_subfolder
+        .as_ref()
+        .map(|raw| raw.trim().to_owned())
+}
+
+/// The agents subfolder a request expresses, or `None` when it expresses none.
+/// Verbatim after a whitespace trim, for [`recordings_subfolder`]'s reason.
+fn agents_subfolder(req: &SyncProfileReq) -> Option<String> {
+    req.agents_subfolder
         .as_ref()
         .map(|raw| raw.trim().to_owned())
 }
@@ -3713,6 +3761,10 @@ fn files_listing_vm(
             .voices
             .as_ref()
             .map(|voices| voices.subfolder.as_str()),
+        agents_subfolder: profile
+            .agents
+            .as_ref()
+            .map(|agents| agents.subfolder.as_str()),
     };
     let (state, entries, detail, truncated) = match listing {
         browse::BrowseListing::Listed(dir) => {
@@ -5637,6 +5689,8 @@ mod tests {
             tasks_subfolder: None,
             voices: None,
             voices_subfolder: None,
+            agents: None,
+            agents_subfolder: None,
         }
     }
 
@@ -5646,7 +5700,7 @@ mod tests {
     /// struct: the bug is a lost KEY, and serde is what decides what a key is.
     ///
     /// A field the request has a slot for.
-    const EXPRESSED: [&str; 24] = [
+    const EXPRESSED: [&str; 25] = [
         "name",
         "localPath",
         "remoteUrl",
@@ -5676,6 +5730,8 @@ mod tests {
         "tasks",
         // Expressed from birth (AD-342), like `sessions`.
         "voices",
+        // Expressed from birth (AD-361), like `voices`.
+        "agents",
         // Moved out of PRESERVED by Story 56.12, in the shape the `recordings`
         // comment above records: the folder's Advanced settings now render all
         // three, so a save from the app expresses what it shows.
@@ -5901,6 +5957,10 @@ mod tests {
         // And keeping voices moves `voices` from `None`, beside the rest.
         edit.voices = Some(true);
         edit.voices_subfolder = Some("70-comms/voices".into());
+        // And keeping agents moves `agents` from `None`, beside the sessions
+        // zone it needs.
+        edit.agents = Some(true);
+        edit.agents_subfolder = Some("80-agents".into());
         // The three virtualization knobs (Story 56.12), each moved off `prior`'s
         // distinctive value AND off a fresh profile's, so the EXPRESSED
         // assertion cannot be satisfied by standing on either.

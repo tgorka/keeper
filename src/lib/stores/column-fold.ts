@@ -42,16 +42,17 @@ export const COLUMN_FOLD_COOKIE = "keeper_column_fold";
 export type ColumnFold = Record<SurfaceColumnId, boolean>;
 
 /**
- * Every column showing, which is what a keeper that has never been folded does.
+ * Every column showing.
  *
- * All six default open, unlike the notes rail's Files section: folding a column
- * hides a browser the surface exists to offer, and there is no cold directory
- * scan to avoid by starting one of them away.
+ * Folding a column hides a browser the surface exists to offer, and there is no
+ * cold directory scan to avoid by starting one of them away — so every column
+ * but one starts like this ({@link columnsAtFirstRun}).
  */
 export function columnsUnfolded(): ColumnFold {
   return {
     "notes-rail": false,
     "notes-list": false,
+    "notes-agent": false,
     "files-tree": false,
     "chat-list": false,
     "tasks-list": false,
@@ -60,14 +61,28 @@ export function columnsUnfolded(): ColumnFold {
 }
 
 /**
+ * What a keeper that has never been folded shows: every column, except the
+ * notes view's assistant dock, which starts on its rail.
+ *
+ * The dock is the one column whose opening is itself an act toward someone
+ * else: while it is open, the note in front of the person is told to their
+ * proxy (UX-DR130). That starts when they open it, never because a build
+ * shipped it open. It also keeps the window's floor where it was — a folded
+ * dock is a 48px strip.
+ */
+export function columnsAtFirstRun(): ColumnFold {
+  return { ...columnsUnfolded(), "notes-agent": true };
+}
+
+/**
  * The fold remembered in a `document.cookie` string.
  *
  * Total: an unknown id, a malformed entry or a value that is not `0`/`1` leaves
- * that column open. A jar holding a column this build no longer has must not
- * cost the user a surface.
+ * that column as it starts at first run. A jar holding a column this build no
+ * longer has must not cost the user a surface.
  */
 export function readColumnFold(cookie: string): ColumnFold {
-  return readFoldFlags(cookie, COLUMN_FOLD_COOKIE, SURFACE_COLUMN_IDS, columnsUnfolded());
+  return readFoldFlags(cookie, COLUMN_FOLD_COOKIE, SURFACE_COLUMN_IDS, columnsAtFirstRun());
 }
 
 /** The `document.cookie` assignment that records this fold. */
@@ -83,7 +98,7 @@ export interface ColumnFoldState {
 }
 
 export const columnFoldStore = createStore<ColumnFoldState>()((set, get) => ({
-  columns: columnsUnfolded(),
+  columns: columnsAtFirstRun(),
   toggleColumn: (id) => {
     const columns = { ...get().columns, [id]: !get().columns[id] };
     persistFold(columnFoldCookie(columns));
@@ -121,7 +136,11 @@ export function useColumnFold<T>(selector: (state: ColumnFoldState) => T): T {
   return useStore(columnFoldStore, selector);
 }
 
-/** Test-only reset: every column showing, unhydrated, no cookie written. */
+/**
+ * Test-only reset: every column showing, unhydrated, no cookie written — the
+ * baseline the column contract is proved from. The first-run fold is
+ * {@link columnsAtFirstRun}, asserted on its own.
+ */
 export function resetColumnFoldForTest(): void {
   hydrated = false;
   columnFoldStore.setState({ columns: columnsUnfolded() });

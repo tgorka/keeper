@@ -26,6 +26,9 @@
 //! executes the plan. Nothing here opens a file, and nothing here mints an id —
 //! a task keeper did not author keeps its bytes (FR-121).
 
+use matrix_sdk::ruma::UserId;
+
+use crate::agents::card::{ALLOWED_BY, SCHEDULED_BY};
 use crate::notes::frontmatter::{FieldValue, Frontmatter};
 use crate::notes::order::{drop_order, renumbered_order, set_order_in};
 use crate::sessions::files::{check_rel, FileVerbError};
@@ -111,10 +114,11 @@ pub fn compile_move(
                 // rewrites a file to the bytes it already holds is a sync
                 // commit nobody made.
                 if (file.order - renumbered).abs() > f64::EPSILON {
-                    steps.push(PlanStep::WriteFile {
-                        path: format!("{session}/{}", file.rel),
-                        content: set_order_in(file.text, renumbered),
-                    });
+                    steps.push(PlanStep::guarded(
+                        format!("{session}/{}", file.rel),
+                        file.text,
+                        set_order_in(file.text, renumbered),
+                    ));
                 }
             }
             renumbered_order(at)
@@ -126,16 +130,96 @@ pub fn compile_move(
         TASK_STATUS_KEY,
         FieldValue::Str(status.as_str().to_owned()),
     );
-    steps.push(PlanStep::WriteFile {
-        path: format!("{session}/{moved}"),
-        content: set_order_in(&moved_text, order),
-    });
+    steps.push(PlanStep::guarded(
+        format!("{session}/{moved}"),
+        text,
+        set_order_in(&moved_text, order),
+    ));
 
     Ok(Plan {
         verb: "task-move".to_owned(),
         session: session.to_owned(),
         steps,
     })
+}
+
+/// Why a person's *Allow* compiled no plan.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum AllowError {
+    #[error(transparent)]
+    Path(#[from] FileVerbError),
+    #[error(
+        "{rel} carries no schedule an agent wrote, so there is nothing to allow. It runs on its \
+         schedule as it is."
+    )]
+    NothingToAllow { rel: String },
+    #[error("{person} is not a Matrix user id, so it cannot be recorded as who allowed this.")]
+    NotAPerson { person: String },
+    #[error("Sign in as {owner} to allow this schedule.")]
+    SignIn { owner: String },
+}
+
+/// The plan a person's *Allow* runs on a card whose schedule an agent wrote
+/// (Q16): its `scheduled_by:` line becomes `allowed_by: <person>` (R76, the
+/// requester of its scheduled runs), and no other byte changes.
+///
+/// A [`PlanStep::GuardedWrite`] on the exact bytes the shell read (their
+/// SHA-256, R120), so a card rewritten between the read and the write — by
+/// even one same-length edit — is refused rather than reverted.
+///
+/// # Errors
+/// Whatever [`check_rel`] refuses, [`AllowError::NothingToAllow`] for a card
+/// without the mark, [`AllowError::NotAPerson`] for a `person` that is not a
+/// Matrix user id.
+pub fn compile_allow_schedule(
+    session: &str,
+    rel: &str,
+    text: &str,
+    person: &str,
+) -> Result<Plan, AllowError> {
+    check_rel(rel)?;
+    let person = UserId::parse(person).map_err(|_| AllowError::NotAPerson {
+        person: person.to_owned(),
+    })?;
+    let (frontmatter, _) = Frontmatter::parse(text);
+    if !frontmatter.keys().any(|key| key == SCHEDULED_BY) {
+        return Err(AllowError::NothingToAllow {
+            rel: rel.to_owned(),
+        });
+    }
+    // Every `scheduled_by:` goes, and the one `allowed_by:` takes the first
+    // one's place: a card with the key twice is never left marked.
+    let allowed = Frontmatter::remove_all_in(text, ALLOWED_BY);
+    let allowed = Frontmatter::set_after_in(
+        &allowed,
+        &[SCHEDULED_BY],
+        ALLOWED_BY,
+        FieldValue::Str(person.to_string()),
+    );
+    Ok(Plan {
+        verb: "task-allow-schedule".to_owned(),
+        session: session.to_owned(),
+        steps: vec![PlanStep::guarded(
+            format!("{session}/{rel}"),
+            text,
+            Frontmatter::remove_all_in(&allowed, SCHEDULED_BY),
+        )],
+    })
+}
+
+/// Who a person's *Allow* records (R118): of the accounts signed in on this
+/// device, the one whose user owns the drive by its `_drive.toml`, else the
+/// only one. With neither, it is refused, naming whom to sign in as.
+pub fn allowing_person(owner: Option<&str>, signed_in: &[String]) -> Result<String, AllowError> {
+    if let Some(owner) = owner.filter(|owner| signed_in.iter().any(|user| user == owner)) {
+        return Ok(owner.to_owned());
+    }
+    match signed_in {
+        [only] => Ok(only.clone()),
+        _ => Err(AllowError::SignIn {
+            owner: owner.unwrap_or("the drive's owner").to_owned(),
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -160,7 +244,7 @@ mod tests {
             .expect("an ordinary card in an ordinary column");
         assert_eq!(plan.verb, "task-move");
         assert_eq!(plan.steps.len(), 1, "one card moved, one file written");
-        let PlanStep::WriteFile { path, content } = &plan.steps[0] else {
+        let PlanStep::GuardedWrite { path, content, .. } = &plan.steps[0] else {
             panic!("expected a write");
         };
         assert_eq!(path, "active/s/c.md");
@@ -180,7 +264,7 @@ mod tests {
         let moved = card("3", "todo");
         let plan = compile_move("active/s", "c.md", &moved, TaskStatus::Deferred, &[], 0)
             .expect("an empty column takes any card");
-        let PlanStep::WriteFile { content, .. } = &plan.steps[0] else {
+        let PlanStep::GuardedWrite { content, .. } = &plan.steps[0] else {
             panic!("expected a write");
         };
         assert!(content.contains("status: deferred"));
@@ -193,7 +277,7 @@ mod tests {
         let column = [file("a.md", &a, 1.0)];
         let plan = compile_move("active/s", "c.md", &a, TaskStatus::Todo, &column, 99)
             .expect("an index past the end is clamped, not refused");
-        let PlanStep::WriteFile { content, .. } = plan
+        let PlanStep::GuardedWrite { content, .. } = plan
             .steps
             .last()
             .expect("a move always writes the moved card")
@@ -215,18 +299,18 @@ mod tests {
             .steps
             .iter()
             .map(|step| match step {
-                PlanStep::WriteFile { path, .. } => path.as_str(),
+                PlanStep::GuardedWrite { path, .. } => path.as_str(),
                 other => panic!("expected only writes, got {other:?}"),
             })
             .collect();
         // `a.md` keeps 1 and is therefore not rewritten; `b.md` moves to slot 3
         // to leave the hole at 2; the moved card is written LAST (AD-111).
         assert_eq!(paths, vec!["active/s/b.md", "active/s/c.md"]);
-        let PlanStep::WriteFile { content, .. } = &plan.steps[0] else {
+        let PlanStep::GuardedWrite { content, .. } = &plan.steps[0] else {
             panic!("expected a write");
         };
         assert!(content.contains("order: 3"), "renumbered, whole");
-        let PlanStep::WriteFile { content, .. } = &plan.steps[1] else {
+        let PlanStep::GuardedWrite { content, .. } = &plan.steps[1] else {
             panic!("expected a write");
         };
         assert!(content.contains("order: 2"), "into the hole");
@@ -253,7 +337,7 @@ mod tests {
         let bare = "---\ntitle: Bare\ntags: [task]\n---\n\nBody.\n";
         let plan = compile_move("active/s", "c.md", bare, TaskStatus::Done, &[], 0)
             .expect("a card missing both keys is still a card");
-        let PlanStep::WriteFile { content, .. } = &plan.steps[0] else {
+        let PlanStep::GuardedWrite { content, .. } = &plan.steps[0] else {
             panic!("expected a write");
         };
         assert!(content.contains("status: done"));
@@ -269,5 +353,116 @@ mod tests {
         assert!(compile_move("active/s", "workspace/x.md", "", TaskStatus::Todo, &[], 0).is_err());
         assert!(compile_move("active/s", "../x.md", "", TaskStatus::Todo, &[], 0).is_err());
         assert!(compile_move("active/s", "shot.png", "", TaskStatus::Todo, &[], 0).is_err());
+    }
+
+    /// A card carrying all nine agent keys, and the person's two.
+    const AGENT_CARD: &str = "---\ntitle: Tidy the inbox\ntags: [task]\nstatus: todo\norder: 1\nassignee: tola-grey\nhost: hesperia\nrequested_by: \"@nixi:h\"\nschedule: \"@daily\"\nworkflow: triage\nscheduled_by: \"@nixi:h\"\nintegrity: untrusted\nrun: blocked\nlast_run: \"2026-10-04T09:00:00+02:00\"\n---\n\nSort what came in.\n";
+
+    /// AC3: a move rewrites `status:` and `order:` and leaves every agent
+    /// key's line as it was.
+    #[test]
+    fn moving_a_card_keeps_its_agent_keys_byte_for_byte() {
+        let plan = compile_move("active/s", "inbox.md", AGENT_CARD, TaskStatus::Done, &[], 0)
+            .expect("an agent card is a card");
+        let PlanStep::GuardedWrite { content, .. } = &plan.steps[0] else {
+            panic!("expected a write");
+        };
+        assert!(content.contains("status: done\n"));
+        let kept = |text: &str| -> Vec<String> {
+            text.lines()
+                .filter(|line| !line.starts_with("status:") && !line.starts_with("order:"))
+                .map(str::to_owned)
+                .collect()
+        };
+        assert_eq!(kept(content), kept(AGENT_CARD));
+        assert_eq!(AGENT_CARD.lines().count(), content.lines().count());
+    }
+
+    /// AC11 with R76: *Allow* turns the `scheduled_by:` line into
+    /// `allowed_by: <person>` and changes no other byte; a card without the
+    /// mark is refused.
+    #[test]
+    fn allowing_a_schedule_removes_one_line() {
+        let plan = compile_allow_schedule("active/s", "inbox.md", AGENT_CARD, "@tgorka:h")
+            .expect("a marked card");
+        assert_eq!(plan.steps.len(), 1);
+        let PlanStep::GuardedWrite {
+            path,
+            expect_len,
+            content,
+            ..
+        } = &plan.steps[0]
+        else {
+            panic!("a guarded write");
+        };
+        assert_eq!(path, "active/s/inbox.md");
+        assert_eq!(*expect_len, AGENT_CARD.len());
+        assert_eq!(
+            *content,
+            AGENT_CARD.replace("scheduled_by: \"@nixi:h\"\n", "allowed_by: \"@tgorka:h\"\n")
+        );
+
+        let unmarked = AGENT_CARD.replace("scheduled_by: \"@nixi:h\"\n", "");
+        assert_eq!(
+            compile_allow_schedule("active/s", "inbox.md", &unmarked, "@tgorka:h"),
+            Err(AllowError::NothingToAllow {
+                rel: "inbox.md".to_owned()
+            })
+        );
+        assert!(matches!(
+            compile_allow_schedule("active/s", "workspace/x.md", AGENT_CARD, "@tgorka:h"),
+            Err(AllowError::Path(_))
+        ));
+        assert!(matches!(
+            compile_allow_schedule("active/s", "inbox.md", AGENT_CARD, "tgorka"),
+            Err(AllowError::NotAPerson { .. })
+        ));
+    }
+
+    /// R4-05: a card carrying `scheduled_by:` twice is left with neither,
+    /// and one `allowed_by:`.
+    #[test]
+    fn allowing_a_doubly_marked_card_leaves_no_mark() {
+        let doubled = AGENT_CARD.replace(
+            "scheduled_by: \"@nixi:h\"\n",
+            "scheduled_by: \"@nixi:h\"\nallowed_by: \"@old:h\"\nscheduled_by: \"@nixi:h\"\n",
+        );
+        let plan = compile_allow_schedule("active/s", "inbox.md", &doubled, "@tgorka:h")
+            .expect("a marked card");
+        let PlanStep::GuardedWrite { content, .. } = &plan.steps[0] else {
+            panic!("a guarded write");
+        };
+        let (fm, _) = Frontmatter::parse(content);
+        assert_eq!(fm.count(SCHEDULED_BY), 0, "{content}");
+        assert_eq!(fm.lines_of(ALLOWED_BY), "allowed_by: \"@tgorka:h\"\n");
+    }
+
+    /// R118: the drive's owner when signed in, else the only account
+    /// signed in, else a sentence naming whom to sign in as.
+    #[test]
+    fn the_person_allowing_is_the_owner_or_the_only_account() {
+        let (owner, marta, x) = ("@tgorka:h", "@marta:h".to_owned(), "@x:h".to_owned());
+        assert_eq!(
+            allowing_person(Some(owner), &[marta.clone(), owner.to_owned()]),
+            Ok(owner.to_owned())
+        );
+        assert_eq!(
+            allowing_person(Some(owner), std::slice::from_ref(&marta)),
+            Ok(marta.clone())
+        );
+        assert_eq!(
+            allowing_person(None, std::slice::from_ref(&marta)),
+            Ok(marta.clone())
+        );
+        let refused = allowing_person(Some(owner), &[]).expect_err("nobody signed in");
+        assert_eq!(
+            refused.to_string(),
+            "Sign in as @tgorka:h to allow this schedule."
+        );
+        assert!(allowing_person(None, &[marta.clone(), x.clone()]).is_err());
+        assert!(
+            allowing_person(Some(owner), &[marta, x]).is_err(),
+            "two others signed in, the owner not: nobody is guessed"
+        );
     }
 }

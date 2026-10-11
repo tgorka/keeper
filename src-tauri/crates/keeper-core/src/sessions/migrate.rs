@@ -200,6 +200,7 @@ pub fn compile_migrate(input: &MigrateInput) -> Option<Plan> {
         PlanStep::GuardedWrite {
             path: at(README),
             expect_len: input.readme.len(),
+            expect_sha256: None,
             content: record,
         }
     });
@@ -442,7 +443,7 @@ pub enum RecordRenameError {
 /// Every other step here is idempotent on replay: `WriteFile` overwrites,
 /// `TrashFile` answers `Ok` when the source is gone and the trash holds it, and
 /// `GuardedWrite` recognises its own output. `MoveFile` is the one that is not —
-/// `sessions_exec` deliberately refuses a `MoveFile` whose target exists, because
+/// `keeper_agent::sessions::exec` deliberately refuses a `MoveFile` whose target exists, because
 /// its only previous caller ran plans it had just stat'd and a gone source there
 /// means a stale list rather than a completed move. So the move sorts last, the
 /// place this codebase already puts a step whose replay is not free
@@ -584,6 +585,7 @@ fn pointer_rewrites(input: &RecordRenameInput) -> Vec<PlanStep> {
             rewritten.map(|content| PlanStep::GuardedWrite {
                 path: file.path(),
                 expect_len: file.text.len(),
+                expect_sha256: None,
                 content,
             })
         })
@@ -850,6 +852,12 @@ pub fn agents_md(title: &str) -> String {
          | `ref` | a pointer at something that lives elsewhere |\n\n\
          A file may carry any other tags too; these five are only the ones this folder's \
          views collect.\n\n\
+         A task an agent works carries more keys. **`run:` is the agent's run, never a \
+         column** (`queued`, `running`, `waiting`, `blocked`, `review`, `failed`), written by \
+         keeper's host with `last_run:`; the card stays in the column its `status:` names. \
+         `assignee:`, `host:` (a pin), `requested_by:`, `schedule:` and `workflow:` say who, \
+         where and when; keeper adds `scheduled_by:` to a schedule an agent wrote until a \
+         person allows it, and `integrity: untrusted` to a card made from outside content.\n\n\
          ## The two directories\n\n\
          - `artifacts/` — output worth keeping. Versioned and synced. Put finished things here.\n\
          - `workspace/` — scratch. **Not versioned, not backed up, and it dies with the \
@@ -1287,6 +1295,7 @@ Release drafted; DMG attached.\n\n\
             path,
             expect_len,
             content,
+            ..
         }) = plan
             .steps
             .iter()
@@ -1500,6 +1509,12 @@ Release drafted; DMG attached.\n\n\
             text.contains("dies with the session"),
             "the workspace warning is the one line that saves real work"
         );
+        for required in ["`run:`", "never a column"] {
+            assert!(
+                text.contains(required),
+                "{required}: an agent's run is not a column"
+            );
+        }
         // It is itself a pool member, and it declares a kind rather than
         // landing in `unfiled` on every migrated session forever.
         let (fm, _) = Frontmatter::parse(&text);
@@ -1609,7 +1624,7 @@ Release drafted; DMG attached.\n\n\
     /// The plan's effect on a zone, as a map of zone-relative path → bytes.
     ///
     /// A four-step interpreter, and deliberately only the four steps
-    /// [`compile_record_rename`] emits, with the semantics `sessions_exec` gives
+    /// [`compile_record_rename`] emits, with the semantics `keeper_agent::sessions::exec` gives
     /// them: a guarded write that recognises its own output, a trash that keeps
     /// the basename under its key, a move that refuses an occupied target. It
     /// exists because this crate touches no filesystem by rule — `text_file`'s
@@ -1625,6 +1640,7 @@ Release drafted; DMG attached.\n\n\
                     path,
                     expect_len,
                     content,
+                    ..
                 } => {
                     let current = zone
                         .get(path)
@@ -2177,7 +2193,7 @@ Release drafted; DMG attached.\n\n\
 
     /// The migration is one plan through the existing executor, and every step
     /// before the move replays for free (AD-111). The move sorts last for exactly
-    /// that reason: `sessions_exec` refuses a `MoveFile` onto an occupied target,
+    /// that reason: `keeper_agent::sessions::exec` refuses a `MoveFile` onto an occupied target,
     /// so a resume that re-runs it refuses over a verb that has already finished
     /// rather than over one that still has work to do.
     #[test]

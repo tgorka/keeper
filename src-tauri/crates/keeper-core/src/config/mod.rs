@@ -530,7 +530,7 @@ pub fn parse_layer_file(
         }
     };
 
-    let document: toml::Table = match toml::from_str(text) {
+    let document: toml::Table = match crate::toml_order::from_str(text) {
         Ok(table) => table,
         Err(error) => {
             // `toml`'s Display carries the line, the column and a snippet of the
@@ -1468,6 +1468,30 @@ mod tests {
         // ...and the two legacy spellings that predate it.
         assert_eq!(text("honor_remote_deletions").as_deref(), Some("on"));
         assert_eq!(text("favorites_collapsed").as_deref(), Some("false"));
+    }
+
+    /// Two spellings of one setting, and of `mainSyncFolder`, in one file: the
+    /// one later in key order wins, as it always has, wherever it is written
+    /// (R170 — `toml` keeps document order in this build).
+    #[test]
+    fn of_two_spellings_the_later_in_key_order_wins_wherever_it_is_written() {
+        let file = parse_layer_file(
+            Path::new("/x/keeper.toml"),
+            LayerTier::UserGlobal,
+            None,
+            "main_sync_folder = \"/old\"\n\
+             mainSyncFolder = \"/new\"\n\
+             [settings]\n\
+             \"recording.fps\" = 30\n\
+             [settings.recording]\n\
+             fps = 60\n",
+        );
+        assert!(file.faults.is_empty(), "{:?}", file.faults);
+        assert_eq!(
+            file.settings.get("recording.fps").map(|o| o.value.as_str()),
+            Some("30")
+        );
+        assert_eq!(file.main_sync_folder, Some(PathBuf::from("/old")));
     }
 
     /// Numbers and strings: written as themselves, stored as decimal text and

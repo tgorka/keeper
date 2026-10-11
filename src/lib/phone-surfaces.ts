@@ -2,7 +2,7 @@
  * Which primary views the phone stack can show (Story 66.1, AD-197, AD-27).
  *
  * The desktop frame renders every {@link PrimaryView}; the phone stack renders
- * the two chat-list windows at level 0 and a subset of the rest as full-screen
+ * the chat-list windows at level 0 and a subset of the rest as full-screen
  * *surfaces* at level 1. This table is the one place that subset is written
  * down, and three readers agree through it:
  *
@@ -67,10 +67,19 @@ export function phoneSurfaceFor(
 }
 
 /**
- * Whether a drawer row for `view` lands somewhere on the phone: the two chat
+ * Whether `view` is one of the chat-list windows — Chats, Archive, Agents —
+ * which share the chat-list pane and the conversation beside it rather than
+ * replacing them with a surface of their own.
+ */
+export function isChatWindowView(view: PrimaryView): boolean {
+  return view === "inbox" || view === "archive" || view === "agents";
+}
+
+/**
+ * Whether a drawer row for `view` lands somewhere on the phone: the chat
  * windows are level 0 (the stack always shows one of them), everything else
  * needs a surface.
  */
 export function phoneRoutesView(view: PrimaryView, capabilities: CapabilitiesVm): boolean {
-  return view === "inbox" || view === "archive" || phoneSurfaceFor(view, capabilities) !== null;
+  return isChatWindowView(view) || phoneSurfaceFor(view, capabilities) !== null;
 }

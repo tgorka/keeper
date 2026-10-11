@@ -1,0 +1,10 @@
+version = 1
+name = "bmad-build"
+description = "The standard implementation flow: clarify intent, plan, implement, review, and present."
+entry = "workflow.md"
+tools = ["drive_read", "session_write", "bmad_config", "bmad_render", "bmad_memlog", "ask_human", "run"]
+
+[[inputs]]
+name = "intent"
+type = "text"
+required = true

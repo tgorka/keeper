@@ -465,10 +465,11 @@ linked it. The phone build now carries the sync engine, the `sync_*`, `copy_*`,
 schemes. What stays desktop-only, and why:
 
 - The five plugins above (tray, hotkey, autostart, updater, process): no iOS concept.
-- `bots_drive_ipc` / `bots_tools` (the drive half of Bots), `notes_window` (the
-  quick-capture window), `sessions_root` / `sessions_exec` (the sessions board and
-  the tasks runner — AD-201: iOS spawns nothing), `hotkey`, `menu`, `tray`,
-  `voice_window`, `recording_protocol`, `pdf_export` (macOS WebKit).
+- `bots_drive_ipc` and the drive half of `agent_ports` (the drive half of Bots), `notes_window` (the
+  quick-capture window), `sessions_root` (the sessions board and the tasks runner — AD-201:
+  iOS spawns nothing), `hotkey`, `menu`, `tray`, `voice_window`, `recording_protocol`,
+  `pdf_export` (macOS WebKit). `keeper_agent::sessions` is not gated: `keeper-agent` is a
+  dependency on every target, so it compiles on the phone and nothing there calls it.
 - Inside `keeper-sync`, `git/cli.rs` is the one module that spawns a process. On
   iOS every verb on it refuses **before** `Command::new` with one sentence naming
   the phone and the in-process route (`GitEngine::Gix`, `GitCli::phone()`); the
@@ -806,7 +807,7 @@ it. The bridge runner: `bridges-pane.tsx` gates the runner on `bridgeSidecar`, w
 `cfg!(desktop)` (`ipc.rs:1430`); discovery, provisioning and health are on the phone since
 Story 66.1. The sessions board: the sessions commands have `unsupported` twins on the
 phone (`crates/keeper/src/sessions_ipc.rs:41-44` and every twin below it) and
-`sessions_root` / `sessions_exec` are `#[cfg(desktop)]` (`lib.rs:66-70`) — it reads a
+`sessions_root` is `#[cfg(desktop)]` (`lib.rs:66-70`) — it reads a
 synced folder and could follow the notes reader, but it is forty commands and its own
 epic (DW-237). Tasks: a task is one of keeper's own verbs and never a shell string
 (`keeper-sync/src/tasks.rs:148-161`, the closed `TaskKind`), so the wall is not a spawn;
@@ -820,13 +821,13 @@ on the phone is a different feature (DW-239). The summon hotkey: `hotkey.rs` is
 because iOS has no global hotkey. The drive tools: Bots exists on the phone — endpoints
 and bots are added, tested, edited and removed there through the same `keeper-core`
 grammar the desktop uses, and a conversation streams the same way — but the drive half
-(grants, the audit, deliverable paths, image staging) is `bots_drive_ipc` / `bots_tools`,
+(grants, the audit, deliverable paths, image staging) is `bots_drive_ipc` / `agent_ports`,
 still `#[cfg(desktop)]` (`lib.rs:22-29`) and `botTools` still `notes_available`
 (`ipc.rs:1495`). Since Epic 66 that is a choice rather than a linking fact — the phone
 has the folder now — and DW-220 says what would flip it. On the phone those controls are
 absent, not disabled: the pane says once, in its empty state, that the drive tools live
-on your Mac. The scope is Hermes because that is what was asked for; an Ollama endpoint
-a phone can reach is the same wire and is neither built for nor blocked (DW-221).
+on your Mac. The scope is Hermes because that is what was asked for; an Ollama or `openai`
+endpoint a phone can reach is the same wire and is neither built for nor blocked (DW-221).
 
 The sixth item is the [7-day re-arm ritual](#the-7-day-re-arm-ritual) above:
 "reinstalling keeper" is exactly the weekly `bun run tauri ios dev` re-sign (or an
@@ -1080,6 +1081,10 @@ listed (`model_for`, `voice_target.rs:110`). Nothing is ever taken from what is 
 the screen: the picker's note says so ("Where a spoken question goes, whatever is open on
 the screen", `bot-voice-target.tsx:33-34`), and a stream opened by Rust replaces the
 conversation on screen with the target's rather than the other way round.
+Since 91.4 (AD-384) the same key may name one of your assistant's conversations as
+`agent:<room id>` — the phone's Bots sheet lists them under "Speak to" from
+`voice_agent_targets` — and the question then goes into that room as your own message,
+with the answer spoken from the room's edits (`docs/agents.md` § *Talking to Nixi*).
 
 **The banner (AD-207, Story 67.2).** `crates/keeper/src/voice_notify.rs` is iOS-only and
 is called from the same fan-out as the island (`voice_ipc.rs:409-412`). On every change of

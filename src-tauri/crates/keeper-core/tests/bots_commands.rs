@@ -389,6 +389,36 @@ fn commands_grant_distinguishes_a_refused_capability_from_an_unread_one() {
     assert_eq!(commanded(resolve("/grant", &unread)).0, "grant");
 }
 
+/// An OpenAI-compatible endpoint hands keeper the pending tool call, so
+/// `/grant` is keeper's to offer there. Its `/v1/models` never states a
+/// capability, so the live case is tools unknown: listed, runnable, with
+/// keeper's caveat, and no Hermes note beside it.
+#[test]
+fn commands_grant_is_offered_on_an_openai_bot_with_tools_unknown() {
+    let openai = Context {
+        kind: Some(ProviderKind::OpenAi),
+        model_tools: None,
+        ..ready()
+    };
+    let spec = COMMANDS
+        .iter()
+        .find(|spec| spec.name == "grant")
+        .expect("/grant is registered");
+    assert!(offered(spec, &openai));
+    assert_eq!(
+        availability(spec, &openai),
+        Availability::AvailableWithWarning(GRANT_TOOLS_UNKNOWN)
+    );
+    assert_eq!(commanded(resolve("/grant", &openai)).0, "grant");
+    assert_eq!(note(&openai), None);
+    // A stated refusal still removes the row, as on Ollama.
+    let refused_tools = Context {
+        model_tools: Some(false),
+        ..openai
+    };
+    assert!(!offered(spec, &refused_tools));
+}
+
 /// Hermes' own commands are not proxied, and the sentence appears exactly where
 /// a Hermes bot is selected — not on Ollama, where there is nothing to
 /// disclose, and not before a bot is chosen, where it would be a fact about

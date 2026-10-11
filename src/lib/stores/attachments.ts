@@ -14,8 +14,7 @@
  * Each entry carries an opaque client `id` so a chip can be removed (a pre-upload
  * cancel) without needing the path/bytes to be unique.
  */
-import { useStore } from "zustand";
-import { createStore } from "zustand/vanilla";
+import { createStore, type StoreApi } from "zustand/vanilla";
 
 /** An attachment ingested by an OS file path (attach button / drag-drop). */
 export interface PathAttachment {
@@ -68,24 +67,20 @@ export function attachmentId(): string {
   return `att-${nextId}`;
 }
 
-/**
- * The vanilla store instance. Created once at module load, shared across the app
- * (the composer renders the tray + Sends it; the conversation pane's drag-drop
- * listener adds dropped paths to it).
- */
-export const attachmentsStore = createStore<AttachmentsState>()((set) => ({
-  pending: [],
-  add: (attachment) => set((s) => ({ pending: [...s.pending, attachment] })),
-  addMany: (attachments) =>
-    set((s) => (attachments.length === 0 ? s : { pending: [...s.pending, ...attachments] })),
-  remove: (id) => set((s) => ({ pending: s.pending.filter((a) => a.id !== id) })),
-  clear: () => set({ pending: [] }),
-}));
+/** A tray for one open conversation's composer. */
+export function createAttachmentsStore(): StoreApi<AttachmentsState> {
+  return createStore<AttachmentsState>()((set) => ({
+    pending: [],
+    add: (attachment) => set((s) => ({ pending: [...s.pending, attachment] })),
+    addMany: (attachments) =>
+      set((s) => (attachments.length === 0 ? s : { pending: [...s.pending, ...attachments] })),
+    remove: (id) => set((s) => ({ pending: s.pending.filter((a) => a.id !== id) })),
+    clear: () => set({ pending: [] }),
+  }));
+}
 
 /**
- * React selector hook over {@link attachmentsStore}. Pass a selector to subscribe
- * to just the slice a component needs.
+ * The chat's tray (the composer renders it and Sends it; the conversation
+ * pane's drag-drop listener adds dropped paths to it).
  */
-export function useAttachmentsStore<T>(selector: (state: AttachmentsState) => T): T {
-  return useStore(attachmentsStore, selector);
-}
+export const attachmentsStore = createAttachmentsStore();

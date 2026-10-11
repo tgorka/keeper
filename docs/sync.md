@@ -83,6 +83,7 @@ reports names a profile. Profiles run concurrently and fail independently.
 | `releaseTtlMs` | How long content may stay after its release clock last moved; `0` disables (default 24 h) |
 | `settleMs` | Quiescence window (see §4) |
 | `tags` | Extra `Keeper-Tag:` provenance trailers |
+| `agents` | This folder keeps agents, and where: `{ subfolder }`, default `80-agents`. Needs `sessions` in the same profile; a folder file may set it as `[folder.agents]`. See `docs/agents.md` § *The agents zone* |
 
 ### State
 
@@ -1393,6 +1394,102 @@ you want a real one.
 
 Provenance rides git's own metadata rather than a sidecar file precisely so it
 cannot drift the first time someone uses plain `git`.
+
+### A commit a caller writes: `Engine::commit_paths`
+
+The nightly memory consolidation and the weekly skill curator commit through
+`Engine::commit_paths`: one commit of exactly the paths it asks for, under its
+own subject and, after the block above, closed trailers (`Memory-Origin`,
+`Source-Session`, `Approval-Record`). It never undoes a file:
+
+- Under the folder's lane and off the async executor, every path must land on
+  itself under the folder's root — which is then held open, its `.git` held
+  open with it, so a root or a folder on the way swapped for a link, the whole
+  folder swapped for another checkout, or another `.git` put in its place
+  inside it, redirects nothing and publishes nothing — and no written or
+  moved path, nor the `.gitattributes` a large
+  file's rule needs, may be another or inside another. The branch `HEAD`
+  names and its commit are read once: every written path, every moved file
+  and every declaration the caller read must be, in that commit and on the
+  disk, what the caller read. A folder moves only with every file that
+  commit holds under it guarded, and only while the disk holds nothing else
+  under it: one the caller did not read — added since, committed or only put
+  on the disk — moves nothing, and stays where it was put with the folder.
+  Anything else refuses the request with nothing changed.
+- The commit is built from that commit's tree and the requested bytes alone —
+  not the disk, not the index, whose other staged entries stay staged — with
+  a large file's LFS object stored and its rule added to `.gitattributes` in
+  the same commit. A record of it, and of the uploads it will owe, goes to
+  `.git/keeper-commit-paths.json`, synced.
+- Every byte the disk will get is read, the guarded files and what a moved
+  folder holds on the disk are read again, and then the caller's fence is
+  asked, right before the branch moves from exactly that commit to the new
+  one in one compare-and-swap: the only publication.
+  The re-read is right before the publication, not one step with it: a guarded
+  file that changes in the instant between them (one hash pass) does not stop
+  it. Nothing on the disk or in the index changed before it, and a request
+  refused there owes the remote no upload: uploads are queued only once it
+  published. A refused request drops its record only from the `.git` it
+  began with: one put in its place keeps its own.
+- Then the disk and the index follow the commit, path by path, each only where
+  `HEAD` still holds the commit's version — read once, right before the files
+  follow: a commit you made before that read, taking it back, stays yours; one
+  landing in the instant after it can have the commit's files written over its
+  own, and stays in the history under them — and the path still holds what was
+  there before. A file is moved aside, checked and replaced, executable if the
+  commit says so — or as you set it, when you changed only its executable bit
+  — only where nothing took its place, so a save made meanwhile stays,
+  uncommitted, yours; a file a move or a deletion takes away whose executable
+  bit you changed stays where it is. The index is changed under its own
+  `index.lock` from its read to its write: a `git add` at that instant is
+  refused, never lost.
+
+A process killed on the way leaves the record. When the engine opens, and
+before any pass walks, pulls or commits the folder, a record whose commit
+`HEAD`'s history does not reach — by the commit graph, never by commit dates —
+is dropped: nothing of it is anywhere. One whose commit it reaches is finished
+the same way, its uploads queued and any file it was staging (named
+`.keeper.<request>-<n>.tmp`, which no commit takes in) removed. A path `HEAD`
+no longer holds as the commit does is settled against what `HEAD` holds
+there now, mode included, and it completes only where whose everything at
+the path is can be told: the commit's own new file — still linked under its
+staging name, holding the commit's bytes and the executable bit the commit
+gave it — is removed where you took the commit back or committed the path's
+deletion; the old file it had moved aside goes back where you took the
+commit back and nothing took the path, and is removed where you committed
+the path's deletion, so the file is not brought back; where you saved a file
+there, yours stays and the old one is removed. The old file is removed only
+while it holds the bytes and the executable bit it was committed with, read
+right before it goes: one you saved over, or whose bit you set or cleared —
+beside an empty path, your own file or the commit's, before the settling
+began or while it ran — stays. An executable bit is never moved from one
+file to another: modes are held, never transferred. Where whose a file is
+cannot be told — the path holds the commit's bytes with nothing to say the
+commit put them there, or `HEAD` holds a third version while anything of
+the commit's is still there, or you took the commit back with another mode
+than the one it replaced, or took it back after removing the old file it had
+moved aside, or you set or cleared the executable bit of the commit's file or
+of the old file beside it, or saved over that old file — or a file of yours
+cannot go back, nothing is removed: the files stay as they are, each with its
+bit, the old one beside the path as `.keeper-displaced-<request>-<n>`, and
+the record with them, and the folder commits nothing until you settle the
+path: put there what you want — `git checkout -- <path>` for what `HEAD`
+holds, nothing for a deletion; to keep the commit's bytes, commit them; or
+put the bit back as it was — and remove the old file kept beside it unless
+it should go back (with the bit you gave it). A settling run again holds
+again with every file and bit where you left them, one a kill stopped after
+it moved the commit's file off the path to `.keeper-taken-<request>-<n>`
+included: that file goes back first. A kill inside that move back, after the
+file got the path's name and before it lost its own, leaves one file under
+both names, and the folder holds until you remove the `.keeper-taken-…` name
+— only when it is the same file as the path (`ls -i` shows one inode number
+for both); a different file under that name is the commit's own, kept
+because a file of yours took the path. A change to the old file in the
+instant between keeper's last look at it and its removal is not seen. A
+record whose commit or history cannot be read is not known to be either;
+like any record that cannot be settled it stays, the folder's card says so,
+and the folder commits nothing until it is. Authored commits are made on
+Linux and macOS only.
 
 ---
 
@@ -2817,8 +2914,9 @@ not hide the control they were looking for.
 #### What a scheduled sync task does to a folder's polling
 
 Give a folder a `sync` task in `scheduled` mode and that schedule **replaces**
-the folder's own backstop poll: the folder is no longer looked at every fifteen
-seconds as well. One driver, not two. Before it worked this way, a folder with
+the folder's own backstop poll and its five-minute remote poll: the folder is no
+longer looked at every fifteen seconds, nor its remote asked every five minutes,
+as well. One driver, not two. Before it worked this way, a folder with
 an hourly sync task was synced hourly *and* every fifteen seconds, and the
 task's run line took the credit for work the ordinary poll would have done
 anyway. `off` and `manual` take nothing away — a `manual` task adds a button,
@@ -3216,6 +3314,39 @@ Two things worth setting deliberately for an agent workspace:
 - **`excludes`**. Agent tooling leaves scratch files around. The built-in tier-0
   set covers editor and download conventions but not your build outputs.
 
+### Fetch now, and what a push published
+
+Two engine calls let a host that is told a peer pushed fetch at once, and let
+the host that pushed say what it published. They serve the agents' doorbell
+(`docs/agents.md` § *How another host finds out*); nothing in the engine knows
+about agents, and `keeper-syncd` neither taps nor is rung.
+
+- **`Engine::push_tap()`** — a broadcast of every push that reached a remote:
+  the profile, the remote branch's tip this copy knew before the push (`None`
+  for a first push) and the commit it published. Same contract as `watch_tap`:
+  it never affects sync, a subscriber that lags past 64 pushes is told it
+  lagged, and an engine nobody tapped reads nothing extra. A push that published
+  nothing new is not sent. After a push that had to reconcile first (§5), the
+  range also holds the peer's commits it merged.
+- **`Engine::changed_paths(profile, from, to)`** — the files that differ
+  between two commits, repository-relative and `/`-separated (renames as both
+  paths); `from = None` reads the whole of `to`.
+- **`Engine::has_commit(profile, sha)`** — whether this copy holds a commit; a
+  local read.
+- **`Engine::pull_now(profile, sha)`** — fetch now, for one commit a peer named.
+  One `Pull` (`db::enqueue_doorbell_pull`) and nothing else: no walk is opened,
+  and a quiet folder's pull skips its pre-fetch commit, so it costs one fetch.
+  The paced remote poll is re-armed (a fetch is about to happen). The same
+  commit asked again queues nothing — even from two threads at once, or while
+  its pull runs: the last commit asked is checked and recorded under one lock
+  around the enqueue. A `pending` or `deferred` `Pull` covers a newer commit; a
+  `running` one does not, so a newer commit during a fetch queues its
+  successor. A parked `Pull` — a remote that refused this copy — is never
+  joined by this call, only by a person's retry, and that check is the insert's
+  own statement (`INSERT … WHERE NOT EXISTS`). A paused or push-only folder is
+  not pulled. Logged as `remote poll queued reason=doorbell`. `wake_now` is not
+  this: it is a request to *look*, and opens the next walk over the whole index.
+
 ## 16. Security posture
 
 - Credentials live in the OS keychain (or, headless, a `0600` file). Everything
@@ -3464,7 +3595,7 @@ than once an hour**, and the thorough passes run once a day.
 | **scan pass** (event-driven) | commit what settled | a walk of the paths the watcher named (`:(literal)` include pathspecs), the stability gate, LFS staging, the commit; a `Push` is queued if anything was committed or the branch is ahead | a wake, once the gate's settle window (5 s; 10 s on removable media; 60 s ceiling) has run out; at most one wake-driven walk per `min(settle, 5 s)` | `scan pass reason=wake` / `reason=settle`, then `status walk finished caller="commit" included=N` | `scan_due`, `scan_and_enqueue`, `WalkPolicy::include` |
 | **scan pass** (backstop) | an event the watcher dropped | the same pass over the **whole index** (every entry `lstat`-ed; no directory walk — a path the gate holds that git does not carry is `lstat`-ed by the pass itself, §4) | every **1 h** while the watcher is live (`LIVE_WATCH_BACKSTOP_MS`); every `pollIntervalMs` (default 15 s) when it is not — the cadence the degraded-watcher warning names | `scan pass reason=paced`, `status walk finished … included=0` | `scan_is_due`, `LIVE_WATCH_BACKSTOP_MS` |
 | **untracked sweep** | a file that appeared while nothing was watching | the walk also reads every directory (`find_untracked`), so a path git has never seen is found; a live watcher's `Create` event buys the same walk at once, so this is only for what it missed. After `untracked=N` the paths it found are held by the gate, and the gate's second look at each of them is the next commit-leg pass's own sample: the pass lists the held paths its walk did not report and the index does not carry (one probe of the index), gives each git's own exclusion (`.gitignore` and nested repositories, which a path held since before the rule was written has not had) and `lstat`s it itself, so a held path git has never seen costs two stats per pass (§4), never a directory walk — a settled one is committed, a moving one stays held, a gone or ignored one is forgotten, one the pass cannot stat stays held with a `warn`. The same sample covers a restart between the two looks, whichever leg walked first, because `file_state` carries the episode and the pass seeds the gate before it looks | every **24 h** (`UNTRACKED_SWEEP_INTERVAL`), on the first pass of a run, and on every pass with no live watcher; the watcher's own 24 h rescan event rides the same clock | `untracked sweep: this walk reads every directory`, then `status walk finished … untracked=N`; the second look logs nothing of its own — `status walk finished … untracked=0 included=N` is the narrowed walk it rode; `a held path is one git ignores …; forgetting it` / `… now lies inside a nested repository …; forgetting it` (info, `path=`) for one the exclusion drops; `a held path the walk did not report could not be stat'd; keeping it held until it can be` (warn, `path=` and `err=`, once per pass) for one it cannot judge; `the gate holds paths the walk did not report and the index cannot be read …; sampling every one of them` (warn, once per pass) when the index probe fails — which the commit leg can only reach by a race, since its walk read the same index a moment earlier and would have failed the pass first | `walk_policy`, `Engine::paths_for_the_second_look`, `watch::DEFAULT_RESCAN_INTERVAL_MS` |
-| **remote poll** | a peer's change | one fetch of `refs/heads/<branch>` (a single HTTPS request when nothing moved), then fast-forward, or §5's merge | **5 min eligibility floor** (`REMOTE_POLL_MS`), evaluated inside a scan pass, not an independent timer; a quiet live-watcher folder may wait for the **1 h** scan backstop. A commit, named wake, `wake_now` or *Sync now* can bring the pass forward | `remote poll queued reason=paced|wake|push owed`, then `remote polled: up to date` / `the remote branch moved` | `scan_and_enqueue`, `do_pull` |
+| **remote poll** | a peer's change | one fetch of `refs/heads/<branch>` (a single HTTPS request when nothing moved), then fast-forward, or §5's merge | a paced `Pull` becomes **eligible to be queued every 5 min** (`REMOTE_POLL_MS`) for an enabled, pulling folder that no `scheduled` sync task governs, while the desktop app's or `keeper-syncd`'s supervisor runs. Checked on every tick: a tick with no walk due queues the paced pull itself, so a quiet live-watcher folder no longer waits for the **1 h** scan backstop; a scan pass asks too when the window is open. Not queued while a `Pull` is already running (in any supervisor sharing `sync.db`) or parked — a parked pull waits for a person's retry. A commit or a named wake asks at once; `wake_now` and *Sync now* also bring it forward. A governed folder follows its task's schedule (§14). The phone runs no supervisor: it syncs on open, foreground and refresh | `remote poll queued reason=paced|wake|push owed`, `remote poll not queued: a pull is already running or parked`, then `remote polled: up to date` / `the remote branch moved` | `tick_profile`, `scan_and_enqueue`, `queue_remote_poll`, `queue_paced_pull`, `db::enqueue_paced_pull`, `do_pull` |
 | **push** | publish what was committed | `git push` of the working branch, held while any LFS upload is outstanding | a journaled unit, drained on the tick after it is queued; retried with backoff | `committed profile=… files=N`, then `pushed branch=… commits=N` | `do_push` |
 | **LFS transfers** | the objects a commit or a pull needs | one upload/download per queued unit, verify-after-upload, resume on download | journaled units, drained as they are queued | `materialized LFS content`, the transfer's own lines | `do_lfs` |
 | **LFS prune** | the second local copy | release local objects the remote **confirmed** holding (`synced_at_ms`) whose content is in the worktree | on a successful pass that moved an LFS object, or the hourly release look (`RELEASE_LOOK_EVERY_MS`) | `lfs prune: nothing to release` / `released local LFS objects the remote is known to hold` | `mark_synced`, `prune_lfs_store` |
@@ -3487,12 +3618,21 @@ Three things the table implies, stated so nobody infers the opposite:
 - **A local change never waits for a clock.** The watcher, the settle window and
   the journal are the whole path from a saved file to a pushed commit; the hourly
   and daily rows exist for what the watcher could not see.
-- **A peer's change waits for a pass that checks the remote.** The five-minute
-  floor is currently checked inside `scan_and_enqueue`, so it is not a
-  five-minute delivery guarantee: a quiet live-watcher folder can wait for the
-  hourly backstop. This scheduling gap was observed on hesperia/v0.8.27 and is
-  not changed by the UI truthfulness fix. Forgejo does not push to clients;
-  a status query reports the last-known tip without forcing another fetch.
+- **A peer's change is asked for every five minutes, not delivered within
+  five.** Under the desktop app's or `keeper-syncd`'s supervisor, an enabled,
+  ungoverned, pulling folder becomes eligible for a paced `Pull` every five
+  minutes, checked on every tick and independent of the walk's hourly backstop.
+  What can still delay the change: a tick that finds the folder reserved by work
+  still running, an offline backoff with no unit due, an older backlog ahead of
+  the `Pull` in the journal, a pull already running or parked, and the fetch's
+  own duration. A folder governed by a `scheduled` sync task follows that
+  schedule, and the phone syncs on open, foreground and refresh, not on this
+  clock. On a quiet live-watcher folder the pull skips its pre-fetch commit, so
+  asking buys no walk of its own; a pull that succeeds still runs whatever
+  housekeeping a successful pass is due. `wake_now` is a look-now, not a
+  fetch-now: it also opens the next walk over the whole index. Forgejo does not
+  push to clients; a status query reports the last-known tip without forcing
+  another fetch.
 - **Every number here is a `const` or a profile field, and the log line is the
   proof it ran.** `grep 'scan pass' keeper.log | cut -c1-16 | uniq -c` is the
   walk cadence; a folder that walks oftener than this table says is a bug, and

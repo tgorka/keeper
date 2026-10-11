@@ -3953,11 +3953,13 @@ settles-with: on kalypso: accept a call while armed, read the ring
 ### DW-237: The sessions board on the phone.
 
 origin: epic 66, AD-201, story 66.6 (recorded), 2026-09-05
-location: `crates/keeper/src/sessions_ipc.rs:41-44` and every `unsupported()` twin below it,
-  `crates/keeper/src/lib.rs:66-70` (`sessions_root`, `sessions_exec` — `#[cfg(desktop)]`),
-  `crates/keeper/src/ipc.rs:1456` (`sessions: notes_available(&state)`),
-  `src/components/layout/sidebar-pane.tsx:272` (the row rides the `sessions` flag),
-  `src/components/sessions/**` (the desktop pane), `docs/ios.md` *Limitations* (fifth item)
+location: `crates/keeper/src/sessions_ipc.rs:40-44` (the first twin, `sessions_roots`) and every `unsupported()` twin below it,
+  `crates/keeper/src/lib.rs:88-92` (`sessions_exec`, `sessions_root` — `#[cfg(desktop)]`),
+  `crates/keeper/src/ipc.rs:1481` (`sessions: mac_folder_capability_of(&git_report(&state), cfg!(desktop))`),
+  `src/components/layout/sidebar-pane.tsx:272-273` (the row rides the `sessions` flag),
+  `src/components/sessions/**` (the desktop pane), `docs/ios.md` *Limitations* (fifth item);
+  lines re-read on 2026-10-02 (the agents plan's consistency review, F15; ruling R24(12)) — epic 98's story 98.2 takes the read half
+  and DW-410 keeps the rest
 reason: A sessions root is a synced folder plus a flag (AD-107), and the phone has synced folders
   now (D-15), so the board *could* follow the notes reader onto the phone the way 66.4 takes
   Notes there: `sessions_root` is a registry over the profile list, and reading a session's
@@ -6992,3 +6994,1680 @@ location: `src/components/notes/media-block-panel.tsx` (no correction controls),
 reason: The block plays, follows and marks; editing a line, changing a speaker, splitting, adding a line and *Transcribe again* stay in the viewer, which the block opens at its current time. Inside the note editor a widget with text fields fights the editor for the caret and the keys, and every block would be one more correction surface over the same `transcript.json`. The corrections still reach every open block through `keeper://transcript-written`. Revisit if the owner asks to fix a word without leaving the note: a per-line ⋯ menu in the block that opens the viewer's line editor in a popover, writing through the same commands.
 status: done 2026-09-30
 resolution: story 88.6 (the owner's field report of 2026-09-30, W1: "wersja w widget w notes wyglada jak tylko do odczytu - chce miec ta sama jak w recordings"). The block renders the transcript viewer's own component (`TranscriptViewer` with an external scroller, a window and a markers slot) with every correction, the speakers' menus, search and *Transcribe again*; the read-only `TranscriptLinesBox` is deleted. Corrections still reach every other open block and viewer through `keeper://transcript-written`.
+
+### DW-355: Naia, the shared agent of round 2, is not seeded.
+
+origin: ARCHITECTURE-AGENTS.md § What stays out (2026-10-02); owner round 3, "naia - omit for now"
+location: `_bmad-output/planning-artifacts/epic-89-an-agent-is-a-file-in-your-drive.md` (the zone and home grammars a Naia home would use); story 91.5 (the seeded roster)
+reason: The owner named Naia in round 2 and asked to omit it in round 3. makistack knows `naia` only as Marta's storage share (`maia/naia`, digest G5 §6), so there is no persona to seed. Revisit when the owner describes Naia: it is a home under a drive's `80-agents/` like any other, with no new mechanism.
+status: open
+
+### DW-356: A BMAD agent's menu and activation steps are not imported into an agent.
+
+origin: epic 89's plan, 2026-10-02 (story 89.3, `soul_from_bmad`)
+location: `src-tauri/crates/keeper-core/src/agents/soul.rs` (`soul_from_bmad`, `SoulImport.not_imported`); `src-tauri/crates/keeper-ported/src/bmad/config.rs`
+reason: The import writes BMAD's persona fields into `SOUL.md` and lists `activation_steps_prepend`/`_append` and each `[[agent.menu]]` item as not imported. A BMAD menu item names a BMAD skill (`skill = "bmad-architecture"`), and keeper's `[[menu]]` names a folder under `_workflows/`, which exists only from Epic 94 on. Writing a menu item that points at nothing would offer the person a command that cannot run. Revisit in 94.3: map `skill = X` to `workflow = X` when `_workflows/X/` exists, and list the rest.
+status: open
+
+### DW-357: A soul written with YAML block scalars (`identity: |`) is refused.
+
+origin: epic 89's plan, 2026-10-02 (story 89.3)
+location: `src-tauri/crates/keeper-core/src/notes/frontmatter.rs:16-23` (the subset: no `|` or `>`); `src-tauri/crates/keeper-core/src/agents/soul.rs`
+reason: `SOUL.md` is read with keeper's own frontmatter subset, which records a block scalar as unparsed rather than guessing it. A scalar is single-line by construction (`frontmatter.rs:54-55`), so a multi-line `identity` must be a double-quoted string with `\n` escapes, which the subset reads (`unescape_double`, `:725`) and `soul_from_bmad` writes (`quote_double`, `:1011`). A person writing a soul by hand in Obsidian may reach for `|`. The refusal names the key and says how to write it. Revisit if the owner writes souls by hand and finds this a burden: teach the subset literal block scalars (`|`), keeping the byte-preserving write rule.
+status: open
+
+### DW-358: A composed prompt is not checked against the model's context window.
+
+origin: epic 89's plan, 2026-10-02 (story 89.3; the architecture's Ambiguity 10; research §13 #48)
+location: `src-tauri/crates/keeper-core/src/agents/prompt.rs` (`compose`); `src-tauri/crates/keeper-core/src/bots/discover.rs` (no context-window capability is read)
+reason: A sensitive agent pins a local model (AD-377), and the Ollama LXC runs with `OLLAMA_CONTEXT_LENGTH=16384` (digest G5 §6). A soul, capped memory, skills and context files may not fit, and a model given a truncated prompt fails quietly. 89.6's smoke records the golden prompt's `prompt_tokens`, but no story refuses a turn whose prompt cannot fit, because no provider kind reports a context window keeper can trust (`context_window_over_v1: No` for every kind). Revisit when the first `local_only` agent runs: read Ollama's `/api/show` context length and refuse the turn with the numbers, never truncate.
+status: open
+
+### DW-359: An archived session's log chunks are kept as they were written.
+
+origin: epic 89's plan, 2026-10-02 (story 89.5; AD-366's measurement)
+location: `src-tauri/crates/keeper-core/src/agents/log/writer.rs`; `src-tauri/crates/keeper-core/tests/agents_log_growth.rs` (the measurement, `#[ignore]`); `docs/agents.md` § What a session costs the drive
+reason: Git stores every committed version of a growing chunk. The 192 KiB bound and pack deltas are expected to keep the cost proportional to the log [INFERENCE], and 89.5's `#[ignore]` test `a_ten_thousand_line_session_costs_the_drive` measures a 10 000-line session to check; re-running it (`cargo test -p keeper-core --test agents_log_growth -- --ignored --nocapture`) re-checks this entry. Archiving a session moves its folder and changes no chunk, so a long session keeps its many committed versions in history forever. Revisit if the measurement shows growth worse than proportional, or a drive's repository grows past the owner's budget: at archive, write the session's chunks into one immutable `log/archive.jsonl.zst` blob and remove the chunks in the same commit.
+status: open
+
+### DW-360: Embeddings through an `openai` provider are not probed.
+
+origin: epic 89's plan, 2026-10-02 (story 89.6; AD-369)
+location: `src-tauri/crates/keeper-core/src/bots/quirks.rs` (the OpenAi row: `embeddings: Unknown`); `src-tauri/crates/keeper-core/src/bots/embed.rs:149-154`
+reason: CLIProxyAPI's route list has no `/v1/embeddings` (§11.1), and another OpenAI-compatible endpoint may have one. The row is `Unknown`, so the notes index may be pointed at such a provider and fail with the endpoint's 404 rather than a sentence before it starts. A probe would add a request no other kind needs. Revisit when the owner points the notes index at an `openai` provider: probe `POST /v1/embeddings` once at *Test*, and record Yes or No per provider.
+status: open
+
+### DW-361: Token streaming over MSC4471 event streams is not used.
+
+origin: ARCHITECTURE-AGENTS.md § What stays out (2026-10-02); AD-370
+location: `src-tauri/crates/keeper-agent/src/matrix_sink.rs` (anchor, edits, final edit)
+reason: MSC4471 is open and needs implementation, and the matrix-rust-sdk PR for it was closed unmerged (digest R7 §2). keeper streams as an anchor plus `m.replace` edits at least 400 ms apart and one final edit, which every homeserver and client already understands. Revisit when MSC4471 is merged in the spec and in matrix-rust-sdk, or when NFR-113's measured edit cadence is the reason an answer feels slow.
+status: open
+
+### DW-362: Copies of an agent do not wake each other with addressed to-device events.
+
+origin: ARCHITECTURE-AGENTS.md § What stays out (2026-10-02); ruling R11
+location: `src-tauri/crates/keeper-core/src/agents/matrix.rs` (no to-device use); `src-tauri/crates/keeper-agent/src/runtime.rs`
+reason: Ruling R11 keeps keeper free of a to-device dependency. Hosts learn about each other from state events (claims, manifests) and room timelines, which every copy already syncs. Revisit if a measured takeover or doorbell path is slower than the state-event round trip allows.
+status: open
+
+### DW-363: matrix-sdk stays at 0.18 for the agents program.
+
+origin: ARCHITECTURE-AGENTS.md § What stays out (2026-10-02); ruling R11; research §13 #23
+location: `src-tauri/Cargo.toml:61-62`
+reason: 0.19.1 is out (research §6.1). An upgrade touches the messenger, verification, backup and the agents' client at once, and is its own decision, not a rider on this program. Revisit as its own epic, re-running 90.4's live tests as the agents' gate.
+status: open
+
+### DW-364: Claims, host manifests and presence are unencrypted state events.
+
+origin: ARCHITECTURE-AGENTS.md § What stays out (2026-10-02); *Matrix events*
+location: `src-tauri/crates/keeper-core/src/agents/events.rs` (claim and host contents); `src-tauri/crates/keeper-core/src/agents/claim.rs`
+reason: Encrypted state is experimental in matrix-sdk (digest R7 §1). So state carries no content (90.6's acceptance 8 pins that): the server sees that a session exists, which host holds it and what a host can do, never a title, path or text — and a host's manifest names the bots it can use by id, never a provider's address (security review S-33, ruling R28; AD-374). Revisit when matrix-sdk ships encrypted state events as stable.
+status: open
+
+### DW-365: A turn cut off by a host's crash is not re-run.
+
+origin: epic 90's plan, 2026-10-02 (story 90.5; C6)
+location: `src-tauri/crates/keeper-agent/src/agent.rs` (start-up: a `user` line with no `assistant` after it)
+reason: After a crash, the session gets an `error` line and a message asking the person to ask again. A re-run could repeat a tool call that already took effect (a write), which NFR-117's "repeats nothing" forbids, and the log does not yet record which calls had effects that are safe to repeat. Revisit with Epic 93's consume-once record: a turn whose logged calls were all reads (T0) could be re-run automatically.
+status: open
+
+### DW-366: keeper-agentd has no Linux CI job.
+
+origin: epic 90's plan, 2026-10-02 (stories 90.1, 90.5; digest D1 §5)
+location: `.github/workflows/ci.yml` (Rust runs on `macos-latest`); `lefthook.yml:47`; `.github/workflows/release.yml` (the `agentd` job)
+reason: keeper's Rust CI runs on macOS, which compiles agentd but never runs it on its real target. Linux is gated by the pre-push lefthook (clippy) and the release build. The live tests run by hand against delectra. Revisit when a Linux runner is available, or after the first agentd regression that a Linux `cargo nextest -p keeper-agent -p keeper-agentd` would have caught.
+status: closed 2026-10-02
+resolution: merged into DW-395 (consistency review F24, ruled by the coordinator 2026-10-02). DW-395 is the one "no Linux CI job" entry: it covers keeper-agentd's Linux gates (the pre-push lefthook and the release job) and 96.1's landlock and seccomp tests.
+
+### DW-367: A desktop without an organisation account hosts no agents.
+
+origin: epic 90's plan, 2026-10-02 (story 90.6; AD-374)
+location: `src-tauri/crates/keeper/src/agents_host.rs`; `src-tauri/crates/keeper-core/src/org_account/layout.rs:484-491` (the device slug)
+reason: A host is named by a slug, and on the desktop that slug is the account's device slug, so two Macs never claim one name. Without an account there is no slug, and the desktop does not host. Settings › Agents says so. The owner signs in with an account on hesperia, so nothing is lost today. Revisit if a person without an account wants a Mac to host agents: derive a slug from `host_label` and record it in the drive's own manifest.
+status: open
+
+### DW-368: The mount rule is checked after a drive's first checkout.
+
+origin: epic 90's plan, 2026-10-02 (story 90.3; C8)
+location: `src-tauri/crates/keeper-agent/src/headless/` (`enforce_mounts`)
+reason: AD-377's rule needs the drive's readers, which live in its own `80-agents/_drive.toml`. agentd learns them only after it has cloned the drive, so a misconfigured `agentd.toml` puts that drive's bytes on disk under the wrong principal's OS user until the check deletes them and exits. No agent runs in between, and the credential that allowed the fetch was the operator's. Revisit if a principal's forge credential can read drives it must not mount: fetch only `80-agents/_drive.toml` from the default branch (a sparse, blob-filtered fetch) before any checkout.
+status: closed 2026-10-02
+resolution: superseded by security review S-15 (ruling R28). `agentd.toml`'s `[[drives]]` pins each drive's readers and owner, so the mount rule runs on the pins before any checkout and a drive that fails it is never fetched (story 90.3, C8, acceptance 6). A `_drive.toml` that differs from its pin makes the zone host nothing.
+
+### DW-369: A holder hands a session back only when it is idle.
+
+origin: epic 90's plan, 2026-10-02 (story 90.6; C10)
+location: `src-tauri/crates/keeper-agent/src/claims.rs` (hand-back)
+reason: P6 owns Nixi's main session by the always-on host, and AD-379 does not say what a holder does when placement later prefers another live host. The plan releases at the holder's next idle moment, so a long turn finishes on the Mac even after electra is back. Revisit if the owner wants an immediate hand-back (park the run with `run: blocked` and release at once), or none (the holder keeps the session until it goes away).
+status: open
+
+### DW-370: Nixi and the person cannot draw on the notes view together.
+
+origin: architecture-keeper-2026-07-03/ARCHITECTURE-AGENTS.md § What stays out; epic 91's plan, 2026-10-02
+location: `src/components/notes/` (no canvas), `keeper-agent/src/surface.rs` (the five surface tools)
+reason: The owner said "for now skip drawing - later state will decide" (round 3). The notes view has no canvas and no Excalidraw dependency (digest G5 §4), and the surface tools open, highlight, point, scroll and propose text only. Revisit when the owner asks for drawing: an Excalidraw file is a drive file, so a sixth surface tool would propose a scene change the person applies, as `surface_propose_edit` does for text.
+status: open
+
+### DW-371: The surface tools reach the notes editor only.
+
+origin: epic 91's plan, 2026-10-02 (AD-383)
+location: `src/lib/agents/surface.ts`, `keeper-agent/src/surface.rs`
+reason: Open, highlight, point, scroll and propose act on a note in the notes view; a path outside every vault opens in the Files preview with no highlight, and the transcript viewer, the sessions board and the recordings view are not targets. The owner asked for "the note view". Revisit when the owner asks Nixi to point inside a transcript or at a card: a `view` argument naming the surface, each with its own range grammar.
+status: open
+
+### DW-372: The dock is on the Mac; the iPhone shows Nixi's room as a room.
+
+origin: epic 91's plan, 2026-10-02 (AD-382)
+location: `src/components/notes/notes-phone-pane.tsx`, `src/components/layout/phone-shell.tsx`
+reason: The phone's notes pane is a single column, and a docked conversation beside a note does not fit it; the phone draws Nixi's room in the Agents window (91.1), answers surface requests aimed at it (91.3), and takes voice (91.4). Revisit when the owner asks for Nixi inside the phone's note: a sheet over the note, sharing the dock's scope chip.
+status: open
+
+### DW-373: A proposed edit replaces one line range.
+
+origin: epic 91's plan, 2026-10-02 (AD-383, Q5)
+location: `keeper-agent/src/surface.rs` (`surface_propose_edit`), `src/components/notes/note-diff-bar.tsx`
+reason: `surface_propose_edit(drive, path, range, text)` proposes one replacement of a 1-based, inclusive line range, shown in the diff bar against the buffer the person sees. Several hunks need several proposals, each applied or declined on its own. Revisit when the owner finds multi-hunk proposals tedious: a list of `{range, text}` applied as one transaction.
+status: open
+
+### DW-374: Run state lives in the card file, where a person's move and a host's write can meet in one commit window.
+
+origin: architecture-keeper-2026-07-03/ARCHITECTURE-AGENTS.md § What stays out (AD-386, ruling R2); epic 92's plan, 2026-10-02
+location: `keeper-agent/src/cards.rs` (the `run:` writer), `keeper-core/src/sessions/tasks.rs` (`compile_move`)
+reason: `run:` and `last_run:` are written into the card by the host that runs it, and `status:`/`order:` by a person moving it. Different lines merge cleanly, and 92.2 keeps the host's keys apart from the person's and pins the merge with `a_person_moving_a_card_while_its_host_flips_run_merges_without_a_conflict_copy`; a move and a write of the same line, or hand edits that put the keys together, still meet. Transitions are few per run, so the window is small, and nobody has measured it. Revisit when conflict copies of cards appear in use (count them in `*.sync-conflict-*` under `60-sessions/`): run state moves out of the card into the session log only, projected by the index.
+status: open
+
+### DW-375: A person cannot schedule an agent's card in their own session by typing `schedule:`.
+
+origin: epic 92's plan, 2026-10-02 (AD-387, Q9)
+location: `keeper-agent/src/cards.rs` (`due`, the runnable check), `src/components/sessions/session-board.tsx`
+reason: A scheduled card runs a turn in its own session, and only an agent's session has an owner, a log and a room; a person's flat session has none. So a scheduled card is born by delegation (`delegate(…, card: {schedule})`, which Nixi does when asked) or by a steward, and it waits for a person's *Allow* before its first run (92.2, 92.3; R28 S-21); a `schedule:` typed on a card in a person's session shows "runs only in <assignee>'s session". Revisit when the owner wants to schedule from the board: a *Hand to an agent…* action on a card that delegates it, with its schedule, to the assignee.
+status: open
+
+### DW-376: Missed windows of a scheduled card run once on return; there is no per-card missed-window policy.
+
+origin: epic 92's plan, 2026-10-02 (AD-387)
+location: `keeper-agent/src/cards.rs` (`due`), `keeper-sync/src/tasks.rs` (`TaskMissedPolicy`)
+reason: A card whose host was away for several windows runs once when a host can serve it, and the wait is shown as `run: waiting` with the `run` line's detail naming the host (ruling R25). keeper's tasks have `on_missed` (`run_now | skip | delay`, Story 58.4); cards have no key for it, because *Card fields* names none. Revisit when the owner wants a card to skip a window it missed: an `on_missed:` card key read by the same parser the tasks use.
+status: open
+
+### DW-377: Triage runs on its schedule, not when something lands in the inbox.
+
+origin: epic 92's plan, 2026-10-02 (AD-389)
+location: `keeper-agent/src/stewards.rs` (the `@daily` triage card), `keeper-sync/src/engine.rs` (`watch_tap`)
+reason: A steward triages once a day (or when asked through her proxy). A file dropped into `00-inbox/` waits for the next triage. `watch_tap` already reports changed paths per profile and could wake a triage. Revisit when the owner wants the inbox handled as it arrives: a triage run on a debounced inbox change, still once per window.
+status: open
+
+### DW-378: "Derived from outside content" is decided by verbatim provenance, not by data flow.
+
+origin: epic 92's plan, 2026-10-02 (AD-391, Q11)
+location: `keeper-core/src/agents/label.rs` (the integrity rule)
+reason: Under `untrusted` integrity, a recipient, path or target argument passes only if it appears verbatim in an `owner` or `peer` line of the session; anything else is blocked. That over-blocks an argument a model composed from trusted parts and under-protects a trusted string chosen because an outside page said so. CaMeL tracks a dependency graph per value (research §9.5); keeper's values carry no taint. Revisit when blocks of legitimate arguments are reported, or with DW-414's quarantined-model pattern: values carried by reference from outside content.
+status: open
+
+### DW-379: One reader's decision is enough on a shared session below T4; there is no two-person rule.
+
+origin: epic 93's plan, 2026-10-02 (AD-395, Q2; R28 S-28)
+location: `keeper-agent/src/approvals.rs` (`MatrixApprover`), `keeper-core/src/agents/approval.rs` (`approvers`), `keeper-core/src/agents/trust.rs` (`sender_is_requester`)
+reason: On a session whose label has two readers — a neuradrive session read by tgorka and Marta — either may decide its approvals up to T3, and the first valid decision wins; the other sees the card change. At T4 only the requester at the head of the record's `dispatch_chain` decides (S-28), so neither reader alone decides an irreversible action on the other's behalf. The owner asked for review before dangerous actions, not for a quorum, and a quorum would leave a shared steward's work waiting on whoever is away. Revisit when the owner wants both people to agree on something shared: a `quorum` in the record, counted over decisions from distinct verified readers before the decision file is written.
+status: open
+
+### DW-380: ⌘9 bots keep the in-memory approver; their pending asks die with the window.
+
+origin: epic 93's plan, 2026-10-02 (AD-394; the program's scope guard on ⌘9)
+location: `src-tauri/crates/keeper/src/bots_drive_ipc.rs` (`approver`, `bots_approval_answer`; `ChannelApprover` after 90.1), `keeper-agent/src/host.rs`
+reason: An agent's waiting action is a file that survives restarts and takeovers. A ⌘9 conversation's ask still blocks its tool call in `block_in_place` and is refused when the pane goes or the app quits, and a `TaskKind::Bot` run still refuses every ask. The program does not change ⌘9 chats. Revisit when the owner wants a ⌘9 bot's ask to survive a restart: give ⌘9 turns a session folder (an agent session in all but name), or a `bot_approvals` table beside `bot_messages` resumed by the same park/resume code.
+status: open
+
+### DW-381: keeper has no web search of its own; a BMAD skill that searches the web needs an MCP server the person configured.
+
+origin: epic 94's plan, 2026-10-02 (AD-397; the architecture's *What stays out*)
+location: `src-tauri/crates/keeper-core/src/agents/workflow.rs` (capability map row 14), `src-tauri/crates/keeper-agent/src/mcp/` (96.2's client, the only door)
+reason: BMAD assumes web search in its planning skills (`S/bmad-architecture/SKILL.md:17`, `S/bmad-party-mode/SKILL.md:15`; G4 §5). keeper adds no search engine and no fetch tool:
+- a built-in one would be a destination nobody configured (NFR-121);
+- everything it returned would be outside content.
+
+An MCP server the person names (96.2) can offer search. Its results are labelled `untrusted`, so they taint the session, block promotion into memory (AD-401) and raise consequential calls (AD-392).
+
+Until such a server is configured, a skill's "search the web" step receives row 14's sentence and continues without it.
+
+Revisit when the owner wants agents to search the web without running a server: a `web_search` tool through a provider the person configures, at T0, with `untrusted` results and a row in the egress list.
+status: open
+
+### DW-382: BMAD's other 39 helper scripts have no Rust port.
+
+origin: epic 94's plan, 2026-10-02 (story 94.1; AD-396's module list)
+location: `src-tauri/crates/keeper-ported/src/bmad/` (the six helpers ported), `src-tauri/crates/keeper-core/src/agents/workflow.rs` (capability map row 5)
+reason: The port covers exactly what AD-396 names: `config_utils.py`/`resolve_config.py`/`resolve_customization.py`, `render_skill.py`, `memlog.py` and `resolve_party.py`.
+
+The installed skills carry 39 more helper scripts (`find ~/.claude/plugins/cache/bmad-method/bmad/6.12.0.0/skills -path '*/scripts/*.py' -not -path '*/tests/*'`, 2026-10-02). Among them:
+- `bmad-architecture/scripts/lint_spine.py`;
+- `bmad-advanced-elicitation/scripts/pick_methods.py`;
+- `bmad-sprint-planning/scripts/sprint_plan.py`;
+- `bmad-brainstorming/scripts/brain.py`;
+- `bmad-retrospective/scripts/{git_evidence,sprint_status}.py`;
+- the builder modules' scanners.
+
+A skill that calls one gets row 5's sentence:
+- on a host whose `run` (96.1) is offered and has Python, the agent may run it in the sandbox over `workspace/`;
+- elsewhere, the step is skipped or done by reading the CSV or file the script would have read.
+
+Revisit when a workflow the owner runs often fails at one of these scripts: port that one into `keeper-ported::bmad` with its upstream tests, as 94.1 did for the six.
+status: open
+
+### DW-383: Format-B BMAD skills halt in any drive whose BMAD install carries the duplicated module keys.
+
+origin: epic 94's plan, 2026-10-02 (story 94.1; G4 §2; research §13 #42)
+location: `src-tauri/crates/keeper-ported/src/bmad/render.rs` (`RenderError::Ambiguous`), `_bmad/config.toml:19-21` and `:32-34` in this repo and in `/workspace/tgdrive`, `/workspace/bmad-plugin/plugins/bmad/runtime/_bmad/config.toml:30-34` (the template)
+reason: `planning_artifacts`, `implementation_artifacts` and `project_knowledge` are each defined in both `[modules.bmm]` and `[modules.gds]`.
+- **What halts.** `render_skill.py`'s `{{.key}}` must name exactly one leaf (`render_skill.py:140-150`), so `bmad-build`, `bmad-build-auto` and every skill rendered through it halt with ``HALT: ambiguous config value `implementation_artifacts` found at: modules.bmm.implementation_artifacts, modules.gds.implementation_artifacts``.
+- **What keeper does.** It refuses with that sentence too (AD-397: a render error is a refusal with its sentence, never a guess).
+- **Why a drive cannot fix it.** No drive-side or custom layer can delete a key (`config_utils.py:79-88`). Equal values are still ambiguous.
+
+The fix is the operator's, OA-94-1:
+1. Drop the three keys from `[modules.gds]` in the plugin's template, or drop `gds` from the install set.
+2. Re-run `/bmad:init` in each install.
+
+Revisit when the template is fixed: switch 94.1's defect test to its fixture copy (it keeps the defect on purpose), and confirm `bmad_render` publishes `bmad-build` in tgdrive.
+status: open
+
+### DW-384: A render generation lives in unsynced scratch, so a run whose BMAD inputs changed cannot resume.
+
+origin: epic 94's plan, 2026-10-02 (stories 94.1, 94.3; Q2)
+location: `src-tauri/crates/keeper-agent/src/bmad.rs` (the publish into `workspace/bmad-render/`), `src-tauri/crates/keeper-agent/src/workflow.rs` (the takeover re-render)
+reason: `bmad_render` publishes a format-B skill's rendered files under the session's `workspace/`. That folder is scratch, never synced (`/workspace/tgdrive/.gitignore:104-105`), because a rendered generation is derived and content-addressed.
+
+A host that takes a running session over renders it again from the same inputs and reads the same paths (94.3 #8). If the workflow's sources or the drive's `_bmad/` configuration changed in between, the new generation's hash differs, and the resume is refused with a sentence. The run must be started again, and its artifacts so far stay in the session.
+
+Keeping the old inputs would mean versioning a whole BMAD install inside every session.
+
+Revisit when a long workflow is lost this way in practice: record the generation's input files' blob ids in the session log at render time, and render from those blobs on takeover.
+status: open
+
+### DW-385: Skills are neither signed nor hash-pinned, and nothing quarantines a skill whose bytes changed after review.
+
+origin: epic 95's plan, 2026-10-02 (the architecture's *What stays out*; research §9.3, §9.7; digest R6 A3; D-34's draft)
+location: `src-tauri/crates/keeper-core/src/agents/skills.rs` (89.3's index), `src-tauri/crates/keeper-core/src/agents/consolidate.rs` (95.2's skill promotion)
+reason: A skill reaches `_skills/` only from a person or from the consolidator. The consolidator applies a proposal that passed the structural exclusions and Hermes' threat scan (95.1, 95.2), and an agent's skill is not offered until a person adopts it (95.2, R28 S-12).
+
+The program does not prevent a change to a skill's bytes after adoption, for example by a person's synced edit or a compromised device pushing to the drive. A changed adopted skill is still offered.
+
+OWASP's skill supply-chain guidance (AST02) recommends signing a canonical digest, pinning by `sha256`, and quarantining on mismatch. R6 recommended the same, and P8 did not pin it.
+
+Revisit when skills arrive from anywhere but the owner's own agents, or a skill is found changed:
+- record each skill's reviewed digest in `metadata.keeper_sha256` at promotion or by a person's *Trust this skill*;
+- have the index refuse to offer a skill whose bytes no longer match, listing it as quarantined.
+status: open
+
+### DW-386: The curator does not consolidate skills with a model.
+
+origin: epic 95's plan, 2026-10-02 (AD-402; the architecture's *What stays out*; research §9.1)
+location: `src-tauri/crates/keeper-ported/src/hermes/curator.rs`, `src-tauri/crates/keeper-agent/src/curate.rs`
+reason: Hermes' curator has an LLM pass that merges overlapping skills. It is off by default (`consolidate:false`) and costs 50–100 model calls a sweep (digest R6 A1).
+
+95.3 ports only the deterministic part: stale at 14 days, archived at 30, never deleted, only skills the agents made. A library of near-duplicate skills therefore stays near-duplicate until a person merges them.
+
+Revisit when the owner sees the skills list grow with overlaps: a weekly merge pass as a `helper` on the always-on host. Its result is a `skill_propose` per merge, so it goes through 95.2's gates and the owner's review on shared drives, never straight into `_skills/`.
+status: open
+
+### DW-387: Journals and outside-derived proposals have no TTL beyond gate sessions.
+
+origin: epic 95's plan, 2026-10-02 (the architecture's *What stays out*; research §9.4; digest R6 (a))
+location: `src-tauri/crates/keeper-agent/src/memory/` (`JournalWriter`), `src-tauri/crates/keeper-core/src/agents/curate.rs` (the gate-proposal expiry), `src-tauri/crates/keeper-core/src/agents/consolidate.rs` (the structural gate)
+reason: R6 recommended two expiries:
+- episodic notes after 90 days;
+- proposals derived from `untrusted` content after 30 days unless a person endorses them.
+
+P12 pinned neither. A gate session's proposals do expire: every night's structural gate skips them, and 95.3's weekly curator gives them `verdict = "expired"` at 30 days (AD-416; R29 F4).
+
+As planned:
+- a journal grows one file per day per host, forever;
+- an `untrusted` proposal is rejected at the next night, because the structural gate excludes it (95.2 #1), and moved to `proposals/done/` rather than expiring.
+
+The open issue is the journal's growth and its re-reading by `drive_search`.
+
+Revisit when an agent's `journal/` passes a few thousand files or starts crowding search results: a monthly roll-up of journals older than 90 days into one file per month, kept in git history, never deleted.
+status: open
+
+### DW-388: agentd builds no notes search index, so `drive_search` on a Linux host is lexical only.
+
+origin: epic 95's plan, 2026-10-02 (story 95.4; AD-403)
+location: `src-tauri/crates/keeper-agent/src/search.rs`, `src-tauri/crates/keeper-core/src/notes/search_index.rs` (the index, readable anywhere), the shell's `notes_vault.rs` (its only builder)
+reason: The hybrid notes index (FTS5 plus vectors, `<vault>/.keeper/search.db`) is built and backfilled by the desktop app's notes vault. `.keeper/` never syncs (a Tier-0 exclusion). So `keeper-agentd` on electra has no index to read.
+
+There, `drive_search` ranks through the bundles' `index.md` listings and a bounded literal scan, and says "lexical: no notes index on this host" (95.4 #10). Meaning-based hits ("the note about the grant deadline" finding "Genesis funding cutoff") appear only on the Mac.
+
+Revisit when agents on electra need meaning-based search, or the scan's caps are hit regularly: have agentd build the same `SearchIndex` for each vault it mounts, through keeper-core's builder moved out of the shell and the configured embeddings provider. It stays derived and disposable (D-21).
+status: open
+
+### DW-389: The drive's own OKF tools never exclude a session's workspace.
+
+origin: epic 95's plan, 2026-10-02 (story 95.4, Q9; checked in process against `/workspace/tgdrive/.okf/bin/okf_lib.py`)
+location: `/workspace/tgdrive/.okf/config.yaml:75` (`60-sessions/**/workspace/**`), `/workspace/tgdrive/.okf/bin/okf_lib.py:819-830` (`_match`), `src-tauri/crates/keeper-ported/src/okf/matcher.rs` (the port, which reproduces it)
+reason: `_match` reads any pattern ending in `/**` as the literal prefix before it. The drive's config says so (`config.yaml:84-85`), so `60-sessions/**/workspace/**` matches only a folder literally named `**`.
+
+`is_excluded("60-sessions/active/2026-10-02-x/workspace/a.md")` is `False` (2026-10-02). `okf index` and `okf validate` therefore walk session workspaces whenever a checkout has them.
+
+keeper is unaffected:
+- `drive_search` never searches a workspace, by keeper's own rule (FR-237; 95.4 #3);
+- the port reproduces the Python exactly, so it agrees with the drive's tools.
+
+The fix belongs to the drive's tooling (OA-95-3).
+
+Revisit when the owner changes `_match` or the pattern: regenerate `keeper-ported::okf`'s parity fixture from the drive's new code, and flip the pinned case.
+status: open
+
+### DW-390: An artifact can be promoted out of a session only into the drive's notes vault.
+
+origin: epic 95's plan, 2026-10-02 (story 95.5)
+location: `src-tauri/crates/keeper-agent/` (`promote_out`), `src-tauri/crates/keeper-sync/src/files_write.rs:464-466` (`WriteScope::create`, vault-only)
+reason: keeper creates a new file in a drive only inside a notes vault. The router refuses a create elsewhere ("Both writers change a file; neither creates one", `files_write.rs:503-505`). The session verbs create only inside a session.
+
+So FR-808's promotion "into the drive's notes vault" reaches the vault (tgdrive's `10-notes/`, where written knowledge lives) and nowhere else (R29 F14 reworded the FR to say so); a target in `30-work/projects/` or `20-records/` is refused with a sentence (95.5 #6). A person can still copy the file there in Finder or Files.
+
+Revisit when the owner wants agent knowledge filed outside the vault: a person-initiated create verb for any folder of a drive, through `browse::resolve` and the same stability gate, offered by the panel's folder picker.
+status: open
+
+### DW-391: Unread marks, per-file history and capture into the session log (FR-235, FR-236, FR-241) stay unbuilt beside the promote panel.
+
+origin: epic 95's plan, 2026-10-02 (story 95.5, Q1; `docs/sessions.md:1070-1073`)
+location: `docs/sessions.md` (*What is not here yet*), `_bmad-output/planning-artifacts/prds/prd-keeper-2026-07-03/phase-7-sessions.md:201-207`, `:234-237`
+reason: `docs/sessions.md` lists five unbuilt features under one parenthetical, "FR-229/235/236/241":
+- the promote panel;
+- unread marks;
+- per-file history projections;
+- capture into the session log;
+- the sticky current session.
+
+The parenthetical's ids do not name the panel: FR-229 is the sessions query grammar, FR-235 unread marks, FR-236 per-file history and FR-241 capture parity; the panel is FR-243 and FR-244 (`phase-7-sessions.md:244-254`). Ruling R26 settles it, and AD-404 now cites FR-243/FR-244 (R29 F24). 95.5 builds the panel as those two FRs specify; FR-235, FR-236 and FR-241 stay unbuilt, and the query grammar (FR-229) already reaches sessions through spaces.
+
+The cost is real for agent work. A person returning to a session an agent worked in has no "changes since you last looked" (FR-235) and no per-file blame by device and origin (FR-236) to see which agent changed what. They read the log and git history instead.
+
+Revisit when the owner reviews agents' sessions regularly: build FR-235 and FR-236 as the phase-7 PRD specifies, over the commit trailers (`Keeper-Device`, `Memory-Origin`) and the session index.
+status: open
+
+### DW-392: The consolidation measures four of OpenClaw's six ranking signals.
+
+origin: epic 95's plan, 2026-10-02 (story 95.2, Q4; `docs/concepts/dreaming.md` at OpenClaw main@07c176c3)
+location: `src-tauri/crates/keeper-ported/src/openclaw/gates.rs`, `src-tauri/crates/keeper-core/src/agents/consolidate.rs`
+reason: OpenClaw scores a memory candidate with six weighted signals: relevance 0.30, frequency 0.24, query diversity 0.15, recency 0.15, consolidation 0.10, conceptual richness 0.06. They are drawn from a recall store of retrieval hits and concept tags.
+
+keeper has no recall store. Its candidates are proposals the agent wrote, so 95.2 measures:
+- frequency as repeated proposals;
+- diversity as distinct sessions;
+- recency and consolidation (distinct days).
+
+It renormalises the weights over those four, and leaves relevance and conceptual richness unmeasured. The documented thresholds (0.75 / 3 / 3) then mean a fact must come up in three sessions on three days, and on a private drive one of those proposals must carry `owner` or `peer` integrity, else the owner is asked (95.2, R28 S-13).
+
+Revisit when the owner finds memory learning too slowly or too noisily:
+- record `drive_search`/`drive_read` hits on journal entries and proposals as recall signals in the `.keeper/agents.db` index;
+- score relevance from them;
+- or let the owner set per-drive thresholds.
+status: open
+
+### DW-393: Computer use on a Linux desktop (AT-SPI, the RemoteDesktop portal) does not exist.
+
+origin: epic 96's plan, 2026-10-02 (AD-408; the architecture's *What stays out*)
+location: `src-tauri/crates/keeper-agent/src/mcp/` (where a Linux screen server would be reached), `src-tauri/crates/keeper-core/src/agents/screen.rs` (the classification table, macOS's only)
+reason: The always-on host is a headless server; the Mac is where a person's screen is, so 96.4 reaches the Mac through Peekaboo and nothing else. A Linux desktop would be reached through AT-SPI (`atspi` 0.30, Apache-2.0 OR MIT) for semantic reads and the RemoteDesktop portal with libei (`ashpd`) for input, which asks a person once and can reconnect unattended with a restore token (research §7.2, §7.8). Neither has a target machine today. Revisit when the owner runs a Linux desktop an agent should act on: a `role = "screen"` MCP server on that desktop, classified by its own table, advertised as `screen:linux`.
+status: open
+
+### DW-394: There is no macOS guest VM for risky GUI work.
+
+origin: epic 96's plan, 2026-10-02 (the architecture's *What stays out*; research §7.8, rank 6)
+location: `src-tauri/crates/keeper-core/src/agents/screen.rs` (the screen table acts on the person's own session)
+reason: Peekaboo acts on the person's own login session, so a mistaken click lands among their own windows; T3/T4 approvals and the re-checked precondition are what stand between the agent and that session. A guest VM (Virtualization.framework) would contain risky GUI work — a download, an unknown installer — but it is not the person's session and cannot do what the owner asked for ("use … the whole computer"). Ranked sixth of six by the research. Revisit when an agent needs to exercise untrusted software on the Mac: a VM host advertised as its own capability, with its own screen server and a disposable disk.
+status: open
+
+### DW-395: No Linux CI job runs keeper-agentd or the landlock and seccomp tests.
+
+origin: epic 96's plan, 2026-10-02 (story 96.1; digest D1 §5); DW-366 (epic 90's plan, stories 90.1 and 90.5) merged into this entry by the consistency review's F24 (ruling R29, 2026-10-02)
+location: `.github/workflows/ci.yml` (every job runs on `macos-latest`); `lefthook.yml:47` (the Linux pre-push clippy); `.github/workflows/release.yml` (the `agentd` job story 90.5 adds); `src-tauri/crates/keeper-agent/tests/run_linux.rs`
+reason: keeper's Rust CI runs on macOS, which compiles keeper-agentd but never runs it on its real target, and proves `run_macos` while `run_linux` — the sandbox electra's agents run under, with its `/proc` and process-reading denials (S-07) — is proved only by `cargo nextest run -p keeper-agent` on the Linux dev host (kernel 6.17) and by `keeper-agentd status` on electra. Linux is otherwise gated by the pre-push lefthook (clippy) and the release build; the live tests run by hand against delectra. A regression in the Linux half is caught at the next developer run, not at the PR. A GitHub `ubuntu-latest` runner could run the suite if its kernel offers landlock ABI ≥ 4 with landlock enabled in its LSM list, which was not established. Revisit when a Linux runner is available — the agents stack's Linux release job (story 90.5) is the first — or after the first agentd or sandbox regression a Linux run would have caught: add `cargo nextest run -p keeper-agent -p keeper-agentd -p keeper-ported` there, and make it a required check once a run proves the runner's ABI.
+status: open
+
+### DW-396: A child-process MCP server runs with the host's own rights, unsandboxed.
+
+origin: epic 96's plan, 2026-10-02 (story 96.2; AD-406)
+location: `src-tauri/crates/keeper-agent/src/mcp/` (the child-process transport), `src-tauri/crates/keeper-core/src/agents/mcp.rs` (`[[mcp]] command`)
+reason: 96.1 sandboxes `run`; a configured MCP server started over stdio — a language server bridge, a debugger adapter — runs as `agentd-<principal>` on Linux or as the person on the Mac, with that user's files and network. keeper treats it as a program the person installed and chose, discloses it in the egress view as "a program you configured", labels its results `untrusted`, checks every call against its configured readers, and never classifies its tools below T2, whatever a person's tier row or the server's own annotations say (S-14, ruling R28) — but does not confine it, because most servers need their own caches, toolchains and network and would fail in the `run` sandbox. Revisit when a configured server misbehaves or the owner wants third-party servers: an optional `sandbox = true` on `[[mcp]]` that starts the child under the same `SandboxPlan` with a server-specific writable directory.
+status: open
+
+### DW-397: `run` has no terminal, no standard input and no process that outlives the call.
+
+origin: epic 96's plan, 2026-10-02 (story 96.1; the owner: "heavy bots (like language server, debugger tools for coding)")
+location: `src-tauri/crates/keeper-core/src/agents/run.rs` (`RunRequest`), `src-tauri/crates/keeper-agent/src/run/mod.rs`
+reason: `run` executes one argv to completion within 30 minutes, with stdin closed and output captured, and kills its process group at the end. A REPL, an interactive debugger, a dev server or a file watcher does not fit: they need a pseudo-terminal (`portable-pty`, MIT) and a process that survives between turns, with its own lifetime, output buffer and approval story. Long-lived tools reach agents as MCP servers instead (96.2). Revisit when a coding agent needs an interactive session: a `process_start`/`process_send`/`process_read`/`process_stop` family over a PTY inside the same sandbox, owned by the session and killed when it closes.
+status: open
+
+### DW-398: Network for `run` is all or nothing; there is no per-host allow-list.
+
+origin: epic 96's plan, 2026-10-02 (story 96.1; AD-405; Q10)
+location: `src-tauri/crates/keeper-core/src/agents/run.rs` (`SandboxPlan.network`), `src-tauri/crates/keeper-agent/src/run/linux.rs`, `macos.rs`
+reason: A `run` with `network: true` may reach any host its argv names; the T3 approval shows the argv and is the person's choice of destination, once (Q10, ruling R24(15)). Since the security review (S-03, ruling R28) such a run sees only its session's `workspace/` — no drive, no `.keeper/` — and its approval releases the workspace's SHA-256 set as shown, so the open network can carry nothing the person did not see listed; what stays all or nothing is the destination. Landlock restricts TCP by port, not by host, and SBPL's network rules match addresses, not names, so a host allow-list would need a filtering proxy the child is forced through — a listening socket keeper does not open (AD-370). Revisit if approvals for `cargo build` or `npm ci` become fatigue: a per-agent list of package registries reached through an outbound-only forward proxy run by the operator, with `run` granted network only to it.
+status: open
+
+### DW-399: MCP elicitation is refused, even when it asks for nothing secret.
+
+origin: epic 96's plan, 2026-10-02 (story 96.2; AD-406)
+location: `src-tauri/crates/keeper-agent/src/mcp/` (the client's advertised capabilities)
+reason: AD-406 refuses an elicitation that asks for a secret (MCP's form mode must never collect secrets, research §7.5). 96.2 goes further and advertises no elicitation at all, because the only way to a person from an agent session is `ask_human` through the proxy (AD-380), and routing a server's form there — a schema, a parked tool call, an answer relayed back — is a second ask-and-wait path beside epic 94's. A server that needs elicitation fails its call with a sentence. Revisit when a configured server the owner needs depends on elicitation: map form-mode elicitation onto `ask_human`, parked like an approval, with secret-looking fields refused by schema.
+status: open
+
+### DW-400: Only the NanoKVM family is spoken; PiKVM, JetKVM and GL.iNet Comet are not.
+
+origin: epic 96's plan, 2026-10-02 (story 96.5; research §7.3)
+location: `src-tauri/crates/keeper-ported/src/nanokvm/`, `src-tauri/crates/keeper-core/src/agents/kvm.rs` (`kind = "nanokvm" | "nanokvm-go"`)
+reason: The owner named NanoKVM-Go+; the classic NanoKVM's protocol is documented by an MIT reference and NanoKVM-Go brings its own MCP server. PiKVM has a documented REST and WebSocket API (`/api/hid/*`, `/api/streamer/snapshot`), GL.iNet Comet is probably PiKVM-compatible, and JetKVM speaks JSON-RPC over WebRTC `[UNVERIFIED]`; JetKVM's and NanoKVM's firmware are GPL, so any of them is a protocol to encode from documentation, never code to link. Revisit when the owner owns one of them: a `kind` per protocol in `keeper-ported`, each with its own `UPSTREAM.md`, under the same T4 floor.
+status: open
+
+### DW-401: A coding run is followed by polling every ten minutes.
+
+origin: epic 96's plan, 2026-10-02 (story 96.3; Q12)
+location: `src-tauri/crates/keeper-core/src/agents/paseo.rs` (the follow card), `/workspace/makistack/docker/superset-host/paseo-mcp.py` (the broker: four verbs, no events)
+reason: Paseo's broker answers only requests; it has no event, webhook or subscription, and keeper would not listen for one (AD-370). The coding agent's host writes a follow card that asks `get_agent_status` every ten minutes; an agent user wrote its schedule, so it carries `scheduled_by:` and its first run waits for a person's tick (S-21, ruling R28). A finished pull request can wait up to ten minutes after that tick to be reported, and an idle follow costs one T0 call per period. Revisit when that delay matters: the broker posting a Matrix event into the coding session's room on completion (a change in makistack, not keeper), which the session would treat as a doorbell.
+status: open
+
+### DW-402: There is no voice on a server; every spoken turn is recognised, timed and spoken on the device.
+
+origin: epic 97's plan, 2026-10-02 (the architecture's *What stays out*; P4's revisit trigger; D-36)
+location: `src-tauri/crates/keeper-core/src/voice/` (the turn machine), `src-tauri/crates/keeper/src/voice_macos.rs`, `voice_ios.rs` (the ports)
+reason: The owner chose the private option, which sends only text (research §8.1). Server-side voice — Kyutai's STT and TTS in `moshi-server`, Moshi or PersonaPlex for full duplex, a self-hosted LiveKit SFU between the device and a Rust voice agent on electra (R5's privacy-max, §8.9) — would send the person's voice to a server, which D-5 refuses ("send a voice anywhere"), and is the second of AD-370's revisit triggers for a hub. It would bring better recognition, a better synthesised voice and true duplex on Android. Revisit when the owner asks for voice quality the device cannot give, or for voice on a device with no recogniser: a D-entry that amends D-5 for a server the owner runs, MatrixRTC as the transport (MSC4195 is merged, §8.9), and a `docs/egress.md` row.
+status: open
+
+### DW-403: The backchannel rule is a word list and a duration, not an acoustic model.
+
+origin: epic 97's plan, 2026-10-02 (story 97.3; AD-411; research §8.4)
+location: `src-tauri/crates/keeper-core/src/voice/backchannel.rs`
+reason: "Mhm" is told from an interruption by the recognised words (a closed list per language) and by under 600 ms of speech, after speech has paused. A laugh, a sigh or a "hmm" the recogniser renders as nothing is resolved as a false onset and resumes; a backchannel word the list lacks stops the answer. LiveKit's adaptive interruption model separates the two acoustically, but only on LiveKit Cloud, and no permissive backchannel model was found (§8.4, §8.9). Revisit when the voice log shows answers stopped by acknowledgements, or a permissive model appears: a third `_models/` role scored on the paused utterance's audio, with the word list as its fallback.
+status: open
+
+### DW-404: `heard_until` is sentence-granular.
+
+origin: epic 97's plan, 2026-10-02 (story 97.3; Q3)
+location: `src-tauri/crates/keeper-core/src/voice/speech.rs` (`Segmenter`'s offsets), `src-tauri/crates/keeper-core/src/agents/heard.rs`
+reason: The agent learns the end of the last sentence the synthesiser finished; a sentence interrupted in its middle counts as not heard, though the person heard its first half. Apple's synthesiser delegate reports the range it is about to speak (`willSpeakRangeOfSpeechString`), so a word-level cursor is possible, at the cost of a delegate callback per word and an offset map from each utterance back to the answer's text. Revisit if agents repeat noticeably more than the person missed: record the last spoken range, and cut at the end of the last word spoken.
+status: open
+
+### DW-405: ⌘9 conversations record no `heard_until`.
+
+origin: epic 97's plan, 2026-10-02 (story 97.3; AD-411; the scope guard on ⌘9 storage)
+location: `src-tauri/crates/keeper-core/src/bots/session.rs` (`bot_messages`), `src-tauri/crates/keeper/src/bots_ipc.rs` (`send_spoken`)
+reason: Pause-first barge-in and end of turn by meaning apply to every spoken turn, a ⌘9 bot's included. Where the person stopped hearing is recorded only for agent sessions, whose log has a `heard` line kind; a ⌘9 conversation lives in `keeper.db`, whose storage this program does not change (AD-365's note), so the next ⌘9 turn sends the whole answer as history, including what nobody heard. Revisit if the owner talks to ⌘9 bots by voice often: a nullable `heard_until` column on `bot_messages` and the same truncation in `replay`.
+status: open
+
+### DW-406: Apple's `SpeechAnalyzer` is not adopted; voice still uses `SFSpeechRecognizer`.
+
+origin: epic 97's plan, 2026-10-02 (research §8.6)
+location: `src-tauri/crates/keeper/src/voice_macos.rs`, `voice_ios.rs` (the recognition requests), `src-tauri/crates/keeper-core/tests/voice_on_device.rs` (the gate that pins `requiresOnDeviceRecognition`)
+reason: On iOS and macOS 26, `SpeechAnalyzer` with `SpeechTranscriber` gives volatile partial results at about 0.3–0.5 s to the first partial and takes buffers, so it could be fed the echo-cancelled tap the turn models already read (§8.6). keeper's ports and their on-device gate are built on `SFSpeechRecognizer`, which still works and keeps the minimum OS where it is; switching is a port rewrite with a new gate, and none of this epic's acceptance needs it. Revisit when keeper's minimum OS reaches 26, or `SFSpeechRecognizer`'s partials prove too slow for 97.2's 300 ms: a second request path behind the same `VoicePort`, and the gate extended to the new API's on-device rule.
+status: open
+
+### DW-407: keeper on Android is distributed by sideload only; there is no Play Store or F-Droid build.
+
+origin: epic 98's plan, 2026-10-02 (AD-414; the architecture's *What stays out*; P15)
+location: `src-tauri/crates/keeper/gen/android/` (the project), `scripts/install-android.sh`, `.github/workflows/ci.yml` (the Android job builds an unsigned debug APK only)
+reason: P15 scopes Android to the owner's tablet, installed from an APK signed with the owner's own keystore. The Play Store needs a developer account, a reviewed listing, a target-API policy keeper would have to track, and a justification for every sensitive permission (the microphone; any future foreground service's `specialUse`, research §11.6); F-Droid needs reproducible builds from source with no proprietary dependency, which the Android Keystore plugin and Google's `androidx.browser` may complicate `[UNVERIFIED]`. Revisit when someone other than the owner should install keeper on Android: decide the channel, then add a signed release job that publishes the APK beside the macOS release.
+status: open
+
+### DW-408: The notification filtering entitlement is not requested; a status that reaches the phone may show.
+
+origin: epic 98's plan, 2026-10-02 (AD-412; the architecture's *What stays out*; story 98.1's Q2, Q5)
+location: `src-tauri/crates/keeper/gen/apple/` (the `KeeperNotify` extension's entitlements), `src-tauri/crates/keeper-core/src/agents/push.rs` (`classify_notification`)
+reason: In an encrypted room the homeserver sees only `m.room.encrypted`, so it pushes status anchors and, if it does not honour `.m.rule.suppress_edits`, every streamed edit; the extension decides on the device what to show. Whether a Notification Service Extension may drop a notification without Apple's `com.apple.developer.usernotifications.filtering` entitlement is `[UNVERIFIED]` (AD-412); without it, a dropped event may still surface as the placeholder alert the push carried. The entitlement is granted by Apple on request, not by configuration. Revisit when 98.1's operator checklist shows a status or an edit reaching the lock screen: request the entitlement for `dev.tgorka.keeper.notify` and let the extension return no content for a `Drop`.
+status: open
+
+### DW-409: Live Activities for a running agent session are not used.
+
+origin: epic 98's plan, 2026-10-02 (research §11.4)
+location: `src-tauri/crates/keeper/gen/apple/KeeperIsland/` (the existing widget extension, used by voice), `src-tauri/crates/keeper-core/src/agents/push.rs`
+reason: A Live Activity could show a delegated session's run state on the lock screen for up to eight hours, updated by ActivityKit pushes and even started by one (push-to-start), and the `KeeperIsland` target already exists for voice. It would need ActivityKit push tokens registered with the owner's gateway (a second Sygnal app type), an hourly update budget, and a decision about which sessions deserve one; 98.1 pushes only what needs the person — approvals and the proxy's answers. Revisit when the owner wants to watch long agent work from the lock screen: an activity per session the person started, driven by status anchors through the same gateway.
+status: open
+
+### DW-410: The phone's board does not create, archive, delete or edit sessions.
+
+origin: epic 98's plan, 2026-10-02 (story 98.2; AD-413; DW-237's second half)
+location: `src-tauri/crates/keeper/src/sessions_ipc.rs` (every lifecycle verb keeps its `#[cfg(not(desktop))]` twin), `src-tauri/crates/keeper-agent/src/sessions/` (the executor, the zone mutex and the journal)
+reason: DW-237 took the board to the phone "read-only half first … the executor and the space editors after". 98.2 takes the read half, plus moving a card (two frontmatter keys and a commit the phone pushes, D-16). Creating, archiving and deleting run journaled multi-step plans under a per-zone mutex (AD-368) that assume a machine which can resume them and merge (D-15: the phone never merges); the space editors are forty-odd desktop commands. On the phone they would be a second executor on a device that can be killed at any step. Revisit when the owner asks to start or archive work from the phone: send the request to the proxy as a message and let a host run the plan, rather than run it on the phone.
+status: open
+
+### DW-411: Ordinary messages do not push; only agents' approvals and the proxy's answers do.
+
+origin: epic 98's plan, 2026-10-02 (story 98.1's Q2; AD-412)
+location: `src-tauri/crates/keeper-core/src/agents/push.rs` (`classify_notification` drops everything else), `docs/ios.md` (the Limitations list), `IOS_DISCLOSURE_LINES`
+reason: The pusher is per account, so the homeserver pushes every notifying event of every room the account is in; AD-412 shows only approval requests and the proxy's answers, so a message from a person in another room of the same account still notifies only while keeper is open, as today. Pushing ordinary messages is the product question D-1 originally deferred, with its own design: which rooms, mentions only or all, what a bridged chat shows, and what the extension decrypts within 24 MB. Revisit when the owner asks for message notifications on the phone: extend `classify_notification` with the person's existing notification settings per room, behind its own decision.
+status: open
+
+### DW-412: Android listens only while keeper is in front.
+
+origin: epic 98's plan, 2026-10-02 (story 98.4's Q10; AD-414)
+location: `src-tauri/crates/keeper/src/voice_android.rs`, `src-tauri/crates/keeper/gen/android/` (no foreground service), `docs/android.md` (*Limitations*)
+reason: Android allows background microphone use only from a foreground service of type `microphone`; AD-414 uses none, because Tauri's open bug #15671 leaves a blank webview on relaunch after a foreground service kept the process alive (research §11.6). So on the tablet a spoken turn works with keeper in front and stops with the screen off, narrower than the iPhone, which listens with the screen locked. Revisit when Tauri fixes #15671 (or its kin stops reproducing) and the owner wants hands-free listening on the tablet: a `microphone` foreground service started only while listening is armed, with its notification, and the disclosure line changed.
+status: open
+
+### DW-413: Android's voice runs without the turn models where `ort` has no Android runtime.
+
+origin: epic 98's plan, 2026-10-02 (story 98.4's Q9; AD-410, AD-414)
+location: `src-tauri/crates/keeper/src/voice_android.rs`, `src-tauri/crates/keeper-core/src/voice/turn_models.rs`
+reason: The turn models run through `ort`; a prebuilt ONNX Runtime for `aarch64-linux-android` is `[UNVERIFIED]`, and building one from source is a native toolchain keeper does not carry. Without it, Android ends a turn by the 1800 ms pause and tells a backchannel from an interruption by the word list alone (FR-814's fallback, 97.3's rule without models). 98.4 states which branch it built; this entry stays open only if it built the fallback. Revisit when an Android runtime is available to `ort` (prebuilt, or built in the Android CI job): load the same `_models/` roles as the iPhone.
+status: open
+
+### DW-414: Gate sessions block and ask; they do not use the quarantined-model pattern.
+
+origin: epic 99's plan, 2026-10-02 (AD-416; the architecture's *What stays out*; research §9.5)
+location: `src-tauri/crates/keeper-core/src/agents/gate.rs` (the selection rule), `src-tauri/crates/keeper-core/src/agents/label.rs` (one label per session)
+reason: A gate session carries one label for its whole life, so once it reads outside text everything it decides is `untrusted`: consequential calls wait for a person, and a recipient, path or target is allowed only when selected from a closed set the configuration fixes (99.2's reading of AD-391). The quarantined-model pattern — a privileged planner that never sees outside text and handles it only by reference, and a reader model whose output is constrained to typed values (FIDES' Hide and `query_llm`, CaMeL's dependency graph, §9.5) — would let a gate act on outside requests with fewer approvals and finer-grained provenance, at the cost of a second model call per step and per-value labels the session log does not carry. Revisit when gate approvals become fatigue: per-value labels in the tool loop, a reader call with a schema-constrained output, and references in place of text in the planner's context.
+status: open
+
+### DW-415: A system without a Matrix client reaches a gate only through a bridge the owner runs.
+
+origin: epic 99's plan, 2026-10-02 (story 99.1's Q6; AD-370, AD-415)
+location: `src-tauri/crates/keeper-agent/src/gate.rs`, `docs/agents.md` (§ *Gates*)
+reason: keeper opens no listening socket (AD-370, D-32), so a webhook cannot reach a gate directly: it has to become a Matrix message through a bridge appservice on the homeserver, and the gate's callback reaches the system only if that bridge also carries room messages out (an outbound webhook). Whether tuwunel hosts appservices, and which bridge (matrix-hookshot's generic webhooks were not read by the research) carries both directions, are `[UNVERIFIED]` and are the operator's. Such a system is async only: a bridge cannot set a deadline or wait for an answer (Q6). Revisit when the owner connects a webhook-only system: name the bridge, verify it on tuwunel, and document its outbound configuration beside the gate's.
+status: open
+
+### DW-416: A gate has no rate limit over time, only its concurrency.
+
+origin: epic 99's plan, 2026-10-02 (story 99.1, acceptance 6)
+location: `src-tauri/crates/keeper-agent/src/gate.rs`, `src-tauri/crates/keeper-core/src/agents/home.rs` (`[[gate]]`)
+reason: A gate refuses a ticket when its open tickets reach its `max_concurrent_sessions`, and each delegation carries a token budget, but an outside system that sends a request every second still costs one model turn per synchronous request and one approval prompt per ticket. Every async ticket waits for a person (Q7), so a flood becomes approval fatigue before it becomes a bill. Revisit when a connected system is chatty or hostile: a `[[gate]] requests_per_hour` with a `refused` answer naming the limit, counted by the gate session from its own log.
+status: closed 2026-10-02
+resolution: Taken into the plan by the security review (S-23, ruling R28). `[[gate]]` gains `max_tickets_per_hour` (1–1 000, default 10): a per-peer token bucket, computed from the gate session's own `ticket` lines so a restart or a takeover does not refill it, with a ticket it cannot pay for answered `refused` (`busy`) and nothing delegated (story 99.1 #9); one peer's approvals within an hour share one coalesced card whose later lines arrive as edits that do not push (99.1 #10, UX-DR160). Synchronous answers that need no ticket stay bounded by the deadline and the agent's limits.
+
+### DW-417: Gates speak Matrix only, not A2A or ACP.
+
+origin: epic 99's plan, 2026-10-02 (research §5.8: "A2A — not taken; epic 99's gate agent speaks Matrix"; §5.3)
+location: `src-tauri/crates/keeper-agent/src/gate.rs`
+reason: The agent-to-agent protocol (A2A; `a2a-lf`, `a2a-protocol-types`, Apache-2.0) and the Agent Client Protocol (`agent-client-protocol`, Apache-2.0) are the two standards an outside agent system might speak. Both are served over HTTP, so a gate speaking them would be a listening socket keeper does not open (AD-370), or a client polling an outside A2A server — which a gate can already do through an MCP server its host names (AD-406). Revisit when an outside agent system the owner uses speaks only A2A: a bridge on the homeserver that maps A2A tasks to gate tickets, or an outbound A2A client tool for gates.
+status: open
+
+### DW-418: On the Mac, a T2 or T3 approval can come from the same keeper that hosts the run.
+
+origin: security review S-22, accepted by ruling R28 (2026-10-02); ARCHITECTURE-AGENTS.md AD-395; D-33 (*What it costs*)
+location: `src-tauri/crates/keeper-agent/src/approvals.rs` (the decision check); `src-tauri/crates/keeper-core/src/agents/approval.rs` (the T4 device rule)
+reason: The desktop app hosts its person's agents in-process (D-3's asymmetry, "no sidecar"), and the person's verified identity it checks a decision against is held by that same process. A T4 decision is therefore taken only from another device — the phone, or another of the person's keepers — and only from the requester (S-22, S-28). Below T4 the Mac's own card still decides, so a compromised keeper on that Mac could approve its own T2 or T3 request, seen only as the card's verdict on the person's other devices; and a person with no other device cannot decide a T4 action on a run the Mac hosts, which waits and then expires denied. Revisit when the person routinely carries a second device: require another device for T3 as well; or when keeper on the Mac gains a separately signed helper that holds the identity outside the app.
+status: open
+
+### DW-419: Stopping a spoken answer stops the speech, not the agent's turn.
+
+origin: ruling R44 (2026-10-03); epic 91, story 91.4 (as built, rung `agents-91-voice`)
+location: `src-tauri/crates/keeper-core/src/agents/spoken.rs` (the device stops following), `src-tauri/crates/keeper-agent/src/agent.rs` (`ServedSession::turn`, which nothing cancels from the room); the architecture's *Matrix events* table (no cancel event)
+reason: A spoken question to the person's proxy is an ordinary message in its room, and the event table has no event a device can send to cancel an agent's turn. So the stop phrase (and the next question) only stops speech and the device's watch of the answer; the host keeps running the turn — tools, provider tokens — and finishes the answer in the room, where the person can read it. Revisit with epic 93 or later: a `dev.keeper.agent.turn.cancel {v, line}` the proxy's `human` may send from a signed device (R47's rule), checked by `rooms::classify` and delivered like `surface.result` ahead of the turn queue (R39's path), ending the turn as `TurnEnding::Stopped`.
+status: open
+
+### DW-420: A person with no Mac keeping their agents zone has no proxy on the phone.
+
+origin: ruling R72 (2026-10-04); epic 91, story 91.4 review fix R5-F1 (rung `agents-91-voice`)
+location: `src-tauri/crates/keeper-core/src/agents/proxy.rs` (`KnownProxies::proxy_of`, fail-closed), `src-tauri/crates/keeper-core/src/account.rs` (`known_proxies`, the only writer of `dev.keeper.agent.proxies`)
+reason: Whose proxy an agent is fails closed: a device admits a proxy only from its own agents zone or from the person's `dev.keeper.agent.proxies` list, and only a keeper whose zone says `human == me` adds an agent to that list. A person whose proxy runs only on a server (`keeper-agentd`) and who uses keeper only on the phone has no keeper that can vouch for it, so the phone lists no proxy room, the voice target offers no assistant, and surface requests and presence do not reach that proxy. Revisit with a confirmation the phone itself can make — the person confirming the proxy once on the device, signed by their cross-signing identity (R47's rule), or `keeper-agentd agents init` writing the list with the person's consent.
+status: open
+
+### DW-421: Two of a person's keepers writing their proxy list at once can drop one's change until it reads the list again.
+
+origin: ruling R72 (2026-10-04); epic 91, story 91.4 review fix R5-F1 (rung `agents-91-voice`)
+location: `src-tauri/crates/keeper-core/src/account.rs` (`known_proxies`: read the stored list, mirror, `set_account_data`)
+reason: Matrix account data has no compare-and-set: each keeper reads the list from its store, adds and removes from its own zone and writes the whole list back. Two Macs with different zones writing in the same sync window can each overwrite the other's addition; the lost one is written again the next time that keeper reads the list (a dock listing, an admission, the minute's presence), and until then a phone may not list that proxy. Revisit if a person keeps different proxies on different Macs in practice.
+status: open
+
+### DW-422: An answer event decrypted after it left the room's in-memory cache is not heard.
+
+origin: epic 91, story 91.4 review fix R5-F4 (rung `agents-91-voice`)
+location: `src-tauri/crates/keeper-core/src/agents/spoken.rs` (`SpokenAnswer`, `CacheFeed`); matrix-sdk 0.18 `event_cache/redecryptor.rs` (`on_resolved_utds`)
+reason: The spoken answer is followed through the room's event cache, whose redecryptor replaces an event once its key arrives and reports it as a `VectorDiff::Set` — for an event in the in-memory linked chunk (`on_resolved_utds` → `replace_event_at` → `updates_as_vector_diffs`). One held only in the store is replaced there with no diff, and the watch holds behind it until the quiet deadline ends the turn on "Nixi stopped answering." The watch holds a cache subscriber, and the SDK shrinks a room's chunk only when its last subscriber goes (`RoomEventCacheSubscriber`'s drop), so an answer's recent events stay in memory while it is followed; this was read in the SDK's source, not reproduced. Revisit if a spoken answer is ever followed across a cache reset.
+status: open
+
+### DW-430: A secret whose shape is outside the closed pattern set is logged as written.
+
+origin: security review S-17, accepted by ruling R28 (2026-10-02); epic 89's plan, story 89.5 (amendment A4)
+location: `src-tauri/crates/keeper-core/src/agents/redact.rs` (the closed pattern set); `src-tauri/crates/keeper-core/src/agents/log/writer.rs` (`ChunkWriter::append`, which applies it)
+reason: The log writer replaces every match of nine secret shapes (Matrix, Anthropic, OpenAI-style, GitHub, Slack and PostHog tokens, AWS access key ids, JSON Web Tokens and PEM private keys) before a line is written. A password in prose, a bearer token of another shape, a database URL with its credentials, or a secret split across two tool results matches none of them, and reaches the chunk, the drive's history and every device that syncs the session. A wider net (entropy, `key=value` guesses) would also redact the ordinary hashes and ids that replay and the person need, so the set stays closed and tested. Revisit when a secret of a new shape is found in a session log: add its pattern to `redact.rs`, with a sample that must be caught and a look-alike that must stay untouched.
+status: open
+
+### DW-431: An agent host cannot name who last wrote a drive file, so a person's own file reads as `agent`, never `owner`.
+
+origin: epic 90's plan, amended 2026-10-02 after the consistency review (F2: the session label held in `SessionContext`, story 90.5)
+location: `src-tauri/crates/keeper-agent/src/agent.rs` (`SessionContext`, the `ReadFacts` it builds); `src-tauri/crates/keeper-core/src/agents/label.rs` (`label_drive_read`, `Author`)
+reason: 89.4's `label_drive_read` gives `owner` integrity to a file whose last author is one of the drive's readers. A host learns a file's last writer only from git, and the last commit's `Keeper-Device` trailer names a device, not a person; no record maps a device to a reader's Matrix id. So 90.5 passes `Author::Unknown`, and every drive read is at most `agent` (fail low, AD-151): only what the person says in the room is `owner`. That blocks nothing today: 92.6's integrity rule acts on `untrusted`, and S-13's promotion counts the person's messages. Revisit when a rule needs `owner` evidence from a file: map a commit's `Keeper-Device` to a reader through the account's device records (`<login>/device.<device>.toml`, D-27), which is what S-31 says `owner` means ("committed by a reader's keeper").
+status: open
+
+### DW-432: A conflicted session has no resolve action.
+
+origin: security review S-05, accepted by ruling R28 (2026-10-02); epic 90's plan, story 90.6
+location: `src-tauri/crates/keeper-agent/src/claims.rs` (a conflicted session is served by no host); `src-tauri/crates/keeper-core/src/agents/log/reader.rs` (`SessionLog.conflicted`)
+reason: When two hosts both acquired one epoch with different claim events (a race the settle makes unlikely, not impossible), the log holds two truths, replay refuses it, and no host serves the session. Its status anchor says so, and `docs/agents.md` tells a person to move the losing host's chunks of that epoch out of `log/` and commit. There is no button, because choosing which host's lines are the truth is the person's call and a wrong choice discards work. Revisit when a conflict happens in practice: a Settings › Agents action that shows both hosts' lines of the epoch side by side and moves the unchosen chunks to `log/conflicted/` in one commit.
+status: open
+
+### DW-444: On a phone, a brief from an agent that is not one of the person's proxies is drawn as an ordinary message.
+
+origin: story 92.1 review fixes (rung `agents-92-brief`, 2026-10-04; ruling R114, R3-03)
+location: `src-tauri/crates/keeper-core/src/agents/room.rs` (`TurnTrust::brief`'s known-agent gate, `HeaderReader::refresh`'s `known` = the zone's agents ∪ `dev.keeper.agent.proxies`)
+reason: A device draws a brief only from an agent it knows: an agent of an agents zone mounted on it, or one the person's own keeper listed as their proxy. The phone mounts no zone, so it knows only the person's proxies; Nixi handing work to Tola draws as a brief there (Nixi is listed), but Tola handing on to a third agent, in a room the person watches, draws as Tola's ordinary message with its text — never as a hand-off the device cannot vouch for. Revisit when the person watches agent-to-agent hand-offs on the phone: a signed, portable list of the person's known agents (all of them, not only proxies) their keeper writes beside `dev.keeper.agent.proxies`, or an authenticated host-admission fact the device can check.
+status: open
+
+### DW-445: A change of the person's proxy list alone redraws an open room's briefs only at the room's next change.
+
+origin: story 92.1 review fixes (rung `agents-92-brief`, 2026-10-04; ruling R117)
+location: `src-tauri/crates/keeper-core/src/timeline.rs` (`forward_timeline`: briefs are drawn again on a room-info change, a member fetch's end or a zone rescan)
+reason: The agents a device knows are read again whenever the open room changes (any sync that touches it, a gap, its members fetched) and whenever this Mac's zone scan changes them, but the person's `dev.keeper.agent.proxies` arriving on its own does not wake the open room. A phone that opens a delegated room before its keeper's first proxy list arrives draws Nixi's brief as an ordinary message until the room next changes or is opened again — fail-closed, never the other way. Revisit if it is seen: subscribe the producer to the account-data event (`Client::observe_events`) and redraw on it.
+status: open
+
+### DW-435: A delegated session made by a host that stops before it pushes can be made again elsewhere.
+
+origin: story 92.1 review fixes (rung `agents-92-delegate`, 2026-10-04; ruling R95)
+location: `src-tauri/crates/keeper-agent/src/hosts.rs` (`HostRuntime::make_delegated`), `src-tauri/crates/keeper-agent/src/sessions/verbs.rs` (`create_with`'s local `taken_names`)
+reason: The placed host takes the child room's claim keyed by the opening's server time before it makes the folder and hands it back after, so two hosts never both make it while either is up, and both would date it the same. If the maker stops before its commit reaches the other host and stays down past the claim's TTL after its session claim replaced the creation claim, the other host can make the folder again; a local name collision can also give the second folder another name. Revisit when a synced folder can be awaited: record the creation in the room (a state event naming the session path) and make a second host wait for that path to arrive rather than make it.
+status: open
+
+### DW-434: On the Mac, an invite from another principal's proxy (invite arm (c)) stays pending.
+
+origin: ruling R63 (coordinator, 2026-10-04; codemap Q16), story 92.1
+location: `src-tauri/crates/keeper-agent/src/rooms.rs` (`invite_decision`, arm (c)), `src-tauri/crates/keeper-agent/src/desktop.rs` (`known_with(Vec::new(), …)`: the desktop has no `[[trust]]`)
+reason: Arm (c) joins a delegation's room when the inviter is the `proxy` of a pinned `[[trust]]` person who reads the invited agent's home — how Nixi's released hand-off reaches Dr Lucyna Novak's host, which never mounts tgdrive. Only `keeper-agentd` has `[[trust]]`; the epic's "a proxy the desktop hosts for the signed-in person" is not built, so on a Mac only arms (a) and (b) join, and a cross-principal hand-off reaches agentd only. Revisit when a Mac should take such hand-offs: derive the desktop's trust from the signed-in person's own verified cross-signing identity and their proxy's `agent.toml`, pinned as `[[trust]]` is.
+status: open
+
+### DW-440: A person adopts an agent's skill by editing its file; keeper has no adopt action.
+
+origin: epic 95's amendment, 2026-10-02 (story 95.2, Q5; R28 S-12)
+location: `src-tauri/crates/keeper-core/src/agents/skills.rs` (`index`: a skill carrying `metadata.keeper_proposal` is not offered), `src-tauri/crates/keeper-agent/src/consolidate.rs` (the stamp), `src-tauri/crates/keeper-core/src/agents/curate.rs` (the curator, which archives a skill nobody adopted 30 days after its last change)
+reason: An agent's skill lands in `_skills/` stamped `metadata.keeper_proposal` and is offered to no agent until a person adopts it (S-12). Adoption is deleting that key from the skill's `SKILL.md` frontmatter by hand, in keeper's editor or any other; `skills_list` tells the agent the skill waits for a person, and the curator archives one nobody adopted 30 days after its last change. Nothing in keeper lists the skills waiting for a person or adopts one in a click, so a person who does not open `_skills/` never sees them, and an agent's useful procedure goes unused. On a shared drive the owner's approval of the review card is the adoption (95.2 #11). Revisit when the owner wants to review agents' skills as they arrive: a *Skills waiting for you* list in the agents' settings, showing each skill whole, with *Adopt* (the same byte-preserving key removal) and *Archive*.
+status: open
+
+### DW-441: A person's move and a host's `run:` write on two machines merge their lines, but keeper-sync still keeps a conflict copy of the card.
+
+origin: story 92.2 (rung `agents-92-cards`, 2026-10-04; acceptance 7, ruling R70; review R4-14/R4-15, ruling R122, 2026-10-05)
+location: `src-tauri/crates/keeper-sync/src/engine.rs` (`converge_with_conflict_copies`), `src-tauri/crates/keeper-sync/src/git/conflict.rs` (`resolve`: Modified/Modified is `ConflictCopy`), `src-tauri/crates/keeper-core/src/agents/card.rs` (`set_host_keys`)
+reason: The host's first `run:` now goes where an unchanged line separates it from `status:`/`order:` (and never where a move would add them), and `a_move_and_a_run_merge_through_gits_own_merge` proves both edits survive `GitCli::merge_theirs` — the `git merge -X theirs` keeper-sync converges with — on a card whose agent keys sit beside the move's keys and on one with none. The R70 spike (2026-10-05) ran the two-copy case in-process through one `Engine` and `advance_remote` (the remote copy's commit), the harness keeper-sync's own divergence tests use: the canonical `card.md` held both edits (`run: running`, `status: done`, `order: 2`), and the engine also wrote `card.sync-conflict-<stamp>-<device>.md` — the local revision — because its convergence keeps a copy of every path both sides changed to different bytes before the line merge runs (AD-43; `conflict::resolve` decides by change kind, never by hunk). So acceptance 7's "no conflict copy" does not hold in keeper-sync as built; the line separation makes the merged card right, not copy-free. Revisit with a ruling: either keeper-sync skips the copy for a markdown path whose `-X theirs` merge had no conflicting hunk (the merged file then carries both sides, and nothing is lost), or acceptance 7 is restated as "the canonical card carries both edits". The device check (hesperia moves while `nixi@electra` runs) stays owed either way.
+status: open
+
+### DW-442: The board's incremental index refresh does not run the claim epoch fence over the lines it appends.
+
+origin: story 92.2 (rung `agents-92-cards`, 2026-10-04; ruling R62)
+location: `src-tauri/crates/keeper-core/src/agents/index.rs` (`Index::refresh_session`, the tail arm)
+reason: A whole read of a session's log runs the epoch fence: a line from a host whose claim epoch was superseded does not move the session's claim or run state. `refresh_session` reads only the chunks that grew and projects their new lines in `(ts, host, id)` order onto the row the index held, without the fence, so a stale host's late append can show as *running on* that host on the board until the next whole read (a chunk that shrank or went away, or a schema rebuild). Only the board reads it; no decision is taken from it. Revisit if the board shows a fenced host: keep each session's highest seen claim epoch in the row and skip a tail line below it.
+status: closed 2026-10-05
+resolution: review R4-11, ruling R121 — `refresh_session` projects grown lines in log order through the same fence a whole read runs (the fence state kept per session in `fences`), and reads the session whole when a line sorts before one already projected; `a_refresh_agrees_with_a_whole_read_whatever_the_order` proves agreement with a whole read over 60 seeded orders.
+
+### DW-443: The board's agent cards are proved over the mock shell only; the device check on hesperia is owed.
+
+origin: story 92.2 (rung `agents-92-cards`, 2026-10-04; acceptance 9)
+location: `src-tauri/crates/keeper/src/sessions_root.rs` (`detail`: the projection), `src-tauri/crates/keeper/src/sessions_ipc.rs` (`sessions_task_allow_schedule`)
+reason: The shell's projection (the index refresh, `CardAgentVm::of`) and *Allow* compile only on macOS and are by inspection on Linux; the board's rendering is rung 5's, over `dev/mock-shell.ts`. Nothing yet shows a real session with an agent card while `nixi@electra` runs it, its *running on* read from the real index, or *Allow* writing `allowed_by:` with the person the Mac finds (R118: the signed-in owner of the drive, else the only signed-in account). Revisit when rung 5 lands: open such a session on hesperia and record it in the epic's As built.
+status: open
+
+### DW-447: A session the index has never seen, or whose log arrived out of order, is read whole on the board's open.
+
+origin: story 92.2 (review R4-13, ruling R121, 2026-10-05)
+location: `src-tauri/crates/keeper-core/src/agents/index.rs` (`Index::refresh_session`, `replay_whole`)
+reason: A refresh reads at most `REFRESH_BYTES` (1 MiB) of grown log per open, and the cards come from the detail's own bounded pool. Two cases still read the whole log under the index's write lock: the first open of a session the index does not hold, and a refresh that finds a line sorting before one already projected (a host's chunk arriving late), a chunk that shrank or went away. Both are what a rebuild does; a session with a very long log pays it once per such event. Revisit if an open is measured slow: keep per-chunk projections so a late chunk is merged rather than replayed.
+status: open
+
+### DW-450: A screen or KVM approval's preview is not part of the session's record.
+
+origin: epic 96's amendment, 2026-10-02 (stories 96.4, 96.5; R28 S-18)
+location: the sessions zone's `.keeper/previews/` (never committed), `src-tauri/crates/keeper-agent/src/mcp/` (the screen server's preview), `src-tauri/crates/keeper-agent/src/kvm/` (the KVM's)
+reason: A screenshot or a KVM frame holds whatever was on a screen — another person's messages, a password shown in the clear — so it is never written into a session folder or committed (S-18): it lives in the zone's `.keeper/previews/`, which no sync carries, and reaches a person only as the approval card's encrypted Matrix attachment, while the record keeps its SHA-256. A session read later — on another host, after a takeover, or after the homeserver's media retention removed the attachment — shows the hash and *Preview no longer available*, not the image the person decided on. Revisit when an audit needs the image itself: an encrypted per-session preview store whose key only the session's readers hold, with its own retention.
+status: open
+
+### DW-451: A networked `run` cannot read the drives, and its approval releases the whole workspace.
+
+origin: epic 96's amendment, 2026-10-02 (story 96.1; R28 S-03)
+location: `src-tauri/crates/keeper-core/src/agents/run.rs` (`SandboxPlan` without drives when `network`; the workspace's SHA-256 set in `ExecBinding`), `src-tauri/crates/keeper-agent/src/run/`
+reason: A run with network mounts only the session's `workspace/`, so a command that needs a drive's file and the network — uploading a note, building against a file kept in the drive — needs the file copied into the workspace first, as a separate step. The approval then releases every file in the workspace as the card listed it (each path and SHA-256), not only the bytes the command will send: the sandbox cannot tell which files a program reads, so the declassified object is the whole set. A large workspace makes a long card, and a person who approves it releases files the command may never touch. Revisit if networked runs over large workspaces become common: a per-run staging directory holding only the files the agent names for that run, mounted in place of the workspace and released alone.
+status: open
+
+### DW-452: NFR-122's doorbell p95 on the tailnet is not measured yet.
+
+origin: epic 92, story 92.4 (rung `agents-92-doorbell`, 2026-10-05; acceptance 7)
+location: `docs/agents.md` § *How another host finds out* and § *Measured*; `src-tauri/crates/keeper-agent/src/doorbell.rs`, `keeper-sync/src/engine.rs` (`pull_now`, `push_tap`)
+reason: In this repository two engines over one local bare remote prove the commit arrives within two ticks of the bell with no walk (`a_doorbell_brings_the_commit_within_two_ticks`), and Synapse accepts a level-0 visitor's doorbell (`live_doorbell.rs`). The NFR's number — p95 ≤ 15 s from a push on electra (`agentd-tgorka`) or hesperia to the other host holding the commit, over 100 session changes, and a quiet folder's pull interval ≤ 5 min without bells — needs both real hosts, the tailnet and the Forgejo remote, which no test here reaches. Revisit when both hosts run this build: the operator pushes 100 session changes from each side, reads the two hosts' `remote poll queued reason=doorbell` and `pushed` log lines, and records the p95 in § *Measured*.
+status: open
+
+### DW-453: One macOS run of keeper-sync failed a sweep test this rung does not touch.
+
+origin: epic 92, story 92.4 review fixes (rung `agents-92-doorbell`, 2026-10-05)
+location: `src-tauri/crates/keeper-sync/src/engine.rs` (`a_file_the_sweep_found_is_committed_once_it_settles`)
+reason: `scripts/check-macos.sh mac` on the review-fix tree passed fmt, workspace clippy and every test of keeper, keeper-agent, keeper-agentd and keeper-core, then failed this one keeper-sync test (1382 of 1383 passed) at its "a walk finished" log assertion; `cargo test --workspace` stopped there, so later crates did not run on the Mac. The test counts walk log lines under a live watcher; the fixes change only `pull_now`'s enqueue (`db::enqueue_doorbell_pull`) in keeper-sync, and the test passes on Linux in the full suite. Re-run on the Mac or macOS CI; if it fails again, it is a watcher-timing defect of its own.
+
+### DW-455: Nothing says that a scheduled card outside a scheduled session never runs.
+
+origin: epic 92, story 92.3 (rung `agents-92-schedule`, 2026-10-05; acceptance 5, Q9; widened by the rung's review fixes, SCH-10)
+location: `src-tauri/crates/keeper-agent/src/zone.rs` (`active_sessions`, which reads cards for a schedule in `kind = scheduled` sessions only), `src-tauri/crates/keeper-agent/src/cards.rs` (`session_schedule`), `src-tauri/crates/keeper-core/src/agents/card.rs` (`CardAgentVm`), `src-tauri/crates/keeper/src/sessions_root.rs` (`detail`), `src/components/notes/board-card-agent.tsx`
+reason: A scheduled card runs only alone in a `kind = scheduled` session of its assignee. Inside such a session, a card that does not run (another agent's, a second one, an unreadable pin, a scan that could not read every card) is said in the holder's status. Every other session's cards are never read for a schedule — the rescan reads only scheduled sessions', to keep the five-second scan bounded — so a scheduled card in a served conversation or delegated session, or in a person's own session (which has no `agent.toml` and no holder), never runs and nothing says so: not its room's status, and not the board, which draws only the card's keys and the index's two facts. Revisit with a `CardAgentVm` field the shell fills from `session_schedule` over the index's card rows (a shell and front change, gated on macOS), drawn on the card under its schedule; that also covers the served non-scheduled sessions without a second scan on the host's tick.
+status: open
+
+### DW-454: A scheduled card's pin, wait and takeover are proved only over the in-memory double.
+
+origin: epic 92, story 92.3 (rung `agents-92-schedule`, 2026-10-05; acceptances 2, 3, 10; scoped by the rung's review fixes, SCH-11)
+location: `src-tauri/crates/keeper-agent/src/hosts.rs` (`tick_schedule`), `src-tauri/crates/keeper-agentd/tests/live_claims.rs` (`a_scheduled_card_claim_race_on_a_real_homeserver`)
+reason: Two `keeper-agentd` processes over one bare drive on Synapse prove only the initial-run race: an `every 24h` card that never ran is run once, by the one claim holder, its window named in the claim and written as `last_run`. The pin's wait, the takeover's settlement (R163), the settlement of a run left running (R164), a holder that placement no longer picks, and a window judged on the card as it reads now are proved by `hosts::tests` over the claim double and the real zone, not by real processes; the desktop host runs the same `HostRuntime::tick`, but no test drives the app. Revisit when electra and hesperia run this build: the operator gives Nixi a `kind = scheduled` session with an `@hourly` card pinned to hesperia, closes hesperia's lid across two windows and checks electra writes `run: waiting` with `hesperia — a live host`, then that hesperia runs one window on waking and its `last_run` reaches electra; then kills hesperia's agentd mid-turn and checks electra settles the card `review`, "ran on hesperia, effect unknown", without running it.
+status: open
+
+### DW-470: A steward duty session whose maker stops after its folder or its release but before it pushes leaves the other hosts waiting.
+
+origin: story 92.5 review fixes (rung `agents-92-stewards`, 2026-10-05; ruling R165, STW-01/STW-02)
+location: `src-tauri/crates/keeper-agent/src/hosts.rs` (`make_steward`: a released claim beside a `dev.keeper.agent.steward.room` record reads as made)
+reason: The creation claim keyed by the duty's id in the control room decides one maker, and its room record lets the next winner adopt a room whose folder was never written. But once the maker has written the folder and released the claim, every other host takes "released beside a record" as made and waits for the folder to sync. If the maker stops before its commit is pushed, and stays down, no folder arrives and no host makes it again — the same residue as DW-435 for delegated sessions. Revisit when a synced folder can be asked for by id (the doorbell's commit, or a pushed marker the record names): a host that has waited past a bound for a released claim's folder takes the claim and writes the folder for the recorded room itself.
+status: open
+
+### DW-471: A steward's harvester keeps one name per archived folder, and a takeover reads the archive again.
+
+origin: story 92.5 review fixes (rung `agents-92-stewards`, 2026-10-05; STW-09)
+location: `src-tauri/crates/keeper-agent/src/stewards.rs` (`Harvester`: the folder names it has seen, the year folders' mtimes)
+reason: The harvester reads at most `READS_PER_STEP` folders a step and re-lists only year folders whose mtime changed, but it remembers every archived folder's name for the life of the claim, so its memory grows with the archive (names only, not contents). A host that takes the harvest session over starts with no memory and reads the whole archive again in bounded steps; what was already harvested is kept to one turn by the session's log (`SessionContext.harvested`), so this costs reads, not duplicate turns. Revisit if an archive reaches tens of thousands of sessions: keep a high-water mark per year folder in the harvest session (beside `harvest-baseline.txt`) so a takeover resumes instead of re-reading.
+status: open
+
+### DW-472: A real model's daily triage can spend its eight tool rounds before it writes a card.
+
+origin: story 92.5 review fixes (rung `agents-92-stewards`, 2026-10-05; STW-11, the real-model smoke)
+location: `src-tauri/crates/keeper-core/src/bots/tools.rs` (`MAX_TOOL_ROUNDS` = 8), `src-tauri/crates/keeper-core/src/agents/seed/zone/steward-menu.toml` (the `TR`/`DS` prompts)
+reason: `a_stewards_triage_runs_on_a_real_model` (claude-haiku-4-5 through CLIProxyAPI) passed 1 of 3 runs: in a failing run the model listed and read the inbox, then also browsed its own sessions and `80-agents/`, reached the round budget, and its `session_write` calls were refused. The stub-model smoke passes every time; the protocol holds (nothing ran that should not). A turn that ends by round exhaustion gets no continuation outside workflow sessions (epic 94's R106 continues only `kind = workflow`). Close by extending R106's bounded continuation to `kind = scheduled` steward sessions in epic 94, or by a per-kind round budget, and by narrowing the `TR` prompt to the inbox; re-run the real-model smoke until it passes repeatedly.
+
+### DW-460: A narrowed session's detail reaches its person only from a host that runs their proxy.
+
+origin: epic 92, story 92.6 (rung `agents-92-labels`, 2026-10-05; acceptance 9, UX-DR135; restated by the rung's review fixes, R169, LB-08)
+location: `src-tauri/crates/keeper-agent/src/sinks.rs` (`ClientDoors`, `Sinks::proxy_dm`), `src-tauri/crates/keeper-agent/src/agent.rs` (`tell_the_requester`)
+reason: The detail now goes through the person's proxy's own client (`ClientDoors`), so a steward's session reaches the person's DM without joining it, a failed send is tried again on the clock and at the worker's start, and a `told` line marks it done. The door is a proxy copy this host runs: a session served on electra whose person's proxy runs only on hesperia has no door there, keeps its detail in its log, and says so in `tracing` until a turn of it runs where the proxy does. Epic 93's R89 route (the DM request carrying `{session}`, forwarded by the DM's worker on whichever host serves it) is the cross-host door; revisit with 93.3 and route the same detail through it.
+status: open
+
+### DW-461: A doorbell the label refuses leaves no audit row and no refused line.
+
+origin: epic 92, story 92.6 (rung `agents-92-labels`, 2026-10-05; acceptance 1)
+location: `src-tauri/crates/keeper-agent/src/doorbell.rs` (`ring`)
+reason: The doorbell is the host's own send after a push, not a call of any session: there is no session log to write a `tool_result` line in and no provider or session id for a `bot_audit` row. A refused ring is checked with `check_sink(Room)` and logged by `tracing`; its content is a drive id, a commit and a closed reason word, never what a session read. Revisit if the doorbell ever carries session content, or when the audit log gains host-level rows.
+status: open
+
+### DW-462: The host's placement status names the session's own title whatever its label became.
+
+origin: epic 92, story 92.6 (rung `agents-92-labels`, 2026-10-05; acceptance 9, R64)
+location: `src-tauri/crates/keeper-agent/src/hosts.rs` (`show`)
+reason: While no worker serves a session (waiting for a host, handed back), `HostRuntime::show` wrote its status from `agent.toml` — the opening title — without reading the log's current label.
+status: closed 2026-10-05
+resolution: Fixed by the rung's review fixes (R169, LB-07): `show` reads the label from the session's log (`logged_label`) and the room's members now; narrowed, it keeps `session`, says the fixed title and drops the detail. Proved by `a_placement_status_follows_the_label_too` and `a_narrowed_session_stays_fixed_through_a_hand_back_a_wait_and_a_takeover` (`hosts::tests`). The cost of that read is DW-463.
+
+### DW-463: A placement status reads the session's whole log to find its label.
+
+origin: epic 92, story 92.6 review fixes (rung `agents-92-labels`, 2026-10-05; R169, LB-07)
+location: `src-tauri/crates/keeper-agent/src/hosts.rs` (`logged_label`, called by `HostRuntime::show`)
+reason: `show` takes the session's current label from its last `label` line, and `logged_label` gets it with `read_session(dir)` — every chunk of the log, parsed — on each status placement says (a wait, a lost claim, a refused card, a conflict). `show` returns early when the same status was already said only after that read. A long-lived session waiting on an absent host pays a whole-log read on every tick that reaches `show`. Revisit when a session's log grows past a few MB or a host serves many waiting sessions: read the label from the index's session projection, or keep the last label per slot and read only chunks that grew (`Index::refresh_session`'s rule, R62).
+status: open
+
+### DW-485: An approver whose proxy runs on another host is never asked: there is no cross-host request and decision relay.
+
+origin: epic 93, story 93.2 (rung `agents-93-park`, 2026-10-05; R85)
+location: `src-tauri/crates/keeper-agent/src/agent.rs` (`ServedSession::request_by_doors`), `src-tauri/crates/keeper-agent/src/approvals.rs` (`park`)
+reason: R85 sends a request the room's gate blocks to each approver's proxy DM through `ProxyDoors` — the proxies this host runs, the same doors as R169's narrowed detail (DW-460). An approver whose proxy runs on another host has no door here and is not asked (logged); a send that fails is not tried again — the record expires undecided after its 24 h or 1 h. A decision sent in the DM arrives at the proxy's `main` worker, not the parked session's: the forward is Q17/R89's route, built with the declassify card in rung 6 (`agents-93-decide`); until then nothing installs a decision source, so nothing parks in production. Close in rung 6: the DM's worker forwards a decision carrying `{session}` to the parked session's worker on whichever host serves it, the cross-host door replaces the local-only one, and a failed DM send joins the worker's `Retry`.
+status: open — rewritten 2026-10-06 (rung `agents-93-decide`, R194 on review R6-08). Built: a decision in the DM of an approver whose proxy *this* host runs goes home to the parked session (`deciding::Forwards`, R89); who was asked and through which DM is kept beside the record (`approvals/<ulid>.asked.json`) and that route is rebuilt at serve start (R6-07); and the host fails closed — when it runs none of the approvers' proxies, or the request reached none of them, the call does not park: its record is removed, nothing is announced, and the model is told `approvals::NOBODY_TO_ASK` (`parks::only_approvers_this_host_can_ask_are_asked_and_nobody_refuses`). What stays open is the relay itself: a request carried to the host that runs an approver's proxy (agentd ↔ the Mac), the decision carried back to the requesting session, whose record and consume authority stay where it parked, and a delivery state that retries a DM send that failed rather than refusing. Until then an action whose only approvers' proxies run elsewhere is refused on this host, never parked.
+
+### DW-486: An approved `drive_write` to a missing note is refused with the delete's sentence.
+
+origin: epic 93, story 93.2 (rung `agents-93-park`, 2026-10-05; the restack's regression check)
+location: `src-tauri/crates/keeper-sync/src/files_write.rs` (`WriteRefusal::Missing`, `WriteScope::route`)
+reason: `drive_write` never creates a file (its tool description says so; `route` refuses a missing path through `resolve_existing` since epic 46, AD-102), so an approved write to a note that is not there is refused at the run — correctly, with its one audit row closed `refused` (`an_approved_write_to_a_missing_note_keeps_its_one_row`). The sentence the model reads is `WriteRefusal::Missing`'s, written for a delete: "… is no longer in this folder, so nothing was deleted." Close by giving `route`'s refusal a write's own sentence ("… is not in this folder, and `drive_write` changes only a file that exists"), or by refusing a missing path before it parks so nobody is asked to approve a call that cannot run. Whether an agent may create a file outside its session is a product question for AD-102, not this rung's.
+status: open
+
+### DW-487: 93.2 acceptance 5's takeover is proved over the claim double, not two host runtimes.
+
+origin: epic 93, story 93.2 (rung `agents-93-park`, 2026-10-05; acceptance 5 and 10)
+location: `src-tauri/crates/keeper-agent/tests/agent_turns.rs` (`parks::a_consume_that_never_pushed_is_seen_by_the_host_that_takes_over`), `src-tauri/crates/keeper-agentd/tests/live_approvals.rs`
+reason: The takeover test serves the session as host B over the approvals-room double, with A's `consumed` event in the room and no `consumed` line in B's chunks; the live tests send two copies' `consumed` sequentially and, since R181, race them concurrently through `consume_once` with one observable effect. Neither runs two `HostRuntime`s that claim, park, crash, expire and take over end to end. Close with a `live_claims`-style pair (its `Pair` harness) that parks on A, kills it after the accepted `consumed` and before a push, lets B's claim take over after expiry, and asserts one effect — a test runtime may inject its own decision source; production installs one only at rung 6 (R92). See DW-503.
+status: open
+
+### DW-500: After a takeover, the parked machine's pending audit row stays pending there.
+
+origin: epic 93, story 93.2 review fixes R93P-07 (rung `agents-93-park`, 2026-10-05; ruling R176)
+location: `src-tauri/crates/keeper-agent/src/approvals.rs` (`ServedSession::close_row`)
+reason: Every terminal path closes the call's one row on the machine that runs it — its own pending row, or, on a host that took over, a row of its own carrying the approval. The machine that parked and lost the session keeps its `pending` row (its `keeper.db` is not the taker's) until something on that machine settles it; nothing does once the session's log records the round whole. Close with a sweep at serve start that closes this machine's `pending` rows whose approval's round the log shows answered, with the outcome the log's `approval` line names.
+status: open
+
+### DW-501: A continuation a stop cut reports its first open call as possibly run even when it never began.
+
+origin: epic 93, story 93.2 review fixes R93P-06 (rung `agents-93-park`, 2026-10-05; ruling R176)
+location: `src-tauri/crates/keeper-agent/src/approvals.rs` (`continue_parked`, `INTERRUPTED`)
+reason: Nothing is logged when a later call of a resumed round starts, so after a stop the first call without a result may or may not have run; keeper answers it `INTERRUPTED` and never re-runs it (safe), even a read that is harmless to repeat or a call that never began. Close with a per-call start mark (or replaying calls whose effect is read-only) if the conservative answer proves costly.
+status: open
+
+### DW-502: A same-host consume this worker sent before a restart is reported as effect unknown.
+
+origin: epic 93, story 93.2 review fixes R93P-11 (rung `agents-93-park`, 2026-10-05; ruling R179)
+location: `src-tauri/crates/keeper-agent/src/approvals.rs` (`ServedSession::settling`, `settle`)
+reason: The `consumed` event a worker's server took is remembered in memory only, so the same worker's retry runs the call once its read-back succeeds, but after a restart that event looks like any other copy's and the call is told its effect is unknown — safe (nothing runs twice) though the effect is known not to have happened (it runs only after the local mirror line). Close by logging the accepted event before the read-back (a `consumed` line with `result: "pending"`) if the conservative answer proves costly.
+status: open
+
+### DW-503: 93.2 acceptance 10 is proved live at the transport and effect level, not with two full hosts.
+
+origin: epic 93, story 93.2 review fixes R93P-16 (rung `agents-93-park`, 2026-10-05; ruling R181)
+location: `src-tauri/crates/keeper-agentd/tests/live_approvals.rs` (`two_copies_racing_run_the_effect_once`)
+reason: Two clients race `consume_once` through the production `ClientApprovals` on delectra and exactly one performs the counted effect, five approvals in a row. Not driven: two `HostRuntime`s with an injected decision source, lease expiry and takeover, and cuts between the server's acceptance, the local mirror line and a push. Close with DW-487's `Pair` harness running both hosts' workers over one drive and one homeserver, the effect a file write, and a kill between acceptance and mirror.
+status: open
+
+### DW-488: 93.3 acceptance 3 is proved live up to the verdict, not to `decision.json` and the run on a host.
+
+origin: epic 93, story 93.3 (rung `agents-93-trust`, 2026-10-05; R92)
+location: `src-tauri/crates/keeper-agentd/tests/live_trust.rs`, `src-tauri/crates/keeper-agent/tests/agent_turns.rs` (`parks::a_decision_from_a_cross_signed_device_counts_and_one_from_a_new_device_does_not`)
+reason: The live test makes the person's devices with matrix-sdk 0.18 (A bootstrapped, B a fresh login, C signed by A), sends four real decisions, and runs keeper's own `arrival_of`, `classify` and the production adapter (`deciding::ClientDecisions` over the agent's client) with `judge`: A and C count, B does not, an unpinned person does not, the desktop's own device does not at T4, and a reset no longer matches its pin. What a counted decision then does — `decision.json` by the claim holder, the consume, the resume — is proved over the same `DecisionSource` seam in `agent_turns::parks`, not on a running `keeper-agentd`: no production host installs a source until rung 6 (R92). Close in rung 6 with a `live_claims`-style host run once agentd installs `ClientDecisions` (together with DW-487).
+status: open
+
+### DW-489: A decision made in a proxy DM before the parked session's worker re-registers after a restart is dropped.
+
+origin: epic 93, story 93.3 (rung `agents-93-trust`, 2026-10-05; R89)
+location: `src-tauri/crates/keeper-agent/src/deciding.rs` (`Forwards`, `ServedSession::expect_decisions`), `src-tauri/crates/keeper-agent/src/agent.rs` (`serve_arrivals`)
+reason: The DM → session route is an in-memory table on the host: a request registers it when sent, and a restarted session's worker registers it again at serve start for every pending record whose request went by doors. A decision the DM's worker serves before that — the proxy's `main` worker starting first after a restart — finds no route, is answered `no approval of this session waits for this decision` in the DM (no line), and is never replayed into the session's room; the record then expires undecided and the person must ask again. Close by registering routes from `approvals/*.json` of every served session before any worker serves, or by having the DM's worker hold an unrouted decision until the next rescan.
+status: open
+
+### DW-510: An unattended run's action raised to T4 names nobody who may decide it.
+
+origin: epic 93, story 93.3 restack onto the reviewed `agents-93-park` (rung `agents-93-trust`, 2026-10-05)
+location: `src-tauri/crates/keeper-core/src/agents/trust.rs` (`decide_trust`, `NO_REQUESTER`), `src-tauri/crates/keeper-agent/src/approvals.rs` (the park's `dispatch_chain`)
+reason: R171 raises a scheduled run's T3 call (a `card_update` setting `schedule`) to T4, and at T4 only the head of the record's `dispatch_chain` decides (S-28). A scheduled run's record carries an empty chain, so every such decision is logged `nobody can decide this: it names nobody who asked` and the run waits until it expires. Rung 2's `a_scheduled_runs_own_card_update_is_approved_and_ends_the_run` names tgorka in the record by hand to keep proving the card's lifecycle. Close with a ruling on who asked an unattended run — the card's assignee's owner, or the session's `requested_by` — written into the chain at park.
+status: open
+
+### DW-511: The proxy DM's record of forwarded decision events is never pruned.
+
+origin: epic 93, story 93.3 review fixes R3-04 (rung `agents-93-trust`, 2026-10-05; ruling R184)
+location: `src-tauri/crates/keeper-agent/src/deciding.rs` (`Forwards.forwarded`)
+reason: Each decision event a DM hands home is remembered so its redelivery is not handed home again; the set lives as long as the host and grows by one event id per forwarded decision. Small (decisions are made by people), but unbounded. Close by dropping an entry with its route once the approval ends.
+status: open
+
+### DW-512: A federation failure in a live `/keys/query` answer is proved over the verifier, not against a homeserver.
+
+origin: epic 93, story 93.3 review fixes R3-01/R3-02 (rung `agents-93-trust`, 2026-10-05; ruling R182)
+location: `src-tauri/crates/keeper-core/src/agents/trust.rs` (`published_in`), `src-tauri/crates/keeper-core/src/agents/matrix.rs` (`AgentClient::keys_answer`), `src-tauri/crates/keeper-agentd/tests/live_trust.rs`
+reason: The adapter now asks one `/keys/query` per decision and judges that answer alone; `live_trust` proves the whole-answer cases on delectra (A and C count, B and a reset do not). An HTTP-200 answer with `failures`, and an identity replaced between two answers, are proved by `trust::tests` on signed key material and by the `agent_turns` double, because delectra federates with nobody. Close with a second homeserver in the harness that is stopped mid-test.
+status: open
+
+
+### DW-505: A device cannot tell a decided card the host refused (drift, an ignored device) from one it is acting on.
+
+origin: epic 93, story 93.3 (rung `agents-93-card-vm`, 2026-10-05)
+location: `src-tauri/crates/keeper-core/src/agents/approval_card.rs` (`ApprovalFold::state`), `src-tauri/crates/keeper-agent/src/approvals.rs` (`decided`, `settle`)
+reason: The card's state comes from what the room shows: the request, people's decisions, the agent's `consumed`. A decision the host ignores (an unsigned device, a key that moved) or refuses for drift writes only a log line and the run's refusal; nothing in the room names the record, so the card shows that decision as `decided` until it is consumed or expires — still decidable since R187 (review fix R4-03), so a corrective decision from a trusted device is never blocked, but the card cannot say the first one was not counted. 93.3 acceptance 8's "drifted" card needs a host echo per record (an edit of the request, or a state event beside `consumed` naming `refused` and why), which rung 6 adds with the install; until then the mock's states are pending, decided (decidable), expired and consumed.
+status: open
+
+### DW-506: Approval requests older than the event cache's loaded events are folded only once the timeline pages back to them.
+
+origin: epic 93, story 93.3 (rung `agents-93-card-vm`, 2026-10-05)
+location: `src-tauri/crates/keeper-core/src/agents/room.rs` (`HeaderReader::open`, `page_back`, `approvals_of`)
+reason: The cards are folded from the event cache, as the header is; `page_back` searches history only for a status. A card whose request, decision or `consumed` lies before the loaded window is drawn once pagination loads it (the item and the fold move together), but `agent_approval_decide` checks against the cache as it is and refuses a card it cannot see ("keeper cannot find this approval in the room"). A loaded approval item is also not redrawn when the room's power levels change (only briefs are, R117). Close with a bounded history search for pending requests at open, and a redraw of approval items on a power change.
+status: open
+
+### DW-507: A request naming no approvers reads as "anyone in the room may decide", which an empty reader set would also produce.
+
+origin: epic 93, story 93.3 (rung `agents-93-card-vm`, 2026-10-05)
+location: `src-tauri/crates/keeper-agent/src/approvals.rs` (`park`, `approvers`), `src-tauri/crates/keeper-core/src/agents/approval_card.rs` (`may_decide`, `refusal`)
+reason: `approvers` is the label's readers, or `[]` for `Readers::Anyone`; `Readers::Only(∅)` (nobody) also serialises as `[]`. The device then shows decide buttons the host will ignore (AD-27). No session label is empty today; close by carrying `anyone: bool` on the request when the wire next changes.
+status: open
+
+### DW-515: A card in an approver's proxy DM never sees the host's `consumed`, which goes to the session's own room.
+
+origin: epic 93, story 93.3 (rung `agents-93-card-vm`, review fix R4-06, 2026-10-05)
+location: `src-tauri/crates/keeper-core/src/agents/approval_card.rs` (`ApprovalFold::state`), `src-tauri/crates/keeper-agent/src/agent.rs` (`request_by_doors`), `src-tauri/crates/keeper-agent/src/runtime.rs` (the `consumed` sender)
+reason: R185 counts a `consumed` only from the agent that sent the request, in the room the card is in. A request R85 routed to a proxy DM is sent there by the proxy; the requesting session's agent writes its `consumed` in the session's room. The DM card therefore stays open (decidable, R187) until its expiry even after the action ran; a decision sent then is logged by the host as `APPROVAL_ENDED` and changes nothing. Closing it needs the host to forward an authenticated verdict into each DM it asked (the proxy's own state event per id, counted only from the DM's creator), R4-06's "explicitly preserve the origin and authenticate any forwarded host verdict".
+status: open
+
+### DW-516: The timeline's approval item admits any sealed sender at agent power; only the card beside the stream is limited to the session's own agent.
+
+origin: epic 93, story 93.3 (rung `agents-93-card-vm`, review fix R4-02, 2026-10-05)
+location: `src-tauri/crates/keeper-core/src/agents/room.rs` (`TurnTrust::approval`), `src-tauri/crates/keeper-core/src/timeline.rs` (`TimelineItemVm::Approval`)
+reason: `TurnTrust` carries the room's creators but not the claim-named agents `session_agents` reads, so the item that places a card in the timeline still takes a request from any agent at power ≥ 50. The card itself (`TimelineBatch.approvals`) comes from the fold, which R185 limits to the session's own agent, so another agent's request places an item naming an id no card has; rung 5 must draw nothing for an item without a card. Close by giving `TurnTrust` the session's agents and dropping the item when its sender is not one.
+status: open
+
+### DW-517: The approvals are folded again from the whole event cache on every change that touches them, and the whole card list crosses IPC.
+
+origin: epic 93, story 93.3 (rung `agents-93-card-vm`, review fix R4-05, 2026-10-05)
+location: `src-tauri/crates/keeper-core/src/agents/room.rs` (`approvals_touched`, `HeaderReader::approvals`, `fold_events`), `src-tauri/crates/keeper-core/src/timeline.rs` (`approvals_changed`)
+reason: R187's fold follows the room's order by being rebuilt from the cache whenever the cache changes other than by an unrelated append — an approval's own append included — so each such change costs one pass over the loaded events, and every card of the loaded window (terminal ones included) is projected and sent when the list differs. That is bounded by the event cache, not by an explicit number of cards; review R4-05's "keep only the active/visible cards plus bounded terminal metadata" is not done. Close with an incremental fold keyed by event position and a cap on terminal cards sent.
+status: open
+
+### DW-518: An event decrypted before its sender's device is known stays unsealed in the event cache.
+
+origin: epic 93, story 93.3 (rung `agents-93-card-vm`, review fix R4-02 / R185, 2026-10-05)
+location: `src-tauri/crates/keeper-core/src/agents/room.rs` (`sealed_by_sender`), `src-tauri/crates/keeper-agent/src/runtime.rs` (`arrival_of`, `hold_brief`, `reply_of`)
+reason: R185 makes `VerificationLevel::None(MissingDevice)` no seal, on the device and in host intake. The SDK records an event's encryption info when it decrypts it; if the sender's device keys were not yet downloaded then, the cached copy says `MissingDevice` even after they arrive (not observed; read from the SDK's model, not reproduced). Such a request is no card, and such a brief, reply or decision is not taken, until the event is decrypted again. Close by re-deriving the verification state from the crypto store for unsealed approval/agent events when the sender's devices change, or by asking the SDK to redecrypt them.
+status: open
+
+### DW-519: A host's own send that the label blocks — an answer, a status, a notice — is refused, never offered for declassification.
+
+origin: epic 93, story 93.3 (rung `agents-93-decide`, R191, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/sinks.rs` (`Sinks::check`, `RoomGate::admit`), `src-tauri/crates/keeper-agent/src/matrix_sink.rs`
+reason: Only an agent's tool call can park: its turn ends and resumes at the call. An answer streamed into a room grown wider than the label, a status or a notice is the host's own send with no call to resume, so it keeps 92.6's refusal (now R192's sentence) and R64's replacement text. Revisit if a person wants to let a withheld answer reach the room: park the answer's final text as a `declassify` record of the turn and send it on approval.
+status: open
+
+### DW-520: A change of the Mac's trust anchor rebuilds the whole desktop host.
+
+origin: epic 93, story 93.3 (rung `agents-93-decide`, R189, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/desktop.rs` (`BuildKey.trust`, `DesktopHost::scan`)
+reason: `DecisionSource::anchor` returns a borrowed `Anchor`, so the desktop's sources are rebuilt rather than updated: verifying this device, or an identity moving, stops the running turns (each gets its final edit), releases every claim and builds the host again on the next scan. Parked runs survive (they are files) and resume at serve start; a running turn is cut. Close with an anchor shared behind a lock (the trait returning an owned or guarded anchor) so only the judgement changes.
+status: open
+
+### DW-521: Surface declassification needs a durable, replayable request (fixed id/expiry) — not built.
+
+origin: epic 93, story 93.3 (rung `agents-93-decide`, R191, 2026-10-06); rewritten by R194 on review R6-05
+location: `src-tauri/crates/keeper-agent/src/surface.rs` (`SurfaceTools::run`, the request's `id` and `expires_at`), `src-tauri/crates/keeper-agent/src/agent.rs` (`ToolHost::run_named`, the surface branch)
+reason: An approval releases exactly the SHA-256 it names, and a surface request mints a fresh ULID and expiry on every send and is hashed whole, so a re-run after approval can never reproduce the approved bytes: the approval would be spent and the action never sent. So a `surface_*` call the label blocks is not declassifiable in this rung: it is refused as before (R192's sentence), never parked, with one audit row and no record (`parks::a_surface_request_the_label_blocks_is_refused_never_parked`). Close by giving a surface approval a durable action of its own — the target, the payload, and a request id and expiry fixed at park and replayed by the run after approval (or a hash over the action without them, with the transport identity bound separately) — proved to complete after approval, after a restart and after a realistic decision delay.
+status: open
+
+### DW-522: One `declassify` approval also passes the blocked call's own tier gate.
+
+origin: epic 93, story 93.3 (rung `agents-93-decide`, R191, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/agent.rs` (`AllowedTools::gated`, `bound_approval`)
+reason: A call both beyond the label and needing a person by its tier (a `drive_write` to a wider drive is T2; a `delegate` whose card carries a schedule is T3) parks once, on the `declassify` record, whose arguments carry the blocked call whole; the resumed call's tier gate sees the consumed approval and runs. The card shows the exact call, but its tier word is the declassification's (T3), and a T2 write's `session` scope is not offered. Revisit if the two should be decided separately: park on the tier first, then on the flow, two cards.
+status: open
+
+### DW-523: The target's host refuses a declassified brief: its label still names only the delegating session's readers.
+
+origin: epic 93, story 93.3 (rung `agents-93-decide`, live AC6 run, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/runtime.rs` (the brief intake: "a brief whose label does not reach this agent's audience and the room's people is not taken"), `src-tauri/crates/keeper-agent/src/delegate.rs` (`compose`, `content_for`), `src-tauri/crates/keeper-agent/src/agent.rs` (`Lift for AllowedTools`)
+reason: Live on delectra (`live_delegate::a_declassification_decided_in_the_proxy_dm_lets_one_flow_through`): Nixi's hand-off parks as a `declassify` card in tgorka's DM, tgorka's decision from his bootstrapped device counts under the pinned key, the approval is consumed, the delegation opens under the approved id and its brief goes in at Tola's join (`BriefSent`, the approved SHA-256) — and Tola's host ignores it, because the brief's `label` is still {tgorka} while Tola's audience is {tgorka, marta}: the receiving host's own check (defence in depth) does not know a person let it through. The turns test passes because its delegation double has no receiving host. Close (a ruling is needed): a declassified brief carries the label the person approved — the session's label widened by the card's `readers`, part of the bytes the digest binds, so the release still matches exactly — and the receiving host takes a brief whose label reaches its audience as before; or the receiving host accepts a brief that names a consumed `declassify` approval it can verify in the sender's room.
+status: closed 2026-10-06
+resolution: Fixed by R193: the declassified brief carries `label::approved_label` (the session's readers ∪ the record's), inside the bytes whose SHA-256 the record binds; the park computes them so and the join send (`send_brief`, the one place the sent brief is composed) composes them again and sends only on a hash match. Proved by `parks::a_declassification_decided_in_the_proxy_dm_lets_one_flow_through` (turns) and live on delectra by `live_delegate::a_declassification_decided_in_the_proxy_dm_lets_one_flow_through` end to end (Tola's host takes the brief, makes the session once and replies; one `consumed` event; other bytes park again); the join's `approved_label` mutated away is killed by both.
+
+### DW-524: A declassified brief whose `delegate` arguments the log redacts is never let through at the join.
+
+origin: epic 93, story 93.3 review fixes (rung `agents-93-decide`, R194 on review R6-03, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/approvals.rs` (`ServedSession::declassified`), `src-tauri/crates/keeper-agent/src/delegate.rs` (`content_for`)
+reason: The brief sent at the target's join is composed from the delegation's `delegate` arguments as the log holds them, and its approval now binds only when the record's call arguments equal that copy byte for byte. A brief holding secret-shaped text is redacted in the log (R174), so its record (the exact bytes) and the log's copy differ: the join refuses it — fail-safe, the delegation ends `refused` and nothing goes in — though the person approved it. Close by composing the join's brief from the record's bound call (as the run after approval does) rather than from the log's copy.
+status: open
+
+### DW-525: A park nobody could be asked about leaves its large arguments' blob behind.
+
+origin: epic 93, story 93.3 review fixes (rung `agents-93-decide`, R194 on review R6-08, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/approvals.rs` (`ServedSession::forget`)
+reason: When no approver can be asked from this host, the park's record, round file and asked file are removed so nothing waits or is announced again; a record whose arguments were over 16 KiB also wrote `approvals/blobs/<sha256>.json`, which is content-addressed and may be another record's too, so it is left. It is inert — nothing reads a blob without a record naming it — but it stays in the synced session. Close with a sweep of blobs no record names.
+status: open
+
+### DW-530: `bmad_party` does not say when the drive's `_bmad/custom/` was not read.
+
+origin: epic 94, story 94.2 (rung `agents-94-config`, R97, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/bmad.rs` (`BmadTools::party`)
+reason: R97 has a tool result say when `_bmad/custom/` is absent or leads out of the drive; `bmad_config` adds an `overlays` sentence, but `bmad_party` prints `resolve_party.py`'s bytes exactly (94.2 acceptance 5), so a roster read without the drive's party overlay looks the same as one read with it. Close by deciding where the sentence goes without breaking the script's output (a second line after the JSON, or a frame line).
+status: closed 2026-10-06
+resolution: Fixed by R195 (06): `bmad_party` prints the script's projection under `party`, byte for byte, and beside it the `overlays` sentence `bmad_config` gives when `_bmad/custom/` is absent or leads out of the drive. Proved by `bmad::tests::bmad_party_says_which_overlays_it_did_not_read` (roster, groups and one group; absent and linked out; nothing behind the link read) and the goldens of `bmad_party_is_resolve_party`.
+
+### DW-531: `skills_list` and `skill_view` have no rule for a skill an agent proposed and no person adopted.
+
+origin: epic 94, story 94.2 acceptance 5 (rung `agents-94-config`, codemap §3 row 17, 2026-10-06)
+location: `src-tauri/crates/keeper-core/src/agents/skills.rs` (`index`)
+reason: The acceptance lists such a skill as refused ("proposed by <agent> on <date>; not offered until a person adopts it") and `skill_view` refusing one still carrying `metadata.keeper_proposal`, but proposals are 95.2's and `skills::index` has no proposal rule; the clause moved to 95.2, which adds it to the index both tools read.
+status: open
+
+
+### DW-534: An ask renders as plain text on devices.
+
+origin: epic 94, story 94.2 (rung `agents-94-ask`, R113, 2026-10-06)
+location: `src-tauri/crates/keeper-core/src/agents/room.rs`, `src/components/chat/`
+reason: R113 keeps the ask and the relayed answer plain `m.text` in 94; a person reading the asking room sees the question and its numbered choices as text, with no card naming who asks whom or which choice was taken. Close with an ask VM decided by the design lane, as the brief has.
+status: open
+
+### DW-535: An ask that reached a proxy's room while its host was down is not read back.
+
+origin: epic 94, story 94.2 (rung `agents-94-ask`, R101, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/runtime.rs` (`intercept_ask`)
+reason: The interception acts on live timeline events only; an ask sent while the proxy's host was not syncing is decrypted on the next sync and intercepted then, but one older than the sync window the host resumes from is never taken, and the asking run stays blocked. Close with a read-back of joined, unserved session rooms for asks with no `peer` line in the proxy's DM, as `recover_briefs` does for briefs.
+status: narrowed 2026-10-06
+resolution: Narrowed by R199 (R94A-05) to DW-546. A proxy's copy reads back every session room it joined and serves no session of (`runtime::recover_asks`, on the host's clock after `recover_briefs`): each room once after a start, and again after a read, a route or a leave that failed or a relay that went in (`runtime::AskRooms`); each ask `rooms::admit_ask` admits there that no answer of its own names (`runtime::asks_waiting`) is routed to its session again, which takes an ask once (`SessionContext.asked_of_me`). Proved by `runtime::tests::a_read_back_finds_the_asks_still_waiting_for_a_relay`, `an_ask_room_is_read_again_until_it_settles` and `agent_turns::a_relay_carries_only_the_persons_own_message` (the same ask again, and after a restart, is no second turn).
+
+### DW-536: A scheduled run's card is not finished by the turn its answer starts.
+
+origin: epic 94, story 94.2 (rung `agents-94-ask`, R99, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/agent.rs` (`ServedSession::answered`, `finish_scheduled`)
+reason: An ask in a scheduled run leaves its card `blocked`; the answer sets the session's card `running` (a delegated session's `brief.md`) and runs a turn, but that turn is not a scheduled window's, so `finish_scheduled` does not write the scheduled card's `review`/`failed`. Close by recording the card an asking run belongs to on its `ask` line and finishing it after the answer's turn.
+status: closed 2026-10-06
+resolution: Fixed by R199 (R94A-06/07): the `ask asked` line names the scheduled card whose run asked (`AskBody.card`, `OpenAsk.card`); while it waits the worker reports the run as holding its card (`ServedSession::holds_windows`, `Activity.parked`) and a later window is ignored (`ASK_WAITS`); the answer's turn — or a refusal's — writes that card `running` and ends it as the run would have (`ServedSession::go_on`, `finish_scheduled`), after a restart too. Proved by `agent_turns::a_scheduled_runs_answer_finishes_its_card`.
+
+### DW-537: A run nobody can be asked about is not yet held one tier stricter.
+
+origin: epic 94, story 94.2 acceptance 7 (rung `agents-94-ask`, R103, 2026-10-06)
+location: `src-tauri/crates/keeper-core/src/agents/tier.rs` (`Context::of_session`), `src-tauri/crates/keeper-core/src/agents/session.rs`
+reason: R103 extends R83's `unattended` to "R102 finds no one to ask" and stamps `checkpoints` into the session's `agent.toml`; this rung answers such a run's asks with their defaults but leaves the tier context and the session key to rung `agents-94-workflows`, which owns `checkpoints`.
+status: closed 2026-10-06
+resolution: Rung `agents-94-workflows` (R103's `checkpoints` half): a workflow run is stamped `checkpoints = "unattended"` at open when `ask::can_ask` finds nobody, its workflow says so or a scheduled card started it; `tier::Context::of_session` reads the stamp as unattended. Proved by `agent_turns::workflows::an_unattended_workflow_takes_defaults_and_is_raised_once` (the stamp, the default, the audit row's `delegated,unattended`); `tier.rs`'s checkpoints clause mutated away is killed by it. Completed by R202 (R94W-13): the "nobody to ask" of any asking session reaches its tier context (`tier::Context::nobody_to_ask`, from `AllowedTools.nobody_to_ask`), one raise and T0/T1 unchanged (R171); proved by `agent_turns::parks::a_session_nobody_can_be_asked_in_is_raised_once`, whose mutant (`.nobody_to_ask(false)`) it kills.
+
+### DW-538: An ask whose deferred send the label refuses leaves its run blocked unannounced.
+
+origin: epic 94, story 94.2 (rung `agents-94-ask`, R168, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/agent.rs` (`ServedSession::send_asks`)
+reason: A question sent on the clock (its proxy joined after the call) is checked against the room as it is then; a refusal writes `ask refused` and sends nothing, but no turn tells the model and the card stays `blocked` until a person or another arrival moves it. Close by running a turn with the refusal as a `peer` note, as a refused brief's join is said.
+status: closed 2026-10-06
+resolution: Fixed by R199 (R94A-11/12/13): every send of an ask — at once after its turn or on the clock — goes through `ServedSession::send_asks`, whose refusal (the room at the send, the invite's label check, a `TooLarge` or `Forbidden` send) becomes an `Arrival::Unasked`: the run's next turn, opened by a `peer` line in the agent's own name saying why the question was never asked, then `ask refused`; its card's run ends. Proved by `agent_turns::a_question_the_room_no_longer_lets_in_is_never_asked_and_the_run_hears_it` and `an_ask_waits_out_a_rate_limit_and_stops_at_a_permanent_refusal`.
+
+### DW-546: An ask further back than a read-back's pages is not found.
+
+origin: epic 94, story 94.2 (rung `agents-94-ask`, review R94A-05, R199, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/runtime.rs` (`asks_waiting`, `walk_back`)
+reason: The read-back of an asking room walks at most `BACKLOG_PAGES` pages back, as the brief read-back does; an ask behind more of the room's events than that, never taken live, is not found, and its run waits until a person moves it. Close with a read-back that stops at the proxy's join event instead of a page bound.
+status: open
+
+### DW-547: A parked round's continuation that asked still makes another model request.
+
+origin: epic 94, story 94.2 (rung `agents-94-ask`, review R94A-08, R199, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/agent.rs` (`run_agent_turn`, `ServedSession::resume_turn`)
+reason: When a round calls `ask_human` and then a call that parks, the round gate's `asked` is the first turn's; the continuation that runs once the call is decided starts its own tools and goes on to the model, so the run speaks once more before the answer comes (the answer itself waits for the round, R199). Close by carrying the round's ask into the continuation's gate, so it ends at that round as the asking turn would have.
+status: open
+
+### DW-548: A proxy's failed leave is retried every tick without backing off.
+
+origin: epic 94, story 94.2 (rung `agents-94-ask`, review R94A-09, R199, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/runtime.rs` (`recover_asks`, `AskRooms::settled`)
+reason: A room whose leave the homeserver refuses is read back and left again on every host tick, each failure logged, until it succeeds; nothing grows the wait. Close with a per-room backoff in `AskRooms`.
+status: open
+
+### DW-552: A render staging folder a refused publication leaves behind is never swept.
+
+origin: epic 94, story 94.2 (rung `agents-94-render`, review R94R-01, R196, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/sessions/write.rs` (`publish_generation`)
+reason: Each publication stages in its own `.staging-<generation>-<ulid>` folder; a plan the executor refuses (a disk error, a staged tree that is not exactly what was written) clears its journal and leaves that folder under `workspace/bmad-render/<skill>/`. It is inert — nothing reads or publishes a staging folder but the plan that named it — yet it stays in the session. Close with a sweep of staging folders no pending journal names, removing real folders only and never following a link.
+status: open
+
+### DW-553: No turns-level test loses the session's claim between a BMAD write's admission and its effect.
+
+origin: epic 94, story 94.2 (rung `agents-94-render`, review R94R-08, R196, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/tests/agent_turns.rs`
+reason: The scripted-provider harness has no seam to lose a `Lease` after the `tool_call` line is written and before the tool runs: a lease lost earlier stops the turn at its first line. The claim refusal of `bmad_render` and `bmad_memlog` is proved at the handler (`bmad::tests::bmad_render_halts_on_the_duplicate_keys`, `bmad_memlog_writes_only_the_memlog`, both through the production `may_write` door); turns-level, both tools' refusal beyond the label is. Close with a lease double or a stub hook that fires between the line and the effect.
+status: open
+
+### DW-554: The journal's removal being synced has no planted-fault test.
+
+origin: epic 94, story 94.2 (rung `agents-94-render`, review R94R-03, R196, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/sessions/exec.rs` (`run_from`)
+reason: `run_from` syncs `.keeper/` after removing the journal, but the only fault a test can plant — an unreadable folder — fails the journal's own earlier writes into that same folder first, so no test separates the removal's sync from them. The steps' directory syncs are proved by planting (`exec::tests::a_folder_the_journal_counts_is_synced_where_it_was_made`). Close with an injectable sync seam or a power-cut harness.
+status: open
+
+### DW-539: A workflow run's takeover is proved on one folder, not on two checkouts synced by git.
+
+origin: epic 94, story 94.3 acceptance 8 (rung `agents-94-workflows`, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/tests/agent_turns.rs` (`workflows::a_classic_workflow_resumes_on_the_other_host_from_its_own_files`, `workflows::a_rendered_workflow_is_rendered_again_after_takeover`), `src-tauri/crates/keeper-agent/tests/headless_engine.rs`
+reason: The acceptance names "two checkouts of one local bare remote through keeper-sync's engine". `open_engine` arms a process-global folder tier, one engine per test binary (codemap §3 row 34), so the turns tests run both hosts over one folder: electra at epoch 1, hesperia at epoch 2 with its own `HostSlug` and lease, the answer delivered after the takeover, the files and lines compared. What a real sync adds — the epics file and the log chunks arriving by pull, `workspace/` absent on the other checkout — is not exercised by them. Close with a two-binary (or git-level clone) harness that runs electra's half, pushes, pulls into a second checkout and runs hesperia's half there.
+status: narrowed 2026-10-06
+resolution: Closed for format C by R202 (R94W-15) and narrowed to DW-541 for format B. `agent_turns::workflows::a_classic_workflow_is_taken_over_on_another_checkout` runs electra and hesperia on two checkouts of one bare remote, each synced by agentd's own engine (`headless::open_engine` + `sync_once`) in a process of its own (`workflows::sync_one_checkout`, the test binary re-run with `--ignored --exact`), because the engine's folder tier is one per process: the run's folder reaches hesperia before any turn; electra's begun turn, not yet pushed, is not begun again there (R94W-05: `run: waiting`, no model asked); after electra's push hesperia takes the session over at epoch 2, answers `C` and writes `[1, 2, 3]`, and after its push electra's checkout reads `[1, 2, 3]`, electra's lines unchanged and hesperia's after them at epoch 2. The anchor mutant (`SessionContext::started` ignoring workflow steps) is killed by it.
+
+### DW-540: A due workflow card across two host runtimes is proved by the run's derived id, not by two real workers.
+
+origin: epic 94, story 94.3 acceptance 5 (rung `agents-94-workflows`, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/hosts.rs` (`mod tests`: `FakeCopy`, `a_due_card_runs_once_across_two_hosts`), `src-tauri/crates/keeper-agent/tests/agent_turns.rs` (`workflows::workflow_card_runs_once_per_window_in_a_fresh_session`)
+reason: 92.3's claim keeps one window to one host (`hosts::tests::a_due_card_runs_once_across_two_hosts`), and the turns test proves that a second host which begins the same window anyway (its copy of the card from before `last_run`) opens nothing, because the run's id is `run_id(session, card, window)`. The hosts harness's worker is a fake that records what was routed and runs no `ServedSession`, so no test runs a workflow card through two `HostRuntime`s end to end. Close by giving `FakeCopy` a worker that serves the routed arrival through a real `ServedSession` over one `Delegations` double.
+status: narrowed 2026-10-06
+resolution (R202, R94W-15): `hosts::tests::a_due_workflow_card_opens_one_run_across_two_hosts` races two `HostRuntime`s (hesperia, electra), each over a checkout of its own holding the same card naming the workflow `sort`, against one claim `Server`: the real placement, claim and `cards::begin`, and on the window's holder the real `workflow::for_card` → `workflow::open` → `verbs::create_claimed_session` under that holder's lease (`FakeCopy::open_run`, on a runtime of its own as a worker thread blocks on the room). One room is made and one run folder exists across both checkouts, its id `run_id(session, card, window)`; the other host opens nothing over six ticks. No single mutant breaks that outcome, and three were tried and survive: the claim's liveness (`claim::may_acquire` always true; also with `acquire_carrying` dropping the carried window), and a host that is not placed acquiring (`claims::step`). Placement (the lowest live slug, read alike by both hosts), the claim and the carried window each keep the window to one host on their own, so the test guards the outcome rather than any one of those layers; each layer is proved by its own tests (`claims::tests`, `hosts::tests::a_due_card_runs_once_across_two_hosts`). What stays open: the opening is called by `FakeCopy` in place of `ServedSession::run_workflow_card`, so that wrapper's arming (`arm_session` → `workflow_offer`), its `Sinks` and its `OwnLog` writer are not in the race: building a `ServedSession` needs an `AgentDeps` (a provider row, a bot, an `AgentHome` read from a zone, the drive declarations), which only `tests/agent_turns.rs`'s `World` makes, while `HostRuntime` and its doubles live in `hosts.rs`'s private `mod tests`. Close by moving `World`'s `AgentDeps` builder where `hosts::tests` can reach it and serving the routed window through `ServedSession::serve`. That wrapper itself is proved on one host by `agent_turns::workflows::workflow_card_runs_once_per_window_in_a_fresh_session`.
+
+### DW-541: A format-B run's takeover on a second checkout is not proved through git.
+
+origin: epic 94, story 94.3 acceptance 8 (rung `agents-94-workflows`, review R94W-15, R202, 2026-10-06), narrowed from DW-539
+location: `src-tauri/crates/keeper-agent/tests/agent_turns.rs` (`workflows::a_classic_workflow_is_taken_over_on_another_checkout`, `workflows::a_rendered_workflow_is_rendered_again_after_takeover`)
+reason: The two-checkout harness runs the format-C fixture. A format-B run's generation lives in the session's `workspace/`, which keeper-sync keeps out of version control only through the drive's own ignore rules (`keeper_sync::profile`'s sessions flag says so); the harness's bare drive carries none, so its `workspace/` would travel and the re-render would never be needed. The format-B takeover (both generations re-rendered, a changed `_bmad/config.toml` failing the run) is proved over one folder with `workspace/` removed. Close by seeding the bare drive with the sessions zone's real ignore file and running `bmad-build` through the same two checkouts.
+status: open
+
+### DW-542: Handing on another session's card reads every session's `agent.toml` and the logs of the agent's workflow runs.
+
+origin: epic 94, story 94.3 (rung `agents-94-workflows`, review R94W-14, R202, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/delegate.rs` (`handed_on`)
+reason: The host's binding of a card to one delegation (`workflow::handoff_id`) is found on the disk: the source session's log for its own `delegate` naming the card, then every session's `agent.toml` for the agent's workflow runs and each such run's log for a `delegate opened` under that id — O(sessions) per `delegate` call with a `<session>:<card>` source, as `verbs::find` already is, plus O(runs × lines). Correct, and bounded by the zone, but it grows with the agent's history. Close with a column in the zone's derived index (`.keeper/agents.db`) mapping a delegation id to the session that opened it, refreshed as the index already is.
+status: open
+
+
+### DW-555: A helper is not offered `drive_search`.
+
+origin: epic 94, story 94.4 (rung `agents-94-helpers`, 2026-10-06)
+location: `src-tauri/crates/keeper-core/src/agents/helper.rs` (`TOOLS`)
+reason: The epic lists `drive_search` among a helper's reads "once 95.4 lands"; it is not in this build's vocabulary, so `helper::TOOLS` holds the five drive reads and `skill_view`. Close by adding it to `TOOLS` in the rung that builds `drive_search`.
+status: open
+
+### DW-556: `bmad-build`'s review step is proved over an offered skill, not a workflow session.
+
+origin: epic 94, story 94.4 (rung `agents-94-helpers`, acceptance 8, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/tests/agent_turns.rs` (`helpers::bmad_build_review_layers_run_as_helpers`)
+reason: The test renders `bmad-build` as an offered skill and names it as each helper's `skill`. The lens lookup without `skill` reads the session's workflow folder the same way (`BmadTools::customization_of`), but no turns test runs it in a workflow session. Rung `agents-94-workflows` (94.3), which opens `workflow` sessions, is below this rung since its restack onto 8671d08e (2026-10-06); the restack proved a helper inside a run against the run's budget and reply (`workflows::a_helper_in_a_run_stops_at_its_budget_and_its_reply`), not a lens read from the run's workflow folder. Close with the same test in a session opened by `workflow_start`.
+status: open
+
+### DW-557: A helper's frame states the session label as it was when the turn was armed.
+
+origin: epic 94, story 94.4 (rung `agents-94-helpers`, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/agent.rs` (`run_agent_turn`, `helper_frame`)
+reason: The helper's system message is composed once per turn, so a read earlier in the turn that narrowed the label is not restated in a later helper's "who may read" sentence. The model check of every helper round uses the live label joined with the helper's reads, so nothing leaves where it may not; only the sentence the helper reads is stale. Close by composing the helper frame at each launch from the turn's current label.
+status: open
+
+### DW-558: The turn's own round whose stream failed is not counted.
+
+origin: epic 94, story 94.4 (rung `agents-94-helpers`, R111, 2026-10-06; narrowed by its review fixes, R203)
+location: `src-tauri/crates/keeper-agent/src/agent.rs` (`ServedSession::run_turn`, the `failed` partial line)
+reason: A helper's failed or stopped round now has its step line with the usage its stream reported, and that usage counts (R203). The turn's own round whose stream broke still writes its partial `assistant` line with empty usage, so usage a provider reported before the failure is not added to the session's spend or a delegated session's budget. Close by carrying the failed round's reported usage on that line.
+status: open
+
+### DW-559: A helper's reads are audited as the session's, with nothing naming the helper call.
+
+origin: epic 94, story 94.4 (rung `agents-94-helpers`, 2026-10-06; narrowed by its review fixes, R203)
+location: `src-tauri/crates/keeper-agent/src/helper.rs` (`Reads`), `keeper_core::bots::audit`
+reason: A helper's refused step's row now carries the helper's call id as its message (R203). A read it made still gets the session's own classified row with no message, so the audit alone does not say which `helper` call read; the log does (a step's `parent` is the helper's `tool_call`). Close by passing the helper's call id into the drive host's row for its reads.
+status: open
+
+### DW-560: An agent can propose a skill's SKILL.md only, never a support file.
+
+origin: epic 95, story 95.1 (rung `agents-95-memory`, R132, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/memory/mod.rs` (`skill_propose`), `src-tauri/crates/keeper-ported/src/hermes/review.rs`
+reason: Hermes' review writes `references/`, `templates/` and `scripts/` files under a skill; keeper's proposal grammar stages one SKILL.md, so the adapted prompts drop that option (UPSTREAM.md lists the change). Close with a proposal body that names a file inside the skill, pinned like a patch, and the consolidator applying it.
+status: open
+
+### DW-561: A journal entry whose text holds a line starting `## ` can be cut short by the torn-tail rule.
+
+origin: epic 95, story 95.1 (rung `agents-95-memory`, R125, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/memory/journal.rs` (`whole`)
+reason: A torn tail is cut back to the last `\n## ` in the file; when the torn entry's own text holds a markdown heading, the cut lands inside that entry and keeps its first part, and a tear that ends exactly on a newline inside an entry is not seen as torn. Each entry is one write, so only a host dying mid-write leaves this. Close with an end marker per entry, or a length the header carries.
+status: done 2026-10-06 — rung `agents-95-memory`, review R95M-09 (R204): each header carries its entry's byte length and `journal::whole` walks the file from its frontmatter, keeping exactly the whole entries (`journal_survives_a_tear_at_every_byte`)
+
+### DW-562: A turn-level test of a review pass that a lost claim stops is missing.
+
+origin: epic 95, story 95.1 (rung `agents-95-memory`, R126, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/tests/agent_turns.rs`
+reason: The memory tools ask the claim right before each effect — a proposal's link, the journal's cut and its append (R95M-07, R204; unit-proved by `memory::tests::a_proposal_is_published_whole_under_the_claim` and `journal::tests::a_lost_claim_cuts_and_writes_nothing`) — but the turns harness cannot lose a `Lease` between a review pass's `tool_call` line and its effect (the same seam DW-553 names). Close with that seam.
+status: open
+
+### DW-565: The night's read is a full `sync_once`, not `Engine::pull_now`.
+
+origin: epic 95, story 95.2 (rung `agents-95-consolidate`, R-NEW-1, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/consolidate.rs` (`run_round`)
+reason: `pull_now` only queues a pull for a commit a doorbell named; the night needs the fetched head before it plans, so it runs the engine's own pass (commit, pull, push) and plans over `HEAD`.
+status: recorded — R205 rules `sync_once` the night's read; the declarations are read again at the fetched `HEAD` (R95C-14)
+
+### DW-566: A review room made before a failed night's commit is orphaned.
+
+origin: epic 95, story 95.2 (rung `agents-95-consolidate`, R128, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/consolidate.rs` (`run_home`), `hosts.rs` (`review_room`)
+reason: the room is made before the commit that writes the session folder naming it; a guarded or failed commit leaves the room with no folder. Close with R165's record-then-folder discipline.
+status: open
+
+### DW-567: No turns-level test drives a consolidator record through a served review session's worker.
+
+origin: epic 95, story 95.2 (rung `agents-95-consolidate`, R128, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/tests/agent_turns.rs` (`parks`)
+reason: `adopt_host_action`, the narrowed approvers and the skipped checkpoint are built but proven only by compilation; acceptance 10/13's decision is written by the test as the worker would write it. Close with a `parks` test: a record from `consolidate::review_record` in the session's `approvals/`, `resume_approvals` sends one request naming the record's readers, a decision is written and consumed, and no completion is asked.
+status: closed (review fixes R95C-01…22) — `agent_turns::parks::a_consolidator_record_is_consumed_once_through_the_worker`
+
+### DW-568: The live test `one_consolidator_per_drive_on_synapse` is not written.
+
+origin: epic 95, story 95.2 (rung `agents-95-consolidate`, 2026-10-06)
+location: `src-tauri/crates/keeper-agentd/tests/`
+reason: the rung ran out of budget; `consolidation_lease_arithmetic` proves the arithmetic over the fake server only.
+status: closed (review fixes R95C-01…22) — `keeper-agentd/tests/live_consolidate.rs::one_consolidator_per_drive_on_synapse`, run against delectra's Synapse 2026-10-06: one Run (hesperia-sim), the other HeldBy, renewed past the stop deadline, both Done after the release (205 s); a whole agentd night is DW-709
+
+### DW-569: The new behaviour tests of rung `agents-95-consolidate` are not mutation-proved.
+
+origin: epic 95, story 95.2 (rung `agents-95-consolidate`, 2026-10-06)
+location: keeper-sync `engine/tests/commit_paths.rs`, keeper-agent `tests/consolidation.rs`, `hosts.rs` tests, keeper-core `consolidate/tests.rs`, keeper-ported `openclaw/gates.rs`
+reason: out of budget; owed before review.
+status: closed (R207) — the rung-wide pass ran: 88 mutants over the rung's behaviour tests of rounds 1–3, every one killed by assertion (`/tmp/agents-salvage/mut-95cons-3.log`, the last three after their tests were added in `mut-95cons-4.log`)
+
+### DW-575: A proposal's part file a crash leaves behind is never swept.
+
+origin: epic 95, story 95.1 (rung `agents-95-memory`, review R95M-15, R204, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/memory/mod.rs` (`write_new`)
+reason: A proposal is written to `proposals/.<id>.md.<ulid>.part`, synced, then linked to its name; every return path removes the part file, but a host that dies between its creation and that removal leaves a dotted file no reader takes for a proposal and nothing deletes. Close with the consolidator (95.2) removing part files older than a run.
+status: open (narrowed 2026-10-07, restack of `agents-95-consolidate` onto 1caff43e) — the night reads only `<ulid>.md`: a part file, committed or not, is never a proposal, never settled and never moved (`consolidation::a_proposals_part_file_is_never_a_proposal`); nothing sweeps it yet
+
+### DW-576: A skill not offered to the session cannot be patched or archived by it.
+
+origin: epic 95, story 95.1 (rung `agents-95-memory`, review R95M-06, R204, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/memory/mod.rs` (`skill`), `src-tauri/crates/keeper-agent/src/skills.rs` (`view`)
+reason: A patch or archive is pinned to the SKILL.md the turn read whole through `skill_view`, and `skill_view` reads only offered skills; a skill outside `[tools].skills`, one waiting for a person, or one longer than `MAX_READ_BYTES` is therefore refused ("Read … whole with skill_view in this turn first"). Fail-closed, as R204 asks. Close with a read of the skill's SKILL.md that records the digest without offering the skill.
+status: open
+
+### DW-577: A proposal whose folder cannot be synced is taken back after a reader may have seen it.
+
+origin: epic 95, story 95.1 (rung `agents-95-memory`, review R95M-15, R204, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/memory/mod.rs` (`write_new`)
+reason: After the link the folder is synced; when that fails the proposal is removed and the call refused, but a consolidator that listed the folder in between can have read the whole proposal, which then applies without the session's `memory` line. No planted-fault test covers the folder sync failing. Close with the consolidator re-checking a proposal's presence under its lease before it applies it, and a fault seam for the sync.
+status: open (narrowed 2026-10-07, restack of `agents-95-consolidate` onto 1caff43e) — the consolidator half holds: a night lists proposals on the disk and its commit is guarded on every settled proposal as the disk holds it right before the publication, under the lease, so a proposal taken back is never applied (`consolidation::a_proposal_taken_back_is_never_applied`); the fault seam for the folder sync remains
+
+### DW-578: A journal append whose folder sync fails is refused although its entry is in the file.
+
+origin: epic 95, story 95.1 (rung `agents-95-memory`, review R95M-10, R204, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/memory/journal.rs` (`append_with`)
+reason: A first append syncs the day file's folder after the entry is written and synced; a failure there is reported as "could not be written" while the entry stays, so a model that retries writes it twice. Close with a refusal that says the entry was written but may not survive a power loss, or a sync before the entry is written.
+status: open
+### DW-585: An archived skill's guard covers its `SKILL.md` only.
+
+origin: epic 95, story 95.3 (rung `agents-95-curate`, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/consolidate.rs` (`change_into`, reused by `curate::plan_sweep`)
+reason: a folder move is guarded on `SKILL.md`'s blob alone; a person's edit to a support file (`scripts/`, `references/`) between the sweep's read and its commit is moved with the folder — kept byte for byte under `.archive/`, not lost, but archived although the skill was just changed. Close by guarding every file of the folder at `HEAD`.
+status: closed (R208, R95U-07) — `consolidate::change_into` guards every file of a moved folder at the planned commit and its destination absent, and `Engine::commit_paths` moves nothing when `HEAD` holds a file under the folder the request did not guard; proof `curation::archiving_guards_the_whole_tree`, `commit_paths::a_move_takes_only_the_files_it_read`
+
+### DW-586: A skill whose `_skills/.archive/<name>/` exists already is left in place with a log line only.
+
+origin: epic 95, story 95.3 (rung `agents-95-curate`, 2026-10-06)
+location: `src-tauri/crates/keeper-core/src/agents/curate.rs` (`sweep`, `notes`)
+reason: the move cannot land on an existing folder, so the sweep skips it every week and says so only in the host's log; no person is told. Close with a dated archive name or a card.
+status: open
+
+### DW-587: The sweep reads `_workflows/` from the working tree, not from `HEAD`.
+
+origin: epic 95, story 95.3 (rung `agents-95-curate`, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/curate.rs` (`texts_under`)
+reason: skills, `agent.toml`s and proposals are read as committed; workflow files were read on the disk after the pull. The earlier text said an uncommitted edit could only protect a skill — wrong: an uncommitted removal of a reference hid a committed one and exposed the skill (R95U-05).
+status: closed (R208, R95U-05/06) — every protection source is read from git's objects at the one pulled commit (`git::history::files_at`, `curate::protection`), guarded through the publication, and an uncommitted change to a workflow or an `agent.toml` makes the read incomplete, so nothing is archived; proof `curation::a_reference_the_sweep_cannot_see_protects`
+
+### DW-700: A cut-off `commit_paths` puts back only the paths it can still reach.
+
+origin: epic 95, story 95.2 (rung `agents-95-consolidate`, R206 / R95C-10, 2026-10-06)
+location: `src-tauri/crates/keeper-sync/src/engine.rs` (`Engine::put_back`, `recover_commit_paths`)
+reason: a path whose folder was swapped for a link, or moved away, after the request wrote it is logged and left rather than followed; the record is removed so the folder's commits go on, and such a leftover is a person's change to the watcher. A folder swapped under a running request is adversarial; closing it needs the effects staged under `.git` and published by one rename.
+status: closed (R207) — `commit_paths` never puts anything back: it publishes once and rolls forward; a path behind a swapped folder refuses there, keeps the record and holds the folder's commits with its card saying so (`commit_paths::{a_root_or_folder_swapped_for_a_link_redirects_nothing, an_unfinished_commit_holds_the_folder_until_it_is_finished}`)
+
+### DW-701: On Windows the contained effect re-checks the landing instead of holding the folders open.
+
+origin: epic 95, story 95.2 (rung `agents-95-consolidate`, R206 / R95C-12, 2026-10-06)
+location: `src-tauri/crates/keeper-sync/src/browse.rs` (`Contained`)
+reason: the no-follow walk uses `openat`/`renameat` (rustix, unix only); elsewhere `Contained` re-runs `landing` before each effect, which narrows the window but does not close it. The consolidator itself runs on unix hosts only.
+status: closed (R207, R95CR-08) — `browse::{Root, Contained}` are Unix only and a non-Unix build refuses an authored commit (`Engine::commit_paths` → `SyncError::Config`); DW-725 records the platform consequence
+
+### DW-702: No test drives an LFS-routed path through `commit_paths`.
+
+origin: epic 95, story 95.2 (rung `agents-95-consolidate`, R206 / R95C-11, 2026-10-06)
+location: `src-tauri/crates/keeper-sync/src/git/commit.rs` (`commit_authored`)
+reason: an LFS pointer that does not name the requested bytes refuses the commit (`SyncError::Integrity` → `CommitPaths::Guarded`), but memory files and skills stay far under the LFS threshold and no fixture routes one; the branch is proven by inspection only.
+status: closed (R207, R95CR-09) — `commit_paths::routed_writes_carry_their_rule_and_nothing_else` routes a write through LFS: pointer committed, rule added to `HEAD`'s attributes, bytes and rule on the disk; an unsaved attributes edit holds it
+
+### DW-703: The consolidator reads every review session's log on every tick of a done night.
+
+origin: epic 95, story 95.2 (rung `agents-95-consolidate`, R206 / R95C-01, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/consolidate.rs` (`owed`, `any_decided`)
+reason: whether a consumed or denied review waits is read from the sessions' logs each tick; cheap for a handful of review sessions, linear in their lines. Close by waking on the session worker's `consumed` instead.
+status: open
+
+### DW-704: A drive whose agents are served by different hosts gets no night.
+
+origin: epic 95, story 95.2 (rung `agents-95-consolidate`, R206 / R95C-07, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/hosts.rs` (`HostRuntime::night`)
+reason: the fix takes the review's second option — a host consolidates a drive only when it serves every agent homed there — so a drive split across hosts is consolidated by none (logged at debug). Per-home completion windows would let each host run its own agents.
+status: open
+
+### DW-705: A failed night taken over from a lapsed holder goes back naming no window.
+
+origin: epic 95, story 95.2 (rung `agents-95-consolidate`, R206 / R95C-05, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/consolidate.rs` (`run_round`, `Taken::Run::prior`)
+reason: a run that does not finish releases the claim naming the night the claim said done before; when the claim it took was a lapsed holder's (not released), that night is unknown and the release names none. The night is still owed and runs once; only the record of the last done night is lost.
+status: closed (R207) — obsolete: the night's lease no longer names its window; each job records its completed window under its own key (`maintain::maintain`), and a run that does not finish records nothing
+
+### DW-706: A cut-off `commit_paths` is settled by the folder's next commit, not at engine start.
+
+origin: epic 95, story 95.2 (rung `agents-95-consolidate`, R206 / R95C-10, 2026-10-06)
+location: `src-tauri/crates/keeper-sync/src/engine.rs` (`Engine::commit`, `commit_paths_held`)
+reason: every commit of the folder — a watcher pass's, a pull's pre-fetch commit, the next request's — settles the record first and commits nothing of a walk taken over the fragments; a status read before that commit lists the fragments as local changes.
+status: closed (R207) — `Engine::settle_commit_paths` runs at `Engine::open` for every mounted folder and at the start of every pass (`tick_profile`, `sync_once`) and commit
+
+### DW-707: An over-cap review offers the leading part that fits, not a person's choice.
+
+origin: epic 95, story 95.2 (rung `agents-95-consolidate`, R206 / R95C-20, 2026-10-06)
+location: `src-tauri/crates/keeper-core/src/agents/consolidate.rs` (`batch`)
+reason: the candidates that fit are taken in proposal order and the rest listed, still pending; choosing which entries to drop instead would need one record per alternative.
+status: open
+
+### DW-708: Applying a consumed host action is recorded in the drive, not in the review session's log.
+
+origin: epic 95, story 95.2 (rung `agents-95-consolidate`, R206 / R95C-01, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/consolidate.rs` (`decided`)
+reason: the worker logs `consumed`; the lease holder's application is the commit that moves the proposals to `proposals/done/`, which every host reconciles by pulling. The session's log never says the change landed; the card does not either.
+status: open
+
+### DW-709: The live test proves the lease on Synapse, not a whole agentd night.
+
+origin: epic 95, story 95.2 (rung `agents-95-consolidate`, DW-568, 2026-10-06)
+location: `src-tauri/crates/keeper-agentd/tests/live_consolidate.rs`
+reason: `one_consolidator_per_drive_on_synapse` races two copies through `take_night`, `holding` and `release` on the real homeserver; two `keeper-agentd run` processes consolidating one drive at 03:00 with a real review room are not driven.
+status: open — the live test now races the drive's one maintenance claim between a consolidation and a curator job (R207); a whole agentd night is still not driven
+
+### DW-710: Reading a vault's notes index leaves SQLite's `-wal` and `-shm` beside it.
+
+origin: epic 95, story 95.4 (rung `agents-95-search`, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/search.rs` (`search_drive`), `src-tauri/crates/keeper-core/src/notes/search_index.rs` (`open_read_only`)
+reason: `drive_search` opens `<vault>/.keeper/search.db` read-only, never where none exists, but a reader of a WAL database creates its `-wal` and `-shm` when the writer has closed; they land in keeper's own `.keeper/`, which git ignores, so the drive's `git status` stays empty (`drive_search_writes_nothing` measures everything else). Opening `immutable=1` would avoid them but is wrong while the Mac's indexer writes. Decide whether a read-only reader may leave them, or read a snapshot copy.
+status: closed — R211 (2026-10-06): the two SQLite reader files are the one permitted exception to "writes nothing"; `drive_search_writes_nothing` now compares the whole drive, `.keeper/` included, and allows exactly those two names
+
+### DW-711: `drive_search` reads only bundle-root listings.
+
+origin: epic 95, story 95.4 (rung `agents-95-search`, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/search.rs` (`listing_hits`)
+reason: Each bundle's root `index.md` is read for its `## Documents` lines; the listings `okf index` writes in every subfolder are not, so a document whose listed title or description holds the query but whose path, title and text do not is found only when it sits at a bundle's root. The scan still opens every such document within its caps.
+status: open
+
+### DW-712: Outside the vault, hits come in bundle and walk order, not by relevance.
+
+origin: epic 95, story 95.4 (rung `agents-95-search`, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/search.rs` (`search_drive`), `src-tauri/crates/keeper-core/src/agents/search.rs` (`merge`)
+reason: The vault's index ranks the vault; listing and scan hits keep the order the walk met them (bundles in config order, names sorted, depth first), and `k` cuts there. A file holding the words twenty times ranks with one holding them once. A lexical score over the scanned text (term counts, title hits) would rank without an index.
+status: open
+
+### DW-713: The drive's own OKF config is not a committed fixture.
+
+origin: epic 95, story 95.4 (rung `agents-95-search`, R137 option b, OA-95-2, 2026-10-06)
+location: `src-tauri/crates/keeper-ported/src/okf/mod.rs` (`okf_matching_matches_the_drives_own_tools`), `src-tauri/crates/keeper-ported/tests/fixtures/okf/`
+reason: Until the owner states the licence of `tgdrive:.okf/bin/` and whether `.okf/config.yaml` may live in this repository, acceptance 1's config test is `#[ignore]` and reads `$KEEPER_TGDRIVE`; CI proves the port on a config written for the fixture, with the drive's own answers. When OA-95-2 is answered: (a) commit the config and its `load_config` JSON, un-ignore the test, and port the scripts if their licence allows reading them.
+status: open
+
+### DW-714: The scan's time cap makes the files it reaches depend on the host's speed.
+
+origin: epic 95, story 95.4 (rung `agents-95-search`, 2026-10-06)
+location: `src-tauri/crates/keeper-sync/src/bots_fs.rs` (`ScanBudget`), `src-tauri/crates/keeper-agent/src/search.rs`
+reason: The scan stops at 2 000 files, 16 MiB or 1.5 s, whichever comes first, and says how many of how many files it searched; on a slow or loaded host the 1.5 s bound comes first, so the same query over the same drive can return fewer hits there. Accepted as a consequence (R-NEW-4, R211's entry); the tests no longer depend on it: `drive_search_is_bounded_and_says_so` and keeper-sync's `a_search_walk_stops_at_its_deadline_and_its_entry_bound` run on an injected clock (`ScanBudget::clock`, `SearchTools::with_clock`), and a walk the time stops says it did not count every file.
+status: open
+
+### DW-715: The macOS-only halves of `drive_search`'s reader are proved by inspection.
+
+origin: epic 95, story 95.4 (rung `agents-95-search`, review R95S-04/R95S-06, R209, 2026-10-06)
+location: `src-tauri/crates/keeper-sync/src/bots_fs.rs` (`nofollow::dataless`), `src-tauri/crates/keeper-agent/src/search.rs` (`kept_out`)
+reason: A dataless (`SF_DATALESS`) listed, ranked or scanned file is refused before it is opened, and `.Keeper`/`Workspace` spelled against a lowercase folder on a case-insensitive volume are kept out; Linux has neither state, so the tests prove the type check (a FIFO), the size check and mixed-case folders that exist as spelled. Close with a run on hesperia over an APFS volume holding an evicted iCloud file and a `.KEEPER/` listing link.
+status: open
+
+### DW-716: The handle-identity check of a search read has no deterministic test.
+
+origin: epic 95, story 95.4 (rung `agents-95-search`, review R95S-03, R209, 2026-10-06)
+location: `src-tauri/crates/keeper-sync/src/bots_fs.rs` (`nofollow::read_in`)
+reason: A file is stat'ed by name with `AT_SYMLINK_NOFOLLOW`, opened `O_NOFOLLOW`, and read only when the handle's `(st_dev, st_ino)` is the one stat'ed. A link put in a file's or a folder's place is proved (`a_link_put_in_an_offered_entrys_place_is_never_followed`); a regular file swapped for another regular file between the stat and the open needs a hook inside that window, which the reader has none of, so the mutant that drops the identity comparison survives. Close with a test seam there, or accept.
+status: open
+
+### DW-717: The vault's index is opened by path, after its landing is checked.
+
+origin: epic 95, story 95.4 (rung `agents-95-search`, review R95S-02, R209, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/search.rs` (`open_index`), `src-tauri/crates/keeper-core/src/notes/search_index.rs` (`open_read_only`)
+reason: `<vault>/.keeper/search.db` is opened only when its landing is exactly that name (no link from the vault's landing) and it is a regular file, but SQLite opens it by its canonical path afterwards, so a link put there in between would be followed. `SQLITE_OPEN_NOFOLLOW` on `open_read_only` would refuse a final link and also changes the Mac's notes search; decide with the shell's owner.
+status: open
+
+### DW-718: `drive_search` reads nothing off Unix.
+
+origin: epic 95, story 95.4 (rung `agents-95-search`, R209, 2026-10-06)
+location: `src-tauri/crates/keeper-sync/src/bots_fs.rs` (`read_landed`, `search_walk`)
+reason: The no-follow reader is `openat(O_NOFOLLOW)` through `rustix`, a Unix-only dependency of keeper-sync; on any other target every search read is skipped and a walk refused, said as files not searched. No shipped target is affected (macOS, iOS, Linux, Android).
+status: open
+
+### DW-720: A keeper-sync unit test printed `error: Unrecognized option: 'repo'`.
+
+origin: epic 95, story 95.2 (rung `agents-95-consolidate`, 2026-10-06)
+location: `src-tauri/crates/keeper-sync/src/engine.rs` (`tests::pending_lists_what_is_still_coming_in_not_only_what_is_going_out`)
+reason: `Engine::open` registers the running executable as the folder's LFS clean filter; under `cargo test` that is the test binary, which git ran on the routed clip and which answered with its own argument error. No assertion depended on it.
+status: closed (R207) — the test registers no filter for its folder (`filter_program = None`, as on a phone); its subject is the queue, not the filter
+
+### DW-721: A holder that commits an approval and dies before pushing is followed by an identical guarded commit.
+
+origin: epic 95, story 95.2 (rung `agents-95-consolidate`, R207 / R95CR-10, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/consolidate.rs` (`decided`, `carried`)
+reason: host A applies a consumed approval locally (`Approval-Record: <id>`) and dies before its push; B takes the claim, pulls, does not find the trailer in its history, and applies the same change — the same bytes over the same guarded blobs, the same moves. When A comes back, its unpushed commit and B's carry the identical tree change; the convergence leg sees the same paths at the same blobs on both sides. Nothing is applied twice in content; the history holds two commits naming the record. Preventing it needs the application recorded on the server (the room) before the commit, which is a second authorization mechanism R207 rules out.
+status: open
+
+### DW-722: A path LFS already tracks can never be guarded.
+
+origin: epic 95, story 95.2 (rung `agents-95-consolidate`, R207, 2026-10-06)
+location: `src-tauri/crates/keeper-sync/src/engine/authored.rs` (`commit_paths_held`)
+reason: a guard compares the disk's bytes with `HEAD`'s blob; for an LFS-tracked path `HEAD` holds the pointer and the disk the content, so a write over it, or a move of a folder holding one, is always `Guarded`. Memory files, proposals and skills stay far under the threshold.
+status: open
+
+### DW-723: An unsaved edit of `.gitattributes` holds a night that routes a file through LFS.
+
+origin: epic 95, story 95.2 (rung `agents-95-consolidate`, R207 / R95CR-09, 2026-10-06)
+location: `src-tauri/crates/keeper-sync/src/engine/authored.rs`, `lfs/stage.rs` (`prepare_authored`)
+reason: the rule is added to `HEAD`'s attributes and the file is guarded like every other path, so a person's uncommitted edit makes the request `Guarded` until the watcher commits it. A routing that needs no new rule leaves the attributes alone, and a managed block's repair waits for the watcher's next commit.
+status: open
+
+### DW-724: Whether a decision was carried out is read by walking the history each tick.
+
+origin: epic 95, story 95.2 (rung `agents-95-consolidate`, R207 / R95CR-10, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/consolidate.rs` (`carried`), `keeper-sync/src/git/history.rs` (`commit_with_line`)
+reason: every consumed or denied record walks `HEAD`'s history down to the record's creation (a day of skew allowed) looking for its `Approval-Record`; cheap for days-old records, linear in the commits since. A history that cannot be read counts as carried out, so nothing is applied on an unknown.
+status: closed (R217, R95C3-05/06) — the timestamp bound is gone; one walk of the whole reachable history per `waiting` call, and an unreadable history is `Application::Unknown`, which holds; the remaining cost is DW-820
+
+### DW-725: Authored commits are made on Unix hosts only.
+
+origin: epic 95, story 95.2 (rung `agents-95-consolidate`, R207 / R95CR-08, 2026-10-06)
+location: `src-tauri/crates/keeper-sync/src/engine.rs` (the non-Unix `Engine::commit_paths`)
+reason: the root held open and the no-follow, no-replace effects use `openat`/`linkat`/`renameat` (rustix); Windows refuses rather than keep a weaker promise. The consolidator itself runs on Unix hosts only.
+status: open
+
+### DW-726: The claim's renewal is a sibling of the work, not a task of its own.
+
+origin: epic 95, story 95.2 (rung `agents-95-consolidate`, R207 / R95CR-06, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/maintain.rs` (`holding`)
+reason: renewal and work are polled in one `select!`; it keeps running because every blocking part of a night runs off the executor (`commit_paths` and the plan through `spawn_blocking`). A future caller that blocks inside the work would stall it; a spawned renewal needs `'static` ports.
+status: closed (R217, R95C3-02) — `maintain::holding` spawns the renewal with owned ports (`CopyPort::keyed_claims` returns `Arc<dyn ClaimPort>`) and stops it between renewals
+
+### DW-727: A person's save kept beside its path is said in the log only.
+
+origin: epic 95, story 95.2 (rung `agents-95-consolidate`, R207 / R95CR-07, 2026-10-06)
+location: `src-tauri/crates/keeper-sync/src/engine/authored.rs` (`materialize`)
+reason: when a file moved aside turns out to be a person's save and its path was taken again meanwhile, it stays beside it as `.keeper-displaced-<request>-<n>` and a warning is logged; the folder's card does not name it.
+status: open
+
+### DW-728: The window is recorded after the claim's release.
+
+origin: epic 95, story 95.2 (rung `agents-95-consolidate`, R207 / R95C-05, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/maintain.rs` (`maintain`)
+reason: completion is written only once the release was accepted, so a crash between the two leaves the window unrecorded and the job runs again — idempotent for the night (nothing pending is applied twice), at the cost of one more run.
+status: open (R217, R95C3-08: the completion is now written monotonically under the claim taken again after the accepted release; the crash window and its extra run remain, see DW-821)
+
+### DW-729: The runtime's simultaneous start of the two schedulers is proven through the helper, not `runtime::run`.
+
+origin: epic 95, story 95.2 (rung `agents-95-consolidate`, R207 / R95U-03, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/hosts.rs` (`one_maintenance_job_per_drive_whichever_starts_first`)
+reason: both jobs take the one claim through `maintain::maintain`; the test starts two at once on two hosts and each interleaving. The curator's scheduler lives on rung 3 and is restacked onto this one; agentd's tick starting both is not driven here.
+status: open
+
+### DW-740: A workflow file or agent folder committed after the sweep's plan is not guarded.
+
+origin: epic 95, story 95.3 (rung `agents-95-curate`, R208 / R95U-05, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/curate.rs` (`plan_sweep`, `protection`)
+reason: every workflow and `agent.toml` the plan read is guarded by its blob, so a change to one holds the commit; a new path added between the plan and the publication is no guard's, and `commit_paths` has no "nothing new under this folder" guard outside a move. The window is the plan's few seconds under the claim; the next week reads it.
+status: accepted (R229) — the reading of R208-05: the window is one sweep under the claim and archiving is a reversible move; not fenced
+
+### DW-741: A file put on the disk into a skill folder after the plan stays behind in the old folder.
+
+origin: epic 95, story 95.3 (rung `agents-95-curate`, R208 / R95U-07, 2026-10-06)
+location: `src-tauri/crates/keeper-sync/src/engine/authored.rs` (`commit_paths_held`, moves)
+reason: a move takes the files `HEAD` holds, each guarded; an untracked file created between the plan's status read and the publication is not one of them, is never committed and never lost, but the folder it is in is left holding only it.
+status: closed (R230, R95U2-03) — `Engine::commit_paths` lists what a moved folder holds on the disk through the held root (`browse::members`, `authored::stray`) when the guards are checked and again right before the publication; anything the commit does not hold there, committed or not, is `Guarded`, nothing is published and the person's file stays in the whole folder; proof `commit_paths::a_move_holds_for_a_file_on_the_disk_it_never_read`, `curation::archiving_guards_the_whole_tree`
+
+### DW-742: One file of a person's at an expiry's `done/` place holds the whole week's sweep.
+
+origin: epic 95, story 95.3 (rung `agents-95-curate`, R208 / R95U-08, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/curate.rs` (`plan_sweep`); `consolidate::settle_into`
+reason: a committed occupant is seen at the plan and only that proposal stays pending; one only on the disk is caught by the commit's guard, which writes nothing of the week — marks and archives included — until it is committed or removed. Since R230 (R95U2-04) that week stays owed and is planned again every `claim::TTL`, so a removed file frees it the same week.
+status: open
+
+### DW-743: An uncommitted edit to any workflow or `agent.toml` holds every skill transition of the week.
+
+origin: epic 95, story 95.3 (rung `agents-95-curate`, R208 / R95U-04/05, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/curate.rs` (`protection`)
+reason: the read is incomplete, so every skill is protected (R208's reading of 04); keeper commits a drive's changes within its cadence, so the hold lasts until the next sweep after that commit — up to a week.
+status: open
+
+### DW-744: A skill whose 32 newest changes are all the curator's never ages.
+
+origin: epic 95, story 95.3 (rung `agents-95-curate`, R208 / R95U-09, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/curate.rs` (`LOG_DEPTH`, `last_change`)
+reason: a bounded walk that finds no real change answers "unknown", and an unknown age is left alone; 32 curator commits on one folder (16 stale/active rounds) is far past any real skill's life, so it is logged, not lifted.
+status: open
+
+### DW-745: The night's instant is still this machine's clock.
+
+origin: epic 95, story 95.3 review (R95U-10's shape on rung `agents-95-consolidate`, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/consolidate.rs` (`run_round`: `Utc::now()`)
+reason: the curator now plans at the server-adjusted clock (`curate::sweep_drive`); the consolidator's `now` for proposal ages and verdict dates is still `Utc::now()`. Rung 2's to change, not this rung's.
+status: open
+
+### DW-820: Whether a decision was carried out walks the whole history while it waits.
+
+origin: epic 95, story 95.2 (rung `agents-95-consolidate`, R217 / R95C3-05, 2026-10-07)
+location: `src-tauri/crates/keeper-agent/src/consolidate.rs` (`waiting`), `keeper-sync/src/git/history.rs` (`lines_in_history`)
+reason: no commit date bounds the search any more, so a consumed or denied record not carried out yet costs one walk of every commit `HEAD` reaches per `waiting` call (each tick of a drive remembered done asks `any_decided`), stopped early only once every marker is found. A commit-graph generation index would bound it.
+status: open
+
+### DW-821: Recording a window takes the drive's claim a second time.
+
+origin: epic 95, story 95.2 (rung `agents-95-consolidate`, R217 / R95C3-08, 2026-10-07)
+location: `src-tauri/crates/keeper-agent/src/maintain.rs` (`record_held`)
+reason: the completion is written under the claim taken again after the accepted release, so it is serialized with every other job's; that costs one more acquisition (its settle wait) per run, and a run whose second acquisition is lost to another host records nothing and runs again — idempotent, one more run.
+status: open
+
+### DW-822: The publication's folder checks precede a path-based ref transaction.
+
+origin: epic 95, story 95.2 (rung `agents-95-consolidate`, R217 / R95C3-09, 2026-10-07)
+location: `src-tauri/crates/keeper-sync/src/engine/authored.rs` (`bound`), `git/commit.rs` (`publish`)
+reason: gitoxide edits references by path; the held root and its `.git` are checked before the repository opens, before the record, right before the compare-and-swap and before every roll-forward, but a swap between the last check and the reference lock is not excluded by a descriptor.
+status: open
+
+### DW-823: A person's long-held `index.lock` leaves a published commit for the next pass.
+
+origin: epic 95, story 95.2 (rung `agents-95-consolidate`, R217 / R95C3-10, 2026-10-07)
+location: `src-tauri/crates/keeper-sync/src/git/commit.rs` (`index_follow`, `INDEX_LOCK_WAIT`)
+reason: the index follows under its own lock, waited for 2 s; past that the roll-forward fails, the record stays, the card says so and the next pass finishes it.
+status: open
+
+### DW-824: A link a moved skill folder holds is materialized as a file.
+
+origin: epic 95, story 95.2 (rung `agents-95-consolidate`, R217 / R95C3-13, 2026-10-07)
+location: `src-tauri/crates/keeper-sync/src/engine/authored.rs` (`roll_forward`, `materialize`)
+reason: the executable mode is carried to the disk; a `120000` entry moved with its folder is written as a regular file holding the link's target, so the next watcher pass would record that as a change. Skill folders hold no links today.
+status: open
+
+### DW-825: A refused rejection leaving a night unfinished is proven at `consolidate::settled`, not through `run_round`.
+
+origin: epic 95, story 95.2 (rung `agents-95-consolidate`, R217 / R95C3-07, 2026-10-07)
+location: `src-tauri/crates/keeper-agent/src/hosts.rs` (`a_night_whose_commit_did_not_finish_is_tried_again`), `tests/consolidation.rs` (`a_refused_rejection_leaves_the_night_unfinished`)
+reason: `run_round` is driven with a real home to `Done`, and with staged proposals whose published commit cannot be finished to `Again` (unrecorded) and then, once the next pull finished it, to `Done`; that proves `night_of` asks `settled`. A consumed approval whose rejection is refused needs a person's decision recorded through the approval store and the agentd harness of `tests/consolidation.rs`, so that branch of `settled` is proven there, at `settled` itself.
+status: open
+
+### DW-830: The vault index's materialization check is proved through a seam, not on a dataless file.
+
+origin: epic 95, story 95.4 (rung `agents-95-search`, re-review R95S2, R218, 2026-10-07)
+location: `src-tauri/crates/keeper-sync/src/bots_fs.rs` (`search_file`, `nofollow::file_at`), `src-tauri/crates/keeper-agent/src/search.rs` (`open_index`)
+reason: `open_index` hands SQLite the index's path only after `search_file` finds a regular file not marked `SF_DATALESS`; Linux has no such flag, so `a_file_whose_content_is_elsewhere_is_never_handed_over` proves the check through an injected `dataless` and the call from `open_index` is proved by inspection (its mutant survives on Linux). Close with DW-715's run on hesperia over an evicted `search.db`.
+status: open
+
+### DW-831: SQLite's own page reads in the vault's index are bounded by time, not counted in bytes.
+
+origin: epic 95, story 95.4 (rung `agents-95-search`, re-review R95S2, R218, 2026-10-07)
+location: `src-tauri/crates/keeper-core/src/notes/search_index.rs` (`Meter`, `open_bounded`)
+reason: A call's 16 MiB counts every value the index hands over (ids, numbers, vector blobs, paths); the b-tree and FTS pages SQLite reads to find them are not, and are bounded by the deadline the progress handler enforces. Counting them needs `sqlite3_db_status(SQLITE_DBSTATUS_CACHE_MISS)`, which rusqlite does not expose safely.
+status: open
+
+### DW-832: The index's lock wait is bounded on the wall clock, with no deterministic test.
+
+origin: epic 95, story 95.4 (rung `agents-95-search`, re-review R95S2, R218, 2026-10-07)
+location: `src-tauri/crates/keeper-agent/src/search.rs` (`open_index`), `src-tauri/crates/keeper-core/src/notes/search_index.rs` (`open_bounded`)
+reason: `open_bounded` sets SQLite's busy timeout to the call's time left (by the call's clock, at most 1.5 s), but SQLite sleeps on the wall clock, so an injected clock cannot drive it and a locked-index test would depend on the host's speed. Close with a busy handler that asks the call's clock, if rusqlite's `busy_handler` grows a closure form.
+status: open
+
+### DW-833: Vectors that spend the call's bytes can leave the vault's index answering nothing.
+
+origin: epic 95, story 95.4 (rung `agents-95-search`, re-review R95S2, R218, 2026-10-07; reopened and narrowed by R248, 2026-10-08)
+location: `src-tauri/crates/keeper-agent/src/search.rs` (`rank_within`), `src-tauri/crates/keeper-core/src/notes/search_index.rs` (`paths_of`)
+reason: Since R236 a vector is admitted by its stored width before it is extracted, so a vector past the bytes left is never fetched and the meaning ranking stops (said, `Said::MeaningCapped`). That does not keep the lexical ranking in general: the vectors spend the same meter the ranked notes' paths are then read from, and the paths need 8 bytes per row plus each path — a meaning ranking that stops with fewer bytes left than that (zero to seven, or simply fewer than the ranked paths take) makes `paths_of` end with `Bounds`, and the lexical ranking already computed is discarded (said as the index not answering). `the_indexs_rows_count_against_the_calls_bytes` keeps the words' ranking only because its 128 KiB vectors happen to stop with ample headroom; it is no proof for every width. Close by reserving the ranked paths' bytes out of the call's allowance before the vectors are read, or by giving the vectors a share of the 16 MiB; decide the share.
+status: open
+
+### DW-834: A config path through a file where a folder should be refuses the drive.
+
+origin: epic 95, story 95.4 (rung `agents-95-search`, re-review R95S2, R218, 2026-10-07)
+location: `src-tauri/crates/keeper-sync/src/bots_fs.rs` (`search_landing`)
+reason: Only `NotFound` is taken for an absent config (R218); `ENOTDIR` — a file named `.okf` — is refused as unknown, so that drive is not searched at all where it arguably has no config. Accepted as the strict side; revisit if a drive is found with a `.okf` file.
+status: open
+
+### DW-885: A file the drive ignores inside an archivable skill folder holds its archive, retried every claim lapse.
+
+origin: epic 95, story 95.3 (rung `agents-95-curate`, R230 / R95U2-03/04, 2026-10-07)
+location: `src-tauri/crates/keeper-sync/src/engine/authored.rs` (`stray`); `src-tauri/crates/keeper-agent/src/curate.rs` (`plan_sweep`, `week`)
+reason: the plan reads uncommitted changes through git's status, which does not list an ignored file (`.DS_Store`, an editor's swap file); the publication's disk listing does, and holds the move. Conservative — nothing is moved or lost — but the week stays owed and the sweep is planned and refused again every `claim::TTL` until the file goes. Telling the plan about ignored files (or ignoring them at the move) is a product decision.
+status: open
+
+### DW-886: A sweep refused at its publication is replanned every claim lapse for as long as the obstruction stays.
+
+origin: epic 95, story 95.3 (rung `agents-95-curate`, R230 / R95U2-04, 2026-10-07)
+location: `src-tauri/crates/keeper-agent/src/curate.rs` (`week`, `run_round`)
+reason: `Outcome::Skipped` is unsettled, so the week is retried on the existing `AGAIN` cadence — each try a pull, a plan and a log line. A person's file left at an expiry's `done/` place, or DW-885's ignored file, makes that hourly until it goes or the week ends; no backoff.
+status: open
+
+### DW-887: The curator's commits are recognized by the shape of keeper's trailer block, not by a signature.
+
+origin: epic 95, story 95.3 (rung `agents-95-curate`, R230 / R95U2-01, 2026-10-07)
+location: `src-tauri/crates/keeper-sync/src/provenance.rs` (`MemoryTrailer::of_message`)
+reason: a person can type the exact block, and a person's cherry-pick or rebase of a curator commit keeps it; either makes that change not count toward a skill's age. Only the drive's writers can do it, and the worst effect is an earlier stale mark or archive — a move, reversible. Authenticity would need signed commits.
+status: open
+
+### DW-900: A person's commit in the instant after the roll-forward's one `HEAD` read can be followed over.
+
+origin: epic 95, story 95.2 (rung `agents-95-consolidate`, R233 / R95C4-02, 2026-10-07)
+location: `src-tauri/crates/keeper-sync/src/engine/authored.rs` (`roll_forward`, `materialize`)
+reason: accepted residual. Which paths follow a published commit is read from `HEAD` once, right before the disk and the index follow; a person's commit landing between that read and the materialization (a window of one hash pass) — a reversal of the commit, say — can still have the night's files written over its paths on the disk and the index entries moved. Keeper is one person's set of devices, the window is bounded, the person's commit stays in the history, and every later night/watch pass sees it with the difference on top. `docs/agents.md` and `docs/sync.md` state the guarantee exactly ("read once, right before the files follow"). Proven only up to that read: `commit_paths::a_persons_commit_right_after_the_publication_is_never_written_over`.
+status: open
+
+### DW-901: A proposal taken back between the night's last re-read and the publication can be settled.
+
+origin: epic 95, story 95.2 (rung `agents-95-consolidate`, R233 / R95C4-05, 2026-10-07)
+location: `src-tauri/crates/keeper-sync/src/engine/authored.rs` (`commit_paths_held`, the re-read before `git::commit::publish`), `keeper-agent/src/consolidate.rs` (`settle_into`; `add_review`, `decided` — the review path)
+reason: accepted residual. Every guarded path and every changed path is read on the disk again right before the compare-and-swap; that re-read and the publication are not one step, so a proposal withdrawal (or any guarded edit) landing between them — a window of one hash pass — is carried by the commit. The review path has no stronger protocol: the commit publishing a review guards every proposal its preview was made from, and the commit carrying a decision out guards the ones it settles, through the same re-read, so a proposal taken back in that instant can still be shown in the published review or settled by the decision's commit (R246 / R95C5-03). No shared serialization of proposal publication/withdrawal with the night exists. Keeper is one person's devices and the window is bounded; the next night or watcher pass sees what landed after. `docs/agents.md` and `docs/sync.md` state "re-read right before publication", never atomic; `docs/agents.md` cites this entry from the proposals and the review paragraphs. The early-removal regression `consolidation::a_proposal_taken_back_is_never_applied` stays.
+status: open
+
+### DW-902: A review room's creation is fenced before it starts, not between its own requests.
+
+origin: epic 95, story 95.2 (rung `agents-95-consolidate`, R233 / R95C4-06, 2026-10-07)
+location: `src-tauri/crates/keeper-agent/src/consolidate.rs` (`run_home`), `hosts.rs` (`CopyPort::review_room`)
+reason: the live fence is asked again after the awaited authority check, right before `room()` starts; the room implementation makes the room and sends its invitations without the fence, so a claim lost while those requests are in flight still completes them. The room is reused by a night run again (`review_room_of`) only once its session is committed; an unused room is left.
+status: open
+
+### DW-903: The completion's fence is asked right before its send, not inside it.
+
+origin: epic 95, story 95.2 (rung `agents-95-consolidate`, R233 / R95C4-03, 2026-10-07)
+location: `src-tauri/crates/keeper-agent/src/maintain.rs` (`record`, `record_held`)
+reason: Matrix state has no compare-and-swap. The completion is read, the claim taken again is asked (`Lease::may_write`) right before the send, and the run is not counted recorded when the claim lapsed before the send or its release was refused after it. That is not unconditional monotonicity: a send held up after the last ask — past the claim's 60 s margin (`claim::STOP_WITHOUT_RENEWAL`), while another host takes the drive and records a later window — can still land after that later completion and replace it with an older window, and that night is then run again. `recorded` is the host's local answer; it says nothing about whether a send already made reached the server. This is the claim protocol's own residual, as for every fenced effect; `docs/agents.md` states these boundaries and cites this entry (R246 / R95C5-03).
+status: open
+
+### DW-930: A listing that fails part way through is proved by inspection only.
+
+origin: epic 95, story 95.4 (rung `agents-95-search`, re-review R95S3, R236, 2026-10-07)
+location: `src-tauri/crates/keeper-sync/src/bots_fs.rs` (`nofollow::children`)
+reason: A folder whose `getdents` fails after some entries, or one of whose entries' kind `statat` cannot ask (a filesystem without `d_type`), counts as unreadable (`SearchWalk::unreadable`, said as `Said::Unlisted`) and, since R248, makes a capped scan's total unknown (`Said::ScanCapped { of: None }`, built from the same count, so these two branches cannot claim a total either). Neither failure can be produced deterministically on the Linux test host (ext4 always reports `d_type`; a mid-listing I/O error needs a failing device), so those two branches have no mutation-proved test; the not-listed and not-opened branches do (`folders_that_cannot_be_read_are_said_not_taken_for_empty`, `a_folder_not_read_leaves_the_capped_count_unknown`). Close with a fault-injecting `Dir` seam or a FUSE fixture.
+status: open
+
+### DW-931: A bounded reader whose bytes end where its rows do reports the bounds.
+
+origin: epic 95, story 95.4 (rung `agents-95-search`, re-review R95S3, R236, 2026-10-07; broadened by R248, 2026-10-08)
+location: `src-tauri/crates/keeper-core/src/notes/search_index.rs` (`Meter::step`, `run_match`, `cosine_top_k_within`)
+reason: R236 checks a row's numbers against what is left before every step, the step that finds no row included. So any reader that steps past its last row ends with `SearchIndexError::Bounds` when fewer than that row's numbers are left, though nothing more was there: the meaning ranking (no `LIMIT`) whose allowance ends at its last row (said as `Said::MeaningCapped`), and equally the lexical ranking whenever its matches are fewer than its `LIMIT` (1 000) — one note with a one-byte id takes 33 bytes, and with exactly 33 allowed the step that would find no second row is refused, so the words' ranking is reported as bounded, not answered. Only a lexical query that fills its `LIMIT` never takes that extra step. Accepted as the strict side: the reader cannot know there is no next row without stepping, and a refusal is said, never an empty answer.
+status: open
+
+### DW-932: The vault's partial coverage is said whenever the drive's scan stopped.
+
+origin: epic 95, story 95.4 (rung `agents-95-search`, re-review R95S3, R236, 2026-10-07)
+location: `src-tauri/crates/keeper-agent/src/search.rs` (`search_drive`, `Searching::scan`)
+reason: `Said::IndexPartial` is said when the index ranked and anything of the drive's scan stopped early (a bound, an unreadable folder) or its ranked/listed reading did, without asking whether the vault's own walk had finished before the stop. Accepted as the conservative side; attributing the stop per start would make it exact.
+status: open
+
+### DW-933: The vault is scanned beside its index on every call.
+
+origin: epic 95, story 95.4 (rung `agents-95-search`, re-review R95S3, R236, 2026-10-07)
+location: `src-tauri/crates/keeper-agent/src/search.rs` (`search_drive`), `src-tauri/crates/keeper/src/notes_vault.rs` (`sync_search`), `src-tauri/crates/keeper-core/src/notes/search_index.rs` (`meta`)
+reason: Nothing a core/agent reader can see says the index holds the vault's current, completed generation (the desktop's `search_state` phase is in-process; `notes.stat` is the shell's `size:mtime_ns:ino:path` format), so R236 scans the vault after the ranked notes on every call: a vault larger than the call's bounds always says it is covered only in part, and its scan spends files and bytes the index could have saved. Close with a completed-generation marker the reconciler writes into `meta` at the end of a cold pass (and clears when it starts one), read by `open_index`, or with a per-file freshness check against `notes.stat` once its format is a core contract.
+status: open
+
+### DW-934: Exhaustion is said before a listing line or ranked note that would not have been read.
+
+origin: epic 95, story 95.4 (rung `agents-95-search`, re-review R95S3, R236, 2026-10-07)
+location: `src-tauri/crates/keeper-agent/src/search.rs` (`Searching::index_hits`, `Searching::listing_hits`)
+reason: R236 asks the bounds before every ranked note, listing and listing line, before it is matched or resolved, so a drive whose bounds ran out exactly as its last read finished says it is incomplete even where every remaining line would not have matched or every remaining note is gone. Accepted as the strict side: matching or resolving is the work the check bounds.
+status: open
+
+### DW-970: A settling that cannot tell whose a file is holds the folder until a person settles the path.
+
+origin: epic 95, story 95.2 (rung `agents-95-consolidate`, R246 / R95C5-02, 2026-10-08; widened by R250 / R95C6-01…03, R264 / R95C7-01…03 and R268 / R95C8-01…03)
+location: `src-tauri/crates/keeper-sync/src/engine/authored.rs` (`put_back`), `src-tauri/crates/keeper-sync/src/browse.rs` (`Displaced::holds`)
+reason: accepted by design. A transaction's own new file is told apart from a person's only while it is still linked under its staging name, holds the commit's bytes and has the executable bit the commit gave it; the old file it moved aside is the commit's only while it holds the committed before-image bytes with the before-image entry's executable bit, read by one check (`browse::Displaced::holds`) right before it is dropped — beside an empty path once a deletion was committed, beside a person's file saved at a reversed path, after the commit's own file was dropped — and before the commit's file is moved off the path for it (R268). Recovery completes only when every path's occupant, mode, `HEAD` entry and before-image are attributed (R250), and no mode is ever moved from one file to another (R264): modes are held, never transferred. It holds — nothing moved or dropped, the files as they are, the old file beside the path as `.keeper-displaced-<request>-<n>`, the record kept and the folder's commits held with the reason on its card — where the path holds the commit's bytes without that staging link (a kill after the placement unlinked the staging name, before the old file moved aside was dropped — no `Cut` stops there — then the commit taken back or the path's deletion committed), where `HEAD` holds a third version while the commit's own file or its old file is still there (with or without an old file moved aside), where `HEAD` holds the old bytes with another mode than the entry the commit replaced, where `HEAD` holds the replaced entry again but the old file moved aside is gone (the commit's own file stays at the path rather than leave it empty for a watcher to commit as a deletion), where the commit's own file's executable bit is not the one its committed entry gives it (a person set or cleared it, a new file included), and where the old file moved aside has other bytes or another executable bit than its committed entry when it would go (a person saved over it or set or cleared its bit at any point before that check, beside an empty path, a person's file or the commit's) — or any of these cannot be read. Holding leaves no step for a kill to interrupt between a mode and the file that carries it: a settling run again holds again with every file and bit where the person left it, including one a kill stopped after moving the commit's file off the path (it goes back first) and one a kill stopped after dropping the commit's file (the old file is checked again before it goes) — except a kill inside that move back, between its link and its unlink, which holds until a person removes the alias (DW-1061). A change in the instant between the check and the unlink is DW-1060. A person settles the path by putting there what they want (`git checkout -- <path>` for what `HEAD` holds, removing the file for a deletion, committing the commit's bytes to keep them, or putting a bit back as it was) and removing the old file kept beside it unless it should go back (after a reversal, an empty path and the old file left let the next settling put it back, with whatever bit the person gave it — never removed, so never checked), or putting the old file's bit back so the settling drops it. No automatic choice is made, because either choice can lose a person's file or mode. Proof: `commit_paths::{a_settling_that_cannot_tell_whose_a_file_is_keeps_the_record, a_deletion_committed_over_a_file_nothing_attributes_holds_the_folder, a_third_version_over_the_commits_own_file_holds_the_folder, a_mode_a_settling_cannot_attribute_holds_the_folder, a_reversal_whose_old_file_is_gone_keeps_the_commits_file, an_old_file_whose_bit_a_person_changed_is_never_dropped, an_old_file_changed_while_its_settling_runs_stays}` (the staging name removed by hand stands in for that kill, a rename to `.keeper-taken-<request>-<n>` for the kill after the move off the path, `Cut::Dropped` for the kill after the commit's file was dropped and for a person acting while the settling runs).
+status: open
+
+### DW-990: A text the scan meets again under another bundle's name is evaluated under its first name only.
+
+origin: epic 95, story 95.4 (rung `agents-95-search`, re-review R95S4, R248, 2026-10-08)
+location: `src-tauri/crates/keeper-agent/src/search.rs` (`Done`, `Searching::scan`)
+reason: R248 keeps what each landing's one read came to and evaluates a pointer again under every later name that reaches it (`a_landing_read_under_one_name_is_evaluated_under_another`). A text is not kept: read by the index or a listing it is always a result already, but read by the scan it is a result only where the terms are in its names, title or body — so where a bundle's path is a link onto a folder another bundle's walk read first, a text whose terms are only in the second name is not found under it. Keeping every scanned text (up to the call's 16 MiB) or which terms its title and body held would close it.
+status: open
+
+### DW-991: A listing line's linear reading is proved by a time bound, not by counted work.
+
+origin: epic 95, story 95.4 (rung `agents-95-search`, re-review R95S4, R248, 2026-10-08)
+location: `src-tauri/crates/keeper-ported/src/okf/index.rs` (`entry_line`)
+reason: `a_line_of_delimiters_reads_in_its_length` reads three lines of half a million `](` each within 2 s; reading them by trying each `](` against the rest of the line takes tens of seconds, so the bound tells the two apart by an order of magnitude on any host the tests run on, but it is the wall clock, not a count of bytes looked at. The interruption between lines is proved on the call's injected clock (`a_listing_is_read_within_the_bounds_a_line_at_a_time`); a single line is never interrupted, only bounded by the 1 MiB file ceiling and its linear reading.
+status: open
+
+### DW-992: An index not stored as UTF-8 is refused by every reader and kept by the writer.
+
+origin: epic 95, story 95.4 (rung `agents-95-search`, re-review R95S4, R248, 2026-10-08)
+location: `src-tauri/crates/keeper-core/src/notes/search_index.rs` (`SearchIndex::reader`, `SearchIndex::open`)
+reason: R248 reads `PRAGMA encoding` once when a reader opens and refuses any answer but `UTF-8` (`SearchIndexError::Encoding`), since a value is admitted by the length SQLite stores for it. `open_read_only` shares that reader, so the Mac's own notes search refuses such an index too, while `SearchIndex::open` (the writer) keeps it. keeper's writer only ever creates UTF-8 indexes, so only a foreign tool can produce one; if one is met, the writer should discard it as it discards an incompatible schema.
+status: open
+
+### DW-1060: A change to the old file in the instant between the settling's last look at it and its unlink is not seen.
+
+origin: epic 95, story 95.2 (rung `agents-95-consolidate`, R268 / R95C8-02, 2026-10-08)
+location: `src-tauri/crates/keeper-sync/src/browse.rs` (`Displaced::holds`, `Displaced::discard`), `src-tauri/crates/keeper-sync/src/engine/authored.rs` (`put_back`'s `drop_old`)
+reason: accepted residual, the same class as DW-900. The old file moved aside is dropped by name: `Displaced::holds` opens it through no link, `fstat`s the descriptor, reads its bytes and compares their blob id with the committed before-image, then `statat`s the name and requires the same device, inode and change time (`st_ctime`, `st_ctime_nsec`: no write, mode change or link change since the open) and the before-image's executable bit; `Displaced::discard` then `unlinkat`s the name. A replacement or a change of bytes or bit made before that `statat` holds (`commit_paths::an_old_file_changed_while_its_settling_runs_stays`); one made after the `statat` returns and before the `unlinkat` — a window of two system calls, `holds` returning and `drop_old` calling `discard` — is not seen, and that file is unlinked. On a file system whose change time is coarser than the interval, a write after the bytes are read and within the same tick is not seen either. Closing it needs the drop to act on the descriptor that was checked (an unlink by identity, which POSIX lacks) or a rename of the name to a private one first and a check of what was moved, with its own recovery. Keeper is one person's set of devices; the old file is a hidden `.keeper-displaced-<request>-<n>` the person has no reason to edit in that instant.
+status: open
+
+### DW-1061: A kill inside the `.keeper-taken` restoration, between its link and its unlink, holds until a person removes the alias.
+
+origin: epic 95, story 95.2 (rung `agents-95-consolidate`, R268 / R95C8-03, 2026-10-08)
+location: `src-tauri/crates/keeper-sync/src/browse.rs` (`place`, `Displaced::restore`), `src-tauri/crates/keeper-sync/src/engine/authored.rs` (`put_back`, the `.keeper-taken` branch first)
+reason: `put_back` moves a commit's file off the path as `.keeper-taken-<request>-<n>` and, on a later settling, puts it back first through `place`: `linkat` to the path's name, then `unlinkat` of the taken name. A kill between the two leaves one inode under both names. Every settling after it tries the same `linkat`, gets `EEXIST`, takes it for a file a person saved at the path and holds (`saved there … kept beside it as .keeper-taken-…`) before reading any bytes or mode. Nothing is lost — bytes and modes are where they were — but putting the path or the bit back, or removing the old file, does not release the hold while the alias stays. Manual remedy: remove the `.keeper-taken-<request>-<n>` name only when it is the same file as the path (`ls -i` shows one inode number for both); the next settling then proceeds. A different file under that name is the commit's own file, kept because a person's file took the path: that is a genuine conflict, settled as DW-970 says. Eventual fix: recognise and finish its own partial restore — when the taken name and the path are one inode, unlink the taken name, sync the folder and go on — with a regression stopping between `place`'s link and unlink. Not a dead end: the manual remedy releases it.
+status: open
+
+### DW-1062: A settling with `HEAD` unchanged drops an old file moved aside whose executable bit a person changed.
+
+origin: epic 95, story 95.2 (rung `agents-95-consolidate`, R271 / R95C9-01, 2026-10-08)
+location: `src-tauri/crates/keeper-sync/src/engine/authored.rs` (`materialize`: `settle(earlier, now.is_none())`); `docs/sync.md` §10
+reason: where `HEAD` still holds the commit's after-image, the settling goes through `materialize`, not `put_back`. With the new file already at the path (`put` false) and the old file moved aside as `.keeper-displaced-<request>-<n>` carrying a bit a person changed while keeper was stopped mid-commit (`theirs` true), `settle` falls through to `old.discard()` and the intent is cleared: the person's chmod of keeper's internal name is lost. Its bytes are the before-image, recoverable from git. Fix: on an occupied destination with a changed aside mode, hold — the aside and the intent stay, no mode transferred; regressions for the bit set and cleared with `HEAD` unchanged, a held watcher commit and the person's resolution. Also: `docs/sync.md` §10 overstates that every saved-over aside holds — bytes restored into an empty path complete (`commit_paths.rs` 2522–2525).
+status: open
+
+### DW-1070: A move taken back after a kill leaves a file the commit had already removed deleted on the disk, and the next watcher pass commits it.
+
+origin: epic 95, story 95.3 (restack of `agents-95-curate` onto 419c9a30, R273, 2026-10-08)
+location: `src-tauri/crates/keeper-sync/src/engine/authored.rs` (`put_back`: `wanted.is_none()` with no old file moved aside returns `Ok(())`; `roll_forward`)
+reason: a move is one deletion at `from/…` and one new file at `to/…` per file. The curator's archive of `_skills/x/{SKILL.md, run.sh}` published, a kill once `_skills/.archive/x/SKILL.md` was linked under its staging name (`Cut::Staged(1, Linked)`), then a person's commit of the index — the commit taken back: the settling drops the archive copy (still the commit's own file) and completes, record gone, but `_skills/x/SKILL.md`, whose deletion the roll-forward had finished (its moved-aside old file already dropped), is not put back — nothing of the commit's is at the path and no old file is aside, so `put_back` returns. `git status` says ` D _skills/x/SKILL.md`, and the next watcher pass commits that deletion over the person's reversal; the bytes stay in history. Seen with a throwaway probe on b9ce3e0f; a kill one change later (`Cut::Displaced(2)`, `Cut::Staged(3, Linked)`) holds instead (DW-970). A consolidation's `proposals/` → `done/` move has the same shape (by reading, not run). Fix (rung 2's `put_back`, final at 419c9a30): where `HEAD` holds the before-image again, the path is empty and this intent's change was the deletion, write the before blob back from the object store with its committed mode, only where nothing is (`Contained::create`); regression: the probe's kill-at-placement case with the skill folder whole afterwards and a watcher pass committing nothing.
+status: open
+
+### DW-1075: A search's bundle listing or configuration read can land on a commit's transient file, and a multi-file commit can be searched half-applied.
+
+origin: epic 95, story 95.4 (restack of `agents-95-search` onto c57046b8, review-95srch-7 R95S7-01, R282, 2026-10-09)
+location: `src-tauri/crates/keeper-agent/src/search.rs` (`Plan::reads_listing` ~334–340 via `read_admitted` ~672–677; configuration reads via `kept_out` ~490–503, which rejects a `.keeper` component but not names beginning `.keeper.`/`.keeper-`); `keeper-sync/src/engine/authored.rs` (~129–145 transient names; ~853–892 final paths materialized one at a time)
+reason: an allowed bundle's `index.md` symlinked to a `.keeper-displaced-<request>-<n>` left by a stopped commit is admitted by `reads_listing` and opened, so a `## Documents` list in those bytes can steer hits. Separately, search can see some of a multi-file commit's final `.md` paths and not others. Search writes nothing, so nothing is lost; the result may be stale or partial. Fix: apply the transient-name families to listing and configuration admission (with a listing-alias regression), and either document or isolate the multi-file-commit read.
+status: open
+

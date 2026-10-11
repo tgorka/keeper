@@ -130,7 +130,7 @@ pub fn load(path: &Path) -> Result<DaemonConfig> {
 /// Separate from [`load`] so the parser is testable without a filesystem, and
 /// so [`example`] can be checked against the very code that will read it.
 pub fn parse(text: &str) -> Result<DaemonConfig> {
-    let raw: RawDocument = toml::from_str(text).map_err(|err| {
+    let raw: RawDocument = from_str_in_key_order(text).map_err(|err| {
         // `toml`'s Display carries the line, the column and a snippet of the
         // offending input, which is the whole "fails loudly with the offending
         // line/key" requirement — do not flatten it to one line.
@@ -171,6 +171,37 @@ pub fn parse(text: &str) -> Result<DaemonConfig> {
     Ok(DaemonConfig {
         daemon: raw.daemon,
         profiles,
+    })
+}
+
+/// `toml::from_str`, with every table visited in key order. A build that
+/// links keeper-ported (a workspace-wide build or test run) turns on `toml`'s
+/// `preserve_order`, and the file's first error must not depend on that
+/// (R170; `keeper_core::toml_order` is the same reader above keeper-sync).
+fn from_str_in_key_order<'a, T: serde::Deserialize<'a>>(
+    text: &'a str,
+) -> std::result::Result<T, toml::de::Error> {
+    use toml::de::{DeTable, DeValue};
+    fn sort_table(table: &mut DeTable<'_>) {
+        let mut entries: Vec<_> = std::mem::take(table).into_iter().collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        for (_, value) in &mut entries {
+            sort_value(value.get_mut());
+        }
+        *table = entries.into_iter().collect();
+    }
+    fn sort_value(value: &mut DeValue<'_>) {
+        match value {
+            DeValue::Table(table) => sort_table(table),
+            DeValue::Array(items) => items.iter_mut().for_each(|item| sort_value(item.get_mut())),
+            _ => {}
+        }
+    }
+    let mut root = DeTable::parse(text)?;
+    sort_table(root.get_mut());
+    T::deserialize(toml::de::Deserializer::from(root)).map_err(|mut error| {
+        error.set_input(Some(text));
+        error
     })
 }
 
@@ -601,6 +632,19 @@ settle_ms = 6000
         let err = parse("[daemon]\npollIntervalMS = 5000\n").expect_err("wrong case must fail");
 
         assert!(err.to_string().contains("pollIntervalMS"), "{err}");
+    }
+
+    /// Two unknown keys: the first in key order is named, in a build with or
+    /// without `toml`'s `preserve_order` (R170). Run under
+    /// `--features toml/preserve_order` for the workspace build.
+    #[test]
+    fn the_first_unknown_key_in_key_order_is_named() {
+        let err = parse("[daemon]\nzeta = 1\nalpha = 2\n").expect_err("refused");
+        let said = err.to_string();
+        assert!(
+            said.contains("`alpha`") && !said.contains("`zeta`"),
+            "{said}"
+        );
     }
 
     #[test]

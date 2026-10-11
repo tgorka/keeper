@@ -165,6 +165,24 @@ mistake the rule above exists to prevent. The two directories named here are the
 exception to the reading: neither is scanned, because one holds output and the
 other is scratch.
 
+## In a session an agent works in
+
+`log/` and `approvals/` are keeper's: the session's record and its pending
+actions. Never edit or delete them by hand. Each file in them has exactly one
+writer, and a hand edit is a second writer whose change nobody reading the
+record can tell from the agent's.
+
+A task an agent works carries more keys beside `status:`. **`run:` is the
+agent's run, never a column** — `queued`, `running`, `waiting`, `blocked`,
+`review` or `failed` — and keeper's host writes it, with `last_run:`. The card
+stays in the column its `status:` names, which is still one of the four. The
+other agent keys: `assignee:` (the agent), `host:` (a host it is pinned to),
+`requested_by:` (who asked), `schedule:` and `workflow:` (written by a person,
+or by an agent through keeper, which then adds `scheduled_by:` until a person
+allows it), and `integrity: untrusted` (keeper's mark on a card made from
+outside content). Do not write `run:`, `last_run:`, `scheduled_by:` or
+`integrity:` by hand unless you mean to override keeper.
+
 ## Writing
 
 - **End every sitting with a log file.** Name it
@@ -1186,6 +1204,12 @@ mod tests {
             "not a new folder",
             // …and the half the amendment adds: keeper itself makes one now.
             "*New folder*",
+            // An agent's session: the files only keeper writes.
+            "`log/` and `approvals/` are keeper's",
+            "Never edit or delete them by hand.",
+            // An agent's card: its run is a key keeper writes, not a column.
+            "`run:`",
+            "never a column",
         ] {
             assert!(
                 AGENTS_MD.contains(required),
@@ -1302,7 +1326,7 @@ mod tests {
     // -----------------------------------------------------------------------
     // A template's own files and folders (FR-284) — the spec's matrix, rows
     // 3-12 and 15, at the plan level. Rows 1-2 are the executor's
-    // (`keeper/src/sessions_exec.rs`) and rows 13-16 the shell's and the room's.
+    // (`keeper-agent/src/sessions/exec.rs`) and rows 13-16 the shell's and the room's.
     // -----------------------------------------------------------------------
 
     /// The template `_template/test1` the owner actually has, as a plan prefix.
@@ -1488,7 +1512,7 @@ mod tests {
         );
         // Row 8's collision is not decided here: the domain opens nothing
         // (AD-108), so the shell asks the disk and `MoveFile` refuses it again as
-        // it runs (`sessions_exec.rs`, matrix row 2).
+        // it runs (`keeper_agent::sessions::exec`, matrix row 2).
     }
 
     /// Row 9. A folder rename is a `MoveDir`, so its contents travel by moving

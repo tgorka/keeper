@@ -569,18 +569,20 @@ pub fn parse_json(text: &str) -> Result<AccountDescriptor, DescriptorError> {
 /// Parse the stored TOML form, then [`validate`].
 pub fn parse_toml(text: &str) -> Result<AccountDescriptor, DescriptorError> {
     let line = |error: &toml::de::Error| error.span().map(|span| line_of(text, span.start));
-    let table: toml::Table = toml::from_str(text).map_err(|error| DescriptorError {
-        line: line(&error),
-        message: format!("{FILE_NAME} is not valid TOML: {}", first_line(&error)),
-    })?;
+    let table: toml::Table =
+        crate::toml_order::from_str(text).map_err(|error| DescriptorError {
+            line: line(&error),
+            message: format!("{FILE_NAME} is not valid TOML: {}", first_line(&error)),
+        })?;
     refuse_secrets_toml(&table)?;
-    let descriptor: AccountDescriptor = toml::from_str(text).map_err(|error| DescriptorError {
-        line: line(&error),
-        message: format!(
-            "{FILE_NAME} does not fit the schema: {}",
-            first_line(&error)
-        ),
-    })?;
+    let descriptor: AccountDescriptor =
+        crate::toml_order::from_str(text).map_err(|error| DescriptorError {
+            line: line(&error),
+            message: format!(
+                "{FILE_NAME} does not fit the schema: {}",
+                first_line(&error)
+            ),
+        })?;
     validate(&descriptor)?;
     Ok(descriptor)
 }

@@ -1,6 +1,13 @@
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { AccountVm, IpcError, TimelineBatch, TimelineItemVm } from "@/lib/ipc/client";
+import type {
+  AccountVm,
+  AgentRunVm,
+  ApprovalCardVm,
+  IpcError,
+  TimelineBatch,
+  TimelineItemVm,
+} from "@/lib/ipc/client";
 import { accountStatusStore } from "@/lib/stores/account-status";
 import { accountsStore } from "@/lib/stores/accounts";
 import { roomsStore } from "@/lib/stores/rooms";
@@ -132,6 +139,7 @@ function messageItem(key: string, sender: string, body: string): TimelineItemVm 
     reactions: [],
     media: null,
     readers: [],
+    brief: null,
   };
 }
 
@@ -261,6 +269,7 @@ describe("ConversationPane", () => {
               reactions: [],
               media: null,
               readers: [],
+              brief: null,
             },
             { kind: "other", key: "o1" },
           ],
@@ -273,6 +282,150 @@ describe("ConversationPane", () => {
     });
     // The `Other` item is not rendered as a bubble.
     expect(screen.getByLabelText("Messages")).toBeInTheDocument();
+  });
+
+  it("draws an agent's approval request where it arrived, and follows the room's state beside the stream", async () => {
+    const captured: { onBatch: ((b: TimelineBatch) => void) | null } = { onBatch: null };
+    subscribeTimeline.mockImplementation((_a, _r, onBatch: (b: TimelineBatch) => void) => {
+      captured.onBatch = onBatch;
+      return Promise.resolve(1);
+    });
+    roomsStore.getState().selectRoom({ accountId: account.accountId, roomId: "!room:example.org" });
+    render(<ConversationPane {...noopProps()} />);
+    const card: ApprovalCardVm = {
+      id: "01A",
+      bindingDigest: "sha256:aa",
+      tier: 2,
+      tierWord: "T2: it changes something that can be put back",
+      summary: "Write `a.md` in tgdrive (3 bytes)",
+      tool: "drive_write",
+      payload: '{\n  "path": "a.md"\n}',
+      attachment: null,
+      approvers: [{ user: "@alice:example.org", name: "Alice" }],
+      anyone: false,
+      chain: [{ user: "@alice:example.org", name: "Alice" }],
+      scopes: [{ scope: "once", label: "Approve once", detail: "This action once." }],
+      expiresAt: 4_000_000_000_000,
+      state: { state: "pending" },
+      canDecide: true,
+      cannotDecide: null,
+      verify: false,
+      only: null,
+      declassify: null,
+    };
+
+    await waitFor(() => expect(captured.onBatch).not.toBeNull());
+    act(() => {
+      captured.onBatch?.({
+        ops: [
+          {
+            op: "reset",
+            items: [
+              messageItem("k1", "@nixi:example.org", "before"),
+              { kind: "approval", key: "ap", id: "01A" },
+              messageItem("k2", "@nixi:example.org", "after"),
+            ],
+          },
+        ],
+        approvals: [{ id: "01A", cards: [card] }],
+      });
+    });
+
+    const request = await screen.findByRole("article", {
+      name: "Approval request: Write a.md in tgdrive (3 bytes)",
+    });
+    const rows = within(screen.getByRole("list", { name: "Messages" })).getAllByRole("listitem");
+    const at = rows.findIndex((row) => row.contains(request));
+    expect(rows[at - 1]).toHaveTextContent("before");
+    expect(rows[at + 1]).toHaveTextContent("after");
+    expect(within(request).getByRole("button", { name: "Approve once" })).toBeInTheDocument();
+
+    // A decision echoed by the room arrives beside the stream, with no ops.
+    act(() => {
+      captured.onBatch?.({
+        ops: [],
+        approvals: [
+          {
+            id: "01A",
+            cards: [
+              {
+                ...card,
+                canDecide: false,
+                state: {
+                  state: "decided",
+                  decision: "deny",
+                  scope: "once",
+                  by: "@alice:example.org",
+                  byName: "Alice",
+                },
+              },
+            ],
+          },
+        ],
+      });
+    });
+    expect(await within(request).findByText("Denied by Alice.")).toBeInTheDocument();
+    expect(within(request).queryByRole("button", { name: "Approve once" })).toBeNull();
+  });
+
+  it("draws each approval request in the stream as its own request, whatever order the room lists them in", async () => {
+    const captured: { onBatch: ((b: TimelineBatch) => void) | null } = { onBatch: null };
+    subscribeTimeline.mockImplementation((_a, _r, onBatch: (b: TimelineBatch) => void) => {
+      captured.onBatch = onBatch;
+      return Promise.resolve(1);
+    });
+    roomsStore.getState().selectRoom({ accountId: account.accountId, roomId: "!room:example.org" });
+    render(<ConversationPane {...noopProps()} />);
+    const request = (id: string, summary: string): ApprovalCardVm => ({
+      id,
+      bindingDigest: `sha256:${id}`,
+      tier: 2,
+      tierWord: "T2: it changes something that can be put back",
+      summary,
+      tool: "drive_write",
+      payload: null,
+      attachment: null,
+      approvers: [{ user: "@alice:example.org", name: "Alice" }],
+      anyone: false,
+      chain: [{ user: "@alice:example.org", name: "Alice" }],
+      scopes: [{ scope: "once", label: "Approve once", detail: "This action once." }],
+      expiresAt: 4_000_000_000_000,
+      state: { state: "pending" },
+      canDecide: true,
+      cannotDecide: null,
+      verify: false,
+      only: null,
+      declassify: null,
+    });
+
+    await waitFor(() => expect(captured.onBatch).not.toBeNull());
+    act(() => {
+      captured.onBatch?.({
+        ops: [
+          {
+            op: "reset",
+            items: [
+              { kind: "approval", key: "ap1", id: "01A" },
+              messageItem("k1", "@nixi:example.org", "between"),
+              { kind: "approval", key: "ap2", id: "01B" },
+            ],
+          },
+        ],
+        approvals: [
+          { id: "01B", cards: [request("01B", "Write b.md in tgdrive")] },
+          { id: "01A", cards: [request("01A", "Write a.md in tgdrive")] },
+        ],
+      });
+    });
+
+    const first = await screen.findByRole("article", {
+      name: "Approval request: Write a.md in tgdrive",
+    });
+    const second = screen.getByRole("article", { name: "Approval request: Write b.md in tgdrive" });
+    const rows = within(screen.getByRole("list", { name: "Messages" })).getAllByRole("listitem");
+    expect(rows.findIndex((row) => row.contains(first))).toBe(0);
+    expect(rows[1]).toHaveTextContent("between");
+    expect(rows.findIndex((row) => row.contains(second))).toBe(2);
   });
 
   it("consumes Escape only when there is composer context to clear (phone-shell cascade)", async () => {
@@ -391,6 +544,7 @@ describe("ConversationPane", () => {
             reactions: [],
             media: null,
             readers: [],
+            brief: null,
           },
         },
       ],
@@ -433,6 +587,7 @@ describe("ConversationPane", () => {
               reactions: [],
               media: null,
               readers: [],
+              brief: null,
             },
             {
               kind: "message",
@@ -448,6 +603,7 @@ describe("ConversationPane", () => {
               reactions: [],
               media: null,
               readers: [],
+              brief: null,
             },
           ],
         },
@@ -697,6 +853,7 @@ describe("ConversationPane", () => {
                 caption: null,
               },
               readers: [],
+              brief: null,
             },
           ],
         },
@@ -738,6 +895,7 @@ describe("ConversationPane", () => {
               reactions: [],
               media: null,
               readers: [],
+              brief: null,
             },
           ],
         },
@@ -783,6 +941,7 @@ describe("ConversationPane", () => {
               reactions: [],
               media: null,
               readers: [],
+              brief: null,
             },
           ],
         },
@@ -854,6 +1013,7 @@ describe("ConversationPane", () => {
               reactions: [],
               media: null,
               readers: [],
+              brief: null,
             },
           ],
         },
@@ -907,6 +1067,7 @@ describe("ConversationPane", () => {
               reactions: [],
               media: null,
               readers: [],
+              brief: null,
             },
           ],
         },
@@ -968,6 +1129,7 @@ describe("ConversationPane", () => {
               reactions: [],
               media: null,
               readers: [],
+              brief: null,
             },
             {
               kind: "message",
@@ -983,6 +1145,7 @@ describe("ConversationPane", () => {
               reactions: [],
               media: null,
               readers: [],
+              brief: null,
             },
           ],
         },
@@ -1041,6 +1204,7 @@ describe("ConversationPane", () => {
                 caption: null,
               },
               readers: [],
+              brief: null,
             },
           ],
         },
@@ -1118,6 +1282,7 @@ describe("ConversationPane", () => {
               reactions: [],
               media: null,
               readers: [],
+              brief: null,
             },
             {
               kind: "message",
@@ -1133,6 +1298,7 @@ describe("ConversationPane", () => {
               reactions: [],
               media: null,
               readers: [],
+              brief: null,
             },
           ],
         },
@@ -1190,6 +1356,7 @@ describe("ConversationPane — held-aware Delete (Story 8.4)", () => {
                 reactions: [],
                 media: null,
                 readers: [],
+                brief: null,
               },
             ],
           },
@@ -1967,5 +2134,110 @@ describe("ConversationPane — safe areas & keyboard-avoiding composer (Story 13
     expect(footer.className).not.toContain("kb-inset");
     expect(footer.className).not.toContain("safe-bottom");
     expect(footer.className).toContain("border-t");
+  });
+});
+
+describe("ConversationPane — an agent room", () => {
+  const NIXI = "@nixi:example.org";
+  const captured: { onBatch: ((b: TimelineBatch) => void) | null } = { onBatch: null };
+
+  function agentHeader(
+    run: AgentRunVm,
+    caretKey: string | null,
+  ): NonNullable<TimelineBatch["header"]> {
+    return {
+      status: {
+        agent: NIXI,
+        agentName: "Nixi",
+        handle: "nixi@electra",
+        host: "electra",
+        title: "Nixi",
+        kind: "main",
+        run,
+        waiting: null,
+        detail: null,
+        unreadable: null,
+      },
+      scope: null,
+      label: null,
+      scopeUnreadable: null,
+      caretKey,
+    };
+  }
+
+  function open(props: { showHeader?: boolean } = {}) {
+    subscribeTimeline.mockImplementation((_a, _r, onBatch: (b: TimelineBatch) => void) => {
+      captured.onBatch = onBatch;
+      return Promise.resolve(1);
+    });
+    roomsStore.getState().selectRoom({ accountId: account.accountId, roomId: "!nixi:example.org" });
+    render(<ConversationPane {...noopProps()} {...props} />);
+  }
+
+  function push(batch: TimelineBatch) {
+    act(() => captured.onBatch?.(batch));
+  }
+
+  /** The message bubble (by its render key) that draws the growing caret, if any. */
+  function caretOwners(): string[] {
+    return Array.from(document.querySelectorAll('[data-slot="growing-caret"]')).map(
+      (caret) => caret.closest("[data-msg-key]")?.getAttribute("data-msg-key") ?? "",
+    );
+  }
+
+  const items = [
+    messageItem("question", "@alice:example.org", "What did I write?"),
+    messageItem("old-answer", NIXI, "Earlier answer"),
+    messageItem("answer", NIXI, "Synapse"),
+  ];
+
+  it("draws the caret on the named answer only while the run is running, then removes it", async () => {
+    open();
+    push({ ops: [{ op: "reset", items }], header: agentHeader("running", "answer") });
+    await screen.findByText("Earlier answer");
+    expect(caretOwners()).toEqual(["answer"]);
+    expect(screen.getByText("(still writing)")).toBeInTheDocument();
+
+    // The answer grows by `set`; the header did not change, so the batch has none.
+    push({ ops: [{ op: "set", index: 2, item: messageItem("answer", NIXI, "Synapse took it") }] });
+    expect(await screen.findByText(/Synapse took it/)).toBeInTheDocument();
+    expect(caretOwners()).toEqual(["answer"]);
+
+    push({ ops: [], header: agentHeader("done", null) });
+    await waitFor(() => expect(caretOwners()).toEqual([]));
+    expect(screen.queryByText("(still writing)")).not.toBeInTheDocument();
+  });
+
+  it("draws no caret once the run has left running, whatever key the header still names", async () => {
+    open();
+    push({ ops: [{ op: "reset", items }], header: agentHeader("blocked", "answer") });
+    await screen.findByText("Earlier answer");
+    expect(caretOwners()).toEqual([]);
+  });
+
+  it("keeps the header through batches that carry none", async () => {
+    open();
+    push({ ops: [{ op: "reset", items }], header: agentHeader("running", "answer") });
+    push({ ops: [{ op: "pushBack", item: messageItem("more", NIXI, "More") }] });
+    await screen.findByText("More");
+    const region = screen.getByRole("region", { name: "Agent status" });
+    expect(within(region).getByText("nixi@electra")).toBeInTheDocument();
+    expect(within(region).getByTestId("agent-run")).toHaveTextContent(/^run: running$/);
+  });
+
+  it("shows the header on the phone, where the pane's own header row is hidden", async () => {
+    open({ showHeader: false });
+    push({ ops: [{ op: "reset", items }], header: agentHeader("idle", null) });
+    const region = await screen.findByRole("region", { name: "Agent status" });
+    expect(within(region).getByTestId("agent-run")).toHaveTextContent(/^run: idle$/);
+    expect(screen.queryByRole("button", { name: "Toggle detail panel" })).not.toBeInTheDocument();
+  });
+
+  it("draws no header in a room whose stream carries none", async () => {
+    open();
+    push({ ops: [{ op: "reset", items }] });
+    await screen.findByText("Earlier answer");
+    expect(screen.queryByRole("region", { name: "Agent status" })).not.toBeInTheDocument();
+    expect(caretOwners()).toEqual([]);
   });
 });

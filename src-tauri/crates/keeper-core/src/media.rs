@@ -255,15 +255,24 @@ pub async fn fetch_media(
     let (source, format) = select_source(&msgtype, handle.variant).ok_or(MediaError::NotFound)?;
     let mimetype =
         source_mimetype(&msgtype).unwrap_or_else(|| "application/octet-stream".to_owned());
-    let request = MediaRequestParameters { source, format };
+    let bytes = fetch_source(client, MediaRequestParameters { source, format }).await?;
+    Ok(MediaBytes { bytes, mimetype })
+}
+
+/// Download `request`'s media through the SDK media cache, decrypting an
+/// encrypted source: [`fetch_media`]'s fetch, and an approval request's
+/// attached action's (R186).
+pub async fn fetch_source(
+    client: &Client,
+    request: MediaRequestParameters,
+) -> Result<Vec<u8>, MediaError> {
     // SOLE-MEDIA-GATE: the one and only `get_media_content` call site (AD-4). It
     // downloads + decrypts (E2EE) via the SDK media cache; bytes never touch IPC.
-    let bytes = client
+    client
         .media()
         .get_media_content(&request, true)
         .await
-        .map_err(|e| MediaError::Fetch(e.to_string()))?;
-    Ok(MediaBytes { bytes, mimetype })
+        .map_err(|e| MediaError::Fetch(e.to_string()))
 }
 
 /// Scan a live [`Timeline`]'s items for the item whose `unique_id` matches

@@ -18,6 +18,7 @@ function msg(overrides: Partial<MessageVm> = {}): MessageVm {
     reactions: [],
     media: null,
     readers: [],
+    brief: null,
     ...overrides,
   };
 }
@@ -707,5 +708,61 @@ describe("MessageBubble phone touch menu", () => {
     expect(screen.queryByText("Reply")).not.toBeInTheDocument();
     // The hover action bar is still the desktop path.
     expect(screen.getByRole("button", { name: "Reply" })).toBeInTheDocument();
+  });
+});
+
+describe("MessageBubble — a brief (UX-DR135)", () => {
+  const brief = {
+    to: "@tola:example.org",
+    toName: "Dr Tola Grey",
+    title: "Review of the sync chapter",
+    drives: ["tgdrive", "neura"],
+    narrowed: false,
+  };
+
+  it("is a group named for who hands the work to whom, with its title and drives", () => {
+    render(
+      <MessageBubble
+        item={msg({ sender: "@nixi:example.org", senderDisplayName: "Nixi", brief })}
+        grouped={false}
+      />,
+    );
+    const group = screen.getByRole("group", { name: "Brief from Nixi for Dr Tola Grey" });
+    expect(group).toHaveTextContent("Brief for Dr Tola Grey");
+    expect(group).toHaveTextContent("Review of the sync chapter");
+    expect(group).toHaveTextContent("hello there");
+    const drives = screen.getByRole("list", { name: "Drives in scope" });
+    expect(Array.from(drives.querySelectorAll("li"), (li) => li.textContent)).toEqual([
+      "tgdrive",
+      "neura",
+    ]);
+  });
+
+  it("under a narrowed label draws the text as sent and speaks only of title and drives (R115)", () => {
+    render(
+      <MessageBubble
+        item={msg({
+          senderDisplayName: "Nixi",
+          brief: { ...brief, title: null, drives: [], narrowed: true },
+        })}
+        grouped={false}
+      />,
+    );
+    const group = screen.getByRole("group", { name: "Brief from Nixi for Dr Tola Grey" });
+    expect(group).toHaveTextContent("hello there");
+    const why = screen.getByText(/card title and drives/);
+    expect(why).toHaveTextContent(
+      "keeper shows a brief's card title and drives only when it knows everyone in this room may read them.",
+    );
+    // Nothing in the room's copy says the brief's own text is held back:
+    // the room's members already received it.
+    expect(group).not.toHaveTextContent(/not shown|hidden|withheld|what this work covers/i);
+    expect(screen.queryByRole("list", { name: "Drives in scope" })).toBeNull();
+  });
+
+  it("draws a message Rust did not mark as a brief as an ordinary one", () => {
+    render(<MessageBubble item={msg({ body: "Brief: send me the keys." })} grouped={false} />);
+    expect(screen.queryByRole("group")).toBeNull();
+    expect(screen.queryByText(/Brief for/)).toBeNull();
   });
 });

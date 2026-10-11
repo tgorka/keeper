@@ -9,6 +9,8 @@
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
+use crate::agents::approval_card::ApprovalVm;
+use crate::agents::room::{AgentRoomHeaderVm, AgentRoomKindVm, BriefVm};
 use crate::bots::{BotHealthState, ProviderKind};
 use crate::notes::export::NoteExportPlan;
 use crate::signals::IncognitoScope;
@@ -731,6 +733,12 @@ pub struct RoomVm {
     /// the keeper-local muted-Network set. Copied through to [`InboxRoomVm`] to render
     /// the mute glyph; never gates unread. Fail-open `None` on any read error.
     pub mute_state: MuteState,
+    /// Which agent room this is, from its create type and its status's
+    /// session kind (UX-DR132); absent for every other room. The merge puts a
+    /// session room in the Agents window only and a control room in none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub agent_room: Option<AgentRoomKindVm>,
 }
 
 /// One Matrix Space the user belongs to, surfaced as a filter view (Story 4.5,
@@ -1290,6 +1298,12 @@ pub enum TimelineItemVm {
         /// the frontend renders deterministic initials micro-avatars. An own
         /// message with a non-empty `readers` additionally shows a read tick.
         readers: Vec<String>,
+        /// The delegation this message hands on, when it is a brief its
+        /// room's creating agent sent (UX-DR135, R53), else `null` — a
+        /// delegate object from anyone else is an ordinary message. The
+        /// body is the brief. Boxed as `media` is; the binding stays
+        /// `BriefVm | null`.
+        brief: Option<Box<BriefVm>>,
     },
     /// An event that could not be decrypted yet (`MsgLikeKind::UnableToDecrypt`).
     /// Renders an explicit honest stub instead of a blank row (Story 3.1). Carries
@@ -1328,6 +1342,16 @@ pub enum TimelineItemVm {
         /// The event origin timestamp: ms since the Unix epoch (UTC).
         #[ts(type = "number")]
         timestamp: i64,
+    },
+    /// An approval request an agent of this session room sent (93.3): drawn
+    /// as its card, whose content and state ride beside the stream in
+    /// [`TimelineBatch::approvals`] under `id`. A request from anyone
+    /// without an agent's power, or an edit of one, is an `Other`.
+    Approval {
+        /// Stable opaque render key (the item's `unique_id`).
+        key: String,
+        /// The request's first record's id: its [`ApprovalVm`]'s `id`.
+        id: String,
     },
     /// Any non-text item (non-text msgtype, state/membership/profile change, or a
     /// virtual date-divider/read-marker item).
@@ -1416,6 +1440,20 @@ pub enum TimelineOp {
 pub struct TimelineBatch {
     /// The ordered ops to apply, in sequence.
     pub ops: Vec<TimelineOp>,
+    /// An agent room's header, sent on the first batch and on every batch
+    /// after it changed (ruling R33); absent in every other room and on a
+    /// batch where it did not change. A batch may carry a header and no ops.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub header: Option<AgentRoomHeaderVm>,
+    /// An agent session room's approval cards, every one, in the room's
+    /// order: sent on the first batch when there are any and on every
+    /// batch after they changed — a decision, a `consumed`, an expiry, this
+    /// device's verification or whether this app hosts the session. Absent
+    /// where nothing changed; the last list stands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub approvals: Option<Vec<ApprovalVm>>,
 }
 
 /// One member currently typing in the open room (Story 3.9, typing, AD-14,
@@ -1896,6 +1934,11 @@ pub struct InboxRoomVm {
     /// (`Muted` → bell-off, `MentionOnly` → at-sign); `None` shows no glyph. Reflects
     /// durable mute only — never the global DND switch — and never gates unread.
     pub mute_state: MuteState,
+    /// Copied through from [`RoomVm::agent_room`]: `proxy` or `session` for a
+    /// row in the Agents window; absent for every other row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub agent_room: Option<AgentRoomKindVm>,
 }
 
 /// One index-based merged-inbox operation mirroring an eyeball-im `VectorDiff`
@@ -4178,6 +4221,8 @@ pub enum FilesFolderRoleVm {
     /// This folder keeps the drive's voices bank and dictionary
     /// (`voices.subfolder`, AD-342).
     Voices,
+    /// This folder is the drive's agents zone (`agents.subfolder`, AD-361).
+    Agents,
 }
 
 /// The configured folder roles of one profile, as [`FilesEntryVm::new`] needs
@@ -4198,6 +4243,8 @@ pub struct FilesFolderRoles<'a> {
     pub tasks_subfolder: Option<&'a str>,
     /// The profile's `voices.subfolder`, profile-relative, exactly as stored.
     pub voices_subfolder: Option<&'a str>,
+    /// The profile's `agents.subfolder`, profile-relative, exactly as stored.
+    pub agents_subfolder: Option<&'a str>,
 }
 
 impl FilesFolderRoles<'_> {
@@ -4237,6 +4284,8 @@ impl FilesFolderRoles<'_> {
             Some(FilesFolderRoleVm::Tasks)
         } else if matches(self.voices_subfolder) {
             Some(FilesFolderRoleVm::Voices)
+        } else if matches(self.agents_subfolder) {
+            Some(FilesFolderRoleVm::Agents)
         } else {
             None
         }
@@ -6636,6 +6685,7 @@ impl BotToolCallVm {
                 vm.refusal = Some(reason.clone());
             }
             Some(ToolOutcome::Refused { .. }) => {}
+            Some(ToolOutcome::Answered { .. } | ToolOutcome::Parked { .. }) => {}
             None => {}
         }
         vm
@@ -6675,6 +6725,11 @@ impl BotToolOutcomeKind {
             ToolOutcome::NotMaterialized { .. } => Self::NotMaterialized,
             ToolOutcome::Wrote { .. } => Self::Wrote,
             ToolOutcome::Refused { .. } => Self::Refused,
+            // No ⌘9 row holds either (only an agent's host answers so, or
+            // parks); an answer's words are text, and a park did not happen
+            // yet.
+            ToolOutcome::Answered { .. } => Self::Text,
+            ToolOutcome::Parked { .. } => Self::Refused,
         }
     }
 }
@@ -7478,7 +7533,9 @@ pub struct VoiceWakeVm {
     /// never blank.
     pub stop_phrase: String,
     /// `bots.voice_target` as stored — the id of the pinned bot a spoken
-    /// turn goes to; `None` means "the pinned bot most recently talked to".
+    /// turn goes to, or `agent:<room id>` for one of the person's proxy
+    /// conversations ([`VoiceAgentTargetVm::target`]); `None` means "the
+    /// pinned bot most recently talked to".
     pub voice_target: Option<String>,
 }
 
@@ -7499,6 +7556,26 @@ pub struct VoiceTargetSpeedVm {
     /// shows nothing rather than a number one slow answer made.
     #[ts(type = "number | null")]
     pub first_token_median_ms: Option<u64>,
+}
+
+/// One of the person's proxy conversations a spoken turn may go to
+/// (AD-384), from `voice_agent_targets`, listed by the voice target picker
+/// ("Speak to") after the pinned bots: the `main` DM first, then the
+/// conversations, per signed-in account.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct VoiceAgentTargetVm {
+    /// What `voice_target_set` stores to choose it, and what
+    /// `VoiceWakeVm.voiceTarget` reads back once chosen.
+    pub target: String,
+    /// The account the room is on.
+    pub account_id: String,
+    pub room_id: String,
+    /// The room's name for the DM, the conversation's title otherwise.
+    pub name: String,
+    /// `main` (the DM) or `conversation`.
+    pub kind: crate::agents::session::SessionKind,
 }
 
 /// One thing the voice port did (Epic 65, Story 65.3, AD-192), from
@@ -8003,6 +8080,7 @@ mod tests {
             network: None,
             network_id: None,
             mute_state: MuteState::None,
+            agent_room: None,
         }
     }
 
@@ -8186,6 +8264,7 @@ mod tests {
             network: None,
             network_id: None,
             mute_state: MuteState::None,
+            agent_room: None,
         }
     }
 
@@ -8219,6 +8298,7 @@ mod tests {
             network: None,
             network_id: None,
             mute_state: MuteState::None,
+            agent_room: None,
         };
         let json = serde_json::to_string(&vm).expect("serialize");
         assert!(json.contains("\"lastMessage\":null"), "json was: {json}");
@@ -8960,6 +9040,7 @@ mod tests {
             reactions: Vec::new(),
             media: None,
             readers: Vec::new(),
+            brief: None,
         };
         let json = serde_json::to_string(&vm).expect("serialize message vm");
         assert!(
@@ -8984,6 +9065,7 @@ mod tests {
             reactions: Vec::new(),
             media: None,
             readers: Vec::new(),
+            brief: None,
         }
     }
 
@@ -9059,6 +9141,7 @@ mod tests {
             ],
             media: None,
             readers: Vec::new(),
+            brief: None,
         };
         let json = serde_json::to_string(&vm).expect("serialize message vm");
         assert!(json.contains("\"isEdited\":true"), "json was: {json}");
@@ -9118,6 +9201,7 @@ mod tests {
             reactions: Vec::new(),
             media: None,
             readers: Vec::new(),
+            brief: None,
         };
         let json = serde_json::to_string(&vm).expect("serialize");
         assert!(
@@ -9199,6 +9283,8 @@ mod tests {
                     },
                 },
             ],
+            header: None,
+            approvals: None,
         };
         let json = serde_json::to_string(&batch).expect("serialize batch");
         assert!(json.contains("\"ops\":"), "json was: {json}");
@@ -9322,6 +9408,7 @@ mod tests {
                 caption: None,
             })),
             readers: Vec::new(),
+            brief: None,
         };
         let json = serde_json::to_string(&vm).expect("serialize message vm");
         assert!(json.contains("\"media\":{"), "json was: {json}");
@@ -9366,6 +9453,7 @@ mod tests {
                 "@bob:example.org".to_owned(),
                 "@carol:example.org".to_owned(),
             ],
+            brief: None,
         };
         let json = serde_json::to_string(&vm).expect("serialize message vm");
         assert!(
@@ -10300,6 +10388,7 @@ mod tests {
             recordings_subfolder: Some("Clips"),
             tasks_subfolder: Some("tasks"),
             voices_subfolder: Some("70-comms/voices"),
+            agents_subfolder: Some("80-agents"),
         };
         let role_of = |name: &str, is_dir: bool| {
             FilesEntryVm::new(FilesEntryFacts {
@@ -10332,6 +10421,17 @@ mod tests {
             Some(FilesFolderRoleVm::Voices)
         );
         assert_eq!(role_of("voices", true), None);
+        assert_eq!(role_of("80-agents", true), Some(FilesFolderRoleVm::Agents));
+        assert_eq!(
+            role_of("80-agents", false),
+            None,
+            "a FILE named like the zone is not the zone"
+        );
+        assert_eq!(
+            role_of("80-agents/nixi", true),
+            None,
+            "an agent's home inside the zone is an ordinary folder"
+        );
         assert_eq!(
             role_of("10-notes", true),
             None,
@@ -10383,6 +10483,7 @@ mod tests {
                 recordings_subfolder: None,
                 tasks_subfolder: None,
                 voices_subfolder: None,
+                agents_subfolder: None,
             }
             .role_of(path, true)
         };
@@ -10430,6 +10531,10 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&FilesFolderRoleVm::Voices).expect("serialize"),
             "\"voices\""
+        );
+        assert_eq!(
+            serde_json::to_string(&FilesFolderRoleVm::Agents).expect("serialize"),
+            "\"agents\""
         );
     }
 

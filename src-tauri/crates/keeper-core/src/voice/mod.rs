@@ -380,6 +380,15 @@ pub struct Turn {
     /// How long the last answer's first token took, kept across turns for
     /// the "first word after" line; `None` until a turn has answered.
     last_wait_ms: Option<i64>,
+    /// The question whose answer this turn is waiting for or reading, by
+    /// generation; `None` when no answer is this turn's. A new one is
+    /// allocated with each [`Effect::SendText`], before the shell does
+    /// anything with the text, so a send still on its way for an earlier
+    /// question — abandoned, or replaced by a barge-in — can never move
+    /// this one ([`Turn::owns_answer`]).
+    question: Option<u64>,
+    /// The last generation handed out.
+    questions: u64,
 }
 
 /// What the driver knows about the answer's stream that the table does not.
@@ -420,6 +429,8 @@ impl Turn {
             answer: Answer::default(),
             sent: None,
             last_wait_ms: None,
+            question: None,
+            questions: 0,
         }
     }
 
@@ -472,6 +483,23 @@ impl Turn {
             self.state,
             TurnState::Heard { .. } | TurnState::Sending { .. }
         )
+    }
+
+    /// The question this turn's answer belongs to now, if any: the shell
+    /// takes it with the text of an [`Effect::SendText`] and hands it back
+    /// with everything the send reports.
+    pub fn question(&self) -> Option<u64> {
+        self.question
+    }
+
+    /// Whether what a send for `question` reports is this turn's to act on:
+    /// `question` is the one the turn is waiting for, or reading aloud while
+    /// the rest streams (Epic 68, AD-214). An earlier question's send — the
+    /// person stopped it, or asked again — moves nothing, whichever order
+    /// the two sends finish in.
+    pub fn owns_answer(&self, question: u64) -> bool {
+        self.question == Some(question)
+            && (self.awaiting_send() || matches!(self.state, TurnState::Speaking))
     }
 
     /// The request for what the turn heard has left (AD-215): to `bot`, at
@@ -635,6 +663,18 @@ impl Turn {
             TurnState::Idle | TurnState::Listening { .. } | TurnState::Failed { .. }
         ) {
             self.sent = None;
+        }
+        if effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::SendText(_)))
+        {
+            self.questions += 1;
+            self.question = Some(self.questions);
+        } else if !matches!(
+            next,
+            TurnState::Heard { .. } | TurnState::Sending { .. } | TurnState::Speaking
+        ) {
+            self.question = None;
         }
         self.state = next;
         if !self.meters() {

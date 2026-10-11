@@ -65,7 +65,7 @@ file-controlled instead, and says which file.
 | `bots.voice_locale` | user-global | text | *(absent)* | `"bots.voice_locale" = "en-US"` |
 | | | | | The language the voice recogniser runs in, as a locale identifier. Blank means the system locale when it can run on the device, otherwise the first that can; a language that cannot run here is refused, never silently replaced. |
 | `bots.voice_target` | user-global | text | *(absent)* | `"bots.voice_target" = "01ARZ3NDEKTSV4RRFFQ69G5FAV"` |
-| | | | | The id of the pinned bot a spoken turn goes to. Blank means the pinned bot most recently talked to; with none, the turn is refused and says so. |
+| | | | | Where a spoken turn goes: the id of a pinned bot, or `agent:<room id>` for one of your assistant's conversations (AD-384), sent there as your own message and never held for Undo-Send. Blank means the pinned bot most recently talked to; with none, the turn is refused and says so. An `agent:` room that is no longer one of your assistant's is refused, never sent to a bot instead. |
 | `bots.stop_phrase` | user-global | text | `stop` | `"bots.stop_phrase" = "stop"` |
 | | | | | The word that ends a spoken answer, as typed; matched case- and diacritic-insensitively while the answer is read aloud. |
 | `debug.mode` | user-global | boolean (`1`/`0`) | `0` | `"debug.mode" = true` |

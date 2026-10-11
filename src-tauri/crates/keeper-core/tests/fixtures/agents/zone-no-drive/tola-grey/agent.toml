@@ -1,0 +1,8 @@
+version     = 1
+id          = "tola-grey"
+name        = "Dr Tola Grey"
+kind        = "steward"
+matrix_user = "@tola-grey:example.org"
+
+[model]
+bot = "bot:ollama:http://electra.example.org:11434#qwen3:32b"

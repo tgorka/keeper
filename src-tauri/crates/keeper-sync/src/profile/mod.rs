@@ -246,6 +246,16 @@ pub const DEFAULT_TASKS_SUBFOLDER: &str = "tasks";
 /// The owner's drives say `70-comms/voices` through their own folder file.
 pub const DEFAULT_VOICES_SUBFOLDER: &str = "voices";
 
+/// Where agents live inside an agents-flagged folder, by default (AD-361).
+/// Its own constant beside [`DEFAULT_SESSIONS_SUBFOLDER`] and
+/// [`DEFAULT_VOICES_SUBFOLDER`] for the reason this module exists: one JSON
+/// blob has to mean the same thing to the app, to `keeper-syncd` and to
+/// whatever reads `sync.db` next, so the default is spelled once, here.
+///
+/// Numbered like `60-sessions/`, because it adopts the zone name the owner's
+/// drives use (`/workspace/tgdrive/README.md`), next to their sessions zone.
+pub const DEFAULT_AGENTS_SUBFOLDER: &str = "80-agents";
+
 /// When a notes-flagged profile commits, and when it pushes (FR-115, AD-62).
 ///
 /// A knob on the profile rather than a scheduler of its own: the 1 Hz
@@ -984,6 +994,119 @@ impl VoicesConfig {
     }
 }
 
+/// Why a folder that keeps agents must also hold sessions: the sentence the
+/// person reads, from the profile, the folder file or the form.
+pub const AGENTS_NEED_SESSIONS: &str = "This folder keeps agents, so it needs a sessions zone: an \
+     agent's sessions live in this folder's sessions zone. Add [folder.sessions].";
+
+/// The agents flag on a profile, and where the zone lives (AD-361).
+///
+/// `Some` means "this synced folder keeps agents": one folder per agent with
+/// its soul, memory and journal, plus the zone's own `_drive.toml`, skills,
+/// workflows and template. An agent's sessions live in the same folder's
+/// sessions zone (AD-365), so the flag is refused without `sessions`.
+///
+/// This crate stores the flag and understands nothing behind it, exactly as it
+/// does for [`VoicesConfig`]: the zone's grammar is `keeper-core`'s
+/// (`agents::drive`, `agents::zone`), and the engine sees a folder with files
+/// in it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentsConfig {
+    /// The zone root, relative to `local_path`. Never empty, never absolute,
+    /// never escaping, and never overlapping another zone of this profile —
+    /// see [`AgentsConfig::validate`] for why each is refused rather than
+    /// corrected.
+    #[serde(default = "default_agents_subfolder")]
+    pub subfolder: String,
+}
+
+impl Default for AgentsConfig {
+    fn default() -> Self {
+        Self {
+            subfolder: DEFAULT_AGENTS_SUBFOLDER.to_owned(),
+        }
+    }
+}
+
+impl AgentsConfig {
+    /// The subfolder rules, split out of [`SyncProfile::validate`] for the
+    /// reason [`VoicesConfig::validate`] is: they are about this field and not
+    /// about the profile.
+    ///
+    /// Every other zone block is passed IN, because the overlap rules are
+    /// rules about pairs, and `subfolders_overlap` is symmetric, so a zone
+    /// inside the agents zone and an agents zone inside another zone are both
+    /// refused. An agent's home holds markdown the notes indexer would claim,
+    /// and its journal has one writer that a sessions, ledger, recordings or
+    /// voices writer must never share a tree with.
+    ///
+    /// `sessions` is also REQUIRED: an agent works in sessions in this
+    /// folder's sessions zone, so an agents zone without one hosts agents that
+    /// can never open a session. The same sentence answers a new flag without
+    /// sessions and a save that turns sessions off under a folder that keeps
+    /// agents.
+    ///
+    /// Public for the reason [`VoicesConfig::validate`] is: checking a
+    /// *candidate* block against a stored profile is a thing the settings path
+    /// does before there is a `SyncProfile` to validate.
+    pub fn validate(
+        &self,
+        notes: Option<&NotesConfig>,
+        recordings: Option<&RecordingsConfig>,
+        sessions: Option<&SessionsConfig>,
+        tasks: Option<&TasksConfig>,
+        voices: Option<&VoicesConfig>,
+    ) -> Result<()> {
+        let subfolder = self.subfolder.trim();
+        // By components, not by the string: `.` and `./` are not empty and
+        // still name the profile root.
+        if subfolder_components(subfolder).next().is_none() {
+            return Err(SyncError::Config(
+                "agents subfolder must name a folder: the agents zone is a folder inside the \
+                 profile, never the profile root"
+                    .into(),
+            ));
+        }
+        // `Path::join` with an absolute right-hand side DISCARDS the left one,
+        // so an absolute subfolder would put the zone outside the synced
+        // folder, where it never travels. Tested as a string as well, because
+        // absoluteness is platform-shaped and one row is read on every machine.
+        if Path::new(subfolder).is_absolute()
+            || subfolder.starts_with('/')
+            || subfolder.starts_with('\\')
+        {
+            return Err(SyncError::Config(format!(
+                "agents subfolder must be relative to the profile folder, got {subfolder}"
+            )));
+        }
+        if subfolder.split(['/', '\\']).any(|c| c == "..") {
+            return Err(SyncError::Config(format!(
+                "agents subfolder must not escape the profile folder: {subfolder}"
+            )));
+        }
+        let Some(sessions) = sessions else {
+            return Err(SyncError::Config(AGENTS_NEED_SESSIONS.into()));
+        };
+        let others = [
+            notes.map(|notes| ("notes", notes.subfolder.trim(), "a vault")),
+            recordings.map(|rec| ("recordings", rec.subfolder.trim(), "a recordings root")),
+            Some(("sessions", sessions.subfolder.trim(), "a sessions zone")),
+            tasks.map(|tasks| ("tasks", tasks.subfolder.trim(), "a task ledger")),
+            voices.map(|voices| ("voices", voices.subfolder.trim(), "a voices bank")),
+        ];
+        for (field, other, role) in others.into_iter().flatten() {
+            if subfolders_overlap(subfolder, other) {
+                return Err(SyncError::Config(format!(
+                    "agents subfolder {subfolder} overlaps {field} subfolder {other}: one folder \
+                     cannot be both {role} and an agents zone"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// The path components of a profile-relative subfolder.
 ///
 /// Empty and `.` components are dropped so `./a//b` compares as `a/b`, and both
@@ -1305,6 +1428,16 @@ pub struct SyncProfile {
     /// `None` is "keeps no voices", never "voices with the defaults".
     #[serde(default)]
     pub voices: Option<VoicesConfig>,
+    /// This folder keeps agents, and where inside it (AD-361).
+    ///
+    /// `#[serde(default)]` here IS the migration, exactly as it is for
+    /// `voices` above: a row written by a keeper that had never heard of
+    /// agents simply has no `agents` key, so it loads as `None` and says
+    /// nothing.
+    ///
+    /// `None` is "keeps no agents", never "agents with the defaults".
+    #[serde(default)]
+    pub agents: Option<AgentsConfig>,
 }
 
 fn default_lfs_threshold() -> u64 {
@@ -1336,6 +1469,9 @@ fn default_tasks_subfolder() -> String {
 }
 fn default_voices_subfolder() -> String {
     DEFAULT_VOICES_SUBFOLDER.to_owned()
+}
+fn default_agents_subfolder() -> String {
+    DEFAULT_AGENTS_SUBFOLDER.to_owned()
 }
 fn default_journal_template() -> String {
     DEFAULT_JOURNAL_TEMPLATE.to_owned()
@@ -1384,6 +1520,7 @@ impl SyncProfile {
             sessions: None,
             tasks: None,
             voices: None,
+            agents: None,
         }
     }
 
@@ -1528,6 +1665,18 @@ impl SyncProfile {
             .map(|voices| self.local_path.join(voices.subfolder.trim()))
     }
 
+    /// The agents zone root — `local_path` joined with the agents subfolder —
+    /// or `None` when this profile keeps no agents.
+    ///
+    /// Beside [`Self::voices_root`] and for the same reason: one answer to
+    /// "where does this profile's zone live", and [`Self::validate`] has
+    /// already refused a subfolder that would leave `local_path`.
+    pub fn agents_root(&self) -> Option<PathBuf> {
+        self.agents
+            .as_ref()
+            .map(|agents| self.local_path.join(agents.subfolder.trim()))
+    }
+
     /// Keychain key for this profile's remote credential. Never the secret.
     pub fn secret_key(&self) -> String {
         format!("sync/{}/credential", self.id)
@@ -1667,6 +1816,17 @@ impl SyncProfile {
         // already checked, for the reason the ledger comes last above.
         if let Some(voices) = &self.voices {
             voices.validate(self.notes.as_ref(), self.recordings.as_ref())?;
+        }
+        // Last, given every other zone, all already checked: the agents zone
+        // is compared against each of them, and needs the sessions zone.
+        if let Some(agents) = &self.agents {
+            agents.validate(
+                self.notes.as_ref(),
+                self.recordings.as_ref(),
+                self.sessions.as_ref(),
+                self.tasks.as_ref(),
+                self.voices.as_ref(),
+            )?;
         }
         Ok(())
     }
@@ -2975,5 +3135,188 @@ mod tests {
             subfolder: "70-comms/voices".to_owned(),
         });
         assert!(p.validate().is_ok(), "sibling folders are not an overlap");
+    }
+
+    fn sessions_beside() -> Option<SessionsConfig> {
+        Some(SessionsConfig {
+            subfolder: "60-sessions".to_owned(),
+        })
+    }
+
+    #[test]
+    fn agents_default_subfolder_is_80_agents_and_an_empty_table_means_on() {
+        let sparse: AgentsConfig = serde_json::from_str("{}").expect("parse");
+        assert_eq!(sparse.subfolder, "80-agents");
+        assert_eq!(sparse.subfolder, DEFAULT_AGENTS_SUBFOLDER);
+
+        let mut p = profile();
+        p.sessions = sessions_beside();
+        p.agents = Some(sparse);
+        assert_eq!(
+            p.agents_root(),
+            Some(PathBuf::from("/home/u/tgdrive/80-agents"))
+        );
+        assert!(p.validate().is_ok());
+
+        p.agents = Some(AgentsConfig {
+            subfolder: " 80-agents ".to_owned(),
+        });
+        assert_eq!(
+            p.agents_root(),
+            Some(PathBuf::from("/home/u/tgdrive/80-agents")),
+            "trimmed, as every other subfolder is"
+        );
+        assert!(p.validate().is_ok());
+    }
+
+    #[test]
+    fn an_agents_subfolder_that_leaves_the_profile_folder_is_refused() {
+        for bad in [
+            "",
+            "   ",
+            ".",
+            "./",
+            "/abs/agents",
+            "\\agents",
+            "..",
+            "../agents",
+            "a/../..",
+        ] {
+            let mut p = profile();
+            p.sessions = sessions_beside();
+            p.agents = Some(AgentsConfig {
+                subfolder: bad.to_owned(),
+            });
+            assert!(
+                matches!(&p.validate(), Err(SyncError::Config(m)) if m.starts_with("agents subfolder")),
+                "{bad:?} must be refused naming the field, got {:?}",
+                p.validate()
+            );
+        }
+    }
+
+    /// An agents zone may not be another zone, sit inside one or contain one,
+    /// whichever zone it is. Each refusal comes from the agents rule — no
+    /// other zone checks against agents — so a pair is refused both ways.
+    #[test]
+    fn an_agents_zone_overlapping_another_zone_is_refused_both_ways() {
+        let pairs = [
+            ("zone", "zone"),
+            ("zone", "zone/80-agents"),
+            ("80-agents/zone", "80-agents"),
+        ];
+        for field in ["notes", "recordings", "sessions", "tasks", "voices"] {
+            for (other, agents) in pairs {
+                let mut p = profile();
+                p.sessions = sessions_beside();
+                match field {
+                    "notes" => {
+                        p.notes = Some(NotesConfig {
+                            subfolder: other.to_owned(),
+                            ..NotesConfig::default()
+                        })
+                    }
+                    "recordings" => {
+                        p.recordings = Some(RecordingsConfig {
+                            subfolder: other.to_owned(),
+                            ..RecordingsConfig::default()
+                        })
+                    }
+                    "sessions" => {
+                        p.sessions = Some(SessionsConfig {
+                            subfolder: other.to_owned(),
+                        })
+                    }
+                    "tasks" => {
+                        p.tasks = Some(TasksConfig {
+                            subfolder: other.to_owned(),
+                        })
+                    }
+                    _ => {
+                        p.voices = Some(VoicesConfig {
+                            subfolder: other.to_owned(),
+                        })
+                    }
+                }
+                assert!(p.validate().is_ok(), "{field} {other:?} alone is fine");
+                p.agents = Some(AgentsConfig {
+                    subfolder: agents.to_owned(),
+                });
+                let named = format!("overlaps {field} subfolder {other}");
+                assert!(
+                    matches!(&p.validate(), Err(SyncError::Config(m))
+                        if m.starts_with("agents subfolder") && m.contains(&named)),
+                    "agents {agents:?} against {field} {other:?}: {:?}",
+                    p.validate()
+                );
+            }
+        }
+
+        // tgdrive's layout: every zone a sibling of `80-agents`.
+        let mut p = profile();
+        p.notes = Some(NotesConfig {
+            subfolder: "10-notes".to_owned(),
+            ..NotesConfig::default()
+        });
+        p.recordings = Some(RecordingsConfig {
+            subfolder: "recordings".to_owned(),
+            ..RecordingsConfig::default()
+        });
+        p.sessions = sessions_beside();
+        p.tasks = Some(TasksConfig {
+            subfolder: "tasks".to_owned(),
+        });
+        p.voices = Some(VoicesConfig {
+            subfolder: "70-comms/voices".to_owned(),
+        });
+        p.agents = Some(AgentsConfig::default());
+        assert!(p.validate().is_ok(), "80-agents beside 60-sessions");
+    }
+
+    #[test]
+    fn an_agents_zone_without_a_sessions_zone_is_refused_naming_folder_sessions() {
+        let sentence = "This folder keeps agents, so it needs a sessions zone: an agent's \
+                        sessions live in this folder's sessions zone. Add [folder.sessions].";
+        let mut p = profile();
+        p.agents = Some(AgentsConfig::default());
+        assert!(matches!(&p.validate(), Err(SyncError::Config(m)) if m == sentence));
+
+        // The converse: a save that turns sessions off under a folder that
+        // keeps agents.
+        let mut kept = profile();
+        kept.sessions = sessions_beside();
+        kept.agents = Some(AgentsConfig::default());
+        assert!(kept.validate().is_ok());
+        kept.sessions = None;
+        assert!(matches!(&kept.validate(), Err(SyncError::Config(m)) if m == sentence));
+    }
+
+    #[test]
+    fn a_profile_row_from_before_agents_loads_without_the_flag() {
+        let before = r#"{
+            "id": "01JOLD", "name": "tgdrive", "localPath": "/home/u/tgdrive",
+            "remoteUrl": "https://git.example/u/tgdrive.git", "branch": "main",
+            "direction": "bidirectional", "lane": "main",
+            "subpaths": [], "excludes": [], "removable": false, "volumeId": null,
+            "lfsMode": "materialize", "lfsThresholdBytes": 4194304,
+            "lfsPruneLocal": false, "lfsNever": [],
+            "settleMs": 5000, "pollIntervalMs": 15000, "tags": [],
+            "commitSubjectTemplate": "", "authorOverride": null, "enabled": true,
+            "notes": null, "recordings": null,
+            "sessions": {"subfolder": "60-sessions"},
+            "tasks": null, "voices": {"subfolder": "70-comms/voices"}
+        }"#;
+        let parsed: SyncProfile = serde_json::from_str(before).expect("an older row still loads");
+        assert_eq!(parsed.agents, None, "an absent key means: keeps no agents");
+        assert_eq!(parsed.agents_root(), None);
+        assert!(parsed.validate().is_ok());
+
+        let mut armed = parsed.clone();
+        armed.agents = Some(AgentsConfig::default());
+        for p in [parsed, armed] {
+            let round = serde_json::to_string(&p).expect("encode");
+            let back: SyncProfile = serde_json::from_str(&round).expect("decode");
+            assert_eq!(back, p);
+        }
     }
 }

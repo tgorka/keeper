@@ -42,6 +42,7 @@ import {
   AddFolderForm,
   SYNC_ADD_SUBMIT_LABEL,
   SYNC_ADVANCED_TOGGLE_TESTID,
+  SYNC_AGENTS_LABEL,
   SYNC_AUTHOR_LABEL,
   SYNC_BRANCH_LABEL,
   SYNC_CHOOSE_FOLDER_LABEL,
@@ -201,6 +202,8 @@ function profileVm(over: Partial<SyncProfileVm> = {}): SyncProfileVm {
     recordingsSubfolder: "recordings",
     voices: false,
     voicesSubfolder: "voices",
+    agents: false,
+    agentsSubfolder: "80-agents",
     sessions: false,
     sessionsSubfolder: "60-sessions",
     tasks: false,
@@ -666,6 +669,8 @@ describe("AddFolderForm editing an existing folder", () => {
         recordingsSubfolder: null,
         voices: false,
         voicesSubfolder: null,
+        agents: false,
+        agentsSubfolder: null,
         sessions: false,
         sessionsSubfolder: null,
         tasks: false,
@@ -1121,6 +1126,107 @@ describe("AddFolderForm voices", () => {
     expect(screen.getByLabelText("Voices subfolder")).toHaveValue("../elsewhere");
     expect(mockSave).toHaveBeenCalledWith(
       expect.objectContaining({ voices: true, voicesSubfolder: "../elsewhere" }),
+    );
+  });
+});
+
+describe("AddFolderForm agents switch (AD-361, UX-DR127)", () => {
+  const NEEDS_SESSIONS =
+    "This folder keeps agents, so it needs a sessions zone: an agent's sessions live in this folder's sessions zone. Add [folder.sessions].";
+
+  /** A folder that keeps agents beside its sessions zone, as Rust reports it. */
+  function keeping(over: Partial<SyncProfileVm> = {}): SyncProfileVm {
+    return profileVm({
+      id: "p9",
+      name: "tgdrive",
+      localPath: "/Volumes/merope/tgdrive",
+      sessions: true,
+      sessionsSubfolder: "60-sessions",
+      agents: true,
+      agentsSubfolder: "80-agents",
+      ...over,
+    });
+  }
+
+  it("is on screen only while the folder has sessions", async () => {
+    render(<AddFolderForm />);
+    await fillRequired();
+    expect(screen.queryByRole("switch", { name: SYNC_AGENTS_LABEL })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByLabelText(SYNC_SESSIONS_LABEL));
+    expect(screen.getByRole("switch", { name: SYNC_AGENTS_LABEL })).toBeEnabled();
+    fireEvent.click(screen.getByLabelText(SYNC_SESSIONS_LABEL));
+    expect(screen.queryByRole("switch", { name: SYNC_AGENTS_LABEL })).not.toBeInTheDocument();
+  });
+
+  it("flags a new folder and leaves an empty subfolder to keeper", async () => {
+    mockSave.mockResolvedValue(keeping());
+    render(<AddFolderForm />);
+    await fillRequired();
+    fireEvent.click(screen.getByLabelText(SYNC_SESSIONS_LABEL));
+    fireEvent.click(screen.getByRole("switch", { name: SYNC_AGENTS_LABEL }));
+    fireEvent.click(screen.getByRole("button", { name: SYNC_ADD_SUBMIT_LABEL }));
+    await waitFor(() =>
+      expect(mockSave).toHaveBeenCalledWith(
+        expect.objectContaining({ sessions: true, agents: true, agentsSubfolder: null }),
+      ),
+    );
+  });
+
+  it("sends a typed subfolder trimmed", async () => {
+    mockSave.mockResolvedValue(keeping());
+    render(<AddFolderForm />);
+    await fillRequired();
+    fireEvent.click(screen.getByLabelText(SYNC_SESSIONS_LABEL));
+    fireEvent.click(screen.getByRole("switch", { name: SYNC_AGENTS_LABEL }));
+    fireEvent.change(screen.getByLabelText("Agents subfolder"), {
+      target: { value: " zones/agents " },
+    });
+    fireEvent.click(screen.getByRole("button", { name: SYNC_ADD_SUBMIT_LABEL }));
+    await waitFor(() =>
+      expect(mockSave).toHaveBeenCalledWith(
+        expect.objectContaining({ agents: true, agentsSubfolder: "zones/agents" }),
+      ),
+    );
+  });
+
+  it("unflagging asks for the block to be removed, not emptied", async () => {
+    mockSave.mockResolvedValue(keeping({ agents: false }));
+    render(<AddFolderForm profile={keeping()} />);
+    await waitFor(() => expect(mockGetCredential).toHaveBeenCalledWith("p9"));
+    expect(screen.getByLabelText("Agents subfolder")).toHaveValue("80-agents");
+    fireEvent.click(screen.getByRole("switch", { name: SYNC_AGENTS_LABEL }));
+    fireEvent.click(screen.getByRole("button", { name: SYNC_EDIT_SUBMIT_LABEL }));
+    await waitFor(() =>
+      expect(mockSave).toHaveBeenCalledWith(
+        expect.objectContaining({ agents: false, agentsSubfolder: null }),
+      ),
+    );
+  });
+
+  it("locks the switch with the folder-file sentence when the folder file owns agents", async () => {
+    mockSave.mockResolvedValue(keeping({ folderOwned: ["agents"] }));
+    render(<AddFolderForm profile={keeping({ folderOwned: ["agents"] })} />);
+    await waitFor(() => expect(mockGetCredential).toHaveBeenCalledWith("p9"));
+    expect(screen.getByRole("switch", { name: SYNC_AGENTS_LABEL })).toBeDisabled();
+    expect(screen.getByText(syncFolderOwnedNote("agents"))).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: SYNC_EDIT_SUBMIT_LABEL }));
+    await waitFor(() =>
+      expect(mockSave).toHaveBeenCalledWith(
+        expect.objectContaining({ agents: null, agentsSubfolder: null }),
+      ),
+    );
+  });
+
+  it("shows Rust's sentence when sessions are turned off under a folder that keeps agents", async () => {
+    mockSave.mockRejectedValue({ code: "internal", message: NEEDS_SESSIONS });
+    render(<AddFolderForm profile={keeping()} />);
+    await waitFor(() => expect(mockGetCredential).toHaveBeenCalledWith("p9"));
+    fireEvent.click(screen.getByLabelText(SYNC_SESSIONS_LABEL));
+    expect(screen.queryByRole("switch", { name: SYNC_AGENTS_LABEL })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: SYNC_EDIT_SUBMIT_LABEL }));
+    expect(await screen.findByText(NEEDS_SESSIONS)).toBeVisible();
+    expect(mockSave).toHaveBeenCalledWith(
+      expect.objectContaining({ sessions: false, agents: true }),
     );
   });
 });
@@ -1950,6 +2056,7 @@ describe("AddFolderForm prefilled from an account offer (Epic 84, UX-DR118)", ()
         prefill={driveOffer({
           recordings: "recordings",
           voices: "voices",
+          agents: "80-agents",
           sessions: "60-sessions",
           tasks: "ledger",
         })}
@@ -1967,6 +2074,8 @@ describe("AddFolderForm prefilled from an account offer (Epic 84, UX-DR118)", ()
       recordingsSubfolder: null,
       voices: null,
       voicesSubfolder: null,
+      agents: null,
+      agentsSubfolder: null,
       sessions: false,
       sessionsSubfolder: null,
       tasks: null,

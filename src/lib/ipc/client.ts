@@ -335,7 +335,31 @@ export type { AccountSetupVm } from "./gen/AccountSetupVm";
 export type { AccountShareVm } from "./gen/AccountShareVm";
 export type { AccountStateVm } from "./gen/AccountStateVm";
 export type { AccountVm } from "./gen/AccountVm";
+export type { AgentCopyVm } from "./gen/AgentCopyVm";
+export type { AgentFocusReq } from "./gen/AgentFocusReq";
+export type { AgentPersonVm } from "./gen/AgentPersonVm";
+export type { AgentPinReq } from "./gen/AgentPinReq";
+export type { AgentPinState } from "./gen/AgentPinState";
+export type { AgentPinVm } from "./gen/AgentPinVm";
+export type { AgentRoomHeaderVm } from "./gen/AgentRoomHeaderVm";
+export type { AgentRoomKindVm } from "./gen/AgentRoomKindVm";
+export type { AgentRunVm } from "./gen/AgentRunVm";
+export type { AgentSeedAgentVm } from "./gen/AgentSeedAgentVm";
+export type { AgentSeedBotVm } from "./gen/AgentSeedBotVm";
+export type { AgentSeedFolderVm } from "./gen/AgentSeedFolderVm";
+export type { AgentSeedOfferVm } from "./gen/AgentSeedOfferVm";
+export type { AgentSeedPlanVm } from "./gen/AgentSeedPlanVm";
+export type { AgentSeedReq } from "./gen/AgentSeedReq";
+export type { AgentSeedResultVm } from "./gen/AgentSeedResultVm";
+export type { AgentStatusVm } from "./gen/AgentStatusVm";
+export type { ApprovalCardVm } from "./gen/ApprovalCardVm";
+export type { ApprovalDecideReq } from "./gen/ApprovalDecideReq";
+export type { ApprovalDecision } from "./gen/ApprovalDecision";
 export type { ApprovalDraftVm } from "./gen/ApprovalDraftVm";
+export type { ApprovalPersonVm } from "./gen/ApprovalPersonVm";
+export type { ApprovalScope } from "./gen/ApprovalScope";
+export type { ApprovalStateVm } from "./gen/ApprovalStateVm";
+export type { ApprovalVm } from "./gen/ApprovalVm";
 export type { AuditOutcome } from "./gen/AuditOutcome";
 export type { AuditVerdict } from "./gen/AuditVerdict";
 export type { AutoUpdateHold } from "./gen/AutoUpdateHold";
@@ -395,9 +419,12 @@ export type { BridgeLoginVm } from "./gen/BridgeLoginVm";
 export type { BridgeNetworkVm } from "./gen/BridgeNetworkVm";
 export type { BridgeSessionHealthVm } from "./gen/BridgeSessionHealthVm";
 export type { BridgeStatus } from "./gen/BridgeStatus";
+export type { BriefVm } from "./gen/BriefVm";
 export type { CapabilitiesVm } from "./gen/CapabilitiesVm";
 export type { CaptureTargetVm } from "./gen/CaptureTargetVm";
 export type { CaptureWindowVm } from "./gen/CaptureWindowVm";
+export type { CardAgentVm } from "./gen/CardAgentVm";
+export type { CardKeyVm } from "./gen/CardKeyVm";
 export type { ChatNotifyMode } from "./gen/ChatNotifyMode";
 export type { ConfigFaultVm } from "./gen/ConfigFaultVm";
 export type { ConfigLayersVm } from "./gen/ConfigLayersVm";
@@ -412,6 +439,7 @@ export type { CouplingCaveatVm } from "./gen/CouplingCaveatVm";
 export type { CredentialChoicesVm } from "./gen/CredentialChoicesVm";
 export type { CredentialChoiceVm } from "./gen/CredentialChoiceVm";
 export type { DaemonPresence } from "./gen/DaemonPresence";
+export type { DeclassifyVm } from "./gen/DeclassifyVm";
 export type { DemoBatch } from "./gen/DemoBatch";
 export type { DemoItem } from "./gen/DemoItem";
 export type { DeviceClassVm } from "./gen/DeviceClassVm";
@@ -467,7 +495,9 @@ export type { IncognitoScope } from "./gen/IncognitoScope";
 export type { IncognitoVm } from "./gen/IncognitoVm";
 export type { IpcError } from "./gen/IpcError";
 export type { IpcErrorCode } from "./gen/IpcErrorCode";
+export type { LabelVm } from "./gen/LabelVm";
 export type { LifecyclePhase } from "./gen/LifecyclePhase";
+export type { LineSpan } from "./gen/LineSpan";
 export type { LoginFieldVm } from "./gen/LoginFieldVm";
 export type { LoginFlowVm } from "./gen/LoginFlowVm";
 export type { MatrixOfferVm } from "./gen/MatrixOfferVm";
@@ -562,6 +592,7 @@ export type { PingVm } from "./gen/PingVm";
 export type { Provider } from "./gen/Provider";
 export type { ProviderKind } from "./gen/ProviderKind";
 export type { ProviderOfferVm } from "./gen/ProviderOfferVm";
+export type { ProxyRoomVm } from "./gen/ProxyRoomVm";
 export type { ReactionGroupVm } from "./gen/ReactionGroupVm";
 export type { RecordingApplicationVm } from "./gen/RecordingApplicationVm";
 export type { RecordingCaptureSourcesPatchVm } from "./gen/RecordingCaptureSourcesPatchVm";
@@ -594,12 +625,15 @@ export type { RoomListBatch } from "./gen/RoomListBatch";
 export type { RoomListOp } from "./gen/RoomListOp";
 export type { RoomVm } from "./gen/RoomVm";
 export type { SasEmojiVm } from "./gen/SasEmojiVm";
+export type { ScopeDriveVm } from "./gen/ScopeDriveVm";
+export type { ScopeOfferVm } from "./gen/ScopeOfferVm";
 export type { ScreenRecordingAccess } from "./gen/ScreenRecordingAccess";
 export type { SearchFilterVm } from "./gen/SearchFilterVm";
 export type { SearchHitVm } from "./gen/SearchHitVm";
 export type { SendState } from "./gen/SendState";
 export type { SessionDetailVm } from "./gen/SessionDetailVm";
 export type { SessionEntryVm } from "./gen/SessionEntryVm";
+export type { SessionKind } from "./gen/SessionKind";
 export type { SessionLogEntryVm } from "./gen/SessionLogEntryVm";
 export type { SessionMigrationVm } from "./gen/SessionMigrationVm";
 export type { SessionPatternFileVm } from "./gen/SessionPatternFileVm";
@@ -634,6 +668,10 @@ export type { SlidesVm } from "./gen/SlidesVm";
 export type { SlideVm } from "./gen/SlideVm";
 export type { SpacesSnapshot } from "./gen/SpacesSnapshot";
 export type { SpaceVm } from "./gen/SpaceVm";
+export type { SurfaceAnswerReq } from "./gen/SurfaceAnswerReq";
+export type { SurfaceOutcome } from "./gen/SurfaceOutcome";
+export type { SurfaceRequestVm } from "./gen/SurfaceRequestVm";
+export type { SurfaceTool } from "./gen/SurfaceTool";
 export type { SyncActivityVm } from "./gen/SyncActivityVm";
 export type { SyncDeviceVm } from "./gen/SyncDeviceVm";
 export type { SyncFootprintVm } from "./gen/SyncFootprintVm";
@@ -686,6 +724,7 @@ export type { UnknownBotGrantVm } from "./gen/UnknownBotGrantVm";
 export type { UnknownTaskVm } from "./gen/UnknownTaskVm";
 export type { VerificationFlowVm } from "./gen/VerificationFlowVm";
 export type { VerificationPhase } from "./gen/VerificationPhase";
+export type { VoiceAgentTargetVm } from "./gen/VoiceAgentTargetVm";
 export type { VoiceEventVm } from "./gen/VoiceEventVm";
 export type { VoiceStateVm } from "./gen/VoiceStateVm";
 export type { VoiceTargetSpeedVm } from "./gen/VoiceTargetSpeedVm";
@@ -701,6 +740,14 @@ export type { WordsVm } from "./gen/WordsVm";
 import type { AccountSetupVm } from "./gen/AccountSetupVm";
 import type { AccountShareVm } from "./gen/AccountShareVm";
 import type { AccountVm } from "./gen/AccountVm";
+import type { AgentCopyVm } from "./gen/AgentCopyVm";
+import type { AgentFocusReq } from "./gen/AgentFocusReq";
+import type { AgentPinReq } from "./gen/AgentPinReq";
+import type { AgentSeedOfferVm } from "./gen/AgentSeedOfferVm";
+import type { AgentSeedPlanVm } from "./gen/AgentSeedPlanVm";
+import type { AgentSeedReq } from "./gen/AgentSeedReq";
+import type { AgentSeedResultVm } from "./gen/AgentSeedResultVm";
+import type { ApprovalDecideReq } from "./gen/ApprovalDecideReq";
 import type { ApprovalDraftVm } from "./gen/ApprovalDraftVm";
 import type { BackupStatus } from "./gen/BackupStatus";
 import type { BbctlAvailabilityVm } from "./gen/BbctlAvailabilityVm";
@@ -806,6 +853,7 @@ import type { PacedWorkVm } from "./gen/PacedWorkVm";
 import type { PaginationStatusBatch } from "./gen/PaginationStatusBatch";
 import type { PaletteMode } from "./gen/PaletteMode";
 import type { PaletteResultsVm } from "./gen/PaletteResultsVm";
+import type { ProxyRoomVm } from "./gen/ProxyRoomVm";
 import type { RecordingCaptureSourcesPatchVm } from "./gen/RecordingCaptureSourcesPatchVm";
 import type { RecordingCaptureSourcesVm } from "./gen/RecordingCaptureSourcesVm";
 import type { RecordingFilterVm } from "./gen/RecordingFilterVm";
@@ -845,6 +893,8 @@ import type { SessionSpaceVm } from "./gen/SessionSpaceVm";
 import type { SessionTemplateEntryVm } from "./gen/SessionTemplateEntryVm";
 import type { SessionTreeVm } from "./gen/SessionTreeVm";
 import type { SpacesSnapshot } from "./gen/SpacesSnapshot";
+import type { SurfaceAnswerReq } from "./gen/SurfaceAnswerReq";
+import type { SurfaceRequestVm } from "./gen/SurfaceRequestVm";
 import type { SyncActivityVm } from "./gen/SyncActivityVm";
 import type { SyncDeviceVm } from "./gen/SyncDeviceVm";
 import type { SyncFootprintVm } from "./gen/SyncFootprintVm";
@@ -875,6 +925,7 @@ import type { TemplateUpdateResultVm } from "./gen/TemplateUpdateResultVm";
 import type { TimelineBatch } from "./gen/TimelineBatch";
 import type { TypingBatch } from "./gen/TypingBatch";
 import type { VerificationFlowVm } from "./gen/VerificationFlowVm";
+import type { VoiceAgentTargetVm } from "./gen/VoiceAgentTargetVm";
 import type { VoiceEventVm } from "./gen/VoiceEventVm";
 import type { VoiceStateVm } from "./gen/VoiceStateVm";
 import type { VoiceTargetSpeedVm } from "./gen/VoiceTargetSpeedVm";
@@ -1592,17 +1643,22 @@ export async function unsubscribeRoomList(accountId: string, id: number): Promis
  * Favorites window (favourited rooms, recency order) to `onFavourites` (each a
  * `Reset` window that updates as accounts sync or as archive/pin/favourite state
  * changes). Resolves with the inbox subscription id — one
- * {@link unsubscribeInbox} tears down all four. Ordering and the four-way split
+ * {@link unsubscribeInbox} tears down all of them. Ordering and the split
  * are computed in Rust — never re-derived here. Rejects with the {@link IpcError}
  * envelope (`code: "syncUnavailable"`) on a stream-start failure.
  *
  * All channels arm their `onmessage` before `invoke` (the ordering is
  * load-bearing per AD-8, so no batch sent by a spawned task is dropped). The Rust
  * command's params are `channel` (inbox), `archive`, `pins`, `favourites`,
- * `spaces`, and `networks`. The fifth channel (Story 4.5) delivers the aggregated
- * Space list as a whole {@link SpacesSnapshot}; the sixth (Story 4.6) delivers the
- * distinct-Networks list as a whole {@link NetworksSnapshot} (no diff protocol for
- * either — the frontend replaces its list).
+ * `agents`, `spaces`, and `networks`. The `spaces` channel (Story 4.5) delivers
+ * the aggregated Space list as a whole {@link SpacesSnapshot}; `networks` (Story
+ * 4.6) delivers the distinct-Networks list as a whole {@link NetworksSnapshot}
+ * (no diff protocol for either — the frontend replaces its list). `agents`
+ * delivers the Agents window to `onAgents`: every agent session room, in
+ * recency order, and only there, whatever Space or Network is selected — a
+ * row's `agentRoom` says `proxy`, `session` or `unknown` (no status read
+ * yet); an agents' control room is in no window (UX-DR132). Without
+ * `onAgents` the Agents window's batches are dropped.
  */
 export async function subscribeInbox(
   onInbox: (batch: InboxBatch) => void,
@@ -1611,17 +1667,20 @@ export async function subscribeInbox(
   onFavourites: (batch: InboxBatch) => void,
   onSpaces: (snapshot: SpacesSnapshot) => void,
   onNetworks: (snapshot: NetworksSnapshot) => void,
+  onAgents?: (batch: InboxBatch) => void,
 ): Promise<number> {
   const channel = new Channel<InboxBatch>();
   const archive = new Channel<InboxBatch>();
   const pins = new Channel<InboxBatch>();
   const favourites = new Channel<InboxBatch>();
+  const agents = new Channel<InboxBatch>();
   const spaces = new Channel<SpacesSnapshot>();
   const networks = new Channel<NetworksSnapshot>();
   channel.onmessage = onInbox;
   archive.onmessage = onArchive;
   pins.onmessage = onPins;
   favourites.onmessage = onFavourites;
+  agents.onmessage = onAgents ?? (() => {});
   spaces.onmessage = onSpaces;
   networks.onmessage = onNetworks;
   return await invoke<number>("inbox_subscribe", {
@@ -1629,6 +1688,7 @@ export async function subscribeInbox(
     archive,
     pins,
     favourites,
+    agents,
     spaces,
     networks,
   });
@@ -6837,6 +6897,27 @@ export async function sessionsTaskMove(
 }
 
 /**
+ * A person's *Allow* on a card whose schedule an agent wrote (92.2, UX-DR134):
+ * the card's `scheduled_by:` becomes `allowed_by:` naming the person, and
+ * nothing else in the file changes. The shell finds the person (R118): the
+ * account signed in on this device whose user owns the drive, else the only
+ * one signed in. Offer it only on a card whose {@link CardAgentVm} carries
+ * `scheduledBy`.
+ *
+ * Rejects with: `internal` (no such account — "Sign in as <owner> to allow
+ * this schedule." — unknown root or session, a card since moved or deleted,
+ * no schedule to allow, a card rewritten twice while it was being allowed),
+ * `unsupported`.
+ */
+export async function sessionsTaskAllowSchedule(
+  rootId: string,
+  sessionId: string,
+  rel: string,
+): Promise<void> {
+  await invoke<null>("sessions_task_allow_schedule", { rootId, sessionId, rel });
+}
+
+/**
  * Everything a new session can be shaped from (FR-253): the zone's own
  * `_template/` first, then every session in the root, newest change first.
  * Each pattern carries its own preview — what creating from it copies, and
@@ -7221,6 +7302,259 @@ export async function syncPacedWork(): Promise<PacedWorkVm[]> {
  */
 export async function syncTaskSchedulePreview(expression: string): Promise<TaskSchedulePreviewVm> {
   return await invoke<TaskSchedulePreviewVm>("sync_task_schedule_preview", { expression });
+}
+
+// ---------------------------------------------------------------------------
+// Agents on this Mac (Story 90.6)
+//
+// Registered in the DESKTOP splice of the `invoke_handler` literal: a phone is
+// never an agents host. Settings renders the section only where
+// `CapabilitiesVm.botTools` is true, so nothing on a phone calls these.
+// ---------------------------------------------------------------------------
+
+/**
+ * One row per agent of this person's folders flagged for agents: whether its
+ * copy is signed in on this Mac, its drive's pin, and why it is not hosted
+ * here when it is not. Empty where no flagged folder has an agent.
+ *
+ * Rejects with: `internal`.
+ */
+export async function agentsCopies(): Promise<AgentCopyVm[]> {
+  return await invoke<AgentCopyVm[]>("agents_copies");
+}
+
+/**
+ * Sign `agent` of the folder `profileId` in on this Mac. The first sign-in for
+ * a drive pins `pin` — the owner, readers and local-only setting the person
+ * was shown — and Rust refuses when `_drive.toml` says something else by now.
+ * `pin` is `null` for a drive already pinned.
+ *
+ * Rejects with: `internal`, its message the sentence to show (a wrong password
+ * included).
+ */
+export async function agentsCopySignIn(
+  profileId: string,
+  agent: string,
+  password: string,
+  pin: AgentPinReq | null,
+): Promise<AgentCopyVm> {
+  return await invoke<AgentCopyVm>("agents_copy_sign_in", { profileId, agent, password, pin });
+}
+
+/**
+ * *Review readers*: pin what `_drive.toml` says now for the folder
+ * `profileId`, only when it is `pin` — what the person was shown. Nothing
+ * re-pins without this call. Answers every row again.
+ *
+ * Rejects with: `internal`.
+ */
+export async function agentsDriveRepin(
+  profileId: string,
+  pin: AgentPinReq,
+): Promise<AgentCopyVm[]> {
+  return await invoke<AgentCopyVm[]>("agents_drive_repin", { profileId, pin });
+}
+
+/**
+ * *Set up agents* (story 91.5, UX-DR133): every synced folder that keeps agents
+ * (`[folder.agents]`) with the drive id, owner and readers its form starts
+ * from, the catalogue (Nixi, Dr Tola Grey, Dr Lucyna Novak), the signed-in
+ * Matrix accounts, and the person's own bots. No bot is preselected (S-20).
+ * A folder whose `problem` is set cannot be seeded from this Mac.
+ *
+ * Rejects with: `internal`.
+ */
+export async function agentsSeedOffer(): Promise<AgentSeedOfferVm> {
+  return await invoke<AgentSeedOfferVm>("agents_seed_offer");
+}
+
+/**
+ * The zone-relative files `req` would write and the ones it would leave (they
+ * are there already; a seed never overwrites). Refused, with the sentence to
+ * show, when `req.bot` is `null`, an id is not the catalogue's, the owner is
+ * not a reader, or the owner and readers differ from this Mac's pin or from a
+ * `_drive.toml` the seed would leave.
+ *
+ * Rejects with: `internal`, its message the sentence to show.
+ */
+export async function agentsSeedPlan(req: AgentSeedReq): Promise<AgentSeedPlanVm> {
+  return await invoke<AgentSeedPlanVm>("agents_seed_plan", { req });
+}
+
+/**
+ * Write `req`'s seed into the folder's agents zone, never over a file: what was
+ * written, what was left, and the agents written — each signs in on its own
+ * Settings › Agents row (`agentsCopySignIn`). Writes the zone only; signs
+ * nothing in. Refused as `agentsSeedPlan` is.
+ *
+ * Rejects with: `internal`, its message the sentence to show.
+ */
+export async function agentsSeedApply(req: AgentSeedReq): Promise<AgentSeedResultVm> {
+  return await invoke<AgentSeedResultVm>("agents_seed_apply", { req });
+}
+
+// ---------------------------------------------------------------------------
+// The proxy beside the notes view (story 91.2, UX-DR130)
+// ---------------------------------------------------------------------------
+
+/**
+ * The person's proxy conversations on `accountId`: every agent session room
+ * whose status says `main` (the DM, first — the dock's default) or
+ * `conversation`, newest next. A room whose status is not read yet is not
+ * listed. `allowed` is the drives the scope chip may offer (the home drive
+ * first), `null` where the proxy's agents zone is not on this device (the
+ * phone). Every target; never rejects (an account that is not live lists
+ * nothing).
+ */
+export async function agentRoomsList(accountId: string): Promise<ProxyRoomVm[]> {
+  return await invoke<ProxyRoomVm[]>("agent_rooms_list", { accountId });
+}
+
+/**
+ * Ask the proxy in `roomId` for `drives` (ids) in scope. The proxy's host
+ * keeps its home drive, refuses a drive outside its `[tools].drives` (named in
+ * the room's status detail) and echoes the accepted scope, which the room's
+ * header (`TimelineBatch.header.scope`) then shows — the chip reads the
+ * header, not this call.
+ *
+ * Rejects with: `sendFailed` (no such room, or the send failed),
+ * `unsupported` (the room is not one of the person's proxy conversations).
+ */
+export async function agentScopeSet(
+  accountId: string,
+  roomId: string,
+  drives: string[],
+): Promise<void> {
+  await invoke<void>("agent_scope_set", { accountId, roomId, drives });
+}
+
+/**
+ * The docked note changed (`focus`), or the dock closed (`null`). Call it on
+ * every change of the active note, the caret's line or the buffer while the
+ * dock is open, and again every `FOCUS_HEARTBEAT_MS` while it stays open:
+ * Rust names the note's drive, path and heading once the change has been
+ * still a second, sends it only when it changed (or the heartbeat is due),
+ * and on close tells the proxy there is none. `seq` must grow with every
+ * call, across reloads too: Rust drops a call older than one it has seen, so
+ * a focus that arrives after the close it preceded is never sent.
+ *
+ * Rejects as `agentScopeSet`.
+ */
+export async function agentFocus(
+  accountId: string,
+  roomId: string,
+  seq: number,
+  focus: AgentFocusReq | null,
+): Promise<void> {
+  await invoke<void>("agent_focus", { accountId, roomId, seq, focus });
+}
+
+/**
+ * *New conversation*: ask the proxy, in its DM `roomId`, for a new
+ * conversation titled `title` (blank: "conversation"). The proxy's host makes
+ * the room and invites the person; it appears in `agentRoomsList` once its
+ * status arrives. Resolves to the request's event id.
+ *
+ * Rejects as `agentScopeSet`; `unsupported` also when `roomId` is not the DM.
+ */
+export async function agentConversationNew(
+  accountId: string,
+  roomId: string,
+  title: string | null,
+): Promise<string> {
+  return await invoke<string>("agent_conversation_new", { accountId, roomId, title });
+}
+
+/**
+ * The person's decision on an approval card (93.3), sent from this device
+ * into the session room `roomId`: `req.id` and `req.bindingDigest` are the
+ * card's, `req.scope` one of its `scopes` (`once` with a deny). A decision in
+ * the room is shown on the card (`decided`) but never closes it: the card
+ * stays decidable until the agent uses an approval (`consumed`) or it
+ * expires (`TimelineBatch.approvals`); whether a decision counts is the
+ * agent's host's.
+ *
+ * Rejects with: `unsupported` and the card's own sentence where the card
+ * shows no decide buttons (`cannotDecide`) or no longer matches the room, or
+ * when approving an attached action (`attachment`) this app has not shown
+ * through {@link agentApprovalPayload}; `sendFailed` (no such room, or the
+ * send failed).
+ */
+export async function agentApprovalDecide(
+  accountId: string,
+  roomId: string,
+  req: ApprovalDecideReq,
+): Promise<void> {
+  await invoke<void>("agent_approval_decide", { accountId, roomId, req });
+}
+
+/**
+ * The attached action of the approval card `id` in the session room
+ * `roomId` (a card whose `attachment` is set), as pretty-printed JSON: its
+ * encrypted file fetched and checked against the card's digest in Rust.
+ * Once shown, the action may be approved from this app.
+ *
+ * Rejects with `unsupported` and a sentence when the attachment is not the
+ * action sent for approval, cannot be fetched now, or the card has none.
+ */
+export async function agentApprovalPayload(
+  accountId: string,
+  roomId: string,
+  id: string,
+): Promise<string> {
+  return await invoke<string>("agent_approval_payload", { accountId, roomId, id });
+}
+
+/**
+ * `accountId`'s own cross-signing master key, base64 in groups of four, for
+ * the person to compare with `keeper-agentd status` before pinning it;
+ * `null` while the account publishes no cross-signing identity.
+ */
+export async function agentOwnFingerprint(accountId: string): Promise<string | null> {
+  return await invoke<string | null>("agent_own_fingerprint", { accountId });
+}
+
+/**
+ * The surface requests this device executes (91.3, AD-383): every request an
+ * agent's host sends to this device, from now on, with its `target` named by
+ * Rust (a vault note, or a file for the Files preview). `range` counts the
+ * editor buffer's lines (the body, without frontmatter), 1-based, inclusive.
+ * A request whose note this device cannot name is answered `unavailable` by
+ * Rust and never delivered. Answer each with {@link agentSurfaceResult}
+ * before `expiresAtMs`.
+ */
+export async function agentSurfaceSubscribe(
+  onRequest: (request: SurfaceRequestVm) => void,
+): Promise<void> {
+  const channel = new Channel<SurfaceRequestVm>();
+  channel.onmessage = onRequest;
+  await invoke<void>("agent_surface_subscribe", { channel });
+}
+
+/**
+ * Answer the surface request `answer.requestId` that arrived in `roomId`:
+ * `done` (with `applied` for a proposal), `declined`, or `unavailable` (the
+ * buffer no longer holds `expected`, a range past the end). `detail` is a
+ * short sentence, never note text.
+ *
+ * Rejects with: `unsupported` (no such request is waiting on this device —
+ * answered already, or never handed on), `roomNotFound`.
+ */
+export async function agentSurfaceResult(
+  accountId: string,
+  roomId: string,
+  answer: SurfaceAnswerReq,
+): Promise<void> {
+  await invoke<void>("agent_surface_result", { accountId, roomId, answer });
+}
+
+/**
+ * The primary view keeper shows now (`notes`, `chats`, …): a lower-case view
+ * id, published in this device's presence. Rejects with `unsupported` for
+ * anything that is not a view id.
+ */
+export async function agentPresenceView(view: string): Promise<void> {
+  await invoke<void>("agent_presence_view", { view });
 }
 
 // ---------------------------------------------------------------------------
@@ -7897,15 +8231,29 @@ export async function voiceWakeSet(
 }
 
 /**
- * Choose the bot a spoken turn goes to (Epic 67, AD-206): a pinned bot's id,
- * or `null` for "the pinned bot most recently talked to". Which bot a turn
- * actually reaches is decided in `keeper_core::bots::voice_target` at send
+ * Choose where a spoken turn goes (Epic 67, AD-206; AD-384): a pinned bot's
+ * id, a proxy conversation's `target` as {@link voiceAgentTargets} lists it,
+ * or `null` for "the pinned bot most recently talked to". Where a turn
+ * actually goes is decided in `keeper_core::bots::voice_target` at send
  * time, never here; the fresh {@link VoiceWakeVm} says what was stored.
  *
  * Rejects with: `internal`.
  */
-export async function voiceTargetSet(botId: string | null): Promise<VoiceWakeVm> {
-  return await invoke<VoiceWakeVm>("voice_target_set", { botId });
+export async function voiceTargetSet(target: string | null): Promise<VoiceWakeVm> {
+  return await invoke<VoiceWakeVm>("voice_target_set", { target });
+}
+
+/**
+ * The person's proxy conversations a spoken turn may go to (AD-384), on
+ * every signed-in account, the DM first: what "Speak to" lists after the
+ * pinned bots. Choose one with `voiceTargetSet(entry.target)`; once chosen,
+ * `VoiceWakeVm.voiceTarget` equals that `target`. An empty list means the
+ * person has no proxy conversation keeper can read yet.
+ *
+ * Never rejects.
+ */
+export async function voiceAgentTargets(): Promise<VoiceAgentTargetVm[]> {
+  return await invoke<VoiceAgentTargetVm[]>("voice_agent_targets");
 }
 
 /**

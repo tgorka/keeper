@@ -9,14 +9,25 @@
  * a text message renders its body. A reply shows the quoted original inline
  * (clickable → jump to original) and an edited message shows an "Edited" caption
  * (Story 3.4); a hover/focus action bar offers Reply and Edit (own).
+ *
+ * A brief (UX-DR135) — the message a delegating agent hands work on with, which
+ * Rust marks only by the host's own rule, from an agent this device knows — is
+ * the same bubble on a card surface with a left accent, named "Brief from … for
+ * …": who the work is handed to above the text, the card's title, and the
+ * drives in scope under it. Under a narrowed label Rust sends neither title nor
+ * drives, and the bubble says it draws them only for a room it knows may read
+ * them. The text is the message's, shown as any message is (R115). A forged
+ * brief arrives as an ordinary message and is drawn as one.
  */
 
+import { Forward } from "lucide-react";
 import { EditHistoryPopover } from "@/components/chat/edit-history-popover";
 import { MediaAttachment } from "@/components/chat/media-attachment";
 import { MessageActions } from "@/components/chat/message-actions";
 import { CURATED_EMOJI } from "@/components/chat/reaction-popover";
 import { ReadReceipts } from "@/components/chat/read-receipts";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
   ContextMenu,
@@ -28,7 +39,7 @@ import {
 import { useLongPress } from "@/hooks/use-long-press";
 import { useShellLayout } from "@/hooks/use-shell-layout";
 import { formatMessageTime } from "@/lib/format-time";
-import type { ReactionGroupVm, ReplyPreviewVm, TimelineItemVm } from "@/lib/ipc/client";
+import type { BriefVm, ReactionGroupVm, ReplyPreviewVm, TimelineItemVm } from "@/lib/ipc/client";
 import { cn } from "@/lib/utils";
 
 /** The `message`-variant of {@link TimelineItemVm} (the only kind this renders). */
@@ -122,6 +133,12 @@ interface MessageBubbleProps {
    * When absent, no Cancel affordance renders.
    */
   onCancelSend?: (key: string) => void;
+  /**
+   * Whether this is an agent's answer still being written: the newest turn of
+   * an agent room whose run is `running`. Draws a caret after the text, and
+   * says so to a screen reader, until the run leaves `running`.
+   */
+  growing?: boolean;
 }
 
 /**
@@ -156,6 +173,7 @@ export function MessageBubble({
   onToggleReaction,
   onOpenPreview,
   onCancelSend,
+  growing = false,
 }: MessageBubbleProps) {
   const displayName = item.senderDisplayName ?? item.sender;
   const time = formatMessageTime(item.timestamp);
@@ -176,14 +194,26 @@ export function MessageBubble({
   const longPress = useLongPress();
   const touchMenu = phone && Boolean(onReply || onEdit || onDelete || onToggleReaction);
 
+  const brief = item.brief;
   const bubbleClass = cn(
     "max-w-[75%] rounded-[14px] px-3 py-2 text-sm",
-    isOwn ? "bg-primary text-primary-foreground" : "bg-muted text-foreground",
+    brief !== null
+      ? "border border-border border-l-2 border-l-primary bg-card text-foreground"
+      : isOwn
+        ? "bg-primary text-primary-foreground"
+        : "bg-muted text-foreground",
     selected && "ring-2 ring-ring ring-offset-1 ring-offset-background",
   );
+  // A brief is a named group, so a screen reader hears whose hand-off it is
+  // before the text.
+  const briefGroup =
+    brief !== null
+      ? ({ role: "group", "aria-label": `Brief from ${displayName} for ${brief.toName}` } as const)
+      : {};
 
   const bubbleContent = (
     <>
+      {brief !== null && <BriefHead brief={brief} />}
       {item.reply && <ReplyQuote reply={item.reply} isOwn={isOwn} onJumpTo={onJumpTo} />}
       {item.media && (
         <div className="mb-1">
@@ -201,8 +231,23 @@ export function MessageBubble({
         </div>
       )}
       {/* Text/caption: rendered only when there is a body (a media message
-          may carry an empty caption). */}
-      {item.body !== "" && <p className="whitespace-pre-wrap break-words">{item.body}</p>}
+          may carry an empty caption) or an answer is still growing into one. */}
+      {(item.body !== "" || growing) && (
+        <p className="whitespace-pre-wrap break-words">
+          {item.body}
+          {growing && (
+            <>
+              <span
+                aria-hidden="true"
+                data-slot="growing-caret"
+                className="ml-0.5 inline-block h-[1em] w-0.5 bg-current align-text-bottom motion-safe:animate-pulse"
+              />
+              <span className="sr-only"> (still writing)</span>
+            </>
+          )}
+        </p>
+      )}
+      {brief !== null && <BriefFoot brief={brief} />}
       <div className="mt-1 flex items-center justify-end gap-1">
         {item.isEdited && (
           <EditedCaption
@@ -237,12 +282,15 @@ export function MessageBubble({
     <div
       data-slot="bubble-long-press"
       className={cn(bubbleClass, "touch-callout-none select-none")}
+      {...briefGroup}
       {...longPress}
     >
       {bubbleContent}
     </div>
   ) : (
-    <div className={bubbleClass}>{bubbleContent}</div>
+    <div className={bubbleClass} {...briefGroup}>
+      {bubbleContent}
+    </div>
   );
 
   return (
@@ -359,6 +407,47 @@ export function MessageBubble({
         <ReadReceipts readers={item.readers} isOwn={isOwn} />
       </div>
     </div>
+  );
+}
+
+/** Above a brief's text: whom the work is handed to, and its card's title. */
+function BriefHead({ brief }: { brief: BriefVm }) {
+  return (
+    <div className="mb-1">
+      <span className="flex items-center gap-1 font-medium text-muted-foreground text-xs">
+        <Forward aria-hidden="true" className="size-3 shrink-0" />
+        Brief for {brief.toName}
+      </span>
+      {brief.title !== null && <span className="block font-medium">{brief.title}</span>}
+    </div>
+  );
+}
+
+/**
+ * Under a brief's text: the drives in scope as the agent-room header draws them,
+ * or — under a narrowed label — why there are none. The sentence speaks of the
+ * title and drives only: the text above it is the message itself (R115).
+ */
+function BriefFoot({ brief }: { brief: BriefVm }) {
+  if (brief.narrowed) {
+    return (
+      <p className="mt-1 text-muted-foreground text-xs">
+        keeper shows a brief's card title and drives only when it knows everyone in this room may
+        read them.
+      </p>
+    );
+  }
+  if (brief.drives.length === 0) {
+    return null;
+  }
+  return (
+    <ul aria-label="Drives in scope" className="mt-1 flex flex-wrap gap-1">
+      {brief.drives.map((drive) => (
+        <li key={drive}>
+          <Badge variant="secondary">{drive}</Badge>
+        </li>
+      ))}
+    </ul>
   );
 }
 

@@ -1,13 +1,33 @@
-import { createEvent, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import {
+  act,
+  createEvent,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { SessionTaskVm } from "@/lib/ipc/client";
+import type { CardAgentVm, SessionTaskVm } from "@/lib/ipc/client";
 
 const sessionsTaskMove = vi.fn();
+const sessionsTaskAllowSchedule = vi.fn();
 vi.mock("@/lib/ipc/client", () => ({
   sessionsTaskMove: (root: unknown, session: unknown, rel: unknown, s: unknown, i: unknown) =>
     sessionsTaskMove(root, session, rel, s, i),
+  sessionsTaskAllowSchedule: (root: unknown, session: unknown, rel: unknown) =>
+    sessionsTaskAllowSchedule(root, session, rel),
 }));
 
+import {
+  BOARD_ALLOW_ELSEWHERE,
+  BOARD_ALLOW_FAILED,
+  BOARD_RUN_UNREADABLE,
+  BOARD_UNTRUSTED,
+  boardAgentDetailsName,
+  boardAllowName,
+  boardScheduledBy,
+} from "@/components/notes/board-card-agent";
 import {
   SESSION_BOARD_COLUMNS,
   SESSION_BOARD_EMPTY,
@@ -18,6 +38,7 @@ import {
   SessionBoard,
 } from "@/components/sessions/session-board";
 import { DRAG_SELECTION_CLASS } from "@/hooks/use-pointer-drag";
+import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
 
 function task(over: Partial<SessionTaskVm> & Pick<SessionTaskVm, "title">): SessionTaskVm {
   const relPath = over.relPath ?? `${over.title.toLowerCase().replace(/\W+/g, "-")}.md`;
@@ -28,6 +49,8 @@ function task(over: Partial<SessionTaskVm> & Pick<SessionTaskVm, "title">): Sess
     orderIsOwn: true,
     tags: ["task"],
     unstableIdentity: false,
+    // A person's card: no agent key (92.2).
+    agent: null,
     ...over,
     relPath,
   };
@@ -161,8 +184,32 @@ function cardOf(title: string): HTMLElement {
   return card;
 }
 
+/** An agent block with every key absent but those given, as Rust projects it. */
+function agent(over: Partial<CardAgentVm>): CardAgentVm {
+  return {
+    run: null,
+    assignee: null,
+    host: null,
+    requestedBy: null,
+    schedule: null,
+    lastRun: null,
+    workflow: null,
+    scheduledBy: null,
+    integrity: null,
+    runningOn: null,
+    waiting: null,
+    ...over,
+  };
+}
+
+/** A readable key. */
+function key(value: string, readable = true) {
+  return { value, readable };
+}
+
 afterEach(() => {
   vi.clearAllMocks();
+  capabilitiesStore.setState({ capabilities: DEFAULT_CAPABILITIES, hydrated: false });
 });
 
 describe("SessionBoard", () => {
@@ -436,5 +483,259 @@ describe("SessionBoard", () => {
     expect(card.style.transform).toBe("");
     expect(card.className).toContain("transition-transform");
     expect(document.body.classList.contains(DRAG_SELECTION_CLASS)).toBe(false);
+  });
+});
+
+describe("SessionBoard — who works a card and where (UX-DR134)", () => {
+  it("a card with run: blocked sits in its column with a badge", () => {
+    mount({
+      tasks: [
+        ...board(),
+        task({
+          title: "Approve the budget",
+          status: "todo",
+          agent: agent({ run: key("blocked") }),
+        }),
+      ],
+    });
+    const todo = screen.getByRole("list", { name: "To do" });
+    const card = within(todo).getByRole("button", { name: "Approve the budget" }).closest("li");
+    expect(within(card as HTMLElement).getByText("blocked")).toBeInTheDocument();
+    // `blocked` is a run word, not a column: nothing reports the card as a fault.
+    expect(screen.queryByRole("heading", { name: SESSION_BOARD_STRAY_HEADING })).toBeNull();
+  });
+
+  it.each([
+    "queued",
+    "running",
+    "waiting",
+    "blocked",
+    "review",
+    "failed",
+  ])("draws run: %s as a badge carrying its word", (word) => {
+    mount({ tasks: [task({ title: "Agent card", agent: agent({ run: key(word) }) })] });
+    const card = cardOf("Agent card");
+    expect(within(card).getByText(word).closest('[data-slot="badge"]')).toHaveTextContent(
+      `run: ${word}`,
+    );
+    expect(within(card).queryByText(new RegExp(BOARD_RUN_UNREADABLE))).toBeNull();
+  });
+
+  it("shows an unreadable run as unreadable, with the file's own value, in its column", () => {
+    mount({
+      tasks: [
+        task({
+          title: "Tidy the shelf",
+          status: "deferred",
+          agent: agent({ run: key("Running!", false) }),
+        }),
+      ],
+    });
+    const deferred = screen.getByRole("list", { name: "Deferred" });
+    expect(
+      within(deferred).getByText(`${BOARD_RUN_UNREADABLE}: Running!`, { exact: false }),
+    ).toBeInTheDocument();
+    // Never guessed into the word it resembles.
+    expect(within(deferred).queryByText("running")).toBeNull();
+  });
+
+  it("says where a card runs — the claim's host, not its pin — or why it waits", () => {
+    mount({
+      tasks: [
+        task({
+          title: "Release notes",
+          agent: agent({
+            run: key("running"),
+            assignee: key("tola-grey"),
+            host: key("hesperia"),
+            requestedBy: key("@nixi:example.org"),
+            runningOn: "electra",
+          }),
+        }),
+        task({
+          title: "Transcribe the call",
+          agent: agent({
+            run: key("waiting"),
+            assignee: key("lucyna-novak"),
+            host: key("hesperia"),
+            waiting: "hesperia — a live host",
+          }),
+        }),
+      ],
+    });
+    const running = cardOf("Release notes");
+    expect(running).toHaveTextContent(
+      "tola-grey · running on electra · requested by @nixi:example.org",
+    );
+    expect(running).not.toHaveTextContent("running on hesperia");
+    const waiting = cardOf("Transcribe the call");
+    expect(waiting).toHaveTextContent("lucyna-novak · waiting: hesperia — a live host");
+    expect(waiting).not.toHaveTextContent("running on");
+  });
+
+  it("keeps the pin and every other key in the card's details", () => {
+    mount({
+      tasks: [
+        task({
+          title: "Release notes",
+          agent: agent({ run: key("running"), host: key("hesperia"), runningOn: "electra" }),
+        }),
+      ],
+    });
+    const toggle = screen.getByRole("button", { name: boardAgentDetailsName("Release notes") });
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    const rows = within(cardOf("Release notes"))
+      .getAllByRole("term")
+      .map((term) => `${term.textContent}=${term.nextElementSibling?.textContent}`);
+    expect(rows).toEqual(["run=running", "host (pin)=hesperia", "running on=electra"]);
+  });
+
+  it("marks a card made from outside content, and only that card", () => {
+    mount({
+      tasks: [
+        task({ title: "From the inbox", agent: agent({ integrity: key("untrusted") }) }),
+        task({ title: "From a person", agent: agent({ run: key("review") }) }),
+      ],
+    });
+    expect(within(cardOf("From the inbox")).getByText(BOARD_UNTRUSTED)).toBeInTheDocument();
+    expect(within(cardOf("From a person")).queryByText(BOARD_UNTRUSTED)).toBeNull();
+  });
+
+  it("shows a schedule that does not parse as unreadable", () => {
+    mount({
+      tasks: [
+        task({ title: "Check the mirror", agent: agent({ schedule: key("every 30s", false) }) }),
+      ],
+    });
+    expect(cardOf("Check the mirror")).toHaveTextContent("schedule unreadable: every 30s");
+  });
+
+  it("offers Allow only on a card whose schedule an agent wrote", () => {
+    mount({
+      tasks: [
+        task({
+          title: "Daily triage",
+          agent: agent({ schedule: key("@daily"), scheduledBy: key("@nixi:example.org") }),
+        }),
+        task({ title: "Person's schedule", agent: agent({ schedule: key("@daily") }) }),
+      ],
+    });
+    expect(cardOf("Daily triage")).toHaveTextContent(boardScheduledBy("@nixi:example.org"));
+    expect(screen.getAllByRole("button", { name: /^Allow the schedule/ })).toHaveLength(1);
+    expect(screen.getByRole("button", { name: boardAllowName("Daily triage") })).toBeEnabled();
+  });
+
+  it("allows with the card's own ids, re-reads, and the mark goes with the re-read", async () => {
+    sessionsTaskAllowSchedule.mockResolvedValue(undefined);
+    const marked = task({
+      title: "Daily triage",
+      relPath: "cards/daily-triage.md",
+      agent: agent({ schedule: key("@daily"), scheduledBy: key("@nixi:example.org") }),
+    });
+    const { onChanged, rerender } = mount({ tasks: [marked] });
+    fireEvent.click(screen.getByRole("button", { name: boardAllowName("Daily triage") }));
+    await waitFor(() => expect(onChanged).toHaveBeenCalledTimes(1));
+    expect(sessionsTaskAllowSchedule).toHaveBeenCalledWith(
+      "tgdrive",
+      "active/2026-08-10-keeper",
+      "cards/daily-triage.md",
+    );
+    rerender(
+      <SessionBoard
+        rootId="tgdrive"
+        sessionId="active/2026-08-10-keeper"
+        tasks={[{ ...marked, agent: agent({ schedule: key("@daily") }) }]}
+        onOpen={vi.fn()}
+        onChanged={onChanged}
+      />,
+    );
+    expect(screen.queryByRole("button", { name: boardAllowName("Daily triage") })).toBeNull();
+    expect(cardOf("Daily triage")).not.toHaveTextContent(boardScheduledBy("@nixi:example.org"));
+  });
+
+  it("holds Allow pending after the write until the re-read arrives, then offers it again", async () => {
+    sessionsTaskAllowSchedule.mockResolvedValue(undefined);
+    const marked = task({
+      title: "Daily triage",
+      relPath: "cards/daily-triage.md",
+      agent: agent({ scheduledBy: key("@nixi:example.org") }),
+    });
+    const { onChanged, rerender } = mount({ tasks: [marked] });
+    const button = () => screen.getByRole("button", { name: boardAllowName("Daily triage") });
+    fireEvent.click(button());
+    await waitFor(() => expect(onChanged).toHaveBeenCalledTimes(1));
+    // Written, not yet re-read: the mark on screen is the one just allowed, so
+    // a second press could only be refused against a stale card.
+    expect(button()).toBeDisabled();
+    fireEvent.click(button());
+    expect(sessionsTaskAllowSchedule).toHaveBeenCalledTimes(1);
+    // A fresh read that still carries a mark (an agent wrote a new schedule
+    // meanwhile) is a mark keeper read afresh, and may be allowed.
+    rerender(
+      <SessionBoard
+        rootId="tgdrive"
+        sessionId="active/2026-08-10-keeper"
+        tasks={[{ ...marked, agent: agent({ scheduledBy: key("@nixi:example.org") }) }]}
+        onOpen={vi.fn()}
+        onChanged={onChanged}
+      />,
+    );
+    expect(button()).toBeEnabled();
+  });
+
+  it("shows keeper's refusal on the card, and re-reads nothing", async () => {
+    sessionsTaskAllowSchedule.mockRejectedValue({
+      code: "internal",
+      message: "Sign in as @tgorka:example.org to allow this schedule.",
+    });
+    const { onChanged } = mount({
+      tasks: [
+        task({ title: "Daily triage", agent: agent({ scheduledBy: key("@nixi:example.org") }) }),
+      ],
+    });
+    fireEvent.click(screen.getByRole("button", { name: boardAllowName("Daily triage") }));
+    expect(await within(cardOf("Daily triage")).findByRole("status")).toHaveTextContent(
+      "Sign in as @tgorka:example.org to allow this schedule.",
+    );
+    expect(onChanged).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: boardAllowName("Daily triage") })).toBeEnabled();
+  });
+
+  it("falls back to the board's sentence when a refusal carries none", async () => {
+    sessionsTaskAllowSchedule.mockRejectedValue({});
+    mount({
+      tasks: [
+        task({ title: "Daily triage", agent: agent({ scheduledBy: key("@nixi:example.org") }) }),
+      ],
+    });
+    fireEvent.click(screen.getByRole("button", { name: boardAllowName("Daily triage") }));
+    expect(await screen.findByRole("status")).toHaveTextContent(BOARD_ALLOW_FAILED);
+  });
+
+  it("keeps the mark and offers no Allow on the phone, where the command is unsupported", () => {
+    act(() => {
+      capabilitiesStore.setState({
+        capabilities: { ...DEFAULT_CAPABILITIES, bots: true, sync: true, notes: true },
+        hydrated: true,
+      });
+    });
+    mount({
+      tasks: [
+        task({ title: "Daily triage", agent: agent({ scheduledBy: key("@nixi:example.org") }) }),
+      ],
+    });
+    expect(cardOf("Daily triage")).toHaveTextContent(boardScheduledBy("@nixi:example.org"));
+    expect(screen.queryByRole("button", { name: boardAllowName("Daily triage") })).toBeNull();
+    expect(cardOf("Daily triage")).toHaveTextContent(BOARD_ALLOW_ELSEWHERE);
+  });
+
+  it("draws a person's card exactly as before: no badge, no agent line, no details", () => {
+    mount();
+    const card = cardOf("Write the board");
+    expect(within(card).queryByRole("button", { name: /^Agent details/ })).toBeNull();
+    expect(card.querySelector('[data-slot="badge"]')).toBeNull();
+    expect(within(card).getAllByRole("button")).toHaveLength(1);
   });
 });

@@ -226,9 +226,10 @@ export interface SurfaceColumnFrame {
    */
   chrome: ReactNode;
   /**
-   * The draggable boundary. The column's next SIBLING, not its child — it
-   * straddles the edge between this column and the one after it. Null while
-   * folded, and null on the phone.
+   * The draggable boundary. The column's SIBLING, not its child — it straddles
+   * the edge between this column and its neighbour: the next sibling for a
+   * column left of the document, the previous one for a column right of it
+   * (`edge: "leading"`). Null while folded, and null on the phone.
    */
   seam: ReactNode;
 }
@@ -245,10 +246,14 @@ export interface SurfaceColumnFrame {
  * the whole screen behind a 48px strip and a seam would be a drag target on a
  * touch device with nothing beside it to trade width with. The column still
  * gets its default width there, and nothing is remembered or restored.
+ *
+ * `edge` is the side the seam is on: `"trailing"` (the default) for a column
+ * left of the panel strip, `"leading"` for one right of it — the notes view's
+ * assistant dock — which the surface renders BEFORE the column.
  */
 export function useSurfaceColumn(
   id: SurfaceColumnId,
-  options: { rail: SurfaceRail; enabled?: boolean },
+  options: { rail: SurfaceRail; enabled?: boolean; edge?: "trailing" | "leading" },
 ): SurfaceColumnFrame {
   const enabled = options.enabled ?? true;
   const spec = SURFACE_COLUMNS[id];
@@ -388,6 +393,7 @@ export function useSurfaceColumn(
           // from a measured fitted width this column never has and report
           // "Fitted to content" to a screen reader about a 320px list.
           width={width}
+          edge={options.edge}
           className="shrink-0"
         />
       ) : null,

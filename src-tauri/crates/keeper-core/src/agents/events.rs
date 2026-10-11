@@ -1,0 +1,972 @@
+//! The agents' Matrix events: room types, event types, the contents 90.4–90.6
+//! send, and a session room's power levels (AD-370, AD-372; *Matrix events*).
+//!
+//! Every content is a closed struct: it serialises exactly its schema's keys,
+//! and reading one refuses a key it does not know, so a state event — which is
+//! not encrypted — can never be made to carry a title, a path or text by a
+//! field nobody meant to add (the architecture's Ambiguity 7).
+
+use std::time::Duration;
+
+use matrix_sdk::ruma::{OwnedEventId, OwnedUserId, UserId};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Map, Value};
+use ts_rs::TS;
+
+use crate::agents::session::SessionKind;
+
+/// `m.room.create` `type` of every session room: a proxy's DM, a proxy
+/// conversation, a delegated, scheduled, workflow or gate session.
+pub const SESSION_ROOM_TYPE: &str = "dev.keeper.agent.session";
+/// `m.room.create` `type` of a principal's control room.
+pub const CONTROL_ROOM_TYPE: &str = "dev.keeper.agent.control";
+
+/// The session's status anchor and its edits.
+pub const STATUS: &str = "dev.keeper.agent.status";
+/// The key inside a streamed answer's anchor content naming its log line.
+pub const TURN: &str = "dev.keeper.agent.turn";
+/// The drives in scope and the label (people may send it in a proxy's rooms).
+pub const SCOPE: &str = "dev.keeper.agent.scope";
+/// An action that waits for a person: the record's payload (AD-393).
+pub const APPROVAL_REQUEST: &str = "dev.keeper.agent.approval.request";
+/// A person's decision on an approval.
+pub const APPROVAL_DECISION: &str = "dev.keeper.agent.approval.decision";
+/// An approval used (state, key = the approval's id, unencrypted; R75):
+/// the first one in the room's order is the consumption.
+pub const APPROVAL_CONSUMED: &str = "dev.keeper.agent.approval.consumed";
+/// Where a spoken answer stopped.
+pub const HEARD: &str = "dev.keeper.agent.heard";
+/// A device's answer to a surface call.
+pub const SURFACE_RESULT: &str = "dev.keeper.agent.surface.result";
+/// The claim on a session (state, key `""`); in the principal's control
+/// room, the claim on making a steward's duty session (key = its id, R165).
+pub const CLAIM: &str = "dev.keeper.agent.claim";
+/// The room a steward's duty session was made with (state in the
+/// principal's control room, key = the session's id, content `{v, room}`;
+/// R165): written by the creation claim's holder before the folder.
+pub const STEWARD_ROOM: &str = "dev.keeper.agent.steward.room";
+/// A host's manifest (state, key = the host slug).
+pub const HOST: &str = "dev.keeper.agent.host";
+/// A person's ask, in their proxy's `main` DM, for a new conversation
+/// (ruling R36): only the main session's claim holder acts on it.
+pub const CONVERSATION_REQUEST: &str = "dev.keeper.agent.conversation.request";
+/// A host's ask to the one device of its person that is in front: open a
+/// note, highlight, point, scroll, or propose an edit (AD-383).
+pub const SURFACE_REQUEST: &str = "dev.keeper.agent.surface.request";
+/// One of a person's keeper clients, and whether it is in front (state in
+/// the principal's control room, key = its Matrix device id; AD-383).
+pub const PRESENCE: &str = "dev.keeper.agent.presence";
+/// The key inside a brief's `m.room.message` content carrying the
+/// delegation (ruling R53): who hands what to whom, under which label.
+pub const DELEGATE: &str = "dev.keeper.agent.delegate";
+/// The key inside an agent's `m.room.message` content naming the files it
+/// hands over, `[{drive, path}]`: a delegated session's reply carries it.
+pub const ARTIFACTS: &str = "dev.keeper.agent.artifacts";
+/// The key inside a delegated session's reply naming the session's label
+/// as it is when it replies (ruling R94): what the delegating session joins.
+pub const REPLY_LABEL: &str = "dev.keeper.agent.label";
+/// The key inside an agent's `m.room.message` content carrying a question
+/// for a person, through that person's proxy (AD-380, R99): the ask.
+pub const ASK: &str = "dev.keeper.agent.ask";
+/// The key inside a proxy's `m.room.message` content relaying its person's
+/// answer to an ask, into the asking room (R100).
+pub const ANSWER: &str = "dev.keeper.agent.answer";
+
+/// A host pushed a commit of a drive that another host should fetch now
+/// (state, key = the drive id, unencrypted; ruling R59): in a session's room
+/// for that session's work, in control rooms for the agents zone's.
+pub const DOORBELL: &str = "dev.keeper.agent.doorbell";
+
+/// The contents' schema version, `"v": 1`.
+pub const CONTENT_VERSION: u32 = 1;
+
+/// The longest final message of a streamed answer, in bytes (R23). Longer
+/// answers are cut on a `char` boundary and point to an artifact holding
+/// the whole text; a device draws an answer up to this and that sentence
+/// (R42).
+///
+/// Measured, not chosen (90.5 acceptance 14): the largest text whose
+/// encrypted final edit the Synapse test homeserver accepted was 47 061
+/// bytes (2026-10-03; the server's 64 KiB event cap after Megolm and base64),
+/// so R23's 60 KiB does not fit. This is that, less room for the artifact
+/// sentence, rounded down to 1 KiB (`docs/agents.md` § Measured).
+pub const FINAL_CUT_BYTES: usize = 45 * 1024;
+
+/// `dev.keeper.agent.status` (timeline, encrypted).
+///
+/// `kind` tells a device a proxy conversation (`main`, `conversation`) from a
+/// session it only watches (R25, F7). `detail` carries counts, never paths or
+/// titles (S-16).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StatusContent {
+    pub v: u32,
+    /// The session's drive-relative path.
+    pub session: String,
+    pub kind: SessionKind,
+    pub title: String,
+    pub agent: OwnedUserId,
+    pub host: String,
+    pub epoch: u64,
+    pub run: RunState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// The host the session waits for, with `run: waiting`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting: Option<String>,
+    /// The status anchor this edit replaces.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<OwnedEventId>,
+}
+
+/// A status's `run`: the five states a device shows; any other word is refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RunState {
+    Idle,
+    Running,
+    Blocked,
+    /// Waiting for the host named in `waiting`.
+    Waiting,
+    Done,
+}
+
+/// `dev.keeper.agent.turn` inside a streamed answer's anchor: which session
+/// and which log line the answer belongs to, and the person's message it
+/// answers — so a device that asked follows the answer to its own question,
+/// never an older one still queued (AD-384).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TurnRef {
+    pub session: String,
+    /// The `user` line's id.
+    pub line: String,
+    /// The Matrix event the turn answers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question: Option<OwnedEventId>,
+}
+
+/// `dev.keeper.agent.scope` (timeline, encrypted).
+///
+/// The person's device sends it in its proxy's own rooms: `drives` asks for
+/// a scope (absent: the scope stays), `focus` says what the docked notes
+/// view shows (absent: nothing). The owning host echoes each accepted scope
+/// with the drives' titles and the session's label, which is what a room's
+/// scope and label chips read (R30: only the agent's own scope is shown).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScopeContent {
+    pub v: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drives: Option<Vec<ScopeDrive>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<crate::agents::label::Label>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focus: Option<Focus>,
+    /// Who chose the scope: the person, also in the host's echo.
+    pub set_by: OwnedUserId,
+}
+
+/// A drive in a scope event, in the scope's order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScopeDrive {
+    pub id: String,
+    pub title: String,
+}
+
+/// The note the person is looking at in the docked notes view: a drive, a
+/// drive-relative path and the heading above the caret (AD-382).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Focus {
+    pub drive: String,
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heading: Option<String>,
+}
+
+/// `dev.keeper.agent.conversation.request` (timeline, encrypted).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConversationRequestContent {
+    pub v: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+}
+
+/// `dev.keeper.agent.claim` (state, key `""`, unencrypted): who writes the
+/// session (AD-378). Times are RFC 3339 UTC.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClaimContent {
+    pub v: u32,
+    pub host: String,
+    pub device: String,
+    pub agent: OwnedUserId,
+    pub epoch: u64,
+    pub acquired_at: String,
+    pub renewed_at: String,
+    pub expires_at: String,
+    pub released: bool,
+    /// The start of the scheduled-card window the holder runs (S-25).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window: Option<String>,
+}
+
+/// The action inside an approval request: exactly what will run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RequestAction {
+    pub tool: String,
+    /// `null` when the canonical arguments are over 16 KiB: they are the
+    /// request's encrypted `file` instead (R86).
+    pub args: Value,
+    pub exec_binding: Value,
+}
+
+/// `dev.keeper.agent.approval.request` (encrypted): one record's payload
+/// for the card — its summary keeper's own, never the model's words — and
+/// every field its `binding_digest` is over, so a device recomputes the
+/// digest over what it shows (R185).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovalRequestContent {
+    pub v: u32,
+    pub id: String,
+    /// Drive-relative.
+    pub session: String,
+    /// The requesting session's own room: the room a T4 card's hosting is
+    /// judged by, wherever the request is shown (a proxy DM, R85).
+    pub room: String,
+    /// The agent's id in its home drive, as the record and its digest name
+    /// it.
+    pub agent: String,
+    pub tier: u8,
+    pub summary: String,
+    pub action: RequestAction,
+    /// The canonical arguments as an encrypted file (`EncryptedFile`), and
+    /// their SHA-256, when they are too large to carry inline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_sha256: Option<String>,
+    /// The SHA-256 of the session's log through the checkpoint (digested).
+    pub checkpoint_sha256: String,
+    /// What must still hold when the approval is used (digested).
+    pub preconditions: crate::agents::approval::Preconditions,
+    pub binding_digest: String,
+    pub scopes: Vec<String>,
+    pub expires_at: String,
+    /// The label's readers when the action parked; empty when anyone reads.
+    pub approvers: Vec<String>,
+    /// Who asked, the person who started it first (R76): at T4 its head
+    /// alone decides.
+    pub dispatch_chain: Vec<String>,
+}
+
+impl ApprovalRequestContent {
+    /// Whether `binding_digest` is the digest of this request over `args`
+    /// — the inline arguments, or the attached file's (R185, R186).
+    pub fn binds(&self, args: &Value) -> bool {
+        crate::agents::approval::binding_digest(
+            &self.id,
+            &self.session,
+            &self.agent,
+            &self.action.tool,
+            args,
+            &self.action.exec_binding,
+            &self.checkpoint_sha256,
+            &serde_json::to_value(&self.preconditions).unwrap_or(Value::Null),
+        )
+        .is_ok_and(|digest| digest == self.binding_digest)
+    }
+}
+
+/// A gate's coalesced card (99.1, R28 S-23): `{v, records: [<request>, …]}`
+/// in one request event; later records arrive as `m.replace` edits whose
+/// `m.new_content` is the whole list. Every record is decided on its own.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CoalescedRequestContent {
+    pub v: u32,
+    pub records: Vec<ApprovalRequestContent>,
+}
+
+/// The records a request content carries: one, or a coalesced card's list;
+/// `None` when it reads as neither, or a record is of another version.
+pub fn request_records(content: &Value) -> Option<Vec<ApprovalRequestContent>> {
+    let records = if content.get("records").is_some() {
+        let coalesced = CoalescedRequestContent::deserialize(content).ok()?;
+        if coalesced.v != CONTENT_VERSION {
+            return None;
+        }
+        coalesced.records
+    } else {
+        vec![ApprovalRequestContent::deserialize(content).ok()?]
+    };
+    (!records.is_empty() && records.iter().all(|record| record.v == CONTENT_VERSION))
+        .then_some(records)
+}
+
+/// `dev.keeper.agent.approval.decision` (encrypted): a person's answer to
+/// exactly one record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovalDecisionContent {
+    pub id: String,
+    pub binding_digest: String,
+    pub decision: crate::agents::approval::Decision,
+    pub scope: crate::agents::approval::Scope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// `dev.keeper.agent.approval.consumed` (state, key = the approval's id,
+/// unencrypted; R75): sent, and accepted, before the approved call runs.
+/// The class of a claim: an id, an epoch and a host slug, nothing more.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConsumedContent {
+    pub v: u32,
+    pub id: String,
+    pub epoch: u64,
+    pub host: String,
+}
+
+/// `dev.keeper.agent.presence` (state, key = the device id, unencrypted):
+/// metadata only — which device, on which platform, whether it is in front
+/// and which primary view it shows. No path, no title, no drive (AD-383).
+/// Times are RFC 3339 UTC.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PresenceContent {
+    pub v: u32,
+    pub user: OwnedUserId,
+    pub device: String,
+    pub platform: PresencePlatform,
+    pub focused: bool,
+    /// A primary view's id (`notes`, `chats`), never a note.
+    pub view: String,
+    pub renewed_at: String,
+    pub expires_at: String,
+}
+
+/// The platform a presence names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PresencePlatform {
+    Macos,
+    Ios,
+    Android,
+}
+
+/// How long a host waits for a device's answer to a surface call (AD-383).
+/// The device counts it from when the server received the request — the one
+/// clock both sides read — never from `expires_at`, the host's own clock.
+pub const SURFACE_WAIT: Duration = Duration::from_secs(60);
+
+/// `dev.keeper.agent.doorbell` (state, key = the drive id, unencrypted;
+/// R59): which drive moved, to which commit, and the closed reason. No path,
+/// no title, no text — what any member of the room may already know from the
+/// hosts' manifests, which name the drive ids in clear. Last writer wins,
+/// which is "the latest commit".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DoorbellContent {
+    pub v: u32,
+    pub drive: String,
+    /// The pushed commit, a full hex object id.
+    pub commit: String,
+    pub reason: DoorbellReason,
+}
+
+/// What a push changed, as a doorbell says it: one of four words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DoorbellReason {
+    /// A new session folder.
+    Session,
+    /// A session's `artifacts/`.
+    Artifact,
+    /// A card of a session.
+    Card,
+    /// The agents zone: homes, souls, memory.
+    Memory,
+}
+
+impl DoorbellContent {
+    /// The doorbell a state event under `state_key` carries, when it reads:
+    /// this version, keyed by the drive it names, and a full hex commit id.
+    pub fn accept(state_key: &str, content: &Value) -> Option<DoorbellContent> {
+        let bell: DoorbellContent = serde_json::from_value(content.clone()).ok()?;
+        let hex = |id: &str| {
+            matches!(id.len(), 40 | 64)
+                && id
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        };
+        (bell.v == CONTENT_VERSION && bell.drive == state_key && hex(&bell.commit)).then_some(bell)
+    }
+}
+
+/// `dev.keeper.agent.surface.request` (timeline, encrypted): one surface
+/// call, for the device `device` only; `expires_at` is when the host says it
+/// stops waiting.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SurfaceRequestContent {
+    pub v: u32,
+    pub id: String,
+    pub device: String,
+    pub tool: SurfaceTool,
+    pub args: SurfaceArgs,
+    pub expires_at: String,
+}
+
+/// What a surface call asks the device to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum SurfaceTool {
+    Open,
+    Highlight,
+    Point,
+    Scroll,
+    ProposeEdit,
+}
+
+impl SurfaceTool {
+    /// The tool's name as the model calls it.
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::Open => "surface_open",
+            Self::Highlight => "surface_highlight",
+            Self::Point => "surface_point",
+            Self::Scroll => "surface_scroll",
+            Self::ProposeEdit => "surface_propose_edit",
+        }
+    }
+
+    /// The five, in the order a turn offers them.
+    pub const ALL: [Self; 5] = [
+        Self::Open,
+        Self::Highlight,
+        Self::Point,
+        Self::Scroll,
+        Self::ProposeEdit,
+    ];
+
+    /// The tool the model called `name`, if it is one of the five.
+    pub fn from_wire(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|tool| tool.wire() == name)
+    }
+}
+
+/// A surface call's arguments. `range` counts lines of the note's body —
+/// the editor's buffer, without the frontmatter — 1-based and inclusive;
+/// `expected` is the text the agent read in that range, so the device
+/// applies a proposal only while its buffer still holds it (R40).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SurfaceArgs {
+    pub drive: String,
+    /// The note's path from the drive's root, `/`-joined.
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heading: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range: Option<LineSpan>,
+    /// `propose_edit`: the lines that replace `range`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected: Option<String>,
+}
+
+/// Lines `from` through `to` of a note's body, 1-based and inclusive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
+#[ts(export)]
+pub struct LineSpan {
+    pub from: u32,
+    pub to: u32,
+}
+
+/// `dev.keeper.agent.surface.result` (timeline, encrypted): the named
+/// device's answer to the request `request`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SurfaceResultContent {
+    pub v: u32,
+    pub request: String,
+    pub device: String,
+    pub outcome: SurfaceOutcome,
+    /// `propose_edit`: whether the person applied it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// How a surface call ended, in the word the model is told.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "lowercase")]
+#[ts(export)]
+pub enum SurfaceOutcome {
+    Done,
+    Declined,
+    Expired,
+    Unavailable,
+}
+
+impl SurfaceOutcome {
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::Done => "done",
+            Self::Declined => "declined",
+            Self::Expired => "expired",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+/// A streamed answer's edit: `m.replace` of `target`, the whole text in
+/// `m.new_content`, and a fallback `body` of at most [`FALLBACK_BODY_MAX`]
+/// bytes, so an edit never carries its text twice (AD-373).
+pub fn edit_content(target: &OwnedEventId, text: &str) -> Value {
+    json!({
+        "msgtype": "m.text",
+        "body": fallback(text),
+        "m.new_content": { "msgtype": "m.text", "body": text },
+        "m.relates_to": { "rel_type": "m.replace", "event_id": target },
+    })
+}
+
+/// The most bytes an edit's fallback `body` carries.
+pub const FALLBACK_BODY_MAX: usize = 1024;
+
+/// `* ` and `text`, cut on a `char` boundary and marked `…` when it would
+/// pass [`FALLBACK_BODY_MAX`] bytes.
+fn fallback(text: &str) -> String {
+    if "* ".len() + text.len() <= FALLBACK_BODY_MAX {
+        return format!("* {text}");
+    }
+    let mut end = FALLBACK_BODY_MAX - "* ".len() - "…".len();
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("* {}…", &text[..end])
+}
+
+/// A session room's power levels (F1 as ruling R30 amends it).
+///
+/// Every session room: the creating agent 100, the other agents 50, people 0;
+/// `events_default` and `state_default` 50, so a person writes no state.
+/// Session rooms are encrypted, so the server sees every timeline event a
+/// person sends as `m.room.encrypted` and cannot tell a decision from free
+/// text: `m.room.encrypted` is allowed at 0 in every session room, and the
+/// host — which decrypts — is what keeps an observer's free text out of a
+/// non-proxy session's turns (AD-380). The per-type rows below stand for a
+/// client that sends in clear: decisions, `heard` and surface results
+/// everywhere, and in a proxy's own rooms (`main`, `conversation`) also
+/// `m.room.message` and the scope.
+///
+/// Because `m.room.encrypted` is at 0, a person can send *any* agent type
+/// encrypted — a status, a scope, a turn, an `m.replace` of the anchor. The
+/// server cannot refuse it, so the host checks the sender of every decrypted
+/// agent-typed event against these levels (power ≥ 50, or one of the room's
+/// agents) before acting on it; the per-type rows bind cleartext senders only.
+pub fn power_levels(kind: SessionKind, creator: &UserId, agents: &[OwnedUserId]) -> Value {
+    let mut users = Map::new();
+    for agent in agents {
+        users.insert(agent.to_string(), json!(50));
+    }
+    users.insert(creator.to_string(), json!(100));
+    let mut events = Map::new();
+    for event in ["m.room.encrypted", APPROVAL_DECISION, HEARD, SURFACE_RESULT] {
+        events.insert(event.to_owned(), json!(0));
+    }
+    if matches!(kind, SessionKind::Main | SessionKind::Conversation) {
+        events.insert("m.room.message".to_owned(), json!(0));
+        events.insert(SCOPE.to_owned(), json!(0));
+    }
+    json!({
+        "users": users,
+        "users_default": 0,
+        "events": events,
+        "events_default": 50,
+        "state_default": 50,
+        "ban": 50,
+        "kick": 50,
+        "redact": 50,
+        "invite": 50,
+    })
+}
+
+/// A principal's control room's power levels (AD-374): the creating agent
+/// 100, every other agent user of the principal 50 — so any of them writes
+/// its host's manifest, `dev.keeper.agent.host` at 50 — and people 0. Two
+/// state events are open at 0: each of a person's devices' presence,
+/// `dev.keeper.agent.presence` (R37), and a drive's doorbell,
+/// `dev.keeper.agent.doorbell`, which a visiting agent rings (R59).
+/// `events_default` and `state_default` are 50.
+pub fn control_power_levels(creator: &UserId, agents: &[OwnedUserId]) -> Value {
+    let mut users = Map::new();
+    for agent in agents {
+        users.insert(agent.to_string(), json!(50));
+    }
+    users.insert(creator.to_string(), json!(100));
+    json!({
+        "users": users,
+        "users_default": 0,
+        "events": { HOST: 50, PRESENCE: 0, DOORBELL: 0 },
+        "events_default": 50,
+        "state_default": 50,
+        "ban": 50,
+        "kick": 50,
+        "redact": 50,
+        "invite": 50,
+    })
+}
+
+/// The rows a control room made before them lacks: each state event open
+/// at 0 that [`control_power_levels`] names.
+const OPEN_ROWS: [&str; 2] = [PRESENCE, DOORBELL];
+
+/// What a control room made before R37 or R59 needs so its people can
+/// publish their presence and a visiting agent can ring.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ControlLevels {
+    /// Every open row is already at 0.
+    UpToDate,
+    /// These levels: the room's, with the missing rows added.
+    Update(Value),
+    /// `me` may not change the room's power levels.
+    NoPower,
+}
+
+/// Whether the control room whose `m.room.power_levels` content is
+/// `levels` needs an open row, and whether `me` may write it.
+pub fn control_levels(levels: &Value, me: &UserId) -> ControlLevels {
+    let missing: Vec<&str> = OPEN_ROWS
+        .into_iter()
+        .filter(|row| levels["events"][*row] != json!(0))
+        .collect();
+    if missing.is_empty() {
+        return ControlLevels::UpToDate;
+    }
+    let level = |value: &Value, default: i64| value.as_i64().unwrap_or(default);
+    let mine = level(
+        &levels["users"][me.as_str()],
+        level(&levels["users_default"], 0),
+    );
+    let needed = level(
+        &levels["events"]["m.room.power_levels"],
+        level(&levels["state_default"], 50),
+    );
+    if mine < needed {
+        return ControlLevels::NoPower;
+    }
+    let mut updated = levels.clone();
+    if !updated["events"].is_object() {
+        updated["events"] = json!({});
+    }
+    if let Some(events) = updated["events"].as_object_mut() {
+        for row in missing {
+            events.insert(row.to_owned(), json!(0));
+        }
+    }
+    ControlLevels::Update(updated)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::*;
+
+    fn keys(value: &Value) -> BTreeSet<String> {
+        value
+            .as_object()
+            .expect("an object")
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    fn user(id: &str) -> OwnedUserId {
+        OwnedUserId::try_from(id).expect("user id")
+    }
+
+    #[test]
+    fn a_status_round_trips_with_exactly_its_keys() {
+        let status = StatusContent {
+            v: CONTENT_VERSION,
+            session: "60-sessions/active/2026-10-02-plan".to_owned(),
+            kind: SessionKind::Conversation,
+            title: "plan".to_owned(),
+            agent: user("@nixi:example.org"),
+            host: "electra".to_owned(),
+            epoch: 0,
+            run: RunState::Running,
+            detail: Some("2 tool calls".to_owned()),
+            waiting: None,
+            anchor: None,
+        };
+        let value = serde_json::to_value(&status).expect("serialise");
+        assert_eq!(value["kind"], "conversation");
+        assert_eq!(value["run"], "running");
+        assert_eq!(
+            keys(&value),
+            ["agent", "detail", "epoch", "host", "kind", "run", "session", "title", "v"]
+                .map(str::to_owned)
+                .into()
+        );
+        assert_eq!(
+            serde_json::from_value::<StatusContent>(value.clone()).expect("read back"),
+            status
+        );
+        let mut unknown = value;
+        unknown["run"] = json!("sleeping");
+        assert!(
+            serde_json::from_value::<StatusContent>(unknown).is_err(),
+            "a run state outside the five is refused"
+        );
+    }
+
+    #[test]
+    fn a_claim_round_trips_and_refuses_a_foreign_key() {
+        let claim = ClaimContent {
+            v: CONTENT_VERSION,
+            host: "electra".to_owned(),
+            device: "ELECTRA1".to_owned(),
+            agent: user("@nixi:example.org"),
+            epoch: 3,
+            acquired_at: "2026-10-02T12:00:00Z".to_owned(),
+            renewed_at: "2026-10-02T12:01:00Z".to_owned(),
+            expires_at: "2026-10-02T12:04:00Z".to_owned(),
+            released: false,
+            window: None,
+        };
+        let mut value = serde_json::to_value(&claim).expect("serialise");
+        assert_eq!(
+            keys(&value),
+            [
+                "acquired_at",
+                "agent",
+                "device",
+                "epoch",
+                "expires_at",
+                "host",
+                "released",
+                "renewed_at",
+                "v"
+            ]
+            .map(str::to_owned)
+            .into()
+        );
+        assert_eq!(
+            serde_json::from_value::<ClaimContent>(value.clone()).expect("read back"),
+            claim
+        );
+        value["title"] = json!("a secret plan");
+        assert!(serde_json::from_value::<ClaimContent>(value).is_err());
+    }
+
+    #[test]
+    fn every_session_room_takes_a_persons_encrypted_event_and_no_state_from_them() {
+        let creator = user("@nixi:example.org");
+        let other = user("@tola:example.org");
+        for kind in SessionKind::ALL {
+            let levels = power_levels(kind, &creator, std::slice::from_ref(&other));
+            assert_eq!(levels["users"]["@nixi:example.org"], 100);
+            assert_eq!(levels["users"]["@tola:example.org"], 50);
+            assert_eq!(levels["users_default"], 0);
+            assert_eq!(levels["events_default"], 50);
+            for allowed in [APPROVAL_DECISION, HEARD, SURFACE_RESULT] {
+                assert_eq!(levels["events"][allowed], 0, "{kind}: {allowed}");
+            }
+            let proxy = matches!(kind, SessionKind::Main | SessionKind::Conversation);
+            assert_eq!(
+                levels["events"].get("m.room.message") == Some(&json!(0)),
+                proxy,
+                "{kind}: m.room.message"
+            );
+            // R30: the server sees a person's every event as encrypted.
+            assert_eq!(levels["events"]["m.room.encrypted"], 0, "{kind}");
+            assert_eq!(levels["state_default"], 50, "{kind}");
+            assert_eq!(
+                levels["events"].get(SCOPE) == Some(&json!(0)),
+                proxy,
+                "{kind}: scope"
+            );
+        }
+    }
+
+    #[test]
+    fn the_fallback_body_is_at_most_1_kib_and_the_new_content_is_whole() {
+        let target = OwnedEventId::try_from("$anchor:example.org").expect("event id");
+        let text = "ż".repeat(3000);
+        let edit = edit_content(&target, &text);
+        let body = edit["body"].as_str().expect("body");
+        assert!(body.len() <= FALLBACK_BODY_MAX, "{}", body.len());
+        assert!(body.starts_with("* ż"));
+        assert_eq!(edit["m.new_content"]["body"], text.as_str());
+        assert_eq!(edit["m.relates_to"]["rel_type"], "m.replace");
+        assert_eq!(edit["m.relates_to"]["event_id"], "$anchor:example.org");
+
+        let short = edit_content(&target, "hi");
+        assert_eq!(short["body"], "* hi");
+    }
+
+    #[test]
+    fn a_control_room_lets_every_agent_of_the_principal_write_its_manifest() {
+        let creator = user("@nixi:example.org");
+        let amelia = user("@amelia:example.org");
+        let levels = control_power_levels(&creator, std::slice::from_ref(&amelia));
+        assert_eq!(levels["users"]["@nixi:example.org"], 100);
+        assert_eq!(levels["users"]["@amelia:example.org"], 50);
+        assert_eq!(levels["users_default"], 0);
+        assert_eq!(levels["events"][HOST], 50);
+        assert_eq!(levels["state_default"], 50);
+        // Each agent reaches the manifest's level; a person (users_default)
+        // reaches no state but their devices' presence (R37).
+        let level = |id: &str| {
+            levels["users"]
+                .get(id)
+                .cloned()
+                .unwrap_or(levels["users_default"].clone())
+        };
+        assert!(level("@amelia:example.org").as_i64() >= levels["events"][HOST].as_i64());
+        assert!(level("@tgorka:example.org").as_i64() < levels["state_default"].as_i64());
+        assert!(level("@tgorka:example.org").as_i64() < levels["events"][HOST].as_i64());
+        assert_eq!(levels["events"][PRESENCE], 0);
+        assert!(level("@tgorka:example.org").as_i64() >= levels["events"][PRESENCE].as_i64());
+        // A visiting agent holds no power here (users_default) and may ring
+        // a drive's doorbell, and nothing else (R59).
+        let visitor = level("@lucyna-novak:example.org");
+        assert_eq!(levels["events"][DOORBELL], 0);
+        assert!(visitor.as_i64() >= levels["events"][DOORBELL].as_i64());
+        assert!(visitor.as_i64() < levels["events"][HOST].as_i64());
+        assert!(visitor.as_i64() < levels["events_default"].as_i64());
+    }
+
+    #[test]
+    fn a_control_room_made_before_presence_or_the_doorbell_is_brought_up_to_date() {
+        let creator = user("@nixi:example.org");
+        let amelia = user("@amelia:example.org");
+        let current = control_power_levels(&creator, std::slice::from_ref(&amelia));
+        let without = |rows: &[&str]| {
+            let mut old = current.clone();
+            for row in rows {
+                old["events"].as_object_mut().expect("events").remove(*row);
+            }
+            old
+        };
+        for rows in [&[PRESENCE][..], &[DOORBELL], &[PRESENCE, DOORBELL]] {
+            let old = without(rows);
+            let ControlLevels::Update(updated) = control_levels(&old, &creator) else {
+                panic!("the creator updates a room without {rows:?}");
+            };
+            // Exactly the missing rows are added; everything else is the room's own.
+            assert_eq!(updated, current, "{rows:?}");
+        }
+        // An agent at 50 may not change the power levels (state_default 50
+        // is reached, but a room naming the levels' own row at 100 is not).
+        let mut old = without(&[DOORBELL]);
+        old["events"]["m.room.power_levels"] = json!(100);
+        assert_eq!(control_levels(&old, &amelia), ControlLevels::NoPower);
+        assert!(matches!(
+            control_levels(&old, &creator),
+            ControlLevels::Update(_)
+        ));
+        assert_eq!(control_levels(&current, &amelia), ControlLevels::UpToDate);
+    }
+
+    #[test]
+    fn a_doorbell_reads_only_as_its_closed_shape() {
+        let commit = "a".repeat(40);
+        let bell = json!({"v": 1, "drive": "neuradrive", "commit": commit, "reason": "memory"});
+        assert_eq!(
+            DoorbellContent::accept("neuradrive", &bell),
+            Some(DoorbellContent {
+                v: CONTENT_VERSION,
+                drive: "neuradrive".to_owned(),
+                commit: commit.clone(),
+                reason: DoorbellReason::Memory,
+            })
+        );
+        let refused = [
+            // Keyed by another drive than it names.
+            ("tgdrive", bell.clone()),
+            // A reason outside the four, a path smuggled in, a short commit,
+            // another version.
+            (
+                "neuradrive",
+                json!({"v": 1, "drive": "neuradrive", "commit": commit, "reason": "notes"}),
+            ),
+            (
+                "neuradrive",
+                json!({"v": 1, "drive": "neuradrive", "commit": commit, "reason": "card", "path": "x.md"}),
+            ),
+            (
+                "neuradrive",
+                json!({"v": 1, "drive": "neuradrive", "commit": "abc", "reason": "card"}),
+            ),
+            (
+                "neuradrive",
+                json!({"v": 2, "drive": "neuradrive", "commit": commit, "reason": "card"}),
+            ),
+        ];
+        for (key, content) in refused {
+            assert_eq!(
+                DoorbellContent::accept(key, &content),
+                None,
+                "{key} {content}"
+            );
+        }
+    }
+
+    #[test]
+    fn surface_events_round_trip_with_exactly_their_keys() {
+        let request = SurfaceRequestContent {
+            v: CONTENT_VERSION,
+            id: "01J".to_owned(),
+            device: "KALYPSO".to_owned(),
+            tool: SurfaceTool::ProposeEdit,
+            args: SurfaceArgs {
+                drive: "tgdrive".to_owned(),
+                path: "notes/plan.md".to_owned(),
+                heading: None,
+                range: Some(LineSpan { from: 3, to: 5 }),
+                text: Some("new".to_owned()),
+                expected: Some("old".to_owned()),
+            },
+            expires_at: "2026-10-03T12:01:00.000Z".to_owned(),
+        };
+        let value = serde_json::to_value(&request).expect("serialise");
+        assert_eq!(value["tool"], "propose_edit");
+        assert_eq!(
+            keys(&value["args"]),
+            ["drive", "expected", "path", "range", "text"]
+                .map(str::to_owned)
+                .into()
+        );
+        assert_eq!(
+            serde_json::from_value::<SurfaceRequestContent>(value).expect("read back"),
+            request
+        );
+        let result = json!({"v": 1, "request": "01J", "device": "KALYPSO", "outcome": "done", "applied": true});
+        let read: SurfaceResultContent = serde_json::from_value(result).expect("a result");
+        assert_eq!(read.outcome, SurfaceOutcome::Done);
+        assert!(serde_json::from_value::<SurfaceResultContent>(
+            json!({"v": 1, "request": "01J", "device": "K", "outcome": "maybe"})
+        )
+        .is_err());
+        for tool in SurfaceTool::ALL {
+            assert_eq!(SurfaceTool::from_wire(tool.wire()), Some(tool));
+        }
+        assert_eq!(SurfaceTool::from_wire("drive_read"), None);
+    }
+}

@@ -1,0 +1,14 @@
+# Team override for Winston: append a principle and a step, add two facts,
+# and replace menu item CA by its code.
+[agent]
+activation_steps_append = ["Read docs/architecture.md before answering."]
+persistent_facts = [
+  "file:{project-root}/docs/standards.md",
+  "keeper's crates never link tauri below the shell.",
+]
+principles = ["Every decision names the failure it prevents."]
+
+[[agent.menu]]
+code = "CA"
+description = "Produce the architecture spine for keeper's agents"
+skill = "bmad-architecture"

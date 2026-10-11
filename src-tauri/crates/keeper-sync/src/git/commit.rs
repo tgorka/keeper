@@ -44,7 +44,7 @@ use crate::{
     error::{Result, SyncError},
     lfs::basic::{ProgressCoalescer, DEFAULT_PROGRESS_INTERVAL},
     profile::SyncProfile,
-    provenance::{change_subject, commit_message, Provenance},
+    provenance::{authored_message, change_subject, commit_message, MemoryTrailer, Provenance},
     stability::{read_verified, FileSample},
 };
 
@@ -608,6 +608,358 @@ fn stage_and_commit_inner(
         .map_err(|err| SyncError::Git(format!("commit failed: {}", super::fetch::flatten(&err))))?
         .detach();
     Ok(Some(id))
+}
+
+/// A commit its caller wrote (`Engine::commit_paths`): its own subject and
+/// the trailers after keeper's provenance block, and each path's entry in it
+/// — a blob and its mode, or `None` where the path goes.
+#[derive(Debug, Clone, Copy)]
+pub struct Authored<'a> {
+    pub subject: &'a str,
+    pub trailers: &'a [MemoryTrailer],
+    pub entries: &'a [(PathBuf, Option<(gix::hash::ObjectId, Mode)>)],
+}
+
+/// Whether `path` (an index key) is `prefix` or lies under it.
+fn at_or_under(path: &[u8], prefix: &[u8]) -> bool {
+    path == prefix || (path.starts_with(prefix) && path.get(prefix.len()) == Some(&b'/'))
+}
+
+/// The stage-0 entries of `HEAD`'s tree as an index, or an empty one on an
+/// unborn branch; and `HEAD` itself.
+fn head_index(repo: &gix::Repository) -> Result<(gix::index::State, Option<gix::hash::ObjectId>)> {
+    let parent = super::repo::head_commit_id(repo)?;
+    Ok((tree_index(repo, parent)?, parent))
+}
+
+/// The stage-0 entries of `commit`'s tree as an index; an empty one for
+/// none.
+fn tree_index(
+    repo: &gix::Repository,
+    commit: Option<gix::hash::ObjectId>,
+) -> Result<gix::index::State> {
+    let Some(commit) = commit else {
+        return Ok(gix::index::State::new(repo.object_hash()));
+    };
+    let failed = |what: &str, err: &dyn std::error::Error| {
+        SyncError::Git(format!("could not read {what}: {err}"))
+    };
+    let tree = repo
+        .find_commit(commit)
+        .map_err(|err| failed("HEAD commit", &err))?
+        .tree_id()
+        .map_err(|err| failed("HEAD tree", &err))?
+        .detach();
+    let file = repo
+        .index_from_tree(&tree)
+        .map_err(|err| failed("HEAD tree", &err))?;
+    Ok(file.into())
+}
+
+/// What `prefixes` hold at or under them in `index` — each file
+/// repository-relative with its entry — one list per prefix.
+fn files_under(
+    index: &gix::index::State,
+    prefixes: &[&Path],
+) -> Result<Vec<Vec<(PathBuf, gix::hash::ObjectId, Mode)>>> {
+    let keys: Vec<BString> = prefixes
+        .iter()
+        .map(|path| index_key(path))
+        .collect::<Result<_>>()?;
+    let backing = index.path_backing();
+    Ok(keys
+        .iter()
+        .map(|key| {
+            index
+                .entries()
+                .iter()
+                .filter(|entry| at_or_under(entry.path_in(backing), key))
+                .map(|entry| {
+                    (
+                        gix::path::from_bstr(entry.path_in(backing)).into_owned(),
+                        entry.id,
+                        entry.mode,
+                    )
+                })
+                .collect()
+        })
+        .collect())
+}
+
+/// The one commit an authored request is checked against, built on and
+/// published over: the branch `HEAD` names and the commit that branch
+/// points at, read once. Every guard, moved file and attribute is read
+/// from it, and the publication moves exactly that branch from exactly
+/// that commit — a commit a person made meanwhile is never taken for it.
+#[derive(Debug, Clone)]
+pub struct Base {
+    pub branch: gix::refs::FullName,
+    /// `None` on an unborn branch.
+    pub head: Option<gix::hash::ObjectId>,
+    index: gix::index::State,
+}
+
+impl Base {
+    /// The branch `HEAD` names now and its commit; a detached `HEAD`
+    /// commits nothing.
+    pub fn of(repo: &gix::Repository) -> Result<Base> {
+        let branch = repo
+            .head_name()
+            .map_err(|err| SyncError::Git(format!("could not read HEAD: {err}")))?
+            .ok_or_else(|| SyncError::Git("HEAD is detached; nothing is committed".to_owned()))?;
+        let head = branch_tip(repo, &branch)?;
+        Ok(Base {
+            index: tree_index(repo, head)?,
+            branch,
+            head,
+        })
+    }
+
+    /// The blob id of the file `path` names in it, hex; `None` when it
+    /// holds no file there.
+    pub fn blob(&self, path: &str) -> Option<String> {
+        let key = index_key(Path::new(path)).ok()?;
+        self.index
+            .entry_by_path(key.as_ref())
+            .map(|entry| entry.id.to_hex().to_string())
+    }
+
+    /// What it holds at or under each of `prefixes`: [`head_files_under`]
+    /// of this commit.
+    pub fn files_under(
+        &self,
+        prefixes: &[&Path],
+    ) -> Result<Vec<Vec<(PathBuf, gix::hash::ObjectId, Mode)>>> {
+        files_under(&self.index, prefixes)
+    }
+}
+
+/// The commit `branch` points at; `None` while it is unborn.
+fn branch_tip(
+    repo: &gix::Repository,
+    branch: &gix::refs::FullName,
+) -> Result<Option<gix::hash::ObjectId>> {
+    let failed = |err: &dyn std::error::Error| {
+        SyncError::Git(format!("could not read {}: {err}", branch.as_bstr()))
+    };
+    match repo
+        .try_find_reference(branch.as_ref())
+        .map_err(|err| failed(&err))?
+    {
+        Some(mut reference) => Ok(Some(
+            reference.peel_to_id().map_err(|err| failed(&err))?.detach(),
+        )),
+        None => Ok(None),
+    }
+}
+
+/// A commit built and not published: [`build_authored`]'s answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Built {
+    pub parent: Option<gix::hash::ObjectId>,
+    pub tree: gix::hash::ObjectId,
+    pub commit: gix::hash::ObjectId,
+}
+
+/// Build the commit of exactly `authored` on `base` — its tree with each
+/// entry in place, never what the disk or the index holds — and write its
+/// objects, moving no reference: [`publish`] does, once. `changes` names
+/// the paths in the body. `Ok(None)` when the tree is `base`'s.
+pub fn build_authored(
+    repo: &gix::Repository,
+    base: &Base,
+    changes: &StagedChange,
+    provenance: &Provenance,
+    author: &gix::actor::Signature,
+    authored: Authored<'_>,
+) -> Result<Option<Built>> {
+    let (mut index, parent) = (base.index.clone(), base.head);
+    let parent_tree = match parent {
+        Some(_) => Some(write_tree_from_index(repo, &index)?),
+        None => None,
+    };
+    for (rela, entry) in authored.entries {
+        let key = index_key(rela)?;
+        index.remove_entries(|_, path, _| path == key.as_slice());
+        if let Some((id, mode)) = entry {
+            index.dangerously_push_entry(Stat::default(), *id, Flags::empty(), *mode, key.as_ref());
+        }
+    }
+    index.sort_entries();
+    let tree = write_tree_from_index(repo, &index)?;
+    if parent_tree == Some(tree) {
+        return Ok(None);
+    }
+    let message = authored_message(
+        authored.subject,
+        &change_body(changes),
+        provenance,
+        authored.trailers,
+    );
+    let mut time_buf = gix::date::parse::TimeBuf::default();
+    let signature = author.to_ref(&mut time_buf);
+    let commit = repo
+        .new_commit_as(signature, signature, &message, tree, parent)
+        .map_err(|err| SyncError::Git(format!("commit failed: {}", super::fetch::flatten(&err))))?
+        .id;
+    Ok(Some(Built {
+        parent,
+        tree,
+        commit,
+    }))
+}
+
+/// What [`publish`] came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Publication {
+    /// The branch points at the commit.
+    Published,
+    /// `HEAD` names another branch, or the branch moved from the base:
+    /// nothing moved.
+    Moved,
+    /// `last` said no: nothing moved.
+    Refused,
+}
+
+/// Point `base`'s branch at `built.commit` only while `HEAD` still names
+/// it and it still points at `base`'s commit: the one publication of an
+/// authored commit. `last` is asked once the branch's lock is known free,
+/// right before the compare-and-swap — a caller's lease, say; an error it
+/// returns moves nothing either.
+pub fn publish(
+    repo: &gix::Repository,
+    base: &Base,
+    built: &Built,
+    last: &dyn Fn() -> Result<bool>,
+) -> Result<Publication> {
+    let named = repo
+        .head_name()
+        .map_err(|err| SyncError::Git(format!("could not read HEAD: {err}")))?;
+    if named.as_ref() != Some(&base.branch) {
+        return Ok(Publication::Moved);
+    }
+    let expected = match base.head {
+        Some(id) => {
+            gix::refs::transaction::PreviousValue::MustExistAndMatch(gix::refs::Target::Object(id))
+        }
+        None => gix::refs::transaction::PreviousValue::MustNotExist,
+    };
+    super::repo::ensure_head_unlocked(repo)?;
+    if !last()? {
+        return Ok(Publication::Refused);
+    }
+    let edited = repo.edit_reference(gix::refs::transaction::RefEdit {
+        change: gix::refs::transaction::Change::Update {
+            log: gix::refs::transaction::LogChange {
+                mode: gix::refs::transaction::RefLog::AndReference,
+                force_create_reflog: false,
+                message: "keeper: commit (authored)".into(),
+            },
+            expected,
+            new: gix::refs::Target::Object(built.commit),
+        },
+        name: base.branch.clone(),
+        deref: false,
+    });
+    match edited {
+        Ok(_) => Ok(Publication::Published),
+        Err(err) => {
+            if branch_tip(repo, &base.branch)? != base.head {
+                return Ok(Publication::Moved);
+            }
+            Err(SyncError::Git(format!(
+                "could not publish the commit: {}",
+                super::fetch::flatten(&err)
+            )))
+        }
+    }
+}
+
+/// One path of an authored commit as the index follows it: the entry
+/// `HEAD` held before and the one the commit holds.
+pub type Followed = (
+    PathBuf,
+    Option<(gix::hash::ObjectId, Mode)>,
+    Option<(gix::hash::ObjectId, Mode)>,
+);
+
+/// How long [`index_follow`] waits for the index's lock a person's `git`
+/// holds.
+const INDEX_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Have the index follow an authored commit for exactly its paths: an
+/// entry that still is what `HEAD` held before becomes the commit's (or
+/// goes); one a person staged since is theirs and stays; every other entry
+/// is left as it is. The stat of an entry set here is empty, so the next
+/// status reads its file again.
+///
+/// Under the index's own lock, `index.lock`, from the read to the write —
+/// the lock every `git add` takes — so nothing staged meanwhile is written
+/// over; and every path is decided against the read, sorted index before
+/// any entry moves. `read` is told once the index is read and not written.
+pub fn index_follow(repo: &gix::Repository, paths: &[Followed], read: &dyn Fn()) -> Result<()> {
+    let failed = |what: &str, err: &dyn std::error::Error| {
+        SyncError::Git(format!(
+            "could not {what} the index: {}",
+            super::fetch::flatten(err)
+        ))
+    };
+    let path = repo.index_path();
+    let lock = gix::lock::File::acquire_to_update_resource(
+        &path,
+        gix::lock::acquire::Fail::AfterDurationWithBackoff(INDEX_LOCK_WAIT),
+        None,
+    )
+    .map_err(|err| failed("lock", &err))?;
+    let mut index = gix::index::File::at_or_default(
+        &path,
+        repo.object_hash(),
+        false,
+        gix::index::decode::Options::default(),
+    )
+    .map_err(|err| failed("read", &err))?;
+    read();
+    let mut edits = Vec::new();
+    for (rela, before, after) in paths {
+        let key = index_key(rela)?;
+        let now = index
+            .entry_by_path(key.as_ref())
+            .map(|entry| (entry.id, entry.mode));
+        if now == *before && now != *after {
+            edits.push((key, after));
+        }
+    }
+    if edits.is_empty() {
+        return Ok(());
+    }
+    for (key, after) in edits {
+        index.remove_entries(|_, path, _| path == key.as_slice());
+        if let Some((id, mode)) = after {
+            index.dangerously_push_entry(Stat::default(), *id, Flags::empty(), *mode, key.as_ref());
+        }
+    }
+    index.sort_entries();
+    index.remove_tree();
+    let mut out = std::io::BufWriter::new(lock);
+    index
+        .write_to(&mut out, gix::index::write::Options::default())
+        .map_err(|err| failed("write", &err))?;
+    out.into_inner()
+        .map_err(|err| failed("write", err.error()))?
+        .commit()
+        .map_err(|err| failed("write", &err.error))
+        .map(drop)
+}
+
+/// What `HEAD` holds at or under each of `prefixes` — each file
+/// repository-relative with its entry — one list per prefix, `HEAD`'s tree
+/// read once.
+pub fn head_files_under(
+    repo: &gix::Repository,
+    prefixes: &[&Path],
+) -> Result<Vec<Vec<(PathBuf, gix::hash::ObjectId, Mode)>>> {
+    let (head, _) = head_index(repo)?;
+    files_under(&head, prefixes)
 }
 
 /// Derive `(name, email)` for the git author of a profile's commits (AD-44).

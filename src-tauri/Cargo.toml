@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/keeper-core", "crates/keeper", "crates/keeper-sync", "crates/keeper-syncd"]
+members = ["crates/keeper-core", "crates/keeper", "crates/keeper-sync", "crates/keeper-syncd", "crates/keeper-ported", "crates/keeper-agent", "crates/keeper-agentd"]
 
 [workspace.package]
 version = "0.9.0"
@@ -277,6 +277,10 @@ notify-debouncer-full = "0.7"
 # plus per-profile excludes. `Unlicense OR MIT` — the MIT arm satisfies the
 # firewall. Already resolved in the lock transitively.
 globset = "0.4"
+# The session log's secret redaction (Epic 89, S-17): a closed pattern set over
+# what an agent logs. Already in Cargo.lock at 1.12 through globset/matrix-sdk,
+# so the tree gains no package. MIT OR Apache-2.0.
+regex = "1"
 # Content verification (Stories 25.1, 25.3, 26.5): SHA-256 for LFS object OIDs
 # and verify-on-read. Already resolved in the lock transitively via
 # vodozemac/matrix-sdk, so a direct dep pulls no new crate version. Hardware
@@ -299,6 +303,12 @@ toml = "0.9"
 # included, stays. Already in Cargo.lock at this version through
 # `proc-macro-crate`, so the tree gains no package. MIT OR Apache-2.0.
 toml_edit = "0.25.12"
+# The headless hosts' process layer (Epic 90, S-07, S-34): `geteuid` for the
+# strict secrets directory, `O_NOFOLLOW` for its files and, on Linux,
+# `prctl(PR_SET_DUMPABLE, 0)`. Already in Cargo.lock at 1.1.4 through
+# tempfile and tokio, so the tree gains no package.
+# `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT`.
+rustix = { version = "1.1", default-features = false, features = ["std", "fs", "process"] }
 # Exact-length streaming request bodies for LFS uploads (Story 25.3). This is
 # not optional sugar: `reqwest::Body::wrap_stream` and `Body::from(File)` both
 # yield an unknown-size body and therefore `Transfer-Encoding: chunked`, which

@@ -101,7 +101,7 @@ impl FakeBotHost {
     /// core, open a stream (record it), and return what `close` would feed
     /// the turn — the answer, or the refusal's sentence.
     fn send_spoken(&mut self, text: &str) -> Result<String, String> {
-        let target = voice_target::resolve(self.chosen.as_deref(), &self.bots, &self.sessions)
+        let target = voice_target::resolve(self.chosen.as_deref(), &self.bots, &self.sessions, &[])
             .map_err(|refusal| refusal.message())?;
         self.streams.push((target, text.to_owned()));
         Ok(self.answer.to_owned())
@@ -191,7 +191,7 @@ fn a_heard_question_becomes_one_stream_on_the_target_and_its_answer_is_spoken() 
     assert_eq!(host.streams.len(), 1, "one turn, not two");
     assert_eq!(
         host.streams[0].0,
-        VoiceTarget {
+        VoiceTarget::Bot {
             bot_id: "b".to_owned(),
             session_id: Some("s2".to_owned()),
         }
@@ -240,7 +240,7 @@ fn a_button_turn_takes_the_same_path() {
     assert_eq!(
         host.streams,
         vec![(
-            VoiceTarget {
+            VoiceTarget::Bot {
                 bot_id: "a".to_owned(),
                 session_id: None,
             },

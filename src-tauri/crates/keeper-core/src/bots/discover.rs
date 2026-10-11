@@ -3,21 +3,23 @@
 //!
 //! Four questions, and this module is honest about which of them it can answer:
 //!
-//! 1. **Is it there, and what is it?** [`health`] asks one cheap, public route
-//!    per kind — Ollama's `GET /api/version`, Hermes' `GET /health`, both of
-//!    which carry a `version` string (R2 §3; R1 §10.3).
+//! 1. **Is it there, and what is it?** [`health`] asks one cheap route per
+//!    kind — Ollama's `GET /api/version`, Hermes' `GET /health`, both of
+//!    which carry a `version` string (R2 §3; R1 §10.3), and an OpenAI-compatible
+//!    endpoint's `GET /v1/models`, the one route the dialect is sure to have.
 //! 2. **Which models can I send?** [`models`] reads the endpoint that is
 //!    strictly better per kind: `GET /api/tags` for Ollama, because it carries
 //!    the whole `capabilities` array for every local model in one round trip
-//!    (R2 §4.1), and `GET /v1/models` merged with `GET /api/model/options` for
+//!    (R2 §4.1), `GET /v1/models` merged with `GET /api/model/options` for
 //!    Hermes, because the first is the roster and only the second knows what a
-//!    model supports (R1 §2.9, §4.3).
+//!    model supports (R1 §2.9, §4.3), and `GET /v1/models` alone for an
+//!    OpenAI-compatible endpoint, which states no capabilities at all (AD-151).
 //! 3. **Does this bot exist?** [`probe_bot`] verifies a *named* bot, and
 //!    distinguishes "no such bot" from "keeper's credential was refused" from
 //!    "nothing answered" — three different sentences for a user about to
 //!    retype a name that was right all along.
-//! 4. **Which bots exist?** It cannot say. See [`NO_BOT_ROSTER`] and
-//!    [`enumerate_bots`].
+//! 4. **Which bots exist?** Ollama and an OpenAI-compatible endpoint list
+//!    them; Hermes cannot say. See [`NO_BOT_ROSTER`] and [`enumerate_bots`].
 //!
 //! # The tri-state, which is the load-bearing rule here
 //!
@@ -106,17 +108,37 @@ pub fn discovery_client() -> Result<reqwest::Client, BotsError> {
     http::client(DISCOVERY_READ_TIMEOUT)
 }
 
-/// The cheap, public route that says whether an endpoint is there and what
-/// version it is, per kind.
+/// The cheap route that says whether an endpoint is there and what version it
+/// is, per kind.
 ///
 /// Ollama: `GET /api/version` — unauthenticated, present since the first
 /// releases, `{"version":"x.y.z"}` (R2 §3). Hermes: `GET /health` — public, and
 /// its `version` comes from `hermes_cli.__version__` specifically so a client
-/// can read the gateway version without scraping (R1 §10.3).
+/// can read the gateway version without scraping (R1 §10.3). OpenAi:
+/// `GET /v1/models` — the dialect has no health or version route, and the
+/// model list is the one it cannot lack; it is authenticated, so a wrong key
+/// shows here rather than at the first chat.
 fn health_route(kind: ProviderKind) -> &'static str {
     match kind {
         ProviderKind::Ollama => "/api/version",
         ProviderKind::Hermes => "/health",
+        ProviderKind::OpenAi => OPENAI_MODELS,
+    }
+}
+
+/// Whether discovery can say what a model supports, per kind — the question
+/// a turn asks before it decides to probe a model's capabilities.
+///
+/// Ollama answers per model (`/api/tags`, `/api/show`). Hermes executes its
+/// own tools and its flags describe the model behind it, not keeper's drive
+/// tools (R1 §2.7). An OpenAI-compatible endpoint's `/v1/models` carries no
+/// capabilities, so a probe's answer is always `None` and costs a request for
+/// nothing. A caller that gets `false` skips the probe and treats the
+/// capability as unknown.
+pub fn probes_model_capabilities(kind: ProviderKind) -> bool {
+    match kind {
+        ProviderKind::Ollama => true,
+        ProviderKind::Hermes | ProviderKind::OpenAi => false,
     }
 }
 
@@ -198,6 +220,7 @@ pub async fn models(
     match endpoint.kind {
         ProviderKind::Ollama => ollama_models(client, endpoint).await,
         ProviderKind::Hermes => hermes_models(client, endpoint).await,
+        ProviderKind::OpenAi => openai_models(client, endpoint).await,
     }
 }
 
@@ -213,6 +236,8 @@ pub async fn models(
 ///
 /// **Ollama**: a bot is a model tag, so the probe is a lookup in the tag list.
 ///
+/// **OpenAi**: a bot is a model id, so the probe is a lookup in `/v1/models`.
+///
 /// The prefixed URL is built by [`Endpoint::url`] from a copy of the caller's
 /// endpoint carrying `bot`, never by string arithmetic here — one place in the
 /// tree knows how a Hermes profile prefix is spelled.
@@ -220,6 +245,7 @@ pub async fn probe_bot(client: &reqwest::Client, endpoint: &Endpoint, bot: &str)
     match endpoint.kind {
         ProviderKind::Hermes => probe_hermes_profile(client, endpoint, bot).await,
         ProviderKind::Ollama => probe_ollama_tag(client, endpoint, bot).await,
+        ProviderKind::OpenAi => probe_openai_model(client, endpoint, bot).await,
     }
 }
 
@@ -227,8 +253,9 @@ pub async fn probe_bot(client: &reqwest::Client, endpoint: &Endpoint, bot: &str)
 /// refusal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BotRoster {
-    /// The endpoint can be asked, and these are its bots. Ollama only: its
-    /// bots are its model tags, which `/api/tags` lists in full.
+    /// The endpoint can be asked, and these are its bots. Ollama's are its
+    /// model tags (`/api/tags`); an OpenAI-compatible endpoint's are its model
+    /// ids (`/v1/models`).
     Enumerated(Vec<String>),
     /// The endpoint cannot be asked, and this is the sentence that says why.
     /// Always [`NO_BOT_ROSTER`] today; typed as an outcome rather than an error
@@ -241,10 +268,11 @@ pub enum BotRoster {
 
 /// List the bots at an endpoint, or say why that cannot be done.
 ///
-/// For Ollama this is real enumeration. For Hermes it is deliberately **not
-/// implemented**, and the reason is [`NO_BOT_ROSTER`] — the bearer API exposes
-/// no roster (R1 §4.2). No request is sent in that case: keeper does not probe
-/// a route it has read the source of and knows is absent.
+/// For Ollama and an OpenAI-compatible endpoint this is real enumeration. For
+/// Hermes it is deliberately **not implemented**, and the reason is
+/// [`NO_BOT_ROSTER`] — the bearer API exposes no roster (R1 §4.2). No request
+/// is sent in that case: keeper does not probe a route it has read the source
+/// of and knows is absent.
 pub async fn enumerate_bots(
     client: &reqwest::Client,
     endpoint: &Endpoint,
@@ -253,7 +281,7 @@ pub async fn enumerate_bots(
         ProviderKind::Hermes => Ok(BotRoster::Unavailable {
             reason: NO_BOT_ROSTER,
         }),
-        ProviderKind::Ollama => Ok(BotRoster::Enumerated(
+        ProviderKind::Ollama | ProviderKind::OpenAi => Ok(BotRoster::Enumerated(
             models(client, endpoint)
                 .await?
                 .into_iter()
@@ -646,6 +674,83 @@ fn hermes_presence(status: u16, bot: &str) -> (BotPresence, Option<String>) {
 }
 
 // ---------------------------------------------------------------------------
+// OpenAI-compatible
+// ---------------------------------------------------------------------------
+
+/// The OpenAI dialect's model list, and its health route.
+const OPENAI_MODELS: &str = "/v1/models";
+
+/// `GET /v1/models` — `{"object":"list","data":[{"id":…,"object":"model",
+/// "owned_by":…}]}`. The list names models and nothing else, so every
+/// capability is `None` (AD-151): keeper could not read it, so it is unknown,
+/// not absent.
+async fn openai_models(
+    client: &reqwest::Client,
+    endpoint: &Endpoint,
+) -> Result<Vec<BotModelVm>, BotsError> {
+    let ids = openai_model_ids(client, endpoint).await?;
+    // A Hermes row with no enrichment is exactly a listed id with every
+    // capability unknown.
+    Ok(ids.into_iter().map(|id| hermes_vm(id, None)).collect())
+}
+
+/// The shared `/v1/models` fetch: distinct, non-empty ids in the endpoint's
+/// order, so the probe and the model list read one parser.
+async fn openai_model_ids(
+    client: &reqwest::Client,
+    endpoint: &Endpoint,
+) -> Result<Vec<String>, BotsError> {
+    let label = format!("GET {OPENAI_MODELS}");
+    let request = http::authorize(
+        client.get(endpoint.url(OPENAI_MODELS)),
+        endpoint.token.as_deref(),
+    )?;
+    let response = request.send().await.map_err(BotsError::transport)?;
+    let response = require_success(response, &label).await?;
+    let roster: HermesModelsBody = json_body(response, &label).await?;
+    let mut ids: Vec<String> = Vec::with_capacity(roster.data.len());
+    for row in roster.data {
+        if !row.id.is_empty() && !ids.contains(&row.id) {
+            ids.push(row.id);
+        }
+    }
+    Ok(ids)
+}
+
+/// The probe for an OpenAI-compatible "bot", which is a model id.
+async fn probe_openai_model(
+    client: &reqwest::Client,
+    endpoint: &Endpoint,
+    bot: &str,
+) -> BotProbeVm {
+    let started = Instant::now();
+    match openai_model_ids(client, endpoint).await {
+        Ok(ids) => {
+            let present = ids.iter().any(|id| id == bot);
+            BotProbeVm {
+                reach: BotReach::Online,
+                status: Some(200),
+                version: None,
+                round_trip_ms: Some(elapsed_ms(started)),
+                bot: Some(bot.to_owned()),
+                presence: Some(if present {
+                    BotPresence::Exists
+                } else {
+                    BotPresence::Absent
+                }),
+                reason: (!present).then(|| {
+                    format!(
+                        "This endpoint lists no model named \"{bot}\". Pick one of the models it \
+                         lists."
+                    )
+                }),
+            }
+        }
+        Err(err) => probe_from_error(err, bot, OPENAI_MODELS, endpoint.kind, elapsed_ms(started)),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Shared HTTP plumbing
 // ---------------------------------------------------------------------------
 
@@ -733,6 +838,10 @@ fn status_sentence(status: u16, path: &str, kind: ProviderKind) -> String {
             ProviderKind::Hermes => format!(
                 "The endpoint refused keeper's key ({status}). Check the provider's key, or \
                  whether this profile is served under one of its own."
+            ),
+            ProviderKind::OpenAi => format!(
+                "The endpoint refused keeper's key ({status}). Check the key this provider was \
+                 saved with."
             ),
         },
         404 => format!(
@@ -859,7 +968,9 @@ struct TagDetails {
     quantization_level: Option<String>,
 }
 
-/// `{"object":"list","data":[{"id":"hermes-agent",…}]}` (R1 §2.9).
+/// `{"object":"list","data":[{"id":"hermes-agent",…}]}` (R1 §2.9) — the
+/// OpenAI dialect's own model list, which an OpenAI-compatible endpoint
+/// answers in the same shape.
 #[derive(Debug, Deserialize)]
 struct HermesModelsBody {
     #[serde(default)]

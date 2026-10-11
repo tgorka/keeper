@@ -1,0 +1,30 @@
+[package]
+name = "keeper-ported"
+description = "Upstream code rewritten in Rust: pure, one module per upstream, each with UPSTREAM.md (AD-396)"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+# AD-396: no keeper dependency, no network, no async runtime, no tauri.
+# `bun run check:ported-pure` asserts it over `cargo tree`.
+[dependencies]
+# `bmad::render` hashes a generation's identity and writes its manifest as
+# BMAD's renderer does; both already in the workspace's lock.
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+# `hermes::threats` compiles Hermes' threat patterns; already in the lock.
+regex = { workspace = true }
+# `preserve_order`: a table keeps its document order, as BMAD's Python dicts
+# do, so a merged configuration, a party roster and an ambiguity sentence come
+# out in BMAD's order (R98). Cargo unifies the feature into every crate that
+# links this one; `indexmap` is already in the lock under `toml`.
+toml = { workspace = true, features = ["preserve_order"] }
+unicode-normalization = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

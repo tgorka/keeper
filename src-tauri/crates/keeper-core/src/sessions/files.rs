@@ -37,6 +37,9 @@ use crate::sessions::model::{ARTIFACTS_DIR, README};
 use crate::sessions::plan::{Plan, PlanStep};
 use crate::sessions::shape::{KindTag, ABOUT, AGENTS};
 
+/// BMAD's memory log, the one dotted name keeper writes into a session.
+pub use keeper_ported::bmad::memlog::MEMLOG;
+
 /// The `workspace/` fence, spelled session-relative.
 ///
 /// The real fence is `keeper_sync::files_write::WriteScope` and it works on
@@ -155,6 +158,18 @@ pub enum FileVerbError {
     Extension { rel: String },
 
     #[error(
+        "an agent writes .md, .csv, .json, .yaml, .yml, .toml, .txt and .html files under \
+         artifacts/ — {rel} is none of those."
+    )]
+    AgentExtension { rel: String },
+
+    #[error(
+        "{rel} is not a memlog: bmad_memlog writes only a file named .memlog.md under \
+         artifacts/. Write anything else with session_write."
+    )]
+    NotMemlog { rel: String },
+
+    #[error(
         "{rel} is one of the three files a session cannot do without: AGENTS.md is what tells \
          keeper this session is a flat one, README.md is the record carrying its identity, its \
          title, its pins and its promote table, and about.md is that same record in every \
@@ -217,6 +232,76 @@ pub fn check_rel(rel: &str) -> Result<(), FileVerbError> {
     Ok(())
 }
 
+/// The extensions an agent's write under `artifacts/` takes besides
+/// [`NewFileKind`]'s three (R112): what BMAD writes as output —
+/// `sprint-status.yaml`, a TOML or text report, an HTML page. A person's
+/// *New file* keeps its three kinds, and so does an agent's write anywhere
+/// else in the session.
+pub const AGENT_ARTIFACT_EXTENSIONS: [&str; 5] = ["yaml", "yml", "toml", "txt", "html"];
+
+/// Whether `rel` lies inside the session's `artifacts/`, below its root.
+fn in_artifacts(rel: &str) -> bool {
+    rel.strip_prefix(ARTIFACTS_DIR)
+        .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// Whether an agent may write the session-relative `rel` as a new or
+/// replaced file (R112): [`check_rel`] anywhere in the session, and under
+/// `artifacts/` the same containment with [`AGENT_ARTIFACT_EXTENSIONS`]
+/// beside the three kinds.
+///
+/// # Errors
+/// Whatever [`check_dir`] refuses; [`FileVerbError::AgentExtension`] for
+/// another extension under `artifacts/`; elsewhere, what [`check_rel`]
+/// refuses.
+pub fn check_agent_file(rel: &str) -> Result<(), FileVerbError> {
+    if !in_artifacts(rel) {
+        return check_rel(rel);
+    }
+    check_dir(rel)?;
+    let ext = rel
+        .rsplit_once('.')
+        .map(|(_, ext)| ext.to_ascii_lowercase())
+        .unwrap_or_default();
+    if NewFileKind::parse(&ext).is_none() && !AGENT_ARTIFACT_EXTENSIONS.contains(&ext.as_str()) {
+        return Err(FileVerbError::AgentExtension {
+            rel: rel.to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Whether `rel`, session-relative, is a memlog an agent's `bmad_memlog`
+/// may write: the basename exactly [`MEMLOG`], inside `artifacts/` at any
+/// depth, every folder on the way one [`check_dir`] accepts. The one
+/// exception to the dotted-name rule (Story 52.5): BMAD reads its memlog
+/// back by name on resume, so the board not listing it costs nothing.
+///
+/// # Errors
+/// [`FileVerbError::Outside`] for traversal or an absolute path;
+/// [`FileVerbError::Hidden`] for a memlog anywhere but `artifacts/`, or a
+/// dotted name other than [`MEMLOG`]; [`FileVerbError::NotMemlog`] for any
+/// other file.
+pub fn check_memlog(rel: &str) -> Result<(), FileVerbError> {
+    if escapes(rel) {
+        return Err(FileVerbError::Outside {
+            rel: rel.to_owned(),
+        });
+    }
+    let hidden = || FileVerbError::Hidden {
+        rel: rel.to_owned(),
+    };
+    match rel.rsplit_once('/') {
+        Some((dir, MEMLOG)) if dir == ARTIFACTS_DIR || in_artifacts(dir) => {
+            check_dir(dir).map_err(|_| hidden())
+        }
+        _ if rel.split('/').any(|part| part.starts_with('.')) => Err(hidden()),
+        _ => Err(FileVerbError::NotMemlog {
+            rel: rel.to_owned(),
+        }),
+    }
+}
+
 /// The same containment rule for a **folder** a new file is going into.
 ///
 /// Split from [`check_rel`] rather than folded into it because the extension
@@ -253,13 +338,7 @@ pub fn check_rel(rel: &str) -> Result<(), FileVerbError> {
 /// capitalised.
 pub fn check_dir(rel: &str) -> Result<(), FileVerbError> {
     let owned = || rel.to_owned();
-    if rel.is_empty()
-        || rel.starts_with('/')
-        || rel.contains('\\')
-        || rel
-            .split('/')
-            .any(|part| part.is_empty() || part == "." || part == "..")
-    {
+    if escapes(rel) {
         return Err(FileVerbError::Outside { rel: owned() });
     }
     // After the traversal arm, so `.` and `..` are answered as what they are: a
@@ -275,6 +354,17 @@ pub fn check_dir(rel: &str) -> Result<(), FileVerbError> {
         return Err(FileVerbError::Workspace { rel: owned() });
     }
     Ok(())
+}
+
+/// Whether `rel` is not a plain path inside the session: empty, absolute,
+/// or with a backslash, an empty, `.` or `..` segment.
+fn escapes(rel: &str) -> bool {
+    rel.is_empty()
+        || rel.starts_with('/')
+        || rel.contains('\\')
+        || rel
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
 }
 
 /// The folder path a *New folder* press lands on: the last segment folded, the
@@ -670,6 +760,20 @@ pub fn render_new(
 /// will not write.
 pub fn compile_new(session: &str, rel: &str, content: &str) -> Result<Plan, FileVerbError> {
     check_rel(rel)?;
+    Ok(compile_file(session, rel, content))
+}
+
+/// [`compile_new`] for an agent's file, under [`check_agent_file`]'s rule:
+/// `artifacts/` also takes [`AGENT_ARTIFACT_EXTENSIONS`] (R112).
+///
+/// # Errors
+/// Whatever [`check_agent_file`] refuses.
+pub fn compile_agent_file(session: &str, rel: &str, content: &str) -> Result<Plan, FileVerbError> {
+    check_agent_file(rel)?;
+    Ok(compile_file(session, rel, content))
+}
+
+fn compile_file(session: &str, rel: &str, content: &str) -> Plan {
     let mut steps = Vec::new();
     if let Some((parent, _)) = rel.rsplit_once('/') {
         steps.push(PlanStep::MkDir {
@@ -680,8 +784,44 @@ pub fn compile_new(session: &str, rel: &str, content: &str) -> Result<Plan, File
         path: format!("{session}/{rel}"),
         content: content.to_owned(),
     });
-    Ok(Plan {
+    Plan {
         verb: "file-new".to_owned(),
+        session: session.to_owned(),
+        steps,
+    }
+}
+
+/// The plan that writes the memlog at `rel` (session-relative) with
+/// `content`: a new file, created only where none has appeared since, or
+/// one replaced through a write guarded on the exact bytes `old` it was
+/// composed from (R120). Every write is the executor's atomic, durable
+/// replace, as `memlog.py`'s `write_atomic` is.
+///
+/// # Errors
+/// Whatever [`check_memlog`] refuses.
+pub fn compile_memlog(
+    session: &str,
+    rel: &str,
+    old: Option<&str>,
+    content: &str,
+) -> Result<Plan, FileVerbError> {
+    check_memlog(rel)?;
+    let path = format!("{session}/{rel}");
+    let mut steps = Vec::with_capacity(2);
+    if let Some((parent, _)) = rel.rsplit_once('/') {
+        steps.push(PlanStep::MkDir {
+            path: format!("{session}/{parent}"),
+        });
+    }
+    steps.push(match old {
+        Some(old) => PlanStep::guarded(path, old, content.to_owned()),
+        None => PlanStep::CreateFile {
+            path,
+            content: content.to_owned(),
+        },
+    });
+    Ok(Plan {
+        verb: "memlog".to_owned(),
         session: session.to_owned(),
         steps,
     })
@@ -796,7 +936,7 @@ pub struct Rewrite {
 ///
 /// **[`PlanStep::MoveFile`] is last.** That is AD-111's rule, and here it is also
 /// the only order that resumes: a re-run guarded write meets its own output and
-/// returns `Ok` (`sessions_exec`'s idempotency-before-guard branch), so the move
+/// returns `Ok` (`keeper_agent::sessions::exec`'s idempotency-before-guard branch), so the move
 /// is the one step a resume has left to do. Moving first would leave a resumable
 /// prefix in which every remaining rewrite is addressed at a path that has gone.
 ///
@@ -805,7 +945,7 @@ pub struct Rewrite {
 /// a source that is no longer there. The tree is *consistent* in that window —
 /// fully renamed, pointers rewritten — and the resume reports the disk's error
 /// over it. Teaching `MoveFile` to read "source gone, target present" as "already
-/// done" would close it, and `sessions_exec` argues at length against exactly
+/// done" would close it, and `keeper_agent::sessions::exec` argues at length against exactly
 /// that: the same test is satisfied by a neighbour a rename must never be told it
 /// ate.
 ///
@@ -827,6 +967,7 @@ pub fn compile_rename(
         steps.push(PlanStep::GuardedWrite {
             path: format!("{session}/{}", rewrite.rel),
             expect_len: rewrite.expect_len,
+            expect_sha256: None,
             content: rewrite.content.clone(),
         });
     }
@@ -863,6 +1004,129 @@ mod tests {
         assert_eq!(NewFileKind::parse("png"), None);
         assert_eq!(NewFileKind::parse("sh"), None);
         assert_eq!(NewFileKind::parse(""), None);
+    }
+
+    /// R112: an agent's file under `artifacts/` also takes BMAD's output
+    /// kinds; anywhere else in the session, and for a person's *New file*,
+    /// the set stays the three.
+    #[test]
+    fn an_agents_artifact_takes_bmads_output_kinds() {
+        for rel in [
+            "artifacts/sprint-status.yaml",
+            "artifacts/run/tea-progress.YML",
+            "artifacts/report.toml",
+            "artifacts/notes.txt",
+            "artifacts/site/index.html",
+            "artifacts/epics.md",
+        ] {
+            assert_eq!(check_agent_file(rel), Ok(()), "{rel}");
+            assert!(compile_agent_file("active/s", rel, "x").is_ok(), "{rel}");
+        }
+        assert_eq!(
+            check_rel("artifacts/sprint-status.yaml"),
+            Err(FileVerbError::Extension {
+                rel: "artifacts/sprint-status.yaml".to_owned()
+            }),
+            "a person's New file keeps its three kinds"
+        );
+        assert_eq!(
+            check_agent_file("sprint-status.yaml"),
+            Err(FileVerbError::Extension {
+                rel: "sprint-status.yaml".to_owned()
+            }),
+            "outside artifacts/ an agent's file keeps them too"
+        );
+        for rel in ["artifacts/shot.png", "artifacts/run.sh", "artifacts/README"] {
+            assert_eq!(
+                check_agent_file(rel),
+                Err(FileVerbError::AgentExtension {
+                    rel: rel.to_owned()
+                })
+            );
+        }
+        assert_eq!(
+            check_agent_file("artifacts/.hidden.yaml"),
+            Err(FileVerbError::Hidden {
+                rel: "artifacts/.hidden.yaml".to_owned()
+            })
+        );
+        assert!(matches!(
+            check_agent_file("artifacts/../x.yaml"),
+            Err(FileVerbError::Outside { .. })
+        ));
+    }
+
+    /// The memlog door: exactly `.memlog.md`, under `artifacts/` at any
+    /// depth; every other dotted name, and a memlog anywhere else, is the
+    /// Hidden refusal it always was.
+    #[test]
+    fn only_the_memlog_under_artifacts_is_dotted() {
+        for rel in [
+            "artifacts/.memlog.md",
+            "artifacts/run-1/.memlog.md",
+            "artifacts/_bmad-output/planning-artifacts/arch/.memlog.md",
+        ] {
+            assert_eq!(check_memlog(rel), Ok(()), "{rel}");
+        }
+        for rel in [
+            ".memlog.md",
+            "notes/.memlog.md",
+            "workspace/.memlog.md",
+            "Artifacts/.memlog.md",
+            "artifacts/run/.other.md",
+            "artifacts/.run/.memlog.md",
+            "artifacts/run/.memlog.md/x.md",
+        ] {
+            assert_eq!(
+                check_memlog(rel),
+                Err(FileVerbError::Hidden {
+                    rel: rel.to_owned()
+                }),
+                "{rel}"
+            );
+        }
+        assert_eq!(
+            check_memlog("artifacts/run/notes.md"),
+            Err(FileVerbError::NotMemlog {
+                rel: "artifacts/run/notes.md".to_owned()
+            })
+        );
+        for rel in ["artifacts/../.memlog.md", "/artifacts/.memlog.md", ""] {
+            assert_eq!(
+                check_memlog(rel),
+                Err(FileVerbError::Outside {
+                    rel: rel.to_owned()
+                }),
+                "{rel}"
+            );
+        }
+        // The rest of the session keeps its rule.
+        assert!(matches!(
+            check_rel("artifacts/run/.memlog.md"),
+            Err(FileVerbError::Hidden { .. })
+        ));
+
+        // A new memlog is created where none is; an existing one is
+        // replaced only over the bytes it was composed from (R120).
+        let new = compile_memlog("active/s", "artifacts/run/.memlog.md", None, "a").expect("plan");
+        assert_eq!(
+            new.steps.last(),
+            Some(&PlanStep::CreateFile {
+                path: "active/s/artifacts/run/.memlog.md".to_owned(),
+                content: "a".to_owned()
+            })
+        );
+        let replaced =
+            compile_memlog("active/s", "artifacts/run/.memlog.md", Some("a"), "ab").expect("plan");
+        assert_eq!(
+            replaced.steps.last(),
+            Some(&PlanStep::guarded(
+                "active/s/artifacts/run/.memlog.md".to_owned(),
+                "a",
+                "ab".to_owned()
+            ))
+        );
+        assert!(compile_memlog("active/s", ".memlog.md", None, "a").is_err());
     }
 
     /// The fence, asked one scope in from where it is enforced (AD-113).
@@ -1774,11 +2038,13 @@ mod tests {
                 PlanStep::GuardedWrite {
                     path: "active/2026-08-16-keeper/2026-08-16-1812-untitled.md".to_owned(),
                     expect_len: 30,
+                    expect_sha256: None,
                     content: "titled".to_owned(),
                 },
                 PlanStep::GuardedWrite {
                     path: "active/2026-08-16-keeper/README.md".to_owned(),
                     expect_len: 40,
+                    expect_sha256: None,
                     content: "pointed".to_owned(),
                 },
                 PlanStep::MoveFile {

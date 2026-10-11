@@ -497,7 +497,7 @@ pub const KEYS: &[KeySpec] = &[
         settable: Settable::AnyLayer,
         shape: Shape::Text,
         default: "",
-        summary: "The id of the pinned bot a spoken turn goes to. Blank means the pinned bot most recently talked to; with none, the turn is refused and says so.",
+        summary: "Where a spoken turn goes: the id of a pinned bot, or `agent:<room id>` for one of your assistant's conversations (AD-384), sent there as your own message and never held for Undo-Send. Blank means the pinned bot most recently talked to; with none, the turn is refused and says so. An `agent:` room that is no longer one of your assistant's is refused, never sent to a bot instead.",
         example: "\"01ARZ3NDEKTSV4RRFFQ69G5FAV\"",
     },
     KeySpec {

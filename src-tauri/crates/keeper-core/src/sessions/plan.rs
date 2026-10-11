@@ -33,12 +33,38 @@ pub enum PlanStep {
     CopyFile { from: String, to: String },
     /// Write these exact bytes to a file, atomically, overwriting.
     WriteFile { path: String, content: String },
+    /// Write these exact bytes to a file that is not there, atomically: a
+    /// file there already is refused unless it holds these bytes (a resume
+    /// finding its own write), so a file that appeared since the plan was
+    /// compiled is never replaced.
+    CreateFile { path: String, content: String },
+    /// Create one directory that is not there, inside a parent that is: a
+    /// resume accepts it there only as a real directory, never a link, so
+    /// nothing written into it can be carried somewhere else.
+    MkDirNew { path: String },
+    /// Move the real directory `from` to `to`, which must not be there,
+    /// once its whole tree is exactly `files` — each regular file by
+    /// `/`-joined path below it, with the SHA-256 of its bytes; a link,
+    /// another kind of entry, a missing or an extra file refuses the move.
+    /// Succeeds when `from` is gone and `to` is exactly `files` (the move
+    /// already happened).
+    PublishDir {
+        from: String,
+        to: String,
+        files: std::collections::BTreeMap<String, String>,
+    },
     /// Replace a file's whole content with `content` **only if** its current
-    /// content is `expect` — the splice-writer's optimistic guard, so a
-    /// concurrent agent write turns into a refusal rather than a lost edit.
+    /// content is what the plan was compiled from — the splice-writer's
+    /// optimistic guard, so a concurrent agent write turns into a refusal
+    /// rather than a lost edit. `expect_len` is the length read; a card's
+    /// writers also give `expect_sha256`, the SHA-256 of the bytes read,
+    /// because an edit of the same length (`todo` → `done`) is still an edit
+    /// (R120). Build one through [`PlanStep::guarded`].
     GuardedWrite {
         path: String,
         expect_len: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expect_sha256: Option<String>,
         content: String,
     },
     /// Move a directory. Succeeds if the source is gone and the target exists.
@@ -70,6 +96,25 @@ pub enum PlanStep {
     /// Remove every entry under a directory except `.gitkeep`, writing one if
     /// absent — the zone's "empty the workspace" (FR-245 step 3).
     EmptyDirKeep { path: String },
+}
+
+impl PlanStep {
+    /// A [`PlanStep::GuardedWrite`] of `content` over `path`, guarded on the
+    /// exact bytes `read` — their length and their SHA-256.
+    pub fn guarded(path: String, read: &str, content: String) -> PlanStep {
+        PlanStep::GuardedWrite {
+            path,
+            expect_len: read.len(),
+            expect_sha256: Some(sha256_hex(read)),
+            content,
+        }
+    }
+}
+
+/// The lowercase hex SHA-256 of `text`, as a guard compares it.
+pub fn sha256_hex(text: &str) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(text.as_bytes()))
 }
 
 /// A compiled verb: its steps, in execution order.
@@ -242,7 +287,7 @@ pub fn compile_create_from(
 /// the zone, and continuing one is a thing an operator does on day one. With the
 /// name fixed, the shell read the source's `README.md` — absent — and compiled
 /// `GuardedWrite { path: "<source>/README.md", expect_len: 0 }`, which
-/// `sessions_exec` reads before writing and refuses with a raw ENOENT; the append
+/// `keeper_agent::sessions::exec` reads before writing and refuses with a raw ENOENT; the append
 /// is pushed AFTER the create steps, so the operator got an errno, a new session
 /// already on disk, and no `continues`/`continued-by` pair — precisely the loss
 /// AD-112 exists to prevent. Worse in the half-migrated shape, where an old
@@ -274,6 +319,7 @@ pub fn compile_create_from_shaped(
     plan.steps.push(PlanStep::GuardedWrite {
         path: format!("{source_session}/{record_name}"),
         expect_len: source_record.len(),
+        expect_sha256: None,
         content: updated,
     });
     plan
@@ -375,6 +421,7 @@ pub fn compile_log_today(session: &str, readme: &str, date: &str) -> Option<(Pla
             steps: vec![PlanStep::GuardedWrite {
                 path: format!("{session}/README.md"),
                 expect_len: readme.len(),
+                expect_sha256: None,
                 content: updated,
             }],
         },
@@ -609,6 +656,7 @@ mod tests {
             path,
             expect_len,
             content,
+            ..
         }) = plan.steps.last()
         else {
             panic!("the source write is the last step");
@@ -625,7 +673,7 @@ mod tests {
     /// The append has to land on the file the bytes came out of. When the name was
     /// a constant, the shell read `<source>/README.md` (absent), got `""`, and
     /// compiled `GuardedWrite { path: "<source>/README.md", expect_len: 0 }`:
-    /// `sessions_exec` reads the target before writing and maps the ENOENT to
+    /// `keeper_agent::sessions::exec` reads the target before writing and maps the ENOENT to
     /// `Refused`, so the step failed with an errno *after* the create steps had
     /// already put the new session on disk — a stray session and no
     /// `continues`/`continued-by` pair, the loss AD-112 exists to prevent.
@@ -656,6 +704,7 @@ mod tests {
             path,
             expect_len,
             content,
+            ..
         }) = plan.steps.last()
         else {
             panic!("the source write is the last step: {:?}", plan.steps);

@@ -1,0 +1,30 @@
+# Nixi: the person's one door to every other agent (AD-380). Seeded by
+# `keeper-agentd agents init`; the file is yours from its first commit.
+version     = 1
+id          = "nixi"
+name        = "Nixi"
+kind        = "proxy"
+matrix_user = "@nixi:{{homeserver}}"
+human       = {{owner}}
+
+[model]
+bot = {{bot}}
+
+[tools]
+drives = ["tgdrive", "neuradrive"]
+
+[host]
+prefer_always_on = true
+
+[limits]
+rounds_per_turn         = 8
+tokens_per_turn         = 0
+tokens_per_delegation   = 200000
+hop_limit               = 3
+rounds_per_exchange     = 3
+max_concurrent_sessions = 4
+
+[memory]
+nudge_user_turns      = 10
+nudge_tool_iterations = 15
+promote               = true

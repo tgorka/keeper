@@ -391,11 +391,12 @@ pub type BotRunFuture = Pin<Box<dyn Future<Output = BotRunRecord> + Send>>;
 /// The one door through which a bot task reaches a bot (AD-224).
 ///
 /// `keeper-sync` is `keeper-core`-free (AD-40), so the engine cannot call
-/// `keeper_core::bots::chat`; the desktop shell implements this over its own
-/// `open_turn` — the same code path a typed or spoken message takes, with an
-/// explicit **task** origin so a run never speaks — and hands it to the engine
-/// through [`SyncPlatform::bot_task_runner`]. Object-safe and boxed for the
-/// reason [`SyncPlatform`] is: the engine holds it as `Arc<dyn …>`.
+/// `keeper_core::bots::chat`; `keeper_agent::task::TaskRunner` implements this
+/// over `keeper_agent::turn::arm_turn` — the same arming a typed or spoken
+/// message takes, with an explicit **task** origin so a run never speaks — and
+/// the desktop app hands it to the engine through
+/// [`SyncPlatform::bot_task_runner`]. Object-safe and boxed for the reason
+/// [`SyncPlatform`] is: the engine holds it as `Arc<dyn …>`.
 ///
 /// A runner **always** answers with a record, never an error: a refusal is a
 /// `Failed` record whose `errors` carry the sentence, so the task history has
@@ -538,10 +539,9 @@ pub trait SyncPlatform: Send + Sync {
     ///   by hand — and a wrong layout reads the wrong offsets in silence.
     ///   `lsof` is a process spawn per candidate, absent on minimal systems,
     ///   and refused by AD-125 by name.
-    /// * **iOS** — the question cannot be asked at all. The `keeper` manifest
-    ///   gates `keeper-sync` behind
-    ///   `cfg(not(any(target_os = "ios", target_os = "android")))`, so no
-    ///   `SyncPlatform` is linked there to ask.
+    /// * **iOS** — the phone links `keeper-sync` since Epic 66, and the
+    ///   shared probe answers `Unknown` there, as on macOS: no process may ask
+    ///   another what it holds open.
     ///
     /// # Why the DEFAULT stays `Unknown`
     ///

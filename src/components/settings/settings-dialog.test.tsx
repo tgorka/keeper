@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/lib/ipc/client", () => ({
@@ -46,6 +46,8 @@ vi.mock("@/lib/ipc/client", () => ({
       revision: 0,
     }),
   ),
+  // The account's own fingerprint line; pinned per test in `beforeEach`.
+  agentOwnFingerprint: vi.fn(() => new Promise(() => {})),
   encryptionPosture: vi.fn(() => Promise.resolve(null)),
   honorRemoteDeletions: vi.fn(() => Promise.resolve(false)),
   setHonorRemoteDeletions: vi.fn(() => Promise.resolve()),
@@ -220,6 +222,14 @@ vi.mock("@/lib/ipc/client", () => ({
   notesCaptureImpact: vi.fn(() => Promise.resolve([])),
   notesVaultSettingsSave: vi.fn(),
   capabilities: vi.fn(),
+  // Settings → Agents (Story 90.6) and Grants, mounted only under `botTools`.
+  agentsCopies: vi.fn(() => Promise.resolve([])),
+  agentsSeedOffer: vi.fn(() =>
+    Promise.resolve({ folders: [], catalogue: [], bots: [], accounts: [] }),
+  ),
+  botsGrantsList: vi.fn(() => Promise.resolve({ grants: [], unknown: [] })),
+  botsBotsList: vi.fn(() => Promise.resolve([])),
+  botsAuditList: vi.fn(() => Promise.resolve([])),
 }));
 
 // The About section (mounted by the dialog) imports the updater/process plugins
@@ -241,6 +251,7 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({
 }));
 
 import { CAPTURE_SECTION_TITLE } from "@/components/notes/capture-settings";
+import { AGENTS_SECTION_NOTE } from "@/components/settings/agents-section";
 import {
   SDK_STORE_ENCRYPTED_STATUS,
   SDK_STORE_UNENCRYPTED_STATUS,
@@ -251,6 +262,7 @@ import {
   NO_BACKGROUND_SYNC_SENTENCE,
 } from "@/components/settings/no-background-sync-disclosure";
 import {
+  OWN_FINGERPRINT_NONE,
   SettingsDialog,
   VOICE_SHORTCUT_LABEL,
   VOICE_SHORTCUT_NOTE,
@@ -259,6 +271,8 @@ import { SYNC_GIT_TITLE } from "@/components/settings/sync-git-row";
 import { SYNC_SECTION_SENTENCE, SYNC_SECTION_TITLE } from "@/components/settings/sync-section";
 import type { AccountVm } from "@/lib/ipc/client";
 import {
+  agentOwnFingerprint,
+  agentsCopies,
   dockBadgeModeSet,
   encryptionPosture,
   type HotkeyVm,
@@ -294,6 +308,7 @@ import { verificationStore } from "@/lib/stores/verification";
 import { voiceStore } from "@/lib/stores/voice";
 import { wizardStore } from "@/lib/stores/wizard";
 
+const mockOwnFingerprint = vi.mocked(agentOwnFingerprint);
 const mockPosture = vi.mocked(encryptionPosture);
 const mockHonorGet = vi.mocked(honorRemoteDeletions);
 const mockHonorSet = vi.mocked(setHonorRemoteDeletions);
@@ -426,6 +441,10 @@ beforeEach(() => {
     engine: "git",
     configuredPath: null,
   });
+  // Unanswered (the project's ES2020 lib has no Promise.withResolvers): the
+  // line draws nothing, so no other assertion meets it.
+  mockOwnFingerprint.mockReset();
+  mockOwnFingerprint.mockImplementation(() => new Promise(() => {}));
   accountsStore.getState().clear();
   encryptionStatusStore.getState().reset();
   keyBackupStore.getState().reset();
@@ -540,6 +559,87 @@ describe("SettingsDialog", () => {
     render(<SettingsDialog open onOpenChange={() => {}} />);
 
     expect(screen.queryByRole("button", { name: "Verify" })).not.toBeInTheDocument();
+  });
+
+  it("shows each account's own fingerprint beside its verification, and says when it has none", async () => {
+    mockPosture.mockResolvedValue(null);
+    mockOwnFingerprint.mockImplementation((accountId) =>
+      Promise.resolve(accountId === "alice" ? "nKr8 3Ffq Wd9u Lx2T" : null),
+    );
+    accountsStore.getState().hydrateAll([account("alice"), account("bob")]);
+    render(<SettingsDialog open onOpenChange={() => {}} />);
+
+    expect(await screen.findByText("nKr8 3Ffq Wd9u Lx2T")).toBeInTheDocument();
+    expect(await screen.findByText(OWN_FINGERPRINT_NONE)).toBeInTheDocument();
+    expect(screen.getAllByText("Your identity fingerprint")).toHaveLength(2);
+  });
+
+  it("refreshes a missing fingerprint when this account finishes identity sync", async () => {
+    mockOwnFingerprint.mockResolvedValueOnce(null).mockResolvedValueOnce("new identity");
+    accountsStore.getState().hydrateAll([account("alice")]);
+    render(<SettingsDialog open onOpenChange={() => {}} />);
+    await screen.findByText(OWN_FINGERPRINT_NONE);
+    act(() => encryptionStatusStore.getState().setStatus("alice", "unverified"));
+    expect(await screen.findByText("new identity")).toBeVisible();
+    expect(screen.queryByText(OWN_FINGERPRINT_NONE)).toBeNull();
+  });
+
+  it("never restores an older fingerprint over a newer verification read", async () => {
+    // ES2020 has no Promise.withResolvers.
+    let resolveOld!: (value: string) => void;
+    const older = new Promise<string>((resolve) => {
+      resolveOld = resolve;
+    });
+    mockOwnFingerprint
+      .mockResolvedValueOnce("initial identity")
+      .mockReturnValueOnce(older)
+      .mockResolvedValueOnce("current identity");
+    accountsStore.getState().hydrateAll([account("alice")]);
+    render(<SettingsDialog open onOpenChange={() => {}} />);
+    await screen.findByText("initial identity");
+    act(() => encryptionStatusStore.getState().setStatus("alice", "unverified"));
+    expect(screen.queryByText("initial identity")).toBeNull();
+    act(() => encryptionStatusStore.getState().setStatus("alice", "verified"));
+    await screen.findByText("current identity");
+    await act(async () => resolveOld("obsolete identity"));
+    expect(screen.queryByText("obsolete identity")).toBeNull();
+    expect(screen.getByText("current identity")).toBeVisible();
+  });
+
+  it("refreshes a changed fingerprint for this account's verification flow, not another account's", async () => {
+    mockOwnFingerprint
+      .mockResolvedValueOnce("initial identity")
+      .mockResolvedValueOnce("changed identity");
+    accountsStore.getState().hydrateAll([account("alice")]);
+    encryptionStatusStore.getState().setStatus("alice", "verified");
+    render(<SettingsDialog open onOpenChange={() => {}} />);
+    await screen.findByText("initial identity");
+    const flow = {
+      flowId: "flow-1",
+      phase: "done" as const,
+      emojis: null,
+      qrCodeSvg: null,
+      reason: null,
+    };
+    act(() => verificationStore.setState({ activeAccountId: "bob", flow }));
+    expect(screen.getByText("initial identity")).toBeVisible();
+    expect(mockOwnFingerprint).toHaveBeenCalledTimes(1);
+    act(() => verificationStore.setState({ activeAccountId: "alice", flow }));
+    expect(await screen.findByText("changed identity")).toBeVisible();
+    expect(screen.queryByText("initial identity")).toBeNull();
+  });
+
+  it("distinguishes a failed fingerprint read from no identity and recovers on verification", async () => {
+    mockOwnFingerprint
+      .mockRejectedValueOnce(new Error("offline"))
+      .mockResolvedValueOnce("available identity");
+    accountsStore.getState().hydrateAll([account("alice")]);
+    render(<SettingsDialog open onOpenChange={() => {}} />);
+    await screen.findByText(/could not read your identity fingerprint/);
+    expect(screen.queryByText(OWN_FINGERPRINT_NONE)).toBeNull();
+    act(() => encryptionStatusStore.getState().setStatus("alice", "verified"));
+    expect(await screen.findByText("available identity")).toBeVisible();
+    expect(screen.queryByText(/could not read your identity fingerprint/)).toBeNull();
   });
 
   it("shows a 'Set up backup' button for a disabled backup and opens enable", () => {
@@ -1089,6 +1189,48 @@ describe("SettingsDialog", () => {
     expect(await screen.findByText(SYNC_SECTION_TITLE)).toBeInTheDocument();
     expect(screen.getByText(SYNC_SECTION_SENTENCE)).toBeInTheDocument();
     await waitFor(() => expect(mockSyncProfiles).toHaveBeenCalled());
+  });
+
+  it("does not mount Settings › Agents where botTools is off: a phone is never a host", async () => {
+    mockPosture.mockResolvedValue(false);
+    capabilitiesStore.getState().applySnapshot(DESKTOP_CAPABILITIES);
+    render(<SettingsDialog open onOpenChange={() => {}} />);
+    await screen.findByText(STORAGE_HONESTY_SENTENCE);
+
+    expect(screen.queryByText(AGENTS_SECTION_NOTE)).not.toBeInTheDocument();
+    expect(agentsCopies).not.toHaveBeenCalled();
+  });
+
+  it("mounts Settings › Agents where botTools is on, and shows it once a folder holds an agent", async () => {
+    vi.mocked(agentsCopies).mockResolvedValueOnce([
+      {
+        profileId: "p1",
+        drive: "tgdrive",
+        agent: "nixi",
+        name: "Nixi",
+        matrixUser: "@nixi:tgorka.org",
+        device: null,
+        host: "hesperia",
+        signedIn: false,
+        pin: {
+          state: "unpinned",
+          owner: { matrixId: "@tgorka:tgorka.org", displayName: null },
+          readers: [],
+          localOnly: false,
+          pinnedOwner: null,
+          pinnedReaders: [],
+          pinnedLocalOnly: null,
+          differences: [],
+        },
+        problem: null,
+      },
+    ]);
+    mockPosture.mockResolvedValue(false);
+    capabilitiesStore.getState().applySnapshot({ ...DESKTOP_CAPABILITIES, botTools: true });
+    render(<SettingsDialog open onOpenChange={() => {}} />);
+
+    expect(await screen.findByText(AGENTS_SECTION_NOTE)).toBeInTheDocument();
+    expect(agentsCopies).toHaveBeenCalled();
   });
 });
 

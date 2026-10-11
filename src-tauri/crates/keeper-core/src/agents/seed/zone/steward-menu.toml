@@ -1,0 +1,34 @@
+[[menu]]
+code        = "TR"
+description = "Triage what came in"
+prompt      = """
+Triage what came in since your last triage. Read the drive's inbox zone and the sessions that changed, with your drive tools. Do not do the work.
+For each piece of work that needs doing, write one card into this session with session_write: tags [task], a title, assignee (the agent of this drive whose work it is), requested_by (who asked, as a Matrix id), and a body a stranger could pick up that says what done looks like.
+Leave out what you cannot place, and say why in your reply. Reply with one line per card: title, assignee, who asked.
+"""
+
+[[menu]]
+code        = "DS"
+description = "Hand the cards on"
+prompt      = """
+For each card in this session that has an assignee and no run state, hand its work to that agent with delegate: the card's body as the brief, the card's title as the new card's title, the card's file name as source, and only the drives the work needs.
+Reply with what you handed on, to whom, and anything you held back because a bound or a label stopped it.
+"""
+
+[[menu]]
+code        = "HV"
+description = "Look at what a closed session learned"
+prompt      = """
+A session of this drive has closed; its path is in the brief. Read its README, its artifacts and its last log lines with your drive tools.
+Reply with what it learned that the drive should keep, and where in the drive it belongs. Write nothing else.
+"""
+
+[[menu]]
+code        = "WT"
+description = "Run the triage workflow"
+workflow    = "triage"
+
+[[menu]]
+code        = "WD"
+description = "Run the dispatch workflow"
+workflow    = "dispatch"

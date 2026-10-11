@@ -79,6 +79,8 @@ pub struct DriveRecord {
     pub tasks: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub voices: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agents: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub excludes: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -490,6 +492,7 @@ pub fn offers(
                     sessions: drive.sessions.clone(),
                     tasks: drive.tasks.clone(),
                     voices: drive.voices.clone(),
+                    agents: drive.agents.clone(),
                     excludes: drive.excludes.clone(),
                     lfs_threshold_bytes: drive.lfs_threshold_bytes,
                     virtual_patterns: drive.virtual_patterns.clone(),
@@ -530,7 +533,8 @@ pub fn offers(
 
 fn parse_toml<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, String> {
     let text = std::str::from_utf8(bytes).map_err(|_| "it is not UTF-8 text".to_owned())?;
-    toml::from_str(text).map_err(|error| format!("it cannot be read: {}", error.message()))
+    crate::toml_order::from_str(text)
+        .map_err(|error| format!("it cannot be read: {}", error.message()))
 }
 
 fn render_toml<T: Serialize>(header: &str, file: &T) -> Result<String, String> {
@@ -925,6 +929,20 @@ mod tests {
         );
 
         assert!(MatrixFile::parse(b"[[account]]\nkind = 1\n").is_err());
+    }
+
+    /// A newer build's nested table survives a sync in key order, as every
+    /// device on any build writes it (R170).
+    #[test]
+    fn a_nested_unknown_table_is_written_back_in_key_order() {
+        let text = "[future]\nz = 1\na = 2\n[future.deep]\nz = 3\nb = 4\n";
+        let rendered = BotsFile::parse(text.as_bytes())
+            .expect("parses")
+            .render()
+            .expect("renders");
+        let at = |needle: &str| rendered.find(needle).expect(needle);
+        assert!(at("a = 2") < at("z = 1"), "{rendered}");
+        assert!(at("b = 4") < at("z = 3"), "{rendered}");
     }
 
     #[test]

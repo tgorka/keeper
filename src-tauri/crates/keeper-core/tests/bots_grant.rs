@@ -814,6 +814,7 @@ fn run_tool(dir: &Path, root: &Path, subpath: &str, effect: Effect) -> GrantVerd
             target: &target,
             effect,
             verdict: &verdict,
+            classified: None,
         },
     )
     .expect("the intent row is written before anything happens");
@@ -964,6 +965,7 @@ fn grant_audit_a_crash_between_the_row_and_the_effect_leaves_a_readable_pending_
             target: &t,
             effect: Effect::Write,
             verdict: &verdict,
+            classified: None,
         },
     )
     .expect("append");
@@ -1014,6 +1016,7 @@ fn grant_audit_completing_a_row_records_the_outcome_and_the_bytes() {
             target: &t,
             effect: Effect::Read,
             verdict: &verdict,
+            classified: None,
         },
     )
     .expect("append");
@@ -1101,6 +1104,7 @@ fn grant_audit_the_log_reads_newest_first_and_filters_by_conversation() {
                 target: &t,
                 effect: Effect::Read,
                 verdict: &verdict,
+                classified: None,
             },
         )
         .expect("append");

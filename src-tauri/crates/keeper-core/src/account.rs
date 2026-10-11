@@ -16,7 +16,8 @@
 //! plaintext beyond the rendered preview crosses IPC or reaches a `tracing` log
 //! (NFR-9).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::future::Future;
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -44,6 +45,22 @@ use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 use tracing::Instrument;
 
+use crate::agents::approval_card::{self, ApprovalDecideReq, HostedRooms, Viewer, NOTE_MAX};
+use crate::agents::device::{self as agent_device, AccountAgents, AgentDevice};
+use crate::agents::events::{
+    ApprovalDecisionContent, ConversationRequestContent, Focus, ScopeContent, ScopeDrive,
+    CONTENT_VERSION,
+};
+use crate::agents::events::{PresencePlatform, SurfaceResultContent};
+use crate::agents::focus::{FocusLanes, FocusPort, Named, SendFuture};
+use crate::agents::proxy::{
+    self, AgentOutbound, AgentProxies, KnownProxies, ProxyListEventContent, ProxyRoomRow,
+    ProxyRoomVm,
+};
+use crate::agents::room::{self as agent_room, AgentIcons, AgentKinds, AgentRoomKind};
+use crate::agents::session::SessionKind;
+use crate::agents::spoken::SpokenAnswer;
+use crate::agents::surface::{SurfaceAnswerReq, SurfaceRequestArrived};
 use crate::archive::{self, ArchiveEvent, ArchiveHandle, ArchiveMedia, ArchiveWriter};
 use crate::auth::{self, session_keychain_key};
 use crate::backup::{self, BackupSink};
@@ -220,6 +237,7 @@ type ActivatedAccount = (
     EventHandlerHandle,
     EventHandlerHandle,
     EventHandlerHandle,
+    AccountAgents,
     JoinHandle<()>,
     tokio::sync::broadcast::Sender<OutboxChange>,
 );
@@ -309,6 +327,10 @@ struct AccountHandle {
     /// task. Aborted on `unsubscribe_outbox` and on shutdown; a producer whose sink
     /// closes ends on its own.
     outbox_subs: Arc<Mutex<HashMap<u64, JoinHandle<()>>>>,
+    /// The account's agents on this device (91.3): its surface request
+    /// handler and presence publisher, started in [`activate`]; dropping the
+    /// handle stops both.
+    agents: AccountAgents,
 }
 
 /// A change signal broadcast on an account's outbox (Story 8.3). Carries no payload:
@@ -468,7 +490,7 @@ async fn run_outbox_scheduler(
             // then remove the row. A dispatch error is best-effort — leave the row to
             // retry next tick rather than deleting an undispatched message.
             match send::dispatch(&timeline, &row.body).await {
-                Ok(()) => {
+                Ok(_) => {
                     if let Err(e) = registry::delete_outbox(&data_dir, &row.id) {
                         // Handed off but not yet deleted: remember it so the next tick
                         // retries the delete instead of re-dispatching a duplicate.
@@ -595,6 +617,29 @@ pub struct AccountManager {
     /// `static`) so there is no new global mutable state; the Settings command reads/sets
     /// it via [`AccountManager::dock_badge_mode_get`] / [`AccountManager::dock_badge_mode_set`].
     badge: Arc<BadgeConfig>,
+    /// The session kind of every agent room read so far (UX-DR132): fed by the
+    /// room list and by an open agent room's header, read by the room list.
+    agent_kinds: Arc<AgentKinds>,
+    /// The soul's mark of every agent whose zone is on this device (91.1
+    /// acceptance 6): the desktop's agents host replaces it on each scan
+    /// through [`AccountManager::agent_icons`]; on the phone it stays empty.
+    agent_icons: Arc<AgentIcons>,
+    /// The proxies whose agents zones are on this device (91.2): their person
+    /// and the drives a dock's scope chip offers. Replaced by the desktop's
+    /// agents host on each scan; empty on the phone.
+    agent_proxies: Arc<AgentProxies>,
+    /// Per (account, proxy room): the docked note's focus on its way there.
+    agent_focus: Arc<FocusLanes<(String, OwnedRoomId)>>,
+    /// The app's agents on this device (91.3): whether keeper is in front,
+    /// which view it shows, and the surface requests its accounts admit.
+    agent_device: Arc<AgentDevice>,
+    /// The session rooms whose agent this app hosts (93.3): the desktop's
+    /// agents host replaces them on each tick; empty on the phone.
+    agent_hosted: Arc<HostedRooms>,
+    /// The attached actions this app showed and found bound to their
+    /// digest, by `(account, room, binding digest)` (R186): only these are
+    /// approved.
+    agent_shown: Arc<std::sync::Mutex<std::collections::HashSet<(String, String, String)>>>,
 }
 
 /// Monotonic source of subscription ids handed back to the frontend.
@@ -685,6 +730,13 @@ impl AccountManager {
             palette: Arc::new(Mutex::new(PaletteIndex::new())),
             notify,
             badge,
+            agent_kinds: Arc::new(AgentKinds::default()),
+            agent_icons: Arc::new(AgentIcons::default()),
+            agent_proxies: Arc::new(AgentProxies::default()),
+            agent_focus: Arc::new(FocusLanes::default()),
+            agent_device: Arc::new(AgentDevice::default()),
+            agent_hosted: Arc::new(HostedRooms::default()),
+            agent_shown: Arc::default(),
         }
     }
 
@@ -808,6 +860,7 @@ impl AccountManager {
                     redaction_handler,
                     draft_handler,
                     notify_handler,
+                    agents,
                     outbox_scheduler,
                     outbox_tx,
                 ) = activate(
@@ -817,6 +870,7 @@ impl AccountManager {
                     self.archive.clone(),
                     self.draft_mirror_tx.clone(),
                     self.notify.clone(),
+                    self.agents_wiring(),
                 )
                 .await?;
                 accounts.insert(
@@ -832,6 +886,7 @@ impl AccountManager {
                         redaction_handler,
                         draft_handler,
                         notify_handler,
+                        agents,
                         verification_flow_tx: Arc::new(verification::FlowSlot::default()),
                         login_sessions: Arc::new(Mutex::new(HashMap::new())),
                         outbox_scheduler,
@@ -890,6 +945,7 @@ impl AccountManager {
         // reads, so the glyph and notification suppression never diverge, and no
         // per-row SQLite open happens on the inbox hot path.
         let notify = self.notify.clone();
+        let kinds = self.agent_kinds.clone();
         let span = tracing::info_span!("room_list_producer", account_id = %account_id);
         let reaper_subs = subs_arc.clone();
         let task = tokio::spawn(
@@ -897,7 +953,7 @@ impl AccountManager {
                 // `client` is captured to keep the account alive for the task's
                 // lifetime; the producer reads from the room list only.
                 let _keep_alive = client;
-                run_producer(room_list, sink, &account_id_owned, &notify).await;
+                run_producer(room_list, sink, &account_id_owned, &notify, &kinds).await;
                 // A naturally-completed producer reaps its own subscription entry.
                 reaper_subs.lock().await.remove(&subscription_id);
             }
@@ -931,11 +987,13 @@ impl AccountManager {
     /// `inbox_sink`, the Archive window into `archive_sink`, the Pins window into
     /// `pins_sink` (seeded from keeper-local [`registry::get_pins`], Story 4.3),
     /// and the Favorites window into `favourites_sink` (SDK-sourced `m.favourite`
-    /// tag, Story 4.4). Returns the inbox subscription id. Replacing an
+    /// tag, Story 4.4), and the Agents window into `agents_sink` (every agent
+    /// session room and only there; control rooms in no window — UX-DR132).
+    /// Returns the inbox subscription id. Replacing an
     /// existing inbox subscription (e.g. the frontend re-subscribes after adding an
     /// account) first tears the old one down. Adding the Nth account is identical
     /// to the 2nd — no count limit.
-    // Six sinks (Inbox/Archive/Pins/Favorites/Spaces/Networks) plus `self` and the
+    // Seven sinks (Inbox/Archive/Pins/Favorites/Agents/Spaces/Networks) plus `self` and the
     // platform each cross the IPC boundary as a distinct stream; grouping them into a
     // struct would only obscure the one-to-one channel mapping.
     #[allow(clippy::too_many_arguments)]
@@ -946,6 +1004,7 @@ impl AccountManager {
         archive_sink: InboxSink,
         pins_sink: InboxSink,
         favourites_sink: InboxSink,
+        agents_sink: InboxSink,
         spaces_sink: SpacesSink,
         networks_sink: NetworksSink,
     ) -> Result<u64, CoreError> {
@@ -963,6 +1022,7 @@ impl AccountManager {
             archive_sink,
             pins_sink,
             favourites_sink,
+            agents_sink,
             pins,
             spaces_sink,
             networks_sink,
@@ -1033,10 +1093,17 @@ impl AccountManager {
             // `MuteState` consults the same live muted-Network set the notify handler
             // reads (Story 10.2) — no per-row SQLite open on the inbox hot path.
             let notify_for_task = self.notify.clone();
+            let kinds_for_task = self.agent_kinds.clone();
             let task = tokio::spawn(
                 async move {
-                    run_inbox_producer(room_list, merger_for_task, &account_id, &notify_for_task)
-                        .await;
+                    run_inbox_producer(
+                        room_list,
+                        merger_for_task,
+                        &account_id,
+                        &notify_for_task,
+                        &kinds_for_task,
+                    )
+                    .await;
                 }
                 .instrument(
                     tracing::info_span!("inbox_producer", account_id = %account.account_id),
@@ -1158,6 +1225,7 @@ impl AccountManager {
                     redaction_handler,
                     draft_handler,
                     notify_handler,
+                    agents,
                     outbox_scheduler,
                     outbox_tx,
                 ) = activate(
@@ -1167,6 +1235,7 @@ impl AccountManager {
                     self.archive.clone(),
                     self.draft_mirror_tx.clone(),
                     self.notify.clone(),
+                    self.agents_wiring(),
                 )
                 .await?;
                 accounts.insert(
@@ -1182,6 +1251,7 @@ impl AccountManager {
                         redaction_handler,
                         draft_handler,
                         notify_handler,
+                        agents,
                         verification_flow_tx: Arc::new(verification::FlowSlot::default()),
                         login_sessions: Arc::new(Mutex::new(HashMap::new())),
                         outbox_scheduler,
@@ -1256,6 +1326,7 @@ impl AccountManager {
                     redaction_handler,
                     draft_handler,
                     notify_handler,
+                    agents,
                     outbox_scheduler,
                     outbox_tx,
                 ) = activate(
@@ -1265,6 +1336,7 @@ impl AccountManager {
                     self.archive.clone(),
                     self.draft_mirror_tx.clone(),
                     self.notify.clone(),
+                    self.agents_wiring(),
                 )
                 .await?;
                 accounts.insert(
@@ -1280,6 +1352,7 @@ impl AccountManager {
                         redaction_handler,
                         draft_handler,
                         notify_handler,
+                        agents,
                         verification_flow_tx: Arc::new(verification::FlowSlot::default()),
                         login_sessions: Arc::new(Mutex::new(HashMap::new())),
                         outbox_scheduler,
@@ -1343,11 +1416,14 @@ impl AccountManager {
         let reaper_timelines = timelines_arc.clone();
         let room_id_task = room_id.clone();
         let room_id_log = room_id.clone();
+        let kinds = self.agent_kinds.clone();
+        let icons = self.agent_icons.clone();
+        let hosted = self.agent_hosted.clone();
         let span =
             tracing::info_span!("timeline_producer", account_id = %account_id, room_id = %room_id);
         let task = tokio::spawn(
             async move {
-                timeline::forward_timeline(open, room_id_task, sink).await;
+                timeline::forward_timeline(open, room_id_task, sink, kinds, icons, hosted).await;
                 // A naturally-completed producer reaps its own subscription entry
                 // and drops its stored `Arc<Timeline>` so nothing leaks (AD-19).
                 reaper_subs.lock().await.remove(&subscription_id);
@@ -1415,6 +1491,7 @@ impl AccountManager {
                     redaction_handler,
                     draft_handler,
                     notify_handler,
+                    agents,
                     outbox_scheduler,
                     outbox_tx,
                 ) = activate(
@@ -1424,6 +1501,7 @@ impl AccountManager {
                     self.archive.clone(),
                     self.draft_mirror_tx.clone(),
                     self.notify.clone(),
+                    self.agents_wiring(),
                 )
                 .await?;
                 accounts.insert(
@@ -1439,6 +1517,7 @@ impl AccountManager {
                         redaction_handler,
                         draft_handler,
                         notify_handler,
+                        agents,
                         verification_flow_tx: Arc::new(verification::FlowSlot::default()),
                         login_sessions: Arc::new(Mutex::new(HashMap::new())),
                         outbox_scheduler,
@@ -1540,6 +1619,7 @@ impl AccountManager {
                     redaction_handler,
                     draft_handler,
                     notify_handler,
+                    agents,
                     outbox_scheduler,
                     outbox_tx,
                 ) = activate(
@@ -1549,6 +1629,7 @@ impl AccountManager {
                     self.archive.clone(),
                     self.draft_mirror_tx.clone(),
                     self.notify.clone(),
+                    self.agents_wiring(),
                 )
                 .await?;
                 accounts.insert(
@@ -1564,6 +1645,7 @@ impl AccountManager {
                         redaction_handler,
                         draft_handler,
                         notify_handler,
+                        agents,
                         verification_flow_tx: Arc::new(verification::FlowSlot::default()),
                         login_sessions: Arc::new(Mutex::new(HashMap::new())),
                         outbox_scheduler,
@@ -1664,6 +1746,7 @@ impl AccountManager {
                     redaction_handler,
                     draft_handler,
                     notify_handler,
+                    agents,
                     outbox_scheduler,
                     outbox_tx,
                 ) = activate(
@@ -1673,6 +1756,7 @@ impl AccountManager {
                     self.archive.clone(),
                     self.draft_mirror_tx.clone(),
                     self.notify.clone(),
+                    self.agents_wiring(),
                 )
                 .await?;
                 accounts.insert(
@@ -1688,6 +1772,7 @@ impl AccountManager {
                         redaction_handler,
                         draft_handler,
                         notify_handler,
+                        agents,
                         verification_flow_tx: Arc::new(verification::FlowSlot::default()),
                         login_sessions: Arc::new(Mutex::new(HashMap::new())),
                         outbox_scheduler,
@@ -1832,6 +1917,7 @@ impl AccountManager {
                     redaction_handler,
                     draft_handler,
                     notify_handler,
+                    agents,
                     outbox_scheduler,
                     outbox_tx,
                 ) = activate(
@@ -1841,6 +1927,7 @@ impl AccountManager {
                     self.archive.clone(),
                     self.draft_mirror_tx.clone(),
                     self.notify.clone(),
+                    self.agents_wiring(),
                 )
                 .await?;
                 accounts.insert(
@@ -1856,6 +1943,7 @@ impl AccountManager {
                         redaction_handler,
                         draft_handler,
                         notify_handler,
+                        agents,
                         verification_flow_tx: Arc::new(verification::FlowSlot::default()),
                         login_sessions: Arc::new(Mutex::new(HashMap::new())),
                         outbox_scheduler,
@@ -1952,6 +2040,36 @@ impl AccountManager {
             })
     }
 
+    /// The display names of `users` as the first live account's homeserver
+    /// answers them (story 90.6: who a drive's pin names), asked all at once
+    /// and each awaited at most `within`, so a dead server a drive names
+    /// delays nothing past it. A user it cannot read in time is left out;
+    /// no live account answers nothing.
+    pub async fn display_names(
+        &self,
+        users: &[matrix_sdk::ruma::OwnedUserId],
+        within: std::time::Duration,
+    ) -> std::collections::BTreeMap<matrix_sdk::ruma::OwnedUserId, String> {
+        use matrix_sdk::ruma::api::client::profile::DisplayName;
+
+        let client = {
+            let accounts = self.accounts.lock().await;
+            accounts.values().next().map(|h| h.client.clone())
+        };
+        let Some(client) = client else {
+            return std::collections::BTreeMap::new();
+        };
+        names_within(users, within, |user| {
+            let account = client.account();
+            let user = user.clone();
+            async move {
+                let profile = account.fetch_user_profile_of(&user).await.ok()?;
+                profile.get_static::<DisplayName>().ok().flatten()
+            }
+        })
+        .await
+    }
+
     /// Resolve the account's live `Client` for a bridge entry point, activating
     /// the account on demand (Story 6.2, FR-25). The First-Run Wizard reaches
     /// bridge discovery right after Beeper login — before any room-list
@@ -1996,6 +2114,7 @@ impl AccountManager {
                 redaction_handler,
                 draft_handler,
                 notify_handler,
+                agents,
                 outbox_scheduler,
                 outbox_tx,
             ) = activate(
@@ -2005,6 +2124,7 @@ impl AccountManager {
                 self.archive.clone(),
                 self.draft_mirror_tx.clone(),
                 self.notify.clone(),
+                self.agents_wiring(),
             )
             .await?;
             accounts.insert(
@@ -2020,6 +2140,7 @@ impl AccountManager {
                     redaction_handler,
                     draft_handler,
                     notify_handler,
+                    agents,
                     verification_flow_tx: Arc::new(verification::FlowSlot::default()),
                     login_sessions: Arc::new(Mutex::new(HashMap::new())),
                     outbox_scheduler,
@@ -2903,6 +3024,7 @@ impl AccountManager {
                     redaction_handler,
                     draft_handler,
                     notify_handler,
+                    agents,
                     outbox_scheduler,
                     outbox_tx,
                 ) = activate(
@@ -2912,6 +3034,7 @@ impl AccountManager {
                     self.archive.clone(),
                     self.draft_mirror_tx.clone(),
                     self.notify.clone(),
+                    self.agents_wiring(),
                 )
                 .await?;
                 accounts.insert(
@@ -2927,6 +3050,7 @@ impl AccountManager {
                         redaction_handler,
                         draft_handler,
                         notify_handler,
+                        agents,
                         verification_flow_tx: Arc::new(verification::FlowSlot::default()),
                         login_sessions: Arc::new(Mutex::new(HashMap::new())),
                         outbox_scheduler,
@@ -3721,6 +3845,416 @@ impl AccountManager {
         registry::set_network_muted(&data_dir, network_id, muted)?;
         self.notify.set_network_muted(network_id, muted);
         Ok(())
+    }
+
+    /// The soul's marks of the agents whose zones are on this device, shared
+    /// with the desktop's agents host, which replaces them on each scan; every
+    /// agent room header reads its agent's mark here (91.1 acceptance 6).
+    pub fn agent_icons(&self) -> Arc<AgentIcons> {
+        self.agent_icons.clone()
+    }
+
+    /// The proxies the dock knows from this device's agents zones (91.2): the
+    /// desktop's agents host replaces them on each scan.
+    pub fn agent_proxies(&self) -> Arc<AgentProxies> {
+        self.agent_proxies.clone()
+    }
+
+    /// What an account's agents are wired to at activation.
+    fn agents_wiring(&self) -> AgentsWiring<'_> {
+        AgentsWiring {
+            device: &self.agent_device,
+            kinds: &self.agent_kinds,
+            proxies: &self.agent_proxies,
+        }
+    }
+
+    /// The person's proxy conversations on `account_id` (UX-DR130): every
+    /// agent session room [`proxy::admits`] admits, the DM first. A room
+    /// whose status is not read yet is not listed; nothing is listed for an
+    /// account that is not live.
+    pub async fn agent_rooms(&self, account_id: &str) -> Vec<ProxyRoomVm> {
+        let client = {
+            let accounts = self.accounts.lock().await;
+            match accounts.get(account_id) {
+                Some(handle) => handle.client.clone(),
+                None => return Vec::new(),
+            }
+        };
+        let Some(me) = client.user_id().map(ToOwned::to_owned) else {
+            return Vec::new();
+        };
+        let mut rows = Vec::new();
+        for room in client.joined_rooms() {
+            if AgentRoomKind::of(room.room_type().as_ref()) != Some(AgentRoomKind::Session) {
+                continue;
+            }
+            rows.push(proxy_row(room, &self.agent_kinds).await);
+        }
+        let known = known_proxies(&client, &self.agent_proxies).await;
+        proxy::proxy_rooms(&rows, &me, &known)
+    }
+
+    /// The live agent session room `room_id` on `account_id`.
+    async fn session_room(&self, account_id: &str, room_id: &str) -> Result<Room, CoreError> {
+        let room_id = RoomId::parse(room_id).map_err(|_| SendError::RoomNotFound)?;
+        let room = self
+            .room_for(account_id, &room_id)
+            .await
+            .map_err(|_| SendError::RoomNotFound)?;
+        if AgentRoomKind::of(room.room_type().as_ref()) != Some(AgentRoomKind::Session) {
+            return Err(SendError::RoomNotFound.into());
+        }
+        Ok(room)
+    }
+
+    /// The live room `room_id` when it is one of the person's proxy rooms as
+    /// this account reads it ([`admit_proxy_room`]), with its kind and agent.
+    /// A scope, a focus or a request for a conversation is only ever sent
+    /// there (R29 F1: where power levels let the person).
+    async fn proxy_room(
+        &self,
+        account_id: &str,
+        room_id: &str,
+    ) -> Result<(Room, SessionKind, matrix_sdk::ruma::OwnedUserId), CoreError> {
+        let room = self.session_room(account_id, room_id).await?;
+        let (kind, agent) = admit_proxy_room(&room, &self.agent_kinds, &self.agent_proxies).await?;
+        Ok((room, kind, agent))
+    }
+
+    /// Ask the proxy for `drives` in scope in `room_id` (AD-382): the host
+    /// checks them against `[tools].drives`, keeps the home drive and logs a
+    /// `scope` line. The focus the host was last told travels with it, so a
+    /// scope change does not clear what the person is looking at; it waits
+    /// for the focus lane, so it never overtakes a clear on its way.
+    pub async fn agent_scope_set(
+        &self,
+        account_id: &str,
+        room_id: &str,
+        drives: Vec<String>,
+    ) -> Result<(), CoreError> {
+        let (room, _, agent) = self.proxy_room(account_id, room_id).await?;
+        // Titles from this room's proxy only: two proxies may title one
+        // drive differently.
+        let titles: HashMap<String, String> = self
+            .agent_proxies
+            .snapshot()
+            .remove(&agent)
+            .map(|facts| facts.allowed)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|drive| (drive.id, drive.title))
+            .collect();
+        let lane = self
+            .agent_focus
+            .get(&(account_id.to_owned(), room.room_id().to_owned()));
+        let _held = match &lane {
+            Some(lane) => Some(lane.hold().await),
+            None => None,
+        };
+        let content = ScopeContent {
+            v: CONTENT_VERSION,
+            drives: Some(
+                drives
+                    .into_iter()
+                    .map(|id| ScopeDrive {
+                        title: titles.get(&id).cloned().unwrap_or_else(|| id.clone()),
+                        id,
+                    })
+                    .collect(),
+            ),
+            label: None,
+            focus: lane.as_ref().and_then(|lane| lane.last()),
+            set_by: room.own_user_id().to_owned(),
+        };
+        send_agent_event(&room, AgentOutbound::Scope(content)).await?;
+        Ok(())
+    }
+
+    /// The docked note in `room_id` changed, as the webview's call `seq`
+    /// says; `name` names it (blocking: the vault's index and the note) and
+    /// runs only once the change has been still a second
+    /// ([`crate::agents::focus`]). The change is registered before anything
+    /// is awaited, so a later [`Self::agent_focus_close`] always drops it.
+    pub async fn agent_focus(
+        &self,
+        account_id: &str,
+        room_id: &str,
+        seq: u64,
+        name: impl FnOnce() -> Option<Focus> + Send + 'static,
+    ) -> Result<(), CoreError> {
+        let parsed = RoomId::parse(room_id).map_err(|_| SendError::RoomNotFound)?;
+        let lane = self.agent_focus.lane(&(account_id.to_owned(), parsed));
+        let namer = Box::new(move || -> Named {
+            Box::pin(async move { tokio::task::spawn_blocking(name).await.ok().flatten() })
+        });
+        if !lane.change(seq, namer) {
+            return Ok(());
+        }
+        if !lane.connected() {
+            match self.proxy_room(account_id, room_id).await {
+                Ok((room, _, _)) => lane.connect(Arc::new(RoomFocus(room))),
+                Err(error) => {
+                    lane.forget_pending();
+                    return Err(error);
+                }
+            }
+        }
+        lane.drive();
+        Ok(())
+    }
+
+    /// The dock closed on `room_id` (the webview's call `seq`): what waits is
+    /// dropped, and the host is told there is no focus when it was told of
+    /// one — after any focus already on its way. A clear that fails is
+    /// owed and tried again.
+    pub async fn agent_focus_close(
+        &self,
+        account_id: &str,
+        room_id: &str,
+        seq: u64,
+    ) -> Result<(), CoreError> {
+        let parsed = RoomId::parse(room_id).map_err(|_| SendError::RoomNotFound)?;
+        self.agent_focus
+            .lane(&(account_id.to_owned(), parsed))
+            .close(Some(seq))
+            .await
+            .map_err(|error| SendError::Dispatch(error).into())
+    }
+
+    /// Ask the proxy for a new conversation, in its `main` DM `room_id`
+    /// (R36): the claim holder of the DM's session makes the room and its
+    /// session and invites the person. Returns the request's event id.
+    pub async fn agent_conversation_new(
+        &self,
+        account_id: &str,
+        room_id: &str,
+        title: Option<String>,
+    ) -> Result<String, CoreError> {
+        let (room, kind, _) = self.proxy_room(account_id, room_id).await?;
+        if kind != SessionKind::Main {
+            return Err(CoreError::Unsupported(
+                "A new conversation is asked for in your proxy's DM.".to_owned(),
+            ));
+        }
+        let content = ConversationRequestContent {
+            v: CONTENT_VERSION,
+            title: title
+                .map(|title| title.trim().to_owned())
+                .filter(|title| !title.is_empty()),
+        };
+        send_agent_event(&room, AgentOutbound::ConversationRequest(content)).await
+    }
+
+    /// Send the person's decision `req` on the approval card it names in the
+    /// session room `room_id` (93.3), from this device: [`decide_approval`]
+    /// with the rooms this app hosts and the attached actions it has shown
+    /// ([`Self::agent_approval_payload`], R186).
+    pub async fn agent_approval_decide(
+        &self,
+        account_id: &str,
+        room_id: &str,
+        req: ApprovalDecideReq,
+    ) -> Result<(), CoreError> {
+        let room = self.session_room(account_id, room_id).await?;
+        let shown = |digest: &str| {
+            self.agent_shown
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains(&(account_id.to_owned(), room_id.to_owned(), digest.to_owned()))
+        };
+        decide_approval(&room, &self.agent_hosted, &shown, req).await
+    }
+
+    /// The attached action of the approval `id` in the session room
+    /// `room_id`: [`approval_payload`]. Once shown, it may be approved from
+    /// this app (R186).
+    pub async fn agent_approval_payload(
+        &self,
+        account_id: &str,
+        room_id: &str,
+        id: &str,
+    ) -> Result<String, CoreError> {
+        let room = self.session_room(account_id, room_id).await?;
+        let (shown, digest) = approval_payload(&room, id).await?;
+        self.agent_shown
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert((account_id.to_owned(), room_id.to_owned(), digest));
+        Ok(shown)
+    }
+
+    /// This account's own master key as a person compares it with what
+    /// `keeper-agentd status` prints (93.3 acceptance 7): the base64 in
+    /// groups of four; `None` while the account publishes no
+    /// cross-signing identity.
+    pub async fn agent_own_fingerprint(
+        &self,
+        account_id: &str,
+    ) -> Result<Option<String>, CoreError> {
+        let client = self.client_for(account_id).await?;
+        let Some(user) = client.user_id().map(ToOwned::to_owned) else {
+            return Ok(None);
+        };
+        let identity = client
+            .encryption()
+            .get_user_identity(&user)
+            .await
+            .map_err(|error| CoreError::Internal(error.to_string()))?;
+        Ok(identity
+            .as_ref()
+            .and_then(crate::agents::matrix::master_key_of)
+            .map(|key| crate::agents::trust::fingerprint(&key)))
+    }
+
+    /// The rooms whose agent this app hosts, shared with the desktop's
+    /// agents host, which replaces them on each tick; empty on the phone. A
+    /// T4 card in one of them is never decided from this app (S-22).
+    pub fn agent_hosted(&self) -> Arc<HostedRooms> {
+        self.agent_hosted.clone()
+    }
+
+    /// Every live account as the desktop's agents host trusts it (R87): its
+    /// user, this app's device of it, whether its own identity is verified
+    /// here and this device cross-signed by it, and its master key — what a
+    /// decision on a session this Mac hosts is judged against. Read again on
+    /// each scan; nothing is pinned or written.
+    pub async fn agent_own_accounts(&self) -> Vec<crate::agents::trust::OwnAccount> {
+        let clients: Vec<matrix_sdk::Client> = self
+            .accounts
+            .lock()
+            .await
+            .values()
+            .map(|handle| handle.client.clone())
+            .collect();
+        let mut own = Vec::with_capacity(clients.len());
+        for client in clients {
+            let (Some(user), Some(device)) = (
+                client.user_id().map(ToOwned::to_owned),
+                client.device_id().map(ToString::to_string),
+            ) else {
+                continue;
+            };
+            let identity = client
+                .encryption()
+                .get_user_identity(&user)
+                .await
+                .ok()
+                .flatten();
+            let cross_signed = crate::agents::room::own_device_cross_signed(&client).await;
+            own.push(crate::agents::trust::OwnAccount::read(
+                user,
+                device,
+                identity
+                    .as_ref()
+                    .is_some_and(|identity| identity.is_verified()),
+                cross_signed,
+                identity
+                    .as_ref()
+                    .and_then(crate::agents::matrix::master_key_of),
+            ));
+        }
+        own.sort_by(|a, b| a.user.cmp(&b.user));
+        own
+    }
+
+    /// Every live account's proxy conversations, by account id (AD-384): the
+    /// rooms a spoken question may go to.
+    pub async fn agent_rooms_everywhere(&self) -> Vec<(String, ProxyRoomVm)> {
+        let account_ids: Vec<String> = self.accounts.lock().await.keys().cloned().collect();
+        let mut rooms = Vec::new();
+        for account_id in account_ids {
+            for room in self.agent_rooms(&account_id).await {
+                rooms.push((account_id.clone(), room));
+            }
+        }
+        rooms
+    }
+
+    /// Send what the voice turn heard into `room_id`, the person's own
+    /// proxy conversation on `account_id`, as their message (AD-384) —
+    /// [`spoken_send`], with the conversation's open timeline when one is.
+    ///
+    /// Errors: a room that is not live → [`SendError::RoomNotFound`]; else
+    /// [`spoken_send`]'s.
+    pub async fn agent_spoken_send(
+        &self,
+        account_id: &str,
+        room_id: &str,
+        text: &str,
+    ) -> Result<SpokenAnswer, CoreError> {
+        let room = self.session_room(account_id, room_id).await?;
+        let open = self
+            .open_timeline_for(account_id, room.room_id())
+            .await
+            .ok();
+        let answer = spoken_send(&room, &self.agent_kinds, &self.agent_proxies, open, text).await?;
+        tracing::info!(account_id = %account_id, room_id = %room.room_id(), "spoken question dispatched to the person's agent");
+        Ok(answer)
+    }
+
+    /// Every surface request a live account of this device admits from now
+    /// on (AD-383): the shell names its target and hands it to the notes
+    /// view.
+    pub fn surface_requests(&self) -> tokio::sync::broadcast::Receiver<SurfaceRequestArrived> {
+        self.agent_device.requests()
+    }
+
+    /// keeper came to the front or left it (the shell's window focus on the
+    /// desktop, the app's lifecycle on the phone): every live account's
+    /// presence follows after a second of stillness.
+    pub fn agent_presence_focus(&self, platform: PresencePlatform, focused: bool) {
+        self.agent_device.focus(platform, focused);
+    }
+
+    /// The primary view keeper shows (`notes`, `chats`): a view id only,
+    /// never a note (AD-383).
+    pub fn agent_presence_view(&self, view: &str) -> Result<(), CoreError> {
+        if !crate::agents::presence::is_view_id(view) {
+            return Err(CoreError::Unsupported(format!(
+                "\"{view}\" is not a view id."
+            )));
+        }
+        self.agent_device.view(view.to_owned());
+        Ok(())
+    }
+
+    /// The notes view's answer to the surface request `answer` names, sent
+    /// into the agent session room `room_id` it came from — only for a
+    /// request this device admitted and handed on, and only once. The
+    /// request is taken for the send and put back when the send fails
+    /// (offline for a second, a 429), so the notes view may answer again:
+    /// the person pressed *Apply* and the edit is in the note; the agent
+    /// must not be told `expired` for it.
+    pub async fn agent_surface_result(
+        &self,
+        account_id: &str,
+        room_id: &str,
+        answer: SurfaceAnswerReq,
+    ) -> Result<(), CoreError> {
+        let room_id = RoomId::parse(room_id).map_err(|_| SendError::RoomNotFound)?;
+        let (client, taken) = {
+            let accounts = self.accounts.lock().await;
+            let handle = accounts.get(account_id).ok_or(SendError::RoomNotFound)?;
+            (
+                handle.client.clone(),
+                handle.agents.take(&room_id, &answer.request_id),
+            )
+        };
+        let Some(waiting) = taken else {
+            return Err(CoreError::Unsupported(
+                "No surface request of that id is waiting on this device.".to_owned(),
+            ));
+        };
+        let request_id = answer.request_id.clone();
+        let sent = send_surface_result(&client, &room_id, answer).await;
+        if sent.is_err() {
+            let accounts = self.accounts.lock().await;
+            if let Some(handle) = accounts.get(account_id) {
+                handle.agents.restore(request_id, waiting);
+            }
+        }
+        sent
     }
 
     /// Read the dock-badge mode (Story 10.3, FR-53). Returns the in-memory
@@ -4654,6 +5188,15 @@ impl AccountManager {
     /// leave immediately while other accounts keep syncing), abort every
     /// subscription, and drop the live `Client`/`SyncService`.
     pub async fn shutdown(&self, account_id: &str) {
+        // The docked note's focus is cleared while the client can still send
+        // (quit, sign-out): the host would otherwise state it until its TTL.
+        // Bounded, so a homeserver that does not answer never holds the quit.
+        self.agent_focus
+            .close_where(
+                |(account, _)| account == account_id,
+                std::time::Duration::from_secs(1),
+            )
+            .await;
         // Drain the account's bridge-health monitor first (Story 6.5): abort its tick,
         // remove its mgmt-room handlers (which hold `Client` clones), and drop its
         // sessions from the shared health snapshot — so a signed-out account's health
@@ -4711,6 +5254,15 @@ impl AccountManager {
             // account produces no further native notifications and no handler (holding
             // a `Client` clone) leaks past teardown.
             handle.client.remove_event_handler(handle.notify_handler);
+            // Say this device is no longer in front while the client can
+            // still send, bounded like the focus clear above (91.3 F4); then
+            // stop the account's surface request handler and presence
+            // publisher — the publisher holds a `Client` clone.
+            handle
+                .agents
+                .goodbye(std::time::Duration::from_secs(1))
+                .await;
+            drop(handle.agents);
             // Stop the SyncService first so no further diffs are produced, then
             // abort the reconnect supervisor and any remaining producer tasks.
             handle.sync.stop().await;
@@ -4819,6 +5371,342 @@ impl AccountManager {
     }
 }
 
+/// `fetch` for every one of `users` at once, each answer awaited at most
+/// `within`: a user whose name is late or missing is left out.
+async fn names_within<F, Fut>(
+    users: &[matrix_sdk::ruma::OwnedUserId],
+    within: std::time::Duration,
+    fetch: F,
+) -> BTreeMap<matrix_sdk::ruma::OwnedUserId, String>
+where
+    F: Fn(&matrix_sdk::ruma::OwnedUserId) -> Fut,
+    Fut: Future<Output = Option<String>>,
+{
+    futures_util::future::join_all(users.iter().map(|user| {
+        let answer = tokio::time::timeout(within, fetch(user));
+        async move { Some((user.clone(), answer.await.ok().flatten()?)) }
+    }))
+    .await
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+/// The attached action of the approval `id` in the session room `room`, as
+/// pretty-printed JSON, and the binding digest it was checked against
+/// (R186): its encrypted file fetched and decrypted through the media
+/// cache, and refused with a sentence unless its bytes are the file the
+/// request names and the action its digest and summary bind.
+pub async fn approval_payload(room: &Room, id: &str) -> Result<(String, String), CoreError> {
+    use matrix_sdk::media::{MediaFormat, MediaRequestParameters};
+    use matrix_sdk::ruma::events::room::{EncryptedFile, MediaSource};
+    let refused = |sentence: &str| CoreError::Unsupported(sentence.to_owned());
+    let fold = agent_room::approvals_of(room).await;
+    let record = fold
+        .record(id)
+        .ok_or_else(|| refused(approval_card::NOT_FOUND))?;
+    if approval_card::binding(record) != approval_card::Binding::Attached {
+        return Err(refused(match record.file {
+            Some(_) => approval_card::PAYLOAD_REFUSED,
+            None => approval_card::NOT_ATTACHED,
+        }));
+    }
+    let file: EncryptedFile = record
+        .file
+        .clone()
+        .and_then(|file| serde_json::from_value(file).ok())
+        .ok_or_else(|| refused(approval_card::PAYLOAD_REFUSED))?;
+    let bytes = crate::media::fetch_source(
+        &room.client(),
+        MediaRequestParameters {
+            source: MediaSource::Encrypted(Box::new(file)),
+            format: MediaFormat::File,
+        },
+    )
+    .await
+    .map_err(|_| refused(approval_card::PAYLOAD_UNAVAILABLE))?;
+    let args = approval_card::verify_attached(record, &bytes).map_err(CoreError::Unsupported)?;
+    let shown = serde_json::to_string_pretty(&args)
+        .map_err(|error| CoreError::Internal(error.to_string()))?;
+    Ok((shown, record.binding_digest.clone()))
+}
+
+/// Send the person's decision `req` on the approval card it names in the
+/// session room `room`, from this device, through the one airlock
+/// ([`send_agent_event`]); `hosted` are the session rooms whose agent this
+/// app hosts and `shown` whether this app has shown the attached action
+/// with a binding digest. Refused at once, with the card's sentence, when
+/// the card would show no buttons: its digest does not bind what it shows,
+/// this device is not signed by its owner's cross-signing identity, the
+/// person is not an approver, at T4 not the requester or on the app that
+/// hosts the requesting session's agent; when the request is not in the
+/// room as the card shows it (another digest, a scope it does not offer,
+/// used or expired); or an approve of an attached action not shown (R186).
+/// A decision already in the room does not close the card: whether one
+/// counts is the owning host's (R187).
+pub async fn decide_approval(
+    room: &Room,
+    hosted: &HostedRooms,
+    shown: &(dyn Fn(&str) -> bool + Sync),
+    req: ApprovalDecideReq,
+) -> Result<(), CoreError> {
+    let viewer = Viewer {
+        own: room.own_user_id().to_owned(),
+        device_cross_signed: agent_room::own_device_cross_signed(&room.client()).await,
+        hosted: hosted.rooms(),
+    };
+    let fold = agent_room::approvals_of(room).await;
+    let record = fold
+        .check(
+            &viewer,
+            &req.id,
+            &req.binding_digest,
+            req.scope,
+            chrono::Utc::now(),
+            &|user| user.to_string(),
+        )
+        .map_err(CoreError::Unsupported)?;
+    if req.decision == crate::agents::approval::Decision::Approve
+        && approval_card::binding(record) == approval_card::Binding::Attached
+        && !shown(&record.binding_digest)
+    {
+        return Err(CoreError::Unsupported(approval_card::UNSEEN.to_owned()));
+    }
+    let content = ApprovalDecisionContent {
+        id: req.id,
+        binding_digest: req.binding_digest,
+        decision: req.decision,
+        scope: req.scope,
+        note: req
+            .note
+            .map(|note| note.trim().chars().take(NOTE_MAX).collect::<String>())
+            .filter(|note| !note.is_empty()),
+    };
+    send_agent_event(room, AgentOutbound::Decision(content))
+        .await
+        .map(|_| ())
+}
+
+/// Send one of the device's agent events ([`AgentOutbound`]: a scope, a
+/// request for a conversation or a surface result, nothing else) into
+/// `room` with `Room::send_raw` — this file's only `send_raw` — and only into an encrypted room (R30:
+/// every session room is); the event id. These are not messages, so they
+/// are outside AD-13's two dispatch triggers (`send.rs`'s Scope paragraph).
+pub(crate) async fn send_agent_event(
+    room: &Room,
+    event: AgentOutbound,
+) -> Result<String, CoreError> {
+    if !room.encryption_state().is_encrypted() {
+        return Err(CoreError::Unsupported(
+            proxy::Refusal::Unencrypted.to_string(),
+        ));
+    }
+    let content = event
+        .content()
+        .map_err(|error| CoreError::Internal(error.to_string()))?;
+    room.send_raw(event.event_type(), content)
+        .await
+        .map(|sent| sent.response.event_id.to_string())
+        .map_err(|error| SendError::Dispatch(error.to_string()).into())
+}
+
+/// What `activate` wires one account's agents (91.3) to: the app's device
+/// state, and what the dock reads a room's proxy from — the same reading
+/// the surface handler and the presence publisher use.
+struct AgentsWiring<'a> {
+    device: &'a AgentDevice,
+    kinds: &'a Arc<AgentKinds>,
+    proxies: &'a Arc<AgentProxies>,
+}
+
+/// Send the notes view's `answer` into the session room `room_id`, as this
+/// device; `detail` is trimmed and clipped, and never note text.
+async fn send_surface_result(
+    client: &Client,
+    room_id: &RoomId,
+    answer: SurfaceAnswerReq,
+) -> Result<(), CoreError> {
+    let room = client.get_room(room_id).ok_or(SendError::RoomNotFound)?;
+    if AgentRoomKind::of(room.room_type().as_ref()) != Some(AgentRoomKind::Session) {
+        return Err(SendError::RoomNotFound.into());
+    }
+    let device = client
+        .device_id()
+        .map(ToString::to_string)
+        .ok_or_else(|| CoreError::Internal("this client has no device id".to_owned()))?;
+    let result = SurfaceResultContent {
+        v: CONTENT_VERSION,
+        request: answer.request_id,
+        device,
+        outcome: answer.outcome,
+        applied: answer.applied,
+        detail: answer
+            .detail
+            .map(|detail| detail.trim().chars().take(200).collect::<String>())
+            .filter(|detail| !detail.is_empty()),
+    };
+    send_agent_event(&room, AgentOutbound::SurfaceResult(result))
+        .await
+        .map(|_| ())
+}
+
+/// What `client`'s account knows of whose proxy an agent is (ruling R72):
+/// this device's zone facts, and the person's own `dev.keeper.agent.proxies`
+/// list. Read on every admission and listing, which is also when this
+/// keeper brings the list in line with its zone
+/// ([`KnownProxies::mirrored`]) — written only when that changes it, and
+/// never over a list of a version it does not read.
+pub(crate) async fn known_proxies(client: &Client, proxies: &AgentProxies) -> KnownProxies {
+    let stored = match client
+        .account()
+        .account_data::<ProxyListEventContent>()
+        .await
+    {
+        Ok(Some(raw)) => raw.deserialize().ok().map(|content| content.agents()),
+        Ok(None) => Some(Some(BTreeSet::new())),
+        Err(error) => {
+            tracing::warn!(%error, "agents: the person's proxy list could not be read");
+            None
+        }
+    };
+    let known = KnownProxies {
+        facts: proxies.snapshot(),
+        listed: stored.clone().flatten().unwrap_or_default(),
+    };
+    let (Some(Some(listed)), Some(me)) = (stored, client.user_id()) else {
+        return known;
+    };
+    let mirrored = known.mirrored(me);
+    if mirrored != listed && proxies.owes(me, &mirrored) {
+        if let Err(error) = client
+            .account()
+            .set_account_data(ProxyListEventContent::of(&mirrored))
+            .await
+        {
+            proxies.unwritten(me);
+            tracing::warn!(%error, "agents: the person's proxy list could not be written");
+        }
+    }
+    known
+}
+
+/// Whether `room` is one of its own user's proxy conversations
+/// ([`proxy::admits`] over [`known_proxies`]): its kind and agent, or
+/// `unsupported` with the refusal's sentence.
+async fn admit_proxy_room(
+    room: &Room,
+    kinds: &AgentKinds,
+    proxies: &AgentProxies,
+) -> Result<(SessionKind, matrix_sdk::ruma::OwnedUserId), CoreError> {
+    let row = proxy_row(room.clone(), kinds).await;
+    let known = known_proxies(&room.client(), proxies).await;
+    let admitted = proxy::admits(&row, room.own_user_id(), &known)
+        .map_err(|refusal| CoreError::Unsupported(refusal.to_string()))?;
+    Ok((admitted.kind, admitted.agent.to_owned()))
+}
+
+/// Send what the voice turn heard into `room`, its own user's proxy
+/// conversation, as their message (AD-384) — through the single dispatch
+/// gate with [`SendTrigger::SpokenToAgent`], legal only there (ruling R31,
+/// whose "the proxy's human is the signed-in user" R72 makes fail closed)
+/// and never held for Undo-Send: the end of the utterance was the send.
+/// The answer's watch is on the room's event cache before the send, and
+/// learns the question's event id from the send queue; it reads the answer
+/// as it grows. `open` is the conversation's timeline when one is open
+/// (no screen need be: the voice turn runs with none).
+///
+/// Errors: a blank text → [`SendError::EmptyBody`]; a room that is not the
+/// person's own `main`/`conversation` proxy room → `unsupported` with
+/// [`proxy::admits`]' reason, and nothing is sent; a transient-build
+/// failure → [`TimelineError::Build`]; an SDK enqueue failure →
+/// [`SendError::Dispatch`].
+pub async fn spoken_send(
+    room: &Room,
+    kinds: &AgentKinds,
+    proxies: &AgentProxies,
+    open: Option<Arc<Timeline>>,
+    text: &str,
+) -> Result<SpokenAnswer, CoreError> {
+    if text.trim().is_empty() {
+        return Err(SendError::EmptyBody.into());
+    }
+    let (_, agent) = admit_proxy_room(room, kinds, proxies).await?;
+    let mut answer = SpokenAnswer::watch(room, agent).await?;
+    let timeline = match open {
+        Some(timeline) => timeline,
+        None => Arc::new(
+            TimelineBuilder::new(room)
+                .build()
+                .await
+                .map_err(|e| TimelineError::Build(e.to_string()))?,
+        ),
+    };
+    if let Some(handle) = send::submit(&timeline, text, SendTrigger::SpokenToAgent).await? {
+        answer.sent(&handle, text);
+    }
+    Ok(answer)
+}
+
+/// What the dock and the surface handler read of a session room to decide
+/// whether it is one of the person's proxy conversations ([`proxy::admits`]).
+pub(crate) async fn proxy_row(room: Room, kinds: &AgentKinds) -> ProxyRoomRow {
+    let room_id = room.room_id().to_string();
+    let name = room
+        .cached_display_name()
+        .map(|name| name.to_string())
+        .unwrap_or_else(|| room_id.clone());
+    let recency = room.recency_stamp().map_or(0, u64::from);
+    let encrypted = room
+        .latest_encryption_state()
+        .await
+        .is_ok_and(|state| state.is_encrypted());
+    let creators = room.creators().unwrap_or_default();
+    let direct_to = room
+        .direct_targets()
+        .iter()
+        .filter_map(|target| target.as_user_id().map(ToOwned::to_owned))
+        .collect();
+    let reader = agent_room::HeaderReader::open(room, kinds).await;
+    let state = reader.state();
+    let agent = state.agent().map(ToOwned::to_owned);
+    let scope = agent
+        .as_deref()
+        .and_then(|agent| state.scope_drives_of(agent));
+    ProxyRoomRow {
+        room_id,
+        name,
+        kind: state.kind(),
+        agent,
+        title: state.title().map(ToOwned::to_owned),
+        recency,
+        creators,
+        encrypted,
+        direct_to,
+        scope,
+    }
+}
+
+/// A focus lane's room: the focus goes there as a scope without drives.
+struct RoomFocus(Room);
+
+impl FocusPort for RoomFocus {
+    fn send(&self, focus: Option<Focus>) -> SendFuture<'_> {
+        Box::pin(async move {
+            let content = ScopeContent {
+                v: CONTENT_VERSION,
+                drives: None,
+                label: None,
+                focus,
+                set_by: self.0.own_user_id().to_owned(),
+            };
+            send_agent_event(&self.0, AgentOutbound::Scope(content))
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        })
+    }
+}
+
 /// Keychain key under which an account's saved base58 recovery key is stored
 /// (Story 3.3, FR-14) — the user's opt-in save after enabling key backup.
 /// Namespaced by account id so it is scoped exactly to one account. The stored
@@ -4845,7 +5733,7 @@ fn recovery_key_keychain_key(account_id: &str) -> String {
 /// lifetime-of-account reconnect supervisor is spawned to re-enable the send
 /// queue on every transition back into `Running`; its `JoinHandle` is returned
 /// for the caller to store on the `AccountHandle`.
-#[tracing::instrument(skip(platform, session, archive), fields(account_id = %account_id))]
+#[tracing::instrument(skip(platform, session, archive, agents), fields(account_id = %account_id))]
 async fn activate(
     platform: &Arc<dyn Platform>,
     account_id: &str,
@@ -4853,6 +5741,7 @@ async fn activate(
     archive: Option<ArchiveHandle>,
     draft_mirror_tx: tokio::sync::broadcast::Sender<DraftMirrorBatch>,
     notify_config: Arc<NotifyConfig>,
+    agents: AgentsWiring<'_>,
 ) -> Result<ActivatedAccount, CoreError> {
     // Use the blob the caller already holds when there is one; otherwise read it
     // here, once. `None` is the honest answer for the callers that activate an
@@ -4934,6 +5823,17 @@ async fn activate(
     // body is never logged; a notifier failure is swallowed and never blocks sync.
     let notify_handler =
         notify::register_notify_handler(&client, account_id, platform.clone(), notify_config);
+    // The agents' surface request handler (91.3) beside the notify handler,
+    // before sync starts, so a request in the first batch is read; and this
+    // device's presence publisher into the account's own control rooms. Both
+    // read which rooms are the person's proxy conversations as the dock does.
+    let agents = agent_device::register(
+        &client,
+        account_id,
+        agents.device,
+        Arc::clone(agents.kinds),
+        Arc::clone(agents.proxies),
+    );
 
     // Archive-first back-pagination enablement (Story 5.6, FR-17). Subscribe the
     // SDK event cache once here — alongside the archive/redaction handlers and
@@ -5020,6 +5920,7 @@ async fn activate(
         redaction_handler,
         draft_handler,
         notify_handler,
+        agents,
         outbox_scheduler,
         outbox_tx,
     ))
@@ -5566,6 +6467,7 @@ async fn run_producer(
     sink: BatchSink,
     account_id: &str,
     notify: &NotifyConfig,
+    kinds: &AgentKinds,
 ) {
     let mut loading_state = room_list.loading_state();
     let (stream, controller) = room_list.entries_with_dynamic_adapters(ROOM_LIST_PAGE_SIZE);
@@ -5590,7 +6492,7 @@ async fn run_producer(
                     Some(diffs) => {
                         let mut ops = Vec::with_capacity(diffs.len());
                         for diff in diffs {
-                            ops.push(diff_to_op(diff, notify).await);
+                            ops.push(diff_to_op(diff, notify, kinds).await);
                         }
                         if !(sink)(RoomListBatch { ops, total }) {
                             tracing::info!(account_id = %account_id, "room list channel closed, stopping producer");
@@ -5624,6 +6526,7 @@ async fn run_inbox_producer(
     merger: InboxMerger,
     account_id: &str,
     notify: &NotifyConfig,
+    kinds: &AgentKinds,
 ) {
     let mut loading_state = room_list.loading_state();
     let (stream, controller) = room_list.entries_with_dynamic_adapters(ROOM_LIST_PAGE_SIZE);
@@ -5644,7 +6547,7 @@ async fn run_inbox_producer(
                     Some(diffs) => {
                         let mut ops = Vec::with_capacity(diffs.len());
                         for diff in diffs {
-                            ops.push(diff_to_op(diff, notify).await);
+                            ops.push(diff_to_op(diff, notify, kinds).await);
                         }
                         if !merger.apply_account_batch(account_id, RoomListBatch { ops, total }).await {
                             tracing::info!(account_id = %account_id, "inbox channel closed, stopping producer");
@@ -5878,8 +6781,12 @@ fn loaded_total(state: &RoomListLoadingState) -> Option<u32> {
 /// Convert a `VectorDiff<RoomListItem>` into a [`RoomListOp`], resolving each
 /// carried item to a [`RoomVm`] (async) before delegating to the pure
 /// [`vector_diff_to_op`] seam.
-async fn diff_to_op(diff: VectorDiff<RoomListItem>, notify: &NotifyConfig) -> RoomListOp {
-    let mapped = map_vector_diff(diff, notify).await;
+async fn diff_to_op(
+    diff: VectorDiff<RoomListItem>,
+    notify: &NotifyConfig,
+    kinds: &AgentKinds,
+) -> RoomListOp {
+    let mapped = map_vector_diff(diff, notify, kinds).await;
     vector_diff_to_op(mapped)
 }
 
@@ -5889,41 +6796,43 @@ async fn diff_to_op(diff: VectorDiff<RoomListItem>, notify: &NotifyConfig) -> Ro
 /// (display name / latest event / mute state) while the diff→op conversion is pure.
 /// `notify` threads the in-memory muted-Network set into the per-room [`MuteState`]
 /// resolution (Story 10.2) — the same live source the notify handler reads.
+/// `kinds` holds the agent rooms' session kinds read so far (UX-DR132).
 async fn map_vector_diff(
     diff: VectorDiff<RoomListItem>,
     notify: &NotifyConfig,
+    kinds: &AgentKinds,
 ) -> VectorDiff<RoomVm> {
     match diff {
         VectorDiff::Append { values } => {
             let mut vms = Vec::with_capacity(values.len());
             for item in values {
-                vms.push(room_item_to_vm(&item, notify).await);
+                vms.push(room_item_to_vm(&item, notify, kinds).await);
             }
             VectorDiff::Append { values: vms.into() }
         }
         VectorDiff::Clear => VectorDiff::Clear,
         VectorDiff::PushFront { value } => VectorDiff::PushFront {
-            value: room_item_to_vm(&value, notify).await,
+            value: room_item_to_vm(&value, notify, kinds).await,
         },
         VectorDiff::PushBack { value } => VectorDiff::PushBack {
-            value: room_item_to_vm(&value, notify).await,
+            value: room_item_to_vm(&value, notify, kinds).await,
         },
         VectorDiff::PopFront => VectorDiff::PopFront,
         VectorDiff::PopBack => VectorDiff::PopBack,
         VectorDiff::Insert { index, value } => VectorDiff::Insert {
             index,
-            value: room_item_to_vm(&value, notify).await,
+            value: room_item_to_vm(&value, notify, kinds).await,
         },
         VectorDiff::Set { index, value } => VectorDiff::Set {
             index,
-            value: room_item_to_vm(&value, notify).await,
+            value: room_item_to_vm(&value, notify, kinds).await,
         },
         VectorDiff::Remove { index } => VectorDiff::Remove { index },
         VectorDiff::Truncate { length } => VectorDiff::Truncate { length },
         VectorDiff::Reset { values } => {
             let mut vms = Vec::with_capacity(values.len());
             for item in values {
-                vms.push(room_item_to_vm(&item, notify).await);
+                vms.push(room_item_to_vm(&item, notify, kinds).await);
             }
             VectorDiff::Reset { values: vms.into() }
         }
@@ -5991,7 +6900,7 @@ async fn resolve_mute_state(
 
 /// Resolve a [`RoomListItem`] to a non-secret [`RoomVm`]: display name plus a
 /// latest-event text preview and timestamp.
-async fn room_item_to_vm(item: &RoomListItem, notify: &NotifyConfig) -> RoomVm {
+async fn room_item_to_vm(item: &RoomListItem, notify: &NotifyConfig, kinds: &AgentKinds) -> RoomVm {
     let room_id = item.room_id().to_string();
     let resolved = item.display_name().await;
     if resolved.is_err() {
@@ -6046,6 +6955,9 @@ async fn room_item_to_vm(item: &RoomListItem, notify: &NotifyConfig) -> RoomVm {
     // any read error so a transient push-rule failure never blocks the inbox stream
     // and never touches the unread computation above.
     let mute_state = resolve_mute_state(item, network.as_deref(), notify).await;
+    // An agent room from its cached create type; a session room's proxy-or-watched
+    // from its status's session kind, never guessed (UX-DR132).
+    let agent_room = agent_room::room_kind_vm(item, kinds).await;
 
     RoomVm {
         room_id,
@@ -6061,6 +6973,7 @@ async fn room_item_to_vm(item: &RoomListItem, notify: &NotifyConfig) -> RoomVm {
         network,
         network_id,
         mute_state,
+        agent_room,
     }
 }
 
@@ -6171,6 +7084,41 @@ mod tests {
     use crate::platform::SecretCache;
     use matrix_sdk_ui::eyeball_im::Vector;
     use std::path::PathBuf;
+
+    /// Settings › Agents waits on these names before it renders: a server
+    /// that never answers costs `within` once, however many people it is
+    /// asked about, and the people who did answer keep their names.
+    #[tokio::test(start_paused = true)]
+    async fn display_names_wait_at_most_the_bound_for_everyone_together() {
+        use matrix_sdk::ruma::OwnedUserId;
+        let user = |id: &str| OwnedUserId::try_from(id).expect("user");
+        let users = [
+            user("@slow1:dead.example"),
+            user("@quick:example.org"),
+            user("@slow2:dead.example"),
+            user("@slow3:dead.example"),
+        ];
+        let within = std::time::Duration::from_secs(2);
+        let started = tokio::time::Instant::now();
+        let asked = names_within(&users, within, |user| {
+            let quick = user.server_name() == "example.org";
+            async move {
+                if quick {
+                    Some("Quick".to_owned())
+                } else {
+                    std::future::pending().await
+                }
+            }
+        });
+        let names = tokio::time::timeout(within * 10, asked)
+            .await
+            .expect("the names are answered within their bound");
+        assert_eq!(started.elapsed(), within);
+        assert_eq!(
+            names,
+            BTreeMap::from([(user("@quick:example.org"), "Quick".to_owned())])
+        );
+    }
 
     /// Fake platform with a fixed data dir, an in-memory keychain (so `activate`
     /// can read back a stored session), a **spy recorder** of every key passed to
@@ -6502,6 +7450,7 @@ mod tests {
             _redaction_handler,
             _draft_handler,
             _notify_handler,
+            _agents,
             outbox_scheduler,
             _outbox_tx,
         ) = activated;
@@ -6586,6 +7535,11 @@ mod tests {
             None,
             draft_tx.clone(),
             Arc::new(NotifyConfig::new(true)),
+            AgentsWiring {
+                device: &AgentDevice::default(),
+                kinds: &Arc::default(),
+                proxies: &Arc::default(),
+            },
         )
         .await
         .expect("offline activation succeeds");
@@ -6609,6 +7563,11 @@ mod tests {
             None,
             draft_tx,
             Arc::new(NotifyConfig::new(true)),
+            AgentsWiring {
+                device: &AgentDevice::default(),
+                kinds: &Arc::default(),
+                proxies: &Arc::default(),
+            },
         )
         .await
         .expect("re-activation succeeds");
@@ -6642,6 +7601,11 @@ mod tests {
             None,
             draft_tx,
             Arc::new(NotifyConfig::new(true)),
+            AgentsWiring {
+                device: &AgentDevice::default(),
+                kinds: &Arc::default(),
+                proxies: &Arc::default(),
+            },
         )
         .await
         .expect("activation succeeds even when backup exclusion fails");
@@ -6703,6 +7667,11 @@ mod tests {
                 None,
                 draft_tx.clone(),
                 Arc::new(NotifyConfig::new(true)),
+                AgentsWiring {
+                    device: &AgentDevice::default(),
+                    kinds: &Arc::default(),
+                    proxies: &Arc::default(),
+                },
             )
             .await
             .expect("offline activation succeeds");
@@ -6752,6 +7721,11 @@ mod tests {
             None,
             draft_tx,
             Arc::new(NotifyConfig::new(true)),
+            AgentsWiring {
+                device: &AgentDevice::default(),
+                kinds: &Arc::default(),
+                proxies: &Arc::default(),
+            },
         )
         .await
         .expect("activation succeeds without a pre-read session");
@@ -6827,6 +7801,11 @@ mod tests {
                 None,
                 draft_tx.clone(),
                 Arc::new(NotifyConfig::new(true)),
+                AgentsWiring {
+                    device: &AgentDevice::default(),
+                    kinds: &Arc::default(),
+                    proxies: &Arc::default(),
+                },
             )
             .await
             .expect("offline activation succeeds");
@@ -7453,6 +8432,7 @@ mod tests {
             network: None,
             network_id: None,
             mute_state: MuteState::None,
+            agent_room: None,
         }
     }
 

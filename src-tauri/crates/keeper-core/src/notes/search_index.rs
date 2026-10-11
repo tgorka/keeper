@@ -28,6 +28,11 @@ pub const VEC_WEIGHT: f32 = 0.55;
 pub const OVERLAP_BONUS: f32 = 0.15;
 pub const MIN_HYBRID_SCORE: f32 = 0.18;
 pub const MIN_MEANING_COSINE: f32 = 0.5;
+/// How many SQLite steps a bounded reader takes between two asks whether
+/// its time is up ([`SearchIndex::open_bounded`]).
+pub const STEPS_PER_CHECK: i32 = 16;
+/// What one number of a row counts as, handed to a bounded reader.
+const NUMBER: usize = 8;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SearchIndexError {
@@ -37,10 +42,114 @@ pub enum SearchIndexError {
     Io(String),
     #[error("notes search vector: {0}")]
     Vector(String),
+    /// A bounded reader's time or bytes ran out ([`SearchIndex::open_bounded`],
+    /// [`Meter`]).
+    #[error("the search's time or bytes ran out before the notes index answered")]
+    Bounds,
+    /// A reader's index whose text is not stored as UTF-8: the lengths it
+    /// stores are not those of what it hands over ([`Meter`]).
+    #[error("the notes index stores its text as {0}, not UTF-8, so it is not read")]
+    Encoding(String),
 }
 impl From<rusqlite::Error> for SearchIndexError {
     fn from(e: rusqlite::Error) -> Self {
+        // Only a bounded reader's progress handler interrupts a statement.
+        if e.sqlite_error_code() == Some(rusqlite::ErrorCode::OperationInterrupted) {
+            return Self::Bounds;
+        }
         Self::Sqlite(e.to_string())
+    }
+}
+
+/// What a bounded reader may still be handed by the index, and what it was
+/// handed. A value is admitted before it is extracted: a row's numbers
+/// before the step that yields it, an id, a path or a vector by its stored
+/// length (asked of SQLite without the value, which in a UTF-8 database is
+/// the length handed over) before the value itself — so what is handed
+/// over never passes what was left, and a row that would pass it ends the
+/// read with [`SearchIndexError::Bounds`] without its payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Meter {
+    pub left: u64,
+    pub taken: u64,
+}
+
+impl Meter {
+    pub fn new(left: u64) -> Self {
+        Meter { left, taken: 0 }
+    }
+
+    fn unbounded() -> Self {
+        Meter::new(u64::MAX)
+    }
+
+    /// Whether `bytes` more may be fetched; nothing is counted.
+    fn admit(&self, bytes: u64) -> Result<(), SearchIndexError> {
+        if bytes > self.left {
+            return Err(SearchIndexError::Bounds);
+        }
+        Ok(())
+    }
+
+    /// Count `bytes` handed over; past what is left ends the read.
+    fn take(&mut self, bytes: usize) -> Result<(), SearchIndexError> {
+        let bytes = bytes as u64;
+        self.taken += bytes;
+        if bytes > self.left {
+            self.left = 0;
+            return Err(SearchIndexError::Bounds);
+        }
+        self.left -= bytes;
+        Ok(())
+    }
+
+    /// Admit, then step `rows` for its next row, whose `numbers` are then
+    /// counted as handed over.
+    fn step<'r, 's>(
+        &mut self,
+        rows: &'r mut rusqlite::Rows<'s>,
+        numbers: usize,
+    ) -> Result<Option<&'r rusqlite::Row<'s>>, SearchIndexError> {
+        self.admit(numbers as u64)?;
+        let row = rows.next()?;
+        if row.is_some() {
+            self.take(numbers)?;
+        }
+        Ok(row)
+    }
+
+    /// The value `fetch` extracts, `length` admitted first, then the bytes
+    /// it says it handed over counted: a value whose length passes what is
+    /// left is never extracted.
+    fn fetch<T>(
+        &mut self,
+        length: u64,
+        fetch: impl FnOnce() -> rusqlite::Result<(T, usize)>,
+    ) -> Result<T, SearchIndexError> {
+        let fetch = || {
+            #[cfg(test)]
+            tests::EXTRACTED.with(|n| n.set(n.get() + 1));
+            fetch()
+        };
+        self.admit(length)?;
+        let (value, handed) = fetch()?;
+        self.take(handed)?;
+        Ok(value)
+    }
+
+    /// The text `fetch` extracts, by the length SQLite stores for it
+    /// ([`Self::fetch`]).
+    fn text(
+        &mut self,
+        length: Option<i64>,
+        fetch: impl FnOnce() -> rusqlite::Result<String>,
+    ) -> Result<String, SearchIndexError> {
+        self.fetch(length.map_or(0, |n| n.max(0) as u64), || {
+            fetch().map(|text| {
+                let handed = text.len();
+                (text, handed)
+            })
+        })
     }
 }
 impl From<std::io::Error> for SearchIndexError {
@@ -169,8 +278,36 @@ impl SearchIndex {
     }
 
     pub fn open_read_only(path: &Path) -> Result<Self, SearchIndexError> {
+        Self::reader(path, Duration::from_secs(5), None::<fn() -> bool>)
+    }
+
+    /// [`Self::open_read_only`] for a reader with bounds: a lock is waited
+    /// on at most `wait`, and every statement is interrupted — failing with
+    /// [`SearchIndexError::Bounds`] — once `expired` says the time is up,
+    /// asked every [`STEPS_PER_CHECK`] SQLite steps.
+    pub fn open_bounded(
+        path: &Path,
+        wait: Duration,
+        expired: impl FnMut() -> bool + Send + 'static,
+    ) -> Result<Self, SearchIndexError> {
+        Self::reader(path, wait, Some(expired))
+    }
+
+    fn reader(
+        path: &Path,
+        wait: Duration,
+        expired: Option<impl FnMut() -> bool + Send + 'static>,
+    ) -> Result<Self, SearchIndexError> {
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        conn.busy_timeout(Duration::from_secs(5))?;
+        conn.busy_timeout(wait)?;
+        conn.progress_handler(STEPS_PER_CHECK, expired);
+        // A value is admitted by the length SQLite stores for it, which is
+        // the length of the UTF-8 handed over only where the text is stored
+        // as UTF-8; an index stored otherwise is not read at all.
+        let encoding: String = conn.query_row("PRAGMA encoding", [], |r| r.get(0))?;
+        if encoding != "UTF-8" {
+            return Err(SearchIndexError::Encoding(encoding));
+        }
         // Ranking and snippet reads share one revision even if the reconciler
         // replaces a note between them. Dropping this fresh reader ends the snapshot.
         conn.execute_batch("BEGIN DEFERRED")?;
@@ -289,23 +426,87 @@ impl SearchIndex {
             .optional()?)
     }
 
+    /// Each of `ids`' vault-relative path, for the notes the index holds:
+    /// what a ranked hit names, for a reader that has no vault snapshot;
+    /// each path's length, then the path, admitted by `meter` before it is
+    /// fetched.
+    pub fn paths_of(
+        &self,
+        ids: &[&str],
+        meter: &mut Meter,
+    ) -> Result<HashMap<String, String>, SearchIndexError> {
+        let mut length = self
+            .conn
+            .prepare("SELECT octet_length(path) FROM notes WHERE id=?1")?;
+        let mut path_of = self.conn.prepare("SELECT path FROM notes WHERE id=?1")?;
+        let mut paths = HashMap::new();
+        for id in ids {
+            let mut rows = length.query([id])?;
+            let Some(row) = meter.step(&mut rows, NUMBER)? else {
+                continue;
+            };
+            let Some(bytes) = row.get::<_, Option<i64>>(0)? else {
+                continue;
+            };
+            let path = meter.text(Some(bytes), || {
+                path_of.query_row([id], |r| r.get::<_, String>(0))
+            })?;
+            paths.insert((*id).to_owned(), path);
+        }
+        Ok(paths)
+    }
+
     pub fn query(&self, q: &str, limit: usize) -> Result<Vec<ChunkHit>, SearchIndexError> {
+        self.query_within(q, limit, &mut Meter::unbounded())
+    }
+
+    /// [`Self::query`], each row read taken from `meter`.
+    pub fn query_within(
+        &self,
+        q: &str,
+        limit: usize,
+        meter: &mut Meter,
+    ) -> Result<Vec<ChunkHit>, SearchIndexError> {
         let Some((and, or)) = build_match(q) else {
             return Ok(Vec::new());
         };
-        let found = self.run_match(&and, limit)?;
+        let found = self.run_match(&and, limit, meter)?;
         if found.is_empty() {
             if let Some(or) = or {
-                return self.run_match(&or, limit);
+                return self.run_match(&or, limit, meter);
             }
         }
         Ok(found)
     }
 
-    fn run_match(&self, expr: &str, limit: usize) -> Result<Vec<ChunkHit>, SearchIndexError> {
-        let mut stmt = self.conn.prepare("WITH matches AS MATERIALIZED (SELECT c.note_id,c.ordinal,c.rowid,-bm25(chunks_fts,?2,1.0) AS score FROM chunks_fts JOIN chunks c ON c.rowid=chunks_fts.rowid WHERE chunks_fts MATCH ?1), ranked AS (SELECT *,ROW_NUMBER() OVER (PARTITION BY note_id ORDER BY score DESC,ordinal) AS n FROM matches) SELECT note_id,ordinal,rowid,score FROM ranked WHERE n=1 ORDER BY 4 DESC,note_id LIMIT ?3")?;
-        let rows = stmt.query_map(params![expr, TITLE_WEIGHT, limit], hit_row)?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    fn run_match(
+        &self,
+        expr: &str,
+        limit: usize,
+        meter: &mut Meter,
+    ) -> Result<Vec<ChunkHit>, SearchIndexError> {
+        let mut stmt = self.conn.prepare("WITH matches AS MATERIALIZED (SELECT c.note_id,c.ordinal,c.rowid,-bm25(chunks_fts,?2,1.0) AS score FROM chunks_fts JOIN chunks c ON c.rowid=chunks_fts.rowid WHERE chunks_fts MATCH ?1), ranked AS (SELECT *,ROW_NUMBER() OVER (PARTITION BY note_id ORDER BY score DESC,ordinal) AS n FROM matches) SELECT octet_length(note_id),ordinal,rowid,score FROM ranked WHERE n=1 ORDER BY 4 DESC,note_id LIMIT ?3")?;
+        let mut id_of = self
+            .conn
+            .prepare("SELECT note_id FROM chunks WHERE rowid=?1")?;
+        let mut rows = stmt.query(params![expr, TITLE_WEIGHT, limit])?;
+        let mut hits = Vec::new();
+        while hits.len() < limit {
+            let Some(row) = meter.step(&mut rows, 4 * NUMBER)? else {
+                break;
+            };
+            let chunk_rowid: i64 = row.get(2)?;
+            let note_id = meter.text(row.get(0)?, || {
+                id_of.query_row([chunk_rowid], |r| r.get::<_, String>(0))
+            })?;
+            hits.push(ChunkHit {
+                note_id,
+                ordinal: row.get(1)?,
+                chunk_rowid,
+                score: row.get(3)?,
+            });
+        }
+        Ok(hits)
     }
 
     pub fn chunks_without_vectors(
@@ -365,38 +566,71 @@ impl SearchIndex {
         query: &[f32],
         k: usize,
     ) -> Result<Vec<ChunkHit>, SearchIndexError> {
+        self.cosine_top_k_within(model, query, k, &mut Meter::unbounded())
+    }
+
+    /// [`Self::cosine_top_k`], each row read admitted by `meter` before it
+    /// is fetched: every vector stepped through, by its numbers, its blob
+    /// where it is the query's width, and a kept candidate's id.
+    pub fn cosine_top_k_within(
+        &self,
+        model: &str,
+        query: &[f32],
+        k: usize,
+        meter: &mut Meter,
+    ) -> Result<Vec<ChunkHit>, SearchIndexError> {
         if k == 0 {
             return Ok(Vec::new());
         }
         let query = normalize_vector(query)?;
-        let mut stmt = self.conn.prepare("SELECT c.note_id,c.ordinal,c.rowid,v.vec FROM vectors v JOIN chunks c ON c.rowid=v.chunk_rowid WHERE v.model=?1 AND v.dim=?2")?;
+        let mut stmt = self.conn.prepare("SELECT c.rowid,c.ordinal,octet_length(c.note_id),octet_length(v.vec) FROM vectors v JOIN chunks c ON c.rowid=v.chunk_rowid WHERE v.model=?1 AND v.dim=?2")?;
+        let mut vector_of = self
+            .conn
+            .prepare("SELECT vec FROM vectors WHERE chunk_rowid=?1")?;
+        let mut id_of = self
+            .conn
+            .prepare("SELECT note_id FROM chunks WHERE rowid=?1")?;
         let mut rows = stmt.query(params![model, query.len()])?;
         let mut heap: BinaryHeap<Candidate> = BinaryHeap::new();
-        while let Some(row) = rows.next()? {
-            let bytes = row
-                .get_ref(3)?
-                .as_blob()
-                .map_err(|e| SearchIndexError::Vector(e.to_string()))?;
-            if bytes.len() != query.len() * 4 {
+        let width = query.len() * 4;
+        while let Some(row) = meter.step(&mut rows, 4 * NUMBER)? {
+            let chunk_rowid: i64 = row.get(0)?;
+            let stored: Option<i64> = row.get(3)?;
+            if stored != Some(width as i64) {
                 continue;
             }
-            let score: f32 = bytes
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .zip(&query)
-                .map(|(b, q)| f32::from_le_bytes(*b) * q)
-                .sum();
-            if !score.is_finite() {
+            let (handed, score) = meter.fetch(width as u64, || {
+                vector_of.query_row([chunk_rowid], |r| {
+                    let bytes = r.get_ref(0)?.as_blob().map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Blob,
+                            e.into(),
+                        )
+                    })?;
+                    let score: f32 = bytes
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .zip(&query)
+                        .map(|(b, q)| f32::from_le_bytes(*b) * q)
+                        .sum();
+                    Ok(((bytes.len(), score), bytes.len()))
+                })
+            })?;
+            if handed != width || !score.is_finite() {
                 continue;
             }
             if heap.len() == k && heap.peek().is_some_and(|worst| score < worst.0.score) {
                 continue;
             }
+            let note_id = meter.text(row.get(2)?, || {
+                id_of.query_row([chunk_rowid], |r| r.get::<_, String>(0))
+            })?;
             let candidate = Candidate(ChunkHit {
-                note_id: row.get(0)?,
+                note_id,
                 ordinal: row.get(1)?,
-                chunk_rowid: row.get(2)?,
+                chunk_rowid,
                 score,
             });
             if heap.len() < k {
@@ -433,14 +667,6 @@ fn hash_parts(parts: &[&str]) -> String {
         hash.update(part.as_bytes());
     }
     hash.finalize().to_hex().to_string()
-}
-fn hit_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ChunkHit> {
-    Ok(ChunkHit {
-        note_id: r.get(0)?,
-        ordinal: r.get(1)?,
-        chunk_rowid: r.get(2)?,
-        score: r.get(3)?,
-    })
 }
 fn normalize_vector(vector: &[f32]) -> Result<Vec<f32>, SearchIndexError> {
     let norm = vector
@@ -1137,6 +1363,222 @@ mod tests {
             .expect("dimension")
             .is_empty());
         assert!(index.cosine_top_k("m", &[], 0).expect("zero k").is_empty());
+    }
+
+    /// A bounded reader is handed values only within its meter, each
+    /// admitted before it is fetched — a lexical hit's four numbers before
+    /// the step and its id by its length, every vector's numbers and its
+    /// blob, a kept one's id, a path's length and then the path — so what
+    /// it was handed never passes what it was allowed: at the exact bound
+    /// it answers, and a byte short of it or with nothing left it stops
+    /// within the allowance. These count what was handed over; that
+    /// nothing past the allowance is extracted at all is
+    /// [`a_path_past_what_is_left_is_never_extracted`]'s and
+    /// [`a_vector_past_what_is_left_is_never_extracted`]'s.
+    #[test]
+    fn a_bounded_reader_is_handed_no_more_than_its_meter() {
+        let scratch = Scratch::new();
+        let mut index = scratch.index();
+        for id in ["a", "b", "c"] {
+            add(&mut index, id, "harbour");
+        }
+        let pending = index.chunks_without_vectors("m", 10).expect("pending");
+        let vectors: Vec<_> = pending
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (c.rowid, c.text_hash.clone(), vec![i as f32, 1.0]))
+            .collect();
+        index.put_vectors("m", &vectors).expect("vectors");
+        let reader =
+            SearchIndex::open_bounded(&scratch.path(), Duration::ZERO, || false).expect("reader");
+        let stops_within =
+            |allowed: u64, read: &dyn Fn(&mut Meter) -> Result<usize, SearchIndexError>| {
+                let mut meter = Meter::new(allowed);
+                assert!(
+                    matches!(read(&mut meter), Err(SearchIndexError::Bounds)),
+                    "{allowed}"
+                );
+                assert!(meter.taken <= allowed, "{} of {allowed}", meter.taken);
+            };
+
+        let lexical = 3 * (32 + 1);
+        let mut meter = Meter::new(lexical);
+        assert_eq!(
+            reader
+                .query_within("harbour", 3, &mut meter)
+                .expect("hits")
+                .len(),
+            3
+        );
+        assert_eq!(
+            meter,
+            Meter {
+                left: 0,
+                taken: lexical
+            }
+        );
+        let query = |meter: &mut Meter| Ok(reader.query_within("harbour", 3, meter)?.len());
+        stops_within(lexical - 1, &query);
+        stops_within(0, &query);
+
+        // The first vector is the best, so it alone is kept; a reader asks
+        // for a row's numbers before every step, the one that finds no row
+        // as well.
+        let vectors = 6 * (32 + 2 * 4) + 1;
+        let mut meter = Meter::new(vectors + 32);
+        assert_eq!(
+            reader
+                .cosine_top_k_within("m", &[-1.0, 0.0], 1, &mut meter)
+                .expect("top")
+                .len(),
+            1
+        );
+        assert_eq!(meter.taken, vectors);
+        let meaning = |meter: &mut Meter| {
+            Ok(reader
+                .cosine_top_k_within("m", &[-1.0, 0.0], 1, meter)?
+                .len())
+        };
+        stops_within(vectors - 1, &meaning);
+        stops_within(0, &meaning);
+
+        let paths = 3 * (8 + 1);
+        let mut meter = Meter::new(paths);
+        assert_eq!(
+            reader
+                .paths_of(&["a", "b", "c"], &mut meter)
+                .expect("paths")
+                .len(),
+            3
+        );
+        assert_eq!(meter.taken, paths);
+        let named = |meter: &mut Meter| Ok(reader.paths_of(&["a", "b", "c"], meter)?.len());
+        stops_within(paths - 1, &named);
+    }
+
+    thread_local! {
+        /// The values [`Meter::fetch`] extracted on this test's thread.
+        pub(super) static EXTRACTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// A bounded reader of an index whose note `big` has a 1 MiB path and,
+    /// under model `w`, a 128 KiB vector for each of its chunks.
+    fn oversized(scratch: &Scratch) -> SearchIndex {
+        let mut index = scratch.index();
+        index
+            .replace_note(&NoteDoc {
+                id: "big",
+                path: &"p".repeat(1 << 20),
+                title: "Untitled",
+                tags: &[],
+                fields: &BTreeMap::new(),
+                body: "harbour",
+                stat: None,
+            })
+            .expect("big note");
+        let pending = index.chunks_without_vectors("w", 10).expect("pending");
+        let rows: Vec<_> = pending
+            .iter()
+            .map(|c| (c.rowid, c.text_hash.clone(), vec![1.0; WIDE]))
+            .collect();
+        index.put_vectors("w", &rows).expect("wide vectors");
+        SearchIndex::open_bounded(&scratch.path(), Duration::ZERO, || false).expect("reader")
+    }
+
+    /// The floats of [`oversized`]'s vectors.
+    const WIDE: usize = 32_768;
+
+    /// `read` against 64 KiB ends with `Bounds`, within the allowance, and
+    /// with nothing extracted: the value past what was left was refused by
+    /// its stored length, never fetched and then refused.
+    fn refused_unextracted(read: impl Fn(&mut Meter) -> Result<usize, SearchIndexError>) {
+        let allowed = 64 * 1024;
+        let mut meter = Meter::new(allowed);
+        EXTRACTED.set(0);
+        assert!(matches!(read(&mut meter), Err(SearchIndexError::Bounds)));
+        assert!(meter.taken <= allowed, "{} of {allowed}", meter.taken);
+        assert_eq!(
+            EXTRACTED.get(),
+            0,
+            "a value past what was left was extracted"
+        );
+    }
+
+    /// R95S4-02: a path longer than what is left is refused by the length
+    /// SQLite stores for it before it is extracted.
+    #[test]
+    fn a_path_past_what_is_left_is_never_extracted() {
+        let scratch = Scratch::new();
+        let reader = oversized(&scratch);
+        refused_unextracted(|meter| Ok(reader.paths_of(&["big"], meter)?.len()));
+    }
+
+    /// R95S4-02: a vector wider than what is left is refused by its stored
+    /// width before its blob is extracted.
+    #[test]
+    fn a_vector_past_what_is_left_is_never_extracted() {
+        let scratch = Scratch::new();
+        let reader = oversized(&scratch);
+        refused_unextracted(|meter| {
+            Ok(reader
+                .cosine_top_k_within("w", &[1.0; WIDE], 1, meter)?
+                .len())
+        });
+    }
+
+    /// R95S4-01: a value is admitted by the length SQLite stores for it,
+    /// the length handed over only where the text is stored as UTF-8. An
+    /// index stored as UTF-16 — where the path `港` is stored in two bytes
+    /// and handed over in three — is refused when it is opened, before
+    /// anything is read from it; in a UTF-8 index the same path is
+    /// admitted by its three bytes, and refused a byte short of them.
+    #[test]
+    fn an_index_whose_text_is_not_utf8_is_never_read() {
+        let note = |index: &mut SearchIndex| {
+            index
+                .replace_note(&NoteDoc {
+                    id: "a",
+                    path: "港",
+                    title: "Untitled",
+                    tags: &[],
+                    fields: &BTreeMap::new(),
+                    body: "harbour",
+                    stat: None,
+                })
+                .expect("note");
+        };
+        let utf16 = Scratch::new();
+        {
+            let conn = Connection::open(utf16.path()).expect("db");
+            conn.pragma_update(None, "encoding", "UTF-16le")
+                .expect("encoding");
+            conn.execute_batch(DDL).expect("schema");
+            conn.execute(
+                "INSERT INTO meta(schema,vault_id) VALUES(?1,?2)",
+                params![SEARCH_SCHEMA, "vault"],
+            )
+            .expect("meta");
+        }
+        note(&mut utf16.index());
+        assert!(matches!(
+            SearchIndex::open_bounded(&utf16.path(), Duration::ZERO, || false),
+            Err(SearchIndexError::Encoding(_))
+        ));
+
+        let utf8 = Scratch::new();
+        note(&mut utf8.index());
+        let reader =
+            SearchIndex::open_bounded(&utf8.path(), Duration::ZERO, || false).expect("reader");
+        let mut meter = Meter::new(8 + 3);
+        let paths = reader.paths_of(&["a"], &mut meter).expect("paths");
+        assert_eq!(paths["a"], "港");
+        assert_eq!(meter.taken, 8 + 3);
+        let mut meter = Meter::new(8 + 2);
+        assert!(matches!(
+            reader.paths_of(&["a"], &mut meter),
+            Err(SearchIndexError::Bounds)
+        ));
+        assert!(meter.taken <= 8 + 2, "{}", meter.taken);
     }
 
     #[test]

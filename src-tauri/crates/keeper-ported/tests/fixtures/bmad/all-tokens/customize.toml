@@ -1,0 +1,30 @@
+[workflow]
+activation_steps_prepend = ["Load {skill-root}/steps/step-01-gather.md first."]
+activation_steps_append = []
+persistent_facts = ["file:{project-root}/docs/house-rules.md"]
+open_spec = ""
+on_complete = ""
+implementation_handoff = """
+Hand the spec at {skill-root}/out/spec.md to the implementer.
+Keep {project-root} literal here: only {skill-root} is bound."""
+
+[[workflow.review_layers]]
+id = "blind"
+name = "Blind Hunter"
+instruction = "Review the diff with no context."
+
+[[workflow.review_layers]]
+id = "edge"
+instruction = """
+Walk every branch.
+  Then every boundary."""
+when = "the change has a branch"
+
+[[workflow.review_layers]]
+id = "off"
+name = "Switched off"
+instruction = "   "
+
+[[workflow.oneshot_review_layers]]
+id = "only"
+instruction = ""

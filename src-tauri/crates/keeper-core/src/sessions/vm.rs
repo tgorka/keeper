@@ -407,6 +407,10 @@ pub struct SessionTaskVm {
     pub tags: Vec<String>,
     /// The id is path-derived, so pins and lineage will not survive a rename.
     pub unstable_identity: bool,
+    /// Who works the card and where, when it carries any agent key (AD-386):
+    /// `run:` is the agent's run, never a column — the card sits where its
+    /// `status:` puts it.
+    pub agent: Option<crate::agents::card::CardAgentVm>,
 }
 
 /// What migrating one session would do, shown before anything is done (FR-257).

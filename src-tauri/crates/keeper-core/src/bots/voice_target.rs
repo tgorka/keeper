@@ -17,6 +17,15 @@
 //!    the switch's refusal is shown and recorded in the ring. Nothing is
 //!    sent to a bot nobody chose.
 //!
+//! `bots.voice_target` may instead name one of the person's own proxy
+//! conversations as `agent:<room id>` (AD-384, ruling R31): the question
+//! goes into that room as the person's own message. A room id is the same
+//! on every device, so the value travels as it is (`settings_sync`). The
+//! room must be one the account reads as its proxy's `main` or
+//! `conversation` room *now* — a choice that is no longer one is refused
+//! with [`AGENT_ROOM_GONE_SENTENCE`], never sent elsewhere, and never read
+//! as "the most recent bot": the person chose to talk to their agent.
+//!
 //! The model a spoken turn sends is decided here too ([`model_for`], AD-217):
 //! the one that last answered in the target conversation, else the
 //! provider's own default, else the first offered model that can chat —
@@ -27,23 +36,74 @@
 //! can show each pinned bot's median first token over its last ten answers.
 //! Nothing is measured that is not already stored.
 
+use crate::agents::proxy::ProxyRoomVm;
 use crate::bots::session::{BotMessage, BotSession};
 use crate::bots::{Bot, ProviderKind};
-use crate::vm::BotModelVm;
+use crate::vm::{BotModelVm, VoiceAgentTargetVm};
 
 /// The sentence a spoken turn is refused with when there is no bot to send
 /// it to. Shown beside the switch (AD-190), spoken by the lock-screen banner
 /// (AD-207) and recorded in the ring (AD-192) — one wording, here.
 pub const NO_TARGET_SENTENCE: &str = "Nothing to talk to yet: choose a bot to talk to under Bots.";
 
-/// Which bot, and which of its conversations, a spoken turn goes to.
+/// The sentence a spoken turn is refused with when `bots.voice_target`
+/// names an agent room that is not one of the person's proxy conversations
+/// on any signed-in account.
+pub const AGENT_ROOM_GONE_SENTENCE: &str =
+    "The conversation chosen under Speak to is not one of your assistant's here: choose again under Speak to.";
+
+/// How `bots.voice_target` names an agent room: this prefix and the room id.
+pub const AGENT_TARGET_PREFIX: &str = "agent:";
+
+/// The stored value that names agent room `room_id`.
+pub fn agent_target(room_id: &str) -> String {
+    format!("{AGENT_TARGET_PREFIX}{room_id}")
+}
+
+/// The room a stored value names, when it names an agent room.
+pub fn agent_room_of(chosen: &str) -> Option<&str> {
+    chosen
+        .strip_prefix(AGENT_TARGET_PREFIX)
+        .map(str::trim)
+        .filter(|room| !room.is_empty())
+}
+
+/// The picker's agent entries from every live account's proxy conversations
+/// in their order (`AccountManager::agent_rooms_everywhere`), each with the
+/// value that chooses it; a room listed twice is offered once.
+pub fn agent_targets(rooms: Vec<(String, ProxyRoomVm)>) -> Vec<VoiceAgentTargetVm> {
+    let mut targets: Vec<VoiceAgentTargetVm> = Vec::with_capacity(rooms.len());
+    for (account_id, room) in rooms {
+        if targets.iter().any(|target| target.room_id == room.room_id) {
+            continue;
+        }
+        targets.push(VoiceAgentTargetVm {
+            target: agent_target(&room.room_id),
+            account_id,
+            room_id: room.room_id,
+            name: room.name,
+            kind: room.kind,
+        });
+    }
+    targets
+}
+
+/// Where a spoken turn goes.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VoiceTarget {
-    /// The pinned bot.
-    pub bot_id: String,
-    /// The bot's most recent conversation, or `None` when a new one is to be
-    /// opened on it.
-    pub session_id: Option<String>,
+pub enum VoiceTarget {
+    /// A pinned bot, and which of its conversations.
+    Bot {
+        /// The pinned bot.
+        bot_id: String,
+        /// The bot's most recent conversation, or `None` when a new one is
+        /// to be opened on it.
+        session_id: Option<String>,
+    },
+    /// One of the person's proxy conversations (R31).
+    Agent {
+        /// The room's id.
+        room_id: String,
+    },
 }
 
 /// Why a spoken turn could not be sent — a sentence with its remedy.
@@ -56,6 +116,9 @@ pub enum SpokenRefusal {
         /// The bot's display name.
         bot: String,
     },
+    /// The chosen agent room is not one of the person's proxy
+    /// conversations on any signed-in account.
+    AgentRoomGone,
 }
 
 impl SpokenRefusal {
@@ -66,31 +129,44 @@ impl SpokenRefusal {
             Self::NoModel { bot } => format!(
                 "{bot} offers no model to answer with: open a conversation with it under Bots and choose one."
             ),
+            Self::AgentRoomGone => AGENT_ROOM_GONE_SENTENCE.to_owned(),
         }
     }
 }
 
-/// Decide where a spoken turn goes (AD-206).
+/// Decide where a spoken turn goes (AD-206, AD-384).
 ///
 /// `chosen` is `bots.voice_target` as stored; `bots` every pinned bot;
 /// `sessions` every live conversation, newest activity first, as
-/// `session::list_sessions(dir, false)` lists them. Never `chosen` when it
-/// names a bot that is no longer pinned: an unpinned bot is not a bot to
-/// talk to, so the rule falls through to the most recent — a choice that
-/// went stale is treated as no choice, never as a send to a bot the list
-/// does not show.
+/// `session::list_sessions(dir, false)` lists them; `agent_rooms` the ids
+/// of every room a signed-in account reads as its person's proxy
+/// conversation (`proxy::proxy_rooms`). Never `chosen` when it names a bot
+/// that is no longer pinned: an unpinned bot is not a bot to talk to, so
+/// the rule falls through to the most recent — a choice that went stale is
+/// treated as no choice, never as a send to a bot the list does not show.
+/// An agent room is different: it is the person's own agent, and a choice
+/// of it that went stale is refused rather than sent to a bot instead.
 pub fn resolve(
     chosen: Option<&str>,
     bots: &[Bot],
     sessions: &[BotSession],
+    agent_rooms: &[String],
 ) -> Result<VoiceTarget, SpokenRefusal> {
+    if let Some(chosen) = chosen.filter(|chosen| chosen.starts_with(AGENT_TARGET_PREFIX)) {
+        return agent_room_of(chosen)
+            .and_then(|room| agent_rooms.iter().find(|listed| listed.as_str() == room))
+            .map(|listed| VoiceTarget::Agent {
+                room_id: listed.clone(),
+            })
+            .ok_or(SpokenRefusal::AgentRoomGone);
+    }
     let pinned = |id: &str| bots.iter().any(|bot| bot.id == id);
     if let Some(bot_id) = chosen.filter(|id| pinned(id)) {
         let session_id = sessions
             .iter()
             .find(|session| session.bot_id == bot_id)
             .map(|session| session.id.clone());
-        return Ok(VoiceTarget {
+        return Ok(VoiceTarget::Bot {
             bot_id: bot_id.to_owned(),
             session_id,
         });
@@ -98,7 +174,7 @@ pub fn resolve(
     sessions
         .iter()
         .find(|session| pinned(&session.bot_id))
-        .map(|session| VoiceTarget {
+        .map(|session| VoiceTarget::Bot {
             bot_id: session.bot_id.clone(),
             session_id: Some(session.id.clone()),
         })
@@ -160,7 +236,7 @@ pub fn model_for(
 fn provider_default(kind: ProviderKind) -> Option<&'static str> {
     match kind {
         ProviderKind::Hermes => Some(HERMES_DEFAULT_MODEL),
-        ProviderKind::Ollama => None,
+        ProviderKind::Ollama | ProviderKind::OpenAi => None,
     }
 }
 
@@ -278,8 +354,8 @@ mod tests {
             session("s1", "a", 10),
         ];
         assert_eq!(
-            resolve(Some("a"), &bots, &sessions),
-            Ok(VoiceTarget {
+            resolve(Some("a"), &bots, &sessions, &[]),
+            Ok(VoiceTarget::Bot {
                 bot_id: "a".to_owned(),
                 session_id: Some("s2".to_owned()),
             })
@@ -291,8 +367,8 @@ mod tests {
         let bots = [bot("a"), bot("b")];
         let sessions = [session("s1", "b", 10)];
         assert_eq!(
-            resolve(Some("a"), &bots, &sessions),
-            Ok(VoiceTarget {
+            resolve(Some("a"), &bots, &sessions, &[]),
+            Ok(VoiceTarget::Bot {
                 bot_id: "a".to_owned(),
                 session_id: None,
             })
@@ -304,8 +380,8 @@ mod tests {
         let bots = [bot("a"), bot("b")];
         let sessions = [session("s3", "b", 30), session("s2", "a", 20)];
         assert_eq!(
-            resolve(None, &bots, &sessions),
-            Ok(VoiceTarget {
+            resolve(None, &bots, &sessions, &[]),
+            Ok(VoiceTarget::Bot {
                 bot_id: "b".to_owned(),
                 session_id: Some("s3".to_owned()),
             })
@@ -317,27 +393,66 @@ mod tests {
         let bots = [bot("a")];
         // The newest conversation is with a bot that was unpinned since.
         let sessions = [session("s3", "gone", 30), session("s2", "a", 20)];
-        let expected = Ok(VoiceTarget {
+        let expected = Ok(VoiceTarget::Bot {
             bot_id: "a".to_owned(),
             session_id: Some("s2".to_owned()),
         });
-        assert_eq!(resolve(None, &bots, &sessions), expected);
+        assert_eq!(resolve(None, &bots, &sessions, &[]), expected);
         // A stale choice is no choice, not a send to a bot the list hides.
-        assert_eq!(resolve(Some("gone"), &bots, &sessions), expected);
+        assert_eq!(resolve(Some("gone"), &bots, &sessions, &[]), expected);
     }
 
     #[test]
     fn nothing_to_talk_to_is_refused_with_the_sentence() {
-        let refused = resolve(None, &[bot("a")], &[]).expect_err("no conversation, no choice");
+        let refused = resolve(None, &[bot("a")], &[], &[]).expect_err("no conversation, no choice");
         assert_eq!(refused, SpokenRefusal::NoTarget);
         assert!(refused
             .message()
             .contains("choose a bot to talk to under Bots"));
         // No bots at all, and a stale choice, are the same refusal.
         assert_eq!(
-            resolve(Some("a"), &[], &[session("s1", "a", 10)]),
+            resolve(Some("a"), &[], &[session("s1", "a", 10)], &[]),
             Err(SpokenRefusal::NoTarget)
         );
+    }
+
+    /// AD-384: `agent:<room>` names one of the person's proxy
+    /// conversations and goes there — never to a bot, and never to a room
+    /// the account does not read as its proxy's, which is refused with the
+    /// sentence naming *Speak to* even when bots could answer.
+    #[test]
+    fn a_voice_target_may_be_the_proxy_room() {
+        let bots = [bot("a")];
+        let sessions = [session("s1", "a", 10)];
+        let mine = ["!dm:server".to_owned(), "!talk:server".to_owned()];
+        assert_eq!(agent_target("!dm:server"), "agent:!dm:server");
+        assert_eq!(
+            resolve(Some("agent:!dm:server"), &bots, &sessions, &mine),
+            Ok(VoiceTarget::Agent {
+                room_id: "!dm:server".to_owned()
+            })
+        );
+        assert_eq!(
+            resolve(Some("agent:!talk:server"), &[], &[], &mine),
+            Ok(VoiceTarget::Agent {
+                room_id: "!talk:server".to_owned()
+            })
+        );
+        for stale in ["agent:!elsewhere:server", "agent:", "agent:  "] {
+            let refused =
+                resolve(Some(stale), &bots, &sessions, &mine).expect_err("not my proxy's room");
+            assert_eq!(refused, SpokenRefusal::AgentRoomGone, "{stale}");
+            assert!(refused.message().contains("Speak to"));
+        }
+        // A bare id is a bot id, as before: an agent room is never guessed.
+        assert_eq!(
+            resolve(Some("a"), &bots, &sessions, &mine),
+            Ok(VoiceTarget::Bot {
+                bot_id: "a".to_owned(),
+                session_id: Some("s1".to_owned())
+            })
+        );
+        assert_eq!(resolve(None, &[], &[], &mine), Err(SpokenRefusal::NoTarget));
     }
 
     #[test]
@@ -375,16 +490,24 @@ mod tests {
             model_for(&b, ProviderKind::Hermes, &[], &[]),
             Ok(HERMES_DEFAULT_MODEL.to_owned())
         );
-        // Ollama has none: the first offered that can chat.
-        assert_eq!(
-            model_for(
-                &b,
-                ProviderKind::Ollama,
-                &[],
-                &[model("qwen3"), model("llama4:8b")]
-            ),
-            Ok("qwen3".to_owned())
-        );
+        // Ollama and an OpenAI-compatible endpoint have none: the first
+        // offered that can chat.
+        for kind in [ProviderKind::Ollama, ProviderKind::OpenAi] {
+            assert_eq!(provider_default(kind), None);
+            assert_eq!(
+                model_for(
+                    &b,
+                    kind,
+                    &[],
+                    &[
+                        model("text-embedding-3-small"),
+                        model("gpt-5"),
+                        model("qwen3")
+                    ]
+                ),
+                Ok("gpt-5".to_owned())
+            );
+        }
     }
 
     #[test]

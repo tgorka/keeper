@@ -21,6 +21,10 @@ thiserror = { workspace = true }
 # Homed here as the architectural owner (AD-6); not yet exercised in Story 1.1.
 matrix-sdk = { workspace = true }
 matrix-sdk-ui = { workspace = true }
+# The room's info observable, by name (`Room::subscribe_info`): an agent
+# room's timeline draws its briefs again when its members or power change
+# (R117). Already resolved in Cargo.lock via matrix-sdk; no new package.
+eyeball = "0.8"
 # QR-code SVG rendering for device-verification display (Story 3.2). Renders the
 # `qrcode::QrCode` from `QrVerification::to_qr_code()` to an SVG string in Rust —
 # the webview never decodes QR crypto.
@@ -42,7 +46,7 @@ reqwest = { workspace = true }
 openidconnect = { workspace = true }
 oauth2-reqwest = { workspace = true }
 # Account registry (keeper.db, WAL) and opaque ULID account ids.
-rusqlite = { workspace = true }
+rusqlite = { workspace = true, features = ["hooks"] }
 # Derived notes chunk identities; already locked transitively (AD-261).
 blake3 = { workspace = true }
 ulid = { workspace = true }
@@ -93,13 +97,25 @@ base64 = { workspace = true }
 # it drags in neither tauri nor gix, so `check:core-tauri-free` and
 # `check:core-sync-free` stay green. MIT OR Apache-2.0.
 unicode-normalization = { workspace = true }
+# Upstream code rewritten in Rust (Epic 89, AD-396): BMAD's customization
+# merge feeds `agents::soul::soul_from_bmad`, agentskills' validator feeds
+# `agents::skills`. A pure path crate — no network, no runtime, no tauri.
+keeper-ported = { path = "../keeper-ported" }
+# Digests of an agent's composed prompt and memory snapshot, and the session
+# log's blob names (Epic 89, AD-363, AD-366). Both already resolved in
+# Cargo.lock for keeper-sync's LFS hashing, so the tree gains no package.
+sha2 = { workspace = true }
+hex = { workspace = true }
+# Secret redaction before an agent's log line is written (Epic 89, S-17).
+regex = { workspace = true }
 # OTLP protobuf wire encoding for the closed consent-gated observability schema.
 # Already resolved via Matrix; no arbitrary tracing subscriber is exported.
 prost = "0.14"
 
 [dev-dependencies]
-# The privacy lifecycle tests observe real localhost connection/cancellation.
-tokio = { workspace = true, features = ["net"] }
+# The privacy lifecycle tests observe real localhost connection/cancellation;
+# the display-name bound is measured on tokio's paused clock.
+tokio = { workspace = true, features = ["net", "test-util"] }
 # Epic 82's OIDC tests sign ID tokens with an RSA key generated per test run
 # (no private key is checked in). Already in the graph via `openidconnect`.
 rsa = "0.9"

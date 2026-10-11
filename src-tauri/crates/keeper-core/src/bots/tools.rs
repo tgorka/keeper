@@ -164,6 +164,10 @@ pub const TOO_MANY_CALLS: &str =
     "keeper runs a limited number of tool calls per round and this one was past it. Ask for it \
      again in your next turn.";
 
+/// What a call of a round Stop ended before it ran is told: nothing of a
+/// stopped turn runs after the Stop.
+pub const STOPPED: &str = "keeper stopped this turn before this call ran.";
+
 // ---------------------------------------------------------------------------
 // The vocabulary
 // ---------------------------------------------------------------------------
@@ -474,6 +478,21 @@ pub enum ToolOutcome {
         /// Rendered verbatim. keeper adds no words of its own.
         reason: String,
     },
+    /// A tool outside the drive's vocabulary answered: its words, verbatim
+    /// (an agent's surface call, AD-383). Never produced for a ⌘9 bot, whose
+    /// hosts serve the drive verbs alone.
+    Answered {
+        /// What the model is told.
+        text: String,
+    },
+    /// The call waits for a person's decision on the approval record
+    /// `approval` (R73): the loop returns right after it, the round's later
+    /// calls handed back unrun. Only an agent's host answers so — never a
+    /// ⌘9 bot's — and the agent's host writes no result for it.
+    Parked {
+        /// The record's id.
+        approval: ulid::Ulid,
+    },
 }
 
 /// The impure half.
@@ -495,6 +514,20 @@ pub enum ToolOutcome {
 pub trait ToolHost: Send + Sync {
     /// Run one call.
     fn run(&self, call: &ToolCall) -> Result<ToolOutcome, BotsError>;
+
+    /// Run a call to a tool outside the drive's seven verbs that this host
+    /// serves by its own name, before the loop parses it as a drive verb;
+    /// `None` for every name it does not serve. No ⌘9 host serves any, so
+    /// what a bot is offered and may call stays [`tool_specs`]' (R38).
+    fn run_named(&self, _wire: &WireToolCall) -> Option<ToolOutcome> {
+        None
+    }
+
+    /// Told a round's calls once, before the first of them runs — only
+    /// those it will run. A host that runs some of them side by side starts
+    /// them here and answers each from [`Self::run_named`] in the round's
+    /// order (R110: an agent's `helper` calls). No ⌘9 host does anything.
+    fn prepare_round(&self, _calls: &[WireToolCall]) {}
 }
 
 // ---------------------------------------------------------------------------
@@ -597,9 +630,10 @@ impl ToolOffer {
 /// The kind-and-capability half is [`grant_offer`]'s verdict, reused rather
 /// than restated so the pane's grant affordance and the request's `tools`
 /// array cannot disagree: a Hermes bot is offered nothing because Hermes runs
-/// its tools on its own host; an Ollama model that **states** it has no tools
-/// is offered nothing; one whose capability keeper could not read is offered
-/// them with [`TOOLS_CAPABILITY_UNKNOWN`] carried along.
+/// its tools on its own host; an Ollama or OpenAI-compatible model that
+/// **states** it has no tools is offered nothing; one whose capability keeper
+/// could not read is offered them with [`TOOLS_CAPABILITY_UNKNOWN`] carried
+/// along.
 ///
 /// The grant half: no live grant offers nothing, every live grant at
 /// [`GrantMode::None`] offers nothing, and otherwise the widest mode among the
@@ -1006,6 +1040,8 @@ pub fn render_result(outcome: &ToolOutcome) -> String {
             format!("Wrote {bytes} bytes to \"{subpath}\". {note}")
         }
         ToolOutcome::Refused { reason } => format!("Refused: {reason}"),
+        ToolOutcome::Answered { text } => text.clone(),
+        ToolOutcome::Parked { .. } => "Waiting for a person's approval.".to_owned(),
     };
     clip_result(text)
 }
@@ -1137,6 +1173,9 @@ pub struct ToolLoopOutcome {
     pub exhausted: bool,
     /// Every tool call, in order.
     pub calls: Vec<ToolCallRecord>,
+    /// The approval a call parked on, and the round's calls after it, not
+    /// run (R73). `None` for every ⌘9 turn.
+    pub parked: Option<(ulid::Ulid, Vec<WireToolCall>)>,
 }
 
 /// The things a tool loop needs that do not change between its rounds.
@@ -1221,6 +1260,44 @@ pub async fn run_tool_loop_reporting(
     sink: ToolLoopSink<'_>,
     report: ToolCallReporter<'_>,
 ) -> Result<ToolLoopOutcome, BotsError> {
+    let mut open = |_: usize| Ok(());
+    run_tool_loop_gated(
+        context,
+        request,
+        options,
+        loop_options,
+        cancel,
+        sink,
+        report,
+        &mut open,
+    )
+    .await
+}
+
+/// Asked before each round's request leaves, with the 0-based round. An
+/// `Err` sends nothing more: the loop returns it, every call already run
+/// having been reported.
+pub type RoundGate<'a> = &'a mut (dyn FnMut(usize) -> Result<(), BotsError> + Send);
+
+/// [`run_tool_loop_reporting`], asking `gate` before every request.
+///
+/// The gate is how a caller stops a conversation from reaching a model it
+/// may no longer reach: what a round sends includes every tool result so
+/// far, so a result that narrowed what may leave must be able to stop the
+/// next request, not only the next turn.
+// One parameter per seam the loop has; a struct would only move the same
+// names one line down.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_tool_loop_gated(
+    context: &ToolLoop<'_>,
+    request: &ChatRequest,
+    options: &ChatOptions,
+    loop_options: &ToolLoopOptions,
+    cancel: CancelSignal,
+    sink: ToolLoopSink<'_>,
+    report: ToolCallReporter<'_>,
+    gate: RoundGate<'_>,
+) -> Result<ToolLoopOutcome, BotsError> {
     let ToolLoop {
         client,
         endpoint,
@@ -1237,6 +1314,21 @@ pub async fn run_tool_loop_reporting(
 
     loop {
         let tools_offered = rounds < budget;
+        // A stopped turn sends no further request (R203).
+        if cancel.is_cancelled() {
+            return Ok(ToolLoopOutcome {
+                final_outcome: ChatOutcome {
+                    finish_reason: FinishReason::Cancelled,
+                    ..ChatOutcome::default()
+                },
+                appended,
+                rounds,
+                exhausted: false,
+                calls,
+                parked: None,
+            });
+        }
+        gate(rounds)?;
         sink(ToolLoopEvent::RoundStarted {
             round: rounds,
             tools_offered,
@@ -1270,13 +1362,18 @@ pub async fn run_tool_loop_reporting(
         };
         rounds += 1;
 
-        if !tools_offered || outcome.tool_calls.is_empty() {
+        // A stream Stop cut runs none of its calls: what arrived is kept.
+        if !tools_offered
+            || outcome.tool_calls.is_empty()
+            || outcome.finish_reason == FinishReason::Cancelled
+        {
             return Ok(ToolLoopOutcome {
                 final_outcome: outcome,
                 appended,
                 rounds,
                 exhausted: !tools_offered,
                 calls,
+                parked: None,
             });
         }
 
@@ -1299,6 +1396,14 @@ pub async fn run_tool_loop_reporting(
             sink(ToolLoopEvent::RoundsExhausted { rounds });
         }
 
+        if !exhausted {
+            let runs = outcome
+                .tool_calls
+                .len()
+                .min(loop_options.max_calls_per_round);
+            host.prepare_round(&outcome.tool_calls[..runs]);
+        }
+        let mut parked = None;
         for (index, wire) in outcome.tool_calls.iter().enumerate() {
             let (record, ran) = if exhausted {
                 // The budget is spent, but the call still has to be ANSWERED:
@@ -1318,22 +1423,27 @@ pub async fn run_tool_loop_reporting(
                         reason: ROUNDS_EXHAUSTED.to_owned(),
                     },
                 )
-            } else if index >= loop_options.max_calls_per_round {
+            } else if index >= loop_options.max_calls_per_round || cancel.is_cancelled() {
+                let refusal = if cancel.is_cancelled() {
+                    STOPPED
+                } else {
+                    TOO_MANY_CALLS
+                };
                 (
                     ToolCallRecord {
                         id: wire.id.clone(),
                         requested_name: wire.name.clone(),
                         name: ToolName::from_wire(&wire.name),
                         display_path: None,
-                        refusal: Some(TOO_MANY_CALLS.to_owned()),
+                        refusal: Some(refusal.to_owned()),
                         grant_denied: false,
                     },
                     ToolOutcome::Refused {
-                        reason: TOO_MANY_CALLS.to_owned(),
+                        reason: refusal.to_owned(),
                     },
                 )
             } else {
-                run_one(host, default_profile_id, wire, sink)
+                run_call(host, default_profile_id, wire, sink)
             };
 
             let result = render_result(&ran);
@@ -1343,6 +1453,10 @@ pub async fn run_tool_loop_reporting(
             });
             report(&record, wire, &ran);
             calls.push(record);
+            if let ToolOutcome::Parked { approval } = ran {
+                parked = Some((approval, index));
+                break;
+            }
             let message = ChatMessage {
                 role: Role::Tool,
                 content: vec![ContentPart::Text(result)],
@@ -1352,16 +1466,51 @@ pub async fn run_tool_loop_reporting(
             messages.push(message.clone());
             appended.push(message);
         }
+        if let Some((approval, index)) = parked {
+            // The rest of the round runs only once a person decided.
+            let rest = outcome.tool_calls[index + 1..].to_vec();
+            return Ok(ToolLoopOutcome {
+                final_outcome: outcome,
+                appended,
+                rounds,
+                exhausted: false,
+                calls,
+                parked: Some((approval, rest)),
+            });
+        }
     }
 }
 
-/// One call: parse it, run it, and say what happened. The caller renders it.
-fn run_one(
+/// One call: parse it, run it, and say what happened. The caller renders
+/// it. The loop's own step, and an agent's resume of a parked round's calls.
+pub fn run_call(
     host: &dyn ToolHost,
     default_profile_id: &str,
     wire: &WireToolCall,
     sink: ToolLoopSink<'_>,
 ) -> (ToolCallRecord, ToolOutcome) {
+    if let Some(outcome) = host.run_named(wire) {
+        sink(ToolLoopEvent::ToolStarted {
+            id: wire.id.clone(),
+            name: None,
+            display_path: None,
+        });
+        let refusal = match &outcome {
+            ToolOutcome::Refused { reason } => Some(reason.clone()),
+            _ => None,
+        };
+        return (
+            ToolCallRecord {
+                id: wire.id.clone(),
+                requested_name: wire.name.clone(),
+                name: None,
+                display_path: None,
+                refusal,
+                grant_denied: false,
+            },
+            outcome,
+        );
+    }
     let call = match parse_call(default_profile_id, wire) {
         Ok(call) => call,
         Err(reason) => {
@@ -1466,6 +1615,74 @@ mod tests {
             tool_specs(GrantMode::None).is_empty(),
             "no grant means no tools, which is what makes a toolless pane consistent"
         );
+    }
+
+    /// A host that serves one tool by its own name, as an agent's host
+    /// serves its surface tools.
+    struct Named;
+
+    impl ToolHost for Named {
+        fn run(&self, _: &ToolCall) -> Result<ToolOutcome, BotsError> {
+            Ok(ToolOutcome::Refused {
+                reason: "no drive here".to_owned(),
+            })
+        }
+
+        fn run_named(&self, wire: &WireToolCall) -> Option<ToolOutcome> {
+            (wire.name == "surface_open").then(|| ToolOutcome::Answered {
+                text: "done".to_owned(),
+            })
+        }
+    }
+
+    /// A host that serves the drive verbs alone, as every ⌘9 host does.
+    struct DriveOnly;
+
+    impl ToolHost for DriveOnly {
+        fn run(&self, _: &ToolCall) -> Result<ToolOutcome, BotsError> {
+            Ok(ToolOutcome::Refused {
+                reason: "no drive here".to_owned(),
+            })
+        }
+    }
+
+    /// R38: a ⌘9 bot is offered the seven drive verbs and nothing else, and
+    /// a surface tool's name reaches no ⌘9 host; only a host that serves a
+    /// name answers it, verbatim.
+    #[test]
+    fn the_bots_vocabulary_is_the_drives_seven_verbs() {
+        let names: Vec<String> = tool_specs(GrantMode::Write)
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "drive_list",
+                "drive_read",
+                "drive_glob",
+                "drive_grep",
+                "drive_stat",
+                "drive_write",
+                "drive_edit"
+            ]
+        );
+        let wire = WireToolCall {
+            id: "call_0".to_owned(),
+            name: "surface_open".to_owned(),
+            arguments_raw: "{}".to_owned(),
+            arguments: Some(json!({})),
+        };
+        let (record, outcome) = run_call(&DriveOnly, "folder", &wire, &mut |_| {});
+        assert!(
+            matches!(&outcome, ToolOutcome::Refused { reason } if reason.starts_with("There is no tool called \"surface_open\"")),
+            "{outcome:?}"
+        );
+        assert_eq!(record.name, None);
+        let (record, outcome) = run_call(&Named, "folder", &wire, &mut |_| {});
+        assert_eq!(render_result(&outcome), "done");
+        assert_eq!((record.name, record.refusal), (None, None));
+        assert_eq!(record.requested_name, "surface_open");
     }
 
     #[test]

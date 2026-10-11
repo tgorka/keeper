@@ -10,6 +10,7 @@
 #![recursion_limit = "256"]
 
 pub mod account;
+pub mod agents;
 pub mod archive;
 pub mod auth;
 pub mod backup;
@@ -46,6 +47,7 @@ pub mod tasks;
 pub mod telemetry;
 pub mod text_file;
 pub mod timeline;
+pub mod toml_order;
 pub mod transcription;
 pub mod update;
 pub mod vault_link;

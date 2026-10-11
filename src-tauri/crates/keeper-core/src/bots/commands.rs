@@ -381,7 +381,7 @@ pub fn offered(spec: &CommandSpec, ctx: &Context) -> bool {
         Some(ProviderKind::Hermes) => false,
         // The endpoint refused the capability, so a grant could never be used.
         // `None` is *unknown* and stays listed with `GRANT_TOOLS_UNKNOWN`.
-        Some(ProviderKind::Ollama) => ctx.model_tools != Some(false),
+        Some(ProviderKind::Ollama | ProviderKind::OpenAi) => ctx.model_tools != Some(false),
     }
 }
 
@@ -409,8 +409,8 @@ pub fn availability(spec: &CommandSpec, ctx: &Context) -> Availability {
 
 /// The one sentence a Hermes bot's pane owes about commands (research §14).
 ///
-/// `None` for Ollama and for no bot at all, because there is nothing to
-/// disclose: the menu is the whole truth there.
+/// `None` for Ollama, for an OpenAI-compatible endpoint and for no bot at all,
+/// because there is nothing to disclose: the menu is the whole truth there.
 pub fn note(ctx: &Context) -> Option<&'static str> {
     match ctx.kind {
         Some(ProviderKind::Hermes) => Some(HERMES_COMMANDS_NOT_PROXIED),

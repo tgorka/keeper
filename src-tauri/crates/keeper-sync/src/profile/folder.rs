@@ -275,6 +275,11 @@ const FOLDER_FIELD_RULES: &[(&str, FolderFieldRule)] = &[
     // the reason the ledger's is: a person recognised on one machine is only
     // recognised on the other if both read the same folder (AD-342).
     ("voices", FolderFieldRule::Allowed),
+    // Where the agents zone lives is a fact about the repository's layout for
+    // the reason the sessions zone's is: an agent's home, memory and journal
+    // are one tree every clone reads, and two machines that disagreed on the
+    // folder would host two different sets of agents from one drive (AD-361).
+    ("agents", FolderFieldRule::Allowed),
 ];
 
 /// What a folder file may do with one canonical profile key.
@@ -488,19 +493,19 @@ struct Salvage {
 ///
 /// # Order
 ///
-/// `toml::Table` is sorted, so keys are tried alphabetically. That is
-/// deterministic — the same file gives the same answer on every clone, which is
-/// the property that matters — and it happens to be the order `validate`'s
-/// cross-field rules want: `notes` before `recordings` before `sessions` is
-/// exactly the sequence its overlap checks are written in.
+/// Keys are tried alphabetically ([`sorted_keys`]). That is deterministic —
+/// the same file gives the same answer on every clone and in every build,
+/// whether or not `toml` keeps document order there — and it is the order
+/// `validate`'s cross-field rules want: `notes` before `recordings` before
+/// `sessions` is exactly the sequence its overlap checks are written in.
 ///
 /// Keys outside `[folder]` are not retried. They are not profile fields, they
 /// were already reported by the whole-layer pass, and the whole point of this
 /// retry is that a misspelled top-level key must stop taking `[folder]` with
 /// it.
 fn salvage_keys(profile: &SyncProfile, table: &toml::Table, is_main: bool) -> Salvage {
-    let Some(fields) = table
-        .iter()
+    let Some(fields) = sorted_keys(table)
+        .into_iter()
         .find(|(key, _)| canonical_key(key) == "folder")
         .and_then(|(_, value)| value.as_table())
     else {
@@ -513,7 +518,7 @@ fn salvage_keys(profile: &SyncProfile, table: &toml::Table, is_main: bool) -> Sa
     let mut current = profile.clone();
     let mut keys = BTreeSet::new();
     let mut problems = Vec::new();
-    for (key, value) in fields {
+    for (key, value) in sorted_keys(fields) {
         let mut one = toml::Table::new();
         let mut folder = toml::Table::new();
         folder.insert(key.clone(), value.clone());
@@ -569,7 +574,7 @@ fn overlay(
 ) -> std::result::Result<Option<Applied>, Vec<String>> {
     let mut problems = Vec::new();
     let mut requested = None;
-    for (key, value) in table {
+    for (key, value) in sorted_keys(table) {
         match canonical_key(key).as_str() {
             "folder" => requested = Some(value),
             // The main folder's `[settings]` belongs to keeper-core's layer
@@ -710,7 +715,12 @@ fn overlay(
 fn settings_refusal(value: &toml::Value) -> String {
     let keys: Vec<&str> = value
         .as_table()
-        .map(|table| table.keys().map(String::as_str).collect())
+        .map(|table| {
+            sorted_keys(table)
+                .into_iter()
+                .map(|(key, _)| key.as_str())
+                .collect()
+        })
         .unwrap_or_default();
     let named = if keys.is_empty() {
         "an empty `[settings]` table".to_owned()
@@ -722,6 +732,16 @@ fn settings_refusal(value: &toml::Value) -> String {
          keys about itself, or two folders would fight over one app-wide setting. Move \
          them to `~/.keeper/keeper.toml` or to the main sync folder's file"
     )
+}
+
+/// A table's entries in key order. `toml::Table` iterates in document order
+/// when any crate in the build enables `toml`'s `preserve_order` (keeper-ported
+/// does, so the app and the agent hosts do) and alphabetically otherwise
+/// (`keeper-syncd`); a folder file must mean the same in both.
+fn sorted_keys(table: &toml::Table) -> Vec<(&String, &toml::Value)> {
+    let mut entries: Vec<_> = table.iter().collect();
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+    entries
 }
 
 /// Overlay `overlay` onto `base`, recursing into tables.
@@ -1233,6 +1253,25 @@ mod tests {
         );
     }
 
+    /// The app links keeper-ported, whose `toml` keeps document order, and
+    /// `keeper-syncd` does not: a folder file must be read in one order in
+    /// both, so its problems come out alphabetically however it is written.
+    /// (Run with `--features toml/preserve_order` to see the app's build.)
+    #[test]
+    fn a_folder_file_reads_in_key_order_whatever_order_it_is_written_in() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let table: toml::Table =
+            toml::from_str("zeta = 1\nalpha = 2\n[settings]\nz = 1\na = 2\n").expect("parses");
+        let problems = match overlay(&profile(dir.path()), &table, false) {
+            Err(problems) => problems,
+            Ok(_) => panic!("refused"),
+        };
+        assert_eq!(problems.len(), 3, "{problems:?}");
+        assert!(problems[0].contains("`alpha`"), "{problems:?}");
+        assert!(problems[1].contains("key(s) a, z:"), "{problems:?}");
+        assert!(problems[2].contains("`zeta`"), "{problems:?}");
+    }
+
     /// The tier exists for these. Repository policy has to be the same on both
     /// clones or the clones disagree about what they are committing.
     #[test]
@@ -1485,6 +1524,67 @@ subfolder = "70-tasks"
                 "{text:?} must not store its voices block"
             );
             assert!(!outcome.owned.contains("voices"), "{:?}", outcome.owned);
+        }
+    }
+
+    /// `[folder.agents]` is read exactly like `[folder.voices]`, beside the
+    /// `[folder.sessions]` it needs: an empty table is "keeps agents, in the
+    /// default zone" (AD-361).
+    #[test]
+    fn an_empty_agents_table_turns_the_flag_on_with_its_default_subfolder() {
+        let (_dir, outcome) = applied("[folder.sessions]\n\n[folder.agents]\n", &tier());
+        assert!(outcome.faults.is_empty(), "{:?}", outcome.faults);
+        assert_eq!(
+            outcome.profile.agents.as_ref().expect("agents").subfolder,
+            crate::profile::DEFAULT_AGENTS_SUBFOLDER
+        );
+        assert_eq!(
+            outcome.profile.agents_root(),
+            Some(outcome.profile.local_path.join("80-agents"))
+        );
+        assert!(outcome.owned.contains("agents"), "{:?}", outcome.owned);
+
+        let (_dir, outcome) = applied(
+            "[folder.sessions]\nsubfolder = \"60-sessions\"\n\n\
+             [folder.agents]\nsubfolder = \"zones/agents\"\n",
+            &tier(),
+        );
+        assert!(outcome.faults.is_empty(), "{:?}", outcome.faults);
+        assert_eq!(
+            outcome.profile.agents.as_ref().expect("agents").subfolder,
+            "zones/agents"
+        );
+    }
+
+    /// A bad zone travels between clones like a bad bank would, so it is
+    /// refused and not stored — including a zone without the sessions zone it
+    /// needs, and one that collides with the sessions zone the same file names.
+    #[test]
+    fn a_bad_agents_subfolder_is_refused_and_not_stored() {
+        for (text, named) in [
+            (
+                "[folder.sessions]\n\n[folder.agents]\nsubfolder = \"/Volumes/elsewhere\"\n",
+                "agents subfolder",
+            ),
+            (
+                "[folder.sessions]\n\n[folder.agents]\nsubfolder = \"../outside\"\n",
+                "agents subfolder",
+            ),
+            (
+                "[folder.sessions]\nsubfolder = \"work\"\n\n\
+                 [folder.agents]\nsubfolder = \"work/agents\"\n",
+                "overlaps sessions subfolder work",
+            ),
+            ("[folder.agents]\n", "Add [folder.sessions]."),
+        ] {
+            let (_dir, outcome) = applied(text, &tier());
+            let fault = only_fault(&outcome);
+            assert!(fault.message.contains(named), "{}", fault.message);
+            assert!(
+                outcome.profile.agents.is_none(),
+                "{text:?} must not store its agents block"
+            );
+            assert!(!outcome.owned.contains("agents"), "{:?}", outcome.owned);
         }
     }
 

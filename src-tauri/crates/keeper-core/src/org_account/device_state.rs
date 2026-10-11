@@ -140,7 +140,7 @@ impl ProviderState {
 impl DeviceStateFile {
     pub fn parse(bytes: &[u8]) -> Result<Self, String> {
         let text = std::str::from_utf8(bytes).map_err(|_| "it is not UTF-8 text".to_owned())?;
-        let file: DeviceStateFile = toml::from_str(text)
+        let file: DeviceStateFile = crate::toml_order::from_str(text)
             .map_err(|error| format!("it cannot be read: {}", error.message()))?;
         file.check()?;
         Ok(file)
@@ -198,7 +198,7 @@ impl DeviceStateFile {
             .drives
             .iter()
             .map(|drive| {
-                let mut drive = drive.clone();
+                let mut drive = crate::toml_order::sorted_table(drive);
                 if let Some(toml::Value::String(remote)) = drive.get_mut("remote_url") {
                     if let Some(portable) = manifest::portable_remote(remote) {
                         *remote = portable;
@@ -432,6 +432,34 @@ mod tests {
             );
             assert!(identity.render().is_err(), "{field}");
         }
+    }
+
+    /// A drive table keeper assembles (the profile's fields, then its
+    /// schedules, then a newer build's fields) renders in key order, as every
+    /// device writes it.
+    #[test]
+    fn a_drive_table_renders_in_key_order_however_it_was_built() {
+        let mut drive = toml::Table::new();
+        for (key, value) in [
+            ("remote_url", "https://git.acme.dev/tg/tgdrive"),
+            ("name", "tgdrive"),
+            ("zz_future", "kept"),
+            ("branch", "main"),
+        ] {
+            drive.insert(key.to_owned(), toml::Value::String(value.to_owned()));
+        }
+        let file = DeviceStateFile {
+            drives: vec![drive],
+            ..DeviceStateFile::default()
+        };
+        let rendered = file.render().expect("renders");
+        let at = |key: &str| rendered.find(&format!("{key} = ")).expect(key);
+        assert!(
+            at("branch") < at("name")
+                && at("name") < at("remote_url")
+                && at("remote_url") < at("zz_future"),
+            "{rendered}"
+        );
     }
 
     #[test]

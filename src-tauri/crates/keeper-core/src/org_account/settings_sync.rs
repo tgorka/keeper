@@ -21,7 +21,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use crate::bots::{self, store};
+use crate::bots::{self, store, voice_target};
 use crate::config::keys::{self, Scope, Shape};
 use crate::error::CoreError;
 use crate::registry::{self, EmbeddingModel};
@@ -132,7 +132,7 @@ impl Values {
     /// what a person is halfway through editing.
     pub fn parse(bytes: &[u8], file: SyncedFile) -> Result<Values, String> {
         let text = std::str::from_utf8(bytes).map_err(|_| "it is not UTF-8 text".to_owned())?;
-        let mut other: toml::Table = toml::from_str(text)
+        let mut other: toml::Table = crate::toml_order::from_str(text)
             .map_err(|error| format!("it is not valid TOML: {}", error.message()))?;
         let mut parsed = Values::default();
         match other.remove("settings") {
@@ -177,7 +177,8 @@ impl Values {
         }
         let mut document = self.other.clone();
         document.insert("settings".to_owned(), toml::Value::Table(settings));
-        let body = toml::to_string(&document).map_err(|error| error.to_string())?;
+        let body = toml::to_string(&crate::toml_order::sorted_table(&document))
+            .map_err(|error| error.to_string())?;
         Ok(format!("{HEADER}{body}"))
     }
 
@@ -810,6 +811,8 @@ pub fn to_portable(key: &str, stored: &str, catalog: &Catalog) -> Option<String>
         return catalog.drive_reference(id);
     }
     match key {
+        // A room id is the same on every device; a bot id is not.
+        VOICE_TARGET_KEY if voice_target::agent_room_of(id).is_some() => Some(id.to_owned()),
         VOICE_TARGET_KEY => {
             let (_, provider_id, target) = catalog.bots.iter().find(|(bot_id, ..)| bot_id == id)?;
             Some(catalog.provider(provider_id)?.bot_reference(target))
@@ -879,6 +882,9 @@ pub fn from_portable(key: &str, portable: &str, catalog: &Catalog) -> Option<Str
     match key {
         // Only a person's tap opens the microphone; "off" travels freely.
         WAKE_ENABLED_KEY if portable == "1" => None,
+        VOICE_TARGET_KEY if voice_target::agent_room_of(portable).is_some() => {
+            Some(portable.to_owned())
+        }
         VOICE_TARGET_KEY => catalog
             .bots
             .iter()
@@ -1433,6 +1439,36 @@ mod tests {
         assert!(Values::parse(b"settings = 1\n", SyncedFile::Shared).is_err());
     }
 
+    /// Kept and applied keys interleave in one sorted `[settings]`, so every
+    /// device writes the same bytes whichever keys it applies.
+    #[test]
+    fn a_rendered_file_lists_its_settings_in_key_order() {
+        let text = "[settings]\n\"recording.scale_percent\" = 7\n\"recording.fps\" = 30\n\
+                    \"future.key\" = 1\n";
+        let rendered = Values::parse(text.as_bytes(), SyncedFile::Shared)
+            .expect("parses")
+            .render()
+            .expect("renders");
+        let at = |key: &str| rendered.find(key).expect(key);
+        assert!(
+            at("future.key") < at("recording.fps")
+                && at("recording.fps") < at("recording.scale_percent"),
+            "{rendered}"
+        );
+    }
+
+    /// `"recording.fps"` and `[settings.recording] fps` in one file: the
+    /// spelling later in key order wins, wherever it is written (R170).
+    #[test]
+    fn of_two_spellings_of_a_setting_the_later_in_key_order_wins() {
+        let text = "[settings]\n\"recording.fps\" = 30\n[settings.recording]\nfps = 60\n";
+        let parsed = Values::parse(text.as_bytes(), SyncedFile::Shared).expect("parses");
+        assert_eq!(
+            parsed.values.get("recording.fps").map(String::as_str),
+            Some("30")
+        );
+    }
+
     #[test]
     fn a_first_sync_against_existing_settings_pulls_them() {
         let remote = values(&[("recording.codec", "hevc"), ("recording.fps", "30")]);
@@ -1815,6 +1851,34 @@ mod tests {
             to_portable("notes.active_vault", "", &catalog).as_deref(),
             Some("")
         );
+    }
+
+    /// A voice target naming an agent room travels as it is stored: a room
+    /// id is the same on every device. A bot target still travels as its
+    /// reference, and an unknown bot still stays home.
+    #[test]
+    fn an_agent_voice_target_is_portable_verbatim() {
+        let catalog = catalog();
+        let agent = "agent:!dm:server";
+        let portable = to_portable(VOICE_TARGET_KEY, agent, &catalog);
+        assert_eq!(portable.as_deref(), Some(agent));
+        assert_eq!(
+            from_portable(VOICE_TARGET_KEY, agent, &catalog).as_deref(),
+            Some(agent)
+        );
+        // A device that knows no bot and no room still takes it.
+        assert_eq!(
+            from_portable(VOICE_TARGET_KEY, agent, &Catalog::default()).as_deref(),
+            Some(agent)
+        );
+        assert_eq!(
+            to_portable(VOICE_TARGET_KEY, "01BOT", &catalog).as_deref(),
+            Some(BOT)
+        );
+        // `agent:` with no room names nothing: it is neither passed through
+        // nor read as a bot.
+        assert_eq!(to_portable(VOICE_TARGET_KEY, "agent:", &catalog), None);
+        assert_eq!(from_portable(VOICE_TARGET_KEY, "agent:", &catalog), None);
     }
 
     #[test]

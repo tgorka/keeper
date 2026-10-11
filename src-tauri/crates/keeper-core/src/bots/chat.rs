@@ -908,7 +908,7 @@ impl CancelSignal {
     }
 
     /// Resolves when cancellation is requested.
-    async fn cancelled(&mut self) {
+    pub async fn cancelled(&mut self) {
         loop {
             if *self.rx.borrow_and_update() {
                 return;
@@ -999,6 +999,11 @@ pub async fn stream_chat(
     let attempts = options.max_attempts.max(1);
 
     for attempt in 0..attempts {
+        // A stopped turn sends nothing more: neither this attempt nor a
+        // retry of one.
+        if cancel.is_cancelled() {
+            return Ok(cancelled_before(sink, 0));
+        }
         let failure = match attempt_stream(
             client,
             endpoint,
@@ -1027,7 +1032,12 @@ pub async fn stream_chat(
                 wait_ms = wait.as_millis() as u64,
                 "bots: retrying a chat request that produced no bytes"
             );
-            tokio::time::sleep(wait).await;
+            let mut stop = cancel.clone();
+            tokio::select! {
+                biased;
+                () = stop.cancelled() => return Ok(cancelled_before(sink, 0)),
+                () = tokio::time::sleep(wait) => {}
+            }
             continue;
         }
 
@@ -1064,6 +1074,20 @@ pub async fn stream_chat(
 fn backoff(base: Duration, attempt: u32) -> Duration {
     let factor = 2u32.saturating_pow(attempt);
     base.saturating_mul(factor)
+}
+
+/// What a request Stop ended before any of its answer arrived: nothing,
+/// [`FinishReason::Cancelled`] — a Stop that waits on a silent connect or a
+/// back-off would not stop anything.
+fn cancelled_before(sink: ChatSink<'_>, total_ms: u64) -> ChatOutcome {
+    sink(ChatEvent::Finished {
+        reason: FinishReason::Cancelled,
+    });
+    ChatOutcome {
+        finish_reason: FinishReason::Cancelled,
+        total_ms,
+        ..ChatOutcome::default()
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1107,7 +1131,14 @@ async fn attempt_stream(
         })
     })?;
 
-    let mut response = match request.send().await {
+    let sent = tokio::select! {
+        biased;
+        () = cancel.cancelled() => {
+            return Ok(cancelled_before(sink, started.elapsed().as_millis() as u64));
+        }
+        sent = request.send() => sent,
+    };
+    let mut response = match sent {
         Ok(response) => response,
         Err(err) => {
             return Err(Box::new(AttemptFailure {
@@ -1526,7 +1557,7 @@ mod tests {
     }
 
     #[test]
-    fn ollama_drops_tool_choice_and_hermes_keeps_it() {
+    fn ollama_drops_tool_choice_and_hermes_and_openai_keep_it() {
         let request = ChatRequest {
             model: "m".to_owned(),
             messages: vec![ChatMessage::text(Role::User, "hi")],
@@ -1544,6 +1575,10 @@ mod tests {
 
         let hermes = build_body(ProviderKind::Hermes, &request).expect("body");
         assert_eq!(hermes.get("tool_choice"), Some(&json!("required")));
+
+        let openai = build_body(ProviderKind::OpenAi, &request).expect("body");
+        assert_eq!(openai.get("tool_choice"), Some(&json!("required")));
+        assert!(honours_tool_choice(ProviderKind::OpenAi));
     }
 
     #[test]
@@ -1587,6 +1622,14 @@ mod tests {
         );
         assert_eq!(part["image_url"]["detail"], json!("high"));
 
+        let openai = build_body(ProviderKind::OpenAi, &request).expect("body");
+        let part = &openai["messages"][0]["content"][1];
+        assert_eq!(part["type"], json!("image_url"));
+        assert_eq!(
+            part["image_url"],
+            json!({"url": "data:image/png;base64,AAAA", "detail": "high"})
+        );
+
         let ollama = build_body(ProviderKind::Ollama, &request).expect("body");
         let part = &ollama["messages"][0]["content"][1];
         assert_eq!(part["image_url"], json!("data:image/png;base64,AAAA"));
@@ -1611,6 +1654,8 @@ mod tests {
             Err(BotsError::Unsupported { .. })
         ));
         assert!(build_body(ProviderKind::Hermes, &request).is_ok());
+        // Unknown is permitted: the endpoint reports what it did with it.
+        assert!(build_body(ProviderKind::OpenAi, &request).is_ok());
     }
 
     #[test]

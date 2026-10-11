@@ -1,5 +1,6 @@
 import type { ReactNode } from "react";
 import { useEffect, useRef, useState } from "react";
+import { useStore } from "zustand";
 import { CaptureSettingsSection } from "@/components/notes/capture-settings";
 import { SearchSettingsSection } from "@/components/notes/search-settings";
 import { RecordingAdvancedControls } from "@/components/recording/recording-advanced-controls";
@@ -7,6 +8,7 @@ import { RecordingDestinationControls } from "@/components/recording/recording-d
 import { SessionsSettingsSection } from "@/components/sessions/sessions-settings";
 import { AboutSection } from "@/components/settings/about-section";
 import { AccountSection } from "@/components/settings/account-section";
+import { AgentsSection } from "@/components/settings/agents-section";
 import {
   SDK_STORE_ENCRYPTED_STATUS,
   SDK_STORE_STATUS_LOADING,
@@ -44,6 +46,7 @@ import { useTelemetryOpening } from "@/hooks/use-telemetry";
 import { useVoiceFacts } from "@/hooks/use-voice-facts";
 import { acceleratorFromEvent, DEFAULT_GLOBAL_HOTKEY, formatAccelerator } from "@/lib/hotkey";
 import {
+  agentOwnFingerprint,
   type DockBadgeMode,
   dockBadgeModeGet,
   dockBadgeModeSet,
@@ -264,6 +267,10 @@ export function SettingsBody({ open, onOpenChange }: SettingsDialogProps) {
           could name. `botTools` is strictly narrower than `bots` in Rust, so
           it is the one gate this section needs. */}
       {botTools && <BotGrantsSection open={open} />}
+      {/* Story 90.6: this Mac as a host for your agents. On `botTools` for the
+          grants' reason — a host reads drives, and a phone is never one — and
+          absent besides where no flagged folder holds an agent (AD-27). */}
+      {botTools && <AgentsSection open={open} />}
       {/* Folder sync needs a usable `git` (Epic 29): absent on every machine
               that has none, never a section whose every button would reject. */}
       {sync && <SyncSection open={open} />}
@@ -1256,7 +1263,69 @@ function EncryptionAccountRow({ accountId, children }: { accountId: string; chil
         </span>
       </div>
       <BackupAccountRow accountId={accountId} />
+      <OwnFingerprintRow accountId={accountId} />
     </li>
+  );
+}
+
+/** What the fingerprint line says when the account publishes no identity yet. */
+export const OWN_FINGERPRINT_NONE =
+  "No cross-signing identity yet, so there is no fingerprint to compare.";
+
+export const OWN_FINGERPRINT_FAILED = "keeper could not read your identity fingerprint.";
+
+/** Why the fingerprint is shown: a Linux host trusts a person by it. */
+export const OWN_FINGERPRINT_HINT =
+  "Compare it with what keeper-agentd status prints before an operator pins it for your agents.";
+
+/**
+ * The account's own cross-signing fingerprint (93.3): the master key in the
+ * groups of four `keeper-agentd status` prints, for the person to compare
+ * before a host pins it. Refresh with this account's live verification facts.
+ */
+function OwnFingerprintRow({ accountId }: { accountId: string }) {
+  const status = useEncryptionStatus(accountId);
+  const phase = useStore(verificationStore, (state) =>
+    state.activeAccountId === accountId ? state.flow?.phase : undefined,
+  );
+  // `undefined` while reading, `null` only when Rust reports no identity.
+  const [fingerprint, setFingerprint] = useState<string | null | undefined>(undefined);
+  const [failed, setFailed] = useState(false);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: live verification facts invalidate Rust's identity read even though only the account id is its argument.
+  useEffect(() => {
+    let live = true;
+    setFingerprint(undefined);
+    setFailed(false);
+    agentOwnFingerprint(accountId).then(
+      (value) => live && setFingerprint(value),
+      () => live && setFailed(true),
+    );
+    return () => {
+      live = false;
+    };
+  }, [accountId, status, phase]);
+  if (failed) {
+    return (
+      <p role="status" className="text-muted-foreground text-xs">
+        {OWN_FINGERPRINT_FAILED}
+      </p>
+    );
+  }
+  if (fingerprint === undefined) {
+    return null;
+  }
+  return (
+    <div className="flex flex-col gap-0.5 pl-1">
+      <span className="text-muted-foreground text-xs">Your identity fingerprint</span>
+      {fingerprint === null ? (
+        <span className="text-muted-foreground text-xs">{OWN_FINGERPRINT_NONE}</span>
+      ) : (
+        <>
+          <code className="break-words font-mono text-xs">{fingerprint}</code>
+          <span className="text-muted-foreground text-xs">{OWN_FINGERPRINT_HINT}</span>
+        </>
+      )}
+    </div>
   );
 }
 

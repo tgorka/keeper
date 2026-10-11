@@ -31,6 +31,9 @@ notify = { workspace = true }
 notify-debouncer-full = { workspace = true }
 globset = { workspace = true }
 sha2 = { workspace = true }
+# Folding names as the Mac's volume folds them (`names::same_entry_folded`):
+# already resolved in Cargo.lock, so the tree gains no package.
+unicode-normalization = { workspace = true }
 hex = { workspace = true }
 tempfile = { workspace = true }
 # Exact-Content-Length streaming bodies for LFS uploads — see the workspace
@@ -103,3 +106,7 @@ workspace = true
 # one syscall is not worth an exception to that.
 [target.'cfg(unix)'.dependencies]
 rlimit = "0.10"
+# `xdg`'s strict secrets directory compares its owner with the effective uid
+# and opens its files `O_NOFOLLOW` (S-34); std has neither `geteuid` nor the
+# flag's value, and this crate denies `unsafe_code`.
+rustix = { workspace = true }

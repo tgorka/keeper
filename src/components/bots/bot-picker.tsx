@@ -8,9 +8,10 @@
  *
  * **The bot list is `bots_bots_list` and never an enumeration of the
  * endpoint.** keeper cannot list the profiles behind a Hermes gateway — the
- * bearer API it is allowed through has no such route — so a bot is a row
- * somebody added and verified. That is why this is a picker over keeper's own
- * rows rather than a discovery control.
+ * bearer API it is allowed through has no such route — and while an Ollama's
+ * tags and an OpenAI-compatible endpoint's models can be listed, a bot is the
+ * same thing on all three kinds: a row somebody added and verified. That is
+ * why this is a picker over keeper's own rows rather than a discovery control.
  *
  * **The model list IS read from the endpoint**, per bot, and its three
  * capability flags are a tri-state. This picker prints what the endpoint said

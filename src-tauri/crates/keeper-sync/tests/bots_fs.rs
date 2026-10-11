@@ -574,3 +574,331 @@ fn the_two_shapes_are_never_confused() {
         }
     );
 }
+
+// ---------------------------------------------------------------------------
+// The search walk (story 95.4)
+// ---------------------------------------------------------------------------
+
+fn budget(max_files: usize, max_bytes: u64) -> bots_fs::ScanBudget {
+    bots_fs::ScanBudget {
+        max_files,
+        max_bytes,
+        max_file_bytes: 1024,
+        deadline: std::time::Instant::now() + std::time::Duration::from_secs(60),
+        clock: std::sync::Arc::new(std::time::Instant::now),
+        max_entries: 10_000,
+        opened: 0,
+        bytes: 0,
+        entries: 0,
+        capped: false,
+    }
+}
+
+/// Every text the walk under `start` hands over, by path, and its report.
+fn texts_under(
+    root: &Path,
+    start: &str,
+    budget: &mut bots_fs::ScanBudget,
+    visit: &mut dyn FnMut(&bots_fs::SearchEntry) -> bots_fs::Step,
+) -> (Vec<(String, String)>, bots_fs::SearchWalk) {
+    let mut texts = Vec::new();
+    let walked = bots_fs::search_walk(root, start, budget, visit, &mut |rel, file| {
+        if let bots_fs::Scanned::Text(text) = file {
+            texts.push((rel.to_owned(), text));
+        }
+    })
+    .expect("walk");
+    (texts, walked)
+}
+
+/// R95S-09: the call's byte budget counts every byte read — a binary
+/// file's too — and the next read may take only what is left: a file
+/// that would pass it is never read, the budget says it is spent; at
+/// exactly the budget every file is read.
+#[test]
+fn the_search_budget_counts_every_byte_and_caps_the_next_read_at_what_is_left() {
+    let dir = tempfile::tempdir().expect("root");
+    let root = dir.path();
+    write(root, "a.md", "aaaa");
+    write(root, "b.md", "b\0bb");
+    write(root, "c.md", "cccc");
+    let enter = &mut |_: &bots_fs::SearchEntry| bots_fs::Step::Enter;
+
+    let mut exact = budget(100, 12);
+    let (texts, walked) = texts_under(root, "", &mut exact, enter);
+    assert_eq!(texts.len(), 2, "{texts:?}");
+    assert_eq!((exact.bytes, walked.skipped, exact.capped), (12, 1, false));
+
+    let mut short = budget(100, 11);
+    let (texts, walked) = texts_under(root, "", &mut short, enter);
+    assert_eq!(texts, [("a.md".to_owned(), "aaaa".to_owned())]);
+    assert_eq!(short.bytes, 8, "the binary file's bytes count");
+    assert!(short.capped);
+    assert_eq!(
+        (walked.candidates, walked.searched + walked.skipped),
+        (3, 2)
+    );
+
+    let mut left = budget(100, 7);
+    assert!(matches!(
+        left.read(root, "a.md"),
+        Ok(bots_fs::Scanned::Text(_))
+    ));
+    assert_eq!(left.read(root, "c.md"), Err(bots_fs::Unread::Capped));
+    assert_eq!(left.bytes, 4);
+}
+
+/// R95S-10: the deadline stops the walk itself — once the clock passes
+/// it nothing more is offered or read — and so does the entry bound, while
+/// a folder is being read; either way the walk says its count is not the
+/// total. The clock is the test's, so no host's speed decides it.
+#[test]
+fn a_search_walk_stops_at_its_deadline_and_its_entry_bound() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().expect("root");
+    let root = dir.path();
+    for n in 0..50 {
+        write(root, &format!("d/{n:02}.md"), "text\n");
+    }
+    let start = std::time::Instant::now();
+    let late = Arc::new(AtomicBool::new(false));
+    let mut timed = budget(100, 1 << 20);
+    let seen = Arc::clone(&late);
+    timed.deadline = start + std::time::Duration::from_secs(1);
+    timed.clock = Arc::new(move || {
+        if seen.load(Ordering::SeqCst) {
+            start + std::time::Duration::from_secs(2)
+        } else {
+            start
+        }
+    });
+    let mut offered = Vec::new();
+    let (texts, walked) = texts_under(root, "d", &mut timed, &mut |entry| {
+        offered.push(entry.subpath.clone());
+        if entry.subpath == "d/10.md" {
+            late.store(true, Ordering::SeqCst);
+        }
+        bots_fs::Step::Enter
+    });
+    assert_eq!(offered.last().map(String::as_str), Some("d/10.md"));
+    assert_eq!(texts.len(), 10, "nothing is read past the deadline");
+    assert!(walked.walk_capped && timed.capped);
+
+    // The deadline passing as a folder is about to be read: none of its
+    // entries is looked at.
+    late.store(false, Ordering::SeqCst);
+    let mut reading = budget(100, 1 << 20);
+    let seen = Arc::clone(&late);
+    reading.deadline = timed.deadline;
+    reading.clock = Arc::new(move || {
+        if seen.load(Ordering::SeqCst) {
+            start + std::time::Duration::from_secs(2)
+        } else {
+            start
+        }
+    });
+    let mut offered = Vec::new();
+    let (texts, walked) = texts_under(root, "d", &mut reading, &mut |entry| {
+        offered.push(entry.subpath.clone());
+        late.store(true, Ordering::SeqCst);
+        bots_fs::Step::Enter
+    });
+    assert_eq!(offered, ["d"]);
+    assert!(texts.is_empty() && walked.walk_capped);
+    assert_eq!(reading.entries, 0);
+
+    let mut bounded = budget(100, 1 << 20);
+    bounded.max_entries = 10;
+    let mut offered = Vec::new();
+    let (texts, walked) = texts_under(root, "", &mut bounded, &mut |entry| {
+        offered.push(entry.subpath.clone());
+        bots_fs::Step::Enter
+    });
+    assert_eq!(
+        offered,
+        ["", "d"],
+        "the 50-entry folder is never offered whole"
+    );
+    assert!(texts.is_empty());
+    assert!(walked.walk_capped);
+    assert_eq!(bounded.entries, 10);
+}
+
+/// R95S-03: what the walk reads is what its visitor was offered or
+/// nothing: a file or a folder replaced by a link after it was offered is
+/// never followed, a landing whose folder became a link is never read, and
+/// a FIFO is never offered nor waited on.
+#[cfg(unix)]
+#[test]
+fn a_link_put_in_an_offered_entrys_place_is_never_followed() {
+    let dir = tempfile::tempdir().expect("root");
+    let root = dir.path();
+    write(root, "a/x.md", "inside\n");
+    write(root, "a/sub/y.md", "inside\n");
+    write(root, "b/z.md", "inside\n");
+    write(root, "secret/x.md", "secret\n");
+    write(root, "secret/y.md", "secret\n");
+    write(root, "secret/z.md", "secret\n");
+    let swap = |at: &str, to: &str| {
+        let path = root.join(at);
+        if path.is_dir() {
+            std::fs::rename(&path, root.join(format!("{at}.gone"))).expect("move");
+        } else {
+            std::fs::remove_file(&path).expect("remove");
+        }
+        std::os::unix::fs::symlink(root.join(to), &path).expect("link");
+    };
+    let (texts, walked) = texts_under(root, "a", &mut budget(100, 1 << 20), &mut |entry| {
+        match entry.subpath.as_str() {
+            "a/x.md" => swap("a/x.md", "secret/x.md"),
+            "a/sub" => swap("a/sub", "secret"),
+            _ => {}
+        }
+        bots_fs::Step::Enter
+    });
+    assert!(texts.is_empty(), "{texts:?}");
+    assert_eq!(walked.skipped, 1, "the replaced file");
+
+    let landed = bots_fs::search_landing(root, "b/z.md").expect("contained");
+    assert_eq!(landed.as_deref(), Some("b/z.md"));
+    swap("b", "secret");
+    assert_eq!(
+        budget(100, 1 << 20).read(root, "b/z.md"),
+        Err(bots_fs::Unread::Skipped)
+    );
+    assert_eq!(
+        bots_fs::search_landing(root, "b/z.md").expect("contained"),
+        Some("secret/z.md".to_owned())
+    );
+
+    let fifo = root.join("pipe.md");
+    let made = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("mkfifo");
+    assert!(made.success());
+    assert_eq!(
+        budget(100, 1 << 20).read(root, "pipe.md"),
+        Err(bots_fs::Unread::Skipped)
+    );
+    let mut offered = Vec::new();
+    texts_under(root, "", &mut budget(100, 1 << 20), &mut |entry| {
+        offered.push(entry.subpath.clone());
+        bots_fs::Step::Skip
+    });
+    assert_eq!(offered, [""]);
+    let mut offered = Vec::new();
+    texts_under(root, "", &mut budget(100, 1 << 20), &mut |entry| {
+        offered.push(entry.subpath.clone());
+        if entry.subpath.is_empty() {
+            bots_fs::Step::Enter
+        } else {
+            bots_fs::Step::Skip
+        }
+    });
+    assert!(!offered.contains(&"pipe.md".to_owned()), "{offered:?}");
+}
+
+/// The search walk's visitor decides before the disk is touched: a folder
+/// it skips is never entered (its file is never handed over), a file it
+/// skips never opened (an unreadable one is not counted as skipped); the
+/// files it enters come in name order, a pointer as its size and never its
+/// text, a large or binary file as skipped; a budget spent stops the opening
+/// but not the counting, and `Stop` ends the walk.
+#[cfg(unix)]
+#[test]
+fn a_search_walk_opens_only_what_its_visitor_enters() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("root");
+    let root = dir.path();
+    write(root, "a/1.md", "one\n");
+    write(root, "a/2.md", "two\n");
+    write(root, "b/3.md", "three\n");
+    write(root, "big.md", &"x".repeat(2048));
+    write(root, "bin.md", "a\0b");
+    write(root, "secret/x.md", "hidden\n");
+    write(root, "z-locked.md", "locked\n");
+    write(
+        root,
+        "p.md",
+        &Pointer::new("ab".repeat(32), 12_345).render(),
+    );
+    std::fs::set_permissions(
+        root.join("z-locked.md"),
+        std::fs::Permissions::from_mode(0o000),
+    )
+    .expect("000");
+
+    let mut texts = Vec::new();
+    let mut pointers = Vec::new();
+    let mut budget_all = budget(100, 1 << 20);
+    let walked = bots_fs::search_walk(
+        root,
+        "",
+        &mut budget_all,
+        &mut |entry| {
+            if entry.subpath == "secret" || entry.subpath == "z-locked.md" {
+                bots_fs::Step::Skip
+            } else {
+                bots_fs::Step::Enter
+            }
+        },
+        &mut |rel, file| match file {
+            bots_fs::Scanned::Text(text) => texts.push((rel.to_owned(), text)),
+            bots_fs::Scanned::Pointer { size } => pointers.push((rel.to_owned(), size)),
+        },
+    )
+    .expect("walk");
+    let names: Vec<&str> = texts.iter().map(|(rel, _)| rel.as_str()).collect();
+    assert_eq!(names, ["a/1.md", "a/2.md", "b/3.md"]);
+    assert_eq!(pointers, [("p.md".to_owned(), 12_345)]);
+    assert_eq!(walked.candidates, 6);
+    assert_eq!(walked.searched, 4);
+    assert_eq!(walked.skipped, 2, "the large and the binary file");
+    assert!(!budget_all.capped);
+
+    let mut opened = Vec::new();
+    let mut small = budget(2, 1 << 20);
+    let walked = bots_fs::search_walk(
+        root,
+        "a",
+        &mut small,
+        &mut |_| bots_fs::Step::Enter,
+        &mut |rel, _| opened.push(rel.to_owned()),
+    )
+    .expect("walk a");
+    assert_eq!(opened, ["a/1.md", "a/2.md"]);
+    let walked_b = bots_fs::search_walk(
+        root,
+        "b",
+        &mut small,
+        &mut |_| bots_fs::Step::Enter,
+        &mut |rel, _| opened.push(rel.to_owned()),
+    )
+    .expect("walk b");
+    assert!(small.capped, "a budget is shared across walks");
+    assert_eq!(
+        (walked.candidates, walked_b.candidates, walked_b.searched),
+        (2, 1, 0)
+    );
+
+    let mut stopped = Vec::new();
+    bots_fs::search_walk(
+        root,
+        "",
+        &mut budget(100, 1 << 20),
+        &mut |entry| {
+            if entry.subpath == "b" {
+                bots_fs::Step::Stop
+            } else {
+                bots_fs::Step::Enter
+            }
+        },
+        &mut |rel, _| stopped.push(rel.to_owned()),
+    )
+    .expect("walk");
+    assert!(stopped.is_empty(), "nothing after the stop: {stopped:?}");
+}

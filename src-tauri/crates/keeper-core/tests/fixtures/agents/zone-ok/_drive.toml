@@ -1,0 +1,6 @@
+version   = 1
+id        = "tgdrive"
+title     = "tgdrive"
+principal = "tgorka"
+owner     = "@tgorka:example.org"
+readers   = ["@tgorka:example.org"]

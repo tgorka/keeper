@@ -1,0 +1,68 @@
+{
+ "bundles": [
+  {
+   "description": "A test drive — a catalogue of nested bundles.",
+   "entry": "README.md",
+   "index": true,
+   "log": true,
+   "name": "shelf",
+   "path": ".",
+   "title": "shelf"
+  },
+  {
+   "description": "Written thinking, single-quoted: it's here.",
+   "entry": "README.md",
+   "index": true,
+   "log": true,
+   "name": "shelf-notes",
+   "path": "notes",
+   "title": "Notes"
+  },
+  {
+   "description": "A bundle inside a bundle.",
+   "entry": "README.md",
+   "index": false,
+   "log": false,
+   "name": "shelf-deep",
+   "path": "notes/deep",
+   "title": "Deep notes"
+  },
+  {
+   "description": "Own output, folded over two lines.",
+   "entry": "README.md",
+   "index": true,
+   "log": true,
+   "name": "shelf-work",
+   "path": "work",
+   "title": "Work"
+  }
+ ],
+ "exclude": [
+  "inbox/**",
+  "tmp/",
+  "work/clients/*",
+  "sessions/**/workspace/**",
+  "*.sync-conflict-*.md",
+  "notes/.keeper/**",
+  "**/drafts/*.md",
+  "archive?.md",
+  "exact/file.md"
+ ],
+ "guides": [
+  "inbox/README.md",
+  "inbox/log.md",
+  "tmp/README.md"
+ ],
+ "listed": [
+  {
+   "description": "What waits to be sorted.",
+   "note": "A snapshot rather than an inventory: the folder is opened one subtree at a time.",
+   "path": "inbox",
+   "title": "inbox — unsorted"
+  }
+ ],
+ "no_index": [
+  "notes/_template"
+ ],
+ "okf_version": "0.2"
+}

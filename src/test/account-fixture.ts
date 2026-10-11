@@ -70,6 +70,7 @@ export function driveOffer(over: Partial<DriveOfferVm> = {}): DriveOfferVm {
     notes: "vault",
     recordings: null,
     voices: null,
+    agents: null,
     sessions: null,
     tasks: "ledger",
     excludes: [".DS_Store"],

@@ -23,7 +23,7 @@ and it is enforced in two ways:
 | Each account's **Matrix homeserver** (e.g. `https://matrix.example.org`) | One entry per distinct homeserver you are signed into (duplicates collapse to one) | All Matrix protocol traffic — sync, sending, media, key backup, verification. |
 | **`api.beeper.com`** | Only when at least one account is a Beeper account (by provider tag **or** by homeserver host `matrix.beeper.com`) | Beeper's unofficial email-code login and account service. Appears exactly once. |
 | Each sync profile's **git remote host** (e.g. `github.com`, `forgejo.example.org`) | One entry per distinct remote *host* across your folder-sync profiles (duplicates collapse to one); absent entirely for a profile whose remote is a local path or a pendrive, which reaches no network | Fetch, push and LFS transfer for that folder. Only the **host** is shown — never the repository path, the username, or a credential that a badly-stored profile put in the URL. See `egress::remote_host`. |
-| Each configured **AI provider's host** (e.g. `localhost`, `127.0.0.1`, `gw.example.org`) | One entry per distinct provider *host* across your Bots providers (duplicates collapse to one); absent entirely when no provider is configured, which is how keeper ships | Chat completions, model and capability discovery, and a bot probe against the Hermes or Ollama endpoint you typed. Only the **host** is shown — never the `/v1` path, a profile prefix, or a credential. See the provider chapter below, and `egress::remote_host`. |
+| Each configured **AI provider's host** (e.g. `localhost`, `127.0.0.1`, `gw.example.org`) | One entry per distinct provider *host* across your Bots providers (duplicates collapse to one); absent entirely when no provider is configured, which is how keeper ships | Chat completions, model and capability discovery, and a bot probe against the Hermes, Ollama or OpenAI-compatible (`openai`) endpoint you typed. Only the **host** is shown — never the `/v1` path, a profile prefix, or a credential. See the provider chapter below, and `egress::remote_host`. |
 | Each **organisation account destination** (e.g. `id.acme.dev`, `git.acme.dev`) | Only while an account is set up in Settings › Account (`~/.keeper/account.toml`); absent entirely without one, which is how keeper ships. One entry per distinct host the account's descriptor names: its identity provider and any endpoint it overrides, the address the setup link was read from (while keeper still knows it), the settings repository and its `api_base`, and in `oauth` mode the forge's own sign-in | Sign-in, token refresh and sign-out against the identity provider; fetch and push of your own directory in the settings repository; reading the descriptor once when you paste or open a setup link (HTTPS only, no redirects, 64 KiB cap). Only the **host** is shown. The identity provider's discovery document may name further hosts (for example a `jwks_uri` on a CDN); those are the provider's choice and are reached only as it names them. See `egress::org_account_egress`. |
 | **GitHub, for browsing repositories** (`api.github.com`; also `github.com` with a connection) | Only while GitHub is a repository source in use. While the account's descriptor names a GitHub broker (`[github_broker]`): `api.github.com`, the host the broker's tokens are sent to. While this device holds a GitHub connection made with *Connect GitHub*: that source's web host and API host, `github.com` and `api.github.com`. Absent otherwise, which is how keeper ships, since keeper's own GitHub app is not registered yet | `api.github.com`: listing the repositories the person may reach (`/installation/repositories` with a broker's token; `/user` and `/user/repos` with a connection). `github.com`: *Connect GitHub*'s device code, the wait for approval, and the refresh of an expiring connection. A GitHub drive's git and LFS traffic is the sync-remote row above. Only the **host** is shown, labelled *`<source name>` repositories* (*GitHub repositories* for the `github` source). See `egress::forge_egress` and the browsing chapter below. |
 | **The GitHub broker's host** (e.g. `broker.acme.dev`) | Only while the account's descriptor names `[github_broker]`; absent without an account | `GET /v1/whoami` and `POST /v1/token`, each carrying the account's sign-in access token, to get one-hour GitHub tokens for listing and for GitHub drives. See `docs/account.md` § *GitHub through your organization's broker*. Only the **host** is shown, labelled *GitHub access broker*. See `egress::forge_egress`. |
@@ -50,6 +50,20 @@ Unlike the app, the daemon's update is **verified by checksum, not by signature*
 the download against the `.sha256` published beside it. That authenticates the transfer, not the
 publisher — a weaker guarantee than the app's minisign check, stated plainly rather than implied
 to be equivalent.
+
+### The agents' Linux host
+
+`keeper-agentd` (docs/agents.md § *keeper-agentd*) reaches only what its `agentd.toml` names, and
+registers no telemetry or export of any kind — no PostHog, no OTLP; `bun run check:agentd-lean`
+keeps those crates out of its build.
+
+| Destination | When | Why |
+| --- | --- | --- |
+| **`[homeserver].url`'s host** | While `run` serves, and on `init` and `login` | The agents' Matrix traffic: each copy's sign-in, `/sync`, the rooms it joins, the anchors and edits of its answers, its status anchor. One homeserver per host; agentd listens on nothing. |
+| **Each `[[providers]] base_url`'s host** | Each turn of an agent whose `[model].bot` names that provider, and the model probe while arming it | Chat completions for the agent's own model, the one the person chose for it. Only providers the file names are reached; a session whose label is `local_only` reaches none but a local (`ollama`) one. |
+| **Each `[[drives]] remote`'s host**, and the LFS destinations the daemon rows above describe | Each drive's checkout and every sync while `run` serves | Fetch and push of the drives, through agentd's own engine: the sessions' logs and artifacts reach the drive this way. |
+
+No other destination: no update check, and no telemetry destination at all.
 
 ## Bridges add no distinct egress
 
@@ -194,7 +208,7 @@ chapter gives: they are one destination.
 **A loopback or private-network host is the normal case here, and it is disclosed, not hidden.**
 Ollama's documentation points every user at `http://localhost:11434`; Hermes' api-server binds
 `127.0.0.1:8642` by default. A blocklist over private ranges — the standard SSRF advice for a
-server accepting arbitrary URLs — would reject the two endpoints the feature exists to reach, so
+server accepting arbitrary URLs — would reject the endpoints the feature exists to reach, so
 keeper answers the SSRF question the way it answers every other reach-outside question: by
 disclosure plus an explicit user act. `bots::url::parse_base_url` accepts a loopback, private or
 link-local host and marks it `is_private` so the surface can say which side of your network the
@@ -212,8 +226,8 @@ de-duplicated, ordered after the sync remotes and before the update endpoint, an
 when the last provider is removed.
 
 Since Epic 67 (AD-205, AD-211) a *spoken* question reaches this same endpoint from Rust —
-`bots_ipc::send_spoken` runs the one `open_turn` a typed message runs
-(`src-tauri/crates/keeper/src/bots_ipc.rs:1330`, `:1356`), with the same request, the same
+`bots_ipc::send_spoken` runs the one `keeper_agent::turn::open_turn` a typed message runs
+(`src-tauri/crates/keeper/src/bots_ipc.rs`, `send_spoken`), with the same request, the same
 host and nothing new on the wire — and the lock-screen banner that says what was heard is a
 local notification posted by the app process with no trigger and no push
 (`crates/keeper/src/voice_notify.rs:175-193`, `UNUserNotificationCenter` in-process; no APNs,
@@ -227,6 +241,18 @@ batches of at most 32, and never while no embedding model is chosen. keeper ship
 downloads no weights, and adds no destination (huggingface.co and its kin are refused by D-4 and
 recorded as rejected in `research-notes-search-2026-09-19.md` §5); with no provider row there is
 no embedding, and search is words only. The row above is unchanged and no row is added.
+
+Since Epic 89 (AD-369, NFR-121) a provider may be of a third kind, `openai`: any
+OpenAI-compatible endpoint, such as a CLIProxyAPI on your own tailnet. It adds **no row of its
+own**. It is a provider row like the other two — the host of the base URL you typed, through the
+same `egress::remote_host`, port and path dropped — and every request it makes goes to that host:
+`GET /v1/models` for *Test*, the model list and a bot probe (the dialect has no health or version
+route, and `/v1/models` is the one route it cannot lack), and `POST /v1/chat/completions` for a
+turn. No path gains a profile prefix. keeper ships no default for it either (D-4): the endpoint is
+yours. What the gateway does with a turn — which upstream it forwards to — is the gateway's
+configuration and not keeper's to disclose; keeper lists where *its* bytes go, and they go to the
+host you typed. `egress::tests::an_openai_provider_discloses_exactly_its_host_once` pins the one
+row.
 
 ## Screen recording adds no egress
 

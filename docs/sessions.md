@@ -42,6 +42,7 @@ could desync, keeper does not store.
     archive/
       2025/2025-03-01-taxes/           # finished sessions, filed by close year
     .keeper/                           # keeper's own cache + journal + trash. NEVER synced.
+      agents.db                        # the agent sessions' index — derived, rebuilt from the logs
 ```
 
 ### The two shapes
@@ -59,6 +60,13 @@ migrates has to keep working.
   house-style.md            # a prompt — tagged `prompt`
   workspace/                # scratch — unversioned, unsynced, READ-ONLY to keeper
   artifacts/                # promoted output — versioned and synced
+
+2026-10-02-release-notes/  # FLAT, worked in by an agent — the same contract, plus:
+  agent.toml                # the opening record: agent, drive, kind, room, label. Written once.
+  log/                      # the session's record: append-only JSONL, one writer per file
+    2026-10-02.electra.1.jsonl  #   <UTC date>.<host>.<n>.jsonl, rotated before min(192 KiB, 3/4 × LFS threshold)
+    blobs/<sha256>.json     #   bodies over 16 KiB, immutable
+  approvals/<ulid>.json     # pending actions, immutable (Epic 93)
 
 2026-08-10-keeper/          # FOLDER — the original, still read exactly as before
   README.md                 # THE record: summary, decisions, log, promote table
@@ -84,6 +92,13 @@ for whoever, or whatever, is handed the folder with no other context.
 
 `artifacts/` and `workspace/` survive in both shapes because their difference is
 about *versioning*, not about kind, and no tag can replace that.
+
+**An agent's session is a flat session plus three agent files** — `agent.toml`, `log/`
+and `approvals/` — and its `AGENTS.md` says so: `log/` and `approvals/` are keeper's, never
+edited or deleted by hand. None of them is markdown, so none enters the pool or a space; the
+board reads an agent session's run state, label and claim from `.keeper/agents.db`, never
+from the log. The formats and the rules are in `docs/agents.md` (*A session an agent works
+in*, *The log*).
 
 **Markdown is found wherever it sits.** keeper reads a session's markdown in
 subdirectories too, so a `spaces/`, a `log/` or any folder you make is a real home: the
@@ -941,6 +956,24 @@ files tagged `task`. A card's column is its `status:` and its position is its `o
 fractional number, so dragging one card rewrites one file rather than renumbering
 everything below it. A `status:` keeper cannot read is shown as unreadable rather than
 quietly filed under "to do".
+
+**A card an agent works is still a card in its column.** Its `run:` (`queued`, `running`,
+`waiting`, `blocked`, `review`, `failed`) is the agent's run, written by keeper's host, never a
+fifth column: `status: todo` with `run: blocked` sits in *To do*. Each card's view model carries
+its agent keys — who it is for, the host it is pinned to, who asked, its schedule and whether it
+reads, the mark of a schedule an agent wrote and of a card made from outside content — and, from
+the session's log, the host it runs on now and why it waits. Moving a card writes `status:` and
+`order:` and leaves every agent key as it was; the write is guarded on the exact bytes the move was
+computed from, so a card the host changed meanwhile (its `run:`) is refused rather than written
+back, and moving it again reads it afresh. A key written twice, or in a form the reader does not
+model, shows as unreadable rather than missing. The keys and who writes them are in
+`docs/agents.md` (*Cards*).
+On the card, under its title: the run as a badge with its word (a value keeper cannot read
+says *run unreadable* with what the file holds), a line naming the agent, where it runs or
+why it waits, and who asked, the schedule (or *schedule unreadable*), the *outside content*
+mark, and a schedule an agent wrote ("Scheduled by … — not running until you allow it") with
+an *Allow* button on the Mac — keeper's refusal, such as whom to sign in as, is shown on the
+card. *Details* lists every agent key as the file spells it, the `host:` pin among them.
 
 **The board follows the pool, not the shape.** It used to be drawn for flat sessions
 only, and the reason was true at the time: a folder-shaped session had no pool to tag, so

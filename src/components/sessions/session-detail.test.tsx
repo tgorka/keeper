@@ -1202,6 +1202,8 @@ describe("SessionDetail's board", () => {
       orderIsOwn: true,
       tags: ["task"],
       unstableIdentity: true,
+      // A person's card: no agent key (92.2).
+      agent: null,
       ...over,
     };
   }

@@ -1,0 +1,54 @@
+[package]
+name = "keeper-agent"
+description = "keeper's one turn loop, drive tool host and task runner, shared by the app and the server (AD-367)"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+# AD-367: tauri-free, so both the app and a Linux host link it.
+# `bun run check:agent-tauri-free` asserts it over `cargo tree`.
+[dependencies]
+keeper-core = { path = "../keeper-core" }
+keeper-sync = { path = "../keeper-sync" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+ulid = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# The zone lock's file half: an exclusive lock a second process waits on.
+fs4 = { workspace = true }
+# The caller's clock, handed to a create (AD-56).
+chrono = { workspace = true }
+# An agent's room: the event ids and transaction ids its sends carry.
+matrix-sdk = { workspace = true }
+# BMAD's helpers, ported (AD-396): `bmad_config` and `bmad_party` read the
+# drive's install through them, and print what they print in key order.
+keeper-ported = { path = "../keeper-ported" }
+toml = { workspace = true }
+# A round's helpers run side by side on the turn's thread (R110).
+futures-util = { workspace = true }
+
+# The headless host's process layer: no secret variable and no core dump
+# after start (S-07), `prctl` on Linux.
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+# The paced edits are tested on tokio's paused clock.
+tokio = { workspace = true, features = ["test-util"] }
+# A served session's second turn opens no file under log/: counted by inotify.
+notify = { workspace = true }
+# What a decision path writes to the process log, captured: a rejected
+# value never reaches it.
+tracing-subscriber = { workspace = true }
+# An index that opens and cannot answer, made by renaming its table
+# (drive_search). keeper-core already links it: no new crate.
+rusqlite = { workspace = true }
