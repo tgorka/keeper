@@ -45,6 +45,7 @@ pub mod proxy;
 pub mod redact;
 pub mod room;
 pub mod run;
+pub mod screen;
 pub mod search;
 pub mod seed;
 pub mod session;

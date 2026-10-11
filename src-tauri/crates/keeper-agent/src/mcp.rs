@@ -186,7 +186,19 @@ struct Server {
     /// How many messages of this server the transport refused as over
     /// [`MESSAGE_MAX`].
     refused: Arc<Refusals>,
+    /// A screen server's latest reads (`see`, `inspect_ui`) as keeper
+    /// parsed them, each with the session whose model made it, newest last:
+    /// what an element an action names by id is known by — Peekaboo's words
+    /// of the screen, never the model's — and only in the session that read
+    /// it (R316), whose label the read joined.
+    reads: Mutex<std::collections::VecDeque<(String, keeper_core::agents::screen::Read)>>,
 }
+
+/// How many of a session's reads of a screen server keeper keeps.
+const READS_KEPT: usize = 16;
+
+/// How many reads of a screen server keeper keeps for all its sessions.
+const READS_KEPT_ALL: usize = 4 * READS_KEPT;
 
 #[derive(Default)]
 struct State {
@@ -708,10 +720,13 @@ impl Listed {
     }
 
     /// Whether the model reads what the server wrote of it — its
-    /// description and schema — when it is offered: every tool but a role
-    /// server's, which keeper describes itself.
+    /// description and schema — when it is offered: every tool but a
+    /// Paseo broker's or a KVM's, which keeper describes itself. The
+    /// Mac's screen server describes its own tools: what it says joins the
+    /// session's label as any server's does (R225), and its table, not its
+    /// words, tiers them.
     pub fn server_authored(&self) -> bool {
-        self.role.is_none()
+        matches!(self.role, None | Some(McpRole::Screen))
     }
 
     /// Its server's role, as the listing it came from holds it.
@@ -744,7 +759,7 @@ impl Listed {
     /// they are offered (R225).
     fn spec(&self) -> Option<ToolSpec> {
         let wire = self.wire.as_ref().ok()?;
-        if let Some(role) = &self.role {
+        if let Some(role) = self.role.as_ref().filter(|_| !self.server_authored()) {
             let (description, parameters) = core_mcp::role_spec(role, &self.tool)?;
             return Some(ToolSpec {
                 name: wire.clone(),
@@ -781,6 +796,10 @@ pub struct Answer {
     pub total: u64,
     /// The server said the call failed.
     pub error: bool,
+    /// Each image it answered with, its bytes: what keeper's own screenshot
+    /// of the Mac's screen is read from (96.4). The model is told only that
+    /// there was one.
+    pub images: Vec<Vec<u8>>,
 }
 
 /// The client's side of the conversation: no capability declared, every
@@ -1228,9 +1247,11 @@ impl Server {
 
     /// How much of an answer of this server is kept: a Paseo broker's whole,
     /// as the transport bounded it, so keeper projects it before any cut
-    /// for display (R96PA2-01); any other server's what the model is shown.
+    /// for display (R96PA2-01), and a screen server's, so keeper parses a
+    /// read before any cut (R316); any other server's what the model is
+    /// shown.
     fn kept_max(&self) -> usize {
-        if self.entry.role == Some(McpRole::Paseo) {
+        if matches!(self.entry.role, Some(McpRole::Paseo | McpRole::Screen)) {
             MESSAGE_MAX
         } else {
             core_mcp::SHOWN_MAX
@@ -1282,11 +1303,23 @@ fn effect_unknown(server: &str, why: &str) -> String {
 
 /// A call's answer, at most `max` bytes of text kept.
 fn answer(result: &CallToolResult, max: usize) -> Answer {
+    use base64::Engine;
     let (text, total) = text_of(&result.content, result.structured_content.as_ref(), max);
+    let images = result
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Image(image) => base64::engine::general_purpose::STANDARD
+                .decode(&image.data)
+                .ok(),
+            _ => None,
+        })
+        .collect();
     Answer {
         text,
         total,
         error: result.is_error == Some(true),
+        images,
     }
 }
 
@@ -1306,6 +1339,19 @@ fn answer_error(error: &ErrorData, max: usize, paseo: bool) -> Answer {
     kept(text, true, max)
 }
 
+/// An answer's text up to its last whole line: all of it when nothing was
+/// cut, else without the line the cut ended inside, so a read cut inside a
+/// frame's digits never reads as another frame (R316).
+fn whole_lines(answer: &Answer) -> &str {
+    if answer.total <= answer.text.len() as u64 {
+        return &answer.text;
+    }
+    answer
+        .text
+        .rfind('\n')
+        .map_or("", |end| &answer.text[..end])
+}
+
 fn kept(text: String, error: bool, max: usize) -> Answer {
     let total = text.len() as u64;
     let mut end = text.len().min(max);
@@ -1314,7 +1360,12 @@ fn kept(text: String, error: bool, max: usize) -> Answer {
     }
     let mut text = text;
     text.truncate(end);
-    Answer { text, total, error }
+    Answer {
+        text,
+        total,
+        error,
+        images: Vec::new(),
+    }
 }
 
 impl McpServers {
@@ -1333,6 +1384,7 @@ impl McpServers {
                         changed: AtomicBool::new(false),
                         connections: AtomicU64::new(0),
                         refused: Arc::new(Refusals::default()),
+                        reads: Mutex::new(std::collections::VecDeque::new()),
                     })
                 })
                 .collect(),
@@ -1426,6 +1478,148 @@ impl McpServers {
             .find(|listed| listed.tool == tool && listed.offered())
             .and_then(|listed| listed.binding())
             .ok_or_else(|| "its MCP server no longer offers the tool".to_owned())
+    }
+
+    /// Keep `answer`, what the screen server `server` answered a read of
+    /// `session`'s model with, as keeper parses it from the whole answer:
+    /// the elements a later action of that session names by id are known by
+    /// this read, newest first, at most [`READS_KEPT`] of them a session.
+    /// A read that does not read — two windows' elements in it, no
+    /// snapshot — is not kept.
+    pub fn remember_read(&self, server: &str, session: &str, answer: &Answer) {
+        let Some(found) = self
+            .server(server)
+            .filter(|found| found.entry.role == Some(McpRole::Screen))
+        else {
+            return;
+        };
+        let Some(read) = keeper_core::agents::screen::read(whole_lines(answer)) else {
+            return;
+        };
+        let mut reads = found.reads.lock().unwrap_or_else(|p| p.into_inner());
+        reads.retain(|(of, kept)| !(of == session && kept.snapshot == read.snapshot));
+        reads.push_back((session.to_owned(), read));
+        let mine = reads.iter().filter(|(of, _)| of == session).count();
+        if mine > READS_KEPT {
+            if let Some(oldest) = reads.iter().position(|(of, _)| of == session) {
+                reads.remove(oldest);
+            }
+        }
+        while reads.len() > READS_KEPT_ALL {
+            reads.pop_front();
+        }
+    }
+
+    /// The read of `server` named `snapshot` that `session`'s model made —
+    /// its latest when `None` — as keeper kept it. Another session's read
+    /// is not this one's (R316).
+    pub fn kept_read(
+        &self,
+        server: &str,
+        session: &str,
+        snapshot: Option<&str>,
+    ) -> Option<keeper_core::agents::screen::Read> {
+        let reads = self
+            .server(server)?
+            .reads
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let mut mine = reads.iter().rev().filter(|(of, _)| of == session);
+        match snapshot {
+            Some(snapshot) => mine.find(|(_, read)| read.snapshot == snapshot),
+            None => mine.next(),
+        }
+        .map(|(_, read)| read.clone())
+    }
+
+    /// A read of the screen keeper makes itself, not the model: `server`'s
+    /// `tool` with `args` as its live listing offers it, once. `Err` is why
+    /// there is none — the tool is not offered now, the call failed, or the
+    /// server answered with an error.
+    async fn read_screen(&self, server: &str, tool: &str, args: Value) -> Result<Answer, String> {
+        let found = self
+            .server(server)
+            .ok_or_else(|| "this host no longer names its screen server".to_owned())?;
+        let listed = found
+            .listed()
+            .into_iter()
+            .find(|listed| listed.tool == tool && listed.offered())
+            .ok_or_else(|| format!("the screen server does not offer `{tool}` now"))?;
+        let (_handle, stop) = keeper_core::bots::chat::cancellation();
+        let args = match args {
+            Value::Object(args) => args,
+            _ => Map::new(),
+        };
+        let answer = self.call(&listed, args, stop).await?;
+        if answer.error {
+            return Err(format!("the screen server could not `{tool}` now"));
+        }
+        Ok(answer)
+    }
+
+    /// A screenshot of the main display, as `server` takes it for keeper:
+    /// its PNG bytes.
+    pub async fn screenshot(&self, server: &str) -> Result<Vec<u8>, String> {
+        self.read_screen(
+            server,
+            "image",
+            keeper_core::agents::screen::screenshot_args(),
+        )
+        .await?
+        .images
+        .into_iter()
+        .next()
+        .ok_or_else(|| "the screen server answered no screenshot".to_owned())
+    }
+
+    /// The window a pinned element is in, read again now by `server`.
+    pub async fn inspect(
+        &self,
+        server: &str,
+        pin: &keeper_core::agents::screen::ElementPin,
+    ) -> Result<keeper_core::agents::screen::Read, String> {
+        let answer = self
+            .read_screen(
+                server,
+                "inspect_ui",
+                keeper_core::agents::screen::inspect_args(pin),
+            )
+            .await?;
+        keeper_core::agents::screen::read(whole_lines(&answer))
+            .ok_or_else(|| "the screen server's read of the window does not read".to_owned())
+    }
+
+    /// The window in front as `server` reads it for keeper now: its
+    /// application and focused window (R316). Keeper's own read: the model
+    /// is not shown it and no session keeps it.
+    pub async fn front(&self, server: &str) -> Result<keeper_core::agents::screen::Read, String> {
+        let answer = self
+            .read_screen(
+                server,
+                "inspect_ui",
+                keeper_core::agents::screen::front_args(),
+            )
+            .await?;
+        keeper_core::agents::screen::read(whole_lines(&answer)).ok_or_else(|| {
+            "the screen server's read of the window in front does not read".to_owned()
+        })
+    }
+
+    /// `app`'s windows, as `server` lists them for keeper now.
+    pub async fn windows(
+        &self,
+        server: &str,
+        app: &str,
+    ) -> Result<keeper_core::agents::screen::Windows, String> {
+        let answer = self
+            .read_screen(
+                server,
+                "list",
+                keeper_core::agents::screen::windows_args(app),
+            )
+            .await?;
+        keeper_core::agents::screen::windows(whole_lines(&answer))
+            .ok_or_else(|| format!("the screen server's list of {app:?}'s windows does not read"))
     }
 
     /// Call `listed` with `args`, once, on the connection it was listed
@@ -2462,5 +2656,22 @@ mod tests {
         };
         assert!(read.read_to_end(&mut Vec::new()).await.is_err());
         assert_eq!(refused.count(), 1);
+    }
+
+    /// R316 (15): a screen read cut short by the transport is read to its
+    /// last whole line. An element whose `size 600x22` was cut to `600x2`
+    /// is not known at all, never known at a frame it does not have.
+    #[test]
+    fn a_cut_read_keeps_no_cut_line() {
+        let text = "UI Text Inspection\nSnapshot ID: S1\nApplication: Mail\nWindow: New Message\n\nUI Elements:\n\ntextField (2 found, 2 actionable):\n  elem_1 - at (20, 100) size 600x22\n  elem_2 - at (20, 140) size 600x22\n";
+        let cut = text.rfind("600x22").expect("a size") + "600x2".len();
+        let answer = kept(text.to_owned(), false, cut);
+        let read = keeper_core::agents::screen::read(whole_lines(&answer)).expect("a read");
+        assert!(read.element("elem_1").is_some());
+        assert!(
+            read.element("elem_2").is_none(),
+            "{:?}",
+            read.element("elem_2")
+        );
     }
 }

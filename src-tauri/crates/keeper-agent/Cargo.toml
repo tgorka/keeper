@@ -43,6 +43,11 @@ toml = { workspace = true }
 futures-util = { workspace = true }
 rmcp = { workspace = true, features = ["client", "transport-streamable-http-client"] }
 sse-stream = { workspace = true }
+# A screen server's screenshot, an MCP image block's base64, decoded to
+# grey for a region's difference hash before an action at coordinates is
+# approved and again before it is consumed (96.4).
+image = { workspace = true }
+base64 = { workspace = true }
 
 # The headless host's process layer: no secret variable and no core dump
 # after start (S-07), `prctl` on Linux; a `run`'s own process group, killed

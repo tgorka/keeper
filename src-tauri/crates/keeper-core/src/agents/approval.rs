@@ -488,6 +488,13 @@ pub struct Preconditions {
     pub files: Vec<FilePin>,
     pub workspace: Option<Value>,
     pub screen: Option<Value>,
+    /// A screen action's preview, `{sha256, ext}`: the screenshot it was
+    /// decided on, kept under the sessions zone's `.keeper/previews/`
+    /// (S-18), digested with the rest so the image a card shows is the one
+    /// decided on (R316). Absent for every other action, whose digest it
+    /// leaves as it was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<Value>,
     /// How old the facts above may be when the approval is used; `None`
     /// when the hashes are the whole check.
     pub max_staleness_s: Option<u64>,

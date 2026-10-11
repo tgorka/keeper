@@ -119,3 +119,6 @@ tokio = { workspace = true, features = ["net", "test-util"] }
 # Epic 82's OIDC tests sign ID tokens with an RSA key generated per test run
 # (no private key is checked in). Already in the graph via `openidconnect`.
 rsa = "0.9"
+# The region difference hash's bounds are proved over real screenshots of
+# the Mac (PNG fixtures, 96.4 #5); the hash itself takes grey bytes.
+image = { workspace = true }

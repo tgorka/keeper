@@ -816,10 +816,12 @@ fn raw_of(req: AgentMcpServerReq) -> RawMcp {
 }
 
 /// What a sheet says beside `raw`'s tier rows: the floor of a program
-/// keeper starts ([`mcp::tier`]'s), a role's table nobody edits.
+/// keeper starts ([`mcp::tier`]'s) — never the screen's, whose table is
+/// authoritative (R150) — a role's table nobody edits.
 fn presentation(raw: &RawMcp) -> (Option<String>, Option<String>) {
+    let screen = raw.role.as_deref() == Some("screen");
     (
-        raw.command.is_some().then(|| COMMAND_FLOOR.to_owned()),
+        (raw.command.is_some() && !screen).then(|| COMMAND_FLOOR.to_owned()),
         raw.role.is_some().then(|| ROLE_TABLE.to_owned()),
     )
 }
@@ -2521,6 +2523,12 @@ mod tests {
             })
         );
         assert_eq!(listed.command, ["peekaboo", "mcp"], "the argv as written");
+        // R150: the screen's table is authoritative, so its sheet shows the
+        // role's table and no program floor, though keeper starts it.
+        assert_eq!(
+            (listed.floor.clone(), listed.fixed.as_deref()),
+            (None, Some(ROLE_TABLE))
+        );
 
         let silent = BTreeMap::from([("screen".to_owned(), Heard::Silent("gone".to_owned()))]);
         assert_eq!(screen(&silent, tables.revision).started, None);

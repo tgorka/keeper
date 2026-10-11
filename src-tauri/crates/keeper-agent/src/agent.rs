@@ -1342,6 +1342,9 @@ impl AllowedTools<'_> {
             declassify: None,
             exec_binding: Value::Null,
             workspace: None,
+            preview: None,
+            screen: None,
+            args: None,
         });
         Gated::Park(approval)
     }
@@ -1642,6 +1645,15 @@ struct McpTools {
     names: Vec<String>,
     stop: CancelSignal,
     answers: Mutex<Vec<McpAnswered>>,
+    /// The sessions zone: where a screen action's preview is kept (S-18).
+    zone: PathBuf,
+    /// The session's folder on this host: whose screen reads are this
+    /// session's (R316).
+    session: String,
+    /// What keeper's own screenshot of the Mac's screen for a parked call
+    /// joins into the session's label before the card carries it to anyone
+    /// (R316), and the capability it came from.
+    pinned: Mutex<Option<(Label, String)>>,
 }
 
 /// One answer a call just got: the label it joins, when it was cut how
@@ -1660,6 +1672,277 @@ impl McpTools {
     /// The answer the call that just ended got, if it got one.
     fn take(&self) -> Option<McpAnswered> {
         self.answers.lock().unwrap_or_else(|p| p.into_inner()).pop()
+    }
+}
+
+/// A screen action as keeper read it (96.4, R316): what it acts on,
+/// everything it was classified by and its tier by that, the read its
+/// element came from and the snapshot keeper sends the call with when the
+/// model named none, the window keeper read in front for an action with no
+/// element and the one window its arguments name, and for a call an
+/// approval bound the target it bound.
+struct ScreenAim {
+    aim: keeper_core::agents::screen::Aim,
+    facts: Vec<keeper_core::agents::screen::Facts>,
+    tier: Tier,
+    element: Option<(
+        keeper_core::agents::screen::Read,
+        keeper_core::agents::screen::Element,
+    )>,
+    snapshot: Option<String>,
+    front: Option<keeper_core::agents::screen::Read>,
+    named: Option<(String, String)>,
+    approved: Option<Value>,
+}
+
+/// What keeper took of the screen before a screen action parks: the
+/// record's `preconditions.preview` and `preconditions.screen`, and the
+/// window keeper read under a click at coordinates, which its card names.
+struct ScreenPinned {
+    preview: Value,
+    pin: Value,
+    under: Option<String>,
+}
+
+impl AllowedTools<'_> {
+    /// `listed`, a screen server's tool, called with `args`: refused when it
+    /// names a file, a question for Peekaboo's AI or a target keeper cannot
+    /// read; else what it acts on as keeper read it — an element by the read
+    /// this session's model made of it (binding that read's snapshot when
+    /// the call names none), anything else by the window keeper reads in
+    /// front now together with the window its arguments name in keeper's
+    /// own list — refused when they name no window there or more than one
+    /// (R328) — or, for a call an approval bound, as the approval bound it
+    /// (`approved`), with no read of its own (R316).
+    fn screen_aim(
+        &self,
+        listed: &crate::mcp::Listed,
+        args: &Value,
+        approved: Option<&Value>,
+    ) -> Result<ScreenAim, String> {
+        use keeper_core::agents::screen::{self, Facts};
+        let tool = listed.tool.as_str();
+        if let Some(reason) = screen::refusal(tool, args) {
+            return Err(reason);
+        }
+        let aim = screen::aim(tool, args);
+        let aimed = |facts: Vec<Facts>| ScreenAim {
+            tier: screen::tier_over(tool, args, &aim, &facts),
+            aim: aim.clone(),
+            facts,
+            element: None,
+            snapshot: None,
+            front: None,
+            named: None,
+            approved: None,
+        };
+        if let Some(target) = approved {
+            let facts = screen::facts_of_target(target).ok_or_else(|| {
+                "Its approval bound no target keeper reads. Nothing was sent.".to_owned()
+            })?;
+            return Ok(ScreenAim {
+                approved: Some(target.clone()),
+                ..aimed(facts)
+            });
+        }
+        // A read, or a list, reads: nothing of the screen classifies it.
+        if screen::tier(tool, args, &aim, &Facts::default()) == Tier::T0 {
+            return Ok(aimed(Vec::new()));
+        }
+        let tools = self
+            .mcp
+            .as_ref()
+            .ok_or_else(|| "this agent has no screen server here".to_owned())?;
+        let servers = &tools.servers;
+        let server = listed.server.as_str();
+        if let screen::Aim::Element { snapshot, id } = &aim {
+            let read = servers.kept_read(server, &tools.session, snapshot.as_deref());
+            let Some((read, element)) = read.and_then(|read| {
+                let element = read.element(id)?.clone();
+                Some((read, element))
+            }) else {
+                return Err(format!(
+                    "keeper has not read the element {id:?} of this screen in this session{}. Read the screen with `inspect_ui` or `see`, then name an element from that read. Nothing was sent.",
+                    if snapshot.is_some() { " in that snapshot" } else { "" }
+                ));
+            };
+            return Ok(ScreenAim {
+                snapshot: snapshot.is_none().then(|| read.snapshot.clone()),
+                element: Some((read.clone(), element.clone())),
+                ..aimed(vec![Facts::of_element(&read, &element)])
+            });
+        }
+        let refused = |what: String| format!("{what}. Nothing was sent.");
+        let front = delegate::block_on(servers.front(server)).map_err(|why| {
+            refused(format!(
+                "keeper could not read the window in front to know what this acts on: {why}"
+            ))
+        })?;
+        let of_args = Facts::of_args(args);
+        let mut facts = vec![
+            of_args.clone(),
+            Facts::of_window(&front.app, &front.window, &of_args),
+        ];
+        let mut named = None;
+        let (app, window) = screen::targets(tool, args);
+        if app.is_some() || window.is_some() {
+            // The app a call names is the model's word, sent to the server
+            // to list its windows: only where the session may send to it.
+            if app.is_some() {
+                if let Some(entry) = servers.entry(server) {
+                    if let SinkVerdict::Block { reason, .. } =
+                        check_sink(&self.view.label(), &keeper_core::agents::mcp::sink(entry))
+                    {
+                        return Err(format!(
+                            "{reason} The MCP server `{server}` is read by fewer people than this session. Nothing was sent to it."
+                        ));
+                    }
+                }
+            }
+            let app = app.unwrap_or_else(|| front.app.clone());
+            let windows = delegate::block_on(servers.windows(server, &app)).map_err(|why| {
+                refused(format!(
+                    "keeper did not find {app:?} among the Mac's applications ({why})"
+                ))
+            })?;
+            // The call is pinned by the window it names, so it names one:
+            // two Peekaboo could choose between — an app with two windows,
+            // a part of a title two hold — are refused (R328).
+            let titles = screen::named_titles(tool, args, &windows);
+            let [title] = titles.as_slice() else {
+                return Err(refused(match &window {
+                    Some(part) if titles.is_empty() => format!(
+                        "keeper did not find a window of {} whose title holds {part:?}",
+                        windows.app
+                    ),
+                    _ => format!(
+                        "keeper found {} windows of {} this names, and it acts on one; name that window by its `window_title`",
+                        titles.len(),
+                        windows.app
+                    ),
+                }));
+            };
+            // A global hotkey lands on the window in front, whatever it
+            // names: that is the one it is pinned by.
+            if !screen::to_the_front(tool, args) {
+                named = Some((windows.app.clone(), title.clone()));
+            }
+            facts.push(Facts::of_window(&windows.app, "", &of_args));
+            facts.push(Facts::of_window(&windows.app, title, &of_args));
+        }
+        Ok(ScreenAim {
+            front: Some(front),
+            named,
+            ..aimed(facts)
+        })
+    }
+
+    /// What a screen action that waits for a person is decided on and
+    /// checked against again (96.4 #4, S-18, R316): a screenshot keeper
+    /// takes itself, kept under the zone's `.keeper/previews/` by its
+    /// SHA-256 — the record's `preview` — and the element as keeper read
+    /// it; for a click at coordinates the square it lands in by its
+    /// difference hash; for anything else the window it acts on — the one
+    /// its arguments name, else the one in front — by its application,
+    /// title and frame as keeper lists them and the hash of that frame;
+    /// the record's `preconditions.screen`. Refused when no such window
+    /// reads. The screenshot joins the screen server's readers into the
+    /// session's label before the card carries it anywhere.
+    fn screen_pin(
+        &self,
+        tools: &McpTools,
+        entry: &keeper_core::agents::mcp::McpEntry,
+        at: &str,
+        aimed: &ScreenAim,
+    ) -> Result<ScreenPinned, String> {
+        use keeper_core::agents::screen::{self, Aim, Pin};
+        let server = entry.name.as_str();
+        let unpinned = |why: String| {
+            format!("keeper could not take the screenshot this would be decided on: {why}. Nothing was sent.")
+        };
+        let front = aimed.front.as_ref();
+        // The window the action acts on, read before the screenshot as the
+        // consume path reads it again: its application, title, frame and
+        // whether it is the one in front.
+        let window = match &aimed.aim {
+            Aim::Screen => {
+                let (app, title, in_front) = match (&aimed.named, front) {
+                    (Some((app, title)), _) => (app.clone(), title.clone(), false),
+                    (None, Some(front)) => (front.app.clone(), front.window.clone(), true),
+                    (None, None) => return Err(unpinned("no window in front reads".to_owned())),
+                };
+                if title.is_empty() {
+                    return Err(unpinned("no window in front reads".to_owned()));
+                }
+                let windows =
+                    delegate::block_on(tools.servers.windows(server, &app)).map_err(unpinned)?;
+                let [frame] = windows.titled(&title)[..] else {
+                    return Err(unpinned(format!(
+                        "{app}'s list does not name exactly one window {title:?}"
+                    )));
+                };
+                Some((windows.app, title, frame, in_front))
+            }
+            _ => None,
+        };
+        // A click at coordinates names the window under it only when the
+        // one keeper read in front is there.
+        let under = match (&aimed.aim, front) {
+            (Aim::Point { x, y }, Some(front)) if !front.window.is_empty() => {
+                delegate::block_on(tools.servers.windows(server, &front.app))
+                    .ok()
+                    .and_then(|windows| match windows.titled(&front.window)[..] {
+                        [frame]
+                            if (frame.x..frame.x.saturating_add(frame.w)).contains(x)
+                                && (frame.y..frame.y.saturating_add(frame.h)).contains(y) =>
+                        {
+                            Some(front.window.clone())
+                        }
+                        _ => None,
+                    })
+            }
+            _ => None,
+        };
+        let png = delegate::block_on(tools.servers.screenshot(server)).map_err(unpinned)?;
+        let grey = crate::previews::grey(&png).map_err(unpinned)?;
+        let outside = || unpinned("what it acts on is outside the screenshot".to_owned());
+        let pin = match (&aimed.aim, &aimed.element, window) {
+            (Aim::Element { .. }, Some((read, element)), _) => {
+                Pin::Element(screen::element_pin(read, element))
+            }
+            (Aim::Point { x, y }, _, _) => Pin::Region(
+                screen::region_around(*x, *y, grey.width, grey.height)
+                    .and_then(|rect| {
+                        screen::region_pin(&grey.pixels, grey.width, grey.height, rect)
+                    })
+                    .ok_or_else(outside)?,
+            ),
+            (_, _, Some((app, title, frame, in_front))) => Pin::Window(
+                screen::window_pin(
+                    &app,
+                    &title,
+                    frame,
+                    in_front,
+                    &grey.pixels,
+                    grey.width,
+                    grey.height,
+                )
+                .ok_or_else(outside)?,
+            ),
+            _ => return Err(unpinned("keeper read nothing it acts on".to_owned())),
+        };
+        let sha256 = off_the_runtime(|| crate::previews::write(&tools.zone, &png, "png")).map_err(
+            |error| unpinned(format!("its preview could not be kept ({})", error.kind())),
+        )?;
+        // The screenshot is outside content read by the screen server's
+        // readers: the card that carries it goes to no one else.
+        *tools.pinned.lock().unwrap_or_else(|p| p.into_inner()) =
+            Some((keeper_core::agents::mcp::result_label(entry), at.to_owned()));
+        Ok(ScreenPinned {
+            preview: json!({"sha256": sha256, "ext": "png"}),
+            pin: pin.value(),
+            under,
+        })
     }
 }
 
@@ -1880,8 +2163,27 @@ impl AllowedTools<'_> {
             .map(|(server, tool)| format!("{}{server}/{tool}", core_mcp::CAPABILITY_PREFIX))
             .unwrap_or_default();
         let offered = self.mcp_offered(name);
+        // A screen action is classified by what keeper read of its target
+        // (96.4 #2): an element by Peekaboo's read, an approved one by what
+        // its approval bound.
+        let screen = offered
+            .as_ref()
+            .filter(|listed| listed.role() == Some(&core_mcp::McpRole::Screen))
+            .map(|listed| {
+                let approved = self
+                    .bound_checked(&wire.id, name)
+                    .map(|run| run.exec_binding["target"].clone());
+                self.screen_aim(
+                    listed,
+                    wire.arguments.as_ref().unwrap_or(&Value::Null),
+                    approved.as_ref(),
+                )
+            });
         let facts = CallFacts {
-            mcp: offered.as_ref().and_then(|listed| listed.tier.clone().ok()),
+            mcp: match &screen {
+                Some(Ok(aimed)) => Some(aimed.tier),
+                _ => offered.as_ref().and_then(|listed| listed.tier.clone().ok()),
+            },
             ..CallFacts::default()
         };
         let classification = self.classify(&wire.id, AgentTool::Mcp, &facts, None);
@@ -1910,6 +2212,26 @@ impl AllowedTools<'_> {
             return refused(format!(
                 "The arguments of {name} are not a JSON object, so the call was not made; nothing was sent."
             ));
+        };
+        if let Some(Err(reason)) = &screen {
+            return refused(reason.clone());
+        }
+        // An element is the one keeper read in the snapshot it read it in:
+        // a call that names none is sent, and bound, with that snapshot,
+        // never Peekaboo's latest, which keeper's own reads move (R316).
+        let with_snapshot;
+        let args = match screen
+            .as_ref()
+            .and_then(|aimed| aimed.as_ref().ok())
+            .and_then(|aimed| aimed.snapshot.as_ref())
+        {
+            Some(snapshot) => {
+                let mut bound = args.clone();
+                bound.insert("snapshot".to_owned(), json!(snapshot));
+                with_snapshot = bound;
+                &with_snapshot
+            }
+            None => args,
         };
         if let Some(reason) =
             core_mcp::untrusted_refusal(entry, &listed.tool, self.view.label().integrity)
@@ -1964,6 +2286,36 @@ impl AllowedTools<'_> {
             ));
         };
         core_paseo::bind_audience(&mut binding, &entry.readers);
+        let aimed = screen.and_then(Result::ok);
+        // A screen action that will wait for a person is pinned, and its
+        // screenshot kept, before it parks: no card without the screen it
+        // is decided on (96.4 #4).
+        let pinned = match &aimed {
+            Some(aimed)
+                if self.parks && bound.is_none() && classification.gate() == Gate::Person =>
+            {
+                match self.screen_pin(tools, entry, &at, aimed) {
+                    Ok(pinned) => Some(pinned),
+                    Err(reason) => return refused(reason),
+                }
+            }
+            _ => None,
+        };
+        // What keeper read of its target is bound beside the server's
+        // binding; a call an approval let through binds what it bound.
+        if let Some(aimed) = &aimed {
+            keeper_core::agents::screen::bind_target(
+                &mut binding,
+                match &aimed.approved {
+                    Some(target) => target.clone(),
+                    None => keeper_core::agents::screen::target(
+                        &aimed.aim,
+                        &aimed.facts,
+                        pinned.as_ref().and_then(|pinned| pinned.under.as_deref()),
+                    ),
+                },
+            );
+        }
         let gated = match self.gated(&wire.id, name, &classification, &[], Vec::new()) {
             Gated::Park(approval) => {
                 if let Some(parking) = self
@@ -1973,6 +2325,13 @@ impl AllowedTools<'_> {
                     .as_mut()
                 {
                     parking.exec_binding = binding;
+                    if let Some(pinned) = pinned {
+                        parking.preview = Some(pinned.preview);
+                        parking.screen = Some(pinned.pin);
+                    }
+                    if aimed.as_ref().is_some_and(|aimed| aimed.snapshot.is_some()) {
+                        parking.args = Some(Value::Object(args.clone()));
+                    }
                 }
                 Gated::Park(approval)
             }
@@ -2022,6 +2381,16 @@ impl AllowedTools<'_> {
         });
         let outcome = match answered {
             Ok(answer) => {
+                // What Peekaboo read of the screen is what a later action
+                // on one of its elements is known by.
+                if listed.role() == Some(&core_mcp::McpRole::Screen)
+                    && matches!(listed.tool.as_str(), "see" | "inspect_ui")
+                    && !answer.error
+                {
+                    tools
+                        .servers
+                        .remember_read(&listed.server, &tools.session, &answer);
+                }
                 // A broker's answer reaches the model, the log and anything
                 // after them only as keeper's projection of it (96.3 #6),
                 // made from the whole answer before any cut for display
@@ -2436,6 +2805,9 @@ impl crate::sinks::Lift for AllowedTools<'_> {
             declassify: Some(args),
             exec_binding: Value::Null,
             workspace: None,
+            preview: None,
+            screen: None,
+            args: None,
         });
         crate::sinks::Lifted::Parked(approval)
     }
@@ -7916,6 +8288,12 @@ async fn run_agent_turn(
         allowances: context.run_allowances.clone(),
         labels: Mutex::new(Vec::new()),
     });
+    // Whose screen reads a read of this turn is: the session's folder.
+    let screen_session = deps
+        .sessions_zone
+        .join(&context.session.path)
+        .display()
+        .to_string();
     let log = Mutex::new(TurnLog {
         context,
         writer,
@@ -8023,6 +8401,9 @@ async fn run_agent_turn(
                 names: config.mcp.clone(),
                 stop: stop.clone(),
                 answers: Mutex::new(Vec::new()),
+                pinned: Mutex::new(None),
+                zone: deps.sessions_zone.clone(),
+                session: screen_session.clone(),
             }),
     };
     let tool_loop = ToolLoop {
@@ -8246,8 +8627,33 @@ async fn run_agent_turn(
                 grant_id: None,
             }),
         );
+        // Keeper's own screenshot of the Mac's screen for a parked call is
+        // read by the screen server's readers: the session's label says so
+        // before its card reaches anyone (R316).
+        let pinned = host.mcp.as_ref().and_then(|tools| {
+            tools
+                .pinned
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take()
+        });
         // A parked call has no result until a person decided (R73).
         if let ToolOutcome::Parked { .. } = outcome {
+            if let Some((label, at)) = pinned {
+                let joined = log.context.label.join(&label);
+                if joined != log.context.label {
+                    log.write(
+                        None,
+                        LineBody::Label(LabelBody::new(
+                            &joined,
+                            LabelCause {
+                                kind: LabelCauseKind::Outside,
+                                reference: at,
+                            },
+                        )),
+                    );
+                }
+            }
             log.parked = Some((call_line, wire.clone()));
             return;
         }
@@ -8460,9 +8866,15 @@ async fn run_agent_turn(
                     args["call"] = json!({"tool": wire.name, "arguments": wire.arguments_raw});
                     args
                 }
-                None => wire.arguments.unwrap_or(Value::Null),
+                None => parking
+                    .args
+                    .take()
+                    .or(wire.arguments)
+                    .unwrap_or(Value::Null),
             };
             let workspace = parking.workspace.clone();
+            let screen = parking.screen.clone();
+            let preview = parking.preview.clone();
             Some(crate::approvals::ParkedTurn {
                 parking,
                 call_line,
@@ -8470,6 +8882,8 @@ async fn run_agent_turn(
                 preconditions: keeper_core::agents::approval::Preconditions {
                     files,
                     workspace,
+                    screen,
+                    preview,
                     ..Default::default()
                 },
                 rest: parked_rest,
@@ -8710,7 +9124,14 @@ fn join_prompt_sources(
         offering.sort_unstable();
         offering.dedup();
         for server in offering {
-            if let Some(entry) = servers.entry(server).filter(|entry| entry.role.is_none()) {
+            // What a server wrote of its own tools is outside content: every
+            // server's but a Paseo broker's or a KVM's, which keeper words.
+            if let Some(entry) = servers.entry(server).filter(|entry| {
+                matches!(
+                    entry.role,
+                    None | Some(keeper_core::agents::mcp::McpRole::Screen)
+                )
+            }) {
                 sources.push((
                     keeper_core::agents::mcp::result_label(entry),
                     format!("{}{server}", keeper_core::agents::mcp::CAPABILITY_PREFIX),

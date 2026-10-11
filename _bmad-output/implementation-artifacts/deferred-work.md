@@ -9158,6 +9158,7 @@ origin: epic 96, story 96.2 (rung `agents-96-mcp`, 2026-10-07)
 location: `src-tauri/crates/keeper-core/src/agents/mcp.rs` (`role_row`)
 reason: a role server takes its role's table and nothing else (96.2 #6). Paseo's four rows are here (R24(2)); the screen table over Peekaboo's 27 tools is 96.4's (Q11, R151) and a KVM's MCP table is 96.5's, so until those rungs every tool of such a server is listed as not offered, with why. Close in `agents-96-screen` and `agents-96-kvm`.
 status: open
+resolution (screen half, 2026-10-11, rung `agents-96-screen`, R150/R151): `mcp::role_row` reads `screen::row` (Peekaboo 3.9.8's 27 tools; `agent`, `analyze`, `browser` never offered); proved by `screen::tests::peekaboo_tool_table_covers_the_fixture` and `mcp::tests`' screen case. The KVM half stays open for `agents-96-kvm`.
 
 ### DW-813: An MCP call does not read the turn's stop.
 
@@ -9584,4 +9585,75 @@ status: open
 origin: epic 96, story 96.3 (rung `agents-96-paseo`, review-96paseo-11.md, R312, 2026-10-11; from R96PA11-01)
 location: `paseo_capture` marks the end notice only when `paseo_origin` reads `<reply.session>/agent.toml` (`keeper-agent/src/agent.rs` ~:2283, 2298–2300, 2348–2364); `[reply].session` is a path (`keeper-core/src/agents/session.rs` ~:170–174) and session folders move on archive/trash (`sessions/exec.rs` ~:652–764)
 reason: a workflow run W moved before its Paseo end is captured produces an unmarked own-name notice in W's room; the R311 ignore arm (~:5327–5332) catches only marked content, and the parent's `takes_reply` (`sent && !replied`, ~:859) takes it as W's reply (delegate replied line, R202 card → review, a turn). Told once, to a run that never replied; no person's reply lost. Fix: carry the origin session's id in `[reply]` at follow time so `paseo_capture` always marks; regression with W's folder moved before capture (desk card stays running).
+status: open
+
+### DW-1160: A screen approval's card does not draw its preview (UX-DR141).
+
+origin: epic 96, story 96.4 (rung `agents-96-screen`, 2026-10-11; R155's pattern)
+location: `keeper-core/src/agents/approval_card.rs` (`ApprovalCardVm`), `src/components/` (the approval card), the shell's download of an approval request's encrypted attachment
+reason: the screenshot reaches the request as `ApprovalRequestContent.preview = {sha256, mimetype, file}` (the room's encrypted upload; `approvals::ServedSession::preview_attachment`), but no view model carries it and no component draws it — the target's frame or click point marked, the window named in the caption, *Preview no longer available* with the hash when the attachment is gone. Drawing it needs the desktop to download and decrypt the attachment, which is a shell command, and 96.4 does not touch the shell crate; the design lane has not decided the card either. Close with a `preview` part of `ApprovalCardVm` (ts-rs), a shell command returning the decrypted bytes for a request's preview, the card's rendering, and a real-browser proof at 1280 and 420 px.
+status: open
+
+### DW-1161: `screen:mac` stays in the manifest while Peekaboo has lost its grants.
+
+origin: epic 96, story 96.4 (rung `agents-96-screen`, 2026-10-11)
+location: `keeper-agent/src/hosts.rs` `HostRuntime::manifest` (`screen` = a `role = "screen"` server answering `tools/list`)
+reason: 96.4 #1 offers `screen:mac` while a screen server answers its tool list, and that is what is built and tested (`hosts::tests::screen_capability_follows_the_server`). A Peekaboo whose Screen Recording or Accessibility grant macOS reset after an update still answers `tools/list`, so the operator check "after a Peekaboo update `screen:mac` drops out of the manifest until the grants are back" is not met: its reads fail and an action that would park is refused because keeper's own screenshot fails, but the capability is still offered. Close by asking Peekaboo's `permissions` tool at each renewal and offering `screen:mac` only when both grants read granted, with a fixture case for each, and the hesperia device check.
+status: open
+
+### DW-1162: A screen action at coordinates outside the main display is refused.
+
+origin: epic 96, story 96.4 (rung `agents-96-screen`, 2026-10-11)
+location: `keeper-core/src/agents/screen.rs` `screenshot_args` (`app_target = "screen:0"`, logical scale), `region_around`; `keeper-agent/src/agent.rs` `AllowedTools::screen_pin`
+reason: keeper's own screenshot is the main display at one pixel per point, so a click whose point lies on a second display falls outside it and the action is refused ("what it acts on is outside the screenshot") rather than pinned. Failing closed is deliberate; the gap is a person with two displays who wants it. Close by mapping a point to the display that holds it (Peekaboo's `list` of screens) and hashing that display's screenshot, proved on a two-display Mac.
+status: open
+
+### DW-1163: The model never sees a screenshot.
+
+origin: epic 96, story 96.4 (rung `agents-96-screen`, 2026-10-11)
+location: `keeper-agent/src/mcp.rs` `text_of` (an image block becomes `[an image, image/png, not shown]`)
+reason: an MCP answer's image reaches the model as that sentence only (96.2's rendering); keeper reads the bytes itself for the preview and the region hash (`Answer.images`). An agent therefore works the screen from Peekaboo's accessibility text (`see`, `inspect_ui`), not from pixels, and "take a screenshot of the front window" runs at T0 but gives the model no picture. Sending an image to the provider is a new sink (the provider's audience and NFR-115's `local_only`) and a provider capability (`BotModelVm.vision`), neither decided here. Close with that decision, the image passed as a vision content part only where the provider's sink allows the screen's label, and a test that a `local_only` session sends none.
+status: open
+
+### DW-1164: Nothing prunes the zone's `.keeper/previews/`.
+
+origin: epic 96, story 96.4 (rung `agents-96-screen`, review-96screen-1 / R316, 2026-10-11)
+location: `keeper-agent/src/previews.rs` `write`
+reason: every screen action that parks keeps its screenshot once by SHA-256 (megabytes each at a 5K display's logical scale) and nothing removes it after its record is decided or expired. Close with a sweep — a preview no open record names, older than the longest expiry (24 h), removed by the host that wrote it — and a test that an open record's preview survives it.
+status: open
+
+### DW-1165: The screen's SUBMIT word list is six words.
+
+origin: epic 96, story 96.4 (rung `agents-96-screen`, review-96screen-1 / R316, 2026-10-11)
+location: `keeper-core/src/agents/screen.rs` `SUBMIT`
+reason: a click on an element is T3 when its role, title or identifier says submit, send, post, buy, pay or delete; `OK`, `Confirm`, `Accept`, `Allow` (outside a TCC prompt), `Continue`, `Purchase`, `Transfer`, `Remove`, `Erase`, `Discard`, `Sign out`, `Empty Trash`, a double-click that opens, and a `menu click-extra` toggle (Wi-Fi, VPN) are T1. Close with the wider list decided (which words, in which languages the Mac runs) and a row each in `screen_tier_rows`.
+status: open
+
+### DW-1166: Peekaboo writes screenshots and recordings to temporary files on the Mac.
+
+origin: epic 96, story 96.4 (rung `agents-96-screen`, review-96screen-1 / R316, 2026-10-11)
+location: `docs/agents.md` § *The Mac's screen* (*What Peekaboo keeps on the Mac*); `keeper-core/src/agents/screen.rs` `TOOLS` (`capture` T0)
+reason: `capture` records up to 180 s of the screen into a temporary folder (`autoclean_minutes`), and `see`/`image` without `format: data` write their screenshot to a temporary file; keeper names no path (R151) and the files are Peekaboo's in the person's account. Documented, not refused. Close with a decision — refuse `capture`, or ask `autoclean_minutes = 0` / inline data where the schema allows — and a test of it.
+status: open
+
+### DW-1167: The names a screen card quotes are the model's.
+
+origin: epic 96, story 96.4 (rung `agents-96-screen`, review-96screen-1 / R316, 2026-10-11)
+location: `keeper-core/src/agents/screen.rs` `summary` (`quoted`)
+reason: a card for an action with no element quotes the app, menu item, Dock item or dialog button its arguments name — capped at 40 characters and quoted as a name (R316 07), but the model's words. Close by resolving each against keeper's own `menu list`, `dialog list`, `app list` and `list` before the action parks, composing the card from the entry found and refusing what is not found, with a test that a name no list holds is refused.
+status: open
+
+### DW-1168: Screen behaviours await a device check on hesperia.
+
+origin: epic 96, story 96.4 (rung `agents-96-screen`, review-96screen-1 / R316, 2026-10-11)
+location: `keeper-core/src/agents/screen.rs` `types_return`, `types_delete`, `screenshot_args`, `windows`, `Windows::holding`, `window_holds`, `named_holds`; `keeper-agent/src/agent.rs` `AllowedTools::screen_aim`, `screen_pin`
+reason: whether Peekaboo's `type` sends a `\n` in its text as Return (R316 08 treats it as Return either way), and whether `image {format: data, app_target: screen:0, scale: logical, max_dimension: 1000000}` answers an inline PNG block — both read from the 3.9.8 schema and sources, neither run on the real server. Close with both run on hesperia (read-only `image`; `type` into a scratch TextEdit document) and the result recorded.
+also (review-96tail-fix1 / R328, 2026-10-11): the window pin rests on Peekaboo facts read from its sources, never run — (a) `inspect_ui {app_target: "frontmost"}`'s `Window:` text equals `list application_windows`' quoted title verbatim, and `list` writes `Found N windows for <app> (<bundle>) - PID: n` then `k. "<title>" [Bounds: x, y w×h]` (a mismatch makes every action with no element refuse at its pin: fails closed, unusable); (b) Peekaboo still resolves `snapshot: S1` after keeper's own later `inspect_ui` (the consumed click names the read's snapshot; if Peekaboo evicted it, the approval is consumed and the click errors); (c) `window_title` matching is case-insensitive as `Windows::holding` assumes (if Peekaboo's is case-sensitive, keeper refuses calls Peekaboo would run, never the reverse); (d) whether `list` lists a sheet as a window (then the identity check sees one laid over the pinned window; else only the frame hash's 13–14 bits do); (e) whether `type` acts on `{delete}` / `{backspace}` in its text (R328 02 treats both as Delete either way). Close with each run on hesperia and recorded, and the code changed where a fact differs.
+status: open
+
+### DW-1169: `inspect_args` targets `<app>:<window>`, which Peekaboo's grammar reads ambiguously.
+
+origin: epic 96, story 96.4 (rung `agents-96-screen`, review-96screen-1 / R316, 2026-10-11)
+location: `keeper-core/src/agents/screen.rs` `inspect_args`
+reason: the element re-read before a consumed action targets `"<app>:<window>"`; a window title holding `:` or an app named like `PID:…` is read another way by Peekaboo (`PID:PROCESS_ID:WindowTitle`). It fails closed (the re-read names another window and the action drifts) but a correct window can drift too. Close with Peekaboo's quoting rule confirmed and applied, or such a window refused at pin time, and a test.
 status: open

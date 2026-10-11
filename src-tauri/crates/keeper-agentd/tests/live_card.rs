@@ -210,6 +210,7 @@ fn request_of(
         },
         file: None,
         file_sha256: None,
+        preview: None,
         checkpoint_sha256: "c0ffee".to_owned(),
         preconditions,
         binding_digest: digest,

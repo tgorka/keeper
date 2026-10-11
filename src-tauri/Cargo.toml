@@ -339,6 +339,10 @@ sse-stream = "0.2"
 # Serves an in-test MCP server's tower service over HTTP. Already in Cargo.lock
 # at 0.8.9; MIT.
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+# A screenshot of the Mac's screen, decoded to grey for its region's
+# difference hash (96.4, Q13). PNG only; already in Cargo.lock at 0.25.10
+# through tauri, so no new crate. MIT OR Apache-2.0.
+image = { version = "0.25", default-features = false, features = ["png"] }
 # Exact-length streaming request bodies for LFS uploads (Story 25.3). This is
 # not optional sugar: `reqwest::Body::wrap_stream` and `Body::from(File)` both
 # yield an unknown-size body and therefore `Transfer-Encoding: chunked`, which

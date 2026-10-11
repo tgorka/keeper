@@ -1129,6 +1129,15 @@ impl HostRuntime {
             .collect();
         bots.sort();
         bots.dedup();
+        // The Mac's screen is offered while a screen server answers (96.4
+        // #1); agentd refuses a screen server at parse, so never there.
+        let screen = self.mcp.iter().any(|offer| {
+            offer.offering.iter().any(|name| {
+                offer.servers.entry(name).is_some_and(|entry| {
+                    entry.role == Some(keeper_core::agents::mcp::McpRole::Screen)
+                })
+            })
+        });
         HostManifest {
             v: CONTENT_VERSION,
             host: self.host.as_str().to_owned(),
@@ -1144,6 +1153,7 @@ impl HostRuntime {
                         format!("{}{name}", keeper_core::agents::mcp::CAPABILITY_PREFIX)
                     })
                 }))
+                .chain(screen.then(|| keeper_core::agents::screen::CAPABILITY.to_owned()))
                 .collect(),
             drives: self.drives.clone(),
             bots,
@@ -7890,6 +7900,55 @@ mod tests {
         refreshed(&w).await;
         w.tick().await;
         assert!(w.rt.manifest(0, true).tools.is_empty());
+    }
+
+    /// 96.4 #1: the Mac's manifest says `screen:mac` exactly while a
+    /// `role = "screen"` server answers `tools/list`; another server
+    /// answering offers no screen. (agentd never names one: its parser
+    /// refuses the role, keeper-core's `mcp::tests::what_a_host_allows_is_its_own`.)
+    #[tokio::test(flavor = "multi_thread")]
+    async fn screen_capability_follows_the_server() {
+        let (screen_url, screen) = one_tool_server().await;
+        let (notes_url, _notes) = one_tool_server().await;
+        let raw: Vec<keeper_core::agents::mcp::RawMcp> = toml::from_str::<
+            std::collections::BTreeMap<String, Vec<keeper_core::agents::mcp::RawMcp>>,
+        >(&format!(
+            "[[mcp]]\nname = \"mac\"\nurl = \"{screen_url}\"\nrole = \"screen\"\n\n[[mcp]]\nname = \"notes\"\nurl = \"{notes_url}\"\n"
+        ))
+        .expect("tables")
+        .remove("mcp")
+        .expect("mcp");
+        let entries =
+            keeper_core::agents::mcp::check(raw, &[], keeper_core::agents::mac_tables::MAC)
+                .expect("the Mac's servers");
+        let servers = Arc::new(crate::mcp::McpServers::new(
+            entries.into_iter().map(|entry| (entry, None)).collect(),
+        ));
+        let mut w = world(Duration::ZERO, true);
+        w.rt.mcp = Some(McpOffer {
+            servers: Arc::clone(&servers),
+            refreshing: None,
+            offering: Vec::new(),
+            published: None,
+        });
+        w.tick().await;
+        refreshed(&w).await;
+        w.tick().await;
+        assert_eq!(
+            w.rt.manifest(0, true).tools,
+            [
+                "mcp:mac",
+                "mcp:notes",
+                keeper_core::agents::screen::CAPABILITY
+            ]
+        );
+        screen.abort();
+        let _ = screen.await;
+        w.rt.manifest_sent = None;
+        w.tick().await;
+        refreshed(&w).await;
+        w.tick().await;
+        assert_eq!(w.rt.manifest(0, true).tools, ["mcp:notes"]);
     }
 
     /// R225: a server that takes every connection and answers none holds

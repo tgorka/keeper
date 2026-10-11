@@ -18631,6 +18631,1043 @@ mod parks {
                 }
             }
         }
+
+        /// 96.4: the Mac's screen through a Peekaboo that lists what
+        /// hesperia's 3.9.8 listed and answers its reads in its own words.
+        mod screen {
+            use super::*;
+            use base64::Engine as _;
+            use keeper_core::agents::label::Readers;
+            use keeper_core::agents::screen::Pin;
+
+            /// Peekaboo 3.9.8's `tools/list`, captured on hesperia: names
+            /// and input schemas.
+            const TOOLS: &str = include_str!("fixtures/peekaboo-tools-3.9.8.json");
+            /// A real screenshot of hesperia's menu bar.
+            const FRAME: &[u8] =
+                include_bytes!("../../keeper-core/tests/fixtures/screen/menu-bar-18-50.png");
+
+            /// What is on the screen as the fixture reads it: one element in
+            /// one window, in front, at `frame` (x, y, w, h) on the screen.
+            #[derive(Clone)]
+            struct Shown {
+                app: &'static str,
+                window: &'static str,
+                role: &'static str,
+                title: &'static str,
+                x: u32,
+                frame: (u32, u32, u32, u32),
+                /// Elements listed before the shown one: a read longer than
+                /// the model is shown.
+                filler: usize,
+                /// A second window of the application `list` names behind
+                /// the shown one, by its title.
+                behind: Option<&'static str>,
+            }
+
+            /// The fixture: every tool of the capture; `see` and
+            /// `inspect_ui` answer [`Shown`] as Peekaboo writes a read, each
+            /// in a snapshot of its own (`S1`, `S2`, …); `list` the shown
+            /// application's windows as Peekaboo lists them; `image` the
+            /// current frame as an inline PNG, anything else "done". Each
+            /// call is kept with its arguments. While `unlisted`, its
+            /// `tools/list` names no tool.
+            #[derive(Clone)]
+            struct Peekaboo {
+                calls: Arc<Mutex<Vec<(String, Value)>>>,
+                shown: Arc<Mutex<Shown>>,
+                frame: Arc<Mutex<Vec<u8>>>,
+                snapshots: Arc<std::sync::atomic::AtomicUsize>,
+                unlisted: Arc<std::sync::atomic::AtomicBool>,
+            }
+
+            impl Peekaboo {
+                fn showing(
+                    app: &'static str,
+                    window: &'static str,
+                    title: &'static str,
+                ) -> Peekaboo {
+                    Peekaboo {
+                        calls: Arc::default(),
+                        shown: Arc::new(Mutex::new(Shown {
+                            app,
+                            window,
+                            role: "button",
+                            title,
+                            x: 812,
+                            frame: (0, 0, 560, 48),
+                            filler: 0,
+                            behind: None,
+                        })),
+                        frame: Arc::new(Mutex::new(FRAME.to_vec())),
+                        snapshots: Arc::default(),
+                        unlisted: Arc::default(),
+                    }
+                }
+
+                fn called(&self) -> Vec<String> {
+                    self.calls
+                        .lock()
+                        .expect("lock")
+                        .iter()
+                        .map(|(tool, _)| tool.clone())
+                        .collect()
+                }
+
+                /// The arguments of the last call of `tool`.
+                fn last(&self, tool: &str) -> Option<Value> {
+                    self.calls
+                        .lock()
+                        .expect("lock")
+                        .iter()
+                        .rev()
+                        .find(|(called, _)| called == tool)
+                        .map(|(_, args)| args.clone())
+                }
+
+                fn read(&self) -> String {
+                    let shown = self.shown.lock().expect("lock").clone();
+                    let snapshot = 1 + self.snapshots.fetch_add(1, Ordering::SeqCst);
+                    let filler: String = (0..shown.filler)
+                        .map(|i| format!("  f{i} - \"Filler {i}\" - at (1, 1) size 9x9\n"))
+                        .collect();
+                    format!(
+                        "UI Text Inspection\nSnapshot ID: S{snapshot}\nApplication: {}\nWindow: {}\nElements found: 1\n\nUI Elements:\n\n{} (1 found, 1 actionable):\n{filler}  elem_7 - \"{}\" - at ({}, 96) size 64x28\n\nUse element IDs with click, type, and other interaction commands.",
+                        shown.app, shown.window, shown.role, shown.title, shown.x
+                    )
+                }
+
+                fn windows(&self) -> String {
+                    let shown = self.shown.lock().expect("lock").clone();
+                    let (x, y, w, h) = shown.frame;
+                    let behind = shown.behind.map_or(String::new(), |title| {
+                        format!("\n2. \"{title}\" [Bounds: 300, 200 400×300]")
+                    });
+                    format!(
+                        "✅ Found 1 window for {} (com.example) - PID: 812\n\nWindows:\n1. \"{}\" [Bounds: {x}, {y} {w}×{h}]{behind}",
+                        shown.app, shown.window
+                    )
+                }
+            }
+
+            impl ServerHandler for Peekaboo {
+                fn get_info(&self) -> ServerConfig {
+                    ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+                }
+
+                async fn list_tools(
+                    &self,
+                    _request: Option<PaginatedRequestParams>,
+                    _context: RequestContext<RoleServer>,
+                ) -> Result<ListToolsResult, ErrorData> {
+                    if self.unlisted.load(Ordering::SeqCst) {
+                        return Ok(ListToolsResult::with_all_items(Vec::new()));
+                    }
+                    let captured: Value = serde_json::from_str(TOOLS).expect("fixture");
+                    let tools = captured["tools"]
+                        .as_array()
+                        .expect("tools")
+                        .iter()
+                        .map(|tool| {
+                            Tool::new(
+                                tool["name"].as_str().expect("name").to_owned(),
+                                "",
+                                Arc::new(tool["inputSchema"].as_object().expect("schema").clone()),
+                            )
+                        })
+                        .collect();
+                    Ok(ListToolsResult::with_all_items(tools))
+                }
+
+                #[allow(deprecated)]
+                async fn call_tool(
+                    &self,
+                    request: CallToolRequestParams,
+                    _context: RequestContext<RoleServer>,
+                ) -> Result<CallToolResponse, ErrorData> {
+                    let args = request.arguments.clone().map_or(Value::Null, Value::Object);
+                    // An application nothing shows is not found, as Peekaboo
+                    // answers it.
+                    let unknown = args["app"]
+                        .as_str()
+                        .is_some_and(|app| app != self.shown.lock().expect("lock").app);
+                    self.calls
+                        .lock()
+                        .expect("lock")
+                        .push((request.name.to_string(), args));
+                    let block = match request.name.as_ref() {
+                        "list" if unknown => {
+                            return Ok(CallToolResult::error(vec![ContentBlock::text(
+                                "Application not found",
+                            )])
+                            .into());
+                        }
+                        "see" | "inspect_ui" => ContentBlock::text(self.read()),
+                        "list" => ContentBlock::text(self.windows()),
+                        "image" => ContentBlock::image(
+                            base64::engine::general_purpose::STANDARD
+                                .encode(&*self.frame.lock().expect("lock")),
+                            "image/png",
+                        ),
+                        _ => ContentBlock::text("done"),
+                    };
+                    Ok(CallToolResult::success(vec![block]).into())
+                }
+            }
+
+            async fn serve(peekaboo: Peekaboo) -> (String, tokio::task::JoinHandle<()>) {
+                use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
+                use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
+                let service = StreamableHttpService::new(
+                    move || Ok(peekaboo.clone()),
+                    Arc::new(LocalSessionManager::default()),
+                    StreamableHttpServerConfig::default(),
+                );
+                let router = axum::Router::new().nest_service("/mcp", service);
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("bind");
+                let address = listener.local_addr().expect("address");
+                let task = tokio::spawn(async move {
+                    let _ = axum::serve(listener, router).await;
+                });
+                (format!("http://{address}/mcp"), task)
+            }
+
+            /// The Mac's servers: `mac`, a `role = "screen"` server at `url`
+            /// read by tgorka and Marta, as Settings saves it; listed once.
+            async fn mac(url: &str) -> Arc<McpServers> {
+                mac_read_by(url, &[TGORKA, MARTA]).await
+            }
+
+            /// [`mac`], read by `readers`.
+            async fn mac_read_by(url: &str, readers: &[&str]) -> Arc<McpServers> {
+                let readers: Vec<String> =
+                    readers.iter().map(|user| format!("\"{user}\"")).collect();
+                let tables: std::collections::BTreeMap<
+                    String,
+                    Vec<keeper_core::agents::mcp::RawMcp>,
+                > = toml::from_str(&format!(
+                    "[[mcp]]\nname = \"mac\"\nurl = \"{url}\"\nrole = \"screen\"\nreaders = [{}]\n",
+                    readers.join(", ")
+                ))
+                .expect("tables");
+                let entries = keeper_core::agents::mcp::check(
+                    tables["mcp"].clone(),
+                    &[],
+                    keeper_core::agents::mac_tables::MAC,
+                )
+                .expect("the Mac's server");
+                let servers = Arc::new(McpServers::new(
+                    entries.into_iter().map(|entry| (entry, None)).collect(),
+                ));
+                servers.refresh().await;
+                assert_eq!(servers.answering(), ["mac"]);
+                servers
+            }
+
+            /// The parked record, asked by tgorka as a session a person
+            /// opened is: a T4 is decided only by who asked (93.3), and the
+            /// test session names nobody. The chain is not digested.
+            fn asked_by_tgorka(world: &World) -> ApprovalRecord {
+                let mut record = world.record();
+                record.dispatch_chain = vec![TGORKA.to_owned()];
+                world.rewrite(&record);
+                record
+            }
+
+            /// Nixi reads the screen, then clicks its one element.
+            fn read_then_click(after: Vec<Completion>) -> Vec<Completion> {
+                let mut script = vec![
+                    calls(&[("s1", "mcp__mac__see", json!({}))]),
+                    calls(&[(
+                        "c1",
+                        "mcp__mac__click",
+                        json!({"on": "elem_7", "snapshot": "S1"}),
+                    )]),
+                ];
+                script.extend(after);
+                script
+            }
+
+            /// 96.4 #3: what Peekaboo read of the screen runs at once and
+            /// reaches the model as outside content: `untrusted`, read by
+            /// the server's readers, joined into the session's label.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn screen_read_is_untrusted() {
+                let peekaboo = Peekaboo::showing("Mail", "Inbox", "Reply");
+                let (url, _server) = serve(peekaboo.clone()).await;
+                let mut world = nixi(
+                    vec![calls(&[("s1", "mcp__mac__see", json!({}))]), prose("Seen.")],
+                    mac(&url).await,
+                    &["mac"],
+                );
+                let mut served = open(&world, &Arc::new(Approvals::default()));
+                let ran = report(world.ask(&mut served, "what is on the screen").await);
+                assert_eq!(ran.ending, TurnEnding::Complete);
+                assert_eq!(peekaboo.called(), ["see"]);
+                let read = results(&world).pop().expect("a result");
+                assert!(read.content.contains("Reply"), "{}", read.content);
+                assert_eq!(read.label.integrity, Integrity::Untrusted);
+                assert_eq!(
+                    read.label.readers,
+                    Readers::Only([user(TGORKA), user(MARTA)].into())
+                );
+                assert_eq!(served.context.label.integrity, Integrity::Untrusted);
+            }
+
+            /// 96.4 #4, #6 (its control): a click on Send waits for a person,
+            /// its record holding the screenshot's SHA-256 and the element
+            /// as keeper read it; the screenshot is under the zone's
+            /// `.keeper/previews/`, which no commit of the drive takes, and
+            /// nowhere in the session; the request carries it only as the
+            /// room's upload. Approved, the element is read again before the
+            /// click is sent, once. Send's row is T3; the read before it made
+            /// the session `untrusted`, which raises it once (R171).
+            #[tokio::test(flavor = "multi_thread")]
+            async fn screen_preview_never_enters_the_drive() {
+                let peekaboo = Peekaboo::showing("Mail", "New Message", "Send");
+                let (url, _server) = serve(peekaboo.clone()).await;
+                let approvals = Arc::new(Approvals::default());
+                let mut world = nixi(
+                    read_then_click(vec![prose("Sent.")]),
+                    mac(&url).await,
+                    &["mac"],
+                );
+                let mut served = open(&world, &approvals);
+                let parked = report(world.ask(&mut served, "send the draft").await);
+                assert_eq!(parked.ending, TurnEnding::Parked);
+                assert_eq!(
+                    peekaboo.called(),
+                    ["see", "image"],
+                    "no click before a person"
+                );
+                let record = asked_by_tgorka(&world);
+                assert_eq!(
+                    (
+                        record.risk.base_tier,
+                        record.risk.tier,
+                        record.risk.raised_by.clone()
+                    ),
+                    (3, 4, vec!["untrusted".to_owned()])
+                );
+                assert_eq!(record.action.summary, "Click \"Send\" (button) in Mail");
+                let sha = sha256_hex(FRAME);
+                assert_eq!(
+                    record.preconditions.preview,
+                    Some(json!({"sha256": sha, "ext": "png"}))
+                );
+                assert_eq!(
+                    record.preconditions.screen.as_ref().and_then(Pin::of),
+                    Some(Pin::Element(keeper_core::agents::screen::ElementPin {
+                        ax_path: "Mail/New Message/button".to_owned(),
+                        app: "Mail".to_owned(),
+                        window: "New Message".to_owned(),
+                        role: "button".to_owned(),
+                        title: "Send".to_owned(),
+                        frame: keeper_core::agents::screen::Rect {
+                            x: 812,
+                            y: 96,
+                            w: 64,
+                            h: 28
+                        },
+                        identifier: None,
+                    }))
+                );
+
+                let kept = world
+                    .deps
+                    .sessions_zone
+                    .join(format!(".keeper/previews/{sha}.png"));
+                assert_eq!(std::fs::read(&kept).expect("the preview"), FRAME);
+                let in_drive = kept.strip_prefix(&world.tgdrive).expect("in the drive");
+                let excludes = keeper_sync::exclude::ExcludeSet::new(&[]).expect("excludes");
+                assert!(
+                    excludes.is_excluded(in_drive),
+                    "{in_drive:?} would be committed"
+                );
+                let mut folders = vec![world.dir(SESSION)];
+                while let Some(folder) = folders.pop() {
+                    for entry in std::fs::read_dir(folder).expect("folder") {
+                        let path = entry.expect("entry").path();
+                        if path.is_dir() {
+                            folders.push(path);
+                        } else {
+                            assert_ne!(std::fs::read(&path).expect("file"), FRAME, "{path:?}");
+                        }
+                    }
+                }
+
+                let requests = world.sent_of(APPROVAL_REQUEST);
+                assert_eq!(requests.len(), 1);
+                assert_eq!(
+                    requests[0]["preview"],
+                    json!({
+                        "sha256": sha,
+                        "mimetype": "image/png",
+                        "file": {"url": "mxc://example.org/args", "bytes": FRAME.len()},
+                    })
+                );
+                assert_eq!(approvals.uploads.load(Ordering::SeqCst), 1);
+
+                let decided = world.decision(&record, Decision::Approve);
+                world.serve(&mut served, decided).await;
+                assert_eq!(approvals.events().len(), 1);
+                assert_eq!(peekaboo.called(), ["see", "image", "inspect_ui", "click"]);
+                let calls = peekaboo.calls.lock().expect("lock").clone();
+                assert_eq!(calls[2].1, json!({"app_target": "Mail:New Message"}));
+                assert_eq!(calls[3].1, json!({"on": "elem_7", "snapshot": "S1"}));
+            }
+
+            /// 96.4 #6: a consumed screen action whose fresh read differs —
+            /// the element 40 points away, or the region a click at
+            /// coordinates lands in showing something else — is refused as
+            /// drift with nothing consumed and nothing clicked; proposed
+            /// again, it is asked again.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn screen_drift_refuses() {
+                let peekaboo = Peekaboo::showing("Mail", "New Message", "Send");
+                let (url, _server) = serve(peekaboo.clone()).await;
+                let approvals = Arc::new(Approvals::default());
+                let mut world = nixi(
+                    read_then_click(vec![
+                        prose("It moved."),
+                        calls(&[(
+                            "c2",
+                            "mcp__mac__click",
+                            json!({"on": "elem_7", "snapshot": "S1"}),
+                        )]),
+                    ]),
+                    mac(&url).await,
+                    &["mac"],
+                );
+                let mut served = open(&world, &approvals);
+                report(world.ask(&mut served, "send the draft").await);
+                let record = asked_by_tgorka(&world);
+                peekaboo.shown.lock().expect("lock").x += 40;
+                let decided = world.decision(&record, Decision::Approve);
+                world.serve(&mut served, decided).await;
+                assert!(approvals.events().is_empty(), "nothing was consumed");
+                assert!(!peekaboo.called().contains(&"click".to_owned()));
+                let line = world.approval_lines().pop().expect("a line");
+                assert_eq!(
+                    line.state,
+                    ApprovalState::Refused,
+                    "{:?}",
+                    world.approval_lines()
+                );
+                assert!(
+                    line.reason.as_deref().is_some_and(|r| r.contains("moved")),
+                    "{line:?}"
+                );
+                assert_eq!(
+                    results(&world).pop().expect("a result").outcome,
+                    ToolOutcomeWord::Refused
+                );
+                let again = report(world.ask(&mut served, "try again").await);
+                assert_eq!(again.ending, TurnEnding::Parked, "asked again");
+                assert_eq!(world.sent_of(APPROVAL_REQUEST).len(), 2);
+
+                // A click at coordinates, pinned by its region: the window
+                // under it moved 40 points.
+                let peekaboo = Peekaboo::showing("Mail", "New Message", "Send");
+                let (url, _server) = serve(peekaboo.clone()).await;
+                let approvals = Arc::new(Approvals::default());
+                let mut world = nixi(
+                    vec![
+                        calls(&[("c1", "mcp__mac__click", json!({"coords": "100,20"}))]),
+                        prose("It moved."),
+                    ],
+                    mac(&url).await,
+                    &["mac"],
+                );
+                let mut served = open(&world, &approvals);
+                let parked = report(world.ask(&mut served, "click there").await);
+                assert_eq!(parked.ending, TurnEnding::Parked);
+                let record = asked_by_tgorka(&world);
+                assert_eq!(
+                    record.action.summary, "Click at (100, 20) in \"New Message\"",
+                    "keeper read that window under the point"
+                );
+                assert!(
+                    matches!(
+                        record.preconditions.screen.as_ref().and_then(Pin::of),
+                        Some(Pin::Region(_))
+                    ),
+                    "{:?}",
+                    record.preconditions.screen
+                );
+                let shifted = {
+                    let image = image::load_from_memory(FRAME).expect("frame").to_rgba8();
+                    let (width, height) = image.dimensions();
+                    let moved = image::RgbaImage::from_fn(width, height, |x, y| {
+                        *image.get_pixel(x.saturating_sub(80), y)
+                    });
+                    let mut png = std::io::Cursor::new(Vec::new());
+                    moved
+                        .write_to(&mut png, image::ImageFormat::Png)
+                        .expect("png");
+                    png.into_inner()
+                };
+                *peekaboo.frame.lock().expect("lock") = shifted;
+                let decided = world.decision(&record, Decision::Approve);
+                world.serve(&mut served, decided).await;
+                assert!(approvals.events().is_empty(), "nothing was consumed");
+                assert_eq!(
+                    peekaboo.called(),
+                    ["inspect_ui", "list", "image", "image"],
+                    "never clicked"
+                );
+                let line = world.approval_lines().pop().expect("a line");
+                assert_eq!(line.state, ApprovalState::Refused, "{line:?}");
+            }
+
+            /// 96.4 #7 (S-22): a T4 screen action — Send, T3, raised once by
+            /// the read before it (R171) — decided from the Mac whose keeper
+            /// hosts the session and acts on its screen is refused with
+            /// nothing consumed or clicked; the same decision from the
+            /// person's phone is used. A TCC prompt's Allow, T4 by its row,
+            /// raised the same way is T5: refused before anything is taken
+            /// or clicked, so no device decides it.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn screen_t4_needs_another_device() {
+                let peekaboo = Peekaboo::showing("Mail", "New Message", "Send");
+                let (url, _server) = serve(peekaboo.clone()).await;
+                let approvals = Arc::new(Approvals::default());
+                let mut world = nixi(
+                    read_then_click(vec![prose("Sent.")]),
+                    mac(&url).await,
+                    &["mac"],
+                );
+                world.deps.decisions = Some(Admit::desktop());
+                let mut served = open(&world, &approvals);
+                let parked = report(world.ask(&mut served, "send it").await);
+                assert_eq!(parked.ending, TurnEnding::Parked);
+                let record = asked_by_tgorka(&world);
+                assert_eq!(record.risk.tier, 4);
+
+                let from_mac = world.decision_from(
+                    TGORKA,
+                    "MAC",
+                    decision_content(&record, Decision::Approve, None),
+                );
+                world.serve(&mut served, from_mac).await;
+                assert_eq!(ignored(&world).reason.as_deref(), Some(THIS_DEVICE));
+                assert!(!decision_file(&world, &record));
+                assert!(approvals.events().is_empty());
+                assert_eq!(peekaboo.called(), ["see", "image"]);
+
+                let phone = world.decision(&record, Decision::Approve);
+                world.serve(&mut served, phone).await;
+                assert!(decision_file(&world, &record));
+                assert_eq!(approvals.events().len(), 1);
+                assert_eq!(peekaboo.called(), ["see", "image", "inspect_ui", "click"]);
+
+                let peekaboo = Peekaboo::showing("UserNotificationCenter", "Notification", "Allow");
+                let (url, _server) = serve(peekaboo.clone()).await;
+                let approvals = Arc::new(Approvals::default());
+                let mut world = nixi(
+                    read_then_click(vec![prose("Refused.")]),
+                    mac(&url).await,
+                    &["mac"],
+                );
+                world.deps.decisions = Some(Admit::desktop());
+                let mut served = open(&world, &approvals);
+                let ran = report(world.ask(&mut served, "allow it").await);
+                assert_eq!(ran.ending, TurnEnding::Complete);
+                assert_eq!(peekaboo.called(), ["see"], "no screenshot, no click");
+                assert!(world.sent_of(APPROVAL_REQUEST).is_empty());
+                assert_eq!(
+                    results(&world).pop().expect("a result").outcome,
+                    ToolOutcomeWord::Refused
+                );
+            }
+
+            /// R316 (02): an element is acted on in the snapshot keeper read
+            /// it in. A click that names none is bound and sent with the
+            /// read's snapshot — never Peekaboo's latest, which keeper's own
+            /// read before the click moved — and one naming a snapshot this
+            /// session never read is refused unsent.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn screen_element_is_clicked_in_the_snapshot_it_was_read_in() {
+                let peekaboo = Peekaboo::showing("Mail", "New Message", "Send");
+                let (url, _server) = serve(peekaboo.clone()).await;
+                let approvals = Arc::new(Approvals::default());
+                let mut world = nixi(
+                    vec![
+                        calls(&[("s1", "mcp__mac__see", json!({}))]),
+                        calls(&[("c1", "mcp__mac__click", json!({"on": "elem_7"}))]),
+                        prose("Sent."),
+                    ],
+                    mac(&url).await,
+                    &["mac"],
+                );
+                let mut served = open(&world, &approvals);
+                let parked = report(world.ask(&mut served, "send the draft").await);
+                assert_eq!(parked.ending, TurnEnding::Parked);
+                let record = asked_by_tgorka(&world);
+                assert_eq!(
+                    record.action.args,
+                    json!({"on": "elem_7", "snapshot": "S1"}),
+                    "the snapshot it was read in is bound"
+                );
+                let decided = world.decision(&record, Decision::Approve);
+                world.serve(&mut served, decided).await;
+                assert_eq!(approvals.events().len(), 1);
+                assert_eq!(peekaboo.called(), ["see", "image", "inspect_ui", "click"]);
+                assert!(
+                    peekaboo.snapshots.load(Ordering::SeqCst) >= 2,
+                    "keeper's own read made a newer snapshot"
+                );
+                assert_eq!(
+                    peekaboo.last("click"),
+                    Some(json!({"on": "elem_7", "snapshot": "S1"}))
+                );
+
+                let peekaboo = Peekaboo::showing("Mail", "New Message", "Send");
+                let (url, _server) = serve(peekaboo.clone()).await;
+                let mut world = nixi(
+                    vec![
+                        calls(&[("s1", "mcp__mac__see", json!({}))]),
+                        calls(&[(
+                            "c1",
+                            "mcp__mac__click",
+                            json!({"on": "elem_7", "snapshot": "S9"}),
+                        )]),
+                        prose("Refused."),
+                    ],
+                    mac(&url).await,
+                    &["mac"],
+                );
+                let mut served = open(&world, &Arc::new(Approvals::default()));
+                report(world.ask(&mut served, "send it").await);
+                assert_eq!(peekaboo.called(), ["see"], "nothing sent for S9");
+                assert_eq!(
+                    results(&world).pop().expect("a result").outcome,
+                    ToolOutcomeWord::Refused
+                );
+            }
+
+            /// R316 (05): a read is the session's that made it. Another
+            /// session on the same host, which read nothing, cannot act on
+            /// it: it is refused unsent, and its label never took the
+            /// screen's.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn screen_reads_are_the_sessions_that_made_them() {
+                let peekaboo = Peekaboo::showing("Mail", "New Message", "Send");
+                let (url, _server) = serve(peekaboo.clone()).await;
+                let servers = mac(&url).await;
+                let mut reader = nixi(
+                    vec![calls(&[("s1", "mcp__mac__see", json!({}))]), prose("Seen.")],
+                    Arc::clone(&servers),
+                    &["mac"],
+                );
+                let mut served = open(&reader, &Arc::new(Approvals::default()));
+                report(reader.ask(&mut served, "look").await);
+                let mut other = nixi(
+                    vec![
+                        calls(&[(
+                            "c1",
+                            "mcp__mac__click",
+                            json!({"on": "elem_7", "snapshot": "S1"}),
+                        )]),
+                        prose("Refused."),
+                    ],
+                    servers,
+                    &["mac"],
+                );
+                let mut theirs = open(&other, &Arc::new(Approvals::default()));
+                report(other.ask(&mut theirs, "send it").await);
+                assert_eq!(peekaboo.called(), ["see"], "nothing sent for the other");
+                assert!(other.sent_of(APPROVAL_REQUEST).is_empty());
+                assert_eq!(
+                    results(&other).pop().expect("a result").outcome,
+                    ToolOutcomeWord::Refused
+                );
+            }
+
+            /// R316 (15): a read longer than the model is shown is kept
+            /// whole: an element past the cut is known.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn screen_read_is_kept_whole_past_the_cut() {
+                let peekaboo = Peekaboo::showing("Mail", "New Message", "Send");
+                peekaboo.shown.lock().expect("lock").filler = 4000;
+                let (url, _server) = serve(peekaboo.clone()).await;
+                let mut world = nixi(
+                    read_then_click(vec![prose("Sent.")]),
+                    mac(&url).await,
+                    &["mac"],
+                );
+                let mut served = open(&world, &Arc::new(Approvals::default()));
+                let parked = report(world.ask(&mut served, "send the draft").await);
+                assert_eq!(peekaboo.called(), ["see", "image"]);
+                assert_eq!(parked.ending, TurnEnding::Parked, "elem_7 was read");
+                let whole = peekaboo.read();
+                assert!(
+                    whole
+                        .find("elem_7")
+                        .is_some_and(|at| at > keeper_core::agents::mcp::SHOWN_MAX),
+                    "elem_7 is past what the model is shown"
+                );
+            }
+
+            /// R316 (01, 04): an action with no element is classified by the
+            /// window keeper reads in front itself and pinned by it — its
+            /// application, title and frame from keeper's own list, and the
+            /// hash of that frame — read again before it is consumed: the
+            /// approved chord is pressed once while the window holds, and
+            /// refused unpressed once it moved or another is in front.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn screen_action_with_no_element_is_pinned_by_its_window() {
+                use keeper_core::agents::screen::Rect;
+                let chord = || {
+                    vec![
+                        calls(&[("h1", "mcp__mac__hotkey", json!({"keys": "cmd,return"}))]),
+                        prose("Done."),
+                    ]
+                };
+                let peekaboo = Peekaboo::showing("Mail", "New Message", "Send");
+                let (url, _server) = serve(peekaboo.clone()).await;
+                let approvals = Arc::new(Approvals::default());
+                let mut world = nixi(chord(), mac(&url).await, &["mac"]);
+                let mut served = open(&world, &approvals);
+                let parked = report(world.ask(&mut served, "send it").await);
+                assert_eq!(parked.ending, TurnEnding::Parked);
+                assert_eq!(peekaboo.called(), ["inspect_ui", "list", "image"]);
+                assert_eq!(
+                    peekaboo.calls.lock().expect("lock")[0].1,
+                    json!({"app_target": "frontmost"})
+                );
+                // The server's own words of its tools are outside content, so
+                // a session offered the screen is `untrusted` from its first
+                // turn and a T3 row is asked as T4 (R315).
+                let record = asked_by_tgorka(&world);
+                assert_eq!((record.risk.base_tier, record.risk.tier), (3, 4));
+                assert_eq!(
+                    record.action.summary,
+                    "Press cmd+return on the Mac's screen"
+                );
+                let frame = Rect {
+                    x: 0,
+                    y: 0,
+                    w: 560,
+                    h: 48,
+                };
+                let Some(Pin::Window(pin)) = record.preconditions.screen.as_ref().and_then(Pin::of)
+                else {
+                    panic!("a window pin: {:?}", record.preconditions.screen);
+                };
+                assert_eq!(
+                    (
+                        pin.app.as_str(),
+                        pin.window.as_str(),
+                        pin.frame,
+                        pin.front,
+                        pin.rect
+                    ),
+                    ("Mail", "New Message", frame, true, frame)
+                );
+                let decided = world.decision(&record, Decision::Approve);
+                world.serve(&mut served, decided).await;
+                assert_eq!(approvals.events().len(), 1);
+                assert_eq!(
+                    peekaboo.called(),
+                    [
+                        "inspect_ui",
+                        "list",
+                        "image",
+                        "inspect_ui",
+                        "list",
+                        "image",
+                        "hotkey"
+                    ]
+                );
+
+                for (moved, why) in [
+                    (
+                        Box::new(|shown: &mut Shown| shown.frame.0 = 40) as Box<dyn Fn(&mut Shown)>,
+                        "the window moved",
+                    ),
+                    (
+                        Box::new(|shown: &mut Shown| shown.window = "Inbox"),
+                        "another window is in front",
+                    ),
+                ] {
+                    let peekaboo = Peekaboo::showing("Mail", "New Message", "Send");
+                    let (url, _server) = serve(peekaboo.clone()).await;
+                    let approvals = Arc::new(Approvals::default());
+                    let mut world = nixi(chord(), mac(&url).await, &["mac"]);
+                    let mut served = open(&world, &approvals);
+                    report(world.ask(&mut served, "send it").await);
+                    let record = asked_by_tgorka(&world);
+                    moved(&mut peekaboo.shown.lock().expect("lock"));
+                    let decided = world.decision(&record, Decision::Approve);
+                    world.serve(&mut served, decided).await;
+                    assert!(approvals.events().is_empty(), "{why}: nothing was consumed");
+                    assert!(
+                        !peekaboo.called().contains(&"hotkey".to_owned()),
+                        "{why}: never pressed"
+                    );
+                    let line = world.approval_lines().pop().expect("a line");
+                    assert_eq!(line.state, ApprovalState::Refused, "{why}: {line:?}");
+                }
+            }
+
+            /// R316 (01, 04): a call with no element is tiered by the window
+            /// keeper reads in front itself — a Return while a TCC prompt is
+            /// in front is the prompt's, T4, raised in a screen session to T5
+            /// and refused before anything is taken or pressed — and an app
+            /// or a window the call names that keeper's own list does not
+            /// hold is refused unsent, as is a chord to wait for a person
+            /// while no window in front reads.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn screen_action_is_classified_by_the_window_in_front() {
+                let peekaboo = Peekaboo::showing("UserNotificationCenter", "Notification", "Allow");
+                let (url, _server) = serve(peekaboo.clone()).await;
+                let mut world = nixi(
+                    vec![
+                        calls(&[("h1", "mcp__mac__hotkey", json!({"keys": "return"}))]),
+                        prose("Refused."),
+                    ],
+                    mac(&url).await,
+                    &["mac"],
+                );
+                let mut served = open(&world, &Arc::new(Approvals::default()));
+                let ran = report(world.ask(&mut served, "press return").await);
+                assert_eq!(ran.ending, TurnEnding::Complete);
+                assert_eq!(peekaboo.called(), ["inspect_ui"], "no screenshot, no key");
+                assert!(world.sent_of(APPROVAL_REQUEST).is_empty());
+                assert_eq!(
+                    results(&world).pop().expect("a result").outcome,
+                    ToolOutcomeWord::Refused
+                );
+
+                for (args, called) in [
+                    (
+                        json!({"keys": "a", "app": "Mail", "window_title": "Ghost"}),
+                        &["inspect_ui", "list"][..],
+                    ),
+                    (
+                        json!({"keys": "a", "app": "Ghost"}),
+                        &["inspect_ui", "list"][..],
+                    ),
+                ] {
+                    let peekaboo = Peekaboo::showing("Mail", "New Message", "Send");
+                    let (url, _server) = serve(peekaboo.clone()).await;
+                    let mut world = nixi(
+                        vec![
+                            calls(&[("h1", "mcp__mac__hotkey", args.clone())]),
+                            prose("Refused."),
+                        ],
+                        mac(&url).await,
+                        &["mac"],
+                    );
+                    let mut served = open(&world, &Arc::new(Approvals::default()));
+                    report(world.ask(&mut served, "type a").await);
+                    assert_eq!(peekaboo.called(), called, "never pressed: {args}");
+                    assert_eq!(
+                        results(&world).pop().expect("a result").outcome,
+                        ToolOutcomeWord::Refused
+                    );
+                }
+
+                let peekaboo = Peekaboo::showing("Mail", "", "Send");
+                let (url, _server) = serve(peekaboo.clone()).await;
+                let mut world = nixi(
+                    vec![
+                        calls(&[("h1", "mcp__mac__hotkey", json!({"keys": "cmd,return"}))]),
+                        prose("Refused."),
+                    ],
+                    mac(&url).await,
+                    &["mac"],
+                );
+                let mut served = open(&world, &Arc::new(Approvals::default()));
+                report(world.ask(&mut served, "send it").await);
+                assert_eq!(peekaboo.called(), ["inspect_ui"], "no screenshot, no key");
+                assert!(world.sent_of(APPROVAL_REQUEST).is_empty());
+                assert_eq!(
+                    results(&world).pop().expect("a result").outcome,
+                    ToolOutcomeWord::Refused
+                );
+            }
+
+            /// R316 (04): Peekaboo sends a `hotkey` with `foreground: true`
+            /// to whatever is in front even when it names an app, so keeper
+            /// pins the window in front for it; without it, the window the
+            /// call names.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_global_hotkey_is_pinned_by_the_window_in_front() {
+                for (foreground, front) in [(true, true), (false, false)] {
+                    let peekaboo = Peekaboo::showing("Mail", "New Message", "Send");
+                    let (url, _server) = serve(peekaboo.clone()).await;
+                    let mut world = nixi(
+                        vec![
+                            calls(&[(
+                                "h1",
+                                "mcp__mac__hotkey",
+                                json!({"keys": "cmd,return", "app": "Mail", "foreground": foreground}),
+                            )]),
+                            prose("Done."),
+                        ],
+                        mac(&url).await,
+                        &["mac"],
+                    );
+                    let mut served = open(&world, &Arc::new(Approvals::default()));
+                    let parked = report(world.ask(&mut served, "send it").await);
+                    assert_eq!(parked.ending, TurnEnding::Parked);
+                    let record = world.record();
+                    let Some(Pin::Window(pin)) =
+                        record.preconditions.screen.as_ref().and_then(Pin::of)
+                    else {
+                        panic!("a window pin: {:?}", record.preconditions.screen);
+                    };
+                    assert_eq!(pin.front, front, "foreground: {foreground}");
+                }
+            }
+
+            /// R328 (01): a call is pinned by the window it names, so it
+            /// names one — an application with two windows, or a part of a
+            /// title two windows hold, is refused unsent with nobody asked;
+            /// and a second window that holds what an approved call names,
+            /// appearing after it parked, is drift: nothing is pressed and
+            /// the approval is not consumed.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_call_names_one_window_or_is_refused() {
+                for args in [
+                    json!({"keys": "cmd,return", "app": "Mail"}),
+                    json!({"keys": "cmd,return", "window_title": "s"}),
+                ] {
+                    let peekaboo = Peekaboo::showing("Mail", "New Message", "Send");
+                    peekaboo.shown.lock().expect("lock").behind = Some("Drafts");
+                    let (url, _server) = serve(peekaboo.clone()).await;
+                    let mut world = nixi(
+                        vec![
+                            calls(&[("h1", "mcp__mac__hotkey", args.clone())]),
+                            prose("Refused."),
+                        ],
+                        mac(&url).await,
+                        &["mac"],
+                    );
+                    let mut served = open(&world, &Arc::new(Approvals::default()));
+                    report(world.ask(&mut served, "send it").await);
+                    assert_eq!(peekaboo.called(), ["inspect_ui", "list"], "{args}");
+                    assert!(world.sent_of(APPROVAL_REQUEST).is_empty(), "{args}");
+                    assert_eq!(
+                        results(&world).pop().expect("a result").outcome,
+                        ToolOutcomeWord::Refused,
+                        "{args}"
+                    );
+                }
+
+                let peekaboo = Peekaboo::showing("Mail", "New Message", "Send");
+                let (url, _server) = serve(peekaboo.clone()).await;
+                let approvals = Arc::new(Approvals::default());
+                let mut world = nixi(
+                    vec![
+                        calls(&[(
+                            "h1",
+                            "mcp__mac__hotkey",
+                            json!({"keys": "cmd,return", "app": "Mail", "window_title": "New"}),
+                        )]),
+                        prose("Done."),
+                    ],
+                    mac(&url).await,
+                    &["mac"],
+                );
+                let mut served = open(&world, &approvals);
+                let parked = report(world.ask(&mut served, "send it").await);
+                assert_eq!(parked.ending, TurnEnding::Parked);
+                let record = asked_by_tgorka(&world);
+                let Some(Pin::Window(pin)) = record.preconditions.screen.as_ref().and_then(Pin::of)
+                else {
+                    panic!("a window pin: {:?}", record.preconditions.screen);
+                };
+                assert_eq!((pin.window.as_str(), pin.front), ("New Message", false));
+                peekaboo.shown.lock().expect("lock").behind = Some("New Draft");
+                let decided = world.decision(&record, Decision::Approve);
+                world.serve(&mut served, decided).await;
+                assert!(approvals.events().is_empty(), "nothing was consumed");
+                assert!(
+                    !peekaboo.called().contains(&"hotkey".to_owned()),
+                    "never pressed"
+                );
+                let line = world.approval_lines().pop().expect("a line");
+                assert_eq!(line.state, ApprovalState::Refused, "{line:?}");
+            }
+
+            /// The app a call names is the model's word: keeper sends it to
+            /// the screen server to list its windows only where the session
+            /// may send to that server, and refuses the call unsent where it
+            /// may not.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn screen_names_no_app_to_a_server_the_session_may_not_reach() {
+                let peekaboo = Peekaboo::showing("Mail", "New Message", "Send");
+                let (url, _server) = serve(peekaboo.clone()).await;
+                let mut world = nixi_read_by(
+                    &[TGORKA],
+                    vec![
+                        calls(&[(
+                            "h1",
+                            "mcp__mac__hotkey",
+                            json!({"keys": "a", "app": "Mail"}),
+                        )]),
+                        prose("Refused."),
+                    ],
+                    mac(&url).await,
+                    &["mac"],
+                );
+                let mut served = open(&world, &Arc::new(Approvals::default()));
+                report(world.ask(&mut served, "type a").await);
+                assert_eq!(peekaboo.called(), ["inspect_ui"], "no list naming Mail");
+                assert_eq!(
+                    results(&world).pop().expect("a result").outcome,
+                    ToolOutcomeWord::Refused
+                );
+            }
+
+            /// R316 (10): keeper's own screenshot is read by the screen
+            /// server's readers. A session that never read the screen, and
+            /// whose turn was armed before the server listed any tool — so
+            /// nothing the server wrote joined its label — parks an action
+            /// on the screen once the server lists its tools mid-turn: the
+            /// session takes the server's readers into its label at the
+            /// park, before the card carries the screenshot, so only they
+            /// are asked.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn screen_preview_reaches_only_the_servers_readers() {
+                let peekaboo = Peekaboo::showing("Mail", "New Message", "Send");
+                peekaboo.unlisted.store(true, Ordering::SeqCst);
+                let (url, _server) = serve(peekaboo.clone()).await;
+                let servers = mac_read_by(&url, &[TGORKA]).await;
+                let mut hotkey = vec![json!({"hold_ms": 3000})];
+                hotkey.extend(calls(&[(
+                    "h1",
+                    "mcp__mac__hotkey",
+                    json!({"keys": "cmd,return"}),
+                )]));
+                let mut world = nixi(vec![hotkey, prose("Done.")], Arc::clone(&servers), &["mac"]);
+                let mut served = open(&world, &Arc::new(Approvals::default()));
+                let requests = Arc::clone(&world.stub.requests);
+                // The server lists its tools after the turn was armed, while
+                // the model's answer is still on its way.
+                let listed = async {
+                    while requests.lock().expect("lock").is_empty() {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    peekaboo.unlisted.store(false, Ordering::SeqCst);
+                    servers.refresh().await;
+                };
+                let (outcome, ()) = tokio::join!(world.ask(&mut served, "send it"), listed);
+                let offered = world.stub.requests()[0]["tools"].to_string();
+                assert!(!offered.contains("mcp__mac__"), "armed with no screen tool");
+                let parked = report(outcome);
+                assert_eq!(parked.ending, TurnEnding::Parked);
+                assert_eq!(
+                    served.context.label.readers,
+                    Readers::Only([user(TGORKA)].into())
+                );
+            }
+        }
     }
 }
 

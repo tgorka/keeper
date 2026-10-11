@@ -260,6 +260,7 @@ pub(crate) fn request_content(
             exec_binding: record.action.exec_binding.clone(),
         },
         file_sha256: file.as_ref().and(record.action.args_blob.clone()),
+        preview: None,
         file,
         checkpoint_sha256: record.checkpoint.sha256.clone(),
         preconditions: record.preconditions.clone(),
@@ -292,6 +293,17 @@ pub(crate) struct Parking {
     /// A networked `run`'s workspace set, its `preconditions.workspace`
     /// (S-03).
     pub workspace: Option<Value>,
+    /// A screen action's preview, `{sha256, ext}`: the screenshot it is
+    /// decided on, kept under the zone's `.keeper/previews/` (S-18), its
+    /// `preconditions.preview`.
+    pub preview: Option<Value>,
+    /// A screen action's `preconditions.screen`: its element, region or
+    /// window pin (AD-394).
+    pub screen: Option<Value>,
+    /// The call's arguments as keeper sends and binds them, when they are
+    /// not the model's: a screen element's call with the snapshot its
+    /// element was read in (R316).
+    pub args: Option<Value>,
 }
 
 /// A parked turn, handed from the tool loop to the worker.
@@ -917,6 +929,35 @@ impl ServedSession {
         self.announce(deps, port, &record, parked.call_line).await
     }
 
+    /// The screenshot `record` was decided on, as its request's encrypted
+    /// attachment (S-18): `{sha256, mimetype, file}`, `file` what the room's
+    /// upload made of the bytes kept under the zone's `.keeper/previews/`.
+    /// `None` when the record has none, or this host does not hold it — a
+    /// host that took the record over re-checks against a fresh screenshot
+    /// and needs none — or it could not be uploaded.
+    async fn preview_attachment(
+        room: Option<Arc<dyn ApprovalRoom>>,
+        zone: PathBuf,
+        record: &ApprovalRecord,
+    ) -> Option<Value> {
+        let preview = record.preconditions.preview.as_ref()?;
+        let (sha256, ext) = (preview["sha256"].as_str()?, preview["ext"].as_str()?);
+        let room = room?;
+        let bytes =
+            crate::agent::off_the_runtime(|| crate::previews::read(&zone, sha256, ext)).ok()?;
+        match room.upload(bytes).await {
+            Ok(file) => Some(serde_json::json!({
+                "sha256": sha256,
+                "mimetype": format!("image/{ext}"),
+                "file": file,
+            })),
+            Err(error) => {
+                tracing::warn!(%error, approval = %record.id, "agents: an approval's preview could not be uploaded; its request goes without it");
+                None
+            }
+        }
+    }
+
     /// A scheduled run's card says `run: blocked` before its park pins
     /// anything for good (R178): the host's own write is no drift. A pin of
     /// the card is taken again only when that write explains its change
@@ -1025,7 +1066,14 @@ impl ServedSession {
             Readers::Only(set) => set.iter().map(|user| user.to_string()).collect(),
             Readers::Anyone => Vec::new(),
         };
-        let content = request_content(record, self.context.agent.room.as_ref(), approvers, file);
+        let mut content =
+            request_content(record, self.context.agent.room.as_ref(), approvers, file);
+        content.preview = Self::preview_attachment(
+            self.approval_room.clone(),
+            deps.sessions_zone.clone(),
+            record,
+        )
+        .await;
         let value = serde_json::to_value(&content).map_err(failed)?;
         let gate = self.gate(deps, port);
         // A declassification is decided in its approvers' proxy DMs, never
@@ -1697,8 +1745,9 @@ impl ServedSession {
             Ok((record, args)) => match self.preconditions(deps, pending, &record, &args, decision)
             {
                 Err(drifted) => Err(drifted),
-                // The MCP server is asked again now, before `consumed`.
-                Ok(()) => match mcp_moved(deps, &record).await {
+                // What the call reaches outside keeper is read again now,
+                // before `consumed` (R144).
+                Ok(()) => match outside_moved(deps, &record).await {
                     Some(reason) => Err((reason, ApprovalState::Refused)),
                     None => {
                         let run = approved_run(&record);
@@ -2335,7 +2384,9 @@ async fn mcp_moved(deps: &AgentDeps, record: &ApprovalRecord) -> Option<String> 
         (Ok(_), None) => moved("this host no longer names its MCP server"),
         (Ok(mut now), Some(readers)) => {
             keeper_core::agents::paseo::bind_audience(&mut now, &readers);
-            if &now != bound {
+            // A screen action's target is not the server's: it is read
+            // again after this, from the screen ([`screen_moved`]).
+            if now != keeper_core::agents::screen::without_target(bound) {
                 return moved(
                     "which MCP server it reaches, who it reaches through it, or what the server says the tool takes or is, changed after it was approved",
                 );
@@ -2343,6 +2394,107 @@ async fn mcp_moved(deps: &AgentDeps, record: &ApprovalRecord) -> Option<String> 
             None
         }
     }
+}
+
+/// What a record's call reaches outside keeper, read again before its
+/// approval is consumed: its MCP server (R144), then the screen it acts on.
+/// The first that moved, and how.
+async fn outside_moved(deps: &AgentDeps, record: &ApprovalRecord) -> Option<String> {
+    if let Some(moved) = mcp_moved(deps, record).await {
+        return Some(moved);
+    }
+    screen_moved(deps, record).await
+}
+
+/// What a screen action's record was pinned by, read from the screen again
+/// before its approval is consumed (96.4 #6, AD-394, R316): its element —
+/// the window read again by Peekaboo, the element there with the same role,
+/// title, identifier and frame; its square, whose difference hash of a
+/// screenshot taken now is within the bound; or its window — still in
+/// front when it was, its application's list naming exactly one window of
+/// its title at its frame, the call's arguments still naming that window
+/// alone when it was the one they named (R328), and its frame's hash
+/// within the bound. Anything else, a record that pins nothing included, is
+/// drift: refused, with no `consumed` sent.
+async fn screen_moved(deps: &AgentDeps, record: &ApprovalRecord) -> Option<String> {
+    use keeper_core::agents::screen::{self, Pin};
+    if record.action.tool != AgentTool::Mcp.as_wire()
+        || record.action.exec_binding["role"] != "screen"
+    {
+        return None;
+    }
+    let moved = |what: &str| {
+        tracing::warn!(approval = %record.id, "agents: what a screen action acts on changed after its approval");
+        Some(what.to_owned())
+    };
+    let Some(pin) = record.preconditions.screen.as_ref().and_then(Pin::of) else {
+        return moved("its record pins nothing of the screen");
+    };
+    let (Some((server, tool)), Some(servers)) = (
+        keeper_core::agents::mcp::bound_tool(&record.action.exec_binding),
+        deps.mcp.as_ref(),
+    ) else {
+        return moved("this host no longer names its screen server");
+    };
+    match pin {
+        Pin::Element(pin) => match servers.inspect(server, &pin).await {
+            Err(reason) => moved(&reason),
+            Ok(fresh) if screen::element_holds(&pin, &fresh) => None,
+            Ok(_) => {
+                moved("the element it acts on moved, changed or is gone since it was approved")
+            }
+        },
+        Pin::Region(pin) => match grey_now(servers, server).await {
+            Err(reason) => moved(&reason),
+            Ok(grey) if screen::region_holds(&pin, &grey.pixels, grey.width, grey.height) => None,
+            Ok(_) => moved("what the screen shows where it acts changed since it was approved"),
+        },
+        Pin::Window(pin) => {
+            let front = if pin.front {
+                match servers.front(server).await {
+                    Ok(front) => Some(front),
+                    Err(reason) => return moved(&reason),
+                }
+            } else {
+                None
+            };
+            let windows = match servers.windows(server, &pin.app).await {
+                Ok(windows) => windows,
+                Err(reason) => return moved(&reason),
+            };
+            if !screen::named_holds(&pin, tool, &record.action.args, &windows) {
+                return moved(
+                    "another window now holds what it names, so it may not act on the one approved",
+                );
+            }
+            match grey_now(servers, server).await {
+                Err(reason) => moved(&reason),
+                Ok(grey)
+                    if screen::window_holds(
+                        &pin,
+                        front.as_ref(),
+                        &windows,
+                        &grey.pixels,
+                        grey.width,
+                        grey.height,
+                    ) =>
+                {
+                    None
+                }
+                Ok(_) => moved(
+                    "the window it acts on moved, changed or is no longer the one in front since it was approved",
+                ),
+            }
+        }
+    }
+}
+
+/// A screenshot `servers`' screen server `server` takes now, made grey.
+async fn grey_now(
+    servers: &crate::mcp::McpServers,
+    server: &str,
+) -> Result<crate::previews::Grey, String> {
+    crate::previews::grey(&servers.screenshot(server).await?)
 }
 
 /// What the model is told of an approval consumed on `host` whose call has

@@ -49,6 +49,9 @@ pub const UNVERIFIED: &str = "This device cannot decide: it is not verified. Ver
 pub const NOT_AN_APPROVER: &str = "You are not one of the people who can decide this.";
 /// A T4 card on the device of the app that runs the asking agent (S-22).
 pub const THIS_DEVICE: &str = "Decide on another device: this app runs the agent that asks, so it cannot be the one that agrees.";
+/// A T4 screen action's card on the Mac whose screen it acts on (96.4 #7,
+/// S-22).
+pub const THIS_MAC: &str = "Decide this on another device: this Mac is the one it acts on.";
 /// A T4 card naming nobody who asked.
 pub const NO_REQUESTER: &str = "Nobody can decide this: it names nobody who asked.";
 /// A record whose digest is not over what the card shows (R185).
@@ -586,7 +589,10 @@ pub fn refusal(
         return Some((UNVERIFIED.to_owned(), true));
     }
     if request.tier >= 4 && viewer.hosts(&request.room) {
-        return Some((THIS_DEVICE.to_owned(), false));
+        let screen = request.action.tool == AgentTool::Mcp.as_wire()
+            && request.action.exec_binding["role"] == "screen";
+        let said = if screen { THIS_MAC } else { THIS_DEVICE };
+        return Some((said.to_owned(), false));
     }
     None
 }
@@ -1702,6 +1708,19 @@ mod tests {
         assert_eq!(t4.cannot_decide.as_deref(), Some(THIS_DEVICE));
         assert!(!t4.can_decide && !t4.verify);
         assert!(card(request("01C", 3, &["once"]), &hosting(ROOM)).can_decide);
+        // A T4 screen action on the Mac whose screen it acts on (96.4 #7).
+        let mut screen = request("01F", 4, &["once"]);
+        screen["action"]["tool"] = json!("mcp");
+        screen["action"]["exec_binding"] =
+            json!({"server": "mac", "role": "screen", "tool": "click"});
+        let screen = sealed(screen, &write_args());
+        let on_mac = card(screen.clone(), &hosting(ROOM));
+        assert_eq!(on_mac.cannot_decide.as_deref(), Some(THIS_MAC));
+        assert!(!on_mac.can_decide);
+        assert!(
+            card(screen, &viewer(TGORKA)).can_decide,
+            "the phone decides it"
+        );
         // This app hosts the proxy DM the card is shown in, not the
         // session that asks: it decides.
         assert!(card(request("01D", 4, &["once"]), &hosting(DM)).can_decide);

@@ -361,12 +361,13 @@ pub struct Hints {
 
 /// The role's own table (R24(2)): `None` is a tool the role does not have,
 /// never offered. Paseo's broker has exactly four verbs (AD-407); the
-/// screen's and a KVM's tables are their stories' (96.4, 96.5), and until
-/// they are built no tool of theirs is offered.
+/// Mac's screen has Peekaboo's table (96.4); a KVM's table is its story's
+/// (96.5), and until it is built no tool of a KVM's is offered.
 fn role_row(role: &McpRole, tool: &str) -> Option<Tier> {
     match role {
         McpRole::Paseo => crate::agents::paseo::row(tool),
-        McpRole::Screen | McpRole::Kvm(_) => None,
+        McpRole::Screen => crate::agents::screen::row(tool),
+        McpRole::Kvm(_) => None,
     }
 }
 
@@ -375,10 +376,12 @@ fn role_row(role: &McpRole, tool: &str) -> Option<Tier> {
 /// `[[mcp.tier]]` row; else, only when the person set `trust_annotations`,
 /// `readOnlyHint` without `destructiveHint` or `openWorldHint` → T0 and any
 /// other hint → T3; else T3. A server keeper starts as a child runs with
-/// the host's rights, so its tools are never below T2. (R150 lifts that
-/// floor for the Mac's screen server, whose table is authoritative; it
-/// lands with that table, 96.4 — until then no screen tool has a row.)
-/// `Err` is why the tool is not offered.
+/// the host's rights, so its tools are never below T2 — but the Mac's
+/// screen server, whose table is authoritative: the floor's reason holds of
+/// a Peekaboo reached by URL as much as of one keeper starts (R150). Its
+/// row is the least a call of the tool is; what the call targets may raise
+/// it ([`crate::agents::screen::tier`]). `Err` is why the tool is not
+/// offered.
 pub fn tier(entry: &McpEntry, tool: &str, hints: Option<Hints>) -> Result<Tier, String> {
     let tier = match &entry.role {
         Some(role) => role_row(role, tool).ok_or_else(|| match role {
@@ -387,7 +390,8 @@ pub fn tier(entry: &McpEntry, tool: &str, hints: Option<Hints>) -> Result<Tier, 
                 entry.name,
                 crate::agents::paseo::FOUR_VERBS
             ),
-            McpRole::Screen | McpRole::Kvm(_) => format!(
+            McpRole::Screen => crate::agents::screen::never_offered(tool),
+            McpRole::Kvm(_) => format!(
                 "`{}` is a role server, and its role has no tool `{tool}`",
                 entry.name
             ),
@@ -406,7 +410,8 @@ pub fn tier(entry: &McpEntry, tool: &str, hints: Option<Hints>) -> Result<Tier, 
             },
         },
     };
-    let floored = matches!(entry.transport, McpTransport::Command(_));
+    let floored =
+        matches!(entry.transport, McpTransport::Command(_)) && entry.role != Some(McpRole::Screen);
     Ok(if floored { tier.max(Tier::T2) } else { tier })
 }
 
@@ -570,12 +575,16 @@ pub fn role_spec(role: &McpRole, tool: &str) -> Option<(&'static str, Value)> {
 /// and the names of its arguments, from what keeper bound — never a value,
 /// which the payload shows, nor the tool's description or the model's
 /// words. A Paseo broker's call says what it starts or steers and, for a
-/// mutation, who the prompt goes to as the binding holds it (96.3 #2).
+/// mutation, who the prompt goes to as the binding holds it (96.3 #2); a
+/// screen action says what it acts on as keeper read it (96.4 #8).
 pub fn summary(args: &Value, exec_binding: &Value) -> String {
     let shown = crate::agents::run::shown;
     let Some((server, tool)) = bound_tool(exec_binding) else {
         return "Call a tool of an MCP server".to_owned();
     };
+    if exec_binding["role"] == "screen" {
+        return crate::agents::screen::summary(tool, args, exec_binding);
+    }
     if exec_binding["role"] == "paseo" {
         if let Some(summary) =
             crate::agents::paseo::summary(tool, args, exec_binding.get("readers"))
@@ -940,15 +949,18 @@ mod tests {
             ..entry(url())
         };
         assert!(tier(&kvm, "snapshot", Some(read_only)).is_err());
-        // The Mac's screen server: no tool of it is offered before 96.4's
-        // table.
+        // The Mac's screen server keeper starts as a program: Peekaboo's
+        // table as it is, no T2 floor (R150, 96.4 #2), and the tools it
+        // never offers are not offered.
         let screen = McpEntry {
             role: Some(McpRole::Screen),
             ..entry(McpTransport::Command(vec![
                 "/opt/homebrew/bin/peekaboo".to_owned()
             ]))
         };
-        assert!(tier(&screen, "see", None).is_err());
+        assert_eq!(tier(&screen, "see", None), Ok(Tier::T0));
+        assert_eq!(tier(&screen, "click", Some(read_only)), Ok(Tier::T1));
+        assert!(tier(&screen, "agent", None).is_err());
         let paseo_child = McpEntry {
             transport: McpTransport::Command(vec!["/bin/paseo".to_owned()]),
             ..paseo

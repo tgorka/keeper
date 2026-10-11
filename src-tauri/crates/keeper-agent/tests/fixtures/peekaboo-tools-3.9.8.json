@@ -1,0 +1,1442 @@
+{
+  "protocolVersion": "2025-06-18",
+  "server": {
+    "name": "peekaboo-mcp",
+    "version": "3.9.8"
+  },
+  "tools": [
+    {
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "dry_run": {
+            "default": false,
+            "description": "Dry run - show planned steps without executing",
+            "type": "boolean"
+          },
+          "listSessions": {
+            "default": false,
+            "description": "List available sessions",
+            "type": "boolean"
+          },
+          "max_steps": {
+            "description": "Maximum model/tool-loop turns before failing (1-100, default 20)",
+            "type": "integer"
+          },
+          "model": {
+            "description": "OpenAI model to use (e.g., gpt-5.5, gpt-5-mini).\nCall `list_models` first to see available presets and descriptions.\nChoose 'FastChat' for quick responses, 'DeepAnalysis' for complex reasoning, etc.\nIf omitted, the tool auto-selects the first mode-compatible preset.",
+            "type": "string"
+          },
+          "noCache": {
+            "default": false,
+            "description": "Disable session caching (always create new session)",
+            "type": "boolean"
+          },
+          "quiet": {
+            "default": false,
+            "description": "Quiet mode - only show final result",
+            "type": "boolean"
+          },
+          "resume": {
+            "default": false,
+            "description": "Resume the most recent session",
+            "type": "boolean"
+          },
+          "resumeSession": {
+            "description": "Resume a specific session by ID",
+            "type": "string"
+          },
+          "task": {
+            "description": "Task to perform in natural language (omit when only listing sessions)",
+            "type": "string"
+          },
+          "verbose": {
+            "default": false,
+            "description": "Enable verbose output with full JSON debug information",
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
+      "name": "agent"
+    },
+    {
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "image_path": {
+            "description": "Required. Absolute path to image file (.png, .jpg, .webp) to be analyzed.",
+            "type": "string"
+          },
+          "provider_config": {
+            "additionalProperties": false,
+            "description": "Optional provider/model. Validated against server defaults.",
+            "properties": {
+              "model": {
+                "description": "Optional. Model name. If omitted, uses server defaults.",
+                "type": "string"
+              },
+              "type": {
+                "default": "auto",
+                "description": "AI provider, default: auto. 'auto' uses server's",
+                "enum": ["auto", "ollama", "openai", "anthropic", "grok"],
+                "type": "string"
+              }
+            },
+            "type": "object"
+          },
+          "question": {
+            "description": "Required. Question for the AI about the image.",
+            "type": "string"
+          }
+        },
+        "required": ["question"],
+        "type": "object"
+      },
+      "name": "analyze"
+    },
+    {
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "description": "Action to perform",
+            "enum": ["launch", "quit", "relaunch", "focus", "hide", "unhide", "switch", "list"],
+            "type": "string"
+          },
+          "all": {
+            "default": false,
+            "description": "Quit all applications",
+            "type": "boolean"
+          },
+          "bundleId": {
+            "description": "Bundle identifier when launching",
+            "type": "string"
+          },
+          "cycle": {
+            "default": false,
+            "description": "Cycle to the next application (like Cmd+Tab)",
+            "type": "boolean"
+          },
+          "except": {
+            "description": "Comma-separated list of apps to exclude when quitting all",
+            "type": "string"
+          },
+          "force": {
+            "default": false,
+            "description": "Force quit application",
+            "type": "boolean"
+          },
+          "name": {
+            "description": "App name/bundle ID/PID (e.g., 'Safari', 'com.apple.Safari', 'PID:663')",
+            "type": "string"
+          },
+          "to": {
+            "description": "Target application when switching",
+            "type": "string"
+          },
+          "wait": {
+            "default": 2,
+            "description": "Wait time (seconds) between quit/launch for relaunch",
+            "type": "number"
+          },
+          "waitUntilReady": {
+            "default": false,
+            "description": "Wait until the launched app is ready",
+            "type": "boolean"
+          }
+        },
+        "required": ["action"],
+        "type": "object"
+      },
+      "name": "app"
+    },
+    {
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "description": "Browser action to perform. Use `status` before connecting. Use `connect` after the user\nenables remote debugging and accepts Chrome's prompt.",
+            "enum": [
+              "status",
+              "connect",
+              "disconnect",
+              "list_pages",
+              "select_page",
+              "close_page",
+              "new_page",
+              "navigate",
+              "wait_for",
+              "snapshot",
+              "click",
+              "fill",
+              "fill_form",
+              "drag",
+              "hover",
+              "type",
+              "press_key",
+              "upload_file",
+              "handle_dialog",
+              "console",
+              "network",
+              "screenshot",
+              "performance_trace",
+              "call"
+            ],
+            "type": "string"
+          },
+          "auto_stop": {
+            "default": true,
+            "description": "Auto-stop trace after capture.",
+            "type": "boolean"
+          },
+          "background": {
+            "default": false,
+            "description": "Open new page in the background.",
+            "type": "boolean"
+          },
+          "bring_to_front": {
+            "default": true,
+            "description": "Bring selected page to front.",
+            "type": "boolean"
+          },
+          "channel": {
+            "description": "Chrome channel for auto-connect. Defaults to the running Chrome channel, then stable.",
+            "enum": ["stable", "beta", "dev", "canary"],
+            "type": "string"
+          },
+          "dialog_action": {
+            "description": "Browser dialog action.",
+            "enum": ["accept", "dismiss"],
+            "type": "string"
+          },
+          "double": {
+            "default": false,
+            "description": "Double-click for click.",
+            "type": "boolean"
+          },
+          "format": {
+            "description": "Screenshot format.",
+            "enum": ["png", "jpeg", "webp"],
+            "type": "string"
+          },
+          "full_page": {
+            "default": false,
+            "description": "Capture a full-page screenshot.",
+            "type": "boolean"
+          },
+          "include_preserved": {
+            "default": false,
+            "description": "Include preserved console/network data from recent navigations.",
+            "type": "boolean"
+          },
+          "include_snapshot": {
+            "default": false,
+            "description": "Ask Chrome DevTools MCP to include a fresh snapshot when supported.",
+            "type": "boolean"
+          },
+          "insight_name": {
+            "description": "Insight name from trace summary.",
+            "type": "string"
+          },
+          "insight_set_id": {
+            "description": "Insight set id from trace summary.",
+            "type": "string"
+          },
+          "key": {
+            "description": "Key or key combination for press_key.",
+            "type": "string"
+          },
+          "mcp_args_json": {
+            "description": "Advanced: JSON object args for raw MCP call.",
+            "type": "string"
+          },
+          "mcp_tool": {
+            "description": "Advanced: raw Chrome DevTools MCP tool name for call.",
+            "type": "string"
+          },
+          "message_id": {
+            "description": "Console message ID for get_console_message.",
+            "type": "number"
+          },
+          "navigation_type": {
+            "description": "Navigation type for navigate.",
+            "enum": ["url", "back", "forward", "reload"],
+            "type": "string"
+          },
+          "page_id": {
+            "description": "Chrome DevTools page ID for select_page/close_page.",
+            "type": "number"
+          },
+          "page_index": {
+            "description": "Zero-based page index for console/network listings.",
+            "type": "number"
+          },
+          "page_size": {
+            "description": "Pagination size for console/network listings.",
+            "type": "number"
+          },
+          "path": {
+            "description": "File path for snapshots, screenshots, or trace output.",
+            "type": "string"
+          },
+          "quality": {
+            "description": "Screenshot quality for jpeg/webp.",
+            "type": "number"
+          },
+          "reload": {
+            "default": true,
+            "description": "Reload page when starting a trace.",
+            "type": "boolean"
+          },
+          "request_file_path": {
+            "description": "Path for saving a network request body.",
+            "type": "string"
+          },
+          "request_id": {
+            "description": "Network request ID for get_network_request.",
+            "type": "number"
+          },
+          "resource_types": {
+            "description": "Network resource types to include.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "uniqueItems": false
+          },
+          "response_file_path": {
+            "description": "Path for saving a network response body.",
+            "type": "string"
+          },
+          "submit_key": {
+            "description": "Optional key pressed after type_text.",
+            "type": "string"
+          },
+          "text": {
+            "description": "Text for type or wait_for.",
+            "type": "string"
+          },
+          "timeout": {
+            "description": "Timeout in milliseconds for navigation/waits.",
+            "type": "number"
+          },
+          "to_uid": {
+            "description": "Drop target uid for drag.",
+            "type": "string"
+          },
+          "trace_action": {
+            "description": "Performance trace operation.",
+            "enum": ["start", "stop", "analyze"],
+            "type": "string"
+          },
+          "types": {
+            "description": "Console message types to include.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "uniqueItems": false
+          },
+          "uid": {
+            "description": "Element uid from the latest browser snapshot.",
+            "type": "string"
+          },
+          "url": {
+            "description": "URL for navigate/new_page.",
+            "type": "string"
+          },
+          "value": {
+            "description": "Value for fill.",
+            "type": "string"
+          }
+        },
+        "required": ["action"],
+        "type": "object"
+      },
+      "name": "browser"
+    },
+    {
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "active_fps": {
+            "description": "Active FPS (default 8, max 15)",
+            "type": "number"
+          },
+          "app": {
+            "description": "Optional app/bundle/PID target for window mode",
+            "type": "string"
+          },
+          "autoclean_minutes": {
+            "description": "Minutes to keep temp outputs (default 120)",
+            "type": "number"
+          },
+          "capture_focus": {
+            "description": "auto|background|foreground",
+            "enum": ["auto", "background", "foreground"],
+            "type": "string"
+          },
+          "diff_budget_ms": {
+            "description": "Diff time budget ms before falling back to fast (default 30 for quality)",
+            "type": "number"
+          },
+          "diff_strategy": {
+            "default": "fast",
+            "description": "fast|quality (default fast)",
+            "enum": ["fast", "quality"],
+            "type": "string"
+          },
+          "duration_seconds": {
+            "description": "Duration seconds (default 60, max 180)",
+            "type": "number"
+          },
+          "end_ms": {
+            "description": "Trim end in ms",
+            "type": "number"
+          },
+          "every_ms": {
+            "description": "Sample every N ms. Exclusive with sample_fps.",
+            "type": "number"
+          },
+          "heartbeat_sec": {
+            "description": "Heartbeat interval seconds (default 5, 0 disables)",
+            "type": "number"
+          },
+          "highlight_changes": {
+            "description": "Overlay motion boxes on frames",
+            "type": "boolean"
+          },
+          "idle_fps": {
+            "description": "Idle FPS (default 2, min 0.1, max 5)",
+            "type": "number"
+          },
+          "input": {
+            "description": "Video file path (required for source=video)",
+            "type": "string"
+          },
+          "max_frames": {
+            "description": "Soft frame cap (default 800)",
+            "type": "number"
+          },
+          "max_mb": {
+            "description": "Soft size cap MB (optional)",
+            "type": "number"
+          },
+          "mode": {
+            "description": "screen|window|frontmost|area (region alias)",
+            "enum": ["screen", "window", "frontmost", "area", "region"],
+            "type": "string"
+          },
+          "no_diff": {
+            "description": "Keep all sampled frames (disable diff filtering)",
+            "type": "boolean"
+          },
+          "output_dir": {
+            "description": "Optional absolute directory for outputs",
+            "type": "string"
+          },
+          "pid": {
+            "description": "Optional process ID target for window mode",
+            "type": "number"
+          },
+          "quiet_ms": {
+            "description": "Calm period before returning to idle (default 1000)",
+            "type": "number"
+          },
+          "region": {
+            "description": "x,y,width,height for area mode",
+            "type": "string"
+          },
+          "resolution_cap": {
+            "description": "Cap longest side px (default 1440)",
+            "type": "number"
+          },
+          "sample_fps": {
+            "description": "Sample FPS (default 2). Exclusive with every_ms.",
+            "type": "number"
+          },
+          "screen_index": {
+            "description": "Optional screen index",
+            "type": "number"
+          },
+          "source": {
+            "default": "live",
+            "description": "live|video (default live)",
+            "enum": ["live", "video"],
+            "type": "string"
+          },
+          "start_ms": {
+            "description": "Trim start in ms",
+            "type": "number"
+          },
+          "threshold_percent": {
+            "description": "Change threshold percent (default 2.5)",
+            "type": "number"
+          },
+          "video_out": {
+            "description": "Optional MP4 output path",
+            "type": "string"
+          },
+          "window_index": {
+            "description": "Optional window index; requires app or pid",
+            "type": "number"
+          },
+          "window_title": {
+            "description": "Optional window title filter",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "name": "capture"
+    },
+    {
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "background": {
+            "default": true,
+            "description": "Optional legacy alias. Defaults to true; set foreground=true for foreground clicks.",
+            "type": "boolean"
+          },
+          "coords": {
+            "description": "Optional. Click at specific coordinates in format 'x,y' (e.g., '100,200').",
+            "type": "string"
+          },
+          "double": {
+            "default": false,
+            "description": "Optional. Double-click instead of single click.",
+            "type": "boolean"
+          },
+          "foreground": {
+            "default": false,
+            "description": "Optional. Use foreground/global click delivery. Background delivery is the default.",
+            "type": "boolean"
+          },
+          "on": {
+            "description": "Optional. Opaque element ID copied exactly from current `see` or `inspect_ui` output.",
+            "type": "string"
+          },
+          "pid": {
+            "description": "Optional. Target process ID for background coordinate clicks.",
+            "type": "number"
+          },
+          "query": {
+            "description": "Optional. Element text or query to click. Will search for matching elements.",
+            "type": "string"
+          },
+          "right": {
+            "default": false,
+            "description": "Optional. Right-click (secondary click) instead of left-click.",
+            "type": "boolean"
+          },
+          "snapshot": {
+            "description": "Optional. Snapshot ID from `see` or `inspect_ui`. Uses latest snapshot if not specified.",
+            "type": "string"
+          },
+          "wait_for": {
+            "default": 5000,
+            "description": "Optional. Maximum milliseconds to wait for element to become actionable. Default: 5000.",
+            "type": "number"
+          }
+        },
+        "type": "object"
+      },
+      "name": "click"
+    },
+    {
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "description": "Action to perform",
+            "enum": ["get", "set", "clear", "save", "restore", "load"],
+            "type": "string"
+          },
+          "allowLarge": {
+            "description": "Allow writes larger than the 10 MB guard",
+            "type": "boolean"
+          },
+          "alsoText": {
+            "description": "Optional plain text companion when setting binary data",
+            "type": "string"
+          },
+          "dataBase64": {
+            "description": "Base64-encoded data to copy",
+            "type": "string"
+          },
+          "filePath": {
+            "description": "Path to a file to copy (binary or text)",
+            "type": "string"
+          },
+          "imagePath": {
+            "description": "Path to an image file to copy",
+            "type": "string"
+          },
+          "outputPath": {
+            "description": "When reading, path to write binary data. Use '-' for stdout.",
+            "type": "string"
+          },
+          "prefer": {
+            "description": "Preferred UTI when reading clipboard",
+            "type": "string"
+          },
+          "slot": {
+            "description": "Save/restore slot name (default: \"0\")",
+            "type": "string"
+          },
+          "text": {
+            "description": "Plain text to set on the clipboard",
+            "type": "string"
+          },
+          "uti": {
+            "description": "Uniform Type Identifier for dataBase64 or to force type",
+            "type": "string"
+          }
+        },
+        "required": ["action"],
+        "type": "object"
+      },
+      "name": "clipboard"
+    },
+    {
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "description": "Action to perform",
+            "enum": ["list", "click", "input", "file", "dismiss"],
+            "type": "string"
+          },
+          "app": {
+            "description": "Target app name/bundle ID, or 'PID:<n>'.",
+            "type": "string"
+          },
+          "button": {
+            "description": "Button text to click. Use 'default' to click OKButton.",
+            "type": "string"
+          },
+          "clear": {
+            "default": false,
+            "description": "Clear existing text first.",
+            "type": "boolean"
+          },
+          "ensure_expanded": {
+            "default": false,
+            "description": "Ensure file dialogs are expanded (Show Details) before applying path navigation.",
+            "type": "boolean"
+          },
+          "field": {
+            "description": "Field label/placeholder to target (for input action).",
+            "type": "string"
+          },
+          "field_index": {
+            "description": "Field index (0-based) to target (for input action).",
+            "type": "number"
+          },
+          "force": {
+            "default": false,
+            "description": "Force dismiss (sends Escape).",
+            "type": "boolean"
+          },
+          "name": {
+            "description": "Filename to enter (for save dialogs).",
+            "type": "string"
+          },
+          "path": {
+            "description": "Directory (or full path) to navigate to (for file action).",
+            "type": "string"
+          },
+          "pid": {
+            "description": "Target process ID (alternative to app).",
+            "type": "number"
+          },
+          "select": {
+            "description": "Button to click after setting path/name. Omit (or pass 'default') to click OKButton.",
+            "type": "string"
+          },
+          "text": {
+            "description": "Text to input (for input action).",
+            "type": "string"
+          },
+          "window_id": {
+            "description": "Window ID (preferred stable selector).",
+            "type": "number"
+          },
+          "window_index": {
+            "description": "Window index (0-based); requires app/pid.",
+            "type": "number"
+          },
+          "window_title": {
+            "description": "Window title (substring match).",
+            "type": "string"
+          }
+        },
+        "required": ["action"],
+        "type": "object"
+      },
+      "name": "dialog"
+    },
+    {
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "description": "Action to perform on the dock",
+            "enum": ["launch", "right-click", "hide", "show", "list"],
+            "type": "string"
+          },
+          "app": {
+            "description": "Application name for launch/right-click actions",
+            "type": "string"
+          },
+          "include_all": {
+            "default": false,
+            "description": "Include all items when listing (default: false)",
+            "type": "boolean"
+          },
+          "select": {
+            "description": "Menu item to select after right-clicking",
+            "type": "string"
+          }
+        },
+        "required": ["action"],
+        "type": "object"
+      },
+      "name": "dock"
+    },
+    {
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "auto_focus": {
+            "default": true,
+            "description": "Optional. Auto-focus target window (default: true)",
+            "type": "boolean"
+          },
+          "bring_to_current_space": {
+            "default": false,
+            "description": "Optional. Bring window to current space",
+            "type": "boolean"
+          },
+          "duration": {
+            "default": 500,
+            "description": "Optional. Duration in milliseconds (default: 500)",
+            "type": "number"
+          },
+          "from": {
+            "description": "Optional. Start element ID or query",
+            "type": "string"
+          },
+          "from_coords": {
+            "description": "Optional. Start coordinates in format 'x,y' (e.g., '100,200')",
+            "type": "string"
+          },
+          "modifiers": {
+            "description": "Optional. Comma-separated modifiers (cmd, shift, alt, ctrl)",
+            "type": "string"
+          },
+          "profile": {
+            "default": "linear",
+            "description": "Optional. Movement profile. Use 'linear' (default) or 'human'.",
+            "enum": ["linear", "human"],
+            "type": "string"
+          },
+          "snapshot": {
+            "description": "Optional. Snapshot ID from `see` or `inspect_ui`. Uses latest snapshot if not specified",
+            "type": "string"
+          },
+          "space_switch": {
+            "default": false,
+            "description": "Optional. Allow switching spaces",
+            "type": "boolean"
+          },
+          "steps": {
+            "default": 10,
+            "description": "Optional. Number of intermediate steps (default: 10)",
+            "type": "number"
+          },
+          "to": {
+            "description": "Optional. End element ID or query",
+            "type": "string"
+          },
+          "to_app": {
+            "description": "Optional. Target application name when dragging between apps",
+            "type": "string"
+          },
+          "to_coords": {
+            "description": "Optional. End coordinates in format 'x,y' (e.g., '300,400')",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "name": "drag"
+    },
+    {
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "app": {
+            "description": "Optional. Target app name/bundle ID, or 'PID:<n>'.",
+            "type": "string"
+          },
+          "foreground": {
+            "default": false,
+            "description": "Optional. Send foreground/global hotkey even when a target is supplied.",
+            "type": "boolean"
+          },
+          "hold_duration": {
+            "default": 50,
+            "description": "Optional. Delay between key press and release in milliseconds. Default: 50.",
+            "minimum": 0,
+            "type": "number"
+          },
+          "keys": {
+            "description": "Comma-separated hotkey chord to press (e.g., 'cmd,c' for copy,\n'cmd,shift,t' for reopen tab). Supported keys: cmd, shift,\nalt/option, ctrl, fn, a-z, 0-9, space, return, tab, escape,\ndelete, arrow_up, arrow_down, arrow_left, arrow_right, f1-f12.",
+            "type": "string"
+          },
+          "pid": {
+            "description": "Optional. Target process ID for background hotkeys.",
+            "type": "number"
+          },
+          "window_id": {
+            "description": "Optional. Window ID for background hotkeys.",
+            "type": "number"
+          },
+          "window_index": {
+            "description": "Optional. Window index (0-based); requires app/pid.",
+            "type": "number"
+          },
+          "window_title": {
+            "description": "Optional. Window title (substring match).",
+            "type": "string"
+          }
+        },
+        "required": ["keys"],
+        "type": "object"
+      },
+      "name": "hotkey"
+    },
+    {
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "app_target": {
+            "description": "Optional. Specifies the capture target.",
+            "type": "string"
+          },
+          "capture_focus": {
+            "default": "auto",
+            "description": "Optional. Focus behavior.",
+            "enum": ["background", "auto", "foreground"],
+            "type": "string"
+          },
+          "format": {
+            "description": "Optional. Output format.",
+            "enum": ["png", "jpg", "data"],
+            "type": "string"
+          },
+          "max_dimension": {
+            "description": "Optional. Downscales the captured image so its longest side does not exceed this value.\nDefaults to 1500 when format is \"data\".",
+            "type": "integer"
+          },
+          "path": {
+            "description": "Optional. Base absolute path for saving the image.",
+            "type": "string"
+          },
+          "question": {
+            "description": "Optional. If provided, the captured image will be analyzed.",
+            "type": "string"
+          },
+          "retina": {
+            "default": false,
+            "description": "Optional. Shorthand for scale=native.",
+            "type": "boolean"
+          },
+          "scale": {
+            "default": "logical",
+            "description": "Optional. Capture scale: logical|1x or native|retina|2x.",
+            "enum": ["logical", "1x", "native", "retina", "2x"],
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "name": "image"
+    },
+    {
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "app_target": {
+            "description": "Optional. Specifies the app/window to inspect via Accessibility.\nOmit, use an empty string, or use 'frontmost' for the current foreground application.\nUse 'AppName' (e.g., 'Safari') for a specific application.\nUse 'PID:PROCESS_ID' to target a specific process.\nUse 'AppName:WindowTitle' or 'PID:PROCESS_ID:WindowTitle' for a specific window title.\nScreen and menu bar targets require screenshots; use `see` for those.",
+            "type": "string"
+          },
+          "max_children": {
+            "description": "Optional. Maximum AX children per node. Env fallback: PEEKABOO_AX_MAX_CHILDREN.\nIncrease this for flat Qt/Electron panels with many sibling controls.",
+            "type": "number"
+          },
+          "max_depth": {
+            "description": "Optional. Maximum AX traversal depth. Env fallback: PEEKABOO_AX_MAX_DEPTH.",
+            "type": "number"
+          },
+          "max_elements": {
+            "description": "Optional. Maximum AX elements to collect. Env fallback: PEEKABOO_AX_MAX_ELEMENTS.",
+            "type": "number"
+          },
+          "snapshot": {
+            "description": "Optional. Snapshot ID for UI automation tracking. A new snapshot is created when absent.",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "name": "inspect_ui"
+    },
+    {
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "app": {
+            "description": "Target application when listing windows. Accepts app name,\nbundle ID, or PID (e.g., PID:663). Partial names are fuzzy matched.",
+            "type": "string"
+          },
+          "include_window_details": {
+            "description": "Extra data for each window (application_windows only).\nChoose any combination of `ids`, `bounds`, or `off_screen`.",
+            "items": {
+              "enum": ["ids", "bounds", "off_screen"],
+              "type": "string"
+            },
+            "type": "array",
+            "uniqueItems": false
+          },
+          "item_type": {
+            "description": "Controls what is listed. Defaults to:\n- application_windows when `app` is provided\n- running_applications otherwise\n\nValid values:\n- running_applications\n- application_windows\n- server_status",
+            "enum": ["running_applications", "application_windows", "server_status"],
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "name": "list"
+    },
+    {
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "description": "Action to perform. Use 'list' to discover menus, 'click' to\ninteract with menu items, 'click-extra' for system menu extras,\nor 'list-all' for all menus.",
+            "enum": ["list", "click", "click-extra", "list-all"],
+            "type": "string"
+          },
+          "app": {
+            "description": "Target application name, bundle ID, or process ID (required for list and click actions)",
+            "type": "string"
+          },
+          "item": {
+            "description": "Simple menu item to click (for non-nested items)",
+            "type": "string"
+          },
+          "path": {
+            "description": "Menu path for nested items (e.g., 'File > Save As...' or 'Edit > Copy')",
+            "type": "string"
+          },
+          "title": {
+            "description": "Title of system menu extra (for click-extra action)",
+            "type": "string"
+          }
+        },
+        "required": ["action"],
+        "type": "object"
+      },
+      "name": "menu"
+    },
+    {
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "center": {
+            "default": false,
+            "description": "Optional. Move to center of screen.",
+            "type": "boolean"
+          },
+          "coordinates": {
+            "description": "Optional. Alias for 'to' - coordinates in format 'x,y' (e.g., '100,200').",
+            "type": "string"
+          },
+          "duration": {
+            "default": 500,
+            "description": "Optional. Duration in milliseconds for smooth movement. Default: 500.",
+            "type": "number"
+          },
+          "id": {
+            "description": "Optional. Element ID to move to (from `see` or `inspect_ui` output).",
+            "type": "string"
+          },
+          "profile": {
+            "default": "linear",
+            "description": "Optional. Movement profile. Use 'linear' (default) or 'human' for natural paths.",
+            "enum": ["linear", "human"],
+            "type": "string"
+          },
+          "smooth": {
+            "default": false,
+            "description": "Optional. Use smooth animated movement.",
+            "type": "boolean"
+          },
+          "snapshot": {
+            "description": "Optional. Snapshot ID from `see` or `inspect_ui`. Uses latest snapshot if not specified.",
+            "type": "string"
+          },
+          "steps": {
+            "default": 10,
+            "description": "Optional. Number of steps for smooth movement. Default: 10.",
+            "type": "number"
+          },
+          "to": {
+            "description": "Optional. Coordinates in format 'x,y' (e.g., '100,200') or 'center' to center on screen.",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "name": "move"
+    },
+    {
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "allowLarge": {
+            "default": false,
+            "description": "Allow payloads larger than 10 MB.",
+            "type": "boolean"
+          },
+          "alsoText": {
+            "description": "Optional plain-text companion when pasting binary.",
+            "type": "string"
+          },
+          "app": {
+            "description": "Target app name/bundle ID, or 'PID:<n>'.",
+            "type": "string"
+          },
+          "dataBase64": {
+            "description": "Base64-encoded payload to paste.",
+            "type": "string"
+          },
+          "filePath": {
+            "description": "Path to a file to paste (file bytes placed on clipboard).",
+            "type": "string"
+          },
+          "foreground": {
+            "default": false,
+            "description": "Optional. Focus target and send foreground/global Cmd+V.",
+            "type": "boolean"
+          },
+          "imagePath": {
+            "description": "Path to an image to paste (alias of filePath).",
+            "type": "string"
+          },
+          "pid": {
+            "description": "Target process ID (alternative to app).",
+            "type": "number"
+          },
+          "restore_delay_ms": {
+            "default": 150,
+            "description": "Delay before restoring the previous clipboard (ms). Default: 150.",
+            "minimum": 0,
+            "type": "number"
+          },
+          "text": {
+            "description": "Plain text to paste.",
+            "type": "string"
+          },
+          "uti": {
+            "description": "UTI for dataBase64, or to force type when pasting a file.",
+            "type": "string"
+          },
+          "window_id": {
+            "description": "Window ID (preferred stable selector).",
+            "type": "number"
+          },
+          "window_index": {
+            "description": "Window index (0-based); requires app/pid.",
+            "type": "number"
+          },
+          "window_title": {
+            "description": "Window title (substring match).",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "name": "paste"
+    },
+    {
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "description": "Accessibility action name to invoke, e.g. AXPress, AXShowMenu, AXIncrement.",
+            "type": "string"
+          },
+          "on": {
+            "description": "Opaque element ID copied exactly from current `see` or `inspect_ui` output, or a query string.",
+            "type": "string"
+          },
+          "snapshot": {
+            "description": "Optional. Snapshot ID from `see` or `inspect_ui`. Uses latest snapshot if not specified.",
+            "type": "string"
+          }
+        },
+        "required": ["on", "action"],
+        "type": "object"
+      },
+      "name": "perform_action"
+    },
+    {
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {},
+        "type": "object"
+      },
+      "name": "permissions"
+    },
+    {
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "amount": {
+            "default": 3,
+            "description": "Optional. Number of scroll ticks/lines. Default: 3.",
+            "type": "number"
+          },
+          "delay": {
+            "default": 2,
+            "description": "Optional. Delay between scroll ticks in milliseconds. Default: 2.",
+            "type": "number"
+          },
+          "direction": {
+            "description": "Scroll direction: up (content moves up), down (content moves down), left, or right.",
+            "enum": ["up", "down", "left", "right"],
+            "type": "string"
+          },
+          "on": {
+            "description": "Optional. Element ID to scroll on (from `see` or `inspect_ui`). If not specified, scrolls at current mouse position.",
+            "type": "string"
+          },
+          "smooth": {
+            "default": false,
+            "description": "Optional. Use smooth scrolling with smaller increments.",
+            "type": "boolean"
+          },
+          "snapshot": {
+            "description": "Optional. Snapshot ID from `see` or `inspect_ui`. Uses latest snapshot if not specified.",
+            "type": "string"
+          }
+        },
+        "required": ["direction"],
+        "type": "object"
+      },
+      "name": "scroll"
+    },
+    {
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "annotate": {
+            "default": false,
+            "description": "Optional. Generate an annotated screenshot with interaction markers and IDs.",
+            "type": "boolean"
+          },
+          "app_target": {
+            "description": "Optional. Specifies the capture target (same as image tool).\nFor example:\nOmit or use an empty string (e.g., '') for all screens.\nUse 'screen:INDEX' (e.g., 'screen:0') for a specific display.\nUse 'frontmost' for all windows of the current foreground application.\nUse 'AppName' (e.g., 'Safari') for all windows of that application.\nUse 'PID:PROCESS_ID' (e.g., 'PID:663') to target a specific process by its PID.",
+            "type": "string"
+          },
+          "max_children": {
+            "description": "Optional. Maximum AX children per node. Env fallback: PEEKABOO_AX_MAX_CHILDREN.\nIncrease this for flat Qt/Electron panels with many sibling controls.",
+            "type": "number"
+          },
+          "max_depth": {
+            "description": "Optional. Maximum AX traversal depth. Env fallback: PEEKABOO_AX_MAX_DEPTH.",
+            "type": "number"
+          },
+          "max_elements": {
+            "description": "Optional. Maximum AX elements to collect. Env fallback: PEEKABOO_AX_MAX_ELEMENTS.",
+            "type": "number"
+          },
+          "path": {
+            "description": "Optional. Path to save the screenshot. If omitted, a temporary file is used.",
+            "type": "string"
+          },
+          "snapshot": {
+            "description": "Optional. Snapshot ID for UI automation tracking. A new snapshot is created when absent.",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "name": "see"
+    },
+    {
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "on": {
+            "description": "Opaque element ID copied exactly from current `see` or `inspect_ui` output, or a query string.",
+            "type": "string"
+          },
+          "snapshot": {
+            "description": "Optional. Snapshot ID from `see` or `inspect_ui`. Uses latest snapshot if not specified.",
+            "type": "string"
+          },
+          "value": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "integer"
+              },
+              {
+                "type": "number"
+              }
+            ],
+            "description": "Value to set. Supported types: string, boolean, integer, or number."
+          }
+        },
+        "required": ["on", "value"],
+        "type": "object"
+      },
+      "name": "set_value"
+    },
+    {
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "duration": {
+            "description": "Sleep duration in milliseconds.",
+            "type": "number"
+          }
+        },
+        "required": ["duration"],
+        "type": "object"
+      },
+      "name": "sleep"
+    },
+    {
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "description": "The action to perform",
+            "enum": ["list", "switch", "move-window"],
+            "type": "string"
+          },
+          "app": {
+            "description": "Application name for move-window action",
+            "type": "string"
+          },
+          "detailed": {
+            "default": false,
+            "description": "Show detailed space information (for list action)",
+            "type": "boolean"
+          },
+          "follow": {
+            "default": false,
+            "description": "Follow the window to the new space (for move-window action)",
+            "type": "boolean"
+          },
+          "to": {
+            "description": "Space number to switch to (for switch action)",
+            "type": "number"
+          },
+          "to_current": {
+            "default": false,
+            "description": "Move window to current space (for move-window action)",
+            "type": "boolean"
+          },
+          "window_index": {
+            "description": "Window index for multi-window apps",
+            "type": "number"
+          },
+          "window_title": {
+            "description": "Window title to move",
+            "type": "string"
+          }
+        },
+        "required": ["action"],
+        "type": "object"
+      },
+      "name": "space"
+    },
+    {
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "duration": {
+            "default": 500,
+            "description": "Optional. Duration of the swipe in milliseconds. Default: 500.",
+            "type": "number"
+          },
+          "from": {
+            "description": "Starting coordinates in format 'x,y' (e.g., '100,200').",
+            "type": "string"
+          },
+          "profile": {
+            "default": "linear",
+            "description": "Optional. Movement profile. Use 'linear' (default) or 'human'.",
+            "enum": ["linear", "human"],
+            "type": "string"
+          },
+          "steps": {
+            "default": 10,
+            "description": "Optional. Number of intermediate steps for smooth movement. Default: 10.",
+            "type": "number"
+          },
+          "to": {
+            "description": "Ending coordinates in format 'x,y' (e.g., '300,400').",
+            "type": "string"
+          }
+        },
+        "required": ["from", "to"],
+        "type": "object"
+      },
+      "name": "swipe"
+    },
+    {
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "app": {
+            "description": "Optional. Target app name/bundle ID, or 'PID:<n>' for background typing.",
+            "type": "string"
+          },
+          "clear": {
+            "default": false,
+            "description": "Optional. Clear the field before typing (Cmd+A, Delete).",
+            "type": "boolean"
+          },
+          "delay": {
+            "default": 0,
+            "description": "Optional. Delay between keystrokes in milliseconds (linear profile). Default: 0.",
+            "type": "number"
+          },
+          "delete": {
+            "default": false,
+            "description": "Optional. Press delete/backspace key.",
+            "type": "boolean"
+          },
+          "escape": {
+            "default": false,
+            "description": "Optional. Press escape key.",
+            "type": "boolean"
+          },
+          "foreground": {
+            "default": false,
+            "description": "Optional. Focus target and send foreground/global keyboard input.",
+            "type": "boolean"
+          },
+          "on": {
+            "description": "Optional. Element ID to type into (from `see` or `inspect_ui`). If not specified, types at current focus.",
+            "type": "string"
+          },
+          "pid": {
+            "description": "Optional. Target process ID for background typing when no element snapshot is used.",
+            "type": "number"
+          },
+          "press_return": {
+            "default": false,
+            "description": "Optional. Press return/enter after typing.",
+            "type": "boolean"
+          },
+          "profile": {
+            "description": "Optional. Typing profile: linear (default) or human.",
+            "type": "string"
+          },
+          "snapshot": {
+            "description": "Optional. Snapshot ID from `see` or `inspect_ui`. Uses latest snapshot if not specified.",
+            "type": "string"
+          },
+          "tab": {
+            "description": "Optional. Press tab N times.",
+            "type": "number"
+          },
+          "text": {
+            "description": "The text to type. If not specified, can use special key flags instead.",
+            "type": "string"
+          },
+          "window_id": {
+            "description": "Optional. Window ID for background typing.",
+            "type": "number"
+          },
+          "window_index": {
+            "description": "Optional. Window index (0-based); requires app/pid.",
+            "type": "number"
+          },
+          "window_title": {
+            "description": "Optional. Window title (substring match).",
+            "type": "string"
+          },
+          "wpm": {
+            "description": "Optional. Human typing speed (80-220 WPM). Overrides delay when set.",
+            "type": "number"
+          }
+        },
+        "type": "object"
+      },
+      "name": "type"
+    },
+    {
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "description": "The action to perform on the window",
+            "enum": ["close", "minimize", "maximize", "move", "resize", "set-bounds", "focus"],
+            "type": "string"
+          },
+          "app": {
+            "description": "Target application name, bundle ID, or process ID",
+            "type": "string"
+          },
+          "height": {
+            "description": "Height for resize or set-bounds action",
+            "type": "number"
+          },
+          "index": {
+            "description": "Window index (0-based) for multi-window applications",
+            "type": "number"
+          },
+          "title": {
+            "description": "Window title to target (partial matching supported)",
+            "type": "string"
+          },
+          "width": {
+            "description": "Width for resize or set-bounds action",
+            "type": "number"
+          },
+          "window_id": {
+            "description": "Window ID (from window list); preferred stable selector",
+            "type": "number"
+          },
+          "x": {
+            "description": "X coordinate for move or set-bounds action",
+            "type": "number"
+          },
+          "y": {
+            "description": "Y coordinate for move or set-bounds action",
+            "type": "number"
+          }
+        },
+        "required": ["action"],
+        "type": "object"
+      },
+      "name": "window"
+    }
+  ]
+}

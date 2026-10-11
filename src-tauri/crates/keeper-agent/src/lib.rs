@@ -73,6 +73,7 @@ pub mod matrix_sink;
 pub mod mcp;
 pub mod memory;
 pub mod ports;
+pub mod previews;
 pub mod promote;
 pub mod rooms;
 pub mod run;

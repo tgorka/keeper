@@ -251,6 +251,12 @@ pub struct ApprovalRequestContent {
     pub file: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_sha256: Option<String>,
+    /// The screenshot the action was decided on (S-18): `{sha256, mimetype,
+    /// file}`, `file` its `EncryptedFile` — the image reaches a person only
+    /// as this encrypted attachment; the record keeps its hash. Not
+    /// digested: the preconditions are what is checked again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<Value>,
     /// The SHA-256 of the session's log through the checkpoint (digested).
     pub checkpoint_sha256: String,
     /// What must still hold when the approval is used (digested).

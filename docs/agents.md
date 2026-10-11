@@ -1379,9 +1379,10 @@ holds a character outside letters, digits, `-` and `_`, or a `__`, is not offere
 `trust_annotations = true` a tool the server marks `readOnlyHint` without `destructiveHint` or
 `openWorldHint` is T0 and any other T3 — annotations are what a server says about itself, read
 only when you vouch for it. A `command` server runs with the host's rights, so its tools are never
-below T2. A `role` server takes its role's table and nothing else: Paseo's four verbs, described to
-the model in keeper's words; the Mac's screen and a KVM's tables come with those features, and
-until then none of their tools is offered. In a session that read something `untrusted`, Paseo's
+below T2 — except the Mac's screen server, whose table is authoritative (*The Mac's screen*,
+below). A `role` server takes its role's table and nothing else: Paseo's four verbs, described to
+the model in keeper's words, and Peekaboo's table for the Mac's screen; a KVM's table comes with that
+feature, and until then none of its tools is offered. In a session that read something `untrusted`, Paseo's
 `create_agent` and `send_agent_prompt` are refused outright, never asked.
 
 **What an approval binds.** An MCP approval is for the one call, never for the session. It binds
@@ -1579,6 +1580,125 @@ mcp = ["paseo"]
   reply: the session that opened the run does not take it, its card keeps reading `running` until
   the run itself replies, and no turn follows. That room is never read back for completions, and an
   event there this host cannot read holds nothing.
+
+### The Mac's screen
+
+An agent on the Mac can see and use its screen through [Peekaboo](https://github.com/steipete/Peekaboo)
+(MIT; a separate program, never linked), named in Settings › Agents › *MCP servers* as the Mac's
+`role = "screen"` server and listed in the agent's `[tools].mcp`. agentd never offers the screen: its
+`agentd.toml` refuses `role = "screen"`.
+
+**Installing it.** `brew install steipete/tap/peekaboo` (3.9.8 is the version keeper's table was
+built from). Run it once in your own GUI session and grant **Peekaboo** — not keeper — Screen
+Recording and Accessibility in System Settings › Privacy & Security; `peekaboo permissions --json`
+says whether both are granted (its Bridge host does the permission-bound work). Then add the server:
+
+```toml
+# Settings › Agents › MCP servers, as the sheet saves it
+[[mcp]]
+name    = "mac"
+command = ["/opt/homebrew/bin/peekaboo", "mcp", "serve"]   # or url = an HTTP Peekaboo you run
+role    = "screen"
+readers = ["@tgorka:<homeserver>"]                         # you: what is on your screen is yours
+```
+
+and in the agent's `agent.toml`, `[tools] mcp = ["mac"]` and `[host] needs = ["screen:mac"]` (the
+screen is never derived from the tools). A screen server keeper starts as a program keeps no T2
+floor: its table decides, because the floor's reason — the program runs with your rights — is as
+true of a Peekaboo you run yourself. Peekaboo's own description of its tools reaches the model as
+outside content; its table, not its words, tiers them.
+
+**Offered while it answers.** The Mac's manifest says `screen:mac` only while a screen server
+answers its tool list, renewed with the rest every 60 s; an agent that needs it waits for it. After
+a Peekaboo update macOS may reset its grants (a re-signed app is a new app to TCC): check them
+again — until they are back Peekaboo answers without the screen, and its reads fail.
+
+**What it may do, and at which tier.** Every tool Peekaboo lists has a row; a tool it adds later is
+T3. Never offered: `agent` and `analyze` (they send the screen to Peekaboo's own AI provider, which
+keeper did not configure) and `browser` (a browser's pages and requests are not the screen). Refused
+before anything is sent: every argument that names a file of the Mac (`path` — but `menu`'s, which
+is a menu's —, `filePath`, `imagePath`, `outputPath`, `input`, `image_path`, `output_dir`,
+`video_out`, `request_file_path`, `response_file_path`), `image` with a `question`, `click` or
+`perform_action` by `query`, `type` or `set_value` without an element `on`, a `hotkey` whose `keys`
+holds anything but Peekaboo's own keys (cmd, shift, alt/option, ctrl, fn, a–z, 0–9, space, return,
+tab, escape, delete, the four arrows, f1–f12), and an action that names its target by number
+(`pid`, `window_id`, `window_index`, `index`) — name it by `app` and `window_title`. A call is tiered
+by what **keeper** read of its target, never by the model's words:
+
+- an action on an element by the element Peekaboo listed in a `see` or `inspect_ui` **this session's
+  model** made — its role, title, accessibility identifier, application and window. An element id
+  from no read this session kept is refused: read the screen first. A read that names two
+  applications or two windows, or names no application, is not kept (keeper could not tell their
+  elements apart, or what they belong to). The action
+  is sent, and bound, in the snapshot its element was read in; a snapshot this session never read
+  is refused.
+- any other action by the window keeper reads **in front** itself just before (`inspect_ui
+  frontmost`; keeper's own read, which no model sees), together with the window of the `app` and
+  `window_title` the call names in keeper's own list of that app's windows — the highest tier of
+  them, so naming another app never lowers what is in front. The call names **one** window: an
+  `app` or `window_title` keeper does not find, an app with two windows and no `window_title`, or a
+  `window_title` two of its windows hold, is refused. A `hotkey` with `foreground: true` goes to
+  whatever is in front even when it names an app, so it is pinned by the window in front.
+
+| What | Tier |
+| --- | --- |
+| a screenshot, a window or app list, an accessibility read, `permissions`, `sleep`; an app, Dock, menu, Space or dialog list | T0 |
+| focus, navigation, scrolling, moving the pointer, a bare key (a letter, a digit, Space, Tab, Escape, Shift, an arrow), typing into a field nobody submits | T1 |
+| a click or key on an element whose role, title or identifier says submit, send, post, buy, pay or delete (`AXSendButton` and an icon button identified `sendButton` say send); a click at coordinates (keeper did not read what is there); a chord with cmd, ctrl, alt/option or fn, Return, Delete or a function key; typing into a secure field, text holding a line break, `{return}`, `{delete}` or `{backspace}`, or `type` with `delete` or `clear` (Cmd+A, Delete) — its card says so; a Dock item's menu (`select`); a click, toggle or value set anywhere in System Settings; launching, quitting or closing; the clipboard, paste, drag, swipe; answering a dialog | T3 |
+| anything touching System Settings' Privacy & Security, a TCC prompt, a password field or a payment sheet | T4 — **refused** in a session that read the screen, which every element action needs (below) |
+| the last step of a password change | T5 |
+
+What is on the screen is outside content: a screenshot or read is labelled `untrusted`, read by the
+server's `readers`, and joined into the session's label — and so are Peekaboo's own words of its
+tools, which every turn offered the screen carries (R225). A session offered the screen is therefore
+`untrusted` and read by the server's `readers` from its first turn, and every screen action that
+waits for a person is raised once, as any is in a session that read something `untrusted`: a T3 row
+is asked as T4 (Send in Mail's draft, or a chord, is decided on another device), and the T4 rows —
+Privacy & Security, a TCC prompt's *Allow*, a password field, a payment sheet — are raised to T5 and
+**refused**: an agent on the screen never gets them approved. Focus, scrolling and typing (T1) are
+not raised. keeper's own parse of a read — the element it pins, the tier it takes — reads the read's
+structure, never its words as instructions, so it stays what it is (R315).
+
+**What an approval binds, and the preview.** A screen action that waits for a person is pinned by
+what keeper read: an element by its accessibility path, role, title, identifier and frame
+(Peekaboo's element ids are good only in their snapshot, so they are never what is pinned); a click
+at coordinates by the 64-bit difference hash of the 64-point square it lands in; any other action by
+the window it acts on — the one window the call names, else the one in front — its application,
+title and frame as keeper lists them, whether it was in front, and the difference hash of that
+frame. No window in front that reads, and the action is refused. Before a named window's approval
+is used, the call's arguments must still name that window alone: another window that holds the same
+part of a title, appearing after the park, is drift. keeper
+takes a screenshot itself (inline, never through a file) when the action parks; the record keeps
+its SHA-256, digested with the rest, and the image is kept at
+`<sessions zone>/.keeper/previews/<sha256>.png` — never in a session's folder, never committed
+(`.keeper/` never syncs) — and reaches you only as the request's encrypted Matrix attachment. That
+screenshot is outside content read by the screen server's `readers`: its label joins the session's
+before the card leaves, so it asks only them. The card's words are keeper's: *Click "Send" (button) in Mail*,
+*Click at (640, 400) in "Inbox"* when keeper read that window under the point, else *on the Mac's
+screen*; what the call names of an app, an item or a button is quoted as a name, at most 40
+characters of it (*Menu click: the item named "View > Sort By" in the app named "Mail"*); an
+`action` or a `direction` is one of the words Peekaboo's own schema allows for it, anything else
+refused; what is typed is counted, never shown. Before the approval is used, keeper reads the screen again — the
+element's window through `inspect_ui`; the window in front, the app's list of windows and a fresh
+screenshot for a window; a fresh screenshot for a square — and a hash must be within 7 bits of the
+one decided on. Measured on real frames as keeper greys them: a clock's next minute or a caret flips
+0–5 bits; over a 64-point square a sheet laid over it flips 10, a button replaced by another 11, a
+move of 40 points 11; over a whole window a sheet laid over it flips 13–14, but a sheet moved 40
+points only 7–8 and one sheet replaced by another of its size 1–2, which only the window's title,
+frame and front, read again, can show. Anything else is drift: refused, logged, nothing consumed and
+nothing clicked; proposed again, it is asked again. A record taken over by a host that names no such
+screen server is refused the same way.
+
+**A T4 action is decided elsewhere.** A T4 screen action is never decided on the Mac it acts on:
+there the card says *Decide this on another device: this Mac is the one it acts on*, and a decision
+sent from it is refused with nothing consumed. Decide it on your phone. In a session that read the
+screen — every session offered it — what reaches this is a raised T3, Send for one, since a T4 row
+is refused there.
+
+**What Peekaboo keeps on the Mac.** `capture` records the screen into a temporary folder on the Mac
+for up to 180 s (Peekaboo cleans it after `autoclean_minutes`); `see` and `image` without `format:
+data` write their screenshot to a temporary file too. keeper names no path for any of them; the
+files are Peekaboo's, in your account.
 
 ## When an action waits
 
