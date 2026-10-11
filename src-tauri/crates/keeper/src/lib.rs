@@ -1635,6 +1635,14 @@ pub fn run() {
         agents_host::agents_seed_offer,
         agents_host::agents_seed_plan,
         agents_host::agents_seed_apply,
+        // This Mac's own MCP servers and `[sandbox]` table (96.2 #11,
+        // R213): device-local, desktop-only like the section.
+        agents_host::agents_mcp_list,
+        agents_host::agents_mcp_draft,
+        agents_host::agents_mcp_save,
+        agents_host::agents_mcp_remove,
+        agents_host::agents_sandbox_get,
+        agents_host::agents_sandbox_save,
     );
     // The commands that touch a window or a file manager have `Unsupported`
     // twins so the handler list is identical on every target and

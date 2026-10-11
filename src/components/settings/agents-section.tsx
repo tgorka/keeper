@@ -27,11 +27,15 @@
  * agent to its sign-in row above. It signs nothing in itself. A folder this
  * Mac cannot seed shows Rust's sentence instead of the form.
  *
- * **Absent, not empty (AD-27).** No flagged folder renders nothing, and the
+ * **Absent, not empty (AD-27).** No flagged folder and nothing this Mac keeps for
+ * its agents — no MCP server, no `[sandbox]` row — renders nothing, and the
  * dialog renders the section only where `botTools` is true — a phone is never
- * a host.
+ * a host. A Mac with stored MCP servers or a sandbox table shows the section
+ * whether or not any folder is flagged, so what it keeps can always be edited
+ * or removed.
  */
 import { useCallback, useEffect, useId, useState } from "react";
+import { AgentsMcpSection, AgentsSandboxSection } from "@/components/settings/agents-mcp-section";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
@@ -50,6 +54,8 @@ import {
   agentsCopies,
   agentsCopySignIn,
   agentsDriveRepin,
+  agentsMcpList,
+  agentsSandboxGet,
   agentsSeedApply,
   agentsSeedOffer,
   agentsSeedPlan,
@@ -120,6 +126,9 @@ export function AgentsSection({ open }: { open: boolean }) {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [offer, setOffer] = useState<AgentSeedOfferVm | undefined>(undefined);
   const [offerError, setOfferError] = useState<string | null>(null);
+  // This Mac keeps MCP servers or a sandbox table: read once per opening, so
+  // the section stays while the person removes the last of them.
+  const [macKeeps, setMacKeeps] = useState(false);
   const id = useId();
 
   const reload = useCallback(async () => {
@@ -146,6 +155,14 @@ export function AgentsSection({ open }: { open: boolean }) {
     }
     void reload();
     void reloadOffer();
+    Promise.all([agentsMcpList(), agentsSandboxGet()])
+      .then(([mcp, sandbox]) =>
+        setMacKeeps(
+          mcp.servers.length > 0 || sandbox.readExec.length > 0 || sandbox.env.length > 0,
+        ),
+      )
+      // The sections below say what failed.
+      .catch(() => setMacKeeps(true));
     const timer = setInterval(() => void reload(), AGENTS_RELOAD_MS);
     return () => clearInterval(timer);
   }, [open, reload, reloadOffer]);
@@ -154,6 +171,7 @@ export function AgentsSection({ open }: { open: boolean }) {
   if (
     loadError === null &&
     offerError === null &&
+    !macKeeps &&
     (rows === undefined || rows.length === 0) &&
     folders.length === 0
   ) {
@@ -223,6 +241,8 @@ export function AgentsSection({ open }: { open: boolean }) {
           onGoToRow={(agent) => goToRow(profileId, agent)}
         />
       ))}
+      <AgentsMcpSection open={open} />
+      <AgentsSandboxSection open={open} />
     </section>
   );
 }

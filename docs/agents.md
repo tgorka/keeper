@@ -1164,6 +1164,17 @@ host's. A `git` program gets `-c core.hooksPath=/dev/null` right after it, so no
 argv cannot override it; the card shows that argv. Builds run against what the workspace vendors: a
 toolchain's caches are read-only, so use `--offline`.
 
+**The Mac's `[sandbox]` table.** On the Mac, `read_exec` and `env` are set in Settings › Agents ›
+*Sandbox* — folders a command may read and run, and variables naming folders (a rustup or nvm
+install under your home, say) — kept in this Mac's `keeper.db`, never synced, and checked by the
+same check as `agentd.toml`'s: absolute paths, a variable's name upper-case and never one keeper sets,
+`KEEPER_*`, `LD_*` or `DYLD_*`, each variable once. A refusal is shown as written. No grant reaches
+any folder keeper syncs, whether or not it holds agents; a folder that moves, comes or goes builds
+the Mac's host and its sandbox again. The section shows what the Mac's probe of that very table
+found — `sandbox-exec ok`, or `unavailable — <reason>` when a folder overlaps a synced folder,
+keeper's own data or a credential under your home — and reads it again every few seconds while
+Settings is open: after a save it says the host probes it again, until it has.
+
 **Tiers.** Without network: T2. With network: T3. Code the session holds — the program, the program
 a wrapper runs (`env ./tool`, and through BusyBox's `env`, `nice` or `nohup`: `busybox env ./tool`),
 or an interpreter's script inside `workspace/`; anything under a
@@ -1256,8 +1267,8 @@ at most two seconds after the group is killed. Its label: the readers of the dri
 (anyone when none), and `untrusted` when it had network or read any drive, else `agent`.
 Secret-shaped text in it is redacted in the log like every other line. `keeper-agentd status`
 prints `sandbox: landlock ABI <n>, seccomp ok` or `sandbox: unavailable — <reason>`; the Mac logs
-`sandbox-exec ok; no [sandbox] table is configurable on this Mac yet` — its own `read_exec`/`env`
-table arrives with its MCP servers' store, checked as agentd's is. On Linux nothing of a run can
+`sandbox-exec ok` — its own `read_exec`/`env` table is the one Settings › Agents › *Sandbox* keeps
+(above), checked as agentd's is. On Linux nothing of a run can
 leave its process group, so the whole group ending is every process of it. On the Mac a process
 can leave the group, and the Mac gives keeper no way to tell a run's descendant from any other
 process without privileges keeper does not hold: after the group is killed, keeper kills each
@@ -1296,6 +1307,46 @@ that is not a Matrix user id or `"*"`, a `fingerprint` that is not `sha256:` and
 `tier` is not `T0`…`T5` or whose `tool` repeats, a row on a `role` server, and two servers of one
 name are each refused naming the entry. A server with a `fingerprint` is not connected to yet:
 keeper does not check a pinned certificate for MCP servers in this version (DW-810).
+
+**On the Mac.** The Mac's servers are set in Settings › Agents › *MCP servers* — the same grammar,
+kept in this Mac's `keeper.db` (never in `settings.toml`, a device file or your account's repository)
+and checked by the same check as `agentd.toml`'s, `role = "screen"` included, `kvm:<id>` refused (the
+Mac names no `[[kvm]]`). Settings › Agents shows these whenever this Mac keeps a server or a sandbox
+row, flagged folder or not. A program is written one field per argument and saved exactly as
+written — an empty argument, spaces and line breaks included. A `url` server's bearer token goes to
+the keychain, never to `keeper.db`; the form takes a new one or forgets it and never shows it, and
+*Forget the token* wins over a token typed in the same sheet. A program keeper starts keeps no token.
+Each token you save is kept in the keychain under a key of its own, which only the saved server
+names: keeper sends a server the token saved with the very settings it connects with, so a server
+moved to a new URL with a new token never sends that token to the old URL, and a save that does not
+go through sends nothing new — a token it left behind is never sent. Forgetting, removing or making
+a server a program deletes only the token it replaced, never one saved after it; a token the
+keychain would not delete is said so, and nothing names it. A token an earlier keeper kept under the
+server's name is not read: such a server is not connected and its row says so until you save its
+token again or forget it — either deletes the old one. A keychain that cannot be read is not "no
+token": that server is not connected, and its row says why; once the keychain is readable again,
+save the server again (or restart keeper) to connect it. Each server is listed with *answers* or
+*does not answer — <why>*, as heard by a host built on the settings shown — after a save it says the
+host asks again, until it has. A program server that answers is also listed as the host started
+it, the way agentd's are known: the absolute program its argv resolved to (through `PATH` and any
+link) and that file's SHA-256 — the program an approval of its tools binds. Its sheet lists the
+tools it listed — a tool's name redacted and shortened as `keeper-agentd status` writes it when the
+name cannot travel, and no tier row for such a tool — and lets you set a tool's tier row and *Trust
+this server's annotations* (off unless you tick it). Every name and reason the sheet shows, a tool
+control's spoken name and a role's refusal of a tool included, is redacted and shortened the same
+way; the exact name only picks the tool's row. As you edit, the sheet shows what keeper will
+apply to what you are about to save: each tool with the tier the role, rows and trust you chose
+give it, a program's T2 floor, a role server's table fixed and not editable. Until keeper has
+worked that out for what the sheet now holds, its tiers, rows and Save wait; when it cannot (its
+settings could not be read), the sheet says why, shows no tiers, and Save waits until it can. The
+tools are those the saved server listed while you keep its URL or program; a new URL or program
+lists its own once saved. Choosing a role for a server with tier rows shows those rows and *Drop
+these rows*: a role takes no row, so Save refuses them until you drop them, and setting the role
+back keeps them. A
+save is checked first — Rust's refusal is shown as written and nothing is saved — and every save, a
+new token included, builds the Mac's host again within seconds; a save or removal stops the old
+host even if keeper cannot read its other settings in that moment. The egress list names each
+server's host or program once: a URL's host and a program of the same name are two lines.
 
 **Offered while it answers.** At start and at every renewal of its manifest (60 s) the host connects
 to each server it is not connected to and asks for its tools — beside the renewal, never holding
@@ -3395,7 +3446,7 @@ that holds its **claim**.
 
 **Each host's manifest.** Every host keeps `dev.keeper.agent.host` in its principal's control room,
 under its slug: its capabilities (`sandbox`; `mcp:<name>` for each MCP server that answered its last
-`tools/list`; `kvm:<id>`; the Mac offers `sandbox` only yet), its drives
+`tools/list`; `kvm:<id>` on agentd only), its drives
 with whether each is checked out and how much of it is on disk (`full`, `partial`, `virtual`), the
 bots it resolves, the agents it hosts, `always_on`, and its version. It is renewed every 60 s and
 lapses 180 s after its last renewal by the homeserver's clock. A state event is not encrypted, so a
