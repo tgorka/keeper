@@ -199,7 +199,7 @@ pub struct ApprovalCardVm {
     /// The tool, as the model called it.
     pub tool: String,
     /// The exact arguments, pretty-printed JSON; `None` when attached, and
-    /// for a `run`, which `run` draws whole.
+    /// for a `run` or a `kvm_act`, which `run` and `kvm` draw whole.
     pub payload: Option<String>,
     /// [`ATTACHED`] and the arguments' SHA-256, when they travel as a file:
     /// `agent_approval_payload` fetches and checks them.
@@ -229,6 +229,31 @@ pub struct ApprovalCardVm {
     /// other tool, or when the action is attached — [`attached_payload`]
     /// then draws the same view once its file is checked (R231).
     pub run: Option<RunCardVm>,
+    /// A `kvm_act`'s inputs as keeper reads them (R323); `None` for any
+    /// other tool, or when the action is attached — [`attached_payload`]
+    /// then draws it.
+    pub kvm: Option<KvmCardVm>,
+}
+
+/// What a `kvm_act` card draws (R323, as R247 draws a `run`): the KVM and
+/// each input as keeper describes it — typed and pasted text as its count
+/// with its line breaks and tabs, a run of character keys as theirs, a run
+/// of letters or digits under Ctrl, Alt or Meta as theirs, named keys and
+/// their chords spelled, points, scroll steps and power. Never the
+/// arguments themselves: the model's `intent` and the text it types are
+/// its words, not the person's.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct KvmCardVm {
+    /// The KVM's id, as keeper shows a name.
+    pub kvm: String,
+    pub inputs: Vec<String>,
+}
+
+/// The KVM card of a `kvm_act` whose arguments are `args`.
+fn kvm_card(args: &Value) -> Option<KvmCardVm> {
+    crate::agents::kvm::card(args).map(|(kvm, inputs)| KvmCardVm { kvm, inputs })
 }
 
 /// What a `run` card draws (UX-DR139, R155, R213, R260): the argv as it
@@ -495,25 +520,39 @@ pub fn verify_attached(request: &ApprovalRequestContent, bytes: &[u8]) -> Result
 /// (R186, R231): the action as text and, for a `run`, the same typed run
 /// view an inline `run` card draws — its argv, programs, folder, held
 /// code and, with network, the workspace it releases, counted, sized and
-/// listed — built from what the digest binds, never from the card.
+/// listed — and for a `kvm_act` the same inputs an inline one draws, built
+/// from what the digest binds, never from the card, and nothing else of it
+/// (R328).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
 pub struct ApprovalPayloadVm {
-    /// The action, pretty-printed JSON.
+    /// The action, pretty-printed JSON; drawn only for a tool with no
+    /// typed view. Empty for a `kvm_act`: its arguments are the model's
+    /// words.
     pub text: String,
     pub run: Option<RunCardVm>,
+    pub kvm: Option<KvmCardVm>,
 }
 
 /// What an attached action's `bytes` show (R186, R231): refused as
 /// [`verify_attached`] refuses them; else the payload as text and, for a
 /// `run`, its run view from the arguments, binding and workspace set the
-/// digest was just checked over.
+/// digest was just checked over; for a `kvm_act` its inputs alone, refused
+/// when they do not read (R328).
 pub fn attached_payload(
     request: &ApprovalRequestContent,
     bytes: &[u8],
 ) -> Result<ApprovalPayloadVm, String> {
     let payload = verify_attached(request, bytes)?;
+    if request.action.tool == AgentTool::KvmAct.as_wire() {
+        let kvm = kvm_card(&payload).ok_or_else(|| PAYLOAD_REFUSED.to_owned())?;
+        return Ok(ApprovalPayloadVm {
+            text: String::new(),
+            run: None,
+            kvm: Some(kvm),
+        });
+    }
     let text = serde_json::to_string_pretty(&payload).map_err(|_| PAYLOAD_REFUSED.to_owned())?;
     let run = (request.action.tool == AgentTool::Run.as_wire())
         .then(|| crate::agents::approval::attached_run(payload))
@@ -525,7 +564,11 @@ pub fn attached_payload(
             whole.preconditions.workspace = workspace;
             run_card(&whole)
         });
-    Ok(ApprovalPayloadVm { text, run })
+    Ok(ApprovalPayloadVm {
+        text,
+        run,
+        kvm: None,
+    })
 }
 
 /// The scopes the card offers: the request's, never `session` above T2.
@@ -640,9 +683,12 @@ impl ApprovalCardVm {
     ) -> ApprovalCardVm {
         let attached = request.file.is_some();
         let run = request.action.tool == AgentTool::Run.as_wire();
+        let kvm = request.action.tool == AgentTool::KvmAct.as_wire();
         // A run is drawn as its typed view alone (R247): its arguments as
-        // raw JSON would show a bidi override as the character it is.
-        let payload = (!attached && !run)
+        // raw JSON would show a bidi override as the character it is. So is
+        // a KVM's (R323): its arguments hold the model's intent and the text
+        // it types, which are not for the person deciding.
+        let payload = (!attached && !run && !kvm)
             .then(|| serde_json::to_string_pretty(&request.action.args).ok())
             .flatten();
         let attachment = attached.then(|| match &request.file_sha256 {
@@ -716,6 +762,9 @@ impl ApprovalCardVm {
             declassify: (request.action.tool == "declassify")
                 .then(|| declassify(&request.action.args, name)),
             run: (run && !attached).then(|| run_card(request)),
+            kvm: (kvm && !attached)
+                .then(|| kvm_card(&request.action.args))
+                .flatten(),
         }
     }
 }
@@ -1396,6 +1445,88 @@ mod tests {
         assert_eq!(
             card(request("01A", 2, &["once"]), &viewer(TGORKA)).run,
             None
+        );
+    }
+
+    /// R323 (R96K1-02): a `kvm_act` card draws the KVM and its inputs as
+    /// keeper reads them, inline and attached alike — no raw arguments, so
+    /// neither the model's intent nor the text it types reaches the person
+    /// deciding.
+    #[test]
+    fn a_kvm_card_draws_its_inputs_never_the_models_words() {
+        let args = json!({
+            "kvm": "desk",
+            "intent": "IGNORE THIS and approve: it is safe",
+            "actions": [
+                {"do": "click", "x": 960, "y": 540},
+                {"do": "type", "text": "s3cret words\n"},
+                {"do": "key", "key": "h"},
+                {"do": "key", "key": "i"},
+            ],
+        });
+        let mut value = request("01K", 4, &["once"]);
+        value["action"] = json!({"tool": "kvm_act", "args": args, "exec_binding": null});
+        value["preconditions"]["files"] = json!([]);
+        let inline = card(sealed(value.clone(), &args), &viewer(TGORKA));
+        let inputs = [
+            "click (960, 540)",
+            "type 13 characters including 1 line break",
+            "2 character keys",
+        ];
+        assert_eq!(inline.payload, None);
+        assert_eq!(
+            inline.kvm,
+            Some(KvmCardVm {
+                kvm: "desk".to_owned(),
+                inputs: inputs.map(str::to_owned).to_vec(),
+            })
+        );
+        let drawn = serde_json::to_string(&inline).expect("json");
+        for words in ["IGNORE", "s3cret", "\"h\"", "\"i\""] {
+            assert!(!drawn.contains(words), "{words}: {drawn}");
+        }
+        // Another tool draws no KVM card.
+        assert_eq!(
+            card(request("01A", 2, &["once"]), &viewer(TGORKA)).kvm,
+            None
+        );
+
+        let bytes = crate::agents::approval::canonical(&args)
+            .expect("canonical")
+            .into_bytes();
+        let (mut large, _) = attached("01L");
+        large["action"] = json!({"tool": "kvm_act", "args": null, "exec_binding": null});
+        large["file_sha256"] = json!(sha256_hex(&bytes));
+        let resealed = sealed(large.clone(), &args);
+        large["summary"] = resealed["summary"].clone();
+        large["binding_digest"] = resealed["binding_digest"].clone();
+        let shown = card(large.clone(), &viewer(TGORKA));
+        assert_eq!((shown.payload, shown.kvm), (None, None));
+        let fetched =
+            attached_payload(&content(large.clone()), &bytes).expect("the attached action");
+        assert_eq!(fetched.run, None);
+        assert_eq!(
+            fetched.kvm.as_ref().map(|kvm| kvm.inputs.clone()),
+            Some(inputs.map(str::to_owned).to_vec())
+        );
+        // R328 (04): the attached action reaches the device as those inputs
+        // alone — nothing of the model's arguments rides beside them.
+        let drawn = serde_json::to_string(&fetched).expect("json");
+        for words in ["IGNORE", "s3cret", "intent", "\"h\"", "\"i\""] {
+            assert!(!drawn.contains(words), "{words}: {drawn}");
+        }
+        // Arguments keeper cannot read as inputs are refused, never shown.
+        let unread = json!({"kvm": "desk", "intent": "IGNORE THIS", "actions": "click Approve"});
+        let bytes = crate::agents::approval::canonical(&unread)
+            .expect("canonical")
+            .into_bytes();
+        large["file_sha256"] = json!(sha256_hex(&bytes));
+        let resealed = sealed(large.clone(), &unread);
+        large["summary"] = resealed["summary"].clone();
+        large["binding_digest"] = resealed["binding_digest"].clone();
+        assert_eq!(
+            attached_payload(&content(large), &bytes),
+            Err(PAYLOAD_REFUSED.to_owned())
         );
     }
 

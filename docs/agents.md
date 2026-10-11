@@ -1069,7 +1069,8 @@ A call that already needs a person (T2 or more) is held one tier stricter when:
 - nobody watches it run: `kind = "scheduled"` or `"gate"`, or a workflow's run stamped
   `checkpoints = "unattended"` (`unattended`);
 - the session read outside content: its label's integrity is `untrusted` (`untrusted`);
-- its target is reached through a KVM (`kvm`; no tool of this build is).
+- its target is reached through a KVM (`kvm`): `kvm_snapshot`, `kvm_act` and every tool of a
+  NanoKVM-Go's server (§ *Another machine through a KVM*).
 
 The raise is one tier however many of these hold: a `drive_write` outside the session is T2 in
 tgorka's DM, and T3 in a delegated session, in a scheduled run, and in a session that is all three.
@@ -1310,8 +1311,10 @@ a URL that is not `http(s)://` with a host or that carries a user or password, a
 that is not a Matrix user id or `"*"`, a `fingerprint` that is not `sha256:` and 64 hex digits, a
 `role` outside `paseo`, `kvm:<id>` (and, on the Mac only, `screen`), a `[[mcp.tier]]` row whose
 `tier` is not `T0`…`T5` or whose `tool` repeats, a row on a `role` server, and two servers of one
-name are each refused naming the entry. A server with a `fingerprint` is not connected to yet:
-keeper does not check a pinned certificate for MCP servers in this version (DW-810).
+name are each refused naming the entry. A server with a `fingerprint` is spoken to only over
+`https://` whose certificate's SHA-256 is that fingerprint — a self-signed one included, since no
+authority is asked; another certificate is refused with a sentence naming both, and a pin on an
+`http://` URL pins nothing, so that server does not answer.
 
 **On the Mac.** The Mac's servers are set in Settings › Agents › *MCP servers* — the same grammar,
 kept in this Mac's `keeper.db` (never in `settings.toml`, a device file or your account's repository)
@@ -1381,8 +1384,8 @@ holds a character outside letters, digits, `-` and `_`, or a `__`, is not offere
 only when you vouch for it. A `command` server runs with the host's rights, so its tools are never
 below T2 — except the Mac's screen server, whose table is authoritative (*The Mac's screen*,
 below). A `role` server takes its role's table and nothing else: Paseo's four verbs, described to
-the model in keeper's words, and Peekaboo's table for the Mac's screen; a KVM's table comes with that
-feature, and until then none of its tools is offered. In a session that read something `untrusted`, Paseo's
+the model in keeper's words, Peekaboo's table for the Mac's screen, and a NanoKVM-Go's is its
+KVM's (§ *Another machine through a KVM*). In a session that read something `untrusted`, Paseo's
 `create_agent` and `send_agent_prompt` are refused outright, never asked.
 
 **What an approval binds.** An MCP approval is for the one call, never for the session. It binds
@@ -1699,6 +1702,108 @@ is refused there.
 for up to 180 s (Peekaboo cleans it after `autoclean_minutes`); `see` and `image` without `format:
 data` write their screenshot to a temporary file too. keeper names no path for any of them; the
 files are Peekaboo's, in your account.
+
+## Another machine through a KVM
+
+An agent on a Linux host can look at and type into another machine through a NanoKVM: a box on
+that machine's HDMI and USB that streams its screen and plays a keyboard and a mouse. Only the
+host names a KVM, in `agentd.toml` — never a drive, never a session:
+
+```toml
+[[kvm]]
+id = "desk"                       # kvm:desk; lowercase letters, digits and dashes, at most 32
+kind = "nanokvm"                  # the classic NanoKVM; "nanokvm-go" for NanoKVM-Go
+url = "https://10.0.0.5"          # https only, no user or password in it
+username = "admin"                # classic only; "admin" when left out
+credential = "secret:desk-kvm"    # its password (classic) or API key (NanoKVM-Go)
+fingerprint = "sha256:…"          # the SHA-256 of the certificate it presents
+readers = ["@tgorka:example.org"] # who sees what is typed into that machine
+```
+
+The table is closed like the rest of the file: an unknown key, a `kind` that is neither, a URL that
+is not `https://` with a host or that carries a credential, a `username` on a NanoKVM-Go, an empty
+one, and an `id` named twice are refused naming the entry. The credential comes from the host's
+secret store (§ *Secrets*) and nowhere else; a `[[kvm]]` table in an agent's `agent.toml` makes
+that file unreadable rather than naming a KVM.
+
+**Its certificate is pinned.** A KVM's certificate is self-signed, so keeper asks no authority:
+it connects only when the SHA-256 of the certificate presented is the `fingerprint`, and otherwise
+refuses with a sentence naming both fingerprints. The pin is the whole check — no name and no
+expiry date is looked at, by intent: the certificate is the device's own. Read it once from the
+device (`openssl s_client -connect 10.0.0.5:443 </dev/null | openssl x509 -outform der | sha256sum`)
+over a cable you trust. Keep the KVM on the tailnet only and its firmware at 2.3.1 or later.
+
+**Which agents.** An agent uses a KVM when its `[tools].allow` names `kvm_snapshot` or `kvm_act`
+and its `[host].needs` names `kvm:<id>` — the need is not derived from the tools, so write it. A
+classic NanoKVM is spoken by keeper itself; a NanoKVM-Go is spoken through its own MCP server,
+named as an `[[mcp]]` entry with `role = "kvm:<id>"` and listed in the agent's `[tools].mcp`. That
+entry carries no `readers`, `fingerprint` or `credential` of its own: they are its `[[kvm]]`
+entry's. Its `url` is the one spoken to; keeper does not yet check that its host is the `[[kvm]]`
+entry's (DW-1179). **A NanoKVM-Go offers only its screenshot in this version:** its click, typing,
+power and media tools are listed as not offered, because they would be approved on a card with no
+frame and sent against a screen nobody read again; they come when they ask through the same frame
+pin `kvm_act` has (DW-1174).
+
+**Looking.** `kvm_snapshot` takes one frame of the screen and runs without asking (T0). The
+model is told the frame's size — the coordinates `kvm_act` takes are its pixels, `0` to one less
+than the width and height — and the frame's SHA-256; what the screen shows is outside content,
+labelled `untrusted` and read by the KVM's `readers`, joined into the session's label. **The model
+is not shown the picture in this version** — no image reaches a provider (DW-1175) — so an agent
+cannot yet see where to click: the person sees the screen, on the card. The frame is kept under
+the sessions zone's `.keeper/previews/<sha256>.png` (the device's JPEG kept as a PNG), which never
+syncs: never in a session, never in a commit. A frame must arrive whole within 15 seconds and be
+at most 8192 pixels on a side; otherwise it is refused.
+
+**Acting.** `kvm_act` sends up to 32 inputs — `click`, `move`, `scroll`, `key` (a name or one
+character, with `ctrl`, `shift`, `alt`, `meta`), `type` (up to 256 characters of a US keyboard),
+`paste` (up to 1024, typed by the device) and `power` (`press`, `hold` to force it off, `reset`) —
+with an `intent`, a few words of what they are for. Nothing through a KVM is below T4: typing,
+clicking, a chord or a paste is T3 raised once by the KVM, and a power press is T4 as it is; other
+reasons to raise (§ *Work nobody is watching*) add nothing more. Anything that touches a security
+dialog, a password or a payment — by the intent, or by what is typed or pasted, each text alone
+and everything the call types joined across its inputs (so a card number split in two, or a
+password spelled one key at a time, still counts), a card number included, or Ctrl+Alt+Delete —
+is T5: keeper never sends it, and the person does it on that machine. The recognisers are a word
+list, a card number's checksum and one chord; what the screen shows is not read (DW-1172). A point
+on the far edge of the frame is no pixel of it: refused before anyone is asked.
+
+**The card.** Its sentence is keeper's, composed from the inputs — *2 inputs to desk: click (960,
+540), type 2 characters* — never from the intent or anything the model wrote. The card draws the
+same inputs one per line and no raw arguments — an attached action's too, which the device is
+given only as those inputs: typed and pasted text is counted, not shown, with
+its line breaks and tabs named (*type 3 characters including 1 line break*, each an Enter); keys
+pressed one character at a time are counted as a run (*6 character keys*), and so are letters and
+digits under Ctrl, Alt or Meta (*4 letter shortcuts*), which would spell a word as well; named keys
+and their chords are spelled. The person decides on the frame keeper took when it asked, which
+joins the session's label as the call waits — what the KVM shows is read by its `readers`, so
+the card goes only where they may see it: the record
+holds that frame's SHA-256 as its preview, and the card carries the image as its encrypted Matrix
+attachment. A T4 card counts only from a device other than the host's own process, and on a
+shared session only from the requester at the head of its chain. An approval is for that one call.
+
+**Before it is used.** keeper takes a fresh frame and compares it with the one decided on: the
+same size, and the difference hash of each tile of the screen (a grid of tiles at most 256
+pixels on a side: a KVM shows no windows to pin) and of the 64-pixel square around each point an
+input clicks or moves to within the bound the Mac's screen measured (seven bits) — a clock or a
+caret passes, a dialog that moved or appeared, or a window over the point, does not. A different
+screen, or a KVM that is not the one approved (another device, certificate or audience behind the
+same `id`), is drift: refused, nothing consumed, nothing sent. A host that took the session over
+re-checks against its own fresh frame; it needs no preview file. Only after the `consumed` event
+is accepted does the first input reach the KVM.
+
+**Sent is not done.** The answer says the input was sent and that whether it took effect is not
+known, with a fresh frame's size and hash; its log line's `effect` is `unverified`. Inputs that
+stop part way — some sent, then the device refuses one — are not a refusal: the answer says some
+were sent, the line's outcome is `failed` and its `effect` `unverified`, and a fresh frame is read
+the same way. Take a snapshot to see what happened. Each use logs in afresh: the classic
+NanoKVM's password travels encrypted under the key its makers publish — an obfuscation, not a
+secret — and only inside the pinned TLS. Two sessions on one host using the same KVM are not yet
+kept from interleaving their inputs (DW-1178).
+
+**A send to its readers.** An input is a send of what the session holds to the KVM's `readers`,
+checked before anything reaches the device — not even a login: a session read by tgorka and marta
+cannot type into a KVM read by anyone else. Only the NanoKVM family is spoken; PiKVM, JetKVM and
+GL.iNet Comet are not (DW-400).
 
 ## When an action waits
 
@@ -2398,7 +2503,7 @@ one `remote`. `[[trust]]` needs `user`;
 `master_key` (`ed25519:<unpadded base64>`) is written by a person after comparing the fingerprint
 with the person's own device, never by keeper, and without it the person is not pinned and no
 decision of theirs is accepted (*Deciding*). `[[mcp]]` names the agents' MCP servers (§ *MCP
-servers*); `[[kvm]]` is read and checked now and used by a later epic, each `id` once, and an
+servers*); `[[kvm]]` names the KVMs (§ *Another machine through a KVM*), each `id` once, and an
 `[[mcp]] role = "kvm:<id>"` must name a `[[kvm]] id`. `[sandbox]` is
 `run`'s (§ *Running a command*):
 

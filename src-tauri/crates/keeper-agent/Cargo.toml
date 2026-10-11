@@ -19,6 +19,15 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 ulid = { workspace = true }
+# A classic NanoKVM (96.5, AD-409): its WebSocket over keeper's own pinned
+# TLS (rustls through tokio-rustls, the stack reqwest already uses), its
+# URLs, and its JPEG frames decoded to grey (`image`'s `jpeg`, through
+# zune-jpeg) for the region hash.
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+tokio-tungstenite = { workspace = true }
+getrandom = { workspace = true }
+url = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -46,7 +55,7 @@ sse-stream = { workspace = true }
 # A screen server's screenshot, an MCP image block's base64, decoded to
 # grey for a region's difference hash before an action at coordinates is
 # approved and again before it is consumed (96.4).
-image = { workspace = true }
+image = { workspace = true, features = ["jpeg"] }
 base64 = { workspace = true }
 
 # The headless host's process layer: no secret variable and no core dump
@@ -81,3 +90,8 @@ rusqlite = { workspace = true }
 # In-test MCP servers, spoken to over a real HTTP port and a real child.
 rmcp = { workspace = true, features = ["server", "elicitation", "transport-io", "transport-streamable-http-server"] }
 axum = { workspace = true }
+# A fake classic NanoKVM checks the login's password as the device would:
+# AES-256-CBC under the published key (96.5 #3). Both in the lock.
+aes = { workspace = true }
+cbc = { workspace = true }
+rcgen = { workspace = true }

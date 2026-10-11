@@ -13,8 +13,8 @@
 //! | T1 | reversible inside the session, the surface, `delegate`, `reply`, `bmad_render`, `bmad_memlog`, `ask_human`, `journal_append`, `memory_propose`, `skill_propose` | runs it |
 //! | T2 | a drive write outside the session, a first write the grant asks for, a sandboxed `run`, an MCP tool of a server keeper starts | asks a person |
 //! | T3 | a schedule or workflow set by an agent, a declassification, a `run` with network, an MCP tool nobody vouched for | asks a person, once |
-//! | T4 | a `run` of code the session holds or given inline, a `git push --force` | the requester decides |
-//! | T5 | a write to the agent's own machine files or to `approvals/`, a `run` of `sudo` and its kin | refuses |
+//! | T4 | a `run` of code the session holds or given inline, a `git push --force`, every input through a KVM | the requester decides |
+//! | T5 | a write to the agent's own machine files or to `approvals/`, a `run` of `sudo` and its kin, a KVM input on a security dialog, a password or a payment | refuses |
 //!
 //! **The raise** (R171): a call that already needs a person (T2 and up) is
 //! one tier stricter when the session is delegated, unattended or
@@ -129,11 +129,15 @@ pub enum AgentTool {
     /// travel in the call's wire name and in what its approval binds, its
     /// row's tier in [`CallFacts::mcp`].
     Mcp,
+    /// A frame of another machine's screen through a KVM (AD-409).
+    KvmSnapshot,
+    /// Inputs to another machine through a KVM (AD-409).
+    KvmAct,
 }
 
 impl AgentTool {
     /// Every tool, in the table's order.
-    pub const ALL: [AgentTool; 34] = [
+    pub const ALL: [AgentTool; 36] = [
         AgentTool::DriveList,
         AgentTool::DriveRead,
         AgentTool::DriveGlob,
@@ -168,6 +172,8 @@ impl AgentTool {
         AgentTool::SkillApply,
         AgentTool::Run,
         AgentTool::Mcp,
+        AgentTool::KvmSnapshot,
+        AgentTool::KvmAct,
     ];
 
     /// The name the model calls (an action's own word for the actions).
@@ -207,6 +213,8 @@ impl AgentTool {
             AgentTool::SkillApply => "skill_apply",
             AgentTool::Run => "run",
             AgentTool::Mcp => "mcp",
+            AgentTool::KvmSnapshot => crate::agents::kvm::SNAPSHOT,
+            AgentTool::KvmAct => crate::agents::kvm::ACT,
         }
     }
 
@@ -242,6 +250,13 @@ pub struct CallFacts {
     /// An MCP tool's tier by its server's rule (`mcp::tier`, S-14); T3 when
     /// nothing gave it one.
     pub mcp: Option<Tier>,
+    /// An action that exists only through a KVM — power, virtual media,
+    /// firmware — whose row already counts the KVM's raise (AD-409): T4,
+    /// never raised again.
+    pub kvm_base: bool,
+    /// An input through a KVM that touches a security dialog, a password
+    /// or a payment (96.5 #5): handed to the person.
+    pub kvm_sensitive: bool,
 }
 
 /// The grant's answer for a drive verb, without its payload.
@@ -273,7 +288,9 @@ pub struct Context {
     pub unattended: bool,
     /// The session's label's integrity now.
     pub integrity: Integrity,
-    /// The target is reached through a KVM (96.5; false until then).
+    /// The target is reached through a KVM: set by the host for a
+    /// NanoKVM-Go's MCP server; `kvm_snapshot` and `kvm_act` are through one
+    /// whatever it says (R22).
     pub via_kvm: bool,
     /// The grant's answer, for a drive verb; `None` for every other tool.
     pub grant: Option<GrantWord>,
@@ -443,7 +460,13 @@ fn row(tool: AgentTool, facts: &CallFacts) -> Tier {
         AgentTool::Run if facts.held_code || facts.force_push => Tier::T4,
         AgentTool::Run if facts.network => Tier::T3,
         AgentTool::Run => Tier::T2,
+        AgentTool::Mcp | AgentTool::KvmAct if facts.kvm_sensitive => Tier::T5,
         AgentTool::Mcp => facts.mcp.unwrap_or(Tier::T3),
+        AgentTool::KvmSnapshot => Tier::T0,
+        AgentTool::KvmAct if facts.kvm_base => Tier::T4,
+        // Typing, clicking, a chord, a paste: what it does, as on a screen,
+        // is T3; the KVM's raise makes it T4 (AD-409).
+        AgentTool::KvmAct => Tier::T3,
     }
 }
 
@@ -451,7 +474,8 @@ fn row(tool: AgentTool, facts: &CallFacts) -> Tier {
 /// asks (the higher wins), then raised once when it needs a person already
 /// and any reason holds — except the consolidator's host actions, whose
 /// person decides by construction: fixed T2 in every context (R128), their
-/// reasons still listed.
+/// reasons still listed — and a KVM's power, media and firmware actions,
+/// whose base carries the KVM's raise (AD-409): counted once, never twice.
 pub fn classify(tool: AgentTool, facts: &CallFacts, context: &Context) -> Classification {
     let grant_floor = match context.grant {
         Some(GrantWord::Ask) => Tier::T2,
@@ -462,12 +486,15 @@ pub fn classify(tool: AgentTool, facts: &CallFacts, context: &Context) -> Classi
         (context.delegated, Raise::Delegated),
         (context.unattended, Raise::Unattended),
         (context.integrity <= Integrity::Untrusted, Raise::Untrusted),
-        (context.via_kvm, Raise::Kvm),
+        (
+            context.via_kvm || matches!(tool, AgentTool::KvmSnapshot | AgentTool::KvmAct),
+            Raise::Kvm,
+        ),
     ]
     .into_iter()
     .filter_map(|(holds, raise)| holds.then_some(raise))
     .collect();
-    let fixed = matches!(tool, AgentTool::MemoryApply | AgentTool::SkillApply);
+    let fixed = matches!(tool, AgentTool::MemoryApply | AgentTool::SkillApply) || facts.kvm_base;
     let tier = if !fixed && base_tier >= Tier::T2 && !raised_by.is_empty() {
         base_tier.raised()
     } else {
@@ -812,6 +839,14 @@ mod tests {
                         ..CallFacts::default()
                     };
                     assert_eq!(tier(tool, row), Tier::T0);
+                }
+                // Their facts' rows are `kvm::tests::kvm_tier_rows`'s; the
+                // KVM's raise is theirs in every context.
+                AgentTool::KvmSnapshot => {
+                    assert_eq!(tier(tool, CallFacts::default()), Tier::T0);
+                }
+                AgentTool::KvmAct => {
+                    assert_eq!(tier(tool, CallFacts::default()), Tier::T4);
                 }
             }
         }

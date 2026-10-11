@@ -410,6 +410,9 @@ pub fn summary_of(tool: AgentTool, args: &Value, exec_binding: &Value) -> String
         }
         AgentTool::Run => crate::agents::run::summary(args, exec_binding),
         AgentTool::Mcp => crate::agents::mcp::summary(args, exec_binding),
+        AgentTool::KvmSnapshot | AgentTool::KvmAct => {
+            crate::agents::kvm::summary(tool.as_wire(), args)
+        }
     }
 }
 

@@ -25,6 +25,11 @@ regex = { workspace = true }
 # links this one; `indexmap` is already in the lock under `toml`.
 toml = { workspace = true, features = ["preserve_order"] }
 unicode-normalization = { workspace = true }
+# `nanokvm::login_password`: the classic NanoKVM's login encrypts the password
+# as its reference documents (AES-256-CBC, base64); all three in the lock.
+aes = { workspace = true }
+cbc = { workspace = true }
+base64 = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

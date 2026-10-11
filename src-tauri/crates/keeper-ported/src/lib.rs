@@ -13,5 +13,6 @@
 pub mod agentskills;
 pub mod bmad;
 pub mod hermes;
+pub mod nanokvm;
 pub mod okf;
 pub mod openclaw;

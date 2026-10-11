@@ -9143,7 +9143,7 @@ status: open
 origin: epic 96, story 96.2 (rung `agents-96-mcp`, 2026-10-07)
 location: `src-tauri/crates/keeper-agent/src/mcp.rs` (`Server::connect`)
 reason: `[[mcp]] fingerprint` parses (`sha256:` and 64 hex), but keeper-agent has no rustls verifier that accepts exactly the pinned certificate yet (codemap §1.2 names 96.5's KVM verifier for it). Rather than connect over the system roots and ignore the pin, a server with a `fingerprint` is reported as not answering ("a pinned certificate is not yet checked for MCP servers") and never offered. Close with the pinned verifier (96.5's, `dangerous()` builder, no `danger_accept_invalid_certs`) handed to the reqwest client of that server, and an in-test TLS server with a self-signed certificate.
-status: open
+status: closed 2026-10-11 (rung `agents-96-kvm`): `[[mcp]] fingerprint` is checked by `keeper_agent::kvm::tls::client` — the server is spoken to only over https whose certificate's SHA-256 is the pin, another certificate is refused naming both fingerprints, a pin over http does not answer; `mcp_a_pinned_server_answers_only_with_its_certificate` over an in-test TLS server with a self-signed certificate made per run. Supersedes R221 (R320).
 
 ### DW-811: An MCP call its sink blocks is refused, never parked as a declassification.
 
@@ -9157,8 +9157,9 @@ status: open
 origin: epic 96, story 96.2 (rung `agents-96-mcp`, 2026-10-07)
 location: `src-tauri/crates/keeper-core/src/agents/mcp.rs` (`role_row`)
 reason: a role server takes its role's table and nothing else (96.2 #6). Paseo's four rows are here (R24(2)); the screen table over Peekaboo's 27 tools is 96.4's (Q11, R151) and a KVM's MCP table is 96.5's, so until those rungs every tool of such a server is listed as not offered, with why. Close in `agents-96-screen` and `agents-96-kvm`.
-status: open
-resolution (screen half, 2026-10-11, rung `agents-96-screen`, R150/R151): `mcp::role_row` reads `screen::row` (Peekaboo 3.9.8's 27 tools; `agent`, `analyze`, `browser` never offered); proved by `screen::tests::peekaboo_tool_table_covers_the_fixture` and `mcp::tests`' screen case. The KVM half stays open for `agents-96-kvm`.
+status: closed
+resolution (screen half, 2026-10-11, rung `agents-96-screen`, R150/R151): `mcp::role_row` reads `screen::row` (Peekaboo 3.9.8's 27 tools; `agent`, `analyze`, `browser` never offered); proved by `screen::tests::peekaboo_tool_table_covers_the_fixture` and `mcp::tests`' screen case.
+resolution (KVM half, 2026-10-11, rung `agents-96-kvm`, R323; joined at the restack onto 6f0dfc8a): a `kvm:<id>` server takes `kvm::role_row` (a NanoKVM-Go's screenshot alone); proved by `mcp::tests`' KVM case.
 
 ### DW-813: An MCP call does not read the turn's stop.
 
@@ -9656,4 +9657,75 @@ status: open
 origin: epic 96, story 96.4 (rung `agents-96-screen`, review-96screen-1 / R316, 2026-10-11)
 location: `keeper-core/src/agents/screen.rs` `inspect_args`
 reason: the element re-read before a consumed action targets `"<app>:<window>"`; a window title holding `:` or an app named like `PID:…` is read another way by Peekaboo (`PID:PROCESS_ID:WindowTitle`). It fails closed (the re-read names another window and the action drifts) but a correct window can drift too. Close with Peekaboo's quoting rule confirmed and applied, or such a window refused at pin time, and a test.
+status: open
+
+### DW-1170: The KVM's frame pin is proved on synthetic frames, not a device's.
+
+origin: epic 96, story 96.5 (rung `agents-96-kvm`, 2026-10-11)
+location: `src-tauri/crates/keeper-core/src/agents/kvm.rs` (`frame_pin`, `frame_holds`), `src-tauri/crates/keeper-agent/src/approvals.rs` (`kvm_moved`)
+reason: no NanoKVM is on the network (96.5's operator checks). `kvm_frame_pin_bounds` and `kvm_drift_refuses` use generated frames — a gradient, a striped dialog, a clock patch — encoded as JPEG in the test. A real target's screen (a blinking cursor in a terminal, video, an animated login screen) may move a 64-pixel square past the bound (`screen::DHASH_BOUND`) and make every approval drift, or a JPEG of a busy screen may hide a small change under it. Close on the device: capture frames of an idle desktop a minute apart and of a dialog moved 40 px, commit them as fixtures, and re-run the bound against them.
+also (review-96tail-fix1 / R328, 2026-10-11): since the restack the KVM's tiles use the shared `screen::DHASH_BOUND` 7, measured on the screen's PNG fixtures — the false-drift rate of a 7-bit bound over 40+ tiles of a re-encoded MJPEG frame is unmeasured. Measure it on those device frames, and give the KVM a bound of its own if 7 drifts an idle screen.
+status: open
+
+### DW-1171: A NanoKVM-Go's MCP tools are tiered by their names alone.
+
+origin: epic 96, story 96.5 (rung `agents-96-kvm`, 2026-10-11)
+location: `src-tauri/crates/keeper-core/src/agents/kvm.rs` (`role_row`)
+reason: NanoKVM-Go's `/api/mcp` tool list is `[UNVERIFIED]` (epic §14): no device has answered `tools/list`. Since R323 `role_row` offers a screenshot-named tool alone, at T0; every other tool is not offered (DW-1174), so a screenshot tool named otherwise is not offered either. Close with the captured `tools/list` committed as a fixture and a table naming every tool, as 96.4 did for Peekaboo.
+status: open
+
+### DW-1172: A security dialog, password or payment is recognised from the agent's words and the inputs, not from the screen.
+
+origin: epic 96, story 96.5 (rung `agents-96-kvm`, 2026-10-11)
+location: `src-tauri/crates/keeper-core/src/agents/kvm.rs` (`SENSITIVE`, `sensitive`, `sensitive_args`)
+reason: 96.5 #5 puts anything touching a security dialog, a password or a payment at T5. keeper recognises it from the `intent`, from typed and pasted text — each text alone and, since R321, everything a call types joined across its inputs, character keys included — by a fixed English/German word list and a Luhn-valid 13–19 digit number, and from Ctrl+Alt+Delete (one chord: Ctrl+Alt+Insert, Ctrl+Alt+End and Win+L are not on the list); it does not read the frame, so a click on a dialog's "Allow" whose intent says "close the popup" is T4, decided by a person who sees the frame on the card. Text split across two calls is not joined. Reading the frame (OCR, an accessibility read of the target) is out of reach of a KVM.
+status: open
+
+### DW-1173: `kvm_act` types only what a US keyboard types.
+
+origin: epic 96, story 96.5 (rung `agents-96-kvm`, 2026-10-11)
+location: `src-tauri/crates/keeper-ported/src/nanokvm/mod.rs` (`char_key`), `src-tauri/crates/keeper-core/src/agents/kvm.rs` (`parse_act`)
+reason: a `type` input is sent as US-layout HID keycodes and a `paste` with `langue = ""`; a character no US key types is refused before anything is sent, and a target whose layout is not US gets other characters for the punctuation keys. The reference documents `"de"` for paste only. Close with a per-`[[kvm]]` `layout` and its keymap.
+status: open
+
+### DW-1174: A NanoKVM-Go's inputs are not offered until they ask through the frame pin.
+
+origin: epic 96, story 96.5 (rung `agents-96-kvm`, review-96kvm-1.md R96K1-01, R323, 2026-10-11)
+location: `src-tauri/crates/keeper-core/src/agents/kvm.rs` (`role_row`, `INPUTS_NOT_OFFERED`), `src-tauri/crates/keeper-agent/src/approvals.rs` (`kvm_moved`), `src-tauri/crates/keeper-agent/src/agent.rs` (the MCP park)
+reason: a NanoKVM-Go input parked through the generic MCP park would carry no preview and no `preconditions.screen`, and `kvm_moved` re-reads only `kvm_act` records — approved on a card with no frame, sent against a screen nobody read again. Since R323 a `role = "kvm:<id>"` server offers its screenshot alone. Close by routing its inputs through `kvm_act`'s park: its screenshot tool taken as keeper's own read (as 96.4's `screen_pin`), pinned with `kvm::frame_pin`, attached as the preview, and re-read in `kvm_moved` by the server's screenshot tool before the consumed mark; needs DW-1171's `tools/list`.
+status: open
+
+### DW-1175: The model is shown no picture of a KVM's screen.
+
+origin: epic 96, story 96.5 (rung `agents-96-kvm`, review-96kvm-1.md R96K1-03, R323, 2026-10-11; the KVM's twin of DW-1163)
+location: `src-tauri/crates/keeper-agent/src/agent.rs` (`kvm_snapshot`, `frame_said`), `src-tauri/crates/keeper-agent/src/mcp.rs` (an MCP image block rendered as "not shown")
+reason: `kvm_snapshot` tells the model the frame's size and its preview's hash; the pixels reach only the card. A KVM has no text read of the target (no accessibility tree, no OCR), so every `kvm_act` is placed at coordinates the model never saw: FR-813 "an agent can see another machine through a KVM" is not met until this closes. Sending an image to a provider is a new sink: decide it gated by the frame's label (its readers, `local_only`) and `BotModelVm.vision`, together with DW-1163.
+status: open
+
+### DW-1176: Every `kvm_snapshot` writes a preview PNG no record refers to.
+
+origin: epic 96, story 96.5 (rung `agents-96-kvm`, review-96kvm-1.md, R323, 2026-10-11)
+location: `src-tauri/crates/keeper-agent/src/agent.rs` (`kvm_frame`), `src-tauri/crates/keeper-agent/src/previews.rs`
+reason: `kvm_frame` keeps every frame under the sessions zone's `.keeper/previews/`, the snapshot's and the fresh frame after the inputs as well as the one a record pins; only the last is ever a card's attachment. DW-1164's retention problem grows with each snapshot a model takes. Close by keeping a frame only when a record names it, or by DW-1164's retention naming the snapshot path.
+status: open
+
+### DW-1177: Five facts of the classic NanoKVM are the reference's reading, not a device's.
+
+origin: epic 96, story 96.5 (rung `agents-96-kvm`, review-96kvm-1.md R96K1-09, R323, 2026-10-11)
+location: `src-tauri/crates/keeper-core/src/agents/kvm.rs` (`steps`), `src-tauri/crates/keeper-ported/src/nanokvm/mod.rs` (`mouse`, `first_jpeg`'s successor `JpegCut`)
+reason: owed device checks, each `[UNVERIFIED]` until a NanoKVM answers: a release is `[2,2,0,0,0]` whatever button was pressed (a right-click released with button 0); a scroll is one frame per step with `y = signum`, positive down; Ctrl+Alt+Delete reaches the target as `[1,76,1,0,4,0]`; the device re-encodes a static screen deterministically enough for the tiles' bound (count refusals over an idle minute, with DW-1170); and `JpegCut` cuts at the first `FF D9` after `FF D8`, so a frame carrying an EXIF thumbnail would be cut at the thumbnail's end and refused as not decoding (fails closed). Close on the first device run.
+status: open
+
+### DW-1178: Two sessions on one host using the same KVM can interleave their inputs.
+
+origin: epic 96, story 96.5 (rung `agents-96-kvm`, review-96kvm-1.md, R323, 2026-10-11)
+location: `src-tauri/crates/keeper-agent/src/kvm/mod.rs` (`Classic::send`), `src-tauri/crates/keeper-agent/src/agent.rs` (`kvm_act`)
+reason: each `send` opens its own WebSocket and logs in afresh, so two approved `kvm_act`s of two sessions naming one KVM reach the device's one keyboard interleaved, and each session's fresh frame may show the other's effect. Close with a per-KVM mutex in `Kvms` held around `send` and the fresh frame after it.
+status: open
+
+### DW-1179: A `role = "kvm:<id>"` server's URL is not tied to its `[[kvm]]` entry's host.
+
+origin: epic 96, story 96.5 (rung `agents-96-kvm`, review-96kvm-1.md R96K1-11b, R323, 2026-10-11)
+location: `src-tauri/crates/keeper-core/src/agents/mcp.rs` (`check`, the `McpRole::Kvm` arm)
+reason: the `[[mcp]]` entry takes its readers, fingerprint and credential from the `[[kvm]]` entry but keeps its own `url`; the pinned certificate keeps the credential from reaching anyone else, so this is hygiene, and `docs/agents.md` says the `[[mcp]]` URL is the one spoken to. Close by refusing a `role = "kvm:<id>"` whose URL host differs from its `[[kvm]]`'s.
 status: open

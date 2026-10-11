@@ -455,6 +455,7 @@ pub(crate) fn deps_over(
         decisions: None,
         sandbox: None,
         mcp: None,
+        kvm: None,
     })
 }
 
@@ -854,6 +855,19 @@ pub async fn run(
             })
             .collect(),
     ));
+    // The `[[kvm]]` entries, each with its credential from the secret store
+    // and never from a drive (96.5 #8): a classic NanoKVM's password, a
+    // NanoKVM-Go's key (handed to its `[[mcp]]` entry above, F15).
+    let kvm = Arc::new(crate::kvm::Kvms::new(
+        config
+            .kvm
+            .iter()
+            .map(|entry| {
+                let password = secrets.get(entry.credential.name()).ok().flatten();
+                (entry.clone(), password)
+            })
+            .collect(),
+    ));
 
     let sessions_zones: Vec<PathBuf> = drives
         .iter()
@@ -918,6 +932,7 @@ pub async fn run(
                 })),
                 sandbox: sandbox.clone(),
                 mcp: Some(Arc::clone(&mcp)),
+                kvm: Some(Arc::clone(&kvm)),
                 ..deps
             }),
             Err(sentence) => {

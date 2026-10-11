@@ -338,6 +338,8 @@ pub(crate) struct Released {
 pub(crate) struct ApprovedRun {
     pub exec_binding: Value,
     pub workspace: Option<Value>,
+    /// A KVM action's frame pin, whose size its coordinates are mapped by.
+    pub screen: Option<Value>,
 }
 
 /// What became of a parked call when it was settled.
@@ -2123,6 +2125,7 @@ impl ServedSession {
                 truncated: None,
                 label: self.context.label.clone(),
                 paseo: None,
+                effect: None,
             });
             if let Err(error) = self
                 .writer
@@ -2276,15 +2279,68 @@ impl ServedSession {
     }
 }
 
-/// What a consumed `run` or MCP record was checked against; `None` for
-/// every other tool.
+/// What a `kvm_act` record relied on, read from the KVM before its approval
+/// is consumed (96.5 #6, R144's KVM part): this host still names the KVM
+/// as the record bound it — the same device, certificate and readers — and
+/// a fresh frame of its screen is the size the inputs were mapped on, the
+/// whole frame and the square around each point within the difference
+/// hash's bound. A host that took the park over has no preview and needs
+/// none: the fresh frame is the check.
+async fn kvm_moved(deps: &AgentDeps, record: &ApprovalRecord) -> Option<String> {
+    use keeper_core::agents::kvm as core_kvm;
+    if record.action.tool != AgentTool::KvmAct.as_wire() {
+        return None;
+    }
+    let moved = |what: String| {
+        tracing::warn!(approval = %record.id, "agents: a KVM action's KVM or screen changed after its approval");
+        Some(what)
+    };
+    let Some(id) = record.action.exec_binding["kvm"].as_str() else {
+        return moved("its record names no KVM".to_owned());
+    };
+    let Some(kvms) = deps.kvm.as_ref() else {
+        return moved(format!("this host no longer names the KVM `{id}`"));
+    };
+    match kvms.entry(id) {
+        Some(entry) if core_kvm::binding(entry) == record.action.exec_binding => {}
+        _ => return moved(format!("the KVM `{id}` is not the one it was approved for")),
+    }
+    let Some(pin) = record
+        .preconditions
+        .screen
+        .clone()
+        .and_then(|pin| serde_json::from_value::<core_kvm::FramePin>(pin).ok())
+    else {
+        return moved("its record pins no screen".to_owned());
+    };
+    let classic = match kvms.classic(id) {
+        Ok(classic) => classic,
+        Err(why) => return moved(why),
+    };
+    let frame = match classic.snapshot().await {
+        Ok(frame) => frame,
+        Err(why) => return moved(format!("its screen could not be read again: {why}")),
+    };
+    let grey = &frame.grey;
+    if !core_kvm::frame_holds(&pin, &grey.pixels, grey.width, grey.height) {
+        return moved(format!(
+            "the screen of `{id}` changed after it was approved"
+        ));
+    }
+    None
+}
+
+/// What a consumed `run`, MCP or KVM record was checked against; `None`
+/// for every other tool.
 fn approved_run(record: &ApprovalRecord) -> Option<Box<ApprovedRun>> {
     (record.action.tool == AgentTool::Run.as_wire()
-        || record.action.tool == AgentTool::Mcp.as_wire())
+        || record.action.tool == AgentTool::Mcp.as_wire()
+        || record.action.tool == AgentTool::KvmAct.as_wire())
     .then(|| {
         Box::new(ApprovedRun {
             exec_binding: record.action.exec_binding.clone(),
             workspace: record.preconditions.workspace.clone(),
+            screen: record.preconditions.screen.clone(),
         })
     })
 }
@@ -2397,13 +2453,16 @@ async fn mcp_moved(deps: &AgentDeps, record: &ApprovalRecord) -> Option<String> 
 }
 
 /// What a record's call reaches outside keeper, read again before its
-/// approval is consumed: its MCP server (R144), then the screen it acts on.
-/// The first that moved, and how.
+/// approval is consumed: its MCP server (R144), then the Mac's screen or
+/// the KVM's screen it acts on. The first that moved, and how.
 async fn outside_moved(deps: &AgentDeps, record: &ApprovalRecord) -> Option<String> {
     if let Some(moved) = mcp_moved(deps, record).await {
         return Some(moved);
     }
-    screen_moved(deps, record).await
+    if let Some(moved) = screen_moved(deps, record).await {
+        return Some(moved);
+    }
+    kvm_moved(deps, record).await
 }
 
 /// What a screen action's record was pinned by, read from the screen again

@@ -1089,6 +1089,11 @@ pub struct AgentDeps {
     /// The MCP servers this host names (96.2): an agent is offered the
     /// tools of those its `[tools].mcp` lists while they answer.
     pub mcp: Option<Arc<crate::mcp::McpServers>>,
+    /// The KVMs this host names (96.5, AD-409), each with the credential
+    /// its secret store holds: an agent is offered `kvm_snapshot` and
+    /// `kvm_act` for the classic NanoKVMs its `[host].needs` names as
+    /// `kvm:<id>`; a NanoKVM-Go is reached through `mcp`.
+    pub kvm: Option<Arc<crate::kvm::Kvms>>,
 }
 
 impl AgentDeps {
@@ -1130,6 +1135,9 @@ struct AllowedTools<'t> {
     /// The agent's MCP servers on this host (96.2); `None` where it names
     /// none.
     mcp: Option<McpTools>,
+    /// The agent's classic NanoKVMs on this host (96.5); `None` where it
+    /// may use none.
+    kvm: Option<KvmTools>,
     view: &'t dyn TurnView,
     sinks: &'t Sinks,
     /// The declarations of the drives this host mounts: a write's audience.
@@ -1216,6 +1224,27 @@ impl AllowedTools<'_> {
             ..self.context()
         };
         let classification = tier::classify(tool, facts, &context);
+        self.keep_tier(id, classification)
+    }
+
+    /// [`Self::classify`] for a call whose target is reached through a KVM
+    /// when `via_kvm` (R22): a NanoKVM-Go's MCP server.
+    fn classify_via(
+        &self,
+        id: &str,
+        tool: AgentTool,
+        facts: &CallFacts,
+        via_kvm: bool,
+    ) -> Classification {
+        let context = Context {
+            via_kvm,
+            ..self.context()
+        };
+        let classification = tier::classify(tool, facts, &context);
+        self.keep_tier(id, classification)
+    }
+
+    fn keep_tier(&self, id: &str, classification: Classification) -> Classification {
         self.tiers
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -1369,9 +1398,10 @@ impl AllowedTools<'_> {
     fn table_tier(&self, wire: &chat::ToolCall, default_profile_id: &str) -> u8 {
         let context = self.context();
         if let Some(listed) = self.mcp_offered(&wire.name) {
-            let facts = CallFacts {
-                mcp: listed.tier.ok(),
-                ..CallFacts::default()
+            let facts = mcp_facts(&listed, wire.arguments.as_ref());
+            let context = Context {
+                via_kvm: kvm_role(&listed),
+                ..context
             };
             return tier::classify(AgentTool::Mcp, &facts, &context)
                 .tier
@@ -1386,6 +1416,9 @@ impl AllowedTools<'_> {
                 self.landed_facts(&call.target.profile_id, &call.target.subpath)
             }
             Ok(_) => CallFacts::default(),
+            Err(_) if tool == AgentTool::KvmAct => keeper_core::agents::kvm::parse_act(args)
+                .map(|act| keeper_core::agents::kvm::act_facts(&act))
+                .unwrap_or_default(),
             Err(_) if crate::cards::is_card_tool(&wire.name) => {
                 let landed = self.landed_facts(&self.home.id, &self.card_at(tool, args));
                 tier::named_facts(tool, args, landed)
@@ -1946,6 +1979,62 @@ impl AllowedTools<'_> {
     }
 }
 
+/// What a turn's KVM calls work with (96.5): the host's KVMs, the classic
+/// ones this agent may use, the sessions zone its previews are kept in, and
+/// what each frame that just came back is labelled.
+struct KvmTools {
+    kvms: Arc<crate::kvm::Kvms>,
+    ids: Vec<String>,
+    zone: PathBuf,
+    answers: Mutex<Vec<KvmAnswered>>,
+}
+
+/// One KVM call's answer: the label its frame joins, where it was read,
+/// what keeper knows of the effect of inputs it sent, and whether they
+/// stopped part way (its line's outcome is then `failed`, R96K1-07).
+struct KvmAnswered {
+    label: Label,
+    at: String,
+    effect: Option<&'static str>,
+    stopped: bool,
+}
+
+impl KvmTools {
+    /// The answer the call that just ended got, if it got one.
+    fn take(&self) -> Option<KvmAnswered> {
+        self.answers.lock().unwrap_or_else(|p| p.into_inner()).pop()
+    }
+}
+
+/// The classic NanoKVMs an agent may use on this host: those its
+/// `[host].needs` names as `kvm:<id>`, when `[tools].allow` names a KVM
+/// tool. A NanoKVM-Go is not one of them: its own MCP server speaks it.
+fn kvm_ids(
+    config: &keeper_core::agents::home::AgentConfig,
+    kvms: Option<&crate::kvm::Kvms>,
+) -> Vec<String> {
+    use keeper_core::agents::kvm as core_kvm;
+    let Some(kvms) = kvms else {
+        return Vec::new();
+    };
+    if !config
+        .allow
+        .iter()
+        .any(|name| name == core_kvm::SNAPSHOT || name == core_kvm::ACT)
+    {
+        return Vec::new();
+    }
+    let classic: Vec<&str> = kvms.ids(core_kvm::KvmKind::NanoKvm).collect();
+    config
+        .host
+        .needs
+        .iter()
+        .filter_map(|need| need.strip_prefix(core_kvm::CAPABILITY_PREFIX))
+        .filter(|id| classic.contains(id))
+        .map(str::to_owned)
+        .collect()
+}
+
 /// The drives a run of `context`'s session may mount on this host: in its
 /// scope, checked out here, and readable under the agent's grants exactly
 /// as a `drive_read` of the drive is (NFR-115, R213).
@@ -2179,14 +2268,15 @@ impl AllowedTools<'_> {
                     approved.as_ref(),
                 )
             });
-        let facts = CallFacts {
-            mcp: match &screen {
-                Some(Ok(aimed)) => Some(aimed.tier),
-                _ => offered.as_ref().and_then(|listed| listed.tier.clone().ok()),
-            },
-            ..CallFacts::default()
-        };
-        let classification = self.classify(&wire.id, AgentTool::Mcp, &facts, None);
+        let mut facts = offered.as_ref().map_or_else(CallFacts::default, |listed| {
+            mcp_facts(listed, wire.arguments.as_ref())
+        });
+        if let Some(Ok(aimed)) = &screen {
+            facts.mcp = Some(aimed.tier);
+        }
+        // A NanoKVM-Go's tools reach another machine through it (R22).
+        let via_kvm = offered.as_ref().is_some_and(kvm_role);
+        let classification = self.classify_via(&wire.id, AgentTool::Mcp, &facts, via_kvm);
         let refused = |reason: String| {
             CallAudit::new(
                 self.sinks,
@@ -2239,7 +2329,11 @@ impl AllowedTools<'_> {
             return refused(reason);
         }
         if classification.gate() == Gate::Refuse {
-            return refused(FORBIDDEN.to_owned());
+            return refused(if facts.kvm_sensitive {
+                keeper_core::agents::kvm::HANDED_TO_PERSON.to_owned()
+            } else {
+                FORBIDDEN.to_owned()
+            });
         }
         // Which broker this is, and whose runs it may be asked about, come
         // from the one listing this call is classified, bound and sent from.
@@ -2441,6 +2535,379 @@ impl AllowedTools<'_> {
         };
         audit.finish(&outcome);
         outcome
+    }
+}
+
+impl AllowedTools<'_> {
+    /// The KVM tools and the classic NanoKVM `id` a call of `name` names,
+    /// when this agent may use both here.
+    fn kvm_offered(&self, name: &str, id: &str) -> Result<&KvmTools, String> {
+        let tools = self
+            .kvm
+            .as_ref()
+            .filter(|_| self.allow.iter().any(|allowed| allowed == name))
+            .ok_or_else(|| format!("{name} is not one of this agent's tools on this host."))?;
+        if !tools.ids.iter().any(|offered| offered == id) {
+            return Err(
+                "That is not a KVM this agent may use on this host; nothing was sent.".to_owned(),
+            );
+        }
+        Ok(tools)
+    }
+
+    /// One frame of `classic`'s screen, kept as a preview under the
+    /// sessions zone's `.keeper/previews/` (S-18): the frame and its hash.
+    fn kvm_frame(
+        tools: &KvmTools,
+        classic: &crate::kvm::Classic,
+    ) -> Result<crate::kvm::Frame, String> {
+        let taking = {
+            let classic = classic.clone();
+            tokio::spawn(async move { classic.snapshot().await })
+        };
+        let frame = delegate::block_on(taking).unwrap_or_else(|_| {
+            Err(format!(
+                "the frame of `{}` was not read: the read ended without an answer",
+                classic.entry.id
+            ))
+        })?;
+        crate::agent::off_the_runtime(|| crate::previews::write(&tools.zone, &frame.png, "png"))
+            .map_err(|error| {
+                format!(
+                    "the frame of `{}` could not be kept: {error}",
+                    classic.entry.id
+                )
+            })?;
+        Ok(frame)
+    }
+
+    /// What a frame is told to the model: the screen is outside content,
+    /// its size is what the inputs' coordinates are pixels of.
+    fn frame_said(id: &str, frame: &crate::kvm::Frame) -> String {
+        format!(
+            "A frame of `{id}`: {}×{} pixels (its preview is sha256:{}). kvm_act's coordinates are this frame's pixels.",
+            frame.grey.width,
+            frame.grey.height,
+            frame.sha256
+        )
+    }
+
+    /// A `kvm_snapshot` call (96.5 #5): T0, run without asking; a read
+    /// that sends nothing of the session; its frame kept as a preview and
+    /// labelled `untrusted`, read by the KVM's readers (AD-409).
+    fn kvm_snapshot(&self, wire: &chat::ToolCall) -> ToolOutcome {
+        use keeper_core::agents::kvm as core_kvm;
+        let name = wire.name.as_str();
+        let args = wire.arguments.as_ref().unwrap_or(&Value::Null);
+        let classification = self.classify(
+            &wire.id,
+            AgentTool::KvmSnapshot,
+            &CallFacts::default(),
+            None,
+        );
+        let named = core_kvm::parse_snapshot(args);
+        let at = format!(
+            "{}{}",
+            core_kvm::CAPABILITY_PREFIX,
+            named.as_deref().unwrap_or_default()
+        );
+        let refused = |reason: String| {
+            CallAudit::new(
+                self.sinks,
+                name,
+                Effect::Read,
+                &classification,
+                Gated::Run(None),
+                ("", &at),
+            )
+            .refuse(reason)
+        };
+        let id = match named {
+            Ok(id) => id,
+            Err(reason) => return refused(reason),
+        };
+        let tools = match self.kvm_offered(name, &id) {
+            Ok(tools) => tools,
+            Err(reason) => return refused(reason),
+        };
+        let (Some(entry), Ok(classic)) = (tools.kvms.entry(&id), tools.kvms.classic(&id)) else {
+            return refused(format!("{name} cannot reach `{id}` on this host."));
+        };
+        let gated = self.gated(&wire.id, name, &classification, &[], Vec::new());
+        let audit = CallAudit::new(
+            self.sinks,
+            name,
+            Effect::Read,
+            &classification,
+            gated,
+            ("", &at),
+        );
+        if let Err(withheld) = audit.admit("", &at) {
+            let outcome = withheld.into();
+            audit.finish(&outcome);
+            return outcome;
+        }
+        let outcome = match Self::kvm_frame(tools, &classic) {
+            Ok(frame) => {
+                tools
+                    .answers
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push(KvmAnswered {
+                        label: core_kvm::result_label(entry),
+                        at: at.clone(),
+                        effect: None,
+                        stopped: false,
+                    });
+                ToolOutcome::Answered {
+                    text: format!(
+                        "{}\n{}",
+                        core_kvm::SCREEN_IS_DATA,
+                        Self::frame_said(&id, &frame)
+                    ),
+                }
+            }
+            Err(reason) => ToolOutcome::Refused { reason },
+        };
+        audit.finish(&outcome);
+        outcome
+    }
+
+    /// A `kvm_act` call (96.5, AD-409), in the order every call keeps (R82,
+    /// R90): its inputs read and bounded, and its tier from them — T4, or
+    /// T5 and handed to the person when it touches a security dialog, a
+    /// password or a payment; a send to the KVM's readers checked before
+    /// anything reaches it (#9, R145: a block is refused, never parked);
+    /// parked on a record binding the KVM (R144) whose preview is a frame
+    /// taken now and whose `preconditions.screen` pins it (#6, S-18); an
+    /// approved call sent only while the KVM is the one the consume path
+    /// checked, its inputs mapped on the frame that was pinned; its audit
+    /// row before the first input; then sent, and answered with what is
+    /// known — that it was sent — and a fresh frame (#7).
+    fn kvm_act(&self, wire: &chat::ToolCall) -> ToolOutcome {
+        use keeper_core::agents::kvm as core_kvm;
+        let name = wire.name.as_str();
+        let args = wire.arguments.as_ref().unwrap_or(&Value::Null);
+        let parsed = core_kvm::parse_act(args);
+        let facts = parsed.as_ref().map(core_kvm::act_facts).unwrap_or_default();
+        let classification = self.classify(&wire.id, AgentTool::KvmAct, &facts, None);
+        let at = format!(
+            "{}{}",
+            core_kvm::CAPABILITY_PREFIX,
+            core_kvm::named_kvm(args).unwrap_or_default()
+        );
+        let refused = |reason: String| {
+            CallAudit::new(
+                self.sinks,
+                name,
+                Effect::Write,
+                &classification,
+                Gated::Run(self.bound_approval(&wire.id, name).map(Approval::Approved)),
+                ("", &at),
+            )
+            .refuse(reason)
+        };
+        let act = match parsed {
+            Ok(act) => act,
+            Err(reason) => return refused(reason),
+        };
+        let tools = match self.kvm_offered(name, &act.kvm) {
+            Ok(tools) => tools,
+            Err(reason) => return refused(reason),
+        };
+        if classification.gate() == Gate::Refuse {
+            return refused(if facts.kvm_sensitive {
+                core_kvm::HANDED_TO_PERSON.to_owned()
+            } else {
+                FORBIDDEN.to_owned()
+            });
+        }
+        let (Some(entry), Ok(classic)) = (tools.kvms.entry(&act.kvm), tools.kvms.classic(&act.kvm))
+        else {
+            return refused(format!("{name} cannot reach `{}` on this host.", act.kvm));
+        };
+        if let SinkVerdict::Block { reason, .. } =
+            check_sink(&self.view.label(), &core_kvm::sink(entry))
+        {
+            return refused(format!(
+                "{reason} The KVM `{}` is read by {}. Nothing was sent to it.",
+                act.kvm,
+                readers_named(&entry.readers)
+            ));
+        }
+        let binding = core_kvm::binding(entry);
+        let bound = self.bound_approval(&wire.id, name);
+        // The frame its inputs are mapped on: the one its approval pinned,
+        // or — before anyone was asked — one taken now, which the person
+        // decides on.
+        let (steps, taken) = if bound.is_some() {
+            let pin = self
+                .bound_checked(&wire.id, name)
+                .filter(|checked| checked.exec_binding == binding)
+                .and_then(|checked| checked.screen)
+                .and_then(|pin| serde_json::from_value::<core_kvm::FramePin>(pin).ok());
+            let Some(pin) = pin else {
+                return refused(format!(
+                    "It was not done: the KVM `{}` is not the one it was approved for. Nothing was sent to it.",
+                    act.kvm
+                ));
+            };
+            match core_kvm::steps(&act.actions, pin.width, pin.height) {
+                Ok(steps) => (steps, None),
+                Err(reason) => return refused(reason),
+            }
+        } else {
+            let frame = match Self::kvm_frame(tools, &classic) {
+                Ok(frame) => frame,
+                Err(reason) => return refused(format!("{reason}. Nothing was sent.")),
+            };
+            let steps = match core_kvm::steps(&act.actions, frame.grey.width, frame.grey.height) {
+                Ok(steps) => steps,
+                Err(reason) => return refused(reason),
+            };
+            // A frame keeper cannot pin is one nobody could be asked to
+            // decide on: refused now, never parked on a record no consume
+            // could pass (R96K1-05).
+            let Some(pin) = core_kvm::frame_pin(
+                &act.actions,
+                &frame.grey.pixels,
+                frame.grey.width,
+                frame.grey.height,
+            )
+            .and_then(|pin| serde_json::to_value(pin).ok()) else {
+                return refused(format!(
+                    "The frame of `{}` is too small to be checked again before an input is sent. Nothing was sent.",
+                    act.kvm
+                ));
+            };
+            (steps, Some((frame, pin)))
+        };
+        let gated = match self.gated(&wire.id, name, &classification, &[], Vec::new()) {
+            Gated::Park(approval) => {
+                if let (Some(parking), Some((frame, pin))) = (
+                    self.parked
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .as_mut(),
+                    taken,
+                ) {
+                    parking.exec_binding = binding.clone();
+                    parking.preview = Some(json!({"sha256": frame.sha256, "ext": "png"}));
+                    // The frame the person decides on is outside content,
+                    // read by the KVM's readers: it joins the session's
+                    // label as the call parks, before the request carrying
+                    // it is sent (S-18, AD-409).
+                    tools
+                        .answers
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .push(KvmAnswered {
+                            label: core_kvm::result_label(entry),
+                            at: at.clone(),
+                            effect: None,
+                            stopped: false,
+                        });
+                    parking.screen = Some(pin);
+                }
+                Gated::Park(approval)
+            }
+            gated => gated,
+        };
+        let audit = CallAudit::new(
+            self.sinks,
+            name,
+            Effect::Write,
+            &classification,
+            gated,
+            ("", &at),
+        );
+        if let Err(withheld) = audit.admit("", &at) {
+            let outcome = withheld.into();
+            audit.finish(&outcome);
+            return outcome;
+        }
+        let sending = {
+            let classic = classic.clone();
+            tokio::spawn(async move { classic.send(&steps).await })
+        };
+        let sent = delegate::block_on(sending).unwrap_or_else(|_| {
+            Err(crate::kvm::SendFailed {
+                reason: format!("the inputs to `{}` ended without an answer", act.kvm),
+                reached: true,
+            })
+        });
+        // Once an input may have reached the target — all of them, or some
+        // before the rest failed — what is known is that it was sent: the
+        // effect is unverified, a fresh frame is read, and the call is never
+        // a plain refusal (#7, R96K1-07).
+        let (said, stopped) = match sent {
+            Ok(()) => (core_kvm::SENT_NOT_DONE.to_owned(), false),
+            Err(failed) if failed.reached => (
+                format!("{} {}.", core_kvm::SENT_IN_PART, failed.reason),
+                true,
+            ),
+            Err(failed) => {
+                let outcome = ToolOutcome::Refused {
+                    reason: format!("{}. Nothing was sent.", failed.reason),
+                };
+                audit.finish(&outcome);
+                return outcome;
+            }
+        };
+        let seen = match Self::kvm_frame(tools, &classic) {
+            Ok(frame) => Self::frame_said(&act.kvm, &frame),
+            Err(reason) => format!("A fresh frame was not read: {reason}."),
+        };
+        tools
+            .answers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(KvmAnswered {
+                label: core_kvm::result_label(entry),
+                at: at.clone(),
+                effect: Some(core_kvm::EFFECT_UNVERIFIED),
+                stopped,
+            });
+        let outcome = ToolOutcome::Answered {
+            text: format!("{said}\n{}\n{seen}", core_kvm::SCREEN_IS_DATA),
+        };
+        audit.finish(&outcome);
+        outcome
+    }
+}
+
+/// Who `readers` are, as a refusal names them.
+fn readers_named(readers: &Readers) -> String {
+    match readers {
+        Readers::Anyone => "anyone".to_owned(),
+        Readers::Only(readers) => readers
+            .iter()
+            .map(|user| user.as_str())
+            .collect::<Vec<_>>()
+            .join(", "),
+    }
+}
+
+/// Whether `listed` is a tool of a NanoKVM-Go's own MCP server.
+fn kvm_role(listed: &crate::mcp::Listed) -> bool {
+    matches!(
+        listed.role(),
+        Some(keeper_core::agents::mcp::McpRole::Kvm(_))
+    )
+}
+
+/// The tier facts of a call to `listed` with `args`: its row's tier and, on
+/// a NanoKVM-Go's server — whose screenshot alone is offered (R323) —
+/// whether its arguments touch a security dialog, a password or a payment
+/// (96.5 #5).
+fn mcp_facts(listed: &crate::mcp::Listed, args: Option<&Value>) -> CallFacts {
+    CallFacts {
+        mcp: listed.tier.clone().ok(),
+        kvm_sensitive: kvm_role(listed)
+            && args
+                .and_then(Value::as_object)
+                .is_some_and(keeper_core::agents::kvm::sensitive_args),
+        ..CallFacts::default()
     }
 }
 
@@ -3279,6 +3746,12 @@ impl AllowedTools<'_> {
             };
             audit.finish(&outcome);
             return Some(outcome);
+        }
+        if wire.name == keeper_core::agents::kvm::SNAPSHOT {
+            return Some(self.kvm_snapshot(wire));
+        }
+        if wire.name == keeper_core::agents::kvm::ACT {
+            return Some(self.kvm_act(wire));
         }
         if wire.name == keeper_core::agents::run::RUN {
             return Some(self.run_command(wire));
@@ -7821,6 +8294,7 @@ fn agent_offer(
     home: &str,
     sandboxed: bool,
     mcp: Option<&crate::mcp::McpServers>,
+    kvm: &[String],
     mut tools: Vec<chat::ToolSpec>,
 ) -> Vec<chat::ToolSpec> {
     // Whether this model is offered tools at all: the surface tools ride on
@@ -7871,6 +8345,17 @@ fn agent_offer(
     if let Some(servers) = mcp {
         tools.extend(servers.specs(&config.mcp));
     }
+    if !kvm.is_empty() {
+        for (name, description, parameters) in keeper_core::agents::kvm::specs(kvm) {
+            if config.allow.iter().any(|allowed| allowed == name) {
+                tools.push(chat::ToolSpec {
+                    name: name.to_owned(),
+                    description,
+                    parameters,
+                });
+            }
+        }
+    }
     tools
 }
 
@@ -7899,6 +8384,7 @@ fn workflow_offer(
         &deps.home.drive.id,
         deps.sandbox.is_some(),
         deps.mcp.as_deref(),
+        &kvm_ids(config, deps.kvm.as_deref()),
         model_tools.to_vec(),
     )
     .into_iter()
@@ -7954,6 +8440,7 @@ async fn arm_session(
         &deps.home.drive.id,
         deps.sandbox.is_some(),
         deps.mcp.as_deref(),
+        &kvm_ids(config, deps.kvm.as_deref()),
         model_tools.clone(),
     );
     (armed, model_tools)
@@ -8405,6 +8892,19 @@ async fn run_agent_turn(
                 zone: deps.sessions_zone.clone(),
                 session: screen_session.clone(),
             }),
+        // A review pass reads and proposes: no KVM either.
+        kvm: deps
+            .kvm
+            .as_ref()
+            .filter(|_| review.is_none())
+            .map(|kvms| (kvms, kvm_ids(config, Some(kvms))))
+            .filter(|(_, ids)| !ids.is_empty())
+            .map(|(kvms, ids)| KvmTools {
+                kvms: Arc::clone(kvms),
+                ids,
+                zone: deps.sessions_zone.clone(),
+                answers: Mutex::new(Vec::new()),
+            }),
     };
     let tool_loop = ToolLoop {
         client: &client,
@@ -8479,6 +8979,8 @@ async fn run_agent_turn(
         let ran = host.runs.as_ref().and_then(RunTools::take_label);
         // An MCP answer is outside content, read by its server's readers.
         let fetched = host.mcp.as_ref().and_then(McpTools::take);
+        // A KVM's frame is outside content, read by the KVM's readers.
+        let framed = host.kvm.as_ref().and_then(KvmTools::take);
         let result_label = if helped.is_some() {
             reads
                 .iter()
@@ -8491,11 +8993,16 @@ async fn run_agent_turn(
                 .map(|(label, _)| label.clone())
                 .chain(ran.clone())
                 .chain(fetched.as_ref().map(|answer| answer.label.clone()))
+                .chain(framed.as_ref().map(|answer| answer.label.clone()))
                 .reduce(|joined, label| joined.join(&label))
                 .unwrap_or_else(|| log.context.label.clone())
         };
-        // An MCP answer cut to its bound says so where nothing else did.
+        // An MCP answer cut to its bound says so where nothing else did; KVM
+        // inputs that stopped part way failed, though some were sent.
         let (word, truncated) = match result_word(outcome) {
+            _ if framed.as_ref().is_some_and(|answer| answer.stopped) => {
+                (ToolOutcomeWord::Failed, None)
+            }
             (ToolOutcomeWord::Ok, None) => (
                 ToolOutcomeWord::Ok,
                 fetched.as_ref().and_then(|answer| answer.truncated),
@@ -8517,6 +9024,10 @@ async fn run_agent_turn(
                 truncated,
                 label: result_label,
                 paseo: fetched.as_ref().and_then(|answer| answer.started.clone()),
+                effect: framed
+                    .as_ref()
+                    .and_then(|answer| answer.effect)
+                    .map(str::to_owned),
             }),
         );
         let surfaced = host
@@ -8565,8 +9076,12 @@ async fn run_agent_turn(
             }
             log.progress.reads += 1;
         }
-        if let Some(answer) = fetched {
-            let joined = log.context.label.join(&answer.label);
+        let outside = fetched
+            .map(|answer| (answer.label, answer.at))
+            .into_iter()
+            .chain(framed.map(|answer| (answer.label, answer.at)));
+        for (label, at) in outside {
+            let joined = log.context.label.join(&label);
             if joined != log.context.label {
                 log.write(
                     None,
@@ -8574,7 +9089,7 @@ async fn run_agent_turn(
                         &joined,
                         LabelCause {
                             kind: LabelCauseKind::Outside,
-                            reference: answer.at,
+                            reference: at,
                         },
                     )),
                 );
@@ -8637,7 +9152,9 @@ async fn run_agent_turn(
                 .unwrap_or_else(|p| p.into_inner())
                 .take()
         });
-        // A parked call has no result until a person decided (R73).
+        // A parked call has no result until a person decided (R73). What
+        // keeper read to ask about it — a KVM's frame — joins the label now,
+        // so the record and its request are the label's (S-18).
         if let ToolOutcome::Parked { .. } = outcome {
             if let Some((label, at)) = pinned {
                 let joined = log.context.label.join(&label);
@@ -8652,6 +9169,24 @@ async fn run_agent_turn(
                             },
                         )),
                     );
+                }
+            }
+            if let Some(answer) = host.kvm.as_ref().and_then(KvmTools::take) {
+                let joined = log.context.label.join(&answer.label);
+                if joined != log.context.label {
+                    log.write(
+                        None,
+                        LineBody::Label(LabelBody::new(
+                            &joined,
+                            LabelCause {
+                                kind: LabelCauseKind::Outside,
+                                reference: answer.at,
+                            },
+                        )),
+                    );
+                    if let Some(board) = board {
+                        board.relabel(&log.context.label);
+                    }
                 }
             }
             log.parked = Some((call_line, wire.clone()));

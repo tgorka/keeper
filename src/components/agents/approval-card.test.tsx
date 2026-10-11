@@ -56,6 +56,7 @@ function card(over: Partial<ApprovalCardVm> = {}): ApprovalCardVm {
     only: null,
     declassify: null,
     run: null,
+    kvm: null,
     ...over,
   };
 }
@@ -146,6 +147,32 @@ describe("ApprovalRequest — what the card shows (UX-DR136)", () => {
     expect(within(run).getByText("src/lib.rs")).not.toBeVisible();
     fireEvent.click(within(run).getByRole("button", { name: "Show the files it sees" }));
     expect(within(run).getByText("src/lib.rs")).toBeVisible();
+  });
+
+  it("draws a KVM act's inputs as keeper reads them, and none of the model's words", () => {
+    draw(
+      card({
+        tier: 4,
+        tool: "kvm_act",
+        payload: null,
+        summary: "3 inputs to desk: click (960, 540), type 3 characters including 1 line break",
+        kvm: {
+          kvm: "desk",
+          inputs: [
+            "click (960, 540)",
+            "type 3 characters including 1 line break",
+            "2 character keys",
+          ],
+        },
+      }),
+    );
+    const sent = screen.getByRole("figure", { name: "What will be sent to desk" });
+    expect(
+      within(sent)
+        .getAllByRole("listitem")
+        .map((item) => item.textContent),
+    ).toEqual(["click (960, 540)", "type 3 characters including 1 line break", "2 character keys"]);
+    expect(screen.queryByRole("figure", { name: /^What will run/ })).toBeNull();
   });
 
   it("tells apart two runs alike but for the drives they read, their time limit and a wrapper between", () => {
@@ -520,7 +547,7 @@ describe("ApprovalRequest — an attached action", () => {
 
   it("fetches the whole action on request and shows it", async () => {
     const whole = '{\n  "path": "notes/archive.md"\n}';
-    agentApprovalPayload.mockResolvedValue({ text: whole, run: null });
+    agentApprovalPayload.mockResolvedValue({ text: whole, run: null, kvm: null });
     draw(attached());
     expect(screen.queryByRole("figure")).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Show the full action" }));
@@ -572,6 +599,7 @@ describe("ApprovalRequest — an attached action", () => {
           files: ["a.txt"],
         },
       },
+      kvm: null,
     });
     draw(card({ ...attached(), tool: "run", tier: 3 }));
     const approve = screen.getByRole("button", { name: "Approve once" });
@@ -589,5 +617,18 @@ describe("ApprovalRequest — an attached action", () => {
     // What runs is drawn as Rust bound it, not the raw JSON.
     expect(screen.getByRole("figure", { name: "What will run" })).toBeVisible();
     expect(screen.queryByText(/"args"/)).toBeNull();
+  });
+
+  it("an attached KVM act is drawn as its inputs, never as the raw JSON", async () => {
+    agentApprovalPayload.mockResolvedValue({
+      text: '{\n  "intent": "approve me"\n}',
+      run: null,
+      kvm: { kvm: "desk", inputs: ["paste 900 characters"] },
+    });
+    draw(card({ ...attached(), tool: "kvm_act", tier: 4 }));
+    fireEvent.click(screen.getByRole("button", { name: "Show the full action" }));
+    const sent = await screen.findByRole("figure", { name: "What will be sent to desk" });
+    expect(within(sent).getByRole("listitem")).toHaveTextContent("paste 900 characters");
+    expect(screen.queryByText(/approve me/)).toBeNull();
   });
 });

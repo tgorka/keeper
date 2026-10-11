@@ -16,7 +16,8 @@ use std::collections::{BTreeSet, HashSet};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::agents::agentd::{self, KvmEntry, SecretRef};
+use crate::agents::agentd::{self, SecretRef};
+use crate::agents::kvm::KvmEntry;
 use crate::agents::label::{label_outside_read_by, Integrity, Label, Readers, Sink};
 use crate::agents::tier::Tier;
 
@@ -239,6 +240,21 @@ fn check_one(raw: RawMcp, kvm: &[KvmEntry], host: HostRules) -> Result<McpEntry,
         })
         .collect::<Result<Vec<_>, _>>()?;
     let parts = agentd::ConfigRefusal::parts;
+    // A NanoKVM-Go's server is the KVM's: its audience, pinned certificate
+    // and key are the `[[kvm]]` entry's, never the `[[mcp]]` entry's (F15).
+    if let Some(McpRole::Kvm(id)) = &role {
+        let owner = kvm.iter().find(|entry| &entry.id == id);
+        return Ok(McpEntry {
+            credential: owner.map(|entry| entry.credential.clone()),
+            readers: owner.map_or(Readers::Anyone, |entry| entry.readers.clone()),
+            fingerprint: owner.map(|entry| entry.fingerprint.clone()),
+            name: raw.name,
+            transport,
+            role,
+            trust_annotations: raw.trust_annotations,
+            tiers,
+        });
+    }
     Ok(McpEntry {
         credential: agentd::secret(raw.credential.as_deref(), &at).map_err(parts)?,
         readers: match &raw.readers {
@@ -361,13 +377,13 @@ pub struct Hints {
 
 /// The role's own table (R24(2)): `None` is a tool the role does not have,
 /// never offered. Paseo's broker has exactly four verbs (AD-407); the
-/// Mac's screen has Peekaboo's table (96.4); a KVM's table is its story's
-/// (96.5), and until it is built no tool of a KVM's is offered.
+/// Mac's screen has Peekaboo's table (96.4); a NanoKVM-Go offers its
+/// screenshot alone ([`crate::agents::kvm::role_row`], R323).
 fn role_row(role: &McpRole, tool: &str) -> Option<Tier> {
     match role {
         McpRole::Paseo => crate::agents::paseo::row(tool),
         McpRole::Screen => crate::agents::screen::row(tool),
-        McpRole::Kvm(_) => None,
+        McpRole::Kvm(_) => crate::agents::kvm::role_row(tool),
     }
 }
 
@@ -392,8 +408,9 @@ pub fn tier(entry: &McpEntry, tool: &str, hints: Option<Hints>) -> Result<Tier, 
             ),
             McpRole::Screen => crate::agents::screen::never_offered(tool),
             McpRole::Kvm(_) => format!(
-                "`{}` is a role server, and its role has no tool `{tool}`",
-                entry.name
+                "`{}` is a NanoKVM-Go's server: {}",
+                entry.name,
+                crate::agents::kvm::INPUTS_NOT_OFFERED
             ),
         })?,
         None => match entry.tiers.iter().find(|(named, _)| named == tool) {
@@ -739,6 +756,23 @@ mod tests {
         let kvm = parsed("[[mcp]]\nname = \"desk\"\nurl = \"https://kvm.example.org/mcp\"\nrole = \"kvm:desk\"\n")
             .expect("a kvm role parses");
         assert_eq!(kvm[0].role, Some(McpRole::Kvm("desk".to_owned())));
+        // F15: its audience, pinned certificate and key are the KVM's.
+        assert_eq!(
+            kvm[0].readers,
+            Readers::Only(
+                [matrix_sdk::ruma::OwnedUserId::try_from("@tgorka:example.org").expect("id")]
+                    .into_iter()
+                    .collect()
+            )
+        );
+        assert_eq!(
+            kvm[0].fingerprint.as_deref(),
+            Some("sha256:0000000000000000000000000000000000000000000000000000000000000000")
+        );
+        assert_eq!(
+            kvm[0].credential.as_ref().map(SecretRef::name),
+            Some("desk-kvm")
+        );
         let rows = parsed(&format!(
             "{good}trust_annotations = true\nfingerprint = \"sha256:{}\"\n[[mcp.tier]]\ntool = \"x\"\ntier = \"T0\"\n[[mcp.tier]]\ntool = \"y\"\ntier = \"T4\"\n",
             "a".repeat(64)
@@ -948,7 +982,11 @@ mod tests {
             role: Some(McpRole::Kvm("desk".to_owned())),
             ..entry(url())
         };
-        assert!(tier(&kvm, "snapshot", Some(read_only)).is_err());
+        // A NanoKVM-Go's server: its screenshot at T0, whatever its hints
+        // say; no input of it is offered (R323).
+        assert_eq!(tier(&kvm, "screenshot", None), Ok(Tier::T0));
+        assert!(tier(&kvm, "click", Some(read_only)).is_err());
+        assert!(tier(&kvm, "power_off", Some(read_only)).is_err());
         // The Mac's screen server keeper starts as a program: Peekaboo's
         // table as it is, no T2 floor (R150, 96.4 #2), and the tools it
         // never offers are not offered.

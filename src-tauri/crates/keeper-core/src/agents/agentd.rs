@@ -55,7 +55,8 @@ pub struct AgentdConfig {
     /// run's own environment, `KEEPER_*`, `LD_*` or `DYLD_*`.
     pub sandbox_env: Vec<(String, PathBuf)>,
     pub mcp: Vec<crate::agents::mcp::McpEntry>,
-    pub kvm: Vec<KvmEntry>,
+    /// `[[kvm]]` (`kvm::check`): never in a drive.
+    pub kvm: Vec<crate::agents::kvm::KvmEntry>,
 }
 
 /// `[homeserver]`.
@@ -126,17 +127,6 @@ pub struct TrustEntry {
     pub proxy: Option<OwnedUserId>,
 }
 
-/// `[[kvm]]`: the one table that owns a KVM's audience, certificate and credential.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct KvmEntry {
-    pub id: String,
-    pub kind: String,
-    pub url: String,
-    pub credential: SecretRef,
-    pub fingerprint: String,
-    pub readers: Readers,
-}
-
 /// Why `agentd.toml` cannot be used. Each is the sentence `keeper-agentd` prints.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ConfigRefusal {
@@ -166,7 +156,7 @@ impl ConfigRefusal {
     }
 }
 
-fn invalid(at: impl Into<String>, reason: impl Into<String>) -> ConfigRefusal {
+pub(crate) fn invalid(at: impl Into<String>, reason: impl Into<String>) -> ConfigRefusal {
     ConfigRefusal::Invalid {
         at: at.into(),
         reason: reason.into(),
@@ -194,7 +184,7 @@ struct RawConfig {
     #[serde(default)]
     mcp: Vec<crate::agents::mcp::RawMcp>,
     #[serde(default)]
-    kvm: Vec<RawKvm>,
+    kvm: Vec<crate::agents::kvm::RawKvm>,
 }
 
 #[derive(Deserialize)]
@@ -247,17 +237,6 @@ struct RawSandbox {
     read_exec: Vec<String>,
     #[serde(default)]
     env: std::collections::BTreeMap<String, String>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawKvm {
-    id: String,
-    kind: String,
-    url: String,
-    credential: String,
-    fingerprint: String,
-    readers: Vec<String>,
 }
 
 impl AgentdConfig {
@@ -389,39 +368,7 @@ impl AgentdConfig {
         } = crate::agents::run::SandboxTable::check(sandbox.read_exec, sandbox.env)
             .map_err(|(at, reason)| invalid(at, reason))?;
 
-        let mut kvm_ids = HashSet::new();
-        let kvm = raw
-            .kvm
-            .into_iter()
-            .map(|entry| {
-                let at = format!("[[kvm]] \"{}\"", entry.id);
-                if !kvm_ids.insert(entry.id.clone()) {
-                    return Err(invalid(
-                        &at,
-                        "another [[kvm]] entry has this id; each KVM is named once",
-                    ));
-                }
-                if !matches!(entry.kind.as_str(), "nanokvm" | "nanokvm-go") {
-                    return Err(invalid(
-                        format!("{at} `kind`"),
-                        format!(
-                            "\"{}\" is not a KVM kind; write \"nanokvm\" or \"nanokvm-go\"",
-                            entry.kind
-                        ),
-                    ));
-                }
-                let credential = secret(Some(&entry.credential), &at)?
-                    .ok_or_else(|| invalid(&at, SECRET_SENTENCE))?;
-                Ok(KvmEntry {
-                    readers: readers_of(&entry.readers, &at)?,
-                    fingerprint: fingerprint(&entry.fingerprint, &at)?,
-                    id: entry.id,
-                    kind: entry.kind,
-                    url: entry.url,
-                    credential,
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let kvm = crate::agents::kvm::check(raw.kvm)?;
 
         let mcp = crate::agents::mcp::check(raw.mcp, &kvm, crate::agents::mcp::AGENTD)
             .map_err(|(at, reason)| invalid(at, reason))?;

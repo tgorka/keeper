@@ -68,6 +68,7 @@ pub mod helper;
 pub mod host;
 #[cfg(unix)]
 pub mod hosts;
+pub mod kvm;
 pub mod maintain;
 pub mod matrix_sink;
 pub mod mcp;

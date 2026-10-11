@@ -573,6 +573,7 @@ fn world_in(
         decisions: None,
         sandbox: None,
         mcp: None,
+        kvm: None,
     };
     World {
         _root: root,
@@ -970,6 +971,7 @@ async fn a_turn_cut_off_mid_tool_loop_is_closed_by_editing_its_anchor() {
                     truncated: None,
                     label: context.label.clone(),
                     paseo: None,
+                    effect: None,
                 }),
             )
             .expect("result");
@@ -2500,6 +2502,7 @@ fn tolas_deps(world: &World) -> AgentDeps {
         decisions: None,
         sandbox: None,
         mcp: None,
+        kvm: None,
     }
 }
 
@@ -3101,6 +3104,7 @@ fn deps_of(world: &World, folder: &str, agent_toml: &str) -> AgentDeps {
         decisions: None,
         sandbox: None,
         mcp: None,
+        kvm: None,
     }
 }
 
@@ -11230,6 +11234,7 @@ mod parks {
             decisions: world.deps.decisions.clone(),
             sandbox: world.deps.sandbox.clone(),
             mcp: world.deps.mcp.clone(),
+            kvm: world.deps.kvm.clone(),
         }
     }
 
@@ -11510,6 +11515,7 @@ mod parks {
                         truncated: None,
                         label,
                         paseo: None,
+                        effect: None,
                     }),
                 )
                 .expect("result");
@@ -14605,29 +14611,6 @@ mod parks {
             );
         }
 
-        /// R221: a server with a pinned certificate is not connected to,
-        /// and says why; the same server without the pin answers.
-        #[tokio::test(flavor = "multi_thread")]
-        async fn mcp_a_pinned_server_is_not_connected() {
-            let fixture = Fixture::default();
-            let (url, _server) = over_http(fixture.clone()).await;
-            let servers = servers(&format!(
-                "{}fingerprint = \"sha256:{}\"\n\n{}",
-                table("pinned", &url, &[]),
-                "a".repeat(64),
-                table("plain", &url, &[])
-            ))
-            .await;
-            assert_eq!(servers.answering(), ["plain"]);
-            assert!(
-                servers.status()[0]["why"]
-                    .as_str()
-                    .is_some_and(|why| why.contains("pinned certificate")),
-                "{:?}",
-                servers.status()
-            );
-        }
-
         /// A `credential` is sent to its server alone: a server that
         /// redirects is not followed — it does not answer, and where it
         /// points is never reached, the token least of all.
@@ -15441,6 +15424,987 @@ mod parks {
                 served.context.label.readers,
                 keeper_core::agents::label::Readers::Only([user(TGORKA)].into())
             );
+        }
+
+        /// Another machine through a KVM (96.5) over an in-test classic
+        /// NanoKVM that behaves as its reference documents it — a real
+        /// socket, a real self-signed certificate made per run — and a
+        /// NanoKVM-Go's MCP server over the same pinned TLS.
+        mod kvm {
+            use super::*;
+            use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
+            use base64::Engine as _;
+            use futures_util::StreamExt as _;
+            use keeper_agent::kvm::Kvms;
+            use keeper_core::agents::approval::{sha256_hex, Scope};
+            use keeper_core::agents::kvm as core_kvm;
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            use tokio_tungstenite::tungstenite::{protocol::Role, Message};
+
+            const PASSWORD: &str = "hunter2";
+            const TOKEN: &str = "tok-7";
+            const EVE: &str = "@eve:example.org";
+            const WIDTH: u32 = 1920;
+            const HEIGHT: u32 = 1080;
+            /// The frames of `click(960, 540), type("ok")` on a 1920 × 1080
+            /// screen, as the reference's examples write them.
+            const CLICK_OK: [&str; 6] = [
+                "[2,1,0,16384,16384]",
+                "[2,2,0,0,0]",
+                "[1,18,0,0,0,0]",
+                "[1,0,0,0,0,0]",
+                "[1,14,0,0,0,0]",
+                "[1,0,0,0,0,0]",
+            ];
+
+            fn click_ok() -> Value {
+                json!({
+                    "kvm": "desk",
+                    "intent": "confirm the dialog",
+                    "actions": [{"do": "click", "x": 960, "y": 540}, {"do": "type", "text": "ok"}],
+                })
+            }
+
+            /// A self-signed certificate made now: the TLS server's
+            /// configuration and the certificate's `sha256:` fingerprint.
+            pub(super) fn certificate() -> (Arc<rustls::ServerConfig>, String) {
+                let made = rcgen::generate_simple_self_signed(vec![
+                    "localhost".to_owned(),
+                    "127.0.0.1".to_owned(),
+                ])
+                .expect("a certificate");
+                let der = made.cert.der().clone();
+                let fingerprint = format!("sha256:{}", sha256_hex(der.as_ref()));
+                let key = rustls::pki_types::PrivateKeyDer::Pkcs8(
+                    made.signing_key.serialize_der().into(),
+                );
+                let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+                    rustls::crypto::aws_lc_rs::default_provider(),
+                ))
+                .with_safe_default_protocol_versions()
+                .expect("versions")
+                .with_no_client_auth()
+                .with_single_cert(vec![der], key)
+                .expect("a server configuration");
+                (Arc::new(config), fingerprint)
+            }
+
+            /// A 1920 × 1080 frame as a JPEG: a soft gradient and a striped
+            /// dialog whose left edge is at `dialog_x`, under the click at
+            /// (960, 540) when it is at 760.
+            fn jpeg(dialog_x: u32) -> Vec<u8> {
+                let mut pixels = Vec::with_capacity((WIDTH * HEIGHT) as usize);
+                for y in 0..HEIGHT {
+                    for x in 0..WIDTH {
+                        let inside =
+                            (dialog_x..dialog_x + 400).contains(&x) && (340..740).contains(&y);
+                        pixels.push(match inside {
+                            true if ((x - dialog_x) / 8).is_multiple_of(2) => 200,
+                            true => 250,
+                            false => (x * 120 / WIDTH + y * 60 / HEIGHT) as u8,
+                        });
+                    }
+                }
+                let mut out = Vec::new();
+                image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 85)
+                    .encode(&pixels, WIDTH, HEIGHT, image::ExtendedColorType::L8)
+                    .expect("a JPEG");
+                out
+            }
+
+            /// What a test reads as the first input arrives.
+            type Probe = Box<dyn FnOnce() -> usize + Send>;
+
+            /// The in-test classic NanoKVM: what it was sent, in the order it
+            /// arrived — `login`, `frame` for each MJPEG read, each WebSocket
+            /// frame's text, `paste <body>`, `gpio <body>` — and the JPEG its
+            /// stream sends now.
+            #[derive(Clone)]
+            struct Nano {
+                seen: Arc<Mutex<Vec<String>>>,
+                frame: Arc<Mutex<Vec<u8>>>,
+                /// Runs as the first input arrives; what it read is kept.
+                probe: Arc<Mutex<Option<Probe>>>,
+                probed: Arc<Mutex<Vec<usize>>>,
+                /// Answers a paste with a server error once set.
+                refuse_paste: Arc<std::sync::atomic::AtomicBool>,
+            }
+
+            impl Nano {
+                fn showing(frame: Vec<u8>) -> Nano {
+                    Nano {
+                        seen: Arc::default(),
+                        frame: Arc::new(Mutex::new(frame)),
+                        probe: Arc::default(),
+                        probed: Arc::default(),
+                        refuse_paste: Arc::default(),
+                    }
+                }
+
+                fn seen(&self) -> Vec<String> {
+                    self.seen.lock().expect("lock").clone()
+                }
+
+                /// What reached the target: frames, pastes, power presses.
+                fn inputs(&self) -> Vec<String> {
+                    self.seen()
+                        .into_iter()
+                        .filter(|seen| seen != "login" && seen != "frame")
+                        .collect()
+                }
+
+                fn input(&self, what: String) {
+                    if let Some(probe) = self.probe.lock().expect("lock").take() {
+                        self.probed.lock().expect("lock").push(probe());
+                    }
+                    self.seen.lock().expect("lock").push(what);
+                }
+
+                /// The login holds when its password is [`PASSWORD`]
+                /// encrypted as the reference says.
+                fn login_holds(body: &str) -> bool {
+                    let Ok(login) = serde_json::from_str::<Value>(body) else {
+                        return false;
+                    };
+                    let Some(sealed) = login["password"].as_str().and_then(|text| {
+                        base64::engine::general_purpose::STANDARD.decode(text).ok()
+                    }) else {
+                        return false;
+                    };
+                    if login["username"] != "admin" || sealed.len() < 32 {
+                        return false;
+                    }
+                    let mut key = [0u8; 32];
+                    key[..19].copy_from_slice(b"nanokvm-sipeed-2024");
+                    let (iv, data) = sealed.split_at(16);
+                    let Ok(iv) = <[u8; 16]>::try_from(iv) else {
+                        return false;
+                    };
+                    cbc::Decryptor::<aes::Aes256>::new(&key.into(), &iv.into())
+                        .decrypt_padded_vec_mut::<Pkcs7>(data)
+                        .is_ok_and(|plain| plain == PASSWORD.as_bytes())
+                }
+
+                /// One request on one TLS connection, as the device answers.
+                async fn answer(
+                    &self,
+                    mut stream: tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+                ) {
+                    let mut head = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while !head.ends_with(b"\r\n\r\n") {
+                        match stream.read(&mut byte).await {
+                            Ok(1) => head.push(byte[0]),
+                            _ => return,
+                        }
+                    }
+                    let head = String::from_utf8_lossy(&head).into_owned();
+                    let mut start = head.split("\r\n").next().unwrap_or("").split(' ');
+                    let (method, path) = (start.next().unwrap_or(""), start.next().unwrap_or(""));
+                    let header = |name: &str| {
+                        head.split("\r\n").find_map(|line| {
+                            let (key, value) = line.split_once(':')?;
+                            key.trim()
+                                .eq_ignore_ascii_case(name)
+                                .then(|| value.trim().to_owned())
+                        })
+                    };
+                    let length: usize = header("content-length")
+                        .and_then(|n| n.parse().ok())
+                        .unwrap_or(0);
+                    let mut body = vec![0u8; length];
+                    if stream.read_exact(&mut body).await.is_err() {
+                        return;
+                    }
+                    let body = String::from_utf8_lossy(&body).into_owned();
+                    let authed = header("cookie").is_some_and(|cookie| {
+                        cookie
+                            .split(';')
+                            .any(|part| part.trim() == format!("nano-kvm-token={TOKEN}"))
+                    });
+                    let reply = |status: &str, extra: &str, body: &str| {
+                        format!(
+                            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{extra}\r\n{body}",
+                            body.len()
+                        )
+                        .into_bytes()
+                    };
+                    let ok = reply("200 OK", "", r#"{"code":0,"msg":"success"}"#);
+                    let answer = match (method, path) {
+                        ("POST", "/api/auth/login") => {
+                            self.seen.lock().expect("lock").push("login".to_owned());
+                            if Self::login_holds(&body) {
+                                reply(
+                                    "200 OK",
+                                    &format!("Set-Cookie: nano-kvm-token={TOKEN}; Path=/\r\n"),
+                                    r#"{"code":0,"msg":"success"}"#,
+                                )
+                            } else {
+                                reply(
+                                    "200 OK",
+                                    "",
+                                    r#"{"code":-2,"msg":"invalid username or password"}"#,
+                                )
+                            }
+                        }
+                        _ if !authed => reply("401 Unauthorized", "", "{}"),
+                        ("GET", "/api/stream/mjpeg") => {
+                            self.seen.lock().expect("lock").push("frame".to_owned());
+                            let jpeg = self.frame.lock().expect("lock").clone();
+                            let mut out = b"HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=frame\r\nConnection: close\r\n\r\n".to_vec();
+                            for _ in 0..2 {
+                                out.extend_from_slice(
+                                    format!(
+                                        "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\n\r\n",
+                                        jpeg.len()
+                                    )
+                                    .as_bytes(),
+                                );
+                                out.extend_from_slice(&jpeg);
+                                out.extend_from_slice(b"\r\n");
+                            }
+                            out
+                        }
+                        ("GET", "/api/ws") => {
+                            let Some(key) = header("sec-websocket-key") else {
+                                return;
+                            };
+                            let accept =
+                                tokio_tungstenite::tungstenite::handshake::derive_accept_key(
+                                    key.as_bytes(),
+                                );
+                            let switching = format!(
+                                "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+                            );
+                            if stream.write_all(switching.as_bytes()).await.is_err() {
+                                return;
+                            }
+                            let mut ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
+                                stream,
+                                Role::Server,
+                                None,
+                            )
+                            .await;
+                            while let Some(Ok(message)) = ws.next().await {
+                                if let Message::Text(text) = message {
+                                    self.input(text.as_str().to_owned());
+                                }
+                            }
+                            return;
+                        }
+                        ("POST", "/api/hid/paste") => {
+                            self.input(format!("paste {body}"));
+                            if self.refuse_paste.load(std::sync::atomic::Ordering::SeqCst) {
+                                reply("500 Internal Server Error", "", "{}")
+                            } else {
+                                ok
+                            }
+                        }
+                        ("POST", "/api/vm/gpio") => {
+                            self.input(format!("gpio {body}"));
+                            ok
+                        }
+                        _ => reply("404 Not Found", "", "{}"),
+                    };
+                    let _ = stream.write_all(&answer).await;
+                    let _ = stream.shutdown().await;
+                }
+            }
+
+            /// A NanoKVM on 127.0.0.1 behind its own certificate.
+            struct Device {
+                nano: Nano,
+                url: String,
+                fingerprint: String,
+                _task: tokio::task::JoinHandle<()>,
+            }
+
+            async fn device() -> Device {
+                let (config, fingerprint) = certificate();
+                let nano = Nano::showing(jpeg(760));
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("bind");
+                let address = listener.local_addr().expect("address");
+                let acceptor = tokio_rustls::TlsAcceptor::from(config);
+                let serving = nano.clone();
+                let task = tokio::spawn(async move {
+                    loop {
+                        let Ok((tcp, _)) = listener.accept().await else {
+                            continue;
+                        };
+                        let (acceptor, nano) = (acceptor.clone(), serving.clone());
+                        tokio::spawn(async move {
+                            if let Ok(tls) = acceptor.accept(tcp).await {
+                                nano.answer(tls).await;
+                            }
+                        });
+                    }
+                });
+                Device {
+                    nano,
+                    url: format!("https://{address}"),
+                    fingerprint,
+                    _task: task,
+                }
+            }
+
+            fn quoted(readers: &[&str]) -> String {
+                readers
+                    .iter()
+                    .map(|reader| format!("\"{reader}\""))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
+
+            /// One classic `[[kvm]]` table: `desk` at `url`, pinned by
+            /// `fingerprint`, read by `readers`.
+            fn kvm_table(url: &str, fingerprint: &str, readers: &[&str]) -> String {
+                format!(
+                    "[[kvm]]\nid = \"desk\"\nkind = \"nanokvm\"\nurl = \"{url}\"\ncredential = \"secret:desk-kvm\"\nfingerprint = \"{fingerprint}\"\nreaders = [{}]\n",
+                    quoted(readers)
+                )
+            }
+
+            /// The KVMs an `agentd.toml` holding `tables` names, each with
+            /// `password` as the secret store resolved it.
+            fn kvms(tables: &str, password: Option<&str>) -> Arc<Kvms> {
+                let config = AgentdConfig::parse(&format!(
+                    "version = 1\nprincipal = \"tgorka\"\nhost = \"electra\"\n\n[homeserver]\nurl = \"https://matrix.example.org\"\n\n{tables}"
+                ))
+                .expect("agentd.toml");
+                Arc::new(Kvms::new(
+                    config
+                        .kvm
+                        .into_iter()
+                        .map(|entry| (entry, password.map(str::to_owned)))
+                        .collect(),
+                ))
+            }
+
+            fn device_kvms(device: &Device, readers: &[&str]) -> Arc<Kvms> {
+                kvms(
+                    &kvm_table(&device.url, &device.fingerprint, readers),
+                    Some(PASSWORD),
+                )
+            }
+
+            /// Nixi, who may use `kvm_snapshot` and `kvm_act` and needs
+            /// `kvm:desk`, on a host whose KVMs are `kvms`, with a decision
+            /// source.
+            fn nixi_kvm(script: Vec<Completion>, kvms: Option<Arc<Kvms>>) -> World {
+                let mut world = world_read_by(
+                    &[TGORKA, MARTA],
+                    ProviderKind::OpenAi,
+                    &["drive_read", core_kvm::SNAPSHOT, core_kvm::ACT],
+                    script,
+                );
+                let toml = world.tgdrive.join("80-agents/nixi/agent.toml");
+                let mut text = std::fs::read_to_string(&toml).expect("agent.toml");
+                text.push_str("\n[host]\nneeds = [\"kvm:desk\"]\n");
+                std::fs::write(&toml, text).expect("agent.toml");
+                let decl = world.deps.drives["tgdrive"].clone();
+                world.deps.home =
+                    read_zone("tgdrive", &profile("tgdrive", &world.tgdrive), Some(&decl))
+                        .homes
+                        .into_iter()
+                        .find_map(|(folder, home)| (folder == "nixi").then_some(home))
+                        .expect("nixi's folder")
+                        .expect("nixi reads");
+                world.deps.decisions = Some(Admit::pinned());
+                world.deps.kvm = kvms;
+                world
+            }
+
+            /// Every file under `dir`, at any depth.
+            fn files_under(dir: &Path) -> Vec<PathBuf> {
+                let mut out = Vec::new();
+                let mut dirs = vec![dir.to_path_buf()];
+                while let Some(dir) = dirs.pop() {
+                    for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+                        let path = entry.path();
+                        if path.is_dir() {
+                            dirs.push(path);
+                        } else {
+                            out.push(path);
+                        }
+                    }
+                }
+                out
+            }
+
+            /// The one preview kept under the sessions zone: its SHA-256 (its
+            /// name) and its bytes, which are that hash.
+            fn the_preview(world: &World) -> (String, Vec<u8>) {
+                let kept = files_under(&world.deps.sessions_zone.join(".keeper/previews"));
+                assert_eq!(kept.len(), 1, "{kept:?}");
+                let name = kept[0]
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .expect("a name");
+                let sha = name.strip_suffix(".png").expect("a PNG").to_owned();
+                let bytes = std::fs::read(&kept[0]).expect("the preview");
+                assert_eq!(sha256_hex(&bytes), sha);
+                (sha, bytes)
+            }
+
+            /// Nixi parked on `click_ok` on `device`: the world, the room
+            /// double, the session and its record.
+            async fn parked_click(
+                device: &Device,
+            ) -> (World, Arc<Approvals>, ServedSession, ApprovalRecord) {
+                parked_with(device, click_ok()).await
+            }
+
+            /// Nixi parked on a `kvm_act` with `args` on `device`.
+            async fn parked_with(
+                device: &Device,
+                args: Value,
+            ) -> (World, Arc<Approvals>, ServedSession, ApprovalRecord) {
+                let mut world = nixi_kvm(
+                    vec![calls(&[("k1", core_kvm::ACT, args)]), prose("Sent.")],
+                    Some(device_kvms(device, &[TGORKA, MARTA])),
+                );
+                let approvals = Arc::new(Approvals::default());
+                let mut served = open(&world, &approvals);
+                let parked = report(world.ask(&mut served, "say ok on the desk").await);
+                assert_eq!(parked.ending, TurnEnding::Parked);
+                // T4: the requester at the head of the chain decides (S-28).
+                let mut record = world.record();
+                record.dispatch_chain = vec![TGORKA.to_owned()];
+                world.rewrite(&record);
+                (world, approvals, served, record)
+            }
+
+            /// 96.5 #3: the client logs in with the password encrypted as
+            /// the reference says, reads one frame — the stream's first whole
+            /// JPEG, decoded to its 1920 × 1080 pixels — and sends exactly
+            /// the frames of `click(960, 540), type("ok")`, in order; a paste
+            /// and a power press go by their own paths with their bodies. A
+            /// wrong password reads nothing.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn kvm_client_sends_the_frames() {
+                let device = device().await;
+                let classic = device_kvms(&device, &[TGORKA])
+                    .classic("desk")
+                    .expect("a classic NanoKVM");
+                let frame = classic.snapshot().await.expect("a frame");
+                assert_eq!((frame.grey.width, frame.grey.height), (WIDTH, HEIGHT));
+                // Kept as a PNG of the same frame, its hash the PNG's.
+                assert_eq!(frame.sha256, sha256_hex(&frame.png));
+                assert_eq!(
+                    keeper_agent::previews::grey(&frame.png).expect("a PNG"),
+                    frame.grey
+                );
+                assert_eq!(device.nano.seen(), ["login", "frame"]);
+
+                let act = core_kvm::parse_act(&click_ok()).expect("reads");
+                let steps = core_kvm::steps(&act.actions, WIDTH, HEIGHT).expect("on the screen");
+                classic.send(&steps).await.expect("sent");
+                until("the frames arrive", || {
+                    device.nano.inputs().len() == CLICK_OK.len()
+                })
+                .await;
+                assert_eq!(device.nano.inputs(), CLICK_OK);
+
+                let more = core_kvm::parse_act(&json!({
+                    "kvm": "desk",
+                    "intent": "x",
+                    "actions": [{"do": "paste", "text": "hi"}, {"do": "power", "button": "press"}],
+                }))
+                .expect("reads");
+                classic
+                    .send(&core_kvm::steps(&more.actions, WIDTH, HEIGHT).expect("steps"))
+                    .await
+                    .expect("sent");
+                let inputs = device.nano.inputs();
+                let bodies: Vec<(String, Value)> = inputs[CLICK_OK.len()..]
+                    .iter()
+                    .map(|input| {
+                        let (path, body) = input.split_once(' ').expect("a body");
+                        (path.to_owned(), serde_json::from_str(body).expect("json"))
+                    })
+                    .collect();
+                assert_eq!(
+                    bodies,
+                    [
+                        ("paste".to_owned(), json!({"content": "hi", "langue": ""})),
+                        ("gpio".to_owned(), json!({"type": "power", "duration": 800})),
+                    ]
+                );
+
+                let before = device.nano.seen().len();
+                let wrong = kvms(
+                    &kvm_table(&device.url, &device.fingerprint, &[TGORKA]),
+                    Some("hunter3"),
+                )
+                .classic("desk")
+                .expect("classic");
+                wrong.snapshot().await.expect_err("the login is refused");
+                assert_eq!(device.nano.seen()[before..], ["login"]);
+            }
+
+            /// 96.5 #4: a certificate whose SHA-256 is not the pinned one is
+            /// refused with a sentence naming both, before anything — the
+            /// password least of all — reaches the server.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn kvm_certificate_is_pinned() {
+                let device = device().await;
+                let wrong = format!("sha256:{}", "ab".repeat(32));
+                let classic = kvms(&kvm_table(&device.url, &wrong, &[TGORKA]), Some(PASSWORD))
+                    .classic("desk")
+                    .expect("classic");
+                let refused = classic.snapshot().await.expect_err("not trusted");
+                assert!(
+                    refused.contains(&device.fingerprint) && refused.contains(&wrong),
+                    "{refused}"
+                );
+                let act = core_kvm::parse_act(&click_ok()).expect("reads");
+                let steps = core_kvm::steps(&act.actions, WIDTH, HEIGHT).expect("steps");
+                let refused = classic.send(&steps).await.expect_err("not trusted");
+                assert!(refused.reason.contains(&device.fingerprint), "{refused:?}");
+                assert!(!refused.reached, "nothing reached the target");
+                assert_eq!(device.nano.seen(), Vec::<String>::new());
+            }
+
+            /// An MCP server over TLS whose certificate is `config`'s: its URL.
+            async fn over_https(
+                fixture: Fixture,
+                config: Arc<rustls::ServerConfig>,
+            ) -> (String, tokio::task::JoinHandle<()>) {
+                use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
+                use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
+                struct Tls {
+                    tcp: tokio::net::TcpListener,
+                    acceptor: tokio_rustls::TlsAcceptor,
+                }
+                impl axum::serve::Listener for Tls {
+                    type Io = tokio_rustls::server::TlsStream<tokio::net::TcpStream>;
+                    type Addr = std::net::SocketAddr;
+                    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+                        loop {
+                            let Ok((tcp, address)) = self.tcp.accept().await else {
+                                continue;
+                            };
+                            // A client that refuses the certificate ends
+                            // this handshake; the next one is served.
+                            if let Ok(tls) = self.acceptor.accept(tcp).await {
+                                return (tls, address);
+                            }
+                        }
+                    }
+                    fn local_addr(&self) -> std::io::Result<Self::Addr> {
+                        self.tcp.local_addr()
+                    }
+                }
+                let service = StreamableHttpService::new(
+                    move || Ok(fixture.clone()),
+                    Arc::new(LocalSessionManager::default()),
+                    StreamableHttpServerConfig::default(),
+                );
+                let router = axum::Router::new().nest_service("/mcp", service);
+                let tcp = tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("bind");
+                let address = tcp.local_addr().expect("address");
+                let listener = Tls {
+                    tcp,
+                    acceptor: tokio_rustls::TlsAcceptor::from(config),
+                };
+                let task = tokio::spawn(async move {
+                    let _ = axum::serve(listener, router).await;
+                });
+                (format!("https://{address}/mcp"), task)
+            }
+
+            /// DW-810, F15: a `url` server with a `fingerprint` — a
+            /// NanoKVM-Go's comes from its `[[kvm]]` entry — is spoken to
+            /// only over TLS whose certificate is the pinned one. Another
+            /// certificate does not answer and says both fingerprints; a pin
+            /// over plain HTTP pins nothing and does not answer.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn mcp_a_pinned_server_answers_only_with_its_certificate() {
+                let (config, fingerprint) = certificate();
+                let (url, _server) = over_https(Fixture::default(), config).await;
+                let wrong = format!("sha256:{}", "ab".repeat(32));
+                let clear = url.replace("https://", "http://");
+                let servers = servers(&format!(
+                    "{}fingerprint = \"{fingerprint}\"\n\n{}fingerprint = \"{wrong}\"\n\n{}fingerprint = \"{fingerprint}\"\n",
+                    table("pinned", &url, &[]),
+                    table("other", &url, &[]),
+                    table("clear", &clear, &[]),
+                ))
+                .await;
+                assert_eq!(servers.answering(), ["pinned"]);
+                let why = |name: &str| {
+                    servers
+                        .status()
+                        .into_iter()
+                        .find(|status| status["name"] == name)
+                        .and_then(|status| status["why"].as_str().map(str::to_owned))
+                        .unwrap_or_default()
+                };
+                let other = why("other");
+                assert!(
+                    other.contains(&fingerprint) && other.contains(&wrong),
+                    "{other}"
+                );
+                assert!(!why("clear").is_empty());
+            }
+
+            /// 96.5 #5, AD-409, S-18: a snapshot runs without asking; its
+            /// frame is kept under the sessions zone's `.keeper/previews/`,
+            /// never in the session; what it shows is outside content,
+            /// labelled `untrusted` and read by the KVM's readers.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn kvm_snapshot_is_untrusted_and_kept_out_of_the_drive() {
+                let device = device().await;
+                let mut world = nixi_kvm(
+                    vec![
+                        calls(&[("k1", core_kvm::SNAPSHOT, json!({"kvm": "desk"}))]),
+                        prose("Seen."),
+                    ],
+                    Some(device_kvms(&device, &[TGORKA, MARTA])),
+                );
+                let approvals = Arc::new(Approvals::default());
+                let mut served = open(&world, &approvals);
+                report(world.ask(&mut served, "look at the desk").await);
+                let offered = offered(&world);
+                assert!(
+                    offered.contains(&core_kvm::SNAPSHOT.to_owned())
+                        && offered.contains(&core_kvm::ACT.to_owned()),
+                    "{offered:?}"
+                );
+                let result = results(&world).pop().expect("a result");
+                assert_eq!(result.outcome, ToolOutcomeWord::Ok, "{result:?}");
+                assert!(
+                    result.content.starts_with(core_kvm::SCREEN_IS_DATA)
+                        && result.content.contains("1920×1080"),
+                    "{}",
+                    result.content
+                );
+                assert_eq!(result.label.integrity, Integrity::Untrusted);
+                assert_eq!(result.effect, None);
+                let joined = outside_labels(&world);
+                assert_eq!(joined[0].0, "kvm:desk");
+                assert_eq!(joined[0].1.integrity, Integrity::Untrusted);
+                let (sha, png) = the_preview(&world);
+                assert!(
+                    result.content.contains(&format!("sha256:{sha}")),
+                    "{}",
+                    result.content
+                );
+                let grey = keeper_agent::previews::grey(&png).expect("a PNG");
+                assert_eq!((grey.width, grey.height), (WIDTH, HEIGHT));
+                let images: Vec<PathBuf> = files_under(&world.dir(SESSION))
+                    .into_iter()
+                    .filter(|path| {
+                        std::fs::read(path).is_ok_and(|bytes| {
+                            bytes.starts_with(&[0xFF, 0xD8]) || bytes.starts_with(b"\x89PNG")
+                        })
+                    })
+                    .collect();
+                assert_eq!(images, Vec::<PathBuf>::new(), "no frame in the session");
+                assert!(!world.approvals().exists(), "nobody was asked");
+                assert_eq!(device.nano.inputs(), Vec::<String>::new());
+            }
+
+            /// 96.5 #5, #6, S-01, S-18: a `kvm_act` parks at T4 for one use;
+            /// its record holds the frame it is decided on as `preview` and
+            /// pins it; the card carries that frame as its encrypted
+            /// attachment; nothing reaches the KVM before a person decides,
+            /// and the first input reaches it only after the `consumed`
+            /// event was accepted.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn kvm_frames_follow_the_consumed_event() {
+                let device = device().await;
+                let (mut world, approvals, mut served, record) = parked_click(&device).await;
+                assert_eq!(device.nano.inputs(), Vec::<String>::new());
+                assert_eq!(record.risk.tier, 4);
+                assert_eq!(record.scopes, vec![Scope::Once]);
+                assert_eq!(
+                    record.action.summary,
+                    "2 inputs to desk: click (960, 540), type 2 characters"
+                );
+                let (sha, png) = the_preview(&world);
+                assert_eq!(
+                    record.preconditions.preview,
+                    Some(json!({"sha256": sha, "ext": "png"}))
+                );
+                let pin: core_kvm::FramePin =
+                    serde_json::from_value(record.preconditions.screen.clone().expect("a pin"))
+                        .expect("a frame pin");
+                assert_eq!(
+                    (pin.width, pin.height, pin.regions.len()),
+                    (WIDTH, HEIGHT, 41),
+                    "8 × 5 tiles and the click's square"
+                );
+                let requests = world.sent_of(APPROVAL_REQUEST);
+                assert_eq!(requests[0]["preview"]["sha256"], sha.as_str());
+                assert_eq!(requests[0]["preview"]["mimetype"], "image/png");
+                assert_eq!(
+                    requests[0]["preview"]["file"]["bytes"],
+                    png.len(),
+                    "the frame itself, uploaded"
+                );
+
+                let consumed = Arc::clone(&approvals);
+                *device.nano.probe.lock().expect("lock") =
+                    Some(Box::new(move || consumed.events().len()));
+                let decided = world.decision(&record, Decision::Approve);
+                world.serve(&mut served, decided).await;
+                assert_eq!(*device.nano.probed.lock().expect("lock"), [1]);
+                assert_eq!(device.nano.inputs(), CLICK_OK);
+            }
+
+            /// S-18, AD-409 (R96S1-10 on the KVM): the frame keeper takes to
+            /// ask about a `kvm_act` is outside content read by the KVM's
+            /// readers, so it joins the session's label before the request
+            /// carrying it goes out — a session tgorka and marta read, acting
+            /// on a KVM only tgorka reads, is labelled for tgorka alone and
+            /// `untrusted`, and its card never reaches the room marta reads.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn kvm_the_frame_on_the_card_joins_the_label() {
+                let device = device().await;
+                let mut world = nixi_kvm(
+                    vec![calls(&[("k1", core_kvm::ACT, click_ok())]), prose("Sent.")],
+                    Some(device_kvms(&device, &[TGORKA])),
+                );
+                let approvals = Arc::new(Approvals::default());
+                let mut served = open(&world, &approvals);
+                report(world.ask(&mut served, "say ok on the desk").await);
+                let only_tgorka = keeper_core::agents::label::Readers::Only([user(TGORKA)].into());
+                let joined = outside_labels(&world);
+                assert_eq!(joined.len(), 1, "{joined:?}");
+                assert_eq!(joined[0].0, "kvm:desk");
+                assert_eq!(joined[0].1.readers, only_tgorka);
+                assert_eq!(joined[0].1.integrity, Integrity::Untrusted);
+                assert_eq!(served.context.label.readers, only_tgorka);
+                // The room marta reads is not where tgorka's frame is asked
+                // about; with no proxy of his on this host nobody is asked.
+                assert_eq!(world.sent_of(APPROVAL_REQUEST), Vec::<Value>::new());
+                assert_eq!(device.nano.inputs(), Vec::<String>::new());
+            }
+
+            /// 96.5 #7: a consumed `kvm_act` says the input was sent and
+            /// that whether it took effect is not known, with a fresh frame;
+            /// its result line's effect is `unverified`.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn kvm_result_never_claims_the_effect() {
+                let device = device().await;
+                let (mut world, _approvals, mut served, record) = parked_click(&device).await;
+                let decided = world.decision(&record, Decision::Approve);
+                world.serve(&mut served, decided).await;
+                let result = results(&world).pop().expect("a result");
+                assert_eq!(result.outcome, ToolOutcomeWord::Ok, "{result:?}");
+                assert!(
+                    result.content.starts_with(core_kvm::SENT_NOT_DONE)
+                        && result.content.contains(core_kvm::SCREEN_IS_DATA)
+                        && result.content.contains("1920×1080"),
+                    "{}",
+                    result.content
+                );
+                assert_eq!(result.effect.as_deref(), Some(core_kvm::EFFECT_UNVERIFIED));
+                assert_eq!(result.label.integrity, Integrity::Untrusted);
+                assert_eq!(
+                    device.nano.seen().last().map(String::as_str),
+                    Some("frame"),
+                    "a frame read after the inputs"
+                );
+            }
+
+            /// 96.5 #6, R144: a consumed `kvm_act` whose screen changed — the
+            /// dialog under its click moved 40 px — or whose KVM is another
+            /// device behind the same id drifts: refused, nothing consumed,
+            /// nothing sent. A host that took the park over without its
+            /// preview file re-checks a fresh frame and sends.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn kvm_drift_refuses() {
+                let device = device().await;
+                let (mut world, approvals, mut served, record) = parked_click(&device).await;
+                *device.nano.frame.lock().expect("lock") = jpeg(800);
+                let decided = world.decision(&record, Decision::Approve);
+                world.serve(&mut served, decided).await;
+                assert!(approvals.events().is_empty(), "nothing was consumed");
+                assert_eq!(device.nano.inputs(), Vec::<String>::new());
+                let line = world.approval_lines().pop().expect("a line");
+                assert_eq!(line.state, ApprovalState::Refused, "{line:?}");
+
+                let device = self::device().await;
+                let (mut world, approvals, mut served, record) = parked_click(&device).await;
+                let another = self::device().await;
+                world.deps.kvm = Some(device_kvms(&another, &[TGORKA, MARTA]));
+                let decided = world.decision(&record, Decision::Approve);
+                world.serve(&mut served, decided).await;
+                assert!(approvals.events().is_empty(), "nothing was consumed");
+                assert_eq!(device.nano.inputs(), Vec::<String>::new());
+                assert_eq!(another.nano.seen(), Vec::<String>::new());
+
+                let device = self::device().await;
+                let (mut world, approvals, mut served, record) = parked_click(&device).await;
+                std::fs::remove_dir_all(world.deps.sessions_zone.join(".keeper/previews"))
+                    .expect("the previews");
+                let decided = world.decision(&record, Decision::Approve);
+                world.serve(&mut served, decided).await;
+                assert_eq!(approvals.events().len(), 1);
+                assert_eq!(device.nano.inputs(), CLICK_OK);
+            }
+
+            /// 96.5 #8: a KVM is named only by the host's own
+            /// configuration. A drive's agent.toml naming one is not read; a
+            /// host that names none offers no KVM tool whatever the agent
+            /// needs, and refuses a call naming one; a credential the host's
+            /// secret store does not hold is looked for nowhere else.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn kvm_config_comes_only_from_host_config() {
+                let device = device().await;
+                let mut world = nixi_kvm(
+                    vec![
+                        calls(&[("k1", core_kvm::SNAPSHOT, json!({"kvm": "desk"}))]),
+                        prose("Nothing."),
+                    ],
+                    None,
+                );
+                let approvals = Arc::new(Approvals::default());
+                let mut served = open(&world, &approvals);
+                report(world.ask(&mut served, "look at the desk").await);
+                let offered = offered(&world);
+                assert!(
+                    !offered.iter().any(|tool| tool.starts_with("kvm_")),
+                    "{offered:?}"
+                );
+                let refused = results(&world).pop().expect("a result");
+                assert_eq!(refused.outcome, ToolOutcomeWord::Refused);
+
+                let toml = world.tgdrive.join("80-agents/nixi/agent.toml");
+                let mut text = std::fs::read_to_string(&toml).expect("agent.toml");
+                text.push('\n');
+                text.push_str(&kvm_table(&device.url, &device.fingerprint, &[TGORKA]));
+                std::fs::write(&toml, text).expect("agent.toml");
+                let decl = world.deps.drives["tgdrive"].clone();
+                let read = read_zone("tgdrive", &profile("tgdrive", &world.tgdrive), Some(&decl))
+                    .homes
+                    .into_iter()
+                    .find_map(|(folder, home)| (folder == "nixi").then_some(home))
+                    .expect("nixi's folder");
+                assert!(read.is_err(), "a drive cannot name a KVM");
+
+                let unresolved = kvms(
+                    &kvm_table(&device.url, &device.fingerprint, &[TGORKA]),
+                    None,
+                );
+                assert!(unresolved.classic("desk").is_err());
+                assert_eq!(device.nano.seen(), Vec::<String>::new());
+            }
+
+            /// 96.5 #9, AD-391: an input is a send to the readers its
+            /// `[[kvm]]` entry names. A classic NanoKVM read by someone the
+            /// session may not tell is refused before anything — a login, a
+            /// frame — reaches it.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn kvm_act_is_a_send_to_its_readers() {
+                let device = device().await;
+                let mut world = nixi_kvm(
+                    vec![calls(&[("k1", core_kvm::ACT, click_ok())]), prose("No.")],
+                    Some(device_kvms(&device, &[TGORKA, EVE])),
+                );
+                let approvals = Arc::new(Approvals::default());
+                let mut served = open(&world, &approvals);
+                report(world.ask(&mut served, "say ok on the desk").await);
+                let refused = results(&world).pop().expect("a result");
+                assert_eq!(refused.outcome, ToolOutcomeWord::Refused);
+                assert!(!world.approvals().exists(), "nobody was asked");
+                assert_eq!(device.nano.seen(), Vec::<String>::new());
+            }
+
+            /// R323 (R96K1-01): a NanoKVM-Go's own MCP server, its readers
+            /// the session's own, offers no input — one would be approved on
+            /// a card with no frame and sent against a screen nobody read
+            /// again. Its input tools are not offered, the host's status says
+            /// why, and a call to one is refused: nobody asked, nothing sent.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn kvm_a_nanokvm_go_input_is_not_offered() {
+                let (config, fingerprint) = certificate();
+                let fixture = Fixture::default();
+                let (url, _server) = over_https(fixture.clone(), config).await;
+                let go = format!(
+                    "[[kvm]]\nid = \"go\"\nkind = \"nanokvm-go\"\nurl = \"{url}\"\ncredential = \"secret:go-key\"\nfingerprint = \"{fingerprint}\"\nreaders = [{}]\n\n[[mcp]]\nname = \"go\"\nurl = \"{url}\"\nrole = \"kvm:go\"\n",
+                    quoted(&[TGORKA, MARTA])
+                );
+                let servers = servers_with(&go, &[("go", "go-key-value")]).await;
+                assert_eq!(servers.answering(), ["go"]);
+                let status = servers.status();
+                let refused = status[0]["not_offered"].as_array().expect("not offered");
+                assert!(
+                    refused.iter().any(|tool| tool["tool"] == "echo"),
+                    "{status:?}"
+                );
+                let mut world = nixi(
+                    vec![
+                        calls(&[("m1", "mcp__go__echo", json!({"q": "x"}))]),
+                        prose("Done."),
+                    ],
+                    servers,
+                    &["go"],
+                );
+                let approvals = Arc::new(Approvals::default());
+                let mut served = open(&world, &approvals);
+                let ended = report(world.ask(&mut served, "type on the go").await);
+                assert_ne!(ended.ending, TurnEnding::Parked);
+                assert!(
+                    !offered(&world).iter().any(|tool| tool == "mcp__go__echo"),
+                    "{:?}",
+                    offered(&world)
+                );
+                let result = results(&world).pop().expect("a result");
+                assert_eq!(result.outcome, ToolOutcomeWord::Refused);
+                assert!(!world.approvals().exists(), "nobody was asked");
+                assert!(
+                    calls_of(&fixture.seen).is_empty(),
+                    "nothing reached the server"
+                );
+            }
+
+            /// R96K1-07, 96.5 #7: inputs that stop part way — a click sent,
+            /// then a paste the device refuses — reached the target, so the
+            /// call is not refused: its line says `failed` with the effect
+            /// `unverified`, the model is told some were sent and whether any
+            /// took is not known, and a fresh frame is read after.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn kvm_inputs_stopped_part_way_are_unverified_not_refused() {
+                let device = device().await;
+                let args = json!({
+                    "kvm": "desk",
+                    "intent": "fill it in",
+                    "actions": [{"do": "click", "x": 960, "y": 540}, {"do": "paste", "text": "hi"}],
+                });
+                let (mut world, _approvals, mut served, record) = parked_with(&device, args).await;
+                device
+                    .nano
+                    .refuse_paste
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                let frames = || device.nano.seen().iter().filter(|s| *s == "frame").count();
+                let before = frames();
+                let decided = world.decision(&record, Decision::Approve);
+                world.serve(&mut served, decided).await;
+                until("the click arrives", || {
+                    CLICK_OK[..2]
+                        .iter()
+                        .all(|frame| device.nano.inputs().iter().any(|input| input == frame))
+                })
+                .await;
+                let result = results(&world).pop().expect("a result");
+                assert_eq!(result.outcome, ToolOutcomeWord::Failed, "{result:?}");
+                assert_eq!(result.effect.as_deref(), Some(core_kvm::EFFECT_UNVERIFIED));
+                assert!(
+                    result.content.starts_with(core_kvm::SENT_IN_PART),
+                    "{}",
+                    result.content
+                );
+                // One frame read again before the consumed mark, one after
+                // the inputs.
+                assert_eq!(frames(), before + 2);
+            }
         }
 
         /// Coding through Paseo (96.3) over a server that behaves like
@@ -21433,6 +22397,7 @@ mod workflows {
             decisions: None,
             sandbox: deps.sandbox.clone(),
             mcp: deps.mcp.clone(),
+            kvm: deps.kvm.clone(),
         }
     }
 

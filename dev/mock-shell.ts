@@ -6094,7 +6094,8 @@ const AGENT_ROOM_TIMELINES: Record<string, { header: AgentRoomHeaderVm; items: T
 // rows, the second approved), `run` (a networked T3 run as keeper bound it:
 // the argv, the program, the folder, the Network chip and its file list),
 // `run-large` (a T2 run attached: its run's own session allowance, and once
-// shown the typed run view with escaped arguments).
+// shown the typed run view with escaped arguments), `kvm` (a T4 `kvm_act`:
+// its inputs as keeper reads them, no raw arguments).
 // `agent_approval_decide` answers as Rust does: refused with the card's own
 // sentence where it shows no buttons, for another digest or a scope the card
 // does not offer, and for an attached action not shown yet; else the card
@@ -6185,6 +6186,7 @@ function approvalCard(
     only: tier >= 4 ? "Only harness can decide this. This cannot be undone." : null,
     declassify: null,
     run: null,
+    kvm: null,
     ...over,
   };
 }
@@ -6299,6 +6301,26 @@ function mockApprovalCards(): ApprovalCardVm[] {
             timeoutS: 1800,
             held: [],
             network: null,
+          },
+        }),
+      ];
+    case "kvm":
+      return [
+        approvalCard(id, 4, {
+          summary:
+            "5 inputs to desk: click (960, 540), type 14 characters including 1 line break, 6 character keys, key ctrl+s, scroll down 3",
+          tool: "kvm_act",
+          // As Rust draws a KVM act: its inputs, no raw payload (R323).
+          payload: null,
+          kvm: {
+            kvm: "desk",
+            inputs: [
+              "click (960, 540)",
+              "type 14 characters including 1 line break",
+              "6 character keys",
+              "key ctrl+s",
+              "scroll down 3",
+            ],
           },
         }),
       ];
@@ -6450,6 +6472,7 @@ function mockApprovalPayload(payload: Record<string, unknown>): Promise<Approval
       return {
         text: JSON.stringify({ args: { argv: ["printf", "…"] } }, null, 2),
         run: ATTACHED_RUN,
+        kvm: null,
       };
     }
     return {
@@ -6459,6 +6482,7 @@ function mockApprovalPayload(payload: Record<string, unknown>): Promise<Approval
         2,
       ),
       run: null,
+      kvm: null,
     };
   });
 }

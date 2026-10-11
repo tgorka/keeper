@@ -1034,12 +1034,24 @@ impl Server {
         };
         match &self.entry.transport {
             McpTransport::Url(url) => {
-                if self.entry.fingerprint.is_some() {
-                    return Err("a pinned certificate is not yet checked for MCP servers, so keeper does not connect to one (DW-810)".to_owned());
-                }
                 let identity = core_mcp::identity(&self.entry, None)?;
-                let client = keeper_core::bots::http::client(keeper_core::bots::http::READ_TIMEOUT)
-                    .map_err(|error| error.to_string())?;
+                // A pinned certificate is the only one accepted — a
+                // NanoKVM-Go's, from its `[[kvm]]` entry (F15), or any
+                // server's own (DW-810); else the system's roots.
+                let (client, pinned) = match &self.entry.fingerprint {
+                    Some(fingerprint) => {
+                        let (client, pinned) = crate::kvm::tls::client(
+                            fingerprint,
+                            keeper_core::bots::http::READ_TIMEOUT,
+                        )?;
+                        (client, Some(pinned))
+                    }
+                    None => (
+                        keeper_core::bots::http::client(keeper_core::bots::http::READ_TIMEOUT)
+                            .map_err(|error| error.to_string())?,
+                        None,
+                    ),
+                };
                 // A session the server forgets ends the connection: rmcp
                 // would start another and send the call again in it, past
                 // every check keeper made of the first (R144).
@@ -1059,9 +1071,16 @@ impl Server {
                     },
                     config,
                 );
+                // A certificate that is not the pinned one is said as
+                // keeper's sentence naming both, not as the transport's.
                 let client = rmcp::serve_client(handler, transport)
                     .await
-                    .map_err(|error| error.to_string())?;
+                    .map_err(|error| {
+                        pinned
+                            .as_ref()
+                            .and_then(|pinned| pinned.refused())
+                            .unwrap_or_else(|| error.to_string())
+                    })?;
                 Ok(Connection {
                     client,
                     identity,

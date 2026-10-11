@@ -2,6 +2,7 @@
 import type { ApprovalPersonVm } from "./ApprovalPersonVm";
 import type { ApprovalStateVm } from "./ApprovalStateVm";
 import type { DeclassifyVm } from "./DeclassifyVm";
+import type { KvmCardVm } from "./KvmCardVm";
 import type { RunCardVm } from "./RunCardVm";
 import type { ScopeOfferVm } from "./ScopeOfferVm";
 
@@ -31,7 +32,7 @@ summary: string,
 tool: string, 
 /**
  * The exact arguments, pretty-printed JSON; `None` when attached, and
- * for a `run`, which `run` draws whole.
+ * for a `run` or a `kvm_act`, which `run` and `kvm` draw whole.
  */
 payload: string | null, 
 /**
@@ -77,4 +78,10 @@ only: string | null, declassify: DeclassifyVm | null,
  * other tool, or when the action is attached — [`attached_payload`]
  * then draws the same view once its file is checked (R231).
  */
-run: RunCardVm | null, };
+run: RunCardVm | null, 
+/**
+ * A `kvm_act`'s inputs as keeper reads them (R323); `None` for any
+ * other tool, or when the action is attached — [`attached_payload`]
+ * then draws it.
+ */
+kvm: KvmCardVm | null, };

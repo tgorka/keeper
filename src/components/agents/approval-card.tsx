@@ -249,6 +249,28 @@ function RunPayload({ run }: { run: NonNullable<ApprovalCardVm["run"]> }) {
   );
 }
 
+/**
+ * A `kvm_act`'s inputs as keeper reads them (R323): typed and pasted text
+ * counted, never shown, a run of single keys counted too, and nothing the
+ * model wrote — its intent included — drawn.
+ */
+function KvmPayload({ kvm }: { kvm: NonNullable<ApprovalCardVm["kvm"]> }) {
+  const captionId = useId();
+  return (
+    <figure aria-labelledby={captionId} className="flex min-w-0 flex-col gap-1">
+      <figcaption id={captionId} className="text-muted-foreground text-xs">
+        What will be sent to <code className="font-mono">{kvm.kvm}</code>
+      </figcaption>
+      <ol className="max-h-60 list-decimal overflow-y-auto rounded-md border border-border bg-background py-2 pr-2 pl-6 text-xs [overflow-wrap:anywhere]">
+        {kvm.inputs.map((input, n) => (
+          // biome-ignore lint/suspicious/noArrayIndexKey: the same input may be sent twice.
+          <li key={n}>{input}</li>
+        ))}
+      </ol>
+    </figure>
+  );
+}
+
 export const APPROVAL_SHOW_FULL = "Show the full action";
 export const APPROVAL_HIDE_FULL = "Hide the full action";
 export const APPROVAL_PAYLOAD_FAILED =
@@ -317,6 +339,8 @@ function AttachedAction({
         shown !== null &&
         (shown.run !== null ? (
           <RunPayload run={shown.run} />
+        ) : shown.kvm !== null ? (
+          <KvmPayload kvm={shown.kvm} />
         ) : (
           <Payload tool={card.tool} text={shown.text} />
         ))}
@@ -594,6 +618,7 @@ function ApprovalCard({
       </p>
       {card.declassify !== null && <p className="text-sm">{card.declassify.sentence}</p>}
       {card.run !== null && <RunPayload run={card.run} />}
+      {card.kvm !== null && <KvmPayload kvm={card.kvm} />}
       {card.payload !== null && <Payload tool={card.tool} text={card.payload} />}
       {card.attachment !== null && (
         <AttachedAction

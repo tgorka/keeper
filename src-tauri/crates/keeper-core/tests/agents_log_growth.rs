@@ -99,6 +99,7 @@ fn body(i: u64) -> LineBody {
             truncated: None,
             label,
             paseo: None,
+            effect: None,
         }),
     }
 }

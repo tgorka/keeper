@@ -397,7 +397,9 @@ pub struct Truncated {
 /// `tool_result`: the result as the model received it, with its label.
 /// `paseo` is the host's own record of the run a successful Paseo
 /// `create_agent` started — the only thing a later poll's authority is
-/// read from (Q14), never the result's text.
+/// read from (Q14), never the result's text. `effect` is what keeper knows
+/// of an effect outside itself: `unverified` for a KVM input that was sent,
+/// whose result nobody saw take (96.5 #7, "sent is never done").
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ToolResultBody {
@@ -409,6 +411,8 @@ pub struct ToolResultBody {
     pub label: Label,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paseo: Option<crate::agents::paseo::Started>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effect: Option<String>,
 }
 
 /// Where an approval stands (R80). Terminal: `consumed`, `expired`,
@@ -1193,6 +1197,7 @@ mod tests {
                 }),
                 label: label(),
                 paseo: None,
+                effect: None,
             }),
             LineBody::Approval(ApprovalBody {
                 id: "01J".into(),

@@ -197,6 +197,26 @@ objc2-ui-kit = { version = "0.3.2", default-features = false, features = [
 # Account registry + opaque account ids (both already present transitively via matrix-sdk).
 ulid = "1"
 rusqlite = { version = "0.37", features = ["bundled"] }
+# The classic NanoKVM's login (96.5, `keeper-ported::nanokvm`): its password
+# travels AES-256-CBC-encrypted under a key the reference publishes. Both
+# already in Cargo.lock (matrix-sdk-crypto, vodozemac); `MIT OR Apache-2.0`.
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc", "block-padding"] }
+# A KVM's self-signed certificate is accepted only when its SHA-256 is the
+# configured `fingerprint` (AD-409): keeper's own verifier, handed to reqwest
+# as a preconfigured `ClientConfig` and to the KVM's WebSocket through
+# tokio-rustls — the TLS stack reqwest already uses, so no second one. Both in
+# Cargo.lock; rustls `Apache-2.0 OR ISC OR MIT`, tokio-rustls `MIT OR Apache-2.0`.
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "aws_lc_rs"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["tls12"] }
+# The classic NanoKVM's HID input over its `/api/ws` WebSocket (96.5): the
+# handshake only, over keeper's own pinned TLS stream — no TLS feature of its
+# own. tokio-tungstenite MIT, tungstenite `MIT OR Apache-2.0`; `cargo deny
+# check` from `src-tauri/` passes with them.
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+# The classic NanoKVM login's IV, drawn from the OS as its reference draws it
+# (`os.urandom`). Already in Cargo.lock at 0.3.4; MIT OR Apache-2.0.
+getrandom = "0.3"
 
 # ---------------------------------------------------------------------------
 # Folder Sync phase (Epics 23–31, AD-40 … AD-53). Consumed by `keeper-sync`
@@ -339,6 +359,11 @@ sse-stream = "0.2"
 # Serves an in-test MCP server's tower service over HTTP. Already in Cargo.lock
 # at 0.8.9; MIT.
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+# A self-signed certificate made per test run, for the in-test KVM and MCP
+# servers whose certificate keeper pins (96.5 #3/#4, DW-810): no private key is
+# ever committed. aws-lc-rs, the provider rustls already uses here. MIT OR
+# Apache-2.0 (yasna, pem: MIT OR Apache-2.0 / MIT).
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs"] }
 # A screenshot of the Mac's screen, decoded to grey for its region's
 # difference hash (96.4, Q13). PNG only; already in Cargo.lock at 0.25.10
 # through tauri, so no new crate. MIT OR Apache-2.0.
