@@ -92,6 +92,11 @@ export function useCapabilitiesStore<T>(selector: (state: CapabilitiesState) => 
  * compute it as `cfg!(desktop)`-shaped — true on both tiers, or true on the
  * phone alone; that is the whole membership rule.
  *
+ * **`sessions` is true on the phone too (98.2, AD-413)** when a folder there
+ * has a sessions zone: the phone's board reads and moves cards. Left in the
+ * fold, the first phone with a zone would read as a desktop and render the
+ * desktop frame.
+ *
  * **`shareOut` is true on the phone ONLY (Story 66.3, AD-200)**: it is the
  * phone's answer to `revealInFileManager`, the one flag in the VM whose truth
  * is inverted against the rest. Folded in, a phone that can share would read
@@ -103,6 +108,7 @@ const TIER_NEUTRAL_FLAGS: Partial<Record<keyof CapabilitiesVm, true>> = {
   bots: true,
   sync: true,
   notes: true,
+  sessions: true,
   shareOut: true,
 };
 

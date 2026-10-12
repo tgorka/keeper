@@ -1,4 +1,5 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { act, renderHook } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { SessionRowVm } from "@/lib/ipc/client";
 
 const sessionsLogToday = vi.fn();
@@ -33,8 +34,10 @@ vi.mock("@/lib/ipc/client", () => ({
 }));
 
 import { SESSION_RECORD_NAME } from "@/components/sessions/session-detail";
-import { logTodayInCurrentSession } from "@/hooks/use-sessions-shortcut";
+import { logTodayInCurrentSession, useSessionsShortcut } from "@/hooks/use-sessions-shortcut";
+import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
 import { panelsStore } from "@/lib/stores/panels";
+import { primaryViewStore } from "@/lib/stores/primary-view";
 import { resetSessionsListStoreForTest, sessionsListStore } from "@/lib/stores/sessions-list";
 import { resetSessionsRootsStoreForTest, sessionsRootsStore } from "@/lib/stores/sessions-roots";
 
@@ -125,5 +128,58 @@ describe("logTodayInCurrentSession", () => {
     await logTodayInCurrentSession();
     expect(sessionsLogToday).not.toHaveBeenCalled();
     expect(panelsStore.getState().panels.find((p) => p.target?.kind === "file")).toBeUndefined();
+  });
+});
+
+/**
+ * The chords on a phone with a sessions zone (98.2): `sessions` is on there,
+ * and the phone shell has no board surface yet — so ⌘7 sets no view it cannot
+ * show, and ⌘⌥L asks for nothing the phone refuses.
+ */
+describe("useSessionsShortcut on a phone with a zone", () => {
+  function press(key: string, code: string, alt = false): KeyboardEvent {
+    const event = new KeyboardEvent("keydown", {
+      key,
+      code,
+      metaKey: true,
+      altKey: alt,
+      bubbles: true,
+      cancelable: true,
+    });
+    act(() => {
+      window.dispatchEvent(event);
+    });
+    return event;
+  }
+
+  afterEach(() => {
+    primaryViewStore.setState({ view: "inbox" });
+    capabilitiesStore.setState({ capabilities: DEFAULT_CAPABILITIES, hydrated: false });
+  });
+
+  it("leaves ⌘7 and ⌘⌥L alone", () => {
+    primaryViewStore.setState({ view: "inbox" });
+    capabilitiesStore
+      .getState()
+      .applySnapshot({ ...DEFAULT_CAPABILITIES, sync: true, notes: true, sessions: true });
+    renderHook(() => useSessionsShortcut());
+    expect(press("7", "Digit7").defaultPrevented).toBe(false);
+    expect(press("l", "KeyL", true).defaultPrevented).toBe(false);
+    expect(primaryViewStore.getState().view).toBe("inbox");
+    expect(sessionsLogToday).not.toHaveBeenCalled();
+  });
+
+  it("opens the board on ⌘7 on a desktop", () => {
+    primaryViewStore.setState({ view: "inbox" });
+    capabilitiesStore.getState().applySnapshot({
+      ...DEFAULT_CAPABILITIES,
+      sync: true,
+      notes: true,
+      sessions: true,
+      trayIcon: true,
+    });
+    renderHook(() => useSessionsShortcut());
+    expect(press("7", "Digit7").defaultPrevented).toBe(true);
+    expect(primaryViewStore.getState().view).toBe("sessions");
   });
 });

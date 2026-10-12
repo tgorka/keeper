@@ -474,10 +474,14 @@ schemes. What stays desktop-only, and why:
 
 - The five plugins above (tray, hotkey, autostart, updater, process): no iOS concept.
 - `bots_drive_ipc` and the drive half of `agent_ports` (the drive half of Bots), `notes_window` (the
-  quick-capture window), `sessions_root` (the sessions board and the tasks runner — AD-201:
-  iOS spawns nothing), `hotkey`, `menu`, `tray`, `voice_window`, `recording_protocol`,
-  `pdf_export` (macOS WebKit). `keeper_agent::sessions` is not gated: `keeper-agent` is a
-  dependency on every target, so it compiles on the phone and nothing there calls it.
+  quick-capture window), `hotkey`, `menu`, `tray`, `voice_window`, `recording_protocol`,
+  `pdf_export` (macOS WebKit). `sessions_root` compiles on the phone since 98.2 (the
+  board below); the sessions lifecycle verbs keep their `unsupported` twins.
+- Inside `keeper-agent`, everything that writes a session's log, an approval or a card's
+  run — `writer`, the session worker in `agent`, `approvals`, `cards` — and every module
+  built on them is `#[cfg(not(phone))]` (`keeper-agent/build.rs` sets `phone` for an iOS
+  or Android target), so a phone code path that names one does not compile.
+  `bun run check:agent-phone` checks that half on any host (98.2, AD-413).
 - Inside `keeper-sync`, `git/cli.rs` is the one module that spawns a process. On
   iOS every verb on it refuses **before** `Command::new` with one sentence naming
   the phone and the in-process route (`GitEngine::Gix`, `GitCli::phone()`); the
@@ -715,8 +719,9 @@ than this prose.
 
 A profile on the phone is a remote URL, a branch, a name and a credential — nothing
 else. The sheet is the desktop's add-folder form with the phone's shape: on the reduced
-tier the folder field, the pickers, Direction, the recordings and sessions switches and
-the whole Advanced disclosure are absent, the access-token field is first-order, and a
+tier the folder field, the pickers, Direction, the recordings, voices and agents switches
+and the whole Advanced disclosure are absent (the sessions switch is there since 98.2:
+the phone's board reads a zone, and a drive offered by your account keeps its flag), the access-token field is first-order, and a
 save no longer requires a path (`src/components/sync/add-folder-form.tsx:1617`,
 `:1651-1664`, `:2296-2297`; Story 66.1), so it sends `localPath: ""`. Rust assigns the
 folder: `<app data dir>/sync/<profile id>`, created there and excluded from backup like
@@ -733,6 +738,46 @@ never a process argument, never a URL.
 **The remote is the hub, never the Mac.** The phone mirrors a profile the Mac already
 syncs; the two devices never talk to each other, and DW-220's inverted route — the Mac
 serving the phone — is refused for the reason it was deferred (D-15).
+
+### The sessions board on the phone (98.2)
+
+The phone reads a drive's sessions zone and moves its cards; it writes no session.
+
+- **Which zones.** A folder flagged *This folder has sessions* — on the phone's form, or
+  carried by your account's drive list from the Mac — is a sessions root once its clone
+  has the zone (`sessions_root`, on every target). `CapabilitiesVm.sessions` is true on
+  the phone exactly when one is registered (`sessions_capability_of`); a first zone
+  landing or a last one going emits `keeper://capabilities-changed` and the webview asks
+  again — only on that edge (`keeper_agent::sessions::zones_flip_the_surface`). The
+  phone taps no watcher: every zone is rescanned after each sync pass — on open, on
+  foreground and on pull-to-refresh (`sessions_root::phone_synced`) — and after a move.
+- **What it reads.** `sessions_roots`, `sessions_list`, `sessions_rescan`,
+  `sessions_detail`, `sessions_tree`, `sessions_refs`, `sessions_search` and its cancel
+  run on the phone with no twin. The board is `keeper_agent::sessions::board::detail`,
+  the one projection the Mac shows too; an agent's session carries its room
+  (`SessionDetailVm.room`), where its approval card is decided.
+- **What it writes.** `sessions_task_move` only: the moved card's `status:` and
+  `order:`, and its neighbours' `order:` when the gap it lands in has collapsed — never
+  `run:`, `assignee:` or a body (`compile_move`). Agents on other hosts commit to the
+  same drive all the time, so the move goes through `Engine::phone_write` (R346): a
+  pull-only pass first, so the move is planned over the remote's current bytes; a folder
+  that is diverged, busy or failing refuses the move with the engine's own sentence and
+  nothing is written; then the move, then one pass that commits and pushes it through the
+  phone's own engine (`Engine::phone_push`, D-16). The command answers what the push did
+  (`SessionTaskMoveVm.unpushed`, shown on the board): `null` once it is on the remote,
+  else the sentence. A push that can land later on its own — the folder busy with another
+  pass, the remote unreachable — is tried again every 30 s while keeper is in front, and
+  at the next foreground sync otherwise; a divergence is not retried (§ *Fast-forward
+  only*). A paused folder is neither pulled nor pushed: the move is written and declared
+  settled, so the first pass after the folder is resumed pushes it (the one after, if
+  keeper was closed in between — the declaration lives in memory).
+- **What stays on the Mac.** Creating, archiving, deleting, migrating sessions, the
+  space and template editors, file verbs and *Allow* on a card's schedule keep their
+  `unsupported` twins, and `keeper-agent`'s session writer and approvals writer do not
+  exist in its build. A move a crash cut short — neighbours renumbered, the card not yet
+  written — is finished before every sync pass, by the same executor
+  (`sessions_root::finish_interrupted_before_pass` → `resume_all`), so no pass commits half
+  a move.
 
 ### Fully virtual by default, and why
 
@@ -829,6 +874,15 @@ the second is a problem. Three shapes:
    `a_phone_names_a_divergence_and_merges_nothing` — two bare repositories, a
    git-driven "Mac" and a Gix engine — beside `a_phone_clones_and_fast_forwards_with_gitoxide`
    in `engine.rs`'s tests (Story 66.2).
+
+   **The sessions board meets this more than notes do.** A drive's sessions zone is
+   written by agents on other hosts all day, so a card moved on top of the phone's last
+   fast-forward would almost always diverge. That is why a move pulls first and is refused
+   — nothing written — when the pull already names a divergence (R346, `Engine::phone_write`).
+   What remains is a remote commit landing in the seconds between that pull and the push,
+   or a move made offline or in a paused folder: the move stays on the phone, the board
+   says so, and until DW-1273's replay or reset exists the way out is removing the
+   folder and adding it again.
 
 ### A push keeper does itself
 

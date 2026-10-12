@@ -77,8 +77,8 @@ pub use credential::AccessToken;
 pub use db::{ActivityEntry, ActivityKind, ActivityRow, DeliveryState};
 pub use engine::{
     blob_id, CommitFence, CommitPaths, CommitRequest, Engine, FinishedTap, ParkedUnit,
-    PathDurability, PendingFile, PendingReason, ProblemReport, SyncOutcome, VerifyReport,
-    TASK_QUIT_SETTLE,
+    PathDurability, PendingFile, PendingReason, PhonePush, PhoneWriteError, ProblemReport,
+    SyncOutcome, VerifyReport, TASK_QUIT_SETTLE,
 };
 pub use error::{Result, SyncError};
 pub use git::resolve::{GitChoice, GitOrigin, GitReject, GitRejection, GitRequest, GitResolution};

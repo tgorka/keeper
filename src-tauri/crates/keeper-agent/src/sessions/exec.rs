@@ -1485,6 +1485,59 @@ mod tests {
         assert!(!journal.exists(), "journal cleared after resume");
     }
 
+    /// A card move a crash cut short — the neighbours renumbered, the card
+    /// itself not yet written (98.2, R346) — is finished by
+    /// [`super::super::resume_all`], which a phone runs before each sync pass,
+    /// so no pass commits half a move.
+    #[test]
+    fn a_card_move_cut_short_is_finished_by_the_sweep_before_a_pass() {
+        use keeper_core::sessions::shape::TaskStatus;
+        use keeper_core::sessions::tasks::{compile_move, TaskFile};
+
+        let zone = zone();
+        let session = zone.path().join("active/s");
+        std::fs::create_dir_all(&session).expect("mkdir");
+        let card = |order: &str, status: &str, title: &str| {
+            format!("---\nstatus: {status}\norder: {order}\n---\n\n# {title}\n")
+        };
+        let a = card("1", "todo", "First");
+        let b = card("1", "todo", "Second"); // the gap has collapsed
+        let moved = card("4", "done", "Moved");
+        for (name, text) in [("a.md", &a), ("b.md", &b), ("c.md", &moved)] {
+            std::fs::write(session.join(name), text).expect("write");
+        }
+        let column = [
+            TaskFile {
+                rel: "a.md",
+                text: &a,
+                order: 1.0,
+            },
+            TaskFile {
+                rel: "b.md",
+                text: &b,
+                order: 1.0,
+            },
+        ];
+        let plan = compile_move("active/s", "c.md", &moved, TaskStatus::Todo, &column, 1)
+            .expect("a collapsed gap renumbers");
+        assert!(plan.steps.len() > 1, "the neighbours first, the card last");
+        let done = plan.steps.len() - 1;
+        for step in &plan.steps[..done] {
+            run_step(zone.path(), step).expect("a step before the crash");
+        }
+        write_journal(&zone.path().join(JOURNAL_REL), &JournalRow { plan, done }).expect("journal");
+        let read = |name: &str| std::fs::read_to_string(session.join(name)).expect("read");
+        assert!(
+            read("c.md").contains("status: done"),
+            "the card was not written yet"
+        );
+
+        let unfinished = super::super::resume_all([zone.path()]);
+        assert!(unfinished.is_empty(), "{unfinished:?}");
+        assert!(read("c.md").contains("status: todo"), "the move is whole");
+        assert!(!zone.path().join(JOURNAL_REL).exists(), "journal cleared");
+    }
+
     /// An inventory stamp of the file at `path`, as [`inventory`] writes it.
     fn stamp(path: &Path) -> String {
         let mut problems = Vec::new();

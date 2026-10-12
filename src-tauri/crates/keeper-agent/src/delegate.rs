@@ -71,7 +71,7 @@ use serde_json::{json, Value};
 use ulid::Ulid;
 
 use crate::agent::RoomFuture;
-use crate::matrix_sink::{EditPort, SendFuture};
+use crate::matrix_sink::{EditPort, MembersFuture, SendFuture};
 use crate::rooms::{BriefRoom, Known, KnownAgent};
 use crate::sessions::verbs::VerbError;
 use crate::sinks::{room_audience, Blocked, CallAudit, Sinks, Withheld};
@@ -177,9 +177,6 @@ pub type BoolFuture<'a> = Pin<Box<dyn Future<Output = bool> + Send + 'a>>;
 pub type EventsFuture<'a> = Pin<Box<dyn Future<Output = Result<Vec<Value>, String>> + Send + 'a>>;
 /// A boxed future of a room change, or the homeserver's answer refusing it.
 pub type UnitFuture<'a> = Pin<Box<dyn Future<Output = Result<(), AgentMatrixError>> + Send + 'a>>;
-/// A boxed future of a room's members, joined or invited.
-pub type MembersFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<BTreeSet<OwnedUserId>, String>> + Send + 'a>>;
 /// A boxed future of what a host reads of a room a brief arrived in.
 pub type BriefRoomFuture<'a> = Pin<Box<dyn Future<Output = Option<BriefRoom>> + Send + 'a>>;
 /// A boxed future of an encrypted upload's `EncryptedFile` JSON.

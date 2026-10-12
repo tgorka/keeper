@@ -3954,9 +3954,10 @@ settles-with: on kalypso: accept a call while armed, read the ring
 
 origin: epic 66, AD-201, story 66.6 (recorded), 2026-09-05
 location: `crates/keeper/src/sessions_ipc.rs:40-44` (the first twin, `sessions_roots`) and every `unsupported()` twin below it,
-  `crates/keeper/src/lib.rs:88-92` (`sessions_exec`, `sessions_root` — `#[cfg(desktop)]`),
+  `crates/keeper/src/lib.rs` (`sessions_root` — on every target since 98.2; `sessions_exec` is gone, it is
+  `keeper_agent::sessions::exec`),
   `crates/keeper/src/ipc.rs:1481` (`sessions: mac_folder_capability_of(&git_report(&state), cfg!(desktop))`),
-  `src/components/layout/sidebar-pane.tsx:272-273` (the row rides the `sessions` flag),
+  `src/components/layout/sidebar-pane.tsx:280` (the row rides the `sessions` flag),
   `src/components/sessions/**` (the desktop pane), `docs/ios.md` *Limitations* (fifth item);
   lines re-read on 2026-10-02 (the agents plan's consistency review, F15; ruling R24(12)) — epic 98's story 98.2 takes the read half
   and DW-410 keeps the rest
@@ -3972,6 +3973,11 @@ reason: A sessions root is a synced folder plus a flag (AD-107), and the phone h
   phone stack, the executor and the space editors after, and `sessions` on a gate that is
   honest on the phone rather than `notes_available` inherited.
 status: open
+progress (rung `agents-98-phone-sessions`, 2026-10-12; R344, R345): the Rust half of the read half is
+  in — `sessions_root` on every target, the read verbs and `sessions_task_move` without twins, the
+  board projection shared (`keeper_agent::sessions::board`), `sessions` gated on a zone being on the
+  phone; the phone surface and the fifth disclosure line are rung `agents-98-phone-board`, and the
+  rest is DW-410.
 
 ### DW-238: Tasks on the phone — and the reason is not the one the epic gave.
 
@@ -10059,4 +10065,32 @@ status: open
 origin: epic 98, story 98.1 (rung `agents-98-apns` fix round 1, 2026-10-12; `review-98apns-1.md` R98APNS1-01, R343)
 location: `src-tauri/crates/keeper/gen/apple/KeeperNotify/NotificationService.swift`, `keeper_core::agents::push::SHOWN_INFO`
 reason: The extension strips every keeper key and the category from what the gateway sent on every path it completes, and only its `show` sets `keeper_shown`. If iOS ends the extension before it calls its handler at all (killed over its memory ceiling, a crash), iOS shows the push as it arrived — the homeserver's words, its category's actions, any `keeper_shown` it planted. The decision path still refuses any record not in the session room with that digest, so nothing but a real request with its real digest is decided, but the words may not be keeper's. Closing it needs a mark the gateway cannot forge — e.g. a per-install secret in the shared keychain the extension seals the shown record with and the app checks — or the record the extension showed written to the App Group and checked by the app. Measure first whether the extension is ever killed (98.1 #12, the 24 MB row).
+status: open
+
+### DW-1270: The phone's session tree says "do it in Finder".
+
+origin: epic 98, story 98.2 (rung `agents-98-phone-sessions`, 2026-10-12; R345)
+location: `crates/keeper/src/sessions_ipc.rs` `SESSION_TREE_DIR_UNDELETABLE`, read by `sessions_tree` on every target now
+reason: A folder row's refusal tells a person to remove the folder in Finder. On the phone the tree is read-only and Finder is not there; the sentence is true about keeper and wrong about where to go. Word it per platform (a `Platform` fact, never a sniff) when the phone's board shows the tree.
+status: open
+
+### DW-1271: Where a card runs may be unknown on the phone.
+
+origin: epic 98, story 98.2 (rung `agents-98-phone-sessions`, 2026-10-12; codemap §5)
+location: `keeper_agent::sessions::board::detail` (`Index::refresh_session` over the session's log chunks), `SyncProfile::make_fully_virtual`
+reason: `running_on` and `waiting` come from the session's log chunks. A phone folder is fully virtual; if the drive's LFS rules make chunk files pointers, the phone's index reads no claim and a running card shows no host (98.2's checklist: "running on electra"). Not checked against tgdrive's `.gitattributes`. If it shows, exclude the log chunks from the virtual patterns of a sessions zone on the phone.
+status: open
+
+### DW-1272: `check:agent-phone` runs only by hand.
+
+origin: epic 98, story 98.2 (rung `agents-98-phone-sessions`, 2026-10-12; R344)
+location: `package.json` `check:agent-phone`, `keeper-agent/build.rs`
+reason: The phone's half of `keeper-agent` is gated by CI's iOS compile job (the real target); the Linux seam that checks the same `cfg(phone)` half is not in `bun run check` or CI, because it recompiles `keeper-agent`. If an iOS break in `keeper-agent` reaches CI twice, add it to the Rust job.
+status: open
+
+### DW-1273: A phone move that meets a remote commit after its pull is stuck until the folder is removed.
+
+origin: epic 98, story 98.2 (rung `agents-98-phone-sessions` fix round 1, 2026-10-12; R346, review-98phonesessions-1 R98PS-01 follow-on)
+location: `keeper_sync::Engine::phone_write` / `apply_in_process` (`SyncError::Diverged` on a phone), `crates/keeper/src/sessions_ipc.rs` `move_and_publish`; the phone has no reset verb (`src/components/settings/about-section.tsx` only names the choice)
+reason: The move now pulls first, so a divergence needs a remote commit inside the seconds between that pull and the push — or a move made offline or in a paused folder while agents kept working. When it happens the phone holds one commit the remote lacks, every later pass refuses with the divergence sentence, and the only way out is removing and re-adding the folder, which drops the move. Two honest convergences, neither built: replay — drop the one local commit, fast-forward, re-plan the move over the new bytes (`compile_move`; its guarded writes refuse if the card itself changed) and push again; or a phone reset verb that resets to the remote and lists the person's unpushed card moves to redo.
 status: open

@@ -83,7 +83,6 @@ mod recorder;
 #[cfg(desktop)]
 mod recording_protocol;
 mod sessions_ipc;
-#[cfg(desktop)]
 mod sessions_root;
 // Share out (Story 66.3, AD-200): the phone's reveal. The containment half
 // compiles everywhere and is tested on Linux; the `UIActivityViewController`
@@ -909,8 +908,10 @@ pub fn run() {
             // Build the sessions-root registry beside it (Phase 7, AD-107/108):
             // the same construction over the same engine tap, and the same quiet
             // return where no engine exists — `CapabilitiesVm.sessions` is
-            // already false there.
-            #[cfg(desktop)]
+            // already false there. On every target since 98.2 (AD-413): the
+            // phone reads its zones and moves cards; it taps no watcher, and a
+            // zone whose clone has not landed yet is adopted by
+            // `sessions_root::phone_synced` when the pass ends.
             sessions_root::start(app.handle());
 
             // The account's network half (Epic 82): sign-in state is already

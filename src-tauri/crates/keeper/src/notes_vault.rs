@@ -3697,50 +3697,24 @@ async fn run_cadence_action(vault_id: &str, action: Action) -> bool {
     }
 }
 
-/// The phone's commit-and-push (Epic 66, Story 66.4, AD-198, AD-202).
+/// The phone's commit-and-push of a vault's notes (Epic 66, Story 66.4,
+/// AD-198, AD-202).
 ///
 /// The desktop's cadence commits by waking the supervisor and pushes on a
-/// later tick; a phone has neither, so a save is one engine pass: declare the
-/// container's own writes settled — there is no other writer in an app
-/// container, so the settle window would be waiting for nobody
-/// (`Engine::prime_worktree_changes`) — then `sync_once_recording`, whose
-/// order is commit, fetch, fast-forward, push. The push is
-/// `Engine::push_after_commit` → `git::push_http::push`, the phone's own
-/// engine, never a binary (AD-202); a history the phone cannot fast-forward
+/// later tick; a phone has neither, so a save is one engine pass:
+/// [`keeper_sync::Engine::phone_push`] declares the container's own writes
+/// settled and runs commit, fetch, fast-forward, push through the phone's own
+/// engine, never a binary (AD-202). A history the phone cannot fast-forward
 /// is the divergence sentence beside the profile (AD-199), and the commit is
 /// kept locally either way.
 ///
 /// `true` — still ahead — when the pass refused, which is what re-arms the
 /// retry in [`dispatch_cadence`]. Offline is the ordinary case, not a fault.
 async fn phone_commit_and_push(engine: &keeper_sync::Engine, vault_id: &str) -> bool {
-    match engine.prime_worktree_changes(vault_id) {
-        Ok(primed) => tracing::debug!(
-            vault_id,
-            primed,
-            "notes: the phone declared its writes settled"
-        ),
-        Err(error) => {
-            tracing::warn!(vault_id, %error, "notes: the phone could not declare its writes")
-        }
-    }
-    match engine
-        .sync_once_recording(vault_id, SyncSource::Watch)
-        .await
-    {
-        Ok(outcome) => {
-            tracing::info!(
-                vault_id,
-                committed = outcome.files_changed,
-                pushed = outcome.pushed,
-                "notes: the phone committed and pushed its notes"
-            );
-            false
-        }
-        Err(error) => {
-            tracing::warn!(vault_id, %error, "notes: the phone's commit-and-push is deferred");
-            true
-        }
-    }
+    !matches!(
+        engine.phone_push(vault_id).await,
+        keeper_sync::PhonePush::Pushed
+    )
 }
 
 /// Arm one delayed cadence pass on the phone (Epic 66, NFR-57).

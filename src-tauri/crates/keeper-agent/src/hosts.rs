@@ -3023,7 +3023,7 @@ mod tests {
             Box::pin(async { false })
         }
 
-        fn members<'a>(&'a self, _room: &'a RoomId) -> crate::delegate::MembersFuture<'a> {
+        fn members<'a>(&'a self, _room: &'a RoomId) -> crate::matrix_sink::MembersFuture<'a> {
             Box::pin(async { Ok(BTreeSet::new()) })
         }
 

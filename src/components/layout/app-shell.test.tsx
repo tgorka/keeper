@@ -407,7 +407,10 @@ describe("AppShell", () => {
     // A `queryByLabelText` and not a width assertion, deliberately: jsdom lays
     // nothing out, so the only thing a component test can own is whether the
     // claimant is in the tree at all. The widths are measured with `dev/probe`.
-    capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, sessions: true });
+    // The desktop's Tasks view: `sessions` alone is a phone with a zone (98.2).
+    capabilitiesStore
+      .getState()
+      .applySnapshot({ ...DEFAULT_CAPABILITIES, trayIcon: true, sessions: true });
     primaryViewStore.getState().setView("tasks");
     render(<AppShell />);
 
@@ -426,7 +429,10 @@ describe("AppShell", () => {
     // not "some panel holds a task". A file left open in the Files surface is
     // still a document somebody asked to keep, and it must not vanish because
     // the reader pressed ⌘8.
-    capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, sessions: true });
+    // The desktop's Tasks view: `sessions` alone is a phone with a zone (98.2).
+    capabilitiesStore
+      .getState()
+      .applySnapshot({ ...DEFAULT_CAPABILITIES, trayIcon: true, sessions: true });
     primaryViewStore.getState().setView("tasks");
     act(() => {
       panelsStore.getState().openPanel({ kind: "file", profileId: "p1", relativePath: "notes.md" });

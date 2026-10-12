@@ -1438,12 +1438,9 @@ pub(crate) fn save_profile(
     // The sessions flag rides this save (FR-222), and the root registry is a
     // filter over the profile list (AD-107) — so the registry re-reads here,
     // the same move `notes_vault_flag` makes for vaults. Idempotent and cheap
-    // when nothing sessions-shaped changed. Desktop: the sessions board stays
-    // on the Mac (AD-201).
-    #[cfg(desktop)]
+    // when nothing sessions-shaped changed. On the phone too since 98.2: a
+    // folder flagged there is a zone its board reads.
     crate::sessions_root::refresh(app);
-    #[cfg(not(desktop))]
-    let _ = app;
     // Best effort, and that word is load-bearing: the row is already committed,
     // so a failure here is a failed READ of work that succeeded. Reporting it as
     // an error would make an add whose write landed look like an add that did
@@ -1524,11 +1521,16 @@ fn phone_shaped_request(
 /// id — so a secret that outlived its profile could never be found again.
 #[tauri::command]
 pub async fn sync_profile_remove(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     id: String,
 ) -> Result<(), IpcError> {
     let engine = engine_of(&state)?;
     engine.remove_profile(&id).map_err(|e| sync_ipc_error(&e))?;
+    // A removed folder's sessions zone leaves the board on every target, and
+    // on a phone the last zone gone takes the sessions capability with it
+    // (98.2, R346): the folder stays on disk, so nothing else would forget it.
+    crate::sessions_root::refresh(&app);
     // The profile set changed, so the archive follows it (the archive follows
     // every recordings root). The removed folder's rows go with it — keeper no
     // longer knows that folder, so nothing could walk it, and a session that
@@ -1658,14 +1660,25 @@ pub async fn sync_folder_now(
     id: String,
 ) -> Result<SyncOutcomeVm, IpcError> {
     let engine = engine_of(&state)?;
+    // A card move a crash cut short is finished before the pass can commit
+    // half of it (98.2, R346), as before every phone pass.
+    #[cfg(not(desktop))]
+    if let Ok(profiles) = engine.list_profiles() {
+        let this: Vec<_> = profiles.into_iter().filter(|p| p.id == id).collect();
+        crate::sessions_root::finish_interrupted_before_pass(&this).await;
+    }
     let outcome = engine
         .sync_once_recording(&id, SyncSource::Manual)
         .await
         .map_err(|e| sync_ipc_error(&e))?;
     // The phone's notes index has no watcher to learn what the pull wrote
     // (Story 66.4); the desktop's tap already saw every path.
+    // The sessions registry likewise (98.2, R346): a clone this pass landed
+    // is a zone from then on, and moved cards reach the board.
     #[cfg(not(desktop))]
     crate::notes_vault::phone_synced(&app);
+    #[cfg(not(desktop))]
+    crate::sessions_root::phone_synced(&app);
     #[cfg(desktop)]
     let _ = app;
     Ok(SyncOutcomeVm {
@@ -4857,7 +4870,6 @@ fn routable_profile(state: &tauri::State<'_, AppState>, id: &str) -> Result<Sync
 // visible to the crate and to nobody else.
 
 /// The profile behind one sessions root.
-#[cfg(desktop)]
 pub(crate) fn sessions_profile(
     state: &tauri::State<'_, AppState>,
     root_id: &str,
@@ -4867,7 +4879,6 @@ pub(crate) fn sessions_profile(
 
 /// The live vault and the write scope over it — including the AD-113 fence,
 /// which is what the tree renders its read-only lock from.
-#[cfg(desktop)]
 pub(crate) fn sessions_scope(
     profile: &SyncProfile,
 ) -> (Option<crate::notes_vault::Vault>, WriteScope<'_>) {
@@ -4876,7 +4887,6 @@ pub(crate) fn sessions_scope(
 
 /// One `Engine::pending` answer for the whole tree, the engine's own words on
 /// failure.
-#[cfg(desktop)]
 pub(crate) async fn sessions_pending(
     state: &tauri::State<'_, AppState>,
     root_id: &str,
@@ -4897,7 +4907,6 @@ pub(crate) async fn sessions_pending(
 /// matters is that there is exactly one function wording these states, so a
 /// session file the Files pane calls excluded is called excluded here in the
 /// same words.
-#[cfg(desktop)]
 pub(crate) fn sessions_sync_mark(
     status: &browse::EntrySyncStatus,
     engine_failure: Option<&str>,
@@ -5145,7 +5154,6 @@ pub async fn sync_write_frontmatter(
 ) -> Result<String, IpcError> {
     // Scoped to this function: nothing else in this module emits, and the
     // module deliberately spells every other `tauri::` name in full.
-    #[cfg(desktop)]
     use tauri::Emitter as _;
 
     let profile = routable_profile(&state, &id)?;
@@ -5224,14 +5232,10 @@ pub async fn sync_write_frontmatter(
     //
     // Only for a profile that holds a sessions zone. A tag written in an
     // ordinary synced folder changes no space, and an event nobody is listening
-    // for is still a re-read for every open board.
-    // A phone has no sessions board to tell (AD-201).
-    #[cfg(desktop)]
+    // for is still a re-read for every open board — the phone's too (98.2).
     if profile.sessions.is_some() {
         let _ = app.emit(crate::sessions_root::SESSIONS_CHANGED_EVENT, id);
     }
-    #[cfg(not(desktop))]
-    let _ = (app, id);
     Ok(landed)
 }
 

@@ -23,12 +23,10 @@ use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::time::Duration;
 
 use keeper_agent::sessions::scan::{
-    read_ref_sources, read_session_pool, read_zone_spaces, scan_zone, section_snippet, RefSource,
-    SessionPool, ZoneSpaces, DETAIL_SCAN_BUDGET, REF_SCAN_BUDGET, WORKSPACE_WALK_BUDGET,
+    read_ref_sources, read_session_pool, read_zone_spaces, scan_zone, RefSource, SessionPool,
+    ZoneSpaces, REF_SCAN_BUDGET, WORKSPACE_WALK_BUDGET,
 };
-use keeper_core::notes::frontmatter::Frontmatter;
-use keeper_core::sessions::model::{lineage, README, WORKSPACE_DIR};
-use keeper_core::sessions::shape::Shape;
+use keeper_core::sessions::model::WORKSPACE_DIR;
 use keeper_core::sessions::vm::{SessionRootVm, SessionRowVm};
 use keeper_sync::SyncProfile;
 use tauri::{AppHandle, Emitter};
@@ -65,6 +63,7 @@ struct Slot {
 static REGISTRY: LazyLock<Mutex<HashMap<String, Slot>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+#[cfg(desktop)]
 static TAP_RUNNING: LazyLock<Mutex<bool>> = LazyLock::new(|| Mutex::new(false));
 
 fn registry() -> MutexGuard<'static, HashMap<String, Slot>> {
@@ -73,6 +72,7 @@ fn registry() -> MutexGuard<'static, HashMap<String, Slot>> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+#[cfg(desktop)]
 fn tap_flag() -> MutexGuard<'static, bool> {
     TAP_RUNNING
         .lock()
@@ -83,9 +83,13 @@ fn tap_flag() -> MutexGuard<'static, bool> {
 /// subscribe to the sync engine's watcher tap. Called from `setup()` after the
 /// sync supervisor, beside `notes_vault::start`, and idempotent for the same
 /// reasons.
+///
+/// On a phone (98.2, AD-413) there is no watcher to tap: a zone is rescanned
+/// after each sync pass ([`phone_synced`]) and after a card move.
 pub fn start(app: &AppHandle) {
     tracing::info!("sessions: starting the root registry");
     refresh(app);
+    #[cfg(desktop)]
     start_tap(app);
 }
 
@@ -113,6 +117,8 @@ pub fn refresh(app: &AppHandle) {
     let keep: HashSet<&str> = wanted.iter().map(|root| root.id.as_str()).collect();
 
     let mut guard = registry();
+    #[cfg(not(desktop))]
+    let had_roots = guard.len();
     guard.retain(|id, _| keep.contains(id.as_str()));
     let mut fresh: Vec<(String, PathBuf)> = Vec::new();
     for root in wanted {
@@ -130,8 +136,77 @@ pub fn refresh(app: &AppHandle) {
             }
         }
     }
+    #[cfg(not(desktop))]
+    let has_roots = guard.len();
     drop(guard);
+    // A phone finishes a crashed card move before each sync pass instead
+    // ([`finish_interrupted_before_pass`]), so a pass never commits half of
+    // one; the sweep here would race the launch's first pass.
+    #[cfg(desktop)]
     finish_interrupted(fresh);
+    // On a phone `CapabilitiesVm.sessions` is whether a zone is here
+    // ([`any`]), so a first zone or a last one gone says so to the webview,
+    // which asks again — and only those (`zones_flip_the_surface`).
+    #[cfg(not(desktop))]
+    if keeper_agent::sessions::zones_flip_the_surface(had_roots, has_roots) {
+        let _ = app.emit(crate::ipc::CAPABILITIES_CHANGED_EVENT, ());
+    }
+}
+
+/// Whether any sessions zone is registered — on a phone, the sessions
+/// capability (98.2 #6).
+pub fn any() -> bool {
+    !registry().is_empty()
+}
+
+/// Re-read the registry and rescan every zone after a phone sync pass (98.2,
+/// NFR-57), as [`crate::notes_vault::phone_synced`] does for vaults: a clone
+/// that just landed is a zone from then on, and a fast-forward that just
+/// moved cards reaches the board — there is no watcher tap on a phone.
+#[cfg(not(desktop))]
+pub fn phone_synced(app: &AppHandle) {
+    refresh(app);
+    for slot in registry().values() {
+        let _ = slot.work.send(());
+    }
+}
+
+/// Finish whatever plan a crash left in the sessions zone of each of these
+/// profiles, before a phone's sync pass runs (98.2, R346).
+///
+/// A card move writes its neighbours' `order:` first and the card last, under
+/// a journal; a phone killed between the two leaves half a move on disk, and
+/// the pass after it would commit and push that half. So every phone pass —
+/// the launch's first one included — runs the same executor the move itself
+/// runs, `resume_all`, over the zones first: the plan is finished whole, or
+/// (when its guarded write refuses because the bytes changed) its journal is
+/// cleared and nothing further is written. Awaited, not spawned: the point is
+/// that the pass starts after it. Nothing else on a phone holds a zone lock
+/// but keeper's own move, so the wait is bounded by that move.
+#[cfg(not(desktop))]
+pub async fn finish_interrupted_before_pass(profiles: &[SyncProfile]) {
+    let zones: Vec<PathBuf> = profiles
+        .iter()
+        .filter_map(register_one)
+        .map(|root| root.root)
+        .collect();
+    if zones.is_empty() {
+        return;
+    }
+    let swept = tauri::async_runtime::spawn_blocking(move || {
+        let unfinished = keeper_agent::sessions::resume_all(zones.iter().map(PathBuf::as_path));
+        for (zone, error) in unfinished {
+            tracing::warn!(
+                zone = %zone.display(),
+                %error,
+                "sessions: an interrupted card move could not be finished"
+            );
+        }
+    })
+    .await;
+    if let Err(error) = swept {
+        tracing::warn!(%error, "sessions: the sweep before the phone's pass did not finish");
+    }
 }
 
 /// Finish whatever plan a crash left in each of these zones (AD-368), off the
@@ -141,6 +216,7 @@ pub fn refresh(app: &AppHandle) {
 /// on a zone finishes its plan under the lock before reading anything
 /// (`keeper_agent::sessions::exec::hold`), so nothing waits on this having
 /// run. Each zone is rescanned afterwards, so the board shows a finished plan.
+#[cfg(desktop)]
 fn finish_interrupted(zones: Vec<(String, PathBuf)>) {
     use keeper_agent::sessions::exec::ExecError;
 
@@ -232,6 +308,7 @@ fn spawn_scanner(app: &AppHandle, root: Root) -> Slot {
 /// any change under its zone. Workspace changes count — they move the
 /// freshness signal — but they enter the same coalesced rescan as everything
 /// else; nothing about workspace content is read beyond `lstat` (AD-113).
+#[cfg(desktop)]
 fn start_tap(app: &AppHandle) {
     let mut running = tap_flag();
     if *running {
@@ -347,211 +424,15 @@ pub fn rescan(root_id: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Compose one session's detail — header facts, properties, the rendered
-/// log, and the file sections (FR-233). One directory read plus one record
-/// parse; every field derivable from files alone (AD-110).
-///
-/// **Both contracts, one payload.** Where the log lives differs by shape, and
-/// *nothing downstream of here knows that*: the header, the properties widget and
-/// the timeline render identically either way. The shape is reported so the UI can
-/// decide what to **offer** — a migrate button, a new-log button — never what a
-/// file means. Since story 52.1 the record's *name* is not one of the
-/// differences: both contracts keep it at `README.md`.
+/// One session's detail and its board ([`keeper_agent::sessions::board::detail`],
+/// the one projection every target shows), for a registered root's row.
 pub fn detail(
     root_id: &str,
     session_id: &str,
 ) -> Option<keeper_core::sessions::vm::SessionDetailVm> {
-    use keeper_core::sessions::vm::{
-        SessionDetailVm, SessionLogEntryVm, SessionPropertyVm, SessionTaskVm,
-    };
-
     let zone = zone_of(root_id)?;
     let row = row_of(root_id, session_id)?;
-    let dir = zone.join(&row.path);
-
-    // One read of the session root, reused for everything: the shape, the pool
-    // and the record. `ref_sources`' own scan is a separate call with a separate
-    // budget, deliberately — the detail must not pay for `refs/`.
-    let (sources, _truncated, shape) = read_ref_sources(&dir, DETAIL_SCAN_BUDGET);
-    let flat = shape == Shape::Flat;
-
-    // The record, `README.md` under both contracts since story 52.1. A missing
-    // one is ordinary under the flat shape — a session may be nothing but logs —
-    // and an empty parse degrades exactly the way an empty README always did.
-    let readme = sources
-        .iter()
-        .find(|source| source.rel == README)
-        .map(|source| source.text.clone())
-        .unwrap_or_else(|| std::fs::read_to_string(dir.join(README)).unwrap_or_default());
-    let (fm, body_at) = Frontmatter::parse(&readme);
-    let body = &readme[body_at..];
-    let line = lineage(&fm);
-
-    // The pool, under both contracts, from that one scan.
-    let pool = detail_pool(&sources, shape);
-
-    // The properties widget (FR-227): user-tier keys only. keeper-owned keys
-    // and the Obsidian-native `tags` are projected elsewhere on the header;
-    // repeating them here would be two spellings of one fact.
-    let owned = [
-        "id",
-        "created",
-        "updated",
-        "pinned",
-        "archived",
-        "keeper",
-        "tags",
-        "aliases",
-        "cssclasses",
-        "title",
-    ];
-    let properties: Vec<SessionPropertyVm> = fm
-        .keys()
-        .filter(|key| !owned.contains(key) && !key.starts_with("keeper."))
-        .filter_map(|key| {
-            fm.get(key).map(|value| SessionPropertyVm {
-                key: key.to_owned(),
-                value: value.index_string(),
-            })
-        })
-        .collect();
-
-    // The log, from whichever contract this session follows. `log_view` owns
-    // that branch so the two readings cannot drift into two ideas of what an
-    // entry is; the folder path stays byte-identical to what it always was
-    // (parse `## Log`, reverse into review order — the FILE stays newest-last).
-    let log: Vec<SessionLogEntryVm> = if flat {
-        // Bodies come from the same texts the pool was parsed from, indexed in
-        // step with `pool.logs`.
-        let texts: Vec<&str> = pool
-            .logs
-            .iter()
-            .map(|entry| {
-                sources
-                    .iter()
-                    .find(|source| source.rel == entry.rel)
-                    .map(|source| source.text.as_str())
-                    .unwrap_or("")
-            })
-            .collect();
-        keeper_core::sessions::pool::log_view_with_bodies(&pool, &texts)
-    } else {
-        keeper_core::sessions::pool::log_view(shape, body, &pool)
-    }
-    .into_iter()
-    .map(|(date, title, entry_body)| SessionLogEntryVm {
-        date,
-        title,
-        body: entry_body,
-    })
-    .collect();
-
-    // Where an agent session's work runs, from its log (R62, R121): the index
-    // reads only the chunks that grew since it last looked, a bounded amount
-    // per open, and takes the cards from the pool this detail already read
-    // rather than reading them again. A person's session has no `agent.toml`,
-    // no log and no index row.
-    let place = if dir.join(keeper_core::agents::session::FILE_NAME).is_file() {
-        let read: Vec<keeper_core::sessions::pool::PoolFile<'_>> = sources
-            .iter()
-            .map(|source| keeper_core::sessions::pool::PoolFile {
-                rel: &source.rel,
-                text: &source.text,
-            })
-            .collect();
-        keeper_core::agents::index::Index::open(&zone)
-            .and_then(|mut index| index.refresh_session(&row.path, Some(&read)))
-            .unwrap_or_else(|error| {
-                tracing::warn!(session = %row.path, %error, "sessions: the agents index could not say where a card runs");
-                None
-            })
-    } else {
-        None
-    };
-    let running_on = place.as_ref().and_then(|place| place.claim_host.as_deref());
-    let waiting = place
-        .as_ref()
-        .and_then(keeper_core::agents::index::SessionRow::waiting);
-
-    let tasks: Vec<SessionTaskVm> = pool
-        .tasks
-        .iter()
-        .map(|entry| SessionTaskVm {
-            id: entry.id.clone(),
-            rel_path: entry.rel.clone(),
-            title: entry.title.clone(),
-            status: entry.status.map(|status| status.as_str().to_owned()),
-            order: entry.order.value,
-            order_is_own: entry.order.is_own(),
-            tags: entry.tags.clone(),
-            unstable_identity: entry.unstable_identity,
-            // From the card's own bytes, so a key the flattened fields drop
-            // (written twice, or in a form the parser does not model) shows
-            // as unreadable rather than absent (R119).
-            agent: sources
-                .iter()
-                .find(|source| source.rel == entry.rel)
-                .and_then(|source| keeper_core::agents::card::CardAgent::of_text(&source.text))
-                .map(|card| {
-                    let readable = card
-                        .schedule
-                        .as_deref()
-                        .is_none_or(|raw| keeper_sync::tasks::TaskSchedule::parse(raw).is_ok());
-                    keeper_core::agents::card::CardAgentVm::of(&card, readable, running_on, waiting)
-                }),
-        })
-        .collect();
-
-    let (status, archived_year) = (row.status.clone(), row.archived_year);
-    Some(SessionDetailVm {
-        id: row.id,
-        path: row.path,
-        title: row.title,
-        status,
-        archived_year,
-        pinned: row.pinned,
-        tags: row.tags,
-        properties,
-        continues: line.continues,
-        continued_by: line.continued_by,
-        summary: section_snippet(body, "## Summary"),
-        log,
-        shape: shape.as_str().to_owned(),
-        tasks,
-    })
-}
-
-/// The pool the DETAIL reads, out of one markdown scan (FR-286).
-///
-/// Split out of [`detail`] so a test can hand it a scan of a folder rather than
-/// having to register a root, and so the exclusion below has one reader instead
-/// of being a line inside a 150-line projection.
-///
-/// **Both contracts read a pool now** (Story 51.7). The folder shape got one in
-/// Story 51.1 — its root markdown is in [`read_ref_sources`]' walk — and this
-/// was the last reader still answering as though it had none, which is what left
-/// a folder-shaped session's `task`-tagged file out of the board and its
-/// untagged root markdown out of *Unfiled*.
-///
-/// **The record is left out, and only under the folder contract.** `README.md`
-/// declares no kind, so feeding it in would report the one file keeper reads the
-/// session's identity, title, tags and lineage out of as *unfiled* — an
-/// accusation against the file that is doing its job. A flat session's record is
-/// the same file under the same name since story 52.1, and it needs no such
-/// exclusion: it carries `tags: [about]`, which is the flat contract's whole
-/// premise, so that pool is byte-for-byte what it was.
-fn detail_pool(sources: &[RefSource], shape: Shape) -> keeper_core::sessions::pool::Pool {
-    use keeper_core::sessions::pool::{read_pool, PoolFile};
-
-    let files: Vec<PoolFile<'_>> = sources
-        .iter()
-        .filter(|source| shape == Shape::Flat || source.rel != README)
-        .map(|source| PoolFile {
-            rel: &source.rel,
-            text: &source.text,
-        })
-        .collect();
-    read_pool(&files)
+    Some(keeper_agent::sessions::board::detail(&zone, row))
 }
 
 /// One raw entry of a session's own tree, before anything is said about sync.
@@ -914,108 +795,5 @@ mod tests {
         let (clipped, truncated) = walk(session, 4);
         assert_eq!(clipped.len(), 4);
         assert!(truncated, "the caller is told the walk stopped");
-    }
-
-    /// Rows 4 and 7 of Story 51.7: the detail's own pool, under the folder
-    /// contract.
-    ///
-    /// A `task`-tagged file at a folder-shaped session's root is a board card —
-    /// this reader is what the board is drawn from, and it used to hand back
-    /// `Pool::default()` for this shape, so the owner's board was hidden with the
-    /// reason "a folder-shaped one has no pool to tag". Story 51.1 made that
-    /// false.
-    ///
-    /// And the record is not accused: `README.md` declares no kind, so a pool
-    /// that took it would name the session's own identity file as *unfiled*.
-    #[test]
-    fn the_detail_pool_finds_a_folder_sessions_tasks_and_leaves_its_record_alone() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let session = dir.path();
-        for rel in ["refs", "prompts"] {
-            std::fs::create_dir_all(session.join(rel)).expect("mkdir");
-        }
-        let write = |rel: &str, body: &str| {
-            std::fs::write(session.join(rel), body).expect("write");
-        };
-        write(
-            "README.md",
-            "# The session\n\n## Log\n\n### 2026-08-16 first\n",
-        );
-        write(
-            "ship-it.md",
-            "---\ntags: [task]\nstatus: todo\norder: 1.5\n---\n# Ship it\n",
-        );
-        write("notes.md", "# Something nobody filed\n");
-        write("refs/inputs.md", "---\ntags: [ref]\n---\n# Filed inputs\n");
-
-        let (sources, _truncated, shape) = read_ref_sources(session, DETAIL_SCAN_BUDGET);
-        assert_eq!(shape, Shape::Folder);
-        let pool = detail_pool(&sources, shape);
-
-        assert_eq!(
-            pool.tasks
-                .iter()
-                .map(|entry| entry.rel.as_str())
-                .collect::<Vec<_>>(),
-            vec!["ship-it.md"],
-            "the board's cards, on a shape whose board was hidden because it \
-             was said to have no pool to tag"
-        );
-        assert_eq!(
-            pool.unfiled
-                .iter()
-                .map(|entry| entry.rel.as_str())
-                .collect::<Vec<_>>(),
-            vec!["notes.md"],
-            "root markdown declaring no kind is reported in this shape too, and \
-             the record is not in the list: it is the file keeper reads the \
-             session out of, not a file nobody filed"
-        );
-        assert!(
-            pool.about.is_empty(),
-            "and it is not carried in as an ordinary entry either"
-        );
-    }
-
-    /// The other half of the same reader: a flat session's pool is what it was.
-    /// Its record carries `tags: [about]`, so it needs no exclusion — and adding
-    /// one would have taken the record out of the About space. Story 52.1: the
-    /// file this asserts about is `README.md` now, and the exclusion the folder
-    /// contract applies to that very name is still not applied here, because
-    /// under the flat contract it is a tagged pool member.
-    #[test]
-    fn the_detail_pool_leaves_a_flat_sessions_record_in_the_pool_where_it_was() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let session = dir.path();
-        let write = |rel: &str, body: &str| {
-            std::fs::write(session.join(rel), body).expect("write");
-        };
-        write("README.md", "---\ntags: [about]\n---\n# The session\n");
-        write("AGENTS.md", "how to read this folder\n");
-        write(
-            "ship-it.md",
-            "---\ntags: [task]\nstatus: todo\n---\n# Ship it\n",
-        );
-
-        let (sources, _truncated, shape) = read_ref_sources(session, DETAIL_SCAN_BUDGET);
-        assert_eq!(shape, Shape::Flat);
-        let pool = detail_pool(&sources, shape);
-
-        assert_eq!(
-            pool.about
-                .iter()
-                .map(|entry| entry.rel.as_str())
-                .collect::<Vec<_>>(),
-            vec!["README.md"]
-        );
-        assert_eq!(pool.tasks.len(), 1, "the board is unchanged");
-        assert_eq!(
-            pool.unfiled
-                .iter()
-                .map(|entry| entry.rel.as_str())
-                .collect::<Vec<_>>(),
-            vec!["AGENTS.md"],
-            "and so is the unfiled list, `AGENTS.md` included"
-        );
     }
 }

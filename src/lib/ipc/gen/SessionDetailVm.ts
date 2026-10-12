@@ -73,4 +73,11 @@ shape: string,
  * and the board answers an empty list with the sentence that says what a
  * task is rather than with columns.
  */
-tasks: Array<SessionTaskVm>, };
+tasks: Array<SessionTaskVm>, 
+/**
+ * An agent's session's Matrix room, from its `agent.toml`: where its
+ * approval card and its answers are, which a card opens on the phone
+ * (98.2, AD-395). `None` for a person's session, and for an
+ * `agent.toml` that does not read.
+ */
+room: string | null, };

@@ -9,7 +9,7 @@
 //!   session's room, the agents zone (`memory`) rings the principal's control
 //!   room and every other control room a copy here is in whose hosts'
 //!   manifests list the drive (R29 F19). A room is rung only when the
-//!   drive's readers may reach every member of it (R160, [`room_sink`]).
+//!   drive's readers may reach every member of it (R160, [`crate::sinks::room_sink`]).
 //! - **The receiver**, for a `dev.keeper.agent.doorbell` state event —
 //!   from the timeline, the sync's state section, or the cached state read
 //!   again once the host is ready — from one of the principal's agents or an
@@ -36,7 +36,7 @@ use keeper_core::agents::events::{
     DoorbellContent, DoorbellReason, CONTENT_VERSION, DOORBELL, HOST,
 };
 use keeper_core::agents::host::HostManifest;
-use keeper_core::agents::label::{check_sink, Integrity, Label, Sink, SinkVerdict};
+use keeper_core::agents::label::{check_sink, Integrity, Label, SinkVerdict};
 use keeper_core::agents::session::{parse_session_agent_toml, FILE_NAME as SESSION_FILE};
 use keeper_sync::engine::{Engine, PullNow, Pushed};
 use keeper_sync::SyncError;
@@ -456,27 +456,6 @@ impl Round {
     }
 }
 
-/// The audience of a room whose members — joined or invited — are
-/// `members` (R160): each one of `agents` through its own audience, every
-/// other member as a person, whatever power the room gives them. An account
-/// this host cannot name as an agent is a person, so it must be a reader.
-pub fn room_sink(members: BTreeSet<OwnedUserId>, agents: &[KnownAgent]) -> Sink {
-    let mut humans = BTreeSet::new();
-    let mut agent_audiences = Vec::new();
-    for member in members {
-        match agents.iter().find(|agent| agent.matrix_user == member) {
-            Some(agent) => agent_audiences.push(agent.home_readers.clone()),
-            None => {
-                humans.insert(member);
-            }
-        }
-    }
-    Sink::Room {
-        humans,
-        agent_audiences,
-    }
-}
-
 /// Ring for `pushed` of `drive`: each room it rings, with its reason.
 pub(crate) async fn ring(
     pushed: &Pushed,
@@ -520,7 +499,9 @@ pub(crate) async fn ring(
             tracing::debug!(%room, "agents: a room whose members could not be read is not rung");
             continue;
         };
-        if let SinkVerdict::Block { .. } = check_sink(&drive.label, &room_sink(members, agents)) {
+        if let SinkVerdict::Block { .. } =
+            check_sink(&drive.label, &crate::sinks::room_sink(members, agents))
+        {
             tracing::info!(%room, drive = %drive.id, "agents: a doorbell is not rung where someone outside the drive's readers would see it");
             continue;
         }

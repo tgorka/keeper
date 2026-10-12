@@ -91,14 +91,15 @@ describe("isReducedCapabilityPlatform", () => {
   it("a single tier-telling flag (hydrated) is NOT reduced — every flag must be absent", () => {
     // Derived from the VM's own keys so a capability added later is exercised
     // automatically: the hand-written list had already drifted past `sync`.
-    // `bots`, `sync` and `notes` are the flags true on every tier (Epic 62,
-    // FR-396; Epic 66, AD-198/AD-200), and `shareOut` is true on the phone
-    // alone (Story 66.3) — so they are the flags that must NOT flip the
-    // verdict; the cases below own them.
+    // `bots`, `sync`, `notes` and `sessions` are the flags true on every tier
+    // (Epic 62, FR-396; Epic 66, AD-198/AD-200; 98.2, AD-413), and `shareOut`
+    // is true on the phone alone (Story 66.3) — so they are the flags that
+    // must NOT flip the verdict; the cases below own them.
     const neutral: Partial<Record<keyof CapabilitiesVm, true>> = {
       bots: true,
       sync: true,
       notes: true,
+      sessions: true,
       shareOut: true,
     };
     const flags = (Object.keys(DEFAULT_CAPABILITIES) as Array<keyof CapabilitiesVm>).filter(
@@ -127,6 +128,20 @@ describe("isReducedCapabilityPlatform", () => {
     capabilitiesStore
       .getState()
       .applySnapshot({ ...DEFAULT_CAPABILITIES, bots: true, sync: true, notes: true });
+    expect(isReducedCapabilityPlatform(capabilitiesStore.getState())).toBe(true);
+  });
+
+  it("a phone with a sessions zone (`sessions` true) IS still reduced", () => {
+    // 98.2 (AD-413): the board is on the phone when a folder there has a
+    // sessions zone. Folded in as tier-telling, the first phone with a zone
+    // would read as a desktop and drop to the desktop frame.
+    capabilitiesStore.getState().applySnapshot({
+      ...DEFAULT_CAPABILITIES,
+      bots: true,
+      sync: true,
+      notes: true,
+      sessions: true,
+    });
     expect(isReducedCapabilityPlatform(capabilitiesStore.getState())).toBe(true);
   });
 

@@ -1569,11 +1569,15 @@ pub fn capabilities(state: State<'_, AppState>) -> Result<CapabilitiesVm, IpcErr
         // since Epic 66 (AD-200) — see `notes_available`.
         notes: notes_available(&state),
         // Sessions (FR-223, AD-107): the same construction as notes — a sessions
-        // root IS a synced folder plus a flag — and on the Mac only (Epic 66,
-        // AD-201): the board is forty commands and its own epic, so the phone
-        // says so in the disclosure rather than rendering a board it cannot
-        // drive.
-        sessions: mac_folder_capability_of(&git_report(&state), cfg!(desktop)),
+        // root IS a synced folder plus a flag. On the Mac, `sync`; on the phone
+        // (98.2, AD-413) `sync` and a sessions zone here, so a phone with no
+        // flagged folder has no board (AD-27) and one whose zone just landed
+        // says so (`CAPABILITIES_CHANGED_EVENT`).
+        sessions: sessions_capability_of(
+            &git_report(&state),
+            cfg!(desktop),
+            crate::sessions_root::any(),
+        ),
         // Bots (Epic 61, FR-378; Epic 62, FR-396): `cfg!(desktop) ||
         // cfg!(mobile)`, i.e. true on every target that has a pane to put it
         // in, and **deliberately not** `notes_available`. Every other surface
@@ -1644,11 +1648,26 @@ fn notes_capability_of(report: &SyncGitVm) -> bool {
 }
 
 /// The gate for what rides the folder but stays on the Mac (AD-201): the
-/// sessions board and the drive half of Bots. `desktop && sync`, with the tier
-/// a parameter so the phone's shape can be asserted from any host.
+/// drive half of Bots. `desktop && sync`, with the tier a parameter so the
+/// phone's shape can be asserted from any host.
 fn mac_folder_capability_of(report: &SyncGitVm, desktop: bool) -> bool {
     desktop && notes_capability_of(report)
 }
+
+/// The sessions board's gate (98.2 #6, AD-27): `sync`, and on the phone a
+/// sessions zone here as well — a board over no zone would be columns saying
+/// nothing true. The tier and the zone are parameters so both states are
+/// asserted from any host.
+fn sessions_capability_of(report: &SyncGitVm, desktop: bool, zone_here: bool) -> bool {
+    notes_capability_of(report) && (desktop || zone_here)
+}
+
+/// Said when a capability that can change while keeper runs has changed —
+/// today the phone's `sessions`, when its first zone lands or its last goes
+/// (98.2). The webview asks `capabilities` again; the payload is empty. Only
+/// a phone says it: the Mac's capabilities do not change while keeper runs.
+#[cfg(not(desktop))]
+pub const CAPABILITIES_CHANGED_EVENT: &str = "keeper://capabilities-changed";
 
 /// The same answer for a caller that holds an app handle rather than the state —
 /// the tray, which decides at menu-build time whether the notes section exists at
@@ -12852,11 +12871,11 @@ mod tests {
     }
 
     /// Epic 66, Story 66.4 (AD-200, AD-201): the phone's git report — `Ok`
-    /// with `engine: gix` — turns notes on, and leaves sessions and the drive
-    /// half of Bots on the Mac; a desktop whose git the engine refuses has
-    /// none of the three.
+    /// with `engine: gix` — turns notes on, and leaves the drive half of Bots
+    /// on the Mac; a desktop whose git the engine refuses has neither. 98.2
+    /// #6: the phone's board is there exactly when a sessions zone is.
     #[test]
-    fn the_phone_shaped_report_opens_notes_and_keeps_sessions_on_the_mac() {
+    fn the_phone_shaped_report_opens_notes_and_keeps_bot_tools_on_the_mac() {
         let phone = SyncGitVm {
             state: SyncGitState::Ok,
             engine: SyncGitEngine::Gix,
@@ -12867,9 +12886,21 @@ mod tests {
         assert!(notes_capability_of(&phone));
         assert!(
             !mac_folder_capability_of(&phone, false),
-            "sessions stay on the Mac"
+            "bot tools stay on the Mac"
         );
         assert!(mac_folder_capability_of(&phone, true));
+        assert!(
+            sessions_capability_of(&phone, false, true),
+            "a phone with a sessions zone has the board"
+        );
+        assert!(
+            !sessions_capability_of(&phone, false, false),
+            "a phone with none has no board"
+        );
+        assert!(
+            sessions_capability_of(&phone, true, false),
+            "the Mac's board needs no zone to be offered"
+        );
 
         let refused = SyncGitVm {
             state: SyncGitState::Missing,
@@ -12880,6 +12911,7 @@ mod tests {
         };
         assert!(!notes_capability_of(&refused));
         assert!(!mac_folder_capability_of(&refused, true));
+        assert!(!sessions_capability_of(&refused, false, true));
     }
 
     #[test]

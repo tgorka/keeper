@@ -14,7 +14,15 @@ import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabiliti
 import { primaryViewStore } from "@/lib/stores/primary-view";
 
 /** The desktop tier with folder sync, which is the tier tasks exist on. */
-const WITH_SYNC = { ...DEFAULT_CAPABILITIES, sync: true, notes: true, sessions: true };
+const WITH_SYNC = {
+  ...DEFAULT_CAPABILITIES,
+  sync: true,
+  notes: true,
+  sessions: true,
+  trayIcon: true,
+};
+/** A phone with a sessions zone (98.2): `sessions` on, every desktop flag off. */
+const PHONE_WITH_ZONE = { ...DEFAULT_CAPABILITIES, sync: true, notes: true, sessions: true };
 
 function press(
   key: string,
@@ -118,6 +126,14 @@ describe("useTasksShortcut", () => {
     // must not swallow the event either, or ⌘8 stops doing whatever the webview
     // would otherwise do with it.
     capabilitiesStore.getState().applySnapshot(DEFAULT_CAPABILITIES);
+    renderHook(() => useTasksShortcut());
+    const event = press("8", { meta: true });
+    expect(primaryViewStore.getState().view).toBe("inbox");
+    expect(event.defaultPrevented).toBe(false);
+  });
+
+  it("is a no-op on a phone with a sessions zone, which has no Tasks surface", () => {
+    capabilitiesStore.getState().applySnapshot(PHONE_WITH_ZONE);
     renderHook(() => useTasksShortcut());
     const event = press("8", { meta: true });
     expect(primaryViewStore.getState().view).toBe("inbox");

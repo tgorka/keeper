@@ -923,9 +923,10 @@ export type AddFolderPrefill = Omit<DriveOfferVm, "credential"> & {
  * windows and the token belong to this device. A policy field the offer leaves
  * unset (`null`) keeps keeper's own default rather than a number nobody chose.
  *
- * On the reduced tier the recordings and sessions switches are absent, so an
- * offer cannot turn them on there: a switch the person cannot see is not a
- * choice they made (AD-27). Tasks are not sent from that tier at all.
+ * On the reduced tier the recordings, voices and agents switches are absent,
+ * so an offer cannot turn them on there: a switch the person cannot see is not
+ * a choice they made (AD-27). The sessions switch is shown there (98.2), so
+ * the offer's zone is carried. Tasks are not sent from that tier at all.
  */
 function formValuesForOffer(offer: AddFolderPrefill, reduced: boolean): SyncFormValues {
   return {
@@ -958,8 +959,9 @@ function formValuesForOffer(offer: AddFolderPrefill, reduced: boolean): SyncForm
     recordingsSubfolder: reduced ? "" : (offer.recordings ?? ""),
     voices: !reduced && offer.voices !== null,
     voicesSubfolder: reduced ? "" : (offer.voices ?? ""),
-    sessions: !reduced && offer.sessions !== null,
-    sessionsSubfolder: reduced ? "" : (offer.sessions ?? ""),
+    // The phone's board reads a zone (98.2), so the offer's flag travels there.
+    sessions: offer.sessions !== null,
+    sessionsSubfolder: offer.sessions ?? "",
     tasks: offer.tasks !== null,
     tasksSubfolder: offer.tasks ?? EMPTY_FORM.tasksSubfolder,
     agents: !reduced && offer.agents !== null,
@@ -1318,7 +1320,7 @@ export function AddFolderForm({
   /**
    * Story 66.1: the same form is the phone's profile sheet (AD-199). What the
    * phone cannot choose — the folder, the direction, a watcher's windows, the
-   * recorder and sessions flags — is absent from it by the tier the
+   * recorder, voices and agents flags — is absent from it by the tier the
    * capabilities report, never a control that fails on tap (AD-27). Read
    * before the fields are seeded, because a prefill must not switch on what
    * this tier does not show.
@@ -2265,10 +2267,10 @@ export function AddFolderForm({
           </ul>
         </>
       )}
-      {/* The recordings and sessions flags: desktop concerns (a recorder that
-          spawns a sidecar, a board over a folder of command runs — AD-201,
-          AD-203), so they are absent on the reduced tier rather than switches
-          that flag a folder for a feature the phone has no surface for. */}
+      {/* The recordings and voices flags: desktop concerns (a recorder that
+          spawns a sidecar — AD-203), so they are absent on the reduced tier
+          rather than switches that flag a folder for a feature the phone has
+          no surface for. The sessions flag follows them, on both tiers. */}
       {!reducedCapability && (
         <>
           {/* The recordings flag (AD-66). Beside the notes flag, above Advanced, for
@@ -2354,49 +2356,55 @@ export function AddFolderForm({
               )}
             </div>
           )}
-          {/* The sessions flag (FR-222, AD-107). Third in the "this folder also
-              holds X" row, on the recordings control's exact shape. */}
+        </>
+      )}
+      {/* The sessions flag (FR-222, AD-107). Third in the "this folder also
+          holds X" row, on the recordings control's exact shape — on the phone
+          too since 98.2 (AD-413): its board reads a zone, so a folder added
+          there by hand can say it has one, and one offered by the account
+          keeps the flag the other device gave it. */}
+      <div className="flex items-center justify-between gap-2">
+        <Label htmlFor={`${fieldId}-sessions`}>{SYNC_SESSIONS_LABEL}</Label>
+        <Switch
+          id={`${fieldId}-sessions`}
+          checked={form.sessions}
+          disabled={disabled || saving || folderOwned.has("sessions")}
+          onCheckedChange={(checked) => setForm((live) => ({ ...live, sessions: checked }))}
+        />
+      </div>
+      <p className="text-muted-foreground text-xs">{SYNC_SESSIONS_NOTE}</p>
+      {folderOwned.has("sessions") && (
+        <p className="text-muted-foreground text-xs">{syncFolderOwnedNote("sessions")}</p>
+      )}
+      {form.sessions && (
+        <>
           <div className="flex items-center justify-between gap-2">
-            <Label htmlFor={`${fieldId}-sessions`}>{SYNC_SESSIONS_LABEL}</Label>
-            <Switch
-              id={`${fieldId}-sessions`}
-              checked={form.sessions}
-              disabled={disabled || saving || folderOwned.has("sessions")}
-              onCheckedChange={(checked) => setForm((live) => ({ ...live, sessions: checked }))}
+            <Label htmlFor={`${fieldId}-sessions-subfolder`}>{SYNC_SESSIONS_SUBFOLDER_LABEL}</Label>
+            <Input
+              id={`${fieldId}-sessions-subfolder`}
+              className="w-56"
+              value={form.sessionsSubfolder}
+              disabled={disabled || saving}
+              onChange={(event) =>
+                setForm((live) => ({ ...live, sessionsSubfolder: event.target.value }))
+              }
             />
           </div>
-          <p className="text-muted-foreground text-xs">{SYNC_SESSIONS_NOTE}</p>
-          {folderOwned.has("sessions") && (
-            <p className="text-muted-foreground text-xs">{syncFolderOwnedNote("sessions")}</p>
+          {/* Only while adding, for the recordings reason: no stored profile has
+              told this form what keeper would pick. */}
+          {!editing && (
+            <p className="text-muted-foreground text-xs">{SYNC_SESSIONS_SUBFOLDER_NOTE}</p>
           )}
-          {form.sessions && (
+          {form.localPath !== "" && form.sessionsSubfolder.trim() !== "" && (
+            <p className="truncate font-mono text-muted-foreground text-xs">
+              {`${form.localPath}/${form.sessionsSubfolder.trim()}`}
+            </p>
+          )}
+          {/* The agents flag (AD-361, UX-DR127): absent, not disabled, while
+              the folder holds no sessions zone, because agents work there — and on
+              the phone, which hosts no agent. */}
+          {!reducedCapability && (
             <>
-              <div className="flex items-center justify-between gap-2">
-                <Label htmlFor={`${fieldId}-sessions-subfolder`}>
-                  {SYNC_SESSIONS_SUBFOLDER_LABEL}
-                </Label>
-                <Input
-                  id={`${fieldId}-sessions-subfolder`}
-                  className="w-56"
-                  value={form.sessionsSubfolder}
-                  disabled={disabled || saving}
-                  onChange={(event) =>
-                    setForm((live) => ({ ...live, sessionsSubfolder: event.target.value }))
-                  }
-                />
-              </div>
-              {/* Only while adding, for the recordings reason: no stored profile has
-                  told this form what keeper would pick. */}
-              {!editing && (
-                <p className="text-muted-foreground text-xs">{SYNC_SESSIONS_SUBFOLDER_NOTE}</p>
-              )}
-              {form.localPath !== "" && form.sessionsSubfolder.trim() !== "" && (
-                <p className="truncate font-mono text-muted-foreground text-xs">
-                  {`${form.localPath}/${form.sessionsSubfolder.trim()}`}
-                </p>
-              )}
-              {/* The agents flag (AD-361, UX-DR127): absent, not disabled, while
-                  the folder holds no sessions zone, because agents work there. */}
               <div className="flex items-center justify-between gap-2">
                 <Label htmlFor={`${fieldId}-agents`}>{SYNC_AGENTS_LABEL}</Label>
                 <Switch
@@ -2432,6 +2440,10 @@ export function AddFolderForm({
               )}
             </>
           )}
+        </>
+      )}
+      {!reducedCapability && (
+        <>
           <div className="flex items-center justify-between gap-2">
             <Label htmlFor={`${fieldId}-tasks`}>{SYNC_TASKS_LABEL}</Label>
             <Switch

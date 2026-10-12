@@ -688,6 +688,7 @@ export type { SessionSpaceFileVm } from "./gen/SessionSpaceFileVm";
 export type { SessionSpaceReq } from "./gen/SessionSpaceReq";
 export type { SessionSpacesRestoredVm } from "./gen/SessionSpacesRestoredVm";
 export type { SessionSpaceVm } from "./gen/SessionSpaceVm";
+export type { SessionTaskMoveVm } from "./gen/SessionTaskMoveVm";
 export type { SessionTaskVm } from "./gen/SessionTaskVm";
 export type { SessionTemplateEntryVm } from "./gen/SessionTemplateEntryVm";
 export type { SessionTreeVm } from "./gen/SessionTreeVm";
@@ -931,6 +932,7 @@ import type { SessionSpaceFilesVm } from "./gen/SessionSpaceFilesVm";
 import type { SessionSpaceReq } from "./gen/SessionSpaceReq";
 import type { SessionSpacesRestoredVm } from "./gen/SessionSpacesRestoredVm";
 import type { SessionSpaceVm } from "./gen/SessionSpaceVm";
+import type { SessionTaskMoveVm } from "./gen/SessionTaskMoveVm";
 import type { SessionTemplateEntryVm } from "./gen/SessionTemplateEntryVm";
 import type { SessionTreeVm } from "./gen/SessionTreeVm";
 import type { SpacesSnapshot } from "./gen/SpacesSnapshot";
@@ -1023,6 +1025,21 @@ export async function invoke<T>(cmd: string, args?: Record<string, unknown>): Pr
  */
 export async function capabilities(): Promise<CapabilitiesVm> {
   return await invoke<CapabilitiesVm>("capabilities");
+}
+
+/**
+ * Said by Rust when a capability that can change while keeper runs has changed
+ * — today the phone's `sessions`, when its first sessions zone lands or its
+ * last one goes (98.2). Payload-free: ask {@link capabilities} again. Mirrors
+ * `CAPABILITIES_CHANGED_EVENT` in `ipc.rs`.
+ */
+export const CAPABILITIES_CHANGED_EVENT = "keeper://capabilities-changed";
+
+/** Subscribe to {@link CAPABILITIES_CHANGED_EVENT}; resolves with an unlisten function. */
+export async function listenCapabilitiesChanged(onChanged: () => void): Promise<() => void> {
+  return await listen(CAPABILITIES_CHANGED_EVENT, () => {
+    onChanged();
+  });
 }
 
 /**
@@ -6962,8 +6979,15 @@ export async function sessionsFilePath(profileId: string, subpath: string): Prom
  * against what is on disk now rather than against the board as it was rendered:
  * a session an agent has been writing to is the ordinary case, not the edge one.
  *
+ * On a phone the folder is pulled first and the move pushed at once (98.2,
+ * R346): `unpushed` is the sentence when it is written there and not on the
+ * remote yet, and `null` once it is (always `null` on a desktop, whose folder
+ * publishes on its own cadence).
+ *
  * Rejects with: `internal` (unknown root or session, an unknown status, a card
- * that has since been moved or deleted, a refused path), `unsupported`.
+ * that has since been moved or deleted, a refused path); on a phone, the sync
+ * error's own code and sentence when the folder could not be pulled first —
+ * diverged, busy or failing — and nothing was written.
  */
 export async function sessionsTaskMove(
   rootId: string,
@@ -6971,8 +6995,14 @@ export async function sessionsTaskMove(
   rel: string,
   status: string,
   index: number,
-): Promise<void> {
-  await invoke<null>("sessions_task_move", { rootId, sessionId, rel, status, index });
+): Promise<SessionTaskMoveVm> {
+  return await invoke<SessionTaskMoveVm>("sessions_task_move", {
+    rootId,
+    sessionId,
+    rel,
+    status,
+    index,
+  });
 }
 
 /**

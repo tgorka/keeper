@@ -17,6 +17,7 @@
 //! label as it is then (R168). Narrowed, an answer's edits stop and a
 //! status says only [`NARROWED_STATUS`] (R64).
 
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -30,13 +31,14 @@ use keeper_core::agents::matrix::{AgentClient, AgentMatrixError};
 use keeper_core::agents::redact::redact_secrets;
 use keeper_core::agents::room::room_members;
 use keeper_core::vm::BotStreamEvent;
-use matrix_sdk::ruma::{EventId, OwnedEventId, OwnedRoomId, OwnedTransactionId, TransactionId};
+use matrix_sdk::ruma::{
+    EventId, OwnedEventId, OwnedRoomId, OwnedTransactionId, OwnedUserId, TransactionId,
+};
 use serde_json::{json, Value};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, sleep_until, Instant};
 
-use crate::delegate::MembersFuture;
 use crate::ports::TurnSink;
 use crate::sinks::{RoomGate, NARROWED_STATUS};
 
@@ -57,6 +59,10 @@ const RATE_LIMIT_DEFAULT: Duration = Duration::from_secs(1);
 /// A boxed send future.
 pub type SendFuture<'a> =
     Pin<Box<dyn Future<Output = Result<OwnedEventId, AgentMatrixError>> + Send + 'a>>;
+
+/// A boxed future of a room's members, joined or invited.
+pub type MembersFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<BTreeSet<OwnedUserId>, String>> + Send + 'a>>;
 
 /// Where a session's events go: one timeline send, once, under `txn`.
 pub trait EditPort: Send + Sync {

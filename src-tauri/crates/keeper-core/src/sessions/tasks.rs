@@ -234,6 +234,81 @@ mod tests {
         format!("---\nid: 01J5AAAAAAAAAAAAAAAAAAAAAA\ntitle: A task\ntags: [task]\nstatus: {status}\norder: {order}\n---\n\n# A task\n\nBody.\n")
     }
 
+    /// A card as an agent's host writes it: every agent key, and a body.
+    fn agent_card(order: &str, status: &str, title: &str) -> String {
+        format!(
+            "---\nid: 01J5AAAAAAAAAAAAAAAAAAAAAA\ntags: [task]\nstatus: {status}\norder: {order}\n\
+             run: running\nassignee: amelia\nhost: electra\nrequested_by: \"@tgorka:h\"\n---\n\n\
+             # {title}\n\nWhat the agent wrote.\n"
+        )
+    }
+
+    /// The text with its `status:` and `order:` lines left out.
+    fn without_status_and_order(text: &str) -> String {
+        text.lines()
+            .filter(|line| !line.starts_with("status:") && !line.starts_with("order:"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// 98.2 #4 — a move from the phone's board changes two keys and nothing
+    /// else: the moved card's `status:` and `order:`, and — when the gap it
+    /// lands in has collapsed — its neighbours' `order:`. Never `run:`,
+    /// `assignee:`, `host:`, `requested_by:` or a body, and never a
+    /// neighbour's column.
+    #[test]
+    fn phone_move_writes_only_status_and_order() {
+        // The column's cards spell their status the way a person typed it;
+        // a renumber must not respell it.
+        let a = agent_card("1", "in preparation", "First");
+        let b = agent_card("1", "in preparation", "Second"); // the gap has collapsed
+        let moved = agent_card("4", "todo", "Moved");
+        let column = [file("a.md", &a, 1.0), file("b.md", &b, 1.0)];
+        let plan = compile_move(
+            "active/s",
+            "c.md",
+            &moved,
+            TaskStatus::InPreparation,
+            &column,
+            1,
+        )
+        .expect("a collapsed gap renumbers rather than refuses");
+        let before = |path: &str| match path {
+            "active/s/a.md" => a.as_str(),
+            "active/s/b.md" => b.as_str(),
+            "active/s/c.md" => moved.as_str(),
+            other => panic!("the move wrote {other}, which is not a card it was given"),
+        };
+        let mut neighbours = 0;
+        for step in &plan.steps {
+            let PlanStep::GuardedWrite { path, content, .. } = step else {
+                panic!("a move only writes cards");
+            };
+            let was = before(path);
+            assert_eq!(
+                without_status_and_order(content),
+                without_status_and_order(was),
+                "{path}: only `status:` and `order:` changed"
+            );
+            let status = |text: &str| {
+                text.lines()
+                    .find(|line| line.starts_with("status:"))
+                    .map(str::to_owned)
+            };
+            if path == "active/s/c.md" {
+                assert_eq!(status(content).as_deref(), Some("status: in-preparation"));
+            } else {
+                neighbours += 1;
+                assert_eq!(
+                    status(content),
+                    status(was),
+                    "{path}: a neighbour keeps its column"
+                );
+            }
+        }
+        assert!(neighbours > 0, "the collapsed gap renumbered a neighbour");
+    }
+
     #[test]
     fn a_normal_move_writes_exactly_one_file() {
         let a = card("1", "todo");

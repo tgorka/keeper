@@ -22,8 +22,9 @@
 
 use std::sync::{Arc, Mutex};
 
-use keeper_agent::doorbell::{room_sink, Answer, Doorbell, DriveEngine};
+use keeper_agent::doorbell::{Answer, Doorbell, DriveEngine};
 use keeper_agent::rooms::KnownAgent;
+use keeper_agent::sinks::room_sink;
 use keeper_core::agents::events::{
     control_levels, ControlLevels, DoorbellContent, DoorbellReason, CONTENT_VERSION, DOORBELL, HOST,
 };

@@ -1361,13 +1361,15 @@ const ANSWERS: Record<string, unknown> = {
         // is its reveal (`shareOut`, Story 66.3, AD-200) and notes ride the
         // folder (`notes`, Story 66.4) — the three flags `ipc.rs` now computes
         // true on iOS, so the Files and Notes rows and the capture sheet are
-        // reachable in the phone rig (`dev/measure-files.ts`).
+        // reachable in the phone rig (`dev/measure-files.ts`). `sessions` is
+        // the phone with a sessions zone (98.2): the mock's folders have one.
         ({
           ...DEFAULT_CAPABILITIES,
           bots: true,
           sync: true,
           shareOut: true,
           notes: true,
+          sessions: true,
         } satisfies CapabilitiesVm)
       : ({
           trayIcon: true,
@@ -1823,6 +1825,7 @@ const ANSWERS: Record<string, unknown> = {
     ],
     shape: "flat",
     tasks: SESSION_TASKS,
+    room: null,
   },
   sessions_tree: { entries: SESSION_ENTRIES, truncated: false },
   sessions_refs: {
@@ -3224,6 +3227,7 @@ const FOLDER_DETAIL = {
   ],
   shape: "folder",
   tasks: [],
+  room: null,
 };
 
 /**
@@ -8388,7 +8392,7 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
     const index = Number(payload.index ?? 0);
     const card = SESSION_TASKS.find((task) => task.relPath === rel);
     if (card === undefined) {
-      return null;
+      return { unpushed: null };
     }
     const column = SESSION_TASKS.filter(
       (task) => task.status === status && task.relPath !== rel,
@@ -8409,7 +8413,9 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
     // it read as before — which is the one thing the real write changes about
     // how the card renders.
     card.orderIsOwn = true;
-    return null;
+    // The real answer's shape: `null` once the move is on the remote, which a
+    // desktop's folder publishes on its own cadence.
+    return { unpushed: null };
   },
   // A person's *Allow* (92.2): Rust turns the card's `scheduled_by:` into
   // `allowed_by: <the person the shell found>`, so the card loses its mark

@@ -17,22 +17,21 @@ use std::time::Duration;
 
 use keeper_agent::agent::{
     arm_agent, reply_of, trail_of, AgentDeps, AgentProfiles, Arrived, ConversationPort, HeldFocus,
-    Outcome, Probe, RoomFuture, ServedSession, SessionRef, Trail, TurnEnding, BRIEF_REFUSED,
-    BRIEF_UNSENT, BUDGET_SPENT, JOIN_POLL, LOCAL_ONLY_REFUSAL, NOT_THIS_DELEGATION, ROUNDS_SPENT,
+    Outcome, Probe, RoomFuture, ServedSession, Trail, TurnEnding, BRIEF_REFUSED, BRIEF_UNSENT,
+    BUDGET_SPENT, JOIN_POLL, LOCAL_ONLY_REFUSAL, NOT_THIS_DELEGATION, ROUNDS_SPENT,
 };
 use keeper_agent::claims::{blocked_status, conflict_line, conflict_of, Lease};
 use keeper_agent::delegate::{
-    reply_content, BoolFuture, BriefRoomFuture, DelegationPort, EventsFuture, MembersFuture,
-    NOT_DELEGATED,
+    reply_content, BoolFuture, BriefRoomFuture, DelegationPort, EventsFuture, NOT_DELEGATED,
 };
 use keeper_agent::host::UNATTENDED_REFUSAL;
-use keeper_agent::matrix_sink::{EditPort, SendFuture};
+use keeper_agent::matrix_sink::{EditPort, MembersFuture, SendFuture};
 use keeper_agent::rooms::{
     Arrival, BriefRoom, Known, KnownAgent, NOT_THE_PERSON, NO_AGENT_POWER, OBSERVER_TEXT,
     UNSIGNED_DEVICE,
 };
 use keeper_agent::runtime::Router;
-use keeper_agent::turn::{DrivePorts, TurnEnv};
+use keeper_agent::turn::{DrivePorts, SessionRef, TurnEnv};
 use keeper_agent::writer::WriterError;
 use keeper_agent::zone::{read_zone, AgentHome};
 use keeper_core::agents::delegation::{read_brief, DelegateContent};

@@ -11,11 +11,14 @@ use std::path::{Path, PathBuf};
 
 use keeper_core::agents::drive::{self, DriveDecl};
 use keeper_core::agents::home::{self, AgentConfig, HomeRefusal};
-use keeper_core::agents::log::reader::read_session;
-use keeper_core::agents::log::LineKind;
-use keeper_core::agents::session::{self, SessionAgent};
+#[cfg(not(phone))]
+use keeper_core::agents::log::{reader::read_session, LineKind};
+use keeper_core::agents::session;
+#[cfg(not(phone))]
+use keeper_core::agents::session::SessionAgent;
 use keeper_core::agents::skills::{self, SkillFilter, SkillsIndex};
 use keeper_core::agents::zone::{self, ZoneAssessment, ZoneEntry};
+#[cfg(not(phone))]
 use keeper_core::sessions::model::ACTIVE_DIR;
 use keeper_sync::browse;
 use keeper_sync::SyncProfile;
@@ -44,6 +47,7 @@ pub struct ZoneRead {
 }
 
 /// One session found in a sessions zone.
+#[cfg(not(phone))]
 #[derive(Debug, Clone)]
 pub struct FoundSession {
     /// Zone-relative: `active/<folder>`.
@@ -183,6 +187,7 @@ pub fn session_facts(
 
 /// The active sessions of `profile`'s sessions zone that hold an
 /// `agent.toml`. Archived sessions are never served.
+#[cfg(not(phone))]
 pub fn active_sessions(profile: &SyncProfile) -> Vec<FoundSession> {
     let Some(zone_dir) = profile.sessions_root() else {
         return Vec::new();
@@ -222,6 +227,7 @@ pub fn active_sessions(profile: &SyncProfile) -> Vec<FoundSession> {
 
 /// Whether `agent`, a session in `dir`, follows a Paseo run whose end its
 /// log there holds captured (R277).
+#[cfg(not(phone))]
 pub fn paseo_captured(agent: &SessionAgent, dir: &Path) -> bool {
     crate::agent::follows_a_run(agent)
         && read_session(dir)

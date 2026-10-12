@@ -107,18 +107,11 @@ use crate::sessions::write::session_write;
 use crate::sinks::{
     room_audience, CallAudit, Gated, ProxyDoors, RoomGate, Sinks, MEMBERS_UNREAD, NARROWED_STATUS,
 };
-use crate::turn::{arm_turn_probing, endpoint_of, read_timeout_of, TurnEnv, TurnOrigin};
+use crate::turn::{
+    arm_turn_probing, endpoint_of, read_timeout_of, SessionRef, TurnEnv, TurnOrigin,
+};
 use crate::writer::{SessionWriter, WriterError};
 use crate::zone::{read_text, AgentHome};
-
-/// A session, by its drive and its zone-relative folder.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct SessionRef {
-    /// The drive whose sessions zone holds it.
-    pub drive: String,
-    /// Zone-relative: `active/2026-10-02-release`.
-    pub path: String,
-}
 
 /// What the final edit says when the label stopped the model (S-04).
 pub const LOCAL_ONLY_REFUSAL: &str = "This conversation has read something that may go only to a model on your own machines, and this agent's model is not one. Nothing more was sent.";

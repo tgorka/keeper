@@ -112,9 +112,11 @@ export function SessionBoard({
       onOpen={onOpen}
       onMove={async (relPath, status, index) => {
         // Rejecting is how the board learns a move was refused: it shows
-        // keeper's own sentence and re-reads nothing.
-        await sessionsTaskMove(rootId, sessionId, relPath, status, index);
+        // keeper's own sentence and re-reads nothing. A move that landed on
+        // a phone but not on the remote says so, and the card stays moved.
+        const moved = await sessionsTaskMove(rootId, sessionId, relPath, status, index);
         onChanged();
+        return moved.unpushed;
       }}
       moveFailed={SESSION_BOARD_MOVE_FAILED}
       onAllow={
