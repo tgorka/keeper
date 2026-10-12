@@ -74,6 +74,8 @@ pub mod desktop;
 #[cfg(all(unix, not(phone)))]
 pub mod doorbell;
 pub mod drive;
+#[cfg(not(phone))]
+pub mod gate;
 pub mod grants;
 #[cfg(unix)]
 pub mod headless;

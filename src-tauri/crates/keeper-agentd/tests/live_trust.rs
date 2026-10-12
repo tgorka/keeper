@@ -208,7 +208,12 @@ async fn a_decision_from_a_cross_signed_device_counts_and_one_from_a_new_device_
             .iter()
             .filter(|(value, _)| value["type"] == APPROVAL_DECISION)
             .filter_map(|(value, encryption)| {
-                arrival_of(value, encryption.as_ref(), tokio::time::Instant::now())
+                arrival_of(
+                    value,
+                    encryption.as_ref(),
+                    tokio::time::Instant::now(),
+                    None,
+                )
             })
             .collect();
         if arrivals.len() == 4 {
@@ -248,6 +253,7 @@ async fn a_decision_from_a_cross_signed_device_counts_and_one_from_a_new_device_
         agent_user: &nixi_user,
         requester: &tgorka,
         readers: &readers,
+        peer: None,
     };
     assert_eq!(
         classify(&served, &from_marta.sender, from_marta.arrival),

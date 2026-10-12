@@ -1515,6 +1515,7 @@ impl HostRuntime {
                         bot: &bot,
                         principal: &principal,
                         prefer_always_on: config.host.prefer_always_on,
+                        always_on_only: false,
                         holder: None,
                     },
                     hosts,
@@ -1738,6 +1739,8 @@ impl HostRuntime {
                 bot: &bot,
                 principal: &principal,
                 prefer_always_on: config.host.prefer_always_on,
+                // A gate runs on always-on hosts only (codemap Q14).
+                always_on_only: slot.agent.kind == SessionKind::Gate,
                 holder: cached.as_ref().map(|c| c.content.host.as_str()),
             },
             hosts,
@@ -2025,6 +2028,7 @@ impl HostRuntime {
                         from_host,
                         ending: Arc::clone(&ending),
                         activity: Arc::clone(&activity),
+                        clock: Arc::clone(&self.clock),
                     },
                 );
                 if let Some(slot) = self.slots.get_mut(room) {

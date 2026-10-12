@@ -131,10 +131,13 @@ pub fn read_answer(content: &Value) -> Option<AnswerContent> {
 
 /// Whether a session of `session` kind, of an agent of `agent` kind, is
 /// offered `ask_human` (R102): every session but a proxy's own `main` and
-/// `conversation`, where its person is already the one it talks to —
-/// whatever `[tools].allow` says.
+/// `conversation`, where its person is already the one it talks to, and a
+/// `gate` session, whose turn answers an outside system and never asks a
+/// person (codemap Q1(a), R369) — whatever `[tools].allow` says.
 pub fn offered(agent: AgentKind, session: SessionKind) -> bool {
-    !(agent == AgentKind::Proxy && matches!(session, SessionKind::Main | SessionKind::Conversation))
+    session != SessionKind::Gate
+        && !(agent == AgentKind::Proxy
+            && matches!(session, SessionKind::Main | SessionKind::Conversation))
 }
 
 /// Who answers an ask, and through which proxy.
@@ -325,14 +328,20 @@ mod tests {
         assert_eq!(of(&["@marta:h", NIXI], &proxies, &trusted), None);
     }
 
-    /// R102: offered in every session but a proxy's own two.
+    /// R102, R369: offered in every session but a proxy's own two and a
+    /// gate's.
     #[test]
     fn every_session_but_a_proxys_own_is_offered_ask_human() {
         for session in SessionKind::ALL {
+            let gate = session == SessionKind::Gate;
             let own = matches!(session, SessionKind::Main | SessionKind::Conversation);
-            assert_eq!(offered(AgentKind::Proxy, session), !own, "{session:?}");
+            assert_eq!(
+                offered(AgentKind::Proxy, session),
+                !own && !gate,
+                "{session:?}"
+            );
             for agent in [AgentKind::Specialist, AgentKind::Steward, AgentKind::Gate] {
-                assert!(offered(agent, session), "{agent:?} {session:?}");
+                assert_eq!(offered(agent, session), !gate, "{agent:?} {session:?}");
             }
         }
     }

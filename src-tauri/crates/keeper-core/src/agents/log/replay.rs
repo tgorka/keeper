@@ -8,7 +8,9 @@
 //! memory from the writer's receipts and never re-reads the log on a turn.
 //!
 //! An answer a `heard` line marks replays cut where the person stopped
-//! listening, in both replays alike ([`crate::agents::heard`]).
+//! listening, in both replays alike ([`crate::agents::heard`]). A gate
+//! session's turn reads one request only (codemap Q5): its `request` line
+//! starts the conversation over, and every earlier line stays in the log.
 
 use std::collections::{HashMap, HashSet};
 
@@ -16,7 +18,9 @@ use serde_json::Value;
 use ulid::Ulid;
 
 use super::reader::SessionLog;
-use super::{LineBody, LogError, LogLine, OpenBody, PeerBody, ReviewLines, UserBody};
+use super::{
+    GateBody, GateState, LineBody, LogError, LogLine, OpenBody, PeerBody, ReviewLines, UserBody,
+};
 use crate::agents::heard::Answers;
 use crate::agents::helper::HELPER;
 use crate::bots::chat::{ChatMessage, ContentPart, Role, ToolCall};
@@ -102,8 +106,29 @@ pub fn message_for(line: &LogLine) -> Option<ChatMessage> {
             Role::System,
             format!("{COMPACT_HEADING}\n\n{}", body.summary),
         )),
+        LineBody::Gate(body) => request_text(body).map(|text| ChatMessage::text(Role::User, text)),
         _ => None,
     }
+}
+
+/// A gate's request as its turn reads it: under
+/// [`crate::agents::gate::REQUEST_IS_DATA`], named, then its text (AD-416,
+/// NFR-48). Only a `request` line is a message.
+fn request_text(body: &GateBody) -> Option<String> {
+    if body.state != GateState::Request {
+        return None;
+    }
+    Some(format!(
+        "{}\n\nRequest {}:\n{}",
+        crate::agents::gate::REQUEST_IS_DATA,
+        body.request,
+        body.text.as_deref().unwrap_or_default()
+    ))
+}
+
+/// Whether `line` starts a gate turn's conversation over: a `request` line.
+pub fn starts_over(line: &LogLine) -> bool {
+    matches!(&line.body, LineBody::Gate(body) if body.state == GateState::Request)
 }
 
 /// A person's text, then the drive files they attached, one per line.
@@ -244,6 +269,7 @@ pub fn replay(
 
         match &line.body {
             LineBody::Open(open) => last_open = Some(open.clone()),
+            _ if starts_over(line) => placed.clear(),
             LineBody::Compact(compact) => {
                 let through = log
                     .lines

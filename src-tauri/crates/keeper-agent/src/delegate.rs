@@ -94,6 +94,8 @@ pub enum ReplyOffer {
     Delegated,
     /// A proxy's relay of its person's answer to an open ask (R100).
     Relay,
+    /// A gate's answer to its outside system's request (codemap Q6).
+    Gate,
 }
 
 /// What a call says on a host with no room to make one in.
@@ -148,6 +150,18 @@ pub fn specs(delegate: bool, reply: ReplyOffer) -> Vec<ToolSpec> {
                 "properties": {
                     "text": {"type": "string"},
                     "artifacts": {"type": "array", "items": {"type": "string"}, "description": "Session-relative paths under artifacts/."}
+                },
+                "required": ["text"],
+                "additionalProperties": false
+            }),
+        }),
+        ReplyOffer::Gate => specs.push(ToolSpec {
+            name: REPLY.to_owned(),
+            description: "Answer the outside system's request: your text goes to it as one message in its room. Answer once; a request you do not answer is refused.".to_owned(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string", "description": "The answer, whole."}
                 },
                 "required": ["text"],
                 "additionalProperties": false
@@ -783,6 +797,8 @@ pub struct DelegateTools<'t> {
     /// A workflow's run: the outputs it declared, session-relative, each
     /// checked when it replies (R107).
     pub outputs: Vec<String>,
+    /// A gate's turn: the request its `reply` answers (codemap Q6).
+    pub serving: Option<crate::gate::Serving>,
     lines: Mutex<Vec<LineBody>>,
 }
 
@@ -811,8 +827,14 @@ impl<'t> DelegateTools<'t> {
             offer_delegate,
             sinks,
             outputs: Vec::new(),
+            serving: None,
             lines: Mutex::new(Vec::new()),
         }
+    }
+
+    /// The request a gate's turn answers.
+    pub fn serving(self, serving: Option<crate::gate::Serving>) -> DelegateTools<'t> {
+        DelegateTools { serving, ..self }
     }
 
     /// The outputs a workflow's run declared, checked at its reply.
@@ -884,6 +906,7 @@ impl<'t> DelegateTools<'t> {
                     refused("reply relays your person's answer: name the question's id as ask.")
                 }
                 (ReplyOffer::Delegated, None) => self.reply(wire.arguments.as_ref(), audit),
+                (ReplyOffer::Gate, None) => self.answer(wire.arguments.as_ref(), audit),
                 (_, Some(_)) => refused(crate::ask::NO_RELAY),
                 (ReplyOffer::None, None) => refused(NOT_DELEGATED),
             },
@@ -1264,6 +1287,71 @@ impl<'t> DelegateTools<'t> {
         Some(ToolOutcome::Answered {
             text: format!("Sent to {to}."),
         })
+    }
+
+    /// A gate's `reply(text)` (codemap Q6, 99.2 #2): one message to its
+    /// outside system in the session's own room — the answer while its
+    /// request is not ticketed, the ticket's result after — passing the
+    /// room's sink with the session's label now, its secrets redacted as
+    /// the room's are (S-17). No artifacts, no label, no card: a blocked
+    /// answer is refused, never sent.
+    fn answer(&self, args: Option<&Value>, audit: &CallAudit<'_>) -> Option<ToolOutcome> {
+        let Some(text) = args.and_then(|args| args["text"].as_str()) else {
+            return refused("reply needs a \"text\" argument.");
+        };
+        let Some(serving) = &self.serving else {
+            return refused(crate::gate::NO_SUCH_REQUEST);
+        };
+        let text = keeper_core::agents::redact::redact_secrets(text).text;
+        let members = match block_on(self.room.members()) {
+            Ok(members) => members,
+            Err(error) => {
+                return Some(audit.refuse(format!(
+                    "Who is in this room could not be read, so nothing was sent: {error}"
+                )))
+            }
+        };
+        let known = self.port.as_ref().map(|port| port.known());
+        let sink = room_audience(
+            members,
+            known.as_deref(),
+            std::slice::from_ref(&self.from.user),
+        );
+        let label = self.view.label();
+        if let Err(blocked) = self.sinks.verdict(
+            REPLY,
+            &Destination::Room {
+                room: self.from.room.clone(),
+            },
+            &label,
+            &sink,
+            text.as_bytes(),
+            None,
+        ) {
+            return Some(audit.refuse(blocked.sentence));
+        }
+        if let Err(withheld) = audit.admit("", self.from.room.as_str()) {
+            return Some(withheld.into());
+        }
+        match block_on(serving.desk.reply(&serving.request, &text)) {
+            Ok(lines) => {
+                let result = lines.last().is_some_and(|fact| {
+                    fact.line.state == keeper_core::agents::log::GateState::Result
+                });
+                let said = if result {
+                    "Sent as the ticket's result."
+                } else {
+                    "Answered."
+                };
+                for fact in lines {
+                    self.line(LineBody::Gate(fact.line));
+                }
+                Some(ToolOutcome::Answered {
+                    text: said.to_owned(),
+                })
+            }
+            Err(sentence) => refused(sentence),
+        }
     }
 
     fn reply(&self, args: Option<&Value>, audit: &CallAudit<'_>) -> Option<ToolOutcome> {

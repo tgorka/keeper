@@ -205,6 +205,28 @@ pub fn compose(input: &PromptInput<'_>) -> ComposedPrompt {
     }
 }
 
+/// A gate's system message (codemap Q16): the soul — its sentences, never
+/// a `file:` fact's file — and the frame, and nothing else: no core
+/// memory, no skills, no menu, no context file. Writing a gate's
+/// `audience` releases its `SOUL.md` to the outside system, nothing more of
+/// its home. Its memory digest is empty: none was read.
+pub fn compose_gate(soul: &Soul, facts: &[RenderedFact], frame: &SessionFrame) -> ComposedPrompt {
+    let mut b = Builder {
+        text: String::new(),
+        sections: Vec::new(),
+    };
+    soul_slot(&mut b, soul, facts);
+    frame_slot(&mut b, frame, &[]);
+    let prompt_sha256 = hex::encode(Sha256::digest(b.text.as_bytes()));
+    ComposedPrompt {
+        text: b.text,
+        sections: b.sections,
+        prompt_sha256,
+        memory_sha256: String::new(),
+        notes: Vec::new(),
+    }
+}
+
 /// The session frame alone — slot 5 as [`compose`] renders it, without
 /// the home's files: what a helper is told of the session it works for,
 /// with no soul and no core memory (AD-399).
@@ -574,6 +596,35 @@ mod tests {
             .map(|s| s.text.as_str())
             .collect();
         assert_eq!(joined, prompt.text);
+    }
+
+    /// Codemap Q16: a gate is told its soul and its frame only — none of
+    /// its home's memory, skills, menu, `file:` facts or context files,
+    /// which its audience was never released.
+    #[test]
+    fn a_gates_prompt_is_its_soul_and_frame() {
+        let home = nixi();
+        let prompt = compose_gate(&home.soul, &home.facts, &home.frame);
+        let slots: Vec<u8> = prompt.sections.iter().map(|s| s.slot).collect();
+        assert_eq!(slots, [1, 5]);
+        let whole = compose_home(&home);
+        let slot = |prompt: &ComposedPrompt, n: u8| {
+            let section = prompt.sections.iter().find(|s| s.slot == n).expect("slot");
+            prompt.text[section.range.clone()].to_owned()
+        };
+        // The soul's slot as the home's prompt has it, the frame alone, and
+        // nothing of any other slot — core memory, skills, files.
+        assert_eq!(slot(&prompt, 1), slot(&whole, 1));
+        assert_eq!(slot(&prompt, 5), frame_text(&home.frame));
+        for other in whole
+            .sections
+            .iter()
+            .filter(|s| s.slot != 1 && s.slot != 5 && !s.range.is_empty())
+        {
+            let text = &whole.text[other.range.clone()];
+            assert!(!prompt.text.contains(text), "slot {}", other.slot);
+        }
+        assert_eq!(prompt.memory_sha256, "");
     }
 
     #[test]

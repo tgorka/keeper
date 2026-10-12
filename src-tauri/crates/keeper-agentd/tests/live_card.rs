@@ -128,7 +128,12 @@ fn decisions(seen: &Seen) -> Vec<Arrived> {
         .iter()
         .filter(|(value, _)| value["type"] == APPROVAL_DECISION)
         .filter_map(|(value, encryption)| {
-            arrival_of(value, encryption.as_ref(), tokio::time::Instant::now())
+            arrival_of(
+                value,
+                encryption.as_ref(),
+                tokio::time::Instant::now(),
+                None,
+            )
         })
         .collect()
 }

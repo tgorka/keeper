@@ -454,6 +454,7 @@ pub(crate) fn deps_over(
         sandbox: None,
         mcp: None,
         kvm: None,
+        gate_tickets: Default::default(),
     })
 }
 
@@ -469,6 +470,9 @@ struct Routes {
     /// Per served room: the session folder, and its worker's channel.
     workers: HashMap<OwnedRoomId, (String, mpsc::UnboundedSender<Arrived>)>,
     pending: HashMap<OwnedRoomId, VecDeque<Arrived>>,
+    /// Per served gate room: its session's desk (99.1), which takes each
+    /// request where it arrives.
+    desks: HashMap<OwnedRoomId, Arc<crate::gate::Desk>>,
 }
 
 impl Router {
@@ -535,6 +539,17 @@ impl Router {
         }))
     }
 
+    /// Take requests for the gate room `room` at `desk` while its worker
+    /// serves it; the worker's end forgets it.
+    pub fn open_desk(&self, room: &RoomId, desk: Arc<crate::gate::Desk>) {
+        self.routes().desks.insert(room.to_owned(), desk);
+    }
+
+    /// The desk of the gate room `room`, while its worker serves it.
+    pub fn desk(&self, room: &RoomId) -> Option<Arc<crate::gate::Desk>> {
+        self.routes().desks.get(room).cloned()
+    }
+
     /// The session folder each served room is served for.
     pub fn served(&self) -> BTreeMap<OwnedRoomId, String> {
         self.routes()
@@ -546,7 +561,9 @@ impl Router {
 
     /// Close every worker's channel.
     pub fn close(&self) {
-        self.routes().workers.clear();
+        let mut routes = self.routes();
+        routes.workers.clear();
+        routes.desks.clear();
     }
 
     /// Drop what was kept for `room`: another host holds its claim and
@@ -557,7 +574,9 @@ impl Router {
 
     /// Close `room`'s worker channel: its claim ended (story 90.6).
     pub fn close_room(&self, room: &RoomId) {
-        self.routes().workers.remove(room);
+        let mut routes = self.routes();
+        routes.workers.remove(room);
+        routes.desks.remove(room);
     }
 
     /// Whether a worker serves `room`.
@@ -574,7 +593,9 @@ struct Detach {
 
 impl Drop for Detach {
     fn drop(&mut self) {
-        self.router.routes().workers.remove(&self.room);
+        let mut routes = self.router.routes();
+        routes.workers.remove(&self.room);
+        routes.desks.remove(&self.room);
     }
 }
 
@@ -622,6 +643,9 @@ pub(crate) struct Claimed {
     /// Busy while the worker works — starting included — and whether a
     /// call waits for a person (R177).
     pub(crate) activity: Arc<crate::agent::Activity>,
+    /// The homeserver's clock as the host's claims calibrate it: what a
+    /// gate's deadlines and allowances are kept by (99.1 #3, Q10).
+    pub(crate) clock: Arc<crate::claims::ServerClock>,
 }
 
 /// How the engine's supervisor ended.
@@ -1162,6 +1186,7 @@ async fn serve_session(
     // A worker that ends — or never starts — holds nothing busy.
     let _idle = Idle(Arc::clone(&claimed.activity));
     let room_id = agent.room.clone();
+    let agent_room = room_id.clone();
     let Some(room) = copy.client.client().get_room(&room_id) else {
         return;
     };
@@ -1223,6 +1248,22 @@ async fn serve_session(
         me.clone(),
         deps.host.as_str(),
     )));
+    // A gate's desk takes its requests where they arrive from here on, on
+    // the homeserver's clock, and says nothing once the claim is lost.
+    if served.context.agent.kind == SessionKind::Gate {
+        let may = Arc::clone(&lease);
+        let known = Arc::clone(&copy.known.read().unwrap_or_else(|p| p.into_inner()));
+        if let Some(desk) = served.open_desk(
+            deps,
+            Arc::clone(&port),
+            Arc::clone(&claimed.clock),
+            Arc::new(move || may.may_write()),
+            Some(known),
+        ) {
+            served.gate_desk = Some(Arc::clone(&desk));
+            copy.router.open_desk(&agent_room, desk);
+        }
+    }
     let (events, mut backlog) = read_back(&room, &mut served, me).await;
     // A taker's log may not hold the last holder's lines yet: what another
     // copy of this agent already answered is not asked again.
@@ -1230,8 +1271,8 @@ async fn serve_session(
     backlog.retain(|arrived| !answered.contains(arrived.event_id.as_str()));
     // A harvest or a workflow step another copy started — its anchor is in
     // the room — is not started again, though its `peer` line never reached
-    // this log (R202).
-    served.context.started(answered.iter().map(String::as_str));
+    // this log (R202); a gate's request it answered is not refused (R368).
+    served.answered_elsewhere(&answered);
     let trail = trail_of(&events, me, served.context.unanswered);
     match served.recover(deps, Arc::clone(&port), &trail).await {
         Ok(true) => {
@@ -1739,10 +1780,15 @@ async fn read_back(
     }
     unseen.reverse();
     let now = Instant::now();
+    let gate = served.context.agent.gate.clone();
+    let door = gate.as_ref().map(|gate| GateDoor {
+        peer: &gate.peer,
+        clear: !gate.encrypted && !room.encryption_state().is_encrypted(),
+    });
     let arrivals = unseen
         .iter()
         .filter(|(value, _)| value["sender"].as_str() != Some(me.as_str()))
-        .filter_map(|(value, encryption)| arrival_of(value, encryption.as_deref(), now))
+        .filter_map(|(value, encryption)| arrival_of(value, encryption.as_deref(), now, door))
         .map(|arrived| Arrived {
             replay: true,
             ..arrived
@@ -1783,13 +1829,29 @@ pub(crate) async fn latest_status(room: &Room, me: &UserId) -> Option<OwnedEvent
 /// started answering. An answer's anchor names its question; one that does
 /// not answers the oldest question before it no anchor answered yet, as a
 /// room's turns run in order. A question no person asked in the room — a
-/// harvest's, a scheduled run's — is answered by the anchor naming it.
+/// harvest's, a scheduled run's — is answered by the anchor naming it. A
+/// gate's request is answered by its `answer`, `result` or `refused`,
+/// which references it and carries no anchor (codemap Q6); its `ticket`
+/// answers nothing yet.
 fn answered_by(events: &[Value], me: &UserId) -> HashSet<String> {
     let mut open: VecDeque<&str> = VecDeque::new();
     let mut answered = HashSet::new();
     for event in events {
         if event["sender"] == me.as_str() {
-            if event["content"][TURN].is_object() {
+            let gate = &event["content"][keeper_core::agents::events::GATE];
+            let relates = &event["content"]["m.relates_to"];
+            let answers = |state: &str| {
+                use keeper_core::agents::log::GateState;
+                [GateState::Answer, GateState::Result, GateState::Refused]
+                    .iter()
+                    .any(|answer| answer.as_str() == state)
+            };
+            if gate["state"].as_str().is_some_and(answers) && relates["rel_type"] == "m.reference" {
+                if let Some(request) = relates["event_id"].as_str() {
+                    open.retain(|asked| *asked != request);
+                    answered.insert(request.to_owned());
+                }
+            } else if event["content"][TURN].is_object() {
                 match event["content"][TURN]["question"].as_str() {
                     Some(question) => {
                         open.retain(|asked| *asked != question);
@@ -1860,6 +1922,16 @@ fn register_handlers(copy: &Arc<Copy>) {
                 if value["type"] == DOORBELL {
                     return;
                 }
+                // A gate's outside system asks and does nothing else: no
+                // event of its but a message reaches a call, a session or
+                // a person's path (AD-416).
+                let desk = copy.router.desk(room.room_id());
+                if desk.as_ref().is_some_and(|desk| {
+                    value["sender"].as_str() == Some(desk.peer.as_str())
+                        && value["type"] != "m.room.message"
+                }) {
+                    return;
+                }
                 // A device's answer to a surface call goes to the call
                 // waiting on it, never to the session's worker, which that
                 // call is holding (R39).
@@ -1909,13 +1981,25 @@ fn register_handlers(copy: &Arc<Copy>) {
                     }
                     return;
                 }
-                let Some(arrived) = arrival_of(&value, encryption.as_ref(), received_at) else {
+                let door = desk.as_ref().map(|desk| GateDoor {
+                    peer: &desk.peer,
+                    clear: desk.clear && !room.encryption_state().is_encrypted(),
+                });
+                let Some(arrived) = arrival_of(&value, encryption.as_ref(), received_at, door)
+                else {
                     return;
                 };
                 // The agent's own events are never acted on (R30's first
                 // rule): they are neither routed nor kept.
                 if arrived.sender == copy.deps.home.config.matrix_user {
                     return;
+                }
+                // A gate's request is taken where it arrives: its ticket and
+                // its deadline do not wait behind the turn under way (Q10).
+                if let Some(desk) = desk.filter(|desk| {
+                    arrived.sender == desk.peer && arrived.arrival == Arrival::Text
+                }) {
+                    desk.take(&arrived);
                 }
                 if arrived.arrival == Arrival::Brief && !copy.router.serves(room.room_id()) {
                     hold_brief(&copy, &room, &value, sealed_by_sender(encryption.as_ref())).await;
@@ -1958,7 +2042,7 @@ async fn intercept_ask(
     let (AgentKind::Proxy, Some(human)) = (config.kind, config.human.as_ref()) else {
         return false;
     };
-    let Some(arrived) = arrival_of(value, encryption, received_at) else {
+    let Some(arrived) = arrival_of(value, encryption, received_at, None) else {
         return true;
     };
     if arrived.arrival != Arrival::Ask || arrived.sender == config.matrix_user {
@@ -2152,6 +2236,7 @@ fn read_back_ask(event: &Value, room: &RoomId) -> Option<Arrived> {
         replay: false,
         via: Some(room.to_owned()),
         device: None,
+        origin_server_ts: None,
     })
 }
 
@@ -2664,6 +2749,7 @@ fn child_arrival(
             replay: false,
             via: Some(room.to_owned()),
             device: None,
+            origin_server_ts: value["origin_server_ts"].as_u64(),
         });
     }
     let unlinked = encryption.is_some() && !sealed_by_sender(encryption);
@@ -2678,6 +2764,7 @@ fn child_arrival(
             replay: false,
             via: Some(room.to_owned()),
             device: None,
+            origin_server_ts: value["origin_server_ts"].as_u64(),
         });
     }
     if !sealed_by_sender(encryption) {
@@ -2701,25 +2788,41 @@ fn owner_signed(encryption: Option<&EncryptionInfo>) -> bool {
     })
 }
 
+/// A gate's room as its front reads it (99.1 #2; codemap Q9): its outside
+/// system, and whether the room is clear — made without encryption, as its
+/// session says and as this copy reads its state.
+#[derive(Debug, Clone, Copy)]
+pub struct GateDoor<'a> {
+    pub peer: &'a UserId,
+    pub clear: bool,
+}
+
 /// A decrypted timeline event as an [`Arrived`], or `None` for an event no
 /// session acts on (membership, state, reactions, attachments, notices).
 ///
 /// Text is a person's `m.text` only, and only when the sender's own device
 /// sealed it: a message in clear, or one whose sender does not match its
-/// Megolm session, is never a turn.
+/// Megolm session, is never a turn. In a gate's room (`gate`), its outside
+/// system's `m.notice` is text too, and so is its message in clear when the
+/// room is clear (Q9): a request, `untrusted` either way.
 pub fn arrival_of(
     value: &Value,
     encryption: Option<&EncryptionInfo>,
     received_at: Instant,
+    gate: Option<GateDoor<'_>>,
 ) -> Option<Arrived> {
     let event_type = value["type"].as_str()?;
     let content = value["content"].clone();
+    let from_peer = gate.is_some_and(|door| value["sender"].as_str() == Some(door.peer.as_str()));
     let arrival = if event_type == "m.room.message" {
+        let clear_request =
+            from_peer && gate.is_some_and(|door| door.clear) && encryption.is_none();
         if content["m.relates_to"]["rel_type"] == "m.replace" {
             Arrival::Edit
-        } else if content["msgtype"] != "m.text" {
+        } else if content["msgtype"] != "m.text" && !(from_peer && content["msgtype"] == "m.notice")
+        {
             return None;
-        } else if !sealed_by_sender(encryption) {
+        } else if !sealed_by_sender(encryption) && !clear_request {
             tracing::info!(
                 sender = value["sender"].as_str().unwrap_or_default(),
                 event = value["event_id"].as_str().unwrap_or_default(),
@@ -2768,6 +2871,7 @@ pub fn arrival_of(
         replay: false,
         via: None,
         device: encryption.and_then(|info| info.sender_device.clone()),
+        origin_server_ts: value["origin_server_ts"].as_u64(),
     })
 }
 
@@ -2967,6 +3071,54 @@ mod tests {
         assert_eq!(answered_by(&events, &me), HashSet::from(["$q1".to_owned()]));
     }
 
+    /// Review R99S-03: a gate answers by referencing the request, with no
+    /// anchor: its `answer`, `result` and `refused` each answer the request
+    /// they reference — and only that one — and a `ticket` answers nothing
+    /// yet; another sender's gate key answers nothing.
+    #[test]
+    fn a_gates_answers_are_answers_after_a_takeover() {
+        use keeper_core::agents::events::GATE;
+        let me = OwnedUserId::try_from("@forge:example.org").expect("user");
+        let peer = "@github:example.org";
+        let message = |id: &str, sender: &str, content: Value| json!({"event_id": id, "sender": sender, "type": "m.room.message", "content": content});
+        let request = |n: u32| {
+            message(
+                &format!("$r{n}"),
+                peer,
+                json!({"msgtype": "m.text", "body": "job"}),
+            )
+        };
+        let said = |id: &str, sender: &str, state: &str, request: &str| {
+            message(
+                id,
+                sender,
+                json!({
+                    "msgtype": "m.text",
+                    "body": "…",
+                    GATE: {"v": 1, "request": "r", "state": state},
+                    "m.relates_to": {"rel_type": "m.reference", "event_id": request},
+                }),
+            )
+        };
+        let events = [
+            request(1),
+            request(2),
+            request(3),
+            request(4),
+            request(5),
+            said("$a4", me.as_str(), "answer", "$r4"),
+            said("$t1", me.as_str(), "ticket", "$r1"),
+            said("$x1", me.as_str(), "result", "$r1"),
+            said("$t2", me.as_str(), "ticket", "$r2"),
+            said("$x3", me.as_str(), "refused", "$r3"),
+            said("$f5", peer, "answer", "$r5"),
+        ];
+        assert_eq!(
+            answered_by(&events, &me),
+            HashSet::from(["$r1", "$r3", "$r4"].map(str::to_owned))
+        );
+    }
+
     fn sealed(level: Option<VerificationLevel>) -> EncryptionInfo {
         EncryptionInfo {
             sender: OwnedUserId::try_from("@tgorka:example.org").expect("user"),
@@ -3001,24 +3153,72 @@ mod tests {
         let now = Instant::now();
         let text = message(json!({"msgtype": "m.text", "body": "hi"}));
         let unverified = sealed(Some(VerificationLevel::UnverifiedIdentity));
-        let arrived = arrival_of(&text, Some(&unverified), now).expect("a turn");
+        let arrived = arrival_of(&text, Some(&unverified), now, None).expect("a turn");
         assert_eq!(arrived.arrival, Arrival::Text);
         assert_eq!(arrived.text, "hi");
 
-        assert!(arrival_of(&text, None, now).is_none(), "a message in clear");
+        assert!(
+            arrival_of(&text, None, now, None).is_none(),
+            "a message in clear"
+        );
         let forged = sealed(Some(VerificationLevel::MismatchedSender));
         assert!(
-            arrival_of(&text, Some(&forged), now).is_none(),
+            arrival_of(&text, Some(&forged), now, None).is_none(),
             "a mismatched sender"
         );
 
         for msgtype in ["m.image", "m.file", "m.notice", "m.audio"] {
             let other = message(json!({"msgtype": msgtype, "body": "photo.png"}));
             assert!(
-                arrival_of(&other, Some(&unverified), now).is_none(),
+                arrival_of(&other, Some(&unverified), now, None).is_none(),
                 "{msgtype} is not a turn"
             );
         }
+    }
+
+    /// Codemap Q9 (99.1 #2): in a gate's room its outside system's notice
+    /// is text, and in a clear gate room so is its message in clear, with
+    /// the homeserver's time; anyone else's message in clear, and the
+    /// peer's in clear where the room is encrypted, is still nothing.
+    #[test]
+    fn a_clear_gate_room_takes_its_peers_messages_only() {
+        let now = Instant::now();
+        let peer = OwnedUserId::try_from("@tgorka:example.org").expect("the sender as peer");
+        let other = OwnedUserId::try_from("@github:example.org").expect("user");
+        let clear = GateDoor {
+            peer: &peer,
+            clear: true,
+        };
+        let mut notice = message(json!({"msgtype": "m.notice", "body": "build failed"}));
+        notice["origin_server_ts"] = json!(1_759_570_000_000u64);
+        let arrived = arrival_of(&notice, None, now, Some(clear)).expect("a request in clear");
+        assert_eq!(arrived.arrival, Arrival::Text);
+        assert_eq!(arrived.origin_server_ts, Some(1_759_570_000_000));
+        let sealed_notice = arrival_of(
+            &notice,
+            Some(&sealed(Some(VerificationLevel::UnverifiedIdentity))),
+            now,
+            Some(GateDoor {
+                peer: &peer,
+                clear: false,
+            }),
+        )
+        .expect("a sealed notice of the peer");
+        assert_eq!(sealed_notice.arrival, Arrival::Text);
+
+        let encrypted_room = GateDoor {
+            peer: &peer,
+            clear: false,
+        };
+        assert!(arrival_of(&notice, None, now, Some(encrypted_room)).is_none());
+        let someone_else = GateDoor {
+            peer: &other,
+            clear: true,
+        };
+        assert!(arrival_of(&notice, None, now, Some(someone_else)).is_none());
+        let text = message(json!({"msgtype": "m.text", "body": "hi"}));
+        assert!(arrival_of(&text, None, now, Some(someone_else)).is_none());
+        assert!(arrival_of(&text, None, now, Some(clear)).is_some());
     }
 
     /// R47 (and Q10 for a heard mark): a scope, a request for a conversation
@@ -3044,6 +3244,7 @@ mod tests {
             agent_user: &nixi,
             requester: &tgorka,
             readers: &readers,
+            peer: None,
         };
         let event = |kind: &str, content: Value| json!({"type": kind, "event_id": "$s:example.org", "sender": tgorka.as_str(), "content": content});
         let scope = event(
@@ -3081,7 +3282,7 @@ mod tests {
             let level = encryption
                 .as_ref()
                 .map(|info| info.verification_state.clone());
-            let scoped = arrival_of(&scope, encryption.as_ref(), now).expect("a scope");
+            let scoped = arrival_of(&scope, encryption.as_ref(), now, None).expect("a scope");
             assert_eq!(
                 scoped.arrival,
                 Arrival::Scope {
@@ -3089,8 +3290,8 @@ mod tests {
                 },
                 "{level:?}"
             );
-            let asked = arrival_of(&ask, encryption.as_ref(), now).expect("a request");
-            let marked = arrival_of(&heard, encryption.as_ref(), now).expect("a mark");
+            let asked = arrival_of(&ask, encryption.as_ref(), now, None).expect("a request");
+            let marked = arrival_of(&heard, encryption.as_ref(), now, None).expect("a mark");
             assert_eq!(
                 marked.arrival,
                 Arrival::Heard {

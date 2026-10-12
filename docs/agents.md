@@ -3380,14 +3380,63 @@ post into an encrypted room, which `msgtype` they send, and whether anything car
 answers back out are all `[UNVERIFIED]`; such a system is asynchronous at best, and its room
 would have to be clear.
 
-**What a gate does with a request** — answering by a deadline, a ticket, handing the work to a
-delegate once a person approves it, and calling back in the room — comes with the rest of the
-gates for outside systems. Until then a gate session's room is served like any other session
-room nobody talks in: what the peer writes is not a turn, and nothing is answered. Some of what
-the room lets the peer do today is closed by then or recorded: an approval decision, a `heard` or
-a surface result at power 0 (DW-1333), an `m.room.encrypted` event in a clear room (DW-1334), the
-status that names the host and the session's folder (DW-1335), and a `[[trust]]` that names the
-peer only after the room was made (DW-1336).
+### Asking a gate
+
+Each message the peer writes in its room — `m.text` or `m.notice` — is one request; anyone
+else's message there is not a turn, and nothing else the peer sends (a decision, a scope, an
+edit, any keeper event) counts for anything. To ask synchronously the system adds a deadline:
+
+```json
+{"msgtype": "m.text", "body": "is the deploy done?",
+ "dev.keeper.agent.gate": {"request": "r1", "deadline_ms": 5000}}
+```
+
+A message without `deadline_ms` is asynchronous; one without the key is asynchronous and named by
+its event id, as is one whose `request` is longer than 255 bytes or holds a line break or another
+control character. A deadline above `deadline_ms_max` is cut to it, and is counted from the
+request's `origin_server_ts` — never from later than the gate's homeserver's own clock, whatever
+the system's homeserver stamped. Where the gate names a request in its own words it quotes the
+name, cut to 64 characters. The gate answers in the same room,
+each message an `m.text` referencing the request (`m.relates_to` `m.reference`) and carrying
+`dev.keeper.agent.gate: {v: 1, request, state, ticket?, deadline_ms?, reason?}`:
+
+| state | when |
+| --- | --- |
+| `answer` | a synchronous request answered within its deadline; `deadline_ms` says the deadline the gate kept |
+| `ticket` | an asynchronous request, at once; a synchronous one whose deadline passed first (timed by the homeserver's clock). The work goes on. |
+| `result` | the ticket's work, done |
+| `refused` | `reason`: `busy` (an hourly allowance is spent, or as many tickets are open across the agent's gates on this host as `[limits].max_concurrent_sessions`), `mode` (an asynchronous request to a gate whose `modes` is `["sync"]`), `no_answer` (the gate's turn ended without answering), `interrupted` (its host stopped mid-turn) |
+
+A synchronous request to a gate whose `modes` is `["async"]` gets a ticket at once. Both hourly
+allowances refill continuously — `max_tickets_per_hour` tickets, `max_requests_per_hour`
+requests, one back every `3600 / n` seconds — and are counted from the gate session's own log, so
+a restart or another host taking the session over refills neither. A refused request runs no turn,
+and of the requests refused before any turn (`busy`, `mode`) the gate says one refusal a minute in
+the room — the rest are logged, not echoed. A request whose turn a stop cut off is refused
+`interrupted` when the session is served again, unless the room already shows its answer, result
+or refusal from the host that held it before. A gate session
+is served only by a host whose `agentd.toml` says `always_on = true`: with none live it waits,
+saying `an always-on host`.
+
+Each request is its own turn: the model reads that request alone, never an earlier one, framed as
+data — what an outside system writes never decides anything — and is told the gate's `SOUL.md` and
+its session's frame, never its memory, skills, menu or any drive file. The turn streams nothing
+and posts no status: the only thing that leaves is what its `reply` sends, once, passing the room
+as a sink like every send. Its label is reset to the gate's opening label (the `audience`,
+`untrusted`) at every request, and never rises.
+
+**In this build a gate's turn is offered `reply` alone, and runs nothing else.** Handing the work
+to a `delegate` once a person approves it, `journal_append` and the MCP servers `[tools].mcp` names
+come with the rest of the gates for outside systems; until then an asynchronous request is worked
+by the gate's own turn, and any other tool its model names — `ask_human`, its journal, an MCP tool
+or a drive verb included, whatever `[tools].allow` says — is refused as not offered, before it runs
+or reaches anyone.
+
+What the room still lets the peer do is recorded: an `m.room.encrypted` event in a clear room
+(DW-1334), the status anchor `agents gate` posts, which names the host and the session's folder
+(DW-1335 — a gate's turn itself posts no status), and a `[[trust]]` that names the peer only
+after the room was made (DW-1336). An approval decision, a `heard` mark or a surface result from
+the peer counts for nothing (DW-1333, closed).
 
 ## Workflows
 

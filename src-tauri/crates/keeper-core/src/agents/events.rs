@@ -62,6 +62,11 @@ pub const PRESENCE: &str = "dev.keeper.agent.presence";
 /// The key inside a brief's `m.room.message` content carrying the
 /// delegation (ruling R53): who hands what to whom, under which label.
 pub const DELEGATE: &str = "dev.keeper.agent.delegate";
+/// The key inside a gate room's `m.room.message` content (AD-415, story
+/// 99.1): from the outside system, `{request, deadline_ms?}`; from the gate,
+/// `{v, request, state, ticket?, deadline_ms?, reason?}`
+/// ([`super::gate::GateState`]).
+pub const GATE: &str = "dev.keeper.agent.gate";
 /// The key inside an agent's `m.room.message` content naming the files it
 /// hands over, `[{drive, path}]`: a delegated session's reply carries it.
 pub const ARTIFACTS: &str = "dev.keeper.agent.artifacts";

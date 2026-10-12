@@ -182,6 +182,7 @@ pub enum LineKind {
     Surface,
     Heard,
     Told,
+    Gate,
     Paseo,
     Memory,
     Compact,
@@ -191,7 +192,7 @@ pub enum LineKind {
 
 impl LineKind {
     /// Every kind, in the documented order.
-    pub const ALL: [LineKind; 21] = [
+    pub const ALL: [LineKind; 22] = [
         Self::Open,
         Self::Claim,
         Self::User,
@@ -208,6 +209,7 @@ impl LineKind {
         Self::Surface,
         Self::Heard,
         Self::Told,
+        Self::Gate,
         Self::Paseo,
         Self::Memory,
         Self::Compact,
@@ -234,6 +236,7 @@ impl LineKind {
             Self::Surface => "surface",
             Self::Heard => "heard",
             Self::Told => "told",
+            Self::Gate => "gate",
             Self::Paseo => "paseo",
             Self::Memory => "memory",
             Self::Compact => "compact",
@@ -775,6 +778,94 @@ pub struct ToldBody {
     pub room: OwnedRoomId,
 }
 
+/// Where one request of a gate's outside system stands (AD-415, story
+/// 99.1; codemap Q13). The `gate` line of each state is the record: both
+/// of a gate's hourly allowances are counted from these lines' server
+/// times, so a restart or a takeover refills neither.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GateState {
+    /// The request came in: its text, and its deadline when it is sync.
+    Request,
+    /// Answered within its deadline.
+    Answer,
+    /// Not answered by its deadline, or async: the work goes on, and its
+    /// result comes against the ticket.
+    Ticket,
+    /// The ticket's work, done.
+    Result,
+    /// Not taken, or given up: [`GateReason`] says why.
+    Refused,
+}
+
+impl GateState {
+    /// The word the line and the room's content spell it with.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Request => "request",
+            Self::Answer => "answer",
+            Self::Ticket => "ticket",
+            Self::Result => "result",
+            Self::Refused => "refused",
+        }
+    }
+}
+
+/// Why a gate refused a request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GateReason {
+    /// An hourly allowance is spent, or as many tickets are open as the
+    /// agent may run sessions at once.
+    Busy,
+    /// The gate does not take requests of that mode.
+    Mode,
+    /// The gate's turn ended without a reply.
+    NoAnswer,
+    /// The host stopped while the request's turn ran.
+    Interrupted,
+}
+
+impl GateReason {
+    /// The word the line and the room's content spell it with.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Busy => "busy",
+            Self::Mode => "mode",
+            Self::NoAnswer => "no_answer",
+            Self::Interrupted => "interrupted",
+        }
+    }
+}
+
+/// `gate`: one step of one outside request in a gate session (codemap
+/// Q13). The line of a `request` carries the request's event and its text,
+/// framed as data when the model reads it; every other state's line
+/// carries the gate's own event that said it in the room.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GateBody {
+    /// The outside system's name for the request: its `request` key, or
+    /// the request event's id when it gave none.
+    pub request: String,
+    pub state: GateState,
+    /// The ticket's id, from `ticket` on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ticket: Option<String>,
+    /// A sync request's deadline as the gate keeps it: clamped to the
+    /// gate's `deadline_ms_max`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline_ms: Option<u32>,
+    /// The homeserver's time, ms since the Unix epoch: the request event's
+    /// own on a `request` line, the gate's estimate of it on the others.
+    pub server_ts: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<GateReason>,
+    /// A `request` line's text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+}
+
 /// Where a Paseo run's end stands in the session that follows it (R275).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -865,6 +956,7 @@ pub enum LineBody {
     Surface(SurfaceBody),
     Heard(HeardBody),
     Told(ToldBody),
+    Gate(GateBody),
     Paseo(PaseoBody),
     Memory(MemoryBody),
     Compact(CompactBody),
@@ -894,6 +986,7 @@ impl LineBody {
             Self::Surface(_) => LineKind::Surface,
             Self::Heard(_) => LineKind::Heard,
             Self::Told(_) => LineKind::Told,
+            Self::Gate(_) => LineKind::Gate,
             Self::Paseo(_) => LineKind::Paseo,
             Self::Memory(_) => LineKind::Memory,
             Self::Compact(_) => LineKind::Compact,
@@ -923,6 +1016,7 @@ impl LineBody {
             LineKind::Surface => Self::Surface(from(value)?),
             LineKind::Heard => Self::Heard(from(value)?),
             LineKind::Told => Self::Told(from(value)?),
+            LineKind::Gate => Self::Gate(from(value)?),
             LineKind::Paseo => Self::Paseo(from(value)?),
             LineKind::Memory => Self::Memory(from(value)?),
             LineKind::Compact => Self::Compact(from(value)?),
@@ -951,6 +1045,7 @@ impl Serialize for LineBody {
             Self::Surface(b) => b.serialize(s),
             Self::Heard(b) => b.serialize(s),
             Self::Told(b) => b.serialize(s),
+            Self::Gate(b) => b.serialize(s),
             Self::Paseo(b) => b.serialize(s),
             Self::Memory(b) => b.serialize(s),
             Self::Compact(b) => b.serialize(s),
@@ -1297,6 +1392,15 @@ mod tests {
             LineBody::Told(ToldBody {
                 person: user("@tgorka:h"),
                 room: OwnedRoomId::try_from("!dm:h").expect("room"),
+            }),
+            LineBody::Gate(GateBody {
+                request: "r1".into(),
+                state: GateState::Refused,
+                ticket: Some("01JTICKET".into()),
+                deadline_ms: Some(3000),
+                server_ts: 1_759_392_903_120,
+                reason: Some(GateReason::NoAnswer),
+                text: None,
             }),
             LineBody::Paseo(PaseoBody {
                 completion: "paseo-ended-01J".into(),

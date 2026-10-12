@@ -22,7 +22,8 @@
 #![cfg(target_os = "linux")]
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Child, Command, Output, Stdio};
+use std::time::Duration;
 
 use keeper_core::agents::events::{self, SESSION_ROOM_TYPE};
 use keeper_core::agents::gate::gate_session_id;
@@ -81,6 +82,41 @@ impl Agentd {
         said
     }
 
+    /// `keeper-agentd run`, its log at `log`; stopped when dropped, a
+    /// failed assertion included.
+    fn start(&self, log: &Path) -> Running {
+        let log = std::fs::File::create(log).expect("log");
+        let mut command = Command::new(BIN);
+        command.args(["run"]).env_clear();
+        command.env("PATH", std::env::var("PATH").unwrap_or_default());
+        for (key, value) in &self.env {
+            command.env(key, value);
+        }
+        command
+            .stdout(Stdio::null())
+            .stderr(log)
+            .spawn()
+            .map(Running)
+            .expect("keeper-agentd run")
+    }
+
+    /// Wait until the running host's status names `room`.
+    async fn wait_serving(&self, room: &OwnedRoomId, log: &Path) {
+        let status = self.home.join("state/keeper-agentd/status.json");
+        let until = std::time::Instant::now() + Duration::from_secs(120);
+        loop {
+            if std::fs::read_to_string(&status).is_ok_and(|text| text.contains(room.as_str())) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < until,
+                "the host never served {room}:\n{}",
+                std::fs::read_to_string(log).unwrap_or_default()
+            );
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
     fn drive(&self) -> PathBuf {
         self.home.join("data/keeper-agentd/drives/smoke")
     }
@@ -110,6 +146,16 @@ impl Agentd {
             .collect();
         assert_eq!(of.len(), 1, "one {system} gate session");
         of.remove(0)
+    }
+}
+
+/// A running `keeper-agentd run`.
+struct Running(Child);
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
     }
 }
 
@@ -155,8 +201,9 @@ async fn leave_session_rooms(smoke: &Smoke, dir: &Path, localpart: &str, passwor
 /// One agentd host over a drive holding the gate `forge` (the user
 /// `nixi-smoke`) with two systems: `github`, encrypted, its audience the
 /// peer and the person; `ci`, clear, its audience anyone. The gate's copy
-/// is signed in once a first `agents gate` has said it is not.
-async fn gate_host(smoke: &Smoke, root: &Path) -> Agentd {
+/// is signed in once a first `agents gate` has said it is not. With
+/// `model`, the gate's model is the stub at that URL.
+async fn gate_host(smoke: &Smoke, root: &Path, model: Option<&str>) -> Agentd {
     let agent = smoke.user("nixi-smoke");
     let peer = smoke.user("nixi-paced");
     let person = smoke.user("tgorka-smoke");
@@ -186,8 +233,12 @@ async fn gate_host(smoke: &Smoke, root: &Path) -> Agentd {
         "version = 1\nid = \"forge\"\nname = \"Forge\"\nkind = \"gate\"\nmatrix_user = \"{agent}\"\n\n\
          [[gate]]\nsystem = \"github\"\npeer = \"{peer}\"\naudience = [\"{peer}\", \"{person}\"]\nmodes = [\"sync\", \"async\"]\n\n\
          [[gate]]\nsystem = \"ci\"\npeer = \"{peer}\"\naudience = [\"*\"]\nmodes = [\"async\"]\nencrypted = false\n\n\
-         [model]\nbot = \"{BOT}\"\n"
+         [model]\nbot = \"{bot}\"\n",
+        bot = model.map_or_else(|| BOT.to_owned(), |url| format!("bot:openai:{url}#m"))
     );
+    let providers = model.map_or_else(String::new, |url| {
+        format!("\n[[providers]]\nkind = \"openai\"\nbase_url = \"{url}\"\n")
+    });
     let bare = bare_drive(
         root,
         &[
@@ -202,7 +253,7 @@ async fn gate_host(smoke: &Smoke, root: &Path) -> Agentd {
     std::fs::write(
         config_dir.join("agentd.toml"),
         format!(
-            "version = 1\nprincipal = \"tgorka\"\nhost = \"electra-sim\"\nalways_on = true\n\n[homeserver]\nurl = \"{}\"\ncontrol_room = \"\"\n\n[[drives]]\nid = \"smoke\"\nremote = \"{}\"\nowner = \"{person}\"\nreaders = [\"{person}\"]\n\n[[agents]]\ndrive = \"smoke\"\nids = [\"forge\"]\n\n[[trust]]\nuser = \"{person}\"\nmaster_key = \"{PIN}\"\n",
+            "version = 1\nprincipal = \"tgorka\"\nhost = \"electra-sim\"\nalways_on = true\n\n[homeserver]\nurl = \"{}\"\ncontrol_room = \"\"\n\n[[drives]]\nid = \"smoke\"\nremote = \"{}\"\nowner = \"{person}\"\nreaders = [\"{person}\"]\n\n[[agents]]\ndrive = \"smoke\"\nids = [\"forge\"]\n\n[[trust]]\nuser = \"{person}\"\nmaster_key = \"{PIN}\"\n{providers}",
             smoke.homeserver,
             bare.display()
         ),
@@ -258,7 +309,7 @@ async fn agents_gate_is_idempotent() {
     let agent = smoke.user("nixi-smoke");
     let peer = smoke.user("nixi-paced");
     let person = smoke.user("tgorka-smoke");
-    let agentd = gate_host(&smoke, root.path()).await;
+    let agentd = gate_host(&smoke, root.path(), None).await;
 
     agentd.ok(&["agents", "gate", "forge", "github"]);
     assert_eq!(agentd.sessions().len(), 1);
@@ -422,7 +473,7 @@ async fn gate_room_power_levels_hold() {
             .expect("the admin's user id"),
     )
     .expect("user");
-    let agentd = gate_host(&smoke, root.path()).await;
+    let agentd = gate_host(&smoke, root.path(), None).await;
     agentd.ok(&["agents", "gate", "forge", "github"]);
     agentd.ok(&["agents", "gate", "forge", "ci"]);
 
@@ -494,4 +545,188 @@ async fn gate_room_power_levels_hold() {
             answer(joined.redact(&levels_event, Some("the peer's"), None).await),
         );
     }
+}
+
+/// The gate's message about `request`, in `state`, once the peer's client
+/// has it: its content and the homeserver's time.
+async fn gate_says(
+    seen: &std::sync::Mutex<Vec<(std::time::Instant, Value)>>,
+    gate: &OwnedUserId,
+    request: &str,
+    state: &str,
+    within: Duration,
+) -> (Value, u64) {
+    let until = std::time::Instant::now() + within;
+    loop {
+        let found = seen.lock().expect("lock").iter().find_map(|(_, event)| {
+            let key = &event["content"][events::GATE];
+            (event["sender"] == gate.as_str() && key["request"] == request && key["state"] == state)
+                .then(|| {
+                    (
+                        event["content"].clone(),
+                        event["origin_server_ts"].as_u64().expect("server time"),
+                    )
+                })
+        });
+        if let Some(found) = found {
+            return found;
+        }
+        assert!(
+            std::time::Instant::now() < until,
+            "no {state} for {request} within {within:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// The server time of the peer's own event `id`, as its client saw it.
+fn server_time(seen: &std::sync::Mutex<Vec<(std::time::Instant, Value)>>, id: &str) -> u64 {
+    seen.lock()
+        .expect("lock")
+        .iter()
+        .find(|(_, event)| event["event_id"] == id)
+        .and_then(|(_, event)| event["origin_server_ts"].as_u64())
+        .expect("the request's server time")
+}
+
+/// 99.1 #7 (codemap §3 row 20): the sockets of this user's that listen —
+/// a TCP row in state `0A`, any UDP row — and that no process it can inspect
+/// owns, by inode. agentd makes itself non-dumpable (S-07), so its
+/// `/proc/<pid>/fd` is closed to its own user and its sockets are the ones
+/// no readable `fd` names; the caller drops what was there before it
+/// started, as `live_turn`'s egress check does.
+fn unowned_listeners() -> std::collections::BTreeSet<String> {
+    use std::os::unix::fs::MetadataExt;
+    let uid = std::fs::metadata("/proc/self").expect("self").uid();
+    let mut owned = std::collections::BTreeSet::new();
+    for entry in std::fs::read_dir("/proc")
+        .expect("proc")
+        .filter_map(Result::ok)
+    {
+        let Ok(fds) = std::fs::read_dir(entry.path().join("fd")) else {
+            continue;
+        };
+        for fd in fds.filter_map(Result::ok) {
+            if let Some(inode) = std::fs::read_link(fd.path()).ok().and_then(|link| {
+                link.to_str()?
+                    .strip_prefix("socket:[")?
+                    .strip_suffix(']')
+                    .map(str::to_owned)
+            }) {
+                owned.insert(inode);
+            }
+        }
+    }
+    let mut found = std::collections::BTreeSet::new();
+    for table in ["tcp", "tcp6", "udp", "udp6"] {
+        let text = std::fs::read_to_string(format!("/proc/net/{table}")).unwrap_or_default();
+        for row in text.lines().skip(1) {
+            let fields: Vec<&str> = row.split_whitespace().collect();
+            let (Some(state), Some(row_uid), Some(inode)) =
+                (fields.get(3), fields.get(7), fields.get(9))
+            else {
+                continue;
+            };
+            let listens = table.starts_with("udp") || *state == "0A";
+            if listens && row_uid.parse::<u32>().ok() == Some(uid) && !owned.contains(*inode) {
+                found.insert(format!("{table} {}", fields[1]));
+            }
+        }
+    }
+    found
+}
+
+/// 99.1 #3 (codemap Q6, Q10) and #7: a gate host serving its room, the
+/// outside system's sync request with `deadline_ms: 3000` gets one `answer`
+/// referencing it when the model answers in 500 ms; when the model takes
+/// 10 s it gets its `ticket` 3 000 ± 300 ms after the request by the
+/// homeserver's timestamps, and later the work's `result` against that
+/// ticket. Meanwhile the host listens on nothing.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "live: Synapse on delectra"]
+async fn gate_sync_answers_or_tickets_at_the_deadline() {
+    let smoke = Smoke::from_env();
+    let root = tempfile::tempdir().expect("tempdir");
+    let gate = smoke.user("nixi-smoke");
+    let stub = common::calls_paced(
+        vec![
+            (
+                1,
+                "reply",
+                json!({"text": "the build is green"}),
+                Duration::from_millis(500),
+            ),
+            (
+                3,
+                "reply",
+                json!({"text": "the long report"}),
+                Duration::from_secs(10),
+            ),
+        ],
+        "ok",
+    );
+    let agentd = gate_host(&smoke, root.path(), Some(&stub.url)).await;
+    agentd.ok(&["agents", "gate", "forge", "github"]);
+    let (_, _, session) = agentd.session_of("github");
+    let room = session.room.clone();
+    let log = root.path().join("agentd.log");
+    let before = unowned_listeners();
+    let _host = agentd.start(&log);
+    agentd.wait_serving(&room, &log).await;
+
+    let peer = smoke
+        .client(
+            &root.path().join("peer"),
+            "nixi-paced",
+            smoke.secret("NIXI_PACED_PASSWORD"),
+        )
+        .await;
+    let seen = common::record(&peer);
+    peer.join(&room).await.expect("the peer joins");
+    peer.sync_once().await.expect("sync");
+    let _sync = common::syncing(&peer);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let ask = |request: &str| json!({"msgtype": "m.text", "body": format!("{request}: how is the build?"), (events::GATE): {"request": request, "deadline_ms": 3000}});
+    let r1 = peer
+        .send(&room, "m.room.message", ask("r1"), None)
+        .await
+        .expect("r1");
+    let (answer, _) = gate_says(&seen, &gate, "r1", "answer", Duration::from_secs(30)).await;
+    assert_eq!(answer["body"], "the build is green");
+    assert_eq!(answer[events::GATE]["deadline_ms"], 3000);
+    assert_eq!(answer["m.relates_to"]["event_id"], r1.as_str());
+    assert_eq!(answer["m.relates_to"]["rel_type"], "m.reference");
+
+    let r2 = peer
+        .send(&room, "m.room.message", ask("r2"), None)
+        .await
+        .expect("r2");
+    let (ticket, ticket_at) =
+        gate_says(&seen, &gate, "r2", "ticket", Duration::from_secs(30)).await;
+    let asked_at = server_time(&seen, r2.as_str());
+    let late = ticket_at.saturating_sub(asked_at);
+    eprintln!("the ticket came {late} ms after the request by the server's clock");
+    assert!(
+        (2_700..=3_300).contains(&late),
+        "the ticket came {late} ms after the request by the server's clock"
+    );
+    assert_eq!(ticket["m.relates_to"]["event_id"], r2.as_str());
+    let listening: Vec<String> = unowned_listeners().difference(&before).cloned().collect();
+    assert!(listening.is_empty(), "the gate host listens: {listening:?}");
+
+    let (result, _) = gate_says(&seen, &gate, "r2", "result", Duration::from_secs(60)).await;
+    assert_eq!(
+        result[events::GATE]["ticket"],
+        ticket[events::GATE]["ticket"]
+    );
+    assert_eq!(result["body"], "the long report");
+    assert!(
+        seen.lock().expect("lock").iter().all(|(_, event)| {
+            event["sender"] != gate.as_str()
+                || event["content"][events::GATE]["request"] != "r1"
+                || event["content"][events::GATE]["state"] == "answer"
+        }),
+        "r1 was answered once and nothing else was said of it"
+    );
 }

@@ -548,6 +548,7 @@ claims — is a log line, and the `.keeper/` index projects the current value (A
 | `surface` | `{id, tool, device, outcome?}` |
 | `told` | `{person, room}` — a narrowed session's detail sent to its person through their proxy's own client, into the proxy DM `room` (ruling R169); written once, after the send succeeded |
 | `heard` | `{assistant: <line id>, heard_until: <char offset>, sentence: <n>, reason: "barge_in" \| "stop"}` (AD-411) |
+| `gate` | `{request, state: "request" \| "answer" \| "ticket" \| "result" \| "refused", ticket?, deadline_ms?, server_ts, reason?: "busy" \| "mode" \| "no_answer" \| "interrupted", text?}` — one step of an outside system's request in a gate session (AD-415; codemap Q13, ruling R368); a `request` line carries the request's event and text and starts the turn's conversation over (one request per turn, R369); both hourly allowances and the open tickets are rebuilt from these lines' `server_ts` |
 | `memory` | `{op: "journal" \| "proposal", ref: <path>}` |
 | `compact` | `{summary, replaces_through: <line id>}` — a context compaction; replay substitutes it for the lines it replaces |
 | `error` | `{sentence, code}` |
@@ -1380,6 +1381,13 @@ notification-extension budget for the anchor's latest edit before showing the te
 > Coordinator note (rulings R24(4), R28 S-23): the gate's configuration is `[[gate]]` in
 > `agent.toml`, and a per-system token bucket keeps an outside peer from flooding a person with
 > approval cards.
+>
+> As built (rung `agents-99-sync`, rulings R368, R369): the peer is at power 0 (R366); the
+> request and answer content is `dev.keeper.agent.gate` — `{request?, deadline_ms?}` in, `{v,
+> request, state, ticket?, deadline_ms?, reason?}` out, each answer an `m.text` with an
+> `m.reference` to its request; the deadline is kept by the host where the request arrives, on the
+> homeserver's clock, and a late `reply` is the ticket's `result`; a gate session runs on
+> always-on hosts only; MCP polling is not built (codemap Q15).
 
 ### AD-416 — Whatever enters through a gate is untrusted, and nothing consequential happens on it without a trusted decision
 - **Binds:** FR-822; Epic 99 (99.2)

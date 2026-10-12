@@ -303,6 +303,23 @@ pub struct SessionContext {
     /// The session's anchored answers, followed as replay follows them: a
     /// `heard` line cuts the answer it marks here as there (AD-411).
     answers: Answers,
+    /// A gate session's allowances and open tickets, from its `gate` lines
+    /// (99.1 #6, #9); `None` in every other session, and in a gate whose
+    /// `[[gate]]` its home no longer has.
+    pub gate_ledger: Option<keeper_core::agents::gate::Ledger>,
+    /// A gate session's requests taken and not yet answered, given their
+    /// result or refused, by name (C6): what a restart refuses.
+    pub gate_pending: BTreeMap<String, GateOpen>,
+    /// The last `gate` line's request and state.
+    pub gate_last: Option<(String, keeper_core::agents::log::GateState)>,
+}
+
+/// A gate's request not yet closed, as its lines say it (C6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GateOpen {
+    /// The request's own event.
+    pub event: Option<OwnedEventId>,
+    pub ticket: Option<String>,
 }
 
 impl SessionContext {
@@ -328,6 +345,18 @@ impl SessionContext {
             return Err(ReplayRefusal::Conflicted.into());
         }
         let frozen = Frozen::read(home)?;
+        let gate_ledger = agent.gate.as_ref().and_then(|gate| {
+            home.config
+                .gates
+                .iter()
+                .find(|config| config.system == gate.system)
+                .map(|config| {
+                    keeper_core::agents::gate::Ledger::new(
+                        config,
+                        home.config.limits.max_concurrent_sessions,
+                    )
+                })
+        });
         let mut context = SessionContext {
             session,
             label: agent.label.clone(),
@@ -381,6 +410,9 @@ impl SessionContext {
             paseo_heard: HashSet::new(),
             paseo_cursor: HashMap::new(),
             answers: Answers::default(),
+            gate_ledger,
+            gate_pending: BTreeMap::new(),
+            gate_last: None,
         };
         for stored in &log.lines {
             match &stored.body {
@@ -455,6 +487,15 @@ impl SessionContext {
                 if line.parent.is_none() || line.parent != self.last_result {
                     self.turn_tokens_at = self.tokens_spent;
                 }
+            }
+            // A gate's turn reads its one request (codemap Q5): the request
+            // starts the conversation over, as replay starts it over.
+            _ if keeper_core::agents::log::replay::starts_over(line) => {
+                self.messages.clear();
+                self.placed.clear();
+                self.unanswered = Some(line.id);
+                self.cut_off = false;
+                self.turn_tokens_at = self.tokens_spent;
             }
             LineBody::ToolResult(_) => self.last_result = Some(line.id),
             // A round that called tools is the middle of a turn (C6): a crash
@@ -621,6 +662,38 @@ impl SessionContext {
                 }
             }
             LineBody::Assistant(_) => self.tokens_spent += tokens_of(line),
+            LineBody::Gate(gate) => {
+                if let Some(ledger) = &mut self.gate_ledger {
+                    ledger.observe(gate);
+                }
+                use keeper_core::agents::log::GateState;
+                self.gate_last = Some((gate.request.clone(), gate.state));
+                match gate.state {
+                    GateState::Request => {
+                        self.gate_pending.insert(
+                            gate.request.clone(),
+                            GateOpen {
+                                event: line.matrix_event.clone(),
+                                ticket: None,
+                            },
+                        );
+                    }
+                    GateState::Ticket => {
+                        if let Some(open) = self.gate_pending.get_mut(&gate.request) {
+                            open.ticket = gate.ticket.clone();
+                        }
+                    }
+                    GateState::Answer | GateState::Result | GateState::Refused => {
+                        // A request refused as it was taken had no turn:
+                        // nothing waits for an answer.
+                        if self.gate_pending.remove(&gate.request).is_some()
+                            && gate.state == GateState::Refused
+                        {
+                            self.unanswered = None;
+                        }
+                    }
+                }
+            }
             LineBody::ToolCall(call) if call.tool == delegate::DELEGATE => {
                 self.delegate_calls.insert(line.id, call.args.clone());
             }
@@ -936,6 +1009,10 @@ impl SessionContext {
         context: Option<&ContextBundle>,
         tools: &[chat::ToolSpec],
     ) -> ComposedPrompt {
+        // A gate is told its soul and its frame only (codemap Q16).
+        if self.agent.kind == SessionKind::Gate {
+            return prompt::compose_gate(&self.soul, &self.facts, &self.frame(deps, tools));
+        }
         prompt::compose(&PromptInput {
             soul: &self.soul,
             facts: &self.facts,
@@ -1111,6 +1188,9 @@ pub struct AgentDeps {
     /// `kvm_act` for the classic NanoKVMs its `[host].needs` names as
     /// `kvm:<id>`; a NanoKVM-Go is reached through `mcp`.
     pub kvm: Option<Arc<crate::kvm::Kvms>>,
+    /// The tickets this agent's gate sessions hold open on this host, one
+    /// count for all of its `[[gate]]`s (99.1 #6).
+    pub gate_tickets: Arc<crate::gate::OpenTickets>,
 }
 
 impl AgentDeps {
@@ -1185,6 +1265,10 @@ struct AllowedTools<'t> {
     nobody_to_ask: bool,
     /// `helper`: the round's helpers run side by side (R110).
     helpers: crate::helper::Helpers<'t>,
+    /// A gate turn's offer, by wire name: its dispatch mirrors it, so a
+    /// name the turn was not offered is refused [`NOT_OFFERED`] unrun,
+    /// whatever `[tools].allow` says (R369); `None` outside a gate.
+    only_offered: Option<Vec<String>>,
 }
 
 /// A consumed approval as the one execution of its call holds it: the
@@ -3328,6 +3412,9 @@ fn write_effect(call: &ToolCall) -> String {
 /// round's calls each get their result, none its effect (R202).
 pub const RUN_ENDED: &str =
     "This workflow's run has replied: it ends here, and this call had no effect.";
+/// What a gate turn's call of a tool it was not offered is told (R369).
+pub const NOT_OFFERED: &str =
+    "That tool was not offered in this turn: a gate answers its outside system with reply alone. Nothing was done.";
 
 impl ToolHost for AllowedTools<'_> {
     fn run(&self, call: &ToolCall) -> Result<ToolOutcome, BotsError> {
@@ -3417,6 +3504,14 @@ impl ToolHost for AllowedTools<'_> {
 }
 
 impl AllowedTools<'_> {
+    /// Whether this turn may dispatch `name`: anything outside a gate, in a
+    /// gate only what its turn was offered (R369).
+    fn was_offered(&self, name: &str) -> bool {
+        self.only_offered
+            .as_ref()
+            .is_none_or(|offered| offered.iter().any(|spec| spec == name))
+    }
+
     /// A `drive_search` call, the session's own or a helper's, made by
     /// what has read `label`: a read of the drives in scope, each as a
     /// `drive_read` of its root is granted; what it returns is labelled file
@@ -3457,6 +3552,12 @@ impl AllowedTools<'_> {
         // calls never reach `run` (R202).
         if self.view.ended() {
             return Some(refusal(RUN_ENDED.to_owned()));
+        }
+        // A gate's dispatch mirrors its offer (R369): a name its turn was
+        // not offered is refused here, ahead of every other host — a drive
+        // verb's too, since `run_call` asks this before `run`.
+        if !self.was_offered(&wire.name) {
+            return Some(refusal(NOT_OFFERED.to_owned()));
         }
         let args = wire.arguments.as_ref().unwrap_or(&Value::Null);
         if wire.name == helper::HELPER {
@@ -3623,7 +3724,7 @@ impl AllowedTools<'_> {
             .lifting(self, &wire.id);
             let outcome = if !self.allow.contains(&wire.name) {
                 refusal(format!("{} is not one of this agent's tools.", wire.name))
-            } else if let Some(reason) = self.memory.refusal(&wire.name) {
+            } else if let Some(reason) = self.memory.refusal() {
                 refusal(reason.to_owned())
             } else {
                 let label = self.view.label();
@@ -3828,6 +3929,8 @@ struct TurnTools {
     gate: Arc<RoomGate>,
     /// The scheduled card whose run the turn is: an ask names it.
     scheduled: Option<String>,
+    /// A gate's turn: the request it answers (codemap Q6).
+    desk: Option<crate::gate::Serving>,
 }
 
 /// One served session: its context and its writer.
@@ -3878,6 +3981,9 @@ pub struct ServedSession {
     /// Asks whose refusal is on its way to the run as an
     /// [`Arrival::Unasked`]: never sent meanwhile (R199).
     refusing: std::collections::BTreeSet<String>,
+    /// A gate session's desk (99.1): opened by the runtime with the
+    /// homeserver's clock, or by the first request served.
+    pub gate_desk: Option<Arc<crate::gate::Desk>>,
 }
 
 /// What a session's worker tells its host while it holds the claim.
@@ -4028,8 +4134,15 @@ pub struct Arrived {
     /// The device that sent it, as its encryption names it: whose trust a
     /// decision is judged on (93.3).
     pub device: Option<matrix_sdk::ruma::OwnedDeviceId>,
+    /// The homeserver's time of the event, ms: what a gate's deadline and
+    /// its allowances are kept by (99.1 #3, #9). `None` for what the host
+    /// made itself.
+    pub origin_server_ts: Option<u64>,
 }
 
+/// A gate session whose home has no `[[gate]]` for its system any more.
+pub const NO_GATE: &str =
+    "this gate's [[gate]] is gone from its agent.toml, so it takes no request";
 /// A brief whose delegation is not this session's.
 pub const NOT_THIS_DELEGATION: &str = "a brief for another delegation is not a turn here";
 /// A join or a reply no delegation of this session waits for.
@@ -4082,6 +4195,7 @@ pub fn unasked_arrival(agent: &UserId, open: &OpenAsk, reason: &str) -> Option<A
         replay: false,
         via: None,
         device: None,
+        origin_server_ts: None,
     })
 }
 
@@ -4119,6 +4233,7 @@ pub fn reply_of(
         replay: false,
         via: Some(room.to_owned()),
         device: None,
+        origin_server_ts: None,
     })
 }
 
@@ -4167,6 +4282,7 @@ pub fn scheduled_arrival(agent: &UserId, scheduled: &Scheduled) -> Option<Arrive
         replay: false,
         via: None,
         device: None,
+        origin_server_ts: None,
     })
 }
 
@@ -4212,6 +4328,7 @@ pub fn harvest_arrival(agent: &UserId, closed: &crate::stewards::Closed) -> Opti
         replay: false,
         via: None,
         device: None,
+        origin_server_ts: None,
     })
 }
 
@@ -4299,6 +4416,7 @@ pub fn workflow_arrival(agent: &UserId, run: &Ulid, step: WorkflowStep) -> Optio
         replay: false,
         via: None,
         device: None,
+        origin_server_ts: None,
     })
 }
 
@@ -4336,6 +4454,11 @@ pub enum Outcome {
     /// Where the person stopped listening to an answer: a `heard` line,
     /// at the offset counted here.
     Heard { heard_until: u64 },
+    /// A gate's request, served: where it stands now (99.1).
+    Gated {
+        request: String,
+        state: keeper_core::agents::log::GateState,
+    },
 }
 
 /// How a turn ended.
@@ -4514,6 +4637,7 @@ impl ServedSession {
             settling: BTreeMap::new(),
             scheduled_card: None,
             refusing: std::collections::BTreeSet::new(),
+            gate_desk: None,
         })
     }
 
@@ -4540,6 +4664,13 @@ impl ServedSession {
         if !self.context.parked.is_empty() {
             return Ok(false);
         }
+        // A gate runs one request's turn at a time, so at a worker's start
+        // every request still open was cut off by the stop (C6): each is
+        // refused in its room — its outside system is never left waiting,
+        // and its ticket stops counting against the gate's sessions.
+        if self.context.agent.kind == SessionKind::Gate {
+            return self.recover_gate(deps, &port).await;
+        }
         let Some(user_line) = self.context.unanswered else {
             return Ok(false);
         };
@@ -4564,6 +4695,48 @@ impl ServedSession {
             self.send_status(deps, &port, RunState::Idle, None).await;
         }
         Ok(true)
+    }
+
+    /// [`Self::recover`] in a gate session: the cut-off turn's `error`
+    /// line, then each open request refused `interrupted`, its line under
+    /// that one. Nothing of the turn reaches the room: it streamed nothing.
+    async fn recover_gate(
+        &mut self,
+        deps: &AgentDeps,
+        port: &Arc<dyn EditPort>,
+    ) -> Result<bool, ServeError> {
+        let mut parent = None;
+        if let Some(user_line) = self.context.unanswered {
+            let closed = self.writer.write(
+                &mut self.context,
+                Some(user_line),
+                None,
+                LineBody::Error(ErrorBody {
+                    sentence: cut_off_sentence(deps.host.as_str()),
+                    code: INTERRUPTED.to_owned(),
+                }),
+            )?;
+            parent = Some(closed.id);
+        }
+        let pending = std::mem::take(&mut self.context.gate_pending);
+        let recovered = parent.is_some() || !pending.is_empty();
+        if let Some(desk) = self.desk(deps, port).filter(|_| !pending.is_empty()) {
+            for (request, open) in pending {
+                let Some(event) = &open.event else { continue };
+                let (line, said) = desk
+                    .refuse(
+                        &request,
+                        event,
+                        open.ticket.clone(),
+                        keeper_core::agents::log::GateReason::Interrupted,
+                    )
+                    .await;
+                self.writer
+                    .write(&mut self.context, parent, said, LineBody::Gate(line))?;
+            }
+        }
+        off_the_runtime(|| self.writer.sync())?;
+        Ok(recovered)
     }
 
     /// The status every edit of this session's status anchor carries; a
@@ -4737,6 +4910,324 @@ impl ServedSession {
         self.waiting() || self.context.asks.values().any(|open| open.card.is_some())
     }
 
+    /// What another copy of this agent already answered in the room
+    /// (`answered_by`): a harvest or workflow step counts as begun (R202),
+    /// and a gate's request it answered, gave its result or refused is
+    /// open here no more, so a takeover neither serves it again nor
+    /// refuses it `interrupted` (R368, review R99S-03).
+    pub fn answered_elsewhere(&mut self, answered: &std::collections::HashSet<String>) {
+        self.context.started(answered.iter().map(String::as_str));
+        let done: Vec<String> = self
+            .context
+            .gate_pending
+            .iter()
+            .filter(|(_, open)| {
+                open.event
+                    .as_ref()
+                    .is_some_and(|event| answered.contains(event.as_str()))
+            })
+            .map(|(request, _)| request.clone())
+            .collect();
+        for request in done {
+            self.context.gate_pending.remove(&request);
+            if let Some(ledger) = &mut self.context.gate_ledger {
+                ledger.close(&request);
+            }
+            if let Some(desk) = &self.gate_desk {
+                desk.close(&request);
+            }
+        }
+    }
+
+    /// This gate session's desk: the one the runtime opened, or one opened
+    /// now on this host's wall clock. `None` when the session is no gate or
+    /// its home has no `[[gate]]` for its system any more.
+    pub fn desk(
+        &mut self,
+        deps: &AgentDeps,
+        port: &Arc<dyn EditPort>,
+    ) -> Option<Arc<crate::gate::Desk>> {
+        if let Some(desk) = &self.gate_desk {
+            return Some(Arc::clone(desk));
+        }
+        let desk = self.open_desk(
+            deps,
+            Arc::clone(port),
+            Arc::new(crate::claims::ServerClock::default()),
+            Arc::new(|| true),
+            None,
+        )?;
+        self.gate_desk = Some(Arc::clone(&desk));
+        Some(desk)
+    }
+
+    /// Open this gate session's desk over its lines' ledger (99.1): the
+    /// limits are its `[[gate]]`'s now, the outside system the one its room
+    /// was made for.
+    pub fn open_desk(
+        &self,
+        deps: &AgentDeps,
+        port: Arc<dyn EditPort>,
+        clock: Arc<crate::claims::ServerClock>,
+        may_post: Arc<dyn Fn() -> bool + Send + Sync>,
+        known: Option<Arc<rooms::Known>>,
+    ) -> Option<Arc<crate::gate::Desk>> {
+        let gate = self.context.agent.gate.as_ref()?;
+        let ledger = self.context.gate_ledger.clone()?;
+        let mut config = deps
+            .home
+            .config
+            .gates
+            .iter()
+            .find(|config| config.system == gate.system)?
+            .clone();
+        config.peer = gate.peer.clone();
+        Some(crate::gate::Desk::open(
+            crate::gate::DeskSetup {
+                gate: config,
+                clear: !gate.encrypted,
+                me: deps.home.config.matrix_user.clone(),
+                label: self.context.agent.label.clone(),
+                port,
+                clock,
+                known,
+                may_post,
+                session: self.context.session.path.clone(),
+                tickets: Arc::clone(&deps.gate_tickets),
+            },
+            ledger,
+        ))
+    }
+
+    /// Write what the desk said by itself — a ticket or a refusal at a
+    /// deadline — as its `gate` lines.
+    fn write_gate_facts(&mut self, desk: &crate::gate::Desk) -> Result<(), ServeError> {
+        let facts = desk.drain();
+        if facts.is_empty() {
+            return Ok(());
+        }
+        for fact in facts {
+            self.writer.write(
+                &mut self.context,
+                None,
+                fact.event,
+                LineBody::Gate(fact.line),
+            )?;
+        }
+        off_the_runtime(|| self.writer.sync())?;
+        Ok(())
+    }
+
+    /// A gate's request (99.1 #2, #3, #6, #9; 99.2 #1): taken by its desk
+    /// — where the front took it already, the same — then logged: refused
+    /// with no turn, or its `request` line (and, async, its ticket) and a
+    /// turn that reads that request only, under the gate's opening label,
+    /// which answers it with `reply`. A turn that ends without one refuses
+    /// it `no_answer`.
+    async fn gate_request(
+        &mut self,
+        deps: &AgentDeps,
+        port: Arc<dyn EditPort>,
+        arrived: Arrived,
+        stop: CancelSignal,
+    ) -> Result<Outcome, ServeError> {
+        use crate::gate::{refused_line, ticket_line, Took};
+        use keeper_core::agents::log::GateState;
+        let Some(desk) = self.desk(deps, &port) else {
+            tracing::warn!(session = %self.context.session.path, "agents: a gate session whose [[gate]] its home no longer has takes no request");
+            return Ok(Outcome::Ignored(NO_GATE));
+        };
+        self.write_gate_facts(&desk)?;
+        let Some(taken) = desk.take(&arrived) else {
+            return Ok(Outcome::Ignored(rooms::ONLY_REQUESTS));
+        };
+        let name = taken.request.request.clone();
+        let event = Some(arrived.event_id.clone());
+        if let Took::Refused {
+            reason,
+            requested: false,
+            at,
+        } = taken.took
+        {
+            self.writer.write(
+                &mut self.context,
+                None,
+                event,
+                LineBody::Gate(refused_line(&name, None, reason, at)),
+            )?;
+            off_the_runtime(|| self.writer.sync())?;
+            return Ok(Outcome::Gated {
+                request: name,
+                state: GateState::Refused,
+            });
+        }
+        // Each request starts at the gate's opening label (codemap Q5):
+        // what an earlier one read never reaches this one's answer, and the
+        // integrity stays `untrusted` (AD-416).
+        let opening = self.context.agent.label.clone();
+        if self.context.label != opening {
+            self.writer.write(
+                &mut self.context,
+                None,
+                None,
+                LineBody::Label(LabelBody::new(
+                    &opening,
+                    LabelCause {
+                        kind: LabelCauseKind::Outside,
+                        reference: arrived.event_id.to_string(),
+                    },
+                )),
+            )?;
+        }
+        let opened = self.writer.write(
+            &mut self.context,
+            None,
+            event,
+            LineBody::Gate(taken.request.line()),
+        )?;
+        match &taken.took {
+            Took::Ticketed { ticket, at } => {
+                // Written once its message's send ended: with that event,
+                // or with none when nothing was said (review R99S-06).
+                let said = desk.ticketed(&name).await;
+                self.writer.write(
+                    &mut self.context,
+                    Some(opened.id),
+                    said,
+                    LineBody::Gate(ticket_line(&name, ticket, None, *at)),
+                )?;
+            }
+            Took::Refused { reason, at, .. } => {
+                self.writer.write(
+                    &mut self.context,
+                    Some(opened.id),
+                    None,
+                    LineBody::Gate(refused_line(&name, None, *reason, *at)),
+                )?;
+                off_the_runtime(|| self.writer.sync())?;
+                return Ok(Outcome::Gated {
+                    request: name,
+                    state: GateState::Refused,
+                });
+            }
+            Took::Turn => {}
+        }
+        off_the_runtime(|| self.writer.sync())?;
+        let serving = crate::gate::Serving {
+            desk: Arc::clone(&desk),
+            request: name.clone(),
+        };
+        let state = self.gate_turn(deps, port, opened.id, serving, stop).await?;
+        self.write_gate_facts(&desk)?;
+        Ok(Outcome::Gated {
+            request: name,
+            state,
+        })
+    }
+
+    /// A gate's turn on one request (codemap Q6): no anchor, no stream and
+    /// no status in its room — the only thing that leaves is what `reply`
+    /// sends — its prose and every call logged. Where its request stands
+    /// after it.
+    async fn gate_turn(
+        &mut self,
+        deps: &AgentDeps,
+        port: Arc<dyn EditPort>,
+        opened: Ulid,
+        serving: crate::gate::Serving,
+        stop: CancelSignal,
+    ) -> Result<keeper_core::agents::log::GateState, ServeError> {
+        use keeper_core::agents::log::GateState;
+        let sinks = self.sinks(deps);
+        let gate = self.gate(deps, &port);
+        let tools = TurnTools {
+            surface: self.surface.clone(),
+            delegations: self.delegations.clone(),
+            room: Arc::clone(&port),
+            from: self.delegator(deps),
+            sinks,
+            gate,
+            scheduled: None,
+            desk: Some(serving.clone()),
+        };
+        let ran = run_agent_turn(
+            &mut self.context,
+            &mut self.writer,
+            deps,
+            None,
+            None,
+            stop,
+            tools,
+            None,
+            None,
+        )
+        .await;
+        let parent = ran.parent.or(Some(opened));
+        let said = if ran.round_logged {
+            String::new()
+        } else {
+            ran.round_text.clone()
+        };
+        let closing = match ran.ending {
+            TurnEnding::Complete | TurnEnding::Stopped | TurnEnding::Asked => {
+                let outcome = ran.outcome.as_ref();
+                let usage = outcome.and_then(|o| o.usage.as_ref());
+                LineBody::Assistant(AssistantBody {
+                    text: if ran.ending == TurnEnding::Stopped {
+                        format!("{said}{}", shutdown_suffix(deps.host.as_str()))
+                    } else {
+                        said
+                    },
+                    model: outcome
+                        .and_then(|o| o.model.clone())
+                        .unwrap_or_else(|| deps.bot.target.clone()),
+                    finish: outcome
+                        .map_or_else(|| "stop".to_owned(), |o| finish_word(&o.finish_reason)),
+                    usage: Usage {
+                        prompt: usage.and_then(|u| u.prompt_tokens),
+                        completion: usage.and_then(|u| u.completion_tokens),
+                    },
+                    ttft_ms: outcome.and_then(|o| o.first_token_ms),
+                    duration_ms: outcome.map_or(0, |o| o.total_ms),
+                    anchor_event: None,
+                })
+            }
+            _ => {
+                let (sentence, code) = match (ran.ending, ran.bound) {
+                    (TurnEnding::LocalOnly, _) => (LOCAL_ONLY_REFUSAL.to_owned(), "local_only"),
+                    (TurnEnding::Bounded, Some(bound)) => (bound.sentence(), bound.word()),
+                    (TurnEnding::Spent, _) => (helper::TURN_SPENT.to_owned(), "turn_tokens"),
+                    _ => (
+                        ran.error.clone().unwrap_or_else(|| TURN_FAILED.to_owned()),
+                        "turn_failed",
+                    ),
+                };
+                LineBody::Error(ErrorBody {
+                    sentence,
+                    code: code.to_owned(),
+                })
+            }
+        };
+        let closed = self
+            .writer
+            .write(&mut self.context, parent, None, closing)?;
+        for fact in serving.desk.finish(&serving.request).await {
+            self.writer.write(
+                &mut self.context,
+                Some(closed.id),
+                fact.event,
+                LineBody::Gate(fact.line),
+            )?;
+        }
+        off_the_runtime(|| self.writer.sync())?;
+        Ok(self
+            .context
+            .gate_last
+            .as_ref()
+            .filter(|(request, _)| *request == serving.request)
+            .map_or(GateState::Request, |(_, state)| *state))
+    }
+
     /// Serve one arrival: ignore it, log a decision, or run a turn.
     pub async fn serve(
         &mut self,
@@ -4757,6 +5248,12 @@ impl ServedSession {
                 agent_user: &config.matrix_user,
                 requester: &self.context.agent.requested_by,
                 readers: &self.context.label.readers,
+                peer: self
+                    .context
+                    .agent
+                    .gate
+                    .as_ref()
+                    .map(|gate| gate.peer.as_ref()),
             },
             &arrived.sender,
             arrived.arrival,
@@ -4766,6 +5263,9 @@ impl ServedSession {
                 tracing::info!(session = %self.context.session.path, sender = %arrived.sender, note, "agents: an observer's event is not a turn");
                 Ok(Outcome::Ignored(note))
             }
+            // A gate never waits for a person (codemap Q4): its outside
+            // system's request is taken whatever else is under way.
+            Disposition::GateRequest => self.gate_request(deps, port, arrived, stop).await,
             // A workflow's run that replied, or failed, takes no more turns
             // (R202): what would start one is left as it is.
             Disposition::Turn | Disposition::Unasked if self.run_ended() => {
@@ -7405,6 +7905,7 @@ impl ServedSession {
             sinks: sinks.clone(),
             gate: Arc::clone(&gate),
             scheduled: self.scheduled_card.clone(),
+            desk: None,
         };
         let ran = run_agent_turn(
             &mut self.context,
@@ -7748,6 +8249,7 @@ impl ServedSession {
             sinks,
             gate: self.gate(deps, port),
             scheduled: None,
+            desk: None,
         };
         let ran = run_agent_turn(
             &mut self.context,
@@ -8318,7 +8820,9 @@ fn grant_read(grants: &dyn GrantSource, drive: &str, at: &str) -> Result<(), Str
 /// (`relays_waiting`) — the relay of that answer (R100).
 fn reply_offer(session: SessionKind, relays_waiting: bool, kind: AgentKind) -> ReplyOffer {
     let own = matches!(session, SessionKind::Main | SessionKind::Conversation);
-    if matches!(session, SessionKind::Delegated | SessionKind::Workflow) {
+    if session == SessionKind::Gate {
+        ReplyOffer::Gate
+    } else if matches!(session, SessionKind::Delegated | SessionKind::Workflow) {
         ReplyOffer::Delegated
     } else if kind == AgentKind::Proxy && own && relays_waiting {
         ReplyOffer::Relay
@@ -8357,6 +8861,13 @@ fn agent_offer(
     // the same offer, and a model that cannot call tools is told of none.
     if tools.is_empty() {
         return tools;
+    }
+    // A gate's tools are a ceiling (codemap Q1): in this build its turn is
+    // offered its answer alone — `delegate`, `journal_append` and its MCP
+    // servers come with the rules that make them safe there (R369); its
+    // dispatch refuses anything else ([`NOT_OFFERED`]).
+    if session == SessionKind::Gate {
+        return delegate::specs(false, ReplyOffer::Gate);
     }
     tools.retain(|spec| config.allow.contains(&spec.name));
     tools.extend(crate::surface::specs(&crate::surface::offered(config)));
@@ -8731,6 +9242,7 @@ async fn run_agent_turn(
         context.agent.workflow.clone(),
         context.skills.clone(),
     );
+    let in_gate = context.agent.kind == SessionKind::Gate;
     let reply = match review {
         Some(_) => ReplyOffer::None,
         None => reply_offer(context.agent.kind, !context.relays.is_empty(), config.kind),
@@ -8895,7 +9407,7 @@ async fn run_agent_turn(
             root: deps.drive_root.clone(),
             zone: agents_zone,
             roots: workflow_roots,
-            offered: offered_names,
+            offered: offered_names.clone(),
             run_offer: Box::new(move |drives: &[String]| {
                 workflow_offer(deps, &model_tools, drives)
             }),
@@ -8908,11 +9420,12 @@ async fn run_agent_turn(
             tools.delegations,
             tools.room,
             &log,
-            allow.iter().any(|name| name == delegate::DELEGATE),
+            allow.iter().any(|name| name == delegate::DELEGATE) && !in_gate,
             reply,
             &tools.sinks,
         )
-        .with_outputs(outputs),
+        .with_outputs(outputs)
+        .serving(tools.desk),
         memory,
         search,
         view: &log,
@@ -8937,13 +9450,15 @@ async fn run_agent_turn(
             helper_offer,
             stop.clone(),
         ),
+        only_offered: in_gate.then_some(offered_names),
         runs,
-        // A review pass reads and proposes: offered no MCP tool, it is given
-        // none to call either, so one it names anyway is refused unsent.
+        // A review pass reads and proposes, a gate turn answers (R369):
+        // offered no MCP tool, neither is given any to call either, so one
+        // it names anyway is refused unsent.
         mcp: deps
             .mcp
             .as_ref()
-            .filter(|_| !config.mcp.is_empty() && review.is_none())
+            .filter(|_| !config.mcp.is_empty() && review.is_none() && !in_gate)
             .map(|servers| McpTools {
                 servers: Arc::clone(servers),
                 names: config.mcp.clone(),
@@ -9671,15 +10186,24 @@ fn join_prompt_sources(
     armed: &mut crate::turn::Armed,
 ) -> Result<(), WriterError> {
     let home = &deps.home.drive;
-    let mut sources = vec![(
-        Label {
-            readers: Readers::Only(home.readers.clone()),
-            integrity: Integrity::Owner,
-            local_only: home.local_only,
-        },
-        format!("{}/{}", deps.home.config.drive, deps.home.config.id),
-        LabelCauseKind::DriveRead,
-    )];
+    // A gate's prompt carries its soul, which its audience was released,
+    // and no file of a drive (codemap Q16): nothing of them joins.
+    let gate = context.agent.kind == SessionKind::Gate;
+    if gate {
+        armed.context = None;
+    }
+    let mut sources = Vec::new();
+    if !gate {
+        sources.push((
+            Label {
+                readers: Readers::Only(home.readers.clone()),
+                integrity: Integrity::Owner,
+                local_only: home.local_only,
+            },
+            format!("{}/{}", deps.home.config.drive, deps.home.config.id),
+            LabelCauseKind::DriveRead,
+        ));
+    }
     if let Some(bundle) = armed.context.as_mut() {
         let profiles = &armed.profiles;
         bundle.files.retain(|file| {

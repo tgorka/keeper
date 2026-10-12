@@ -10378,7 +10378,8 @@ status: open
 origin: review-99room-1 (DW candidate; R367)
 location: `keeper_core::agents::events::power_levels(Gate, …)`, `keeper_core::agents::gate::room_levels`, `keeper_agent::runtime::classify`
 reason: every session room opens `dev.keeper.agent.approval.decision`, `dev.keeper.agent.heard` and `dev.keeper.agent.surface.result` at 0, so the peer can send them. Harmless at this rung (no surface tool is offered there, `classify` ignores `heard` outside proxy rooms, no approval record exists), but `classify` today reads a sealed decision from any reader of the label, and the peer is one. Rung `agents-99-sync`'s gate arm must answer a peer's decision `Ignored(UNTRUSTED_DECISION)` (codemap §1.1); `room_levels` could close `heard` and `surface.result` for gate rooms.
-status: open
+status: done 2026-10-12
+resolution: closed in rung `agents-99-sync` by the host, not by the levels: `rooms::classify`'s gate arm answers every event of the peer but a message `Ignored(ONLY_REQUESTS)` — a sealed decision, a scope, a heard mark, a conversation request, an agent event, an edit, a brief, an ask — whatever `reads` says (test `rooms::tests::in_a_gate_room_the_peer_only_asks`); and the copy's timeline handler drops every event of a served gate room's peer that is not an `m.room.message` before the surface-result path or any router sees it (`runtime::register_handlers`). The levels stay as rung 1 made them; closing `heard`/`surface.result` at 0 for gate rooms would change `events::power_levels` for one kind and is not needed while the host reads nothing else of the peer's.
 
 ### DW-1334: A clear gate room still accepts `m.room.encrypted` from the peer.
 
@@ -10399,4 +10400,53 @@ status: open
 origin: review-99room-1 (DW candidate; R367; beside DW-1330)
 location: `keeper_core::agents::gate::room_invitees`, `keeper-agentd run`
 reason: the peer-is-no-`[[trust]]`-person rule is checked by `agents gate` when the room is made; an operator who later pins the peer as a person or a proxy is not told by a running host, and the peer's decisions would then come from a pinned key. `agentd.toml` is the operator's; `run` or `status` could refuse or flag such a gate.
+status: open
+
+### DW-1340: A gate request taken but not yet logged when its host stops is taken again on restart.
+
+origin: epic 99, story 99.1 (rung `agents-99-sync`, 2026-10-12; R368)
+location: `keeper_agent::gate::Desk::take`, `keeper_agent::runtime::read_back`
+reason: the room's front takes a request — says its async ticket, or arms its deadline — before the worker writes its `request` line. A stop between the two leaves the event unseen by the log, so the next worker reads it back and takes it again: a second ticket (or refusal) message can reach the outside system, and the request pays a second request token at its old server time. A `ticket` the deadline timer said whose line was not written yet is lost the same way (the system then hears the request's `interrupted` or a second ticket). Writing the `request` line from the front, or reading the gate's own messages back from the room before taking a replayed request, would close it.
+status: open
+
+### DW-1341: A gate's own message the homeserver keeps refusing is given up.
+
+origin: epic 99, story 99.1 (rung `agents-99-sync`, 2026-10-12; R368)
+location: `keeper_agent::gate::Desk::send`
+reason: a ticket or refusal the desk says by itself is tried five times under one transaction (a 429 waited out, any other error after 500 ms), and its line is then written with no event; a reply the room's sink blocks, or one the homeserver refuses, is refused to the model and the request then ends `no_answer`. Nothing retries a lost ticket on the host's clock, and a refusal blocked by the sink (a member outside the audience joined) is not said at all. A retry queue on the worker's tick, like the briefs', would carry them.
+status: open
+
+### DW-1342: A gate's deadline is kept on an uncalibrated clock until the host's first claim read-back.
+
+origin: epic 99, story 99.1 (rung `agents-99-sync`, 2026-10-12; R368; codemap §5)
+location: `keeper_agent::claims::ServerClock`, `keeper_agent::gate::Desk`
+reason: the deadline timer waits `origin_server_ts + deadline_ms − ServerClock::now()`; until a claim's read-back has set the clock's offset, `now()` is this host's wall clock, so a host whose clock is off from the homeserver's tickets early or late by that much. A gate session's claim is acquired before its worker starts, which calibrates the clock in the usual case; a host that took no claim read-back yet (a takeover race) is not measured.
+status: open
+
+### DW-1343: A takeover tickets again a request the last holder ticketed and did not finish.
+
+origin: review-99sync-1 (R99S-03; R370)
+location: `keeper_agent::runtime::answered_by`, `keeper_agent::agent::ServedSession::answered_elsewhere`
+reason: a gate's `answer`, `result` or `refused` in the room now answers its request after a takeover, but its `ticket` answers nothing: a request the last holder ticketed — whose lines this copy's log does not hold yet — is read back and taken again, so the outside system hears a second ticket for it and its first is never given a result. Adopting the room's ticket (its id becomes the entry's, the ledger opens it, the turn's `reply` is its `result`) would close it; rung `agents-99-tickets` reads tickets back for its callbacks and is where it fits.
+status: open
+
+### DW-1344: An agent's open gate tickets are counted per host.
+
+origin: review-99sync-1 (R99S-05; R370)
+location: `keeper_agent::gate::OpenTickets`, `AgentDeps.gate_tickets`
+reason: `[limits].max_concurrent_sessions` now bounds the tickets open across all of an agent's gate sessions on one host, each counted from its ledger as its desk opens; an agent whose gate sessions are placed on two always-on hosts holds up to the limit on each, and a gate session not served on this host is not counted here. Counting from the drive's gate lines, or placing an agent's gates on one host, would make it one limit.
+status: open
+
+### DW-1345: The frame a gate's model is told can be asked for through `reply`.
+
+origin: review-99sync-1 (DW candidate; R370; beside DW-1335)
+location: `keeper_core::agents::prompt::compose_gate` (slot 5, the frame)
+reason: a gate's system message carries the frame — host slug, session path, drive id and title, the audience sentence and the time — and the peer can ask the model to repeat it, which `reply` then sends. The status anchor already names host and path to the outside system (DW-1335); whether a gate's frame drops them is the same decision.
+status: open
+
+### DW-1346: A gate whose model calls no tools is offered no `reply`.
+
+origin: review-99sync-1 (DW candidate; R370)
+location: `keeper_agent::agent::agent_offer`
+reason: a model that cannot call tools is told of none, and the gate arm comes after that return, so such a gate's every request ends `no_answer`. `agents gate` or the placement could refuse a gate whose model calls no tools, and `status` could say so.
 status: open

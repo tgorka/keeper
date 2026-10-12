@@ -58,13 +58,16 @@ pub fn serves(name: &str) -> bool {
     TOOLS.contains(&name)
 }
 
-/// What a `gate` session's call of a proposal tool is told: nothing a gate
-/// session learns becomes memory or a skill (AD-400, R29 F4).
-pub const GATE_REFUSAL: &str = "A gate session proposes no memory and no skill: what arrives from outside never becomes what an agent remembers. Nothing was written.";
+/// What a `gate` session's call of any of these tools is told: nothing a
+/// gate session learns becomes memory or a skill (AD-400, R29 F4), and in
+/// this rung its turn is offered `reply` alone, so not its journal either
+/// (codemap Q1; `journal_append` returns where its rung offers it).
+pub const GATE_REFUSAL: &str = "A gate session writes no journal and proposes no memory and no skill: what arrives from outside never becomes what an agent remembers. Nothing was written.";
 
-/// Whether a session of `kind` is offered `name` at all.
-fn offered_in(name: &str, kind: SessionKind) -> bool {
-    name == JOURNAL_APPEND || kind != SessionKind::Gate
+/// Whether a session of `kind` is offered these tools at all: a gate
+/// session none of them (R369).
+fn offered_in(kind: SessionKind) -> bool {
+    kind != SessionKind::Gate
 }
 
 /// The specs of this module's tools that `allow` names and a session of
@@ -73,7 +76,7 @@ fn offered_in(name: &str, kind: SessionKind) -> bool {
 pub fn specs(allow: &[String], kind: SessionKind, review: Option<Due>) -> Vec<ToolSpec> {
     let wanted = |name: &str| {
         allow.iter().any(|allowed| allowed == name)
-            && offered_in(name, kind)
+            && offered_in(kind)
             && match review {
                 None => true,
                 Some(due) => {
@@ -320,9 +323,9 @@ impl MemoryTools {
             .insert(name.to_owned(), sha256_hex(body.as_bytes()));
     }
 
-    /// Why a session like this one never runs `name`, when it does not.
-    pub fn refusal(&self, name: &str) -> Option<&'static str> {
-        (!offered_in(name, self.session.kind)).then_some(GATE_REFUSAL)
+    /// Why a session like this one never runs these tools, when it does not.
+    pub fn refusal(&self) -> Option<&'static str> {
+        (!offered_in(self.session.kind)).then_some(GATE_REFUSAL)
     }
 
     /// Run `wire`, admitted under the session's `label`; `may_write` is the
@@ -333,7 +336,7 @@ impl MemoryTools {
         label: &Label,
         may_write: &dyn Fn() -> bool,
     ) -> ToolOutcome {
-        if let Some(reason) = self.refusal(&wire.name) {
+        if let Some(reason) = self.refusal() {
             return refused(reason);
         }
         let args = wire.arguments.as_ref().unwrap_or(&Value::Null);
@@ -709,8 +712,8 @@ mod tests {
         );
     }
 
-    /// R29 F4: a gate session's call of either proposal tool is refused and
-    /// writes nothing, a journal entry is not.
+    /// R29 F4, R369: a gate session's call of any memory tool, its journal's
+    /// included, is refused and writes nothing.
     #[test]
     fn a_gate_session_proposes_nothing() {
         use keeper_core::agents::label::{Integrity, Readers};
@@ -748,6 +751,7 @@ mod tests {
                 json!({"target":"memory","op":"add","text":"from outside"}),
             ),
             call(SKILL_PROPOSE, json!({"name":"x","op":"archive"})),
+            call(JOURNAL_APPEND, json!({"text":"Ingested."})),
         ] {
             assert_eq!(
                 tools.run(&wire, &label, &|| true),
@@ -757,16 +761,12 @@ mod tests {
             );
         }
         assert!(!home.path().join(proposal::DIR).exists());
+        assert_eq!(
+            std::fs::read_dir(home.path()).expect("home").count(),
+            0,
+            "nothing was written into the home"
+        );
         assert!(tools.take_lines().is_empty());
-        let journal = tools.run(
-            &call(JOURNAL_APPEND, json!({"text":"Ingested."})),
-            &label,
-            &|| true,
-        );
-        assert!(
-            matches!(journal, ToolOutcome::Answered { .. }),
-            "{journal:?}"
-        );
     }
 
     fn tools_in(home: &Path) -> MemoryTools {

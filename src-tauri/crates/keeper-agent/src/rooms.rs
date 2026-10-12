@@ -458,6 +458,9 @@ pub enum Disposition {
     Harvest,
     /// A workflow's run goes on from its card or where it stopped.
     Workflow,
+    /// A gate's outside system asked something (99.1 #2): data for the
+    /// gate's turn, never a person's word.
+    GateRequest,
     /// Neither: not logged, not a turn. The sentence is the host's own note.
     Ignored(&'static str),
 }
@@ -473,6 +476,9 @@ pub struct Served<'a> {
     pub requester: &'a UserId,
     /// The session's readers (its label's).
     pub readers: &'a Readers,
+    /// A gate session's outside system: the only sender whose text is a
+    /// request there (99.1 #2); `None` in every other session.
+    pub peer: Option<&'a UserId>,
 }
 
 /// A person's text in a session that is not a proxy conversation.
@@ -506,6 +512,13 @@ pub const NOT_THE_REQUESTER: &str =
     "a brief is a turn only in a delegated session, from the agent that delegated it";
 /// An ask anywhere but a proxy's own rooms.
 pub const NOT_ASKED_HERE: &str = "an ask is taken only into a proxy's own rooms";
+/// Anything but a message from a gate's outside system: it asks, and does
+/// nothing else — no decision, scope, heard mark or agent event of its
+/// counts (AD-416).
+pub const ONLY_REQUESTS: &str =
+    "an outside system's event in its gate's room is a request or nothing";
+/// A message in a gate's room from anyone but its outside system.
+pub const NOT_THE_PEER: &str = "only the gate's outside system asks in its room";
 
 /// Whether `sender`'s arrival becomes a turn, a decision, a scope, a new
 /// conversation, or nothing (AD-380, R30). Text becomes a turn only in a
@@ -540,6 +553,20 @@ pub fn classify(served: &Served<'_>, sender: &UserId, arrival: Arrival) -> Dispo
     }
     if sender == served.agent_user {
         return Disposition::Ignored(OWN_EVENT);
+    }
+    // A gate's room (99.1 #2, AD-416): its outside system's messages are
+    // requests, and every other event of its is nothing, whatever the
+    // label's readers say — the peer reads the room, and must never decide,
+    // scope or mark what it reads. Anyone else's text there is not a turn;
+    // a person's decision goes the ordinary way.
+    if served.session_kind == SessionKind::Gate {
+        let from_peer = served.peer == Some(sender);
+        match arrival {
+            Arrival::Text if from_peer => return Disposition::GateRequest,
+            _ if from_peer || served.peer.is_none() => return Disposition::Ignored(ONLY_REQUESTS),
+            Arrival::Text => return Disposition::Ignored(NOT_THE_PEER),
+            _ => {}
+        }
     }
     let conversation = served.agent_kind == AgentKind::Proxy
         && matches!(
@@ -935,7 +962,62 @@ mod tests {
             agent_user: agent,
             requester: human.unwrap_or(agent),
             readers,
+            peer: None,
         }
+    }
+
+    /// 99.1 #2 and AD-416 (review R99R1, the peer at 0): in a gate's room
+    /// only its outside system's message is a request; everything else of
+    /// its — a sealed decision though it reads the label, a scope, a heard
+    /// mark, a request for a conversation, an agent event, an edit, a brief
+    /// — is nothing, and anyone else's text is no turn. A reader's own
+    /// decision still goes the ordinary way.
+    #[test]
+    fn in_a_gate_room_the_peer_only_asks() {
+        let forge = user("@forge:example.org");
+        let github = user("@github:example.org");
+        let tgorka = user(TGORKA);
+        let anyone = Readers::Anyone;
+        let gate = Served {
+            peer: Some(&github),
+            requester: &tgorka,
+            ..served(AgentKind::Gate, None, SessionKind::Gate, &forge, &anyone)
+        };
+        assert_eq!(
+            classify(&gate, &github, Arrival::Text),
+            Disposition::GateRequest
+        );
+        for arrival in [
+            Arrival::Decision { sealed: true },
+            Arrival::Scope { owner_signed: true },
+            Arrival::Heard { owner_signed: true },
+            Arrival::ConversationRequest { owner_signed: true },
+            Arrival::AgentEvent,
+            Arrival::Edit,
+            Arrival::Brief,
+            Arrival::Ask,
+            Arrival::Answer,
+        ] {
+            assert_eq!(
+                classify(&gate, &github, arrival),
+                Disposition::Ignored(ONLY_REQUESTS),
+                "{arrival:?}"
+            );
+        }
+        assert_eq!(
+            classify(&gate, &tgorka, Arrival::Text),
+            Disposition::Ignored(NOT_THE_PEER)
+        );
+        assert_eq!(
+            classify(&gate, &tgorka, Arrival::Decision { sealed: true }),
+            Disposition::Decision
+        );
+        // A gate session that names no peer takes nothing from anyone.
+        let unnamed = Served { peer: None, ..gate };
+        assert_eq!(
+            classify(&unnamed, &github, Arrival::Text),
+            Disposition::Ignored(ONLY_REQUESTS)
+        );
     }
 
     /// R53: a brief is a turn only in a delegated session and only from the
@@ -1247,6 +1329,9 @@ mod tests {
                 classify(&session, &tola, Arrival::Ask),
                 if own {
                     Disposition::Ask
+                } else if kind == SessionKind::Gate {
+                    // A gate session that names no peer takes nothing.
+                    Disposition::Ignored(ONLY_REQUESTS)
                 } else {
                     Disposition::Ignored(NOT_ASKED_HERE)
                 },
