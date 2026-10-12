@@ -75,12 +75,13 @@ use ts_rs::TS;
 /// 16.5). The `Recorder` trait is not object-safe (its async methods are RPITIT),
 /// so the concrete type is selected at compile time per target rather than held
 /// as a trait object: the desktop recorder spawns `keeper-rec` per round-trip;
-/// the iOS one honestly answers [`CoreError::Unsupported`] (the frontend never
-/// calls these commands there — the `recording` capability is `false`).
+/// the phone and tablet one honestly answers [`CoreError::Unsupported`] (the
+/// frontend never calls these commands there — the `recording` capability is
+/// `false`).
 #[cfg(desktop)]
 type PlatformRecorder = crate::recorder::DesktopRecorder;
-#[cfg(target_os = "ios")]
-type PlatformRecorder = crate::recorder::IosRecorder;
+#[cfg(mobile)]
+type PlatformRecorder = crate::recorder::MobileRecorder;
 
 /// Tauri-managed application state holding the injected platform port and the
 /// single-account supervisor.
@@ -453,7 +454,8 @@ impl ExportRegistry {
 
 impl AppState {
     /// Construct the app state with the platform implementation for this build
-    /// target (Story 12.2): [`DesktopPlatform`] on desktop, [`IosPlatform`] on iOS.
+    /// target (Story 12.2): [`DesktopPlatform`] on desktop, [`IosPlatform`] on
+    /// iOS, [`AndroidPlatform`] on Android (Epic 98, story 98.3).
     ///
     /// Resolves the platform data dir up front so the [`AccountManager`] can open
     /// the single app-wide `archive.db` and spawn its serialized writer (Story
@@ -465,26 +467,29 @@ impl AppState {
         let platform: Arc<dyn Platform> = Arc::new(DesktopPlatform);
         #[cfg(target_os = "ios")]
         let platform: Arc<dyn Platform> = Arc::new(IosPlatform::resolve());
-        // Story 12.2's compile seam supports desktop and iOS only. A non-iOS mobile
-        // target (e.g. Android) is `mobile` — so `run()` still reaches this via the
-        // `#[cfg_attr(mobile, ...)]` entry point — but binds no `platform` above.
-        // Fail loudly and specifically here rather than with a bare "cannot find
-        // value `platform`"; such a target needs its own `Platform` port impl.
-        #[cfg(all(not(desktop), not(target_os = "ios")))]
+        #[cfg(target_os = "android")]
+        let platform: Arc<dyn Platform> = Arc::new(AndroidPlatform::resolve());
+        // A mobile target that is neither iOS nor Android is `mobile` — so
+        // `run()` still reaches this via the `#[cfg_attr(mobile, ...)]` entry
+        // point — but binds no `platform` above. Fail loudly and specifically
+        // here rather than with a bare "cannot find value `platform`"; such a
+        // target needs its own `Platform` port impl.
+        #[cfg(all(not(desktop), not(target_os = "ios"), not(target_os = "android")))]
         compile_error!(
-            "no Platform implementation for this build target: Story 12.2's seam covers \
-             desktop and iOS only; add a Platform port impl for other mobile targets"
+            "no Platform implementation for this build target: the seam covers desktop, \
+             iOS and Android; add a Platform port impl for other mobile targets"
         );
         let data_dir = platform.data_dir().unwrap_or_else(|e| {
             tracing::error!(error = %e, "could not resolve data dir; archive falls back to temp");
             std::env::temp_dir().join("dev.tgorka.keeper")
         });
         // The recorder shares the platform port (for sidecar resolution) on
-        // desktop; iOS is the honest Unsupported impl (see `PlatformRecorder`).
+        // desktop; a phone or tablet is the honest Unsupported impl (see
+        // `PlatformRecorder`).
         #[cfg(desktop)]
         let recorder = Arc::new(crate::recorder::DesktopRecorder::new(platform.clone()));
-        #[cfg(target_os = "ios")]
-        let recorder = Arc::new(crate::recorder::IosRecorder);
+        #[cfg(mobile)]
+        let recorder = Arc::new(crate::recorder::MobileRecorder);
         Self {
             // The manager flags the `data_dir` root as backup-excluded through the
             // platform port (Story 14.7, FR-65) — best-effort, never startup-fatal.
@@ -517,6 +522,9 @@ impl Default for AppState {
 static NEXT_SUBSCRIPTION_ID: AtomicU64 = AtomicU64::new(1);
 
 /// macOS Keychain service name under which all keeper secrets are stored (AD-3).
+/// Apple's keychains and the desktop's only: Android keeps its secrets in
+/// `keeper_core::secret_file`, which has no service name.
+#[cfg(any(desktop, target_os = "ios"))]
 const KEYCHAIN_SERVICE: &str = "dev.tgorka.keeper";
 
 /// The Tauri app handle used by the desktop `Platform::notify` port to post native
@@ -1103,6 +1111,119 @@ impl Platform for IosPlatform {
     }
 }
 
+/// Concrete [`Platform`] implementation for the Android shell (Epic 98,
+/// story 98.3; AD-414).
+///
+/// - **Data directory:** the app's private files directory, as
+///   `MainActivity` reports it ([`crate::android::files_dir`]). Android
+///   removes it with the app; the manifest's backup rules keep it out of
+///   cloud backups and device transfers, which is why
+///   [`Platform::exclude_from_backup`] has nothing left to do per path.
+/// - **Secrets:** `keeper_core::secret_file` — one AEAD file in that
+///   directory, keyed by the data key the Android Keystore wraps
+///   ([`crate::android::KeystoreKey`]). Never `keyring`.
+/// - **Browser and sign-in:** the opener plugin hands the URL to Android
+///   (the default browser); the sign-in callback returns through the
+///   `keeper://` deep link. Custom Tabs and Auth Tab are the tablet rung's.
+/// - **Notifications:** the notification plugin, as on iOS. No badge — an
+///   Android launcher draws its own from the notifications — and no sidecar.
+#[cfg(target_os = "android")]
+pub struct AndroidPlatform {
+    /// `None` only when the activity reported no files directory.
+    data_dir: Option<PathBuf>,
+    secrets: Option<keeper_core::secret_file::SecretFile<crate::android::KeystoreKey>>,
+}
+
+#[cfg(target_os = "android")]
+impl AndroidPlatform {
+    /// Read the files directory once, before any store opens.
+    pub fn resolve() -> Self {
+        let data_dir = crate::android::files_dir();
+        if data_dir.is_none() {
+            tracing::error!(
+                "Android reported no files directory (MainActivity sets KEEPER_ANDROID_FILES_DIR \
+                 before the app starts); keeper has nowhere to keep its data"
+            );
+        }
+        let secrets = data_dir.as_ref().map(|dir| {
+            keeper_core::secret_file::SecretFile::new(
+                dir.join(keeper_core::secret_file::FILE_NAME),
+                crate::android::KeystoreKey::default(),
+            )
+        });
+        Self { data_dir, secrets }
+    }
+
+    fn secrets(
+        &self,
+    ) -> Result<&keeper_core::secret_file::SecretFile<crate::android::KeystoreKey>, CoreError> {
+        self.secrets.as_ref().ok_or_else(|| {
+            PlatformError::DirUnavailable("no files directory for the secret store".to_owned())
+                .into()
+        })
+    }
+}
+
+#[cfg(target_os = "android")]
+impl Platform for AndroidPlatform {
+    fn data_dir(&self) -> Result<PathBuf, CoreError> {
+        self.data_dir.clone().ok_or_else(|| {
+            PlatformError::DirUnavailable("Android reported no files directory".to_owned()).into()
+        })
+    }
+
+    fn keychain_set(&self, key: &str, value: &str) -> Result<(), CoreError> {
+        self.secrets()?.set(key, value)
+    }
+
+    fn keychain_get(&self, key: &str) -> Result<Option<String>, CoreError> {
+        self.secrets()?.get(key)
+    }
+
+    fn keychain_delete(&self, key: &str) -> Result<(), CoreError> {
+        self.secrets()?.delete(key)
+    }
+
+    fn open_url(&self, url: &str) -> Result<(), CoreError> {
+        tauri_plugin_opener::open_url(url, None::<&str>)
+            .map_err(|e| CoreError::Internal(format!("could not open the browser: {e}")))
+    }
+
+    fn notify(&self, title: &str, body: &str, target: &NotifyTarget) -> Result<(), CoreError> {
+        use tauri_plugin_notification::NotificationExt;
+
+        record_last_notify_target(target);
+        let app = NOTIFY_APP.get().ok_or_else(|| {
+            CoreError::Unsupported("notification app handle is not set (headless)".to_owned())
+        })?;
+        app.notification()
+            .builder()
+            .title(title)
+            .body(body)
+            .show()
+            .map_err(|e| CoreError::Internal(format!("could not post notification: {e}")))
+    }
+
+    /// Android has no app badge to set: a launcher that shows one counts the
+    /// app's notifications itself.
+    fn set_badge_count(&self, _count: Option<u32>) -> Result<(), CoreError> {
+        Ok(())
+    }
+
+    /// The manifest does this for the whole app (`android:allowBackup="false"`
+    /// and `data_extraction_rules.xml`, which exclude every domain from cloud
+    /// backup and device transfer), so there is nothing to do per path.
+    fn exclude_from_backup(&self, _path: &Path) -> Result<(), CoreError> {
+        Ok(())
+    }
+
+    fn sidecar_path(&self, name: &str) -> Result<PathBuf, CoreError> {
+        Err(CoreError::Unsupported(format!(
+            "sidecar {name:?} is not available on Android"
+        )))
+    }
+}
+
 /// The logical sidecar name for the Beeper `bbctl` CLI (Story 6.7). Resolved per-arch
 /// next to the executable via [`Platform::sidecar_path`].
 const BBCTL_SIDECAR_NAME: &str = "bbctl";
@@ -1594,7 +1715,8 @@ pub fn capabilities(state: State<'_, AppState>) -> Result<CapabilitiesVm, IpcErr
         // `desktop` and `mobile` as a partition of the targets it builds for,
         // so today the two are exhaustive — but writing `true` would make the
         // flag stop being a claim about this build, and `AppState::new`
-        // already `compile_error!`s on a mobile target that is not iOS. A
+        // already `compile_error!`s on a mobile target that is neither iOS
+        // nor Android. A
         // later target earns the pane by joining the partition, not by
         // inheriting a literal.
         //
@@ -5624,20 +5746,15 @@ fn device_ulid(data_dir: &Path) -> Result<String, IpcError> {
 
 /// The mobile twin: there is no `sync.db` to read.
 ///
-/// Folder sync is a desktop-only dependency, so `keeper_sync` is not even linked
-/// here — and neither is a recorder (`IosRecorder::is_available` is `false` and
-/// its `run_session` returns `Unsupported`). The refusal quotes that recorder's
-/// own sentence so the two paths are indistinguishable to a caller, and it now
-/// refuses before a session folder is created rather than after.
+/// Folder sync is a desktop-only dependency, and a phone or tablet has no
+/// recorder (`MobileRecorder::is_available` is `false` and its `run_session`
+/// returns `Unsupported`). The refusal is that recorder's own
+/// ([`MobileRecorder::refused`]) on iOS and Android alike, so the two paths are
+/// indistinguishable to a caller, and it refuses before a session folder is
+/// created rather than after.
 #[cfg(not(desktop))]
 fn device_ulid(_data_dir: &Path) -> Result<String, IpcError> {
-    Err(to_ipc_error(CoreError::Unsupported(
-        if cfg!(target_os = "ios") {
-            "recording is not available on iOS".to_owned()
-        } else {
-            "recording is not available on this platform".to_owned()
-        },
-    )))
+    Err(to_ipc_error(crate::recorder::MobileRecorder::refused()))
 }
 
 /// Create the session folder for one start, walking the template's ordinal.

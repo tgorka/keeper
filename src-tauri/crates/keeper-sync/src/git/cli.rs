@@ -124,9 +124,9 @@ impl GitCapabilities {
 
 /// Which engine drives the verbs this module exists for (Epic 66, AD-198).
 ///
-/// A desktop has a `git` binary and the shim spawns it. A phone has none —
-/// iOS denies `posix_spawn` to third-party apps, so `Command::spawn` can only
-/// ever return `Err` there — and keeper does what it can in-process with
+/// A desktop has a `git` binary and the shim spawns it. A phone or tablet has
+/// none — iOS denies `posix_spawn` to third-party apps, so `Command::spawn` can
+/// only ever return `Err` there, and Android has no `git` to spawn — and keeper does what it can in-process with
 /// gitoxide (fetch, fast-forward checkout, commit, its own push over HTTP) and
 /// refuses the rest with a sentence. The variant is decided by the target at
 /// compile time ([`GitEngine::HOST`]) and can be *set* by a test, which is what
@@ -140,8 +140,10 @@ pub enum GitEngine {
 }
 
 impl GitEngine {
-    /// The engine this build runs: gitoxide on a phone, a binary elsewhere.
-    pub const HOST: GitEngine = if cfg!(target_os = "ios") {
+    /// The engine this build runs: gitoxide on a phone or tablet, a binary
+    /// elsewhere. Android ships no `git` either (and an app may not count on
+    /// one on its `PATH`), so it runs gitoxide like the iPhone (story 98.3).
+    pub const HOST: GitEngine = if cfg!(any(target_os = "ios", target_os = "android")) {
         GitEngine::Gix
     } else {
         GitEngine::Binary

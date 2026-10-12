@@ -90,6 +90,11 @@ toml_edit = { workspace = true }
 # neither tauri nor gix, so `check:core-tauri-free` and `check:core-sync-free`
 # stay green.
 base64 = { workspace = true }
+# The Android secret store (Epic 98, story 98.3 #2, `secret_file`): the format
+# and its AEAD live here so they are tested on Linux with a fake key provider.
+# Already in the lock (matrix-sdk-store-encryption); Apache-2.0 OR MIT; tauri-
+# and gix-free.
+chacha20poly1305 = { workspace = true }
 # Wake-phrase normalisation (Epic 62, Story 62.4, FR-404): NFD decomposition
 # plus combining-mark removal is how `voice::phrase` makes "Hej Kééper" and
 # "hej keeper" the same phrase. Already resolved in Cargo.lock as matrix-sdk's

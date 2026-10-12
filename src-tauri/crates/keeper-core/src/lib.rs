@@ -40,6 +40,7 @@ pub mod panels;
 pub mod platform;
 pub mod recording;
 pub mod registry;
+pub mod secret_file;
 pub mod send;
 pub mod sessions;
 pub mod signals;

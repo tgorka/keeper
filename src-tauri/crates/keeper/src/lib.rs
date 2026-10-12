@@ -114,6 +114,11 @@ mod tray;
 // frameworks are reached, and the only voice code that is target-specific.
 // Every other target answers `unsupported` through `voice_ipc`'s absent
 // port, so the command list stays identical.
+// Android (Epic 98, story 98.3, AD-414): what `MainActivity` reports about the
+// device before the app starts, and the Keystore plugin behind the secret
+// file. Android-only; the format is `keeper_core::secret_file`'s.
+#[cfg(target_os = "android")]
+mod android;
 // Push on the iPhone (Epic 98, story 98.1, AD-412): the APNs token, the
 // pusher, the notification delegate's actions and taps. iOS-only; every
 // decision is `keeper_core::agents::push`.
@@ -311,6 +316,10 @@ pub fn run() {
     // `Platform::notify` port posts through this plugin; the app handle is stored in
     // `setup()` and notification permission is requested best-effort there.
     let builder = builder.plugin(tauri_plugin_notification::init());
+    // The Android Keystore's half of the secret store (story 98.3 #2): it must
+    // be registered before any account restores and reads its session.
+    #[cfg(target_os = "android")]
+    let builder = builder.plugin(android::keystore_plugin());
     // Opt-in launch-at-login (Story 10.3, FR-53, AD-25). The autostart plugin owns
     // the LaunchAgent state authoritatively; it is off by default and only ever
     // toggled by an explicit user action via the `launch_at_login_set` command.

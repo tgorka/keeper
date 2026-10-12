@@ -391,9 +391,10 @@ admin must, under **Settings → Branches → Branch protection rules** for `mai
 - **Rust** — `rustfmt --check`, clippy `-D warnings`, cargo-nextest.
 - **Tauri build** — `tauri build --no-bundle` with a synthetic management-env canary, followed by credential exclusion over frontend assets, the app executable and staged recording sidecar.
 - **iOS (compile check)** — `cargo check --workspace --exclude keeper-agentd --target aarch64-apple-ios` (Rust, device-free compile gate; no signing/simulator; the Linux-only `keeper-agentd` is excluded).
+- **Android (compile and debug APK)** — on `ubuntu-latest` with the image's SDK and NDK: `bun run check:android-graph`, `cargo check -p keeper -p keeper-core -p keeper-sync -p keeper-agent --target aarch64-linux-android`, then `tauri android build --debug --apk --target aarch64`, then the resolved-classpath licence scan (`./gradlew -q :app:dependencies` for the debug and release runtime classpaths, checked by `the_resolved_android_classpath_is_licensed`; docs/android.md § What Gradle resolves), the debug-signed APK (the runner's throwaway debug key) uploaded as the `keeper-android-debug-apk` artifact (Epic 98, story 98.3 #1; docs/android.md). No release signing in CI. Its first green run is owed on story 98.3's pull request.
 - **Recording sidecar (gapless-concat, NFR-22)** — `swift test` on the `keeper-rec` package (rotation unit tests + the gapless-concat gate, fixtures generated on the runner; no capture hardware, no signing). Maps to the `recording` job in `ci.yml`.
 
-These correspond to the `licenses`, `frontend`, `rust`, `build`, `ios`, and `recording` jobs in
+These correspond to the `licenses`, `frontend`, `rust`, `build`, `ios`, `android`, and `recording` jobs in
 `.github/workflows/ci.yml`. **CI is the license source of truth**: the JS gate scans the
 installed `node_modules` tree, so run it via CI (which does a clean `bun install
 --frozen-lockfile`) rather than trusting a local run against a possibly-stale tree. `bun run

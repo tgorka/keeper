@@ -73,8 +73,6 @@ ulid = { workspace = true }
 # (`evaluate_destination`) and never a filesystem-probe dependency.
 # Apache-2.0/MIT — passes `cargo deny check`.
 fs4 = { workspace = true }
-# macOS Keychain access for the keychain_* Platform ports (shell-only glue).
-keyring = { workspace = true }
 # Native file-picker dialog for the composer attach button (Story 3.7). Yields OS
 # file paths (never bytes over IPC). MIT/Apache — passes `cargo deny check`.
 tauri-plugin-dialog = { workspace = true }
@@ -120,6 +118,12 @@ tauri-plugin-autostart = { workspace = true }
 # `tauri-plugin-process` supplies `relaunch()` after applying an update.
 tauri-plugin-updater = { workspace = true }
 tauri-plugin-process = { workspace = true }
+# The desktop keychain for `DesktopPlatform`'s keychain_* ports (shell-only
+# glue). Desktop-only since Epic 98 (story 98.3): iOS reaches its Keychain
+# through `security-framework`, and on Android keyring would resolve to its
+# MOCK store, which forgets every secret at exit — Android's secrets are
+# `keeper_core::secret_file`'s. `check:android-graph` fails if it comes back.
+keyring = { workspace = true }
 
 # Linux credential store. The workspace catalog entry turns on `apple-native`
 # only, so on a Linux target keyring resolves to its MOCK store — an in-memory

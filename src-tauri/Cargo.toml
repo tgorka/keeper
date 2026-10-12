@@ -386,6 +386,11 @@ bytes = "1"
 # direct dep pulls no new crate version. MIT OR Apache-2.0 — passes
 # `cargo deny check`.
 base64 = "0.22"
+# The Android secret store's AEAD (Epic 98, story 98.3 #2): XChaCha20-Poly1305
+# over one file whose key the Android Keystore wraps. Already resolved in the
+# lock as matrix-sdk-store-encryption's cipher, so this adds no new package.
+# Apache-2.0 OR MIT.
+chacha20poly1305 = "0.10"
 # C-style unquoting for `.gitattributes` pattern fields (Story 46.1). A
 # gitattributes line whose pattern holds a space MUST be quoted — git decides
 # to unquote from the line's FIRST BYTE, so a backslash escape is read as an

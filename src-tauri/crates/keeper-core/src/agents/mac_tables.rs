@@ -51,10 +51,10 @@ use crate::platform::Platform;
 
 const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// The Mac: it may start a `command` server (a phone never hosts) and it
-/// offers its own screen (96.4).
+/// The Mac: it may start a `command` server (a phone or tablet never hosts)
+/// and it offers its own screen (96.4).
 pub const MAC: HostRules = HostRules {
-    may_spawn: !cfg!(target_os = "ios"),
+    may_spawn: !cfg!(any(target_os = "ios", target_os = "android")),
     screen: true,
 };
 

@@ -1,0 +1,284 @@
+# keeper on Android
+
+keeper builds for Android from the same Tauri project as the Mac and the iPhone
+(Epic 98, story 98.3; AD-414). The target the owner asked for is an Android
+tablet; a phone runs the same build. It is a client, like keeper on the iPhone:
+it reads and writes your Matrix rooms and the drive folders it syncs, it never
+runs an agent, and it is installed by sideloading a signed APK — there is no
+Play Store or F-Droid build (DW-407).
+
+**What is proved where.** Nothing Android runs on keeper's Linux dev host and
+no Android device has run keeper yet:
+
+- **CI's `Android (compile and debug APK)` job** (`.github/workflows/ci.yml`,
+  `ubuntu-latest`) is the gate: it type-checks `keeper`, `keeper-core`,
+  `keeper-sync` and `keeper-agent` for `aarch64-linux-android` with the NDK,
+  builds a debug APK (signed with the runner's throwaway debug key, as every
+  debug build is — not an installable release), scans what Gradle resolved
+  for it (below) and uploads the APK as an artifact. **Its first green run is
+  owed on this rung's pull request**; until then the Android half has been
+  type-checked locally only, and neither Gradle nor `tauri android build` has
+  run anywhere. The macOS job and the iOS compile check must stay green on the
+  same change.
+- **On Linux:** the secret file's format (`keeper_core::secret_file`, the
+  `android_secret_store` tests), the Android dependency graph
+  (`bun run check:android-graph`) and the Gradle licence scan's rules and
+  tables (`android_gradle_licences`, below).
+- **On the tablet:** the device run in story 98.3 #7, recorded in
+  `docs/agents.md` § *Measured* — owed until it is done.
+
+## Prerequisites
+
+On the machine that builds (not this repository's Linux container, which has no
+JDK, SDK or NDK):
+
+- A JDK 17 (`JAVA_HOME`).
+- The Android SDK (`ANDROID_HOME`) with `platforms;android-36`, a recent
+  `build-tools` (for `zipalign` and `apksigner`) and `platform-tools` (`adb`).
+- The Android NDK (`NDK_HOME`), r27 or newer.
+- The Rust target: `rustup target add aarch64-linux-android` (add
+  `armv7-linux-androideabi`, `i686-linux-android` and `x86_64-linux-android` for
+  an emulator or an older device).
+- `bun install` at the repository root.
+
+## The Android project
+
+`src-tauri/crates/keeper/gen/android/` is the Android Studio project, generated
+once by `tauri android init` (tauri-cli 2.11.4) and committed, like
+`gen/apple/`. What keeper changed in it after generation:
+
+- `app/src/main/java/dev/tgorka/keeper/MainActivity.kt` writes three facts
+  into the process environment **before** `super.onCreate`, because keeper's
+  Rust half starts inside it and has no other way to ask Android that early:
+  `KEEPER_ANDROID_FILES_DIR` (the app's private files directory),
+  `KEEPER_ANDROID_DEVICE_CLASS` (`tablet` at a smallest width of 600 dp, else
+  `mobile`) and `KEEPER_ANDROID_MODEL`. None is a secret.
+- `app/src/main/java/dev/tgorka/keeper/KeystorePlugin.kt` — the Keystore half
+  of the secret store (below).
+- `AndroidManifest.xml`: no backups (`allowBackup="false"`,
+  `fullBackupContent="false"` and `res/xml/data_extraction_rules.xml`, which
+  exclude every domain from cloud backup and device transfer) and the
+  `keeper://` / `dev.tgorka.keeper:` deep link, in the block the deep-link
+  plugin's build script rewrites from `tauri.conf.json` on every Android build.
+- `app/build.gradle.kts` declares no test dependencies: the project has no
+  Android tests to run them.
+
+**Permissions.** The committed manifest asks for `INTERNET` only; Gradle merges
+the libraries' manifests into the APK's. The merged release manifest (read from
+a Gradle `processUniversalReleaseMainManifest` run on 2026-10-12) asks for:
+
+- `INTERNET` — needed: Matrix, sync, sign-in.
+- `POST_NOTIFICATIONS` (the notification plugin) — needed: keeper's
+  notifications. On Android 13 and later it is a runtime permission, which
+  keeper asks for at start whenever it is not granted yet (the same startup
+  thread that asks on every other target).
+- `RECEIVE_BOOT_COMPLETED` and `WAKE_LOCK` (the notification plugin) — idle:
+  the plugin's `LocalNotificationRestoreReceiver` (`BOOT_COMPLETED`,
+  `LOCKED_BOOT_COMPLETED`, `QUICKBOOT_POWERON`, not exported) puts back
+  *scheduled* local notifications after a reboot, and keeper schedules none.
+  Android starts keeper's process to deliver the broadcast, the receiver finds
+  nothing to restore, and keeper's own code — which starts with its activity —
+  does not run. Its `TimedNotificationPublisher` (fires a scheduled
+  notification) is idle for the same reason; `NotificationDismissReceiver`
+  hears a notification being swiped away. Neither is exported.
+- `dev.tgorka.keeper.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION` (AndroidX Core)
+  — a `signature` permission keeper defines and holds itself, so receivers
+  AndroidX registers at run time take no broadcast from another app.
+
+Also merged in, from AndroidX: `androidx.startup`'s `InitializationProvider`
+(not exported) and `profileinstaller`'s `ProfileInstallReceiver`, which is
+exported but guarded by `android.permission.DUMP`, so only `adb` and the
+system can send to it. No location, contacts, storage, camera or microphone
+permission is in the build.
+
+`src-tauri/crates/keeper/tauri.android.conf.json` is merged over
+`tauri.conf.json` for Android builds: no `externalBin` (no sidecar runs on
+Android) and `minSdkVersion` 24, the notification plugin's floor.
+
+To regenerate after a Tauri upgrade, run `bun run tauri android init` from the
+repository root on a machine with the SDK and NDK, then re-apply the changes
+above; `git diff` shows them.
+
+## Build
+
+```sh
+bun run android:dev      # a debug build on a connected device or emulator
+bun run android:build    # release APKs (unsigned) for every Android target
+```
+
+`tauri android build` drives Gradle, whose `rust` plugin calls back into the
+Tauri CLI to build `libkeeper_lib.so` for each ABI. The unsigned release APK
+lands under `gen/android/app/build/outputs/apk/`.
+
+## Sign and sideload
+
+The signing keystore is the owner's and never enters this repository. Create
+it once, on the machine that builds:
+
+```sh
+keytool -genkeypair -v -keystore ~/keeper-release.jks -alias keeper \
+  -keyalg RSA -keysize 4096 -validity 10000
+```
+
+and export, for the session that installs:
+
+| Variable | What |
+|---|---|
+| `KEEPER_ANDROID_KEYSTORE` | the keystore file |
+| `KEEPER_ANDROID_KEYSTORE_PASSWORD` | its password — `apksigner` reads it from the environment, never from a command line |
+| `KEEPER_ANDROID_KEY_ALIAS` | the key's alias (`keeper` above) |
+
+On the device: Developer options → USB debugging (or *Install unknown apps*
+for the file manager you copy the APK with). Then:
+
+```sh
+bun run install:android                 # build, zipalign, sign, verify, adb install -r
+bun run install:android -- --no-install # build and sign only; prints the APK's path
+bun run install:android -- --serial <id>
+```
+
+Every later install must be signed with the same key: Android refuses an update
+signed by another one, and the only way out is uninstalling, which removes
+keeper's data on the device.
+
+## Sign-in
+
+keeper opens a sign-in in the default browser (the opener plugin hands the URL
+to Android), and the browser returns to keeper through the `keeper://` or
+`dev.tgorka.keeper:` deep link the manifest declares. Custom Tabs and Auth Tab
+(DW-290's recipe) are the tablet rung's (codemap §2 row 8).
+
+## Where keeper keeps its data
+
+- **The data directory** is the app's private files directory
+  (`Context.getFilesDir()`, typically `/data/user/0/dev.tgorka.keeper/files`):
+  `keeper.db`, `archive.db`, `sync.db`, `accounts/<id>/sdk` and the phone's
+  folders under `sync/`. Android removes it with the app. Without
+  `KEEPER_ANDROID_FILES_DIR` (a `MainActivity` that lost its first lines) keeper
+  logs that it has nowhere to keep its data rather than guessing a path.
+- **Secrets** (`session/<id>`, `store_passphrase/<id>`,
+  `sync/<profile>/credential`) are in `secrets.bin` in that directory: one
+  XChaCha20-Poly1305 file — `KSEC`, a version byte, a random 24-byte nonce, the
+  ciphertext of every key and value — rewritten whole and atomically on every
+  change (`keeper_core::secret_file`). A flipped byte, another key or another
+  version is refused, by reads and writes alike, and the file is never
+  overwritten then: starting over is clearing keeper's storage in Android's
+  settings.
+- **Its key** is a random 32-byte data key that `KeystorePlugin` generates
+  once, stores only wrapped (AES-256-GCM) by a key the Android Keystore
+  generated and never lets out, in `noBackupFilesDir/keeper-secret-file.key`,
+  and unwraps once per process for the Rust side. A wrapped key that no longer
+  unwraps is refused, never replaced.
+- **Never `keyring`.** Off Apple and desktop Linux, the `keyring` crate is an
+  in-memory mock that forgets every secret at exit; `check:android-graph` fails
+  if it is in the Android build.
+- **No backups.** The manifest excludes everything; a restored copy would be
+  bytes nobody could open anyway, because no backup carries a Keystore key.
+
+## Limitations
+
+These are the lines the tablet's About screen shows (the mirror test arrives
+with the tablet rung, story 98.3 #4):
+
+- No agent runs on this tablet: agents run on your Mac or your server.
+- No screen recording and no transcription on this tablet.
+- The sessions board reads, moves cards and decides approvals, as on the phone.
+- No voice yet on Android (story 98.4).
+- No push: keeper syncs while it is open, and a notification needs it running
+  (story 98.4 brings UnifiedPush).
+- Installed by sideloading only, signed with your own key.
+
+And, for whoever builds it:
+
+- Sync on Android runs gitoxide in-process, like the iPhone
+  (`GitEngine::HOST`): there is no `git` binary to spawn.
+- Media responses are capped at 8 MiB per range request, as on the iPhone,
+  so one large video cannot allocate a second full copy in memory.
+
+## What changed in the shell for Android (98.3)
+
+Every `cfg(target_os = "ios")` site was reviewed; this is the list and the
+decision for each.
+
+| Site | Decision |
+|---|---|
+| `keeper-sync` `GitEngine::HOST` | **widened**: gitoxide on Android too |
+| `ipc.rs` `AppState::new` guard | **narrowed**: fails only on a mobile target that is neither iOS nor Android |
+| `ipc.rs` / `recorder.rs` recorder | **widened**: `MobileRecorder` (`cfg(mobile)`), honestly `Unsupported` |
+| `media_protocol.rs` range cap | **widened**: 8 MiB on Android too |
+| `keeper-core` `agents::mac_tables::MAC.may_spawn` | **widened**: no spawning on Android |
+| `account_ipc.rs` device class, model, default name | **widened** with an Android twin (`android.rs`) |
+| `ipc.rs` `KEYCHAIN_SERVICE` | gated to desktop and iOS (Android has no keychain service) |
+| `keeper` `Cargo.toml` `keyring` | moved to the desktop-only table |
+| `ipc.rs` `share_out: cfg!(target_os = "ios")` | kept: Android earns share-out with its own intent |
+| `push_ios`, `push_open_take`, `sign_out`'s pusher, `push_gateway_set`'s registration | kept: Android push is story 98.4 (UnifiedPush) |
+| `voice_ios`, `voice_island`, `voice_notify`, `voice_synthesizer`, `voice_ipc`, `voice_turn_models` | kept: Android voice is story 98.4; `voice_ipc`'s `AbsentPort` answers there |
+| `web_auth.rs`, `web_auth_apple.rs` | kept: Android signs in through the browser until Auth Tab (row 8) |
+| `share_ios.rs` | kept: share-out is off on Android (`share_out` false) |
+| `ipc.rs` `device_ulid` recording refusal | **widened**: quotes `MobileRecorder::refused` on iOS and Android alike |
+| `agents_ipc.rs` `PLATFORM`, `sessions/lock.rs`, `browse.rs` | already Android-aware |
+
+## Dependencies and licences
+
+`cargo deny` never sees Gradle. Two checks stand in for it.
+
+**What the build files declare.** `android_gradle_dependencies_are_licensed`
+(`src-tauri/crates/keeper-core/tests/android_gradle_licences.rs`, Linux) reads
+every `group:artifact:version` declared in `gen/android`'s Gradle build files
+and in the Android libraries of the Tauri crates in `Cargo.lock` (`tauri`'s
+`mobile/android`, each `tauri-plugin-*`'s `android/`) — test configurations
+(`testImplementation`, `androidTestImplementation`) excepted, since they neither
+ship nor run in keeper's build — and fails unless each
+is a row below whose licence is one `src-tauri/deny.toml` allows; a GPL or
+AGPL licence, an unknown one, an unlisted coordinate, or a row that no build
+file declares any more fails too. Bumping a version means updating its row.
+
+| Coordinate | Licence | Declared by |
+|---|---|---|
+| `androidx.activity:activity-ktx:1.10.1` | Apache-2.0 | `gen/android` app |
+| `androidx.appcompat:appcompat:1.7.1` | Apache-2.0 | `gen/android` app |
+| `androidx.lifecycle:lifecycle-process:2.10.0` | Apache-2.0 | `gen/android` app |
+| `androidx.webkit:webkit:1.14.0` | Apache-2.0 | `gen/android` app |
+| `com.google.android.material:material:1.12.0` | Apache-2.0 | `gen/android` app |
+| `com.android.tools.build:gradle:8.11.0` | Apache-2.0 | `gen/android` build script, `buildSrc` (build tooling) |
+| `org.jetbrains.kotlin:kotlin-gradle-plugin:1.9.25` | Apache-2.0 | `gen/android` build script (build tooling) |
+| `androidx.appcompat:appcompat:1.6.0` | Apache-2.0 | tauri, tauri-plugin-notification, -dialog, -fs, -deep-link |
+| `androidx.browser:browser:1.8.0` | Apache-2.0 | tauri-plugin-opener |
+| `androidx.core:core-ktx:1.7.0` | Apache-2.0 | tauri |
+| `androidx.core:core-ktx:1.9.0` | Apache-2.0 | tauri-plugin-notification, -opener, -dialog, -fs, -deep-link |
+| `com.fasterxml.jackson.core:jackson-databind:2.15.3` | Apache-2.0 | tauri, tauri-plugin-notification, -opener |
+| `com.google.android.material:material:1.7.0` | Apache-2.0 | tauri, tauri-plugin-notification, -dialog, -fs, -deep-link |
+
+Outside the scan, also Apache-2.0: the Gradle wrapper (`gradle-wrapper.jar`,
+committed by `tauri android init`) and the Gradle 8.14.3 distribution it
+downloads.
+
+## What Gradle resolves
+
+**What ships.** The coordinates above pull in more, which only Gradle
+resolves. After building the APK, CI's `android` job has Gradle list the
+APK's runtime classpath (`./gradlew -q :app:dependencies --configuration
+universalDebugRuntimeClasspath`, and the same for `universalRelease`, which
+`bun run install:android` signs) and runs
+`the_resolved_android_classpath_is_licensed` over that report: every artifact
+in it, transitive ones included, must belong to a group below; a group nobody
+listed, a line Gradle could not resolve, or a row nothing resolves any more
+fails the job. A row is one Maven group, or a group and every group beneath it
+when it ends in `.*`. Every row's licence is checked against
+`src-tauri/deny.toml` on Linux too
+(`every_group_gradle_may_resolve_carries_an_allowed_licence`). The list below
+is what Gradle resolved on 2026-10-12 for both configurations (identical); the
+job's first run is what confirms it on CI's runner.
+
+| Group | Licence | What, pulled in by |
+|---|---|---|
+| `androidx.*` | Apache-2.0 | AndroidX — the app, tauri and every plugin |
+| `com.fasterxml.jackson` | Apache-2.0 | `jackson-bom`, via `jackson-databind` |
+| `com.fasterxml.jackson.core` | Apache-2.0 | `jackson-databind`, `-core`, `-annotations` — tauri, the notification and opener plugins |
+| `com.google.android.material` | Apache-2.0 | `material` — the app, tauri, the plugins |
+| `com.google.errorprone` | Apache-2.0 | `error_prone_annotations`, via AndroidX |
+| `com.google.guava` | Apache-2.0 | `listenablefuture`, via AndroidX |
+| `org.jetbrains` | Apache-2.0 | `annotations`, via the Kotlin standard library |
+| `org.jetbrains.kotlin` | Apache-2.0 | `kotlin-stdlib`, `kotlin-bom` |
+| `org.jetbrains.kotlinx` | Apache-2.0 | `kotlinx-coroutines-*`, `kotlinx-serialization-*`, via AndroidX |
+| `org.jspecify` | Apache-2.0 | `jspecify`, via AndroidX |

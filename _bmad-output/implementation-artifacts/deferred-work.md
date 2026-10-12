@@ -10138,3 +10138,52 @@ origin: epic 98, story 98.2 (rung `agents-98-phone-board` fix round 1, 2026-10-1
 location: `src/components/sessions/sessions-phone-pane.tsx` (`sessionRoomOnThisPhone`: first Agents window row, Rust's recency order)
 reason: The person's account and a proxy or harness account can both hold a session's room. The room then opens on whichever streamed most recently, which may be an account 93.3's approval card does not let decide. Prefer an account the approval record names (or the person's own), else the first.
 status: open
+
+### DW-1290: The resolved-classpath scan allows whole Maven groups, and their licences are asserted by hand.
+
+origin: epic 98, story 98.3 #6 (rung `agents-98-android`, 2026-10-12; R349; narrowed by R351, fix round 1)
+location: `src-tauri/crates/keeper-core/tests/android_gradle_licences.rs` (`the_resolved_android_classpath_is_licensed`, `covers`), `docs/android.md` § What Gradle resolves, `.github/workflows/ci.yml` `android`
+reason: Since R351 CI's `android` job scans every `group:artifact` Gradle resolves for the APK, transitive ones included, against an allow-list of groups. What remains: a row covers a whole group (`androidx.*` every AndroidX group), so a new artifact in a listed group passes unread, and each row's licence is what the list says, not what the artifact's POM declares. Close it, if a group ever mixes licences, with per-artifact rows or the `com.github.jk1.dependency-license-report` plugin reading the POMs' `<licenses>` in the same job.
+status: open
+
+### DW-1291: The Android build is checked, not linted.
+
+origin: epic 98, story 98.3 #1 (rung `agents-98-android`, 2026-10-12; R349)
+location: `.github/workflows/ci.yml` `android` (`cargo check`, no clippy), `crates/keeper/src/{ipc,notes_vault,sync,sync_ipc,sessions_root,build_identity}.rs`
+reason: `cargo check --target aarch64-linux-android` passes with 37 warnings, all dead code or unused imports in items only the desktop calls (quit finalisers, the tray, the supervisor) that a `not(desktop)` build compiles and never uses — the same set the iOS compile job leaves unlinted. A `clippy -D warnings` for either phone target fails until those items are gated `#[cfg(desktop)]`; one change for both targets, then add clippy to the `ios` and `android` jobs.
+status: open
+
+### DW-1292: A refused secret file has no way back inside keeper.
+
+origin: epic 98, story 98.3 #2 (rung `agents-98-android`, 2026-10-12; R349)
+location: `keeper_core::secret_file` (`SecretFile::{get,set}` refuse a file that fails its tag or names another version), `gen/android/.../KeystorePlugin.kt` (a wrapped key that no longer unwraps is refused)
+reason: A tampered `secrets.bin`, a Keystore that lost keeper's wrapping key, or a file from a newer keeper is refused by reads and writes alike, so every account asks for a sign-in it cannot store. The way out is Android's *Clear storage* for keeper, which also drops the accounts' stores and the phone's folders. An in-app "forget this device's secrets" that removes only `secrets.bin` and the wrapped key (and says what it costs) would keep the folders; it is a person's choice, so it needs a surface, which is the tablet rung's or later.
+status: open
+
+### DW-1293: The Android CI job caches no Gradle state.
+
+origin: epic 98, story 98.3 #1 (rung `agents-98-android` fix round 1, 2026-10-12; R351, review-98android-1 DW candidate)
+location: `.github/workflows/ci.yml` `android`
+reason: Nothing caches `~/.gradle` or the wrapper, so every run downloads Gradle 8.14.3, AGP 8.11 and AndroidX before building, and again for the resolved-classpath report. `gradle/actions/setup-gradle` (read-only cache on pull requests) is the standard fix. Time, not correctness.
+status: open
+
+### DW-1294: Android's sign-in callback is a custom scheme any app may claim.
+
+origin: epic 98, story 98.3 (rung `agents-98-android` fix round 1, 2026-10-12; R351, review-98android-1 DW candidate) — for rung 8 (`agents-98-tablet`, Auth Tab)
+location: `src-tauri/crates/keeper/gen/android/app/src/main/AndroidManifest.xml` (deep-link block), `src-tauri/crates/keeper/tauri.conf.json` (`deep-link.mobile`, `appLink: false`)
+reason: `dev.tgorka.keeper:/oauth/callback` and `keeper://` are plain custom schemes, so another app can register the same intent filter and receive the authorization code. PKCE and the state registry make an intercepted code useless, as on desktop, but rung 8's Auth Tab is the moment to decide whether the Matrix and org sign-in return through an App Link (`https` plus `assetlinks.json`) instead.
+status: open
+
+### DW-1295: The secret file's data key sits unzeroised in the JVM heap and in `KeystoreKey`.
+
+origin: epic 98, story 98.3 #2 (rung `agents-98-android` fix round 1, 2026-10-12; R351, review-98android-1 DW candidate)
+location: `src-tauri/crates/keeper/gen/android/app/src/main/java/dev/tgorka/keeper/KeystorePlugin.kt` (the key crosses as a hex `String`), `src-tauri/crates/keeper/src/android.rs` (`KeystoreKey.held`)
+reason: The unwrapped data key crosses Tauri's JSON plugin IPC as a hex string the JVM may keep until collection, and the Rust side holds it for the process's life without zeroising it on drop. Tauri's plugin IPC offers no cheaper path; whoever hardens the store should zeroise `held` (and the decoded buffers) and keep the key's JVM lifetime as short as the API allows.
+status: open
+
+### DW-1296: `rust-toolchain.toml` does not list the Android target.
+
+origin: epic 98, story 98.3 (rung `agents-98-android` fix round 1, 2026-10-12; R351, review-98android-1 DW candidate)
+location: `rust-toolchain.toml` (`targets`: the two iOS targets), `docs/android.md` § Prerequisites
+reason: The Mac (or any builder) must `rustup target add aarch64-linux-android` by hand; listing it in `targets` makes `bun run android:build` self-provisioning once the SDK and NDK exist. It also makes every rustup install of the toolchain download the Android standard library, which is why it was left to a decision.
+status: open

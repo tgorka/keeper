@@ -538,8 +538,15 @@ pub fn device_model() -> String {
         .map_or_else(|| "iPhone".to_owned(), |device| device.model.clone())
 }
 
+/// On Android, `tablet` at Android's own 600 dp smallest width, else
+/// `mobile` (story 98.3; `MainActivity` reports it before the app starts).
+#[cfg(target_os = "android")]
+pub fn device_class() -> DeviceClass {
+    crate::android::device_class()
+}
+
 /// `desktop` on macOS, Linux and Windows.
-#[cfg(not(target_os = "ios"))]
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 pub fn device_class() -> DeviceClass {
     DeviceClass::Desktop
 }
@@ -564,8 +571,15 @@ fn default_device_name() -> String {
     layout::device_slug(&format!("{model}-{suffix:04x}"))
 }
 
+/// On Android, likewise: the model `MainActivity` reports plus a suffix.
+#[cfg(target_os = "android")]
+fn default_device_name() -> String {
+    let suffix = (ulid::Ulid::new().random() & 0xffff) as u16;
+    layout::device_slug(&format!("{}-{suffix:04x}", crate::android::device_model()))
+}
+
 /// The short host name, folded to a slug.
-#[cfg(not(target_os = "ios"))]
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 fn default_device_name() -> String {
     layout::device_slug(&keeper_core::config::read_host_label())
 }

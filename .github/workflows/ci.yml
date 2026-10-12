@@ -92,6 +92,78 @@ jobs:
       - run: cargo check --workspace --exclude keeper-agentd --target aarch64-apple-ios
         working-directory: src-tauri
 
+  android:
+    name: Android (compile and debug APK)
+    # Epic 98, story 98.3 #1 (AD-414): the gate for keeper on Android. Nothing
+    # Android builds on keeper's Linux dev host or on the Mac, so this job is
+    # where the shell's Android half is compiled at all. The runner image
+    # carries the Android SDK and NDK; the APK is signed only with the runner's
+    # throwaway debug key (the owner signs a release with
+    # `bun run install:android`, docs/android.md).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # A debug build of the whole app for one ABI needs more disk than the
+      # image leaves free; these toolchains are never used here.
+      - name: Free disk space
+        run: sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: android
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - run: bun install --frozen-lockfile
+      # The C build scripts in the graph (aws-lc-sys, libsqlite3-sys, blake3)
+      # need the NDK's clang even for `cargo check`.
+      - name: NDK toolchain for cargo
+        run: |
+          ndk="${ANDROID_NDK_LATEST_HOME:?the runner image has no NDK}"
+          tc="$ndk/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          {
+            echo "NDK_HOME=$ndk"
+            echo "CC_aarch64_linux_android=$tc/aarch64-linux-android24-clang"
+            echo "CXX_aarch64_linux_android=$tc/aarch64-linux-android24-clang++"
+            echo "AR_aarch64_linux_android=$tc/llvm-ar"
+            echo "RANLIB_aarch64_linux_android=$tc/llvm-ranlib"
+            echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$tc/aarch64-linux-android24-clang"
+          } >> "$GITHUB_ENV"
+      # No desktop plugin, no `keyring` (a mock store off Apple and desktop
+      # Linux), no Apple framework and no `ort` in the Android graph.
+      - run: bun run check:android-graph
+      # keeper-agentd is a Linux server binary (story 90.5) and never ships
+      # to a phone or tablet.
+      - run: cargo check -p keeper -p keeper-core -p keeper-sync -p keeper-agent --target aarch64-linux-android
+        working-directory: src-tauri
+      - run: bun run tauri android build --debug --apk --target aarch64 --ci
+      # 98.3 #6 past the declared coordinates (R351): Gradle lists what it
+      # resolved for the APK, transitive dependencies included, and every group
+      # in it must be a row of docs/android.md § What Gradle resolves under a
+      # licence src-tauri/deny.toml allows.
+      - name: Resolved Android classpath
+        working-directory: src-tauri/crates/keeper/gen/android
+        run: |
+          for configuration in universalDebugRuntimeClasspath universalReleaseRuntimeClasspath; do
+            ./gradlew -q :app:dependencies --configuration "$configuration"
+          done > "$RUNNER_TEMP/android-classpath.txt"
+      - run: cargo test -p keeper-core --test android_gradle_licences -- --ignored --exact the_resolved_android_classpath_is_licensed
+        working-directory: src-tauri
+        env:
+          KEEPER_ANDROID_CLASSPATH: ${{ runner.temp }}/android-classpath.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: keeper-android-debug-apk
+          path: src-tauri/crates/keeper/gen/android/app/build/outputs/apk/**/*.apk
+          if-no-files-found: error
+
   licenses:
     name: License firewall (cargo-deny, JS)
     runs-on: macos-latest

@@ -101,6 +101,35 @@ and why:
   in the same container) makes the tray fail with `Permission denied` — logged at `warn`,
   non-fatal, no tray.
 
+## Android (Epic 98, story 98.3 — gated by CI, not yet built or run anywhere)
+
+keeper builds for `aarch64-linux-android` from the same project (`gen/android`, AD-414). Its
+gate is CI's `Android (compile and debug APK)` job on `ubuntu-latest`, whose first green run
+is owed on story 98.3's pull request; until then the Android half has only been type-checked
+locally, and Gradle has never built the APK. Neither keeper's Linux dev host nor the Mac has
+an Android SDK, and the owner's tablet run (98.3 #7) is owed. What is different there, and
+why (`docs/android.md` has the whole list):
+
+- **Secrets live in an encrypted file, not a keychain.** Android's Keystore holds keys, not
+  values, so `keeper_core::secret_file` keeps every secret in one XChaCha20-Poly1305 file in
+  the app's files directory, keyed by a data key the Keystore wraps (`KeystorePlugin.kt`). A
+  tampered file, a lost Keystore key or a newer format is refused and never overwritten;
+  starting over is clearing keeper's storage in Android's settings. `keyring` is not in the
+  Android build at all (`check:android-graph`): there it would be a mock that forgets.
+- **No backups.** The manifest turns backup and device transfer off for everything.
+- **Sync is gitoxide in-process**, as on the iPhone: no `git` binary to spawn.
+- **No agent, recorder, transcription, voice or push yet** — the recorder is honestly
+  `Unsupported`; voice and UnifiedPush are story 98.4; sign-in goes through the default
+  browser until Auth Tab (codemap row 8).
+- **Sideload only**, signed with the owner's own key (`bun run install:android`); no store
+  build (DW-407).
+- **The Gradle half of the licence firewall** is two checks: a Linux test over the declared
+  coordinates (`android_gradle_dependencies_are_licensed`), and, in the CI job, every group
+  Gradle resolves for the APK — transitive dependencies included — against an allow-list
+  with each group's licence (`the_resolved_android_classpath_is_licensed`). The allow-list
+  covers groups, not single artifacts: a new artifact in a listed group passes unread
+  (DW-1290).
+
 ## Audited `unsafe` FFI inventory (shell crate only)
 
 Policy (2026-07-11): `unsafe_code` stays denied workspace-wide; the `keeper` shell crate may
