@@ -118,8 +118,17 @@ why (`docs/android.md` has the whole list):
   Android build at all (`check:android-graph`): there it would be a mock that forgets.
 - **No backups.** The manifest turns backup and device transfer off for everything.
 - **Sync is gitoxide in-process**, as on the iPhone: no `git` binary to spawn.
-- **No agent, recorder, transcription or voice yet** — the recorder is honestly
-  `Unsupported`; voice is story 98.4's last rung.
+- **No agent, recorder or transcription** — the recorder is honestly `Unsupported`.
+- **Voice only in front, from Android 13, and without turn models.** keeper records the
+  microphone itself with the device's echo canceller on it and feeds that audio to the
+  on-device recogniser in a segmented session (`voice_android.rs`, `VoicePlugin.kt`); no
+  recogniser that may use a server is ever made (`voice_on_device`). Android gives an app
+  with no microphone foreground service silence behind other apps, so listening stops when
+  keeper leaves the front, nothing is read aloud there either, and the switch you left on
+  listens again when keeper is back or opened again (DW-412). A device without an echo
+  canceller is half duplex: keeper stops listening while it speaks. `ort` has an Android
+  library but this build links none, so a turn always ends by the pause (DW-413).
+  Not yet run on a device (98.4 #10).
 - **Push is UnifiedPush, read only while keeper runs.** keeper registers with a distributor
   (the ntfy app and a server the person runs) only after the person confirmed that one, by
   name and package, in Settings on this device; it gives keeper an endpoint, keeper asks

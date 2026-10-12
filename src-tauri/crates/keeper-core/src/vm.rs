@@ -7552,6 +7552,27 @@ pub enum VoiceUnavailableVm {
         /// The sentence.
         message: String,
     },
+    /// This system is older than the first version keeper listens on
+    /// (Android 13: the on-device recogniser fed keeper's own capture).
+    SystemTooOld {
+        /// The first version that can, as a person names it.
+        needs: String,
+        /// The sentence.
+        message: String,
+    },
+    /// The device has not been read yet (Android, a moment after launch).
+    /// Not an answer: `voice_availability` reports it as a retriable error,
+    /// so a surface never draws or erases itself on it (AD-179).
+    NotReadYet {
+        /// The sentence.
+        message: String,
+    },
+    /// keeper is behind another app, where Android gives it only silence:
+    /// nothing is heard or read aloud until it is back in front.
+    LeftTheFront {
+        /// The sentence.
+        message: String,
+    },
     /// This build has no voice port (every platform but iOS today).
     Unsupported {
         /// The sentence.

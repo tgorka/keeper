@@ -25,6 +25,20 @@
 //! for that capture with [`VoicePlatform::half_duplex_sentence`] beside the
 //! switch, while the turn's rule ([`super::may_record`]) stays the
 //! platform's (Epic 68, AD-213).
+//!
+//! Android is the platform where duplex is not the platform's at all
+//! (Epic 98, story 98.4): whether the capture has an echo canceller is a
+//! fact of the device, so [`VoicePlatform::ANDROID`] is half duplex and the
+//! port answers [`VoicePlatform::android`] with what its device offers.
+
+use crate::org_account::layout::DeviceClass;
+
+/// What armed listening is on Android, beside the switch and in About — one
+/// sentence for every Android device (AD-169): it names both the device
+/// with an echo canceller and the one without, because which one this is
+/// is read from the device after the sentence may already be on screen
+/// ([`VoicePlatform::android`]).
+pub const ANDROID_LIMITS: &str = "Turn listening on while keeper is in front and it listens while keeper stays in front with the screen on. Switching to another app or turning the screen off stops it, and it starts again whenever keeper is back in front, after a relaunch too. Where this device has no echo canceller, keeper stops listening while it speaks, so saying the stop word over an answer does nothing and the button stops it. It stops when you turn it off. Android shows its microphone indicator the whole time, and listening uses battery.";
 
 /// The nouns and the one capability that differ between the platforms a
 /// [`super::VoicePort`] runs on.
@@ -111,6 +125,51 @@ impl VoicePlatform {
         // guess. What IS known is stated.
         limits: "Turn listening on while keeper is in front and it keeps listening when another app is in front. It stops when you turn it off, when the system takes the microphone away, or when keeper quits. The microphone indicator in the menu bar stays on the whole time and cannot be hidden, and listening uses battery.",
     };
+
+    /// Android: the phone or the tablet (Epic 98, story 98.4; AD-414, D-36).
+    /// The microphone grant lives on the app's own permissions page; the
+    /// on-device model is a language the system's on-device speech
+    /// recognition downloads; voices are the text-to-speech engine's.
+    ///
+    /// Half duplex here, because nothing about Android as a platform keeps
+    /// keeper's answer out of its microphone: that is a fact of the device —
+    /// whether `AcousticEchoCanceler.isAvailable()` — which the port reads at
+    /// run time and answers through [`VoicePlatform::android`] (the codemap's
+    /// Q15). The settings paths differ between makers, so each names the
+    /// page by what it is and gives the usual path as an example.
+    ///
+    /// The limits are Android's own rule for the microphone: an app with no
+    /// foreground service of the microphone type hears silence once it
+    /// leaves the front, and keeper runs none. So listening stops when
+    /// keeper leaves the front or the screen goes off, and starts again,
+    /// still switched on, when keeper is back in front (AD-168, AD-190).
+    pub const ANDROID: Self = Self {
+        noun: "phone",
+        allow: "allow the microphone for keeper under Settings > Apps > keeper > Permissions",
+        download: "download that language in the system's on-device speech recognition settings (Settings > System > Languages & input on most devices)",
+        voice_download: "install a voice for it in the system's text-to-speech settings (Settings > Accessibility > Text-to-speech output on most devices)",
+        full_duplex: false,
+        limits: ANDROID_LIMITS,
+    };
+
+    /// The Android platform a port on a device of `class` answers, where
+    /// `echo_cancelled` is whether the device offers an acoustic echo
+    /// canceller for keeper's capture (`AcousticEchoCanceler.isAvailable()`).
+    /// With one, the microphone stays open while keeper speaks and the
+    /// person can talk over an answer; without one, [`super::may_record`]
+    /// answers `false` while speaking and the turn releases the microphone
+    /// before it speaks. [`ANDROID_LIMITS`] says both.
+    #[must_use]
+    pub fn android(class: DeviceClass, echo_cancelled: bool) -> Self {
+        Self {
+            noun: match class {
+                DeviceClass::Tablet => "tablet",
+                DeviceClass::Mobile | DeviceClass::Desktop => "phone",
+            },
+            full_duplex: echo_cancelled,
+            ..Self::ANDROID
+        }
+    }
 
     /// The platform of a port that has none — the shell's absent port on a
     /// target with no voice at all. Its one sentence,

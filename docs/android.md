@@ -288,6 +288,55 @@ one stays installed (DW-1312, narrowed), no APK built yet (DW-1313), a tap's
 room forgeable through the launcher activity (DW-1314), and no retry of an
 unreachable server while keeper runs (DW-1315).
 
+## Voice
+
+Voice on Android is the iPhone's turn — the wake phrase, a question, the answer read
+aloud, talking over it — with three differences, each a fact of the platform
+(`keeper_core::voice::android`, AD-414, D-36):
+
+1. **Only in front.** Android gives an app with no microphone foreground service
+   silence once another app is in front or the screen is off, and keeper runs none.
+   Listening stops when keeper leaves the front (the turn ends with "keeper stopped
+   listening when it left the front…") and starts again, from the switch, when keeper is
+   back — and after a relaunch, as on the iPhone and the Mac: a switch you left on is
+   armed again once keeper has read the device, by the same rule (`should_rearm`,
+   AD-190); keeper never turns it on for you (AD-169). Behind another app nothing is
+   read aloud either: an answer that arrives there stays on the screen, and the turn
+   ends with the same sentence.
+2. **From Android 13.** keeper records the microphone itself — `AudioRecord` on
+   `VOICE_COMMUNICATION`, with `AcousticEchoCanceler` on where the device has one —
+   and feeds that audio to the on-device recogniser
+   (`SpeechRecognizer.createOnDeviceSpeechRecognizer`) through `EXTRA_AUDIO_SOURCE`, in
+   one segmented session whose results `keeper_core::voice::segments` joins into the
+   utterance. `EXTRA_AUDIO_SOURCE` and segmented sessions arrived in Android 13; older
+   Android is refused by name ("listening needs Android 13 or later…"). There is no
+   server recogniser in keeper: a language this device has not installed for on-device
+   recognition is refused with where to download it, never sent anywhere.
+3. **Duplex is the device's.** With an echo canceller, the microphone stays open while
+   keeper speaks and you can talk over the answer, as on the iPhone. Without one,
+   keeper stops listening while it speaks — the stop word does nothing over an answer;
+   the button still stops it. The one sentence beside the switch names both cases,
+   because which one this device is is read after the sentence may be on screen.
+
+The microphone is asked for at your first voice act (the switch or the microphone
+button), never at launch; Android has no separate speech-recognition grant. Answers are
+read by the text-to-speech engine in an installed voice that needs no network; a
+language with none stays on the screen. The turn models of Epic 97 do not run here —
+`ort` publishes an Android library, but this build links none (DW-413) — so a turn ends
+when you pause, and Settings says *Turn models are not available on Android; keeper
+waits 1.8 s after you stop*.
+
+**What is proved where.** On Linux: the joining of segments, Android's availability,
+grant, language and error rules, the platform's duplex and sentences, and the scan that
+keeps every recogniser in the app on the device (`keeper-core`'s `voice::segments`,
+`voice::android`, `tests/voice_platform.rs`, `tests/voice_on_device.rs`). The Rust port
+type-checked for `aarch64-linux-android` and `VoicePlugin.kt` compiled in a scratch copy
+of `gen/android` on Linux; nothing has linked or run them — CI's `android` job is the
+first build. The device run — the permission dialog, a spoken question and its answer, talking
+over it, whether the tablet has an echo canceller and whether recognition keeps working
+while text-to-speech plays — is story 98.4 #10, owed until its row is in
+`docs/agents.md` § *Measured*.
+
 ## Where keeper keeps its data
 
 - **The data directory** is the app's private files directory
@@ -324,14 +373,15 @@ tablet"** (on an Android phone the same lines say "phone"):
 - A folder you add here mirrors a remote your Mac already syncs and lives inside keeper's own storage: it syncs only when keeper opens, comes back in front or you pull to refresh, and nothing is merged on this tablet — the Mac merges.
 - The sessions board is here: read a session's cards, move one with Move to…, and open an agent's session room to decide its approval; creating and archiving sessions stays on your Mac. Bots talks to a model here, but the drive tools live on your Mac.
 - No screen recording and no transcription on this tablet.
-- keeper syncs and notifies about messages only while it is open. With a UnifiedPush distributor whose server is also a Matrix push gateway, your agents' approval requests and your own agent's answers reach this tablet while keeper runs in the background, read on this tablet (nothing else shows; the ids of other messages still pass through that server, and this tablet discards them); once Android has stopped keeper, a push only says that something arrived. There is no voice here yet.
+- keeper syncs and notifies about messages only while it is open. With a UnifiedPush distributor whose server is also a Matrix push gateway, your agents' approval requests and your own agent's answers reach this tablet while keeper runs in the background, read on this tablet (nothing else shows; the ids of other messages still pass through that server, and this tablet discards them); once Android has stopped keeper, a push only says that something arrived.
+- Voice works from Android 13: speech is recognised on this tablet and never sent to a server, and the answer is read aloud. There are no turn models here, so keeper waits for a pause after you stop. Turn listening on while keeper is in front and it listens while keeper stays in front with the screen on. Switching to another app or turning the screen off stops it, and it starts again whenever keeper is back in front, after a relaunch too. Where this device has no echo canceller, keeper stops listening while it speaks, so saying the stop word over an answer does nothing and the button stops it. It stops when you turn it off. Android shows its microphone indicator the whole time, and listening uses battery.
 - Updates arrive by installing a new build, signed with your own key and sideloaded.
 
 > This list is composed in Rust (`keeper_core::disclosure::android`) and shown by
 > the About screen exactly as Rust sends it; `keeper-core/tests/platform_disclosure_mirrors_docs.rs`
 > reads this list from disk and fails when the two differ. Edit both together or
-> neither. Voice arrives with story 98.4's voice rung, which rewrites the fifth
-> line again.
+> neither. The sixth line is `keeper_core::voice::android::disclosure_line`; § Voice
+> says the same at length.
 
 And, for whoever builds it:
 

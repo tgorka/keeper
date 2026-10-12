@@ -109,11 +109,11 @@ mod transcribe_ipc;
 mod transcribe_macos;
 #[cfg(desktop)]
 mod tray;
-// The voice port's platform implementations: iOS (Story 62.4, AD-165–AD-167)
-// and macOS (Story 63.4, AD-175) — the only places the Speech and AVFAudio
-// frameworks are reached, and the only voice code that is target-specific.
-// Every other target answers `unsupported` through `voice_ipc`'s absent
-// port, so the command list stays identical.
+// The voice port's platform implementations: iOS (Story 62.4, AD-165–AD-167),
+// macOS (Story 63.4, AD-175) and Android (Epic 98, story 98.4, AD-414) — the
+// only places the speech frameworks are reached, and the only voice code that
+// is target-specific. Every other target answers `unsupported` through
+// `voice_ipc`'s absent port, so the command list stays identical.
 // Android (Epic 98, story 98.3, AD-414): what `MainActivity` reports about the
 // device before the app starts, and the Keystore plugin behind the secret
 // file. Android-only; the format is `keeper_core::secret_file`'s.
@@ -130,6 +130,8 @@ mod push_ios;
 // `keeper_core::agents::{push, unifiedpush}`.
 #[cfg(target_os = "android")]
 mod push_android;
+#[cfg(target_os = "android")]
+mod voice_android;
 #[cfg(target_os = "ios")]
 mod voice_ios;
 // The island (Story 65.5, AD-194): the Live Activity that shows the phone's
@@ -336,6 +338,10 @@ pub fn run() {
     // Push through the person's UnifiedPush distributor (story 98.4).
     #[cfg(target_os = "android")]
     let builder = builder.plugin(push_android::plugin());
+    // The voice port's Kotlin half: capture, the on-device recogniser,
+    // text-to-speech (story 98.4).
+    #[cfg(target_os = "android")]
+    let builder = builder.plugin(voice_android::plugin());
     // Opt-in launch-at-login (Story 10.3, FR-53, AD-25). The autostart plugin owns
     // the LaunchAgent state authoritatively; it is off by default and only ever
     // toggled by an explicit user action via the `launch_at_login_set` command.
@@ -403,6 +409,10 @@ pub fn run() {
     let builder = builder
         .setup(|app| {
             telemetry_ipc::init(app);
+            // The Android voice port's plugin calls and its event channel
+            // (98.4), before `voice_ipc::boot` hands the port its language.
+            #[cfg(target_os = "android")]
+            voice_android::set_up();
             // Boot-time settings layers, config import and logging init
             // (Stories 22.5/22.6, 46.6/46.7) — first among the setup steps, and
             // for a sharper reason than "it always was".
@@ -1953,7 +1963,14 @@ pub fn run() {
         // cleared — the microphone allowed under Settings > keeper, a
         // language downloaded — it is armed again (Epic 65, AD-190).
         // The desktop's equivalent is the main window's focus, above.
+        //
+        // On Android the same rule runs from the voice port itself
+        // (`voice_android`, 98.4): keeper back in front — and at launch, as
+        // the iPhone's first `Resumed` does — re-reads the device, and the
+        // facts arriving with keeper in front call `voice_rearm`, so the
+        // arm never runs on facts the return has not read yet.
         tauri::RunEvent::Resumed => {
+            #[cfg(not(target_os = "android"))]
             voice_ipc::voice_rearm();
             // The phone in front again is where an agent's surface call
             // goes (AD-383); the desktop's is the main window's focus.

@@ -37,6 +37,7 @@
 //! platform, because what takes the microphone away has a name and it is not
 //! the same name on a Mac as on a phone.
 
+pub mod android;
 pub mod authorization;
 pub mod backchannel;
 pub mod banner;
@@ -48,6 +49,7 @@ pub mod locale;
 pub mod phrase;
 pub mod platform;
 pub mod request;
+pub mod segments;
 pub mod speech;
 pub mod timings;
 pub mod turn;
@@ -141,6 +143,27 @@ pub enum VoiceUnavailable {
         /// The detected language, as the detector spelled it (`pl`).
         language: String,
     },
+    /// This system is older than the first version whose on-device
+    /// recogniser can listen to keeper's own echo-cancelled capture (Epic
+    /// 98, story 98.4: Android 13, `android::VOICE_FROM_API`). Nothing in
+    /// keeper's settings changes that, and keeper will not listen through
+    /// a recogniser that might use a server instead.
+    SystemTooOld {
+        /// The first system version that can, as a person names it
+        /// (`Android 13`).
+        needs: String,
+    },
+    /// The port has not read the device yet (Epic 98, story 98.4: Android's
+    /// facts come from the Kotlin half a moment after launch, and again
+    /// after a read that failed). Not an answer: the shell keeps the
+    /// question unanswered and asks again ([`VoiceUnavailable::answered`]),
+    /// so no voice surface is drawn or erased on it (AD-179).
+    NotReadYet,
+    /// keeper is behind another app (Epic 98, story 98.4): Android gives an
+    /// app with no microphone foreground service only silence there, so
+    /// nothing is heard or read aloud until keeper is back in front
+    /// ([`android::LEFT_THE_FRONT`]).
+    LeftTheFront,
     /// This build has no voice port.
     Unsupported,
 }
@@ -182,8 +205,22 @@ impl VoiceUnavailable {
             Self::NoRecognizer => format!(
                 "this build of keeper was made without Apple's Speech framework, so it cannot recognise speech on any {noun} — no setting or language download changes that; install a build whose Xcode project links Speech.framework"
             ),
+            Self::SystemTooOld { needs } => format!(
+                "listening needs {needs} or later, and this {noun} runs an older version — keeper never sends your voice to a server instead"
+            ),
+            Self::NotReadYet => format!(
+                "keeper is still reading what this {noun} can do for voice; it answers in a moment"
+            ),
+            Self::LeftTheFront => android::LEFT_THE_FRONT.to_owned(),
             Self::Unsupported => "voice is not available in this build".to_owned(),
         }
+    }
+
+    /// Whether this is an answer at all. [`VoiceUnavailable::NotReadYet`]
+    /// is not: a surface asking now is told to ask again, rather than shown
+    /// a refusal or — worse — `Unsupported`'s absence (AD-179).
+    pub fn answered(&self) -> bool {
+        !matches!(self, Self::NotReadYet)
     }
 
     /// The refusal as the surface receives it: the kind, the locale where
@@ -208,6 +245,12 @@ impl VoiceUnavailable {
                 message,
             },
             Self::NoRecognizer => VoiceUnavailableVm::NoRecognizer { message },
+            Self::SystemTooOld { needs } => VoiceUnavailableVm::SystemTooOld {
+                needs: needs.clone(),
+                message,
+            },
+            Self::NotReadYet => VoiceUnavailableVm::NotReadYet { message },
+            Self::LeftTheFront => VoiceUnavailableVm::LeftTheFront { message },
             Self::Unsupported => VoiceUnavailableVm::Unsupported { message },
         }
     }
@@ -817,7 +860,17 @@ impl Turn {
     /// Apply `event`, carry out the effects on `port`, and if the port refuses
     /// one, fail the turn — which releases the device — and carry that out
     /// too. Returns every effect that was attempted, for the caller's log.
+    ///
+    /// The port's platform is asked again here while the turn rests (`Idle`
+    /// or `Failed`): on Android whether the device has an echo canceller is
+    /// read from the device after the turn was made (Epic 98, story 98.4;
+    /// [`VoicePlatform::android`]), and a turn must take it up before its
+    /// next question. Never mid-turn, so a turn's half-duplex rule does not
+    /// change under a microphone it already opened.
     pub fn drive(&mut self, event: TurnEvent, port: &dyn VoicePort) -> Vec<Effect> {
+        if matches!(self.state, TurnState::Idle | TurnState::Failed { .. }) {
+            self.platform = port.platform();
+        }
         let was_paused = matches!(self.state, TurnState::Paused { .. });
         let mut effects = self.apply(event);
         if let Err(why) = perform(

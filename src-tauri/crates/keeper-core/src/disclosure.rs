@@ -53,8 +53,8 @@ pub const IPHONE_LINES: [&str; 8] = [
 /// The Android lines for a device called `noun` ("tablet" or "phone"):
 /// no agent runs on it, no screen recording or transcription, the board reads,
 /// moves and decides as on the phone, push arrives through the person's
-/// UnifiedPush distributor ([`android_push_line`]), and what 98.4 has not
-/// brought yet (voice) is said as missing rather than left out.
+/// UnifiedPush distributor ([`android_push_line`]), and voice works while
+/// keeper is in front (`voice::android::disclosure_line`).
 pub fn android(noun: &str) -> Vec<String> {
     vec![
         format!("No agent runs on this {noun}: your agents run on your Mac or your server, and keeper here talks to them."),
@@ -62,6 +62,7 @@ pub fn android(noun: &str) -> Vec<String> {
         "The sessions board is here: read a session's cards, move one with Move to…, and open an agent's session room to decide its approval; creating and archiving sessions stays on your Mac. Bots talks to a model here, but the drive tools live on your Mac.".to_owned(),
         format!("No screen recording and no transcription on this {noun}."),
         android_push_line(noun),
+        crate::voice::android::disclosure_line(noun),
         "Updates arrive by installing a new build, signed with your own key and sideloaded.".to_owned(),
     ]
 }
@@ -74,7 +75,7 @@ pub fn android(noun: &str) -> Vec<String> {
 /// push status there.
 pub fn android_push_line(noun: &str) -> String {
     format!(
-        "keeper syncs and notifies about messages only while it is open. With a UnifiedPush distributor whose server is also a Matrix push gateway, your agents' approval requests and your own agent's answers reach this {noun} while keeper runs in the background, read on this {noun} (nothing else shows; the ids of other messages still pass through that server, and this {noun} discards them); once Android has stopped keeper, a push only says that something arrived. There is no voice here yet."
+        "keeper syncs and notifies about messages only while it is open. With a UnifiedPush distributor whose server is also a Matrix push gateway, your agents' approval requests and your own agent's answers reach this {noun} while keeper runs in the background, read on this {noun} (nothing else shows; the ids of other messages still pass through that server, and this {noun} discards them); once Android has stopped keeper, a push only says that something arrived."
     )
 }
 

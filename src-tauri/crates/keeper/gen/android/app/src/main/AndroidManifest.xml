@@ -1,6 +1,23 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.INTERNET" />
+    <!--
+      Voice (story 98.4): keeper records the microphone itself, with the
+      echo canceller on it, and feeds that audio to the on-device recogniser
+      (VoicePlugin). Asked for at the first deliberate voice act, never at
+      launch. The two queries let keeper see the on-device recognition
+      service and the text-to-speech engine (Android 11's package
+      visibility).
+    -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <queries>
+        <intent>
+            <action android:name="android.speech.RecognitionService" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.TTS_SERVICE" />
+        </intent>
+    </queries>
 
     <!-- AndroidTV support -->
     <uses-feature android:name="android.software.leanback" android:required="false" />

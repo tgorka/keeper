@@ -610,3 +610,80 @@ fn voice_turn_failure_reason_uses_the_turn_platform() {
         other => panic!("expected Failed, got {other:?}"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Android (Epic 98, story 98.4 #6): duplex is the device's fact.
+// ---------------------------------------------------------------------------
+
+/// Android names the phone or the tablet and is full duplex only where the
+/// device has an echo canceller — the port's fact, answered at run time — so
+/// without one the turn releases the microphone before it speaks, and with
+/// one the person can talk over the answer. Whichever it is, the sentence
+/// beside the switch is the one Android sentence (AD-169), and About shows it
+/// rather than a paraphrase. A turn made before the port read its device
+/// takes the answer up before its next question.
+#[test]
+fn voice_platform_android() {
+    use keeper_core::org_account::layout::DeviceClass;
+    use keeper_core::voice::android::disclosure_line;
+
+    assert!(!may_record(&VoicePlatform::ANDROID, &TurnState::Speaking));
+    let tablet_no_aec = VoicePlatform::android(DeviceClass::Tablet, false);
+    let phone_aec = VoicePlatform::android(DeviceClass::Mobile, true);
+    assert_eq!(tablet_no_aec.noun, "tablet");
+    assert_eq!(phone_aec.noun, "phone");
+    assert!(!may_record(&tablet_no_aec, &TurnState::Speaking));
+    assert!(may_record(&phone_aec, &TurnState::Speaking));
+    assert_eq!(tablet_no_aec.limits, VoicePlatform::ANDROID.limits);
+    assert_eq!(phone_aec.limits, VoicePlatform::ANDROID.limits);
+    assert!(disclosure_line("tablet").contains(VoicePlatform::ANDROID.limits));
+
+    for (echo_cancelled, expected) in [
+        (
+            false,
+            vec![
+                Effect::ReleaseMicrophone,
+                Effect::Speak("It is noon.".to_owned()),
+            ],
+        ),
+        (
+            true,
+            vec![
+                Effect::OpenMicrophone,
+                Effect::Speak("It is noon.".to_owned()),
+            ],
+        ),
+    ] {
+        let port = FakePort::on(VoicePlatform::android(DeviceClass::Tablet, echo_cancelled));
+        let mut turn = Turn::new(VoicePlatform::ANDROID);
+        turn.set_wake(Some(phrase()));
+        let effects = turn.drive(TurnEvent::AnswerDone("It is noon.".to_owned()), &port);
+        assert_eq!(effects, expected, "echo canceller: {echo_cancelled}");
+        assert_eq!(turn.microphone_open(), echo_cancelled);
+        assert_eq!(turn.platform().full_duplex, echo_cancelled);
+    }
+}
+
+/// An Android older than 13 is refused with the version it needs, carried
+/// to the surface beside the sentence about this device.
+#[test]
+fn voice_android_names_the_version_it_needs() {
+    use keeper_core::org_account::layout::DeviceClass;
+
+    let why = VoiceUnavailable::SystemTooOld {
+        needs: "Android 13".to_owned(),
+    };
+    let tablet = VoicePlatform::android(DeviceClass::Tablet, true);
+    let message = why.message(&tablet);
+    assert!(
+        message.contains("Android 13") && message.contains("this tablet"),
+        "{message}"
+    );
+    assert_eq!(
+        why.vm(&tablet),
+        VoiceUnavailableVm::SystemTooOld {
+            needs: "Android 13".to_owned(),
+            message,
+        }
+    );
+}

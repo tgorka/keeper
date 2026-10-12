@@ -13,7 +13,9 @@
 //! ONNX Runtime is linked statically on the two targets it ships a library
 //! for that keeper builds — Apple silicon Macs and the iPhone itself
 //! (`docs/constraints-and-limitations.md`). Everywhere else (an Intel Mac,
-//! the iOS simulator) voice keeps its pause rule and shows no turn-models line.
+//! the iOS simulator) voice keeps its pause rule and shows no turn-models
+//! line — except Android, whose voice is real and whose line says the pause
+//! decides there (Epic 98, story 98.4 #7).
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -97,8 +99,13 @@ fn follow_published() {
 
 /// The turn models' line under the voice switch, or `None` where voice runs
 /// none. Blocking: it reads the settings and hashes the turn group's plain
-/// files in the account's clone.
+/// files in the account's clone. On Android, which runs voice but links no
+/// runtime for the models (98.4 #7), the line says the pause decides
+/// (`keeper_core::voice::android::turn_models`).
 pub fn state_vm(data_dir: &Path) -> Option<ModelsStateVm> {
+    if cfg!(target_os = "android") {
+        return Some(keeper_core::voice::android::turn_models().vm());
+    }
     if !supported() {
         return None;
     }

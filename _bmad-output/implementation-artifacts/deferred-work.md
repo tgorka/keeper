@@ -7518,6 +7518,7 @@ status: open
 origin: epic 98's plan, 2026-10-02 (story 98.4's Q10; AD-414)
 location: `src-tauri/crates/keeper/src/voice_android.rs`, `src-tauri/crates/keeper/gen/android/` (no foreground service), `docs/android.md` (*Limitations*)
 reason: Android allows background microphone use only from a foreground service of type `microphone`; AD-414 uses none, because Tauri's open bug #15671 leaves a blank webview on relaunch after a foreground service kept the process alive (research §11.6). So on the tablet a spoken turn works with keeper in front and stops with the screen off, narrower than the iPhone, which listens with the screen locked. Revisit when Tauri fixes #15671 (or its kin stops reproducing) and the owner wants hands-free listening on the tablet: a `microphone` foreground service started only while listening is armed, with its notification, and the disclosure line changed.
+**98.4 built it (rung `agents-98-android-voice`, 2026-10-12; R360, fix round 1):** `VoicePlugin.onPause` reports `background`, the port stops listening and the turn ends with `voice::android::LEFT_THE_FRONT`; behind another app `voice::android::act` refuses both listening and reading aloud (`VoiceUnavailable::LeftTheFront`), and the facts read on the return arm the switch again through `should_rearm`. The `microphone` foreground service above is still the only way to listen behind other apps.
 status: open
 
 ### DW-413: Android's voice runs without the turn models where `ort` has no Android runtime.
@@ -7525,6 +7526,7 @@ status: open
 origin: epic 98's plan, 2026-10-02 (story 98.4's Q9; AD-410, AD-414)
 location: `src-tauri/crates/keeper/src/voice_android.rs`, `src-tauri/crates/keeper-core/src/voice/turn_models.rs`
 reason: The turn models run through `ort`; a prebuilt ONNX Runtime for `aarch64-linux-android` is `[UNVERIFIED]`, and building one from source is a native toolchain keeper does not carry. Without it, Android ends a turn by the 1800 ms pause and tells a backchannel from an interruption by the word list alone (FR-814's fallback, 97.3's rule without models). 98.4 states which branch it built; this entry stays open only if it built the fallback. Revisit when an Android runtime is available to `ort` (prebuilt, or built in the Android CI job): load the same `_models/` roles as the iPhone.
+**98.4 built the fallback (rung `agents-98-android-voice`, 2026-10-12; R361).** `ort` 2.0.0-rc.13 does list a prebuilt `aarch64-linux-android` (+nnapi) library in `ort-sys/build/download/dist.tsv`, so the runtime is no longer `[UNVERIFIED]`; what is missing is (a) the capture's PCM in Rust — Android's capture is `VoicePlugin.kt`'s `AudioRecord`, which reaches Rust only through a JSON channel, so the end-of-turn ear needs a JNI audio bridge — and (b) a link of the library into `libkeeper_lib.so`, which only an APK build proves. Settings says *Turn models are not available on Android; keeper waits 1.8 s after you stop* (`voice::android::turn_models`).
 status: open
 
 ### DW-414: Gate sessions block and ask; they do not use the quarantined-model pattern.
@@ -10285,4 +10287,67 @@ status: open
 origin: epic 98, story 98.4 (review-98unifiedpush-1, DW candidate; fix round 1, 2026-10-12)
 location: `src-tauri/crates/keeper/src/push_android.rs` (`message`), `AccountManager::push_shown`
 reason: `push_shown` reads the pushed event again every `DECRYPT_POLL` for up to `DECRYPT_BUDGET` while it cannot be decrypted, per push, and pushes are handled concurrently; anyone holding the endpoint (a capability) can make keeper do that and post its generic notification at will — keeper's words, no action. A bound on concurrent reads would cap it.
+status: open
+
+### DW-1320: Android voice has not been built into an APK or run.
+
+origin: epic 98, story 98.4 (rung `agents-98-android-voice`, 2026-10-12; R360)
+location: `src-tauri/crates/keeper/src/voice_android.rs`, `gen/android/app/src/main/java/dev/tgorka/keeper/VoicePlugin.kt`, `AndroidManifest.xml`
+reason: The Rust port type-checked for `aarch64-linux-android`; nothing linked, packaged or ran it, and the Kotlin is compiled only where the rung's report says so. The tablet run of 98.4 #10's voice part is owed: the microphone dialog at the first voice act (no crash, Tauri #15506), a spoken question reaching Nixi and its answer read aloud, talking over it where the echo canceller exists, listening stopping when keeper leaves the front and coming back with it, and the row in `docs/agents.md` § *Measured* — whether `AcousticEchoCanceler.isAvailable()` is true and whether on-device recognition keeps working while text-to-speech plays.
+status: open
+
+### DW-1321: Whether Android's echo canceller removes keeper's own text-to-speech is unmeasured.
+
+origin: epic 98, story 98.4 (rung `agents-98-android-voice`, 2026-10-12; R360)
+location: `VoicePlugin.kt` (`startCapture`, `withTts`)
+reason: Capture is `VOICE_COMMUNICATION` with `AcousticEchoCanceler` on its session; text-to-speech plays as `USAGE_ASSISTANT`. Whether a device's canceller takes that stream as its echo reference (some only reference the voice-call path, which would need `AudioManager.MODE_IN_COMMUNICATION`) is a device fact. Until measured, a full-duplex tablet may hear its own answer as a barge-in; the iPhone's tail gate (`TAIL_GATE`) has no Android twin yet.
+status: open
+
+### DW-1322: Android's port detects no language, so an answer is read in the listening language.
+
+origin: epic 98, story 98.4 (rung `agents-98-android-voice`, 2026-10-12; R360)
+location: `AndroidVoicePort::detect_language` (`voice_android.rs`)
+reason: Android's language identification is the system's `TextClassifier`, which may be a vendor service keeper cannot hold to the device (AD-188 asks for on-device detection or none). The model is asked to answer in the listening language (`speech::answer_instruction`), so this is usually right; an answer in another language is read in the listening language's voice. Revisit with an on-device identifier keeper ships or can prove local.
+status: open
+
+### DW-1323: The Android sentences' Settings paths are examples, not checked on the owner's tablet.
+
+origin: epic 98, story 98.4 (rung `agents-98-android-voice`, 2026-10-12; R360)
+location: `VoicePlatform::ANDROID` (`keeper-core/src/voice/platform.rs`)
+reason: Where on-device recognition languages and text-to-speech voices are installed differs between Android versions and makers, so `download` and `voice_download` name the page and give "Settings > System > Languages & input" / "Settings > Accessibility > Text-to-speech output" as the usual path "on most devices". The tablet run should record the real paths and the sentences follow them.
+status: open
+
+### DW-1325: Android has no twin of AD-209's tail gate.
+
+origin: review-98androidvoice-1 (rung `agents-98-android-voice` fix round 1, 2026-10-12; R364)
+location: `src-tauri/crates/keeper/src/voice_android.rs` (`spoken` → `Silence`), `keeper_core::voice` (AD-209)
+reason: After the last utterance is read the port reports `Silence` at once, and the recogniser pipeline's last few hundred milliseconds of keeper's own voice can come back as a partial in `Idle`, where the wake phrase is matched; an answer that contains the phrase on a device whose canceller leaves some of it through could wake keeper by itself. The Apple ports gate the tail (AD-209); Android does not yet. Pair with DW-1321's measurement.
+status: open
+
+### DW-1326: Whether an answer that arrives behind another app should be read aloud is a stated choice.
+
+origin: review-98androidvoice-1 (R98AV1-05's second half; R364)
+location: `keeper_core::voice::android::act`
+reason: The iPhone reads an answer behind other apps (its audio session keeps running); Android without a microphone foreground service gives keeper only silence to listen to there, and this round chose that nothing is read aloud either — the answer stays on the screen and the turn ends with `LEFT_THE_FRONT`. If the owner wants answers read behind other apps on the tablet, that is a change to `act` and to `docs/android.md` § Voice, not to the port.
+status: open
+
+### DW-1327: `SpeechRecognizer.triggerModelDownload` could offer the language download in place.
+
+origin: review-98androidvoice-1 (DW candidate; R364)
+location: `VoicePlugin.kt`, `VoicePlatform::ANDROID.download`
+reason: Android 13 has `triggerModelDownload` for an on-device recogniser's language; the refusal now names a Settings path (DW-1323) instead. Offering the download from the refusal is a new act with its own consent and progress.
+status: open
+
+### DW-1328: A text-to-speech engine that failed to start stays failed for the process.
+
+origin: review-98androidvoice-1 (DW candidate; R364)
+location: `VoicePlugin.kt` (`withTts`: `ttsReady = true`, `tts = null` on a failed init)
+reason: An engine installed or fixed after launch is seen only after a relaunch; until then `facts` lists no voices and every answer is refused as having no voice. Re-initialising on the next `facts` read would pick it up.
+status: open
+
+### DW-1329: The device's facts are read twice at launch.
+
+origin: review-98androidvoice-1 (DW candidate; R364)
+location: `voice_android::set_up`, `voice_ipc::boot` (`set_locale` → `refresh`)
+reason: `set_up` reads the facts and `boot`'s `set_locale` reads them again a moment later, each making a checker recogniser; harmless — the second read re-arms through `should_rearm`, which is idempotent — but one read would do.
 status: open

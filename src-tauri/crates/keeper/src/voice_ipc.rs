@@ -61,8 +61,9 @@
 //!
 //! # Every target
 //!
-//! iOS has a port ([`crate::voice_ios`]) and so does macOS
-//! ([`crate::voice_macos`], Story 63.4); every other target holds
+//! iOS has a port ([`crate::voice_ios`]), so does macOS
+//! ([`crate::voice_macos`], Story 63.4) and so does Android
+//! (`crate::voice_android`, Epic 98 story 98.4); every other target holds
 //! [`AbsentPort`], whose every answer is [`VoiceUnavailable::Unsupported`],
 //! so the command list is identical everywhere and a desktop that asks gets
 //! a sentence rather than "command not found" (AD-27, the `sessions_ipc`
@@ -78,13 +79,13 @@ use keeper_core::voice::end_of_turn::Heard;
 use keeper_core::voice::events::VoiceEventKind;
 use keeper_core::voice::speech::Sentence;
 use keeper_core::voice::timings::TurnClock;
-#[cfg(any(target_os = "ios", target_os = "macos"))]
+#[cfg(any(target_os = "ios", target_os = "macos", target_os = "android"))]
 use keeper_core::voice::EventSink;
 use keeper_core::voice::{
     locale, should_rearm, silence_budget, ConsentPort, Effect, Turn, TurnEvent, TurnState,
     VoicePort, WakePhrase,
 };
-#[cfg(not(any(target_os = "ios", target_os = "macos")))]
+#[cfg(not(any(target_os = "ios", target_os = "macos", target_os = "android")))]
 use keeper_core::voice::{VoicePlatform, VoiceUnavailable};
 use tauri::ipc::Channel;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -190,24 +191,46 @@ fn platform_consent() -> Arc<dyn ConsentPort> {
     macos_port()
 }
 
+/// The one Android port (Epic 98, story 98.4): the same object answers as
+/// [`VoicePort`] and as [`ConsentPort`], and the plugin's event channel
+/// (`voice_android`) hands it what the recogniser and the engine report.
+#[cfg(target_os = "android")]
+pub(crate) fn android_port() -> Arc<crate::voice_android::AndroidVoicePort> {
+    static PORT: std::sync::LazyLock<Arc<crate::voice_android::AndroidVoicePort>> =
+        std::sync::LazyLock::new(|| Arc::new(crate::voice_android::AndroidVoicePort::new(sink())));
+    Arc::clone(&PORT)
+}
+
 /// The port for this target.
-#[cfg(not(any(target_os = "ios", target_os = "macos")))]
+#[cfg(target_os = "android")]
+fn platform_port() -> Arc<dyn VoicePort> {
+    android_port()
+}
+
+/// The consent half for this target (FR-408).
+#[cfg(target_os = "android")]
+fn platform_consent() -> Arc<dyn ConsentPort> {
+    android_port()
+}
+
+/// The port for this target.
+#[cfg(not(any(target_os = "ios", target_os = "macos", target_os = "android")))]
 fn platform_port() -> Arc<dyn VoicePort> {
     Arc::new(AbsentPort)
 }
 
 /// The consent half for this target: nothing to ask for.
-#[cfg(not(any(target_os = "ios", target_os = "macos")))]
+#[cfg(not(any(target_os = "ios", target_os = "macos", target_os = "android")))]
 fn platform_consent() -> Arc<dyn ConsentPort> {
     Arc::new(AbsentPort)
 }
 
 /// The port every target without one holds: honest, non-panicking,
 /// unsupported.
-#[cfg(not(any(target_os = "ios", target_os = "macos")))]
+#[cfg(not(any(target_os = "ios", target_os = "macos", target_os = "android")))]
 struct AbsentPort;
 
-#[cfg(not(any(target_os = "ios", target_os = "macos")))]
+#[cfg(not(any(target_os = "ios", target_os = "macos", target_os = "android")))]
 impl VoicePort for AbsentPort {
     /// No platform to name: this port covers every target without one, and
     /// its one sentence names no device.
@@ -251,7 +274,7 @@ impl VoicePort for AbsentPort {
     fn finish_recognition(&self, _finish: u64) {}
 }
 
-#[cfg(not(any(target_os = "ios", target_os = "macos")))]
+#[cfg(not(any(target_os = "ios", target_os = "macos", target_os = "android")))]
 impl ConsentPort for AbsentPort {
     fn consent(&self) -> Result<keeper_core::voice::Consent, VoiceUnavailable> {
         Err(VoiceUnavailable::Unsupported)
@@ -263,7 +286,7 @@ impl ConsentPort for AbsentPort {
 
 /// Where the port delivers what it heard: off the framework thread, onto the
 /// runtime, into [`transition`].
-#[cfg(any(target_os = "ios", target_os = "macos"))]
+#[cfg(any(target_os = "ios", target_os = "macos", target_os = "android"))]
 fn sink() -> EventSink {
     Arc::new(deliver)
 }
@@ -275,7 +298,7 @@ fn sink() -> EventSink {
 /// `keeper_core::voice::level::Meter` is the limiter, so one spawned task
 /// per reading is the whole cost here and no coalescing is needed. Every
 /// other event is a transition.
-#[cfg(any(target_os = "ios", target_os = "macos"))]
+#[cfg(any(target_os = "ios", target_os = "macos", target_os = "android"))]
 fn deliver(event: TurnEvent) {
     tauri::async_runtime::spawn(async move {
         match event {
@@ -288,7 +311,7 @@ fn deliver(event: TurnEvent) {
 
 /// The synthesiser read one utterance of the answer to its end: the
 /// question's mark counts it. Not a transition.
-#[cfg(any(target_os = "ios", target_os = "macos"))]
+#[cfg(any(target_os = "ios", target_os = "macos", target_os = "android"))]
 fn sentence_spoken() {
     let mut voice = voice();
     let question = voice.turn.question();
@@ -305,7 +328,7 @@ fn sentence_spoken() {
 /// not touched. A level that moved would otherwise re-arm the
 /// end-of-utterance pause on every reading, and a room with any noise in it
 /// would never let a sentence end.
-#[cfg(any(target_os = "ios", target_os = "macos"))]
+#[cfg(any(target_os = "ios", target_os = "macos", target_os = "android"))]
 fn meter(level: f32) {
     let mut voice = voice();
     let before = voice.turn.level();
@@ -734,15 +757,54 @@ fn refused(message: String) -> IpcError {
 /// the one line that tells a log reader whether voice is alive on this
 /// phone — a build that shipped without its recogniser was once invisible
 /// precisely because nothing wrote this down.
+///
+/// Asked on the blocking pool, never on the caller's thread: a port may
+/// wait for what it has not read yet (Android's first facts, Epic 98 story
+/// 98.4), and the thing it waits for may need the main thread.
 #[tauri::command]
-pub fn voice_availability() -> Result<Option<VoiceUnavailableVm>, IpcError> {
+pub async fn voice_availability() -> Result<Option<VoiceUnavailableVm>, IpcError> {
+    tauri::async_runtime::spawn_blocking(availability_now)
+        .await
+        .map_err(|error| IpcError {
+            code: IpcErrorCode::Internal,
+            message: format!("voice availability was not answered: {error}"),
+            account_id: None,
+            retriable: true,
+        })?
+}
+
+/// [`voice_availability`]'s answer, on the thread that asks — also what the
+/// reach surfaces read (`voice_reach::present`).
+pub(crate) fn availability_now() -> Result<Option<VoiceUnavailableVm>, IpcError> {
     let port = Arc::clone(&voice().port);
     let refusal = port.availability().err();
     match &refusal {
         Some(why) => tracing::info!(?why, "voice: unavailable"),
         None => tracing::info!("voice: available"),
     }
-    Ok(refusal.as_ref().map(|why| why.vm(&port.platform())))
+    refusal
+        .as_ref()
+        .map(|why| refusal_vm(why, &port.platform()))
+        .transpose()
+}
+
+/// A refusal as the surface receives it — or, for a question the port could
+/// not answer yet (`VoiceUnavailable::answered`: Android before it has read
+/// the device), a retriable error, so the surface keeps the question
+/// unanswered and draws nothing on it (AD-179).
+fn refusal_vm(
+    why: &keeper_core::voice::VoiceUnavailable,
+    platform: &keeper_core::voice::VoicePlatform,
+) -> Result<VoiceUnavailableVm, IpcError> {
+    if why.answered() {
+        return Ok(why.vm(platform));
+    }
+    Err(IpcError {
+        code: IpcErrorCode::Internal,
+        message: why.message(platform),
+        account_id: None,
+        retriable: true,
+    })
 }
 
 /// Register `channel` as the watcher and return its id.
@@ -913,14 +975,11 @@ pub const VOICE_WAKE_EVENT: &str = "keeper://voice-wake";
 
 /// Send the wake VM as it reads now on [`VOICE_WAKE_EVENT`]. What the line
 /// says is `keeper_core::voice::turn_models`'s; this only says it may have
-/// moved. Blocking — the line hashes the turn group's files — so a caller on
-/// the async runtime runs it through `spawn_blocking`. Nothing before
-/// [`boot`], and nothing where voice runs no turn models: that wake VM
-/// carries no line to move.
+/// moved — and so may the port's languages and its sentence beside the
+/// switch, which Android reads off the device after launch (98.4). Blocking
+/// — the line hashes the turn group's files — so a caller on the async
+/// runtime runs it through `spawn_blocking`. Nothing before [`boot`].
 pub fn announce_wake() {
-    if !crate::voice_turn_models::supported() {
-        return;
-    }
     let (app, data_dir, port) = {
         let voice = voice();
         let (Some(app), Some(data_dir)) = (voice.app.clone(), voice.data_dir.clone()) else {
@@ -1245,7 +1304,11 @@ pub async fn voice_authorize() -> Result<Option<VoiceUnavailableVm>, IpcError> {
             rearm_locked(&mut voice, &data_dir)?;
         }
     }
-    Ok(verdict.err().as_ref().map(|why| why.vm(&platform)))
+    verdict
+        .err()
+        .as_ref()
+        .map(|why| refusal_vm(why, &platform))
+        .transpose()
 }
 
 /// Story 68.1 (AD-212), the failure shape Epic 67 must not repeat: every

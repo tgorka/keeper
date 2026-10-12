@@ -170,6 +170,12 @@ pub enum TurnModelsState {
     Failed {
         sentence: String,
     },
+    /// This build has no runtime for the turn models on `platform` (Android,
+    /// Epic 98 story 98.4 #7: `android::turn_models`), so a turn always ends
+    /// by the pause.
+    Unavailable {
+        platform: String,
+    },
 }
 
 /// Readiness first: models that may be loaded and were are `Ready` even while
@@ -512,6 +518,9 @@ impl TurnModelsState {
                 "Fetching the turn models from your account\u{2026} {fallback} until they are here"
             ),
             Self::Failed { sentence } => format!("{sentence} \u{2014} {fallback}"),
+            Self::Unavailable { platform } => {
+                format!("Turn models are not available on {platform}; {fallback}")
+            }
         }
     }
 
@@ -524,6 +533,7 @@ impl TurnModelsState {
             Self::Refused { .. } | Self::Failed { .. } => ModelsState::Failed,
             Self::NoAccount => ModelsState::NoAccount,
             Self::Fetching => ModelsState::Fetching,
+            Self::Unavailable { .. } => ModelsState::Unavailable,
         };
         let missing = match self {
             Self::Missing { files } => files.clone(),

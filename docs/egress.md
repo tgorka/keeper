@@ -358,6 +358,17 @@ and fails when the two lists differ. Edit both together or neither.
 - Nothing is recorded or uploaded; what you said reaches only the model endpoint you configured, as text.
 - keeper does not lower other audio while it listens or speaks, because macOS has no audio session that could; it stops listening while it talks instead.
 
+The Android port (`crates/keeper/src/voice_android.rs` over `gen/android/…/VoicePlugin.kt`,
+Epic 98, story 98.4) adds no destination either. Every recogniser it makes is
+`SpeechRecognizer.createOnDeviceSpeechRecognizer`, after `isOnDeviceRecognitionAvailable`, fed
+keeper's own capture through a pipe; the factory for a recogniser that may use a server never
+appears in the app, and `voice_on_device` reads every Kotlin file of the app to keep it so. An
+answer is read only by a text-to-speech voice that is installed and needs no network
+(`Voice.isNetworkConnectionRequired`); a language with none is refused, as on the Apple
+platforms. Android's language identifier is the system's text classifier, which may be a
+vendor service, so the Android port detects no language and reads the answer in the
+listening language.
+
 ### A spoken answer's language is decided on the device
 
 Epic 64 (Story 64.2, AD-182, AD-183, AD-188) makes keeper choose a voice for the answer it reads
