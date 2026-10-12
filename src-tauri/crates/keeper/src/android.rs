@@ -121,3 +121,31 @@ impl KeyProvider for KeystoreKey {
         Ok(key)
     }
 }
+
+/// The registered `AuthTabPlugin`, set once by [`auth_tab_plugin`]'s setup.
+static AUTH_TAB: OnceLock<PluginHandle<Wry>> = OnceLock::new();
+
+/// The Tauri plugin that registers the Kotlin `AuthTabPlugin` (class
+/// `dev.tgorka.keeper.AuthTabPlugin` in the app module), through which a
+/// sign-in's authorization page opens in an Auth Tab (`web_auth::start_in`).
+pub fn auth_tab_plugin() -> TauriPlugin<Wry> {
+    Builder::new("keeper-auth-tab")
+        .setup(|_app, api| {
+            let handle = api.register_android_plugin("dev.tgorka.keeper", "AuthTabPlugin")?;
+            let _ = AUTH_TAB.set(handle);
+            Ok(())
+        })
+        .build()
+}
+
+/// Open `url` in an Auth Tab that returns on `scheme`, and wait for how it
+/// ended — for as long as the person takes, without holding a thread.
+pub async fn auth_tab(url: &str, scheme: &str) -> Result<crate::web_auth::AuthTabAnswer, String> {
+    let handle = AUTH_TAB
+        .get()
+        .ok_or_else(|| "the sign-in tab is not available before keeper has started".to_owned())?;
+    handle
+        .run_mobile_plugin_async("start", serde_json::json!({ "url": url, "scheme": scheme }))
+        .await
+        .map_err(|error| format!("the sign-in tab did not answer: {error}"))
+}

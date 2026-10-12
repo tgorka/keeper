@@ -30,7 +30,11 @@ use matrix_sdk_ui::timeline::Timeline;
 use matrix_sdk_ui::timeline::{MsgLikeKind, TimelineItemContent, TimelineItemKind};
 use url::Url;
 
+use crate::asset_url::{self, UrlForm};
 use crate::error::MediaError;
+
+/// The custom URI scheme media bytes are served over.
+pub const SCHEME: &str = "keeper-media";
 
 /// The fixed host of every `keeper-media://` URL. A constant so the parser can
 /// reject a foreign host.
@@ -96,16 +100,30 @@ pub struct MediaBytes {
 }
 
 /// Build the opaque `keeper-media://` URL for one media attachment variant
-/// (Story 3.6, AD-4). Pure and round-trippable via [`parse_media_url`].
-///
-/// The URL is `keeper-media://media/<account>/<room>/<item>/<variant>` with each
-/// segment percent-encoded by the `url` crate, so odd room ids (`!a/b:host`) and
-/// keys survive intact. It carries **only** data the frontend already holds — no
-/// `mxc`, `EncryptedFile`, or key material ever appears.
+/// (Story 3.6, AD-4), in this build's spelling ([`UrlForm::HOST`]). Pure and
+/// round-trippable via [`parse_media_url`].
 pub fn media_url(account_id: &str, room_id: &str, item_key: &str, variant: MediaVariant) -> String {
+    media_url_in(UrlForm::HOST, account_id, room_id, item_key, variant)
+}
+
+/// [`media_url`] in a given spelling (Epic 98, story 98.3 #3).
+///
+/// The URL is `keeper-media://media/<account>/<room>/<item>/<variant>` — or,
+/// where the webview cannot load a custom scheme, the same host and path under
+/// `http://keeper-media.localhost/` — with each segment percent-encoded by the
+/// `url` crate, so odd room ids (`!a/b:host`) and keys survive intact. It
+/// carries **only** data the frontend already holds — no `mxc`,
+/// `EncryptedFile`, or key material ever appears.
+pub fn media_url_in(
+    form: UrlForm,
+    account_id: &str,
+    room_id: &str,
+    item_key: &str,
+    variant: MediaVariant,
+) -> String {
     // Start from a bare base with the fixed host, then push percent-encoded path
     // segments so no separator inside a segment is ever mis-parsed.
-    let mut url = Url::parse(&format!("keeper-media://{MEDIA_HOST}"))
+    let mut url = Url::parse(&format!("{SCHEME}://{MEDIA_HOST}"))
         .expect("static keeper-media base URL is always valid");
     {
         // `path_segments_mut` fails only for a cannot-be-a-base URL; ours always
@@ -119,17 +137,21 @@ pub fn media_url(account_id: &str, room_id: &str, item_key: &str, variant: Media
             .push(item_key)
             .push(variant.as_str());
     }
-    url.to_string()
+    // The host and path, exactly as `url` encoded them, carried by either
+    // spelling unchanged.
+    let rest = url.as_str().get(SCHEME.len() + 3..).unwrap_or_default();
+    asset_url::compose(form, SCHEME, rest)
 }
 
-/// Parse a `keeper-media://` URL back into a [`MediaHandle`] (Story 3.6, AD-4),
-/// or `None` for any malformed / foreign-scheme / foreign-host / wrong-arity URL.
-/// The inverse of [`media_url`] — percent-decoding each segment.
+/// Parse a `keeper-media://` URL, in either spelling, back into a
+/// [`MediaHandle`] (Story 3.6, AD-4; Epic 98, story 98.3 #3), or `None` for any
+/// malformed / foreign-scheme / foreign-host / wrong-arity URL. The inverse of
+/// [`media_url_in`] — percent-decoding each segment.
 pub fn parse_media_url(raw: &str) -> Option<MediaHandle> {
-    let url = Url::parse(raw).ok()?;
-    if url.scheme() != "keeper-media" {
-        return None;
-    }
+    // Read the host and path back under the scheme spelling, so both spellings
+    // go through one parse.
+    let rest = asset_url::strip(raw, SCHEME)?;
+    let url = Url::parse(&asset_url::compose(UrlForm::Scheme, SCHEME, rest)).ok()?;
     if url.host_str() != Some(MEDIA_HOST) {
         return None;
     }
@@ -344,7 +366,7 @@ mod tests {
 
     #[test]
     fn media_url_uses_fixed_scheme_and_host() {
-        let url = media_url("a", "r", "k", MediaVariant::Full);
+        let url = media_url_in(UrlForm::Scheme, "a", "r", "k", MediaVariant::Full);
         assert!(
             url.starts_with("keeper-media://media/"),
             "unexpected url: {url}"
@@ -384,6 +406,51 @@ mod tests {
     fn parse_media_url_rejects_garbage() {
         assert_eq!(parse_media_url("not a url at all"), None);
         assert_eq!(parse_media_url(""), None);
+    }
+
+    #[test]
+    fn the_localhost_spelling_carries_the_same_handle() {
+        // Android's WebView cannot load `keeper-media://`; Tauri serves the
+        // protocol at `http://keeper-media.localhost/` with the host moved into
+        // the path (story 98.3 #3).
+        let url = media_url_in(
+            UrlForm::Localhost,
+            "a b",
+            "!r/x:h",
+            "k?1",
+            MediaVariant::Thumbnail,
+        );
+        assert_eq!(
+            url,
+            "http://keeper-media.localhost/media/a%20b/!r%2Fx:h/k%3F1/thumb"
+        );
+        let scheme = media_url_in(
+            UrlForm::Scheme,
+            "a b",
+            "!r/x:h",
+            "k?1",
+            MediaVariant::Thumbnail,
+        );
+        assert_eq!(scheme, "keeper-media://media/a%20b/!r%2Fx:h/k%3F1/thumb");
+        assert_eq!(parse_media_url(&url), parse_media_url(&scheme));
+        assert_eq!(
+            parse_media_url(&url).map(|handle| handle.room_id),
+            Some("!r/x:h".to_owned())
+        );
+        // A cache-busting query still names the same handle.
+        assert_eq!(
+            parse_media_url(&format!("{url}?retry=1")),
+            parse_media_url(&scheme)
+        );
+        // Another host under the localhost spelling is refused, as in the other.
+        assert_eq!(
+            parse_media_url("http://keeper-media.localhost/evil/a/r/k/full"),
+            None
+        );
+        assert_eq!(
+            parse_media_url("http://keeper-file.localhost/media/a/r/k/full"),
+            None
+        );
     }
 
     fn image_msgtype_plain() -> MessageType {

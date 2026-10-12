@@ -2,6 +2,7 @@ import { act, renderHook } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { useShellLayout } from "@/hooks/use-shell-layout";
 import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
+import { platformStore } from "@/lib/stores/platform";
 
 /**
  * Mock matchMedia so that any query with a `max-width: <bp>` matches when the
@@ -130,5 +131,106 @@ describe("useShellLayout", () => {
       capabilitiesStore.getState().applySnapshot(DEFAULT_CAPABILITIES);
     });
     expect(result.current.phone).toBe(true);
+  });
+});
+
+/**
+ * A viewport of `width` × `height` that answers `max-width`, `min-width` and
+ * `min-height` features, joined by `and`, the way a browser does. `resize`
+ * changes it and fires every registered `change` listener, as a browser does
+ * when the on-screen keyboard resizes the layout viewport.
+ */
+function mockViewport(width: number, height: number) {
+  const viewport = { width, height };
+  const listeners = new Set<() => void>();
+  window.matchMedia = vi.fn().mockImplementation((query: string) => ({
+    get matches() {
+      return query.split(" and ").every((feature) => {
+        const [, name, px] = feature.match(/(max-width|min-width|min-height):\s*(\d+)px/) ?? [];
+        const bound = Number(px);
+        return name === "max-width"
+          ? viewport.width <= bound
+          : name === "min-width"
+            ? viewport.width >= bound
+            : name === "min-height"
+              ? viewport.height >= bound
+              : true;
+      });
+    },
+    media: query,
+    onchange: null,
+    addEventListener: (_: string, listener: () => void) => listeners.add(listener),
+    removeEventListener: (_: string, listener: () => void) => listeners.delete(listener),
+    addListener: vi.fn(),
+    removeListener: vi.fn(),
+    dispatchEvent: vi.fn(),
+  }));
+  return {
+    resize(nextWidth: number, nextHeight: number) {
+      viewport.width = nextWidth;
+      viewport.height = nextHeight;
+      for (const listener of listeners) {
+        listener();
+      }
+    },
+  };
+}
+
+// ── The tablet (Epic 98, story 98.3 #5, UX-DR146) ─────────────────────────────
+// Android's capabilities are the phone's: every `cfg!(desktop)` flag false.
+// Whether the device is a tablet is Rust's fact (`PlatformVm.tablet`).
+describe("useShellLayout on an Android tablet", () => {
+  const ANDROID: typeof DEFAULT_CAPABILITIES = {
+    ...DEFAULT_CAPABILITIES,
+    bots: true,
+    sync: true,
+    notes: true,
+    sessions: true,
+  };
+  const facts = (tablet: boolean) => ({ urlForm: "localhost" as const, tablet, disclosure: null });
+
+  afterEach(() => {
+    platformStore.getState().applySnapshot({ urlForm: "scheme", tablet: false, disclosure: null });
+  });
+
+  it.each([
+    // [width, height, device is a tablet, tablet, split]
+    [800, 1280, true, true, false], // a tablet upright: the phone's stack, plus the dock
+    [1280, 800, true, true, true], // a tablet on its side: rooms list and room side by side
+    [840, 600, true, true, true], // the first split width
+    [839, 1280, true, true, false], // one dp short of the split
+    [430, 932, false, false, false], // a phone upright
+    [932, 430, false, false, false], // a phone on its side is still a phone
+    [1000, 700, false, false, false], // a phone-class device with a large viewport stays a phone
+  ])("at %i × %i on a device Rust calls a tablet: %s, is a tablet: %s, side by side: %s", (width, height, device, tablet, split) => {
+    mockViewport(width, height);
+    capabilitiesStore.getState().applySnapshot(ANDROID);
+    platformStore.getState().applySnapshot(facts(device));
+    const { result } = renderHook(() => useShellLayout());
+    expect(result.current).toMatchObject({ phone: true, tablet, split });
+  });
+
+  it("stays a tablet, side by side, when the keyboard shrinks the viewport", () => {
+    const viewport = mockViewport(1280, 800);
+    capabilitiesStore.getState().applySnapshot(ANDROID);
+    platformStore.getState().applySnapshot(facts(true));
+    const { result } = renderHook(() => useShellLayout());
+    expect(result.current).toMatchObject({ tablet: true, split: true });
+    // A landscape keyboard takes well over 200 dp of the layout viewport
+    // (`interactive-widget=resizes-content`).
+    act(() => viewport.resize(1280, 450));
+    expect(result.current).toMatchObject({ phone: true, tablet: true, split: true });
+  });
+
+  it("never calls a desktop window a tablet, however large", () => {
+    mockViewport(1280, 800);
+    capabilitiesStore.getState().applySnapshot({
+      ...DEFAULT_CAPABILITIES,
+      trayIcon: true,
+      globalHotkey: true,
+    });
+    platformStore.getState().applySnapshot(facts(true));
+    const { result } = renderHook(() => useShellLayout());
+    expect(result.current).toMatchObject({ phone: false, tablet: false, split: false });
   });
 });

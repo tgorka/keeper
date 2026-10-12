@@ -119,8 +119,15 @@ why (`docs/android.md` has the whole list):
 - **No backups.** The manifest turns backup and device transfer off for everything.
 - **Sync is gitoxide in-process**, as on the iPhone: no `git` binary to spawn.
 - **No agent, recorder, transcription, voice or push yet** — the recorder is honestly
-  `Unsupported`; voice and UnifiedPush are story 98.4; sign-in goes through the default
-  browser until Auth Tab (codemap row 8).
+  `Unsupported`; voice and UnifiedPush are story 98.4.
+- **Sign-in is an Auth Tab**, which returns the callback as the activity's result; a
+  browser without Auth Tab falls back to a Custom Tab and the claimable `keeper://` deep
+  link (PKCE-protected). A verified `https` App Link needs a per-signer `assetlinks.json`
+  and homeservers that accept `https` from a native client (DW-1300).
+- **keeper's own URLs are spelled `http://<scheme>.localhost/…`**: Android's WebView cannot
+  load a custom scheme (`keeper_core::asset_url::UrlForm::HOST`).
+- **The tablet** shows the phone's surfaces, the rooms list beside the open room at ≥ 840 dp
+  and the proxy dock as a sheet; desktop-only panes stay absent.
 - **Sideload only**, signed with the owner's own key (`bun run install:android`); no store
   build (DW-407).
 - **The Gradle half of the licence firewall** is two checks: a Linux test over the declared

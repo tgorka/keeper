@@ -27,12 +27,14 @@
 import { Bot, NotebookPen, Pencil, Search, Users } from "lucide-react";
 import type { Ref } from "react";
 import { BOTS_PANE_TITLE } from "@/components/bots/bots-pane";
+import { ProxyDockSheet } from "@/components/layout/proxy-dock-sheet";
 import { NOTES_PHONE_CAPTURE_LABEL } from "@/components/notes/notes-phone-pane";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Button } from "@/components/ui/button";
 import { Lamp } from "@/components/ui/lamp";
 import { IconHint } from "@/components/ui/tooltip";
 import { showCapture } from "@/hooks/use-notes-actions";
+import { useShellLayout } from "@/hooks/use-shell-layout";
 import { accountHueVar } from "@/lib/account-hue";
 import { initials } from "@/lib/account-initials";
 import { BRIDGE_HEALTH_LABEL, BRIDGE_HEALTH_LAMP } from "@/lib/bridges";
@@ -70,6 +72,8 @@ export function PhoneInboxHeader({ drawerButtonRef, magnifierRef }: PhoneInboxHe
   const bots = useCapabilitiesStore((s) => s.capabilities.bots);
   // Quick capture (Story 66.4): present only where a vault can exist.
   const notes = useCapabilitiesStore((s) => s.capabilities.notes);
+  // A tablet's shell (story 98.3, UX-DR146) adds the proxy dock as a sheet.
+  const { tablet } = useShellLayout();
   // A lamp inside a button with an explicit `aria-label` is mute: the label
   // replaces the contents rather than joining them. So the health rides the
   // button's own name, and the lamp beside it carries the shape.
@@ -168,6 +172,9 @@ export function PhoneInboxHeader({ drawerButtonRef, magnifierRef }: PhoneInboxHe
             </Button>
           </IconHint>
         )}
+        {/* The proxy dock, on a tablet only (story 98.3, UX-DR146): a phone keeps
+            its proxy DM as a room in the Inbox. */}
+        {tablet && <ProxyDockSheet />}
         <IconHint label="Search">
           <Button
             ref={magnifierRef}

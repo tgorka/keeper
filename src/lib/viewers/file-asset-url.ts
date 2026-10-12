@@ -20,6 +20,9 @@
  * `recordingAssetUrl` and `keeper-note://`'s composer exactly.
  */
 
+import type { UrlForm } from "@/lib/ipc/client";
+import { mediaSrc } from "@/lib/media-src";
+
 /** The scheme, spelled as `keeper_core::file_asset::SCHEME` in Rust. The two
  *  are pinned to each other by `file-asset-url-vectors.json`, which this
  *  module's test and `file_asset.rs`'s test both load. */
@@ -56,9 +59,10 @@ function segment(raw: string): string {
  * resolution, where it can be true rather than merely likely.
  *
  * Segment by segment, so a `/` stays a separator and a space, a `#` or a `?`
- * cannot end the path.
+ * cannot end the path. Spelled for this build by {@link mediaSrc} (`form`
+ * overrides Rust's answer — the shared vector table composes both).
  */
-export function fileAssetUrl(profileId: string, relativePath: string): string {
+export function fileAssetUrl(profileId: string, relativePath: string, form?: UrlForm): string {
   const path = relativePath
     .split("/")
     // `.replace(/\./g)` rather than `replaceAll`: TypeScript narrows `part` to
@@ -66,5 +70,5 @@ export function fileAssetUrl(profileId: string, relativePath: string): string {
     // `replaceAll` on a string literal type.
     .map((part) => (part === "." || part === ".." ? part.replace(/\./g, "%2E") : segment(part)))
     .join("/");
-  return `${FILE_ASSET_SCHEME}://${segment(profileId)}/${path}`;
+  return mediaSrc(FILE_ASSET_SCHEME, `${segment(profileId)}/${path}`, form);
 }

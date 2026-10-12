@@ -126,6 +126,7 @@ import type {
   OrgAccountVm,
   PacedWorkVm,
   PanelIntentVm,
+  PlatformVm,
   PromoteState,
   ProxyRoomVm,
   RecordingCaptureSourcesVm,
@@ -165,6 +166,12 @@ import type {
 } from "@/lib/ipc/client";
 import { VOICE_WAKE_EVENT } from "@/lib/ipc/client";
 import { DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
+import { platformStore } from "@/lib/stores/platform";
+// The phone's and the tablet's "On this …" lists are composed in Rust
+// (`keeper_core::disclosure`) and pinned to these docs there; the rig reads the
+// docs rather than holding a third copy.
+import ANDROID_DOC from "../docs/android.md?raw";
+import IOS_DOC from "../docs/ios.md?raw";
 import {
   MEDIA_BLOCK_FRONTMATTER,
   MEDIA_BLOCK_NOTES,
@@ -1338,6 +1345,50 @@ const CSV_ROWS = [
  * is why a screen keeps rendering when it reaches for something not listed —
  * an unanswered command should show an empty state, never a white page.
  */
+/**
+ * `?platform=phone` answers the iPhone's shape and `?platform=tablet` an
+ * Android tablet's (story 98.3): both are reduced builds — every `cfg!(desktop)`
+ * flag false — and differ in the platform facts the shell writes into the
+ * webview (the tablet, the disclosure, and the `localhost` URL spelling
+ * Android's WebView needs).
+ */
+const MOCK_PLATFORM = new URLSearchParams(window.location.search).get("platform");
+const MOCK_REDUCED = MOCK_PLATFORM === "phone" || MOCK_PLATFORM === "tablet";
+
+/** The first `- ` bullet run under `## Limitations` in a doc. */
+function limitationsOf(doc: string): string[] {
+  const after = doc.slice(doc.indexOf("## Limitations\n")).split("\n");
+  const first = after.findIndex((line) => line.startsWith("- "));
+  const rest = after.slice(first);
+  const end = rest.findIndex((line) => !line.startsWith("- "));
+  return rest.slice(0, end < 0 ? rest.length : end).map((line) => line.slice(2));
+}
+
+const MOCK_PLATFORM_FACTS: PlatformVm =
+  MOCK_PLATFORM === "tablet"
+    ? {
+        urlForm: "localhost",
+        tablet: true,
+        disclosure: {
+          heading: "On this tablet",
+          lines: limitationsOf(ANDROID_DOC),
+          docsUrl: "https://github.com/tgorka/keeper/blob/main/docs/android.md",
+          docsLabel: "What's different on Android",
+        },
+      }
+    : MOCK_PLATFORM === "phone"
+      ? {
+          urlForm: "scheme",
+          tablet: false,
+          disclosure: {
+            heading: "On this iPhone",
+            lines: limitationsOf(IOS_DOC),
+            docsUrl: "https://github.com/tgorka/keeper/blob/main/docs/ios.md",
+            docsLabel: "What's different on iPhone",
+          },
+        }
+      : { urlForm: "scheme", tablet: false, disclosure: null };
+
 const ANSWERS: Record<string, unknown> = {
   app_ping: "ok",
   // The full `CapabilitiesVm`, `satisfies`-checked for this file's own stated
@@ -1355,47 +1406,47 @@ const ANSWERS: Record<string, unknown> = {
   // window's width — is what puts the shell in the phone tier, so it is the
   // only way to look at the phone's landscape shape here, and it is what
   // `dev/measure-bots.ts --phone` drives.
-  capabilities:
-    new URLSearchParams(window.location.search).get("platform") === "phone"
-      ? // Epic 66: the folder links on the phone (`sync`, AD-198), share-out
-        // is its reveal (`shareOut`, Story 66.3, AD-200) and notes ride the
-        // folder (`notes`, Story 66.4) — the three flags `ipc.rs` now computes
-        // true on iOS, so the Files and Notes rows and the capture sheet are
-        // reachable in the phone rig (`dev/measure-files.ts`). `sessions` is
-        // the phone with a sessions zone (98.2): the mock's folders have one.
-        ({
-          ...DEFAULT_CAPABILITIES,
-          bots: true,
-          sync: true,
-          shareOut: true,
-          notes: true,
-          sessions: true,
-        } satisfies CapabilitiesVm)
-      : ({
-          trayIcon: true,
-          globalHotkey: true,
-          launchAtLogin: true,
-          inAppUpdater: true,
-          nativeMenuBar: true,
-          bridgeSidecar: true,
-          revealInFileManager: true,
-          // Story 66.3: the phone's reveal, and false on every desktop.
-          shareOut: false,
-          recording: true,
-          transcription: true,
-          sync: true,
-          notes: true,
-          sessions: true,
-          // Epic 61: `true`, and this is the trap the comment above names. As `false`
-          // every bots fixture below would be unreachable in `bun run dev` — the
-          // pane, the picker, the composer and the fake stream all sit behind it.
-          bots: true,
-          // Epic 62: the drive half, `desktop && sync` in Rust. `true` here so the
-          // grant bar, the tool rows and the reveal control are reachable in `bun
-          // run dev`; flip to `false` to see the phone's shape of the same pane.
-          botTools: true,
-          overlayTitleBar: true,
-        } satisfies CapabilitiesVm),
+  capabilities: MOCK_REDUCED
+    ? // Epic 66: the folder links on the phone (`sync`, AD-198), share-out
+      // is its reveal (`shareOut`, Story 66.3, AD-200) and notes ride the
+      // folder (`notes`, Story 66.4) — the three flags `ipc.rs` now computes
+      // true on iOS, so the Files and Notes rows and the capture sheet are
+      // reachable in the phone rig (`dev/measure-files.ts`). `sessions` is
+      // the phone with a sessions zone (98.2): the mock's folders have one.
+      ({
+        ...DEFAULT_CAPABILITIES,
+        bots: true,
+        sync: true,
+        // Share-out is iOS's alone (`cfg!(target_os = "ios")`).
+        shareOut: MOCK_PLATFORM === "phone",
+        notes: true,
+        sessions: true,
+      } satisfies CapabilitiesVm)
+    : ({
+        trayIcon: true,
+        globalHotkey: true,
+        launchAtLogin: true,
+        inAppUpdater: true,
+        nativeMenuBar: true,
+        bridgeSidecar: true,
+        revealInFileManager: true,
+        // Story 66.3: the phone's reveal, and false on every desktop.
+        shareOut: false,
+        recording: true,
+        transcription: true,
+        sync: true,
+        notes: true,
+        sessions: true,
+        // Epic 61: `true`, and this is the trap the comment above names. As `false`
+        // every bots fixture below would be unreachable in `bun run dev` — the
+        // pane, the picker, the composer and the fake stream all sit behind it.
+        bots: true,
+        // Epic 62: the drive half, `desktop && sync` in Rust. `true` here so the
+        // grant bar, the tool rows and the reveal control are reachable in `bun
+        // run dev`; flip to `false` to see the phone's shape of the same pane.
+        botTools: true,
+        overlayTitleBar: true,
+      } satisfies CapabilitiesVm),
   // ---------------------------------------------------------------------------
   // The two answers that decide WHICH screen boots (`src/App.tsx`
   // `renderContent`). Without them every `bun run dev` stopped at the first-run
@@ -5097,7 +5148,7 @@ let chosenDriveFolder: string | null = null;
 const MOCK_HOME = "/Users/tgorka";
 
 function mockDriveFolder(): DriveFolderVm | null {
-  if (new URLSearchParams(window.location.search).get("platform") === "phone") {
+  if (MOCK_REDUCED) {
     return null;
   }
   return chosenDriveFolder === null
@@ -9144,5 +9195,8 @@ export function installMockShell(): void {
   // reads the window's label from the shell's metadata; without it opening any
   // room throws before the timeline draws.
   mockWindows("main");
+  // What the shell's initialization script writes before the bundle runs
+  // (`ipc::platform_plugin`): applied here, before the app mounts.
+  platformStore.getState().applySnapshot(MOCK_PLATFORM_FACTS);
   document.documentElement.dataset.mockShell = "on";
 }

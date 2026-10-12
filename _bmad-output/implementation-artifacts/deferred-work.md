@@ -10172,7 +10172,8 @@ status: open
 origin: epic 98, story 98.3 (rung `agents-98-android` fix round 1, 2026-10-12; R351, review-98android-1 DW candidate) — for rung 8 (`agents-98-tablet`, Auth Tab)
 location: `src-tauri/crates/keeper/gen/android/app/src/main/AndroidManifest.xml` (deep-link block), `src-tauri/crates/keeper/tauri.conf.json` (`deep-link.mobile`, `appLink: false`)
 reason: `dev.tgorka.keeper:/oauth/callback` and `keeper://` are plain custom schemes, so another app can register the same intent filter and receive the authorization code. PKCE and the state registry make an intercepted code useless, as on desktop, but rung 8's Auth Tab is the moment to decide whether the Matrix and org sign-in return through an App Link (`https` plus `assetlinks.json`) instead.
-status: open
+resolution: decided in rung 8 (`agents-98-tablet`, R354): both sign-ins open in an Auth Tab, which returns the callback as the activity's result, so no other app can claim it there; the App Link is refused for now (a per-signer `assetlinks.json`, MSC2966's refusal of `https` for native clients, every IdP's registration). What stays claimable — the Custom Tab fallback in a browser without Auth Tab, and the deep link itself — is DW-1300.
+status: resolved (remainder → DW-1300)
 
 ### DW-1295: The secret file's data key sits unzeroised in the JVM heap and in `KeystoreKey`.
 
@@ -10186,4 +10187,39 @@ status: open
 origin: epic 98, story 98.3 (rung `agents-98-android` fix round 1, 2026-10-12; R351, review-98android-1 DW candidate)
 location: `rust-toolchain.toml` (`targets`: the two iOS targets), `docs/android.md` § Prerequisites
 reason: The Mac (or any builder) must `rustup target add aarch64-linux-android` by hand; listing it in `targets` makes `bun run android:build` self-provisioning once the SDK and NDK exist. It also makes every rustup install of the toolchain download the Android standard library, which is why it was left to a decision.
+status: open
+
+### DW-1300: Android sign-in has no verified `https` App Link, so its Custom Tab fallback's callback is claimable.
+
+origin: epic 98, story 98.3 (rung `agents-98-tablet`, 2026-10-12; review of rung `agents-98-android`: "a custom-scheme OAuth callback is claimable by any app")
+location: `src-tauri/crates/keeper/gen/android/app/src/main/java/dev/tgorka/keeper/AuthTabPlugin.kt` (redirect by scheme), `keeper_core::oauth::REDIRECT_URI` (`dev.tgorka.keeper:/oauth/callback`, registered as `ApplicationType::Native`), the manifest's deep-link block
+reason: With an Auth Tab the browser hands the callback back as the activity's result, so nothing else can claim it; a browser without Auth Tab gets a Custom Tab whose callback returns as a `keeper://`/`dev.tgorka.keeper:` intent any app may also declare (PKCE keeps the stolen code useless without keeper's verifier). Auth Tab's `https` redirect with Digital Asset Links would close that too, but it needs (1) `https://keeper.tgorka.dev/.well-known/assetlinks.json` listing the SHA-256 of every signer's own key — each sideloaded build is signed by its owner, so this is an operator service per signer, outside a client-only repo (D-1); (2) Matrix homeservers to accept an `https` redirect from keeper's client registration, which MSC2966 refuses for `application_type: native` (Tuwunel and MAS validate it; keeper would have to register as a `web` client on every platform); (3) every organisation's identity provider to register the new address. Revisit when a homeserver keeper targets admits a claimed-`https` native redirect, or when the owner publishes `assetlinks.json` for his key.
+status: open
+
+### DW-1301: keeper cannot close an Android Auth Tab whose sign-in already ended.
+
+origin: epic 98, story 98.3 (rung `agents-98-tablet`, 2026-10-12)
+location: `src-tauri/crates/keeper/src/web_auth.rs` (`close`, `cancel_all` are no-ops on Android)
+reason: On iOS `web_auth_apple::cancel` dismisses the sheet when its flow times out or a sibling sign-in cancels it. androidx.browser has no call that finishes an Auth Tab from the launching app, so on Android the flow ends and the tab stays until the person closes it (its later result reaches a registry that no longer waits and is ignored). Bringing keeper's activity to the front with `FLAG_ACTIVITY_CLEAR_TOP` would cover it; that needs a device to see what the browser does with the tab behind it — the tablet device run.
+status: open
+
+### DW-1302: Before `platform_facts` answers, the front spells keeper's URLs the Apple way.
+
+origin: epic 98, story 98.3 #3 (rung `agents-98-tablet`, 2026-10-12)
+location: `src/lib/stores/platform.ts` (default `urlForm: "scheme"`), `src/lib/media-src.ts`
+reason: The front composes `keeper-file`/`keeper-note`/`keeper-recording` URLs synchronously from the platform store, which `App` fills at boot beside the capabilities. On Android a URL composed in the frames before that answer would be the `scheme` spelling, which the WebView cannot load; a component that composed one keeps it until it re-renders. No surface that composes such a URL is reachable before the shell mounts (the shell waits on `session_restore`, which is later than the answer), so this is a window nobody has observed; closing it outright means gating those surfaces on the answer, or injecting the fact into the page before the bundle runs. Measure on the tablet device run.
+status: resolved (rung `agents-98-tablet`, fix round 1, R355) — the shell's `ipc::platform_plugin` initialization script writes `PlatformVm` into the webview as `window.__KEEPER_PLATFORM__` before the bundle runs and `platformStore` starts from it, so no URL is ever composed before the fact; the `platform_facts` command and its boot hydration are gone.
+
+### DW-1303: A PDF in Files or in a note shows nothing on Android.
+
+origin: epic 98, story 98.3 (review R98TAB DW candidate, rung `agents-98-tablet` fix round 1, 2026-10-12)
+location: `src/components/viewers/document-viewer.tsx` (`<embed type="application/pdf">`), `src/components/notes/editor/media-element.ts` (the note's PDF embed)
+reason: Both draw a PDF with `<embed type="application/pdf">`, which Android's WebView has no plugin for, so the pane is blank there (inferred from the WebView's documented lack of a PDF plugin; not observed on a device). Either refuse it on Android the way `servable` refuses other kinds, with an "Open in…" action, or decide on a renderer that runs in the page. Confirm on the tablet device run first.
+status: open
+
+### DW-1304: Android sign-in does not look for another browser with Auth Tab when the Custom Tabs pick lacks it.
+
+origin: epic 98, story 98.3 (review R98TAB-03 (b), rung `agents-98-tablet` fix round 1, 2026-10-12)
+location: `src-tauri/crates/keeper/gen/android/app/src/main/java/dev/tgorka/keeper/AuthTabPlugin.kt` (`authTabBrowser`)
+reason: `AuthTabPlugin` requests an Auth Tab only from the browser Android's Custom Tabs pick (`CustomTabsClient.getPackageName`, the default browser when it serves Custom Tabs), and only when that browser supports Auth Tab. When it does not but another installed browser does, the sign-in falls back to the claimable deep link (DW-1300) though an unclaimable one was on the device. Preferring an installed Auth-Tab browser means choosing among the person's browsers on their behalf — which one, and whether to say so — so it waits for that decision; the `<queries>` it needs are already in the manifest.
 status: open

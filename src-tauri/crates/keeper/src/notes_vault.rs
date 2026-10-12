@@ -2722,7 +2722,8 @@ const ASSET_SEGMENT: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHAN
     .remove(b'_')
     .remove(b'~');
 
-/// The `keeper-note://` URL for a vault-relative asset.
+/// The `keeper-note://` URL for a vault-relative asset, in this build's spelling
+/// (`keeper_core::asset_url::UrlForm::HOST`; story 98.3 #3).
 ///
 /// Segment by segment, so a `/` in the path stays a separator and everything
 /// else is escaped. The one exception is a dot segment: `.` and `..` are encoded
@@ -2740,7 +2741,11 @@ pub fn asset_url(vault_id: &str, rel: &str) -> String {
             percent_encoding::utf8_percent_encode(segment, ASSET_SEGMENT).to_string()
         })
         .collect();
-    format!("keeper-note://{vault_id}/{}", encoded.join("/"))
+    keeper_core::asset_url::compose(
+        keeper_core::asset_url::UrlForm::HOST,
+        crate::note_protocol::SCHEME,
+        &format!("{vault_id}/{}", encoded.join("/")),
+    )
 }
 
 /// The sibling file names of a vault-relative directory, for the collision

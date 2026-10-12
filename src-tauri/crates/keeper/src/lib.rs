@@ -320,6 +320,13 @@ pub fn run() {
     // be registered before any account restores and reads its session.
     #[cfg(target_os = "android")]
     let builder = builder.plugin(android::keystore_plugin());
+    // The Auth Tab a sign-in's authorization page opens in (story 98.3).
+    #[cfg(target_os = "android")]
+    let builder = builder.plugin(android::auth_tab_plugin());
+    // This build's platform facts — the URL spelling, the tablet, the
+    // disclosure — written into the webview before the bundle runs (story
+    // 98.3), so the front never renders a frame without them.
+    let builder = builder.plugin(ipc::platform_plugin());
     // Opt-in launch-at-login (Story 10.3, FR-53, AD-25). The autostart plugin owns
     // the LaunchAgent state authoritatively; it is off by default and only ever
     // toggled by an explicit user action via the `launch_at_login_set` command.

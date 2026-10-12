@@ -83,6 +83,7 @@ import {
   searchRecordings,
   syncBrowse,
 } from "@/lib/ipc/client";
+import { mediaSrc } from "@/lib/media-src";
 import {
   followExternalUrl,
   noMomentSentence,
@@ -597,10 +598,13 @@ export function NoteEditor({
   pathRef.current = path;
   const assetUrl = useCallback(
     (rel: string) =>
-      `keeper-note://${vaultId}/${vaultRelative(pathRef.current, rel)
-        .split("/")
-        .map(encodeURIComponent)
-        .join("/")}`,
+      mediaSrc(
+        "keeper-note",
+        `${vaultId}/${vaultRelative(pathRef.current, rel)
+          .split("/")
+          .map(encodeURIComponent)
+          .join("/")}`,
+      ),
     [vaultId],
   );
   const assetUrlRef = useRef(assetUrl);

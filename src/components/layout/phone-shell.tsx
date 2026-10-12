@@ -284,6 +284,12 @@ function StackLevel({
   );
 }
 
+/** What the split tablet's room pane says before a room is chosen (UX-DR146). */
+export const TABLET_NO_ROOM_SENTENCE = "Choose a conversation from the list.";
+
+/** The room levels' box on a split tablet: right of the Inbox column. */
+const ROOM_PANE_SPLIT = "absolute inset-y-0 right-0 left-[var(--tablet-list)] z-10";
+
 export function PhoneShell() {
   const selected = useRoomsStore((s) => s.selected);
   const detailOpen = useDetailStore((s) => s.open);
@@ -293,7 +299,7 @@ export function PhoneShell() {
   // Keyboard avoidance (Story 13.5, UX-DR25): only the phone tier drives the
   // `--kb-inset` var — the visualViewport listener never runs on desktop/tablet,
   // so the desktop layout stays byte-for-byte.
-  const { phone } = useShellLayout();
+  const { phone, split } = useShellLayout();
   useKeyboardInset({ enabled: phone });
 
   // Story 62.2 / 66.1 / 66.4: the view levels. With no room selected, a view
@@ -427,6 +433,11 @@ export function PhoneShell() {
   const surfaceBack1Ref = useRef<HTMLButtonElement>(null);
   const surfaceBack2Ref = useRef<HTMLButtonElement>(null);
   const roomLevels = selected !== null;
+  // A tablet at least 840 dp wide (story 98.3 #5, UX-DR146) shows the rooms
+  // list and the open room side by side: the room levels stand beside the
+  // Inbox rather than over it, so the Inbox stays live — never dimmed, shifted
+  // or inert — while a room is open. The view levels still cover the whole.
+  const sideBySide = split && roomLevels;
   // The most recently focused element per level, tracked via focus-capture on
   // each level's wrapper — captured *before* a push makes the level inert (an
   // inert subtree blurs its focus, so reading `document.activeElement` in the
@@ -921,19 +932,24 @@ export function PhoneShell() {
     <div
       ref={containerRef}
       onKeyDown={onKeyDown}
-      className="relative flex min-h-0 min-w-0 flex-1 overflow-hidden"
+      className="relative flex min-h-0 min-w-0 flex-1 overflow-hidden [--tablet-list:min(24rem,42%)]"
     >
-      {/* Level 0 — always mounted so the Inbox scroll position survives pushes. */}
+      {/* Level 0 — always mounted so the Inbox scroll position survives pushes.
+          On a split tablet it is the left column, beside the room levels. */}
       <StackLevel
         levelIndex={0}
         open
-        covered={level > 0}
-        inert={level !== 0}
+        covered={level > 0 && !sideBySide}
+        inert={level !== 0 && !sideBySide}
         reducedMotion={reducedMotion}
         dragX={null}
-        coveredProgress={coveredProgressFor(0)}
+        coveredProgress={sideBySide ? null : coveredProgressFor(0)}
         onFocusCapture={captureFocusFor(0)}
-        className="min-h-0 min-w-0 flex-1"
+        className={
+          split
+            ? "relative min-h-0 w-[var(--tablet-list)] shrink-0 border-border border-r"
+            : "min-h-0 min-w-0 flex-1"
+        }
       >
         {/* Level 0's leading edge opens the drawer (the edge 13.2 reserved); the
             top band pulls down to open Search (Story 13.4). */}
@@ -946,6 +962,12 @@ export function PhoneShell() {
           <ChatListPane />
         </div>
       </StackLevel>
+      {/* The split tablet's right pane before a room is chosen. */}
+      {split && (
+        <div className="flex min-w-0 flex-1 items-center justify-center p-6 text-muted-foreground text-sm">
+          {TABLET_NO_ROOM_SENTENCE}
+        </div>
+      )}
       <StackLevel
         levelIndex={1}
         open={selected !== null}
@@ -955,7 +977,7 @@ export function PhoneShell() {
         dragX={dragXFor(1)}
         coveredProgress={coveredProgressFor(1)}
         onFocusCapture={captureFocusFor(1)}
-        className="absolute inset-0 z-10"
+        className={split ? ROOM_PANE_SPLIT : "absolute inset-0 z-10"}
       >
         {level === 1 && edgeSwipeZone}
         {/* A card of the sessions board opens its room with the view left on
@@ -984,7 +1006,7 @@ export function PhoneShell() {
         dragX={dragXFor(2)}
         coveredProgress={null}
         onFocusCapture={captureFocusFor(2)}
-        className="absolute inset-0 z-20"
+        className={split ? `${ROOM_PANE_SPLIT} z-20` : "absolute inset-0 z-20"}
       >
         {level === 2 && edgeSwipeZone}
         <PhoneHeader level={2} onBack={onBack} backRef={back2Ref} />

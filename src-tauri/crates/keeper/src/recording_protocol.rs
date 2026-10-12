@@ -220,10 +220,7 @@ fn contained_read(destination_root: &Path, absolute: &Path) -> Option<PathBuf> {
 /// beats a silent no-match, and because a NUL must not reach a `Path` on a
 /// platform that would truncate at it.
 fn parse_recording_url(raw: &str) -> Option<(String, String)> {
-    let rest = raw
-        .strip_prefix(&format!("{SCHEME}://"))
-        .or_else(|| raw.strip_prefix(&format!("http://{SCHEME}.localhost/")))
-        .or_else(|| raw.strip_prefix(&format!("https://{SCHEME}.localhost/")))?;
+    let rest = keeper_core::asset_url::strip(raw, SCHEME)?;
     let rest = rest.split(['?', '#']).next()?;
 
     let mut segments = rest.split('/');

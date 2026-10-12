@@ -612,6 +612,8 @@ export type { PanelTargetVm } from "./gen/PanelTargetVm";
 // begin by narrowing a type it was handed already narrowed.
 export type { PdfProbeVm } from "./gen/PdfProbeVm";
 export type { PingVm } from "./gen/PingVm";
+export type { PlatformDisclosureVm } from "./gen/PlatformDisclosureVm";
+export type { PlatformVm } from "./gen/PlatformVm";
 export type { PromoteRowVm } from "./gen/PromoteRowVm";
 export type { PromoteState } from "./gen/PromoteState";
 export type { Provider } from "./gen/Provider";
@@ -753,6 +755,7 @@ export type { TypistVm } from "./gen/TypistVm";
 export type { UnknownBotGrantVm } from "./gen/UnknownBotGrantVm";
 export type { UnknownTaskVm } from "./gen/UnknownTaskVm";
 export type { UnlistedVm } from "./gen/UnlistedVm";
+export type { UrlForm } from "./gen/UrlForm";
 export type { VaultCopyVm } from "./gen/VaultCopyVm";
 export type { VerificationFlowVm } from "./gen/VerificationFlowVm";
 export type { VerificationPhase } from "./gen/VerificationPhase";

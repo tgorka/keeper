@@ -30,6 +30,8 @@ interface Vector {
   profile_id: string;
   relative_path: string;
   url: string;
+  /** The same URL as Tauri serves it on Android and Windows (story 98.3 #3). */
+  localhost_url: string;
 }
 
 const VECTORS = JSON.parse(readFileSync(FIXTURE, "utf8")) as {
@@ -44,7 +46,10 @@ describe("the shared vector table", () => {
     // already collapsed. Rust's side of this file asserts every one of those is
     // then refused on resolution.
     for (const vector of [...VECTORS.ok, ...VECTORS.refused]) {
-      expect(fileAssetUrl(vector.profile_id, vector.relative_path)).toBe(vector.url);
+      expect(fileAssetUrl(vector.profile_id, vector.relative_path, "scheme")).toBe(vector.url);
+      expect(fileAssetUrl(vector.profile_id, vector.relative_path, "localhost")).toBe(
+        vector.localhost_url,
+      );
     }
   });
 

@@ -143,10 +143,42 @@ keeper's data on the device.
 
 ## Sign-in
 
-keeper opens a sign-in in the default browser (the opener plugin hands the URL
-to Android), and the browser returns to keeper through the `keeper://` or
-`dev.tgorka.keeper:` deep link the manifest declares. Custom Tabs and Auth Tab
-(DW-290's recipe) are the tablet rung's (codemap §2 row 8).
+- **An organisation account or a Matrix single sign-on** opens its
+  authorization page in an **Auth Tab** (`AuthTabPlugin.kt`, androidx.browser
+  1.10; `web_auth.rs`): the browser's cookies, password manager and passkeys,
+  in a tab stripped down to signing in. When the page redirects to keeper's
+  callback (`keeper://oauth/…` or `dev.tgorka.keeper:/oauth/callback`) the
+  browser captures that navigation and hands the URL back to keeper as the
+  tab's result — it never travels as an intent, so no other app that declares
+  the same scheme can claim it. Closing the tab cancels that one sign-in; a
+  browser that cannot verify the address ends it with the reason.
+- **Which browser.** The one Android opens Custom Tabs in — your default browser
+  when it supports them — and only when that browser supports Auth Tab. keeper
+  sends the tab to that browser by name, so the tab that opens is the one it
+  checked. The manifest declares the browsers it looks for (`<queries>`), which
+  Android 11 and later require. Another installed browser with Auth Tab is not
+  sought yet (DW-1304).
+- **When that browser has no Auth Tab** the page opens wherever Android sends it — a
+  Custom Tab or the browser itself — and the callback returns through the
+  `keeper://` / `dev.tgorka.keeper:` deep link the manifest declares, as from
+  any browser. That path is the one another app could intercept; the
+  authorization code it carries is useless without the PKCE verifier, which
+  never leaves keeper's process. Android often reports such a tab as ended the
+  moment it opens, so its ending ends nothing: the sign-in finishes on the deep
+  link, on your own cancel, or after five minutes.
+- **Why not a verified `https` App Link.** Auth Tab can return on an `https`
+  address the browser verifies against Digital Asset Links, which would close
+  the fallback's gap too. It needs three things keeper cannot supply from this
+  repository: a `/.well-known/assetlinks.json` on the redirect's host
+  (`keeper.tgorka.dev`, keeper's `client_uri`) naming the SHA-256 of **each
+  signer's own key** — every sideloaded build is signed by its owner; Matrix
+  homeservers that admit a native client by MSC2966 to accept an `https`
+  redirect from it, which they refuse for `application_type: native` (only a
+  reverse-DNS scheme or a loopback address); and every organisation's identity
+  provider registering the new address. DW-1300 holds it.
+- **Links** ("Open in browser") open in a Custom Tab through the opener plugin.
+  The plugin's free `open_url` is the `open` crate, which on Android spawns a
+  desktop opener that does not exist, so keeper never calls it there.
 
 ## Where keeper keeps its data
 
@@ -177,16 +209,21 @@ to Android), and the browser returns to keeper through the `keeper://` or
 
 ## Limitations
 
-These are the lines the tablet's About screen shows (the mirror test arrives
-with the tablet rung, story 98.3 #4):
+These are the lines keeper shows in-app under **Settings → About → "On this
+tablet"** (on an Android phone the same lines say "phone"):
 
-- No agent runs on this tablet: agents run on your Mac or your server.
+- No agent runs on this tablet: your agents run on your Mac or your server, and keeper here talks to them.
+- A folder you add here mirrors a remote your Mac already syncs and lives inside keeper's own storage: it syncs only when keeper opens, comes back in front or you pull to refresh, and nothing is merged on this tablet — the Mac merges.
+- The sessions board is here: read a session's cards, move one with Move to…, and open an agent's session room to decide its approval; creating and archiving sessions stays on your Mac. Bots talks to a model here, but the drive tools live on your Mac.
 - No screen recording and no transcription on this tablet.
-- The sessions board reads, moves cards and decides approvals, as on the phone.
-- No voice yet on Android (story 98.4).
-- No push: keeper syncs while it is open, and a notification needs it running
-  (story 98.4 brings UnifiedPush).
-- Installed by sideloading only, signed with your own key.
+- keeper syncs and notifies only while it is open; nothing reaches this tablet while keeper is closed, and there is no voice here yet.
+- Updates arrive by installing a new build, signed with your own key and sideloaded.
+
+> This list is composed in Rust (`keeper_core::disclosure::android`) and shown by
+> the About screen exactly as Rust sends it; `keeper-core/tests/platform_disclosure_mirrors_docs.rs`
+> reads this list from disk and fails when the two differ. Edit both together or
+> neither. Push (UnifiedPush) and voice arrive with story 98.4, which rewrites the
+> fifth line.
 
 And, for whoever builds it:
 
@@ -194,6 +231,23 @@ And, for whoever builds it:
   (`GitEngine::HOST`): there is no `git` binary to spawn.
 - Media responses are capped at 8 MiB per range request, as on the iPhone,
   so one large video cannot allocate a second full copy in memory.
+- keeper's own URLs (`keeper-media`, `keeper-file`, `keeper-note`,
+  `keeper-recording`) are spelled `http://<scheme>.localhost/<host>/<path>`:
+  Android's WebView cannot load a custom scheme, so Tauri serves each protocol
+  on that host. The spelling is one Rust fact (`keeper_core::asset_url::UrlForm::HOST`,
+  Tauri's own rule: Android and Windows), composed by `asset_url::compose` in
+  Rust and `src/lib/media-src.ts` in the front, which reads it from the facts
+  the shell writes into the webview before the bundle runs; every parser takes
+  either spelling, because the handler cannot choose which one the webview
+  sends and one parser serves every build.
+- The layout: a tablet — by Android's own rule, the device's smallest width at
+  least 600 dp, which `MainActivity` reads and Rust serves as
+  `PlatformVm.tablet` — shows the phone's surfaces with the proxy dock as a
+  sheet from the Inbox header; at 840 dp wide and above, the rooms list and the
+  open room side by side (`use-shell-layout.ts`, UX-DR146). The viewport never
+  decides it, so the keyboard opening keeps the dock and the rooms list.
+- A PDF in Files or in a note has no viewer here: Android's WebView draws no
+  `<embed type="application/pdf">` (DW-1303).
 
 ## What changed in the shell for Android (98.3)
 
@@ -213,7 +267,8 @@ decision for each.
 | `ipc.rs` `share_out: cfg!(target_os = "ios")` | kept: Android earns share-out with its own intent |
 | `push_ios`, `push_open_take`, `sign_out`'s pusher, `push_gateway_set`'s registration | kept: Android push is story 98.4 (UnifiedPush) |
 | `voice_ios`, `voice_island`, `voice_notify`, `voice_synthesizer`, `voice_ipc`, `voice_turn_models` | kept: Android voice is story 98.4; `voice_ipc`'s `AbsentPort` answers there |
-| `web_auth.rs`, `web_auth_apple.rs` | kept: Android signs in through the browser until Auth Tab (row 8) |
+| `web_auth.rs` `start`, `start_in`, `MatrixSignIn::open_url` | **widened** (rung 8): an Auth Tab on Android (`AuthTabPlugin.kt`) |
+| `web_auth_apple.rs` | kept: `ASWebAuthenticationSession` is iOS's |
 | `share_ios.rs` | kept: share-out is off on Android (`share_out` false) |
 | `ipc.rs` `device_ulid` recording refusal | **widened**: quotes `MobileRecorder::refused` on iOS and Android alike |
 | `agents_ipc.rs` `PLATFORM`, `sessions/lock.rs`, `browse.rs` | already Android-aware |
@@ -237,11 +292,12 @@ file declares any more fails too. Bumping a version means updating its row.
 |---|---|---|
 | `androidx.activity:activity-ktx:1.10.1` | Apache-2.0 | `gen/android` app |
 | `androidx.appcompat:appcompat:1.7.1` | Apache-2.0 | `gen/android` app |
+| `androidx.browser:browser:1.10.0` | Apache-2.0 | `gen/android` app (Auth Tab) |
 | `androidx.lifecycle:lifecycle-process:2.10.0` | Apache-2.0 | `gen/android` app |
 | `androidx.webkit:webkit:1.14.0` | Apache-2.0 | `gen/android` app |
 | `com.google.android.material:material:1.12.0` | Apache-2.0 | `gen/android` app |
 | `com.android.tools.build:gradle:8.11.0` | Apache-2.0 | `gen/android` build script, `buildSrc` (build tooling) |
-| `org.jetbrains.kotlin:kotlin-gradle-plugin:1.9.25` | Apache-2.0 | `gen/android` build script (build tooling) |
+| `org.jetbrains.kotlin:kotlin-gradle-plugin:2.1.20` | Apache-2.0 | `gen/android` build script (build tooling; 2.1 because androidx.browser 1.10.0 brings `kotlin-stdlib` 2.1.20) |
 | `androidx.appcompat:appcompat:1.6.0` | Apache-2.0 | tauri, tauri-plugin-notification, -dialog, -fs, -deep-link |
 | `androidx.browser:browser:1.8.0` | Apache-2.0 | tauri-plugin-opener |
 | `androidx.core:core-ktx:1.7.0` | Apache-2.0 | tauri |

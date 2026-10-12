@@ -12,6 +12,7 @@
 pub mod account;
 pub mod agents;
 pub mod archive;
+pub mod asset_url;
 pub mod auth;
 pub mod backup;
 pub mod badge;
@@ -22,6 +23,7 @@ pub mod capture;
 pub mod config;
 pub mod container;
 pub mod demo;
+pub mod disclosure;
 pub mod document;
 pub mod drafts;
 pub mod egress;

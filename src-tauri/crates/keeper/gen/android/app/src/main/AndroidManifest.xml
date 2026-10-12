@@ -6,6 +6,22 @@
     <uses-feature android:name="android.software.leanback" android:required="false" />
 
     <!--
+      The browsers a sign-in may open in (`AuthTabPlugin.kt`, R354): on Android 11
+      and later an app sees only the packages it declares it looks for, and the
+      plugin asks which browser serves Custom Tabs and whether it has Auth Tab.
+    -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <category android:name="android.intent.category.BROWSABLE" />
+            <data android:scheme="https" />
+        </intent>
+        <intent>
+            <action android:name="android.support.customtabs.action.CustomTabsService" />
+        </intent>
+    </queries>
+
+    <!--
       keeper keeps its data in the app's private files directory and its
       secrets in an encrypted file there (story 98.3): none of it leaves the
       device in a cloud backup or a device-to-device transfer. The key that

@@ -23,6 +23,7 @@ import { detailStore } from "@/lib/stores/detail-ui";
 import { favoritesRoomsStore } from "@/lib/stores/favorites-rooms";
 import { leadingDrawerStore } from "@/lib/stores/leading-drawer";
 import { pinsRoomsStore } from "@/lib/stores/pins-rooms";
+import { platformStore } from "@/lib/stores/platform";
 import { primaryViewStore } from "@/lib/stores/primary-view";
 import { roomsStore } from "@/lib/stores/rooms";
 import { searchSurfaceStore } from "@/lib/stores/search-surface";
@@ -160,7 +161,8 @@ vi.mock("@tauri-apps/api/webview", () => ({
 }));
 
 import { dispatchPaletteAction } from "@/components/command-palette/actions";
-import { PhoneShell } from "@/components/layout/phone-shell";
+import { PhoneShell, TABLET_NO_ROOM_SENTENCE } from "@/components/layout/phone-shell";
+import { PROXY_DOCK_LABEL } from "@/components/layout/proxy-dock-sheet";
 import { sidebarViews } from "@/components/layout/sidebar-pane";
 import { COPY_SUBMIT_LABEL } from "@/components/layout/sync-pane";
 import {
@@ -215,25 +217,48 @@ function inboxRoom(roomId: string, displayName: string): InboxRoomVm {
  * `(prefers-reduced-motion: reduce)` query for `useReducedMotion` (Story 13.2).
  * Tests default to reduced motion so pops unmount synchronously (jsdom never
  * fires `transitionend`); motion-specific tests pass `reducedMotion: false`
- * and end transitions by hand.
+ * and end transitions by hand. `resize` changes the viewport and fires every
+ * registered `change` listener, as the on-screen keyboard does.
  */
 const originalMatchMedia = window.matchMedia;
-function mockViewportWidth(width: number, { reducedMotion = true } = {}) {
-  window.matchMedia = vi.fn().mockImplementation((query: string) => {
-    const match = query.match(/max-width:\s*(\d+)px/);
-    const maxWidth = match ? Number(match[1]) : Number.POSITIVE_INFINITY;
-    const matches = query.includes("prefers-reduced-motion") ? reducedMotion : width <= maxWidth;
-    return {
-      matches,
-      media: query,
-      onchange: null,
-      addEventListener: vi.fn(),
-      removeEventListener: vi.fn(),
-      addListener: vi.fn(),
-      removeListener: vi.fn(),
-      dispatchEvent: vi.fn(),
-    };
-  });
+function mockViewportWidth(width: number, { reducedMotion = true, height = 844 } = {}) {
+  const viewport = { width, height };
+  const listeners = new Set<() => void>();
+  window.matchMedia = vi.fn().mockImplementation((query: string) => ({
+    // Every `max-width`/`min-width`/`min-height` feature joined by `and` must
+    // hold, as in a browser.
+    get matches() {
+      return query.includes("prefers-reduced-motion")
+        ? reducedMotion
+        : query.split(" and ").every((feature) => {
+            const [, name, px] = feature.match(/(max-width|min-width|min-height):\s*(\d+)px/) ?? [];
+            const bound = Number(px);
+            return name === "max-width"
+              ? viewport.width <= bound
+              : name === "min-width"
+                ? viewport.width >= bound
+                : name === "min-height"
+                  ? viewport.height >= bound
+                  : true;
+          });
+    },
+    media: query,
+    onchange: null,
+    addEventListener: (_: string, listener: () => void) => listeners.add(listener),
+    removeEventListener: (_: string, listener: () => void) => listeners.delete(listener),
+    addListener: vi.fn(),
+    removeListener: vi.fn(),
+    dispatchEvent: vi.fn(),
+  }));
+  return {
+    resize(nextWidth: number, nextHeight: number) {
+      viewport.width = nextWidth;
+      viewport.height = nextHeight;
+      for (const listener of listeners) {
+        listener();
+      }
+    },
+  };
 }
 
 /** Render the stack and stream a set of inbox rows through the captured emitter. */
@@ -1841,5 +1866,87 @@ describe("PhoneShell sessions board (98.2 #5, UX-DR145)", () => {
       screen.queryByRole("button", { name: sessionsPhoneOpenCardRoom("Approve the budget line") }),
     ).toBeNull();
     expect(screen.queryByRole("button", { name: SESSIONS_PHONE_OPEN_ROOM })).toBeNull();
+  });
+});
+
+// ── The Android tablet (Epic 98, story 98.3 #5, UX-DR146) ─────────────────────
+describe("PhoneShell on an Android tablet", () => {
+  // Android's answer: every `cfg!(desktop)` flag false, the folder flags on;
+  // whether the device is a tablet is Rust's fact (`PlatformVm.tablet`).
+  const ANDROID = { ...DEFAULT_CAPABILITIES, bots: true, sync: true, notes: true, sessions: true };
+  const onDevice = (tablet: boolean) => {
+    capabilitiesStore.getState().applySnapshot(ANDROID);
+    platformStore.getState().applySnapshot({ urlForm: "localhost", tablet, disclosure: null });
+  };
+
+  afterEach(() => {
+    platformStore.getState().applySnapshot({ urlForm: "scheme", tablet: false, disclosure: null });
+  });
+
+  it("on its side, keeps the rooms list live beside the open room and offers the dock", async () => {
+    mockViewportWidth(1280, { height: 800 });
+    onDevice(true);
+    await renderWithRooms([{ roomId: "!r1:example.org", displayName: "Room One" }]);
+    expect(screen.getByText(TABLET_NO_ROOM_SENTENCE)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: PROXY_DOCK_LABEL })).toBeInTheDocument();
+
+    act(() => {
+      roomsStore.getState().selectRoom(selection);
+    });
+    await waitFor(() => expect(screen.getByRole("main")).toBeInTheDocument());
+    // Side by side: the Inbox is neither covered nor inert, so its rows stay
+    // reachable while the room is open.
+    expect(stackLevel(0)).not.toHaveAttribute("inert");
+    expect(stackLevel(0).style.transform).toBe("translateX(0)");
+    expect(stackLevel(1)).not.toHaveAttribute("inert");
+    expect(screen.getByText("Room One")).toBeInTheDocument();
+  });
+
+  it("keeps the Assistant sheet open and the rooms list beside the room when the keyboard opens", async () => {
+    const viewport = mockViewportWidth(1280, { height: 800 });
+    onDevice(true);
+    await renderWithRooms([{ roomId: "!r1:example.org", displayName: "Room One" }]);
+    act(() => {
+      roomsStore.getState().selectRoom(selection);
+    });
+    await waitFor(() => expect(screen.getByRole("main")).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: PROXY_DOCK_LABEL }));
+    expect(await screen.findByTestId("proxy-dock-sheet")).toBeInTheDocument();
+
+    // A landscape keyboard takes well over 200 dp of the layout viewport
+    // (`interactive-widget=resizes-content`).
+    act(() => viewport.resize(1280, 450));
+    expect(screen.getByTestId("proxy-dock-sheet")).toBeInTheDocument();
+    expect(stackLevel(0)).not.toHaveAttribute("inert");
+    expect(stackLevel(0).style.transform).toBe("translateX(0)");
+  });
+
+  it("upright, is the phone's one-level stack, with the dock still offered", async () => {
+    mockViewportWidth(800, { height: 1280 });
+    onDevice(true);
+    await renderWithRooms([{ roomId: "!r1:example.org", displayName: "Room One" }]);
+    expect(screen.getByRole("button", { name: PROXY_DOCK_LABEL })).toBeInTheDocument();
+    expect(screen.queryByText(TABLET_NO_ROOM_SENTENCE)).not.toBeInTheDocument();
+
+    act(() => {
+      roomsStore.getState().selectRoom(selection);
+    });
+    await waitFor(() => expect(screen.getByRole("main")).toBeInTheDocument());
+    expect(stackLevel(0)).toHaveAttribute("inert");
+  });
+
+  it("offers no dock on a phone, upright, on its side, or with a tablet-sized viewport", async () => {
+    onDevice(false);
+    for (const [width, height] of [
+      [390, 844],
+      [844, 390],
+      [1280, 800],
+    ]) {
+      mockViewportWidth(width, { height });
+      const view = await renderWithRooms([{ roomId: "!r1:example.org", displayName: "Room One" }]);
+      expect(screen.queryByRole("button", { name: PROXY_DOCK_LABEL })).toBeNull();
+      expect(screen.queryByText(TABLET_NO_ROOM_SENTENCE)).toBeNull();
+      view.unmount();
+    }
   });
 });

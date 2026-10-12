@@ -6,9 +6,12 @@
  *
  * Consumers: the transcript player (the viewer's and the note's media block),
  * the gallery block, and the Files panel's media viewer. This module imports
- * NOTHING, which is what lets a React surface and a CodeMirror widget share it
+ * nothing but the URL speller (`media-src.ts`, a function over the platform
+ * store), which is what lets a React surface and a CodeMirror widget share it
  * without either pulling the other's dependencies in.
  */
+
+import { mediaSrc } from "@/lib/media-src";
 
 /**
  * How far two tracks may disagree before the player pulls the follower back.
@@ -85,7 +88,7 @@ export const RECORDING_ASSET_SCHEME = "keeper-recording";
  */
 export function recordingAssetUrl(sessionId: string, relativePath: string): string {
   const path = relativePath.split("/").map(encodeURIComponent).join("/");
-  return `${RECORDING_ASSET_SCHEME}://${encodeURIComponent(sessionId)}/${path}`;
+  return mediaSrc(RECORDING_ASSET_SCHEME, `${encodeURIComponent(sessionId)}/${path}`);
 }
 
 /**

@@ -170,7 +170,14 @@ export function NotesAgentDock() {
   );
 }
 
-function DockBody() {
+/**
+ * The dock's contents — the proxy's rooms, the picker, the conversation — for
+ * the Notes column here and for the tablet's sheet (UX-DR146,
+ * `proxy-dock-sheet.tsx`). `tellsNote` is whether the note in front of the
+ * person is told to the proxy: beside the notes it is; over the Inbox no note
+ * is in front, so nothing is said.
+ */
+export function DockBody({ tellsNote = true }: { tellsNote?: boolean }) {
   const accounts = useAccountsStore((s) => s.accounts);
   // `null` while listing. Every account's proxy rooms, account by account, each
   // account's DM first as Rust ordered them — so the first row is the DM.
@@ -315,7 +322,7 @@ function DockBody() {
 
   return (
     <ConversationStoresProvider value={stores}>
-      <NoteFocus accountId={current.accountId} roomId={current.roomId} />
+      {tellsNote && <NoteFocus accountId={current.accountId} roomId={current.roomId} />}
       <div className="flex shrink-0 items-center gap-1 border-border border-b p-2">
         <Select
           value={`${current.accountId} ${current.roomId}`}

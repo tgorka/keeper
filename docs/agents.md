@@ -2897,6 +2897,10 @@ like any other). What keeper and the proxy's host do for it:
   selected, and a file dropped on the window goes to the note, not to the dock. Opened in a
   window too narrow for every column, it folds the notes rail to its strip. With no proxy it says
   so, looks again on its own and offers *Look again*.
+- **On an Android tablet** (story 98.3, UX-DR146) the same dock is a sheet: *Assistant* in the
+  Inbox header opens it over whatever is showing, with the same picker, header, timeline and
+  composer. It tells your proxy no note, because over the Inbox none is in front of you. A phone
+  has no dock; its proxy DM is a room in the Inbox.
 - **Which rooms.** The dock lists your proxy's conversations: the session rooms whose status says
   `kind: main` — the DM, listed first, the dock's default — or `kind: conversation`, newest next.
   A status is the word of whoever holds power in the room, so keeper also requires the room to be

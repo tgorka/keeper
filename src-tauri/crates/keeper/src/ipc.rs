@@ -1122,9 +1122,9 @@ impl Platform for IosPlatform {
 /// - **Secrets:** `keeper_core::secret_file` — one AEAD file in that
 ///   directory, keyed by the data key the Android Keystore wraps
 ///   ([`crate::android::KeystoreKey`]). Never `keyring`.
-/// - **Browser and sign-in:** the opener plugin hands the URL to Android
-///   (the default browser); the sign-in callback returns through the
-///   `keeper://` deep link. Custom Tabs and Auth Tab are the tablet rung's.
+/// - **Browser and sign-in:** a link opens in a Custom Tab (the opener
+///   plugin); a sign-in's authorization page in an Auth Tab, whose callback
+///   comes back as the activity's result (`web_auth.rs`, story 98.3).
 /// - **Notifications:** the notification plugin, as on iOS. No badge — an
 ///   Android launcher draws its own from the notifications — and no sidecar.
 #[cfg(target_os = "android")]
@@ -1184,9 +1184,31 @@ impl Platform for AndroidPlatform {
         self.secrets()?.delete(key)
     }
 
+    /// A Custom Tab, through the opener plugin's Android half (`inAppBrowser`).
+    /// Not the crate's free `open_url`: that is the `open` crate, which on
+    /// Android spawns a desktop opener that is not there.
     fn open_url(&self, url: &str) -> Result<(), CoreError> {
-        tauri_plugin_opener::open_url(url, None::<&str>)
+        use tauri_plugin_opener::OpenerExt;
+
+        let app = NOTIFY_APP.get().ok_or_else(|| {
+            CoreError::Unsupported(
+                "the browser is not reachable before keeper has started".to_owned(),
+            )
+        })?;
+        app.opener()
+            .open_url(url, Some("inAppBrowser"))
             .map_err(|e| CoreError::Internal(format!("could not open the browser: {e}")))
+    }
+
+    /// The account sign-in (Epic 82, AD-311; story 98.3): an Auth Tab, which
+    /// hands the callback back as the activity's result rather than as an
+    /// intent another app could claim (`web_auth::start_in`).
+    fn start_web_auth(&self, url: &str, callback_scheme: &str) -> Result<(), CoreError> {
+        if crate::web_auth::sheet_can_deliver(callback_scheme) {
+            crate::web_auth::start(url, callback_scheme)
+        } else {
+            self.open_url(url)
+        }
     }
 
     fn notify(&self, title: &str, body: &str, target: &NotifyTarget) -> Result<(), CoreError> {
@@ -1745,6 +1767,58 @@ pub fn capabilities(state: State<'_, AppState>) -> Result<CapabilitiesVm, IpcErr
         // everywhere else. The models are a separate state.
         transcription: crate::transcribe_ipc::transcription_supported(),
     })
+}
+
+/// What this build tells the webview about itself beyond what it offers (Epic
+/// 98, story 98.3 #3, #4, #5; codemap Q12 (b), Q13): the spelling keeper's
+/// custom scheme URLs take here, whether this device is a tablet, and the
+/// reduced build's "On this …" disclosure, composed in `keeper_core::disclosure`
+/// for the device this is. A desktop has no disclosure.
+///
+/// The tablet tier is Android's alone (R353): a device is a tablet by Android's
+/// own 600 dp smallest-width rule (`android::device_class`, read from
+/// `MainActivity`), a fact of the device that the on-screen keyboard cannot
+/// change. An iOS build is never a tablet here, an iPad included: its
+/// disclosure is the iPhone's ("On this iPhone"), and the tablet's layout and
+/// dock sheet do not apply under it — an iPad build would need its own
+/// disclosure and its own decision first.
+pub fn platform_facts() -> keeper_core::vm::PlatformVm {
+    #[cfg(target_os = "ios")]
+    let device = Some(keeper_core::disclosure::Device::Iphone);
+    #[cfg(target_os = "android")]
+    let device = Some(match crate::android::device_class() {
+        keeper_core::org_account::layout::DeviceClass::Tablet => {
+            keeper_core::disclosure::Device::AndroidTablet
+        }
+        _ => keeper_core::disclosure::Device::AndroidPhone,
+    });
+    #[cfg(not(any(target_os = "ios", target_os = "android")))]
+    let device = None;
+    keeper_core::vm::PlatformVm {
+        url_form: keeper_core::asset_url::UrlForm::HOST,
+        tablet: device == Some(keeper_core::disclosure::Device::AndroidTablet),
+        disclosure: device.map(keeper_core::disclosure::disclosure),
+    }
+}
+
+/// The plugin whose initialization script writes [`platform_facts`] into every
+/// webview as `window.__KEEPER_PLATFORM__` before the bundle runs, which
+/// `src/lib/stores/platform.ts` reads as its starting value. Every fact in it
+/// is fixed for the process, so there is nothing to ask for later and no
+/// window in which the front composes a URL in the wrong spelling or lays a
+/// tablet out as a phone (review R98TAB-06). On Android the app's own pages
+/// come from Tauri's custom protocol, where the script is prepended to the
+/// page or added at document start — before any of keeper's scripts.
+pub fn platform_plugin() -> tauri::plugin::TauriPlugin<tauri::Wry> {
+    let builder = tauri::plugin::Builder::new("keeper-platform");
+    match serde_json::to_string(&platform_facts()) {
+        Ok(facts) => builder.js_init_script(format!("window.__KEEPER_PLATFORM__ = {facts};")),
+        Err(error) => {
+            tracing::error!(%error, "platform facts: could not write them for the webview");
+            builder
+        }
+    }
+    .build()
 }
 
 /// Whether this build and this machine can show notes (FR-122).

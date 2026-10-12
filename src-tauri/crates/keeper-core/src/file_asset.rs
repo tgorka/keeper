@@ -140,10 +140,7 @@ pub fn is_servable_path(rel: &str) -> bool {
 /// legible in the log and keeps a NUL out of a `Path` on a platform that would
 /// truncate at it.
 pub fn parse_file_url(raw: &str) -> Option<(String, String)> {
-    let rest = raw
-        .strip_prefix(&format!("{SCHEME}://"))
-        .or_else(|| raw.strip_prefix(&format!("http://{SCHEME}.localhost/")))
-        .or_else(|| raw.strip_prefix(&format!("https://{SCHEME}.localhost/")))?;
+    let rest = crate::asset_url::strip(raw, SCHEME)?;
     // A query or fragment ends the path. `split` always yields at least one
     // element, so the `?` is unreachable in practice and keeps this total.
     let rest = rest.split(['?', '#']).next()?;
@@ -201,6 +198,8 @@ mod tests {
         profile_id: String,
         relative_path: String,
         url: String,
+        /// The same URL as Tauri serves it on Android and Windows.
+        localhost_url: String,
     }
 
     #[derive(serde::Deserialize)]
@@ -222,12 +221,13 @@ mod tests {
              emptying it would leave both suites passing while agreeing on nothing"
         );
         for vector in &table.ok {
-            assert_eq!(
-                parse_file_url(&vector.url),
-                Some((vector.profile_id.clone(), vector.relative_path.clone())),
-                "{} did not take apart into its two halves",
-                vector.url
-            );
+            for url in [&vector.url, &vector.localhost_url] {
+                assert_eq!(
+                    parse_file_url(url),
+                    Some((vector.profile_id.clone(), vector.relative_path.clone())),
+                    "{url} did not take apart into its two halves",
+                );
+            }
         }
     }
 
@@ -240,12 +240,9 @@ mod tests {
         let table = vectors();
         assert!(!table.refused.is_empty());
         for vector in &table.refused {
-            assert_eq!(
-                parse_file_url(&vector.url),
-                None,
-                "{} was accepted",
-                vector.url
-            );
+            for url in [&vector.url, &vector.localhost_url] {
+                assert_eq!(parse_file_url(url), None, "{url} was accepted");
+            }
         }
     }
 

@@ -1006,11 +1006,11 @@ to finish with the screen locked):
 - Listening for the wake phrase starts in keeper, and then keeps working with another app in front and with the screen locked; the answer is spoken there too, and saying "stop" (or the stop word you chose) ends it. Speech is recognised on this phone and never sent to a server.
 - Turn listening on while keeper is in front and it keeps listening when another app is in front or the screen is locked. Siri or an app that takes the microphone pauses it and keeper resumes on its own; a phone call ends it until you open keeper again. It stops when you turn it off or when keeper is force-quit. The orange microphone indicator stays on the whole time and cannot be hidden, and listening uses battery.
 
-> This list is mirrored from `IOS_DISCLOSURE_LINES` in
-> `src/components/settings/about-section.tsx`, which is the single source of truth —
-> the in-app "On this iPhone" disclosure links here, so the two must stay identical.
-> Edit both together or neither; `about-section.test.tsx` reads this list from disk
-> and fails when they differ.
+> This list is mirrored from `keeper_core::disclosure::IPHONE_LINES`, which is the
+> single source of truth — Rust sends it to the in-app "On this iPhone" disclosure
+> (`platform_facts`), which links here, so the two must stay identical. Edit both
+> together or neither; `keeper-core/tests/platform_disclosure_mirrors_docs.rs` reads
+> this list from disk and fails when they differ.
 
 On the first item, the canonical in-app wording spells out the sync consequence and its
 two exceptions (`NO_BACKGROUND_SYNC_SENTENCE`,

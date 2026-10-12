@@ -269,6 +269,45 @@ pub struct CapabilitiesVm {
     pub transcription: bool,
 }
 
+/// What this build tells the webview about itself beyond what it offers
+/// (Epic 98, story 98.3 #3, #4, #5; codemap Q12 (b), Q13): written into the
+/// webview by the shell's initialization script before the bundle runs
+/// (`window.__KEEPER_PLATFORM__`, `ipc::platform_plugin`), so the front's first
+/// frame already holds it; beside [`CapabilitiesVm`], which stays a flat set of
+/// surface flags.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct PlatformVm {
+    /// The spelling every `keeper-file`/`keeper-note`/`keeper-recording` URL the
+    /// front composes takes on this build (`asset_url::UrlForm::HOST`).
+    pub url_form: crate::asset_url::UrlForm,
+    /// This device is a tablet by Android's own smallest-width rule (600 dp,
+    /// read by `MainActivity`): the tablet tier's layout and dock (UX-DR146).
+    /// A device fact, never the viewport's, so the on-screen keyboard
+    /// shrinking the viewport leaves it a tablet. `false` on a desktop, a
+    /// phone and every iOS build.
+    pub tablet: bool,
+    /// The reduced build's "On this …" disclosure; `None` on a desktop.
+    pub disclosure: Option<PlatformDisclosureVm>,
+}
+
+/// A phone's or tablet's list of what it does differently
+/// (`disclosure::disclosure`), with the doc that says it at length.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct PlatformDisclosureVm {
+    /// "On this iPhone", "On this tablet", "On this phone".
+    pub heading: String,
+    /// The honesty lines, in order; mirrored into the doc's Limitations list.
+    pub lines: Vec<String>,
+    /// The doc the disclosure links to.
+    pub docs_url: String,
+    /// The link's text.
+    pub docs_label: String,
+}
+
 /// Stable, string-serialized error taxonomy for the IPC envelope.
 ///
 /// Variants serialize to their camelCase names (e.g. `"unsupported"`) and are
