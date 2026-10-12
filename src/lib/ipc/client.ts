@@ -40,6 +40,7 @@ import type { NotificationPermission } from "./gen/NotificationPermission";
 import type { NotifyTarget } from "./gen/NotifyTarget";
 import type { PersonVm } from "./gen/PersonVm";
 import type { PushGatewayVm } from "./gen/PushGatewayVm";
+import type { PushOpenVm } from "./gen/PushOpenVm";
 import type { TelemetryConsentVm } from "./gen/TelemetryConsentVm";
 import type { TelemetryEventReq } from "./gen/TelemetryEventReq";
 import type { TelemetryRemoteConfigVm } from "./gen/TelemetryRemoteConfigVm";
@@ -618,6 +619,7 @@ export type { ProviderKind } from "./gen/ProviderKind";
 export type { ProviderOfferVm } from "./gen/ProviderOfferVm";
 export type { ProxyRoomVm } from "./gen/ProxyRoomVm";
 export type { PushGatewayVm } from "./gen/PushGatewayVm";
+export type { PushOpenVm } from "./gen/PushOpenVm";
 export type { ReactionGroupVm } from "./gen/ReactionGroupVm";
 export type { ReadState } from "./gen/ReadState";
 export type { RecordingApplicationVm } from "./gen/RecordingApplicationVm";
@@ -3757,6 +3759,28 @@ export async function listenNotifyNavigate(
 ): Promise<() => void> {
   return await listen<NotifyTarget>(NOTIFY_NAVIGATE_EVENT, (event) => {
     onNavigate(event.payload);
+  });
+}
+
+/**
+ * The event the iPhone's shell emits when a keeper push was tapped (98.1, UX-DR144). Must
+ * match `PUSH_OPEN_EVENT` in `keeper/src/push_ios.rs`. It carries nothing: the room to
+ * open is taken with {@link pushOpenTake}.
+ */
+export const PUSH_OPEN_EVENT = "push://open";
+
+/**
+ * The session room a tapped keeper notification opens, once; `null` when none waits
+ * (always, off the iPhone).
+ */
+export async function pushOpenTake(): Promise<PushOpenVm | null> {
+  return await invoke<PushOpenVm | null>("push_open_take");
+}
+
+/** Subscribe to {@link PUSH_OPEN_EVENT}; resolves with an unlisten function. */
+export async function listenPushOpen(onTapped: () => void): Promise<() => void> {
+  return await listen(PUSH_OPEN_EVENT, () => {
+    onTapped();
   });
 }
 

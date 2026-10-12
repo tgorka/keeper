@@ -1320,3 +1320,74 @@ async fn synapse_suppresses_edit_pushes() {
         .expect("remove the pusher");
     assert!(removed.status().is_success(), "{}", removed.status());
 }
+
+/// 98.1 #3: the pusher keeper registers is the one the homeserver keeps. The
+/// person holds an agent session room, so `push::register` sets this phone's
+/// pusher: `http`, `event_id_only`, the gateway as `Gateway::parse` reads it
+/// and a `default_payload` naming the local account; registering with no
+/// gateway removes it, and the person has no pusher of this phone's left.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "live: Synapse on delectra"]
+async fn the_homeserver_keeps_the_pusher_keeper_registers() {
+    use keeper_core::agents::push::{self, ApnsEnvironment, PusherSpec, Registered};
+
+    let smoke = Smoke::setup().await;
+    let root = TempDir::new();
+    let (_nixi, person, _room) = joined_pair(&smoke, SessionKind::Main, root.path()).await;
+    let token = [0x6b, 0x65, 0x65, 0x70, 0x65, 0x72];
+    let account = "01J9ZK0000000000000000ACCT";
+    let spec = PusherSpec::of_setting(
+        Some("https://push.invalid"),
+        ApnsEnvironment::Development,
+        &token,
+        account,
+        "smoke",
+    )
+    .expect("a gateway keeper registers");
+    let pushkey = "a2VlcGVy";
+    let mine = || async {
+        smoke
+            .http
+            .get(format!("{}/_matrix/client/v3/pushers", smoke.homeserver))
+            .bearer_auth(person.client().access_token().expect("signed in"))
+            .send()
+            .await
+            .expect("pushers")
+            .json::<Value>()
+            .await
+            .expect("pushers json")["pushers"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|p| p["pushkey"] == pushkey && p["app_id"] == "dev.tgorka.keeper.ios.dev")
+            .collect::<Vec<Value>>()
+    };
+
+    let set = push::register(person.client(), spec.ids(), Some(&spec))
+        .await
+        .expect("set the pusher");
+    assert_eq!(set, Registered::Set);
+    let kept = mine().await;
+    assert_eq!(kept.len(), 1, "{kept:?}");
+    assert_eq!(kept[0]["kind"], "http");
+    assert_eq!(
+        kept[0]["data"]["url"],
+        "https://push.invalid/_matrix/push/v1/notify"
+    );
+    assert_eq!(kept[0]["data"]["format"], "event_id_only");
+    assert_eq!(
+        kept[0]["data"]["default_payload"]["keeper_account"],
+        account
+    );
+    assert_eq!(
+        kept[0]["data"]["default_payload"]["aps"]["mutable-content"],
+        1
+    );
+
+    let removed = push::register(person.client(), spec.ids(), None)
+        .await
+        .expect("remove the pusher");
+    assert_eq!(removed, Registered::Removed);
+    assert_eq!(mine().await, Vec::<Value>::new());
+}

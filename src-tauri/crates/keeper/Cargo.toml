@@ -191,6 +191,12 @@ ort = { workspace = true }
 
 [target.'cfg(target_os = "ios")'.dependencies]
 security-framework = { workspace = true }
+# Push (Epic 98, story 98.1): the APNs device token reaches keeper through the
+# app delegate's two remote-notification selectors, which keeper's patched tao
+# adds (`tools/tao/NOTICE`, change 3) and `push_ios.rs` hooks with
+# `tao::platform::ios::set_remote_notification_hooks`. The same tao Tauri
+# runs on (`[patch.crates-io]`); only the edge is new.
+tao = { version = "0.35.3", default-features = false }
 # iOS backup exclusion (Story 14.7, FR-65). The single audited `#[allow(unsafe_code)]`
 # FFI in `IosPlatform::exclude_from_backup` sets `NSURLIsExcludedFromBackupKey` via
 # objc2-foundation (features NSURL/NSError/NSString/NSValue, set on the workspace

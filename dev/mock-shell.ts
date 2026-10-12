@@ -6984,6 +6984,7 @@ function mockPushGatewaySet(payload: Record<string, unknown>) {
 
 const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = {
   push_gateway_get: () => pushGateway,
+  push_open_take: () => null,
   push_gateway_set: mockPushGatewaySet,
   inbox_subscribe: subscribeMockInbox,
   agent_approval_decide: mockApprovalDecide,

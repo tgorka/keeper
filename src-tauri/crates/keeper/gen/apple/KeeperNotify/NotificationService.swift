@@ -13,7 +13,16 @@
 //
 // Rust opens nothing in the group container before the app's one-time move
 // has finished there (`keeper_nse::store_of`); until then, and on any
-// failure, the notification stays as the gateway sent it ("generic").
+// failure, the notification says keeper's generic words.
+//
+// The push is the homeserver's to write (the pusher's `default_payload`, and
+// whatever reaches the gateway): its alert, its `aps.category` and every
+// keeper key in it are untrusted. So on every path but `show` this hands iOS
+// keeper's generic title and body with no category — no actions — and no
+// keeper key (`generic`); `show` removes every keeper key before it sets its
+// own, and only `show` sets `keeper_shown`, which the app's delegate
+// (`KeeperPush.swift`) and `push::action_decision` require
+// (`keeper_core::agents::push::SHOWN_INFO`, R343).
 
 import Foundation
 import Security
@@ -31,6 +40,24 @@ final class NotificationService: UNNotificationServiceExtension {
   private var handler: ((UNNotificationContent) -> Void)?
   private var fallback: UNNotificationContent?
 
+  /// Every key of keeper's a notification's `userInfo` can carry
+  /// (`push::PAYLOAD_ACCOUNT`, `push::APPROVAL_INFO`, `push::SHOWN_INFO`).
+  private static let keeperKeys = ["keeper_account", "keeper_approval", "keeper_shown"]
+
+  /// What iOS shows when keeper cannot say more: keeper's own words
+  /// (`push::GENERIC_TITLE`, `push::GENERIC_BODY`), no category, no keeper
+  /// key — whatever the push carried.
+  private static func generic(_ original: UNNotificationContent) -> UNNotificationContent {
+    let content = UNMutableNotificationContent()
+    content.title = "keeper"
+    content.body = "Open keeper to see what arrived."
+    content.sound = original.sound
+    var info = original.userInfo
+    for key in keeperKeys { info.removeValue(forKey: key) }
+    content.userInfo = info
+    return content
+  }
+
   /// Hand `content` to iOS once; later calls do nothing.
   private func deliver(_ content: UNNotificationContent) {
     lock.lock()
@@ -46,7 +73,7 @@ final class NotificationService: UNNotificationServiceExtension {
   ) {
     lock.lock()
     handler = contentHandler
-    fallback = request.content
+    fallback = Self.generic(request.content)
     lock.unlock()
 
     let info = request.content.userInfo
@@ -58,7 +85,7 @@ final class NotificationService: UNNotificationServiceExtension {
         forSecurityApplicationGroupIdentifier: "group.dev.tgorka.keeper"),
       let session = Self.keychain("session/\(account)")
     else {
-      deliver(request.content)
+      deliver(Self.generic(request.content))
       return
     }
     let body: [String: Any] = [
@@ -73,12 +100,12 @@ final class NotificationService: UNNotificationServiceExtension {
       let data = try? JSONSerialization.data(withJSONObject: body),
       let json = String(data: data, encoding: .utf8)
     else {
-      deliver(request.content)
+      deliver(Self.generic(request.content))
       return
     }
     Self.queue.async {
       let answer = Self.ask(json)
-      self.deliver(Self.content(answer, from: request.content))
+      self.deliver(Self.content(answer, account: account, from: request.content))
     }
   }
 
@@ -99,19 +126,24 @@ final class NotificationService: UNNotificationServiceExtension {
   }
 
   /// What to show for Rust's `answer`: its own content for `show`, nothing
-  /// for `drop`, the gateway's notification otherwise.
+  /// for `drop`, keeper's generic words otherwise. Only `show` carries
+  /// keeper keys, and only the ones it sets: `account` is the account whose
+  /// store answered.
   private static func content(
-    _ answer: [String: Any]?, from original: UNNotificationContent
+    _ answer: [String: Any]?, account: String, from original: UNNotificationContent
   ) -> UNNotificationContent {
     switch answer?["kind"] as? String {
     case "show":
       guard let answer, let mutable = original.mutableCopy() as? UNMutableNotificationContent
-      else { return original }
+      else { return generic(original) }
+      for key in keeperKeys { mutable.userInfo.removeValue(forKey: key) }
       mutable.title = answer["title"] as? String ?? ""
       mutable.subtitle = answer["subtitle"] as? String ?? ""
       mutable.body = answer["body"] as? String ?? ""
       mutable.categoryIdentifier = answer["category"] as? String ?? ""
       mutable.threadIdentifier = answer["thread_id"] as? String ?? ""
+      mutable.userInfo["keeper_account"] = account
+      mutable.userInfo["keeper_shown"] = true
       if let approval = answer["approval"] as? [String: Any] {
         // What the action handler decides (rung 4): exactly the record and
         // digest this notification showed.
@@ -121,7 +153,7 @@ final class NotificationService: UNNotificationServiceExtension {
     case "drop":
       return UNNotificationContent()
     default:
-      return original
+      return generic(original)
     }
   }
 

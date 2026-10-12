@@ -9917,7 +9917,8 @@ reason: reads are kept per session but under one host-wide cap, so a busy sessio
 origin: epic 98, story 98.1 fix round 1 (rung `agents-98-push-setting`, 2026-10-11; `review-98pushsetting-1.md` DW-a, R331)
 location: `src-tauri/crates/keeper-core/src/agents/push.rs` (`Gateway::parse`), `src-tauri/crates/keeper-core/src/registry.rs` (`get_push_gateway_url`); rung 4 (`agents-98-apns`) `PusherSpec`
 reason: `get_push_gateway_url` returns the raw stored text, and a synced `settings.toml` can carry any text. The setter and the egress row read it through `Gateway::parse`; the pusher rung 4 registers must too, and register no pusher when it refuses — never hand the raw string to the homeserver. Rung 4 also adds the `egress_list` append (`cfg(not(desktop))`) and the `docs/egress.md` row that moved out of rung 1 (R330), and rewrites `PUSH_GATEWAY_NOTE` with `NO_BACKGROUND_SYNC_SENTENCE` and `docs/ios.md` (codemap Q16).
-status: open
+status: done 2026-10-12
+resolution: rung `agents-98-apns` (R340): `push::PusherSpec::of_setting` takes the raw stored text and reads it only through `Gateway::parse` — blank, absent or refused is no pusher, and `push::register` then removes this phone's pusher instead (`push::tests::pusher_spec`: `http://`, a user name, a bare host and blank register nothing); the `cfg(not(desktop))` `egress_list` append and the `docs/egress.md` row are in; `PUSH_GATEWAY_NOTE`, `NO_BACKGROUND_SYNC_SENTENCE` and `docs/ios.md` are rewritten (R342).
 
 ### DW-1231: One host-vs-port rule for every egress row.
 
@@ -10009,4 +10010,53 @@ status: open
 origin: epic 98, story 98.1 (rung `agents-98-nse` fix round 1, 2026-10-12; `review-98nse-1.md`, R339)
 location: `scripts/install-ios.sh` (`KEEPER_IOS_FREE_TEAM` yq drop), `gen/apple/KeeperNotify/Info.plist` (`KeeperKeychainGroup`)
 reason: Both are written by inspection and `bash -n`: the yq removal of the target and the app's dependency mirrors the island's proven shape, and the keychain group relies on Xcode expanding `$(AppIdentifierPrefix)` in Info.plist; neither has run in an install. Trigger: `install:ios` on hesperia with `KEEPER_IOS_FREE_TEAM=1`, and the paid-team install.
+status: open
+
+### DW-1260: An account gets its pusher only when keeper registers again.
+
+origin: epic 98, story 98.1 (rung `agents-98-apns`, 2026-10-12; R340)
+location: `src-tauri/crates/keeper/src/push_ios.rs` (`register_soon`), `keeper_core::agents::push::register`
+reason: The pusher is set on an account only while it holds an agent session room, and registration runs after setup when the token arrives and when the gateway is saved. An account that joins its first agent room while keeper runs, a gateway changed on another device and synced in through `settings.toml`, and a token APNs rotates mid-run are registered at the next launch, not at once; a rotated token's old pusher stays on the homeserver until the gateway reports it rejected. If the device run (98.1 #12) shows a missed first approval, register again when an agent room appears (the agents window's stream already sees it).
+status: open
+
+### DW-1261: Why push is not working is said only in the log.
+
+origin: epic 98, story 98.1 (rung `agents-98-apns`, 2026-10-12; extends DW-1241)
+location: `src-tauri/crates/keeper/src/push_ios.rs` (`token_refused`, `register_soon`), `src/components/settings/push-gateway-field.tsx`
+reason: iOS refusing a token (a free Personal Team's build has no `aps-environment`), a profile that grants no push, a pusher the homeserver refused and a refused App Group move (DW-1241) each leave the field showing a valid gateway and nothing arriving; only the log says why. A status line under the field, composed in Rust from the last token outcome, the registration outcomes and the move's refusal, would say it. Not built here: the disclosures already say push needs a paid-team build, and the owner installs free-team builds until enrolment.
+status: open
+
+### DW-1262: A decision from the lock screen is not measured, and its background account keeps syncing.
+
+origin: epic 98, story 98.1 (rung `agents-98-apns`, 2026-10-12; R341, codemap §5)
+location: `keeper_core::account::AccountManager::agent_approval_decide_notified`, `push::ACTION_BUDGET`, `KeeperPush.swift`
+reason: An action that launches keeper in the background activates its one account (its `SyncService` included) and retries for up to 20 s while the request syncs in; how long that takes, whether iOS grants the time, and whether the webview-less process behaves are device measurements (98.1 #12). The account stays active until iOS suspends the process; nothing stops its sync when the action is done. If the time shows short, fetch the request event by id instead of waiting for the sync; if the lingering sync shows in battery, shut the account down after a background-only action.
+status: open
+
+### DW-1263: A lock-screen action that launches keeper in the background writes no log file.
+
+origin: epic 98, story 98.1 (rung `agents-98-apns` fix round 1, 2026-10-12; `review-98apns-1.md`, R343; extends DW-1261)
+location: `src-tauri/crates/keeper/src/push_ios.rs` (`act`, `token_refused`), `src-tauri/crates/keeper/src/lib.rs` (`setup()`, `debug_log::init`)
+reason: Under the scene lifecycle an action that launches keeper in the background runs no `setup()` (R341), and `debug_log::init` runs only there, so `act`'s warnings — why a decision was not sent, an action on a notification keeper did not compose — and `token_refused` reach no file on the device. The measurement DW-1262 owes therefore has no log. Fix when the device run needs it: initialise the log in `push_ios::install`, before UIKit starts, when `setup()` has not run.
+status: open
+
+### DW-1264: The notification plugin could take the delegate back after keeper's install.
+
+origin: epic 98, story 98.1 (rung `agents-98-apns` fix round 1, 2026-10-12; `review-98apns-1.md`, R343)
+location: `src-tauri/crates/keeper/gen/apple/Sources/keeper/KeeperPush.swift` (`install`), `push_ios::set_up`
+reason: `KeeperPush.install` captures the plugin's delegate once and becomes `UNUserNotificationCenter`'s delegate; `set_up()` installs again, so a plugin that re-set itself before then is wrapped again, but one that does so later — its `requestPermission` path was not read — would leave keeper's actions and taps unhandled until the next launch. Device check (98.1 #12): after the permission prompt, an action and a tap still reach keeper. If not, install again after the plugin's permission call returns.
+status: open
+
+### DW-1265: R341's two inferences about iOS are owed to the device run.
+
+origin: epic 98, story 98.1 (rung `agents-98-apns` fix round 1, 2026-10-12; `review-98apns-1.md`, R341)
+location: `src-tauri/crates/keeper/src/push_ios.rs` (`install`), `tools/tao/src/platform_impl/ios/app_state.rs` (`did_finish_launching`)
+reason: Two facts are read from documentation and source, not observed: that iOS honours a `UNUserNotificationCenter` delegate set before `UIApplicationMain` for a response that launches the app, and that tao 0.35.3 on iOS 27 emits no `StartCause::Init` for an action's background launch under the scene lifecycle (so `setup()` does not run). Trigger: the kalypso run (98.1 #12) — an action from a killed keeper is decided, and the log (DW-1263) shows no `setup()`.
+status: open
+
+### DW-1266: A push shows as it arrived when the extension ends before it answers.
+
+origin: epic 98, story 98.1 (rung `agents-98-apns` fix round 1, 2026-10-12; `review-98apns-1.md` R98APNS1-01, R343)
+location: `src-tauri/crates/keeper/gen/apple/KeeperNotify/NotificationService.swift`, `keeper_core::agents::push::SHOWN_INFO`
+reason: The extension strips every keeper key and the category from what the gateway sent on every path it completes, and only its `show` sets `keeper_shown`. If iOS ends the extension before it calls its handler at all (killed over its memory ceiling, a crash), iOS shows the push as it arrived — the homeserver's words, its category's actions, any `keeper_shown` it planted. The decision path still refuses any record not in the session room with that digest, so nothing but a real request with its real digest is decided, but the words may not be keeper's. Closing it needs a mark the gateway cannot forge — e.g. a per-install secret in the shared keychain the extension seals the shown record with and the app checks — or the record the extension showed written to the App Group and checked by the app. Measure first whether the extension is ever killed (98.1 #12, the 24 MB row).
 status: open

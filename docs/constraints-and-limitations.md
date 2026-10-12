@@ -28,8 +28,15 @@ risk sections.
 - **No WhatsApp automation features** (bulk send, auto-reply) — ban-bait for bridge users.
 - **No native VoIP implementation now.** MatrixRTC (MSC4143) is pre-spec and volatile;
   calls arrive post-MVP via the Element Call widget.
-- **No paid Apple Developer Program yet** (so no APNs push, NSE, TestFlight, or App Groups) —
-  deferred by decision; see [decisions.md](decisions.md) D-1.
+- **Push on the iPhone needs the paid Apple Developer Program and a gateway you run.** D-35
+  ended D-1's deferral: the build carries `aps-environment`, an App Group and the notification
+  extension (Epic 98, story 98.1), and with a build signed by the owner's paid team and a Sygnal
+  holding that team's APNs key, an agent's approval request and the owner's own agent's answer
+  reach the locked phone, and nothing else shows; the homeserver still sends the gateway, and
+  Apple, the id of every other message that would notify, and the phone discards it. keeper ships no gateway and never chooses one
+  (D-1, D-4). A free Personal Team's build strips all three and has no push; it is what the owner
+  installs until enrolment, and the device run that closes 98.1 is owed until then
+  ([docs/ios.md](ios.md) § *Push*). No TestFlight.
 
 ## Hard / risky (do with eyes open)
 
@@ -175,8 +182,8 @@ safe binding. Current inventory:
   `keeper-core/src/voice/island.rs:43`), how long a failure card lingers (`FAILURE_LINGER`,
   30 s, `:38`) — is `keeper_core::voice::island`, pure and tested on the dev host, with no
   platform `cfg` and no `tauri`; the bridge only carries it. Every call is local
-  (`pushType: nil`, no APNs, no App Group — `docs/egress.md`, *The phone's record and the
-  island add no egress*), and a request the system refuses (in the background, on a free
+  (`pushType: nil`; the app's APNs entitlement and App Group are push's, never the island's —
+  `docs/egress.md`, *The phone's record and the island add no egress*), and a request the system refuses (in the background, on a free
   team) is recorded once in the ring as `island:refused` and retried on `RunEvent::Resumed`
   rather than looped. **Not yet compiled anywhere**: the Swift, the extension target and
   the link are proven only by the Mac gate and the kalypso install (DW-222).
@@ -378,3 +385,17 @@ safe binding. Current inventory:
   Swift). Both stop a panic with `catch_unwind` before it reaches the C ABI (a panic
   is the generic notification). Everything between is safe Rust taking and returning
   JSON (`keeper_nse::handle_json`), tested on Linux; `keeper-core` stays without `unsafe`.
+- Push's C ABI in the app, iOS (Epic 98, story 98.1, AD-412): the app's notification
+  delegate (`gen/apple/Sources/keeper/KeeperPush.swift`, declared to Swift by
+  `Sources/keeper/keeper_push.h`) calls Rust, so `crates/keeper/src/push_ios.rs` exports
+  three `#[no_mangle] pub unsafe extern "C"` fns, each function-level
+  `#[allow(unsafe_code)]` with a `// SAFETY:` comment — `keeper_push_action` (an action's
+  request, read with `CStr::from_ptr` from Swift's `withCString` buffer; returns null or a
+  `CString::into_raw` answer), `keeper_push_open` (a tap's `userInfo`, read the same way)
+  and `keeper_push_free` (`CString::from_raw` of an answer, released once by Swift) — plus
+  `received`, the one `CStr::from_ptr` both readers share, and `bridge_install`, the call
+  into Swift's `keeper_push_install` with a buffer that outlives it. What an action sends and
+  where a tap lands are `keeper_core::agents::push` (`action_decision`, `tap_target`), safe
+  and tested on Linux. The APNs token reaches Rust through keeper's patched tao
+  (`tools/tao/NOTICE`, change 3), whose new app-delegate methods read `NSData` bytes and an
+  `NSError`'s description with `msg_send!` in tao's own style.

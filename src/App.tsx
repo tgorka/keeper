@@ -16,6 +16,7 @@ import { useCapabilitiesHydrate } from "@/hooks/use-capabilities-hydrate";
 import { useNavStatePersistence } from "@/hooks/use-nav-state-persistence";
 import { useNotesOpenNote } from "@/hooks/use-notes-open-note";
 import { useNotifyNavigate } from "@/hooks/use-notify-navigate";
+import { usePushOpen } from "@/hooks/use-push-open";
 import { useRecordingRemoved } from "@/hooks/use-recording-removed";
 import { useSessionRestore } from "@/hooks/use-session-restore";
 import { useTelemetryReadiness } from "@/hooks/use-telemetry";
@@ -71,6 +72,7 @@ function App() {
   // a notification click summons the app and lands it on the Inbox (message) or the
   // Bridges view (bridge alert). Coarse only — no exact-message deep landing in MVP.
   useNotifyNavigate();
+  usePushOpen();
   // Open the note the tray just created (Story 44.6, FR-160). At the root and
   // not in the notes view: the tray exists so the app window is optional for a
   // whole day (FR-102), so this event routinely arrives while another view is

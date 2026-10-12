@@ -17,8 +17,9 @@ It covers, in reading order:
 8. [Building a shareable IPA](#building-a-shareable-ipa)
 9. [Sharing a build without Xcode](#sharing-a-build-without-xcode)
 10. [Verifying the core compiles for iOS](#verifying-the-core-compiles-for-ios)
-11. [The folder on the phone](#the-folder-on-the-phone)
-12. [Limitations](#limitations)
+11. [Push](#push)
+12. [The folder on the phone](#the-folder-on-the-phone)
+13. [Limitations](#limitations)
 
 All shell commands are run from the repository root unless stated otherwise.
 
@@ -608,7 +609,7 @@ request in keeper's own words, an answer of your own agent, or nothing.
 - **It opens nothing before the move.** It reads the group's data directory only once
   `.keeper-moved` is there (`keeper_nse::store_of`), and creates nothing in it; until
   then — a free team's build, or a move not yet finished — and on any failure, the
-  notification stays as the gateway sent it.
+  notification says keeper's generic words with no actions ([Push](#push), *What shows*).
 - **One account, one room.** The push's payload names keeper's account id
   (`keeper_account`); the extension opens that account's store alone, loads only the
   room the push names, and takes its own cross-process lock holder (`nse`) beside the
@@ -630,6 +631,77 @@ rewrite (`keeper-sync/src/db.rs`, `a_folder_under_the_data_directory_follows_it_
 `a_phone_folder_under_a_previous_app_container_…`). **Not yet proved anywhere:** that iOS
 answers nil without the entitlement and a path with it, and that the move keeps an
 existing install's accounts, messages and folder — the kalypso runs owed in the epic.
+
+## Push
+
+Epic 98, story 98.1 (AD-412, D-35). An agent's approval request and your own agent's
+answer reach the phone while keeper is closed — and nothing else shows. The pusher is the
+account's, though: your homeserver still sends your gateway, and the gateway Apple, the id
+of every other message that would notify, and this phone's extension discards it. Every
+other message notifies only while keeper is open, as before.
+
+**What it needs, none of it in this repository** (D-1, D-35: keeper ships no gateway and
+never chooses one):
+
+- **A build signed by your own paid Apple team.** APNs, the App Group and the notification
+  extension need the paid Apple Developer Program; a free Personal Team's build
+  (`KEEPER_IOS_FREE_TEAM=1`) has no `aps-environment`, iOS gives it no device token, and
+  keeper registers nothing.
+- **A push gateway you run, holding your own APNs key.** APNs takes pushes for a bundle
+  only from the holder of that team's key, so the gateway — a Sygnal beside your
+  homeserver — is configured with your `.p8` key, its key id and your team id, and two
+  apps: `dev.tgorka.keeper.ios` (APNs production) and `dev.tgorka.keeper.ios.dev` (the
+  sandbox). Its address goes into **Settings › Notifications › Push gateway**
+  (`push.gateway_url`).
+
+**What keeper does with them** (`src-tauri/crates/keeper/src/push_ios.rs`, every decision
+in `keeper_core::agents::push`):
+
+- **The token.** keeper asks UIKit for remote notifications at every launch; the device
+  token arrives through tao's app delegate, which keeper's patched tao gives the two
+  selectors upstream lacks (`tools/tao/NOTICE`, change 3).
+- **The pusher.** Once keeper is in front and has the token, it registers on each signed-in
+  account that holds agent session rooms an `http` pusher to your gateway, format
+  `event_id_only`, app `dev.tgorka.keeper.ios.dev` or `dev.tgorka.keeper.ios` by the
+  `aps-environment` of the build's own provisioning profile (an App Store build has none
+  and is production; a profile that is there but cannot be read registers nothing, and the
+  log says so, rather than guess which of the two the token belongs to), and a
+  `default_payload` that runs the notification extension (`mutable-content`) and names
+  keeper's account id. On every other account, and on all of them when the field is empty
+  or holds an address keeper refuses, it removes the pusher. Signing out removes this
+  phone's pusher from that account first, best effort — offline it stays until the gateway
+  reports the token rejected. Your homeserver sends the gateway event ids, never messages;
+  keeper never contacts it. Changing the field registers again at once; an account that
+  gains its first agent room is registered at the next launch.
+- **What shows** is the extension's decision ([The notification
+  extension](#the-notification-extension)). If it cannot decide — the data has not moved
+  into the App Group yet, the token expired, an event it cannot read — the notification
+  reads *keeper — Open keeper to see what arrived.*, with no actions, whatever the push
+  carried: the push is your homeserver's to write, so its alert, its category and any
+  keeper key in it are never shown or acted on. Only a notification the extension composed
+  carries the key (`keeper_shown`) the delegate and `push::action_decision` require.
+- **Actions.** An approval whose whole payload fits the notification offers *Approve once*
+  and *Deny*; any other offers *Deny* only. Both need the phone unlocked; *Deny* is drawn
+  as destructive. keeper owns the notification delegate (`Sources/keeper/KeeperPush.swift`)
+  and hands everything that is not its push to the notification plugin's. An action sends
+  exactly the record and digest the notification showed, scope `once`, through the same
+  decision the in-app card sends, which checks once more that the request is in the session
+  room with that digest; an action that launches keeper in the background signs in that one
+  account only and, while the request or its room has not reached the phone yet, tries for
+  twenty seconds. Any other refusal — the device is not cross-signed, another digest, no
+  longer waiting — is the answer at once, and a decision whose send failed is not sent
+  again. Then a new notification says *Open keeper to finish deciding.* with the reason,
+  and tapping it opens the session.
+- **Taps.** Tapping a keeper notification opens its session room in the Agents window.
+
+**Proved on Linux:** what a notification offers and sends, the pusher and the app id
+(`keeper-core/src/agents/push.rs` tests); that Synapse keeps the pusher keeper registers
+and removes it (`keeper-core/tests/agents_matrix_live.rs`,
+`the_homeserver_keeps_the_pusher_keeper_registers`, against the test homeserver); the
+webview's landing (`src/hooks/use-push-open.test.ts`). **Owed on the phone** after
+enrolment (98.1 #12): the token, the pusher on the owner's homeserver, the lock-screen
+actions with Face ID, the time an action takes from a background launch, and that a
+status update shows nothing.
 
 ## The folder on the phone
 
@@ -856,7 +928,7 @@ build. These are the same eight points keeper shows in-app under **Settings → 
 folder; the first and seventh by Epic 67, Story 67.4, AD-210, when a spoken turn learned
 to finish with the screen locked):
 
-- keeper syncs and notifies about messages only while it's open; background notifications await a future decision. A voice session you left listening is the exception: it answers with the screen locked and posts what it heard as a banner from this phone.
+- keeper syncs and notifies about messages only while it's open. Two things still reach you while it is closed: with a build signed by your own paid Apple team and a push gateway you run, your agents' approval requests and your own agent's answers arrive as notifications through it, read on this phone (nothing else shows; the ids of other messages still pass through your gateway and Apple, and this phone discards them); and a voice session you left listening answers with the screen locked and posts what it heard as a banner from this phone.
 - A folder you add here mirrors a remote your Mac already syncs and lives inside keeper's own container: every large file stays a pointer until you open it, and it syncs only when keeper opens, comes back in front or you pull to refresh — nothing watches the folder on a battery.
 - Nothing is merged on a phone: a history this copy cannot fast-forward is named — how many commits this phone has that the remote does not — and you push them or reset this copy; the Mac merges.
 - Notes are a synced folder, so they are here too: list, search, read and edit them, and a save is a commit that keeper pushes from this phone with its own engine — there is no git on a phone.
@@ -872,21 +944,18 @@ to finish with the screen locked):
 > and fails when they differ.
 
 On the first item, the canonical in-app wording spells out the sync consequence and its
-one exception (`NO_BACKGROUND_SYNC_SENTENCE`,
-`src/components/settings/no-background-sync-disclosure.tsx:30-35`): "On iPhone, keeper
-syncs and notifies about messages only while open. Close it and messages wait on your
-homeserver until you return — nothing is lost, and nothing here pretends to be push. A
-voice session you left listening is the one exception: it keeps listening with keeper
-behind other apps or the screen locked, and posts what it heard and answered as a local
-banner from this phone." The app-icon badge follows the same honesty: "The app-icon badge
-is not a live count while keeper is closed; it reflects what keeper knew when it was last
-open."
+two exceptions (`NO_BACKGROUND_SYNC_SENTENCE`,
+`src/components/settings/no-background-sync-disclosure.tsx`): "On iPhone, keeper syncs and notifies about messages only while open. Close it and messages wait on your homeserver until you return — nothing is lost. Two things still reach you while it is closed. With a build signed by your own paid Apple team and a push gateway you run, set in Settings › Notifications, your agents' approval requests and your own agent's answers arrive as notifications, read on this phone. Nothing else shows; the ids of other messages still pass through your gateway and Apple, and this phone discards them. And a voice session you left listening keeps listening with keeper behind other apps or the screen locked, and posts what it heard and answered as a local banner from this phone." The app-icon badge
+follows the same honesty: "The app-icon badge is not a live count while keeper is closed; it
+reflects what keeper knew when it was last open."
 
-The "future decision" the first item names is recorded in [decisions.md](decisions.md) D-1 —
-the deferred paid Apple Developer Program that would unlock APNs push and the NSE. The
-exception is not push and needs none of that: it is a local notification the app posts
-from its own process, and [A turn that finishes without the screen](#a-turn-that-finishes-without-the-screen)
-below is what it is made of.
+The first exception is [Push](#push) above: D-35 ended D-1's deferral of the paid Apple
+Developer Program, and with it and a gateway the owner runs the notification extension shows an
+agent's approval request and the owner's own agent's answer. A free Personal Team's build has
+neither, and for it the first item's message half is the whole story. The second exception is not
+push and needs none of that: it is a local notification the app posts from its own process, and
+[A turn that finishes without the screen](#a-turn-that-finishes-without-the-screen) below is what
+it is made of.
 
 The second and third items are [The folder on the phone](#the-folder-on-the-phone)
 above, Epic 66 (AD-198, AD-199; D-15). "Mirrors a remote your Mac already syncs" is the

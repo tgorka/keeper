@@ -83,12 +83,13 @@ export function debugModeSentence(logPath: string | null): string {
  * sentence read here before switching listening on is the sentence shown
  * beside the switch. The third line's fact is `phone_divergence_sentence` in
  * `keeper-sync/src/engine.rs` (AD-199), worded for a list rather than a status
- * row. The first line's exception is `NO_BACKGROUND_SYNC_SENTENCE`'s last
- * sentence (AD-207), in the list's voice: the message half stays scoped to
- * messages, because a voice banner would otherwise contradict it.
+ * row. The first line's two exceptions are `NO_BACKGROUND_SYNC_SENTENCE`'s
+ * (push, Epic 98 story 98.1, AD-412; the voice banner, AD-207), in the
+ * list's voice: the message half stays scoped to messages, because either
+ * would otherwise contradict it.
  */
 export const IOS_DISCLOSURE_LINES: ReadonlyArray<string> = [
-  "keeper syncs and notifies about messages only while it's open; background notifications await a future decision. A voice session you left listening is the exception: it answers with the screen locked and posts what it heard as a banner from this phone.",
+  "keeper syncs and notifies about messages only while it's open. Two things still reach you while it is closed: with a build signed by your own paid Apple team and a push gateway you run, your agents' approval requests and your own agent's answers arrive as notifications through it, read on this phone (nothing else shows; the ids of other messages still pass through your gateway and Apple, and this phone discards them); and a voice session you left listening answers with the screen locked and posts what it heard as a banner from this phone.",
   "A folder you add here mirrors a remote your Mac already syncs and lives inside keeper's own container: every large file stays a pointer until you open it, and it syncs only when keeper opens, comes back in front or you pull to refresh — nothing watches the folder on a battery.",
   "Nothing is merged on a phone: a history this copy cannot fast-forward is named — how many commits this phone has that the remote does not — and you push them or reset this copy; the Mac merges.",
   "Notes are a synced folder, so they are here too: list, search, read and edit them, and a save is a commit that keeper pushes from this phone with its own engine — there is no git on a phone.",

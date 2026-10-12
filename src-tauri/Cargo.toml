@@ -556,8 +556,10 @@ rustfft = "6.4"
 # the app (a scanned `keeper://setup?…` code while keeper is closed) is still
 # delivered once the UIScene lifecycle is on. iOS 27 requires that lifecycle, and
 # in it the launch URL exists only in the first scene's connection options, which
-# upstream (through 0.37.1) never reads. See tools/tao/NOTICE. Retire it when
-# upstream reads them: delete this table and the directory.
+# upstream (through 0.37.1) never reads; and the app delegate's two APNs-token
+# selectors, which push on the iPhone needs (Epic 98, `push_ios.rs`). See
+# tools/tao/NOTICE. Retire it when upstream has both: delete this table and the
+# directory.
 [patch.crates-io]
 tao = { path = "../tools/tao" }
 

@@ -1903,6 +1903,12 @@ notification's content, host an agent on a phone or a tablet, or write a session
   on the tablet (Tauri #15671 and its kin), which is D-1's own Plan B trigger. Neither reopens the
   second paragraph: a project-run gateway is not a revisit, it is the infrastructure D-1 and D-4
   refuse.
+- **D-1's Plan B trigger, answered (codemap Q10, Epic 98 story 98.1):** D-1 keeps Plan B (UniFFI
+  and a native shell) shelved with "NSE work beginning" among its revisit triggers. That work has
+  begun and does not reopen it: the extension is `keeper-nse`, a static library of keeper's own
+  that depends on `keeper-core` alone (`bun run check:nse-lean`) behind one C call, and the app's
+  notification delegate is one Swift file calling three C functions of the Tauri shell
+  (`push_ios.rs`). Neither needs a second shell or generated bindings, so the trigger is spent.
 - **Status / owner:** decided by the owner on 2026-10-01 (round 2), pinned by the coordinator
   (P15, rulings R20, R24(13), R24(14); R28 S-10; R29 F9, F14). Owner is the architect. Epic 98 implements it: the iPhone's pusher, notification service
   extension and actions; the phone's sessions board; and keeper's Android platform, build and

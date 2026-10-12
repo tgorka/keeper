@@ -9,16 +9,19 @@ import { syncErrorMessage } from "@/lib/stores/sync";
 export const PUSH_GATEWAY_LABEL = "Push gateway";
 
 /**
- * What the field is for and who contacts the address (98.1, Q4/Q6; D-1; R331): the gateway
- * is the person's, keeper keeps the address for the pusher it will register and never
- * contacts it, and it carries event ids only. It promises nothing this build does — the
- * sentence under it (`NO_BACKGROUND_SYNC_SENTENCE`) stays true until a pusher is registered.
- * Sentence case, no exclamation marks.
+ * What the field is for and who contacts the address (98.1, Q4/Q6; D-1, D-35; R331): the
+ * gateway is the person's; keeper registers it with each account that holds agent rooms as
+ * a pusher that carries event ids only, and never contacts it; what push brings is an
+ * agent's approval request and the person's own agent's answer, read on the phone; and it
+ * needs a build signed by the person's paid Apple team. Sentence case, no exclamation marks.
  */
 export const PUSH_GATEWAY_NOTE =
-  "The address of a Matrix push gateway you run, kept for the push keeper will register with " +
-  "your homeserver. Your homeserver will send it event ids, never messages, and keeper never " +
-  "contacts it. Leave it empty for no push.";
+  "The address of a Matrix push gateway you run. keeper registers it with your homeserver for " +
+  "each account that holds agent rooms, so your agents' approval requests and your own " +
+  "agent's answers reach this phone while keeper is closed, and nothing else shows. Your " +
+  "homeserver sends the gateway the id of every message that would notify, never its words, " +
+  "and keeper never contacts it. Push needs a build signed by your " +
+  "own paid Apple team. Leave it empty for no push.";
 
 const PUSH_GATEWAY_PLACEHOLDER = "https://push.example.org";
 const PUSH_GATEWAY_SAVE = "Save";

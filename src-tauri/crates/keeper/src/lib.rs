@@ -115,6 +115,11 @@ mod tray;
 // frameworks are reached, and the only voice code that is target-specific.
 // Every other target answers `unsupported` through `voice_ipc`'s absent
 // port, so the command list stays identical.
+// Push on the iPhone (Epic 98, story 98.1, AD-412): the APNs token, the
+// pusher, the notification delegate's actions and taps. iOS-only; every
+// decision is `keeper_core::agents::push`.
+#[cfg(target_os = "ios")]
+mod push_ios;
 #[cfg(target_os = "ios")]
 mod voice_ios;
 // The island (Story 65.5, AD-194): the Live Activity that shows the phone's
@@ -649,6 +654,10 @@ pub fn run() {
             transcribe_ipc::install(app.handle());
             #[cfg(target_os = "ios")]
             voice_notify::install(app.handle());
+            // Push (98.1): keeper is in front now, so this phone's pusher may
+            // be registered once iOS gives the token.
+            #[cfg(target_os = "ios")]
+            push_ios::set_up();
 
             // Store the app handle for the desktop dock-badge port (Story 10.3) so
             // `Platform::set_badge_count` can drive the main window's OS dock badge from
@@ -1258,6 +1267,7 @@ pub fn run() {
                 ipc::notify_set_preview_enabled,
                 ipc::push_gateway_get,
                 ipc::push_gateway_set,
+                ipc::push_open_take,
                 ipc::dnd_get_global,
                 ipc::dnd_set_global,
                 ipc::network_mute_get,
@@ -1770,182 +1780,187 @@ pub fn run() {
                 .study_stop();
         }
     });
-    builder
+    let app = builder
         .build(tauri::generate_context!())
-        .expect("error while building tauri application")
-        .run(|app_handle, event| match event {
-            // App-quit (⌘Q / native Quit): gracefully stop every account's sync with a
-            // bounded wait, then let the process exit. This is the honest-quit
-            // guarantee made mechanical — no hidden background process survives a
-            // quit. If shutdown exceeds the bound, still exit (log at warn).
-            //
-            // Quit-while-recording (Story 18.2) warns FIRST: a live session shows a
-            // modal OkCancel confirm before anything stops. The plugin's
-            // `blocking_show` must never run on this (main) thread — the sheet's
-            // completion needs the main runloop the block would freeze — so the
-            // confirm is the async twin of blocking: prevent this exit, show the
-            // sheet, and have the callback re-request the exit with
-            // `QUIT_CONFIRMED` set; the second pass then runs stop → bounded
-            // finalize (→ force-kill on timeout) BEFORE the bounded sync shutdown.
-            // Cancel simply leaves the app (and recording) running. With no live
-            // recording this arm is byte-for-byte the pre-18.2 quit path.
-            tauri::RunEvent::ExitRequested { api, .. } => {
-                // iOS never records (the recorder is honestly `Unsupported`), so the
-                // desktop-only quit guard below is the only consumer of `api`.
-                #[cfg(not(desktop))]
-                let _ = api;
-                let state = app_handle.state::<ipc::AppState>();
-                #[cfg(desktop)]
-                if ipc::recording_snapshot(&state).state.is_live() {
-                    if !QUIT_CONFIRMED.load(Ordering::Relaxed) {
-                        api.prevent_exit();
-                        if QUIT_CONFIRM_IN_FLIGHT.swap(true, Ordering::Relaxed) {
-                            // A confirm sheet is already up — never stack a second.
-                            return;
-                        }
-                        // The confirm attaches to the main window as a sheet — raise
-                        // the window first so a quit from the tray (window hidden)
-                        // shows a visible dialog, never an invisible stuck quit.
-                        tray::show_main_window(app_handle);
-                        let handle = app_handle.clone();
-                        app_handle
-                            .dialog()
-                            .message(
-                                "Recording in progress — quit will stop and finalize \
-                                 the current segment",
-                            )
-                            .title("Quit keeper?")
-                            .buttons(MessageDialogButtons::OkCancel)
-                            .show(move |confirmed| {
-                                QUIT_CONFIRM_IN_FLIGHT.store(false, Ordering::Relaxed);
-                                if confirmed {
-                                    QUIT_CONFIRMED.store(true, Ordering::Relaxed);
-                                    handle.exit(0);
-                                }
-                            });
+        .expect("error while building tauri application");
+    // The notification delegate and the token's hooks, before UIKit starts:
+    // an action that launches keeper in the background runs no `setup()`
+    // (push_ios's module doc).
+    #[cfg(target_os = "ios")]
+    push_ios::install(app.handle());
+    app.run(|app_handle, event| match event {
+        // App-quit (⌘Q / native Quit): gracefully stop every account's sync with a
+        // bounded wait, then let the process exit. This is the honest-quit
+        // guarantee made mechanical — no hidden background process survives a
+        // quit. If shutdown exceeds the bound, still exit (log at warn).
+        //
+        // Quit-while-recording (Story 18.2) warns FIRST: a live session shows a
+        // modal OkCancel confirm before anything stops. The plugin's
+        // `blocking_show` must never run on this (main) thread — the sheet's
+        // completion needs the main runloop the block would freeze — so the
+        // confirm is the async twin of blocking: prevent this exit, show the
+        // sheet, and have the callback re-request the exit with
+        // `QUIT_CONFIRMED` set; the second pass then runs stop → bounded
+        // finalize (→ force-kill on timeout) BEFORE the bounded sync shutdown.
+        // Cancel simply leaves the app (and recording) running. With no live
+        // recording this arm is byte-for-byte the pre-18.2 quit path.
+        tauri::RunEvent::ExitRequested { api, .. } => {
+            // iOS never records (the recorder is honestly `Unsupported`), so the
+            // desktop-only quit guard below is the only consumer of `api`.
+            #[cfg(not(desktop))]
+            let _ = api;
+            let state = app_handle.state::<ipc::AppState>();
+            #[cfg(desktop)]
+            if ipc::recording_snapshot(&state).state.is_live() {
+                if !QUIT_CONFIRMED.load(Ordering::Relaxed) {
+                    api.prevent_exit();
+                    if QUIT_CONFIRM_IN_FLIGHT.swap(true, Ordering::Relaxed) {
+                        // A confirm sheet is already up — never stack a second.
                         return;
                     }
-                    // Confirmed quit: graceful stop → await finalize under the
-                    // kill-timeout → abort the driver (sidecar force-killed via
-                    // `kill_on_drop`) if it hangs. Bounded — quit is never stuck.
-                    ipc::finalize_recording_for_quit(&state);
+                    // The confirm attaches to the main window as a sheet — raise
+                    // the window first so a quit from the tray (window hidden)
+                    // shows a visible dialog, never an invisible stuck quit.
+                    tray::show_main_window(app_handle);
+                    let handle = app_handle.clone();
+                    app_handle
+                        .dialog()
+                        .message(
+                            "Recording in progress — quit will stop and finalize \
+                                 the current segment",
+                        )
+                        .title("Quit keeper?")
+                        .buttons(MessageDialogButtons::OkCancel)
+                        .show(move |confirmed| {
+                            QUIT_CONFIRM_IN_FLIGHT.store(false, Ordering::Relaxed);
+                            if confirmed {
+                                QUIT_CONFIRMED.store(true, Ordering::Relaxed);
+                                handle.exit(0);
+                            }
+                        });
+                    return;
                 }
-                // Flush every notes vault before the supervisor is signalled
-                // (FR-115, AD-62): quitting mid-typing must not lose the note. The
-                // wait is bounded, and bounding it is safe precisely because the
-                // commit already happened locally and an outstanding push is a
-                // journal row the next launch drains — the work is queued, not
-                // dropped.
-                #[cfg(desktop)]
-                notes_vault::flush_for_quit();
-                // Ask the sync supervisor to stop before the account teardown
-                // below: the engine finishes the unit it holds and leaves its
-                // journal row intact, so an interrupted push is re-driven next
-                // launch instead of being killed mid-write.
-                //
-                // ...and hand this host's task leases back in the same call
-                // (Story 57.5, AD-137, NFR-42). Signalling alone was not enough
-                // and the gap was a race the app loses: `start_supervisor` drops
-                // the spawned task's `JoinHandle` (`sync.rs:445-451`), nothing
-                // here awaits it, and `Engine::run`'s post-loop `finalize()` —
-                // which is what reaches `db::release_host_leases` — therefore
-                // may never be polled before the process exits. A task holding
-                // a lease at quit would then be unrunnable by ANY host for the
-                // whole of `TASK_LEASE_MS`, and the lease names a pid the next
-                // launch cannot prove dead.
-                //
-                // Releasing them the instant the signal is sent was not the fix
-                // either, and this arm is why: the process does NOT exit here —
-                // the bounded `shutdown_all` below runs first — so a supervisor
-                // already inside a task run keeps going, with a git child that
-                // has no `kill_on_drop`. `finalize_for_quit` therefore settles
-                // in-flight runs within a bounded budget and only then releases,
-                // and it never releases a lease whose run is still executing:
-                // freeing that one let the daemon on a shared `sync.db` start a
-                // second concurrent run over the same working tree.
-                //
-                // Deliberately NOT on the window-close path: closing hides the
-                // window and keeps the host (`WindowEvent::CloseRequested`
-                // above), so releasing there would stop tasks the user never
-                // asked to stop.
-                // The agents this Mac hosts stop first: running turns get
-                // their final edits and their log lines, which the sync quit
-                // below commits and pushes; only then are the claims released,
-                // so a taker reads a log that has them (AD-378).
-                #[cfg(desktop)]
-                agents_host::stop_turns_for_quit();
-                #[cfg(desktop)]
-                sync::finalize_for_quit();
-                #[cfg(desktop)]
-                agents_host::release_for_quit();
-                // A short, bounded graceful shutdown: `shutdown_all` awaits each
-                // account's `sync.stop()`. Bounding it keeps quit responsive even if a
-                // network teardown hangs.
-                let shutdown = async {
-                    tokio::time::timeout(
-                        std::time::Duration::from_secs(3),
-                        state.accounts.shutdown_all(),
-                    )
-                    .await
-                };
-                if tauri::async_runtime::block_on(shutdown).is_err() {
-                    tracing::warn!("shutdown_all exceeded the quit bound; exiting anyway");
-                }
+                // Confirmed quit: graceful stop → await finalize under the
+                // kill-timeout → abort the driver (sidecar force-killed via
+                // `kill_on_drop`) if it hangs. Bounded — quit is never stuck.
+                ipc::finalize_recording_for_quit(&state);
             }
-            // macOS dock-icon click while the window is hidden re-shows + focuses it.
-            // Following a notification click (which activates the app), this is the
-            // coarse click-through seam (Story 10.4, Option B): summon+focus, then emit a
-            // navigate event derived from the KIND of the last recorded notification
-            // target so the webview lands on the Inbox (Message) or Bridges (Bridge)
-            // view. The kept notification backend has NO per-notification click callback,
-            // so this is deliberately coarse — never exact-message routing (deferred to
-            // Epic 11).
+            // Flush every notes vault before the supervisor is signalled
+            // (FR-115, AD-62): quitting mid-typing must not lose the note. The
+            // wait is bounded, and bounding it is safe precisely because the
+            // commit already happened locally and an outstanding push is a
+            // journal row the next launch drains — the work is queued, not
+            // dropped.
+            #[cfg(desktop)]
+            notes_vault::flush_for_quit();
+            // Ask the sync supervisor to stop before the account teardown
+            // below: the engine finishes the unit it holds and leaves its
+            // journal row intact, so an interrupted push is re-driven next
+            // launch instead of being killed mid-write.
             //
-            // The phone came back to the foreground (`willEnterForeground` on
-            // iOS; never at launch, which keeps AD-169's "keeper never arms
-            // itself"): if the phrase is switched on and its refusal has
-            // cleared — the microphone allowed under Settings > keeper, a
-            // language downloaded — it is armed again (Epic 65, AD-190).
-            // The desktop's equivalent is the main window's focus, above.
-            tauri::RunEvent::Resumed => {
-                voice_ipc::voice_rearm();
-                // The phone in front again is where an agent's surface call
-                // goes (AD-383); the desktop's is the main window's focus.
-                #[cfg(not(desktop))]
-                agents_ipc::presence_focus(app_handle, true);
-                // A Live Activity can be requested only with keeper in
-                // front (Story 65.5): one refused while it was not — the
-                // eight-hour renew, an arm from the port's own resume — is
-                // requested now.
-                #[cfg(target_os = "ios")]
-                voice_island::resumed();
-                #[cfg(target_os = "ios")]
-                voice_notify::resumed();
-                // The folder on the phone syncs on foreground (Epic 66,
-                // NFR-57): no supervisor ticks here, so this and
-                // pull-to-refresh are the only times a remote change arrives.
-                #[cfg(not(desktop))]
-                sync::phone_sync_all(app_handle, "foreground");
+            // ...and hand this host's task leases back in the same call
+            // (Story 57.5, AD-137, NFR-42). Signalling alone was not enough
+            // and the gap was a race the app loses: `start_supervisor` drops
+            // the spawned task's `JoinHandle` (`sync.rs:445-451`), nothing
+            // here awaits it, and `Engine::run`'s post-loop `finalize()` —
+            // which is what reaches `db::release_host_leases` — therefore
+            // may never be polled before the process exits. A task holding
+            // a lease at quit would then be unrunnable by ANY host for the
+            // whole of `TASK_LEASE_MS`, and the lease names a pid the next
+            // launch cannot prove dead.
+            //
+            // Releasing them the instant the signal is sent was not the fix
+            // either, and this arm is why: the process does NOT exit here —
+            // the bounded `shutdown_all` below runs first — so a supervisor
+            // already inside a task run keeps going, with a git child that
+            // has no `kill_on_drop`. `finalize_for_quit` therefore settles
+            // in-flight runs within a bounded budget and only then releases,
+            // and it never releases a lease whose run is still executing:
+            // freeing that one let the daemon on a shared `sync.db` start a
+            // second concurrent run over the same working tree.
+            //
+            // Deliberately NOT on the window-close path: closing hides the
+            // window and keeps the host (`WindowEvent::CloseRequested`
+            // above), so releasing there would stop tasks the user never
+            // asked to stop.
+            // The agents this Mac hosts stop first: running turns get
+            // their final edits and their log lines, which the sync quit
+            // below commits and pushes; only then are the claims released,
+            // so a taker reads a log that has them (AD-378).
+            #[cfg(desktop)]
+            agents_host::stop_turns_for_quit();
+            #[cfg(desktop)]
+            sync::finalize_for_quit();
+            #[cfg(desktop)]
+            agents_host::release_for_quit();
+            // A short, bounded graceful shutdown: `shutdown_all` awaits each
+            // account's `sync.stop()`. Bounding it keeps quit responsive even if a
+            // network teardown hangs.
+            let shutdown = async {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    state.accounts.shutdown_all(),
+                )
+                .await
+            };
+            if tauri::async_runtime::block_on(shutdown).is_err() {
+                tracing::warn!("shutdown_all exceeded the quit bound; exiting anyway");
             }
-            // The phone leaving the front (`applicationWillResignActive`):
-            // its presence stops naming it as the device in front.
+        }
+        // macOS dock-icon click while the window is hidden re-shows + focuses it.
+        // Following a notification click (which activates the app), this is the
+        // coarse click-through seam (Story 10.4, Option B): summon+focus, then emit a
+        // navigate event derived from the KIND of the last recorded notification
+        // target so the webview lands on the Inbox (Message) or Bridges (Bridge)
+        // view. The kept notification backend has NO per-notification click callback,
+        // so this is deliberately coarse — never exact-message routing (deferred to
+        // Epic 11).
+        //
+        // The phone came back to the foreground (`willEnterForeground` on
+        // iOS; never at launch, which keeps AD-169's "keeper never arms
+        // itself"): if the phrase is switched on and its refusal has
+        // cleared — the microphone allowed under Settings > keeper, a
+        // language downloaded — it is armed again (Epic 65, AD-190).
+        // The desktop's equivalent is the main window's focus, above.
+        tauri::RunEvent::Resumed => {
+            voice_ipc::voice_rearm();
+            // The phone in front again is where an agent's surface call
+            // goes (AD-383); the desktop's is the main window's focus.
             #[cfg(not(desktop))]
-            tauri::RunEvent::WindowEvent {
-                event: tauri::WindowEvent::Suspended,
-                ..
-            } => agents_ipc::presence_focus(app_handle, false),
-            // keeper opened on the phone is in front; `Resumed` comes only
-            // on a return from the background.
+            agents_ipc::presence_focus(app_handle, true);
+            // A Live Activity can be requested only with keeper in
+            // front (Story 65.5): one refused while it was not — the
+            // eight-hour renew, an arm from the port's own resume — is
+            // requested now.
+            #[cfg(target_os = "ios")]
+            voice_island::resumed();
+            #[cfg(target_os = "ios")]
+            voice_notify::resumed();
+            // The folder on the phone syncs on foreground (Epic 66,
+            // NFR-57): no supervisor ticks here, so this and
+            // pull-to-refresh are the only times a remote change arrives.
             #[cfg(not(desktop))]
-            tauri::RunEvent::Ready => agents_ipc::presence_focus(app_handle, true),
-            // `RunEvent::Reopen` is an Apple-platform variant (there is no dock on
-            // Linux/Windows), so this arm is gated on macOS specifically rather than on
-            // `desktop` — the wider gate does not compile on the Linux desktop target.
-            #[cfg(target_os = "macos")]
-            tauri::RunEvent::Reopen { .. } => {
-                tray::show_main_window(app_handle);
-                ipc::emit_notify_navigate(app_handle);
-            }
-            _ => {}
-        });
+            sync::phone_sync_all(app_handle, "foreground");
+        }
+        // The phone leaving the front (`applicationWillResignActive`):
+        // its presence stops naming it as the device in front.
+        #[cfg(not(desktop))]
+        tauri::RunEvent::WindowEvent {
+            event: tauri::WindowEvent::Suspended,
+            ..
+        } => agents_ipc::presence_focus(app_handle, false),
+        // keeper opened on the phone is in front; `Resumed` comes only
+        // on a return from the background.
+        #[cfg(not(desktop))]
+        tauri::RunEvent::Ready => agents_ipc::presence_focus(app_handle, true),
+        // `RunEvent::Reopen` is an Apple-platform variant (there is no dock on
+        // Linux/Windows), so this arm is gated on macOS specifically rather than on
+        // `desktop` — the wider gate does not compile on the Linux desktop target.
+        #[cfg(target_os = "macos")]
+        tauri::RunEvent::Reopen { .. } => {
+            tray::show_main_window(app_handle);
+            ipc::emit_notify_navigate(app_handle);
+        }
+        _ => {}
+    });
 }

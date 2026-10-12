@@ -92,6 +92,8 @@ pub use self::{
 };
 pub(crate) use crate::icon::NoIcon as PlatformIcon;
 pub(crate) use badge::set_badge_count;
+// keeper (tools/tao/NOTICE, change 3).
+pub(crate) use view::REMOTE_NOTIFICATION_HOOKS;
 
 // todo: implement iOS keyboard event
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]

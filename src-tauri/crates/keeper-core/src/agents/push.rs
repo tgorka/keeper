@@ -18,6 +18,9 @@
 //! sees all of it, and the person's proxy's answer, by its newest words
 //! ([`latest_text`]); nothing else.
 
+/// A pusher's identity on a homeserver — what [`register`] and a sign-out
+/// remove by — named for the shell, which has no `matrix-sdk` of its own.
+pub use matrix_sdk::ruma::api::client::push::PusherIds;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use ts_rs::TS;
@@ -215,6 +218,13 @@ impl Category {
         }
     }
 
+    /// The category iOS names by `id`; `None` for any other.
+    pub fn of_id(id: &str) -> Option<Category> {
+        [Category::Approval, Category::ApprovalOpen]
+            .into_iter()
+            .find(|category| category.id() == id)
+    }
+
     /// The actions the category offers, in order.
     pub fn actions(self) -> &'static [NotificationAction] {
         match self {
@@ -249,6 +259,19 @@ impl NotificationAction {
             NotificationAction::ApproveOnce => "Approve once",
             NotificationAction::Deny => "Deny",
         }
+    }
+
+    /// The action iOS names by `id`; `None` for any other.
+    pub fn of_id(id: &str) -> Option<NotificationAction> {
+        [NotificationAction::ApproveOnce, NotificationAction::Deny]
+            .into_iter()
+            .find(|action| action.id() == id)
+    }
+
+    /// Whether the lock screen draws the action as destructive (UX-DR144:
+    /// *Deny*).
+    pub fn destructive(self) -> bool {
+        self == NotificationAction::Deny
     }
 
     /// The decision this action sends for `approval` — the request
@@ -617,6 +640,364 @@ pub fn answer_edit<'a>(
         && content["m.relates_to"]["event_id"] == anchor)
         .then(|| content["m.new_content"]["body"].as_str())
         .flatten()
+}
+
+// ---------------------------------------------------------------------------
+// The pusher (98.1 #3; AD-412, Q4, DW-1230)
+//
+// The phone hands each account's homeserver an `event_id_only` pusher naming
+// the gateway the person typed — read only through [`Gateway::parse`], so a
+// refused or blank setting registers nothing and the raw text never reaches
+// the homeserver — and the APNs token this build was given.
+
+/// The notification's own words when the extension cannot say more — the
+/// app's data has not moved yet, the token expired, an event it could not
+/// read (`keeper-nse`'s generic answer): keeper's words, never an event's.
+pub const GENERIC_TITLE: &str = "keeper";
+
+/// See [`GENERIC_TITLE`].
+pub const GENERIC_BODY: &str = "Open keeper to see what arrived.";
+
+/// The key an approval's notification carries the shown record under, for
+/// the action handler (`KeeperNotify` writes it, [`action_decision`] reads
+/// it).
+pub const APPROVAL_INFO: &str = "keeper_approval";
+
+/// The key only a notification keeper composed on this phone carries
+/// (R343): the extension's `show`, or the notification keeper re-posts
+/// after an action ([`FINISH_IN_KEEPER`]). The push itself is the
+/// homeserver's to write — the pusher's `default_payload` and anything
+/// that reaches the gateway — so it can carry this key, and
+/// [`APPROVAL_INFO`], [`PAYLOAD_ACCOUNT`] and a category too; the extension
+/// therefore removes every keeper key from what arrived on every path, shows
+/// keeper's generic words with no category on every path but `show`, and
+/// sets this key only there. [`action_decision`] and [`tap_target`] act on
+/// nothing without it. What it cannot cover: an extension that ends before
+/// it answers at all, where iOS shows the push as it arrived. Then the
+/// decision path's own check is the guard — the record must be in the
+/// session room as this phone syncs it, with the digest the notification
+/// carried ([`crate::agents::approval_card::ApprovalFold::check`]), so
+/// nothing is decided that is not a real request with its real digest.
+pub const SHOWN_INFO: &str = "keeper_shown";
+
+/// APNs' two environments, which a Sygnal serves as two apps (Q4): the
+/// pusher's `app_id` says which one this build's token belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApnsEnvironment {
+    /// The sandbox: a build signed with a development profile.
+    Development,
+    /// Production: an ad-hoc, TestFlight or App Store build.
+    Production,
+}
+
+impl ApnsEnvironment {
+    /// The pusher's `app_id`: the Sygnal app that holds this environment.
+    pub fn app_id(self) -> &'static str {
+        match self {
+            ApnsEnvironment::Development => "dev.tgorka.keeper.ios.dev",
+            ApnsEnvironment::Production => "dev.tgorka.keeper.ios",
+        }
+    }
+
+    /// The environment this build's signature registers with, from the
+    /// bundle's `embedded.mobileprovision`: its `aps-environment`; no
+    /// profile at all is an App Store build, which is production; a profile
+    /// without the key — a free Personal Team's — is no push (`None`).
+    pub fn of_profile(profile: Option<&[u8]>) -> Option<ApnsEnvironment> {
+        let Some(profile) = profile else {
+            return Some(ApnsEnvironment::Production);
+        };
+        let key = b"<key>aps-environment</key>";
+        let rest = &profile[find(profile, key)? + key.len()..];
+        let open = b"<string>";
+        let start = find(rest, open)?;
+        if !rest[..start].iter().all(u8::is_ascii_whitespace) {
+            return None;
+        }
+        let value = &rest[start + open.len()..];
+        match value[..find(value, b"</string>")?].trim_ascii() {
+            b"development" => Some(ApnsEnvironment::Development),
+            b"production" => Some(ApnsEnvironment::Production),
+            _ => None,
+        }
+    }
+
+    /// The environment from reading the bundle's `embedded.mobileprovision`:
+    /// [`Self::of_profile`] over its bytes, and over no profile when the file
+    /// does not exist — the App Store's builds carry none. Any other read
+    /// error is returned, never read as production: a development build
+    /// whose profile could not be read would register its sandbox token with
+    /// the production app, and every push to it would fail at Apple. The
+    /// safe answer is no pusher, with the error in the log (R343).
+    pub fn of_profile_read(
+        read: std::io::Result<Vec<u8>>,
+    ) -> std::io::Result<Option<ApnsEnvironment>> {
+        match read {
+            Ok(profile) => Ok(ApnsEnvironment::of_profile(Some(&profile))),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(ApnsEnvironment::of_profile(None))
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
+/// Where `needle` first starts in `hay`.
+fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    hay.windows(needle.len())
+        .position(|window| window == needle)
+}
+
+/// The pusher's identity on the homeserver: the token as Sygnal reads an
+/// APNs pushkey (base64) and the environment's app.
+pub fn pusher_ids(
+    environment: ApnsEnvironment,
+    token: &[u8],
+) -> matrix_sdk::ruma::api::client::push::PusherIds {
+    use base64::Engine as _;
+    matrix_sdk::ruma::api::client::push::PusherIds::new(
+        base64::engine::general_purpose::STANDARD.encode(token),
+        environment.app_id().to_owned(),
+    )
+}
+
+/// The pusher this phone registers on one account (98.1 #3): an `http`
+/// pusher to the person's gateway, `event_id_only`, whose `default_payload`
+/// asks iOS to run the notification extension (`mutable-content`), gives
+/// the alert it shows when the extension cannot say more, and names the
+/// local account whose store the extension opens ([`PAYLOAD_ACCOUNT`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PusherSpec {
+    gateway: Gateway,
+    environment: ApnsEnvironment,
+    token: Vec<u8>,
+    account: String,
+    device: String,
+}
+
+impl PusherSpec {
+    /// The pusher for `account` over `stored`, `push.gateway_url` as the
+    /// registry holds it (raw: a synced `settings.toml` can carry any
+    /// text). Read only through [`Gateway::parse`]: blank, absent or
+    /// refused is no pusher, as is a build with no token yet (DW-1230).
+    pub fn of_setting(
+        stored: Option<&str>,
+        environment: ApnsEnvironment,
+        token: &[u8],
+        account: &str,
+        device: &str,
+    ) -> Option<PusherSpec> {
+        if token.is_empty() || account.is_empty() {
+            return None;
+        }
+        let gateway = Gateway::parse(stored?).ok()??;
+        Some(PusherSpec {
+            gateway,
+            environment,
+            token: token.to_vec(),
+            account: account.to_owned(),
+            device: device.to_owned(),
+        })
+    }
+
+    /// The pusher's identity ([`pusher_ids`]).
+    pub fn ids(&self) -> matrix_sdk::ruma::api::client::push::PusherIds {
+        pusher_ids(self.environment, &self.token)
+    }
+
+    /// The pusher as the homeserver's `POST /pushers/set` takes it.
+    pub fn pusher(&self) -> matrix_sdk::ruma::api::client::push::Pusher {
+        use matrix_sdk::ruma::api::client::push::{PusherInit, PusherKind};
+        use matrix_sdk::ruma::push::{HttpPusherData, PushFormat};
+
+        let mut data = HttpPusherData::new(self.gateway.as_str().to_owned());
+        data.format = Some(PushFormat::EventIdOnly);
+        data.data.insert(
+            "default_payload".to_owned(),
+            serde_json::json!({
+                "aps": {
+                    "mutable-content": 1,
+                    "alert": { "title": GENERIC_TITLE, "body": GENERIC_BODY },
+                },
+                PAYLOAD_ACCOUNT: self.account,
+            }),
+        );
+        PusherInit {
+            ids: self.ids(),
+            kind: PusherKind::Http(data),
+            app_display_name: "keeper".to_owned(),
+            device_display_name: self.device.clone(),
+            profile_tag: None,
+            lang: "en".to_owned(),
+        }
+        .into()
+    }
+}
+
+/// What [`register`] did on one account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Registered {
+    /// The pusher is set.
+    Set,
+    /// Any pusher of this phone's is removed.
+    Removed,
+}
+
+/// Whether `client`'s person is in any agent session room: the accounts a
+/// phone registers its pusher on — on any other, every event would wake the
+/// extension only for it to show nothing (DW-408).
+pub fn holds_session_rooms(client: &matrix_sdk::Client) -> bool {
+    client.joined_rooms().iter().any(|room| {
+        crate::agents::room::AgentRoomKind::of(room.room_type().as_ref())
+            == Some(crate::agents::room::AgentRoomKind::Session)
+    })
+}
+
+/// Set `spec` on `client`'s account when it holds agent session rooms,
+/// else remove the pusher `ids` names. `append`: one phone signed in to two
+/// accounts on one homeserver registers the same token and app twice, and
+/// without it the second registration would remove the first.
+pub async fn register(
+    client: &matrix_sdk::Client,
+    ids: matrix_sdk::ruma::api::client::push::PusherIds,
+    spec: Option<&PusherSpec>,
+) -> Result<Registered, matrix_sdk::Error> {
+    match spec.filter(|_| holds_session_rooms(client)) {
+        Some(spec) => {
+            client.pusher().set(spec.pusher(), true).await?;
+            Ok(Registered::Set)
+        }
+        None => {
+            client.pusher().delete(ids).await?;
+            Ok(Registered::Removed)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The lock screen's actions and taps (98.1 #4, UX-DR144; Q2, Q3)
+
+/// How long a decision from the lock screen is tried before the person is
+/// asked to finish it in keeper: iOS gives an action about thirty seconds.
+pub const ACTION_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// What a re-posted notification says when a decision from the lock screen
+/// could not be sent in [`ACTION_BUDGET`].
+pub const FINISH_IN_KEEPER: &str = "Open keeper to finish deciding.";
+
+/// What the app's notification delegate hands Rust when the person picks an
+/// action: the notification's category, the action, and its `userInfo`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ActionTap {
+    pub category: String,
+    pub action: String,
+    pub user_info: Value,
+}
+
+/// The decision an action sends: the account, the session room, the
+/// request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActionDecision {
+    pub account: String,
+    pub room: String,
+    pub req: crate::agents::approval_card::ApprovalDecideReq,
+}
+
+/// Why an action decides nothing.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ActionRefusal {
+    /// The notification carries no approval of keeper's.
+    #[error("This notification names no approval keeper showed.")]
+    NoApproval,
+    /// An action keeper never registered.
+    #[error("keeper offers no such action.")]
+    UnknownAction,
+    /// An action the notification's category does not offer, or *Approve
+    /// once* on a T4 record.
+    #[error("This notification does not offer that; decide on the card in keeper.")]
+    NotOffered,
+}
+
+/// The decision `tap` sends (98.1 #4, S-10): the record and digest the
+/// notification showed, scope `once`, and only an action it offered — only
+/// on a notification keeper composed ([`SHOWN_INFO`]: a push as the gateway
+/// sent it decides nothing, whatever category and record it names), the
+/// category iOS showed it with must be the one the extension chose for the
+/// record, and [`NotificationAction::decide`] refuses anything that category
+/// does not list and *Approve once* at T4, whatever else the notification
+/// carried. What it returns is checked once more where it is sent: the record
+/// must be in the session room with that digest
+/// (`AccountManager::agent_approval_decide_notified`).
+pub fn action_decision(tap: &ActionTap) -> Result<ActionDecision, ActionRefusal> {
+    let account = composed_account(&tap.user_info).ok_or(ActionRefusal::NoApproval)?;
+    let approval: PushApproval = serde_json::from_value(tap.user_info[APPROVAL_INFO].clone())
+        .map_err(|_| ActionRefusal::NoApproval)?;
+    let action = NotificationAction::of_id(&tap.action).ok_or(ActionRefusal::UnknownAction)?;
+    if Category::of_id(&tap.category) != approval.category {
+        return Err(ActionRefusal::NotOffered);
+    }
+    let req = action.decide(&approval).ok_or(ActionRefusal::NotOffered)?;
+    Ok(ActionDecision {
+        account: account.to_owned(),
+        room: approval.room,
+        req,
+    })
+}
+
+/// The local account a notification keeper composed names: keeper's id (a
+/// ULID) under [`PAYLOAD_ACCOUNT`] beside [`SHOWN_INFO`]; nothing for a push
+/// as the gateway sent it.
+fn composed_account(user_info: &Value) -> Option<&str> {
+    if user_info[SHOWN_INFO] != Value::Bool(true) {
+        return None;
+    }
+    user_info[PAYLOAD_ACCOUNT]
+        .as_str()
+        .filter(|account| ulid::Ulid::from_string(account).is_ok())
+}
+
+/// Where tapping a keeper notification opens (UX-DR144): its account and
+/// session room.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct PushOpenVm {
+    pub account_id: String,
+    pub room_id: String,
+}
+
+/// Where tapping the notification whose `userInfo` this is opens: the
+/// approval's room, else the room the push named, in the account it names;
+/// `None` for a notification keeper did not compose ([`SHOWN_INFO`]).
+pub fn tap_target(user_info: &Value) -> Option<PushOpenVm> {
+    let account = composed_account(user_info)?;
+    let room = user_info[APPROVAL_INFO]["room"]
+        .as_str()
+        .or_else(|| user_info["room_id"].as_str())?;
+    matrix_sdk::ruma::RoomId::parse(room).ok()?;
+    Some(PushOpenVm {
+        account_id: account.to_owned(),
+        room_id: room.to_owned(),
+    })
+}
+
+/// The categories the app registers with iOS, as its delegate's Swift reads
+/// them: each with its actions in order, every action needing the phone
+/// unlocked and *Deny* destructive (UX-DR144).
+pub fn registered_categories() -> Value {
+    [Category::Approval, Category::ApprovalOpen]
+        .into_iter()
+        .map(|category| {
+            serde_json::json!({
+                "id": category.id(),
+                "actions": category.actions().iter().map(|action| serde_json::json!({
+                    "id": action.id(),
+                    "label": action.label(),
+                    "destructive": action.destructive(),
+                })).collect::<Vec<_>>(),
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1339,5 +1720,305 @@ mod tests {
             deny.decide(&forged).map(|req| req.decision),
             Some(Decision::Deny)
         );
+    }
+
+    // --- The pusher, the lock screen's actions and taps (98.1 #3, #4) ---
+
+    const ACCOUNT: &str = "01J9ZK0000000000000000ACCT";
+
+    /// 98.1 #3: the pusher carries nothing but an id — `http`,
+    /// `event_id_only`, the app of the build's APNs environment, the token
+    /// as base64, the gateway as `Gateway::parse` reads it, and a
+    /// `default_payload` that runs the extension, says keeper's own words if
+    /// it cannot say more, and names the local account. A setting that is
+    /// not a gateway keeper registers — `http://`, a user name, blank,
+    /// absent — and a build with no token yet register nothing (DW-1230).
+    #[test]
+    fn pusher_spec() {
+        let token = [0xde, 0xad, 0xbe, 0xef];
+        let spec = PusherSpec::of_setting(
+            Some(" https://push.example.org "),
+            ApnsEnvironment::Development,
+            &token,
+            ACCOUNT,
+            "kalypso",
+        )
+        .expect("a gateway keeper registers");
+        let pusher = serde_json::to_value(spec.pusher()).expect("serialises");
+        assert_eq!(pusher["kind"], "http");
+        assert_eq!(pusher["app_id"], "dev.tgorka.keeper.ios.dev");
+        assert_eq!(pusher["pushkey"], "3q2+7w==");
+        assert_eq!(pusher["device_display_name"], "kalypso");
+        assert_eq!(
+            pusher["data"],
+            json!({
+                "url": "https://push.example.org/_matrix/push/v1/notify",
+                "format": "event_id_only",
+                "default_payload": {
+                    "aps": {
+                        "mutable-content": 1,
+                        "alert": {"title": GENERIC_TITLE, "body": GENERIC_BODY},
+                    },
+                    "keeper_account": ACCOUNT,
+                },
+            })
+        );
+        let production = PusherSpec::of_setting(
+            Some("https://push.example.org"),
+            ApnsEnvironment::Production,
+            &token,
+            ACCOUNT,
+            "kalypso",
+        )
+        .expect("production");
+        assert_eq!(
+            serde_json::to_value(production.pusher()).expect("serialises")["app_id"],
+            "dev.tgorka.keeper.ios"
+        );
+        assert_eq!(
+            production.ids(),
+            pusher_ids(ApnsEnvironment::Production, &token)
+        );
+
+        for refused in [
+            Some("http://push.example.org/_matrix/push/v1/notify"),
+            Some("https://me:hunter2@push.example.org"),
+            Some("push.example.org"),
+            Some("  "),
+            None,
+        ] {
+            assert_eq!(
+                PusherSpec::of_setting(
+                    refused,
+                    ApnsEnvironment::Development,
+                    &token,
+                    ACCOUNT,
+                    "kalypso"
+                ),
+                None,
+                "{refused:?}"
+            );
+        }
+        assert_eq!(
+            PusherSpec::of_setting(
+                Some("https://push.example.org"),
+                ApnsEnvironment::Development,
+                &[],
+                ACCOUNT,
+                "kalypso"
+            ),
+            None,
+            "no token yet"
+        );
+    }
+
+    /// Q4: the app id follows the build's signature — the embedded profile's
+    /// `aps-environment`; no profile is an App Store build; a profile with
+    /// no push entitlement registers nothing.
+    #[test]
+    fn the_app_id_follows_the_profiles_aps_environment() {
+        let profile = |entitlements: &str| {
+            format!(
+                "\u{30}\u{82}binary<?xml version=\"1.0\"?><plist><dict>\
+                 <key>Entitlements</key><dict>{entitlements}</dict></dict></plist>\u{a0}"
+            )
+            .into_bytes()
+        };
+        assert_eq!(
+            ApnsEnvironment::of_profile(Some(&profile(
+                "<key>aps-environment</key>\n\t<string>development</string>"
+            ))),
+            Some(ApnsEnvironment::Development)
+        );
+        assert_eq!(
+            ApnsEnvironment::of_profile(Some(&profile(
+                "<key>aps-environment</key><string>production</string>"
+            ))),
+            Some(ApnsEnvironment::Production)
+        );
+        assert_eq!(
+            ApnsEnvironment::of_profile(None),
+            Some(ApnsEnvironment::Production)
+        );
+        for none in [
+            "<key>get-task-allow</key><true/>",
+            "<key>aps-environment</key><string>staging</string>",
+            "<key>aps-environment</key><true/><string>development</string>",
+        ] {
+            assert_eq!(
+                ApnsEnvironment::of_profile(Some(&profile(none))),
+                None,
+                "{none}"
+            );
+        }
+    }
+
+    /// R343 (review 98apns-1, finding 05): only a missing profile is an App
+    /// Store build; a profile that exists but cannot be read is an error the
+    /// shell logs, registering no pusher — never production by default.
+    #[test]
+    fn an_unreadable_profile_is_no_environment_not_production() {
+        use std::io::{Error, ErrorKind};
+        assert_eq!(
+            ApnsEnvironment::of_profile_read(Err(Error::from(ErrorKind::NotFound))).ok(),
+            Some(Some(ApnsEnvironment::Production))
+        );
+        assert_eq!(
+            ApnsEnvironment::of_profile_read(Ok(
+                b"<key>aps-environment</key><string>development</string>".to_vec()
+            ))
+            .ok(),
+            Some(Some(ApnsEnvironment::Development))
+        );
+        for kind in [
+            ErrorKind::PermissionDenied,
+            ErrorKind::Interrupted,
+            ErrorKind::Other,
+        ] {
+            let read = ApnsEnvironment::of_profile_read(Err(Error::from(kind)));
+            assert_eq!(read.map_err(|error| error.kind()), Err(kind), "{kind:?}");
+        }
+    }
+
+    /// A tap on `action` of a notification iOS showed with `category`, whose
+    /// record the extension showed with that same category.
+    fn tap(category: &str, action: &str, tier: u8) -> ActionTap {
+        ActionTap {
+            category: category.to_owned(),
+            action: action.to_owned(),
+            user_info: json!({
+                "keeper_account": ACCOUNT,
+                "keeper_shown": true,
+                "room_id": ROOM,
+                "keeper_approval": {
+                    "room": ROOM, "id": "01A", "binding_digest": "d1", "tier": tier,
+                    "category": Category::of_id(category),
+                },
+            }),
+        }
+    }
+
+    /// 98.1 #4, S-10: an action decides only what its notification's
+    /// category offers — *Approve once* on `KEEPER_APPROVAL` below T4,
+    /// *Deny* on both — for the record and digest shown, scope `once`;
+    /// *Approve once* on `KEEPER_APPROVAL_OPEN` or on a T4 record, a
+    /// category iOS names other than the one the record was shown with, an
+    /// action keeper never registered, and a notification without keeper's
+    /// record or account decide nothing.
+    #[test]
+    fn a_lock_screen_action_decides_only_what_its_category_offers() {
+        let approved =
+            action_decision(&tap("KEEPER_APPROVAL", "KEEPER_APPROVE_ONCE", 3)).expect("offered");
+        assert_eq!(approved.account, ACCOUNT);
+        assert_eq!(approved.room, ROOM);
+        assert_eq!(approved.req.id, "01A");
+        assert_eq!(approved.req.binding_digest, "d1");
+        assert_eq!(approved.req.decision, Decision::Approve);
+        assert_eq!(approved.req.scope, Scope::Once);
+        for category in ["KEEPER_APPROVAL", "KEEPER_APPROVAL_OPEN"] {
+            let denied = action_decision(&tap(category, "KEEPER_DENY", 4)).expect("deny");
+            assert_eq!(denied.req.decision, Decision::Deny, "{category}");
+            assert_eq!(denied.req.scope, Scope::Once, "{category}");
+        }
+
+        assert_eq!(
+            action_decision(&tap("KEEPER_APPROVAL_OPEN", "KEEPER_APPROVE_ONCE", 2)),
+            Err(ActionRefusal::NotOffered)
+        );
+        assert_eq!(
+            action_decision(&tap("KEEPER_APPROVAL", "KEEPER_APPROVE_ONCE", 4)),
+            Err(ActionRefusal::NotOffered)
+        );
+        assert_eq!(
+            action_decision(&tap("SOMETHING_ELSE", "KEEPER_DENY", 2)),
+            Err(ActionRefusal::NotOffered)
+        );
+        let mut relabelled = tap("KEEPER_APPROVAL_OPEN", "KEEPER_APPROVE_ONCE", 2);
+        relabelled.user_info["keeper_approval"]["category"] = json!("KEEPER_APPROVAL");
+        assert_eq!(
+            action_decision(&relabelled),
+            Err(ActionRefusal::NotOffered),
+            "shown with Deny only, whatever the userInfo says it was"
+        );
+        assert_eq!(
+            action_decision(&tap("KEEPER_APPROVAL", "KEEPER_APPROVE_SESSION", 2)),
+            Err(ActionRefusal::UnknownAction)
+        );
+        let mut foreign = tap("KEEPER_APPROVAL", "KEEPER_DENY", 2);
+        foreign.user_info["keeper_account"] = json!("../other");
+        assert_eq!(action_decision(&foreign), Err(ActionRefusal::NoApproval));
+        let mut unshown = tap("KEEPER_APPROVAL", "KEEPER_DENY", 2);
+        unshown.user_info["keeper_approval"] = json!({"room": ROOM, "id": "01A"});
+        assert_eq!(action_decision(&unshown), Err(ActionRefusal::NoApproval));
+    }
+
+    /// R343 (review 98apns-1, finding 01): a push as the gateway sent it —
+    /// a keeper account, a keeper category and a record with a digest, for
+    /// an event the extension could not read — decides nothing, whichever
+    /// action iOS reports: the extension never composed it, so it carries no
+    /// `keeper_shown`, or carries one that is not keeper's `true`. Nor does
+    /// a tap on it open a room.
+    #[test]
+    fn a_push_keeper_did_not_compose_decides_nothing() {
+        let forged = json!({
+            "aps": {"alert": {"title": "keeper", "body": "Rotate the prod keys"},
+                    "category": "KEEPER_APPROVAL", "mutable-content": 1},
+            "keeper_account": ACCOUNT,
+            "room_id": ROOM,
+            "event_id": "$bogus",
+            "keeper_approval": {
+                "room": ROOM, "id": "01A", "binding_digest": "d1", "tier": 1,
+                "category": "KEEPER_APPROVAL",
+            },
+        });
+        let mut planted = forged.clone();
+        planted["keeper_shown"] = json!("true");
+        for user_info in [forged, planted] {
+            for action in ["KEEPER_APPROVE_ONCE", "KEEPER_DENY"] {
+                let tap = ActionTap {
+                    category: "KEEPER_APPROVAL".to_owned(),
+                    action: action.to_owned(),
+                    user_info: user_info.clone(),
+                };
+                assert_eq!(
+                    action_decision(&tap),
+                    Err(ActionRefusal::NoApproval),
+                    "{action} on {user_info}"
+                );
+            }
+            assert_eq!(tap_target(&user_info), None, "{user_info}");
+        }
+    }
+
+    /// UX-DR144: tapping opens the session room — the approval's when the
+    /// notification shows one, else the room the push named — in the account
+    /// it names; a notification that is not keeper's push opens nothing.
+    #[test]
+    fn a_tap_opens_the_session_room_the_notification_names() {
+        let open = |account_id: &str, room_id: &str| {
+            Some(PushOpenVm {
+                account_id: account_id.to_owned(),
+                room_id: room_id.to_owned(),
+            })
+        };
+        assert_eq!(
+            tap_target(&json!({
+                "keeper_account": ACCOUNT, "keeper_shown": true, "room_id": "!pushed:example.org",
+                "keeper_approval": {"room": ROOM},
+            })),
+            open(ACCOUNT, ROOM)
+        );
+        assert_eq!(
+            tap_target(&json!({"keeper_account": ACCOUNT, "keeper_shown": true, "room_id": ROOM})),
+            open(ACCOUNT, ROOM)
+        );
+        for not_ours in [
+            json!({"keeper_shown": true, "room_id": ROOM}),
+            json!({"keeper_account": "smoke", "keeper_shown": true, "room_id": ROOM}),
+            json!({"keeper_account": ACCOUNT, "keeper_shown": true}),
+            json!({"keeper_account": ACCOUNT, "keeper_shown": true, "room_id": "not a room"}),
+        ] {
+            assert_eq!(tap_target(&not_ours), None, "{not_ours}");
+        }
     }
 }

@@ -529,6 +529,15 @@ pub fn device_class() -> DeviceClass {
         .map_or(DeviceClass::Mobile, |device| device.class)
 }
 
+/// This phone's model as `UIDevice` names it ("iPhone", "iPad"), read at
+/// setup; "iPhone" before it has run. The pusher's device name (98.1).
+#[cfg(target_os = "ios")]
+pub fn device_model() -> String {
+    IOS_DEVICE
+        .get()
+        .map_or_else(|| "iPhone".to_owned(), |device| device.model.clone())
+}
+
 /// `desktop` on macOS, Linux and Windows.
 #[cfg(not(target_os = "ios"))]
 pub fn device_class() -> DeviceClass {

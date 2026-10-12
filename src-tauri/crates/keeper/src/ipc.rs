@@ -4743,11 +4743,32 @@ pub fn push_gateway_set(
     let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
     keeper_core::registry::set_push_gateway_url(&data_dir, gateway.as_ref())
         .map_err(to_ipc_error)?;
+    // The pusher follows the setting at once: set where there is a gateway,
+    // removed where there is none (98.1 #3).
+    #[cfg(target_os = "ios")]
+    crate::push_ios::register_soon();
     Ok(keeper_core::agents::push::PushGatewayVm::of(
         gateway
             .as_ref()
             .map(keeper_core::agents::push::Gateway::as_str),
     ))
+}
+
+/// The session room a tapped keeper notification opens, once (98.1,
+/// UX-DR144): the webview asks on mount — for a tap that launched keeper —
+/// and on `push://open`. Every target, so the command list is identical
+/// everywhere; only the iPhone has push (`push_ios`).
+#[cfg(target_os = "ios")]
+#[tauri::command]
+pub fn push_open_take() -> Result<Option<keeper_core::agents::push::PushOpenVm>, IpcError> {
+    Ok(crate::push_ios::take_open())
+}
+
+/// No push here, so nothing is ever waiting to be opened.
+#[cfg(not(target_os = "ios"))]
+#[tauri::command]
+pub fn push_open_take() -> Result<Option<keeper_core::agents::push::PushOpenVm>, IpcError> {
+    Ok(None)
 }
 
 /// Read the global Do-Not-Disturb switch (Story 10.2). Returns the in-memory
@@ -12670,6 +12691,15 @@ pub async fn egress_list(
     destinations.extend(keeper_core::egress::agent_egress(
         &keeper_core::agents::mac_tables::read(&data_dir).mcp,
     ));
+    // The push gateway the person named (98.1 #8, R330): only a phone
+    // registers a pusher, and only while the setting holds an address keeper
+    // registers; keeper never contacts it, its homeserver does.
+    #[cfg(not(desktop))]
+    destinations.extend(keeper_core::egress::push_egress(
+        keeper_core::registry::get_push_gateway_url(&data_dir)
+            .map_err(to_ipc_error)?
+            .as_deref(),
+    ));
     Ok(destinations)
 }
 
@@ -12774,12 +12804,18 @@ pub async fn inbox_unsubscribe(
 /// tears down the account's live supervision tasks then deletes exactly its SDK
 /// store dir, Keychain session entry, and registry row — no server-side logout,
 /// works offline, and is idempotent whether or not the account was ever
-/// activated. Failures funnel through [`to_ipc_error`].
+/// activated. On iOS it first asks the homeserver, best effort, to drop this
+/// phone's pusher (`push_ios::pusher_ids`, R340). Failures funnel through
+/// [`to_ipc_error`].
 #[tauri::command]
 pub async fn sign_out(state: State<'_, AppState>, account_id: String) -> Result<(), IpcError> {
+    #[cfg(target_os = "ios")]
+    let pusher = crate::push_ios::pusher_ids();
+    #[cfg(not(target_os = "ios"))]
+    let pusher = None;
     state
         .accounts
-        .sign_out(&state.platform, &account_id)
+        .sign_out(&state.platform, &account_id, pusher)
         .await
         .map_err(to_ipc_error)?;
     // The account leaves the person's `matrix.toml` for this device.
