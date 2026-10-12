@@ -10351,3 +10351,52 @@ origin: review-98androidvoice-1 (DW candidate; R364)
 location: `voice_android::set_up`, `voice_ipc::boot` (`set_locale` → `refresh`)
 reason: `set_up` reads the facts and `boot`'s `set_locale` reads them again a moment later, each making a checker recogniser; harmless — the second read re-arms through `should_rearm`, which is idempotent — but one read would do.
 status: open
+
+### DW-1330: A gate room invites its approvers once, when it is made.
+
+origin: epic 99, story 99.1 (rung `agents-99-room`, 2026-10-12; R366; codemap Q2)
+location: `keeper_core::agents::gate::{approvers, room_invitees}`, `keeper_agent::seed::gate_room`
+reason: the approvers — the home drive's pinned readers with a pinned `[[trust]]` key — are invited as the room is created; a person pinned later is never invited to an existing gate room, and one whose pin is removed stays a member. Rung `agents-99-tickets` invites approvers into each child room it delegates into, and its card goes to the gate room: reconciling the gate room's observers with the pins (an invite for a new approver, nothing removed without a person) belongs with that card.
+status: open
+
+### DW-1331: A gate session made for one peer cannot be remade for another.
+
+origin: epic 99, story 99.1 (rung `agents-99-room`, 2026-10-12; R366)
+location: `keeper_core::agents::gate::gate_session_id`, `keeper-agentd agents gate`
+reason: the session's id is derived from (drive, agent, system), and its `[gate]` copies `peer`, `delegates` and `encrypted` once, never rewritten; after an owner edits one of them `agents gate` finds the existing session and makes nothing, so the change reaches no room until the session is archived (or the system renamed). `agents gate` could say which copied keys differ from the home's table, and an archive-and-remake path could be offered; neither is built.
+status: open
+
+### DW-1332: A gate's peer is checked against the agents of its own drive only.
+
+origin: review-99room-1 (DW candidate; R365 as amended, R367)
+location: `keeper_core::agents::home::gate_zone_refusals`, `keeper_agent::zone::read_zone`, `keeper-agentd agents gate`
+reason: the zone check reads one zone, so a `peer` that is the Matrix user of an agent homed in another drive the same host mounts is not refused; Q2 said "not any known agent's user". `agents gate` sees every hosted drive (`inspection.drives`) and could check the peer against each home's `matrix_user` there.
+status: open
+
+### DW-1333: In a gate room the peer may post decisions, `heard` and surface results at power 0.
+
+origin: review-99room-1 (DW candidate; R367)
+location: `keeper_core::agents::events::power_levels(Gate, …)`, `keeper_core::agents::gate::room_levels`, `keeper_agent::runtime::classify`
+reason: every session room opens `dev.keeper.agent.approval.decision`, `dev.keeper.agent.heard` and `dev.keeper.agent.surface.result` at 0, so the peer can send them. Harmless at this rung (no surface tool is offered there, `classify` ignores `heard` outside proxy rooms, no approval record exists), but `classify` today reads a sealed decision from any reader of the label, and the peer is one. Rung `agents-99-sync`'s gate arm must answer a peer's decision `Ignored(UNTRUSTED_DECISION)` (codemap §1.1); `room_levels` could close `heard` and `surface.result` for gate rooms.
+status: open
+
+### DW-1334: A clear gate room still accepts `m.room.encrypted` from the peer.
+
+origin: review-99room-1 (DW candidate; R367)
+location: `keeper_core::agents::gate::room_levels(_, false)`
+reason: `m.room.encrypted` stays at 0 in a clear room, so the peer can post ciphertext the gate's copy has no key for: undecryptable noise. Closing it (`m.room.encrypted` at 50 in `room_levels(_, false)`) would change a clear room's levels, which adoption compares row for row, so it needs a word on rooms already made.
+status: open
+
+### DW-1335: A gate room's status anchor names the host and the session's folder to the outside system.
+
+origin: review-99room-1 (DW candidate; R367)
+location: `keeper_agent::seed::ensure_anchor` (`StatusContent { session: "<subfolder>/<path>", host }`)
+reason: the anchor posted into every gate room, clear or not, carries the host's name and the session's path in the drive; not what the session read, so not the failure shape, but the first thing a gate tells a system about the host. Rung `agents-99-sync`'s "a status in a gate room never names a path" decides whether these two fields are in scope.
+status: open
+
+### DW-1336: A `[[trust]]` that names a gate's peer after its room was made is not noticed.
+
+origin: review-99room-1 (DW candidate; R367; beside DW-1330)
+location: `keeper_core::agents::gate::room_invitees`, `keeper-agentd run`
+reason: the peer-is-no-`[[trust]]`-person rule is checked by `agents gate` when the room is made; an operator who later pins the peer as a person or a proxy is not told by a running host, and the peer's decisions would then come from a pinned key. `agentd.toml` is the operator's; `run` or `status` could refuse or flag such a gate.
+status: open

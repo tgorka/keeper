@@ -263,6 +263,19 @@ pub struct OpenBody {
     pub model: String,
     pub prompt_sha256: String,
     pub memory_sha256: String,
+    /// Whether the session's room is end-to-end encrypted: written only
+    /// when it is not — a gate's clear room (codemap Q9) — so every other
+    /// `open` line reads as before.
+    #[serde(default = "encrypted_by_default", skip_serializing_if = "is_encrypted")]
+    pub encrypted: bool,
+}
+
+fn encrypted_by_default() -> bool {
+    true
+}
+
+fn is_encrypted(encrypted: &bool) -> bool {
+    *encrypted
 }
 
 /// A claim transition.
@@ -1149,6 +1162,7 @@ mod tests {
                 model: "bot:openai:http://127.0.0.1:8317#gpt".into(),
                 prompt_sha256: "a".repeat(64),
                 memory_sha256: "b".repeat(64),
+                encrypted: true,
             }),
             LineBody::Claim(ClaimBody {
                 epoch: 2,
@@ -1359,6 +1373,23 @@ mod tests {
             assert!(json.contains("\"ts\":\"2026-10-02T08:15:03.120Z\""));
             assert_eq!(LogLine::parse(&json).expect("parse"), line, "{json}");
         }
+    }
+
+    /// Codemap Q9: an `open` line says `"encrypted":false` for a clear gate
+    /// room and nothing otherwise; a line without the key reads encrypted.
+    #[test]
+    fn an_open_line_names_a_clear_room_only() {
+        let json = line(one_of_each().remove(0)).to_json().expect("json");
+        assert!(!json.contains("encrypted"), "{json}");
+        let LineBody::Open(mut body) = LogLine::parse(&json).expect("parse").body else {
+            panic!("the first line is the open line");
+        };
+        assert!(body.encrypted, "a line without the key reads encrypted");
+        body.encrypted = false;
+        let clear = line(LineBody::Open(body));
+        let json = clear.to_json().expect("json");
+        assert!(json.contains("\"encrypted\":false"), "{json}");
+        assert_eq!(LogLine::parse(&json).expect("parse"), clear);
     }
 
     #[test]

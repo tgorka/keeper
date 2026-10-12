@@ -222,6 +222,7 @@ fn agent_session(zone: &Path, opening: &[&str]) {
         checkpoints: None,
         outputs: Vec::new(),
         created_at: chrono::Utc::now(),
+        gate: None,
     });
     std::fs::write(zone.join(SESSION).join("agent.toml"), toml).expect("agent.toml");
 }

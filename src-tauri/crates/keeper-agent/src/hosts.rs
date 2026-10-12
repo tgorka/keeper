@@ -3723,6 +3723,7 @@ mod tests {
                 checkpoints: None,
                 outputs: Vec::new(),
                 created_at: chrono::Utc::now(),
+                gate: None,
             };
             let dir = self.dir(room);
             std::fs::create_dir_all(&dir).expect("dir");
@@ -4274,6 +4275,7 @@ mod tests {
             checkpoints: None,
             outputs: Vec::new(),
             created_at: chrono::Utc::now(),
+            gate: None,
         })
     }
 
@@ -5179,6 +5181,7 @@ mod tests {
                 checkpoints: None,
                 outputs: Vec::new(),
                 created_at: chrono::Utc::now(),
+                gate: None,
             };
             let dir = zone.join(SCHEDULED);
             let session = FoundSession {

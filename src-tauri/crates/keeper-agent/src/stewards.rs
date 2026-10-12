@@ -155,6 +155,7 @@ pub fn session(
         checkpoints: None,
         outputs: Vec::new(),
         created_at: now.with_timezone(&chrono::Utc),
+        gate: None,
     }
 }
 

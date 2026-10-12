@@ -315,7 +315,7 @@ workflow    = "triage"
 | `[tools].drives` | the home drive | drive ids in scope; the home drive is always first |
 | `[tools].mcp` | none | MCP server names |
 | `[tools].skills` | `["*"]` | skill folders under `_skills/` to offer; `"*"` offers every valid one |
-| `[[gate]]` | none | not read yet: a gate's configuration arrives with the gates for outside systems, and until then a file holding it is refused as an unknown key |
+| `[[gate]]` | none | a `gate`'s only, refused on every other kind: one table per outside system, its keys in § *Gates* |
 | `[[menu]]` | none | `code` (2 to 4 capital letters, unique), `description` (at most 120 characters), and exactly one of `workflow` (a folder under `_workflows/`) or `prompt` (at most 2 KiB) |
 | `[host].needs` | derived | `sandbox`, `mcp:<name>`, `screen:mac`, `kvm:<id>` or `voice`; without the key, `sandbox` when `run` is allowed and `mcp:<server>` for each server |
 | `[host].pin` | `""` | a host slug |
@@ -339,7 +339,10 @@ The tool vocabulary is closed: `drive_list`, `drive_read`, `drive_glob`, `drive_
 is accepted, and the host lists it as not offered.
 
 `kind` chooses the default tools and whether `human` is required. It grants nothing: an `allow`
-list is taken as written, whatever the kind.
+list is taken as written, whatever the kind — except a gate's, whose set is also its ceiling: a
+`kind = "gate"` home whose `allow` names anything but `reply`, `delegate` and `journal_append` is
+refused, naming the tool ("agent.toml's tools.allow is refused: \"drive_read\" is not a gate's
+…"). Its MCP servers are named by `[tools].mcp`, as for every kind (§ *Gates*).
 
 | kind | tools without `[tools].allow` |
 | --- | --- |
@@ -2682,7 +2685,7 @@ keys, so nothing sent before its first `run` can be decrypted by it: run the hos
 
 ## keeper-agentd
 
-`keeper-agentd` is the Linux host. One binary, seven verbs:
+`keeper-agentd` is the Linux host. One binary, eight verbs:
 
 | verb | what it does |
 | --- | --- |
@@ -2691,6 +2694,7 @@ keys, so nothing sent before its first `run` can be decrypted by it: run the hos
 | `keeper-agentd agents list` | every zone and home with its verdict, each refused skill, and whether each served agent's copy is signed in |
 | `keeper-agentd agents init <drive> --owner <@user> --reader <@user>… --bot <bot> [--local-only] [--with <ids>] [--principal <p>] [--into <dir>]` | seeds the drive's agents zone, never over a file, refusing an owner, readers or `local_only` that differ from the pin, and a bot that is not local on a `local_only` drive; against agentd's own checkout — refused while `run` serves the principal — makes the seeded proxy's DM and `main` session once its copy is signed in, adopting the DM when the copy is already in it (§ *Setting up the agents zone*) |
 | `keeper-agentd agents new <id> [--name <name>] [--from-bmad <dir>] [--drive <drive>] [--into <dir>]` | copies the zone's `_template/` to a new agent's folder, refusing one that is there and a link in the template; `--from-bmad` writes the BMAD agent's soul and lists what it did not import |
+| `keeper-agentd agents gate <agent> <system>` | makes the room and the gate session of one `[[gate]]` of a gate agent (`<drive>/<id>`, or an id one mounted drive alone has), once: run again it finds the session and says nothing was made, and a session folder lost before `run` pushed it is made again naming the room the copy is already in, when that room is the gate's own. Refused (exit 2) while `run` serves the principal, on a host whose `agentd.toml` says `always_on = false`, for a peer `[[trust]]` names, a drive with no reader whose key is pinned, an approver outside a listed audience, a room found as the gate's that the gate did not make or whose levels or encryption are not the gate's, and before the gate's copy is signed in (§ *Gates*) |
 | `keeper-agentd run` | serves the agents until `SIGTERM`, holding `agentd.lock` in its data folder so no second `run` or `agents init` opens the copies beside it |
 | `keeper-agentd status [--session <drive>/<session> [--no-probe]]` | the host, each drive's engine state and mount verdict, each copy, the sessions served (and a session not served because another names its room), the tools each agent is and is not offered here, and each `[[trust]]` person's pin against the master key their homeserver publishes (`matches`, `differs`, `not pinned`, `not published`; read by the running host, "not running" without one); with `--session`, what that session's agent is told and whether its digest is the last `open` line's. Composing it asks an `ollama` provider which tools its model supports, as a turn does; `--no-probe` asks nothing and composes as if that were unknown |
 
@@ -3281,6 +3285,109 @@ over. A reply without a label is not taken. A reply sent while the delegating ho
 read back as far as that host's newest brief in the room, however many pages. A `peer` line,
 like a `user` line, is a question a restart closes rather than reruns; a `delegate replied` line
 whose `peer` line a crash lost gets it back from the receipt first.
+
+
+## Gates
+
+A gate is the door for one outside system — a CI, a forge, a ticket queue, another company's
+bot — that talks to your agents through Matrix. It is an agent of `kind = "gate"` with one
+`[[gate]]` table per system, and each table is one room and one session of kind `gate`: the
+outside system's account (its *peer*) writes in that room, and nothing it writes ever reaches a
+person's DM or another agent except through the gate.
+
+```toml
+version     = 1
+id          = "forge"
+name        = "Forge"
+kind        = "gate"
+matrix_user = "@forge:example.org"
+
+[[gate]]
+system    = "github"
+peer      = "@github-bot:example.org"
+audience  = ["@github-bot:example.org", "@tgorka:example.org"]
+delegates = ["tola-grey"]
+modes     = ["sync", "async"]
+
+[model]
+bot = "bot:ollama:http://localhost:11434#qwen3"
+```
+
+| key | default | rule |
+| --- | --- | --- |
+| `system` | required | 1 to 32 lowercase letters, digits or dashes; unique in the agent. It names the room and the session. |
+| `peer` | required | the outside system's own Matrix user id: never the gate's own user, a reader of the home drive, another agent of the zone, or anyone `agentd.toml`'s `[[trust]]` names (a person's own account would make their decisions count in the room where their text is outside content) |
+| `audience` | required | who reads what is posted in the room: `["*"]` (anyone the system shares with — its server's operator included), or Matrix user ids that list the `peer` and every person who decides the gate's tickets (below) |
+| `delegates` | `[]` | agent ids of the home drive the gate may hand work to — never the gate itself or another gate. They are the only agents a request can ever reach. |
+| `modes` | required | `["sync"]`, `["async"]` or both |
+| `deadline_ms_max` | `30000` | 1000 to 120000: the longest a synchronous request may ask the gate to wait |
+| `max_tickets_per_hour` | `10` | 1 to 1000: tickets the system may raise in an hour |
+| `max_requests_per_hour` | `120` | 1 to 3600: requests the system may make in an hour, answered or not |
+| `encrypted` | `true` | `false` makes the room without end-to-end encryption, for a system that cannot decrypt; only with `audience = ["*"]`, since the server's operator reads a clear room |
+
+A bound is refused one past its edge, naming the key (`gate[2].deadline_ms_max`). A `delegates`
+entry that is not an agent of the drive, and a `peer` that is one, are refused when the zone is
+read: the gate is then listed refused by `keeper-agentd agents list`, naming its first fault. That
+check reads one drive: a peer that is an agent of another drive the host mounts is not refused
+(DW-1332).
+
+**Writing `audience` releases the gate's `SOUL.md` to it**, and everything the gate posts in its
+room. A gate reads no drive itself (its tools are at most `reply`, `delegate` and
+`journal_append`, and the MCP servers `[tools].mcp` names); drive content reaches it only in a
+reply from an agent it delegated to, and is then held by the room's audience like any send.
+
+### Making a gate's room
+
+On the always-on Linux host that serves the gate, with `keeper-agentd run` stopped:
+
+```sh
+keeper-agentd login tgdrive/forge
+keeper-agentd agents gate forge github
+```
+
+The room is a session room (`dev.keeper.agent.session`), encrypted unless the table says
+`encrypted = false`, named "Forge · github". It invites the peer and, as observers, the home
+drive's pinned readers whose master key `[[trust]]` pins — the people who decide the gate's
+tickets; each of them must be in a listed `audience`, or the command is refused naming them, and
+a drive none of whose readers has a pinned key is refused naming the drive: nobody would decide the
+gate's tickets or see its room. In
+the room the gate holds 100 and everyone else 0: the peer posts (encrypted, or as `m.room.message`
+in a clear room) and can write no state — no claim, no power levels — and cannot invite, kick, ban
+or redact. The gate session's id is derived from the drive, the agent and the system, so running
+the command again makes nothing; its `agent.toml` says `kind = "gate"`, is asked for by the
+drive's pinned owner (who heads its chain), carries the label `audience` at `untrusted` for its
+whole life — a gate session's file saying any other integrity does not read — and copies the table
+into `[gate]`: the system, the peer, each delegate as
+`<drive>/<id>`, and `encrypted = false` for a clear room. A session file is never rewritten, so
+a later edit of `peer`, `delegates` or `encrypted` reaches only a new gate session.
+
+When the session folder is gone (lost before `run` pushed it, or a run stopped between the room and
+the folder), the command looks for the room among those the gate's copy is in: one whose newest
+status from the gate says it serves this system — the peer in it or not, so a peer that declined
+or left does not get a second room — or, with no status yet, one named as the gate room with the
+peer in it. Such a room is adopted only when the gate's copy alone made it, its power levels are
+the ones a gate room is made with, and it is encrypted as the table says; otherwise the command is
+refused (exit 2) naming the room, and nothing is made: have the gate's account leave a room it did
+not make, restore the levels, or write `encrypted` back.
+
+### Connecting a system
+
+keeper ships no bridge and opens no port: Matrix is the only way in, and keeper-agentd still
+listens on nothing. A system with its own Matrix client logs in as the peer and writes in the
+room. A system that only sends webhooks needs a bridge the operator runs on the homeserver, whose
+puppet is the peer — whether tuwunel hosts appservices, whether matrix-hookshot's webhooks can
+post into an encrypted room, which `msgtype` they send, and whether anything carries the gate's
+answers back out are all `[UNVERIFIED]`; such a system is asynchronous at best, and its room
+would have to be clear.
+
+**What a gate does with a request** — answering by a deadline, a ticket, handing the work to a
+delegate once a person approves it, and calling back in the room — comes with the rest of the
+gates for outside systems. Until then a gate session's room is served like any other session
+room nobody talks in: what the peer writes is not a turn, and nothing is answered. Some of what
+the room lets the peer do today is closed by then or recorded: an approval decision, a `heard` or
+a surface result at power 0 (DW-1333), an `m.room.encrypted` event in a clear room (DW-1334), the
+status that names the host and the session's folder (DW-1335), and a `[[trust]]` that names the
+peer only after the room was made (DW-1336).
 
 ## Workflows
 

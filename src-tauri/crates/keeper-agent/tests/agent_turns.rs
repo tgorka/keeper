@@ -622,7 +622,15 @@ fn session_of(
         reply: None,
         room: room.try_into().expect("room"),
         drives: vec!["tgdrive".to_owned(), "private".to_owned()],
-        label: Label::opening(home, Integrity::Owner),
+        // A gate session is untrusted for life; any other opens as the owner's.
+        label: Label::opening(
+            home,
+            if kind == SessionKind::Gate {
+                Integrity::Untrusted
+            } else {
+                Integrity::Owner
+            },
+        ),
         needs: None,
         pin: None,
         hop: 0,
@@ -632,6 +640,13 @@ fn session_of(
         checkpoints: None,
         outputs: Vec::new(),
         created_at: chrono::Utc::now(),
+        // A gate session names the `[[gate]]` it serves (R366).
+        gate: (kind == SessionKind::Gate).then(|| keeper_core::agents::session::GateSession {
+            system: "chat".to_owned(),
+            peer: user("@system:example.org"),
+            delegates: Vec::new(),
+            encrypted: true,
+        }),
     };
     write(
         drive,

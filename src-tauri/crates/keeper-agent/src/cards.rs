@@ -1852,6 +1852,7 @@ mod tests {
             checkpoints: None,
             outputs: Vec::new(),
             created_at: chrono::Utc::now(),
+            gate: None,
         }
     }
 

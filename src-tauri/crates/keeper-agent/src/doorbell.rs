@@ -1004,6 +1004,7 @@ mod tests {
             checkpoints: None,
             outputs: Vec::new(),
             created_at: chrono::Utc::now(),
+            gate: None,
         });
         std::fs::create_dir_all(outside.path().join("elsewhere")).expect("dir");
         std::fs::write(outside.path().join(SESSION_FILE), &toml).expect("write");

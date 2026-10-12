@@ -800,6 +800,7 @@ pub fn follow_session(
         checkpoints: None,
         outputs: Vec::new(),
         created_at: now,
+        gate: None,
     }
 }
 
@@ -1570,6 +1571,7 @@ mod tests {
             checkpoints: None,
             outputs: Vec::new(),
             created_at: chrono::Utc::now(),
+            gate: None,
         };
         let label = Label {
             integrity: Integrity::Untrusted,
@@ -1650,6 +1652,7 @@ mod tests {
             checkpoints: None,
             outputs: Vec::new(),
             created_at: chrono::Utc::now(),
+            gate: None,
         };
         let one = broker(&json!({"server": "paseo", "url": "https://a.example.org/mcp"}));
         for length in [114, 115, 128] {

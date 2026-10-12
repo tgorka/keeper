@@ -448,7 +448,7 @@ pub(crate) use dm::Settled;
 #[cfg(unix)]
 pub(crate) use dm::{discard, make_folder};
 #[cfg(unix)]
-pub use dm::{main_dm, main_session, Made, MainDm};
+pub use dm::{gate_room, main_dm, main_session, GateRoom, GateRoomError, Made, MainDm};
 
 #[cfg(unix)]
 mod dm {
@@ -459,7 +459,8 @@ mod dm {
     use keeper_core::agents::events::{
         RunState, StatusContent, CONTENT_VERSION, SESSION_ROOM_TYPE, STATUS,
     };
-    use keeper_core::agents::home::AgentConfig;
+    use keeper_core::agents::gate::{self, gate_session, gate_session_id};
+    use keeper_core::agents::home::{AgentConfig, GateConfig};
     use keeper_core::agents::label::{Integrity, Label, Readers};
     use keeper_core::agents::matrix::{AgentClient, RoomKind};
     use keeper_core::agents::seed::main_session_id;
@@ -530,6 +531,7 @@ mod dm {
             checkpoints: None,
             outputs: Vec::new(),
             created_at: now.with_timezone(&chrono::Utc),
+            gate: None,
         }
     }
 
@@ -569,12 +571,19 @@ mod dm {
             .ok_or_else(|| "the copy is not signed in".to_owned())?
             .to_owned();
         let id = main_session_id(&proxy.drive, &proxy.id);
+        let anchor = Anchor {
+            agent: &proxy.matrix_user,
+            kind: SessionKind::Main,
+            title: MAIN_TITLE,
+            sessions_subfolder,
+            host,
+        };
         client
             .sync_once()
             .await
             .map_err(|error| error.to_string())?;
         if let Some((path, room)) = existing(sessions, &id.to_string())? {
-            ensure_anchor(client, &me, proxy, &room, sessions_subfolder, &path, host).await?;
+            ensure_anchor(client, &me, &anchor, &room, &path).await?;
             return Ok(MainDm {
                 room,
                 path,
@@ -623,7 +632,7 @@ mod dm {
             (_, false) => Made::Nothing,
         };
         let Settled { room, path, .. } = settled;
-        ensure_anchor(client, &me, proxy, &room, sessions_subfolder, &path, host).await?;
+        ensure_anchor(client, &me, &anchor, &room, &path).await?;
         Ok(MainDm { room, path, made })
     }
 
@@ -732,7 +741,9 @@ mod dm {
                     .direct_targets()
                     .iter()
                     .any(|target| target.as_user_id() == Some(human));
-            let kind = status_kind(&room, me).await;
+            let kind = newest_status(&room, me)
+                .await
+                .and_then(|status| status["kind"].as_str().map(str::to_owned));
             if is_main_dm(
                 room_type.as_deref(),
                 &members,
@@ -748,8 +759,8 @@ mod dm {
         found.into_iter().next()
     }
 
-    /// The `kind` of the newest status `me` sent in `room`.
-    async fn status_kind(room: &Room, me: &UserId) -> Option<String> {
+    /// The content of the newest status `me` sent in `room`.
+    async fn newest_status(room: &Room, me: &UserId) -> Option<Value> {
         let mut from: Option<String> = None;
         for _ in 0..BACKLOG_PAGES {
             let mut options = MessagesOptions::backward().from(from.as_deref());
@@ -758,8 +769,7 @@ mod dm {
             let newest = page.chunk.iter().find_map(|event| {
                 let value: Value = event.raw().deserialize_as().ok()?;
                 (value["type"] == STATUS && value["sender"] == me.as_str())
-                    .then(|| value["content"]["kind"].as_str().map(str::to_owned))
-                    .flatten()
+                    .then(|| value["content"].clone())
             });
             if newest.is_some() {
                 return newest;
@@ -819,15 +829,22 @@ mod dm {
         Ok(Some((row.path, agent.room)))
     }
 
+    /// What a session room's status anchor says.
+    struct Anchor<'a> {
+        agent: &'a UserId,
+        kind: SessionKind,
+        title: &'a str,
+        sessions_subfolder: &'a str,
+        host: &'a str,
+    }
+
     /// The status anchor in `room`, sent only when the room has none.
     async fn ensure_anchor(
         client: &AgentClient,
         me: &UserId,
-        proxy: &AgentConfig,
+        anchor: &Anchor<'_>,
         room: &OwnedRoomId,
-        sessions_subfolder: &str,
         path: &str,
-        host: &str,
     ) -> Result<(), String> {
         if let Some(joined) = client.client().get_room(room) {
             if crate::runtime::latest_status(&joined, me).await.is_some() {
@@ -836,11 +853,11 @@ mod dm {
         }
         let status = StatusContent {
             v: CONTENT_VERSION,
-            session: format!("{sessions_subfolder}/{path}"),
-            kind: SessionKind::Main,
-            title: MAIN_TITLE.to_owned(),
-            agent: proxy.matrix_user.clone(),
-            host: host.to_owned(),
+            session: format!("{}/{path}", anchor.sessions_subfolder),
+            kind: anchor.kind,
+            title: anchor.title.to_owned(),
+            agent: anchor.agent.to_owned(),
+            host: anchor.host.to_owned(),
             epoch: 0,
             run: RunState::Idle,
             detail: None,
@@ -854,10 +871,221 @@ mod dm {
             .map(|_| ())
             .map_err(|error| error.to_string())
     }
+
+    /// A gate's room and its gate session (99.1 #5).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct GateRoom {
+        pub room: OwnedRoomId,
+        /// Zone-relative: `active/<folder>`.
+        pub path: String,
+        pub made: Made,
+    }
+
+    /// Why [`gate_room`] made nothing.
+    #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+    pub enum GateRoomError {
+        /// A room found as the gate's is not adopted
+        /// ([`gate::AdoptRefusal`]): a person acts before a run can.
+        #[error("{0}")]
+        Refused(String),
+        /// The homeserver or the drive failed.
+        #[error("{0}")]
+        Failed(String),
+    }
+
+    impl From<String> for GateRoomError {
+        fn from(sentence: String) -> Self {
+            Self::Failed(sentence)
+        }
+    }
+
+    /// Make the room and the gate session of `gate`, a `[[gate]]` of
+    /// `agent`, once (AD-372, AD-415) — [`main_dm`]'s discipline under the
+    /// id [`gate_session_id`] derives: the folder is looked for first; with
+    /// none, a gate room the copy is already in that serves this system is
+    /// adopted when [`gate::adoption`] allows it and refused when it does
+    /// not (see [`find_gate_room`]); else a room is made, typed
+    /// `dev.keeper.agent.session`, encrypted unless the gate says otherwise,
+    /// inviting `invite` (the peer, then the approvers:
+    /// [`gate::room_invitees`]) at [`gate::room_levels`]. A folder that wins
+    /// the race, or one that cannot be written, leaves the room just made,
+    /// its invites revoked. The anchor says `kind: "gate"` and the system.
+    /// `owner` is the home drive's pinned owner, who asked for the session.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn gate_room(
+        client: &AgentClient,
+        agent: &AgentConfig,
+        gate: &GateConfig,
+        owner: &UserId,
+        invite: Vec<OwnedUserId>,
+        sessions: &Path,
+        sessions_subfolder: &str,
+        host: &str,
+        now: chrono::DateTime<chrono::Local>,
+    ) -> Result<GateRoom, GateRoomError> {
+        let me = client
+            .user_id()
+            .ok_or_else(|| "the copy is not signed in".to_owned())?
+            .to_owned();
+        let anchor = Anchor {
+            agent: &agent.matrix_user,
+            kind: SessionKind::Gate,
+            title: &gate.system,
+            sessions_subfolder,
+            host,
+        };
+        let id = gate_session_id(&agent.drive, &agent.id, &gate.system);
+        client
+            .sync_once()
+            .await
+            .map_err(|error| error.to_string())?;
+        if let Some((path, room)) = existing(sessions, &id.to_string())? {
+            ensure_anchor(client, &me, &anchor, &room, &path).await?;
+            return Ok(GateRoom {
+                room,
+                path,
+                made: Made::Nothing,
+            });
+        }
+
+        let name = gate::room_name(&agent.name, &gate.system);
+        let (room, made_room) = match find_gate_room(client, &me, gate, &name).await? {
+            Some(room) => (room, false),
+            None => (
+                client
+                    .create_room(
+                        RoomKind::Gate {
+                            encrypted: gate.encrypted,
+                        },
+                        &name,
+                        invite.clone(),
+                        &[],
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?,
+                true,
+            ),
+        };
+        let session = gate_session(agent, gate, &room, owner, now.with_timezone(&chrono::Utc));
+        let folder = sessions.to_owned();
+        let settled = tokio::task::spawn_blocking(move || {
+            make_folder(&folder, &session, Vec::new(), made_room, now)
+        })
+        .await
+        .map_err(|error| error.to_string())
+        .and_then(|settled| settled);
+        let settled = match settled {
+            Ok(settled) => settled,
+            Err(sentence) => {
+                if made_room {
+                    discard(client, &room, &invite).await;
+                }
+                return Err(sentence.into());
+            }
+        };
+        if let Some(orphan) = &settled.discard {
+            discard(client, orphan, &invite).await;
+        }
+        let made = match (made_room, settled.folder_made) {
+            (true, true) => Made::RoomAndFolder,
+            (false, true) => Made::Folder,
+            (_, false) => Made::Nothing,
+        };
+        let Settled { room, path, .. } = settled;
+        ensure_anchor(client, &me, &anchor, &room, &path).await?;
+        Ok(GateRoom { room, path, made })
+    }
+
+    /// Whether a room the copy `me` is in is found as the room of the gate
+    /// serving `system`: a session room whose newest status from `me` says
+    /// `kind: "gate"` with the system as its title — or, with no status yet
+    /// (a run stopped between the room and the folder), whose name is the
+    /// gate room's and which the peer is in (joined or invited). Found is
+    /// not adopted: [`gate::adoption`] decides that.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn is_gate_room(
+        room_type: Option<&str>,
+        members: &BTreeSet<OwnedUserId>,
+        me: &UserId,
+        peer: &UserId,
+        status: Option<&Value>,
+        name: Option<&str>,
+        gate_name: &str,
+        system: &str,
+    ) -> bool {
+        room_type == Some(SESSION_ROOM_TYPE)
+            && members.iter().any(|member| member == me)
+            && match status {
+                Some(status) => {
+                    status["kind"] == SessionKind::Gate.as_str() && status["title"] == system
+                }
+                None => name == Some(gate_name) && members.iter().any(|member| member == peer),
+            }
+    }
+
+    /// The copy's room for `gate` among the rooms it is in: of those found
+    /// as the gate's ([`is_gate_room`]), the first by room id that
+    /// [`gate::adoption`] allows; when it allows none, the first one's
+    /// refusal; `None` when none is found, and a room is made.
+    async fn find_gate_room(
+        client: &AgentClient,
+        me: &UserId,
+        gate: &GateConfig,
+        gate_name: &str,
+    ) -> Result<Option<OwnedRoomId>, GateRoomError> {
+        let mut found = Vec::new();
+        for room in client.client().joined_rooms() {
+            let room_type = room.room_type().map(|kind| kind.to_string());
+            if room_type.as_deref() != Some(SESSION_ROOM_TYPE) {
+                continue;
+            }
+            let Ok(members) = room
+                .members(RoomMemberships::JOIN | RoomMemberships::INVITE)
+                .await
+            else {
+                continue;
+            };
+            let members: BTreeSet<OwnedUserId> =
+                members.iter().map(|m| m.user_id().to_owned()).collect();
+            let status = newest_status(&room, me).await;
+            let name = room.name();
+            if !is_gate_room(
+                room_type.as_deref(),
+                &members,
+                me,
+                &gate.peer,
+                status.as_ref(),
+                name.as_deref(),
+                gate_name,
+                &gate.system,
+            ) {
+                continue;
+            }
+            let encrypted = room
+                .latest_encryption_state()
+                .await
+                .map_err(|error| error.to_string())?
+                .is_encrypted();
+            let levels = room.power_levels().await.ok();
+            let creators = room.creators().unwrap_or_default();
+            let verdict = gate::adoption(me, &creators, levels.as_ref(), encrypted, gate);
+            found.push((room.room_id().to_owned(), verdict));
+        }
+        found.sort_by(|a, b| a.0.cmp(&b.0));
+        if let Some((room, _)) = found.iter().find(|(_, verdict)| verdict.is_ok()) {
+            return Ok(Some(room.clone()));
+        }
+        match found.first() {
+            Some((room, Err(refusal))) => {
+                Err(GateRoomError::Refused(refusal.sentence(room, me, gate)))
+            }
+            _ => Ok(None),
+        }
+    }
 }
 
 #[cfg(all(unix, test))]
-use dm::is_main_dm;
+use dm::{is_gate_room, is_main_dm};
 
 #[cfg(test)]
 mod tests;

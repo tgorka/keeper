@@ -1,5 +1,6 @@
-//! `keeper-agentd agents init` and `agents new`: a drive's agents zone
-//! seeded, a new agent from its template, and the proxy's DM (story 91.5).
+//! `keeper-agentd agents init`, `agents new` and `agents gate`: a drive's
+//! agents zone seeded, a new agent from its template, the proxy's DM (story
+//! 91.5), and a gate's room and session (story 99.1).
 //!
 //! `init` writes the zone and never overwrites a file. Against agentd's own
 //! checkout it refuses an owner, readers or `local_only` that differ from
@@ -195,21 +196,7 @@ fn init_checkout(
     choices: &SeedChoices,
     args: &InitArgs<'_>,
 ) -> Result<(), CliError> {
-    let _lock = crate::host_lock::take(&host.dirs.data, &config.host)
-        .map_err(|error| {
-            CliError::Failure(format!(
-                "{} cannot be locked: {error}",
-                crate::host_lock::path(&host.dirs.data).display()
-            ))
-        })?
-        .map_err(|holder| {
-            CliError::Config(format!(
-                "keeper-agentd run is serving {principal}'s agents on {host} ({holder}), and agents init would open the same copies beside it: stop keeper-agentd@{principal}, run this again, then start it.",
-                principal = config.principal,
-                host = config.host,
-                holder = holder.0,
-            ))
-        })?;
+    let _lock = hold_copies(host, config, "agents init")?;
     let secrets = host.harden(config)?;
     let runtime = runtime()?;
     runtime.block_on(check_out_missing(config, &host.dirs, &secrets))?;
@@ -295,6 +282,187 @@ fn init_checkout(
             Made::Nothing => println!(
                 "{}'s DM is {} already, with its main session {subfolder}/{}: nothing made.",
                 proxy.name, dm.room, dm.path
+            ),
+        },
+    }
+    println!("`keeper-agentd run` commits and pushes what this wrote.");
+    Ok(())
+}
+
+/// The copies' lock for `verb`, refused while `keeper-agentd run` holds it:
+/// a verb that opens an agent's copy must not open it beside `run`.
+fn hold_copies(
+    host: &Host,
+    config: &AgentdConfig,
+    verb: &str,
+) -> Result<crate::host_lock::HostLock, CliError> {
+    crate::host_lock::take(&host.dirs.data, &config.host)
+        .map_err(|error| {
+            CliError::Failure(format!(
+                "{} cannot be locked: {error}",
+                crate::host_lock::path(&host.dirs.data).display()
+            ))
+        })?
+        .map_err(|holder| {
+            CliError::Config(format!(
+                "keeper-agentd run is serving {principal}'s agents on {host} ({holder}), and {verb} would open the same copies beside it: stop keeper-agentd@{principal}, run this again, then start it.",
+                principal = config.principal,
+                host = config.host,
+                holder = holder.0,
+            ))
+        })
+}
+
+/// `agents gate <agent> <system>` (99.1 #5, AD-415): the room and the gate
+/// session of one `[[gate]]`, made once — a second run finds the session
+/// and its room and makes nothing. `agent` is `<drive>/<id>` or an id one
+/// mounted drive alone has. A gate answers by a deadline, so only an
+/// always-on host makes one (codemap Q14); keeper-agentd is the only
+/// program that does.
+pub fn gate(host: &Host, agent: &str, system: &str) -> Result<(), CliError> {
+    let config = host.config()?;
+    if !config.always_on {
+        return Err(CliError::Config(format!(
+            "A gate answers by a deadline, so it is served by an always-on host, and {}'s agentd.toml says always_on = false.",
+            config.host
+        )));
+    }
+    let _lock = hold_copies(host, &config, "agents gate")?;
+    let secrets = host.harden(&config)?;
+    let runtime = runtime()?;
+    runtime.block_on(check_out_missing(&config, &host.dirs, &secrets))?;
+    let inspection = inspect(&config, &host.dirs);
+
+    let (drive, id) = match agent.split_once('/') {
+        Some(parts) => parts,
+        None => {
+            let homing: Vec<&str> = inspection
+                .drives
+                .iter()
+                .filter(|view| view.zone.homes.iter().any(|(folder, _)| folder == agent))
+                .map(|view| view.id.as_str())
+                .collect();
+            match homing.as_slice() {
+                [drive] => (*drive, agent),
+                [] => {
+                    return Err(CliError::Config(format!(
+                        "No drive this host mounts has an agent {agent}: `keeper-agentd agents list` shows them."
+                    )))
+                }
+                _ => {
+                    return Err(CliError::Config(format!(
+                        "{agent} is in {}: name one as <drive>/{agent}.",
+                        homing.join(" and ")
+                    )))
+                }
+            }
+        }
+    };
+    let view = inspection
+        .drives
+        .iter()
+        .find(|view| view.id == drive)
+        .ok_or_else(|| CliError::Config(format!("{drive} is not a drive this host mounts.")))?;
+    match view.zone.homes.iter().find(|(folder, _)| folder == id) {
+        None => {
+            return Err(CliError::Config(format!(
+                "{drive} has no agent {id}: `keeper-agentd agents list` shows its agents."
+            )))
+        }
+        Some((_, Err(sentence))) => {
+            return Err(CliError::Config(format!(
+                "{drive}/{id} is refused: {sentence}"
+            )))
+        }
+        Some((_, Ok(_))) => {}
+    }
+    let Some(home) = inspection
+        .hosted
+        .iter()
+        .find(|home| home.config.drive == drive && home.config.id == id)
+    else {
+        return Err(CliError::Config(format!(
+            "{drive}/{id} is not served here: name it in agentd.toml's [[agents]] (drive = \"{drive}\"), then run this again."
+        )));
+    };
+    let Some(gate) = home.config.gates.iter().find(|gate| gate.system == system) else {
+        return Err(CliError::Config(match home.config.kind {
+            keeper_core::agents::home::AgentKind::Gate => format!(
+                "{drive}/{id} has no [[gate]] with system = \"{system}\": add one to its agent.toml."
+            ),
+            other => format!(
+                "{drive}/{id} is a {}, and only a kind = \"gate\" agent has gates.",
+                other.as_str()
+            ),
+        }));
+    };
+    let pin = config
+        .drive(drive)
+        .ok_or_else(|| CliError::Config(format!("{drive} is not pinned")))?;
+    let approvers = keeper_core::agents::gate::approvers(&pin.readers, &config.trust);
+    let invite = keeper_core::agents::gate::room_invitees(gate, drive, &approvers, &config.trust)
+        .map_err(|refusal| CliError::Config(refusal.to_string()))?;
+
+    let profile = in_force(&drive_profile(&host.dirs, pin), &config.host)?;
+    let sessions = profile
+        .sessions_root()
+        .ok_or_else(|| CliError::Failure("the drive has no sessions zone".to_owned()))?;
+    let subfolder = profile
+        .sessions
+        .as_ref()
+        .map(|s| s.subfolder.trim().to_owned())
+        .unwrap_or_default();
+    let platform = keeper_agent::headless::HeadlessPlatform::new(&host.dirs.data, secrets);
+    let made = runtime.block_on(async {
+        let Some(client) = restore_copy(
+            &config,
+            &platform,
+            &host.dirs.data,
+            &home.config.matrix_user,
+        )
+        .await
+        .map_err(CliError::Failure)?
+        else {
+            return Ok(None);
+        };
+        seed::gate_room(
+            &client,
+            &home.config,
+            gate,
+            &pin.owner,
+            invite,
+            &sessions,
+            &subfolder,
+            &config.host,
+            chrono::Local::now(),
+        )
+        .await
+        .map(Some)
+        .map_err(|error| match error {
+            seed::GateRoomError::Refused(sentence) => CliError::Config(sentence),
+            seed::GateRoomError::Failed(sentence) => CliError::Failure(sentence),
+        })
+    })?;
+    let name = &home.config.name;
+    match made {
+        None => {
+            return Err(CliError::Config(format!(
+                "{} is not signed in here yet: run `keeper-agentd login {drive}/{id}`, then this again.",
+                home.config.matrix_user
+            )))
+        }
+        Some(made) => match made.made {
+            Made::RoomAndFolder => println!(
+                "Made {name}'s {system} gate: the room {} with {} invited, and its gate session {subfolder}/{}.",
+                made.room, gate.peer, made.path
+            ),
+            Made::Folder => println!(
+                "{name}'s {system} gate room is {} already, and had no gate session here: made {subfolder}/{} naming it.",
+                made.room, made.path
+            ),
+            Made::Nothing => println!(
+                "{name}'s {system} gate is {} already, with its gate session {subfolder}/{}: nothing made.",
+                made.room, made.path
             ),
         },
     }

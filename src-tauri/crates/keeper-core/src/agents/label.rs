@@ -207,6 +207,18 @@ impl Label {
         }
     }
 
+    /// A gate session's label at its opening (AD-416, 99.2 #1): its
+    /// `[[gate]].audience` as readers — never the home drive's, since the
+    /// outside system reads the room — and `untrusted`, whatever asked.
+    /// `local_only` is the gate agent's own.
+    pub fn gate_opening(audience: &Readers, local_only: bool) -> Label {
+        Label {
+            readers: audience.clone(),
+            integrity: Integrity::Untrusted,
+            local_only,
+        }
+    }
+
     /// The sentence the session frame tells the model, naming each reader as
     /// `name` does, in the readers' sorted order.
     pub fn sentence(&self, name: &dyn Fn(&UserId) -> String) -> String {

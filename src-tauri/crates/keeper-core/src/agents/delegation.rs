@@ -335,6 +335,7 @@ pub fn child_session(
         checkpoints: None,
         outputs: Vec::new(),
         created_at,
+        gate: None,
     })
 }
 

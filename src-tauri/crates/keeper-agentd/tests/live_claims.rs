@@ -182,6 +182,7 @@ fn session_agent(room: &OwnedRoomId, person: &OwnedUserId, mac: bool) -> Session
         checkpoints: None,
         outputs: Vec::new(),
         created_at: chrono::Utc::now(),
+        gate: None,
     }
 }
 

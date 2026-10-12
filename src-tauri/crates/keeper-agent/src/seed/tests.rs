@@ -255,6 +255,71 @@ fn a_main_dm_is_known_by_its_room() {
     assert!(!dm(session, &other, true, Some("main")));
 }
 
+/// 99.1 #5, R366 as amended: a gate's room is found by its own status
+/// naming the gate's system — the peer in it or not, so a peer that left
+/// does not get a second room — or, with no status yet, by its name with the
+/// peer in it; no other room is found. Found is not adopted:
+/// `gate::adoption` decides that.
+#[test]
+fn a_gate_room_is_known_by_its_status_or_its_name() {
+    use keeper_core::agents::events::SESSION_ROOM_TYPE;
+    let me = user("@forge:example.org");
+    let peer = user("@github:example.org");
+    let both: BTreeSet<OwnedUserId> = [me.clone(), peer.clone()].into_iter().collect();
+    let session = Some(SESSION_ROOM_TYPE);
+    let status = |kind: &str, title: &str| serde_json::json!({"kind": kind, "title": title});
+    let gate = |kind, members: &BTreeSet<OwnedUserId>, status: Option<&serde_json::Value>, name| {
+        is_gate_room(
+            kind,
+            members,
+            &me,
+            &peer,
+            status,
+            name,
+            "Forge · github",
+            "github",
+        )
+    };
+    assert!(gate(session, &both, Some(&status("gate", "github")), None));
+    assert!(gate(session, &both, None, Some("Forge · github")));
+    assert!(!gate(
+        session,
+        &both,
+        Some(&status("gate", "gitlab")),
+        Some("Forge · github")
+    ));
+    assert!(!gate(
+        session,
+        &both,
+        Some(&status("delegated", "github")),
+        None
+    ));
+    assert!(!gate(session, &both, None, Some("Forge · gitlab")));
+    assert!(!gate(session, &both, None, None));
+    assert!(!gate(
+        Some("dev.keeper.agent.control"),
+        &both,
+        Some(&status("gate", "github")),
+        None
+    ));
+    // A peer that declined or left: found by the status, never by the name.
+    let without_peer: BTreeSet<OwnedUserId> = [me.clone(), user(MARTA)].into_iter().collect();
+    assert!(gate(
+        session,
+        &without_peer,
+        Some(&status("gate", "github")),
+        None
+    ));
+    assert!(!gate(session, &without_peer, None, Some("Forge · github")));
+    let without_me: BTreeSet<OwnedUserId> = [peer.clone(), user(MARTA)].into_iter().collect();
+    assert!(!gate(
+        session,
+        &without_me,
+        Some(&status("gate", "github")),
+        None
+    ));
+}
+
 fn profile(root: &Path) -> SyncProfile {
     let mut profile = SyncProfile::new(
         "P1".to_owned(),

@@ -957,6 +957,7 @@ pub fn add_review(
                 checkpoints: None,
                 outputs: Vec::new(),
                 created_at: now,
+                gate: None,
             };
             files.push((SESSION_FILE.to_owned(), compose_session_agent_toml(&agent)));
         }

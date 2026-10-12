@@ -498,3 +498,95 @@ fn agents_new_copies_the_template_and_never_takes_a_folder() {
         "{said}"
     );
 }
+
+/// `agents gate` through the verb (99.1 #5, Q2, Q14; R99R1-02…04): a host
+/// that is not always on, a peer `[[trust]]` names, a gate no reader with a
+/// pinned key would decide for, and an approver outside a listed audience
+/// are each refused with exit 2 before the copy is even looked for — the
+/// sentence names the host, the peer, the drive or the approver, never the
+/// gate's own user the sign-in check names — and nothing is made.
+#[test]
+fn agents_gate_refuses_what_its_host_cannot_serve() {
+    const PEER: &str = "@github:example.org";
+    const GATE_USER: &str = "@forge:example.org";
+    let env = Env::new();
+    let forge = format!(
+        "version = 1\nid = \"forge\"\nname = \"Forge\"\nkind = \"gate\"\nmatrix_user = \"{GATE_USER}\"\n\n\
+         [[gate]]\nsystem = \"github\"\npeer = \"{PEER}\"\naudience = [\"{PEER}\", \"{TGORKA}\"]\nmodes = [\"sync\"]\n\n\
+         [[gate]]\nsystem = \"narrow\"\npeer = \"{PEER}\"\naudience = [\"{PEER}\"]\nmodes = [\"async\"]\n\n\
+         [model]\nbot = \"{BOT}\"\n"
+    );
+    let soul = "---\nname: Forge\ntitle: a gate\nicon: \"*\"\nrole: The door.\nidentity: \"A test gate.\"\ncommunication_style: Short.\nprinciples:\n  - Answer.\n---\n\nForge answers.\n";
+    let bare = common::bare_drive(
+        env.path(),
+        &[
+            (
+                "80-agents/_drive.toml".to_owned(),
+                format!("version = 1\nid = \"tgdrive\"\nprincipal = \"tgorka\"\nowner = \"{TGORKA}\"\nreaders = [\"{TGORKA}\"]\n"),
+            ),
+            ("80-agents/forge/agent.toml".to_owned(), forge),
+            ("80-agents/forge/SOUL.md".to_owned(), soul.to_owned()),
+        ],
+    );
+    let config_dir = env.path().join("home/config/keeper-agentd");
+    std::fs::create_dir_all(&config_dir).expect("config dir");
+    let host = |always_on: bool, trust: &str| {
+        std::fs::write(
+            config_dir.join("agentd.toml"),
+            format!(
+                "version = 1\nprincipal = \"tgorka\"\nhost = \"electra\"\nalways_on = {always_on}\n\n[homeserver]\nurl = \"http://127.0.0.1:9\"\ncontrol_room = \"\"\n\n[[drives]]\nid = \"tgdrive\"\nremote = \"{}\"\nowner = \"{TGORKA}\"\nreaders = [\"{TGORKA}\"]\n\n[[agents]]\ndrive = \"tgdrive\"\nids = [\"forge\"]\n{trust}",
+                bare.display()
+            ),
+        )
+        .expect("agentd.toml");
+    };
+    let pinned = format!(
+        "\n[[trust]]\nuser = \"{TGORKA}\"\nmaster_key = \"ed25519:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"\n"
+    );
+    let sessions = env
+        .path()
+        .join("home/data/keeper-agentd/drives/tgdrive/60-sessions");
+    let refused = |system: &str| {
+        let out = env.run(&["agents", "gate", "forge", system]);
+        let said = text(&out);
+        assert_eq!(out.status.code(), Some(2), "{said}");
+        assert!(listing(&sessions).is_empty(), "nothing made: {said}");
+        said
+    };
+
+    // Everything the verb checks holds: the copy is looked for, and it is
+    // not signed in.
+    host(true, &pinned);
+    let said = refused("github");
+    assert!(said.contains(GATE_USER), "{said}");
+
+    for (what, always_on, trust, system, names) in [
+        ("not always on", false, pinned.clone(), "github", "electra"),
+        (
+            "the peer in [[trust]]",
+            true,
+            format!("{pinned}\n[[trust]]\nuser = \"{PEER}\"\n"),
+            "github",
+            PEER,
+        ),
+        (
+            "no reader with a pinned key",
+            true,
+            format!("\n[[trust]]\nuser = \"{TGORKA}\"\n"),
+            "github",
+            "tgdrive",
+        ),
+        (
+            "the approver outside the audience",
+            true,
+            pinned.clone(),
+            "narrow",
+            TGORKA,
+        ),
+    ] {
+        host(always_on, &trust);
+        let said = refused(system);
+        assert!(said.contains(names), "{what}: {said}");
+        assert!(!said.contains(GATE_USER), "{what}, before the copy: {said}");
+    }
+}

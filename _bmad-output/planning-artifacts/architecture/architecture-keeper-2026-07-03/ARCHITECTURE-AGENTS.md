@@ -307,7 +307,7 @@ S-20).
 | `version` | integer | required | `1` |
 | `id` | string | required | equals the folder name; `[a-z][a-z0-9-]{0,31}`; names starting `_` are reserved for the zone |
 | `name` | string | required | ≤ 64 chars; equals `SOUL.md` `name` |
-| `kind` | enum | required | `proxy \| steward \| specialist \| gate` (AD-360); `kind` chooses defaults, never powers |
+| `kind` | enum | required | `proxy \| steward \| specialist \| gate` (AD-360); `kind` chooses defaults, never powers — but a gate's set (`reply`, `delegate`, `journal_append`) is also its ceiling: a gate's `[tools].allow` naming any other tool is refused (epic 99 codemap Q1; R365, rung `agents-99-room`) |
 | `matrix_user` | string | required | a Matrix user id on the homeserver the host uses; unique across every agent the host knows; one user per agent (AD-374) |
 | `human` | string | required for `proxy`, refused otherwise | a Matrix user id in the home drive's `readers`; the person this proxy is the door for |
 | `[model].bot` | string | required | the host-independent reference `bot:{kind}:{base}#{target}` already used by settings sync (`org_account/settings_sync.rs:572-583`); `{base}` follows AD-146's base-URL grammar (no userinfo); each host resolves it to its own provider row or `[[providers]]` entry, and a host without it is not a placement candidate (AD-379) |
@@ -329,7 +329,7 @@ S-20).
 | `[memory].nudge_user_turns` | integer | `10` | 0 (off) or 5–50 (P12) |
 | `[memory].nudge_tool_iterations` | integer | `15` | 0 (off) or 5–100 (P12) |
 | `[memory].promote` | boolean | `true` | `false` keeps every proposal for a person's review |
-| `[[gate]]` | array of tables | `[]` | `kind = "gate"` only, refused on any other kind (AD-415; ruling R24(4)): `system` (`[a-z0-9-]{1,32}`, unique in the agent), `peer` (the outside system's Matrix user id), `audience` (Matrix user ids, or `["*"]`), `delegates` (agent ids of this drive the gate may hand work to), `deadline_ms_max` (1 000–120 000, default 30 000), `modes` (a non-empty subset of `["sync", "async"]`), `max_tickets_per_hour` (1–1 000, default 10; ruling R28 S-23) |
+| `[[gate]]` | array of tables | `[]` | `kind = "gate"` only, refused on any other kind (AD-415; ruling R24(4)): `system` (`[a-z0-9-]{1,32}`, unique in the agent), `peer` (the outside system's Matrix user id), `audience` (Matrix user ids, or `["*"]`), `delegates` (agent ids of this drive the gate may hand work to), `deadline_ms_max` (1 000–120 000, default 30 000), `modes` (a non-empty subset of `["sync", "async"]`), `max_tickets_per_hour` (1–1 000, default 10; ruling R28 S-23); `max_requests_per_hour` (1–3 600, default 120; codemap Q11) and `encrypted` (default `true`, `false` only with `audience = ["*"]`; codemap Q9); `modes` required; `peer` never the gate's own user, a reader of the home drive, an agent of the zone or a `[[trust]]` person; `audience` lists the `peer` and every approver, or is `["*"]` (R365, R366) |
 
 ### `<agent>/SOUL.md`
 
@@ -471,7 +471,7 @@ the home drive's sessions zone, plus:
 | `hop` | integer | `0` | 0–3 |
 | `limits` | table | the agent's | `{ rounds_per_exchange, tokens }` for a delegated session |
 | `workflow` | string | absent | a folder under `_workflows/` |
-| `delegates` | array of strings | absent | gate sessions only: the `[[gate]].delegates` copied in at opening — the agents the gate may hand work to, its trusted set (AD-416; ruling R24(4)) |
+| `[gate]` | table | absent | gate sessions only, and required there: `system` (the `[[gate]]` served), `peer`, `delegates` (the `[[gate]].delegates` copied in at opening as `<drive>/<id>` — the agents the gate may hand work to, its trusted set; AD-416, ruling R24(4), codemap Q12) and `encrypted = false` for a clear room; one table rather than root keys (R366, rung `agents-99-room`) |
 | `created_at` | RFC 3339 | required | |
 
 `agent.toml` is never rewritten. Everything that changes afterwards — scope, label, run state,
@@ -770,8 +770,10 @@ Power levels make the proxy rule enforceable (AD-380): in a session room the cre
 proxy's own rooms — session kind `main` or `conversation` — the person must also talk and set the
 scope, so their per-type `events` add `m.room.message: 0` and `dev.keeper.agent.scope: 0` (ruling
 R29 F1); everywhere else people stay at 0 for decisions, `heard` and surface results only. A gate
-room gives the peer 50 and sets `state_default` and `dev.keeper.agent.claim` to 100, so the peer
-can post and can write no state (AD-415). In a control room a visiting steward has 0 and
+room gives the peer 0, like a person (epic 99 codemap Q3, R366, superseding the peer at 50):
+it posts `m.room.encrypted` at 0 — and `m.room.message` at 0 in a clear gate room — and reaches no
+state, invite, kick, ban or redaction, which stay at 50 with only the gate (100) above them
+(AD-415). In a control room a visiting steward has 0 and
 `dev.keeper.agent.doorbell` is allowed at 0 (AD-388), as is each person's device's
 `dev.keeper.agent.presence` (ruling R37). A person reads every session room of their
 label and decides its approvals, and talks only to their proxy. **Joining** (ruling R29 F5): a host

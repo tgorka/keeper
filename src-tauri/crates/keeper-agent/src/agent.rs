@@ -6828,6 +6828,7 @@ impl ServedSession {
             checkpoints: None,
             outputs: Vec::new(),
             created_at: chrono::Utc::now(),
+            gate: None,
         };
         let path = match off_the_runtime(|| {
             verbs::create_agent_session(&zone, &agent, chrono::Local::now())
@@ -8520,6 +8521,11 @@ fn open_body(context: &SessionContext, deps: &AgentDeps, composed: &ComposedProm
         ),
         prompt_sha256: composed.prompt_sha256.clone(),
         memory_sha256: composed.memory_sha256.clone(),
+        encrypted: context
+            .agent
+            .gate
+            .as_ref()
+            .is_none_or(|gate| gate.encrypted),
     }
 }
 

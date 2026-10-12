@@ -213,6 +213,11 @@ fn no_retry() -> RequestConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RoomKind {
     Session(SessionKind),
+    /// A gate's session room (AD-415): encrypted unless its `[[gate]]`
+    /// says otherwise (codemap Q9), with [`crate::agents::gate::room_levels`].
+    Gate {
+        encrypted: bool,
+    },
     Control,
 }
 
@@ -373,7 +378,7 @@ impl AgentClient {
             .map_err(from_sdk)
     }
 
-    /// Create a typed, encrypted room as [`create_room_request`] makes it.
+    /// Create a typed room as [`create_room_request`] makes it.
     pub async fn create_room(
         &self,
         kind: RoomKind,
@@ -693,10 +698,12 @@ pub(crate) fn master_key_of(
         .get_first_key()
         .map(|key| format!("ed25519:{}", key.to_base64()))
 }
-/// The `createRoom` request for a typed, encrypted room, inviting `invite`,
-/// with `creator` at 100 and `agents` at 50: a session room's power levels
-/// from [`events::power_levels`], a control room's from
-/// [`events::control_power_levels`]. A `main` session room is a proxy's DM
+/// The `createRoom` request for a typed room, inviting `invite`, with
+/// `creator` at 100 and `agents` at 50: a session room's power levels from
+/// [`events::power_levels`], a gate room's from
+/// [`crate::agents::gate::room_levels`] (no other agent: `agents` is not
+/// read), a control room's from [`events::control_power_levels`]. Every
+/// room is encrypted but a gate room its `[[gate]]` makes clear. A `main` session room is a proxy's DM
 /// with its person (AD-372), so it is `is_direct`; no other room is.
 pub fn create_room_request(
     kind: &RoomKind,
@@ -711,17 +718,20 @@ pub fn create_room_request(
     request.preset = Some(create_room::v3::RoomPreset::PrivateChat);
     request.is_direct = *kind == RoomKind::Session(SessionKind::Main);
     let room_type = match kind {
-        RoomKind::Session(_) => SESSION_ROOM_TYPE,
+        RoomKind::Session(_) | RoomKind::Gate { .. } => SESSION_ROOM_TYPE,
         RoomKind::Control => CONTROL_ROOM_TYPE,
     };
     request.creation_content = Some(raw(&json!({ "type": room_type }))?);
-    request.initial_state = vec![raw(&json!({
-        "type": "m.room.encryption",
-        "state_key": "",
-        "content": { "algorithm": "m.megolm.v1.aes-sha2" },
-    }))?];
+    if *kind != (RoomKind::Gate { encrypted: false }) {
+        request.initial_state = vec![raw(&json!({
+            "type": "m.room.encryption",
+            "state_key": "",
+            "content": { "algorithm": "m.megolm.v1.aes-sha2" },
+        }))?];
+    }
     let levels = match kind {
         RoomKind::Session(session) => events::power_levels(*session, creator, agents),
+        RoomKind::Gate { encrypted } => crate::agents::gate::room_levels(creator, *encrypted),
         RoomKind::Control => events::control_power_levels(creator, agents),
     };
     request.power_level_content_override = Some(raw(&levels)?);
@@ -807,6 +817,57 @@ mod tests {
             create_room_request(&RoomKind::Control, "c", vec![person.clone()], &nixi, &[])
                 .expect("control");
         assert!(!control.is_direct);
+    }
+
+    /// Codemap Q9: a gate room is a typed session room, never direct,
+    /// encrypted unless its `[[gate]]` made it clear, at the gate's levels.
+    #[test]
+    fn a_gate_room_is_clear_only_when_its_gate_says_so() {
+        let forge = UserId::parse("@forge:example.org").expect("user");
+        let peer = UserId::parse("@github:example.org").expect("user");
+        for encrypted in [true, false] {
+            let request = create_room_request(
+                &RoomKind::Gate { encrypted },
+                "Forge · github",
+                vec![peer.clone()],
+                &forge,
+                &[],
+            )
+            .expect("request");
+            assert!(!request.is_direct);
+            assert_eq!(request.invite, vec![peer.clone()]);
+            let created: Value = serde_json::from_str(
+                request
+                    .creation_content
+                    .as_ref()
+                    .expect("create")
+                    .json()
+                    .get(),
+            )
+            .expect("json");
+            assert_eq!(created["type"], SESSION_ROOM_TYPE);
+            let states: Vec<Value> = request
+                .initial_state
+                .iter()
+                .map(|state| serde_json::from_str(state.json().get()).expect("json"))
+                .collect();
+            assert_eq!(
+                states
+                    .iter()
+                    .any(|state| state["type"] == "m.room.encryption"),
+                encrypted
+            );
+            let levels: Value = serde_json::from_str(
+                request
+                    .power_level_content_override
+                    .as_ref()
+                    .expect("levels")
+                    .json()
+                    .get(),
+            )
+            .expect("json");
+            assert_eq!(levels, crate::agents::gate::room_levels(&forge, encrypted));
+        }
     }
 
     #[test]

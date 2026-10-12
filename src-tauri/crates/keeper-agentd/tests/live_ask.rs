@@ -318,6 +318,7 @@ async fn ask_human_round_trip_on_synapse() {
         checkpoints: None,
         outputs: Vec::new(),
         created_at: chrono::Utc::now(),
+        gate: None,
     };
     let files = vec![
         ("80-agents/_drive.toml".to_owned(), drive_toml.clone()),

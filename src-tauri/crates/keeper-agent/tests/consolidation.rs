@@ -163,6 +163,7 @@ fn session(name: &str, requester: &str) -> (String, String) {
         checkpoints: None,
         outputs: Vec::new(),
         created_at: now(),
+        gate: None,
     };
     (
         format!("60-sessions/active/{name}/agent.toml"),

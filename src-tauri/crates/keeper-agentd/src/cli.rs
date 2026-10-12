@@ -1,4 +1,4 @@
-//! The command line: `init`, `login`, `agents list|init|new`, `run`, `status`.
+//! The command line: `init`, `login`, `agents list|init|new|gate`, `run`, `status`.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -115,6 +115,13 @@ pub enum AgentsCommand {
         /// Make it in this checkout instead of agentd's own.
         #[arg(long)]
         into: Option<PathBuf>,
+    },
+    /// Make a gate's room and its gate session for one `[[gate]]`, once.
+    Gate {
+        /// The gate agent, `<drive>/<id>` or an id one drive alone has.
+        agent: String,
+        /// The `[[gate]]`'s `system`.
+        system: String,
     },
 }
 
@@ -252,6 +259,9 @@ pub fn run(cli: Cli) -> u8 {
                 into: into.as_deref(),
             },
         ),
+        Command::Agents {
+            command: AgentsCommand::Gate { agent, system },
+        } => crate::seed::gate(&host, &agent, &system),
         Command::Run => serve(&host),
         Command::Status { session, no_probe } => {
             crate::report::status(&host, session.as_deref(), !no_probe)

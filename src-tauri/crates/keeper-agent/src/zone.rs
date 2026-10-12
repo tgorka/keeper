@@ -135,6 +135,15 @@ pub fn read_zone(drive_id: &str, profile: &SyncProfile, pinned: Option<&DriveDec
                 }
             }
         }
+        // A gate's delegates are agents of this zone, and its peer is none
+        // of them (99.1 #1): the gate is refused, its first fault named.
+        for (folder, refusal) in home::gate_zone_refusals(&configs) {
+            if let Some((_, home)) = read.iter_mut().find(|(at, _)| *at == folder) {
+                if home.is_ok() {
+                    *home = Err(refusal.to_string());
+                }
+            }
+        }
         homes = read;
     }
     ZoneRead {

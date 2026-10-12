@@ -31,7 +31,7 @@ pub const TITLE_MAX: usize = 120;
 /// The deepest delegation hop.
 pub const HOP_MAX: i64 = 3;
 
-const ROOT_KEYS: [&str; 21] = [
+const ROOT_KEYS: [&str; 22] = [
     "version",
     "id",
     "agent",
@@ -53,11 +53,13 @@ const ROOT_KEYS: [&str; 21] = [
     "checkpoints",
     "outputs",
     "created_at",
+    "gate",
 ];
 const PARENT_KEYS: [&str; 3] = ["drive", "session", "room"];
 const REPLY_KEYS: [&str; 3] = ["session", "room", "run"];
 const LABEL_KEYS: [&str; 3] = ["readers", "integrity", "local_only"];
 const LIMITS_KEYS: [&str; 2] = ["rounds_per_exchange", "tokens"];
+const GATE_KEYS: [&str; 4] = ["system", "peer", "delegates", "encrypted"];
 
 /// What a session is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
@@ -186,6 +188,22 @@ pub struct SessionLimits {
     pub tokens: u64,
 }
 
+/// A gate session's `[gate]` (AD-415): the `[[gate]]` it serves, copied in
+/// once when the session opens, so a later edit of the home's table reaches
+/// only a new gate session (session files are never rewritten).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GateSession {
+    /// The `[[gate]].system` it serves.
+    pub system: String,
+    /// The outside system's Matrix user the room was made for.
+    pub peer: OwnedUserId,
+    /// The agents it may hand work to, each `<drive>/<id>` (codemap Q12):
+    /// the trusted set a request is never allowed to widen (AD-416).
+    pub delegates: Vec<String>,
+    /// Whether its room was made end-to-end encrypted (codemap Q9).
+    pub encrypted: bool,
+}
+
 /// A parsed session `agent.toml`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionAgent {
@@ -235,6 +253,9 @@ pub struct SessionAgent {
     pub outputs: Vec<String>,
     /// When the session was created.
     pub created_at: DateTime<Utc>,
+    /// A gate session's `[gate]`; `None` for every other kind, and never
+    /// `None` for a gate session.
+    pub gate: Option<GateSession>,
 }
 
 /// Why a session `agent.toml` cannot be read. Each is one sentence.
@@ -526,6 +547,61 @@ fn limits(table: &toml::Table) -> Result<Option<SessionLimits>, SessionRefusal> 
     }))
 }
 
+/// `[gate]`: required on a gate session, refused on every other.
+fn gate(table: &toml::Table, kind: SessionKind) -> Result<Option<GateSession>, SessionRefusal> {
+    let gate = match (table.get("gate"), kind) {
+        (None, SessionKind::Gate) => return Err(missing("gate")),
+        (None, _) => return Ok(None),
+        (Some(_), kind) if kind != SessionKind::Gate => {
+            return Err(invalid(
+                "gate",
+                format!("there in a {kind} session"),
+                "only a gate session serves a [[gate]].",
+            ))
+        }
+        (Some(toml::Value::Table(gate)), _) => gate,
+        (Some(_), _) => return Err(wrong("gate", "a table, [gate]")),
+    };
+    unknown_keys(gate, &GATE_KEYS, "gate.")?;
+    let system = required_text(gate, "system", "gate.system")?;
+    if system.is_empty()
+        || system.len() > 32
+        || !system
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    {
+        return Err(invalid(
+            "gate.system",
+            format!("\"{system}\""),
+            "a system is 1 to 32 lowercase letters, digits or hyphens.",
+        ));
+    }
+    let peer = user("gate.peer", &required_text(gate, "peer", "gate.peer")?)?;
+    let delegates = text_list(gate, "delegates")?.unwrap_or_default();
+    if let Some(bad) = delegates.iter().find(|entry| {
+        !entry
+            .split_once('/')
+            .is_some_and(|(drive, id)| fits_id(drive) && fits_id(id))
+    }) {
+        return Err(invalid(
+            "gate.delegates",
+            format!("\"{bad}\""),
+            "each is <drive>/<agent id>.",
+        ));
+    }
+    let encrypted = match gate.get("encrypted") {
+        None => true,
+        Some(toml::Value::Boolean(on)) => *on,
+        Some(_) => return Err(wrong("gate.encrypted", "true or false")),
+    };
+    Ok(Some(GateSession {
+        system,
+        peer,
+        delegates,
+        encrypted,
+    }))
+}
+
 /// Read a session `agent.toml`.
 pub fn parse_session_agent_toml(text_in: &str) -> Result<SessionAgent, SessionRefusal> {
     let table: toml::Table = crate::toml_order::from_str(text_in).map_err(|error| {
@@ -603,6 +679,16 @@ pub fn parse_session_agent_toml(text_in: &str) -> Result<SessionAgent, SessionRe
             )
         })?
         .with_timezone(&Utc);
+    let label = label(&table)?;
+    // A gate session is the door for an outside system: what it holds is
+    // untrusted for life (AD-416), whatever its file says.
+    if kind == SessionKind::Gate && label.integrity != Integrity::Untrusted {
+        return Err(invalid(
+            "label.integrity",
+            format!("\"{}\"", format!("{:?}", label.integrity).to_lowercase()),
+            "a gate session is untrusted for life.",
+        ));
+    }
 
     Ok(SessionAgent {
         id,
@@ -615,7 +701,7 @@ pub fn parse_session_agent_toml(text_in: &str) -> Result<SessionAgent, SessionRe
         reply: reply(&table)?,
         room,
         drives,
-        label: label(&table)?,
+        label,
         needs: text_list(&table, "needs")?,
         pin: text(&table, "pin", "pin")?,
         hop,
@@ -634,6 +720,7 @@ pub fn parse_session_agent_toml(text_in: &str) -> Result<SessionAgent, SessionRe
         },
         outputs: text_list(&table, "outputs")?.unwrap_or_default(),
         created_at,
+        gate: gate(&table, kind)?,
     })
 }
 
@@ -647,7 +734,8 @@ fn quoted_list<'a>(items: impl IntoIterator<Item = &'a str>) -> String {
 }
 
 /// Write a session `agent.toml`: every key the session has, top-level keys
-/// first in the documented order, then `[parent]`, `[label]` and `[limits]`.
+/// first in the documented order, then `[parent]`, `[reply]`, `[label]`,
+/// `[limits]` and `[gate]`.
 pub fn compose_session_agent_toml(session: &SessionAgent) -> String {
     let mut out = String::new();
     let mut line = |key: &str, value: String| {
@@ -734,6 +822,18 @@ pub fn compose_session_agent_toml(session: &SessionAgent) -> String {
             "rounds_per_exchange = {}\ntokens = {}\n",
             limits.rounds_per_exchange, limits.tokens
         ));
+    }
+    if let Some(gate) = &session.gate {
+        out.push_str("\n[gate]\n");
+        out.push_str(&format!("system = {}\n", quoted(&gate.system)));
+        out.push_str(&format!("peer = {}\n", quoted(gate.peer.as_str())));
+        out.push_str(&format!(
+            "delegates = {}\n",
+            quoted_list(gate.delegates.iter().map(String::as_str))
+        ));
+        if !gate.encrypted {
+            out.push_str("encrypted = false\n");
+        }
     }
     out
 }
@@ -951,6 +1051,68 @@ local_only = true
             refused_key(&with("rounds_per_exchange = 8", "rounds_per_exchange = 0")),
             "limits.rounds_per_exchange"
         );
+    }
+
+    /// 99.1 #5, codemap Q9/Q12: a gate session's `[gate]` — the system,
+    /// the peer, its delegates as `<drive>/<id>`, and a clear room — writes
+    /// and reads back; it is required on a gate session and refused on any
+    /// other, and a delegate that is not `<drive>/<id>` is refused.
+    #[test]
+    fn a_gate_session_carries_its_gate() {
+        let gate_text = GOOD
+            .replace("kind = \"delegated\"", "kind = \"gate\"")
+            .replace("readers = [\"@tgorka:h\"]\nintegrity = \"peer\"", "readers = \"*\"\nintegrity = \"untrusted\"")
+            + "\n[gate]\nsystem = \"github\"\npeer = \"@github:h\"\ndelegates = [\"tgdrive/tola-grey\"]\nencrypted = false\n";
+        let session = parse_session_agent_toml(&gate_text).expect("a gate session parses");
+        assert_eq!(
+            session.gate,
+            Some(GateSession {
+                system: "github".to_owned(),
+                peer: UserId::parse("@github:h").expect("user"),
+                delegates: vec!["tgdrive/tola-grey".to_owned()],
+                encrypted: false,
+            })
+        );
+        assert_eq!(compose_session_agent_toml(&session), gate_text);
+        let encrypted = gate_text.replace("encrypted = false\n", "");
+        let session = parse_session_agent_toml(&encrypted).expect("parses");
+        assert!(session.gate.as_ref().is_some_and(|gate| gate.encrypted));
+        assert_eq!(compose_session_agent_toml(&session), encrypted);
+
+        let without = gate_text
+            .split("\n[gate]\n")
+            .next()
+            .expect("head")
+            .to_owned();
+        assert_eq!(refused_key(&without), "gate", "required on a gate session");
+        let on_delegated = format!("{GOOD}\n[gate]\nsystem = \"github\"\npeer = \"@github:h\"\n");
+        assert_eq!(
+            refused_key(&on_delegated),
+            "gate",
+            "refused on another kind"
+        );
+        assert_eq!(
+            refused_key(&gate_text.replace("\"tgdrive/tola-grey\"", "\"tola-grey\"")),
+            "gate.delegates"
+        );
+        assert_eq!(
+            refused_key(&gate_text.replace("system = \"github\"", "system = \"Git Hub\"")),
+            "gate.system"
+        );
+        assert_eq!(
+            refused_key(&gate_text.replace("encrypted = false", "colour = 1")),
+            "gate.colour"
+        );
+        for integrity in ["owner", "peer", "agent"] {
+            assert_eq!(
+                refused_key(&gate_text.replace(
+                    "integrity = \"untrusted\"",
+                    &format!("integrity = \"{integrity}\"")
+                )),
+                "label.integrity",
+                "a gate session is untrusted for life: {integrity}"
+            );
+        }
     }
 
     #[test]
