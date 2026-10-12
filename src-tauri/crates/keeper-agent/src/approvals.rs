@@ -47,6 +47,7 @@ use keeper_core::agents::events::{
 use keeper_core::agents::label::{check_sink, Readers, Sink, SinkVerdict};
 use keeper_core::agents::log::{ApprovalBody, ApprovalState, LineBody, PeerBody};
 use keeper_core::agents::matrix::AgentMatrixError;
+use keeper_core::agents::session::SessionKind;
 use keeper_core::agents::tier::{AgentTool, Classification, APPROVALS_DIR};
 use keeper_core::agents::trust::{Anchor, Published};
 use keeper_core::bots::audit::{self, AuditIntent, AuditOutcome};
@@ -61,6 +62,8 @@ use tokio::time::Instant;
 use ulid::Ulid;
 
 use crate::agent::{AgentDeps, Arrived, Outcome, ServeError, ServedSession};
+
+mod tickets;
 use crate::matrix_sink::EditPort;
 use crate::turn::now_ms;
 
@@ -1053,6 +1056,11 @@ impl ServedSession {
             }
             None => None,
         };
+        // A gate's ticket is asked for on the hour's card in its own room
+        // (codemap Q8).
+        if self.context.agent.kind == SessionKind::Gate {
+            return Box::pin(self.on_the_card(deps, port, record, call_line, file)).await;
+        }
         // The consolidator's record is decided by the approvers its digest
         // binds, while they are still who they should be (R206); a parked
         // call asks the session's readers.
@@ -1157,6 +1165,11 @@ impl ServedSession {
     /// record and its line — waits as a park not yet announced (R176):
     /// [`Self::resume_approvals`] announces it again, or expires it.
     pub(crate) fn adopt_records(&mut self, deps: &AgentDeps) {
+        // A gate's records are its tickets', raised again by their own
+        // lines ([`Self::raise_tickets`]).
+        if self.context.agent.kind == SessionKind::Gate {
+            return;
+        }
         let Ok(entries) = self.approvals(deps, false).and_then(fs::read_dir) else {
             return;
         };
@@ -1294,6 +1307,11 @@ impl ServedSession {
 
     /// Whether a call of this session waits for a person now.
     pub fn waiting(&self) -> bool {
+        // A gate never waits: its tickets wait outside its turns (codemap
+        // Q4), and every request is still taken.
+        if self.context.agent.kind == SessionKind::Gate {
+            return false;
+        }
         self.context
             .parked
             .values()
@@ -2195,6 +2213,14 @@ impl ServedSession {
         note: Option<PeerBody>,
         stop: CancelSignal,
     ) {
+        // A gate's ticket has no turn to resume: the host hands it on, or
+        // refuses it in the room (codemap Q4).
+        if self.context.agent.kind == SessionKind::Gate {
+            if let Some(settled) = settled {
+                Box::pin(self.ticket_settled(deps, port, pending, settled)).await;
+            }
+            return;
+        }
         let Ok(approval) = Ulid::from_string(&pending.id) else {
             return;
         };
@@ -2256,7 +2282,9 @@ impl ServedSession {
         self.scheduled_card = self
             .read_round(deps, &pending.id)
             .and_then(|round| round.scheduled);
-        let went_on = self.resume_turn(deps, Arc::clone(port), resume, stop).await;
+        // A resumed turn's future is large; on the heap, every path that
+        // settles an approval stays small on the worker's stack.
+        let went_on = Box::pin(self.resume_turn(deps, Arc::clone(port), resume, stop)).await;
         match &went_on {
             Ok(report) => {
                 tracing::info!(approval = %pending.id, ending = ?report.ending, "agents: a parked run went on")

@@ -821,6 +821,22 @@ impl<'s> CallAudit<'s> {
         Ok(())
     }
 
+    /// A call [`CallAudit::admit`] parked that does not wait after all — a
+    /// gate's hand-off whose ticket could not be had: the row its park
+    /// left pending closed refused, so the call keeps one row (R172).
+    pub fn unpark(&self) {
+        let Some(Approval::Park(approval)) = self.approval() else {
+            return;
+        };
+        match audit::parked_row(&self.sinks.data_dir, &approval.to_string()) {
+            Ok(Some(row)) => self.sinks.close(row, AuditOutcome::Refused),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(%error, tool = self.tool, "agents: a call that does not wait could not find its pending audit row");
+            }
+        }
+    }
+
     /// The call ended with `outcome`: its admitted row closed with it, or —
     /// a call that ended before its sinks were asked — its row written now.
     pub fn finish(&self, outcome: &ToolOutcome) {

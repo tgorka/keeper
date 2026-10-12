@@ -10409,11 +10409,11 @@ location: `keeper_agent::gate::Desk::take`, `keeper_agent::runtime::read_back`
 reason: the room's front takes a request — says its async ticket, or arms its deadline — before the worker writes its `request` line. A stop between the two leaves the event unseen by the log, so the next worker reads it back and takes it again: a second ticket (or refusal) message can reach the outside system, and the request pays a second request token at its old server time. A `ticket` the deadline timer said whose line was not written yet is lost the same way (the system then hears the request's `interrupted` or a second ticket). Writing the `request` line from the front, or reading the gate's own messages back from the room before taking a replayed request, would close it.
 status: open
 
-### DW-1341: A gate's own message the homeserver keeps refusing is given up.
+### DW-1341: A gate's own message the homeserver keeps refusing is given up, and a ticket said at a `delegate` is logged only at its turn's end.
 
-origin: epic 99, story 99.1 (rung `agents-99-sync`, 2026-10-12; R368)
-location: `keeper_agent::gate::Desk::send`
-reason: a ticket or refusal the desk says by itself is tried five times under one transaction (a 429 waited out, any other error after 500 ms), and its line is then written with no event; a reply the room's sink blocks, or one the homeserver refuses, is refused to the model and the request then ends `no_answer`. Nothing retries a lost ticket on the host's clock, and a refusal blocked by the sink (a member outside the audience joined) is not said at all. A retry queue on the worker's tick, like the briefs', would carry them.
+origin: epic 99, story 99.1 (rung `agents-99-sync`, 2026-10-12; R368); extended by review-99tickets-1 (R99T-06; R373)
+location: `keeper_agent::gate::Desk::send`, `keeper_agent::gate::Desk::ticket_for`, `keeper_agent::agent::ServedSession::gate_turn`
+reason: a ticket or refusal the desk says by itself is tried five times under one transaction (a 429 waited out, any other error after 500 ms), and its line is then written with no event; a reply the room's sink blocks, or one the homeserver refuses, is refused to the model and the request then ends `no_answer`. Nothing retries a lost ticket on the host's clock, and a refusal blocked by the sink (a member outside the audience joined) is not said at all. A retry queue on the worker's tick, like the briefs', would carry them. The converse on a new path (rung `agents-99-tickets`): a sync request a `delegate` hands on has its `ticket` said at the call (`Desk::ticket_for`) but its line written with the desk's other facts only after the turn's closing line; a stop in between leaves a `ticket` in the room with no line and no ledger token, and the restart (`recover_gate`) refuses the request `interrupted` naming no ticket. Writing the fact when the call returns — drained at the call's `tool_result` as a deadline's facts are — would close it.
 status: open
 
 ### DW-1342: A gate's deadline is kept on an uncalibrated clock until the host's first claim read-back.
@@ -10423,11 +10423,11 @@ location: `keeper_agent::claims::ServerClock`, `keeper_agent::gate::Desk`
 reason: the deadline timer waits `origin_server_ts + deadline_ms − ServerClock::now()`; until a claim's read-back has set the clock's offset, `now()` is this host's wall clock, so a host whose clock is off from the homeserver's tickets early or late by that much. A gate session's claim is acquired before its worker starts, which calibrates the clock in the usual case; a host that took no claim read-back yet (a takeover race) is not measured.
 status: open
 
-### DW-1343: A takeover tickets again a request the last holder ticketed and did not finish.
+### DW-1343: A takeover tickets again a request the last holder ticketed and did not finish, and the hour's card can go stale across a stop or a takeover.
 
-origin: review-99sync-1 (R99S-03; R370)
-location: `keeper_agent::runtime::answered_by`, `keeper_agent::agent::ServedSession::answered_elsewhere`
-reason: a gate's `answer`, `result` or `refused` in the room now answers its request after a takeover, but its `ticket` answers nothing: a request the last holder ticketed — whose lines this copy's log does not hold yet — is read back and taken again, so the outside system hears a second ticket for it and its first is never given a result. Adopting the room's ticket (its id becomes the entry's, the ledger opens it, the turn's `reply` is its `result`) would close it; rung `agents-99-tickets` reads tickets back for its callbacks and is where it fits.
+origin: review-99sync-1 (R99S-03; R370); widened by review-99tickets-1 (R99T-05; R373)
+location: `keeper_agent::runtime::answered_by`, `keeper_agent::agent::ServedSession::answered_elsewhere`, `keeper_agent::approvals::tickets::on_the_card` (`approvals/card.json`)
+reason: a gate's `answer`, `result` or `refused` in the room now answers its request after a takeover, but its `ticket` answers nothing: a request the last holder ticketed — whose lines this copy's log does not hold yet — is read back and taken again, so the outside system hears a second ticket for it and its first is never given a result. Adopting the room's ticket (its id becomes the entry's, the ledger opens it, the turn's `reply` is its `result`) would close it; rung `agents-99-tickets` reads tickets back for its callbacks and is where it fits. The hour's card has the same shape: `card.json` is written after the card's send and read with every error swallowed, so (a) a stop between the send and the write opens a second card for the hour without the earlier record (the first card stands; its record is asked again if its `approval requested` line was lost too), and (b) after a takeover the taker's synced `card.json` can lag the last holder's edit — its next edit lists one record fewer, the device ignores it (`approval_card` counts an edit only when it keeps every listed record byte for byte), and the new ticket is never shown and ends `expired` a day later. Both fail closed; (b) is silent. Reading the card back from the room (its event and its last accepted edit), or opening a new card whenever `card.json`'s event is not one this copy sent — and writing `card.json` with the intended list before the send — would close it.
 status: open
 
 ### DW-1344: An agent's open gate tickets are counted per host.
@@ -10450,3 +10450,39 @@ origin: review-99sync-1 (DW candidate; R370)
 location: `keeper_agent::agent::agent_offer`
 reason: a model that cannot call tools is told of none, and the gate arm comes after that return, so such a gate's every request ends `no_answer`. `agents gate` or the placement could refuse a gate whose model calls no tools, and `status` could say so.
 status: open
+
+### DW-1350: A gate whose room is clear cannot hand a request on.
+
+origin: epic 99, story 99.1 (rung `agents-99-tickets`, 2026-10-12; R371; codemap Q9)
+location: `keeper_agent::delegate::GATE_CLEAR`, `keeper_core::agents::approval_card` (the device fold takes only sealed requests)
+reason: the hour's card goes into the gate's own room (codemap Q8 (a)), and a device draws an approval request only when it was sealed by its sender's device; in a clear room (`encrypted = false`) nothing is sealed, so no person could see or decide a card there. A clear gate's `delegate` is refused, naming why, and its requests are answered by its own turn. Carrying a clear gate's cards to its approvers' proxy DMs (R85's route, agentd only) is the way out.
+status: open
+
+### DW-1351: An approved ticket whose host stopped before its room was made is refused, its approval spent.
+
+origin: epic 99, story 99.1 (rung `agents-99-tickets`, 2026-10-12; R371)
+location: `keeper_agent::approvals::tickets::ticket_settled`, `keeper_agent::agent::ServedSession::recover_gate`
+reason: a ticket's approval is consumed in the room before the host makes the delegation's room (NFR-117's order); a stop between the two leaves a consumed record and no `delegate opened` line, and the next start refuses the request `interrupted` — the person's approval is spent and the outside system must ask again. A room a stop left made is an orphan nothing serves.
+status: open
+
+### DW-1352: An approver pinned after a gate's room was made decides tickets they cannot see.
+
+origin: review-99tickets-1 (doc nit; R373; beside DW-1336)
+location: `keeper_agent::approvals::tickets::gate_approvers`, `keeper_core::agents::gate::room_invitees`
+reason: a gate's approvers — the drive's pinned readers whose key this host pins — are worked out again at the card, at each decision's seat and at the delegation room's invites, while the gate's room was joined by the people `agents gate` invited when it made it. A person pinned in `[[trust]]` later is named on the card and their decision would count, but they are no member of the gate room, so the card never reaches their devices. `agents gate` could invite the approvers again, or `status` could flag an approver outside the room.
+status: open
+
+### DW-1353: One record can sit on two of a gate's cards after a stop.
+
+origin: review-99tickets-1 (DW candidate, R99T-05 (a); R373)
+location: `keeper_agent::approvals::tickets::on_the_card`, `keeper_core::agents::approval_card` (the device's projection)
+reason: a stop between a card's send and its `approval requested` line leaves the ticket unasked, so the next `raise_tickets` puts the same record on a card again — the first card stands. A person's device then sees one record id on two cards; whether 93's projection draws it once (dedup by record id) is not verified here.
+status: open
+
+### DW-1354: The hour's card shows its lines for a day.
+
+origin: review-99tickets-1 (DW candidate; R373)
+location: `keeper_core::agents::gate::HourCard`, the approval card's surface (epic 99's UI rung)
+reason: a card collects an hour's tickets, but each record expires a day after its own creation, so one card may show lines in every state — waiting, approved, denied, expired — for up to a day. How a decided line keeps its verdict on the card (UX-DR160) is that rung's to draw.
+status: open
+

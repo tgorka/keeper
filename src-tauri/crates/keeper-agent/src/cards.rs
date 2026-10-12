@@ -1098,6 +1098,7 @@ mod tests {
                 zone: zone.to_owned(),
                 subfolder: "60-sessions".to_owned(),
                 chain: Vec::new(),
+                gate: None,
             },
             drive_readers: Readers::Only([tgorka()].into_iter().collect()),
             view,

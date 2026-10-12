@@ -537,7 +537,87 @@ pub fn said(
         (_, Some(GateReason::Interrupted)) => {
             format!("{request} was cut off when its host stopped. Ask again.")
         }
+        (_, Some(GateReason::Denied)) => {
+            format!("{request} was not handed on: a person declined it.")
+        }
+        (_, Some(GateReason::Expired)) => {
+            format!("{request} was not handed on: nobody decided it in time.")
+        }
+        (_, Some(GateReason::Failed)) => {
+            format!("{request} was approved, but could not be handed on. Ask again.")
+        }
         _ => String::new(),
+    }
+}
+
+/// Whether a gate whose session lists `delegates` (`<drive>/<id>`, as its
+/// `[gate]` table writes them) may hand a request to the agent `id` of
+/// `drive` (99.2 #4, codemap Q12): by identity — whatever name the call
+/// gave, it is the agent it resolved to that must be listed. Anything else,
+/// the agent a request names included, is blocked, never asked.
+pub fn selects(delegates: &[String], drive: &str, id: &str) -> bool {
+    delegates.iter().any(|listed| {
+        listed
+            .split_once('/')
+            .is_some_and(|(at, agent)| at == drive && agent == id)
+    })
+}
+
+/// How long one card gathers a gate's tickets (S-23, UX-DR160): an hour
+/// from its first record, by the homeserver's clock.
+pub const CARD_WINDOW_MS: u64 = HOUR_MS;
+
+/// The most bytes a card's content may hold (codemap Q8): an edit carries
+/// the whole list, and an encrypted event is bounded (`events.rs`, ~47 KiB
+/// accepted); past this the next ticket opens a new card, even inside the
+/// hour.
+pub const CARD_BYTES_MAX: usize = 32 * 1024;
+
+/// The hour's card (99.1 #10, UX-DR160): one `approval.request` event whose
+/// content is the coalesced `{v, records}`, opened by its first record at
+/// `opened_at` (server ms); every later record of its window is added by an
+/// `m.replace` edit carrying the whole list, each earlier record exactly as
+/// it was sent — a device drops an edit that changes or loses one.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HourCard {
+    pub v: u32,
+    /// The card's own event.
+    pub event: OwnedEventId,
+    pub opened_at: u64,
+    pub records: Vec<events::ApprovalRequestContent>,
+}
+
+/// The version of a kept [`HourCard`].
+pub const CARD_VERSION: u32 = 1;
+
+impl HourCard {
+    /// The coalesced content of `records`.
+    pub fn content(records: &[events::ApprovalRequestContent]) -> Value {
+        json!({ "v": events::CONTENT_VERSION, "records": records })
+    }
+
+    /// Whether `record` joins this card at `at` (server ms): inside the
+    /// hour its first record opened, and with it the content stays within
+    /// [`CARD_BYTES_MAX`]. Else it opens a new card.
+    pub fn takes(&self, at: u64, record: &events::ApprovalRequestContent) -> bool {
+        if at < self.opened_at || at >= self.opened_at.saturating_add(CARD_WINDOW_MS) {
+            return false;
+        }
+        let mut records = self.records.clone();
+        records.push(record.clone());
+        Self::content(&records).to_string().len() <= CARD_BYTES_MAX
+    }
+
+    /// The edit that adds `record`: the whole list as `m.new_content`, a
+    /// replacement of the card's own event.
+    pub fn edit(&self, record: &events::ApprovalRequestContent) -> Value {
+        let mut records = self.records.clone();
+        records.push(record.clone());
+        json!({
+            "m.new_content": Self::content(&records),
+            "m.relates_to": {"rel_type": "m.replace", "event_id": self.event},
+        })
     }
 }
 
@@ -1086,5 +1166,97 @@ mod tests {
         }
         assert_eq!(rebuilt.open(), 1);
         assert!(rebuilt.is_open("b"));
+    }
+}
+
+#[cfg(test)]
+mod ticket_tests {
+    use super::*;
+
+    /// 99.2 #4 (codemap Q12): a gate hands work only to an agent its
+    /// session lists, by identity — the drive and the id the call resolved
+    /// to — so a listed agent passes, and anyone else, the one a request
+    /// names included, does not; a bare name or another drive's agent of
+    /// the same id is not a listed one.
+    #[test]
+    fn gate_arguments_are_selected_not_derived() {
+        let delegates = vec!["tgdrive/tola".to_owned(), "tgdrive/amelia-grey".to_owned()];
+        assert!(selects(&delegates, "tgdrive", "tola"));
+        assert!(selects(&delegates, "tgdrive", "amelia-grey"));
+        assert!(
+            !selects(&delegates, "tgdrive", "amelia"),
+            "the name a request gave"
+        );
+        assert!(
+            !selects(&delegates, "neuradrive", "tola"),
+            "another drive's tola"
+        );
+        assert!(!selects(&delegates, "tgdrive", "tgdrive/tola"));
+        assert!(
+            !selects(&["tola".to_owned()], "tgdrive", "tola"),
+            "a bare entry"
+        );
+        assert!(!selects(&[], "tgdrive", "tola"));
+    }
+
+    fn record(id: &str, brief: usize) -> events::ApprovalRequestContent {
+        events::ApprovalRequestContent {
+            v: events::CONTENT_VERSION,
+            id: id.to_owned(),
+            session: "60-sessions/active/2026-10-12-gate".to_owned(),
+            room: "!gate:example.org".to_owned(),
+            agent: "forge".to_owned(),
+            tier: 2,
+            summary: "Hand work to tola".to_owned(),
+            action: events::RequestAction {
+                tool: "delegate".to_owned(),
+                args: json!({"agent": "tola", "brief": "x".repeat(brief)}),
+                exec_binding: json!({"ticket": id}),
+            },
+            file: None,
+            file_sha256: None,
+            preview: None,
+            checkpoint_sha256: String::new(),
+            preconditions: crate::agents::approval::Preconditions::default(),
+            binding_digest: format!("sha256:{id}"),
+            scopes: vec!["once".to_owned()],
+            expires_at: "2026-10-13T09:00:00Z".to_owned(),
+            approvers: vec!["@tgorka:example.org".to_owned()],
+            dispatch_chain: vec!["@tgorka:example.org".to_owned()],
+        }
+    }
+
+    /// 99.1 #10 (S-23, codemap Q8): a card gathers the tickets of the hour
+    /// its first record opened — the last millisecond of it included, the
+    /// next one not, nor a time before it — and an edit carries the whole
+    /// list with every earlier record exactly as sent; a record that would
+    /// take the content past the byte budget opens a new card even inside
+    /// the hour.
+    #[test]
+    fn a_card_holds_one_hour_of_tickets_within_its_budget() {
+        let opened_at = 1_000_000;
+        let card = HourCard {
+            v: CARD_VERSION,
+            event: OwnedEventId::try_from("$card:example.org").expect("event"),
+            opened_at,
+            records: vec![record("a", 10)],
+        };
+        let next = record("b", 10);
+        assert!(card.takes(opened_at, &next));
+        assert!(card.takes(opened_at + CARD_WINDOW_MS - 1, &next));
+        assert!(!card.takes(opened_at + CARD_WINDOW_MS, &next));
+        assert!(!card.takes(opened_at - 1, &next));
+        let edit = card.edit(&next);
+        assert_eq!(edit["m.relates_to"]["rel_type"], "m.replace");
+        assert_eq!(edit["m.relates_to"]["event_id"], "$card:example.org");
+        let listed = events::request_records(&edit["m.new_content"]).expect("coalesced");
+        assert_eq!(listed, vec![record("a", 10), next.clone()]);
+        // Exactly at the budget it fits; one byte past, a new card.
+        let fixed = HourCard::content(&[record("a", 10), record("b", 0)])
+            .to_string()
+            .len();
+        let room_for = CARD_BYTES_MAX - fixed;
+        assert!(card.takes(opened_at, &record("b", room_for)));
+        assert!(!card.takes(opened_at, &record("b", room_for + 1)));
     }
 }

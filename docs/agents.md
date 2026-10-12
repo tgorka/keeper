@@ -3405,7 +3405,7 @@ each message an `m.text` referencing the request (`m.relates_to` `m.reference`) 
 | `answer` | a synchronous request answered within its deadline; `deadline_ms` says the deadline the gate kept |
 | `ticket` | an asynchronous request, at once; a synchronous one whose deadline passed first (timed by the homeserver's clock). The work goes on. |
 | `result` | the ticket's work, done |
-| `refused` | `reason`: `busy` (an hourly allowance is spent, or as many tickets are open across the agent's gates on this host as `[limits].max_concurrent_sessions`), `mode` (an asynchronous request to a gate whose `modes` is `["sync"]`), `no_answer` (the gate's turn ended without answering), `interrupted` (its host stopped mid-turn) |
+| `refused` | `reason`: `busy` (an hourly allowance is spent, or as many tickets are open across the agent's gates on this host as `[limits].max_concurrent_sessions`), `mode` (an asynchronous request to a gate whose `modes` is `["sync"]`), `no_answer` (the gate's turn ended without answering), `interrupted` (its host stopped mid-turn), `denied` (a person declined handing it on), `expired` (nobody decided that in time), `failed` (approved, but it could not be handed on) |
 
 A synchronous request to a gate whose `modes` is `["async"]` gets a ticket at once. Both hourly
 allowances refill continuously — `max_tickets_per_hour` tickets, `max_requests_per_hour`
@@ -3425,12 +3425,56 @@ and posts no status: the only thing that leaves is what its `reply` sends, once,
 as a sink like every send. Its label is reset to the gate's opening label (the `audience`,
 `untrusted`) at every request, and never rises.
 
-**In this build a gate's turn is offered `reply` alone, and runs nothing else.** Handing the work
-to a `delegate` once a person approves it, `journal_append` and the MCP servers `[tools].mcp` names
-come with the rest of the gates for outside systems; until then an asynchronous request is worked
-by the gate's own turn, and any other tool its model names — `ask_human`, its journal, an MCP tool
+### Handing a request on
+
+A gate's turn is offered `reply`, and `delegate` when `[tools].allow` names it (a gate's default
+`allow` does); `journal_append` and the MCP servers `[tools].mcp` names come with the rest of the
+gates for outside systems. Any other tool its model names — `ask_human`, its journal, an MCP tool
 or a drive verb included, whatever `[tools].allow` says — is refused as not offered, before it runs
 or reaches anyone.
+
+`delegate` in a gate never hands anything on by itself. Its target must resolve to an agent its
+`[[gate]].delegates` lists — compared as `<drive>/<id>`, whatever name the call wrote, so the agent
+a request names is refused, never asked — and it never sets a schedule or a workflow, opens a
+second round, or hands on a card. A call that passes is written to the audit log first — one that
+cannot be recorded is refused, and nothing is paid or said for it — then takes the request's
+ticket (a synchronous request gets one there and then, and its work goes on as asynchronous; one
+request is handed on once, and a synchronous request past the hour's `max_tickets_per_hour` is not
+handed on), and waits for a person: it is tier 1 raised to tier 2 in a gate, decided `once` only.
+The turn ends normally and the request stays open under its ticket; the gate's `reply` in that
+turn is refused.
+
+The host then asks for it on **the hour's card** in the gate's own room: one
+`dev.keeper.agent.approval.request` whose content lists every ticket's record (`{v, records}`),
+opened by the first ticket of an hour by the homeserver's clock, each later ticket of that hour
+added by an `m.replace` edit carrying the whole list — every earlier record exactly as it was — so
+a ticket after the hour, or one that would take the card past 32 KiB, opens a new card. Each record
+names the gate's session, the agent it would go to, the brief, the ticket and the request, and is
+decided on its own; the decision event names one record. The people who decide are the drive's
+pinned readers whose key this host pins, worked out again when the card is sent, when a decision
+arrives and when the delegation's room is made — a person pinned after `agents gate` made the room
+decides too, though the room never invited them (DW-1352) — never the room's audience, and a
+decision the peer sends counts for nothing. A decision is judged against the label the ticket was
+asked under, whatever a later result made the gate read. Edits do not push, so a phone shows one
+notification for a card however many tickets join it. A card the room does not take — its members
+could not be read as it was sent — leaves its ticket waiting, and is sent again at the gate's next
+turn. A clear gate room cannot carry a card a device would draw, so a gate there refuses
+`delegate`.
+
+Once a decision approves a record, the host — not a turn — hands the request on as any delegation:
+the room made inviting the delegate and the deciding people as observers (never the peer), the
+brief sent only after the delegate's host joined, its id the ticket's, carrying the gate's
+`[limits].tokens_per_delegation`, asked for by the gate's user with the gate session as its parent.
+When the delegate replies, the gate runs one turn that reads that request and the reply alone, and
+its `reply` goes out as the ticket's `result`; a reply delivered again adds nothing. That `reply`
+passes the room as a sink like every send, and the delegate's reply carries what its own turn read —
+its home drive at least, whose readers never include the peer — so in this build a result the
+delegate's home went into is blocked, nothing reaches the peer, and the request ends refused;
+releasing it through a person's declassification comes with the rest of the gates for outside
+systems. A denial
+refuses the ticket `denied`, a record nobody decides within a day `expired`. Open tickets — handed
+on or not — count against `[limits].max_concurrent_sessions` until their `result` or refusal; one
+waiting for a person or a delegate survives a restart.
 
 What the room still lets the peer do is recorded: an `m.room.encrypted` event in a clear room
 (DW-1334), the status anchor `agents gate` posts, which names the host and the session's folder

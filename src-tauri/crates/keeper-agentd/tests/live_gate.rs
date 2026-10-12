@@ -46,6 +46,8 @@ const PIN: &str = "ed25519:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 struct Agentd {
     home: PathBuf,
     env: Vec<(String, String)>,
+    /// The drive's bare remote.
+    bare: PathBuf,
 }
 
 impl Agentd {
@@ -204,6 +206,21 @@ async fn leave_session_rooms(smoke: &Smoke, dir: &Path, localpart: &str, passwor
 /// is signed in once a first `agents gate` has said it is not. With
 /// `model`, the gate's model is the stub at that URL.
 async fn gate_host(smoke: &Smoke, root: &Path, model: Option<&str>) -> Agentd {
+    gate_host_with(smoke, root, model, Extra::default()).await
+}
+
+/// What a test adds to [`gate_host`]'s drive and host: `github`'s and
+/// forge's extra lines, more files, the person's real pinned key.
+#[derive(Default)]
+struct Extra {
+    github: String,
+    forge: String,
+    files: Vec<(String, String)>,
+    pin: Option<String>,
+}
+
+/// [`gate_host`] with `extra`.
+async fn gate_host_with(smoke: &Smoke, root: &Path, model: Option<&str>, extra: Extra) -> Agentd {
     let agent = smoke.user("nixi-smoke");
     let peer = smoke.user("nixi-paced");
     let person = smoke.user("tgorka-smoke");
@@ -231,29 +248,31 @@ async fn gate_host(smoke: &Smoke, root: &Path, model: Option<&str>) -> Agentd {
     );
     let forge = format!(
         "version = 1\nid = \"forge\"\nname = \"Forge\"\nkind = \"gate\"\nmatrix_user = \"{agent}\"\n\n\
-         [[gate]]\nsystem = \"github\"\npeer = \"{peer}\"\naudience = [\"{peer}\", \"{person}\"]\nmodes = [\"sync\", \"async\"]\n\n\
+         [[gate]]\nsystem = \"github\"\npeer = \"{peer}\"\naudience = [\"{peer}\", \"{person}\"]\nmodes = [\"sync\", \"async\"]\n{github}\n\n\
          [[gate]]\nsystem = \"ci\"\npeer = \"{peer}\"\naudience = [\"*\"]\nmodes = [\"async\"]\nencrypted = false\n\n\
-         [model]\nbot = \"{bot}\"\n",
-        bot = model.map_or_else(|| BOT.to_owned(), |url| format!("bot:openai:{url}#m"))
+         [model]\nbot = \"{bot}\"\n{forge_extra}",
+        bot = model.map_or_else(|| BOT.to_owned(), |url| format!("bot:openai:{url}#m")),
+        github = extra.github,
+        forge_extra = extra.forge,
     );
     let providers = model.map_or_else(String::new, |url| {
         format!("\n[[providers]]\nkind = \"openai\"\nbase_url = \"{url}\"\n")
     });
-    let bare = bare_drive(
-        root,
-        &[
-            ("80-agents/_drive.toml".to_owned(), drive_toml),
-            ("80-agents/forge/agent.toml".to_owned(), forge),
-            ("80-agents/forge/SOUL.md".to_owned(), soul("Forge")),
-        ],
-    );
+    let mut files = vec![
+        ("80-agents/_drive.toml".to_owned(), drive_toml),
+        ("80-agents/forge/agent.toml".to_owned(), forge),
+        ("80-agents/forge/SOUL.md".to_owned(), soul("Forge")),
+    ];
+    files.extend(extra.files);
+    let bare = bare_drive(root, &files);
+    let pin = extra.pin.unwrap_or_else(|| PIN.to_owned());
     let home = root.join("electra-sim");
     let config_dir = home.join("config/keeper-agentd");
     std::fs::create_dir_all(&config_dir).expect("config dir");
     std::fs::write(
         config_dir.join("agentd.toml"),
         format!(
-            "version = 1\nprincipal = \"tgorka\"\nhost = \"electra-sim\"\nalways_on = true\n\n[homeserver]\nurl = \"{}\"\ncontrol_room = \"\"\n\n[[drives]]\nid = \"smoke\"\nremote = \"{}\"\nowner = \"{person}\"\nreaders = [\"{person}\"]\n\n[[agents]]\ndrive = \"smoke\"\nids = [\"forge\"]\n\n[[trust]]\nuser = \"{person}\"\nmaster_key = \"{PIN}\"\n{providers}",
+            "version = 1\nprincipal = \"tgorka\"\nhost = \"electra-sim\"\nalways_on = true\n\n[homeserver]\nurl = \"{}\"\ncontrol_room = \"\"\n\n[[drives]]\nid = \"smoke\"\nremote = \"{}\"\nowner = \"{person}\"\nreaders = [\"{person}\"]\n\n[[agents]]\ndrive = \"smoke\"\nids = [\"forge\"]\n\n[[trust]]\nuser = \"{person}\"\nmaster_key = \"{pin}\"\n{providers}",
             smoke.homeserver,
             bare.display()
         ),
@@ -280,6 +299,7 @@ async fn gate_host(smoke: &Smoke, root: &Path, model: Option<&str>) -> Agentd {
             ),
         ],
         home,
+        bare: bare.clone(),
     };
     let said = agentd.refused(&["agents", "gate", "forge", "github"]);
     assert!(said.contains(agent.as_str()), "the copy to sign in: {said}");
@@ -728,5 +748,658 @@ async fn gate_sync_answers_or_tickets_at_the_deadline() {
                 || event["content"][events::GATE]["state"] == "answer"
         }),
         "r1 was answered once and nothing else was said of it"
+    );
+}
+
+/// Dr Tola Grey's own host (`tola-smoke`, a steward) over the gate host's
+/// drive at `bare`, signed in with `password`; `model` its stub; the person
+/// pinned with `pin`.
+fn steward_host(
+    smoke: &Smoke,
+    root: &Path,
+    bare: &Path,
+    model: &str,
+    pin: &str,
+    password: &str,
+) -> Agentd {
+    let person = smoke.user("tgorka-smoke");
+    let home = root.join("tola-sim");
+    let config_dir = home.join("config/keeper-agentd");
+    std::fs::create_dir_all(&config_dir).expect("config dir");
+    std::fs::write(
+        config_dir.join("agentd.toml"),
+        format!(
+            "version = 1\nprincipal = \"tgorka\"\nhost = \"tola-sim\"\n\n[homeserver]\nurl = \"{}\"\ncontrol_room = \"\"\n\n[[drives]]\nid = \"smoke\"\nremote = \"{}\"\nowner = \"{person}\"\nreaders = [\"{person}\"]\n\n[[agents]]\ndrive = \"smoke\"\nids = [\"tola\"]\n\n[[trust]]\nuser = \"{person}\"\nmaster_key = \"{pin}\"\n\n[[providers]]\nkind = \"openai\"\nbase_url = \"{model}\"\n",
+            smoke.homeserver,
+            bare.display()
+        ),
+    )
+    .expect("agentd.toml");
+    let dir = |name: &str| home.join(name).display().to_string();
+    let agentd = Agentd {
+        env: vec![
+            ("HOME".to_owned(), dir("")),
+            ("XDG_CONFIG_HOME".to_owned(), dir("config")),
+            ("XDG_DATA_HOME".to_owned(), dir("data")),
+            ("XDG_STATE_HOME".to_owned(), dir("state")),
+            (
+                "KEEPER_AGENTD_SECRET_AGENT_PASSWORD".to_owned(),
+                password.to_owned(),
+            ),
+        ],
+        home,
+        bare: bare.to_owned(),
+    };
+    agentd.ok(&[
+        "login",
+        "smoke/tola",
+        "--password-credential",
+        "agent_password",
+    ]);
+    agentd
+}
+
+/// Every log line of every session of `agentd`'s checkout, as JSON.
+fn lines_of(agentd: &Agentd) -> Vec<Value> {
+    let mut out = Vec::new();
+    let active = agentd.drive().join("60-sessions/active");
+    for session in std::fs::read_dir(active).into_iter().flatten().flatten() {
+        for chunk in std::fs::read_dir(session.path().join("log"))
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            if chunk.path().extension().is_some_and(|ext| ext == "jsonl") {
+                let text = std::fs::read_to_string(chunk.path()).unwrap_or_default();
+                out.extend(text.lines().filter_map(|l| serde_json::from_str(l).ok()));
+            }
+        }
+    }
+    out
+}
+
+/// What a failed live test shows of a host's lines: kind and state.
+fn told(lines: &[Value]) -> String {
+    lines
+        .iter()
+        .map(|l| {
+            format!(
+                "{} {} {}",
+                l["kind"], l["body"]["state"], l["body"]["reason"]
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// What a failed live test shows of a host's log: its warnings and errors.
+fn told_log(log: &Path) -> String {
+    std::fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| line.contains("WARN") || line.contains("ERROR"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The room's events in order, as the server holds them.
+async fn timeline(smoke: &Smoke, room: &str) -> Vec<Value> {
+    smoke
+        .admin(
+            reqwest::Method::GET,
+            &format!("/_synapse/admin/v1/rooms/{room}/messages?dir=f&limit=500"),
+            None,
+        )
+        .await["chunk"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// tgorka's device A, its identity made and signed by itself; the master
+/// key a host pins for him.
+async fn person_device(
+    smoke: &Smoke,
+    dir: &Path,
+) -> (keeper_core::agents::matrix::AgentClient, String) {
+    let person = smoke.user("tgorka-smoke");
+    smoke.clear_devices(&person).await;
+    let device = smoke
+        .client(dir, "tgorka-smoke", smoke.secret("TGORKA_SMOKE_PASSWORD"))
+        .await;
+    common::bootstrap(&device, &person, smoke.secret("TGORKA_SMOKE_PASSWORD")).await;
+    let pin = device
+        .published_master_key(&person)
+        .await
+        .expect("the homeserver answers")
+        .expect("tgorka publishes an identity");
+    (device, pin)
+}
+
+/// The cards `seen` holds from `gate`: each `approval.request` event.
+fn cards_of(
+    seen: &std::sync::Mutex<Vec<(std::time::Instant, Value)>>,
+    gate: &OwnedUserId,
+) -> Vec<Value> {
+    seen.lock()
+        .expect("lock")
+        .iter()
+        .filter(|(_, event)| {
+            event["type"] == events::APPROVAL_REQUEST && event["sender"] == gate.as_str()
+        })
+        .map(|(_, event)| event.clone())
+        .collect()
+}
+
+/// A person's decision on the card record `record`.
+fn decision_on(record: &Value, decision: keeper_core::agents::approval::Decision) -> Value {
+    json!({
+        "id": record["id"],
+        "binding_digest": record["binding_digest"],
+        "decision": decision,
+        "scope": "once",
+    })
+}
+
+async fn wait_for(what: &str, within: Duration, done: impl Fn() -> bool) {
+    let until = std::time::Instant::now() + within;
+    while !done() {
+        assert!(std::time::Instant::now() < until, "{what}");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// 99.1 #4 (codemap Q2, Q4, Q5): the peer's plain message is ticketed
+/// within a second of it by the homeserver's clock, and its delegation is
+/// asked for on the hour's card the person's device draws. The peer's own
+/// decision on it changes nothing; the person's approval from his verified
+/// device hands it to Dr Tola Grey's host in 92.1's order — the brief only
+/// after Tola joined — her session made with the gate session as `parent`
+/// and the gate's user as `requested_by`; her reply comes back to the
+/// gate's callback turn, whose `reply` the room's sink blocks: Tola's prompt
+/// read her home, which the peer may not read, so nothing reaches the peer
+/// (its release is 99.2 #3's declassification) and the request is refused.
+/// A denied ticket is refused `denied`. The gate room's members at the end
+/// are the gate, the peer and the person.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "live: Synapse on delectra"]
+async fn gate_async_ticket_session_callback() {
+    use keeper_core::agents::approval::Decision;
+    let smoke = Smoke::from_env();
+    let root = tempfile::tempdir().expect("tempdir");
+    let gate = smoke.user("nixi-smoke");
+    let tola = smoke.user("tola-smoke");
+    let person = smoke.user("tgorka-smoke");
+    let tola_password = ulid::Ulid::new().to_string();
+    smoke
+        .admin(
+            reqwest::Method::PUT,
+            &format!("/_synapse/admin/v2/users/{tola}"),
+            Some(json!({ "password": tola_password, "admin": false })),
+        )
+        .await;
+    smoke.clear_devices(&tola).await;
+    smoke.set_ratelimit(&tola, 0, 0).await;
+    let (device, pin) = person_device(&smoke, &root.path().join("person")).await;
+
+    let gates_model = common::calls_at(
+        vec![
+            (
+                1,
+                "delegate",
+                json!({"agent": "smoke/tola", "brief": "Say where the v1.2 notes are."}),
+            ),
+            (3, "reply", json!({"text": "The notes are in 30-releases."})),
+            (
+                5,
+                "delegate",
+                json!({"agent": "smoke/tola", "brief": "Tag v1.3."}),
+            ),
+        ],
+        "ok",
+    );
+    let tolas_model = common::tool_then("reply", json!({"text": "In 30-releases."}), "Replied.");
+    let tola_toml = format!(
+        "version = 1\nid = \"tola\"\nname = \"Dr Tola Grey\"\nkind = \"steward\"\nmatrix_user = \"{tola}\"\n\n[model]\nbot = \"bot:openai:{}#stub\"\n\n[tools]\nallow = [\"drive_read\"]\ndrives = [\"smoke\"]\n",
+        tolas_model.url
+    );
+    let agentd = gate_host_with(
+        &smoke,
+        root.path(),
+        Some(&gates_model.url),
+        Extra {
+            github: "delegates = [\"tola\"]".to_owned(),
+            files: vec![
+                ("80-agents/tola/agent.toml".to_owned(), tola_toml),
+                ("80-agents/tola/SOUL.md".to_owned(), soul("Dr Tola Grey")),
+            ],
+            pin: Some(pin.clone()),
+            ..Extra::default()
+        },
+    )
+    .await;
+    agentd.ok(&["agents", "gate", "forge", "github"]);
+    let (folder, _, session) = agentd.session_of("github");
+    let room = session.room.clone();
+    let log = root.path().join("agentd.log");
+    let _host = agentd.start(&log);
+    agentd.wait_serving(&room, &log).await;
+    let stewards = steward_host(
+        &smoke,
+        root.path(),
+        &agentd.bare,
+        &tolas_model.url,
+        &pin,
+        &tola_password,
+    );
+    let tola_log = root.path().join("tola.log");
+    let _tolas = stewards.start(&tola_log);
+
+    let seen_by_person = common::record(&device);
+    device.join(&room).await.expect("the person joins");
+    let _person_sync = common::syncing(&device);
+    let peer = smoke
+        .client(
+            &root.path().join("peer"),
+            "nixi-paced",
+            smoke.secret("NIXI_PACED_PASSWORD"),
+        )
+        .await;
+    let seen = common::record(&peer);
+    peer.join(&room).await.expect("the peer joins");
+    peer.sync_once().await.expect("sync");
+    let _sync = common::syncing(&peer);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let asked = peer
+        .send(
+            &room,
+            "m.room.message",
+            json!({"msgtype": "m.text", "body": "where are the v1.2 notes?"}),
+            None,
+        )
+        .await
+        .expect("the request");
+    let (ticket, ticket_at) = gate_says(
+        &seen,
+        &gate,
+        asked.as_str(),
+        "ticket",
+        Duration::from_secs(30),
+    )
+    .await;
+    let asked_at = server_time(&seen, asked.as_str());
+    assert!(
+        ticket_at.saturating_sub(asked_at) <= 1_000,
+        "the ticket came {} ms after",
+        ticket_at - asked_at
+    );
+    let ticket_id = ticket[events::GATE]["ticket"]
+        .as_str()
+        .expect("its ticket")
+        .to_owned();
+
+    wait_for(
+        "no card reached the person",
+        Duration::from_secs(60),
+        || !cards_of(&seen_by_person, &gate).is_empty(),
+    )
+    .await;
+    let card = cards_of(&seen_by_person, &gate).remove(0);
+    let record = card["content"]["records"][0].clone();
+    assert_eq!(record["action"]["tool"], "delegate", "{card}");
+    assert_eq!(
+        record["action"]["exec_binding"]["ticket"],
+        ticket_id.as_str()
+    );
+    assert_eq!(record["approvers"], json!([person.as_str()]));
+    assert_eq!(record["scopes"], json!(["once"]));
+
+    // The outside system decides for itself: nothing moves.
+    peer.send(
+        &room,
+        events::APPROVAL_DECISION,
+        decision_on(&record, Decision::Approve),
+        None,
+    )
+    .await
+    .expect("the peer's decision is accepted by the server");
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    assert!(
+        !lines_of(&agentd)
+            .iter()
+            .any(|l| l["kind"] == "delegate" && l["body"]["state"] == "opened"),
+        "the peer's decision handed nothing on"
+    );
+
+    device
+        .send(
+            &room,
+            events::APPROVAL_DECISION,
+            decision_on(&record, Decision::Approve),
+            None,
+        )
+        .await
+        .expect("the person decides");
+    // Tola's reply carries her home's label — her prompt read the drive,
+    // whose readers are tgorka alone — so the callback's `reply` into a room
+    // the peer reads is blocked by the room's sink, and nothing of it
+    // reaches the peer; releasing it is a declassification (99.2 #3). The
+    // request ends refused.
+    let until = std::time::Instant::now() + Duration::from_secs(240);
+    while !seen.lock().expect("lock").iter().any(|(_, e)| {
+        e["sender"] == gate.as_str()
+            && e["content"][events::GATE]["request"] == asked.as_str()
+            && e["content"][events::GATE]["state"] == "refused"
+    }) {
+        assert!(
+            std::time::Instant::now() < until,
+            "the callback never ended within 240 s.\ngate's lines:\n{}\ngate's host:\n{}\ntola's lines:\n{}\ntola's host:\n{}",
+            told(&lines_of(&agentd)),
+            told_log(&log),
+            told(&lines_of(&stewards)),
+            told_log(&tola_log),
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    let lines = lines_of(&agentd);
+    let narrowed = lines
+        .iter()
+        .skip_while(|l| !(l["kind"] == "delegate" && l["body"]["state"] == "replied"))
+        .find(|l| l["kind"] == "label")
+        .expect("the reply's label joined the callback's");
+    assert_eq!(narrowed["body"]["readers"], json!([person.as_str()]));
+    let blocked = lines
+        .iter()
+        .skip_while(|l| !(l["kind"] == "delegate" && l["body"]["state"] == "replied"))
+        .find(|l| l["kind"] == "tool_result")
+        .expect("the callback's reply");
+    assert_eq!(blocked["body"]["outcome"], "refused", "{blocked}");
+
+    let lines = lines_of(&agentd);
+    let states: Vec<&str> = lines
+        .iter()
+        .filter(|l| l["kind"] == "delegate" && l["body"]["id"] == ticket_id.as_str())
+        .filter_map(|l| l["body"]["state"].as_str())
+        .collect();
+    assert_eq!(
+        states,
+        ["requested", "opened", "sent", "replied"],
+        "{lines:#?}"
+    );
+    let child = lines
+        .iter()
+        .find(|l| l["kind"] == "delegate" && l["body"]["state"] == "opened")
+        .and_then(|l| l["body"]["room"].as_str())
+        .expect("the delegation's room")
+        .to_owned();
+    // F5: the brief went after Tola's join.
+    let order: Vec<(String, String)> = timeline(&smoke, &child)
+        .await
+        .into_iter()
+        .map(|e| {
+            (
+                e["type"].as_str().unwrap_or("").to_owned(),
+                e["sender"].as_str().unwrap_or("").to_owned(),
+            )
+        })
+        .collect();
+    let joined_at = order
+        .iter()
+        .position(|(kind, sender)| kind == "m.room.member" && sender == tola.as_str())
+        .expect("Tola joined");
+    let brief_at = order
+        .iter()
+        .position(|(kind, sender)| kind == "m.room.encrypted" && sender == gate.as_str())
+        .expect("the brief");
+    assert!(
+        joined_at < brief_at,
+        "the brief waited for the join: {order:?}"
+    );
+    let tolas_session = stewards
+        .sessions()
+        .into_iter()
+        .find(|(_, _, agent)| agent.kind == SessionKind::Delegated)
+        .expect("Tola's session");
+    assert_eq!(tolas_session.2.requested_by, gate);
+    let folder = folder
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("its folder");
+    assert_eq!(
+        tolas_session
+            .2
+            .parent
+            .as_ref()
+            .map(|parent| parent.session.clone()),
+        Some(format!("active/{folder}"))
+    );
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let results = seen
+        .lock()
+        .expect("lock")
+        .iter()
+        .filter(|(_, e)| {
+            e["sender"] == gate.as_str() && e["content"][events::GATE]["state"] == "result"
+        })
+        .count();
+    assert_eq!(
+        results, 0,
+        "nothing narrower than the room reached the peer"
+    );
+
+    // A second request, denied.
+    let again = peer
+        .send(
+            &room,
+            "m.room.message",
+            json!({"msgtype": "m.text", "body": "tag v1.3"}),
+            None,
+        )
+        .await
+        .expect("the second request");
+    gate_says(
+        &seen,
+        &gate,
+        again.as_str(),
+        "ticket",
+        Duration::from_secs(30),
+    )
+    .await;
+    wait_for(
+        "the second ticket reached no card",
+        Duration::from_secs(60),
+        || cards_of(&seen_by_person, &gate).len() >= 2,
+    )
+    .await;
+    let edit = cards_of(&seen_by_person, &gate).remove(1);
+    let second = edit["content"]["m.new_content"]["records"][1].clone();
+    device
+        .send(
+            &room,
+            events::APPROVAL_DECISION,
+            decision_on(&second, Decision::Deny),
+            None,
+        )
+        .await
+        .expect("the person declines");
+    let (refused, _) = gate_says(
+        &seen,
+        &gate,
+        again.as_str(),
+        "refused",
+        Duration::from_secs(60),
+    )
+    .await;
+    assert_eq!(refused[events::GATE]["reason"], "denied");
+
+    let members: std::collections::BTreeSet<String> = admin_state(&smoke, &room)
+        .await
+        .into_iter()
+        .filter(|e| e["type"] == "m.room.member" && e["content"]["membership"] == "join")
+        .filter_map(|e| e["state_key"].as_str().map(str::to_owned))
+        .collect();
+    assert_eq!(
+        members,
+        [
+            gate.to_string(),
+            smoke.user("nixi-paced").to_string(),
+            person.to_string()
+        ]
+        .into(),
+    );
+}
+
+/// 99.1 #10 (S-23, codemap Q8): five tickets of one peer inside the hour
+/// make one card — one request event and four edits whose new content
+/// lists all five records, as the person's device receives them; two
+/// decisions consume exactly their two records. (The hour's end opening a
+/// new card is `gate_cards_coalesce_per_peer_per_window` in agent_turns,
+/// on a clock the test moves.)
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "live: Synapse on delectra"]
+async fn gate_cards_coalesce_per_peer_per_window() {
+    use keeper_core::agents::approval::Decision;
+    let smoke = Smoke::from_env();
+    let root = tempfile::tempdir().expect("tempdir");
+    let gate = smoke.user("nixi-smoke");
+    let tola = smoke.user("tola-smoke");
+    let (device, pin) = person_device(&smoke, &root.path().join("person")).await;
+    let hand = || json!({"agent": "smoke/tola", "brief": "Run the job."});
+    let gates_model = common::calls_at(
+        (0..5).map(|n| (2 * n + 1, "delegate", hand())).collect(),
+        "ok",
+    );
+    let agentd = gate_host_with(
+        &smoke,
+        root.path(),
+        Some(&gates_model.url),
+        Extra {
+            github: "delegates = [\"tola\"]".to_owned(),
+            forge: "\n[limits]\nmax_concurrent_sessions = 8\n".to_owned(),
+            files: vec![
+                (
+                    "80-agents/tola/agent.toml".to_owned(),
+                    format!("version = 1\nid = \"tola\"\nname = \"Dr Tola Grey\"\nkind = \"steward\"\nmatrix_user = \"{tola}\"\n\n[model]\nbot = \"{BOT}\"\n\n[tools]\nallow = [\"drive_read\"]\ndrives = [\"smoke\"]\n"),
+                ),
+                ("80-agents/tola/SOUL.md".to_owned(), soul("Dr Tola Grey")),
+            ],
+            pin: Some(pin),
+        },
+    )
+    .await;
+    agentd.ok(&["agents", "gate", "forge", "github"]);
+    let (_, _, session) = agentd.session_of("github");
+    let room = session.room.clone();
+    let log = root.path().join("agentd.log");
+    let _host = agentd.start(&log);
+    agentd.wait_serving(&room, &log).await;
+
+    let seen_by_person = common::record(&device);
+    device.join(&room).await.expect("the person joins");
+    let _person_sync = common::syncing(&device);
+    let peer = smoke
+        .client(
+            &root.path().join("peer"),
+            "nixi-paced",
+            smoke.secret("NIXI_PACED_PASSWORD"),
+        )
+        .await;
+    let seen = common::record(&peer);
+    peer.join(&room).await.expect("the peer joins");
+    peer.sync_once().await.expect("sync");
+    let _sync = common::syncing(&peer);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    for n in 1..=5 {
+        let asked = peer
+            .send(
+                &room,
+                "m.room.message",
+                json!({"msgtype": "m.text", "body": format!("job {n}")}),
+                None,
+            )
+            .await
+            .expect("a request");
+        gate_says(
+            &seen,
+            &gate,
+            asked.as_str(),
+            "ticket",
+            Duration::from_secs(30),
+        )
+        .await;
+        wait_for("a ticket reached no card", Duration::from_secs(60), || {
+            cards_of(&seen_by_person, &gate).len() >= n
+        })
+        .await;
+    }
+    let cards = cards_of(&seen_by_person, &gate);
+    assert_eq!(cards.len(), 5, "one request and four edits");
+    let original = cards[0]["event_id"].as_str().expect("its event");
+    assert!(cards[0]["content"]["m.relates_to"].is_null());
+    assert_eq!(
+        cards[0]["content"]["records"].as_array().map(Vec::len),
+        Some(1)
+    );
+    for (n, edit) in cards.iter().enumerate().skip(1) {
+        assert_eq!(edit["content"]["m.relates_to"]["rel_type"], "m.replace");
+        assert_eq!(edit["content"]["m.relates_to"]["event_id"], original);
+        let records = edit["content"]["m.new_content"]["records"]
+            .as_array()
+            .expect("records");
+        assert_eq!(records.len(), n + 1);
+        assert_eq!(
+            records[..n],
+            cards[n - 1]["content"]
+                .get("m.new_content")
+                .unwrap_or(&cards[n - 1]["content"])["records"]
+                .as_array()
+                .expect("the earlier list")[..]
+        );
+    }
+    let all = cards[4]["content"]["m.new_content"]["records"]
+        .as_array()
+        .expect("five")
+        .clone();
+    for record in &all[..2] {
+        device
+            .send(
+                &room,
+                events::APPROVAL_DECISION,
+                decision_on(record, Decision::Approve),
+                None,
+            )
+            .await
+            .expect("the person decides");
+    }
+    wait_for(
+        "two records were not consumed",
+        Duration::from_secs(60),
+        || {
+            lines_of(&agentd)
+                .iter()
+                .filter(|l| l["kind"] == "approval" && l["body"]["state"] == "consumed")
+                .count()
+                >= 2
+        },
+    )
+    .await;
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let consumed: Vec<String> = admin_state(&smoke, &room)
+        .await
+        .into_iter()
+        .filter(|e| e["type"] == events::APPROVAL_CONSUMED)
+        .filter_map(|e| e["state_key"].as_str().map(str::to_owned))
+        .collect();
+    let decided: std::collections::BTreeSet<String> = all[..2]
+        .iter()
+        .filter_map(|record| record["id"].as_str().map(str::to_owned))
+        .collect();
+    assert_eq!(
+        consumed
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>(),
+        decided
     );
 }

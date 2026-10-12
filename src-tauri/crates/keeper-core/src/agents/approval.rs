@@ -613,8 +613,12 @@ impl ApprovalRecord {
             label: parking.label.clone(),
             preconditions: parking.preconditions,
             // No host keeps a `session` allowance for an MCP tool: its
-            // approval is for the one call.
-            scopes: if classification.tool == AgentTool::Mcp {
+            // approval is for the one call; nor for a gate's delegation,
+            // a person's for each ticket (codemap Q7, S-23).
+            scopes: if classification.tool == AgentTool::Mcp
+                || (classification.tool == AgentTool::Delegate
+                    && parking.session_kind == SessionKind::Gate)
+            {
                 vec![Scope::Once]
             } else {
                 scopes(classification.tier, parking.session_kind)

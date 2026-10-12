@@ -3155,6 +3155,7 @@ mod tests {
                 zone: zone.to_owned(),
                 subfolder: "60-sessions".to_owned(),
                 chain: vec![user(PERSON)],
+                gate: None,
             };
             let offer = |_: &[String]| vec!["drive_read".to_owned()];
             let sinks = self.sinks(agent);

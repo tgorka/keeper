@@ -257,6 +257,10 @@ pub struct CallFacts {
     /// An input through a KVM that touches a security dialog, a password
     /// or a payment (96.5 #5): handed to the person.
     pub kvm_sensitive: bool,
+    /// A `delegate` from a gate session (codemap Q7): it hands an outside
+    /// system's request to an agent that can read a drive, so the raise
+    /// reaches it at T1 — a person decides each one (AD-416, 99.2 #2).
+    pub gate_send: bool,
 }
 
 /// The grant's answer for a drive verb, without its payload.
@@ -472,10 +476,12 @@ fn row(tool: AgentTool, facts: &CallFacts) -> Tier {
 
 /// Classify one call (AD-392, R171): its row, at least T2 when the grant
 /// asks (the higher wins), then raised once when it needs a person already
-/// and any reason holds — except the consolidator's host actions, whose
-/// person decides by construction: fixed T2 in every context (R128), their
-/// reasons still listed — and a KVM's power, media and firmware actions,
-/// whose base carries the KVM's raise (AD-409): counted once, never twice.
+/// — or is a gate's send ([`CallFacts::gate_send`]), which the raise reaches
+/// at T1 — and any reason holds — except the consolidator's host actions,
+/// whose person decides by construction: fixed T2 in every context (R128),
+/// their reasons still listed — and a KVM's power, media and firmware
+/// actions, whose base carries the KVM's raise (AD-409): counted once,
+/// never twice.
 pub fn classify(tool: AgentTool, facts: &CallFacts, context: &Context) -> Classification {
     let grant_floor = match context.grant {
         Some(GrantWord::Ask) => Tier::T2,
@@ -495,7 +501,8 @@ pub fn classify(tool: AgentTool, facts: &CallFacts, context: &Context) -> Classi
     .filter_map(|(holds, raise)| holds.then_some(raise))
     .collect();
     let fixed = matches!(tool, AgentTool::MemoryApply | AgentTool::SkillApply) || facts.kvm_base;
-    let tier = if !fixed && base_tier >= Tier::T2 && !raised_by.is_empty() {
+    let consequential = base_tier >= Tier::T2 || facts.gate_send;
+    let tier = if !fixed && consequential && !raised_by.is_empty() {
         base_tier.raised()
     } else {
         base_tier
@@ -1048,11 +1055,12 @@ mod tests {
         }
     }
 
-    /// 99.2 #2 (`reply`'s row), #7 (codemap Q7): in a gate session —
-    /// unattended and `untrusted` from its first line — `reply` is T1 and
-    /// runs without a person, both reasons named on its row; a reply that
-    /// quotes the request's words is the same call. Later rungs add the
-    /// gate's other rows.
+    /// 99.2 #2 (`reply`'s and `delegate`'s rows), #7 (codemap Q7): in a
+    /// gate session — unattended and `untrusted` from its first line —
+    /// `reply` is T1 and runs without a person, both reasons named on its
+    /// row; a reply that quotes the request's words is the same call. A
+    /// `delegate` there is T1 raised once to T2: a person decides it, and
+    /// the same call outside a gate runs.
     #[test]
     fn gate_tiers() {
         let text = include_str!(
@@ -1076,5 +1084,33 @@ mod tests {
             assert_eq!(reply.gate(), Gate::Run, "{text}");
             assert_eq!(reply.raised_by, vec![Raise::Unattended, Raise::Untrusted]);
         }
+        let delegate = |gate_send| {
+            let facts = CallFacts {
+                gate_send,
+                ..named_facts(
+                    AgentTool::Delegate,
+                    &serde_json::json!({ "agent": "tola", "brief": "ship it" }),
+                    CallFacts::default(),
+                )
+            };
+            classify(AgentTool::Delegate, &facts, &context)
+        };
+        let handed = delegate(true);
+        assert_eq!((handed.base_tier, handed.tier), (Tier::T1, Tier::T2));
+        assert_eq!(handed.gate(), Gate::Person);
+        assert_eq!(handed.raised_by, vec![Raise::Unattended, Raise::Untrusted]);
+        let elsewhere = delegate(false);
+        assert_eq!(elsewhere.tier, Tier::T1);
+        assert_eq!(elsewhere.gate(), Gate::Run);
+        // The fact alone raises nothing: watched and trusted, it is the T1
+        // call it always was.
+        let facts = CallFacts {
+            gate_send: true,
+            ..CallFacts::default()
+        };
+        assert_eq!(
+            classify(AgentTool::Delegate, &facts, &attended()).tier,
+            Tier::T1
+        );
     }
 }

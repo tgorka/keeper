@@ -334,6 +334,84 @@ pub struct Delegator {
     pub subfolder: String,
     /// The delegating session's dispatch chain (R76).
     pub chain: Vec<OwnedUserId>,
+    /// A gate session's: who it may hand work to and who decides it
+    /// (codemap Q2, Q12); `None` in every other session.
+    pub gate: Option<GateDelegator>,
+}
+
+/// What a gate session's `delegate` is held to (codemap Q2, Q4, Q12).
+#[derive(Debug, Clone)]
+pub struct GateDelegator {
+    /// Its `[gate].delegates`, `<drive>/<id>`: the only agents a ticket
+    /// can reach.
+    pub delegates: Vec<String>,
+    /// The people who decide its tickets, invited to every room it
+    /// delegates into as observers, whatever the label's readers.
+    pub approvers: Vec<OwnedUserId>,
+    /// Its room was made in clear: no device draws a card there.
+    pub clear: bool,
+}
+
+/// What a gate's `delegate` that would open a second round says.
+pub const GATE_ONE_ROUND: &str =
+    "A gate hands each request on once, as a new delegation: it does not send another round.";
+/// What a gate's `delegate` handing on a card says.
+pub const GATE_NO_SOURCE: &str = "A gate hands on the request it serves, never a card.";
+/// What a gate's `delegate` whose card sets a schedule or a workflow says
+/// (codemap Q7: refused outright, never asked).
+pub const GATE_NO_SCHEDULE: &str =
+    "A gate's delegation never sets a schedule or a workflow. Nothing was handed on.";
+/// What a gate's `delegate` in a clear room says: a card there reaches no
+/// device, so nobody could decide it.
+pub const GATE_CLEAR: &str = "This gate's room is not encrypted, so nobody can be asked to approve a hand-off there. Nothing was handed on.";
+/// What a gate's `delegate` that would run unasked says: never.
+pub const GATE_UNASKED: &str =
+    "A gate's delegation waits for a person's decision; this one could not ask, so nothing was handed on.";
+
+/// What a gate's `delegate` to an agent its `[gate].delegates` does not
+/// list says (99.2 #4): blocked, never asked.
+pub fn not_a_delegate(name: &str) -> String {
+    format!("{name} is not one of this gate's delegates, so nothing was handed on. A gate hands work only to the agents its [[gate]] lists.")
+}
+
+/// Who a gate's delegation room invites (codemap Q2): its target, then the
+/// gate's approvers as observers.
+pub fn gate_invites(target: &UserId, approvers: &[OwnedUserId]) -> Vec<OwnedUserId> {
+    let mut invites = vec![target.to_owned()];
+    invites.extend(approvers.iter().filter(|person| *person != target).cloned());
+    invites
+}
+
+/// The agent a `delegate` call's `args` names, as written.
+pub fn agent_of(args: &str) -> Option<String> {
+    parse_args(args).ok().map(|args| args.agent)
+}
+
+/// Why a gate's `delegate` call `args` is refused before anything else is
+/// asked, if it is: a next round, a card handed on, a card that schedules,
+/// no request served, or a clear room.
+fn gate_refusal(
+    args: &DelegateArgs,
+    gate: &GateDelegator,
+    serving: Option<&crate::gate::Serving>,
+) -> Option<String> {
+    let schedules = args
+        .card
+        .as_ref()
+        .is_some_and(|card| card.schedule.is_some() || card.workflow.is_some());
+    if args.session.is_some() {
+        Some(GATE_ONE_ROUND.to_owned())
+    } else if args.source.is_some() {
+        Some(GATE_NO_SOURCE.to_owned())
+    } else if schedules {
+        Some(GATE_NO_SCHEDULE.to_owned())
+    } else if serving.is_none() {
+        Some(crate::gate::NO_SUCH_REQUEST.to_owned())
+    } else if gate.clear {
+        Some(GATE_CLEAR.to_owned())
+    } else {
+        None
+    }
 }
 
 /// What a running turn's tools read of its session: the label now, which a
@@ -871,6 +949,7 @@ impl<'t> DelegateTools<'t> {
             reason: Some(reason.clone()),
             reply: None,
             window: None,
+            approval: None,
         }));
         refused(reason)
     }
@@ -1009,6 +1088,14 @@ impl<'t> DelegateTools<'t> {
         let Some(port) = self.port.clone() else {
             return refused(NO_ROOMS);
         };
+        // A gate hands its request on once, to a listed agent, when a person
+        // decides (codemap Q4, Q7): what it may never do is refused first.
+        let gate = self.from.gate.as_ref();
+        if let Some(refusal) =
+            gate.and_then(|gate| gate_refusal(&args, gate, self.serving.as_ref()))
+        {
+            return refused(refusal);
+        }
         if let Some(id) = &args.session {
             return self.next_round(port.as_ref(), id, &args.agent, &args.brief, audit);
         }
@@ -1065,6 +1152,11 @@ impl<'t> DelegateTools<'t> {
                 "An agent does not delegate to itself.".to_owned(),
             );
         }
+        if let Some(gate) = gate {
+            if !keeper_core::agents::gate::selects(&gate.delegates, &target.drive, &target.id) {
+                return self.refuse(&id, &to, None, not_a_delegate(args.agent.trim()));
+            }
+        }
         if let Err(bound) = Limits::of(&self.from.limits).check(self.from.hop, 0, 0) {
             return self.refuse(&id, &to, None, bound.sentence());
         }
@@ -1073,9 +1165,13 @@ impl<'t> DelegateTools<'t> {
             Ok(content) => content,
             Err(sentence) => return self.refuse(&id, &to, None, sentence),
         };
-        // The room's observers are the session's readers; a declassified
-        // brief's wider readers read it through the target's own sessions.
-        let invites = room_invites(&target.matrix_user, &self.from.user, &label);
+        // The room's observers are the session's readers — a gate's are its
+        // approvers (codemap Q2), never its peer; a declassified brief's
+        // wider readers read it through the target's own sessions.
+        let invites = match gate {
+            Some(gate) => gate_invites(&target.matrix_user, &gate.approvers),
+            None => room_invites(&target.matrix_user, &self.from.user, &label),
+        };
         let members = observers(&invites, &target.matrix_user);
         let effect = brief_effect(&content);
         let destination = Destination::Agent {
@@ -1112,6 +1208,9 @@ impl<'t> DelegateTools<'t> {
                 }
             }
         }
+        if let (Some(gate), Some(serving)) = (gate, self.serving.as_ref()) {
+            return self.hand_on(audit, serving, gate, &id, &to, target);
+        }
         // The label's say first, then the integrity rule's and the tier's: a
         // card with a schedule or a workflow is a person's to allow (S-21,
         // T3).
@@ -1145,6 +1244,7 @@ impl<'t> DelegateTools<'t> {
             reason: None,
             reply: None,
             window: None,
+            approval: None,
         }));
         // The card it hands on says so, and is not handed on again; another
         // session's card is that session's to write.
@@ -1164,6 +1264,64 @@ impl<'t> DelegateTools<'t> {
             text: format!(
                 "Handed to {} as delegation {id}; waiting for it to join. Its reply will come to this session. To say more in this exchange, call delegate with session = {id}.",
                 target.name
+            ),
+        })
+    }
+
+    /// A gate's delegation, its sinks passed (codemap Q4, Q13): no room is
+    /// made and nothing is sent. The audit answers first (R371): what it
+    /// refuses — the integrity rule, T5, a row that cannot be written —
+    /// pays no ticket and says none. Then the request's ticket — paid and
+    /// said now when a sync request has none yet — becomes the delegation's
+    /// id, and the call's audit row waits, pending, for its approval (a
+    /// ticket that cannot be had closes it refused); its `delegate
+    /// requested` line names the approval record the host writes once the
+    /// turn ends, onto the hour's card. The turn goes on: it ends normally,
+    /// and the request waits for its ticket's result.
+    fn hand_on(
+        &self,
+        audit: &CallAudit<'_>,
+        serving: &crate::gate::Serving,
+        gate: &GateDelegator,
+        id: &str,
+        to: &str,
+        target: &KnownAgent,
+    ) -> Option<ToolOutcome> {
+        let approval = match audit.admit(&target.drive, to) {
+            Err(Withheld::Parked(approval)) => approval,
+            Err(Withheld::Refused(reason)) => return self.refuse(id, to, None, reason),
+            // Never handed on unasked (AD-416).
+            Ok(()) => return self.refuse(id, to, None, GATE_UNASKED.to_owned()),
+        };
+        let ticket = match block_on(serving.desk.ticket_for(&serving.request)) {
+            Ok(ticket) => ticket,
+            Err(sentence) => {
+                audit.unpark();
+                return self.refuse(id, to, None, sentence);
+            }
+        };
+        block_on(serving.desk.hand_on(&serving.request));
+        self.line(LineBody::Delegate(DelegateBody {
+            id: ticket.clone(),
+            to: to.to_owned(),
+            room: None,
+            child: None,
+            state: DelegateState::Requested,
+            reason: None,
+            reply: None,
+            window: None,
+            approval: Some(approval.to_string()),
+        }));
+        let approvers = gate
+            .approvers
+            .iter()
+            .map(|person| person.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        Some(ToolOutcome::Answered {
+            text: format!(
+                "Ticket {ticket} for {}: handing it to {} waits for a person's decision ({approvers}). Its reply comes back here, and you answer the request then; say nothing more about it now.",
+                serving.request, target.name
             ),
         })
     }
@@ -1283,6 +1441,7 @@ impl<'t> DelegateTools<'t> {
             reason: None,
             reply: None,
             window: None,
+            approval: None,
         }));
         Some(ToolOutcome::Answered {
             text: format!("Sent to {to}."),
@@ -1430,6 +1589,7 @@ impl<'t> DelegateTools<'t> {
             reason: None,
             reply: None,
             window: None,
+            approval: None,
         }));
         // A workflow's run ends here, whatever becomes of its card: the line
         // is the log's own word (R202).

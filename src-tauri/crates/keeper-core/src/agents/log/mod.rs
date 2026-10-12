@@ -484,14 +484,16 @@ pub struct ChildSession {
     pub session: String,
 }
 
-/// Where a delegation stands: `opened` when the room is made, `sent` when
-/// the brief went in after the target joined (each round after is another
-/// `sent`), `accepted` in the child once its host created it, `replied` when
-/// the target replied (in the child, when its `reply` went out), `refused`
-/// when a call or a send was refused.
+/// Where a delegation stands: `requested` when a gate's ticket asks a
+/// person for it (codemap Q4) — no room yet — `opened` when the room is
+/// made, `sent` when the brief went in after the target joined (each round
+/// after is another `sent`), `accepted` in the child once its host created
+/// it, `replied` when the target replied (in the child, when its `reply`
+/// went out), `refused` when a call or a send was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DelegateState {
+    Requested,
     Opened,
     Sent,
     Accepted,
@@ -522,6 +524,10 @@ pub struct DelegateBody {
     /// still names this window (the epic's Q5).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window: Option<CardWindow>,
+    /// On a gate's `requested`: the approval record the delegation waits
+    /// for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval: Option<String>,
 }
 
 /// The scheduled card, and the window of it, a workflow's run was opened
@@ -824,6 +830,12 @@ pub enum GateReason {
     NoAnswer,
     /// The host stopped while the request's turn ran.
     Interrupted,
+    /// A person declined the ticket's delegation (codemap Q4).
+    Denied,
+    /// Nobody decided the ticket's delegation before its approval expired.
+    Expired,
+    /// The ticket's delegation was approved, but could not be handed on.
+    Failed,
 }
 
 impl GateReason {
@@ -834,6 +846,9 @@ impl GateReason {
             Self::Mode => "mode",
             Self::NoAnswer => "no_answer",
             Self::Interrupted => "interrupted",
+            Self::Denied => "denied",
+            Self::Expired => "expired",
+            Self::Failed => "failed",
         }
     }
 }
@@ -1346,6 +1361,7 @@ mod tests {
                     completion: Some("paseo-ended-01J".into()),
                 }),
                 window: None,
+                approval: None,
             }),
             LineBody::Ask(AskBody {
                 id: "01J".into(),

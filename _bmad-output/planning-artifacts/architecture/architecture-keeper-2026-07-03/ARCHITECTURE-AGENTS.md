@@ -1388,6 +1388,14 @@ notification-extension budget for the anchor's latest edit before showing the te
 > `m.reference` to its request; the deadline is kept by the host where the request arrives, on the
 > homeserver's clock, and a late `reply` is the ticket's `result`; a gate session runs on
 > always-on hosts only; MCP polling is not built (codemap Q15).
+>
+> As built (rung `agents-99-tickets`, rulings R371, R372): a gate's `delegate` is a deferred
+> hand-off — no room and no park in its turn; the request's ticket (= the delegation's id) waits on
+> an approval record a person decides on the hour's card (one `approval.request` `{v, records}` per
+> hour, later tickets added by `m.replace`, 32 KiB at most) in the gate room; its approvers are the
+> drive's pinned readers with a pinned key; the target must be listed in `[gate].delegates` by
+> identity; once consumed the host opens the delegation (target + approvers invited, the brief after
+> the join), and the reply comes back as one turn on that request whose `reply` is the `result`.
 
 ### AD-416 — Whatever enters through a gate is untrusted, and nothing consequential happens on it without a trusted decision
 - **Binds:** FR-822; Epic 99 (99.2)

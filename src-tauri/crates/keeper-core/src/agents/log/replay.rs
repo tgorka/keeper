@@ -106,9 +106,15 @@ pub fn message_for(line: &LogLine) -> Option<ChatMessage> {
             Role::System,
             format!("{COMPACT_HEADING}\n\n{}", body.summary),
         )),
-        LineBody::Gate(body) => request_text(body).map(|text| ChatMessage::text(Role::User, text)),
+        LineBody::Gate(body) => request_message(body),
         _ => None,
     }
+}
+
+/// The message a gate's `request` line is to its turn — the request's
+/// own, and its ticket's callback, which reads it again (codemap Q5).
+pub fn request_message(body: &GateBody) -> Option<ChatMessage> {
+    request_text(body).map(|text| ChatMessage::text(Role::User, text))
 }
 
 /// A gate's request as its turn reads it: under

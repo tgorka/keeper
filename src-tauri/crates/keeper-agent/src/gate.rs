@@ -67,6 +67,14 @@ pub const ANSWERED_ALREADY: &str =
     "This request has had its answer, or was refused; nothing was sent.";
 /// What a `reply` the homeserver did not take says.
 pub const UNSENT: &str = "The answer could not be sent to the room; try reply again.";
+/// What a second `delegate` for one request says.
+pub const ONE_DELEGATION: &str =
+    "This request's ticket is handed on already: one request goes to one agent.";
+/// What a `delegate` whose ticket could not be paid says.
+pub const NO_TICKET: &str =
+    "This gate is busy: no ticket could be paid for this request now, so nothing was handed on.";
+/// What a `reply` after `delegate` in the same turn says.
+pub const HANDED_ON: &str = "This request is handed on: its answer comes back as its ticket's result once the agent it goes to replies. Nothing was sent.";
 
 /// What became of a request as it was taken.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,6 +119,19 @@ enum State {
     Done,
 }
 
+/// Where a ticket's delegation stands on the desk (codemap Q4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Handed {
+    /// No delegation.
+    No,
+    /// Its delegation waits for a person, or runs: the turn that asked
+    /// for it neither answers nor ends it.
+    Asked,
+    /// Its delegation replied: this is its callback, whose `reply` is the
+    /// ticket's result.
+    Back,
+}
+
 #[derive(Debug)]
 struct Entry {
     request: String,
@@ -118,6 +139,7 @@ struct Entry {
     deadline_ms: Option<u32>,
     state: State,
     ticket: Option<String>,
+    handed: Handed,
 }
 
 #[derive(Debug)]
@@ -284,6 +306,7 @@ impl Desk {
                 deadline_ms: request.deadline_ms,
                 state,
                 ticket,
+                handed: Handed::No,
             }))
         };
         let took = match book.ledger.admit(&request) {
@@ -440,6 +463,7 @@ impl Desk {
                 reason: None,
                 text: None,
             },
+            State::Ticketed if entry.handed == Handed::Asked => return Err(HANDED_ON.to_owned()),
             State::Ticketed => GateBody {
                 request: entry.request.clone(),
                 state: GateState::Result,
@@ -477,15 +501,18 @@ impl Desk {
     }
 
     /// `request`'s turn ended (Q6): a request it neither answered nor gave
-    /// a result is refused `no_answer`, its ticket with it. The lines still
-    /// to write of it, in order.
+    /// a result is refused `no_answer`, its ticket with it — unless its
+    /// ticket was handed on (Q4): that one waits for its delegation. The
+    /// lines still to write of it, in order.
     pub async fn finish(&self, request: &str) -> Vec<Fact> {
         let Some(held) = self.book().live.remove(request) else {
             return self.facts_of(request);
         };
         let mut entry = held.lock().await;
         let mut lines = self.facts_of(request);
-        if entry.state == State::Done {
+        if entry.state == State::Done
+            || (entry.state == State::Ticketed && entry.handed == Handed::Asked)
+        {
             return lines;
         }
         entry.state = State::Done;
@@ -518,6 +545,69 @@ impl Desk {
         let sent = self.say(&line, event, true).await;
         self.close(request);
         (line, sent)
+    }
+
+    /// The ticket `request`'s delegation goes under (codemap Q4, Q13): its
+    /// ticket — paid now and said in the room when a sync request has none
+    /// yet, its work going on as async; the ticket's line waits on the desk
+    /// as a deadline's does. `Err` why it cannot be handed on: answered or
+    /// refused already, handed on already, or no ticket to be had.
+    pub async fn ticket_for(&self, request: &str) -> Result<String, String> {
+        let held = self
+            .book()
+            .live
+            .get(request)
+            .cloned()
+            .ok_or_else(|| NO_SUCH_REQUEST.to_owned())?;
+        let mut entry = held.lock().await;
+        match (entry.state, entry.handed, entry.ticket.clone()) {
+            (State::Done, ..) => Err(ANSWERED_ALREADY.to_owned()),
+            (State::Ticketed, Handed::No, Some(ticket)) => Ok(ticket),
+            (State::Ticketed, ..) => Err(ONE_DELEGATION.to_owned()),
+            (State::Waiting, ..) => {
+                let now = self.clock.now();
+                let paid = {
+                    let mut book = self.book();
+                    self.pay_ticket(&mut book, &entry.request, now)
+                };
+                if !paid {
+                    return Err(NO_TICKET.to_owned());
+                }
+                let ticket = Ulid::new().to_string();
+                entry.ticket = Some(ticket.clone());
+                entry.state = State::Ticketed;
+                let line = ticket_line(&entry.request, &ticket, entry.deadline_ms, now);
+                let event = self.say(&line, &entry.event, true).await;
+                self.book().facts.push(Fact { line, event });
+                Ok(ticket)
+            }
+        }
+    }
+
+    /// `request`'s ticket is handed on (Q4): its turn no longer answers it,
+    /// and its end refuses nothing.
+    pub async fn hand_on(&self, request: &str) {
+        let held = self.book().live.get(request).cloned();
+        if let Some(held) = held {
+            held.lock().await.handed = Handed::Asked;
+        }
+    }
+
+    /// `request`, whose event is `event`, is open again under `ticket` for
+    /// its delegation's callback (Q5): its `reply` is the ticket's result,
+    /// and it hands nothing on again.
+    pub fn call_back(&self, request: &str, event: OwnedEventId, ticket: String) {
+        let entry = Entry {
+            request: request.to_owned(),
+            event,
+            deadline_ms: None,
+            state: State::Ticketed,
+            ticket: Some(ticket),
+            handed: Handed::Back,
+        };
+        self.book()
+            .live
+            .insert(request.to_owned(), Arc::new(Held::new(entry)));
     }
 
     /// The steps said by the timer since the last drain, oldest first.

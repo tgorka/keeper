@@ -122,6 +122,9 @@ struct Room {
     limited: Mutex<Option<Vec<&'static str>>>,
     /// As `limited`, for its next approval request only.
     limited_request: Mutex<Option<Vec<&'static str>>>,
+    /// Its next approval request is asked to wait, and meanwhile its
+    /// members stop being readable.
+    unread_on_request: std::sync::atomic::AtomicBool,
     /// An approvals folder whose records are counted when a request is
     /// sent: what was on disk before the room heard of it.
     witness: Mutex<Option<PathBuf>>,
@@ -179,6 +182,14 @@ impl EditPort for Room {
                         retry_after_ms: Some(1),
                     });
                 }
+            }
+            if event_type == keeper_core::agents::events::APPROVAL_REQUEST
+                && self.unread_on_request.swap(false, Ordering::SeqCst)
+            {
+                self.unread.store(true, Ordering::SeqCst);
+                return Err(keeper_core::agents::matrix::AgentMatrixError::RateLimited {
+                    retry_after_ms: Some(1),
+                });
             }
             if let Some(members) = self.limited.lock().expect("lock").take() {
                 self.set_members(&members);
@@ -5812,6 +5823,7 @@ async fn a_reply_whose_peer_line_was_lost_is_restored_from_its_receipt() {
                         completion: None,
                     }),
                     window: None,
+                    approval: None,
                 }),
             )
             .expect("the receipt");
@@ -13822,8 +13834,8 @@ mod parks {
         }
 
         /// Codemap Q1 (99.2 #2's ceiling), R369: a gate's dispatch mirrors
-        /// its offer. Whatever its model names besides `reply` — `delegate`
-        /// to an agent the request named, a drive read, a sandboxed run, an
+        /// its offer. Whatever its model names besides `reply` and
+        /// `delegate` — a drive read, a sandboxed run, an
         /// ask while someone could answer it, its journal (in its `allow`)
         /// and a tool of an MCP server its `[tools].mcp` names on a host
         /// that runs it — is refused as not offered, and nothing runs: no
@@ -13892,7 +13904,10 @@ mod parks {
             );
             let lines = world.lines(GATE_SESSION);
             let results = tool_results(&lines);
-            for call in ["d1", "r1", "x1", "a1", "j1", "m1"] {
+            // `delegate` is offered (R371); the agent a request named is no
+            // delegate of this gate, so nothing is handed on.
+            assert_eq!(result_of(&results, "d1").outcome, ToolOutcomeWord::Refused);
+            for call in ["r1", "x1", "a1", "j1", "m1"] {
                 let result = result_of(&results, call);
                 assert_eq!(result.outcome, ToolOutcomeWord::Refused, "{call}");
                 assert!(
@@ -20906,6 +20921,775 @@ mod parks {
             }
         }
     }
+
+    // -----------------------------------------------------------------------
+    // A gate's tickets (story 99.1 #4, #10; 99.2 #2, #4; rung agents-99-tickets)
+    // -----------------------------------------------------------------------
+
+    use keeper_core::agents::approval::Scope;
+    use keeper_core::agents::events::request_records;
+    use keeper_core::agents::log::{GateReason, GateState};
+
+    /// The `[[gate]]` of the gate world with tickets: Dr Tola Grey its one
+    /// delegate.
+    const TICKET_GATE: &str = "modes = [\"sync\", \"async\"]\ndelegates = [\"tola\"]";
+    const TICKET_LIMITS: &str = "max_concurrent_sessions = 4\ntokens_per_delegation = 4000";
+
+    /// The gate world with tickets: forge's `[[gate]]` lists Dr Tola Grey as
+    /// its one delegate; tgorka and Marta, readers of tgdrive with pinned
+    /// keys, decide; its delegations go through `rooms`, made as forge.
+    fn ticket_world(
+        script: Vec<Completion>,
+    ) -> (World, Arc<Approvals>, Arc<Delegations>, ServedSession) {
+        tickets_in(gate_world(TICKET_GATE, TICKET_LIMITS, script))
+    }
+
+    /// [`ticket_world`] over the gate world `world`.
+    fn tickets_in(mut world: World) -> (World, Arc<Approvals>, Arc<Delegations>, ServedSession) {
+        world.deps.decisions = Some(Admit::pinned());
+        let approvals = Arc::new(Approvals::default());
+        let rooms = Delegations::over(known(&[TGORKA]));
+        *rooms.as_user.lock().expect("lock") = Some(user(FORGE));
+        let mut served = world.open(GATE_SESSION);
+        served.approval_room = Some(Arc::clone(&approvals) as Arc<dyn ApprovalRoom>);
+        served.delegations = Some(Arc::clone(&rooms) as Arc<dyn DelegationPort>);
+        (world, approvals, rooms, served)
+    }
+
+    fn handing_to_tola(id: &str, brief: &str) -> Completion {
+        delegate_call(id, json!({"agent": "tola", "brief": brief}))
+    }
+
+    /// The gate's messages in its room, each one's gate key.
+    fn gate_keys(world: &World) -> Vec<Value> {
+        world
+            .sent_of("m.room.message")
+            .into_iter()
+            .map(|content| content[keeper_core::agents::events::GATE].clone())
+            .collect()
+    }
+
+    /// The approval record `id` of the gate session, read strictly.
+    fn gate_record(world: &World, id: &str) -> ApprovalRecord {
+        parse_record(
+            &std::fs::read_to_string(
+                world
+                    .dir(GATE_SESSION)
+                    .join("approvals")
+                    .join(format!("{id}.json")),
+            )
+            .expect("the record"),
+        )
+        .expect("a strict record")
+    }
+
+    /// The `delegate requested` lines of the gate session: (ticket, approval).
+    fn requested(world: &World) -> Vec<(String, String)> {
+        delegate_lines(&world.lines(GATE_SESSION))
+            .into_iter()
+            .filter(|body| body.state == DelegateState::Requested)
+            .map(|body| (body.id, body.approval.expect("its approval")))
+            .collect()
+    }
+
+    /// 99.1 #4, 99.2 #2 (codemap Q2, Q4, Q5, Q7, Q13): an async request is
+    /// ticketed at once; the gate's `delegate` makes no room and parks
+    /// nothing — its record (T1 raised to T2, `once` only, bound to the
+    /// ticket and the request, the chain headed by the drive's owner) goes
+    /// on the hour's card in the gate's room for the approvers. The peer's
+    /// decision changes nothing; tgorka's approval hands it on as 92.1 does
+    /// — the room inviting Tola and the approvers, never the peer — the
+    /// brief going only after Tola joined, under the ticket's id and with the
+    /// gate's `tokens_per_delegation`; Tola's reply is the ticket's one
+    /// `result`, and a redelivered reply adds none.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn gate_delegate_needs_a_person() {
+        let (mut world, approvals, rooms, mut served) = ticket_world(vec![
+            calls(&[
+                (
+                    "d1",
+                    "delegate",
+                    json!({"agent": "tola", "brief": "Find the release notes of v1.2."}),
+                ),
+                ("r0", "reply", json!({"text": "Working on it."})),
+            ]),
+            prose("Handed on."),
+            calls(&[(
+                "c1",
+                "reply",
+                json!({"text": "The notes of v1.2 are in 30-releases."}),
+            )]),
+            prose("done."),
+        ]);
+        let asked = request(1, "where are the release notes of v1.2?", None);
+        assert_eq!(
+            gated(world.serve(&mut served, asked).await),
+            GateState::Ticket
+        );
+        assert!(rooms.made().is_empty(), "nothing is handed on unasked");
+        let results = tool_results(&world.lines(GATE_SESSION));
+        assert_eq!(
+            result_of(&results, "r0").content,
+            format!("Refused: {}", keeper_agent::gate::HANDED_ON),
+            "a request handed on is answered by its ticket's result alone"
+        );
+        let [(ticket, approval)]: [(String, String); 1] =
+            requested(&world).try_into().expect("one ticket handed on");
+        let said = gate_keys(&world);
+        assert_eq!(said.len(), 1);
+        assert_eq!(said[0]["state"], "ticket");
+        assert_eq!(
+            said[0]["ticket"],
+            ticket.as_str(),
+            "the ticket is the delegation"
+        );
+        let record = gate_record(&world, &approval);
+        assert_eq!((record.risk.base_tier, record.risk.tier), (1, 2));
+        assert_eq!(record.scopes, vec![Scope::Once]);
+        assert_eq!(record.action.tool, "delegate");
+        assert_eq!(record.action.exec_binding["ticket"], ticket.as_str());
+        assert_eq!(record.action.exec_binding["request"], "$g1:example.org");
+        assert_eq!(
+            record.dispatch_chain,
+            vec![TGORKA.to_owned(), FORGE.to_owned()]
+        );
+        let cards = world.sent_of(APPROVAL_REQUEST);
+        assert_eq!(cards.len(), 1, "the hour's card");
+        let listed = request_records(&cards[0]).expect("a coalesced card");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, approval);
+        assert_eq!(
+            listed[0].approvers,
+            vec![MARTA.to_owned(), TGORKA.to_owned()]
+        );
+        assert!(
+            listed[0].session.ends_with(GATE_SESSION),
+            "it names the gate"
+        );
+
+        // The outside system's decision is no person's.
+        let content = decision_content(&record, Decision::Approve, None);
+        let peers = world.decision_from(PEER, "GITHUB", content);
+        world.serve(&mut served, peers).await;
+        assert!(rooms.made().is_empty());
+        assert!(approvals.events().is_empty());
+
+        let approve = world.decision(&record, Decision::Approve);
+        world.serve(&mut served, approve).await;
+        assert_eq!(approvals.events().len(), 1, "consumed once");
+        let made = rooms.made();
+        assert_eq!(made.len(), 1);
+        assert_eq!(made[0].1, vec![user(TOLA), user(MARTA), user(TGORKA)]);
+        assert!(rooms.sent().is_empty(), "the brief waits for the join");
+        let child = made[0].3.clone();
+
+        let joined = world.joined(&child);
+        world.serve(&mut served, joined).await;
+        let sent = rooms.sent();
+        assert_eq!(sent.len(), 1);
+        let brief = &sent[0].1[keeper_core::agents::events::DELEGATE];
+        assert_eq!(brief["id"], ticket.as_str());
+        assert_eq!(brief["from"]["agent"], FORGE);
+        assert_eq!(brief["limits"]["tokens"], 4000);
+
+        let label = served.context.agent.label.clone();
+        let reply = world.reply(
+            &child,
+            &keeper_agent::delegate::reply_content("v1.2: 30-releases.", Vec::new(), &label),
+        );
+        assert_eq!(
+            gated(world.serve(&mut served, reply.clone()).await),
+            GateState::Result
+        );
+        assert!(matches!(
+            world.serve(&mut served, reply).await,
+            Outcome::Duplicate
+        ));
+        // The callback read its own request and the reply, nothing of the
+        // turn that handed it on.
+        let requests = world.stub.requests();
+        let callback = requests.last().expect("the callback's request").to_string();
+        assert!(callback.contains("where are the release notes of v1.2?"));
+        assert!(callback.contains("v1.2: 30-releases."));
+        assert!(!callback.contains("Working on it."), "{callback}");
+        let said = gate_keys(&world);
+        let results: Vec<&Value> = said.iter().filter(|key| key["state"] == "result").collect();
+        assert_eq!(results.len(), 1, "{said:?}");
+        assert_eq!(results[0]["ticket"], ticket.as_str());
+        assert_eq!(
+            gate_states(&world.lines(GATE_SESSION)),
+            vec![GateState::Request, GateState::Ticket, GateState::Result]
+        );
+    }
+
+    /// 99.1 #4 (codemap Q4): a denied ticket is refused `denied` against its
+    /// ticket and nothing is handed on; one nobody decides waits across a
+    /// restart — it was no turn the stop cut — and, its time past, is
+    /// refused `expired`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_gate_ticket_denied_or_expired_is_refused() {
+        let (mut world, _approvals, rooms, mut served) = ticket_world(vec![
+            handing_to_tola("d1", "Tag v1.2."),
+            prose("Handed on."),
+            handing_to_tola("d2", "Tag v1.3."),
+            prose("Handed on."),
+        ]);
+        let first = request(1, "tag v1.2", None);
+        world.serve(&mut served, first).await;
+        let second = request(2, "tag v1.3", None);
+        world.serve(&mut served, second).await;
+        let tickets = requested(&world);
+        assert_eq!(tickets.len(), 2);
+        let denied = gate_record(&world, &tickets[0].1);
+        let deny = world.decision(&denied, Decision::Deny);
+        world.serve(&mut served, deny).await;
+        let refused = gate_keys(&world)
+            .into_iter()
+            .find(|key| key["state"] == "refused")
+            .expect("refused");
+        assert_eq!(refused["reason"], GateReason::Denied.as_str());
+        assert_eq!(refused["ticket"], tickets[0].0.as_str());
+
+        // The host stops; the second ticket's record has had its time.
+        let mut waiting = gate_record(&world, &tickets[1].1);
+        waiting.expires_at = "2026-01-01T00:00:00Z".to_owned();
+        std::fs::write(
+            world
+                .dir(GATE_SESSION)
+                .join("approvals")
+                .join(format!("{}.json", waiting.id)),
+            serde_json::to_string(&waiting).expect("json"),
+        )
+        .expect("rewrite");
+        let mut again = world.open(GATE_SESSION);
+        again.approval_room = Some(Arc::new(Approvals::default()) as Arc<dyn ApprovalRoom>);
+        again.delegations = Some(Arc::clone(&rooms) as Arc<dyn DelegationPort>);
+        let port = Arc::clone(&world.room) as Arc<dyn EditPort>;
+        again
+            .recover(&world.deps, Arc::clone(&port), &Trail::default())
+            .await
+            .expect("recovered");
+        assert_eq!(
+            gate_keys(&world)
+                .iter()
+                .filter(|key| key["state"] == "refused")
+                .count(),
+            1,
+            "a ticket waiting for a person was no turn a stop cut"
+        );
+        let (_stop, signal) = chat::cancellation();
+        again.resume_approvals(&world.deps, port, signal).await;
+        let expired = gate_keys(&world)
+            .into_iter()
+            .filter(|key| key["state"] == "refused")
+            .nth(1)
+            .expect("expired");
+        assert_eq!(expired["reason"], GateReason::Expired.as_str());
+        assert_eq!(expired["ticket"], tickets[1].0.as_str());
+        assert!(rooms.made().is_empty());
+    }
+
+    /// 99.1 #10 (S-23, codemap Q8): the tickets of an hour share one card —
+    /// its first record its own request, every later one an `m.replace`
+    /// whose new content lists every record, each earlier one exactly as
+    /// sent; each decision consumes its own record alone, and a ticket
+    /// still waiting holds nothing of the gate up; a ticket after the hour
+    /// opens a new card.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn gate_cards_coalesce_per_peer_per_window() {
+        let mut script = Vec::new();
+        for n in 1..=4 {
+            script.push(handing_to_tola(&format!("d{n}"), &format!("Job {n}.")));
+            script.push(prose("Handed on."));
+        }
+        let (mut world, approvals, rooms, mut served) = ticket_world(script);
+        let wall = Arc::new(std::sync::atomic::AtomicU64::new(
+            keeper_agent::claims::wall_ms(),
+        ));
+        let port = Arc::clone(&world.room) as Arc<dyn EditPort>;
+        served.gate_desk = served.open_desk(
+            &world.deps,
+            port,
+            Arc::new(keeper_agent::claims::ServerClock::on_wall(Arc::clone(
+                &wall,
+            ))),
+            Arc::new(|| true),
+            None,
+        );
+        for n in 1..=3 {
+            let asked = request(n, &format!("job {n}"), None);
+            world.serve(&mut served, asked).await;
+        }
+        let cards = world.sent_of(APPROVAL_REQUEST);
+        assert_eq!(cards.len(), 3, "one request and two edits");
+        let first = request_records(&cards[0]).expect("the card");
+        assert_eq!(first.len(), 1);
+        assert!(cards[0].get("m.relates_to").is_none());
+        let mut listed = first.clone();
+        for edit in &cards[1..] {
+            assert_eq!(edit["m.relates_to"]["rel_type"], "m.replace");
+            let whole = request_records(&edit["m.new_content"]).expect("the whole list");
+            assert_eq!(whole[..listed.len()], listed[..], "earlier records as sent");
+            assert_eq!(whole.len(), listed.len() + 1);
+            listed = whole;
+        }
+        let tickets = requested(&world);
+        let ids: Vec<&str> = listed.iter().map(|record| record.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            tickets
+                .iter()
+                .map(|(_, approval)| approval.as_str())
+                .collect::<Vec<_>>()
+        );
+        for (_, approval) in &tickets[..2] {
+            let record = gate_record(&world, approval);
+            let approve = world.decision(&record, Decision::Approve);
+            world.serve(&mut served, approve).await;
+        }
+        let consumed: Vec<String> = approvals
+            .events()
+            .into_iter()
+            .map(|event| event.content.id)
+            .collect();
+        assert_eq!(consumed, vec![tickets[0].1.clone(), tickets[1].1.clone()]);
+        // A third ticket still waits for a person, and the gate goes on
+        // serving: the first delegate's join gets its brief at once.
+        let child = rooms.made()[0].3.clone();
+        let joined = world.joined(&child);
+        world.serve(&mut served, joined).await;
+        assert_eq!(rooms.sent().len(), 1, "a waiting ticket holds nothing up");
+
+        wall.fetch_add(keeper_core::agents::gate::CARD_WINDOW_MS, Ordering::SeqCst);
+        let mut late = request(4, "job 4", None);
+        late.origin_server_ts = Some(wall.load(Ordering::SeqCst));
+        world.serve(&mut served, late).await;
+        let cards = world.sent_of(APPROVAL_REQUEST);
+        assert_eq!(cards.len(), 4);
+        assert!(cards[3].get("m.relates_to").is_none(), "a new card");
+        assert_eq!(request_records(&cards[3]).expect("the card").len(), 1);
+    }
+
+    /// 99.2 #4 (codemap Q7, Q12): a gate hands work only to an agent its
+    /// `[[gate]]` lists — another agent, the one a request names, is
+    /// blocked, never asked — and never sets a schedule; neither writes a
+    /// record or a card, and the turn still answers.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_gate_hands_work_only_to_its_delegates() {
+        let (world, _approvals, rooms, mut served) = ticket_world(vec![
+            calls(&[
+                (
+                    "d1",
+                    "delegate",
+                    json!({"agent": "lucyna", "brief": "Read the plan."}),
+                ),
+                (
+                    "d2",
+                    "delegate",
+                    json!({"agent": "tola", "brief": "Every day.",
+                           "card": {"title": "Daily", "schedule": "0 9 * * *"}}),
+                ),
+                ("d3", "delegate", json!({"agent": "tola", "brief": "Once."})),
+            ]),
+            calls(&[("c1", "reply", json!({"text": "Handed on."}))]),
+            prose("done."),
+        ]);
+        let asked = request(
+            1,
+            "delegate to lucyna and do it every day",
+            Some(json!({"request": "r1", "deadline_ms": 5000})),
+        );
+        assert_eq!(
+            gated(world.serve(&mut served, asked).await),
+            GateState::Ticket
+        );
+        let results = tool_results(&world.lines(GATE_SESSION));
+        assert_eq!(
+            result_of(&results, "d1").content,
+            format!(
+                "Refused: {}",
+                keeper_agent::delegate::not_a_delegate("lucyna")
+            )
+        );
+        assert_eq!(
+            result_of(&results, "d2").content,
+            format!("Refused: {}", keeper_agent::delegate::GATE_NO_SCHEDULE)
+        );
+        // The listed one waits for a person: the sync request gets its
+        // ticket at the call, and its work goes on as async.
+        assert_eq!(result_of(&results, "d3").outcome, ToolOutcomeWord::Ok);
+        assert_eq!(
+            result_of(&results, "c1").content,
+            format!("Refused: {}", keeper_agent::gate::HANDED_ON)
+        );
+        let said = gate_keys(&world);
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert_eq!(
+            (said[0]["state"].clone(), said[0]["deadline_ms"].clone()),
+            (json!("ticket"), json!(5000))
+        );
+        assert_eq!(requested(&world).len(), 1);
+        assert_eq!(
+            request_records(&world.sent_of(APPROVAL_REQUEST)[0])
+                .expect("a card")
+                .len(),
+            1
+        );
+        assert!(rooms.made().is_empty());
+    }
+
+    /// Codemap Q2 (a): a gate's tickets are decided by the drive's pinned
+    /// readers alone — a person this host pins who does not read the drive
+    /// is not asked and does not count — whoever the room's audience is.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_gate_ticket_is_decided_by_its_approvers_alone() {
+        const STRANGER: &str = "@stranger:example.org";
+        const STRANGERS: &str = "ed25519:StRaNgErIjKlMnOpQrStUvWxYz0123456789+/AbCdE";
+        let (mut world, approvals, rooms, mut served) = ticket_world(vec![
+            handing_to_tola("d1", "Tag v1.2."),
+            prose("Handed on."),
+        ]);
+        let admit = Admit::over(Anchor::Pinned(
+            [(TGORKA, KEY), (MARTA, MARTAS), (STRANGER, STRANGERS)]
+                .map(|(person, key)| TrustEntry {
+                    user: user(person),
+                    master_key: Some(key.to_owned()),
+                    proxy: None,
+                })
+                .into(),
+        ));
+        admit.publish(STRANGER, STRANGERS);
+        world.deps.decisions = Some(admit);
+        let asked = request(1, "tag v1.2", None);
+        world.serve(&mut served, asked).await;
+        let [(_, approval)]: [(String, String); 1] =
+            requested(&world).try_into().expect("one ticket");
+        let card = request_records(&world.sent_of(APPROVAL_REQUEST)[0]).expect("a card");
+        assert_eq!(card[0].approvers, vec![MARTA.to_owned(), TGORKA.to_owned()]);
+        let record = gate_record(&world, &approval);
+        let strangers = world.decision_from(
+            STRANGER,
+            "PHONE",
+            decision_content(&record, Decision::Approve, None),
+        );
+        world.serve(&mut served, strangers).await;
+        assert!(approvals.events().is_empty());
+        assert!(rooms.made().is_empty());
+        let ignored = kinds(&world.lines(GATE_SESSION), LineKind::Approval)
+            .iter()
+            .filter_map(|line| match &line.body {
+                LineBody::Approval(body) if body.state == ApprovalState::Decided => {
+                    body.reason.clone()
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(ignored, vec![NOT_AN_APPROVER.to_owned()]);
+    }
+
+    /// R371 as amended (R373 FIX 01): a gate's ticket is decided at the
+    /// label it was asked under, its record's. A callback whose reply read
+    /// what only tgorka reads narrows the session's label between turns;
+    /// Marta's decision on another ticket still counts.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_approver_outside_a_callbacks_label_still_decides() {
+        let (mut world, approvals, rooms, mut served) = ticket_world(vec![
+            handing_to_tola("d1", "Tag v1.2."),
+            prose("Handed on."),
+            handing_to_tola("d2", "Tag v1.3."),
+            prose("Handed on."),
+            calls(&[("c1", "reply", json!({"text": "Tagged."}))]),
+            prose("done."),
+        ]);
+        world.serve(&mut served, request(1, "tag v1.2", None)).await;
+        world.serve(&mut served, request(2, "tag v1.3", None)).await;
+        let tickets = requested(&world);
+        assert_eq!(tickets.len(), 2);
+        let first = gate_record(&world, &tickets[0].1);
+        let approve = world.decision(&first, Decision::Approve);
+        world.serve(&mut served, approve).await;
+        let child = rooms.made()[0].3.clone();
+        let joined = world.joined(&child);
+        world.serve(&mut served, joined).await;
+        let mut tgorkas = served.context.agent.label.clone();
+        tgorkas.readers = Readers::Only([user(TGORKA)].into());
+        let reply = world.reply(
+            &child,
+            &keeper_agent::delegate::reply_content("v1.2 is tagged.", Vec::new(), &tgorkas),
+        );
+        world.serve(&mut served, reply).await;
+        assert_eq!(
+            served.context.label.readers,
+            Readers::Only([user(TGORKA)].into()),
+            "the callback's reply narrowed the label"
+        );
+
+        let second = gate_record(&world, &tickets[1].1);
+        let martas = world.decision_from(
+            MARTA,
+            "PHONE",
+            decision_content(&second, Decision::Approve, None),
+        );
+        world.serve(&mut served, martas).await;
+        let consumed: Vec<String> = approvals
+            .events()
+            .into_iter()
+            .map(|event| event.content.id)
+            .collect();
+        assert_eq!(consumed, vec![first.id.clone(), second.id.clone()]);
+        assert_eq!(rooms.made().len(), 2, "Marta's approval hands it on");
+    }
+
+    /// R371 as amended (R373 FIX 02): what a hand-off's audit refuses — here
+    /// a row that cannot be written — pays no ticket and says none: the sync
+    /// request is not ticketed, no record or card is made, and it ends
+    /// refused by its own turn.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_hand_off_its_audit_refuses_pays_no_ticket() {
+        let mut world = gate_world(
+            TICKET_GATE,
+            TICKET_LIMITS,
+            vec![handing_to_tola("d1", "Tag v1.2."), prose("Not handed on.")],
+        );
+        let broken = world.tgdrive.with_file_name("broken");
+        std::fs::create_dir_all(broken.join("keeper.db")).expect("a folder");
+        world.deps.data_dir = broken;
+        let (world, _approvals, rooms, mut served) = tickets_in(world);
+        let asked = request(
+            1,
+            "tag v1.2",
+            Some(json!({"request": "r1", "deadline_ms": 20000})),
+        );
+        world.serve(&mut served, asked).await;
+        let results = tool_results(&world.lines(GATE_SESSION));
+        assert_eq!(result_of(&results, "d1").outcome, ToolOutcomeWord::Refused);
+        let said = gate_keys(&world);
+        assert_eq!(
+            said.iter()
+                .map(|key| key["state"].clone())
+                .collect::<Vec<_>>(),
+            vec![json!("refused")],
+            "no ticket was said: {said:?}"
+        );
+        assert_eq!(said[0]["reason"], GateReason::NoAnswer.as_str());
+        assert!(said[0].get("ticket").is_none_or(Value::is_null));
+        assert!(requested(&world).is_empty());
+        assert!(world.sent_of(APPROVAL_REQUEST).is_empty());
+        assert!(rooms.made().is_empty());
+    }
+
+    /// R373 FIX 03: a card its room did not take — the room's members could
+    /// not be read at the send — leaves its ticket unasked, not refused; the
+    /// next request's end asks for it, with the new ticket on the same card.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_card_its_room_did_not_take_is_asked_for_again() {
+        let (world, _approvals, _rooms, mut served) = ticket_world(vec![
+            handing_to_tola("d1", "Tag v1.2."),
+            prose("Handed on."),
+            handing_to_tola("d2", "Tag v1.3."),
+            prose("Handed on."),
+        ]);
+        world.room.unread_on_request.store(true, Ordering::SeqCst);
+        world.serve(&mut served, request(1, "tag v1.2", None)).await;
+        assert!(world.sent_of(APPROVAL_REQUEST).is_empty(), "no card sent");
+        let refused = |world: &World| {
+            gate_keys(world)
+                .iter()
+                .filter(|key| key["state"] == "refused")
+                .count()
+        };
+        assert_eq!(refused(&world), 0, "the ticket still waits");
+
+        world.room.unread.store(false, Ordering::SeqCst);
+        world.serve(&mut served, request(2, "tag v1.3", None)).await;
+        assert_eq!(refused(&world), 0);
+        let tickets = requested(&world);
+        assert_eq!(tickets.len(), 2);
+        let cards = world.sent_of(APPROVAL_REQUEST);
+        assert_eq!(cards.len(), 2, "the first ticket's card, then its edit");
+        let listed = request_records(&cards[1]["m.new_content"]).expect("the whole list");
+        assert_eq!(
+            listed
+                .iter()
+                .map(|record| record.id.as_str())
+                .collect::<Vec<_>>(),
+            tickets
+                .iter()
+                .map(|(_, approval)| approval.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// R373 FIX 04: every way a gate's hand-off is refused before a person
+    /// is asked, by its cause, none of them a ticket, a record or a card: a
+    /// second hand-off of one request, and one in its callback
+    /// (`ONE_DELEGATION`); a next round (`GATE_ONE_ROUND`); a card
+    /// (`GATE_NO_SOURCE`); a sync request whose ticket the hour's allowance
+    /// cannot pay (`NO_TICKET`); a clear room (`GATE_CLEAR`). An approved
+    /// ticket whose agent its `[gate]` no longer lists is checked again
+    /// when it is handed on, and refused.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_gates_hand_off_is_refused_by_its_cause() {
+        use keeper_agent::delegate::{GATE_CLEAR, GATE_NO_SOURCE, GATE_ONE_ROUND};
+        use keeper_agent::gate::{NO_TICKET, ONE_DELEGATION};
+        let refused = |cause: &str| format!("Refused: {cause}");
+        let sync = |n: usize| {
+            request(
+                n,
+                &format!("job {n}"),
+                Some(json!({"request": format!("r{n}"), "deadline_ms": 20000})),
+            )
+        };
+        let world = gate_world(
+            &format!("{TICKET_GATE}\nmax_tickets_per_hour = 2"),
+            TICKET_LIMITS,
+            vec![
+                calls(&[
+                    (
+                        "d1",
+                        "delegate",
+                        json!({"agent": "tola", "brief": "Job 1."}),
+                    ),
+                    (
+                        "d2",
+                        "delegate",
+                        json!({"agent": "tola", "brief": "Job 1 again."}),
+                    ),
+                    (
+                        "d3",
+                        "delegate",
+                        json!({"agent": "tola", "brief": "More.", "session": "01JAAAAAAAAAAAAAAAAAAAAAAA"}),
+                    ),
+                    (
+                        "d4",
+                        "delegate",
+                        json!({"agent": "tola", "brief": "This card.", "source": "card.md"}),
+                    ),
+                ]),
+                prose("Handed on."),
+                handing_to_tola("d5", "Job 2."),
+                prose("Handed on."),
+                handing_to_tola("d6", "Job 3."),
+                prose("Not handed on."),
+                calls(&[
+                    (
+                        "d7",
+                        "delegate",
+                        json!({"agent": "tola", "brief": "Once more."}),
+                    ),
+                    ("c1", "reply", json!({"text": "Job 1 is done."})),
+                ]),
+                prose("done."),
+            ],
+        );
+        let (mut world, _approvals, rooms, mut served) = tickets_in(world);
+        for n in 1..=3 {
+            world.serve(&mut served, sync(n)).await;
+        }
+        let results = tool_results(&world.lines(GATE_SESSION));
+        for call in ["d1", "d5"] {
+            assert_eq!(
+                result_of(&results, call).outcome,
+                ToolOutcomeWord::Ok,
+                "{call}"
+            );
+        }
+        for (call, cause) in [
+            ("d2", ONE_DELEGATION),
+            ("d3", GATE_ONE_ROUND),
+            ("d4", GATE_NO_SOURCE),
+            ("d6", NO_TICKET),
+        ] {
+            assert_eq!(result_of(&results, call).content, refused(cause), "{call}");
+        }
+        let tickets = requested(&world);
+        assert_eq!(tickets.len(), 2, "d1's and d5's");
+        let said = gate_keys(&world);
+        assert_eq!(
+            said.iter().filter(|key| key["state"] == "ticket").count(),
+            2,
+            "{said:?}"
+        );
+        let cards = world.sent_of(APPROVAL_REQUEST);
+        assert_eq!(cards.len(), 2);
+        assert_eq!(
+            request_records(&cards[1]["m.new_content"])
+                .expect("the whole list")
+                .len(),
+            2
+        );
+
+        // The first ticket's callback hands nothing on again.
+        let first = gate_record(&world, &tickets[0].1);
+        let approve = world.decision(&first, Decision::Approve);
+        world.serve(&mut served, approve).await;
+        let child = rooms.made()[0].3.clone();
+        let joined = world.joined(&child);
+        world.serve(&mut served, joined).await;
+        let label = served.context.agent.label.clone();
+        let reply = world.reply(
+            &child,
+            &keeper_agent::delegate::reply_content("Job 1: done.", Vec::new(), &label),
+        );
+        assert_eq!(
+            gated(world.serve(&mut served, reply).await),
+            GateState::Result
+        );
+        let results = tool_results(&world.lines(GATE_SESSION));
+        assert_eq!(result_of(&results, "d7").content, refused(ONE_DELEGATION));
+        assert_eq!(requested(&world).len(), 2);
+
+        // The second is approved after its gate stopped listing Tola: it is
+        // checked again as it is handed on, and refused.
+        served
+            .context
+            .agent
+            .gate
+            .as_mut()
+            .expect("a gate session")
+            .delegates = vec!["tgdrive/lucyna".to_owned()];
+        let second = gate_record(&world, &tickets[1].1);
+        let approve = world.decision(&second, Decision::Approve);
+        world.serve(&mut served, approve).await;
+        assert_eq!(rooms.made().len(), 1, "nothing more handed on");
+        let not_listed = delegate_lines(&world.lines(GATE_SESSION))
+            .into_iter()
+            .find(|body| body.id == tickets[1].0 && body.state == DelegateState::Refused)
+            .expect("the ticket's delegation refused");
+        assert_eq!(
+            not_listed.reason,
+            Some(keeper_agent::approvals::not_done(
+                &keeper_agent::delegate::not_a_delegate("tola")
+            ))
+        );
+        let refusal = gate_keys(&world)
+            .into_iter()
+            .find(|key| key["state"] == "refused" && key["ticket"] == tickets[1].0.as_str())
+            .expect("the second ticket refused");
+        assert_eq!(refusal["reason"], GateReason::Failed.as_str());
+        // Every hand-off keeps its one row, and none is left waiting.
+        let rows = rows_of(&world, &served, "delegate");
+        assert_eq!(rows.len(), 7, "one row per call");
+        assert!(
+            rows.iter()
+                .all(|row| row.outcome != keeper_core::bots::audit::AuditOutcome::Pending),
+            "{:?}",
+            rows.iter().map(|row| row.outcome).collect::<Vec<_>>()
+        );
+
+        // A clear gate room carries no card: its gate hands nothing on.
+        let (clear, _approvals, clear_rooms, mut gate) = tickets_in(gate_world(
+            &format!("{TICKET_GATE}\nencrypted = false"),
+            TICKET_LIMITS,
+            vec![handing_to_tola("d1", "Job."), prose("Not handed on.")],
+        ));
+        clear.serve(&mut gate, request(1, "job", None)).await;
+        let results = tool_results(&clear.lines(GATE_SESSION));
+        assert_eq!(result_of(&results, "d1").content, refused(GATE_CLEAR));
+        assert!(requested(&clear).is_empty());
+        assert!(clear.sent_of(APPROVAL_REQUEST).is_empty());
+        assert!(clear_rooms.made().is_empty());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -26775,6 +27559,17 @@ fn gate_world(gate: &str, limits: &str, script: Vec<Completion>) -> World {
         "80-agents/forge/MEMORY.md",
         &format!("{FORGE_MEMORY}\n"),
     );
+    // Dr Tola Grey, the steward a `[[gate]]` may list as a delegate.
+    write(
+        &world.tgdrive,
+        "80-agents/tola/agent.toml",
+        "version = 1\nid = \"tola\"\nname = \"Dr Tola Grey\"\nkind = \"steward\"\nmatrix_user = \"@tola:example.org\"\n\n[model]\nbot = \"bot:openai:http://127.0.0.1:9#model\"\n\n[tools]\nallow = [\"drive_read\"]\ndrives = [\"tgdrive\"]\n",
+    );
+    write(
+        &world.tgdrive,
+        "80-agents/tola/SOUL.md",
+        &SOUL.replace("Nixi", "Dr Tola Grey"),
+    );
     let decl = world.deps.drives["tgdrive"].clone();
     let zone = read_zone("tgdrive", &profile("tgdrive", &world.tgdrive), Some(&decl));
     let home: AgentHome = zone
@@ -26918,7 +27713,9 @@ async fn a_gate_answers_by_reply_in_one_message_and_streams_nothing() {
         .iter()
         .filter_map(|tool| tool["function"]["name"].as_str())
         .collect();
-    assert_eq!(offered, ["reply"]);
+    // The gate's default `allow`: its answer, and the hand-off a person
+    // decides (codemap Q1, Q4); nothing else.
+    assert_eq!(offered, ["delegate", "reply"]);
     let system = requests[0]["messages"][0]["content"]
         .as_str()
         .expect("system");

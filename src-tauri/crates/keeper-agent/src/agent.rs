@@ -312,6 +312,12 @@ pub struct SessionContext {
     pub gate_pending: BTreeMap<String, GateOpen>,
     /// The last `gate` line's request and state.
     pub gate_last: Option<(String, keeper_core::agents::log::GateState)>,
+    /// A gate session's tickets handed on (codemap Q4), by ticket — the
+    /// delegation's own id (Q13): from its `delegate requested` line until
+    /// its reply or its refusal.
+    pub gate_deferred: BTreeMap<String, Deferred>,
+    /// Each `delegate` call's wire id, by its `tool_call` line.
+    delegate_call_ids: HashMap<Ulid, String>,
 }
 
 /// A gate's request not yet closed, as its lines say it (C6).
@@ -320,6 +326,29 @@ pub struct GateOpen {
     /// The request's own event.
     pub event: Option<OwnedEventId>,
     pub ticket: Option<String>,
+    /// Its `request` line: what its ticket's callback reads again (Q5).
+    pub line: Option<keeper_core::agents::log::GateBody>,
+}
+
+/// A gate's ticket handed on (codemap Q4): its delegation waits for a
+/// person's decision on its approval record, then runs, until its reply or
+/// its refusal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Deferred {
+    /// The approval record it waits for.
+    pub approval: String,
+    /// The agent it goes to, as the call named it.
+    pub to: String,
+    /// The `delegate` call's `tool_call` line, its wire id and arguments.
+    pub call_line: Ulid,
+    pub call_id: String,
+    pub args: String,
+    /// Its `approval requested` line is written: the card asks for it.
+    pub announced: bool,
+    /// Its approval ended: denied, consumed, expired or refused.
+    pub decided: bool,
+    /// Its delegation's room is made.
+    pub opened: bool,
 }
 
 impl SessionContext {
@@ -413,6 +442,8 @@ impl SessionContext {
             gate_ledger,
             gate_pending: BTreeMap::new(),
             gate_last: None,
+            gate_deferred: BTreeMap::new(),
+            delegate_call_ids: HashMap::new(),
         };
         for stored in &log.lines {
             match &stored.body {
@@ -487,6 +518,28 @@ impl SessionContext {
                 if line.parent.is_none() || line.parent != self.last_result {
                     self.turn_tokens_at = self.tokens_spent;
                 }
+            }
+            // A ticket's callback reads its own request and the reply only
+            // (codemap Q5): the reply's receipt starts the conversation over
+            // at that request.
+            LineBody::Delegate(body)
+                if body.state == DelegateState::Replied && self.agent.kind == SessionKind::Gate =>
+            {
+                let request = self
+                    .gate_pending
+                    .values()
+                    .find(|open| open.ticket.as_deref() == Some(body.id.as_str()))
+                    .and_then(|open| open.line.as_ref())
+                    .and_then(keeper_core::agents::log::replay::request_message);
+                if let Some(request) = request {
+                    self.messages.clear();
+                    self.placed.clear();
+                    self.messages.push(request);
+                    self.placed.push((line.id, position));
+                    self.cut_off = false;
+                    self.turn_tokens_at = self.tokens_spent;
+                }
+                return;
             }
             // A gate's turn reads its one request (codemap Q5): the request
             // starts the conversation over, as replay starts it over.
@@ -590,6 +643,30 @@ impl SessionContext {
                 self.parked.retain(|_, pending| !pending.round.is_empty());
             }
             LineBody::Approval(body) => match body.state {
+                // A gate's ticket waits outside any turn (codemap Q4): its
+                // call has its result already, and nothing waits on it.
+                ApprovalState::Requested if self.agent.kind == SessionKind::Gate => {
+                    let deferred = self
+                        .gate_deferred
+                        .values_mut()
+                        .find(|deferred| deferred.approval == body.id);
+                    if let Some(deferred) = deferred {
+                        deferred.announced = true;
+                        self.parked.insert(
+                            body.id.clone(),
+                            crate::approvals::Pending {
+                                id: body.id.clone(),
+                                call_id: deferred.call_id.clone(),
+                                call_line: deferred.call_line,
+                                request_event: line.matrix_event.clone(),
+                                ended: None,
+                                round: vec![deferred.call_id.clone()],
+                                announced: true,
+                                ran: false,
+                            },
+                        );
+                    }
+                }
                 ApprovalState::Requested => {
                     let round = line
                         .parent
@@ -621,6 +698,16 @@ impl SessionContext {
                     if let Some(pending) = self.parked.get_mut(&body.id) {
                         pending.ended.get_or_insert(body.state);
                         pending.ran |= ran;
+                    }
+                    // A gate's ended ticket waits no more: its settlement
+                    // has what it needs.
+                    if self.agent.kind == SessionKind::Gate {
+                        self.parked.remove(&body.id);
+                        for deferred in self.gate_deferred.values_mut() {
+                            if deferred.approval == body.id {
+                                deferred.decided = true;
+                            }
+                        }
                     }
                 }
                 _ => {}
@@ -675,6 +762,7 @@ impl SessionContext {
                             GateOpen {
                                 event: line.matrix_event.clone(),
                                 ticket: None,
+                                line: Some(gate.clone()),
                             },
                         );
                     }
@@ -696,6 +784,7 @@ impl SessionContext {
             }
             LineBody::ToolCall(call) if call.tool == delegate::DELEGATE => {
                 self.delegate_calls.insert(line.id, call.args.clone());
+                self.delegate_call_ids.insert(line.id, call.call_id.clone());
             }
             LineBody::ToolCall(call) if call.tool == keeper_core::agents::workflow::BMAD_RENDER => {
                 self.renders.insert(call.call_id.clone(), call.args.clone());
@@ -782,6 +871,33 @@ impl SessionContext {
             LineBody::Error(error) if error.code == WITHHELD_CODE => self.withheld = true,
             LineBody::Error(error) if error.code == INTERRUPTED => self.cut_off = true,
             LineBody::Delegate(body) => match body.state {
+                // A gate's ticket handed on: its delegation waits for a
+                // person (codemap Q4); its call's arguments stay for the
+                // room's `opened`.
+                DelegateState::Requested => {
+                    let (Some(call_line), Some(approval)) = (line.parent, &body.approval) else {
+                        return;
+                    };
+                    let (Some(call_id), Some(args)) = (
+                        self.delegate_call_ids.get(&call_line),
+                        self.delegate_calls.get(&call_line),
+                    ) else {
+                        return;
+                    };
+                    self.gate_deferred.insert(
+                        body.id.clone(),
+                        Deferred {
+                            approval: approval.clone(),
+                            to: body.to.clone(),
+                            call_line,
+                            call_id: call_id.clone(),
+                            args: args.clone(),
+                            announced: false,
+                            decided: false,
+                            opened: false,
+                        },
+                    );
+                }
                 DelegateState::Opened => {
                     let (Some(room), Ok(to)) =
                         (&body.room, OwnedUserId::try_from(body.to.as_str()))
@@ -804,6 +920,9 @@ impl SessionContext {
                             window: body.window.clone(),
                         },
                     );
+                    if let Some(deferred) = self.gate_deferred.get_mut(&body.id) {
+                        deferred.opened = true;
+                    }
                 }
                 DelegateState::Sent => {
                     if let Some(open) = self.delegations.get_mut(&body.id) {
@@ -842,6 +961,7 @@ impl SessionContext {
                         self.reply_unpeered =
                             Some((line.id, line.matrix_event.clone(), body.clone()));
                     }
+                    self.gate_deferred.remove(&body.id);
                 }
                 DelegateState::Accepted => self.accepted = true,
                 // A brief its label no longer lets in is never sent: the
@@ -854,6 +974,7 @@ impl SessionContext {
                     {
                         self.delegations.remove(&body.id);
                     }
+                    self.gate_deferred.remove(&body.id);
                 }
             },
             // The person's own words after a question was shown are all a
@@ -1477,6 +1598,23 @@ impl AllowedTools<'_> {
             args: None,
         });
         Gated::Park(approval)
+    }
+
+    /// What a gate's delegation comes to (codemap Q4): the integrity
+    /// rule's block or T5 refuse it; anything else waits for a person on a
+    /// new approval record, outside the turn — never run unasked, never a
+    /// park of the gate's one worker.
+    fn deferred(
+        &self,
+        tool: &str,
+        classification: &Classification,
+        recipients: &[Recipient],
+    ) -> Gated {
+        match check_call(&self.view.label(), tool, classification.tier, recipients) {
+            CallVerdict::Block { reason } => Gated::Refuse(reason),
+            _ if classification.gate() == Gate::Refuse => Gated::Refuse(FORBIDDEN.to_owned()),
+            _ => Gated::Park(Ulid::new()),
+        }
     }
 
     /// Where a card tool's call lands, as it runs it: `card_update`'s card,
@@ -3569,7 +3707,13 @@ impl AllowedTools<'_> {
         }
         if delegate::is_delegation(&wire.name) {
             let tool = AgentTool::from_wire(&wire.name)?;
-            let facts = tier::named_facts(tool, args, CallFacts::default());
+            // A gate's delegation hands an outside request on: a person
+            // decides each one (codemap Q7).
+            let in_gate = self.agent.kind == SessionKind::Gate && tool == AgentTool::Delegate;
+            let facts = CallFacts {
+                gate_send: in_gate,
+                ..tier::named_facts(tool, args, CallFacts::default())
+            };
             let classification = self.classify(&wire.id, tool, &facts, None);
             let recipient = self.delegation.recipient(wire);
             let recipients: Vec<Recipient> = recipient
@@ -3580,14 +3724,20 @@ impl AllowedTools<'_> {
                 })
                 .collect();
             // Decided now, said only once the delegation's own sinks have
-            // passed (R82).
-            let gated = self.gated(
-                &wire.id,
-                &wire.name,
-                &classification,
-                &recipients,
-                Vec::new(),
-            );
+            // passed (R82). A gate's never parks its turn: it is deferred
+            // to the hour's card (codemap Q4), and no blocked flow of it is
+            // lifted.
+            let gated = if in_gate {
+                self.deferred(&wire.name, &classification, &recipients)
+            } else {
+                self.gated(
+                    &wire.id,
+                    &wire.name,
+                    &classification,
+                    &recipients,
+                    Vec::new(),
+                )
+            };
             let (drive, at) = self.delegation.destination(wire);
             let audit = CallAudit::new(
                 self.sinks,
@@ -3596,8 +3746,12 @@ impl AllowedTools<'_> {
                 &classification,
                 gated,
                 (&drive, &at),
-            )
-            .lifting(self, &wire.id);
+            );
+            let audit = if in_gate {
+                audit
+            } else {
+                audit.lifting(self, &wire.id)
+            };
             let outcome = self.delegation.run(wire, &audit);
             if let Some(outcome) = &outcome {
                 audit.finish(outcome);
@@ -4660,16 +4814,17 @@ impl ServedSession {
         // A record whose `approval requested` line a stop lost still waits
         // (R176): it is announced again, never cut off.
         self.adopt_records(deps);
-        // A turn parked on an approval waits; it was not cut off (R74).
-        if !self.context.parked.is_empty() {
-            return Ok(false);
-        }
         // A gate runs one request's turn at a time, so at a worker's start
         // every request still open was cut off by the stop (C6): each is
         // refused in its room — its outside system is never left waiting,
-        // and its ticket stops counting against the gate's sessions.
+        // and its ticket stops counting against the gate's sessions. A
+        // ticket handed on is no turn: it waits on (codemap Q4).
         if self.context.agent.kind == SessionKind::Gate {
             return self.recover_gate(deps, &port).await;
+        }
+        // A turn parked on an approval waits; it was not cut off (R74).
+        if !self.context.parked.is_empty() {
+            return Ok(false);
         }
         let Some(user_line) = self.context.unanswered else {
             return Ok(false);
@@ -4699,7 +4854,10 @@ impl ServedSession {
 
     /// [`Self::recover`] in a gate session: the cut-off turn's `error`
     /// line, then each open request refused `interrupted`, its line under
-    /// that one. Nothing of the turn reaches the room: it streamed nothing.
+    /// that one — but a ticket handed on whose delegation still waits for
+    /// its decision or runs, whose card a stop cut is asked for again
+    /// first (codemap Q4). Nothing of the turn reaches the room: it
+    /// streamed nothing.
     async fn recover_gate(
         &mut self,
         deps: &AgentDeps,
@@ -4718,7 +4876,18 @@ impl ServedSession {
             )?;
             parent = Some(closed.id);
         }
-        let pending = std::mem::take(&mut self.context.gate_pending);
+        Box::pin(self.raise_tickets(deps, port)).await?;
+        let deferred = &self.context.gate_deferred;
+        let (waiting, pending): (BTreeMap<_, _>, BTreeMap<_, _>) =
+            std::mem::take(&mut self.context.gate_pending)
+                .into_iter()
+                .partition(|(_, open): &(String, GateOpen)| {
+                    open.ticket
+                        .as_ref()
+                        .and_then(|ticket| deferred.get(ticket))
+                        .is_some_and(|deferred| !deferred.decided || deferred.opened)
+                });
+        self.context.gate_pending = waiting;
         let recovered = parent.is_some() || !pending.is_empty();
         if let Some(desk) = self.desk(deps, port).filter(|_| !pending.is_empty()) {
             for (request, open) in pending {
@@ -5064,21 +5233,7 @@ impl ServedSession {
         // Each request starts at the gate's opening label (codemap Q5):
         // what an earlier one read never reaches this one's answer, and the
         // integrity stays `untrusted` (AD-416).
-        let opening = self.context.agent.label.clone();
-        if self.context.label != opening {
-            self.writer.write(
-                &mut self.context,
-                None,
-                None,
-                LineBody::Label(LabelBody::new(
-                    &opening,
-                    LabelCause {
-                        kind: LabelCauseKind::Outside,
-                        reference: arrived.event_id.to_string(),
-                    },
-                )),
-            )?;
-        }
+        self.reset_gate_label(arrived.event_id.to_string())?;
         let opened = self.writer.write(
             &mut self.context,
             None,
@@ -5220,12 +5375,78 @@ impl ServedSession {
             )?;
         }
         off_the_runtime(|| self.writer.sync())?;
+        // What the turn handed on is asked for on the hour's card now that
+        // its lines are written (codemap Q4).
+        Box::pin(self.raise_tickets(deps, &port)).await?;
         Ok(self
             .context
             .gate_last
             .as_ref()
             .filter(|(request, _)| *request == serving.request)
             .map_or(GateState::Request, |(_, state)| *state))
+    }
+
+    /// The reply of the delegation ticket `open` came, its receipt written
+    /// (codemap Q4, Q5): the request is open again on the desk under its
+    /// ticket, the label back at the gate's opening one before the reply's
+    /// joins it — for this turn only — and the gate's turn reads that
+    /// request and the reply alone; its `reply` is the ticket's `result`.
+    async fn gate_callback(
+        &mut self,
+        deps: &AgentDeps,
+        port: Arc<dyn EditPort>,
+        open: &Delegation,
+        stop: CancelSignal,
+    ) -> Result<Outcome, ServeError> {
+        off_the_runtime(|| self.writer.sync())?;
+        let Some(desk) = self.desk(deps, &port) else {
+            return Ok(Outcome::Ignored(NO_GATE));
+        };
+        self.write_gate_facts(&desk)?;
+        let waiting = self
+            .context
+            .gate_pending
+            .iter()
+            .find(|(_, waiting)| waiting.ticket.as_deref() == Some(open.id.as_str()))
+            .and_then(|(request, waiting)| Some((request.clone(), waiting.event.clone()?)));
+        let Some((request, event)) = waiting else {
+            tracing::info!(delegation = %open.id, "agents: a gate's delegation replied for a ticket that is closed");
+            return Ok(Outcome::Ignored(NOT_A_DELEGATION));
+        };
+        desk.call_back(&request, event.clone(), open.id.clone());
+        self.reset_gate_label(event.to_string())?;
+        let Some(peer) = self.peer_the_reply()? else {
+            return Ok(Outcome::Ignored(NOT_A_DELEGATION));
+        };
+        off_the_runtime(|| self.writer.sync())?;
+        let serving = crate::gate::Serving {
+            desk: Arc::clone(&desk),
+            request: request.clone(),
+        };
+        let state = self.gate_turn(deps, port, peer.id, serving, stop).await?;
+        self.write_gate_facts(&desk)?;
+        Ok(Outcome::Gated { request, state })
+    }
+
+    /// Bring a gate session's label back to its opening one (codemap Q5),
+    /// by a `label` line naming `reference`, when it is anything else.
+    fn reset_gate_label(&mut self, reference: String) -> Result<(), ServeError> {
+        let opening = self.context.agent.label.clone();
+        if self.context.label != opening {
+            self.writer.write(
+                &mut self.context,
+                None,
+                None,
+                LineBody::Label(LabelBody::new(
+                    &opening,
+                    LabelCause {
+                        kind: LabelCauseKind::Outside,
+                        reference,
+                    },
+                )),
+            )?;
+        }
+        Ok(())
     }
 
     /// Serve one arrival: ignore it, log a decision, or run a turn.
@@ -5247,7 +5468,14 @@ impl ServedSession {
                 session_kind: self.context.agent.kind,
                 agent_user: &config.matrix_user,
                 requester: &self.context.agent.requested_by,
-                readers: &self.context.label.readers,
+                // A gate's decisions are its tickets', each asked under the
+                // gate's opening label, never the label a callback's reply
+                // narrowed between turns (R371).
+                readers: if self.context.agent.kind == SessionKind::Gate {
+                    &self.context.agent.label.readers
+                } else {
+                    &self.context.label.readers
+                },
                 peer: self
                     .context
                     .agent
@@ -6043,6 +6271,16 @@ impl ServedSession {
                 &self.context.agent,
                 &config.matrix_user,
             ),
+            gate: self
+                .context
+                .agent
+                .gate
+                .as_ref()
+                .map(|gate| crate::delegate::GateDelegator {
+                    delegates: gate.delegates.clone(),
+                    approvers: self.gate_approvers(deps),
+                    clear: !gate.encrypted,
+                }),
         }
     }
 
@@ -6732,8 +6970,14 @@ impl ServedSession {
                                 .map(|(completion, _)| completion.to_owned()),
                         }),
                         window: None,
+                        approval: None,
                     }),
                 )?;
+                // A gate's ticket comes back (codemap Q5): its own turn on
+                // its request and this reply, its answer the ticket's result.
+                if self.context.agent.kind == SessionKind::Gate {
+                    return Box::pin(self.gate_callback(deps, port, &open, stop)).await;
+                }
                 // A workflow's run that replied takes a late child's reply
                 // as a record, never as a turn that reopens it (R202).
                 if self.run_ended() {
@@ -6861,12 +7105,14 @@ impl ServedSession {
         };
         let session = self.context.session.path.clone();
         let known = rooms.known();
-        let content = match delegate::content_for(
-            open,
-            &self.delegator(deps),
-            &self.context.label,
-            &known,
-        ) {
+        // A gate's brief goes under the label its ticket was asked under —
+        // the gate's opening one — whatever request runs now (codemap Q5).
+        let label = if self.context.agent.kind == SessionKind::Gate {
+            self.context.agent.label.clone()
+        } else {
+            self.context.label.clone()
+        };
+        let content = match delegate::content_for(open, &self.delegator(deps), &label, &known) {
             Ok(content) => content,
             Err(sentence) => {
                 tracing::warn!(%session, delegation = %open.id, %sentence, "agents: a brief could not be composed");
@@ -6878,7 +7124,7 @@ impl ServedSession {
         let content = self
             .declassified(deps, open)
             .and_then(|released| {
-                delegate::approved_brief(&self.context.label, &released.readers, |approved| {
+                delegate::approved_brief(&label, &released.readers, |approved| {
                     delegate::content_for(open, &self.delegator(deps), approved, &known)
                 })
                 .filter(|(_, sha)| *sha == released.sha256)
@@ -6944,6 +7190,7 @@ impl ServedSession {
                     reason: Some(reason),
                     reply: None,
                     window: None,
+                    approval: None,
                 }),
             )?;
             off_the_runtime(|| self.writer.sync())?;
@@ -6978,6 +7225,7 @@ impl ServedSession {
                 reason: None,
                 reply: None,
                 window: None,
+                approval: None,
             }),
         )?;
         off_the_runtime(|| self.writer.sync())?;
@@ -7582,6 +7830,7 @@ impl ServedSession {
                         reason: None,
                         reply: None,
                         window: None,
+                        approval: None,
                     });
                     self.writer.write(&mut self.context, None, None, accepted)?;
                 }
@@ -7619,6 +7868,7 @@ impl ServedSession {
                         reason: None,
                         reply: None,
                         window: None,
+                        approval: None,
                     });
                     self.writer.write(&mut self.context, None, None, accepted)?;
                 }
@@ -8323,13 +8573,24 @@ impl ServedSession {
     /// audiences (R199), the session's own agents left out, under the label
     /// now; a suppression audited.
     pub(crate) fn gate(&self, deps: &AgentDeps, port: &Arc<dyn EditPort>) -> Arc<RoomGate> {
+        self.gate_under(deps, port, self.context.label.clone())
+    }
+
+    /// [`Self::gate`] under `label` rather than the label now: a gate's
+    /// ticket goes on the card under the label it was asked under.
+    pub(crate) fn gate_under(
+        &self,
+        deps: &AgentDeps,
+        port: &Arc<dyn EditPort>,
+        label: Label,
+    ) -> Arc<RoomGate> {
         Arc::new(RoomGate::new(
             Arc::clone(port),
             self.delegations
                 .as_ref()
                 .map(|rooms| Arc::new(crate::ask::with_pinned_proxies(&rooms.known()))),
             self.context.room_own(&deps.home.config.matrix_user),
-            self.context.label.clone(),
+            label,
             Some((self.sinks(deps), self.context.agent.room.clone())),
         ))
     }
@@ -8813,6 +9074,13 @@ fn grant_read(grants: &dyn GrantSource, drive: &str, at: &str) -> Result<(), Str
     }
 }
 
+/// Whether a turn of the agent `config` is offered `delegate` — and so may
+/// call it: its `[tools].allow` names it, in a gate as anywhere (R365's
+/// ceiling holds a gate's allow to its three tools).
+fn offers_delegate(config: &keeper_core::agents::home::AgentConfig) -> bool {
+    config.allow.iter().any(|name| name == delegate::DELEGATE)
+}
+
 /// The `reply` a turn of a session of kind `session` is offered: the answer
 /// of a session that answers a requester — delegated, or a workflow's run
 /// (R48, R104) — or — in the `main` or `conversation` of an agent of
@@ -8862,12 +9130,13 @@ fn agent_offer(
     if tools.is_empty() {
         return tools;
     }
-    // A gate's tools are a ceiling (codemap Q1): in this build its turn is
-    // offered its answer alone — `delegate`, `journal_append` and its MCP
-    // servers come with the rules that make them safe there (R369); its
-    // dispatch refuses anything else ([`NOT_OFFERED`]).
+    // A gate's tools are a ceiling (codemap Q1): its turn is offered its
+    // answer, and `delegate` as `allow` says — a hand-off a person decides
+    // on the hour's card (R371); `journal_append` and its MCP servers come
+    // with the rules that make them safe there. Its dispatch refuses
+    // anything it was not offered ([`NOT_OFFERED`], R369).
     if session == SessionKind::Gate {
-        return delegate::specs(false, ReplyOffer::Gate);
+        return delegate::specs(offers_delegate(config), ReplyOffer::Gate);
     }
     tools.retain(|spec| config.allow.contains(&spec.name));
     tools.extend(crate::surface::specs(&crate::surface::offered(config)));
@@ -9242,11 +9511,11 @@ async fn run_agent_turn(
         context.agent.workflow.clone(),
         context.skills.clone(),
     );
-    let in_gate = context.agent.kind == SessionKind::Gate;
     let reply = match review {
         Some(_) => ReplyOffer::None,
         None => reply_offer(context.agent.kind, !context.relays.is_empty(), config.kind),
     };
+    let in_gate = context.agent.kind == SessionKind::Gate;
     let asks_offered =
         review.is_none() && keeper_core::agents::ask::offered(config.kind, context.agent.kind);
     let unattended =
@@ -9420,7 +9689,7 @@ async fn run_agent_turn(
             tools.delegations,
             tools.room,
             &log,
-            allow.iter().any(|name| name == delegate::DELEGATE) && !in_gate,
+            allow.iter().any(|name| name == delegate::DELEGATE),
             reply,
             &tools.sinks,
         )
