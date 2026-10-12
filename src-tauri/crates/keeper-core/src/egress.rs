@@ -458,6 +458,36 @@ pub fn push_egress(stored: Option<&str>) -> Vec<EgressEndpointVm> {
         .collect()
 }
 
+/// The label of an Android egress list's UnifiedPush row (98.4 #8, Q6):
+/// whose server it is — the distributor the person confirmed, by name and
+/// package — and that, unlike the iPhone's gateway, keeper itself contacts
+/// it: once per endpoint, to ask whether it is a Matrix gateway.
+pub fn unifiedpush_label(distributor: &crate::agents::unifiedpush::Distributor) -> String {
+    format!(
+        "UnifiedPush server of {} — keeper asks it, once per address, whether it is a Matrix push gateway; your homeserver sends it event ids for this device",
+        distributor.named()
+    )
+}
+
+/// The UnifiedPush endpoint the person's distributor gave this device (98.4
+/// #8, Q6), as one [`EgressKind::PushGateway`] row: its host, and its port
+/// when it names one — never its path or query, which are a capability —
+/// labelled with the distributor ([`unifiedpush_label`]). The gateway keeper
+/// registers is that same server
+/// ([`crate::agents::unifiedpush::discover_gateway`]), so one row discloses
+/// both. No endpoint is no row. The shell appends it on Android.
+pub fn unifiedpush_egress(
+    kept: Option<&crate::agents::unifiedpush::KeptEndpoint>,
+) -> Vec<EgressEndpointVm> {
+    kept.map(|kept| EgressEndpointVm {
+        url: kept.endpoint.host(),
+        kind: EgressKind::PushGateway,
+        label: unifiedpush_label(&kept.distributor),
+    })
+    .into_iter()
+    .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1173,6 +1203,33 @@ mod tests {
         ] {
             assert!(push_egress(nothing).is_empty(), "{nothing:?}");
         }
+    }
+
+    /// 98.4 #8: the UnifiedPush endpoint is one row, its host and port —
+    /// never its path or query — labelled with the distributor whose server
+    /// it is, by name and package (R98UP1-02); no endpoint is no row.
+    #[test]
+    fn the_unifiedpush_server_is_disclosed_by_host_never_by_its_endpoint() {
+        use crate::agents::unifiedpush::{Distributor, Endpoint, KeptEndpoint};
+        let kept = KeptEndpoint {
+            endpoint: Endpoint::parse("https://ntfy.example:8443/upAbc?up=1").expect("an endpoint"),
+            distributor: Distributor {
+                package: "io.heckel.ntfy".to_owned(),
+                label: "ntfy".to_owned(),
+            },
+            gateway: true,
+        };
+        let rows = unifiedpush_egress(Some(&kept));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].url, "ntfy.example:8443");
+        assert_eq!(rows[0].kind, EgressKind::PushGateway);
+        assert!(
+            rows[0].label.contains("ntfy (io.heckel.ntfy)"),
+            "{}",
+            rows[0].label
+        );
+        assert!(!rows[0].label.contains("upAbc"), "{}", rows[0].label);
+        assert!(unifiedpush_egress(None).is_empty());
     }
 
     /// R96MM2-05: a URL's host and a program of the same name are two

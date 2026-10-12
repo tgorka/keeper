@@ -643,6 +643,157 @@ pub fn answer_edit<'a>(
 }
 
 // ---------------------------------------------------------------------------
+// Reading the pushed event (98.1 #1, #2; 98.4 #3)
+//
+// Both phones read the one event a push names the same way, then ask
+// [`classify_notification`]: the iPhone's extension (`keeper-nse`) with the
+// store it opens, Android's app (`AccountManager::push_shown`) with the
+// account that is live. One reader, one table — no second classification.
+
+/// How often the edits of an answer are asked for while it is waited on.
+const EDIT_POLL: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// `event` as JSON, as the classifier reads it.
+pub fn json_of(event: &matrix_sdk::deserialized_responses::TimelineEvent) -> Option<Value> {
+    event.raw().deserialize_as::<Value>().ok()
+}
+
+/// Whether a device the SDK links to `event`'s sender sealed it (R185).
+fn sealed(event: &matrix_sdk::deserialized_responses::TimelineEvent) -> bool {
+    crate::agents::room::sealed_by_sender(event.encryption_info().map(|info| &**info))
+}
+
+/// What the decrypted `event` of `room` shows (98.1 #1, #2): the facts
+/// [`PushContext`] needs read from `client`'s store and the homeserver, then
+/// [`classify_notification`]; an answer's body is its newest words by the
+/// end of [`ANSWER_BUDGET`] from `started`, when the push arrived. `room`
+/// is the room as the caller loaded it (the extension's notification client
+/// may know it when `client` does not). `Err` is why it could not be read —
+/// the caller's generic notification.
+pub async fn shown_of(
+    client: &matrix_sdk::Client,
+    room: &matrix_sdk::Room,
+    event: &matrix_sdk::deserialized_responses::TimelineEvent,
+    started: std::time::Instant,
+) -> Result<Classified, String> {
+    use matrix_sdk::ruma::{EventId, UserId};
+
+    let json = json_of(event).ok_or("the event does not read")?;
+    let sender = json["sender"]
+        .as_str()
+        .and_then(|sender| UserId::parse(sender).ok())
+        .ok_or("the event names no sender")?;
+    let own = client.user_id().ok_or("not signed in")?.to_owned();
+    let room_id = room.room_id().to_owned();
+    let agent_power =
+        crate::agents::room::holds_agent_power(room.power_levels().await.ok().as_ref(), &sender);
+    let sealed_now = sealed(event);
+    let is_message = json["type"] == "m.room.message";
+    let answer_agent = if is_message && agent_power && sealed_now && sender != own {
+        match client.get_room(&room_id) {
+            Some(own_room) => crate::account::proxy_answer_agent(&own_room).await,
+            None => None,
+        }
+    } else {
+        None
+    };
+    let replaced = match json["content"]["m.relates_to"]["event_id"].as_str() {
+        Some(target) if is_message => match EventId::parse(target) {
+            Ok(target) => room
+                .event(&target, None)
+                .await
+                .ok()
+                .filter(sealed)
+                .and_then(|original| json_of(&original)),
+            Err(_) => None,
+        },
+        _ => None,
+    };
+    let name = sender_name(room, &sender).await;
+    let ctx = PushContext {
+        own: &own,
+        room: crate::agents::room::AgentRoomKind::of(room.room_type().as_ref()),
+        room_id: room_id.as_str(),
+        agent_power,
+        sealed: sealed_now,
+        answer_agent: answer_agent.as_deref(),
+        sender_name: &name,
+        replaced: replaced.as_ref(),
+    };
+    match classify_notification(&json, &ctx) {
+        Classified::Drop => Ok(Classified::Drop),
+        Classified::Show(mut shown) => {
+            if let Some(anchor) = shown.answer.clone() {
+                let agent = shown_name(&name, sender.as_str());
+                shown.body =
+                    newest_words(room, &anchor, &sender, &shown.body, agent, started).await;
+            }
+            Ok(Classified::Show(shown))
+        }
+    }
+}
+
+/// How the notification names `sender`: their display name in the room,
+/// else their user id's localpart.
+async fn sender_name(room: &matrix_sdk::Room, sender: &matrix_sdk::ruma::UserId) -> String {
+    room.get_member_no_sync(sender)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|member| member.display_name().map(str::to_owned))
+        .unwrap_or_else(|| sender.localpart().to_owned())
+}
+
+/// An answer's words when the budget ends (98.1 #2): its edits are asked for
+/// every [`EDIT_POLL`] until [`ANSWER_BUDGET`] from the push's arrival, and
+/// [`latest_text`] picks the newest seen, else `shown`.
+async fn newest_words(
+    room: &matrix_sdk::Room,
+    anchor: &str,
+    sender: &matrix_sdk::ruma::UserId,
+    shown: &str,
+    name: &str,
+    started: std::time::Instant,
+) -> String {
+    use matrix_sdk::room::{IncludeRelations, RelationsOptions};
+    use matrix_sdk::ruma::events::relation::RelationType;
+    use matrix_sdk::ruma::{EventId, UInt};
+
+    let Ok(anchor_id) = EventId::parse(anchor) else {
+        return shown.to_owned();
+    };
+    let mut seen: Vec<(std::time::Duration, String)> = Vec::new();
+    while started.elapsed() < ANSWER_BUDGET {
+        let left = ANSWER_BUDGET.saturating_sub(started.elapsed());
+        tokio::time::sleep(EDIT_POLL.min(left)).await;
+        let options = RelationsOptions {
+            include_relations: IncludeRelations::RelationsOfType(RelationType::Replacement),
+            limit: Some(UInt::from(20u32)),
+            ..Default::default()
+        };
+        let Ok(relations) = room.relations(anchor_id.clone(), options).await else {
+            continue;
+        };
+        let newest = relations
+            .chunk
+            .iter()
+            .filter_map(|edit| {
+                let json = json_of(edit)?;
+                let at = json["origin_server_ts"].as_u64().unwrap_or(0);
+                answer_edit(&json, anchor, sender.as_str(), sealed(edit))
+                    .map(|text| (at, text.to_owned()))
+            })
+            .max_by_key(|(at, _)| *at);
+        if let Some((_, text)) = newest {
+            seen.push((started.elapsed(), text));
+        }
+    }
+    let edits: Vec<(std::time::Duration, &str)> =
+        seen.iter().map(|(at, text)| (*at, text.as_str())).collect();
+    latest_text(shown, &edits, ANSWER_BUDGET, name)
+}
+
+// ---------------------------------------------------------------------------
 // The pusher (98.1 #3; AD-412, Q4, DW-1230)
 //
 // The phone hands each account's homeserver an `event_id_only` pusher naming
@@ -761,18 +912,35 @@ pub fn pusher_ids(
     )
 }
 
-/// The pusher this phone registers on one account (98.1 #3): an `http`
-/// pusher to the person's gateway, `event_id_only`, whose `default_payload`
-/// asks iOS to run the notification extension (`mutable-content`), gives
-/// the alert it shows when the extension cannot say more, and names the
-/// local account whose store the extension opens ([`PAYLOAD_ACCOUNT`]).
+/// The pusher this phone registers on one account (98.1 #3, 98.4 #1): an
+/// `http` pusher to the person's gateway, `event_id_only`. On the iPhone its
+/// pushkey is the APNs token and its `default_payload` asks iOS to run the
+/// notification extension (`mutable-content`), gives the alert it shows when
+/// the extension cannot say more, and names the local account whose store
+/// the extension opens ([`PAYLOAD_ACCOUNT`]). On Android its pushkey is the
+/// UnifiedPush endpoint and it carries nothing else: keeper reads the event
+/// in its own process, with the account that knows the room
+/// ([`crate::agents::unifiedpush`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PusherSpec {
     gateway: Gateway,
-    environment: ApnsEnvironment,
-    token: Vec<u8>,
+    transport: Transport,
     account: String,
     device: String,
+}
+
+/// How a push reaches this device once the gateway has it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Transport {
+    /// Apple's push service, to this build's token in its environment.
+    Apns {
+        environment: ApnsEnvironment,
+        token: Vec<u8>,
+    },
+    /// The person's UnifiedPush distributor, to this endpoint.
+    UnifiedPush {
+        endpoint: crate::agents::unifiedpush::Endpoint,
+    },
 }
 
 impl PusherSpec {
@@ -793,16 +961,40 @@ impl PusherSpec {
         let gateway = Gateway::parse(stored?).ok()??;
         Some(PusherSpec {
             gateway,
-            environment,
-            token: token.to_vec(),
+            transport: Transport::Apns {
+                environment,
+                token: token.to_vec(),
+            },
             account: account.to_owned(),
             device: device.to_owned(),
         })
     }
 
-    /// The pusher's identity ([`pusher_ids`]).
+    /// The Android pusher (98.4 #1): to the gateway discovery found on the
+    /// endpoint's own server ([`crate::agents::unifiedpush::discover_gateway`],
+    /// which reads it through [`Gateway::parse`]) — never one keeper chose —
+    /// with the endpoint as its pushkey.
+    pub fn unifiedpush(
+        gateway: Gateway,
+        endpoint: crate::agents::unifiedpush::Endpoint,
+        account: &str,
+        device: &str,
+    ) -> PusherSpec {
+        PusherSpec {
+            gateway,
+            transport: Transport::UnifiedPush { endpoint },
+            account: account.to_owned(),
+            device: device.to_owned(),
+        }
+    }
+
+    /// The pusher's identity ([`pusher_ids`], or the endpoint's
+    /// [`crate::agents::unifiedpush::Endpoint::pusher_ids`]).
     pub fn ids(&self) -> matrix_sdk::ruma::api::client::push::PusherIds {
-        pusher_ids(self.environment, &self.token)
+        match &self.transport {
+            Transport::Apns { environment, token } => pusher_ids(*environment, token),
+            Transport::UnifiedPush { endpoint } => endpoint.pusher_ids(),
+        }
     }
 
     /// The pusher as the homeserver's `POST /pushers/set` takes it.
@@ -812,16 +1004,18 @@ impl PusherSpec {
 
         let mut data = HttpPusherData::new(self.gateway.as_str().to_owned());
         data.format = Some(PushFormat::EventIdOnly);
-        data.data.insert(
-            "default_payload".to_owned(),
-            serde_json::json!({
-                "aps": {
-                    "mutable-content": 1,
-                    "alert": { "title": GENERIC_TITLE, "body": GENERIC_BODY },
-                },
-                PAYLOAD_ACCOUNT: self.account,
-            }),
-        );
+        if let Transport::Apns { .. } = self.transport {
+            data.data.insert(
+                "default_payload".to_owned(),
+                serde_json::json!({
+                    "aps": {
+                        "mutable-content": 1,
+                        "alert": { "title": GENERIC_TITLE, "body": GENERIC_BODY },
+                    },
+                    PAYLOAD_ACCOUNT: self.account,
+                }),
+            );
+        }
         PusherInit {
             ids: self.ids(),
             kind: PusherKind::Http(data),

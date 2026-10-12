@@ -10223,3 +10223,66 @@ origin: epic 98, story 98.3 (review R98TAB-03 (b), rung `agents-98-tablet` fix r
 location: `src-tauri/crates/keeper/gen/android/app/src/main/java/dev/tgorka/keeper/AuthTabPlugin.kt` (`authTabBrowser`)
 reason: `AuthTabPlugin` requests an Auth Tab only from the browser Android's Custom Tabs pick (`CustomTabsClient.getPackageName`, the default browser when it serves Custom Tabs), and only when that browser supports Auth Tab. When it does not but another installed browser does, the sign-in falls back to the claimable deep link (DW-1300) though an unclaimable one was on the device. Preferring an installed Auth-Tab browser means choosing among the person's browsers on their behalf — which one, and whether to say so — so it waits for that decision; the `<queries>` it needs are already in the manifest.
 status: open
+
+### DW-1310: Android push is read only while keeper's process runs, and whether it still answers after its activity is gone is unmeasured.
+
+origin: epic 98, story 98.4 (rung `agents-98-unifiedpush`, 2026-10-12; R357)
+location: `src-tauri/crates/keeper/gen/android/app/src/main/java/dev/tgorka/keeper/PushBridge.kt`, `PushReceiver.kt`, `src-tauri/crates/keeper/src/push_android.rs`
+reason: keeper's Rust half (accounts, keys, the reader) starts with `MainActivity`; the distributor's broadcast to a stopped keeper starts only the receiver, which posts the one generic notification. keeper runs no foreground service (AD-414, Tauri #15671), so after Android stops it the person sees "Open keeper to see what arrived." for any push of an account holding agent rooms, never the request itself. Whether the Rust half still answers the event channel while the process lives on after its activity was destroyed (back pressed) is not known; if it does not, the bridge needs to treat a destroyed activity as "not running". A headless start of the Rust half for a push would close both; measure on the tablet device run first.
+status: open
+
+### DW-1311: Android registers its pusher only when the distributor hands an endpoint.
+
+origin: epic 98, story 98.4 (rung `agents-98-unifiedpush`, 2026-10-12)
+location: `src-tauri/crates/keeper/src/push_android.rs` (`new_endpoint`, `start`)
+reason: As on the iPhone (DW-1260): registration runs when the distributor answers `registerApp` at start. An account signed in later, an account's first agent room, or a gateway that comes up after a refused discovery waits for keeper's next start. A re-registration on sign-in and on joining a session room would close it.
+status: open
+
+### DW-1312: keeper offers no way to switch to another UnifiedPush distributor while the confirmed one stays installed.
+
+origin: epic 98, story 98.4 (rung `agents-98-unifiedpush`, 2026-10-12; R356; narrowed by fix round 1, R359)
+location: `keeper_core::agents::unifiedpush::choose_distributor`, Settings → Notifications (`PhonePush`)
+reason: Narrowed in fix round 1: keeper now registers only with a distributor the person confirmed on this device, and Settings offers every installed one — the only one, or several — by name and package, so the "several, no picker" case is closed. What is left: once one is confirmed, keeper uses it while it stays installed and Settings offers no other; switching means uninstalling it (keeper then asks again). A "Use another distributor" control that returns to the question (and removes the pusher of the endpoint it leaves) would close it.
+status: open (narrowed)
+
+### DW-1313: Android push has not been built into an APK or run.
+
+origin: epic 98, story 98.4 #9 (rung `agents-98-unifiedpush`, 2026-10-12)
+location: `gen/android/app/src/main/java/dev/tgorka/keeper/{UnifiedPushPlugin,PushBridge,PushReceiver,PushActionReceiver}.kt`, `app/build.gradle.kts`, `AndroidManifest.xml`, `docs/android.md` § What Gradle resolves
+reason: In a scratch copy of `gen/android` (the five Tauri Android libraries beside it, wry's and Tauri's generated Kotlin written from their templates) Gradle compiled the app's Kotlin (`compileUniversalDebugKotlin`) and resolved both runtime classpaths (`the_resolved_android_classpath_is_licensed` passed). That run found the base's Kotlin 1.9.25 unable to read the `kotlin-stdlib` 2.1.20 that androidx.browser 1.10.0 brings — every Kotlin file of the app failed — fixed by Kotlin Gradle plugin 2.1.20 (carried by rung `agents-98-tablet`, R354 amended). The merged release manifest was not kept (its artefact is empty), so the receivers and the connector's `<queries>` in it are read from the sources and the connector's AAR, not observed. Fix round 1's Kotlin (the distributors' names, the intents' data URIs, the status-bar icon) is checked by inspection only. Nothing linked `libkeeper_lib.so`, packaged, shrank (R8) or ran an APK: CI's `android` job is the first build and its first green run is owed; the device run is 98.4 #10.
+status: open
+
+### DW-1314: A tap's `user_info` reaches keeper through its exported activity, where another app could forge one.
+
+origin: epic 98, story 98.4 (rung `agents-98-unifiedpush`, 2026-10-12; R357)
+location: `PushNotifier.openIntent` (`PushBridge.kt`), `UnifiedPushPlugin.opened`
+reason: The notification's tap opens `MainActivity` (exported: it is the launcher) with the notification's `user_info` as an extra; any app can start that activity with an extra carrying `keeper_shown`, an account and a room, and keeper would open that room. It decides nothing (actions go only to the unexported `PushActionReceiver`, and an approval is decided on its card), so it is navigation an app could already cause by other means. Routing taps through an unexported trampoline receiver, or a per-launch random token in the extra, would close it.
+status: open
+
+### DW-1315: An unreachable UnifiedPush server is asked again only at keeper's next start.
+
+origin: epic 98, story 98.4 (rung `agents-98-unifiedpush`, fix round 1, 2026-10-12; R98UP1-01)
+location: `src-tauri/crates/keeper/src/push_android.rs` (`new_endpoint`), `keeper_core::agents::unifiedpush::pusher_change`
+reason: A server keeper cannot reach no longer removes the pusher (`PusherChange::Keep`): nothing changes, and the question is asked again at the next start. While keeper runs it is not retried, so a first endpoint whose server was unreachable at start registers nothing until keeper starts again — and keeps no endpoint, so the egress list shows no row for a server keeper only tried to ask. A retry with backoff while keeper runs (with DW-1311's re-registration) would close it.
+status: open
+
+### DW-1316: A server that stops being a Matrix gateway is noticed only when the distributor gives a new endpoint.
+
+origin: epic 98, story 98.4 (rung `agents-98-unifiedpush`, fix round 1, 2026-10-12; R98UP1-03)
+location: `keeper_core::agents::unifiedpush::known_gateway`
+reason: keeper asks an endpoint's server once (the promise the docs make): an endpoint it kept whose server answered as a gateway is not asked again at the next start, so a server whose gateway was switched off keeps receiving pushers' event ids until the distributor hands keeper a new endpoint; the homeserver's own pusher failures (its gateway answering 404) are the signal. Asking again on a cadence, or when the homeserver reports the pushkey rejected, would close it.
+status: open
+
+### DW-1317: A UnifiedPush server whose certificate this device refuses reads as "could not reach".
+
+origin: epic 98, story 98.4 (review-98unifiedpush-1, DW candidate; fix round 1, 2026-10-12)
+location: `keeper_core::agents::unifiedpush::discover_gateway`
+reason: Every transport error, a refused certificate (a private CA on the ntfy host) included, becomes `DiscoveryRefusal::Unreachable`, whose sentence says keeper could not reach the host. The homeserver path uses the same TLS stack, so a CA that works for one works for the other; splitting "no route" from "certificate refused" (reqwest's `is_connect`/`is_timeout` against the rest) would give the person the right hint.
+status: open
+
+### DW-1318: Each push makes keeper read its event up to seven times while the keys wait, with no cap on concurrent pushes.
+
+origin: epic 98, story 98.4 (review-98unifiedpush-1, DW candidate; fix round 1, 2026-10-12)
+location: `src-tauri/crates/keeper/src/push_android.rs` (`message`), `AccountManager::push_shown`
+reason: `push_shown` reads the pushed event again every `DECRYPT_POLL` for up to `DECRYPT_BUDGET` while it cannot be decrypted, per push, and pushes are handled concurrently; anyone holding the endpoint (a capability) can make keeper do that and post its generic notification at will — keeper's words, no action. A bound on concurrent reads would cap it.
+status: open

@@ -4972,17 +4972,73 @@ pub fn push_gateway_set(
 /// The session room a tapped keeper notification opens, once (98.1,
 /// UX-DR144): the webview asks on mount — for a tap that launched keeper —
 /// and on `push://open`. Every target, so the command list is identical
-/// everywhere; only the iPhone has push (`push_ios`).
+/// everywhere; the iPhone (`push_ios`) and Android (`push_android`) push.
 #[cfg(target_os = "ios")]
 #[tauri::command]
 pub fn push_open_take() -> Result<Option<keeper_core::agents::push::PushOpenVm>, IpcError> {
     Ok(crate::push_ios::take_open())
 }
 
-/// No push here, so nothing is ever waiting to be opened.
-#[cfg(not(target_os = "ios"))]
+/// Android's twin: the room a tapped notification opens (98.4).
+#[cfg(target_os = "android")]
 #[tauri::command]
 pub fn push_open_take() -> Result<Option<keeper_core::agents::push::PushOpenVm>, IpcError> {
+    Ok(crate::push_android::take_open())
+}
+
+/// No push here, so nothing is ever waiting to be opened.
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
+#[tauri::command]
+pub fn push_open_take() -> Result<Option<keeper_core::agents::push::PushOpenVm>, IpcError> {
+    Ok(None)
+}
+
+/// Where push through UnifiedPush stands on this Android device, and what it
+/// brings (98.4, Settings → Notifications): `None` on every other build,
+/// where push is the iPhone's gateway field or absent. Every target, so the
+/// command list is identical everywhere.
+#[cfg(target_os = "android")]
+#[tauri::command]
+pub fn unifiedpush_status(
+) -> Result<Option<keeper_core::agents::unifiedpush::UnifiedPushVm>, IpcError> {
+    Ok(Some(crate::push_android::status()))
+}
+
+/// Not Android: no UnifiedPush.
+#[cfg(not(target_os = "android"))]
+#[tauri::command]
+pub fn unifiedpush_status(
+) -> Result<Option<keeper_core::agents::unifiedpush::UnifiedPushVm>, IpcError> {
+    Ok(None)
+}
+
+/// The person confirmed the UnifiedPush distributor `package` in Settings →
+/// Notifications (98.4, R98UP1-02): keeper keeps the choice on this device
+/// and registers with it, and answers where push stands now. Only a
+/// distributor keeper asked about is confirmed. `None` on every other build.
+#[cfg(target_os = "android")]
+#[tauri::command]
+pub async fn unifiedpush_confirm(
+    package: String,
+) -> Result<Option<keeper_core::agents::unifiedpush::UnifiedPushVm>, IpcError> {
+    crate::push_android::confirm(&package)
+        .await
+        .map(Some)
+        .map_err(|message| IpcError {
+            code: IpcErrorCode::Internal,
+            message,
+            account_id: None,
+            retriable: false,
+        })
+}
+
+/// Not Android: no UnifiedPush, nothing to confirm.
+#[cfg(not(target_os = "android"))]
+#[tauri::command]
+pub async fn unifiedpush_confirm(
+    package: String,
+) -> Result<Option<keeper_core::agents::unifiedpush::UnifiedPushVm>, IpcError> {
+    let _ = package;
     Ok(None)
 }
 
@@ -12901,14 +12957,21 @@ pub async fn egress_list(
     destinations.extend(keeper_core::egress::agent_egress(
         &keeper_core::agents::mac_tables::read(&data_dir).mcp,
     ));
-    // The push gateway the person named (98.1 #8, R330): only a phone
-    // registers a pusher, and only while the setting holds an address keeper
-    // registers; keeper never contacts it, its homeserver does.
-    #[cfg(not(desktop))]
+    // The push gateway the person named (98.1 #8, R330): only the iPhone
+    // registers a pusher to it, and only while the setting holds an address
+    // keeper registers; keeper never contacts it, its homeserver does.
+    #[cfg(target_os = "ios")]
     destinations.extend(keeper_core::egress::push_egress(
         keeper_core::registry::get_push_gateway_url(&data_dir)
             .map_err(to_ipc_error)?
             .as_deref(),
+    ));
+    // Android's UnifiedPush server (98.4 #8): the endpoint the distributor
+    // gave, by host — keeper asks it whether it is a Matrix gateway, and the
+    // homeserver sends it event ids.
+    #[cfg(target_os = "android")]
+    destinations.extend(keeper_core::egress::unifiedpush_egress(
+        keeper_core::agents::unifiedpush::kept_endpoint(&data_dir).as_ref(),
     ));
     Ok(destinations)
 }
@@ -13021,7 +13084,13 @@ pub async fn inbox_unsubscribe(
 pub async fn sign_out(state: State<'_, AppState>, account_id: String) -> Result<(), IpcError> {
     #[cfg(target_os = "ios")]
     let pusher = crate::push_ios::pusher_ids();
-    #[cfg(not(target_os = "ios"))]
+    #[cfg(target_os = "android")]
+    let pusher = state
+        .platform
+        .data_dir()
+        .ok()
+        .and_then(|dir| crate::push_android::pusher_ids(&dir));
+    #[cfg(not(any(target_os = "ios", target_os = "android")))]
     let pusher = None;
     state
         .accounts

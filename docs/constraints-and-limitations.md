@@ -118,8 +118,18 @@ why (`docs/android.md` has the whole list):
   Android build at all (`check:android-graph`): there it would be a mock that forgets.
 - **No backups.** The manifest turns backup and device transfer off for everything.
 - **Sync is gitoxide in-process**, as on the iPhone: no `git` binary to spawn.
-- **No agent, recorder, transcription, voice or push yet** — the recorder is honestly
-  `Unsupported`; voice and UnifiedPush are story 98.4.
+- **No agent, recorder, transcription or voice yet** — the recorder is honestly
+  `Unsupported`; voice is story 98.4's last rung.
+- **Push is UnifiedPush, read only while keeper runs.** keeper registers with a distributor
+  (the ntfy app and a server the person runs) only after the person confirmed that one, by
+  name and package, in Settings on this device; it gives keeper an endpoint, keeper asks
+  that server once per endpoint whether it is a Matrix push gateway and registers an
+  `event_id_only` pusher to it only when it answers so (`agents::unifiedpush`), never one of
+  its own; a server it cannot reach changes nothing. A push is read in keeper's own
+  process with the iPhone's classifier; once Android has stopped keeper — no foreground
+  service (AD-414) — a push shows only keeper's generic words. Approve once / Deny need
+  Android 12 (an action that requires unlocking); older Android gets no actions. Not yet run
+  on a device (98.4 #10).
 - **Sign-in is an Auth Tab**, which returns the callback as the activity's result; a
   browser without Auth Tab falls back to a Custom Tab and the claimable `keeper://` deep
   link (PKCE-protected). A verified `https` App Link needs a per-signer `assetlinks.json`

@@ -164,7 +164,7 @@ import type {
   VoiceUnavailableVm,
   VoiceWakeVm,
 } from "@/lib/ipc/client";
-import { VOICE_WAKE_EVENT } from "@/lib/ipc/client";
+import { UNIFIEDPUSH_STATUS_EVENT, VOICE_WAKE_EVENT } from "@/lib/ipc/client";
 import { DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
 import { platformStore } from "@/lib/stores/platform";
 // The phone's and the tablet's "On this …" lists are composed in Rust
@@ -179,6 +179,7 @@ import {
   mediaBlockMockHandlers,
 } from "./media-block-fixture";
 import { transcriptionMockHandlers } from "./transcription-fixture";
+import UNIFIEDPUSH_FIXTURE from "./unifiedpush-fixture.json";
 
 /** Roughly now, so relative timestamps read as "3 min ago" rather than 1970. */
 const NOW = Date.now();
@@ -7040,9 +7041,38 @@ function mockPushGatewaySet(payload: Record<string, unknown>) {
   return pushGateway;
 }
 
+/** The tablet's distributor was confirmed in Settings this session (98.4). */
+let unifiedpushConfirmed = false;
+
 const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = {
   push_gateway_get: () => pushGateway,
   push_open_take: () => null,
+  // Android's push status (98.4): the tablet first asks which distributor to use
+  // (ntfy, by name and package), and once confirmed answers a registered pusher. Both
+  // views are Rust's own `UnifiedPushVm`s, written by the keeper-core test
+  // `the_mock_shells_push_status_is_rusts` — never copied here. Every other build: null.
+  unifiedpush_status: () =>
+    MOCK_PLATFORM === "tablet"
+      ? unifiedpushConfirmed
+        ? UNIFIEDPUSH_FIXTURE.registered
+        : UNIFIEDPUSH_FIXTURE.asking
+      : null,
+  unifiedpush_confirm: (payload) => {
+    if (MOCK_PLATFORM !== "tablet") {
+      return null;
+    }
+    if (!UNIFIEDPUSH_FIXTURE.asking.offers.some((offer) => offer.package === payload.package)) {
+      throw {
+        code: "internal",
+        message: "keeper did not ask about that distributor",
+        accountId: null,
+        retriable: false,
+      };
+    }
+    unifiedpushConfirmed = true;
+    void emit(UNIFIEDPUSH_STATUS_EVENT);
+    return UNIFIEDPUSH_FIXTURE.registered;
+  },
   push_gateway_set: mockPushGatewaySet,
   inbox_subscribe: subscribeMockInbox,
   agent_approval_decide: mockApprovalDecide,

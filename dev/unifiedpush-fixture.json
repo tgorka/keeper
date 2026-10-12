@@ -1,0 +1,17 @@
+{
+  "asking": {
+    "note": "keeper syncs and notifies about messages only while it is open. With a UnifiedPush distributor whose server is also a Matrix push gateway, your agents' approval requests and your own agent's answers reach this tablet while keeper runs in the background, read on this tablet (nothing else shows; the ids of other messages still pass through that server, and this tablet discards them); once Android has stopped keeper, a push only says that something arrived. There is no voice here yet.",
+    "offers": [
+      {
+        "confirm": "Use ntfy (io.heckel.ntfy) for push",
+        "package": "io.heckel.ntfy"
+      }
+    ],
+    "status": "keeper registers for push on this tablet only through a UnifiedPush distributor you confirm here. Installed: ntfy (io.heckel.ntfy). The one you confirm gives keeper an address on its server; keeper asks that server once whether it is a Matrix push gateway, and your homeserver then sends it the id of every message that would notify on accounts that hold agent rooms, never its words."
+  },
+  "registered": {
+    "note": "keeper syncs and notifies about messages only while it is open. With a UnifiedPush distributor whose server is also a Matrix push gateway, your agents' approval requests and your own agent's answers reach this tablet while keeper runs in the background, read on this tablet (nothing else shows; the ids of other messages still pass through that server, and this tablet discards them); once Android has stopped keeper, a push only says that something arrived. There is no voice here yet.",
+    "offers": [],
+    "status": "Push reaches this tablet through ntfy.example.org, the server of ntfy (io.heckel.ntfy), the UnifiedPush distributor you confirmed; it answers as a Matrix push gateway. Your homeserver sends it the id of every message that would notify on accounts that hold agent rooms, never its words."
+  }
+}

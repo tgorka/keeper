@@ -53,6 +53,7 @@ import type { TranscriptionStatusVm } from "./gen/TranscriptionStatusVm";
 import type { TranscriptMediaVm } from "./gen/TranscriptMediaVm";
 import type { TranscriptVm } from "./gen/TranscriptVm";
 import type { TranscriptWrittenVm } from "./gen/TranscriptWrittenVm";
+import type { UnifiedPushVm } from "./gen/UnifiedPushVm";
 
 export type {
   CorrectionResultVm,
@@ -463,6 +464,7 @@ export type { DestinationVm } from "./gen/DestinationVm";
 export type { DeviceClassVm } from "./gen/DeviceClassVm";
 export type { DeviceCodeVm } from "./gen/DeviceCodeVm";
 export type { DiscoveredBridgeVm } from "./gen/DiscoveredBridgeVm";
+export type { DistributorOfferVm } from "./gen/DistributorOfferVm";
 export type { DockBadgeMode } from "./gen/DockBadgeMode";
 export type { DocumentFormat } from "./gen/DocumentFormat";
 export type { DocumentVm } from "./gen/DocumentVm";
@@ -752,6 +754,7 @@ export type { TokenViaVm } from "./gen/TokenViaVm";
 export type { ToolName } from "./gen/ToolName";
 export type { TypingBatch } from "./gen/TypingBatch";
 export type { TypistVm } from "./gen/TypistVm";
+export type { UnifiedPushVm } from "./gen/UnifiedPushVm";
 export type { UnknownBotGrantVm } from "./gen/UnknownBotGrantVm";
 export type { UnknownTaskVm } from "./gen/UnknownTaskVm";
 export type { UnlistedVm } from "./gen/UnlistedVm";
@@ -3783,18 +3786,50 @@ export async function listenNotifyNavigate(
 }
 
 /**
- * The event the iPhone's shell emits when a keeper push was tapped (98.1, UX-DR144). Must
- * match `PUSH_OPEN_EVENT` in `keeper/src/push_ios.rs`. It carries nothing: the room to
+ * The event a phone's shell emits when a keeper push was tapped (98.1, UX-DR144; 98.4).
+ * Must match `PUSH_OPEN_EVENT` in `keeper/src/push_ios.rs` and `push_android.rs`. It carries nothing: the room to
  * open is taken with {@link pushOpenTake}.
  */
 export const PUSH_OPEN_EVENT = "push://open";
 
 /**
  * The session room a tapped keeper notification opens, once; `null` when none waits
- * (always, off the iPhone).
+ * (always, off the iPhone and Android).
  */
 export async function pushOpenTake(): Promise<PushOpenVm | null> {
   return await invoke<PushOpenVm | null>("push_open_take");
+}
+
+/**
+ * Where push through UnifiedPush stands on this Android device and what it brings, in
+ * Rust's sentences (98.4); `null` on every other build — the iPhone's push is its typed
+ * gateway ({@link pushGatewayGet}).
+ */
+export async function unifiedpushStatus(): Promise<UnifiedPushVm | null> {
+  return await invoke<UnifiedPushVm | null>("unifiedpush_status");
+}
+
+/**
+ * The person confirmed the UnifiedPush distributor `pkg` (one of
+ * {@link UnifiedPushVm.offers}) in Settings: Rust keeps the choice on this device, registers
+ * with it, and answers where push stands now; `null` on every other build (98.4).
+ */
+export async function unifiedpushConfirm(pkg: string): Promise<UnifiedPushVm | null> {
+  return await invoke<UnifiedPushVm | null>("unifiedpush_confirm", { package: pkg });
+}
+
+/**
+ * The event Android's shell emits when where push stands changed. Must match
+ * `STATUS_EVENT` in `keeper/src/push_android.rs`; it carries nothing — re-read
+ * {@link unifiedpushStatus}.
+ */
+export const UNIFIEDPUSH_STATUS_EVENT = "unifiedpush://status";
+
+/** Subscribe to {@link UNIFIEDPUSH_STATUS_EVENT}; resolves with an unlisten function. */
+export async function listenUnifiedpushStatus(onChanged: () => void): Promise<() => void> {
+  return await listen(UNIFIEDPUSH_STATUS_EVENT, () => {
+    onChanged();
+  });
 }
 
 /** Subscribe to {@link PUSH_OPEN_EVENT}; resolves with an unlisten function. */

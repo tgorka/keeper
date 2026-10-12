@@ -124,6 +124,12 @@ mod android;
 // decision is `keeper_core::agents::push`.
 #[cfg(target_os = "ios")]
 mod push_ios;
+// Push on Android (Epic 98, story 98.4, AD-414): the UnifiedPush
+// distributor, the gateway on its server, the pusher, a push read and posted
+// in keeper's own process, actions and taps. Android-only; every decision is
+// `keeper_core::agents::{push, unifiedpush}`.
+#[cfg(target_os = "android")]
+mod push_android;
 #[cfg(target_os = "ios")]
 mod voice_ios;
 // The island (Story 65.5, AD-194): the Live Activity that shows the phone's
@@ -327,6 +333,9 @@ pub fn run() {
     // disclosure — written into the webview before the bundle runs (story
     // 98.3), so the front never renders a frame without them.
     let builder = builder.plugin(ipc::platform_plugin());
+    // Push through the person's UnifiedPush distributor (story 98.4).
+    #[cfg(target_os = "android")]
+    let builder = builder.plugin(push_android::plugin());
     // Opt-in launch-at-login (Story 10.3, FR-53, AD-25). The autostart plugin owns
     // the LaunchAgent state authoritatively; it is off by default and only ever
     // toggled by an explicit user action via the `launch_at_login_set` command.
@@ -673,6 +682,9 @@ pub fn run() {
             // be registered once iOS gives the token.
             #[cfg(target_os = "ios")]
             push_ios::set_up();
+            // Push (98.4): register with the person's UnifiedPush distributor.
+            #[cfg(target_os = "android")]
+            push_android::set_up(app.handle());
 
             // Store the app handle for the desktop dock-badge port (Story 10.3) so
             // `Platform::set_badge_count` can drive the main window's OS dock badge from
@@ -1285,6 +1297,8 @@ pub fn run() {
                 ipc::push_gateway_get,
                 ipc::push_gateway_set,
                 ipc::push_open_take,
+                ipc::unifiedpush_status,
+                ipc::unifiedpush_confirm,
                 ipc::dnd_get_global,
                 ipc::dnd_set_global,
                 ipc::network_mute_get,

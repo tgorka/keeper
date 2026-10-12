@@ -4126,20 +4126,104 @@ impl AccountManager {
     ) -> Result<Vec<(String, Result<crate::agents::push::Registered, CoreError>)>, CoreError> {
         use crate::agents::push;
 
-        let ids = push::pusher_ids(environment, token);
+        self.push_register_each(
+            platform,
+            push::pusher_ids(environment, token),
+            None,
+            |account| push::PusherSpec::of_setting(stored, environment, token, account, device),
+        )
+        .await
+    }
+
+    /// Register a pusher on every signed-in account, each activated when it
+    /// is not live yet: `spec(account)` where the account holds agent
+    /// session rooms, else the pusher `ids` names is removed
+    /// ([`crate::agents::push::register`]). `stale` — a pusher this device
+    /// registered before under another identity (Android's previous
+    /// endpoint) — is removed first, best effort. One outcome per account,
+    /// for the log.
+    pub async fn push_register_each(
+        &self,
+        platform: &Arc<dyn Platform>,
+        ids: crate::agents::push::PusherIds,
+        stale: Option<crate::agents::push::PusherIds>,
+        spec: impl Fn(&str) -> Option<crate::agents::push::PusherSpec>,
+    ) -> Result<Vec<(String, Result<crate::agents::push::Registered, CoreError>)>, CoreError> {
+        use crate::agents::push;
+
+        let stale = stale.filter(|stale| *stale != ids);
         let mut outcomes = Vec::new();
         for row in registry::list_accounts(&platform.data_dir()?)? {
-            let spec =
-                push::PusherSpec::of_setting(stored, environment, token, &row.account_id, device);
+            let spec = spec(&row.account_id);
             let outcome = match self.ensure_live(platform, &row.account_id).await {
-                Ok(client) => push::register(&client, ids.clone(), spec.as_ref())
-                    .await
-                    .map_err(|error| CoreError::Internal(error.to_string())),
+                Ok(client) => {
+                    if let Some(stale) = stale.clone() {
+                        if let Err(error) = push::register(&client, stale, None).await {
+                            tracing::warn!(
+                                account_id = %row.account_id,
+                                %error,
+                                "push: this device's previous pusher could not be removed"
+                            );
+                        }
+                    }
+                    push::register(&client, ids.clone(), spec.as_ref())
+                        .await
+                        .map_err(|error| CoreError::Internal(error.to_string()))
+                }
                 Err(error) => Err(error),
             };
             outcomes.push((row.account_id, outcome));
         }
         Ok(outcomes)
+    }
+
+    /// What a push that names `pushed` shows on Android (98.4 #3): the first
+    /// signed-in account that knows the room reads the event in this process
+    /// — waiting up to [`DECRYPT_BUDGET`](crate::agents::unifiedpush::DECRYPT_BUDGET) for its keys, which travel in
+    /// the sync beside it — and [`crate::agents::push::shown_of`] decides, as
+    /// the iPhone's extension does. `Ok(None)`: nothing shows — the classifier
+    /// dropped it, or no account here knows the room (a push keeper did not
+    /// ask for). `Err`: it could not be read, the generic notification.
+    pub async fn push_shown(
+        &self,
+        platform: &Arc<dyn Platform>,
+        pushed: &crate::agents::unifiedpush::PushedEvent,
+    ) -> Result<Option<(String, crate::agents::push::Shown)>, CoreError> {
+        use crate::agents::push;
+
+        let started = std::time::Instant::now();
+        for row in registry::list_accounts(&platform.data_dir()?)? {
+            let client = match self.ensure_live(platform, &row.account_id).await {
+                Ok(client) => client,
+                Err(error) => {
+                    tracing::warn!(account_id = %row.account_id, %error, "push: account not live");
+                    continue;
+                }
+            };
+            let Some(room) = client.get_room(&pushed.room_id) else {
+                continue;
+            };
+            let event = loop {
+                let event = room.event(&pushed.event_id, None).await.map_err(|error| {
+                    CoreError::Internal(format!("could not read the event: {error}"))
+                })?;
+                let still_sealed =
+                    push::json_of(&event).is_some_and(|json| json["type"] == "m.room.encrypted");
+                if !still_sealed || started.elapsed() >= crate::agents::unifiedpush::DECRYPT_BUDGET
+                {
+                    break event;
+                }
+                tokio::time::sleep(crate::agents::unifiedpush::DECRYPT_POLL).await;
+            };
+            return match push::shown_of(&client, &room, &event, started)
+                .await
+                .map_err(CoreError::Internal)?
+            {
+                push::Classified::Drop => Ok(None),
+                push::Classified::Show(shown) => Ok(Some((row.account_id, *shown))),
+            };
+        }
+        Ok(None)
     }
 
     /// The attached action of the approval `id` in the session room

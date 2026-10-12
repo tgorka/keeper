@@ -63,6 +63,11 @@ dependencies {
     implementation("androidx.activity:activity-ktx:1.10.1")
     // Auth Tab (`AuthTabPlugin.kt`): `AuthTabIntent` and its public result contract.
     implementation("androidx.browser:browser:1.10.0")
+    // Push through the person's UnifiedPush distributor (`PushReceiver.kt`,
+    // story 98.4). 2.5.0, the last line before the connector's web-push
+    // encryption: it pulls in nothing but the Kotlin standard library, which
+    // the build already resolves at a newer version.
+    implementation("org.unifiedpush.android:connector:2.5.0")
     implementation("com.google.android.material:material:1.12.0")
     implementation("androidx.lifecycle:lifecycle-process:2.10.0")
 }

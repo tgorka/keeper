@@ -18,11 +18,8 @@ import {
 import { BotGrantsSection } from "@/components/settings/bot-grants-section";
 import { BotsSection } from "@/components/settings/bots-section";
 import { ConfigSourceSection, FileControlled } from "@/components/settings/config-source-section";
-import {
-  BADGE_NOT_LIVE_SENTENCE,
-  NO_BACKGROUND_SYNC_SENTENCE,
-} from "@/components/settings/no-background-sync-disclosure";
-import { PushGatewayField } from "@/components/settings/push-gateway-field";
+import { BADGE_NOT_LIVE_SENTENCE } from "@/components/settings/no-background-sync-disclosure";
+import { PhonePush } from "@/components/settings/phone-push";
 import { RecordingSettingsControls } from "@/components/settings/recording-settings-controls";
 import { SyncGitRow } from "@/components/settings/sync-git-row";
 import { DeviceSection, SyncSection } from "@/components/settings/sync-section";
@@ -555,8 +552,7 @@ function NotificationsSection({ open }: { open: boolean }) {
               ))}
             </RadioGroup>
           </div>
-          <PushGatewayField open={open} />
-          <p className="text-muted-foreground">{NO_BACKGROUND_SYNC_SENTENCE}</p>
+          <PhonePush open={open} />
           <p className="text-muted-foreground">{BADGE_NOT_LIVE_SENTENCE}</p>
           {permission === "denied" && (
             <div className="mt-1 flex flex-col gap-2 rounded-md border border-border p-2">

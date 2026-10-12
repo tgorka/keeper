@@ -38,25 +38,17 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use keeper_core::agents::push::{
-    answer_edit, classify_notification, latest_text, shown_name, Classified, PushContext, Shown,
-    ANSWER_BUDGET,
-};
-use keeper_core::agents::room::{holds_agent_power, sealed_by_sender, AgentRoomKind};
+use keeper_core::agents::push::{shown_of, Classified, Shown};
 use keeper_core::auth::StoredSession;
 use keeper_core::container::{group_data_dir, MOVE_DONE};
 use matrix_sdk::cross_process_lock::CrossProcessLockConfig;
-use matrix_sdk::deserialized_responses::TimelineEvent;
-use matrix_sdk::room::{IncludeRelations, RelationsOptions};
-use matrix_sdk::ruma::events::relation::RelationType;
-use matrix_sdk::ruma::{EventId, OwnedEventId, OwnedRoomId, RoomId, UInt, UserId};
+use matrix_sdk::ruma::{EventId, OwnedEventId, OwnedRoomId, RoomId};
 use matrix_sdk::store::RoomLoadSettings;
-use matrix_sdk::{Client, Room};
+use matrix_sdk::Client;
 use matrix_sdk_ui::notification_client::{
     NotificationClient, NotificationProcessSetup, NotificationStatus,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 /// The cross-process lock holder of the extension's client; the app's is
 /// the SDK's default, `main`.
@@ -65,9 +57,6 @@ pub const HOLDER: &str = "nse";
 /// The whole of the extension's work: iOS gives an extension about thirty
 /// seconds before it shows the best attempt, and this leaves it room.
 pub const DEADLINE: Duration = Duration::from_secs(20);
-
-/// How often the edits of an answer are asked for while it is waited on.
-const EDIT_POLL: Duration = Duration::from_millis(1500);
 
 /// What the extension's Swift hands over, as JSON.
 #[derive(Debug, Clone, Deserialize)]
@@ -192,14 +181,6 @@ pub async fn answer(request: NseRequest) -> NseAnswer {
         .unwrap_or_else(generic)
 }
 
-fn json_of(event: &TimelineEvent) -> Option<Value> {
-    event.raw().deserialize_as::<Value>().ok()
-}
-
-fn sealed(event: &TimelineEvent) -> bool {
-    sealed_by_sender(event.encryption_info().map(|info| &**info))
-}
-
 async fn decide(
     store: &Store,
     request: &NseRequest,
@@ -244,112 +225,10 @@ async fn decide(
         .event(&event_id, None)
         .await
         .map_err(|e| format!("could not read the event: {e}"))?;
-    let json = json_of(&event).ok_or("the event does not read")?;
-    let sender = json["sender"]
-        .as_str()
-        .and_then(|sender| UserId::parse(sender).ok())
-        .ok_or("the event names no sender")?;
-    let own = client.user_id().ok_or("not signed in")?.to_owned();
-    let agent_power = holds_agent_power(room.power_levels().await.ok().as_ref(), &sender);
-    let sealed_now = sealed(&event);
-    let is_message = json["type"] == "m.room.message";
-    let answer_agent = if is_message && agent_power && sealed_now && sender != own {
-        match client.get_room(&room_id) {
-            Some(own_room) => keeper_core::account::proxy_answer_agent(&own_room).await,
-            None => None,
-        }
-    } else {
-        None
-    };
-    let replaced = match json["content"]["m.relates_to"]["event_id"].as_str() {
-        Some(target) if is_message => match EventId::parse(target) {
-            Ok(target) => room
-                .event(&target, None)
-                .await
-                .ok()
-                .filter(sealed)
-                .and_then(|original| json_of(&original)),
-            Err(_) => None,
-        },
-        _ => None,
-    };
-    let name = sender_name(&room, &sender).await;
-    let ctx = PushContext {
-        own: &own,
-        room: AgentRoomKind::of(room.room_type().as_ref()),
-        room_id: room_id.as_str(),
-        agent_power,
-        sealed: sealed_now,
-        answer_agent: answer_agent.as_deref(),
-        sender_name: &name,
-        replaced: replaced.as_ref(),
-    };
-    match classify_notification(&json, &ctx) {
+    match shown_of(&client, &room, &event, started).await? {
         Classified::Drop => Ok(NseAnswer::Drop),
-        Classified::Show(mut shown) => {
-            if let Some(anchor) = shown.answer.clone() {
-                let agent = shown_name(&name, sender.as_str());
-                shown.body =
-                    newest_words(&room, &anchor, &sender, &shown.body, agent, started).await;
-            }
-            Ok(NseAnswer::Show(*shown))
-        }
+        Classified::Show(shown) => Ok(NseAnswer::Show(*shown)),
     }
-}
-
-/// How the notification names `sender`: their display name in the room,
-/// else their user id's localpart.
-async fn sender_name(room: &Room, sender: &UserId) -> String {
-    room.get_member_no_sync(sender)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|member| member.display_name().map(str::to_owned))
-        .unwrap_or_else(|| sender.localpart().to_owned())
-}
-
-/// An answer's words when the budget ends (98.1 #2): its edits are asked for
-/// every [`EDIT_POLL`] until [`ANSWER_BUDGET`] from the push's arrival, and
-/// [`latest_text`] picks the newest seen, else `shown`.
-async fn newest_words(
-    room: &Room,
-    anchor: &str,
-    sender: &UserId,
-    shown: &str,
-    name: &str,
-    started: Instant,
-) -> String {
-    let Ok(anchor_id) = EventId::parse(anchor) else {
-        return shown.to_owned();
-    };
-    let mut seen: Vec<(Duration, String)> = Vec::new();
-    while started.elapsed() < ANSWER_BUDGET {
-        let left = ANSWER_BUDGET.saturating_sub(started.elapsed());
-        tokio::time::sleep(EDIT_POLL.min(left)).await;
-        let options = RelationsOptions {
-            include_relations: IncludeRelations::RelationsOfType(RelationType::Replacement),
-            limit: Some(UInt::from(20u32)),
-            ..Default::default()
-        };
-        let Ok(relations) = room.relations(anchor_id.clone(), options).await else {
-            continue;
-        };
-        let newest = relations
-            .chunk
-            .iter()
-            .filter_map(|edit| {
-                let json = json_of(edit)?;
-                let at = json["origin_server_ts"].as_u64().unwrap_or(0);
-                answer_edit(&json, anchor, sender.as_str(), sealed(edit))
-                    .map(|text| (at, text.to_owned()))
-            })
-            .max_by_key(|(at, _)| *at);
-        if let Some((_, text)) = newest {
-            seen.push((started.elapsed(), text));
-        }
-    }
-    let edits: Vec<(Duration, &str)> = seen.iter().map(|(at, text)| (*at, text.as_str())).collect();
-    latest_text(shown, &edits, ANSWER_BUDGET, name)
 }
 
 /// The lock that keeps one notification's client alive at a time in this
@@ -447,6 +326,7 @@ pub unsafe extern "C" fn keeper_nse_free(answer: *mut c_char) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
 
     const ACCOUNT: &str = "01J9ZK3Y6V5T4R3Q2P1N0M9K8J";
 
@@ -579,6 +459,7 @@ mod tests {
 mod one_at_a_time_tests {
     use super::*;
     use keeper_core::agents::push::{Category, PushApproval};
+    use serde_json::Value;
     use std::collections::BTreeSet;
     use std::sync::atomic::{AtomicUsize, Ordering};
 

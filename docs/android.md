@@ -55,6 +55,10 @@ once by `tauri android init` (tauri-cli 2.11.4) and committed, like
   `mobile`) and `KEEPER_ANDROID_MODEL`. None is a secret.
 - `app/src/main/java/dev/tgorka/keeper/KeystorePlugin.kt` — the Keystore half
   of the secret store (below).
+- `UnifiedPushPlugin.kt`, `PushBridge.kt`, `PushReceiver.kt` and
+  `PushActionReceiver.kt` in the same package — push through your UnifiedPush
+  distributor ([Push](#push) below), with the two receivers declared in
+  `AndroidManifest.xml`.
 - `AndroidManifest.xml`: no backups (`allowBackup="false"`,
   `fullBackupContent="false"` and `res/xml/data_extraction_rules.xml`, which
   exclude every domain from cloud backup and device transfer) and the
@@ -84,6 +88,16 @@ a Gradle `processUniversalReleaseMainManifest` run on 2026-10-12) asks for:
 - `dev.tgorka.keeper.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION` (AndroidX Core)
   — a `signature` permission keeper defines and holds itself, so receivers
   AndroidX registers at run time take no broadcast from another app.
+
+The UnifiedPush connector (98.4) adds `WAKE_LOCK`, already there, and a
+`<queries>` block naming the distributor's `REGISTER` and `UNREGISTER` actions,
+so keeper can see which distributors are installed and read their names (read
+from the connector 2.5.0 AAR's own manifest; no merged manifest of story 98.4's
+tree was kept, so the permission list above is expected, not observed, to be
+unchanged by it — CI's `android` job is the first build that shows it).
+keeper's `PushReceiver` is exported, as the connector requires: every
+broadcast to it carries the registration's random token, which the connector
+checks before keeper sees anything. `PushActionReceiver` is not exported.
 
 Also merged in, from AndroidX: `androidx.startup`'s `InitializationProvider`
 (not exported) and `profileinstaller`'s `ProfileInstallReceiver`, which is
@@ -180,6 +194,100 @@ keeper's data on the device.
   The plugin's free `open_url` is the `open` crate, which on Android spawns a
   desktop opener that does not exist, so keeper never calls it there.
 
+## Push
+
+Your agents' approval requests and your own agent's answers can reach this
+device while keeper is in the background — through a UnifiedPush
+**distributor** you install and a server you run (story 98.4; AD-414, D-36).
+keeper ships no push server and never picks one (D-1, D-4).
+
+**What you set up (operator actions).**
+
+- A UnifiedPush server that is also a Matrix push gateway, reachable over
+  `https://` by your homeserver and by this device — ntfy (Apache-2.0) is one:
+  it answers the Matrix push path on its own address. keeper registers push
+  only over `https://`.
+- The distributor app for it on this device — the ntfy app, pointed at that
+  server.
+
+**What keeper does.**
+
+1. At start keeper asks Android which distributors are installed, by package
+   and by the name Android shows. keeper registers with a distributor only
+   after **you confirmed that one** on this device: Settings → Notifications
+   names each installed distributor — name and package, because any app can
+   call itself a distributor and a name alone can be borrowed — and asks; the
+   only one installed is asked about too. Nothing registers before you answer.
+   Your choice is kept in keeper's data directory
+   (`unifiedpush-distributor`), on this device only — nothing syncs it; while
+   that distributor stays installed keeper uses it without asking, and if it
+   is gone, a different one is asked about again
+   (`unifiedpush::choose_distributor`). keeper never chooses for you.
+2. The distributor gives keeper an **endpoint**: an address on its server that
+   delivers whatever is posted to it to keeper here. Its path is a secret —
+   anyone who has it can post to this device — so keeper never logs or shows it,
+   only its host; it is kept in keeper's data directory as
+   `unifiedpush-endpoint`, with the distributor it came from and whether its
+   server answered as a gateway, so a sign-out can remove the pusher.
+3. keeper asks the endpoint's own server once per endpoint whether it is a
+   Matrix push gateway: `GET https://<endpoint host>/_matrix/push/v1/notify`,
+   which a gateway answers with `{"unifiedpush":{"gateway":"matrix"}}`
+   (`unifiedpush::discover_gateway`). An endpoint it kept whose server answered
+   so is not asked again at the next start (`unifiedpush::known_gateway`); a
+   new endpoint is. This is the one request keeper itself makes to the push
+   server — on the iPhone it contacts its gateway never. A redirect is not
+   followed. A definite other answer — a 404, something that is not that JSON,
+   a UnifiedPush gateway of another kind — registers nothing (and removes a
+   pusher registered before), and Settings → Notifications says why, naming
+   the host. **No answer** — the server unreachable, or slower than 10
+   seconds — is not an answer: keeper changes nothing, a pusher registered
+   before stays, and it asks again at the next start
+   (`unifiedpush::pusher_change`). No other gateway is ever tried.
+4. On every signed-in account that holds agent session rooms keeper registers
+   an `event_id_only` pusher: app `dev.tgorka.keeper.android`, pushkey the
+   endpoint, `url` the gateway it found, and nothing else
+   (`PusherSpec::unifiedpush`). An account without agent rooms has this
+   device's pusher removed; so does every account when the endpoint changes,
+   the distributor drops keeper, or you sign out (best effort).
+5. A push carries the event's id. If keeper is still running in the
+   background, the account that knows the room reads the event in keeper's own
+   process and the same classifier as the iPhone's decides
+   (`push::shown_of`, `push::classify_notification`): an agent's approval
+   request in keeper's words, or your own agent's answer by its newest text.
+   Nothing else shows; the ids of other messages still pass through your
+   server, and keeper discards them.
+6. An approval offers **Approve once** and **Deny** when the whole payload
+   fits, else **Deny** only, as on the iPhone — and only on Android 12
+   (API 31) and later, where an action can require the device to be unlocked.
+   Before Android 12 the notification carries no actions; tapping it opens the
+   session room, where the card decides. An action sends exactly what the
+   notification showed, scope `once`; if it cannot within 20 seconds, the
+   notification is replaced by one asking you to finish in keeper.
+7. Once Android has stopped keeper, a push cannot be read — keeper's accounts
+   and keys start with its window — so keeper posts one notification of its own
+   words ("Open keeper to see what arrived."), and each such push replaces the
+   last.
+
+**What is proved where.** On Linux: the pusher, the endpoint's grammar, the
+discovery answer and request (against a local HTTPS server), asking once per
+endpoint, an unreachable server keeping the pusher, what a push names, the
+distributor confirmation and what a notification posts and offers
+(`keeper-core/tests/unifiedpush_android.rs`,
+`unifiedpush_gateway_discovery.rs`). The Kotlin compiled
+(`compileUniversalDebugKotlin`) in a scratch copy of `gen/android` on Linux
+before the confirmation was added; the confirmation's Kotlin (the
+distributors' names), the notification intents' data URIs and the status-bar
+icon are checked by inspection, and `push_android.rs` type-checked for
+`aarch64-linux-android`; neither has been linked into an APK or run — CI's
+`android` job is the first build. The device run — the pusher on tuwunel,
+an approval from the lock screen, push latency — is story 98.4 #10, owed until
+its row is in `docs/agents.md` § *Measured*. What is still open: push only
+while keeper runs (DW-1310), registration only when the distributor answers at
+start (DW-1311), no way to switch to another distributor while the confirmed
+one stays installed (DW-1312, narrowed), no APK built yet (DW-1313), a tap's
+room forgeable through the launcher activity (DW-1314), and no retry of an
+unreachable server while keeper runs (DW-1315).
+
 ## Where keeper keeps its data
 
 - **The data directory** is the app's private files directory
@@ -216,14 +324,14 @@ tablet"** (on an Android phone the same lines say "phone"):
 - A folder you add here mirrors a remote your Mac already syncs and lives inside keeper's own storage: it syncs only when keeper opens, comes back in front or you pull to refresh, and nothing is merged on this tablet — the Mac merges.
 - The sessions board is here: read a session's cards, move one with Move to…, and open an agent's session room to decide its approval; creating and archiving sessions stays on your Mac. Bots talks to a model here, but the drive tools live on your Mac.
 - No screen recording and no transcription on this tablet.
-- keeper syncs and notifies only while it is open; nothing reaches this tablet while keeper is closed, and there is no voice here yet.
+- keeper syncs and notifies about messages only while it is open. With a UnifiedPush distributor whose server is also a Matrix push gateway, your agents' approval requests and your own agent's answers reach this tablet while keeper runs in the background, read on this tablet (nothing else shows; the ids of other messages still pass through that server, and this tablet discards them); once Android has stopped keeper, a push only says that something arrived. There is no voice here yet.
 - Updates arrive by installing a new build, signed with your own key and sideloaded.
 
 > This list is composed in Rust (`keeper_core::disclosure::android`) and shown by
 > the About screen exactly as Rust sends it; `keeper-core/tests/platform_disclosure_mirrors_docs.rs`
 > reads this list from disk and fails when the two differ. Edit both together or
-> neither. Push (UnifiedPush) and voice arrive with story 98.4, which rewrites the
-> fifth line.
+> neither. Voice arrives with story 98.4's voice rung, which rewrites the fifth
+> line again.
 
 And, for whoever builds it:
 
@@ -265,7 +373,8 @@ decision for each.
 | `ipc.rs` `KEYCHAIN_SERVICE` | gated to desktop and iOS (Android has no keychain service) |
 | `keeper` `Cargo.toml` `keyring` | moved to the desktop-only table |
 | `ipc.rs` `share_out: cfg!(target_os = "ios")` | kept: Android earns share-out with its own intent |
-| `push_ios`, `push_open_take`, `sign_out`'s pusher, `push_gateway_set`'s registration | kept: Android push is story 98.4 (UnifiedPush) |
+| `push_open_take`, `sign_out`'s pusher, `egress_list`'s push row, `unifiedpush_status`, `unifiedpush_confirm` | **widened** (98.4): `push_android.rs` — the tapped room, the UnifiedPush pusher removed at sign-out, the UnifiedPush server's row, where push stands and the distributor the person confirms (every other build answers `null`) |
+| `push_ios`, `push_gateway_set`'s registration, `push_egress` | kept: the typed gateway is the iPhone's (APNs); Android's gateway is discovered on the distributor's server |
 | `voice_ios`, `voice_island`, `voice_notify`, `voice_synthesizer`, `voice_ipc`, `voice_turn_models` | kept: Android voice is story 98.4; `voice_ipc`'s `AbsentPort` answers there |
 | `web_auth.rs` `start`, `start_in`, `MatrixSignIn::open_url` | **widened** (rung 8): an Auth Tab on Android (`AuthTabPlugin.kt`) |
 | `web_auth_apple.rs` | kept: `ASWebAuthenticationSession` is iOS's |
@@ -295,6 +404,7 @@ file declares any more fails too. Bumping a version means updating its row.
 | `androidx.browser:browser:1.10.0` | Apache-2.0 | `gen/android` app (Auth Tab) |
 | `androidx.lifecycle:lifecycle-process:2.10.0` | Apache-2.0 | `gen/android` app |
 | `androidx.webkit:webkit:1.14.0` | Apache-2.0 | `gen/android` app |
+| `org.unifiedpush.android:connector:2.5.0` | Apache-2.0 | `gen/android` app (push) |
 | `com.google.android.material:material:1.12.0` | Apache-2.0 | `gen/android` app |
 | `com.android.tools.build:gradle:8.11.0` | Apache-2.0 | `gen/android` build script, `buildSrc` (build tooling) |
 | `org.jetbrains.kotlin:kotlin-gradle-plugin:2.1.20` | Apache-2.0 | `gen/android` build script (build tooling; 2.1 because androidx.browser 1.10.0 brings `kotlin-stdlib` 2.1.20) |
@@ -323,8 +433,10 @@ fails the job. A row is one Maven group, or a group and every group beneath it
 when it ends in `.*`. Every row's licence is checked against
 `src-tauri/deny.toml` on Linux too
 (`every_group_gradle_may_resolve_carries_an_allowed_licence`). The list below
-is what Gradle resolved on 2026-10-12 for both configurations (identical); the
-job's first run is what confirms it on CI's runner.
+is what Gradle resolved on 2026-10-12 for both configurations (identical) —
+again after story 98.4 added the UnifiedPush connector, in a scratch copy of
+`gen/android`, where `the_resolved_android_classpath_is_licensed` passed over
+the report; the job's first run is what confirms it on CI's runner.
 
 | Group | Licence | What, pulled in by |
 |---|---|---|
@@ -338,3 +450,4 @@ job's first run is what confirms it on CI's runner.
 | `org.jetbrains.kotlin` | Apache-2.0 | `kotlin-stdlib`, `kotlin-bom` |
 | `org.jetbrains.kotlinx` | Apache-2.0 | `kotlinx-coroutines-*`, `kotlinx-serialization-*`, via AndroidX |
 | `org.jspecify` | Apache-2.0 | `jspecify`, via AndroidX |
+| `org.unifiedpush.android` | Apache-2.0 | `connector` — the app (push) |

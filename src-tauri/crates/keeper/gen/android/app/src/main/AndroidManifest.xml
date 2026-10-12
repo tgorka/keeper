@@ -66,6 +66,29 @@
             <!-- DEEP LINK PLUGIN. AUTO-GENERATED. DO NOT REMOVE. -->
         </activity>
 
+        <!--
+          Push through the person's UnifiedPush distributor (story 98.4):
+          PushReceiver takes the distributor's broadcasts (exported, as the
+          connector requires; each carries the registration's secret token,
+          which the connector checks before keeper sees anything);
+          PushActionReceiver takes a notification's actions and is reachable
+          only through keeper's own intents.
+        -->
+        <receiver
+            android:name=".PushReceiver"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="org.unifiedpush.android.connector.MESSAGE" />
+                <action android:name="org.unifiedpush.android.connector.UNREGISTERED" />
+                <action android:name="org.unifiedpush.android.connector.NEW_ENDPOINT" />
+                <action android:name="org.unifiedpush.android.connector.REGISTRATION_FAILED" />
+            </intent-filter>
+        </receiver>
+        <receiver
+            android:name=".PushActionReceiver"
+            android:exported="false" />
+
         <provider
           android:name="androidx.core.content.FileProvider"
           android:authorities="${applicationId}.fileprovider"
