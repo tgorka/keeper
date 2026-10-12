@@ -1825,7 +1825,10 @@ const ANSWERS: Record<string, unknown> = {
     ],
     shape: "flat",
     tasks: SESSION_TASKS,
-    room: null,
+    // An agent's session (its board holds agent cards), so it carries its room:
+    // Nixi's reading-list conversation, where `?approval=` draws 93.3's card —
+    // what the phone board's cards open (98.2 #5, `?platform=phone`).
+    room: "!nixi-reading:example.org",
   },
   sessions_tree: { entries: SESSION_ENTRIES, truncated: false },
   sessions_refs: {

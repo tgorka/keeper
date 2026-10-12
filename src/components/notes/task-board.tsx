@@ -181,7 +181,7 @@ export interface BoardCard {
  * A component that rendered one order and reported another would put cards
  * wherever the difference happened to fall.
  */
-function columnOf(cards: readonly BoardCard[], status: string): BoardCard[] {
+export function columnOf(cards: readonly BoardCard[], status: string): BoardCard[] {
   return cards
     .filter((card) => card.status === status)
     .sort(

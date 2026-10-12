@@ -7,11 +7,15 @@ import type {
   BridgeNetworkVm,
   InboxBatch,
   InboxRoomVm,
+  SessionDetailVm,
+  SessionRootVm,
+  SessionRowVm,
   SyncProfileVm,
 } from "@/lib/ipc/client";
 import { accountStore, NO_ACCOUNT } from "@/lib/stores/account";
 import { accountStatusStore } from "@/lib/stores/account-status";
 import { accountsStore } from "@/lib/stores/accounts";
+import { agentRoomsStore } from "@/lib/stores/agent-rooms";
 import { archiveRoomsStore } from "@/lib/stores/archive-rooms";
 import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
 import { composerStore } from "@/lib/stores/composer";
@@ -42,6 +46,10 @@ const bridgeDiscover = vi.fn(
 );
 const bbctlAvailability = vi.fn();
 const syncProfiles = vi.fn(async (): Promise<SyncProfileVm[]> => []);
+// The Sessions surface (98.2): the zone, its sessions and one session's board.
+const sessionsRoots = vi.fn(async (): Promise<SessionRootVm[]> => []);
+const sessionsList = vi.fn(async (): Promise<SessionRowVm[]> => []);
+const sessionsDetail = vi.fn(async (): Promise<SessionDetailVm | null> => null);
 /** A read that never answers, for the voice surfaces (AD-179: unanswered renders nothing). */
 const pending = new Promise<never>(() => {});
 vi.mock("@/lib/ipc/client", async (importOriginal) => {
@@ -121,6 +129,11 @@ vi.mock("@/lib/ipc/client", async (importOriginal) => {
     // Unanswered (the mock never resolves), so no voice affordance renders (AD-179).
     voiceAvailability: vi.fn(() => pending),
     voiceWakeGet: vi.fn(() => pending),
+    // The Sessions surface (98.2), reached by the drawer enumeration below.
+    sessionsRoots: () => sessionsRoots(),
+    sessionsList: () => sessionsList(),
+    sessionsDetail: () => sessionsDetail(),
+    listenSessionsChanged: vi.fn(async () => () => {}),
   };
 });
 
@@ -151,12 +164,20 @@ import { PhoneShell } from "@/components/layout/phone-shell";
 import { sidebarViews } from "@/components/layout/sidebar-pane";
 import { COPY_SUBMIT_LABEL } from "@/components/layout/sync-pane";
 import {
+  SESSIONS_PHONE_OPEN_ROOM,
+  SESSIONS_PHONE_ROOM_ABSENT,
+  SESSIONS_PHONE_ROOMS_READING,
+  sessionsPhoneOpenCardRoom,
+} from "@/components/sessions/sessions-phone-pane";
+import {
   SYNC_ADD_TITLE,
   SYNC_CHOOSE_FOLDER_LABEL,
   SYNC_REMOTE_URL_LABEL,
   SYNC_TOKEN_LABEL,
 } from "@/components/sync/add-folder-form";
 import { isChatWindowView, phoneRoutesView } from "@/lib/phone-surfaces";
+import { resetSessionsListStoreForTest } from "@/lib/stores/sessions-list";
+import { resetSessionsRootsStoreForTest } from "@/lib/stores/sessions-roots";
 
 const account: AccountVm = {
   accountId: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
@@ -1414,8 +1435,9 @@ describe("PhoneShell keyboard inset (Story 13.5)", () => {
 });
 
 describe("PhoneShell view surfaces (Story 66.1, AD-197)", () => {
-  /** The tier a phone hydrates to once its folder links (Epic 66): only what the OS refuses is off. */
-  const PHONE_WITH_FOLDER = { ...DEFAULT_CAPABILITIES, bots: true, sync: true };
+  /** The tier a phone hydrates to once its folder links (Epic 66) and that folder has a
+   *  sessions zone (98.2): only what the OS refuses is off. */
+  const PHONE_WITH_FOLDER = { ...DEFAULT_CAPABILITIES, bots: true, sync: true, sessions: true };
 
   const draft: ApprovalDraftVm = {
     accountId: account.accountId,
@@ -1613,5 +1635,211 @@ describe("PhoneShell view surfaces (Story 66.1, AD-197)", () => {
       fireEvent.click(within(level).getByRole("button", { name: "Back to Inbox" }));
       await waitFor(() => expect(document.querySelector('[data-level="1"]')).toBeNull());
     }
+  });
+});
+
+describe("PhoneShell sessions board (98.2 #5, UX-DR145)", () => {
+  const PHONE_WITH_ZONE = { ...DEFAULT_CAPABILITIES, bots: true, sync: true, sessions: true };
+  const SESSION_ROOM = "!session-room:example.org";
+  /** A second account on this phone: the one whose Agents window holds the session's room. */
+  const APPROVER_ACCOUNT = "01BX5ZZKBKACTAV9WEVGEMMVRZ";
+
+  const root: SessionRootVm = {
+    id: "p1",
+    name: "tgdrive",
+    subfolder: "60-sessions",
+    root: "/var/mobile/sync/p1/60-sessions",
+    indexed: true,
+    activeCount: 1,
+    unreadCount: 0,
+  };
+  const row: SessionRowVm = {
+    id: "01J8SESSIONAAAAAAAAAAAAAAA",
+    path: "active/2026-10-12-budget",
+    title: "Budget review",
+    status: "active",
+    archivedYear: null,
+    workspaceMs: null,
+    recordMs: null,
+    lastLogDate: "",
+    lastLogLine: "",
+    snippet: "",
+    tags: [],
+    pinned: false,
+    unread: false,
+    origin: "local",
+    headRev: "rev",
+    conflict: false,
+    lineage: false,
+  };
+  function detail(room: string | null): SessionDetailVm {
+    return {
+      id: row.id,
+      path: row.path,
+      title: row.title,
+      status: "active",
+      archivedYear: null,
+      pinned: false,
+      tags: [],
+      properties: [],
+      continues: [],
+      continuedBy: [],
+      summary: "",
+      log: [],
+      shape: "flat",
+      tasks: [
+        {
+          id: "path:cards/approve-the-budget.md",
+          relPath: "cards/approve-the-budget.md",
+          title: "Approve the budget line",
+          status: "todo",
+          order: 1,
+          orderIsOwn: true,
+          tags: ["task"],
+          unstableIdentity: true,
+          agent: {
+            run: { value: "blocked", readable: true },
+            assignee: { value: "tola-grey", readable: true },
+            host: null,
+            requestedBy: null,
+            schedule: null,
+            lastRun: null,
+            workflow: null,
+            scheduledBy: null,
+            integrity: null,
+            runningOn: null,
+            waiting: null,
+          },
+        },
+      ],
+      room,
+    };
+  }
+
+  /** Open Sessions, then the session's board. */
+  async function openBoard() {
+    capabilitiesStore.getState().applySnapshot(PHONE_WITH_ZONE);
+    render(<PhoneShell />);
+    act(() => {
+      primaryViewStore.getState().setView("sessions");
+    });
+    fireEvent.click(await screen.findByRole("button", { name: new RegExp(row.title) }));
+    return await screen.findByRole("button", {
+      name: sessionsPhoneOpenCardRoom("Approve the budget line"),
+    });
+  }
+
+  beforeEach(() => {
+    resetSessionsRootsStoreForTest();
+    resetSessionsListStoreForTest();
+    agentRoomsStore.getState().clear();
+    sessionsRoots.mockResolvedValue([root]);
+    sessionsList.mockResolvedValue([row]);
+    sessionsDetail.mockResolvedValue(detail(SESSION_ROOM));
+  });
+
+  it("a card opens its session's room on the account that holds it, over the board", async () => {
+    const card = await openBoard();
+    act(() => {
+      agentRoomsStore.getState().applyBatch({
+        ops: [
+          {
+            op: "reset",
+            rooms: [
+              { ...inboxRoom("!other:example.org", "Another agent"), accountId: account.accountId },
+              { ...inboxRoom(SESSION_ROOM, "Tola — budget"), accountId: APPROVER_ACCOUNT },
+            ],
+          },
+        ],
+        total: 2,
+      });
+    });
+
+    fireEvent.click(card);
+
+    // The room where 93.3's card is decided, on the account whose window holds it.
+    expect(roomsStore.getState().selected).toEqual({
+      accountId: APPROVER_ACCOUNT,
+      roomId: SESSION_ROOM,
+    });
+    // Backing out of the room lands on the board again, not on a chat list.
+    // The room's back button names where it goes: the board, not the Inbox.
+    fireEvent.click(within(stackLevel(1)).getByRole("button", { name: "Back to Sessions" }));
+    await waitFor(() => expect(roomsStore.getState().selected).toBeNull());
+    expect(primaryViewStore.getState().view).toBe("sessions");
+    expect(
+      await screen.findByRole("button", {
+        name: sessionsPhoneOpenCardRoom("Approve the budget line"),
+      }),
+    ).toBeVisible();
+  });
+
+  it("says so, and opens nothing, when no account on this phone is in the room", async () => {
+    const card = await openBoard();
+    act(() => {
+      agentRoomsStore.getState().applyBatch({
+        ops: [{ op: "reset", rooms: [inboxRoom("!other:example.org", "Another agent")] }],
+        total: 1,
+      });
+    });
+
+    fireEvent.click(card);
+
+    expect(roomsStore.getState().selected).toBeNull();
+    expect(await screen.findByText(SESSIONS_PHONE_ROOM_ABSENT)).toHaveAttribute("role", "status");
+  });
+
+  it("before the Agents window has arrived, says keeper is still reading, not that the room is absent", async () => {
+    const card = await openBoard();
+
+    fireEvent.click(card);
+
+    expect(roomsStore.getState().selected).toBeNull();
+    expect(await screen.findByText(SESSIONS_PHONE_ROOMS_READING)).toHaveAttribute("role", "status");
+    expect(screen.queryByText(SESSIONS_PHONE_ROOM_ABSENT)).toBeNull();
+  });
+
+  it("the board's page survives the room round trip", async () => {
+    const card = await openBoard();
+    act(() => {
+      agentRoomsStore.getState().applyBatch({
+        ops: [
+          {
+            op: "reset",
+            rooms: [{ ...inboxRoom(SESSION_ROOM, "Tola — budget"), accountId: APPROVER_ACCOUNT }],
+          },
+        ],
+        total: 1,
+      });
+    });
+    const columns = screen.getByRole("navigation", { name: "Columns" });
+    fireEvent.click(within(columns).getByRole("button", { name: /^Deferred/ }));
+
+    fireEvent.click(card);
+    // The room covers the board, and the board's level goes once its slide ends.
+    await waitFor(() => expect(screen.queryByRole("navigation", { name: "Columns" })).toBeNull());
+    fireEvent.click(within(stackLevel(1)).getByRole("button", { name: "Back to Sessions" }));
+
+    const back = await screen.findByRole("navigation", { name: "Columns" });
+    expect(within(back).getByRole("button", { name: /^Deferred/ })).toHaveAttribute(
+      "aria-current",
+      "true",
+    );
+  });
+
+  it("a person's session has no room, so its cards open nothing", async () => {
+    sessionsDetail.mockResolvedValue(detail(null));
+    capabilitiesStore.getState().applySnapshot(PHONE_WITH_ZONE);
+    render(<PhoneShell />);
+    act(() => {
+      primaryViewStore.getState().setView("sessions");
+    });
+    fireEvent.click(await screen.findByRole("button", { name: new RegExp(row.title) }));
+
+    expect(await screen.findByText("Approve the budget line")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: sessionsPhoneOpenCardRoom("Approve the budget line") }),
+    ).toBeNull();
+    expect(screen.queryByRole("button", { name: SESSIONS_PHONE_OPEN_ROOM })).toBeNull();
   });
 });

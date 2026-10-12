@@ -778,6 +778,21 @@ The phone reads a drive's sessions zone and moves its cards; it writes no sessio
   written — is finished before every sync pass, by the same executor
   (`sessions_root::finish_interrupted_before_pass` → `resume_all`), so no pass commits half
   a move.
+- **What it shows.** *Sessions* in the drawer, present exactly while `sessions` is
+  (`phoneSurfaceFor`): the zone's sessions, then one session's board as the next level
+  (`sessions-phone-pane.tsx`). The four columns are pages swiped sideways, each named
+  with its count in a row above, and a card whose `status:` is none of the four gets a
+  fifth page. A card shows its title, the run badge (`blocked` is a waiting approval),
+  who works it and *running on `<host>`*, the desktop's own agent block; it moves by
+  *Move to…* (to the end of the column it joins), never by a drag — the picker's own
+  *Move to…* entry is choosable and moves nothing, so opening the picker to look and
+  tapping *Done* changes no card; a refused move is said in Rust's words, a move whose
+  push did not land says so (`unpushed`) — and *Allow* says to allow on the Mac. Tapping a
+  card of an agent's session opens the session's room on the account whose Agents window
+  holds it — the approval card is decided there, by the Matrix event a Mac would send —
+  and backing out of the room lands on the board again, on the page it was left on. A room
+  no account on the phone is in is said, not opened; a tap before the Agents window has
+  arrived says keeper is still reading the rooms.
 
 ### Fully virtual by default, and why
 
@@ -986,7 +1001,7 @@ to finish with the screen locked):
 - A folder you add here mirrors a remote your Mac already syncs and lives inside keeper's own container: every large file stays a pointer until you open it, and it syncs only when keeper opens, comes back in front or you pull to refresh — nothing watches the folder on a battery.
 - Nothing is merged on a phone: a history this copy cannot fast-forward is named — how many commits this phone has that the remote does not — and you push them or reset this copy; the Mac merges.
 - Notes are a synced folder, so they are here too: list, search, read and edit them, and a save is a commit that keeper pushes from this phone with its own engine — there is no git on a phone.
-- What stays on your Mac: the self-hosted bridge runner, the sessions board, tasks, screen recording and the global summon hotkey; Bots talks to a model here, but the drive tools live on your Mac.
+- The sessions board is here too: read a session's cards, move one with Move to…, and open an agent's session room to decide its approval; creating and archiving sessions stays on your Mac, with tasks, the self-hosted bridge runner, screen recording and the global summon hotkey. Bots talks to a model here, but the drive tools live on your Mac.
 - Updates arrive by reinstalling keeper; its signature renews every 7 days.
 - Listening for the wake phrase starts in keeper, and then keeps working with another app in front and with the screen locked; the answer is spoken there too, and saying "stop" (or the stop word you chose) ends it. Speech is recognised on this phone and never sent to a server.
 - Turn listening on while keeper is in front and it keeps listening when another app is in front or the screen is locked. Siri or an app that takes the microphone pauses it and keeper resumes on its own; a phone call ends it until you open keeper again. It stops when you turn it off or when keeper is force-quit. The orange microphone indicator stays on the whole time and cannot be hidden, and listening uses battery.
@@ -1031,14 +1046,18 @@ commit → push path, citing `src/components/notes/**`, `src/components/capture/
 literal: `GitEngine::HOST` is `Gix` on iOS (`cli.rs:118-122`) and the push is
 `push_http` (D-16).
 
-The fifth item is AD-201 and AD-203 in one line, each clause a fact with a gate behind
-it. The bridge runner: `bridges-pane.tsx` gates the runner on `bridgeSidecar`, which is
-`cfg!(desktop)` (`ipc.rs:1430`); discovery, provisioning and health are on the phone since
-Story 66.1. The sessions board: the sessions commands have `unsupported` twins on the
-phone (`crates/keeper/src/sessions_ipc.rs:41-44` and every twin below it) and
-`sessions_root` is `#[cfg(desktop)]` (`lib.rs:66-70`) — it reads a
-synced folder and could follow the notes reader, but it is forty commands and its own
-epic (DW-237). Tasks: a task is one of keeper's own verbs and never a shell string
+The fifth item is AD-201 and AD-203 in one line, rewritten by Epic 98 (story 98.2,
+AD-413) when the board reached the phone; each clause is a fact with a gate behind it.
+The sessions board: the read verbs and `sessions_task_move` run on the phone with no
+twin, and the Sessions surface (`src/components/sessions/sessions-phone-pane.tsx`) is
+there exactly while `CapabilitiesVm.sessions` is — a folder on the phone with a sessions
+zone ([The sessions board on the phone](#the-sessions-board-on-the-phone-982) above).
+A card's session room is where its approval is decided; "creating and archiving
+sessions stays on your Mac" is every lifecycle verb's `unsupported` twin
+(`crates/keeper/src/sessions_ipc.rs`, DW-410). The bridge runner: `bridges-pane.tsx`
+gates the runner on `bridgeSidecar`, which is `cfg!(desktop)` (`ipc.rs:1430`);
+discovery, provisioning and health are on the phone since Story 66.1.
+Tasks: a task is one of keeper's own verbs and never a shell string
 (`keeper-sync/src/tasks.rs:148-161`, the closed `TaskKind`), so the wall is not a spawn;
 it is that a schedule needs a host that is awake, and a phone process is suspended the
 moment it leaves the foreground (NFR-57) — `keeper runs this — only while keeper is

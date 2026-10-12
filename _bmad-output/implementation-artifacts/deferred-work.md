@@ -3978,6 +3978,12 @@ progress (rung `agents-98-phone-sessions`, 2026-10-12; R344, R345): the Rust hal
   board projection shared (`keeper_agent::sessions::board`), `sessions` gated on a zone being on the
   phone; the phone surface and the fifth disclosure line are rung `agents-98-phone-board`, and the
   rest is DW-410.
+progress (rung `agents-98-phone-board`, 2026-10-12): the phone surface is in — *Sessions* in the
+  drawer while `sessions` is true (`src/lib/phone-surfaces.ts`, `phoneSurfaceFor`), the zone's
+  sessions then one session's board paged a column at a time with *Move to…*, a card of an agent's
+  session opening its room (`src/components/sessions/sessions-phone-pane.tsx`); the fifth line of
+  `IOS_DISCLOSURE_LINES` and `docs/ios.md` *Limitations* says so. The resolution line is the
+  coordinator's.
 
 ### DW-238: Tasks on the phone — and the reason is not the one the epic gave.
 
@@ -4006,6 +4012,9 @@ reason: AD-201 says tasks stay on the Mac because "tasks run user commands and i
   no pretence of a schedule. Until then the Tasks row is absent on the phone because it rides
   `sessions` (DW-237), and the disclosure's fifth line names it. Correct AD-201's wording when
   the epic file is next touched.
+progress (rung `agents-98-phone-board`, 2026-10-12): `sessions` is now true on a phone with a
+  sessions zone (98.2), so the Tasks row's absence there is `phoneSurfaceFor("tasks") === null`
+  (`src/lib/phone-surfaces.ts`), no longer the flag; the fifth line still names tasks as the Mac's.
 status: open
 
 ### DW-239: An audio memo on the phone.
@@ -10093,4 +10102,39 @@ status: open
 origin: epic 98, story 98.2 (rung `agents-98-phone-sessions` fix round 1, 2026-10-12; R346, review-98phonesessions-1 R98PS-01 follow-on)
 location: `keeper_sync::Engine::phone_write` / `apply_in_process` (`SyncError::Diverged` on a phone), `crates/keeper/src/sessions_ipc.rs` `move_and_publish`; the phone has no reset verb (`src/components/settings/about-section.tsx` only names the choice)
 reason: The move now pulls first, so a divergence needs a remote commit inside the seconds between that pull and the push — or a move made offline or in a paused folder while agents kept working. When it happens the phone holds one commit the remote lacks, every later pass refuses with the divergence sentence, and the only way out is removing and re-adding the folder, which drops the move. Two honest convergences, neither built: replay — drop the one local commit, fast-forward, re-plan the move over the new bytes (`compile_move`; its guarded writes refuse if the card itself changed) and push again; or a phone reset verb that resets to the remote and lists the person's unpushed card moves to redo.
+status: open
+
+### DW-1280: A room opened over a phone surface says "Back to Inbox".
+
+origin: epic 98, story 98.2 (rung `agents-98-phone-board`, 2026-10-12; R347)
+location: `src/components/layout/phone-header.tsx` (`PhoneHeader`'s Room-level back title), `src/components/layout/phone-shell.tsx` (`surfaceTitle` is passed for the Sessions surface only)
+reason: A selected room outranks every view level, and popping it clears the selection, so the stack lands on whatever view surface was showing beneath it — Notes, Files, Sync, Bots — not on the Inbox. The Room level's back button nevertheless reads "Back to Inbox" everywhere but over the sessions board (a room reaches the phone over a surface by a notification tap or a search hit while one is open). Take it as one title per `PhoneSurface` beside `phoneSurfaceFor`, passed as `surfaceTitle` whenever `surface !== null`, with a stack test that pops a room over each.
+status: open
+
+### DW-1281: The phone board's "not on your Mac yet" outlives the push it describes.
+
+origin: epic 98, story 98.2 (rung `agents-98-phone-board` fix round 1, 2026-10-12; R348, review-98phoneboard-1 R98PB1-02)
+location: `src/components/sessions/sessions-phone-pane.tsx` (`SessionsPhoneBoard.move` sets `notice = SessionTaskMoveVm.unpushed`; a `keeper://sessions-changed` re-read never touches it), `src/components/sessions/session-board.tsx` (the desktop `TaskBoard` has the same shape)
+reason: `unpushed` is a one-shot answer of the move. R346 re-arms the push every 30 s while keeper is in front, so the retry often lands and the board keeps saying the card is not on the Mac until the next move. Clearing the sentence on the changed event would be dishonest the other way (a pass that failed to push rescans too). The honest fix is Rust's: a pending-push fact for the zone's folder in a VM (`SessionDetailVm` or the folder's sync row), rendered while it is true.
+status: open
+
+### DW-1282: The phone's search surface offers New Session, Log Today and Tasks, which do nothing there.
+
+origin: epic 98, story 98.2 (rung `agents-98-phone-board` fix round 1, 2026-10-12; R348, review-98phoneboard-1 DW candidate B, pre-existing)
+location: `src-tauri/crates/keeper-core/src/palette.rs` (`registry_sections` gates the Sessions and Tasks categories on `notes`), `src-tauri/crates/keeper/src/ipc.rs` (passes `notes_available(&state)`), `src/components/layout/phone-search-surface.tsx`, `src/lib/palette/actions.ts` (`sessions-new`, `sessions-log-today`, `tasks-view`)
+reason: Since Story 66.4 `notes` is `sync` on every tier, so a phone's search surface ("every registered action is reachable") lists *New Session* (now lands on the phone's Sessions list and bumps a create nonce nothing on the phone consumes), *Log Today in Session* (calls the `unsupported` twin; the rejection is swallowed by `dispatchPaletteAction`) and *Tasks* (`setView("tasks")`, no phone surface). No write escapes — the Rust twins hold — but each is a dead affordance (AD-27). Gate the three on a desktop fact in `registry_sections`, or filter them in the front by `phoneRoutesView`/tier as `open-search` does.
+status: open
+
+### DW-1283: A `focus()` can scroll the phone stack's clipping root; why only the board showed it is not established.
+
+origin: epic 98, story 98.2 (rung `agents-98-phone-board` fix round 1, 2026-10-12; R348, review-98phoneboard-1 R98PB1-04, DW candidate C)
+location: `src/components/layout/phone-shell.tsx` (the level focus effect; `StackLevel`'s `absolute inset-0` levels inside an `overflow-hidden` root)
+reason: Rung 6 measured a push focus scrolling the root 238 px on the sessions board (not on the Bots conversation level) and fixed it with `preventScroll` on push; fix round 1 added it to both pop focuses. Any other in-level `focus()` that lands on a node outside the root's box can still scroll it, and a pop can still put focus on a node in a level that is leaving (a card's room pops 2 → 1 and restores focus to the sessions row on the exiting surface level). Root cause: find why the board's level was scrollable into, then either make the root unscrollable (`overflow: clip`) or restore focus only to the active level.
+status: open
+
+### DW-1284: When two accounts on the phone are in an agent's room, the board opens it on the more recent one.
+
+origin: epic 98, story 98.2 (rung `agents-98-phone-board` fix round 1, 2026-10-12; R348, review-98phoneboard-1 DW candidate D)
+location: `src/components/sessions/sessions-phone-pane.tsx` (`sessionRoomOnThisPhone`: first Agents window row, Rust's recency order)
+reason: The person's account and a proxy or harness account can both hold a session's room. The room then opens on whichever streamed most recently, which may be an account 93.3's approval card does not let decide. Prefer an account the approval record names (or the person's own), else the first.
 status: open

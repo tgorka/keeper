@@ -44,6 +44,17 @@ describe("phone surfaces (Story 66.1, AD-197, AD-27)", () => {
     }
   });
 
+  it("routes Sessions only where a folder on the phone has a sessions zone (98.2)", () => {
+    const phone: CapabilitiesVm = { ...DEFAULT_CAPABILITIES, bots: true, sync: true };
+    expect(phoneSurfaceFor("sessions", phone)).toBeNull();
+    expect(phoneRoutesView("sessions", phone)).toBe(false);
+    const withZone: CapabilitiesVm = { ...phone, sessions: true };
+    expect(phoneSurfaceFor("sessions", withZone)).toBe("sessions");
+    expect(phoneRoutesView("sessions", withZone)).toBe(true);
+    // The Tasks view rides the same flag on the desktop and has no phone surface.
+    expect(phoneRoutesView("tasks", withZone)).toBe(false);
+  });
+
   it("keeps a gated surface absent where its capability is off", () => {
     expect(phoneSurfaceFor("bots", DEFAULT_CAPABILITIES)).toBeNull();
     expect(phoneSurfaceFor("sync", DEFAULT_CAPABILITIES)).toBeNull();
@@ -56,7 +67,15 @@ describe("phone surfaces (Story 66.1, AD-197, AD-27)", () => {
     // is reachable from a row under the capabilities that gate it.
     const allOn = capabilityShapes()[1];
     const rows = sidebarViews(allOn).map((entry) => entry.view);
-    const surfaces: PhoneSurface[] = ["approval", "bridges", "settings", "bots", "sync", "files"];
+    const surfaces: PhoneSurface[] = [
+      "approval",
+      "bridges",
+      "settings",
+      "bots",
+      "sync",
+      "files",
+      "sessions",
+    ];
     for (const view of surfaces) {
       expect(phoneSurfaceFor(view, allOn), view).toBe(view);
       expect(rows, view).toContain(view);

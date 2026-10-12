@@ -72,7 +72,7 @@ export const SESSION_BOARD_UNSTABLE_ID = BOARD_UNSTABLE_ID;
  * path where a vault's notes are addressed by id, and the board never has to
  * know which because it never looks inside the key.
  */
-function cardOf(task: SessionTaskVm): BoardCard {
+export function cardOf(task: SessionTaskVm): BoardCard {
   return {
     key: task.relPath,
     title: task.title,

@@ -157,16 +157,19 @@ describe("useSessionsShortcut on a phone with a zone", () => {
     capabilitiesStore.setState({ capabilities: DEFAULT_CAPABILITIES, hydrated: false });
   });
 
-  it("leaves ⌘7 and ⌘⌥L alone", () => {
+  it("opens the phone's Sessions surface on ⌘7 (98.2, rung 6) and leaves ⌘⌥L alone", () => {
     primaryViewStore.setState({ view: "inbox" });
     capabilitiesStore
       .getState()
       .applySnapshot({ ...DEFAULT_CAPABILITIES, sync: true, notes: true, sessions: true });
     renderHook(() => useSessionsShortcut());
-    expect(press("7", "Digit7").defaultPrevented).toBe(false);
+    // Logging today is a desktop verb: the chord does nothing on a phone.
     expect(press("l", "KeyL", true).defaultPrevented).toBe(false);
     expect(primaryViewStore.getState().view).toBe("inbox");
     expect(sessionsLogToday).not.toHaveBeenCalled();
+    // The board has a phone surface now, so ⌘7 lands on it.
+    expect(press("7", "Digit7").defaultPrevented).toBe(true);
+    expect(primaryViewStore.getState().view).toBe("sessions");
   });
 
   it("opens the board on ⌘7 on a desktop", () => {

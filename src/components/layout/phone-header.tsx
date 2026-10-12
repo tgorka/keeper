@@ -91,18 +91,23 @@ interface PhoneHeaderProps {
   onBack: () => void;
   /** Forwarded to the back button so the shell can focus it on push (UX-DR28). */
   backRef?: Ref<HTMLButtonElement>;
+  /** The Room level's back title when the level beneath it is not the Inbox — a
+   *  room opened over a view surface pops back to that surface (98.2: the sessions
+   *  board). Ignored at the Detail level. */
+  surfaceTitle?: string;
 }
 
-export function PhoneHeader({ level, onBack, backRef }: PhoneHeaderProps) {
+export function PhoneHeader({ level, onBack, backRef, surfaceTitle }: PhoneHeaderProps) {
   const selected = useRoomsStore((s) => s.selected);
   const room = useSelectedRoomVm();
   const accountId = selected?.accountId ?? null;
   const roomId = selected?.roomId ?? null;
   const networkId = room?.networkId ?? null;
 
-  // The back button carries the previous level's title. At the Detail level the
-  // previous level is the Room; an unknown room VM degrades to a generic "Back".
-  const backTitle = level === 1 ? PHONE_INBOX_TITLE : (room?.displayName ?? null);
+  // The back button carries the previous level's title. At the Room level that is
+  // the Inbox, or the view surface the room was opened over; at the Detail level
+  // it is the Room, and an unknown room VM degrades to a generic "Back".
+  const backTitle = level === 1 ? (surfaceTitle ?? PHONE_INBOX_TITLE) : (room?.displayName ?? null);
   const backLabel = backTitle === null ? "Back" : `Back to ${backTitle}`;
 
   return (
