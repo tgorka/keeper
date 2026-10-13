@@ -183,7 +183,13 @@ impl ServedSession {
             // checked again now; never its label, which is the data's.
             // A gate's ticket: the people who decide its tickets (codemap
             // Q2), never its label's readers — its audience may be anyone.
-            sender_in_approvers: if gate {
+            // A gate's held result: the readers of what it read, whose
+            // head — the drive's owner — alone decides at T4 (99.2 #3).
+            sender_in_approvers: if gate
+                && record.action.tool == keeper_core::agents::tier::AgentTool::Declassify.as_wire()
+            {
+                reads(&record.label.readers, sender)
+            } else if gate {
                 self.gate_approvers(deps).contains(sender)
             } else if keeper_core::agents::consolidate::is_host_action(record) {
                 crate::approvals::read_stored_record(

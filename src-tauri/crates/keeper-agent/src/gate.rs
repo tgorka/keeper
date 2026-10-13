@@ -75,6 +75,8 @@ pub const NO_TICKET: &str =
     "This gate is busy: no ticket could be paid for this request now, so nothing was handed on.";
 /// What a `reply` after `delegate` in the same turn says.
 pub const HANDED_ON: &str = "This request is handed on: its answer comes back as its ticket's result once the agent it goes to replies. Nothing was sent.";
+/// What a `reply` after a held result in the same turn says (99.2 #3).
+pub const HELD: &str = "This request's result waits for a person to let it out of what this room may read; nothing more was sent.";
 
 /// What became of a request as it was taken.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -130,6 +132,10 @@ enum Handed {
     /// Its delegation replied: this is its callback, whose `reply` is the
     /// ticket's result.
     Back,
+    /// Its callback's result read what the room may not read and waits
+    /// for the owner's declassification (99.2 #3): the turn's end refuses
+    /// nothing, and the host sends it once a person releases it.
+    Held,
 }
 
 #[derive(Debug)]
@@ -462,8 +468,10 @@ impl Desk {
                 server_ts: now,
                 reason: None,
                 text: None,
+                approval: None,
             },
             State::Ticketed if entry.handed == Handed::Asked => return Err(HANDED_ON.to_owned()),
+            State::Ticketed if entry.handed == Handed::Held => return Err(HELD.to_owned()),
             State::Ticketed => GateBody {
                 request: entry.request.clone(),
                 state: GateState::Result,
@@ -472,6 +480,7 @@ impl Desk {
                 server_ts: now,
                 reason: None,
                 text: None,
+                approval: None,
             },
             State::Done => return Err(ANSWERED_ALREADY.to_owned()),
         };
@@ -511,7 +520,8 @@ impl Desk {
         let mut entry = held.lock().await;
         let mut lines = self.facts_of(request);
         if entry.state == State::Done
-            || (entry.state == State::Ticketed && entry.handed == Handed::Asked)
+            || (entry.state == State::Ticketed
+                && matches!(entry.handed, Handed::Asked | Handed::Held))
         {
             return lines;
         }
@@ -529,11 +539,12 @@ impl Desk {
     }
 
     /// Refuse `request`, whose event is `event`, for `reason` now — a turn
-    /// a stop cut off (C6) — closing its ticket. Its line and event.
+    /// a stop cut off (C6) — closing its ticket. Its line and event; said
+    /// in the room only against the request's event, unsaid without one.
     pub async fn refuse(
         &self,
         request: &str,
-        event: &EventId,
+        event: Option<&EventId>,
         ticket: Option<String>,
         reason: GateReason,
     ) -> (GateBody, Option<OwnedEventId>) {
@@ -542,7 +553,10 @@ impl Desk {
             held.lock().await.state = State::Done;
         }
         let line = refused_line(request, ticket, reason, self.clock.now());
-        let sent = self.say(&line, event, true).await;
+        let sent = match event {
+            Some(event) => self.say(&line, event, true).await,
+            None => None,
+        };
         self.close(request);
         (line, sent)
     }
@@ -591,6 +605,29 @@ impl Desk {
         if let Some(held) = held {
             held.lock().await.handed = Handed::Asked;
         }
+    }
+
+    /// Whether `request` is a ticket's callback whose result may wait for
+    /// a person's declassification (99.2 #3): its ticket's, never an answer
+    /// within a deadline.
+    pub async fn holdable(&self, request: &str) -> bool {
+        let held = self.book().live.get(request).cloned();
+        match held {
+            Some(held) => {
+                let entry = held.lock().await;
+                entry.state == State::Ticketed && entry.handed == Handed::Back
+            }
+            None => false,
+        }
+    }
+
+    /// `request`'s result waits for its declassification: its turn's end
+    /// refuses nothing. Its ticket.
+    pub async fn hold(&self, request: &str) -> Option<String> {
+        let held = self.book().live.get(request).cloned()?;
+        let mut entry = held.lock().await;
+        entry.handed = Handed::Held;
+        entry.ticket.clone()
     }
 
     /// `request`, whose event is `event`, is open again under `ticket` for
@@ -692,6 +729,7 @@ pub fn ticket_line(request: &str, ticket: &str, deadline_ms: Option<u32>, at: u6
         server_ts: at,
         reason: None,
         text: None,
+        approval: None,
     }
 }
 
@@ -710,6 +748,7 @@ pub fn refused_line(
         server_ts: at,
         reason: Some(reason),
         text: None,
+        approval: None,
     }
 }
 

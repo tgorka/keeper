@@ -1453,7 +1453,12 @@ impl<'t> DelegateTools<'t> {
     /// request is not ticketed, the ticket's result after — passing the
     /// room's sink with the session's label now, its secrets redacted as
     /// the room's are (S-17). No artifacts, no label, no card: a blocked
-    /// answer is refused, never sent.
+    /// answer is refused, never sent. A ticket's result the sink blocks
+    /// because its delegate read what the room may not read waits for a
+    /// person instead (99.2 #3): the call parks on a `declassify` record
+    /// the drive's owner decides in their proxy's DM, the turn ends there,
+    /// and the gate goes on serving; nothing reaches the room until the
+    /// host sends exactly those bytes on a consumed approval.
     fn answer(&self, args: Option<&Value>, audit: &CallAudit<'_>) -> Option<ToolOutcome> {
         let Some(text) = args.and_then(|args| args["text"].as_str()) else {
             return refused("reply needs a \"text\" argument.");
@@ -1487,7 +1492,19 @@ impl<'t> DelegateTools<'t> {
             text.as_bytes(),
             None,
         ) {
-            return Some(audit.refuse(blocked.sentence));
+            let holdable =
+                blocked.flow.is_some() && block_on(serving.desk.holdable(&serving.request));
+            if !holdable {
+                return Some(audit.refuse(blocked.sentence));
+            }
+            match audit.blocked(blocked) {
+                Ok(()) => {}
+                Err(Withheld::Parked(approval)) => {
+                    block_on(serving.desk.hold(&serving.request));
+                    return Some(ToolOutcome::Parked { approval });
+                }
+                Err(Withheld::Refused(reason)) => return refused(reason),
+            }
         }
         if let Err(withheld) = audit.admit("", self.from.room.as_str()) {
             return Some(withheld.into());

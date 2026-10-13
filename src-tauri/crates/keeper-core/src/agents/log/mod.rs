@@ -706,6 +706,10 @@ pub enum MemoryOp {
     /// that fired, `memory`, `skill` or `memory,skill`. Every line of the
     /// pass descends from this one ([`ReviewLines`]).
     Review,
+    /// A gate session's `journal_append` waits for a person on the hour's
+    /// card (99.2 #2, codemap Q4); `ref` is its approval's id. The entry is
+    /// written only once that approval is consumed, by the host.
+    Asked,
 }
 
 /// `memory`.
@@ -802,6 +806,11 @@ pub enum GateState {
     Result,
     /// Not taken, or given up: [`GateReason`] says why.
     Refused,
+    /// The ticket's result read what the room's audience may not read, so
+    /// it waits for the drive owner's declassification in their proxy's
+    /// DM (99.2 #3): said nowhere in the room, written in the log alone,
+    /// naming the approval that would release it.
+    Held,
 }
 
 impl GateState {
@@ -813,6 +822,7 @@ impl GateState {
             Self::Ticket => "ticket",
             Self::Result => "result",
             Self::Refused => "refused",
+            Self::Held => "held",
         }
     }
 }
@@ -836,6 +846,13 @@ pub enum GateReason {
     Expired,
     /// The ticket's delegation was approved, but could not be handed on.
     Failed,
+    /// The ticket's result read what the room's audience may not read, and
+    /// the person who could release it declined (99.2 #3).
+    Withheld,
+    /// The ticket's result read what the room's audience may not read, and
+    /// it was not released: nobody could be asked, nobody decided in time,
+    /// or the result or the room changed after the decision (99.2 #3).
+    Unreleased,
 }
 
 impl GateReason {
@@ -849,6 +866,8 @@ impl GateReason {
             Self::Denied => "denied",
             Self::Expired => "expired",
             Self::Failed => "failed",
+            Self::Withheld => "withheld",
+            Self::Unreleased => "unreleased",
         }
     }
 }
@@ -879,6 +898,10 @@ pub struct GateBody {
     /// A `request` line's text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    /// A `held` line's approval: the `declassify` record whose consumption
+    /// releases the result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval: Option<String>,
 }
 
 /// Where a Paseo run's end stands in the session that follows it (R275).
@@ -1417,6 +1440,7 @@ mod tests {
                 server_ts: 1_759_392_903_120,
                 reason: Some(GateReason::NoAnswer),
                 text: None,
+                approval: None,
             }),
             LineBody::Paseo(PaseoBody {
                 completion: "paseo-ended-01J".into(),

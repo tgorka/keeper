@@ -1058,7 +1058,11 @@ impl ServedSession {
         };
         // A gate's ticket is asked for on the hour's card in its own room
         // (codemap Q8).
-        if self.context.agent.kind == SessionKind::Gate {
+        // A held result's declassification goes to the owner's proxy DM
+        // like any other (99.2 #3).
+        let in_gate = self.context.agent.kind == SessionKind::Gate;
+        let declassify = record.action.tool == AgentTool::Declassify.as_wire();
+        if in_gate && !declassify {
             return Box::pin(self.on_the_card(deps, port, record, call_line, file)).await;
         }
         // The consolidator's record is decided by the approvers its digest
@@ -1126,9 +1130,21 @@ impl ServedSession {
                     gate.suppressed(APPROVAL_REQUEST);
                 }
                 tracing::info!(approval = %record.id, "agents: an approval's request may not go into its room; it goes to its approvers' DMs");
-                let cursor = self
-                    .send_status(deps, port, RunState::Blocked, Some(&detail))
-                    .await;
+                // A gate's room shows no status (codemap Q6): its held
+                // request's own event is where the room is read forward from.
+                let held = self
+                    .context
+                    .gate_held
+                    .iter()
+                    .find(|(_, approval)| **approval == record.id)
+                    .and_then(|(request, _)| self.context.gate_pending.get(request)?.event.clone());
+                let cursor = match held.filter(|_| in_gate) {
+                    Some(event) => event,
+                    None => {
+                        self.send_status(deps, port, RunState::Blocked, Some(&detail))
+                            .await
+                    }
+                };
                 let asked = self.request_by_doors(deps, &value).await;
                 // Nobody it reached is nobody asked: it is not announced.
                 if asked.is_empty() {
@@ -2217,7 +2233,7 @@ impl ServedSession {
         // refuses it in the room (codemap Q4).
         if self.context.agent.kind == SessionKind::Gate {
             if let Some(settled) = settled {
-                Box::pin(self.ticket_settled(deps, port, pending, settled)).await;
+                Box::pin(self.gate_settled(deps, port, pending, settled)).await;
             }
             return;
         }

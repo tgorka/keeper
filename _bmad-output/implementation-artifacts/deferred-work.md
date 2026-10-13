@@ -10486,3 +10486,45 @@ location: `keeper_core::agents::gate::HourCard`, the approval card's surface (ep
 reason: a card collects an hour's tickets, but each record expires a day after its own creation, so one card may show lines in every state — waiting, approved, denied, expired — for up to a day. How a decided line keeps its verdict on the card (UX-DR160) is that rung's to draw.
 status: open
 
+### DW-1360: A gate's MCP servers are not offered.
+
+origin: epic 99, story 99.2 (rung `agents-99-untrusted`, 2026-10-12; R375; codemap Q1, Q7)
+location: `keeper_agent::agent::agent_offer` (gate arm), `AllowedTools::named` (the mirror)
+reason: codemap Q1 lets a gate's turn be offered the MCP servers `[tools].mcp` names, and Q7 puts each call at T4 for the chain's head. A T4 call parks its turn, and a gate's turn never parks (Q4): its one worker answers every request. An MCP call from a gate needs Q4's deferred shape — the call on the hour's card, run by the host on the owner's approval, its answer coming back as the ticket's result — and the server's answer labelled before it reaches the room. Until then the gate offers none, and the dispatch refuses one named `NOT_OFFERED`.
+status: open
+
+### DW-1361: A held gate result is released only by an owner whose proxy runs on the gate's host.
+
+origin: epic 99, story 99.2 (rung `agents-99-untrusted`, 2026-10-12; R374; codemap §5 "how a gate host reaches the owner's proxy DM")
+location: `keeper_agent::approvals::tickets::hold_result`, `ServedSession::askable`, `deciding::Forwards`
+reason: the declassification goes to the owner's DM through a proxy door this host runs (R85, R89); where the owner's proxy runs on another host — the Mac, or a second agentd — nobody can be asked and the result is refused `unreleased` at once. The cross-host relay is DW-485's.
+status: open
+
+### DW-1362: A held result whose release a stop cut is refused, its approval spent.
+
+origin: epic 99, story 99.2 (rung `agents-99-untrusted`, 2026-10-12; R374)
+location: `keeper_agent::approvals::tickets::held_settled`, `keeper_agent::agent::ServedSession::recover_gate`
+reason: as DW-1351 for a ticket: the declassification is consumed in the gate room before the result is sent, and a stop between the two — or between the held result's record and its `approval requested` line — leaves the request open with nothing waiting for it; the next start refuses it `interrupted`, and the owner's approval is spent.
+status: open
+
+### DW-1363: A gate journal entry's `session` allowance lives in its host's memory.
+
+origin: epic 99, story 99.2 (rung `agents-99-untrusted`, 2026-10-12; R375; S-11)
+location: `keeper_agent::agent::SessionContext::gate_journal`, `keeper_core::agents::gate::JournalAllowance`
+reason: as a `run`'s `session` approval (R146) the allowance is held in memory only: a restart or a takeover drops it and the next entry asks again — never more than the day it was given for, but a person may be asked twice in that day. Rebuilding it from the consumed decision's line would keep it across a restart on the same host.
+status: open
+
+### DW-1364: A gate journal entry made after a drive read is refused unasked rather than asked in its owner's DM.
+
+origin: epic 99, story 99.2 (rung `agents-99-untrusted`, fix round 1, 2026-10-13; R375 amended, R376; review-99untrusted-1 R99U1-02 (b))
+location: `keeper_agent::agent::AllowedTools` (the `journal_append` gate arm, `GATE_JOURNAL_NARROWED`), `keeper_agent::approvals::tickets::raise_journals`
+reason: a callback turn's entry carries the label its reply narrowed the session to, and the hour's card would carry it into the gate's room, which that label does not reach (NFR-115): it is refused at the call, nobody asked. The route a held result takes — a record asked in the drive's owner's proxy DM (R374) — would let such an entry be decided by the one person who may read it.
+status: open
+
+### DW-1365: 99.2 #6's re-run "with a proposal written by a gate session" is satisfied structurally.
+
+origin: epic 99, story 99.2 (rung `agents-99-untrusted`, fix round 1, 2026-10-13; R376; review-99untrusted-1)
+location: `keeper_core::agents::curate::tests::gate_proposals_expire_unread`, `keeper_agent::memory::offered_in`
+reason: no code path lets a gate session write a proposal (R369's offer; `gate_injection_fixture` refuses `memory_propose`/`skill_propose` `NOT_OFFERED`), so the curator test's fixture is 95.3's `origin = "gate"` file, not a gate session's output. Accepted reading: the re-run on this rung plus the structural refusal satisfy #6; a fixture written by a gate session needs a path that must not exist.
+status: accepted
+

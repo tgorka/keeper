@@ -21,7 +21,7 @@ use keeper_core::agents::log::{DelegateBody, DelegateState, GateReason};
 use keeper_core::agents::tier::{self as tier_rules, CallFacts, Context};
 
 use super::*;
-use crate::agent::Deferred;
+use crate::agent::{Deferred, JournalAsk};
 
 /// The hour's card, kept beside the gate session's records.
 const CARD_FILE: &str = "card.json";
@@ -85,6 +85,7 @@ impl ServedSession {
                 }
             }
         }
+        Box::pin(self.raise_journals(deps, port)).await;
         Ok(())
     }
 
@@ -99,10 +100,7 @@ impl ServedSession {
         ticket: &str,
         deferred: &Deferred,
     ) -> Result<ApprovalRecord, String> {
-        fn failed(error: impl std::fmt::Display) -> String {
-            error.to_string()
-        }
-        let args: Value = serde_json::from_str(&deferred.args).map_err(failed)?;
+        let args: Value = serde_json::from_str(&deferred.args).map_err(|e| e.to_string())?;
         let request = self
             .context
             .gate_pending
@@ -110,13 +108,41 @@ impl ServedSession {
             .find(|(_, open)| open.ticket.as_deref() == Some(ticket))
             .map(|(request, _)| request.clone())
             .ok_or_else(|| "its request is closed".to_owned())?;
+        let label = self.context.agent.label.clone();
+        self.gate_record(
+            deps,
+            AgentTool::Delegate,
+            (deferred.call_line, &deferred.call_id, &deferred.approval),
+            &args,
+            serde_json::json!({ "ticket": ticket, "request": request }),
+            &label,
+        )
+    }
+
+    /// The approval record `approval` of a gate's deferred call — the
+    /// `tool_call` line `call_line` of wire id `call_id` — written once:
+    /// its arguments as the model sent them, bound with `exec_binding`;
+    /// classified as the call was (a gate's send, raised once); under
+    /// `label`.
+    fn gate_record(
+        &mut self,
+        deps: &AgentDeps,
+        tool: AgentTool,
+        (call_line, call_id, approval): (Ulid, &str, &str),
+        args: &Value,
+        exec_binding: Value,
+        label: &keeper_core::agents::label::Label,
+    ) -> Result<ApprovalRecord, String> {
+        fn failed(error: impl std::fmt::Display) -> String {
+            error.to_string()
+        }
         let agent = self.context.agent.clone();
         let facts = CallFacts {
             gate_send: true,
-            ..tier_rules::named_facts(AgentTool::Delegate, &args, CallFacts::default())
+            ..tier_rules::named_facts(tool, args, CallFacts::default())
         };
         let classification = tier_rules::classify(
-            AgentTool::Delegate,
+            tool,
             &facts,
             &Context::of_session(&agent, agent.label.integrity),
         );
@@ -130,7 +156,7 @@ impl ServedSession {
         let sha = chunk_sha256(&session_dir, &place.chunk, place.through_bytes).map_err(failed)?;
         let session = format!("{}/{}", deps.sessions_subfolder, self.context.session.path);
         let mut record = ApprovalRecord::new(RecordParking {
-            id: &deferred.approval,
+            id: approval,
             created_at: Utc::now(),
             session: &session,
             session_kind: agent.kind,
@@ -139,8 +165,8 @@ impl ServedSession {
             host: deps.host.as_str(),
             epoch: self.context.epoch,
             call: CallRef {
-                line: deferred.call_line.to_string(),
-                call_id: deferred.call_id.clone(),
+                line: call_line.to_string(),
+                call_id: call_id.to_owned(),
             },
             dispatch_chain: agent
                 .dispatch_chain
@@ -152,10 +178,10 @@ impl ServedSession {
                 through: place.line.to_string(),
                 sha256: sha,
             },
-            args: &args,
-            exec_binding: serde_json::json!({ "ticket": ticket, "request": request }),
+            args,
+            exec_binding,
             classification: &classification,
-            label: &agent.label,
+            label,
             preconditions: Preconditions::default(),
         })
         .map_err(failed)?;
@@ -177,6 +203,76 @@ impl ServedSession {
         })
         .map_err(failed)?;
         Ok(record)
+    }
+
+    /// Ask for every journal entry a gate's turn deferred (99.2 #2) whose
+    /// card a turn's end or a stop left unasked: its record, then the
+    /// hour's card, under the session's label as the turn left it. A card
+    /// the room did not take this time leaves the entry unasked, asked
+    /// again at the next turn's end or start, as a ticket's is; one that
+    /// cannot be asked at all — a label the room may not read among them
+    /// (R375) — is refused for good, its approval ended, its call's row
+    /// closed, and nothing is written.
+    async fn raise_journals(&mut self, deps: &AgentDeps, port: &Arc<dyn EditPort>) {
+        let unasked: Vec<(String, JournalAsk)> = self
+            .context
+            .gate_journals
+            .iter()
+            .filter(|(_, ask)| !ask.announced && !ask.decided)
+            .map(|(id, ask)| (id.clone(), ask.clone()))
+            .collect();
+        for (approval, ask) in unasked {
+            let record = match self.read_record(deps, &approval) {
+                Ok((record, _)) => Ok(record),
+                Err(_) => {
+                    let label = self.context.label.clone();
+                    serde_json::from_str::<Value>(&ask.args)
+                        .map_err(|error| error.to_string())
+                        .and_then(|args| {
+                            self.gate_record(
+                                deps,
+                                AgentTool::JournalAppend,
+                                (ask.call_line, &ask.call_id, &approval),
+                                &args,
+                                Value::Null,
+                                &label,
+                            )
+                        })
+                }
+            };
+            let asked = match record {
+                Ok(record) => {
+                    self.due.insert(record.id.clone(), record.expires());
+                    self.announce(deps, port, &record, ask.call_line).await
+                }
+                Err(reason) => Err(reason),
+            };
+            let reason = match asked {
+                Ok(()) => continue,
+                Err(reason) if reason == CARD_UNSENT => {
+                    tracing::info!(%approval, "agents: a gate's journal card was not taken by its room; it is asked for again later");
+                    continue;
+                }
+                Err(reason) => reason,
+            };
+            tracing::warn!(%approval, %reason, "agents: a gate's journal entry could not be asked for; it is refused");
+            self.due.remove(&approval);
+            self.close_row(deps, &approval, AuditOutcome::Refused);
+            let mut body = line(&approval, ApprovalState::Refused);
+            body.reason = Some(reason);
+            let ended = self
+                .writer
+                .write(
+                    &mut self.context,
+                    Some(ask.call_line),
+                    None,
+                    LineBody::Approval(body),
+                )
+                .and_then(|_| crate::agent::off_the_runtime(|| self.writer.sync()));
+            if let Err(error) = ended {
+                tracing::error!(%approval, %error, "agents: a refused journal entry's line could not be written");
+            }
+        }
     }
 
     /// Ask for `record`, a gate's ticket whose call is the `tool_call` line
@@ -417,7 +513,7 @@ impl ServedSession {
             .and_then(|(request, open)| Some((request.clone(), open.event.clone()?)));
         if let (Some((request, event)), Some(desk)) = (open, self.desk(deps, port)) {
             let (line, sent) = desk
-                .refuse(&request, &event, Some(ticket.to_owned()), reason)
+                .refuse(&request, Some(&event), Some(ticket.to_owned()), reason)
                 .await;
             self.writer.write(
                 &mut self.context,
@@ -428,5 +524,353 @@ impl ServedSession {
         }
         crate::agent::off_the_runtime(|| self.writer.sync())?;
         Ok(())
+    }
+
+    /// A gate's approval `pending` settled (codemap Q4, 99.2 #2, #3): a held
+    /// result's, a journal entry's or a ticket's, each by its own path.
+    pub(super) async fn gate_settled(
+        &mut self,
+        deps: &AgentDeps,
+        port: &Arc<dyn EditPort>,
+        pending: &Pending,
+        settled: Settled,
+    ) {
+        let held = self
+            .context
+            .gate_held
+            .iter()
+            .find(|(_, approval)| **approval == pending.id)
+            .map(|(request, _)| request.clone());
+        if let Some(request) = held {
+            Box::pin(self.held_settled(deps, port, pending, &request, settled)).await;
+        } else if self.context.gate_journals.contains_key(&pending.id) {
+            self.journal_settled(deps, pending, settled);
+        } else {
+            Box::pin(self.ticket_settled(deps, port, pending, settled)).await;
+        }
+    }
+
+    /// The gate's server ms now: its desk's clock, else this host's.
+    fn gate_now(&self) -> u64 {
+        self.gate_desk
+            .as_ref()
+            .map_or_else(crate::claims::wall_ms, |desk| desk.now())
+    }
+
+    /// A ticket's result the room's sink blocked, parked on the
+    /// `declassify` record `parked` names (99.2 #3): its call answered that
+    /// it waits, the request's `held` line naming the record, then the
+    /// record and its request in the approvers' proxy DMs — the drive's
+    /// owner's, at T4 — never the gate room. Nothing is said in the room.
+    /// Where nobody can be asked the result is refused `unreleased` now.
+    pub(crate) async fn hold_result(
+        &mut self,
+        deps: &AgentDeps,
+        port: &Arc<dyn EditPort>,
+        serving: &crate::gate::Serving,
+        parked: ParkedTurn,
+    ) -> Result<(), ServeError> {
+        let approval = parked.parking.approval.to_string();
+        let ticket = self
+            .context
+            .gate_pending
+            .get(&serving.request)
+            .and_then(|open| open.ticket.clone());
+        let mut held = crate::gate::refused_line(
+            &serving.request,
+            ticket,
+            GateReason::Unreleased,
+            self.gate_now(),
+        );
+        held.state = keeper_core::agents::log::GateState::Held;
+        held.reason = None;
+        held.approval = Some(approval.clone());
+        self.writer.write(
+            &mut self.context,
+            Some(parked.call_line),
+            None,
+            LineBody::Gate(held),
+        )?;
+        crate::agent::off_the_runtime(|| self.writer.sync())?;
+        let asked = self.park(deps, port, &parked).await;
+        // The call's result says what became of it; the round's later calls
+        // never run: the turn ended at its result.
+        let first = match &asked {
+            Ok(()) => ToolOutcome::Parked {
+                approval: parked.parking.approval,
+            },
+            Err(reason) => ToolOutcome::Refused {
+                reason: if reason == NOBODY_TO_ASK {
+                    NOBODY_TO_ASK.to_owned()
+                } else {
+                    format!("This could not wait for a person: {reason}")
+                },
+            },
+        };
+        let mut answers = vec![(parked.call_line, parked.parking.call_id.clone(), first)];
+        for (line_id, wire) in &parked.rest {
+            answers.push((
+                *line_id,
+                wire.id.clone(),
+                ToolOutcome::Refused {
+                    reason: NOT_RUN.to_owned(),
+                },
+            ));
+        }
+        let label = self.context.label.clone();
+        for (line_id, call_id, outcome) in answers {
+            let (word, truncated) = crate::agent::result_word(&outcome);
+            self.writer.write(
+                &mut self.context,
+                Some(line_id),
+                None,
+                LineBody::ToolResult(keeper_core::agents::log::ToolResultBody {
+                    call_id,
+                    outcome: word,
+                    content: render_result(&outcome),
+                    truncated,
+                    label: label.clone(),
+                    paseo: None,
+                    effect: None,
+                }),
+            )?;
+        }
+        crate::agent::off_the_runtime(|| self.writer.sync())?;
+        if let Err(reason) = asked {
+            tracing::warn!(request = %serving.request, %reason, "agents: a gate's held result could not be asked for; it is refused");
+            self.due.remove(&approval);
+            self.close_row(deps, &approval, AuditOutcome::Refused);
+            self.refuse_held(
+                port,
+                deps,
+                &serving.request,
+                parked.call_line,
+                GateReason::Unreleased,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Refuse the held request `request` for `reason` in the room, against
+    /// its ticket, its line under the call's `call_line`. Without its
+    /// request's event or the gate's desk the line is still written — the
+    /// request closed, nothing said in the room.
+    async fn refuse_held(
+        &mut self,
+        port: &Arc<dyn EditPort>,
+        deps: &AgentDeps,
+        request: &str,
+        call_line: Ulid,
+        reason: GateReason,
+    ) -> Result<(), ServeError> {
+        if let Some(open) = self.context.gate_pending.get(request).cloned() {
+            let (line, sent) = match (open.event.as_deref(), self.desk(deps, port)) {
+                (Some(event), Some(desk)) => {
+                    desk.refuse(request, Some(event), open.ticket, reason).await
+                }
+                (event, desk) => {
+                    tracing::warn!(%request, event = event.is_some(), desk = desk.is_some(), "agents: a held gate result is refused without a word in its room: its request's event or the gate's desk is gone");
+                    match desk {
+                        Some(desk) => desk.refuse(request, None, open.ticket, reason).await,
+                        None => (
+                            crate::gate::refused_line(
+                                request,
+                                open.ticket,
+                                reason,
+                                self.gate_now(),
+                            ),
+                            None,
+                        ),
+                    }
+                }
+            };
+            self.writer.write(
+                &mut self.context,
+                Some(call_line),
+                sent,
+                LineBody::Gate(line),
+            )?;
+        }
+        crate::agent::off_the_runtime(|| self.writer.sync())?;
+        Ok(())
+    }
+
+    /// A held result's declassification settled (99.2 #3). Consumed, the
+    /// result goes as the ticket's one `result` — exactly the bytes the
+    /// record names, and only while the room as it is now is within the
+    /// label it was held under widened by the readers the person let read
+    /// it (R193, R194); else it is refused `unreleased`. Denied, it is
+    /// refused `withheld`; expired or refused, `unreleased`. The call's one
+    /// row closes either way.
+    async fn held_settled(
+        &mut self,
+        deps: &AgentDeps,
+        port: &Arc<dyn EditPort>,
+        pending: &Pending,
+        request: &str,
+        settled: Settled,
+    ) {
+        let reason = match settled {
+            Settled::Run(call, Some(released), _) => {
+                match self
+                    .release(deps, port, pending, request, &call, &released)
+                    .await
+                {
+                    Ok(()) => {
+                        self.close_row(deps, &pending.id, AuditOutcome::Ok);
+                        return;
+                    }
+                    Err(why) => {
+                        tracing::warn!(%request, %why, "agents: a released gate result was not sent");
+                        GateReason::Unreleased
+                    }
+                }
+            }
+            Settled::Run(..) => GateReason::Unreleased,
+            Settled::Refuse(said) if said == DENIED => GateReason::Withheld,
+            Settled::Refuse(_) => GateReason::Unreleased,
+        };
+        self.close_row(deps, &pending.id, AuditOutcome::Refused);
+        if let Err(error) = self
+            .refuse_held(port, deps, request, pending.call_line, reason)
+            .await
+        {
+            tracing::error!(%request, %error, "agents: a held gate result could not be refused");
+        }
+    }
+
+    /// Send the held result of `request`, `call` as its turn made it, on
+    /// its consumed declassification `released`: its redacted text's bytes
+    /// as the record names them, into the room only while the room is
+    /// within the approved label; its lines under the call's.
+    async fn release(
+        &mut self,
+        deps: &AgentDeps,
+        port: &Arc<dyn EditPort>,
+        pending: &Pending,
+        request: &str,
+        call: &chat::ToolCall,
+        released: &Released,
+    ) -> Result<(), String> {
+        let text = call
+            .arguments
+            .as_ref()
+            .and_then(|args| args["text"].as_str())
+            .ok_or_else(|| CHANGED.to_owned())?;
+        let text = keeper_core::agents::redact::redact_secrets(text).text;
+        if approval::sha256_hex(text.as_bytes()) != released.sha256 {
+            return Err(CHANGED.to_owned());
+        }
+        let (record, _) = self.read_record(deps, &pending.id)?;
+        let approved = keeper_core::agents::label::approved_label(&record.label, &released.readers);
+        let members = port.members().await.map_err(|error| error.to_string())?;
+        let known = self.delegations.as_ref().map(|rooms| rooms.known());
+        let sink = crate::sinks::room_audience(
+            members,
+            known.as_deref(),
+            std::slice::from_ref(&deps.home.config.matrix_user),
+        );
+        if check_sink(&approved, &sink) != SinkVerdict::Allow {
+            return Err(crate::agent::AUDIENCE_MOVED.to_owned());
+        }
+        let (event, ticket) = self
+            .context
+            .gate_pending
+            .get(request)
+            .and_then(|open| Some((open.event.clone()?, open.ticket.clone()?)))
+            .ok_or_else(|| "its request is closed".to_owned())?;
+        let desk = self
+            .desk(deps, port)
+            .ok_or_else(|| "this session has no desk".to_owned())?;
+        desk.call_back(request, event, ticket);
+        let lines = desk.reply(request, &text).await?;
+        for fact in lines {
+            self.writer
+                .write(
+                    &mut self.context,
+                    Some(pending.call_line),
+                    fact.event,
+                    LineBody::Gate(fact.line),
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        crate::agent::off_the_runtime(|| self.writer.sync()).map_err(|error| error.to_string())
+    }
+
+    /// A gate's journal entry's approval settled (99.2 #2): consumed, the
+    /// host writes the entry — quoted as data — under the label it was
+    /// asked under, into the home its readers read, and a `session`
+    /// decision lets this session's later entries go for a day; denied,
+    /// expired or refused, nothing is written. The call's one row closes
+    /// either way.
+    fn journal_settled(&mut self, deps: &AgentDeps, pending: &Pending, settled: Settled) {
+        let Some(ask) = self.context.gate_journals.remove(&pending.id) else {
+            return;
+        };
+        let Settled::Run(call, ..) = settled else {
+            self.close_row(deps, &pending.id, AuditOutcome::Refused);
+            return;
+        };
+        let label = match self.read_record(deps, &pending.id) {
+            Ok((record, _)) => record.label,
+            Err(reason) => {
+                tracing::warn!(approval = %pending.id, %reason, "agents: a gate's journal entry's record does not read; nothing is written");
+                self.close_row(deps, &pending.id, AuditOutcome::Refused);
+                return;
+            }
+        };
+        let home = Readers::Only(deps.home.drive.readers.clone());
+        if check_sink(&label, &Sink::MemoryWrite { home_readers: home }) != SinkVerdict::Allow {
+            self.close_row(deps, &pending.id, AuditOutcome::Refused);
+            return;
+        }
+        let memory = crate::memory::MemoryTools::new(
+            crate::memory::MemoryHome {
+                agent: deps.home.config.id.clone(),
+                dir: deps.home.dir.clone(),
+                dir_rel: crate::agent::drive_relative(&deps.drive_root, &deps.home.dir),
+                zone: deps.home.zone.clone(),
+                host: deps.host.clone(),
+            },
+            crate::memory::MemorySession {
+                dir: format!("{}/{}", deps.sessions_subfolder, self.context.session.path),
+                slug: self
+                    .context
+                    .session
+                    .path
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or_default()
+                    .to_owned(),
+                kind: SessionKind::Gate,
+                parent_kind: None,
+                review: false,
+            },
+        );
+        let lease = self.writer.lease();
+        let may_write = move || lease.as_ref().is_none_or(|lease| lease.may_write());
+        let outcome = memory.run(&call, &label, &may_write);
+        for line in memory.take_lines() {
+            if let Err(error) =
+                self.writer
+                    .write(&mut self.context, Some(ask.call_line), None, line)
+            {
+                tracing::error!(approval = %pending.id, %error, "agents: a gate's journal line could not be written");
+            }
+        }
+        if let Err(error) = crate::agent::off_the_runtime(|| self.writer.sync()) {
+            tracing::error!(%error, "agents: the session's log could not be synced");
+        }
+        self.close_row(deps, &pending.id, crate::sinks::audit_outcome(&outcome));
+        let session_scope = self
+            .read_decision(deps, &pending.id)
+            .is_some_and(|decision| decision.scope == approval::Scope::Session);
+        if session_scope && matches!(outcome, ToolOutcome::Answered { .. }) {
+            self.context.gate_journal = Some(keeper_core::agents::gate::JournalAllowance::granted(
+                &pending.id,
+                self.gate_now(),
+            ));
+        }
     }
 }

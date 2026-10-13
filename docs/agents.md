@@ -3405,7 +3405,7 @@ each message an `m.text` referencing the request (`m.relates_to` `m.reference`) 
 | `answer` | a synchronous request answered within its deadline; `deadline_ms` says the deadline the gate kept |
 | `ticket` | an asynchronous request, at once; a synchronous one whose deadline passed first (timed by the homeserver's clock). The work goes on. |
 | `result` | the ticket's work, done |
-| `refused` | `reason`: `busy` (an hourly allowance is spent, or as many tickets are open across the agent's gates on this host as `[limits].max_concurrent_sessions`), `mode` (an asynchronous request to a gate whose `modes` is `["sync"]`), `no_answer` (the gate's turn ended without answering), `interrupted` (its host stopped mid-turn), `denied` (a person declined handing it on), `expired` (nobody decided that in time), `failed` (approved, but it could not be handed on) |
+| `refused` | `reason`: `busy` (an hourly allowance is spent, or as many tickets are open across the agent's gates on this host as `[limits].max_concurrent_sessions`), `mode` (an asynchronous request to a gate whose `modes` is `["sync"]`), `no_answer` (the gate's turn ended without answering), `interrupted` (its host stopped mid-turn), `denied` (a person declined handing it on), `expired` (nobody decided that in time), `failed` (approved, but it could not be handed on), `withheld` (its result read what the room may not read, and the drive's owner declined to let it out), `unreleased` (the same, and nobody let it out: nobody could be asked from this host, nobody decided within the hour, or the result or the room changed after the decision) |
 
 A synchronous request to a gate whose `modes` is `["async"]` gets a ticket at once. Both hourly
 allowances refill continuously — `max_tickets_per_hour` tickets, `max_requests_per_hour`
@@ -3427,11 +3427,11 @@ as a sink like every send. Its label is reset to the gate's opening label (the `
 
 ### Handing a request on
 
-A gate's turn is offered `reply`, and `delegate` when `[tools].allow` names it (a gate's default
-`allow` does); `journal_append` and the MCP servers `[tools].mcp` names come with the rest of the
-gates for outside systems. Any other tool its model names — `ask_human`, its journal, an MCP tool
-or a drive verb included, whatever `[tools].allow` says — is refused as not offered, before it runs
-or reaches anyone.
+A gate's turn is offered `reply`, and `delegate` and `journal_append` when `[tools].allow` names
+them (a gate's default `allow` does). Any other tool its model names — `ask_human`, a memory or
+skill proposal, an MCP tool or a drive verb included, whatever `[tools].allow` says — is refused as
+not offered, before it runs or reaches anyone. A gate's MCP servers are not offered in this build
+(DW-1360).
 
 `delegate` in a gate never hands anything on by itself. Its target must resolve to an agent its
 `[[gate]].delegates` lists — compared as `<drive>/<id>`, whatever name the call wrote, so the agent
@@ -3468,13 +3468,59 @@ brief sent only after the delegate's host joined, its id the ticket's, carrying 
 When the delegate replies, the gate runs one turn that reads that request and the reply alone, and
 its `reply` goes out as the ticket's `result`; a reply delivered again adds nothing. That `reply`
 passes the room as a sink like every send, and the delegate's reply carries what its own turn read —
-its home drive at least, whose readers never include the peer — so in this build a result the
-delegate's home went into is blocked, nothing reaches the peer, and the request ends refused;
-releasing it through a person's declassification comes with the rest of the gates for outside
-systems. A denial
+its home drive at least, whose readers never include the peer — so a result the delegate's home
+went into is **held** (below). A denial
 refuses the ticket `denied`, a record nobody decides within a day `expired`. Open tickets — handed
 on or not — count against `[limits].max_concurrent_sessions` until their `result` or refusal; one
 waiting for a person or a delegate survives a restart.
+
+### A result that read a drive
+
+A ticket's result whose delegate read what the room's audience may not read never reaches the room
+by itself. Its `reply` is blocked by the room's sink and waits for the drive's owner — the head of
+the gate's chain — on a `declassify` card (tier 3 raised to 4, `once`, an hour to decide) sent to
+the owner's DM with their proxy, never into the gate room; the proxy never joins the gate room. The
+card names who the result would let read (the peer, and anyone else in the room the label does not
+reach), the exact bytes by their SHA-256, and the `reply` itself. The gate logs the request `held`
+and says nothing in the room; it goes on taking requests meanwhile, and its ticket stays open. Only
+the owner's decision from a verified device counts — a reader of the note, the peer or another
+pinned person count for nothing. Approved, exactly that text goes once as the ticket's `result`,
+and only while the room is still within the label the result was held under widened by the readers
+the card named; a room someone joined since is refused `unreleased`. Declined, the request is
+refused `withheld`; undecided within the hour, or on a host that runs no proxy of the owner's (the
+card cannot be asked anywhere), `unreleased`. A held result survives a restart. A later reply of
+the same ticket while it is held runs no turn and asks nothing: the first card is the one that
+decides. The SHA-256 on the card is the record's own: what goes is the text the card carries,
+never a later line of the turn.
+
+Every status and scope a gate would post is held the same way: a gate's turn posts neither, so
+nothing in the room names a path, a title or a heading a delegate read.
+
+### What an outside system cannot make an agent do
+
+A request is data. Whatever it says — "ignore your instructions", "delegate to amelia", "push to
+origin", "remember that…" — the safety is the host's, not the model's:
+
+- **No tool it was not given.** A gate's turn is offered `reply`, `delegate` and `journal_append` at
+  most; `run`, a drive verb, `ask_human`, `workflow_start`, a helper and a memory or skill proposal
+  are never offered and are refused unrun if named.
+- **No recipient or path from its text.** `delegate` reaches only an agent `[[gate]].delegates`
+  lists, by identity; the agent a request names is refused, never asked. `reply` goes only to the
+  gate's own room.
+- **Nothing consequential without a person.** Every hand-off and every journal entry waits on the
+  hour's card for one of the drive's pinned people; a result that read their drive waits for the
+  owner's declassification. The session is `untrusted` for life, and no decision, reply or event
+  raises it.
+- **No memory.** A gate proposes no memory and no skill; a `gate`-origin proposal is never promoted
+  and expires unread after 30 days. Its journal entry — tier 1 raised to 2, decided `once` or for
+  the session (a day at most, by the homeserver's clock, then it asks again) — is written only once
+  approved, quoted line by line under a sentence saying it came from an outside system and is data.
+  An entry whose card the room did not take is asked for again after the next request. An entry made
+  after the turn read what only some of the room may read — a delegate's reply from a drive — cannot
+  be put on a card in that room: it is refused unasked, nothing is written, and the model is told
+  so (DW-1364).
+- **No flood.** Requests and tickets are bounded per hour, tickets also by
+  `[limits].max_concurrent_sessions`, and one card gathers an hour's tickets.
 
 What the room still lets the peer do is recorded: an `m.room.encrypted` event in a clear room
 (DW-1334), the status anchor `agents gate` posts, which names the host and the session's folder

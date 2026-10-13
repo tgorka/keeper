@@ -105,7 +105,8 @@ use crate::rooms::{self, Arrival, BriefEvent, Disposition, Served};
 use crate::sessions::verbs::{self, CreateOutcome};
 use crate::sessions::write::session_write;
 use crate::sinks::{
-    room_audience, CallAudit, Gated, ProxyDoors, RoomGate, Sinks, MEMBERS_UNREAD, NARROWED_STATUS,
+    room_audience, CallAudit, Gated, ProxyDoors, RoomGate, Sinks, Withheld, MEMBERS_UNREAD,
+    NARROWED_STATUS,
 };
 use crate::turn::{
     arm_turn_probing, endpoint_of, read_timeout_of, SessionRef, TurnEnv, TurnOrigin,
@@ -281,6 +282,11 @@ pub struct SessionContext {
     /// in memory only, so they end when the session closes or this host
     /// lets it go — a run then asks again.
     pub(crate) run_allowances: Vec<keeper_core::agents::run::RunAllowance>,
+    /// A gate session's journal allowance a person's `session` decision
+    /// gave (99.2 #2, S-11): held in memory only, as `run_allowances` are,
+    /// so it ends with the session's hold on this host or a day after the
+    /// decision, whichever is first.
+    pub(crate) gate_journal: Option<keeper_core::agents::gate::JournalAllowance>,
     /// The Paseo runs this session's own successful `create_agent` calls
     /// started, from the host's records on their results — every line's,
     /// a blob's hydrated — by broker (Q14).
@@ -316,6 +322,18 @@ pub struct SessionContext {
     /// delegation's own id (Q13): from its `delegate requested` line until
     /// its reply or its refusal.
     pub gate_deferred: BTreeMap<String, Deferred>,
+    /// A gate session's ticket results held for their declassification
+    /// (99.2 #3): the request's name, and the `declassify` approval whose
+    /// consumption sends its result — from its `held` line until the
+    /// request's `result` or `refused`.
+    pub gate_held: BTreeMap<String, String>,
+    /// A gate session's journal entries waiting for a person (99.2 #2), by
+    /// their approval's id: from the call's `memory asked` line until the
+    /// host settled it.
+    pub gate_journals: BTreeMap<String, JournalAsk>,
+    /// The current request's `reply` and `journal_append` calls in a gate
+    /// session, by `tool_call` line: wire id, tool, arguments.
+    gate_calls: HashMap<Ulid, (String, String, String)>,
     /// Each `delegate` call's wire id, by its `tool_call` line.
     delegate_call_ids: HashMap<Ulid, String>,
 }
@@ -349,6 +367,20 @@ pub struct Deferred {
     pub decided: bool,
     /// Its delegation's room is made.
     pub opened: bool,
+}
+
+/// A gate's `journal_append` waiting for a person on the hour's card
+/// (99.2 #2): the host writes its entry once its approval is consumed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JournalAsk {
+    pub call_line: Ulid,
+    pub call_id: String,
+    /// The call's arguments as the model sent them.
+    pub args: String,
+    /// Its `approval requested` line is written.
+    pub announced: bool,
+    /// Its approval ended.
+    pub decided: bool,
 }
 
 impl SessionContext {
@@ -434,6 +466,7 @@ impl SessionContext {
             last_result: None,
             nudges: Default::default(),
             run_allowances: Vec::new(),
+            gate_journal: None,
             paseo_runs: std::collections::BTreeSet::new(),
             paseo_ended: None,
             paseo_heard: HashSet::new(),
@@ -443,6 +476,9 @@ impl SessionContext {
             gate_pending: BTreeMap::new(),
             gate_last: None,
             gate_deferred: BTreeMap::new(),
+            gate_held: BTreeMap::new(),
+            gate_journals: BTreeMap::new(),
+            gate_calls: HashMap::new(),
             delegate_call_ids: HashMap::new(),
         };
         for stored in &log.lines {
@@ -637,30 +673,48 @@ impl SessionContext {
                     .retain(|(_, wire)| wire.id != result.call_id);
                 // An approval stays until every call of its round has its
                 // result, so a continuation a stop cut is resumed (R176).
-                for pending in self.parked.values_mut() {
-                    pending.round.retain(|id| *id != result.call_id);
+                // A gate's waits are ended by their approval's own lines
+                // alone: its calls have their results by then or after.
+                if self.agent.kind != SessionKind::Gate {
+                    for pending in self.parked.values_mut() {
+                        pending.round.retain(|id| *id != result.call_id);
+                    }
+                    self.parked.retain(|_, pending| !pending.round.is_empty());
                 }
-                self.parked.retain(|_, pending| !pending.round.is_empty());
             }
             LineBody::Approval(body) => match body.state {
-                // A gate's ticket waits outside any turn (codemap Q4): its
-                // call has its result already, and nothing waits on it.
+                // A gate's ticket, journal entry or held result waits outside
+                // any turn (codemap Q4, 99.2 #2, #3): its call has its result
+                // already, and nothing waits on it.
                 ApprovalState::Requested if self.agent.kind == SessionKind::Gate => {
-                    let deferred = self
+                    let waits = if let Some(deferred) = self
                         .gate_deferred
                         .values_mut()
-                        .find(|deferred| deferred.approval == body.id);
-                    if let Some(deferred) = deferred {
+                        .find(|deferred| deferred.approval == body.id)
+                    {
                         deferred.announced = true;
+                        Some((deferred.call_line, deferred.call_id.clone()))
+                    } else if let Some(ask) = self.gate_journals.get_mut(&body.id) {
+                        ask.announced = true;
+                        Some((ask.call_line, ask.call_id.clone()))
+                    } else if self.gate_held.values().any(|held| *held == body.id) {
+                        line.parent.and_then(|call_line| {
+                            let (call_id, ..) = self.gate_calls.get(&call_line)?;
+                            Some((call_line, call_id.clone()))
+                        })
+                    } else {
+                        None
+                    };
+                    if let Some((call_line, call_id)) = waits {
                         self.parked.insert(
                             body.id.clone(),
                             crate::approvals::Pending {
                                 id: body.id.clone(),
-                                call_id: deferred.call_id.clone(),
-                                call_line: deferred.call_line,
+                                call_id: call_id.clone(),
+                                call_line,
                                 request_event: line.matrix_event.clone(),
                                 ended: None,
-                                round: vec![deferred.call_id.clone()],
+                                round: vec![call_id],
                                 announced: true,
                                 ran: false,
                             },
@@ -707,6 +761,9 @@ impl SessionContext {
                             if deferred.approval == body.id {
                                 deferred.decided = true;
                             }
+                        }
+                        if let Some(ask) = self.gate_journals.get_mut(&body.id) {
+                            ask.decided = true;
                         }
                     }
                 }
@@ -757,6 +814,7 @@ impl SessionContext {
                 self.gate_last = Some((gate.request.clone(), gate.state));
                 match gate.state {
                     GateState::Request => {
+                        self.gate_calls.clear();
                         self.gate_pending.insert(
                             gate.request.clone(),
                             GateOpen {
@@ -771,7 +829,14 @@ impl SessionContext {
                             open.ticket = gate.ticket.clone();
                         }
                     }
+                    GateState::Held => {
+                        if let Some(approval) = &gate.approval {
+                            self.gate_held
+                                .insert(gate.request.clone(), approval.clone());
+                        }
+                    }
                     GateState::Answer | GateState::Result | GateState::Refused => {
+                        self.gate_held.remove(&gate.request);
                         // A request refused as it was taken had no turn:
                         // nothing waits for an answer.
                         if self.gate_pending.remove(&gate.request).is_some()
@@ -788,6 +853,33 @@ impl SessionContext {
             }
             LineBody::ToolCall(call) if call.tool == keeper_core::agents::workflow::BMAD_RENDER => {
                 self.renders.insert(call.call_id.clone(), call.args.clone());
+            }
+            // A gate turn's answer and journal calls: what a held result's
+            // and a deferred entry's lines name (99.2 #2, #3).
+            LineBody::ToolCall(call)
+                if self.agent.kind == SessionKind::Gate
+                    && (call.tool == delegate::REPLY
+                        || call.tool == crate::memory::JOURNAL_APPEND) =>
+            {
+                self.gate_calls.insert(
+                    line.id,
+                    (call.call_id.clone(), call.tool.clone(), call.args.clone()),
+                );
+            }
+            LineBody::Memory(body) if body.op == keeper_core::agents::log::MemoryOp::Asked => {
+                let ask = line.parent.and_then(|call_line| {
+                    let (call_id, _, args) = self.gate_calls.get(&call_line)?;
+                    Some(JournalAsk {
+                        call_line,
+                        call_id: call_id.clone(),
+                        args: args.clone(),
+                        announced: false,
+                        decided: false,
+                    })
+                });
+                if let Some(ask) = ask {
+                    self.gate_journals.insert(body.reference.clone(), ask);
+                }
             }
             LineBody::ToolResult(result) => {
                 if let Some(started) = &result.paseo {
@@ -1390,6 +1482,9 @@ struct AllowedTools<'t> {
     /// name the turn was not offered is refused [`NOT_OFFERED`] unrun,
     /// whatever `[tools].allow` says (R369); `None` outside a gate.
     only_offered: Option<Vec<String>>,
+    /// A gate session's journal allowance a person gave for the session
+    /// (99.2 #2): while it covers the server's now, an entry goes unasked.
+    gate_journal: Option<keeper_core::agents::gate::JournalAllowance>,
 }
 
 /// A consumed approval as the one execution of its call holds it: the
@@ -1406,7 +1501,7 @@ struct Bound {
 
 /// Why a bound call that would now reach someone its approval did not name
 /// does not run.
-const AUDIENCE_MOVED: &str = "who it would reach changed after it was approved";
+pub(crate) const AUDIENCE_MOVED: &str = "who it would reach changed after it was approved";
 
 /// Where `subpath` of the drive checked out at `profile` lands, as
 /// drive-relative names: keeper-sync's landing, every link followed. The
@@ -3552,7 +3647,20 @@ pub const RUN_ENDED: &str =
     "This workflow's run has replied: it ends here, and this call had no effect.";
 /// What a gate turn's call of a tool it was not offered is told (R369).
 pub const NOT_OFFERED: &str =
-    "That tool was not offered in this turn: a gate answers its outside system with reply alone. Nothing was done.";
+    "That tool was not offered in this turn: a gate answers its outside system with reply, hands a request on with delegate and keeps notes with journal_append, as its agent allows. Nothing was done.";
+
+/// What a gate's `journal_append` says where nobody could decide it.
+pub const GATE_JOURNAL_UNASKED: &str =
+    "A gate's journal entry waits for a person's decision, and nobody can be asked here, so nothing was written.";
+
+/// What a gate's `journal_append` says while its entry waits for a person
+/// on the hour's card (99.2 #2): nothing is written yet.
+pub const GATE_JOURNAL_ASKED: &str = "This entry waits for a person's decision on the hour's card; it is written, quoted as data, only once they approve it. Nothing was written yet: go on with the request";
+
+/// What a gate's `journal_append` says when its turn read what only some
+/// of the gate's room may read (R375): the hour's card would carry it into
+/// that room, so nobody is asked and nothing is written.
+pub const GATE_JOURNAL_NARROWED: &str = "This turn read what only some of this gate's room may read, so its journal entry cannot be put to a person on the hour's card there: nobody was asked and nothing was written. Go on with the request";
 
 impl ToolHost for AllowedTools<'_> {
     fn run(&self, call: &ToolCall) -> Result<ToolOutcome, BotsError> {
@@ -3858,15 +3966,44 @@ impl AllowedTools<'_> {
             // checked against the home's readers before any effect, then
             // made under the claim (R120).
             let tool = AgentTool::from_wire(&wire.name)?;
-            let classification = self.classify(&wire.id, tool, &CallFacts::default(), None);
+            // A gate's journal entry is outside text going into the home:
+            // a person decides it on the hour's card (99.2 #2, codemap Q4),
+            // unless they let this session's entries go for a day.
+            let in_gate =
+                self.agent.kind == SessionKind::Gate && wire.name == crate::memory::JOURNAL_APPEND;
+            let facts = CallFacts {
+                gate_send: in_gate,
+                ..CallFacts::default()
+            };
+            let classification = self.classify(&wire.id, tool, &facts, None);
             let at = self.memory.at(wire);
-            let gated = self.gated(
-                &wire.id,
-                &wire.name,
-                &classification,
-                &[],
-                vec![(self.home.id.clone(), at.clone())],
-            );
+            let allowed = self
+                .gate_journal
+                .as_ref()
+                .filter(|_| in_gate)
+                .zip(self.delegation.serving.as_ref())
+                .filter(|(allowance, serving)| allowance.covers(serving.desk.now()))
+                .and_then(|(allowance, _)| Ulid::from_string(&allowance.approval).ok());
+            let gated = match (in_gate, allowed) {
+                (true, Some(approval)) => Gated::Run(Some(Approval::Approved(approval))),
+                // Where no decision source is installed nobody could decide
+                // it: refused, never written unasked.
+                (true, None) if !self.parks => Gated::Refuse(GATE_JOURNAL_UNASKED.to_owned()),
+                // Its card goes into the gate's room under the turn's label:
+                // one narrowed below the room — a callback's reply that read
+                // a drive — cannot be asked there (R375).
+                (true, None) if !self.view.label().may_reach(&self.agent.label.readers) => {
+                    Gated::Refuse(GATE_JOURNAL_NARROWED.to_owned())
+                }
+                (true, None) => self.deferred(&wire.name, &classification, &[]),
+                (false, _) => self.gated(
+                    &wire.id,
+                    &wire.name,
+                    &classification,
+                    &[],
+                    vec![(self.home.id.clone(), at.clone())],
+                ),
+            };
             let audit = CallAudit::new(
                 self.sinks,
                 &wire.name,
@@ -3874,11 +4011,16 @@ impl AllowedTools<'_> {
                 &classification,
                 gated,
                 (&self.home.id, &at),
-            )
-            .lifting(self, &wire.id);
+            );
+            // A gate's blocked entry is refused, never declassified.
+            let audit = if in_gate {
+                audit
+            } else {
+                audit.lifting(self, &wire.id)
+            };
             let outcome = if !self.allow.contains(&wire.name) {
                 refusal(format!("{} is not one of this agent's tools.", wire.name))
-            } else if let Some(reason) = self.memory.refusal() {
+            } else if let Some(reason) = self.memory.refusal(&wire.name) {
                 refusal(reason.to_owned())
             } else {
                 let label = self.view.label();
@@ -3901,6 +4043,14 @@ impl AllowedTools<'_> {
                     .and_then(|()| audit.admit(&self.home.id, &at));
                 match admitted {
                     Ok(()) => self.memory.run(wire, &label, &|| self.view.may_write()),
+                    // Deferred to the hour's card: the turn goes on, and the
+                    // host writes the entry once a person approved it.
+                    Err(Withheld::Parked(approval)) if in_gate => {
+                        self.memory.asked(&approval.to_string());
+                        ToolOutcome::Answered {
+                            text: format!("{GATE_JOURNAL_ASKED} (approval {approval})"),
+                        }
+                    }
                     Err(withheld) => withheld.into(),
                 }
             };
@@ -4301,6 +4451,11 @@ pub const NO_GATE: &str =
 pub const NOT_THIS_DELEGATION: &str = "a brief for another delegation is not a turn here";
 /// A join or a reply no delegation of this session waits for.
 pub const NOT_A_DELEGATION: &str = "no delegation of this session waits for this";
+/// A ticket's reply that comes again while its result waits for its
+/// declassification (99.2 #3): the first record stands, and this one is
+/// no turn.
+pub const RESULT_HELD: &str =
+    "this ticket's result waits for its owner's decision; a later reply is no turn";
 /// A Paseo run's completion that arrived while its room's readback is
 /// owed: taken when that readback reaches it, in the room's order, so the
 /// cursor never passes an older completion not yet taken (R279).
@@ -4878,14 +5033,23 @@ impl ServedSession {
         }
         Box::pin(self.raise_tickets(deps, port)).await?;
         let deferred = &self.context.gate_deferred;
+        let held = &self.context.gate_held;
+        let parked = &self.context.parked;
         let (waiting, pending): (BTreeMap<_, _>, BTreeMap<_, _>) =
             std::mem::take(&mut self.context.gate_pending)
                 .into_iter()
-                .partition(|(_, open): &(String, GateOpen)| {
-                    open.ticket
-                        .as_ref()
-                        .and_then(|ticket| deferred.get(ticket))
-                        .is_some_and(|deferred| !deferred.decided || deferred.opened)
+                .partition(|(request, open): &(String, GateOpen)| {
+                    // A result held for its declassification waits on as a
+                    // ticket waiting for its decision does (99.2 #3) — once
+                    // its card was asked for; one a stop cut before that is
+                    // refused with the rest.
+                    held.get(request)
+                        .is_some_and(|approval| parked.contains_key(approval))
+                        || open
+                            .ticket
+                            .as_ref()
+                            .and_then(|ticket| deferred.get(ticket))
+                            .is_some_and(|deferred| !deferred.decided || deferred.opened)
                 });
         self.context.gate_pending = waiting;
         let recovered = parent.is_some() || !pending.is_empty();
@@ -4895,7 +5059,7 @@ impl ServedSession {
                 let (line, said) = desk
                     .refuse(
                         &request,
-                        event,
+                        Some(event),
                         open.ticket.clone(),
                         keeper_core::agents::log::GateReason::Interrupted,
                     )
@@ -5324,7 +5488,9 @@ impl ServedSession {
             ran.round_text.clone()
         };
         let closing = match ran.ending {
-            TurnEnding::Complete | TurnEnding::Stopped | TurnEnding::Asked => {
+            // A turn whose result waits for a declassification ends at it:
+            // the host, not a resumed turn, sends what a person releases.
+            TurnEnding::Complete | TurnEnding::Stopped | TurnEnding::Asked | TurnEnding::Parked => {
                 let outcome = ran.outcome.as_ref();
                 let usage = outcome.and_then(|o| o.usage.as_ref());
                 LineBody::Assistant(AssistantBody {
@@ -5375,6 +5541,11 @@ impl ServedSession {
             )?;
         }
         off_the_runtime(|| self.writer.sync())?;
+        // A result held for its declassification is asked for in the
+        // owner's proxy DM now (99.2 #3).
+        if let Some(parked) = ran.parked.clone() {
+            Box::pin(self.hold_result(deps, &port, &serving, parked)).await?;
+        }
         // What the turn handed on is asked for on the hour's card now that
         // its lines are written (codemap Q4).
         Box::pin(self.raise_tickets(deps, &port)).await?;
@@ -5413,6 +5584,13 @@ impl ServedSession {
             tracing::info!(delegation = %open.id, "agents: a gate's delegation replied for a ticket that is closed");
             return Ok(Outcome::Ignored(NOT_A_DELEGATION));
         };
+        // A result held for its declassification stays the one its record
+        // names: a later reply of the same ticket opens no second turn and
+        // asks for no second record.
+        if self.context.gate_held.contains_key(&request) {
+            tracing::info!(delegation = %open.id, %request, "agents: a gate's ticket replied again while its result waits for its owner's decision; the reply is no turn");
+            return Ok(Outcome::Ignored(RESULT_HELD));
+        }
         desk.call_back(&request, event.clone(), open.id.clone());
         self.reset_gate_label(event.to_string())?;
         let Some(peer) = self.peer_the_reply()? else {
@@ -9131,12 +9309,15 @@ fn agent_offer(
         return tools;
     }
     // A gate's tools are a ceiling (codemap Q1): its turn is offered its
-    // answer, and `delegate` as `allow` says — a hand-off a person decides
-    // on the hour's card (R371); `journal_append` and its MCP servers come
-    // with the rules that make them safe there. Its dispatch refuses
-    // anything it was not offered ([`NOT_OFFERED`], R369).
+    // answer, and as `allow` says `delegate` — a hand-off a person decides
+    // on the hour's card (R371) — and `journal_append`, whose entry waits
+    // on the same card and is written quoted as data (99.2 #2). Its MCP
+    // servers are not offered (DW-1360). Its dispatch refuses anything it
+    // was not offered ([`NOT_OFFERED`], R369).
     if session == SessionKind::Gate {
-        return delegate::specs(offers_delegate(config), ReplyOffer::Gate);
+        let mut offered = delegate::specs(offers_delegate(config), ReplyOffer::Gate);
+        offered.extend(crate::memory::specs(&config.allow, session, None));
+        return offered;
     }
     tools.retain(|spec| config.allow.contains(&spec.name));
     tools.extend(crate::surface::specs(&crate::surface::offered(config)));
@@ -9532,6 +9713,7 @@ async fn run_agent_turn(
     // A workflow's run checks at its reply the outputs it declared as it
     // opened, whatever its header says now (R107, R202).
     let outputs = context.agent.outputs.clone();
+    let gate_journal = context.gate_journal.clone();
     let workflow_roots: Vec<(String, PathBuf)> = profiles
         .iter()
         .map(|profile| (profile.id.clone(), profile.local_path.clone()))
@@ -9720,6 +9902,7 @@ async fn run_agent_turn(
             stop.clone(),
         ),
         only_offered: in_gate.then_some(offered_names),
+        gate_journal,
         runs,
         // A review pass reads and proposes, a gate turn answers (R369):
         // offered no MCP tool, neither is given any to call either, so one
@@ -10379,7 +10562,7 @@ fn read_label(
 
 /// `dir` relative to `root`, `/`-separated: the agents zone's folder in
 /// its drive.
-fn drive_relative(root: &Path, dir: &Path) -> String {
+pub(crate) fn drive_relative(root: &Path, dir: &Path) -> String {
     dir.strip_prefix(root)
         .map(|rel| {
             rel.components()

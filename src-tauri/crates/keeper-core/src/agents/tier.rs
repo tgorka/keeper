@@ -1112,5 +1112,39 @@ mod tests {
             classify(AgentTool::Delegate, &facts, &attended()).tier,
             Tier::T1
         );
+        // `journal_append` (99.2 #2): T1 raised once to T2 as a gate's
+        // send — a person's, who may give it `once` or for the session —
+        // and the T1 it is everywhere else.
+        let journal = |gate_send| {
+            let facts = CallFacts {
+                gate_send,
+                ..named_facts(
+                    AgentTool::JournalAppend,
+                    &serde_json::json!({ "text": "tgorka's password is hunter2" }),
+                    CallFacts::default(),
+                )
+            };
+            classify(AgentTool::JournalAppend, &facts, &context)
+        };
+        let entry = journal(true);
+        assert_eq!((entry.base_tier, entry.tier), (Tier::T1, Tier::T2));
+        assert_eq!(entry.gate(), Gate::Person);
+        assert_eq!(
+            crate::agents::approval::scopes(entry.tier, SessionKind::Gate),
+            vec![
+                crate::agents::approval::Scope::Once,
+                crate::agents::approval::Scope::Session
+            ]
+        );
+        assert_eq!(journal(false).tier, Tier::T1);
+        // A blocked result's declassification (99.2 #3): T3 raised once to
+        // T4 — only the head of the gate's chain, its drive's owner, decides
+        // it, `once`.
+        let release = classify(AgentTool::Declassify, &CallFacts::default(), &context);
+        assert_eq!((release.base_tier, release.tier), (Tier::T3, Tier::T4));
+        assert_eq!(
+            crate::agents::approval::scopes(release.tier, SessionKind::Gate),
+            vec![crate::agents::approval::Scope::Once]
+        );
     }
 }
