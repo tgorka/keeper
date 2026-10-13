@@ -251,12 +251,21 @@ What the repository knows:
 - The bot is reached as `bot:openai:<base URL>#<model>`, a model its `/v1/models` lists (ruling
   R13); `keeper-agentd`'s `[[providers]]` row carries the credential as `secret:<name>`.
 
-What the owner records here (owed, not yet written):
+What the owner records here (recorded 2026-10-13):
 
-- Which upstream providers sit behind CLIProxyAPI's endpoint: **owed by the owner**.
-- Whether `disable-claude-cloak-mode` is set in its configuration: **owed by the owner**.
-- In the owner's own words, that the owner accepts the risk that a provider's terms stop the
-  agents: **owed by the owner**.
+- **Which upstream providers sit behind CLIProxyAPI's endpoint:** the owner's own Claude and
+  ChatGPT (Codex) subscription accounts, several accounts per provider with failover, plus an
+  OpenRouter key and the makistack Ollama — read from the endpoint's `/v1/models` (`owned_by`) and
+  the makistack `docker/cliproxyapi` configuration on 2026-10-13. The seeded agents use
+  `claude-opus-5-5` on the Claude subscriptions.
+- **Whether `disable-claude-cloak-mode` is set:** not set in makistack's
+  `docker/cliproxyapi/config.template.yaml`, so the proxy's default applies; the running
+  configuration can also be changed in its Management Center, which this record did not read.
+- **The owner's acceptance of the risk**, in the owner's words (2026-10-13, asked "if an upstream's
+  terms stop it, every agent stops at once"): *"dodaj cliproxy na subskrypcje z astra, sol, opus,
+  haiku"* and, to the agents' model, *"Tak, Opus 5.5 przez CLIProxy"*. The client key keeper uses
+  is, for now, omp's own (`op://makistack/cliproxyapi/api-key-omp`); a key of keeper's own replaces
+  it when the Management Center issues one.
 
 ## An agent's home
 
