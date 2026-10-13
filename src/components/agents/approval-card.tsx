@@ -22,6 +22,14 @@
  *
  * A coalesced request (a gate's card) is one group of rows, each decided on its
  * own: a row's decision never touches another row.
+ *
+ * **A gate's hour card** (UX-DR160) — a request Rust marks with `gate` — is
+ * always that group, even with one row: it names the system and the hour it
+ * covers, each row names the request it serves (quoted by Rust), its ticket and
+ * the agent the work would go to, and *Deny all* sends one deny per row Rust
+ * lists in `denyAll` — the rows still waiting that this device may decide — each
+ * through the same `agent_approval_decide` a row's own *Deny* uses, after a
+ * second press confirms how many. A decided row keeps its verdict.
  */
 import type { LucideIcon } from "lucide-react";
 import {
@@ -42,6 +50,7 @@ import { Textarea } from "@/components/ui/textarea";
 import {
   type ApprovalCardVm,
   type ApprovalDecision,
+  type ApprovalPayloadVm,
   type ApprovalPersonVm,
   type ApprovalScope,
   type ApprovalVm,
@@ -51,6 +60,9 @@ import {
 import { syncErrorMessage } from "@/lib/stores/sync";
 import { verificationStore } from "@/lib/stores/verification";
 import { cn } from "@/lib/utils";
+
+/** A gate card's hour, as a person reads a clock. */
+const HOUR_FORMAT = new Intl.DateTimeFormat(undefined, { timeStyle: "short" });
 
 /**
  * Each tier's weight. T0/T1 never wait for a person and T5 is never done, so
@@ -79,10 +91,18 @@ export const APPROVAL_VERIFY = "Verify this device";
 export const APPROVAL_SENT = "Your decision was sent. The card changes when the room has it.";
 export const APPROVAL_DECIDE_FAILED =
   "keeper could not send that decision. Nothing was decided; try again.";
+export const GATE_DENY_ALL = "Deny all";
+export const GATE_DENY_ALL_SENT =
+  "Your denials were sent. Each line changes when the room has its own.";
 
 /** A coalesced request's accessible name. */
 export function approvalListName(count: number): string {
   return `Approval request: ${count} actions, each decided on its own`;
+}
+
+/** A gate's hour card's accessible name (UX-DR160). */
+export function gateCardName(system: string, count: number): string {
+  return `Tickets from ${system} this hour: ${count} ${count === 1 ? "line" : "lines"}, each decided on its own`;
 }
 
 /** The declassification's question (UX-DR136's wording), drawn in place of the summary. */
@@ -145,6 +165,131 @@ function Payload({ tool, text }: { tool: string; text: string }) {
   );
 }
 
+export const RUN_SHOW_FILES = "Show the files it sees";
+export const RUN_HIDE_FILES = "Hide the files";
+
+/**
+ * A `run`'s execution as keeper bound it (UX-DR139): the argv one element
+ * per line, the program, each wrapper between and the one the last wrapper
+ * runs with their hashes, the folder, the drives it reads, when it is
+ * stopped, the code the session holds, and with network what it may send.
+ * Every name arrives escaped by Rust where it could be misread.
+ */
+function RunPayload({ run }: { run: NonNullable<ApprovalCardVm["run"]> }) {
+  const captionId = useId();
+  const filesId = useId();
+  const [files, setFiles] = useState(false);
+  return (
+    <figure aria-labelledby={captionId} className="flex min-w-0 flex-col gap-1">
+      <figcaption id={captionId} className="text-muted-foreground text-xs">
+        What will run
+      </figcaption>
+      <pre className="max-h-60 overflow-y-auto whitespace-pre-wrap rounded-md border border-border bg-background p-2 font-mono text-xs [overflow-wrap:anywhere]">
+        {run.argv.join("\n")}
+      </pre>
+      <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-2 gap-y-0.5 text-xs">
+        <dt className="text-muted-foreground">Program</dt>
+        <dd className="font-mono">{run.program}</dd>
+        {run.wrappers.length > 0 && (
+          <>
+            <dt className="text-muted-foreground">Then starts</dt>
+            <dd>
+              <ul className="font-mono">
+                {run.wrappers.map((wrapper, n) => (
+                  // biome-ignore lint/suspicious/noArrayIndexKey: the same wrapper may start twice.
+                  <li key={n}>{wrapper}</li>
+                ))}
+              </ul>
+            </dd>
+          </>
+        )}
+        {run.wrapped !== null && (
+          <>
+            <dt className="text-muted-foreground">Runs</dt>
+            <dd className="font-mono">{run.wrapped}</dd>
+          </>
+        )}
+        <dt className="text-muted-foreground">In</dt>
+        <dd className="font-mono">{run.cwd}</dd>
+        {run.reads.length > 0 && (
+          <>
+            <dt className="text-muted-foreground">Reads, read-only</dt>
+            <dd>
+              <ul className="font-mono">
+                {run.reads.map((drive) => (
+                  <li key={drive}>{drive}</li>
+                ))}
+              </ul>
+            </dd>
+          </>
+        )}
+        <dt className="text-muted-foreground">Stopped after</dt>
+        <dd>{run.timeoutS} s</dd>
+        {run.held.length > 0 && (
+          <>
+            <dt className="text-muted-foreground">Code the session holds</dt>
+            <dd>
+              <ul className="font-mono">
+                {run.held.map((held) => (
+                  <li key={held}>{held}</li>
+                ))}
+              </ul>
+            </dd>
+          </>
+        )}
+      </dl>
+      {run.network !== null && (
+        <div className="flex flex-col gap-1 rounded-md border border-border p-2 text-xs">
+          <p>
+            <span className="mr-1 rounded-sm bg-muted px-1 font-medium">Network</span>
+            {run.network.sentence}
+          </p>
+          {run.network.files.length > 0 && (
+            <>
+              <button
+                type="button"
+                aria-expanded={files}
+                aria-controls={filesId}
+                onClick={() => setFiles((was) => !was)}
+                className="w-fit rounded-sm text-muted-foreground underline-offset-2 outline-none hover:text-foreground hover:underline focus-visible:ring-2 focus-visible:ring-ring"
+              >
+                {files ? RUN_HIDE_FILES : RUN_SHOW_FILES}
+              </button>
+              <ul id={filesId} hidden={!files} className="max-h-60 overflow-y-auto font-mono">
+                {run.network.files.map((file) => (
+                  <li key={file}>{file}</li>
+                ))}
+              </ul>
+            </>
+          )}
+        </div>
+      )}
+    </figure>
+  );
+}
+
+/**
+ * A `kvm_act`'s inputs as keeper reads them (R323): typed and pasted text
+ * counted, never shown, a run of single keys counted too, and nothing the
+ * model wrote — its intent included — drawn.
+ */
+function KvmPayload({ kvm }: { kvm: NonNullable<ApprovalCardVm["kvm"]> }) {
+  const captionId = useId();
+  return (
+    <figure aria-labelledby={captionId} className="flex min-w-0 flex-col gap-1">
+      <figcaption id={captionId} className="text-muted-foreground text-xs">
+        What will be sent to <code className="font-mono">{kvm.kvm}</code>
+      </figcaption>
+      <ol className="max-h-60 list-decimal overflow-y-auto rounded-md border border-border bg-background py-2 pr-2 pl-6 text-xs [overflow-wrap:anywhere]">
+        {kvm.inputs.map((input, n) => (
+          // biome-ignore lint/suspicious/noArrayIndexKey: the same input may be sent twice.
+          <li key={n}>{input}</li>
+        ))}
+      </ol>
+    </figure>
+  );
+}
+
 export const APPROVAL_SHOW_FULL = "Show the full action";
 export const APPROVAL_HIDE_FULL = "Hide the full action";
 export const APPROVAL_PAYLOAD_FAILED =
@@ -152,32 +297,38 @@ export const APPROVAL_PAYLOAD_FAILED =
 
 /**
  * An attached action, fetched whole on request: Rust checks the file against
- * the card's digest before answering, and says why when it cannot.
+ * the card's digest before answering, and says why when it cannot. A `run`
+ * is drawn as an inline one is, from the typed view Rust built over what the
+ * digest binds.
  */
 function AttachedAction({
   card,
   accountId,
   roomId,
+  onShown,
 }: {
   card: ApprovalCardVm;
   accountId: string;
   roomId: string;
+  /** Called once the file, checked against the card's digest, is shown. */
+  onShown: () => void;
 }) {
   const [open, setOpen] = useState(false);
   const [loading, setLoading] = useState(false);
-  const [text, setText] = useState<string | null>(null);
+  const [shown, setShown] = useState<ApprovalPayloadVm | null>(null);
   const [refusal, setRefusal] = useState<string | null>(null);
 
   const toggle = async () => {
-    if (open || text !== null) {
+    if (open || shown !== null) {
       setOpen((was) => !was);
       return;
     }
     setRefusal(null);
     setLoading(true);
     try {
-      setText(await agentApprovalPayload(accountId, roomId, card.id));
+      setShown(await agentApprovalPayload(accountId, roomId, card.id));
       setOpen(true);
+      onShown();
     } catch (error) {
       setRefusal(syncErrorMessage(error, APPROVAL_PAYLOAD_FAILED));
     } finally {
@@ -203,7 +354,15 @@ function AttachedAction({
       >
         {open ? APPROVAL_HIDE_FULL : APPROVAL_SHOW_FULL}
       </Button>
-      {open && text !== null && <Payload tool={card.tool} text={text} />}
+      {open &&
+        shown !== null &&
+        (shown.run !== null ? (
+          <RunPayload run={shown.run} />
+        ) : shown.kvm !== null ? (
+          <KvmPayload kvm={shown.kvm} />
+        ) : (
+          <Payload tool={card.tool} text={shown.text} />
+        ))}
       {refusal !== null && (
         <p role="status" className="text-destructive text-xs">
           {refusal}
@@ -294,15 +453,21 @@ function Outcome({ card }: { card: ApprovalCardVm }) {
   }
 }
 
+export const APPROVAL_SEE_RUN_FIRST =
+  "Show the full action before approving: it holds what this run is bound to and what it releases.";
+
 /** Approve (in each offered scope) or deny with an optional note. */
 function Decide({
   card,
   accountId,
   roomId,
+  unseen,
 }: {
   card: ApprovalCardVm;
   accountId: string;
   roomId: string;
+  /** An attached `run` not yet shown: it cannot be approved unseen (UX-DR139). */
+  unseen: boolean;
 }) {
   const noteId = useId();
   const [sending, setSending] = useState(false);
@@ -383,7 +548,7 @@ function Decide({
               type="button"
               size="sm"
               variant={i === 0 ? "default" : "outline"}
-              disabled={sending}
+              disabled={sending || unseen}
               aria-describedby={`${noteId}-${offer.scope}`}
               onClick={() => void decide("approve", offer.scope)}
             >
@@ -400,6 +565,9 @@ function Decide({
             {APPROVAL_DENY}
           </Button>
         </div>
+      )}
+      {!denying && unseen && (
+        <p className="text-muted-foreground text-xs">{APPROVAL_SEE_RUN_FIRST}</p>
       )}
       {!denying &&
         card.scopes.map((offer) => (
@@ -436,6 +604,8 @@ function ApprovalCard({
   const weight = TIER_WEIGHT[card.tier] ?? HEAVIEST;
   const TierIcon = weight.icon;
   const waiting = card.state.state === "pending" || card.state.state === "decided";
+  const [shown, setShown] = useState(false);
+  const unseen = card.tool === "run" && card.attachment !== null && !shown;
   const head =
     card.declassify !== null ? declassifyQuestion(card.declassify.readers) : card.summary;
   // At T4 Rust's `only` already says who decides; its `cannotDecide` for anyone
@@ -466,11 +636,36 @@ function ApprovalCard({
         <Summary text={head} />
       </p>
       {card.declassify !== null && <p className="text-sm">{card.declassify.sentence}</p>}
+      {card.run !== null && <RunPayload run={card.run} />}
+      {card.kvm !== null && <KvmPayload kvm={card.kvm} />}
       {card.payload !== null && <Payload tool={card.tool} text={card.payload} />}
       {card.attachment !== null && (
-        <AttachedAction card={card} accountId={accountId} roomId={roomId} />
+        <AttachedAction
+          card={card}
+          accountId={accountId}
+          roomId={roomId}
+          onShown={() => setShown(true)}
+        />
       )}
       <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-2 gap-y-0.5 text-xs">
+        {card.gate !== null && (
+          <>
+            <dt className="text-muted-foreground">Request</dt>
+            <dd className="font-mono">{card.gate.request ?? "unnamed"}</dd>
+            {card.gate.ticket !== null && (
+              <>
+                <dt className="text-muted-foreground">Ticket</dt>
+                <dd className="break-all font-mono">{card.gate.ticket}</dd>
+              </>
+            )}
+            {card.gate.to !== null && (
+              <>
+                <dt className="text-muted-foreground">Goes to</dt>
+                <dd className="font-mono">{card.gate.to}</dd>
+              </>
+            )}
+          </>
+        )}
         <dt className="text-muted-foreground">Asked by</dt>
         <dd>{card.chain.map((p) => p.name).join(" → ")}</dd>
         <dt className="text-muted-foreground">Can decide</dt>
@@ -490,7 +685,13 @@ function ApprovalCard({
       </dl>
       {waiting && card.only !== null && <p className={cn("text-sm", weight.tone)}>{card.only}</p>}
       {waiting && card.canDecide && (
-        <Decide key={card.state.state} card={card} accountId={accountId} roomId={roomId} />
+        <Decide
+          key={card.state.state}
+          card={card}
+          accountId={accountId}
+          roomId={roomId}
+          unseen={unseen}
+        />
       )}
       {waiting && !card.canDecide && (reason !== null || card.verify) && (
         <div className="flex flex-col items-start gap-2">
@@ -513,6 +714,102 @@ function ApprovalCard({
 }
 
 /**
+ * What *Deny all* has done on a gate's hour card, held by the card's request so
+ * a new list from Rust — the first denial's echo, or a new ticket — forgets
+ * none of it: the rows whose denial went, the rows of a run still going, and
+ * why a run stopped part-way.
+ */
+interface DenyAllRun {
+  sent: ReadonlySet<string>;
+  sending: ReadonlySet<string>;
+  refusal: string | null;
+}
+
+const NO_DENIALS: DenyAllRun = { sent: new Set(), sending: new Set(), refusal: null };
+
+/**
+ * Why a *Deny all* stopped after `denied` of `of` denials went: none went is
+ * the card's own refusal; some went says how many, and why the rest did not.
+ */
+function denyAllRefusal(denied: number, of: number, error: unknown): string {
+  if (denied === 0) {
+    return syncErrorMessage(error, APPROVAL_DECIDE_FAILED);
+  }
+  const why = syncErrorMessage(error, "keeper could not send them.");
+  const rest = of - denied;
+  return `${denied} of ${of} denied; the other ${rest} ${rest === 1 ? "was" : "were"} not sent: ${why}`;
+}
+
+/**
+ * *Deny all* on a gate's hour card: a second press says how many it denies,
+ * then one decision per offered row goes, each naming its own record. A row
+ * whose denial went is never offered again.
+ */
+function DenyAll({
+  rows,
+  run,
+  onDeny,
+}: {
+  rows: readonly ApprovalCardVm[];
+  run: DenyAllRun;
+  onDeny: (rows: readonly ApprovalCardVm[]) => void;
+}) {
+  const [confirming, setConfirming] = useState(false);
+  const going = run.sending.size > 0;
+  return (
+    <div className="flex flex-col gap-1.5">
+      {going && (
+        <p role="status" className="text-muted-foreground text-sm">
+          Sending {run.sending.size === 1 ? "1 denial" : `${run.sending.size} denials`}…
+        </p>
+      )}
+      {!going && rows.length === 0 && run.sent.size > 0 && run.refusal === null && (
+        <p role="status" className="text-muted-foreground text-sm">
+          {GATE_DENY_ALL_SENT}
+        </p>
+      )}
+      {!going &&
+        rows.length > 0 &&
+        (confirming ? (
+          <div className="flex flex-wrap items-center gap-2">
+            <Button
+              type="button"
+              size="sm"
+              variant="destructive"
+              onClick={() => {
+                setConfirming(false);
+                onDeny(rows);
+              }}
+            >
+              {rows.length === 1
+                ? "Deny the 1 waiting request"
+                : `Deny ${rows.length} waiting requests`}
+            </Button>
+            <Button type="button" size="sm" variant="ghost" onClick={() => setConfirming(false)}>
+              {APPROVAL_CANCEL}
+            </Button>
+          </div>
+        ) : (
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            className="self-start"
+            onClick={() => setConfirming(true)}
+          >
+            {GATE_DENY_ALL}
+          </Button>
+        ))}
+      {run.refusal !== null && (
+        <p role="status" className="text-destructive text-sm">
+          {run.refusal}
+        </p>
+      )}
+    </div>
+  );
+}
+
+/**
  * One request in the stream: its card, or a coalesced request's rows.
  */
 export function ApprovalRequest({
@@ -524,11 +821,50 @@ export function ApprovalRequest({
   accountId: string;
   roomId: string;
 }) {
-  const multiple = approval.cards.length > 1;
+  const gate = approval.gate;
+  const multiple = approval.cards.length > 1 || gate !== null;
   const weight = TIER_WEIGHT[Math.max(...approval.cards.map((card) => card.tier))] ?? HEAVIEST;
+  const [run, setRun] = useState<DenyAllRun>(NO_DENIALS);
+  // The rows *Deny all* offers: Rust's list, less every row it already sent.
+  // While a run goes it offers nothing.
+  const offered = (gate?.denyAll ?? []).flatMap((id) => {
+    const card = approval.cards.find((c) => c.id === id);
+    return card !== undefined && !run.sent.has(id) ? [card] : [];
+  });
+  const denyAll = async (rows: readonly ApprovalCardVm[]) => {
+    setRun((r) => ({ ...r, sending: new Set(rows.map((row) => row.id)), refusal: null }));
+    let denied = 0;
+    for (const row of rows) {
+      try {
+        await agentApprovalDecide(accountId, roomId, {
+          id: row.id,
+          bindingDigest: row.bindingDigest,
+          decision: "deny",
+          scope: "once",
+          note: null,
+        });
+      } catch (error) {
+        const refusal = denyAllRefusal(denied, rows.length, error);
+        setRun((r) => ({ sent: r.sent, sending: new Set(), refusal }));
+        return;
+      }
+      denied += 1;
+      setRun((r) => ({
+        ...r,
+        sent: new Set(r.sent).add(row.id),
+        sending: new Set([...r.sending].filter((id) => id !== row.id)),
+      }));
+    }
+  };
   return (
     <section
-      aria-label={multiple ? approvalListName(approval.cards.length) : undefined}
+      aria-label={
+        gate !== null
+          ? gateCardName(gate.system, approval.cards.length)
+          : multiple
+            ? approvalListName(approval.cards.length)
+            : undefined
+      }
       className={cn(
         "my-2 max-w-[560px]",
         multiple &&
@@ -536,9 +872,27 @@ export function ApprovalRequest({
         multiple && weight.edge,
       )}
     >
-      <p hidden={!multiple} className="text-muted-foreground text-xs">
-        {approval.cards.length} actions in one request. Each is decided on its own.
-      </p>
+      {gate !== null ? (
+        <div className="flex flex-col gap-0.5">
+          <p className="font-medium">
+            Tickets from <span className="font-mono">{gate.system}</span>,{" "}
+            <time dateTime={new Date(gate.from).toISOString()}>
+              {HOUR_FORMAT.format(gate.from)}
+            </time>
+            –
+            <time dateTime={new Date(gate.until).toISOString()}>
+              {HOUR_FORMAT.format(gate.until)}
+            </time>
+          </p>
+          <p className="text-muted-foreground text-xs">
+            One line per ticket this hour. Each is decided on its own.
+          </p>
+        </div>
+      ) : (
+        <p hidden={!multiple} className="text-muted-foreground text-xs">
+          {approval.cards.length} actions in one request. Each is decided on its own.
+        </p>
+      )}
       <ul role={multiple ? undefined : "presentation"} className="flex flex-col gap-3">
         {approval.cards.map((card) => (
           <li key={card.id} role={multiple ? undefined : "presentation"}>
@@ -546,6 +900,16 @@ export function ApprovalRequest({
           </li>
         ))}
       </ul>
+      {gate !== null && (
+        // A new list of offered rows — the card grew, or the room has a
+        // decision — asks for the confirmation again.
+        <DenyAll
+          key={offered.map((row) => row.id).join(" ")}
+          rows={offered}
+          run={run}
+          onDeny={(rows) => void denyAll(rows)}
+        />
+      )}
     </section>
   );
 }

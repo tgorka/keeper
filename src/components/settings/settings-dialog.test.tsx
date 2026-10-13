@@ -69,6 +69,11 @@ vi.mock("@/lib/ipc/client", () => ({
   dockBadgeModeSet: vi.fn(() => Promise.resolve()),
   notificationPermissionState: vi.fn(() => Promise.resolve("granted")),
   iosOpenAppSettings: vi.fn(() => Promise.resolve()),
+  pushGatewayGet: vi.fn(() => Promise.resolve({ url: null, refusal: null })),
+  unifiedpushStatus: vi.fn(() => Promise.resolve(null)),
+  unifiedpushConfirm: vi.fn(() => Promise.resolve(null)),
+  listenUnifiedpushStatus: vi.fn(() => Promise.resolve(() => {})),
+  pushGatewaySet: vi.fn(() => Promise.resolve({ url: null, refusal: null })),
   launchAtLoginGet: vi.fn(() => Promise.resolve(false)),
   launchAtLoginSet: vi.fn(() => Promise.resolve()),
   menuBarPresenceGet: vi.fn(() => Promise.resolve(false)),
@@ -224,6 +229,10 @@ vi.mock("@/lib/ipc/client", () => ({
   capabilities: vi.fn(),
   // Settings → Agents (Story 90.6) and Grants, mounted only under `botTools`.
   agentsCopies: vi.fn(() => Promise.resolve([])),
+  agentsMcpList: vi.fn(() => Promise.resolve({ servers: [], tiers: [] })),
+  agentsSandboxGet: vi.fn(() =>
+    Promise.resolve({ readExec: [], env: [], status: "", refusal: null }),
+  ),
   agentsSeedOffer: vi.fn(() =>
     Promise.resolve({ folders: [], catalogue: [], bots: [], accounts: [] }),
   ),
@@ -261,6 +270,8 @@ import {
   BADGE_NOT_LIVE_SENTENCE,
   NO_BACKGROUND_SYNC_SENTENCE,
 } from "@/components/settings/no-background-sync-disclosure";
+import { UNIFIEDPUSH_LABEL } from "@/components/settings/phone-push";
+import { PUSH_GATEWAY_LABEL } from "@/components/settings/push-gateway-field";
 import {
   OWN_FINGERPRINT_NONE,
   SettingsDialog,
@@ -293,6 +304,8 @@ import {
   syncGitStatus,
   syncProfiles,
   undoSendWindow,
+  unifiedpushConfirm,
+  unifiedpushStatus,
   voiceAvailability,
   voiceHotkeyClear,
   voiceHotkeyGet,
@@ -1020,6 +1033,8 @@ describe("SettingsDialog", () => {
     // No iOS lifecycle-honesty copy on desktop (Story 14.2).
     expect(screen.queryByText(NO_BACKGROUND_SYNC_SENTENCE)).not.toBeInTheDocument();
     expect(screen.queryByText(BADGE_NOT_LIVE_SENTENCE)).not.toBeInTheDocument();
+    // The push gateway is a phone's setting (98.1): no field on the Mac.
+    expect(screen.queryByLabelText(PUSH_GATEWAY_LABEL)).not.toBeInTheDocument();
   });
 
   it("iOS: hides the Shortcuts section and the whole Background & dock section, and shows the Archive backup line", async () => {
@@ -1050,6 +1065,74 @@ describe("SettingsDialog", () => {
 
     expect(await screen.findByText(NO_BACKGROUND_SYNC_SENTENCE)).toBeInTheDocument();
     expect(screen.getByText(BADGE_NOT_LIVE_SENTENCE)).toBeInTheDocument();
+    // 98.1: the phone takes the push gateway's address here.
+    expect(await screen.findByLabelText(PUSH_GATEWAY_LABEL)).toBeInTheDocument();
+  });
+
+  it("Android: push is Rust's UnifiedPush status and note, with no gateway field and no iPhone sentence (98.4)", async () => {
+    mockPosture.mockResolvedValue(false);
+    capabilitiesStore.getState().applySnapshot(DEFAULT_CAPABILITIES);
+    vi.mocked(unifiedpushStatus).mockResolvedValueOnce({
+      status: "Push reaches this tablet through ntfy.example.org.",
+      note: "What push brings on this tablet.",
+      offers: [],
+    });
+    render(<SettingsDialog open onOpenChange={() => {}} />);
+
+    const push = await screen.findByRole("region", { name: UNIFIEDPUSH_LABEL });
+    expect(push).toHaveTextContent("Push reaches this tablet through ntfy.example.org.");
+    expect(push).toHaveTextContent("What push brings on this tablet.");
+    expect(screen.queryByLabelText(PUSH_GATEWAY_LABEL)).not.toBeInTheDocument();
+    expect(screen.queryByText(NO_BACKGROUND_SYNC_SENTENCE)).not.toBeInTheDocument();
+    // The badge note is about the app icon, on every reduced build.
+    expect(screen.getByText(BADGE_NOT_LIVE_SENTENCE)).toBeInTheDocument();
+  });
+
+  it("Android: a distributor registers only once the person confirms it, by package (98.4, R98UP1-02)", async () => {
+    mockPosture.mockResolvedValue(false);
+    capabilitiesStore.getState().applySnapshot(DEFAULT_CAPABILITIES);
+    const asking = {
+      status: "Which distributor?",
+      note: "What push brings on this tablet.",
+      offers: [
+        { package: "io.heckel.ntfy", confirm: "Use ntfy (io.heckel.ntfy) for push" },
+        { package: "org.example.other", confirm: "Use Other (org.example.other) for push" },
+      ],
+    };
+    vi.mocked(unifiedpushStatus).mockResolvedValueOnce(asking);
+    vi.mocked(unifiedpushConfirm).mockResolvedValueOnce({
+      status: "Waiting for ntfy.",
+      note: asking.note,
+      offers: [],
+    });
+    render(<SettingsDialog open onOpenChange={() => {}} />);
+
+    const push = await screen.findByRole("region", { name: UNIFIEDPUSH_LABEL });
+    expect(unifiedpushConfirm).not.toHaveBeenCalled();
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Use ntfy (io.heckel.ntfy) for push" }),
+    );
+
+    await waitFor(() => expect(push).toHaveTextContent("Waiting for ntfy."));
+    expect(unifiedpushConfirm).toHaveBeenCalledTimes(1);
+    expect(unifiedpushConfirm).toHaveBeenCalledWith("io.heckel.ntfy");
+    expect(screen.queryByRole("button", { name: /for push$/ })).not.toBeInTheDocument();
+  });
+
+  it("Android: push status is read again when keeper comes back to the front (98.4)", async () => {
+    mockPosture.mockResolvedValue(false);
+    capabilitiesStore.getState().applySnapshot(DEFAULT_CAPABILITIES);
+    vi.mocked(unifiedpushStatus)
+      .mockResolvedValueOnce({ status: "Waiting.", note: "Note.", offers: [] })
+      .mockResolvedValueOnce({ status: "Registered.", note: "Note.", offers: [] });
+    render(<SettingsDialog open onOpenChange={() => {}} />);
+
+    const push = await screen.findByRole("region", { name: UNIFIEDPUSH_LABEL });
+    expect(push).toHaveTextContent("Waiting.");
+    act(() => {
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+    await waitFor(() => expect(push).toHaveTextContent("Registered."));
   });
 
   // ── Story 14.3: iOS app-icon badge radio + permission-denied surface ─────────

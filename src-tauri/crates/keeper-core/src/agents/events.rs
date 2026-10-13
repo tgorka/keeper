@@ -25,6 +25,9 @@ pub const CONTROL_ROOM_TYPE: &str = "dev.keeper.agent.control";
 pub const STATUS: &str = "dev.keeper.agent.status";
 /// The key inside a streamed answer's anchor content naming its log line.
 pub const TURN: &str = "dev.keeper.agent.turn";
+/// What a streamed answer's anchor says before its first edit: the agent's
+/// host sends it, and a notification never shows it (98.1 #2).
+pub const PLACEHOLDER: &str = "…";
 /// The drives in scope and the label (people may send it in a proxy's rooms).
 pub const SCOPE: &str = "dev.keeper.agent.scope";
 /// An action that waits for a person: the record's payload (AD-393).
@@ -59,6 +62,11 @@ pub const PRESENCE: &str = "dev.keeper.agent.presence";
 /// The key inside a brief's `m.room.message` content carrying the
 /// delegation (ruling R53): who hands what to whom, under which label.
 pub const DELEGATE: &str = "dev.keeper.agent.delegate";
+/// The key inside a gate room's `m.room.message` content (AD-415, story
+/// 99.1): from the outside system, `{request, deadline_ms?}`; from the gate,
+/// `{v, request, state, ticket?, deadline_ms?, reason?}`
+/// ([`super::gate::GateState`]).
+pub const GATE: &str = "dev.keeper.agent.gate";
 /// The key inside an agent's `m.room.message` content naming the files it
 /// hands over, `[{drive, path}]`: a delegated session's reply carries it.
 pub const ARTIFACTS: &str = "dev.keeper.agent.artifacts";
@@ -251,6 +259,12 @@ pub struct ApprovalRequestContent {
     pub file: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_sha256: Option<String>,
+    /// The screenshot the action was decided on (S-18): `{sha256, mimetype,
+    /// file}`, `file` its `EncryptedFile` — the image reaches a person only
+    /// as this encrypted attachment; the record keeps its hash. Not
+    /// digested: the preconditions are what is checked again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<Value>,
     /// The SHA-256 of the session's log through the checkpoint (digested).
     pub checkpoint_sha256: String,
     /// What must still hold when the approval is used (digested).

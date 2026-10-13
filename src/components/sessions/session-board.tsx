@@ -72,7 +72,7 @@ export const SESSION_BOARD_UNSTABLE_ID = BOARD_UNSTABLE_ID;
  * path where a vault's notes are addressed by id, and the board never has to
  * know which because it never looks inside the key.
  */
-function cardOf(task: SessionTaskVm): BoardCard {
+export function cardOf(task: SessionTaskVm): BoardCard {
   return {
     key: task.relPath,
     title: task.title,
@@ -112,9 +112,11 @@ export function SessionBoard({
       onOpen={onOpen}
       onMove={async (relPath, status, index) => {
         // Rejecting is how the board learns a move was refused: it shows
-        // keeper's own sentence and re-reads nothing.
-        await sessionsTaskMove(rootId, sessionId, relPath, status, index);
+        // keeper's own sentence and re-reads nothing. A move that landed on
+        // a phone but not on the remote says so, and the card stays moved.
+        const moved = await sessionsTaskMove(rootId, sessionId, relPath, status, index);
         onChanged();
+        return moved.unpushed;
       }}
       moveFailed={SESSION_BOARD_MOVE_FAILED}
       onAllow={

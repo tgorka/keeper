@@ -74,8 +74,12 @@
 //!   microphone stays open while keeper speaks (`MACOS.full_duplex`).
 //! - **Barge-in by voice** therefore exists here as on the phone: a
 //!   transcript while the `speaking` flag is up is `SpeechDetected` with
-//!   its words, and the turn tells the stop phrase from a question
-//!   (AD-208). After an utterance the ears shut for [`TAIL_GATE`], and
+//!   its words (a final one `FinalHeard`), and the turn pauses the answer
+//!   and decides what the words were (AD-411): the port pauses and continues
+//!   the synthesiser when told ([`Worker::pause_speaking`],
+//!   [`Worker::continue_speaking`]), keeps the flag up while paused, and
+//!   reports each utterance read to its end through the synthesiser's
+//!   delegate (`voice_synthesizer`). After an utterance the ears shut for [`TAIL_GATE`], and
 //!   what arrives inside the gate is dropped and recorded as
 //!   `echo_dropped` with its words (AD-209) — the ring is the measurement
 //!   of what this Mac hears of itself.
@@ -121,10 +125,11 @@
 //! churns errors. So the **capture** — the engine and its tap — is one
 //! long-lived thing, and the **request** is rolled underneath it: the tap
 //! appends to whichever request is in [`RequestSlot`] right now, and the
-//! worker swaps in a fresh one after [`REQUEST_ROLL_AFTER`] at the next
-//! quiet moment, at [`REQUEST_LONGEST`] regardless, and immediately when a
-//! task reports a final result or an error. The microphone never closes for
-//! a roll.
+//! worker swaps in a fresh one when core's [`request::rolls`] says so —
+//! after [`request::REQUEST_ROLL_AFTER`] at the next quiet moment, at
+//! [`request::REQUEST_LONGEST`] regardless — and immediately when a task
+//! reports a final result or an error. The microphone never closes for a
+//! roll.
 //!
 //! # A capture that dies is rebuilt, not reported
 //!
@@ -189,6 +194,7 @@ use block2::RcBlock;
 use keeper_core::voice::events::VoiceEventKind;
 use keeper_core::voice::level::{self, Meter};
 use keeper_core::voice::locale::{self, DeviceLocales};
+use keeper_core::voice::request::{self, RequestAge};
 use keeper_core::voice::{
     Ask, Consent, ConsentPort, EventSink, Permission, TurnEvent, VoicePlatform, VoicePort,
     VoiceUnavailable, WakePhrase,
@@ -248,19 +254,6 @@ const ELEMENT_MAIN: u32 = 0;
 /// is; the request resamples.
 const TAP_FRAMES: u32 = 1024;
 
-/// After this long on one request, roll to a fresh one at the next quiet
-/// moment. Under Apple's one-minute guidance for a request, with room for
-/// the quiet moment to arrive.
-const REQUEST_ROLL_AFTER: Duration = Duration::from_secs(45);
-
-/// A request is quiet when its last transcript is this old — the pause
-/// between sentences, so a roll does not cut a word in half.
-const REQUEST_ROLL_QUIET: Duration = Duration::from_millis(1500);
-
-/// Roll regardless of quiet after this long: somebody talking without a
-/// pause for a minute is rarer than a request that should not run that long.
-const REQUEST_LONGEST: Duration = Duration::from_secs(58);
-
 /// How often a capture the system took away is tried again while the turn
 /// still wants it.
 const RESUME_RETRY: Duration = Duration::from_secs(5);
@@ -314,6 +307,14 @@ enum Command {
         reply: SyncSender<Result<(), VoiceUnavailable>>,
     },
     StopSpeaking,
+    /// The turn's `PauseSpeaking` (AD-411), answered once the synthesiser
+    /// paused.
+    PauseSpeaking(SyncSender<()>),
+    /// The turn's `ContinueSpeaking`, answered once it resumed.
+    ContinueSpeaking(SyncSender<()>),
+    /// The turn's `FinishRecognition` (AD-411): the request's audio ends, so
+    /// its task delivers the final words.
+    FinishRecognition(u64),
     /// The input device voice processing was refused on for the capture up
     /// now, if any (AD-213).
     HalfDuplex(SyncSender<Option<String>>),
@@ -453,6 +454,18 @@ impl VoicePort for MacVoicePort {
         self.tell(Command::StopSpeaking);
     }
 
+    fn pause_speaking(&self) {
+        let _ = self.ask(Command::PauseSpeaking);
+    }
+
+    fn continue_speaking(&self) {
+        let _ = self.ask(Command::ContinueSpeaking);
+    }
+
+    fn finish_recognition(&self, finish: u64) {
+        self.tell(Command::FinishRecognition(finish));
+    }
+
     fn half_duplex(&self) -> Option<String> {
         self.ask(Command::HalfDuplex).flatten()
     }
@@ -519,6 +532,11 @@ struct Worker {
     capture: Option<Capture>,
     recognition: Option<Recognition>,
     synthesizer: Option<Retained<AVSpeechSynthesizer>>,
+    /// The synthesiser's delegate, held because the property is weak.
+    delegate: Option<Retained<crate::voice_synthesizer::SpeechDelegate>>,
+    /// Whether the turn paused the answer: the flag stays up, and the end
+    /// of the answer is not looked for until it continues.
+    paused: bool,
     /// The serial of the current request; handlers from older serials are
     /// stale and dropped.
     current: Arc<AtomicU64>,
@@ -537,6 +555,9 @@ struct Worker {
     /// The `Silence` owed to the turn for an utterance that ended on its
     /// own, reported once the gate has passed; `None` when none is owed.
     silence_due: Option<Instant>,
+    /// When the current request's audio was ended for its final words;
+    /// `None` while it is still fed. [`request::rolls`] reads it.
+    finishing: Option<Instant>,
     /// When the system took the capture away, for the retry clock; `None`
     /// while capturing or not wanted.
     suspended: Option<Instant>,
@@ -567,11 +588,14 @@ impl Worker {
             capture: None,
             recognition: None,
             synthesizer: None,
+            delegate: None,
+            paused: false,
             current: Arc::new(AtomicU64::new(0)),
             speaking: Arc::new(AtomicBool::new(false)),
             speaking_since: None,
             gate_until: Arc::new(AtomicU64::new(0)),
             silence_due: None,
+            finishing: None,
             suspended: None,
             failed_starts: 0,
             requested: None,
@@ -642,6 +666,15 @@ impl Worker {
                     let _ = reply.send(self.enqueue(&text, &language));
                 }
                 Ok(Command::StopSpeaking) => self.stop_speaking(),
+                Ok(Command::PauseSpeaking(reply)) => {
+                    self.pause_speaking();
+                    let _ = reply.send(());
+                }
+                Ok(Command::ContinueSpeaking(reply)) => {
+                    self.continue_speaking();
+                    let _ = reply.send(());
+                }
+                Ok(Command::FinishRecognition(finish)) => self.finish_recognition(finish),
                 Ok(Command::HalfDuplex(reply)) => {
                     let _ = reply.send(self.capture.as_ref().and_then(|c| c.half_duplex.clone()));
                 }
@@ -812,9 +845,36 @@ impl Worker {
         // Bump the serial first so the cancelled task's error is stale on
         // arrival.
         self.current.fetch_add(1, Ordering::SeqCst);
+        self.finishing = None;
         if let Some(recognition) = self.recognition.take() {
             end_request(&recognition);
         }
+    }
+
+    /// The turn's `FinishRecognition`: the tap stops feeding the request and
+    /// its audio ends, so the task answers with its final transcript, which
+    /// the result handler delivers as `FinalHeard` and which rolls the
+    /// request. Not cancelled — that would drop the words — and rolled
+    /// anyway once [`request::rolls`] says the wait has passed without
+    /// them. The turn hears that `endAudio` ran, and when — the same moment
+    /// the roll's wait runs from — or that there was nothing to end. The
+    /// capture stays up.
+    fn finish_recognition(&mut self, finish: u64) {
+        let (Some(recognition), Some(capture)) = (&self.recognition, &self.capture) else {
+            (self.sink)(TurnEvent::NothingToFinish(finish));
+            return;
+        };
+        capture
+            .slot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        finish_request(recognition);
+        self.finishing = Some(Instant::now());
+        (self.sink)(TurnEvent::AudioEnded {
+            finish,
+            at_ms: crate::voice_log::now_ms(),
+        });
     }
 
     fn end_capture(&mut self) {
@@ -871,12 +931,13 @@ impl Worker {
                 tracing::warn!(%error, "voice: could not roll the request before speaking");
             }
         }
-        let synthesizer = self.synthesizer.get_or_insert_with(new_synthesizer);
+        let synthesizer = self.synthesizer();
         // A new utterance: whatever the last one still owed is moot.
+        self.paused = false;
         self.silence_due = None;
         self.speaking.store(true, Ordering::SeqCst);
         self.speaking_since = Some(Instant::now());
-        speak_text(synthesizer, text, &voice);
+        speak_text(&synthesizer, text, &voice);
         Ok(())
     }
 
@@ -889,7 +950,7 @@ impl Worker {
     /// between two sentences; a stop clears the queue with the utterance.
     fn enqueue(&mut self, text: &str, language: &str) -> Result<(), VoiceUnavailable> {
         let voice = self.voice_for(language)?;
-        let synthesizer = self.synthesizer.get_or_insert_with(new_synthesizer);
+        let synthesizer = self.synthesizer();
         self.silence_due = None;
         if self.speaking_since.is_none() {
             // The queue had drained before this sentence arrived: it is a
@@ -897,7 +958,13 @@ impl Worker {
             self.speaking.store(true, Ordering::SeqCst);
             self.speaking_since = Some(Instant::now());
         }
-        speak_text(synthesizer, text, &voice);
+        speak_text(&synthesizer, text, &voice);
+        if self.paused {
+            // The turn paused the answer and keeps its queue (AD-411): on a
+            // synthesiser that had nothing left to pause, the utterance just
+            // queued would play at once, over the person.
+            crate::voice_synthesizer::pause_speech(&synthesizer);
+        }
         Ok(())
     }
 
@@ -923,11 +990,60 @@ impl Worker {
         Ok(voice)
     }
 
+    /// The synthesiser, made on first use with its delegate, which reports
+    /// every utterance read to its end to the turn as `SentenceSpoken`.
+    fn synthesizer(&mut self) -> Retained<AVSpeechSynthesizer> {
+        if let Some(synthesizer) = &self.synthesizer {
+            return synthesizer.clone();
+        }
+        let synthesizer = new_synthesizer();
+        self.delegate = Some(crate::voice_synthesizer::with_delegate(
+            &synthesizer,
+            Arc::clone(&self.sink),
+        ));
+        self.synthesizer = Some(synthesizer.clone());
+        synthesizer
+    }
+
     fn stop_speaking(&mut self) {
         if let Some(synthesizer) = &self.synthesizer {
             stop_speech(synthesizer);
         }
+        self.paused = false;
         self.speech_over();
+    }
+
+    /// The turn's `PauseSpeaking` (AD-411): the synthesiser pauses
+    /// mid-word with its queue kept, and the `speaking` flag stays up, so
+    /// what the person goes on saying is still `SpeechDetected` on the same
+    /// request. No `Silence` is owed while paused: an answer that ran out
+    /// as the pause landed is reported once it continues.
+    fn pause_speaking(&mut self) {
+        if let Some(synthesizer) = &self.synthesizer {
+            crate::voice_synthesizer::pause_speech(synthesizer);
+        }
+        self.paused = true;
+        self.silence_due = None;
+    }
+
+    /// The turn's `ContinueSpeaking`: a fresh request first, so the next
+    /// utterance over the answer is heard on its own (Q11), then the
+    /// synthesiser goes on. The grace clock starts again, so an answer with
+    /// nothing left to read ends through [`Worker::watch_speech_end`] as
+    /// any other does.
+    fn continue_speaking(&mut self) {
+        if self.capture.is_some() {
+            if let Err(error) = self.roll_request() {
+                tracing::warn!(%error, "voice: could not roll the request before continuing");
+            }
+        }
+        if let Some(synthesizer) = &self.synthesizer {
+            crate::voice_synthesizer::continue_speech(synthesizer);
+        }
+        self.paused = false;
+        self.silence_due = None;
+        self.speaking.store(true, Ordering::SeqCst);
+        self.speaking_since = Some(Instant::now());
     }
 
     /// The utterance is over, one way or another: the ears shut for
@@ -984,23 +1100,21 @@ impl Worker {
         }
     }
 
-    /// Whether the current request has run long enough to be replaced.
+    /// Whether the current request is replaced now: core's
+    /// [`request::rolls`] over its age, its quiet and its finishing.
     fn roll_due(&self) -> bool {
         let Some(recognition) = &self.recognition else {
             return self.capture.is_some();
         };
-        let age = recognition.started.elapsed();
-        if age >= REQUEST_LONGEST {
-            return true;
-        }
-        if age < REQUEST_ROLL_AFTER {
-            return false;
-        }
         let quiet_for = Duration::from_millis(
             self.millis()
                 .saturating_sub(recognition.last_heard.load(Ordering::SeqCst)),
         );
-        quiet_for >= REQUEST_ROLL_QUIET
+        request::rolls(RequestAge {
+            age: recognition.started.elapsed(),
+            quiet_for,
+            finishing_for: self.finishing.map(|since| since.elapsed()),
+        })
     }
 
     /// Rebuild the capture after it died; on refusal, wait for the next
@@ -1068,6 +1182,9 @@ impl Worker {
         let Some(since) = self.speaking_since else {
             return;
         };
+        if self.paused {
+            return;
+        }
         if since.elapsed() < SPEAK_GRACE {
             return;
         }
@@ -1127,7 +1244,9 @@ impl Worker {
                             last_heard.store(now, Ordering::SeqCst);
                         }
                         if speaking.load(Ordering::SeqCst) {
-                            if heard_something && full_duplex {
+                            if heard_something && full_duplex && is_final {
+                                sink(TurnEvent::FinalHeard(text));
+                            } else if heard_something && full_duplex {
                                 sink(TurnEvent::SpeechDetected(text));
                             } else if heard_something {
                                 tracing::info!(%text, "voice: transcript while speaking on a half-duplex capture dropped");
@@ -1469,7 +1588,9 @@ fn start_capture(commands: &Sender<Command>, sink: EventSink) -> Result<Capture,
     // valid for the duration of the tap call, so the slice built over them
     // is read only inside the call and never stored. The meter's mutex is
     // touched by the audio thread alone; the sink is `Send + Sync` by its
-    // type.
+    // type. `sampleRate` is a read-only property of the retained format,
+    // read once here; the end-of-turn ear copies the same slice into a
+    // buffer it already owns and keeps no pointer into it.
     let engine = unsafe { AVAudioEngine::new() };
     let input = unsafe { engine.inputNode() };
     let (engine, input, half_duplex) = match unsafe { input.setVoiceProcessingEnabled_error(true) }
@@ -1496,6 +1617,10 @@ fn start_capture(commands: &Sender<Command>, sink: EventSink) -> Result<Capture,
         }
     };
     let format = unsafe { input.outputFormatForBus(0) };
+    // The tap's rate, for the end-of-turn listener's resampler.
+    let rate = unsafe { format.sampleRate() } as u32;
+    // A new capture: the end-of-turn listener starts afresh on it.
+    crate::voice_turn_models::ear().interrupt();
 
     let slot: Arc<RequestSlot> = Arc::new(Mutex::new(None));
     let fed = Arc::clone(&slot);
@@ -1526,6 +1651,13 @@ fn start_capture(commands: &Sender<Command>, sink: EventSink) -> Result<Capture,
             if let Some(level) = reading {
                 sink(TurnEvent::Level(level));
             }
+            // The end-of-turn models' copy (AD-411): into a pooled buffer,
+            // or dropped — never an allocation or a wait on this thread.
+            crate::voice_turn_models::ear().hear(
+                samples.iter().copied().step_by(stride),
+                rate,
+                crate::voice_log::now_ms(),
+            );
         },
     );
     unsafe {
@@ -1731,6 +1863,17 @@ fn end_request(recognition: &Recognition) {
     // error whose serial is stale by then.
     unsafe { recognition.request.endAudio() };
     unsafe { recognition.task.cancel() };
+}
+
+/// End one request's audio for its final words (AD-411): `endAudio` alone,
+/// so the task finishes what it heard instead of being cancelled.
+#[allow(unsafe_code)]
+fn finish_request(recognition: &Recognition) {
+    // SAFETY: the retained request `start_request` built, still held by the
+    // worker's `Recognition`; `endAudio` is idempotent and only tells the
+    // request no more audio is coming. The tap no longer appends to it: the
+    // worker took it out of the slot first.
+    unsafe { recognition.request.endAudio() };
 }
 
 /// Read one recogniser callback: `Ok(Some((text, is_final)))`, `Ok(None)` for

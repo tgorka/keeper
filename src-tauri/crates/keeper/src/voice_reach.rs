@@ -38,7 +38,7 @@ use crate::ipc::AppState;
 /// probe that could not answer is treated as absence — the frontend's
 /// `undefined` rule: a surface is never shown on a question not answered.
 pub fn present() -> bool {
-    match crate::voice_ipc::voice_availability() {
+    match crate::voice_ipc::availability_now() {
         Ok(availability) => reach_present(availability.as_ref()),
         Err(error) => {
             tracing::warn!(

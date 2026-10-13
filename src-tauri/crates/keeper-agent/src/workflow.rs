@@ -251,6 +251,7 @@ fn parent_line(
         reason: None,
         reply: None,
         window,
+        approval: None,
     })
 }
 

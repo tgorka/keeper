@@ -50,6 +50,27 @@ afterAll(() => {
   rmSync(root, { recursive: true, force: true });
 });
 
+/** The licence text each fixture checkout carries under `licenses/`. */
+const LICENCE = "licenses/onnxruntime-1.28.0/LICENSE";
+
+/** A checkout at `dir` as the guard reads it: tauri.conf.json, dist/, and a licence. */
+function checkout(dir: string): string {
+  mkdirSync(join(dir, "src-tauri/crates/keeper"), { recursive: true });
+  cpSync(TAURI_CONF, join(dir, "src-tauri/crates/keeper/tauri.conf.json"));
+  mkdirSync(join(dir, "dist"));
+  writeFileSync(join(dir, "dist/index.html"), INDEX_HTML);
+  mkdirSync(join(dir, "licenses/onnxruntime-1.28.0"), { recursive: true });
+  writeFileSync(join(dir, LICENCE), "MIT License");
+  return dir;
+}
+
+/** The third-party notices a bundle carries, in its resources directory. */
+function notices(resources: string): void {
+  writeFileSync(join(resources, "NOTICE"), "keeper");
+  mkdirSync(join(resources, "licenses/onnxruntime-1.28.0"), { recursive: true });
+  writeFileSync(join(resources, LICENCE), "MIT License");
+}
+
 /** A fresh `<dir>/keeper.app` per fixture, so no case sees another's files. */
 function app(): string {
   const dir = join(root, `case-${n++}`, "keeper.app");
@@ -72,6 +93,7 @@ function goodIos(): string {
   // A correct build carries the dev URL too: tauri-codegen compiles the whole
   // config into the binary. The guard must not refuse it for that.
   writeFileSync(join(dir, "keeper"), binary(ENTRY, DEV_URL));
+  notices(dir);
   return dir;
 }
 
@@ -86,11 +108,7 @@ function run(path: string, env: Record<string, string> = {}) {
 describe("check-bundle.sh on an iOS .app", () => {
   let iosRoot: string;
   beforeAll(() => {
-    iosRoot = join(root, "ios-root");
-    mkdirSync(join(iosRoot, "src-tauri/crates/keeper"), { recursive: true });
-    cpSync(TAURI_CONF, join(iosRoot, "src-tauri/crates/keeper/tauri.conf.json"));
-    mkdirSync(join(iosRoot, "dist"));
-    writeFileSync(join(iosRoot, "dist/index.html"), INDEX_HTML);
+    iosRoot = checkout(join(root, "ios-root"));
   });
 
   it("passes a bundle whose executable embeds the chunk, with assets/ empty as a real one is", () => {
@@ -105,8 +123,17 @@ describe("check-bundle.sh on an iOS .app", () => {
   it("passes a bundle with no assets/ directory at all: it is not evidence either way", () => {
     const dir = app();
     writeFileSync(join(dir, "keeper"), binary(ENTRY, DEV_URL));
+    notices(dir);
     const r = run(dir, { KEEPER_REPO_ROOT: iosRoot });
     expect(r.status).toBe(0);
+  });
+
+  it("refuses a bundle without a licence text the checkout carries, naming it", () => {
+    const dir = goodIos();
+    rmSync(join(dir, LICENCE));
+    const r = run(dir, { KEEPER_REPO_ROOT: iosRoot });
+    expect(r.status).toBe(1);
+    expect(r.err).toContain(`lacks the third-party notices the app must carry: ${LICENCE}.`);
   });
 
   it("refuses a binary that carries the dev-server URL and no frontend, naming the URL", () => {
@@ -154,11 +181,7 @@ describe("check-bundle.sh on a macOS .app", () => {
   // build produced, under KEEPER_REPO_ROOT.
   let macRoot: string;
   beforeAll(() => {
-    macRoot = join(root, "mac-root");
-    mkdirSync(join(macRoot, "src-tauri/crates/keeper"), { recursive: true });
-    cpSync(TAURI_CONF, join(macRoot, "src-tauri/crates/keeper/tauri.conf.json"));
-    mkdirSync(join(macRoot, "dist"));
-    writeFileSync(join(macRoot, "dist/index.html"), INDEX_HTML);
+    macRoot = checkout(join(root, "mac-root"));
   });
 
   function macApp(bin: Buffer): string {
@@ -167,6 +190,7 @@ describe("check-bundle.sh on a macOS .app", () => {
     mkdirSync(join(dir, "Contents/Resources"));
     writeFileSync(join(dir, "Contents/Resources/icon.icns"), "");
     writeFileSync(join(dir, "Contents/MacOS/keeper"), bin);
+    notices(join(dir, "Contents/Resources"));
     return dir;
   }
 
@@ -174,6 +198,14 @@ describe("check-bundle.sh on a macOS .app", () => {
     const r = run(macApp(binary(ENTRY, DEV_URL)), { KEEPER_REPO_ROOT: macRoot });
     expect(r.err).toBe("");
     expect(r.status).toBe(0);
+  });
+
+  it("refuses a bundle whose Contents/Resources lacks NOTICE", () => {
+    const dir = macApp(binary(ENTRY, DEV_URL));
+    rmSync(join(dir, "Contents/Resources/NOTICE"));
+    const r = run(dir, { KEEPER_REPO_ROOT: macRoot });
+    expect(r.status).toBe(1);
+    expect(r.err).toContain("lacks the third-party notices the app must carry: NOTICE.");
   });
 
   it("refuses a --debug executable and points at tauri:build:signed", () => {
@@ -222,11 +254,7 @@ describe("check-bundle.sh on a macOS .app", () => {
 describe.skipIf(!python3)("check-bundle.sh on an .ipa", () => {
   let ipaRoot: string;
   beforeAll(() => {
-    ipaRoot = join(root, "ipa-root");
-    mkdirSync(join(ipaRoot, "src-tauri/crates/keeper"), { recursive: true });
-    cpSync(TAURI_CONF, join(ipaRoot, "src-tauri/crates/keeper/tauri.conf.json"));
-    mkdirSync(join(ipaRoot, "dist"));
-    writeFileSync(join(ipaRoot, "dist/index.html"), INDEX_HTML);
+    ipaRoot = checkout(join(root, "ipa-root"));
   });
 
   function ipa(appDir: string): string {

@@ -162,6 +162,7 @@ impl ServedSession {
     ) -> Result<DecidedBy, String> {
         let sender = &arrived.sender;
         let known = self.delegations.as_ref().map(|rooms| rooms.known());
+        let gate = self.context.agent.kind == keeper_core::agents::session::SessionKind::Gate;
         let seat = Seat {
             sender_is_agent: *sender == deps.home.config.matrix_user
                 || known.as_ref().is_some_and(|known| {
@@ -170,10 +171,27 @@ impl ServedSession {
                         .iter()
                         .any(|agent| agent.matrix_user == *sender)
                 }),
-            sender_in_label: reads(&self.context.label.readers, sender),
+            // A gate's ticket is judged against the label it was asked
+            // under — the record's, the gate's opening one — never the
+            // label a callback's reply narrowed between turns (R371).
+            sender_in_label: if gate {
+                reads(&record.label.readers, sender)
+            } else {
+                reads(&self.context.label.readers, sender)
+            },
             // The consolidator's record: the approvers its digest binds,
             // checked again now; never its label, which is the data's.
-            sender_in_approvers: if keeper_core::agents::consolidate::is_host_action(record) {
+            // A gate's ticket: the people who decide its tickets (codemap
+            // Q2), never its label's readers — its audience may be anyone.
+            // A gate's held result: the readers of what it read, whose
+            // head — the drive's owner — alone decides at T4 (99.2 #3).
+            sender_in_approvers: if gate
+                && record.action.tool == keeper_core::agents::tier::AgentTool::Declassify.as_wire()
+            {
+                reads(&record.label.readers, sender)
+            } else if gate {
+                self.gate_approvers(deps).contains(sender)
+            } else if keeper_core::agents::consolidate::is_host_action(record) {
                 crate::approvals::read_stored_record(
                     &deps.sessions_zone.join(&self.context.session.path),
                     &record.id,

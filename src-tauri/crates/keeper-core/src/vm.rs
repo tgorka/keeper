@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
 use crate::agents::approval_card::ApprovalVm;
+use crate::agents::gate_room::GateLineVm;
+use crate::agents::heard::HeardMarkVm;
 use crate::agents::room::{AgentRoomHeaderVm, AgentRoomKindVm, BriefVm};
 use crate::bots::{BotHealthState, ProviderKind};
 use crate::notes::export::NoteExportPlan;
@@ -266,6 +268,45 @@ pub struct CapabilitiesVm {
     /// at runtime in the shell like `recording`. Says nothing about the
     /// models; `transcription_status` does.
     pub transcription: bool,
+}
+
+/// What this build tells the webview about itself beyond what it offers
+/// (Epic 98, story 98.3 #3, #4, #5; codemap Q12 (b), Q13): written into the
+/// webview by the shell's initialization script before the bundle runs
+/// (`window.__KEEPER_PLATFORM__`, `ipc::platform_plugin`), so the front's first
+/// frame already holds it; beside [`CapabilitiesVm`], which stays a flat set of
+/// surface flags.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct PlatformVm {
+    /// The spelling every `keeper-file`/`keeper-note`/`keeper-recording` URL the
+    /// front composes takes on this build (`asset_url::UrlForm::HOST`).
+    pub url_form: crate::asset_url::UrlForm,
+    /// This device is a tablet by Android's own smallest-width rule (600 dp,
+    /// read by `MainActivity`): the tablet tier's layout and dock (UX-DR146).
+    /// A device fact, never the viewport's, so the on-screen keyboard
+    /// shrinking the viewport leaves it a tablet. `false` on a desktop, a
+    /// phone and every iOS build.
+    pub tablet: bool,
+    /// The reduced build's "On this …" disclosure; `None` on a desktop.
+    pub disclosure: Option<PlatformDisclosureVm>,
+}
+
+/// A phone's or tablet's list of what it does differently
+/// (`disclosure::disclosure`), with the doc that says it at length.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct PlatformDisclosureVm {
+    /// "On this iPhone", "On this tablet", "On this phone".
+    pub heading: String,
+    /// The honesty lines, in order; mirrored into the doc's Limitations list.
+    pub lines: Vec<String>,
+    /// The doc the disclosure links to.
+    pub docs_url: String,
+    /// The link's text.
+    pub docs_label: String,
 }
 
 /// Stable, string-serialized error taxonomy for the IPC envelope.
@@ -1304,6 +1345,12 @@ pub enum TimelineItemVm {
         /// body is the brief. Boxed as `media` is; the binding stays
         /// `BriefVm | null`.
         brief: Option<Box<BriefVm>>,
+        /// In a gate room (UX-DR147), the outside system's request — once
+        /// the gate has spoken of it, its chip the gate's newest word on it
+        /// — or the gate's own word on one, by Rust's reading of the room
+        /// (`gate_room::GateView`); else `null`. Boxed as `brief` is; the
+        /// binding stays `GateLineVm | null`.
+        gate: Option<Box<GateLineVm>>,
     },
     /// An event that could not be decrypted yet (`MsgLikeKind::UnableToDecrypt`).
     /// Renders an explicit honest stub instead of a blank row (Story 3.1). Carries
@@ -1454,6 +1501,15 @@ pub struct TimelineBatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub approvals: Option<Vec<ApprovalVm>>,
+    /// An agent session room's marks of where the person stopped listening
+    /// to a spoken answer (97.3, UX-DR143), one per marked answer that is
+    /// loaded and was not heard to its end: sent on the first batch when
+    /// there are any and on every batch after they changed — a mark, or
+    /// the answer's body or its loading. Absent where nothing changed; the
+    /// last list stands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub heard: Option<Vec<HeardMarkVm>>,
 }
 
 /// One member currently typing in the open room (Story 3.9, typing, AD-14,
@@ -1625,6 +1681,16 @@ pub enum EgressKind {
     /// a device-flow connection exists, and the organisation's GitHub broker
     /// plus GitHub's API while the descriptor names one.
     Forge,
+    /// An MCP server this Mac's agents use (96.2 #10): a `url` server's host
+    /// and port, never its path or token; a `command` server as the program
+    /// keeper starts, which reaches what it reaches with this Mac's rights.
+    /// Present only while Settings › Agents names one.
+    McpServer,
+    /// The host of the push gateway the person named in `push.gateway_url`
+    /// (98.1 #8, Q6). keeper never contacts it: the homeserver does, with
+    /// event ids for this device. Present only on a phone, and only while
+    /// the setting holds an address keeper registers.
+    PushGateway,
 }
 
 /// One network destination keeper contacts, derived from live app state (Story
@@ -7493,6 +7559,27 @@ pub enum VoiceUnavailableVm {
         /// The sentence.
         message: String,
     },
+    /// This system is older than the first version keeper listens on
+    /// (Android 13: the on-device recogniser fed keeper's own capture).
+    SystemTooOld {
+        /// The first version that can, as a person names it.
+        needs: String,
+        /// The sentence.
+        message: String,
+    },
+    /// The device has not been read yet (Android, a moment after launch).
+    /// Not an answer: `voice_availability` reports it as a retriable error,
+    /// so a surface never draws or erases itself on it (AD-179).
+    NotReadYet {
+        /// The sentence.
+        message: String,
+    },
+    /// keeper is behind another app, where Android gives it only silence:
+    /// nothing is heard or read aloud until it is back in front.
+    LeftTheFront {
+        /// The sentence.
+        message: String,
+    },
     /// This build has no voice port (every platform but iOS today).
     Unsupported {
         /// The sentence.
@@ -7537,6 +7624,13 @@ pub struct VoiceWakeVm {
     /// conversations ([`VoiceAgentTargetVm::target`]); `None` means "the
     /// pinned bot most recently talked to".
     pub voice_target: Option<String>,
+    /// The turn models' line under the voice switch (UX-DR142, D-36):
+    /// `keeper_core::voice::turn_models::turn_models_state` as transcription's
+    /// model-state shape. Absent where this device's voice runs no turn
+    /// models.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub turn_models: Option<crate::transcription::vm::ModelsStateVm>,
 }
 
 /// How fast a pinned bot starts answering (Epic 68, Story 68.4, AD-216),
@@ -9041,6 +9135,7 @@ mod tests {
             media: None,
             readers: Vec::new(),
             brief: None,
+            gate: None,
         };
         let json = serde_json::to_string(&vm).expect("serialize message vm");
         assert!(
@@ -9066,6 +9161,7 @@ mod tests {
             media: None,
             readers: Vec::new(),
             brief: None,
+            gate: None,
         }
     }
 
@@ -9142,6 +9238,7 @@ mod tests {
             media: None,
             readers: Vec::new(),
             brief: None,
+            gate: None,
         };
         let json = serde_json::to_string(&vm).expect("serialize message vm");
         assert!(json.contains("\"isEdited\":true"), "json was: {json}");
@@ -9202,6 +9299,7 @@ mod tests {
             media: None,
             readers: Vec::new(),
             brief: None,
+            gate: None,
         };
         let json = serde_json::to_string(&vm).expect("serialize");
         assert!(
@@ -9285,6 +9383,7 @@ mod tests {
             ],
             header: None,
             approvals: None,
+            heard: None,
         };
         let json = serde_json::to_string(&batch).expect("serialize batch");
         assert!(json.contains("\"ops\":"), "json was: {json}");
@@ -9409,6 +9508,7 @@ mod tests {
             })),
             readers: Vec::new(),
             brief: None,
+            gate: None,
         };
         let json = serde_json::to_string(&vm).expect("serialize message vm");
         assert!(json.contains("\"media\":{"), "json was: {json}");
@@ -9454,6 +9554,7 @@ mod tests {
                 "@carol:example.org".to_owned(),
             ],
             brief: None,
+            gate: None,
         };
         let json = serde_json::to_string(&vm).expect("serialize message vm");
         assert!(

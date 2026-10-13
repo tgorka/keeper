@@ -2,6 +2,9 @@
 import type { ApprovalPersonVm } from "./ApprovalPersonVm";
 import type { ApprovalStateVm } from "./ApprovalStateVm";
 import type { DeclassifyVm } from "./DeclassifyVm";
+import type { GateRowVm } from "./GateRowVm";
+import type { KvmCardVm } from "./KvmCardVm";
+import type { RunCardVm } from "./RunCardVm";
 import type { ScopeOfferVm } from "./ScopeOfferVm";
 
 /**
@@ -29,7 +32,8 @@ summary: string,
  */
 tool: string, 
 /**
- * The exact arguments, pretty-printed JSON; `None` when attached.
+ * The exact arguments, pretty-printed JSON; `None` when attached, and
+ * for a `run` or a `kvm_act`, which `run` and `kvm` draw whole.
  */
 payload: string | null, 
 /**
@@ -69,4 +73,22 @@ verify: boolean,
 /**
  * At T4: who alone decides, and that it cannot be undone.
  */
-only: string | null, declassify: DeclassifyVm | null, };
+only: string | null, declassify: DeclassifyVm | null, 
+/**
+ * A `run`'s execution as keeper bound it (UX-DR139); `None` for any
+ * other tool, or when the action is attached — [`attached_payload`]
+ * then draws the same view once its file is checked (R231).
+ */
+run: RunCardVm | null, 
+/**
+ * A `kvm_act`'s inputs as keeper reads them (R323); `None` for any
+ * other tool, or when the action is attached — [`attached_payload`]
+ * then draws it.
+ */
+kvm: KvmCardVm | null, 
+/**
+ * A row of a gate's hour card (UX-DR160): the request it serves, its
+ * ticket and the agent the work would go to; `None` outside a gate
+ * room.
+ */
+gate: GateRowVm | null, };

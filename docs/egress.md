@@ -29,6 +29,9 @@ and it is enforced in two ways:
 | **The GitHub broker's host** (e.g. `broker.acme.dev`) | Only while the account's descriptor names `[github_broker]`; absent without an account | `GET /v1/whoami` and `POST /v1/token`, each carrying the account's sign-in access token, to get one-hour GitHub tokens for listing and for GitHub drives. See `docs/account.md` § *GitHub through your organization's broker*. Only the **host** is shown, labelled *GitHub access broker*. See `egress::forge_egress`. |
 | **`github.com/tgorka/keeper/releases/...`** (the signed-update `latest.json` endpoint) | On a cadence while the app runs (about every 6 hours, starting 2 minutes after launch) while **Update automatically** is on, and on every "Check for updates" click. Off — the switch in Settings → About, or `update.auto = false` in a config file — leaves the click as the only time it is contacted | Signed auto-updates (NFR-12). Downloads are cryptographically verified against keeper's minisign public key before installing. |
 | **`*.githubusercontent.com`** (GitHub's release-asset CDN) | While an update is downloading: either one the user chose to install, or one the background updater found while **Update automatically** is on | GitHub serves release files (the update binary) from its content-delivery network, which the `github.com` release URL redirects to. Disclosed so the egress list is exhaustive, not just the check endpoint. |
+| Each **MCP server this Mac's agents use** (e.g. `notes.example.org`, `127.0.0.1:8931`) | Only while Settings › Agents › *MCP servers* names one, which is how keeper does not ship; one entry per distinct host and port. A server keeper starts as a program is listed as *A program you configured: `<program>`*, once per program — never folded into a host of the same name | `initialize`, `tools/list` at each renewal of the Mac's host manifest (60 s) while it hosts agents, and each call an agent that lists the server makes — tiered, audited and checked against the server's `readers` first (docs/agents.md § *MCP servers*). Only the **host** is shown, never the path or the bearer token, which is sent to that host alone. A program reaches whatever it reaches with your rights; keeper cannot see where. See `egress::agent_egress`. |
+| **The push gateway you run** (e.g. `push.example.org`, `push.example.org:8443`) | Only on a phone, only while Settings › Notifications › *Push gateway* (`push.gateway_url`) holds an address keeper registers — `https://`, no user name or password, the push path — which is how keeper does not ship; one entry, the host and the port when the address names one, labelled *Push gateway — your homeserver sends it event ids for this device* | keeper itself never contacts it. It registers the address with each signed-in homeserver as this phone's `event_id_only` pusher (iPhone, Epic 98 story 98.1, `docs/ios.md` § *Push*), and the **homeserver** sends it, for this device, the event id of every message of that account that would notify, which it relays to Apple's push service; the notification's words are decrypted on the phone, which shows only agents' approval requests and your own agent's answers and discards the rest. Only the host is shown, never the path. See `egress::push_egress`. |
+| **Your UnifiedPush server** (e.g. `ntfy.example.org`) — Android | Only on Android, only after you confirmed a UnifiedPush distributor in Settings › Notifications and it gave keeper an endpoint (kept as `unifiedpush-endpoint` in the data directory); one entry, the endpoint's host and its port when it names one, labelled with the distributor by name and package — *UnifiedPush server of ntfy (io.heckel.ntfy) — keeper asks it, once per address, whether it is a Matrix push gateway; your homeserver sends it event ids for this device* | Unlike the iPhone's gateway, **keeper itself contacts it**, once per endpoint: `GET https://<host>/_matrix/push/v1/notify`, no redirects followed, 10 s, answer read up to 16 KiB — asking whether it is a Matrix push gateway (`agents::unifiedpush::discover_gateway`, story 98.4). When it answers so, keeper registers that same address with each signed-in homeserver holding agent rooms as this device's `event_id_only` pusher, and the **homeserver** sends it the event id of every message of that account that would notify, which it forwards to the distributor on this device; keeper reads the event itself and shows only agents' approval requests and your own agent's answers. The endpoint's path and query are a secret (anyone holding them can post to this device) and are never shown. See `egress::unifiedpush_egress`, `docs/android.md` § *Push*. |
 | **`us.i.posthog.com`** | Only when configured and a relevant local observability category is enabled, or an explicitly started synthetic study is active; all default off | Closed diagnostic/product observations, OTLP diagnostic records/traces, separately consented public remote configuration, or content-isolated synthetic study replay/heatmaps. No raw app log export. See the consent boundary below. |
 
 ### The folder-sync daemon
@@ -62,6 +65,10 @@ keeps those crates out of its build.
 | **`[homeserver].url`'s host** | While `run` serves, and on `init` and `login` | The agents' Matrix traffic: each copy's sign-in, `/sync`, the rooms it joins, the anchors and edits of its answers, its status anchor. One homeserver per host; agentd listens on nothing. |
 | **Each `[[providers]] base_url`'s host** | Each turn of an agent whose `[model].bot` names that provider, and the model probe while arming it | Chat completions for the agent's own model, the one the person chose for it. Only providers the file names are reached; a session whose label is `local_only` reaches none but a local (`ollama`) one. |
 | **Each `[[drives]] remote`'s host**, and the LFS destinations the daemon rows above describe | Each drive's checkout and every sync while `run` serves | Fetch and push of the drives, through agentd's own engine: the sessions' logs and artifacts reach the drive this way. |
+| **A host an approved `run` with network names** (docs/agents.md § *Running a command*) | Only after a person approves that one run | Whatever its program reaches — keeper cannot list it ahead, so each such run is approved on its own (T3), and that approval is the person configuring that destination (NFR-121). The run sees only its session's `workspace/`, exactly as its card listed it; no drive, no `.keeper/`, no credential of the host's. The same holds on the Mac. |
+| **Each `[[mcp]] url`'s host** (docs/agents.md § *MCP servers*) | Connecting (`initialize`, `notifications/initialized`) at start and again whenever the connection was lost; `tools/list` beside every manifest renewal (60 s), whenever the server says its tools changed, and before an approval of one of its tools is used; each call an agent that lists the server makes, and a `notifications/cancelled` when that call is stopped or times out | The MCP servers the file names: only those, never one a drive or a session names. Each call is tiered, audited and checked against the server's `readers` before it is sent; a `credential` is sent to that host alone, and redirects are not followed. |
+| **Each `[[kvm]] url`'s host** (docs/agents.md § *Another machine through a KVM*) | Each `kvm_snapshot`, and each `kvm_act` a person approved together with the fresh frame read before it is used | A classic NanoKVM keeper speaks itself: its login, one MJPEG frame, the WebSocket inputs and the paste and power requests, all over TLS pinned by the entry's `fingerprint`. Each input is checked against the entry's `readers` before anything is sent; a NanoKVM-Go is reached as its `[[mcp]] url` row above. |
+| **Whatever a `[[mcp]] command` program reaches** | While `run` serves | A program you configured, started as agentd's child with agentd's rights: keeper cannot see where it connects, so its tools are never below T2. |
 
 No other destination: no update check, and no telemetry destination at all.
 
@@ -325,6 +332,14 @@ build if a recognition request is ever built without the on-device flag, if the 
 to `false`, or if a network API appears in any voice module (NFR-50). The decision is recorded
 as `docs/decisions.md` D-5.
 
+The turn models (Epic 97, D-36) do not change that conclusion. The voice activity and end-of-turn
+models are files from the account's config repository, fetched with the transcription models'
+client from that repository's own LFS endpoint (*Transcription adds no egress*) — the phone now
+makes that fetch too, for the turn models only, to the same host — and run on the device by
+ONNX Runtime, loaded by path; nothing they are given leaves the device. ONNX Runtime's library
+is downloaded from `cdn.pyke.io` by the build, never by the app
+(`docs/constraints-and-limitations.md`).
+
 ### On this Mac
 
 The macOS port (`crates/keeper/src/voice_macos.rs`, Epic 63, Story 63.4) adds no destination
@@ -342,6 +357,17 @@ and fails when the two lists differ. Edit both together or neither.
 - The microphone is open only while voice is on — after you press Talk, the hotkey or the tray item, or while it listens for your wake phrase — and the system microphone indicator shows it.
 - Nothing is recorded or uploaded; what you said reaches only the model endpoint you configured, as text.
 - keeper does not lower other audio while it listens or speaks, because macOS has no audio session that could; it stops listening while it talks instead.
+
+The Android port (`crates/keeper/src/voice_android.rs` over `gen/android/…/VoicePlugin.kt`,
+Epic 98, story 98.4) adds no destination either. Every recogniser it makes is
+`SpeechRecognizer.createOnDeviceSpeechRecognizer`, after `isOnDeviceRecognitionAvailable`, fed
+keeper's own capture through a pipe; the factory for a recogniser that may use a server never
+appears in the app, and `voice_on_device` reads every Kotlin file of the app to keep it so. An
+answer is read only by a text-to-speech voice that is installed and needs no network
+(`Voice.isNetworkConnectionRequired`); a language with none is refused, as on the Apple
+platforms. Android's language identifier is the system's text classifier, which may be a
+vendor service, so the Android port detects no language and reads the answer in the
+listening language.
 
 ### A spoken answer's language is decided on the device
 
@@ -389,8 +415,9 @@ read back by the `voice_events` command in `src-tauri/crates/keeper/src/voice_lo
 shown under Settings → Bots on the phone with the sentence "Kept in memory only — nothing is
 written or sent", `src/components/settings/bots-section.tsx:188-189`), and the Live Activity
 is started, updated and ended from the app process with `pushType: nil`
-(`src-tauri/crates/keeper/gen/apple/Sources/keeper/KeeperIsland.swift:76`) — no APNs, no push
-entitlement, no App Group, no token — so nothing about what the phone heard leaves the device
+(`src-tauri/crates/keeper/gen/apple/Sources/keeper/KeeperIsland.swift:76`) — no APNs push
+for the activity and no push token for it; the app's push entitlement and App Group (Epic 98)
+are for push — agents' approval requests and your own agent's answers, through the gateway row above (`docs/ios.md` § *Push*) — never the island — so nothing about what the phone heard leaves the device
 (Apple, `Activity.request(attributes:content:pushType:)`,
 `https://developer.apple.com/documentation/activitykit/activity`, and *Displaying live data
 with Live Activities*, both read 2026-09-05; Epic 65, AD-194, AD-196). The `voice_on_device`

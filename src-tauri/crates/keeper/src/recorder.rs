@@ -22,7 +22,6 @@
 #[cfg(desktop)]
 use std::sync::Arc;
 
-#[cfg(any(desktop, target_os = "ios"))]
 use keeper_core::error::CoreError;
 #[cfg(desktop)]
 use keeper_core::platform::Platform;
@@ -35,7 +34,6 @@ use keeper_core::recording::{
     response_protocol_version, start_recording_request, stop_recording_request,
     verify_protocol_version, RecordingEvent, SessionParams,
 };
-#[cfg(any(desktop, target_os = "ios"))]
 use keeper_core::vm::{RecordingCapabilitiesVm, RecordingSourcesVm, TccPermission};
 
 /// The logical sidecar name for the first-party Swift capture sidecar (Story 16.1).
@@ -580,15 +578,25 @@ impl keeper_core::recording::Recorder for DesktopRecorder {
     }
 }
 
-/// The iOS [`Recorder`](keeper_core::recording::Recorder) impl (Story 16.2, AD-27).
-/// Recording is desktop-macOS-only — iOS never records, so this is honest about its
+/// The phone and tablet [`Recorder`](keeper_core::recording::Recorder) impl (Story
+/// 16.2, AD-27; Android since Epic 98, story 98.3). Recording is desktop-macOS-only —
+/// an iPhone or an Android device never records, so this is honest about its
 /// absence: `is_available` is `false` and `run_session` returns
 /// [`CoreError::Unsupported`], never a spawn, never a panic.
-#[cfg(target_os = "ios")]
-pub struct IosRecorder;
+#[cfg(mobile)]
+pub struct MobileRecorder;
 
-#[cfg(target_os = "ios")]
-impl keeper_core::recording::Recorder for IosRecorder {
+#[cfg(mobile)]
+impl MobileRecorder {
+    /// The one refusal every phone and tablet gives for recording — this
+    /// recorder's and `ipc::device_ulid`'s mobile twin's alike.
+    pub(crate) fn refused() -> CoreError {
+        CoreError::Unsupported("recording is not available on a phone or tablet".to_owned())
+    }
+}
+
+#[cfg(mobile)]
+impl keeper_core::recording::Recorder for MobileRecorder {
     fn is_available(&self) -> bool {
         false
     }
@@ -599,39 +607,27 @@ impl keeper_core::recording::Recorder for IosRecorder {
         _stop: impl std::future::Future<Output = ()> + Send + 'static,
         _on_event: Box<dyn FnMut(keeper_core::recording::RecordingEvent) + Send>,
     ) -> Result<(), CoreError> {
-        Err(CoreError::Unsupported(
-            "recording is not available on iOS".to_owned(),
-        ))
+        Err(Self::refused())
     }
 
     async fn get_capabilities(&self) -> Result<RecordingCapabilitiesVm, CoreError> {
-        Err(CoreError::Unsupported(
-            "recording is not available on iOS".to_owned(),
-        ))
+        Err(Self::refused())
     }
 
     async fn list_sources(&self) -> Result<RecordingSourcesVm, CoreError> {
-        Err(CoreError::Unsupported(
-            "recording is not available on iOS".to_owned(),
-        ))
+        Err(Self::refused())
     }
 
     async fn request_screen_recording(&self) -> Result<bool, CoreError> {
-        Err(CoreError::Unsupported(
-            "recording is not available on iOS".to_owned(),
-        ))
+        Err(Self::refused())
     }
 
     async fn request_microphone(&self) -> Result<TccPermission, CoreError> {
-        Err(CoreError::Unsupported(
-            "recording is not available on iOS".to_owned(),
-        ))
+        Err(Self::refused())
     }
 
     async fn request_camera(&self) -> Result<TccPermission, CoreError> {
-        Err(CoreError::Unsupported(
-            "recording is not available on iOS".to_owned(),
-        ))
+        Err(Self::refused())
     }
 }
 

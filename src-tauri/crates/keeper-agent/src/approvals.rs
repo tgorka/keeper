@@ -47,6 +47,7 @@ use keeper_core::agents::events::{
 use keeper_core::agents::label::{check_sink, Readers, Sink, SinkVerdict};
 use keeper_core::agents::log::{ApprovalBody, ApprovalState, LineBody, PeerBody};
 use keeper_core::agents::matrix::AgentMatrixError;
+use keeper_core::agents::session::SessionKind;
 use keeper_core::agents::tier::{AgentTool, Classification, APPROVALS_DIR};
 use keeper_core::agents::trust::{Anchor, Published};
 use keeper_core::bots::audit::{self, AuditIntent, AuditOutcome};
@@ -61,6 +62,8 @@ use tokio::time::Instant;
 use ulid::Ulid;
 
 use crate::agent::{AgentDeps, Arrived, Outcome, ServeError, ServedSession};
+
+mod tickets;
 use crate::matrix_sink::EditPort;
 use crate::turn::now_ms;
 
@@ -235,6 +238,47 @@ pub async fn consume_once(
     }
 }
 
+/// The request a person's card is drawn from for `record`, as written —
+/// its large payload already moved out ([`ApprovalRecord::externalise_args`])
+/// and uploaded as `file` (its `EncryptedFile` JSON) — in the session room
+/// `room`, decided by `approvers` (empty: anyone reading). Every field its
+/// digest is over is the record's own.
+pub(crate) fn request_content(
+    record: &ApprovalRecord,
+    room: &str,
+    approvers: Vec<String>,
+    file: Option<Value>,
+) -> ApprovalRequestContent {
+    ApprovalRequestContent {
+        v: CONTENT_VERSION,
+        id: record.id.clone(),
+        session: record.session.clone(),
+        room: room.to_owned(),
+        agent: record.agent.clone(),
+        tier: record.risk.tier,
+        summary: record.action.summary.clone(),
+        action: RequestAction {
+            tool: record.action.tool.clone(),
+            args: record.action.args.clone(),
+            exec_binding: record.action.exec_binding.clone(),
+        },
+        file_sha256: file.as_ref().and(record.action.args_blob.clone()),
+        preview: None,
+        file,
+        checkpoint_sha256: record.checkpoint.sha256.clone(),
+        preconditions: record.preconditions.clone(),
+        binding_digest: record.binding_digest.clone(),
+        scopes: record
+            .scopes
+            .iter()
+            .map(|scope| scope.as_word().to_owned())
+            .collect(),
+        expires_at: record.expires_at.clone(),
+        approvers,
+        dispatch_chain: record.dispatch_chain.clone(),
+    }
+}
+
 /// The call a turn's host parked: what the record needs beyond the wire.
 #[derive(Debug, Clone)]
 pub(crate) struct Parking {
@@ -246,6 +290,23 @@ pub(crate) struct Parking {
     /// A flow its sinks blocked: the `declassify` action's arguments, the
     /// call itself added once its wire is known (R89).
     pub declassify: Option<Value>,
+    /// A `run`'s or an MCP call's `exec_binding` (AD-393, R144); `null` for
+    /// every other call.
+    pub exec_binding: Value,
+    /// A networked `run`'s workspace set, its `preconditions.workspace`
+    /// (S-03).
+    pub workspace: Option<Value>,
+    /// A screen action's preview, `{sha256, ext}`: the screenshot it is
+    /// decided on, kept under the zone's `.keeper/previews/` (S-18), its
+    /// `preconditions.preview`.
+    pub preview: Option<Value>,
+    /// A screen action's `preconditions.screen`: its element, region or
+    /// window pin (AD-394).
+    pub screen: Option<Value>,
+    /// The call's arguments as keeper sends and binds them, when they are
+    /// not the model's: a screen element's call with the snapshot its
+    /// element was read in (R316).
+    pub args: Option<Value>,
 }
 
 /// A parked turn, handed from the tool loop to the worker.
@@ -272,13 +333,26 @@ pub(crate) struct Released {
     pub readers: std::collections::BTreeSet<OwnedUserId>,
 }
 
+/// What a consumed `run` approval was checked against (R144, R213): its
+/// `exec_binding` and the workspace set it releases. The execution it lets
+/// go prepares again and runs only when both are still these — one fact set
+/// from the check before `consumed` to the program's start.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ApprovedRun {
+    pub exec_binding: Value,
+    pub workspace: Option<Value>,
+    /// A KVM action's frame pin, whose size its coordinates are mapped by.
+    pub screen: Option<Value>,
+}
+
 /// What became of a parked call when it was settled.
 #[derive(Debug, Clone)]
 pub(crate) enum Settled {
     /// Its approval was consumed here: it runs as its record bound it —
     /// the tool and the exact arguments, never the log's redacted copy
-    /// (R174) — with the flow a `declassify` approval releases.
-    Run(chat::ToolCall, Option<Released>),
+    /// (R174) — with the flow a `declassify` approval releases, and a
+    /// `run`'s checked facts.
+    Run(chat::ToolCall, Option<Released>, Option<Box<ApprovedRun>>),
     /// It does not run; the model is told this.
     Refuse(String),
 }
@@ -425,6 +499,18 @@ pub(crate) fn read_stored_record(
     session_dir: &Path,
     id: &str,
 ) -> Result<(ApprovalRecord, Value), String> {
+    let (record, whole) = read_stored_whole(session_dir, id)?;
+    Ok((record, whole.action.args))
+}
+
+/// [`read_stored_record`]'s record `id` as it is stored — what its request
+/// is announced from, its large payload an attachment — and as its digest
+/// is over it, with what [`ApprovalRecord::externalise_args`] moved out read
+/// back.
+pub(crate) fn read_stored_whole(
+    session_dir: &Path,
+    id: &str,
+) -> Result<(ApprovalRecord, ApprovalRecord), String> {
     let unread = |error: std::io::Error| format!("the approval record could not be read: {error}");
     let dir = contained(&session_dir.join(APPROVALS_DIR), false).map_err(unread)?;
     let text = read_text_in(&dir, &format!("{id}.json")).map_err(unread)?;
@@ -440,10 +526,10 @@ pub(crate) fn read_stored_record(
         ),
         None => None,
     };
-    let args = record
-        .args(blob.as_deref())
+    let whole = record
+        .whole(blob.as_deref())
         .ok_or_else(|| "the approval's arguments do not match their digest".to_owned())?;
-    Ok((record, args))
+    Ok((record, whole))
 }
 
 /// The decision written beside `id`'s record in the store of the session at
@@ -606,9 +692,22 @@ impl ServedSession {
         approvals_dir(deps, &self.context.session.path, make)
     }
 
-    /// The record `id`, read strictly, with its arguments.
+    /// The record `id`, read strictly, as its digest is over it (its
+    /// attached payload read back), with its arguments.
     fn read_record(&self, deps: &AgentDeps, id: &str) -> Result<(ApprovalRecord, Value), String> {
-        read_stored_record(&deps.sessions_zone.join(&self.context.session.path), id)
+        let (_, whole) = self.read_stored(deps, id)?;
+        let args = whole.action.args.clone();
+        Ok((whole, args))
+    }
+
+    /// The record `id` as it is stored and as its digest is over it
+    /// ([`read_stored_whole`]).
+    fn read_stored(
+        &self,
+        deps: &AgentDeps,
+        id: &str,
+    ) -> Result<(ApprovalRecord, ApprovalRecord), String> {
+        read_stored_whole(&deps.sessions_zone.join(&self.context.session.path), id)
     }
 
     /// The round file of `id`: the parked round's later calls as the model
@@ -792,6 +891,7 @@ impl ServedSession {
                 sha256: sha,
             },
             args: &parked.args,
+            exec_binding: parked.parking.exec_binding.clone(),
             classification: &parked.parking.classification,
             label: &self.context.label,
             preconditions,
@@ -832,6 +932,35 @@ impl ServedSession {
         .map_err(failed)?;
         self.due.insert(id.clone(), record.expires());
         self.announce(deps, port, &record, parked.call_line).await
+    }
+
+    /// The screenshot `record` was decided on, as its request's encrypted
+    /// attachment (S-18): `{sha256, mimetype, file}`, `file` what the room's
+    /// upload made of the bytes kept under the zone's `.keeper/previews/`.
+    /// `None` when the record has none, or this host does not hold it — a
+    /// host that took the record over re-checks against a fresh screenshot
+    /// and needs none — or it could not be uploaded.
+    async fn preview_attachment(
+        room: Option<Arc<dyn ApprovalRoom>>,
+        zone: PathBuf,
+        record: &ApprovalRecord,
+    ) -> Option<Value> {
+        let preview = record.preconditions.preview.as_ref()?;
+        let (sha256, ext) = (preview["sha256"].as_str()?, preview["ext"].as_str()?);
+        let room = room?;
+        let bytes =
+            crate::agent::off_the_runtime(|| crate::previews::read(&zone, sha256, ext)).ok()?;
+        match room.upload(bytes).await {
+            Ok(file) => Some(serde_json::json!({
+                "sha256": sha256,
+                "mimetype": format!("image/{ext}"),
+                "file": file,
+            })),
+            Err(error) => {
+                tracing::warn!(%error, approval = %record.id, "agents: an approval's preview could not be uploaded; its request goes without it");
+                None
+            }
+        }
     }
 
     /// A scheduled run's card says `run: blocked` before its park pins
@@ -927,6 +1056,15 @@ impl ServedSession {
             }
             None => None,
         };
+        // A gate's ticket is asked for on the hour's card in its own room
+        // (codemap Q8).
+        // A held result's declassification goes to the owner's proxy DM
+        // like any other (99.2 #3).
+        let in_gate = self.context.agent.kind == SessionKind::Gate;
+        let declassify = record.action.tool == AgentTool::Declassify.as_wire();
+        if in_gate && !declassify {
+            return Box::pin(self.on_the_card(deps, port, record, call_line, file)).await;
+        }
         // The consolidator's record is decided by the approvers its digest
         // binds, while they are still who they should be (R206); a parked
         // call asks the session's readers.
@@ -942,33 +1080,14 @@ impl ServedSession {
             Readers::Only(set) => set.iter().map(|user| user.to_string()).collect(),
             Readers::Anyone => Vec::new(),
         };
-        let content = ApprovalRequestContent {
-            v: CONTENT_VERSION,
-            id: record.id.clone(),
-            session: record.session.clone(),
-            room: self.context.agent.room.to_string(),
-            agent: record.agent.clone(),
-            tier: record.risk.tier,
-            summary: record.action.summary.clone(),
-            action: RequestAction {
-                tool: record.action.tool.clone(),
-                args: record.action.args.clone(),
-                exec_binding: record.action.exec_binding.clone(),
-            },
-            file_sha256: file.as_ref().and(record.action.args_blob.clone()),
-            file,
-            checkpoint_sha256: record.checkpoint.sha256.clone(),
-            preconditions: record.preconditions.clone(),
-            binding_digest: record.binding_digest.clone(),
-            scopes: record
-                .scopes
-                .iter()
-                .map(|scope| scope.as_word().to_owned())
-                .collect(),
-            expires_at: record.expires_at.clone(),
-            approvers,
-            dispatch_chain: record.dispatch_chain.clone(),
-        };
+        let mut content =
+            request_content(record, self.context.agent.room.as_ref(), approvers, file);
+        content.preview = Self::preview_attachment(
+            self.approval_room.clone(),
+            deps.sessions_zone.clone(),
+            record,
+        )
+        .await;
         let value = serde_json::to_value(&content).map_err(failed)?;
         let gate = self.gate(deps, port);
         // A declassification is decided in its approvers' proxy DMs, never
@@ -1011,9 +1130,21 @@ impl ServedSession {
                     gate.suppressed(APPROVAL_REQUEST);
                 }
                 tracing::info!(approval = %record.id, "agents: an approval's request may not go into its room; it goes to its approvers' DMs");
-                let cursor = self
-                    .send_status(deps, port, RunState::Blocked, Some(&detail))
-                    .await;
+                // A gate's room shows no status (codemap Q6): its held
+                // request's own event is where the room is read forward from.
+                let held = self
+                    .context
+                    .gate_held
+                    .iter()
+                    .find(|(_, approval)| **approval == record.id)
+                    .and_then(|(request, _)| self.context.gate_pending.get(request)?.event.clone());
+                let cursor = match held.filter(|_| in_gate) {
+                    Some(event) => event,
+                    None => {
+                        self.send_status(deps, port, RunState::Blocked, Some(&detail))
+                            .await
+                    }
+                };
                 let asked = self.request_by_doors(deps, &value).await;
                 // Nobody it reached is nobody asked: it is not announced.
                 if asked.is_empty() {
@@ -1050,6 +1181,11 @@ impl ServedSession {
     /// record and its line — waits as a park not yet announced (R176):
     /// [`Self::resume_approvals`] announces it again, or expires it.
     pub(crate) fn adopt_records(&mut self, deps: &AgentDeps) {
+        // A gate's records are its tickets', raised again by their own
+        // lines ([`Self::raise_tickets`]).
+        if self.context.agent.kind == SessionKind::Gate {
+            return;
+        }
         let Ok(entries) = self.approvals(deps, false).and_then(fs::read_dir) else {
             return;
         };
@@ -1187,6 +1323,11 @@ impl ServedSession {
 
     /// Whether a call of this session waits for a person now.
     pub fn waiting(&self) -> bool {
+        // A gate never waits: its tickets wait outside its turns (codemap
+        // Q4), and every request is still taken.
+        if self.context.agent.kind == SessionKind::Gate {
+            return false;
+        }
         self.context
             .parked
             .values()
@@ -1209,7 +1350,7 @@ impl ServedSession {
         self.adopt_records(deps);
         let pending: Vec<Pending> = self.context.parked.values().cloned().collect();
         for pending in pending {
-            let record = self.read_record(deps, &pending.id).ok();
+            let record = self.read_stored(deps, &pending.id).ok();
             if let Some((record, _)) = &record {
                 self.due.insert(pending.id.clone(), record.expires());
             }
@@ -1629,13 +1770,30 @@ impl ServedSession {
             None if !read.complete => return unknown(self, sent),
             _ => {}
         }
-        let checked: Result<(chat::ToolCall, Option<Released>), (String, ApprovalState)> =
-            match self.read_record(deps, id) {
-                Err(reason) => Err((reason, ApprovalState::Refused)),
-                Ok((record, args)) => self
-                    .preconditions(deps, pending, &record, &args, decision)
-                    .map(|()| bound_call(&record, args)),
-            };
+        type Checked = (
+            chat::ToolCall,
+            Option<Released>,
+            Option<Box<ApprovedRun>>,
+            Option<keeper_core::agents::run::RunAllowance>,
+        );
+        let checked: Result<Checked, (String, ApprovalState)> = match self.read_record(deps, id) {
+            Err(reason) => Err((reason, ApprovalState::Refused)),
+            Ok((record, args)) => match self.preconditions(deps, pending, &record, &args, decision)
+            {
+                Err(drifted) => Err(drifted),
+                // What the call reaches outside keeper is read again now,
+                // before `consumed` (R144).
+                Ok(()) => match outside_moved(deps, &record).await {
+                    Some(reason) => Err((reason, ApprovalState::Refused)),
+                    None => {
+                        let run = approved_run(&record);
+                        let allowance = run_allowance(&record, decision);
+                        let (call, released) = bound_call(&record, args);
+                        Ok((call, released, run, allowance))
+                    }
+                },
+            },
+        };
         let call = match checked {
             Ok(call) => call,
             Err((reason, state)) => {
@@ -1692,7 +1850,10 @@ impl ServedSession {
                 match mirrored {
                     Ok(()) => {
                         self.settling.remove(id);
-                        Some(Settled::Run(call.0, call.1))
+                        // A `session` approval of a T2 run lets its kin go
+                        // on this host until the session closes (R146).
+                        self.context.run_allowances.extend(call.3);
+                        Some(Settled::Run(call.0, call.1, call.2))
                     }
                     Err(_) => unknown(self, Some(ours)),
                 }
@@ -1763,7 +1924,48 @@ impl ServedSession {
         if let Some(reason) = self.sink_now_blocks(deps, record, args) {
             return drift(reason);
         }
+        if let Some(reason) = self.run_moved(deps, record, args) {
+            return drift(reason);
+        }
         Ok(())
+    }
+
+    /// What a `run` record relied on beyond its files, read again before
+    /// its approval is consumed (R144, R213): the binding recomputed whole
+    /// here — the host that resolves it (digested, so a record moved to or
+    /// edited for another host drifts), the folder `cwd` resolves to, the
+    /// programs' paths and SHA-256 and every operand's — over the drives
+    /// the agent's grants let it read now, and, with network, the workspace
+    /// set the card showed (S-03).
+    fn run_moved(&self, deps: &AgentDeps, record: &ApprovalRecord, args: &Value) -> Option<String> {
+        if record.action.tool != AgentTool::Run.as_wire() {
+            return None;
+        }
+        let Some(sandbox) = &deps.sandbox else {
+            return Some("this host no longer offers a sandbox".to_owned());
+        };
+        let drives = crate::agent::run_drives(&self.context, deps);
+        let session = crate::run::Session {
+            drive: &deps.drive_root,
+            zone: &deps.sessions_subfolder,
+            path: &self.context.session.path,
+        };
+        let now = match crate::agent::off_the_runtime(|| sandbox.prepare(args, session, &drives)) {
+            Ok(now) => now,
+            Err(reason) => return Some(reason),
+        };
+        if now.exec_binding != record.action.exec_binding {
+            tracing::warn!(approval = %record.id, "agents: a run's host, folder, program or the code it runs changed after its approval");
+            return Some(
+                "where it runs, its program, or the code it runs changed after it was approved"
+                    .to_owned(),
+            );
+        }
+        if now.workspace_set != record.preconditions.workspace {
+            tracing::warn!(approval = %record.id, "agents: a networked run's workspace changed after its approval");
+            return Some("its workspace changed after it was approved".to_owned());
+        }
+        None
     }
 
     /// Whether this host holds the session's claim now: its lease lets it
@@ -1956,6 +2158,8 @@ impl ServedSession {
                 }),
                 truncated: None,
                 label: self.context.label.clone(),
+                paseo: None,
+                effect: None,
             });
             if let Err(error) = self
                 .writer
@@ -2025,6 +2229,14 @@ impl ServedSession {
         note: Option<PeerBody>,
         stop: CancelSignal,
     ) {
+        // A gate's ticket has no turn to resume: the host hands it on, or
+        // refuses it in the room (codemap Q4).
+        if self.context.agent.kind == SessionKind::Gate {
+            if let Some(settled) = settled {
+                Box::pin(self.gate_settled(deps, port, pending, settled)).await;
+            }
+            return;
+        }
         let Ok(approval) = Ulid::from_string(&pending.id) else {
             return;
         };
@@ -2086,7 +2298,9 @@ impl ServedSession {
         self.scheduled_card = self
             .read_round(deps, &pending.id)
             .and_then(|round| round.scheduled);
-        let went_on = self.resume_turn(deps, Arc::clone(port), resume, stop).await;
+        // A resumed turn's future is large; on the heap, every path that
+        // settles an approval stays small on the worker's stack.
+        let went_on = Box::pin(self.resume_turn(deps, Arc::clone(port), resume, stop)).await;
         match &went_on {
             Ok(report) => {
                 tracing::info!(approval = %pending.id, ending = ?report.ending, "agents: a parked run went on")
@@ -2107,6 +2321,90 @@ impl ServedSession {
             self.close_row(deps, &pending.id, AuditOutcome::Refused);
         }
     }
+}
+
+/// What a `kvm_act` record relied on, read from the KVM before its approval
+/// is consumed (96.5 #6, R144's KVM part): this host still names the KVM
+/// as the record bound it — the same device, certificate and readers — and
+/// a fresh frame of its screen is the size the inputs were mapped on, the
+/// whole frame and the square around each point within the difference
+/// hash's bound. A host that took the park over has no preview and needs
+/// none: the fresh frame is the check.
+async fn kvm_moved(deps: &AgentDeps, record: &ApprovalRecord) -> Option<String> {
+    use keeper_core::agents::kvm as core_kvm;
+    if record.action.tool != AgentTool::KvmAct.as_wire() {
+        return None;
+    }
+    let moved = |what: String| {
+        tracing::warn!(approval = %record.id, "agents: a KVM action's KVM or screen changed after its approval");
+        Some(what)
+    };
+    let Some(id) = record.action.exec_binding["kvm"].as_str() else {
+        return moved("its record names no KVM".to_owned());
+    };
+    let Some(kvms) = deps.kvm.as_ref() else {
+        return moved(format!("this host no longer names the KVM `{id}`"));
+    };
+    match kvms.entry(id) {
+        Some(entry) if core_kvm::binding(entry) == record.action.exec_binding => {}
+        _ => return moved(format!("the KVM `{id}` is not the one it was approved for")),
+    }
+    let Some(pin) = record
+        .preconditions
+        .screen
+        .clone()
+        .and_then(|pin| serde_json::from_value::<core_kvm::FramePin>(pin).ok())
+    else {
+        return moved("its record pins no screen".to_owned());
+    };
+    let classic = match kvms.classic(id) {
+        Ok(classic) => classic,
+        Err(why) => return moved(why),
+    };
+    let frame = match classic.snapshot().await {
+        Ok(frame) => frame,
+        Err(why) => return moved(format!("its screen could not be read again: {why}")),
+    };
+    let grey = &frame.grey;
+    if !core_kvm::frame_holds(&pin, &grey.pixels, grey.width, grey.height) {
+        return moved(format!(
+            "the screen of `{id}` changed after it was approved"
+        ));
+    }
+    None
+}
+
+/// What a consumed `run`, MCP or KVM record was checked against; `None`
+/// for every other tool.
+fn approved_run(record: &ApprovalRecord) -> Option<Box<ApprovedRun>> {
+    (record.action.tool == AgentTool::Run.as_wire()
+        || record.action.tool == AgentTool::Mcp.as_wire()
+        || record.action.tool == AgentTool::KvmAct.as_wire())
+    .then(|| {
+        Box::new(ApprovedRun {
+            exec_binding: record.action.exec_binding.clone(),
+            workspace: record.preconditions.workspace.clone(),
+            screen: record.preconditions.screen.clone(),
+        })
+    })
+}
+
+/// The allowance a `session` decision on a T2 `run` record gives (R146):
+/// what its binding covers, until 24 hours after the decision; `None` for
+/// any other decision, tool or tier.
+fn run_allowance(
+    record: &ApprovalRecord,
+    decision: &DecisionRecord,
+) -> Option<keeper_core::agents::run::RunAllowance> {
+    let decided = chrono::DateTime::parse_from_rfc3339(&decision.decided_at).ok()?;
+    (record.action.tool == AgentTool::Run.as_wire()
+        && decision.scope == approval::Scope::Session
+        && record.risk.tier == 2)
+        .then(|| keeper_core::agents::run::RunAllowance {
+            approval: record.id.clone(),
+            key: keeper_core::agents::run::allowance_key(&record.action.exec_binding),
+            ends: approval::session_scope_ends(decided.with_timezone(&Utc), None),
+        })
 }
 
 /// The call `record` binds, as it runs after approval: its call id, its
@@ -2134,13 +2432,172 @@ fn bound_call(record: &ApprovalRecord, args: Value) -> (chat::ToolCall, Option<R
         };
         return (call, Some(released));
     }
+    // An MCP call is rebuilt under the wire name of the server and tool its
+    // record bound (R144).
+    let name = if record.action.tool == AgentTool::Mcp.as_wire() {
+        keeper_core::agents::mcp::bound_tool(&record.action.exec_binding)
+            .and_then(|(server, tool)| keeper_core::agents::mcp::wire_name(server, tool).ok())
+            .unwrap_or_default()
+    } else {
+        record.action.tool.clone()
+    };
     let call = chat::ToolCall {
         id: record.call.call_id.clone(),
-        name: record.action.tool.clone(),
+        name,
         arguments_raw: args.to_string(),
         arguments: Some(args),
     };
     (call, None)
+}
+
+/// What an MCP call's record relied on, read from the server itself before
+/// its approval is consumed (R144's MCP part): the agent still lists the
+/// server, the host still names it, and the server — asked for its tools
+/// again now, connected anew if its connection is gone — answers, offers
+/// the tool, and binds what the record bound: the same server identity
+/// (endpoint, or argv and program bytes), the same tool definition, the
+/// same tier and, for a Paseo mutation, the same audience its prompt goes
+/// to (R96PA-04). Anything else, a record naming no server included, is
+/// drift.
+async fn mcp_moved(deps: &AgentDeps, record: &ApprovalRecord) -> Option<String> {
+    if record.action.tool != AgentTool::Mcp.as_wire() {
+        return None;
+    }
+    let bound = &record.action.exec_binding;
+    let moved = |what: &str| {
+        tracing::warn!(approval = %record.id, "agents: an MCP call's server changed after its approval");
+        Some(what.to_owned())
+    };
+    let Some((server, tool)) = keeper_core::agents::mcp::bound_tool(bound) else {
+        return moved("its record names no MCP server and tool");
+    };
+    let Some(servers) = deps
+        .mcp
+        .as_ref()
+        .filter(|_| deps.home.config.mcp.iter().any(|name| name == server))
+    else {
+        return moved("this host or this agent no longer names its MCP server");
+    };
+    let readers = servers.entry(server).map(|entry| entry.readers.clone());
+    match (servers.fresh_binding(server, tool).await, readers) {
+        (Err(reason), _) => moved(&reason),
+        (Ok(_), None) => moved("this host no longer names its MCP server"),
+        (Ok(mut now), Some(readers)) => {
+            keeper_core::agents::paseo::bind_audience(&mut now, &readers);
+            // A screen action's target is not the server's: it is read
+            // again after this, from the screen ([`screen_moved`]).
+            if now != keeper_core::agents::screen::without_target(bound) {
+                return moved(
+                    "which MCP server it reaches, who it reaches through it, or what the server says the tool takes or is, changed after it was approved",
+                );
+            }
+            None
+        }
+    }
+}
+
+/// What a record's call reaches outside keeper, read again before its
+/// approval is consumed: its MCP server (R144), then the Mac's screen or
+/// the KVM's screen it acts on. The first that moved, and how.
+async fn outside_moved(deps: &AgentDeps, record: &ApprovalRecord) -> Option<String> {
+    if let Some(moved) = mcp_moved(deps, record).await {
+        return Some(moved);
+    }
+    if let Some(moved) = screen_moved(deps, record).await {
+        return Some(moved);
+    }
+    kvm_moved(deps, record).await
+}
+
+/// What a screen action's record was pinned by, read from the screen again
+/// before its approval is consumed (96.4 #6, AD-394, R316): its element —
+/// the window read again by Peekaboo, the element there with the same role,
+/// title, identifier and frame; its square, whose difference hash of a
+/// screenshot taken now is within the bound; or its window — still in
+/// front when it was, its application's list naming exactly one window of
+/// its title at its frame, the call's arguments still naming that window
+/// alone when it was the one they named (R328), and its frame's hash
+/// within the bound. Anything else, a record that pins nothing included, is
+/// drift: refused, with no `consumed` sent.
+async fn screen_moved(deps: &AgentDeps, record: &ApprovalRecord) -> Option<String> {
+    use keeper_core::agents::screen::{self, Pin};
+    if record.action.tool != AgentTool::Mcp.as_wire()
+        || record.action.exec_binding["role"] != "screen"
+    {
+        return None;
+    }
+    let moved = |what: &str| {
+        tracing::warn!(approval = %record.id, "agents: what a screen action acts on changed after its approval");
+        Some(what.to_owned())
+    };
+    let Some(pin) = record.preconditions.screen.as_ref().and_then(Pin::of) else {
+        return moved("its record pins nothing of the screen");
+    };
+    let (Some((server, tool)), Some(servers)) = (
+        keeper_core::agents::mcp::bound_tool(&record.action.exec_binding),
+        deps.mcp.as_ref(),
+    ) else {
+        return moved("this host no longer names its screen server");
+    };
+    match pin {
+        Pin::Element(pin) => match servers.inspect(server, &pin).await {
+            Err(reason) => moved(&reason),
+            Ok(fresh) if screen::element_holds(&pin, &fresh) => None,
+            Ok(_) => {
+                moved("the element it acts on moved, changed or is gone since it was approved")
+            }
+        },
+        Pin::Region(pin) => match grey_now(servers, server).await {
+            Err(reason) => moved(&reason),
+            Ok(grey) if screen::region_holds(&pin, &grey.pixels, grey.width, grey.height) => None,
+            Ok(_) => moved("what the screen shows where it acts changed since it was approved"),
+        },
+        Pin::Window(pin) => {
+            let front = if pin.front {
+                match servers.front(server).await {
+                    Ok(front) => Some(front),
+                    Err(reason) => return moved(&reason),
+                }
+            } else {
+                None
+            };
+            let windows = match servers.windows(server, &pin.app).await {
+                Ok(windows) => windows,
+                Err(reason) => return moved(&reason),
+            };
+            if !screen::named_holds(&pin, tool, &record.action.args, &windows) {
+                return moved(
+                    "another window now holds what it names, so it may not act on the one approved",
+                );
+            }
+            match grey_now(servers, server).await {
+                Err(reason) => moved(&reason),
+                Ok(grey)
+                    if screen::window_holds(
+                        &pin,
+                        front.as_ref(),
+                        &windows,
+                        &grey.pixels,
+                        grey.width,
+                        grey.height,
+                    ) =>
+                {
+                    None
+                }
+                Ok(_) => moved(
+                    "the window it acts on moved, changed or is no longer the one in front since it was approved",
+                ),
+            }
+        }
+    }
+}
+
+/// A screenshot `servers`' screen server `server` takes now, made grey.
+async fn grey_now(
+    servers: &crate::mcp::McpServers,
+    server: &str,
+) -> Result<crate::previews::Grey, String> {
+    crate::previews::grey(&servers.screenshot(server).await?)
 }
 
 /// What the model is told of an approval consumed on `host` whose call has

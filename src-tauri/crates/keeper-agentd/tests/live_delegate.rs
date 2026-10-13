@@ -292,6 +292,7 @@ async fn a_delegation_round_trip_on_a_real_homeserver() {
         title: "smoke".to_owned(),
         requested_by: person.clone(),
         parent: None,
+        reply: None,
         room: dm.clone(),
         drives: vec!["smoke".to_owned()],
         label: Label {
@@ -307,6 +308,7 @@ async fn a_delegation_round_trip_on_a_real_homeserver() {
         checkpoints: None,
         outputs: Vec::new(),
         created_at: chrono::Utc::now(),
+        gate: None,
     };
     let files = vec![
         ("80-agents/_drive.toml".to_owned(), drive_toml.clone()),
@@ -596,6 +598,7 @@ async fn a_declassification_decided_in_the_proxy_dm_lets_one_flow_through() {
         title: "smoke".to_owned(),
         requested_by: person.clone(),
         parent: None,
+        reply: None,
         room: dm.clone(),
         drives: vec!["smoke".to_owned()],
         label: Label {
@@ -611,6 +614,7 @@ async fn a_declassification_decided_in_the_proxy_dm_lets_one_flow_through() {
         checkpoints: None,
         outputs: Vec::new(),
         created_at: chrono::Utc::now(),
+        gate: None,
     };
     let files = vec![
         ("80-agents/_drive.toml".to_owned(), drive_toml.clone()),

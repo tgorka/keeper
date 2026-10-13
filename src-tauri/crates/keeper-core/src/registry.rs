@@ -1062,6 +1062,36 @@ pub fn set_bots_stop_phrase(data_dir: &Path, phrase: &str) -> Result<(), CoreErr
     set_setting(data_dir, BOTS_STOP_PHRASE_KEY, phrase)
 }
 
+/// The `settings` key holding the push gateway the person runs (Epic 98,
+/// story 98.1, Q4; AD-412). Absent or blank = no push. User-global, so both
+/// of a person's phones register with the same gateway.
+const PUSH_GATEWAY_URL_KEY: &str = "push.gateway_url";
+
+/// Read `push.gateway_url` as stored, trimmed; absent or blank ⇒ `None`.
+/// Raw, not parsed: a layer file can set any text, and what Settings shows
+/// of a value keeper will not register is `agents::push::PushGatewayVm`'s
+/// answer.
+pub fn get_push_gateway_url(data_dir: &Path) -> Result<Option<String>, CoreError> {
+    Ok(get_setting(data_dir, PUSH_GATEWAY_URL_KEY)?
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty()))
+}
+
+/// Write `push.gateway_url`: a parsed gateway, or `None` to clear it — so
+/// nothing but an address keeper would register is ever written by keeper.
+pub fn set_push_gateway_url(
+    data_dir: &Path,
+    gateway: Option<&crate::agents::push::Gateway>,
+) -> Result<(), CoreError> {
+    set_setting(
+        data_dir,
+        PUSH_GATEWAY_URL_KEY,
+        gateway
+            .map(crate::agents::push::Gateway::as_str)
+            .unwrap_or_default(),
+    )
+}
+
 /// The boot-time config-override file's name (Story 22.6, FR-80): lives beside
 /// `keeper.db` in the data dir.
 pub const CONFIG_FILE_NAME: &str = "config.json";
@@ -2961,6 +2991,22 @@ pub fn set_transcription_diarization_model(data_dir: &Path, id: &str) -> Result<
     set_setting(data_dir, TRANSCRIPTION_DIARIZATION_MODEL_KEY, id.trim())
 }
 
+/// The `settings` keys holding the turn models picked in Settings (D-36),
+/// shaped like the speech and speaker model's.
+pub(crate) const TRANSCRIPTION_VAD_MODEL_KEY: &str = "transcription.vad_model";
+pub(crate) const TRANSCRIPTION_SMART_TURN_MODEL_KEY: &str = "transcription.smart_turn_model";
+
+/// The picked voice activity and end-of-turn model, each `""` when the
+/// config repository's choice stands. Surrounding whitespace is not part of
+/// a name.
+pub fn get_turn_models(data_dir: &Path) -> Result<(String, String), CoreError> {
+    let name = |raw: Option<String>| raw.map(|raw| raw.trim().to_owned()).unwrap_or_default();
+    Ok((
+        name(get_setting(data_dir, TRANSCRIPTION_VAD_MODEL_KEY)?),
+        name(get_setting(data_dir, TRANSCRIPTION_SMART_TURN_MODEL_KEY)?),
+    ))
+}
+
 /// The `settings` key holding an explicit path to the `git` binary folder sync
 /// drives (Story 34.14). Stored as the raw absolute path string; absent / empty
 /// ⇒ automatic resolution, which is the default and what almost every install
@@ -3296,6 +3342,36 @@ pub fn list_accounts(data_dir: &Path) -> Result<Vec<AccountRow>, CoreError> {
         );
     }
     Ok(accounts)
+}
+
+/// The homeserver of `account_id`, read without writing anything: `None`
+/// when there is no `keeper.db` in `data_dir` or no such account. The
+/// notification extension reads it this way — it is a second process beside
+/// the app, so it neither creates the registry nor runs [`open`]'s
+/// migrations (98.1).
+pub fn homeserver_of_existing(
+    data_dir: &Path,
+    account_id: &str,
+) -> Result<Option<String>, CoreError> {
+    let path = db_path(data_dir);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let conn = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|e| CoreError::Internal(format!("could not read keeper.db: {e}")))?;
+    conn.busy_timeout(BUSY_TIMEOUT)
+        .map_err(|e| CoreError::Internal(format!("could not set busy timeout: {e}")))?;
+    match conn.query_row(
+        "SELECT homeserver_url FROM accounts WHERE account_id = ?1",
+        rusqlite::params![account_id],
+        |r| r.get::<_, String>(0),
+    ) {
+        Ok(url) => Ok(Some(url)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(CoreError::Internal(format!(
+            "could not read the account row: {e}"
+        ))),
+    }
 }
 
 /// Fetch a single account row by id, if present.

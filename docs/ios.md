@@ -17,8 +17,9 @@ It covers, in reading order:
 8. [Building a shareable IPA](#building-a-shareable-ipa)
 9. [Sharing a build without Xcode](#sharing-a-build-without-xcode)
 10. [Verifying the core compiles for iOS](#verifying-the-core-compiles-for-ios)
-11. [The folder on the phone](#the-folder-on-the-phone)
-12. [Limitations](#limitations)
+11. [Push](#push)
+12. [The folder on the phone](#the-folder-on-the-phone)
+13. [Limitations](#limitations)
 
 All shell commands are run from the repository root unless stated otherwise.
 
@@ -138,21 +139,28 @@ Developer Program membership are real but livable for a personal build:
 - There is **no TestFlight and no App Store** distribution. Sharing a build means
   handing someone an IPA they re-sign themselves (see
   [Sharing a build without Xcode](#sharing-a-build-without-xcode)).
-- The **Data Protection entitlement cannot be granted**. keeper's iOS target pins
+- The **entitlements cannot be granted**. keeper's iOS target pins
   `com.apple.developer.default-data-protection` to
-  `NSFileProtectionCompleteUntilFirstUserAuthentication` (source of truth:
-  `gen/apple/project.yml`, FR-65, guarded by `crates/keeper/tests/entitlements_protection.rs`),
-  and a Personal Team's automatic profile does not carry that capability, so the build
-  fails at signing with `Provisioning profile "iOS Team Provisioning Profile:
+  `NSFileProtectionCompleteUntilFirstUserAuthentication` and (Epic 98) names the App
+  Group `group.dev.tgorka.keeper`, the keychain group
+  `$(AppIdentifierPrefix)dev.tgorka.keeper` and `aps-environment` (source of truth:
+  `gen/apple/project.yml`, FR-65, guarded by
+  `crates/keeper-core/tests/apple_entitlements.rs`, which runs on Linux),
+  and a Personal Team's automatic profile carries none of those capabilities, so the
+  build fails at signing with `Provisioning profile "iOS Team Provisioning Profile:
   dev.tgorka.keeper" doesn't match the entitlements file's value for the
   com.apple.developer.default-data-protection entitlement` (measured 2026-09-03,
   Xcode 26.6, iOS 26.6.1). To sideload on a free team, delete the `entitlements:`
   block from `gen/apple/project.yml` and re-run `xcodegen generate` in that directory —
-  a local edit to a generated file; the committed value stays as it is and its test
-  keeps passing. Nothing is lost in practice: iOS already defaults a third-party app's
-  container files to that same protection class, and the entitlement exists to pin it
-  so it cannot drift. A paid team keeps it. Note that an `XCODE_XCCONFIG_FILE` override
-  does **not** work here — target-level build settings beat a project-level xcconfig.
+  a local edit to a generated file; the committed values stay as they are and their
+  test keeps passing (`bun run install:ios` does this with `KEEPER_IOS_FREE_TEAM=1`).
+  What is lost: the pin (iOS already defaults a third-party app's container files to
+  that same protection class), and everything push needs — without the App Group keeper
+  keeps its data in the app's own container (see
+  [Where keeper keeps its data](#where-keeper-keeps-its-data)), and the notification
+  extension, which the same switch removes. A paid team keeps them all. Note that an
+  `XCODE_XCCONFIG_FILE` override does **not** work here — target-level
+  build settings beat a project-level xcconfig.
 
 ### Set your team, without committing any secret
 
@@ -466,10 +474,14 @@ schemes. What stays desktop-only, and why:
 
 - The five plugins above (tray, hotkey, autostart, updater, process): no iOS concept.
 - `bots_drive_ipc` and the drive half of `agent_ports` (the drive half of Bots), `notes_window` (the
-  quick-capture window), `sessions_root` (the sessions board and the tasks runner — AD-201:
-  iOS spawns nothing), `hotkey`, `menu`, `tray`, `voice_window`, `recording_protocol`,
-  `pdf_export` (macOS WebKit). `keeper_agent::sessions` is not gated: `keeper-agent` is a
-  dependency on every target, so it compiles on the phone and nothing there calls it.
+  quick-capture window), `hotkey`, `menu`, `tray`, `voice_window`, `recording_protocol`,
+  `pdf_export` (macOS WebKit). `sessions_root` compiles on the phone since 98.2 (the
+  board below); the sessions lifecycle verbs keep their `unsupported` twins.
+- Inside `keeper-agent`, everything that writes a session's log, an approval or a card's
+  run — `writer`, the session worker in `agent`, `approvals`, `cards` — and every module
+  built on them is `#[cfg(not(phone))]` (`keeper-agent/build.rs` sets `phone` for an iOS
+  or Android target), so a phone code path that names one does not compile.
+  `bun run check:agent-phone` checks that half on any host (98.2, AD-413).
 - Inside `keeper-sync`, `git/cli.rs` is the one module that spawns a process. On
   iOS every verb on it refuses **before** `Command::new` with one sentence naming
   the phone and the in-process route (`GitEngine::Gix`, `GitCli::phone()`); the
@@ -525,6 +537,176 @@ aarch64-apple-ios` in `.github/workflows/ci.yml`); it does not build, sign, or r
 device app — signing and on-device install remain a local, human-driven flow as
 documented above.
 
+## Where keeper keeps its data
+
+Everything keeper stores on the phone — every account's matrix-sdk store under
+`accounts/<id>/sdk`, `keeper.db`, `archive.db`, `sync.db` and the phone's folders under
+`sync/<profile id>` — lives under one directory, `dev.tgorka.keeper`, in
+`Library/Application Support` of one of two containers. Which one is decided once, when
+keeper starts and before anything opens a store (`IosPlatform::resolve`,
+`src-tauri/crates/keeper/src/ipc.rs`; Epic 98, story 98.1):
+
+- **The App Group container** (`group.dev.tgorka.keeper`) when the build carries the
+  App Group entitlement — a paid team's build. The notification extension (Epic 98)
+  opens the same store there.
+- **The app's own container** when it does not — a free Personal Team's build, whose
+  entitlements `install:ios` strips. iOS answers no group container, and keeper keeps
+  its data where it always has.
+
+The first start with a group container **moves** the data, once
+(`keeper_core::container::move_into_group_container`). It is a data migration, not a
+path change, so it is journaled:
+
+- Before the first entry moves, a journal (`.keeper-moving`) is written into the
+  destination; each top-level entry then moves by one rename, so it is in one container
+  or the other, never half in each. A start that finds the journal finishes the move.
+- A finished move leaves `.keeper-moved`; every later start moves nothing.
+- A destination that already holds files keeper did not put there (no journal) is
+  refused, and nothing moves or is marked — on a fresh install too.
+- An entry that cannot move puts back the ones that did. keeper keeps using the app's
+  own container for that start, writes the reason to the log, and tries again at the
+  next start.
+- **A name in both containers is a clash, and it does not resolve itself.** keeper
+  cannot tell which copy is right, so it moves nothing, puts back what an earlier start
+  moved, keeps using the app's own container, and the log names the entry and says the
+  move will not finish while it is in both. Every later start answers the same, without
+  moving anything. Nothing on the phone shows it yet (DW-1241).
+- Once every entry has moved, the group container is the data directory even if the
+  done marker could not be written; the next start writes it.
+
+A phone folder is stored in `sync.db` **relative to the data directory**
+(`keeper_sync::db::upsert_profile`), and read back absolute against wherever the
+directory is now, so the move — and any change of the app container's own path across
+an update — carries the folders along. Rows an older keeper stored absolute are
+rewritten when `sync.db` opens, and once more just before the move, while they still
+name the old directory; if that rewrite fails, the move does not happen. A phone row
+stored under a *previous* app container's path (`…/<UUID>/…/dev.tgorka.keeper/sync/<its
+id>` — iOS can give the container a new path across a reinstall or an update) is
+rewritten the same way, because its folder moved with the rest. A folder a person chose
+outside the data directory (every desktop folder) is stored as it was.
+
+Secrets stay in the keychain, never in either container. The keychain group is the
+app's own application identifier, so the items written before the entitlement existed
+are already in it, and the extension reads them by naming the same group.
+
+### The notification extension
+
+`KeeperNotify` (`gen/apple/KeeperNotify/`, bundle id `dev.tgorka.keeper.notify`; Epic 98,
+story 98.1) is the second process iOS starts when a push arrives. A push names one room
+and one event and nothing else; the extension's Swift reads the account's session and
+store passphrase from the shared keychain group and hands them, with the App Group's
+root, to `keeper_nse_handle` in `libkeeper_nse.a` (`src-tauri/crates/keeper-nse`, which
+depends on `keeper-core` alone — `bun run check:nse-lean`). Rust decides what the lock
+screen shows (`keeper_core::agents::push::classify_notification`): an agent's approval
+request in keeper's own words, an answer of your own agent, or nothing.
+
+- **Its buttons are the card's.** An approval offers *Approve once* and *Deny* only when
+  you could press them on its card: the record is bound, you are one of its approvers,
+  and at T4 you are the one who asked — and *Approve once* only when the whole request
+  fits in the notification and is below T4. Otherwise it offers *Deny* alone, or nothing
+  and opens the card, which says why.
+- **No title says what its sender typed into it.** A summary or a display name holding a
+  line break or a direction override is replaced by keeper's words or the sender's user
+  id.
+- **Only your proxy answers.** An answer is shown only from the agent keeper admits as
+  your proxy in that conversation, not from another agent in it.
+- **It opens nothing before the move.** It reads the group's data directory only once
+  `.keeper-moved` is there (`keeper_nse::store_of`), and creates nothing in it; until
+  then — a free team's build, or a move not yet finished — and on any failure, the
+  notification says keeper's generic words with no actions ([Push](#push), *What shows*).
+- **One account, one room.** The push's payload names keeper's account id
+  (`keeper_account`); the extension opens that account's store alone, loads only the
+  room the push names, and takes its own cross-process lock holder (`nse`) beside the
+  app's. It reads one notification at a time, so several arriving together never open
+  several stores at once under the extension's memory ceiling.
+- **It never refreshes a token.** An OAuth refresh token is used once, and a refresh in
+  the extension would strand the app's; an expired token shows the gateway's
+  notification instead.
+- **A free Personal Team builds without it.** Its App ID and App Group need the paid
+  program, so `KEEPER_IOS_FREE_TEAM=1` removes the target from the remote copy of
+  `project.yml` with the entitlements.
+
+Its memory under the 24 MB ceiling and its decryption on the phone are measured on the
+device after enrolment (98.1 #12), not here.
+
+**Proved on Linux:** the move (`keeper-core/src/container.rs`, its tests) and the folder
+rewrite (`keeper-sync/src/db.rs`, `a_folder_under_the_data_directory_follows_it_…`,
+`an_older_absolute_folder_is_made_relative_…`,
+`a_phone_folder_under_a_previous_app_container_…`). **Not yet proved anywhere:** that iOS
+answers nil without the entitlement and a path with it, and that the move keeps an
+existing install's accounts, messages and folder — the kalypso runs owed in the epic.
+
+## Push
+
+Epic 98, story 98.1 (AD-412, D-35). An agent's approval request and your own agent's
+answer reach the phone while keeper is closed — and nothing else shows. The pusher is the
+account's, though: your homeserver still sends your gateway, and the gateway Apple, the id
+of every other message that would notify, and this phone's extension discards it. Every
+other message notifies only while keeper is open, as before.
+
+**What it needs, none of it in this repository** (D-1, D-35: keeper ships no gateway and
+never chooses one):
+
+- **A build signed by your own paid Apple team.** APNs, the App Group and the notification
+  extension need the paid Apple Developer Program; a free Personal Team's build
+  (`KEEPER_IOS_FREE_TEAM=1`) has no `aps-environment`, iOS gives it no device token, and
+  keeper registers nothing.
+- **A push gateway you run, holding your own APNs key.** APNs takes pushes for a bundle
+  only from the holder of that team's key, so the gateway — a Sygnal beside your
+  homeserver — is configured with your `.p8` key, its key id and your team id, and two
+  apps: `dev.tgorka.keeper.ios` (APNs production) and `dev.tgorka.keeper.ios.dev` (the
+  sandbox). Its address goes into **Settings › Notifications › Push gateway**
+  (`push.gateway_url`).
+
+**What keeper does with them** (`src-tauri/crates/keeper/src/push_ios.rs`, every decision
+in `keeper_core::agents::push`):
+
+- **The token.** keeper asks UIKit for remote notifications at every launch; the device
+  token arrives through tao's app delegate, which keeper's patched tao gives the two
+  selectors upstream lacks (`tools/tao/NOTICE`, change 3).
+- **The pusher.** Once keeper is in front and has the token, it registers on each signed-in
+  account that holds agent session rooms an `http` pusher to your gateway, format
+  `event_id_only`, app `dev.tgorka.keeper.ios.dev` or `dev.tgorka.keeper.ios` by the
+  `aps-environment` of the build's own provisioning profile (an App Store build has none
+  and is production; a profile that is there but cannot be read registers nothing, and the
+  log says so, rather than guess which of the two the token belongs to), and a
+  `default_payload` that runs the notification extension (`mutable-content`) and names
+  keeper's account id. On every other account, and on all of them when the field is empty
+  or holds an address keeper refuses, it removes the pusher. Signing out removes this
+  phone's pusher from that account first, best effort — offline it stays until the gateway
+  reports the token rejected. Your homeserver sends the gateway event ids, never messages;
+  keeper never contacts it. Changing the field registers again at once; an account that
+  gains its first agent room is registered at the next launch.
+- **What shows** is the extension's decision ([The notification
+  extension](#the-notification-extension)). If it cannot decide — the data has not moved
+  into the App Group yet, the token expired, an event it cannot read — the notification
+  reads *keeper — Open keeper to see what arrived.*, with no actions, whatever the push
+  carried: the push is your homeserver's to write, so its alert, its category and any
+  keeper key in it are never shown or acted on. Only a notification the extension composed
+  carries the key (`keeper_shown`) the delegate and `push::action_decision` require.
+- **Actions.** An approval whose whole payload fits the notification offers *Approve once*
+  and *Deny*; any other offers *Deny* only. Both need the phone unlocked; *Deny* is drawn
+  as destructive. keeper owns the notification delegate (`Sources/keeper/KeeperPush.swift`)
+  and hands everything that is not its push to the notification plugin's. An action sends
+  exactly the record and digest the notification showed, scope `once`, through the same
+  decision the in-app card sends, which checks once more that the request is in the session
+  room with that digest; an action that launches keeper in the background signs in that one
+  account only and, while the request or its room has not reached the phone yet, tries for
+  twenty seconds. Any other refusal — the device is not cross-signed, another digest, no
+  longer waiting — is the answer at once, and a decision whose send failed is not sent
+  again. Then a new notification says *Open keeper to finish deciding.* with the reason,
+  and tapping it opens the session.
+- **Taps.** Tapping a keeper notification opens its session room in the Agents window.
+
+**Proved on Linux:** what a notification offers and sends, the pusher and the app id
+(`keeper-core/src/agents/push.rs` tests); that Synapse keeps the pusher keeper registers
+and removes it (`keeper-core/tests/agents_matrix_live.rs`,
+`the_homeserver_keeps_the_pusher_keeper_registers`, against the test homeserver); the
+webview's landing (`src/hooks/use-push-open.test.ts`). **Owed on the phone** after
+enrolment (98.1 #12): the token, the pusher on the owner's homeserver, the lock-screen
+actions with Face ID, the time an action takes from a background launch, and that a
+status update shows nothing.
+
 ## The folder on the phone
 
 Until Epic 66 the phone had no folder, so everything the folder carries — Files, Notes,
@@ -537,8 +719,9 @@ than this prose.
 
 A profile on the phone is a remote URL, a branch, a name and a credential — nothing
 else. The sheet is the desktop's add-folder form with the phone's shape: on the reduced
-tier the folder field, the pickers, Direction, the recordings and sessions switches and
-the whole Advanced disclosure are absent, the access-token field is first-order, and a
+tier the folder field, the pickers, Direction, the recordings, voices and agents switches
+and the whole Advanced disclosure are absent (the sessions switch is there since 98.2:
+the phone's board reads a zone, and a drive offered by your account keeps its flag), the access-token field is first-order, and a
 save no longer requires a path (`src/components/sync/add-folder-form.tsx:1617`,
 `:1651-1664`, `:2296-2297`; Story 66.1), so it sends `localPath: ""`. Rust assigns the
 folder: `<app data dir>/sync/<profile id>`, created there and excluded from backup like
@@ -555,6 +738,61 @@ never a process argument, never a URL.
 **The remote is the hub, never the Mac.** The phone mirrors a profile the Mac already
 syncs; the two devices never talk to each other, and DW-220's inverted route — the Mac
 serving the phone — is refused for the reason it was deferred (D-15).
+
+### The sessions board on the phone (98.2)
+
+The phone reads a drive's sessions zone and moves its cards; it writes no session.
+
+- **Which zones.** A folder flagged *This folder has sessions* — on the phone's form, or
+  carried by your account's drive list from the Mac — is a sessions root once its clone
+  has the zone (`sessions_root`, on every target). `CapabilitiesVm.sessions` is true on
+  the phone exactly when one is registered (`sessions_capability_of`); a first zone
+  landing or a last one going emits `keeper://capabilities-changed` and the webview asks
+  again — only on that edge (`keeper_agent::sessions::zones_flip_the_surface`). The
+  phone taps no watcher: every zone is rescanned after each sync pass — on open, on
+  foreground and on pull-to-refresh (`sessions_root::phone_synced`) — and after a move.
+- **What it reads.** `sessions_roots`, `sessions_list`, `sessions_rescan`,
+  `sessions_detail`, `sessions_tree`, `sessions_refs`, `sessions_search` and its cancel
+  run on the phone with no twin. The board is `keeper_agent::sessions::board::detail`,
+  the one projection the Mac shows too; an agent's session carries its room
+  (`SessionDetailVm.room`), where its approval card is decided.
+- **What it writes.** `sessions_task_move` only: the moved card's `status:` and
+  `order:`, and its neighbours' `order:` when the gap it lands in has collapsed — never
+  `run:`, `assignee:` or a body (`compile_move`). Agents on other hosts commit to the
+  same drive all the time, so the move goes through `Engine::phone_write` (R346): a
+  pull-only pass first, so the move is planned over the remote's current bytes; a folder
+  that is diverged, busy or failing refuses the move with the engine's own sentence and
+  nothing is written; then the move, then one pass that commits and pushes it through the
+  phone's own engine (`Engine::phone_push`, D-16). The command answers what the push did
+  (`SessionTaskMoveVm.unpushed`, shown on the board): `null` once it is on the remote,
+  else the sentence. A push that can land later on its own — the folder busy with another
+  pass, the remote unreachable — is tried again every 30 s while keeper is in front, and
+  at the next foreground sync otherwise; a divergence is not retried (§ *Fast-forward
+  only*). A paused folder is neither pulled nor pushed: the move is written and declared
+  settled, so the first pass after the folder is resumed pushes it (the one after, if
+  keeper was closed in between — the declaration lives in memory).
+- **What stays on the Mac.** Creating, archiving, deleting, migrating sessions, the
+  space and template editors, file verbs and *Allow* on a card's schedule keep their
+  `unsupported` twins, and `keeper-agent`'s session writer and approvals writer do not
+  exist in its build. A move a crash cut short — neighbours renumbered, the card not yet
+  written — is finished before every sync pass, by the same executor
+  (`sessions_root::finish_interrupted_before_pass` → `resume_all`), so no pass commits half
+  a move.
+- **What it shows.** *Sessions* in the drawer, present exactly while `sessions` is
+  (`phoneSurfaceFor`): the zone's sessions, then one session's board as the next level
+  (`sessions-phone-pane.tsx`). The four columns are pages swiped sideways, each named
+  with its count in a row above, and a card whose `status:` is none of the four gets a
+  fifth page. A card shows its title, the run badge (`blocked` is a waiting approval),
+  who works it and *running on `<host>`*, the desktop's own agent block; it moves by
+  *Move to…* (to the end of the column it joins), never by a drag — the picker's own
+  *Move to…* entry is choosable and moves nothing, so opening the picker to look and
+  tapping *Done* changes no card; a refused move is said in Rust's words, a move whose
+  push did not land says so (`unpushed`) — and *Allow* says to allow on the Mac. Tapping a
+  card of an agent's session opens the session's room on the account whose Agents window
+  holds it — the approval card is decided there, by the Matrix event a Mac would send —
+  and backing out of the room lands on the board again, on the page it was left on. A room
+  no account on the phone is in is said, not opened; a tap before the Agents window has
+  arrived says keeper is still reading the rooms.
 
 ### Fully virtual by default, and why
 
@@ -651,6 +889,15 @@ the second is a problem. Three shapes:
    `a_phone_names_a_divergence_and_merges_nothing` — two bare repositories, a
    git-driven "Mac" and a Gix engine — beside `a_phone_clones_and_fast_forwards_with_gitoxide`
    in `engine.rs`'s tests (Story 66.2).
+
+   **The sessions board meets this more than notes do.** A drive's sessions zone is
+   written by agents on other hosts all day, so a card moved on top of the phone's last
+   fast-forward would almost always diverge. That is why a move pulls first and is refused
+   — nothing written — when the pull already names a divergence (R346, `Engine::phone_write`).
+   What remains is a remote commit landing in the seconds between that pull and the push,
+   or a move made offline or in a paused folder: the move stays on the phone, the board
+   says so, and until DW-1273's replay or reset exists the way out is removing the
+   folder and adding it again.
 
 ### A push keeper does itself
 
@@ -750,37 +997,34 @@ build. These are the same eight points keeper shows in-app under **Settings → 
 folder; the first and seventh by Epic 67, Story 67.4, AD-210, when a spoken turn learned
 to finish with the screen locked):
 
-- keeper syncs and notifies about messages only while it's open; background notifications await a future decision. A voice session you left listening is the exception: it answers with the screen locked and posts what it heard as a banner from this phone.
+- keeper syncs and notifies about messages only while it's open. Two things still reach you while it is closed: with a build signed by your own paid Apple team and a push gateway you run, your agents' approval requests and your own agent's answers arrive as notifications through it, read on this phone (nothing else shows; the ids of other messages still pass through your gateway and Apple, and this phone discards them); and a voice session you left listening answers with the screen locked and posts what it heard as a banner from this phone.
 - A folder you add here mirrors a remote your Mac already syncs and lives inside keeper's own container: every large file stays a pointer until you open it, and it syncs only when keeper opens, comes back in front or you pull to refresh — nothing watches the folder on a battery.
 - Nothing is merged on a phone: a history this copy cannot fast-forward is named — how many commits this phone has that the remote does not — and you push them or reset this copy; the Mac merges.
 - Notes are a synced folder, so they are here too: list, search, read and edit them, and a save is a commit that keeper pushes from this phone with its own engine — there is no git on a phone.
-- What stays on your Mac: the self-hosted bridge runner, the sessions board, tasks, screen recording and the global summon hotkey; Bots talks to a model here, but the drive tools live on your Mac.
+- The sessions board is here too: read a session's cards, move one with Move to…, and open an agent's session room to decide its approval; creating and archiving sessions stays on your Mac, with tasks, the self-hosted bridge runner, screen recording and the global summon hotkey. Bots talks to a model here, but the drive tools live on your Mac.
 - Updates arrive by reinstalling keeper; its signature renews every 7 days.
 - Listening for the wake phrase starts in keeper, and then keeps working with another app in front and with the screen locked; the answer is spoken there too, and saying "stop" (or the stop word you chose) ends it. Speech is recognised on this phone and never sent to a server.
 - Turn listening on while keeper is in front and it keeps listening when another app is in front or the screen is locked. Siri or an app that takes the microphone pauses it and keeper resumes on its own; a phone call ends it until you open keeper again. It stops when you turn it off or when keeper is force-quit. The orange microphone indicator stays on the whole time and cannot be hidden, and listening uses battery.
 
-> This list is mirrored from `IOS_DISCLOSURE_LINES` in
-> `src/components/settings/about-section.tsx`, which is the single source of truth —
-> the in-app "On this iPhone" disclosure links here, so the two must stay identical.
-> Edit both together or neither; `about-section.test.tsx` reads this list from disk
-> and fails when they differ.
+> This list is mirrored from `keeper_core::disclosure::IPHONE_LINES`, which is the
+> single source of truth — Rust sends it to the in-app "On this iPhone" disclosure
+> (`platform_facts`), which links here, so the two must stay identical. Edit both
+> together or neither; `keeper-core/tests/platform_disclosure_mirrors_docs.rs` reads
+> this list from disk and fails when they differ.
 
 On the first item, the canonical in-app wording spells out the sync consequence and its
-one exception (`NO_BACKGROUND_SYNC_SENTENCE`,
-`src/components/settings/no-background-sync-disclosure.tsx:30-35`): "On iPhone, keeper
-syncs and notifies about messages only while open. Close it and messages wait on your
-homeserver until you return — nothing is lost, and nothing here pretends to be push. A
-voice session you left listening is the one exception: it keeps listening with keeper
-behind other apps or the screen locked, and posts what it heard and answered as a local
-banner from this phone." The app-icon badge follows the same honesty: "The app-icon badge
-is not a live count while keeper is closed; it reflects what keeper knew when it was last
-open."
+two exceptions (`NO_BACKGROUND_SYNC_SENTENCE`,
+`src/components/settings/no-background-sync-disclosure.tsx`): "On iPhone, keeper syncs and notifies about messages only while open. Close it and messages wait on your homeserver until you return — nothing is lost. Two things still reach you while it is closed. With a build signed by your own paid Apple team and a push gateway you run, set in Settings › Notifications, your agents' approval requests and your own agent's answers arrive as notifications, read on this phone. Nothing else shows; the ids of other messages still pass through your gateway and Apple, and this phone discards them. And a voice session you left listening keeps listening with keeper behind other apps or the screen locked, and posts what it heard and answered as a local banner from this phone." The app-icon badge
+follows the same honesty: "The app-icon badge is not a live count while keeper is closed; it
+reflects what keeper knew when it was last open."
 
-The "future decision" the first item names is recorded in [decisions.md](decisions.md) D-1 —
-the deferred paid Apple Developer Program that would unlock APNs push and the NSE. The
-exception is not push and needs none of that: it is a local notification the app posts
-from its own process, and [A turn that finishes without the screen](#a-turn-that-finishes-without-the-screen)
-below is what it is made of.
+The first exception is [Push](#push) above: D-35 ended D-1's deferral of the paid Apple
+Developer Program, and with it and a gateway the owner runs the notification extension shows an
+agent's approval request and the owner's own agent's answer. A free Personal Team's build has
+neither, and for it the first item's message half is the whole story. The second exception is not
+push and needs none of that: it is a local notification the app posts from its own process, and
+[A turn that finishes without the screen](#a-turn-that-finishes-without-the-screen) below is what
+it is made of.
 
 The second and third items are [The folder on the phone](#the-folder-on-the-phone)
 above, Epic 66 (AD-198, AD-199; D-15). "Mirrors a remote your Mac already syncs" is the
@@ -802,14 +1046,18 @@ commit → push path, citing `src/components/notes/**`, `src/components/capture/
 literal: `GitEngine::HOST` is `Gix` on iOS (`cli.rs:118-122`) and the push is
 `push_http` (D-16).
 
-The fifth item is AD-201 and AD-203 in one line, each clause a fact with a gate behind
-it. The bridge runner: `bridges-pane.tsx` gates the runner on `bridgeSidecar`, which is
-`cfg!(desktop)` (`ipc.rs:1430`); discovery, provisioning and health are on the phone since
-Story 66.1. The sessions board: the sessions commands have `unsupported` twins on the
-phone (`crates/keeper/src/sessions_ipc.rs:41-44` and every twin below it) and
-`sessions_root` is `#[cfg(desktop)]` (`lib.rs:66-70`) — it reads a
-synced folder and could follow the notes reader, but it is forty commands and its own
-epic (DW-237). Tasks: a task is one of keeper's own verbs and never a shell string
+The fifth item is AD-201 and AD-203 in one line, rewritten by Epic 98 (story 98.2,
+AD-413) when the board reached the phone; each clause is a fact with a gate behind it.
+The sessions board: the read verbs and `sessions_task_move` run on the phone with no
+twin, and the Sessions surface (`src/components/sessions/sessions-phone-pane.tsx`) is
+there exactly while `CapabilitiesVm.sessions` is — a folder on the phone with a sessions
+zone ([The sessions board on the phone](#the-sessions-board-on-the-phone-982) above).
+A card's session room is where its approval is decided; "creating and archiving
+sessions stays on your Mac" is every lifecycle verb's `unsupported` twin
+(`crates/keeper/src/sessions_ipc.rs`, DW-410). The bridge runner: `bridges-pane.tsx`
+gates the runner on `bridgeSidecar`, which is `cfg!(desktop)` (`ipc.rs:1430`);
+discovery, provisioning and health are on the phone since Story 66.1.
+Tasks: a task is one of keeper's own verbs and never a shell string
 (`keeper-sync/src/tasks.rs:148-161`, the closed `TaskKind`), so the wall is not a spawn;
 it is that a schedule needs a host that is awake, and a phone process is suspended the
 moment it leaves the foreground (NFR-57) — `keeper runs this — only while keeper is
@@ -934,8 +1182,10 @@ What it is made of, all under `src-tauri/crates/keeper/gen/apple/` unless stated
   the app's own Swift objects at link time; the `extern` block compiles on the Linux
   host and only the Mac link proves it.
 - `KeeperIsland/KeeperIslandAttributes.swift` — the `ActivityAttributes`, a member of
-  **both** targets (no App Group: data flows through ActivityKit, and an App Group is
-  needed only if the extension read the app's files, which it does not).
+  **both** targets (the island takes no App Group: data flows through ActivityKit, and
+  an App Group is needed only by an extension that reads the app's files — the
+  notification extension does, the island does not; the app's own App Group is
+  [Where keeper keeps its data](#where-keeper-keeps-its-data)).
 - `KeeperIsland/KeeperIslandBundle.swift`, `KeeperIsland/KeeperIslandLiveActivity.swift`,
   `KeeperIsland/Info.plist` — the widget-extension target `KeeperIsland`
   (`com.apple.widgetkit-extension`, bundle id `dev.tgorka.keeper.island`,
@@ -1011,6 +1261,92 @@ on its own remote copy, which proves the spec but commits nothing); and the one
 documented Tauri precedent for a Live Activity reports it working under `tauri ios
 build` and not under `tauri ios dev` (tauri-apps discussion #14555, read 2026-09-05),
 which the scripted path — a `build` — sidesteps rather than answers.
+
+### How a spoken turn ends
+
+Without turn models a spoken question is sent 1.8 s after the recogniser's last partial
+(`keeper_core::voice::END_OF_UTTERANCE_PAUSE`) — on the phone and the Mac alike. With the
+account's turn models loaded (Epic 97, story 97.1: Silero VAD and Smart Turn v3.2 from
+`_models/`, run through ONNX Runtime on the arm64 iPhone) a finished sentence ends the turn
+sooner (AD-411, story 97.2):
+
+1. **The tap's copy.** The capture's one tap (`start_capture`, `voice_ios.rs`) still appends
+   every buffer to the recognition request and meters it; it also copies channel 0 into a
+   buffer from a fixed pool (`keeper_core::voice::end_of_turn::Ear`), stamped with
+   `voice_log::now_ms` as the tap delivers it, and only while the turn is `Listening`. The
+   audio thread never allocates or waits for this: it only tries the pool's lock, and with the
+   lock busy or no free buffer the audio is dropped, counted, and the listener starts afresh, so
+   the pause decides that turn. Each buffer carries the listening it was heard in; one heard
+   in a listening that is over — the turn abandoned, barged in on, the models replaced, the
+   capture rebuilt — is skipped, and nothing made of it reaches the turn.
+2. **The listener.** One thread (`keeper-end-of-turn`) resamples the input node's rate to
+   16 kHz (windowed sinc), feeds 32 ms frames to the voice activity model, and runs
+   `EndOfTurn`: an onset is three frames at ≥ 0.5; speech ends at the first frame under 0.35
+   after ≥ 250 ms of speech; 224 ms later (the 200 ms hangover in whole frames) it asks the
+   end-of-turn model, unless speech started again. That model hears the turn from 500 ms before
+   its first onset, at most the last 8 s, as Smart Turn's log-mel features
+   (`keeper_ported::smart_turn`). A score ≥ 0.5 is `UtteranceEnd`; below, nothing happens and
+   the pause decides. The thread hands its events to the turn one at a time, in order, and the
+   turn takes each under its lock only if it is from the listening still under way.
+3. **The last words.** `UtteranceEnd` takes a `Listening` turn that heard words to `Finishing`
+   and the port carries out `FinishRecognition`: the request leaves the tap's slot and gets
+   `endAudio` — not `cancel` — so the recogniser delivers its final transcript, which is sent.
+   The port reports the moment `endAudio` ran; if the final transcript has not come within
+   600 ms (`FINAL_WORDS_WAIT`) of that moment, the last partial is sent. A port with no request
+   to end says so and the partial is sent at once; one that has not reported within 600 ms of
+   the decision is waited for no longer. Partials meanwhile do not extend the wait. The port
+   rolls to a fresh request on the final words, or 600 ms after `endAudio` — its routine rolls
+   (after 45 s at a quiet moment, at 58 s regardless) wait for that. The microphone and the
+   audio session stay up throughout, and the surface draws `Finishing` as listening.
+
+**Reading it back.** Every sent question leaves one `turn_end` row in the ring, its detail a JSON
+record — `ended_by` (`model`, `pause` or `recogniser`), `speech_end_ms`, `utterance_end_ms`
+(the decision), `finish_recognition_ms` (when `endAudio` ran, as the port reported it),
+`final_words_ms` (absent when the 600 ms ran out), `sent_ms` — and the
+same line, `voice turn_end {…}`, in the app log while debug mode is on
+(`<container>/Library/Logs/keeper/keeper.log`). A device run is measured from that file:
+`KEEPER_VOICE_LOG=<keeper.log> cargo test -p keeper-core --test voice_timings
+measure_a_device_run -- --ignored --nocapture` prints NFR-114's figures and refuses fewer than
+twenty turns ([agents.md](agents.md) § *Measured: a spoken turn's end*).
+
+### When you talk over an answer
+
+Speech over an answer pauses it; it never stops it first (AD-411; AD-208 amended by ruling R14).
+The turn moves to `Paused` with `PauseSpeaking` alone, and the port carries it out as
+`pauseSpeakingAtBoundary:` immediate — mid-word, the queue kept, the `speaking` flag up, so what
+you go on saying is still barge-in on the same recognition request. With the turn models, the
+same listener that ends a spoken question hears you over the answer — only on a capture with
+voice processing, since one without it hears keeper's own voice: its onset (three frames at
+≥ 0.5, the first of them `onset_ms`) pauses the answer before the recogniser has a word, and its
+speech end says how long you spoke. Without them the recogniser's first words pause it. What you
+said then decides (`keeper_core::voice::backchannel`), in the language recognition runs in:
+
+- **A backchannel resumes the answer** (`ContinueSpeaking`: a fresh recognition request, then
+  `continueSpeaking`). The whole utterance, folded like the stop phrase, is on the list —
+  English: mhm, uh-huh, yeah, yep, aha, okay, right; Polish: mhm, aha, tak, no, okej, jasne; any
+  other language: mhm, aha. With the turn models, wordless speech under 600 ms is one too, and
+  an onset that comes to no words in under 250 ms — or never comes to an end the model hears —
+  resumes as a false onset (echo or a click, counted apart). Words are the list's to judge, so a
+  short "no" in English is not a backchannel.
+- **The stop phrase ends the answer**, as it did while speaking.
+- **Anything else is your next question**: the answer stops (`StopSpeaking`), and the words are
+  sent — "no, wait" in English, "nie, czekaj" in Polish.
+
+Words are decided when the recogniser's final words come, or 600 ms after the voice activity
+model heard you stop, or 800 ms after the last thing heard (always, without the models). While
+paused the answer keeps arriving and queueing — a sentence that arrives when the synthesiser had
+nothing left to pause is paused again as it is queued, so it waits too — and the surface still
+draws it as speaking. The
+port reports no end of the answer while paused; one that ran out as the pause landed ends once it
+continues. Each utterance the synthesiser reads to its end is reported by its delegate
+(`voice_synthesizer.rs`), and when the answer was an agent's and you stopped it or asked over it,
+the agent is told where you stopped listening before your next question goes in
+([agents.md](agents.md) § *Talking to Nixi*). Every pause leaves one `pause` row in the ring and
+the line `voice pause {…}` in the app log — `decision` (`backchannel_duration`,
+`backchannel_words`, `stop`, `question`, `false_onset`), `onset_ms`, `pause_ms`, `speech_end_ms`,
+`final_words_ms`, `resume_ms` — and every answer read a `voice spoken {"spoken_ms":…}` line, which
+`measure_a_pause_run` turns into NFR-114's backchannel figures ([agents.md](agents.md) §
+*Measured: talking over an answer*).
 
 ### A turn that finishes without the screen
 
@@ -1122,8 +1458,9 @@ port ever emits (`turn.rs:109-112`), and `(Speaking, StopHeard)` is `Idle` with
 `[StopSpeaking, ReleaseMicrophone]` (`turn.rs:212-214`); because `StopHeard` counts as
 the turn ending (`mod.rs:476-483`), the wake phrase is re-armed on the way out
 (`:485-491`, `OpenMicrophone` pushed after the release — D-13's rule). Any other speech
-mid-answer keeps FR-403's shape, `Listening` with `[StopSpeaking, OpenMicrophone]`
-(`turn.rs:204-210`). The word is `WakePhrase::parse_stop` (`phrase.rs:112-114`): the wake
+mid-answer kept FR-403's shape, `Listening` with `[StopSpeaking, OpenMicrophone]`
+(`turn.rs:204-210`) — until story 97.3, which pauses first and lets the words decide (*When
+you talk over an answer*, above); the stop phrase is matched while `Paused` too. The word is `WakePhrase::parse_stop` (`phrase.rs:112-114`): the wake
 phrase's normalisation and word rules with a shorter letter minimum —
 `STOP_MIN_LETTERS = 3` (`:50`) instead of five — because the word people say to stop
 something must be allowed, and a false match costs the rest of an answer rather than an

@@ -7,11 +7,15 @@ import type {
   BridgeNetworkVm,
   InboxBatch,
   InboxRoomVm,
+  SessionDetailVm,
+  SessionRootVm,
+  SessionRowVm,
   SyncProfileVm,
 } from "@/lib/ipc/client";
 import { accountStore, NO_ACCOUNT } from "@/lib/stores/account";
 import { accountStatusStore } from "@/lib/stores/account-status";
 import { accountsStore } from "@/lib/stores/accounts";
+import { agentRoomsStore } from "@/lib/stores/agent-rooms";
 import { archiveRoomsStore } from "@/lib/stores/archive-rooms";
 import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
 import { composerStore } from "@/lib/stores/composer";
@@ -19,6 +23,7 @@ import { detailStore } from "@/lib/stores/detail-ui";
 import { favoritesRoomsStore } from "@/lib/stores/favorites-rooms";
 import { leadingDrawerStore } from "@/lib/stores/leading-drawer";
 import { pinsRoomsStore } from "@/lib/stores/pins-rooms";
+import { platformStore } from "@/lib/stores/platform";
 import { primaryViewStore } from "@/lib/stores/primary-view";
 import { roomsStore } from "@/lib/stores/rooms";
 import { searchSurfaceStore } from "@/lib/stores/search-surface";
@@ -42,6 +47,10 @@ const bridgeDiscover = vi.fn(
 );
 const bbctlAvailability = vi.fn();
 const syncProfiles = vi.fn(async (): Promise<SyncProfileVm[]> => []);
+// The Sessions surface (98.2): the zone, its sessions and one session's board.
+const sessionsRoots = vi.fn(async (): Promise<SessionRootVm[]> => []);
+const sessionsList = vi.fn(async (): Promise<SessionRowVm[]> => []);
+const sessionsDetail = vi.fn(async (): Promise<SessionDetailVm | null> => null);
 /** A read that never answers, for the voice surfaces (AD-179: unanswered renders nothing). */
 const pending = new Promise<never>(() => {});
 vi.mock("@/lib/ipc/client", async (importOriginal) => {
@@ -121,6 +130,11 @@ vi.mock("@/lib/ipc/client", async (importOriginal) => {
     // Unanswered (the mock never resolves), so no voice affordance renders (AD-179).
     voiceAvailability: vi.fn(() => pending),
     voiceWakeGet: vi.fn(() => pending),
+    // The Sessions surface (98.2), reached by the drawer enumeration below.
+    sessionsRoots: () => sessionsRoots(),
+    sessionsList: () => sessionsList(),
+    sessionsDetail: () => sessionsDetail(),
+    listenSessionsChanged: vi.fn(async () => () => {}),
   };
 });
 
@@ -147,9 +161,16 @@ vi.mock("@tauri-apps/api/webview", () => ({
 }));
 
 import { dispatchPaletteAction } from "@/components/command-palette/actions";
-import { PhoneShell } from "@/components/layout/phone-shell";
+import { PhoneShell, TABLET_NO_ROOM_SENTENCE } from "@/components/layout/phone-shell";
+import { PROXY_DOCK_LABEL } from "@/components/layout/proxy-dock-sheet";
 import { sidebarViews } from "@/components/layout/sidebar-pane";
 import { COPY_SUBMIT_LABEL } from "@/components/layout/sync-pane";
+import {
+  SESSIONS_PHONE_OPEN_ROOM,
+  SESSIONS_PHONE_ROOM_ABSENT,
+  SESSIONS_PHONE_ROOMS_READING,
+  sessionsPhoneOpenCardRoom,
+} from "@/components/sessions/sessions-phone-pane";
 import {
   SYNC_ADD_TITLE,
   SYNC_CHOOSE_FOLDER_LABEL,
@@ -157,6 +178,8 @@ import {
   SYNC_TOKEN_LABEL,
 } from "@/components/sync/add-folder-form";
 import { isChatWindowView, phoneRoutesView } from "@/lib/phone-surfaces";
+import { resetSessionsListStoreForTest } from "@/lib/stores/sessions-list";
+import { resetSessionsRootsStoreForTest } from "@/lib/stores/sessions-roots";
 
 const account: AccountVm = {
   accountId: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
@@ -194,25 +217,48 @@ function inboxRoom(roomId: string, displayName: string): InboxRoomVm {
  * `(prefers-reduced-motion: reduce)` query for `useReducedMotion` (Story 13.2).
  * Tests default to reduced motion so pops unmount synchronously (jsdom never
  * fires `transitionend`); motion-specific tests pass `reducedMotion: false`
- * and end transitions by hand.
+ * and end transitions by hand. `resize` changes the viewport and fires every
+ * registered `change` listener, as the on-screen keyboard does.
  */
 const originalMatchMedia = window.matchMedia;
-function mockViewportWidth(width: number, { reducedMotion = true } = {}) {
-  window.matchMedia = vi.fn().mockImplementation((query: string) => {
-    const match = query.match(/max-width:\s*(\d+)px/);
-    const maxWidth = match ? Number(match[1]) : Number.POSITIVE_INFINITY;
-    const matches = query.includes("prefers-reduced-motion") ? reducedMotion : width <= maxWidth;
-    return {
-      matches,
-      media: query,
-      onchange: null,
-      addEventListener: vi.fn(),
-      removeEventListener: vi.fn(),
-      addListener: vi.fn(),
-      removeListener: vi.fn(),
-      dispatchEvent: vi.fn(),
-    };
-  });
+function mockViewportWidth(width: number, { reducedMotion = true, height = 844 } = {}) {
+  const viewport = { width, height };
+  const listeners = new Set<() => void>();
+  window.matchMedia = vi.fn().mockImplementation((query: string) => ({
+    // Every `max-width`/`min-width`/`min-height` feature joined by `and` must
+    // hold, as in a browser.
+    get matches() {
+      return query.includes("prefers-reduced-motion")
+        ? reducedMotion
+        : query.split(" and ").every((feature) => {
+            const [, name, px] = feature.match(/(max-width|min-width|min-height):\s*(\d+)px/) ?? [];
+            const bound = Number(px);
+            return name === "max-width"
+              ? viewport.width <= bound
+              : name === "min-width"
+                ? viewport.width >= bound
+                : name === "min-height"
+                  ? viewport.height >= bound
+                  : true;
+          });
+    },
+    media: query,
+    onchange: null,
+    addEventListener: (_: string, listener: () => void) => listeners.add(listener),
+    removeEventListener: (_: string, listener: () => void) => listeners.delete(listener),
+    addListener: vi.fn(),
+    removeListener: vi.fn(),
+    dispatchEvent: vi.fn(),
+  }));
+  return {
+    resize(nextWidth: number, nextHeight: number) {
+      viewport.width = nextWidth;
+      viewport.height = nextHeight;
+      for (const listener of listeners) {
+        listener();
+      }
+    },
+  };
 }
 
 /** Render the stack and stream a set of inbox rows through the captured emitter. */
@@ -1414,8 +1460,9 @@ describe("PhoneShell keyboard inset (Story 13.5)", () => {
 });
 
 describe("PhoneShell view surfaces (Story 66.1, AD-197)", () => {
-  /** The tier a phone hydrates to once its folder links (Epic 66): only what the OS refuses is off. */
-  const PHONE_WITH_FOLDER = { ...DEFAULT_CAPABILITIES, bots: true, sync: true };
+  /** The tier a phone hydrates to once its folder links (Epic 66) and that folder has a
+   *  sessions zone (98.2): only what the OS refuses is off. */
+  const PHONE_WITH_FOLDER = { ...DEFAULT_CAPABILITIES, bots: true, sync: true, sessions: true };
 
   const draft: ApprovalDraftVm = {
     accountId: account.accountId,
@@ -1612,6 +1659,294 @@ describe("PhoneShell view surfaces (Story 66.1, AD-197)", () => {
       ).toBeVisible();
       fireEvent.click(within(level).getByRole("button", { name: "Back to Inbox" }));
       await waitFor(() => expect(document.querySelector('[data-level="1"]')).toBeNull());
+    }
+  });
+});
+
+describe("PhoneShell sessions board (98.2 #5, UX-DR145)", () => {
+  const PHONE_WITH_ZONE = { ...DEFAULT_CAPABILITIES, bots: true, sync: true, sessions: true };
+  const SESSION_ROOM = "!session-room:example.org";
+  /** A second account on this phone: the one whose Agents window holds the session's room. */
+  const APPROVER_ACCOUNT = "01BX5ZZKBKACTAV9WEVGEMMVRZ";
+
+  const root: SessionRootVm = {
+    id: "p1",
+    name: "tgdrive",
+    subfolder: "60-sessions",
+    root: "/var/mobile/sync/p1/60-sessions",
+    indexed: true,
+    activeCount: 1,
+    unreadCount: 0,
+  };
+  const row: SessionRowVm = {
+    id: "01J8SESSIONAAAAAAAAAAAAAAA",
+    path: "active/2026-10-12-budget",
+    title: "Budget review",
+    status: "active",
+    archivedYear: null,
+    workspaceMs: null,
+    recordMs: null,
+    lastLogDate: "",
+    lastLogLine: "",
+    snippet: "",
+    tags: [],
+    pinned: false,
+    unread: false,
+    origin: "local",
+    headRev: "rev",
+    conflict: false,
+    lineage: false,
+  };
+  function detail(room: string | null): SessionDetailVm {
+    return {
+      id: row.id,
+      path: row.path,
+      title: row.title,
+      status: "active",
+      archivedYear: null,
+      pinned: false,
+      tags: [],
+      properties: [],
+      continues: [],
+      continuedBy: [],
+      summary: "",
+      log: [],
+      shape: "flat",
+      tasks: [
+        {
+          id: "path:cards/approve-the-budget.md",
+          relPath: "cards/approve-the-budget.md",
+          title: "Approve the budget line",
+          status: "todo",
+          order: 1,
+          orderIsOwn: true,
+          tags: ["task"],
+          unstableIdentity: true,
+          agent: {
+            run: { value: "blocked", readable: true },
+            assignee: { value: "tola-grey", readable: true },
+            host: null,
+            requestedBy: null,
+            schedule: null,
+            lastRun: null,
+            workflow: null,
+            scheduledBy: null,
+            integrity: null,
+            runningOn: null,
+            waiting: null,
+          },
+        },
+      ],
+      room,
+    };
+  }
+
+  /** Open Sessions, then the session's board. */
+  async function openBoard() {
+    capabilitiesStore.getState().applySnapshot(PHONE_WITH_ZONE);
+    render(<PhoneShell />);
+    act(() => {
+      primaryViewStore.getState().setView("sessions");
+    });
+    fireEvent.click(await screen.findByRole("button", { name: new RegExp(row.title) }));
+    return await screen.findByRole("button", {
+      name: sessionsPhoneOpenCardRoom("Approve the budget line"),
+    });
+  }
+
+  beforeEach(() => {
+    resetSessionsRootsStoreForTest();
+    resetSessionsListStoreForTest();
+    agentRoomsStore.getState().clear();
+    sessionsRoots.mockResolvedValue([root]);
+    sessionsList.mockResolvedValue([row]);
+    sessionsDetail.mockResolvedValue(detail(SESSION_ROOM));
+  });
+
+  it("a card opens its session's room on the account that holds it, over the board", async () => {
+    const card = await openBoard();
+    act(() => {
+      agentRoomsStore.getState().applyBatch({
+        ops: [
+          {
+            op: "reset",
+            rooms: [
+              { ...inboxRoom("!other:example.org", "Another agent"), accountId: account.accountId },
+              { ...inboxRoom(SESSION_ROOM, "Tola — budget"), accountId: APPROVER_ACCOUNT },
+            ],
+          },
+        ],
+        total: 2,
+      });
+    });
+
+    fireEvent.click(card);
+
+    // The room where 93.3's card is decided, on the account whose window holds it.
+    expect(roomsStore.getState().selected).toEqual({
+      accountId: APPROVER_ACCOUNT,
+      roomId: SESSION_ROOM,
+    });
+    // Backing out of the room lands on the board again, not on a chat list.
+    // The room's back button names where it goes: the board, not the Inbox.
+    fireEvent.click(within(stackLevel(1)).getByRole("button", { name: "Back to Sessions" }));
+    await waitFor(() => expect(roomsStore.getState().selected).toBeNull());
+    expect(primaryViewStore.getState().view).toBe("sessions");
+    expect(
+      await screen.findByRole("button", {
+        name: sessionsPhoneOpenCardRoom("Approve the budget line"),
+      }),
+    ).toBeVisible();
+  });
+
+  it("says so, and opens nothing, when no account on this phone is in the room", async () => {
+    const card = await openBoard();
+    act(() => {
+      agentRoomsStore.getState().applyBatch({
+        ops: [{ op: "reset", rooms: [inboxRoom("!other:example.org", "Another agent")] }],
+        total: 1,
+      });
+    });
+
+    fireEvent.click(card);
+
+    expect(roomsStore.getState().selected).toBeNull();
+    expect(await screen.findByText(SESSIONS_PHONE_ROOM_ABSENT)).toHaveAttribute("role", "status");
+  });
+
+  it("before the Agents window has arrived, says keeper is still reading, not that the room is absent", async () => {
+    const card = await openBoard();
+
+    fireEvent.click(card);
+
+    expect(roomsStore.getState().selected).toBeNull();
+    expect(await screen.findByText(SESSIONS_PHONE_ROOMS_READING)).toHaveAttribute("role", "status");
+    expect(screen.queryByText(SESSIONS_PHONE_ROOM_ABSENT)).toBeNull();
+  });
+
+  it("the board's page survives the room round trip", async () => {
+    const card = await openBoard();
+    act(() => {
+      agentRoomsStore.getState().applyBatch({
+        ops: [
+          {
+            op: "reset",
+            rooms: [{ ...inboxRoom(SESSION_ROOM, "Tola — budget"), accountId: APPROVER_ACCOUNT }],
+          },
+        ],
+        total: 1,
+      });
+    });
+    const columns = screen.getByRole("navigation", { name: "Columns" });
+    fireEvent.click(within(columns).getByRole("button", { name: /^Deferred/ }));
+
+    fireEvent.click(card);
+    // The room covers the board, and the board's level goes once its slide ends.
+    await waitFor(() => expect(screen.queryByRole("navigation", { name: "Columns" })).toBeNull());
+    fireEvent.click(within(stackLevel(1)).getByRole("button", { name: "Back to Sessions" }));
+
+    const back = await screen.findByRole("navigation", { name: "Columns" });
+    expect(within(back).getByRole("button", { name: /^Deferred/ })).toHaveAttribute(
+      "aria-current",
+      "true",
+    );
+  });
+
+  it("a person's session has no room, so its cards open nothing", async () => {
+    sessionsDetail.mockResolvedValue(detail(null));
+    capabilitiesStore.getState().applySnapshot(PHONE_WITH_ZONE);
+    render(<PhoneShell />);
+    act(() => {
+      primaryViewStore.getState().setView("sessions");
+    });
+    fireEvent.click(await screen.findByRole("button", { name: new RegExp(row.title) }));
+
+    expect(await screen.findByText("Approve the budget line")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: sessionsPhoneOpenCardRoom("Approve the budget line") }),
+    ).toBeNull();
+    expect(screen.queryByRole("button", { name: SESSIONS_PHONE_OPEN_ROOM })).toBeNull();
+  });
+});
+
+// ── The Android tablet (Epic 98, story 98.3 #5, UX-DR146) ─────────────────────
+describe("PhoneShell on an Android tablet", () => {
+  // Android's answer: every `cfg!(desktop)` flag false, the folder flags on;
+  // whether the device is a tablet is Rust's fact (`PlatformVm.tablet`).
+  const ANDROID = { ...DEFAULT_CAPABILITIES, bots: true, sync: true, notes: true, sessions: true };
+  const onDevice = (tablet: boolean) => {
+    capabilitiesStore.getState().applySnapshot(ANDROID);
+    platformStore.getState().applySnapshot({ urlForm: "localhost", tablet, disclosure: null });
+  };
+
+  afterEach(() => {
+    platformStore.getState().applySnapshot({ urlForm: "scheme", tablet: false, disclosure: null });
+  });
+
+  it("on its side, keeps the rooms list live beside the open room and offers the dock", async () => {
+    mockViewportWidth(1280, { height: 800 });
+    onDevice(true);
+    await renderWithRooms([{ roomId: "!r1:example.org", displayName: "Room One" }]);
+    expect(screen.getByText(TABLET_NO_ROOM_SENTENCE)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: PROXY_DOCK_LABEL })).toBeInTheDocument();
+
+    act(() => {
+      roomsStore.getState().selectRoom(selection);
+    });
+    await waitFor(() => expect(screen.getByRole("main")).toBeInTheDocument());
+    // Side by side: the Inbox is neither covered nor inert, so its rows stay
+    // reachable while the room is open.
+    expect(stackLevel(0)).not.toHaveAttribute("inert");
+    expect(stackLevel(0).style.transform).toBe("translateX(0)");
+    expect(stackLevel(1)).not.toHaveAttribute("inert");
+    expect(screen.getByText("Room One")).toBeInTheDocument();
+  });
+
+  it("keeps the Assistant sheet open and the rooms list beside the room when the keyboard opens", async () => {
+    const viewport = mockViewportWidth(1280, { height: 800 });
+    onDevice(true);
+    await renderWithRooms([{ roomId: "!r1:example.org", displayName: "Room One" }]);
+    act(() => {
+      roomsStore.getState().selectRoom(selection);
+    });
+    await waitFor(() => expect(screen.getByRole("main")).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: PROXY_DOCK_LABEL }));
+    expect(await screen.findByTestId("proxy-dock-sheet")).toBeInTheDocument();
+
+    // A landscape keyboard takes well over 200 dp of the layout viewport
+    // (`interactive-widget=resizes-content`).
+    act(() => viewport.resize(1280, 450));
+    expect(screen.getByTestId("proxy-dock-sheet")).toBeInTheDocument();
+    expect(stackLevel(0)).not.toHaveAttribute("inert");
+    expect(stackLevel(0).style.transform).toBe("translateX(0)");
+  });
+
+  it("upright, is the phone's one-level stack, with the dock still offered", async () => {
+    mockViewportWidth(800, { height: 1280 });
+    onDevice(true);
+    await renderWithRooms([{ roomId: "!r1:example.org", displayName: "Room One" }]);
+    expect(screen.getByRole("button", { name: PROXY_DOCK_LABEL })).toBeInTheDocument();
+    expect(screen.queryByText(TABLET_NO_ROOM_SENTENCE)).not.toBeInTheDocument();
+
+    act(() => {
+      roomsStore.getState().selectRoom(selection);
+    });
+    await waitFor(() => expect(screen.getByRole("main")).toBeInTheDocument());
+    expect(stackLevel(0)).toHaveAttribute("inert");
+  });
+
+  it("offers no dock on a phone, upright, on its side, or with a tablet-sized viewport", async () => {
+    onDevice(false);
+    for (const [width, height] of [
+      [390, 844],
+      [844, 390],
+      [1280, 800],
+    ]) {
+      mockViewportWidth(width, { height });
+      const view = await renderWithRooms([{ roomId: "!r1:example.org", displayName: "Room One" }]);
+      expect(screen.queryByRole("button", { name: PROXY_DOCK_LABEL })).toBeNull();
+      expect(screen.queryByText(TABLET_NO_ROOM_SENTENCE)).toBeNull();
+      view.unmount();
     }
   });
 });

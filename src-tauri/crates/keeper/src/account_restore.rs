@@ -702,7 +702,6 @@ fn drives_added(app: Option<&AppHandle>) {
     let Some(app) = app else {
         return;
     };
-    #[cfg(desktop)]
     crate::sessions_root::refresh(app);
     crate::ipc::spawn_recordings_index_rebuild(
         app.state::<crate::ipc::AppState>().inner(),

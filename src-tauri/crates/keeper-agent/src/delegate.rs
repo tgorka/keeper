@@ -64,14 +64,14 @@ use keeper_core::bots::tools::ToolOutcome;
 use keeper_core::sessions::model::ARTIFACTS_DIR;
 use keeper_sync::browse;
 use matrix_sdk::ruma::{
-    OwnedRoomId, OwnedTransactionId, OwnedUserId, RoomId, TransactionId, UserId,
+    EventId, OwnedRoomId, OwnedTransactionId, OwnedUserId, RoomId, TransactionId, UserId,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
 use ulid::Ulid;
 
 use crate::agent::RoomFuture;
-use crate::matrix_sink::{EditPort, SendFuture};
+use crate::matrix_sink::{EditPort, MembersFuture, SendFuture};
 use crate::rooms::{BriefRoom, Known, KnownAgent};
 use crate::sessions::verbs::VerbError;
 use crate::sinks::{room_audience, Blocked, CallAudit, Sinks, Withheld};
@@ -94,6 +94,8 @@ pub enum ReplyOffer {
     Delegated,
     /// A proxy's relay of its person's answer to an open ask (R100).
     Relay,
+    /// A gate's answer to its outside system's request (codemap Q6).
+    Gate,
 }
 
 /// What a call says on a host with no room to make one in.
@@ -153,6 +155,18 @@ pub fn specs(delegate: bool, reply: ReplyOffer) -> Vec<ToolSpec> {
                 "additionalProperties": false
             }),
         }),
+        ReplyOffer::Gate => specs.push(ToolSpec {
+            name: REPLY.to_owned(),
+            description: "Answer the outside system's request: your text goes to it as one message in its room. Answer once; a request you do not answer is refused.".to_owned(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string", "description": "The answer, whole."}
+                },
+                "required": ["text"],
+                "additionalProperties": false
+            }),
+        }),
         ReplyOffer::Relay => specs.push(ToolSpec {
             name: REPLY.to_owned(),
             description: "Relay your person's answer to a question another agent asked them through you, once they have answered it here. What goes to the asking agent is your person's own message, as they wrote it — never your words: name the question's id as ask, and, when they said more than one thing since the question, quote the message that answers it as text.".to_owned(),
@@ -177,19 +191,24 @@ pub type BoolFuture<'a> = Pin<Box<dyn Future<Output = bool> + Send + 'a>>;
 pub type EventsFuture<'a> = Pin<Box<dyn Future<Output = Result<Vec<Value>, String>> + Send + 'a>>;
 /// A boxed future of a room change, or the homeserver's answer refusing it.
 pub type UnitFuture<'a> = Pin<Box<dyn Future<Output = Result<(), AgentMatrixError>> + Send + 'a>>;
-/// A boxed future of a room's members, joined or invited.
-pub type MembersFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<BTreeSet<OwnedUserId>, String>> + Send + 'a>>;
 /// A boxed future of what a host reads of a room a brief arrived in.
 pub type BriefRoomFuture<'a> = Pin<Box<dyn Future<Output = Option<BriefRoom>> + Send + 'a>>;
+/// A boxed future of an encrypted upload's `EncryptedFile` JSON.
+pub type FileFuture<'a> = Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>>;
+/// A boxed future of the bytes an encrypted file decrypts to.
+pub type BytesFuture<'a> = Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send + 'a>>;
+/// A boxed future of a state event as the homeserver holds it now: its
+/// sender and content, `None` when there is none.
+pub type StateFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Option<(OwnedUserId, Value)>, String>> + Send + 'a>>;
 
 /// The rooms a delegation goes through.
 pub trait DelegationPort: Send + Sync {
     /// Every agent of a drive this host mounts.
     fn known(&self) -> Arc<Known>;
-    /// A session room of `kind` — a delegation's, or a workflow's run
-    /// (R104) — named `name`, made by the agent, `invite` invited and
-    /// `agents` at power 50.
+    /// A session room of `kind` — a delegation's, a workflow's run, or a
+    /// session its host makes for its own agent (R104) — named `name`, made
+    /// by the agent, `invite` invited and `agents` at power 50.
     fn create<'a>(
         &'a self,
         kind: SessionKind,
@@ -212,6 +231,45 @@ pub trait DelegationPort: Send + Sync {
     /// first: paged back as far as that brief, so a reply behind any number
     /// of later events is found (R55).
     fn since_brief<'a>(&'a self, room: &'a RoomId, me: &'a UserId) -> EventsFuture<'a>;
+    /// `room`'s events after `after` — after its first when `None` — that
+    /// carry a Paseo run's completion and whose senders' devices sealed
+    /// them, oldest first, paged back as far as `after` or the room's
+    /// beginning: never a partial list — a history that could not be read
+    /// back that far, or that holds an event of `teller`'s this copy cannot
+    /// decrypt, is an error (R277, R283).
+    fn completions<'a>(
+        &'a self,
+        room: &'a RoomId,
+        after: Option<&'a EventId>,
+        teller: &'a UserId,
+    ) -> EventsFuture<'a>;
+    /// Encrypt `bytes` and upload them: their `EncryptedFile` JSON.
+    fn upload(&self, bytes: Vec<u8>) -> FileFuture<'_>;
+    /// The bytes of the encrypted file `file`.
+    fn download<'a>(&'a self, file: &'a Value) -> BytesFuture<'a>;
+    /// Put the state event `(event_type, key)` of `room`.
+    fn put_state<'a>(
+        &'a self,
+        room: &'a RoomId,
+        event_type: &'a str,
+        key: &'a str,
+        content: Value,
+    ) -> SendFuture<'a>;
+    /// The state event `(event_type, key)` of `room` as the homeserver holds
+    /// it now, never a sync's cached copy.
+    fn state<'a>(&'a self, room: &'a RoomId, event_type: &'a str, key: &'a str) -> StateFuture<'a>;
+    /// `room`'s events that publish a capture of the Paseo run end
+    /// `completion` or say it was delivered, whose senders' devices sealed
+    /// them, oldest first, read back to the room's beginning: never a
+    /// partial list — a history that could not be read back that far, or
+    /// that holds an event of `agent`'s this copy cannot decrypt or link to
+    /// it, is an error (R279, R283, R293).
+    fn captures<'a>(
+        &'a self,
+        room: &'a RoomId,
+        completion: &'a str,
+        agent: &'a UserId,
+    ) -> EventsFuture<'a>;
     /// What `room` is now, as a brief's admission reads it (R93).
     fn brief_room<'a>(&'a self, room: &'a RoomId) -> BriefRoomFuture<'a>;
     /// Route `child`'s joins and replies to `parent`'s worker from now on;
@@ -276,6 +334,84 @@ pub struct Delegator {
     pub subfolder: String,
     /// The delegating session's dispatch chain (R76).
     pub chain: Vec<OwnedUserId>,
+    /// A gate session's: who it may hand work to and who decides it
+    /// (codemap Q2, Q12); `None` in every other session.
+    pub gate: Option<GateDelegator>,
+}
+
+/// What a gate session's `delegate` is held to (codemap Q2, Q4, Q12).
+#[derive(Debug, Clone)]
+pub struct GateDelegator {
+    /// Its `[gate].delegates`, `<drive>/<id>`: the only agents a ticket
+    /// can reach.
+    pub delegates: Vec<String>,
+    /// The people who decide its tickets, invited to every room it
+    /// delegates into as observers, whatever the label's readers.
+    pub approvers: Vec<OwnedUserId>,
+    /// Its room was made in clear: no device draws a card there.
+    pub clear: bool,
+}
+
+/// What a gate's `delegate` that would open a second round says.
+pub const GATE_ONE_ROUND: &str =
+    "A gate hands each request on once, as a new delegation: it does not send another round.";
+/// What a gate's `delegate` handing on a card says.
+pub const GATE_NO_SOURCE: &str = "A gate hands on the request it serves, never a card.";
+/// What a gate's `delegate` whose card sets a schedule or a workflow says
+/// (codemap Q7: refused outright, never asked).
+pub const GATE_NO_SCHEDULE: &str =
+    "A gate's delegation never sets a schedule or a workflow. Nothing was handed on.";
+/// What a gate's `delegate` in a clear room says: a card there reaches no
+/// device, so nobody could decide it.
+pub const GATE_CLEAR: &str = "This gate's room is not encrypted, so nobody can be asked to approve a hand-off there. Nothing was handed on.";
+/// What a gate's `delegate` that would run unasked says: never.
+pub const GATE_UNASKED: &str =
+    "A gate's delegation waits for a person's decision; this one could not ask, so nothing was handed on.";
+
+/// What a gate's `delegate` to an agent its `[gate].delegates` does not
+/// list says (99.2 #4): blocked, never asked.
+pub fn not_a_delegate(name: &str) -> String {
+    format!("{name} is not one of this gate's delegates, so nothing was handed on. A gate hands work only to the agents its [[gate]] lists.")
+}
+
+/// Who a gate's delegation room invites (codemap Q2): its target, then the
+/// gate's approvers as observers.
+pub fn gate_invites(target: &UserId, approvers: &[OwnedUserId]) -> Vec<OwnedUserId> {
+    let mut invites = vec![target.to_owned()];
+    invites.extend(approvers.iter().filter(|person| *person != target).cloned());
+    invites
+}
+
+/// The agent a `delegate` call's `args` names, as written.
+pub fn agent_of(args: &str) -> Option<String> {
+    parse_args(args).ok().map(|args| args.agent)
+}
+
+/// Why a gate's `delegate` call `args` is refused before anything else is
+/// asked, if it is: a next round, a card handed on, a card that schedules,
+/// no request served, or a clear room.
+fn gate_refusal(
+    args: &DelegateArgs,
+    gate: &GateDelegator,
+    serving: Option<&crate::gate::Serving>,
+) -> Option<String> {
+    let schedules = args
+        .card
+        .as_ref()
+        .is_some_and(|card| card.schedule.is_some() || card.workflow.is_some());
+    if args.session.is_some() {
+        Some(GATE_ONE_ROUND.to_owned())
+    } else if args.source.is_some() {
+        Some(GATE_NO_SOURCE.to_owned())
+    } else if schedules {
+        Some(GATE_NO_SCHEDULE.to_owned())
+    } else if serving.is_none() {
+        Some(crate::gate::NO_SUCH_REQUEST.to_owned())
+    } else if gate.clear {
+        Some(GATE_CLEAR.to_owned())
+    } else {
+        None
+    }
 }
 
 /// What a running turn's tools read of its session: the label now, which a
@@ -302,6 +438,11 @@ pub trait TurnView: Sync {
     /// included — and its limit. A helper stops at it as the run's next
     /// round would (Q12, R111, R214).
     fn session_budget(&self) -> Option<(u64, u64)>;
+    /// The ids of the Paseo runs this session's own successful
+    /// `create_agent` calls started on `broker` (Q14).
+    fn paseo_started(&self, broker: &str) -> std::collections::BTreeSet<String>;
+    /// This follow session's run end, once captured (R275).
+    fn paseo_ended(&self) -> Option<keeper_core::agents::log::PaseoBody>;
 }
 
 #[derive(Debug, Deserialize)]
@@ -734,6 +875,8 @@ pub struct DelegateTools<'t> {
     /// A workflow's run: the outputs it declared, session-relative, each
     /// checked when it replies (R107).
     pub outputs: Vec<String>,
+    /// A gate's turn: the request its `reply` answers (codemap Q6).
+    pub serving: Option<crate::gate::Serving>,
     lines: Mutex<Vec<LineBody>>,
 }
 
@@ -762,8 +905,14 @@ impl<'t> DelegateTools<'t> {
             offer_delegate,
             sinks,
             outputs: Vec::new(),
+            serving: None,
             lines: Mutex::new(Vec::new()),
         }
+    }
+
+    /// The request a gate's turn answers.
+    pub fn serving(self, serving: Option<crate::gate::Serving>) -> DelegateTools<'t> {
+        DelegateTools { serving, ..self }
     }
 
     /// The outputs a workflow's run declared, checked at its reply.
@@ -800,6 +949,7 @@ impl<'t> DelegateTools<'t> {
             reason: Some(reason.clone()),
             reply: None,
             window: None,
+            approval: None,
         }));
         refused(reason)
     }
@@ -835,6 +985,7 @@ impl<'t> DelegateTools<'t> {
                     refused("reply relays your person's answer: name the question's id as ask.")
                 }
                 (ReplyOffer::Delegated, None) => self.reply(wire.arguments.as_ref(), audit),
+                (ReplyOffer::Gate, None) => self.answer(wire.arguments.as_ref(), audit),
                 (_, Some(_)) => refused(crate::ask::NO_RELAY),
                 (ReplyOffer::None, None) => refused(NOT_DELEGATED),
             },
@@ -937,6 +1088,14 @@ impl<'t> DelegateTools<'t> {
         let Some(port) = self.port.clone() else {
             return refused(NO_ROOMS);
         };
+        // A gate hands its request on once, to a listed agent, when a person
+        // decides (codemap Q4, Q7): what it may never do is refused first.
+        let gate = self.from.gate.as_ref();
+        if let Some(refusal) =
+            gate.and_then(|gate| gate_refusal(&args, gate, self.serving.as_ref()))
+        {
+            return refused(refusal);
+        }
         if let Some(id) = &args.session {
             return self.next_round(port.as_ref(), id, &args.agent, &args.brief, audit);
         }
@@ -993,6 +1152,11 @@ impl<'t> DelegateTools<'t> {
                 "An agent does not delegate to itself.".to_owned(),
             );
         }
+        if let Some(gate) = gate {
+            if !keeper_core::agents::gate::selects(&gate.delegates, &target.drive, &target.id) {
+                return self.refuse(&id, &to, None, not_a_delegate(args.agent.trim()));
+            }
+        }
         if let Err(bound) = Limits::of(&self.from.limits).check(self.from.hop, 0, 0) {
             return self.refuse(&id, &to, None, bound.sentence());
         }
@@ -1001,9 +1165,13 @@ impl<'t> DelegateTools<'t> {
             Ok(content) => content,
             Err(sentence) => return self.refuse(&id, &to, None, sentence),
         };
-        // The room's observers are the session's readers; a declassified
-        // brief's wider readers read it through the target's own sessions.
-        let invites = room_invites(&target.matrix_user, &self.from.user, &label);
+        // The room's observers are the session's readers — a gate's are its
+        // approvers (codemap Q2), never its peer; a declassified brief's
+        // wider readers read it through the target's own sessions.
+        let invites = match gate {
+            Some(gate) => gate_invites(&target.matrix_user, &gate.approvers),
+            None => room_invites(&target.matrix_user, &self.from.user, &label),
+        };
         let members = observers(&invites, &target.matrix_user);
         let effect = brief_effect(&content);
         let destination = Destination::Agent {
@@ -1040,6 +1208,9 @@ impl<'t> DelegateTools<'t> {
                 }
             }
         }
+        if let (Some(gate), Some(serving)) = (gate, self.serving.as_ref()) {
+            return self.hand_on(audit, serving, gate, &id, &to, target);
+        }
         // The label's say first, then the integrity rule's and the tier's: a
         // card with a schedule or a workflow is a person's to allow (S-21,
         // T3).
@@ -1073,6 +1244,7 @@ impl<'t> DelegateTools<'t> {
             reason: None,
             reply: None,
             window: None,
+            approval: None,
         }));
         // The card it hands on says so, and is not handed on again; another
         // session's card is that session's to write.
@@ -1092,6 +1264,64 @@ impl<'t> DelegateTools<'t> {
             text: format!(
                 "Handed to {} as delegation {id}; waiting for it to join. Its reply will come to this session. To say more in this exchange, call delegate with session = {id}.",
                 target.name
+            ),
+        })
+    }
+
+    /// A gate's delegation, its sinks passed (codemap Q4, Q13): no room is
+    /// made and nothing is sent. The audit answers first (R371): what it
+    /// refuses — the integrity rule, T5, a row that cannot be written —
+    /// pays no ticket and says none. Then the request's ticket — paid and
+    /// said now when a sync request has none yet — becomes the delegation's
+    /// id, and the call's audit row waits, pending, for its approval (a
+    /// ticket that cannot be had closes it refused); its `delegate
+    /// requested` line names the approval record the host writes once the
+    /// turn ends, onto the hour's card. The turn goes on: it ends normally,
+    /// and the request waits for its ticket's result.
+    fn hand_on(
+        &self,
+        audit: &CallAudit<'_>,
+        serving: &crate::gate::Serving,
+        gate: &GateDelegator,
+        id: &str,
+        to: &str,
+        target: &KnownAgent,
+    ) -> Option<ToolOutcome> {
+        let approval = match audit.admit(&target.drive, to) {
+            Err(Withheld::Parked(approval)) => approval,
+            Err(Withheld::Refused(reason)) => return self.refuse(id, to, None, reason),
+            // Never handed on unasked (AD-416).
+            Ok(()) => return self.refuse(id, to, None, GATE_UNASKED.to_owned()),
+        };
+        let ticket = match block_on(serving.desk.ticket_for(&serving.request)) {
+            Ok(ticket) => ticket,
+            Err(sentence) => {
+                audit.unpark();
+                return self.refuse(id, to, None, sentence);
+            }
+        };
+        block_on(serving.desk.hand_on(&serving.request));
+        self.line(LineBody::Delegate(DelegateBody {
+            id: ticket.clone(),
+            to: to.to_owned(),
+            room: None,
+            child: None,
+            state: DelegateState::Requested,
+            reason: None,
+            reply: None,
+            window: None,
+            approval: Some(approval.to_string()),
+        }));
+        let approvers = gate
+            .approvers
+            .iter()
+            .map(|person| person.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        Some(ToolOutcome::Answered {
+            text: format!(
+                "Ticket {ticket} for {}: handing it to {} waits for a person's decision ({approvers}). Its reply comes back here, and you answer the request then; say nothing more about it now.",
+                serving.request, target.name
             ),
         })
     }
@@ -1211,10 +1441,93 @@ impl<'t> DelegateTools<'t> {
             reason: None,
             reply: None,
             window: None,
+            approval: None,
         }));
         Some(ToolOutcome::Answered {
             text: format!("Sent to {to}."),
         })
+    }
+
+    /// A gate's `reply(text)` (codemap Q6, 99.2 #2): one message to its
+    /// outside system in the session's own room — the answer while its
+    /// request is not ticketed, the ticket's result after — passing the
+    /// room's sink with the session's label now, its secrets redacted as
+    /// the room's are (S-17). No artifacts, no label, no card: a blocked
+    /// answer is refused, never sent. A ticket's result the sink blocks
+    /// because its delegate read what the room may not read waits for a
+    /// person instead (99.2 #3): the call parks on a `declassify` record
+    /// the drive's owner decides in their proxy's DM, the turn ends there,
+    /// and the gate goes on serving; nothing reaches the room until the
+    /// host sends exactly those bytes on a consumed approval.
+    fn answer(&self, args: Option<&Value>, audit: &CallAudit<'_>) -> Option<ToolOutcome> {
+        let Some(text) = args.and_then(|args| args["text"].as_str()) else {
+            return refused("reply needs a \"text\" argument.");
+        };
+        let Some(serving) = &self.serving else {
+            return refused(crate::gate::NO_SUCH_REQUEST);
+        };
+        let text = keeper_core::agents::redact::redact_secrets(text).text;
+        let members = match block_on(self.room.members()) {
+            Ok(members) => members,
+            Err(error) => {
+                return Some(audit.refuse(format!(
+                    "Who is in this room could not be read, so nothing was sent: {error}"
+                )))
+            }
+        };
+        let known = self.port.as_ref().map(|port| port.known());
+        let sink = room_audience(
+            members,
+            known.as_deref(),
+            std::slice::from_ref(&self.from.user),
+        );
+        let label = self.view.label();
+        if let Err(blocked) = self.sinks.verdict(
+            REPLY,
+            &Destination::Room {
+                room: self.from.room.clone(),
+            },
+            &label,
+            &sink,
+            text.as_bytes(),
+            None,
+        ) {
+            let holdable =
+                blocked.flow.is_some() && block_on(serving.desk.holdable(&serving.request));
+            if !holdable {
+                return Some(audit.refuse(blocked.sentence));
+            }
+            match audit.blocked(blocked) {
+                Ok(()) => {}
+                Err(Withheld::Parked(approval)) => {
+                    block_on(serving.desk.hold(&serving.request));
+                    return Some(ToolOutcome::Parked { approval });
+                }
+                Err(Withheld::Refused(reason)) => return refused(reason),
+            }
+        }
+        if let Err(withheld) = audit.admit("", self.from.room.as_str()) {
+            return Some(withheld.into());
+        }
+        match block_on(serving.desk.reply(&serving.request, &text)) {
+            Ok(lines) => {
+                let result = lines.last().is_some_and(|fact| {
+                    fact.line.state == keeper_core::agents::log::GateState::Result
+                });
+                let said = if result {
+                    "Sent as the ticket's result."
+                } else {
+                    "Answered."
+                };
+                for fact in lines {
+                    self.line(LineBody::Gate(fact.line));
+                }
+                Some(ToolOutcome::Answered {
+                    text: said.to_owned(),
+                })
+            }
+            Err(sentence) => refused(sentence),
+        }
     }
 
     fn reply(&self, args: Option<&Value>, audit: &CallAudit<'_>) -> Option<ToolOutcome> {
@@ -1293,6 +1606,7 @@ impl<'t> DelegateTools<'t> {
             reason: None,
             reply: None,
             window: None,
+            approval: None,
         }));
         // A workflow's run ends here, whatever becomes of its card: the line
         // is the log's own word (R202).

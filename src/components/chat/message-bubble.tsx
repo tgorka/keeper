@@ -18,10 +18,22 @@
  * drives, and the bubble says it draws them only for a room it knows may read
  * them. The text is the message's, shown as any message is (R115). A forged
  * brief arrives as an ordinary message and is drawn as one.
+ *
+ * In a gate room (UX-DR147) Rust marks the outside system's requests — once the
+ * gate has spoken of them — and the gate's word on each (`item.gate`): a request
+ * is the system's text quoted as data on a dashed surface under its state chip,
+ * the gate's word an agent message headed by the request it speaks of
+ * ({@link GateHead}).
  */
 
 import { Forward } from "lucide-react";
 import { EditHistoryPopover } from "@/components/chat/edit-history-popover";
+import {
+  GateHead,
+  GateRequestText,
+  gateBubbleClass,
+  gateLineName,
+} from "@/components/chat/gate-line";
 import { MediaAttachment } from "@/components/chat/media-attachment";
 import { MessageActions } from "@/components/chat/message-actions";
 import { CURATED_EMOJI } from "@/components/chat/reaction-popover";
@@ -139,6 +151,13 @@ interface MessageBubbleProps {
    * says so to a screen reader, until the run leaves `running`.
    */
   growing?: boolean;
+  /**
+   * Where the person stopped listening to this spoken answer (97.3,
+   * UX-DR143): the body's UTF-16 index Rust computed. A thin rule with
+   * "You stopped listening here" is drawn there and the text after it is
+   * dimmed; absent when the answer was not stopped or was heard to its end.
+   */
+  heardUntil?: number;
 }
 
 /**
@@ -174,6 +193,7 @@ export function MessageBubble({
   onOpenPreview,
   onCancelSend,
   growing = false,
+  heardUntil,
 }: MessageBubbleProps) {
   const displayName = item.senderDisplayName ?? item.sender;
   const time = formatMessageTime(item.timestamp);
@@ -195,24 +215,33 @@ export function MessageBubble({
   const touchMenu = phone && Boolean(onReply || onEdit || onDelete || onToggleReaction);
 
   const brief = item.brief;
+  const gate = item.gate;
   const bubbleClass = cn(
     "max-w-[75%] rounded-[14px] px-3 py-2 text-sm",
-    brief !== null
-      ? "border border-border border-l-2 border-l-primary bg-card text-foreground"
-      : isOwn
-        ? "bg-primary text-primary-foreground"
-        : "bg-muted text-foreground",
+    gate !== null
+      ? gateBubbleClass(gate)
+      : brief !== null
+        ? "border border-border border-l-2 border-l-primary bg-card text-foreground"
+        : isOwn
+          ? "bg-primary text-primary-foreground"
+          : "bg-muted text-foreground",
     selected && "ring-2 ring-ring ring-offset-1 ring-offset-background",
   );
   // A brief is a named group, so a screen reader hears whose hand-off it is
   // before the text.
   const briefGroup =
-    brief !== null
-      ? ({ role: "group", "aria-label": `Brief from ${displayName} for ${brief.toName}` } as const)
-      : {};
+    gate !== null
+      ? ({ role: "group", "aria-label": gateLineName(gate, displayName) } as const)
+      : brief !== null
+        ? ({
+            role: "group",
+            "aria-label": `Brief from ${displayName} for ${brief.toName}`,
+          } as const)
+        : {};
 
   const bubbleContent = (
     <>
+      {gate !== null && <GateHead line={gate} />}
       {brief !== null && <BriefHead brief={brief} />}
       {item.reply && <ReplyQuote reply={item.reply} isOwn={isOwn} onJumpTo={onJumpTo} />}
       {item.media && (
@@ -232,9 +261,20 @@ export function MessageBubble({
       )}
       {/* Text/caption: rendered only when there is a body (a media message
           may carry an empty caption) or an answer is still growing into one. */}
-      {(item.body !== "" || growing) && (
+      {gate?.role === "request" && <GateRequestText body={item.body} />}
+      {gate?.role !== "request" && (item.body !== "" || growing) && (
         <p className="whitespace-pre-wrap break-words">
-          {item.body}
+          {heardUntil === undefined ? (
+            item.body
+          ) : (
+            <>
+              {item.body.slice(0, heardUntil)}
+              <HeardRule />
+              <span data-slot="unheard" className="opacity-60">
+                {item.body.slice(heardUntil).trimStart()}
+              </span>
+            </>
+          )}
           {growing && (
             <>
               <span
@@ -316,8 +356,10 @@ export function MessageBubble({
 
       <div className={cn("flex min-w-0 flex-col", isOwn ? "items-end" : "items-start")}>
         {!grouped && !isOwn && (
+          // A gate room's request names its sender as Rust quoted it: the
+          // outside system chose that name.
           <span className="mb-0.5 px-1 font-medium text-muted-foreground text-xs">
-            {displayName}
+            {gate?.senderName ?? displayName}
           </span>
         )}
         <div className={cn("flex items-center gap-1", isOwn ? "flex-row-reverse" : "flex-row")}>
@@ -376,10 +418,10 @@ export function MessageBubble({
                 messageKey={item.key}
                 canEdit={canEdit}
                 canDelete={canDelete}
-                onReact={(k, emoji) => onToggleReaction?.(k, emoji)}
-                onReply={(k) => onReply?.(k)}
-                onEdit={(k) => onEdit?.(k)}
-                onDelete={(k) => onDelete?.(k)}
+                onReact={onToggleReaction}
+                onReply={onReply}
+                onEdit={onEdit}
+                onDelete={onDelete}
               />
             </div>
           )}
@@ -407,6 +449,19 @@ export function MessageBubble({
         <ReadReceipts readers={item.readers} isOwn={isOwn} />
       </div>
     </div>
+  );
+}
+
+/**
+ * Where the person stopped listening to a spoken answer (UX-DR143): a thin rule
+ * with its words, on its own line inside the answer's text.
+ */
+function HeardRule() {
+  return (
+    <span data-slot="heard-mark" className="my-1.5 flex items-center gap-2 text-xs opacity-70">
+      <span className="shrink-0">You stopped listening here</span>
+      <span aria-hidden="true" className="h-px min-w-4 flex-1 bg-current opacity-50" />
+    </span>
   );
 }
 

@@ -6,6 +6,11 @@
 //! cold path — a session opened, taken over or restarted — and is pure over a
 //! [`SessionLog`] already read: a host serving a session keeps the history in
 //! memory from the writer's receipts and never re-reads the log on a turn.
+//!
+//! An answer a `heard` line marks replays cut where the person stopped
+//! listening, in both replays alike ([`crate::agents::heard`]). A gate
+//! session's turn reads one request only (codemap Q5): its `request` line
+//! starts the conversation over, and every earlier line stays in the log.
 
 use std::collections::{HashMap, HashSet};
 
@@ -13,7 +18,10 @@ use serde_json::Value;
 use ulid::Ulid;
 
 use super::reader::SessionLog;
-use super::{LineBody, LogError, LogLine, OpenBody, PeerBody, ReviewLines, UserBody};
+use super::{
+    GateBody, GateState, LineBody, LogError, LogLine, OpenBody, PeerBody, ReviewLines, UserBody,
+};
+use crate::agents::heard::Answers;
 use crate::agents::helper::HELPER;
 use crate::bots::chat::{ChatMessage, ContentPart, Role, ToolCall};
 
@@ -98,8 +106,35 @@ pub fn message_for(line: &LogLine) -> Option<ChatMessage> {
             Role::System,
             format!("{COMPACT_HEADING}\n\n{}", body.summary),
         )),
+        LineBody::Gate(body) => request_message(body),
         _ => None,
     }
+}
+
+/// The message a gate's `request` line is to its turn — the request's
+/// own, and its ticket's callback, which reads it again (codemap Q5).
+pub fn request_message(body: &GateBody) -> Option<ChatMessage> {
+    request_text(body).map(|text| ChatMessage::text(Role::User, text))
+}
+
+/// A gate's request as its turn reads it: under
+/// [`crate::agents::gate::REQUEST_IS_DATA`], named, then its text (AD-416,
+/// NFR-48). Only a `request` line is a message.
+fn request_text(body: &GateBody) -> Option<String> {
+    if body.state != GateState::Request {
+        return None;
+    }
+    Some(format!(
+        "{}\n\nRequest {}:\n{}",
+        crate::agents::gate::REQUEST_IS_DATA,
+        body.request,
+        body.text.as_deref().unwrap_or_default()
+    ))
+}
+
+/// Whether `line` starts a gate turn's conversation over: a `request` line.
+pub fn starts_over(line: &LogLine) -> bool {
+    matches!(&line.body, LineBody::Gate(body) if body.state == GateState::Request)
 }
 
 /// A person's text, then the drive files they attached, one per line.
@@ -201,6 +236,7 @@ pub fn replay(
     let mut last_open = None;
     let mut helpers = HelperSteps::default();
     let mut review = ReviewLines::default();
+    let mut answers = Answers::default();
     for (position, stored) in log.lines.iter().enumerate() {
         let hydrated;
         let line = match &stored.body {
@@ -230,9 +266,16 @@ pub fn replay(
         if review.take(line) {
             continue;
         }
+        // A `heard` line cuts the answer it marks where the person stopped
+        // listening (AD-411); the line itself stands for no message.
+        if let Some(cut) = answers.observe(line) {
+            cut.apply(placed.iter_mut().map(|p| (p.line, &mut p.message)));
+            continue;
+        }
 
         match &line.body {
             LineBody::Open(open) => last_open = Some(open.clone()),
+            _ if starts_over(line) => placed.clear(),
             LineBody::Compact(compact) => {
                 let through = log
                     .lines

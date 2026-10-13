@@ -41,10 +41,18 @@ use keeper_core::vm::{
 use keeper_core::voice::speech;
 use keeper_sync::SyncProfile;
 
-use crate::agent::SessionRef;
 use crate::grants::{GrantSource, StoreGrants};
 use crate::host::{self, ArmedDrive, TurnHost};
 use crate::ports::{ApprovalPort, ProfileSource, VaultWriter};
+
+/// A session, by its drive and its zone-relative folder.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SessionRef {
+    /// The drive whose sessions zone holds it.
+    pub drive: String,
+    /// Zone-relative: `active/2026-10-02-release`.
+    pub path: String,
+}
 
 /// Why a turn could not be opened. The shell maps each arm onto the error
 /// code the same failure always carried.

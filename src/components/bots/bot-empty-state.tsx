@@ -67,12 +67,13 @@ export const BOTS_EMPTY_COPY: Record<
 
 /**
  * What the phone says about the half of the surface it cannot have. `keeper-sync`
- * is not linkable on iOS, so a grant would be a promise about files keeper
- * cannot reach from there; the honest sentence names where the tools are.
+ * is not a dependency of the shell's drive tools on iOS or Android, so a grant
+ * would be a promise about files keeper cannot reach from there; the honest
+ * sentence names where the tools are, for either device (story 98.3).
  * One const, so the empty state and the `/grant` answer cannot word it twice.
  */
 export const BOTS_NO_DRIVE_HERE_SENTENCE =
-  "On this iPhone a bot can talk but cannot reach the folders you sync — the drive tools live on your Mac.";
+  "On a phone or a tablet a bot can talk but cannot reach the folders you sync — the drive tools live on your Mac.";
 
 /**
  * Render one empty state. It stands where the transcript would, so it takes

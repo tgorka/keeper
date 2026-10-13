@@ -24,6 +24,7 @@ function message(key: string, sender = "@bob:example.org"): TimelineItemVm {
     media: null,
     readers: [],
     brief: null,
+    gate: null,
   };
 }
 
@@ -116,6 +117,7 @@ describe("timelineStore header", () => {
     label: null,
     scopeUnreadable: null,
     caretKey,
+    gate: null,
   });
 
   it("keeps the last header through batches that carry none, and replaces it when one does", () => {
@@ -139,7 +141,11 @@ describe("timelineStore header", () => {
 
 describe("timelineStore approvals", () => {
   const approvals = (state: "pending" | "consumed"): ApprovalVm[] => [
-    { id: "01A", cards: [{ id: "01A", state: { state } } as ApprovalVm["cards"][number]] },
+    {
+      id: "01A",
+      cards: [{ id: "01A", state: { state } } as ApprovalVm["cards"][number]],
+      gate: null,
+    },
   ];
 
   it("keeps the last cards through batches that carry none, and the room's clear drops them", () => {
@@ -155,5 +161,24 @@ describe("timelineStore approvals", () => {
     expect(keys()).toEqual(["k", "b"]);
     timelineStore.getState().clear();
     expect(timelineStore.getState().approvals).toEqual([]);
+  });
+});
+
+describe("timelineStore heard marks (97.3, UX-DR143)", () => {
+  it("keeps the last marks through batches that carry none, an empty list clears them, and so does the room's clear", () => {
+    timelineStore.getState().applyBatch({
+      ops: [{ op: "reset", items: [message("answer")] }],
+      heard: [{ key: "answer", splitUtf16: 6 }],
+    });
+    timelineStore.getState().applyBatch(batch([{ op: "pushBack", item: message("b") }]));
+    expect(timelineStore.getState().heard).toEqual([{ key: "answer", splitUtf16: 6 }]);
+    // The answer grew past the mark: Rust sends the new list with no ops.
+    timelineStore.getState().applyBatch({ ops: [], heard: [{ key: "answer", splitUtf16: 12 }] });
+    expect(timelineStore.getState().heard).toEqual([{ key: "answer", splitUtf16: 12 }]);
+    timelineStore.getState().applyBatch({ ops: [], heard: [] });
+    expect(timelineStore.getState().heard).toEqual([]);
+    timelineStore.getState().applyBatch({ ops: [], heard: [{ key: "answer", splitUtf16: 6 }] });
+    timelineStore.getState().clear();
+    expect(timelineStore.getState().heard).toEqual([]);
   });
 });

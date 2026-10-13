@@ -53,6 +53,7 @@ use crate::agents::events::{
 };
 use crate::agents::events::{PresencePlatform, SurfaceResultContent};
 use crate::agents::focus::{FocusLanes, FocusPort, Named, SendFuture};
+use crate::agents::heard::HeardContent;
 use crate::agents::proxy::{
     self, AgentOutbound, AgentProxies, KnownProxies, ProxyListEventContent, ProxyRoomRow,
     ProxyRoomVm,
@@ -4046,6 +4047,22 @@ impl AccountManager {
         send_agent_event(&room, AgentOutbound::ConversationRequest(content)).await
     }
 
+    /// Tell the agent in the person's proxy room `room_id` where they stopped
+    /// listening to its spoken answer (97.3, AD-411): `content` names the
+    /// answer's anchor and the sentences the synthesiser finished. Only a
+    /// proxy room of this account's is written to; the owning host decides
+    /// whether the mark counts. Returns the event's id, which the next
+    /// spoken question waits for, so the mark reaches the room first (Q10).
+    pub async fn agent_heard_send(
+        &self,
+        account_id: &str,
+        room_id: &str,
+        content: HeardContent,
+    ) -> Result<String, CoreError> {
+        let (room, _, _) = self.proxy_room(account_id, room_id).await?;
+        send_agent_event(&room, AgentOutbound::Heard(content)).await
+    }
+
     /// Send the person's decision `req` on the approval card it names in the
     /// session room `room_id` (93.3), from this device: [`decide_approval`]
     /// with the rooms this app hosts and the attached actions it has shown
@@ -4066,6 +4083,149 @@ impl AccountManager {
         decide_approval(&room, &self.agent_hosted, &shown, req).await
     }
 
+    /// Send the decision a lock-screen action chose (98.1 #4, Q2;
+    /// `push::action_decision`). A notification's action may launch keeper
+    /// in the background with no window and no account live, so
+    /// `decision.account` — that one account only — is activated here when
+    /// it is not live; the decision then goes through
+    /// [`Self::agent_approval_decide`], whose card check is the local
+    /// re-check of what the notification carried: the record must be in the
+    /// session room as this phone syncs it, with that digest (R343). It is
+    /// tried again every second while the refusal is one the sync the
+    /// activation starts can still change ([`not_yet_synced`]) and `budget`
+    /// has not passed; any other refusal, and a dispatch error, is the
+    /// answer at once.
+    pub async fn agent_approval_decide_notified(
+        &self,
+        platform: &Arc<dyn Platform>,
+        decision: crate::agents::push::ActionDecision,
+        budget: std::time::Duration,
+    ) -> Result<(), CoreError> {
+        let deadline = tokio::time::Instant::now() + budget;
+        self.ensure_live(platform, &decision.account).await?;
+        until_synced(deadline, || {
+            self.agent_approval_decide(&decision.account, &decision.room, decision.req.clone())
+        })
+        .await
+    }
+
+    /// Register this phone's pusher on every signed-in account, each
+    /// activated when it is not live yet (98.1 #3, AD-412): the pusher
+    /// `push::PusherSpec::of_setting` builds over `stored` — the raw
+    /// `push.gateway_url` — set where the account holds agent session
+    /// rooms, removed everywhere else and wherever the setting registers
+    /// nothing ([`crate::agents::push::register`]). One outcome per account,
+    /// for the log.
+    pub async fn push_register(
+        &self,
+        platform: &Arc<dyn Platform>,
+        stored: Option<&str>,
+        environment: crate::agents::push::ApnsEnvironment,
+        token: &[u8],
+        device: &str,
+    ) -> Result<Vec<(String, Result<crate::agents::push::Registered, CoreError>)>, CoreError> {
+        use crate::agents::push;
+
+        self.push_register_each(
+            platform,
+            push::pusher_ids(environment, token),
+            None,
+            |account| push::PusherSpec::of_setting(stored, environment, token, account, device),
+        )
+        .await
+    }
+
+    /// Register a pusher on every signed-in account, each activated when it
+    /// is not live yet: `spec(account)` where the account holds agent
+    /// session rooms, else the pusher `ids` names is removed
+    /// ([`crate::agents::push::register`]). `stale` — a pusher this device
+    /// registered before under another identity (Android's previous
+    /// endpoint) — is removed first, best effort. One outcome per account,
+    /// for the log.
+    pub async fn push_register_each(
+        &self,
+        platform: &Arc<dyn Platform>,
+        ids: crate::agents::push::PusherIds,
+        stale: Option<crate::agents::push::PusherIds>,
+        spec: impl Fn(&str) -> Option<crate::agents::push::PusherSpec>,
+    ) -> Result<Vec<(String, Result<crate::agents::push::Registered, CoreError>)>, CoreError> {
+        use crate::agents::push;
+
+        let stale = stale.filter(|stale| *stale != ids);
+        let mut outcomes = Vec::new();
+        for row in registry::list_accounts(&platform.data_dir()?)? {
+            let spec = spec(&row.account_id);
+            let outcome = match self.ensure_live(platform, &row.account_id).await {
+                Ok(client) => {
+                    if let Some(stale) = stale.clone() {
+                        if let Err(error) = push::register(&client, stale, None).await {
+                            tracing::warn!(
+                                account_id = %row.account_id,
+                                %error,
+                                "push: this device's previous pusher could not be removed"
+                            );
+                        }
+                    }
+                    push::register(&client, ids.clone(), spec.as_ref())
+                        .await
+                        .map_err(|error| CoreError::Internal(error.to_string()))
+                }
+                Err(error) => Err(error),
+            };
+            outcomes.push((row.account_id, outcome));
+        }
+        Ok(outcomes)
+    }
+
+    /// What a push that names `pushed` shows on Android (98.4 #3): the first
+    /// signed-in account that knows the room reads the event in this process
+    /// — waiting up to [`DECRYPT_BUDGET`](crate::agents::unifiedpush::DECRYPT_BUDGET) for its keys, which travel in
+    /// the sync beside it — and [`crate::agents::push::shown_of`] decides, as
+    /// the iPhone's extension does. `Ok(None)`: nothing shows — the classifier
+    /// dropped it, or no account here knows the room (a push keeper did not
+    /// ask for). `Err`: it could not be read, the generic notification.
+    pub async fn push_shown(
+        &self,
+        platform: &Arc<dyn Platform>,
+        pushed: &crate::agents::unifiedpush::PushedEvent,
+    ) -> Result<Option<(String, crate::agents::push::Shown)>, CoreError> {
+        use crate::agents::push;
+
+        let started = std::time::Instant::now();
+        for row in registry::list_accounts(&platform.data_dir()?)? {
+            let client = match self.ensure_live(platform, &row.account_id).await {
+                Ok(client) => client,
+                Err(error) => {
+                    tracing::warn!(account_id = %row.account_id, %error, "push: account not live");
+                    continue;
+                }
+            };
+            let Some(room) = client.get_room(&pushed.room_id) else {
+                continue;
+            };
+            let event = loop {
+                let event = room.event(&pushed.event_id, None).await.map_err(|error| {
+                    CoreError::Internal(format!("could not read the event: {error}"))
+                })?;
+                let still_sealed =
+                    push::json_of(&event).is_some_and(|json| json["type"] == "m.room.encrypted");
+                if !still_sealed || started.elapsed() >= crate::agents::unifiedpush::DECRYPT_BUDGET
+                {
+                    break event;
+                }
+                tokio::time::sleep(crate::agents::unifiedpush::DECRYPT_POLL).await;
+            };
+            return match push::shown_of(&client, &room, &event, started)
+                .await
+                .map_err(CoreError::Internal)?
+            {
+                push::Classified::Drop => Ok(None),
+                push::Classified::Show(shown) => Ok(Some((row.account_id, *shown))),
+            };
+        }
+        Ok(None)
+    }
+
     /// The attached action of the approval `id` in the session room
     /// `room_id`: [`approval_payload`]. Once shown, it may be approved from
     /// this app (R186).
@@ -4074,7 +4234,7 @@ impl AccountManager {
         account_id: &str,
         room_id: &str,
         id: &str,
-    ) -> Result<String, CoreError> {
+    ) -> Result<crate::agents::approval_card::ApprovalPayloadVm, CoreError> {
         let room = self.session_room(account_id, room_id).await?;
         let (shown, digest) = approval_payload(&room, id).await?;
         self.agent_shown
@@ -5308,16 +5468,44 @@ impl AccountManager {
     /// persisted state (SDK store dir + Keychain session + registry row) — local
     /// only, no server-side logout (AD-10, Story 1.8).
     ///
-    /// `shutdown` runs *first* so the SDK's SQLite handles are released before the
-    /// store dir is removed, and it is a no-op when the account was never
-    /// activated (restored-but-never-subscribed). [`crate::auth::sign_out_cleanup`]
-    /// then removes exactly this account's three persisted targets, each
-    /// idempotent — so sign-out converges whether or not the account was live.
+    /// `pusher`: this phone's pusher (iOS, once it has a token —
+    /// `push::pusher_ids`), removed from the account's homeserver *before*
+    /// anything is torn down, while the session can still ask: otherwise the
+    /// homeserver would keep pushing every message of an account the phone no
+    /// longer holds, each shown as keeper's generic notification. Best effort
+    /// (R340): offline, or refused, the sign-out goes on — the pusher then
+    /// stays until the gateway reports the token rejected — and the words of
+    /// a pusher, like everything the homeserver stores, are the homeserver's
+    /// to keep.
+    ///
+    /// `shutdown` runs *first* among the teardown so the SDK's SQLite handles
+    /// are released before the store dir is removed, and it is a no-op when
+    /// the account was never activated (restored-but-never-subscribed).
+    /// [`crate::auth::sign_out_cleanup`] then removes exactly this account's
+    /// three persisted targets, each idempotent — so sign-out converges
+    /// whether or not the account was live.
     pub async fn sign_out(
         &self,
         platform: &Arc<dyn Platform>,
         account_id: &str,
+        pusher: Option<matrix_sdk::ruma::api::client::push::PusherIds>,
     ) -> Result<(), CoreError> {
+        if let Some(ids) = pusher {
+            let removed = match self.ensure_live(platform, account_id).await {
+                Ok(client) => crate::agents::push::register(&client, ids, None)
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| CoreError::Internal(error.to_string())),
+                Err(error) => Err(error),
+            };
+            if let Err(error) = removed {
+                tracing::warn!(
+                    account_id = %account_id,
+                    %error,
+                    "push: this phone's pusher could not be removed before signing out"
+                );
+            }
+        }
         self.shutdown(account_id).await;
         crate::auth::sign_out_cleanup(platform.as_ref(), account_id)?;
         Ok(())
@@ -5392,12 +5580,16 @@ where
     .collect()
 }
 
-/// The attached action of the approval `id` in the session room `room`, as
-/// pretty-printed JSON, and the binding digest it was checked against
+/// The attached action of the approval `id` in the session room `room` —
+/// as pretty-printed JSON and, for a `run`, the typed run view an inline
+/// card draws (R231) — and the binding digest it was checked against
 /// (R186): its encrypted file fetched and decrypted through the media
 /// cache, and refused with a sentence unless its bytes are the file the
 /// request names and the action its digest and summary bind.
-pub async fn approval_payload(room: &Room, id: &str) -> Result<(String, String), CoreError> {
+pub async fn approval_payload(
+    room: &Room,
+    id: &str,
+) -> Result<(approval_card::ApprovalPayloadVm, String), CoreError> {
     use matrix_sdk::media::{MediaFormat, MediaRequestParameters};
     use matrix_sdk::ruma::events::room::{EncryptedFile, MediaSource};
     let refused = |sentence: &str| CoreError::Unsupported(sentence.to_owned());
@@ -5425,10 +5617,49 @@ pub async fn approval_payload(room: &Room, id: &str) -> Result<(String, String),
     )
     .await
     .map_err(|_| refused(approval_card::PAYLOAD_UNAVAILABLE))?;
-    let args = approval_card::verify_attached(record, &bytes).map_err(CoreError::Unsupported)?;
-    let shown = serde_json::to_string_pretty(&args)
-        .map_err(|error| CoreError::Internal(error.to_string()))?;
+    let shown = approval_card::attached_payload(record, &bytes).map_err(CoreError::Unsupported)?;
     Ok((shown, record.binding_digest.clone()))
+}
+
+/// Whether a lock-screen decision refused with `error` may still be sent as
+/// this process syncs: the session room is not in the store yet
+/// ([`SendError::RoomNotFound`]), or the request is not in its event cache
+/// yet ([`approval_card::NOT_FOUND`]). Every other refusal is the card's —
+/// another digest, no longer waiting, a scope it does not offer, not an
+/// approver, this device not cross-signed — which time does not change; and a
+/// dispatch error is never tried again, because that decision may already be
+/// in the room (R343).
+fn not_yet_synced(error: &CoreError) -> bool {
+    match error {
+        CoreError::Send(SendError::RoomNotFound) => true,
+        CoreError::Unsupported(sentence) => sentence == approval_card::NOT_FOUND,
+        _ => false,
+    }
+}
+
+/// `attempt`, again every second while it is refused [`not_yet_synced`] and
+/// the next try starts before `deadline`; its first other answer, or the
+/// last refusal, is the answer.
+async fn until_synced<F, Fut>(
+    deadline: tokio::time::Instant,
+    mut attempt: F,
+) -> Result<(), CoreError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<(), CoreError>>,
+{
+    const AGAIN: std::time::Duration = std::time::Duration::from_secs(1);
+    loop {
+        match attempt().await {
+            Err(error)
+                if not_yet_synced(&error) && tokio::time::Instant::now() + AGAIN < deadline =>
+            {
+                tracing::debug!(%error, "a lock-screen decision is not sent yet; trying again");
+                tokio::time::sleep(AGAIN).await;
+            }
+            answer => return answer,
+        }
+    }
 }
 
 /// Send the person's decision `req` on the approval card it names in the
@@ -5456,22 +5687,14 @@ pub async fn decide_approval(
         hosted: hosted.rooms(),
     };
     let fold = agent_room::approvals_of(room).await;
-    let record = fold
-        .check(
-            &viewer,
-            &req.id,
-            &req.binding_digest,
-            req.scope,
-            chrono::Utc::now(),
-            &|user| user.to_string(),
-        )
-        .map_err(CoreError::Unsupported)?;
-    if req.decision == crate::agents::approval::Decision::Approve
-        && approval_card::binding(record) == approval_card::Binding::Attached
-        && !shown(&record.binding_digest)
-    {
-        return Err(CoreError::Unsupported(approval_card::UNSEEN.to_owned()));
-    }
+    fold.decide(
+        &viewer,
+        &req,
+        chrono::Utc::now(),
+        &|user| user.to_string(),
+        shown,
+    )
+    .map_err(CoreError::Unsupported)?;
     let content = ApprovalDecisionContent {
         id: req.id,
         binding_digest: req.binding_digest,
@@ -5603,6 +5826,18 @@ async fn admit_proxy_room(
     let admitted = proxy::admits(&row, room.own_user_id(), &known)
         .map_err(|refusal| CoreError::Unsupported(refusal.to_string()))?;
     Ok((admitted.kind, admitted.agent.to_owned()))
+}
+
+/// The agent `room` admits as its own user's proxy, when it is one of their
+/// proxy conversations by what this client alone can read
+/// ([`proxy::admits`], R72) — a device with no agents zone, as the
+/// notification extension is. A push shows an answer there only from this
+/// agent (98.1 #1, R336).
+pub async fn proxy_answer_agent(room: &Room) -> Option<matrix_sdk::ruma::OwnedUserId> {
+    admit_proxy_room(room, &AgentKinds::default(), &AgentProxies::default())
+        .await
+        .ok()
+        .map(|(_, agent)| agent)
 }
 
 /// Send what the voice turn heard into `room`, its own user's proxy
@@ -7085,6 +7320,77 @@ mod tests {
     use matrix_sdk_ui::eyeball_im::Vector;
     use std::path::PathBuf;
 
+    /// R343 (review 98apns-1, finding 04): a lock-screen decision is tried
+    /// again only while the sync the activation started can still change the
+    /// answer — the session room or the request not in this process's store
+    /// yet — and gives up at the budget with the last refusal. A refusal of
+    /// the card's is the answer at once, with its sentence; a decision whose
+    /// send failed is never sent a second time.
+    #[tokio::test(start_paused = true)]
+    async fn a_lock_screen_decision_waits_only_for_what_the_sync_can_bring() {
+        use std::sync::atomic::AtomicUsize;
+        let budget = std::time::Duration::from_secs(20);
+        let not_found = || CoreError::Unsupported(approval_card::NOT_FOUND.to_owned());
+
+        let tries = AtomicUsize::new(0);
+        let sent = until_synced(tokio::time::Instant::now() + budget, || {
+            let n = tries.fetch_add(1, Ordering::SeqCst);
+            async move {
+                match n {
+                    0 => Err(SendError::RoomNotFound.into()),
+                    1 => Err(not_found()),
+                    _ => Ok(()),
+                }
+            }
+        })
+        .await;
+        assert!(sent.is_ok(), "{sent:?}");
+        assert_eq!(tries.load(Ordering::SeqCst), 3);
+
+        let card = [
+            approval_card::OTHER_ACTION,
+            approval_card::NOT_WAITING,
+            approval_card::SCOPE_NOT_OFFERED,
+        ]
+        .map(|sentence| CoreError::Unsupported(sentence.to_owned()));
+        for refusal in card
+            .into_iter()
+            .chain([SendError::Dispatch("timed out".to_owned()).into()])
+        {
+            let expected = refusal.to_string();
+            let mut refusal = Some(refusal);
+            let tries = AtomicUsize::new(0);
+            let started = tokio::time::Instant::now();
+            let answer = until_synced(started + budget, || {
+                tries.fetch_add(1, Ordering::SeqCst);
+                let answer = refusal.take().map_or(Ok(()), Err);
+                async move { answer }
+            })
+            .await;
+            assert_eq!(
+                answer.map_err(|error| error.to_string()),
+                Err(expected.clone()),
+                "{expected}"
+            );
+            assert_eq!(tries.load(Ordering::SeqCst), 1, "{expected}");
+            assert_eq!(started.elapsed(), std::time::Duration::ZERO, "{expected}");
+        }
+
+        let tries = AtomicUsize::new(0);
+        let started = tokio::time::Instant::now();
+        let never = until_synced(started + budget, || {
+            tries.fetch_add(1, Ordering::SeqCst);
+            async { Err(not_found()) }
+        })
+        .await;
+        assert_eq!(
+            never.map_err(|error| error.to_string()),
+            Err(not_found().to_string())
+        );
+        assert!(started.elapsed() < budget, "{:?}", started.elapsed());
+        assert_eq!(tries.load(Ordering::SeqCst), 20);
+    }
+
     /// Settings › Agents waits on these names before it renders: a server
     /// that never answers costs `within` once, however many people it is
     /// asked about, and the people who did answer keep their names.
@@ -7321,14 +7627,59 @@ mod tests {
         // The account was never activated (absent from the manager map): shutdown
         // is a no-op and cleanup touches only already-absent persisted state.
         manager
-            .sign_out(&platform, "01ARZ3NDEKTSV4RRFFQ69G5FAV")
+            .sign_out(&platform, "01ARZ3NDEKTSV4RRFFQ69G5FAV", None)
             .await
             .expect("sign_out of an inactive account should succeed");
         // A second sign-out is likewise a no-op.
         manager
-            .sign_out(&platform, "01ARZ3NDEKTSV4RRFFQ69G5FAV")
+            .sign_out(&platform, "01ARZ3NDEKTSV4RRFFQ69G5FAV", None)
             .await
             .expect("second sign_out should succeed");
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// R340 (review 98apns-1, finding 02): signing out first asks the
+    /// homeserver to drop this phone's pusher, best effort — when it cannot
+    /// (here: no session to ask with), the account is signed out all the
+    /// same and its row is gone.
+    #[tokio::test]
+    async fn a_sign_out_whose_pusher_cannot_be_removed_still_signs_out() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "keeper-account-signout-pusher-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let platform: Arc<dyn Platform> = Arc::new(FakePlatform::new(data_dir.clone()));
+        let manager = AccountManager::new(&FakePlatform::new(data_dir.clone()), &data_dir);
+        let account = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        registry::insert_account(
+            &data_dir,
+            account,
+            "@tgorka:example.invalid",
+            "https://example.invalid",
+            "DEVICE",
+            0,
+            0,
+            "password",
+        )
+        .expect("row");
+        let ids = crate::agents::push::pusher_ids(
+            crate::agents::push::ApnsEnvironment::Development,
+            b"token",
+        );
+
+        manager
+            .sign_out(&platform, account, Some(ids))
+            .await
+            .expect("signed out although the pusher could not be removed");
+        assert!(registry::list_accounts(&data_dir)
+            .expect("accounts")
+            .iter()
+            .all(|row| row.account_id != account));
 
         let _ = std::fs::remove_dir_all(&data_dir);
     }

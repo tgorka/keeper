@@ -618,6 +618,15 @@ pub unsafe fn create_window(
   window
 }
 
+/// keeper (tools/tao/NOTICE, change 3): where the APNs token goes. tao's
+/// `AppDelegate` declared no `application:didRegisterForRemoteNotifications…`
+/// selector, so the token `registerForRemoteNotifications` asked for reached
+/// nobody. The embedder sets these once, before the event loop runs
+/// (`platform::ios::set_remote_notification_hooks`); unset, both methods do
+/// nothing.
+pub(crate) static REMOTE_NOTIFICATION_HOOKS: std::sync::OnceLock<(fn(&[u8]), fn(&str))> =
+  std::sync::OnceLock::new();
+
 pub fn create_delegate_class() {
   extern "C" fn did_finish_launching(_: &Object, _: Sel, _: id, _: id) -> BOOL {
     unsafe {
@@ -739,6 +748,47 @@ pub fn create_delegate_class() {
     }
   }
 
+  // keeper (NOTICE, change 3): the device token as bytes, and why there is
+  // none, handed to the embedder's hooks on the main thread.
+  extern "C" fn did_register_for_remote_notifications(_: &Object, _: Sel, _: id, token: id) {
+    let Some((on_token, _)) = REMOTE_NOTIFICATION_HOOKS.get() else {
+      return;
+    };
+    unsafe {
+      let length: usize = msg_send![token, length];
+      let bytes: *const u8 = msg_send![token, bytes];
+      if bytes.is_null() || length == 0 {
+        on_token(&[]);
+      } else {
+        on_token(std::slice::from_raw_parts(bytes, length));
+      }
+    }
+  }
+
+  extern "C" fn did_fail_to_register_for_remote_notifications(
+    _: &Object,
+    _: Sel,
+    _: id,
+    error: id,
+  ) {
+    let Some((_, on_error)) = REMOTE_NOTIFICATION_HOOKS.get() else {
+      return;
+    };
+    unsafe {
+      let description: id = msg_send![error, localizedDescription];
+      let text: *const c_char = if description == nil {
+        std::ptr::null()
+      } else {
+        msg_send![description, UTF8String]
+      };
+      if text.is_null() {
+        on_error("");
+      } else {
+        on_error(&CStr::from_ptr(text).to_string_lossy());
+      }
+    }
+  }
+
   let ui_responder = class!(UIResponder);
   let mut decl = ClassDecl::new(
     CStr::from_bytes_with_nul(b"AppDelegate\0").unwrap(),
@@ -785,6 +835,15 @@ pub fn create_delegate_class() {
     decl.add_method(
       sel!(applicationWillTerminate:),
       will_terminate as extern "C" fn(_, _, _),
+    );
+
+    decl.add_method(
+      sel!(application:didRegisterForRemoteNotificationsWithDeviceToken:),
+      did_register_for_remote_notifications as extern "C" fn(_, _, _, _),
+    );
+    decl.add_method(
+      sel!(application:didFailToRegisterForRemoteNotificationsWithError:),
+      did_fail_to_register_for_remote_notifications as extern "C" fn(_, _, _, _),
     );
 
     decl.register();

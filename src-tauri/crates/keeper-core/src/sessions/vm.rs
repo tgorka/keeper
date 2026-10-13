@@ -372,6 +372,11 @@ pub struct SessionDetailVm {
     /// and the board answers an empty list with the sentence that says what a
     /// task is rather than with columns.
     pub tasks: Vec<SessionTaskVm>,
+    /// An agent's session's Matrix room, from its `agent.toml`: where its
+    /// approval card and its answers are, which a card opens on the phone
+    /// (98.2, AD-395). `None` for a person's session, and for an
+    /// `agent.toml` that does not read.
+    pub room: Option<String>,
 }
 
 /// One work item of a flat session — a `task`-tagged markdown file, projected
@@ -411,6 +416,23 @@ pub struct SessionTaskVm {
     /// `run:` is the agent's run, never a column — the card sits where its
     /// `status:` puts it.
     pub agent: Option<crate::agents::card::CardAgentVm>,
+}
+
+/// What a card move came to (98.2, R346): `sessions_task_move`'s answer.
+///
+/// On a desktop the folder's own cadence commits and pushes the move, so the
+/// answer is always `unpushed: null`. On a phone the move is pulled onto first
+/// and pushed at once, and a push that did not land says so here rather than
+/// behind a silent success: the card has moved on this phone and not on the
+/// Mac yet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionTaskMoveVm {
+    /// The sentence saying why the move is on this device and not on the
+    /// remote yet — a paused folder, a push deferred and retried, or the
+    /// refusal recorded beside the folder — or `null` once it is pushed.
+    pub unpushed: Option<String>,
 }
 
 /// What migrating one session would do, shown before anything is done (FR-257).

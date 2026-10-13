@@ -24,7 +24,10 @@ oversight and not a purchase — recorded here because the deferral is load-bear
   infrastructure would break that invariant.
 - **Cheap-now mitigations already paid for:** the single `Platform::data_dir()` root keeps all
   account state under one path, so a future App Group container move (NSE era) is a path change,
-  not a data migration. (AD-29; FR-65) Plan B (UniFFI + native SwiftUI shell) stays shelved with
+  not a data migration. (AD-29; FR-65) *Corrected by Epic 98 (story 98.1):* it is a data
+  migration — the bytes move once, and a phone folder's absolute path was stored in `sync.db`
+  (Epic 66) — so the move is journaled (`keeper_core::container`) and phone folders are stored
+  relative to the data directory; `docs/ios.md`, *Where keeper keeps its data*. Plan B (UniFFI + native SwiftUI shell) stays shelved with
   its revisit triggers recorded — the blank-webview bug class proving unfixable across Tauri
   releases, or NSE work beginning. (PRD §13.8)
 - **Status / owner:** deferred. Revisit is owned by the PM/owner, when push demand is real.
@@ -1746,6 +1749,21 @@ an irreversible action stand for more than once.
   mounts no drive, so nothing the argv does not show can leave (rulings R24(15), R28 S-03). A
   session tainted by outside content needs a person for anything consequential (D-34). The approval
   binds what was shown to what runs; drift denies it.
+- **The Linux filter, exactly (Q7; rulings R147, R213):** the trampoline refuses to start when any
+  descriptor but standard input, output and error is open; landlock (ABI 6 or newer, a hard
+  requirement) grants only the plan's folders, nothing of `/proc`, `/sys`, `/dev` (but `null`,
+  `zero`, `urandom`), `/run`, a drive's `.git/` or `.keeper/`, the home's credentials or the host's
+  secrets, and scopes abstract Unix sockets and signals to the run; seccomp answers `EPERM` to
+  `socket(2)` for every family without network and for every family but IPv4 and IPv6 with it, and
+  in every run to the calls that reach another process (`ptrace`, `process_vm_*`, `kcmp`,
+  `pidfd_getfd`, `perf_event_open`, io_uring), the keyrings, System V IPC and POSIX message queues,
+  `bpf`, `personality`, a namespace (`unshare`, `setns`, a `clone` with a `CLONE_NEW*` flag),
+  leaving the process group (`setsid`, `setpgid`) and every metadata change (the chmod, chown,
+  xattr and utime families, which landlock does not mediate), with the x32 numbers too; `clone3`
+  gets `ENOSYS` so the C library falls back to `clone`, and a call of another architecture kills
+  the process. Each rule is proved twice: on the generated filter itself, and on the kernel beside
+  a control outside the sandbox that this host does not refuse. The metadata rule costs modes and
+  times inside the workspace too (DW-758).
 - **Why a sandbox and not a policy:** in-process guardrails do not hold against an adversarial
   model — "the only security boundary against an adversarial LLM is the operating system" (the
   operator's own lesson, research §3.9). A rule the model can talk past is not a boundary.
@@ -1885,6 +1903,12 @@ notification's content, host an agent on a phone or a tablet, or write a session
   on the tablet (Tauri #15671 and its kin), which is D-1's own Plan B trigger. Neither reopens the
   second paragraph: a project-run gateway is not a revisit, it is the infrastructure D-1 and D-4
   refuse.
+- **D-1's Plan B trigger, answered (codemap Q10, Epic 98 story 98.1):** D-1 keeps Plan B (UniFFI
+  and a native shell) shelved with "NSE work beginning" among its revisit triggers. That work has
+  begun and does not reopen it: the extension is `keeper-nse`, a static library of keeper's own
+  that depends on `keeper-core` alone (`bun run check:nse-lean`) behind one C call, and the app's
+  notification delegate is one Swift file calling three C functions of the Tauri shell
+  (`push_ios.rs`). Neither needs a second shell or generated bindings, so the trigger is spent.
 - **Status / owner:** decided by the owner on 2026-10-01 (round 2), pinned by the coordinator
   (P15, rulings R20, R24(13), R24(14); R28 S-10; R29 F9, F14). Owner is the architect. Epic 98 implements it: the iPhone's pusher, notification service
   extension and actions; the phone's sessions board; and keeper's Android platform, build and
@@ -1916,6 +1940,38 @@ them, download them from anyone else, send audio anywhere, or start the micropho
   on-device recogniser in segmented sessions with echo-cancelled capture and, where `ort` has no
   runtime, no turn models (DW-413); continuous duplex on Android is a documented limitation, not a
   promise. (AD-410, AD-411, AD-414; FR-814…FR-816, FR-820; NFR-114, NFR-119; Epics 97, 98)
+- **A complete set, per group (as built, 97.1):** hydration runs per role group into
+  `<data_dir>/models/` — `transcription` (every folder but the turn models') and `turn` (the
+  turn models' folders and any picked in Settings) — each with its own completion marker over
+  what it holds, written last; the turn models load only when their group's marker matches what
+  the clone names now, so a turn-model update never makes transcription "updating", and a phone
+  that fetches only the turn group is complete. No folder is in both groups: a picked turn folder,
+  and any folder holding a turn model's `model.onnx`, is never transcription's (a folder
+  `[asr]`/`[diarizer]` names stays transcription's). `models.toml` is copied by both groups, but
+  each group's marker records only its own sections of it, so switching `[smart_turn] dir` leaves
+  transcription current.
+- **One rule loads them (as built, 97.1):** `keeper_core::voice::turn_models::TurnDisk::load`
+  decides whether the turn models may be loaded — an account, a complete turn group whose marker
+  the clone names now, both files there — and the voice settings' line is computed from the same
+  facts, so the line and the loaded models never disagree. Forgetting the account unloads them;
+  an unreachable server leaves the clone, and the loaded models, as they were. Loads at launch
+  and after each fetch race; only the newest load is published (`LoadSlot`), and one whose files
+  were replaced while it read them is dropped. A model file whose tensors are not named as keeper
+  feeds and reads them is refused at load, and a worker that stops is an error to every caller,
+  never a wait.
+- **The runtime is linked, not a model (as built, 97.1):** `ort` 2.0.0-rc.13 links ONNX Runtime
+  1.28.0 statically into keeper on Apple silicon Macs and the iPhone — a library, not model
+  weights, so "nothing bundled" still holds of models. It is MIT; pyke's artefact carries no
+  licence file, so the licence, its ThirdPartyNotices and the artefacts' hashes are in `NOTICE`
+  and `licenses/`, which both apps carry (`keeper.app/Contents/Resources/`, the top of the
+  iPhone app). The build downloads it from `cdn.pyke.io`; keeper never does. CPU only: no
+  execution provider is registered. Intel Macs and the iOS simulator have no turn models.
+- **The picks reach every device (as built, 97.1):** `transcription.vad_model` and
+  `transcription.smart_turn_model` are user-global, so a pick reaches the phone; every device
+  that runs the turn models fetches the picked folder as well, and a pick missing there is
+  refused, never replaced by the repository's. Settings has no picker for the two keys yet
+  (DW-490), so the refusal names the key and says to set it to another folder of `_models/` in
+  the account's `settings.toml` or remove it.
 - **Why from `_models/` and not bundled:** D-5's reason still holds — a model's terms are not
   keeper's to imply, and every byte keeper ships is keeper's. The organisation that runs the
   account chooses to distribute the models, as D-29 records for transcription. Without an account

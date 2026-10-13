@@ -1,16 +1,27 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
-<!-- GENERATED MIRROR (Story 14.7, FR-65): XcodeGen regenerates this file from
+<!-- GENERATED MIRROR (Story 14.7, FR-65; Epic 98): XcodeGen regenerates this file from
      project.yml `entitlements.properties` on every `xcodegen generate` — edit the
      value THERE, not here (an edit made only here is silently reverted; this
-     comment is likewise stripped on regeneration, which is fine — the value is
-     what matters and it is pinned by crates/keeper/tests/entitlements_protection.rs).
+     comment is likewise stripped on regeneration, which is fine — the values are
+     what matter, and crates/keeper-core/tests/apple_entitlements.rs pins that this
+     file says exactly what project.yml says).
      Default data protection must stay CompleteUntilFirstUserAuthentication, never
-     NSFileProtectionComplete (which would lock the SQLite WAL after screen lock
-     and stall a resumed sync loop). -->
+     NSFileProtectionComplete (which would lock the SQLite WAL after screen lock and
+     stall a resumed sync loop). -->
 <dict>
+	<key>aps-environment</key>
+	<string>development</string>
 	<key>com.apple.developer.default-data-protection</key>
 	<string>NSFileProtectionCompleteUntilFirstUserAuthentication</string>
+	<key>com.apple.security.application-groups</key>
+	<array>
+		<string>group.dev.tgorka.keeper</string>
+	</array>
+	<key>keychain-access-groups</key>
+	<array>
+		<string>$(AppIdentifierPrefix)dev.tgorka.keeper</string>
+	</array>
 </dict>
 </plist>

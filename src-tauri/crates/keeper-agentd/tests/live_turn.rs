@@ -146,6 +146,19 @@ async fn host(
     model: &Model,
     lure: Option<&OwnedRoomId>,
 ) -> Host {
+    host_with(smoke, agent, password_key, model, lure, &[]).await
+}
+
+/// [`host`] with `guests` invited to the room and reading the drive and
+/// the session beside the person.
+async fn host_with(
+    smoke: &Smoke,
+    agent: &str,
+    password_key: &str,
+    model: &Model,
+    lure: Option<&OwnedRoomId>,
+    guests: &[OwnedUserId],
+) -> Host {
     let root = tempfile::tempdir().expect("tempdir");
     let agent_user = smoke.user(agent);
     let person = smoke.user("tgorka-smoke");
@@ -163,15 +176,24 @@ async fn host(
         .create_room(
             RoomKind::Session(SessionKind::Main),
             "smoke",
-            vec![person.clone()],
+            std::iter::once(person.clone())
+                .chain(guests.iter().cloned())
+                .collect(),
             &[],
         )
         .await
         .expect("room");
 
-    let readers = [person.clone()].into_iter().collect();
+    let readers = std::iter::once(person.clone())
+        .chain(guests.iter().cloned())
+        .collect();
+    let quoted = std::iter::once(&person)
+        .chain(guests)
+        .map(|reader| format!("\"{reader}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
     let drive_toml = format!(
-        "version = 1\nid = \"smoke\"\ntitle = \"smoke\"\nprincipal = \"tgorka\"\nowner = \"{person}\"\nreaders = [\"{person}\"]\n"
+        "version = 1\nid = \"smoke\"\ntitle = \"smoke\"\nprincipal = \"tgorka\"\nowner = \"{person}\"\nreaders = [{quoted}]\n"
     );
     let decl = keeper_core::agents::drive::parse(&drive_toml).expect("decl");
     let session = SessionAgent {
@@ -182,6 +204,7 @@ async fn host(
         title: "smoke".to_owned(),
         requested_by: person.clone(),
         parent: None,
+        reply: None,
         room: room.clone(),
         drives: vec!["smoke".to_owned()],
         label: Label {
@@ -197,6 +220,7 @@ async fn host(
         checkpoints: None,
         outputs: Vec::new(),
         created_at: chrono::Utc::now(),
+        gate: None,
     };
     let soul = "---\nname: Nixi\ntitle: the smoke proxy\nicon: \"*\"\nrole: Answers the smoke test.\nidentity: \"A test proxy.\"\ncommunication_style: Short.\nprinciples:\n  - Answer from the drive.\n---\n\nNixi answers from the drive.\n";
     let mut files = vec![
@@ -234,7 +258,7 @@ async fn host(
         ""
     };
     let config = format!(
-        "version = 1\nprincipal = \"tgorka\"\nhost = \"{HOST}\"\n\n[homeserver]\nurl = \"{}\"\n\n[[drives]]\nid = \"smoke\"\nremote = \"{}\"\nowner = \"{person}\"\nreaders = [\"{person}\"]\n\n[[providers]]\nkind = \"openai\"\nbase_url = \"{}\"\n{provider_credential}\n[[agents]]\ndrive = \"smoke\"\nids = [\"nixi\"]\n",
+        "version = 1\nprincipal = \"tgorka\"\nhost = \"{HOST}\"\n\n[homeserver]\nurl = \"{}\"\n\n[[drives]]\nid = \"smoke\"\nremote = \"{}\"\nowner = \"{person}\"\nreaders = [{quoted}]\n\n[[providers]]\nkind = \"openai\"\nbase_url = \"{}\"\n{provider_credential}\n[[agents]]\ndrive = \"smoke\"\nids = [\"nixi\"]\n",
         smoke.homeserver,
         bare.display(),
         model.base_url
@@ -1044,8 +1068,14 @@ async fn a_spoken_question_is_one_message_and_its_answer_follows() {
     assert_eq!(anchors(&seen, &agent), 2, "answered once each");
     assert!(host.log_text().contains("a turn was answered"));
 
-    // What was heard: the first words, the closed sentence once, the tail.
-    let (first, rest) = steps.split_first().expect("something was heard");
+    // What was heard: the answer's anchor, the first words, the closed
+    // sentence once, the tail.
+    let (anchored, steps) = steps.split_first().expect("something was heard");
+    assert!(
+        matches!(anchored, SpokenStep::Anchored { .. }),
+        "{anchored:?}"
+    );
+    let (first, rest) = steps.split_first().expect("words were heard");
     assert!(
         matches!(first, SpokenStep::FirstText { after_ms } if *after_ms < 60_000),
         "{first:?}"
@@ -1058,16 +1088,17 @@ async fn a_spoken_question_is_one_message_and_its_answer_follows() {
     let sentences: Vec<&str> = sentences
         .iter()
         .map(|s| match s {
-            SpokenStep::Sentence(sentence) => sentence.as_str(),
+            SpokenStep::Sentence(sentence) => sentence.text.as_str(),
             other => panic!("a sentence, not {other:?}"),
         })
         .collect();
-    let SpokenStep::Complete(tail) = closing else {
-        panic!("the answer completes: {closing:?}");
+    let SpokenStep::Complete(Some(tail)) = closing else {
+        panic!("the answer completes with its tail: {closing:?}");
     };
     let (first_sentence, second) = ANSWER.split_once(". ").expect("two sentences");
     assert_eq!(sentences, [format!("{first_sentence}.")]);
-    assert_eq!(tail, second);
+    assert_eq!(tail.text, second);
+    assert_eq!(tail.end, ANSWER.chars().count());
     host.kill();
 }
 
@@ -1144,5 +1175,191 @@ async fn the_largest_final_message_that_fits_encrypted() {
     assert!(
         cut + 512 <= low,
         "FINAL_CUT_BYTES {cut} plus its link does not fit under {low}"
+    );
+}
+
+/// A spoken answer of three sentences, streamed in four pieces.
+const SPOKEN: &str = "The drive holds one note. It says hello twice. Nothing else is there.";
+
+/// Story 97.3, acceptance 7, on Synapse (Q10): after a typed question is
+/// answered, `dev.keeper.agent.heard` events reach the running host from
+/// Marta (a reader of the session who is not the proxy's person), from a
+/// fresh login of the person that nobody signed, from the person's
+/// cross-signed device naming the question instead of an answer, and from
+/// that device naming the answer — at an offset that disagrees with the
+/// sentence count. Only the last is logged, once, at the offset the host
+/// counted; a second mark of the answer is not; a restart that reads the
+/// room again logs nothing more. The log keeps the whole answer and its
+/// replay ends at the second sentence with the note.
+#[ignore = "live: Synapse on delectra"]
+#[tokio::test(flavor = "multi_thread")]
+async fn heard_event_is_validated_and_logged_once() {
+    use keeper_agent::rooms::{NOT_THE_PERSON, UNSIGNED_DEVICE};
+    use keeper_core::agents::heard::{
+        message_text, ALREADY_MARKED, NOT_AN_ANSWER, STOPPED_LISTENING,
+    };
+    use keeper_core::agents::log::reader::{hydrate_blob, read_session};
+    use keeper_core::agents::log::replay::replay;
+    use keeper_core::agents::log::{HeardReason, LineBody, LineKind};
+    use keeper_core::voice::speech::sentence_ends;
+
+    let smoke = Smoke::from_env();
+    let stub = stub(SPOKEN, 4, Duration::from_millis(800));
+    let agent = smoke.user("nixi-smoke");
+    let tgorka = smoke.user("tgorka-smoke");
+    let marta_user = smoke.user("marta-smoke");
+    let marta_password = ulid::Ulid::new().to_string();
+    smoke
+        .admin(
+            reqwest::Method::PUT,
+            &format!("/_synapse/admin/v2/users/{marta_user}"),
+            Some(json!({ "password": marta_password, "admin": false })),
+        )
+        .await;
+    smoke.clear_devices(&marta_user).await;
+    for user in [&agent, &tgorka, &marta_user] {
+        smoke.set_ratelimit(user, 0, 0).await;
+    }
+    let mut host = host_with(
+        &smoke,
+        "nixi-smoke",
+        "NIXI_SMOKE_PASSWORD",
+        &stub_model(&stub),
+        None,
+        std::slice::from_ref(&marta_user),
+    )
+    .await;
+    host.start();
+    host.wait_serving(&host.room.clone()).await;
+    let room = host.room.clone();
+    let dir = host.root.path().join("person");
+    let (client, seen, _sync) = person(&smoke, &dir, &room).await;
+    let password = smoke.secret("TGORKA_SMOKE_PASSWORD").to_owned();
+    common::bootstrap(&client, &tgorka, &password).await;
+    let unsigned = smoke
+        .client(
+            &host.root.path().join("unsigned"),
+            "tgorka-smoke",
+            &password,
+        )
+        .await;
+    let marta = smoke
+        .client(
+            &host.root.path().join("marta"),
+            "marta-smoke",
+            &marta_password,
+        )
+        .await;
+    for other in [&unsigned, &marta] {
+        other.join(&room).await.expect("join");
+        other.sync_once().await.expect("sync");
+    }
+    for everyone in [&client, &unsigned, &marta] {
+        everyone.sync_once().await.expect("sync");
+    }
+
+    let question = say(&client, &room, "what does the drive hold").await;
+    answer_to(&seen, &agent, &question, "the question", &|text| {
+        text == SPOKEN
+    })
+    .await;
+    let anchor = seen
+        .lock()
+        .expect("lock")
+        .iter()
+        .find(|(_, e)| e["sender"] == agent.as_str() && e["content"][events::TURN].is_object())
+        .and_then(|(_, e)| e["event_id"].as_str().map(str::to_owned))
+        .expect("the answer's anchor");
+    for everyone in [&client, &unsigned, &marta] {
+        everyone.sync_once().await.expect("sync");
+    }
+
+    let mark = |anchor: &str| json!({"v": 1, "anchor": anchor, "heard_until": 0, "sentence": 2, "reason": "stop"});
+    marta
+        .send(&room, events::HEARD, mark(&anchor), None)
+        .await
+        .expect("Marta's mark");
+    unsigned
+        .send(&room, events::HEARD, mark(&anchor), None)
+        .await
+        .expect("the unsigned device's mark");
+    client
+        .send(&room, events::HEARD, mark(&question), None)
+        .await
+        .expect("a mark of the question");
+    let logged = client
+        .send(&room, events::HEARD, mark(&anchor), None)
+        .await
+        .expect("the person's mark");
+    client
+        .send(&room, events::HEARD, mark(&anchor), None)
+        .await
+        .expect("a second mark");
+
+    let session = host.root.path().join(format!(
+        "data/keeper-agentd/drives/smoke/60-sessions/{SESSION}"
+    ));
+    let marks = |session: &Path| {
+        read_session(session)
+            .lines
+            .into_iter()
+            .filter(|line| line.kind() == LineKind::Heard)
+            .collect::<Vec<_>>()
+    };
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while !host.log_text().contains(ALREADY_MARKED) {
+        assert!(
+            Instant::now() < deadline,
+            "the second mark was never refused:\n{}",
+            host.log_text()
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    let said = host.log_text();
+    for note in [NOT_THE_PERSON, UNSIGNED_DEVICE, NOT_AN_ANSWER] {
+        assert!(
+            said.contains(note),
+            "{note} missing from the host's log:\n{said}"
+        );
+    }
+
+    // A restart reads the room again: nothing more is logged.
+    host.kill();
+    host.start();
+    host.wait_serving(&room).await;
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    host.kill();
+
+    let lines = marks(&session);
+    assert_eq!(lines.len(), 1, "one mark, logged once: {lines:?}");
+    assert_eq!(lines[0].matrix_event.as_ref(), Some(&logged));
+    let LineBody::Heard(body) = &lines[0].body else {
+        panic!("a heard line");
+    };
+    let second = sentence_ends(SPOKEN)[1] as u64;
+    assert_eq!(
+        (body.heard_until, body.sentence, body.reason),
+        (second, 2, HeardReason::Stop),
+        "the host's own count, not the device's 0"
+    );
+    let log = read_session(&session);
+    assert!(log.lines.iter().any(|line| matches!(
+        &line.body,
+        LineBody::Assistant(said) if said.text == SPOKEN
+    )));
+    let replayed = replay(&log, &|sha| hydrate_blob(&session, sha)).expect("replay");
+    let last = replayed
+        .messages
+        .iter()
+        .rev()
+        .find(|m| m.role == keeper_core::bots::chat::Role::Assistant)
+        .map(message_text)
+        .expect("the answer");
+    let kept: String = SPOKEN.chars().take(second as usize).collect();
+    assert_eq!(last, format!("{kept}\n\n{STOPPED_LISTENING}"));
+    assert_eq!(
+        *stub.requests.lock().expect("lock"),
+        1,
+        "no mark started a turn"
     );
 }

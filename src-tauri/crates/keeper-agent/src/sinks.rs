@@ -39,10 +39,9 @@ use keeper_core::bots::tools::ToolOutcome;
 use matrix_sdk::ruma::{OwnedRoomId, OwnedUserId, UserId};
 use serde_json::Value;
 
-use crate::delegate::MembersFuture;
 use crate::host::Approval;
-use crate::matrix_sink::{EditPort, SendFuture};
-use crate::rooms::Known;
+use crate::matrix_sink::{EditPort, MembersFuture, SendFuture};
+use crate::rooms::{Known, KnownAgent};
 use crate::sessions::verbs;
 use crate::turn::now_ms;
 
@@ -70,7 +69,28 @@ pub fn room_audience(
         .into_iter()
         .filter(|member| !own.contains(member))
         .collect();
-    crate::doorbell::room_sink(members, known.map_or(&[][..], |known| &known.agents))
+    room_sink(members, known.map_or(&[][..], |known| &known.agents))
+}
+
+/// The audience of a room whose members — joined or invited — are
+/// `members` (R160): each one of `agents` through its own audience, every
+/// other member as a person, whatever power the room gives them. An account
+/// this host cannot name as an agent is a person, so it must be a reader.
+pub fn room_sink(members: BTreeSet<OwnedUserId>, agents: &[KnownAgent]) -> Sink {
+    let mut humans = BTreeSet::new();
+    let mut agent_audiences = Vec::new();
+    for member in members {
+        match agents.iter().find(|agent| agent.matrix_user == member) {
+            Some(agent) => agent_audiences.push(agent.home_readers.clone()),
+            None => {
+                humans.insert(member);
+            }
+        }
+    }
+    Sink::Room {
+        humans,
+        agent_audiences,
+    }
 }
 
 /// One session room's outbound boundary (R168): every send that carries
@@ -801,6 +821,22 @@ impl<'s> CallAudit<'s> {
         Ok(())
     }
 
+    /// A call [`CallAudit::admit`] parked that does not wait after all — a
+    /// gate's hand-off whose ticket could not be had: the row its park
+    /// left pending closed refused, so the call keeps one row (R172).
+    pub fn unpark(&self) {
+        let Some(Approval::Park(approval)) = self.approval() else {
+            return;
+        };
+        match audit::parked_row(&self.sinks.data_dir, &approval.to_string()) {
+            Ok(Some(row)) => self.sinks.close(row, AuditOutcome::Refused),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(%error, tool = self.tool, "agents: a call that does not wait could not find its pending audit row");
+            }
+        }
+    }
+
     /// The call ended with `outcome`: its admitted row closed with it, or —
     /// a call that ended before its sinks were asked — its row written now.
     pub fn finish(&self, outcome: &ToolOutcome) {
@@ -869,7 +905,9 @@ pub trait ProxyDoors: Send + Sync {
         event_type: &'a str,
         content: Value,
     ) -> SendFuture<'a>;
-    /// The decisions this host waits for in its proxies' DMs (R89).
+    /// The decisions this host waits for in its proxies' DMs (R89). A
+    /// phone waits for none: it runs no session.
+    #[cfg(not(phone))]
     fn forwards(&self) -> &crate::deciding::Forwards;
 }
 
@@ -887,6 +925,7 @@ struct Door {
 #[derive(Default)]
 pub struct ClientDoors {
     proxies: RwLock<Vec<Door>>,
+    #[cfg(not(phone))]
     forwards: crate::deciding::Forwards,
 }
 
@@ -962,6 +1001,7 @@ impl ProxyDoors for ClientDoors {
         })
     }
 
+    #[cfg(not(phone))]
     fn forwards(&self) -> &crate::deciding::Forwards {
         &self.forwards
     }

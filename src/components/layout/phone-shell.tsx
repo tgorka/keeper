@@ -99,6 +99,8 @@ import { SettingsPane } from "@/components/layout/settings-pane";
 import { OFFLINE_PILL_TEXT } from "@/components/layout/sidebar-pane";
 import { SyncPane } from "@/components/layout/sync-pane";
 import { NotesPhoneList, NotesPhoneNote } from "@/components/notes/notes-phone-pane";
+import { SESSIONS_PANE_TITLE } from "@/components/sessions/sessions-pane";
+import { SessionsPhoneBoard, SessionsPhoneList } from "@/components/sessions/sessions-phone-pane";
 import { useKeyboardInset } from "@/hooks/use-keyboard-inset";
 import { useReducedMotion } from "@/hooks/use-reduced-motion";
 import { useShellLayout } from "@/hooks/use-shell-layout";
@@ -282,6 +284,12 @@ function StackLevel({
   );
 }
 
+/** What the split tablet's room pane says before a room is chosen (UX-DR146). */
+export const TABLET_NO_ROOM_SENTENCE = "Choose a conversation from the list.";
+
+/** The room levels' box on a split tablet: right of the Inbox column. */
+const ROOM_PANE_SPLIT = "absolute inset-y-0 right-0 left-[var(--tablet-list)] z-10";
+
 export function PhoneShell() {
   const selected = useRoomsStore((s) => s.selected);
   const detailOpen = useDetailStore((s) => s.open);
@@ -291,7 +299,7 @@ export function PhoneShell() {
   // Keyboard avoidance (Story 13.5, UX-DR25): only the phone tier drives the
   // `--kb-inset` var — the visualViewport listener never runs on desktop/tablet,
   // so the desktop layout stays byte-for-byte.
-  const { phone } = useShellLayout();
+  const { phone, split } = useShellLayout();
   useKeyboardInset({ enabled: phone });
 
   // Story 62.2 / 66.1 / 66.4: the view levels. With no room selected, a view
@@ -341,6 +349,25 @@ export function PhoneShell() {
   // The Notes list pushes its note from an effect that fires on the active
   // panel target changing, so the callback identity has to hold still.
   const pushNotes = useCallback(() => setPushedSurface("notes"), []);
+  // The session the Sessions surface's second level shows (98.2). Kept after
+  // the level pops, so the exit slide keeps drawing the board that is leaving;
+  // replaced by the next row a person opens. `page` is the column the person
+  // rests on: a card's room covers — and unmounts — the board, and backing out
+  // of the room must land on the page it left from, not on the first.
+  const [phoneSession, setPhoneSession] = useState<{
+    rootId: string;
+    sessionId: string;
+    page: number;
+  } | null>(null);
+  const pushSession = useCallback((target: { rootId: string; sessionId: string }) => {
+    setPhoneSession({ ...target, page: 0 });
+    setPushedSurface("sessions");
+  }, []);
+  const rememberSessionPage = useCallback((page: number) => {
+    setPhoneSession((shown) =>
+      shown === null || shown.page === page ? shown : { ...shown, page },
+    );
+  }, []);
 
   // An agent's surface request brought a note forward: the request
   // already made Notes the view and the note the active panel, so show it —
@@ -406,6 +433,11 @@ export function PhoneShell() {
   const surfaceBack1Ref = useRef<HTMLButtonElement>(null);
   const surfaceBack2Ref = useRef<HTMLButtonElement>(null);
   const roomLevels = selected !== null;
+  // A tablet at least 840 dp wide (story 98.3 #5, UX-DR146) shows the rooms
+  // list and the open room side by side: the room levels stand beside the
+  // Inbox rather than over it, so the Inbox stays live — never dimmed, shifted
+  // or inert — while a room is open. The view levels still cover the whole.
+  const sideBySide = split && roomLevels;
   // The most recently focused element per level, tracked via focus-capture on
   // each level's wrapper — captured *before* a push makes the level inert (an
   // inert subtree blurs its focus, so reading `document.activeElement` in the
@@ -434,7 +466,12 @@ export function PhoneShell() {
           : roomLevels
             ? back1Ref
             : surfaceBack1Ref;
-      backRef.current?.focus();
+      // `preventScroll`: the level is still at its entering offset when this
+      // runs, and a focus that scrolls into view scrolls the stack's own
+      // clipping root to reach it — measured on the sessions board (98.2),
+      // which then sat 238 px left of the screen after its slide ended. Where
+      // a level lies is the transition's business, never focus's.
+      backRef.current?.focus({ preventScroll: true });
       return;
     }
     // Pop: restore focus to the element that pushed the popped level; when it
@@ -443,10 +480,13 @@ export function PhoneShell() {
     for (let l = prev; l > level; l--) {
       pushersRef.current.delete(l);
     }
+    // `preventScroll` for the push's reason: the pusher may sit in a level that
+    // is itself sliding (a card's room opened over the board pops 2 → 1, and the
+    // pusher is the sessions row on the leaving surface level).
     if (pusher?.isConnected) {
-      pusher.focus();
+      pusher.focus({ preventScroll: true });
     } else if (level === 1) {
-      (roomLevels ? back1Ref : surfaceBack1Ref).current?.focus();
+      (roomLevels ? back1Ref : surfaceBack1Ref).current?.focus({ preventScroll: true });
     }
     // `roomLevels` is a fact about the same render as `level`; a selection
     // change at an unchanged level returns at the guard above.
@@ -892,19 +932,24 @@ export function PhoneShell() {
     <div
       ref={containerRef}
       onKeyDown={onKeyDown}
-      className="relative flex min-h-0 min-w-0 flex-1 overflow-hidden"
+      className="relative flex min-h-0 min-w-0 flex-1 overflow-hidden [--tablet-list:min(24rem,42%)]"
     >
-      {/* Level 0 — always mounted so the Inbox scroll position survives pushes. */}
+      {/* Level 0 — always mounted so the Inbox scroll position survives pushes.
+          On a split tablet it is the left column, beside the room levels. */}
       <StackLevel
         levelIndex={0}
         open
-        covered={level > 0}
-        inert={level !== 0}
+        covered={level > 0 && !sideBySide}
+        inert={level !== 0 && !sideBySide}
         reducedMotion={reducedMotion}
         dragX={null}
-        coveredProgress={coveredProgressFor(0)}
+        coveredProgress={sideBySide ? null : coveredProgressFor(0)}
         onFocusCapture={captureFocusFor(0)}
-        className="min-h-0 min-w-0 flex-1"
+        className={
+          split
+            ? "relative min-h-0 w-[var(--tablet-list)] shrink-0 border-border border-r"
+            : "min-h-0 min-w-0 flex-1"
+        }
       >
         {/* Level 0's leading edge opens the drawer (the edge 13.2 reserved); the
             top band pulls down to open Search (Story 13.4). */}
@@ -917,6 +962,12 @@ export function PhoneShell() {
           <ChatListPane />
         </div>
       </StackLevel>
+      {/* The split tablet's right pane before a room is chosen. */}
+      {split && (
+        <div className="flex min-w-0 flex-1 items-center justify-center p-6 text-muted-foreground text-sm">
+          {TABLET_NO_ROOM_SENTENCE}
+        </div>
+      )}
       <StackLevel
         levelIndex={1}
         open={selected !== null}
@@ -926,10 +977,18 @@ export function PhoneShell() {
         dragX={dragXFor(1)}
         coveredProgress={coveredProgressFor(1)}
         onFocusCapture={captureFocusFor(1)}
-        className="absolute inset-0 z-10"
+        className={split ? ROOM_PANE_SPLIT : "absolute inset-0 z-10"}
       >
         {level === 1 && edgeSwipeZone}
-        <PhoneHeader level={1} onBack={onBack} backRef={back1Ref} />
+        {/* A card of the sessions board opens its room with the view left on
+            Sessions, so popping the room lands on the board and the back button
+            says so (98.2). Other surfaces under a room: DW-1280. */}
+        <PhoneHeader
+          level={1}
+          onBack={onBack}
+          backRef={back1Ref}
+          surfaceTitle={surface === "sessions" ? SESSIONS_PANE_TITLE : undefined}
+        />
         <div className="flex min-h-0 min-w-0 flex-1">
           <ConversationPane
             detailOpen={detailOpen}
@@ -947,7 +1006,7 @@ export function PhoneShell() {
         dragX={dragXFor(2)}
         coveredProgress={null}
         onFocusCapture={captureFocusFor(2)}
-        className="absolute inset-0 z-20"
+        className={split ? `${ROOM_PANE_SPLIT} z-20` : "absolute inset-0 z-20"}
       >
         {level === 2 && edgeSwipeZone}
         <PhoneHeader level={2} onBack={onBack} backRef={back2Ref} />
@@ -958,7 +1017,8 @@ export function PhoneShell() {
       {/* Story 62.2 / 66.1 — the view levels, occupying levels 1 and 2 only
           while no room is selected (the room levels above are closed then, so
           the two families never share a level). Bots is the list, then the
-          conversation; Notes is the list, then the note (66.4); Approvals,
+          conversation; Notes is the list, then the note (66.4); Sessions is
+          the zone's sessions, then one session's board (98.2); Approvals,
           Bridges, Sync, Files and Settings are the same panes the desktop
           renders, under one "Back to Inbox" bar. A new surface is one more
           `PhoneSurface` member, one arm in `phoneSurfaceFor`, and one branch
@@ -983,6 +1043,8 @@ export function PhoneShell() {
           />
         ) : shownSurface === "notes" ? (
           <NotesPhoneList onBack={onBack} backRef={surfaceBack1Ref} onOpen={pushNotes} />
+        ) : shownSurface === "sessions" ? (
+          <SessionsPhoneList onBack={onBack} backRef={surfaceBack1Ref} onOpen={pushSession} />
         ) : shownSurface !== null ? (
           <>
             <PhoneBackBar
@@ -1027,6 +1089,20 @@ export function PhoneShell() {
             level keeps drawing the pane that is leaving. */}
         {shownPushed === "notes" ? (
           <NotesPhoneNote onBack={onBack} backRef={surfaceBack2Ref} />
+        ) : shownPushed === "sessions" ? (
+          phoneSession !== null && (
+            <SessionsPhoneBoard
+              // Another session is another board: its page starts where the
+              // shell says, not where a still-exiting one was left.
+              key={`${phoneSession.rootId}/${phoneSession.sessionId}`}
+              rootId={phoneSession.rootId}
+              sessionId={phoneSession.sessionId}
+              onBack={onBack}
+              backRef={surfaceBack2Ref}
+              initialPage={phoneSession.page}
+              onPageChange={rememberSessionPage}
+            />
+          )
         ) : (
           <BotsPhoneConversation onBack={onBack} backRef={surfaceBack2Ref} />
         )}

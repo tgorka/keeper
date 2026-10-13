@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/keeper-core", "crates/keeper", "crates/keeper-sync", "crates/keeper-syncd", "crates/keeper-ported", "crates/keeper-agent", "crates/keeper-agentd"]
+members = ["crates/keeper-core", "crates/keeper", "crates/keeper-sync", "crates/keeper-syncd", "crates/keeper-ported", "crates/keeper-agent", "crates/keeper-agentd", "crates/keeper-nse"]
 
 [workspace.package]
 version = "0.9.0"
@@ -197,6 +197,26 @@ objc2-ui-kit = { version = "0.3.2", default-features = false, features = [
 # Account registry + opaque account ids (both already present transitively via matrix-sdk).
 ulid = "1"
 rusqlite = { version = "0.37", features = ["bundled"] }
+# The classic NanoKVM's login (96.5, `keeper-ported::nanokvm`): its password
+# travels AES-256-CBC-encrypted under a key the reference publishes. Both
+# already in Cargo.lock (matrix-sdk-crypto, vodozemac); `MIT OR Apache-2.0`.
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc", "block-padding"] }
+# A KVM's self-signed certificate is accepted only when its SHA-256 is the
+# configured `fingerprint` (AD-409): keeper's own verifier, handed to reqwest
+# as a preconfigured `ClientConfig` and to the KVM's WebSocket through
+# tokio-rustls — the TLS stack reqwest already uses, so no second one. Both in
+# Cargo.lock; rustls `Apache-2.0 OR ISC OR MIT`, tokio-rustls `MIT OR Apache-2.0`.
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "aws_lc_rs"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["tls12"] }
+# The classic NanoKVM's HID input over its `/api/ws` WebSocket (96.5): the
+# handshake only, over keeper's own pinned TLS stream — no TLS feature of its
+# own. tokio-tungstenite MIT, tungstenite `MIT OR Apache-2.0`; `cargo deny
+# check` from `src-tauri/` passes with them.
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+# The classic NanoKVM login's IV, drawn from the OS as its reference draws it
+# (`os.urandom`). Already in Cargo.lock at 0.3.4; MIT OR Apache-2.0.
+getrandom = "0.3"
 
 # ---------------------------------------------------------------------------
 # Folder Sync phase (Epics 23–31, AD-40 … AD-53). Consumed by `keeper-sync`
@@ -309,6 +329,45 @@ toml_edit = "0.25.12"
 # tempfile and tokio, so the tree gains no package.
 # `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT`.
 rustix = { version = "1.1", default-features = false, features = ["std", "fs", "process"] }
+# An agent's `run` on Linux (D-33, AD-405): agentd re-executes itself, applies a
+# landlock ruleset and a seccomp filter to itself and then execs the program —
+# no `unsafe`. Linux-only target dependencies of keeper-agent. landlock is
+# `MIT OR Apache-2.0`, seccompiler (Firecracker's) `Apache-2.0 OR BSD-3-Clause`;
+# both pass `cargo deny check`.
+landlock = "0.4"
+seccompiler = "0.5"
+# Syscall numbers and address families for that filter — constants only, no
+# call through it. Already in Cargo.lock; `MIT OR Apache-2.0`.
+libc = "0.2"
+# The trampoline closes every descriptor it inherited but the standard
+# streams before it execs a run's program (R213): `nix::unistd::close` takes a
+# raw number safely, which std and rustix do not, so keeper's code stays free
+# of `unsafe` (R141). No feature: `unistd` is always built. MIT.
+nix = { version = "0.31", default-features = false }
+# An agent's MCP servers (AD-406): keeper is a client only. The streamable HTTP
+# transport rides the workspace's reqwest 0.13 (rmcp's own `reqwest` TLS feature
+# stays off, so rustls is the one TLS stack); the child-process transport is
+# compiled everywhere and refused at use where the host may not spawn.
+# `Apache-2.0`; `cargo deny check licenses bans sources` from `src-tauri/`
+# passes with it (R157). The server half and its HTTP service are
+# keeper-agent's dev-dependencies only, for in-test servers.
+rmcp = { version = "3.5", default-features = false }
+# The event-stream parser rmcp itself uses, under keeper's own bounded MCP HTTP
+# client (every body and event read only up to a bound). Already in Cargo.lock
+# at 0.2.6; `MIT OR Apache-2.0`.
+sse-stream = "0.2"
+# Serves an in-test MCP server's tower service over HTTP. Already in Cargo.lock
+# at 0.8.9; MIT.
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+# A self-signed certificate made per test run, for the in-test KVM and MCP
+# servers whose certificate keeper pins (96.5 #3/#4, DW-810): no private key is
+# ever committed. aws-lc-rs, the provider rustls already uses here. MIT OR
+# Apache-2.0 (yasna, pem: MIT OR Apache-2.0 / MIT).
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs"] }
+# A screenshot of the Mac's screen, decoded to grey for its region's
+# difference hash (96.4, Q13). PNG only; already in Cargo.lock at 0.25.10
+# through tauri, so no new crate. MIT OR Apache-2.0.
+image = { version = "0.25", default-features = false, features = ["png"] }
 # Exact-length streaming request bodies for LFS uploads (Story 25.3). This is
 # not optional sugar: `reqwest::Body::wrap_stream` and `Body::from(File)` both
 # yield an unknown-size body and therefore `Transfer-Encoding: chunked`, which
@@ -327,6 +386,11 @@ bytes = "1"
 # direct dep pulls no new crate version. MIT OR Apache-2.0 — passes
 # `cargo deny check`.
 base64 = "0.22"
+# The Android secret store's AEAD (Epic 98, story 98.3 #2): XChaCha20-Poly1305
+# over one file whose key the Android Keystore wraps. Already resolved in the
+# lock as matrix-sdk-store-encryption's cipher, so this adds no new package.
+# Apache-2.0 OR MIT.
+chacha20poly1305 = "0.10"
 # C-style unquoting for `.gitattributes` pattern fields (Story 46.1). A
 # gitattributes line whose pattern holds a space MUST be quoted — git decides
 # to unquote from the line's FIRST BYTE, so a backslash escape is read as an
@@ -460,14 +524,55 @@ objc2-natural-language = { version = "0.3.2", default-features = false, features
     "NLLanguage",
     "NLLanguageRecognizer",
 ] }
+# ONNX Runtime for the two turn models voice loads from the account's `_models/`
+# (Epic 97, D-36, AD-410): Silero VAD and Smart Turn, run on the CPU in
+# `voice_turn_models.rs`. Only pre-releases of 2.0 exist and they break between
+# each other, so the pin is exact. Default features off: no `fetch-models` (the
+# runtime never downloads a model), no `ndarray`, no `copy-dylibs`, no execution
+# provider (so nothing shares the Neural Engine with transcription), and rustls
+# rather than native TLS for the build script. `download-binaries` makes the
+# build script fetch ONNX Runtime 1.28.0 as one static `libonnxruntime.a` from
+# pyke's CDN (`cdn.pyke.io`), checked against the sha256 `ort-sys` pins for the
+# target, at build time only — keeper itself never contacts it. That library
+# is MIT (microsoft/onnxruntime v1.28.0), is not a cargo package, and carries
+# no licence file of its own, so its licence is recorded in `NOTICE` and
+# `docs/constraints-and-limitations.md`. `ort`/`ort-sys` are MIT OR Apache-2.0.
+# Consumed by the `keeper` crate on Apple silicon macOS and the iPhone (arm64
+# iOS, not the simulator) only — the two targets whose library and hash
+# `NOTICE` records; the iOS link also needs CoreML and libc++ in
+# `gen/apple/project.yml`. The library's licence and ThirdPartyNotices ship
+# inside both apps (`licenses/onnxruntime-1.28.0/`).
+ort = { version = "=2.0.0-rc.13", default-features = false, features = [
+    "std",
+    "download-binaries",
+    "tls-rustls",
+    "api-24",
+] }
+# The FFT under Smart Turn's log-mel front end (`keeper-ported::smart_turn`,
+# Epic 97, story 97.2): a 400-point transform per 10 ms frame, which is not a
+# power of two, so a mixed-radix library rather than a hand-written radix-2.
+# Pure Rust, no network, no build script. rustfft and its dependencies
+# (`num-complex`, `num-integer`, `num-traits`, `primal-check`, `strength_reduce`,
+# `transpose`) are MIT OR Apache-2.0 — on deny.toml's allow-list.
+rustfft = "6.4"
 
 # tao, the window layer under Tauri, from `tools/tao`: 0.35.3 as crates.io serves
 # it plus one hunk in `ios/app_state.rs`'s `connect_scene`, so a URL that LAUNCHED
 # the app (a scanned `keeper://setup?…` code while keeper is closed) is still
 # delivered once the UIScene lifecycle is on. iOS 27 requires that lifecycle, and
 # in it the launch URL exists only in the first scene's connection options, which
-# upstream (through 0.37.1) never reads. See tools/tao/NOTICE. Retire it when
-# upstream reads them: delete this table and the directory.
+# upstream (through 0.37.1) never reads; and the app delegate's two APNs-token
+# selectors, which push on the iPhone needs (Epic 98, `push_ios.rs`). See
+# tools/tao/NOTICE. Retire it when upstream has both: delete this table and the
+# directory.
 [patch.crates-io]
 tao = { path = "../tools/tao" }
 
+# SHA-256 at the shipped build's speed in debug and test builds too. keeper
+# hashes a program before it starts it as an MCP server (R225), inside the
+# server's 10 s answer bound (`keeper_agent::mcp::ANSWER_WITHIN`), and the
+# MCP tests start their own test binary as that server — 300 MB on a Mac,
+# which an unoptimised sha2 took ten of those seconds to hash (sampled on
+# hesperia, 2026-10-11). Nothing else of the build changes.
+[profile.dev.package.sha2]
+opt-level = 3

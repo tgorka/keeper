@@ -128,7 +128,12 @@ fn decisions(seen: &Seen) -> Vec<Arrived> {
         .iter()
         .filter(|(value, _)| value["type"] == APPROVAL_DECISION)
         .filter_map(|(value, encryption)| {
-            arrival_of(value, encryption.as_ref(), tokio::time::Instant::now())
+            arrival_of(
+                value,
+                encryption.as_ref(),
+                tokio::time::Instant::now(),
+                None,
+            )
         })
         .collect()
 }
@@ -198,7 +203,11 @@ fn request_of(
         room: room.to_string(),
         agent: "nixi".to_owned(),
         tier: 2,
-        summary: summary_of(AgentTool::from_wire("drive_write").expect("a tool"), args),
+        summary: summary_of(
+            AgentTool::from_wire("drive_write").expect("a tool"),
+            args,
+            &Value::Null,
+        ),
         action: RequestAction {
             tool: "drive_write".to_owned(),
             args: args.clone(),
@@ -206,6 +215,7 @@ fn request_of(
         },
         file: None,
         file_sha256: None,
+        preview: None,
         checkpoint_sha256: "c0ffee".to_owned(),
         preconditions,
         binding_digest: digest,
@@ -539,7 +549,7 @@ async fn a_card_is_decided_through_the_devices_own_path_and_closes_when_the_agen
         .expect("the attached action");
     assert_eq!(bound, large.binding_digest);
     assert_eq!(
-        serde_json::from_str::<Value>(&shown).expect("json"),
+        serde_json::from_str::<Value>(&shown.text).expect("json"),
         big,
         "the action as its digest binds it"
     );

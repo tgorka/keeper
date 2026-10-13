@@ -329,6 +329,11 @@ the house requires for each new crate, and `docs/project-context.md` gets the tw
 - **Running commands**: no tool executes a shell string. `docs/decisions.md` D-3 stands, and the
   general exec kind remains Epic 60's, unbuilt. This is stated because a filesystem tool surface is
   exactly where someone will propose `bash`. DW-213.
+  *Resolution (2026-10-07, D-33, story 96.1, R15, R213):* the letter is kept — no tool executes a
+  shell string, `run` refuses one in every disguise, and the programs keeper knows to run a command
+  line given as text, and no `TaskKind` runs a command; the intent is reversed for agents only —
+  an agent may run an argument list inside an OS sandbox behind an approval tier (`run`). ⌘9 bots
+  still have no shell tool.
 - **omp as a provider kind.** The enum stays closed at two. DW-214.
 - **Giving a Hermes bot the drive, by being an MCP server rather than a tool client.** This is the
   honest route and it is a real one: Hermes loads `mcp_servers:` from its own config over stdio or

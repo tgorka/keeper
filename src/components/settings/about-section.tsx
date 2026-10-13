@@ -19,6 +19,7 @@ import {
   egressList,
 } from "@/lib/ipc/client";
 import { useCapabilitiesStore, useIsReducedCapabilityPlatform } from "@/lib/stores/capabilities";
+import { usePlatformStore } from "@/lib/stores/platform";
 import { isUpdateBusy, type UpdatePhase, updateStore, useUpdateStore } from "@/lib/stores/update";
 import { useVoiceStore } from "@/lib/stores/voice";
 import { updateErrorMessage } from "@/lib/update-error";
@@ -49,9 +50,6 @@ const EGRESS_HONESTY_SENTENCE =
 const UPDATE_HONESTY_SENTENCE =
   "Updates are downloaded from GitHub and verified against keeper's signing key before they install. If verification fails, the update is refused.";
 
-/** The docs page opened from the "On this iPhone" disclosure (Story 13.7). */
-const IOS_DOCS_URL = "https://github.com/tgorka/keeper/blob/main/docs/ios.md";
-
 /**
  * The honest debug-mode disclosure (Story 22.5, FR-79): names exactly what
  * lands on disk and where, and that it is local-only. Off by default.
@@ -65,38 +63,6 @@ const IOS_DOCS_URL = "https://github.com/tgorka/keeper/blob/main/docs/ios.md";
 export function debugModeSentence(logPath: string | null): string {
   return `Writes app logs to ${logPath ?? "keeper.log"} and a per-recording events.log beside each session's manifest. Local files only — nothing is uploaded.`;
 }
-
-/**
- * The eight honesty lines of the reduced-platform (phone tier) "On this iPhone"
- * disclosure (Story 13.7; rewritten by Epic 66, Story 66.6, AD-204, after the
- * phone gained the folder; the first and seventh lines by Epic 67, Story 67.4,
- * AD-210, once a spoken turn finished with the screen locked). Project voice:
- * sentence case, no exclamation marks, honest consequence-naming. Each names a
- * fact a person can act on: what the phone does differently, and what stays on
- * the Mac (AD-201, AD-203).
- *
- * Mirrored one-to-one into the Limitations list of `docs/ios.md`, which the
- * disclosure links to; `about-section.test.tsx` reads that file from disk and
- * fails when the two lists differ. Edit both together or neither. The eighth
- * line is, byte for byte, `VoicePlatform::IOS.limits` in
- * `keeper-core/src/voice/platform.rs` (Epic 65, Story 65.4, AD-193): the
- * sentence read here before switching listening on is the sentence shown
- * beside the switch. The third line's fact is `phone_divergence_sentence` in
- * `keeper-sync/src/engine.rs` (AD-199), worded for a list rather than a status
- * row. The first line's exception is `NO_BACKGROUND_SYNC_SENTENCE`'s last
- * sentence (AD-207), in the list's voice: the message half stays scoped to
- * messages, because a voice banner would otherwise contradict it.
- */
-export const IOS_DISCLOSURE_LINES: ReadonlyArray<string> = [
-  "keeper syncs and notifies about messages only while it's open; background notifications await a future decision. A voice session you left listening is the exception: it answers with the screen locked and posts what it heard as a banner from this phone.",
-  "A folder you add here mirrors a remote your Mac already syncs and lives inside keeper's own container: every large file stays a pointer until you open it, and it syncs only when keeper opens, comes back in front or you pull to refresh — nothing watches the folder on a battery.",
-  "Nothing is merged on a phone: a history this copy cannot fast-forward is named — how many commits this phone has that the remote does not — and you push them or reset this copy; the Mac merges.",
-  "Notes are a synced folder, so they are here too: list, search, read and edit them, and a save is a commit that keeper pushes from this phone with its own engine — there is no git on a phone.",
-  "What stays on your Mac: the self-hosted bridge runner, the sessions board, tasks, screen recording and the global summon hotkey; Bots talks to a model here, but the drive tools live on your Mac.",
-  "Updates arrive by reinstalling keeper; its signature renews every 7 days.",
-  'Listening for the wake phrase starts in keeper, and then keeps working with another app in front and with the screen locked; the answer is spoken there too, and saying "stop" (or the stop word you chose) ends it. Speech is recognised on this phone and never sent to a server.',
-  "Turn listening on while keeper is in front and it keeps listening when another app is in front or the screen is locked. Siri or an app that takes the microphone pauses it and keeper resumes on its own; a phone call ends it until you open keeper again. It stops when you turn it off or when keeper is force-quit. The orange microphone indicator stays on the whole time and cannot be hidden, and listening uses battery.",
-];
 
 /**
  * The honesty lines of the desktop tier's "On this Mac" voice disclosure
@@ -172,9 +138,12 @@ export function AboutSection({ open }: { open: boolean }) {
   // sub-block wherever the platform lacks it (the phone tier). The egress list stays
   // ungated. `inAppUpdater` never gates the egress list — only the update controls.
   const inAppUpdater = useCapabilitiesStore((s) => s.capabilities.inAppUpdater);
-  // Whether this is the capability-reduced (phone) tier — drives the "On this
-  // iPhone" disclosure list below.
+  // Whether this is the capability-reduced (phone) tier.
   const reducedPlatform = useIsReducedCapabilityPlatform();
+  // The phone's or tablet's "On this …" list, composed in Rust for the device
+  // this is (`keeper_core::disclosure`, story 98.3 #4) and mirrored into its
+  // doc there; written into the webview before the bundle runs, `null` on a desktop.
+  const disclosure = usePlatformStore((s) => s.disclosure);
   // The desktop tier is the mirror hydrated and not reduced; `reducedPlatform`
   // is false before hydration too, so the Mac block needs the `hydrated` term
   // for the same reason the iPhone one does — never a flash on the wrong tier.
@@ -551,22 +520,22 @@ export function AboutSection({ open }: { open: boolean }) {
         </div>
       )}
 
-      {reducedPlatform && (
+      {reducedPlatform && disclosure !== null && (
         <div className="mt-1 flex flex-col gap-1.5">
-          <p className="font-medium">On this iPhone</p>
+          <p className="font-medium">{disclosure.heading}</p>
           <ul className="flex flex-col gap-1">
-            {IOS_DISCLOSURE_LINES.map((line) => (
+            {disclosure.lines.map((line) => (
               <li key={line} className="text-muted-foreground text-xs">
                 {line}
               </li>
             ))}
           </ul>
           <a
-            href={IOS_DOCS_URL}
-            onClick={(event) => openExternal(event, IOS_DOCS_URL)}
+            href={disclosure.docsUrl}
+            onClick={(event) => openExternal(event, disclosure.docsUrl)}
             className="text-xs underline underline-offset-2"
           >
-            What's different on iPhone
+            {disclosure.docsLabel}
           </a>
         </div>
       )}

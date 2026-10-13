@@ -3,10 +3,11 @@
 
 use std::sync::Arc;
 
-use keeper_agent::agent::{arm_agent, Probe, SessionContext, SessionRef};
+use keeper_agent::agent::{arm_agent, Probe, SessionContext};
 use keeper_agent::claims::{conflict_line, conflict_of};
 use keeper_agent::headless::{HeadlessPlatform, SecretMap};
 use keeper_agent::runtime::{agent_deps, inspect, Inspection, STATUS_FILE};
+use keeper_agent::turn::SessionRef;
 use keeper_agent::zone::{skills_of, AgentHome};
 use keeper_core::agents::agentd::TrustEntry;
 use keeper_core::agents::log::HostSlug;
@@ -102,8 +103,9 @@ fn running(host: &Host) -> Option<Value> {
 }
 
 /// The tools an agent's `[tools].allow` names, split into those this host
-/// implements and those it does not.
-fn tools(home: &AgentHome) -> (Vec<&str>, Vec<&str>) {
+/// implements and those it does not; `run` is offered only where the
+/// running host's sandbox passed its probe (96.1 #11).
+fn tools(home: &AgentHome, sandboxed: bool) -> (Vec<&str>, Vec<&str>) {
     home.config
         .allow
         .iter()
@@ -117,8 +119,28 @@ fn tools(home: &AgentHome) -> (Vec<&str>, Vec<&str>) {
                 || *name == keeper_core::agents::workflow::ASK_HUMAN
                 || *name == keeper_core::agents::workflow::WORKFLOW_START
                 || *name == keeper_core::agents::helper::HELPER
+                || (sandboxed && *name == keeper_core::agents::run::RUN)
                 || ToolName::ALL.iter().any(|tool| tool.as_wire() == *name)
         })
+}
+
+/// The running host's sandbox as its start's probe found it: the line
+/// `status` prints, and whether `run` is offered.
+fn sandbox_line(live: Option<&Value>) -> (String, bool) {
+    match live.map(|status| &status["sandbox"]) {
+        None => (
+            "sandbox: not known — the host is not running, and it probes at start".to_owned(),
+            false,
+        ),
+        Some(Value::String(found)) if !found.starts_with("unavailable") => {
+            (format!("sandbox: {found}"), true)
+        }
+        Some(Value::String(found)) => (format!("sandbox: {found}"), false),
+        Some(_) => (
+            "sandbox: unavailable — the running host is older than this command".to_owned(),
+            false,
+        ),
+    }
 }
 
 /// `status`. With `--session`, `probe: false` composes without asking the
@@ -143,6 +165,8 @@ pub fn status(host: &Host, session: Option<&str>, probe: bool) -> Result<(), Cli
             host.dirs.state.display()
         ),
     }
+    let (sandbox, sandboxed) = sandbox_line(live.as_ref());
+    println!("{sandbox}");
     for drive in &inspection.drives {
         let engine = live
             .as_ref()
@@ -225,16 +249,54 @@ pub fn status(host: &Host, session: Option<&str>, probe: bool) -> Result<(), Cli
                 agent.kind.as_str()
             );
         }
-        let (offered, missing) = tools(home);
+        let (offered, missing) = tools(home, sandboxed);
         println!("  tools offered: {}", offered.join(", "));
         if !missing.is_empty() {
             println!("  not offered on this host: {}", missing.join(", "));
+        }
+        for line in mcp_lines(&home.config.mcp, live.as_ref()) {
+            println!("{line}");
         }
     }
     for line in trust_lines(&config.trust, live.as_ref()) {
         println!("{line}");
     }
     Ok(())
+}
+
+/// Each MCP server an agent's `[tools].mcp` names, as the running host
+/// last found it (96.2 #3, #5): answering and how many of its tools are
+/// offered, each tool that is not with why; or why it is not offered.
+fn mcp_lines(names: &[String], live: Option<&Value>) -> Vec<String> {
+    let servers = live.and_then(|status| status["mcp"].as_array());
+    let mut lines = Vec::new();
+    for name in names {
+        let found = servers.and_then(|servers| servers.iter().find(|s| s["name"] == name.as_str()));
+        match found {
+            None if live.is_none() => lines.push(format!(
+                "  mcp {name}: not known — the host is not running, and it asks its servers once it runs"
+            )),
+            None => lines.push(format!("  mcp {name}: not offered — this host names no such [[mcp]] server")),
+            Some(server) if server["answers"] == true => {
+                lines.push(format!(
+                    "  mcp {name}: answers; {} tools offered",
+                    server["offered"]
+                ));
+                for refused in server["not_offered"].as_array().into_iter().flatten() {
+                    lines.push(format!(
+                        "    {} not offered: {}",
+                        refused["tool"].as_str().unwrap_or("?"),
+                        refused["why"].as_str().unwrap_or("?")
+                    ));
+                }
+            }
+            Some(server) => lines.push(format!(
+                "  mcp {name}: not offered — it does not answer: {}",
+                server["why"].as_str().unwrap_or("?")
+            )),
+        }
+    }
+    lines
 }
 
 /// Each `[[trust]]` person as `status` prints them (R88): the running
@@ -445,6 +507,61 @@ mod tests {
             [format!(
                 "trust @tgorka:h: matches; published {old}, pinned {old}; agentd.toml now pins none, used after a restart"
             )]
+        );
+    }
+
+    /// 96.1 #11: `status` names what the running host's probe found, and
+    /// offers `run` only when the sandbox holds.
+    #[test]
+    fn status_names_the_missing_sandbox() {
+        let missing = json!({"sandbox": "unavailable — landlock: kernel ABI 3 is below 6"});
+        assert_eq!(
+            sandbox_line(Some(&missing)),
+            (
+                "sandbox: unavailable — landlock: kernel ABI 3 is below 6".to_owned(),
+                false
+            )
+        );
+        let held = json!({"sandbox": "landlock ABI 7, seccomp ok"});
+        assert_eq!(
+            sandbox_line(Some(&held)),
+            ("sandbox: landlock ABI 7, seccomp ok".to_owned(), true)
+        );
+        assert!(!sandbox_line(None).1);
+        assert!(!sandbox_line(Some(&json!({}))).1);
+    }
+
+    /// 96.2 #3, #5: `status` gives each server an agent names one line —
+    /// how many tools it offers while it answers, then each tool it does
+    /// not offer with why; why a server does not answer; a server the
+    /// host does not name, with no reason of any server's.
+    #[test]
+    fn status_lists_each_mcp_server_and_what_it_does_not_offer() {
+        let names = ["notes".to_owned(), "gone".to_owned(), "absent".to_owned()];
+        let live = json!({"mcp": [
+            {"name": "notes", "answers": true, "offered": 7,
+             "not_offered": [{"tool": "get file", "why": "it cannot travel"}]},
+            {"name": "gone", "answers": false, "why": "connection refused"},
+        ]});
+        let lines = mcp_lines(&names, Some(&live));
+        assert_eq!(lines.len(), 4, "{lines:?}");
+        assert!(
+            lines[0].contains("notes") && lines[0].contains('7'),
+            "{lines:?}"
+        );
+        assert!(
+            lines[1].contains("get file") && lines[1].contains("it cannot travel"),
+            "{lines:?}"
+        );
+        assert!(
+            lines[2].contains("gone") && lines[2].contains("connection refused"),
+            "{lines:?}"
+        );
+        assert!(lines[3].contains("absent"), "{lines:?}");
+        assert_ne!(
+            mcp_lines(&names[..1], None),
+            mcp_lines(&names[..1], Some(&live))[..1],
+            "a host not running knows nothing of its servers"
         );
     }
 }

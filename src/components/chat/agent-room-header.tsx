@@ -8,6 +8,11 @@
  * handle, the run, the detail drawn as sent, the unreadable sentence, the label
  * sentence — so this file only lays them out.
  *
+ * In a gate room (UX-DR147) a line above them names the outside system: the
+ * `system` the gate is the door for and its account, by the name Rust quoted
+ * and cut; the label chip then says `*` as "Anyone the system shares with" —
+ * whoever the outside system lets read what is said here.
+ *
  * It is drawn on every tier, the phone included: the phone hides the pane's own
  * header row behind its 52px bar, and an agent's status is not something the
  * phone may lose with it.
@@ -31,9 +36,12 @@ const RUN_LAMP: Record<AgentRunVm, LampState> = {
   unreadable: "fault",
 };
 
+/** What a gate room's label chip says for `*` (UX-DR147). */
+export const GATE_ANYONE = "Anyone the system shares with";
+
 /** The label chip's words: readers by name (or anyone), then integrity. */
-function labelChipText(label: LabelVm): string {
-  const readers = label.anyone ? "anyone" : label.readers.join(", ");
+function labelChipText(label: LabelVm, gate: boolean): string {
+  const readers = label.anyone ? (gate ? GATE_ANYONE : "anyone") : label.readers.join(", ");
   return [readers, label.integrity, ...(label.localOnly ? ["local only"] : [])].join(" · ");
 }
 
@@ -48,7 +56,7 @@ export function AgentRoomHeader({
    */
   scopeControl?: ReactNode;
 }) {
-  const { status, scope, scopeUnreadable, label } = header;
+  const { status, scope, scopeUnreadable, label, gate } = header;
   // The mark is the soul's icon where the agent's zone is on this device
   // (Rust checked it against the identity's bound), else the first letter of
   // the handle — its localpart — the only name the phone has for an agent
@@ -68,6 +76,20 @@ export function AgentRoomHeader({
       data-testid="agent-room-header"
       className="flex shrink-0 flex-col gap-1 border-border border-b px-3 py-2"
     >
+      {gate !== null && (
+        <p
+          data-testid="agent-gate"
+          className="flex min-w-0 flex-wrap items-baseline gap-x-1.5 text-sm"
+        >
+          <span className="text-muted-foreground">Gate for</span>{" "}
+          <span className="font-medium font-mono">{gate.system}</span>{" "}
+          <span className="min-w-0 truncate text-muted-foreground text-xs">
+            {gate.peerName === null
+              ? "— no request answered yet"
+              : `— ${gate.peerName} (${gate.peer})`}
+          </span>
+        </p>
+      )}
       {status === null ? (
         <p className="text-muted-foreground text-sm">No status from the agent yet.</p>
       ) : (
@@ -106,7 +128,7 @@ export function AgentRoomHeader({
         {scopeControl}
         {label !== null && (
           <Badge variant="outline" data-testid="agent-label" className="max-w-full">
-            <span className="truncate">{labelChipText(label)}</span>
+            <span className="truncate">{labelChipText(label, gate !== null)}</span>
             <span className="sr-only">. {label.sentence}</span>
           </Badge>
         )}

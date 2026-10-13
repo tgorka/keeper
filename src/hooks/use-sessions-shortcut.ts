@@ -10,7 +10,8 @@
 import { useEffect } from "react";
 import { SESSION_RECORD_NAME } from "@/components/sessions/session-detail";
 import { sessionsLogToday } from "@/lib/ipc/client";
-import { capabilitiesStore } from "@/lib/stores/capabilities";
+import { phoneSurfaceFor } from "@/lib/phone-surfaces";
+import { capabilitiesStore, isReducedCapabilityPlatform } from "@/lib/stores/capabilities";
 import { panelsStore } from "@/lib/stores/panels";
 import { primaryViewStore } from "@/lib/stores/primary-view";
 import { sessionsListStore } from "@/lib/stores/sessions-list";
@@ -63,22 +64,32 @@ export function useSessionsShortcut(): void {
       if (!mod) {
         return;
       }
-      // No dead sessions chord where no zone can exist (FR-223).
-      if (!capabilitiesStore.getState().capabilities.sessions) {
+      // No dead sessions chord where no zone can exist (FR-223). On a phone
+      // with a zone (98.2) the board opens only once the phone shell has a
+      // surface for it, and logging today is a desktop verb there.
+      const state = capabilitiesStore.getState();
+      if (!state.capabilities.sessions) {
         return;
       }
+      const phone = isReducedCapabilityPlatform(state);
       if (isTypingTarget(event.target)) {
         return;
       }
       if (!event.altKey) {
         // ⌘7 — the board. Ctrl+7 is the non-mac twin, matching ⌘1–⌘6.
         if (event.key === "7") {
+          if (phone && phoneSurfaceFor("sessions", state.capabilities) === null) {
+            return;
+          }
           event.preventDefault();
           primaryViewStore.getState().setView("sessions");
         }
         return;
       }
       if (event.code === "KeyL") {
+        if (phone) {
+          return;
+        }
         event.preventDefault();
         primaryViewStore.getState().setView("sessions");
         void logTodayInCurrentSession();

@@ -168,6 +168,7 @@ function detail(over: Partial<SessionDetailVm> = {}): SessionDetailVm {
     // like every other space's.
     shape: "folder",
     tasks: [],
+    room: null,
     ...over,
   };
 }
@@ -1230,7 +1231,7 @@ describe("SessionDetail's board", () => {
    * point.
    */
   it("rows 5-6: moves a card by keyboard on a folder-shaped session", async () => {
-    sessionsTaskMove.mockResolvedValue(undefined);
+    sessionsTaskMove.mockResolvedValue({ unpushed: null });
     sessionsDetail.mockResolvedValue(detail({ shape: "folder", tasks: [task()] }));
     mount();
 

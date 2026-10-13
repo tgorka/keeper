@@ -61,7 +61,6 @@ import {
   AboutSection,
   autoUpdateSentence,
   debugModeSentence,
-  IOS_DISCLOSURE_LINES,
   MACOS_DISCLOSURE_LINES,
   selfRestartNote,
 } from "@/components/settings/about-section";
@@ -71,9 +70,11 @@ import {
   debugLogPath,
   type EgressEndpointVm,
   egressList,
+  type PlatformDisclosureVm,
   voiceAvailability,
 } from "@/lib/ipc/client";
 import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
+import { platformStore } from "@/lib/stores/platform";
 import { updateStore } from "@/lib/stores/update";
 import { voiceStore } from "@/lib/stores/voice";
 
@@ -135,7 +136,28 @@ const SYNC_EGRESS: EgressEndpointVm[] = [
   { url: UPDATE_ENDPOINT, kind: "update", label: "Signed app updates" },
 ];
 
+/**
+ * What Rust's `platform_facts` answers on an iPhone, its lines read from
+ * `docs/ios.md` (which `keeper_core::disclosure::IPHONE_LINES` is pinned to by
+ * `platform_disclosure_mirrors_docs.rs`) rather than restated here.
+ */
+const IPHONE_DISCLOSURE: PlatformDisclosureVm = {
+  heading: "On this iPhone",
+  lines: firstBulletRun(
+    readFileSync(resolve(process.cwd(), "docs/ios.md"), "utf8"),
+    "docs/ios.md",
+    "## Limitations",
+  ),
+  docsUrl: "https://github.com/tgorka/keeper/blob/main/docs/ios.md",
+  docsLabel: "What's different on iPhone",
+};
+
 beforeEach(() => {
+  platformStore.getState().applySnapshot({
+    urlForm: "scheme",
+    tablet: false,
+    disclosure: IPHONE_DISCLOSURE,
+  });
   mockEgress.mockReset();
   mockEgress.mockResolvedValue([]);
   mockCheck.mockReset();
@@ -505,20 +527,12 @@ describe("AboutSection capability gating (Story 13.7)", () => {
     // …but the software-update block is gone (no dead "Check for updates" button).
     expect(screen.queryByText("Software updates")).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Check for updates" })).not.toBeInTheDocument();
-    // The "On this iPhone" list renders every honesty line.
+    // The list Rust composed for this device renders under its heading, every
+    // line in order (story 98.3 #4: the front decides none of it).
     expect(screen.getByText("On this iPhone")).toBeInTheDocument();
-    expect(
-      screen.getByText(/syncs and notifies about messages only while it's open/),
-    ).toBeInTheDocument();
-    expect(screen.getByText(/mirrors a remote your Mac already syncs/)).toBeInTheDocument();
-    expect(screen.getByText(/Nothing is merged on a phone/)).toBeInTheDocument();
-    expect(screen.getByText(/the self-hosted bridge runner/)).toBeInTheDocument();
-    expect(screen.getByText(/the global summon hotkey/)).toBeInTheDocument();
-    expect(screen.getByText(/signature renews every 7 days/)).toBeInTheDocument();
-    expect(screen.getByText(/the drive tools live on your Mac/)).toBeInTheDocument();
-    for (const line of IOS_DISCLOSURE_LINES) {
-      expect(screen.getByText(line)).toBeInTheDocument();
-    }
+    expect(screen.getAllByRole("listitem").map((item) => item.textContent)).toEqual(
+      expect.arrayContaining(IPHONE_DISCLOSURE.lines),
+    );
   });
 
   it("iOS: the docs link opens docs/ios.md externally via openUrl (best-effort)", async () => {
@@ -671,27 +685,6 @@ function firstBulletRun(doc: string, docPath: string, headingLine: string): stri
   }
   return bullets;
 }
-
-/**
- * `docs/ios.md` says of its Limitations list: "mirrored from `IOS_DISCLOSURE_LINES`
- * … the two must stay identical. Edit both together or neither." A sentence in a
- * doc is a request; this is the guard. The list is read from disk, never
- * restated here, so a third copy cannot drift either.
- */
-describe("IOS_DISCLOSURE_LINES mirrors docs/ios.md (Story 62.3, FR-400)", () => {
-  it("is identical to the Limitations bullet list, in order", () => {
-    const doc = readFileSync(resolve(process.cwd(), "docs/ios.md"), "utf8");
-    expect(firstBulletRun(doc, "docs/ios.md", "## Limitations")).toEqual([...IOS_DISCLOSURE_LINES]);
-  });
-
-  it("names, in the phone's own disclosure, what Bots does not do there", () => {
-    // FR-400: the drive tools are on the Mac, and the phone says so where the
-    // person reads what this build lacks — not only in a doc.
-    expect(IOS_DISCLOSURE_LINES.some((line) => /drive tools live on your Mac/.test(line))).toBe(
-      true,
-    );
-  });
-});
 
 /**
  * The Mac's lines are the egress claim in the person's own words, so they are

@@ -315,7 +315,7 @@ workflow    = "triage"
 | `[tools].drives` | the home drive | drive ids in scope; the home drive is always first |
 | `[tools].mcp` | none | MCP server names |
 | `[tools].skills` | `["*"]` | skill folders under `_skills/` to offer; `"*"` offers every valid one |
-| `[[gate]]` | none | not read yet: a gate's configuration arrives with the gates for outside systems, and until then a file holding it is refused as an unknown key |
+| `[[gate]]` | none | a `gate`'s only, refused on every other kind: one table per outside system, its keys in § *Gates* |
 | `[[menu]]` | none | `code` (2 to 4 capital letters, unique), `description` (at most 120 characters), and exactly one of `workflow` (a folder under `_workflows/`) or `prompt` (at most 2 KiB) |
 | `[host].needs` | derived | `sandbox`, `mcp:<name>`, `screen:mac`, `kvm:<id>` or `voice`; without the key, `sandbox` when `run` is allowed and `mcp:<server>` for each server |
 | `[host].pin` | `""` | a host slug |
@@ -339,7 +339,10 @@ The tool vocabulary is closed: `drive_list`, `drive_read`, `drive_glob`, `drive_
 is accepted, and the host lists it as not offered.
 
 `kind` chooses the default tools and whether `human` is required. It grants nothing: an `allow`
-list is taken as written, whatever the kind.
+list is taken as written, whatever the kind — except a gate's, whose set is also its ceiling: a
+`kind = "gate"` home whose `allow` names anything but `reply`, `delegate` and `journal_append` is
+refused, naming the tool ("agent.toml's tools.allow is refused: \"drive_read\" is not a gate's
+…"). Its MCP servers are named by `[tools].mcp`, as for every kind (§ *Gates*).
 
 | kind | tools without `[tools].allow` |
 | --- | --- |
@@ -503,7 +506,8 @@ line `{op: review, ref: memory | skill | memory,skill}`, then one more model run
 conversation and Hermes' review prompt (adapted to these tools; `keeper-ported/src/hermes/
 UPSTREAM.md` lists every change). The review is offered the drive reads, `drive_search`,
 `skills_list`, `skill_view`, and `memory_propose` for the memory nudge or `skill_propose` for the
-skill nudge — nothing else that writes, sends or delegates, no `helper`, and nothing it says
+skill nudge — nothing else that writes, sends or delegates, no `helper`, no MCP server's tool
+(one it calls anyway is refused and nothing reaches the server), and nothing it says
 reaches the room. Its lines hang under its `memory` line and are never replayed as the
 conversation; its tokens count, and are charged to the turn's `[limits].tokens_per_turn` with the
 answer's rounds and its helpers': a pass starts only when they left some of it, no review round
@@ -900,7 +904,8 @@ may read or raises trust, so a summary of a private file is as private as the fi
 | a message from another reader | the sender and the room's readers | `peer` |
 | a message from anyone else | the sender and the room's readers | `untrusted` |
 | another agent's message | that agent's session label | that label's |
-| anything from outside: a fetched page, an MCP result, a screen | anyone | `untrusted` |
+| an MCP server's answer | the server's configured `readers` | `untrusted` |
+| anything else from outside: a fetched page, a screen | anyone | `untrusted` |
 
 `owner` means "committed by a reader's keeper", not "written by that person": a reader's keeper
 syncs whatever lands in the drive, including words pasted from elsewhere. That is why the
@@ -1028,9 +1033,10 @@ tier decides whether it runs:
 | --- | --- | --- |
 | T0 | `drive_list`, `drive_read`, `drive_glob`, `drive_grep`, `drive_stat`, `drive_search`; `bmad_config`, `bmad_party`, `skills_list`, `skill_view`; `helper` | runs it |
 | T1 | `session_write`; `card_update` on a card of the session; a `drive_write` or `drive_edit` inside the session's own folder; `delegate` and its later rounds; `reply`; the five `surface_*` tools; `bmad_render` and `bmad_memlog`, which write only inside the session; `journal_append`, `memory_propose` and `skill_propose`, which write only into the agent's own home and change nothing until the consolidator or a person acts | runs it |
-| T2 | `drive_write` or `drive_edit` outside the session; `card_update` on another session's card; any write the agent's grant asks a person about; the consolidator's `memory_apply` and `skill_apply` — host actions, never a model's call — fixed at T2 in every session: nothing raises them | asks a person |
-| T3 | `card_update` that sets `schedule` or `workflow`, and a `delegate` whose card carries either — in every session, the person's own DM included; letting a blocked flow through (a declassification) | asks a person, for that one action |
-| T5 | a write — `drive_write`, `drive_edit`, `session_write` or `card_update` — that lands on any `agent.toml`, any `_drive.toml`, or anything in a session's `approvals/`, on any drive | never: "keeper never lets an agent do this: it would change the agent's own configuration or the approvals that guard its work. A person can do it themselves. Nothing was changed." |
+| T2 | `drive_write` or `drive_edit` outside the session; `card_update` on another session's card; any write the agent's grant asks a person about; the consolidator's `memory_apply` and `skill_apply` — host actions, never a model's call — fixed at T2 in every session: nothing raises them; a `run` without network (§ *Running a command*) | asks a person |
+| T3 | `card_update` that sets `schedule` or `workflow`, and a `delegate` whose card carries either — in every session, the person's own DM included; letting a blocked flow through (a declassification); a `run` with network | asks a person, for that one action |
+| T4 | a `run` of code the session holds or given inline; a `git push --force` | the person who started the work decides |
+| T5 | a write — `drive_write`, `drive_edit`, `session_write` or `card_update` — that lands on any `agent.toml`, any `_drive.toml`, or anything in a session's `approvals/`, on any drive; a `run` of `sudo`, `doas`, `su` or `pkexec` | never: "keeper never lets an agent do this: it would change the agent's own configuration or the approvals that guard its work. A person can do it themselves. Nothing was changed." (a `run` says why in its own words) |
 
 A write's tier is decided by where it lands on the disk, not how the call spelled it: keeper
 follows every folder link on the way and compares names as the Mac's volume does, so
@@ -1039,8 +1045,8 @@ follows every folder link on the way and compares names as the Mac's volume does
 lands outside it (T2). T5 is never an approval's to give: in a session that read outside content
 it is still refused with the sentence above, not with the approval sentence.
 
-No tool of this build is T4 (irreversible: deletes, credentials, running downloaded code). The
-grant still answers every drive call: a write the grant asks about is at least T2, and the higher
+The only T4 calls of this build are `run`'s. The grant still answers every drive call: a write the
+grant asks about is at least T2, and the higher
 of the two wins, so a grant alone never lets a write through. On agentd and on the Mac a call that
 asks a person parks for one (§ *When an action waits*); a host with no decision source — none of
 keeper's hosts is — refuses it with "This needs a person's approval, and there is no one here to
@@ -1066,7 +1072,8 @@ A call that already needs a person (T2 or more) is held one tier stricter when:
 - nobody watches it run: `kind = "scheduled"` or `"gate"`, or a workflow's run stamped
   `checkpoints = "unattended"` (`unattended`);
 - the session read outside content: its label's integrity is `untrusted` (`untrusted`);
-- its target is reached through a KVM (`kvm`; no tool of this build is).
+- its target is reached through a KVM (`kvm`): `kvm_snapshot`, `kvm_act` and every tool of a
+  NanoKVM-Go's server (§ *Another machine through a KVM*).
 
 The raise is one tier however many of these hold: a `drive_write` outside the session is T2 in
 tgorka's DM, and T3 in a delegated session, in a scheduled run, and in a session that is all three.
@@ -1082,6 +1089,724 @@ expires 24 hours after it was made. An approval in the morning resumes the run o
 holds the session's claim then, the write done once; with no decision by the expiry the run is
 refused, its card says so, and the log has `approval expired`. Until it ends, the card's later
 windows are not begun.
+
+## Running a command
+
+An agent whose `[tools].allow` names `run` may run a program — on a host that offers `sandbox`
+(its `[host].needs` derives it, so such an agent waits for one). It is never a shell string:
+`run({argv, cwd?, network?, timeout_s?, read?})` takes the program and its arguments as a list,
+and a shell given `-c`/`--command`, reading its script from standard input, or given no script
+file is refused — directly or behind `env`, `nice`, `nohup`, `timeout`, `xargs`, `stdbuf`,
+`command`, `flock` and their kin (D-33). So is a program keeper knows runs a command line given as
+text: `watch`, `script`, `flock -c`, `ssh` with a remote command or a command option
+(`ProxyCommand`, `LocalCommand`, `-F`), `scp -S`, `sftp -b`, `rsync -e`/`--rsh`/`--rsync-path`, and
+git given `-c`, `--config-env` or `--exec-path`, or running `rebase --exec`, `submodule foreach`,
+`bisect run`, `filter-branch`, `difftool --extcmd`, `grep -O` or the upload/receive-pack options.
+That list is not exhaustive: a program missing from it still runs only in the sandbox, at its tier.
+Each is refused however its value is spelled — attached (`env -S'…'`, `git -calias.x=…`, `rebase
+-xmake`, `rsync -e/usr/bin/x`) or apart, a long option whole or abbreviated (`--split=`, `--exe=`)
+— and a wrapper's option keeper does not know is refused too, since keeper could not tell where its
+program begins. `env` may not set `PATH`, `HOME`, `TMPDIR` or any `GIT_*`, `LD_*` or `DYLD_*`
+variable, nor change folder (`-C`; give `cwd`) or where it finds its program (`-P`); `ruby -C`,
+`ruby -X`, `ruby -x<folder>` and `perl -x<folder>`, which change folder before reading their
+script, are refused, however the folder is spelled (`-Xsub`, `-X sub`); and `xargs` may not read
+its arguments from a file. Any text after a wrapper is read as that wrapper reads it — a command
+name that starts with a letter outside ASCII is the program, an option keeper does not know is
+refused. git may not be given its repository
+apart from its folder (`--git-dir`, `--work-tree`, `--bare`): run it in the repository's folder.
+Write the script into `workspace/` and run that file instead.
+
+**The request is bounded:** `argv` holds 1 to 256 elements of at most 32 KiB each, no NUL; `cwd` is
+a folder inside the session's `workspace/`, wherever its links lead (one leading out is refused);
+`timeout_s` is 1 to 1800, 120 when absent; `read` names drives in the session's scope that the
+agent's grants let it read (as `drive_read` would). keeper walks from the drive's checkout to
+`workspace/` folder by folder — the sessions zone and every folder of it, the session's folders,
+`workspace/` itself — and each must be a real folder: a link in any of their places is refused,
+never followed. Each folder is opened from the one opened before it, never by its path again, so a
+folder swapped for a link while keeper walks redirects nothing — no check, no folder made — and
+the run is refused; the folder keeper reached is the one the approval binds.
+
+**What the program sees.** Only an OS sandbox it cannot leave — on Linux, agentd re-executes
+itself, applies landlock (ABI 6 or newer) and a seccomp filter to itself and then becomes the
+program; on the Mac, `/usr/bin/sandbox-exec` with a profile keeper writes:
+
+| place | access |
+| --- | --- |
+| the session's `workspace/` | read, write, run |
+| its own empty `HOME` and `TMPDIR`, made for it outside the workspace and the drives, removed when it ends | read, write |
+| `/usr`, `/bin`, `/sbin`, `/lib*`, `/etc` (on the Mac `/System`, the Command Line Tools and the folder `xcode-select -p` names), and `[sandbox] read_exec` and `env` | read, run |
+| the drives named in `read`, without network only — never their `.git/` and never any `.keeper/` | read |
+| anything else: other drives, `/proc`, `/sys`, `/dev` (but `null`, `zero`, `urandom`), `/run`, the host's home, its secrets | nothing |
+
+Every grant is checked as it resolves when the run starts: one that is or holds `/proc`, `/sys`,
+`/dev`, `/run`, a drive, the host's secrets, or a credential under its home (`.ssh`, `.gnupg`,
+`.aws`, `.config`, `.netrc`, `.docker`, `.kube`, a keyring …) refuses the run — a system folder
+holding a drive, or a `read_exec` link retargeted since start, included. A credential that is a
+link, or holds links, is refused where it leads too, through every folder a link leads to: with
+`~/.ssh` a link to `/opt/keys`, a grant of `/opt` or `/opt/keys` refuses the run, and with
+`~/.ssh/keys` a link to `/opt/key-store` whose `id_ed25519` is a link to
+`/usr/local/share/private-key`, so does a grant of `/usr/local/share`. A credential folder keeper
+cannot read refuses every run (and, at start, the sandbox): where it leads is not known.
+
+Without network it opens no socket at all; with network it may reach any host over TCP and UDP
+but no local Unix socket. The one exception is the Mac's: a networked run may reach the system
+resolver's socket, `/private/var/run/mDNSResponder`, for name resolution only, and nothing else
+local; a Mac run without network has no such exception. In every run it cannot trace,
+read or signal another process (`ptrace`, `process_vm_*`, `kcmp`, `pidfd_getfd`, `perf_event_open`,
+io_uring; on the Mac another process's `process-info*` and `kern.procargs`, and the keychain's
+Mach service), reach the keyrings, System V IPC or POSIX message queues, load a `bpf` program,
+change its personality, make a namespace, or leave its process group (`setsid`, `setpgid`). On
+Linux it cannot change any file's metadata — mode, owner, times, extended attributes — because
+landlock does not guard them: the cost is that `chmod +x`, `tar x` and `cp -p` cannot set modes
+or times even inside `workspace/` (DW-758). Of
+what it would inherit, a run gets only its standard streams: every other descriptor — from agentd
+or from whatever started agentd — is closed before the program starts, and a run where one cannot
+be closed is refused. The one other descriptor a program can hold is keeper's own read-only handle
+of a program a wrapper starts, opened inside the sandbox (below). Its environment is exactly `PATH` (the system's folders, then `read_exec`), `HOME`,
+`TMPDIR`, `LANG=C.UTF-8`, `TERM=dumb`, `NO_COLOR=1`, `GIT_TERMINAL_PROMPT=0`,
+`GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM=1` and `[sandbox] env` — no credential of the
+host's. A `git` program gets `-c core.hooksPath=/dev/null` right after it, so no hook runs, and the
+argv cannot override it; the card shows that argv. Builds run against what the workspace vendors: a
+toolchain's caches are read-only, so use `--offline`.
+
+**The Mac's `[sandbox]` table.** On the Mac, `read_exec` and `env` are set in Settings › Agents ›
+*Sandbox* — folders a command may read and run, and variables naming folders (a rustup or nvm
+install under your home, say) — kept in this Mac's `keeper.db`, never synced, and checked by the
+same check as `agentd.toml`'s: absolute paths, a variable's name upper-case and never one keeper sets,
+`KEEPER_*`, `LD_*` or `DYLD_*`, each variable once. A refusal is shown as written. No grant reaches
+any folder keeper syncs, whether or not it holds agents; a folder that moves, comes or goes builds
+the Mac's host and its sandbox again. The section shows what the Mac's probe of that very table
+found — `sandbox-exec ok`, or `unavailable — <reason>` when a folder overlaps a synced folder,
+keeper's own data or a credential under your home — and reads it again every few seconds while
+Settings is open: after a save it says the host probes it again, until it has.
+
+**Tiers.** Without network: T2. With network: T3. Code the session holds — the program, the program
+a wrapper runs (`env ./tool`, and through BusyBox's `env`, `nice` or `nohup`: `busybox env ./tool`),
+or an interpreter's script inside `workspace/`; anything under a
+root entry of `workspace/` whose name starts with `.` (`.npmrc`, `.cargo/config.toml`); a git hook
+(a file in a `.git/hooks/` not ending in `.sample`); a repository's configuration with any key
+beyond the ones that only describe it (a `core.fsmonitor`, `core.sshCommand`, filter or diff
+driver, alias, `include.path`, credential helper …), found where git finds it — every `.git/`,
+every folder whose `HEAD` git reads as one (`ref: refs/…`, a link to `refs/…`, or an object id)
+beside an `objects` and a `refs` git can enter (a bare repository, a separate git folder), and
+the folder a `.git` file (`gitdir: …`) or a worktree's `commondir` names (a file named `commondir`
+anywhere but beside a `HEAD` or in a `.git/` is a project's own, and names nothing; so is a folder
+git cannot take for a repository — a `HEAD` holding other text, an `objects` or `refs` that is an
+ordinary file — which refuses nothing); one that names a folder outside `workspace/` refuses the
+run, and so does a repository keeper cannot read as git does — a `.git`, a `commondir` or a
+configuration that is a link, or an `objects` or `refs` that is a link beside a `HEAD` git reads,
+which git follows — before anything runs and again right before the program starts, as
+does a configuration that ran nothing when the run was prepared and runs a program now; a setting
+given inline to `env`
+(`RUSTC_WRAPPER=…`) — or code given inline in any spelling its interpreter reads (`python -c` and
+`-cprint(1)`, `node -e`/`--eval`, `bun -e`, `perl -e`/`-e1`, `ruby -e`, `php -r`, `lua -e`,
+`osascript -e`, `deno eval`), and `git push --force` (or `-f`, `--force-with-lease`, a
+`+refspec`): T4. `sudo`, `doas`, `su`, `pkexec`: refused. keeper reads `env` as `env` reads itself
+— its options, then an optional `-`, then every element holding a `=` as a setting (after `--`
+too, and `./NAME=value` as much as `NAME=value`), then the program — and keeper's own variables
+are refused wherever they are set. A name `-u` (`--unset`, `-uNAME`) removes that holds a `=`
+(`env -u LD_PRELOAD=./x.so tool`) is refused: BusyBox's `env` sets that variable instead, GNU's
+rejects it. Of BusyBox's applets that start a program, keeper reads `env`, `nice` and `nohup`;
+its others (`timeout`, `xargs`, `time`, `setsid`, `ionice`, `flock`) read their options unlike
+the tools keeper knows, so a run through them is refused. BusyBox's `nice` reads one adjustment
+(`-n 3`, `-n3` or `-3`) and runs the next element whatever it looks like, so a second option there
+(`busybox nice -n 3 -n./tool true` runs the file `-n./tool`, not `true`) is refused rather than
+read as GNU's `nice` reads it. The approval binds the host that resolved
+it, the argv as it runs, the folder `cwd` resolved to, that folder and `workspace/` themselves (by
+device and inode), the environment, the resolved program — and the one a wrapper runs, and any
+wrapper a wrapper runs (`env nice tool`) — with their SHA-256 and every held file's SHA-256
+(`exec_binding`). Before it is used keeper resolves and hashes all of it again: another host,
+another folder behind the same `cwd` or put at the same name, or any other difference refuses it.
+The run it lets go is prepared once more and runs only on those same facts, and the trampoline
+checks the folders, programs, held files and a networked run's workspace again, inside the
+sandbox, right before the program starts. On Linux it reads each program's bytes through one open
+handle and starts the program by that handle, so a program put at its path after that check is not
+what runs. That holds behind a wrapper too: the wrapper is given a link to the handle of the
+program it starts in that program's place in its argv (which is the name that program sees as its
+own), and still does all it does — `env` sets, `nice` lowers the priority — before it starts the
+program keeper checked. That handle is opened only once the sandbox holds, as the run's own grants
+allow: a program outside every grant — on a drive the run did not ask for, under the host's home —
+refuses the run and is never handed on, so the program inherits a read-only descriptor of each
+such program only when it is a file the run may read anyway. What keeper cannot close (DW-759): a script (`#!`) is started by its path, as
+its interpreter opens it by name — wherever the script is, in `workspace/` or in a `read_exec`
+folder (R245); a held file or a workspace file changed by another writer — sync, another process of
+the host — after that last check is read as it is then; and on the Mac the program, and any program
+a wrapper starts, is checked before `sandbox-exec` starts it by its path. The card's sentence is
+keeper's: *Run `<program>` in `workspace/<cwd>`*, *with network*, *with code the session holds*;
+below it the card draws the argv one element per line, the program and its hash, each wrapper a
+wrapper starts and the program the last one runs with theirs, the folder, the drives the run
+reads (read-only), the seconds after which it is stopped, each held file, and with network the
+*Network* chip — "This command may reach any host. It sees only this session's workspace: <n>
+files, <size>." — with the file list one tap away. The card does not draw the environment (the
+fixed one above) nor the folders' device and inode, which the approval binds too. An argument, a
+drive or a name that could be misread — empty, holding a newline, a tab, a quote, a backslash or a
+bidirectional override, or with a space at an end — is shown in quotes with each such character
+escaped (`"a\nb"`, `"\u{202e}…"`), so one argument never looks like two and nothing is reordered;
+what runs is the raw value. A run's card draws only that view, never its arguments as raw JSON.
+A run whose binding is too large for the card travels as the request's
+attachment, whole: opened on the card, keeper checks it against the digest and draws it as it draws
+an inline run — the argv, the programs, the folder, the drives, the time limit, the held code and
+the *Network* chip — and it
+is approved only once it was shown.
+
+**Approve for this session.** A T2 run outside `main` offers it: later runs of the same program
+(and wrapped program, and any wrapper between), byte for byte, in the same folder — the folder itself, not another put at
+its name — on the same host, with any arguments, go without asking for at most 24 hours — until the session closes or this host lets it go. A run
+that needs network, runs code the session holds, or is raised a tier is outside it.
+
+**Network is a send to anyone.** A networked run sees only `workspace/`, so what it can send is its
+argv and the workspace. Its T3 approval releases exactly the workspace its card listed — every
+file's path and SHA-256 (at most 512 files) — and keeper lists it again before the run: one file
+more, or other bytes, refuses it and the agent asks again. A file whose name is not UTF-8, a pipe,
+a socket or a device in `workspace/` refuses every run: keeper could not bind it.
+
+**What it may write.** `workspace/` is on the session's home drive, so a run is a write there: one
+that would read a drive fewer people read than the home drive's — or that runs in a session already
+narrowed below them — is refused before anything runs.
+
+**The result.** Its exit status (or *timed out after N s*, its process group stopped), then
+stdout and stderr, each kept to 64 KiB and saying `truncated: {shown, total}` in the stream's own
+bytes when not all of it is shown — invalid UTF-8 replaced, two full streams sharing the tool
+result's 80 KiB, never cut again after — read as data, not instructions. Its pipes are drained for
+at most two seconds after the group is killed. Its label: the readers of the drives it read
+(anyone when none), and `untrusted` when it had network or read any drive, else `agent`.
+Secret-shaped text in it is redacted in the log like every other line. `keeper-agentd status`
+prints `sandbox: landlock ABI <n>, seccomp ok` or `sandbox: unavailable — <reason>`; the Mac logs
+`sandbox-exec ok` — its own `read_exec`/`env` table is the one Settings › Agents › *Sandbox* keeps
+(above), checked as agentd's is. On Linux nothing of a run can
+leave its process group, so the whole group ending is every process of it. On the Mac a process
+can leave the group, and the Mac gives keeper no way to tell a run's descendant from any other
+process without privileges keeper does not hold: before the group is killed, keeper kills each
+process that still descends from the run's first process but left its group, and after it each
+process still naming the run's `TMPDIR` in its environment (which macOS 27 does not show for
+every program — a system binary's, such as `/bin/sleep`'s, reads empty), and the result says how
+many it found — never that every process ended. One whose parent had already ended and whose
+environment the Mac does not show, or that also cleared its environment, can outlive the run,
+still inside the same profile and keeping every grant the run had: the workspace, read and
+write; the drives the run asked to read, read-only, for a run without network (a networked run
+reads no drive); no secret, no other drive, and no network the run did not have (DW-757).
+Without a sandbox `run` is not offered and nothing runs unsandboxed. ⌘9 bots and scheduled tasks
+never have `run`.
+
+## MCP servers
+
+An agent can use the tools of an MCP server its **host** names for it — never one a drive, a
+session or a project file names: a `.mcp.json`, a `.cursor/mcp.json` or an `opencode.json` anywhere
+is never read. keeper is an MCP client only. On a Linux host the servers are `agentd.toml`'s
+`[[mcp]]` tables; an agent uses those its `agent.toml` lists in `[tools].mcp`:
+
+```toml
+[[mcp]]
+name       = "notes"                         # letters, digits, - and _; never __, nor _ at an end
+url        = "https://notes.example.org/mcp" # or command = ["/usr/local/bin/notes-mcp", "--stdio"]
+credential = "secret:notes"                  # optional; the bearer token a url server is sent
+readers    = ["@tgorka:<homeserver>"]        # who reads what reaches it; ["*"] by default
+trust_annotations = false                    # optional; only you set it
+
+[[mcp.tier]]                                 # optional; only you write these
+tool = "search"
+tier = "T0"
+```
+
+The grammar is closed: an unknown key, `url` and `command` together or neither, an empty or (on a
+phone) any `command`, a `credential` beside `command` (a program you start reads its own secrets),
+a URL that is not `http(s)://` with a host or that carries a user or password, a `readers` entry
+that is not a Matrix user id or `"*"`, a `fingerprint` that is not `sha256:` and 64 hex digits, a
+`role` outside `paseo`, `kvm:<id>` (and, on the Mac only, `screen`), a `[[mcp.tier]]` row whose
+`tier` is not `T0`…`T5` or whose `tool` repeats, a row on a `role` server, and two servers of one
+name are each refused naming the entry. A server with a `fingerprint` is spoken to only over
+`https://` whose certificate's SHA-256 is that fingerprint — a self-signed one included, since no
+authority is asked; another certificate is refused with a sentence naming both, and a pin on an
+`http://` URL pins nothing, so that server does not answer.
+
+**On the Mac.** The Mac's servers are set in Settings › Agents › *MCP servers* — the same grammar,
+kept in this Mac's `keeper.db` (never in `settings.toml`, a device file or your account's repository)
+and checked by the same check as `agentd.toml`'s, `role = "screen"` included, `kvm:<id>` refused (the
+Mac names no `[[kvm]]`). Settings › Agents shows these whenever this Mac keeps a server or a sandbox
+row, flagged folder or not. A program is written one field per argument and saved exactly as
+written — an empty argument, spaces and line breaks included. A `url` server's bearer token goes to
+the keychain, never to `keeper.db`; the form takes a new one or forgets it and never shows it, and
+*Forget the token* wins over a token typed in the same sheet. A program keeper starts keeps no token.
+Each token you save is kept in the keychain under a key of its own, which only the saved server
+names: keeper sends a server the token saved with the very settings it connects with, so a server
+moved to a new URL with a new token never sends that token to the old URL, and a save that does not
+go through sends nothing new — a token it left behind is never sent. Forgetting, removing or making
+a server a program deletes only the token it replaced, never one saved after it; a token the
+keychain would not delete is said so, and nothing names it. A token an earlier keeper kept under the
+server's name is not read: such a server is not connected and its row says so until you save its
+token again or forget it — either deletes the old one. A keychain that cannot be read is not "no
+token": that server is not connected, and its row says why; once the keychain is readable again,
+save the server again (or restart keeper) to connect it. Each server is listed with *answers* or
+*does not answer — <why>*, as heard by a host built on the settings shown — after a save it says the
+host asks again, until it has. A program server that answers is also listed as the host started
+it, the way agentd's are known: the absolute program its argv resolved to (through `PATH` and any
+link) and that file's SHA-256 — the program an approval of its tools binds. Its sheet lists the
+tools it listed — a tool's name redacted and shortened as `keeper-agentd status` writes it when the
+name cannot travel, and no tier row for such a tool — and lets you set a tool's tier row and *Trust
+this server's annotations* (off unless you tick it). Every name and reason the sheet shows, a tool
+control's spoken name and a role's refusal of a tool included, is redacted and shortened the same
+way; the exact name only picks the tool's row. As you edit, the sheet shows what keeper will
+apply to what you are about to save: each tool with the tier the role, rows and trust you chose
+give it, a program's T2 floor, a role server's table fixed and not editable. Until keeper has
+worked that out for what the sheet now holds, its tiers, rows and Save wait; when it cannot (its
+settings could not be read), the sheet says why, shows no tiers, and Save waits until it can. The
+tools are those the saved server listed while you keep its URL or program; a new URL or program
+lists its own once saved. Choosing a role for a server with tier rows shows those rows and *Drop
+these rows*: a role takes no row, so Save refuses them until you drop them, and setting the role
+back keeps them. A
+save is checked first — Rust's refusal is shown as written and nothing is saved — and every save, a
+new token included, builds the Mac's host again within seconds; a save or removal stops the old
+host even if keeper cannot read its other settings in that moment. The egress list names each
+server's host or program once: a URL's host and a program of the same name are two lines.
+
+**Offered while it answers.** At start and at every renewal of its manifest (60 s) the host connects
+to each server it is not connected to and asks for its tools — beside the renewal, never holding
+it: a server that does not answer cannot delay the manifest or a session's claim. A server that
+answered offers its tools to the agents that list it, and the manifest says `mcp:<name>`, renewed
+as soon as a server comes to answer or stops. What the host offers — to placement here and in the
+manifest — is read again at every tick; a renewal that failed, even one whose send reached the
+homeserver and only its read-back failed, is tried again at the next tick whatever the servers did
+meanwhile, until one succeeds. One that did not answer is left out, so an agent whose
+`[host].needs` names it waits for a host where it answers. A server that says its tools changed is
+asked again at once — one listing of a server at a time, however many times it says so, and an
+older answer never replaces a newer one. A server whose list is over 512 tools or 32 pages, that
+names one tool twice (on one page or across pages), or that sends one message over 4 MiB, is
+refused, not offered in part. `keeper-agentd status` lists each server an agent names: answering
+and how many tools it offers, each tool it does not offer and why, or why it does not answer —
+every reason redacted like the session log, and keeper's log never holds what a server sent,
+whatever `RUST_LOG` says.
+
+**Names on the wire.** A tool travels to the model as `mcp__<server>__<tool>`; the log, the audit
+row and the card name it `mcp:<server>/<tool>`. A tool whose name would be over 64 characters, or
+holds a character outside letters, digits, `-` and `_`, or a `__`, is not offered — it is listed in
+`status` with why.
+
+**Tiers.** A tool is T3 unless you said otherwise: a `[[mcp.tier]]` row sets its tier; with
+`trust_annotations = true` a tool the server marks `readOnlyHint` without `destructiveHint` or
+`openWorldHint` is T0 and any other T3 — annotations are what a server says about itself, read
+only when you vouch for it. A `command` server runs with the host's rights, so its tools are never
+below T2 — except the Mac's screen server, whose table is authoritative (*The Mac's screen*,
+below). A `role` server takes its role's table and nothing else: Paseo's four verbs, described to
+the model in keeper's words, Peekaboo's table for the Mac's screen, and a NanoKVM-Go's is its
+KVM's (§ *Another machine through a KVM*). In a session that read something `untrusted`, Paseo's
+`create_agent` and `send_agent_prompt` are refused outright, never asked.
+
+**What an approval binds.** An MCP approval is for the one call, never for the session. It binds
+which server the connection reached — its name, its whole URL (scheme, host, port, path and query),
+or its argv, the program it resolved to and that program's SHA-256 as it was started, and its pinned
+certificate — and the tool's schema, annotations and tier as listed. Before the approval is used,
+keeper asks the server for its tools again: a server gone, moved, started anew from changed bytes,
+or whose tool changed is refused, never consumed; and a tool that changes while the approval is
+being used is not sent. A call is sent exactly as it was checked: on the connection whose list the
+tool was offered from — that connection itself, never another that looks like it — and only while
+the server still lists the tool as it did. It is checked as the turn sends it and again in the one
+step that dispatches it, the request already built and the connection's writer already had: a list
+or a lost connection that lands before that step sends nothing, and one that lands after it finds
+the call already on its way — otherwise it is refused and nothing is sent. A child server that is
+not reading what keeper writes leaves the call waiting with nothing of it sent, and the call is
+checked again each time keeper tries the pipe, until the pipe takes its first byte. A program
+keeper cannot read is never started. Arguments that are not a JSON object are refused, never sent
+as another call.
+
+**A send to its readers.** A call is a send of what the session holds to the server's `readers`,
+checked before anything reaches the server: a session read by tgorka and marta cannot call a
+server read by anyone, and the call is refused saying so. A call runs on its own, for at most
+120 s, and is sent once: a server that answers HTTP 404 because it forgot the session gets no new
+session and no second copy of the call — its answer reaches the model like any error. A stop or
+the deadline before a child server's pipe took any of the call withdraws it, and nothing is
+sent; one stopped while still being written ends that child's connection — keeper closes its end of
+the pipe under the call, so the rest never arrives even at a process the child started that still
+holds the pipe, and no call queued behind it is written; a call already sent is cancelled with the
+server, and the model is told it is unknown whether it took effect and whether keeper could tell
+the server.
+
+**Outside content.** Everything a server wrote is outside content: the descriptions and schemas of
+the tools offered — their server's label joins the session's before the model is asked, whether or
+not a tool is called — and every answer, an error included. An answer reaches the model under the
+sentence that it is data, not instructions, cut at 79 KiB with how much there was; it is labelled
+`untrusted` and read by the server's `readers`, joined into the session's label (a `label` line),
+and a secret-shaped string in it reaches the log redacted. keeper's client declares no roots,
+sampling or elicitation, and a server that asks for any is refused and logged.
+
+### Coding through Paseo
+
+A coding agent hands work to Paseo through makistack's broker (`paseo-mcp.py`), named on the host
+as a `role = "paseo"` server and listed in the agent's `[tools].mcp`:
+
+```toml
+# agentd.toml
+[[mcp]]
+name       = "paseo"
+url        = "http://<broker host>:5189/mcp"
+credential = "secret:paseo"   # the broker's bearer token: the only Paseo secret keeper holds
+role       = "paseo"          # readers default to ["*"]: a pull request is read by the repository's audience
+
+# the coding agent's agent.toml
+[tools]
+mcp = ["paseo"]
+```
+
+- **Four verbs, fixed tiers.** `list_agents` and `get_agent_status` are T0, `create_agent` and
+  `send_agent_prompt` T3 (T4 in a delegated or scheduled session), whatever the broker says of
+  them. Any other tool it lists is not offered — `keeper-agentd status` says "the broker has exactly
+  four verbs".
+- **Starting work is a person's decision, every time.** Each `create_agent` and `send_agent_prompt`
+  waits for its own approval, `once` only. The card says *Start a coding run through Paseo in
+  `<workspace>`; the prompt goes to `<who reads the broker>`; following the run waits for a person
+  to allow its follow card* or *Send a prompt to Paseo run `<agentId>`; the prompt goes to …*; the
+  prompt is what the card shows, and approving it is releasing exactly that prompt to exactly that
+  audience. A host that names the broker with other readers by the time the approval is used — a
+  restart, another host — does not send it: the approval is refused as changed. Nobody to ask: the
+  call is refused saying the label blocks it. In a session that read something `untrusted` —
+  Paseo's own answers, or a Paseo run's record, included — both are refused outright, so a run is
+  started, or steered, from a session that has not read outside content (in a proxy's `main`, every
+  turn).
+- **The reads carry nothing of the session.** `list_agents` takes no argument; `get_agent_status`
+  takes only the `agentId` of a run this session's own successful `create_agent` started **on that
+  same broker** — keeper writes which run on that call's result line in the session's log (its own
+  record, never the answer's words) and reads it back whenever the session is opened. Any other id,
+  the same id on another broker, the same name now pointing at another endpoint, or anything more,
+  is blocked, not asked, and nothing reaches the broker. A run's id is the broker's, `:` and all;
+  where it names a file, each `:` is written `~`.
+- **What the broker answers is cut to its eight fields.** keeper reads the broker's whole answer —
+  bounded only by the transport's 4 MiB message limit, never by what the model is shown — and the
+  model, the log and everything after them see a run only as `agentId`, `workspaceId`, `title`,
+  `status`, `provider`, `createdAt`, `updatedAt` and `prUrl`. A successful answer that is not the
+  broker's `agent` or `agents` record — another shape, or not JSON — is replaced by keeper's
+  sentence that it was not passed on; none of its words reach the model. A value carrying a secret
+  or a link with a user or password is `withheld`; a link is read as the URL parser reads it (tabs
+  and newlines dropped, a quote or a space ending nothing, and after `http`, `https`, `ws`, `wss`
+  or `ftp` and its `:` any number of `/` and `\` — none too — before the user and host), and a
+  link holding `@` the parser cannot read is withheld too. `prUrl` is shown only as the canonical
+  form of a plain `http(s)` link: one with a control character, a space, an angle bracket, a quote
+  or a backslash is withheld, and so is one whose decoded query or fragment has a parameter named
+  for a credential — `token`, `auth`,
+  `authorization`, `key`, `secret`, `password`, `passwd`, `pwd`, `sig`, `signature`,
+  `credential`, `credentials`, or a name ending in one, read without case or punctuation
+  (`access_token`, `api-key`, `X-Amz-Signature`) — or holds a link that has one
+  (`?next=https://…/r?token=…`). The same parameter names withhold a link in
+  every other field too — the whole field is `withheld` — and in every error keeper passes on or
+  writes itself, where the link is withheld from its start to the error's end, since the URL
+  parser reads a query on past a space; a link with ordinary parameters (`?ref=main&page=2`)
+  stays. An error keeps its other words, without secrets or credentialed links; its structured
+  `data` (and a JSON error body) has each string — keys too — cleaned before it is written out as
+  JSON, so an escape the JSON writer adds (`\t`) hides no link.
+- **The broker's refusals are its words.** Its ceilings (429), a field it does not take (400) and
+  its kill switch (503) reach the model and the log as the broker's answer, outside content; nothing
+  is tried again by itself.
+- **Following a run.** After an approved `create_agent`, keeper makes a scheduled session of the
+  same agent in a room for the session's readers, holding the card `follow.md`: every 10 minutes,
+  assigned to the agent, `scheduled_by` it — so it runs only once you allow its schedule on the
+  board. The session is titled `paseo-<agentId>` (cut with `…` past a title's 120 characters); the
+  run it follows is the one its `agent.toml` names whole (`[reply] run`), beside the conversation
+  that started it (`[reply] session`, `room`). Each run asks `get_agent_status`, automatic. When
+  the run has ended (`completed`, `failed`, `cancelled` and the like), keeper first checks that the
+  home drive's readers, everyone in the starting conversation's room — the person who asked
+  included — and the follow session's own room may read what the follow session read; if not,
+  nothing is written or sent and the card keeps asking. Otherwise it **captures** the end: one
+  `paseo` line `pending`, written by the session's holder before the call's result, holding the
+  record's bytes (the eight fields, marked `integrity: untrusted`), their SHA-256 and the notice
+  with the label it was admitted under. That line is the end's first durable step; after it this
+  checkout's session never asks the broker again and never sends `create_agent` again, and
+  everything else is made from it, each step resumed by the next window when one fails or the
+  host stops:
+  1. **Published in the follow room.** The follow room's timeline is read first. When it holds
+     no capture, this one is uploaded as an encrypted file and sent into the follow session's own
+     room (admitted there for its label) as a message marked `dev.keeper.agent.paseo_capture`
+     with the completion id `paseo-ended-<follow session id>` and the capture's SHA-256, and the
+     timeline is read again. **The first capture message the agent sent for that completion, in
+     the homeserver's timeline order, is the end** — whichever host sent it: a capture that lands
+     later, however delayed, never replaces it. When it is not this host's, this host adopts it
+     (below). The state event `dev.keeper.agent.paseo_captured`, keyed by the completion id, is
+     then put as an index naming it — only an index: it tells placement and a host with no capture
+     to read the timeline, and is never trusted over it.
+  2. **The record.** `artifacts/paseo-<agentId>.md` is written from the capture — put back as
+     captured when its bytes changed — only while the home drive's readers *now* may read the
+     capture's label; a drive whose readers grew since gets nothing, and the end stays pending.
+  3. **The notice.** The starting conversation's room is admitted as it is now, then the notice
+     is sent under the completion id as its transaction id, the record attached.
+  4. **Delivered.** A message marked `dev.keeper.agent.paseo_delivered`, naming the capture and
+     the event the homeserver answered with, is appended to the follow room's timeline, the log
+     says `delivered`, and only then is `schedule:` taken off the card. Once any such message is
+     there, the end is delivered for good: nothing that lands after it makes it pending again.
+
+  Uploading, publishing, adopting, indexing, writing the record and telling each happen only
+  while this host holds the session, checked right before them after every wait: a host that lost
+  the session's claim meanwhile — while it read the room, say — starts no upload, does nothing
+  more and leaves the capture pending for the holder. The delivery message is the one write after
+  the notice not checked that way: it says what the homeserver already took, and, appended, it
+  replaces nothing. A follow session holding a capture asks no broker, so placement no longer needs
+  a host offering its `mcp:<server>`: the capture on the checkout's log, or the room's index,
+  places it anywhere.
+- **One end, whichever host finishes it.** A window that holds no capture reads the follow room's
+  index before it polls. When the index is there — another host published a capture and this
+  checkout has not received its lines yet — the room's timeline is read and its first capture is
+  fetched, checked against its SHA-256, admitted to the home drive as its readers are now, and
+  logged as this session's; if the timeline holds a delivery message, nothing is sent again. A
+  capture whose label the home drive's readers can no longer read is not taken: nothing of it is
+  written on this host and nobody is told. A window whose room cannot be read — the index, or the
+  timeline back to its beginning — polls nothing. A capture this host holds that differs from the
+  room's first is replaced by it, under the same admission. So the same completion id always
+  carries the same bytes, and a told end stays told. Two limits stay. Between a capture's line and
+  its index in the room, another host whose checkout lacks that line polls again and may capture
+  an end of its own; only the first one published is told (DW-1123). And the homeserver's own
+  deduplication: a notice another device sent but whose delivery message never followed can be
+  sent once more by the taker, with the same content (DW-953). The timeline is read back to the
+  room's beginning within the page budget (20 pages of 50 events): a follow room grown past that
+  cannot be read for its end — a host holding a capture publishes and tells nothing, and one
+  without polls nothing once the index names a capture — and every window tries again (DW-1127).
+  Only the homeserver's missing page token is the room's beginning: an empty page that names the
+  next is read past, and a token that does not move on is a room not read. A message of the
+  agent's in the follow room that this host did not decrypt — its room key not here yet, its
+  decryption failed, or the message was redacted or is malformed, still an encrypted envelope — or
+  decrypted with a key it cannot link to the agent's device (one from a key backup or a forward, a
+  device it does not know, another user's session) is never taken for no capture or no delivery,
+  and never taken as one either: nothing is published, uploaded or told until it can be read and
+  linked, and every window tries again; a key that never arrives, a redacted message, or one that
+  is never linked holds that end for good — so can a forged message claiming to be the agent's,
+  though it can never stand for a capture or a delivery — and only the host's log says so
+  (DW-1129).
+  Follow sessions captured by a build before R279 (never released) are not read.
+- **A delegated start hears its end.** When the session that started the run is a delegated one,
+  the notice goes into the delegation's room marked as the follow session's completion answering
+  that delegated session. The delegating session takes it beside the delegation's own reply —
+  whether or not that reply already came, and without closing a round of a new exchange — logs it,
+  joins the label it carries and answers it in a turn; the same completion is taken once. A
+  session opened again reads completions back from the room up to the newest completion it took
+  there — not only since its latest brief, so one told before a later round is found — and a
+  history it cannot read back that far within the page budget recovers nothing until it can.
+  Completions are taken in the room's order: one that arrives while such a readback is owed waits
+  for it, so a newer end never moves the session past an older one it has not taken. An event of
+  the delegation's target that this host did not decrypt, or decrypted but cannot link to the
+  target's device — read back after the newest completion taken, or arriving live — may be such an
+  end: the completions after it wait until it can be read and linked, and it is never taken as
+  one. A message anyone sends in clear is no such event.
+- **A workflow's run keeps its own end.** When the session that started the run is a workflow's
+  run, the notice goes into that run's room, for the people who read it; neither the run nor the session that opened it takes it. It is never the run's
+  reply: the session that opened the run does not take it, its card keeps reading `running` until
+  the run itself replies, and no turn follows. That room is never read back for completions, and an
+  event there this host cannot read holds nothing.
+
+### The Mac's screen
+
+An agent on the Mac can see and use its screen through [Peekaboo](https://github.com/steipete/Peekaboo)
+(MIT; a separate program, never linked), named in Settings › Agents › *MCP servers* as the Mac's
+`role = "screen"` server and listed in the agent's `[tools].mcp`. agentd never offers the screen: its
+`agentd.toml` refuses `role = "screen"`.
+
+**Installing it.** `brew install steipete/tap/peekaboo` (3.9.8 is the version keeper's table was
+built from). Run it once in your own GUI session and grant **Peekaboo** — not keeper — Screen
+Recording and Accessibility in System Settings › Privacy & Security; `peekaboo permissions --json`
+says whether both are granted (its Bridge host does the permission-bound work). Then add the server:
+
+```toml
+# Settings › Agents › MCP servers, as the sheet saves it
+[[mcp]]
+name    = "mac"
+command = ["/opt/homebrew/bin/peekaboo", "mcp", "serve"]   # or url = an HTTP Peekaboo you run
+role    = "screen"
+readers = ["@tgorka:<homeserver>"]                         # you: what is on your screen is yours
+```
+
+and in the agent's `agent.toml`, `[tools] mcp = ["mac"]` and `[host] needs = ["screen:mac"]` (the
+screen is never derived from the tools). A screen server keeper starts as a program keeps no T2
+floor: its table decides, because the floor's reason — the program runs with your rights — is as
+true of a Peekaboo you run yourself. Peekaboo's own description of its tools reaches the model as
+outside content; its table, not its words, tiers them.
+
+**Offered while it answers.** The Mac's manifest says `screen:mac` only while a screen server
+answers its tool list, renewed with the rest every 60 s; an agent that needs it waits for it. After
+a Peekaboo update macOS may reset its grants (a re-signed app is a new app to TCC): check them
+again — until they are back Peekaboo answers without the screen, and its reads fail.
+
+**What it may do, and at which tier.** Every tool Peekaboo lists has a row; a tool it adds later is
+T3. Never offered: `agent` and `analyze` (they send the screen to Peekaboo's own AI provider, which
+keeper did not configure) and `browser` (a browser's pages and requests are not the screen). Refused
+before anything is sent: every argument that names a file of the Mac (`path` — but `menu`'s, which
+is a menu's —, `filePath`, `imagePath`, `outputPath`, `input`, `image_path`, `output_dir`,
+`video_out`, `request_file_path`, `response_file_path`), `image` with a `question`, `click` or
+`perform_action` by `query`, `type` or `set_value` without an element `on`, a `hotkey` whose `keys`
+holds anything but Peekaboo's own keys (cmd, shift, alt/option, ctrl, fn, a–z, 0–9, space, return,
+tab, escape, delete, the four arrows, f1–f12), and an action that names its target by number
+(`pid`, `window_id`, `window_index`, `index`) — name it by `app` and `window_title`. A call is tiered
+by what **keeper** read of its target, never by the model's words:
+
+- an action on an element by the element Peekaboo listed in a `see` or `inspect_ui` **this session's
+  model** made — its role, title, accessibility identifier, application and window. An element id
+  from no read this session kept is refused: read the screen first. A read that names two
+  applications or two windows, or names no application, is not kept (keeper could not tell their
+  elements apart, or what they belong to). The action
+  is sent, and bound, in the snapshot its element was read in; a snapshot this session never read
+  is refused.
+- any other action by the window keeper reads **in front** itself just before (`inspect_ui
+  frontmost`; keeper's own read, which no model sees), together with the window of the `app` and
+  `window_title` the call names in keeper's own list of that app's windows — the highest tier of
+  them, so naming another app never lowers what is in front. The call names **one** window: an
+  `app` or `window_title` keeper does not find, an app with two windows and no `window_title`, or a
+  `window_title` two of its windows hold, is refused. A `hotkey` with `foreground: true` goes to
+  whatever is in front even when it names an app, so it is pinned by the window in front.
+
+| What | Tier |
+| --- | --- |
+| a screenshot, a window or app list, an accessibility read, `permissions`, `sleep`; an app, Dock, menu, Space or dialog list | T0 |
+| focus, navigation, scrolling, moving the pointer, a bare key (a letter, a digit, Space, Tab, Escape, Shift, an arrow), typing into a field nobody submits | T1 |
+| a click or key on an element whose role, title or identifier says submit, send, post, buy, pay or delete (`AXSendButton` and an icon button identified `sendButton` say send); a click at coordinates (keeper did not read what is there); a chord with cmd, ctrl, alt/option or fn, Return, Delete or a function key; typing into a secure field, text holding a line break, `{return}`, `{delete}` or `{backspace}`, or `type` with `delete` or `clear` (Cmd+A, Delete) — its card says so; a Dock item's menu (`select`); a click, toggle or value set anywhere in System Settings; launching, quitting or closing; the clipboard, paste, drag, swipe; answering a dialog | T3 |
+| anything touching System Settings' Privacy & Security, a TCC prompt, a password field or a payment sheet | T4 — **refused** in a session that read the screen, which every element action needs (below) |
+| the last step of a password change | T5 |
+
+What is on the screen is outside content: a screenshot or read is labelled `untrusted`, read by the
+server's `readers`, and joined into the session's label — and so are Peekaboo's own words of its
+tools, which every turn offered the screen carries (R225). A session offered the screen is therefore
+`untrusted` and read by the server's `readers` from its first turn, and every screen action that
+waits for a person is raised once, as any is in a session that read something `untrusted`: a T3 row
+is asked as T4 (Send in Mail's draft, or a chord, is decided on another device), and the T4 rows —
+Privacy & Security, a TCC prompt's *Allow*, a password field, a payment sheet — are raised to T5 and
+**refused**: an agent on the screen never gets them approved. Focus, scrolling and typing (T1) are
+not raised. keeper's own parse of a read — the element it pins, the tier it takes — reads the read's
+structure, never its words as instructions, so it stays what it is (R315).
+
+**What an approval binds, and the preview.** A screen action that waits for a person is pinned by
+what keeper read: an element by its accessibility path, role, title, identifier and frame
+(Peekaboo's element ids are good only in their snapshot, so they are never what is pinned); a click
+at coordinates by the 64-bit difference hash of the 64-point square it lands in; any other action by
+the window it acts on — the one window the call names, else the one in front — its application,
+title and frame as keeper lists them, whether it was in front, and the difference hash of that
+frame. No window in front that reads, and the action is refused. Before a named window's approval
+is used, the call's arguments must still name that window alone: another window that holds the same
+part of a title, appearing after the park, is drift. keeper
+takes a screenshot itself (inline, never through a file) when the action parks; the record keeps
+its SHA-256, digested with the rest, and the image is kept at
+`<sessions zone>/.keeper/previews/<sha256>.png` — never in a session's folder, never committed
+(`.keeper/` never syncs) — and reaches you only as the request's encrypted Matrix attachment. That
+screenshot is outside content read by the screen server's `readers`: its label joins the session's
+before the card leaves, so it asks only them. The card's words are keeper's: *Click "Send" (button) in Mail*,
+*Click at (640, 400) in "Inbox"* when keeper read that window under the point, else *on the Mac's
+screen*; what the call names of an app, an item or a button is quoted as a name, at most 40
+characters of it (*Menu click: the item named "View > Sort By" in the app named "Mail"*); an
+`action` or a `direction` is one of the words Peekaboo's own schema allows for it, anything else
+refused; what is typed is counted, never shown. Before the approval is used, keeper reads the screen again — the
+element's window through `inspect_ui`; the window in front, the app's list of windows and a fresh
+screenshot for a window; a fresh screenshot for a square — and a hash must be within 7 bits of the
+one decided on. Measured on real frames as keeper greys them: a clock's next minute or a caret flips
+0–5 bits; over a 64-point square a sheet laid over it flips 10, a button replaced by another 11, a
+move of 40 points 11; over a whole window a sheet laid over it flips 13–14, but a sheet moved 40
+points only 7–8 and one sheet replaced by another of its size 1–2, which only the window's title,
+frame and front, read again, can show. Anything else is drift: refused, logged, nothing consumed and
+nothing clicked; proposed again, it is asked again. A record taken over by a host that names no such
+screen server is refused the same way.
+
+**A T4 action is decided elsewhere.** A T4 screen action is never decided on the Mac it acts on:
+there the card says *Decide this on another device: this Mac is the one it acts on*, and a decision
+sent from it is refused with nothing consumed. Decide it on your phone. In a session that read the
+screen — every session offered it — what reaches this is a raised T3, Send for one, since a T4 row
+is refused there.
+
+**What Peekaboo keeps on the Mac.** `capture` records the screen into a temporary folder on the Mac
+for up to 180 s (Peekaboo cleans it after `autoclean_minutes`); `see` and `image` without `format:
+data` write their screenshot to a temporary file too. keeper names no path for any of them; the
+files are Peekaboo's, in your account.
+
+## Another machine through a KVM
+
+An agent on a Linux host can look at and type into another machine through a NanoKVM: a box on
+that machine's HDMI and USB that streams its screen and plays a keyboard and a mouse. Only the
+host names a KVM, in `agentd.toml` — never a drive, never a session:
+
+```toml
+[[kvm]]
+id = "desk"                       # kvm:desk; lowercase letters, digits and dashes, at most 32
+kind = "nanokvm"                  # the classic NanoKVM; "nanokvm-go" for NanoKVM-Go
+url = "https://10.0.0.5"          # https only, no user or password in it
+username = "admin"                # classic only; "admin" when left out
+credential = "secret:desk-kvm"    # its password (classic) or API key (NanoKVM-Go)
+fingerprint = "sha256:…"          # the SHA-256 of the certificate it presents
+readers = ["@tgorka:example.org"] # who sees what is typed into that machine
+```
+
+The table is closed like the rest of the file: an unknown key, a `kind` that is neither, a URL that
+is not `https://` with a host or that carries a credential, a `username` on a NanoKVM-Go, an empty
+one, and an `id` named twice are refused naming the entry. The credential comes from the host's
+secret store (§ *Secrets*) and nowhere else; a `[[kvm]]` table in an agent's `agent.toml` makes
+that file unreadable rather than naming a KVM.
+
+**Its certificate is pinned.** A KVM's certificate is self-signed, so keeper asks no authority:
+it connects only when the SHA-256 of the certificate presented is the `fingerprint`, and otherwise
+refuses with a sentence naming both fingerprints. The pin is the whole check — no name and no
+expiry date is looked at, by intent: the certificate is the device's own. Read it once from the
+device (`openssl s_client -connect 10.0.0.5:443 </dev/null | openssl x509 -outform der | sha256sum`)
+over a cable you trust. Keep the KVM on the tailnet only and its firmware at 2.3.1 or later.
+
+**Which agents.** An agent uses a KVM when its `[tools].allow` names `kvm_snapshot` or `kvm_act`
+and its `[host].needs` names `kvm:<id>` — the need is not derived from the tools, so write it. A
+classic NanoKVM is spoken by keeper itself; a NanoKVM-Go is spoken through its own MCP server,
+named as an `[[mcp]]` entry with `role = "kvm:<id>"` and listed in the agent's `[tools].mcp`. That
+entry carries no `readers`, `fingerprint` or `credential` of its own: they are its `[[kvm]]`
+entry's. Its `url` is the one spoken to; keeper does not yet check that its host is the `[[kvm]]`
+entry's (DW-1179). **A NanoKVM-Go offers only its screenshot in this version:** its click, typing,
+power and media tools are listed as not offered, because they would be approved on a card with no
+frame and sent against a screen nobody read again; they come when they ask through the same frame
+pin `kvm_act` has (DW-1174).
+
+**Looking.** `kvm_snapshot` takes one frame of the screen and runs without asking (T0). The
+model is told the frame's size — the coordinates `kvm_act` takes are its pixels, `0` to one less
+than the width and height — and the frame's SHA-256; what the screen shows is outside content,
+labelled `untrusted` and read by the KVM's `readers`, joined into the session's label. **The model
+is not shown the picture in this version** — no image reaches a provider (DW-1175) — so an agent
+cannot yet see where to click: the person sees the screen, on the card. The frame is kept under
+the sessions zone's `.keeper/previews/<sha256>.png` (the device's JPEG kept as a PNG), which never
+syncs: never in a session, never in a commit. A frame must arrive whole within 15 seconds and be
+at most 8192 pixels on a side; otherwise it is refused.
+
+**Acting.** `kvm_act` sends up to 32 inputs — `click`, `move`, `scroll`, `key` (a name or one
+character, with `ctrl`, `shift`, `alt`, `meta`), `type` (up to 256 characters of a US keyboard),
+`paste` (up to 1024, typed by the device) and `power` (`press`, `hold` to force it off, `reset`) —
+with an `intent`, a few words of what they are for. Nothing through a KVM is below T4: typing,
+clicking, a chord or a paste is T3 raised once by the KVM, and a power press is T4 as it is; other
+reasons to raise (§ *Work nobody is watching*) add nothing more. Anything that touches a security
+dialog, a password or a payment — by the intent, or by what is typed or pasted, each text alone
+and everything the call types joined across its inputs (so a card number split in two, or a
+password spelled one key at a time, still counts), a card number included, or Ctrl+Alt+Delete —
+is T5: keeper never sends it, and the person does it on that machine. The recognisers are a word
+list, a card number's checksum and one chord; what the screen shows is not read (DW-1172). A point
+on the far edge of the frame is no pixel of it: refused before anyone is asked.
+
+**The card.** Its sentence is keeper's, composed from the inputs — *2 inputs to desk: click (960,
+540), type 2 characters* — never from the intent or anything the model wrote. The card draws the
+same inputs one per line and no raw arguments — an attached action's too, which the device is
+given only as those inputs: typed and pasted text is counted, not shown, with
+its line breaks and tabs named (*type 3 characters including 1 line break*, each an Enter); keys
+pressed one character at a time are counted as a run (*6 character keys*), and so are letters and
+digits under Ctrl, Alt or Meta (*4 letter shortcuts*), which would spell a word as well; named keys
+and their chords are spelled. The person decides on the frame keeper took when it asked, which
+joins the session's label as the call waits — what the KVM shows is read by its `readers`, so
+the card goes only where they may see it: the record
+holds that frame's SHA-256 as its preview, and the card carries the image as its encrypted Matrix
+attachment. A T4 card counts only from a device other than the host's own process, and on a
+shared session only from the requester at the head of its chain. An approval is for that one call.
+
+**Before it is used.** keeper takes a fresh frame and compares it with the one decided on: the
+same size, and the difference hash of each tile of the screen (a grid of tiles at most 256
+pixels on a side: a KVM shows no windows to pin) and of the 64-pixel square around each point an
+input clicks or moves to within the bound the Mac's screen measured (seven bits) — a clock or a
+caret passes, a dialog that moved or appeared, or a window over the point, does not. A different
+screen, or a KVM that is not the one approved (another device, certificate or audience behind the
+same `id`), is drift: refused, nothing consumed, nothing sent. A host that took the session over
+re-checks against its own fresh frame; it needs no preview file. Only after the `consumed` event
+is accepted does the first input reach the KVM.
+
+**Sent is not done.** The answer says the input was sent and that whether it took effect is not
+known, with a fresh frame's size and hash; its log line's `effect` is `unverified`. Inputs that
+stop part way — some sent, then the device refuses one — are not a refusal: the answer says some
+were sent, the line's outcome is `failed` and its `effect` `unverified`, and a fresh frame is read
+the same way. Take a snapshot to see what happened. Each use logs in afresh: the classic
+NanoKVM's password travels encrypted under the key its makers publish — an obfuscation, not a
+secret — and only inside the pinned TLS. Two sessions on one host using the same KVM are not yet
+kept from interleaving their inputs (DW-1178).
+
+**A send to its readers.** An input is a send of what the session holds to the KVM's `readers`,
+checked before anything reaches the device — not even a login: a session read by tgorka and marta
+cannot type into a KVM read by anyone else. Only the NanoKVM family is spoken; PiKVM, JetKVM and
+GL.iNet Comet are not (DW-400).
 
 ## When an action waits
 
@@ -1420,16 +2145,17 @@ per date and host, compared as a number. Each host writes only its own chunks an
 | `peer` | `sender, text`, optional `ask {id, question, room, label}` (another agent's question for the proxy's person, in the proxy's session), `answers {id, choice}` (the person's answer to this session's ask, relayed by their proxy; `choice` is `null` when the answer picks none) and `artifacts` |
 | `assistant` | `text, model, finish, usage {prompt, completion}, ttft_ms, duration_ms, anchor_event`; a round that called tools carries that round's own usage |
 | `tool_call` | `call_id, tool, args, tier`, optional `grant_id`; `args` is the string the model sent, verbatim |
-| `tool_result` | `call_id, outcome` (`ok`, `refused`, `failed`), `content`, optional `truncated {shown, total}`, `label` |
+| `tool_result` | `call_id, outcome` (`ok`, `refused`, `failed`), `content`, optional `truncated {shown, total}`, `label`, optional `paseo {broker, id}` (the run a successful Paseo `create_agent` started) |
 | `approval` | `id, state` (`requested`, `decided`, `consumed`, `expired`, `refused`), optional `decision, by, result, reason, scope`; terminal: `consumed`, `expired`, `refused`, and `decided` with `decision: "deny"`; a `decided` line without `decision` is a decision ignored, `reason` saying why |
-| `delegate` | `id, to`, optional `room` (absent on a refusal made before the room existed), optional `child {drive, session}`, `state` (`opened`, `sent`, `accepted`, `replied`, `refused`), optional `reason` |
+| `delegate` | `id, to`, optional `room` (absent on a refusal made before the room existed), optional `child {drive, session}`, `state` (`opened`, `sent`, `accepted`, `replied`, `refused`), optional `reason`, optional `reply {text, artifacts, label, completion}` (`completion`: a Paseo run's end told into the delegation's room) |
 | `ask` | `id, state` (`asked`, `sent`, `answered`, `defaulted`, `refused`), optional `to, via, room, question, choices, default, card, answer, choice, reason`; in the asking session `asked` → `sent` → `answered`, `asked` → `refused` when the send was refused, or `defaulted`/`refused` at once; `card` names the scheduled card whose run asked; in the proxy's session one `answered` carrying the person's message it relayed |
 | `label` | `readers, integrity`, optional `local_only`, `cause {kind, ref}` |
 | `scope` | `drives, set_by` |
 | `run` | `state` (`queued`, `running`, `waiting`, `blocked`, `review`, `failed`, `idle`), optional `detail` |
 | `surface` | `id, tool, device`, optional `outcome` |
 | `told` | `person, room` — the person a narrowed session's detail was sent to, and their proxy DM it went into |
-| `heard` | `assistant, heard_until, sentence, reason` (`barge_in`, `stop`) |
+| `paseo` | `completion, state` (`pending`, `delivered`), `room, artifact, sha256`; `pending` also `record` (the record's bytes) and `content` (the notice), `delivered` also `event` |
+| `heard` | `assistant, heard_until, sentence, reason` (`barge_in`, `stop`) — under the answer's closing `assistant` line (`assistant`), carrying the person's `dev.keeper.agent.heard` event; `heard_until` is the end of the `sentence`th sentence as the host counts it in the answer the room showed (Unicode scalar values), never the device's own number |
 | `memory` | `op` (`journal`, `proposal`), `ref` |
 | `compact` | `summary, replaces_through` |
 | `error` | `sentence, code` |
@@ -1480,6 +2206,13 @@ session". Prefixed with the same system message, the replayed request is byte fo
 model received, except where a secret was replaced. Replay runs when a session opens, moves to
 another host or restarts; a host serving a session keeps its history in memory and never reads
 its log on a turn.
+An answer a `heard` line marks replays cut where the person stopped listening: its rounds keep
+their text up to `heard_until` (counted over the rounds joined as the room showed them, a blank
+line before each later round with text), the round holding the cut ends with "[The person stopped listening here.]", and
+later rounds keep their tool calls and lose their text. The first mark of an answer counts; an
+answer the room never showed (withheld, R168) is counted over the sentence the room showed
+instead and is not cut. The log line keeps the whole answer, and
+a served session cuts its context in memory exactly as replay does.
 
 **The index.** `<sessions zone>/.keeper/agents.db` answers the session list and the board: each
 session's agent, kind, label, scope, run state and that `run` line's detail, claim host and
@@ -1779,10 +2512,23 @@ the bots' URL rules; an `[[agents]] drive` must be a `[[drives]] id`. Two `[[dri
 one `remote`. `[[trust]]` needs `user`;
 `master_key` (`ed25519:<unpadded base64>`) is written by a person after comparing the fingerprint
 with the person's own device, never by keeper, and without it the person is not pinned and no
-decision of theirs is accepted (*Deciding*). `[[mcp]]`, `[[kvm]]` and `[sandbox]` are read and checked now and
-used by later epics; an `[[mcp]] role = "kvm:<id>"` must name a `[[kvm]] id`. `[sandbox]
-read_exec` must be absolute; that it names nothing inside a drive's checkout and nothing holding
-this host's secrets is checked by the sandbox that mounts it, in a later release.
+decision of theirs is accepted (*Deciding*). `[[mcp]]` names the agents' MCP servers (§ *MCP
+servers*); `[[kvm]]` names the KVMs (§ *Another machine through a KVM*), each `id` once, and an
+`[[mcp]] role = "kvm:<id>"` must name a `[[kvm]] id`. `[sandbox]` is
+`run`'s (§ *Running a command*):
+
+```toml
+[sandbox]
+read_exec = ["/opt/toolchains/bin"]
+env       = { RUSTUP_HOME = "/usr/local/rustup", CARGO_HOME = "/usr/local/cargo" }
+```
+
+`read_exec` folders and `env` values are absolute paths a run may read and execute (the `read_exec`
+folders also go on its `PATH`); an `env` name is upper-case and never one keeper sets itself
+(`PATH`, `HOME`, `TMPDIR`, `LANG`, `TERM`, `NO_COLOR`, `GIT_*` of the run's list), `KEEPER_*`,
+`LD_*` or `DYLD_*`. At start agentd refuses to offer `sandbox` when one of them is `/`, is or holds
+a drive's checkout, agentd's own configuration, data or state folder or `$CREDENTIALS_DIRECTORY`,
+or holds its user's home; `keeper-agentd status` names which.
 
 `[[providers]]` become `keeper.db` rows, one per entry and kept in step with the file at every
 start: a changed `base_url` updates its row, a removed entry deletes it. No token enters the
@@ -1858,9 +2604,12 @@ own log and never sent to the model.
 
 **Sends.** Every send disables matrix-sdk's own retry, so a `M_LIMIT_EXCEEDED` reaches the caller
 with its `retry_after_ms` and the caller decides how to pace; a retried send reuses its
-transaction id so the server keeps one copy. State events (claims, host manifests) are not
-encrypted and carry no content — no title, no path, no text. A claim is read back from the server
-(`GET /rooms/{id}/state`), never from the client's cache, which can be a sync behind.
+transaction id so the server keeps one copy. State events (claims, host manifests, a follow
+session's capture evidence) are not encrypted and carry no content — no title, no path, no text:
+the evidence holds only ids and a SHA-256, the capture itself travels as an encrypted file. A claim
+— and a capture's evidence, before a worker acts on it — is read back from the server
+(`GET /rooms/{id}/state`), never from the client's cache, which can be a sync behind; placement
+reads the cache, as it does for claims.
 
 **Run the live tests** against the Synapse test homeserver (its users and the secrets file are the
 operator's; the file holds `SERVER_NAME`, `ADMIN_TOKEN`, `NIXI_SMOKE_PASSWORD`,
@@ -1936,7 +2685,7 @@ keys, so nothing sent before its first `run` can be decrypted by it: run the hos
 
 ## keeper-agentd
 
-`keeper-agentd` is the Linux host. One binary, seven verbs:
+`keeper-agentd` is the Linux host. One binary, eight verbs:
 
 | verb | what it does |
 | --- | --- |
@@ -1945,6 +2694,7 @@ keys, so nothing sent before its first `run` can be decrypted by it: run the hos
 | `keeper-agentd agents list` | every zone and home with its verdict, each refused skill, and whether each served agent's copy is signed in |
 | `keeper-agentd agents init <drive> --owner <@user> --reader <@user>… --bot <bot> [--local-only] [--with <ids>] [--principal <p>] [--into <dir>]` | seeds the drive's agents zone, never over a file, refusing an owner, readers or `local_only` that differ from the pin, and a bot that is not local on a `local_only` drive; against agentd's own checkout — refused while `run` serves the principal — makes the seeded proxy's DM and `main` session once its copy is signed in, adopting the DM when the copy is already in it (§ *Setting up the agents zone*) |
 | `keeper-agentd agents new <id> [--name <name>] [--from-bmad <dir>] [--drive <drive>] [--into <dir>]` | copies the zone's `_template/` to a new agent's folder, refusing one that is there and a link in the template; `--from-bmad` writes the BMAD agent's soul and lists what it did not import |
+| `keeper-agentd agents gate <agent> <system>` | makes the room and the gate session of one `[[gate]]` of a gate agent (`<drive>/<id>`, or an id one mounted drive alone has), once: run again it finds the session and says nothing was made, and a session folder lost before `run` pushed it is made again naming the room the copy is already in, when that room is the gate's own. Refused (exit 2) while `run` serves the principal, on a host whose `agentd.toml` says `always_on = false`, for a peer `[[trust]]` names, a drive with no reader whose key is pinned, an approver outside a listed audience, a room found as the gate's that the gate did not make or whose levels or encryption are not the gate's, and before the gate's copy is signed in (§ *Gates*) |
 | `keeper-agentd run` | serves the agents until `SIGTERM`, holding `agentd.lock` in its data folder so no second `run` or `agents init` opens the copies beside it |
 | `keeper-agentd status [--session <drive>/<session> [--no-probe]]` | the host, each drive's engine state and mount verdict, each copy, the sessions served (and a session not served because another names its room), the tools each agent is and is not offered here, and each `[[trust]]` person's pin against the master key their homeserver publishes (`matches`, `differs`, `not pinned`, `not published`; read by the running host, "not running" without one); with `--session`, what that session's agent is told and whether its digest is the last `open` line's. Composing it asks an `ollama` provider which tools its model supports, as a turn does; `--no-probe` asks nothing and composes as if that were unknown |
 
@@ -2151,6 +2901,10 @@ like any other). What keeper and the proxy's host do for it:
   selected, and a file dropped on the window goes to the note, not to the dock. Opened in a
   window too narrow for every column, it folds the notes rail to its strip. With no proxy it says
   so, looks again on its own and offers *Look again*.
+- **On an Android tablet** (story 98.3, UX-DR146) the same dock is a sheet: *Assistant* in the
+  Inbox header opens it over whatever is showing, with the same picker, header, timeline and
+  composer. It tells your proxy no note, because over the Inbox none is in front of you. A phone
+  has no dock; its proxy DM is a room in the Inbox.
 - **Which rooms.** The dock lists your proxy's conversations: the session rooms whose status says
   `kind: main` — the DM, listed first, the dock's default — or `kind: conversation`, newest next.
   A status is the word of whoever holds power in the room, so keeper also requires the room to be
@@ -2198,7 +2952,8 @@ like any other). What keeper and the proxy's host do for it:
   dock opens the new conversation when it appears. A room made but whose folder could not be
   written is left, your invite revoked. If the host stops between the room and the folder, that
   room is left with no session; ask again.
-- **Who may ask.** A scope or a new conversation counts only from the proxy's `human`, in the
+- **Who may ask.** A scope, a new conversation or a mark of where you stopped listening
+  (`dev.keeper.agent.heard`, *Talking to Nixi*) counts only from the proxy's `human`, in the
   proxy's own rooms (a new conversation in the DM only), and only from a device that person's
   cross-signing identity signed (ruling R47).
   Anyone else's, or one from a device its owner never signed, is ignored and logged as a note.
@@ -2304,13 +3059,113 @@ as chosen ("not listed yet") and is looked for again, never rewritten. What happ
   no copy of it may be running right now.") or nothing from the turn for two minutes once it
   answered ("Nixi stopped answering.") ends the turn; a question the send queue gave up on ends
   it at once ("Your question did not reach Nixi.").
-- **Stopping.** The stop phrase stops the speech on this device; nothing tells the agent, which
-  finishes its answer in the room (ruling R44; a turn-cancel event is DW-419). Every question
+- **Stopping.** The stop phrase stops the speech on this device; the agent is told where you
+  stopped listening, and its turn is not cancelled: it finishes its answer in the room (ruling
+  R44; a turn-cancel event is DW-419). Every question
   the voice turn sends is numbered before anything is sent: stopping it, or asking again, makes
   every later report of the earlier one — its send, its first words, its sentences, its end —
   move nothing, whichever finishes first; the earlier one's send and watch are stopped.
+- **Where you stopped listening (the host's half).** The proxy's host takes
+  `dev.keeper.agent.heard` — `{v, anchor, heard_until, sentence, reason}`, the answer's anchor
+  and how many of its sentences were finished aloud — from you alone, from a device your identity
+  signed, in the proxy's own rooms; it is served after the turn under way, like any arrival. The
+  answer must be one of the session's (its anchor), marked once, and no longer than it is; the
+  host counts where its `sentence`th sentence ends itself, with the speech segmenter's own cut,
+  and logs one `heard` line carrying the event, so a redelivery is not logged twice. Nothing
+  else: the answer is not cancelled and no turn runs (R44, DW-419); the next turn reads the answer
+  cut there (*Replay*, above). Anything else is ignored with a note in the host's log.
+- **Where you stopped listening (the speaking device's half).** The device keeps a mark per
+  question, beside the answer's follow and not inside it (so asking again loses nothing): the
+  answer's anchor, where each sentence handed to the synthesiser ends in the answer's text (in
+  Unicode scalar values, the segmenter's own cut), and how many the synthesiser read to their
+  end, as its delegate reports them. A sentence it was cut off in does not count: an agent told
+  you heard less repeats a little, one told you heard more skips what you never heard. When the
+  answer is stopped — the stop phrase, the mic button, the hotkey, the tray, or long speech with
+  no words in it (reason `stop`), or a question asked over it (`barge_in`) — the device sends
+  `dev.keeper.agent.heard` into the room first, and your next question, asked over the answer or
+  after the stop, goes in only once the mark's event id came back, so the agent's next turn
+  already reads the answer cut where you stopped. A mark that has not come back in ten seconds
+  is not waited for: the question goes, and the mark cuts the turns after it. An answer heard to
+  its end, or one a failure ended, is marked nowhere.
+- **Where you stopped listening (the room).** The agent room shows it in the answer itself, in
+  the conversation pane and in the notes view's dock alike: a thin rule with *You stopped
+  listening here* after the last sentence you heard, and the rest of the answer after it,
+  dimmed (UX-DR143). It is drawn only from your own mark — sent by you, sealed by a device of
+  yours — and only in an agent's answer; of two marks of one answer the first in the room's order
+  stands, as on the host. A mark cannot be taken back: one you redact still draws its rule, as
+  the host still cut the answer at it.
+  keeper counts the mark's `sentence` over the answer the room shows with the speech segmenter's
+  own cut, as the host does, so the rule does not depend on which edit your device saw last;
+  an answer that shows no more than that is drawn whole. The mark itself is never an item in
+  the timeline.
+- **When you talk over an answer.** The answer pauses, mid-word, the moment you speak — at the
+  voice activity model's onset (three frames, 96 ms) with the turn models, at the recogniser's
+  first words without them — and what you said decides: "mhm", "yeah", "okay" (English) or
+  "mhm", "tak", "no", "jasne" (Polish), the whole utterance and nothing else, resume it; with the
+  turn models, wordless speech under 600 ms resumes it too, and an onset that comes to no words
+  under 250 ms resumes it as a false onset. The stop phrase ends the answer. Anything else stops
+  it and is your next question — "no, wait" in English is a question. The list is the one for
+  the language recognition runs in; any other language has "mhm" and "aha". Words are decided
+  once the recogniser's last of them came or 600 ms after the voice activity model heard you
+  stop (800 ms after the last thing heard otherwise). On the Mac this is the same as on the
+  phone ([ios.md](ios.md) § *When you talk over an answer*); a capture without voice processing
+  (an aggregate input, AD-213) hears keeper's own voice, so there the voice activity model does
+  not listen while keeper speaks and your words still cannot pause the answer — the button, the
+  hotkey and the tray stop it.
 - **The wake phrase is unchanged.** Naming the proxy "Nixi" renames nothing; the wake phrase is
   the one you set.
+- **When your question ends.** Without the account's turn models it ends 1.8 s after the
+  recogniser's last words, as it always has. With them (Silero VAD and Smart Turn v3.2 from
+  `_models/`, on an Apple-silicon Mac and the iPhone) a finished sentence ends it about a quarter
+  of a second after you stop: the voice activity model hears speech stop, the end-of-turn model
+  judges the sentence finished, and the recogniser is asked for its last words — sent when they
+  come, or what it had heard 600 ms after the recogniser was told the audio ended. A sentence
+  the model judges unfinished ("and the second one is…") waits for the 1.8 s pause. On the Mac
+  this is the same as on the phone
+  ([ios.md](ios.md) § *How a spoken turn ends*): the tap's copy, the listener thread, the models,
+  `FinishRecognition`'s `endAudio`; a capture without voice processing (an aggregate input,
+  AD-213) ends turns the same way, since the models listen only while the turn is listening, not
+  while keeper speaks. The audio goes from the tap to the models and nowhere else.
+
+### Measured: a spoken turn's end
+
+NFR-114's end-of-turn half, per device, over at least twenty spoken questions with the turn
+models present — about half complete sentences, half trailing off — from the app log of the run
+(debug mode on; `KEEPER_VOICE_LOG=<keeper.log> cargo test -p keeper-core --test voice_timings
+measure_a_device_run -- --ignored --nocapture`): the p95 of `finish_recognition_ms −
+speech_end_ms` over the turns the model ended (≤ 300 ms; `finish_recognition_ms` is when the
+port ran `endAudio`, as it reported it), the p95 of `sent_ms − finish_recognition_ms`
+(≤ 600 ms), and the pause turns sent less than 1.8 s after their speech end
+(none). Each sent text is also compared by hand with what was said: no question may lose its last
+word.
+
+| device | OS | build | date | n | model turns | finish p95 | send p95 | early pauses | last words lost |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| hesperia | — | — | owed | — | — | — | — | — | — |
+| kalypso | — | — | owed | — | — | — | — | — | — |
+
+Both rows are owed: story 97.2 is done only when they are filled from real runs (97.2 #8).
+
+### Measured: talking over an answer
+
+NFR-114's backchannel half, per device, with the turn models present, over at least twenty
+pauses — "mhm" and "yeah" (English), "no" and "tak" (Polish) during long answers, "stop" and
+"no, wait" mid-answer, and ten minutes of an answer read with nobody speaking — from the app log
+of the run (debug mode on; `KEEPER_VOICE_LOG=<keeper.log> cargo test -p keeper-core --test
+voice_timings measure_a_pause_run -- --ignored --nocapture`): the p95 of `pause_ms − onset_ms`
+(≤ 150 ms), of `resume_ms − speech_end_ms` over pauses resumed by their duration and of
+`resume_ms − final_words_ms` over pauses resumed by their words (each ≤ 300 ms; `final_words_ms`
+is when the deciding words reached the turn, `resume_ms` when the synthesiser had continued),
+and the false
+onsets per ten minutes of reading aloud — more than one is reported to the coordinator before
+97.3 closes.
+
+| device | OS | build | date | n | pause p95 | duration resume p95 | words resume p95 | false onsets / 10 min |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| hesperia | — | — | owed | — | — | — | — | — |
+| kalypso | — | — | owed | — | — | — | — | — |
+
+Both rows are owed: story 97.3 is done only when they are filled from real runs (97.3 #11).
 
 ## Handing work on
 
@@ -2430,6 +3285,281 @@ over. A reply without a label is not taken. A reply sent while the delegating ho
 read back as far as that host's newest brief in the room, however many pages. A `peer` line,
 like a `user` line, is a question a restart closes rather than reruns; a `delegate replied` line
 whose `peer` line a crash lost gets it back from the receipt first.
+
+
+## Gates
+
+A gate is the door for one outside system — a CI, a forge, a ticket queue, another company's
+bot — that talks to your agents through Matrix. It is an agent of `kind = "gate"` with one
+`[[gate]]` table per system, and each table is one room and one session of kind `gate`: the
+outside system's account (its *peer*) writes in that room, and nothing it writes ever reaches a
+person's DM or another agent except through the gate.
+
+```toml
+version     = 1
+id          = "forge"
+name        = "Forge"
+kind        = "gate"
+matrix_user = "@forge:example.org"
+
+[[gate]]
+system    = "github"
+peer      = "@github-bot:example.org"
+audience  = ["@github-bot:example.org", "@tgorka:example.org"]
+delegates = ["tola-grey"]
+modes     = ["sync", "async"]
+
+[model]
+bot = "bot:ollama:http://localhost:11434#qwen3"
+```
+
+| key | default | rule |
+| --- | --- | --- |
+| `system` | required | 1 to 32 lowercase letters, digits or dashes; unique in the agent. It names the room and the session. |
+| `peer` | required | the outside system's own Matrix user id: never the gate's own user, a reader of the home drive, another agent of the zone, or anyone `agentd.toml`'s `[[trust]]` names (a person's own account would make their decisions count in the room where their text is outside content) |
+| `audience` | required | who reads what is posted in the room: `["*"]` (anyone the system shares with — its server's operator included), or Matrix user ids that list the `peer` and every person who decides the gate's tickets (below) |
+| `delegates` | `[]` | agent ids of the home drive the gate may hand work to — never the gate itself or another gate. They are the only agents a request can ever reach. |
+| `modes` | required | `["sync"]`, `["async"]` or both |
+| `deadline_ms_max` | `30000` | 1000 to 120000: the longest a synchronous request may ask the gate to wait |
+| `max_tickets_per_hour` | `10` | 1 to 1000: tickets the system may raise in an hour |
+| `max_requests_per_hour` | `120` | 1 to 3600: requests the system may make in an hour, answered or not |
+| `encrypted` | `true` | `false` makes the room without end-to-end encryption, for a system that cannot decrypt; only with `audience = ["*"]`, since the server's operator reads a clear room |
+
+A bound is refused one past its edge, naming the key (`gate[2].deadline_ms_max`). A `delegates`
+entry that is not an agent of the drive, and a `peer` that is one, are refused when the zone is
+read: the gate is then listed refused by `keeper-agentd agents list`, naming its first fault. That
+check reads one drive: a peer that is an agent of another drive the host mounts is not refused
+(DW-1332).
+
+**Writing `audience` releases the gate's `SOUL.md` to it**, and everything the gate posts in its
+room. A gate reads no drive itself (its tools are at most `reply`, `delegate` and
+`journal_append`, and the MCP servers `[tools].mcp` names); drive content reaches it only in a
+reply from an agent it delegated to, and is then held by the room's audience like any send.
+
+### Making a gate's room
+
+On the always-on Linux host that serves the gate, with `keeper-agentd run` stopped:
+
+```sh
+keeper-agentd login tgdrive/forge
+keeper-agentd agents gate forge github
+```
+
+The room is a session room (`dev.keeper.agent.session`), encrypted unless the table says
+`encrypted = false`, named "Forge · github". It invites the peer and, as observers, the home
+drive's pinned readers whose master key `[[trust]]` pins — the people who decide the gate's
+tickets; each of them must be in a listed `audience`, or the command is refused naming them, and
+a drive none of whose readers has a pinned key is refused naming the drive: nobody would decide the
+gate's tickets or see its room. In
+the room the gate holds 100 and everyone else 0: the peer posts (encrypted, or as `m.room.message`
+in a clear room) and can write no state — no claim, no power levels — and cannot invite, kick, ban
+or redact. The gate session's id is derived from the drive, the agent and the system, so running
+the command again makes nothing; its `agent.toml` says `kind = "gate"`, is asked for by the
+drive's pinned owner (who heads its chain), carries the label `audience` at `untrusted` for its
+whole life — a gate session's file saying any other integrity does not read — and copies the table
+into `[gate]`: the system, the peer, each delegate as
+`<drive>/<id>`, and `encrypted = false` for a clear room. A session file is never rewritten, so
+a later edit of `peer`, `delegates` or `encrypted` reaches only a new gate session.
+
+When the session folder is gone (lost before `run` pushed it, or a run stopped between the room and
+the folder), the command looks for the room among those the gate's copy is in: one whose newest
+status from the gate says it serves this system — the peer in it or not, so a peer that declined
+or left does not get a second room — or, with no status yet, one named as the gate room with the
+peer in it. Such a room is adopted only when the gate's copy alone made it, its power levels are
+the ones a gate room is made with, and it is encrypted as the table says; otherwise the command is
+refused (exit 2) naming the room, and nothing is made: have the gate's account leave a room it did
+not make, restore the levels, or write `encrypted` back.
+
+### Connecting a system
+
+keeper ships no bridge and opens no port: Matrix is the only way in, and keeper-agentd still
+listens on nothing. A system with its own Matrix client logs in as the peer and writes in the
+room. A system that only sends webhooks needs a bridge the operator runs on the homeserver, whose
+puppet is the peer — whether tuwunel hosts appservices, whether matrix-hookshot's webhooks can
+post into an encrypted room, which `msgtype` they send, and whether anything carries the gate's
+answers back out are all `[UNVERIFIED]`; such a system is asynchronous at best, and its room
+would have to be clear.
+
+### Asking a gate
+
+Each message the peer writes in its room — `m.text` or `m.notice` — is one request; anyone
+else's message there is not a turn, and nothing else the peer sends (a decision, a scope, an
+edit, any keeper event) counts for anything. To ask synchronously the system adds a deadline:
+
+```json
+{"msgtype": "m.text", "body": "is the deploy done?",
+ "dev.keeper.agent.gate": {"request": "r1", "deadline_ms": 5000}}
+```
+
+A message without `deadline_ms` is asynchronous; one without the key is asynchronous and named by
+its event id, as is one whose `request` is longer than 255 bytes or holds a line break or another
+control character. A deadline above `deadline_ms_max` is cut to it, and is counted from the
+request's `origin_server_ts` — never from later than the gate's homeserver's own clock, whatever
+the system's homeserver stamped. Where the gate names a request in its own words it quotes the
+name, cut to 64 characters. The gate answers in the same room,
+each message an `m.text` referencing the request (`m.relates_to` `m.reference`) and carrying
+`dev.keeper.agent.gate: {v: 1, request, state, ticket?, deadline_ms?, reason?}`:
+
+| state | when |
+| --- | --- |
+| `answer` | a synchronous request answered within its deadline; `deadline_ms` says the deadline the gate kept |
+| `ticket` | an asynchronous request, at once; a synchronous one whose deadline passed first (timed by the homeserver's clock). The work goes on. |
+| `result` | the ticket's work, done |
+| `refused` | `reason`: `busy` (an hourly allowance is spent, or as many tickets are open across the agent's gates on this host as `[limits].max_concurrent_sessions`), `mode` (an asynchronous request to a gate whose `modes` is `["sync"]`), `no_answer` (the gate's turn ended without answering), `interrupted` (its host stopped mid-turn), `denied` (a person declined handing it on), `expired` (nobody decided that in time), `failed` (approved, but it could not be handed on), `withheld` (its result read what the room may not read, and the drive's owner declined to let it out), `unreleased` (the same, and nobody let it out: nobody could be asked from this host, nobody decided within the hour, or the result or the room changed after the decision) |
+
+A synchronous request to a gate whose `modes` is `["async"]` gets a ticket at once. Both hourly
+allowances refill continuously — `max_tickets_per_hour` tickets, `max_requests_per_hour`
+requests, one back every `3600 / n` seconds — and are counted from the gate session's own log, so
+a restart or another host taking the session over refills neither. A refused request runs no turn,
+and of the requests refused before any turn (`busy`, `mode`) the gate says one refusal a minute in
+the room — the rest are logged, not echoed. A request whose turn a stop cut off is refused
+`interrupted` when the session is served again, unless the room already shows its answer, result
+or refusal from the host that held it before. A gate session
+is served only by a host whose `agentd.toml` says `always_on = true`: with none live it waits,
+saying `an always-on host`.
+
+Each request is its own turn: the model reads that request alone, never an earlier one, framed as
+data — what an outside system writes never decides anything — and is told the gate's `SOUL.md` and
+its session's frame, never its memory, skills, menu or any drive file. The turn streams nothing
+and posts no status: the only thing that leaves is what its `reply` sends, once, passing the room
+as a sink like every send. Its label is reset to the gate's opening label (the `audience`,
+`untrusted`) at every request, and never rises.
+
+### Handing a request on
+
+A gate's turn is offered `reply`, and `delegate` and `journal_append` when `[tools].allow` names
+them (a gate's default `allow` does). Any other tool its model names — `ask_human`, a memory or
+skill proposal, an MCP tool or a drive verb included, whatever `[tools].allow` says — is refused as
+not offered, before it runs or reaches anyone. A gate's MCP servers are not offered in this build
+(DW-1360).
+
+`delegate` in a gate never hands anything on by itself. Its target must resolve to an agent its
+`[[gate]].delegates` lists — compared as `<drive>/<id>`, whatever name the call wrote, so the agent
+a request names is refused, never asked — and it never sets a schedule or a workflow, opens a
+second round, or hands on a card. A call that passes is written to the audit log first — one that
+cannot be recorded is refused, and nothing is paid or said for it — then takes the request's
+ticket (a synchronous request gets one there and then, and its work goes on as asynchronous; one
+request is handed on once, and a synchronous request past the hour's `max_tickets_per_hour` is not
+handed on), and waits for a person: it is tier 1 raised to tier 2 in a gate, decided `once` only.
+The turn ends normally and the request stays open under its ticket; the gate's `reply` in that
+turn is refused.
+
+The host then asks for it on **the hour's card** in the gate's own room: one
+`dev.keeper.agent.approval.request` whose content lists every ticket's record (`{v, records}`),
+opened by the first ticket of an hour by the homeserver's clock, each later ticket of that hour
+added by an `m.replace` edit carrying the whole list — every earlier record exactly as it was — so
+a ticket after the hour, or one that would take the card past 32 KiB, opens a new card. Each record
+names the gate's session, the agent it would go to, the brief, the ticket and the request, and is
+decided on its own; the decision event names one record. The people who decide are the drive's
+pinned readers whose key this host pins, worked out again when the card is sent, when a decision
+arrives and when the delegation's room is made — a person pinned after `agents gate` made the room
+decides too, though the room never invited them (DW-1352) — never the room's audience, and a
+decision the peer sends counts for nothing. A decision is judged against the label the ticket was
+asked under, whatever a later result made the gate read. Edits do not push, so a phone shows one
+notification for a card however many tickets join it. A card the room does not take — its members
+could not be read as it was sent — leaves its ticket waiting, and is sent again at the gate's next
+turn. A clear gate room cannot carry a card a device would draw, so a gate there refuses
+`delegate`.
+
+Once a decision approves a record, the host — not a turn — hands the request on as any delegation:
+the room made inviting the delegate and the deciding people as observers (never the peer), the
+brief sent only after the delegate's host joined, its id the ticket's, carrying the gate's
+`[limits].tokens_per_delegation`, asked for by the gate's user with the gate session as its parent.
+When the delegate replies, the gate runs one turn that reads that request and the reply alone, and
+its `reply` goes out as the ticket's `result`; a reply delivered again adds nothing. That `reply`
+passes the room as a sink like every send, and the delegate's reply carries what its own turn read —
+its home drive at least, whose readers never include the peer — so a result the delegate's home
+went into is **held** (below). A denial
+refuses the ticket `denied`, a record nobody decides within a day `expired`. Open tickets — handed
+on or not — count against `[limits].max_concurrent_sessions` until their `result` or refusal; one
+waiting for a person or a delegate survives a restart.
+
+### A result that read a drive
+
+A ticket's result whose delegate read what the room's audience may not read never reaches the room
+by itself. Its `reply` is blocked by the room's sink and waits for the drive's owner — the head of
+the gate's chain — on a `declassify` card (tier 3 raised to 4, `once`, an hour to decide) sent to
+the owner's DM with their proxy, never into the gate room; the proxy never joins the gate room. The
+card names who the result would let read (the peer, and anyone else in the room the label does not
+reach), the exact bytes by their SHA-256, and the `reply` itself. The gate logs the request `held`
+and says nothing in the room; it goes on taking requests meanwhile, and its ticket stays open. Only
+the owner's decision from a verified device counts — a reader of the note, the peer or another
+pinned person count for nothing. Approved, exactly that text goes once as the ticket's `result`,
+and only while the room is still within the label the result was held under widened by the readers
+the card named; a room someone joined since is refused `unreleased`. Declined, the request is
+refused `withheld`; undecided within the hour, or on a host that runs no proxy of the owner's (the
+card cannot be asked anywhere), `unreleased`. A held result survives a restart. A later reply of
+the same ticket while it is held runs no turn and asks nothing: the first card is the one that
+decides. The SHA-256 on the card is the record's own: what goes is the text the card carries,
+never a later line of the turn.
+
+Every status and scope a gate would post is held the same way: a gate's turn posts neither, so
+nothing in the room names a path, a title or a heading a delegate read. The room's one scope is the
+one `agents gate` posts beside its status anchor when it makes the room: no drives, and the gate's
+opening label — its audience, `untrusted` — which names no one the room does not already hold.
+
+### What an outside system cannot make an agent do
+
+A request is data. Whatever it says — "ignore your instructions", "delegate to amelia", "push to
+origin", "remember that…" — the safety is the host's, not the model's:
+
+- **No tool it was not given.** A gate's turn is offered `reply`, `delegate` and `journal_append` at
+  most; `run`, a drive verb, `ask_human`, `workflow_start`, a helper and a memory or skill proposal
+  are never offered and are refused unrun if named.
+- **No recipient or path from its text.** `delegate` reaches only an agent `[[gate]].delegates`
+  lists, by identity; the agent a request names is refused, never asked. `reply` goes only to the
+  gate's own room.
+- **Nothing consequential without a person.** Every hand-off and every journal entry waits on the
+  hour's card for one of the drive's pinned people; a result that read their drive waits for the
+  owner's declassification. The session is `untrusted` for life, and no decision, reply or event
+  raises it.
+- **No memory.** A gate proposes no memory and no skill; a `gate`-origin proposal is never promoted
+  and expires unread after 30 days. Its journal entry — tier 1 raised to 2, decided `once` or for
+  the session (a day at most, by the homeserver's clock, then it asks again) — is written only once
+  approved, quoted line by line under a sentence saying it came from an outside system and is data.
+  An entry whose card the room did not take is asked for again after the next request. An entry made
+  after the turn read what only some of the room may read — a delegate's reply from a drive — cannot
+  be put on a card in that room: it is refused unasked, nothing is written, and the model is told
+  so (DW-1364).
+- **No flood.** Requests and tickets are bounded per hour, tickets also by
+  `[limits].max_concurrent_sessions`, and one card gathers an hour's tickets.
+
+What the room still lets the peer do is recorded: an `m.room.encrypted` event in a clear room
+(DW-1334), the status anchor `agents gate` posts, which names the host and the session's folder
+(DW-1335 — a gate's turn itself posts no status), and a `[[trust]]` that names the peer only
+after the room was made (DW-1336). An approval decision, a `heard` mark or a surface result from
+the peer counts for nothing (DW-1333, closed).
+
+### A gate's room in keeper
+
+You watch a gate's room; you do not talk in it (UX-DR147): it has no composer, and its messages
+offer no reply, edit or reaction, and no file dropped on the window lands there. Its header says
+**Gate for** the system the gate is the door for, then the outside system's account — by its display
+name, quoted and cut, and its Matrix id — once the gate has answered one of its requests; until then
+*no request answered yet*. The label chip shows who may read what is said there: `*` reads *Anyone
+the system shares with*, always `untrusted`.
+
+A message is drawn as a **request** only once the gate has spoken of it: the outside system's text
+quoted as data — a dashed outline, in a monospace quote, never the agent's card — under the
+request's name and its state chip: *answered*, *ticket*, *result* or *refused* with its reason
+(*busy*, *declined by a person*, *held back by its owner*, …), and a sync request the deadline the
+gate held it to. It is signed by its sender's display name quoted, as the system chose it. A
+ticketed request names its ticket by id, and once its result is in, the session that worked it. The
+gate's own messages are headed by the request they speak of. A message the gate never answered, and
+anyone's look-alike of the gate's words — the peer's included — is drawn as an ordinary message:
+keeper takes a gate's word only from the room's member at an agent's power. So is a request the
+outside system edited after the gate spoke of it: the gate never reads an edit, so its word does not
+stand over the new text.
+
+Your one control is **the hour's card** (UX-DR160). It names the system and the hour it covers; each
+line is one ticket — the request it serves, its ticket, the agent it would go to, its tier and the
+exact brief or journal entry — with *Approve once* and *Deny*. **Deny all** denies, after a second
+press says how many, every line still waiting that this device may decide: one decision per line,
+each naming its own record. A line whose denial went is never offered again, and if the sending
+stops part-way the card says how many of how many were denied. A decided line keeps its verdict and
+*Deny all* passes it by; a ticket refused `busy` never reaches a card. The card's notification
+offers no *Approve once*, even for its first ticket: the card grows, and a card of several requests
+never fits on a lock screen.
 
 ## Workflows
 
@@ -2606,10 +3736,11 @@ offered as `[tools].allow` says, but never in a proxy's `main` or `conversation`
 is refused, "a workflow is started by delegation or a card, never inside the DM". Before anything
 is made, the workflow must let `workflow_start` start it, every tool it names must be one a turn of
 the run would be offered — what its agent is offered in a session of kind `workflow`, `reply` and
-`ask_human` included, a name `allow` gives that no tool answers yet not ("`bmad-build` needs `run`,
-which `amelia` is not allowed") — every drive it works in must be in scope, and every input is
-checked: a required one given, a `path` inside a drive the run works in (`<drive>:<path>`, or a
-path of the home drive), a `drive` in scope, a `session` the id of a session of the drive. The
+`ask_human` included, `run` only on a host whose sandbox passed its probe, a name `allow` gives
+that no tool answers here not ("`bmad-build` needs `run`, which `amelia` is not allowed") — every
+drive it works in must be in scope, and every input is checked: a required one given, a `path`
+inside a drive the run works in (`<drive>:<path>`, or a path of the home drive), a `drive` in
+scope, a `session` the id of a session of the drive. The
 brief and its inputs land in the run's folder in the home drive, which every reader of that drive
 reads, whatever the run's label says: a session whose label keeps them from those readers parks
 on a declassification of exactly those bytes, as a write would, or is refused where nobody can
@@ -2892,8 +4023,8 @@ her model is not local, or whose label, joined, does not reach the harvest room 
 members, a known agent through its audience), is refused, logged and audited, and nothing is
 written or sent — not even the answer's placeholder, which would name the closed session. A room
 whose members cannot be read hands it again; a room that widens while the placeholder is retried
-gets one naming no session. The turn replies with what the drive should keep and where; it writes
-nothing.
+gets one naming no session. The turn writes what the drive should keep as candidate notes in her
+harvest session (*Knowledge from sessions*, below) and replies with one line per note.
 
 **Her questions.** Until a steward can ask a person (`ask_human`), her question is her `reply` to
 the agent that asked her — Nixi or Dixi — never a message to the person.
@@ -2919,6 +4050,178 @@ from Nixi's private session to her is refused by the label, naming the readers i
 `a_stewards_triage_runs_on_a_real_model` (CLIProxyAPI) in `live_stewards.rs`.
 **Owed:** a real `@daily` triage of tgdrive on its host.
 
+## Knowledge from sessions
+
+What a closed session learned reaches the drive's notes in two steps: a steward writes it down as a
+candidate, and a person reads it and promotes it.
+
+**The candidate.** Her `HV` prompt has her write one note per thing worth keeping, with
+`session_write`, at `artifacts/knowledge/<the closed session's folder>/<note>.md` of her own harvest
+session — never into the closed session, which is another agent's and is refused like any write
+outside the session she runs in. Its frontmatter is OKF: `type` (one of the drive's
+`.okf/registry/types.md`, else `Note`), `title`, `description`, `sources` — each a file of the closed
+session by its path from the drive's root, or `log/<chunk>#<line id>` of its log — and the host's own
+`generated: {by: agent:<agent>@<host>, at}`, `human_reviewed: false` and, when the note says none,
+`status: draft`. The host writes those over whatever the model wrote, so a note whose model wrote
+`generated: {by: human:tgorka}` is stored as `agent:tola-grey@electra`'s. It refuses a note carrying
+`verified` or `verified_by` — in any spelling a YAML reader takes for it, and any frontmatter line whose
+key keeper cannot name for certain (an explicit `? key`, a flow map, a merge key, an anchor, an escaped
+key), since it might be one — a `sources` list it cannot read whole (each source a block entry with one
+`resource`), one naming a person (`human:`, `user:`) as a source's author — read as YAML reads it, so
+`"\u0068uman:tgorka"` is a person too, and a quoted value with an escape YAML does not define is a
+source it cannot read — one citing a file outside the closed session, one the closed session does not have or one reached through a link, and one over 64 KiB
+as stored ("a knowledge note holds at most 64 KiB"), so a person reviewing it can read all of it.
+Unknown keys it can name are kept. A refused note
+writes nothing. An existing drive keeps its old `HV` prompt — a seed never overwrites a file — so its
+owner copies the new `HV` prompt from `steward-menu.toml` into the `[[menu]]` table of the
+steward's own `agent.toml` by hand.
+
+keeper reads a candidate as unreviewed: a tool read of it says "generated by agent:tola-grey@electra
+(an agent), nobody has reviewed it", and its `human_reviewed: false` keeps a read of it at `agent`
+integrity.
+
+**The promote panel.** `sessions_promote_panel` renders the session's `## Promote` table row by row —
+`ok`, `stale` (the source's content differs and changed later: by commit time for a synced file, review
+keys aside, by mtime for `workspace/` and a session file's change not committed yet), a quiet `missing
+source`, a loud `missing target` (only where the disk says the file is not there), `unknown` with why for
+a file that is there but could not be read, one behind a folder that may not be searched, or two files
+that differ when which changed last is not known — a vault copy is dated by its commits alone, since a
+tick moves its mtime and nothing it says, so before its first commit, or when every commit read (16) is
+a review, its time is not known — an unreadable line as written — the `workspace/` files no row names (listed by name, never read), and the harvested notes
+with who wrote them, their revision (the SHA-256 of their bytes), where each was promoted, who reviewed
+it and whether the person on this Mac did, beside the session's label chip. A note that cannot be read
+or is larger than 64 KiB is listed with why; a folder that would not list, and a listing past 4096
+files, are said in `problems`.
+`sessions_promote` copies a settled `workspace/` file into `artifacts/` — exactly the bytes the
+stability check read; a file written within the profile's settle window is refused: "still being
+written; try again in a moment" — and `sessions_promote_to` copies an artifact out into the drive's own
+notes vault at the folder and filename the person chose, the target composed and fenced in Rust; each
+records one row, first, so a promotion that fails after it shows as `missing target` (or `unknown`, with
+why, when a file stands where the target's folder belongs: only a target the disk says is not there is
+missing) and promoting again finishes it. A copy is staged under a fresh name of its own — whatever
+was planted at the staging name, a link or a second name of another file, is removed, never written
+through — and that file is what is renamed into place. A promotion out keeps the exact version
+admitted, its target and its row in the
+sessions zone (`.keeper/promote-out.json`) before either lands and clears it once both have — the copy
+only once the vault's writer has synced its bytes and every folder on the way from the drive's root — a
+vault folder just made for it included — to the disk — so one a crash or a failed write interrupts is
+finished — with that version, whatever the candidate became — by the next promotion out of the zone or
+review, or refused with why and cleared: another file at its target, a target that is there and cannot
+be read, a vault that moved since it was admitted, a session archived, deleted or moved away, another
+session now at its path, an audience that no longer fits. Once a copy has landed its row records it: a
+fourth cell, the digest of what was published, past what a markdown view of the table shows. For a
+harvested note that digest covers what lies between its frontmatter's fences with the review keys taken
+out, and its body, each kept apart, so a tick or an untick — however large the frontmatter, whatever the
+target is named — leaves it the note's copy, while moving the note's metadata into its body does not.
+That cell, synced with the session, and the file at the target agreeing are the only thing that lets a
+promotion replace what is at a target or a review be written into it — never a row alone, a row a
+refused or unfinished publication left, a file that happens to hold the very bytes being promoted, or
+anything kept on this Mac. Only a source's first row counts: a second row naming the same note lends it
+neither its target nor its digest, in the panel, a review or a promotion. A copy a person edited in the
+vault is no longer the note's (R252, DW-960): promoting the note there again and *Reviewed by me* are
+refused saying so — "… was changed since … published it there …", or, for a row that records no
+publication, "… is not known to be the copy … published …" — with what to do that keeps the file:
+promote the note under another name, or move that file elsewhere in the vault first. The panel shows
+no review of such a copy, offers no promotion to it, and says the same in the note's `foreignCopy` and
+as why it may not be promoted. A record that does not read is
+refused with why and kept beside it as `.keeper/promote-out.<id>.unreadable.json`, written to the disk
+before the record goes; until it can be, every promotion out of the zone and every review is refused,
+none writes over it. A row appended to a table that ends the file without a
+line break goes on a line of its own. A note that the table cannot hold in one row (a `|`, a line break) is refused before
+anything is copied. A promotion out is drive-relative:
+`| artifacts/knowledge/<…>.md | 10-notes/knowledge/<note>.md | knowledge | <digest> |`. A target outside the vault
+is refused with the vault's own sentence, another drive is not a path the command takes, a folder link
+on the way is refused, a target in an agent's home, in the agents folder's own `_` folders (`_skills/`,
+`_workflows/`, …) or in a session's `workspace/` is refused wherever the vault is — those change only
+through their own writers — and a session whose label — narrowed by what it read, from its whole log — does
+not reach every reader of the drive is refused with the readers it would add ("This would let @marta:h
+read what only @tgorka:h may read."). It is refused as well whenever who reads the session or the drive
+cannot be established: an `agent.toml` or `_drive.toml` that does not read — or that may be there, behind
+a folder that may not be searched — a drive whose readers are not pinned on this Mac or whose
+`_drive.toml` differs from the pin, an agent's log with a line that does not read or a `log/` that cannot
+be looked at or listed whole, an agents folder that is a link to nothing or a file — however the profile spells it, `80-agents/` or `./80-agents`. Only a declaration the disk says is not there, with no pin, is anyone's. The panel shows the same refusal. Open the panel
+with **Promote…** in session detail. It opens each knowledge note whole, names its author and host,
+and offers only this drive's vault folders; a label refusal removes the promote-out controls.
+
+**Reviewed by me.** Promoting a harvested note to notes *is* the person's review: the command carries
+the revision they read (`sessions_knowledge_read` answers the text with the revision of exactly those
+bytes), refuses a candidate that has changed since, and writes the vault's copy with a
+canonical `verified: - by: human:<them>, at: …` entry and `human_reviewed: true` — never into the
+candidate, which the steward's host also writes. `sessions_knowledge_review` then unticks or ticks the
+promoted copy again as the person read it, through the notes editor's guarded amend — written only
+over the text it was composed from, the check and the write one step to every other write keeper makes
+to the note, whether an editor has it open or not. The copy's revision names its path and its bytes, and
+it is compared with each text the amend hands over, inside the sessions zone's lock: an edit, a pending
+promotion out finished first, a row retargeted to another file, or an amend's retry after an editor's
+save landed between its read and its write, refuses the review — the copy is kept as it is, never
+reviewed unread; read it again. A copy keeper publishes or ticks stays within 80 KiB (the 64 KiB note
+plus 16 KiB of reviews), so a note at the cap can still be read whole and its review changed; a tick
+that would pass that is refused. The untick takes that entry out and sets `human_reviewed` to whether another person's
+review is left, and a legacy `verified: true` beside `verified_by`, or one review written as a map
+(`verified: {by: …}`) rather than a list item, is written canonical. A tick or an untick changes only
+the copy's frontmatter and leaves its body byte for byte — a body that opens with a `---` block of its
+own stays body even when the frontmatter held nothing but the review keys. A note not
+promoted yet is refused: promote it first; so is one whose row's target holds a file the note did not
+publish, and the panel shows no review from such a file. The person is the one an *Allow* records: of the accounts
+signed in on this Mac, the drive's owner, else the only one. What *reviewed by a person* proves is that
+a reader's keeper committed the tick, not that the person typed it (R28 S-31) — the same reading as
+`owner` integrity. A candidate edited after promotion shows `stale` on its row; the review keys never
+count as a change.
+
+In the panel a person first reads the note whole, then ticks **I reviewed this version**, which
+binds their consent to the revision they read: the panel forwards what the person read and
+consented to with each read, and Rust decides whether it holds (`KnowledgeNoteVm.candidateRead`,
+`copyRead`, `consented`). If the candidate changes, the text they read is marked as an older
+version and the tick clears; **Promote to notes…** sends that revision as
+`expected`, so the copy and the person's review land in one write. A note already in the vault
+shows its notes copy separately: **Read notes copy** opens the vault's file, and **Reviewed by
+me in notes** is ticked from the VM's `reviewedByMe`, never from another person's review, and
+changes only the copy the person has open. A notes copy that is missing offers no review; the
+VM offers its row's target, and **Restore the notes copy** promotes the note again there.
+
+**Proven:** `a_harvested_note_never_claims_a_person`, `harvest_never_writes_the_closed_session`
+(`cards.rs`); `promote_copies_and_records_one_row`, `promote_out_into_the_vault`,
+`promoting_out_respects_the_label`, `an_audience_that_cannot_be_established_refuses`,
+`a_label_past_the_index_s_reach_still_binds`, `a_link_in_the_vault_never_carries_a_promotion`,
+`a_checked_copy_copies_only_what_was_read`, `a_harvested_note_is_promoted_only_as_it_was_read`,
+`a_failed_copy_leaves_a_row_promoting_again_finishes`,
+`a_failed_publication_leaves_a_row_promoting_again_finishes`,
+`a_row_the_table_cannot_hold_is_refused_before_any_copy`, `a_tick_keeps_an_edit_that_landed_meanwhile`,
+`what_the_panel_cannot_read_it_says`, `staleness_is_by_what_changed_not_by_mtime`,
+`review_commits_past_the_history_read_never_date_the_copy`,
+`a_tick_before_the_first_commit_never_dates_the_copy`,
+`a_row_file_behind_a_closed_folder_is_unknown_not_missing`,
+`a_declaration_that_cannot_be_looked_at_is_not_an_absence`, `a_log_that_will_not_list_has_no_frontier`,
+`a_planted_stage_is_never_written_through`,
+`an_interrupted_promotion_out_publishes_the_version_it_reviewed`,
+`an_agents_folder_the_disk_cannot_vouch_for_is_no_absence`,
+`a_moved_vault_is_never_written_by_an_interrupted_promotion`,
+`an_unreadable_target_is_never_written_by_an_interrupted_promotion`,
+`a_session_moved_away_never_blocks_the_zone`, `an_unreadable_promotion_record_is_refused_and_kept`,
+`a_copy_not_yet_durable_keeps_its_promotion`,
+`a_row_no_copy_stands_behind_grants_nothing_on_another_mac`,
+`a_set_aside_record_leaves_its_row_without_authority`,
+`a_review_never_writes_into_a_file_the_note_did_not_publish`,
+`a_session_at_a_reused_path_is_never_finished_into`,
+`a_record_is_set_aside_only_once_its_copy_is_durable` (`promote/tests.rs`, keeper-agent);
+`folders_a_durable_write_makes_are_synced_up_to_its_root` (`sessions/exec.rs`, keeper-agent);
+`a_root_the_disk_cannot_vouch_for_is_no_absence` (`browse.rs`, keeper-sync);
+`a_log_that_cannot_be_looked_at_is_not_an_empty_log` (`agents/log/reader.rs`, keeper-core);
+`two_amendments_of_a_closed_note_both_land` (`notes_ipc.rs`, keeper, macOS); `keeper_reads_a_harvested_note_as_unreviewed`,
+`the_host_stamps_what_a_model_cannot_be_trusted_to_say`, `a_review_keeper_cannot_name_is_refused`,
+`every_source_is_read_or_the_note_is_refused`, `a_legacy_review_is_written_canonical`,
+`a_single_map_review_is_written_as_a_list`, `an_escaped_author_is_read_as_yaml_reads_it`,
+`only_a_person_marks_a_note_reviewed` (`agents/knowledge.rs`), `promote_panel_rows`,
+`a_renamed_artifact_keeps_its_row`, `a_rename_in_the_session_never_moves_a_drive_target`,
+`a_row_is_written_only_as_it_reads_back`, `a_row_appended_where_the_file_ends_reads_back`,
+`a_published_copy_is_recorded_kept_and_dropped`,
+`an_unknown_content_time_is_never_read_as_in_order`, `what_could_not_be_read_is_said_not_absent`,
+`a_digest_streams_and_ignores_only_review_keys` (`sessions/promote.rs`, keeper-core). The UI behavior
+is covered through the mock shell in `promote-panel.test.tsx`.
+**Owed:** the three commands compile only on macOS (CI's macOS job); real WKWebView proof on
+hesperia (DW-780), where a delegated session closing in tgdrive must leave Dr Tola Grey's
+candidate in the panel, ticked and promoted, read back as "reviewed by a person (human:tgorka)".
+
 ## Which host answers
 
 An agent can have a copy on several hosts — `nixi@electra` on the server, `nixi@hesperia` on the
@@ -2926,7 +4229,8 @@ Mac — and every copy is in the session's room. Exactly one host writes a sessi
 that holds its **claim**.
 
 **Each host's manifest.** Every host keeps `dev.keeper.agent.host` in its principal's control room,
-under its slug: its capabilities (`mcp:<name>`, `kvm:<id>`; the Mac offers none yet), its drives
+under its slug: its capabilities (`sandbox`; `mcp:<name>` for each MCP server that answered its last
+`tools/list`; `kvm:<id>` on agentd only), its drives
 with whether each is checked out and how much of it is on disk (`full`, `partial`, `virtual`), the
 bots it resolves, the agents it hosts, `always_on`, and its version. It is renewed every 60 s and
 lapses 180 s after its last renewal by the homeserver's clock. A state event is not encrypted, so a

@@ -1941,14 +1941,28 @@ describe("AddFolderForm on the phone (Story 66.1, AD-199)", () => {
     expect(screen.getByLabelText(SYNC_TOKEN_LABEL)).toBeInTheDocument();
     expect(screen.getByText(SYNC_TOKEN_NOTE)).toBeInTheDocument();
     // Absent, never disabled (AD-27): the phone has no folder to pick, no
-    // direction to choose, no watcher to tune, no recorder and no sessions.
+    // direction to choose, no watcher to tune and no recorder.
     expect(screen.queryByLabelText(SYNC_FOLDER_LABEL)).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: SYNC_CHOOSE_FOLDER_LABEL })).toBeNull();
     expect(screen.queryByRole("button", { name: SYNC_HOME_FOLDER_LABEL })).toBeNull();
     expect(screen.queryByText(SYNC_DIRECTION_LABEL)).not.toBeInTheDocument();
     expect(screen.queryByTestId(SYNC_ADVANCED_TOGGLE_TESTID)).toBeNull();
     expect(screen.queryByLabelText(SYNC_RECORDINGS_LABEL)).not.toBeInTheDocument();
-    expect(screen.queryByLabelText(SYNC_SESSIONS_LABEL)).not.toBeInTheDocument();
+    // 98.2: the phone's board reads a sessions zone, so a folder can say it has one.
+    expect(screen.getByLabelText(SYNC_SESSIONS_LABEL)).toBeInTheDocument();
+  });
+
+  it("with sessions on, still shows no agents, voices, recordings or tasks switch", () => {
+    arrangePhone();
+    render(<AddFolderForm />);
+    fireEvent.click(screen.getByLabelText(SYNC_SESSIONS_LABEL));
+    expect(screen.getByLabelText(SYNC_SESSIONS_LABEL)).toBeChecked();
+    // The phone hosts no agent, keeps no voices, records nothing and has no
+    // Tasks surface (98.2): a sessions zone there is a board to read.
+    expect(screen.queryByRole("switch", { name: SYNC_AGENTS_LABEL })).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("This folder keeps voices")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(SYNC_RECORDINGS_LABEL)).not.toBeInTheDocument();
+    expect(screen.queryByRole("switch", { name: SYNC_TASKS_LABEL })).not.toBeInTheDocument();
   });
 
   it("saves with an empty path — Rust assigns the container — and stores the credential", async () => {
@@ -2048,7 +2062,7 @@ describe("AddFolderForm prefilled from an account offer (Epic 84, UX-DR118)", ()
     });
   });
 
-  it("on the phone, turns on nothing the phone does not show, and needs no folder", async () => {
+  it("on the phone, turns on nothing the phone does not show, keeps the sessions zone, and needs no folder", async () => {
     capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, bots: true, sync: true });
     mockSave.mockResolvedValue(profileVm({ id: "p9" }));
     render(
@@ -2076,8 +2090,8 @@ describe("AddFolderForm prefilled from an account offer (Epic 84, UX-DR118)", ()
       voicesSubfolder: null,
       agents: null,
       agentsSubfolder: null,
-      sessions: false,
-      sessionsSubfolder: null,
+      sessions: true,
+      sessionsSubfolder: "60-sessions",
       tasks: null,
       tasksSubfolder: null,
     });

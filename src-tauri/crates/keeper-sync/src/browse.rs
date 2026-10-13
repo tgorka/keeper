@@ -761,6 +761,168 @@ pub fn resolve(root: &Path, subpath: &str) -> Result<Option<PathBuf>, BrowseRefu
     Ok(Some(canonical_target))
 }
 
+/// [`resolve`] for a caller that must tell "not there" from "not known" —
+/// keeper-sync's one such resolver, for every reader that acts on an
+/// absence or reads a landing: absent only where the disk says `NotFound`
+/// for the entry under a root that is there ([`Known::Absent`]), or for the
+/// root itself under a folder that is ([`Known::RootAbsent`],
+/// [`absent_root`]), and no dangling link names it ([`landing`] refuses
+/// one). Anything else the disk cannot vouch for is
+/// [`BrowseRefusal::Unreadable`]: a folder on the way that may not be
+/// searched, an I/O error, a file where a folder of the path should be
+/// (`NotADirectory`), a root that is not a folder, or one on the way to it
+/// that is a file or a dangling link — an absence a caller acts on has to
+/// be one the disk established. The root is asked about in its plain
+/// spelling — `80-agents/`, `./80-agents` and `80-agents//` are `80-agents`
+/// ([`Path::components`]) — so a trailing separator, which makes the disk
+/// follow a link before it answers, never hides a link to nothing as an
+/// absence. A landing outside the root is refused, and one keeper cannot
+/// spell is [`BrowseRefusal::Unspellable`]: a caller admits a path where it
+/// is asked for AND where it lands ([`Landing::relative`]).
+pub fn resolve_known(root: &Path, subpath: &str) -> Result<Known, BrowseRefusal> {
+    use std::io::ErrorKind::NotFound;
+    let root: PathBuf = root.components().collect();
+    let root = root.as_path();
+    let target = lexical_join(root, subpath)?;
+    let unreadable = |error: std::io::Error| BrowseRefusal::Unreadable {
+        reason: error.to_string(),
+    };
+    let canonical_root = match root.canonicalize() {
+        Ok(canonical) if canonical.is_dir() => canonical,
+        Ok(_) => {
+            return Err(BrowseRefusal::Unreadable {
+                reason: format!("{} is not a folder", root.display()),
+            })
+        }
+        Err(error) if error.kind() == NotFound => {
+            absent_root(root)?;
+            return Ok(Known::RootAbsent);
+        }
+        Err(error) => return Err(unreadable(error)),
+    };
+    let canonical_target = match target.canonicalize() {
+        Ok(target) => target,
+        Err(error) if error.kind() == NotFound => {
+            landing(root, subpath)?;
+            return Ok(Known::Absent);
+        }
+        Err(error) => return Err(unreadable(error)),
+    };
+    let inside = canonical_target
+        .strip_prefix(&canonical_root)
+        .map_err(|_| BrowseRefusal::EscapesAfterResolution {
+            subpath: subpath.to_owned(),
+        })?;
+    if inside
+        .components()
+        .any(|part| part.as_os_str().to_str().is_none())
+    {
+        return Err(BrowseRefusal::Unspellable {
+            subpath: subpath.to_owned(),
+        });
+    }
+    let depth = canonical_root.components().count();
+    Ok(Known::Landed(Landing {
+        path: canonical_target,
+        depth,
+    }))
+}
+
+/// What the disk positively says of a path ([`resolve_known`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Known {
+    /// It is there, and lands here.
+    Landed(Landing),
+    /// Nothing is at it: `NotFound` under a root that is there.
+    Absent,
+    /// The root itself is not there, under a folder that is.
+    RootAbsent,
+}
+
+impl Known {
+    /// For a caller whose root's absence is the entry's: a missing agents
+    /// folder holds no `_drive.toml`.
+    pub fn landed(self) -> Option<Landing> {
+        match self {
+            Self::Landed(landing) => Some(landing),
+            Self::Absent | Self::RootAbsent => None,
+        }
+    }
+
+    /// For a caller whose root must be there — a drive's checkout: a root
+    /// that is not is refused, since nothing under it can be told apart
+    /// from a drive that is gone.
+    pub fn under_root(self) -> Result<Option<Landing>, BrowseRefusal> {
+        match self {
+            Self::Landed(landing) => Ok(Some(landing)),
+            Self::Absent => Ok(None),
+            Self::RootAbsent => Err(BrowseRefusal::Unreadable {
+                reason: "the folder is not there".to_owned(),
+            }),
+        }
+    }
+}
+
+/// Where a path [`resolve_known`] found lands: canonical, under the
+/// canonical root, every name of it spellable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Landing {
+    path: PathBuf,
+    /// How many components of `path` are the canonical root's.
+    depth: usize,
+}
+
+impl Landing {
+    /// The canonical path.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn into_path(self) -> PathBuf {
+        self.path
+    }
+
+    /// Its root-relative names, `/`-joined (empty for the root): what a
+    /// caller admits and reads by, so it composes no path itself (AD-65).
+    pub fn relative(&self) -> String {
+        let mut names = String::new();
+        for part in self.path.components().skip(self.depth) {
+            if !names.is_empty() {
+                names.push('/');
+            }
+            // Spellable: `resolve_known` refused any other landing.
+            names.push_str(&part.as_os_str().to_string_lossy());
+        }
+        names
+    }
+}
+
+/// `Ok` when `root`, which does not canonicalize, is positively not there:
+/// the nearest of it and its ancestors that is on the disk is a folder,
+/// reached through no dangling link. Refused when that one is `root`
+/// itself — a dangling link — or is not a folder, does not resolve, or
+/// cannot be looked at: then what `root` names is not known.
+fn absent_root(root: &Path) -> Result<(), BrowseRefusal> {
+    let refused = |reason: String| BrowseRefusal::Unreadable { reason };
+    for ancestor in root.ancestors() {
+        match ancestor.symlink_metadata() {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(refused(format!("{}: {error}", ancestor.display()))),
+            Ok(_) if ancestor == root => {
+                return Err(refused(format!("{} is a link to nothing", root.display())))
+            }
+            Ok(_) => {
+                return match ancestor.canonicalize() {
+                    Ok(canonical) if canonical.is_dir() => Ok(()),
+                    Ok(_) => Err(refused(format!("{} is not a folder", ancestor.display()))),
+                    Err(error) => Err(refused(format!("{}: {error}", ancestor.display()))),
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The lexical half of [`resolve`], on its own.
 ///
 /// Split out because [`resolve`] is not the only caller that needs it: a create
@@ -2313,6 +2475,80 @@ mod tests {
             Err(BrowseRefusal::EscapesAfterResolution {
                 subpath: "escape".to_owned()
             })
+        );
+    }
+
+    /// R95K3-01: [`resolve_known`] calls a root absent only where the disk
+    /// says so — a root not there under a folder that is, and an entry not
+    /// there under a root that is. A root that is a link to nothing, a file
+    /// where the root's folder should be, or a root under a file or a
+    /// dangling link is not known, never an absence. R244: so in every
+    /// spelling a profile's subfolder may take — a trailing separator, a
+    /// `./` — while those spellings of a root that is there, or positively
+    /// is not, answer as the plain one does.
+    #[cfg(unix)]
+    #[test]
+    fn a_root_the_disk_cannot_vouch_for_is_no_absence() {
+        let drive = tempfile::tempdir().expect("drive");
+        let at = |rel: &str| drive.path().join(rel);
+        std::fs::create_dir(at("agents")).expect("root");
+        std::fs::write(at("file"), "x").expect("file");
+        std::os::unix::fs::symlink(at("nowhere"), at("dangling")).expect("link");
+
+        for spelling in ["{}", "{}/", "./{}", "./{}//"] {
+            let root = |name: &str| at(&spelling.replace("{}", name));
+            assert_eq!(
+                resolve_known(&root("agents"), "_drive.toml"),
+                Ok(Known::Absent),
+                "{spelling}"
+            );
+            assert_eq!(
+                resolve_known(&root("absent"), "_drive.toml"),
+                Ok(Known::RootAbsent),
+                "{spelling}"
+            );
+            assert_eq!(
+                resolve_known(&root("absent/deeper"), "_drive.toml"),
+                Ok(Known::RootAbsent),
+                "{spelling}"
+            );
+            for name in ["dangling", "file", "file/agents", "dangling/agents"] {
+                // The root itself as well: a file where the root's folder
+                // should be never lands as one.
+                for subpath in ["_drive.toml", ""] {
+                    let known = resolve_known(&root(name), subpath);
+                    assert!(
+                        matches!(known, Err(BrowseRefusal::Unreadable { .. })),
+                        "{spelling} {name} {subpath:?}: {known:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// R218 carried to every caller of the one resolver: only `NotFound` is
+    /// an absence — an entry whose path runs through a file (`ENOTDIR`) is
+    /// not known, so neither a search's config nor a promotion's
+    /// declaration is taken for absent there; a drive's checkout that is
+    /// gone is refused where the root must be there.
+    #[cfg(unix)]
+    #[test]
+    fn only_not_found_is_an_absence() {
+        let drive = tempfile::tempdir().expect("drive");
+        std::fs::write(drive.path().join(".okf"), "x").expect("file");
+        let known = resolve_known(drive.path(), ".okf/config.yaml");
+        assert!(
+            matches!(known, Err(BrowseRefusal::Unreadable { .. })),
+            "{known:?}"
+        );
+        let gone = resolve_known(&drive.path().join("gone"), ".okf/config.yaml");
+        assert_eq!(gone.clone().map(Known::landed), Ok(None));
+        assert!(
+            matches!(
+                gone.and_then(Known::under_root),
+                Err(BrowseRefusal::Unreadable { .. })
+            ),
+            "a gone checkout"
         );
     }
 

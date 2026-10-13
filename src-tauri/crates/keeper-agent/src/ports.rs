@@ -59,8 +59,25 @@ pub trait VaultWriter: Send + Sync {
     /// holds no registered vault.
     fn subfolder(&self, profile_id: &str) -> Option<String>;
 
-    /// Write `text` at `rel` inside the profile's vault, and tell the vault.
-    fn write(&self, profile_id: &str, rel: &str, text: &str) -> Result<(), String>;
+    /// Write `text` at `rel` inside the profile's vault, and tell the vault —
+    /// refused, nothing written, unless the live vault is still the one at
+    /// `subfolder` that `rel` was checked against. `Ok` only once the write
+    /// is durable: the bytes and the new name synced to the disk, so a
+    /// caller may let go of anything it kept to finish the write.
+    fn write(&self, profile_id: &str, subfolder: &str, rel: &str, text: &str)
+        -> Result<(), String>;
+
+    /// Change the note at `rel` inside the profile's vault through `amend`,
+    /// under the vault's write coordination: `amend` is handed the text as
+    /// it is and answers the whole new text, or `None` for no change; a text
+    /// that changed between that read and the write is read and amended
+    /// again, never overwritten. `Ok(false)` when nothing changed.
+    fn amend(
+        &self,
+        profile_id: &str,
+        rel: &str,
+        amend: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<bool, String>;
 }
 
 /// The sync profiles a tool call may name.

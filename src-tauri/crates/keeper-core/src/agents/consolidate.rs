@@ -1168,7 +1168,7 @@ impl ApplyArgs {
             (After::Text(_), None) => [MemoryTarget::User, MemoryTarget::Memory]
                 .iter()
                 .any(|target| self.change.path == format!("{home}/{}", target.file())),
-            (After::Text(_), Some(rest)) => rest.strip_suffix("/SKILL.md").is_some_and(&plain),
+            (After::Text(_), Some(rest)) => rest.strip_suffix("/SKILL.md").is_some_and(plain),
             (After::MovedTo(to), Some(name)) => {
                 plain(name) && *to == format!("_skills/{ARCHIVE_DIR}/{name}")
             }
@@ -1267,6 +1267,7 @@ pub fn review_record(
             sha256: String::new(),
         },
         args: &value,
+        exec_binding: serde_json::Value::Null,
         classification: &classification,
         label: &args.label,
         preconditions: Preconditions {

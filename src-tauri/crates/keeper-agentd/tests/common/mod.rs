@@ -245,6 +245,20 @@ pub fn tool_then(name: &'static str, args: Value, answer: &'static str) -> Stub 
 /// with `answer`. `@ASK@` in a call's arguments is the id of the last
 /// question the request carries ("Question <id>: …").
 pub fn calls_at(calls: Vec<(usize, &'static str, Value)>, answer: &'static str) -> Stub {
+    calls_paced(
+        calls
+            .into_iter()
+            .map(|(n, name, args)| (n, name, args, Duration::ZERO))
+            .collect(),
+        answer,
+    )
+}
+
+/// [`calls_at`], each call answered only after its wait.
+pub fn calls_paced(
+    calls: Vec<(usize, &'static str, Value, Duration)>,
+    answer: &'static str,
+) -> Stub {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let url = format!("http://{}", listener.local_addr().expect("addr"));
     let requests = Arc::new(Mutex::new(0));
@@ -285,7 +299,8 @@ pub fn calls_at(calls: Vec<(usize, &'static str, Value)>, answer: &'static str) 
                 };
                 let _ = write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n");
                 let frame = match calls.iter().find(|(at, ..)| *at == n) {
-                    Some((_, name, args)) => {
+                    Some((_, name, args, wait)) => {
+                        std::thread::sleep(*wait);
                         let request = String::from_utf8_lossy(&body);
                         let asked = request.rfind("Question ").map(|at| {
                             let from = at + "Question ".len();

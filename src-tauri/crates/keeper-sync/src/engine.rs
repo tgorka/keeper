@@ -966,6 +966,63 @@ pub fn phone_divergence_sentence(ahead: usize) -> String {
     )
 }
 
+/// What became of a write a phone made, once it was written (98.2, R346):
+/// [`Engine::phone_push`]'s and [`Engine::phone_write`]'s answer.
+#[derive(Debug)]
+pub enum PhonePush {
+    /// Committed and on the remote.
+    Pushed,
+    /// The folder is paused: written here and declared settled, not pushed.
+    Paused,
+    /// Here and not on the remote: the pass refused, and recorded why beside
+    /// the profile ([`SyncError::Busy`] excepted).
+    Deferred(SyncError),
+}
+
+impl PhonePush {
+    /// Whether a later pass can publish it with nobody doing anything: the
+    /// folder was busy with another pass, or the failure is one the world
+    /// may fix on its own (the network, a held upload). A divergence or a
+    /// refused credential is never retried — it waits on a person, and the
+    /// sentence beside the profile says so.
+    pub fn retry(&self) -> bool {
+        match self {
+            Self::Deferred(err) => {
+                matches!(err, SyncError::Busy(_)) || err.retriability() != Retriability::Permanent
+            }
+            Self::Pushed | Self::Paused => false,
+        }
+    }
+
+    /// The sentence a person reads when the write is on this phone and not on
+    /// the remote; `None` once it is pushed.
+    pub fn unpushed(&self) -> Option<String> {
+        match self {
+            Self::Pushed => None,
+            Self::Paused => Some(
+                "This folder is paused, so the change stays on this phone and is pushed when \
+                 the folder syncs again."
+                    .to_owned(),
+            ),
+            Self::Deferred(err) if self.retry() => Some(format!(
+                "Saved on this phone, not on the remote yet: {err}. Keeper pushes it again \
+                 while the app is open, and at the next sync otherwise."
+            )),
+            Self::Deferred(err) => Some(format!("Saved on this phone, not on the remote: {err}.")),
+        }
+    }
+}
+
+/// Why [`Engine::phone_write`] wrote nothing.
+#[derive(Debug)]
+pub enum PhoneWriteError<E> {
+    /// The pull before the write refused — the folder is diverged, busy or
+    /// failing — and the write was never attempted.
+    Pull(SyncError),
+    /// The caller's own write refused.
+    Write(E),
+}
+
 /// How long a profile waits before trying to arm a watcher again.
 ///
 /// A watcher fails for reasons that do not fix themselves in a second — an
@@ -13120,6 +13177,142 @@ impl Engine {
         self.publish(self.progress(&profile, SyncPhase::Idle));
         self.refresh_pending(&profile.id);
         Ok(outcome)
+    }
+
+    /// A pull-only pass, with a failure recorded beside the profile (98.2,
+    /// R346): commit what had settled — the apply needs a clean tree, exactly
+    /// as a journaled `Pull` unit does — fetch, fast-forward, and stop. Nothing
+    /// is pushed.
+    ///
+    /// What a phone runs before it writes on a person's behalf
+    /// ([`Self::phone_write`]): a drive that agents on other hosts commit to is
+    /// a remote that has usually moved since the last foreground pass, and a
+    /// write made on top of the old tip is a history the phone can never
+    /// fast-forward again (AD-199).
+    ///
+    /// [`SyncError::Busy`] is answered and not recorded: the pass holding the
+    /// folder is doing this work, and a status row reading "busy" would send a
+    /// person looking for a fault that is not there.
+    pub async fn pull_once_recording(&self, id: &str, source: SyncSource) -> Result<()> {
+        let Some(profile) = self.with_db(|conn| db::get_profile(conn, id))? else {
+            return Err(SyncError::Config(format!("no such sync profile: {id}")));
+        };
+        let pulled = self.pull_once(&profile, source).await;
+        if let Err(err) = &pulled {
+            if !matches!(err, SyncError::Busy(_)) {
+                self.record_failure(&profile, err);
+            }
+        }
+        pulled
+    }
+
+    /// [`Self::pull_once_recording`]'s pass: `sync_once`'s arrival half under
+    /// the same reservation, and the same closing bookkeeping.
+    async fn pull_once(&self, profile: &SyncProfile, source: SyncSource) -> Result<()> {
+        if !self.volume_ready(profile)? {
+            return Err(SyncError::MediaAbsent);
+        }
+        let _reservation = self
+            .reserve(&profile.id)
+            .ok_or_else(|| SyncError::Busy(profile.name.clone()))?;
+        self.settle_commit_paths(profile)?;
+        self.ensure_repo(profile)?;
+        self.do_pull(profile, source, TreeState::Unknown).await?;
+        if profile.direction.pulls() {
+            let store = lfs::store::LfsStore::in_git_dir(profile.local_path.join(".git"));
+            self.materialize_pending(profile, &store)?;
+        }
+        self.mark_synced(profile, Self::pull_contact(profile)).await;
+        self.settle_and_persist(&profile.id);
+        self.publish(self.progress(profile, SyncPhase::Idle));
+        self.refresh_pending(&profile.id);
+        Ok(())
+    }
+
+    /// The phone's commit-and-push of its own writes (Epic 66, AD-202; 98.2):
+    /// declare the container's writes settled — there is no other writer in
+    /// an app container, so the settle window would wait for nobody — then one
+    /// pass, commit → fetch → fast-forward → push, through keeper's own engine.
+    ///
+    /// A failure is recorded beside the profile, [`SyncError::Busy`] excepted
+    /// for the reason [`Self::pull_once_recording`] gives; the answer says
+    /// whether a later pass can publish it ([`PhonePush::retry`]).
+    pub async fn phone_push(&self, id: &str) -> PhonePush {
+        match self.prime_worktree_changes(id) {
+            Ok(primed) => {
+                tracing::debug!(id, primed, "sync: the phone declared its writes settled")
+            }
+            Err(error) => {
+                tracing::warn!(id, %error, "sync: the phone could not declare its writes")
+            }
+        }
+        match self.sync_once(id, SyncSource::Watch).await {
+            Ok(outcome) => {
+                tracing::info!(
+                    id,
+                    committed = outcome.files_changed,
+                    pushed = outcome.pushed,
+                    "sync: the phone committed and pushed its writes"
+                );
+                PhonePush::Pushed
+            }
+            Err(err) => {
+                if !matches!(err, SyncError::Busy(_)) {
+                    if let Ok(Some(profile)) = self.with_db(|conn| db::get_profile(conn, id)) {
+                        self.record_failure(&profile, &err);
+                    }
+                }
+                tracing::warn!(id, %err, "sync: the phone's push is deferred");
+                PhonePush::Deferred(err)
+            }
+        }
+    }
+
+    /// A write a phone makes on a person's behalf, made safe to push (98.2,
+    /// R346): pull first, then write, then commit and push.
+    ///
+    /// * **Pull first** ([`Self::pull_once_recording`]), so `write` reads the
+    ///   remote's current bytes and its commit lands on the remote's tip.
+    ///   A folder that is diverged, busy or failing refuses here with the
+    ///   engine's own sentence, and `write` is never called — nothing is
+    ///   written that could not be pushed.
+    /// * **Then `write`**, whose refusal is the caller's ([`PhoneWriteError::Write`]).
+    /// * **Then [`Self::phone_push`]**, whose outcome is the answer: on the
+    ///   remote, or here with the reason, and whether a later pass can publish it.
+    ///
+    /// A paused folder is neither pulled nor pushed — pausing is for exactly
+    /// that — but the write is made and declared settled, so the first pass
+    /// after the folder is resumed commits and pushes it ([`PhonePush::Paused`]).
+    /// The declaration lives in memory: a phone that closes keeper before the
+    /// resume commits it one settle window later instead.
+    pub async fn phone_write<T, E, F, Fut>(
+        &self,
+        id: &str,
+        write: F,
+    ) -> std::result::Result<(T, PhonePush), PhoneWriteError<E>>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = std::result::Result<T, E>>,
+    {
+        let profile = self
+            .with_db(|conn| db::get_profile(conn, id))
+            .map_err(PhoneWriteError::Pull)?
+            .ok_or_else(|| {
+                PhoneWriteError::Pull(SyncError::Config(format!("no such sync profile: {id}")))
+            })?;
+        if profile.enabled {
+            self.pull_once_recording(id, SyncSource::Watch)
+                .await
+                .map_err(PhoneWriteError::Pull)?;
+        }
+        let value = write().await.map_err(PhoneWriteError::Write)?;
+        if !profile.enabled {
+            if let Err(error) = self.prime_worktree_changes(id) {
+                tracing::warn!(id, %error, "sync: the phone could not declare a paused folder's write");
+            }
+            return Ok((value, PhonePush::Paused));
+        }
+        Ok((value, self.phone_push(id).await))
     }
 
     /// Release local LFS objects whose content is still in the worktree, whose
@@ -35034,6 +35227,73 @@ mod tests {
                 .expect("answered in-process"),
             "the phone reads its own history without a binary"
         );
+    }
+
+    /// A folder another pass holds (98.2, R346): a phone write refuses before
+    /// it writes, and a push that meets the held folder is deferred for a
+    /// retry — not recorded as a fault — where a divergence is never retried.
+    #[tokio::test]
+    async fn a_busy_phone_folder_refuses_a_write_and_defers_its_push_for_a_retry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let remote = dir.path().join("remote.git");
+        if gix::init_bare(&remote).is_err() {
+            return;
+        }
+        let Some(mac) = Mac::publish_into(dir.path(), &remote) else {
+            return;
+        };
+        mac.write("README.md", b"hello\n");
+        mac.commit_and_push("first");
+        let (_platform, engine, p) = phone(dir.path(), &remote);
+        engine
+            .sync_once_recording(&p.id, SyncSource::Manual)
+            .await
+            .expect("clone");
+
+        let held = engine.reserve(&p.id).expect("nobody holds the folder yet");
+        let mut written = false;
+        let refused = engine
+            .phone_write(&p.id, || {
+                written = true;
+                async { Ok::<(), ()>(()) }
+            })
+            .await
+            .expect_err("a held folder refuses the write");
+        assert!(
+            matches!(refused, PhoneWriteError::Pull(SyncError::Busy(_))),
+            "{refused:?}"
+        );
+        assert!(!written, "nothing is written that could not be pulled onto");
+
+        std::fs::write(p.local_path.join("card.md"), b"moved\n").expect("write");
+        let push = engine.phone_push(&p.id).await;
+        assert!(
+            matches!(push, PhonePush::Deferred(SyncError::Busy(_))),
+            "{push:?}"
+        );
+        assert!(push.retry(), "a busy folder's push is retried");
+        assert!(push
+            .unpushed()
+            .is_some_and(|line| line.contains("pushes it again")));
+        let status = engine.status(&p.id).expect("a status");
+        assert_eq!(status.error, None, "busy is not a fault beside the profile");
+        drop(held);
+
+        let diverged = PhonePush::Deferred(SyncError::Diverged {
+            profile: "phone".to_owned(),
+            reason: phone_divergence_sentence(1),
+        });
+        assert!(!diverged.retry(), "a divergence waits on a person");
+        assert!(diverged
+            .unpushed()
+            .is_some_and(|line| line.contains("reset this copy") && !line.contains("again")));
+        assert!(PhonePush::Deferred(SyncError::Network {
+            host: "remote".to_owned(),
+            reason: "unreachable".to_owned(),
+        })
+        .retry());
+        assert!(!PhonePush::Pushed.retry());
+        assert!(!PhonePush::Paused.retry());
     }
 
     /// A note the phone wrote commits on the very next pass: the phone

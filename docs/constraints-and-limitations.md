@@ -28,8 +28,15 @@ risk sections.
 - **No WhatsApp automation features** (bulk send, auto-reply) — ban-bait for bridge users.
 - **No native VoIP implementation now.** MatrixRTC (MSC4143) is pre-spec and volatile;
   calls arrive post-MVP via the Element Call widget.
-- **No paid Apple Developer Program yet** (so no APNs push, NSE, TestFlight, or App Groups) —
-  deferred by decision; see [decisions.md](decisions.md) D-1.
+- **Push on the iPhone needs the paid Apple Developer Program and a gateway you run.** D-35
+  ended D-1's deferral: the build carries `aps-environment`, an App Group and the notification
+  extension (Epic 98, story 98.1), and with a build signed by the owner's paid team and a Sygnal
+  holding that team's APNs key, an agent's approval request and the owner's own agent's answer
+  reach the locked phone, and nothing else shows; the homeserver still sends the gateway, and
+  Apple, the id of every other message that would notify, and the phone discards it. keeper ships no gateway and never chooses one
+  (D-1, D-4). A free Personal Team's build strips all three and has no push; it is what the owner
+  installs until enrolment, and the device run that closes 98.1 is owed until then
+  ([docs/ios.md](ios.md) § *Push*). No TestFlight.
 
 ## Hard / risky (do with eyes open)
 
@@ -94,6 +101,61 @@ and why:
   in the same container) makes the tray fail with `Permission denied` — logged at `warn`,
   non-fatal, no tray.
 
+## Android (Epic 98, story 98.3 — gated by CI, not yet built or run anywhere)
+
+keeper builds for `aarch64-linux-android` from the same project (`gen/android`, AD-414). Its
+gate is CI's `Android (compile and debug APK)` job on `ubuntu-latest`, whose first green run
+is owed on story 98.3's pull request; until then the Android half has only been type-checked
+locally, and Gradle has never built the APK. Neither keeper's Linux dev host nor the Mac has
+an Android SDK, and the owner's tablet run (98.3 #7) is owed. What is different there, and
+why (`docs/android.md` has the whole list):
+
+- **Secrets live in an encrypted file, not a keychain.** Android's Keystore holds keys, not
+  values, so `keeper_core::secret_file` keeps every secret in one XChaCha20-Poly1305 file in
+  the app's files directory, keyed by a data key the Keystore wraps (`KeystorePlugin.kt`). A
+  tampered file, a lost Keystore key or a newer format is refused and never overwritten;
+  starting over is clearing keeper's storage in Android's settings. `keyring` is not in the
+  Android build at all (`check:android-graph`): there it would be a mock that forgets.
+- **No backups.** The manifest turns backup and device transfer off for everything.
+- **Sync is gitoxide in-process**, as on the iPhone: no `git` binary to spawn.
+- **No agent, recorder or transcription** — the recorder is honestly `Unsupported`.
+- **Voice only in front, from Android 13, and without turn models.** keeper records the
+  microphone itself with the device's echo canceller on it and feeds that audio to the
+  on-device recogniser in a segmented session (`voice_android.rs`, `VoicePlugin.kt`); no
+  recogniser that may use a server is ever made (`voice_on_device`). Android gives an app
+  with no microphone foreground service silence behind other apps, so listening stops when
+  keeper leaves the front, nothing is read aloud there either, and the switch you left on
+  listens again when keeper is back or opened again (DW-412). A device without an echo
+  canceller is half duplex: keeper stops listening while it speaks. `ort` has an Android
+  library but this build links none, so a turn always ends by the pause (DW-413).
+  Not yet run on a device (98.4 #10).
+- **Push is UnifiedPush, read only while keeper runs.** keeper registers with a distributor
+  (the ntfy app and a server the person runs) only after the person confirmed that one, by
+  name and package, in Settings on this device; it gives keeper an endpoint, keeper asks
+  that server once per endpoint whether it is a Matrix push gateway and registers an
+  `event_id_only` pusher to it only when it answers so (`agents::unifiedpush`), never one of
+  its own; a server it cannot reach changes nothing. A push is read in keeper's own
+  process with the iPhone's classifier; once Android has stopped keeper — no foreground
+  service (AD-414) — a push shows only keeper's generic words. Approve once / Deny need
+  Android 12 (an action that requires unlocking); older Android gets no actions. Not yet run
+  on a device (98.4 #10).
+- **Sign-in is an Auth Tab**, which returns the callback as the activity's result; a
+  browser without Auth Tab falls back to a Custom Tab and the claimable `keeper://` deep
+  link (PKCE-protected). A verified `https` App Link needs a per-signer `assetlinks.json`
+  and homeservers that accept `https` from a native client (DW-1300).
+- **keeper's own URLs are spelled `http://<scheme>.localhost/…`**: Android's WebView cannot
+  load a custom scheme (`keeper_core::asset_url::UrlForm::HOST`).
+- **The tablet** shows the phone's surfaces, the rooms list beside the open room at ≥ 840 dp
+  and the proxy dock as a sheet; desktop-only panes stay absent.
+- **Sideload only**, signed with the owner's own key (`bun run install:android`); no store
+  build (DW-407).
+- **The Gradle half of the licence firewall** is two checks: a Linux test over the declared
+  coordinates (`android_gradle_dependencies_are_licensed`), and, in the CI job, every group
+  Gradle resolves for the APK — transitive dependencies included — against an allow-list
+  with each group's licence (`the_resolved_android_classpath_is_licensed`). The allow-list
+  covers groups, not single artifacts: a new artifact in a listed group passes unread
+  (DW-1290).
+
 ## Audited `unsafe` FFI inventory (shell crate only)
 
 Policy (2026-07-11): `unsafe_code` stays denied workspace-wide; the `keeper` shell crate may
@@ -124,12 +186,12 @@ safe binding. Current inventory:
   `AVAudioEngineConfigurationChangeNotification` and, since Epic 65,
   `AVAudioSessionRouteChangeNotification`, `removeObserver:`) via objc2-speech,
   objc2-avf-audio and objc2-foundation, behind `keeper_core::voice::VoicePort` and
-  `keeper_core::voice::ConsentPort` — twenty-eight function-level `#[allow(unsafe_code)]`
+  `keeper_core::voice::ConsentPort` — twenty-nine function-level `#[allow(unsafe_code)]`
   fns in `crates/keeper/src/voice_ios.rs`, one per concern (`speech_authorization`,
   `microphone`, `microphone_consent`, `ask_speech`, `ask_microphone`,
   `on_device_locales`, `recognizer_for`, `configure_session`, `set_session_options`,
   `release_session`, `start_capture`, `stop_capture`, `engine_running`, `start_request`,
-  `end_request`, `read_result`, `observe_session`, `route_change_reason`,
+  `end_request`, `finish_request`, `read_result`, `observe_session`, `route_change_reason`,
   `interruption_notice`, `forget_observer`, `new_synthesizer`, `voice_languages`,
   `voice_for_language`, `voice_name`, `detect_language`, `speak_text`, `stop_speech`,
   `is_speaking`), each
@@ -175,8 +237,8 @@ safe binding. Current inventory:
   `keeper-core/src/voice/island.rs:43`), how long a failure card lingers (`FAILURE_LINGER`,
   30 s, `:38`) — is `keeper_core::voice::island`, pure and tested on the dev host, with no
   platform `cfg` and no `tauri`; the bridge only carries it. Every call is local
-  (`pushType: nil`, no APNs, no App Group — `docs/egress.md`, *The phone's record and the
-  island add no egress*), and a request the system refuses (in the background, on a free
+  (`pushType: nil`; the app's APNs entitlement and App Group are push's, never the island's —
+  `docs/egress.md`, *The phone's record and the island add no egress*), and a request the system refuses (in the background, on a free
   team) is recorded once in the ring as `island:refused` and retried on `RunEvent::Resumed`
   rather than looped. **Not yet compiled anywhere**: the Swift, the extension target and
   the link are proven only by the Mac gate and the kalypso install (DW-222).
@@ -205,15 +267,20 @@ safe binding. Current inventory:
   (`addObserverForName:object:queue:usingBlock:` for
   `AVAudioEngineConfigurationChangeNotification`, `removeObserver:`) and `NSProcessInfo`
   (`endActivity:` for the App Nap assertion; `beginActivityWithOptions:reason:` is a safe
-  binding) via objc2-speech, objc2-avf-audio and objc2-foundation, behind
-  `keeper_core::voice::VoicePort` and `keeper_core::voice::ConsentPort` — twenty-two
-  function-level `#[allow(unsafe_code)]` fns in `crates/keeper/src/voice_macos.rs`, one per
-  concern (`speech_authorization`, `microphone_consent`, `ask_speech`, `ask_microphone`,
-  `input_present`, `on_device_locales`, `recognizer_for`, `start_capture`, `stop_capture`,
-  `engine_running`, `start_request`, `end_request`, `read_result`, `forget_observer`,
-  `new_synthesizer`, `voice_languages`, `voice_for_language`, `voice_name`,
-  `detect_language`, `speak_text`, `stop_speech`, `is_speaking`), each with a `// SAFETY:`
-  comment citing the Apple contract it relies on. `start_capture` also carries
+  binding) via objc2-speech, objc2-avf-audio and objc2-foundation, plus CoreAudio's
+  `AudioObjectGetPropertyData` (declared in the file; the default input device, then its
+  `kAudioObjectPropertyName` as a +1 `CFStringRef` the fn takes ownership of and releases
+  once), behind `keeper_core::voice::VoicePort` and `keeper_core::voice::ConsentPort` —
+  twenty-four function-level `#[allow(unsafe_code)]` fns in
+  `crates/keeper/src/voice_macos.rs`, one per concern (`speech_authorization`,
+  `microphone_consent`, `ask_speech`, `ask_microphone`, `input_present`,
+  `on_device_locales`, `recognizer_for`, `start_capture`, `default_input_device_name` —
+  read only after voice processing was refused, for the half-duplex sentence (AD-213) —
+  `stop_capture`, `engine_running`, `start_request`, `end_request`, `finish_request`,
+  `read_result`, `forget_observer`, `new_synthesizer`, `voice_languages`,
+  `voice_for_language`, `voice_name`, `detect_language`, `speak_text`, `stop_speech`,
+  `is_speaking`), each with a `// SAFETY:` comment citing the Apple contract it relies on.
+  `start_capture` also carries
   `#[allow(clippy::arc_with_non_send_sync)]` for the same request slot as the iOS port. No
   `AVAudioSession` call exists in the file — the class does not exist on macOS — so there
   is no category, no ducking and no interruption observer; half-duplex is
@@ -258,6 +325,33 @@ safe binding. Current inventory:
   second and never one per buffer. Only a number in `0.0..=1.0` leaves the tap; no sample
   does. There is no second tap: `installTapOnBus:` allows one per bus, and the level shares
   the recogniser's.
+- End of turn by meaning, both ports (Epic 97, Story 97.2, AD-411): `AVAudioFormat
+  sampleRate` read once in `start_capture` (already counted), and one new audited fn per
+  port, `finish_request` — `SFSpeechAudioBufferRecognitionRequest endAudio` alone, after the
+  worker took the request out of the tap's slot, so the task delivers its final words
+  instead of being cancelled (`keeper_core::voice::VoicePort::finish_recognition`, counted
+  in the totals above); the port then tells the turn when `endAudio` ran. The tap also
+  copies channel 0 into a buffer from a fixed pool held by
+  `keeper_core::voice::end_of_turn::Ear` for one listener thread, which runs the turn
+  models (`voice_turn_models.rs`, ONNX Runtime) while the turn is `Listening`; the samples
+  go nowhere else. The tap never allocates and never waits: it only tries the lock on the
+  pool's line, and with the lock held (a listener being attached or detached) or no free
+  buffer, the audio is dropped, counted (`Ear::dropped`) and the listener starts afresh.
+- Speaking over an answer, both ports (Epic 97, Story 97.3, AD-411): four function-level
+  `#[allow(unsafe_code)]` items in `crates/keeper/src/voice_synthesizer.rs`, which both
+  Apple ports share and which the ports' totals above do not count — the `class` module
+  around `define_class!` for `SpeechDelegate` (an `NSObject` subclass implementing
+  `AVSpeechSynthesizerDelegate`'s `speechSynthesizer:didFinishSpeechUtterance:` alone; its
+  one ivar is the port's event sink; the `web_auth_apple.rs` precedent), `set_delegate`
+  (`setDelegate:`, a weak property — the worker keeps the delegate as long as the
+  synthesiser), `pause_speech` (`pauseSpeakingAtBoundary:AVSpeechBoundaryImmediate`) and
+  `continue_speech` (`continueSpeaking`), each with its `// SAFETY:` comment, behind
+  `keeper_core::voice::VoicePort::{pause_speaking, continue_speaking}`. The delegate only
+  reports that an utterance was read to its end (`TurnEvent::SentenceSpoken`); whether to
+  pause, resume or stop, and how far the person heard, is `keeper_core::voice` and
+  `keeper_core::agents::spoken::HeardMark`'s. While the turn is `Speaking` or `Paused` the
+  same `Ear` listener hears the person over the answer on a capture with voice processing
+  (`half_duplex()` is `None`), and on no other; the samples still go nowhere else.
 - The account sign-in sheet, iOS (Epic 82, AD-311; macOS dropped it for the default browser):
   `ASWebAuthenticationSession` (`initWithURL:callback:completionHandler:` with
   `ASWebAuthenticationSessionCallback callbackWithCustomScheme:` behind
@@ -309,3 +403,54 @@ safe binding. Current inventory:
   (`swift-tools-version: 6.2`), and SwiftPM fetches FluidAudio from github.com at build
   time. Linux, Windows and iOS have no engine: the dependency is target-gated, and
   `transcribe_ipc`'s `AbsentEngine` answers `Unsupported` there (DW-335).
+- The turn models, Apple silicon macOS and the iPhone (Epic 97, D-36, AD-410): **no new entry in the
+  shell crate.** ONNX Runtime 1.28.0 is reached through `ort` 2.0.0-rc.13 (MIT OR Apache-2.0,
+  exact pin, default features off, no execution provider), whose own `unsafe` stays in that
+  crate; `crates/keeper/src/voice_turn_models.rs` uses its safe API and carries no
+  `#[allow(unsafe_code)]`. The runtime itself is not a cargo package: `ort-sys`'s build
+  script downloads one static `libonnxruntime.a` per target from pyke (`cdn.pyke.io`,
+  `ms@1.28.0/aarch64-apple-darwin+coreml` and `ms@1.28.0/aarch64-apple-ios+coreml`, each
+  checked against the sha256 `ort-sys` pins) **at build time** on CI and hesperia — the app
+  never contacts that host. It is Microsoft's ONNX Runtime, **MIT** (microsoft/onnxruntime tag
+  `v1.28.0`, commit `da9b5e36`, licence read 2026-10-05); the archive carries no licence file,
+  so the licence and the artefacts' hashes are recorded in the repository's `NOTICE`, and its
+  LICENSE and `ThirdPartyNotices.txt` at that tag (what it bundles: Eigen, MPL-2.0, among them)
+  are copied into `licenses/onnxruntime-1.28.0/`. Both apps carry `NOTICE` and `licenses/`
+  (`keeper.app/Contents/Resources/` through `tauri.conf.json`, the top of the iPhone app through
+  `gen/apple/project.yml`); `scripts/bundle-notices.test.ts` pins the two configurations and the
+  install paths' bundle guard refuses a built app without them. `cargo deny` sees `ort`, `ort-sys` and their build-time crates, not this
+  library. The library is linked statically into keeper on both platforms; its minimum OS
+  (macOS 13.4, iOS 15.1) is below keeper's (14.0, 16.2). The iOS app links `libapp.a`
+  through Xcode, so `gen/apple/project.yml` names `CoreML.framework` and `libc++.tbd`, which
+  the library needs; only `bun run install:ios` proves that link. No Intel macOS library is
+  published, and only the device's iOS library is recorded, so `ort` is a dependency of Apple
+  silicon macOS and the arm64 iPhone alone (`target_env` not `sim`): an Intel Mac and the iOS
+  simulator build without it, have no turn models and keep voice's pause rule. The models
+  load only by path from `<data_dir>/models/` after the turn group's completion marker; the
+  runtime's model download (`fetch-models`) is not compiled in, and its call is a forbidden
+  token in `keeper-core/tests/voice_on_device.rs`.
+- The notification extension's C ABI, iOS (Epic 98, story 98.1, R24(14); the one
+  exception outside the shell crate, ruling of rung `agents-98-nse`): the extension's
+  Swift (`gen/apple/KeeperNotify/NotificationService.swift`) calls Rust, so
+  `crates/keeper-nse/src/lib.rs` exports two `#[no_mangle] pub unsafe extern "C"` fns,
+  each function-level `#[allow(unsafe_code)]` with a `// SAFETY:` comment —
+  `keeper_nse_handle` (reads the NUL-terminated request with `CStr::from_ptr`; the
+  buffer is Swift's `withCString` and lives for the call) and `keeper_nse_free`
+  (`CString::from_raw` of the answer `keeper_nse_handle` returned, released once by
+  Swift). Both stop a panic with `catch_unwind` before it reaches the C ABI (a panic
+  is the generic notification). Everything between is safe Rust taking and returning
+  JSON (`keeper_nse::handle_json`), tested on Linux; `keeper-core` stays without `unsafe`.
+- Push's C ABI in the app, iOS (Epic 98, story 98.1, AD-412): the app's notification
+  delegate (`gen/apple/Sources/keeper/KeeperPush.swift`, declared to Swift by
+  `Sources/keeper/keeper_push.h`) calls Rust, so `crates/keeper/src/push_ios.rs` exports
+  three `#[no_mangle] pub unsafe extern "C"` fns, each function-level
+  `#[allow(unsafe_code)]` with a `// SAFETY:` comment — `keeper_push_action` (an action's
+  request, read with `CStr::from_ptr` from Swift's `withCString` buffer; returns null or a
+  `CString::into_raw` answer), `keeper_push_open` (a tap's `userInfo`, read the same way)
+  and `keeper_push_free` (`CString::from_raw` of an answer, released once by Swift) — plus
+  `received`, the one `CStr::from_ptr` both readers share, and `bridge_install`, the call
+  into Swift's `keeper_push_install` with a buffer that outlives it. What an action sends and
+  where a tap lands are `keeper_core::agents::push` (`action_decision`, `tap_target`), safe
+  and tested on Linux. The APNs token reaches Rust through keeper's patched tao
+  (`tools/tao/NOTICE`, change 3), whose new app-delegate methods read `NSData` bytes and an
+  `NSError`'s description with `msg_send!` in tao's own style.

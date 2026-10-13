@@ -150,6 +150,7 @@ fn session(name: &str, requester: &str) -> (String, String) {
         title: name.to_owned(),
         requested_by: user(requester),
         parent: None,
+        reply: None,
         room: OwnedRoomId::try_from(format!("!{name}:example.org")).expect("room"),
         drives: vec!["tgdrive".to_owned()],
         label: Label::opening(&decl, Integrity::Owner),
@@ -162,6 +163,7 @@ fn session(name: &str, requester: &str) -> (String, String) {
         checkpoints: None,
         outputs: Vec::new(),
         created_at: now(),
+        gate: None,
     };
     (
         format!("60-sessions/active/{name}/agent.toml"),

@@ -151,10 +151,7 @@ pub fn contained_read(vault: &Vault, rel: &str) -> Option<PathBuf> {
 /// fragment is discarded: this scheme has no parameters, so a URL that carries
 /// some is being probed rather than used.
 fn parse_note_url(raw: &str) -> Option<(String, String)> {
-    let rest = raw
-        .strip_prefix(&format!("{SCHEME}://"))
-        .or_else(|| raw.strip_prefix(&format!("http://{SCHEME}.localhost/")))
-        .or_else(|| raw.strip_prefix(&format!("https://{SCHEME}.localhost/")))?;
+    let rest = keeper_core::asset_url::strip(raw, SCHEME)?;
     // A query or fragment ends the path. `split` always yields at least one
     // element, so the `?` is unreachable in practice and keeps this total.
     let rest = rest.split(['?', '#']).next()?;

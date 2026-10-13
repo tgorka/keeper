@@ -14,7 +14,7 @@
 use std::sync::Mutex;
 
 use keeper_agent::surface::{drive_of, locate, Located};
-use keeper_core::agents::approval_card::ApprovalDecideReq;
+use keeper_core::agents::approval_card::{ApprovalDecideReq, ApprovalPayloadVm};
 use keeper_core::agents::events::{Focus, PresencePlatform, SurfaceOutcome};
 use keeper_core::agents::proxy::{AgentFocusReq, ProxyRoomVm};
 use keeper_core::agents::spoken::{FollowSlot, SpokenStep};
@@ -323,17 +323,18 @@ pub async fn agent_approval_decide(
 }
 
 /// The attached action of the approval `id` in the session room `room_id`,
-/// as pretty-printed JSON, fetched, decrypted and checked against its
-/// digest; refused with a sentence when it is not the action sent for
-/// approval (R186, `keeper_core`'s `agent_approval_payload`). Once shown,
-/// it may be approved from this app.
+/// as pretty-printed JSON and, for a `run`, its typed run view (R231),
+/// fetched, decrypted and checked against its digest; refused with a
+/// sentence when it is not the action sent for approval (R186,
+/// `keeper_core`'s `agent_approval_payload`). Once shown, it may be
+/// approved from this app.
 #[tauri::command]
 pub async fn agent_approval_payload(
     state: State<'_, AppState>,
     account_id: String,
     room_id: String,
     id: String,
-) -> Result<String, IpcError> {
+) -> Result<ApprovalPayloadVm, IpcError> {
     state
         .accounts
         .agent_approval_payload(&account_id, &room_id, &id)
@@ -381,8 +382,9 @@ fn spoken_answer(
 }
 
 /// A new question was heard: an earlier one's send or answer is not the
-/// new turn's to speak (R44: the agent itself is not told; it finishes its
-/// answer in the room).
+/// new turn's to speak (R44: the agent's turn is not cancelled; it finishes
+/// its answer in the room — where the person stopped listening is
+/// `voice_ipc`'s mark, already on its way).
 pub fn drop_spoken_answer() {
     let current = crate::voice_ipc::question_now();
     if let Some(earlier) = spoken_answer().keep_only(current) {
@@ -397,8 +399,9 @@ pub fn drop_spoken_answer() {
 /// which room is allowed and what of the answer is heard when are
 /// `keeper_core::account::spoken_send`'s and `keeper_core::agents::spoken`'s.
 /// The voice turn hears the send leave (`note_sent`, with the agent's name),
-/// the first words, each sentence and the end — or the refusal or failure
-/// as its sentence — each for `question`. The work is in the slot before it
+/// the first words, the answer's anchor (for where the person stops
+/// listening, AD-411), each sentence with its end and the end — or the
+/// refusal or failure as its sentence — each for `question`. The work is in the slot before it
 /// starts: a question that is no longer the voice turn's never sends, and
 /// a newer one stops it.
 pub fn send_spoken(
@@ -431,6 +434,12 @@ pub fn send_spoken(
                 SpokenStep::FirstText { after_ms } => {
                     crate::voice_ipc::note_answer_chunk(question, after_ms);
                 }
+                SpokenStep::Anchored { anchor } => crate::voice_ipc::answer_anchored(
+                    question,
+                    account_id.clone(),
+                    room_id.clone(),
+                    &anchor,
+                ),
                 SpokenStep::Sentence(sentence) => {
                     crate::voice_ipc::answer_sentence(question, sentence);
                 }

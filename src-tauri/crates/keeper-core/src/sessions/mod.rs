@@ -40,6 +40,7 @@ pub mod add_ref;
 pub mod files;
 pub mod migrate;
 pub mod model;
+pub mod offer;
 pub mod pattern;
 pub mod plan;
 pub mod pool;

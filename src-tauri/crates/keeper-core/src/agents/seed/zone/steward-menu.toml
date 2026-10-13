@@ -20,7 +20,8 @@ code        = "HV"
 description = "Look at what a closed session learned"
 prompt      = """
 A session of this drive has closed; its path is in the brief. Read its README, its artifacts and its last log lines with your drive tools.
-Reply with what it learned that the drive should keep, and where in the drive it belongs. Write nothing else.
+For each thing it learned that the drive should keep, write one candidate note with session_write at artifacts/knowledge/<the closed session's folder name>/<a short name>.md: frontmatter with type (one of the drive's .okf/registry/types.md, else Note), title, description and sources (each an id, a resource — a file of the closed session by its path from the drive's root, or log/<chunk>#<line id> — and a title), then the note itself, at most 64 KiB. keeper signs it as yours and marks it unreviewed; never write verified, and never name a person as its author.
+Reply with one line per note: its path, and where in the drive it belongs. Write nothing else.
 """
 
 [[menu]]

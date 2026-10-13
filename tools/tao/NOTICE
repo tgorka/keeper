@@ -2,7 +2,7 @@ tao — keeper's patched copy
 ===========================
 
 This directory is tao 0.35.3, the window and event-loop layer under Tauri, as
-crates.io serves it, with two changes, both on iOS's UIScene path. It is used
+crates.io serves it, with three changes, all on iOS. The first two are on its UIScene path. It is used
 through `[patch.crates-io]` in `src-tauri/Cargo.toml`.
 
   upstream: https://github.com/tauri-apps/tao
@@ -35,8 +35,22 @@ The changes
    through 0.37.1 never reads it, so a `keeper://setup?…` code scanned while
    keeper was closed would open keeper and do nothing.
 
+3. The APNs device token (keeper Epic 98, story 98.1). `src/platform_impl/ios/view.rs`,
+   `create_delegate_class`: tao's `AppDelegate` declared no
+   `application:didRegisterForRemoteNotificationsWithDeviceToken:` and no
+   `application:didFailToRegisterForRemoteNotificationsWithError:`, so the token
+   `UIApplication.registerForRemoteNotifications` asks for reached nobody. Both are
+   added and hand the token's bytes, or the error's description, to two plain function
+   pointers the embedder sets once with
+   `platform::ios::set_remote_notification_hooks` (`src/platform/ios.rs`; the cell is
+   `REMOTE_NOTIFICATION_HOOKS` in `view.rs`). Unset, both methods do nothing. keeper
+   sets them in `src-tauri/crates/keeper/src/push_ios.rs` before the event loop runs.
+   Swizzling a method onto the runtime class from Swift was the alternative and was
+   refused: it would couple silently to the class name `AppDelegate`.
+
 Retiring it
 -----------
 
-When upstream tao fixes both, delete the `[patch.crates-io]` table and this
+When upstream tao fixes the first two and gives the app delegate a way to hand over the
+APNs token, move `push_ios.rs` to it, then delete the `[patch.crates-io]` table and this
 directory, and re-run the cold-launch check in docs/ios.md.

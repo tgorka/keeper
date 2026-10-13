@@ -47,3 +47,6 @@ rustix = { workspace = true, features = ["termios"] }
 tempfile = { workspace = true }
 reqwest = { workspace = true }
 ulid = { workspace = true }
+# `status` read through the CLI over a real MCP server's answer.
+rmcp = { workspace = true, features = ["server", "transport-streamable-http-server"] }
+axum = { workspace = true }

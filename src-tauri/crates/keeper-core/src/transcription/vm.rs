@@ -79,6 +79,9 @@ pub enum ModelsState {
     Fetching,
     Failed,
     NoAccount,
+    // This build has no runtime for the models at all (the turn models on
+    // Android, Epic 98 story 98.4): nothing to fetch, nothing to fix.
+    Unavailable,
 }
 
 /// A drive that keeps voices (AD-342).

@@ -1,4 +1,5 @@
-//! A note saved on the phone becomes a commit and a push (Story 66.4, AD-202).
+//! A note saved on the phone becomes a commit and a push (Story 66.4, AD-202),
+//! and a card the phone's board moves is pulled onto first (98.2, R346).
 //!
 //! The whole path a save takes on a phone, driven end to end against a real
 //! `git`: a phone-shaped engine (`GitEngine::Gix` — nothing here spawns on the
@@ -35,7 +36,7 @@ use keeper_sync::{
     git::{cli::GitEngine, history},
     platform::TestPlatform,
     provenance::SyncSource,
-    SyncPlatform, SyncProfile,
+    PhonePush, PhoneWriteError, SyncError, SyncPlatform, SyncProfile,
 };
 
 /// A `git` that reads no configuration but the repository's own.
@@ -395,4 +396,124 @@ async fn a_note_saved_on_the_phone_is_a_commit_on_the_remote_within_one_pass() {
         .await
         .expect("an up-to-date phone syncs cleanly");
     assert_eq!(harness.receive_posts.load(Ordering::SeqCst), 1);
+}
+
+/// A card the phone's board moves (98.2, R346): agents on another host have
+/// pushed since the phone's last pass, so the write pulls first, reads the
+/// remote's tip, and its commit lands on top of the agent's — one pass, no
+/// divergence, and the answer says it is on the remote.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_card_moved_on_the_phone_is_written_on_the_remotes_tip_and_pushed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let Some(harness) = Harness::start(dir.path()) else {
+        return;
+    };
+    let first = harness.mac_publishes("sessions/s/tasks/a.md", b"---\nstatus: todo\n---\n");
+    let (_platform, engine, profile) = phone(dir.path(), &harness.url);
+    engine
+        .sync_once_recording(&profile.id, SyncSource::Manual)
+        .await
+        .expect("the first pass clones over HTTP");
+
+    // An agent on the Mac works on after the phone's last fast-forward.
+    let agent = harness.mac_publishes("sessions/s/log/1.md", b"a turn\n");
+
+    let card = profile.local_path.join("sessions/s/tasks/a.md");
+    let log = profile.local_path.join("sessions/s/log/1.md");
+    let (saw_the_agent, push) = engine
+        .phone_write(&profile.id, || async {
+            let saw = log.exists();
+            std::fs::write(&card, b"---\nstatus: done\n---\n")?;
+            Ok::<_, std::io::Error>(saw)
+        })
+        .await
+        .expect("the move is written");
+    assert!(
+        saw_the_agent,
+        "the write read the remote's tip: it pulled first"
+    );
+    assert!(matches!(push, PhonePush::Pushed), "{push:?}");
+    assert_eq!(push.unpushed(), None);
+    assert!(!push.retry());
+
+    let tip = harness.tip();
+    assert_eq!(
+        git(&harness.bare, &["log", "--format=%H", "main"]).expect("git"),
+        format!("{tip}\n{agent}\n{first}"),
+        "the move is one commit on top of the agent's, nothing rewritten"
+    );
+    assert_eq!(
+        git(
+            &harness.bare,
+            &["show", &format!("{tip}:sessions/s/tasks/a.md")]
+        )
+        .expect("git"),
+        "---\nstatus: done\n---"
+    );
+    assert_eq!(engine.status(&profile.id).expect("a status").error, None);
+}
+
+/// A phone holding a commit the remote lacks, against a remote that moved:
+/// the move is refused with the engine's own divergence sentence before a
+/// byte is written, and nothing is pushed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_phone_that_cannot_fast_forward_refuses_the_move_and_writes_nothing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let Some(harness) = Harness::start(dir.path()) else {
+        return;
+    };
+    let todo = b"---\nstatus: todo\n---\n";
+    harness.mac_publishes("sessions/s/tasks/a.md", todo);
+    let (_platform, engine, profile) = phone(dir.path(), &harness.url);
+    engine
+        .sync_once_recording(&profile.id, SyncSource::Manual)
+        .await
+        .expect("the first pass clones over HTTP");
+
+    // A note the phone saved and committed, and a pull-only pass that pushes
+    // nothing of it.
+    std::fs::write(profile.local_path.join("captured.md"), b"from the phone\n").expect("write");
+    engine.prime_worktree_changes(&profile.id).expect("primed");
+    engine
+        .pull_once_recording(&profile.id, SyncSource::Watch)
+        .await
+        .expect("a pull-only pass over an unmoved remote");
+    assert_eq!(
+        harness.receive_posts.load(Ordering::SeqCst),
+        0,
+        "a pull-only pass pushes nothing"
+    );
+    harness.mac_publishes("sessions/s/log/1.md", b"a turn\n");
+
+    let card = profile.local_path.join("sessions/s/tasks/a.md");
+    let mut written = false;
+    let refused = engine
+        .phone_write(&profile.id, || {
+            written = true;
+            async { std::fs::write(&card, b"---\nstatus: done\n---\n") }
+        })
+        .await
+        .expect_err("a phone that cannot fast-forward moves nothing");
+    let PhoneWriteError::Pull(SyncError::Diverged { reason, .. }) = &refused else {
+        panic!("the divergence, got {refused:?}");
+    };
+    assert!(
+        reason.contains("this phone has 1 commit the remote does not"),
+        "{reason}"
+    );
+    assert!(!written, "the write was never attempted");
+    assert_eq!(
+        std::fs::read(&card).expect("the card"),
+        todo,
+        "the card did not move"
+    );
+    assert_eq!(harness.receive_posts.load(Ordering::SeqCst), 0);
+    assert!(
+        engine
+            .status(&profile.id)
+            .expect("a status")
+            .error
+            .is_some(),
+        "the sentence is beside the profile"
+    );
 }

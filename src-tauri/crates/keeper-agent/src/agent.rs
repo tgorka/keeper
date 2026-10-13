@@ -40,6 +40,7 @@ use keeper_core::agents::events::{
     StatusContent, ARTIFACTS, CONTENT_VERSION, SCOPE, STATUS, TURN,
 };
 use keeper_core::agents::focus::FOCUS_TTL;
+use keeper_core::agents::heard::{message_text, Answers, HeardContent, HeardRefusal, Marked};
 use keeper_core::agents::helper;
 use keeper_core::agents::home::{serves_local_models, AgentKind, MenuItem};
 use keeper_core::agents::label::{
@@ -53,7 +54,7 @@ use keeper_core::agents::log::{
     ApprovalBody, ApprovalState, AskBody, AskState, AssistantBody, ChildSession, DelegateBody,
     DelegateReply, DelegateState, ErrorBody, HostSlug, LineBody, LogLine, MemoryBody, MemoryOp,
     OpenBody, PeerAnswer, PeerAsk, PeerBody, RunBody, ScopeBody, ToldBody, ToolCallBody,
-    ToolOutcomeWord, ToolResultBody, Truncated, Usage, UserBody,
+    ToolOutcomeWord, ToolResultBody, Truncated, Usage, UserBody, NARROWER_THAN_ROOM, WITHHELD_CODE,
 };
 use keeper_core::agents::matrix::AgentMatrixError;
 use keeper_core::agents::memory::{self, MemorySnapshot};
@@ -104,20 +105,14 @@ use crate::rooms::{self, Arrival, BriefEvent, Disposition, Served};
 use crate::sessions::verbs::{self, CreateOutcome};
 use crate::sessions::write::session_write;
 use crate::sinks::{
-    room_audience, CallAudit, Gated, ProxyDoors, RoomGate, Sinks, MEMBERS_UNREAD, NARROWED_STATUS,
+    room_audience, CallAudit, Gated, ProxyDoors, RoomGate, Sinks, Withheld, MEMBERS_UNREAD,
+    NARROWED_STATUS,
 };
-use crate::turn::{arm_turn_probing, endpoint_of, read_timeout_of, TurnEnv, TurnOrigin};
+use crate::turn::{
+    arm_turn_probing, endpoint_of, read_timeout_of, SessionRef, TurnEnv, TurnOrigin,
+};
 use crate::writer::{SessionWriter, WriterError};
 use crate::zone::{read_text, AgentHome};
-
-/// A session, by its drive and its zone-relative folder.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct SessionRef {
-    /// The drive whose sessions zone holds it.
-    pub drive: String,
-    /// Zone-relative: `active/2026-10-02-release`.
-    pub path: String,
-}
 
 /// What the final edit says when the label stopped the model (S-04).
 pub const LOCAL_ONLY_REFUSAL: &str = "This conversation has read something that may go only to a model on your own machines, and this agent's model is not one. Nothing more was sent.";
@@ -126,15 +121,6 @@ pub const LOCAL_ONLY_REFUSAL: &str = "This conversation has read something that 
 /// reason itself is in the session's log.
 pub const TURN_FAILED: &str =
     "I could not finish this answer. The reason is in this session's log.";
-
-/// What the room is told instead of an answer when the session's label no
-/// longer reaches everyone the session's `agent.toml` names (S-16): the
-/// answer drew on something narrower than the room. The log keeps the whole
-/// answer, with an `error` line whose code is [`LABEL_CODE`].
-pub const NARROWER_THAN_ROOM: &str = "This answer drew on something not everyone in this room may read, so it is not shown here. It is in this session's log.";
-
-/// The code of the `error` line of an answer withheld from its room.
-const LABEL_CODE: &str = "label";
 
 /// The `finish` of an `assistant` line written for a round that called
 /// tools: the turn goes on after it, so it answers nothing yet.
@@ -240,7 +226,7 @@ pub struct SessionContext {
     /// its work went on where only some of its room may read it (R169).
     pub told: bool,
     /// Whether an answer of the session was withheld from its room as the
-    /// room then was — an `error` line coded [`LABEL_CODE`] (R168).
+    /// room then was — an `error` line coded [`WITHHELD_CODE`] (R168).
     pub withheld: bool,
     /// The approvals whose call has no result yet, by id (93.2): a turn
     /// parked on one is waiting, not unanswered, and `recover` leaves it.
@@ -292,6 +278,109 @@ pub struct SessionContext {
     /// The nudges' counters, from every line (95.1): when the session's
     /// agent reviews what it learned.
     pub nudges: keeper_core::agents::nudge::Nudges,
+    /// The `session` approvals of T2 runs this host consumed (R146): held
+    /// in memory only, so they end when the session closes or this host
+    /// lets it go — a run then asks again.
+    pub(crate) run_allowances: Vec<keeper_core::agents::run::RunAllowance>,
+    /// A gate session's journal allowance a person's `session` decision
+    /// gave (99.2 #2, S-11): held in memory only, as `run_allowances` are,
+    /// so it ends with the session's hold on this host or a day after the
+    /// decision, whichever is first.
+    pub(crate) gate_journal: Option<keeper_core::agents::gate::JournalAllowance>,
+    /// The Paseo runs this session's own successful `create_agent` calls
+    /// started, from the host's records on their results — every line's,
+    /// a blob's hydrated — by broker (Q14).
+    pub(crate) paseo_runs: std::collections::BTreeSet<keeper_core::agents::paseo::Started>,
+    /// This follow session's run end, from its `paseo` lines: the capture
+    /// to finish while `pending` — the latest, so one adopted from the
+    /// capture its room binds stands for an earlier one that does not bind
+    /// — or what was delivered (R275, R277, R279).
+    pub paseo_ended: Option<keeper_core::agents::log::PaseoBody>,
+    /// The Paseo completions a delegated session's room told this session,
+    /// by completion id: each is taken once (R96PA2-05).
+    pub(crate) paseo_heard: HashSet<String>,
+    /// By delegation, the event of the newest completion this session took
+    /// from its room: where reading the room back for completions stops,
+    /// whatever the latest brief is (R277). A live completion moves it only
+    /// while no readback of that room is owed; one that arrives while a
+    /// readback failed waits for it, so the cursor never passes a
+    /// completion that readback has not reached (R279).
+    pub(crate) paseo_cursor: HashMap<String, OwnedEventId>,
+    /// The session's anchored answers, followed as replay follows them: a
+    /// `heard` line cuts the answer it marks here as there (AD-411).
+    answers: Answers,
+    /// A gate session's allowances and open tickets, from its `gate` lines
+    /// (99.1 #6, #9); `None` in every other session, and in a gate whose
+    /// `[[gate]]` its home no longer has.
+    pub gate_ledger: Option<keeper_core::agents::gate::Ledger>,
+    /// A gate session's requests taken and not yet answered, given their
+    /// result or refused, by name (C6): what a restart refuses.
+    pub gate_pending: BTreeMap<String, GateOpen>,
+    /// The last `gate` line's request and state.
+    pub gate_last: Option<(String, keeper_core::agents::log::GateState)>,
+    /// A gate session's tickets handed on (codemap Q4), by ticket — the
+    /// delegation's own id (Q13): from its `delegate requested` line until
+    /// its reply or its refusal.
+    pub gate_deferred: BTreeMap<String, Deferred>,
+    /// A gate session's ticket results held for their declassification
+    /// (99.2 #3): the request's name, and the `declassify` approval whose
+    /// consumption sends its result — from its `held` line until the
+    /// request's `result` or `refused`.
+    pub gate_held: BTreeMap<String, String>,
+    /// A gate session's journal entries waiting for a person (99.2 #2), by
+    /// their approval's id: from the call's `memory asked` line until the
+    /// host settled it.
+    pub gate_journals: BTreeMap<String, JournalAsk>,
+    /// The current request's `reply` and `journal_append` calls in a gate
+    /// session, by `tool_call` line: wire id, tool, arguments.
+    gate_calls: HashMap<Ulid, (String, String, String)>,
+    /// Each `delegate` call's wire id, by its `tool_call` line.
+    delegate_call_ids: HashMap<Ulid, String>,
+}
+
+/// A gate's request not yet closed, as its lines say it (C6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GateOpen {
+    /// The request's own event.
+    pub event: Option<OwnedEventId>,
+    pub ticket: Option<String>,
+    /// Its `request` line: what its ticket's callback reads again (Q5).
+    pub line: Option<keeper_core::agents::log::GateBody>,
+}
+
+/// A gate's ticket handed on (codemap Q4): its delegation waits for a
+/// person's decision on its approval record, then runs, until its reply or
+/// its refusal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Deferred {
+    /// The approval record it waits for.
+    pub approval: String,
+    /// The agent it goes to, as the call named it.
+    pub to: String,
+    /// The `delegate` call's `tool_call` line, its wire id and arguments.
+    pub call_line: Ulid,
+    pub call_id: String,
+    pub args: String,
+    /// Its `approval requested` line is written: the card asks for it.
+    pub announced: bool,
+    /// Its approval ended: denied, consumed, expired or refused.
+    pub decided: bool,
+    /// Its delegation's room is made.
+    pub opened: bool,
+}
+
+/// A gate's `journal_append` waiting for a person on the hour's card
+/// (99.2 #2): the host writes its entry once its approval is consumed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JournalAsk {
+    pub call_line: Ulid,
+    pub call_id: String,
+    /// The call's arguments as the model sent them.
+    pub args: String,
+    /// Its `approval requested` line is written.
+    pub announced: bool,
+    /// Its approval ended.
+    pub decided: bool,
 }
 
 impl SessionContext {
@@ -317,6 +406,18 @@ impl SessionContext {
             return Err(ReplayRefusal::Conflicted.into());
         }
         let frozen = Frozen::read(home)?;
+        let gate_ledger = agent.gate.as_ref().and_then(|gate| {
+            home.config
+                .gates
+                .iter()
+                .find(|config| config.system == gate.system)
+                .map(|config| {
+                    keeper_core::agents::gate::Ledger::new(
+                        config,
+                        home.config.limits.max_concurrent_sessions,
+                    )
+                })
+        });
         let mut context = SessionContext {
             session,
             label: agent.label.clone(),
@@ -364,6 +465,21 @@ impl SessionContext {
             turn_tokens_at: 0,
             last_result: None,
             nudges: Default::default(),
+            run_allowances: Vec::new(),
+            gate_journal: None,
+            paseo_runs: std::collections::BTreeSet::new(),
+            paseo_ended: None,
+            paseo_heard: HashSet::new(),
+            paseo_cursor: HashMap::new(),
+            answers: Answers::default(),
+            gate_ledger,
+            gate_pending: BTreeMap::new(),
+            gate_last: None,
+            gate_deferred: BTreeMap::new(),
+            gate_held: BTreeMap::new(),
+            gate_journals: BTreeMap::new(),
+            gate_calls: HashMap::new(),
+            delegate_call_ids: HashMap::new(),
         };
         for stored in &log.lines {
             match &stored.body {
@@ -410,6 +526,17 @@ impl SessionContext {
             }
             return;
         }
+        // Where the person stopped listening cuts the answer it marks, as
+        // replay cuts it; the line stands for no message (AD-411).
+        if let Some(cut) = self.answers.observe(line) {
+            cut.apply(
+                self.placed
+                    .iter()
+                    .map(|(id, _)| *id)
+                    .zip(self.messages.iter_mut()),
+            );
+            return;
+        }
         match &line.body {
             // A label line holds the label after its join.
             LineBody::Label(body) => self.label = body.label(),
@@ -427,6 +554,37 @@ impl SessionContext {
                 if line.parent.is_none() || line.parent != self.last_result {
                     self.turn_tokens_at = self.tokens_spent;
                 }
+            }
+            // A ticket's callback reads its own request and the reply only
+            // (codemap Q5): the reply's receipt starts the conversation over
+            // at that request.
+            LineBody::Delegate(body)
+                if body.state == DelegateState::Replied && self.agent.kind == SessionKind::Gate =>
+            {
+                let request = self
+                    .gate_pending
+                    .values()
+                    .find(|open| open.ticket.as_deref() == Some(body.id.as_str()))
+                    .and_then(|open| open.line.as_ref())
+                    .and_then(keeper_core::agents::log::replay::request_message);
+                if let Some(request) = request {
+                    self.messages.clear();
+                    self.placed.clear();
+                    self.messages.push(request);
+                    self.placed.push((line.id, position));
+                    self.cut_off = false;
+                    self.turn_tokens_at = self.tokens_spent;
+                }
+                return;
+            }
+            // A gate's turn reads its one request (codemap Q5): the request
+            // starts the conversation over, as replay starts it over.
+            _ if keeper_core::agents::log::replay::starts_over(line) => {
+                self.messages.clear();
+                self.placed.clear();
+                self.unanswered = Some(line.id);
+                self.cut_off = false;
+                self.turn_tokens_at = self.tokens_spent;
             }
             LineBody::ToolResult(_) => self.last_result = Some(line.id),
             // A round that called tools is the middle of a turn (C6): a crash
@@ -481,6 +639,23 @@ impl SessionContext {
         }
     }
 
+    /// The `heard` line where the person stopped listening to the answer
+    /// `content` names, checked against that answer as the conversation
+    /// holds it and its offset counted here (Q9).
+    pub fn mark_heard(&self, content: &HeardContent) -> Result<Marked, HeardRefusal> {
+        self.answers.mark(content, |rounds| {
+            rounds
+                .iter()
+                .map(|round| {
+                    self.placed
+                        .iter()
+                        .position(|(id, _)| id == round)
+                        .map(|at| message_text(&self.messages[at]))
+                })
+                .collect()
+        })
+    }
+
     /// The calls a parked round left open, and its approvals.
     fn track(&mut self, line: &LogLine) {
         match &line.body {
@@ -498,12 +673,54 @@ impl SessionContext {
                     .retain(|(_, wire)| wire.id != result.call_id);
                 // An approval stays until every call of its round has its
                 // result, so a continuation a stop cut is resumed (R176).
-                for pending in self.parked.values_mut() {
-                    pending.round.retain(|id| *id != result.call_id);
+                // A gate's waits are ended by their approval's own lines
+                // alone: its calls have their results by then or after.
+                if self.agent.kind != SessionKind::Gate {
+                    for pending in self.parked.values_mut() {
+                        pending.round.retain(|id| *id != result.call_id);
+                    }
+                    self.parked.retain(|_, pending| !pending.round.is_empty());
                 }
-                self.parked.retain(|_, pending| !pending.round.is_empty());
             }
             LineBody::Approval(body) => match body.state {
+                // A gate's ticket, journal entry or held result waits outside
+                // any turn (codemap Q4, 99.2 #2, #3): its call has its result
+                // already, and nothing waits on it.
+                ApprovalState::Requested if self.agent.kind == SessionKind::Gate => {
+                    let waits = if let Some(deferred) = self
+                        .gate_deferred
+                        .values_mut()
+                        .find(|deferred| deferred.approval == body.id)
+                    {
+                        deferred.announced = true;
+                        Some((deferred.call_line, deferred.call_id.clone()))
+                    } else if let Some(ask) = self.gate_journals.get_mut(&body.id) {
+                        ask.announced = true;
+                        Some((ask.call_line, ask.call_id.clone()))
+                    } else if self.gate_held.values().any(|held| *held == body.id) {
+                        line.parent.and_then(|call_line| {
+                            let (call_id, ..) = self.gate_calls.get(&call_line)?;
+                            Some((call_line, call_id.clone()))
+                        })
+                    } else {
+                        None
+                    };
+                    if let Some((call_line, call_id)) = waits {
+                        self.parked.insert(
+                            body.id.clone(),
+                            crate::approvals::Pending {
+                                id: body.id.clone(),
+                                call_id: call_id.clone(),
+                                call_line,
+                                request_event: line.matrix_event.clone(),
+                                ended: None,
+                                round: vec![call_id],
+                                announced: true,
+                                ran: false,
+                            },
+                        );
+                    }
+                }
                 ApprovalState::Requested => {
                     let round = line
                         .parent
@@ -536,6 +753,19 @@ impl SessionContext {
                         pending.ended.get_or_insert(body.state);
                         pending.ran |= ran;
                     }
+                    // A gate's ended ticket waits no more: its settlement
+                    // has what it needs.
+                    if self.agent.kind == SessionKind::Gate {
+                        self.parked.remove(&body.id);
+                        for deferred in self.gate_deferred.values_mut() {
+                            if deferred.approval == body.id {
+                                deferred.decided = true;
+                            }
+                        }
+                        if let Some(ask) = self.gate_journals.get_mut(&body.id) {
+                            ask.decided = true;
+                        }
+                    }
                 }
                 _ => {}
             },
@@ -565,14 +795,96 @@ impl SessionContext {
     /// exchange, the delegations, the asks, the run.
     fn keep(&mut self, line: &LogLine) {
         match &line.body {
+            // A delivered end stands; a later capture — one adopted from the
+            // capture the room binds — stands for an earlier pending one.
+            LineBody::Paseo(ended) => {
+                let delivered = self.paseo_ended.as_ref().is_some_and(|held| {
+                    held.state == keeper_core::agents::log::PaseoState::Delivered
+                });
+                if !delivered {
+                    self.paseo_ended = Some(ended.clone());
+                }
+            }
             LineBody::Assistant(_) => self.tokens_spent += tokens_of(line),
+            LineBody::Gate(gate) => {
+                if let Some(ledger) = &mut self.gate_ledger {
+                    ledger.observe(gate);
+                }
+                use keeper_core::agents::log::GateState;
+                self.gate_last = Some((gate.request.clone(), gate.state));
+                match gate.state {
+                    GateState::Request => {
+                        self.gate_calls.clear();
+                        self.gate_pending.insert(
+                            gate.request.clone(),
+                            GateOpen {
+                                event: line.matrix_event.clone(),
+                                ticket: None,
+                                line: Some(gate.clone()),
+                            },
+                        );
+                    }
+                    GateState::Ticket => {
+                        if let Some(open) = self.gate_pending.get_mut(&gate.request) {
+                            open.ticket = gate.ticket.clone();
+                        }
+                    }
+                    GateState::Held => {
+                        if let Some(approval) = &gate.approval {
+                            self.gate_held
+                                .insert(gate.request.clone(), approval.clone());
+                        }
+                    }
+                    GateState::Answer | GateState::Result | GateState::Refused => {
+                        self.gate_held.remove(&gate.request);
+                        // A request refused as it was taken had no turn:
+                        // nothing waits for an answer.
+                        if self.gate_pending.remove(&gate.request).is_some()
+                            && gate.state == GateState::Refused
+                        {
+                            self.unanswered = None;
+                        }
+                    }
+                }
+            }
             LineBody::ToolCall(call) if call.tool == delegate::DELEGATE => {
                 self.delegate_calls.insert(line.id, call.args.clone());
+                self.delegate_call_ids.insert(line.id, call.call_id.clone());
             }
             LineBody::ToolCall(call) if call.tool == keeper_core::agents::workflow::BMAD_RENDER => {
                 self.renders.insert(call.call_id.clone(), call.args.clone());
             }
+            // A gate turn's answer and journal calls: what a held result's
+            // and a deferred entry's lines name (99.2 #2, #3).
+            LineBody::ToolCall(call)
+                if self.agent.kind == SessionKind::Gate
+                    && (call.tool == delegate::REPLY
+                        || call.tool == crate::memory::JOURNAL_APPEND) =>
+            {
+                self.gate_calls.insert(
+                    line.id,
+                    (call.call_id.clone(), call.tool.clone(), call.args.clone()),
+                );
+            }
+            LineBody::Memory(body) if body.op == keeper_core::agents::log::MemoryOp::Asked => {
+                let ask = line.parent.and_then(|call_line| {
+                    let (call_id, _, args) = self.gate_calls.get(&call_line)?;
+                    Some(JournalAsk {
+                        call_line,
+                        call_id: call_id.clone(),
+                        args: args.clone(),
+                        announced: false,
+                        decided: false,
+                    })
+                });
+                if let Some(ask) = ask {
+                    self.gate_journals.insert(body.reference.clone(), ask);
+                }
+            }
             LineBody::ToolResult(result) => {
+                if let Some(started) = &result.paseo {
+                    self.paseo_runs.insert(started.clone());
+                }
                 if let Some(args) = self.renders.remove(&result.call_id) {
                     let rendered = (args, result.content.clone());
                     if result.outcome == ToolOutcomeWord::Ok
@@ -648,9 +960,36 @@ impl SessionContext {
                 }
             },
             LineBody::Told(_) => self.told = true,
-            LineBody::Error(error) if error.code == LABEL_CODE => self.withheld = true,
+            LineBody::Error(error) if error.code == WITHHELD_CODE => self.withheld = true,
             LineBody::Error(error) if error.code == INTERRUPTED => self.cut_off = true,
             LineBody::Delegate(body) => match body.state {
+                // A gate's ticket handed on: its delegation waits for a
+                // person (codemap Q4); its call's arguments stay for the
+                // room's `opened`.
+                DelegateState::Requested => {
+                    let (Some(call_line), Some(approval)) = (line.parent, &body.approval) else {
+                        return;
+                    };
+                    let (Some(call_id), Some(args)) = (
+                        self.delegate_call_ids.get(&call_line),
+                        self.delegate_calls.get(&call_line),
+                    ) else {
+                        return;
+                    };
+                    self.gate_deferred.insert(
+                        body.id.clone(),
+                        Deferred {
+                            approval: approval.clone(),
+                            to: body.to.clone(),
+                            call_line,
+                            call_id: call_id.clone(),
+                            args: args.clone(),
+                            announced: false,
+                            decided: false,
+                            opened: false,
+                        },
+                    );
+                }
                 DelegateState::Opened => {
                     let (Some(room), Ok(to)) =
                         (&body.room, OwnedUserId::try_from(body.to.as_str()))
@@ -673,6 +1012,9 @@ impl SessionContext {
                             window: body.window.clone(),
                         },
                     );
+                    if let Some(deferred) = self.gate_deferred.get_mut(&body.id) {
+                        deferred.opened = true;
+                    }
                 }
                 DelegateState::Sent => {
                     if let Some(open) = self.delegations.get_mut(&body.id) {
@@ -686,14 +1028,32 @@ impl SessionContext {
                     self.exchange_rounds = 0;
                 }
                 DelegateState::Replied => {
-                    if let Some(open) = self.delegations.get_mut(&body.id) {
-                        open.replied = true;
-                        open.rounds = 0;
+                    // A run's end the delegated session's room was told is
+                    // taken beside the delegation's own reply: it closes no
+                    // round of the exchange.
+                    match body
+                        .reply
+                        .as_ref()
+                        .and_then(|reply| reply.completion.clone())
+                    {
+                        Some(completion) => {
+                            self.paseo_heard.insert(completion);
+                            if let Some(event) = &line.matrix_event {
+                                self.paseo_cursor.insert(body.id.clone(), event.clone());
+                            }
+                        }
+                        None => {
+                            if let Some(open) = self.delegations.get_mut(&body.id) {
+                                open.replied = true;
+                                open.rounds = 0;
+                            }
+                        }
                     }
                     if body.reply.is_some() {
                         self.reply_unpeered =
                             Some((line.id, line.matrix_event.clone(), body.clone()));
                     }
+                    self.gate_deferred.remove(&body.id);
                 }
                 DelegateState::Accepted => self.accepted = true,
                 // A brief its label no longer lets in is never sent: the
@@ -706,6 +1066,7 @@ impl SessionContext {
                     {
                         self.delegations.remove(&body.id);
                     }
+                    self.gate_deferred.remove(&body.id);
                 }
             },
             // The person's own words after a question was shown are all a
@@ -788,6 +1149,20 @@ impl SessionContext {
         self.delegations.values().find(|open| open.room == room)
     }
 
+    /// Whether a reply `content` from `open`'s target is one this session
+    /// takes now: the delegation's own while its latest round waits for
+    /// one; or a Paseo run's end the delegated session's follow session
+    /// told, answering that very session — the delegation's id — and not
+    /// taken before, whatever the delegation's own reply did (R96PA2-05).
+    pub fn takes_reply(&self, open: &Delegation, content: &Value) -> bool {
+        match keeper_core::agents::paseo::completion_of(content) {
+            Some((completion, session)) => {
+                open.sent && session == open.id && !self.paseo_heard.contains(completion)
+            }
+            None => open.sent && !open.replied,
+        }
+    }
+
     /// The agents this session's room sends pass between, left out of its
     /// audience (R94): its own agent `me`, and the requester of a session
     /// that answers one — a delegated session, a workflow's run (R104) —
@@ -847,6 +1222,10 @@ impl SessionContext {
         context: Option<&ContextBundle>,
         tools: &[chat::ToolSpec],
     ) -> ComposedPrompt {
+        // A gate is told its soul and its frame only (codemap Q16).
+        if self.agent.kind == SessionKind::Gate {
+            return prompt::compose_gate(&self.soul, &self.facts, &self.frame(deps, tools));
+        }
         prompt::compose(&PromptInput {
             soul: &self.soul,
             facts: &self.facts,
@@ -1011,6 +1390,20 @@ pub struct AgentDeps {
     /// a test world or agentd's prompt preview has it, refuses it with
     /// [`UNATTENDED_REFUSAL`].
     pub decisions: Option<Arc<dyn crate::approvals::DecisionSource>>,
+    /// This host's sandbox, when its probe passed (96.1 #11): `run` is
+    /// offered only with it, and never runs without it.
+    pub sandbox: Option<Arc<crate::run::SandboxHost>>,
+    /// The MCP servers this host names (96.2): an agent is offered the
+    /// tools of those its `[tools].mcp` lists while they answer.
+    pub mcp: Option<Arc<crate::mcp::McpServers>>,
+    /// The KVMs this host names (96.5, AD-409), each with the credential
+    /// its secret store holds: an agent is offered `kvm_snapshot` and
+    /// `kvm_act` for the classic NanoKVMs its `[host].needs` names as
+    /// `kvm:<id>`; a NanoKVM-Go is reached through `mcp`.
+    pub kvm: Option<Arc<crate::kvm::Kvms>>,
+    /// The tickets this agent's gate sessions hold open on this host, one
+    /// count for all of its `[[gate]]`s (99.1 #6).
+    pub gate_tickets: Arc<crate::gate::OpenTickets>,
 }
 
 impl AgentDeps {
@@ -1046,6 +1439,15 @@ struct AllowedTools<'t> {
     memory: crate::memory::MemoryTools,
     /// `drive_search` (95.4).
     search: crate::search::SearchTools,
+    /// `run` (96.1): this host's sandbox and where this session's runs
+    /// work; `None` where the host offers no `sandbox`.
+    runs: Option<RunTools>,
+    /// The agent's MCP servers on this host (96.2); `None` where it names
+    /// none.
+    mcp: Option<McpTools>,
+    /// The agent's classic NanoKVMs on this host (96.5); `None` where it
+    /// may use none.
+    kvm: Option<KvmTools>,
     view: &'t dyn TurnView,
     sinks: &'t Sinks,
     /// The declarations of the drives this host mounts: a write's audience.
@@ -1076,21 +1478,30 @@ struct AllowedTools<'t> {
     nobody_to_ask: bool,
     /// `helper`: the round's helpers run side by side (R110).
     helpers: crate::helper::Helpers<'t>,
+    /// A gate turn's offer, by wire name: its dispatch mirrors it, so a
+    /// name the turn was not offered is refused [`NOT_OFFERED`] unrun,
+    /// whatever `[tools].allow` says (R369); `None` outside a gate.
+    only_offered: Option<Vec<String>>,
+    /// A gate session's journal allowance a person gave for the session
+    /// (99.2 #2): while it covers the server's now, an entry goes unasked.
+    gate_journal: Option<keeper_core::agents::gate::JournalAllowance>,
 }
 
 /// A consumed approval as the one execution of its call holds it: the
-/// call's wire id and tool, the record, and the flow a `declassify`
-/// approval releases (R89).
+/// call's wire id and tool, the record, the flow a `declassify` approval
+/// releases (R89), and what a `run` or an MCP approval was checked against
+/// before it was consumed (R213, R144).
 struct Bound {
     call: String,
     tool: String,
     approval: Ulid,
     released: Option<crate::approvals::Released>,
+    run: Option<Box<crate::approvals::ApprovedRun>>,
 }
 
 /// Why a bound call that would now reach someone its approval did not name
 /// does not run.
-const AUDIENCE_MOVED: &str = "who it would reach changed after it was approved";
+pub(crate) const AUDIENCE_MOVED: &str = "who it would reach changed after it was approved";
 
 /// Where `subpath` of the drive checked out at `profile` lands, as
 /// drive-relative names: keeper-sync's landing, every link followed. The
@@ -1130,6 +1541,27 @@ impl AllowedTools<'_> {
             ..self.context()
         };
         let classification = tier::classify(tool, facts, &context);
+        self.keep_tier(id, classification)
+    }
+
+    /// [`Self::classify`] for a call whose target is reached through a KVM
+    /// when `via_kvm` (R22): a NanoKVM-Go's MCP server.
+    fn classify_via(
+        &self,
+        id: &str,
+        tool: AgentTool,
+        facts: &CallFacts,
+        via_kvm: bool,
+    ) -> Classification {
+        let context = Context {
+            via_kvm,
+            ..self.context()
+        };
+        let classification = tier::classify(tool, facts, &context);
+        self.keep_tier(id, classification)
+    }
+
+    fn keep_tier(&self, id: &str, classification: Classification) -> Classification {
         self.tiers
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -1172,6 +1604,7 @@ impl AllowedTools<'_> {
         call: &chat::ToolCall,
         approval: Ulid,
         released: Option<crate::approvals::Released>,
+        approved_run: Option<Box<crate::approvals::ApprovedRun>>,
         run: impl FnOnce() -> R,
     ) -> R {
         *self.bound.lock().unwrap_or_else(|p| p.into_inner()) = Some(Bound {
@@ -1179,6 +1612,7 @@ impl AllowedTools<'_> {
             tool: call.name.clone(),
             approval,
             released,
+            run: approved_run,
         });
         let ran = run();
         *self.bound.lock().unwrap_or_else(|p| p.into_inner()) = None;
@@ -1194,6 +1628,24 @@ impl AllowedTools<'_> {
             .as_ref()
             .filter(|bound| bound.call == id && bound.tool == tool)
             .map(|bound| bound.approval)
+    }
+
+    /// What the consumed approval call `id`, a `run`, runs on was checked
+    /// against, while it is the bound call's execution.
+    fn bound_run(&self, id: &str) -> Option<Box<crate::approvals::ApprovedRun>> {
+        self.bound_checked(id, keeper_core::agents::run::RUN)
+    }
+
+    /// What the consumed approval call `id` of `tool` — a `run` or an MCP
+    /// call — runs on was checked against before it was consumed, while it
+    /// is the bound call's execution.
+    fn bound_checked(&self, id: &str, tool: &str) -> Option<Box<crate::approvals::ApprovedRun>> {
+        self.bound
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .filter(|bound| bound.call == id && bound.tool == tool)
+            .and_then(|bound| bound.run.clone())
     }
 
     /// What classified call `id` to `recipients` comes to once its sinks
@@ -1234,8 +1686,30 @@ impl AllowedTools<'_> {
             classification: classification.clone(),
             pins,
             declassify: None,
+            exec_binding: Value::Null,
+            workspace: None,
+            preview: None,
+            screen: None,
+            args: None,
         });
         Gated::Park(approval)
+    }
+
+    /// What a gate's delegation comes to (codemap Q4): the integrity
+    /// rule's block or T5 refuse it; anything else waits for a person on a
+    /// new approval record, outside the turn — never run unasked, never a
+    /// park of the gate's one worker.
+    fn deferred(
+        &self,
+        tool: &str,
+        classification: &Classification,
+        recipients: &[Recipient],
+    ) -> Gated {
+        match check_call(&self.view.label(), tool, classification.tier, recipients) {
+            CallVerdict::Block { reason } => Gated::Refuse(reason),
+            _ if classification.gate() == Gate::Refuse => Gated::Refuse(FORBIDDEN.to_owned()),
+            _ => Gated::Park(Ulid::new()),
+        }
     }
 
     /// Where a card tool's call lands, as it runs it: `card_update`'s card,
@@ -1256,6 +1730,17 @@ impl AllowedTools<'_> {
     /// its facts read as [`ToolHost::run`] and [`ToolHost::run_named`] read
     /// them when it runs.
     fn table_tier(&self, wire: &chat::ToolCall, default_profile_id: &str) -> u8 {
+        let context = self.context();
+        if let Some(listed) = self.mcp_offered(&wire.name) {
+            let facts = mcp_facts(&listed, wire.arguments.as_ref());
+            let context = Context {
+                via_kvm: kvm_role(&listed),
+                ..context
+            };
+            return tier::classify(AgentTool::Mcp, &facts, &context)
+                .tier
+                .as_u8();
+        }
         let Some(tool) = AgentTool::from_wire(&wire.name) else {
             return 0;
         };
@@ -1265,13 +1750,16 @@ impl AllowedTools<'_> {
                 self.landed_facts(&call.target.profile_id, &call.target.subpath)
             }
             Ok(_) => CallFacts::default(),
+            Err(_) if tool == AgentTool::KvmAct => keeper_core::agents::kvm::parse_act(args)
+                .map(|act| keeper_core::agents::kvm::act_facts(&act))
+                .unwrap_or_default(),
             Err(_) if crate::cards::is_card_tool(&wire.name) => {
                 let landed = self.landed_facts(&self.home.id, &self.card_at(tool, args));
                 tier::named_facts(tool, args, landed)
             }
             Err(_) => tier::named_facts(tool, args, CallFacts::default()),
         };
-        let context = self.context();
+
         tier::classify(tool, &facts, &context).tier.as_u8()
     }
 
@@ -1492,6 +1980,1568 @@ impl crate::helper::Parent for AllowedTools<'_> {
     }
 }
 
+/// What a turn's `run` calls work with (96.1): this host's sandbox, the
+/// session's place in its sessions zone, the drives in its scope this host
+/// mounts and the agent's grants let it read, the `session` approvals this
+/// host holds for it, and the label of what each run could read, taken by
+/// the call's result.
+struct RunTools {
+    host: Arc<crate::run::SandboxHost>,
+    /// The home drive's checkout and its sessions zone's folder in it.
+    drive: PathBuf,
+    zone: String,
+    session: String,
+    drives: Vec<(String, PathBuf)>,
+    allowances: Vec<keeper_core::agents::run::RunAllowance>,
+    labels: Mutex<Vec<Label>>,
+}
+
+impl RunTools {
+    /// The label of the run the call that just ended made, if it ran.
+    fn take_label(&self) -> Option<Label> {
+        self.labels.lock().unwrap_or_else(|p| p.into_inner()).pop()
+    }
+}
+
+/// What a turn's MCP calls work with (96.2): the host's servers, the ones
+/// the agent's `[tools].mcp` names, the turn's stop, which cancels a call
+/// in flight, and what each answer that just came back is labelled and how
+/// much of it was shown.
+struct McpTools {
+    servers: Arc<crate::mcp::McpServers>,
+    names: Vec<String>,
+    stop: CancelSignal,
+    answers: Mutex<Vec<McpAnswered>>,
+    /// The sessions zone: where a screen action's preview is kept (S-18).
+    zone: PathBuf,
+    /// The session's folder on this host: whose screen reads are this
+    /// session's (R316).
+    session: String,
+    /// What keeper's own screenshot of the Mac's screen for a parked call
+    /// joins into the session's label before the card carries it to anyone
+    /// (R316), and the capability it came from.
+    pinned: Mutex<Option<(Label, String)>>,
+}
+
+/// One answer a call just got: the label it joins, when it was cut how
+/// much of it was shown, the Paseo run it started, which its result's line
+/// records, and the Paseo run end it captured, which the line after it
+/// does (R275).
+struct McpAnswered {
+    label: Label,
+    at: String,
+    truncated: Option<Truncated>,
+    started: Option<keeper_core::agents::paseo::Started>,
+    ended: Option<keeper_core::agents::log::PaseoBody>,
+}
+
+impl McpTools {
+    /// The answer the call that just ended got, if it got one.
+    fn take(&self) -> Option<McpAnswered> {
+        self.answers.lock().unwrap_or_else(|p| p.into_inner()).pop()
+    }
+}
+
+/// A screen action as keeper read it (96.4, R316): what it acts on,
+/// everything it was classified by and its tier by that, the read its
+/// element came from and the snapshot keeper sends the call with when the
+/// model named none, the window keeper read in front for an action with no
+/// element and the one window its arguments name, and for a call an
+/// approval bound the target it bound.
+struct ScreenAim {
+    aim: keeper_core::agents::screen::Aim,
+    facts: Vec<keeper_core::agents::screen::Facts>,
+    tier: Tier,
+    element: Option<(
+        keeper_core::agents::screen::Read,
+        keeper_core::agents::screen::Element,
+    )>,
+    snapshot: Option<String>,
+    front: Option<keeper_core::agents::screen::Read>,
+    named: Option<(String, String)>,
+    approved: Option<Value>,
+}
+
+/// What keeper took of the screen before a screen action parks: the
+/// record's `preconditions.preview` and `preconditions.screen`, and the
+/// window keeper read under a click at coordinates, which its card names.
+struct ScreenPinned {
+    preview: Value,
+    pin: Value,
+    under: Option<String>,
+}
+
+impl AllowedTools<'_> {
+    /// `listed`, a screen server's tool, called with `args`: refused when it
+    /// names a file, a question for Peekaboo's AI or a target keeper cannot
+    /// read; else what it acts on as keeper read it — an element by the read
+    /// this session's model made of it (binding that read's snapshot when
+    /// the call names none), anything else by the window keeper reads in
+    /// front now together with the window its arguments name in keeper's
+    /// own list — refused when they name no window there or more than one
+    /// (R328) — or, for a call an approval bound, as the approval bound it
+    /// (`approved`), with no read of its own (R316).
+    fn screen_aim(
+        &self,
+        listed: &crate::mcp::Listed,
+        args: &Value,
+        approved: Option<&Value>,
+    ) -> Result<ScreenAim, String> {
+        use keeper_core::agents::screen::{self, Facts};
+        let tool = listed.tool.as_str();
+        if let Some(reason) = screen::refusal(tool, args) {
+            return Err(reason);
+        }
+        let aim = screen::aim(tool, args);
+        let aimed = |facts: Vec<Facts>| ScreenAim {
+            tier: screen::tier_over(tool, args, &aim, &facts),
+            aim: aim.clone(),
+            facts,
+            element: None,
+            snapshot: None,
+            front: None,
+            named: None,
+            approved: None,
+        };
+        if let Some(target) = approved {
+            let facts = screen::facts_of_target(target).ok_or_else(|| {
+                "Its approval bound no target keeper reads. Nothing was sent.".to_owned()
+            })?;
+            return Ok(ScreenAim {
+                approved: Some(target.clone()),
+                ..aimed(facts)
+            });
+        }
+        // A read, or a list, reads: nothing of the screen classifies it.
+        if screen::tier(tool, args, &aim, &Facts::default()) == Tier::T0 {
+            return Ok(aimed(Vec::new()));
+        }
+        let tools = self
+            .mcp
+            .as_ref()
+            .ok_or_else(|| "this agent has no screen server here".to_owned())?;
+        let servers = &tools.servers;
+        let server = listed.server.as_str();
+        if let screen::Aim::Element { snapshot, id } = &aim {
+            let read = servers.kept_read(server, &tools.session, snapshot.as_deref());
+            let Some((read, element)) = read.and_then(|read| {
+                let element = read.element(id)?.clone();
+                Some((read, element))
+            }) else {
+                return Err(format!(
+                    "keeper has not read the element {id:?} of this screen in this session{}. Read the screen with `inspect_ui` or `see`, then name an element from that read. Nothing was sent.",
+                    if snapshot.is_some() { " in that snapshot" } else { "" }
+                ));
+            };
+            return Ok(ScreenAim {
+                snapshot: snapshot.is_none().then(|| read.snapshot.clone()),
+                element: Some((read.clone(), element.clone())),
+                ..aimed(vec![Facts::of_element(&read, &element)])
+            });
+        }
+        let refused = |what: String| format!("{what}. Nothing was sent.");
+        let front = delegate::block_on(servers.front(server)).map_err(|why| {
+            refused(format!(
+                "keeper could not read the window in front to know what this acts on: {why}"
+            ))
+        })?;
+        let of_args = Facts::of_args(args);
+        let mut facts = vec![
+            of_args.clone(),
+            Facts::of_window(&front.app, &front.window, &of_args),
+        ];
+        let mut named = None;
+        let (app, window) = screen::targets(tool, args);
+        if app.is_some() || window.is_some() {
+            // The app a call names is the model's word, sent to the server
+            // to list its windows: only where the session may send to it.
+            if app.is_some() {
+                if let Some(entry) = servers.entry(server) {
+                    if let SinkVerdict::Block { reason, .. } =
+                        check_sink(&self.view.label(), &keeper_core::agents::mcp::sink(entry))
+                    {
+                        return Err(format!(
+                            "{reason} The MCP server `{server}` is read by fewer people than this session. Nothing was sent to it."
+                        ));
+                    }
+                }
+            }
+            let app = app.unwrap_or_else(|| front.app.clone());
+            let windows = delegate::block_on(servers.windows(server, &app)).map_err(|why| {
+                refused(format!(
+                    "keeper did not find {app:?} among the Mac's applications ({why})"
+                ))
+            })?;
+            // The call is pinned by the window it names, so it names one:
+            // two Peekaboo could choose between — an app with two windows,
+            // a part of a title two hold — are refused (R328).
+            let titles = screen::named_titles(tool, args, &windows);
+            let [title] = titles.as_slice() else {
+                return Err(refused(match &window {
+                    Some(part) if titles.is_empty() => format!(
+                        "keeper did not find a window of {} whose title holds {part:?}",
+                        windows.app
+                    ),
+                    _ => format!(
+                        "keeper found {} windows of {} this names, and it acts on one; name that window by its `window_title`",
+                        titles.len(),
+                        windows.app
+                    ),
+                }));
+            };
+            // A global hotkey lands on the window in front, whatever it
+            // names: that is the one it is pinned by.
+            if !screen::to_the_front(tool, args) {
+                named = Some((windows.app.clone(), title.clone()));
+            }
+            facts.push(Facts::of_window(&windows.app, "", &of_args));
+            facts.push(Facts::of_window(&windows.app, title, &of_args));
+        }
+        Ok(ScreenAim {
+            front: Some(front),
+            named,
+            ..aimed(facts)
+        })
+    }
+
+    /// What a screen action that waits for a person is decided on and
+    /// checked against again (96.4 #4, S-18, R316): a screenshot keeper
+    /// takes itself, kept under the zone's `.keeper/previews/` by its
+    /// SHA-256 — the record's `preview` — and the element as keeper read
+    /// it; for a click at coordinates the square it lands in by its
+    /// difference hash; for anything else the window it acts on — the one
+    /// its arguments name, else the one in front — by its application,
+    /// title and frame as keeper lists them and the hash of that frame;
+    /// the record's `preconditions.screen`. Refused when no such window
+    /// reads. The screenshot joins the screen server's readers into the
+    /// session's label before the card carries it anywhere.
+    fn screen_pin(
+        &self,
+        tools: &McpTools,
+        entry: &keeper_core::agents::mcp::McpEntry,
+        at: &str,
+        aimed: &ScreenAim,
+    ) -> Result<ScreenPinned, String> {
+        use keeper_core::agents::screen::{self, Aim, Pin};
+        let server = entry.name.as_str();
+        let unpinned = |why: String| {
+            format!("keeper could not take the screenshot this would be decided on: {why}. Nothing was sent.")
+        };
+        let front = aimed.front.as_ref();
+        // The window the action acts on, read before the screenshot as the
+        // consume path reads it again: its application, title, frame and
+        // whether it is the one in front.
+        let window = match &aimed.aim {
+            Aim::Screen => {
+                let (app, title, in_front) = match (&aimed.named, front) {
+                    (Some((app, title)), _) => (app.clone(), title.clone(), false),
+                    (None, Some(front)) => (front.app.clone(), front.window.clone(), true),
+                    (None, None) => return Err(unpinned("no window in front reads".to_owned())),
+                };
+                if title.is_empty() {
+                    return Err(unpinned("no window in front reads".to_owned()));
+                }
+                let windows =
+                    delegate::block_on(tools.servers.windows(server, &app)).map_err(unpinned)?;
+                let [frame] = windows.titled(&title)[..] else {
+                    return Err(unpinned(format!(
+                        "{app}'s list does not name exactly one window {title:?}"
+                    )));
+                };
+                Some((windows.app, title, frame, in_front))
+            }
+            _ => None,
+        };
+        // A click at coordinates names the window under it only when the
+        // one keeper read in front is there.
+        let under = match (&aimed.aim, front) {
+            (Aim::Point { x, y }, Some(front)) if !front.window.is_empty() => {
+                delegate::block_on(tools.servers.windows(server, &front.app))
+                    .ok()
+                    .and_then(|windows| match windows.titled(&front.window)[..] {
+                        [frame]
+                            if (frame.x..frame.x.saturating_add(frame.w)).contains(x)
+                                && (frame.y..frame.y.saturating_add(frame.h)).contains(y) =>
+                        {
+                            Some(front.window.clone())
+                        }
+                        _ => None,
+                    })
+            }
+            _ => None,
+        };
+        let png = delegate::block_on(tools.servers.screenshot(server)).map_err(unpinned)?;
+        let grey = crate::previews::grey(&png).map_err(unpinned)?;
+        let outside = || unpinned("what it acts on is outside the screenshot".to_owned());
+        let pin = match (&aimed.aim, &aimed.element, window) {
+            (Aim::Element { .. }, Some((read, element)), _) => {
+                Pin::Element(screen::element_pin(read, element))
+            }
+            (Aim::Point { x, y }, _, _) => Pin::Region(
+                screen::region_around(*x, *y, grey.width, grey.height)
+                    .and_then(|rect| {
+                        screen::region_pin(&grey.pixels, grey.width, grey.height, rect)
+                    })
+                    .ok_or_else(outside)?,
+            ),
+            (_, _, Some((app, title, frame, in_front))) => Pin::Window(
+                screen::window_pin(
+                    &app,
+                    &title,
+                    frame,
+                    in_front,
+                    &grey.pixels,
+                    grey.width,
+                    grey.height,
+                )
+                .ok_or_else(outside)?,
+            ),
+            _ => return Err(unpinned("keeper read nothing it acts on".to_owned())),
+        };
+        let sha256 = off_the_runtime(|| crate::previews::write(&tools.zone, &png, "png")).map_err(
+            |error| unpinned(format!("its preview could not be kept ({})", error.kind())),
+        )?;
+        // The screenshot is outside content read by the screen server's
+        // readers: the card that carries it goes to no one else.
+        *tools.pinned.lock().unwrap_or_else(|p| p.into_inner()) =
+            Some((keeper_core::agents::mcp::result_label(entry), at.to_owned()));
+        Ok(ScreenPinned {
+            preview: json!({"sha256": sha256, "ext": "png"}),
+            pin: pin.value(),
+            under,
+        })
+    }
+}
+
+/// What a turn's KVM calls work with (96.5): the host's KVMs, the classic
+/// ones this agent may use, the sessions zone its previews are kept in, and
+/// what each frame that just came back is labelled.
+struct KvmTools {
+    kvms: Arc<crate::kvm::Kvms>,
+    ids: Vec<String>,
+    zone: PathBuf,
+    answers: Mutex<Vec<KvmAnswered>>,
+}
+
+/// One KVM call's answer: the label its frame joins, where it was read,
+/// what keeper knows of the effect of inputs it sent, and whether they
+/// stopped part way (its line's outcome is then `failed`, R96K1-07).
+struct KvmAnswered {
+    label: Label,
+    at: String,
+    effect: Option<&'static str>,
+    stopped: bool,
+}
+
+impl KvmTools {
+    /// The answer the call that just ended got, if it got one.
+    fn take(&self) -> Option<KvmAnswered> {
+        self.answers.lock().unwrap_or_else(|p| p.into_inner()).pop()
+    }
+}
+
+/// The classic NanoKVMs an agent may use on this host: those its
+/// `[host].needs` names as `kvm:<id>`, when `[tools].allow` names a KVM
+/// tool. A NanoKVM-Go is not one of them: its own MCP server speaks it.
+fn kvm_ids(
+    config: &keeper_core::agents::home::AgentConfig,
+    kvms: Option<&crate::kvm::Kvms>,
+) -> Vec<String> {
+    use keeper_core::agents::kvm as core_kvm;
+    let Some(kvms) = kvms else {
+        return Vec::new();
+    };
+    if !config
+        .allow
+        .iter()
+        .any(|name| name == core_kvm::SNAPSHOT || name == core_kvm::ACT)
+    {
+        return Vec::new();
+    }
+    let classic: Vec<&str> = kvms.ids(core_kvm::KvmKind::NanoKvm).collect();
+    config
+        .host
+        .needs
+        .iter()
+        .filter_map(|need| need.strip_prefix(core_kvm::CAPABILITY_PREFIX))
+        .filter(|id| classic.contains(id))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The drives a run of `context`'s session may mount on this host: in its
+/// scope, checked out here, and readable under the agent's grants exactly
+/// as a `drive_read` of the drive is (NFR-115, R213).
+pub(crate) fn run_drives(context: &SessionContext, deps: &AgentDeps) -> Vec<(String, PathBuf)> {
+    let grants = agent_grants(context, deps);
+    deps.env
+        .drive
+        .as_ref()
+        .map(|drive| drive.profiles.profiles())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|profile| context.scope.contains(&profile.id))
+        .filter(|profile| grant_read(&*grants, &profile.id, "").is_ok())
+        .map(|profile| (profile.id, profile.local_path))
+        .collect()
+}
+
+impl AllowedTools<'_> {
+    /// A `run` call (96.1, D-33), in the order every call keeps (R82,
+    /// R90): what it relies on read and its tier classified from that;
+    /// T5 refused; a call an approval bound runs only on the facts that
+    /// approval was checked against (R213); its writable workspace checked
+    /// as a write to the session's home drive, against the label joined with
+    /// every drive it would read (R213); a networked run — a send to anyone
+    /// (AD-391) — only on its own T3 approval, which names the workspace set
+    /// it releases (R145, S-03); a T2 run a `session` approval covers goes
+    /// without asking (R146); its one audit row before the program starts;
+    /// then the sandboxed run, its result labelled by what the run could
+    /// read.
+    fn run_command(&self, wire: &chat::ToolCall) -> ToolOutcome {
+        use keeper_core::agents::run as core_run;
+        let tool = AgentTool::Run;
+        let name = wire.name.as_str();
+        let args = wire.arguments.as_ref().unwrap_or(&Value::Null);
+        let at = format!(
+            "{}/{}",
+            self.session_dir,
+            keeper_core::sessions::model::WORKSPACE_DIR
+        );
+        let drive = self.home.id.clone();
+        let ready = self
+            .runs
+            .as_ref()
+            .filter(|_| self.allow.iter().any(|allowed| allowed == core_run::RUN))
+            .ok_or_else(|| format!("{name} is not one of this agent's tools on this host."))
+            .and_then(|runs| {
+                let session = crate::run::Session {
+                    drive: &runs.drive,
+                    zone: &runs.zone,
+                    path: &runs.session,
+                };
+                runs.host
+                    .prepare(args, session, &runs.drives)
+                    .map(|prepared| (prepared, runs))
+            });
+        let facts = ready.as_ref().map_or_else(
+            |_| CallFacts::default(),
+            |(prepared, _)| prepared.call_facts,
+        );
+        let classification = self.classify(&wire.id, tool, &facts, None);
+        let refused = |reason: String| {
+            CallAudit::new(
+                self.sinks,
+                name,
+                Effect::Write,
+                &classification,
+                Gated::Run(self.bound_approval(&wire.id, name).map(Approval::Approved)),
+                (&drive, &at),
+            )
+            .refuse(reason)
+        };
+        let (prepared, runs) = match ready {
+            Ok(ready) => ready,
+            Err(reason) => return refused(reason),
+        };
+        if classification.gate() == Gate::Refuse {
+            return refused(core_run::PRIVILEGED.to_owned());
+        }
+        let bound = self.bound_approval(&wire.id, name);
+        if bound.is_some() {
+            let held = self.bound_run(&wire.id).is_some_and(|approved| {
+                approved.exec_binding == prepared.exec_binding
+                    && approved.workspace == prepared.workspace_set
+            });
+            if !held {
+                tracing::warn!(call = %wire.id, "agents: a run changed between its approval's check and its start");
+                return refused(
+                    "This run was refused: where it runs, its program, the code it runs or its workspace changed after it was approved. Nothing was run.".to_owned(),
+                );
+            }
+        }
+        // Its workspace is written, whatever the program does: a write to
+        // the session's home drive, by the label as it would be once the
+        // run read every drive it mounts.
+        let reading = self.view.label().join(&core_run::result_label(
+            false,
+            &crate::run::mounted_labels(&prepared.mounted, self.drives),
+        ));
+        let home_readers = Sink::DriveWrite {
+            drive_readers: Readers::Only(self.home.readers.clone()),
+        };
+        if let SinkVerdict::Block { reason, .. } = check_sink(&reading, &home_readers) {
+            return refused(format!(
+                "This run was refused: its workspace is on {drive}, and {reason}"
+            ));
+        }
+        let blocked = match check_sink(&self.view.label(), &core_run::network_sink()) {
+            SinkVerdict::Block { reason, .. } if prepared.request.network && bound.is_none() => {
+                Some(reason)
+            }
+            _ => None,
+        };
+        let allowed = runs
+            .allowances
+            .iter()
+            .filter(|_| bound.is_none())
+            .filter(|_| {
+                !matches!(
+                    check_call(&self.view.label(), name, classification.tier, &[]),
+                    CallVerdict::Block { .. }
+                )
+            })
+            .find(|allowance| {
+                allowance.covers(
+                    &prepared.exec_binding,
+                    classification.tier,
+                    self.agent.kind,
+                    chrono::Utc::now(),
+                )
+            })
+            .and_then(|allowance| Ulid::from_string(&allowance.approval).ok());
+        let gated = match allowed {
+            Some(approval) => Gated::Run(Some(Approval::Approved(approval))),
+            None => match self.gated(&wire.id, name, &classification, &[], Vec::new()) {
+                Gated::Park(approval) => {
+                    if let Some(parking) = self
+                        .parked
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .as_mut()
+                    {
+                        parking.exec_binding = prepared.exec_binding.clone();
+                        parking.workspace = prepared.workspace_set.clone();
+                    }
+                    Gated::Park(approval)
+                }
+                // Nobody can be asked: a networked run says what blocks it.
+                Gated::Refuse(reason) => Gated::Refuse(blocked.unwrap_or(reason)),
+                gated => gated,
+            },
+        };
+        let audit = CallAudit::new(
+            self.sinks,
+            name,
+            Effect::Write,
+            &classification,
+            gated,
+            (&drive, &at),
+        );
+        if let Err(withheld) = audit.admit(&drive, &at) {
+            let outcome = withheld.into();
+            audit.finish(&outcome);
+            return outcome;
+        }
+        let outcome = match crate::agent::off_the_runtime(|| runs.host.execute(&prepared)) {
+            Ok(ran) => {
+                runs.labels
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push(core_run::result_label(
+                        prepared.request.network,
+                        &crate::run::mounted_labels(&prepared.mounted, self.drives),
+                    ));
+                ToolOutcome::Answered { text: ran.render() }
+            }
+            Err(reason) => ToolOutcome::Refused { reason },
+        };
+        audit.finish(&outcome);
+        outcome
+    }
+}
+
+impl AllowedTools<'_> {
+    /// The tool `wire` names among this agent's servers on this host, while
+    /// its server answers and the tool is offered.
+    fn mcp_offered(&self, wire: &str) -> Option<crate::mcp::Listed> {
+        let tools = self.mcp.as_ref()?;
+        tools.servers.offered(&tools.names, wire)
+    }
+
+    /// An MCP call (96.2, AD-406), in the order every call keeps (R82,
+    /// R90), every fact of it read from one listing of its server, taken
+    /// once here: its tier by its server's rule; arguments that are not a
+    /// JSON object refused, never sent as another call (R225); Paseo's
+    /// mutations refused outright in an `untrusted` session (R143/Q3); T5
+    /// refused; a send to the server's readers checked before anything
+    /// reaches it (#8, AD-391) — for Paseo's broker by what the call sends
+    /// of the session (96.3 #7): a read that carries nothing passes, a run
+    /// this session did not start is blocked, and starting or steering one
+    /// parks, its approval the declassification of the prompt (R145/Q5);
+    /// a call that needs a person parks on a record binding which server
+    /// that listing's connection reached and the tool's definition and tier
+    /// there (R144); a call an approval let through runs only while that
+    /// binding is still what the consume path checked; its one audit row
+    /// before the call; then the call on its own task, sent on that
+    /// listing's connection only while it is the live one and the tool
+    /// unchanged, cancelled by the turn's stop, its answer — a result or the
+    /// server's error — outside content labelled `untrusted` and read by the
+    /// server's readers (#7).
+    fn mcp_call(&self, wire: &chat::ToolCall) -> ToolOutcome {
+        use keeper_core::agents::mcp as core_mcp;
+        use keeper_core::agents::paseo as core_paseo;
+        let name = wire.name.as_str();
+        let at = core_mcp::decode(name)
+            .map(|(server, tool)| format!("{}{server}/{tool}", core_mcp::CAPABILITY_PREFIX))
+            .unwrap_or_default();
+        let offered = self.mcp_offered(name);
+        // A screen action is classified by what keeper read of its target
+        // (96.4 #2): an element by Peekaboo's read, an approved one by what
+        // its approval bound.
+        let screen = offered
+            .as_ref()
+            .filter(|listed| listed.role() == Some(&core_mcp::McpRole::Screen))
+            .map(|listed| {
+                let approved = self
+                    .bound_checked(&wire.id, name)
+                    .map(|run| run.exec_binding["target"].clone());
+                self.screen_aim(
+                    listed,
+                    wire.arguments.as_ref().unwrap_or(&Value::Null),
+                    approved.as_ref(),
+                )
+            });
+        let mut facts = offered.as_ref().map_or_else(CallFacts::default, |listed| {
+            mcp_facts(listed, wire.arguments.as_ref())
+        });
+        if let Some(Ok(aimed)) = &screen {
+            facts.mcp = Some(aimed.tier);
+        }
+        // A NanoKVM-Go's tools reach another machine through it (R22).
+        let via_kvm = offered.as_ref().is_some_and(kvm_role);
+        let classification = self.classify_via(&wire.id, AgentTool::Mcp, &facts, via_kvm);
+        let refused = |reason: String| {
+            CallAudit::new(
+                self.sinks,
+                name,
+                Effect::Write,
+                &classification,
+                Gated::Run(self.bound_approval(&wire.id, name).map(Approval::Approved)),
+                ("", &at),
+            )
+            .refuse(reason)
+        };
+        let (Some(tools), Some(listed)) = (self.mcp.as_ref(), offered) else {
+            return refused(format!(
+                "{name} is not one of this agent's tools on this host."
+            ));
+        };
+        let Some(entry) = tools.servers.entry(&listed.server) else {
+            return refused(format!(
+                "{name} is not one of this agent's tools on this host."
+            ));
+        };
+        let Some(Value::Object(args)) = wire.arguments.as_ref() else {
+            return refused(format!(
+                "The arguments of {name} are not a JSON object, so the call was not made; nothing was sent."
+            ));
+        };
+        if let Some(Err(reason)) = &screen {
+            return refused(reason.clone());
+        }
+        // An element is the one keeper read in the snapshot it read it in:
+        // a call that names none is sent, and bound, with that snapshot,
+        // never Peekaboo's latest, which keeper's own reads move (R316).
+        let with_snapshot;
+        let args = match screen
+            .as_ref()
+            .and_then(|aimed| aimed.as_ref().ok())
+            .and_then(|aimed| aimed.snapshot.as_ref())
+        {
+            Some(snapshot) => {
+                let mut bound = args.clone();
+                bound.insert("snapshot".to_owned(), json!(snapshot));
+                with_snapshot = bound;
+                &with_snapshot
+            }
+            None => args,
+        };
+        if let Some(reason) =
+            core_mcp::untrusted_refusal(entry, &listed.tool, self.view.label().integrity)
+        {
+            return refused(reason);
+        }
+        if classification.gate() == Gate::Refuse {
+            return refused(if facts.kvm_sensitive {
+                keeper_core::agents::kvm::HANDED_TO_PERSON.to_owned()
+            } else {
+                FORBIDDEN.to_owned()
+            });
+        }
+        // Which broker this is, and whose runs it may be asked about, come
+        // from the one listing this call is classified, bound and sent from.
+        let broker = (listed.role() == Some(&core_mcp::McpRole::Paseo))
+            .then(|| core_paseo::broker(listed.identity()));
+        let paseo = broker
+            .as_ref()
+            .map(|broker| core_paseo::reach(&listed.tool, args, &self.paseo_polled(broker)));
+        if let Some(core_paseo::Reach::Blocked(why)) = paseo {
+            return refused(format!("{why} Nothing was sent to `{}`.", listed.server));
+        }
+        let bound = self.bound_approval(&wire.id, name);
+        // A declassifying call that nobody approved yet waits for its
+        // approval, and is refused with this when nobody can be asked.
+        let mut blocked = None;
+        if let SinkVerdict::Block { reason, .. } =
+            check_sink(&self.view.label(), &core_mcp::sink(entry))
+        {
+            let sentence = format!(
+                "{reason} The MCP server `{}` is read by {}. Nothing was sent to it.",
+                listed.server,
+                match &entry.readers {
+                    Readers::Anyone => "anyone".to_owned(),
+                    Readers::Only(readers) => readers
+                        .iter()
+                        .map(|user| user.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                }
+            );
+            match paseo {
+                Some(core_paseo::Reach::Nothing) => {}
+                // The approval released the prompt to the audience its
+                // binding names; one that reaches another drifts below.
+                Some(core_paseo::Reach::Prompt) if bound.is_some() => {}
+                Some(core_paseo::Reach::Prompt) => blocked = Some(sentence),
+                _ => return refused(sentence),
+            }
+        }
+        let Some(mut binding) = listed.binding() else {
+            return refused(format!(
+                "`{}` does not answer here now; nothing was sent to it.",
+                listed.server
+            ));
+        };
+        core_paseo::bind_audience(&mut binding, &entry.readers);
+        let aimed = screen.and_then(Result::ok);
+        // A screen action that will wait for a person is pinned, and its
+        // screenshot kept, before it parks: no card without the screen it
+        // is decided on (96.4 #4).
+        let pinned = match &aimed {
+            Some(aimed)
+                if self.parks && bound.is_none() && classification.gate() == Gate::Person =>
+            {
+                match self.screen_pin(tools, entry, &at, aimed) {
+                    Ok(pinned) => Some(pinned),
+                    Err(reason) => return refused(reason),
+                }
+            }
+            _ => None,
+        };
+        // What keeper read of its target is bound beside the server's
+        // binding; a call an approval let through binds what it bound.
+        if let Some(aimed) = &aimed {
+            keeper_core::agents::screen::bind_target(
+                &mut binding,
+                match &aimed.approved {
+                    Some(target) => target.clone(),
+                    None => keeper_core::agents::screen::target(
+                        &aimed.aim,
+                        &aimed.facts,
+                        pinned.as_ref().and_then(|pinned| pinned.under.as_deref()),
+                    ),
+                },
+            );
+        }
+        let gated = match self.gated(&wire.id, name, &classification, &[], Vec::new()) {
+            Gated::Park(approval) => {
+                if let Some(parking) = self
+                    .parked
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .as_mut()
+                {
+                    parking.exec_binding = binding;
+                    if let Some(pinned) = pinned {
+                        parking.preview = Some(pinned.preview);
+                        parking.screen = Some(pinned.pin);
+                    }
+                    if aimed.as_ref().is_some_and(|aimed| aimed.snapshot.is_some()) {
+                        parking.args = Some(Value::Object(args.clone()));
+                    }
+                }
+                Gated::Park(approval)
+            }
+            Gated::Run(Some(approved)) => {
+                // What the consume path checked against the server is what
+                // runs: a list change since then is drift.
+                let checked = self.bound_checked(&wire.id, name);
+                if checked.as_ref().map(|run| &run.exec_binding) != Some(&binding) {
+                    return refused(format!(
+                        "It was not done: the MCP server `{}` or its tool changed after it was approved. Nothing was sent to it.",
+                        listed.server
+                    ));
+                }
+                Gated::Run(Some(approved))
+            }
+            // Nobody can be asked: a declassifying call says what blocks it.
+            Gated::Refuse(reason) => Gated::Refuse(blocked.clone().unwrap_or(reason)),
+            Gated::Run(None) if blocked.is_some() => {
+                return refused(blocked.unwrap_or_default());
+            }
+            gated => gated,
+        };
+        let audit = CallAudit::new(
+            self.sinks,
+            name,
+            Effect::Write,
+            &classification,
+            gated,
+            ("", &at),
+        );
+        if let Err(withheld) = audit.admit("", &at) {
+            let outcome = withheld.into();
+            audit.finish(&outcome);
+            return outcome;
+        }
+        let call = {
+            let servers = Arc::clone(&tools.servers);
+            let (listed, args) = (listed.clone(), args.clone());
+            let stop = tools.stop.clone();
+            tokio::spawn(async move { servers.call(&listed, args, stop).await })
+        };
+        let answered = delegate::block_on(call).unwrap_or_else(|_| {
+            Err(format!(
+                "The call to `{}` ended without an answer; whether it took effect is unknown.",
+                listed.server
+            ))
+        });
+        let outcome = match answered {
+            Ok(answer) => {
+                // What Peekaboo read of the screen is what a later action
+                // on one of its elements is known by.
+                if listed.role() == Some(&core_mcp::McpRole::Screen)
+                    && matches!(listed.tool.as_str(), "see" | "inspect_ui")
+                    && !answer.error
+                {
+                    tools
+                        .servers
+                        .remember_read(&listed.server, &tools.session, &answer);
+                }
+                // A broker's answer reaches the model, the log and anything
+                // after them only as keeper's projection of it (96.3 #6),
+                // made from the whole answer before any cut for display
+                // (R96PA2-01): the eight fields of a run, an error's words
+                // with no credential, nothing of any other answer.
+                let projected = broker.as_ref().map(|_| {
+                    if answer.error {
+                        core_paseo::Answer {
+                            text: core_paseo::sanitized(&answer.text),
+                            runs: Vec::new(),
+                        }
+                    } else {
+                        core_paseo::answer(&answer.text)
+                    }
+                });
+                let (shown, total) = match &projected {
+                    Some(projected) => (projected.text.as_str(), projected.text.len() as u64),
+                    None => (answer.text.as_str(), answer.total),
+                };
+                let (text, cut) =
+                    core_mcp::render(&listed.server, &listed.tool, shown, total, answer.error);
+                // What keeper did with Paseo's answer is keeper's own
+                // sentence, above the broker's words.
+                let done = match (broker.as_ref(), projected.as_ref()) {
+                    (Some(broker), Some(shown)) if !answer.error => {
+                        self.paseo_answered(entry, broker, &listed.tool, args, shown)
+                    }
+                    _ => PaseoDone::default(),
+                };
+                let text = match done.said {
+                    Some(said) => format!("{said}\n{text}"),
+                    None => text,
+                };
+                tools
+                    .answers
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push(McpAnswered {
+                        label: core_mcp::result_label(entry),
+                        at: at.clone(),
+                        truncated: cut.map(|(shown, total)| Truncated { shown, total }),
+                        started: done.started,
+                        ended: done.ended,
+                    });
+                ToolOutcome::Answered { text }
+            }
+            Err(reason) => ToolOutcome::Refused { reason },
+        };
+        audit.finish(&outcome);
+        outcome
+    }
+}
+
+impl AllowedTools<'_> {
+    /// The KVM tools and the classic NanoKVM `id` a call of `name` names,
+    /// when this agent may use both here.
+    fn kvm_offered(&self, name: &str, id: &str) -> Result<&KvmTools, String> {
+        let tools = self
+            .kvm
+            .as_ref()
+            .filter(|_| self.allow.iter().any(|allowed| allowed == name))
+            .ok_or_else(|| format!("{name} is not one of this agent's tools on this host."))?;
+        if !tools.ids.iter().any(|offered| offered == id) {
+            return Err(
+                "That is not a KVM this agent may use on this host; nothing was sent.".to_owned(),
+            );
+        }
+        Ok(tools)
+    }
+
+    /// One frame of `classic`'s screen, kept as a preview under the
+    /// sessions zone's `.keeper/previews/` (S-18): the frame and its hash.
+    fn kvm_frame(
+        tools: &KvmTools,
+        classic: &crate::kvm::Classic,
+    ) -> Result<crate::kvm::Frame, String> {
+        let taking = {
+            let classic = classic.clone();
+            tokio::spawn(async move { classic.snapshot().await })
+        };
+        let frame = delegate::block_on(taking).unwrap_or_else(|_| {
+            Err(format!(
+                "the frame of `{}` was not read: the read ended without an answer",
+                classic.entry.id
+            ))
+        })?;
+        crate::agent::off_the_runtime(|| crate::previews::write(&tools.zone, &frame.png, "png"))
+            .map_err(|error| {
+                format!(
+                    "the frame of `{}` could not be kept: {error}",
+                    classic.entry.id
+                )
+            })?;
+        Ok(frame)
+    }
+
+    /// What a frame is told to the model: the screen is outside content,
+    /// its size is what the inputs' coordinates are pixels of.
+    fn frame_said(id: &str, frame: &crate::kvm::Frame) -> String {
+        format!(
+            "A frame of `{id}`: {}×{} pixels (its preview is sha256:{}). kvm_act's coordinates are this frame's pixels.",
+            frame.grey.width,
+            frame.grey.height,
+            frame.sha256
+        )
+    }
+
+    /// A `kvm_snapshot` call (96.5 #5): T0, run without asking; a read
+    /// that sends nothing of the session; its frame kept as a preview and
+    /// labelled `untrusted`, read by the KVM's readers (AD-409).
+    fn kvm_snapshot(&self, wire: &chat::ToolCall) -> ToolOutcome {
+        use keeper_core::agents::kvm as core_kvm;
+        let name = wire.name.as_str();
+        let args = wire.arguments.as_ref().unwrap_or(&Value::Null);
+        let classification = self.classify(
+            &wire.id,
+            AgentTool::KvmSnapshot,
+            &CallFacts::default(),
+            None,
+        );
+        let named = core_kvm::parse_snapshot(args);
+        let at = format!(
+            "{}{}",
+            core_kvm::CAPABILITY_PREFIX,
+            named.as_deref().unwrap_or_default()
+        );
+        let refused = |reason: String| {
+            CallAudit::new(
+                self.sinks,
+                name,
+                Effect::Read,
+                &classification,
+                Gated::Run(None),
+                ("", &at),
+            )
+            .refuse(reason)
+        };
+        let id = match named {
+            Ok(id) => id,
+            Err(reason) => return refused(reason),
+        };
+        let tools = match self.kvm_offered(name, &id) {
+            Ok(tools) => tools,
+            Err(reason) => return refused(reason),
+        };
+        let (Some(entry), Ok(classic)) = (tools.kvms.entry(&id), tools.kvms.classic(&id)) else {
+            return refused(format!("{name} cannot reach `{id}` on this host."));
+        };
+        let gated = self.gated(&wire.id, name, &classification, &[], Vec::new());
+        let audit = CallAudit::new(
+            self.sinks,
+            name,
+            Effect::Read,
+            &classification,
+            gated,
+            ("", &at),
+        );
+        if let Err(withheld) = audit.admit("", &at) {
+            let outcome = withheld.into();
+            audit.finish(&outcome);
+            return outcome;
+        }
+        let outcome = match Self::kvm_frame(tools, &classic) {
+            Ok(frame) => {
+                tools
+                    .answers
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push(KvmAnswered {
+                        label: core_kvm::result_label(entry),
+                        at: at.clone(),
+                        effect: None,
+                        stopped: false,
+                    });
+                ToolOutcome::Answered {
+                    text: format!(
+                        "{}\n{}",
+                        core_kvm::SCREEN_IS_DATA,
+                        Self::frame_said(&id, &frame)
+                    ),
+                }
+            }
+            Err(reason) => ToolOutcome::Refused { reason },
+        };
+        audit.finish(&outcome);
+        outcome
+    }
+
+    /// A `kvm_act` call (96.5, AD-409), in the order every call keeps (R82,
+    /// R90): its inputs read and bounded, and its tier from them — T4, or
+    /// T5 and handed to the person when it touches a security dialog, a
+    /// password or a payment; a send to the KVM's readers checked before
+    /// anything reaches it (#9, R145: a block is refused, never parked);
+    /// parked on a record binding the KVM (R144) whose preview is a frame
+    /// taken now and whose `preconditions.screen` pins it (#6, S-18); an
+    /// approved call sent only while the KVM is the one the consume path
+    /// checked, its inputs mapped on the frame that was pinned; its audit
+    /// row before the first input; then sent, and answered with what is
+    /// known — that it was sent — and a fresh frame (#7).
+    fn kvm_act(&self, wire: &chat::ToolCall) -> ToolOutcome {
+        use keeper_core::agents::kvm as core_kvm;
+        let name = wire.name.as_str();
+        let args = wire.arguments.as_ref().unwrap_or(&Value::Null);
+        let parsed = core_kvm::parse_act(args);
+        let facts = parsed.as_ref().map(core_kvm::act_facts).unwrap_or_default();
+        let classification = self.classify(&wire.id, AgentTool::KvmAct, &facts, None);
+        let at = format!(
+            "{}{}",
+            core_kvm::CAPABILITY_PREFIX,
+            core_kvm::named_kvm(args).unwrap_or_default()
+        );
+        let refused = |reason: String| {
+            CallAudit::new(
+                self.sinks,
+                name,
+                Effect::Write,
+                &classification,
+                Gated::Run(self.bound_approval(&wire.id, name).map(Approval::Approved)),
+                ("", &at),
+            )
+            .refuse(reason)
+        };
+        let act = match parsed {
+            Ok(act) => act,
+            Err(reason) => return refused(reason),
+        };
+        let tools = match self.kvm_offered(name, &act.kvm) {
+            Ok(tools) => tools,
+            Err(reason) => return refused(reason),
+        };
+        if classification.gate() == Gate::Refuse {
+            return refused(if facts.kvm_sensitive {
+                core_kvm::HANDED_TO_PERSON.to_owned()
+            } else {
+                FORBIDDEN.to_owned()
+            });
+        }
+        let (Some(entry), Ok(classic)) = (tools.kvms.entry(&act.kvm), tools.kvms.classic(&act.kvm))
+        else {
+            return refused(format!("{name} cannot reach `{}` on this host.", act.kvm));
+        };
+        if let SinkVerdict::Block { reason, .. } =
+            check_sink(&self.view.label(), &core_kvm::sink(entry))
+        {
+            return refused(format!(
+                "{reason} The KVM `{}` is read by {}. Nothing was sent to it.",
+                act.kvm,
+                readers_named(&entry.readers)
+            ));
+        }
+        let binding = core_kvm::binding(entry);
+        let bound = self.bound_approval(&wire.id, name);
+        // The frame its inputs are mapped on: the one its approval pinned,
+        // or — before anyone was asked — one taken now, which the person
+        // decides on.
+        let (steps, taken) = if bound.is_some() {
+            let pin = self
+                .bound_checked(&wire.id, name)
+                .filter(|checked| checked.exec_binding == binding)
+                .and_then(|checked| checked.screen)
+                .and_then(|pin| serde_json::from_value::<core_kvm::FramePin>(pin).ok());
+            let Some(pin) = pin else {
+                return refused(format!(
+                    "It was not done: the KVM `{}` is not the one it was approved for. Nothing was sent to it.",
+                    act.kvm
+                ));
+            };
+            match core_kvm::steps(&act.actions, pin.width, pin.height) {
+                Ok(steps) => (steps, None),
+                Err(reason) => return refused(reason),
+            }
+        } else {
+            let frame = match Self::kvm_frame(tools, &classic) {
+                Ok(frame) => frame,
+                Err(reason) => return refused(format!("{reason}. Nothing was sent.")),
+            };
+            let steps = match core_kvm::steps(&act.actions, frame.grey.width, frame.grey.height) {
+                Ok(steps) => steps,
+                Err(reason) => return refused(reason),
+            };
+            // A frame keeper cannot pin is one nobody could be asked to
+            // decide on: refused now, never parked on a record no consume
+            // could pass (R96K1-05).
+            let Some(pin) = core_kvm::frame_pin(
+                &act.actions,
+                &frame.grey.pixels,
+                frame.grey.width,
+                frame.grey.height,
+            )
+            .and_then(|pin| serde_json::to_value(pin).ok()) else {
+                return refused(format!(
+                    "The frame of `{}` is too small to be checked again before an input is sent. Nothing was sent.",
+                    act.kvm
+                ));
+            };
+            (steps, Some((frame, pin)))
+        };
+        let gated = match self.gated(&wire.id, name, &classification, &[], Vec::new()) {
+            Gated::Park(approval) => {
+                if let (Some(parking), Some((frame, pin))) = (
+                    self.parked
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .as_mut(),
+                    taken,
+                ) {
+                    parking.exec_binding = binding.clone();
+                    parking.preview = Some(json!({"sha256": frame.sha256, "ext": "png"}));
+                    // The frame the person decides on is outside content,
+                    // read by the KVM's readers: it joins the session's
+                    // label as the call parks, before the request carrying
+                    // it is sent (S-18, AD-409).
+                    tools
+                        .answers
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .push(KvmAnswered {
+                            label: core_kvm::result_label(entry),
+                            at: at.clone(),
+                            effect: None,
+                            stopped: false,
+                        });
+                    parking.screen = Some(pin);
+                }
+                Gated::Park(approval)
+            }
+            gated => gated,
+        };
+        let audit = CallAudit::new(
+            self.sinks,
+            name,
+            Effect::Write,
+            &classification,
+            gated,
+            ("", &at),
+        );
+        if let Err(withheld) = audit.admit("", &at) {
+            let outcome = withheld.into();
+            audit.finish(&outcome);
+            return outcome;
+        }
+        let sending = {
+            let classic = classic.clone();
+            tokio::spawn(async move { classic.send(&steps).await })
+        };
+        let sent = delegate::block_on(sending).unwrap_or_else(|_| {
+            Err(crate::kvm::SendFailed {
+                reason: format!("the inputs to `{}` ended without an answer", act.kvm),
+                reached: true,
+            })
+        });
+        // Once an input may have reached the target — all of them, or some
+        // before the rest failed — what is known is that it was sent: the
+        // effect is unverified, a fresh frame is read, and the call is never
+        // a plain refusal (#7, R96K1-07).
+        let (said, stopped) = match sent {
+            Ok(()) => (core_kvm::SENT_NOT_DONE.to_owned(), false),
+            Err(failed) if failed.reached => (
+                format!("{} {}.", core_kvm::SENT_IN_PART, failed.reason),
+                true,
+            ),
+            Err(failed) => {
+                let outcome = ToolOutcome::Refused {
+                    reason: format!("{}. Nothing was sent.", failed.reason),
+                };
+                audit.finish(&outcome);
+                return outcome;
+            }
+        };
+        let seen = match Self::kvm_frame(tools, &classic) {
+            Ok(frame) => Self::frame_said(&act.kvm, &frame),
+            Err(reason) => format!("A fresh frame was not read: {reason}."),
+        };
+        tools
+            .answers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(KvmAnswered {
+                label: core_kvm::result_label(entry),
+                at: at.clone(),
+                effect: Some(core_kvm::EFFECT_UNVERIFIED),
+                stopped,
+            });
+        let outcome = ToolOutcome::Answered {
+            text: format!("{said}\n{}\n{seen}", core_kvm::SCREEN_IS_DATA),
+        };
+        audit.finish(&outcome);
+        outcome
+    }
+}
+
+/// Who `readers` are, as a refusal names them.
+fn readers_named(readers: &Readers) -> String {
+    match readers {
+        Readers::Anyone => "anyone".to_owned(),
+        Readers::Only(readers) => readers
+            .iter()
+            .map(|user| user.as_str())
+            .collect::<Vec<_>>()
+            .join(", "),
+    }
+}
+
+/// Whether `listed` is a tool of a NanoKVM-Go's own MCP server.
+fn kvm_role(listed: &crate::mcp::Listed) -> bool {
+    matches!(
+        listed.role(),
+        Some(keeper_core::agents::mcp::McpRole::Kvm(_))
+    )
+}
+
+/// The tier facts of a call to `listed` with `args`: its row's tier and, on
+/// a NanoKVM-Go's server — whose screenshot alone is offered (R323) —
+/// whether its arguments touch a security dialog, a password or a payment
+/// (96.5 #5).
+fn mcp_facts(listed: &crate::mcp::Listed, args: Option<&Value>) -> CallFacts {
+    CallFacts {
+        mcp: listed.tier.clone().ok(),
+        kvm_sensitive: kvm_role(listed)
+            && args
+                .and_then(Value::as_object)
+                .is_some_and(keeper_core::agents::kvm::sensitive_args),
+        ..CallFacts::default()
+    }
+}
+
+/// What keeper did with a Paseo broker's answer: its own sentence above
+/// the broker's words, the run a successful `create_agent` started, which
+/// the result's log line records (Q14), and the run end a follow session's
+/// poll captured, which the line after it records (R275).
+#[derive(Default)]
+struct PaseoDone {
+    said: Option<String>,
+    started: Option<keeper_core::agents::paseo::Started>,
+    ended: Option<keeper_core::agents::log::PaseoBody>,
+}
+
+impl AllowedTools<'_> {
+    /// The Paseo runs this session may ask `broker` about (Q14): those its
+    /// own successful `create_agent` on that broker was answered with — the
+    /// host's records on its results, as the held context replays them —
+    /// and, for the follow session keeper made for a run of that broker,
+    /// that run.
+    fn paseo_polled(&self, broker: &str) -> std::collections::BTreeSet<String> {
+        use keeper_core::agents::paseo as core_paseo;
+        let mut polled = self.view.paseo_started(broker);
+        if let Some(id) = core_paseo::followed(&self.agent, broker) {
+            polled.insert(id.to_owned());
+        }
+        polled
+    }
+
+    /// What keeper does with the projected answer `shown` of `broker` to
+    /// `tool` called with `args`, in its own words: a run `create_agent`
+    /// started is this session's to poll and gets a follow card (96.3 #5);
+    /// a status a follow session asked for that says its run ended is
+    /// captured once — recorded, and its notice fixed — to be told and
+    /// the card's schedule ended once this run of the card is over (R275).
+    fn paseo_answered(
+        &self,
+        entry: &keeper_core::agents::mcp::McpEntry,
+        broker: &str,
+        tool: &str,
+        args: &serde_json::Map<String, Value>,
+        shown: &keeper_core::agents::paseo::Answer,
+    ) -> PaseoDone {
+        use keeper_core::agents::paseo as core_paseo;
+        let label = self
+            .view
+            .label()
+            .join(&keeper_core::agents::mcp::result_label(entry));
+        let said = |said: String| PaseoDone {
+            said: Some(said),
+            ..PaseoDone::default()
+        };
+        match tool {
+            "create_agent" => {
+                let Some(id) = shown.runs.first().and_then(|run| run.id()) else {
+                    return said("keeper found no run id it can follow in Paseo's answer, so no follow card was made.".to_owned());
+                };
+                let started = core_paseo::Started {
+                    broker: broker.to_owned(),
+                    id: id.to_owned(),
+                };
+                let made = match self.paseo_follow(&entry.name, broker, id, label) {
+                    Ok(path) => format!("keeper made the follow card of Paseo run `{id}` in {path}: it asks for the run's status every 10 minutes once a person allows its schedule."),
+                    Err(why) => format!("keeper could not make the follow card of Paseo run `{id}`: {why}"),
+                };
+                PaseoDone {
+                    said: Some(made),
+                    started: Some(started),
+                    ended: None,
+                }
+            }
+            "get_agent_status" => {
+                let Some(followed) = core_paseo::followed(&self.agent, broker) else {
+                    return PaseoDone::default();
+                };
+                let Some(run) = shown.runs.first() else {
+                    return PaseoDone::default();
+                };
+                let asked = args.get("agentId").and_then(Value::as_str);
+                if run.id() != Some(followed)
+                    || asked != Some(followed)
+                    || !run.status().is_some_and(core_paseo::is_terminal)
+                {
+                    return PaseoDone::default();
+                }
+                if let Some(held) = self.view.paseo_ended() {
+                    return said(format!("keeper already captured the ended run, recorded in {}; it is told from that capture, not from this answer.", held.artifact));
+                }
+                match self.paseo_capture(run, label) {
+                    Ok(ended) => PaseoDone {
+                        said: Some(format!("keeper captured the ended run: it records it in {}, tells the conversation that started it and ends this card's schedule once this run of the card is over.", ended.artifact)),
+                        started: None,
+                        ended: Some(ended),
+                    },
+                    Err(why) => said(format!("keeper could not finish following the run, and asks again at the card's next run: {why}")),
+                }
+            }
+            _ => PaseoDone::default(),
+        }
+    }
+
+    /// Make the session that follows run `id` of `broker`, reached as
+    /// `server` (Q14, R241): a scheduled session of this agent, labelled
+    /// `label`, in a room this host makes for the session's readers,
+    /// holding the follow card and answering this session when the run
+    /// ends. Its zone-relative path.
+    fn paseo_follow(
+        &self,
+        server: &str,
+        broker: &str,
+        id: &str,
+        label: Label,
+    ) -> Result<String, String> {
+        use keeper_core::agents::paseo as core_paseo;
+        let from = &self.delegation.from;
+        let session =
+            core_paseo::follow_session_id(&self.agent.drive, &self.agent.agent, broker, id);
+        if let Some(found) = verbs::find(&from.zone, &session.to_string()) {
+            return Ok(found.path);
+        }
+        let port = self
+            .delegation
+            .port
+            .clone()
+            .ok_or_else(|| "this host has no rooms for it".to_owned())?;
+        let invites: Vec<OwnedUserId> = match &label.readers {
+            Readers::Only(readers) => readers
+                .iter()
+                .filter(|reader| **reader != from.user)
+                .cloned()
+                .collect(),
+            Readers::Anyone => vec![self.agent.requested_by.clone()],
+        };
+        let title = format!("Follow Paseo run {id}");
+        let room = delegate::block_on(port.create(
+            SessionKind::Scheduled,
+            &title,
+            invites,
+            vec![from.user.clone()],
+        ))
+        .map_err(|error| format!("its room could not be made: {error}"))?;
+        let agent = core_paseo::follow_session(
+            &self.agent,
+            &from.session,
+            label,
+            broker,
+            id,
+            room,
+            chrono::Utc::now(),
+        );
+        let card = core_paseo::follow_card(
+            id,
+            server,
+            &self.agent.agent,
+            &from.user,
+            &self.agent.requested_by,
+        );
+        match verbs::create_carded_session(
+            &from.zone,
+            &agent,
+            vec![(core_paseo::FOLLOW_CARD.to_owned(), card)],
+            chrono::Local::now(),
+        ) {
+            Ok(CreateOutcome::Created { path, .. } | CreateOutcome::Existed { path, .. }) => {
+                Ok(path)
+            }
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    /// Capture the end of `run` in this follow session, labelled `label`,
+    /// once (R96PA-09, R275, R277). Every sink the end will reach is asked
+    /// first, so none gets anything when one refuses: the home drive's
+    /// readers must read what the record holds (R96PA-08); the room of the
+    /// conversation that started the run takes the notice as its own gate
+    /// counts that room — every person in it, the requester included
+    /// (R96PA-08, R96PA-10); and this session's own
+    /// room takes the capture's publication. What is returned is
+    /// the capture: the record's bytes, stamped as written from outside
+    /// content (R96PA-07), their SHA-256, and the notice — marked as this
+    /// session's completion, answering the starting session (R96PA2-05),
+    /// carrying the label it was admitted under — as the `pending` line,
+    /// the end's first durable step, written before the call's result.
+    /// Nothing is written or sent here: the record, the publication, the
+    /// notice and the end of the schedule are made from that line
+    /// ([`ServedSession::finish_paseo`]).
+    fn paseo_capture(
+        &self,
+        run: &keeper_core::agents::paseo::Projected,
+        label: Label,
+    ) -> Result<keeper_core::agents::log::PaseoBody, String> {
+        use keeper_core::agents::paseo as core_paseo;
+        let from = &self.delegation.from;
+        let id = run.id().unwrap_or_default();
+        let rel = core_paseo::artifact_path(id);
+        if let SinkVerdict::Block { reason, .. } = check_sink(
+            &label,
+            &keeper_core::agents::label::Sink::DriveWrite {
+                drive_readers: self.cards.drive_readers.clone(),
+            },
+        ) {
+            return Err(format!("its record was not written: {reason}"));
+        }
+        let reply = self
+            .agent
+            .reply
+            .as_ref()
+            .ok_or_else(|| "this session names no conversation to tell".to_owned())?;
+        let origin = paseo_origin(&from.zone, reply);
+        let port = self
+            .delegation
+            .port
+            .clone()
+            .ok_or_else(|| delegate::NO_ROOMS.to_owned())?;
+        let completion = core_paseo::completion_id(&self.agent.id);
+        let mut content = delegate::reply_content(
+            &core_paseo::ended(run),
+            vec![json!({
+                "drive": from.drive,
+                "path": format!("{}/{}/{rel}", from.subfolder, from.session),
+            })],
+            &label,
+        );
+        if let Some(origin) = &origin {
+            core_paseo::mark_completion(&mut content, &completion, &origin.id.to_string());
+        }
+        delegate::block_on(delegate::admit_reply(
+            port.as_ref(),
+            self.sinks,
+            &reply.room,
+            [&from.user, paseo_delegating(origin.as_ref(), &from.user)],
+            &label,
+            &content,
+        ))?;
+        delegate::block_on(delegate::admit_reply(
+            port.as_ref(),
+            self.sinks,
+            &from.room,
+            [&from.user, &from.user],
+            &label,
+            &content,
+        ))?;
+        let record = keeper_core::agents::card::stamp_agent_write(
+            None,
+            &core_paseo::artifact(run),
+            &from.user,
+            label.integrity,
+        );
+        Ok(keeper_core::agents::log::PaseoBody {
+            completion,
+            state: keeper_core::agents::log::PaseoState::Pending,
+            room: reply.room.clone(),
+            artifact: rel,
+            sha256: keeper_core::agents::approval::sha256_hex(record.as_bytes()),
+            record: Some(record),
+            content: Some(content),
+            event: None,
+        })
+    }
+}
+
+/// Whether `agent` is a session keeper made to follow a Paseo run: a
+/// scheduled one whose `[reply]` names the run.
+pub(crate) fn follows_a_run(agent: &SessionAgent) -> bool {
+    agent.kind == SessionKind::Scheduled
+        && agent
+            .reply
+            .as_ref()
+            .is_some_and(|reply| reply.run.is_some())
+}
+
+/// The session a follow session answers, read from its `[reply]` path in
+/// `zone`, when it can be.
+fn paseo_origin(
+    zone: &Path,
+    reply: &keeper_core::agents::session::SessionReply,
+) -> Option<SessionAgent> {
+    crate::zone::read_text(
+        zone,
+        &format!(
+            "{}/{}",
+            reply.session,
+            keeper_core::agents::session::FILE_NAME
+        ),
+    )
+    .ok()
+    .flatten()
+    .and_then(|text| keeper_core::agents::session::parse_session_agent_toml(&text).ok())
+}
+
+/// The second agent a run's end notice passes between beside the follow
+/// session's own, `me`: a delegated starting session's delegating agent,
+/// whose session joins the label the notice carries (R94); else `me`, so
+/// anyone else in that room is counted, the person who asked included.
+fn paseo_delegating<'a>(origin: Option<&'a SessionAgent>, me: &'a UserId) -> &'a UserId {
+    origin
+        .filter(|origin| origin.kind == SessionKind::Delegated)
+        .map_or(me, |origin| &*origin.requested_by)
+}
+
 impl crate::sinks::Lift for AllowedTools<'_> {
     /// A flow of call `call` the label blocks (R89). The call a consumed
     /// approval bound never parks again: its flow goes through when that
@@ -1554,6 +3604,11 @@ impl crate::sinks::Lift for AllowedTools<'_> {
             classification,
             pins,
             declassify: Some(args),
+            exec_binding: Value::Null,
+            workspace: None,
+            preview: None,
+            screen: None,
+            args: None,
         });
         crate::sinks::Lifted::Parked(approval)
     }
@@ -1590,6 +3645,22 @@ fn write_effect(call: &ToolCall) -> String {
 /// round's calls each get their result, none its effect (R202).
 pub const RUN_ENDED: &str =
     "This workflow's run has replied: it ends here, and this call had no effect.";
+/// What a gate turn's call of a tool it was not offered is told (R369).
+pub const NOT_OFFERED: &str =
+    "That tool was not offered in this turn: a gate answers its outside system with reply, hands a request on with delegate and keeps notes with journal_append, as its agent allows. Nothing was done.";
+
+/// What a gate's `journal_append` says where nobody could decide it.
+pub const GATE_JOURNAL_UNASKED: &str =
+    "A gate's journal entry waits for a person's decision, and nobody can be asked here, so nothing was written.";
+
+/// What a gate's `journal_append` says while its entry waits for a person
+/// on the hour's card (99.2 #2): nothing is written yet.
+pub const GATE_JOURNAL_ASKED: &str = "This entry waits for a person's decision on the hour's card; it is written, quoted as data, only once they approve it. Nothing was written yet: go on with the request";
+
+/// What a gate's `journal_append` says when its turn read what only some
+/// of the gate's room may read (R375): the hour's card would carry it into
+/// that room, so nobody is asked and nothing is written.
+pub const GATE_JOURNAL_NARROWED: &str = "This turn read what only some of this gate's room may read, so its journal entry cannot be put to a person on the hour's card there: nobody was asked and nothing was written. Go on with the request";
 
 impl ToolHost for AllowedTools<'_> {
     fn run(&self, call: &ToolCall) -> Result<ToolOutcome, BotsError> {
@@ -1679,6 +3750,14 @@ impl ToolHost for AllowedTools<'_> {
 }
 
 impl AllowedTools<'_> {
+    /// Whether this turn may dispatch `name`: anything outside a gate, in a
+    /// gate only what its turn was offered (R369).
+    fn was_offered(&self, name: &str) -> bool {
+        self.only_offered
+            .as_ref()
+            .is_none_or(|offered| offered.iter().any(|spec| spec == name))
+    }
+
     /// A `drive_search` call, the session's own or a helper's, made by
     /// what has read `label`: a read of the drives in scope, each as a
     /// `drive_read` of its root is granted; what it returns is labelled file
@@ -1720,6 +3799,12 @@ impl AllowedTools<'_> {
         if self.view.ended() {
             return Some(refusal(RUN_ENDED.to_owned()));
         }
+        // A gate's dispatch mirrors its offer (R369): a name its turn was
+        // not offered is refused here, ahead of every other host — a drive
+        // verb's too, since `run_call` asks this before `run`.
+        if !self.was_offered(&wire.name) {
+            return Some(refusal(NOT_OFFERED.to_owned()));
+        }
         let args = wire.arguments.as_ref().unwrap_or(&Value::Null);
         if wire.name == helper::HELPER {
             if !self.helpers.ran(&wire.id) {
@@ -1730,7 +3815,13 @@ impl AllowedTools<'_> {
         }
         if delegate::is_delegation(&wire.name) {
             let tool = AgentTool::from_wire(&wire.name)?;
-            let facts = tier::named_facts(tool, args, CallFacts::default());
+            // A gate's delegation hands an outside request on: a person
+            // decides each one (codemap Q7).
+            let in_gate = self.agent.kind == SessionKind::Gate && tool == AgentTool::Delegate;
+            let facts = CallFacts {
+                gate_send: in_gate,
+                ..tier::named_facts(tool, args, CallFacts::default())
+            };
             let classification = self.classify(&wire.id, tool, &facts, None);
             let recipient = self.delegation.recipient(wire);
             let recipients: Vec<Recipient> = recipient
@@ -1741,14 +3832,20 @@ impl AllowedTools<'_> {
                 })
                 .collect();
             // Decided now, said only once the delegation's own sinks have
-            // passed (R82).
-            let gated = self.gated(
-                &wire.id,
-                &wire.name,
-                &classification,
-                &recipients,
-                Vec::new(),
-            );
+            // passed (R82). A gate's never parks its turn: it is deferred
+            // to the hour's card (codemap Q4), and no blocked flow of it is
+            // lifted.
+            let gated = if in_gate {
+                self.deferred(&wire.name, &classification, &recipients)
+            } else {
+                self.gated(
+                    &wire.id,
+                    &wire.name,
+                    &classification,
+                    &recipients,
+                    Vec::new(),
+                )
+            };
             let (drive, at) = self.delegation.destination(wire);
             let audit = CallAudit::new(
                 self.sinks,
@@ -1757,8 +3854,12 @@ impl AllowedTools<'_> {
                 &classification,
                 gated,
                 (&drive, &at),
-            )
-            .lifting(self, &wire.id);
+            );
+            let audit = if in_gate {
+                audit
+            } else {
+                audit.lifting(self, &wire.id)
+            };
             let outcome = self.delegation.run(wire, &audit);
             if let Some(outcome) = &outcome {
                 audit.finish(outcome);
@@ -1865,15 +3966,44 @@ impl AllowedTools<'_> {
             // checked against the home's readers before any effect, then
             // made under the claim (R120).
             let tool = AgentTool::from_wire(&wire.name)?;
-            let classification = self.classify(&wire.id, tool, &CallFacts::default(), None);
+            // A gate's journal entry is outside text going into the home:
+            // a person decides it on the hour's card (99.2 #2, codemap Q4),
+            // unless they let this session's entries go for a day.
+            let in_gate =
+                self.agent.kind == SessionKind::Gate && wire.name == crate::memory::JOURNAL_APPEND;
+            let facts = CallFacts {
+                gate_send: in_gate,
+                ..CallFacts::default()
+            };
+            let classification = self.classify(&wire.id, tool, &facts, None);
             let at = self.memory.at(wire);
-            let gated = self.gated(
-                &wire.id,
-                &wire.name,
-                &classification,
-                &[],
-                vec![(self.home.id.clone(), at.clone())],
-            );
+            let allowed = self
+                .gate_journal
+                .as_ref()
+                .filter(|_| in_gate)
+                .zip(self.delegation.serving.as_ref())
+                .filter(|(allowance, serving)| allowance.covers(serving.desk.now()))
+                .and_then(|(allowance, _)| Ulid::from_string(&allowance.approval).ok());
+            let gated = match (in_gate, allowed) {
+                (true, Some(approval)) => Gated::Run(Some(Approval::Approved(approval))),
+                // Where no decision source is installed nobody could decide
+                // it: refused, never written unasked.
+                (true, None) if !self.parks => Gated::Refuse(GATE_JOURNAL_UNASKED.to_owned()),
+                // Its card goes into the gate's room under the turn's label:
+                // one narrowed below the room — a callback's reply that read
+                // a drive — cannot be asked there (R375).
+                (true, None) if !self.view.label().may_reach(&self.agent.label.readers) => {
+                    Gated::Refuse(GATE_JOURNAL_NARROWED.to_owned())
+                }
+                (true, None) => self.deferred(&wire.name, &classification, &[]),
+                (false, _) => self.gated(
+                    &wire.id,
+                    &wire.name,
+                    &classification,
+                    &[],
+                    vec![(self.home.id.clone(), at.clone())],
+                ),
+            };
             let audit = CallAudit::new(
                 self.sinks,
                 &wire.name,
@@ -1881,8 +4011,13 @@ impl AllowedTools<'_> {
                 &classification,
                 gated,
                 (&self.home.id, &at),
-            )
-            .lifting(self, &wire.id);
+            );
+            // A gate's blocked entry is refused, never declassified.
+            let audit = if in_gate {
+                audit
+            } else {
+                audit.lifting(self, &wire.id)
+            };
             let outcome = if !self.allow.contains(&wire.name) {
                 refusal(format!("{} is not one of this agent's tools.", wire.name))
             } else if let Some(reason) = self.memory.refusal(&wire.name) {
@@ -1908,6 +4043,14 @@ impl AllowedTools<'_> {
                     .and_then(|()| audit.admit(&self.home.id, &at));
                 match admitted {
                     Ok(()) => self.memory.run(wire, &label, &|| self.view.may_write()),
+                    // Deferred to the hour's card: the turn goes on, and the
+                    // host writes the entry once a person approved it.
+                    Err(Withheld::Parked(approval)) if in_gate => {
+                        self.memory.asked(&approval.to_string());
+                        ToolOutcome::Answered {
+                            text: format!("{GATE_JOURNAL_ASKED} (approval {approval})"),
+                        }
+                    }
                     Err(withheld) => withheld.into(),
                 }
             };
@@ -2026,6 +4169,18 @@ impl AllowedTools<'_> {
             audit.finish(&outcome);
             return Some(outcome);
         }
+        if wire.name == keeper_core::agents::kvm::SNAPSHOT {
+            return Some(self.kvm_snapshot(wire));
+        }
+        if wire.name == keeper_core::agents::kvm::ACT {
+            return Some(self.kvm_act(wire));
+        }
+        if wire.name == keeper_core::agents::run::RUN {
+            return Some(self.run_command(wire));
+        }
+        if keeper_core::agents::mcp::decode(&wire.name).is_some() {
+            return Some(self.mcp_call(wire));
+        }
         if !crate::surface::is_surface(&wire.name) {
             return None;
         }
@@ -2078,6 +4233,8 @@ struct TurnTools {
     gate: Arc<RoomGate>,
     /// The scheduled card whose run the turn is: an ask names it.
     scheduled: Option<String>,
+    /// A gate's turn: the request it answers (codemap Q6).
+    desk: Option<crate::gate::Serving>,
 }
 
 /// One served session: its context and its writer.
@@ -2128,6 +4285,9 @@ pub struct ServedSession {
     /// Asks whose refusal is on its way to the run as an
     /// [`Arrival::Unasked`]: never sent meanwhile (R199).
     refusing: std::collections::BTreeSet<String>,
+    /// A gate session's desk (99.1): opened by the runtime with the
+    /// homeserver's clock, or by the first request served.
+    pub gate_desk: Option<Arc<crate::gate::Desk>>,
 }
 
 /// What a session's worker tells its host while it holds the claim.
@@ -2165,6 +4325,9 @@ struct Retry {
     briefs: std::collections::BTreeSet<String>,
     /// Delegations whose room could not be read back for a reply.
     replies: std::collections::BTreeSet<String>,
+    /// Delegations whose room could not be read back, as far as their
+    /// completion cursor, for a Paseo run's completion (R277).
+    completions: std::collections::BTreeSet<String>,
     /// The session's person was not told yet that its work narrowed.
     tell: bool,
     /// An ask of the session is not in its room yet: its proxy has not
@@ -2177,7 +4340,11 @@ struct Retry {
 
 impl Retry {
     fn is_empty(&self) -> bool {
-        self.briefs.is_empty() && self.replies.is_empty() && !self.tell && !self.asks
+        self.briefs.is_empty()
+            && self.replies.is_empty()
+            && self.completions.is_empty()
+            && !self.tell
+            && !self.asks
     }
 }
 
@@ -2271,12 +4438,34 @@ pub struct Arrived {
     /// The device that sent it, as its encryption names it: whose trust a
     /// decision is judged on (93.3).
     pub device: Option<matrix_sdk::ruma::OwnedDeviceId>,
+    /// The homeserver's time of the event, ms: what a gate's deadline and
+    /// its allowances are kept by (99.1 #3, #9). `None` for what the host
+    /// made itself.
+    pub origin_server_ts: Option<u64>,
 }
 
+/// A gate session whose home has no `[[gate]]` for its system any more.
+pub const NO_GATE: &str =
+    "this gate's [[gate]] is gone from its agent.toml, so it takes no request";
 /// A brief whose delegation is not this session's.
 pub const NOT_THIS_DELEGATION: &str = "a brief for another delegation is not a turn here";
 /// A join or a reply no delegation of this session waits for.
 pub const NOT_A_DELEGATION: &str = "no delegation of this session waits for this";
+/// A ticket's reply that comes again while its result waits for its
+/// declassification (99.2 #3): the first record stands, and this one is
+/// no turn.
+pub const RESULT_HELD: &str =
+    "this ticket's result waits for its owner's decision; a later reply is no turn";
+/// A Paseo run's completion that arrived while its room's readback is
+/// owed: taken when that readback reaches it, in the room's order, so the
+/// cursor never passes an older completion not yet taken (R279).
+pub const COMPLETION_HELD: &str =
+    "a Paseo run's end waits until its room is read back as far as it";
+/// A Paseo run's end told into the room of a workflow's run this agent
+/// started: the run's own news, for the run's readers, never the run's
+/// reply to the session that started it (R311).
+pub const RUNS_OWN_END: &str =
+    "a Paseo run's end told in a workflow's run is the run's own, not its reply";
 /// A brief that arrived after the exchange's last round, before a reply.
 pub const ROUNDS_SPENT: &str =
     "this exchange has had its rounds; a brief is not a turn here until this session replies";
@@ -2315,6 +4504,7 @@ pub fn unasked_arrival(agent: &UserId, open: &OpenAsk, reason: &str) -> Option<A
         replay: false,
         via: None,
         device: None,
+        origin_server_ts: None,
     })
 }
 
@@ -2352,6 +4542,7 @@ pub fn reply_of(
         replay: false,
         via: Some(room.to_owned()),
         device: None,
+        origin_server_ts: None,
     })
 }
 
@@ -2360,6 +4551,18 @@ pub const NOT_SCHEDULED: &str = "the host's clock sent nothing this host reads";
 /// A scheduled card that could not be read or written.
 pub const CARD_UNWRITTEN: &str =
     "the scheduled card could not be read or written; it is tried at its next window";
+/// A follow session's window once its run's end was told: the follow card's
+/// schedule is ended, and nothing is polled.
+pub const PASEO_TOLD: &str =
+    "the Paseo run's end was told to the conversation that started it; the follow card's schedule is ended";
+/// A follow session's window while its run's end waits to be told: tried
+/// again from its record at the next window, with no poll of the broker.
+pub const PASEO_UNTOLD: &str =
+    "the Paseo run's end is recorded and waits to be told; it is tried again at the card's next window";
+/// A follow session's window when its room could not be read for a
+/// captured end: nothing is polled until it can be.
+pub const PASEO_UNCHECKED: &str =
+    "whether the Paseo run's end was captured could not be read from the follow session's room; nothing is polled, and it is read again at the card's next window";
 
 /// The arrival the host's clock routes to a scheduled session's worker
 /// (92.3), in the agent's own name. A window's run has an id derived from
@@ -2388,6 +4591,7 @@ pub fn scheduled_arrival(agent: &UserId, scheduled: &Scheduled) -> Option<Arrive
         replay: false,
         via: None,
         device: None,
+        origin_server_ts: None,
     })
 }
 
@@ -2433,6 +4637,7 @@ pub fn harvest_arrival(agent: &UserId, closed: &crate::stewards::Closed) -> Opti
         replay: false,
         via: None,
         device: None,
+        origin_server_ts: None,
     })
 }
 
@@ -2520,6 +4725,7 @@ pub fn workflow_arrival(agent: &UserId, run: &Ulid, step: WorkflowStep) -> Optio
         replay: false,
         via: None,
         device: None,
+        origin_server_ts: None,
     })
 }
 
@@ -2554,6 +4760,14 @@ pub enum Outcome {
     /// A decision on a request another session sent into this DM, handed
     /// to that session (R89).
     Forwarded,
+    /// Where the person stopped listening to an answer: a `heard` line,
+    /// at the offset counted here.
+    Heard { heard_until: u64 },
+    /// A gate's request, served: where it stands now (99.1).
+    Gated {
+        request: String,
+        state: keeper_core::agents::log::GateState,
+    },
 }
 
 /// How a turn ended.
@@ -2732,6 +4946,7 @@ impl ServedSession {
             settling: BTreeMap::new(),
             scheduled_card: None,
             refusing: std::collections::BTreeSet::new(),
+            gate_desk: None,
         })
     }
 
@@ -2754,6 +4969,14 @@ impl ServedSession {
         // A record whose `approval requested` line a stop lost still waits
         // (R176): it is announced again, never cut off.
         self.adopt_records(deps);
+        // A gate runs one request's turn at a time, so at a worker's start
+        // every request still open was cut off by the stop (C6): each is
+        // refused in its room — its outside system is never left waiting,
+        // and its ticket stops counting against the gate's sessions. A
+        // ticket handed on is no turn: it waits on (codemap Q4).
+        if self.context.agent.kind == SessionKind::Gate {
+            return self.recover_gate(deps, &port).await;
+        }
         // A turn parked on an approval waits; it was not cut off (R74).
         if !self.context.parked.is_empty() {
             return Ok(false);
@@ -2782,6 +5005,71 @@ impl ServedSession {
             self.send_status(deps, &port, RunState::Idle, None).await;
         }
         Ok(true)
+    }
+
+    /// [`Self::recover`] in a gate session: the cut-off turn's `error`
+    /// line, then each open request refused `interrupted`, its line under
+    /// that one — but a ticket handed on whose delegation still waits for
+    /// its decision or runs, whose card a stop cut is asked for again
+    /// first (codemap Q4). Nothing of the turn reaches the room: it
+    /// streamed nothing.
+    async fn recover_gate(
+        &mut self,
+        deps: &AgentDeps,
+        port: &Arc<dyn EditPort>,
+    ) -> Result<bool, ServeError> {
+        let mut parent = None;
+        if let Some(user_line) = self.context.unanswered {
+            let closed = self.writer.write(
+                &mut self.context,
+                Some(user_line),
+                None,
+                LineBody::Error(ErrorBody {
+                    sentence: cut_off_sentence(deps.host.as_str()),
+                    code: INTERRUPTED.to_owned(),
+                }),
+            )?;
+            parent = Some(closed.id);
+        }
+        Box::pin(self.raise_tickets(deps, port)).await?;
+        let deferred = &self.context.gate_deferred;
+        let held = &self.context.gate_held;
+        let parked = &self.context.parked;
+        let (waiting, pending): (BTreeMap<_, _>, BTreeMap<_, _>) =
+            std::mem::take(&mut self.context.gate_pending)
+                .into_iter()
+                .partition(|(request, open): &(String, GateOpen)| {
+                    // A result held for its declassification waits on as a
+                    // ticket waiting for its decision does (99.2 #3) — once
+                    // its card was asked for; one a stop cut before that is
+                    // refused with the rest.
+                    held.get(request)
+                        .is_some_and(|approval| parked.contains_key(approval))
+                        || open
+                            .ticket
+                            .as_ref()
+                            .and_then(|ticket| deferred.get(ticket))
+                            .is_some_and(|deferred| !deferred.decided || deferred.opened)
+                });
+        self.context.gate_pending = waiting;
+        let recovered = parent.is_some() || !pending.is_empty();
+        if let Some(desk) = self.desk(deps, port).filter(|_| !pending.is_empty()) {
+            for (request, open) in pending {
+                let Some(event) = &open.event else { continue };
+                let (line, said) = desk
+                    .refuse(
+                        &request,
+                        Some(event),
+                        open.ticket.clone(),
+                        keeper_core::agents::log::GateReason::Interrupted,
+                    )
+                    .await;
+                self.writer
+                    .write(&mut self.context, parent, said, LineBody::Gate(line))?;
+            }
+        }
+        off_the_runtime(|| self.writer.sync())?;
+        Ok(recovered)
     }
 
     /// The status every edit of this session's status anchor carries; a
@@ -2955,6 +5243,390 @@ impl ServedSession {
         self.waiting() || self.context.asks.values().any(|open| open.card.is_some())
     }
 
+    /// What another copy of this agent already answered in the room
+    /// (`answered_by`): a harvest or workflow step counts as begun (R202),
+    /// and a gate's request it answered, gave its result or refused is
+    /// open here no more, so a takeover neither serves it again nor
+    /// refuses it `interrupted` (R368, review R99S-03).
+    pub fn answered_elsewhere(&mut self, answered: &std::collections::HashSet<String>) {
+        self.context.started(answered.iter().map(String::as_str));
+        let done: Vec<String> = self
+            .context
+            .gate_pending
+            .iter()
+            .filter(|(_, open)| {
+                open.event
+                    .as_ref()
+                    .is_some_and(|event| answered.contains(event.as_str()))
+            })
+            .map(|(request, _)| request.clone())
+            .collect();
+        for request in done {
+            self.context.gate_pending.remove(&request);
+            if let Some(ledger) = &mut self.context.gate_ledger {
+                ledger.close(&request);
+            }
+            if let Some(desk) = &self.gate_desk {
+                desk.close(&request);
+            }
+        }
+    }
+
+    /// This gate session's desk: the one the runtime opened, or one opened
+    /// now on this host's wall clock. `None` when the session is no gate or
+    /// its home has no `[[gate]]` for its system any more.
+    pub fn desk(
+        &mut self,
+        deps: &AgentDeps,
+        port: &Arc<dyn EditPort>,
+    ) -> Option<Arc<crate::gate::Desk>> {
+        if let Some(desk) = &self.gate_desk {
+            return Some(Arc::clone(desk));
+        }
+        let desk = self.open_desk(
+            deps,
+            Arc::clone(port),
+            Arc::new(crate::claims::ServerClock::default()),
+            Arc::new(|| true),
+            None,
+        )?;
+        self.gate_desk = Some(Arc::clone(&desk));
+        Some(desk)
+    }
+
+    /// Open this gate session's desk over its lines' ledger (99.1): the
+    /// limits are its `[[gate]]`'s now, the outside system the one its room
+    /// was made for.
+    pub fn open_desk(
+        &self,
+        deps: &AgentDeps,
+        port: Arc<dyn EditPort>,
+        clock: Arc<crate::claims::ServerClock>,
+        may_post: Arc<dyn Fn() -> bool + Send + Sync>,
+        known: Option<Arc<rooms::Known>>,
+    ) -> Option<Arc<crate::gate::Desk>> {
+        let gate = self.context.agent.gate.as_ref()?;
+        let ledger = self.context.gate_ledger.clone()?;
+        let mut config = deps
+            .home
+            .config
+            .gates
+            .iter()
+            .find(|config| config.system == gate.system)?
+            .clone();
+        config.peer = gate.peer.clone();
+        Some(crate::gate::Desk::open(
+            crate::gate::DeskSetup {
+                gate: config,
+                clear: !gate.encrypted,
+                me: deps.home.config.matrix_user.clone(),
+                label: self.context.agent.label.clone(),
+                port,
+                clock,
+                known,
+                may_post,
+                session: self.context.session.path.clone(),
+                tickets: Arc::clone(&deps.gate_tickets),
+            },
+            ledger,
+        ))
+    }
+
+    /// Write what the desk said by itself — a ticket or a refusal at a
+    /// deadline — as its `gate` lines.
+    fn write_gate_facts(&mut self, desk: &crate::gate::Desk) -> Result<(), ServeError> {
+        let facts = desk.drain();
+        if facts.is_empty() {
+            return Ok(());
+        }
+        for fact in facts {
+            self.writer.write(
+                &mut self.context,
+                None,
+                fact.event,
+                LineBody::Gate(fact.line),
+            )?;
+        }
+        off_the_runtime(|| self.writer.sync())?;
+        Ok(())
+    }
+
+    /// A gate's request (99.1 #2, #3, #6, #9; 99.2 #1): taken by its desk
+    /// — where the front took it already, the same — then logged: refused
+    /// with no turn, or its `request` line (and, async, its ticket) and a
+    /// turn that reads that request only, under the gate's opening label,
+    /// which answers it with `reply`. A turn that ends without one refuses
+    /// it `no_answer`.
+    async fn gate_request(
+        &mut self,
+        deps: &AgentDeps,
+        port: Arc<dyn EditPort>,
+        arrived: Arrived,
+        stop: CancelSignal,
+    ) -> Result<Outcome, ServeError> {
+        use crate::gate::{refused_line, ticket_line, Took};
+        use keeper_core::agents::log::GateState;
+        let Some(desk) = self.desk(deps, &port) else {
+            tracing::warn!(session = %self.context.session.path, "agents: a gate session whose [[gate]] its home no longer has takes no request");
+            return Ok(Outcome::Ignored(NO_GATE));
+        };
+        self.write_gate_facts(&desk)?;
+        let Some(taken) = desk.take(&arrived) else {
+            return Ok(Outcome::Ignored(rooms::ONLY_REQUESTS));
+        };
+        let name = taken.request.request.clone();
+        let event = Some(arrived.event_id.clone());
+        if let Took::Refused {
+            reason,
+            requested: false,
+            at,
+        } = taken.took
+        {
+            self.writer.write(
+                &mut self.context,
+                None,
+                event,
+                LineBody::Gate(refused_line(&name, None, reason, at)),
+            )?;
+            off_the_runtime(|| self.writer.sync())?;
+            return Ok(Outcome::Gated {
+                request: name,
+                state: GateState::Refused,
+            });
+        }
+        // Each request starts at the gate's opening label (codemap Q5):
+        // what an earlier one read never reaches this one's answer, and the
+        // integrity stays `untrusted` (AD-416).
+        self.reset_gate_label(arrived.event_id.to_string())?;
+        let opened = self.writer.write(
+            &mut self.context,
+            None,
+            event,
+            LineBody::Gate(taken.request.line()),
+        )?;
+        match &taken.took {
+            Took::Ticketed { ticket, at } => {
+                // Written once its message's send ended: with that event,
+                // or with none when nothing was said (review R99S-06).
+                let said = desk.ticketed(&name).await;
+                self.writer.write(
+                    &mut self.context,
+                    Some(opened.id),
+                    said,
+                    LineBody::Gate(ticket_line(&name, ticket, None, *at)),
+                )?;
+            }
+            Took::Refused { reason, at, .. } => {
+                self.writer.write(
+                    &mut self.context,
+                    Some(opened.id),
+                    None,
+                    LineBody::Gate(refused_line(&name, None, *reason, *at)),
+                )?;
+                off_the_runtime(|| self.writer.sync())?;
+                return Ok(Outcome::Gated {
+                    request: name,
+                    state: GateState::Refused,
+                });
+            }
+            Took::Turn => {}
+        }
+        off_the_runtime(|| self.writer.sync())?;
+        let serving = crate::gate::Serving {
+            desk: Arc::clone(&desk),
+            request: name.clone(),
+        };
+        let state = self.gate_turn(deps, port, opened.id, serving, stop).await?;
+        self.write_gate_facts(&desk)?;
+        Ok(Outcome::Gated {
+            request: name,
+            state,
+        })
+    }
+
+    /// A gate's turn on one request (codemap Q6): no anchor, no stream and
+    /// no status in its room — the only thing that leaves is what `reply`
+    /// sends — its prose and every call logged. Where its request stands
+    /// after it.
+    async fn gate_turn(
+        &mut self,
+        deps: &AgentDeps,
+        port: Arc<dyn EditPort>,
+        opened: Ulid,
+        serving: crate::gate::Serving,
+        stop: CancelSignal,
+    ) -> Result<keeper_core::agents::log::GateState, ServeError> {
+        use keeper_core::agents::log::GateState;
+        let sinks = self.sinks(deps);
+        let gate = self.gate(deps, &port);
+        let tools = TurnTools {
+            surface: self.surface.clone(),
+            delegations: self.delegations.clone(),
+            room: Arc::clone(&port),
+            from: self.delegator(deps),
+            sinks,
+            gate,
+            scheduled: None,
+            desk: Some(serving.clone()),
+        };
+        let ran = run_agent_turn(
+            &mut self.context,
+            &mut self.writer,
+            deps,
+            None,
+            None,
+            stop,
+            tools,
+            None,
+            None,
+        )
+        .await;
+        let parent = ran.parent.or(Some(opened));
+        let said = if ran.round_logged {
+            String::new()
+        } else {
+            ran.round_text.clone()
+        };
+        let closing = match ran.ending {
+            // A turn whose result waits for a declassification ends at it:
+            // the host, not a resumed turn, sends what a person releases.
+            TurnEnding::Complete | TurnEnding::Stopped | TurnEnding::Asked | TurnEnding::Parked => {
+                let outcome = ran.outcome.as_ref();
+                let usage = outcome.and_then(|o| o.usage.as_ref());
+                LineBody::Assistant(AssistantBody {
+                    text: if ran.ending == TurnEnding::Stopped {
+                        format!("{said}{}", shutdown_suffix(deps.host.as_str()))
+                    } else {
+                        said
+                    },
+                    model: outcome
+                        .and_then(|o| o.model.clone())
+                        .unwrap_or_else(|| deps.bot.target.clone()),
+                    finish: outcome
+                        .map_or_else(|| "stop".to_owned(), |o| finish_word(&o.finish_reason)),
+                    usage: Usage {
+                        prompt: usage.and_then(|u| u.prompt_tokens),
+                        completion: usage.and_then(|u| u.completion_tokens),
+                    },
+                    ttft_ms: outcome.and_then(|o| o.first_token_ms),
+                    duration_ms: outcome.map_or(0, |o| o.total_ms),
+                    anchor_event: None,
+                })
+            }
+            _ => {
+                let (sentence, code) = match (ran.ending, ran.bound) {
+                    (TurnEnding::LocalOnly, _) => (LOCAL_ONLY_REFUSAL.to_owned(), "local_only"),
+                    (TurnEnding::Bounded, Some(bound)) => (bound.sentence(), bound.word()),
+                    (TurnEnding::Spent, _) => (helper::TURN_SPENT.to_owned(), "turn_tokens"),
+                    _ => (
+                        ran.error.clone().unwrap_or_else(|| TURN_FAILED.to_owned()),
+                        "turn_failed",
+                    ),
+                };
+                LineBody::Error(ErrorBody {
+                    sentence,
+                    code: code.to_owned(),
+                })
+            }
+        };
+        let closed = self
+            .writer
+            .write(&mut self.context, parent, None, closing)?;
+        for fact in serving.desk.finish(&serving.request).await {
+            self.writer.write(
+                &mut self.context,
+                Some(closed.id),
+                fact.event,
+                LineBody::Gate(fact.line),
+            )?;
+        }
+        off_the_runtime(|| self.writer.sync())?;
+        // A result held for its declassification is asked for in the
+        // owner's proxy DM now (99.2 #3).
+        if let Some(parked) = ran.parked.clone() {
+            Box::pin(self.hold_result(deps, &port, &serving, parked)).await?;
+        }
+        // What the turn handed on is asked for on the hour's card now that
+        // its lines are written (codemap Q4).
+        Box::pin(self.raise_tickets(deps, &port)).await?;
+        Ok(self
+            .context
+            .gate_last
+            .as_ref()
+            .filter(|(request, _)| *request == serving.request)
+            .map_or(GateState::Request, |(_, state)| *state))
+    }
+
+    /// The reply of the delegation ticket `open` came, its receipt written
+    /// (codemap Q4, Q5): the request is open again on the desk under its
+    /// ticket, the label back at the gate's opening one before the reply's
+    /// joins it — for this turn only — and the gate's turn reads that
+    /// request and the reply alone; its `reply` is the ticket's `result`.
+    async fn gate_callback(
+        &mut self,
+        deps: &AgentDeps,
+        port: Arc<dyn EditPort>,
+        open: &Delegation,
+        stop: CancelSignal,
+    ) -> Result<Outcome, ServeError> {
+        off_the_runtime(|| self.writer.sync())?;
+        let Some(desk) = self.desk(deps, &port) else {
+            return Ok(Outcome::Ignored(NO_GATE));
+        };
+        self.write_gate_facts(&desk)?;
+        let waiting = self
+            .context
+            .gate_pending
+            .iter()
+            .find(|(_, waiting)| waiting.ticket.as_deref() == Some(open.id.as_str()))
+            .and_then(|(request, waiting)| Some((request.clone(), waiting.event.clone()?)));
+        let Some((request, event)) = waiting else {
+            tracing::info!(delegation = %open.id, "agents: a gate's delegation replied for a ticket that is closed");
+            return Ok(Outcome::Ignored(NOT_A_DELEGATION));
+        };
+        // A result held for its declassification stays the one its record
+        // names: a later reply of the same ticket opens no second turn and
+        // asks for no second record.
+        if self.context.gate_held.contains_key(&request) {
+            tracing::info!(delegation = %open.id, %request, "agents: a gate's ticket replied again while its result waits for its owner's decision; the reply is no turn");
+            return Ok(Outcome::Ignored(RESULT_HELD));
+        }
+        desk.call_back(&request, event.clone(), open.id.clone());
+        self.reset_gate_label(event.to_string())?;
+        let Some(peer) = self.peer_the_reply()? else {
+            return Ok(Outcome::Ignored(NOT_A_DELEGATION));
+        };
+        off_the_runtime(|| self.writer.sync())?;
+        let serving = crate::gate::Serving {
+            desk: Arc::clone(&desk),
+            request: request.clone(),
+        };
+        let state = self.gate_turn(deps, port, peer.id, serving, stop).await?;
+        self.write_gate_facts(&desk)?;
+        Ok(Outcome::Gated { request, state })
+    }
+
+    /// Bring a gate session's label back to its opening one (codemap Q5),
+    /// by a `label` line naming `reference`, when it is anything else.
+    fn reset_gate_label(&mut self, reference: String) -> Result<(), ServeError> {
+        let opening = self.context.agent.label.clone();
+        if self.context.label != opening {
+            self.writer.write(
+                &mut self.context,
+                None,
+                None,
+                LineBody::Label(LabelBody::new(
+                    &opening,
+                    LabelCause {
+                        kind: LabelCauseKind::Outside,
+                        reference,
+                    },
+                )),
+            )?;
+        }
+        Ok(())
+    }
+
     /// Serve one arrival: ignore it, log a decision, or run a turn.
     pub async fn serve(
         &mut self,
@@ -2974,7 +5646,20 @@ impl ServedSession {
                 session_kind: self.context.agent.kind,
                 agent_user: &config.matrix_user,
                 requester: &self.context.agent.requested_by,
-                readers: &self.context.label.readers,
+                // A gate's decisions are its tickets', each asked under the
+                // gate's opening label, never the label a callback's reply
+                // narrowed between turns (R371).
+                readers: if self.context.agent.kind == SessionKind::Gate {
+                    &self.context.agent.label.readers
+                } else {
+                    &self.context.label.readers
+                },
+                peer: self
+                    .context
+                    .agent
+                    .gate
+                    .as_ref()
+                    .map(|gate| gate.peer.as_ref()),
             },
             &arrived.sender,
             arrived.arrival,
@@ -2984,6 +5669,9 @@ impl ServedSession {
                 tracing::info!(session = %self.context.session.path, sender = %arrived.sender, note, "agents: an observer's event is not a turn");
                 Ok(Outcome::Ignored(note))
             }
+            // A gate never waits for a person (codemap Q4): its outside
+            // system's request is taken whatever else is under way.
+            Disposition::GateRequest => self.gate_request(deps, port, arrived, stop).await,
             // A workflow's run that replied, or failed, takes no more turns
             // (R202): what would start one is left as it is.
             Disposition::Turn | Disposition::Unasked if self.run_ended() => {
@@ -3016,6 +5704,9 @@ impl ServedSession {
                 off_the_runtime(|| self.writer.sync())?;
                 Ok(Outcome::Decided)
             }
+            // Where the person stopped listening is logged whatever the
+            // session waits for, and starts nothing (R44, AD-411).
+            Disposition::Heard => self.heard(arrived),
             // While a call waits for a person (R74): in the person's own
             // `main` or `conversation` session their new message denies it
             // and then runs; anywhere else what would start a turn is held
@@ -3162,6 +5853,27 @@ impl ServedSession {
         if matches!(scheduled, Scheduled::Run { .. }) && self.holds_windows() {
             return Ok(Outcome::Ignored(ASK_WAITS));
         }
+        // A follow session whose run's end is captured asks the broker
+        // nothing more: each window finishes the end from its capture
+        // (R275). One that holds none yet first reads its room — the
+        // index a host that captured it put there, then the timeline that
+        // says which capture binds (R279) — however far this checkout lags
+        // behind that host's lines (R277).
+        if matches!(scheduled, Scheduled::Run { .. }) {
+            if self.context.paseo_ended.is_some() {
+                return self.finish_paseo(deps).await;
+            }
+            if follows_a_run(&self.context.agent) {
+                match self.adopt_paseo(deps).await {
+                    Ok(true) => return self.finish_paseo(deps).await,
+                    Ok(false) => {}
+                    Err(why) => {
+                        tracing::warn!(session = %self.context.session.path, %why, "agents: a follow session's room could not be read for a captured end; nothing is polled");
+                        return Ok(Outcome::Ignored(PASEO_UNCHECKED));
+                    }
+                }
+            }
+        }
         let session = self.context.session.path.clone();
         let lease = self.writer.lease();
         // A window begins only while the claim names it (R56): a run routed
@@ -3267,6 +5979,10 @@ impl ServedSession {
         let ran = self.turn(deps, port, arrived, stop).await;
         self.scheduled_card = None;
         self.finish_scheduled(deps, &card, ran.as_ref().ok().map(|report| report.ending))?;
+        // A run's end this window captured is told now, not a window later.
+        if self.context.paseo_ended.is_some() {
+            self.finish_paseo(deps).await?;
+        }
         ran.map(Outcome::Answered)
     }
 
@@ -3354,6 +6070,310 @@ impl ServedSession {
         Ok(Outcome::Scheduled(LogRun::Failed))
     }
 
+    /// Finish this follow session's captured run end (R275, R277), asking
+    /// the broker nothing: a `pending` capture is delivered
+    /// ([`Self::deliver_paseo`]); then the follow card's schedule ends,
+    /// while this host still holds the session. A failure leaves the end as
+    /// it is, and the card's next window comes back here.
+    async fn finish_paseo(&mut self, deps: &AgentDeps) -> Result<Outcome, ServeError> {
+        use keeper_core::agents::log::PaseoState;
+        let Some(ended) = self.context.paseo_ended.clone() else {
+            return Ok(Outcome::Ignored(PASEO_UNTOLD));
+        };
+        let session = self.context.session.path.clone();
+        if ended.state == PaseoState::Pending {
+            if let Err(why) = self.deliver_paseo(deps).await {
+                tracing::warn!(%session, completion = %ended.completion, %why, "agents: a Paseo run's end could not be told; it is tried again at the card's next window");
+                return Ok(Outcome::Ignored(PASEO_UNTOLD));
+            }
+        }
+        let zone = deps.sessions_zone.clone();
+        let lease = self.writer.lease();
+        let may_write = move || lease.as_ref().is_none_or(|lease| lease.may_write());
+        match off_the_runtime(|| {
+            cards::end_schedule(
+                &zone,
+                &session,
+                keeper_core::agents::paseo::FOLLOW_CARD,
+                &may_write,
+            )
+        }) {
+            Ok(_) => Ok(Outcome::Ignored(PASEO_TOLD)),
+            Err(error) => {
+                tracing::warn!(%session, %error, "agents: a told Paseo run's follow card kept its schedule; it is ended at the card's next window");
+                Ok(Outcome::Ignored(PASEO_UNTOLD))
+            }
+        }
+    }
+
+    /// Whether `room`'s index says `me` published a capture of
+    /// `completion` (`keeper_core::agents::paseo::CAPTURED`), as the
+    /// homeserver holds it now: a lookup only — which capture binds the
+    /// end, and whether it was delivered, the timeline says
+    /// ([`Self::paseo_authority`]).
+    async fn paseo_indexed(
+        port: &dyn DelegationPort,
+        room: &RoomId,
+        me: &UserId,
+        completion: &str,
+    ) -> Result<bool, String> {
+        use keeper_core::agents::paseo as core_paseo;
+        let state = port.state(room, core_paseo::CAPTURED, completion).await?;
+        Ok(state
+            .filter(|(sender, _)| sender == me)
+            .and_then(|(_, content)| serde_json::from_value::<core_paseo::Captured>(content).ok())
+            .is_some_and(|captured| captured.completion == completion))
+    }
+
+    /// What `room`'s timeline establishes of `completion` as `me` wrote it
+    /// there: the first capture, which binds the end, and any delivery
+    /// (R279).
+    async fn paseo_authority(
+        port: &dyn DelegationPort,
+        room: &RoomId,
+        me: &UserId,
+        completion: &str,
+    ) -> Result<keeper_core::agents::paseo::Authority, String> {
+        let events = port.captures(room, completion, me).await?;
+        Ok(keeper_core::agents::paseo::authority(
+            &events, me, completion,
+        ))
+    }
+
+    /// The capture `binding` names, read back: the bytes of its encrypted
+    /// file, which hash to the digest its message names.
+    async fn paseo_captured(
+        port: &dyn DelegationPort,
+        binding: &keeper_core::agents::paseo::Binding,
+        completion: &str,
+    ) -> Result<keeper_core::agents::log::PaseoBody, String> {
+        let bytes = port.download(&binding.file).await?;
+        keeper_core::agents::paseo::capture_of(&bytes, &binding.digest, completion)
+            .ok_or_else(|| "the room's capture is not the one its message names".to_owned())
+    }
+
+    /// The label of `ended`'s notice, when the home drive's readers as they
+    /// are now may hold its record (NFR-115, AD-391, R96PA-08): asked before
+    /// a capture's bytes are logged or materialized here — an adopted
+    /// capture's too, whose label was admitted where it was captured, not
+    /// where it goes now (R279).
+    fn paseo_admitted(
+        deps: &AgentDeps,
+        ended: &keeper_core::agents::log::PaseoBody,
+    ) -> Result<Label, String> {
+        let label = ended
+            .content
+            .as_ref()
+            .and_then(delegate::reply_label)
+            .ok_or_else(|| "its notice carries no label".to_owned())?;
+        if let SinkVerdict::Block { reason, .. } = check_sink(
+            &label,
+            &keeper_core::agents::label::Sink::DriveWrite {
+                drive_readers: Readers::Only(deps.home.drive.readers.clone()),
+            },
+        ) {
+            return Err(format!("its record may not be written now: {reason}"));
+        }
+        Ok(label)
+    }
+
+    /// A follow session that holds no capture — its checkout may lag
+    /// behind the host that captured the end — adopts the one its room
+    /// binds, delivered too when the room says so: whether it did. Only
+    /// when the room's index names no capture may the broker be polled
+    /// (R277); one it names is read from the timeline (R279) and admitted
+    /// to the home drive as its readers are now before any of it is logged.
+    async fn adopt_paseo(&mut self, deps: &AgentDeps) -> Result<bool, String> {
+        let Some(port) = self.delegations.clone() else {
+            return Ok(false);
+        };
+        let me = deps.home.config.matrix_user.clone();
+        let own = self.context.agent.room.clone();
+        let completion = keeper_core::agents::paseo::completion_id(&self.context.agent.id);
+        if !Self::paseo_indexed(port.as_ref(), &own, &me, &completion).await? {
+            return Ok(false);
+        }
+        let authority = Self::paseo_authority(port.as_ref(), &own, &me, &completion).await?;
+        let binding = authority.capture.ok_or_else(|| {
+            "the room's index names a capture its timeline does not hold".to_owned()
+        })?;
+        let adopted = Self::paseo_captured(port.as_ref(), &binding, &completion).await?;
+        Self::paseo_admitted(deps, &adopted)?;
+        self.write_paseo(adopted.clone())?;
+        if let Some(event) = authority.delivered {
+            self.write_paseo(keeper_core::agents::log::PaseoBody {
+                state: keeper_core::agents::log::PaseoState::Delivered,
+                record: None,
+                content: None,
+                event: Some(event),
+                ..adopted
+            })?;
+        }
+        Ok(true)
+    }
+
+    /// Log a `paseo` line, synced before anything is done after it.
+    fn write_paseo(&mut self, body: keeper_core::agents::log::PaseoBody) -> Result<(), String> {
+        self.writer
+            .write(&mut self.context, None, None, LineBody::Paseo(body))
+            .map_err(|error| error.to_string())?;
+        off_the_runtime(|| self.writer.sync()).map_err(|error| error.to_string())
+    }
+
+    /// Deliver the `pending` capture, every step made from its bytes (R277).
+    /// The room's timeline first (R279): with no capture there, this one is
+    /// published as an encrypted file in the session's own room, admitted
+    /// there for its label, and the timeline read again — whichever host's
+    /// capture the homeserver took first binds the end, and a different
+    /// one is adopted in this one's place, once the home drive's readers
+    /// now read its label. A delivery message there ends it: only logged.
+    /// Then the room's index is put, the record materialized under the
+    /// same admission, the notice admitted to the starting room as it is
+    /// now and sent under the completion's transaction id — a send the
+    /// homeserver took but did not acknowledge is the same event sent
+    /// again — and its delivery appended to the timeline and logged.
+    /// Uploading, publishing, adopting, indexing, materializing and telling
+    /// each happen only while this host still holds the session, checked
+    /// right before them, after every wait; the delivery message is not:
+    /// it says what the homeserver already took, and being appended it
+    /// replaces nothing.
+    async fn deliver_paseo(&mut self, deps: &AgentDeps) -> Result<(), String> {
+        use keeper_core::agents::paseo as core_paseo;
+        let port = self
+            .delegations
+            .clone()
+            .ok_or_else(|| delegate::NO_ROOMS.to_owned())?;
+        let lease = self.writer.lease();
+        let holds = move |step: &str| {
+            if lease.as_ref().is_none_or(|lease| lease.may_write()) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "this host no longer holds the session, so {step} was not done"
+                ))
+            }
+        };
+        let me = deps.home.config.matrix_user.clone();
+        let own = self.context.agent.room.clone();
+        let sinks = self.sinks(deps);
+        off_the_runtime(|| self.writer.sync()).map_err(|error| error.to_string())?;
+        let Some(mut ended) = self.context.paseo_ended.clone() else {
+            return Err("no run end is captured".to_owned());
+        };
+        let digest = keeper_core::agents::approval::sha256_hex(&core_paseo::capture_bytes(&ended));
+        let mut authority =
+            Self::paseo_authority(port.as_ref(), &own, &me, &ended.completion).await?;
+        if authority.capture.is_none() {
+            let label = ended
+                .content
+                .as_ref()
+                .and_then(delegate::reply_label)
+                .ok_or_else(|| "its notice carries no label".to_owned())?;
+            holds("uploading the capture")?;
+            let file = port.upload(core_paseo::capture_bytes(&ended)).await?;
+            let message = core_paseo::capture_message(&ended.completion, &digest, file);
+            delegate::admit_reply(port.as_ref(), &sinks, &own, [&me, &me], &label, &message)
+                .await?;
+            holds("publishing the capture")?;
+            let txn =
+                matrix_sdk::ruma::OwnedTransactionId::from(format!("{}-capture", ended.completion));
+            port.send(&own, message, txn)
+                .await
+                .map_err(|error| format!("its capture could not be published: {error}"))?;
+            authority = Self::paseo_authority(port.as_ref(), &own, &me, &ended.completion).await?;
+        }
+        let binding = authority.capture.ok_or_else(|| {
+            "the room's timeline does not hold the published capture yet".to_owned()
+        })?;
+        if binding.digest != digest {
+            let adopted = Self::paseo_captured(port.as_ref(), &binding, &ended.completion).await?;
+            Self::paseo_admitted(deps, &adopted)?;
+            holds("adopting the room's capture")?;
+            self.write_paseo(adopted.clone())?;
+            ended = adopted;
+        }
+        let delivered = |event| keeper_core::agents::log::PaseoBody {
+            state: keeper_core::agents::log::PaseoState::Delivered,
+            record: None,
+            content: None,
+            event: Some(event),
+            ..ended.clone()
+        };
+        if let Some(event) = authority.delivered {
+            return self.write_paseo(delivered(event));
+        }
+        holds("indexing the capture")?;
+        port.put_state(
+            &own,
+            core_paseo::CAPTURED,
+            &ended.completion,
+            serde_json::to_value(core_paseo::Captured {
+                v: keeper_core::agents::events::CONTENT_VERSION,
+                completion: ended.completion.clone(),
+                digest: binding.digest.clone(),
+                capture: binding.event.clone(),
+            })
+            .map_err(|error| error.to_string())?,
+        )
+        .await
+        .map_err(|error| format!("its index could not be put: {error}"))?;
+        let (Some(record), Some(content)) = (&ended.record, &ended.content) else {
+            return Err("its capture holds no record or notice".to_owned());
+        };
+        let label = Self::paseo_admitted(deps, &ended)?;
+        let zone = deps.sessions_zone.clone();
+        let session = self.context.session.path.clone();
+        let on_disk = crate::zone::read_text(&zone, &format!("{session}/{}", ended.artifact))
+            .ok()
+            .flatten();
+        if on_disk.as_deref() != Some(record.as_str()) {
+            let lease = self.writer.lease();
+            let may_write = move || lease.as_ref().is_none_or(|lease| lease.may_write());
+            off_the_runtime(|| {
+                crate::sessions::write::session_write(
+                    &zone,
+                    &session,
+                    &ended.artifact,
+                    record,
+                    &may_write,
+                )
+            })
+            .map_err(|error| format!("its record could not be written: {error}"))?;
+        }
+        let reply = self
+            .context
+            .agent
+            .reply
+            .clone()
+            .ok_or_else(|| "this session names no conversation to tell".to_owned())?;
+        let origin = paseo_origin(&zone, &reply);
+        delegate::admit_reply(
+            port.as_ref(),
+            &sinks,
+            &ended.room,
+            [&me, paseo_delegating(origin.as_ref(), &me)],
+            &label,
+            content,
+        )
+        .await?;
+        holds("telling the conversation")?;
+        let txn = matrix_sdk::ruma::OwnedTransactionId::from(ended.completion.as_str());
+        let event = port
+            .send(&ended.room, content.clone(), txn)
+            .await
+            .map_err(|error| format!("the conversation could not be told: {error}"))?;
+        // What was sent is said whoever holds the session now: no new
+        // effect, and appended, it replaces nothing; a taker reads it and
+        // never tells the end again.
+        port.send(
+            &own,
+            core_paseo::delivered_message(&ended.completion, &binding.event, &event),
+            matrix_sdk::ruma::OwnedTransactionId::from(format!("{}-delivered", ended.completion)),
+        )
+        .await
+        .map_err(|error| format!("the room could not be told it was delivered: {error}"))?;
+        self.write_paseo(delivered(event))
+    }
     /// End the run of the scheduled card `card` as its turn — the run's own
     /// or a parked run's continuation — ended (`None`: it failed), on the
     /// card and as a `run` line: `review`, `failed`, or `blocked` — a run
@@ -3429,6 +6449,16 @@ impl ServedSession {
                 &self.context.agent,
                 &config.matrix_user,
             ),
+            gate: self
+                .context
+                .agent
+                .gate
+                .as_ref()
+                .map(|gate| crate::delegate::GateDelegator {
+                    delegates: gate.delegates.clone(),
+                    approvers: self.gate_approvers(deps),
+                    clear: !gate.encrypted,
+                }),
         }
     }
 
@@ -4040,8 +7070,18 @@ impl ServedSession {
 
     /// A delegation this session made moved (R55): its target joined — the
     /// brief goes in now — or replied, which is logged with what it said and
-    /// answered by a turn of this session's agent. Anyone else's event from
-    /// that room, and one for a delegation in another state, changes nothing.
+    /// answered by a turn of this session's agent; a Paseo run's end its
+    /// follow session told the delegated session's room is taken the same
+    /// way, once, whether or not the delegation's own reply came first
+    /// (R96PA2-05). An event of the target's this copy could not decrypt,
+    /// or could not link to the target's device, may be such an end: the
+    /// room's readback is owed from then on, so no later end is taken
+    /// before it (R283, R293). A workflow's run this agent started is a
+    /// delegation to the agent itself: a Paseo run that run started ends in
+    /// the run's room, its own news, so there such an end is never taken
+    /// and nothing unreadable holds anything (R311). Anyone else's event
+    /// from that room, and one for a delegation in another state, changes
+    /// nothing.
     async fn delegation_moved(
         &mut self,
         deps: &AgentDeps,
@@ -4058,14 +7098,35 @@ impl ServedSession {
         else {
             return Ok(Outcome::Ignored(NOT_A_DELEGATION));
         };
+        let own_run = open.to == deps.home.config.matrix_user;
         match arrived.arrival {
             Arrival::Joined if !open.sent => {
                 self.send_brief(deps, &open, Some(arrived.event_id)).await
             }
-            Arrival::Replied if open.sent && !open.replied => {
+            Arrival::Unreadable if open.sent && !own_run => {
+                tracing::info!(delegation = %open.id, event = %arrived.event_id, "agents: a delegation's room holds an event this copy cannot decrypt or link to its sender; its ends wait for the room to be read back past it");
+                self.retry.completions.insert(open.id.clone());
+                Ok(Outcome::Ignored(COMPLETION_HELD))
+            }
+            Arrival::Replied
+                if own_run
+                    && keeper_core::agents::paseo::completion_of(&arrived.content).is_some() =>
+            {
+                Ok(Outcome::Ignored(RUNS_OWN_END))
+            }
+            Arrival::Replied if self.context.takes_reply(&open, &arrived.content) => {
                 let Some(label) = delegate::reply_label(&arrived.content) else {
                     return Ok(Outcome::Ignored(NOT_A_DELEGATION));
                 };
+                // Completions are taken in their room's order: while that
+                // room's readback is owed, a live one waits for it — the
+                // readback reads it too — and so moves no cursor past an
+                // older one not yet taken (R279).
+                if keeper_core::agents::paseo::completion_of(&arrived.content).is_some()
+                    && self.retry.completions.contains(&open.id)
+                {
+                    return Ok(Outcome::Ignored(COMPLETION_HELD));
+                }
                 // The receipt carries the reply: a crash before its `peer`
                 // line loses nothing (`peer_the_reply`).
                 self.writer.write(
@@ -4083,10 +7144,18 @@ impl ServedSession {
                             text: arrived.text.clone(),
                             artifacts: handed_over(&arrived.content),
                             label,
+                            completion: keeper_core::agents::paseo::completion_of(&arrived.content)
+                                .map(|(completion, _)| completion.to_owned()),
                         }),
                         window: None,
+                        approval: None,
                     }),
                 )?;
+                // A gate's ticket comes back (codemap Q5): its own turn on
+                // its request and this reply, its answer the ticket's result.
+                if self.context.agent.kind == SessionKind::Gate {
+                    return Box::pin(self.gate_callback(deps, port, &open, stop)).await;
+                }
                 // A workflow's run that replied takes a late child's reply
                 // as a record, never as a turn that reopens it (R202).
                 if self.run_ended() {
@@ -4214,12 +7283,14 @@ impl ServedSession {
         };
         let session = self.context.session.path.clone();
         let known = rooms.known();
-        let content = match delegate::content_for(
-            open,
-            &self.delegator(deps),
-            &self.context.label,
-            &known,
-        ) {
+        // A gate's brief goes under the label its ticket was asked under —
+        // the gate's opening one — whatever request runs now (codemap Q5).
+        let label = if self.context.agent.kind == SessionKind::Gate {
+            self.context.agent.label.clone()
+        } else {
+            self.context.label.clone()
+        };
+        let content = match delegate::content_for(open, &self.delegator(deps), &label, &known) {
             Ok(content) => content,
             Err(sentence) => {
                 tracing::warn!(%session, delegation = %open.id, %sentence, "agents: a brief could not be composed");
@@ -4231,7 +7302,7 @@ impl ServedSession {
         let content = self
             .declassified(deps, open)
             .and_then(|released| {
-                delegate::approved_brief(&self.context.label, &released.readers, |approved| {
+                delegate::approved_brief(&label, &released.readers, |approved| {
                     delegate::content_for(open, &self.delegator(deps), approved, &known)
                 })
                 .filter(|(_, sha)| *sha == released.sha256)
@@ -4297,6 +7368,7 @@ impl ServedSession {
                     reason: Some(reason),
                     reply: None,
                     window: None,
+                    approval: None,
                 }),
             )?;
             off_the_runtime(|| self.writer.sync())?;
@@ -4331,6 +7403,7 @@ impl ServedSession {
                 reason: None,
                 reply: None,
                 window: None,
+                approval: None,
             }),
         )?;
         off_the_runtime(|| self.writer.sync())?;
@@ -4338,8 +7411,10 @@ impl ServedSession {
     }
 
     /// The replies `open`'s target sent since its latest round that this
-    /// session has not logged, read back from the room; a room that could
-    /// not be read is tried again on the clock.
+    /// session has not logged and takes now ([`SessionContext::takes_reply`]),
+    /// read back from the room; a room that could not be read is tried again
+    /// on the clock. A Paseo run's completion is not read here: it may
+    /// precede the latest round ([`Self::read_completions`]).
     async fn read_replies(&mut self, open: &Delegation, me: &UserId) -> Vec<Arrived> {
         let Some(rooms) = self.delegations.clone() else {
             return Vec::new();
@@ -4357,6 +7432,39 @@ impl ServedSession {
         events
             .iter()
             .filter_map(|event| reply_of(event, &open.to, &open.room, now))
+            .filter(|arrived| keeper_core::agents::paseo::completion_of(&arrived.content).is_none())
+            .filter(|arrived| self.context.takes_reply(open, &arrived.content))
+            .filter(|arrived| !self.writer.seen(&arrived.event_id).unwrap_or(true))
+            .collect()
+    }
+
+    /// The Paseo run completions `open`'s target told its room that this
+    /// session has not taken, read back as far as the newest completion it
+    /// took from that room — its own cursor, whatever round the exchange is
+    /// in — or to the room's beginning (R277). A history that could not be
+    /// read back that far is no recovery: it is read again on the clock.
+    async fn read_completions(&mut self, open: &Delegation) -> Vec<Arrived> {
+        let Some(rooms) = self.delegations.clone() else {
+            return Vec::new();
+        };
+        let cursor = self.context.paseo_cursor.get(&open.id).cloned();
+        let events = match rooms
+            .completions(&open.room, cursor.as_deref(), &open.to)
+            .await
+        {
+            Ok(events) => events,
+            Err(error) => {
+                tracing::warn!(delegation = %open.id, %error, "agents: a delegation's room could not be read back for a Paseo run's end; it is read again on the clock");
+                self.retry.completions.insert(open.id.clone());
+                return Vec::new();
+            }
+        };
+        self.retry.completions.remove(&open.id);
+        let now = Instant::now();
+        events
+            .iter()
+            .filter_map(|event| reply_of(event, &open.to, &open.room, now))
+            .filter(|arrived| self.context.takes_reply(open, &arrived.content))
             .filter(|arrived| !self.writer.seen(&arrived.event_id).unwrap_or(true))
             .collect()
     }
@@ -4364,8 +7472,10 @@ impl ServedSession {
     /// On a worker's start: every delegation's room is watched again —
     /// replied ones too, since a later round's reply must come back here; a
     /// brief whose target joined while this host was down is sent now; a
-    /// reply that came meanwhile is returned, to be served like one that
-    /// arrives (R55).
+    /// reply that came meanwhile, or a Paseo run's end told after the
+    /// delegation replied, is returned, to be served like one that arrives
+    /// (R55, R96PA2-05). A workflow's run this agent started is never read
+    /// back for ends: none there is its starter's (R311).
     pub async fn resume_delegations(&mut self, deps: &AgentDeps) -> Vec<Arrived> {
         let Some(rooms) = self.delegations.clone() else {
             return Vec::new();
@@ -4385,8 +7495,13 @@ impl ServedSession {
                         tracing::warn!(delegation = %open.id, %error, "agents: a brief could not be logged");
                     }
                 }
-            } else if !open.replied {
-                replies.extend(self.read_replies(&open, &me).await);
+            } else {
+                if !open.replied {
+                    replies.extend(self.read_replies(&open, &me).await);
+                }
+                if open.to != me {
+                    replies.extend(self.read_completions(&open).await);
+                }
             }
         }
         replies
@@ -4407,21 +7522,55 @@ impl ServedSession {
             }
         }
         for id in std::mem::take(&mut self.retry.replies) {
-            let Some(open) = self
-                .context
-                .delegations
-                .get(&id)
-                .filter(|open| open.sent && !open.replied)
-            else {
+            let Some(open) = self.context.delegations.get(&id).filter(|open| open.sent) else {
                 continue;
             };
             let open = open.clone();
             replies.extend(self.read_replies(&open, &me).await);
         }
+        for id in std::mem::take(&mut self.retry.completions) {
+            let Some(open) = self.context.delegations.get(&id).filter(|open| open.sent) else {
+                continue;
+            };
+            let open = open.clone();
+            replies.extend(self.read_completions(&open).await);
+        }
         if self.retry.tell {
             self.tell_the_requester(deps).await;
         }
         replies
+    }
+
+    /// Where the person stopped listening to a spoken answer (AD-411, Q9):
+    /// checked against the answer it names, its offset counted here from the
+    /// sentences the device finished, and logged as one `heard` line under
+    /// that answer, carrying the event — so a redelivery is a duplicate.
+    /// Nothing else: the turn is not cancelled (R44, DW-419), and only the
+    /// next turn's context reads the answer cut.
+    fn heard(&mut self, arrived: Arrived) -> Result<Outcome, ServeError> {
+        let marked = HeardContent::read(&arrived.content)
+            .ok_or(HeardRefusal::Unreadable)
+            .and_then(|content| self.context.mark_heard(&content));
+        let marked = match marked {
+            Ok(marked) => marked,
+            Err(refusal) => {
+                let note = refusal.note();
+                tracing::info!(session = %self.context.session.path, sender = %arrived.sender, event = %arrived.event_id, note, "agents: a heard mark was not logged");
+                return Ok(Outcome::Ignored(note));
+            }
+        };
+        if let Some(device) = marked.disagreed {
+            tracing::info!(session = %self.context.session.path, event = %arrived.event_id, device, counted = marked.body.heard_until, "agents: a heard mark's offset is the one counted here, not the device's");
+        }
+        let heard_until = marked.body.heard_until;
+        self.writer.write(
+            &mut self.context,
+            Some(marked.body.assistant),
+            Some(arrived.event_id.clone()),
+            LineBody::Heard(marked.body),
+        )?;
+        off_the_runtime(|| self.writer.sync())?;
+        Ok(Outcome::Heard { heard_until })
     }
 
     /// The person's scope event (AD-382, R41): its focus replaces the held
@@ -4592,6 +7741,7 @@ impl ServedSession {
             title: title.clone(),
             requested_by: person.clone(),
             parent: None,
+            reply: None,
             room: room.clone(),
             drives: self.context.scope.clone(),
             label: self.context.agent.label.clone(),
@@ -4604,6 +7754,7 @@ impl ServedSession {
             checkpoints: None,
             outputs: Vec::new(),
             created_at: chrono::Utc::now(),
+            gate: None,
         };
         let path = match off_the_runtime(|| {
             verbs::create_agent_session(&zone, &agent, chrono::Local::now())
@@ -4857,6 +8008,7 @@ impl ServedSession {
                         reason: None,
                         reply: None,
                         window: None,
+                        approval: None,
                     });
                     self.writer.write(&mut self.context, None, None, accepted)?;
                 }
@@ -4894,6 +8046,7 @@ impl ServedSession {
                         reason: None,
                         reply: None,
                         window: None,
+                        approval: None,
                     });
                     self.writer.write(&mut self.context, None, None, accepted)?;
                 }
@@ -5180,6 +8333,7 @@ impl ServedSession {
             sinks: sinks.clone(),
             gate: Arc::clone(&gate),
             scheduled: self.scheduled_card.clone(),
+            desk: None,
         };
         let ran = run_agent_turn(
             &mut self.context,
@@ -5231,6 +8385,7 @@ impl ServedSession {
                     keeper_core::agents::approval::summary_of(
                         parked.parking.classification.tool,
                         &parked.args,
+                        &parked.parking.exec_binding,
                     )
                 });
                 let note = format!("{} {summary}", crate::approvals::WAITING_FOR);
@@ -5418,7 +8573,7 @@ impl ServedSession {
                 None,
                 LineBody::Error(ErrorBody {
                     sentence: NARROWER_THAN_ROOM.to_owned(),
-                    code: LABEL_CODE.to_owned(),
+                    code: WITHHELD_CODE.to_owned(),
                 }),
             )?;
         }
@@ -5522,6 +8677,7 @@ impl ServedSession {
             sinks,
             gate: self.gate(deps, port),
             scheduled: None,
+            desk: None,
         };
         let ran = run_agent_turn(
             &mut self.context,
@@ -5595,13 +8751,24 @@ impl ServedSession {
     /// audiences (R199), the session's own agents left out, under the label
     /// now; a suppression audited.
     pub(crate) fn gate(&self, deps: &AgentDeps, port: &Arc<dyn EditPort>) -> Arc<RoomGate> {
+        self.gate_under(deps, port, self.context.label.clone())
+    }
+
+    /// [`Self::gate`] under `label` rather than the label now: a gate's
+    /// ticket goes on the card under the label it was asked under.
+    pub(crate) fn gate_under(
+        &self,
+        deps: &AgentDeps,
+        port: &Arc<dyn EditPort>,
+        label: Label,
+    ) -> Arc<RoomGate> {
         Arc::new(RoomGate::new(
             Arc::clone(port),
             self.delegations
                 .as_ref()
                 .map(|rooms| Arc::new(crate::ask::with_pinned_proxies(&rooms.known()))),
             self.context.room_own(&deps.home.config.matrix_user),
-            self.context.label.clone(),
+            label,
             Some((self.sinks(deps), self.context.agent.room.clone())),
         ))
     }
@@ -5941,6 +9108,25 @@ impl TurnView for Mutex<TurnLog<'_>> {
         let limits = log.context.agent.limits.as_ref()?;
         Some((log.context.tokens_spent + log.open_round(), limits.tokens))
     }
+
+    fn paseo_started(&self, broker: &str) -> std::collections::BTreeSet<String> {
+        self.lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .context
+            .paseo_runs
+            .iter()
+            .filter(|started| started.broker == broker)
+            .map(|started| started.id.clone())
+            .collect()
+    }
+
+    fn paseo_ended(&self) -> Option<keeper_core::agents::log::PaseoBody> {
+        self.lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .context
+            .paseo_ended
+            .clone()
+    }
 }
 
 /// A session's own log, written by its worker outside a turn: what a
@@ -6066,6 +9252,13 @@ fn grant_read(grants: &dyn GrantSource, drive: &str, at: &str) -> Result<(), Str
     }
 }
 
+/// Whether a turn of the agent `config` is offered `delegate` — and so may
+/// call it: its `[tools].allow` names it, in a gate as anywhere (R365's
+/// ceiling holds a gate's allow to its three tools).
+fn offers_delegate(config: &keeper_core::agents::home::AgentConfig) -> bool {
+    config.allow.iter().any(|name| name == delegate::DELEGATE)
+}
+
 /// The `reply` a turn of a session of kind `session` is offered: the answer
 /// of a session that answers a requester — delegated, or a workflow's run
 /// (R48, R104) — or — in the `main` or `conversation` of an agent of
@@ -6073,7 +9266,9 @@ fn grant_read(grants: &dyn GrantSource, drive: &str, at: &str) -> Result<(), Str
 /// (`relays_waiting`) — the relay of that answer (R100).
 fn reply_offer(session: SessionKind, relays_waiting: bool, kind: AgentKind) -> ReplyOffer {
     let own = matches!(session, SessionKind::Main | SessionKind::Conversation);
-    if matches!(session, SessionKind::Delegated | SessionKind::Workflow) {
+    if session == SessionKind::Gate {
+        ReplyOffer::Gate
+    } else if matches!(session, SessionKind::Delegated | SessionKind::Workflow) {
         ReplyOffer::Delegated
     } else if kind == AgentKind::Proxy && own && relays_waiting {
         ReplyOffer::Relay
@@ -6090,21 +9285,39 @@ fn reply_offer(session: SessionKind, relays_waiting: bool, kind: AgentKind) -> R
 /// tools where the home drive `home` reads (R195), `helper` as `allow`
 /// says (R105), `ask_human` by the session's kind (R102),
 /// `workflow_start` outside a proxy's own conversation (AD-380) and the
-/// memory tools `allow` names, by the session's kind (R127), and
-/// `drive_search` as `allow` says (95.4). Arming and a workflow's start
-/// check both ask it (R202).
+/// memory tools `allow` names, by the session's kind (R127),
+/// `drive_search` as `allow` says (95.4), `run` as `allow` says where
+/// this host's sandbox passed its probe, `sandboxed` (96.1 #11), and the
+/// tools of each server `[tools].mcp` names that answered its last
+/// `tools/list` on this host, `mcp`, each that can travel and has a tier
+/// (96.2 #3, #5). Arming and a workflow's start check both ask it (R202).
+#[allow(clippy::too_many_arguments)]
 fn agent_offer(
     config: &keeper_core::agents::home::AgentConfig,
     session: SessionKind,
     relays_waiting: bool,
     grants: &dyn GrantSource,
     home: &str,
+    sandboxed: bool,
+    mcp: Option<&crate::mcp::McpServers>,
+    kvm: &[String],
     mut tools: Vec<chat::ToolSpec>,
 ) -> Vec<chat::ToolSpec> {
     // Whether this model is offered tools at all: the surface tools ride on
     // the same offer, and a model that cannot call tools is told of none.
     if tools.is_empty() {
         return tools;
+    }
+    // A gate's tools are a ceiling (codemap Q1): its turn is offered its
+    // answer, and as `allow` says `delegate` — a hand-off a person decides
+    // on the hour's card (R371) — and `journal_append`, whose entry waits
+    // on the same card and is written quoted as data (99.2 #2). Its MCP
+    // servers are not offered (DW-1360). Its dispatch refuses anything it
+    // was not offered ([`NOT_OFFERED`], R369).
+    if session == SessionKind::Gate {
+        let mut offered = delegate::specs(offers_delegate(config), ReplyOffer::Gate);
+        offered.extend(crate::memory::specs(&config.allow, session, None));
+        return offered;
     }
     tools.retain(|spec| config.allow.contains(&spec.name));
     tools.extend(crate::surface::specs(&crate::surface::offered(config)));
@@ -6138,6 +9351,28 @@ fn agent_offer(
     if config.allow.iter().any(|name| crate::search::serves(name)) {
         tools.push(crate::search::spec());
     }
+    if sandboxed
+        && config
+            .allow
+            .iter()
+            .any(|name| name == keeper_core::agents::run::RUN)
+    {
+        tools.push(keeper_core::agents::run::spec());
+    }
+    if let Some(servers) = mcp {
+        tools.extend(servers.specs(&config.mcp));
+    }
+    if !kvm.is_empty() {
+        for (name, description, parameters) in keeper_core::agents::kvm::specs(kvm) {
+            if config.allow.iter().any(|allowed| allowed == name) {
+                tools.push(chat::ToolSpec {
+                    name: name.to_owned(),
+                    description,
+                    parameters,
+                });
+            }
+        }
+    }
     tools
 }
 
@@ -6164,6 +9399,9 @@ fn workflow_offer(
         false,
         &grants,
         &deps.home.drive.id,
+        deps.sandbox.is_some(),
+        deps.mcp.as_deref(),
+        &kvm_ids(config, deps.kvm.as_deref()),
         model_tools.to_vec(),
     )
     .into_iter()
@@ -6217,6 +9455,9 @@ async fn arm_session(
         !context.relays.is_empty(),
         grants.as_ref(),
         &deps.home.drive.id,
+        deps.sandbox.is_some(),
+        deps.mcp.as_deref(),
+        &kvm_ids(config, deps.kvm.as_deref()),
         model_tools.clone(),
     );
     (armed, model_tools)
@@ -6241,6 +9482,11 @@ fn open_body(context: &SessionContext, deps: &AgentDeps, composed: &ComposedProm
         ),
         prompt_sha256: composed.prompt_sha256.clone(),
         memory_sha256: composed.memory_sha256.clone(),
+        encrypted: context
+            .agent
+            .gate
+            .as_ref()
+            .is_none_or(|gate| gate.encrypted),
     }
 }
 
@@ -6450,6 +9696,7 @@ async fn run_agent_turn(
         Some(_) => ReplyOffer::None,
         None => reply_offer(context.agent.kind, !context.relays.is_empty(), config.kind),
     };
+    let in_gate = context.agent.kind == SessionKind::Gate;
     let asks_offered =
         review.is_none() && keeper_core::agents::ask::offered(config.kind, context.agent.kind);
     let unattended =
@@ -6466,6 +9713,7 @@ async fn run_agent_turn(
     // A workflow's run checks at its reply the outputs it declared as it
     // opened, whatever its header says now (R107, R202).
     let outputs = context.agent.outputs.clone();
+    let gate_journal = context.gate_journal.clone();
     let workflow_roots: Vec<(String, PathBuf)> = profiles
         .iter()
         .map(|profile| (profile.id.clone(), profile.local_path.clone()))
@@ -6539,6 +9787,24 @@ async fn run_agent_turn(
             review: review.is_some(),
         },
     );
+    // `run`'s place on this host: the session's workspace, the drives the
+    // agent may read in its scope this host mounts, and the `session`
+    // approvals of runs it holds (96.1, R146).
+    let runs = deps.sandbox.as_ref().map(|host| RunTools {
+        host: Arc::clone(host),
+        drive: deps.drive_root.clone(),
+        zone: deps.sessions_subfolder.clone(),
+        session: context.session.path.clone(),
+        drives: run_drives(context, deps),
+        allowances: context.run_allowances.clone(),
+        labels: Mutex::new(Vec::new()),
+    });
+    // Whose screen reads a read of this turn is: the session's folder.
+    let screen_session = deps
+        .sessions_zone
+        .join(&context.session.path)
+        .display()
+        .to_string();
     let log = Mutex::new(TurnLog {
         context,
         writer,
@@ -6567,6 +9833,8 @@ async fn run_agent_turn(
             drive_readers: Readers::Only(deps.home.drive.readers.clone()),
             view: &log,
             allow: &allow,
+            signer: keeper_core::agents::knowledge::agent_actor(&config.id, deps.host.as_str()),
+            drive_root: deps.drive_root.clone(),
         },
         bmad,
         grants,
@@ -6590,7 +9858,7 @@ async fn run_agent_turn(
             root: deps.drive_root.clone(),
             zone: agents_zone,
             roots: workflow_roots,
-            offered: offered_names,
+            offered: offered_names.clone(),
             run_offer: Box::new(move |drives: &[String]| {
                 workflow_offer(deps, &model_tools, drives)
             }),
@@ -6607,7 +9875,8 @@ async fn run_agent_turn(
             reply,
             &tools.sinks,
         )
-        .with_outputs(outputs),
+        .with_outputs(outputs)
+        .serving(tools.desk),
         memory,
         search,
         view: &log,
@@ -6632,6 +9901,38 @@ async fn run_agent_turn(
             helper_offer,
             stop.clone(),
         ),
+        only_offered: in_gate.then_some(offered_names),
+        gate_journal,
+        runs,
+        // A review pass reads and proposes, a gate turn answers (R369):
+        // offered no MCP tool, neither is given any to call either, so one
+        // it names anyway is refused unsent.
+        mcp: deps
+            .mcp
+            .as_ref()
+            .filter(|_| !config.mcp.is_empty() && review.is_none() && !in_gate)
+            .map(|servers| McpTools {
+                servers: Arc::clone(servers),
+                names: config.mcp.clone(),
+                stop: stop.clone(),
+                answers: Mutex::new(Vec::new()),
+                pinned: Mutex::new(None),
+                zone: deps.sessions_zone.clone(),
+                session: screen_session.clone(),
+            }),
+        // A review pass reads and proposes: no KVM either.
+        kvm: deps
+            .kvm
+            .as_ref()
+            .filter(|_| review.is_none())
+            .map(|kvms| (kvms, kvm_ids(config, Some(kvms))))
+            .filter(|(_, ids)| !ids.is_empty())
+            .map(|(kvms, ids)| KvmTools {
+                kvms: Arc::clone(kvms),
+                ids,
+                zone: deps.sessions_zone.clone(),
+                answers: Mutex::new(Vec::new()),
+            }),
     };
     let tool_loop = ToolLoop {
         client: &client,
@@ -6701,7 +10002,13 @@ async fn run_agent_turn(
             .collect();
         // A helper's answer was drawn from its brief, which this session's
         // model wrote, and from what it read: it carries the session's
-        // label joined with its reads.
+        // label joined with its reads. A run's result is labelled by what it
+        // could read (96.1 #14).
+        let ran = host.runs.as_ref().and_then(RunTools::take_label);
+        // An MCP answer is outside content, read by its server's readers.
+        let fetched = host.mcp.as_ref().and_then(McpTools::take);
+        // A KVM's frame is outside content, read by the KVM's readers.
+        let framed = host.kvm.as_ref().and_then(KvmTools::take);
         let result_label = if helped.is_some() {
             reads
                 .iter()
@@ -6712,10 +10019,30 @@ async fn run_agent_turn(
             reads
                 .iter()
                 .map(|(label, _)| label.clone())
+                .chain(ran.clone())
+                .chain(fetched.as_ref().map(|answer| answer.label.clone()))
+                .chain(framed.as_ref().map(|answer| answer.label.clone()))
                 .reduce(|joined, label| joined.join(&label))
                 .unwrap_or_else(|| log.context.label.clone())
         };
-        let (word, truncated) = result_word(outcome);
+        // An MCP answer cut to its bound says so where nothing else did; KVM
+        // inputs that stopped part way failed, though some were sent.
+        let (word, truncated) = match result_word(outcome) {
+            _ if framed.as_ref().is_some_and(|answer| answer.stopped) => {
+                (ToolOutcomeWord::Failed, None)
+            }
+            (ToolOutcomeWord::Ok, None) => (
+                ToolOutcomeWord::Ok,
+                fetched.as_ref().and_then(|answer| answer.truncated),
+            ),
+            worded => worded,
+        };
+        // A run's end the call captured is the end's first durable step:
+        // on the log before its result, before anything of it is made or
+        // sent (R277).
+        if let Some(ended) = fetched.as_ref().and_then(|answer| answer.ended.clone()) {
+            log.write(call_line, LineBody::Paseo(ended));
+        }
         log.last_line = log.write(
             call_line,
             LineBody::ToolResult(ToolResultBody {
@@ -6724,6 +10051,11 @@ async fn run_agent_turn(
                 content: tools::render_result(outcome),
                 truncated,
                 label: result_label,
+                paseo: fetched.as_ref().and_then(|answer| answer.started.clone()),
+                effect: framed
+                    .as_ref()
+                    .and_then(|answer| answer.effect)
+                    .map(str::to_owned),
             }),
         );
         let surfaced = host
@@ -6772,6 +10104,40 @@ async fn run_agent_turn(
             }
             log.progress.reads += 1;
         }
+        let outside = fetched
+            .map(|answer| (answer.label, answer.at))
+            .into_iter()
+            .chain(framed.map(|answer| (answer.label, answer.at)));
+        for (label, at) in outside {
+            let joined = log.context.label.join(&label);
+            if joined != log.context.label {
+                log.write(
+                    None,
+                    LineBody::Label(LabelBody::new(
+                        &joined,
+                        LabelCause {
+                            kind: LabelCauseKind::Outside,
+                            reference: at,
+                        },
+                    )),
+                );
+            }
+        }
+        if let Some(label) = ran {
+            let joined = log.context.label.join(&label);
+            if joined != log.context.label {
+                log.write(
+                    None,
+                    LineBody::Label(LabelBody::new(
+                        &joined,
+                        LabelCause {
+                            kind: LabelCauseKind::ToolResult,
+                            reference: wire.id.clone(),
+                        },
+                    )),
+                );
+            }
+        }
         log.progress.calls += 1;
         // The room's gate checks the label as it is now from the next send.
         if let Some(board) = board {
@@ -6804,8 +10170,53 @@ async fn run_agent_turn(
                 grant_id: None,
             }),
         );
-        // A parked call has no result until a person decided (R73).
+        // Keeper's own screenshot of the Mac's screen for a parked call is
+        // read by the screen server's readers: the session's label says so
+        // before its card reaches anyone (R316).
+        let pinned = host.mcp.as_ref().and_then(|tools| {
+            tools
+                .pinned
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take()
+        });
+        // A parked call has no result until a person decided (R73). What
+        // keeper read to ask about it — a KVM's frame — joins the label now,
+        // so the record and its request are the label's (S-18).
         if let ToolOutcome::Parked { .. } = outcome {
+            if let Some((label, at)) = pinned {
+                let joined = log.context.label.join(&label);
+                if joined != log.context.label {
+                    log.write(
+                        None,
+                        LineBody::Label(LabelBody::new(
+                            &joined,
+                            LabelCause {
+                                kind: LabelCauseKind::Outside,
+                                reference: at,
+                            },
+                        )),
+                    );
+                }
+            }
+            if let Some(answer) = host.kvm.as_ref().and_then(KvmTools::take) {
+                let joined = log.context.label.join(&answer.label);
+                if joined != log.context.label {
+                    log.write(
+                        None,
+                        LineBody::Label(LabelBody::new(
+                            &joined,
+                            LabelCause {
+                                kind: LabelCauseKind::Outside,
+                                reference: answer.at,
+                            },
+                        )),
+                    );
+                    if let Some(board) = board {
+                        board.relabel(&log.context.label);
+                    }
+                }
+            }
             log.parked = Some((call_line, wire.clone()));
             return;
         }
@@ -6839,12 +10250,14 @@ async fn run_agent_turn(
             let (call, (record, outcome)) = match resume.settled {
                 // What runs is what the record bound, not the log's
                 // redacted copy (R174).
-                crate::approvals::Settled::Run(bound, released) => {
+                crate::approvals::Settled::Run(bound, released, approved_run) => {
                     // The approval — and the flow a `declassify` one lets
-                    // through — is this one execution's alone (R89).
-                    let ran = host.run_bound(&bound, resume.approval, released, || {
-                        tools::run_call(&host, &default_profile, &bound, &mut events)
-                    });
+                    // through, the facts a `run` one was checked on — is
+                    // this one execution's alone (R89, R213).
+                    let ran =
+                        host.run_bound(&bound, resume.approval, released, approved_run, || {
+                            tools::run_call(&host, &default_profile, &bound, &mut events)
+                        });
                     let ran = match ran {
                         // A bound call never parks again (its drift is
                         // refused); were it to, it would not wait either.
@@ -7016,14 +10429,24 @@ async fn run_agent_turn(
                     args["call"] = json!({"tool": wire.name, "arguments": wire.arguments_raw});
                     args
                 }
-                None => wire.arguments.unwrap_or(Value::Null),
+                None => parking
+                    .args
+                    .take()
+                    .or(wire.arguments)
+                    .unwrap_or(Value::Null),
             };
+            let workspace = parking.workspace.clone();
+            let screen = parking.screen.clone();
+            let preview = parking.preview.clone();
             Some(crate::approvals::ParkedTurn {
                 parking,
                 call_line,
                 args,
                 preconditions: keeper_core::agents::approval::Preconditions {
                     files,
+                    workspace,
+                    screen,
+                    preview,
                     ..Default::default()
                 },
                 rest: parked_rest,
@@ -7139,7 +10562,7 @@ fn read_label(
 
 /// `dir` relative to `root`, `/`-separated: the agents zone's folder in
 /// its drive.
-fn drive_relative(root: &Path, dir: &Path) -> String {
+pub(crate) fn drive_relative(root: &Path, dir: &Path) -> String {
     dir.strip_prefix(root)
         .map(|rel| {
             rel.components()
@@ -7204,6 +10627,10 @@ fn drive_read_label(
 /// declaration, and each context file arming loaded, under its drive's
 /// declaration and its own facts, as a read of it would be. A context file
 /// of a drive this host holds no declaration for is left out of the prompt.
+/// The descriptions and schemas an MCP server wrote of the tools offered
+/// are outside content as its answers are (R225): each such server's
+/// result label joins here, before any request carries them — a role
+/// server's tools are described by keeper and join nothing.
 fn join_prompt_sources(
     context: &mut SessionContext,
     writer: &mut SessionWriter,
@@ -7211,14 +10638,24 @@ fn join_prompt_sources(
     armed: &mut crate::turn::Armed,
 ) -> Result<(), WriterError> {
     let home = &deps.home.drive;
-    let mut sources = vec![(
-        Label {
-            readers: Readers::Only(home.readers.clone()),
-            integrity: Integrity::Owner,
-            local_only: home.local_only,
-        },
-        format!("{}/{}", deps.home.config.drive, deps.home.config.id),
-    )];
+    // A gate's prompt carries its soul, which its audience was released,
+    // and no file of a drive (codemap Q16): nothing of them joins.
+    let gate = context.agent.kind == SessionKind::Gate;
+    if gate {
+        armed.context = None;
+    }
+    let mut sources = Vec::new();
+    if !gate {
+        sources.push((
+            Label {
+                readers: Readers::Only(home.readers.clone()),
+                integrity: Integrity::Owner,
+                local_only: home.local_only,
+            },
+            format!("{}/{}", deps.home.config.drive, deps.home.config.id),
+            LabelCauseKind::DriveRead,
+        ));
+    }
     if let Some(bundle) = armed.context.as_mut() {
         let profiles = &armed.profiles;
         bundle.files.retain(|file| {
@@ -7239,7 +10676,7 @@ fn join_prompt_sources(
                     card_untrusted: keeper_core::agents::card::marked_untrusted(&head),
                 },
             );
-            sources.push((label, file.subpath.clone()));
+            sources.push((label, file.subpath.clone(), LabelCauseKind::DriveRead));
             true
         });
         bundle.total_bytes = bundle
@@ -7248,20 +10685,41 @@ fn join_prompt_sources(
             .map(|file| usize::try_from(file.bytes).unwrap_or(usize::MAX))
             .sum();
     }
-    for (label, reference) in sources {
+    if let Some(servers) = &deps.mcp {
+        let mut offering: Vec<&str> = armed
+            .request
+            .tools
+            .iter()
+            .filter_map(|spec| keeper_core::agents::mcp::decode(&spec.name))
+            .map(|(server, _)| server)
+            .collect();
+        offering.sort_unstable();
+        offering.dedup();
+        for server in offering {
+            // What a server wrote of its own tools is outside content: every
+            // server's but a Paseo broker's or a KVM's, which keeper words.
+            if let Some(entry) = servers.entry(server).filter(|entry| {
+                matches!(
+                    entry.role,
+                    None | Some(keeper_core::agents::mcp::McpRole::Screen)
+                )
+            }) {
+                sources.push((
+                    keeper_core::agents::mcp::result_label(entry),
+                    format!("{}{server}", keeper_core::agents::mcp::CAPABILITY_PREFIX),
+                    LabelCauseKind::Outside,
+                ));
+            }
+        }
+    }
+    for (label, reference, kind) in sources {
         let joined = context.label.join(&label);
         if joined != context.label {
             writer.write(
                 context,
                 None,
                 None,
-                LineBody::Label(LabelBody::new(
-                    &joined,
-                    LabelCause {
-                        kind: LabelCauseKind::DriveRead,
-                        reference,
-                    },
-                )),
+                LineBody::Label(LabelBody::new(&joined, LabelCause { kind, reference })),
             )?;
         }
     }

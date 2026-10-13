@@ -772,6 +772,24 @@ pub struct HostRuntime {
     /// Each held harvest session's view of the archive (R61).
     harvesters: HashMap<OwnedRoomId, Harvester>,
     stewards: Stewarding,
+    /// The MCP servers this host names: each is `mcp:<name>` in the
+    /// manifest only while it answered its last `tools/list` (96.2 #3).
+    mcp: Option<McpOffer>,
+}
+
+/// A host's MCP servers as its manifest offers them: the refresh running
+/// beside the lease clock, the servers answering as of this tick (what
+/// this host's own manifest says, locally and when published), and the
+/// ones a manifest the homeserver took last said. `published` is `None`
+/// while that is unknown — nothing published yet, or a publication failed
+/// after it may have reached the homeserver — and stays so until a
+/// publication succeeds: whatever the servers do meanwhile, the next tick
+/// publishes.
+struct McpOffer {
+    servers: Arc<crate::mcp::McpServers>,
+    refreshing: Option<tokio::task::JoinHandle<()>>,
+    offering: Vec<String>,
+    published: Option<Vec<String>>,
 }
 
 /// The steward duty sessions this host still has to see made (R66, R165),
@@ -877,19 +895,24 @@ async fn make_steward(
     Ok(true)
 }
 
+/// The `sandbox` capability, when the host's probe passed (96.1 #11): a
+/// host offers it only where it can enforce it.
+fn sandbox_tool(sandbox: bool) -> impl Iterator<Item = String> {
+    sandbox.then(|| "sandbox".to_owned()).into_iter()
+}
+
 impl HostRuntime {
-    /// The runtime of an agentd host over its mounted `drives` and `copies`.
+    /// The runtime of an agentd host over its mounted `drives` and `copies`;
+    /// `sandbox` when its probe passed (96.1 #11).
     pub(crate) fn agentd(
         config: &AgentdConfig,
         host: HostSlug,
         version: &str,
         drives: &[DriveView],
         copies: Vec<Arc<Copy>>,
+        sandbox: bool,
     ) -> HostRuntime {
-        let tools = config
-            .mcp
-            .iter()
-            .map(|mcp| format!("mcp:{}", mcp.name))
+        let tools = sandbox_tool(sandbox)
             .chain(config.kvm.iter().map(|kvm| format!("kvm:{}", kvm.id)))
             .collect();
         let manifest_drives = drives
@@ -923,18 +946,21 @@ impl HostRuntime {
             calendar: server_calendar(),
             harvesters: HashMap::new(),
             stewards: Stewarding::default(),
+            mcp: None,
         }
     }
 
-    /// The runtime of a desktop host: never always on, no tool of its own
-    /// yet, its drives as the app syncs them, and no control room until one
-    /// of its copies is found in the principal's ([`Self::set_control_room`]).
+    /// The runtime of a desktop host: never always on, `sandbox` its only
+    /// tool when its probe passed, its drives as the app syncs them, and no
+    /// control room until one of its copies is found in the principal's
+    /// ([`Self::set_control_room`]).
     pub(crate) fn desktop(
         host: HostSlug,
         principal: &str,
         version: &str,
         drives: &[(DriveView, Materialized)],
         copies: Vec<Arc<Copy>>,
+        sandbox: bool,
     ) -> HostRuntime {
         HostRuntime {
             host,
@@ -942,7 +968,7 @@ impl HostRuntime {
             always_on: false,
             version: version.to_owned(),
             control_room: None,
-            tools: Vec::new(),
+            tools: sandbox_tool(sandbox).collect(),
             drives: drives
                 .iter()
                 .map(|(view, materialized)| HostDrive {
@@ -965,7 +991,45 @@ impl HostRuntime {
             calendar: server_calendar(),
             harvesters: HashMap::new(),
             stewards: Stewarding::default(),
+            mcp: None,
         }
+    }
+
+    /// Offer `servers` while each answers (96.2 #3): listed again at every
+    /// renewal of the manifest, as a task of its own beside the lease clock.
+    pub(crate) fn with_mcp(mut self, servers: Arc<crate::mcp::McpServers>) -> HostRuntime {
+        self.mcp = Some(McpOffer {
+            servers,
+            refreshing: None,
+            offering: Vec::new(),
+            published: None,
+        });
+        self
+    }
+
+    /// The MCP servers' side of a tick: when the manifest is `due`, their
+    /// refresh starts as its own task unless the last one still runs —
+    /// never awaited here, so a server that does not answer, or a call
+    /// holding its connection, cannot hold the lease clock (R225). What it
+    /// offers is read again now, and whether that differs from what the
+    /// homeserver is known to hold, so it is published at once.
+    fn tick_mcp(&mut self, due: bool) -> bool {
+        let Some(offer) = &mut self.mcp else {
+            return false;
+        };
+        if offer
+            .refreshing
+            .as_ref()
+            .is_some_and(tokio::task::JoinHandle::is_finished)
+        {
+            offer.refreshing = None;
+        }
+        if due && offer.refreshing.is_none() {
+            let servers = Arc::clone(&offer.servers);
+            offer.refreshing = Some(tokio::spawn(async move { servers.refresh().await }));
+        }
+        offer.offering = offer.servers.answering();
+        offer.published.as_ref() != Some(&offer.offering)
     }
 
     /// The principal's control room, once known.
@@ -1065,13 +1129,32 @@ impl HostRuntime {
             .collect();
         bots.sort();
         bots.dedup();
+        // The Mac's screen is offered while a screen server answers (96.4
+        // #1); agentd refuses a screen server at parse, so never there.
+        let screen = self.mcp.iter().any(|offer| {
+            offer.offering.iter().any(|name| {
+                offer.servers.entry(name).is_some_and(|entry| {
+                    entry.role == Some(keeper_core::agents::mcp::McpRole::Screen)
+                })
+            })
+        });
         HostManifest {
             v: CONTENT_VERSION,
             host: self.host.as_str().to_owned(),
             principal: self.principal.clone(),
             version: self.version.clone(),
             always_on: self.always_on,
-            tools: self.tools.clone(),
+            tools: self
+                .tools
+                .iter()
+                .cloned()
+                .chain(self.mcp.iter().flat_map(|offer| {
+                    offer.offering.iter().map(|name| {
+                        format!("{}{name}", keeper_core::agents::mcp::CAPABILITY_PREFIX)
+                    })
+                }))
+                .chain(screen.then(|| keeper_core::agents::screen::CAPABILITY.to_owned()))
+                .collect(),
             drives: self.drives.clone(),
             bots,
             agents: self
@@ -1157,19 +1240,31 @@ impl HostRuntime {
     pub async fn tick(&mut self, stop: &CancelSignal) {
         self.tick_stewards();
         self.join_control_room().await;
-        if self
+        let due = self
             .manifest_sent
-            .is_none_or(|at| at.elapsed() >= RENEW_EVERY)
-        {
+            .is_none_or(|at| at.elapsed() >= RENEW_EVERY);
+        // A server that came to answer, or stopped, renews it at once.
+        if self.tick_mcp(due) || due {
             match self.publish(true).await {
                 Ok(true) => {
                     let now = Instant::now();
                     self.manifest_sent = Some(now);
                     self.first_published.get_or_insert(now);
+                    if let Some(offer) = &mut self.mcp {
+                        offer.published = Some(offer.offering.clone());
+                    }
                 }
-                // No copy has the control room yet: try again next tick.
+                // No copy has the control room yet: nothing was sent, so
+                // what the homeserver holds is as it was; try again next
+                // tick.
                 Ok(false) => {}
-                Err(error) => tracing::warn!(%error, "agents: the host manifest was not renewed"),
+                // It may have reached the homeserver, or not.
+                Err(error) => {
+                    if let Some(offer) = &mut self.mcp {
+                        offer.published = None;
+                    }
+                    tracing::warn!(%error, "agents: the host manifest was not renewed");
+                }
             }
         }
         let hosts = self.manifests().await;
@@ -1420,6 +1515,7 @@ impl HostRuntime {
                         bot: &bot,
                         principal: &principal,
                         prefer_always_on: config.host.prefer_always_on,
+                        always_on_only: false,
                         holder: None,
                     },
                     hosts,
@@ -1593,6 +1689,17 @@ impl HostRuntime {
             .into_iter()
             .find(|(key, _)| key.is_empty())
             .and_then(|(_, state)| ServerClaim::read(&state).ok());
+        // A follow session whose run's end is captured — on this checkout's
+        // log, or in its room's index another host put there — tells that
+        // capture and calls no tool again: it is placed without any
+        // `mcp:<server>` (R277). The index is a hint only: the worker reads
+        // which capture binds from the room's timeline (R279).
+        let captured = slot.session.paseo_captured
+            || copy
+                .cached_states(room, keeper_core::agents::paseo::CAPTURED)
+                .await
+                .into_iter()
+                .any(|(_, state)| state.sender == copy.config().matrix_user);
         let server_now = self.clock.now();
         let config = copy.config();
         let principal = copy
@@ -1601,11 +1708,14 @@ impl HostRuntime {
         let Some(slot) = self.slots.get_mut(room) else {
             return;
         };
-        let needs = slot
+        let mut needs = slot
             .agent
             .needs
             .clone()
             .unwrap_or_else(|| config.host.needs.clone());
+        if captured {
+            needs.retain(|need| !need.starts_with(keeper_core::agents::mcp::CAPABILITY_PREFIX));
+        }
         // A scheduled card's `host:` is its session's pin (R57).
         let card_pin = cards::session_schedule(Some(&slot.agent), &slot.session.scheduled)
             .ok()
@@ -1629,6 +1739,8 @@ impl HostRuntime {
                 bot: &bot,
                 principal: &principal,
                 prefer_always_on: config.host.prefer_always_on,
+                // A gate runs on always-on hosts only (codemap Q14).
+                always_on_only: slot.agent.kind == SessionKind::Gate,
                 holder: cached.as_ref().map(|c| c.content.host.as_str()),
             },
             hosts,
@@ -1916,6 +2028,7 @@ impl HostRuntime {
                         from_host,
                         ending: Arc::clone(&ending),
                         activity: Arc::clone(&activity),
+                        clock: Arc::clone(&self.clock),
                     },
                 );
                 if let Some(slot) = self.slots.get_mut(room) {
@@ -2704,6 +2817,10 @@ mod tests {
         stall_doorbells: AtomicBool,
         /// A claim send fails.
         fail_claims: AtomicBool,
+        /// A manifest send fails.
+        fail_manifests: AtomicBool,
+        /// Reading a manifest back fails.
+        fail_manifest_readbacks: AtomicBool,
         /// Every room the steward's user made for a duty, as every copy of
         /// her sees it, and the ones a copy left.
         steward_rooms: Mutex<Vec<OwnedRoomId>>,
@@ -2910,7 +3027,7 @@ mod tests {
             Box::pin(async { false })
         }
 
-        fn members<'a>(&'a self, _room: &'a RoomId) -> crate::delegate::MembersFuture<'a> {
+        fn members<'a>(&'a self, _room: &'a RoomId) -> crate::matrix_sink::MembersFuture<'a> {
             Box::pin(async { Ok(BTreeSet::new()) })
         }
 
@@ -2920,6 +3037,51 @@ mod tests {
             _me: &'a matrix_sdk::ruma::UserId,
         ) -> crate::delegate::EventsFuture<'a> {
             Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn completions<'a>(
+            &'a self,
+            _room: &'a RoomId,
+            _after: Option<&'a matrix_sdk::ruma::EventId>,
+            _teller: &'a matrix_sdk::ruma::UserId,
+        ) -> crate::delegate::EventsFuture<'a> {
+            unreachable!("opening a run reads no Paseo run's end")
+        }
+
+        fn upload(&self, _bytes: Vec<u8>) -> crate::delegate::FileFuture<'_> {
+            unreachable!("opening a run uploads nothing")
+        }
+
+        fn download<'a>(&'a self, _file: &'a Value) -> crate::delegate::BytesFuture<'a> {
+            unreachable!("opening a run downloads nothing")
+        }
+
+        fn put_state<'a>(
+            &'a self,
+            _room: &'a RoomId,
+            _event_type: &'a str,
+            _key: &'a str,
+            _content: Value,
+        ) -> crate::matrix_sink::SendFuture<'a> {
+            unreachable!("opening a run puts no state")
+        }
+
+        fn state<'a>(
+            &'a self,
+            _room: &'a RoomId,
+            _event_type: &'a str,
+            _key: &'a str,
+        ) -> crate::delegate::StateFuture<'a> {
+            unreachable!("opening a run reads no state")
+        }
+
+        fn captures<'a>(
+            &'a self,
+            _room: &'a RoomId,
+            _completion: &'a str,
+            _agent: &'a matrix_sdk::ruma::UserId,
+        ) -> crate::delegate::EventsFuture<'a> {
+            unreachable!("opening a run reads no Paseo capture")
         }
 
         fn brief_room<'a>(&'a self, _room: &'a RoomId) -> crate::delegate::BriefRoomFuture<'a> {
@@ -2993,6 +3155,7 @@ mod tests {
                 zone: zone.to_owned(),
                 subfolder: "60-sessions".to_owned(),
                 chain: vec![user(PERSON)],
+                gate: None,
             };
             let offer = |_: &[String]| vec!["drive_read".to_owned()];
             let sinks = self.sinks(agent);
@@ -3090,6 +3253,9 @@ mod tests {
                 if stall.load(Ordering::Relaxed) {
                     std::future::pending::<()>().await;
                 }
+                if event_type == HOST && self.server.fail_manifests.load(Ordering::Relaxed) {
+                    return Err(AgentMatrixError::Network("unreachable".to_owned()));
+                }
                 Ok(self.server.put(
                     room,
                     event_type,
@@ -3106,7 +3272,13 @@ mod tests {
             event_type: &'a str,
             state_key: &'a str,
         ) -> ClaimFuture<'a, Result<Option<ServerState>, AgentMatrixError>> {
-            Box::pin(async move { Ok(self.server.get(room, event_type, state_key)) })
+            Box::pin(async move {
+                if event_type == HOST && self.server.fail_manifest_readbacks.load(Ordering::Relaxed)
+                {
+                    return Err(AgentMatrixError::Network("unreachable".to_owned()));
+                }
+                Ok(self.server.get(room, event_type, state_key))
+            })
         }
 
         fn claims<'a>(&'a self, room: &'a OwnedRoomId) -> Box<dyn ClaimPort + 'a> {
@@ -3500,6 +3672,7 @@ mod tests {
             calendar: server_calendar(),
             harvesters: HashMap::new(),
             stewards: Stewarding::default(),
+            mcp: None,
         };
         let (cancel, stop) = cancellation();
         let now = Arc::new(std::sync::atomic::AtomicI64::new(wall_ms() as i64));
@@ -3542,6 +3715,7 @@ mod tests {
                 title: "main".to_owned(),
                 requested_by: user(PERSON),
                 parent: None,
+                reply: None,
                 room: room.clone(),
                 drives: vec!["tgdrive".to_owned()],
                 label: Label::opening(&decl, Integrity::Owner),
@@ -3554,6 +3728,7 @@ mod tests {
                 checkpoints: None,
                 outputs: Vec::new(),
                 created_at: chrono::Utc::now(),
+                gate: None,
             };
             let dir = self.dir(room);
             std::fs::create_dir_all(&dir).expect("dir");
@@ -3562,6 +3737,7 @@ mod tests {
                 dir,
                 agent: Ok(agent.clone()),
                 scheduled: cards::ScheduledScan::default(),
+                paseo_captured: false,
             };
             self.rt.offer(&self.copy, &session, &agent);
         }
@@ -3660,6 +3836,7 @@ mod tests {
                 dir,
                 agent: Ok(agent.clone()),
                 scheduled: cards::ScheduledScan::default(),
+                paseo_captured: false,
             };
             self.rt.offer(&self.copy, &session, &agent);
         }
@@ -4090,6 +4267,7 @@ mod tests {
             title: "work".to_owned(),
             requested_by: user(PERSON),
             parent: None,
+            reply: None,
             room: room.clone(),
             drives: vec!["tgdrive".to_owned()],
             label: Label::opening(&decl, Integrity::Owner),
@@ -4102,6 +4280,7 @@ mod tests {
             checkpoints: None,
             outputs: Vec::new(),
             created_at: chrono::Utc::now(),
+            gate: None,
         })
     }
 
@@ -4966,6 +5145,17 @@ mod tests {
 
         /// [`World::offer_scheduled`], the session needing `needs`.
         fn offer_scheduled_needing(&mut self, room: &OwnedRoomId, needs: Option<Vec<String>>) {
+            self.offer_scheduled_as(room, needs, None);
+        }
+
+        /// [`World::offer_scheduled_needing`], the session answering
+        /// `reply` — a follow session when it names a run.
+        fn offer_scheduled_as(
+            &mut self,
+            room: &OwnedRoomId,
+            needs: Option<Vec<String>>,
+            reply: Option<keeper_core::agents::session::SessionReply>,
+        ) {
             self.copy.joined.lock().expect("lock").insert(room.clone());
             self.copy
                 .members
@@ -4983,6 +5173,7 @@ mod tests {
                 title: "sort".to_owned(),
                 requested_by: user(PERSON),
                 parent: None,
+                reply,
                 room: room.clone(),
                 drives: vec!["tgdrive".to_owned()],
                 label: Label::opening(&decl, Integrity::Owner),
@@ -4995,6 +5186,7 @@ mod tests {
                 checkpoints: None,
                 outputs: Vec::new(),
                 created_at: chrono::Utc::now(),
+                gate: None,
             };
             let dir = zone.join(SCHEDULED);
             let session = FoundSession {
@@ -5002,6 +5194,7 @@ mod tests {
                 dir: dir.clone(),
                 agent: Ok(agent.clone()),
                 scheduled: cards::scheduled_cards(SCHEDULED, &dir),
+                paseo_captured: crate::zone::paseo_captured(&agent, &dir),
             };
             self.rt.offer(&self.copy, &session, &agent);
         }
@@ -5548,6 +5741,112 @@ mod tests {
         let card = card_in(zone.path());
         assert!(ran_in(&card, "2026-10-05T09:00:00Z"), "{card:?}");
         assert_eq!(run_of(&card), Some(keeper_core::agents::card::Run::Waiting));
+    }
+
+    /// A `paseo` line of a captured run end, as a follow session's worker
+    /// logs it, written into the session `dir`.
+    fn capture_logged(dir: &Path) {
+        use keeper_core::agents::log::{
+            writer::{rotate_at, ChunkWriter},
+            HostSlug, LineBody, LogLine, PaseoBody, PaseoState, LINE_VERSION,
+        };
+        let host = HostSlug::new(ME).expect("slug");
+        let now = chrono::Utc::now();
+        ChunkWriter::open(dir, &host, rotate_at(1 << 20), now.date_naive())
+            .expect("chunk")
+            .append(&LogLine {
+                v: LINE_VERSION,
+                id: ulid::Ulid::new(),
+                parent: None,
+                ts: chrono::DateTime::from_timestamp_millis(now.timestamp_millis()).expect("ts"),
+                host,
+                epoch: 0,
+                claim: None,
+                matrix_event: None,
+                body: LineBody::Paseo(PaseoBody {
+                    completion: "paseo-ended-01".to_owned(),
+                    state: PaseoState::Pending,
+                    room: room(2),
+                    artifact: "artifacts/paseo-run-1.md".to_owned(),
+                    sha256: "c".repeat(64),
+                    record: Some("# Paseo run `run-1`\n".to_owned()),
+                    content: Some(json!({"msgtype": "m.text", "body": "ended"})),
+                    event: None,
+                }),
+            })
+            .expect("append");
+    }
+
+    /// R277 (R96PA3-02): a session following a Paseo run needs its broker's
+    /// `mcp:paseo`, which no live host offers, so placement waits and no
+    /// window runs — until the run's end is captured: on this checkout's
+    /// log, or, for a host taking the session over whose checkout holds no
+    /// such line, in the room's evidence the agent put there. Then its
+    /// window is a run, with no host offering the broker.
+    #[tokio::test(start_paused = true)]
+    async fn a_captured_follow_session_is_placed_without_its_broker() {
+        let server = Arc::new(Server::default());
+        let (here_zone, there_zone) = (
+            tempfile::tempdir().expect("zone"),
+            tempfile::tempdir().expect("zone"),
+        );
+        let follow = Some(keeper_core::agents::session::SessionReply {
+            session: "active/2026-10-05-chat".to_owned(),
+            room: room(2),
+            run: Some("run-1".to_owned()),
+        });
+        let needs = Some(vec!["mcp:paseo".to_owned()]);
+        let a = room(1);
+        put_card(
+            here_zone.path(),
+            &hourly("last_run: \"2026-10-05T08:00:00Z\"\n"),
+        );
+        let mut here = world_over(copy_over(&server, here_zone.path()), true);
+        here.at("2026-10-05T09:30:00Z");
+        here.offer_scheduled_as(&a, needs.clone(), follow.clone());
+        for _ in 0..3 {
+            here.tick().await;
+            tokio::time::advance(Duration::from_secs(1)).await;
+        }
+        assert_eq!(here.copy.runs(), 0, "{:?}", here.copy.routed());
+
+        capture_logged(&here_zone.path().join(SCHEDULED));
+        here.offer_scheduled_as(&a, needs.clone(), follow.clone());
+        for _ in 0..3 {
+            here.tick().await;
+            tokio::time::advance(Duration::from_secs(1)).await;
+        }
+        assert_eq!(here.copy.runs(), 1, "{:?}", here.copy.routed());
+
+        // Hesperia is gone; electra's checkout holds the card, not the line.
+        drop(here);
+        lapse(&server, &a);
+        put_card(
+            there_zone.path(),
+            &hourly("last_run: \"2026-10-05T08:00:00Z\"\n"),
+        );
+        let mut there = world_over(copy_over(&server, there_zone.path()), true);
+        there.rt.host = HostSlug::new(OTHER).expect("slug");
+        there.lapse_manifest(ME);
+        there.at("2026-10-05T10:30:00Z");
+        there.offer_scheduled_as(&a, needs.clone(), follow.clone());
+        for _ in 0..3 {
+            there.tick().await;
+            tokio::time::advance(Duration::from_secs(1)).await;
+        }
+        assert_eq!(there.copy.runs(), 0, "{:?}", there.copy.routed());
+        server.put(
+            &a,
+            keeper_core::agents::paseo::CAPTURED,
+            "paseo-ended-01",
+            &config().matrix_user,
+            json!({"v": 1, "completion": "paseo-ended-01", "digest": "d", "capture": "$c:example.org"}),
+        );
+        for _ in 0..3 {
+            there.tick().await;
+            tokio::time::advance(Duration::from_secs(1)).await;
+        }
+        assert_eq!(there.copy.runs(), 1, "{:?}", there.copy.routed());
     }
 
     /// R164: a run its host died in — after the card said `running`, before
@@ -7460,5 +7759,416 @@ mod tests {
             claim_at(&w, &week).expect("recorded").content.window,
             Some(claim::rfc3339(window as u64))
         );
+    }
+
+    /// 96.1 #11: a host's manifest offers `sandbox` exactly when its probe
+    /// passed, so an agent needing it waits for a host that can; an
+    /// `[[mcp]]` server nobody asked yet is not offered (96.2 #3).
+    #[test]
+    fn sandbox_capability_follows_the_probe() {
+        let config = AgentdConfig::parse(
+            "version = 1\nprincipal = \"tgorka\"\nhost = \"electra\"\n\n[homeserver]\nurl = \"https://matrix.example.org\"\n\n[[mcp]]\nname = \"forge\"\nurl = \"https://forge.example.org/mcp\"\n",
+        )
+        .expect("parses");
+        let slug = || HostSlug::new("electra").expect("slug");
+        for (probed, agentd, desktop) in [
+            (true, vec!["sandbox"], vec!["sandbox"]),
+            (false, vec![], vec![]),
+        ] {
+            let server = HostRuntime::agentd(&config, slug(), "t", &[], Vec::new(), probed);
+            assert_eq!(server.manifest(0, true).tools, agentd, "{probed}");
+            let mac = HostRuntime::desktop(slug(), "tgorka", "t", &[], Vec::new(), probed);
+            assert_eq!(mac.manifest(0, true).tools, desktop, "{probed}");
+        }
+    }
+
+    /// An in-test MCP server with one tool, over HTTP, whose calls never
+    /// answer: its URL, and the task to abort to make it stop answering.
+    async fn one_tool_server() -> (String, tokio::task::JoinHandle<()>) {
+        one_tool_server_silenced(Arc::new(AtomicBool::new(false))).await
+    }
+
+    /// [`one_tool_server`], refusing to list its tools while `silent`.
+    async fn one_tool_server_silenced(
+        silent: Arc<AtomicBool>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use rmcp::model::{
+            CallToolRequestParams, CallToolResponse, ListToolsResult, PaginatedRequestParams,
+            ServerCapabilities, ServerConfig, Tool,
+        };
+        use rmcp::service::RequestContext;
+        use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
+        use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
+        #[derive(Clone)]
+        struct OneTool(Arc<AtomicBool>);
+        impl rmcp::ServerHandler for OneTool {
+            fn get_info(&self) -> ServerConfig {
+                ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+            }
+            async fn list_tools(
+                &self,
+                _request: Option<PaginatedRequestParams>,
+                _context: RequestContext<rmcp::RoleServer>,
+            ) -> Result<ListToolsResult, rmcp::ErrorData> {
+                if self.0.load(Ordering::SeqCst) {
+                    return Err(rmcp::ErrorData::internal_error("not now", None));
+                }
+                Ok(ListToolsResult::with_all_items(vec![Tool::new(
+                    "echo",
+                    "Echoes.",
+                    Arc::new(serde_json::Map::new()),
+                )]))
+            }
+            #[allow(deprecated)]
+            async fn call_tool(
+                &self,
+                _request: CallToolRequestParams,
+                _context: RequestContext<rmcp::RoleServer>,
+            ) -> Result<CallToolResponse, rmcp::ErrorData> {
+                std::future::pending().await
+            }
+        }
+        let service = StreamableHttpService::new(
+            move || Ok(OneTool(Arc::clone(&silent))),
+            Arc::new(LocalSessionManager::default()),
+            StreamableHttpServerConfig::default(),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("address");
+        let router = axum::Router::new().nest_service("/mcp", service);
+        let task = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        (format!("http://{address}/mcp"), task)
+    }
+
+    /// The servers `tables` name, each call ending at `within`.
+    fn mcp_servers(tables: &str, within: Duration) -> Arc<crate::mcp::McpServers> {
+        let config = AgentdConfig::parse(&format!(
+            "version = 1\nprincipal = \"tgorka\"\nhost = \"electra\"\n\n[homeserver]\nurl = \"https://matrix.example.org\"\n\n{tables}"
+        ))
+        .expect("parses");
+        Arc::new(
+            crate::mcp::McpServers::new(
+                config.mcp.into_iter().map(|entry| (entry, None)).collect(),
+            )
+            .with_call_within(within),
+        )
+    }
+
+    /// `world`'s host offering the `[[mcp]]` servers `tables` name.
+    fn offering(world: &mut World, tables: &str) -> Arc<crate::mcp::McpServers> {
+        let servers = mcp_servers(tables, crate::mcp::CALL_WITHIN);
+        world.rt.mcp = Some(McpOffer {
+            servers: Arc::clone(&servers),
+            refreshing: None,
+            offering: Vec::new(),
+            published: None,
+        });
+        servers
+    }
+
+    /// Until the refresh the last tick started has ended.
+    async fn refreshed(world: &World) {
+        while world
+            .rt
+            .mcp
+            .as_ref()
+            .and_then(|offer| offer.refreshing.as_ref())
+            .is_some_and(|task| !task.is_finished())
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// 96.2 #3: the published manifest says `mcp:<name>` exactly while the
+    /// server answers — renewed as soon as a refresh finds it answering,
+    /// and again once it stops; a server that never answers is never in it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_manifest_offers_an_mcp_server_while_it_answers() {
+        let (url, server) = one_tool_server().await;
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let nobody = format!("http://{}/mcp", closed.local_addr().expect("address"));
+        drop(closed);
+        let mut w = world(Duration::ZERO, true);
+        offering(
+            &mut w,
+            &format!("[[mcp]]\nname = \"notes\"\nurl = \"{url}\"\n\n[[mcp]]\nname = \"gone\"\nurl = \"{nobody}\"\n"),
+        );
+        w.tick().await;
+        refreshed(&w).await;
+        w.tick().await;
+        assert_eq!(w.rt.manifest(0, true).tools, ["mcp:notes"]);
+        server.abort();
+        let _ = server.await;
+        w.rt.manifest_sent = None;
+        w.tick().await;
+        refreshed(&w).await;
+        w.tick().await;
+        assert!(w.rt.manifest(0, true).tools.is_empty());
+    }
+
+    /// 96.4 #1: the Mac's manifest says `screen:mac` exactly while a
+    /// `role = "screen"` server answers `tools/list`; another server
+    /// answering offers no screen. (agentd never names one: its parser
+    /// refuses the role, keeper-core's `mcp::tests::what_a_host_allows_is_its_own`.)
+    #[tokio::test(flavor = "multi_thread")]
+    async fn screen_capability_follows_the_server() {
+        let (screen_url, screen) = one_tool_server().await;
+        let (notes_url, _notes) = one_tool_server().await;
+        let raw: Vec<keeper_core::agents::mcp::RawMcp> = toml::from_str::<
+            std::collections::BTreeMap<String, Vec<keeper_core::agents::mcp::RawMcp>>,
+        >(&format!(
+            "[[mcp]]\nname = \"mac\"\nurl = \"{screen_url}\"\nrole = \"screen\"\n\n[[mcp]]\nname = \"notes\"\nurl = \"{notes_url}\"\n"
+        ))
+        .expect("tables")
+        .remove("mcp")
+        .expect("mcp");
+        let entries =
+            keeper_core::agents::mcp::check(raw, &[], keeper_core::agents::mac_tables::MAC)
+                .expect("the Mac's servers");
+        let servers = Arc::new(crate::mcp::McpServers::new(
+            entries.into_iter().map(|entry| (entry, None)).collect(),
+        ));
+        let mut w = world(Duration::ZERO, true);
+        w.rt.mcp = Some(McpOffer {
+            servers: Arc::clone(&servers),
+            refreshing: None,
+            offering: Vec::new(),
+            published: None,
+        });
+        w.tick().await;
+        refreshed(&w).await;
+        w.tick().await;
+        assert_eq!(
+            w.rt.manifest(0, true).tools,
+            [
+                "mcp:mac",
+                "mcp:notes",
+                keeper_core::agents::screen::CAPABILITY
+            ]
+        );
+        screen.abort();
+        let _ = screen.await;
+        w.rt.manifest_sent = None;
+        w.tick().await;
+        refreshed(&w).await;
+        w.tick().await;
+        assert_eq!(w.rt.manifest(0, true).tools, ["mcp:notes"]);
+    }
+
+    /// R225: a server that takes every connection and answers none holds
+    /// no tick: the manifest is renewed while its refresh still waits.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_mcp_server_that_never_answers_holds_no_tick() {
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let url = format!("http://{}/mcp", silent.local_addr().expect("address"));
+        let mut w = world(Duration::ZERO, true);
+        offering(
+            &mut w,
+            &format!("[[mcp]]\nname = \"silent\"\nurl = \"{url}\"\n"),
+        );
+        let started = Instant::now();
+        w.tick().await;
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(w.rt.manifest_sent.is_some(), "renewed");
+        drop(silent);
+    }
+
+    /// The tools the manifest the homeserver holds says.
+    fn published_tools(w: &World) -> Value {
+        w.server()
+            .get(&control(), HOST, ME)
+            .map(|state| state.content["tools"].clone())
+            .unwrap_or(Value::Null)
+    }
+
+    /// R225, R238: a server that stops answering between renewals is
+    /// withdrawn from the manifest at once; when that publication fails,
+    /// the next tick publishes it again, not the next renewal.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_mcp_publication_is_tried_again() {
+        let (url, server) = one_tool_server().await;
+        let mut w = world(Duration::ZERO, true);
+        let servers = offering(
+            &mut w,
+            &format!("[[mcp]]\nname = \"notes\"\nurl = \"{url}\"\n"),
+        );
+        w.tick().await;
+        refreshed(&w).await;
+        w.tick().await;
+        assert_eq!(published_tools(&w), json!(["mcp:notes"]));
+        server.abort();
+        let _ = server.await;
+        // Between renewals, as an approval's use would ask it again.
+        servers.refresh().await;
+        assert!(servers.answering().is_empty());
+        w.server().fail_manifests.store(true, Ordering::Relaxed);
+        w.tick().await;
+        assert_eq!(published_tools(&w), json!(["mcp:notes"]), "it failed");
+        w.server().fail_manifests.store(false, Ordering::Relaxed);
+        w.tick().await;
+        assert_eq!(published_tools(&w), json!([]), "tried again");
+    }
+
+    /// The tools this host's own manifest says as placement reads it.
+    async fn placed_tools(w: &World) -> Vec<String> {
+        w.rt.manifests().await.pop().expect("its own").tools
+    }
+
+    /// R238, R254: what this host offers follows its servers every tick,
+    /// and a publication that failed — its send, or its readback after
+    /// the send took — is reconciled on the next tick, even once the
+    /// servers came back to what was published before: placement reads
+    /// what answers now, and the homeserver ends up holding it. With no
+    /// copy in the control room to publish, placement still follows them.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_mcp_publication_is_reconciled_when_the_offer_reverts() {
+        let silent = Arc::new(AtomicBool::new(false));
+        let (url, _server) = one_tool_server_silenced(Arc::clone(&silent)).await;
+        let mut w = world(Duration::ZERO, true);
+        let servers = offering(
+            &mut w,
+            &format!("[[mcp]]\nname = \"notes\"\nurl = \"{url}\"\n"),
+        );
+        let answers = |yes: bool| {
+            silent.store(!yes, Ordering::SeqCst);
+            let servers = Arc::clone(&servers);
+            async move {
+                servers.refresh().await;
+                assert_eq!(servers.answering().is_empty(), !yes);
+            }
+        };
+        w.tick().await;
+        refreshed(&w).await;
+        w.tick().await;
+        assert_eq!(published_tools(&w), json!(["mcp:notes"]));
+
+        // Its withdrawal fails; it answers again before the next tick.
+        answers(false).await;
+        w.server().fail_manifests.store(true, Ordering::Relaxed);
+        w.tick().await;
+        assert_eq!(published_tools(&w), json!(["mcp:notes"]), "it failed");
+        assert!(placed_tools(&w).await.is_empty(), "placed as it answers");
+        answers(true).await;
+        w.server().fail_manifests.store(false, Ordering::Relaxed);
+        w.tick().await;
+        assert_eq!(placed_tools(&w).await, ["mcp:notes"], "answering again");
+        assert_eq!(published_tools(&w), json!(["mcp:notes"]));
+
+        // Its withdrawal is sent and its readback fails; it answers again.
+        answers(false).await;
+        w.server()
+            .fail_manifest_readbacks
+            .store(true, Ordering::Relaxed);
+        w.tick().await;
+        assert_eq!(published_tools(&w), json!([]), "the send took");
+        answers(true).await;
+        w.server()
+            .fail_manifest_readbacks
+            .store(false, Ordering::Relaxed);
+        w.tick().await;
+        assert_eq!(published_tools(&w), json!(["mcp:notes"]), "published again");
+        assert_eq!(placed_tools(&w).await, ["mcp:notes"]);
+
+        // Its addition fails; it stops answering before the next tick.
+        answers(false).await;
+        w.tick().await;
+        assert_eq!(published_tools(&w), json!([]));
+        answers(true).await;
+        w.server().fail_manifests.store(true, Ordering::Relaxed);
+        w.tick().await;
+        assert_eq!(
+            placed_tools(&w).await,
+            ["mcp:notes"],
+            "placed as it answers"
+        );
+        answers(false).await;
+        w.server().fail_manifests.store(false, Ordering::Relaxed);
+        w.tick().await;
+        assert!(placed_tools(&w).await.is_empty(), "gone again");
+        assert_eq!(published_tools(&w), json!([]));
+
+        // Published; no copy can publish now; it stops, then answers again.
+        answers(true).await;
+        w.tick().await;
+        assert_eq!(published_tools(&w), json!(["mcp:notes"]));
+        w.copy.joined.lock().expect("lock").remove(&control());
+        answers(false).await;
+        w.tick().await;
+        assert!(placed_tools(&w).await.is_empty(), "placed as it answers");
+        answers(true).await;
+        w.tick().await;
+        assert_eq!(placed_tools(&w).await, ["mcp:notes"], "answering again");
+    }
+
+    /// R225, R238: while an MCP call of this host waits on a server that
+    /// never answers, and a refresh waits on one that never answers its
+    /// connection, an unrelated session's claim is renewed on time and the
+    /// host shuts down within its bound, its claim released.
+    #[tokio::test]
+    async fn a_blocked_mcp_call_holds_no_lease_and_no_shutdown() {
+        let (url, _server) = one_tool_server().await;
+        let silent = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let nobody = format!("http://{}/mcp", silent.local_addr().expect("address"));
+        let servers = mcp_servers(
+            &format!("[[mcp]]\nname = \"notes\"\nurl = \"{url}\"\n\n[[mcp]]\nname = \"silent\"\nurl = \"{nobody}\"\n"),
+            Duration::from_secs(86_400),
+        );
+        let refreshing = {
+            let servers = Arc::clone(&servers);
+            tokio::spawn(async move { servers.refresh().await })
+        };
+        // `notes` answers at once; `silent` waits out its connection.
+        while servers.answering().is_empty() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let echo = servers.listed(&["notes".to_owned()]).pop().expect("echo");
+        let (_keep, signal) = keeper_core::bots::chat::cancellation();
+        let blocked = {
+            let servers = Arc::clone(&servers);
+            tokio::spawn(async move { servers.call(&echo, serde_json::Map::new(), signal).await })
+        };
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let mut w = world(Duration::ZERO, true);
+        w.rt.mcp = Some(McpOffer {
+            servers,
+            refreshing: Some(refreshing),
+            offering: Vec::new(),
+            published: None,
+        });
+        let a = room(1);
+        w.offer(&a, Some(ME));
+        w.tick().await;
+        assert!(w.held_by_me(&a));
+        tokio::time::pause();
+        let renewed = w.server().claim(&a).expect("a").event_id;
+        tokio::time::advance(RENEW_EVERY).await;
+        tokio::time::timeout(Duration::from_secs(1), w.rt.tick(&w.stop))
+            .await
+            .expect("the tick waits for no MCP server");
+        assert_ne!(
+            w.server().claim(&a).expect("a").event_id,
+            renewed,
+            "renewed"
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            w.rt.stop_workers(Duration::from_secs(1)).await;
+            w.rt.release_all().await;
+        })
+        .await
+        .expect("the shutdown waits for no MCP server");
+        assert!(w.released(&a));
+        assert!(!blocked.is_finished(), "the call still waits");
+        drop(silent);
     }
 }

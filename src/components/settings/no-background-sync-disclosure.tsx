@@ -20,19 +20,26 @@ import { useWizardStore } from "@/lib/stores/wizard";
  * `docs/ios.md` by Story 15.2. Sentence case, no exclamation marks, honest
  * consequence-naming — never edit one copy without the others.
  *
- * The message half is about Matrix and stays true. The last sentence is
- * Story 67.2 (AD-207): a voice session armed with keeper in front keeps
- * listening behind other apps and the lock screen, and what it heard and
- * answered is posted as a local notification — on this phone, from this
- * app, never a push. Without that sentence the banner would contradict the
- * one before it.
+ * The message half is about Matrix and stays true. Two exceptions follow.
+ * Push (Epic 98, story 98.1, AD-412): with the paid program and the
+ * person's own gateway, an agent's approval request and the person's own
+ * agent's answer arrive while keeper is closed — decrypted on this phone by
+ * the notification extension. Nothing else shows, but the pusher is the
+ * account's, so the id of every other message that would notify still
+ * passes through the gateway and Apple, and the extension discards it
+ * (R343). And Story 67.2 (AD-207): a voice session armed with keeper in
+ * front keeps listening behind other apps and the lock screen, and what it
+ * heard and answered is posted as a local notification from this phone.
  */
 export const NO_BACKGROUND_SYNC_SENTENCE =
   "On iPhone, keeper syncs and notifies about messages only while open. Close it and messages " +
-  "wait on your homeserver until you return — nothing is lost, and nothing here pretends to be " +
-  "push. A voice session you left listening is the one exception: it keeps listening with keeper " +
-  "behind other apps or the screen locked, and posts what it heard and answered as a local " +
-  "banner from this phone.";
+  "wait on your homeserver until you return — nothing is lost. Two things still reach you " +
+  "while it is closed. With a build signed by your own paid Apple team and a push gateway you " +
+  "run, set in Settings › Notifications, your agents' approval requests and your own agent's " +
+  "answers arrive as notifications, read on this phone. Nothing else shows; the ids of other " +
+  "messages still pass through your gateway and Apple, and this phone discards them. And a " +
+  "voice session you left listening keeps listening with keeper behind other apps or the " +
+  "screen locked, and posts what it heard and answered as a local banner from this phone.";
 
 /**
  * The badge-honesty note shown next to the canonical sentence in Settings →

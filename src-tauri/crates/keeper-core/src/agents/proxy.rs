@@ -34,8 +34,9 @@ use ulid::Ulid;
 
 use crate::agents::events::{
     ApprovalDecisionContent, ConversationRequestContent, ScopeContent, SurfaceResultContent,
-    APPROVAL_DECISION, CONTENT_VERSION, CONVERSATION_REQUEST, SCOPE, SURFACE_RESULT,
+    APPROVAL_DECISION, CONTENT_VERSION, CONVERSATION_REQUEST, HEARD, SCOPE, SURFACE_RESULT,
 };
+use crate::agents::heard::HeardContent;
 use crate::agents::room::ScopeDriveVm;
 use crate::agents::session::SessionKind;
 
@@ -346,8 +347,9 @@ pub fn is_own_control_room(creators: &[OwnedUserId], own: &BTreeSet<OwnedUserId>
 /// What the person's device may send into an agent's room: a closed set,
 /// each with its fixed event type. A scope (with or without drives, with the
 /// focus or none), a request for a conversation, a surface result for a
-/// request this device was handed (91.3), and the person's decision on an
-/// approval card (93.3) — never a status, a claim, a turn or a `consumed`,
+/// request this device was handed (91.3), the person's decision on an
+/// approval card (93.3), and where the person stopped listening to a spoken
+/// answer (97.3, AD-411) — never a status, a claim, a turn or a `consumed`,
 /// which are the agent's own.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentOutbound {
@@ -355,6 +357,7 @@ pub enum AgentOutbound {
     ConversationRequest(ConversationRequestContent),
     SurfaceResult(SurfaceResultContent),
     Decision(ApprovalDecisionContent),
+    Heard(HeardContent),
 }
 
 impl AgentOutbound {
@@ -365,6 +368,7 @@ impl AgentOutbound {
             AgentOutbound::ConversationRequest(_) => CONVERSATION_REQUEST,
             AgentOutbound::SurfaceResult(_) => SURFACE_RESULT,
             AgentOutbound::Decision(_) => APPROVAL_DECISION,
+            AgentOutbound::Heard(_) => HEARD,
         }
     }
 
@@ -375,6 +379,7 @@ impl AgentOutbound {
             AgentOutbound::ConversationRequest(content) => serde_json::to_value(content),
             AgentOutbound::SurfaceResult(content) => serde_json::to_value(content),
             AgentOutbound::Decision(content) => serde_json::to_value(content),
+            AgentOutbound::Heard(content) => serde_json::to_value(content),
         }
     }
 }

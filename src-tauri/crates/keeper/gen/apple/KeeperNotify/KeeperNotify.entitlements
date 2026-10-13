@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<!-- GENERATED MIRROR (Epic 98, story 98.1): XcodeGen regenerates this file from
+     project.yml `targets.KeeperNotify.entitlements.properties` — edit the value
+     THERE. crates/keeper-core/tests/apple_entitlements.rs pins that this file
+     says exactly what project.yml says, and that it names the app's App Group,
+     keychain group and data protection. -->
+<dict>
+	<key>com.apple.developer.default-data-protection</key>
+	<string>NSFileProtectionCompleteUntilFirstUserAuthentication</string>
+	<key>com.apple.security.application-groups</key>
+	<array>
+		<string>group.dev.tgorka.keeper</string>
+	</array>
+	<key>keychain-access-groups</key>
+	<array>
+		<string>$(AppIdentifierPrefix)dev.tgorka.keeper</string>
+	</array>
+</dict>
+</plist>

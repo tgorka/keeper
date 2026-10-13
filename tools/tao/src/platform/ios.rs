@@ -376,3 +376,12 @@ pub(crate) fn operating_system_version() -> (isize, isize, isize) {
     version.patchVersion,
   )
 }
+
+/// keeper (tools/tao/NOTICE, change 3): where the app delegate hands the
+/// APNs device token `UIApplication::registerForRemoteNotifications` asks
+/// for — `on_token` with its bytes, or `on_error` with why there is none —
+/// both on the main thread. Set once, before the event loop runs; a second
+/// call is ignored.
+pub fn set_remote_notification_hooks(on_token: fn(&[u8]), on_error: fn(&str)) {
+  let _ = crate::platform_impl::REMOTE_NOTIFICATION_HOOKS.set((on_token, on_error));
+}

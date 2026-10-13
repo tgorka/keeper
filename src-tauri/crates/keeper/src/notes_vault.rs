@@ -2398,6 +2398,48 @@ pub fn write_note(vault: &Vault, rel: &str, text: &str) -> Result<(), NotesError
     Ok(())
 }
 
+/// [`write_note`], only over `expected`: `Ok(false)`, nothing written, when
+/// the note on the disk is no longer exactly that text. The check and the
+/// write are one step to every other write keeper makes through
+/// [`write_vault_file`] or [`write_note`] ([`file_write`]), so a change
+/// composed from `expected` never lands over another of those that came
+/// after `expected` was read — whether an editor has the note open or not.
+pub fn write_note_if(
+    vault: &Vault,
+    rel: &str,
+    expected: &str,
+    text: &str,
+) -> Result<bool, NotesError> {
+    {
+        let _held = file_write(&vault.id, rel);
+        if read_note(vault, rel)? != expected {
+            return Ok(false);
+        }
+        #[cfg(test)]
+        if let Some(meanwhile) = CHECKED.with(|hook| hook.borrow_mut().take()) {
+            meanwhile();
+        }
+        write_held(vault, rel, text)?;
+    }
+    touch(&vault.id, vec![rel.to_owned()]);
+    mark_dirty(&vault.id);
+    Ok(true)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Run once, on this thread, between [`write_note_if`]'s check and its
+    /// write: where a test puts a competing write, inside the window the
+    /// note's write lock closes.
+    pub(crate) static CHECKED: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+    /// Run once, on this thread, when [`file_write`] finds its lock held by
+    /// another write and is about to wait for it: where a test sees that a
+    /// competing write reached the lock and was stopped there.
+    pub(crate) static WAITING: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Write a vault file that is not a note, atomically.
 ///
 /// [`write_note`] minus the two announcements, for keeper's own bookkeeping —
@@ -2406,30 +2448,122 @@ pub fn write_note(vault: &Vault, rel: &str, text: &str) -> Result<(), NotesError
 /// marking the vault dirty for it would put a commit cadence behind a file the
 /// user never touched.
 pub fn write_vault_file(vault: &Vault, rel: &str, text: &str) -> Result<(), NotesError> {
+    let _held = file_write(&vault.id, rel);
+    write_held(vault, rel, text)
+}
+
+/// [`write_vault_file`], said done only once it is durable: every folder on
+/// the way from the profile's root — the vault root and its configured
+/// folders, made here or at registration, included — made and its entry
+/// synced in its parent, one an earlier, failed write made included, the
+/// bytes synced before the rename and the folder synced after it, so a
+/// power cut after `Ok` never loses the write or the way to it. For a
+/// caller that lets go of what it kept to finish the write once this
+/// answers — the agents' promotion out.
+pub fn write_vault_file_durable(vault: &Vault, rel: &str, text: &str) -> Result<(), NotesError> {
+    let _held = file_write(&vault.id, rel);
+    write_held_as(vault, rel, text, Durability::Durable)
+}
+
+/// [`write_vault_file`] for a caller holding [`file_write`].
+fn write_held(vault: &Vault, rel: &str, text: &str) -> Result<(), NotesError> {
+    write_held_as(vault, rel, text, Durability::Atomic)
+}
+
+fn write_held_as(
+    vault: &Vault,
+    rel: &str,
+    text: &str,
+    durability: Durability,
+) -> Result<(), NotesError> {
     let path = contained(vault, rel)?;
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|error| NotesError::Name(format!("{rel}: {error}")))?;
+        let made = match durability {
+            Durability::Atomic => std::fs::create_dir_all(parent),
+            Durability::Durable => keeper_agent::sessions::exec::make_dirs_within(
+                &vault.local_path,
+                &vault.root,
+                parent,
+            ),
+        };
+        made.map_err(|error| NotesError::Name(format!("{rel}: {error}")))?;
     }
-    atomic_write(&path, text.as_bytes())
+    write_atomic(&path, text.as_bytes(), durability)
         .map_err(|error| NotesError::Name(format!("{rel}: {error}")))?;
     Ok(())
 }
 
-/// Write `bytes` to `path` through a temp file in the same directory.
-fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let dir = path.parent().unwrap_or(Path::new("."));
-    let temp = dir.join(format!(".keeper.{}.tmp", crate::sync_ipc::new_ulid()));
-    std::fs::write(&temp, bytes)?;
-    match std::fs::rename(&temp, path) {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            // A failed rename must not leave the temp behind: it is excluded
-            // from sync, but it is still litter in the user's vault.
-            let _ = std::fs::remove_file(&temp);
-            Err(error)
+/// How many locks keeper's own vault writes are spread over.
+const FILE_WRITE_LOCKS: usize = 64;
+
+/// One lock per stripe of (vault, path): every write of a vault file keeper
+/// makes holds its path's, so [`write_note_if`]'s check and write are never
+/// split by another of keeper's writes to that path. Striped rather than a
+/// map, so nothing grows with the paths ever written; two paths sharing a
+/// stripe only wait for each other.
+static FILE_WRITES: [Mutex<()>; FILE_WRITE_LOCKS] = [const { Mutex::new(()) }; FILE_WRITE_LOCKS];
+
+/// Hold the write lock of `rel` in the vault `vault_id`, recovering a
+/// poisoned one: it guards no data, only the order of writes.
+fn file_write(vault_id: &str, rel: &str) -> MutexGuard<'static, ()> {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (vault_id, rel).hash(&mut hasher);
+    let stripe = usize::try_from(hasher.finish() % FILE_WRITE_LOCKS as u64).unwrap_or(0);
+    let lock = &FILE_WRITES[stripe];
+    #[cfg(test)]
+    match lock.try_lock() {
+        Ok(held) => return held,
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => return poisoned.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            if let Some(waiting) = WAITING.with(|hook| hook.borrow_mut().take()) {
+                waiting();
+            }
         }
     }
+    lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// How far a write through a temp file goes before it is said done.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Durability {
+    /// Whole or not at all to every reader.
+    Atomic,
+    /// And on the disk: the temp file's bytes and the folder's new entry
+    /// synced.
+    Durable,
+}
+
+/// Write `bytes` to `path` through a temp file in the same directory.
+fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    write_atomic(path, bytes, Durability::Atomic)
+}
+
+fn write_atomic(path: &Path, bytes: &[u8], durability: Durability) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let temp = dir.join(format!(".keeper.{}.tmp", crate::sync_ipc::new_ulid()));
+    let written = std::fs::File::create(&temp)
+        .and_then(|mut file| {
+            file.write_all(bytes)?;
+            if durability == Durability::Durable {
+                file.sync_all()?;
+            }
+            Ok(())
+        })
+        .and_then(|()| std::fs::rename(&temp, path));
+    if let Err(error) = written {
+        // A failed write or rename must not leave the temp behind: it is
+        // excluded from sync, but it is still litter in the user's vault.
+        let _ = std::fs::remove_file(&temp);
+        return Err(error);
+    }
+    // Windows commits a rename with the file; a folder cannot be opened to
+    // sync there.
+    if cfg!(unix) && durability == Durability::Durable {
+        std::fs::File::open(dir)?.sync_all()?;
+    }
+    Ok(())
 }
 
 /// Move a note into `<vault>/.keeper/trash/<ulid>/<original-path>` (NFR-30).
@@ -2588,7 +2722,8 @@ const ASSET_SEGMENT: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHAN
     .remove(b'_')
     .remove(b'~');
 
-/// The `keeper-note://` URL for a vault-relative asset.
+/// The `keeper-note://` URL for a vault-relative asset, in this build's spelling
+/// (`keeper_core::asset_url::UrlForm::HOST`; story 98.3 #3).
 ///
 /// Segment by segment, so a `/` in the path stays a separator and everything
 /// else is escaped. The one exception is a dot segment: `.` and `..` are encoded
@@ -2606,7 +2741,11 @@ pub fn asset_url(vault_id: &str, rel: &str) -> String {
             percent_encoding::utf8_percent_encode(segment, ASSET_SEGMENT).to_string()
         })
         .collect();
-    format!("keeper-note://{vault_id}/{}", encoded.join("/"))
+    keeper_core::asset_url::compose(
+        keeper_core::asset_url::UrlForm::HOST,
+        crate::note_protocol::SCHEME,
+        &format!("{vault_id}/{}", encoded.join("/")),
+    )
 }
 
 /// The sibling file names of a vault-relative directory, for the collision
@@ -3563,50 +3702,24 @@ async fn run_cadence_action(vault_id: &str, action: Action) -> bool {
     }
 }
 
-/// The phone's commit-and-push (Epic 66, Story 66.4, AD-198, AD-202).
+/// The phone's commit-and-push of a vault's notes (Epic 66, Story 66.4,
+/// AD-198, AD-202).
 ///
 /// The desktop's cadence commits by waking the supervisor and pushes on a
-/// later tick; a phone has neither, so a save is one engine pass: declare the
-/// container's own writes settled — there is no other writer in an app
-/// container, so the settle window would be waiting for nobody
-/// (`Engine::prime_worktree_changes`) — then `sync_once_recording`, whose
-/// order is commit, fetch, fast-forward, push. The push is
-/// `Engine::push_after_commit` → `git::push_http::push`, the phone's own
-/// engine, never a binary (AD-202); a history the phone cannot fast-forward
+/// later tick; a phone has neither, so a save is one engine pass:
+/// [`keeper_sync::Engine::phone_push`] declares the container's own writes
+/// settled and runs commit, fetch, fast-forward, push through the phone's own
+/// engine, never a binary (AD-202). A history the phone cannot fast-forward
 /// is the divergence sentence beside the profile (AD-199), and the commit is
 /// kept locally either way.
 ///
 /// `true` — still ahead — when the pass refused, which is what re-arms the
 /// retry in [`dispatch_cadence`]. Offline is the ordinary case, not a fault.
 async fn phone_commit_and_push(engine: &keeper_sync::Engine, vault_id: &str) -> bool {
-    match engine.prime_worktree_changes(vault_id) {
-        Ok(primed) => tracing::debug!(
-            vault_id,
-            primed,
-            "notes: the phone declared its writes settled"
-        ),
-        Err(error) => {
-            tracing::warn!(vault_id, %error, "notes: the phone could not declare its writes")
-        }
-    }
-    match engine
-        .sync_once_recording(vault_id, SyncSource::Watch)
-        .await
-    {
-        Ok(outcome) => {
-            tracing::info!(
-                vault_id,
-                committed = outcome.files_changed,
-                pushed = outcome.pushed,
-                "notes: the phone committed and pushed its notes"
-            );
-            false
-        }
-        Err(error) => {
-            tracing::warn!(vault_id, %error, "notes: the phone's commit-and-push is deferred");
-            true
-        }
-    }
+    !matches!(
+        engine.phone_push(vault_id).await,
+        keeper_sync::PhonePush::Pushed
+    )
 }
 
 /// Arm one delayed cadence pass on the phone (Epic 66, NFR-57).

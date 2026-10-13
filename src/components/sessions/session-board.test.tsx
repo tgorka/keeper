@@ -7,7 +7,7 @@ import {
   waitFor,
   within,
 } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { CardAgentVm, SessionTaskVm } from "@/lib/ipc/client";
 
 const sessionsTaskMove = vi.fn();
@@ -206,6 +206,10 @@ function agent(over: Partial<CardAgentVm>): CardAgentVm {
 function key(value: string, readable = true) {
   return { value, readable };
 }
+
+beforeEach(() => {
+  sessionsTaskMove.mockResolvedValue({ unpushed: null });
+});
 
 afterEach(() => {
   vi.clearAllMocks();
@@ -418,6 +422,18 @@ describe("SessionBoard", () => {
     // nothing re-read, so the refusal costs the user nothing but the sentence.
     const prep = screen.getByRole("list", { name: "In preparation" });
     expect(within(prep).getByRole("button", { name: "Draft the plan" })).toBeInTheDocument();
+  });
+
+  it("says a move that landed on this phone but not on the remote, and keeps it moved", async () => {
+    const { onChanged } = mount();
+    layout();
+    const unpushed =
+      "Saved on this phone, not on the remote yet: tgdrive is already syncing. Keeper pushes it again while the app is open, and at the next sync otherwise.";
+    sessionsTaskMove.mockResolvedValue({ unpushed });
+    drag(cardOf("Draft the plan"), X.todo, Y.empty);
+    expect(await screen.findByRole("status")).toHaveTextContent(unpushed);
+    // The move is written: the board re-reads, unlike a refusal.
+    expect(onChanged).toHaveBeenCalled();
   });
 
   it("falls back to keeper's sentence when the refusal carries none", async () => {

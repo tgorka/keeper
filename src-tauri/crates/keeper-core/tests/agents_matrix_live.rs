@@ -1086,3 +1086,308 @@ async fn an_agent_room_reads_as_one_header_and_one_growing_answer() {
         Some(AgentRoomKindVm::Control)
     );
 }
+
+/// 97.3 #9 (UX-DR143): the person's own mark of where they stopped listening
+/// rides beside the stream of a real encrypted agent room — sealed by their
+/// device, split in UTF-16 units of the answer's latest body — while the
+/// agent's mark of the same answer and the mark event itself are no item.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "live: Synapse on delectra"]
+async fn the_persons_heard_mark_is_drawn_beside_the_stream() {
+    use keeper_core::agents::heard::HeardMarkVm;
+    use keeper_core::agents::room::{AgentIcons, AgentKinds};
+    use keeper_core::timeline;
+    use keeper_core::vm::{TimelineBatch, TimelineItemVm, TimelineOp};
+
+    let smoke = Smoke::setup().await;
+    let root = TempDir::new();
+    let (nixi, person, room) = joined_pair(&smoke, SessionKind::Main, root.path()).await;
+    person
+        .client()
+        .event_cache()
+        .subscribe()
+        .expect("event cache");
+    let answer = nixi
+        .send(
+            &room,
+            "m.room.message",
+            json!({
+                "msgtype": "m.text", "body": "…",
+                "dev.keeper.agent.turn": {"session": "sessions/nixi/main", "line": "01J"},
+            }),
+            None,
+        )
+        .await
+        .expect("answer anchor");
+    nixi.send(
+        &room,
+        "m.room.message",
+        events::edit_content(&answer, "Hi 😀. Two three! Four."),
+        None,
+    )
+    .await
+    .expect("answer edit");
+    let mark = |sentence: u32| {
+        json!({
+            "v": 1, "anchor": answer, "heard_until": 0, "sentence": sentence, "reason": "stop",
+        })
+    };
+    // The agent's mark is no one's: it comes first and is ignored.
+    nixi.send(&room, events::HEARD, mark(2), None)
+        .await
+        .expect("the agent's mark");
+    person
+        .send(&room, events::HEARD, mark(1), None)
+        .await
+        .expect("the person's mark");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let events = cached_events(&person, &room).await;
+        let marks = events.iter().filter(|e| e["type"] == events::HEARD).count();
+        if marks == 2 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the marks never arrived");
+        person.sync_once().await.expect("sync");
+    }
+
+    let open = timeline::open_timeline(person.client(), &room, "acct")
+        .await
+        .expect("timeline");
+    let batches: Arc<Mutex<Vec<TimelineBatch>>> = Arc::default();
+    let sink = Arc::clone(&batches);
+    let producer = tokio::spawn(timeline::forward_timeline(
+        open,
+        room.clone(),
+        Box::new(move |batch| {
+            sink.lock().expect("lock").push(batch);
+            true
+        }),
+        Arc::new(AgentKinds::default()),
+        Arc::new(AgentIcons::default()),
+        Arc::new(keeper_core::agents::approval_card::HostedRooms::default()),
+    ));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while batches.lock().expect("lock").is_empty() {
+        assert!(Instant::now() < deadline, "no first batch");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    producer.abort();
+    let first = batches.lock().expect("lock")[0].clone();
+    let TimelineOp::Reset { items } = &first.ops[0] else {
+        panic!("the first batch is a reset");
+    };
+    let answer_key = items
+        .iter()
+        .find_map(|item| match item {
+            TimelineItemVm::Message { key, body, .. } if body == "Hi 😀. Two three! Four." => {
+                Some(key.clone())
+            }
+            _ => None,
+        })
+        .expect("the answer's item");
+    let messages = items
+        .iter()
+        .filter(|item| matches!(item, TimelineItemVm::Message { .. }))
+        .count();
+    assert_eq!(messages, 1, "a mark is no item: {items:?}");
+    assert_eq!(
+        first.heard,
+        Some(vec![HeardMarkVm {
+            key: answer_key,
+            split_utf16: 6,
+        }]),
+        "the person's mark, one sentence heard, the emoji two units"
+    );
+}
+
+/// 98.1 #7: edits do not push, on a real homeserver's push rules. The person
+/// has an `event_id_only` pusher; the agent streams an answer — the anchor,
+/// three edits, a final edit — and asks for an approval. What the server
+/// recorded as notifying for the person (`GET /notifications`) is the
+/// anchor and the request, and none of the edits (`.m.rule.suppress_edits`
+/// reads `m.relates_to`, which an encrypted edit carries in the clear).
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "live: Synapse on delectra"]
+async fn synapse_suppresses_edit_pushes() {
+    let smoke = Smoke::setup().await;
+    let root = TempDir::new();
+    let (nixi, person, room) = joined_pair(&smoke, SessionKind::Main, root.path()).await;
+    let token = person.client().access_token().expect("signed in");
+    let pushers = format!("{}/_matrix/client/v3/pushers/set", smoke.homeserver);
+    let pusher = |kind: Value| {
+        json!({
+            "kind": kind, "app_id": "dev.tgorka.keeper.ios.dev", "pushkey": "keeper-smoke",
+            "app_display_name": "keeper", "device_display_name": "smoke", "lang": "en",
+            "data": {
+                "url": "https://push.invalid/_matrix/push/v1/notify",
+                "format": "event_id_only",
+                "default_payload": {"aps": {"mutable-content": 1}, "keeper_account": "smoke"},
+            },
+        })
+    };
+    let set = smoke
+        .http
+        .post(&pushers)
+        .bearer_auth(&token)
+        .json(&pusher(json!("http")))
+        .send()
+        .await
+        .expect("set the pusher");
+    assert!(set.status().is_success(), "{}", set.status());
+
+    let anchor = nixi
+        .send(
+            &room,
+            "m.room.message",
+            json!({"msgtype": "m.text", "body": events::PLACEHOLDER,
+                events::TURN: {"session": "s", "line": "l"}}),
+            None,
+        )
+        .await
+        .expect("anchor");
+    let mut edits = Vec::new();
+    for text in [
+        "Looking",
+        "Looking at",
+        "Looking at the plan",
+        "Done: the plan is written.",
+    ] {
+        edits.push(
+            nixi.send(
+                &room,
+                "m.room.message",
+                events::edit_content(&anchor, text),
+                None,
+            )
+            .await
+            .expect("edit"),
+        );
+    }
+    let request = nixi
+        .send(
+            &room,
+            events::APPROVAL_REQUEST,
+            json!({"v": 1, "id": "01SMOKE", "tier": 3, "summary": "a smoke approval"}),
+            None,
+        )
+        .await
+        .expect("approval request");
+
+    let notified = || async {
+        smoke
+            .http
+            .get(format!(
+                "{}/_matrix/client/v3/notifications?limit=50",
+                smoke.homeserver
+            ))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .expect("notifications")
+            .json::<Value>()
+            .await
+            .expect("notifications json")["notifications"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|n| n["room_id"] == room.as_str())
+            .filter_map(|n| n["event"]["event_id"].as_str().map(str::to_owned))
+            .collect::<Vec<String>>()
+    };
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut ids = notified().await;
+    while !(ids.contains(&anchor.to_string()) && ids.contains(&request.to_string())) {
+        assert!(Instant::now() < deadline, "notified: {ids:?}");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        ids = notified().await;
+    }
+    for edit in &edits {
+        assert!(
+            !ids.contains(&edit.to_string()),
+            "an edit was pushed: {ids:?}"
+        );
+    }
+
+    let removed = smoke
+        .http
+        .post(&pushers)
+        .bearer_auth(&token)
+        .json(&pusher(Value::Null))
+        .send()
+        .await
+        .expect("remove the pusher");
+    assert!(removed.status().is_success(), "{}", removed.status());
+}
+
+/// 98.1 #3: the pusher keeper registers is the one the homeserver keeps. The
+/// person holds an agent session room, so `push::register` sets this phone's
+/// pusher: `http`, `event_id_only`, the gateway as `Gateway::parse` reads it
+/// and a `default_payload` naming the local account; registering with no
+/// gateway removes it, and the person has no pusher of this phone's left.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "live: Synapse on delectra"]
+async fn the_homeserver_keeps_the_pusher_keeper_registers() {
+    use keeper_core::agents::push::{self, ApnsEnvironment, PusherSpec, Registered};
+
+    let smoke = Smoke::setup().await;
+    let root = TempDir::new();
+    let (_nixi, person, _room) = joined_pair(&smoke, SessionKind::Main, root.path()).await;
+    let token = [0x6b, 0x65, 0x65, 0x70, 0x65, 0x72];
+    let account = "01J9ZK0000000000000000ACCT";
+    let spec = PusherSpec::of_setting(
+        Some("https://push.invalid"),
+        ApnsEnvironment::Development,
+        &token,
+        account,
+        "smoke",
+    )
+    .expect("a gateway keeper registers");
+    let pushkey = "a2VlcGVy";
+    let mine = || async {
+        smoke
+            .http
+            .get(format!("{}/_matrix/client/v3/pushers", smoke.homeserver))
+            .bearer_auth(person.client().access_token().expect("signed in"))
+            .send()
+            .await
+            .expect("pushers")
+            .json::<Value>()
+            .await
+            .expect("pushers json")["pushers"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|p| p["pushkey"] == pushkey && p["app_id"] == "dev.tgorka.keeper.ios.dev")
+            .collect::<Vec<Value>>()
+    };
+
+    let set = push::register(person.client(), spec.ids(), Some(&spec))
+        .await
+        .expect("set the pusher");
+    assert_eq!(set, Registered::Set);
+    let kept = mine().await;
+    assert_eq!(kept.len(), 1, "{kept:?}");
+    assert_eq!(kept[0]["kind"], "http");
+    assert_eq!(
+        kept[0]["data"]["url"],
+        "https://push.invalid/_matrix/push/v1/notify"
+    );
+    assert_eq!(kept[0]["data"]["format"], "event_id_only");
+    assert_eq!(
+        kept[0]["data"]["default_payload"]["keeper_account"],
+        account
+    );
+    assert_eq!(
+        kept[0]["data"]["default_payload"]["aps"]["mutable-content"],
+        1
+    );
+
+    let removed = push::register(person.client(), spec.ids(), None)
+        .await
+        .expect("remove the pusher");
+    assert_eq!(removed, Registered::Removed);
+    assert_eq!(mine().await, Vec::<Value>::new());
+}

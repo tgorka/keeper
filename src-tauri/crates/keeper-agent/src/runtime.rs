@@ -43,8 +43,8 @@ use keeper_core::agents::agentd::{AgentdConfig, DrivePin, TrustEntry};
 use keeper_core::agents::drive::{self, DriveDecl};
 use keeper_core::agents::events::{
     control_levels, ControlLevels, ANSWER, APPROVAL_DECISION, ASK, CONTROL_ROOM_TYPE,
-    CONVERSATION_REQUEST, DELEGATE, DOORBELL, PRESENCE, SCOPE, SESSION_ROOM_TYPE, SURFACE_REQUEST,
-    SURFACE_RESULT, TURN,
+    CONVERSATION_REQUEST, DELEGATE, DOORBELL, HEARD, PRESENCE, SCOPE, SESSION_ROOM_TYPE,
+    SURFACE_REQUEST, SURFACE_RESULT, TURN,
 };
 use keeper_core::agents::home::AgentKind;
 use keeper_core::agents::index::Index;
@@ -63,12 +63,12 @@ use keeper_sync::provenance::SyncSource;
 use keeper_sync::xdg::XdgDirs;
 use keeper_sync::SyncProfile;
 use matrix_sdk::deserialized_responses::{EncryptionInfo, VerificationLevel, VerificationState};
-use matrix_sdk::room::MessagesOptions;
+use matrix_sdk::room::{Messages, MessagesOptions};
 use matrix_sdk::ruma::events::room::member::{MembershipState, StrippedRoomMemberEvent};
 use matrix_sdk::ruma::events::AnySyncTimelineEvent;
 use matrix_sdk::ruma::serde::Raw;
 use matrix_sdk::ruma::{
-    OwnedEventId, OwnedRoomId, OwnedTransactionId, OwnedUserId, RoomId, UInt, UserId,
+    EventId, OwnedEventId, OwnedRoomId, OwnedTransactionId, OwnedUserId, RoomId, UInt, UserId,
 };
 use matrix_sdk::{LoopCtrl, Room, RoomMemberships, RoomState};
 use serde_json::{json, Value};
@@ -78,26 +78,24 @@ use tokio::time::Instant;
 
 use crate::agent::{
     bot_for, reply_of, trail_of, AgentDeps, AgentProfiles, Arrived, ConversationPort, RoomFuture,
-    ServedSession, SessionRef,
+    ServedSession,
 };
 use crate::claims::Lease;
 use crate::deciding::ClientDecisions;
-use crate::delegate::{
-    BoolFuture, BriefRoomFuture, DelegationPort, EventsFuture, MembersFuture, UnitFuture,
-};
+use crate::delegate::{BoolFuture, BriefRoomFuture, DelegationPort, EventsFuture, UnitFuture};
 use crate::doorbell::{self as bells, Doorbell, DriveEngine, Ringer, RING_FINISH};
 use crate::headless::{
     apply_providers, drive_path, open_engine, zone_verdicts, HeadlessError, HeadlessPlatform,
     HeadlessSyncPlatform, SecretMap,
 };
 use crate::hosts::{read_back_rooms, HostRuntime, Opening, PendingBriefs};
-use crate::matrix_sink::{EditPort, RoomPort, SendFuture};
+use crate::matrix_sink::{EditPort, MembersFuture, RoomPort, SendFuture};
 use crate::rooms::{
     self, Arrival, BriefEvent, BriefRoom, Invite, InviteDecision, Known, KnownAgent,
 };
 use crate::sinks::{ClientDoors, ProxyDoors};
 use crate::surface::{self, PresenceFuture, SurfacePort};
-use crate::turn::{DrivePorts, TurnEnv};
+use crate::turn::{DrivePorts, SessionRef, TurnEnv};
 use crate::zone::{active_sessions, read_text, read_zone, AgentHome, FoundSession, ZoneRead};
 
 /// The host's one clock (AD-62).
@@ -453,6 +451,10 @@ pub(crate) fn deps_over(
             .unwrap_or_default(),
         lfs_threshold_bytes: home_drive.profile.lfs_threshold_bytes,
         decisions: None,
+        sandbox: None,
+        mcp: None,
+        kvm: None,
+        gate_tickets: Default::default(),
     })
 }
 
@@ -468,6 +470,9 @@ struct Routes {
     /// Per served room: the session folder, and its worker's channel.
     workers: HashMap<OwnedRoomId, (String, mpsc::UnboundedSender<Arrived>)>,
     pending: HashMap<OwnedRoomId, VecDeque<Arrived>>,
+    /// Per served gate room: its session's desk (99.1), which takes each
+    /// request where it arrives.
+    desks: HashMap<OwnedRoomId, Arc<crate::gate::Desk>>,
 }
 
 impl Router {
@@ -534,6 +539,17 @@ impl Router {
         }))
     }
 
+    /// Take requests for the gate room `room` at `desk` while its worker
+    /// serves it; the worker's end forgets it.
+    pub fn open_desk(&self, room: &RoomId, desk: Arc<crate::gate::Desk>) {
+        self.routes().desks.insert(room.to_owned(), desk);
+    }
+
+    /// The desk of the gate room `room`, while its worker serves it.
+    pub fn desk(&self, room: &RoomId) -> Option<Arc<crate::gate::Desk>> {
+        self.routes().desks.get(room).cloned()
+    }
+
     /// The session folder each served room is served for.
     pub fn served(&self) -> BTreeMap<OwnedRoomId, String> {
         self.routes()
@@ -545,7 +561,9 @@ impl Router {
 
     /// Close every worker's channel.
     pub fn close(&self) {
-        self.routes().workers.clear();
+        let mut routes = self.routes();
+        routes.workers.clear();
+        routes.desks.clear();
     }
 
     /// Drop what was kept for `room`: another host holds its claim and
@@ -556,7 +574,9 @@ impl Router {
 
     /// Close `room`'s worker channel: its claim ended (story 90.6).
     pub fn close_room(&self, room: &RoomId) {
-        self.routes().workers.remove(room);
+        let mut routes = self.routes();
+        routes.workers.remove(room);
+        routes.desks.remove(room);
     }
 
     /// Whether a worker serves `room`.
@@ -573,7 +593,9 @@ struct Detach {
 
 impl Drop for Detach {
     fn drop(&mut self) {
-        self.router.routes().workers.remove(&self.room);
+        let mut routes = self.router.routes();
+        routes.workers.remove(&self.room);
+        routes.desks.remove(&self.room);
     }
 }
 
@@ -621,6 +643,9 @@ pub(crate) struct Claimed {
     /// Busy while the worker works — starting included — and whether a
     /// call waits for a person (R177).
     pub(crate) activity: Arc<crate::agent::Activity>,
+    /// The homeserver's clock as the host's claims calibrate it: what a
+    /// gate's deadlines and allowances are kept by (99.1 #3, Q10).
+    pub(crate) clock: Arc<crate::claims::ServerClock>,
 }
 
 /// How the engine's supervisor ended.
@@ -740,6 +765,42 @@ pub(crate) fn start_copy(
     (copy, sync)
 }
 
+/// This host's sandbox (96.1 #11, R141): agentd's own binary as the
+/// trampoline, `[sandbox] read_exec` and `env` checked against its drives,
+/// its own folders and secrets and its user's home, then probed.
+fn agentd_sandbox(
+    config: &AgentdConfig,
+    dirs: &XdgDirs,
+    drives: &[DriveView],
+) -> Result<crate::run::SandboxHost, String> {
+    let program = std::env::current_exe()
+        .map_err(|error| format!("agentd could not find its own binary: {error}"))?;
+    let forbidden = crate::run::Forbidden {
+        drives: drives
+            .iter()
+            .map(|drive| (drive.id.clone(), drive.profile.local_path.clone()))
+            .collect(),
+        secrets: [&dirs.config, &dirs.data, &dirs.state]
+            .into_iter()
+            .cloned()
+            .chain(std::env::var_os("CREDENTIALS_DIRECTORY").map(PathBuf::from))
+            .collect(),
+        home: std::env::var_os("HOME").map(PathBuf::from),
+    };
+    crate::run::SandboxHost::probe(
+        crate::run::Kind::Trampoline {
+            program,
+            args: vec![crate::run::TRAMPOLINE_ARG.into()],
+        },
+        &config.host,
+        &keeper_core::agents::run::SandboxTable {
+            read_exec: config.read_exec.clone(),
+            env: config.sandbox_env.clone(),
+        },
+        &forbidden,
+    )
+}
+
 /// Run the host until `shutdown` turns `true`.
 pub async fn run(
     config: AgentdConfig,
@@ -790,6 +851,45 @@ pub async fn run(
             tracing::warn!(drive = %drive.id, %sentence, "agentd: this drive's zone hosts nothing");
         }
     }
+    // A `run` only where the sandbox holds (96.1 #11): agentd's own binary
+    // is the trampoline, probed once now.
+    let sandbox = agentd_sandbox(&config, &dirs, &drives);
+    let sandbox_status = match &sandbox {
+        Ok(sandbox) => sandbox.status.clone(),
+        Err(reason) => {
+            tracing::warn!(%reason, "agentd: no sandbox on this host; agents that need `sandbox` wait for another host");
+            format!("unavailable — {reason}")
+        }
+    };
+    let sandbox = sandbox.ok().map(Arc::new);
+    // The `[[mcp]]` servers, each with its bearer token; connected and
+    // listed at the manifest's first renewal and every one after (96.2 #3).
+    let mcp = Arc::new(crate::mcp::McpServers::new(
+        config
+            .mcp
+            .iter()
+            .map(|entry| {
+                let token = entry
+                    .credential
+                    .as_ref()
+                    .and_then(|secret| secrets.get(secret.name()).ok().flatten());
+                (entry.clone(), token)
+            })
+            .collect(),
+    ));
+    // The `[[kvm]]` entries, each with its credential from the secret store
+    // and never from a drive (96.5 #8): a classic NanoKVM's password, a
+    // NanoKVM-Go's key (handed to its `[[mcp]]` entry above, F15).
+    let kvm = Arc::new(crate::kvm::Kvms::new(
+        config
+            .kvm
+            .iter()
+            .map(|entry| {
+                let password = secrets.get(entry.credential.name()).ok().flatten();
+                (entry.clone(), password)
+            })
+            .collect(),
+    ));
 
     let sessions_zones: Vec<PathBuf> = drives
         .iter()
@@ -852,6 +952,9 @@ pub async fn run(
                     client: client.clone(),
                     anchor: Anchor::Pinned(config.trust.clone()),
                 })),
+                sandbox: sandbox.clone(),
+                mcp: Some(Arc::clone(&mcp)),
+                kvm: Some(Arc::clone(&kvm)),
                 ..deps
             }),
             Err(sentence) => {
@@ -876,7 +979,9 @@ pub async fn run(
         env!("CARGO_PKG_VERSION"),
         &drives,
         copies.clone(),
-    );
+        sandbox.is_some(),
+    )
+    .with_mcp(Arc::clone(&mcp));
     doorbell.set_principal_agents(hosts.principal_agents());
     // Each steward's triage and harvest sessions are made from the first
     // tick on, beside the lease clock (R66, R165).
@@ -901,7 +1006,11 @@ pub async fn run(
     let engine = Arc::clone(&agentd.engine);
     let mut supervisor = tokio::spawn(async move { engine.run(engine_shutdown).await });
 
-    let mut status = StatusFile::new(dirs.state.join(STATUS_FILE));
+    let mut status = StatusFile::new(
+        dirs.state.join(STATUS_FILE),
+        sandbox_status,
+        Arc::clone(&mcp),
+    );
     let trust = Arc::new(Mutex::new(Vec::<Value>::new()));
     let trust_reader = tokio::spawn(read_trust(
         config.trust.clone(),
@@ -1077,6 +1186,7 @@ async fn serve_session(
     // A worker that ends — or never starts — holds nothing busy.
     let _idle = Idle(Arc::clone(&claimed.activity));
     let room_id = agent.room.clone();
+    let agent_room = room_id.clone();
     let Some(room) = copy.client.client().get_room(&room_id) else {
         return;
     };
@@ -1138,6 +1248,22 @@ async fn serve_session(
         me.clone(),
         deps.host.as_str(),
     )));
+    // A gate's desk takes its requests where they arrive from here on, on
+    // the homeserver's clock, and says nothing once the claim is lost.
+    if served.context.agent.kind == SessionKind::Gate {
+        let may = Arc::clone(&lease);
+        let known = Arc::clone(&copy.known.read().unwrap_or_else(|p| p.into_inner()));
+        if let Some(desk) = served.open_desk(
+            deps,
+            Arc::clone(&port),
+            Arc::clone(&claimed.clock),
+            Arc::new(move || may.may_write()),
+            Some(known),
+        ) {
+            served.gate_desk = Some(Arc::clone(&desk));
+            copy.router.open_desk(&agent_room, desk);
+        }
+    }
     let (events, mut backlog) = read_back(&room, &mut served, me).await;
     // A taker's log may not hold the last holder's lines yet: what another
     // copy of this agent already answered is not asked again.
@@ -1145,8 +1271,8 @@ async fn serve_session(
     backlog.retain(|arrived| !answered.contains(arrived.event_id.as_str()));
     // A harvest or a workflow step another copy started — its anchor is in
     // the room — is not started again, though its `peer` line never reached
-    // this log (R202).
-    served.context.started(answered.iter().map(String::as_str));
+    // this log (R202); a gate's request it answered is not refused (R368).
+    served.answered_elsewhere(&answered);
     let trail = trail_of(&events, me, served.context.unanswered);
     match served.recover(deps, Arc::clone(&port), &trail).await {
         Ok(true) => {
@@ -1418,6 +1544,82 @@ impl DelegationPort for ClientRooms {
         })
     }
 
+    fn completions<'a>(
+        &'a self,
+        room: &'a RoomId,
+        after: Option<&'a EventId>,
+        teller: &'a UserId,
+    ) -> EventsFuture<'a> {
+        Box::pin(async move {
+            let room = self
+                .client
+                .client()
+                .get_room(room)
+                .ok_or_else(|| "this copy is not in the room".to_owned())?;
+            completions_after(|from| page_back(&room, from), after, teller).await
+        })
+    }
+
+    fn upload(&self, bytes: Vec<u8>) -> crate::delegate::FileFuture<'_> {
+        Box::pin(async move {
+            self.client
+                .upload_encrypted(&bytes)
+                .await
+                .map_err(|error| error.to_string())
+        })
+    }
+
+    fn download<'a>(&'a self, file: &'a Value) -> crate::delegate::BytesFuture<'a> {
+        Box::pin(async move {
+            self.client
+                .download_encrypted(file)
+                .await
+                .map_err(|error| error.to_string())
+        })
+    }
+
+    fn put_state<'a>(
+        &'a self,
+        room: &'a RoomId,
+        event_type: &'a str,
+        key: &'a str,
+        content: Value,
+    ) -> SendFuture<'a> {
+        Box::pin(async move {
+            crate::claims::bounded(self.client.send_state(room, event_type, key, &content)).await
+        })
+    }
+
+    fn state<'a>(
+        &'a self,
+        room: &'a RoomId,
+        event_type: &'a str,
+        key: &'a str,
+    ) -> crate::delegate::StateFuture<'a> {
+        Box::pin(async move {
+            crate::claims::bounded(self.client.server_state(room, event_type, key))
+                .await
+                .map(|state| state.map(|state| (state.sender, state.content)))
+                .map_err(|error| error.to_string())
+        })
+    }
+
+    fn captures<'a>(
+        &'a self,
+        room: &'a RoomId,
+        completion: &'a str,
+        agent: &'a UserId,
+    ) -> EventsFuture<'a> {
+        Box::pin(async move {
+            let room = self
+                .client
+                .client()
+                .get_room(room)
+                .ok_or_else(|| "this copy is not in the room".to_owned())?;
+            captures_of(|from| page_back(&room, from), completion, agent).await
+        })
+    }
+
     fn brief_room<'a>(&'a self, room: &'a RoomId) -> BriefRoomFuture<'a> {
         Box::pin(async move {
             let room = self.client.client().get_room(room)?;
@@ -1578,10 +1780,15 @@ async fn read_back(
     }
     unseen.reverse();
     let now = Instant::now();
+    let gate = served.context.agent.gate.clone();
+    let door = gate.as_ref().map(|gate| GateDoor {
+        peer: &gate.peer,
+        clear: !gate.encrypted && !room.encryption_state().is_encrypted(),
+    });
     let arrivals = unseen
         .iter()
         .filter(|(value, _)| value["sender"].as_str() != Some(me.as_str()))
-        .filter_map(|(value, encryption)| arrival_of(value, encryption.as_deref(), now))
+        .filter_map(|(value, encryption)| arrival_of(value, encryption.as_deref(), now, door))
         .map(|arrived| Arrived {
             replay: true,
             ..arrived
@@ -1622,13 +1829,29 @@ pub(crate) async fn latest_status(room: &Room, me: &UserId) -> Option<OwnedEvent
 /// started answering. An answer's anchor names its question; one that does
 /// not answers the oldest question before it no anchor answered yet, as a
 /// room's turns run in order. A question no person asked in the room — a
-/// harvest's, a scheduled run's — is answered by the anchor naming it.
+/// harvest's, a scheduled run's — is answered by the anchor naming it. A
+/// gate's request is answered by its `answer`, `result` or `refused`,
+/// which references it and carries no anchor (codemap Q6); its `ticket`
+/// answers nothing yet.
 fn answered_by(events: &[Value], me: &UserId) -> HashSet<String> {
     let mut open: VecDeque<&str> = VecDeque::new();
     let mut answered = HashSet::new();
     for event in events {
         if event["sender"] == me.as_str() {
-            if event["content"][TURN].is_object() {
+            let gate = &event["content"][keeper_core::agents::events::GATE];
+            let relates = &event["content"]["m.relates_to"];
+            let answers = |state: &str| {
+                use keeper_core::agents::log::GateState;
+                [GateState::Answer, GateState::Result, GateState::Refused]
+                    .iter()
+                    .any(|answer| answer.as_str() == state)
+            };
+            if gate["state"].as_str().is_some_and(answers) && relates["rel_type"] == "m.reference" {
+                if let Some(request) = relates["event_id"].as_str() {
+                    open.retain(|asked| *asked != request);
+                    answered.insert(request.to_owned());
+                }
+            } else if event["content"][TURN].is_object() {
                 match event["content"][TURN]["question"].as_str() {
                     Some(question) => {
                         open.retain(|asked| *asked != question);
@@ -1699,6 +1922,16 @@ fn register_handlers(copy: &Arc<Copy>) {
                 if value["type"] == DOORBELL {
                     return;
                 }
+                // A gate's outside system asks and does nothing else: no
+                // event of its but a message reaches a call, a session or
+                // a person's path (AD-416).
+                let desk = copy.router.desk(room.room_id());
+                if desk.as_ref().is_some_and(|desk| {
+                    value["sender"].as_str() == Some(desk.peer.as_str())
+                        && value["type"] != "m.room.message"
+                }) {
+                    return;
+                }
                 // A device's answer to a surface call goes to the call
                 // waiting on it, never to the session's worker, which that
                 // call is holding (R39).
@@ -1748,13 +1981,25 @@ fn register_handlers(copy: &Arc<Copy>) {
                     }
                     return;
                 }
-                let Some(arrived) = arrival_of(&value, encryption.as_ref(), received_at) else {
+                let door = desk.as_ref().map(|desk| GateDoor {
+                    peer: &desk.peer,
+                    clear: desk.clear && !room.encryption_state().is_encrypted(),
+                });
+                let Some(arrived) = arrival_of(&value, encryption.as_ref(), received_at, door)
+                else {
                     return;
                 };
                 // The agent's own events are never acted on (R30's first
                 // rule): they are neither routed nor kept.
                 if arrived.sender == copy.deps.home.config.matrix_user {
                     return;
+                }
+                // A gate's request is taken where it arrives: its ticket and
+                // its deadline do not wait behind the turn under way (Q10).
+                if let Some(desk) = desk.filter(|desk| {
+                    arrived.sender == desk.peer && arrived.arrival == Arrival::Text
+                }) {
+                    desk.take(&arrived);
                 }
                 if arrived.arrival == Arrival::Brief && !copy.router.serves(room.room_id()) {
                     hold_brief(&copy, &room, &value, sealed_by_sender(encryption.as_ref())).await;
@@ -1797,7 +2042,7 @@ async fn intercept_ask(
     let (AgentKind::Proxy, Some(human)) = (config.kind, config.human.as_ref()) else {
         return false;
     };
-    let Some(arrived) = arrival_of(value, encryption, received_at) else {
+    let Some(arrived) = arrival_of(value, encryption, received_at, None) else {
         return true;
     };
     if arrived.arrival != Arrival::Ask || arrived.sender == config.matrix_user {
@@ -1991,6 +2236,7 @@ fn read_back_ask(event: &Value, room: &RoomId) -> Option<Arrived> {
         replay: false,
         via: Some(room.to_owned()),
         device: None,
+        origin_server_ts: None,
     })
 }
 
@@ -2221,36 +2467,76 @@ pub(crate) async fn recover_briefs(copy: &Copy, served: HashSet<OwnedRoomId>) {
     recover_asks(copy, &served).await;
 }
 
+/// How this copy read an event of a page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Read {
+    /// Decrypted, sealed by a device the SDK links to its sender.
+    Sealed,
+    /// In clear: anyone's.
+    Unsealed,
+    /// Decrypted, but from a device the SDK cannot link to the sender its
+    /// envelope names — a key from a backup or a forward, an unknown
+    /// device, another user's Megolm session: never what its sender said
+    /// (R185), yet it may be, so never read as saying nothing either
+    /// (R293).
+    Unlinked,
+    /// Encrypted, and not decrypted here — its key not here yet, or never,
+    /// or its decryption failed, or it was redacted or malformed: its
+    /// envelope names its sender, but what it says is unknown, so it is
+    /// never read as saying nothing (R283, R287).
+    Unreadable,
+}
+
 /// One page of a room's timeline read backward: its events, newest first,
-/// each with whether its sender's device sealed it, and where the next
-/// page starts — `None` at the room's beginning.
-pub(crate) struct Page {
-    pub(crate) events: Vec<(Value, bool)>,
-    pub(crate) end: Option<String>,
+/// each with how it was read, and where the next page starts — `None` at
+/// the room's beginning.
+pub struct Page {
+    pub events: Vec<(Value, Read)>,
+    pub end: Option<String>,
+}
+
+/// The page the homeserver answered, as keeper reads it. Only a missing
+/// token ends the room: a page may be empty while more history follows
+/// (R283).
+pub fn page_of(messages: Messages) -> Page {
+    Page {
+        events: messages
+            .chunk
+            .iter()
+            .filter_map(|event| {
+                let value = event.raw().deserialize_as::<Value>().ok()?;
+                let decrypted = event.encryption_info().map(|info| &**info);
+                let read = match decrypted {
+                    _ if event.kind.is_utd() => Read::Unreadable,
+                    None if enveloped(&value) => Read::Unreadable,
+                    None => Read::Unsealed,
+                    Some(_) if sealed_by_sender(decrypted) => Read::Sealed,
+                    Some(_) => Read::Unlinked,
+                };
+                Some((value, read))
+            })
+            .collect(),
+        end: messages.end,
+    }
+}
+
+/// Whether `value` is a message-like event still in its `m.room.encrypted`
+/// envelope. The SDK hands one back that way, as if in clear, not only when
+/// it names it undecryptable: also when decrypting it failed otherwise (a
+/// crypto store error), and when it was redacted or does not parse as an
+/// encrypted event, which it then never tries to decrypt (R287).
+fn enveloped(value: &Value) -> bool {
+    value["type"] == "m.room.encrypted" && value.get("state_key").is_none()
 }
 
 /// The page of `room` before `from` (the newest when `None`).
 async fn page_back(room: &Room, from: Option<String>) -> Result<Page, String> {
     let mut options = MessagesOptions::backward().from(from.as_deref());
     options.limit = UInt::from(BACKLOG_PAGE);
-    let page = room
-        .messages(options)
+    room.messages(options)
         .await
-        .map_err(|error| error.to_string())?;
-    Ok(Page {
-        events: page
-            .chunk
-            .iter()
-            .filter_map(|event| {
-                let value = event.raw().deserialize_as::<Value>().ok()?;
-                Some((
-                    value,
-                    sealed_by_sender(event.encryption_info().map(|info| &**info)),
-                ))
-            })
-            .collect(),
-        end: page.end.filter(|_| !page.chunk.is_empty()),
-    })
+        .map(page_of)
+        .map_err(|error| error.to_string())
 }
 
 /// Read a timeline back, newest first, at most [`BACKLOG_PAGES`] pages of
@@ -2267,8 +2553,8 @@ where
     let mut from = None;
     for _ in 0..BACKLOG_PAGES {
         let page = fetch(from.take()).await?;
-        for (event, sealed) in &page.events {
-            if visit(event, *sealed) {
+        for (event, read) in &page.events {
+            if visit(event, *read == Read::Sealed) {
                 return Ok(true);
             }
         }
@@ -2283,7 +2569,7 @@ where
 /// The events its senders' devices sealed after the newest brief `me` sent
 /// into a room, oldest first, read back as far as that brief however many
 /// pages away it is (R55).
-pub(crate) async fn after_brief<F, Fut>(fetch: F, me: &UserId) -> Result<Vec<Value>, String>
+pub async fn after_brief<F, Fut>(fetch: F, me: &UserId) -> Result<Vec<Value>, String>
 where
     F: FnMut(Option<String>) -> Fut,
     Fut: Future<Output = Result<Page, String>>,
@@ -2300,6 +2586,113 @@ where
     .await?;
     after.reverse();
     Ok(after)
+}
+
+/// The events of a room after `after` — all of them when `None` — that
+/// carry a Paseo run's completion and whose senders' devices sealed them,
+/// oldest first, read back to `after` or to the room's beginning,
+/// whichever comes first (R277). Whatever the latest brief is: a completion
+/// told before a later round is found. History that does not reach that
+/// far within [`BACKLOG_PAGES`] pages is an error, never a partial list;
+/// so is an event of `teller`'s there that this copy cannot decrypt or link
+/// to them, which may be an end not yet taken (R283, R293).
+pub async fn completions_after<F, Fut>(
+    fetch: F,
+    after: Option<&EventId>,
+    teller: &UserId,
+) -> Result<Vec<Value>, String>
+where
+    F: FnMut(Option<String>) -> Fut,
+    Fut: Future<Output = Result<Page, String>>,
+{
+    sealed_after(fetch, after, teller, |content| {
+        keeper_core::agents::paseo::completion_of(content).is_some()
+    })
+    .await
+}
+
+/// The events of a follow session's own room that publish a capture of
+/// `completion` or say it was delivered (`paseo::marks`), whose senders'
+/// devices sealed them, oldest first, read back to the room's beginning
+/// (R279): the first capture binds the end, so a list that does not reach
+/// the beginning within [`BACKLOG_PAGES`] pages is an error, never a
+/// partial one — and so is one beside an event of `agent`'s, the session's
+/// own, that this copy cannot decrypt or link to it, which may be the
+/// capture or the delivery (R283, R293).
+pub async fn captures_of<F, Fut>(
+    fetch: F,
+    completion: &str,
+    agent: &UserId,
+) -> Result<Vec<Value>, String>
+where
+    F: FnMut(Option<String>) -> Fut,
+    Fut: Future<Output = Result<Page, String>>,
+{
+    sealed_after(fetch, None, agent, |content| {
+        keeper_core::agents::paseo::marks(content, completion)
+    })
+    .await
+}
+
+/// The sealed events of a room after `after` — to its beginning when
+/// `None` — whose content `keep` keeps, oldest first. An error when the
+/// history does not reach that far within [`BACKLOG_PAGES`] pages, when a
+/// page's token does not move on, or when an event of `author`'s there
+/// cannot be decrypted or linked to them: only `author` writes what is
+/// kept, and an event whose words or sealer are unknown is not one that
+/// says nothing (R283, R293). Anyone else's such event is passed over, as
+/// their sealed ones are kept only for `keep`'s caller to reject.
+async fn sealed_after<F, Fut>(
+    mut fetch: F,
+    after: Option<&EventId>,
+    author: &UserId,
+    keep: impl Fn(&Value) -> bool,
+) -> Result<Vec<Value>, String>
+where
+    F: FnMut(Option<String>) -> Fut,
+    Fut: Future<Output = Result<Page, String>>,
+{
+    let mut found = Vec::new();
+    let mut from: Option<String> = None;
+    for _ in 0..BACKLOG_PAGES {
+        let page = fetch(from.clone()).await?;
+        for (event, read) in &page.events {
+            if after.is_some_and(|after| event["event_id"].as_str() == Some(after.as_str())) {
+                found.reverse();
+                return Ok(found);
+            }
+            match read {
+                Read::Sealed if keep(&event["content"]) => found.push(event.clone()),
+                Read::Unreadable | Read::Unlinked
+                    if event["sender"].as_str() == Some(author.as_str()) =>
+                {
+                    let why = if *read == Read::Unreadable {
+                        "could not be decrypted here"
+                    } else {
+                        "was sealed by a device this copy cannot link to them"
+                    };
+                    return Err(format!(
+                        "{author}'s event {} {why}, so what the room says is not known yet",
+                        event["event_id"].as_str().unwrap_or("with no id")
+                    ));
+                }
+                _ => {}
+            }
+        }
+        match page.end {
+            None => {
+                found.reverse();
+                return Ok(found);
+            }
+            // The same page again would be read forever.
+            Some(end) if from.as_ref() == Some(&end) => break,
+            Some(end) => from = Some(end),
+        }
+    }
+    Err(format!(
+        "the room's history was not read back as far as {} within {BACKLOG_PAGES} pages",
+        after.map_or("its beginning".to_owned(), |after| after.to_string())
+    ))
 }
 
 /// The opening of a delegation to `me` in a room that is `room` now: the
@@ -2327,7 +2720,11 @@ where
 }
 
 /// An event of a room a session delegated into, as that session's arrival:
-/// a member's join, or a reply its sender's device sealed. The session
+/// a member's join, a reply its sender's device sealed, or an event this
+/// copy could not decrypt — the SDK hands one on still `m.room.encrypted`,
+/// with no encryption info (R283) — or one decrypted that it cannot link to
+/// its sender's device, which may be the sender's own end (R293): both as
+/// [`Arrival::Unreadable`]. An event in clear is nothing. The session
 /// checks the sender is its target.
 fn child_arrival(
     value: &Value,
@@ -2352,6 +2749,22 @@ fn child_arrival(
             replay: false,
             via: Some(room.to_owned()),
             device: None,
+            origin_server_ts: value["origin_server_ts"].as_u64(),
+        });
+    }
+    let unlinked = encryption.is_some() && !sealed_by_sender(encryption);
+    if unlinked || (value["type"] == "m.room.encrypted" && encryption.is_none()) {
+        return Some(Arrived {
+            event_id: OwnedEventId::try_from(value["event_id"].as_str()?).ok()?,
+            sender,
+            arrival: Arrival::Unreadable,
+            text: String::new(),
+            content: Value::Null,
+            received_at,
+            replay: false,
+            via: Some(room.to_owned()),
+            device: None,
+            origin_server_ts: value["origin_server_ts"].as_u64(),
         });
     }
     if !sealed_by_sender(encryption) {
@@ -2375,25 +2788,41 @@ fn owner_signed(encryption: Option<&EncryptionInfo>) -> bool {
     })
 }
 
+/// A gate's room as its front reads it (99.1 #2; codemap Q9): its outside
+/// system, and whether the room is clear — made without encryption, as its
+/// session says and as this copy reads its state.
+#[derive(Debug, Clone, Copy)]
+pub struct GateDoor<'a> {
+    pub peer: &'a UserId,
+    pub clear: bool,
+}
+
 /// A decrypted timeline event as an [`Arrived`], or `None` for an event no
 /// session acts on (membership, state, reactions, attachments, notices).
 ///
 /// Text is a person's `m.text` only, and only when the sender's own device
 /// sealed it: a message in clear, or one whose sender does not match its
-/// Megolm session, is never a turn.
+/// Megolm session, is never a turn. In a gate's room (`gate`), its outside
+/// system's `m.notice` is text too, and so is its message in clear when the
+/// room is clear (Q9): a request, `untrusted` either way.
 pub fn arrival_of(
     value: &Value,
     encryption: Option<&EncryptionInfo>,
     received_at: Instant,
+    gate: Option<GateDoor<'_>>,
 ) -> Option<Arrived> {
     let event_type = value["type"].as_str()?;
     let content = value["content"].clone();
+    let from_peer = gate.is_some_and(|door| value["sender"].as_str() == Some(door.peer.as_str()));
     let arrival = if event_type == "m.room.message" {
+        let clear_request =
+            from_peer && gate.is_some_and(|door| door.clear) && encryption.is_none();
         if content["m.relates_to"]["rel_type"] == "m.replace" {
             Arrival::Edit
-        } else if content["msgtype"] != "m.text" {
+        } else if content["msgtype"] != "m.text" && !(from_peer && content["msgtype"] == "m.notice")
+        {
             return None;
-        } else if !sealed_by_sender(encryption) {
+        } else if !sealed_by_sender(encryption) && !clear_request {
             tracing::info!(
                 sender = value["sender"].as_str().unwrap_or_default(),
                 event = value["event_id"].as_str().unwrap_or_default(),
@@ -2421,6 +2850,12 @@ pub fn arrival_of(
         Arrival::ConversationRequest {
             owner_signed: owner_signed(encryption),
         }
+    } else if event_type == HEARD {
+        // Where the person stopped a spoken answer: theirs to send, as a
+        // scope is (R47), and queued behind the turn under way (AD-411).
+        Arrival::Heard {
+            owner_signed: owner_signed(encryption),
+        }
     } else if event_type.starts_with("dev.keeper.agent.") {
         Arrival::AgentEvent
     } else {
@@ -2436,6 +2871,7 @@ pub fn arrival_of(
         replay: false,
         via: None,
         device: encryption.and_then(|info| info.sender_device.clone()),
+        origin_server_ts: value["origin_server_ts"].as_u64(),
     })
 }
 
@@ -2499,13 +2935,24 @@ fn trust_line(entry: &TrustEntry, published: Result<Option<String>, String>) -> 
 /// when it changes and every [`STATUS_HEARTBEAT`] while it does not.
 struct StatusFile {
     path: PathBuf,
+    /// What the start's probe found: `landlock ABI 7, seccomp ok`, or
+    /// `unavailable — <reason>` (96.1 #11).
+    sandbox: String,
+    /// Each MCP server as it last answered, and each tool not offered with
+    /// why (96.2 #3, #5).
+    mcp: Arc<crate::mcp::McpServers>,
     /// The last body written, without its time, and when.
     last: Option<(String, Instant)>,
 }
 
 impl StatusFile {
-    fn new(path: PathBuf) -> StatusFile {
-        StatusFile { path, last: None }
+    fn new(path: PathBuf, sandbox: String, mcp: Arc<crate::mcp::McpServers>) -> StatusFile {
+        StatusFile {
+            path,
+            sandbox,
+            mcp,
+            last: None,
+        }
     }
 
     /// Each drive's engine state, each copy, the sessions it serves and the
@@ -2565,6 +3012,8 @@ impl StatusFile {
             "copies": copies,
             "claims": hosts.held(),
             "trust": trust,
+            "sandbox": self.sandbox,
+            "mcp": self.mcp.status(),
         });
         let body = status.to_string();
         let fresh = self
@@ -2622,6 +3071,54 @@ mod tests {
         assert_eq!(answered_by(&events, &me), HashSet::from(["$q1".to_owned()]));
     }
 
+    /// Review R99S-03: a gate answers by referencing the request, with no
+    /// anchor: its `answer`, `result` and `refused` each answer the request
+    /// they reference — and only that one — and a `ticket` answers nothing
+    /// yet; another sender's gate key answers nothing.
+    #[test]
+    fn a_gates_answers_are_answers_after_a_takeover() {
+        use keeper_core::agents::events::GATE;
+        let me = OwnedUserId::try_from("@forge:example.org").expect("user");
+        let peer = "@github:example.org";
+        let message = |id: &str, sender: &str, content: Value| json!({"event_id": id, "sender": sender, "type": "m.room.message", "content": content});
+        let request = |n: u32| {
+            message(
+                &format!("$r{n}"),
+                peer,
+                json!({"msgtype": "m.text", "body": "job"}),
+            )
+        };
+        let said = |id: &str, sender: &str, state: &str, request: &str| {
+            message(
+                id,
+                sender,
+                json!({
+                    "msgtype": "m.text",
+                    "body": "…",
+                    GATE: {"v": 1, "request": "r", "state": state},
+                    "m.relates_to": {"rel_type": "m.reference", "event_id": request},
+                }),
+            )
+        };
+        let events = [
+            request(1),
+            request(2),
+            request(3),
+            request(4),
+            request(5),
+            said("$a4", me.as_str(), "answer", "$r4"),
+            said("$t1", me.as_str(), "ticket", "$r1"),
+            said("$x1", me.as_str(), "result", "$r1"),
+            said("$t2", me.as_str(), "ticket", "$r2"),
+            said("$x3", me.as_str(), "refused", "$r3"),
+            said("$f5", peer, "answer", "$r5"),
+        ];
+        assert_eq!(
+            answered_by(&events, &me),
+            HashSet::from(["$r1", "$r3", "$r4"].map(str::to_owned))
+        );
+    }
+
     fn sealed(level: Option<VerificationLevel>) -> EncryptionInfo {
         EncryptionInfo {
             sender: OwnedUserId::try_from("@tgorka:example.org").expect("user"),
@@ -2656,32 +3153,81 @@ mod tests {
         let now = Instant::now();
         let text = message(json!({"msgtype": "m.text", "body": "hi"}));
         let unverified = sealed(Some(VerificationLevel::UnverifiedIdentity));
-        let arrived = arrival_of(&text, Some(&unverified), now).expect("a turn");
+        let arrived = arrival_of(&text, Some(&unverified), now, None).expect("a turn");
         assert_eq!(arrived.arrival, Arrival::Text);
         assert_eq!(arrived.text, "hi");
 
-        assert!(arrival_of(&text, None, now).is_none(), "a message in clear");
+        assert!(
+            arrival_of(&text, None, now, None).is_none(),
+            "a message in clear"
+        );
         let forged = sealed(Some(VerificationLevel::MismatchedSender));
         assert!(
-            arrival_of(&text, Some(&forged), now).is_none(),
+            arrival_of(&text, Some(&forged), now, None).is_none(),
             "a mismatched sender"
         );
 
         for msgtype in ["m.image", "m.file", "m.notice", "m.audio"] {
             let other = message(json!({"msgtype": msgtype, "body": "photo.png"}));
             assert!(
-                arrival_of(&other, Some(&unverified), now).is_none(),
+                arrival_of(&other, Some(&unverified), now, None).is_none(),
                 "{msgtype} is not a turn"
             );
         }
     }
 
-    /// R47: a scope or a request for a conversation counts from a device its
-    /// owner's identity signed, verified here or not; from an unsigned,
-    /// unknown or mismatched device, or in clear, the person's own scope in
-    /// their own DM is ignored.
+    /// Codemap Q9 (99.1 #2): in a gate's room its outside system's notice
+    /// is text, and in a clear gate room so is its message in clear, with
+    /// the homeserver's time; anyone else's message in clear, and the
+    /// peer's in clear where the room is encrypted, is still nothing.
     #[test]
-    fn a_scope_counts_only_from_a_device_its_owner_signed() {
+    fn a_clear_gate_room_takes_its_peers_messages_only() {
+        let now = Instant::now();
+        let peer = OwnedUserId::try_from("@tgorka:example.org").expect("the sender as peer");
+        let other = OwnedUserId::try_from("@github:example.org").expect("user");
+        let clear = GateDoor {
+            peer: &peer,
+            clear: true,
+        };
+        let mut notice = message(json!({"msgtype": "m.notice", "body": "build failed"}));
+        notice["origin_server_ts"] = json!(1_759_570_000_000u64);
+        let arrived = arrival_of(&notice, None, now, Some(clear)).expect("a request in clear");
+        assert_eq!(arrived.arrival, Arrival::Text);
+        assert_eq!(arrived.origin_server_ts, Some(1_759_570_000_000));
+        let sealed_notice = arrival_of(
+            &notice,
+            Some(&sealed(Some(VerificationLevel::UnverifiedIdentity))),
+            now,
+            Some(GateDoor {
+                peer: &peer,
+                clear: false,
+            }),
+        )
+        .expect("a sealed notice of the peer");
+        assert_eq!(sealed_notice.arrival, Arrival::Text);
+
+        let encrypted_room = GateDoor {
+            peer: &peer,
+            clear: false,
+        };
+        assert!(arrival_of(&notice, None, now, Some(encrypted_room)).is_none());
+        let someone_else = GateDoor {
+            peer: &other,
+            clear: true,
+        };
+        assert!(arrival_of(&notice, None, now, Some(someone_else)).is_none());
+        let text = message(json!({"msgtype": "m.text", "body": "hi"}));
+        assert!(arrival_of(&text, None, now, Some(someone_else)).is_none());
+        assert!(arrival_of(&text, None, now, Some(clear)).is_some());
+    }
+
+    /// R47 (and Q10 for a heard mark): a scope, a request for a conversation
+    /// or where a spoken answer stopped counts from a device its owner's
+    /// identity signed, verified here or not; from an unsigned, unknown or
+    /// mismatched device, or in clear, the person's own event in their own
+    /// DM is ignored.
+    #[test]
+    fn a_scope_or_a_heard_mark_counts_only_from_a_device_its_owner_signed() {
         use crate::rooms::{classify, Disposition, Served, UNSIGNED_DEVICE};
         use keeper_core::agents::home::AgentKind;
         use keeper_core::agents::session::SessionKind;
@@ -2698,6 +3244,7 @@ mod tests {
             agent_user: &nixi,
             requester: &tgorka,
             readers: &readers,
+            peer: None,
         };
         let event = |kind: &str, content: Value| json!({"type": kind, "event_id": "$s:example.org", "sender": tgorka.as_str(), "content": content});
         let scope = event(
@@ -2705,6 +3252,10 @@ mod tests {
             json!({"v": 1, "drives": [], "set_by": tgorka.as_str()}),
         );
         let ask = event(CONVERSATION_REQUEST, json!({"v": 1}));
+        let heard = event(
+            HEARD,
+            json!({"v": 1, "anchor": "$a:example.org", "heard_until": 4, "sentence": 1, "reason": "stop"}),
+        );
         for (encryption, counts) in [
             (Some(sealed(None)), true),
             (
@@ -2731,7 +3282,7 @@ mod tests {
             let level = encryption
                 .as_ref()
                 .map(|info| info.verification_state.clone());
-            let scoped = arrival_of(&scope, encryption.as_ref(), now).expect("a scope");
+            let scoped = arrival_of(&scope, encryption.as_ref(), now, None).expect("a scope");
             assert_eq!(
                 scoped.arrival,
                 Arrival::Scope {
@@ -2739,19 +3290,33 @@ mod tests {
                 },
                 "{level:?}"
             );
-            let asked = arrival_of(&ask, encryption.as_ref(), now).expect("a request");
-            let (scope_to, ask_to) = (
+            let asked = arrival_of(&ask, encryption.as_ref(), now, None).expect("a request");
+            let marked = arrival_of(&heard, encryption.as_ref(), now, None).expect("a mark");
+            assert_eq!(
+                marked.arrival,
+                Arrival::Heard {
+                    owner_signed: counts
+                },
+                "{level:?}"
+            );
+            let (scope_to, ask_to, heard_to) = (
                 classify(&dm, &tgorka, scoped.arrival),
                 classify(&dm, &tgorka, asked.arrival),
+                classify(&dm, &tgorka, marked.arrival),
             );
             if counts {
                 assert_eq!(
-                    (scope_to, ask_to),
-                    (Disposition::Scope, Disposition::NewConversation)
+                    (scope_to, ask_to, heard_to),
+                    (
+                        Disposition::Scope,
+                        Disposition::NewConversation,
+                        Disposition::Heard
+                    )
                 );
             } else {
-                assert_eq!(scope_to, Disposition::Ignored(UNSIGNED_DEVICE), "{level:?}");
-                assert_eq!(ask_to, Disposition::Ignored(UNSIGNED_DEVICE), "{level:?}");
+                for to in [scope_to, ask_to, heard_to] {
+                    assert_eq!(to, Disposition::Ignored(UNSIGNED_DEVICE), "{level:?}");
+                }
             }
         }
     }
@@ -2779,8 +3344,9 @@ mod tests {
         OwnedUserId::try_from(id).expect("user")
     }
 
-    /// `timeline` (oldest first) as a homeserver pages it backward, 50 a
-    /// page; the page starting `failing` events back fails.
+    /// `timeline` (oldest first, each event sealed or not) as a homeserver
+    /// pages it backward, 50 a page; the page starting `failing` events
+    /// back fails.
     fn pages(
         timeline: &[(Value, bool)],
         failing: Option<usize>,
@@ -2790,13 +3356,184 @@ mod tests {
             if failing == Some(skip) {
                 return std::future::ready(Err("messages: 502".to_owned()));
             }
-            let newest_first: Vec<(Value, bool)> =
-                timeline.iter().rev().skip(skip).take(50).cloned().collect();
+            let newest_first: Vec<(Value, Read)> = timeline
+                .iter()
+                .rev()
+                .skip(skip)
+                .take(50)
+                .map(|(event, sealed)| {
+                    let read = if *sealed {
+                        Read::Sealed
+                    } else {
+                        Read::Unsealed
+                    };
+                    (event.clone(), read)
+                })
+                .collect();
             let end = (skip + 50 < timeline.len()).then(|| (skip + 50).to_string());
             std::future::ready(Ok(Page {
                 events: newest_first,
                 end,
             }))
+        }
+    }
+
+    /// `value` as the SDK's `Room::messages` hands it back, read as `read`
+    /// says: decrypted and sealed by its sender's device, in clear,
+    /// decrypted from a key with no link to its sender (one from a backup),
+    /// or encrypted with no key here — then only its envelope, still
+    /// `m.room.encrypted`, its sender and id in the clear.
+    fn sdk_event(value: &Value, read: Read) -> matrix_sdk::deserialized_responses::TimelineEvent {
+        use matrix_sdk::deserialized_responses::{
+            DeviceLinkProblem, TimelineEvent, UnableToDecryptInfo, UnableToDecryptReason,
+        };
+        match read {
+            Read::Sealed => decrypted(value, None),
+            Read::Unsealed => TimelineEvent::from_plaintext(raw(value)),
+            Read::Unlinked => decrypted(
+                value,
+                Some(VerificationLevel::None(DeviceLinkProblem::InsecureSource)),
+            ),
+            Read::Unreadable => TimelineEvent::from_utd(
+                raw(&envelope(value)),
+                UnableToDecryptInfo {
+                    session_id: Some("megolm-session".to_owned()),
+                    reason: UnableToDecryptReason::MissingMegolmSession {
+                        withheld_code: None,
+                    },
+                },
+            ),
+        }
+    }
+
+    fn raw<T>(value: &Value) -> Raw<T> {
+        Raw::from_json(serde_json::value::to_raw_value(value).expect("raw"))
+    }
+
+    /// `value` as the SDK decrypts it, its Megolm session sealed as `level`
+    /// says ([`sealed`]).
+    fn decrypted(
+        value: &Value,
+        level: Option<VerificationLevel>,
+    ) -> matrix_sdk::deserialized_responses::TimelineEvent {
+        matrix_sdk::deserialized_responses::TimelineEvent::from_decrypted(
+            matrix_sdk::deserialized_responses::DecryptedRoomEvent {
+                event: raw(value),
+                encryption_info: std::sync::Arc::new(sealed(level)),
+                unsigned_encryption_info: None,
+            },
+            None,
+        )
+    }
+
+    /// The ways the SDK decrypts an event whose sender it cannot link to
+    /// the Megolm session: the key came from a backup or a forward, the
+    /// device is one it does not know, or the session is another user's.
+    fn unlinked_levels() -> [(&'static str, VerificationLevel); 3] {
+        use matrix_sdk::deserialized_responses::DeviceLinkProblem;
+        [
+            (
+                "insecure source",
+                VerificationLevel::None(DeviceLinkProblem::InsecureSource),
+            ),
+            (
+                "missing device",
+                VerificationLevel::None(DeviceLinkProblem::MissingDevice),
+            ),
+            ("mismatched sender", VerificationLevel::MismatchedSender),
+        ]
+    }
+
+    /// A room whose whole history is one page, `chunk` newest first, as
+    /// the SDK hands it back, read through [`page_of`].
+    fn one_page(
+        chunk: Vec<matrix_sdk::deserialized_responses::TimelineEvent>,
+    ) -> impl FnMut(Option<String>) -> std::future::Ready<Result<Page, String>> {
+        move |_| {
+            std::future::ready(Ok(page_of(Messages {
+                chunk: chunk.clone(),
+                ..Messages::default()
+            })))
+        }
+    }
+
+    /// `value`'s `m.room.encrypted` envelope: its sender and id in the
+    /// clear, what it says not.
+    fn envelope(value: &Value) -> Value {
+        json!({
+            "type": "m.room.encrypted",
+            "event_id": value["event_id"],
+            "sender": value["sender"],
+            "origin_server_ts": 1_759_570_000_000u64,
+            "content": {
+                "algorithm": "m.megolm.v1.aes-sha2",
+                "ciphertext": "AwgAEnACm9zZ",
+                "session_id": "megolm-session",
+                "sender_key": "curve-key",
+                "device_id": "DEVICE",
+            },
+        })
+    }
+
+    /// The envelopes of `value` the SDK's `Room::messages` hands back as if
+    /// in clear — read as [`Read::Unsealed`] says, through
+    /// `TimelineEvent::from_plaintext` — with no word that they were not
+    /// decrypted: one whose decryption failed with an error other than a
+    /// missing key (a crypto store's), one redacted, and one that does not
+    /// parse as an encrypted event.
+    fn handed_back_as_clear(value: &Value) -> [(&'static str, Value); 3] {
+        let failed = envelope(value);
+        let mut redacted = envelope(value);
+        redacted["content"] = json!({});
+        redacted["unsigned"] = json!({"redacted_because": {
+            "type": "m.room.redaction",
+            "event_id": "$redaction:example.org",
+            "sender": value["sender"],
+            "origin_server_ts": 1_759_570_000_001u64,
+            "redacts": value["event_id"],
+            "content": {},
+        }});
+        let mut malformed = envelope(value);
+        malformed["content"] = json!({"algorithm": "m.megolm.v1.aes-sha2"});
+        [
+            ("decryption failed", failed),
+            ("redacted", redacted),
+            ("malformed", malformed),
+        ]
+    }
+
+    /// A page as a homeserver answers it: its events newest first, each
+    /// read as [`Read`] says, and the token it names.
+    type Answered = (Vec<(Value, Read)>, Option<&'static str>);
+
+    /// A homeserver's backward pages, each its events newest first and
+    /// the token it answered (`Some("p<n>")` for page `n`), read through
+    /// the production conversion, [`page_of`]. A token naming no page is a
+    /// page that cannot be read.
+    fn sdk_pages(
+        answered: Vec<Answered>,
+    ) -> impl FnMut(Option<String>) -> std::future::Ready<Result<Page, String>> {
+        move |from| {
+            let at = match from.as_deref() {
+                None => Some(0),
+                Some(token) => token
+                    .strip_prefix('p')
+                    .and_then(|n| n.parse::<usize>().ok()),
+            };
+            std::future::ready(
+                at.and_then(|at| answered.get(at))
+                    .map(|(events, end)| {
+                        page_of(Messages {
+                            chunk: events
+                                .iter()
+                                .map(|(value, read)| sdk_event(value, *read))
+                                .collect(),
+                            end: end.map(str::to_owned),
+                            ..Messages::default()
+                        })
+                    })
+                    .ok_or_else(|| "messages: 502".to_owned()),
+            )
         }
     }
 
@@ -3156,5 +3893,393 @@ mod tests {
             ask_target(Some((parent, SessionKind::Scheduled)), None),
             None
         );
+    }
+
+    /// The follow room's messages for run end `c1`, as `NIXI`, the
+    /// session's agent, sent them: capture `$x` (sent first), capture `$y`,
+    /// and `$d`, saying `$y`'s notice `$n` was delivered.
+    fn follow_room() -> (Value, Value, Value) {
+        use keeper_core::agents::paseo::{capture_message, delivered_message};
+        let message = |id: &str, content: Value| json!({"type": "m.room.message", "event_id": id, "sender": NIXI, "content": content});
+        let id = |id: &str| OwnedEventId::try_from(id).expect("event");
+        (
+            message(
+                "$x:example.org",
+                capture_message("c1", "digest-x", json!({"url": "mxc://example.org/x"})),
+            ),
+            message(
+                "$y:example.org",
+                capture_message("c1", "digest-y", json!({"url": "mxc://example.org/y"})),
+            ),
+            message(
+                "$d:example.org",
+                delivered_message("c1", &id("$y:example.org"), &id("$n:example.org")),
+            ),
+        )
+    }
+
+    /// R283 (R96PA5-01), through the SDK's own undecryptable event and the
+    /// production page conversion: an event of the session's agent this
+    /// copy cannot decrypt is never read as one that says nothing. Before a
+    /// readable capture, or beside one with a delivery it may hide, the
+    /// read is an error; once its key is here, the first capture binds and
+    /// the delivery stands. Anyone else's unreadable event changes nothing.
+    /// Completions alike: one of the teller's unreadable after the cursor
+    /// holds the readback; one before the cursor is not read at all.
+    #[tokio::test]
+    async fn an_unreadable_event_of_its_author_is_never_absent() {
+        use keeper_core::agents::paseo::authority;
+        let (x, y, d) = follow_room();
+        let nixi = user(NIXI);
+        let read =
+            |events: Vec<(Value, Read)>| captures_of(sdk_pages(vec![(events, None)]), "c1", &nixi);
+        for (case, events) in [
+            (
+                "an unreadable capture before a readable one",
+                vec![(y.clone(), Read::Sealed), (x.clone(), Read::Unreadable)],
+            ),
+            (
+                "an unreadable delivery beside a readable capture",
+                vec![(d.clone(), Read::Unreadable), (y.clone(), Read::Sealed)],
+            ),
+        ] {
+            assert!(read(events).await.is_err(), "{case}");
+        }
+        let restored = read(vec![(y.clone(), Read::Sealed), (x.clone(), Read::Sealed)])
+            .await
+            .expect("read back");
+        let bound = authority(&restored, &nixi, "c1");
+        assert_eq!(
+            bound.capture.map(|binding| binding.digest).as_deref(),
+            Some("digest-x"),
+            "the first capture binds"
+        );
+        let restored = read(vec![(d.clone(), Read::Sealed), (y.clone(), Read::Sealed)])
+            .await
+            .expect("read back");
+        assert!(authority(&restored, &nixi, "c1").delivered.is_some());
+        // Tola's unreadable event is not the session's agent's.
+        let mut foreign = x.clone();
+        foreign["sender"] = json!(TOLA);
+        let read_past = read(vec![(y.clone(), Read::Sealed), (foreign, Read::Unreadable)])
+            .await
+            .expect("read back");
+        assert_eq!(read_past, std::slice::from_ref(&y));
+
+        let tola = user(TOLA);
+        let label = Label::top();
+        let told = |n: usize| {
+            let mut content = crate::delegate::reply_content("ended", Vec::new(), &label);
+            keeper_core::agents::paseo::mark_completion(&mut content, &format!("c{n}"), "s");
+            event(n, TOLA, content)
+        };
+        let (cursor, one, two) = (told(0), told(1), told(2));
+        let cursor_id = OwnedEventId::try_from("$e0:example.org").expect("event");
+        let newest_first = vec![
+            (two.clone(), Read::Sealed),
+            (one.clone(), Read::Unreadable),
+            (cursor.clone(), Read::Sealed),
+        ];
+        assert!(
+            completions_after(
+                sdk_pages(vec![(newest_first, None)]),
+                Some(&cursor_id),
+                &tola
+            )
+            .await
+            .is_err(),
+            "an end after the cursor that cannot be read holds the readback"
+        );
+        let newest_first = vec![
+            (two.clone(), Read::Sealed),
+            (cursor.clone(), Read::Sealed),
+            (one.clone(), Read::Unreadable),
+        ];
+        assert_eq!(
+            completions_after(
+                sdk_pages(vec![(newest_first, None)]),
+                Some(&cursor_id),
+                &tola
+            )
+            .await
+            .expect("read back"),
+            std::slice::from_ref(&two),
+            "before the cursor, nothing is read"
+        );
+        let newest_first = vec![(two.clone(), Read::Sealed), (one, Read::Sealed)];
+        let ends = completions_after(
+            sdk_pages(vec![(newest_first, None)]),
+            Some(&cursor_id),
+            &tola,
+        )
+        .await
+        .expect("read back");
+        assert_eq!(ends.len(), 2, "both, in order: {ends:?}");
+    }
+
+    /// R287 (R96PA6-01), through the production page conversion: an
+    /// encrypted event the SDK hands back as if in clear — its decryption
+    /// failed, it was redacted, or it does not parse — is unreadable, never
+    /// one that says nothing. The session's agent's, before a readable
+    /// capture or beside one with a delivery it may hide, and the teller's
+    /// after the cursor, hold the readback; anyone else's changes nothing.
+    /// A message or state event of the session's agent in clear is no
+    /// envelope: read past, never kept.
+    #[tokio::test]
+    async fn an_envelope_handed_back_as_clear_is_unreadable() {
+        let (x, y, d) = follow_room();
+        let (nixi, tola) = (user(NIXI), user(TOLA));
+        let read =
+            |events: Vec<(Value, Read)>| captures_of(sdk_pages(vec![(events, None)]), "c1", &nixi);
+        for (case, back) in handed_back_as_clear(&x) {
+            let events = vec![(y.clone(), Read::Sealed), (back, Read::Unsealed)];
+            assert!(read(events).await.is_err(), "{case}: a capture before");
+        }
+        for (case, back) in handed_back_as_clear(&d) {
+            let events = vec![(back, Read::Unsealed), (y.clone(), Read::Sealed)];
+            assert!(read(events).await.is_err(), "{case}: a delivery beside");
+        }
+        let mut foreign = x.clone();
+        foreign["sender"] = json!(TOLA);
+        for (case, back) in handed_back_as_clear(&foreign) {
+            let events = vec![(y.clone(), Read::Sealed), (back, Read::Unsealed)];
+            assert_eq!(
+                read(events).await.expect(case),
+                std::slice::from_ref(&y),
+                "{case}: Tola's"
+            );
+        }
+
+        let label = Label::top();
+        let told = |n: usize| {
+            let mut content = crate::delegate::reply_content("ended", Vec::new(), &label);
+            keeper_core::agents::paseo::mark_completion(&mut content, &format!("c{n}"), "s");
+            event(n, TOLA, content)
+        };
+        let (cursor, one, two) = (told(0), told(1), told(2));
+        let cursor_id = OwnedEventId::try_from("$e0:example.org").expect("event");
+        for (case, back) in handed_back_as_clear(&one) {
+            let newest_first = vec![
+                (two.clone(), Read::Sealed),
+                (back, Read::Unsealed),
+                (cursor.clone(), Read::Sealed),
+            ];
+            let held = completions_after(
+                sdk_pages(vec![(newest_first, None)]),
+                Some(&cursor_id),
+                &tola,
+            );
+            assert!(held.await.is_err(), "{case}: an end after the cursor");
+        }
+
+        let topic = json!({"type": "m.room.topic", "state_key": "", "event_id": "$t:example.org", "sender": NIXI, "content": {"topic": "runs"}});
+        let clear = json!({"type": "m.room.message", "event_id": "$m:example.org", "sender": NIXI, "content": {"msgtype": "m.text", "body": "in clear"}});
+        let events = vec![
+            (y.clone(), Read::Sealed),
+            (topic.clone(), Read::Unsealed),
+            (clear.clone(), Read::Unsealed),
+            (x.clone(), Read::Unsealed),
+        ];
+        assert_eq!(
+            read(events).await.expect("read back"),
+            std::slice::from_ref(&y),
+            "in clear: read past, not kept"
+        );
+        let [(_, failed), ..] = handed_back_as_clear(&x);
+        let page = page_of(Messages {
+            chunk: [topic, clear, failed]
+                .iter()
+                .map(|value| sdk_event(value, Read::Unsealed))
+                .collect(),
+            ..Messages::default()
+        });
+        let reads: Vec<Read> = page.events.iter().map(|(_, read)| *read).collect();
+        assert_eq!(reads, [Read::Unsealed, Read::Unsealed, Read::Unreadable]);
+    }
+
+    /// R293 (R96PA7-01), through the production page conversion: an event
+    /// the SDK decrypted but cannot link to its sender — a key from a
+    /// backup or a forward, an unknown device, another user's session — is
+    /// never kept, and never read as one that says nothing either. The
+    /// session's agent's, before a readable capture or beside one with a
+    /// delivery it may hide, and the teller's after the cursor, hold the
+    /// readback; anyone else's, and one before the cursor, change nothing.
+    /// Linked again, the first capture binds, the delivery stands and the
+    /// ends are read once each, in order. The session's agent's message and
+    /// state in clear are read past, never kept, never held on.
+    #[tokio::test]
+    async fn an_unlinked_event_of_its_author_is_never_absent() {
+        use keeper_core::agents::paseo::authority;
+        let (x, y, d) = follow_room();
+        let (nixi, tola) = (user(NIXI), user(TOLA));
+        let linked = |value: &Value| decrypted(value, None);
+        let read = |chunk| captures_of(one_page(chunk), "c1", &nixi);
+        let mut foreign = x.clone();
+        foreign["sender"] = json!(TOLA);
+        let label = Label::top();
+        let told = |n: usize| {
+            let mut content = crate::delegate::reply_content("ended", Vec::new(), &label);
+            keeper_core::agents::paseo::mark_completion(&mut content, &format!("c{n}"), "s");
+            event(n, TOLA, content)
+        };
+        let (cursor, one, two) = (told(0), told(1), told(2));
+        let cursor_id = OwnedEventId::try_from("$e0:example.org").expect("event");
+        let ends = |chunk| completions_after(one_page(chunk), Some(&cursor_id), &tola);
+
+        for (case, level) in unlinked_levels() {
+            let unlinked = |value: &Value| decrypted(value, Some(level.clone()));
+            let error = read(vec![linked(&y), unlinked(&x)]).await;
+            assert!(error.is_err(), "{case}: a capture before");
+            let error = read(vec![unlinked(&d), linked(&y)]).await;
+            assert!(error.is_err(), "{case}: a delivery beside");
+            assert_eq!(
+                read(vec![linked(&y), unlinked(&foreign)])
+                    .await
+                    .expect(case),
+                std::slice::from_ref(&y),
+                "{case}: Tola's"
+            );
+            let held = ends(vec![linked(&two), unlinked(&one), linked(&cursor)]).await;
+            assert!(held.is_err(), "{case}: an end after the cursor");
+            assert_eq!(
+                ends(vec![linked(&two), linked(&cursor), unlinked(&one)])
+                    .await
+                    .expect(case),
+                std::slice::from_ref(&two),
+                "{case}: before the cursor, nothing is read"
+            );
+        }
+
+        let restored = read(vec![linked(&y), linked(&x)]).await.expect("read back");
+        assert_eq!(
+            authority(&restored, &nixi, "c1")
+                .capture
+                .map(|binding| binding.digest)
+                .as_deref(),
+            Some("digest-x"),
+            "the first capture binds"
+        );
+        let restored = read(vec![linked(&d), linked(&y)]).await.expect("read back");
+        assert!(authority(&restored, &nixi, "c1").delivered.is_some());
+        let both = ends(vec![linked(&two), linked(&one), linked(&cursor)])
+            .await
+            .expect("read back");
+        assert_eq!(both, [one, two], "each once, in order");
+
+        let topic = json!({"type": "m.room.topic", "state_key": "", "event_id": "$t:example.org", "sender": NIXI, "content": {"topic": "runs"}});
+        let clear = json!({"type": "m.room.message", "event_id": "$m:example.org", "sender": NIXI, "content": {"msgtype": "m.text", "body": "in clear"}});
+        let in_clear = [&topic, &clear, &x].map(|value| sdk_event(value, Read::Unsealed));
+        let mut chunk = vec![linked(&y)];
+        chunk.extend(in_clear);
+        assert_eq!(
+            read(chunk).await.expect("read back"),
+            std::slice::from_ref(&y),
+            "in clear: read past, not kept"
+        );
+    }
+
+    /// R283 (R96PA5-02), through the production page conversion: only a
+    /// missing token ends the room. A late capture, then an empty page that
+    /// names the next, then the binding capture and its delivery: the read
+    /// goes on, the first capture binds, the delivery stands. An empty first
+    /// page is not an empty room. A token that does not move on, and pages
+    /// past the budget, are errors, never the room's beginning.
+    #[tokio::test]
+    async fn an_empty_page_is_not_the_rooms_beginning() {
+        use keeper_core::agents::paseo::authority;
+        let (x, y, d) = follow_room();
+        let nixi = user(NIXI);
+        let late_x = sdk_pages(vec![
+            (vec![(x.clone(), Read::Sealed)], Some("p1")),
+            (Vec::new(), Some("p2")),
+            (
+                vec![(d.clone(), Read::Sealed), (y.clone(), Read::Sealed)],
+                None,
+            ),
+        ]);
+        let read = captures_of(late_x, "c1", &nixi).await.expect("read back");
+        assert_eq!(read, [y.clone(), d.clone(), x.clone()]);
+        let bound = authority(&read, &nixi, "c1");
+        assert_eq!(
+            bound.capture.map(|binding| binding.digest).as_deref(),
+            Some("digest-y")
+        );
+        assert_eq!(
+            bound.delivered.map(|notice| notice.to_string()).as_deref(),
+            Some("$n:example.org")
+        );
+
+        let empty_first = sdk_pages(vec![
+            (Vec::new(), Some("p1")),
+            (vec![(y.clone(), Read::Sealed)], None),
+        ]);
+        assert_eq!(
+            captures_of(empty_first, "c1", &nixi)
+                .await
+                .expect("read back"),
+            std::slice::from_ref(&y)
+        );
+
+        let stuck = sdk_pages(vec![(Vec::new(), Some("p1")), (Vec::new(), Some("p1"))]);
+        assert!(
+            captures_of(stuck, "c1", &nixi).await.is_err(),
+            "no progress"
+        );
+        let mut n = 0;
+        let endless = move |_from: Option<String>| {
+            n += 1;
+            std::future::ready(Ok(page_of(Messages {
+                end: Some(format!("t{n}")),
+                ..Messages::default()
+            })))
+        };
+        assert!(
+            captures_of(endless, "c1", &nixi).await.is_err(),
+            "the budget"
+        );
+    }
+
+    /// R283: an event of a delegated room this copy cannot decrypt — the
+    /// SDK's live handler gets it still `m.room.encrypted`, with no
+    /// encryption info — reaches the session that delegated, to hold its
+    /// ends; decrypted in clear, a reply is still nothing.
+    #[test]
+    fn an_undecryptable_event_of_a_delegated_room_reaches_its_session() {
+        let room = OwnedRoomId::try_from("!child:example.org").expect("room");
+        let utd = sdk_event(&event(1, TOLA, json!({})), Read::Unreadable);
+        let value = utd.raw().deserialize_as::<Value>().expect("json");
+        let arrived = child_arrival(&value, None, &room, Instant::now()).expect("an arrival");
+        assert_eq!(arrived.arrival, Arrival::Unreadable);
+        assert_eq!(arrived.sender, user(TOLA));
+        assert_eq!(arrived.via.as_deref(), Some(&*room));
+        let reply = crate::delegate::reply_content("Sorted.", Vec::new(), &Label::top());
+        assert!(child_arrival(&event(2, TOLA, reply), None, &room, Instant::now()).is_none());
+    }
+
+    /// R293 (R96PA7-01): a reply of a delegated room the SDK decrypted but
+    /// cannot link to its sender reaches the session that delegated as one
+    /// it cannot read — holding its ends, carrying nothing of what it says —
+    /// never as a reply, and never dropped. Linked, it is the reply; in
+    /// clear, a reply or a state event is nothing.
+    #[test]
+    fn an_unlinked_event_of_a_delegated_room_holds_its_session() {
+        let room = OwnedRoomId::try_from("!child:example.org").expect("room");
+        let mut content = crate::delegate::reply_content("Ended.", Vec::new(), &Label::top());
+        keeper_core::agents::paseo::mark_completion(&mut content, "c1", "s");
+        let reply = event(1, TOLA, content);
+        let now = Instant::now();
+        for (case, level) in unlinked_levels() {
+            let arrived = child_arrival(&reply, Some(&sealed(Some(level))), &room, now)
+                .unwrap_or_else(|| panic!("{case}: an arrival"));
+            assert_eq!(arrived.arrival, Arrival::Unreadable, "{case}");
+            assert_eq!(arrived.sender, user(TOLA), "{case}");
+            assert_eq!(arrived.via.as_deref(), Some(&*room), "{case}");
+            assert_eq!(arrived.content, Value::Null, "{case}: nothing it says");
+        }
+        let linked = child_arrival(&reply, Some(&sealed(None)), &room, now).expect("a reply");
+        assert_eq!(linked.arrival, Arrival::Replied);
+        assert!(child_arrival(&reply, None, &room, now).is_none());
+        let topic = json!({"type": "m.room.topic", "state_key": "", "event_id": "$t:example.org", "sender": TOLA, "content": {"topic": "runs"}});
+        assert!(child_arrival(&topic, None, &room, now).is_none());
     }
 }

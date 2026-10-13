@@ -3954,9 +3954,10 @@ settles-with: on kalypso: accept a call while armed, read the ring
 
 origin: epic 66, AD-201, story 66.6 (recorded), 2026-09-05
 location: `crates/keeper/src/sessions_ipc.rs:40-44` (the first twin, `sessions_roots`) and every `unsupported()` twin below it,
-  `crates/keeper/src/lib.rs:88-92` (`sessions_exec`, `sessions_root` — `#[cfg(desktop)]`),
+  `crates/keeper/src/lib.rs` (`sessions_root` — on every target since 98.2; `sessions_exec` is gone, it is
+  `keeper_agent::sessions::exec`),
   `crates/keeper/src/ipc.rs:1481` (`sessions: mac_folder_capability_of(&git_report(&state), cfg!(desktop))`),
-  `src/components/layout/sidebar-pane.tsx:272-273` (the row rides the `sessions` flag),
+  `src/components/layout/sidebar-pane.tsx:280` (the row rides the `sessions` flag),
   `src/components/sessions/**` (the desktop pane), `docs/ios.md` *Limitations* (fifth item);
   lines re-read on 2026-10-02 (the agents plan's consistency review, F15; ruling R24(12)) — epic 98's story 98.2 takes the read half
   and DW-410 keeps the rest
@@ -3972,6 +3973,17 @@ reason: A sessions root is a synced folder plus a flag (AD-107), and the phone h
   phone stack, the executor and the space editors after, and `sessions` on a gate that is
   honest on the phone rather than `notes_available` inherited.
 status: open
+progress (rung `agents-98-phone-sessions`, 2026-10-12; R344, R345): the Rust half of the read half is
+  in — `sessions_root` on every target, the read verbs and `sessions_task_move` without twins, the
+  board projection shared (`keeper_agent::sessions::board`), `sessions` gated on a zone being on the
+  phone; the phone surface and the fifth disclosure line are rung `agents-98-phone-board`, and the
+  rest is DW-410.
+progress (rung `agents-98-phone-board`, 2026-10-12): the phone surface is in — *Sessions* in the
+  drawer while `sessions` is true (`src/lib/phone-surfaces.ts`, `phoneSurfaceFor`), the zone's
+  sessions then one session's board paged a column at a time with *Move to…*, a card of an agent's
+  session opening its room (`src/components/sessions/sessions-phone-pane.tsx`); the fifth line of
+  `IOS_DISCLOSURE_LINES` and `docs/ios.md` *Limitations* says so. The resolution line is the
+  coordinator's.
 
 ### DW-238: Tasks on the phone — and the reason is not the one the epic gave.
 
@@ -4000,6 +4012,9 @@ reason: AD-201 says tasks stay on the Mac because "tasks run user commands and i
   no pretence of a schedule. Until then the Tasks row is absent on the phone because it rides
   `sessions` (DW-237), and the disclosure's fifth line names it. Correct AD-201's wording when
   the epic file is next touched.
+progress (rung `agents-98-phone-board`, 2026-10-12): `sessions` is now true on a phone with a
+  sessions zone (98.2), so the Tasks row's absence there is `phoneSurfaceFor("tasks") === null`
+  (`src/lib/phone-surfaces.ts`), no longer the flag; the fifth line still names tasks as the Mac's.
 status: open
 
 ### DW-239: An audio memo on the phone.
@@ -7503,6 +7518,7 @@ status: open
 origin: epic 98's plan, 2026-10-02 (story 98.4's Q10; AD-414)
 location: `src-tauri/crates/keeper/src/voice_android.rs`, `src-tauri/crates/keeper/gen/android/` (no foreground service), `docs/android.md` (*Limitations*)
 reason: Android allows background microphone use only from a foreground service of type `microphone`; AD-414 uses none, because Tauri's open bug #15671 leaves a blank webview on relaunch after a foreground service kept the process alive (research §11.6). So on the tablet a spoken turn works with keeper in front and stops with the screen off, narrower than the iPhone, which listens with the screen locked. Revisit when Tauri fixes #15671 (or its kin stops reproducing) and the owner wants hands-free listening on the tablet: a `microphone` foreground service started only while listening is armed, with its notification, and the disclosure line changed.
+**98.4 built it (rung `agents-98-android-voice`, 2026-10-12; R360, fix round 1):** `VoicePlugin.onPause` reports `background`, the port stops listening and the turn ends with `voice::android::LEFT_THE_FRONT`; behind another app `voice::android::act` refuses both listening and reading aloud (`VoiceUnavailable::LeftTheFront`), and the facts read on the return arm the switch again through `should_rearm`. The `microphone` foreground service above is still the only way to listen behind other apps.
 status: open
 
 ### DW-413: Android's voice runs without the turn models where `ort` has no Android runtime.
@@ -7510,6 +7526,7 @@ status: open
 origin: epic 98's plan, 2026-10-02 (story 98.4's Q9; AD-410, AD-414)
 location: `src-tauri/crates/keeper/src/voice_android.rs`, `src-tauri/crates/keeper-core/src/voice/turn_models.rs`
 reason: The turn models run through `ort`; a prebuilt ONNX Runtime for `aarch64-linux-android` is `[UNVERIFIED]`, and building one from source is a native toolchain keeper does not carry. Without it, Android ends a turn by the 1800 ms pause and tells a backchannel from an interruption by the word list alone (FR-814's fallback, 97.3's rule without models). 98.4 states which branch it built; this entry stays open only if it built the fallback. Revisit when an Android runtime is available to `ort` (prebuilt, or built in the Android CI job): load the same `_models/` roles as the iPhone.
+**98.4 built the fallback (rung `agents-98-android-voice`, 2026-10-12; R361).** `ort` 2.0.0-rc.13 does list a prebuilt `aarch64-linux-android` (+nnapi) library in `ort-sys/build/download/dist.tsv`, so the runtime is no longer `[UNVERIFIED]`; what is missing is (a) the capture's PCM in Rust — Android's capture is `VoicePlugin.kt`'s `AudioRecord`, which reaches Rust only through a JSON channel, so the end-of-turn ear needs a JNI audio bridge — and (b) a link of the library into `libkeeper_lib.so`, which only an APK build proves. Settings says *Turn models are not available on Android; keeper waits 1.8 s after you stop* (`voice::android::turn_models`).
 status: open
 
 ### DW-414: Gate sessions block and ask; they do not use the quarantined-model pattern.
@@ -8405,6 +8422,80 @@ location: `src-tauri/crates/keeper-agent/src/hosts.rs` (`one_maintenance_job_per
 reason: both jobs take the one claim through `maintain::maintain`; the test starts two at once on two hosts and each interleaving. The curator's scheduler lives on rung 3 and is restacked onto this one; agentd's tick starting both is not driven here.
 status: open
 
+### DW-730: A harvested note's `log/<chunk>#<line id>` source resolves to its chunk only.
+
+origin: epic 95, story 95.5 (rung `agents-95-knowledge`, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/cards.rs` (`CardTools::harvested`), `src-tauri/crates/keeper-core/src/agents/knowledge.rs` (`source_file`)
+reason: The host checks that the chunk file is in the closed session's `log/`; the line id after `#` is required but not looked up in the chunk, so a made-up id in a real chunk is stored. Close with a bounded scan of the chunk for a line with that id.
+status: open
+
+### DW-731: The promote panel tells "newer" by mtime on this disk, not by commit time.
+
+origin: epic 95, story 95.5 (rung `agents-95-knowledge`, 2026-10-06)
+location: `src-tauri/crates/keeper-core/src/sessions/promote.rs` (`row_vm`), `src-tauri/crates/keeper-agent/src/promote.rs` (`panel`)
+reason: The epic asks for commit time for synced files and mtime for `workspace/`; every row uses mtime, which a pull or checkout rewrites, so after a fresh clone an older source can read as newer. Close with `git::history::file_log` times for synced cells.
+status: done 2026-10-06
+resolution: closed by rung `agents-95-knowledge`'s review fixes (R95K-11, R212): `FileFact.changed_ms` is a synced file's commit time by `git::history` (the oldest of its newest commits holding today's content, review keys aside), mtime only for `workspace/` and uncommitted content; `staleness_is_by_what_changed_not_by_mtime`.
+
+### DW-732: A promotion out whose README write fails leaves an unrecorded vault copy.
+
+origin: epic 95, story 95.5 (rung `agents-95-knowledge`, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/promote.rs` (`promote_out`)
+reason: The vault copy is written through `VaultWriter` first and the row second, in two writers; a README changed in between (guarded write refused) leaves the copy with no row, and promoting again is then refused as a taken name. Close with a re-promotion that adopts a byte-identical copy, or a retry of the row.
+status: done 2026-10-06
+resolution: closed by R95K-07 (R212): `promote::record_then` records the row first in the same held, journaled plan, re-splicing over a concurrent README edit; a publication that fails after it leaves a row a re-promotion finishes; `a_failed_publication_leaves_a_row_promoting_again_finishes`.
+
+### DW-733: "Reviewed by me" is required before "Promote to notes…" only in the panel.
+
+origin: epic 95, story 95.5 (rung `agents-95-knowledge`, R139, 2026-10-06)
+location: `src-tauri/crates/keeper/src/sessions_ipc.rs` (`sessions_promote`, `sessions_knowledge_review`)
+reason: The tick lands in the vault copy, so the commands run promote then review; a review that fails after a promotion leaves an unreviewed copy in the vault (it reads "nobody has reviewed it", never more). Rung `agents-95-panel` sequences the two and says so on a failure.
+status: done 2026-10-06
+resolution: closed by R95K-06 (R212, R-NEW-2 rejected): promoting a harvested note is the person's review, in Rust — `promote_out` takes the revision they read (`expected`) and a `Reviewer` and writes the vault copy already reviewed; `a_harvested_note_is_promoted_only_as_it_was_read`.
+
+### DW-734: A promotion into the session copies after its stability read, not from it.
+
+origin: epic 95, story 95.5 (rung `agents-95-knowledge`, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/promote.rs` (`promote_in`), `src-tauri/crates/keeper-agent/src/sessions/exec.rs` (`CopyFile`)
+reason: The source must be still for the settle window and read whole by `read_verified`, then the plan's `CopyFile` (`std::fs::copy`) copies it; a writer starting in that gap is copied torn. Close with a `CopyFile` that checks the source's `FileSample` before and after, as `read_verified` does.
+status: done 2026-10-06
+resolution: closed by R95K-05 (R212): `PlanStep::CopyChecked` copies only bytes hashing to what `verify_while_reading` read, staged and renamed, the target untouched otherwise; `a_checked_copy_copies_only_what_was_read`.
+
+### DW-735: Commit-time staleness walks a file's history from HEAD for each row cell.
+
+origin: epic 95, story 95.5 (rung `agents-95-knowledge`, review fix R95K-11, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/promote.rs` (`committed_ms`), `src-tauri/crates/keeper-sync/src/git/history.rs` (`file_log`)
+reason: `file_log` walks every commit from HEAD until it has 16 that touched the path, and `blob_at` reopens the repository per revision; a drive with a long history and a file touched rarely pays a whole walk per row cell on every panel open. Close with one walk per panel that collects every cell's revisions, or a cache keyed by HEAD.
+status: open
+
+### DW-736: A link swapped into the vault between the landing check and the shell's write is followed.
+
+origin: epic 95, story 95.5 (rung `agents-95-knowledge`, review fix R95K-04, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/promote.rs` (`lands_as_named`), `src-tauri/crates/keeper/src/notes_vault.rs` (`write_vault_file`, `contained`)
+reason: `promote_out` and `review` refuse a target whose landing differs from its path, then the shell writes through the lexical `contained` path; a folder replaced by a link in that window still carries the write. Close by writing with the directory chain opened no-follow (`openat`), or by checking the landing again inside the vault writer.
+status: open
+
+### DW-737: On a case-insensitive volume a promote target typed in another case is refused as a link.
+
+origin: epic 95, story 95.5 (rung `agents-95-knowledge`, review fix R95K-04, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/promote.rs` (`lands_as_named`)
+reason: The landing is compared byte for byte with the typed path, so `10-Notes/knowledge/x.md` against a folder `10-notes/` on APFS is refused with "leads through a link". Close by comparing the existing part with `names::same_entry_folded`, as `sessions::write::land` does.
+status: open
+
+### DW-738: A host appending to an agent's log right now refuses a promotion out of it.
+
+origin: epic 95, story 95.5 (rung `agents-95-knowledge`, review fix R95K-03, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/promote.rs` (`audience`)
+reason: Any problem the log reader reports — a torn last line included — leaves the label not established, so a promotion while the session's host is mid-append is refused (and the panel says so) until the line is whole; a retry succeeds. Close by telling a live writer's in-progress tail of its newest chunk from a corrupt line.
+status: open
+
+### DW-739: Re-promoting a harvested note replaces an edit a person made to its vault copy.
+
+origin: epic 95, story 95.5 (rung `agents-95-knowledge`, review fix R95K-06/07, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/promote.rs` (`promote_out`), `src-tauri/crates/keeper-agent/src/ports.rs` (`VaultWriter::write`)
+reason: A row naming the target makes a re-promotion replace the vault copy whole (FR-243's "re-promotion overwrites the target"); a person's edit to the copy since the last promotion is gone, recoverable only from history. Close with a replace guarded on the copy as last promoted, writing a conflict copy otherwise.
+status: open
+
 ### DW-740: A workflow file or agent folder committed after the sweep's plan is not guarded.
 
 origin: epic 95, story 95.3 (rung `agents-95-curate`, R208 / R95U-05, 2026-10-06)
@@ -8520,8 +8611,43 @@ status: open
 ### DW-834: A config path through a file where a folder should be refuses the drive.
 
 origin: epic 95, story 95.4 (rung `agents-95-search`, re-review R95S2, R218, 2026-10-07)
-location: `src-tauri/crates/keeper-sync/src/bots_fs.rs` (`search_landing`)
+location: `src-tauri/crates/keeper-sync/src/browse.rs` (`resolve_known`, the one resolver `bots_fs::search_landing` was folded into at the knowledge restack, R-NEW-1 — so a declaration or a row file behind a file is refused the same way)
 reason: Only `NotFound` is taken for an absent config (R218); `ENOTDIR` — a file named `.okf` — is refused as unknown, so that drive is not searched at all where it arguably has no config. Accepted as the strict side; revisit if a drive is found with a `.okf` file.
+status: open
+
+### DW-835: An interrupted promotion out is finished only by the zone's next promotion out or review.
+
+origin: epic 95, story 95.5 (rung `agents-95-knowledge`, re-review fix R95K2-03, 2026-10-07)
+location: `src-tauri/crates/keeper-agent/src/promote.rs` (`finish_pending`), `src-tauri/crates/keeper-agent/src/sessions/mod.rs` (`resume_all`)
+reason: The vault write is the shell's (`VaultWriter`), which `exec::resume_all` at host start does not hold, so a crash after `.keeper/promote-out.json` is kept leaves the row `missing target` until someone promotes out of, or reviews in, that zone again. Close by finishing pending promotions at app start where the vault writer is installed.
+status: open
+
+### DW-836: Another process's save between `write_note_if`'s check and its rename is overwritten.
+
+origin: epic 95, story 95.5 (rung `agents-95-knowledge`, re-review fix R95K2-04, 2026-10-07)
+location: `src-tauri/crates/keeper/src/notes_vault.rs` (`write_note_if`, `atomic_write`)
+reason: The striped write lock orders keeper's own writes; an external editor, another keeper or a sync pull that writes the note between the compare and the rename is replaced. Close with a compare after staging and an exchange-rename (`renameat2(RENAME_EXCHANGE)` / `renamex_np(RENAME_SWAP)`) that restores and retries when the swapped-out bytes are not the expected ones.
+status: open
+
+### DW-837: A staging name swapped after `publish_stage`'s check is still renamed into place.
+
+origin: epic 95, story 95.5 (rung `agents-95-knowledge`, re-review fix R95K2-02, 2026-10-07)
+location: `src-tauri/crates/keeper-agent/src/sessions/exec.rs` (`stage_beside`, `publish_stage`)
+reason: The stage is created exclusively and its device/inode checked before the rename, but a link put at the staging name in that instant is what `rename` moves (the planted-before-the-run case is closed). Close with an unnamed stage linked in place (`O_TMPFILE` + `linkat` on Linux, a directory-fd `renameat` on macOS) — the same window class as DW-736.
+status: open
+
+### DW-838: A promoted note shows `unknown` freshness until its vault copy's first commit.
+
+origin: epic 95, story 95.5 (rung `agents-95-knowledge`, re-review fix R95K2-06, 2026-10-07)
+location: `src-tauri/crates/keeper-agent/src/promote.rs` (`file_fact`, `history_of`)
+reason: A vault copy is dated by its commits only, since a tick moves its mtime; before the cadence commits it (or when its 16 newest commits are all reviews), a candidate edited since reads `unknown` rather than `stale`. Close by recording the promoted content's digest and time when the copy is published (the promotion's own content fact), and reading further back when every commit read is a review.
+status: open
+
+### DW-839: `browse::resolve` still reads an unsearchable folder as absence for its other callers.
+
+origin: epic 95, story 95.5 (rung `agents-95-knowledge`, re-review fix R95K2-01/07, 2026-10-07)
+location: `src-tauri/crates/keeper-sync/src/browse.rs` (`resolve`), its ~40 callers across keeper-sync, keeper-agent and the shell
+reason: R219 added `resolve_known` for the promotion path and `zone::read_text`; `resolve` keeps turning every canonicalization error into `Ok(None)`, so other callers (file serving, exports, bots_fs, media, skills) still say "missing" for a file behind a folder that may not be searched. Close by moving `resolve` to `resolve_known`'s semantics after auditing each caller's `Ok(None)` branch.
 status: open
 
 ### DW-885: A file the drive ignores inside an archivable skill folder holds its archive, retried every claim lapse.
@@ -8573,6 +8699,27 @@ location: `src-tauri/crates/keeper-agent/src/maintain.rs` (`record`, `record_hel
 reason: Matrix state has no compare-and-swap. The completion is read, the claim taken again is asked (`Lease::may_write`) right before the send, and the run is not counted recorded when the claim lapsed before the send or its release was refused after it. That is not unconditional monotonicity: a send held up after the last ask — past the claim's 60 s margin (`claim::STOP_WITHOUT_RENEWAL`), while another host takes the drive and records a later window — can still land after that later completion and replace it with an older window, and that night is then run again. `recorded` is the host's local answer; it says nothing about whether a send already made reached the server. This is the claim protocol's own residual, as for every fenced effect; `docs/agents.md` states these boundaries and cites this entry (R246 / R95C5-03).
 status: open
 
+### DW-920: A file put at a promotion's target between recovery's read of it and the writer's rename is replaced.
+
+origin: epic 95, story 95.5 (rung `agents-95-knowledge`, re-review fix R95K3-03, 2026-10-07)
+location: `src-tauri/crates/keeper-agent/src/promote.rs` (`publish`), `src-tauri/crates/keeper/src/notes_vault.rs` (`write_vault_file_durable`)
+reason: `publish` establishes absence (or an authorised replacement) by reading the target, then the shell's writer renames its temp over the path; another process's file landing in that instant is replaced. Close with a no-replace publish for a target established absent (`renameat2(RENAME_NOREPLACE)` / `renamex_np(RENAME_EXCL)`, or `link` + `unlink` of the temp) — the same window class as DW-836/837.
+status: open
+
+### DW-921: An interrupted promotion out of a session that was archived is retired, not finished.
+
+origin: epic 95, story 95.5 (rung `agents-95-knowledge`, re-review fix R95K3-05, 2026-10-07)
+location: `src-tauri/crates/keeper-agent/src/promote.rs` (`finish_pending`)
+reason: A pending record whose session is not at its recorded path is refused terminally (its record cleared) rather than followed by the session's id to its new place, so a person who archives a session with an unfinished promotion promotes it again after unarchiving. Close by resolving `Pending.session_id` with `verbs::find` and finishing it for an active session, refusing only for an archived or trashed one.
+status: open
+
+### DW-922: Promotion records set aside as unreadable stay in `.keeper/` with nothing that shows them.
+
+origin: epic 95, story 95.5 (rung `agents-95-knowledge`, re-review fix R95K3-06, 2026-10-07)
+location: `src-tauri/crates/keeper-agent/src/promote.rs` (`set_aside`)
+reason: The refusal names `.keeper/promote-out.<ulid>.unreadable.json` once; afterwards only a person looking in the never-synced `.keeper/` finds it, and nothing prunes such files. Close with a panel line for set-aside records and a way to dismiss them.
+status: open
+
 ### DW-930: A listing that fails part way through is proved by inspection only.
 
 origin: epic 95, story 95.4 (rung `agents-95-search`, re-review R95S3, R236, 2026-10-07)
@@ -8608,6 +8755,41 @@ location: `src-tauri/crates/keeper-agent/src/search.rs` (`Searching::index_hits`
 reason: R236 asks the bounds before every ranked note, listing and listing line, before it is matched or resolved, so a drive whose bounds ran out exactly as its last read finished says it is incomplete even where every remaining line would not have matched or every remaining note is gone. Accepted as the strict side: matching or resolving is the work the check bounds.
 status: open
 
+### DW-960: A vault copy a person edited after its promotion is no longer the note's copy.
+
+origin: epic 95, story 95.5 (rung `agents-95-knowledge`, re-review fix R95K4-02…04 / R244, 2026-10-08)
+location: `src-tauri/crates/keeper-core/src/sessions/promote.rs` (`standing`, `copy_digest`, `CopyLoss`, `promote_panel`), `src-tauri/crates/keeper-agent/src/promote.rs` (`promote_out`, `review`)
+reason: R244/R252/R253 grant replacement and review only to the copy whose `copy_digest` (review keys aside) the row's fourth cell records. A person who edits the vault copy makes it another file to keeper: promoting the note again and *Reviewed by me* are refused — saying the copy changed since it was published (`CopyLoss::Changed`), the panel's `foreign_copy` the same — and the panel shows no review of it, until the copy is moved away (kept) or the note is promoted under another name. A row written before R244 (three cells) grants nothing either (`CopyLoss::Unrecorded`). Close by recording the copy's later revisions the person made (e.g. the row's digest followed through the vault copy's own commits), or by offering "this copy is the note's" as a person's explicit act.
+status: open
+
+### DW-961: The journal executor's `make_dirs` resume syncs only the leaf folder's entry.
+
+origin: epic 95, story 95.5 (rung `agents-95-knowledge`, re-review fix R95K4-06 / R244, 2026-10-08)
+location: `src-tauri/crates/keeper-agent/src/sessions/exec.rs` (`make_dirs`)
+reason: `make_dirs` syncs the entries of the folders it made itself; a resume after a crash between `create_dir_all` and those syncs finds every folder there and syncs only the leaf's entry, so a new ancestor's entry may never be synced. R244 added `make_dirs_within` (since R253 `make_dirs_within(drive, vault, dir)`, syncing every entry from the drive's child down on every call) for the shell's durable vault write only. Close by giving the executor's `MkDir`/`write_durable`/`copy_checked` the zone as root and calling it.
+status: open
+
+### DW-962: The promote panel reads a harvested note's vault copy only up to 1 MiB.
+
+origin: epic 95, story 95.5 (rung `agents-95-knowledge`, re-review fix R95K5-01/02 / R253, 2026-10-08)
+location: `src-tauri/crates/keeper-agent/src/promote.rs` (`COPY_BYTES`, `copy_fact`, `promote_out`)
+reason: Whether a copy is still the note's (`copy_digest`) needs its whole text, so the panel reads it whole, up to `COPY_BYTES` (16 × `MAX_NOTE_BYTES`); a larger file shows no review and says the panel did not read it (`foreign_copy`), while a re-promotion and a review, which read the copy whole, still decide by it. `promote_out` does not refuse a harvested note larger than `MAX_NOTE_BYTES` (the panel offers no revision for one, so the UI cannot ask). Close by refusing such a promotion, which bounds every copy below the panel's read.
+status: open
+
+### DW-963: Bytes identical to a pending promotion's that land at its target before it finishes are taken as its own.
+
+origin: epic 95, story 95.5 (rung `agents-95-knowledge`, re-review fix R95K5-03 / R253, 2026-10-08)
+location: `src-tauri/crates/keeper-agent/src/promote.rs` (`publish`)
+reason: A pending promotion is admitted only onto an absent target or the copy its row records (`promote::standing`); `publish` accepts its own exact bytes at the target as the operation's write done before a crash, and records the receipt. A file synced from another device between the admission and the finish holding exactly those bytes cannot be told from that write — the same window as DW-920's absent-target race. Close with DW-920 (a create-new write, or the operation's own marker written durably after its write).
+status: open
+
+### DW-964: The promote panel does not show a note's `foreignCopy` yet.
+
+origin: epic 95, story 95.5 (rung `agents-95-knowledge`, re-review fix R95K5-05 / R253, 2026-10-08)
+location: `src/lib/ipc/gen/KnowledgeNoteVm.ts` (`foreignCopy`); the promote panel (rung `agents-95-panel`)
+reason: Rust and the dev mock fill `KnowledgeNoteVm.foreignCopy` with why the note's vault copy is not its own and what the person can do; this rung ships no panel UI. Close in the panel rung by showing it beside the note's review state.
+status: open
+
 ### DW-970: A settling that cannot tell whose a file is holds the folder until a person settles the path.
 
 origin: epic 95, story 95.2 (rung `agents-95-consolidate`, R246 / R95C5-02, 2026-10-08; widened by R250 / R95C6-01…03, R264 / R95C7-01…03 and R268 / R95C8-01…03)
@@ -8634,6 +8816,34 @@ status: open
 origin: epic 95, story 95.4 (rung `agents-95-search`, re-review R95S4, R248, 2026-10-08)
 location: `src-tauri/crates/keeper-core/src/notes/search_index.rs` (`SearchIndex::reader`, `SearchIndex::open`)
 reason: R248 reads `PRAGMA encoding` once when a reader opens and refuses any answer but `UTF-8` (`SearchIndexError::Encoding`), since a value is admitted by the length SQLite stores for it. `open_read_only` shares that reader, so the Mac's own notes search refuses such an index too, while `SearchIndex::open` (the writer) keeps it. keeper's writer only ever creates UTF-8 indexes, so only a foreign tool can produce one; if one is met, the writer should discard it as it discards an incompatible schema.
+status: open
+
+### DW-1040: A review's write trusts `knowledge::review` to keep the copy the note's; nothing re-checks it.
+
+origin: epic 95, story 95.5 (rung `agents-95-knowledge`, re-review fix R95K6-01 / R263, 2026-10-08)
+location: `src-tauri/crates/keeper-agent/src/promote.rs` (`review`, the `amend` closure)
+reason: `review` checks `promote::standing` on the copy before composing the tick or untick, then writes `knowledge::review`'s output without asking whether that output still has the receipt's `copy_digest`. R263 makes the writer keep the body and the frontmatter boundary (`Frontmatter::remove_in` keeps an emptied block in front of a block-shaped body), proven by the review-cycle fixtures; a future writer change that broke it again would write the copy and only then lose its authority. R263 does not hold for every shape: a body-leading U+FEFF (`---\nhuman_reviewed: true\n---\n\uFEFFBody.\n`) moves into the header when the review empties the first block — DW-1041 is that counterexample. Close by refusing, inside the `amend` closure, a composition whose `copy_digest` differs from the text it was composed from (never by refreshing the receipt).
+status: open
+
+### DW-1041: A review that empties the first block moves a body-leading byte order mark into the header.
+
+origin: epic 95, story 95.5 (rung `agents-95-knowledge`, review-95know-7 R95K7-01, R266, 2026-10-08)
+location: `src-tauri/crates/keeper-core/src/agents/knowledge.rs` (`review`), `src-tauri/crates/keeper-core/src/notes/frontmatter.rs` (`Frontmatter::remove_in`); the shell's `live_editor::amend_block`
+reason: for `---\nhuman_reviewed: true\n---\n\uFEFFBody.\n` the untick empties the first block and the body-leading U+FEFF is then read as part of the header; the shell's `live_editor::amend_block` refuses that untick, so nothing is corrupted — a person's review is refused. Fix: keep the byte order mark / frontmatter / body partition through the review's composition, with a body-leading-BOM review-cycle test.
+status: open
+
+### DW-1042: The properties panel does not see a frontmatter block behind a byte order mark.
+
+origin: epic 95, story 95.5 (rung `agents-95-knowledge`, review-95know-7 R95K7-02, R266, 2026-10-08)
+location: `src/components/notes/properties-panel.tsx` (`readFrontmatter`, `addProperty`)
+reason: a BOM-prefixed block (the retained empty `\uFEFF---\n---\n` included) is not read as frontmatter, so `addProperty` prepends a second block and the old one becomes body. Pre-existing, and only a person's action reaches it. Fix: a BOM-aware parser and splicer with a body-preservation test.
+status: open
+
+### DW-1043: The mock shell's review rewrite ignores the first block's boundary.
+
+origin: epic 95, story 95.5 (rung `agents-95-knowledge`, review-95know-7 R95K7-03, R266, 2026-10-08)
+location: `dev/mock-shell.ts` (`promoteFileText`)
+reason: the mock replaces the first literal `human_reviewed: false\n` anywhere in the text, so a note with two frontmatter-shaped blocks reads back without `verified` or with its body edited; the Rust path does not. Fix: respect the first-block boundary in the mock; until then these shapes are excluded from mock/Rust parity claims.
 status: open
 
 ### DW-1060: A change to the old file in the instant between the settling's last look at it and its unlink is not seen.
@@ -8671,3 +8881,1677 @@ location: `src-tauri/crates/keeper-agent/src/search.rs` (`Plan::reads_listing` ~
 reason: an allowed bundle's `index.md` symlinked to a `.keeper-displaced-<request>-<n>` left by a stopped commit is admitted by `reads_listing` and opened, so a `## Documents` list in those bytes can steer hits. Separately, search can see some of a multi-file commit's final `.md` paths and not others. Search writes nothing, so nothing is lost; the result may be stale or partial. Fix: apply the transient-name families to listing and configuration admission (with a listing-alias regression), and either document or isolate the multi-file-commit read.
 status: open
 
+### DW-1093: The Files surface's create asks only the vault, so with the vault at the drive's root a person can create an empty file inside a session's workspace.
+
+origin: epic 95, story 95.5 (rung `agents-95-knowledge`, review-95know-8 R95K8-02, R292, 2026-10-10); pre-existing (Phase 7 / story 46.14), a person's own action, not an agent write
+location: `src-tauri/crates/keeper/src/sync_ipc.rs` (`vault_and_scope` ~4762–4780, `sync_create_entry` ~5475–5520); `src-tauri/crates/keeper-sync/src/files_write.rs` (`WriteScope::create` ~568–582, `WriteScope::fenced` ~769–792)
+reason: `sync_create_entry` composes the target with `scope.create(&subpath, &name)`, resolves the directory, checks a collision and calls `write_vault_file` — it never asks `fenced`, `owner` or `route`, and `create` tests only the vault (R291). Its scope (`vault_and_scope`) arms `with_sessions` but deliberately not `with_agents`: the Files surface is a person's, and a person edits an agent's home. So where the live vault contains the sessions zone (a vault at the drive's root, or any vault around `60-sessions/`), the Files "create" can make an empty file under `<zone>/active/<session>/workspace/` or `<zone>/archive/<year>/<session>/workspace/`, which the zone's contract keeps as scratch keeper never touches; nothing is overwritten (the collision check stands). Fix: enforce the zones' fence in the shared create path (`WriteScope::create` asking `fenced` on the composed profile-relative path), or have `sync_create_entry` check `fenced(&target.profile_relative)` before writing; either way document that the shell scope arms no agents fence (the person's edit policy for agent homes) rather than implying it. Behavioural test: create under a session's workspace refused and a permitted sibling (the session's `artifacts/`, or a vault folder beside the zone) created. Gate: the shell crate compiles and runs only on macOS (`scripts/check-macos.sh`, CI's macOS job).
+status: open
+
+### DW-1094: The session tree and reference candidates compose the sessions zone's raw spelling, so a zone configured `./60-sessions` loses its workspace lock and promotable flag.
+
+origin: epic 95, story 95.5 (rung `agents-95-knowledge`, review-95know-9 R95K9-02, R295, 2026-10-10)
+location: `src-tauri/crates/keeper/src/sessions_ipc.rs` (`sessions_tree` ~197–201 zone, ~243 subpath, ~277–284 `session_workspace_lock`; `sessions_ref_candidates` ~4216–4221 zone, ~4251 `in_session_workspace`); `src-tauri/crates/keeper-sync/src/files_write.rs` (`WriteScope::workspace_position`, exact `strip_prefix` of the stored prefix)
+reason: both commands build `format!("{zone}/…")` from `sessions.subfolder.trim()`, while the scope from `sync_ipc::sessions_scope` stores the native prefix (`./60-sessions` → `60-sessions`, R292/R295). `workspace_position`'s exact strip then fails for any spelling the prefix rewrites: the tree omits the scratch lock and its sentence, and a workspace file's candidate reports `promotable: false`. View-model facts only — the session file and directory commands keep their own session-relative workspace refusal (`sessions_ipc.rs` ~3206, ~3377–3405; `core/sessions/files.rs` ~224–225, ~339–357). Fix: compose the profile-relative path through the scope's shared interpretation (no shell-local normalisation rule); cover the rendered lock and the candidate's flag for `./60-sessions` and an ordinary sibling; macOS gate.
+status: open
+
+### DW-1095: Vault links keep their own subfolder matching, so a vault configured `./notes` or ` notes ` is not recognised from `notes/x.md`.
+
+origin: epic 95, story 95.5 (rung `agents-95-knowledge`, review-95know-9 fixer's R-NEW-1, R295, 2026-10-10); pre-existing
+location: `src-tauri/crates/keeper-core/src/vault_link.rs` (`subfolder_components` ~111–118 and its use in `note_path_for_file` ~191–201; `file_path_for_note` ~234–246); TS mirror `src/lib/vault-link/rule.ts` and its shared vectors
+reason: both directions split the configured subfolder on `/` and `\` and drop only empty parts, untrimmed and keeping `.`; forward matching (`core/vault_link.rs` ~111–116, 191–201) folds case, while the reverse composition (~231–250, TS mirror `src/lib/vault-link/rule.ts` ~201–217) builds the prefix from the configured components without folding (keeps `Notes`) — a third reading beside the profile's (`subfolder_components`) and the write scope's (`native_prefix`, R295). A vault configured `./notes` or ` notes ` is not matched from the real `notes/x.md`, and the reverse mapping composes `./notes/…`; on Unix a backslash is split where the registered root keeps it. Missing or misdirected link affordances; this module writes nothing and is not the write fence. Fix: one shared interpretation for both directions and the TS mirror, with shared vectors for `./notes`, ` notes `, `notes/.` and (Unix) a backslash name.
+status: open
+
+### DW-780: The promote panel still needs a real WKWebView and harvested-note run on hesperia.
+
+origin: epic 95, story 95.5 (rung `agents-95-panel`, 2026-10-06)
+location: `src/components/sessions/promote-panel.tsx`, `session-detail.tsx`, `session-actions.tsx`
+reason: Linux Chromium over the mock shell proves rendering and interaction, not Tauri IPC, the installed WKWebView or the live drive. Close by opening a steward's harvested note on hesperia, reading it whole, promoting with a review, unticking and reticking the vault copy, and archiving with a chosen promotion plus a skipped row; read back the provenance through a real tool read. CI's macOS build remains the shell rung's gate.
+status: open
+
+### DW-781: The existing phone stack has no Sessions route, including a desktop window narrowed below 768 px.
+
+origin: epic 95, story 95.5 browser proof (rung `agents-95-panel`, 2026-10-06)
+location: `src/lib/phone-surfaces.ts` (`PhoneSurface`, `phoneSurfaceFor`), `src/hooks/use-shell-layout.ts`
+reason: At 420 px the full app renders the Inbox and filters Sessions out of its navigation; this predates the promote panel. The panel and archive dialog are verified at that width by mounting the real SessionsPane with shipped CSS and the mock shell, not by pretending the full app has a route. Close in a phone-sessions story with capability-gated navigation and full-stack browser/device proof.
+status: open
+
+### DW-782: The archive checklist's revision sees a workspace file by its length and modification time, not its bytes.
+
+origin: epic 95, story 95.5 (rung `agents-95-panel`, review fix R95P-05/06, R216, 2026-10-07)
+location: `src-tauri/crates/keeper-agent/src/promote/offer.rs` (`stamps`), `src-tauri/crates/keeper-core/src/sessions/offer.rs` (`snapshot_revision`, `row_revision`)
+reason: Hashing every `workspace/` file on each panel read would read the whole scratch area on every root event, which is the listing-only posture of FR-243. A rewrite that keeps the length and lands within the filesystem's mtime resolution of the read is not seen as a change; a chosen promotion still runs `promote_in`'s stability admission and copies only the bytes it verified, so what is lost is only the skip of a file rewritten that way. Close if a content-addressed workspace index (or a cheap per-file fingerprint the sync engine already keeps) becomes available.
+status: open
+
+### DW-783: Every sessions-root event rereads the whole promote panel.
+
+origin: epic 95, story 95.5 (rung `agents-95-panel`, review fix R95P-06, R216, 2026-10-07)
+location: `src/components/sessions/promote-panel.tsx` (`listenSessionsChanged`), `src-tauri/crates/keeper/src/sessions_root.rs` (rescan trigger)
+reason: R216 keeps the choices of rows whose Rust revision did not change, so activity in another session no longer wipes a checklist, but the event names only the root: each one costs a full panel read — up to 4096 note hashes and an `is_text` pass over the session's artifacts — and briefly withdraws Archive. Close by carrying the changed session (or path) in `sessions-changed` and rereading only for this session.
+status: open
+
+### DW-784: Ticking a notes copy after one's own review needs the copy read again.
+
+origin: epic 95, story 95.5 (rung `agents-95-panel`, review fix R95P-03, R216, 2026-10-07)
+location: `src-tauri/crates/keeper-agent/src/promote.rs` (`review`; `review_as_read` until R234), `src/components/sessions/promote-panel.tsx` (`KnowledgeCard`)
+reason: A review is bound to the copy's revision as read; the review write itself changes the copy's bytes, so the person's next tick on the same card asks for **Read the notes copy again**. Correct but one step more than needed. Close by having `sessions_knowledge_review` answer the copy as it wrote it (`NoteTextVm`), so the panel keeps showing exactly what is on disk.
+status: open
+
+### DW-785: The R216 promote and archive commands need a macOS build and a live drive run.
+
+origin: epic 95, story 95.5 (rung `agents-95-panel`, R216, 2026-10-07)
+location: `src-tauri/crates/keeper/src/sessions_ipc.rs` (`sessions_archive`, `sessions_promote`, `sessions_promote_to`, `sessions_knowledge_read`, `sessions_knowledge_review`), `src-tauri/crates/keeper/src/lib.rs` (handler list)
+reason: The shell crate does not compile on Linux; these commands were changed by inspection, every caller grepped. Close with CI's macOS job (or `scripts/check-macos.sh mac`) and, with DW-780, on hesperia: archive a session with a chosen promotion and a retargeted row, restore a deleted notes copy, and review a notes copy edited in Obsidian.
+status: open
+
+### DW-910: Every choice, read and consent in the promote panel rereads the whole panel.
+
+origin: epic 95, story 95.5 (rung `agents-95-panel`, review fix R95P2-06, R234, 2026-10-07)
+location: `src/components/sessions/promote-panel.tsx` (`PromotePanel.choose`, `changeNote`), `src-tauri/crates/keeper-agent/src/promote/offer.rs` (`panel_for`)
+reason: Rust decides what of the person's intent holds, so the panel forwards each change with a full `sessions_promote_panel` read (inventory, row digests, note reads, history). Correct, and Archive waits for the read, but a session with thousands of workspace entries pays that per click. Close with a decide-only command over the last read's facts (still Rust's `offer::decisions`), or with DW-783's per-session events.
+status: open
+
+### DW-911: The R234 promote and archive commands need a macOS build and a live drive run.
+
+origin: epic 95, story 95.5 (rung `agents-95-panel`, R234, 2026-10-07)
+location: `src-tauri/crates/keeper/src/sessions_ipc.rs` (`sessions_promote_panel` + `intent`, `sessions_archive` + `choices`/`root`, `sessions_knowledge_review` → `promote::review`, and their `#[cfg(not(desktop))]` twins)
+reason: The shell crate does not compile on Linux; changed by inspection, every caller grepped. Close with DW-785: CI's macOS job, then on hesperia archive a session whose workspace holds a hidden file and a link, delete a promoted target after skipping its row, and tick a notes copy while Obsidian saves it.
+status: open
+
+### DW-912: A workspace with more than 4096 entries cannot be archived with its emptying.
+
+origin: epic 95, story 95.5 (rung `agents-95-panel`, review fix R95P2-03, R234, 2026-10-07)
+location: `src-tauri/crates/keeper-agent/src/sessions/exec.rs` (`inventory`, `INVENTORY_CAP`)
+reason: The emptying's guard needs the whole inventory, and every entry is a checklist item; past the cap the inventory says so and the archive is refused rather than deleting what nobody decided about. A bulk choice ("skip everything under this folder") would lift it.
+status: open
+
+### DW-913: A link or special file in the workspace can only be skipped.
+
+origin: epic 95, story 95.5 (rung `agents-95-panel`, review fix R95P2-03, R234, 2026-10-07)
+location: `src-tauri/crates/keeper-core/src/sessions/offer.rs` (`refused_unlisted`)
+reason: Promotion copies a regular file; a link is never followed, so keeping what it points at means copying that file into `workspace/` first. Fine for now; say so in the row (it does) and revisit if agents start leaving links.
+status: open
+
+### DW-914: Past some fifty reviewers a notes copy's tick is refused.
+
+origin: epic 95, story 95.5 (rung `agents-95-panel`, review fix R95P2-02, R234, 2026-10-07)
+location: `src-tauri/crates/keeper-core/src/agents/knowledge.rs` (`MAX_REVIEWED_BYTES`), `src-tauri/crates/keeper-agent/src/promote.rs` (`review`)
+reason: The reader's bound is the 64 KiB note plus 16 KiB of review blocks, so every copy keeper writes stays readable whole; a tick that would pass it is refused with the sentence. A copy edited past the bound in Obsidian is shown with why, not read.
+status: open
+
+### DW-1000: The command vectors run without drive history.
+
+origin: epic 95, story 95.5 (rung `agents-95-panel`, review fix R95P3-06, R249, 2026-10-08)
+location: `src-tauri/crates/keeper-agent/src/promote/command-vectors.json`, `dev/mock-shell.ts` (`promotePanel`'s row state)
+reason: Rust dates a vault copy by the drive's git history and the vectors' drive has none, so a harvested note that differs from its copy is `unknown` there while the mock, which models history as `changed`, says `stale`. The scenarios keep candidates equal to their copies (review keys aside). Close by committing the scenario's vault into a repository in `every_command_vector_holds` and adding a newer-candidate scenario.
+status: open
+
+### DW-1001: What the emptying can still remove that it was not decided on.
+
+origin: epic 95, story 95.5 (rung `agents-95-panel`, review fix R95P3-02, R249, 2026-10-08; corrected by R95P4-01, R265, 2026-10-08)
+location: `src-tauri/crates/keeper-agent/src/sessions/exec.rs` (`empty_as_decided`, `Folder`, `walk`, `down`)
+reason: On Unix the emptying holds the workspace folder by descriptor from its check on (reached from the zone with `O_NOFOLLOW` opens), walks and removes relative to it (`statat`/`unlinkat`, `AT_REMOVEDIR` for folders), and binds each folder below it to the identity the check found, so a root or folder swapped for a link or another folder after the check is never reached and nothing outside the held workspace can be removed. What remains, all inside that held folder: (1) a file name rewritten or renamed over in the instant between its re-stamp and its `unlinkat` is removed whatever its length and mtime — the bytes lost are what was put in the workspace in that instant; (2) folders below the workspace are bound only from the check, not from the decision (`Emptying.entries` stamps a folder `dir`), so a real folder holding the same names with the same stamps, moved into a decided folder's place between the decision and the check, is emptied; (3) a target changed after the target check; (4) a decided directory entry is removed checking only its holder's identity, so an EMPTY leaf directory substituted after the check, or recreated after it was absent at the walk, is removed and the archive completes instead of refusing as `PlanStep::EmptyDirKeep` promises (DW-1050; an empty folder holds no bytes, so nothing a person wrote is lost). Off Unix (DW-1002) every removal is by path, so R95P4-01's redirect through a root or folder replaced by a link after the check stands there. Close (1) with a rename into a quarantine checked afterwards, (2) by recording folder identities in `Emptying`, (3) by holding the targets, (4) as DW-1050 says.
+status: open
+
+### DW-1002: Off Unix a replaced workspace folder is told only by its place and contents.
+
+origin: epic 95, story 95.5 (rung `agents-95-panel`, review fix R95P3-04, R249, 2026-10-08)
+location: `src-tauri/crates/keeper-agent/src/sessions/exec.rs` (`identity`)
+reason: `identity` is `<dev>:<ino>` on Unix (macOS, iOS, Linux, Android); elsewhere it is only "a real folder", so a workspace replaced by a twin with the same names and stamps would be emptied. No Windows host runs sessions today. Close with the file index (`GetFileInformationByHandle`) when one does.
+status: open
+
+### DW-1050: An empty folder put in a decided folder's place during the emptying is removed instead of refused.
+
+origin: epic 95, story 95.5 (rung `agents-95-panel`, review-95panel-5 R95P5-01, deferred under the convergence policy by R270, 2026-10-08)
+location: `src-tauri/crates/keeper-agent/src/sessions/exec.rs` (`empty_as_decided`, the `unlinkat(AT_REMOVEDIR)` of a decided folder)
+reason: `sessions/exec.rs` removes a decided directory entry checking only its holder's identity, so an EMPTY leaf directory substituted after the check (or recreated after being absent at the walk) is removed and the archive completes instead of refusing (`PlanStep::EmptyDirKeep` promises refusal). `AT_REMOVEDIR` cannot remove a non-empty folder, so no person's bytes are lost. Fix: compare the entry's own identity with the walk's record before `unlinkat(AT_REMOVEDIR)`; absent-at-walk but present-now refuses; keep the NotFound recovery. Regression: an empty child replaced by another empty folder; an absent child recreated. DW-1001 (4) names this case.
+status: open
+
+### DW-1141: An artifact's "Promote again" is offered over a vault file that is not its copy.
+
+origin: epic 95, story 95.5 (rung `agents-95-panel` restack onto rung 5's fe760de0, 2026-10-10)
+location: `src-tauri/crates/keeper-agent/src/promote/offer.rs` (`complete`, `vm.artifacts`); `keeper-core` `sessions::promote::PanelFacts::copies`
+reason: knowledge's `promote_panel` tells a harvested note's copy standing (`foreign_copy`, from `PanelFacts::copies`, which `panel` reads for harvested notes only), and the panel now offers nothing over a note's foreign copy (R-NEW-1). An ordinary artifact promoted out has no such fact: its fixed "Promote again to …" is still offered when the file at its row's target is edited or unrecorded, and `promote_out` then refuses it with the `CopyLoss` sentence — nothing is written over, but the panel offers an action Rust refuses. Close by reading `copy_fact` for every out row's target, not only harvested notes', and folding it into `ArtifactOfferVm.unavailable`.
+status: open
+
+### DW-1142: The dev mock's publication-receipt digest is a second frontmatter parser that disagrees with Rust's `Frontmatter`.
+
+origin: epic 95, story 95.5 panel restack (R300; from R95P6-01, review-95panel-6.md), 2026-10-10
+location: `dev/mock-shell.ts` ~:2496–2507 (README's fourth cell; archive snapshot ~:2530–2541, ~:2825–2828); Rust reference `keeper-core` `sessions::promote.rs` ~:345–350, 375–402 and `notes/frontmatter.rs` ~:261–285, 505–520, 710–716, 823–842
+reason: the dev mock's publication-receipt digest (`dev/mock-shell.ts` ~:2496–2507, used for the README's fourth cell and the archive snapshot ~:2530–2541, ~:2825–2828) is a second frontmatter parser that disagrees with Rust's `Frontmatter` (`keeper-core/src/sessions/promote.rs` ~:345–350, 375–402; `notes/frontmatter.rs` ~:261–285, 505–520, 710–716, 823–842): it accepts only an unpadded opening `---` and a `---` close (Rust also accepts trailing whitespace on the opening fence and `...` as a close), drops a comment line following the removed review entry (Rust keeps comments outside the entry's span), and keeps a quoted `"human_reviewed": false` (Rust unquotes/trims keys). So the mock's receipts and snapshot revisions can differ from the built app's for those inputs; the nine command-vector scenarios cover only canonical inputs. Dev-only: no production write. Fix: carry Rust-recorded receipts in the viewing fixtures instead of a TS parser; or, if dynamic computation stays, match Rust's span/fence semantics and add shared Rust/TS vectors for the three counterexamples (comment after a review block, quoted/padded review key, alternate/padded fences) — never re-record expectations from the TS side.
+status: open
+
+### DW-750: A `run` card does not draw its execution binding (UX-DR139).
+
+origin: epic 96, story 96.1 (rung `agents-96-run`, R155, 2026-10-06)
+location: `src-tauri/crates/keeper-core/src/agents/approval_card.rs` (`ApprovalCardVm`), `src/components/` (the approval card)
+reason: R155 (Q15's (b), epic 93 being cut) puts UX-DR139's payload — the argv one element per line, the resolved program with 12 hex digits of its SHA-256, each held file's hash, the *Network* chip with the workspace's file count, size and list — on the card through 96.1, with the design lane deciding before the rung. That decision has not been made, so this rung changes no view model or component: the card shows keeper's summary (*with network*, *with code the session holds*), the tier and the exact arguments; the binding is digested and re-checked at consume (R144) but not drawn. Close with the design lane's decision, an `exec` part of `ApprovalCardVm` (ts-rs) and the card's rendering, proved in a real browser at 1280 and 420 px.
+status: closed 2026-10-07
+resolution: Fixed by R213 (R96R-17): `ApprovalCardVm.run` (`RunCardVm`, `RunNetworkVm`, ts-rs) carries the argv as it runs, the program and a wrapped program with 12 hex digits of their SHA-256, the resolved folder, each held file's hash and, with network, the *Network* chip's sentence and file list; `approval-card.tsx` draws it. Proved by `approval_card` VM tests, `approval-card.test.tsx` ("draws a run as keeper bound it") and the mock-shell `run` card in a real browser.
+
+### DW-751: A `run`'s session allowance (R146) is described but no host applies a session allowance.
+
+origin: epic 96, story 96.1 (rung `agents-96-run`, R146, 2026-10-06)
+location: `src-tauri/crates/keeper-core/src/agents/run.rs` (`session_reach`), `src-tauri/crates/keeper-agent/src/approvals.rs`
+reason: A T2 `run` outside `main` offers `session`, and the card says what it would grant (the same program by SHA-256, the same `cwd`, any argv, no network, no held code). No host of this build reuses a `session` decision for a later call of any tool (R78's reuse is unbuilt for drive writes too), so every run still asks. Close with the reuse, matching on `exec_binding.exe_sha256` and `cwd` for `run`.
+status: closed 2026-10-07
+resolution: Fixed by R213 (R96R-18): a `session` decision on a T2 run gives the consuming host a `run::RunAllowance` (same host, program SHA-256s and resolved cwd, any argv, T2 only, never `main`, ≤ 24 h, in memory until the session closes). Proved by `run::tests::a_run_allowance_covers_only_its_kin` and `agent_turns parks::a_session_approval_lets_the_same_program_run_again`.
+
+### DW-752: Shell strings carried by programs outside the refusal table.
+
+origin: epic 96, story 96.1 (rung `agents-96-run`, D-33, 2026-10-06)
+location: `src-tauri/crates/keeper-core/src/agents/run.rs` (`shell_string`)
+reason: The table refuses a shell's `-c`, `--command` and standard-input script directly, behind `env` (and `env -S`), `nice`, `nohup`, `timeout`, `xargs`, `stdbuf`, `command`, `time`, `setsid`, `ionice`, `busybox`, and a shell named later with `-c` (`find -exec sh -c`). Other programs run text as a command line too: `watch`, `flock … -c`, `script -c`, `ssh host <command>`, a git alias `-c alias.x=!…`. Each runs inside the same sandbox and tier, so nothing escapes it, but D-33's letter is broader than the table. Close with those rows.
+status: closed 2026-10-07
+resolution: Fixed by R213 (R96R-07): `run::command_string` and the wrapper table refuse `watch`, `script`, `flock -c`, `ssh` remote commands and command options, `scp -S`, `sftp -b`, `rsync -e`, git's `-c`/`--config-env`/`--exec-path` and command-running subcommands (`COMMAND_STRING`). Proved by `run::tests::run_refuses_a_command_line_given_as_text`, one mutant per row. The table is not exhaustive.
+
+### DW-753: A repository's own `.git/config` inside `workspace/` can name programs git runs.
+
+origin: epic 96, story 96.1 (rung `agents-96-run`, S-08, 2026-10-06)
+location: `src-tauri/crates/keeper-core/src/agents/run.rs` (`held_files`)
+reason: S-08 counts hooks git would run and the workspace root's dotfiles as code the session holds; `workspace/repo/.git/config` is neither, yet `core.fsmonitor`, `core.sshCommand`, `diff.*.textconv` and filter drivers there name programs git starts (the run's `-c core.hooksPath=/dev/null` stops hooks only). The program still runs in the sandbox at the run's tier. Close by counting a nested repository's `.git/config` as held when it names a program-running key, or by passing `-c core.fsmonitor=false` and kin.
+status: closed 2026-10-07
+resolution: Fixed by R213 (R96R-09): a `.git/config` at any depth whose keys are not all descriptive (`run::git_config_runs_code`) is code the session holds (T4, hashed into the binding). Proved by `run::tests::a_repository_config_that_runs_a_program_is_held_code` and `keeper-agent run::tests::code_the_session_holds_is_found_on_the_disk`.
+
+### DW-754: A networked run of a workspace above 512 files is refused instead of attaching its set.
+
+origin: epic 96, story 96.1 (rung `agents-96-run`, S-03, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/run/mod.rs` (`prepare`)
+reason: The workspace set rides in the request's `preconditions`, inline, so a set of thousands of files would exceed a Matrix event; keeper refuses such a run with a sentence rather than sending a request no room carries. Close with the set as an encrypted attachment beside the arguments (R86's blob discipline), digested the same way.
+status: open
+
+### DW-755: The Mac's `[sandbox]` table (read_exec, env) has no home.
+
+origin: epic 96, story 96.1 (rung `agents-96-run`, R148, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/desktop.rs` (`desktop_sandbox`)
+reason: R148 keeps the same `read_exec`/`env` table device-local on the Mac; this rung grants the Mac only the system folders and the folder `xcode-select -p` names, so a toolchain under the person's home (rustup, nvm) is not reachable there. Close with the table in the Mac's device-local agent store (Q9's pins-style store) and Settings › Agents.
+status: done 2026-10-07 — rung `agents-96-mcp-mac` (R213's Mac half): `keeper_core::agents::mac_tables` keeps the table in `keeper.db` (`agent_sandbox`, `agent_sandbox_read_exec`, `agent_sandbox_env`), checked by `SandboxTable::check`; Settings › Agents › *Sandbox* edits it and `desktop_sandbox` probes it (`the_mac_sandbox_table_round_trip`, `a_saved_table_builds_the_host_again`); a toolchain run without downloading into the fresh HOME is owed on hesperia
+resolution: Scope moved by R213 (R96R-19): the validation is `run::SandboxTable::check`, used by agentd and the Mac now; the Mac's device-local store, its Settings section and the desktop host reading it land in rung 3 `agents-96-mcp-mac` with the MCP table (Q9(a)). Until then the Mac runs the default table and its status says no `[sandbox]` table is configurable there.
+
+### DW-756: A person's stop does not stop a `run` that is under way.
+
+origin: epic 96, story 96.1 (rung `agents-96-run`, 2026-10-06)
+location: `src-tauri/crates/keeper-agent/src/run/mod.rs` (`execute_in`)
+reason: A run ends at its exit or its `timeout_s` (at most 1800 s), its whole process group killed either way; the turn's cancel signal is not read while it waits, so a stop takes effect when the run ends. Close by handing the turn's `CancelSignal` to `execute` and killing the group on it.
+status: open
+
+### DW-757: A process of a Mac run that left its group and rewrote its environment outlives the run.
+
+origin: epic 96, story 96.1 (rung `agents-96-run`, review R96R-06, R213, 2026-10-07)
+location: `src-tauri/crates/keeper-agent/src/run/macos.rs` (`sweep`)
+reason: A sandbox profile cannot refuse `setsid`, so after killing the run's group the Mac kills every process of the user whose environment names the run's own `TMPDIR`. A descendant that left the group and also cleared or rewrote `TMPDIR` in its own environment is not found and keeps running. Close with a set the kernel tracks: walk the run's process tree from its pid (`proc_listchildpids`, through the shell crate's Platform port) before the kill.
+status: accepted residual (R231, 2026-10-07; its description corrected by R247, 2026-10-08): the Mac gives no unforgeable descendant identity without privileges keeper does not hold. An escaped descendant stays inside the same SBPL profile and keeps every grant the run had after keeper returns its result — `workspace/` read and write, and for a run without network the drives it asked to read (`read`), read-only, since the profile is applied once and the sweep revokes nothing; a networked run reads no drive. It gets no secret, no other drive and no network the run did not have. The run's result says what was swept (`run::Reaped::Swept { found }`), never that every process ended. docs/agents.md § *Running a command* and `run/macos.rs` say the same.
+
+### DW-758: A Linux run cannot set a file's mode or times even inside `workspace/`.
+
+origin: epic 96, story 96.1 (rung `agents-96-run`, review R96R-03, R213, 2026-10-07)
+location: `src-tauri/crates/keeper-agent/src/run/linux.rs` (`refused`)
+reason: Landlock does not mediate the chmod/chown/xattr/utime families, so keeper's seccomp filter refuses them in every run with `EPERM`; `chmod +x`, `tar x` and `cp -p` therefore cannot set modes or times in the workspace either. Close, where unprivileged user namespaces exist, with a mount namespace whose view of everything but `workspace/`, `HOME` and `TMPDIR` is read-only, and the metadata calls allowed again.
+status: open
+
+### DW-759: A script, a held file or a workspace file changed by another writer after the last check is used as it is then; the Mac checks its program before `sandbox-exec` starts it by path.
+
+origin: epic 96, story 96.1 (rung `agents-96-run`, review R96R-12, R213, 2026-10-07; re-audit R96R2-08, R231)
+location: `src-tauri/crates/keeper-agent/src/run/{mod.rs (verify_program), linux.rs (exec), macos.rs (command)}`
+reason: Since R231 the Linux trampoline reads the program's bytes through one open handle and starts it by that handle (`execveat` on the descriptor), so an ELF program put at its path after the check does not run. What stays: a `#!` script is started by its path, since its interpreter opens it by name and the descriptor cannot reach it under landlock; the held files (scripts, configuration) and, for a networked run, the workspace it releases are read by the program as they are when it reads them, so a writer outside the run (sync, another process of the host) changing them after the trampoline's last check is not seen; and on the Mac the parent checks the program before `sandbox-exec` execs it by path. Close with a snapshot: the verified bytes copied into a folder of the run's own, read-only to it, and the program and held code run from there.
+status: accepted residual (R231, 2026-10-07; R245, 2026-10-08: a `#!` program outside the workspace that `read_exec` grants is started by its path too and belongs here; R247, 2026-10-08: a native program a wrapper starts — `env tool`, `env nice tool`, and each wrapper between — is no longer in this residual on Linux: the trampoline opens it, checks it through that handle and hands the wrapper a link to the handle, `run::started`, `Expected.programs`); docs/agents.md § *Running a command* says so.
+
+### DW-980: A `run` card names the program a wrapper runs, but not the wrappers between.
+
+origin: epic 96, story 96.1 (rung `agents-96-run`, re-audit R96R3-01, R247, 2026-10-08)
+location: `src-tauri/crates/keeper-core/src/agents/approval_card.rs` (`run_card`, `RunCardVm.wrapped`)
+reason: Since R247 `exec_binding.wrappers` binds each wrapper a wrapper starts (`env nice tool` binds `nice`) by path and SHA-256, and the digest covers it, but the card draws only the program started and the innermost program (`wrapped`); the wrappers between show only as argv elements, without their hash. Close by drawing `wrappers` as `wrapped` is drawn (a `RunCardVm` field, TS binding, mock shell, card component).
+status: closed 2026-10-08
+resolution: Fixed by R260 (R96R4-05): `RunCardVm.wrappers` draws each wrapper between, by path and the first 12 hex digits of its SHA-256, as `wrapped` is drawn, through `ApprovalCardVm::of` and `attached_payload`, the TS binding, `approval-card.tsx` ("Then starts") and the mock shell. Proved by `approval_card::tests::a_run_card_draws_the_drives_it_reads_when_it_stops_and_each_wrapper` and `approval-card.test.tsx` "tells apart two runs alike but for the drives they read, their time limit and a wrapper between". The card still does not draw the environment (the host's fixed one, docs/agents.md) nor the folders' device and inode, which the approval binds; docs/agents.md says so.
+
+### DW-981: A program a wrapper starts sees the link to its descriptor as its own name.
+
+origin: epic 96, story 96.1 (rung `agents-96-run`, re-audit R96R3-01, R247, 2026-10-08)
+location: `src-tauri/crates/keeper-agent/src/run/linux.rs` (`reserve`, `hand`)
+reason: The wrapper is given `<run folder>/program-<n>/<name>` in the program's place, so the program's `argv[0]` is that path: a multi-call program still finds its name, and one that resolves itself through `/proc/self/exe` its install, but one that finds its install from `argv[0]`'s folder looks in the run's own folder, and `command -v tool` prints the link. The program also inherits one read-only descriptor of each such program. Since R260 (R96R4-01) that descriptor is opened inside the sandbox, under the run's own grants (`run::linux::hand`): a program outside every grant refuses the run, so the descriptor is only ever of a file the run's grants let it read anyway — before R260 it was opened before landlock and could carry a file outside them. Close by teaching the trampoline each wrapper's semantics and starting the program itself with its own `argv[0]`.
+status: open (R259 accepts the changed `argv[0]` and the inherited read-only descriptors as narrowed by R260)
+
+### DW-1030: A program outside the wrapper table that starts another program starts it by its path, unbound.
+
+origin: epic 96, story 96.1 (rung `agents-96-run`, re-audit R96R4-02, R260, 2026-10-08)
+location: `src-tauri/crates/keeper-core/src/agents/run.rs` (`WRAPPERS`, `programs`, `started`)
+reason: keeper resolves, hashes, binds and hands on by descriptor the program each wrapper of its table starts (`env`, `nice`, `nohup`, `timeout`, `xargs`, `stdbuf`, `command`, `time`, `setsid`, `ionice`, `flock`, and BusyBox's `env`, `nice`, `nohup`). A program outside that table that starts one named in its argv — `taskset 1 ./tool`, `chrt`, `chroot`, `find -exec`, `make`, BusyBox's `chpst` or `setuidgid` — is bound and tiered as itself: the program it starts runs inside the same sandbox at the run's tier, but by its path, unhashed, and a `./tool` it names is not counted as code the session holds. Close by modelling each such program's grammar as a wrapper's, or by refusing those forms.
+status: open
+
+### DW-1065: `headref` takes for a repository's two `HEAD` shapes git rejects, so a project folder beside a link is refused.
+
+origin: epic 96, story 96.1 (rung `agents-96-run`, re-audit R96R5-03, R269, 2026-10-08)
+location: `src-tauri/crates/keeper-agent/src/run/mod.rs` (`headref`, `git_configs`'s `HEAD` arm)
+reason: `headref` reads the whole `HEAD` file and skips what follows `ref:` with Rust's `trim_ascii_start`, whose ASCII whitespace includes form feed (`0x0c`); git's `validate_headref` (`setup.c`) reads at most 255 bytes and skips with git's own `isspace` (`ctype.c`: space, `\t`, `\n`, `\r` — no form feed). So a `HEAD` of the bytes `72 65 66 3a 0c 72 65 66 73 2f 68 65 61 64 73 2f 6d 61 69 6e 0a` (`ref:\x0crefs/heads/main\n`), and one of `ref:` followed by 247 or more spaces (`0x20`) before `refs/` (so `refs/` does not end within git's 255 bytes), are a repository's `HEAD` to keeper and not to git. Beside such a `HEAD`, an `objects` or `refs` link refuses the run (`git_configs`' unconditional linked-entry refusal) although git would not take the folder for a repository. A false-positive refusal only: nothing more runs, is granted or escapes, and the person can rename the folder or the link.
+fix: Read at most 255 bytes and skip only git's `isspace` set; keep the executable-entry and valid-linked-repository controls of `a_folder_git_cannot_take_for_a_repository_refuses_nothing`, and add real-git non-repository controls (`git rev-parse --git-dir` refusing the folder) for both byte shapes.
+status: open (R269: DW-class under the convergence policy, no code change this round)
+
+### DW-1143: The BusyBox `nice` and `env -u` refusal tables do not name `--u` or a first-position `--`, and the As built says "every spelling".
+
+origin: epic 96, story 96.1 (rung `agents-96-run`, review-96run-6.md DW candidate, R301, 2026-10-10)
+location: `src-tauri/crates/keeper-core/src/agents/run.rs` (`tests::busybox_nice_reads_one_adjustment_then_its_program`, `tests::an_unset_name_holding_a_value_is_refused`), `src-tauri/crates/keeper-agentd/tests/run_linux.rs` (`what_busybox_would_run_or_set_unread_is_refused`), `_bmad-output/planning-artifacts/epic-96-agents-that-use-tools-and-the-computer.md` (R269 As-built row 02)
+reason: the parser tables do not exercise the shortest unset abbreviation `--u`, and their BusyBox `nice` `--` row puts `--` after an adjustment, never first (BusyBox 1.37's `nice_main` does not take a first `--` as an option terminator; it reaches the numeric adjustment parse). The real-process test exercises three unset spellings (separate, attached, long), not every cluster or abbreviation. The omitted forms were checked by source inspection only (review-96run-6.md), not executed; no bypass is established. The R269 As-built row 02 says "every spelling refused" where the table covers a named matrix.
+fix: Add `--u NAME=value` and `--u=NAME=value` rows to `an_unset_name_holding_a_value_is_refused` and a first-position `busybox nice -- …` row to `busybox_nice_reads_one_adjustment_then_its_program`; narrow the As-built phrase to the forms the tables name.
+status: open (R301: low, coverage only, under the convergence policy)
+
+### DW-1191: On macOS 27 a run's process whose environment the Mac does not show, and that left its group after its parent ended, outlives the run.
+
+origin: epic 96, story 96.1 (rung `agents-96-run`, lane CI486, 2026-10-11)
+location: `keeper-agent/src/run/macos.rs` `strays`, `sweep`; `keeper-agent/src/run/mod.rs` `SandboxHost::execute_in`
+reason: the Mac's descendant bound was `sweep`, which finds what left the group by `TMPDIR=` in `ps -E`. macOS 27 does not show every program's environment (measured on hesperia, 27.0: `ps -E` of `/bin/sleep` started with a planted variable prints only its argv, while the developer folder's `python3` started the same way shows it), so `sweep` misses a system binary that left the group. `run_macos::run_timeout_kills_the_process_group`'s grandchild now `exec`s `/bin/sleep` after `setsid`, which only the walk below finds (`mut-ci486-mac` M6). `strays` now walks `ps -A -o pid,ppid,pgid` from the run's first process before the group is killed and kills each descendant out of the group. Residual: on macOS 27 a process whose environment the Mac does not show and whose parent ended before the run did (a double fork) hangs from launchd, carries no mark the host can read, and escapes both — inside the same profile and grants as DW-757 already accepts. A kernel-backed descendant identity (an Endpoint Security client, or a launchd job per run) would close it.
+status: open
+
+### DW-1192: A sandboxed Mac run could read any process's argv (and, where the Mac shows it, its environment) through `kern.procargs2`.
+
+origin: epic 96, story 96.1 (rung `agents-96-run`, lane CI486, 2026-10-11)
+location: `keeper-core/src/agents/run.rs` `sbpl`; `keeper-agent/tests/run_macos.rs` `no_process_information_and_no_keychain`
+reason: S-07's `(deny process-info*)` does not cover the `sysctl` that `ps` reads command lines and environments with: a run's helper calling `sysctl({CTL_KERN, KERN_PROCARGS2, pid})` read another process's argv inside the profile on hesperia. The old S-07 test probed with `/bin/ps -E`, which is setuid and is never exec'd inside the profile, so it passed without the profile refusing anything.
+status: closed (2026-10-11, rung `agents-96-run`, lane CI486): `sbpl` adds `(deny sysctl-read (sysctl-name-prefix "kern.procargs"))` (a process's own stays readable); the test's helper reads the planted process's `kern.procargs2` — outside it gets the command line, inside `refused`.
+
+### DW-1193: `/usr/bin/python3` and `/usr/bin/git` do not run inside a Mac run when the developer folder is an Xcode.app's.
+
+origin: epic 96, story 96.1 (rung `agents-96-run`, lane CI486, 2026-10-11)
+location: `keeper-agent/src/desktop.rs` `desktop_sandbox` (adds `xcode-select -p` read-and-execute); `keeper-core/src/agents/run.rs` `system_read_exec`
+reason: those are `xcrun` shims. With `xcode-select -p` = `/Applications/Xcode.app/Contents/Developer` (hesperia; CI's runners alike [INFERENCE]), the shim inside the profile cannot write its cache under `DARWIN_USER_TEMP_DIR`, cannot read `/Library/Preferences/com.apple.dt.Xcode.plist` (it then says the licence was not agreed, exit 69) and runs `xcodebuild`, which needs `/Applications/Xcode.app/Contents/SharedFrameworks` (exit 71). Measured: with the app's whole `Contents` read-and-execute plus that plist, both shims run (~3 s each, `xcodebuild` started every call). The developer folder's own `usr/bin/python3` runs as granted, and the `run_macos` helpers now use it. Widening the grant is a ruling (R-NEW-2 proposed): the app's `Contents` and the licence plist read-only, or `/usr/bin/git` refused with a sentence naming the developer folder's own binaries.
+status: open
+
+### DW-810: An MCP server with a pinned certificate (`fingerprint`) is not connected to.
+
+origin: epic 96, story 96.2 (rung `agents-96-mcp`, 2026-10-07)
+location: `src-tauri/crates/keeper-agent/src/mcp.rs` (`Server::connect`)
+reason: `[[mcp]] fingerprint` parses (`sha256:` and 64 hex), but keeper-agent has no rustls verifier that accepts exactly the pinned certificate yet (codemap §1.2 names 96.5's KVM verifier for it). Rather than connect over the system roots and ignore the pin, a server with a `fingerprint` is reported as not answering ("a pinned certificate is not yet checked for MCP servers") and never offered. Close with the pinned verifier (96.5's, `dangerous()` builder, no `danger_accept_invalid_certs`) handed to the reqwest client of that server, and an in-test TLS server with a self-signed certificate.
+status: closed 2026-10-11 (rung `agents-96-kvm`): `[[mcp]] fingerprint` is checked by `keeper_agent::kvm::tls::client` — the server is spoken to only over https whose certificate's SHA-256 is the pin, another certificate is refused naming both fingerprints, a pin over http does not answer; `mcp_a_pinned_server_answers_only_with_its_certificate` over an in-test TLS server with a self-signed certificate made per run. Supersedes R221 (R320).
+
+### DW-811: An MCP call its sink blocks is refused, never parked as a declassification.
+
+origin: epic 96, story 96.2 (rung `agents-96-mcp`, 2026-10-07)
+location: `src-tauri/crates/keeper-agent/src/agent.rs` (`AllowedTools::mcp_call`), `src-tauri/crates/keeper-core/src/agents/label.rs` (`Destination`)
+reason: 96.2 #8 asks that a call to a server whose `readers` the session's label does not reach be blocked with the reason and nothing sent; R145 keeps a call to a `*` server blocked. A server with finite readers wider than the label could be let through by a person (R191's `declassify` park), but `Destination` has no external-server arm and the call's bytes have no canonical effect yet, so the call is refused with the sink's sentence. Close with a `Destination::External { name }`, the call's canonical bytes as the effect, and `CallAudit::lifting` on the MCP path.
+status: open
+
+### DW-812: A `screen` or `kvm:<id>` role server offers no tool until its table is built.
+
+origin: epic 96, story 96.2 (rung `agents-96-mcp`, 2026-10-07)
+location: `src-tauri/crates/keeper-core/src/agents/mcp.rs` (`role_row`)
+reason: a role server takes its role's table and nothing else (96.2 #6). Paseo's four rows are here (R24(2)); the screen table over Peekaboo's 27 tools is 96.4's (Q11, R151) and a KVM's MCP table is 96.5's, so until those rungs every tool of such a server is listed as not offered, with why. Close in `agents-96-screen` and `agents-96-kvm`.
+status: closed
+resolution (screen half, 2026-10-11, rung `agents-96-screen`, R150/R151): `mcp::role_row` reads `screen::row` (Peekaboo 3.9.8's 27 tools; `agent`, `analyze`, `browser` never offered); proved by `screen::tests::peekaboo_tool_table_covers_the_fixture` and `mcp::tests`' screen case.
+resolution (KVM half, 2026-10-11, rung `agents-96-kvm`, R323; joined at the restack onto 6f0dfc8a): a `kvm:<id>` server takes `kvm::role_row` (a NanoKVM-Go's screenshot alone); proved by `mcp::tests`' KVM case.
+
+### DW-813: An MCP call does not read the turn's stop.
+
+origin: epic 96, story 96.2 (rung `agents-96-mcp`, 2026-10-07)
+location: `src-tauri/crates/keeper-agent/src/mcp.rs` (`McpServers::call`)
+reason: a call ends at the server's answer or after `CALL_WITHIN` (120 s); the turn's cancel signal is not read while it waits, as DW-756 says of `run`. Close by racing the call against the turn's `CancelSignal` and sending `notifications/cancelled`.
+status: closed (rung `agents-96-mcp`, R225: `McpServers::call` races the turn's stop and the deadline, and sends `notifications/cancelled` for the request in flight; proved by `parks::mcp::mcp_stop_cancels_the_call`)
+
+### DW-850: A `command` MCP server's program is hashed, then started by its path.
+
+origin: epic 96, story 96.2 (rung `agents-96-mcp`, audit fixes R225, 2026-10-07)
+location: `src-tauri/crates/keeper-agent/src/mcp.rs` (`Server::connect`, `hashed`)
+reason: the program is resolved to an absolute path, read and hashed, then that path is executed; a replacement in the instant between the read and the `exec` would run other bytes than the identity records. Close by executing from an open file descriptor of the bytes hashed (`fexecve`, Linux) or by re-reading `/proc/<pid>/exe` after the spawn and refusing a mismatch.
+status: open
+
+### DW-851: The MCP path's refusal when its audit row cannot be written is not proved by a test.
+
+origin: epic 96, story 96.2 (rung `agents-96-mcp`, audit fixes R225, 2026-10-07)
+location: `src-tauri/crates/keeper-agent/src/agent.rs` (`AllowedTools::mcp_call`, `CallAudit::admit`)
+reason: `mcp_call` sends only after `CallAudit::admit` succeeds (source order, and `parks::mcp::mcp_call_follows_its_audit_row_and_consumption` shows the row exists when the server acts), but no fixture makes `keeper.db` unwritable and asserts that nothing reaches the server. Close with that fixture.
+status: open
+
+### DW-940: A listing that answers on an MCP connection ended while it listed is dropped by a check no test reaches.
+
+origin: epic 96, story 96.2 (rung `agents-96-mcp`, re-audit fixes R238, 2026-10-08)
+location: `src-tauri/crates/keeper-agent/src/mcp.rs` (`Server::refresh`, the `live` check; `Server::end`)
+reason: `Server::end` (a child call half written past its stop or deadline) can drop the live connection while a listing on it is outstanding; `refresh` then keeps nobody's answer rather than offering tools of a dead connection. The window is the instant between the child's answer arriving and `end` taking the state lock, so no fixture reaches it, and mutant `02-ended-connection-kept` (`mut-96mcp-4.log`) survives. Since R254, `end` closes the child's stdin but not its stdout: a launcher's descendant that still holds stdout can answer a listing already written after the launcher is killed, which widens the window; the guard rejects that answer too, still unproved. Close with a seam that holds a listing's answer in the client until `end` has run.
+status: open
+
+### DW-1020: A `command` MCP server's descendants are not killed when keeper ends its connection.
+
+origin: epic 96, story 96.2 (rung `agents-96-mcp`, re-audit fixes R254, 2026-10-08)
+location: `src-tauri/crates/keeper-agent/src/mcp.rs` (`Connection::end`, `Server::connect`)
+reason: `Connection::end` closes keeper's end of the child's stdin (the cutoff R254 requires, proved with a launcher and its descendant by `parks::mcp::mcp_a_stopped_call_never_leaves_a_blocked_pipe`) and kills the immediate child only. A process the child started gets end-of-input on its stdin and an MCP server then stops, but one that ignores end-of-input keeps running, orphaned, after keeper is done with it. No request reaches it; the process does. Close by starting the child in its own process group and ending the group, with a fixture that observes the descendant gone.
+status: open
+
+### DW-1021: An MCP child frame queued behind `Writes::end` is refused by a guard no test isolates.
+
+origin: epic 96, story 96.2 (rung `agents-96-mcp`, re-audit fixes R254, 2026-10-08)
+location: `src-tauri/crates/keeper-agent/src/mcp.rs` (`Writes::begin`, its `ended` check)
+reason: after `Connection::end` closes the pipe, `Server::end` clears the live connection, and a queued call's frame is refused by its `Admission` before `Writes::begin` runs; `begin`'s own `ended` check refuses one that took the pipe's turn in the instant between the two. `mcp_a_stopped_call_never_leaves_a_blocked_pipe` shows the queued call never written, but removing the `ended` check alone would not fail it, because the admission refuses first. Close with a seam that holds `Server::end` between closing the pipe and clearing the state.
+status: open
+
+### DW-1055: The MCP dispatch-window tests prove the hold only for a change that lands inside their window.
+
+origin: epic 96, story 96.2 (rung `agents-96-mcp`, re-audit fixes R267, 2026-10-08)
+location: `src-tauri/crates/keeper-agent/src/mcp.rs` (`tests::Boundary::pause`, `a_call_leaves_only_under_the_check_it_passed`, `a_childs_call_leaves_only_under_the_check_it_passed`)
+reason: between the final check and the dispatch a test-only pause (500 ms over HTTP, 1.5 s for a child) gives a retirement or a listing the chance to land, and the test asserts it had not when the call dispatched. With the commit moved outside the hold (mutant `01-commit-outside-hold`) the change lands within milliseconds — but a host so loaded that it does not land within the window would let that mutant pass. The test is also not deterministic for correct code: the child test's delayed listing can finish before a heavily delayed call reaches its admission, and the phase then fails without the listing ever having landed in the window — a false failure, not a pass (amended R272: the earlier "correct code never fails" was an assertion, not evidence). Neither window test covers a call whose first write the pipe took nothing of; that case (R96M5-01) is proved by `a_call_waiting_on_a_full_pipe_is_checked_again_before_it_is_written`, not by these. The pause also marks where the dispatch is in the source: a dispatch that is moved past the hold while leaving a no-op in its place is caught by review, not by these tests (no test can see the instant a request is committed rather than when its bytes arrive). Close only if a deterministic seam is found that observes the commit itself without becoming a wiring test.
+status: open
+
+### DW-1056: The HTTP dispatch-window phase retires its connection through `Server::end`, not a failing listing.
+
+origin: epic 96, story 96.2 (rung `agents-96-mcp`, re-audit fixes R267, 2026-10-08)
+location: `src-tauri/crates/keeper-agent/src/mcp.rs` (`tests::a_call_leaves_only_under_the_check_it_passed`, its last phase)
+reason: over HTTP a connection is retired in production by a listing that fails. In the window between the final check and the dispatch the paused dispatch runs inside rmcp's HTTP worker task, which also carries that listing's POST, so a failing listing cannot complete there in a test even with the commit outside the hold. The phase retires the connection with `Server::end` from another thread instead — the same state change under the same lock. The listing and failed-listing races before the final check are covered with the real refresh in the same test's first phases, and the child test lands a real listing in its window.
+status: open
+
+### DW-1057: `mcp_diagnostics_are_redacted` sometimes captures no event from a branch that ran, when run beside the other MCP tests.
+
+origin: epic 96, story 96.2 (rung `agents-96-mcp`, re-audit fixes R267, 2026-10-08)
+location: `src-tauri/crates/keeper-agent/tests/agent_turns.rs` (`parks::mcp::mcp_diagnostics_are_redacted`, its `Catcher` under `tracing::subscriber::set_default`)
+reason: evidenced: in one of three runs of `parks::mcp::` (`dbg-96mcp-6-2.log`; `dbg-96mcp-6-1.log` passed) and once in the full gate (`gate-96mcp-6-test-agent.log`) the input-required step's captured event set was empty although the call's own answer — "`keys` asked for more than the call's arguments, …", returned only from the branch of `McpServers::answered` whose first statement is that `tracing::warn!` — shows that branch ran. Not evidenced (amended R272): that the subscriber received an emitted event and lost it, or that `tracing`'s callsite-interest caching is the cause. The test catches events through a thread-local default subscriber (`set_default`) while other tests' threads register the same callsites with none, and callsite interest computed there could skip the event for the catching thread — a hypothesis no controlled run attributed, and no isolated passing round-6 diagnostic log exists. The failure is a missing capture, not evidence of a secret leak. Neither the event nor the path changed in R267 or R272. Close by catching through a subscriber that does not depend on per-thread interest (a process-wide one filtered by the test's span, or running the test in its own binary), and confirm the cause by a controlled run of the old and new capture side by side.
+evidence (restack onto 02827329, 2026-10-10): run alone it passes (`/tmp/agents-salvage/gate-96mcp-rs2-diagnostics-alone.log`); beside the other `parks::mcp::` tests it failed twice with the same empty capture, "the call that asked for input: []" (`gate-96mcp-rs-test-agent.log`, `gate-96mcp-rs2-diagnostics-module.log`). Its group failure also kills mutants by chance: a restack mutant killed only by this test in its group was re-run with it alone or skipped (`mut-96mcp-rs9.log`).
+status: open
+
+### DW-1080: An MCP HTTP call's spawned request outlives the POST that awaits it.
+
+origin: epic 96, story 96.2 (rung `agents-96-mcp`, re-audit R96M5 DW candidate, R272, 2026-10-09)
+location: `src-tauri/crates/keeper-agent/src/mcp/http.rs` (`BoundedHttp::post_message`, the `tokio::spawn(self.client.execute(request))` under `admitted` and its awaited handle)
+reason: R267 hands the built request to a task spawned under the server's state hold and awaits its join handle outside it. When rmcp drops the enclosing POST future — the call cancelled, the connection torn down — the await is dropped and the spawned task is detached: the request still goes, and its response is read by no one. The turn already reports such a call as effect-unknown (`McpServers::call`, the stop and deadline arms), so this is no unchecked dispatch and no hang, but the request's lifetime is not its owner's. Close by tying the task to the POST (abort on drop of a guard holding the `JoinHandle`) and prove with a server that stalls before response headers: a call cancelled there leaves no request in flight.
+status: open
+
+### DW-1081: Every malformed ID-bearing line from an MCP child spawns another response task, unbounded.
+
+origin: epic 96, story 96.2 (rung `agents-96-mcp`, re-audit R96M5 DW candidate, R272, 2026-10-09)
+location: `src-tauri/crates/keeper-agent/src/mcp.rs` (`ChildTransport::receive`, its `Unread::Invalid` arm)
+reason: an ID-bearing line keeper cannot read is answered `Invalid request` by a task spawned per line, each waiting for the pipe's writer (`Writes::turn`). The common writer keeps the frames from interleaving, but a child that floods such lines while not reading its stdin piles up waiting tasks without bound. No hang of the convergence class was shown. Close by serializing these answers through one bounded owner (drop or coalesce beyond the bound) and test with a non-reading peer that floods malformed lines.
+status: open
+
+### DW-1082: The MCP child transport's receive and fault paths have no focused proofs.
+
+origin: epic 96, story 96.2 (rung `agents-96-mcp`, re-audit R96M5 DW candidate, R272, 2026-10-09)
+location: `src-tauri/crates/keeper-agent/src/mcp.rs` (`ChildTransport::receive`, `ChildTransport.line`, `line`/`Unread`); `src-tauri/crates/keeper-agent/src/mcp/http.rs` (the `TokioJoinError` arm of `BoundedHttp::post_message`)
+reason: the reviewed code supports each path, but no test exercises it on its own: a `receive` cancelled part way through a line resuming with the bytes kept in `line`; a malformed line followed by a good one (recovery); end-of-file and a read failure ending receive; and the HTTP join-error path mapping to a transport failure, not a server-authored result. Close with one test per path, each mutation-proved.
+status: open
+
+### DW-1085: The MCP full-pipe regression's synchronisation rests on wall-clock windows and a fixture delay, not a handshake.
+
+origin: epic 96, story 96.2 (rung `agents-96-mcp`, re-audit R96M5 DW candidate, R274, 2026-10-09)
+location: `src-tauri/crates/keeper-agent/src/mcp.rs` (`tests::Boundary.checked` in `a_call_waiting_on_a_full_pipe_is_checked_again_before_it_is_written`, `tests::filled`, `tests::waiting`)
+reason: `waiting` watches `Boundary.checked` (`src-tauri/crates/keeper-agent/src/mcp.rs:1709,2133–2141`), which increments before `begin`, not after an observed `Pending`; it has no timeout and no early-failure exit. `filled` settles with timed waits, and the relist phase depends on a 500 ms fixture delay (`src-tauri/crates/keeper-agent/src/mcp.rs:1726,2094–2113,2187–2193,2205–2209`). A sufficiently delayed setup can miss the window, and a call refused before reaching the counter can leave the test waiting indefinitely. The retained mutant kills establish genuine backpressure discrimination, not deterministic scheduling. Close with an explicit fixture handshake, bounded waits and direct observation of a pending first attempt.
+status: open
+
+### DW-1086: A withdrawn MCP child call's unsent transport task is not woken and keeps the writer and frame.
+
+origin: epic 96, story 96.2 (rung `agents-96-mcp`, re-audit R96M5 DW candidate, R274, 2026-10-09)
+location: `src-tauri/crates/keeper-agent/src/mcp.rs` (`Server::call`'s `withdraw`, `Writes::waker`, `ChildTransport::send`'s pending first write)
+reason: `withdraw` records `Withdrawn` without waking `Writes::waker` (`src-tauri/crates/keeper-agent/src/mcp.rs:367–377`), while the pending send keeps the connection-local writer and frame (`src-tauri/crates/keeper-agent/src/mcp.rs:509–528`); rmcp owns that send in a separate task (`rmcp-3.5.1/src/service.rs:1527–1536`), so returning the outer call does not drop it. Absent another readiness event or teardown, the already-withdrawn task can retain the writer and frame until the pipe changes; the turn itself returns through `NotWritten` without waiting (`src-tauri/crates/keeper-agent/src/mcp.rs:1489–1494`), so this is no convergence-class hang or unchecked send. Close by waking the owner once withdrawal is recorded and proving prompt release without making the child readable.
+status: open
+
+### DW-1087: The MCP first-write fault and wake paths have no focused proofs.
+
+origin: epic 96, story 96.2 (rung `agents-96-mcp`, re-audit R96M5 DW candidate, R274, 2026-10-09)
+location: `src-tauri/crates/keeper-agent/src/mcp.rs` (`Writes::end`'s wake, `ChildTransport::send`'s first write, `McpServers::call`'s effect-unknown arms)
+reason: the supplied test does not isolate `Writes::end` waking a zero-byte first-write waiter, `Ready(Ok(0))`, an immediate write error, or the deadline while the first write is pending; the existing partial-frame cutoff and HTTP deadline tests cover different paths. First-write I/O faults take the conservative effect-unknown mapping, not `Unsent` (`src-tauri/crates/keeper-agent/src/mcp.rs:343–349,1554–1585`). Retain these as focused proof candidates; the five R272 mutants do not cover them. Close with one focused, mutation-proved test per path.
+status: open
+
+### DW-1148: Two of R254's pipe-closing mutants survive since R267/R272: no test tells which of the connection's close paths stopped a half-written frame.
+
+origin: epic 96, story 96.2 (rung `agents-96-mcp`, restack onto 02827329, 2026-10-10)
+location: `src-tauri/crates/keeper-agent/src/mcp.rs` (`Connection::end`'s `writes.end()`, `Writes::end`'s `drop(self.stdin().take())`); `src-tauri/crates/keeper-agent/tests/agent_turns.rs` (`parks::mcp::mcp_a_stopped_call_never_leaves_a_blocked_pipe`)
+reason: `mut-96mcp-5.py`'s `03-pipe-left-open` (no `writes.end()` at a connection's end) and `03-stdin-kept` (stdin not taken at `Writes::end`) were killed in round 5 by `mcp_a_stopped_call_never_leaves_a_blocked_pipe` (`mut-96mcp-5.log`); after R267 (keeper the child pipe's one writer) and R272 (the first write checked again at each attempt) both survive it, on 2ecf08d6 as on the restacked tree (`/tmp/agents-salvage/mut-96mcp-rs-pre.log`, `mut-96mcp-rs5.log`). What the test observes is that, after the stopped call ended, the queued call was refused and the stalled child resumed reading for a second, the child's completed-call log holds only `stall` — not that zero bytes of the half-written frame reached it, and not which close stopped the frame; it no longer proves that each of these two closes is needed. `Writes.ended` is no guard on every write: `Writes::begin` reads it once, at a frame's first write (admission), while the remainder of a frame is written through `Pipe::poll_write`, which checks only whether stdin is still there (`src-tauri/crates/keeper-agent/src/mcp.rs:334–336,405–418`). Which path stops the frame in the survivors' runs — the writer dropped with its connection, or another — is not established (inference from the source, not a controlled run); the survivors alone do not show that either close is redundant. Close by deciding whether the stdin drop is the one cutoff R254 says it is — then a test in which only that close can stop the frame, observing the bytes the child received, kills both mutants — or by removing a close proved redundant (R306).
+status: open
+
+### DW-1190: A `url` that does not parse was echoed whole in the Save refusal, userinfo included.
+
+origin: epic 96, story 96.2 (rung `agents-96-mcp`; Fable review `review-fable-96tail.md` RF96-01, 2026-10-11)
+location: `keeper-core/src/agents/mcp.rs` `checked_url`, reached from Settings by `mac_tables::save_server` → `check_one`
+reason: `url::Url::parse(raw)` failing produced `"{raw}" is not a URL` before the userinfo check, so `https://me:tok3n@` (no host yet) showed its credential back in the sheet's alert. Not stored, not logged.
+status: closed (2026-10-11, rung `agents-96-mcp`, lane CI486): the refusal names `without_userinfo(raw)` — what stands between `://` and the last `@` is `…`. Proved by `mcp::tests::a_url_that_does_not_parse_is_named_without_its_credential` (fails on the old sentence).
+
+### DW-1194: A command server's program is hashed whole on a runtime worker, inside its answer bound.
+
+origin: epic 96, story 96.2 (rung `agents-96-mcp`, lane CI486, 2026-10-11)
+location: `keeper-agent/src/mcp.rs` `hashed` (called from `Server::connect` inside `refresh`'s `ANSWER_WITHIN`)
+reason: `hashed` reads and SHA-256s the program on the async task, so a large program (the tests' own 300 MB binary; a bundled runtime) holds a tokio worker for the hash and spends the 10 s bound on it. The test failures this caused on macOS were the unoptimised sha2 of debug builds (fixed by the sha2 profile override); a release build hashes 300 MB in well under a second [INFERENCE: not measured]. Moving the hash to `spawn_blocking` (and caching it by path, size and mtime) would free the worker.
+status: open
+
+### DW-1088: Settings' one-listing proof for an MCP server is a contention test, not a handshake.
+
+origin: epic 96, story 96.2 (rung `agents-96-mcp-mac`, restack onto 2ecf08d6, R258, 2026-10-09)
+location: `src-tauri/crates/keeper-agent/src/mcp.rs` (`McpServers::heard`, `tests::what_is_heard_is_one_listing_however_the_connection_changes`)
+reason: a `heard` that reads the program and the tools under separate locks differs from the one-snapshot read only when `Server::end` or a failed listing lands between those locks: under the state mutex `Listing::Answered(c)` always pairs with `connection == Some(c.connection)` (Answered is written only after the `ptr_eq` check in `Server::refresh`, every `connection = None` pairs with `Silent`, refreshes are serialized by `refreshing`). The test ends and relists the live connection 1000 times while three threads read `heard()`, so it kills that mutant only when a retirement falls inside the window (`/tmp/agents-salvage/mut-96mcpmac-5b.log`, `-5d.log`); it never fails on the one-snapshot code. Close with a test-only hold between `heard`'s reads, or by making a second-lock read unrepresentable.
+status: open — re-confirmed by R276 (2026-10-09): the rung's R258 rebuild regression now counts the child's calls, but this one-listing proof still rests on contention; a controlled interleaving (a test-only hold between `heard`'s reads) is still owed.
+
+### DW-840: Saving a Mac MCP server or `[sandbox]` table stops the Mac's running turns.
+
+origin: epic 96, story 96.2 (rung `agents-96-mcp-mac`, 2026-10-07)
+location: `src-tauri/crates/keeper-agent/src/desktop.rs` (`BuildKey.tables`, `DesktopHost::scan`)
+reason: the Mac's servers and sandbox are held by each copy's `AgentDeps` and by `HostRuntime` as immutable `Arc`s, so a save is applied by building the host again: the scan after it stops every running turn (each gets its final edit), releases the claims and builds anew, and another host may take a session over meanwhile. Close by swapping the servers and the sandbox in place (one shared cell both read) so only new calls see the new table.
+status: open
+
+### DW-841: A Mac MCP server's row and its keychain token are not written as one.
+
+origin: epic 96, story 96.2 (rung `agents-96-mcp-mac`, 2026-10-07)
+location: `src-tauri/crates/keeper-core/src/agents/mac_tables.rs` (`save_server`, `remove_server`)
+reason: the row is committed to `keeper.db` before the token is set in (or removed from) the keychain; a keychain failure leaves the row saved without the new token (or a removed server's token behind), and the refusal says so. Close by writing the token first and rolling it back when the row's transaction fails.
+status: done 2026-10-09 — R276 (rung `agents-96-mcp-mac`, R96MM2-01/02). The 2026-10-07 R228 closure claimed too much: the token was still kept under the server's name (`agent_mcp_token/<name>`), so a read taken before a successful save that moved the server and gave it a new token connected the old URL with the new token (R96MM2-01), an older Forget/Remove/URL→command whose delete ran after a newer save deleted that save's token (R96MM2-02), and a failed put-back left the new token usable under the old row — its "one window left" (DW-870) was not the only one, and "a refusal changes neither" was not true of a failed compensation. Now each token is staged under its own generation's key (`token_key(<generation>)`), the row names that generation (`agent_mcp_servers.token_ref`) in the same transaction, `bearer` reads only the generation the read published, and an operation deletes only the generation it retired; a save that does not commit published nothing, whatever the keychain then does. Tests `mac_tables::tests::a_read_sends_only_the_token_its_rows_published`, `a_save_that_does_not_commit_publishes_nothing`, `an_older_forget_or_remove_never_deletes_a_newer_token`, `keychain_errors_are_errors`, `desktop::tests::a_saved_server_is_used_with_its_saved_token`. What a failed delete leaves behind is DW-1111.
+
+### DW-842: The Mac asks its MCP servers only while it hosts an agent that found its control room.
+
+origin: epic 96, story 96.2 (rung `agents-96-mcp-mac`, 2026-10-07)
+location: `src-tauri/crates/keeper-agent/src/hosts.rs` (`HostRuntime::tick`), `src-tauri/crates/keeper-agent/src/desktop.rs` (`DesktopHost::tick`)
+reason: servers are listed at the manifest's renewal, which the desktop runs only after a copy has found the principal's control room; before that, and on a Mac hosting no agent, Settings shows each server as *does not answer — This Mac has not asked it yet…* (`mac_tables::NOT_ASKED`), so a person cannot test a server they just added. Close with a *Check now* that lists one server's tools outside the host.
+status: open
+
+### DW-870: A token rotation whose commit fails can leave a host built in between on the new token.
+
+origin: R228 (rung `agents-96-mcp-mac`, R96MM-03, 2026-10-07)
+location: `src-tauri/crates/keeper-core/src/agents/mac_tables.rs` (`save_server`, `restore`)
+reason: a rotation sets the new token in the keychain, then commits the row and the new revision; when that commit fails the old token is put back, but a scan that built the host between the keychain write and the failed commit read the new token under the old revision, and nothing builds it again until the next save. Only a failed SQLite commit (disk full, I/O error) opens it. Close by making a failed commit's compensation bump the revision in a second transaction, or by recording an unpublished generation the host refuses.
+status: done 2026-10-09 — R276: a rotation stages the new token under a new generation's key that only the committed row names, so a host built between the keychain write and a failed commit read the old row, which names the old generation — it never held the new token (`mac_tables::tests::a_save_that_does_not_commit_publishes_nothing`, `a_read_sends_only_the_token_its_rows_published`). No revision bump is needed for it.
+
+### DW-935: A Mac program server saved by a bare name resolves on the app's own `PATH`.
+
+origin: restack of rung `agents-96-mcp-mac` onto rung 2's R225 (2026-10-08)
+location: `src-tauri/crates/keeper-agent/src/mcp.rs` (`resolve`), `src-tauri/crates/keeper-core/src/agents/mac_tables.rs` (`save_server`)
+reason: the Mac's servers are now connected the way agentd's are — argv[0] resolved on the host's `PATH`, canonicalised and hashed at connection — and Settings shows the program started and its SHA-256 once it answers. A `command` saved as `peekaboo` (bare) is resolved on keeper.app's environment `PATH`, which for an app launched from Finder is launchd's short default, not the shell's, so a Homebrew program may not be found [INFERENCE, unverified on hesperia]; and the hash is shown only after the server answered, not when it is saved. Codemap Q10(a) wants the screen role's argv pinned to an absolute path with its SHA-256 shown; close in `agents-96-screen` by refusing a bare argv[0] for `role = "screen"` on the Mac (or resolving it at save and storing the absolute path) and showing the file's SHA-256 in the sheet before the first connection.
+status: open
+
+### DW-1108: A Mac MCP server left out for an unreadable keychain comes back only with a table change.
+
+origin: epic 96, story 96.2 (rung `agents-96-mcp-mac`, re-audit R96MM2 candidate, R276, 2026-10-09)
+location: `src-tauri/crates/keeper-agent/src/desktop.rs` (`mac_servers`, `BuildKey`, `DesktopHost::scan`)
+reason: `mac_servers` leaves out a server whose token cannot be read (the keychain locked, or its generation missing), while a scan whose `BuildKey` is unchanged keeps the registry it built. Unlocking the keychain without another save does not reinsert the server; Settings can stop showing the keychain's refusal while the host still has no entry for it [INFERENCE from source, unexercised]. Today the person saves the server again (or restarts keeper) to bring it back; docs/agents.md says so. Close with a bounded recovery — the scan reading each left-out server's token again and building the host anew when one becomes readable — and an observed reconnect test.
+status: open
+
+### DW-1109: An MCP refresh started by the Mac's old host can outlive the rebuild that retired it.
+
+origin: epic 96, story 96.2 (rung `agents-96-mcp-mac`, re-audit R96MM2 candidate, R276, 2026-10-09)
+location: `src-tauri/crates/keeper-agent/src/hosts.rs` (the spawned `McpServers::refresh` in `HostRuntime::tick`, `release_all`), `src-tauri/crates/keeper-agent/src/desktop.rs` (the old runtime dropped after release)
+reason: the refresh the host spawns holds the old registry and `release_all` does not abort it, so a listing or a connection begun for the configuration a save retired can run on after the host built on the new one [INFERENCE from source]. Calls are not at stake (R258's admission refuses the old registry's tools on the new one, `desktop::tests::a_tool_listed_before_a_rebuild_is_never_sent_after_it`, which does not prove teardown). Close by aborting the old runtime's refresh on release and a teardown test that tells already-dispatched work from new connection or listing work after removal and rebuild.
+status: open
+
+### DW-1110: The Mac's saved tables have no proof through the full host and under `sandbox-exec`.
+
+origin: epic 96, story 96.2 (rung `agents-96-mcp-mac`, R96MM-12 retained, R276, 2026-10-09)
+location: `src-tauri/crates/keeper-agent/src/desktop.rs` (`DesktopHost::build` → `AgentDeps.mcp`), `src-tauri/crates/keeper-agent/src/run/` (the Mac's `sandbox-exec` profile from the saved `[sandbox]` table)
+reason: Linux tests prove store → transport (`a_saved_server_is_used_with_its_saved_token` observes real requests and bearers, rotation and removal included) and synthetic-host invalidation, but not a saved table driving a rebuilt `DesktopHost` with signed-in copies to an observed tool call, nor a home-installed toolchain running under the saved sandbox grants without downloading. Owed on hesperia (device run) or CI's macOS job; never claimed from Linux.
+status: open
+
+### DW-1111: A token the keychain would not delete stays in it under a key no row names.
+
+origin: epic 96, story 96.2 (rung `agents-96-mcp-mac`, R276, 2026-10-09)
+location: `src-tauri/crates/keeper-core/src/agents/mac_tables.rs` (`discard`, `save_server_with`, `remove_server`)
+reason: a token staged for a save that did not commit, or retired by Forget/Remove/URL→command/a replacement, is deleted from the keychain; when the keychain refuses, it stays under its generation's key (or an earlier keeper's `agent_mcp_token/<name>`). No row names that key, so it is never sent (`mac_tables::tests::a_save_that_does_not_commit_publishes_nothing`), and a refused retirement is said to the person, a refused discard only logged. Nothing sweeps such keys later. Close with a sweep of `agent_mcp_bearer/*` keys no row names, if the keychain port gains a listing.
+status: open
+
+### DW-1118: A keychain write that stores the token and then reports failure, with its discard refused, is not exercised.
+
+origin: epic 96, story 96.2 (rung `agents-96-mcp-mac`, re-audit R96MM3 candidate, R278, 2026-10-09)
+location: `src-tauri/crates/keeper-core/src/agents/mac_tables.rs` (`save_server_with`, `discard`; the test platform's `fail_set`)
+reason: the test platform's `fail_set` refuses before it writes, so a save whose keychain set stores the new generation and then errors is never driven — let alone with the discard that follows refused too. By inspection the outcome is the one `a_save_that_does_not_commit_publishes_nothing` proves for a failed commit: the staged generation is under a key no row names, so nothing sends it and the published row keeps its own (DW-1111's unswept key). This is extra port-failure proof, not a known defect. Close with a fake whose set writes then errors, and a test that a refused discard after it leaves the published endpoint/bearer pair unchanged.
+status: open
+
+### DW-1119: Equal form inputs reuse a settled draft answer while a newer request for them is unanswered.
+
+origin: epic 96, story 96.2, R284; from R96MM4-01
+location: `src/components/settings/agents-mcp-section.tsx`
+reason: draft readiness identifies request contents, not request generation. The draft answer is keyed with `JSON.stringify(request)` (~:292–309); a `live` host refresh (~:321–336) issues a new request without invalidating the answer or entering its generation in the key, and readiness is `answer.key === key` (~:369–373), which drives `aria-busy` and Save (~:535, :658). So an unanswered same-input refresh leaves the previous draft enabled with `aria-busy=false`, and A→B→A reuses A's earlier answer while the new A request is unanswered. Not HIGH: the restored form is a policy the person already saw; no secret, data loss or runtime-admission bypass is shown. Fix: track pending ownership per request generation (same-input refreshes included), keep the previous VM only as inert presentation; controlled-promise tests for a held `live` refresh and A→B→A before the latest A resolves (busy, disabled controls and Save, then recovery). No policy computation in TypeScript.
+status: open
+### DW-860: Paseo's terminal statuses are a closed guess.
+
+origin: epic 96, story 96.3 (rung `agents-96-paseo`, 2026-10-07)
+location: `src-tauri/crates/keeper-core/src/agents/paseo.rs` (`TERMINAL`, `is_terminal`)
+reason: the broker passes Paseo's `status` through unchanged and Paseo's vocabulary is documented nowhere beside it; keeper ends following at `completed`, `failed`, `cancelled` and nine kin, and keeps polling at any other status (a run idle after its pull request would be polled until a person removes the card). Close by reading the real statuses on electra (the operator check) and fixing the set.
+status: open
+
+### DW-861: A Paseo run whose id holds `:` is neither followed nor polled.
+
+origin: epic 96, story 96.3 (rung `agents-96-paseo`, 2026-10-07)
+location: `src-tauri/crates/keeper-core/src/agents/paseo.rs` (`safe_id`)
+reason: the broker's `SAFE_ID` allows `:`; keeper names a file and a session title by the id and keeps to `[A-Za-z0-9._-]`, so such a run gets no follow card and its status is not asked. Close with an encoding of the id in names, if Paseo's ids ever carry one.
+status: closed (2026-10-08, rung `agents-96-paseo`, R243): the broker-valid id is kept on the wire and in the host's record; its file name is `paseo::stored` (`:` → `~`); `paseo_follow_card_ends_with_the_pr_link` follows `claude:run-1` through create, polls and its record
+
+### DW-862: The `create_agent` card does not say the follow card waits for a tick, and no notification rule is built for Paseo.
+
+origin: epic 96, story 96.3 (rung `agents-96-paseo`, 2026-10-07)
+location: 93's approval card VM (`approval_card.rs`); epic 98.1
+reason: the epic has the card say the follow card waits for a person (S-21) and has no notification offer *Approve once* for either mutation (98.1); R155 keeps 96's rungs from changing the card VM, and 98.1 is unbuilt. The model's result and `docs/agents.md` say it. Close in 93's card payload (Q15) and 98.1.
+status: open for 98.1's notification rule only; the card's part closed (2026-10-08, R243): the `create_agent` summary says who the prompt reaches and that following waits for a person's tick (`paseo::summary`, `paseo_create_needs_an_approval_each_time`)
+
+### DW-863: The follow card's report goes to the follow session's room, not to the conversation that started the run.
+
+origin: epic 96, story 96.3 (rung `agents-96-paseo`, 2026-10-07)
+location: `src-tauri/crates/keeper-agent/src/agent.rs` (`AllowedTools::paseo_ended`), `paseo::follow_session` (`parent: None`)
+reason: the follow session is a scheduled session with no parent (a `parent` makes it a delegation to every predicate that reads one), so the ended run is told in its own room, whose members are the starting session's readers; the conversation that asked hears nothing. A follow card is also made only where the turn has rooms (`DelegationPort`), else the model is told it was not made. Close with R104's local start carrying the parent's room.
+status: closed (2026-10-08, rung `agents-96-paseo`, R243): the follow session's `[reply]` names the starting conversation, which is told through its room's gate (`paseo_follow_card_ends_with_the_pr_link` asserts the starting room, not the follow room)
+
+### DW-864: `paseo_follow_card_ends_with_the_pr_link` failed in 3 of 11 whole-binary runs of `agent_turns`, never alone.
+
+origin: epic 96, story 96.3 (rung `agents-96-paseo`, 2026-10-07)
+location: `src-tauri/crates/keeper-agent/tests/agent_turns.rs` (`parks::mcp::paseo`), `AllowedTools::paseo_ended`, `cards::end_schedule`
+reason: in three full runs (logs `/tmp/agents-salvage/gate-96paseo-final.log`, `gate-96paseo-turns2.log`, `gate-96paseo-turns3.log`) the ended run's record was written and the room told, and the tool result says the schedule was ended, yet the card read afterwards still held `schedule:`; the test passed alone, in its module, and in eight later whole-binary runs (five with the card writes traced, three with the session's lines dumped on failure). Not root-caused: every card write is a guarded write on the bytes read, and no concurrent writer of the card was found. Close by finding the writer (the failure message now dumps the follow session's log) or proving the test's own timing.
+status: open — on the restacked rung (base 6a9e53d9) the pre-fix test passed in 20 runs alone, 8 runs of `parks::`, and 9 whole-binary runs three at a time (`/tmp/agents-salvage/scratch-96paseo/stress-*.log`); no causal writer found. 2026-10-09: the R243 tree's test passed in its whole-binary gate (`/tmp/agents-salvage/gate-96paseo-4-test-agent.log`) and in 9 more whole-binary runs three at a time (`scratch-96paseo/stress-new-*.log`). The three failing dumps show the card after the failing window as `finish_scheduled`'s `write_run` makes it from a card still holding `schedule:` (`run: review`, that window's `last_run`, `schedule:` in place) — whether the old `end_schedule` matched no key or its write was overwritten is not established, and no unguarded writer of that card was found. 2026-10-09 (R275): the schedule is now ended by `ServedSession::finish_paseo` after `finish_scheduled`, outside the turn, which removes the in-turn ordering the dumps point at; that is a changed code path, not an attribution. **Closure criterion (R275):** attribution of the writer or ordering that left `schedule:` in place, plus a discriminating regression that fails without the fix and passes with it. A whole-gate run that fails again, or many that pass, is investigation evidence only, never closure.
+
+### DW-950: A delegated starting session's exemption of its delegating agent is source-inspected, not fixture-proved.
+
+origin: epic 96, story 96.3 (rung `agents-96-paseo`, audit fixes R243, 2026-10-08)
+location: `src-tauri/crates/keeper-agent/src/agent.rs` (`AllowedTools::paseo_capture`, `ServedSession::deliver_paseo`, `paseo_delegating`)
+reason: when the conversation that started a run is a delegated session, its delegating agent's session joins the label the notice carries (R94), so that agent is one of the room's own; every person counts. No test starts a run from a delegated session, so nothing tells the exemption from counting that agent through its audience. Close with a delegated-origin case whose delegating agent's audience is narrower than the label.
+status: closed for the sink's exemption only (2026-10-08, R243; wording corrected 2026-10-09, R275): `paseo_a_delegated_start_hears_its_end` does **not** start the run from a delegation — it starts it in a conversation and rewrites that session's `agent.toml` to a delegated one afterwards, and no recipient runs. It proves only that the notice reaches the starting room because Lucyna is exempt, and that counting her through her audience (mutant `10 a delegated start's agent is counted`) blocks it. The real delegated start and the requester's receipt are `paseo_a_delegated_start_tells_its_requester_after_it_replied` (R96PA2-05).
+
+### DW-951: A follow card whose record its drive or starting room may not hold keeps polling.
+
+origin: epic 96, story 96.3 (rung `agents-96-paseo`, audit fixes R243, 2026-10-08)
+location: `AllowedTools::paseo_capture`
+reason: when the home drive's readers or the starting conversation's room may not read what the follow session read, nothing is written or sent and the card keeps its schedule, so a T0 `get_agent_status` runs every 10 minutes (T2 and up, a person's approval each time, if the broker is a `command` server: the configured-command floor of `mcp::tier`) until the audience changes or the card is removed; the model's result says why each time. Two different remedies, not one: changing the **destination audience** (who reads the drive or is in the starting room) can only let the record in when the destination narrows to within the label — widening a destination never makes a narrowed label fit; changing **release authority** (a person explicitly declassifying the record to that wider audience, R193) is what lets a narrower label out. Close with a run state on the card (`blocked`, with the reason and which of the two would let it through) once 93's run states take a host reason.
+status: open
+
+### DW-952: A keeper built before R243 skips the Paseo lines it does not know, and refuses a known line's new field only when that line is a blob.
+
+origin: epic 96, story 96.3 (rung `agents-96-paseo`, audit fixes R243, 2026-10-08)
+location: `keeper-core/src/agents/log/mod.rs` (`ToolResultBody.paseo`, `DelegateReply.completion`, kind `paseo`, `deny_unknown_fields`); `keeper-core/src/agents/log/reader.rs`; `SessionContext::load`
+reason: three different cases, corrected 2026-10-09 (R277, R96PA3-08). **A known kind with a new field** — `tool_result`'s `paseo` (a host's record of a started run) and `delegate`'s `reply.completion`: an older build parses the line envelope, finds the kind, and fails on the unknown field. Held **inline**, `LogLine::parse` fails and the reader records the line as a skipped problem (`reader.rs`), which `SessionContext::load` does not refuse — the result or receipt silently drops out of the rebuilt conversation (history loss, and a started run's poll authority with it). Held as a **blob** (over 16 KiB), the envelope parses, then `LineBody::decode` of the hydrated body fails and the load is refused (`ReplayRefusal::BlobShape`): which one happens depends on the line's size. **An unknown kind** — the `paseo` line: `LogLine::parse` resolves `LineKind` before it looks at a blob reference, so an older build skips the line as a problem whether it is inline or a blob; it never reaches hydration and never refuses the session. **A line-version bump** would likewise be a skipped-line problem under this reader, not a refusal of the whole session: refusing a session written by a newer build would need a separate, explicit whole-session admission policy (no such policy exists). Close by shipping hosts together (DW-1100), or by such a policy.
+status: open
+
+### DW-953: A notice a taker on another device sends again can be a second event.
+
+origin: epic 96, story 96.3 (rung `agents-96-paseo`, audit fixes R243, 2026-10-08)
+location: `ServedSession::deliver_paseo` (`paseo-ended-<follow session>`, the follow room's `dev.keeper.agent.paseo_capture` / `dev.keeper.agent.paseo_delivered` messages; `dev.keeper.agent.paseo_captured` is an index only)
+reason: corrected 2026-10-09 to R279's contract, established and tested. The end is captured once on a checkout (`pending` line, before the call's result). The authority is the follow room's TIMELINE, not its state: the capture that binds the end is the FIRST sealed `dev.keeper.agent.paseo_capture` message of the agent for the completion in the homeserver's timeline order (`paseo::authority`), and delivery is an appended sealed `dev.keeper.agent.paseo_delivered` message naming that capture and the notice event; the `dev.keeper.agent.paseo_captured` state event is a lookup index, never trusted over the timeline. A holder reads the timeline before publishing, publishes only when no capture is there, reads it again after, and adopts the first capture when it is not its own; a taker with no capture polls only when the index names none, and otherwise adopts the timeline's first capture; any delivery message means nothing is sent again. A late or stale write of an earlier holder — its capture message or index landing after another host delivered — never binds and never makes the end pending again (`paseo_a_late_capture_never_binds_and_delivery_stands`, `paseo_a_taker_finishes_the_capture_the_room_names`, `paseo_every_step_after_the_capture_resumes_from_it`). Re-read 2026-10-10 after R283, after R287 (R96PA6-01), and again after R293 (R96PA7-01), each of which the earlier wording needed: the read is complete only when it is — an event of the agent's this copy did not decrypt fails it however `Room::messages` hands it back (named undecryptable; or as if in clear, still `m.room.encrypted` with no encryption info, after a crypto store error, redacted, or malformed), and so, since R293, does one it decrypted but cannot link to the agent's device (`Unverified(None(InsecureSource | MissingDevice | …))` — a key from a backup or a forward, a device it did not know — or `MismatchedSender`), read as `Read::Unlinked`: never authority, never absence; and only a missing page token ends the room (`paseo_an_unreadable_capture_or_delivery_holds_the_end` for each of the seven shapes, `runtime::tests::an_envelope_handed_back_as_clear_is_unreadable`, `runtime::tests::an_unlinked_event_of_its_author_is_never_absent`, `paseo_an_empty_page_is_not_the_rooms_beginning`) — so an incomplete read no longer opens a second window for those events. What remains of that claim: a redacted, or permanently unlinked, capture or delivery holds that end for good rather than being told again, and anyone able to send a sealed-but-unlinked event as the agent can hold it the same way (DW-1129); and the fixtures enumerate the SDK's shapes from its source, not from a real homeserver (DW-1104). Not established, and not claimed: exactly-once across devices. The remaining duplicate: a notice send that reached the homeserver whose delivery message never followed — taken but unacknowledged, or acknowledged and the host stopped before appending its delivery — sent again by a taker on another device (transaction ids are deduplicated per device, and only while the homeserver keeps them) is a second event, always with the bound capture's content. Also open beside it: the pre-publication window (DW-1123), the timeline budget (DW-1127), an event of the agent's held on for good (DW-1129), the state-key boundary of the envelope test (DW-1134), and follow sessions captured by a build before R279 (DW-1125). Not exercised against a real homeserver or across real devices (DW-1104). Close by reading the starting room for the completion's event before a taker's first send, or with a live two-device check showing the residual is acceptable.
+status: open (residual of the R277 contract)
+
+### DW-954: A follow session's `agent.toml` is refused by a keeper built before R243.
+
+origin: epic 96, story 96.3 (rung `agents-96-paseo`, audit fixes R243, 2026-10-08)
+location: `keeper-core/src/agents/session.rs` (`ROOT_KEYS`, `[reply]`)
+reason: the follow session's `[reply]` table is a new root key; an older build's `parse_session_agent_toml` refuses an unknown root key, so it cannot open that follow session (DW-952's mixed-fleet case, for the session file). Close as DW-952 closes.
+status: open
+
+### DW-1098: A follow session finds its starting session by path, not by a stable id.
+
+origin: epic 96, story 96.3 (rung `agents-96-paseo`, re-audit fixes R275, 2026-10-09)
+location: `keeper-core/src/agents/session.rs` (`SessionReply.session`), `keeper-agent/src/agent.rs` (`paseo_origin`)
+reason: `[reply].session` is the starting session's zone-relative path. Archiving or moving that session before the run ends makes `paseo_origin` read nothing: the delegating agent's exemption falls away (the notice may then be refused indefinitely, kept pending and retried each window) and the notice carries no completion mark, so a delegating session would not take it. Refusal stays safe; delivery is lost. Close by naming the origin by its session id (a ULID) and resolving it through the zone's index, keeping refusal when it cannot be found.
+status: open
+
+### DW-1099: Real room kind and homeserver/device behaviour of the follow session are not verified.
+
+origin: epic 96, story 96.3 (rung `agents-96-paseo`, re-audit fixes R275, 2026-10-09)
+location: `agent::runtime` `DelegationPort::create(.., SessionKind::Scheduled)`; `ServedSession::deliver_paseo`; the test fake `Delegations` in `agent_turns.rs`
+reason: the follow room's kind is passed to the production adapter by inspection only — the test port ignores `_kind`; transaction-id dedupe of a taken-but-unacknowledged send is modelled by the fake, not observed on Synapse; host/device takeover of a pending end, and electra's real broker (create, follow, terminal status vocabulary, DW-860) are owed. Close with a live `#[ignore]` Synapse test of the follow room's kind and a repeated send under one txn, and the electra operator run.
+status: open
+
+### DW-1100: Hosts of one principal on builds between R243 and R277 disagree about a follow session.
+
+origin: epic 96, story 96.3 (rung `agents-96-paseo`, re-audit fixes R277, 2026-10-09)
+location: `keeper-core/src/agents/session.rs` (`[reply] run`); `ServedSession::scheduled` (`adopt_paseo`); `HostRuntime` placement (`FoundSession.paseo_captured`, `paseo::CAPTURED`)
+reason: DW-954 covers a build before R243 refusing `[reply]` outright. Two intermediate cases remain: a build that knows `[reply]` but not its `run` key (R243 before R275) refuses or misreads the follow session's `agent.toml`; and an R275 build taking a follow session over reads neither the room's capture evidence nor a capture it never saw, so it polls the broker again and can capture a second end under the same completion id — exactly what R277 removes, but only on R277 hosts. Not exercised: no mixed-version run. Close by shipping every host of a principal together (with DW-952/DW-954), or by a session-level version gate that keeps older builds from serving follow sessions.
+status: open
+
+### DW-1101: A run's end captured in a parked call's continuation is told a window later.
+
+origin: epic 96, story 96.3 (rung `agents-96-paseo`, re-audit fixes R277, 2026-10-09)
+location: `keeper-agent/src/approvals.rs` (approval continuation → `finish_scheduled`), `ServedSession` ask-answer continuation; `ServedSession::scheduled` (the immediate `finish_paseo` hook)
+reason: the immediate finalization after a capture is in `scheduled` only. When a follow poll parks first — a `command` broker's `get_agent_status` at the configured-command floor (T2) — and captures its end in the approval's (or an ask answer's) continuation, that continuation calls `finish_scheduled` but not `finish_paseo`; the end is told at the card's next window. Safe — the capture is durable and the next window finishes it from the capture with no poll — but not immediate. Close by calling `finish_paseo` after those continuations too, with a parked-poll fixture.
+status: open
+
+### DW-1102: The completion receipt's negative cases are source-inspected, not fixture-proved.
+
+origin: epic 96, story 96.3 (rung `agents-96-paseo`, re-audit fixes R277, 2026-10-09)
+location: `SessionContext::takes_reply`, `ServedSession::read_completions`, `agent::reply_of`
+reason: the completion fixtures prove the positive path (taken once, label joined, newer round open, readback beyond a later brief, no partial recovery). Not exercised: a completion naming another delegation id, one sent by another member or agent of the room, a malformed `dev.keeper.agent.paseo_completion` marker, a replay after a second reopening of a session whose cursor moved, and the readers/local-only part of the joined label. The source has the sender, correlation and dedupe checks (R96PA3 review, "checked and clean"). Close with those fixtures.
+status: open
+
+### DW-1103: A delegation room longer than the readback budget is read again every tick until a completion is taken there.
+
+origin: epic 96, story 96.3 (rung `agents-96-paseo`, re-audit fixes R277, 2026-10-09)
+location: `ServedSession::read_completions`, `runtime::completions_after` (`BACKLOG_PAGES` × `BACKLOG_PAGE` = 1000 events), `Retry.completions`
+reason: completions are read back to the newest one taken from that room, or to the room's beginning when none was taken yet. A history that does not reach that far within the budget is an error — never a partial recovery (R277) — and is read again on the clock. So a delegation room of more than 1000 events with no completion taken yet is paged back 20 pages on every clock tick while the session's worker runs, finding nothing, and a completion beyond that budget is never recovered. Close with a cursor that starts at the delegation's first brief (its event logged when sent), or a bounded backoff for the retry.
+status: open
+
+### DW-1104: The capture's evidence, encrypted file and placement are not verified against a real homeserver and host.
+
+origin: epic 96, story 96.3 (rung `agents-96-paseo`, re-audit fixes R277, 2026-10-09)
+location: `runtime::ClientRooms` (`upload`, `download`, `put_state`, `state`, `captures`, `completions`, `page_back`/`page_of`); `AgentClient::download_encrypted`; `HostRuntime` placement; `zone::active_sessions`
+reason: the R277/R279 fixtures run the worker against the `Delegations` fake (per-device transaction dedupe, state, uploads, events, paging modelled; since R283 its pages are built as the SDK's `Messages`, decrypted or undecryptable, and read through the production `runtime::page_of`) and the host's placement against `FakeCopy` in two halves — `a_captured_follow_session_is_placed_without_its_broker` (tick → placement → `Scheduled::Run` with no host offering `mcp:paseo`, from the checkout's log and from the room's evidence) and the worker fixtures (a `Run` window with the broker gone finishes the capture). Not observed: Synapse accepting the agent's `dev.keeper.agent.paseo_captured` state at the session room's `state_default` 50, the encrypted upload/download round trip, the `Room::messages` authority path — back-pagination of the follow room and the delegation room with each event's decryption, sealed-sender verdict and undecryptable outcome as the real SDK and homeserver produce them, empty pages included — `server_state` returning the index to another device, the live handler handing an undecryptable event on as `m.room.encrypted`, and one agentd process routing the placed window into its own worker. The rescan reads each follow session's whole log (`zone::paseo_captured`), bounded by those logs' size. Close with a live `#[ignore]` Synapse test of the evidence, the paged authority read (with a device lacking a room key) and the file round trip, and an agentd run of a follow session whose broker is gone (the electra operator run of DW-1099).
+status: open
+
+### DW-1123: A capture not yet published in the follow room is invisible to a host taking the session over.
+
+origin: epic 96, story 96.3 (rung `agents-96-paseo`, re-audit fixes R279, 2026-10-09)
+location: `ServedSession::adopt_paseo`, `ServedSession::deliver_paseo` (publication and index), `AllowedTools::paseo_capture`
+reason: R96PA4-04 (MEDIUM, deferred under the convergence policy). The `pending` line is durable on the capturing checkout before the call's result, but other hosts learn of it only once its capture message is in the follow room and the index `dev.keeper.agent.paseo_captured` names it. A host whose checkout lacks that line and whose room holds no index yet — the holder crashed after the line and before the upload, the send, or the index put — polls the broker again and can capture an end of its own; when the broker is gone it cannot finish at all. The timeline makes the first PUBLISHED capture bind (R279), so no two contents are ever told, but the first holder's bytes are not recoverable through the room before they are published. The docs' "after capture, no re-poll" holds per checkout, not across hosts (docs/agents.md, narrowed). Not exercised: a stale-checkout takeover at each pre-publication boundary (before upload, after the capture message and before the index), with a changed and with an unavailable broker. Close with a recoverable handoff of the capture before the result, or by gating takeover of a follow session on a capture publication, and those fixtures.
+status: open
+
+### DW-1124: A taker that adopts delivered evidence ends the schedule without materializing the linked record.
+
+origin: epic 96, story 96.3 (rung `agents-96-paseo`, re-audit fixes R279, 2026-10-09)
+location: `ServedSession::adopt_paseo`, `ServedSession::deliver_paseo` (the `delivered` return), `ServedSession::finish_paseo`
+reason: R96PA4-05 (MEDIUM, deferred). Adopting a capture whose delivery message is already in the timeline writes the `pending` and `delivered` lines (after admitting the label to the home drive as its readers are now, R279) and `finish_paseo` then removes the schedule; nothing writes `artifacts/paseo-<agentId>.md` on that checkout, so a notice already sent can link a file the taker's drive never gets when the first host's artifact never synced. The same holds for a holder whose local pending capture meets a delivery message. The notice and the captured bytes survive. `paseo_a_taker_finishes_the_capture_the_room_names` (`already told`) does not assert the artifact. Close by separating "told" from "materialized here": restore the record from the capture under the same admission before ending the schedule, and extend that case with the artifact and audience-drift assertions.
+status: open
+
+### DW-1125: An invalid, foreign or redacted capture index is read as no index, and the broker is polled again.
+
+origin: epic 96, story 96.3 (rung `agents-96-paseo`, re-audit fixes R279, 2026-10-09)
+location: `ServedSession::paseo_indexed`, `ServedSession::adopt_paseo`; `keeper-core/src/agents/events.rs` (session-room power levels)
+reason: R96PA4-06 (MEDIUM, deferred). A taker with no local capture decides whether to poll from the index state event: one sent by anyone but the agent, one that does not deserialize, or one for another completion is read as absent. Who can write it: an ordinary member at power 0 cannot; state defaults to power 50 in a session room and no `dev.keeper.agent.paseo_captured` row reserves it, so another member or agent granted 50 can replace it (a new follow room passes only its own agent as a powered agent, at 100 as creator). After R279 the effect is narrower than the review's scenario [by source inspection, not fixture-proved]: the re-poll still happens and a second capture can be logged locally, but `deliver_paseo` then reads the timeline, adopts its first capture and, when a delivery message is there, sends nothing — so the impact is an extra poll and broker call, not a second notice. That holds only when a complete, readable timeline in the R279 format holds the authority (corrected 2026-10-10, R283): an incomplete read now fails closed instead (R96PA5-01/02), but records written before R279 — R277's `delivered` field in the index and its capture messages without the `dev.keeper.agent.paseo_capture` / `dev.keeper.agent.paseo_delivered` markers — are unsupported: they were dev-only and never released (no `agents-96-*` branch is on the remote; `main` has no `keeper-core/src/agents/paseo.rs`), no cutover reads them, and an R279 host reads them as no evidence, so such a session could be polled and told again. Close by distinguishing absent from present-but-unusable state (stop and reconcile from the timeline), reserving the state type where power policy can, and fixtures for power-0 rejection and a power-50 overwrite.
+status: open
+
+### DW-1126: The capture checks and two transition faults are not mutation-proved.
+
+origin: epic 96, story 96.3 (rung `agents-96-paseo`, re-audit fixes R279, 2026-10-09)
+location: `keeper-core/src/agents/paseo.rs` (`capture_of`), `ServedSession::paseo_captured`, `ServedSession::write_paseo` (capture and delivered appends), `AllowedTools::paseo_capture`
+reason: Proof debt from R96PA4 ("DW candidates / convergence"), corrected 2026-10-10 (R283, R96PA5-05; R293). A valid-but-different local capture's bytes are now exercised (`paseo_an_adopted_capture_is_admitted_where_it_goes_now` `replacing`, `paseo_a_late_capture_never_binds_and_delivery_stands`), a foreign sender's capture and delivery messages are rejected in the pure reducer (`the_first_capture_binds_and_delivery_is_for_good`), an undecryptable event of the agent's fails the production read (`an_unreadable_event_of_its_author_is_never_absent`), and since R293 so does a decrypted capture or delivery message that is not sealed by its sender's device (`MismatchedSender`, `None(_)`: `Read::Unlinked`, `an_unlinked_event_of_its_author_is_never_absent`), while one in clear is read past, never kept. What remains: `capture_of` checks the payload digest, the completion, the `pending` state and the record's SHA-256, and the fixtures build a correct digest, but no mutant removes a rejection check; no fault is injected at the capture append itself or at the `delivered` log append; no mutant reverses capture-before-publication order (R279's order-reversal mutant is of the BINDING — first vs latest capture — not of capture vs publication); an unreadable index → no poll is not fixture-proved; real encrypted-media corruption is not exercised. Close with negative fixtures and those mutants.
+status: open
+
+### DW-1127: A follow room longer than the readback budget cannot be read for its end, and the end is never told.
+
+origin: epic 96, story 96.3 (rung `agents-96-paseo`, re-audit fixes R279, 2026-10-09)
+location: `runtime::captures_of` (`BACKLOG_PAGES` × `BACKLOG_PAGE` = 1000 events), `ServedSession::paseo_authority`, `ServedSession::deliver_paseo`, `ServedSession::adopt_paseo`
+reason: R279 makes the first capture message in the follow room's timeline the authority, so finding it means reading the timeline back to the room's beginning. A history that does not reach the beginning within the budget is an error, never a partial list: a holder with a capture neither publishes nor tells, and a host without one polls nothing once the index names a capture (`PASEO_UNCHECKED`); every window tries again, so a follow room that grew past 1000 events before its end was told is never told (fail closed; DW-1103 is the delegation-room analogue for completions and stays as it is). Each deliver attempt pages the follow room back to its beginning, twice when it publishes. Close with a relation-anchored read (`/relations` from a fixed anchor event) or an index whose binding can be verified without reaching the beginning.
+status: open
+
+### DW-1128: A live completion after a sync gap still moves the completion cursor.
+
+origin: epic 96, story 96.3 (rung `agents-96-paseo`, re-audit fixes R279, 2026-10-09)
+location: `ServedSession::delegation_moved` (`COMPLETION_HELD`), `SessionContext::paseo_cursor`, the worker's sync routing
+reason: R279 holds a live completion while that delegation room's readback is owed (failed and waiting for the clock), so the cursor never passes a completion a failed readback has not reached (`a_live_completion_waits_for_the_owed_readback`). A completion the live path never delivered without any readback failing — a `/sync` response whose timeline was `limited`, which keeper's routing does not backfill for any arrival — is not covered: the next live completion is taken and moves the cursor past it. Close by taking a live completion only through a readback from the cursor (the live event as its cue), with a gap fixture.
+status: open
+
+### DW-1129: An event of the session's agent this copy can never decrypt, or never link to it, holds the run's end for good.
+
+origin: epic 96, story 96.3 (rung `agents-96-paseo`, re-audit fixes R283, 2026-10-10)
+location: `runtime::page_of` (`enveloped`, `Read::Unlinked`), `runtime::sealed_after` (`Read::Unreadable`, `Read::Unlinked`), `runtime::child_arrival`, `runtime::captures_of`, `runtime::completions_after`, `ServedSession::paseo_authority`, `ServedSession::read_completions`, `ServedSession::delegation_moved` (`Arrival::Unreadable`)
+reason: the fail-closed residual of R283 (R96PA5-01), widened by R287 (R96PA6-01) and R293 (R96PA7-01). Any event of the follow session's agent in its own room, and any event of a delegation's target after the completion cursor in the delegation room, that this copy did not decrypt — or decrypted but cannot link to that sender's device — makes the read an error: the encrypted envelope hides whether it is a capture, a delivery or an end, and an unlinked one may be a forgery or may be the sender's own, so nothing is published, uploaded, told or taken past it, and every window (or clock tick, for completions) reads again. Since R287 "did not decrypt" is any message-like event `Room::messages` hands back still `m.room.encrypted` with no encryption info — named undecryptable, or as if in clear when its decryption failed otherwise (a crypto store error: transient, the next read retries), when it was redacted (permanent: a redacted capture, delivery or end of that author holds for good), or when it does not parse as an encrypted event (permanent). Since R293 the unattributed shape holds too: a decrypted event whose verification state is `Unverified(None(_))` (`InsecureSource`: a key from a backup or a forward; `MissingDevice`: a device this copy does not know) or `Unverified(MismatchedSender)` is `Read::Unlinked` in a read back and `Arrival::Unreadable` live (`runtime::child_arrival`), and holds exactly as an undecrypted one does; a better sender link later (the device's keys arriving, the SDK re-deriving the verdict) releases it, as the read decrypts afresh each time [the fixtures simulate the link's return; not observed with the real SDK, DW-1104]. A room key that never arrives here — lost, withheld, a device never shared with, an unrelated old message of the agent's from before this device existed — or a key that only ever arrives from backup with no link to its device, therefore wedges that end for good, with a warning logged each time; a delegation room is paged back every tick meanwhile (DW-1103's cost). Forged sealing: anyone who can put a decrypting event into the room that claims the agent (or the delegation's target) as its sender — a homeserver, or a member forwarding a Megolm session under that sender's name — can hold that follow room or that delegation's later ends, potentially indefinitely. That is availability harm only, not authority: such an event is never kept, so it can never bind a capture, mark a delivery, advance the completion cursor, release content to a model or cross a sink; the author-matched malformed or redacted envelope already allowed the same class of hold, and an event claiming anyone else holds nothing. Scope: per follow room — any such event of its agent anywhere in its history, as the room is read to its beginning — and per delegation — its target's events after that delegation's completion cursor, which hold every later end of that delegation, including unrelated later runs in it. It does not wedge every session, and ordinary turns go on. The person is given no blocked state: these paths log a diagnostic and return `Outcome::Ignored`, which the caller only debug-logs, so a held end is visible only in the logs. Close with key backup / key request recovery on the agent's devices that restores a sender link (not a backup-only `InsecureSource` key), a person-visible state for a held end with an authorized way to release it, and a live test with a device lacking a room key (DW-1104).
+status: open
+
+### DW-1130: A non-progressing page token is read as an unreadable history, not the room's beginning.
+
+origin: epic 96, story 96.3 (rung `agents-96-paseo`, re-audit fixes R283, 2026-10-10)
+location: `runtime::page_of`, `runtime::sealed_after`, `runtime::walk_back`
+reason: R283 (R96PA5-02) makes only a missing `end` token end the room and fails closed when a page names the token it was asked with (the R279 budget error). A homeserver that, at a room's beginning, answers an empty chunk with `end` equal to `from` instead of omitting `end` makes every capture/completion read of that room an error, so its end is never told (fail closed) [INFERENCE: not observed on any server keeper uses]. `walk_back`'s readers (`after_brief`, `oldest_opening`, `answered_by`) now also read on past an empty page with a token, within the same budget, and keep returning what they found at its end. Not exercised against a real homeserver (DW-1104). Close by observing Synapse's beginning-of-room answer in a live `#[ignore]` test.
+status: open
+
+### DW-1131: A link with a credential parameter withholds the rest of an error's text, and a field whose prose looks like one is withheld whole.
+
+origin: epic 96, story 96.3 (rung `agents-96-paseo`, re-audit fixes R283, 2026-10-10)
+location: `keeper-core/src/agents/paseo.rs` (`credential_parameter`, `withhold_credentials`, `bears_credential`, `link`, `kept`, `sanitized`)
+reason: R283 (R96PA5-04) applies the decoded credential-parameter policy to every link in every kept field and broker error, and R287 (R96PA6-02) makes "every kept field" true: `prUrl`, which R283 left to `link`'s outer-parameter check alone, now goes through the same `bears_credential` before `link`'s stricter canonicalization and display checks (`the_pr_link_is_canonical`, `paseo_a_credential_parameter_in_any_field_reaches_no_record`). The policy reads a link's query as the URL parser does — to the text's end, a space not ending it — so the withheld span runs from that link to the end of the error's text, and every `?`, `#` and `&` after the first link's authority starts a parameter: a literal link nested in a parameter's value names its own parameters and is found, in every field. Fail closed, but it over-withholds: an error's words after such a link are lost, and a field whose prose after a link has `?token=` or `&key=` is withheld whole (`a_credential_parameter_is_withheld_from_every_field_and_error` keeps the ordinary-query controls). Residual: a credential inside a parameter's VALUE under an innocent name when that value is percent-encoded (an encoded nested link) is not decoded and not found, in any field, `prUrl` included; scheme-less links are not links. Close with a narrower span where a person's reading of the link differs from the parser's, and a decision on encoded nested links.
+status: open
+
+### DW-1132: The forward state reader takes an unchanged page token as the room's end.
+
+origin: epic 96, story 96.3 (rung `agents-96-paseo`, re-audit R96PA6, R286, 2026-10-10)
+location: `keeper-core/src/agents/matrix.rs` `read_forward` (the `match next` arm, ~:281–289)
+reason: `read_forward`'s doc says "only a missing next token ends the room", but its `_` arm also returns `complete: true` when a page names the token it was asked with. A homeserver answering that way mid-history would end the forward state read early, reported complete [INFERENCE: forward `/messages` pagination always returns an `end`, and an empty chunk is the room's end today; not observed either way]. The Paseo backward reader (`runtime::sealed_after`) deliberately fails closed on the same answer instead (R283, R286, DW-1130). Not changed in this rung (other reader, R287 non-goal). Close by deciding which contract `read_forward` keeps — make the doc say an unchanged token ends the room, or report it `complete: false` — with a test of the non-progressing page.
+status: open
+
+### DW-1133: A capture, delivery or end decrypted with a key the SDK cannot link to its sender is read as absent.
+
+origin: epic 96, story 96.3 (rung `agents-96-paseo`, re-audit fixes R287, 2026-10-10)
+location: `runtime::page_of` (`Read::Unlinked`), `runtime::sealed_after`, `runtime::child_arrival`, `keeper-core/src/agents/room.rs` `sealed_by_sender` (unchanged)
+reason: as opened (R287): `page_of` read a decrypted event whose verification state is `Unverified(MismatchedSender | None(_))` as `Read::Unsealed`, and `sealed_after` passed over it as anyone's, so a capture, delivery or end of the agent's own device decrypted with a key from a backup or a forward (`None(InsecureSource)`) or before this copy knew that device (`None(MissingDevice)`) was neither kept nor an error, and the live path dropped it. The opening's trade-off sentence was wrong: holding on it does not let a clear event hold the room — that follows only from holding on every `Read::Unsealed` event, and a decrypted-but-unlinked event is not a clear one. R96PA7-01 promoted it to HIGH.
+status: closed (2026-10-10, rung `agents-96-paseo`, R293): `page_of` reads such an event as `Read::Unlinked` — never kept, as R185 requires (`sealed_by_sender` unchanged) — and `sealed_after` errors on it when it claims the read's author (the follow session's agent; the delegation's target after the cursor) and passes over anyone else's; `child_arrival` routes it as `Arrival::Unreadable` to the same per-delegation hold. Clear messages and state events stay `Read::Unsealed`, read past, never held. Proved by `runtime::tests::an_unlinked_event_of_its_author_is_never_absent`, `runtime::tests::an_unlinked_event_of_a_delegated_room_holds_its_session`, and the worker scenarios `paseo_an_unreadable_capture_or_delivery_holds_the_end` and `an_unreadable_end_holds_those_told_after_it` for `InsecureSource`, `MissingDevice` and `MismatchedSender`; history-skip and live-drop mutants killed (`mut-96paseo-10a.log`). The availability residual — an unlinked event, real or forged, claiming the author holds that room or delegation, possibly for good — is DW-1129.
+
+### DW-1134: The envelope test treats a JSON-null `state_key` as a state event, which ruma reads as message-like.
+
+origin: epic 96, story 96.3 (rung `agents-96-paseo`, re-audit R96PA7-02, R293, 2026-10-10)
+location: `keeper-agent/src/runtime.rs` `enveloped` (`value.get("state_key").is_none()`), `runtime::page_of`; ruma-events 0.34.0 `src/enums.rs` (~:375–408, the timeline event kind discriminator)
+reason: `enveloped` reads any present `state_key`, including an explicit JSON `null`, as a state event and so not as an `m.room.encrypted` envelope; ruma's kind discriminator deserializes `state_key` as `Option<IgnoredAny>` and calls an event with a `null` one message-like. An `m.room.encrypted` event with `state_key: null` that reaches the plaintext fallback could therefore be treated as message-like by the SDK yet read `Read::Unsealed` here, passed over instead of holding the read [INFERENCE: no evidence that Keeper or its homeserver emits that shape]. No test isolates the boundary on an encrypted type: the clear-state controls use `m.room.topic`, so the retained overbroad mutant proves ordinary clear events are not held, not where `state_key` excludes an envelope. Not changed in this rung (R96PA7-02 is not HIGH). Close by deciding absent versus null — align with ruma (null is message-like) or document and prove the rejection — with a fixture through `page_of` of an `m.room.encrypted` event with a real state key and one with `null`; the live-server half belongs with DW-1104.
+status: open
+
+### DW-1158: R241's text still writes the follow room's `create` call with its kind last.
+
+origin: epic 96, story 96.3 (rung `agents-96-paseo`, review-96paseo-10.md, R311, 2026-10-11)
+location: `_bmad-output/planning-artifacts/agents-coordinator-decisions-2026-10-02.md` R241; `keeper-agent/src/agent.rs` `AllowedTools::paseo_follow` (`port.create(SessionKind::Scheduled, ..)`)
+reason: since the second restack (R104's `DelegationPort::create(kind, name, invite, agents)`) the kind is the first argument; R241's sentence shows `create(.., SessionKind::Scheduled)`. The behaviour is right and now tested (`paseo_follow_card_ends_with_the_pr_link` asserts `[SessionKind::Scheduled]`, RS3-03 killed); only the ruling's wording is stale. Close by refreshing R241's text at the coordinator's next pass over the decisions file.
+status: open
+
+### DW-1159: A session folder moved before its Paseo end is captured leaves an unmarked notice the parent takes as the run's reply.
+
+origin: epic 96, story 96.3 (rung `agents-96-paseo`, review-96paseo-11.md, R312, 2026-10-11; from R96PA11-01)
+location: `paseo_capture` marks the end notice only when `paseo_origin` reads `<reply.session>/agent.toml` (`keeper-agent/src/agent.rs` ~:2283, 2298–2300, 2348–2364); `[reply].session` is a path (`keeper-core/src/agents/session.rs` ~:170–174) and session folders move on archive/trash (`sessions/exec.rs` ~:652–764)
+reason: a workflow run W moved before its Paseo end is captured produces an unmarked own-name notice in W's room; the R311 ignore arm (~:5327–5332) catches only marked content, and the parent's `takes_reply` (`sent && !replied`, ~:859) takes it as W's reply (delegate replied line, R202 card → review, a turn). Told once, to a run that never replied; no person's reply lost. Fix: carry the origin session's id in `[reply]` at follow time so `paseo_capture` always marks; regression with W's folder moved before capture (desk card stays running).
+status: open
+
+### DW-1160: A screen approval's card does not draw its preview (UX-DR141).
+
+origin: epic 96, story 96.4 (rung `agents-96-screen`, 2026-10-11; R155's pattern)
+location: `keeper-core/src/agents/approval_card.rs` (`ApprovalCardVm`), `src/components/` (the approval card), the shell's download of an approval request's encrypted attachment
+reason: the screenshot reaches the request as `ApprovalRequestContent.preview = {sha256, mimetype, file}` (the room's encrypted upload; `approvals::ServedSession::preview_attachment`), but no view model carries it and no component draws it — the target's frame or click point marked, the window named in the caption, *Preview no longer available* with the hash when the attachment is gone. Drawing it needs the desktop to download and decrypt the attachment, which is a shell command, and 96.4 does not touch the shell crate; the design lane has not decided the card either. Close with a `preview` part of `ApprovalCardVm` (ts-rs), a shell command returning the decrypted bytes for a request's preview, the card's rendering, and a real-browser proof at 1280 and 420 px.
+status: open
+
+### DW-1161: `screen:mac` stays in the manifest while Peekaboo has lost its grants.
+
+origin: epic 96, story 96.4 (rung `agents-96-screen`, 2026-10-11)
+location: `keeper-agent/src/hosts.rs` `HostRuntime::manifest` (`screen` = a `role = "screen"` server answering `tools/list`)
+reason: 96.4 #1 offers `screen:mac` while a screen server answers its tool list, and that is what is built and tested (`hosts::tests::screen_capability_follows_the_server`). A Peekaboo whose Screen Recording or Accessibility grant macOS reset after an update still answers `tools/list`, so the operator check "after a Peekaboo update `screen:mac` drops out of the manifest until the grants are back" is not met: its reads fail and an action that would park is refused because keeper's own screenshot fails, but the capability is still offered. Close by asking Peekaboo's `permissions` tool at each renewal and offering `screen:mac` only when both grants read granted, with a fixture case for each, and the hesperia device check.
+status: open
+
+### DW-1162: A screen action at coordinates outside the main display is refused.
+
+origin: epic 96, story 96.4 (rung `agents-96-screen`, 2026-10-11)
+location: `keeper-core/src/agents/screen.rs` `screenshot_args` (`app_target = "screen:0"`, logical scale), `region_around`; `keeper-agent/src/agent.rs` `AllowedTools::screen_pin`
+reason: keeper's own screenshot is the main display at one pixel per point, so a click whose point lies on a second display falls outside it and the action is refused ("what it acts on is outside the screenshot") rather than pinned. Failing closed is deliberate; the gap is a person with two displays who wants it. Close by mapping a point to the display that holds it (Peekaboo's `list` of screens) and hashing that display's screenshot, proved on a two-display Mac.
+status: open
+
+### DW-1163: The model never sees a screenshot.
+
+origin: epic 96, story 96.4 (rung `agents-96-screen`, 2026-10-11)
+location: `keeper-agent/src/mcp.rs` `text_of` (an image block becomes `[an image, image/png, not shown]`)
+reason: an MCP answer's image reaches the model as that sentence only (96.2's rendering); keeper reads the bytes itself for the preview and the region hash (`Answer.images`). An agent therefore works the screen from Peekaboo's accessibility text (`see`, `inspect_ui`), not from pixels, and "take a screenshot of the front window" runs at T0 but gives the model no picture. Sending an image to the provider is a new sink (the provider's audience and NFR-115's `local_only`) and a provider capability (`BotModelVm.vision`), neither decided here. Close with that decision, the image passed as a vision content part only where the provider's sink allows the screen's label, and a test that a `local_only` session sends none.
+status: open
+
+### DW-1164: Nothing prunes the zone's `.keeper/previews/`.
+
+origin: epic 96, story 96.4 (rung `agents-96-screen`, review-96screen-1 / R316, 2026-10-11)
+location: `keeper-agent/src/previews.rs` `write`
+reason: every screen action that parks keeps its screenshot once by SHA-256 (megabytes each at a 5K display's logical scale) and nothing removes it after its record is decided or expired. Close with a sweep — a preview no open record names, older than the longest expiry (24 h), removed by the host that wrote it — and a test that an open record's preview survives it.
+status: open
+
+### DW-1165: The screen's SUBMIT word list is six words.
+
+origin: epic 96, story 96.4 (rung `agents-96-screen`, review-96screen-1 / R316, 2026-10-11)
+location: `keeper-core/src/agents/screen.rs` `SUBMIT`
+reason: a click on an element is T3 when its role, title or identifier says submit, send, post, buy, pay or delete; `OK`, `Confirm`, `Accept`, `Allow` (outside a TCC prompt), `Continue`, `Purchase`, `Transfer`, `Remove`, `Erase`, `Discard`, `Sign out`, `Empty Trash`, a double-click that opens, and a `menu click-extra` toggle (Wi-Fi, VPN) are T1. Close with the wider list decided (which words, in which languages the Mac runs) and a row each in `screen_tier_rows`.
+status: open
+
+### DW-1166: Peekaboo writes screenshots and recordings to temporary files on the Mac.
+
+origin: epic 96, story 96.4 (rung `agents-96-screen`, review-96screen-1 / R316, 2026-10-11)
+location: `docs/agents.md` § *The Mac's screen* (*What Peekaboo keeps on the Mac*); `keeper-core/src/agents/screen.rs` `TOOLS` (`capture` T0)
+reason: `capture` records up to 180 s of the screen into a temporary folder (`autoclean_minutes`), and `see`/`image` without `format: data` write their screenshot to a temporary file; keeper names no path (R151) and the files are Peekaboo's in the person's account. Documented, not refused. Close with a decision — refuse `capture`, or ask `autoclean_minutes = 0` / inline data where the schema allows — and a test of it.
+status: open
+
+### DW-1167: The names a screen card quotes are the model's.
+
+origin: epic 96, story 96.4 (rung `agents-96-screen`, review-96screen-1 / R316, 2026-10-11)
+location: `keeper-core/src/agents/screen.rs` `summary` (`quoted`)
+reason: a card for an action with no element quotes the app, menu item, Dock item or dialog button its arguments name — capped at 40 characters and quoted as a name (R316 07), but the model's words. Close by resolving each against keeper's own `menu list`, `dialog list`, `app list` and `list` before the action parks, composing the card from the entry found and refusing what is not found, with a test that a name no list holds is refused.
+status: open
+
+### DW-1168: Screen behaviours await a device check on hesperia.
+
+origin: epic 96, story 96.4 (rung `agents-96-screen`, review-96screen-1 / R316, 2026-10-11)
+location: `keeper-core/src/agents/screen.rs` `types_return`, `types_delete`, `screenshot_args`, `windows`, `Windows::holding`, `window_holds`, `named_holds`; `keeper-agent/src/agent.rs` `AllowedTools::screen_aim`, `screen_pin`
+reason: whether Peekaboo's `type` sends a `\n` in its text as Return (R316 08 treats it as Return either way), and whether `image {format: data, app_target: screen:0, scale: logical, max_dimension: 1000000}` answers an inline PNG block — both read from the 3.9.8 schema and sources, neither run on the real server. Close with both run on hesperia (read-only `image`; `type` into a scratch TextEdit document) and the result recorded.
+also (review-96tail-fix1 / R328, 2026-10-11): the window pin rests on Peekaboo facts read from its sources, never run — (a) `inspect_ui {app_target: "frontmost"}`'s `Window:` text equals `list application_windows`' quoted title verbatim, and `list` writes `Found N windows for <app> (<bundle>) - PID: n` then `k. "<title>" [Bounds: x, y w×h]` (a mismatch makes every action with no element refuse at its pin: fails closed, unusable); (b) Peekaboo still resolves `snapshot: S1` after keeper's own later `inspect_ui` (the consumed click names the read's snapshot; if Peekaboo evicted it, the approval is consumed and the click errors); (c) `window_title` matching is case-insensitive as `Windows::holding` assumes (if Peekaboo's is case-sensitive, keeper refuses calls Peekaboo would run, never the reverse); (d) whether `list` lists a sheet as a window (then the identity check sees one laid over the pinned window; else only the frame hash's 13–14 bits do); (e) whether `type` acts on `{delete}` / `{backspace}` in its text (R328 02 treats both as Delete either way). Close with each run on hesperia and recorded, and the code changed where a fact differs.
+status: open
+
+### DW-1169: `inspect_args` targets `<app>:<window>`, which Peekaboo's grammar reads ambiguously.
+
+origin: epic 96, story 96.4 (rung `agents-96-screen`, review-96screen-1 / R316, 2026-10-11)
+location: `keeper-core/src/agents/screen.rs` `inspect_args`
+reason: the element re-read before a consumed action targets `"<app>:<window>"`; a window title holding `:` or an app named like `PID:…` is read another way by Peekaboo (`PID:PROCESS_ID:WindowTitle`). It fails closed (the re-read names another window and the action drifts) but a correct window can drift too. Close with Peekaboo's quoting rule confirmed and applied, or such a window refused at pin time, and a test.
+status: open
+
+### DW-1170: The KVM's frame pin is proved on synthetic frames, not a device's.
+
+origin: epic 96, story 96.5 (rung `agents-96-kvm`, 2026-10-11)
+location: `src-tauri/crates/keeper-core/src/agents/kvm.rs` (`frame_pin`, `frame_holds`), `src-tauri/crates/keeper-agent/src/approvals.rs` (`kvm_moved`)
+reason: no NanoKVM is on the network (96.5's operator checks). `kvm_frame_pin_bounds` and `kvm_drift_refuses` use generated frames — a gradient, a striped dialog, a clock patch — encoded as JPEG in the test. A real target's screen (a blinking cursor in a terminal, video, an animated login screen) may move a 64-pixel square past the bound (`screen::DHASH_BOUND`) and make every approval drift, or a JPEG of a busy screen may hide a small change under it. Close on the device: capture frames of an idle desktop a minute apart and of a dialog moved 40 px, commit them as fixtures, and re-run the bound against them.
+also (review-96tail-fix1 / R328, 2026-10-11): since the restack the KVM's tiles use the shared `screen::DHASH_BOUND` 7, measured on the screen's PNG fixtures — the false-drift rate of a 7-bit bound over 40+ tiles of a re-encoded MJPEG frame is unmeasured. Measure it on those device frames, and give the KVM a bound of its own if 7 drifts an idle screen.
+status: open
+
+### DW-1171: A NanoKVM-Go's MCP tools are tiered by their names alone.
+
+origin: epic 96, story 96.5 (rung `agents-96-kvm`, 2026-10-11)
+location: `src-tauri/crates/keeper-core/src/agents/kvm.rs` (`role_row`)
+reason: NanoKVM-Go's `/api/mcp` tool list is `[UNVERIFIED]` (epic §14): no device has answered `tools/list`. Since R323 `role_row` offers a screenshot-named tool alone, at T0; every other tool is not offered (DW-1174), so a screenshot tool named otherwise is not offered either. Close with the captured `tools/list` committed as a fixture and a table naming every tool, as 96.4 did for Peekaboo.
+status: open
+
+### DW-1172: A security dialog, password or payment is recognised from the agent's words and the inputs, not from the screen.
+
+origin: epic 96, story 96.5 (rung `agents-96-kvm`, 2026-10-11)
+location: `src-tauri/crates/keeper-core/src/agents/kvm.rs` (`SENSITIVE`, `sensitive`, `sensitive_args`)
+reason: 96.5 #5 puts anything touching a security dialog, a password or a payment at T5. keeper recognises it from the `intent`, from typed and pasted text — each text alone and, since R321, everything a call types joined across its inputs, character keys included — by a fixed English/German word list and a Luhn-valid 13–19 digit number, and from Ctrl+Alt+Delete (one chord: Ctrl+Alt+Insert, Ctrl+Alt+End and Win+L are not on the list); it does not read the frame, so a click on a dialog's "Allow" whose intent says "close the popup" is T4, decided by a person who sees the frame on the card. Text split across two calls is not joined. Reading the frame (OCR, an accessibility read of the target) is out of reach of a KVM.
+status: open
+
+### DW-1173: `kvm_act` types only what a US keyboard types.
+
+origin: epic 96, story 96.5 (rung `agents-96-kvm`, 2026-10-11)
+location: `src-tauri/crates/keeper-ported/src/nanokvm/mod.rs` (`char_key`), `src-tauri/crates/keeper-core/src/agents/kvm.rs` (`parse_act`)
+reason: a `type` input is sent as US-layout HID keycodes and a `paste` with `langue = ""`; a character no US key types is refused before anything is sent, and a target whose layout is not US gets other characters for the punctuation keys. The reference documents `"de"` for paste only. Close with a per-`[[kvm]]` `layout` and its keymap.
+status: open
+
+### DW-1174: A NanoKVM-Go's inputs are not offered until they ask through the frame pin.
+
+origin: epic 96, story 96.5 (rung `agents-96-kvm`, review-96kvm-1.md R96K1-01, R323, 2026-10-11)
+location: `src-tauri/crates/keeper-core/src/agents/kvm.rs` (`role_row`, `INPUTS_NOT_OFFERED`), `src-tauri/crates/keeper-agent/src/approvals.rs` (`kvm_moved`), `src-tauri/crates/keeper-agent/src/agent.rs` (the MCP park)
+reason: a NanoKVM-Go input parked through the generic MCP park would carry no preview and no `preconditions.screen`, and `kvm_moved` re-reads only `kvm_act` records — approved on a card with no frame, sent against a screen nobody read again. Since R323 a `role = "kvm:<id>"` server offers its screenshot alone. Close by routing its inputs through `kvm_act`'s park: its screenshot tool taken as keeper's own read (as 96.4's `screen_pin`), pinned with `kvm::frame_pin`, attached as the preview, and re-read in `kvm_moved` by the server's screenshot tool before the consumed mark; needs DW-1171's `tools/list`.
+status: open
+
+### DW-1175: The model is shown no picture of a KVM's screen.
+
+origin: epic 96, story 96.5 (rung `agents-96-kvm`, review-96kvm-1.md R96K1-03, R323, 2026-10-11; the KVM's twin of DW-1163)
+location: `src-tauri/crates/keeper-agent/src/agent.rs` (`kvm_snapshot`, `frame_said`), `src-tauri/crates/keeper-agent/src/mcp.rs` (an MCP image block rendered as "not shown")
+reason: `kvm_snapshot` tells the model the frame's size and its preview's hash; the pixels reach only the card. A KVM has no text read of the target (no accessibility tree, no OCR), so every `kvm_act` is placed at coordinates the model never saw: FR-813 "an agent can see another machine through a KVM" is not met until this closes. Sending an image to a provider is a new sink: decide it gated by the frame's label (its readers, `local_only`) and `BotModelVm.vision`, together with DW-1163.
+status: open
+
+### DW-1176: Every `kvm_snapshot` writes a preview PNG no record refers to.
+
+origin: epic 96, story 96.5 (rung `agents-96-kvm`, review-96kvm-1.md, R323, 2026-10-11)
+location: `src-tauri/crates/keeper-agent/src/agent.rs` (`kvm_frame`), `src-tauri/crates/keeper-agent/src/previews.rs`
+reason: `kvm_frame` keeps every frame under the sessions zone's `.keeper/previews/`, the snapshot's and the fresh frame after the inputs as well as the one a record pins; only the last is ever a card's attachment. DW-1164's retention problem grows with each snapshot a model takes. Close by keeping a frame only when a record names it, or by DW-1164's retention naming the snapshot path.
+status: open
+
+### DW-1177: Five facts of the classic NanoKVM are the reference's reading, not a device's.
+
+origin: epic 96, story 96.5 (rung `agents-96-kvm`, review-96kvm-1.md R96K1-09, R323, 2026-10-11)
+location: `src-tauri/crates/keeper-core/src/agents/kvm.rs` (`steps`), `src-tauri/crates/keeper-ported/src/nanokvm/mod.rs` (`mouse`, `first_jpeg`'s successor `JpegCut`)
+reason: owed device checks, each `[UNVERIFIED]` until a NanoKVM answers: a release is `[2,2,0,0,0]` whatever button was pressed (a right-click released with button 0); a scroll is one frame per step with `y = signum`, positive down; Ctrl+Alt+Delete reaches the target as `[1,76,1,0,4,0]`; the device re-encodes a static screen deterministically enough for the tiles' bound (count refusals over an idle minute, with DW-1170); and `JpegCut` cuts at the first `FF D9` after `FF D8`, so a frame carrying an EXIF thumbnail would be cut at the thumbnail's end and refused as not decoding (fails closed). Close on the first device run.
+status: open
+
+### DW-1178: Two sessions on one host using the same KVM can interleave their inputs.
+
+origin: epic 96, story 96.5 (rung `agents-96-kvm`, review-96kvm-1.md, R323, 2026-10-11)
+location: `src-tauri/crates/keeper-agent/src/kvm/mod.rs` (`Classic::send`), `src-tauri/crates/keeper-agent/src/agent.rs` (`kvm_act`)
+reason: each `send` opens its own WebSocket and logs in afresh, so two approved `kvm_act`s of two sessions naming one KVM reach the device's one keyboard interleaved, and each session's fresh frame may show the other's effect. Close with a per-KVM mutex in `Kvms` held around `send` and the fresh frame after it.
+status: open
+
+### DW-1179: A `role = "kvm:<id>"` server's URL is not tied to its `[[kvm]]` entry's host.
+
+origin: epic 96, story 96.5 (rung `agents-96-kvm`, review-96kvm-1.md R96K1-11b, R323, 2026-10-11)
+location: `src-tauri/crates/keeper-core/src/agents/mcp.rs` (`check`, the `McpRole::Kvm` arm)
+reason: the `[[mcp]]` entry takes its readers, fingerprint and credential from the `[[kvm]]` entry but keeps its own `url`; the pinned certificate keeps the credential from reaching anyone else, so this is hygiene, and `docs/agents.md` says the `[[mcp]]` URL is the one spoken to. Close by refusing a `role = "kvm:<id>"` whose URL host differs from its `[[kvm]]`'s.
+status: open
+
+### DW-490: The turn-model picks have settings keys but no picker in Settings.
+
+origin: epic 97, story 97.1 (rung `agents-97-models`, 2026-10-05; acceptance 4, Q6)
+location: `src-tauri/crates/keeper-core/src/config/keys.rs` (`transcription.vad_model`, `transcription.smart_turn_model`), `src/components/settings/` (Settings › Transcription)
+reason: 97.1 builds the keys, `choose_turn`'s refusal and the fetch of a picked folder; the rung plan gives the UI only UX-DR142's line, so a pick is made by writing the key in a settings file. `models::available` scans the transcription roles only, so nothing lists turn-model folders yet. Until then a refused pick names the key and says to set it to another folder of `_models/` in the account's `settings.toml`, or remove it. Revisit when the turn models have a second folder worth choosing: a picker beside Speech model / Speaker model, fed by `available` with the two turn roles.
+status: open
+
+### DW-491: The models directory keeps the pre-group state and marker files after the update.
+
+origin: epic 97, story 97.1 (rung `agents-97-models`, 2026-10-05; Q5)
+location: `src-tauri/crates/keeper-sync/src/config_repo/hydrate.rs` (`state_file`, `complete_file`)
+reason: Hydration state and completion are per group now (`.keeper-hydrate.<group>.json`, `.keeper-models-complete.<group>.json`). A Mac hydrated before the update keeps `.keeper-hydrate.json` and `.keeper-models-complete.json`, which nothing reads; its first run hashes the transcription set once (about 480 MB) to adopt what is already in place, and transcription reads "updating" until that run ends. Revisit if a stale file ever confuses a reader: remove the two names in the hydration's first run.
+status: open
+
+### DW-492: ONNX Runtime arrives as pyke's prebuilt library, downloaded by the build.
+
+origin: epic 97, story 97.1 (rung `agents-97-models`, 2026-10-05; acceptance 7, Q2)
+location: `src-tauri/Cargo.toml` (`ort`, `download-binaries`), `NOTICE`
+reason: `ort-sys`'s build script fetches `libonnxruntime.a` (ONNX Runtime 1.28.0) from `cdn.pyke.io`, hash-pinned per target, on CI and hesperia; the bytes are pyke's build of Microsoft's release, not one we built or attested. `ort` is a dependency only of Apple silicon macOS and the arm64 iPhone (`target_env` not `sim`): no Intel macOS library exists, and the simulator's is not recorded in `NOTICE`, so an Intel Mac and the iOS simulator (arm64 or Intel) compile the runtime-less port and have no turn models (`voice_turn_models::supported`). Revisit when the build must be offline or attested, or an Intel Mac needs turn models: build ONNX Runtime for the two Apple targets in CI and point `ORT_LIB_LOCATION`/`ORT_IOS_XCFWK_PATH` at it (Q2 option c).
+status: open
+
+### DW-493: The app bundle does not carry ONNX Runtime's licence text.
+
+origin: epic 97, story 97.1 (rung `agents-97-models`, 2026-10-05; acceptance 7)
+location: `NOTICE`, the macOS and iOS bundles
+reason: ONNX Runtime's MIT licence asks that its notice travel with copies of the software. It was recorded in the repository's `NOTICE` only, neither bundle carried it, and the ThirdPartyNotices of the components ONNX Runtime bundles were not reproduced.
+status: closed 2026-10-05
+resolution: Fixed by the rung's review fixes (R97-01): ONNX Runtime's LICENSE and ThirdPartyNotices.txt at v1.28.0 (and FluidAudio's LICENSE, the other native code `NOTICE` names) are in `licenses/`, with their sha256 in `NOTICE`; `tauri.conf.json` (`bundle.macOS.files`) puts `NOTICE` and `licenses/` in `keeper.app/Contents/Resources/`, `gen/apple/project.yml` at the top of the iPhone app. `scripts/bundle-notices.test.ts` pins both configurations, and the bundle guard every install runs (`scripts/lib/bundle-guard.sh`) refuses a built app that lacks any of them. Settings › About shows none yet; a person reads them in the bundle.
+
+### DW-494: The voice settings read the turn group's currency on every read.
+
+origin: epic 97, story 97.1 (rung `agents-97-models`, 2026-10-05; acceptance 9)
+location: `src-tauri/crates/keeper/src/voice_turn_models.rs` (`state_vm`, called by `voice_ipc::wake_vm`)
+reason: `voice_wake_get` is a synchronous command, and its turn-models line asks `hydration_is_current`, which walks the clone's turn folders and hashes their plain files (`models.toml`, the licence files) each time. That is a few small files today. Revisit if the turn folders grow plain files of size or the read shows on a profile: cache the answer per clone commit, or read it off the main thread.
+status: open
+
+### DW-495: End of turn by meaning has not run on a Mac or a phone.
+
+origin: epic 97, story 97.2 (rung `agents-97-turns`, 2026-10-05; acceptance 6 and 8)
+location: `src-tauri/crates/keeper/src/voice_macos.rs`, `voice_ios.rs`, `voice_turn_models.rs`, `voice_ipc.rs`; `docs/agents.md` § *Measured: a spoken turn's end*
+reason: The shell half (the taps' copy into `end_of_turn::Ear`, `finish_recognition`'s `endAudio`, the listener over the ONNX sessions, the `turn_end` log line) was written on Linux and compiled by inspection only. Owed, after merge: CI's macOS job and iOS `cargo check`; `check:rust:macos` on hesperia; `bun run install:ios` to kalypso; then the device run of 97.2 #8 on both — twenty or more spoken questions each with debug mode on, `measure_a_device_run` over each `keeper.log`, the rows in § *Measured*. Not established either: the voice-processing input's sample rate on each device (the resampler takes any), the Smart Turn and Silero latency on Apple silicon and the A-series, and whether `endAudio` alone delivers the final words within 600 ms.
+status: open
+
+### DW-496: A frame's time is its tap buffer's.
+
+origin: epic 97, story 97.2 (rung `agents-97-turns`, 2026-10-05; acceptance 7; narrowed by the rung's review fixes, R97-R3-02)
+location: `src-tauri/crates/keeper-core/src/voice/end_of_turn.rs` (`Ear::hear`, `Listener::hear`)
+reason: Every 32 ms frame completed inside one tap buffer carries that buffer's delivery time, so `speech_end_ms` is late by up to one buffer (~21 ms at 48 kHz on the Mac, ~64 ms if the phone's input runs at 16 kHz), which counts against NFR-114's 300 ms. Revisit if the device run's `finish_recognition_ms − speech_end_ms` sits near 300 ms: interpolate the frame's time inside its buffer from the sample count. The second half of this entry as first filed — the listener's onset, speech end and utterance end reaching the turn as separate spawned tasks, in any order — was not a latency matter but a corruption of the record (a late onset could erase a finished turn's speech end, a late speech end land on the next turn), and is fixed: the listener's thread delivers its events to `voice_ipc::heard` one at a time in the order heard, each stamped with its listening's generation, and `Ear::admit` checks the generation, writes the clock and names the move under one hold of the voice lock (`ear_keeps_late_clock_points_off_the_turn`).
+status: open
+
+### DW-497: A model turn whose port never said it ended the audio is in neither NFR-114 figure.
+
+origin: epic 97, story 97.2 review fixes (rung `agents-97-turns`, 2026-10-05; R97-R3-05)
+location: `src-tauri/crates/keeper-core/src/voice/timings.rs` (`measure`)
+reason: `finish_recognition_ms` is now the moment the port reports `endAudio` ran, and is absent when it never reported it (no request to end, or no report within the 600 ms the turn waits for one). `measure` takes both figures over model turns that have the point, so such a turn is counted in `model_turns` but in neither p95. On a device run that is a failure the figures hide. Revisit with the device run (DW-495): if `model_turns` exceeds the turns with the point, list those turns' `sent_ms` the way `early_pauses` lists early pauses, and count them against NFR-114.
+status: open
+
+### DW-1200: A heard mark is measured on the answer's prose, not on the room's last message.
+
+origin: epic 97, story 97.3 (rung `agents-97-heard`, 2026-10-11; acceptance 7, codemap Q9)
+location: `src-tauri/crates/keeper-core/src/agents/heard.rs` (`answer_text`, `Answers::mark`)
+reason: The host counts the device's `sentence` over the turn's `assistant` lines joined as the stream joined them. The room's final message can say more than that prose: an answer over `FINAL_CUT_BYTES` ends with its artifact sentence, and a turn that failed, parked or was bounded ends with the host's note (`join_note`) or the shutdown suffix's own words. A device that finished one of those sentences counts past the prose and its mark is refused as past the answer, though the person heard all of it — the same cut as no mark. A turn that failed after its last round's prose was already on that round's line has no anchored `assistant` line at all, so its anchor is no answer and a mark of it is refused. Revisit if spoken answers that end in a note turn out to matter: keep the room's final text (or its sentence count) on the closing line.
+status: open
+
+### DW-1201: The first message of a parked turn cannot be marked.
+
+origin: epic 97, story 97.3 (rung `agents-97-heard`, 2026-10-11; acceptance 7)
+location: `src-tauri/crates/keeper-core/src/agents/heard.rs` (`Answers::observe`)
+reason: A turn parked on an approval ends its room message with the waiting note and writes no closing line; it resumes under a new anchor (`resume_turn`). Only the resumed anchor names an answer, so a person who stopped the spoken waiting message — the rounds before the park — leaves a mark that is refused as no answer, and the model's next turn reads those rounds whole. Revisit with the device half (rung `agents-97-pause`) if spoken turns park in practice: give the parked rounds their own answer under the first anchor.
+status: open
+
+### DW-1202: A device count past the final answer after a rewrite is refused, not clamped.
+
+origin: epic 97, story 97.3 review (rung `agents-97-heard`, 2026-10-11; `review-97heard-1.md` DW-A, R319)
+location: `src-tauri/crates/keeper-core/src/agents/heard.rs` (`Answers::mark`), `src-tauri/crates/keeper-core/src/voice/speech.rs` (`AnswerFollower::edit`)
+reason: After a mid-stream rewrite `AnswerFollower::edit` skips the sentences it already handed out by position, so the device may have finished more sentences than the final text holds. The host then refuses the mark as `PastTheAnswer` — the same as no mark: the next turn reads the answer whole — rather than clamping `sentence` to the last sentence and naming the device's count as `disagreed`. Rare (the agent rewrote earlier prose mid-answer). Revisit with the device half (rung `agents-97-pause`) if the device run logs `PastTheAnswer` refusals for answers that were rewritten while spoken.
+status: open
+
+### DW-1203: A cut-off turn's rounds stay open until the next `user` or `peer` line.
+
+origin: epic 97, story 97.3 review (rung `agents-97-heard`, 2026-10-11; `review-97heard-1.md` DW-B, R319)
+location: `src-tauri/crates/keeper-core/src/agents/heard.rs` (`Answers::observe`)
+reason: `observe` starts a new stream only at a `user` or `peer` line or a requested approval; the `error: interrupted` line `recover` writes under a cut-off turn's question does not close it. In a proxy conversation the next turn always starts with the person's new `user` line, so the lost rounds never join a later answer; a turn kind that resumes without one (a workflow's `Resume`) is never a proxy conversation, so no heard mark reaches it. Revisit if a conversation turn ever resumes without a `user` or `peer` line: clear the open rounds on an `error` line whose parent is not a turn's closing line.
+status: open
+
+### DW-1210: A pause's decision window does not wait for speech the voice activity model has not heard end.
+
+origin: epic 97, story 97.3 (rung `agents-97-pause`, 2026-10-11; acceptance 2, 4)
+location: `src-tauri/crates/keeper-core/src/voice/turn.rs` (`silence_budget`, `PAUSE_DECISION_WAIT`), `src-tauri/crates/keeper-core/src/voice/backchannel.rs` (`settle`)
+reason: `Paused` waits 800 ms after the last thing it heard (an onset, a partial) unless the voice activity model heard the speech end. A click shorter than the detector's 256 ms minimum never ends (`EndOfTurn` reports no speech end for it), so the window must close without one — and so does a wordless sound longer than 0.8 s that is still going, which is then resumed and logged as `false_onset` although it was longer than 250 ms; a first partial slower than 0.8 s after the onset resumes the answer and pauses it again when it lands (two `pause` records). Revisit with the device run's `false_onset` count and pause records (97.3 #11): have the detector report a click's end, or hold the window while the model hears speech.
+status: open
+
+### DW-1211: Words that trail a pause resumed by its duration pause the answer again.
+
+origin: epic 97, story 97.3 (rung `agents-97-pause`, 2026-10-11; acceptance 2)
+location: `src-tauri/crates/keeper-core/src/voice/backchannel.rs` (`at_speech_end`)
+reason: The duration rule decides at the voice activity model's speech end, and only when the recogniser has no words yet; Apple's partials trail the audio by a few hundred milliseconds, so a short "no" (English) can be resumed by its duration and then arrive as words over the resumed answer, which pauses it again and stops it as a question — a brief resume over an objection, with two records. Revisit with the device run: if trailing words are common, wait a fixed beat for words after a short wordless speech end before resuming.
+status: open
+
+### DW-1212: A sentence finished at the moment of a stop can go uncounted.
+
+origin: epic 97, story 97.3 (rung `agents-97-pause`, 2026-10-11; acceptance 6)
+location: `src-tauri/crates/keeper/src/voice_ipc.rs` (`deliver`, `sentence_spoken`)
+reason: The synthesiser delegate's `SentenceSpoken` reaches the question's `HeardMark` through a task spawned per port event, like every port event (`deliver`), and nothing orders it against the stop phrase's transcript arriving within the same milliseconds. When the stop wins, the mark says one sentence less than was heard — the safe side (Q3), never more. Revisit if the device run shows marks short by one.
+status: open
+
+### DW-1213: `pause_ms` and `resume_ms` are when the port's call returned, not when the audio paused.
+
+origin: epic 97, story 97.3 (rung `agents-97-pause`, 2026-10-11; acceptance 10)
+location: `src-tauri/crates/keeper-core/src/voice/timings.rs` (`TurnClock::observe_reading`), `src-tauri/crates/keeper/src/voice_macos.rs`/`voice_ios.rs` (`pause_speaking`, `continue_speaking`)
+reason: Both ports answer `PauseSpeaking`/`ContinueSpeaking` once `pauseSpeakingAtBoundary:`/`continueSpeaking` returned on the worker, and the shell stamps them after the move (`final_words_ms` is read before it, when the deciding words reached the turn — R326(01)); the output's own latency to silence (and the delegate's `didPause`/`didContinue`) is not read. `onset_ms` is the tap buffer's time (DW-496's half). NFR-114's 150 ms is therefore measured to the call, not to the speaker. Revisit if the device run's figures sit near the bound: stamp from `didPauseSpeechUtterance:`.
+status: open
+
+### DW-1214: Over the answer the listener still asks the end-of-turn model after every speech end.
+
+origin: epic 97, story 97.3 (rung `agents-97-pause`, 2026-10-11)
+location: `src-tauri/crates/keeper-core/src/voice/end_of_turn.rs` (`Listener::frame_heard`, `Ear::admit`)
+reason: The `Listener` does not know what the ear listens for, so after a speech end over the answer it computes Smart Turn's features and scores them (36–49 ms on the dev host) like at the end of a question; `Ear::admit` then discards the verdict. Revisit if the phone's CPU during speech shows it: tell the listener its mode with the generation.
+status: open
+
+### DW-1215: A heard mark that fails to send leaves the next question uncut.
+
+origin: epic 97, story 97.3 (rung `agents-97-pause`, 2026-10-11; acceptance 6, Q10)
+location: `src-tauri/crates/keeper/src/voice_ipc.rs` (`transition_locked`)
+reason: The next spoken question waits for the mark's send (`Voice.sending_mark`) to return, at most `agents::spoken::HEARD_MARK_WAIT` (10 s, R326(03, 04)), then is sent whatever it returned; a refusal or a network failure is logged and not retried, and a mark still sending past the wait arrives after the question, so the agent's next turn reads the answer whole. Revisit if the device run or the app log shows refusals: queue the mark like the question, or say so beside the turn.
+status: open
+
+### DW-1216: The shell's heard-mark arms are untested and unmutated on Linux.
+
+origin: epic 97, story 97.3 review (rung `agents-97-pause`, 2026-10-11; `review-97pause-1.md` DW-D, R326)
+location: `src-tauri/crates/keeper/src/voice_ipc.rs` (`transition_locked`, `after_mark`, `hand`, `sentence_spoken`)
+reason: `transition_locked`'s `stopped` match (kept, dropped, sent), the wait of the next question and of a later mark on `Voice.sending_mark`, `hand` before the transition and `sentence_spoken`'s question check are in the shell crate, which does not compile on Linux; they are written by inspection and the rung's mutants cover core files only. Their proof is the device run's "stop" and "no, wait" steps. Revisit when the shell gains a test seam for `agent_heard_send` (a hook that returns the content instead of sending): pin the three arms and the wait with `CountingPort`.
+status: open
+
+### DW-1217: With the turn models a short word is decided by its duration before the recogniser spells it.
+
+origin: epic 97, story 97.3 review (rung `agents-97-pause`, 2026-10-11; `review-97pause-1.md` DW-E, R326)
+location: `src-tauri/crates/keeper-core/src/voice/backchannel.rs` (`at_speech_end`)
+reason: Apple's first partial trails the audio, so a 300 ms English "no" can end (`SpeechEnded`) before any `SpeechDetected("no")`; `at_speech_end` then resumes it as `backchannel_duration`, and the words pause the resumed answer again (DW-1211's symptom). The per-language list's "no" therefore holds for words heard before the speech end, or without the models. The device run's "no" (Polish) and "no, wait" (English) steps are the proof. Revisit if they resume an English "no".
+status: open
+
+### DW-1218: A sentence queued on an idle synthesiser while paused may sound for a few milliseconds.
+
+origin: epic 97, story 97.3 review (rung `agents-97-pause`, 2026-10-11; `review-97pause-1.md` R97P1-02, R326)
+location: `src-tauri/crates/keeper/src/voice_macos.rs`, `src-tauri/crates/keeper/src/voice_ios.rs` (`Worker::enqueue`)
+reason: When the queue had drained before the pause, `pauseSpeakingAtBoundary:` found nothing to pause; the next sentence is queued with `speakUtterance:` and paused again at once with `AVSpeechBoundaryImmediate`, so its first few milliseconds may play over the person. Written by inspection; not observed. Revisit if the device run hears it: hold the sentence in the port until `continue_speaking`.
+status: open
+
+### DW-1219: Two `voice_ipc` shell tests race for the process-wide turn.
+
+origin: epic 97, story 97.3 fix round 1 (rung `agents-97-pause`, 2026-10-11; `mac-97pause-fix1.log`)
+location: `src-tauri/crates/keeper/src/voice_ipc.rs` (`tests::the_button_the_tray_and_the_hotkey_each_stop_the_voice_once`, `tests::three_chunks_become_two_utterances_and_a_stop_leaves_the_second_unspoken`)
+reason: Both tests replace the one `voice()` state's turn and port and drive it, each taking the lock per call, and the test harness runs them on parallel threads; when the other test swaps the port between `speaking_on` and the press, the counting port sees no stop ("the tray item: how often the synthesiser is told to stop", left 0). Seen on hesperia in `mac-97pause-fix1.log` and before this rung in `mac-96screen-1.log` and `mac92r4-tests.log`; the pair passes single-threaded and three whole-lib reruns passed (`mac-97pause-fix1-rerun.log`). Revisit: hold one test-wide guard (a `static` mutex both tests take first) so the two run in turn.
+status: open
+
+### DW-1220: The room can draw a mark the host refused.
+
+origin: epic 97, story 97.3 (rung `agents-97-mark`, 2026-10-11; acceptance 9, codemap Q16)
+location: `src-tauri/crates/keeper-core/src/agents/room.rs` (`HeaderReader::mark`), `src-tauri/crates/keeper-core/src/agents/heard.rs` (`RoomMarks`, `split_utf16`)
+reason: The room draws the person's own sealed mark over the body it shows; the host logs a mark only from a device the person's identity signed, over the answer's prose, and refuses one past the prose (DW-1200), one of a parked turn's first message (DW-1201) or one from an unsigned device. In those cases the rule says where the person stopped although the agent was told nothing and its next turn reads the answer whole. Nothing in the room says what the host did with a mark. Revisit if the device run shows refusals in the host's log: have the host answer a mark (logged or refused) and draw only a logged one.
+also (review-97mark-1 R97M1-02 / R327, 2026-10-11): a mark the person redacts still draws its rule — `RoomMarks` only adds — as the host still cut the answer at it (R317 never unmarks); the two agree, but nothing in the room says the mark was taken back. Documented in `docs/agents.md` § *Where you stopped listening (the room)*.
+status: open
+
+### DW-1221: A mark past the shown body's cap draws nothing though the host cut the answer.
+
+origin: epic 97, story 97.3 (rung `agents-97-mark`, review-97mark-1 / R327, 2026-10-11)
+location: `src-tauri/crates/keeper-core/src/timeline.rs` (`heard_mark`, `truncate_body(…, MAX_TURN_BODY_CHARS)`), `src-tauri/crates/keeper-core/src/agents/heard.rs` (`Answers::mark`, `split_utf16`)
+reason: the room counts a mark's `sentence` over the body it shows, capped at `MAX_TURN_BODY_CHARS`; the host counts it over the whole answer. A mark whose sentence ends past the cap finds no such end in the shown body, so the room draws no rule while the host cut the replay there. Bounded by R42 (the host's own cut of an answer is below the cap), so only a malformed or oversized answer reaches it. Close by counting over the uncapped body and drawing the rule at the cap's end, or by refusing such a mark on the host, with a test of an answer longer than the cap.
+status: open
+
+### DW-1222: A window whose title changes on its own drifts every screen pin.
+
+origin: epic 96, story 96.4 (rung `agents-96-screen`, review-96tail-fix1 / R328, 2026-10-11; recorded at rung `agents-97-mark` by the coordinator to avoid re-cascading seven rungs for a ledger line)
+location: `src-tauri/crates/keeper-core/src/agents/screen.rs` (`named_holds`, `Windows::holding`)
+reason: a pin names its window by title; a window that retitles itself (a browser tab, Mail's compose window taking its subject) no longer holds at consume, so every approval drifts and is re-asked. Fails closed (a refusal, never a wrong action). Close by pinning by `window_id` from Peekaboo's `list … ids` once its output format is confirmed on hesperia, with a test of a retitled window.
+
+### DW-1223: Another session can evict this session's kept screen reads.
+
+origin: epic 96, story 96.4 (rung `agents-96-screen`, review-96tail-fix1 / R328, 2026-10-11; recorded at rung `agents-97-mark` by the coordinator)
+location: `src-tauri/crates/keeper-agent/src/mcp.rs` (`READS_KEPT_ALL`)
+reason: reads are kept per session but under one host-wide cap, so a busy session can evict another's reads; that session's next element action is refused for want of a read. Fails closed — a denial of service only, never misuse. Close with a per-session share of the cap, with a test of two sessions.
+
+### DW-1230: Rung 4's pusher must be built only through `Gateway::parse`.
+
+origin: epic 98, story 98.1 fix round 1 (rung `agents-98-push-setting`, 2026-10-11; `review-98pushsetting-1.md` DW-a, R331)
+location: `src-tauri/crates/keeper-core/src/agents/push.rs` (`Gateway::parse`), `src-tauri/crates/keeper-core/src/registry.rs` (`get_push_gateway_url`); rung 4 (`agents-98-apns`) `PusherSpec`
+reason: `get_push_gateway_url` returns the raw stored text, and a synced `settings.toml` can carry any text. The setter and the egress row read it through `Gateway::parse`; the pusher rung 4 registers must too, and register no pusher when it refuses — never hand the raw string to the homeserver. Rung 4 also adds the `egress_list` append (`cfg(not(desktop))`) and the `docs/egress.md` row that moved out of rung 1 (R330), and rewrites `PUSH_GATEWAY_NOTE` with `NO_BACKGROUND_SYNC_SENTENCE` and `docs/ios.md` (codemap Q16).
+status: done 2026-10-12
+resolution: rung `agents-98-apns` (R340): `push::PusherSpec::of_setting` takes the raw stored text and reads it only through `Gateway::parse` — blank, absent or refused is no pusher, and `push::register` then removes this phone's pusher instead (`push::tests::pusher_spec`: `http://`, a user name, a bare host and blank register nothing); the `cfg(not(desktop))` `egress_list` append and the `docs/egress.md` row are in; `PUSH_GATEWAY_NOTE`, `NO_BACKGROUND_SYNC_SENTENCE` and `docs/ios.md` are rewritten (R342).
+
+### DW-1231: One host-vs-port rule for every egress row.
+
+origin: epic 98, story 98.1 fix round 1 (rung `agents-98-push-setting`, 2026-10-11; `review-98pushsetting-1.md` R98PUSHSETTING1-04, DW-c)
+location: `src-tauri/crates/keeper-core/src/egress.rs` (`remote_host` and its callers), `src-tauri/crates/keeper-core/src/agents/mcp.rs` (`url_host`), `docs/egress.md`
+reason: The MCP and push gateway rows show `host:port` when the address names a port (`url_host`); the sync-remote and forge rows show the host only (`remote_host`), so `forge.example.org:8443` and `forge.example.org` read as one destination. `docs/egress.md` says "one entry per distinct host and port" for one table and "only the host" for others. Pick one rule and apply it to every row.
+status: open
+
+### DW-1232: `delectra-gate.sh … HEAD` cannot fetch its bundle.
+
+origin: epic 98, story 98.1 (rung `agents-98-push-setting`, 2026-10-11; `review-98pushsetting-1.md` DW-d)
+location: `/tmp/agents-salvage/delectra-gate.sh` (coordinator tooling, not the repo)
+reason: Given `HEAD`, the script's bundle carries no `refs/*`, so delectra fetches nothing and fails with `fatal: unable to read tree <sha>`; passing the branch name works. The script should bundle a named ref (or resolve `HEAD` to the branch) before it fetches.
+status: open
+
+### DW-1240: The free-team install may never see the App Group move.
+
+origin: epic 98, story 98.1 (rung `agents-98-group`, 2026-10-11; acceptance 6, codemap Q8)
+location: `src-tauri/crates/keeper/src/ipc.rs` (`IosPlatform::resolve`), `src-tauri/crates/keeper-core/src/container.rs`
+reason: The move runs when a build that carries the App Group starts over an install that kept its data in the app's own container. The owner's kalypso install is signed by a free Personal Team; the paid program issues a different team id, and iOS may refuse to install a build of the same bundle id signed by another team over it (and the keychain items carry the old team's application-identifier prefix) `[INFERENCE: not measured]`. If it does, the old install is deleted first and nothing is moved: accounts are signed in again and phone folders cloned again. The device run after enrolment decides; if the install goes over, "the existing install's accounts, messages and phone folder are intact" is the check that proves the move.
+status: open
+
+### DW-1241: A refused or failed container move is said only in the log.
+
+origin: epic 98, story 98.1 (rung `agents-98-group`, 2026-10-11; the plan's Q3 "failure leaves the old directory in use and says so")
+location: `src-tauri/crates/keeper/src/ipc.rs` (`IosPlatform::resolve`), `keeper_core::container::MoveRefusal`
+reason: `MoveRefusal`'s sentence names the folder keeper keeps using, and `IosPlatform::resolve` writes it to the log; no view model carries it, so a person whose move was refused sees push not working rather than why. A line in Settings › Notifications on the phone (beside the push gateway field) would say it; it needs a `MoveRefusal` kept on the platform and an IPC read, which belongs with rung 4's push disclosures. Extended by R335 (02): `MoveRefusal::Clash` is the first thing that disclosure must say, with the entry's name — a clash is a permanent refusal, not a retry (every start answers it again without moving anything), so until it reaches a view model the phone never gets push and nothing but the log says why. Resolving a clash automatically (the journal proves the destination's copy is keeper's own earlier state, the old directory's is newer) is a design decision for that disclosure, not for the move.
+status: open
+
+### DW-1242: The notification extension must create nothing under the group data directory before the move is marked.
+
+origin: epic 98, story 98.1 (rung `agents-98-group` fix round 1, 2026-10-11; R335, `review-98group-1.md` DW candidate 3) — a contract for rung 3 (`agents-98-nse`)
+location: rung 3's `KeeperNotify` (Swift NSE and any Rust it links), `keeper_core::container` (`DestinationNotEmpty`)
+reason: The app's move refuses a destination that holds anything without its journal — before anything is moved or marked, a fresh install included (R332). `<group container>/Library/Application Support/dev.tgorka.keeper` is the app's data directory only once `.keeper-moved` is in it; if `KeeperNotify` creates a file there first — a log, a crash file, a store opened "to see" — the app's first move becomes `DestinationNotEmpty` on every start, for good. The NSE checks for `.keeper-moved` and, without it, opens nothing and writes nothing under that directory (its own logs go elsewhere, e.g. the extension's own container). Close when rung 3 lands with that check and a test or an inspection note naming it.
+status: done 2026-10-11
+resolution: rung `agents-98-nse` (R337): the extension touches the group's data directory only through `keeper_nse::store_of`, which reads `.keeper-moved`, the account's `sdk` directory and the registry row (`registry::homeserver_of_existing`, read-only) and creates nothing; any miss is the gateway's notification. Tests `keeper_nse::tests::nothing_is_touched_before_the_move_finished` (no data directory; a move under way with its journal — the tree unchanged) and `the_store_is_the_moved_accounts_own` (no `keeper.db` created; a row whose store did not move is not opened); mutants N01–N04 killed. The Swift writes nothing there.
+
+### DW-1250: The notification extension never refreshes a token, so an expired one shows the gateway's notification.
+
+origin: epic 98, story 98.1 (rung `agents-98-nse`, 2026-10-11; codemap §0 item 8, Q7 (a))
+location: `src-tauri/crates/keeper-nse/src/lib.rs` (`decide`: no `handle_refresh_tokens`), `src-tauri/crates/keeper-core/src/account.rs` (`activate`)
+reason: An OAuth refresh token is used once; a refresh in the extension would leave the app holding a spent one, so the extension's client is built without `handle_refresh_tokens()` and a 401 is a generic notification. The codemap's Q7 (a) also names `OAuth::enable_cross_process_refresh_lock` in app and extension; doing it right needs the SDK's session callbacks (reload the rotated session from the keychain in each process) in `account::activate` on every target, which this rung does not touch. How often an approval push arrives while the access token is expired is a device measurement (98.1 #12); if it shows, enable the lock in both processes with the callbacks.
+status: open
+
+### DW-1251: An answer's notification waits the whole budget, and the proxy-room check may page back history inside the extension.
+
+origin: epic 98, story 98.1 (rung `agents-98-nse`, 2026-10-11; acceptance 2, 12)
+location: `src-tauri/crates/keeper-nse/src/lib.rs` (`newest_words`, `decide`), `keeper_core::account::proxy_answer_agent`
+reason: The extension asks for the anchor's edits every 1.5 s until `push::ANSWER_BUDGET` (6 s) has passed, even when the final edit came in the first poll (an answer's end is its status going `idle`, which it does not read); and `proxy_answer_agent` reuses the dock's admission (`proxy_row` → `HeaderReader::open`), which pages back up to four pages of fifty events when the store holds no status for the room. Both are correct and both cost time and memory under the 24 MB ceiling that only the device run measures (98.1 #12: peak memory over twenty notifications, p95 latency). If either shows, stop at the status's `idle` and give the extension a status-only header read.
+status: open
+
+### DW-1252: A homeserver without simplified sliding sync makes every push the gateway's notification.
+
+origin: epic 98, story 98.1 (rung `agents-98-nse` fix round 1, 2026-10-12; `review-98nse-1.md`, R339)
+location: `src-tauri/crates/keeper-nse/src/lib.rs` (`decide`: `NotificationClient::get_notification`)
+reason: matrix-sdk-ui 0.18's `get_notification` falls back to `/context` only on `EventNotFound`; when the sliding-sync request itself fails (a server without simplified sliding sync) the error propagates and `decide` answers generic. Synapse serves it (the live test ran there); tuwunel's support is unverified (epic Q5). A fix tries `get_notification_with_context` once before answering generic. Trigger: a push on kalypso against a tuwunel homeserver (or any without sliding sync) showing the gateway's text.
+status: open
+
+### DW-1253: The extension builds a new client for every notification instead of keeping one per account.
+
+origin: epic 98, story 98.1 (rung `agents-98-nse` fix round 1, 2026-10-12; `review-98nse-1.md`, R339)
+location: `src-tauri/crates/keeper-nse/src/lib.rs` (`handle_json`, `decide`)
+reason: R339 serialises notifications (one Swift serial queue, one Rust `Mutex`), so one client lives at a time; each still opens the SQLite state and crypto stores, builds an OlmMachine and a sliding sync, and drops them. Element X keeps one process-wide client per account and a live runtime across notifications. Worth it only if the device numbers say so. Trigger: 98.1 #12's memory row (peak over twenty notifications near 24 MB) or the latency row (p95) on kalypso.
+status: open
+
+### DW-1254: The KeeperNotify pre-build compiles keeper-nse for a newer iOS than the extension links.
+
+origin: epic 98, story 98.1 (rung `agents-98-nse` fix round 1, 2026-10-12; `review-98nse-1.md`, R339)
+location: `src-tauri/crates/keeper/gen/apple/project.yml` (`KeeperNotify` pre-build script)
+reason: On hesperia ld warned the object was "built for newer iOS (27.0) than being linked (16.0)" (`mac-98nse.log`): the cargo step runs without `IPHONEOS_DEPLOYMENT_TARGET`, so rustc targets the SDK's version. Export the target's `$IPHONEOS_DEPLOYMENT_TARGET` to cargo in the pre-build step. Trigger: the paid-team `install:ios` on hesperia, or a launch failure of the extension on an iOS older than the SDK.
+status: open
+
+### DW-1255: The extension reads the pushed event and its anchor again after the notification client already fetched them.
+
+origin: epic 98, story 98.1 (rung `agents-98-nse` fix round 1, 2026-10-12; `review-98nse-1.md`, R339)
+location: `src-tauri/crates/keeper-nse/src/lib.rs` (`decide`: `room.event` for the event and for the replaced anchor)
+reason: `NotificationItem` carries no `EncryptionInfo`, so `decide` re-reads the event (and, for an edit, its anchor) to learn who sealed it: up to two more round trips inside the extension's budget. Trigger: 98.1 #12's latency row on kalypso.
+status: open
+
+### DW-1256: The notification extension has no log sink: a generic notification's reason goes nowhere on the phone.
+
+origin: epic 98, story 98.1 (rung `agents-98-nse` fix round 1, 2026-10-12; `review-98nse-1.md`, R339)
+location: `src-tauri/crates/keeper-nse/src/lib.rs` (`handle_json` warns `Generic.why` through `tracing`), `gen/apple/KeeperNotify/NotificationService.swift`
+reason: R339 (08) keeps `tracing` and warns every generic answer's `why`, but the extension installs no subscriber, so on kalypso the reason is lost. A subscriber writing to os_log (a dependency that passes `check:nse-lean` and the licence firewall) would make it readable in Console. Trigger: the first generic notification on kalypso whose cause is not obvious.
+status: open
+
+### DW-1257: The free-team drop of KeeperNotify and the `$(AppIdentifierPrefix)` keychain group have not been run.
+
+origin: epic 98, story 98.1 (rung `agents-98-nse` fix round 1, 2026-10-12; `review-98nse-1.md`, R339)
+location: `scripts/install-ios.sh` (`KEEPER_IOS_FREE_TEAM` yq drop), `gen/apple/KeeperNotify/Info.plist` (`KeeperKeychainGroup`)
+reason: Both are written by inspection and `bash -n`: the yq removal of the target and the app's dependency mirrors the island's proven shape, and the keychain group relies on Xcode expanding `$(AppIdentifierPrefix)` in Info.plist; neither has run in an install. Trigger: `install:ios` on hesperia with `KEEPER_IOS_FREE_TEAM=1`, and the paid-team install.
+status: open
+
+### DW-1260: An account gets its pusher only when keeper registers again.
+
+origin: epic 98, story 98.1 (rung `agents-98-apns`, 2026-10-12; R340)
+location: `src-tauri/crates/keeper/src/push_ios.rs` (`register_soon`), `keeper_core::agents::push::register`
+reason: The pusher is set on an account only while it holds an agent session room, and registration runs after setup when the token arrives and when the gateway is saved. An account that joins its first agent room while keeper runs, a gateway changed on another device and synced in through `settings.toml`, and a token APNs rotates mid-run are registered at the next launch, not at once; a rotated token's old pusher stays on the homeserver until the gateway reports it rejected. If the device run (98.1 #12) shows a missed first approval, register again when an agent room appears (the agents window's stream already sees it).
+status: open
+
+### DW-1261: Why push is not working is said only in the log.
+
+origin: epic 98, story 98.1 (rung `agents-98-apns`, 2026-10-12; extends DW-1241)
+location: `src-tauri/crates/keeper/src/push_ios.rs` (`token_refused`, `register_soon`), `src/components/settings/push-gateway-field.tsx`
+reason: iOS refusing a token (a free Personal Team's build has no `aps-environment`), a profile that grants no push, a pusher the homeserver refused and a refused App Group move (DW-1241) each leave the field showing a valid gateway and nothing arriving; only the log says why. A status line under the field, composed in Rust from the last token outcome, the registration outcomes and the move's refusal, would say it. Not built here: the disclosures already say push needs a paid-team build, and the owner installs free-team builds until enrolment.
+status: open
+
+### DW-1262: A decision from the lock screen is not measured, and its background account keeps syncing.
+
+origin: epic 98, story 98.1 (rung `agents-98-apns`, 2026-10-12; R341, codemap §5)
+location: `keeper_core::account::AccountManager::agent_approval_decide_notified`, `push::ACTION_BUDGET`, `KeeperPush.swift`
+reason: An action that launches keeper in the background activates its one account (its `SyncService` included) and retries for up to 20 s while the request syncs in; how long that takes, whether iOS grants the time, and whether the webview-less process behaves are device measurements (98.1 #12). The account stays active until iOS suspends the process; nothing stops its sync when the action is done. If the time shows short, fetch the request event by id instead of waiting for the sync; if the lingering sync shows in battery, shut the account down after a background-only action.
+status: open
+
+### DW-1263: A lock-screen action that launches keeper in the background writes no log file.
+
+origin: epic 98, story 98.1 (rung `agents-98-apns` fix round 1, 2026-10-12; `review-98apns-1.md`, R343; extends DW-1261)
+location: `src-tauri/crates/keeper/src/push_ios.rs` (`act`, `token_refused`), `src-tauri/crates/keeper/src/lib.rs` (`setup()`, `debug_log::init`)
+reason: Under the scene lifecycle an action that launches keeper in the background runs no `setup()` (R341), and `debug_log::init` runs only there, so `act`'s warnings — why a decision was not sent, an action on a notification keeper did not compose — and `token_refused` reach no file on the device. The measurement DW-1262 owes therefore has no log. Fix when the device run needs it: initialise the log in `push_ios::install`, before UIKit starts, when `setup()` has not run.
+status: open
+
+### DW-1264: The notification plugin could take the delegate back after keeper's install.
+
+origin: epic 98, story 98.1 (rung `agents-98-apns` fix round 1, 2026-10-12; `review-98apns-1.md`, R343)
+location: `src-tauri/crates/keeper/gen/apple/Sources/keeper/KeeperPush.swift` (`install`), `push_ios::set_up`
+reason: `KeeperPush.install` captures the plugin's delegate once and becomes `UNUserNotificationCenter`'s delegate; `set_up()` installs again, so a plugin that re-set itself before then is wrapped again, but one that does so later — its `requestPermission` path was not read — would leave keeper's actions and taps unhandled until the next launch. Device check (98.1 #12): after the permission prompt, an action and a tap still reach keeper. If not, install again after the plugin's permission call returns.
+status: open
+
+### DW-1265: R341's two inferences about iOS are owed to the device run.
+
+origin: epic 98, story 98.1 (rung `agents-98-apns` fix round 1, 2026-10-12; `review-98apns-1.md`, R341)
+location: `src-tauri/crates/keeper/src/push_ios.rs` (`install`), `tools/tao/src/platform_impl/ios/app_state.rs` (`did_finish_launching`)
+reason: Two facts are read from documentation and source, not observed: that iOS honours a `UNUserNotificationCenter` delegate set before `UIApplicationMain` for a response that launches the app, and that tao 0.35.3 on iOS 27 emits no `StartCause::Init` for an action's background launch under the scene lifecycle (so `setup()` does not run). Trigger: the kalypso run (98.1 #12) — an action from a killed keeper is decided, and the log (DW-1263) shows no `setup()`.
+status: open
+
+### DW-1266: A push shows as it arrived when the extension ends before it answers.
+
+origin: epic 98, story 98.1 (rung `agents-98-apns` fix round 1, 2026-10-12; `review-98apns-1.md` R98APNS1-01, R343)
+location: `src-tauri/crates/keeper/gen/apple/KeeperNotify/NotificationService.swift`, `keeper_core::agents::push::SHOWN_INFO`
+reason: The extension strips every keeper key and the category from what the gateway sent on every path it completes, and only its `show` sets `keeper_shown`. If iOS ends the extension before it calls its handler at all (killed over its memory ceiling, a crash), iOS shows the push as it arrived — the homeserver's words, its category's actions, any `keeper_shown` it planted. The decision path still refuses any record not in the session room with that digest, so nothing but a real request with its real digest is decided, but the words may not be keeper's. Closing it needs a mark the gateway cannot forge — e.g. a per-install secret in the shared keychain the extension seals the shown record with and the app checks — or the record the extension showed written to the App Group and checked by the app. Measure first whether the extension is ever killed (98.1 #12, the 24 MB row).
+status: open
+
+### DW-1270: The phone's session tree says "do it in Finder".
+
+origin: epic 98, story 98.2 (rung `agents-98-phone-sessions`, 2026-10-12; R345)
+location: `crates/keeper/src/sessions_ipc.rs` `SESSION_TREE_DIR_UNDELETABLE`, read by `sessions_tree` on every target now
+reason: A folder row's refusal tells a person to remove the folder in Finder. On the phone the tree is read-only and Finder is not there; the sentence is true about keeper and wrong about where to go. Word it per platform (a `Platform` fact, never a sniff) when the phone's board shows the tree.
+status: open
+
+### DW-1271: Where a card runs may be unknown on the phone.
+
+origin: epic 98, story 98.2 (rung `agents-98-phone-sessions`, 2026-10-12; codemap §5)
+location: `keeper_agent::sessions::board::detail` (`Index::refresh_session` over the session's log chunks), `SyncProfile::make_fully_virtual`
+reason: `running_on` and `waiting` come from the session's log chunks. A phone folder is fully virtual; if the drive's LFS rules make chunk files pointers, the phone's index reads no claim and a running card shows no host (98.2's checklist: "running on electra"). Not checked against tgdrive's `.gitattributes`. If it shows, exclude the log chunks from the virtual patterns of a sessions zone on the phone.
+status: open
+
+### DW-1272: `check:agent-phone` runs only by hand.
+
+origin: epic 98, story 98.2 (rung `agents-98-phone-sessions`, 2026-10-12; R344)
+location: `package.json` `check:agent-phone`, `keeper-agent/build.rs`
+reason: The phone's half of `keeper-agent` is gated by CI's iOS compile job (the real target); the Linux seam that checks the same `cfg(phone)` half is not in `bun run check` or CI, because it recompiles `keeper-agent`. If an iOS break in `keeper-agent` reaches CI twice, add it to the Rust job.
+status: open
+
+### DW-1273: A phone move that meets a remote commit after its pull is stuck until the folder is removed.
+
+origin: epic 98, story 98.2 (rung `agents-98-phone-sessions` fix round 1, 2026-10-12; R346, review-98phonesessions-1 R98PS-01 follow-on)
+location: `keeper_sync::Engine::phone_write` / `apply_in_process` (`SyncError::Diverged` on a phone), `crates/keeper/src/sessions_ipc.rs` `move_and_publish`; the phone has no reset verb (`src/components/settings/about-section.tsx` only names the choice)
+reason: The move now pulls first, so a divergence needs a remote commit inside the seconds between that pull and the push — or a move made offline or in a paused folder while agents kept working. When it happens the phone holds one commit the remote lacks, every later pass refuses with the divergence sentence, and the only way out is removing and re-adding the folder, which drops the move. Two honest convergences, neither built: replay — drop the one local commit, fast-forward, re-plan the move over the new bytes (`compile_move`; its guarded writes refuse if the card itself changed) and push again; or a phone reset verb that resets to the remote and lists the person's unpushed card moves to redo.
+status: open
+
+### DW-1280: A room opened over a phone surface says "Back to Inbox".
+
+origin: epic 98, story 98.2 (rung `agents-98-phone-board`, 2026-10-12; R347)
+location: `src/components/layout/phone-header.tsx` (`PhoneHeader`'s Room-level back title), `src/components/layout/phone-shell.tsx` (`surfaceTitle` is passed for the Sessions surface only)
+reason: A selected room outranks every view level, and popping it clears the selection, so the stack lands on whatever view surface was showing beneath it — Notes, Files, Sync, Bots — not on the Inbox. The Room level's back button nevertheless reads "Back to Inbox" everywhere but over the sessions board (a room reaches the phone over a surface by a notification tap or a search hit while one is open). Take it as one title per `PhoneSurface` beside `phoneSurfaceFor`, passed as `surfaceTitle` whenever `surface !== null`, with a stack test that pops a room over each.
+status: open
+
+### DW-1281: The phone board's "not on your Mac yet" outlives the push it describes.
+
+origin: epic 98, story 98.2 (rung `agents-98-phone-board` fix round 1, 2026-10-12; R348, review-98phoneboard-1 R98PB1-02)
+location: `src/components/sessions/sessions-phone-pane.tsx` (`SessionsPhoneBoard.move` sets `notice = SessionTaskMoveVm.unpushed`; a `keeper://sessions-changed` re-read never touches it), `src/components/sessions/session-board.tsx` (the desktop `TaskBoard` has the same shape)
+reason: `unpushed` is a one-shot answer of the move. R346 re-arms the push every 30 s while keeper is in front, so the retry often lands and the board keeps saying the card is not on the Mac until the next move. Clearing the sentence on the changed event would be dishonest the other way (a pass that failed to push rescans too). The honest fix is Rust's: a pending-push fact for the zone's folder in a VM (`SessionDetailVm` or the folder's sync row), rendered while it is true.
+status: open
+
+### DW-1282: The phone's search surface offers New Session, Log Today and Tasks, which do nothing there.
+
+origin: epic 98, story 98.2 (rung `agents-98-phone-board` fix round 1, 2026-10-12; R348, review-98phoneboard-1 DW candidate B, pre-existing)
+location: `src-tauri/crates/keeper-core/src/palette.rs` (`registry_sections` gates the Sessions and Tasks categories on `notes`), `src-tauri/crates/keeper/src/ipc.rs` (passes `notes_available(&state)`), `src/components/layout/phone-search-surface.tsx`, `src/lib/palette/actions.ts` (`sessions-new`, `sessions-log-today`, `tasks-view`)
+reason: Since Story 66.4 `notes` is `sync` on every tier, so a phone's search surface ("every registered action is reachable") lists *New Session* (now lands on the phone's Sessions list and bumps a create nonce nothing on the phone consumes), *Log Today in Session* (calls the `unsupported` twin; the rejection is swallowed by `dispatchPaletteAction`) and *Tasks* (`setView("tasks")`, no phone surface). No write escapes — the Rust twins hold — but each is a dead affordance (AD-27). Gate the three on a desktop fact in `registry_sections`, or filter them in the front by `phoneRoutesView`/tier as `open-search` does.
+status: open
+
+### DW-1283: A `focus()` can scroll the phone stack's clipping root; why only the board showed it is not established.
+
+origin: epic 98, story 98.2 (rung `agents-98-phone-board` fix round 1, 2026-10-12; R348, review-98phoneboard-1 R98PB1-04, DW candidate C)
+location: `src/components/layout/phone-shell.tsx` (the level focus effect; `StackLevel`'s `absolute inset-0` levels inside an `overflow-hidden` root)
+reason: Rung 6 measured a push focus scrolling the root 238 px on the sessions board (not on the Bots conversation level) and fixed it with `preventScroll` on push; fix round 1 added it to both pop focuses. Any other in-level `focus()` that lands on a node outside the root's box can still scroll it, and a pop can still put focus on a node in a level that is leaving (a card's room pops 2 → 1 and restores focus to the sessions row on the exiting surface level). Root cause: find why the board's level was scrollable into, then either make the root unscrollable (`overflow: clip`) or restore focus only to the active level.
+status: open
+
+### DW-1284: When two accounts on the phone are in an agent's room, the board opens it on the more recent one.
+
+origin: epic 98, story 98.2 (rung `agents-98-phone-board` fix round 1, 2026-10-12; R348, review-98phoneboard-1 DW candidate D)
+location: `src/components/sessions/sessions-phone-pane.tsx` (`sessionRoomOnThisPhone`: first Agents window row, Rust's recency order)
+reason: The person's account and a proxy or harness account can both hold a session's room. The room then opens on whichever streamed most recently, which may be an account 93.3's approval card does not let decide. Prefer an account the approval record names (or the person's own), else the first.
+status: open
+
+### DW-1290: The resolved-classpath scan allows whole Maven groups, and their licences are asserted by hand.
+
+origin: epic 98, story 98.3 #6 (rung `agents-98-android`, 2026-10-12; R349; narrowed by R351, fix round 1)
+location: `src-tauri/crates/keeper-core/tests/android_gradle_licences.rs` (`the_resolved_android_classpath_is_licensed`, `covers`), `docs/android.md` § What Gradle resolves, `.github/workflows/ci.yml` `android`
+reason: Since R351 CI's `android` job scans every `group:artifact` Gradle resolves for the APK, transitive ones included, against an allow-list of groups. What remains: a row covers a whole group (`androidx.*` every AndroidX group), so a new artifact in a listed group passes unread, and each row's licence is what the list says, not what the artifact's POM declares. Close it, if a group ever mixes licences, with per-artifact rows or the `com.github.jk1.dependency-license-report` plugin reading the POMs' `<licenses>` in the same job.
+status: open
+
+### DW-1291: The Android build is checked, not linted.
+
+origin: epic 98, story 98.3 #1 (rung `agents-98-android`, 2026-10-12; R349)
+location: `.github/workflows/ci.yml` `android` (`cargo check`, no clippy), `crates/keeper/src/{ipc,notes_vault,sync,sync_ipc,sessions_root,build_identity}.rs`
+reason: `cargo check --target aarch64-linux-android` passes with 37 warnings, all dead code or unused imports in items only the desktop calls (quit finalisers, the tray, the supervisor) that a `not(desktop)` build compiles and never uses — the same set the iOS compile job leaves unlinted. A `clippy -D warnings` for either phone target fails until those items are gated `#[cfg(desktop)]`; one change for both targets, then add clippy to the `ios` and `android` jobs.
+status: open
+
+### DW-1292: A refused secret file has no way back inside keeper.
+
+origin: epic 98, story 98.3 #2 (rung `agents-98-android`, 2026-10-12; R349)
+location: `keeper_core::secret_file` (`SecretFile::{get,set}` refuse a file that fails its tag or names another version), `gen/android/.../KeystorePlugin.kt` (a wrapped key that no longer unwraps is refused)
+reason: A tampered `secrets.bin`, a Keystore that lost keeper's wrapping key, or a file from a newer keeper is refused by reads and writes alike, so every account asks for a sign-in it cannot store. The way out is Android's *Clear storage* for keeper, which also drops the accounts' stores and the phone's folders. An in-app "forget this device's secrets" that removes only `secrets.bin` and the wrapped key (and says what it costs) would keep the folders; it is a person's choice, so it needs a surface, which is the tablet rung's or later.
+status: open
+
+### DW-1293: The Android CI job caches no Gradle state.
+
+origin: epic 98, story 98.3 #1 (rung `agents-98-android` fix round 1, 2026-10-12; R351, review-98android-1 DW candidate)
+location: `.github/workflows/ci.yml` `android`
+reason: Nothing caches `~/.gradle` or the wrapper, so every run downloads Gradle 8.14.3, AGP 8.11 and AndroidX before building, and again for the resolved-classpath report. `gradle/actions/setup-gradle` (read-only cache on pull requests) is the standard fix. Time, not correctness.
+status: open
+
+### DW-1294: Android's sign-in callback is a custom scheme any app may claim.
+
+origin: epic 98, story 98.3 (rung `agents-98-android` fix round 1, 2026-10-12; R351, review-98android-1 DW candidate) — for rung 8 (`agents-98-tablet`, Auth Tab)
+location: `src-tauri/crates/keeper/gen/android/app/src/main/AndroidManifest.xml` (deep-link block), `src-tauri/crates/keeper/tauri.conf.json` (`deep-link.mobile`, `appLink: false`)
+reason: `dev.tgorka.keeper:/oauth/callback` and `keeper://` are plain custom schemes, so another app can register the same intent filter and receive the authorization code. PKCE and the state registry make an intercepted code useless, as on desktop, but rung 8's Auth Tab is the moment to decide whether the Matrix and org sign-in return through an App Link (`https` plus `assetlinks.json`) instead.
+resolution: decided in rung 8 (`agents-98-tablet`, R354): both sign-ins open in an Auth Tab, which returns the callback as the activity's result, so no other app can claim it there; the App Link is refused for now (a per-signer `assetlinks.json`, MSC2966's refusal of `https` for native clients, every IdP's registration). What stays claimable — the Custom Tab fallback in a browser without Auth Tab, and the deep link itself — is DW-1300.
+status: resolved (remainder → DW-1300)
+
+### DW-1295: The secret file's data key sits unzeroised in the JVM heap and in `KeystoreKey`.
+
+origin: epic 98, story 98.3 #2 (rung `agents-98-android` fix round 1, 2026-10-12; R351, review-98android-1 DW candidate)
+location: `src-tauri/crates/keeper/gen/android/app/src/main/java/dev/tgorka/keeper/KeystorePlugin.kt` (the key crosses as a hex `String`), `src-tauri/crates/keeper/src/android.rs` (`KeystoreKey.held`)
+reason: The unwrapped data key crosses Tauri's JSON plugin IPC as a hex string the JVM may keep until collection, and the Rust side holds it for the process's life without zeroising it on drop. Tauri's plugin IPC offers no cheaper path; whoever hardens the store should zeroise `held` (and the decoded buffers) and keep the key's JVM lifetime as short as the API allows.
+status: open
+
+### DW-1296: `rust-toolchain.toml` does not list the Android target.
+
+origin: epic 98, story 98.3 (rung `agents-98-android` fix round 1, 2026-10-12; R351, review-98android-1 DW candidate)
+location: `rust-toolchain.toml` (`targets`: the two iOS targets), `docs/android.md` § Prerequisites
+reason: The Mac (or any builder) must `rustup target add aarch64-linux-android` by hand; listing it in `targets` makes `bun run android:build` self-provisioning once the SDK and NDK exist. It also makes every rustup install of the toolchain download the Android standard library, which is why it was left to a decision.
+status: open
+
+### DW-1300: Android sign-in has no verified `https` App Link, so its Custom Tab fallback's callback is claimable.
+
+origin: epic 98, story 98.3 (rung `agents-98-tablet`, 2026-10-12; review of rung `agents-98-android`: "a custom-scheme OAuth callback is claimable by any app")
+location: `src-tauri/crates/keeper/gen/android/app/src/main/java/dev/tgorka/keeper/AuthTabPlugin.kt` (redirect by scheme), `keeper_core::oauth::REDIRECT_URI` (`dev.tgorka.keeper:/oauth/callback`, registered as `ApplicationType::Native`), the manifest's deep-link block
+reason: With an Auth Tab the browser hands the callback back as the activity's result, so nothing else can claim it; a browser without Auth Tab gets a Custom Tab whose callback returns as a `keeper://`/`dev.tgorka.keeper:` intent any app may also declare (PKCE keeps the stolen code useless without keeper's verifier). Auth Tab's `https` redirect with Digital Asset Links would close that too, but it needs (1) `https://keeper.tgorka.dev/.well-known/assetlinks.json` listing the SHA-256 of every signer's own key — each sideloaded build is signed by its owner, so this is an operator service per signer, outside a client-only repo (D-1); (2) Matrix homeservers to accept an `https` redirect from keeper's client registration, which MSC2966 refuses for `application_type: native` (Tuwunel and MAS validate it; keeper would have to register as a `web` client on every platform); (3) every organisation's identity provider to register the new address. Revisit when a homeserver keeper targets admits a claimed-`https` native redirect, or when the owner publishes `assetlinks.json` for his key.
+status: open
+
+### DW-1301: keeper cannot close an Android Auth Tab whose sign-in already ended.
+
+origin: epic 98, story 98.3 (rung `agents-98-tablet`, 2026-10-12)
+location: `src-tauri/crates/keeper/src/web_auth.rs` (`close`, `cancel_all` are no-ops on Android)
+reason: On iOS `web_auth_apple::cancel` dismisses the sheet when its flow times out or a sibling sign-in cancels it. androidx.browser has no call that finishes an Auth Tab from the launching app, so on Android the flow ends and the tab stays until the person closes it (its later result reaches a registry that no longer waits and is ignored). Bringing keeper's activity to the front with `FLAG_ACTIVITY_CLEAR_TOP` would cover it; that needs a device to see what the browser does with the tab behind it — the tablet device run.
+status: open
+
+### DW-1302: Before `platform_facts` answers, the front spells keeper's URLs the Apple way.
+
+origin: epic 98, story 98.3 #3 (rung `agents-98-tablet`, 2026-10-12)
+location: `src/lib/stores/platform.ts` (default `urlForm: "scheme"`), `src/lib/media-src.ts`
+reason: The front composes `keeper-file`/`keeper-note`/`keeper-recording` URLs synchronously from the platform store, which `App` fills at boot beside the capabilities. On Android a URL composed in the frames before that answer would be the `scheme` spelling, which the WebView cannot load; a component that composed one keeps it until it re-renders. No surface that composes such a URL is reachable before the shell mounts (the shell waits on `session_restore`, which is later than the answer), so this is a window nobody has observed; closing it outright means gating those surfaces on the answer, or injecting the fact into the page before the bundle runs. Measure on the tablet device run.
+status: resolved (rung `agents-98-tablet`, fix round 1, R355) — the shell's `ipc::platform_plugin` initialization script writes `PlatformVm` into the webview as `window.__KEEPER_PLATFORM__` before the bundle runs and `platformStore` starts from it, so no URL is ever composed before the fact; the `platform_facts` command and its boot hydration are gone.
+
+### DW-1303: A PDF in Files or in a note shows nothing on Android.
+
+origin: epic 98, story 98.3 (review R98TAB DW candidate, rung `agents-98-tablet` fix round 1, 2026-10-12)
+location: `src/components/viewers/document-viewer.tsx` (`<embed type="application/pdf">`), `src/components/notes/editor/media-element.ts` (the note's PDF embed)
+reason: Both draw a PDF with `<embed type="application/pdf">`, which Android's WebView has no plugin for, so the pane is blank there (inferred from the WebView's documented lack of a PDF plugin; not observed on a device). Either refuse it on Android the way `servable` refuses other kinds, with an "Open in…" action, or decide on a renderer that runs in the page. Confirm on the tablet device run first.
+status: open
+
+### DW-1304: Android sign-in does not look for another browser with Auth Tab when the Custom Tabs pick lacks it.
+
+origin: epic 98, story 98.3 (review R98TAB-03 (b), rung `agents-98-tablet` fix round 1, 2026-10-12)
+location: `src-tauri/crates/keeper/gen/android/app/src/main/java/dev/tgorka/keeper/AuthTabPlugin.kt` (`authTabBrowser`)
+reason: `AuthTabPlugin` requests an Auth Tab only from the browser Android's Custom Tabs pick (`CustomTabsClient.getPackageName`, the default browser when it serves Custom Tabs), and only when that browser supports Auth Tab. When it does not but another installed browser does, the sign-in falls back to the claimable deep link (DW-1300) though an unclaimable one was on the device. Preferring an installed Auth-Tab browser means choosing among the person's browsers on their behalf — which one, and whether to say so — so it waits for that decision; the `<queries>` it needs are already in the manifest.
+status: open
+
+### DW-1310: Android push is read only while keeper's process runs, and whether it still answers after its activity is gone is unmeasured.
+
+origin: epic 98, story 98.4 (rung `agents-98-unifiedpush`, 2026-10-12; R357)
+location: `src-tauri/crates/keeper/gen/android/app/src/main/java/dev/tgorka/keeper/PushBridge.kt`, `PushReceiver.kt`, `src-tauri/crates/keeper/src/push_android.rs`
+reason: keeper's Rust half (accounts, keys, the reader) starts with `MainActivity`; the distributor's broadcast to a stopped keeper starts only the receiver, which posts the one generic notification. keeper runs no foreground service (AD-414, Tauri #15671), so after Android stops it the person sees "Open keeper to see what arrived." for any push of an account holding agent rooms, never the request itself. Whether the Rust half still answers the event channel while the process lives on after its activity was destroyed (back pressed) is not known; if it does not, the bridge needs to treat a destroyed activity as "not running". A headless start of the Rust half for a push would close both; measure on the tablet device run first.
+status: open
+
+### DW-1311: Android registers its pusher only when the distributor hands an endpoint.
+
+origin: epic 98, story 98.4 (rung `agents-98-unifiedpush`, 2026-10-12)
+location: `src-tauri/crates/keeper/src/push_android.rs` (`new_endpoint`, `start`)
+reason: As on the iPhone (DW-1260): registration runs when the distributor answers `registerApp` at start. An account signed in later, an account's first agent room, or a gateway that comes up after a refused discovery waits for keeper's next start. A re-registration on sign-in and on joining a session room would close it.
+status: open
+
+### DW-1312: keeper offers no way to switch to another UnifiedPush distributor while the confirmed one stays installed.
+
+origin: epic 98, story 98.4 (rung `agents-98-unifiedpush`, 2026-10-12; R356; narrowed by fix round 1, R359)
+location: `keeper_core::agents::unifiedpush::choose_distributor`, Settings → Notifications (`PhonePush`)
+reason: Narrowed in fix round 1: keeper now registers only with a distributor the person confirmed on this device, and Settings offers every installed one — the only one, or several — by name and package, so the "several, no picker" case is closed. What is left: once one is confirmed, keeper uses it while it stays installed and Settings offers no other; switching means uninstalling it (keeper then asks again). A "Use another distributor" control that returns to the question (and removes the pusher of the endpoint it leaves) would close it.
+status: open (narrowed)
+
+### DW-1313: Android push has not been built into an APK or run.
+
+origin: epic 98, story 98.4 #9 (rung `agents-98-unifiedpush`, 2026-10-12)
+location: `gen/android/app/src/main/java/dev/tgorka/keeper/{UnifiedPushPlugin,PushBridge,PushReceiver,PushActionReceiver}.kt`, `app/build.gradle.kts`, `AndroidManifest.xml`, `docs/android.md` § What Gradle resolves
+reason: In a scratch copy of `gen/android` (the five Tauri Android libraries beside it, wry's and Tauri's generated Kotlin written from their templates) Gradle compiled the app's Kotlin (`compileUniversalDebugKotlin`) and resolved both runtime classpaths (`the_resolved_android_classpath_is_licensed` passed). That run found the base's Kotlin 1.9.25 unable to read the `kotlin-stdlib` 2.1.20 that androidx.browser 1.10.0 brings — every Kotlin file of the app failed — fixed by Kotlin Gradle plugin 2.1.20 (carried by rung `agents-98-tablet`, R354 amended). The merged release manifest was not kept (its artefact is empty), so the receivers and the connector's `<queries>` in it are read from the sources and the connector's AAR, not observed. Fix round 1's Kotlin (the distributors' names, the intents' data URIs, the status-bar icon) is checked by inspection only. Nothing linked `libkeeper_lib.so`, packaged, shrank (R8) or ran an APK: CI's `android` job is the first build and its first green run is owed; the device run is 98.4 #10.
+status: open
+
+### DW-1314: A tap's `user_info` reaches keeper through its exported activity, where another app could forge one.
+
+origin: epic 98, story 98.4 (rung `agents-98-unifiedpush`, 2026-10-12; R357)
+location: `PushNotifier.openIntent` (`PushBridge.kt`), `UnifiedPushPlugin.opened`
+reason: The notification's tap opens `MainActivity` (exported: it is the launcher) with the notification's `user_info` as an extra; any app can start that activity with an extra carrying `keeper_shown`, an account and a room, and keeper would open that room. It decides nothing (actions go only to the unexported `PushActionReceiver`, and an approval is decided on its card), so it is navigation an app could already cause by other means. Routing taps through an unexported trampoline receiver, or a per-launch random token in the extra, would close it.
+status: open
+
+### DW-1315: An unreachable UnifiedPush server is asked again only at keeper's next start.
+
+origin: epic 98, story 98.4 (rung `agents-98-unifiedpush`, fix round 1, 2026-10-12; R98UP1-01)
+location: `src-tauri/crates/keeper/src/push_android.rs` (`new_endpoint`), `keeper_core::agents::unifiedpush::pusher_change`
+reason: A server keeper cannot reach no longer removes the pusher (`PusherChange::Keep`): nothing changes, and the question is asked again at the next start. While keeper runs it is not retried, so a first endpoint whose server was unreachable at start registers nothing until keeper starts again — and keeps no endpoint, so the egress list shows no row for a server keeper only tried to ask. A retry with backoff while keeper runs (with DW-1311's re-registration) would close it.
+status: open
+
+### DW-1316: A server that stops being a Matrix gateway is noticed only when the distributor gives a new endpoint.
+
+origin: epic 98, story 98.4 (rung `agents-98-unifiedpush`, fix round 1, 2026-10-12; R98UP1-03)
+location: `keeper_core::agents::unifiedpush::known_gateway`
+reason: keeper asks an endpoint's server once (the promise the docs make): an endpoint it kept whose server answered as a gateway is not asked again at the next start, so a server whose gateway was switched off keeps receiving pushers' event ids until the distributor hands keeper a new endpoint; the homeserver's own pusher failures (its gateway answering 404) are the signal. Asking again on a cadence, or when the homeserver reports the pushkey rejected, would close it.
+status: open
+
+### DW-1317: A UnifiedPush server whose certificate this device refuses reads as "could not reach".
+
+origin: epic 98, story 98.4 (review-98unifiedpush-1, DW candidate; fix round 1, 2026-10-12)
+location: `keeper_core::agents::unifiedpush::discover_gateway`
+reason: Every transport error, a refused certificate (a private CA on the ntfy host) included, becomes `DiscoveryRefusal::Unreachable`, whose sentence says keeper could not reach the host. The homeserver path uses the same TLS stack, so a CA that works for one works for the other; splitting "no route" from "certificate refused" (reqwest's `is_connect`/`is_timeout` against the rest) would give the person the right hint.
+status: open
+
+### DW-1318: Each push makes keeper read its event up to seven times while the keys wait, with no cap on concurrent pushes.
+
+origin: epic 98, story 98.4 (review-98unifiedpush-1, DW candidate; fix round 1, 2026-10-12)
+location: `src-tauri/crates/keeper/src/push_android.rs` (`message`), `AccountManager::push_shown`
+reason: `push_shown` reads the pushed event again every `DECRYPT_POLL` for up to `DECRYPT_BUDGET` while it cannot be decrypted, per push, and pushes are handled concurrently; anyone holding the endpoint (a capability) can make keeper do that and post its generic notification at will — keeper's words, no action. A bound on concurrent reads would cap it.
+status: open
+
+### DW-1320: Android voice has not been built into an APK or run.
+
+origin: epic 98, story 98.4 (rung `agents-98-android-voice`, 2026-10-12; R360)
+location: `src-tauri/crates/keeper/src/voice_android.rs`, `gen/android/app/src/main/java/dev/tgorka/keeper/VoicePlugin.kt`, `AndroidManifest.xml`
+reason: The Rust port type-checked for `aarch64-linux-android`; nothing linked, packaged or ran it, and the Kotlin is compiled only where the rung's report says so. The tablet run of 98.4 #10's voice part is owed: the microphone dialog at the first voice act (no crash, Tauri #15506), a spoken question reaching Nixi and its answer read aloud, talking over it where the echo canceller exists, listening stopping when keeper leaves the front and coming back with it, and the row in `docs/agents.md` § *Measured* — whether `AcousticEchoCanceler.isAvailable()` is true and whether on-device recognition keeps working while text-to-speech plays.
+status: open
+
+### DW-1321: Whether Android's echo canceller removes keeper's own text-to-speech is unmeasured.
+
+origin: epic 98, story 98.4 (rung `agents-98-android-voice`, 2026-10-12; R360)
+location: `VoicePlugin.kt` (`startCapture`, `withTts`)
+reason: Capture is `VOICE_COMMUNICATION` with `AcousticEchoCanceler` on its session; text-to-speech plays as `USAGE_ASSISTANT`. Whether a device's canceller takes that stream as its echo reference (some only reference the voice-call path, which would need `AudioManager.MODE_IN_COMMUNICATION`) is a device fact. Until measured, a full-duplex tablet may hear its own answer as a barge-in; the iPhone's tail gate (`TAIL_GATE`) has no Android twin yet.
+status: open
+
+### DW-1322: Android's port detects no language, so an answer is read in the listening language.
+
+origin: epic 98, story 98.4 (rung `agents-98-android-voice`, 2026-10-12; R360)
+location: `AndroidVoicePort::detect_language` (`voice_android.rs`)
+reason: Android's language identification is the system's `TextClassifier`, which may be a vendor service keeper cannot hold to the device (AD-188 asks for on-device detection or none). The model is asked to answer in the listening language (`speech::answer_instruction`), so this is usually right; an answer in another language is read in the listening language's voice. Revisit with an on-device identifier keeper ships or can prove local.
+status: open
+
+### DW-1323: The Android sentences' Settings paths are examples, not checked on the owner's tablet.
+
+origin: epic 98, story 98.4 (rung `agents-98-android-voice`, 2026-10-12; R360)
+location: `VoicePlatform::ANDROID` (`keeper-core/src/voice/platform.rs`)
+reason: Where on-device recognition languages and text-to-speech voices are installed differs between Android versions and makers, so `download` and `voice_download` name the page and give "Settings > System > Languages & input" / "Settings > Accessibility > Text-to-speech output" as the usual path "on most devices". The tablet run should record the real paths and the sentences follow them.
+status: open
+
+### DW-1325: Android has no twin of AD-209's tail gate.
+
+origin: review-98androidvoice-1 (rung `agents-98-android-voice` fix round 1, 2026-10-12; R364)
+location: `src-tauri/crates/keeper/src/voice_android.rs` (`spoken` → `Silence`), `keeper_core::voice` (AD-209)
+reason: After the last utterance is read the port reports `Silence` at once, and the recogniser pipeline's last few hundred milliseconds of keeper's own voice can come back as a partial in `Idle`, where the wake phrase is matched; an answer that contains the phrase on a device whose canceller leaves some of it through could wake keeper by itself. The Apple ports gate the tail (AD-209); Android does not yet. Pair with DW-1321's measurement.
+status: open
+
+### DW-1326: Whether an answer that arrives behind another app should be read aloud is a stated choice.
+
+origin: review-98androidvoice-1 (R98AV1-05's second half; R364)
+location: `keeper_core::voice::android::act`
+reason: The iPhone reads an answer behind other apps (its audio session keeps running); Android without a microphone foreground service gives keeper only silence to listen to there, and this round chose that nothing is read aloud either — the answer stays on the screen and the turn ends with `LEFT_THE_FRONT`. If the owner wants answers read behind other apps on the tablet, that is a change to `act` and to `docs/android.md` § Voice, not to the port.
+status: open
+
+### DW-1327: `SpeechRecognizer.triggerModelDownload` could offer the language download in place.
+
+origin: review-98androidvoice-1 (DW candidate; R364)
+location: `VoicePlugin.kt`, `VoicePlatform::ANDROID.download`
+reason: Android 13 has `triggerModelDownload` for an on-device recogniser's language; the refusal now names a Settings path (DW-1323) instead. Offering the download from the refusal is a new act with its own consent and progress.
+status: open
+
+### DW-1328: A text-to-speech engine that failed to start stays failed for the process.
+
+origin: review-98androidvoice-1 (DW candidate; R364)
+location: `VoicePlugin.kt` (`withTts`: `ttsReady = true`, `tts = null` on a failed init)
+reason: An engine installed or fixed after launch is seen only after a relaunch; until then `facts` lists no voices and every answer is refused as having no voice. Re-initialising on the next `facts` read would pick it up.
+status: open
+
+### DW-1329: The device's facts are read twice at launch.
+
+origin: review-98androidvoice-1 (DW candidate; R364)
+location: `voice_android::set_up`, `voice_ipc::boot` (`set_locale` → `refresh`)
+reason: `set_up` reads the facts and `boot`'s `set_locale` reads them again a moment later, each making a checker recogniser; harmless — the second read re-arms through `should_rearm`, which is idempotent — but one read would do.
+status: open
+
+### DW-1330: A gate room invites its approvers once, when it is made.
+
+origin: epic 99, story 99.1 (rung `agents-99-room`, 2026-10-12; R366; codemap Q2)
+location: `keeper_core::agents::gate::{approvers, room_invitees}`, `keeper_agent::seed::gate_room`
+reason: the approvers — the home drive's pinned readers with a pinned `[[trust]]` key — are invited as the room is created; a person pinned later is never invited to an existing gate room, and one whose pin is removed stays a member. Rung `agents-99-tickets` invites approvers into each child room it delegates into, and its card goes to the gate room: reconciling the gate room's observers with the pins (an invite for a new approver, nothing removed without a person) belongs with that card.
+status: open
+
+### DW-1331: A gate session made for one peer cannot be remade for another.
+
+origin: epic 99, story 99.1 (rung `agents-99-room`, 2026-10-12; R366)
+location: `keeper_core::agents::gate::gate_session_id`, `keeper-agentd agents gate`
+reason: the session's id is derived from (drive, agent, system), and its `[gate]` copies `peer`, `delegates` and `encrypted` once, never rewritten; after an owner edits one of them `agents gate` finds the existing session and makes nothing, so the change reaches no room until the session is archived (or the system renamed). `agents gate` could say which copied keys differ from the home's table, and an archive-and-remake path could be offered; neither is built.
+status: open
+
+### DW-1332: A gate's peer is checked against the agents of its own drive only.
+
+origin: review-99room-1 (DW candidate; R365 as amended, R367)
+location: `keeper_core::agents::home::gate_zone_refusals`, `keeper_agent::zone::read_zone`, `keeper-agentd agents gate`
+reason: the zone check reads one zone, so a `peer` that is the Matrix user of an agent homed in another drive the same host mounts is not refused; Q2 said "not any known agent's user". `agents gate` sees every hosted drive (`inspection.drives`) and could check the peer against each home's `matrix_user` there.
+status: open
+
+### DW-1333: In a gate room the peer may post decisions, `heard` and surface results at power 0.
+
+origin: review-99room-1 (DW candidate; R367)
+location: `keeper_core::agents::events::power_levels(Gate, …)`, `keeper_core::agents::gate::room_levels`, `keeper_agent::runtime::classify`
+reason: every session room opens `dev.keeper.agent.approval.decision`, `dev.keeper.agent.heard` and `dev.keeper.agent.surface.result` at 0, so the peer can send them. Harmless at this rung (no surface tool is offered there, `classify` ignores `heard` outside proxy rooms, no approval record exists), but `classify` today reads a sealed decision from any reader of the label, and the peer is one. Rung `agents-99-sync`'s gate arm must answer a peer's decision `Ignored(UNTRUSTED_DECISION)` (codemap §1.1); `room_levels` could close `heard` and `surface.result` for gate rooms.
+status: done 2026-10-12
+resolution: closed in rung `agents-99-sync` by the host, not by the levels: `rooms::classify`'s gate arm answers every event of the peer but a message `Ignored(ONLY_REQUESTS)` — a sealed decision, a scope, a heard mark, a conversation request, an agent event, an edit, a brief, an ask — whatever `reads` says (test `rooms::tests::in_a_gate_room_the_peer_only_asks`); and the copy's timeline handler drops every event of a served gate room's peer that is not an `m.room.message` before the surface-result path or any router sees it (`runtime::register_handlers`). The levels stay as rung 1 made them; closing `heard`/`surface.result` at 0 for gate rooms would change `events::power_levels` for one kind and is not needed while the host reads nothing else of the peer's.
+
+### DW-1334: A clear gate room still accepts `m.room.encrypted` from the peer.
+
+origin: review-99room-1 (DW candidate; R367)
+location: `keeper_core::agents::gate::room_levels(_, false)`
+reason: `m.room.encrypted` stays at 0 in a clear room, so the peer can post ciphertext the gate's copy has no key for: undecryptable noise. Closing it (`m.room.encrypted` at 50 in `room_levels(_, false)`) would change a clear room's levels, which adoption compares row for row, so it needs a word on rooms already made.
+status: open
+
+### DW-1335: A gate room's status anchor names the host and the session's folder to the outside system.
+
+origin: review-99room-1 (DW candidate; R367)
+location: `keeper_agent::seed::ensure_anchor` (`StatusContent { session: "<subfolder>/<path>", host }`)
+reason: the anchor posted into every gate room, clear or not, carries the host's name and the session's path in the drive; not what the session read, so not the failure shape, but the first thing a gate tells a system about the host. Rung `agents-99-sync`'s "a status in a gate room never names a path" decides whether these two fields are in scope.
+status: open
+
+### DW-1336: A `[[trust]]` that names a gate's peer after its room was made is not noticed.
+
+origin: review-99room-1 (DW candidate; R367; beside DW-1330)
+location: `keeper_core::agents::gate::room_invitees`, `keeper-agentd run`
+reason: the peer-is-no-`[[trust]]`-person rule is checked by `agents gate` when the room is made; an operator who later pins the peer as a person or a proxy is not told by a running host, and the peer's decisions would then come from a pinned key. `agentd.toml` is the operator's; `run` or `status` could refuse or flag such a gate.
+status: open
+
+### DW-1340: A gate request taken but not yet logged when its host stops is taken again on restart.
+
+origin: epic 99, story 99.1 (rung `agents-99-sync`, 2026-10-12; R368)
+location: `keeper_agent::gate::Desk::take`, `keeper_agent::runtime::read_back`
+reason: the room's front takes a request — says its async ticket, or arms its deadline — before the worker writes its `request` line. A stop between the two leaves the event unseen by the log, so the next worker reads it back and takes it again: a second ticket (or refusal) message can reach the outside system, and the request pays a second request token at its old server time. A `ticket` the deadline timer said whose line was not written yet is lost the same way (the system then hears the request's `interrupted` or a second ticket). Writing the `request` line from the front, or reading the gate's own messages back from the room before taking a replayed request, would close it.
+status: open
+
+### DW-1341: A gate's own message the homeserver keeps refusing is given up, and a ticket said at a `delegate` is logged only at its turn's end.
+
+origin: epic 99, story 99.1 (rung `agents-99-sync`, 2026-10-12; R368); extended by review-99tickets-1 (R99T-06; R373)
+location: `keeper_agent::gate::Desk::send`, `keeper_agent::gate::Desk::ticket_for`, `keeper_agent::agent::ServedSession::gate_turn`
+reason: a ticket or refusal the desk says by itself is tried five times under one transaction (a 429 waited out, any other error after 500 ms), and its line is then written with no event; a reply the room's sink blocks, or one the homeserver refuses, is refused to the model and the request then ends `no_answer`. Nothing retries a lost ticket on the host's clock, and a refusal blocked by the sink (a member outside the audience joined) is not said at all. A retry queue on the worker's tick, like the briefs', would carry them. The converse on a new path (rung `agents-99-tickets`): a sync request a `delegate` hands on has its `ticket` said at the call (`Desk::ticket_for`) but its line written with the desk's other facts only after the turn's closing line; a stop in between leaves a `ticket` in the room with no line and no ledger token, and the restart (`recover_gate`) refuses the request `interrupted` naming no ticket. Writing the fact when the call returns — drained at the call's `tool_result` as a deadline's facts are — would close it.
+status: open
+
+### DW-1342: A gate's deadline is kept on an uncalibrated clock until the host's first claim read-back.
+
+origin: epic 99, story 99.1 (rung `agents-99-sync`, 2026-10-12; R368; codemap §5)
+location: `keeper_agent::claims::ServerClock`, `keeper_agent::gate::Desk`
+reason: the deadline timer waits `origin_server_ts + deadline_ms − ServerClock::now()`; until a claim's read-back has set the clock's offset, `now()` is this host's wall clock, so a host whose clock is off from the homeserver's tickets early or late by that much. A gate session's claim is acquired before its worker starts, which calibrates the clock in the usual case; a host that took no claim read-back yet (a takeover race) is not measured.
+status: open
+
+### DW-1343: A takeover tickets again a request the last holder ticketed and did not finish, and the hour's card can go stale across a stop or a takeover.
+
+origin: review-99sync-1 (R99S-03; R370); widened by review-99tickets-1 (R99T-05; R373)
+location: `keeper_agent::runtime::answered_by`, `keeper_agent::agent::ServedSession::answered_elsewhere`, `keeper_agent::approvals::tickets::on_the_card` (`approvals/card.json`)
+reason: a gate's `answer`, `result` or `refused` in the room now answers its request after a takeover, but its `ticket` answers nothing: a request the last holder ticketed — whose lines this copy's log does not hold yet — is read back and taken again, so the outside system hears a second ticket for it and its first is never given a result. Adopting the room's ticket (its id becomes the entry's, the ledger opens it, the turn's `reply` is its `result`) would close it; rung `agents-99-tickets` reads tickets back for its callbacks and is where it fits. The hour's card has the same shape: `card.json` is written after the card's send and read with every error swallowed, so (a) a stop between the send and the write opens a second card for the hour without the earlier record (the first card stands; its record is asked again if its `approval requested` line was lost too), and (b) after a takeover the taker's synced `card.json` can lag the last holder's edit — its next edit lists one record fewer, the device ignores it (`approval_card` counts an edit only when it keeps every listed record byte for byte), and the new ticket is never shown and ends `expired` a day later. Both fail closed; (b) is silent. Reading the card back from the room (its event and its last accepted edit), or opening a new card whenever `card.json`'s event is not one this copy sent — and writing `card.json` with the intended list before the send — would close it.
+status: open
+
+### DW-1344: An agent's open gate tickets are counted per host.
+
+origin: review-99sync-1 (R99S-05; R370)
+location: `keeper_agent::gate::OpenTickets`, `AgentDeps.gate_tickets`
+reason: `[limits].max_concurrent_sessions` now bounds the tickets open across all of an agent's gate sessions on one host, each counted from its ledger as its desk opens; an agent whose gate sessions are placed on two always-on hosts holds up to the limit on each, and a gate session not served on this host is not counted here. Counting from the drive's gate lines, or placing an agent's gates on one host, would make it one limit.
+status: open
+
+### DW-1345: The frame a gate's model is told can be asked for through `reply`.
+
+origin: review-99sync-1 (DW candidate; R370; beside DW-1335)
+location: `keeper_core::agents::prompt::compose_gate` (slot 5, the frame)
+reason: a gate's system message carries the frame — host slug, session path, drive id and title, the audience sentence and the time — and the peer can ask the model to repeat it, which `reply` then sends. The status anchor already names host and path to the outside system (DW-1335); whether a gate's frame drops them is the same decision.
+status: open
+
+### DW-1346: A gate whose model calls no tools is offered no `reply`.
+
+origin: review-99sync-1 (DW candidate; R370)
+location: `keeper_agent::agent::agent_offer`
+reason: a model that cannot call tools is told of none, and the gate arm comes after that return, so such a gate's every request ends `no_answer`. `agents gate` or the placement could refuse a gate whose model calls no tools, and `status` could say so.
+status: open
+
+### DW-1350: A gate whose room is clear cannot hand a request on.
+
+origin: epic 99, story 99.1 (rung `agents-99-tickets`, 2026-10-12; R371; codemap Q9)
+location: `keeper_agent::delegate::GATE_CLEAR`, `keeper_core::agents::approval_card` (the device fold takes only sealed requests)
+reason: the hour's card goes into the gate's own room (codemap Q8 (a)), and a device draws an approval request only when it was sealed by its sender's device; in a clear room (`encrypted = false`) nothing is sealed, so no person could see or decide a card there. A clear gate's `delegate` is refused, naming why, and its requests are answered by its own turn. Carrying a clear gate's cards to its approvers' proxy DMs (R85's route, agentd only) is the way out.
+status: open
+
+### DW-1351: An approved ticket whose host stopped before its room was made is refused, its approval spent.
+
+origin: epic 99, story 99.1 (rung `agents-99-tickets`, 2026-10-12; R371)
+location: `keeper_agent::approvals::tickets::ticket_settled`, `keeper_agent::agent::ServedSession::recover_gate`
+reason: a ticket's approval is consumed in the room before the host makes the delegation's room (NFR-117's order); a stop between the two leaves a consumed record and no `delegate opened` line, and the next start refuses the request `interrupted` — the person's approval is spent and the outside system must ask again. A room a stop left made is an orphan nothing serves.
+status: open
+
+### DW-1352: An approver pinned after a gate's room was made decides tickets they cannot see.
+
+origin: review-99tickets-1 (doc nit; R373; beside DW-1336)
+location: `keeper_agent::approvals::tickets::gate_approvers`, `keeper_core::agents::gate::room_invitees`
+reason: a gate's approvers — the drive's pinned readers whose key this host pins — are worked out again at the card, at each decision's seat and at the delegation room's invites, while the gate's room was joined by the people `agents gate` invited when it made it. A person pinned in `[[trust]]` later is named on the card and their decision would count, but they are no member of the gate room, so the card never reaches their devices. `agents gate` could invite the approvers again, or `status` could flag an approver outside the room.
+status: open
+
+### DW-1353: One record can sit on two of a gate's cards after a stop.
+
+origin: review-99tickets-1 (DW candidate, R99T-05 (a); R373)
+location: `keeper_agent::approvals::tickets::on_the_card`, `keeper_core::agents::approval_card` (the device's projection)
+reason: a stop between a card's send and its `approval requested` line leaves the ticket unasked, so the next `raise_tickets` puts the same record on a card again — the first card stands. A person's device then sees one record id on two cards; whether 93's projection draws it once (dedup by record id) is not verified here.
+status: open
+
+### DW-1354: The hour's card shows its lines for a day.
+
+origin: review-99tickets-1 (DW candidate; R373)
+location: `keeper_core::agents::gate::HourCard`, the approval card's surface (epic 99's UI rung)
+reason: a card collects an hour's tickets, but each record expires a day after its own creation, so one card may show lines in every state — waiting, approved, denied, expired — for up to a day. How a decided line keeps its verdict on the card (UX-DR160) is that rung's to draw.
+status: open
+
+### DW-1360: A gate's MCP servers are not offered.
+
+origin: epic 99, story 99.2 (rung `agents-99-untrusted`, 2026-10-12; R375; codemap Q1, Q7)
+location: `keeper_agent::agent::agent_offer` (gate arm), `AllowedTools::named` (the mirror)
+reason: codemap Q1 lets a gate's turn be offered the MCP servers `[tools].mcp` names, and Q7 puts each call at T4 for the chain's head. A T4 call parks its turn, and a gate's turn never parks (Q4): its one worker answers every request. An MCP call from a gate needs Q4's deferred shape — the call on the hour's card, run by the host on the owner's approval, its answer coming back as the ticket's result — and the server's answer labelled before it reaches the room. Until then the gate offers none, and the dispatch refuses one named `NOT_OFFERED`.
+status: open
+
+### DW-1361: A held gate result is released only by an owner whose proxy runs on the gate's host.
+
+origin: epic 99, story 99.2 (rung `agents-99-untrusted`, 2026-10-12; R374; codemap §5 "how a gate host reaches the owner's proxy DM")
+location: `keeper_agent::approvals::tickets::hold_result`, `ServedSession::askable`, `deciding::Forwards`
+reason: the declassification goes to the owner's DM through a proxy door this host runs (R85, R89); where the owner's proxy runs on another host — the Mac, or a second agentd — nobody can be asked and the result is refused `unreleased` at once. The cross-host relay is DW-485's.
+status: open
+
+### DW-1362: A held result whose release a stop cut is refused, its approval spent.
+
+origin: epic 99, story 99.2 (rung `agents-99-untrusted`, 2026-10-12; R374)
+location: `keeper_agent::approvals::tickets::held_settled`, `keeper_agent::agent::ServedSession::recover_gate`
+reason: as DW-1351 for a ticket: the declassification is consumed in the gate room before the result is sent, and a stop between the two — or between the held result's record and its `approval requested` line — leaves the request open with nothing waiting for it; the next start refuses it `interrupted`, and the owner's approval is spent.
+status: open
+
+### DW-1363: A gate journal entry's `session` allowance lives in its host's memory.
+
+origin: epic 99, story 99.2 (rung `agents-99-untrusted`, 2026-10-12; R375; S-11)
+location: `keeper_agent::agent::SessionContext::gate_journal`, `keeper_core::agents::gate::JournalAllowance`
+reason: as a `run`'s `session` approval (R146) the allowance is held in memory only: a restart or a takeover drops it and the next entry asks again — never more than the day it was given for, but a person may be asked twice in that day. Rebuilding it from the consumed decision's line would keep it across a restart on the same host.
+status: open
+
+### DW-1364: A gate journal entry made after a drive read is refused unasked rather than asked in its owner's DM.
+
+origin: epic 99, story 99.2 (rung `agents-99-untrusted`, fix round 1, 2026-10-13; R375 amended, R376; review-99untrusted-1 R99U1-02 (b))
+location: `keeper_agent::agent::AllowedTools` (the `journal_append` gate arm, `GATE_JOURNAL_NARROWED`), `keeper_agent::approvals::tickets::raise_journals`
+reason: a callback turn's entry carries the label its reply narrowed the session to, and the hour's card would carry it into the gate's room, which that label does not reach (NFR-115): it is refused at the call, nobody asked. The route a held result takes — a record asked in the drive's owner's proxy DM (R374) — would let such an entry be decided by the one person who may read it.
+status: open
+
+### DW-1365: 99.2 #6's re-run "with a proposal written by a gate session" is satisfied structurally.
+
+origin: epic 99, story 99.2 (rung `agents-99-untrusted`, fix round 1, 2026-10-13; R376; review-99untrusted-1)
+location: `keeper_core::agents::curate::tests::gate_proposals_expire_unread`, `keeper_agent::memory::offered_in`
+reason: no code path lets a gate session write a proposal (R369's offer; `gate_injection_fixture` refuses `memory_propose`/`skill_propose` `NOT_OFFERED`), so the curator test's fixture is 95.3's `origin = "gate"` file, not a gate session's output. Accepted reading: the re-run on this rung plus the structural refusal satisfy #6; a fixture written by a gate session needs a path that must not exist.
+status: accepted
+
+### DW-1370: A gate room's ticket names the session that works it by its id, not as a link.
+
+origin: epic 99, UX-DR147 (rung `agents-99-ui`, 2026-10-13; R377; codemap §3 row 24)
+location: `keeper_core::agents::gate_room::GateLineVm.ticket`, `src/components/chat/gate-line.tsx`
+reason: the ticket id is the delegation's id and the child session's (AD-368), but the gate room says nothing of the child's room, and a device learns that room only by reading the child's brief in a room the person may not be invited to (the approvers are; a reader who is not an approver is not). Linking needs a device-side index of session rooms by their session id (the child's status names its `session` path, not its id) or the delegate's `parent` read from the child room's first event.
+status: open
+
+### DW-1371: A gate room made before rung `agents-99-ui` draws no label chip.
+
+origin: epic 99, UX-DR147 (rung `agents-99-ui`, 2026-10-13; R377)
+location: `keeper_agent::seed::gate_room` (`ensure_anchor`)
+reason: the room's opening scope is sent with its status anchor only, so `agents gate` on an existing room — its anchor already there — sends none, and a room adopted after a lost folder keeps whatever it had. The same holds when the anchor was sent and the scope's own send then failed (review-99ui-1 R99UI1-08, R379): the scope goes out only after a successful anchor send and is never repaired, so the next `agents gate` finds the anchor and sends nothing. Sending the scope when the room has an anchor but no scope from the gate would cover all three; no room made by this program's earlier rungs exists outside test homeservers.
+status: open
+
+### DW-1372: A gate room's lines are read from the loaded timeline only.
+
+origin: epic 99, UX-DR147 (rung `agents-99-ui`, 2026-10-13; R377)
+location: `keeper_core::agents::gate_room::GateView::of`, `keeper_core::timeline::AgentHeader::regate`
+reason: a request whose gate word is not loaded — the window starts after the request but the word is further back, or the word arrived but the request scrolled out of the loaded window — draws as an ordinary message until both are loaded, and the header names no peer until a request the gate spoke of is loaded. Reading the gate's words from the event cache, as the header reads status and scope (R33), would draw them whatever is loaded.
+status: open
+
+### DW-1380: `scripts/check-macos.sh` runs the workspace's tests with `cargo test` under ssh's file-descriptor limit.
+
+origin: the agents program's close-out (2026-10-13; stack-notes 2026-10-11 RS9697 and 2026-10-12 98tablet; `report-restack-96tail-97.md`)
+location: `scripts/check-macos.sh:102-105` (`cargo test --workspace` over `ssh -o BatchMode=yes`)
+reason: a non-interactive ssh session on hesperia starts with `ulimit -n 256`, and `cargo test` runs a test binary's tests on threads in one process, so keeper-agent's `agent_turns` (the `parks::*` tests) run out of descriptors — 153 failed and one hung at the 97 tip (RS9697), `parks::*` ×105 at rung 98tablet — while the same tree passes under `cargo nextest run --workspace` with `ulimit -n 65536` (7493/7493 and 7607/7607 on hesperia). Every lane that ran `bun run check:rust:macos` had to rerun by hand and explain the red; the script's red is therefore not evidence of anything. Fix: raise the limit in the remote command (`ulimit -n 65536`) and run `cargo nextest run --workspace` (installing cargo-nextest on the Mac if absent), keeping the bindings-drift check after it, since ts-rs writes the bindings during the test run under nextest too.
+status: open

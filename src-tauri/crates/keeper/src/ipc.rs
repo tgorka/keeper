@@ -75,12 +75,13 @@ use ts_rs::TS;
 /// 16.5). The `Recorder` trait is not object-safe (its async methods are RPITIT),
 /// so the concrete type is selected at compile time per target rather than held
 /// as a trait object: the desktop recorder spawns `keeper-rec` per round-trip;
-/// the iOS one honestly answers [`CoreError::Unsupported`] (the frontend never
-/// calls these commands there — the `recording` capability is `false`).
+/// the phone and tablet one honestly answers [`CoreError::Unsupported`] (the
+/// frontend never calls these commands there — the `recording` capability is
+/// `false`).
 #[cfg(desktop)]
 type PlatformRecorder = crate::recorder::DesktopRecorder;
-#[cfg(target_os = "ios")]
-type PlatformRecorder = crate::recorder::IosRecorder;
+#[cfg(mobile)]
+type PlatformRecorder = crate::recorder::MobileRecorder;
 
 /// Tauri-managed application state holding the injected platform port and the
 /// single-account supervisor.
@@ -453,7 +454,8 @@ impl ExportRegistry {
 
 impl AppState {
     /// Construct the app state with the platform implementation for this build
-    /// target (Story 12.2): [`DesktopPlatform`] on desktop, [`IosPlatform`] on iOS.
+    /// target (Story 12.2): [`DesktopPlatform`] on desktop, [`IosPlatform`] on
+    /// iOS, [`AndroidPlatform`] on Android (Epic 98, story 98.3).
     ///
     /// Resolves the platform data dir up front so the [`AccountManager`] can open
     /// the single app-wide `archive.db` and spawn its serialized writer (Story
@@ -464,27 +466,30 @@ impl AppState {
         #[cfg(desktop)]
         let platform: Arc<dyn Platform> = Arc::new(DesktopPlatform);
         #[cfg(target_os = "ios")]
-        let platform: Arc<dyn Platform> = Arc::new(IosPlatform);
-        // Story 12.2's compile seam supports desktop and iOS only. A non-iOS mobile
-        // target (e.g. Android) is `mobile` — so `run()` still reaches this via the
-        // `#[cfg_attr(mobile, ...)]` entry point — but binds no `platform` above.
-        // Fail loudly and specifically here rather than with a bare "cannot find
-        // value `platform`"; such a target needs its own `Platform` port impl.
-        #[cfg(all(not(desktop), not(target_os = "ios")))]
+        let platform: Arc<dyn Platform> = Arc::new(IosPlatform::resolve());
+        #[cfg(target_os = "android")]
+        let platform: Arc<dyn Platform> = Arc::new(AndroidPlatform::resolve());
+        // A mobile target that is neither iOS nor Android is `mobile` — so
+        // `run()` still reaches this via the `#[cfg_attr(mobile, ...)]` entry
+        // point — but binds no `platform` above. Fail loudly and specifically
+        // here rather than with a bare "cannot find value `platform`"; such a
+        // target needs its own `Platform` port impl.
+        #[cfg(all(not(desktop), not(target_os = "ios"), not(target_os = "android")))]
         compile_error!(
-            "no Platform implementation for this build target: Story 12.2's seam covers \
-             desktop and iOS only; add a Platform port impl for other mobile targets"
+            "no Platform implementation for this build target: the seam covers desktop, \
+             iOS and Android; add a Platform port impl for other mobile targets"
         );
         let data_dir = platform.data_dir().unwrap_or_else(|e| {
             tracing::error!(error = %e, "could not resolve data dir; archive falls back to temp");
             std::env::temp_dir().join("dev.tgorka.keeper")
         });
         // The recorder shares the platform port (for sidecar resolution) on
-        // desktop; iOS is the honest Unsupported impl (see `PlatformRecorder`).
+        // desktop; a phone or tablet is the honest Unsupported impl (see
+        // `PlatformRecorder`).
         #[cfg(desktop)]
         let recorder = Arc::new(crate::recorder::DesktopRecorder::new(platform.clone()));
-        #[cfg(target_os = "ios")]
-        let recorder = Arc::new(crate::recorder::IosRecorder);
+        #[cfg(mobile)]
+        let recorder = Arc::new(crate::recorder::MobileRecorder);
         Self {
             // The manager flags the `data_dir` root as backup-excluded through the
             // platform port (Story 14.7, FR-65) — best-effort, never startup-fatal.
@@ -517,6 +522,9 @@ impl Default for AppState {
 static NEXT_SUBSCRIPTION_ID: AtomicU64 = AtomicU64::new(1);
 
 /// macOS Keychain service name under which all keeper secrets are stored (AD-3).
+/// Apple's keychains and the desktop's only: Android keeps its secrets in
+/// `keeper_core::secret_file`, which has no service name.
+#[cfg(any(desktop, target_os = "ios"))]
 const KEYCHAIN_SERVICE: &str = "dev.tgorka.keeper";
 
 /// The Tauri app handle used by the desktop `Platform::notify` port to post native
@@ -804,15 +812,107 @@ impl Platform for DesktopPlatform {
 
 /// Concrete [`Platform`] implementation for the iOS shell (Story 12.2).
 ///
-/// The Apple-shared ports (data dir via `dirs`, keychain via `keyring`'s
-/// `apple-native` backend, browser-open via the opener plugin, notifications via
-/// the notification plugin) mirror the desktop bodies. The desktop-only ports are
-/// honest about their absence: `sidecar_path` returns [`CoreError::Unsupported`]
-/// (no child processes / sidecars on iOS — ever), and `set_badge_count` is a
-/// no-op (the desktop dock badge does not exist; an iOS app badge arrives with
-/// the push/notification work in a later story, never here).
+/// The Apple-shared ports (keychain via the Security framework, browser-open
+/// via the opener plugin, notifications via the notification plugin) mirror the
+/// desktop bodies. The data directory is decided once, at start
+/// ([`IosPlatform::resolve`]): the App Group container's when the build has
+/// one, the app's own container's otherwise. The desktop-only ports are honest
+/// about their absence: `sidecar_path` returns [`CoreError::Unsupported`]
+/// (no child processes / sidecars on iOS — ever), and `set_badge_count` goes
+/// through `UNUserNotificationCenter` rather than a dock.
 #[cfg(target_os = "ios")]
-pub struct IosPlatform;
+pub struct IosPlatform {
+    /// `None` only when iOS answered no data directory at all.
+    data_dir: Option<PathBuf>,
+}
+
+// The App Group and the data directory's name are keeper-core's, so the
+// notification extension (`keeper-nse`) opens exactly where this moves to.
+#[cfg(target_os = "ios")]
+use keeper_core::container::{APP_GROUP, DATA_DIR_NAME};
+
+#[cfg(target_os = "ios")]
+impl IosPlatform {
+    /// Decide the data directory, moving it into the App Group container the
+    /// first time there is one (Epic 98, story 98.1 #6; the plan's Q3).
+    ///
+    /// Runs in [`AppState::new`] before anything opens a store, which is the
+    /// whole of what makes the move safe: nothing holds a file in either
+    /// directory while it moves. Three outcomes:
+    /// - **No group container** — a free Personal Team strips every
+    ///   entitlement (`scripts/install-ios.sh`, `KEEPER_IOS_FREE_TEAM`), so iOS
+    ///   answers nil: the app's own `Library/Application Support/
+    ///   dev.tgorka.keeper`, exactly as before.
+    /// - **The move finished** (now, earlier, or there was nothing to move) —
+    ///   the group container's `Library/Application Support/dev.tgorka.keeper`,
+    ///   even when only its done marker could not be written (the next start
+    ///   writes it).
+    /// - **The move refused or failed** — the app's own directory, kept whole
+    ///   by `keeper_core::container` (a put-back that itself failed says it is
+    ///   not), and the refusal's sentence in the log. The next start tries
+    ///   again, except after a clash — a name on both sides — which the
+    ///   refusal says will not resolve itself (DW-1241).
+    ///
+    /// Before the move, the phone folders in `sync.db` are rewritten relative
+    /// to the old directory (`keeper_sync::db::store_folder_paths_relative_at`,
+    /// Q8(b)), so after it they resolve under the new one. If that rewrite
+    /// fails the move does not happen: a folder still stored absolute would
+    /// point into the emptied old directory.
+    pub fn resolve() -> Self {
+        let Some(own) = dirs::data_dir().map(|base| base.join(DATA_DIR_NAME)) else {
+            tracing::error!("iOS answered no data directory");
+            return Self { data_dir: None };
+        };
+        let Some(group) = app_group_container() else {
+            tracing::info!(
+                group = APP_GROUP,
+                "no App Group container (this build carries no App Group entitlement); \
+                 keeper keeps its data in the app's own container"
+            );
+            return Self {
+                data_dir: Some(own),
+            };
+        };
+        let shared = keeper_core::container::group_data_dir(&group);
+        if let Err(err) = keeper_sync::db::store_folder_paths_relative_at(&own) {
+            tracing::error!(
+                %err,
+                path = %own.display(),
+                "keeper did not move its data into the App Group container because it could \
+                 not first store the phone's folders relative to it; it keeps using its own \
+                 container"
+            );
+            return Self {
+                data_dir: Some(own),
+            };
+        }
+        let data_dir = match keeper_core::container::move_into_group_container(&own, &shared) {
+            Ok(moved) => {
+                tracing::info!(?moved, path = %shared.display(), "data directory: the App Group container");
+                shared
+            }
+            Err(refusal) => {
+                tracing::error!(%refusal, "data directory: the app's own container");
+                own
+            }
+        };
+        Self {
+            data_dir: Some(data_dir),
+        }
+    }
+}
+
+/// The App Group container's root, or `None` when this build's signature
+/// carries no App Group entitlement — iOS answers nil then, never a path the
+/// sandbox would refuse.
+#[cfg(target_os = "ios")]
+fn app_group_container() -> Option<PathBuf> {
+    use objc2_foundation::{NSFileManager, NSString};
+
+    let url = NSFileManager::defaultManager()
+        .containerURLForSecurityApplicationGroupIdentifier(&NSString::from_str(APP_GROUP))?;
+    Some(PathBuf::from(url.path()?.to_string()))
+}
 
 /// `errSecItemNotFound` (`-25300`) — the Security Framework status returned when no
 /// keychain item matches. `security_framework` does not re-export it, and although
@@ -825,19 +925,14 @@ const ERR_SEC_ITEM_NOT_FOUND: i32 = -25300;
 
 #[cfg(target_os = "ios")]
 impl Platform for IosPlatform {
-    /// The single app-container root for all account state on iOS.
-    ///
-    /// Inside the iOS sandbox `dirs::data_dir()` resolves to the app container's
-    /// `Library/Application Support`, so this returns
-    /// `{container}/Library/Application Support/dev.tgorka.keeper` — the one root under
-    /// which `accounts/<ulid>/sdk`, `keeper.db`, and `archive.db` all live (Story 12.3).
-    /// A future App Group move relocates this single path; it is a path change, not a
-    /// data migration (`NSFileProtection*` / `isExcludedFromBackup` are Epic 14 / 14.7).
+    /// The single root for all account state on iOS, decided once by
+    /// [`IosPlatform::resolve`]: `accounts/<ulid>/sdk`, `keeper.db`,
+    /// `archive.db`, `sync.db` and the phone's folders under `sync/` all live
+    /// here (Story 12.3; Epic 98 for the App Group container).
     fn data_dir(&self) -> Result<PathBuf, CoreError> {
-        let base = dirs::data_dir().ok_or_else(|| {
-            PlatformError::DirUnavailable("no OS data directory available".to_owned())
-        })?;
-        Ok(base.join("dev.tgorka.keeper"))
+        self.data_dir.clone().ok_or_else(|| {
+            PlatformError::DirUnavailable("no OS data directory available".to_owned()).into()
+        })
     }
 
     fn keychain_set(&self, key: &str, value: &str) -> Result<(), CoreError> {
@@ -850,6 +945,14 @@ impl Platform for IosPlatform {
         // access control (flags = 0, no biometry/passcode/user-presence): readable
         // headless by the resumed sync loop, never iCloud-synced, invisible to other
         // apps (Story 12.3, AD-29).
+        //
+        // No `kSecAttrAccessGroup` (Epic 98): the item lands in the first entry of
+        // `keychain-access-groups`, `$(AppIdentifierPrefix)dev.tgorka.keeper` — the
+        // app's own application identifier, which is where every item written before
+        // that entitlement already lives — and the notification extension names the
+        // same group to read it. A free Personal Team strips the entitlement and the
+        // default is that same identifier, so naming the group here would only make
+        // those installs fail with `errSecMissingEntitlement`.
         let access_control = SecAccessControl::create_with_protection(
             Some(ProtectionMode::AccessibleAfterFirstUnlockThisDeviceOnly),
             0,
@@ -1004,6 +1107,141 @@ impl Platform for IosPlatform {
         // `IpcErrorCode::Unsupported` (`retriable: false`) at the command edge.
         Err(CoreError::Unsupported(format!(
             "sidecar {name:?} is not available on iOS"
+        )))
+    }
+}
+
+/// Concrete [`Platform`] implementation for the Android shell (Epic 98,
+/// story 98.3; AD-414).
+///
+/// - **Data directory:** the app's private files directory, as
+///   `MainActivity` reports it ([`crate::android::files_dir`]). Android
+///   removes it with the app; the manifest's backup rules keep it out of
+///   cloud backups and device transfers, which is why
+///   [`Platform::exclude_from_backup`] has nothing left to do per path.
+/// - **Secrets:** `keeper_core::secret_file` — one AEAD file in that
+///   directory, keyed by the data key the Android Keystore wraps
+///   ([`crate::android::KeystoreKey`]). Never `keyring`.
+/// - **Browser and sign-in:** a link opens in a Custom Tab (the opener
+///   plugin); a sign-in's authorization page in an Auth Tab, whose callback
+///   comes back as the activity's result (`web_auth.rs`, story 98.3).
+/// - **Notifications:** the notification plugin, as on iOS. No badge — an
+///   Android launcher draws its own from the notifications — and no sidecar.
+#[cfg(target_os = "android")]
+pub struct AndroidPlatform {
+    /// `None` only when the activity reported no files directory.
+    data_dir: Option<PathBuf>,
+    secrets: Option<keeper_core::secret_file::SecretFile<crate::android::KeystoreKey>>,
+}
+
+#[cfg(target_os = "android")]
+impl AndroidPlatform {
+    /// Read the files directory once, before any store opens.
+    pub fn resolve() -> Self {
+        let data_dir = crate::android::files_dir();
+        if data_dir.is_none() {
+            tracing::error!(
+                "Android reported no files directory (MainActivity sets KEEPER_ANDROID_FILES_DIR \
+                 before the app starts); keeper has nowhere to keep its data"
+            );
+        }
+        let secrets = data_dir.as_ref().map(|dir| {
+            keeper_core::secret_file::SecretFile::new(
+                dir.join(keeper_core::secret_file::FILE_NAME),
+                crate::android::KeystoreKey::default(),
+            )
+        });
+        Self { data_dir, secrets }
+    }
+
+    fn secrets(
+        &self,
+    ) -> Result<&keeper_core::secret_file::SecretFile<crate::android::KeystoreKey>, CoreError> {
+        self.secrets.as_ref().ok_or_else(|| {
+            PlatformError::DirUnavailable("no files directory for the secret store".to_owned())
+                .into()
+        })
+    }
+}
+
+#[cfg(target_os = "android")]
+impl Platform for AndroidPlatform {
+    fn data_dir(&self) -> Result<PathBuf, CoreError> {
+        self.data_dir.clone().ok_or_else(|| {
+            PlatformError::DirUnavailable("Android reported no files directory".to_owned()).into()
+        })
+    }
+
+    fn keychain_set(&self, key: &str, value: &str) -> Result<(), CoreError> {
+        self.secrets()?.set(key, value)
+    }
+
+    fn keychain_get(&self, key: &str) -> Result<Option<String>, CoreError> {
+        self.secrets()?.get(key)
+    }
+
+    fn keychain_delete(&self, key: &str) -> Result<(), CoreError> {
+        self.secrets()?.delete(key)
+    }
+
+    /// A Custom Tab, through the opener plugin's Android half (`inAppBrowser`).
+    /// Not the crate's free `open_url`: that is the `open` crate, which on
+    /// Android spawns a desktop opener that is not there.
+    fn open_url(&self, url: &str) -> Result<(), CoreError> {
+        use tauri_plugin_opener::OpenerExt;
+
+        let app = NOTIFY_APP.get().ok_or_else(|| {
+            CoreError::Unsupported(
+                "the browser is not reachable before keeper has started".to_owned(),
+            )
+        })?;
+        app.opener()
+            .open_url(url, Some("inAppBrowser"))
+            .map_err(|e| CoreError::Internal(format!("could not open the browser: {e}")))
+    }
+
+    /// The account sign-in (Epic 82, AD-311; story 98.3): an Auth Tab, which
+    /// hands the callback back as the activity's result rather than as an
+    /// intent another app could claim (`web_auth::start_in`).
+    fn start_web_auth(&self, url: &str, callback_scheme: &str) -> Result<(), CoreError> {
+        if crate::web_auth::sheet_can_deliver(callback_scheme) {
+            crate::web_auth::start(url, callback_scheme)
+        } else {
+            self.open_url(url)
+        }
+    }
+
+    fn notify(&self, title: &str, body: &str, target: &NotifyTarget) -> Result<(), CoreError> {
+        use tauri_plugin_notification::NotificationExt;
+
+        record_last_notify_target(target);
+        let app = NOTIFY_APP.get().ok_or_else(|| {
+            CoreError::Unsupported("notification app handle is not set (headless)".to_owned())
+        })?;
+        app.notification()
+            .builder()
+            .title(title)
+            .body(body)
+            .show()
+            .map_err(|e| CoreError::Internal(format!("could not post notification: {e}")))
+    }
+
+    /// Android has no app badge to set: a launcher that shows one counts the
+    /// app's notifications itself.
+    fn set_badge_count(&self, _count: Option<u32>) -> Result<(), CoreError> {
+        Ok(())
+    }
+
+    /// The manifest does this for the whole app (`android:allowBackup="false"`
+    /// and `data_extraction_rules.xml`, which exclude every domain from cloud
+    /// backup and device transfer), so there is nothing to do per path.
+    fn exclude_from_backup(&self, _path: &Path) -> Result<(), CoreError> {
+        Ok(())
+    }
+
+    fn sidecar_path(&self, name: &str) -> Result<PathBuf, CoreError> {
+        Err(CoreError::Unsupported(format!(
+            "sidecar {name:?} is not available on Android"
         )))
     }
 }
@@ -1474,11 +1712,15 @@ pub fn capabilities(state: State<'_, AppState>) -> Result<CapabilitiesVm, IpcErr
         // since Epic 66 (AD-200) — see `notes_available`.
         notes: notes_available(&state),
         // Sessions (FR-223, AD-107): the same construction as notes — a sessions
-        // root IS a synced folder plus a flag — and on the Mac only (Epic 66,
-        // AD-201): the board is forty commands and its own epic, so the phone
-        // says so in the disclosure rather than rendering a board it cannot
-        // drive.
-        sessions: mac_folder_capability_of(&git_report(&state), cfg!(desktop)),
+        // root IS a synced folder plus a flag. On the Mac, `sync`; on the phone
+        // (98.2, AD-413) `sync` and a sessions zone here, so a phone with no
+        // flagged folder has no board (AD-27) and one whose zone just landed
+        // says so (`CAPABILITIES_CHANGED_EVENT`).
+        sessions: sessions_capability_of(
+            &git_report(&state),
+            cfg!(desktop),
+            crate::sessions_root::any(),
+        ),
         // Bots (Epic 61, FR-378; Epic 62, FR-396): `cfg!(desktop) ||
         // cfg!(mobile)`, i.e. true on every target that has a pane to put it
         // in, and **deliberately not** `notes_available`. Every other surface
@@ -1495,7 +1737,8 @@ pub fn capabilities(state: State<'_, AppState>) -> Result<CapabilitiesVm, IpcErr
         // `desktop` and `mobile` as a partition of the targets it builds for,
         // so today the two are exhaustive — but writing `true` would make the
         // flag stop being a claim about this build, and `AppState::new`
-        // already `compile_error!`s on a mobile target that is not iOS. A
+        // already `compile_error!`s on a mobile target that is neither iOS
+        // nor Android. A
         // later target earns the pane by joining the partition, not by
         // inheriting a literal.
         //
@@ -1526,6 +1769,58 @@ pub fn capabilities(state: State<'_, AppState>) -> Result<CapabilitiesVm, IpcErr
     })
 }
 
+/// What this build tells the webview about itself beyond what it offers (Epic
+/// 98, story 98.3 #3, #4, #5; codemap Q12 (b), Q13): the spelling keeper's
+/// custom scheme URLs take here, whether this device is a tablet, and the
+/// reduced build's "On this …" disclosure, composed in `keeper_core::disclosure`
+/// for the device this is. A desktop has no disclosure.
+///
+/// The tablet tier is Android's alone (R353): a device is a tablet by Android's
+/// own 600 dp smallest-width rule (`android::device_class`, read from
+/// `MainActivity`), a fact of the device that the on-screen keyboard cannot
+/// change. An iOS build is never a tablet here, an iPad included: its
+/// disclosure is the iPhone's ("On this iPhone"), and the tablet's layout and
+/// dock sheet do not apply under it — an iPad build would need its own
+/// disclosure and its own decision first.
+pub fn platform_facts() -> keeper_core::vm::PlatformVm {
+    #[cfg(target_os = "ios")]
+    let device = Some(keeper_core::disclosure::Device::Iphone);
+    #[cfg(target_os = "android")]
+    let device = Some(match crate::android::device_class() {
+        keeper_core::org_account::layout::DeviceClass::Tablet => {
+            keeper_core::disclosure::Device::AndroidTablet
+        }
+        _ => keeper_core::disclosure::Device::AndroidPhone,
+    });
+    #[cfg(not(any(target_os = "ios", target_os = "android")))]
+    let device = None;
+    keeper_core::vm::PlatformVm {
+        url_form: keeper_core::asset_url::UrlForm::HOST,
+        tablet: device == Some(keeper_core::disclosure::Device::AndroidTablet),
+        disclosure: device.map(keeper_core::disclosure::disclosure),
+    }
+}
+
+/// The plugin whose initialization script writes [`platform_facts`] into every
+/// webview as `window.__KEEPER_PLATFORM__` before the bundle runs, which
+/// `src/lib/stores/platform.ts` reads as its starting value. Every fact in it
+/// is fixed for the process, so there is nothing to ask for later and no
+/// window in which the front composes a URL in the wrong spelling or lays a
+/// tablet out as a phone (review R98TAB-06). On Android the app's own pages
+/// come from Tauri's custom protocol, where the script is prepended to the
+/// page or added at document start — before any of keeper's scripts.
+pub fn platform_plugin() -> tauri::plugin::TauriPlugin<tauri::Wry> {
+    let builder = tauri::plugin::Builder::new("keeper-platform");
+    match serde_json::to_string(&platform_facts()) {
+        Ok(facts) => builder.js_init_script(format!("window.__KEEPER_PLATFORM__ = {facts};")),
+        Err(error) => {
+            tracing::error!(%error, "platform facts: could not write them for the webview");
+            builder
+        }
+    }
+    .build()
+}
+
 /// Whether this build and this machine can show notes (FR-122).
 ///
 /// Derived from the same `git` resolution `CapabilitiesVm.sync` reports, because a
@@ -1549,11 +1844,26 @@ fn notes_capability_of(report: &SyncGitVm) -> bool {
 }
 
 /// The gate for what rides the folder but stays on the Mac (AD-201): the
-/// sessions board and the drive half of Bots. `desktop && sync`, with the tier
-/// a parameter so the phone's shape can be asserted from any host.
+/// drive half of Bots. `desktop && sync`, with the tier a parameter so the
+/// phone's shape can be asserted from any host.
 fn mac_folder_capability_of(report: &SyncGitVm, desktop: bool) -> bool {
     desktop && notes_capability_of(report)
 }
+
+/// The sessions board's gate (98.2 #6, AD-27): `sync`, and on the phone a
+/// sessions zone here as well — a board over no zone would be columns saying
+/// nothing true. The tier and the zone are parameters so both states are
+/// asserted from any host.
+fn sessions_capability_of(report: &SyncGitVm, desktop: bool, zone_here: bool) -> bool {
+    notes_capability_of(report) && (desktop || zone_here)
+}
+
+/// Said when a capability that can change while keeper runs has changed —
+/// today the phone's `sessions`, when its first zone lands or its last goes
+/// (98.2). The webview asks `capabilities` again; the payload is empty. Only
+/// a phone says it: the Mac's capabilities do not change while keeper runs.
+#[cfg(not(desktop))]
+pub const CAPABILITIES_CHANGED_EVENT: &str = "keeper://capabilities-changed";
 
 /// The same answer for a caller that holds an app handle rather than the state —
 /// the tray, which decides at menu-build time whether the notes section exists at
@@ -4616,6 +4926,122 @@ pub fn notify_set_preview_enabled(
         .map_err(to_ipc_error)
 }
 
+/// Read `push.gateway_url` (98.1, Q4) as Settings shows it: the stored
+/// address, and Rust's sentence when what is stored is one keeper will not
+/// register. Every target, so the command list is identical everywhere; only
+/// the phones draw the field.
+#[tauri::command]
+pub fn push_gateway_get(
+    state: State<'_, AppState>,
+) -> Result<keeper_core::agents::push::PushGatewayVm, IpcError> {
+    let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
+    let stored = keeper_core::registry::get_push_gateway_url(&data_dir).map_err(to_ipc_error)?;
+    Ok(keeper_core::agents::push::PushGatewayVm::of(
+        stored.as_deref(),
+    ))
+}
+
+/// Set `push.gateway_url` (98.1, Q4): blank clears it (no push); anything
+/// else is stored only as `Gateway::parse` normalises it, and a refusal is
+/// returned as its sentence with nothing written. Returns what was stored.
+#[tauri::command]
+pub fn push_gateway_set(
+    state: State<'_, AppState>,
+    url: String,
+) -> Result<keeper_core::agents::push::PushGatewayVm, IpcError> {
+    let gateway = keeper_core::agents::push::Gateway::parse(&url).map_err(|why| IpcError {
+        code: IpcErrorCode::Internal,
+        message: why.to_string(),
+        account_id: None,
+        retriable: false,
+    })?;
+    let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
+    keeper_core::registry::set_push_gateway_url(&data_dir, gateway.as_ref())
+        .map_err(to_ipc_error)?;
+    // The pusher follows the setting at once: set where there is a gateway,
+    // removed where there is none (98.1 #3).
+    #[cfg(target_os = "ios")]
+    crate::push_ios::register_soon();
+    Ok(keeper_core::agents::push::PushGatewayVm::of(
+        gateway
+            .as_ref()
+            .map(keeper_core::agents::push::Gateway::as_str),
+    ))
+}
+
+/// The session room a tapped keeper notification opens, once (98.1,
+/// UX-DR144): the webview asks on mount — for a tap that launched keeper —
+/// and on `push://open`. Every target, so the command list is identical
+/// everywhere; the iPhone (`push_ios`) and Android (`push_android`) push.
+#[cfg(target_os = "ios")]
+#[tauri::command]
+pub fn push_open_take() -> Result<Option<keeper_core::agents::push::PushOpenVm>, IpcError> {
+    Ok(crate::push_ios::take_open())
+}
+
+/// Android's twin: the room a tapped notification opens (98.4).
+#[cfg(target_os = "android")]
+#[tauri::command]
+pub fn push_open_take() -> Result<Option<keeper_core::agents::push::PushOpenVm>, IpcError> {
+    Ok(crate::push_android::take_open())
+}
+
+/// No push here, so nothing is ever waiting to be opened.
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
+#[tauri::command]
+pub fn push_open_take() -> Result<Option<keeper_core::agents::push::PushOpenVm>, IpcError> {
+    Ok(None)
+}
+
+/// Where push through UnifiedPush stands on this Android device, and what it
+/// brings (98.4, Settings → Notifications): `None` on every other build,
+/// where push is the iPhone's gateway field or absent. Every target, so the
+/// command list is identical everywhere.
+#[cfg(target_os = "android")]
+#[tauri::command]
+pub fn unifiedpush_status(
+) -> Result<Option<keeper_core::agents::unifiedpush::UnifiedPushVm>, IpcError> {
+    Ok(Some(crate::push_android::status()))
+}
+
+/// Not Android: no UnifiedPush.
+#[cfg(not(target_os = "android"))]
+#[tauri::command]
+pub fn unifiedpush_status(
+) -> Result<Option<keeper_core::agents::unifiedpush::UnifiedPushVm>, IpcError> {
+    Ok(None)
+}
+
+/// The person confirmed the UnifiedPush distributor `package` in Settings →
+/// Notifications (98.4, R98UP1-02): keeper keeps the choice on this device
+/// and registers with it, and answers where push stands now. Only a
+/// distributor keeper asked about is confirmed. `None` on every other build.
+#[cfg(target_os = "android")]
+#[tauri::command]
+pub async fn unifiedpush_confirm(
+    package: String,
+) -> Result<Option<keeper_core::agents::unifiedpush::UnifiedPushVm>, IpcError> {
+    crate::push_android::confirm(&package)
+        .await
+        .map(Some)
+        .map_err(|message| IpcError {
+            code: IpcErrorCode::Internal,
+            message,
+            account_id: None,
+            retriable: false,
+        })
+}
+
+/// Not Android: no UnifiedPush, nothing to confirm.
+#[cfg(not(target_os = "android"))]
+#[tauri::command]
+pub async fn unifiedpush_confirm(
+    package: String,
+) -> Result<Option<keeper_core::agents::unifiedpush::UnifiedPushVm>, IpcError> {
+    let _ = package;
+    Ok(None)
+}
+
 /// Read the global Do-Not-Disturb switch (Story 10.2). Returns the in-memory
 /// [`NotifyConfig`](keeper_core::notify::NotifyConfig) value (seeded from the persisted
 /// registry at startup; default off). Infallible — reads process state, never fails.
@@ -5450,20 +5876,15 @@ fn device_ulid(data_dir: &Path) -> Result<String, IpcError> {
 
 /// The mobile twin: there is no `sync.db` to read.
 ///
-/// Folder sync is a desktop-only dependency, so `keeper_sync` is not even linked
-/// here — and neither is a recorder (`IosRecorder::is_available` is `false` and
-/// its `run_session` returns `Unsupported`). The refusal quotes that recorder's
-/// own sentence so the two paths are indistinguishable to a caller, and it now
-/// refuses before a session folder is created rather than after.
+/// Folder sync is a desktop-only dependency, and a phone or tablet has no
+/// recorder (`MobileRecorder::is_available` is `false` and its `run_session`
+/// returns `Unsupported`). The refusal is that recorder's own
+/// ([`MobileRecorder::refused`]) on iOS and Android alike, so the two paths are
+/// indistinguishable to a caller, and it refuses before a session folder is
+/// created rather than after.
 #[cfg(not(desktop))]
 fn device_ulid(_data_dir: &Path) -> Result<String, IpcError> {
-    Err(to_ipc_error(CoreError::Unsupported(
-        if cfg!(target_os = "ios") {
-            "recording is not available on iOS".to_owned()
-        } else {
-            "recording is not available on this platform".to_owned()
-        },
-    )))
+    Err(to_ipc_error(crate::recorder::MobileRecorder::refused()))
 }
 
 /// Create the session folder for one start, walking the template's ordinal.
@@ -12530,6 +12951,28 @@ pub async fn egress_list(
         descriptor.as_ref(),
         keeper_core::forges::BUILTIN_GITHUB_CLIENT_ID,
     ));
+    // This Mac's MCP servers (96.2 #10): the table Settings › Agents
+    // writes, read on every call, each server's host or program once.
+    #[cfg(desktop)]
+    destinations.extend(keeper_core::egress::agent_egress(
+        &keeper_core::agents::mac_tables::read(&data_dir).mcp,
+    ));
+    // The push gateway the person named (98.1 #8, R330): only the iPhone
+    // registers a pusher to it, and only while the setting holds an address
+    // keeper registers; keeper never contacts it, its homeserver does.
+    #[cfg(target_os = "ios")]
+    destinations.extend(keeper_core::egress::push_egress(
+        keeper_core::registry::get_push_gateway_url(&data_dir)
+            .map_err(to_ipc_error)?
+            .as_deref(),
+    ));
+    // Android's UnifiedPush server (98.4 #8): the endpoint the distributor
+    // gave, by host — keeper asks it whether it is a Matrix gateway, and the
+    // homeserver sends it event ids.
+    #[cfg(target_os = "android")]
+    destinations.extend(keeper_core::egress::unifiedpush_egress(
+        keeper_core::agents::unifiedpush::kept_endpoint(&data_dir).as_ref(),
+    ));
     Ok(destinations)
 }
 
@@ -12634,12 +13077,24 @@ pub async fn inbox_unsubscribe(
 /// tears down the account's live supervision tasks then deletes exactly its SDK
 /// store dir, Keychain session entry, and registry row — no server-side logout,
 /// works offline, and is idempotent whether or not the account was ever
-/// activated. Failures funnel through [`to_ipc_error`].
+/// activated. On iOS it first asks the homeserver, best effort, to drop this
+/// phone's pusher (`push_ios::pusher_ids`, R340). Failures funnel through
+/// [`to_ipc_error`].
 #[tauri::command]
 pub async fn sign_out(state: State<'_, AppState>, account_id: String) -> Result<(), IpcError> {
+    #[cfg(target_os = "ios")]
+    let pusher = crate::push_ios::pusher_ids();
+    #[cfg(target_os = "android")]
+    let pusher = state
+        .platform
+        .data_dir()
+        .ok()
+        .and_then(|dir| crate::push_android::pusher_ids(&dir));
+    #[cfg(not(any(target_os = "ios", target_os = "android")))]
+    let pusher = None;
     state
         .accounts
-        .sign_out(&state.platform, &account_id)
+        .sign_out(&state.platform, &account_id, pusher)
         .await
         .map_err(to_ipc_error)?;
     // The account leaves the person's `matrix.toml` for this device.
@@ -12676,11 +13131,11 @@ mod tests {
     }
 
     /// Epic 66, Story 66.4 (AD-200, AD-201): the phone's git report — `Ok`
-    /// with `engine: gix` — turns notes on, and leaves sessions and the drive
-    /// half of Bots on the Mac; a desktop whose git the engine refuses has
-    /// none of the three.
+    /// with `engine: gix` — turns notes on, and leaves the drive half of Bots
+    /// on the Mac; a desktop whose git the engine refuses has neither. 98.2
+    /// #6: the phone's board is there exactly when a sessions zone is.
     #[test]
-    fn the_phone_shaped_report_opens_notes_and_keeps_sessions_on_the_mac() {
+    fn the_phone_shaped_report_opens_notes_and_keeps_bot_tools_on_the_mac() {
         let phone = SyncGitVm {
             state: SyncGitState::Ok,
             engine: SyncGitEngine::Gix,
@@ -12691,9 +13146,21 @@ mod tests {
         assert!(notes_capability_of(&phone));
         assert!(
             !mac_folder_capability_of(&phone, false),
-            "sessions stay on the Mac"
+            "bot tools stay on the Mac"
         );
         assert!(mac_folder_capability_of(&phone, true));
+        assert!(
+            sessions_capability_of(&phone, false, true),
+            "a phone with a sessions zone has the board"
+        );
+        assert!(
+            !sessions_capability_of(&phone, false, false),
+            "a phone with none has no board"
+        );
+        assert!(
+            sessions_capability_of(&phone, true, false),
+            "the Mac's board needs no zone to be offered"
+        );
 
         let refused = SyncGitVm {
             state: SyncGitState::Missing,
@@ -12704,6 +13171,7 @@ mod tests {
         };
         assert!(!notes_capability_of(&refused));
         assert!(!mac_folder_capability_of(&refused, true));
+        assert!(!sessions_capability_of(&refused, false, true));
     }
 
     #[test]

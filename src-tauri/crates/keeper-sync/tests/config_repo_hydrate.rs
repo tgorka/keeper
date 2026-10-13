@@ -18,13 +18,69 @@ use std::{
 };
 
 use keeper_sync::config_repo::{
-    completion_digest, hydrate_lfs_dir, hydration_is_current, HydrateReport, RepoAuth,
-    HYDRATE_COMPLETE_FILE, HYDRATE_STATE_FILE,
+    completion_digest, hydrate_complete_file, hydrate_lfs_dir, hydrate_state_file,
+    hydration_is_current, Folders, HydrateGroup, HydrateReport, Manifest, RepoAuth,
 };
 use keeper_sync::error::SyncError;
 use keeper_sync::lfs::{pointer::Pointer, store::LfsStore};
 
 const TOKEN: &str = "eyJ.config";
+
+/// The whole directory, as one group.
+const ALL: HydrateGroup<'static> = HydrateGroup {
+    name: "all",
+    folders: Folders::AllBut(&[]),
+    manifest: None,
+};
+
+/// The lines of `models.toml`'s `wanted` sections, as keeper-core's
+/// fingerprints read it: what one group depends on.
+fn sections(raw: &[u8], wanted: &[&str]) -> Option<String> {
+    let raw = std::str::from_utf8(raw).ok()?;
+    let mut taking = false;
+    let mut kept = String::new();
+    for line in raw.lines() {
+        if let Some(section) = line.strip_prefix('[') {
+            taking = wanted.iter().any(|name| section == format!("{name}]"));
+        }
+        if taking {
+            kept.push_str(line);
+            kept.push('\n');
+        }
+    }
+    Some(kept)
+}
+
+fn transcription_manifest(raw: &[u8]) -> Option<String> {
+    sections(raw, &["asr", "diarizer", "embedding"])
+}
+
+fn turn_manifest(raw: &[u8]) -> Option<String> {
+    sections(raw, &["vad", "smart_turn"])
+}
+
+/// The transcription and turn groups over `turn_dirs`, each reading its own
+/// sections of `models.toml`.
+fn role_groups(turn_dirs: &[String]) -> (HydrateGroup<'_>, HydrateGroup<'_>) {
+    (
+        HydrateGroup {
+            name: "transcription",
+            folders: Folders::AllBut(turn_dirs),
+            manifest: Some(Manifest {
+                file: "models.toml",
+                fingerprint: transcription_manifest,
+            }),
+        },
+        HydrateGroup {
+            name: "turn",
+            folders: Folders::Only(turn_dirs),
+            manifest: Some(Manifest {
+                file: "models.toml",
+                fingerprint: turn_manifest,
+            }),
+        },
+    )
+}
 
 fn oid_of(bytes: &[u8]) -> String {
     LfsStore::digest_of(bytes).expect("hash").0
@@ -191,10 +247,21 @@ async fn hydrate(
     auth: &RepoAuth,
     dest: &Path,
 ) -> keeper_sync::error::Result<HydrateReport> {
+    hydrate_group(server, clone, ALL, auth, dest).await
+}
+
+async fn hydrate_group(
+    server: &Server,
+    clone: &Path,
+    group: HydrateGroup<'_>,
+    auth: &RepoAuth,
+    dest: &Path,
+) -> keeper_sync::error::Result<HydrateReport> {
     hydrate_lfs_dir(
         &reqwest::Client::new(),
         clone,
         "_models",
+        group,
         &server.remote_url,
         auth,
         dest,
@@ -277,7 +344,7 @@ async fn a_tree_is_hydrated_once_and_then_found_in_place() {
         std::fs::symlink_metadata(dest.join("escape")).is_err(),
         "a symbolic link is neither followed nor recreated"
     );
-    assert!(dest.join(HYDRATE_STATE_FILE).is_file());
+    assert!(dest.join(hydrate_state_file(ALL.name)).is_file());
 
     let second = hydrate(&server, &clone, &bearer(), &dest)
         .await
@@ -340,7 +407,7 @@ async fn content_that_does_not_match_its_pointer_is_refused_and_not_written() {
         std::fs::read(dest.join("weights.bin")).expect("placed"),
         encoder
     );
-    let state = std::fs::read_to_string(dest.join(HYDRATE_STATE_FILE)).expect("state");
+    let state = std::fs::read_to_string(dest.join(hydrate_state_file(ALL.name))).expect("state");
     assert!(
         state.contains("weights.bin") && !state.contains("vocab.json"),
         "{state}"
@@ -420,6 +487,7 @@ async fn a_directory_outside_the_copy_is_refused() {
                 &reqwest::Client::new(),
                 &clone,
                 rel,
+                ALL,
                 &url,
                 &bearer(),
                 &dest,
@@ -465,6 +533,7 @@ async fn an_interrupt_cancels_the_run() {
         &reqwest::Client::new(),
         &clone,
         "_models",
+        ALL,
         &server.remote_url,
         &bearer(),
         &dest,
@@ -541,7 +610,7 @@ async fn a_half_updated_set_is_never_current() {
         pointer_text(VOCAB).as_bytes(),
     );
     write(&clone.join("_models/models.toml"), MODELS_TOML);
-    let current = || hydration_is_current(&clone, "_models", &dest);
+    let current = || hydration_is_current(&clone, "_models", ALL, &dest);
     assert!(!current(), "nothing hydrated yet");
 
     let server = Server::start(HashMap::from([
@@ -552,12 +621,15 @@ async fn a_half_updated_set_is_never_current() {
         .await
         .expect("hydrates");
     assert!(current());
-    let first = completion_digest(&dest).expect("marked complete");
+    let first = completion_digest(&dest, ALL.name).expect("marked complete");
     hydrate(&server, &clone, &bearer(), &dest)
         .await
         .expect("nothing to do");
     assert!(current(), "a run that changes nothing keeps the set ready");
-    assert_eq!(completion_digest(&dest).as_deref(), Some(first.as_str()));
+    assert_eq!(
+        completion_digest(&dest, ALL.name).as_deref(),
+        Some(first.as_str())
+    );
 
     // The config repository moves the decoder to new weights.
     let decoder = b"new decoder weights".to_vec();
@@ -572,7 +644,7 @@ async fn a_half_updated_set_is_never_current() {
         dest.join("Decoder/weights.bin").is_file(),
         "the old decoder is still on disk, so nothing looks missing"
     );
-    assert!(!dest.join(HYDRATE_COMPLETE_FILE).exists());
+    assert!(!dest.join(hydrate_complete_file(ALL.name)).exists());
     assert!(!current(), "…and yet the set is not ready");
 
     let updated = Server::start(HashMap::from([(oid_of(&decoder), decoder.clone())]));
@@ -580,12 +652,13 @@ async fn a_half_updated_set_is_never_current() {
         .await
         .expect("the rest of the set arrives");
     assert!(current());
-    assert_ne!(completion_digest(&dest), Some(first));
+    assert_ne!(completion_digest(&dest, ALL.name), Some(first));
 
     let cancelled = hydrate_lfs_dir(
         &reqwest::Client::new(),
         &clone,
         "_models",
+        ALL,
         &updated.remote_url,
         &bearer(),
         &dest,
@@ -594,4 +667,266 @@ async fn a_half_updated_set_is_never_current() {
     .await;
     assert!(matches!(cancelled, Err(SyncError::Cancelled)));
     assert!(!current(), "a cancelled run leaves the set unvouched for");
+}
+
+/// Two groups into one destination, the way keeper fetches its models: the
+/// turn group asks the server for its two folders' objects and nothing else
+/// (the transcription model is neither requested nor written), both groups
+/// copy the plain top-level files, and each keeps its own marker and state —
+/// so a new turn model makes only the turn group stale, and bringing it up to
+/// date leaves the transcription group's marker as it was.
+#[tokio::test]
+async fn hydrate_lfs_dir_takes_only_the_named_roles() {
+    let work = tempfile::tempdir().expect("tempdir");
+    let clone = work.path().join("repo");
+    let dest = work.path().join("models");
+    let asr = encoder();
+    let vad = b"silero weights".to_vec();
+    let turn = b"smart turn weights".to_vec();
+    write(
+        &clone.join("_models/parakeet/Encoder.mlmodelc/weights.bin"),
+        pointer_text(&asr).as_bytes(),
+    );
+    write(
+        &clone.join("_models/silero-vad/model.onnx"),
+        pointer_text(&vad).as_bytes(),
+    );
+    write(
+        &clone.join("_models/smart-turn-v3/model.onnx"),
+        pointer_text(&turn).as_bytes(),
+    );
+    write(&clone.join("_models/silero-vad/LICENSE"), b"MIT");
+    write(&clone.join("_models/models.toml"), MODELS_TOML);
+    let server = Server::start(HashMap::from([
+        (oid_of(&asr), asr.clone()),
+        (oid_of(&vad), vad.clone()),
+        (oid_of(&turn), turn.clone()),
+    ]));
+    let turn_dirs = ["silero-vad".to_owned(), "smart-turn-v3".to_owned()];
+    let (transcription, turn_group) = role_groups(&turn_dirs);
+
+    let report = hydrate_group(&server, &clone, turn_group, &bearer(), &dest)
+        .await
+        .expect("the turn models");
+    assert_eq!((report.downloaded, report.copied), (2, 2));
+    assert_eq!(server.batches(), vec![2], "only the two turn objects asked");
+    assert_eq!(server.downloads(), 2);
+    assert_eq!(
+        std::fs::read(dest.join("silero-vad/model.onnx")).expect("vad"),
+        vad
+    );
+    assert_eq!(
+        std::fs::read(dest.join("smart-turn-v3/model.onnx")).expect("turn"),
+        turn
+    );
+    assert!(dest.join("models.toml").is_file());
+    assert!(!dest.join("parakeet").exists(), "nothing else is written");
+    assert!(hydration_is_current(&clone, "_models", turn_group, &dest));
+    assert!(!hydration_is_current(
+        &clone,
+        "_models",
+        transcription,
+        &dest
+    ));
+
+    let report = hydrate_group(&server, &clone, transcription, &bearer(), &dest)
+        .await
+        .expect("the transcription models");
+    assert_eq!(
+        (report.downloaded, report.copied, report.skipped),
+        (1, 0, 1),
+        "the transcription model fetched; models.toml already in place"
+    );
+    assert_eq!(server.batches(), vec![2, 1]);
+    let transcription_state =
+        std::fs::read_to_string(dest.join(hydrate_state_file("transcription"))).expect("state");
+    assert!(
+        transcription_state.contains("parakeet") && !transcription_state.contains("silero"),
+        "{transcription_state}"
+    );
+    let transcription_digest =
+        completion_digest(&dest, "transcription").expect("transcription marked");
+    let turn_digest = completion_digest(&dest, "turn").expect("turn marked");
+    assert_ne!(transcription_digest, turn_digest);
+
+    // The organisation publishes a new Smart Turn.
+    let turn_next = b"smart turn weights, retrained".to_vec();
+    write(
+        &clone.join("_models/smart-turn-v3/model.onnx"),
+        pointer_text(&turn_next).as_bytes(),
+    );
+    assert!(!hydration_is_current(&clone, "_models", turn_group, &dest));
+    assert!(
+        hydration_is_current(&clone, "_models", transcription, &dest),
+        "a turn model change never makes transcription look half-updated"
+    );
+    let updated = Server::start(HashMap::from([(oid_of(&turn_next), turn_next.clone())]));
+    let report = hydrate_group(&updated, &clone, turn_group, &bearer(), &dest)
+        .await
+        .expect("the new turn model");
+    assert_eq!(report.downloaded, 1);
+    assert_eq!(updated.batches(), vec![1]);
+    assert!(hydration_is_current(&clone, "_models", turn_group, &dest));
+    assert_eq!(
+        completion_digest(&dest, "transcription").as_deref(),
+        Some(transcription_digest.as_str())
+    );
+    assert_ne!(completion_digest(&dest, "turn"), Some(turn_digest));
+}
+
+/// A group's name becomes two file names in the destination, so it is
+/// letters only: anything else is refused before anything is read.
+#[tokio::test]
+async fn a_group_name_that_is_not_letters_is_refused() {
+    let work = tempfile::tempdir().expect("tempdir");
+    let clone = work.path().join("repo");
+    let dest = work.path().join("models");
+    write(&clone.join("_models/models.toml"), MODELS_TOML);
+    let server = Server::start(HashMap::new());
+    for name in ["", "../turn", "Turn"] {
+        let group = HydrateGroup {
+            name,
+            folders: Folders::AllBut(&[]),
+            manifest: None,
+        };
+        let refused = hydrate_group(&server, &clone, group, &bearer(), &dest).await;
+        assert!(matches!(refused, Err(SyncError::Config(_))), "{name:?}");
+    }
+    assert!(!dest.exists());
+}
+
+const ROLES_TOML: &[u8] = b"[asr]\ndir = \"parakeet\"\n\n[vad]\ndir = \"silero-vad\"\n\n\
+    [smart_turn]\ndir = \"smart-turn-v3\"\n";
+
+/// A clone with a transcription model and two turn models, all served.
+fn roles_clone(clone: &Path) -> HashMap<String, Vec<u8>> {
+    let asr = encoder();
+    let vad = b"silero weights".to_vec();
+    let turn = b"smart turn weights".to_vec();
+    for (rel, bytes) in [
+        ("parakeet/Encoder.mlmodelc/weights.bin", &asr),
+        ("silero-vad/model.onnx", &vad),
+        ("smart-turn-v3/model.onnx", &turn),
+    ] {
+        write(
+            &clone.join("_models").join(rel),
+            pointer_text(bytes).as_bytes(),
+        );
+    }
+    write(&clone.join("_models/models.toml"), ROLES_TOML);
+    HashMap::from([
+        (oid_of(&asr), asr),
+        (oid_of(&vad), vad),
+        (oid_of(&turn), turn),
+    ])
+}
+
+/// A turn model picked in settings whose object the server does not have:
+/// the turn group fails, and transcription — which leaves the picked folder
+/// out — hydrates, stays current and keeps its marker. Had transcription
+/// taken the picked folder, its own hydration would have failed on it.
+#[tokio::test]
+async fn an_unavailable_picked_turn_model_leaves_transcription_usable() {
+    let work = tempfile::tempdir().expect("tempdir");
+    let clone = work.path().join("repo");
+    let dest = work.path().join("models");
+    let server = Server::start(roles_clone(&clone));
+    write(
+        &clone.join("_models/silero-vad-v7/model.onnx"),
+        pointer_text(b"silero v7, never uploaded").as_bytes(),
+    );
+    let picked = [
+        "silero-vad".to_owned(),
+        "silero-vad-v7".to_owned(),
+        "smart-turn-v3".to_owned(),
+    ];
+    let (transcription, turn) = role_groups(&picked);
+
+    hydrate_group(&server, &clone, transcription, &bearer(), &dest)
+        .await
+        .expect("transcription never asks for the picked folder");
+    let failed = hydrate_group(&server, &clone, turn, &bearer(), &dest).await;
+    assert!(failed.is_err(), "the picked object is not on the server");
+    assert!(!hydration_is_current(&clone, "_models", turn, &dest));
+    assert!(hydration_is_current(
+        &clone,
+        "_models",
+        transcription,
+        &dest
+    ));
+    assert!(completion_digest(&dest, "transcription").is_some());
+    assert!(dest.join("parakeet/Encoder.mlmodelc/weights.bin").is_file());
+
+    // The overlap the groups must not have: a transcription group taking the
+    // picked folder fails on its object.
+    let repo_only = ["silero-vad".to_owned(), "smart-turn-v3".to_owned()];
+    let (overlapping, _) = role_groups(&repo_only);
+    let overlapping = HydrateGroup {
+        name: "overlap",
+        ..overlapping
+    };
+    assert!(
+        hydrate_group(&server, &clone, overlapping, &bearer(), &dest)
+            .await
+            .is_err()
+    );
+}
+
+/// The documented upgrade: `[smart_turn] dir` moves to a new folder, the old
+/// one kept. Transcription — its sections of `models.toml` and its folders
+/// unchanged — is current before the turn group is fetched and while that
+/// fetch fails, and copying the new `models.toml` changes nothing for it.
+#[tokio::test]
+async fn a_turn_model_version_switch_keeps_transcription_current() {
+    let work = tempfile::tempdir().expect("tempdir");
+    let clone = work.path().join("repo");
+    let dest = work.path().join("models");
+    let server = Server::start(roles_clone(&clone));
+    let before = ["silero-vad".to_owned(), "smart-turn-v3".to_owned()];
+    let (transcription, turn) = role_groups(&before);
+    hydrate_group(&server, &clone, transcription, &bearer(), &dest)
+        .await
+        .expect("transcription");
+    hydrate_group(&server, &clone, turn, &bearer(), &dest)
+        .await
+        .expect("turn");
+    let marked = completion_digest(&dest, "transcription").expect("marked");
+
+    write(
+        &clone.join("_models/smart-turn-v4/model.onnx"),
+        pointer_text(b"smart turn v4, not served yet").as_bytes(),
+    );
+    let switched = String::from_utf8(ROLES_TOML.to_vec())
+        .expect("utf-8")
+        .replace("smart-turn-v3", "smart-turn-v4");
+    write(&clone.join("_models/models.toml"), switched.as_bytes());
+    // keeper-core leaves every folder holding a turn model out of
+    // transcription, the old version's too.
+    let turn_folders = [
+        "silero-vad".to_owned(),
+        "smart-turn-v3".to_owned(),
+        "smart-turn-v4".to_owned(),
+    ];
+    let (transcription, _) = role_groups(&turn_folders);
+    let after = ["silero-vad".to_owned(), "smart-turn-v4".to_owned()];
+    let (_, turn) = role_groups(&after);
+    let current = || hydration_is_current(&clone, "_models", transcription, &dest);
+
+    assert!(current(), "before the turn group is fetched");
+    assert!(!hydration_is_current(&clone, "_models", turn, &dest));
+    let report = hydrate_group(&server, &clone, transcription, &bearer(), &dest)
+        .await
+        .expect("transcription copies the new models.toml");
+    assert_eq!(report.copied, 1);
+    assert_eq!(
+        completion_digest(&dest, "transcription").as_deref(),
+        Some(marked.as_str())
+    );
+    let failed = hydrate_group(&server, &clone, turn, &bearer(), &dest).await;
+    assert!(failed.is_err(), "the new turn model is not served yet");
+    assert!(current(), "while the turn fetch fails");
+    assert_eq!(
+        completion_digest(&dest, "transcription").as_deref(),
+        Some(marked.as_str())
+    );
 }

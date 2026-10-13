@@ -12,6 +12,8 @@
 //! - [`task`] is the scheduled bot task, over the same arming.
 //! - [`sessions`] is the sessions runtime: one plan at a time per zone.
 //! - [`ports`] is what a host process supplies.
+//! - [`promote`] promotes a session's files into its artifacts and its
+//!   harvested notes into the drive's vault, and renders the promote panel.
 //! - [`approval`] is the ask-and-wait a host with a person at it plugs in.
 //! - [`grants`] is where a turn's grants come from: the app's rows or an
 //!   agent's own `agent.toml`.
@@ -37,43 +39,67 @@
 //!   which closed sessions wake her harvest.
 //! - [`doorbell`] rings the hosts that should fetch a push of agent work,
 //!   and fetches when it is rung.
+//!
+//! **A phone builds the read half only** (story 98.2, AD-413): under
+//! `cfg(phone)` (`build.rs` — an iOS or Android target) the session worker,
+//! [`writer`], the approvals writer in [`approvals`], the run writer in
+//! [`cards`] and every module built on them are absent, so a phone code path
+//! that names one does not compile. [`sessions`] — the scan, the board and the
+//! journaled executor a card move runs through — stays.
 
 // matrix-sdk's sync future is deep enough to need it, as in keeper-core.
 #![recursion_limit = "256"]
 
+#[cfg(not(phone))]
 pub mod agent;
 pub mod approval;
+#[cfg(not(phone))]
 pub mod approvals;
+#[cfg(not(phone))]
 pub mod ask;
 pub mod bmad;
+#[cfg(not(phone))]
 pub mod cards;
 pub mod claims;
-#[cfg(unix)]
+#[cfg(all(unix, not(phone)))]
 pub mod consolidate;
-#[cfg(unix)]
+#[cfg(all(unix, not(phone)))]
 pub mod curate;
+#[cfg(not(phone))]
 pub mod deciding;
+#[cfg(not(phone))]
 pub mod delegate;
-#[cfg(unix)]
+#[cfg(all(unix, not(phone)))]
 pub mod desktop;
-#[cfg(unix)]
+#[cfg(all(unix, not(phone)))]
 pub mod doorbell;
 pub mod drive;
+#[cfg(not(phone))]
+pub mod gate;
 pub mod grants;
 #[cfg(unix)]
 pub mod headless;
+#[cfg(not(phone))]
 pub mod helper;
 pub mod host;
-#[cfg(unix)]
+#[cfg(all(unix, not(phone)))]
 pub mod hosts;
+pub mod kvm;
 pub mod maintain;
 pub mod matrix_sink;
+#[cfg(not(phone))]
+pub mod mcp;
 pub mod memory;
 pub mod ports;
+pub mod previews;
+pub mod promote;
 pub mod rooms;
-#[cfg(unix)]
+pub mod run;
+#[cfg(all(unix, not(phone)))]
 pub mod runtime;
+#[cfg(not(phone))]
 pub mod search;
+#[cfg(not(phone))]
 pub mod seed;
 pub mod sessions;
 pub mod sinks;
@@ -82,6 +108,8 @@ pub mod stewards;
 pub mod surface;
 pub mod task;
 pub mod turn;
+#[cfg(not(phone))]
 pub mod workflow;
+#[cfg(not(phone))]
 pub mod writer;
 pub mod zone;

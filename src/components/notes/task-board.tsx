@@ -181,7 +181,7 @@ export interface BoardCard {
  * A component that rendered one order and reported another would put cards
  * wherever the difference happened to fall.
  */
-function columnOf(cards: readonly BoardCard[], status: string): BoardCard[] {
+export function columnOf(cards: readonly BoardCard[], status: string): BoardCard[] {
   return cards
     .filter((card) => card.status === status)
     .sort(
@@ -348,8 +348,14 @@ export function TaskBoard({
   /** Open a card's file — a card is a note, and reading it is the point. */
   onOpen: (key: string) => void;
   /** Write the move, and re-read. Rejecting is how a refusal is reported: the
-   *  board shows keeper's own sentence and changes nothing. */
-  onMove: (key: string, status: string, index: number) => Promise<void>;
+   *  board shows keeper's own sentence and changes nothing. Resolving with a
+   *  sentence is how a move that landed still has something to say — on a
+   *  phone, that it is written there and not on the remote yet (98.2). */
+  onMove: (
+    key: string,
+    status: string,
+    index: number,
+  ) => Promise<string | null | undefined> | Promise<void>;
   /** What to say when a refusal carries no sentence of its own. */
   moveFailed?: string;
   /** A person's *Allow* on a card whose schedule an agent wrote, then re-read.
@@ -386,7 +392,10 @@ export function TaskBoard({
   const move = async (key: string, status: string, index: number) => {
     setNotice(null);
     try {
-      await onMove(key, status, index);
+      const said = await onMove(key, status, index);
+      if (typeof said === "string") {
+        setNotice(said);
+      }
     } catch (error) {
       // keeper's own sentence when it sent one — it knows what it refused and
       // this component does not (UX-DR43).

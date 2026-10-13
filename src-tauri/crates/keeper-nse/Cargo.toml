@@ -1,0 +1,32 @@
+[package]
+name = "keeper-nse"
+description = "keeper's iPhone notification extension: decrypt the one event a push names and decide what the lock screen shows (98.1, AD-412)"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+# A static library the `KeeperNotify` extension target links (gen/apple/
+# project.yml builds it in its pre-build step); `lib` so its tests run on Linux.
+[lib]
+crate-type = ["staticlib", "lib"]
+
+# Lean by rule (R24(14)): keeper-core and the Matrix SDK it already carries,
+# nothing of the app — no tauri, no keeper-agent, no keeper-sync. `bun run
+# check:nse-lean` asserts it over `cargo tree`.
+[dependencies]
+keeper-core = { path = "../keeper-core" }
+matrix-sdk = { workspace = true }
+matrix-sdk-ui = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+ulid = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

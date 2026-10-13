@@ -393,6 +393,101 @@ pub fn forge_egress(
     endpoints
 }
 
+/// This Mac's MCP servers (96.2 #10), as [`EgressKind::McpServer`] rows: a
+/// `url` server's host and port once however many servers share it — never
+/// its path, a user or a token — and a `command` server as the program
+/// keeper starts, once however many start it, which reaches whatever it
+/// reaches with the Mac's rights. A host and a program are never one row,
+/// whatever they are named (R276). Kept beside [`compute_egress`] for
+/// [`forge_egress`]'s reason: the shell appends it from the Mac's own
+/// table. No server, no row.
+pub fn agent_egress(servers: &[crate::agents::mcp::McpEntry]) -> Vec<EgressEndpointVm> {
+    use crate::agents::mcp::{url_host, McpTransport};
+    let mut endpoints: Vec<EgressEndpointVm> = Vec::new();
+    let mut seen: Vec<(bool, String)> = Vec::new();
+    for server in servers {
+        let (program, url, label) = match &server.transport {
+            McpTransport::Url(url) => {
+                let Some(host) = url_host(url) else { continue };
+                (false, host, "MCP server".to_owned())
+            }
+            McpTransport::Command(argv) => (
+                true,
+                argv[0].clone(),
+                format!("A program you configured: `{}`", argv[0]),
+            ),
+        };
+        if seen.contains(&(program, url.clone())) {
+            continue;
+        }
+        seen.push((program, url.clone()));
+        endpoints.push(EgressEndpointVm {
+            url,
+            kind: EgressKind::McpServer,
+            label,
+        });
+    }
+    endpoints
+}
+
+/// The row an egress list carries for the push gateway (98.1 #8, Q6).
+pub const PUSH_GATEWAY_LABEL: &str =
+    "Push gateway — your homeserver sends it event ids for this device";
+
+/// The push gateway the person named (98.1 #8, Q6; NFR-121), as one
+/// [`EgressKind::PushGateway`] row: its host, and its port when the address
+/// names one — the way an MCP server's row is composed
+/// ([`url_host`](crate::agents::mcp::url_host)), so `:8443` and `:443` are
+/// two destinations — never its path. `stored` is `push.gateway_url` as the
+/// settings table holds it; blank, absent, or an address
+/// [`Gateway::parse`](crate::agents::push::Gateway::parse) refuses (keeper
+/// registers no pusher with it) is no row. Kept beside [`compute_egress`] for
+/// [`forge_egress`]'s reason: the shell appends it on the phones, from the
+/// rung that registers the pusher (epic 98 rung 4, `agents-98-apns`).
+pub fn push_egress(stored: Option<&str>) -> Vec<EgressEndpointVm> {
+    let Some(Ok(Some(gateway))) = stored.map(crate::agents::push::Gateway::parse) else {
+        return Vec::new();
+    };
+    crate::agents::mcp::url_host(gateway.as_str())
+        .map(|host| EgressEndpointVm {
+            url: host,
+            kind: EgressKind::PushGateway,
+            label: PUSH_GATEWAY_LABEL.to_owned(),
+        })
+        .into_iter()
+        .collect()
+}
+
+/// The label of an Android egress list's UnifiedPush row (98.4 #8, Q6):
+/// whose server it is — the distributor the person confirmed, by name and
+/// package — and that, unlike the iPhone's gateway, keeper itself contacts
+/// it: once per endpoint, to ask whether it is a Matrix gateway.
+pub fn unifiedpush_label(distributor: &crate::agents::unifiedpush::Distributor) -> String {
+    format!(
+        "UnifiedPush server of {} — keeper asks it, once per address, whether it is a Matrix push gateway; your homeserver sends it event ids for this device",
+        distributor.named()
+    )
+}
+
+/// The UnifiedPush endpoint the person's distributor gave this device (98.4
+/// #8, Q6), as one [`EgressKind::PushGateway`] row: its host, and its port
+/// when it names one — never its path or query, which are a capability —
+/// labelled with the distributor ([`unifiedpush_label`]). The gateway keeper
+/// registers is that same server
+/// ([`crate::agents::unifiedpush::discover_gateway`]), so one row discloses
+/// both. No endpoint is no row. The shell appends it on Android.
+pub fn unifiedpush_egress(
+    kept: Option<&crate::agents::unifiedpush::KeptEndpoint>,
+) -> Vec<EgressEndpointVm> {
+    kept.map(|kept| EgressEndpointVm {
+        url: kept.endpoint.host(),
+        kind: EgressKind::PushGateway,
+        label: unifiedpush_label(&kept.distributor),
+    })
+    .into_iter()
+    .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -934,6 +1029,8 @@ mod tests {
             EgressKind::Telemetry,
             EgressKind::Account,
             EgressKind::Forge,
+            EgressKind::McpServer,
+            EgressKind::PushGateway,
         ];
 
         // Wildcard-free exhaustive match: a new `EgressKind` variant makes this
@@ -948,6 +1045,8 @@ mod tests {
                 EgressKind::Telemetry => {}
                 EgressKind::Account => {}
                 EgressKind::Forge => {}
+                EgressKind::McpServer => {}
+                EgressKind::PushGateway => {}
             }
         }
 
@@ -973,6 +1072,11 @@ mod tests {
         let enterprise = account_fixture(ENTERPRISE);
         connect(&p, &enterprise, "ghe");
         out.extend(forge_egress(&p, Some(&enterprise), None));
+        out.extend(agent_egress(&mcp_servers(&[(
+            "notes",
+            "https://notes.example.org/mcp",
+        )])));
+        out.extend(push_egress(Some("https://push.example.org")));
 
         for kind in ALL_KINDS {
             assert!(
@@ -1005,6 +1109,152 @@ mod tests {
         assert!(org_account_egress(None, None).is_empty());
         // keeper's own GitHub client exists, but nothing is connected to it.
         assert!(forge_egress(&p, None, Some("Iv1.builtin")).is_empty());
+    }
+
+    /// `[[mcp]]` entries as the one check makes them: `(name, where)`, a
+    /// `where` with a scheme a URL with a token, else a program.
+    fn mcp_servers(servers: &[(&str, &str)]) -> Vec<crate::agents::mcp::McpEntry> {
+        let raw = servers
+            .iter()
+            .map(|(name, at)| {
+                let program = !at.contains("://");
+                crate::agents::mcp::RawMcp {
+                    name: (*name).to_owned(),
+                    url: (!program).then(|| (*at).to_owned()),
+                    command: program.then(|| vec![(*at).to_owned(), "--stdio".to_owned()]),
+                    credential: (!program).then(|| format!("secret:{name}")),
+                    readers: None,
+                    role: None,
+                    fingerprint: None,
+                    trust_annotations: false,
+                    tier: Vec::new(),
+                }
+            })
+            .collect();
+        crate::agents::mcp::check(raw, &[], crate::agents::mac_tables::MAC).expect("servers")
+    }
+
+    /// 96.2 #10: each `url` server's host (with its port) once, never its
+    /// path, query or token; each `command` server as the program keeper
+    /// starts, once; no server, no row.
+    #[test]
+    fn mcp_servers_are_disclosed_by_host_and_program() {
+        assert!(agent_egress(&[]).is_empty());
+        let out = agent_egress(&mcp_servers(&[
+            ("notes", "https://notes.example.org/mcp?key=v"),
+            ("notes-b", "https://notes.example.org/other"),
+            ("local", "http://127.0.0.1:8931/mcp"),
+            ("kid", "/opt/bin/kid-mcp"),
+            ("kid-b", "/opt/bin/kid-mcp"),
+        ]));
+        let rows: Vec<(EgressKind, &str, &str)> = out
+            .iter()
+            .map(|e| (e.kind, e.url.as_str(), e.label.as_str()))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                (EgressKind::McpServer, "notes.example.org", "MCP server"),
+                (EgressKind::McpServer, "127.0.0.1:8931", "MCP server"),
+                (
+                    EgressKind::McpServer,
+                    "/opt/bin/kid-mcp",
+                    "A program you configured: `/opt/bin/kid-mcp`"
+                ),
+            ]
+        );
+        let shown = format!("{out:?}");
+        assert!(
+            !shown.contains("/mcp") && !shown.contains("key=") && !shown.contains("secret"),
+            "{shown}"
+        );
+    }
+
+    /// 98.1 #8: the gateway the person set is one row, its host — and its
+    /// port when the address names one — labelled as the homeserver's
+    /// destination; blank, absent, or an address keeper would not register
+    /// is no row.
+    #[test]
+    fn the_push_gateway_is_disclosed_by_host_once_and_nothing_when_blank() {
+        let row = |url: &str| {
+            vec![EgressEndpointVm {
+                url: url.to_owned(),
+                kind: EgressKind::PushGateway,
+                label: PUSH_GATEWAY_LABEL.to_owned(),
+            }]
+        };
+        assert_eq!(
+            push_egress(Some(
+                " https://Push.Example.org:8443/_matrix/push/v1/notify "
+            )),
+            row("push.example.org:8443")
+        );
+        // The default port is the address without one: one destination.
+        assert_eq!(
+            push_egress(Some("https://push.example.org:443")),
+            row("push.example.org")
+        );
+        for nothing in [
+            None,
+            Some(""),
+            Some("  "),
+            Some("http://push.example.org/_matrix/push/v1/notify"),
+            Some("https://me:pw@push.example.org"),
+        ] {
+            assert!(push_egress(nothing).is_empty(), "{nothing:?}");
+        }
+    }
+
+    /// 98.4 #8: the UnifiedPush endpoint is one row, its host and port —
+    /// never its path or query — labelled with the distributor whose server
+    /// it is, by name and package (R98UP1-02); no endpoint is no row.
+    #[test]
+    fn the_unifiedpush_server_is_disclosed_by_host_never_by_its_endpoint() {
+        use crate::agents::unifiedpush::{Distributor, Endpoint, KeptEndpoint};
+        let kept = KeptEndpoint {
+            endpoint: Endpoint::parse("https://ntfy.example:8443/upAbc?up=1").expect("an endpoint"),
+            distributor: Distributor {
+                package: "io.heckel.ntfy".to_owned(),
+                label: "ntfy".to_owned(),
+            },
+            gateway: true,
+        };
+        let rows = unifiedpush_egress(Some(&kept));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].url, "ntfy.example:8443");
+        assert_eq!(rows[0].kind, EgressKind::PushGateway);
+        assert!(
+            rows[0].label.contains("ntfy (io.heckel.ntfy)"),
+            "{}",
+            rows[0].label
+        );
+        assert!(!rows[0].label.contains("upAbc"), "{}", rows[0].label);
+        assert!(unifiedpush_egress(None).is_empty());
+    }
+
+    /// R96MM2-05: a URL's host and a program of the same name are two
+    /// disclosures, whichever server comes first.
+    #[test]
+    fn a_host_and_a_program_of_one_name_are_both_disclosed() {
+        let host = ("a-url", "http://localhost/mcp");
+        let program = ("b-program", "localhost");
+        let both = |first, second| {
+            let mut rows: Vec<(String, String)> = agent_egress(&mcp_servers(&[first, second]))
+                .into_iter()
+                .map(|e| (e.url, e.label))
+                .collect();
+            rows.sort();
+            rows
+        };
+        let expected = vec![
+            (
+                "localhost".to_owned(),
+                "A program you configured: `localhost`".to_owned(),
+            ),
+            ("localhost".to_owned(), "MCP server".to_owned()),
+        ];
+        assert_eq!(both(host, program), expected);
+        assert_eq!(both(program, host), expected);
     }
 
     const ENTERPRISE: &str = r#""config": { "url": "https://git.acme.dev/c.git" },

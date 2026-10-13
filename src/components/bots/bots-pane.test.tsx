@@ -223,6 +223,9 @@ const WITH_BOT_TOOLS = { ...DEFAULT_CAPABILITIES, bots: true, botTools: true, sy
 /** Full folder sync, `bots` off — the state a gate on the wrong flag misreads. */
 const SYNC_WITHOUT_BOTS = {
   ...DEFAULT_CAPABILITIES,
+  // A desktop: `sessions` is true on a phone with a zone too (98.2), so a
+  // tier-telling flag says which this is.
+  trayIcon: true,
   sync: true,
   notes: true,
   sessions: true,

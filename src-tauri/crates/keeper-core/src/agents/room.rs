@@ -40,8 +40,11 @@ use crate::agents::approval_card::{ApprovalFold, ApprovalVm, Senders, Viewer};
 use crate::agents::delegation::{enveloped_brief, trusted_brief, DelegateContent};
 use crate::agents::events::{
     RunState, StatusContent, APPROVAL_CONSUMED, APPROVAL_DECISION, APPROVAL_REQUEST, CLAIM,
-    CONTENT_VERSION, CONTROL_ROOM_TYPE, DELEGATE, HOST, SCOPE, SESSION_ROOM_TYPE, STATUS, TURN,
+    CONTENT_VERSION, CONTROL_ROOM_TYPE, DELEGATE, HEARD, HOST, SCOPE, SESSION_ROOM_TYPE, STATUS,
+    TURN,
 };
+use crate::agents::gate_room::{GateHeaderVm, GateInput, GateLineVm, GateView};
+use crate::agents::heard::RoomMarks;
 use crate::agents::label::{Label, LabelVm, Readers};
 use crate::agents::proxy::ProxyListEventContent;
 use crate::agents::session::SessionKind;
@@ -210,8 +213,9 @@ pub fn is_trusted_turn(
 /// Who may stream an answer or hand work on in the room being drawn: its
 /// agent room kind, its power levels as last read (`None` when unread,
 /// which trusts no one), its creators (empty when unread, which trusts no
-/// brief), its members as last read ([`Roster`]) and the agents this device
-/// knows (`None` knows none).
+/// brief), its members as last read ([`Roster`]), the agents this device
+/// knows (`None` knows none) and, in a gate room, what its loaded timeline
+/// says of each request (`None` elsewhere, which draws no gate line).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TurnTrust<'a> {
     pub kind: Option<AgentRoomKind>,
@@ -219,6 +223,7 @@ pub struct TurnTrust<'a> {
     pub creators: &'a [OwnedUserId],
     pub roster: Option<&'a Roster>,
     pub known: Option<&'a BTreeSet<OwnedUserId>>,
+    pub gate: Option<&'a GateView>,
 }
 
 impl TurnTrust<'_> {
@@ -231,6 +236,22 @@ impl TurnTrust<'_> {
             holds_agent_power(self.levels, sender),
             json,
         )
+    }
+
+    /// Whether `user` holds an agent's power under the levels as read.
+    pub fn is_agent(&self, user: &UserId) -> bool {
+        holds_agent_power(self.levels, user)
+    }
+
+    /// How `message` — its event id, sender, original event, whether it was
+    /// edited and its sender's name — is drawn in a gate room as `own`
+    /// reads it (UX-DR147): only in a session room whose gate view is read,
+    /// a sender at an agent's power being the gate ([`GateView::line`]).
+    pub fn gate_line(&self, own: &UserId, message: GateInput<'_>) -> Option<GateLineVm> {
+        if self.kind != Some(AgentRoomKind::Session) {
+            return None;
+        }
+        self.gate?.line(own, message, &|user| self.is_agent(user))
     }
 
     /// The brief `sender`'s message hands on, read by `own`, with `json` its
@@ -343,6 +364,7 @@ impl Trust {
             creators: &self.creators,
             roster: self.roster.as_ref(),
             known: Some(&self.known),
+            gate: None,
         }
     }
 }
@@ -537,6 +559,9 @@ pub struct AgentRoomHeaderVm {
     /// The render key of the newest answer's anchor while the run is
     /// `running`: the message that draws the growing caret.
     pub caret_key: Option<String>,
+    /// In a gate room (UX-DR147): the outside system's name and account;
+    /// `None` in any other room, or before a status says it is a gate's.
+    pub gate: Option<GateHeaderVm>,
 }
 
 /// The sentence for a status from a newer keeper.
@@ -755,6 +780,17 @@ impl AgentRoomState {
         }
     }
 
+    /// The system a gate room's session is the door for: the title of its
+    /// newest readable status, when that says the session is a gate's.
+    pub fn gate_system(&self) -> Option<&str> {
+        match &self.status {
+            Some((_, StatusRead::Read(status))) if status.kind == SessionKind::Gate => {
+                Some(&status.title)
+            }
+            _ => None,
+        }
+    }
+
     /// The users the header names: the agent and the label's readers, for
     /// the caller to resolve to display names.
     pub fn named(&self) -> Vec<OwnedUserId> {
@@ -782,13 +818,15 @@ impl AgentRoomState {
     }
 
     /// The header, naming users as `name` does, marking the agent with its
-    /// soul's icon from `icons`, and drawing the caret on `newest_turn` while
-    /// the run is `running`.
+    /// soul's icon from `icons`, drawing the caret on `newest_turn` while the
+    /// run is `running`, and, in a gate room, naming `peer` — the outside
+    /// system's account as the gate's words show it ([`GateView::peer`]).
     pub fn header(
         &self,
         name: &dyn Fn(&UserId) -> String,
         icons: &AgentIcons,
         newest_turn: Option<&str>,
+        peer: Option<&UserId>,
     ) -> AgentRoomHeaderVm {
         let status = self
             .status
@@ -811,6 +849,13 @@ impl AgentRoomState {
             label,
             scope_unreadable,
             caret_key: newest_turn.filter(|_| self.running()).map(str::to_owned),
+            gate: self.gate_system().map(|system| GateHeaderVm {
+                system: system.to_owned(),
+                peer: peer.map(ToString::to_string),
+                // The peer chose its own name: shown quoted and cut, as the
+                // gate shows a request's.
+                peer_name: peer.map(|peer| crate::agents::gate::shown_request(&name(peer))),
+            }),
         }
     }
 }
@@ -1084,6 +1129,9 @@ pub struct HeaderReader {
     /// Whether the event cache changed under the fold other than by an
     /// append it took: it is folded again from the cache before it is read.
     approvals_stale: bool,
+    /// Where the person stopped listening to the room's answers (97.3,
+    /// UX-DR143), as their own devices marked it.
+    marks: RoomMarks,
 }
 
 impl HeaderReader {
@@ -1103,12 +1151,15 @@ impl HeaderReader {
             names: HashMap::new(),
             approvals: ApprovalFold::default(),
             approvals_stale: false,
+            marks: RoomMarks::default(),
         };
         if let Ok((cache, _handles)) = reader.room.event_cache().await {
             if let Ok(events) = cache.events().await {
                 for event in &events {
                     if let Some(value) = header_event(event.raw()) {
                         reader.apply(&value);
+                    } else if event_type(event.raw()) == Some(HEARD) {
+                        reader.mark(event);
                     }
                 }
             }
@@ -1153,6 +1204,16 @@ impl HeaderReader {
             }
         }
         true
+    }
+
+    /// Fold the person's mark of where they stopped listening, if `event`
+    /// is one; returns whether the marks changed.
+    fn mark(&mut self, event: &matrix_sdk::deserialized_responses::TimelineEvent) -> bool {
+        let Ok(value) = event.raw().deserialize_as::<Value>() else {
+            return false;
+        };
+        let sealed = sealed_by_sender(event.encryption_info().map(|info| &**info));
+        self.marks.apply(&value, self.room.own_user_id(), sealed)
     }
 
     fn apply(&mut self, event: &Value) -> bool {
@@ -1255,6 +1316,7 @@ impl HeaderReader {
                         self.names.clear();
                         changed = true;
                     }
+                    Some(HEARD) => changed |= self.mark(event),
                     _ => {}
                 }
             }
@@ -1267,17 +1329,21 @@ impl HeaderReader {
         changed
     }
 
-    /// The header now, with `newest_turn` as the caret's candidate and the
-    /// agent's mark from `icons`.
+    /// The header now, with `newest_turn` as the caret's candidate, the
+    /// agent's mark from `icons` and, in a gate room, `peer` as the outside
+    /// system's account.
     pub async fn header(
         &mut self,
         icons: &AgentIcons,
         newest_turn: Option<&str>,
+        peer: Option<&UserId>,
     ) -> AgentRoomHeaderVm {
-        self.resolve(self.state.named()).await;
+        let mut named = self.state.named();
+        named.extend(peer.map(ToOwned::to_owned));
+        self.resolve(named).await;
         let names = &self.names;
         let name = |user: &UserId| names.get(user).cloned().unwrap_or_else(|| user.to_string());
-        self.state.header(&name, icons, newest_turn)
+        self.state.header(&name, icons, newest_turn, peer)
     }
 
     /// The room's approval cards as `viewer` reads them at `now`.
@@ -1288,12 +1354,18 @@ impl HeaderReader {
         self.resolve(self.approvals.named()).await;
         let names = &self.names;
         let name = |user: &UserId| names.get(user).cloned().unwrap_or_else(|| user.to_string());
-        self.approvals.approvals(viewer, now, &name)
+        self.approvals
+            .approvals(viewer, now, &name, self.state.gate_system())
     }
 
     /// When the next waiting card turns expired, after `now`.
     pub fn next_expiry(&self, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
         self.approvals.next_expiry(now)
+    }
+
+    /// The person's marks of where they stopped listening, as folded.
+    pub fn marks(&self) -> &RoomMarks {
+        &self.marks
     }
 
     /// Resolve the display names of `users` not resolved yet.
@@ -1526,7 +1598,42 @@ mod tests {
             MARTA => "Marta".to_owned(),
             other => other.to_owned(),
         };
-        state.header(&name, &AgentIcons::default(), Some("turn-key"))
+        state.header(&name, &AgentIcons::default(), Some("turn-key"), None)
+    }
+
+    /// UX-DR147: a gate room's header names the system its status titles
+    /// the session with and the outside system's account the gate's words
+    /// show, by its name in the room; a session of any other kind names
+    /// none, whatever account is offered.
+    #[test]
+    fn a_gate_rooms_header_names_its_system_and_its_peer() {
+        let peer = user("@github:example.org");
+        let name = |user: &UserId| match user.as_str() {
+            "@github:example.org" => "GitHub".to_owned(),
+            other => other.to_owned(),
+        };
+        let mut gate = content("idle", "electra", None);
+        gate["kind"] = json!("gate");
+        gate["title"] = json!("github");
+        let mut state = AgentRoomState::new(own());
+        assert!(state.apply(&status("$g", 10, gate), &agents));
+        let icons = AgentIcons::default();
+        assert_eq!(
+            state.header(&name, &icons, None, Some(&peer)).gate,
+            Some(GateHeaderVm {
+                system: "github".to_owned(),
+                peer: Some(peer.to_string()),
+                peer_name: Some("\"GitHub\"".to_owned()),
+            })
+        );
+        let unspoken = state
+            .header(&name, &icons, None, None)
+            .gate
+            .expect("a gate");
+        assert_eq!((unspoken.peer, unspoken.peer_name), (None, None));
+        let mut main = AgentRoomState::new(own());
+        assert!(main.apply(&status("$m", 10, content("idle", "electra", None)), &agents));
+        assert_eq!(main.header(&name, &icons, None, Some(&peer)).gate, None);
     }
 
     fn status_of(state: &AgentRoomState) -> AgentStatusVm {
@@ -1600,6 +1707,16 @@ mod tests {
                 event(base("dev.keeper.agent.surface.result", json!({"v": 1}))),
             ),
             (
+                "heard",
+                event(base(
+                    HEARD,
+                    json!({
+                        "v": 1, "anchor": "$a", "heard_until": 4, "sentence": 1,
+                        "reason": "stop",
+                    }),
+                )),
+            ),
+            (
                 "claim",
                 event(state(CLAIM, "", json!({"v": 1, "epoch": 1}))),
             ),
@@ -1658,12 +1775,13 @@ mod tests {
                 };
                 assert_eq!(filter(&event, &rules), expected, "{kind:?} {name}");
             }
-            // Status, scope and surface results are read beside the stream,
-            // never drawn as items (R33).
+            // Status, scope, surface results and the person's mark of where
+            // they stopped listening (97.3, UX-DR143) are read beside the
+            // stream, never drawn as items (R33).
             for (name, event) in fixtures() {
                 if matches!(
                     name,
-                    "status" | "scope" | "surface.result" | "claim" | "host"
+                    "status" | "scope" | "surface.result" | "heard" | "claim" | "host"
                 ) {
                     assert!(!filter(&event, &rules), "{kind:?} {name}");
                 }
@@ -1957,6 +2075,7 @@ mod tests {
             creators: &creators,
             roster: Some(&roster),
             known: Some(&known),
+            gate: None,
         };
         let own = own();
         let nixi = user(NIXI);
@@ -2093,6 +2212,7 @@ mod tests {
             creators: &by_nixi,
             roster: Some(&roster),
             known: Some(&known),
+            gate: None,
         };
         let genuine = brief_json(NIXI, NIXI, &[PERSON]);
         let drawn = desktop.brief(&own, &nixi, Some(&genuine.to_string()), false);
@@ -2181,6 +2301,7 @@ mod tests {
             creators: &creators,
             roster: Some(&complete),
             known: Some(&known),
+            gate: None,
         };
         let own = own();
         let nixi = user(NIXI);
@@ -2309,7 +2430,7 @@ mod tests {
         let icons = AgentIcons::default();
         let icon_of = |state: &AgentRoomState, icons: &AgentIcons| {
             state
-                .header(&|user| user.to_string(), icons, None)
+                .header(&|user| user.to_string(), icons, None, None)
                 .status
                 .expect("a status")
                 .icon

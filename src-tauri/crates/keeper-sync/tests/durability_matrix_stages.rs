@@ -639,7 +639,15 @@ fn a_volume_pulled_during_staging_is_never_a_deletion_and_loses_no_committed_fil
         "a pulled volume must read as absent, never as a tree of deletions"
     );
 
-    // Re-attach.
+    // Re-attach. A write the child had in flight when the media went may
+    // have made its folders again at the mount path before the kill landed
+    // (git's lock and object writes create missing parents) — on a real
+    // unplug those writes land on no volume. The scan above read that path
+    // as absent, so what stands there is not the volume: it goes, and the
+    // volume comes back in its place.
+    if mount.exists() {
+        std::fs::remove_dir_all(&mount).expect("clear what the child wrote after the unplug");
+    }
     std::fs::rename(&detached, &mount).expect("re-attach the volume");
     assert!(
         matches!(

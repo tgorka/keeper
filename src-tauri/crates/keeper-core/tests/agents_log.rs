@@ -341,6 +341,8 @@ fn result_line(seq: u64, content: String) -> LogLine {
             content,
             truncated: None,
             label: tg_label(),
+            paseo: None,
+            effect: None,
         }),
     )
 }
@@ -950,6 +952,7 @@ async fn logged_turn(session: &Path, secret: Option<&str>) -> (String, String) {
                 model: "bot:ollama:http://127.0.0.1:11434#llama3.1".into(),
                 prompt_sha256: hex::encode(Sha256::digest(SYSTEM.as_bytes())),
                 memory_sha256: hex::encode(Sha256::digest(b"")),
+                encrypted: true,
             }),
         );
         log.next(
@@ -1005,6 +1008,8 @@ async fn logged_turn(session: &Path, secret: Option<&str>) -> (String, String) {
                 content: render_result(outcome),
                 truncated: None,
                 label: tg_label(),
+                paseo: None,
+                effect: None,
             }),
         );
     };
@@ -1829,6 +1834,8 @@ fn helper_steps_are_in_the_log_and_out_of_the_replay() {
             content: content.to_owned(),
             truncated: None,
             label: tg_label(),
+            paseo: None,
+            effect: None,
         })
     };
     next(

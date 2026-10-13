@@ -182,6 +182,8 @@ pub enum LineKind {
     Surface,
     Heard,
     Told,
+    Gate,
+    Paseo,
     Memory,
     Compact,
     Error,
@@ -190,7 +192,7 @@ pub enum LineKind {
 
 impl LineKind {
     /// Every kind, in the documented order.
-    pub const ALL: [LineKind; 20] = [
+    pub const ALL: [LineKind; 22] = [
         Self::Open,
         Self::Claim,
         Self::User,
@@ -207,6 +209,8 @@ impl LineKind {
         Self::Surface,
         Self::Heard,
         Self::Told,
+        Self::Gate,
+        Self::Paseo,
         Self::Memory,
         Self::Compact,
         Self::Error,
@@ -232,6 +236,8 @@ impl LineKind {
             Self::Surface => "surface",
             Self::Heard => "heard",
             Self::Told => "told",
+            Self::Gate => "gate",
+            Self::Paseo => "paseo",
             Self::Memory => "memory",
             Self::Compact => "compact",
             Self::Error => "error",
@@ -260,6 +266,19 @@ pub struct OpenBody {
     pub model: String,
     pub prompt_sha256: String,
     pub memory_sha256: String,
+    /// Whether the session's room is end-to-end encrypted: written only
+    /// when it is not — a gate's clear room (codemap Q9) — so every other
+    /// `open` line reads as before.
+    #[serde(default = "encrypted_by_default", skip_serializing_if = "is_encrypted")]
+    pub encrypted: bool,
+}
+
+fn encrypted_by_default() -> bool {
+    true
+}
+
+fn is_encrypted(encrypted: &bool) -> bool {
+    *encrypted
 }
 
 /// A claim transition.
@@ -392,6 +411,11 @@ pub struct Truncated {
 }
 
 /// `tool_result`: the result as the model received it, with its label.
+/// `paseo` is the host's own record of the run a successful Paseo
+/// `create_agent` started — the only thing a later poll's authority is
+/// read from (Q14), never the result's text. `effect` is what keeper knows
+/// of an effect outside itself: `unverified` for a KVM input that was sent,
+/// whose result nobody saw take (96.5 #7, "sent is never done").
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ToolResultBody {
@@ -401,6 +425,10 @@ pub struct ToolResultBody {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub truncated: Option<Truncated>,
     pub label: Label,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paseo: Option<crate::agents::paseo::Started>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effect: Option<String>,
 }
 
 /// Where an approval stands (R80). Terminal: `consumed`, `expired`,
@@ -456,14 +484,16 @@ pub struct ChildSession {
     pub session: String,
 }
 
-/// Where a delegation stands: `opened` when the room is made, `sent` when
-/// the brief went in after the target joined (each round after is another
-/// `sent`), `accepted` in the child once its host created it, `replied` when
-/// the target replied (in the child, when its `reply` went out), `refused`
-/// when a call or a send was refused.
+/// Where a delegation stands: `requested` when a gate's ticket asks a
+/// person for it (codemap Q4) — no room yet — `opened` when the room is
+/// made, `sent` when the brief went in after the target joined (each round
+/// after is another `sent`), `accepted` in the child once its host created
+/// it, `replied` when the target replied (in the child, when its `reply`
+/// went out), `refused` when a call or a send was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DelegateState {
+    Requested,
     Opened,
     Sent,
     Accepted,
@@ -494,6 +524,10 @@ pub struct DelegateBody {
     /// still names this window (the epic's Q5).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window: Option<CardWindow>,
+    /// On a gate's `requested`: the approval record the delegation waits
+    /// for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval: Option<String>,
 }
 
 /// The scheduled card, and the window of it, a workflow's run was opened
@@ -517,6 +551,11 @@ pub struct DelegateReply {
     pub artifacts: Vec<String>,
     /// The replying session's label when it replied (R94).
     pub label: Label,
+    /// A Paseo run's end its follow session told the delegated session's
+    /// room (R96PA2-05): that completion's id. Such a reply is taken beside
+    /// the delegation's own and closes no round of it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion: Option<String>,
 }
 
 /// Where an ask stands (R99): `asked` when the call made it — its intent,
@@ -667,6 +706,10 @@ pub enum MemoryOp {
     /// that fired, `memory`, `skill` or `memory,skill`. Every line of the
     /// pass descends from this one ([`ReviewLines`]).
     Review,
+    /// A gate session's `journal_append` waits for a person on the hour's
+    /// card (99.2 #2, codemap Q4); `ref` is its approval's id. The entry is
+    /// written only once that approval is consumed, by the host.
+    Asked,
 }
 
 /// `memory`.
@@ -722,6 +765,18 @@ pub struct ErrorBody {
     pub code: String,
 }
 
+/// The code of the `error` line, under the turn's closing line, of an answer
+/// withheld from its room because its label no longer reached the room
+/// (R168): the room showed a fixed sentence, never the answer.
+pub const WITHHELD_CODE: &str = "label";
+
+/// What the room is told instead of an answer when the session's label no
+/// longer reaches everyone the session's `agent.toml` names (S-16): the
+/// answer drew on something narrower than the room. The log keeps the whole
+/// answer, with an `error` line whose code is [`WITHHELD_CODE`]; a heard
+/// mark of such an answer is counted over this sentence (97.3).
+pub const NARROWER_THAN_ROOM: &str = "This answer drew on something not everyone in this room may read, so it is not shown here. It is in this session's log.";
+
 /// `told`: the session's person was told, in their proxy's DM, that its
 /// work went on where only some of its room may read it (R64, R169); the
 /// host tells them once, and a session with no such line is told again.
@@ -731,6 +786,165 @@ pub struct ToldBody {
     pub person: OwnedUserId,
     /// The proxy DM it went to.
     pub room: OwnedRoomId,
+}
+
+/// Where one request of a gate's outside system stands (AD-415, story
+/// 99.1; codemap Q13). The `gate` line of each state is the record: both
+/// of a gate's hourly allowances are counted from these lines' server
+/// times, so a restart or a takeover refills neither.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GateState {
+    /// The request came in: its text, and its deadline when it is sync.
+    Request,
+    /// Answered within its deadline.
+    Answer,
+    /// Not answered by its deadline, or async: the work goes on, and its
+    /// result comes against the ticket.
+    Ticket,
+    /// The ticket's work, done.
+    Result,
+    /// Not taken, or given up: [`GateReason`] says why.
+    Refused,
+    /// The ticket's result read what the room's audience may not read, so
+    /// it waits for the drive owner's declassification in their proxy's
+    /// DM (99.2 #3): said nowhere in the room, written in the log alone,
+    /// naming the approval that would release it.
+    Held,
+}
+
+impl GateState {
+    /// The word the line and the room's content spell it with.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Request => "request",
+            Self::Answer => "answer",
+            Self::Ticket => "ticket",
+            Self::Result => "result",
+            Self::Refused => "refused",
+            Self::Held => "held",
+        }
+    }
+}
+
+/// Why a gate refused a request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GateReason {
+    /// An hourly allowance is spent, or as many tickets are open as the
+    /// agent may run sessions at once.
+    Busy,
+    /// The gate does not take requests of that mode.
+    Mode,
+    /// The gate's turn ended without a reply.
+    NoAnswer,
+    /// The host stopped while the request's turn ran.
+    Interrupted,
+    /// A person declined the ticket's delegation (codemap Q4).
+    Denied,
+    /// Nobody decided the ticket's delegation before its approval expired.
+    Expired,
+    /// The ticket's delegation was approved, but could not be handed on.
+    Failed,
+    /// The ticket's result read what the room's audience may not read, and
+    /// the person who could release it declined (99.2 #3).
+    Withheld,
+    /// The ticket's result read what the room's audience may not read, and
+    /// it was not released: nobody could be asked, nobody decided in time,
+    /// or the result or the room changed after the decision (99.2 #3).
+    Unreleased,
+}
+
+impl GateReason {
+    /// The word the line and the room's content spell it with.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Busy => "busy",
+            Self::Mode => "mode",
+            Self::NoAnswer => "no_answer",
+            Self::Interrupted => "interrupted",
+            Self::Denied => "denied",
+            Self::Expired => "expired",
+            Self::Failed => "failed",
+            Self::Withheld => "withheld",
+            Self::Unreleased => "unreleased",
+        }
+    }
+}
+
+/// `gate`: one step of one outside request in a gate session (codemap
+/// Q13). The line of a `request` carries the request's event and its text,
+/// framed as data when the model reads it; every other state's line
+/// carries the gate's own event that said it in the room.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GateBody {
+    /// The outside system's name for the request: its `request` key, or
+    /// the request event's id when it gave none.
+    pub request: String,
+    pub state: GateState,
+    /// The ticket's id, from `ticket` on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ticket: Option<String>,
+    /// A sync request's deadline as the gate keeps it: clamped to the
+    /// gate's `deadline_ms_max`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline_ms: Option<u32>,
+    /// The homeserver's time, ms since the Unix epoch: the request event's
+    /// own on a `request` line, the gate's estimate of it on the others.
+    pub server_ts: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<GateReason>,
+    /// A `request` line's text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    /// A `held` line's approval: the `declassify` record whose consumption
+    /// releases the result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval: Option<String>,
+}
+
+/// Where a Paseo run's end stands in the session that follows it (R275).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PaseoState {
+    /// The record's bytes and the notice are fixed, before the notice is
+    /// sent.
+    Pending,
+    /// The homeserver acknowledged the notice.
+    Delivered,
+}
+
+/// `paseo`: a follow session's run ended (R275, R277). `pending` is the
+/// immutable capture — the record's bytes, their SHA-256, the notice's
+/// content and with it the label it was admitted under, under the
+/// completion's transaction id — and is the first durable step of the
+/// end, written before the record is materialized, the capture is published
+/// in the room or anything is sent; every later step, on this host or one that
+/// takes the session over, is made from those same bytes, with no other
+/// poll of the broker. `delivered` holds the event the homeserver answered
+/// with.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PaseoBody {
+    /// The notice's transaction id: one per follow session.
+    pub completion: String,
+    pub state: PaseoState,
+    /// The starting conversation's room, where the notice goes.
+    pub room: OwnedRoomId,
+    /// The record's path, session-relative.
+    pub artifact: String,
+    /// The SHA-256 of the record's bytes.
+    pub sha256: String,
+    /// `pending`: the record's bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record: Option<String>,
+    /// `pending`: the notice's content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<Value>,
+    /// `delivered`: the notice's event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event: Option<OwnedEventId>,
 }
 
 /// Why a session closed.
@@ -780,6 +994,8 @@ pub enum LineBody {
     Surface(SurfaceBody),
     Heard(HeardBody),
     Told(ToldBody),
+    Gate(GateBody),
+    Paseo(PaseoBody),
     Memory(MemoryBody),
     Compact(CompactBody),
     Error(ErrorBody),
@@ -808,6 +1024,8 @@ impl LineBody {
             Self::Surface(_) => LineKind::Surface,
             Self::Heard(_) => LineKind::Heard,
             Self::Told(_) => LineKind::Told,
+            Self::Gate(_) => LineKind::Gate,
+            Self::Paseo(_) => LineKind::Paseo,
             Self::Memory(_) => LineKind::Memory,
             Self::Compact(_) => LineKind::Compact,
             Self::Error(_) => LineKind::Error,
@@ -836,6 +1054,8 @@ impl LineBody {
             LineKind::Surface => Self::Surface(from(value)?),
             LineKind::Heard => Self::Heard(from(value)?),
             LineKind::Told => Self::Told(from(value)?),
+            LineKind::Gate => Self::Gate(from(value)?),
+            LineKind::Paseo => Self::Paseo(from(value)?),
             LineKind::Memory => Self::Memory(from(value)?),
             LineKind::Compact => Self::Compact(from(value)?),
             LineKind::Error => Self::Error(from(value)?),
@@ -863,6 +1083,8 @@ impl Serialize for LineBody {
             Self::Surface(b) => b.serialize(s),
             Self::Heard(b) => b.serialize(s),
             Self::Told(b) => b.serialize(s),
+            Self::Gate(b) => b.serialize(s),
+            Self::Paseo(b) => b.serialize(s),
             Self::Memory(b) => b.serialize(s),
             Self::Compact(b) => b.serialize(s),
             Self::Error(b) => b.serialize(s),
@@ -1073,6 +1295,7 @@ mod tests {
                 model: "bot:openai:http://127.0.0.1:8317#gpt".into(),
                 prompt_sha256: "a".repeat(64),
                 memory_sha256: "b".repeat(64),
+                encrypted: true,
             }),
             LineBody::Claim(ClaimBody {
                 epoch: 2,
@@ -1132,6 +1355,8 @@ mod tests {
                     total: 20,
                 }),
                 label: label(),
+                paseo: None,
+                effect: None,
             }),
             LineBody::Approval(ApprovalBody {
                 id: "01J".into(),
@@ -1156,8 +1381,10 @@ mod tests {
                     text: "Done.".into(),
                     artifacts: vec!["tgdrive/60-sessions/active/x/artifacts/a.md".into()],
                     label: label(),
+                    completion: Some("paseo-ended-01J".into()),
                 }),
                 window: None,
+                approval: None,
             }),
             LineBody::Ask(AskBody {
                 id: "01J".into(),
@@ -1204,6 +1431,26 @@ mod tests {
             LineBody::Told(ToldBody {
                 person: user("@tgorka:h"),
                 room: OwnedRoomId::try_from("!dm:h").expect("room"),
+            }),
+            LineBody::Gate(GateBody {
+                request: "r1".into(),
+                state: GateState::Refused,
+                ticket: Some("01JTICKET".into()),
+                deadline_ms: Some(3000),
+                server_ts: 1_759_392_903_120,
+                reason: Some(GateReason::NoAnswer),
+                text: None,
+                approval: None,
+            }),
+            LineBody::Paseo(PaseoBody {
+                completion: "paseo-ended-01J".into(),
+                state: PaseoState::Pending,
+                room: OwnedRoomId::try_from("!coding:h").expect("room"),
+                artifact: "artifacts/paseo-r1.md".into(),
+                sha256: "c".repeat(64),
+                record: Some("# Paseo run `r1`\n".into()),
+                content: Some(serde_json::json!({"msgtype": "m.text", "body": "ended"})),
+                event: None,
             }),
             LineBody::Memory(MemoryBody {
                 op: MemoryOp::Journal,
@@ -1270,6 +1517,23 @@ mod tests {
             assert!(json.contains("\"ts\":\"2026-10-02T08:15:03.120Z\""));
             assert_eq!(LogLine::parse(&json).expect("parse"), line, "{json}");
         }
+    }
+
+    /// Codemap Q9: an `open` line says `"encrypted":false` for a clear gate
+    /// room and nothing otherwise; a line without the key reads encrypted.
+    #[test]
+    fn an_open_line_names_a_clear_room_only() {
+        let json = line(one_of_each().remove(0)).to_json().expect("json");
+        assert!(!json.contains("encrypted"), "{json}");
+        let LineBody::Open(mut body) = LogLine::parse(&json).expect("parse").body else {
+            panic!("the first line is the open line");
+        };
+        assert!(body.encrypted, "a line without the key reads encrypted");
+        body.encrypted = false;
+        let clear = line(LineBody::Open(body));
+        let json = clear.to_json().expect("json");
+        assert!(json.contains("\"encrypted\":false"), "{json}");
+        assert_eq!(LogLine::parse(&json).expect("parse"), clear);
     }
 
     #[test]

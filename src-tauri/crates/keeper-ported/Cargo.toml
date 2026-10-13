@@ -19,12 +19,18 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 # `hermes::threats` compiles Hermes' threat patterns; already in the lock.
 regex = { workspace = true }
+rustfft = { workspace = true }
 # `preserve_order`: a table keeps its document order, as BMAD's Python dicts
 # do, so a merged configuration, a party roster and an ambiguity sentence come
 # out in BMAD's order (R98). Cargo unifies the feature into every crate that
 # links this one; `indexmap` is already in the lock under `toml`.
 toml = { workspace = true, features = ["preserve_order"] }
 unicode-normalization = { workspace = true }
+# `nanokvm::login_password`: the classic NanoKVM's login encrypts the password
+# as its reference documents (AES-256-CBC, base64); all three in the lock.
+aes = { workspace = true }
+cbc = { workspace = true }
+base64 = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

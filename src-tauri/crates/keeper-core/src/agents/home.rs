@@ -15,6 +15,7 @@ use matrix_sdk::ruma::{OwnedUserId, UserId};
 use toml::{Table, Value};
 
 use super::drive::DriveDecl;
+use super::label::Readers;
 use crate::bots::{parse_base_url, ProviderKind};
 
 /// The file's name inside a home.
@@ -129,7 +130,10 @@ const STEWARD_DEFAULTS: &[&str] = &[
     "delegate",
 ];
 
-const GATE_DEFAULTS: &[&str] = &["reply", "delegate", "journal_append"];
+/// A gate's tools: its defaults and its ceiling (AD-415, codemap Q1). A
+/// `kind = "gate"` home whose `[tools].allow` names anything else is
+/// refused; MCP servers come from `[tools].mcp`, as for every kind.
+pub const GATE_TOOLS: &[&str] = &["reply", "delegate", "journal_append"];
 
 /// What an agent is for (AD-360). It chooses defaults, never powers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -172,7 +176,7 @@ pub fn default_allow(kind: AgentKind) -> &'static [&'static str] {
         AgentKind::Proxy => PROXY_DEFAULTS,
         AgentKind::Steward => STEWARD_DEFAULTS,
         AgentKind::Specialist => SPECIALIST_DEFAULTS,
-        AgentKind::Gate => GATE_DEFAULTS,
+        AgentKind::Gate => GATE_TOOLS,
     }
 }
 
@@ -264,6 +268,50 @@ pub struct MemorySettings {
     pub promote: bool,
 }
 
+/// How an outside system may ask a gate (AD-415).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum GateMode {
+    /// An answer by a deadline, or a ticket at it.
+    Sync,
+    /// A ticket at once, and a callback when the work is done.
+    Async,
+}
+
+impl GateMode {
+    /// The word `agent.toml` spells it with.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Sync => "sync",
+            Self::Async => "async",
+        }
+    }
+}
+
+/// One `[[gate]]`: the door for one outside system, one gate session and
+/// one room (AD-415; codemap Q1–Q3, Q9, Q11).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GateConfig {
+    /// `[a-z0-9-]{1,32}`, unique in the agent: the system's name.
+    pub system: String,
+    /// The outside system's Matrix user: never the gate's own, a reader of
+    /// the home drive or another agent of the zone.
+    pub peer: OwnedUserId,
+    /// Who reads what is posted in the gate's room: anyone, or the listed
+    /// ids, which include the `peer`.
+    pub audience: Readers,
+    /// Agent ids of the home drive the gate may hand work to, in the file's
+    /// order; checked against the zone by [`gate_zone_refusals`].
+    pub delegates: Vec<String>,
+    pub deadline_ms_max: u32,
+    /// Non-empty, sorted, each once.
+    pub modes: Vec<GateMode>,
+    pub max_tickets_per_hour: u32,
+    pub max_requests_per_hour: u32,
+    /// Whether the room is end-to-end encrypted; `false` only when the
+    /// audience is anyone (codemap Q9).
+    pub encrypted: bool,
+}
+
 /// A home's `agent.toml`, read against its drive.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentConfig {
@@ -289,6 +337,8 @@ pub struct AgentConfig {
     pub memory: MemorySettings,
     /// The home drive's readers: who may see what this agent reads.
     pub audience: BTreeSet<OwnedUserId>,
+    /// `[[gate]]`, a gate's only; empty for every other kind.
+    pub gates: Vec<GateConfig>,
 }
 
 impl AgentConfig {
@@ -321,6 +371,23 @@ pub enum HomeRefusal {
         first: String,
         second: String,
     },
+    /// A `[[gate]]` read against the other homes of its zone
+    /// ([`gate_zone_refusals`]).
+    #[error("agent.toml's {key} is refused: {cause}.")]
+    GateZone { key: String, cause: GateZoneCause },
+}
+
+/// Why a `[[gate]]` is refused against its zone (99.1 #1).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum GateZoneCause {
+    #[error("{peer} is {agent}'s Matrix user, and a peer is the outside system's own account, never an agent")]
+    PeerIsAgent { peer: OwnedUserId, agent: String },
+    #[error("\"{delegate}\" is not an agent of {drive}")]
+    NotAnAgent { delegate: String, drive: String },
+    #[error("\"{delegate}\" is this gate itself")]
+    Itself { delegate: String },
+    #[error("\"{delegate}\" is another gate, and a gate hands work only to an agent that does it")]
+    AnotherGate { delegate: String },
 }
 
 const ROOT_KEYS: &[&str] = &[
@@ -336,6 +403,7 @@ const ROOT_KEYS: &[&str] = &[
     "host",
     "limits",
     "memory",
+    "gate",
 ];
 const MODEL_KEYS: &[&str] = &["bot", "local_only"];
 const TOOLS_KEYS: &[&str] = &["allow", "drives", "mcp", "skills"];
@@ -350,6 +418,23 @@ const LIMITS_KEYS: &[&str] = &[
     "max_concurrent_sessions",
 ];
 const MEMORY_KEYS: &[&str] = &["nudge_user_turns", "nudge_tool_iterations", "promote"];
+const GATE_KEYS: &[&str] = &[
+    "system",
+    "peer",
+    "audience",
+    "delegates",
+    "deadline_ms_max",
+    "modes",
+    "max_tickets_per_hour",
+    "max_requests_per_hour",
+    "encrypted",
+];
+/// Each `[[gate]]` bound as (default, lowest, highest); codemap Q11 adds
+/// the requests' bound.
+const GATE_DEADLINE_MS: (i64, i64, i64) = (30_000, 1_000, 120_000);
+const GATE_TICKETS_PER_HOUR: (i64, i64, i64) = (10, 1, 1_000);
+const GATE_REQUESTS_PER_HOUR: (i64, i64, i64) = (120, 1, 3_600);
+const SYSTEM_MAX: usize = 32;
 
 const NAME_MAX: usize = 64;
 const MENU_DESCRIPTION_MAX: usize = 120;
@@ -628,6 +713,15 @@ pub fn parse_agent_toml(
                         ),
                     });
                 }
+                if kind == AgentKind::Gate && !GATE_TOOLS.contains(&tool.as_str()) {
+                    return Err(HomeRefusal::Invalid {
+                        key: tools_name("allow"),
+                        reason: format!(
+                            "\"{tool}\" is not a gate's: a gate's tools are at most {}, and its MCP servers are named by [tools].mcp",
+                            GATE_TOOLS.join(", ")
+                        ),
+                    });
+                }
             }
             names
         }
@@ -715,6 +809,7 @@ pub fn parse_agent_toml(
         nudge_tool_iterations: off_or(&memory, "nudge_tool_iterations", 15, 5, 100)?,
         promote: memory.bool("promote", true)?,
     };
+    let gates = parse_gates(&root, kind, &matrix_user, drive)?;
 
     Ok(AgentConfig {
         drive: drive.id.clone(),
@@ -734,6 +829,7 @@ pub fn parse_agent_toml(
         limits,
         memory,
         audience: drive.readers.clone(),
+        gates,
     })
 }
 
@@ -885,6 +981,170 @@ fn parse_menu(root: &Section<'_>) -> Result<Vec<MenuItem>, HomeRefusal> {
     Ok(menu)
 }
 
+/// Whether `system` names a gate's system: `[a-z0-9-]{1,32}`.
+fn is_system(system: &str) -> bool {
+    (1..=SYSTEM_MAX).contains(&system.len())
+        && system
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// `[[gate]]` (AD-415): a gate's only. What one file can say is checked
+/// here; what needs the zone — the delegates, a peer that is an agent — is
+/// [`gate_zone_refusals`]'s.
+fn parse_gates(
+    root: &Section<'_>,
+    kind: AgentKind,
+    me: &UserId,
+    drive: &DriveDecl,
+) -> Result<Vec<GateConfig>, HomeRefusal> {
+    let items = match root.table.get("gate") {
+        None => return Ok(Vec::new()),
+        Some(Value::Array(items)) => items,
+        Some(_) => return Err(root.wrong("gate", "an array of [[gate]] tables")),
+    };
+    if kind != AgentKind::Gate {
+        return Err(root.invalid(
+            "gate",
+            format!(
+                "only a gate has [[gate]] tables, and this agent is a {}",
+                kind.as_str()
+            ),
+        ));
+    }
+    let mut gates: Vec<GateConfig> = Vec::with_capacity(items.len());
+    for (at, item) in items.iter().enumerate() {
+        let Value::Table(table) = item else {
+            return Err(root.wrong("gate", "an array of [[gate]] tables"));
+        };
+        let section = Section::new(&format!("gate[{}]", at + 1), table, GATE_KEYS)?;
+        let system = section.required_str("system")?;
+        if !is_system(system) {
+            return Err(section.invalid(
+                "system",
+                format!(
+                    "\"{system}\" must be 1 to {SYSTEM_MAX} lowercase letters, digits or hyphens"
+                ),
+            ));
+        }
+        if gates.iter().any(|earlier| earlier.system == system) {
+            return Err(section.invalid(
+                "system",
+                format!("\"{system}\" is already used by an earlier [[gate]]"),
+            ));
+        }
+
+        let peer = user_id(&section, "peer", section.required_str("peer")?)?;
+        if peer == me {
+            return Err(section.invalid(
+                "peer",
+                format!("{peer} is this gate's own Matrix user; the peer is the outside system's account"),
+            ));
+        }
+        if drive.readers.contains(&peer) {
+            return Err(section.invalid(
+                "peer",
+                format!(
+                    "{peer} is a reader of {}, and a person's own account is never a peer: what it says would be outside content in a room where that person decides",
+                    drive.id
+                ),
+            ));
+        }
+
+        let listed = section
+            .strings("audience")?
+            .ok_or_else(|| HomeRefusal::Missing(section.name("audience")))?;
+        let audience = if listed == ["*"] {
+            Readers::Anyone
+        } else {
+            let mut readers = BTreeSet::new();
+            for text in &listed {
+                if text == "*" {
+                    return Err(
+                        section.invalid("audience", "\"*\" is anyone, so it stands alone: [\"*\"]")
+                    );
+                }
+                if !readers.insert(user_id(&section, "audience", text)?) {
+                    return Err(section.invalid("audience", format!("{text} is listed twice")));
+                }
+            }
+            if !readers.contains(&peer) {
+                return Err(section.invalid(
+                    "audience",
+                    format!("it is who reads the gate's room, and the peer {peer} reads it: list it, or write [\"*\"]"),
+                ));
+            }
+            Readers::Only(readers)
+        };
+
+        let delegates = section.strings("delegates")?.unwrap_or_default();
+        for (at, delegate) in delegates.iter().enumerate() {
+            if !is_agent_id(delegate) {
+                return Err(section.invalid(
+                    "delegates",
+                    format!("\"{delegate}\" is not an agent id of {}", drive.id),
+                ));
+            }
+            if delegates[..at].contains(delegate) {
+                return Err(section.invalid("delegates", format!("\"{delegate}\" is listed twice")));
+            }
+        }
+
+        let words = section
+            .strings("modes")?
+            .ok_or_else(|| HomeRefusal::Missing(section.name("modes")))?;
+        let mut modes = Vec::with_capacity(words.len());
+        for word in &words {
+            let mode = [GateMode::Sync, GateMode::Async]
+                .into_iter()
+                .find(|mode| mode.as_str() == word)
+                .ok_or_else(|| {
+                    section.invalid("modes", format!("\"{word}\" is not sync or async"))
+                })?;
+            if modes.contains(&mode) {
+                return Err(section.invalid("modes", format!("\"{word}\" is listed twice")));
+            }
+            modes.push(mode);
+        }
+        if modes.is_empty() {
+            return Err(section.invalid(
+                "modes",
+                "it lists no mode, and a gate answers sync, async or both",
+            ));
+        }
+        modes.sort();
+
+        let (default, lo, hi) = GATE_DEADLINE_MS;
+        let deadline_ms_max = bounded_u32(&section, "deadline_ms_max", default, lo, hi)?;
+        let (default, lo, hi) = GATE_TICKETS_PER_HOUR;
+        let max_tickets_per_hour = bounded_u32(&section, "max_tickets_per_hour", default, lo, hi)?;
+        let (default, lo, hi) = GATE_REQUESTS_PER_HOUR;
+        let max_requests_per_hour =
+            bounded_u32(&section, "max_requests_per_hour", default, lo, hi)?;
+
+        let encrypted = section.bool("encrypted", true)?;
+        if !encrypted && audience != Readers::Anyone {
+            return Err(section.invalid(
+                "encrypted",
+                "a room without encryption is read by its server's operator too, so only a gate whose audience is [\"*\"] may have one",
+            ));
+        }
+
+        gates.push(GateConfig {
+            system: system.to_owned(),
+            peer,
+            audience,
+            delegates,
+            deadline_ms_max,
+            modes,
+            max_tickets_per_hour,
+            max_requests_per_hour,
+            encrypted,
+        });
+    }
+    Ok(gates)
+}
+
 /// The homes in one zone that share a Matrix user, each pair refused naming
 /// both folders (AD-374: one user per agent).
 pub fn shared_matrix_users(homes: &[AgentConfig]) -> Vec<HomeRefusal> {
@@ -899,6 +1159,54 @@ pub fn shared_matrix_users(homes: &[AgentConfig]) -> Vec<HomeRefusal> {
                 first: first.id.clone(),
                 second: home.id.clone(),
             });
+        }
+    }
+    refusals
+}
+
+/// What one file cannot say about its `[[gate]]` tables, read against the
+/// other homes of its zone: each `delegates` entry is an agent of this drive
+/// that is neither the gate itself nor another gate, and no `peer` is an
+/// agent's Matrix user. Each refusal names the gate's folder (99.1 #1).
+pub fn gate_zone_refusals(homes: &[AgentConfig]) -> Vec<(String, HomeRefusal)> {
+    let mut refusals = Vec::new();
+    for home in homes.iter().filter(|home| home.kind == AgentKind::Gate) {
+        for (at, gate) in home.gates.iter().enumerate() {
+            let key = |name: &str| format!("gate[{}].{name}", at + 1);
+            if let Some(agent) = homes.iter().find(|other| other.matrix_user == gate.peer) {
+                refusals.push((
+                    home.id.clone(),
+                    HomeRefusal::GateZone {
+                        key: key("peer"),
+                        cause: GateZoneCause::PeerIsAgent {
+                            peer: gate.peer.clone(),
+                            agent: agent.id.clone(),
+                        },
+                    },
+                ));
+            }
+            for delegate in &gate.delegates {
+                let cause = match homes.iter().find(|other| other.id == *delegate) {
+                    None => GateZoneCause::NotAnAgent {
+                        delegate: delegate.clone(),
+                        drive: home.drive.clone(),
+                    },
+                    Some(other) if other.id == home.id => GateZoneCause::Itself {
+                        delegate: delegate.clone(),
+                    },
+                    Some(other) if other.kind == AgentKind::Gate => GateZoneCause::AnotherGate {
+                        delegate: delegate.clone(),
+                    },
+                    Some(_) => continue,
+                };
+                refusals.push((
+                    home.id.clone(),
+                    HomeRefusal::GateZone {
+                        key: key("delegates"),
+                        cause,
+                    },
+                ));
+            }
         }
     }
     refusals
@@ -1442,37 +1750,332 @@ promote               = true
             set(&[&["reply", "delegate", "journal_append"]])
         );
 
+        // Same file, two kinds that do work: everything but `kind` is equal.
         let reads = "[tools]\nallow = [\"drive_list\", \"drive_read\", \"drive_glob\", \"drive_grep\", \"drive_stat\"]\n";
-        let gate = parse_agent_toml(
-            &minimal("gate", "").replace("[model]", &format!("{reads}[model]")),
-            "amelia",
-            &tgdrive(),
-        )
-        .expect("a gate with reads parses");
-        assert_eq!(
-            gate.allow,
-            [
-                "drive_list",
-                "drive_read",
-                "drive_glob",
-                "drive_grep",
-                "drive_stat"
-            ]
-        );
-
-        // Same file, another non-proxy kind: everything but `kind` is equal.
-        let as_specialist = parse_agent_toml(
-            &minimal("specialist", "").replace("[model]", &format!("{reads}[model]")),
-            "amelia",
-            &tgdrive(),
-        )
-        .expect("parses");
+        let with_reads = |kind: &str| {
+            parse_agent_toml(
+                &minimal(kind, "").replace("[model]", &format!("{reads}[model]")),
+                "amelia",
+                &tgdrive(),
+            )
+        };
+        let as_steward = with_reads("steward").expect("a steward with reads parses");
+        let as_specialist = with_reads("specialist").expect("parses");
         assert_eq!(
             AgentConfig {
-                kind: AgentKind::Gate,
+                kind: AgentKind::Steward,
                 ..as_specialist
             },
-            gate
+            as_steward
+        );
+        // A gate's set is a ceiling, not a default (codemap Q1, 99.2 #2):
+        // the same reads are refused, naming the first tool past it.
+        let refusal = with_reads("gate").expect_err("past the ceiling");
+        assert!(
+            matches!(&refusal, HomeRefusal::Invalid { key, reason }
+                if key == "tools.allow" && reason.starts_with("\"drive_list\"")),
+            "{refusal}"
+        );
+    }
+
+    /// The key a refusal names.
+    fn refused_key(result: Result<AgentConfig, HomeRefusal>) -> String {
+        match result.expect_err("refused") {
+            HomeRefusal::Invalid { key, .. } | HomeRefusal::WrongType { key, .. } => key,
+            HomeRefusal::Missing(key) | HomeRefusal::UnknownKey(key) => key,
+            other => panic!("not a key's refusal: {other}"),
+        }
+    }
+
+    const GATE: &str = "[[gate]]\nsystem = \"github\"\npeer = \"@github:example.org\"\n\
+        audience = [\"@github:example.org\", \"@tgorka:example.org\"]\n\
+        delegates = [\"tola-grey\"]\ndeadline_ms_max = 5000\nmodes = [\"async\", \"sync\"]\n\
+        max_tickets_per_hour = 3\nmax_requests_per_hour = 60\n";
+
+    fn gate_with(tables: &str) -> Result<AgentConfig, HomeRefusal> {
+        parse_agent_toml(&minimal("gate", tables), "amelia", &tgdrive())
+    }
+
+    /// `GATE` with one line replaced, which must be there.
+    fn gate_line(from: &str, to: &str) -> Result<AgentConfig, HomeRefusal> {
+        assert!(GATE.contains(from), "{from}");
+        gate_with(&GATE.replacen(from, to, 1))
+    }
+
+    /// 99.1 #1 (codemap Q1, Q2, Q9, Q11): every key of `[[gate]]`, its
+    /// defaults, and each refusal by the key it names.
+    #[test]
+    fn gate_table_grammar() {
+        let user = |id: &str| UserId::parse(id).expect("user");
+        let config = gate_with(GATE).expect("a gate with every key parses");
+        assert_eq!(
+            config.gates,
+            [GateConfig {
+                system: "github".to_owned(),
+                peer: user("@github:example.org"),
+                audience: Readers::Only(
+                    [user("@github:example.org"), user("@tgorka:example.org")]
+                        .into_iter()
+                        .collect()
+                ),
+                delegates: vec!["tola-grey".to_owned()],
+                deadline_ms_max: 5000,
+                modes: vec![GateMode::Sync, GateMode::Async],
+                max_tickets_per_hour: 3,
+                max_requests_per_hour: 60,
+                encrypted: true,
+            }]
+        );
+        let least = gate_with(
+            "[[gate]]\nsystem = \"ci\"\npeer = \"@ci:example.org\"\naudience = [\"*\"]\nmodes = [\"sync\"]\nencrypted = false\n",
+        )
+        .expect("a gate with only the required keys parses");
+        let gate = &least.gates[0];
+        assert_eq!(gate.audience, Readers::Anyone);
+        assert_eq!(gate.delegates, Vec::<String>::new());
+        assert_eq!(
+            (
+                gate.deadline_ms_max,
+                gate.max_tickets_per_hour,
+                gate.max_requests_per_hour
+            ),
+            (30_000, 10, 120),
+            "the defaults"
+        );
+        assert!(!gate.encrypted, "clear, with anyone as its audience");
+        assert_eq!(
+            gate_with("").expect("a gate with no [[gate]]").gates,
+            Vec::new()
+        );
+
+        // Only a gate has gates.
+        for (kind, extra) in [
+            ("proxy", "human = \"@tgorka:example.org\"\n"),
+            ("steward", ""),
+            ("specialist", ""),
+        ] {
+            let text = minimal(kind, &format!("{extra}{GATE}"));
+            assert_eq!(
+                refused_key(parse_agent_toml(&text, "amelia", &tgdrive())),
+                "gate",
+                "{kind}"
+            );
+        }
+        assert_eq!(
+            refused_key(gate_with(&format!("{GATE}{GATE}"))),
+            "gate[2].system",
+            "a system is unique in the agent"
+        );
+        let too_long = format!("system = \"{}\"", "g".repeat(33));
+        for (from, to, key) in [
+            (
+                "system = \"github\"",
+                "system = \"Git Hub\"",
+                "gate[1].system",
+            ),
+            ("system = \"github\"", too_long.as_str(), "gate[1].system"),
+            (
+                "peer = \"@github:example.org\"",
+                "peer = \"github\"",
+                "gate[1].peer",
+            ),
+            (
+                "peer = \"@github:example.org\"",
+                "peer = \"@amelia-tgdrive:example.org\"",
+                "gate[1].peer",
+            ),
+            (
+                "peer = \"@github:example.org\"",
+                "peer = \"@tgorka:example.org\"",
+                "gate[1].peer",
+            ),
+            (
+                "modes = [\"async\", \"sync\"]",
+                "modes = []",
+                "gate[1].modes",
+            ),
+            (
+                "modes = [\"async\", \"sync\"]",
+                "modes = [\"fast\"]",
+                "gate[1].modes",
+            ),
+            (
+                "modes = [\"async\", \"sync\"]",
+                "modes = [\"sync\", \"sync\"]",
+                "gate[1].modes",
+            ),
+            ("modes = [\"async\", \"sync\"]\n", "", "gate[1].modes"),
+            (
+                "audience = [\"@github:example.org\", \"@tgorka:example.org\"]",
+                "audience = [\"@tgorka:example.org\"]",
+                "gate[1].audience",
+            ),
+            (
+                "audience = [\"@github:example.org\", \"@tgorka:example.org\"]",
+                "audience = [\"*\", \"@github:example.org\"]",
+                "gate[1].audience",
+            ),
+            (
+                "audience = [\"@github:example.org\", \"@tgorka:example.org\"]",
+                "audience = [\"@github:example.org\", \"@github:example.org\"]",
+                "gate[1].audience",
+            ),
+            (
+                "audience = [\"@github:example.org\", \"@tgorka:example.org\"]\n",
+                "",
+                "gate[1].audience",
+            ),
+            (
+                "delegates = [\"tola-grey\"]",
+                "delegates = [\"Tola\"]",
+                "gate[1].delegates",
+            ),
+            (
+                "delegates = [\"tola-grey\"]",
+                "delegates = [\"tola-grey\", \"tola-grey\"]",
+                "gate[1].delegates",
+            ),
+            ("max_tickets_per_hour = 3", "colour = 3", "gate[1].colour"),
+            (
+                "max_tickets_per_hour = 3",
+                "max_tickets_per_hour = 3\nencrypted = false",
+                "gate[1].encrypted",
+            ),
+        ] {
+            assert_eq!(refused_key(gate_line(from, to)), key, "{to}");
+        }
+        for (key, refused, accepted) in [
+            ("deadline_ms_max", [999, 120_001], [1_000, 120_000]),
+            ("max_tickets_per_hour", [0, 1_001], [1, 1_000]),
+            ("max_requests_per_hour", [0, 3_601], [1, 3_600]),
+        ] {
+            let line = GATE
+                .lines()
+                .find(|line| line.starts_with(key))
+                .expect("the key is in GATE");
+            for value in refused {
+                assert_eq!(
+                    refused_key(gate_line(line, &format!("{key} = {value}"))),
+                    format!("gate[1].{key}"),
+                    "{value}"
+                );
+            }
+            for value in accepted {
+                assert!(
+                    gate_line(line, &format!("{key} = {value}")).is_ok(),
+                    "{key} = {value}"
+                );
+            }
+        }
+
+        // The ceiling (codemap Q1): at most reply, delegate and
+        // journal_append; MCP servers by [tools].mcp.
+        let tools = |allow: &str| {
+            gate_with(&format!(
+                "{GATE}[tools]\nallow = {allow}\nmcp = [\"forge\"]\n"
+            ))
+        };
+        let allowed = tools("[\"reply\", \"journal_append\"]").expect("within the ceiling");
+        assert_eq!(allowed.allow, ["reply", "journal_append"]);
+        assert_eq!(allowed.mcp, ["forge"]);
+        for past in [
+            "ask_human",
+            "run",
+            "workflow_start",
+            "helper",
+            "drive_read",
+            "surface_open",
+        ] {
+            assert_eq!(
+                refused_key(tools(&format!("[\"reply\", \"{past}\"]"))),
+                "tools.allow",
+                "{past}"
+            );
+        }
+    }
+
+    /// 99.1 #1's zone half: a gate's delegates are agents of its drive,
+    /// neither itself nor another gate, and its peer is no agent's user.
+    #[test]
+    fn gate_delegates_are_agents_of_the_zone() {
+        let tola = parse_agent_toml(
+            &fixture("zone-ok/tola-grey/agent.toml"),
+            "tola-grey",
+            &tgdrive(),
+        )
+        .expect("Tola parses");
+        let nixi = parse_agent_toml(&nixi(), "nixi", &tgdrive()).expect("Nixi parses");
+        let gate = gate_with(GATE).expect("the gate parses");
+        let other_gate = parse_agent_toml(
+            &minimal("gate", "")
+                .replace("\"amelia\"", "\"forge\"")
+                .replace("@amelia-tgdrive:", "@forge:"),
+            "forge",
+            &tgdrive(),
+        )
+        .expect("another gate parses");
+        assert_eq!(
+            gate_zone_refusals(&[nixi.clone(), tola.clone(), gate.clone()]),
+            Vec::new()
+        );
+        let delegating = |to: &str| {
+            gate_with(&GATE.replace(
+                "delegates = [\"tola-grey\"]",
+                &format!("delegates = [\"{to}\"]"),
+            ))
+            .expect("parses alone")
+        };
+        for (to, homes, cause) in [
+            (
+                "amelia",
+                vec![tola.clone()],
+                GateZoneCause::Itself {
+                    delegate: "amelia".to_owned(),
+                },
+            ),
+            (
+                "lucyna-novak",
+                vec![tola.clone()],
+                GateZoneCause::NotAnAgent {
+                    delegate: "lucyna-novak".to_owned(),
+                    drive: "tgdrive".to_owned(),
+                },
+            ),
+            (
+                "forge",
+                vec![tola.clone(), other_gate.clone()],
+                GateZoneCause::AnotherGate {
+                    delegate: "forge".to_owned(),
+                },
+            ),
+        ] {
+            let mut zone = homes;
+            zone.push(delegating(to));
+            assert_eq!(
+                gate_zone_refusals(&zone),
+                [(
+                    "amelia".to_owned(),
+                    HomeRefusal::GateZone {
+                        key: "gate[1].delegates".to_owned(),
+                        cause,
+                    }
+                )]
+            );
+        }
+        let peer_is_nixi = gate_with(&GATE.replace("@github:example.org", "@nixi:example.org"))
+            .expect("parses alone");
+        assert_eq!(
+            gate_zone_refusals(&[nixi, tola, peer_is_nixi]),
+            [(
+                "amelia".to_owned(),
+                HomeRefusal::GateZone {
+                    key: "gate[1].peer".to_owned(),
+                    cause: GateZoneCause::PeerIsAgent {
+                        peer: OwnedUserId::try_from("@nixi:example.org").expect("user"),
+                        agent: "nixi".to_owned(),
+                    },
+                }
+            )]
         );
     }
 

@@ -24,6 +24,9 @@ pub enum Need {
     Agent(String),
     /// Any live host of the principal.
     LiveHost,
+    /// A host that is always on: a gate's session runs on no other
+    /// (codemap Q14) — a sleeping laptop misses every deadline.
+    AlwaysOn,
 }
 
 impl fmt::Display for Need {
@@ -35,6 +38,7 @@ impl fmt::Display for Need {
             Need::Bot => f.write_str("the agent's model"),
             Need::Agent(agent) => write!(f, "a copy of {agent}"),
             Need::LiveHost => f.write_str("a live host"),
+            Need::AlwaysOn => f.write_str("an always-on host"),
         }
     }
 }
@@ -54,6 +58,8 @@ pub struct Ask<'a> {
     pub bot: &'a str,
     pub principal: &'a str,
     pub prefer_always_on: bool,
+    /// Only an always-on host may serve it: a gate's session (Q14).
+    pub always_on_only: bool,
     /// The host of the session's most recent claim.
     pub holder: Option<&'a str>,
 }
@@ -109,13 +115,17 @@ fn missing(ask: &Ask<'_>, host: &HostManifest) -> Vec<Need> {
     if !host.agents.iter().any(|agent| agent == ask.agent) {
         missing.push(Need::Agent(ask.agent.to_owned()));
     }
+    if ask.always_on_only && !host.always_on {
+        missing.push(Need::AlwaysOn);
+    }
     missing
 }
 
 /// Place one session among `hosts` at `server_now` (ms).
 ///
 /// Candidates are the principal's live hosts that host the agent and lack
-/// nothing; a pin keeps only the pinned one. Among candidates an always-on
+/// nothing — an always-on host, for a session that needs one; a pin keeps
+/// only the pinned one. Among candidates an always-on
 /// host comes first when the agent prefers one, then the holder of the
 /// session's last claim, then the lowest slug.
 pub fn place(ask: &Ask<'_>, hosts: &[HostManifest], server_now: u64) -> Placement {
@@ -192,6 +202,7 @@ mod tests {
         drives: Vec<String>,
         bot: String,
         prefer_always_on: bool,
+        always_on_only: bool,
         holder: Option<&'static str>,
     }
 
@@ -202,6 +213,7 @@ mod tests {
             drives: vec!["tgdrive".to_owned()],
             bot: bot(OPUS),
             prefer_always_on: true,
+            always_on_only: false,
             holder: None,
         }
     }
@@ -216,6 +228,7 @@ mod tests {
                 bot: &facts.bot,
                 principal: "tgorka",
                 prefer_always_on: facts.prefer_always_on,
+                always_on_only: facts.always_on_only,
                 holder: facts.holder,
             },
             hosts,
@@ -281,7 +294,24 @@ mod tests {
             prefer_always_on: false,
             ..facts()
         };
+        let gate = Facts {
+            prefer_always_on: false,
+            always_on_only: true,
+            ..facts()
+        };
         let rows: Vec<(&str, Facts, Vec<HostManifest>, Placement)> = vec![
+            (
+                "a gate, never on a host that sleeps",
+                gate.clone(),
+                vec![hesperia.clone(), electra.clone()],
+                at("electra"),
+            ),
+            (
+                "a gate with only a laptop waits for an always-on host",
+                gate.clone(),
+                vec![hesperia.clone()],
+                waiting(None, vec![Need::AlwaysOn]),
+            ),
             (
                 "one live host",
                 facts(),

@@ -43,7 +43,7 @@ pub fn session_write(
     content: &str,
     may_write: &dyn Fn() -> bool,
 ) -> Result<(), VerbError> {
-    session_write_with(zone, session, rel, may_write, |_, _| content.to_owned())
+    session_write_with(zone, session, rel, may_write, |_, _| Ok(content.to_owned()))
 }
 
 /// Where in a session a write lands.
@@ -123,15 +123,16 @@ fn land(zone: &Path, session: &str, rel: &str, leaf: Option<&str>) -> Result<Str
 
 /// [`session_write`], storing what `compose` makes of the file's bytes as
 /// they are while the zone is held (`None` for a new file), given where the
-/// write lands — the seam an agent's write is stamped through (R52, R119).
-/// An existing file is replaced through a write guarded on the exact bytes
-/// composed from (R120).
+/// write lands — the seam an agent's write is stamped through (R52, R119),
+/// and refused through with `compose`'s sentence, nothing written (the
+/// `artifacts/knowledge/**` rule, R140). An existing file is replaced
+/// through a write guarded on the exact bytes composed from (R120).
 pub fn session_write_with(
     zone: &Path,
     session: &str,
     rel: &str,
     may_write: &dyn Fn() -> bool,
-    compose: impl FnOnce(&str, Option<&str>) -> String,
+    compose: impl FnOnce(&str, Option<&str>) -> Result<String, String>,
 ) -> Result<(), VerbError> {
     let held = exec::hold(zone)?;
     let landed = landing(held.zone(), session, rel)?;
@@ -156,7 +157,7 @@ pub fn session_write_with(
     let file = browse::lexical_join(&dir, &landed)
         .map_err(|refusal| VerbError::Refused(refusal.to_string()))?;
     let old = std::fs::read_to_string(file).ok();
-    let content = compose(&landed, old.as_deref());
+    let content = compose(&landed, old.as_deref()).map_err(VerbError::Refused)?;
     let path = format!("{session}/{landed}");
     let mut steps = Vec::with_capacity(2);
     if let Some((parent, _)) = landed.rsplit_once('/') {

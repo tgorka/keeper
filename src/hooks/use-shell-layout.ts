@@ -4,6 +4,7 @@ import {
   isReducedCapabilityPlatform,
   useIsReducedCapabilityPlatform,
 } from "@/lib/stores/capabilities";
+import { usePlatformStore } from "@/lib/stores/platform";
 
 const PHONE_BREAKPOINT = 768;
 /**
@@ -14,6 +15,15 @@ const PHONE_BREAKPOINT = 768;
  */
 export const SIDEBAR_COLLAPSE_BREAKPOINT = 1080;
 const DETAIL_FLOAT_BREAKPOINT = 1280;
+/**
+ * At or above this width a tablet shows the rooms list and the open room side
+ * by side (UX-DR146: "≥ 840 dp"); below it, the phone's one-level stack. Width
+ * alone: whether the device is a tablet at all is Rust's fact
+ * (`PlatformVm.tablet`, Android's `sw600dp`), never the viewport's, so the
+ * on-screen keyboard — which shrinks the viewport's height, never its width —
+ * changes neither the tier nor the split.
+ */
+export const TABLET_SPLIT_MIN_WIDTH = 840;
 
 export interface ShellLayout {
   /**
@@ -40,6 +50,17 @@ export interface ShellLayout {
   sidebarCollapsed: boolean;
   /** Detail panel opens as a Sheet (instead of pinned) below 1280px. */
   detailFloating: boolean;
+  /**
+   * A reduced platform on a device Rust calls a tablet (`PlatformVm.tablet`,
+   * story 98.3 #5): the phone's surfaces, plus the proxy dock as a sheet.
+   * Never true on a desktop, and never decided by the viewport.
+   */
+  tablet: boolean;
+  /**
+   * A tablet at least {@link TABLET_SPLIT_MIN_WIDTH} wide: the rooms list and
+   * the open room side by side in the phone shell (UX-DR146).
+   */
+  split: boolean;
 }
 
 /**
@@ -59,46 +80,62 @@ export function isPhoneTier(): boolean {
 
 export function useShellLayout(): ShellLayout {
   const reduced = useIsReducedCapabilityPlatform();
-  const [layout, setLayout] = React.useState<ShellLayout>(() => {
+  const tabletDevice = usePlatformStore((s) => s.tablet);
+  const [layout, setLayout] = React.useState<ViewportRules>(() => {
     // Initialize synchronously from the current viewport so a narrow window
     // does not flash the wide layout for one frame before the effect runs.
     if (typeof window === "undefined" || !window.matchMedia) {
-      return { phone: false, sidebarCollapsed: false, detailFloating: false };
+      return {
+        phone: false,
+        sidebarCollapsed: false,
+        detailFloating: false,
+        splitWide: false,
+      };
     }
-    return {
-      phone: window.matchMedia(`(max-width: ${PHONE_BREAKPOINT - 1}px)`).matches,
-      sidebarCollapsed: window.matchMedia(`(max-width: ${SIDEBAR_COLLAPSE_BREAKPOINT - 1}px)`)
-        .matches,
-      detailFloating: window.matchMedia(`(max-width: ${DETAIL_FLOAT_BREAKPOINT - 1}px)`).matches,
-    };
+    return viewportRules(QUERIES.map((query) => window.matchMedia(query)));
   });
 
   React.useEffect(() => {
-    const phoneQuery = window.matchMedia(`(max-width: ${PHONE_BREAKPOINT - 1}px)`);
-    const collapseQuery = window.matchMedia(`(max-width: ${SIDEBAR_COLLAPSE_BREAKPOINT - 1}px)`);
-    const floatQuery = window.matchMedia(`(max-width: ${DETAIL_FLOAT_BREAKPOINT - 1}px)`);
-
-    const onChange = () => {
-      setLayout({
-        phone: phoneQuery.matches,
-        sidebarCollapsed: collapseQuery.matches,
-        detailFloating: floatQuery.matches,
-      });
-    };
+    const queries = QUERIES.map((query) => window.matchMedia(query));
+    const onChange = () => setLayout(viewportRules(queries));
 
     onChange();
-    phoneQuery.addEventListener("change", onChange);
-    collapseQuery.addEventListener("change", onChange);
-    floatQuery.addEventListener("change", onChange);
-
+    for (const query of queries) {
+      query.addEventListener("change", onChange);
+    }
     return () => {
-      phoneQuery.removeEventListener("change", onChange);
-      collapseQuery.removeEventListener("change", onChange);
-      floatQuery.removeEventListener("change", onChange);
+      for (const query of queries) {
+        query.removeEventListener("change", onChange);
+      }
     };
   }, []);
 
   // Only the tier is the platform's; the column rules stay the viewport's,
-  // because they only ever matter on the desktop frame.
-  return reduced ? { ...layout, phone: true } : layout;
+  // because they only ever matter on the desktop frame. A tablet is a reduced
+  // platform on a tablet device — never a desktop window, however large.
+  const { splitWide, ...rules } = layout;
+  const tablet = reduced && tabletDevice;
+  return reduced
+    ? { ...rules, phone: true, tablet, split: tablet && splitWide }
+    : { ...rules, tablet: false, split: false };
+}
+
+/** The four viewport facts the layout folds, in {@link viewportRules}' order. */
+const QUERIES = [
+  `(max-width: ${PHONE_BREAKPOINT - 1}px)`,
+  `(max-width: ${SIDEBAR_COLLAPSE_BREAKPOINT - 1}px)`,
+  `(max-width: ${DETAIL_FLOAT_BREAKPOINT - 1}px)`,
+  `(min-width: ${TABLET_SPLIT_MIN_WIDTH}px)`,
+] as const;
+
+interface ViewportRules {
+  phone: boolean;
+  sidebarCollapsed: boolean;
+  detailFloating: boolean;
+  splitWide: boolean;
+}
+
+function viewportRules(lists: ReadonlyArray<{ matches: boolean }>): ViewportRules {
+  const [phone, sidebarCollapsed, detailFloating, splitWide] = lists.map((list) => list.matches);
+  return { phone, sidebarCollapsed, detailFloating, splitWide };
 }

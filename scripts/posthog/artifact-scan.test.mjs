@@ -55,3 +55,19 @@ test("ordinary ops identifiers remain buildable but 1Password service capsules a
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("identifiers that merely contain phs_ remain buildable but a secure flag key is refused", () => {
+  const root = mkdtempSync(join(tmpdir(), "keeper-scan-"));
+  try {
+    const artifact = join(root, "client.bin");
+    writeFileSync(artifact, "ap != subgraphs_kernel_create_info_maps_.e");
+    assert.equal(scan([artifact]).status, 0);
+    const credential = `${"phs_"}${"aB3".repeat(15)}`;
+    writeFileSync(artifact, `subgraphs_kernel ${credential}`);
+    const result = scan([artifact]);
+    assert.equal(result.status, 1);
+    assert.ok(!`${result.stdout}${result.stderr}`.includes(credential));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

@@ -82,6 +82,9 @@ impl VoicePort for FakePort {
     fn stop_speaking(&self) {
         self.record(Call::StopSpeaking);
     }
+    fn pause_speaking(&self) {}
+    fn continue_speaking(&self) {}
+    fn finish_recognition(&self, _finish: u64) {}
 }
 
 /// The shell's part, played by a fake: the bot host that receives what the

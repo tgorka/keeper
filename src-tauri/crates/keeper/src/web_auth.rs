@@ -7,22 +7,31 @@
 //! that shares Safari's cookies, offers passkeys and password managers, and
 //! hands the callback URL straight back — no deep link has to make it through
 //! Launch Services, which on a phone is the difference between a sign-in that
-//! finishes and one that waits five minutes for nothing. Everywhere else,
-//! macOS included, the port's default opens the person's default browser and
-//! the `keeper://` deep link (or the loopback listener core binds itself)
+//! finishes and one that waits five minutes for nothing. On Android it is an
+//! Auth Tab (`AuthTabPlugin.kt`, story 98.3, DW-290's recipe): the default
+//! browser captures the navigation to the callback scheme and returns the URL
+//! as the activity's result, so the callback never travels as an intent another
+//! app could claim. A browser without Auth Tab gets a Custom Tab, and the
+//! callback then arrives through the deep link like any browser's. Everywhere
+//! else, macOS included, the port's default opens the person's default browser
+//! and the `keeper://` deep link (or the loopback listener core binds itself)
 //! delivers the callback. On a Mac the sheet was a separate Safari window
 //! whatever the default browser was, so the browser the person signs in to —
 //! with its password manager and passkeys — is the better place.
 //!
 //! This file is the part of that relay that is not FFI: where the sheet's
 //! outcome goes. It compiles and is tested on every target; only
-//! [`start`] and [`cancel_all`] reach the iOS half.
+//! [`start`] and [`cancel_all`] reach the iOS half, and [`start`] the Android
+//! one. An Auth Tab cannot be closed by the app, so [`close`] and
+//! [`cancel_all`] end only the flow there; the tab stays until the person
+//! closes it.
 //!
 //! [`Platform::start_web_auth`]: keeper_core::platform::Platform::start_web_auth
 
-// Off Apple nothing presents a sheet, so the routing below is reached only by
-// its tests there; it stays compiled so those tests run on every host.
-#![cfg_attr(not(target_os = "ios"), allow(dead_code))]
+// Off iOS and Android nothing presents a sheet, so the routing below is
+// reached only by its tests there; it stays compiled so those tests run on
+// every host.
+#![cfg_attr(not(any(target_os = "ios", target_os = "android")), allow(dead_code))]
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
@@ -95,6 +104,55 @@ pub enum Ending {
     Failed(String),
 }
 
+/// What `AuthTabPlugin.kt` answers when its tab ends (Android, story 98.3).
+/// Only the Android build receives one; iOS has its own sheet.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(tag = "ending", rename_all = "camelCase")]
+pub enum AuthTabAnswer {
+    /// The browser captured the redirect to the callback scheme.
+    Callback { url: String },
+    /// The person closed the Auth Tab.
+    Cancelled,
+    /// A Custom Tab standing in for an Auth Tab ended, as Android saw it: the
+    /// callback, if the person finishes, comes through the deep link instead.
+    /// Several browsers hand a VIEW intent to an activity of their own task,
+    /// so this can arrive the moment the page opens, while the person is
+    /// still signing in.
+    Closed,
+    /// The tab could not open, or ended in a way that is no callback.
+    Failed { reason: String },
+}
+
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+impl AuthTabAnswer {
+    /// How the flow ends on this answer, or `None` when the answer cannot say:
+    /// a closed stand-in tab tells nothing about a sign-in that may still be in
+    /// front of the person.
+    pub fn ending(self) -> Option<Ending> {
+        match self {
+            AuthTabAnswer::Callback { url } => Some(Ending::Callback(url)),
+            AuthTabAnswer::Cancelled => Some(Ending::Cancelled),
+            AuthTabAnswer::Closed => None,
+            AuthTabAnswer::Failed { reason } => Some(Ending::Failed(reason)),
+        }
+    }
+}
+
+/// Deliver an Auth Tab's answer to the flow waiting under `state`.
+///
+/// A stand-in Custom Tab's `closed` ends nothing (R354): the flow ends by its
+/// deep link, by the person's own cancel (`cancel_oidc`), or by the registry's
+/// five-minute timeout — what the default-browser path relies on everywhere
+/// else. Ending it on `closed` would cancel a sign-in still on screen in every
+/// browser that answers at once.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+pub fn deliver(flows: &OAuthFlowRegistry, state: &str, answer: AuthTabAnswer) {
+    if let Some(ending) = answer.ending() {
+        finish(flows, state, ending);
+    }
+}
+
 /// Deliver one sheet's ending to the flow waiting under `state`.
 ///
 /// A callback carrying this flow's `state` goes through
@@ -143,9 +201,10 @@ fn failure_url(state: &str, reason: &str) -> String {
 #[cfg(target_os = "ios")]
 const MAIN_WINDOW: &str = "main";
 
-/// Present `url` in `ASWebAuthenticationSession` over the main window, for
-/// an account sign-in (its flows are the registry [`install`] recorded).
-#[cfg(target_os = "ios")]
+/// Present `url` in `ASWebAuthenticationSession` over the main window (iOS)
+/// or in an Auth Tab (Android), for an account sign-in (its flows are the
+/// registry [`install`] recorded).
+#[cfg(any(target_os = "ios", target_os = "android"))]
 pub fn start(url: &str, callback_scheme: &str) -> Result<(), CoreError> {
     let (_, flows) = HOST.get().ok_or_else(not_up)?;
     start_in(url, callback_scheme, Arc::clone(flows))
@@ -241,7 +300,29 @@ fn attempt(
         .map_err(|error| CoreError::Internal(format!("could not reach the main window: {error}")))
 }
 
-#[cfg(target_os = "ios")]
+/// Open `url` in an Auth Tab returning on `callback_scheme`, and deliver its
+/// ending to `flows` (story 98.3; the iOS twin above). Returns once the tab is
+/// asked for; the answer arrives on keeper's async runtime, however long the
+/// person takes, and reaches the registry through [`finish`].
+#[cfg(target_os = "android")]
+pub fn start_in(
+    url: &str,
+    callback_scheme: &str,
+    flows: Arc<OAuthFlowRegistry>,
+) -> Result<(), CoreError> {
+    let state = state_of(url)
+        .ok_or_else(|| CoreError::Internal("the authorization URL carries no state".to_owned()))?;
+    let (url, scheme) = (url.to_owned(), callback_scheme.to_owned());
+    tauri::async_runtime::spawn(async move {
+        match crate::android::auth_tab(&url, &scheme).await {
+            Ok(answer) => deliver(&flows, &state, answer),
+            Err(reason) => finish(&flows, &state, Ending::Failed(reason)),
+        }
+    });
+    Ok(())
+}
+
+#[cfg(any(target_os = "ios", target_os = "android"))]
 fn not_up() -> CoreError {
     CoreError::Unsupported("the sign-in sheet is not available before the app starts".to_owned())
 }
@@ -280,7 +361,7 @@ pub fn cancel_all(flows: &Arc<OAuthFlowRegistry>) {
 
 /// The platform a Matrix single sign-on runs against (AD-331): the app's
 /// own, except that on iOS the authorization page opens in the sign-in
-/// sheet, so the identity provider's session from the account sign-in
+/// sheet (on Android in the Auth Tab, story 98.3), so the identity provider's session from the account sign-in
 /// carries over and the person is not asked for a password again. Its ending
 /// goes to the Matrix registry the flow waits in; the redirect
 /// (`dev.tgorka.keeper:/oauth/callback`, `oauth::redirect_uri`) is core's.
@@ -332,7 +413,7 @@ impl Platform for MatrixSignIn<'_> {
         self.inner.keychain_delete(key)
     }
     fn open_url(&self, url: &str) -> Result<(), CoreError> {
-        #[cfg(target_os = "ios")]
+        #[cfg(any(target_os = "ios", target_os = "android"))]
         if let (Some(state), Ok(redirect)) = (state_of(url), keeper_core::oauth::redirect_uri()) {
             if sheet_can_deliver(redirect.scheme()) {
                 match start_in(url, redirect.scheme(), Arc::clone(&self.flows)) {
@@ -480,6 +561,47 @@ mod tests {
         let waiting = flows.register("abc".to_owned());
         let url = "keeper://oauth/acme/callback?code=c&state=abc".to_owned();
         finish(&flows, "abc", Ending::Callback(url.clone()));
+        assert!(matches!(waiting.await, Ok(OAuthCallback::Redirect(got)) if got == url));
+    }
+
+    #[test]
+    fn each_auth_tab_answer_ends_the_flow_as_the_tab_ended() {
+        let answer = |json: &str| {
+            serde_json::from_str::<AuthTabAnswer>(json)
+                .expect("the plugin's answer parses")
+                .ending()
+        };
+        assert_eq!(
+            answer(r#"{"ending":"callback","url":"dev.tgorka.keeper:/oauth/callback?state=s"}"#),
+            Some(Ending::Callback(
+                "dev.tgorka.keeper:/oauth/callback?state=s".to_owned()
+            ))
+        );
+        assert_eq!(answer(r#"{"ending":"cancelled"}"#), Some(Ending::Cancelled));
+        assert_eq!(
+            answer(r#"{"ending":"failed","reason":"no browser"}"#),
+            Some(Ending::Failed("no browser".to_owned()))
+        );
+        // A stand-in Custom Tab closing says nothing about the deep link that
+        // may already have resolved the flow, so it ends nothing by itself.
+        assert_eq!(answer(r#"{"ending":"closed"}"#), None);
+        // An answer keeper does not know is a parse failure, never a cancel.
+        assert!(serde_json::from_str::<AuthTabAnswer>(r#"{"ending":"maybe"}"#).is_err());
+    }
+
+    /// R98TAB-02: a browser that takes the VIEW intent in its own task answers
+    /// `closed` while the login page is still in front of the person; the
+    /// sign-in keeps waiting, and the deep link that follows still ends it.
+    #[tokio::test]
+    async fn a_closed_stand_in_tab_leaves_the_sign_in_to_its_deep_link() {
+        let flows = OAuthFlowRegistry::new();
+        let waiting = flows.register("abc".to_owned());
+        deliver(&flows, "abc", AuthTabAnswer::Closed);
+        let url = "keeper://oauth/acme/callback?code=c&state=abc";
+        assert!(
+            flows.resolve(url),
+            "the flow is still waiting for its deep link"
+        );
         assert!(matches!(waiting.await, Ok(OAuthCallback::Redirect(got)) if got == url));
     }
 }

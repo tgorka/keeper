@@ -73,8 +73,6 @@ ulid = { workspace = true }
 # (`evaluate_destination`) and never a filesystem-probe dependency.
 # Apache-2.0/MIT — passes `cargo deny check`.
 fs4 = { workspace = true }
-# macOS Keychain access for the keychain_* Platform ports (shell-only glue).
-keyring = { workspace = true }
 # Native file-picker dialog for the composer attach button (Story 3.7). Yields OS
 # file paths (never bytes over IPC). MIT/Apache — passes `cargo deny check`.
 tauri-plugin-dialog = { workspace = true }
@@ -120,6 +118,12 @@ tauri-plugin-autostart = { workspace = true }
 # `tauri-plugin-process` supplies `relaunch()` after applying an update.
 tauri-plugin-updater = { workspace = true }
 tauri-plugin-process = { workspace = true }
+# The desktop keychain for `DesktopPlatform`'s keychain_* ports (shell-only
+# glue). Desktop-only since Epic 98 (story 98.3): iOS reaches its Keychain
+# through `security-framework`, and on Android keyring would resolve to its
+# MOCK store, which forgets every secret at exit — Android's secrets are
+# `keeper_core::secret_file`'s. `check:android-graph` fails if it comes back.
+keyring = { workspace = true }
 
 # Linux credential store. The workspace catalog entry turns on `apple-native`
 # only, so on a Linux target keyring resolves to its MOCK store — an in-memory
@@ -174,8 +178,29 @@ objc2-natural-language = { workspace = true }
 # needs Xcode (Swift 6.2+) and fetches FluidAudio through SwiftPM.
 fluidaudio-rs = { path = "../../../tools/fluidaudio-rs" }
 
+# The turn models (Epic 97, D-36): ONNX Runtime, statically linked, reached
+# only from `voice_turn_models.rs`. Apple silicon only — pyke publishes no
+# Intel macOS library, and keeper ships for aarch64 alone; an Intel build keeps
+# voice's pause rule. See the workspace entry for what the build downloads.
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+ort = { workspace = true }
+
+# The same on the iPhone itself, the one iOS target `NOTICE` records a runtime
+# for: the simulator (arm64 or Intel) keeps voice's pause rule and shows no
+# turn-models line (`voice_turn_models::supported`). Xcode links `libapp.a`,
+# so the CoreML framework and libc++ the library needs are named in
+# `gen/apple/project.yml`.
+[target.'cfg(all(target_os = "ios", target_arch = "aarch64", not(target_env = "sim")))'.dependencies]
+ort = { workspace = true }
+
 [target.'cfg(target_os = "ios")'.dependencies]
 security-framework = { workspace = true }
+# Push (Epic 98, story 98.1): the APNs device token reaches keeper through the
+# app delegate's two remote-notification selectors, which keeper's patched tao
+# adds (`tools/tao/NOTICE`, change 3) and `push_ios.rs` hooks with
+# `tao::platform::ios::set_remote_notification_hooks`. The same tao Tauri
+# runs on (`[patch.crates-io]`); only the edge is new.
+tao = { version = "0.35.3", default-features = false }
 # iOS backup exclusion (Story 14.7, FR-65). The single audited `#[allow(unsafe_code)]`
 # FFI in `IosPlatform::exclude_from_backup` sets `NSURLIsExcludedFromBackupKey` via
 # objc2-foundation (features NSURL/NSError/NSString/NSValue, set on the workspace

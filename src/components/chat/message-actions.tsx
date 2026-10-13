@@ -2,11 +2,12 @@
  * Per-message hover/focus action bar (Story 3.4/3.5/3.8, FR-10/FR-11/FR-12/FR-15;
  * epic action-bar).
  *
- * Reveals React (a curated-emoji Popover, always), Reply (always), Edit (own text
- * messages only), and Delete (own messages only — delete for everyone) over a
- * bubble. All are labeled, keyboard-focusable controls. The parent wires
- * `onReact`/`onReply`/`onEdit`/`onDelete`; this component holds no IPC or store
- * knowledge — Delete opens the confirmation dialog in the parent.
+ * Reveals React (a curated-emoji Popover), Reply, Edit (own text messages only),
+ * and Delete (own messages only — delete for everyone) over a bubble, each only
+ * when the parent wires its handler — a gate's room (UX-DR147) wires neither
+ * React nor Reply. All are labeled, keyboard-focusable controls. This component
+ * holds no IPC or store knowledge — Delete opens the confirmation dialog in the
+ * parent.
  */
 import { Pencil, Reply, Trash2 } from "lucide-react";
 import { ReactionPopover } from "@/components/chat/reaction-popover";
@@ -20,14 +21,14 @@ interface MessageActionsProps {
   canEdit: boolean;
   /** Whether Delete is offered (own message only — delete for everyone). */
   canDelete: boolean;
-  /** Add an emoji reaction to this message (via the curated Popover). */
-  onReact: (key: string, emoji: string) => void;
-  /** Begin a reply to this message. */
-  onReply: (key: string) => void;
+  /** Add an emoji reaction to this message (via the curated Popover); absent, no React. */
+  onReact?: (key: string, emoji: string) => void;
+  /** Begin a reply to this message; absent, no Reply. */
+  onReply?: (key: string) => void;
   /** Begin an edit of this message (offered only when `canEdit`). */
-  onEdit: (key: string) => void;
+  onEdit?: (key: string) => void;
   /** Begin deleting this message for everyone (offered only when `canDelete`). */
-  onDelete: (key: string) => void;
+  onDelete?: (key: string) => void;
 }
 
 export function MessageActions({
@@ -41,19 +42,21 @@ export function MessageActions({
 }: MessageActionsProps) {
   return (
     <div className="flex items-center gap-0.5 rounded-md border border-border bg-background p-0.5 shadow-xs">
-      <ReactionPopover onPick={(emoji) => onReact(messageKey, emoji)} />
-      <IconHint label="Reply">
-        <Button
-          type="button"
-          variant="ghost"
-          size="icon-xs"
-          aria-label="Reply"
-          onClick={() => onReply(messageKey)}
-        >
-          <Reply aria-hidden="true" />
-        </Button>
-      </IconHint>
-      {canEdit && (
+      {onReact && <ReactionPopover onPick={(emoji) => onReact(messageKey, emoji)} />}
+      {onReply && (
+        <IconHint label="Reply">
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon-xs"
+            aria-label="Reply"
+            onClick={() => onReply(messageKey)}
+          >
+            <Reply aria-hidden="true" />
+          </Button>
+        </IconHint>
+      )}
+      {canEdit && onEdit && (
         <IconHint label="Edit">
           <Button
             type="button"
@@ -66,7 +69,7 @@ export function MessageActions({
           </Button>
         </IconHint>
       )}
-      {canDelete && (
+      {canDelete && onDelete && (
         <IconHint label="Delete">
           <Button
             type="button"

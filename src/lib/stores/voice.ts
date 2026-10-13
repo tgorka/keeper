@@ -116,23 +116,48 @@ export interface VoiceState {
   unavailable: VoiceUnavailableVm | null | undefined;
   /** The wake switch, phrase and limits sentence; `null` until read. */
   wake: VoiceWakeVm | null;
+  /** The ticket of the wake VM `wake` holds: every VM applied and every read
+   *  asked takes the next one, so a read answered after a newer VM landed is
+   *  dropped ({@link applyWakeRead}). */
+  wakeTicket: number;
   applyState: (state: VoiceStateVm) => void;
   applyAvailability: (unavailable: VoiceUnavailableVm | null) => void;
+  /** A VM Rust sent itself — the shell's event, a write's reply: the newest
+   *  there is, whenever it arrives. */
   applyWake: (wake: VoiceWakeVm) => void;
+  /** A `voice_wake_get` answer, asked under `ticket` ({@link askWakeTicket}):
+   *  kept only when nothing newer landed since it was asked. */
+  applyWakeRead: (ticket: number, wake: VoiceWakeVm) => void;
   /** Forget the stream's last snapshot (subscription teardown). The wake
    *  settings and availability survive: they are facts read once, not the
    *  stream's. */
   reset: () => void;
 }
 
+/** The last wake ticket handed out; it only grows. */
+let wakeTickets = 0;
+
+/** A ticket for a `voice_wake_get` about to be asked, later than every wake
+ *  VM already applied or asked for. */
+export function askWakeTicket(): number {
+  wakeTickets += 1;
+  return wakeTickets;
+}
+
 /** The vanilla store instance, created once at module load. */
-export const voiceStore = createStore<VoiceState>()((set) => ({
+export const voiceStore = createStore<VoiceState>()((set, get) => ({
   state: null,
   unavailable: undefined,
   wake: null,
+  wakeTicket: 0,
   applyState: (state) => set({ state }),
   applyAvailability: (unavailable) => set({ unavailable }),
-  applyWake: (wake) => set({ wake }),
+  applyWake: (wake) => set({ wake, wakeTicket: askWakeTicket() }),
+  applyWakeRead: (ticket, wake) => {
+    if (ticket > get().wakeTicket) {
+      set({ wake, wakeTicket: ticket });
+    }
+  },
   reset: () => set({ state: null }),
 }));
 

@@ -41,6 +41,7 @@ use crate::agents::events::{
     request_records, ApprovalDecisionContent, ApprovalRequestContent, ConsumedContent,
     APPROVAL_CONSUMED, APPROVAL_DECISION, APPROVAL_REQUEST, CONTENT_VERSION,
 };
+use crate::agents::gate_room::{GateCardVm, GateRowVm};
 use crate::agents::tier::AgentTool;
 
 /// This device is not verified by its owner's cross-signing identity.
@@ -49,6 +50,9 @@ pub const UNVERIFIED: &str = "This device cannot decide: it is not verified. Ver
 pub const NOT_AN_APPROVER: &str = "You are not one of the people who can decide this.";
 /// A T4 card on the device of the app that runs the asking agent (S-22).
 pub const THIS_DEVICE: &str = "Decide on another device: this app runs the agent that asks, so it cannot be the one that agrees.";
+/// A T4 screen action's card on the Mac whose screen it acts on (96.4 #7,
+/// S-22).
+pub const THIS_MAC: &str = "Decide this on another device: this Mac is the one it acts on.";
 /// A T4 card naming nobody who asked.
 pub const NO_REQUESTER: &str = "Nobody can decide this: it names nobody who asked.";
 /// A record whose digest is not over what the card shows (R185).
@@ -195,7 +199,8 @@ pub struct ApprovalCardVm {
     pub summary: String,
     /// The tool, as the model called it.
     pub tool: String,
-    /// The exact arguments, pretty-printed JSON; `None` when attached.
+    /// The exact arguments, pretty-printed JSON; `None` when attached, and
+    /// for a `run` or a `kvm_act`, which `run` and `kvm` draw whole.
     pub payload: Option<String>,
     /// [`ATTACHED`] and the arguments' SHA-256, when they travel as a file:
     /// `agent_approval_payload` fetches and checks them.
@@ -221,6 +226,198 @@ pub struct ApprovalCardVm {
     /// At T4: who alone decides, and that it cannot be undone.
     pub only: Option<String>,
     pub declassify: Option<DeclassifyVm>,
+    /// A `run`'s execution as keeper bound it (UX-DR139); `None` for any
+    /// other tool, or when the action is attached — [`attached_payload`]
+    /// then draws the same view once its file is checked (R231).
+    pub run: Option<RunCardVm>,
+    /// A `kvm_act`'s inputs as keeper reads them (R323); `None` for any
+    /// other tool, or when the action is attached — [`attached_payload`]
+    /// then draws it.
+    pub kvm: Option<KvmCardVm>,
+    /// A row of a gate's hour card (UX-DR160): the request it serves, its
+    /// ticket and the agent the work would go to; `None` outside a gate
+    /// room.
+    pub gate: Option<GateRowVm>,
+}
+
+/// What a `kvm_act` card draws (R323, as R247 draws a `run`): the KVM and
+/// each input as keeper describes it — typed and pasted text as its count
+/// with its line breaks and tabs, a run of character keys as theirs, a run
+/// of letters or digits under Ctrl, Alt or Meta as theirs, named keys and
+/// their chords spelled, points, scroll steps and power. Never the
+/// arguments themselves: the model's `intent` and the text it types are
+/// its words, not the person's.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct KvmCardVm {
+    /// The KVM's id, as keeper shows a name.
+    pub kvm: String,
+    pub inputs: Vec<String>,
+}
+
+/// The KVM card of a `kvm_act` whose arguments are `args`.
+fn kvm_card(args: &Value) -> Option<KvmCardVm> {
+    crate::agents::kvm::card(args).map(|(kvm, inputs)| KvmCardVm { kvm, inputs })
+}
+
+/// What a `run` card draws (UX-DR139, R155, R213, R260): the argv as it
+/// runs, one element per line — git's inserted `-c core.hooksPath=/dev/null`
+/// with it; the program started, each wrapper a wrapper starts, and the
+/// program the last one runs, with the first 12 hex digits of their
+/// SHA-256; where it runs; the drives it asked to read and when it is
+/// stopped; each piece of code the session holds; and, with network, the
+/// workspace it releases. Not drawn: the environment, which is the host's
+/// fixed one, and the folders' device and inode.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct RunCardVm {
+    pub argv: Vec<String>,
+    /// `/usr/bin/cargo · 0123456789ab`.
+    pub program: String,
+    /// Each wrapper a wrapper starts before the program (`env nice tool`
+    /// starts `nice`), the same way, in order.
+    pub wrappers: Vec<String>,
+    /// The program a wrapper runs, the same way.
+    pub wrapped: Option<String>,
+    /// `workspace/<folder>`, as it resolved.
+    pub cwd: String,
+    /// Each drive id the run asked to read, read-only.
+    pub reads: Vec<String>,
+    /// The seconds after which it is stopped: the one it asked for, or the
+    /// default.
+    #[ts(type = "number")]
+    pub timeout_s: u64,
+    /// Each file of the code the session holds, or the inline code's flag,
+    /// with its hash: `tool.py · 0123456789ab`.
+    pub held: Vec<String>,
+    pub network: Option<RunNetworkVm>,
+}
+
+/// The *Network* chip and the workspace a networked run releases.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct RunNetworkVm {
+    /// "This command may reach any host. It sees only this session's
+    /// workspace: <n> files, <size>."
+    pub sentence: String,
+    /// Every file it releases, by path.
+    pub files: Vec<String>,
+}
+
+/// `text` as a run card shows one argument or one file's name (R231):
+/// itself when nothing in it could be misread — not empty, no control or
+/// bidirectional character, no quote or backslash, no space at either end
+/// — else in double quotes with `\\`, `\"`, `\n`, `\t` and `\u{…}` escapes.
+/// So an empty argument, one holding a newline and two arguments, a name
+/// that a bidi override would reorder, each shows as what it is; the raw
+/// values are what runs and what the digest binds.
+fn card_text(text: &str) -> String {
+    let bidi = |c: char| matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}');
+    let plain = !text.is_empty()
+        && text.trim() == text
+        && !text
+            .chars()
+            .any(|c| c.is_control() || bidi(c) || c == '"' || c == '\\');
+    if plain {
+        return text.to_owned();
+    }
+    let mut out = String::from("\"");
+    for c in text.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() || bidi(c) => out.push_str(&format!("\\u{{{:x}}}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// `bytes` as a person reads a size.
+fn size_words(bytes: u64) -> String {
+    match bytes {
+        0..=999 => format!("{bytes} bytes"),
+        1_000..=999_999 => format!("{:.1} kB", bytes as f64 / 1e3),
+        1_000_000..=999_999_999 => format!("{:.1} MB", bytes as f64 / 1e6),
+        _ => format!("{:.1} GB", bytes as f64 / 1e9),
+    }
+}
+
+/// What `request`, a `run` as its digest is over it — inline, or its
+/// attachment read back — shows, each argument and name as [`card_text`].
+fn run_card(request: &ApprovalRequestContent) -> RunCardVm {
+    let binding = &request.action.exec_binding;
+    let args = &request.action.args;
+    let raw = |value: &Value| value.as_str().unwrap_or("").to_owned();
+    let text = |value: &Value| card_text(value.as_str().unwrap_or(""));
+    let hashed = |what: String, sha: &Value| {
+        let sha = raw(sha);
+        format!("{what} · {}", sha.get(..12).unwrap_or(&sha))
+    };
+    let network = request.preconditions.workspace.as_ref().map(|set| {
+        let files: Vec<String> = set["files"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|file| text(&file["path"]))
+            .collect();
+        RunNetworkVm {
+            sentence: format!(
+                "This command may reach any host. It sees only this session's workspace: {} {}, {}.",
+                files.len(),
+                if files.len() == 1 { "file" } else { "files" },
+                size_words(set["bytes"].as_u64().unwrap_or(0)),
+            ),
+            files,
+        }
+    });
+    RunCardVm {
+        argv: binding["argv"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(text)
+            .collect(),
+        program: hashed(text(&binding["exe"]), &binding["exe_sha256"]),
+        wrappers: binding["wrappers"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|wrapper| hashed(text(&wrapper["path"]), &wrapper["sha256"]))
+            .collect(),
+        wrapped: binding
+            .get("program")
+            .map(|program| hashed(text(&program["path"]), &program["sha256"])),
+        cwd: card_text(&format!("workspace/{}", raw(&binding["cwd"]))),
+        reads: args["read"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(text)
+            .collect(),
+        timeout_s: args["timeout_s"]
+            .as_u64()
+            .unwrap_or(crate::agents::run::TIMEOUT_DEFAULT_S),
+        held: binding["operands"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|operand| {
+                let what = operand["path"]
+                    .as_str()
+                    .or_else(|| operand["inline"].as_str())
+                    .unwrap_or("");
+                hashed(card_text(what), &operand["sha256"])
+            })
+            .collect(),
+        network,
+    }
 }
 
 /// One request event's cards: one, or a coalesced card's rows. `id` is the
@@ -231,6 +428,9 @@ pub struct ApprovalCardVm {
 pub struct ApprovalVm {
     pub id: String,
     pub cards: Vec<ApprovalCardVm>,
+    /// In a gate room, the hour's card (UX-DR160): the system, the hour it
+    /// covers and what *Deny all* denies; `None` elsewhere.
+    pub gate: Option<GateCardVm>,
 }
 
 /// The tier as a card says it.
@@ -267,10 +467,11 @@ pub enum Binding {
     Unbound,
 }
 
-/// Whether `summary` is keeper's own sentence for `tool` with `args`.
+/// Whether `summary` is keeper's own sentence for `tool` with `args` and
+/// the request's `exec_binding`.
 fn summary_holds(request: &ApprovalRequestContent, args: &Value) -> bool {
     AgentTool::from_wire(&request.action.tool)
-        .is_some_and(|tool| summary_of(tool, args) == request.summary)
+        .is_some_and(|tool| summary_of(tool, args, &request.action.exec_binding) == request.summary)
 }
 
 /// How `request`'s digest stands against what its card shows (R185).
@@ -292,9 +493,11 @@ pub fn binding(request: &ApprovalRequestContent) -> Binding {
     }
 }
 
-/// The arguments in an attached action's decrypted `bytes`, when they are
-/// the file the request names and the action its digest and summary bind
-/// (R186); else [`PAYLOAD_REFUSED`].
+/// What an attached action's decrypted `bytes` hold, when they are the
+/// file the request names and the action its digest and summary bind
+/// (R186); else [`PAYLOAD_REFUSED`]. A `run`'s file holds its arguments,
+/// its `exec_binding` and the workspace set it releases, all of which the
+/// digest is over and the person sees (R213); any other's, the arguments.
 pub fn verify_attached(request: &ApprovalRequestContent, bytes: &[u8]) -> Result<Value, String> {
     let refused = || PAYLOAD_REFUSED.to_owned();
     if binding(request) != Binding::Attached {
@@ -303,11 +506,77 @@ pub fn verify_attached(request: &ApprovalRequestContent, bytes: &[u8]) -> Result
     if request.file_sha256.as_deref() != Some(crate::agents::approval::sha256_hex(bytes).as_str()) {
         return Err(refused());
     }
-    let args: Value = serde_json::from_slice(bytes).map_err(|_| refused())?;
-    if !request.binds(&args) || !summary_holds(request, &args) {
+    let payload: Value = serde_json::from_slice(bytes).map_err(|_| refused())?;
+    if request.action.tool == AgentTool::Run.as_wire() {
+        let (args, exec_binding, workspace) =
+            crate::agents::approval::attached_run(payload.clone()).ok_or_else(refused)?;
+        let mut whole = request.clone();
+        whole.action.exec_binding = exec_binding;
+        whole.preconditions.workspace = workspace;
+        if !whole.binds(&args) || !summary_holds(&whole, &args) {
+            return Err(refused());
+        }
+        return Ok(payload);
+    }
+    if !request.binds(&payload) || !summary_holds(request, &payload) {
         return Err(refused());
     }
-    Ok(args)
+    Ok(payload)
+}
+
+/// An attached action as a device shows it once its bytes are checked
+/// (R186, R231): the action as text and, for a `run`, the same typed run
+/// view an inline `run` card draws — its argv, programs, folder, held
+/// code and, with network, the workspace it releases, counted, sized and
+/// listed — and for a `kvm_act` the same inputs an inline one draws, built
+/// from what the digest binds, never from the card, and nothing else of it
+/// (R328).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct ApprovalPayloadVm {
+    /// The action, pretty-printed JSON; drawn only for a tool with no
+    /// typed view. Empty for a `kvm_act`: its arguments are the model's
+    /// words.
+    pub text: String,
+    pub run: Option<RunCardVm>,
+    pub kvm: Option<KvmCardVm>,
+}
+
+/// What an attached action's `bytes` show (R186, R231): refused as
+/// [`verify_attached`] refuses them; else the payload as text and, for a
+/// `run`, its run view from the arguments, binding and workspace set the
+/// digest was just checked over; for a `kvm_act` its inputs alone, refused
+/// when they do not read (R328).
+pub fn attached_payload(
+    request: &ApprovalRequestContent,
+    bytes: &[u8],
+) -> Result<ApprovalPayloadVm, String> {
+    let payload = verify_attached(request, bytes)?;
+    if request.action.tool == AgentTool::KvmAct.as_wire() {
+        let kvm = kvm_card(&payload).ok_or_else(|| PAYLOAD_REFUSED.to_owned())?;
+        return Ok(ApprovalPayloadVm {
+            text: String::new(),
+            run: None,
+            kvm: Some(kvm),
+        });
+    }
+    let text = serde_json::to_string_pretty(&payload).map_err(|_| PAYLOAD_REFUSED.to_owned())?;
+    let run = (request.action.tool == AgentTool::Run.as_wire())
+        .then(|| crate::agents::approval::attached_run(payload))
+        .flatten()
+        .map(|(args, exec_binding, workspace)| {
+            let mut whole = request.clone();
+            whole.action.args = args;
+            whole.action.exec_binding = exec_binding;
+            whole.preconditions.workspace = workspace;
+            run_card(&whole)
+        });
+    Ok(ApprovalPayloadVm {
+        text,
+        run,
+        kvm: None,
+    })
 }
 
 /// The scopes the card offers: the request's, never `session` above T2.
@@ -344,6 +613,43 @@ fn person(user: &str, name: &dyn Fn(&UserId) -> String) -> ApprovalPersonVm {
     }
 }
 
+/// Why a person cannot decide a request from what it shows ([`undecidable`]).
+enum Undecidable<'a> {
+    Unbound,
+    NotAnApprover,
+    NoRequester,
+    /// At T4: only the requester decides.
+    OnlyRequester(&'a str),
+}
+
+/// Why nobody signed in as `own` can decide `request` from what it shows,
+/// on any device of theirs: the card's three rules, which the lock screen's
+/// actions follow too (R336) — the digest binds what is shown, `own` is an
+/// approver (anyone when the request names none), and at T4 `own` is the
+/// requester. `None` when `own` may decide.
+fn undecidable<'a>(request: &'a ApprovalRequestContent, own: &str) -> Option<Undecidable<'a>> {
+    if binding(request) == Binding::Unbound {
+        return Some(Undecidable::Unbound);
+    }
+    if !request.approvers.is_empty() && !request.approvers.iter().any(|a| a == own) {
+        return Some(Undecidable::NotAnApprover);
+    }
+    if request.tier >= 4 {
+        match requester(request) {
+            None => return Some(Undecidable::NoRequester),
+            Some(asked) if asked != own => return Some(Undecidable::OnlyRequester(asked)),
+            Some(_) => {}
+        }
+    }
+    None
+}
+
+/// Whether `own` may decide `request` by what it shows, wherever they read
+/// it: the rules of [`refusal`] that do not depend on the device (R336).
+pub fn decidable_by(request: &ApprovalRequestContent, own: &str) -> bool {
+    undecidable(request, own).is_none()
+}
+
 /// Why `viewer` cannot decide `request` now, and whether verifying this
 /// device would let them; `None` when they can.
 pub fn refusal(
@@ -351,27 +657,24 @@ pub fn refusal(
     viewer: &Viewer,
     name: &dyn Fn(&UserId) -> String,
 ) -> Option<(String, bool)> {
-    if binding(request) == Binding::Unbound {
-        return Some((UNBOUND.to_owned(), false));
-    }
-    let own = viewer.own.as_str();
-    if !request.approvers.is_empty() && !request.approvers.iter().any(|a| a == own) {
-        return Some((NOT_AN_APPROVER.to_owned(), false));
-    }
-    if request.tier >= 4 {
-        match requester(request) {
-            None => return Some((NO_REQUESTER.to_owned(), false)),
-            Some(asked) if asked != own => {
-                return Some((only(&person(asked, name).name), false));
-            }
-            Some(_) => {}
-        }
+    let why = match undecidable(request, viewer.own.as_str()) {
+        Some(Undecidable::Unbound) => Some(UNBOUND.to_owned()),
+        Some(Undecidable::NotAnApprover) => Some(NOT_AN_APPROVER.to_owned()),
+        Some(Undecidable::NoRequester) => Some(NO_REQUESTER.to_owned()),
+        Some(Undecidable::OnlyRequester(asked)) => Some(only(&person(asked, name).name)),
+        None => None,
+    };
+    if let Some(why) = why {
+        return Some((why, false));
     }
     if !viewer.device_cross_signed {
         return Some((UNVERIFIED.to_owned(), true));
     }
     if request.tier >= 4 && viewer.hosts(&request.room) {
-        return Some((THIS_DEVICE.to_owned(), false));
+        let screen = request.action.tool == AgentTool::Mcp.as_wire()
+            && request.action.exec_binding["role"] == "screen";
+        let said = if screen { THIS_MAC } else { THIS_DEVICE };
+        return Some((said.to_owned(), false));
     }
     None
 }
@@ -418,7 +721,13 @@ impl ApprovalCardVm {
         name: &dyn Fn(&UserId) -> String,
     ) -> ApprovalCardVm {
         let attached = request.file.is_some();
-        let payload = (!attached)
+        let run = request.action.tool == AgentTool::Run.as_wire();
+        let kvm = request.action.tool == AgentTool::KvmAct.as_wire();
+        // A run is drawn as its typed view alone (R247): its arguments as
+        // raw JSON would show a bidi override as the character it is. So is
+        // a KVM's (R323): its arguments hold the model's intent and the text
+        // it types, which are not for the person deciding.
+        let payload = (!attached && !run && !kvm)
             .then(|| serde_json::to_string_pretty(&request.action.args).ok())
             .flatten();
         let attachment = attached.then(|| match &request.file_sha256 {
@@ -443,10 +752,12 @@ impl ApprovalCardVm {
                 Scope::Session => ScopeOfferVm {
                     scope,
                     label: "Approve for this session".to_owned(),
-                    detail: if attached {
-                        ATTACHED_REACH.to_owned()
-                    } else {
-                        session_reach(&request.action.tool, &request.action.args)
+                    detail: match (attached, request.action.tool == AgentTool::Run.as_wire()) {
+                        // A run's allowance is its programs and folder,
+                        // whatever its size (R146, R231).
+                        (true, true) => crate::agents::run::ATTACHED_SESSION_REACH.to_owned(),
+                        (true, false) => ATTACHED_REACH.to_owned(),
+                        (false, _) => session_reach(&request.action.tool, &request.action.args),
                     },
                 },
             })
@@ -489,6 +800,11 @@ impl ApprovalCardVm {
             only,
             declassify: (request.action.tool == "declassify")
                 .then(|| declassify(&request.action.args, name)),
+            run: (run && !attached).then(|| run_card(request)),
+            kvm: (kvm && !attached)
+                .then(|| kvm_card(&request.action.args))
+                .flatten(),
+            gate: None,
         }
     }
 }
@@ -497,6 +813,9 @@ impl ApprovalCardVm {
 struct Request {
     event: String,
     sender: OwnedUserId,
+    /// The request event's `origin_server_ts`, ms: a gate card's hour
+    /// starts there.
+    at: u64,
     records: Vec<ApprovalRequestContent>,
 }
 
@@ -555,7 +874,12 @@ impl ApprovalFold {
                 {
                     return false;
                 }
-                self.request(id, sender, content)
+                self.request(
+                    id,
+                    sender,
+                    event["origin_server_ts"].as_u64().unwrap_or(0),
+                    content,
+                )
             }
             APPROVAL_DECISION => {
                 if !sealed || (senders.agent)(&sender) {
@@ -599,7 +923,7 @@ impl ApprovalFold {
             .any(|request| request.records.iter().any(|record| record.id == id))
     }
 
-    fn request(&mut self, event: &str, sender: OwnedUserId, content: &Value) -> bool {
+    fn request(&mut self, event: &str, sender: OwnedUserId, at: u64, content: &Value) -> bool {
         let relation = &content["m.relates_to"];
         if relation["rel_type"] == "m.replace" {
             let Some(target) = relation["event_id"].as_str() else {
@@ -608,10 +932,10 @@ impl ApprovalFold {
             let Some(new) = request_records(&content["m.new_content"]) else {
                 return false;
             };
-            let Some(at) = self.requests.iter().position(|r| r.event == target) else {
+            let Some(place) = self.requests.iter().position(|r| r.event == target) else {
                 return false;
             };
-            let held = &self.requests[at];
+            let held = &self.requests[place];
             // Only the original sender adds records, and never drops or
             // changes one already listed.
             if held.sender != sender
@@ -637,7 +961,7 @@ impl ApprovalFold {
             if added.is_empty() {
                 return false;
             }
-            self.requests[at].records.extend(added);
+            self.requests[place].records.extend(added);
             return true;
         }
         let Some(records) = request_records(content) else {
@@ -655,6 +979,7 @@ impl ApprovalFold {
         self.requests.push(Request {
             event: event.to_owned(),
             sender,
+            at,
             records: fresh,
         });
         true
@@ -724,25 +1049,42 @@ impl ApprovalFold {
     }
 
     /// Every request's cards, in the room's order, as `viewer` reads them
-    /// at `now`.
+    /// at `now`. In the room of a gate that is the door for `gate` (a
+    /// `system`), each request is the hour's card (UX-DR160): its rows name
+    /// their request and ticket, each approves *once* in those words, and
+    /// the card says its hour and what *Deny all* denies.
     pub fn approvals(
         &self,
         viewer: &Viewer,
         now: DateTime<Utc>,
         name: &dyn Fn(&UserId) -> String,
+        gate: Option<&str>,
     ) -> Vec<ApprovalVm> {
         self.requests
             .iter()
-            .map(|request| ApprovalVm {
-                id: request.records[0].id.clone(),
-                cards: request
+            .map(|request| {
+                let cards: Vec<ApprovalCardVm> = request
                     .records
                     .iter()
                     .map(|record| {
                         let state = self.state_vm(request, record, now, name);
-                        ApprovalCardVm::of(record, state, viewer, name)
+                        let mut card = ApprovalCardVm::of(record, state, viewer, name);
+                        if gate.is_some() {
+                            card.gate = Some(GateRowVm::of(record));
+                            for offer in &mut card.scopes {
+                                if offer.scope == Scope::Once {
+                                    offer.label = "Approve once".to_owned();
+                                }
+                            }
+                        }
+                        card
                     })
-                    .collect(),
+                    .collect();
+                ApprovalVm {
+                    id: request.records[0].id.clone(),
+                    gate: gate.map(|system| GateCardVm::of(system, request.at, &cards)),
+                    cards,
+                }
             })
             .collect()
     }
@@ -817,6 +1159,29 @@ impl ApprovalFold {
             Some((sentence, _)) => Err(sentence),
             None => Ok(record),
         }
+    }
+
+    /// Whether `viewer` may send the decision `req` at `now`, `shown`
+    /// saying whether this app has shown an attached action with a
+    /// binding digest: [`Self::check`], and an approve of an attached
+    /// action not shown refused ([`UNSEEN`], R186) — so nothing is approved
+    /// that [`attached_payload`] did not check and show first.
+    pub fn decide(
+        &self,
+        viewer: &Viewer,
+        req: &ApprovalDecideReq,
+        now: DateTime<Utc>,
+        name: &dyn Fn(&UserId) -> String,
+        shown: &dyn Fn(&str) -> bool,
+    ) -> Result<&ApprovalRequestContent, String> {
+        let record = self.check(viewer, &req.id, &req.binding_digest, req.scope, now, name)?;
+        if req.decision == Decision::Approve
+            && binding(record) == Binding::Attached
+            && !shown(&record.binding_digest)
+        {
+            return Err(UNSEEN.to_owned());
+        }
+        Ok(record)
     }
 }
 
@@ -927,7 +1292,8 @@ mod tests {
         let tool = request["action"]["tool"].as_str().expect("tool").to_owned();
         request["summary"] = json!(summary_of(
             AgentTool::from_wire(&tool).expect("a tool"),
-            args
+            args,
+            &request["action"]["exec_binding"]
         ));
         request["binding_digest"] = json!(binding_digest(
             request["id"].as_str().expect("id"),
@@ -1017,7 +1383,7 @@ mod tests {
     }
 
     fn states(fold: &ApprovalFold, at: DateTime<Utc>) -> Vec<ApprovalStateVm> {
-        fold.approvals(&viewer(TGORKA), at, &name)
+        fold.approvals(&viewer(TGORKA), at, &name, None)
             .into_iter()
             .flat_map(|approval| approval.cards)
             .map(|card| card.state)
@@ -1104,6 +1470,233 @@ mod tests {
         );
     }
 
+    /// R96R-17, UX-DR139: a `run` card draws its execution as keeper bound
+    /// it, not as the model asked — the argv as it runs, the folder `cwd`
+    /// resolved to, the programs and held files with their SHA-256 — and,
+    /// with network, the workspace it releases.
+    #[test]
+    fn a_run_card_draws_what_keeper_bound() {
+        let args = json!({"argv": ["env", "./tool", "fetch"], "cwd": "sel", "network": true});
+        let binding = json!({
+            "host": "electra",
+            "argv": ["env", "./tool", "-c", "core.hooksPath=/dev/null", "fetch"],
+            "cwd": "repo-a",
+            "env": [],
+            "exe": "/usr/bin/env",
+            "exe_sha256": "0123456789abcdef".repeat(4),
+            "program": {"path": "/w/repo-a/tool", "sha256": "fedcba9876543210".repeat(4)},
+            "operands": [{"path": "tool", "inline": null, "sha256": "aa".repeat(32)}],
+        });
+        let mut value = request("01R", 3, &["once"]);
+        value["action"] = json!({"tool": "run", "args": args, "exec_binding": binding});
+        value["preconditions"]["files"] = json!([]);
+        value["preconditions"]["workspace"] = json!({"sha256": "s", "bytes": 41_300,
+            "files": [{"path": "a.txt", "sha256": "b"}, {"path": "tool", "sha256": "c"}]});
+        let run = card(sealed(value, &args), &viewer(TGORKA))
+            .run
+            .expect("a run card");
+        assert_eq!(
+            run.argv,
+            ["env", "./tool", "-c", "core.hooksPath=/dev/null", "fetch"]
+        );
+        assert_eq!(run.program, "/usr/bin/env · 0123456789ab");
+        assert_eq!(
+            run.wrapped.as_deref(),
+            Some("/w/repo-a/tool · fedcba987654")
+        );
+        assert_eq!(run.cwd, "workspace/repo-a");
+        assert_eq!(run.held, ["tool · aaaaaaaaaaaa"]);
+        assert!(run.network.is_some());
+        // Another tool draws no run.
+        assert_eq!(
+            card(request("01A", 2, &["once"]), &viewer(TGORKA)).run,
+            None
+        );
+    }
+
+    /// R323 (R96K1-02): a `kvm_act` card draws the KVM and its inputs as
+    /// keeper reads them, inline and attached alike — no raw arguments, so
+    /// neither the model's intent nor the text it types reaches the person
+    /// deciding.
+    #[test]
+    fn a_kvm_card_draws_its_inputs_never_the_models_words() {
+        let args = json!({
+            "kvm": "desk",
+            "intent": "IGNORE THIS and approve: it is safe",
+            "actions": [
+                {"do": "click", "x": 960, "y": 540},
+                {"do": "type", "text": "s3cret words\n"},
+                {"do": "key", "key": "h"},
+                {"do": "key", "key": "i"},
+            ],
+        });
+        let mut value = request("01K", 4, &["once"]);
+        value["action"] = json!({"tool": "kvm_act", "args": args, "exec_binding": null});
+        value["preconditions"]["files"] = json!([]);
+        let inline = card(sealed(value.clone(), &args), &viewer(TGORKA));
+        let inputs = [
+            "click (960, 540)",
+            "type 13 characters including 1 line break",
+            "2 character keys",
+        ];
+        assert_eq!(inline.payload, None);
+        assert_eq!(
+            inline.kvm,
+            Some(KvmCardVm {
+                kvm: "desk".to_owned(),
+                inputs: inputs.map(str::to_owned).to_vec(),
+            })
+        );
+        let drawn = serde_json::to_string(&inline).expect("json");
+        for words in ["IGNORE", "s3cret", "\"h\"", "\"i\""] {
+            assert!(!drawn.contains(words), "{words}: {drawn}");
+        }
+        // Another tool draws no KVM card.
+        assert_eq!(
+            card(request("01A", 2, &["once"]), &viewer(TGORKA)).kvm,
+            None
+        );
+
+        let bytes = crate::agents::approval::canonical(&args)
+            .expect("canonical")
+            .into_bytes();
+        let (mut large, _) = attached("01L");
+        large["action"] = json!({"tool": "kvm_act", "args": null, "exec_binding": null});
+        large["file_sha256"] = json!(sha256_hex(&bytes));
+        let resealed = sealed(large.clone(), &args);
+        large["summary"] = resealed["summary"].clone();
+        large["binding_digest"] = resealed["binding_digest"].clone();
+        let shown = card(large.clone(), &viewer(TGORKA));
+        assert_eq!((shown.payload, shown.kvm), (None, None));
+        let fetched =
+            attached_payload(&content(large.clone()), &bytes).expect("the attached action");
+        assert_eq!(fetched.run, None);
+        assert_eq!(
+            fetched.kvm.as_ref().map(|kvm| kvm.inputs.clone()),
+            Some(inputs.map(str::to_owned).to_vec())
+        );
+        // R328 (04): the attached action reaches the device as those inputs
+        // alone — nothing of the model's arguments rides beside them.
+        let drawn = serde_json::to_string(&fetched).expect("json");
+        for words in ["IGNORE", "s3cret", "intent", "\"h\"", "\"i\""] {
+            assert!(!drawn.contains(words), "{words}: {drawn}");
+        }
+        // Arguments keeper cannot read as inputs are refused, never shown.
+        let unread = json!({"kvm": "desk", "intent": "IGNORE THIS", "actions": "click Approve"});
+        let bytes = crate::agents::approval::canonical(&unread)
+            .expect("canonical")
+            .into_bytes();
+        large["file_sha256"] = json!(sha256_hex(&bytes));
+        let resealed = sealed(large.clone(), &unread);
+        large["summary"] = resealed["summary"].clone();
+        large["binding_digest"] = resealed["binding_digest"].clone();
+        assert_eq!(
+            attached_payload(&content(large), &bytes),
+            Err(PAYLOAD_REFUSED.to_owned())
+        );
+    }
+
+    /// R96R2-11, R96R3-06, R247: each argument and name on a run card shows
+    /// as what it is — empty, holding a newline, a tab, a quote, a
+    /// backslash, a bidi override or a trailing space — never raw, and each
+    /// distinct from the plain argument it could be taken for; a plain one
+    /// shows as it is. Nothing the whole inline card carries to the webview
+    /// holds the raw override, while its digest still binds the raw bytes.
+    #[test]
+    fn a_run_card_shows_each_argument_as_what_it_is() {
+        let hostile = [
+            "printf",
+            "",
+            "a\nb",
+            "a",
+            "b",
+            "t\tx",
+            "say \"hi\"",
+            "back\\slash",
+            "\u{202e}gnp.exe",
+            "x ",
+            "\"\"",
+        ];
+        let args = json!({"argv": hostile});
+        let binding = json!({
+            "argv": hostile,
+            "cwd": "a\nb",
+            "exe": "/w/\u{202e}tool",
+            "exe_sha256": "e".repeat(64),
+            "operands": [{"path": "dir/\u{2066}x", "sha256": "f".repeat(64)}],
+        });
+        let mut value = request("01R", 2, &["once"]);
+        value["action"] = json!({"tool": "run", "args": args, "exec_binding": binding});
+        value["preconditions"]["files"] = json!([]);
+        let whole = card(sealed(value, &args), &viewer(TGORKA));
+        assert!(whole.can_decide, "the digest binds the raw argv");
+        let bidi = |c: char| matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}');
+        let sent = serde_json::to_string(&whole).expect("json");
+        assert!(!sent.chars().any(bidi), "{sent}");
+        let run = whole.run.expect("a run card");
+        let raw = |c: char| c.is_control() || bidi(c);
+        for shown in run
+            .argv
+            .iter()
+            .chain([&run.program, &run.cwd])
+            .chain(&run.held)
+        {
+            assert!(!shown.chars().any(raw), "{shown:?}");
+        }
+        let distinct: BTreeSet<&String> = run.argv.iter().collect();
+        assert_eq!(distinct.len(), hostile.len(), "{:?}", run.argv);
+        assert_eq!(run.argv[0], "printf");
+        assert_eq!(run.argv[3], "a");
+        assert_ne!(run.argv[1], "");
+        assert_ne!(run.argv[9], "x");
+    }
+
+    /// R96R4-05, R260: two inline runs alike but for the drives they ask
+    /// to read, how long they may take and the wrapper between, draw
+    /// differently — each drive (a hostile name escaped like every other
+    /// name), the time it is stopped at (the default when it asked for
+    /// none), each wrapper with its hash — and nothing the whole card
+    /// carries holds a raw override.
+    #[test]
+    fn a_run_card_draws_the_drives_it_reads_when_it_stops_and_each_wrapper() {
+        let sha = |c: &str| c.repeat(64);
+        let run_of = |args: Value, wrappers: Value| {
+            let mut binding = json!({
+                "host": "electra",
+                "argv": args["argv"],
+                "cwd": "",
+                "env": [],
+                "exe": "/usr/bin/env",
+                "exe_sha256": sha("e"),
+                "program": {"path": "/usr/bin/cargo", "sha256": sha("c")},
+                "operands": [],
+            });
+            if !wrappers.is_null() {
+                binding["wrappers"] = wrappers;
+            }
+            let mut value = request("01R", 2, &["once"]);
+            value["action"] = json!({"tool": "run", "args": args, "exec_binding": binding});
+            value["preconditions"]["files"] = json!([]);
+            let whole = card(sealed(value, &args), &viewer(TGORKA));
+            assert!(whole.can_decide, "the digest binds the request");
+            let sent = serde_json::to_string(&whole).expect("json");
+            assert!(!sent.contains('\u{202e}'), "{sent}");
+            whole.run.expect("a run card")
+        };
+        let argv = json!(["env", "nice", "cargo", "test"]);
+        let plain = run_of(json!({"argv": argv}), Value::Null);
+        assert_eq!(plain.reads, Vec::<String>::new());
+        assert_eq!(plain.timeout_s, crate::agents::run::TIMEOUT_DEFAULT_S);
+        assert_eq!(plain.wrappers, Vec::<String>::new());
+        let wider = run_of(
+            json!({"argv": argv, "read": ["tgdrive", "\u{202e}evird"], "timeout_s": 1800}),
+            json!([{"path": "/usr/bin/nice", "sha256": sha("a")}]),
+        );
+        assert_eq!(wider.reads, ["tgdrive", "\"\\u{202e}evird\""]);
+        assert_eq!(wider.timeout_s, 1800);
+        assert_eq!(wider.wrappers, ["/usr/bin/nice · aaaaaaaaaaaa"]);
+    }
+
     /// R78 (R4-08): approving for the session names the tool, the drive,
     /// the approved path's folder and the lifetime the allowance has.
     #[test]
@@ -1183,10 +1776,86 @@ mod tests {
             &event(APPROVAL_REQUEST, "$e", NIXI, edit),
             true
         ));
-        let cards = &fold.approvals(&tgorka, now(), &name)[0].cards;
+        let cards = &fold.approvals(&tgorka, now(), &name, None)[0].cards;
         assert!(cards[0].can_decide);
         assert!(!cards[1].can_decide);
         assert_eq!(cards[1].cannot_decide.as_deref(), Some(UNBOUND));
+    }
+
+    /// UX-DR160: in a gate's room each request is the hour's card — the
+    /// system, the hour from the card's own server time, every row approved
+    /// *once* in those words and naming its ticket — and *Deny all* denies
+    /// only the rows still waiting that this device may decide: a decided
+    /// row keeps its verdict, a row it cannot decide is left alone. In any
+    /// other room the same request is an ordinary card.
+    #[test]
+    fn a_gate_card_covers_its_hour_and_denies_only_what_waits() {
+        let ticket = |id: &str| {
+            let mut record = request(id, 2, &["once"]);
+            record["action"]["exec_binding"] = json!({"ticket": id, "request": "r1"});
+            let args = record["action"]["args"].clone();
+            sealed(record, &args)
+        };
+        let (waiting, decided) = (
+            ticket("01JGATE0000000000000000001"),
+            ticket("01JGATE0000000000000000002"),
+        );
+        let mut unbound = ticket("01JGATE0000000000000000003");
+        unbound["action"]["args"]["content"] = json!("something else");
+        let mut fold = ApprovalFold::default();
+        let mut card = event(
+            APPROVAL_REQUEST,
+            "$card",
+            NIXI,
+            json!({"v": 1, "records": [waiting, decided.clone(), unbound]}),
+        );
+        card["origin_server_ts"] = json!(5_000);
+        assert!(apply(&mut fold, &card, true));
+        assert!(apply(
+            &mut fold,
+            &event(
+                APPROVAL_DECISION,
+                "$d",
+                MARTA,
+                decision(&decided, "approve", "once")
+            ),
+            true
+        ));
+        let tgorka = viewer(TGORKA);
+        let [hour] = fold
+            .approvals(&tgorka, now(), &name, Some("github"))
+            .try_into()
+            .expect("one card");
+        assert_eq!(
+            hour.gate,
+            Some(GateCardVm {
+                system: "github".to_owned(),
+                from: 5_000,
+                until: 5_000 + 3_600_000,
+                deny_all: vec!["01JGATE0000000000000000001".to_owned()],
+            })
+        );
+        assert!(matches!(
+            hour.cards[1].state,
+            ApprovalStateVm::Decided { .. }
+        ));
+        assert!(!hour.cards[2].can_decide);
+        for row in &hour.cards {
+            assert_eq!(row.scopes[0].label, "Approve once");
+            assert_eq!(
+                row.gate.as_ref().and_then(|gate| gate.ticket.as_deref()),
+                Some(row.id.as_str())
+            );
+        }
+        let [plain] = fold
+            .approvals(&tgorka, now(), &name, None)
+            .try_into()
+            .expect("one card");
+        assert_eq!(plain.gate, None);
+        assert!(plain
+            .cards
+            .iter()
+            .all(|row| row.gate.is_none() && row.scopes[0].label == "Approve"));
     }
 
     fn attached(id: &str) -> (Value, Vec<u8>) {
@@ -1312,6 +1981,19 @@ mod tests {
         assert_eq!(t4.cannot_decide.as_deref(), Some(THIS_DEVICE));
         assert!(!t4.can_decide && !t4.verify);
         assert!(card(request("01C", 3, &["once"]), &hosting(ROOM)).can_decide);
+        // A T4 screen action on the Mac whose screen it acts on (96.4 #7).
+        let mut screen = request("01F", 4, &["once"]);
+        screen["action"]["tool"] = json!("mcp");
+        screen["action"]["exec_binding"] =
+            json!({"server": "mac", "role": "screen", "tool": "click"});
+        let screen = sealed(screen, &write_args());
+        let on_mac = card(screen.clone(), &hosting(ROOM));
+        assert_eq!(on_mac.cannot_decide.as_deref(), Some(THIS_MAC));
+        assert!(!on_mac.can_decide);
+        assert!(
+            card(screen, &viewer(TGORKA)).can_decide,
+            "the phone decides it"
+        );
         // This app hosts the proxy DM the card is shown in, not the
         // session that asks: it decides.
         assert!(card(request("01D", 4, &["once"]), &hosting(DM)).can_decide);
@@ -1463,7 +2145,7 @@ mod tests {
         };
         assert_eq!(states(&fold, now()), std::slice::from_ref(&approved));
         let tgorka = viewer(TGORKA);
-        let card = &fold.approvals(&tgorka, now(), &name)[0].cards[0];
+        let card = &fold.approvals(&tgorka, now(), &name, None)[0].cards[0];
         assert!(card.can_decide);
         assert!(fold
             .check(&tgorka, "01A", &digest_of(&real), Scope::Once, now(), &name)
@@ -1680,7 +2362,7 @@ mod tests {
             true
         ));
 
-        let approvals = fold.approvals(&viewer(TGORKA), now(), &name);
+        let approvals = fold.approvals(&viewer(TGORKA), now(), &name, None);
         assert_eq!(approvals.len(), 1);
         assert_eq!(approvals[0].id, "01A");
         let ids: Vec<&str> = approvals[0].cards.iter().map(|c| c.id.as_str()).collect();
@@ -1697,7 +2379,7 @@ mod tests {
             true,
         );
         apply(&mut fold, &consumed(NIXI, "01C"), false);
-        let cards = &fold.approvals(&viewer(TGORKA), now(), &name)[0].cards;
+        let cards = &fold.approvals(&viewer(TGORKA), now(), &name, None)[0].cards;
         assert_eq!(cards[0].state, ApprovalStateVm::Pending);
         assert!(matches!(cards[1].state, ApprovalStateVm::Decided { .. }));
         assert_eq!(cards[2].state, ApprovalStateVm::Consumed);

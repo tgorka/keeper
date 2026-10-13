@@ -799,46 +799,6 @@ pub enum Unread {
     Capped,
 }
 
-/// Where `subpath` of `root` lands: its drive-relative name through every
-/// link, as [`browse::resolve`] finds it, `/`-joined. A search admits a path
-/// where it is asked for AND where it lands, then reads the landing alone
-/// ([`ScanBudget::read`]).
-///
-/// `Ok(None)` only where the disk says nothing is there (`NotFound`) and no
-/// dangling link names it: a name the disk cannot be asked about — a folder
-/// on the way that may not be searched, an I/O error — is refused, never
-/// taken for an absence, since what is there is unknown.
-pub fn search_landing(root: &Path, subpath: &str) -> Result<Option<String>, FsRefusal> {
-    let target = browse::lexical_join(root, subpath)?;
-    let unreadable = |error: std::io::Error| FsRefusal::Unreadable {
-        subpath: subpath.to_owned(),
-        reason: error.to_string(),
-    };
-    let canonical_root = root.canonicalize().map_err(unreadable)?;
-    let resolved = match target.canonicalize() {
-        Ok(resolved) => resolved,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            // A dangling link is no absence: what it names is unknown.
-            browse::landing(root, subpath)?;
-            return Ok(None);
-        }
-        Err(error) => return Err(unreadable(error)),
-    };
-    let inside = resolved.strip_prefix(&canonical_root).map_err(|_| {
-        BrowseRefusal::EscapesAfterResolution {
-            subpath: subpath.to_owned(),
-        }
-    })?;
-    let names: Option<Vec<&str>> = inside
-        .components()
-        .map(|part| part.as_os_str().to_str())
-        .collect();
-    let names = names.ok_or_else(|| BrowseRefusal::Unspellable {
-        subpath: subpath.to_owned(),
-    })?;
-    Ok(Some(names.join("/")))
-}
-
 /// What tells a search's time is up: the instant now.
 pub type Clock = std::sync::Arc<dyn Fn() -> std::time::Instant + Send + Sync>;
 
@@ -934,7 +894,7 @@ impl ScanBudget {
         got
     }
 
-    /// Read `landed` ([`search_landing`]) of `root` as a search reads
+    /// Read `landed` ([`browse::Landing::relative`]) of `root` as a search reads
     /// anything — a candidate, a drive's config, a listing, a ranked or
     /// listed document: admitted as a walked candidate is, then opened from
     /// the root a name at a time, no link followed, so what is read is the
@@ -990,7 +950,7 @@ fn read_landed(_: &Path, _: &str, _: u64, _: u64) -> (Result<Scanned, Unread>, u
     (Err(Unread::Skipped), 0)
 }
 
-/// The absolute path of `landed` ([`search_landing`]) of `root`, for a
+/// The absolute path of `landed` ([`browse::Landing::relative`]) of `root`, for a
 /// search's reader that opens it by path — the vault's SQLite index — where
 /// it is a file [`ScanBudget::read`] would open: reached from the root a
 /// name at a time with no link followed, a regular file, its content on
@@ -1037,7 +997,7 @@ pub struct SearchWalk {
     pub unreadable: usize,
 }
 
-/// Walk `start`'s subtree (a landing, [`search_landing`]) for a search: in
+/// Walk `start`'s subtree (a landing, [`browse::Landing::relative`]) for a search: in
 /// name order, depth first, each entry — `start` first — offered to
 /// `visit` before anything of it is opened: a folder it skips is never
 /// opened, a file it skips never read. Every folder is opened by its name

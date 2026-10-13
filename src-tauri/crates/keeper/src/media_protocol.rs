@@ -114,15 +114,17 @@ fn full_response(bytes: Vec<u8>, mimetype: &str) -> Response<Vec<u8>> {
         .unwrap_or_else(|_| not_found())
 }
 
-/// Per-response Range slice ceiling. iOS: a hard jetsam guard so one open-ended
-/// `bytes=0-` cannot allocate a second full-size copy of large media. The 8 MiB
+/// Per-response Range slice ceiling. iOS and Android: a hard memory guard (jetsam,
+/// the low-memory killer) so one open-ended `bytes=0-` cannot allocate a second
+/// full-size copy of large media — Android's webview receives each response as
+/// one in-memory body, like WKWebView. The 8 MiB
 /// value sits well under the epic's 25 MB media bar, so legitimate large media
 /// simply streams in successive capped chunks (`<video>`/`<audio>` reissue
 /// forward Range requests). Desktop: `u64::MAX` — a no-op, keeping desktop Range
 /// behavior byte-identical.
-#[cfg(target_os = "ios")]
+#[cfg(any(target_os = "ios", target_os = "android"))]
 const MAX_MEDIA_RANGE_CHUNK: u64 = 8 * 1024 * 1024;
-#[cfg(not(target_os = "ios"))]
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 const MAX_MEDIA_RANGE_CHUNK: u64 = u64::MAX;
 
 /// Clamp an inclusive range `end` so the slice is at most `cap` bytes. Pure.

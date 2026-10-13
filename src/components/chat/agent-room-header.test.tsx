@@ -1,6 +1,6 @@
 import { render, screen, within } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
-import { AgentRoomHeader } from "@/components/chat/agent-room-header";
+import { AgentRoomHeader, GATE_ANYONE } from "@/components/chat/agent-room-header";
 import type { AgentRoomHeaderVm, AgentStatusVm } from "@/lib/ipc/client";
 
 function status(overrides: Partial<AgentStatusVm> = {}): AgentStatusVm {
@@ -35,6 +35,7 @@ function header(overrides: Partial<AgentRoomHeaderVm> = {}): AgentRoomHeaderVm {
     },
     scopeUnreadable: null,
     caretKey: null,
+    gate: null,
     ...overrides,
   };
 }
@@ -148,5 +149,61 @@ describe("AgentRoomHeader", () => {
     render(<AgentRoomHeader header={header({ status: null })} />);
     expect(within(region()).getByText("No status from the agent yet.")).toBeInTheDocument();
     expect(screen.queryByTestId("agent-run")).not.toBeInTheDocument();
+  });
+});
+
+describe("AgentRoomHeader — a gate room (UX-DR147)", () => {
+  const gateHeader = (peer: boolean) =>
+    header({
+      status: status({
+        agent: "@forge:example.org",
+        handle: "forge@electra",
+        title: "github",
+        kind: "gate",
+        run: "idle",
+        detail: null,
+      }),
+      scope: [],
+      label: {
+        readers: [],
+        anyone: true,
+        integrity: "untrusted",
+        localOnly: false,
+        sentence: "What you read here may be shown to anyone.",
+      },
+      gate: {
+        system: "github",
+        peer: peer ? "@github:example.org" : null,
+        peerName: peer ? '"GitHub"' : null,
+      },
+    });
+
+  it("names the system and its account, and reads anyone as whoever the system shares with", () => {
+    render(<AgentRoomHeader header={gateHeader(true)} />);
+    const gate = within(region()).getByTestId("agent-gate");
+    for (const shown of ["github", '"GitHub"', "@github:example.org"]) {
+      expect(gate).toHaveTextContent(shown);
+    }
+    expect(within(region()).getByTestId("agent-label")).toHaveTextContent(
+      `${GATE_ANYONE} · untrusted`,
+    );
+  });
+
+  it("names the system alone before the gate has named its account", () => {
+    render(<AgentRoomHeader header={gateHeader(false)} />);
+    const gate = within(region()).getByTestId("agent-gate");
+    expect(gate).toHaveTextContent("github");
+    expect(gate).not.toHaveTextContent("@github:example.org");
+    expect(gate).not.toHaveTextContent('"GitHub"');
+  });
+
+  it("keeps anyone as anyone outside a gate room", () => {
+    render(
+      <AgentRoomHeader
+        header={header({ label: { ...gateHeader(true).label!, integrity: "owner" }, gate: null })}
+      />,
+    );
+    expect(within(region()).getByTestId("agent-label")).toHaveTextContent("anyone · owner");
+    expect(within(region()).queryByTestId("agent-gate")).toBeNull();
   });
 });

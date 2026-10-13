@@ -17,33 +17,33 @@
 //! label as it is then (R168). Narrowed, an answer's edits stop and a
 //! status says only [`NARROWED_STATUS`] (R64).
 
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use keeper_core::agents::events::{
-    self, RunState, StatusContent, TurnRef, CONTENT_VERSION, FINAL_CUT_BYTES, STATUS, TURN,
+    self, RunState, StatusContent, TurnRef, CONTENT_VERSION, FINAL_CUT_BYTES, PLACEHOLDER, STATUS,
+    TURN,
 };
 use keeper_core::agents::matrix::{AgentClient, AgentMatrixError};
 use keeper_core::agents::redact::redact_secrets;
 use keeper_core::agents::room::room_members;
 use keeper_core::vm::BotStreamEvent;
-use matrix_sdk::ruma::{EventId, OwnedEventId, OwnedRoomId, OwnedTransactionId, TransactionId};
+use matrix_sdk::ruma::{
+    EventId, OwnedEventId, OwnedRoomId, OwnedTransactionId, OwnedUserId, TransactionId,
+};
 use serde_json::{json, Value};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, sleep_until, Instant};
 
-use crate::delegate::MembersFuture;
 use crate::ports::TurnSink;
 use crate::sinks::{RoomGate, NARROWED_STATUS};
 
 /// No two edits of one anchor are closer than this (R18, NFR-113).
 pub const MIN_EDIT_GAP: Duration = Duration::from_millis(400);
-
-/// What an anchor says before the first edit.
-pub const PLACEHOLDER: &str = "…";
 
 /// How long one send may take before it counts as failed.
 const SEND_TIMEOUT: Duration = Duration::from_secs(10);
@@ -59,6 +59,10 @@ const RATE_LIMIT_DEFAULT: Duration = Duration::from_secs(1);
 /// A boxed send future.
 pub type SendFuture<'a> =
     Pin<Box<dyn Future<Output = Result<OwnedEventId, AgentMatrixError>> + Send + 'a>>;
+
+/// A boxed future of a room's members, joined or invited.
+pub type MembersFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<BTreeSet<OwnedUserId>, String>> + Send + 'a>>;
 
 /// Where a session's events go: one timeline send, once, under `txn`.
 pub trait EditPort: Send + Sync {

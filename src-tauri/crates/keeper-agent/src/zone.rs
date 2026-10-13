@@ -11,9 +11,14 @@ use std::path::{Path, PathBuf};
 
 use keeper_core::agents::drive::{self, DriveDecl};
 use keeper_core::agents::home::{self, AgentConfig, HomeRefusal};
-use keeper_core::agents::session::{self, SessionAgent};
+#[cfg(not(phone))]
+use keeper_core::agents::log::{reader::read_session, LineKind};
+use keeper_core::agents::session;
+#[cfg(not(phone))]
+use keeper_core::agents::session::SessionAgent;
 use keeper_core::agents::skills::{self, SkillFilter, SkillsIndex};
 use keeper_core::agents::zone::{self, ZoneAssessment, ZoneEntry};
+#[cfg(not(phone))]
 use keeper_core::sessions::model::ACTIVE_DIR;
 use keeper_sync::browse;
 use keeper_sync::SyncProfile;
@@ -42,6 +47,7 @@ pub struct ZoneRead {
 }
 
 /// One session found in a sessions zone.
+#[cfg(not(phone))]
 #[derive(Debug, Clone)]
 pub struct FoundSession {
     /// Zone-relative: `active/<folder>`.
@@ -53,15 +59,21 @@ pub struct FoundSession {
     /// whether the bounded read found them all, read at the rescan (92.3);
     /// empty for any other session, whose cards are not read for a schedule.
     pub scheduled: crate::cards::ScheduledScan,
+    /// Whether this checkout's log of a session following a Paseo run holds
+    /// the run's captured end, read at the rescan (R277); `false` for any
+    /// other session, whose log is not read here.
+    pub paseo_captured: bool,
 }
 
-/// A file's text under `root`, reached through `browse::resolve`; `None`
-/// when it is not there. A link out of `root`, or anything but a regular
-/// file (a pipe would never end a read), is refused.
+/// A file's text under `root`, reached through `browse::resolve_known`;
+/// `None` only when the disk says it is not there. A link out of `root`, a
+/// dangling link, a folder on the way that cannot be searched, or anything
+/// but a regular file (a pipe would never end a read), is refused: what is
+/// there is not known, which is not the same as nothing.
 pub fn read_text(root: &Path, rel: &str) -> Result<Option<String>, String> {
-    match browse::resolve(root, rel) {
-        Ok(Some(path)) if !path.is_file() => Err(format!("{rel} is not a file")),
-        Ok(Some(path)) => match std::fs::read_to_string(&path) {
+    match browse::resolve_known(root, rel).map(browse::Known::landed) {
+        Ok(Some(landing)) if !landing.path().is_file() => Err(format!("{rel} is not a file")),
+        Ok(Some(landing)) => match std::fs::read_to_string(landing.path()) {
             Ok(text) => Ok(Some(text)),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(format!("{rel} could not be read: {error}")),
@@ -123,6 +135,15 @@ pub fn read_zone(drive_id: &str, profile: &SyncProfile, pinned: Option<&DriveDec
                 }
             }
         }
+        // A gate's delegates are agents of this zone, and its peer is none
+        // of them (99.1 #1): the gate is refused, its first fault named.
+        for (folder, refusal) in home::gate_zone_refusals(&configs) {
+            if let Some((_, home)) = read.iter_mut().find(|(at, _)| *at == folder) {
+                if home.is_ok() {
+                    *home = Err(refusal.to_string());
+                }
+            }
+        }
         homes = read;
     }
     ZoneRead {
@@ -175,6 +196,7 @@ pub fn session_facts(
 
 /// The active sessions of `profile`'s sessions zone that hold an
 /// `agent.toml`. Archived sessions are never served.
+#[cfg(not(phone))]
 pub fn active_sessions(profile: &SyncProfile) -> Vec<FoundSession> {
     let Some(zone_dir) = profile.sessions_root() else {
         return Vec::new();
@@ -194,20 +216,33 @@ pub fn active_sessions(profile: &SyncProfile) -> Vec<FoundSession> {
             Err(sentence) => Err(sentence),
         };
         let dir = zone_dir.join(&path);
-        let scheduled = match &agent {
-            Ok(agent) if agent.kind == session::SessionKind::Scheduled => {
-                crate::cards::scheduled_cards(&path, &dir)
-            }
-            _ => crate::cards::ScheduledScan::default(),
+        let (scheduled, paseo_captured) = match &agent {
+            Ok(agent) if agent.kind == session::SessionKind::Scheduled => (
+                crate::cards::scheduled_cards(&path, &dir),
+                paseo_captured(agent, &dir),
+            ),
+            _ => (crate::cards::ScheduledScan::default(), false),
         };
         found.push(FoundSession {
             dir,
             path,
             agent,
             scheduled,
+            paseo_captured,
         });
     }
     found
+}
+
+/// Whether `agent`, a session in `dir`, follows a Paseo run whose end its
+/// log there holds captured (R277).
+#[cfg(not(phone))]
+pub fn paseo_captured(agent: &SessionAgent, dir: &Path) -> bool {
+    crate::agent::follows_a_run(agent)
+        && read_session(dir)
+            .lines
+            .iter()
+            .any(|line| line.kind() == LineKind::Paseo)
 }
 
 /// The zone's `_skills/<name>/SKILL.md`, offered as the agent's

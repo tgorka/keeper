@@ -663,11 +663,12 @@ pub fn repoint_engine(platform: Arc<dyn Platform>) {
 /// the foreground transition, and a folder that refuses does not stop the
 /// next one.
 ///
-/// Takes the app handle rather than the platform because the notes registry
-/// is told when the pass ends (`notes_vault::phone_synced`, Story 66.4): a
-/// clone that just landed is a vault from then on, and a fast-forward that
-/// just wrote notes reaches the index — there is no watcher on a phone to
-/// announce either.
+/// Takes the app handle rather than the platform because the notes and
+/// sessions registries are told when the pass ends
+/// (`notes_vault::phone_synced`, Story 66.4; `sessions_root::phone_synced`,
+/// 98.2): a clone that just landed is a vault or a zone from then on, and a
+/// fast-forward that just wrote notes or moved cards reaches the index and
+/// the board — there is no watcher on a phone to announce either.
 #[cfg(not(desktop))]
 pub fn phone_sync_all(app: &tauri::AppHandle, when: &'static str) {
     use tauri::Manager as _;
@@ -689,6 +690,9 @@ pub fn phone_sync_all(app: &tauri::AppHandle, when: &'static str) {
                 return;
             }
         };
+        // A card move a crash cut short is finished before any pass can
+        // commit half of it (98.2, R346).
+        crate::sessions_root::finish_interrupted_before_pass(&profiles).await;
         for profile in profiles.into_iter().filter(|p| p.enabled) {
             match engine
                 .sync_once_recording(&profile.id, keeper_sync::provenance::SyncSource::Manual)
@@ -710,6 +714,7 @@ pub fn phone_sync_all(app: &tauri::AppHandle, when: &'static str) {
             }
         }
         crate::notes_vault::phone_synced(&app);
+        crate::sessions_root::phone_synced(&app);
     });
 }
 

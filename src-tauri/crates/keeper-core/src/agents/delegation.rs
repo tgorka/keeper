@@ -319,6 +319,7 @@ pub fn child_session(
             session: content.from.session.clone(),
             room: content.from.room.clone(),
         }),
+        reply: None,
         room: room.clone(),
         drives: content.drives.clone(),
         label: content.label.clone(),
@@ -334,6 +335,7 @@ pub fn child_session(
         checkpoints: None,
         outputs: Vec::new(),
         created_at,
+        gate: None,
     })
 }
 

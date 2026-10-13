@@ -39,6 +39,8 @@ import type { NavState } from "./gen/NavState";
 import type { NotificationPermission } from "./gen/NotificationPermission";
 import type { NotifyTarget } from "./gen/NotifyTarget";
 import type { PersonVm } from "./gen/PersonVm";
+import type { PushGatewayVm } from "./gen/PushGatewayVm";
+import type { PushOpenVm } from "./gen/PushOpenVm";
 import type { TelemetryConsentVm } from "./gen/TelemetryConsentVm";
 import type { TelemetryEventReq } from "./gen/TelemetryEventReq";
 import type { TelemetryRemoteConfigVm } from "./gen/TelemetryRemoteConfigVm";
@@ -51,6 +53,7 @@ import type { TranscriptionStatusVm } from "./gen/TranscriptionStatusVm";
 import type { TranscriptMediaVm } from "./gen/TranscriptMediaVm";
 import type { TranscriptVm } from "./gen/TranscriptVm";
 import type { TranscriptWrittenVm } from "./gen/TranscriptWrittenVm";
+import type { UnifiedPushVm } from "./gen/UnifiedPushVm";
 
 export type {
   CorrectionResultVm,
@@ -337,6 +340,15 @@ export type { AccountStateVm } from "./gen/AccountStateVm";
 export type { AccountVm } from "./gen/AccountVm";
 export type { AgentCopyVm } from "./gen/AgentCopyVm";
 export type { AgentFocusReq } from "./gen/AgentFocusReq";
+export type { AgentMcpConflictVm } from "./gen/AgentMcpConflictVm";
+export type { AgentMcpDraftVm } from "./gen/AgentMcpDraftVm";
+export type { AgentMcpListVm } from "./gen/AgentMcpListVm";
+export type { AgentMcpRowVm } from "./gen/AgentMcpRowVm";
+export type { AgentMcpServerReq } from "./gen/AgentMcpServerReq";
+export type { AgentMcpServerVm } from "./gen/AgentMcpServerVm";
+export type { AgentMcpStartedVm } from "./gen/AgentMcpStartedVm";
+export type { AgentMcpTierVm } from "./gen/AgentMcpTierVm";
+export type { AgentMcpToolVm } from "./gen/AgentMcpToolVm";
 export type { AgentPersonVm } from "./gen/AgentPersonVm";
 export type { AgentPinReq } from "./gen/AgentPinReq";
 export type { AgentPinState } from "./gen/AgentPinState";
@@ -344,6 +356,9 @@ export type { AgentPinVm } from "./gen/AgentPinVm";
 export type { AgentRoomHeaderVm } from "./gen/AgentRoomHeaderVm";
 export type { AgentRoomKindVm } from "./gen/AgentRoomKindVm";
 export type { AgentRunVm } from "./gen/AgentRunVm";
+export type { AgentSandboxEnvVm } from "./gen/AgentSandboxEnvVm";
+export type { AgentSandboxReq } from "./gen/AgentSandboxReq";
+export type { AgentSandboxVm } from "./gen/AgentSandboxVm";
 export type { AgentSeedAgentVm } from "./gen/AgentSeedAgentVm";
 export type { AgentSeedBotVm } from "./gen/AgentSeedBotVm";
 export type { AgentSeedFolderVm } from "./gen/AgentSeedFolderVm";
@@ -356,10 +371,12 @@ export type { ApprovalCardVm } from "./gen/ApprovalCardVm";
 export type { ApprovalDecideReq } from "./gen/ApprovalDecideReq";
 export type { ApprovalDecision } from "./gen/ApprovalDecision";
 export type { ApprovalDraftVm } from "./gen/ApprovalDraftVm";
+export type { ApprovalPayloadVm } from "./gen/ApprovalPayloadVm";
 export type { ApprovalPersonVm } from "./gen/ApprovalPersonVm";
 export type { ApprovalScope } from "./gen/ApprovalScope";
 export type { ApprovalStateVm } from "./gen/ApprovalStateVm";
 export type { ApprovalVm } from "./gen/ApprovalVm";
+export type { ArtifactOfferVm } from "./gen/ArtifactOfferVm";
 export type { AuditOutcome } from "./gen/AuditOutcome";
 export type { AuditVerdict } from "./gen/AuditVerdict";
 export type { AutoUpdateHold } from "./gen/AutoUpdateHold";
@@ -426,6 +443,7 @@ export type { CaptureWindowVm } from "./gen/CaptureWindowVm";
 export type { CardAgentVm } from "./gen/CardAgentVm";
 export type { CardKeyVm } from "./gen/CardKeyVm";
 export type { ChatNotifyMode } from "./gen/ChatNotifyMode";
+export type { ChoiceVm } from "./gen/ChoiceVm";
 export type { ConfigFaultVm } from "./gen/ConfigFaultVm";
 export type { ConfigLayersVm } from "./gen/ConfigLayersVm";
 export type { ConfigOverrideVm } from "./gen/ConfigOverrideVm";
@@ -442,9 +460,11 @@ export type { DaemonPresence } from "./gen/DaemonPresence";
 export type { DeclassifyVm } from "./gen/DeclassifyVm";
 export type { DemoBatch } from "./gen/DemoBatch";
 export type { DemoItem } from "./gen/DemoItem";
+export type { DestinationVm } from "./gen/DestinationVm";
 export type { DeviceClassVm } from "./gen/DeviceClassVm";
 export type { DeviceCodeVm } from "./gen/DeviceCodeVm";
 export type { DiscoveredBridgeVm } from "./gen/DiscoveredBridgeVm";
+export type { DistributorOfferVm } from "./gen/DistributorOfferVm";
 export type { DockBadgeMode } from "./gen/DockBadgeMode";
 export type { DocumentFormat } from "./gen/DocumentFormat";
 export type { DocumentVm } from "./gen/DocumentVm";
@@ -484,8 +504,16 @@ export type { ForgeReposVm } from "./gen/ForgeReposVm";
 export type { ForgeRepoVm } from "./gen/ForgeRepoVm";
 export type { ForgeSourceVm } from "./gen/ForgeSourceVm";
 export type { ForgeStateVm } from "./gen/ForgeStateVm";
+export type { GateCardVm } from "./gen/GateCardVm";
+export type { GateHeaderVm } from "./gen/GateHeaderVm";
+export type { GateLineVm } from "./gen/GateLineVm";
+export type { GateReasonVm } from "./gen/GateReasonVm";
+export type { GateRoleVm } from "./gen/GateRoleVm";
+export type { GateRowVm } from "./gen/GateRowVm";
+export type { GateStepVm } from "./gen/GateStepVm";
 export type { GrantMode } from "./gen/GrantMode";
 export type { GrantScope } from "./gen/GrantScope";
+export type { HeardMarkVm } from "./gen/HeardMarkVm";
 export type { HeldSendVm } from "./gen/HeldSendVm";
 export type { HotkeyVm } from "./gen/HotkeyVm";
 export type { InboxBatch } from "./gen/InboxBatch";
@@ -495,6 +523,7 @@ export type { IncognitoScope } from "./gen/IncognitoScope";
 export type { IncognitoVm } from "./gen/IncognitoVm";
 export type { IpcError } from "./gen/IpcError";
 export type { IpcErrorCode } from "./gen/IpcErrorCode";
+export type { KnowledgeNoteVm } from "./gen/KnowledgeNoteVm";
 export type { LabelVm } from "./gen/LabelVm";
 export type { LifecyclePhase } from "./gen/LifecyclePhase";
 export type { LineSpan } from "./gen/LineSpan";
@@ -535,6 +564,7 @@ export type { NoteGalleryVm } from "./gen/NoteGalleryVm";
 export type { NoteHitVm } from "./gen/NoteHitVm";
 export type { NoteHunkVm } from "./gen/NoteHunkVm";
 export type { NoteIndexProgressVm } from "./gen/NoteIndexProgressVm";
+export type { NoteIntentVm } from "./gen/NoteIntentVm";
 export type { NoteLinkTargetVm } from "./gen/NoteLinkTargetVm";
 export type { NoteListOp } from "./gen/NoteListOp";
 export type { NoteListVm } from "./gen/NoteListVm";
@@ -565,6 +595,7 @@ export type { NoteTagNodeVm } from "./gen/NoteTagNodeVm";
 export type { NoteTagTerm } from "./gen/NoteTagTerm";
 export type { NoteTagTreeVm } from "./gen/NoteTagTreeVm";
 export type { NoteTemplateVm } from "./gen/NoteTemplateVm";
+export type { NoteTextVm } from "./gen/NoteTextVm";
 export type { NoteVaultSettingsReq } from "./gen/NoteVaultSettingsReq";
 export type { NoteVaultVm } from "./gen/NoteVaultVm";
 export type { NoteWriteVm } from "./gen/NoteWriteVm";
@@ -581,6 +612,7 @@ export type { PaletteActionVm } from "./gen/PaletteActionVm";
 export type { PaletteChatVm } from "./gen/PaletteChatVm";
 export type { PaletteMode } from "./gen/PaletteMode";
 export type { PaletteResultsVm } from "./gen/PaletteResultsVm";
+export type { PanelIntentVm } from "./gen/PanelIntentVm";
 export type { PanelTargetVm } from "./gen/PanelTargetVm";
 // Story 45.8's document bodies. Exported beside `DocumentVm` rather than left
 // reachable only through it, because a viewer that renders one sheet or one
@@ -589,11 +621,18 @@ export type { PanelTargetVm } from "./gen/PanelTargetVm";
 // begin by narrowing a type it was handed already narrowed.
 export type { PdfProbeVm } from "./gen/PdfProbeVm";
 export type { PingVm } from "./gen/PingVm";
+export type { PlatformDisclosureVm } from "./gen/PlatformDisclosureVm";
+export type { PlatformVm } from "./gen/PlatformVm";
+export type { PromoteRowVm } from "./gen/PromoteRowVm";
+export type { PromoteState } from "./gen/PromoteState";
 export type { Provider } from "./gen/Provider";
 export type { ProviderKind } from "./gen/ProviderKind";
 export type { ProviderOfferVm } from "./gen/ProviderOfferVm";
 export type { ProxyRoomVm } from "./gen/ProxyRoomVm";
+export type { PushGatewayVm } from "./gen/PushGatewayVm";
+export type { PushOpenVm } from "./gen/PushOpenVm";
 export type { ReactionGroupVm } from "./gen/ReactionGroupVm";
+export type { ReadState } from "./gen/ReadState";
 export type { RecordingApplicationVm } from "./gen/RecordingApplicationVm";
 export type { RecordingCaptureSourcesPatchVm } from "./gen/RecordingCaptureSourcesPatchVm";
 export type { RecordingCaptureSourcesVm } from "./gen/RecordingCaptureSourcesVm";
@@ -639,6 +678,7 @@ export type { SessionMigrationVm } from "./gen/SessionMigrationVm";
 export type { SessionPatternFileVm } from "./gen/SessionPatternFileVm";
 export type { SessionPatternSkipVm } from "./gen/SessionPatternSkipVm";
 export type { SessionPatternVm } from "./gen/SessionPatternVm";
+export type { SessionPromoteVm } from "./gen/SessionPromoteVm";
 export type { SessionPropertyVm } from "./gen/SessionPropertyVm";
 export type { SessionRecordMigrateVm } from "./gen/SessionRecordMigrateVm";
 export type { SessionRecordSkipVm } from "./gen/SessionRecordSkipVm";
@@ -659,6 +699,7 @@ export type { SessionSpaceFileVm } from "./gen/SessionSpaceFileVm";
 export type { SessionSpaceReq } from "./gen/SessionSpaceReq";
 export type { SessionSpacesRestoredVm } from "./gen/SessionSpacesRestoredVm";
 export type { SessionSpaceVm } from "./gen/SessionSpaceVm";
+export type { SessionTaskMoveVm } from "./gen/SessionTaskMoveVm";
 export type { SessionTaskVm } from "./gen/SessionTaskVm";
 export type { SessionTemplateEntryVm } from "./gen/SessionTemplateEntryVm";
 export type { SessionTreeVm } from "./gen/SessionTreeVm";
@@ -720,8 +761,12 @@ export type { TokenViaVm } from "./gen/TokenViaVm";
 export type { ToolName } from "./gen/ToolName";
 export type { TypingBatch } from "./gen/TypingBatch";
 export type { TypistVm } from "./gen/TypistVm";
+export type { UnifiedPushVm } from "./gen/UnifiedPushVm";
 export type { UnknownBotGrantVm } from "./gen/UnknownBotGrantVm";
 export type { UnknownTaskVm } from "./gen/UnknownTaskVm";
+export type { UnlistedVm } from "./gen/UnlistedVm";
+export type { UrlForm } from "./gen/UrlForm";
+export type { VaultCopyVm } from "./gen/VaultCopyVm";
 export type { VerificationFlowVm } from "./gen/VerificationFlowVm";
 export type { VerificationPhase } from "./gen/VerificationPhase";
 export type { VoiceAgentTargetVm } from "./gen/VoiceAgentTargetVm";
@@ -742,13 +787,19 @@ import type { AccountShareVm } from "./gen/AccountShareVm";
 import type { AccountVm } from "./gen/AccountVm";
 import type { AgentCopyVm } from "./gen/AgentCopyVm";
 import type { AgentFocusReq } from "./gen/AgentFocusReq";
+import type { AgentMcpDraftVm } from "./gen/AgentMcpDraftVm";
+import type { AgentMcpListVm } from "./gen/AgentMcpListVm";
+import type { AgentMcpServerReq } from "./gen/AgentMcpServerReq";
 import type { AgentPinReq } from "./gen/AgentPinReq";
+import type { AgentSandboxReq } from "./gen/AgentSandboxReq";
+import type { AgentSandboxVm } from "./gen/AgentSandboxVm";
 import type { AgentSeedOfferVm } from "./gen/AgentSeedOfferVm";
 import type { AgentSeedPlanVm } from "./gen/AgentSeedPlanVm";
 import type { AgentSeedReq } from "./gen/AgentSeedReq";
 import type { AgentSeedResultVm } from "./gen/AgentSeedResultVm";
 import type { ApprovalDecideReq } from "./gen/ApprovalDecideReq";
 import type { ApprovalDraftVm } from "./gen/ApprovalDraftVm";
+import type { ApprovalPayloadVm } from "./gen/ApprovalPayloadVm";
 import type { BackupStatus } from "./gen/BackupStatus";
 import type { BbctlAvailabilityVm } from "./gen/BbctlAvailabilityVm";
 import type { BbctlProgressVm } from "./gen/BbctlProgressVm";
@@ -782,6 +833,7 @@ import type { BridgeNetworkVm } from "./gen/BridgeNetworkVm";
 import type { CapabilitiesVm } from "./gen/CapabilitiesVm";
 import type { CaptureTargetVm } from "./gen/CaptureTargetVm";
 import type { CaptureWindowVm } from "./gen/CaptureWindowVm";
+import type { ChoiceVm } from "./gen/ChoiceVm";
 import type { ConfigLayersVm } from "./gen/ConfigLayersVm";
 import type { ConnectionStatusBatch } from "./gen/ConnectionStatusBatch";
 import type { CopyJobVm } from "./gen/CopyJobVm";
@@ -844,6 +896,7 @@ import type { NoteSpaceTermsVm } from "./gen/NoteSpaceTermsVm";
 import type { NoteSpaceVm } from "./gen/NoteSpaceVm";
 import type { NoteTagTreeVm } from "./gen/NoteTagTreeVm";
 import type { NoteTemplateVm } from "./gen/NoteTemplateVm";
+import type { NoteTextVm } from "./gen/NoteTextVm";
 import type { NoteVaultSettingsReq } from "./gen/NoteVaultSettingsReq";
 import type { NoteVaultVm } from "./gen/NoteVaultVm";
 import type { NoteWriteVm } from "./gen/NoteWriteVm";
@@ -853,6 +906,7 @@ import type { PacedWorkVm } from "./gen/PacedWorkVm";
 import type { PaginationStatusBatch } from "./gen/PaginationStatusBatch";
 import type { PaletteMode } from "./gen/PaletteMode";
 import type { PaletteResultsVm } from "./gen/PaletteResultsVm";
+import type { PanelIntentVm } from "./gen/PanelIntentVm";
 import type { ProxyRoomVm } from "./gen/ProxyRoomVm";
 import type { RecordingCaptureSourcesPatchVm } from "./gen/RecordingCaptureSourcesPatchVm";
 import type { RecordingCaptureSourcesVm } from "./gen/RecordingCaptureSourcesVm";
@@ -876,6 +930,7 @@ import type { SearchHitVm } from "./gen/SearchHitVm";
 import type { SessionDetailVm } from "./gen/SessionDetailVm";
 import type { SessionMigrationVm } from "./gen/SessionMigrationVm";
 import type { SessionPatternVm } from "./gen/SessionPatternVm";
+import type { SessionPromoteVm } from "./gen/SessionPromoteVm";
 import type { SessionRecordMigrateVm } from "./gen/SessionRecordMigrateVm";
 import type { SessionRefAddedVm } from "./gen/SessionRefAddedVm";
 import type { SessionRefAddReq } from "./gen/SessionRefAddReq";
@@ -890,6 +945,7 @@ import type { SessionSpaceFilesVm } from "./gen/SessionSpaceFilesVm";
 import type { SessionSpaceReq } from "./gen/SessionSpaceReq";
 import type { SessionSpacesRestoredVm } from "./gen/SessionSpacesRestoredVm";
 import type { SessionSpaceVm } from "./gen/SessionSpaceVm";
+import type { SessionTaskMoveVm } from "./gen/SessionTaskMoveVm";
 import type { SessionTemplateEntryVm } from "./gen/SessionTemplateEntryVm";
 import type { SessionTreeVm } from "./gen/SessionTreeVm";
 import type { SpacesSnapshot } from "./gen/SpacesSnapshot";
@@ -982,6 +1038,21 @@ export async function invoke<T>(cmd: string, args?: Record<string, unknown>): Pr
  */
 export async function capabilities(): Promise<CapabilitiesVm> {
   return await invoke<CapabilitiesVm>("capabilities");
+}
+
+/**
+ * Said by Rust when a capability that can change while keeper runs has changed
+ * — today the phone's `sessions`, when its first sessions zone lands or its
+ * last one goes (98.2). Payload-free: ask {@link capabilities} again. Mirrors
+ * `CAPABILITIES_CHANGED_EVENT` in `ipc.rs`.
+ */
+export const CAPABILITIES_CHANGED_EVENT = "keeper://capabilities-changed";
+
+/** Subscribe to {@link CAPABILITIES_CHANGED_EVENT}; resolves with an unlisten function. */
+export async function listenCapabilitiesChanged(onChanged: () => void): Promise<() => void> {
+  return await listen(CAPABILITIES_CHANGED_EVENT, () => {
+    onChanged();
+  });
 }
 
 /**
@@ -2476,6 +2547,22 @@ export async function notifySetPreviewEnabled(enabled: boolean): Promise<void> {
 }
 
 /**
+ * Read `push.gateway_url` (98.1): the stored address, and Rust's sentence when what is
+ * stored is one keeper will not register.
+ */
+export async function pushGatewayGet(): Promise<PushGatewayVm> {
+  return await invoke<PushGatewayVm>("push_gateway_get");
+}
+
+/**
+ * Set `push.gateway_url` (98.1): `""` clears it. Rejects with Rust's sentence, writing
+ * nothing, when the address is not one keeper registers; resolves with what was stored.
+ */
+export async function pushGatewaySet(url: string): Promise<PushGatewayVm> {
+  return await invoke<PushGatewayVm>("push_gateway_set", { url });
+}
+
+/**
  * Read the global Do-Not-Disturb switch (Story 10.2). Absent = off (DND off by default,
  * so notifications post normally). Resolves with the current in-memory config value.
  */
@@ -3702,6 +3789,60 @@ export async function listenNotifyNavigate(
 ): Promise<() => void> {
   return await listen<NotifyTarget>(NOTIFY_NAVIGATE_EVENT, (event) => {
     onNavigate(event.payload);
+  });
+}
+
+/**
+ * The event a phone's shell emits when a keeper push was tapped (98.1, UX-DR144; 98.4).
+ * Must match `PUSH_OPEN_EVENT` in `keeper/src/push_ios.rs` and `push_android.rs`. It carries nothing: the room to
+ * open is taken with {@link pushOpenTake}.
+ */
+export const PUSH_OPEN_EVENT = "push://open";
+
+/**
+ * The session room a tapped keeper notification opens, once; `null` when none waits
+ * (always, off the iPhone and Android).
+ */
+export async function pushOpenTake(): Promise<PushOpenVm | null> {
+  return await invoke<PushOpenVm | null>("push_open_take");
+}
+
+/**
+ * Where push through UnifiedPush stands on this Android device and what it brings, in
+ * Rust's sentences (98.4); `null` on every other build — the iPhone's push is its typed
+ * gateway ({@link pushGatewayGet}).
+ */
+export async function unifiedpushStatus(): Promise<UnifiedPushVm | null> {
+  return await invoke<UnifiedPushVm | null>("unifiedpush_status");
+}
+
+/**
+ * The person confirmed the UnifiedPush distributor `pkg` (one of
+ * {@link UnifiedPushVm.offers}) in Settings: Rust keeps the choice on this device, registers
+ * with it, and answers where push stands now; `null` on every other build (98.4).
+ */
+export async function unifiedpushConfirm(pkg: string): Promise<UnifiedPushVm | null> {
+  return await invoke<UnifiedPushVm | null>("unifiedpush_confirm", { package: pkg });
+}
+
+/**
+ * The event Android's shell emits when where push stands changed. Must match
+ * `STATUS_EVENT` in `keeper/src/push_android.rs`; it carries nothing — re-read
+ * {@link unifiedpushStatus}.
+ */
+export const UNIFIEDPUSH_STATUS_EVENT = "unifiedpush://status";
+
+/** Subscribe to {@link UNIFIEDPUSH_STATUS_EVENT}; resolves with an unlisten function. */
+export async function listenUnifiedpushStatus(onChanged: () => void): Promise<() => void> {
+  return await listen(UNIFIEDPUSH_STATUS_EVENT, () => {
+    onChanged();
+  });
+}
+
+/** Subscribe to {@link PUSH_OPEN_EVENT}; resolves with an unlisten function. */
+export async function listenPushOpen(onTapped: () => void): Promise<() => void> {
+  return await listen(PUSH_OPEN_EVENT, () => {
+    onTapped();
   });
 }
 
@@ -6883,8 +7024,15 @@ export async function sessionsFilePath(profileId: string, subpath: string): Prom
  * against what is on disk now rather than against the board as it was rendered:
  * a session an agent has been writing to is the ordinary case, not the edge one.
  *
+ * On a phone the folder is pulled first and the move pushed at once (98.2,
+ * R346): `unpushed` is the sentence when it is written there and not on the
+ * remote yet, and `null` once it is (always `null` on a desktop, whose folder
+ * publishes on its own cadence).
+ *
  * Rejects with: `internal` (unknown root or session, an unknown status, a card
- * that has since been moved or deleted, a refused path), `unsupported`.
+ * that has since been moved or deleted, a refused path); on a phone, the sync
+ * error's own code and sentence when the folder could not be pulled first —
+ * diverged, busy or failing — and nothing was written.
  */
 export async function sessionsTaskMove(
   rootId: string,
@@ -6892,8 +7040,14 @@ export async function sessionsTaskMove(
   rel: string,
   status: string,
   index: number,
-): Promise<void> {
-  await invoke<null>("sessions_task_move", { rootId, sessionId, rel, status, index });
+): Promise<SessionTaskMoveVm> {
+  return await invoke<SessionTaskMoveVm>("sessions_task_move", {
+    rootId,
+    sessionId,
+    rel,
+    status,
+    index,
+  });
 }
 
 /**
@@ -7061,19 +7215,136 @@ export async function sessionsSetPinned(
 }
 
 /**
- * Archive a session (FR-245): run the checklist's settled decision — the
- * promote copies, optionally the workspace emptying — and move the folder to
+ * Archive a session (FR-245): run the checklist's settled decision — a
+ * choice about every row and unlisted file (`SessionPromoteVm.intent.choices`,
+ * as Rust kept them), each chosen promotion run as the promote panel runs
+ * one, optionally the guarded workspace emptying — and move the folder to
  * `archive/<year>/` as the last, journaled, crash-resumable step (NFR-38).
+ * `revision` is the checklist's `SessionPromoteVm.revision`: a workspace,
+ * table or row target that changed since, or a row without a choice, is
+ * refused, nothing archived.
  *
  * Rejects with: `internal` (not active; a refusal — retriable), `unsupported`.
  */
 export async function sessionsArchive(
   rootId: string,
   sessionId: string,
-  promotes: [string, string][],
+  choices: ChoiceVm[],
   emptyWorkspace: boolean,
+  revision: string,
 ): Promise<void> {
-  await invoke<void>("sessions_archive", { rootId, sessionId, promotes, emptyWorkspace });
+  await invoke<void>("sessions_archive", {
+    rootId,
+    sessionId,
+    choices,
+    emptyWorkspace,
+    revision,
+  });
+}
+
+/**
+ * One session's promote panel (FR-243, FR-244, UX-DR90, UX-DR137): every row
+ * of its README's `## Promote` table with its state, the workspace files no
+ * row names, its harvested notes, the label chip, the drive's notes vault and
+ * why a promotion into it is refused. Rust composes every field, and decides
+ * what of `intent` — the person's choices, reads and consent, as the panel
+ * holds them — still holds (`SessionPromoteVm.intent`, `complete`, each row's
+ * `choice`, each note's `candidateRead`/`copyRead`/`consented`).
+ *
+ * Rejects with: `internal` (unknown root or session), `unsupported`.
+ */
+export async function sessionsPromotePanel(
+  rootId: string,
+  sessionId: string,
+  intent: PanelIntentVm,
+): Promise<SessionPromoteVm> {
+  return invoke<SessionPromoteVm>("sessions_promote_panel", { rootId, sessionId, intent });
+}
+
+/**
+ * Promote the settled `workspace/` file `source` into the session's
+ * `artifacts/` at `target` and record its one row (FR-243).
+ *
+ * Rejects with: `internal` (the refusal's sentence, e.g. "still being written;
+ * try again in a moment"), `unsupported`.
+ */
+export async function sessionsPromote(
+  rootId: string,
+  sessionId: string,
+  source: string,
+  target: string,
+  note: string,
+): Promise<void> {
+  await invoke<void>("sessions_promote", { rootId, sessionId, source, target, note });
+}
+
+/**
+ * Promote the artifact `source` out into the drive's notes vault at the
+ * `folder` and `name` the person chose (a `DestinationVm`'s), the target
+ * composed in Rust (FR-808). `expected` is the revision of the note the
+ * person read (`sessionsKnowledgeRead`): promoting a harvested note is this
+ * person's review of that version, written into the vault copy; it is
+ * refused without one, or when the note changed since.
+ *
+ * Rejects with: `internal` (the refusal's sentence), `unsupported`.
+ */
+export async function sessionsPromoteTo(
+  rootId: string,
+  sessionId: string,
+  source: string,
+  folder: string,
+  name: string,
+  expected: string | null,
+): Promise<void> {
+  await invoke<void>("sessions_promote_to", {
+    rootId,
+    sessionId,
+    source,
+    folder,
+    name,
+    expected,
+  });
+}
+
+/**
+ * A harvested note at `path` read whole: its candidate, or — `copy` — the
+ * vault copy its row names, with the revision of exactly the bytes read.
+ *
+ * Rejects with: `internal` (not a harvested note, no copy, too large),
+ * `unsupported`.
+ */
+export async function sessionsKnowledgeRead(
+  rootId: string,
+  sessionId: string,
+  path: string,
+  copy: boolean,
+): Promise<NoteTextVm> {
+  return invoke<NoteTextVm>("sessions_knowledge_read", { rootId, sessionId, path, copy });
+}
+
+/**
+ * A person's *Reviewed by me* (or its untick) on a promoted harvested note at
+ * `path`: written into the vault copy its row names, never the session's
+ * candidate. `expected` is the copy's revision as the person read it; a copy
+ * that changed since is refused.
+ *
+ * Rejects with: `internal` (not promoted to notes yet; the copy changed; no
+ * account to record), `unsupported`.
+ */
+export async function sessionsKnowledgeReview(
+  rootId: string,
+  sessionId: string,
+  path: string,
+  reviewed: boolean,
+  expected: string,
+): Promise<void> {
+  await invoke<void>("sessions_knowledge_review", {
+    rootId,
+    sessionId,
+    path,
+    reviewed,
+    expected,
+  });
 }
 
 /**
@@ -7393,6 +7664,75 @@ export async function agentsSeedApply(req: AgentSeedReq): Promise<AgentSeedResul
   return await invoke<AgentSeedResultVm>("agents_seed_apply", { req });
 }
 
+/**
+ * Settings › Agents › *MCP servers* (story 96.2, UX-DR140): this Mac's own
+ * servers as stored in `keeper.db`, whether each answers a running host built
+ * on these very settings (`answer` is the sentence to show), and the tiers a
+ * row may set as the cards name them; what each lists is its sheet's
+ * (`agentsMcpDraft`). Never a token: `token`
+ * only says the server is saved with one.
+ *
+ * Rejects with: `internal`.
+ */
+export async function agentsMcpList(): Promise<AgentMcpListVm> {
+  return await invoke<AgentMcpListVm>("agents_mcp_list");
+}
+
+/**
+ * What the sheet says for the server being edited, as a save of the draft
+ * would be: a program's floor, a role's fixed table, every tool the saved
+ * server listed while the draft still reaches it and every row, each with the
+ * tier Rust gives it (a name that cannot travel redacted and bounded, with no
+ * row key), and the rows a role does not take. Send it with `token: null`: the
+ * draft's token is not read.
+ *
+ * Rejects with: `internal`, when this Mac's settings cannot be read.
+ */
+export async function agentsMcpDraft(req: AgentMcpServerReq): Promise<AgentMcpDraftVm> {
+  return await invoke<AgentMcpDraftVm>("agents_mcp_draft", { req });
+}
+
+/**
+ * Add or replace the server `req.name`, checked by the same `[[mcp]]` check
+ * agentd's servers go through. `req.token` is write-only (`null` keeps the
+ * saved one); `req.forgetToken` forgets it, whatever `req.token` says. Answers
+ * the list again.
+ *
+ * Rejects with: `internal`, its message Rust's refusal to show verbatim.
+ */
+export async function agentsMcpSave(req: AgentMcpServerReq): Promise<AgentMcpListVm> {
+  return await invoke<AgentMcpListVm>("agents_mcp_save", { req });
+}
+
+/**
+ * Remove the server `name` and its token. Answers the list again.
+ *
+ * Rejects with: `internal`.
+ */
+export async function agentsMcpRemove(name: string): Promise<AgentMcpListVm> {
+  return await invoke<AgentMcpListVm>("agents_mcp_remove", { name });
+}
+
+/**
+ * This Mac's `[sandbox]` table (`read_exec`, `env`) and the line a probe of
+ * that very table wrote (R213).
+ *
+ * Rejects with: `internal`.
+ */
+export async function agentsSandboxGet(): Promise<AgentSandboxVm> {
+  return await invoke<AgentSandboxVm>("agents_sandbox_get");
+}
+
+/**
+ * Replace this Mac's `[sandbox]` table, checked by the same `[sandbox]` check
+ * agentd's goes through.
+ *
+ * Rejects with: `internal`, its message Rust's refusal to show verbatim.
+ */
+export async function agentsSandboxSave(req: AgentSandboxReq): Promise<AgentSandboxVm> {
+  return await invoke<AgentSandboxVm>("agents_sandbox_save", { req });
+}
+
 // ---------------------------------------------------------------------------
 // The proxy beside the notes view (story 91.2, UX-DR130)
 // ---------------------------------------------------------------------------
@@ -7490,9 +7830,10 @@ export async function agentApprovalDecide(
 
 /**
  * The attached action of the approval card `id` in the session room
- * `roomId` (a card whose `attachment` is set), as pretty-printed JSON: its
- * encrypted file fetched and checked against the card's digest in Rust.
- * Once shown, the action may be approved from this app.
+ * `roomId` (a card whose `attachment` is set): as pretty-printed JSON
+ * (`text`) and, for a `run`, the same typed run view an inline card draws
+ * (`run`), its encrypted file fetched and checked against the card's
+ * digest in Rust. Once shown, the action may be approved from this app.
  *
  * Rejects with `unsupported` and a sentence when the attachment is not the
  * action sent for approval, cannot be fetched now, or the card has none.
@@ -7501,8 +7842,8 @@ export async function agentApprovalPayload(
   accountId: string,
   roomId: string,
   id: string,
-): Promise<string> {
-  return await invoke<string>("agent_approval_payload", { accountId, roomId, id });
+): Promise<ApprovalPayloadVm> {
+  return await invoke<ApprovalPayloadVm>("agent_approval_payload", { accountId, roomId, id });
 }
 
 /**
@@ -8205,12 +8546,31 @@ export async function listenVoiceState(
  * The wake switch and phrase as persisted (`bots.wake_enabled`,
  * `bots.wake_phrase`), plus the sentence about what listening costs on this
  * phone — decided once per platform in `VoicePlatform::limits` and rendered
- * beside the switch (FR-406). Off on a fresh install.
+ * beside the switch (FR-406). Off on a fresh install. `turnModels` is the
+ * turn models' line (UX-DR142), absent where this device's voice runs none;
+ * when it moves without a voice command, the shell sends the whole VM again
+ * on {@link VOICE_WAKE_EVENT}.
  *
  * Rejects with: `internal`.
  */
 export async function voiceWakeGet(): Promise<VoiceWakeVm> {
   return await invoke<VoiceWakeVm>("voice_wake_get");
+}
+
+/**
+ * The Tauri event the shell sends the {@link VoiceWakeVm} on, to every
+ * window, when the turn models' line may have moved with no voice command
+ * asking: a models fetch began or ended, the launch load finished, a synced
+ * model pick landed, the account was forgotten (`voice_ipc::announce_wake`).
+ * Never sent where voice runs no turn models.
+ */
+export const VOICE_WAKE_EVENT = "keeper://voice-wake";
+
+/** Subscribe to {@link VOICE_WAKE_EVENT}. Resolves with an unlisten function. */
+export async function listenVoiceWake(onWake: (wake: VoiceWakeVm) => void): Promise<() => void> {
+  return await listen<VoiceWakeVm>(VOICE_WAKE_EVENT, (event) => {
+    onWake(event.payload);
+  });
 }
 
 /**

@@ -74,7 +74,13 @@
     ],
     "macOS": {
       "minimumSystemVersion": "14.0",
-      "entitlements": "./keeper-rec.entitlements"
+      "entitlements": "./keeper-rec.entitlements",
+      "files": {
+        "Resources/NOTICE": "../../../NOTICE",
+        "Resources/licenses/onnxruntime-1.28.0/LICENSE": "../../../licenses/onnxruntime-1.28.0/LICENSE",
+        "Resources/licenses/onnxruntime-1.28.0/ThirdPartyNotices.txt": "../../../licenses/onnxruntime-1.28.0/ThirdPartyNotices.txt",
+        "Resources/licenses/FluidAudio-0.17.4/LICENSE": "../../../licenses/FluidAudio-0.17.4/LICENSE"
+      }
     },
     "iOS": {
       "frameworks": ["AuthenticationServices"]

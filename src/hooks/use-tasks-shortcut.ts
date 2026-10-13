@@ -6,13 +6,12 @@
  * from the Rust-authored mirror rather than from a platform sniff, typing
  * targets skipped, and IME composition ignored.
  *
- * **The capability is `sessions` and that is not a copy-paste slip.** AD-137
- * gates tasks on `sync && desktop`, which is the identical condition
- * `CapabilitiesVm.sessions` and `CapabilitiesVm.notes` are both computed from,
- * and `keeper_core::palette::registry_sections` takes one boolean for all three
- * categories for exactly that reason. Minting a twelfth flag would be a second
- * name for one fact until the day they diverge — and that day amends the Rust
- * signature, its two call sites and this line together.
+ * **The gate is `sessions` on a desktop.** AD-137 gates tasks on
+ * `sync && desktop`, and on a desktop `CapabilitiesVm.sessions` is computed
+ * from that same condition. Since 98.2 `sessions` is also true on a phone with
+ * a sessions zone, and the phone has no Tasks surface (DW-238) — so the chord
+ * does nothing on the reduced tier, where a view the phone shell cannot show
+ * would leave the view store wrong until the next tap.
  *
  * ⌘8 is the first free number: ⌘1–⌘6 are the views and ⌘7 is the sessions
  * board. The registry entry that puts `⌘8` on the ⌘K row, the ⌘? cheat sheet
@@ -20,7 +19,7 @@
  * hook owns the binding, as every chip in that registry is display-only.
  */
 import { useEffect } from "react";
-import { capabilitiesStore } from "@/lib/stores/capabilities";
+import { capabilitiesStore, isReducedCapabilityPlatform } from "@/lib/stores/capabilities";
 import { primaryViewStore } from "@/lib/stores/primary-view";
 
 function isTypingTarget(target: EventTarget | null): boolean {
@@ -60,7 +59,8 @@ export function useTasksShortcut(): void {
       // No dead chord where no task surface can exist (AD-27's no-dead-buttons
       // rule): with the capability off the event is left alone entirely, so the
       // webview's own handling of ⌘8 is not swallowed either.
-      if (!capabilitiesStore.getState().capabilities.sessions) {
+      const state = capabilitiesStore.getState();
+      if (!state.capabilities.sessions || isReducedCapabilityPlatform(state)) {
         return;
       }
       if (isTypingTarget(event.target)) {

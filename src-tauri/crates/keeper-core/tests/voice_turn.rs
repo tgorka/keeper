@@ -2,14 +2,19 @@
 //! microphone is a port, and every rule is pinned here against a fake port
 //! — the only host this code is ever tested on.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use keeper_core::vm::{VoiceStateVm, VoiceUnavailableVm};
+use keeper_core::voice::request::{
+    rolls, RequestAge, REQUEST_LONGEST, REQUEST_ROLL_AFTER, REQUEST_ROLL_QUIET,
+};
 use keeper_core::voice::{
-    advance, perform, should_rearm, silence_budget, Effect, PhraseRefused, Turn, TurnEvent,
-    TurnState, VoicePlatform, VoicePort, VoiceUnavailable, WakePhrase, DEFAULT_STOP_PHRASE,
-    DEFAULT_WAKE_PHRASE, END_OF_UTTERANCE_PAUSE, NOTHING_HEARD_TIMEOUT,
+    advance, perform, restarts_budget, should_rearm, silence_budget, Effect, PhraseRefused, Turn,
+    TurnEvent, TurnState, VoicePlatform, VoicePort, VoiceUnavailable, WakePhrase,
+    DEFAULT_STOP_PHRASE, DEFAULT_WAKE_PHRASE, END_OF_UTTERANCE_PAUSE, FINAL_WORDS_WAIT,
+    NOTHING_HEARD_TIMEOUT, PAUSE_DECISION_WAIT,
 };
 
 // ---------------------------------------------------------------------------
@@ -25,6 +30,9 @@ enum Call {
     /// A sentence queued behind the running utterance, with its language.
     Enqueue(String, String),
     StopSpeaking,
+    PauseSpeaking,
+    ContinueSpeaking,
+    FinishRecognition(u64),
 }
 
 struct FakePort {
@@ -44,6 +52,8 @@ struct FakePort {
     voices: Vec<String>,
     /// The locale the fake listens in.
     listening: String,
+    /// How often the turn asked the fake what it listens in.
+    listening_asked: AtomicUsize,
     /// What the fake's detector answers for any text.
     detected: Option<String>,
 }
@@ -58,6 +68,7 @@ impl Default for FakePort {
             half_duplex: false,
             voices: vec!["en-US".to_owned()],
             listening: "en-US".to_owned(),
+            listening_asked: AtomicUsize::new(0),
             detected: None,
         }
     }
@@ -109,6 +120,7 @@ impl VoicePort for FakePort {
         self.voices.clone()
     }
     fn listening(&self) -> String {
+        self.listening_asked.fetch_add(1, Ordering::SeqCst);
         self.listening.clone()
     }
     fn detect_language(&self, _text: &str, _constraints: &[String]) -> Option<String> {
@@ -124,6 +136,15 @@ impl VoicePort for FakePort {
     }
     fn stop_speaking(&self) {
         self.record(Call::StopSpeaking);
+    }
+    fn pause_speaking(&self) {
+        self.record(Call::PauseSpeaking);
+    }
+    fn continue_speaking(&self) {
+        self.record(Call::ContinueSpeaking);
+    }
+    fn finish_recognition(&self, finish: u64) {
+        self.record(Call::FinishRecognition(finish));
     }
 }
 
@@ -158,6 +179,36 @@ fn heard(text: &str) -> TurnState {
     }
 }
 
+/// `Finishing` for the listening generation [`FINISH`], before the port
+/// said it ended the request's audio.
+fn finishing(heard: &str) -> TurnState {
+    TurnState::Finishing {
+        heard: heard.to_owned(),
+        finish: FINISH,
+        audio_ended_ms: None,
+    }
+}
+
+/// `Finishing` once the port ended the request's audio at `at_ms`.
+fn ended(heard: &str, at_ms: i64) -> TurnState {
+    TurnState::Finishing {
+        heard: heard.to_owned(),
+        finish: FINISH,
+        audio_ended_ms: Some(at_ms),
+    }
+}
+
+/// The listening a finished sentence was heard in.
+const FINISH: u64 = 7;
+
+/// The answer paused over `heard`, with `speech_ms` of speech measured.
+fn paused(heard: &str, speech_ms: Option<u32>) -> TurnState {
+    TurnState::Paused {
+        heard: heard.to_owned(),
+        speech_ms,
+    }
+}
+
 fn failed(reason: &str) -> TurnState {
     TurnState::Failed {
         reason: reason.to_owned(),
@@ -170,10 +221,13 @@ fn every_state() -> Vec<TurnState> {
         TurnState::Idle,
         listening(""),
         listening("hej"),
+        finishing("hej"),
         heard("hello"),
         TurnState::Sending { answering: false },
         TurnState::Sending { answering: true },
         TurnState::Speaking,
+        paused("", None),
+        paused("mhm", Some(400)),
         failed("boom"),
     ]
 }
@@ -274,13 +328,16 @@ fn voice_silence_after_words_sends_what_was_heard() {
 /// clock does.
 #[test]
 fn voice_silence_budget_is_bounded_and_only_while_listening() {
-    assert_eq!(silence_budget(&listening("")), Some(NOTHING_HEARD_TIMEOUT));
     assert_eq!(
-        silence_budget(&listening("   ")),
+        silence_budget(&listening(""), 0),
         Some(NOTHING_HEARD_TIMEOUT)
     );
     assert_eq!(
-        silence_budget(&listening("hej")),
+        silence_budget(&listening("   "), 0),
+        Some(NOTHING_HEARD_TIMEOUT)
+    );
+    assert_eq!(
+        silence_budget(&listening("hej"), 0),
         Some(END_OF_UTTERANCE_PAUSE)
     );
     assert!(END_OF_UTTERANCE_PAUSE < NOTHING_HEARD_TIMEOUT);
@@ -291,30 +348,277 @@ fn voice_silence_budget_is_bounded_and_only_while_listening() {
         TurnState::Speaking,
         failed("x"),
     ] {
-        assert_eq!(silence_budget(&state), None, "{state:?}");
+        assert_eq!(silence_budget(&state, 0), None, "{state:?}");
     }
-}
-
-/// Barge-in: `SpeechDetected` while `Speaking` emits `StopSpeaking` before
-/// anything else, and the turn is listening again.
-#[test]
-fn voice_barge_in_stops_speaking_before_anything_else() {
-    let (next, effects) = advance(TurnState::Speaking, TurnEvent::SpeechDetected("hey".into()));
-    assert_eq!(next, listening(""));
-    assert_eq!(effects.first(), Some(&Effect::StopSpeaking));
-    assert!(
-        !effects.contains(&Effect::ReleaseMicrophone),
-        "barge-in keeps the microphone: {effects:?}"
+    // A pause's decision window: 800 ms after the last thing heard, 600 ms
+    // for the last words once the speech is heard to end.
+    assert_eq!(
+        silence_budget(&paused("", None), 0),
+        Some(PAUSE_DECISION_WAIT)
+    );
+    assert_eq!(
+        silence_budget(&paused("no", Some(700)), 0),
+        Some(FINAL_WORDS_WAIT)
     );
 }
 
-/// `SpeechDetected` and `StopHeard` anywhere but `Speaking` are nothing —
-/// there is nothing to interrupt.
+/// Barge-in pauses first (AD-411, AD-208 amended by R14): `SpeechDetected`
+/// while `Speaking` — the recogniser's words, or the voice activity model's
+/// wordless onset — is `PauseSpeaking` and nothing else. Speech is not
+/// stopped before the utterance has decided, the microphone is kept, and
+/// the request the words are arriving on is not restarted.
+#[test]
+fn voice_barge_in_pauses_speaking_before_anything_else() {
+    for (words, heard) in [("hey", "hey"), ("", ""), ("  ", "")] {
+        let (next, effects) = advance(
+            TurnState::Speaking,
+            TurnEvent::SpeechDetected(words.to_owned()),
+        );
+        assert_eq!(next, paused(heard, None), "{words:?}");
+        assert_eq!(effects, vec![Effect::PauseSpeaking], "{words:?}");
+    }
+    // A final transcript over the answer is the person too (Q12).
+    let (next, effects) = advance(TurnState::Speaking, TurnEvent::FinalHeard("hey".into()));
+    assert_eq!(next, paused("hey", None));
+    assert_eq!(effects, vec![Effect::PauseSpeaking]);
+}
+
+/// A turn reading the first sentence of an answer still arriving, on a
+/// port listening in `listening`, with `stop` as its stop phrase.
+fn reading(listening: &str, stop: &str) -> (FakePort, Turn) {
+    let port = FakePort {
+        listening: listening.to_owned(),
+        voices: vec!["en-US".to_owned(), "pl-PL".to_owned()],
+        ..FakePort::default()
+    };
+    let mut turn = Turn::new(VoicePlatform::IOS);
+    turn.set_stop(Some(stop_phrase(stop)));
+    turn.drive(TurnEvent::WakeMatched, &port);
+    turn.drive(TurnEvent::FinalHeard("tell me a story".to_owned()), &port);
+    turn.drive(
+        TurnEvent::AnswerSentence("Once upon a time.".to_owned()),
+        &port,
+    );
+    assert_eq!(turn.state(), &TurnState::Speaking);
+    (port, turn)
+}
+
+/// Drive `events` and return the effects of the last.
+fn drive_all(turn: &mut Turn, port: &FakePort, events: &[TurnEvent]) -> Vec<Effect> {
+    let mut last = Vec::new();
+    for event in events {
+        last = turn.drive(event.clone(), port);
+    }
+    last
+}
+
+/// 97.3 #2: from `Paused` the utterance decides, in the language the turn
+/// listens in. A backchannel — by the list, or under 600 ms of wordless
+/// speech with the models — resumes; the stop phrase ends the turn; anything
+/// else stops the answer and is sent; a wordless onset too short to be
+/// anyone resumes as a false onset. The answer keeps queueing meanwhile.
+#[test]
+fn voice_paused_utterance_decides() {
+    let words = |t: &str| TurnEvent::SpeechDetected(t.to_owned());
+    let onset = || TurnEvent::SpeechDetected(String::new());
+    let ended = |speech_ms| TurnEvent::SpeechEnded { speech_ms };
+    let resumed = vec![Effect::ContinueSpeaking];
+
+    for (listening, stop, backchannel, question) in [
+        ("en-US", "stop", "Mhm.", "No, wait."),
+        ("pl-PL", "przestań", "No.", "Nie, czekaj."),
+    ] {
+        // A backchannel by the list: paused, then resumed once the window
+        // closes on its words, or at once on the recogniser's final words.
+        let (port, mut turn) = reading(listening, stop);
+        assert_eq!(
+            turn.drive(words(backchannel), &port),
+            vec![Effect::PauseSpeaking]
+        );
+        assert!(turn.owns_answer(1), "a paused answer is still the turn's");
+        assert_eq!(
+            turn.drive(TurnEvent::AnswerSentence("And then.".to_owned()), &port),
+            vec![Effect::Enqueue("And then.".to_owned())],
+            "the answer queues while paused"
+        );
+        assert_eq!(
+            turn.drive(TurnEvent::Silence, &port),
+            resumed,
+            "{listening}"
+        );
+        assert_eq!(turn.state(), &TurnState::Speaking);
+        let effects = drive_all(
+            &mut turn,
+            &port,
+            &[
+                words(backchannel),
+                TurnEvent::FinalHeard(backchannel.to_owned()),
+            ],
+        );
+        assert_eq!(effects, resumed, "{listening}: final words");
+
+        // A backchannel by its duration: a wordless onset the voice activity
+        // model heard end under 600 ms resumes at the speech end.
+        assert_eq!(
+            drive_all(&mut turn, &port, &[onset(), ended(450)]),
+            resumed,
+            "{listening}"
+        );
+
+        // A false onset: under 250 ms, or never heard to end.
+        assert_eq!(drive_all(&mut turn, &port, &[onset(), ended(120)]), resumed);
+        assert_eq!(
+            drive_all(&mut turn, &port, &[onset(), TurnEvent::Silence]),
+            resumed
+        );
+
+        // Words wait for their last word, even when the speech was short:
+        // a short objection is not a backchannel by its duration.
+        assert!(drive_all(&mut turn, &port, &[onset(), words(question), ended(300)]).is_empty());
+        assert_eq!(
+            turn.state(),
+            &TurnState::Paused {
+                heard: question.to_owned(),
+                speech_ms: Some(300)
+            }
+        );
+        let effects = turn.drive(TurnEvent::FinalHeard(question.to_owned()), &port);
+        assert_eq!(
+            effects,
+            vec![Effect::StopSpeaking, Effect::SendText(question.to_owned())],
+            "{listening}: anything else is the next question"
+        );
+        assert_eq!(turn.state(), &heard(question));
+        assert_eq!(turn.question(), Some(2));
+
+        // A blank final does not erase the words the partials heard.
+        let (port, mut turn) = reading(listening, stop);
+        let effects = drive_all(
+            &mut turn,
+            &port,
+            &[words(question), TurnEvent::FinalHeard(String::new())],
+        );
+        assert_eq!(
+            effects,
+            vec![Effect::StopSpeaking, Effect::SendText(question.to_owned())],
+            "{listening}: a blank final"
+        );
+
+        // The stop phrase, heard while paused, ends the turn.
+        let (port, mut turn) = reading(listening, stop);
+        let effects = drive_all(&mut turn, &port, &[onset(), words(stop)]);
+        assert_eq!(
+            effects,
+            vec![Effect::StopSpeaking, Effect::ReleaseMicrophone]
+        );
+        assert_eq!(turn.state(), &TurnState::Idle);
+
+        // Long wordless speech is no backchannel: the answer stops, and
+        // there is nothing to ask.
+        let (port, mut turn) = reading(listening, stop);
+        assert!(drive_all(&mut turn, &port, &[onset(), ended(900)]).is_empty());
+        // Speech that starts again is measured anew: its end is not yet heard.
+        assert!(turn.drive(onset(), &port).is_empty());
+        assert_eq!(turn.state(), &paused("", None));
+        assert!(turn.drive(ended(1_400), &port).is_empty());
+        assert_eq!(
+            turn.drive(TurnEvent::Silence, &port),
+            vec![Effect::StopSpeaking, Effect::ReleaseMicrophone]
+        );
+        assert_eq!(turn.state(), &TurnState::Idle);
+    }
+
+    // "no" is a backchannel in Polish and a question in English.
+    let (port, mut turn) = reading("en-US", "stop");
+    let effects = drive_all(&mut turn, &port, &[words("no"), TurnEvent::Silence]);
+    assert_eq!(
+        effects,
+        vec![Effect::StopSpeaking, Effect::SendText("no".to_owned())]
+    );
+}
+
+/// A pause asks the port what it listens in once, as the answer pauses —
+/// the list is that language's — and not again for every word, partial or
+/// silence heard while it is decided: each ask is a round trip to the
+/// port's worker under the voice lock.
+#[test]
+fn voice_a_pause_asks_its_language_once() {
+    let (port, mut turn) = reading("pl-PL", "przestań");
+    let words = |t: &str| TurnEvent::SpeechDetected(t.to_owned());
+    port.listening_asked.store(0, Ordering::SeqCst);
+    assert_eq!(turn.drive(words("No"), &port), vec![Effect::PauseSpeaking]);
+    turn.drive(words("No."), &port);
+    turn.drive(TurnEvent::SpeechEnded { speech_ms: 700 }, &port);
+    assert_eq!(
+        turn.drive(TurnEvent::Silence, &port),
+        vec![Effect::ContinueSpeaking],
+        "\"no\" is a backchannel in the Polish the turn listens in"
+    );
+    assert_eq!(port.listening_asked.load(Ordering::SeqCst), 1);
+    let effects = drive_all(
+        &mut turn,
+        &port,
+        &[
+            TurnEvent::SpeechDetected(String::new()),
+            words("No"),
+            TurnEvent::FinalHeard("No.".to_owned()),
+        ],
+    );
+    assert_eq!(effects, vec![Effect::ContinueSpeaking]);
+    assert_eq!(
+        port.listening_asked.load(Ordering::SeqCst),
+        2,
+        "once more for the second pause"
+    );
+}
+
+/// 97.3 #4: without the turn models nothing but the recogniser's words
+/// reaches a speaking turn: the first non-empty partial pauses it, no speech
+/// is ever measured, and the list alone decides — a short word not on it is
+/// a question, however brief.
+#[test]
+fn voice_backchannel_without_models_uses_the_list_only() {
+    let (port, mut turn) = reading("en-US", "stop");
+    let words = |t: &str| TurnEvent::SpeechDetected(t.to_owned());
+    assert_eq!(
+        turn.drive(words("Yeah"), &port),
+        vec![Effect::PauseSpeaking]
+    );
+    turn.drive(words("Yeah."), &port);
+    assert_eq!(
+        turn.state(),
+        &TurnState::Paused {
+            heard: "Yeah.".to_owned(),
+            speech_ms: None
+        }
+    );
+    assert_eq!(
+        turn.drive(TurnEvent::Silence, &port),
+        vec![Effect::ContinueSpeaking]
+    );
+    assert_eq!(turn.drive(words("Hm"), &port), vec![Effect::PauseSpeaking]);
+    assert_eq!(
+        turn.drive(TurnEvent::Silence, &port),
+        vec![Effect::StopSpeaking, Effect::SendText("Hm".to_owned())]
+    );
+    assert_eq!(
+        port.calls()
+            .into_iter()
+            .filter(|call| matches!(call, Call::PauseSpeaking | Call::ContinueSpeaking))
+            .count(),
+        3
+    );
+}
+
+/// `SpeechDetected` and `StopHeard` anywhere but `Speaking` and `Paused`
+/// are nothing — there is nothing to interrupt. (In `Paused` they are the
+/// utterance being decided: `voice_paused_utterance_decides`.)
 #[test]
 fn voice_speech_detected_outside_speaking_is_ignored() {
     for state in [
         TurnState::Idle,
         listening("a"),
+        finishing("a"),
         heard("a"),
         TurnState::Sending { answering: true },
     ] {
@@ -362,12 +666,18 @@ fn voice_turn_matches_the_stop_phrase_only_while_speaking() {
     turn.drive(TurnEvent::WakeMatched, &port);
     turn.drive(TurnEvent::FinalHeard("hi".to_owned()), &port);
     turn.drive(TurnEvent::AnswerDone("a long answer".to_owned()), &port);
-    // Another word mid-answer: today's barge-in.
+    // Another word mid-answer pauses; its final words ask again.
     let effects = turn.drive(TurnEvent::SpeechDetected("wait, what".to_owned()), &port);
-    assert_eq!(effects, vec![Effect::StopSpeaking, Effect::OpenMicrophone]);
-    assert_eq!(turn.state(), &listening(""));
-
-    turn.drive(TurnEvent::FinalHeard("again".to_owned()), &port);
+    assert_eq!(effects, vec![Effect::PauseSpeaking]);
+    assert_eq!(turn.state(), &paused("wait, what", None));
+    let effects = turn.drive(TurnEvent::FinalHeard("wait, what again".to_owned()), &port);
+    assert_eq!(
+        effects,
+        vec![
+            Effect::StopSpeaking,
+            Effect::SendText("wait, what again".to_owned())
+        ]
+    );
     turn.drive(TurnEvent::AnswerDone("another answer".to_owned()), &port);
     // The stop word, as the recogniser writes it: capitalised, punctuated.
     let effects = turn.drive(TurnEvent::SpeechDetected("Stop.".to_owned()), &port);
@@ -388,15 +698,20 @@ fn voice_turn_matches_the_stop_phrase_only_while_speaking() {
     );
 }
 
-/// With no stop phrase set, every barge-in asks a question — the shape
-/// before Epic 67.
+/// With no stop phrase set, a barge-in that is not a backchannel asks a
+/// question — "stop" included, once the pause's window decides it.
 #[test]
 fn voice_turn_without_a_stop_phrase_treats_stop_as_a_question() {
     let mut turn = Turn::new(VoicePlatform::IOS);
     turn.apply(TurnEvent::AnswerDone("noon".to_owned()));
     let effects = turn.apply(TurnEvent::SpeechDetected("stop".to_owned()));
-    assert_eq!(effects, vec![Effect::StopSpeaking, Effect::OpenMicrophone]);
-    assert_eq!(turn.state(), &listening(""));
+    assert_eq!(effects, vec![Effect::PauseSpeaking]);
+    let effects = turn.apply(TurnEvent::Silence);
+    assert_eq!(
+        effects,
+        vec![Effect::StopSpeaking, Effect::SendText("stop".to_owned())]
+    );
+    assert_eq!(turn.state(), &heard("stop"));
 }
 
 /// A Polish stop word, set from `bots.stop_phrase`, matches what the
@@ -1018,8 +1333,10 @@ fn voice_driver_fails_the_turn_when_the_port_refuses_to_speak() {
     );
 }
 
-/// The driver's port calls for a whole turn, in order: barge-in stops the
-/// synthesiser before restarting recognition.
+/// The driver's port calls for a whole turn, in order: a barge-in pauses
+/// the synthesiser and leaves recognition running on the request the words
+/// arrive on; only once the words are a question is speech stopped, and
+/// nothing restarts recognition for them.
 #[test]
 fn voice_driver_orders_port_calls_for_barge_in() {
     let port = FakePort::default();
@@ -1033,11 +1350,13 @@ fn voice_driver_orders_port_calls_for_barge_in() {
         vec![
             Call::Start(None),
             Call::Speak("a long answer".to_owned(), "en-US".to_owned()),
-            Call::StopSpeaking,
-            Call::Start(None),
+            Call::PauseSpeaking,
         ]
     );
-    assert_eq!(turn.state(), &listening(""));
+    turn.drive(TurnEvent::FinalHeard("hang on".to_owned()), &port);
+    assert_eq!(port.calls().last(), Some(&Call::StopSpeaking));
+    assert_eq!(port.calls().len(), 4);
+    assert_eq!(turn.state(), &heard("hang on"));
 }
 
 /// Every machine state has a projection, and `Idle` carries what the surface
@@ -1498,8 +1817,13 @@ fn voice_level_rides_listening_and_heard_only() {
 
     turn.apply(TurnEvent::AnswerDone("noon".to_owned()));
     turn.apply(TurnEvent::SpeechDetected("wait".to_owned()));
-    assert_eq!(turn.state(), &listening(""));
-    assert_eq!(turn.level(), None, "a fresh listening starts unmeasured");
+    turn.apply(TurnEvent::Level(0.5));
+    assert_eq!(turn.state(), &paused("wait", None));
+    assert_eq!(
+        turn.level(),
+        None,
+        "a paused answer is drawn as speaking, unmetered"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1638,4 +1962,270 @@ fn voice_driver_is_armed_while_a_turn_runs_and_not_before_the_phrase_is_set() {
         "mid-turn, only recorded"
     );
     assert!(matches!(turn.state(), TurnState::Heard { .. }));
+}
+
+// ---------------------------------------------------------------------------
+// End of turn by meaning (AD-411): `UtteranceEnd`, `Finishing`, the last words.
+// ---------------------------------------------------------------------------
+
+/// A finished sentence heard by the models takes a `Listening` turn that
+/// heard words to `Finishing` and asks the recogniser for its last words;
+/// anywhere else, or before any words, it is nothing. The microphone stays
+/// open, and the surface still draws the turn as listening.
+#[test]
+fn voice_utterance_end_finishes_recognition() {
+    let (next, effects) = advance(
+        listening("what time is it"),
+        TurnEvent::UtteranceEnd(FINISH),
+    );
+    assert_eq!(next, finishing("what time is it"));
+    assert_eq!(effects, vec![Effect::FinishRecognition(FINISH)]);
+
+    for state in every_state()
+        .into_iter()
+        .filter(|state| *state != listening("hej"))
+        .chain([listening("  ")])
+    {
+        let (next, effects) = advance(state.clone(), TurnEvent::UtteranceEnd(FINISH));
+        assert_eq!(next, state, "{state:?} ignores it");
+        assert!(effects.is_empty(), "{state:?}: {effects:?}");
+    }
+
+    let port = FakePort::default();
+    let mut turn = Turn::new(VoicePlatform::IOS);
+    turn.drive(TurnEvent::WakeMatched, &port);
+    turn.drive(TurnEvent::PartialHeard("what time".to_owned()), &port);
+    turn.drive(TurnEvent::Level(0.4), &port);
+    let effects = turn.drive(TurnEvent::UtteranceEnd(FINISH), &port);
+    assert_eq!(effects, vec![Effect::FinishRecognition(FINISH)]);
+    assert_eq!(
+        port.calls(),
+        vec![Call::Start(None), Call::FinishRecognition(FINISH)]
+    );
+    assert!(turn.microphone_open());
+    assert_eq!(
+        turn.vm(),
+        VoiceStateVm::Listening {
+            heard: "what time".to_owned(),
+            level: Some(0.4),
+        }
+    );
+}
+
+/// The recogniser's final words are the message; a partial meanwhile is the
+/// better fallback, a blank one is not, and a blank final sends what the
+/// partials heard rather than nothing.
+#[test]
+fn voice_finishing_sends_the_final_words() {
+    let (next, effects) = advance(
+        finishing("what time"),
+        TurnEvent::FinalHeard("what time is it".to_owned()),
+    );
+    assert_eq!(next, heard("what time is it"));
+    assert_eq!(
+        effects,
+        vec![Effect::SendText("what time is it".to_owned())]
+    );
+
+    let (next, effects) = advance(
+        finishing("what time"),
+        TurnEvent::PartialHeard("what time is".to_owned()),
+    );
+    assert_eq!(next, finishing("what time is"));
+    assert!(effects.is_empty());
+    let (next, _) = advance(next, TurnEvent::PartialHeard(" ".to_owned()));
+    assert_eq!(next, finishing("what time is"));
+    let (next, effects) = advance(next, TurnEvent::FinalHeard(String::new()));
+    assert_eq!(next, heard("what time is"));
+    assert_eq!(effects, vec![Effect::SendText("what time is".to_owned())]);
+
+    let port = FakePort::default();
+    let mut turn = Turn::new(VoicePlatform::IOS);
+    turn.drive(TurnEvent::WakeMatched, &port);
+    turn.drive(TurnEvent::PartialHeard("what time".to_owned()), &port);
+    turn.drive(TurnEvent::UtteranceEnd(FINISH), &port);
+    assert_eq!(turn.question(), None);
+    turn.drive(TurnEvent::FinalHeard("What time is it?".to_owned()), &port);
+    assert!(turn.awaiting_send());
+    assert_eq!(turn.question(), Some(1), "the send follows as today");
+}
+
+/// Without the final words within `FINAL_WORDS_WAIT`, the shell's clock
+/// feeds `Silence` and the turn sends what it heard. The wait runs from the
+/// port's end of the request's audio: the partials it delivers meanwhile do
+/// not restart it, while every move in `Listening` still restarts the pause.
+#[test]
+fn voice_finishing_falls_back_after_600_ms() {
+    assert_eq!(FINAL_WORDS_WAIT, Duration::from_millis(600));
+    assert_eq!(silence_budget(&finishing("x"), 0), Some(FINAL_WORDS_WAIT));
+    let (next, effects) = advance(finishing("what time is"), TurnEvent::Silence);
+    assert_eq!(next, heard("what time is"));
+    assert_eq!(effects, vec![Effect::SendText("what time is".to_owned())]);
+    let (next, _) = advance(ended("what time is", 1_000), TurnEvent::Silence);
+    assert_eq!(next, heard("what time is"));
+
+    assert!(!restarts_budget(&finishing("a"), &finishing("a b")));
+    assert!(!restarts_budget(&ended("a", 1_000), &ended("a b", 1_000)));
+    assert!(restarts_budget(&finishing("a"), &ended("a", 1_000)));
+    assert!(restarts_budget(&listening("a"), &finishing("a")));
+    assert!(restarts_budget(&listening("a"), &listening("a b")));
+    assert!(restarts_budget(&listening("a"), &listening("a")));
+    assert!(restarts_budget(&finishing("a"), &heard("a")));
+    // A pause's window restarts on what the utterance changes, and not on a
+    // sentence of the answer queued meanwhile.
+    assert!(restarts_budget(&paused("", None), &paused("no", None)));
+    assert!(restarts_budget(
+        &paused("no", None),
+        &paused("no", Some(700))
+    ));
+    assert!(!restarts_budget(&paused("no", None), &paused("no", None)));
+    assert!(restarts_budget(&TurnState::Speaking, &paused("", None)));
+}
+
+/// The wait for the last words is counted from when the port
+/// actually ran `endAudio`, as it reports it — not from the decision, and
+/// not from when the report reached the turn. Only this finish's report
+/// counts, and only the first; a port with nothing to end sends the
+/// partial at once.
+#[test]
+fn voice_final_words_wait_runs_from_the_ports_end_of_audio() {
+    let port = FakePort::default();
+    let mut turn = Turn::new(VoicePlatform::MACOS);
+    turn.drive(TurnEvent::WakeMatched, &port);
+    turn.drive(TurnEvent::PartialHeard("what time".to_owned()), &port);
+    turn.drive(TurnEvent::UtteranceEnd(FINISH), &port);
+    assert_eq!(turn.state(), &finishing("what time"));
+
+    // Another finish's acknowledgement is nothing.
+    let stale = turn.budget();
+    turn.drive(
+        TurnEvent::AudioEnded {
+            finish: FINISH - 2,
+            at_ms: 10_100,
+        },
+        &port,
+    );
+    turn.drive(TurnEvent::NothingToFinish(FINISH - 2), &port);
+    assert_eq!(turn.state(), &finishing("what time"));
+    assert_eq!(turn.budget(), stale, "nothing restarted");
+
+    // The worker ran `endAudio` 200 ms after the decision; its report
+    // reaches the turn 200 ms after that. 400 ms of the wait are left.
+    turn.drive(
+        TurnEvent::AudioEnded {
+            finish: FINISH,
+            at_ms: 10_200,
+        },
+        &port,
+    );
+    assert_eq!(turn.state(), &ended("what time", 10_200));
+    assert_ne!(turn.budget(), stale, "the wait starts at the report");
+    assert_eq!(
+        silence_budget(turn.state(), 10_400),
+        Some(Duration::from_millis(400))
+    );
+    assert_eq!(silence_budget(turn.state(), 10_900), Some(Duration::ZERO));
+    // A second report does not move the clock.
+    turn.drive(
+        TurnEvent::AudioEnded {
+            finish: FINISH,
+            at_ms: 10_700,
+        },
+        &port,
+    );
+    assert_eq!(turn.state(), &ended("what time", 10_200));
+    // The final words 500 ms after `endAudio` are inside the wait.
+    let effects = turn.drive(TurnEvent::FinalHeard("what time is it".to_owned()), &port);
+    assert_eq!(
+        effects,
+        vec![Effect::SendText("what time is it".to_owned())]
+    );
+
+    // Nothing to end: no final words are coming, so the partial goes now.
+    let (next, effects) = advance(finishing("what time"), TurnEvent::NothingToFinish(FINISH));
+    assert_eq!(next, heard("what time"));
+    assert_eq!(effects, vec![Effect::SendText("what time".to_owned())]);
+}
+
+/// The shell stamps its timer with the turn's budget and feeds
+/// `Silence` only if, under the same lock, it is still the budget. The
+/// pause armed in `Listening` is spent once a finished sentence moves the
+/// turn to `Finishing`, so it cannot send the partial before the last
+/// words' wait; the wait's own timer can.
+#[test]
+fn voice_a_spent_pause_cannot_end_a_finishing_turn() {
+    /// The shell's timer firing: check the stamp and spend it in one go.
+    fn fire(turn: &mut Turn, stamp: u64, port: &FakePort) -> Option<Vec<Effect>> {
+        (turn.budget() == stamp).then(|| turn.drive(TurnEvent::Silence, port))
+    }
+    let port = FakePort::default();
+    let mut turn = Turn::new(VoicePlatform::MACOS);
+    turn.drive(TurnEvent::WakeMatched, &port);
+    turn.drive(TurnEvent::PartialHeard("what time".to_owned()), &port);
+    let pause = turn.budget();
+    turn.drive(TurnEvent::UtteranceEnd(FINISH), &port);
+    let wait = turn.budget();
+    turn.drive(TurnEvent::PartialHeard("what time is".to_owned()), &port);
+    assert_eq!(turn.budget(), wait, "partials in Finishing keep the wait");
+
+    assert_eq!(fire(&mut turn, pause, &port), None);
+    assert_eq!(turn.state(), &finishing("what time is"));
+    assert_eq!(
+        fire(&mut turn, wait, &port),
+        Some(vec![Effect::SendText("what time is".to_owned())])
+    );
+
+    // Setting the phrase restarts the budget, as the shell arms afresh.
+    let before = turn.budget();
+    turn.set_wake(None);
+    assert_ne!(turn.budget(), before);
+}
+
+/// A request whose audio was ended for its last words is rolled
+/// at `FINAL_WORDS_WAIT` after that, and never earlier by the routine
+/// clock — not at the quiet roll, not at the hard age limit. A request
+/// still fed rolls by the routine clock alone.
+#[test]
+fn voice_finishing_request_is_not_rolled_before_its_wait() {
+    let quiet = RequestAge {
+        age: REQUEST_ROLL_AFTER,
+        quiet_for: REQUEST_ROLL_QUIET,
+        finishing_for: None,
+    };
+    let old = RequestAge {
+        age: REQUEST_LONGEST,
+        quiet_for: Duration::ZERO,
+        finishing_for: None,
+    };
+    let young = RequestAge {
+        age: REQUEST_ROLL_AFTER - Duration::from_millis(1),
+        quiet_for: REQUEST_ROLL_QUIET,
+        finishing_for: None,
+    };
+    let talking = RequestAge {
+        quiet_for: REQUEST_ROLL_QUIET - Duration::from_millis(1),
+        ..quiet
+    };
+    assert!(rolls(quiet));
+    assert!(rolls(old));
+    assert!(!rolls(young));
+    assert!(!rolls(talking));
+
+    let just_before = Some(FINAL_WORDS_WAIT - Duration::from_millis(1));
+    for routine in [quiet, old, young] {
+        assert!(
+            !rolls(RequestAge {
+                finishing_for: just_before,
+                ..routine
+            }),
+            "{routine:?}"
+        );
+        assert!(
+            rolls(RequestAge {
+                finishing_for: Some(FINAL_WORDS_WAIT),
+                ..routine
+            }),
+            "{routine:?}"
+        );
+    }
 }

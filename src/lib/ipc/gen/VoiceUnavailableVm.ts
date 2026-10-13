@@ -45,6 +45,22 @@ language: string,
 /**
  * The sentence.
  */
+message: string, } | { "kind": "systemTooOld", 
+/**
+ * The first version that can, as a person names it.
+ */
+needs: string, 
+/**
+ * The sentence.
+ */
+message: string, } | { "kind": "notReadYet", 
+/**
+ * The sentence.
+ */
+message: string, } | { "kind": "leftTheFront", 
+/**
+ * The sentence.
+ */
 message: string, } | { "kind": "unsupported", 
 /**
  * The sentence.

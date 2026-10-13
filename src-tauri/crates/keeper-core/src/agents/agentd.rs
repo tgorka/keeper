@@ -45,11 +45,18 @@ pub struct AgentdConfig {
     pub trust: Vec<TrustEntry>,
     /// `[sandbox].read_exec`: absolute paths only. The architecture's other
     /// two rules — nothing inside a drive's checkout, nothing holding this
-    /// host's secrets — need the host's directories, so the sandbox that
-    /// mounts these (90.5) checks them, not the parser.
+    /// host's secrets — need the host's directories, so the host that
+    /// builds a run's sandbox checks them (`run::grant_refusal`), not the
+    /// parser.
     pub read_exec: Vec<PathBuf>,
-    pub mcp: Vec<McpEntry>,
-    pub kvm: Vec<KvmEntry>,
+    /// `[sandbox].env` (R148): variables a run gets whose values are
+    /// absolute paths — a toolchain's `RUSTUP_HOME`, `CARGO_HOME` — mounted
+    /// read-and-execute, checked as `read_exec` is. Never a name of the
+    /// run's own environment, `KEEPER_*`, `LD_*` or `DYLD_*`.
+    pub sandbox_env: Vec<(String, PathBuf)>,
+    pub mcp: Vec<crate::agents::mcp::McpEntry>,
+    /// `[[kvm]]` (`kvm::check`): never in a drive.
+    pub kvm: Vec<crate::agents::kvm::KvmEntry>,
 }
 
 /// `[homeserver]`.
@@ -120,48 +127,6 @@ pub struct TrustEntry {
     pub proxy: Option<OwnedUserId>,
 }
 
-/// An `[[mcp]]` server's role.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum McpRole {
-    Paseo,
-    Screen,
-    /// Names a `[[kvm]] id`.
-    Kvm(String),
-}
-
-/// How an `[[mcp]]` server is reached: exactly one of the two.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum McpTransport {
-    Url(String),
-    /// An argv.
-    Command(Vec<String>),
-}
-
-/// `[[mcp]]` (ruling R24(4), F15).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct McpEntry {
-    pub name: String,
-    pub transport: McpTransport,
-    pub credential: Option<SecretRef>,
-    pub readers: Readers,
-    pub role: Option<McpRole>,
-    pub fingerprint: Option<String>,
-    pub trust_annotations: bool,
-    /// `[[mcp.tier]]`: tool → `T0`…`T5`.
-    pub tiers: Vec<(String, String)>,
-}
-
-/// `[[kvm]]`: the one table that owns a KVM's audience, certificate and credential.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct KvmEntry {
-    pub id: String,
-    pub kind: String,
-    pub url: String,
-    pub credential: SecretRef,
-    pub fingerprint: String,
-    pub readers: Readers,
-}
-
 /// Why `agentd.toml` cannot be used. Each is the sentence `keeper-agentd` prints.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ConfigRefusal {
@@ -180,9 +145,18 @@ impl ConfigRefusal {
     pub fn sentence(&self) -> String {
         self.to_string()
     }
+
+    /// Where and why, for a check shared with a host that reads no
+    /// `agentd.toml` ([`crate::agents::mcp::check`]).
+    pub(crate) fn parts(self) -> (String, String) {
+        match self {
+            ConfigRefusal::Invalid { at, reason } => (at, reason),
+            other => (String::new(), other.sentence()),
+        }
+    }
 }
 
-fn invalid(at: impl Into<String>, reason: impl Into<String>) -> ConfigRefusal {
+pub(crate) fn invalid(at: impl Into<String>, reason: impl Into<String>) -> ConfigRefusal {
     ConfigRefusal::Invalid {
         at: at.into(),
         reason: reason.into(),
@@ -208,9 +182,9 @@ struct RawConfig {
     #[serde(default)]
     sandbox: Option<RawSandbox>,
     #[serde(default)]
-    mcp: Vec<RawMcp>,
+    mcp: Vec<crate::agents::mcp::RawMcp>,
     #[serde(default)]
-    kvm: Vec<RawKvm>,
+    kvm: Vec<crate::agents::kvm::RawKvm>,
 }
 
 #[derive(Deserialize)]
@@ -261,40 +235,8 @@ struct RawTrust {
 struct RawSandbox {
     #[serde(default)]
     read_exec: Vec<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawMcp {
-    name: String,
-    url: Option<String>,
-    command: Option<Vec<String>>,
-    credential: Option<String>,
-    readers: Option<Vec<String>>,
-    role: Option<String>,
-    fingerprint: Option<String>,
     #[serde(default)]
-    trust_annotations: bool,
-    #[serde(default)]
-    tier: Vec<RawTier>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawTier {
-    tool: String,
-    tier: String,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawKvm {
-    id: String,
-    kind: String,
-    url: String,
-    credential: String,
-    fingerprint: String,
-    readers: Vec<String>,
+    env: std::collections::BTreeMap<String, String>,
 }
 
 impl AgentdConfig {
@@ -416,56 +358,20 @@ impl AgentdConfig {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        let read_exec = raw
-            .sandbox
-            .map(|sandbox| sandbox.read_exec)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|path| {
-                let path = PathBuf::from(path);
-                if path.is_absolute() {
-                    Ok(path)
-                } else {
-                    Err(invalid(
-                        "[sandbox] `read_exec`",
-                        format!("\"{}\" is not an absolute path", path.display()),
-                    ))
-                }
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let sandbox = raw.sandbox.unwrap_or(RawSandbox {
+            read_exec: Vec::new(),
+            env: Default::default(),
+        });
+        let crate::agents::run::SandboxTable {
+            read_exec,
+            env: sandbox_env,
+        } = crate::agents::run::SandboxTable::check(sandbox.read_exec, sandbox.env)
+            .map_err(|(at, reason)| invalid(at, reason))?;
 
-        let kvm = raw
-            .kvm
-            .into_iter()
-            .map(|entry| {
-                let at = format!("[[kvm]] \"{}\"", entry.id);
-                if !matches!(entry.kind.as_str(), "nanokvm" | "nanokvm-go") {
-                    return Err(invalid(
-                        format!("{at} `kind`"),
-                        format!(
-                            "\"{}\" is not a KVM kind; write \"nanokvm\" or \"nanokvm-go\"",
-                            entry.kind
-                        ),
-                    ));
-                }
-                let credential = secret(Some(&entry.credential), &at)?
-                    .ok_or_else(|| invalid(&at, SECRET_SENTENCE))?;
-                Ok(KvmEntry {
-                    readers: readers_of(&entry.readers, &at)?,
-                    fingerprint: fingerprint(&entry.fingerprint, &at)?,
-                    id: entry.id,
-                    kind: entry.kind,
-                    url: entry.url,
-                    credential,
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let kvm = crate::agents::kvm::check(raw.kvm)?;
 
-        let mcp = raw
-            .mcp
-            .into_iter()
-            .map(|entry| mcp_entry(entry, &kvm))
-            .collect::<Result<Vec<_>, _>>()?;
+        let mcp = crate::agents::mcp::check(raw.mcp, &kvm, crate::agents::mcp::AGENTD)
+            .map_err(|(at, reason)| invalid(at, reason))?;
 
         Ok(AgentdConfig {
             principal: raw.principal,
@@ -477,6 +383,7 @@ impl AgentdConfig {
             agents,
             trust,
             read_exec,
+            sandbox_env,
             mcp,
             kvm,
         })
@@ -568,81 +475,9 @@ fn drive_pin(
     })
 }
 
-fn mcp_entry(raw: RawMcp, kvm: &[KvmEntry]) -> Result<McpEntry, ConfigRefusal> {
-    let at = format!("[[mcp]] \"{}\"", raw.name);
-    let transport = match (raw.url, raw.command) {
-        (Some(url), None) => McpTransport::Url(url),
-        (None, Some(command)) if !command.is_empty() => McpTransport::Command(command),
-        (None, Some(_)) => return Err(invalid(&at, "`command` is an empty argv")),
-        _ => return Err(invalid(&at, "it names exactly one of `url` and `command`")),
-    };
-    let role = match raw.role.as_deref() {
-        None => None,
-        Some("paseo") => Some(McpRole::Paseo),
-        Some("screen") => Some(McpRole::Screen),
-        Some(role) => match role.strip_prefix("kvm:") {
-            Some(id) => {
-                if !kvm.iter().any(|entry| entry.id == id) {
-                    return Err(invalid(
-                        &at,
-                        format!("its role \"{role}\" names [[kvm]] id \"{id}\", and there is none"),
-                    ));
-                }
-                if raw.readers.is_some() || raw.fingerprint.is_some() || raw.credential.is_some() {
-                    return Err(invalid(
-                        &at,
-                        format!(
-                            "a role \"{role}\" entry carries no `readers`, `fingerprint` or `credential`; [[kvm]] \"{id}\" owns them"
-                        ),
-                    ));
-                }
-                Some(McpRole::Kvm(id.to_owned()))
-            }
-            None => {
-                return Err(invalid(
-                    &at,
-                    format!(
-                        "\"{role}\" is not a role; write \"paseo\", \"screen\" or \"kvm:<id>\""
-                    ),
-                ))
-            }
-        },
-    };
-    let tiers = raw
-        .tier
-        .into_iter()
-        .map(|row| {
-            if !matches!(row.tier.as_str(), "T0" | "T1" | "T2" | "T3" | "T4" | "T5") {
-                return Err(invalid(
-                    format!("{at} [[mcp.tier]] \"{}\"", row.tool),
-                    format!("\"{}\" is not a tier; write T0 to T5", row.tier),
-                ));
-            }
-            Ok((row.tool, row.tier))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(McpEntry {
-        credential: secret(raw.credential.as_deref(), &at)?,
-        readers: match &raw.readers {
-            None => Readers::Anyone,
-            Some(list) => readers_of(list, &at)?,
-        },
-        fingerprint: raw
-            .fingerprint
-            .as_deref()
-            .map(|print| fingerprint(print, &at))
-            .transpose()?,
-        name: raw.name,
-        transport,
-        role,
-        trust_annotations: raw.trust_annotations,
-        tiers,
-    })
-}
-
 /// `secret:<name>`, `<name>` of `[A-Za-z0-9_-]{1,64}`; anything else is a
 /// secret pasted into the file.
-fn secret(raw: Option<&str>, at: &str) -> Result<Option<SecretRef>, ConfigRefusal> {
+pub(crate) fn secret(raw: Option<&str>, at: &str) -> Result<Option<SecretRef>, ConfigRefusal> {
     let Some(raw) = raw else { return Ok(None) };
     let name = raw
         .strip_prefix("secret:")
@@ -656,7 +491,7 @@ fn secret(raw: Option<&str>, at: &str) -> Result<Option<SecretRef>, ConfigRefusa
     Ok(Some(SecretRef(name.to_owned())))
 }
 
-fn readers_of(list: &[String], at: &str) -> Result<Readers, ConfigRefusal> {
+pub(crate) fn readers_of(list: &[String], at: &str) -> Result<Readers, ConfigRefusal> {
     if list.len() == 1 && list[0] == "*" {
         return Ok(Readers::Anyone);
     }
@@ -667,7 +502,7 @@ fn readers_of(list: &[String], at: &str) -> Result<Readers, ConfigRefusal> {
     Ok(Readers::Only(set))
 }
 
-fn fingerprint(raw: &str, at: &str) -> Result<String, ConfigRefusal> {
+pub(crate) fn fingerprint(raw: &str, at: &str) -> Result<String, ConfigRefusal> {
     let fits = raw
         .strip_prefix("sha256:")
         .is_some_and(|hex| hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()));
@@ -801,7 +636,7 @@ readers     = ["@tgorka:example.org"]
         assert_eq!(config.mcp[0].readers, Readers::Anyone);
         assert_eq!(
             config.mcp[1].tiers,
-            [("search".to_owned(), "T0".to_owned())]
+            [("search".to_owned(), crate::agents::tier::Tier::T0)]
         );
         let names: Vec<&str> = config.secrets().iter().map(|s| s.name()).collect();
         assert_eq!(names, ["cliproxy", "desk-kvm", "paseo", "tgdrive"]);
@@ -958,6 +793,55 @@ readers     = ["@tgorka:example.org"]
             )
             .replace("credential = \"secret:paseo\"\n", "");
         let config = AgentdConfig::parse(&text).expect("a kvm role naming desk parses");
-        assert_eq!(config.mcp[0].role, Some(McpRole::Kvm("desk".to_owned())));
+        assert_eq!(
+            config.mcp[0].role,
+            Some(crate::agents::mcp::McpRole::Kvm("desk".to_owned()))
+        );
+    }
+
+    /// 96.2 #2: a KVM is named once; a second `[[kvm]]` of the same id is
+    /// refused rather than one silently shadowing the other's readers.
+    #[test]
+    fn a_kvm_id_is_named_once() {
+        let second = EXAMPLE.replace(
+            "[[kvm]]\nid          = \"desk\"",
+            "[[kvm]]\nid          = \"desk\"\nkind        = \"nanokvm-go\"\nurl         = \"https://other.example.org\"\ncredential  = \"secret:other\"\nfingerprint = \"sha256:1111111111111111111111111111111111111111111111111111111111111111\"\nreaders     = [\"*\"]\n\n[[kvm]]\nid          = \"desk\"",
+        );
+        assert!(refused(&second).contains("each KVM is named once"));
+        assert!(AgentdConfig::parse(&second.replacen("\"desk\"", "\"den\"", 1)).is_ok());
+    }
+
+    /// R148: a toolchain's homes reach a run as `[sandbox] env`, absolute
+    /// paths under a name the run's own environment does not hold.
+    #[test]
+    fn sandbox_env_names_absolute_paths_keeper_does_not_set() {
+        let with = |env: &str| {
+            EXAMPLE.replace(
+                "read_exec = [\"/opt/toolchains/bin\"]",
+                &format!("read_exec = [\"/opt/toolchains/bin\"]\nenv = {{ {env} }}"),
+            )
+        };
+        let config = AgentdConfig::parse(&with(
+            "RUSTUP_HOME = \"/usr/local/rustup\", CARGO_HOME = \"/usr/local/cargo\"",
+        ))
+        .expect("parses");
+        assert_eq!(
+            config.sandbox_env,
+            [
+                ("CARGO_HOME".to_owned(), PathBuf::from("/usr/local/cargo")),
+                ("RUSTUP_HOME".to_owned(), PathBuf::from("/usr/local/rustup")),
+            ]
+        );
+        for env in [
+            "CARGO_HOME = \"cargo\"",
+            "HOME = \"/srv\"",
+            "PATH = \"/opt/bin\"",
+            "GIT_CONFIG_GLOBAL = \"/etc/gitconfig\"",
+            "LD_PRELOAD = \"/tmp/x.so\"",
+            "KEEPER_AGENTD_SECRET_X = \"/x\"",
+            "cargo_home = \"/usr/local/cargo\"",
+        ] {
+            assert!(refused(&with(env)).contains("[sandbox] env"), "{env}");
+        }
     }
 }

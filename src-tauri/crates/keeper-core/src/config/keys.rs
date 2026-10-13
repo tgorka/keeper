@@ -719,6 +719,22 @@ pub const KEYS: &[KeySpec] = &[
         summary: "What the dock badge counts.",
         example: "\"mentions\"",
     },
+    // ---- push ------------------------------------------------------------
+    KeySpec {
+        key: "push.gateway_url",
+        family: false,
+        scope: Scope::UserGlobal,
+        settable: Settable::Never(
+            "it names where your homeserver sends this phone's event ids, which is the \
+             person's choice in Settings on the device — it roams to their other phones \
+             through settings.toml, and no file, this machine's, the account's or a folder's, \
+             may choose it for them",
+        ),
+        shape: Shape::Text,
+        default: "",
+        summary: "The push gateway you run (`https://…/_matrix/push/v1/notify`) that your homeserver sends event ids to for your phones; absent means no push.",
+        example: "",
+    },
     // ---- recording -------------------------------------------------------
     KeySpec {
         key: "recording.destination_dir",
@@ -988,6 +1004,26 @@ pub const KEYS: &[KeySpec] = &[
         default: "auto",
         summary: "The spoken language transcription expects; `auto` lets the model decide.",
         example: "\"pl\"",
+    },
+    KeySpec {
+        key: "transcription.smart_turn_model",
+        family: false,
+        scope: Scope::UserGlobal,
+        settable: Settable::AnyLayer,
+        shape: Shape::Text,
+        default: "",
+        summary: "The end-of-turn model voice loads, as a folder name under the hydrated `_models/`. Blank means the config repository's choice (`[smart_turn]` in `_models/models.toml`); every device that runs turn models fetches the folder named here, and one that is missing or incomplete on the device is refused, never replaced.",
+        example: "\"smart-turn-v3\"",
+    },
+    KeySpec {
+        key: "transcription.vad_model",
+        family: false,
+        scope: Scope::UserGlobal,
+        settable: Settable::AnyLayer,
+        shape: Shape::Text,
+        default: "",
+        summary: "The voice activity model voice loads, as a folder name under the hydrated `_models/`. Blank means the config repository's choice (`[vad]` in `_models/models.toml`); every device that runs turn models fetches the folder named here, and one that is missing or incomplete on the device is refused, never replaced.",
+        example: "\"silero-vad\"",
     },
     // ---- ui --------------------------------------------------------------
     KeySpec {

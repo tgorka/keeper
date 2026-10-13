@@ -33,7 +33,8 @@ export type PhoneSurface =
   | "bridges"
   | "sync"
   | "files"
-  | "notes";
+  | "notes"
+  | "sessions";
 
 /**
  * The surface a view opens on the phone, or `null` where the phone has none
@@ -42,7 +43,9 @@ export type PhoneSurface =
  * Files rides `sync` exactly as the desktop's nav entry does (Story 66.3,
  * AD-200): where no folder can be synced there is nothing to browse. Notes
  * rides `notes`, which since Story 66.4 is `sync` on every tier — a vault is
- * a synced folder, and the phone has the folder now.
+ * a synced folder, and the phone has the folder now. Sessions rides `sessions`,
+ * which on a phone is true only while a folder there has a sessions zone (98.2,
+ * `sessions_capability_of`); the Tasks view has no phone surface.
  */
 export function phoneSurfaceFor(
   view: PrimaryView,
@@ -57,6 +60,8 @@ export function phoneSurfaceFor(
       return capabilities.sync ? "files" : null;
     case "notes":
       return capabilities.notes ? "notes" : null;
+    case "sessions":
+      return capabilities.sessions ? "sessions" : null;
     case "approval":
     case "bridges":
     case "settings":
