@@ -241,6 +241,10 @@ function toRenderedRows(items: TimelineItemVm[], approvals: ApprovalVm[]): Rende
   return rendered;
 }
 
+/** What a gate room says where the composer would be (UX-DR147). */
+export const GATE_OBSERVER =
+  "You watch this room: what is written here reaches the outside system and whoever it shares with. Decide its tickets on the hour's card.";
+
 export function ConversationBody({
   accountId,
   roomId,
@@ -261,6 +265,10 @@ export function ConversationBody({
   // every other room. Drawn on the phone too: it is not part of the pane's
   // own header row.
   const agentHeader = useConversationTimeline((s) => s.header);
+  // A gate's room (UX-DR147): the person watches. Everything that would write
+  // into it — the composer, reply, edit, reactions, dropped files, typing — is
+  // absent; the guard is the host ignoring an observer's text, this is UX.
+  const gateRoom = agentHeader?.gate != null;
   // An agent room's approval requests, by id; the stream's `approval` items say
   // where each is drawn.
   const approvals = useConversationTimeline((s) => s.approvals);
@@ -571,7 +579,7 @@ export function ConversationBody({
   // asynchronously, so a late listener is unlistened immediately if we already
   // unmounted.
   useEffect(() => {
-    if (!acceptsWindowDrops || accountId === null || roomId === null) {
+    if (gateRoom || !acceptsWindowDrops || accountId === null || roomId === null) {
       return;
     }
     let unlisten: (() => void) | null = null;
@@ -612,7 +620,7 @@ export function ConversationBody({
       cancelled = true;
       unlisten?.();
     };
-  }, [accountId, roomId, acceptsWindowDrops, tray]);
+  }, [accountId, roomId, acceptsWindowDrops, gateRoom, tray]);
 
   // Scroll management on timeline change (Story 3.9). Preserves the user's visual
   // position when older history prepends (compensating scrollTop by the height
@@ -881,7 +889,7 @@ export function ConversationBody({
   const onReply = useCallback(
     (key: string) => {
       const target = items.find((it) => it.kind === "message" && it.key === key);
-      if (target?.kind !== "message") {
+      if (gateRoom || target?.kind !== "message") {
         return;
       }
       composer.getState().startReply({
@@ -890,19 +898,19 @@ export function ConversationBody({
         bodyPreview: previewOf(target.body),
       });
     },
-    [items, composer],
+    [items, composer, gateRoom],
   );
 
   const onEdit = useCallback(
     (key: string) => {
       const target = items.find((it) => it.kind === "message" && it.key === key);
       // Only own text messages are editable (Rust also gates on `is_editable()`).
-      if (target?.kind !== "message" || !target.isOwn) {
+      if (gateRoom || target?.kind !== "message" || !target.isOwn) {
         return;
       }
       composer.getState().startEdit({ targetKey: key, body: target.body }, "");
     },
-    [items, composer],
+    [items, composer, gateRoom],
   );
 
   // Resolve a Delete intent on a HELD (still-in-window) bubble as an UNDO, never a
@@ -961,12 +969,12 @@ export function ConversationBody({
   // swallowed so it is never an unhandled promise.
   const onToggleReaction = useCallback(
     (key: string, emoji: string) => {
-      if (accountId === null || roomId === null) {
+      if (gateRoom || accountId === null || roomId === null) {
         return;
       }
       toggleReaction(accountId, roomId, key, emoji).catch(() => {});
     },
-    [accountId, roomId],
+    [accountId, roomId, gateRoom],
   );
 
   // Open the Quick-Look preview overlay for a media message (Story 3.6). The
@@ -1317,12 +1325,12 @@ export function ConversationBody({
                     onRetry={onRetry}
                     offline={offline}
                     reducedCapability={reducedCapability}
-                    onReply={onReply}
-                    onEdit={onEdit}
+                    onReply={gateRoom ? undefined : onReply}
+                    onEdit={gateRoom ? undefined : onEdit}
                     onDelete={onDelete}
                     onJumpTo={onJumpTo}
                     selected={selectedKey === row.item.key}
-                    onToggleReaction={onToggleReaction}
+                    onToggleReaction={gateRoom ? undefined : onToggleReaction}
                     onOpenPreview={onOpenPreview}
                     onCancelSend={onCancelSend}
                     growing={caretKey === row.item.key}
@@ -1381,7 +1389,18 @@ export function ConversationBody({
           </ol>
         </div>
       )}
-      {roomId !== null && (
+      {roomId !== null && gateRoom && (
+        // A gate's room (UX-DR147): the person watches; anything written here
+        // would reach the outside system and whoever it shares with, and the
+        // gate never takes it as a request. The only control is the hour's card.
+        <p
+          data-testid="gate-observer"
+          className="shrink-0 border-border border-t px-4 py-3 text-center text-muted-foreground text-xs"
+        >
+          {GATE_OBSERVER}
+        </p>
+      )}
+      {roomId !== null && !gateRoom && (
         <div
           data-testid="composer-footer"
           // Phone (Story 13.5): the footer bottom-insets by the live keyboard

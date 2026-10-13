@@ -135,6 +135,7 @@ function header(scope: string[]): AgentRoomHeaderVm {
     label: null,
     scopeUnreadable: null,
     caretKey: null,
+    gate: null,
   };
 }
 

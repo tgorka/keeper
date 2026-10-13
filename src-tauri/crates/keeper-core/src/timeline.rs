@@ -32,7 +32,7 @@ use matrix_sdk::encryption::VerificationState;
 use matrix_sdk::event_cache::PaginationStatus;
 use matrix_sdk::event_cache::{RoomEventCacheSubscriber, RoomEventCacheUpdate};
 use matrix_sdk::ruma::events::room::message::MessageType;
-use matrix_sdk::ruma::{OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, UserId};
+use matrix_sdk::ruma::{EventId, OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, UserId};
 use matrix_sdk::{Client, Room, RoomInfo};
 use matrix_sdk_ui::eyeball_im::{Vector, VectorDiff};
 use matrix_sdk_ui::timeline::{
@@ -46,6 +46,7 @@ use tokio::sync::watch;
 use crate::account::{PaginationSink, TimelineSink};
 use crate::agents::approval_card::{ApprovalVm, HostedRooms, Viewer};
 use crate::agents::events::FINAL_CUT_BYTES;
+use crate::agents::gate_room::{GateInput, GateView};
 use crate::agents::heard::{split_utf16, HeardMarkVm, RoomMarks};
 use crate::agents::room::{
     self, AgentIcons, AgentKinds, AgentRoomHeaderVm, AgentRoomKind, HeaderReader, TurnTrust,
@@ -446,6 +447,9 @@ pub fn item_to_vm(
                 brief: turns
                     .brief(own_user_id, ev.sender(), json, message.is_edited())
                     .map(Box::new),
+                gate: gate_input(item)
+                    .and_then(|message| turns.gate_line(own_user_id, message))
+                    .map(Box::new),
             }
         }
         // An event that cannot be decrypted yet: surface an honest stub. No
@@ -685,6 +689,9 @@ struct AgentHeader {
     cross_signed: bool,
     /// The rooms whose agent this app hosts.
     hosted: Arc<HostedRooms>,
+    /// In a gate room, what its loaded timeline says of each request
+    /// (UX-DR147); `None` in any other session room.
+    gate: Option<GateView>,
 }
 
 /// What redraws the approval cards without an event in the room: this
@@ -723,9 +730,50 @@ async fn next_recheck(recheck: &mut Option<Recheck>, expiry: Option<DateTime<Utc
 
 impl AgentHeader {
     /// Who may stream an answer or hand work on here: an agent of this
-    /// session room, under what the reader last read of it.
+    /// session room, under what the reader last read of it, and in a gate
+    /// room what its loaded timeline says of each request.
     fn turns(&self) -> TurnTrust<'_> {
-        self.reader.turns()
+        TurnTrust {
+            gate: self.gate.as_ref(),
+            ..self.reader.turns()
+        }
+    }
+
+    /// Read the gate room's requests again from the loaded items — only
+    /// in a room whose status says it is a gate's; the positions of the
+    /// loaded messages drawn differently now.
+    fn regate(&mut self) -> Vec<usize> {
+        let view = self.reader.state().gate_system().is_some().then(|| {
+            let turns = self.reader.turns();
+            GateView::of(
+                self.loaded.iter().filter_map(|item| gate_input(item)),
+                &self.own_user_id,
+                &|user| turns.is_agent(user),
+            )
+        });
+        if view == self.gate {
+            return Vec::new();
+        }
+        let before = std::mem::replace(&mut self.gate, view);
+        self.gated(TurnTrust {
+            gate: before.as_ref(),
+            ..self.reader.turns()
+        })
+    }
+
+    /// The positions of the loaded messages whose gate line `before` drew
+    /// otherwise than the room draws it now.
+    fn gated(&self, before: TurnTrust<'_>) -> Vec<usize> {
+        let after = self.turns();
+        let own = &self.own_user_id;
+        self.loaded
+            .iter()
+            .enumerate()
+            .filter_map(|(at, item)| {
+                let message = gate_input(item)?;
+                (before.gate_line(own, message) != after.gate_line(own, message)).then_some(at)
+            })
+            .collect()
     }
 
     /// Note the answer anchors among `items` (a snapshot when `reset`).
@@ -765,11 +813,17 @@ impl AgentHeader {
 
     /// The header when it differs from the one last sent.
     async fn changed(&mut self) -> Option<AgentRoomHeaderVm> {
+        let peer = self
+            .gate
+            .as_ref()
+            .and_then(GateView::peer)
+            .map(ToOwned::to_owned);
         let header = self
             .reader
             .header(
                 &self.icons,
                 self.newest_turn.as_ref().map(|(_, key)| key.as_str()),
+                peer.as_deref(),
             )
             .await;
         if self.sent.as_ref() == Some(&header) {
@@ -818,22 +872,38 @@ impl AgentHeader {
         (!(first && heard.is_empty())).then_some(heard)
     }
 
-    /// Read again whose brief to draw and who reads it; the positions of
-    /// the loaded messages it draws differently now.
+    /// Read again whose brief to draw, who reads it and, in a gate room,
+    /// what the gate said of each request under the power read now (its
+    /// view keys requests and the peer on who holds an agent's power); the
+    /// positions of the loaded messages it draws differently now.
     async fn rebrief(&mut self) -> Vec<usize> {
         let before = self.reader.refresh(&self.icons).await;
-        self.rebriefed(before.turns())
+        let mut positions = self.rebriefed(before.turns());
+        positions.extend(self.regate());
+        positions.sort_unstable();
+        positions.dedup();
+        positions
     }
 
     /// The positions of the loaded messages drawn differently now than
-    /// under `before`.
+    /// under `before`: its brief, or its gate line (whose sender holds an
+    /// agent's power may have changed).
     fn rebriefed(&self, before: TurnTrust<'_>) -> Vec<usize> {
-        room::rebriefed(
+        let mut positions = room::rebriefed(
             self.loaded.iter().map(|item| brief_input(item)),
             &self.own_user_id,
             before,
             self.turns(),
-        )
+        );
+        if self.gate.is_some() {
+            positions.extend(self.gated(TurnTrust {
+                gate: self.gate.as_ref(),
+                ..before
+            }));
+            positions.sort_unstable();
+            positions.dedup();
+        }
+        positions
     }
 
     /// The `Set`s that draw the loaded items at `positions` again.
@@ -877,6 +947,29 @@ fn brief_input(item: &TimelineItem) -> Option<(&UserId, Option<&str>, bool)> {
         ev.original_json().map(|raw| raw.json().get()),
         message.is_edited(),
     ))
+}
+
+/// A loaded item as a gate room reads it ([`GateView`]): a message's event
+/// id, sender, original event, whether it was edited and its sender's
+/// display name; `None` for any other item.
+fn gate_input(item: &TimelineItem) -> Option<GateInput<'_>> {
+    let ev = item.as_event()?;
+    let TimelineItemContent::MsgLike(msg_like) = ev.content() else {
+        return None;
+    };
+    let MsgLikeKind::Message(message) = &msg_like.kind else {
+        return None;
+    };
+    Some(GateInput {
+        event: ev.event_id().map(EventId::as_str),
+        sender: ev.sender(),
+        json: ev.original_json().map(|raw| raw.json().get()),
+        edited: message.is_edited(),
+        name: match ev.sender_profile() {
+            TimelineDetails::Ready(profile) => profile.display_name.as_deref(),
+            _ => None,
+        },
+    })
 }
 
 /// The mark the room draws in `item` (97.3, UX-DR143): an agent's streamed
@@ -1052,7 +1145,7 @@ pub async fn forward_timeline(
             let mut reader = HeaderReader::open(room.clone(), &kinds).await;
             reader.refresh(&icons).await;
             fetch_members(&mut fetch, &reader, &room);
-            let header = AgentHeader {
+            let mut header = AgentHeader {
                 reader,
                 own_user_id: own_user_id.clone(),
                 newest_turn: None,
@@ -1064,7 +1157,9 @@ pub async fn forward_timeline(
                 heard_sent: None,
                 cross_signed: room::own_device_cross_signed(&room.client()).await,
                 hosted,
+                gate: None,
             };
+            header.regate();
             (
                 Some(header),
                 updates,
@@ -1141,6 +1236,9 @@ pub async fn forward_timeline(
                         header.see_diff(diff);
                     }
                 }
+                // A gate's word on a request redraws the request it names,
+                // after the items that carry it.
+                let regated = header.as_mut().map(AgentHeader::regate).unwrap_or_default();
                 let turns = header
                     .as_ref()
                     .map_or_else(TurnTrust::default, AgentHeader::turns);
@@ -1154,6 +1252,9 @@ pub async fn forward_timeline(
                         turns,
                     ))
                 }));
+                if let Some(header) = &header {
+                    ops.extend(header.redraw(regated, &index, &account_id, &room_id_str));
+                }
                 let (changed, heard) = match &mut header {
                     Some(header) => (header.changed().await, header.heard_changed()),
                     None => (None, None),
@@ -1188,6 +1289,11 @@ pub async fn forward_timeline(
                         false
                     }
                 };
+                if folded {
+                    // A status may say only now that this is a gate's room.
+                    let positions = header.regate();
+                    ops.extend(header.redraw(positions, &index, &account_id, &room_id_str));
+                }
                 let changed = if folded { header.changed().await } else { None };
                 let approvals = if folded {
                     header.approvals_changed().await
@@ -1204,7 +1310,13 @@ pub async fn forward_timeline(
                 let positions = header.rebrief().await;
                 fetch_members(&mut fetch, &header.reader, &room);
                 let ops = header.redraw(positions, &index, &account_id, &room_id_str);
-                TimelineBatch { ops, header: None, approvals: None, heard: header.heard_changed() }
+                TimelineBatch {
+                    ops,
+                    // A gate room's peer is read again with its levels.
+                    header: header.changed().await,
+                    approvals: None,
+                    heard: header.heard_changed(),
+                }
             }
             () = next_fetch(&mut fetch) => {
                 // A fetch that completes the list marks the room's members
@@ -1380,6 +1492,7 @@ mod tests {
             media: None,
             readers: Vec::new(),
             brief: None,
+            gate: None,
         }
     }
 

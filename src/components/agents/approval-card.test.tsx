@@ -18,6 +18,9 @@ import {
   APPROVAL_SENT,
   ApprovalRequest,
   approvalListName,
+  GATE_DENY_ALL,
+  GATE_DENY_ALL_SENT,
+  gateCardName,
 } from "@/components/agents/approval-card";
 import { verificationStore } from "@/lib/stores/verification";
 
@@ -57,12 +60,13 @@ function card(over: Partial<ApprovalCardVm> = {}): ApprovalCardVm {
     declassify: null,
     run: null,
     kvm: null,
+    gate: null,
     ...over,
   };
 }
 
 function draw(...cards: ApprovalCardVm[]) {
-  const approval: ApprovalVm = { id: cards[0].id, cards };
+  const approval: ApprovalVm = { id: cards[0].id, cards, gate: null };
   return render(<ApprovalRequest approval={approval} accountId={ACCOUNT} roomId={ROOM} />);
 }
 
@@ -292,6 +296,7 @@ describe("ApprovalRequest — what the card shows (UX-DR136)", () => {
         approval={{
           id: approved.id,
           cards: [{ ...approved, state: { state: "expired" }, canDecide: false }],
+          gate: null,
         }}
       />,
     );
@@ -311,6 +316,7 @@ describe("ApprovalRequest — what the card shows (UX-DR136)", () => {
         approval={{
           id: pending.id,
           cards: [{ ...pending, state: { state: "consumed" }, canDecide: false }],
+          gate: null,
         }}
       />,
     );
@@ -442,7 +448,7 @@ describe("ApprovalRequest — deciding", () => {
       <ApprovalRequest
         accountId={ACCOUNT}
         roomId={ROOM}
-        approval={{ id: first.id, cards: [first, card({ id: "02A" })] }}
+        approval={{ id: first.id, cards: [first, card({ id: "02A" })], gate: null }}
       />,
     );
     expect(screen.getByLabelText("Note for the agent (optional)")).toHaveValue("Keep this file");
@@ -462,7 +468,7 @@ describe("ApprovalRequest — deciding", () => {
       <ApprovalRequest
         accountId={ACCOUNT}
         roomId={ROOM}
-        approval={{ id: first.id, cards: [first, card({ id: "02A" })] }}
+        approval={{ id: first.id, cards: [first, card({ id: "02A" })], gate: null }}
       />,
     );
     const row = within(screen.getAllByRole("article")[0]);
@@ -482,7 +488,7 @@ describe("ApprovalRequest — deciding", () => {
       <ApprovalRequest
         accountId={ACCOUNT}
         roomId={ROOM}
-        approval={{ id: first.id, cards: [first, card({ id: "02A" })] }}
+        approval={{ id: first.id, cards: [first, card({ id: "02A" })], gate: null }}
       />,
     );
     const row = within(screen.getAllByRole("article")[0]);
@@ -630,5 +636,150 @@ describe("ApprovalRequest — an attached action", () => {
     const sent = await screen.findByRole("figure", { name: "What will be sent to desk" });
     expect(within(sent).getByRole("listitem")).toHaveTextContent("paste 900 characters");
     expect(screen.queryByText(/approve me/)).toBeNull();
+  });
+});
+
+describe("ApprovalRequest — a gate's hour card (UX-DR160)", () => {
+  const FROM = Date.UTC(2026, 9, 13, 9, 0);
+  const row = (id: string, request: string | null, over: Partial<ApprovalCardVm> = {}) =>
+    card({
+      id,
+      bindingDigest: `sha256:${id.toLowerCase()}`,
+      tool: "delegate",
+      summary: "Hand work to tola-grey",
+      scopes: [{ scope: "once", label: "Approve once", detail: "This action once." }],
+      gate: { request, ticket: id, to: '"tola-grey"' },
+      ...over,
+    });
+  const hour = (cards: ApprovalCardVm[], denyAll: string[]): ApprovalVm => ({
+    id: cards[0].id,
+    cards,
+    gate: { system: "github", from: FROM, until: FROM + 3_600_000, denyAll },
+  });
+  const drawHour = (approval: ApprovalVm) =>
+    render(<ApprovalRequest approval={approval} accountId={ACCOUNT} roomId={ROOM} />);
+
+  it("is one card even with one ticket: the system, its hour, and each row's request, ticket and agent", () => {
+    drawHour(hour([row("01JT1", '"pr-12"')], ["01JT1"]));
+    const group = screen.getByRole("region", { name: gateCardName("github", 1) });
+    expect(within(group).getByText("github")).toBeInTheDocument();
+    const shown = within(group).getByRole("article");
+    expect(within(shown).getByText('"pr-12"')).toBeInTheDocument();
+    expect(within(shown).getByText("01JT1")).toBeInTheDocument();
+    expect(within(shown).getByText('"tola-grey"')).toBeInTheDocument();
+    expect(within(shown).getByRole("button", { name: "Approve once" })).toBeEnabled();
+    expect(within(group).getByRole("button", { name: GATE_DENY_ALL })).toBeEnabled();
+  });
+
+  it("denies every waiting row Rust lists, each by its own record, after saying how many", async () => {
+    agentApprovalDecide.mockResolvedValue(undefined);
+    const decided = row("01JT0", '"pr-9"', {
+      state: { state: "decided", decision: "deny", scope: "once", by: MARTA.user, byName: "Marta" },
+    });
+    const cannot = row("01JT3", null, {
+      canDecide: false,
+      cannotDecide: "You are not one of the people who can decide this.",
+    });
+    drawHour(
+      hour([decided, row("01JT1", '"pr-12"'), row("01JT2", null), cannot], ["01JT1", "01JT2"]),
+    );
+    fireEvent.click(screen.getByRole("button", { name: GATE_DENY_ALL }));
+    expect(agentApprovalDecide).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Deny 2 waiting requests" }));
+    expect(await screen.findByText(GATE_DENY_ALL_SENT)).toBeVisible();
+    expect(agentApprovalDecide.mock.calls.map(([, , req]) => req)).toEqual([
+      { id: "01JT1", bindingDigest: "sha256:01jt1", decision: "deny", scope: "once", note: null },
+      { id: "01JT2", bindingDigest: "sha256:01jt2", decision: "deny", scope: "once", note: null },
+    ]);
+    // The decided row keeps its verdict.
+    expect(screen.getByText("Denied by Marta.")).toBeInTheDocument();
+  });
+
+  it("offers no Deny all when no row waits for this device, and starts over when the card grows", async () => {
+    agentApprovalDecide.mockResolvedValue(undefined);
+    const { rerender } = drawHour(hour([row("01JT1", null, { canDecide: false })], []));
+    expect(screen.queryByRole("button", { name: GATE_DENY_ALL })).toBeNull();
+    const grown = (ids: string[]) => (
+      <ApprovalRequest
+        approval={hour(
+          [row("01JT1", null, { canDecide: false }), ...ids.map((id) => row(id, null))],
+          ids,
+        )}
+        accountId={ACCOUNT}
+        roomId={ROOM}
+      />
+    );
+    rerender(grown(["01JT2"]));
+    fireEvent.click(screen.getByRole("button", { name: GATE_DENY_ALL }));
+    fireEvent.click(screen.getByRole("button", { name: "Deny the 1 waiting request" }));
+    expect(await screen.findByText(GATE_DENY_ALL_SENT)).toBeVisible();
+    // A ticket joins the card before the room has the denial: Deny all is offered
+    // again, over the rows Rust lists now less the one already sent.
+    rerender(grown(["01JT2", "01JT3"]));
+    fireEvent.click(screen.getByRole("button", { name: GATE_DENY_ALL }));
+    fireEvent.click(screen.getByRole("button", { name: "Deny the 1 waiting request" }));
+    await screen.findByText(GATE_DENY_ALL_SENT);
+    expect(agentApprovalDecide.mock.calls.map(([, , req]) => req.id)).toEqual(["01JT2", "01JT3"]);
+  });
+
+  it("a send that stops part-way says how many went, and offers only the rows not sent", async () => {
+    const refused = { message: "This approval is no longer waiting for a decision." };
+    agentApprovalDecide.mockResolvedValueOnce(undefined).mockRejectedValueOnce(refused);
+    const ids = ["01JT1", "01JT2", "01JT3"];
+    drawHour(
+      hour(
+        ids.map((id) => row(id, null)),
+        ids,
+      ),
+    );
+    fireEvent.click(screen.getByRole("button", { name: GATE_DENY_ALL }));
+    fireEvent.click(screen.getByRole("button", { name: "Deny 3 waiting requests" }));
+    // The person reads that one of the three went, not that nothing was decided.
+    expect(await screen.findByText(/\b1 of 3\b/)).toBeVisible();
+    expect(screen.queryByText(/Nothing was decided/)).toBeNull();
+    agentApprovalDecide.mockResolvedValue(undefined);
+    fireEvent.click(screen.getByRole("button", { name: GATE_DENY_ALL }));
+    fireEvent.click(screen.getByRole("button", { name: "Deny 2 waiting requests" }));
+    await screen.findByText(GATE_DENY_ALL_SENT);
+    expect(agentApprovalDecide.mock.calls.map(([, , req]) => req.id)).toEqual([
+      "01JT1",
+      "01JT2",
+      "01JT2",
+      "01JT3",
+    ]);
+  });
+
+  it("offers nothing again while a send is going, though the room has its first denial", async () => {
+    let second!: () => void;
+    agentApprovalDecide
+      .mockResolvedValueOnce(undefined)
+      .mockReturnValueOnce(new Promise<void>((resolve) => (second = resolve)));
+    const cards = [row("01JT1", null), row("01JT2", null)];
+    const { rerender } = drawHour(hour(cards, ["01JT1", "01JT2"]));
+    fireEvent.click(screen.getByRole("button", { name: GATE_DENY_ALL }));
+    fireEvent.click(screen.getByRole("button", { name: "Deny 2 waiting requests" }));
+    await waitFor(() => expect(agentApprovalDecide).toHaveBeenCalledTimes(2));
+    // The first denial's echo: Rust lists only the row still in flight.
+    rerender(
+      <ApprovalRequest approval={hour(cards, ["01JT2"])} accountId={ACCOUNT} roomId={ROOM} />,
+    );
+    expect(screen.queryByRole("button", { name: GATE_DENY_ALL })).toBeNull();
+    act(() => second());
+    expect(await screen.findByText(GATE_DENY_ALL_SENT)).toBeVisible();
+    expect(screen.queryByRole("button", { name: GATE_DENY_ALL })).toBeNull();
+  });
+
+  it("says a failed send in keeper's words and leaves the rest to try again", async () => {
+    agentApprovalDecide.mockRejectedValueOnce({
+      message: "This approval is no longer waiting for a decision.",
+    });
+    drawHour(hour([row("01JT1", null), row("01JT2", null)], ["01JT1", "01JT2"]));
+    fireEvent.click(screen.getByRole("button", { name: GATE_DENY_ALL }));
+    fireEvent.click(screen.getByRole("button", { name: "Deny 2 waiting requests" }));
+    expect(
+      await screen.findByText("This approval is no longer waiting for a decision."),
+    ).toBeVisible();
+    expect(agentApprovalDecide).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("button", { name: GATE_DENY_ALL })).toBeEnabled();
   });
 });

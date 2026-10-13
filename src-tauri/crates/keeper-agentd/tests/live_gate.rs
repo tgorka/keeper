@@ -523,6 +523,26 @@ async fn gate_room_power_levels_hold() {
             encrypted,
             "{system}"
         );
+        if !encrypted {
+            // UX-DR147: beside its status anchor the gate posts one scope —
+            // no drives, its opening label — which a person's keeper draws
+            // as the room's label chip. The clear room shows it in clear.
+            let scopes: Vec<Value> = timeline(&smoke, room.as_str())
+                .await
+                .into_iter()
+                .filter(|event| event["type"] == events::SCOPE)
+                .collect();
+            assert_eq!(scopes.len(), 1, "{scopes:?}");
+            assert_eq!(scopes[0]["sender"], smoke.user("nixi-smoke").as_str());
+            let content = &scopes[0]["content"];
+            assert_eq!(content["drives"], json!([]), "{content}");
+            assert_eq!(
+                content["label"],
+                json!({"readers": "*", "integrity": "untrusted"}),
+                "{content}"
+            );
+            assert_eq!(content["set_by"], person.as_str(), "{content}");
+        }
         let levels = state_of(&state, "m.room.power_levels", "").expect("levels");
         let levels_event = OwnedEventId::try_from(levels["event_id"].as_str().expect("event id"))
             .expect("event id");

@@ -457,7 +457,7 @@ mod dm {
 
     use keeper_core::agents::drive::DriveDecl;
     use keeper_core::agents::events::{
-        RunState, StatusContent, CONTENT_VERSION, SESSION_ROOM_TYPE, STATUS,
+        RunState, ScopeContent, StatusContent, CONTENT_VERSION, SCOPE, SESSION_ROOM_TYPE, STATUS,
     };
     use keeper_core::agents::gate::{self, gate_session, gate_session_id};
     use keeper_core::agents::home::{AgentConfig, GateConfig};
@@ -577,6 +577,7 @@ mod dm {
             title: MAIN_TITLE,
             sessions_subfolder,
             host,
+            scope: None,
         };
         client
             .sync_once()
@@ -836,9 +837,14 @@ mod dm {
         title: &'a str,
         sessions_subfolder: &'a str,
         host: &'a str,
+        /// The scope sent with the anchor: a gate room's opening label,
+        /// which a person's keeper draws as the room's label chip
+        /// (UX-DR147); `None` for any other room.
+        scope: Option<ScopeContent>,
     }
 
-    /// The status anchor in `room`, sent only when the room has none.
+    /// The status anchor in `room`, sent only when the room has none, and
+    /// the anchor's scope right after it.
     async fn ensure_anchor(
         client: &AgentClient,
         me: &UserId,
@@ -868,8 +874,15 @@ mod dm {
         client
             .send(room, STATUS, content, None)
             .await
-            .map(|_| ())
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        if let Some(scope) = &anchor.scope {
+            let content = serde_json::to_value(scope).map_err(|error| error.to_string())?;
+            client
+                .send(room, SCOPE, content, None)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
     }
 
     /// A gate's room and its gate session (99.1 #5).
@@ -933,6 +946,17 @@ mod dm {
             title: &gate.system,
             sessions_subfolder,
             host,
+            // The gate reads no drive (codemap Q1): no drives, and the
+            // label everything said here is under — the audience, at
+            // `untrusted` for life (AD-416). It names no one the room does
+            // not already hold: the peer and the approvers.
+            scope: Some(ScopeContent {
+                v: CONTENT_VERSION,
+                drives: Some(Vec::new()),
+                label: Some(Label::gate_opening(&gate.audience, agent.local_only)),
+                focus: None,
+                set_by: owner.to_owned(),
+            }),
         };
         let id = gate_session_id(&agent.drive, &agent.id, &gate.system);
         client

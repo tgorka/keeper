@@ -428,10 +428,16 @@ pub fn classify_notification(event: &Value, ctx: &PushContext<'_>) -> Classified
             let Some(records) = request_records(content) else {
                 return Classified::Drop;
             };
-            let [record] = records.as_slice() else {
+            // A coalesced card — a gate's hour of tickets (UX-DR160) —
+            // offers no decision even while it holds one record: it grows,
+            // and a card of several requests never fits on a lock screen.
+            let ([record], false) = (records.as_slice(), content.get("records").is_some()) else {
                 let tier = records.iter().map(|r| r.tier).max().unwrap_or(0);
                 return shown(
-                    format!("{agent} asks for {} decisions", records.len()),
+                    match records.len() {
+                        1 => format!("{agent} asks for a decision"),
+                        n => format!("{agent} asks for {n} decisions"),
+                    },
                     None,
                     open_body(tier),
                     None,
@@ -1596,6 +1602,15 @@ mod tests {
         assert_eq!(many.title, "Nixi asks for 2 decisions");
         assert_eq!(many.category, None);
         assert_eq!(many.approval, None);
+        // UX-DR160: the hour's first ticket is a card of one that grows —
+        // it offers no *Approve once* either, though its one record fits.
+        let first = json!({"v": 1, "records": [fitting.clone()]});
+        let one = shown(classify_notification(
+            &event(APPROVAL_REQUEST_TYPE, "$r", NIXI, first),
+            &base,
+        ));
+        assert_eq!(one.title, "Nixi asks for a decision");
+        assert_eq!((one.category, one.approval), (None, None));
 
         // The proxy's answer anchor: the placeholder is never shown.
         let anchor_content =

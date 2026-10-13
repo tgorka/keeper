@@ -3494,7 +3494,9 @@ decides. The SHA-256 on the card is the record's own: what goes is the text the 
 never a later line of the turn.
 
 Every status and scope a gate would post is held the same way: a gate's turn posts neither, so
-nothing in the room names a path, a title or a heading a delegate read.
+nothing in the room names a path, a title or a heading a delegate read. The room's one scope is the
+one `agents gate` posts beside its status anchor when it makes the room: no drives, and the gate's
+opening label — its audience, `untrusted` — which names no one the room does not already hold.
 
 ### What an outside system cannot make an agent do
 
@@ -3527,6 +3529,37 @@ What the room still lets the peer do is recorded: an `m.room.encrypted` event in
 (DW-1335 — a gate's turn itself posts no status), and a `[[trust]]` that names the peer only
 after the room was made (DW-1336). An approval decision, a `heard` mark or a surface result from
 the peer counts for nothing (DW-1333, closed).
+
+### A gate's room in keeper
+
+You watch a gate's room; you do not talk in it (UX-DR147): it has no composer, and its messages
+offer no reply, edit or reaction, and no file dropped on the window lands there. Its header says
+**Gate for** the system the gate is the door for, then the outside system's account — by its display
+name, quoted and cut, and its Matrix id — once the gate has answered one of its requests; until then
+*no request answered yet*. The label chip shows who may read what is said there: `*` reads *Anyone
+the system shares with*, always `untrusted`.
+
+A message is drawn as a **request** only once the gate has spoken of it: the outside system's text
+quoted as data — a dashed outline, in a monospace quote, never the agent's card — under the
+request's name and its state chip: *answered*, *ticket*, *result* or *refused* with its reason
+(*busy*, *declined by a person*, *held back by its owner*, …), and a sync request the deadline the
+gate held it to. It is signed by its sender's display name quoted, as the system chose it. A
+ticketed request names its ticket by id, and once its result is in, the session that worked it. The
+gate's own messages are headed by the request they speak of. A message the gate never answered, and
+anyone's look-alike of the gate's words — the peer's included — is drawn as an ordinary message:
+keeper takes a gate's word only from the room's member at an agent's power. So is a request the
+outside system edited after the gate spoke of it: the gate never reads an edit, so its word does not
+stand over the new text.
+
+Your one control is **the hour's card** (UX-DR160). It names the system and the hour it covers; each
+line is one ticket — the request it serves, its ticket, the agent it would go to, its tier and the
+exact brief or journal entry — with *Approve once* and *Deny*. **Deny all** denies, after a second
+press says how many, every line still waiting that this device may decide: one decision per line,
+each naming its own record. A line whose denial went is never offered again, and if the sending
+stops part-way the card says how many of how many were denied. A decided line keeps its verdict and
+*Deny all* passes it by; a ticket refused `busy` never reaches a card. The card's notification
+offers no *Approve once*, even for its first ticket: the card grows, and a card of several requests
+never fits on a lock screen.
 
 ## Workflows
 

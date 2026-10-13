@@ -2,6 +2,7 @@
 import type { ApprovalPersonVm } from "./ApprovalPersonVm";
 import type { ApprovalStateVm } from "./ApprovalStateVm";
 import type { DeclassifyVm } from "./DeclassifyVm";
+import type { GateRowVm } from "./GateRowVm";
 import type { KvmCardVm } from "./KvmCardVm";
 import type { RunCardVm } from "./RunCardVm";
 import type { ScopeOfferVm } from "./ScopeOfferVm";
@@ -84,4 +85,10 @@ run: RunCardVm | null,
  * other tool, or when the action is attached — [`attached_payload`]
  * then draws it.
  */
-kvm: KvmCardVm | null, };
+kvm: KvmCardVm | null, 
+/**
+ * A row of a gate's hour card (UX-DR160): the request it serves, its
+ * ticket and the agent the work would go to; `None` outside a gate
+ * room.
+ */
+gate: GateRowVm | null, };

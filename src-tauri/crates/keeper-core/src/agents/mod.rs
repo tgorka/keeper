@@ -23,6 +23,7 @@ pub mod drive;
 pub mod events;
 pub mod focus;
 pub mod gate;
+pub mod gate_room;
 pub mod heard;
 pub mod helper;
 pub mod home;

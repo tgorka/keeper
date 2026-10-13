@@ -140,6 +140,7 @@ function messageItem(key: string, sender: string, body: string): TimelineItemVm 
     media: null,
     readers: [],
     brief: null,
+    gate: null,
   };
 }
 
@@ -270,6 +271,7 @@ describe("ConversationPane", () => {
               media: null,
               readers: [],
               brief: null,
+              gate: null,
             },
             { kind: "other", key: "o1" },
           ],
@@ -314,6 +316,7 @@ describe("ConversationPane", () => {
       declassify: null,
       run: null,
       kvm: null,
+      gate: null,
     };
 
     await waitFor(() => expect(captured.onBatch).not.toBeNull());
@@ -329,7 +332,7 @@ describe("ConversationPane", () => {
             ],
           },
         ],
-        approvals: [{ id: "01A", cards: [card] }],
+        approvals: [{ id: "01A", cards: [card], gate: null }],
       });
     });
 
@@ -362,6 +365,7 @@ describe("ConversationPane", () => {
                 },
               },
             ],
+            gate: null,
           },
         ],
       });
@@ -400,6 +404,7 @@ describe("ConversationPane", () => {
       declassify: null,
       run: null,
       kvm: null,
+      gate: null,
     });
 
     await waitFor(() => expect(captured.onBatch).not.toBeNull());
@@ -416,8 +421,8 @@ describe("ConversationPane", () => {
           },
         ],
         approvals: [
-          { id: "01B", cards: [request("01B", "Write b.md in tgdrive")] },
-          { id: "01A", cards: [request("01A", "Write a.md in tgdrive")] },
+          { id: "01B", cards: [request("01B", "Write b.md in tgdrive")], gate: null },
+          { id: "01A", cards: [request("01A", "Write a.md in tgdrive")], gate: null },
         ],
       });
     });
@@ -549,6 +554,7 @@ describe("ConversationPane", () => {
             media: null,
             readers: [],
             brief: null,
+            gate: null,
           },
         },
       ],
@@ -592,6 +598,7 @@ describe("ConversationPane", () => {
               media: null,
               readers: [],
               brief: null,
+              gate: null,
             },
             {
               kind: "message",
@@ -608,6 +615,7 @@ describe("ConversationPane", () => {
               media: null,
               readers: [],
               brief: null,
+              gate: null,
             },
           ],
         },
@@ -858,6 +866,7 @@ describe("ConversationPane", () => {
               },
               readers: [],
               brief: null,
+              gate: null,
             },
           ],
         },
@@ -900,6 +909,7 @@ describe("ConversationPane", () => {
               media: null,
               readers: [],
               brief: null,
+              gate: null,
             },
           ],
         },
@@ -946,6 +956,7 @@ describe("ConversationPane", () => {
               media: null,
               readers: [],
               brief: null,
+              gate: null,
             },
           ],
         },
@@ -1018,6 +1029,7 @@ describe("ConversationPane", () => {
               media: null,
               readers: [],
               brief: null,
+              gate: null,
             },
           ],
         },
@@ -1072,6 +1084,7 @@ describe("ConversationPane", () => {
               media: null,
               readers: [],
               brief: null,
+              gate: null,
             },
           ],
         },
@@ -1134,6 +1147,7 @@ describe("ConversationPane", () => {
               media: null,
               readers: [],
               brief: null,
+              gate: null,
             },
             {
               kind: "message",
@@ -1150,6 +1164,7 @@ describe("ConversationPane", () => {
               media: null,
               readers: [],
               brief: null,
+              gate: null,
             },
           ],
         },
@@ -1209,6 +1224,7 @@ describe("ConversationPane", () => {
               },
               readers: [],
               brief: null,
+              gate: null,
             },
           ],
         },
@@ -1287,6 +1303,7 @@ describe("ConversationPane", () => {
               media: null,
               readers: [],
               brief: null,
+              gate: null,
             },
             {
               kind: "message",
@@ -1303,6 +1320,7 @@ describe("ConversationPane", () => {
               media: null,
               readers: [],
               brief: null,
+              gate: null,
             },
           ],
         },
@@ -1361,6 +1379,7 @@ describe("ConversationPane — held-aware Delete (Story 8.4)", () => {
                 media: null,
                 readers: [],
                 brief: null,
+                gate: null,
               },
             ],
           },
@@ -2166,6 +2185,7 @@ describe("ConversationPane — an agent room", () => {
       label: null,
       scopeUnreadable: null,
       caretKey,
+      gate: null,
     };
   }
 
@@ -2194,6 +2214,38 @@ describe("ConversationPane — an agent room", () => {
     messageItem("old-answer", NIXI, "Earlier answer"),
     messageItem("answer", NIXI, "Synapse"),
   ];
+
+  it("a gate's room offers nothing that writes into it: no composer, reply, edit, reaction or drop (UX-DR147)", async () => {
+    const released = vi.fn();
+    onDragDropEvent.mockImplementation(() => Promise.resolve(released));
+    open();
+    push({
+      ops: [{ op: "reset", items }],
+      header: {
+        ...agentHeader("done", null),
+        gate: { system: "github", peer: "@github:example.org", peerName: '"GitHub"' },
+      },
+    });
+    expect(await screen.findByTestId("gate-observer")).toBeInTheDocument();
+    expect(screen.queryByTestId("composer-footer")).toBeNull();
+    expect(screen.queryByPlaceholderText("Write a message…")).toBeNull();
+    await screen.findByText("Earlier answer");
+    expect(screen.queryByRole("button", { name: "Reply" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Add reaction" })).toBeNull();
+    // The `r` key starts no reply on a selected line.
+    act(() => composerStore.getState().select("question"));
+    fireEvent.keyDown(screen.getByLabelText("Messages"), { key: "r" });
+    expect(composerStore.getState().pending).toBeNull();
+    // Every drop listener registered before the room was known is released.
+    expect(onDragDropEvent).toHaveBeenCalled();
+    await waitFor(() => expect(released).toHaveBeenCalledTimes(onDragDropEvent.mock.calls.length));
+    // Any other agent room keeps its composer and its line actions.
+    push({ ops: [], header: agentHeader("done", null) });
+    expect(await screen.findByTestId("composer-footer")).toBeInTheDocument();
+    expect(screen.getAllByRole("button", { name: "Reply" }).length).toBeGreaterThan(0);
+    fireEvent.keyDown(screen.getByLabelText("Messages"), { key: "r" });
+    await waitFor(() => expect(composerStore.getState().pending).not.toBeNull());
+  });
 
   it("draws the caret on the named answer only while the run is running, then removes it", async () => {
     open();

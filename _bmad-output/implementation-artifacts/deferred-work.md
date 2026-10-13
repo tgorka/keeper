@@ -10528,3 +10528,24 @@ location: `keeper_core::agents::curate::tests::gate_proposals_expire_unread`, `k
 reason: no code path lets a gate session write a proposal (R369's offer; `gate_injection_fixture` refuses `memory_propose`/`skill_propose` `NOT_OFFERED`), so the curator test's fixture is 95.3's `origin = "gate"` file, not a gate session's output. Accepted reading: the re-run on this rung plus the structural refusal satisfy #6; a fixture written by a gate session needs a path that must not exist.
 status: accepted
 
+### DW-1370: A gate room's ticket names the session that works it by its id, not as a link.
+
+origin: epic 99, UX-DR147 (rung `agents-99-ui`, 2026-10-13; R377; codemap §3 row 24)
+location: `keeper_core::agents::gate_room::GateLineVm.ticket`, `src/components/chat/gate-line.tsx`
+reason: the ticket id is the delegation's id and the child session's (AD-368), but the gate room says nothing of the child's room, and a device learns that room only by reading the child's brief in a room the person may not be invited to (the approvers are; a reader who is not an approver is not). Linking needs a device-side index of session rooms by their session id (the child's status names its `session` path, not its id) or the delegate's `parent` read from the child room's first event.
+status: open
+
+### DW-1371: A gate room made before rung `agents-99-ui` draws no label chip.
+
+origin: epic 99, UX-DR147 (rung `agents-99-ui`, 2026-10-13; R377)
+location: `keeper_agent::seed::gate_room` (`ensure_anchor`)
+reason: the room's opening scope is sent with its status anchor only, so `agents gate` on an existing room — its anchor already there — sends none, and a room adopted after a lost folder keeps whatever it had. The same holds when the anchor was sent and the scope's own send then failed (review-99ui-1 R99UI1-08, R379): the scope goes out only after a successful anchor send and is never repaired, so the next `agents gate` finds the anchor and sends nothing. Sending the scope when the room has an anchor but no scope from the gate would cover all three; no room made by this program's earlier rungs exists outside test homeservers.
+status: open
+
+### DW-1372: A gate room's lines are read from the loaded timeline only.
+
+origin: epic 99, UX-DR147 (rung `agents-99-ui`, 2026-10-13; R377)
+location: `keeper_core::agents::gate_room::GateView::of`, `keeper_core::timeline::AgentHeader::regate`
+reason: a request whose gate word is not loaded — the window starts after the request but the word is further back, or the word arrived but the request scrolled out of the loaded window — draws as an ordinary message until both are loaded, and the header names no peer until a request the gate spoke of is loaded. Reading the gate's words from the event cache, as the header reads status and scope (R33), would draw them whatever is loaded.
+status: open
+

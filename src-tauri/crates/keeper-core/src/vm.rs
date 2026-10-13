@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
 use crate::agents::approval_card::ApprovalVm;
+use crate::agents::gate_room::GateLineVm;
 use crate::agents::heard::HeardMarkVm;
 use crate::agents::room::{AgentRoomHeaderVm, AgentRoomKindVm, BriefVm};
 use crate::bots::{BotHealthState, ProviderKind};
@@ -1344,6 +1345,12 @@ pub enum TimelineItemVm {
         /// body is the brief. Boxed as `media` is; the binding stays
         /// `BriefVm | null`.
         brief: Option<Box<BriefVm>>,
+        /// In a gate room (UX-DR147), the outside system's request — once
+        /// the gate has spoken of it, its chip the gate's newest word on it
+        /// — or the gate's own word on one, by Rust's reading of the room
+        /// (`gate_room::GateView`); else `null`. Boxed as `brief` is; the
+        /// binding stays `GateLineVm | null`.
+        gate: Option<Box<GateLineVm>>,
     },
     /// An event that could not be decrypted yet (`MsgLikeKind::UnableToDecrypt`).
     /// Renders an explicit honest stub instead of a blank row (Story 3.1). Carries
@@ -9128,6 +9135,7 @@ mod tests {
             media: None,
             readers: Vec::new(),
             brief: None,
+            gate: None,
         };
         let json = serde_json::to_string(&vm).expect("serialize message vm");
         assert!(
@@ -9153,6 +9161,7 @@ mod tests {
             media: None,
             readers: Vec::new(),
             brief: None,
+            gate: None,
         }
     }
 
@@ -9229,6 +9238,7 @@ mod tests {
             media: None,
             readers: Vec::new(),
             brief: None,
+            gate: None,
         };
         let json = serde_json::to_string(&vm).expect("serialize message vm");
         assert!(json.contains("\"isEdited\":true"), "json was: {json}");
@@ -9289,6 +9299,7 @@ mod tests {
             media: None,
             readers: Vec::new(),
             brief: None,
+            gate: None,
         };
         let json = serde_json::to_string(&vm).expect("serialize");
         assert!(
@@ -9497,6 +9508,7 @@ mod tests {
             })),
             readers: Vec::new(),
             brief: None,
+            gate: None,
         };
         let json = serde_json::to_string(&vm).expect("serialize message vm");
         assert!(json.contains("\"media\":{"), "json was: {json}");
@@ -9542,6 +9554,7 @@ mod tests {
                 "@carol:example.org".to_owned(),
             ],
             brief: None,
+            gate: None,
         };
         let json = serde_json::to_string(&vm).expect("serialize message vm");
         assert!(

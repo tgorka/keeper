@@ -22,6 +22,14 @@
  *
  * A coalesced request (a gate's card) is one group of rows, each decided on its
  * own: a row's decision never touches another row.
+ *
+ * **A gate's hour card** (UX-DR160) — a request Rust marks with `gate` — is
+ * always that group, even with one row: it names the system and the hour it
+ * covers, each row names the request it serves (quoted by Rust), its ticket and
+ * the agent the work would go to, and *Deny all* sends one deny per row Rust
+ * lists in `denyAll` — the rows still waiting that this device may decide — each
+ * through the same `agent_approval_decide` a row's own *Deny* uses, after a
+ * second press confirms how many. A decided row keeps its verdict.
  */
 import type { LucideIcon } from "lucide-react";
 import {
@@ -53,6 +61,9 @@ import { syncErrorMessage } from "@/lib/stores/sync";
 import { verificationStore } from "@/lib/stores/verification";
 import { cn } from "@/lib/utils";
 
+/** A gate card's hour, as a person reads a clock. */
+const HOUR_FORMAT = new Intl.DateTimeFormat(undefined, { timeStyle: "short" });
+
 /**
  * Each tier's weight. T0/T1 never wait for a person and T5 is never done, so
  * only T2–T4 arrive; a tier outside them is drawn at the heaviest weight
@@ -80,10 +91,18 @@ export const APPROVAL_VERIFY = "Verify this device";
 export const APPROVAL_SENT = "Your decision was sent. The card changes when the room has it.";
 export const APPROVAL_DECIDE_FAILED =
   "keeper could not send that decision. Nothing was decided; try again.";
+export const GATE_DENY_ALL = "Deny all";
+export const GATE_DENY_ALL_SENT =
+  "Your denials were sent. Each line changes when the room has its own.";
 
 /** A coalesced request's accessible name. */
 export function approvalListName(count: number): string {
   return `Approval request: ${count} actions, each decided on its own`;
+}
+
+/** A gate's hour card's accessible name (UX-DR160). */
+export function gateCardName(system: string, count: number): string {
+  return `Tickets from ${system} this hour: ${count} ${count === 1 ? "line" : "lines"}, each decided on its own`;
 }
 
 /** The declassification's question (UX-DR136's wording), drawn in place of the summary. */
@@ -629,6 +648,24 @@ function ApprovalCard({
         />
       )}
       <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-2 gap-y-0.5 text-xs">
+        {card.gate !== null && (
+          <>
+            <dt className="text-muted-foreground">Request</dt>
+            <dd className="font-mono">{card.gate.request ?? "unnamed"}</dd>
+            {card.gate.ticket !== null && (
+              <>
+                <dt className="text-muted-foreground">Ticket</dt>
+                <dd className="break-all font-mono">{card.gate.ticket}</dd>
+              </>
+            )}
+            {card.gate.to !== null && (
+              <>
+                <dt className="text-muted-foreground">Goes to</dt>
+                <dd className="font-mono">{card.gate.to}</dd>
+              </>
+            )}
+          </>
+        )}
         <dt className="text-muted-foreground">Asked by</dt>
         <dd>{card.chain.map((p) => p.name).join(" → ")}</dd>
         <dt className="text-muted-foreground">Can decide</dt>
@@ -677,6 +714,102 @@ function ApprovalCard({
 }
 
 /**
+ * What *Deny all* has done on a gate's hour card, held by the card's request so
+ * a new list from Rust — the first denial's echo, or a new ticket — forgets
+ * none of it: the rows whose denial went, the rows of a run still going, and
+ * why a run stopped part-way.
+ */
+interface DenyAllRun {
+  sent: ReadonlySet<string>;
+  sending: ReadonlySet<string>;
+  refusal: string | null;
+}
+
+const NO_DENIALS: DenyAllRun = { sent: new Set(), sending: new Set(), refusal: null };
+
+/**
+ * Why a *Deny all* stopped after `denied` of `of` denials went: none went is
+ * the card's own refusal; some went says how many, and why the rest did not.
+ */
+function denyAllRefusal(denied: number, of: number, error: unknown): string {
+  if (denied === 0) {
+    return syncErrorMessage(error, APPROVAL_DECIDE_FAILED);
+  }
+  const why = syncErrorMessage(error, "keeper could not send them.");
+  const rest = of - denied;
+  return `${denied} of ${of} denied; the other ${rest} ${rest === 1 ? "was" : "were"} not sent: ${why}`;
+}
+
+/**
+ * *Deny all* on a gate's hour card: a second press says how many it denies,
+ * then one decision per offered row goes, each naming its own record. A row
+ * whose denial went is never offered again.
+ */
+function DenyAll({
+  rows,
+  run,
+  onDeny,
+}: {
+  rows: readonly ApprovalCardVm[];
+  run: DenyAllRun;
+  onDeny: (rows: readonly ApprovalCardVm[]) => void;
+}) {
+  const [confirming, setConfirming] = useState(false);
+  const going = run.sending.size > 0;
+  return (
+    <div className="flex flex-col gap-1.5">
+      {going && (
+        <p role="status" className="text-muted-foreground text-sm">
+          Sending {run.sending.size === 1 ? "1 denial" : `${run.sending.size} denials`}…
+        </p>
+      )}
+      {!going && rows.length === 0 && run.sent.size > 0 && run.refusal === null && (
+        <p role="status" className="text-muted-foreground text-sm">
+          {GATE_DENY_ALL_SENT}
+        </p>
+      )}
+      {!going &&
+        rows.length > 0 &&
+        (confirming ? (
+          <div className="flex flex-wrap items-center gap-2">
+            <Button
+              type="button"
+              size="sm"
+              variant="destructive"
+              onClick={() => {
+                setConfirming(false);
+                onDeny(rows);
+              }}
+            >
+              {rows.length === 1
+                ? "Deny the 1 waiting request"
+                : `Deny ${rows.length} waiting requests`}
+            </Button>
+            <Button type="button" size="sm" variant="ghost" onClick={() => setConfirming(false)}>
+              {APPROVAL_CANCEL}
+            </Button>
+          </div>
+        ) : (
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            className="self-start"
+            onClick={() => setConfirming(true)}
+          >
+            {GATE_DENY_ALL}
+          </Button>
+        ))}
+      {run.refusal !== null && (
+        <p role="status" className="text-destructive text-sm">
+          {run.refusal}
+        </p>
+      )}
+    </div>
+  );
+}
+
+/**
  * One request in the stream: its card, or a coalesced request's rows.
  */
 export function ApprovalRequest({
@@ -688,11 +821,50 @@ export function ApprovalRequest({
   accountId: string;
   roomId: string;
 }) {
-  const multiple = approval.cards.length > 1;
+  const gate = approval.gate;
+  const multiple = approval.cards.length > 1 || gate !== null;
   const weight = TIER_WEIGHT[Math.max(...approval.cards.map((card) => card.tier))] ?? HEAVIEST;
+  const [run, setRun] = useState<DenyAllRun>(NO_DENIALS);
+  // The rows *Deny all* offers: Rust's list, less every row it already sent.
+  // While a run goes it offers nothing.
+  const offered = (gate?.denyAll ?? []).flatMap((id) => {
+    const card = approval.cards.find((c) => c.id === id);
+    return card !== undefined && !run.sent.has(id) ? [card] : [];
+  });
+  const denyAll = async (rows: readonly ApprovalCardVm[]) => {
+    setRun((r) => ({ ...r, sending: new Set(rows.map((row) => row.id)), refusal: null }));
+    let denied = 0;
+    for (const row of rows) {
+      try {
+        await agentApprovalDecide(accountId, roomId, {
+          id: row.id,
+          bindingDigest: row.bindingDigest,
+          decision: "deny",
+          scope: "once",
+          note: null,
+        });
+      } catch (error) {
+        const refusal = denyAllRefusal(denied, rows.length, error);
+        setRun((r) => ({ sent: r.sent, sending: new Set(), refusal }));
+        return;
+      }
+      denied += 1;
+      setRun((r) => ({
+        ...r,
+        sent: new Set(r.sent).add(row.id),
+        sending: new Set([...r.sending].filter((id) => id !== row.id)),
+      }));
+    }
+  };
   return (
     <section
-      aria-label={multiple ? approvalListName(approval.cards.length) : undefined}
+      aria-label={
+        gate !== null
+          ? gateCardName(gate.system, approval.cards.length)
+          : multiple
+            ? approvalListName(approval.cards.length)
+            : undefined
+      }
       className={cn(
         "my-2 max-w-[560px]",
         multiple &&
@@ -700,9 +872,27 @@ export function ApprovalRequest({
         multiple && weight.edge,
       )}
     >
-      <p hidden={!multiple} className="text-muted-foreground text-xs">
-        {approval.cards.length} actions in one request. Each is decided on its own.
-      </p>
+      {gate !== null ? (
+        <div className="flex flex-col gap-0.5">
+          <p className="font-medium">
+            Tickets from <span className="font-mono">{gate.system}</span>,{" "}
+            <time dateTime={new Date(gate.from).toISOString()}>
+              {HOUR_FORMAT.format(gate.from)}
+            </time>
+            –
+            <time dateTime={new Date(gate.until).toISOString()}>
+              {HOUR_FORMAT.format(gate.until)}
+            </time>
+          </p>
+          <p className="text-muted-foreground text-xs">
+            One line per ticket this hour. Each is decided on its own.
+          </p>
+        </div>
+      ) : (
+        <p hidden={!multiple} className="text-muted-foreground text-xs">
+          {approval.cards.length} actions in one request. Each is decided on its own.
+        </p>
+      )}
       <ul role={multiple ? undefined : "presentation"} className="flex flex-col gap-3">
         {approval.cards.map((card) => (
           <li key={card.id} role={multiple ? undefined : "presentation"}>
@@ -710,6 +900,16 @@ export function ApprovalRequest({
           </li>
         ))}
       </ul>
+      {gate !== null && (
+        // A new list of offered rows — the card grew, or the room has a
+        // decision — asks for the confirmation again.
+        <DenyAll
+          key={offered.map((row) => row.id).join(" ")}
+          rows={offered}
+          run={run}
+          onDeny={(rows) => void denyAll(rows)}
+        />
+      )}
     </section>
   );
 }

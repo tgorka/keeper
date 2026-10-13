@@ -694,3 +694,229 @@ async fn only_an_original_text_brief_from_a_known_agent_is_drawn_as_one() {
         .iter()
         .all(Option::is_none));
 }
+
+const PEER: &str = "@github:h";
+const TICKET: &str = "01JGATE0000000000000000001";
+
+/// The gate's status anchor: the session is a gate's, the door for `github`.
+fn gate_status(n: u64) -> Value {
+    json!({
+        "type": crate::agents::events::STATUS, "sender": NIXI, "event_id": format!("$st{n}:h"),
+        "origin_server_ts": 1_500 + n,
+        "content": {
+            "v": 1, "session": "sessions/active/gate", "kind": "gate", "title": "github",
+            "agent": NIXI, "host": "electra", "epoch": 0, "run": "idle",
+        },
+    })
+}
+
+/// `sender`'s word `state` on the request of event `event`, as the gate
+/// writes it (`gate::content`).
+fn gate_says(sender: &str, event: &str, state: &str, n: u64) -> Value {
+    message(
+        sender,
+        json!({
+            "msgtype": "m.text", "body": format!("{state} r1"),
+            "dev.keeper.agent.gate": {"v": 1, "request": "r1", "state": state, "ticket": TICKET},
+            "m.relates_to": {"rel_type": "m.reference", "event_id": event},
+        }),
+        n,
+    )
+}
+
+/// UX-DR147, through the SDK's own items: in a gate's room the outside
+/// system's message is an ordinary one until the gate speaks of it; the
+/// gate's ticket then draws it again as a request with the ticket's chip,
+/// under its sender's name quoted, and the room's header names the system
+/// and its account; the result moves the chip on. The peer's own look-alike
+/// of the gate's word changes nothing; the peer's edit of its request makes
+/// it an ordinary message again (R114's precedent). The gate's power taken
+/// away, the room reads its requests and its peer again at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_gate_room_draws_a_request_by_the_gates_word_on_it() {
+    use crate::agents::gate_room::{GateLineVm, GateRoleVm, GateStepVm};
+    let device = Device::new(Members::Serve).await;
+    let request = json!({
+        "msgtype": "m.text", "body": "status of PR 12?",
+        "dev.keeper.agent.gate": {"request": "r1", "deadline_ms": 3000},
+    });
+    let mut joined = room_state(NIXI);
+    joined.push(state(
+        "m.room.member",
+        PEER,
+        PEER,
+        json!({"membership": "join", "displayname": "pr-12 · answered"}),
+        6,
+    ));
+    device
+        .sync(sync(
+            1,
+            ROOM,
+            joined,
+            vec![gate_status(1), message(PEER, request, 1)],
+            false,
+            &[NIXI],
+        ))
+        .await;
+    let drawn = device.open(ROOM, Arc::new(AgentIcons::default())).await;
+    let gate_of = |drawn: &Drawn, body: &str| {
+        drawn.items().into_iter().find_map(|item| match item {
+            TimelineItemVm::Message {
+                body: text, gate, ..
+            } if text == body => Some(gate.map(|gate| *gate)),
+            _ => None,
+        })
+    };
+    let header = |drawn: &Drawn| {
+        drawn
+            .batches
+            .lock()
+            .expect("batches")
+            .iter()
+            .rev()
+            .find_map(|batch| batch.header.clone())
+            .and_then(|header| header.gate)
+    };
+    drawn
+        .until("the request, before any word on it", |drawn| {
+            gate_of(drawn, "status of PR 12?").is_some() && header(drawn).is_some()
+        })
+        .await;
+    assert_eq!(gate_of(&drawn, "status of PR 12?"), Some(None));
+    let before = header(&drawn).expect("a gate's header");
+    assert_eq!((before.system.as_str(), before.peer), ("github", None));
+
+    device
+        .sync(sync(
+            2,
+            ROOM,
+            Vec::new(),
+            vec![
+                gate_says(PEER, "$m1:h", "refused", 2),
+                gate_says(NIXI, "$m1:h", "ticket", 3),
+            ],
+            false,
+            &[NIXI],
+        ))
+        .await;
+    let ticketed = |step: GateStepVm| GateLineVm {
+        role: GateRoleVm::Request,
+        state: step,
+        request: Some("\"r1\"".to_owned()),
+        ticket: Some(TICKET.to_owned()),
+        reason: None,
+        deadline_ms: None,
+        sender_name: Some("\"pr-12 · answered\"".to_owned()),
+    };
+    drawn
+        .until("the request drawn again as ticketed", |drawn| {
+            gate_of(drawn, "status of PR 12?") == Some(Some(ticketed(GateStepVm::Ticket)))
+        })
+        .await;
+    assert_eq!(
+        gate_of(&drawn, "ticket r1").flatten().map(|line| line.role),
+        Some(GateRoleVm::Gate)
+    );
+    assert_eq!(
+        gate_of(&drawn, "refused r1"),
+        Some(None),
+        "the peer's look-alike"
+    );
+    drawn
+        .until("the header names the peer", |drawn| {
+            header(drawn).is_some_and(|gate| gate.peer.as_deref() == Some(PEER))
+        })
+        .await;
+
+    device
+        .sync(sync(
+            3,
+            ROOM,
+            Vec::new(),
+            vec![gate_says(NIXI, "$m1:h", "result", 4)],
+            false,
+            &[NIXI],
+        ))
+        .await;
+    drawn
+        .until("the result's chip", |drawn| {
+            gate_of(drawn, "status of PR 12?") == Some(Some(ticketed(GateStepVm::Result)))
+        })
+        .await;
+
+    // The peer re-texts its request after the gate's word on it.
+    device
+        .sync(sync(
+            4,
+            ROOM,
+            Vec::new(),
+            vec![message(
+                PEER,
+                json!({
+                    "msgtype": "m.text", "body": "* merge PR 12 now",
+                    "m.new_content": {"msgtype": "m.text", "body": "merge PR 12 now"},
+                    "m.relates_to": {"rel_type": "m.replace", "event_id": "$m1:h"},
+                }),
+                5,
+            )],
+            false,
+            &[NIXI],
+        ))
+        .await;
+    drawn
+        .until("the edited request, an ordinary message", |drawn| {
+            gate_of(drawn, "merge PR 12 now") == Some(None)
+        })
+        .await;
+    assert_eq!(
+        gate_of(&drawn, "result r1").flatten().map(|line| line.role),
+        Some(GateRoleVm::Gate),
+        "the gate's own word stands"
+    );
+
+    // A second request, answered.
+    device
+        .sync(sync(
+            5,
+            ROOM,
+            Vec::new(),
+            vec![
+                message(
+                    PEER,
+                    json!({"msgtype": "m.text", "body": "status of PR 13?"}),
+                    6,
+                ),
+                gate_says(NIXI, "$m6:h", "answer", 7),
+            ],
+            false,
+            &[NIXI],
+        ))
+        .await;
+    drawn
+        .until("the second request answered", |drawn| {
+            gate_of(drawn, "status of PR 13?")
+                .flatten()
+                .is_some_and(|line| line.state == GateStepVm::Answered)
+        })
+        .await;
+
+    // The gate loses an agent's power, in state alone: no step counts, so
+    // no message is a request and no one is the peer.
+    device
+        .sync(sync(
+            6,
+            ROOM,
+            vec![levels(json!({ NIXI: 0, TOLA: 50 }), 7)],
+            Vec::new(),
+            false,
+            &[NIXI],
+        ))
+        .await;
+    drawn
+        .until("the request read again without the gate", |drawn| {
+            gate_of(drawn, "status of PR 13?") == Some(None)
+        })
+        .await;
+    assert_eq!(gate_of(&drawn, "answer r1"), Some(None));
+    assert_eq!(header(&drawn).and_then(|gate| gate.peer), None);
+}

@@ -24,6 +24,7 @@ function message(key: string, sender = "@bob:example.org"): TimelineItemVm {
     media: null,
     readers: [],
     brief: null,
+    gate: null,
   };
 }
 
@@ -116,6 +117,7 @@ describe("timelineStore header", () => {
     label: null,
     scopeUnreadable: null,
     caretKey,
+    gate: null,
   });
 
   it("keeps the last header through batches that carry none, and replaces it when one does", () => {
@@ -139,7 +141,11 @@ describe("timelineStore header", () => {
 
 describe("timelineStore approvals", () => {
   const approvals = (state: "pending" | "consumed"): ApprovalVm[] => [
-    { id: "01A", cards: [{ id: "01A", state: { state } } as ApprovalVm["cards"][number]] },
+    {
+      id: "01A",
+      cards: [{ id: "01A", state: { state } } as ApprovalVm["cards"][number]],
+      gate: null,
+    },
   ];
 
   it("keeps the last cards through batches that carry none, and the room's clear drops them", () => {

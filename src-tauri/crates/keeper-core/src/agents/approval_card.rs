@@ -41,6 +41,7 @@ use crate::agents::events::{
     request_records, ApprovalDecisionContent, ApprovalRequestContent, ConsumedContent,
     APPROVAL_CONSUMED, APPROVAL_DECISION, APPROVAL_REQUEST, CONTENT_VERSION,
 };
+use crate::agents::gate_room::{GateCardVm, GateRowVm};
 use crate::agents::tier::AgentTool;
 
 /// This device is not verified by its owner's cross-signing identity.
@@ -233,6 +234,10 @@ pub struct ApprovalCardVm {
     /// other tool, or when the action is attached — [`attached_payload`]
     /// then draws it.
     pub kvm: Option<KvmCardVm>,
+    /// A row of a gate's hour card (UX-DR160): the request it serves, its
+    /// ticket and the agent the work would go to; `None` outside a gate
+    /// room.
+    pub gate: Option<GateRowVm>,
 }
 
 /// What a `kvm_act` card draws (R323, as R247 draws a `run`): the KVM and
@@ -423,6 +428,9 @@ fn run_card(request: &ApprovalRequestContent) -> RunCardVm {
 pub struct ApprovalVm {
     pub id: String,
     pub cards: Vec<ApprovalCardVm>,
+    /// In a gate room, the hour's card (UX-DR160): the system, the hour it
+    /// covers and what *Deny all* denies; `None` elsewhere.
+    pub gate: Option<GateCardVm>,
 }
 
 /// The tier as a card says it.
@@ -796,6 +804,7 @@ impl ApprovalCardVm {
             kvm: (kvm && !attached)
                 .then(|| kvm_card(&request.action.args))
                 .flatten(),
+            gate: None,
         }
     }
 }
@@ -804,6 +813,9 @@ impl ApprovalCardVm {
 struct Request {
     event: String,
     sender: OwnedUserId,
+    /// The request event's `origin_server_ts`, ms: a gate card's hour
+    /// starts there.
+    at: u64,
     records: Vec<ApprovalRequestContent>,
 }
 
@@ -862,7 +874,12 @@ impl ApprovalFold {
                 {
                     return false;
                 }
-                self.request(id, sender, content)
+                self.request(
+                    id,
+                    sender,
+                    event["origin_server_ts"].as_u64().unwrap_or(0),
+                    content,
+                )
             }
             APPROVAL_DECISION => {
                 if !sealed || (senders.agent)(&sender) {
@@ -906,7 +923,7 @@ impl ApprovalFold {
             .any(|request| request.records.iter().any(|record| record.id == id))
     }
 
-    fn request(&mut self, event: &str, sender: OwnedUserId, content: &Value) -> bool {
+    fn request(&mut self, event: &str, sender: OwnedUserId, at: u64, content: &Value) -> bool {
         let relation = &content["m.relates_to"];
         if relation["rel_type"] == "m.replace" {
             let Some(target) = relation["event_id"].as_str() else {
@@ -915,10 +932,10 @@ impl ApprovalFold {
             let Some(new) = request_records(&content["m.new_content"]) else {
                 return false;
             };
-            let Some(at) = self.requests.iter().position(|r| r.event == target) else {
+            let Some(place) = self.requests.iter().position(|r| r.event == target) else {
                 return false;
             };
-            let held = &self.requests[at];
+            let held = &self.requests[place];
             // Only the original sender adds records, and never drops or
             // changes one already listed.
             if held.sender != sender
@@ -944,7 +961,7 @@ impl ApprovalFold {
             if added.is_empty() {
                 return false;
             }
-            self.requests[at].records.extend(added);
+            self.requests[place].records.extend(added);
             return true;
         }
         let Some(records) = request_records(content) else {
@@ -962,6 +979,7 @@ impl ApprovalFold {
         self.requests.push(Request {
             event: event.to_owned(),
             sender,
+            at,
             records: fresh,
         });
         true
@@ -1031,25 +1049,42 @@ impl ApprovalFold {
     }
 
     /// Every request's cards, in the room's order, as `viewer` reads them
-    /// at `now`.
+    /// at `now`. In the room of a gate that is the door for `gate` (a
+    /// `system`), each request is the hour's card (UX-DR160): its rows name
+    /// their request and ticket, each approves *once* in those words, and
+    /// the card says its hour and what *Deny all* denies.
     pub fn approvals(
         &self,
         viewer: &Viewer,
         now: DateTime<Utc>,
         name: &dyn Fn(&UserId) -> String,
+        gate: Option<&str>,
     ) -> Vec<ApprovalVm> {
         self.requests
             .iter()
-            .map(|request| ApprovalVm {
-                id: request.records[0].id.clone(),
-                cards: request
+            .map(|request| {
+                let cards: Vec<ApprovalCardVm> = request
                     .records
                     .iter()
                     .map(|record| {
                         let state = self.state_vm(request, record, now, name);
-                        ApprovalCardVm::of(record, state, viewer, name)
+                        let mut card = ApprovalCardVm::of(record, state, viewer, name);
+                        if gate.is_some() {
+                            card.gate = Some(GateRowVm::of(record));
+                            for offer in &mut card.scopes {
+                                if offer.scope == Scope::Once {
+                                    offer.label = "Approve once".to_owned();
+                                }
+                            }
+                        }
+                        card
                     })
-                    .collect(),
+                    .collect();
+                ApprovalVm {
+                    id: request.records[0].id.clone(),
+                    gate: gate.map(|system| GateCardVm::of(system, request.at, &cards)),
+                    cards,
+                }
             })
             .collect()
     }
@@ -1348,7 +1383,7 @@ mod tests {
     }
 
     fn states(fold: &ApprovalFold, at: DateTime<Utc>) -> Vec<ApprovalStateVm> {
-        fold.approvals(&viewer(TGORKA), at, &name)
+        fold.approvals(&viewer(TGORKA), at, &name, None)
             .into_iter()
             .flat_map(|approval| approval.cards)
             .map(|card| card.state)
@@ -1741,10 +1776,86 @@ mod tests {
             &event(APPROVAL_REQUEST, "$e", NIXI, edit),
             true
         ));
-        let cards = &fold.approvals(&tgorka, now(), &name)[0].cards;
+        let cards = &fold.approvals(&tgorka, now(), &name, None)[0].cards;
         assert!(cards[0].can_decide);
         assert!(!cards[1].can_decide);
         assert_eq!(cards[1].cannot_decide.as_deref(), Some(UNBOUND));
+    }
+
+    /// UX-DR160: in a gate's room each request is the hour's card — the
+    /// system, the hour from the card's own server time, every row approved
+    /// *once* in those words and naming its ticket — and *Deny all* denies
+    /// only the rows still waiting that this device may decide: a decided
+    /// row keeps its verdict, a row it cannot decide is left alone. In any
+    /// other room the same request is an ordinary card.
+    #[test]
+    fn a_gate_card_covers_its_hour_and_denies_only_what_waits() {
+        let ticket = |id: &str| {
+            let mut record = request(id, 2, &["once"]);
+            record["action"]["exec_binding"] = json!({"ticket": id, "request": "r1"});
+            let args = record["action"]["args"].clone();
+            sealed(record, &args)
+        };
+        let (waiting, decided) = (
+            ticket("01JGATE0000000000000000001"),
+            ticket("01JGATE0000000000000000002"),
+        );
+        let mut unbound = ticket("01JGATE0000000000000000003");
+        unbound["action"]["args"]["content"] = json!("something else");
+        let mut fold = ApprovalFold::default();
+        let mut card = event(
+            APPROVAL_REQUEST,
+            "$card",
+            NIXI,
+            json!({"v": 1, "records": [waiting, decided.clone(), unbound]}),
+        );
+        card["origin_server_ts"] = json!(5_000);
+        assert!(apply(&mut fold, &card, true));
+        assert!(apply(
+            &mut fold,
+            &event(
+                APPROVAL_DECISION,
+                "$d",
+                MARTA,
+                decision(&decided, "approve", "once")
+            ),
+            true
+        ));
+        let tgorka = viewer(TGORKA);
+        let [hour] = fold
+            .approvals(&tgorka, now(), &name, Some("github"))
+            .try_into()
+            .expect("one card");
+        assert_eq!(
+            hour.gate,
+            Some(GateCardVm {
+                system: "github".to_owned(),
+                from: 5_000,
+                until: 5_000 + 3_600_000,
+                deny_all: vec!["01JGATE0000000000000000001".to_owned()],
+            })
+        );
+        assert!(matches!(
+            hour.cards[1].state,
+            ApprovalStateVm::Decided { .. }
+        ));
+        assert!(!hour.cards[2].can_decide);
+        for row in &hour.cards {
+            assert_eq!(row.scopes[0].label, "Approve once");
+            assert_eq!(
+                row.gate.as_ref().and_then(|gate| gate.ticket.as_deref()),
+                Some(row.id.as_str())
+            );
+        }
+        let [plain] = fold
+            .approvals(&tgorka, now(), &name, None)
+            .try_into()
+            .expect("one card");
+        assert_eq!(plain.gate, None);
+        assert!(plain
+            .cards
+            .iter()
+            .all(|row| row.gate.is_none() && row.scopes[0].label == "Approve"));
     }
 
     fn attached(id: &str) -> (Value, Vec<u8>) {
@@ -2034,7 +2145,7 @@ mod tests {
         };
         assert_eq!(states(&fold, now()), std::slice::from_ref(&approved));
         let tgorka = viewer(TGORKA);
-        let card = &fold.approvals(&tgorka, now(), &name)[0].cards[0];
+        let card = &fold.approvals(&tgorka, now(), &name, None)[0].cards[0];
         assert!(card.can_decide);
         assert!(fold
             .check(&tgorka, "01A", &digest_of(&real), Scope::Once, now(), &name)
@@ -2251,7 +2362,7 @@ mod tests {
             true
         ));
 
-        let approvals = fold.approvals(&viewer(TGORKA), now(), &name);
+        let approvals = fold.approvals(&viewer(TGORKA), now(), &name, None);
         assert_eq!(approvals.len(), 1);
         assert_eq!(approvals[0].id, "01A");
         let ids: Vec<&str> = approvals[0].cards.iter().map(|c| c.id.as_str()).collect();
@@ -2268,7 +2379,7 @@ mod tests {
             true,
         );
         apply(&mut fold, &consumed(NIXI, "01C"), false);
-        let cards = &fold.approvals(&viewer(TGORKA), now(), &name)[0].cards;
+        let cards = &fold.approvals(&viewer(TGORKA), now(), &name, None)[0].cards;
         assert_eq!(cards[0].state, ApprovalStateVm::Pending);
         assert!(matches!(cards[1].state, ApprovalStateVm::Decided { .. }));
         assert_eq!(cards[2].state, ApprovalStateVm::Consumed);
