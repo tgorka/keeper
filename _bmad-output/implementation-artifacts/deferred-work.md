@@ -10549,3 +10549,9 @@ location: `keeper_core::agents::gate_room::GateView::of`, `keeper_core::timeline
 reason: a request whose gate word is not loaded — the window starts after the request but the word is further back, or the word arrived but the request scrolled out of the loaded window — draws as an ordinary message until both are loaded, and the header names no peer until a request the gate spoke of is loaded. Reading the gate's words from the event cache, as the header reads status and scope (R33), would draw them whatever is loaded.
 status: open
 
+### DW-1380: `scripts/check-macos.sh` runs the workspace's tests with `cargo test` under ssh's file-descriptor limit.
+
+origin: the agents program's close-out (2026-10-13; stack-notes 2026-10-11 RS9697 and 2026-10-12 98tablet; `report-restack-96tail-97.md`)
+location: `scripts/check-macos.sh:102-105` (`cargo test --workspace` over `ssh -o BatchMode=yes`)
+reason: a non-interactive ssh session on hesperia starts with `ulimit -n 256`, and `cargo test` runs a test binary's tests on threads in one process, so keeper-agent's `agent_turns` (the `parks::*` tests) run out of descriptors — 153 failed and one hung at the 97 tip (RS9697), `parks::*` ×105 at rung 98tablet — while the same tree passes under `cargo nextest run --workspace` with `ulimit -n 65536` (7493/7493 and 7607/7607 on hesperia). Every lane that ran `bun run check:rust:macos` had to rerun by hand and explain the red; the script's red is therefore not evidence of anything. Fix: raise the limit in the remote command (`ulimit -n 65536`) and run `cargo nextest run --workspace` (installing cargo-nextest on the Mac if absent), keeping the bindings-drift check after it, since ts-rs writes the bindings during the test run under nextest too.
+status: open
