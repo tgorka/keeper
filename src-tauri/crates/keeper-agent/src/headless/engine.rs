@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use keeper_core::agents::agentd::AgentdConfig;
+use keeper_core::agents::agentd::{AgentdConfig, Materialize};
 use keeper_core::agents::drive::{self, DriveDecl};
 use keeper_core::agents::log::writer::rotate_at;
 use keeper_core::agents::mount::{self, MountRefusal};
@@ -71,8 +71,9 @@ pub fn enforce_mounts(config: &AgentdConfig) -> Result<(), MountRefusal> {
 ///    over what `sync.db` mounts, not only over the file — before any sync;
 /// 5. a profile per drive, found again by its id (a moved `remote` updates
 ///    it in place), checked out under `drives/<id>/`, both directions,
-///    materialised, `[folder.agents]` and `[folder.sessions]` armed, its
-///    credential bound to its `secret:<name>`.
+///    materialised — every LFS object, or with `materialize = "zones"` only
+///    the agents and sessions zones' ([`zones_only`]) — `[folder.agents]` and
+///    `[folder.sessions]` armed, its credential bound to its `secret:<name>`.
 ///
 /// A removed drive's checkout stays on disk for the operator to delete.
 /// The first checkout is the caller's `sync_once` (or the engine's run).
@@ -132,6 +133,13 @@ pub fn open_engine(
         profile.lfs_mode = LfsMode::Materialize;
         profile.sessions = Some(profile.sessions.take().unwrap_or_default());
         profile.agents = Some(profile.agents.take().unwrap_or_else(AgentsConfig::default));
+        // agentd.toml is the only writer of agentd's rows, so the row's list
+        // is its answer alone, `all` included: a drive moved back to `all`
+        // loses the list `zones` wrote.
+        profile.virtual_patterns = match pin.materialize {
+            Materialize::All => Vec::new(),
+            Materialize::Zones => zones_only(&profile),
+        };
         if let Some(credential) = &pin.credential {
             platform
                 .secrets()
@@ -145,6 +153,45 @@ pub fn open_engine(
         });
     }
     Ok(AgentdEngine { engine, drives })
+}
+
+/// Every path may stay on the server.
+const EVERY_PATH: &str = "**";
+
+/// `materialize = "zones"` as a virtual policy on the profile row: every path
+/// may stay away, the agents and the sessions zone may not.
+///
+/// A policy and not `LfsMode::PointerOnly`, because a protection wins over
+/// every pattern and keeps its subtree's content on this disk (AD-123), which
+/// is what AD-376 asks of the two zones: agentd reads every file of them as
+/// bytes — `hydrate_blob` reads a log blob straight off the disk, and a blob
+/// over the LFS threshold left as a pointer would refuse the session's replay.
+/// Under `PointerOnly` nothing is protected. The policy is also what keeps the
+/// rest away from the start: a checkout enqueues a download only for a path the
+/// policy materialises, so a drive opened `zones` never queues its media.
+///
+/// The row's list is the profile tier's, so it replaces a committed
+/// `.keepervirtual`'s permissive list and joins its protections; a folder
+/// TOML that sets `virtualPatterns` outranks it, and when that leaves a zone as
+/// pointers [`zone_verdicts`] says so and the drive hosts nothing here.
+fn zones_only(profile: &SyncProfile) -> Vec<String> {
+    let mut patterns = vec![EVERY_PATH.to_owned()];
+    let zones = [
+        profile.agents.as_ref().map(|z| z.subfolder.as_str()),
+        profile.sessions.as_ref().map(|z| z.subfolder.as_str()),
+    ];
+    for zone in zones.into_iter().flatten() {
+        let zone = zone.trim().trim_matches('/');
+        if !zone.is_empty() {
+            patterns.push(format!("!/{zone}/"));
+        }
+    }
+    patterns
+}
+
+/// A `!` line: a protection, which keeps what it names whatever matches it.
+fn is_protection(pattern: &str) -> bool {
+    pattern.trim_start().starts_with('!')
 }
 
 /// After a checkout: whether each mounted drive's agents zone hosts.
@@ -233,9 +280,24 @@ fn virtual_refusal(profile: &SyncProfile) -> Option<String> {
             policy.resolve(&Path::new(zone).join("x.md"), largest) == Virtualization::Virtual
         })
     };
-    for pattern in &profile.virtual_patterns {
+    // A pattern is tried alone but under every protection, because a
+    // protection wins over any pattern (AD-123): `**` beside `!/80-agents/`
+    // leaves the agents zone whole, and naming `**` would be a false refusal.
+    let protections: Vec<String> = profile
+        .virtual_patterns
+        .iter()
+        .filter(|pattern| is_protection(pattern))
+        .cloned()
+        .collect();
+    for pattern in profile
+        .virtual_patterns
+        .iter()
+        .filter(|pattern| !is_protection(pattern))
+    {
         let mut alone = profile.clone();
-        alone.virtual_patterns = vec![pattern.clone()];
+        alone.virtual_patterns = std::iter::once(pattern.clone())
+            .chain(protections.iter().cloned())
+            .collect();
         alone.virtual_over_bytes = 0;
         for (name, zone) in &zones {
             if covers(&alone, zone) {

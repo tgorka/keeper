@@ -196,6 +196,7 @@ fn pin(ids: &[&str]) -> DrivePin {
         owner: user(TG),
         readers: ids.iter().map(|id| user(id)).collect(),
         local_only: false,
+        materialize: Default::default(),
     }
 }
 

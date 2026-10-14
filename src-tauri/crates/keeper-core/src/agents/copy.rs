@@ -166,6 +166,7 @@ pub fn pin_from_shown(
         owner,
         readers,
         local_only: decl.local_only,
+        materialize: Default::default(),
     })
 }
 

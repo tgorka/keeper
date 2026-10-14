@@ -120,6 +120,7 @@ pub fn pins(data_dir: &Path) -> Result<BTreeMap<String, DrivePin>, CoreError> {
                 owner,
                 readers,
                 local_only,
+                materialize: Default::default(),
             },
         );
     }
@@ -182,6 +183,7 @@ mod tests {
             owner: OwnedUserId::try_from("@tgorka:example.org").expect("owner"),
             readers: readers_from(readers).expect("readers"),
             local_only: true,
+            materialize: Default::default(),
         }
     }
 

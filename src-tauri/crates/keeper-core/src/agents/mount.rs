@@ -220,6 +220,7 @@ mod tests {
             owner: OwnedUserId::try_from(owner).expect("owner"),
             readers: readers_from(readers).expect("readers"),
             local_only: false,
+            materialize: Default::default(),
         }
     }
 

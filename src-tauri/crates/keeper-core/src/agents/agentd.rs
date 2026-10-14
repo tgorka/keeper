@@ -9,6 +9,8 @@
 //! `[[drives]]` pins each drive's `owner`, `readers` and `local_only` (S-15):
 //! the operator copies the audience from the forge's collaborator list, which
 //! is the real access list, and the mount rule runs on it before any checkout.
+//! Its `materialize` says how much of the drive's LFS content this host keeps
+//! on disk ([`Materialize`]).
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
@@ -93,6 +95,49 @@ pub struct DrivePin {
     /// pin says `true` hosts nothing, so no reader can open the drive to a
     /// remote model by editing it. `false` when the key is absent.
     pub local_only: bool,
+    /// Which of the drive's LFS content this host keeps on disk. Not a
+    /// `_drive.toml` fact: it is a question about this host's disk, which
+    /// a drive's readers have no say in.
+    pub materialize: Materialize,
+}
+
+/// `[[drives]].materialize`: which LFS content a host checks out.
+///
+/// A drive whose large files outweigh the host's disk — a personal drive of
+/// hundreds of gigabytes of media beside a few megabytes of agents — is
+/// `zones`: the agents and sessions zones are kept whole, as AD-376 requires,
+/// and every other LFS object stays on the server, its pointer in the
+/// worktree, until something asks for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Materialize {
+    /// Every LFS object the drive tracks. The default.
+    #[default]
+    All,
+    /// Only what lies in the agents and the sessions zone.
+    Zones,
+}
+
+impl Materialize {
+    /// The value as `agentd.toml` spells it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Materialize::All => "all",
+            Materialize::Zones => "zones",
+        }
+    }
+
+    fn parse(raw: Option<&str>, at: &str) -> Result<Materialize, ConfigRefusal> {
+        match raw {
+            None | Some("all") => Ok(Materialize::All),
+            Some("zones") => Ok(Materialize::Zones),
+            Some(other) => Err(invalid(
+                format!("{at} `materialize`"),
+                format!(
+                    "\"{other}\" is not a choice; write \"all\" (every LFS object on this disk) or \"zones\" (only the agents and sessions zones; everything else stays on the server)"
+                ),
+            )),
+        }
+    }
 }
 
 impl DrivePin {
@@ -205,6 +250,7 @@ struct RawDrive {
     readers: Option<Vec<String>>,
     #[serde(default)]
     local_only: bool,
+    materialize: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -467,6 +513,7 @@ fn drive_pin(
         drive::audience(&owner, &readers).map_err(|refusal| invalid(&at, refusal.sentence()))?;
     Ok(DrivePin {
         credential: secret(raw.credential.as_deref(), &at)?,
+        materialize: Materialize::parse(raw.materialize.as_deref(), &at)?,
         id: raw.id,
         remote: raw.remote,
         owner,
@@ -734,6 +781,36 @@ readers     = ["@tgorka:example.org"]
 
         let text = text.replace("local_only = true", "local_only = \"yes\"");
         assert!(refused(&text).contains("expected a boolean"));
+    }
+
+    #[test]
+    fn a_drives_materialize_reads_all_when_absent_and_takes_zones() {
+        let config = AgentdConfig::parse(EXAMPLE).expect("parses");
+        assert_eq!(config.drives[0].materialize, Materialize::All);
+
+        let with = |value: &str| {
+            EXAMPLE.replace(
+                "readers    = [\"@tgorka:example.org\"]\n\n[[providers]]",
+                &format!(
+                    "readers    = [\"@tgorka:example.org\"]\nmaterialize = \"{value}\"\n\n[[providers]]"
+                ),
+            )
+        };
+        let zones = AgentdConfig::parse(&with("zones")).expect("zones parses");
+        assert_eq!(zones.drives[0].materialize, Materialize::Zones);
+        let all = AgentdConfig::parse(&with("all")).expect("all parses");
+        assert_eq!(all.drives[0].materialize, Materialize::All);
+
+        let sentence = refused(&with("pointerOnly"));
+        assert!(
+            sentence.contains("[[drives]] \"tgdrive\" `materialize`"),
+            "{sentence}"
+        );
+        assert!(
+            sentence.contains("\"pointerOnly\" is not a choice"),
+            "{sentence}"
+        );
+        assert!(sentence.contains("\"zones\""), "{sentence}");
     }
 
     #[test]
