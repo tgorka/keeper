@@ -372,6 +372,10 @@ describe("the formatting toolbar, in the editor the user actually types into", (
         target: { value: "tada" },
       });
       fireEvent.click(screen.getByRole("button", { name: "Emoji" }));
+      // Closed before it opens again: two clicks in one tick can land as one
+      // render under load, and a picker that never closed keeps its query —
+      // which is the test's race, not the picker's.
+      await waitFor(() => expect(screen.queryByLabelText("Search emoji")).toBeNull(), SLOW);
       fireEvent.click(screen.getByRole("button", { name: "Emoji" }));
 
       // A stale query is a picker that lies about what it is showing.
