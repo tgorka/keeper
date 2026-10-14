@@ -13,6 +13,7 @@
  * card's figures never bleed into the next session.
  */
 import { useEffect, useRef, useState } from "react";
+import { logFailure } from "@/lib/failure";
 import type { RecordingSummaryVm } from "@/lib/ipc/client";
 import { recordingSessionSummary } from "@/lib/ipc/client";
 
@@ -52,7 +53,8 @@ export function useRecordedSessionSummary(
           setSummary(vm);
         }
       })
-      .catch(() => {
+      .catch((raw: unknown) => {
+        logFailure("recording.sessionSummary")(raw);
         // Best-effort: no summary → the card falls back to folder + Reveal.
         if (!stale && mounted.current) {
           setSummary(null);

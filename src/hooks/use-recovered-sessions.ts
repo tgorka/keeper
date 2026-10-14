@@ -21,6 +21,7 @@
  * card the user just dismissed.
  */
 import { useCallback, useEffect, useRef, useState } from "react";
+import { logFailure } from "@/lib/failure";
 import type { RecordingSummaryVm } from "@/lib/ipc/client";
 import { recoveredSessionAcknowledge, recoveredSessionsList } from "@/lib/ipc/client";
 import { useCapabilitiesStore } from "@/lib/stores/capabilities";
@@ -72,9 +73,8 @@ export function useRecoveredSessions(): UseRecoveredSessions {
           setSessions(list.filter((session) => !dismissed.current.has(session.sessionFolder)));
         }
       })
-      .catch(() => {
-        // Transient IPC noise: keep the previous list, never flash to empty.
-      });
+      // Transient IPC noise: keep the previous list, never flash to empty.
+      .catch(logFailure("recording.listRecovered"));
   }, [recording]);
 
   // Scan on mount and whenever the recording capability settles.
@@ -87,9 +87,8 @@ export function useRecoveredSessions(): UseRecoveredSessions {
     // failed latch at worst re-surfaces it on a later scan — never a stuck card.
     dismissed.current.add(folder);
     setSessions((prev) => prev.filter((session) => session.sessionFolder !== folder));
-    void recoveredSessionAcknowledge(folder).catch(() => {
-      // Best-effort latch (the Rust write is one-way, idempotent).
-    });
+    // Best-effort latch (the Rust write is one-way, idempotent).
+    void recoveredSessionAcknowledge(folder).catch(logFailure("recording.acknowledgeRecovered"));
   }, []);
 
   const retitled = useCallback((folder: string, summary: RecordingSummaryVm) => {

@@ -55,6 +55,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { spaceQueryText } from "@/hooks/use-notes-actions";
+import { logFailure } from "@/lib/failure";
 import type { NoteSpaceFieldVm, SessionSpaceVm } from "@/lib/ipc/client";
 import { notesSpaceTerms, sessionsSpaceSave } from "@/lib/ipc/client";
 import { flipTagTerm, type TagChip, tagChipState, withTagTerm } from "@/lib/stores/notes-filters";
@@ -387,7 +388,8 @@ export function SessionSpaceEditor({
             : { kind: "frozen", reason: SPACE_TERMS_READONLY, terms: read.terms },
         );
       })
-      .catch(() => {
+      .catch((raw: unknown) => {
+        logFailure("sessions.spaceTerms")(raw);
         // A query that does not parse is a state of the space, not a failed
         // command: the row already says so, and the editor says the same rather
         // than offering an empty chip set one Save away from selecting nothing.
@@ -495,6 +497,7 @@ export function SessionSpaceEditor({
       });
       onSaved();
     } catch (raw: unknown) {
+      logFailure("sessions.spaceSave")(raw);
       // Rust's own sentence, not a generic one. A refused destination names which
       // rule it broke — scratch that dies with the session, a dotted folder the
       // scan never reads back, a path that leaves the session — and three

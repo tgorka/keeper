@@ -42,16 +42,24 @@ const CLIENT_NAME: &str = "keeper";
 /// The outcome of an in-flight OIDC flow, delivered over its one-shot channel.
 ///
 /// A `Redirect` carries the full callback URL (which the SDK re-parses to
-/// extract `code`+`state` and perform the PKCE token exchange). `Error` carries
-/// a non-secret server-reported error string. `Cancelled` is produced by
-/// [`OAuthFlowRegistry::cancel_all`].
+/// extract `code`+`state` and perform the PKCE token exchange). `Error` is the
+/// identity provider's own `error=` answer; `Failed` is the platform's browser
+/// round trip ending without one (Epic 100, R381: a refusal and a broken round
+/// trip read differently). `Cancelled` is produced by
+/// [`OAuthFlowRegistry::cancel_all`] and [`OAuthFlowRegistry::cancel`].
 #[derive(Debug)]
 pub enum OAuthCallback {
     /// The browser redirected back with a (matched) callback URL.
     Redirect(String),
-    /// The callback carried an `error=` parameter; the string is the server's
-    /// non-secret error description.
-    Error(String),
+    /// The callback carried an `error=` parameter: the provider's error code
+    /// and, when it sent one, its non-secret `error_description`.
+    Error {
+        error: String,
+        description: Option<String>,
+    },
+    /// The platform's sign-in sheet could not be shown or ended with a system
+    /// error; the string is the platform's reason.
+    Failed(String),
     /// The flow was cancelled in-app before any callback arrived.
     Cancelled,
 }
@@ -100,9 +108,10 @@ impl OAuthFlowRegistry {
     ///
     /// Parses the `state` query parameter, looks up the pending sender, removes
     /// it, and sends either [`OAuthCallback::Error`] (if the URL carries an
-    /// `error=` param) or [`OAuthCallback::Redirect`]. Returns `true` if a flow
-    /// was matched and notified, `false` for an unparsable URL, a URL with no
-    /// `state`, or a `state` matching no in-flight flow (all ignored, no crash).
+    /// `error=` param, with its `error_description`) or
+    /// [`OAuthCallback::Redirect`]. Returns `true` if a flow was matched and
+    /// notified, `false` for an unparsable URL, a URL with no `state`, or a
+    /// `state` matching no in-flight flow (all ignored, no crash).
     pub fn resolve(&self, url: &str) -> bool {
         let parsed = match Url::parse(url) {
             Ok(u) => u,
@@ -114,10 +123,12 @@ impl OAuthFlowRegistry {
 
         let mut state: Option<String> = None;
         let mut error: Option<String> = None;
+        let mut description: Option<String> = None;
         for (key, value) in parsed.query_pairs() {
             match key.as_ref() {
                 "state" => state = Some(value.into_owned()),
                 "error" => error = Some(value.into_owned()),
+                "error_description" => description = Some(value.into_owned()),
                 _ => {}
             }
         }
@@ -138,7 +149,7 @@ impl OAuthFlowRegistry {
         };
 
         let outcome = match error {
-            Some(err) => OAuthCallback::Error(err),
+            Some(error) => OAuthCallback::Error { error, description },
             None => OAuthCallback::Redirect(url.to_owned()),
         };
         // A send error means the receiver was already dropped (flow ended); the
@@ -174,6 +185,19 @@ impl OAuthFlowRegistry {
             // A dropped receiver is already-cancelled.
             let _ = tx.send(OAuthCallback::Cancelled);
         }
+    }
+
+    /// End one in-flight flow as a failed round trip: send
+    /// [`OAuthCallback::Failed`] with the platform's `reason` to the sender
+    /// registered under `state` and remove it. Returns whether a flow was
+    /// waiting. Used when the platform's sign-in sheet could not be shown or
+    /// handed back something that is not this flow's answer, so the waiting
+    /// flow ends at once — and reads as a broken round trip, never as the
+    /// identity provider's refusal.
+    pub fn fail(&self, state: &str, reason: &str) -> bool {
+        let sender = self.lock().remove(state);
+        // A dropped receiver is an already-ended flow.
+        sender.is_some_and(|tx| tx.send(OAuthCallback::Failed(reason.to_owned())).is_ok())
     }
 
     /// Lock helper that recovers a poisoned mutex (a panicking send would only
@@ -249,17 +273,39 @@ mod tests {
         assert!(!registry.resolve(url), "flow already resolved/removed");
     }
 
-    /// A callback carrying `error=` resolves as an `Error` with the server string.
+    /// A callback carrying `error=` resolves as an `Error` with the server's
+    /// code and, when present, its `error_description`.
     #[tokio::test]
     async fn resolve_forwards_error_param() {
         let registry = OAuthFlowRegistry::new();
         let rx = registry.register("s1".to_owned());
 
-        assert!(registry.resolve("dev.tgorka.keeper:/oauth/callback?error=access_denied&state=s1"));
+        assert!(registry.resolve(
+            "dev.tgorka.keeper:/oauth/callback?error=access_denied&error_description=Not%20for%20you&state=s1"
+        ));
         match rx.await.expect("sender not dropped") {
-            OAuthCallback::Error(e) => assert_eq!(e, "access_denied"),
+            OAuthCallback::Error { error, description } => {
+                assert_eq!(error, "access_denied");
+                assert_eq!(description.as_deref(), Some("Not for you"));
+            }
             other => panic!("expected Error, got {other:?}"),
         }
+    }
+
+    /// `fail` ends only the named flow, as a failed round trip with its reason.
+    #[tokio::test]
+    async fn fail_ends_one_flow_as_a_failed_round_trip() {
+        let registry = OAuthFlowRegistry::new();
+        let rx = registry.register("a".to_owned());
+        let _other = registry.register("b".to_owned());
+
+        assert!(registry.fail("a", "no browser"));
+        assert!(!registry.fail("a", "twice"), "the flow already ended");
+        match rx.await.expect("sender not dropped") {
+            OAuthCallback::Failed(reason) => assert_eq!(reason, "no browser"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        assert!(registry.resolve("dev.tgorka.keeper:/oauth/callback?code=x&state=b"));
     }
 
     /// A callback whose `state` matches no in-flight flow is ignored (no crash).

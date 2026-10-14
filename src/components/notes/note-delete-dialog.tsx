@@ -33,6 +33,7 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import { deleteNote } from "@/hooks/use-notes-actions";
+import { logFailure } from "@/lib/failure";
 import { type NoteDeletePlanVm, notesDeletePlan } from "@/lib/ipc/client";
 import { syncErrorMessage } from "@/lib/stores/sync";
 
@@ -87,6 +88,7 @@ export function NoteDeleteDialog({
         }
       })
       .catch((raw: unknown) => {
+        logFailure("notes.deletePlan")(raw);
         // Said out loud and with no Delete button beside it. A confirmation
         // that cannot say what it would remove must not offer to remove it.
         if (live) {
@@ -107,6 +109,7 @@ export function NoteDeleteDialog({
         onClose();
       })
       .catch((raw: unknown) => {
+        logFailure("notes.delete")(raw);
         setDeleting(false);
         setFailure(syncErrorMessage(raw, NOTE_DELETE_FAILED));
       });

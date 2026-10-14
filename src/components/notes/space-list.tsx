@@ -17,6 +17,7 @@ import { MENU_TARGET_RING, useMenuTarget } from "@/components/ui/menu-target";
 import { HoverHint, IconHint } from "@/components/ui/tooltip";
 import { openNotesSpace, toggleNotesSpace } from "@/hooks/use-notes-actions";
 import { useShellLayout } from "@/hooks/use-shell-layout";
+import { logFailure } from "@/lib/failure";
 import type { NoteRailVaultVm, NoteSpaceVm } from "@/lib/ipc/client";
 import { notesSpaceSave, notesSpaces, notesSpacesRestoreDefaults } from "@/lib/ipc/client";
 import { ALL_SPACE_ID, GROUP_SPACE_PREFIX, TEMPORARY_SPACE_ID } from "@/lib/notes/all-spaces";
@@ -131,6 +132,7 @@ export function SpaceList({
           setRevealed(reveal);
         }
       } catch (error) {
+        logFailure("notes.spaces")(error);
         if (generation === request.current)
           setNotice(syncErrorMessage(error, "Spaces could not be read."));
       }
@@ -230,6 +232,7 @@ export function SpaceList({
       });
       await reload(saved);
     } catch (error) {
+      logFailure("notes.spacePin")(error);
       report(error);
     }
   };
@@ -256,6 +259,7 @@ export function SpaceList({
       });
       await reload(saved);
     } catch (error) {
+      logFailure("notes.spaceDuplicate")(error);
       report(error);
     } finally {
       duplicatePending.current = false;
@@ -277,6 +281,7 @@ export function SpaceList({
       );
       await reload();
     } catch (error) {
+      logFailure("notes.spacesRestore")(error);
       setNotice(syncErrorMessage(error, RESTORE_FAILED));
     } finally {
       setRestoring(false);

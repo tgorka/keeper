@@ -16,6 +16,7 @@
  * the first answer and the subscription would otherwise be missed for good.
  */
 import { useEffect } from "react";
+import { logFailure } from "@/lib/failure";
 import { capabilities, listenCapabilitiesChanged } from "@/lib/ipc/client";
 import { capabilitiesStore } from "@/lib/stores/capabilities";
 
@@ -30,6 +31,7 @@ export function useCapabilitiesHydrate(): void {
           }
         })
         .catch((error: unknown) => {
+          logFailure("capabilities.hydrate")(error);
           // Fail-safe: keep the declared safe default (all surfaces absent) and
           // surface the anomaly in the console — the app boots regardless.
           console.error("capabilities: hydration failed; keeping safe defaults", error);
@@ -47,6 +49,7 @@ export function useCapabilitiesHydrate(): void {
         }
       })
       .catch((error: unknown) => {
+        logFailure("capabilities.listen")(error);
         console.error("capabilities: could not listen for changes", error);
       });
     return () => {

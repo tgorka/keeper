@@ -102,6 +102,7 @@ import {
 } from "@/components/ui/sheet";
 import { useSpokenStream } from "@/hooks/use-spoken-stream";
 import { useVoiceStream } from "@/hooks/use-voice-stream";
+import { logFailure, sayFailure } from "@/lib/failure";
 import type { VoiceStateVm, VoiceUnavailableVm, VoiceWakeVm } from "@/lib/ipc/client";
 import {
   botsBotsList,
@@ -256,7 +257,9 @@ export function BotsPhoneVoiceLine({ onOpen }: { onOpen: () => void }) {
           size="sm"
           onClick={() => {
             // Best-effort deep link through the Rust opener; never re-prompts.
-            void iosOpenAppSettings().catch(() => {});
+            void iosOpenAppSettings().catch(
+              sayFailure("voice.openSettings", "keeper couldn't open Settings."),
+            );
           }}
         >
           {VOICE_OPEN_SETTINGS_LABEL}
@@ -361,6 +364,7 @@ export function BotsPhoneList({
         onOpen();
       })
       .catch((raw: unknown) => {
+        logFailure("bots.sessionOpen")(raw);
         botsStore.getState().setError(syncErrorMessage(raw, BOTS_READ_FAILED));
       });
   };
@@ -470,10 +474,9 @@ export function BotsPhoneConversation({
           botsStore.getState().selectModel(first.id);
         }
       })
-      .catch(() => {
-        // The sheet's picker says why when it is opened; the composer stays
-        // disabled, which is the honest state for a bot with nothing to run.
-      });
+      // The sheet's picker says why when it is opened; the composer stays
+      // disabled, which is the honest state for a bot with nothing to run.
+      .catch(logFailure("bots.firstModel"));
     return () => {
       cancelled = true;
     };
@@ -496,6 +499,7 @@ export function BotsPhoneConversation({
       onStreamEvent,
     )
       .catch((raw: unknown) => {
+        logFailure("bots.send")(raw);
         botsStore.getState().setError(syncErrorMessage(raw, BOTS_READ_FAILED));
       })
       // The list order is `updated_ms`, which the send just changed.
@@ -511,6 +515,7 @@ export function BotsPhoneConversation({
       { sessionId: conversation.session.id, messageId, model: selectedModel },
       onStreamEvent,
     ).catch((raw: unknown) => {
+      logFailure("bots.retry")(raw);
       botsStore.getState().setError(syncErrorMessage(raw, BOTS_READ_FAILED));
     });
   };

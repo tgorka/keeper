@@ -17,6 +17,7 @@
  */
 import { useState } from "react";
 import { Button } from "@/components/ui/button";
+import { logFailure } from "@/lib/failure";
 import { notesResolveConflict } from "@/lib/ipc/client";
 
 /** Above this, the pairwise alignment is not worth its quadratic cost and the
@@ -170,7 +171,8 @@ export function ConflictResolver({
       text: assemble(blocks, choices),
     })
       .then(onResolved)
-      .catch(() => {
+      .catch((raw: unknown) => {
+        logFailure("notes.resolveConflict")(raw);
         setFailure("keeper couldn't write the resolution. Both versions are still on disk.");
       });
   };

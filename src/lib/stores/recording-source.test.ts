@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/lib/ipc/client", () => ({
+  frontendErrorReport: vi.fn(async () => {}),
   listRecordingSources: vi.fn(),
 }));
 

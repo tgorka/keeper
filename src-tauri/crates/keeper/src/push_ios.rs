@@ -49,6 +49,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use keeper_core::agents::push::{self, ApnsEnvironment, PushOpenVm};
+use keeper_core::failure::{FailureOperation, PUSH_NOT_REGISTERED};
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, Manager};
 
@@ -186,7 +187,12 @@ pub fn register_soon() {
         {
             Ok(stored) => stored,
             Err(error) => {
-                tracing::warn!(%error, "push: could not read the push gateway setting");
+                crate::failure_notice::tell(
+                    FailureOperation::PushRegistration,
+                    None,
+                    PUSH_NOT_REGISTERED,
+                    &error,
+                );
                 return;
             }
         };
@@ -203,18 +209,34 @@ pub fn register_soon() {
             .await
         {
             Ok(outcomes) => {
+                // The registration reached the accounts: a failure of push as
+                // a whole is over; each account's own outcome sets or clears
+                // its own (R387).
+                crate::failure_notice::recovered(FailureOperation::PushRegistration, None);
                 for (account, outcome) in outcomes {
                     match outcome {
                         Ok(registered) => {
                             tracing::info!(account, ?registered, "push: pusher registered");
+                            crate::failure_notice::recovered(
+                                FailureOperation::PushRegistration,
+                                Some(account.as_str()),
+                            );
                         }
-                        Err(error) => {
-                            tracing::warn!(account, %error, "push: could not register the pusher");
-                        }
+                        Err(error) => crate::failure_notice::tell(
+                            FailureOperation::PushRegistration,
+                            Some(account.as_str()),
+                            PUSH_NOT_REGISTERED,
+                            &error,
+                        ),
                     }
                 }
             }
-            Err(error) => tracing::warn!(%error, "push: could not list the accounts"),
+            Err(error) => crate::failure_notice::tell(
+                FailureOperation::PushRegistration,
+                None,
+                PUSH_NOT_REGISTERED,
+                &error,
+            ),
         }
     });
 }

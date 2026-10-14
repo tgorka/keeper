@@ -75,6 +75,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { IconHint } from "@/components/ui/tooltip";
 import { formatElapsed } from "@/hooks/use-recording-session";
+import { sayFailure } from "@/lib/failure";
 import type { RecordingHitVm, TranscriptionProgressVm } from "@/lib/ipc/client";
 import { formatSize } from "@/lib/recording-format";
 
@@ -289,13 +290,12 @@ export function RecordingRow({
             size="sm"
             aria-label={`${RECORDINGS_COPY_ID_LABEL}: ${headline}`}
             onClick={() => {
-              // Best effort, and deliberately so: a clipboard the browser refuses
-              // is not something the person browsing their recordings needs a
-              // dialog about. Mirrors the recovery-key card exactly.
+              // The id is on screen either way, but a copy that did not happen
+              // is said, so nobody pastes something else believing it went.
               void navigator.clipboard
                 ?.writeText(hit.sessionId)
                 .then(() => setCopied(true))
-                .catch(() => {});
+                .catch(sayFailure("recordings.copyId", "keeper couldn't copy the recording id."));
             }}
           >
             <Copy aria-hidden="true" />

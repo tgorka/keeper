@@ -20,6 +20,7 @@
  */
 import { useStore } from "zustand";
 import { createStore } from "zustand/vanilla";
+import { logFailure } from "@/lib/failure";
 import {
   type SyncOutcomeVm,
   type SyncProfileReq,
@@ -382,6 +383,7 @@ export async function ensureSyncHydrated(): Promise<void> {
     return;
   }
   hydration ??= loadSnapshot().catch((raw: unknown) => {
+    logFailure("sync.hydrate")(raw);
     syncStore.getState().setError(syncErrorMessage(raw));
     // Allow a later retry rather than caching the failure forever.
     hydration = null;
@@ -400,6 +402,7 @@ export async function refreshSyncProfiles(): Promise<void> {
     state.setProfiles(profiles);
     state.setError(null);
   } catch (raw) {
+    logFailure("sync.profiles")(raw);
     syncStore.getState().setError(syncErrorMessage(raw));
   }
 }
@@ -416,6 +419,7 @@ export async function refreshSyncStatuses(): Promise<void> {
     state.mergeStatuses(statuses);
     state.setError(null);
   } catch (raw) {
+    logFailure("sync.statuses")(raw);
     syncStore.getState().setError(syncErrorMessage(raw));
   }
 }

@@ -13,11 +13,18 @@
  * - feeding the answer token by token lands on the same HTML as rendering it
  *   in one shot.
  */
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { BotAnswer } from "@/components/bots/bot-answer";
 import { BOT_CODE_COPIED_LABEL, BOT_CODE_COPY_LABEL } from "@/lib/bots-markdown";
+import type * as IpcClient from "@/lib/ipc/client";
+
+const frontendErrorReport = vi.fn<(...args: unknown[]) => Promise<void>>(() => Promise.resolve());
+vi.mock("@/lib/ipc/client", async (importOriginal) => ({
+  ...(await importOriginal<typeof IpcClient>()),
+  frontendErrorReport: (...args: unknown[]) => frontendErrorReport(...args),
+}));
 
 beforeEach(() => {
   // jsdom lacks a clipboard by default.
@@ -101,7 +108,7 @@ describe("a code block", () => {
     expect(await screen.findByText(BOT_CODE_COPIED_LABEL)).toBeInTheDocument();
   });
 
-  it("says nothing and shows no error when the webview refuses the clipboard", async () => {
+  it("claims no copy when the webview refuses the clipboard", async () => {
     Object.assign(navigator, {
       clipboard: { writeText: vi.fn(() => Promise.reject(new Error("denied"))) },
     });
@@ -109,7 +116,8 @@ describe("a code block", () => {
 
     fireEvent.click(screen.getByRole("button", { name: BOT_CODE_COPY_LABEL }));
 
-    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    await waitFor(() => expect(navigator.clipboard.writeText).toHaveBeenCalled());
+    expect(screen.queryByText(BOT_CODE_COPIED_LABEL)).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: BOT_CODE_COPY_LABEL })).toBeInTheDocument();
   });
 

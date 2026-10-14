@@ -66,6 +66,7 @@ import {
   Transaction,
 } from "@codemirror/state";
 import { Decoration, type DecorationSet, EditorView, WidgetType } from "@codemirror/view";
+import { logFailure } from "@/lib/failure";
 import { type NoteCsvVm, notesCsvFromTable, notesTableFromCsv } from "@/lib/ipc/client";
 import { attachmentEmbed } from "@/lib/notes/attach";
 import { alignedTable, type TableAlign } from "./format-commands";
@@ -847,6 +848,7 @@ async function writeTableAsCsv(
       );
       return;
     }
+    logFailure("notes.tableToCsv")(error);
     host.append(tableNotice(failure.message));
     return;
   }
@@ -890,6 +892,7 @@ async function readCsvAsTable(
   try {
     rows = await convert.toRows(vaultId, target);
   } catch (error) {
+    logFailure("notes.csvToTable")(error);
     host.append(tableNotice(failureOf(error).message));
     return;
   }

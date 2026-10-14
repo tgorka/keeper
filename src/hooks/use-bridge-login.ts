@@ -12,6 +12,7 @@
  * the Sheet renders the honest error + Retry rather than a stuck spinner.
  */
 import { useCallback, useEffect, useRef, useState } from "react";
+import { logFailure } from "@/lib/failure";
 import type { BridgeLoginInput, BridgeLoginVm, IpcError } from "@/lib/ipc/client";
 import { cancelBridgeLogin, startBridgeLogin, submitBridgeLogin } from "@/lib/ipc/client";
 
@@ -55,10 +56,9 @@ export function useBridgeLogin(
       if (id === null) {
         return;
       }
-      void submitBridgeLogin(accountId, id, input).catch(() => {
-        // A submit into an already-ended session is non-fatal — the stream will
-        // have surfaced the terminal state already.
-      });
+      // A submit into an already-ended session is non-fatal — the stream will
+      // have surfaced the terminal state already.
+      void submitBridgeLogin(accountId, id, input).catch(logFailure("bridgeLogin.submit"));
     },
     [accountId],
   );
@@ -67,9 +67,8 @@ export function useBridgeLogin(
     const id = sessionIdRef.current;
     sessionIdRef.current = null;
     if (id !== null) {
-      void cancelBridgeLogin(accountId, id).catch(() => {
-        // Cancel is best-effort.
-      });
+      // Cancel is best-effort.
+      void cancelBridgeLogin(accountId, id).catch(logFailure("bridgeLogin.cancel"));
     }
     setVm(null);
   }, [accountId]);
@@ -94,13 +93,14 @@ export function useBridgeLogin(
       .then((id) => {
         if (cancelled) {
           // Torn down before the id resolved — cancel immediately.
-          void cancelBridgeLogin(accountId, id).catch(() => {});
+          void cancelBridgeLogin(accountId, id).catch(logFailure("bridgeLogin.cancel"));
           return;
         }
         resolvedId = id;
         sessionIdRef.current = id;
       })
       .catch((raw: IpcError) => {
+        logFailure("bridgeLogin.start")(raw);
         if (!cancelled) {
           // Render an honest failure VM so the Sheet offers Retry.
           setVm({
@@ -121,7 +121,7 @@ export function useBridgeLogin(
       const id = resolvedId ?? sessionIdRef.current;
       sessionIdRef.current = null;
       if (id !== null) {
-        void cancelBridgeLogin(accountId, id).catch(() => {});
+        void cancelBridgeLogin(accountId, id).catch(logFailure("bridgeLogin.cancel"));
       }
     };
   }, [accountId, networkId, active, attempt]);

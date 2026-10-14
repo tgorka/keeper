@@ -16,6 +16,7 @@ const recordingCaptureSourcesGet = vi.fn();
 const recordingCaptureSourcesSet = vi.fn();
 
 vi.mock("@/lib/ipc/client", () => ({
+  frontendErrorReport: vi.fn(async () => {}),
   recordingCaptureSourcesGet: () => recordingCaptureSourcesGet(),
   recordingCaptureSourcesSet: (sources: unknown) => recordingCaptureSourcesSet(sources),
   // Imported by the recording-source store module that the capture stores pull

@@ -5,11 +5,13 @@ import type { AccountVm, BackupStatus } from "@/lib/ipc/client";
 // Mock the typed IPC wrapper so the hook never touches Tauri.
 const subscribeBackupStatus = vi.fn();
 const unsubscribeBackupStatus = vi.fn();
+const frontendErrorReport = vi.fn((..._args: unknown[]) => Promise.resolve());
 vi.mock("@/lib/ipc/client", () => ({
   subscribeBackupStatus: (accountId: string, onStatus: (s: BackupStatus) => void) =>
     subscribeBackupStatus(accountId, onStatus),
   unsubscribeBackupStatus: (accountId: string, id: number) =>
     unsubscribeBackupStatus(accountId, id),
+  frontendErrorReport: (...args: unknown[]) => frontendErrorReport(...args),
 }));
 
 import { useKeyBackupStatuses } from "@/hooks/use-key-backup-statuses";
@@ -116,7 +118,7 @@ describe("useKeyBackupStatuses", () => {
     expect(keyBackupStore.getState().statuses).toEqual({});
   });
 
-  it("swallows a subscribe failure and leaves the account pending", async () => {
+  it("survives a subscribe failure and leaves the account pending", async () => {
     subscribeBackupStatus.mockRejectedValue(new Error("stream failed"));
     accountsStore.getState().hydrateAll([alice]);
     renderHook(() => useKeyBackupStatuses());

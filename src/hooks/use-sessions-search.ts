@@ -15,6 +15,7 @@
  * for an answer nobody will read.
  */
 import { useEffect, useState } from "react";
+import { logFailure } from "@/lib/failure";
 import {
   type IpcError,
   type SessionSearchHitVm,
@@ -87,10 +88,11 @@ export function useSessionsSearch(
           } else {
             // Resolved after the cleanup ran: cancel what we were just handed,
             // since the cleanup had no id to cancel with.
-            void sessionsSearchCancel(id).catch(() => {});
+            void sessionsSearchCancel(id).catch(logFailure("sessions.searchCancel"));
           }
         })
         .catch((failure: unknown) => {
+          logFailure("sessions.search")(failure);
           if (live) {
             setRunning(false);
             setError(isIpcError(failure) ? failure.message : String(failure));
@@ -103,8 +105,8 @@ export function useSessionsSearch(
       clearTimeout(timer);
       if (scanId !== null) {
         // Cancelling an id that already finished is a no-op in Rust, so a race
-        // with the last batch is not an error to swallow loudly.
-        void sessionsSearchCancel(scanId).catch(() => {});
+        // with the last batch is not an error to say, only to log.
+        void sessionsSearchCancel(scanId).catch(logFailure("sessions.searchCancel"));
       }
     };
   }, [rootId, query, limit]);

@@ -33,6 +33,7 @@
  */
 import { useStore } from "zustand";
 import { createStore } from "zustand/vanilla";
+import { logFailure } from "@/lib/failure";
 import {
   listRecordingSources,
   type RecordingSourcesVm,
@@ -164,9 +165,8 @@ export async function refreshRecordingSources(): Promise<void> {
     .then((vm) => {
       recordingSourceStore.getState().setSources(vm);
     })
-    .catch(() => {
-      // Keep the prior snapshot; the next poll/focus retries.
-    })
+    // Keep the prior snapshot; the next poll/focus retries.
+    .catch(logFailure("recording.listSources"))
     .finally(() => {
       recordingSourceStore.getState().setRefreshing(false);
       inFlight = null;

@@ -17,10 +17,11 @@
  * subscribing exactly the live accounts. On cleanup — StrictMode double-mount,
  * account-set change, or unmount — every open subscription is torn down. Each
  * per-account sink is gated so a late batch after cleanup never mutates the store,
- * and a subscribe failure is swallowed (verification is a user-initiated flow — a
- * failed stream simply means no auto-open for that account).
+ * and a subscribe failure is logged, not said (verification is a user-initiated
+ * flow — a failed stream simply means no auto-open for that account).
  */
 import { useEffect } from "react";
+import { logFailure } from "@/lib/failure";
 import type { VerificationFlowVm } from "@/lib/ipc/client";
 import {
   subscribeVerification,
@@ -62,10 +63,9 @@ export function useVerification(): void {
           // from `Requested` to `Ready` (a keeper-started request is accepted by
           // the *other* session instead). Without this the incoming direction
           // stalls in `Requested` forever — SAS can only start once ready.
-          void verificationAccept(accountId, flow.flowId).catch(() => {
-            // A failed accept surfaces as a terminal state via the stream; the
-            // modal never traps the user on a dead "waiting" screen.
-          });
+          // A failed accept surfaces as a terminal state via the stream; the
+          // modal never traps the user on a dead "waiting" screen.
+          void verificationAccept(accountId, flow.flowId).catch(logFailure("verification.accept"));
         }
         // Only mirror the snapshot into the store for the account whose modal is
         // active, so a stray flow on a background account never drives the modal.
@@ -81,9 +81,8 @@ export function useVerification(): void {
           }
           subscriptionIds.set(accountId, id);
         })
-        .catch(() => {
-          // A failed verification stream is non-fatal: no auto-open for it.
-        });
+        // A failed verification stream is non-fatal: no auto-open for it.
+        .catch(logFailure("verification.subscribe"));
     }
 
     return () => {

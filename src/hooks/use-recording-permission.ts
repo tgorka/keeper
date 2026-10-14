@@ -17,12 +17,14 @@
  * timeout); nothing is cached optimistically here — the state held is only the
  * latest probe result.
  *
- * Error-safe by design: every IPC failure (sidecar unavailable / hung / iOS) is
- * swallowed to the safe default — Start stays disabled and no row claims a
- * grant — never a crash, never an infinite spinner.
+ * Error-safe by design: a failed probe falls back to the safe default — Start
+ * stays disabled and no row claims a grant — never a crash, never an infinite
+ * spinner. A request or deep link the person clicked that fails is said on
+ * screen and logged.
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { logFailure, sayFailure } from "@/lib/failure";
 import type { RecordingPermissionVm } from "@/lib/ipc/client";
 import {
   openCameraSettings as ipcOpenCameraSettings,
@@ -39,6 +41,10 @@ import {
   webcamEnabled as isWebcamEnabledNow,
   useWebcamEnabled,
 } from "@/lib/stores/recording-webcam";
+
+/** What the permissions say when keeper could not read them (R387). */
+export const RECORDING_PERMISSION_UNREAD =
+  "keeper couldn't check the recording permissions, so Start stays off. Switch away from keeper and back to check again.";
 
 /**
  * The safe default while no probe has resolved (and after any failed probe):
@@ -68,6 +74,11 @@ export const RETURN_PROBE_COALESCE_MS = 500;
 export interface UseRecordingPermission {
   /** The latest resolved pre-flight (the safe default until a probe lands). */
   permission: RecordingPermissionVm;
+  /**
+   * Why the last probe could not read the permissions, or `null` once one
+   * lands (R387): Start stays off on the safe default, and this says why.
+   */
+  failure: string | null;
   /** Trigger the OS request (one real prompt per app lifetime where allowed). */
   request: () => Promise<void>;
   /** Deep-link to the Screen Recording pane in System Settings (best-effort). */
@@ -86,6 +97,7 @@ export interface UseRecordingPermission {
 
 export function useRecordingPermission(): UseRecordingPermission {
   const [permission, setPermission] = useState<RecordingPermissionVm>(DEFAULT_RECORDING_PERMISSION);
+  const [failure, setFailure] = useState<string | null>(null);
   // The enabled-source flags (Story 20.2), subscribed reactively only to drive
   // the enabled-change re-probe effect below (so a toggle makes the row
   // appear/disappear live). The probe/request paths themselves read the *live*
@@ -119,12 +131,16 @@ export function useRecordingPermission(): UseRecordingPermission {
       const vm = await recordingPermission(mic, cam);
       if (mounted.current && token === seq.current) {
         setPermission(vm);
+        setFailure(null);
       }
-    } catch {
+    } catch (error) {
       // Safe default: a failed probe must never crash or spin — Start stays
-      // disabled and the rows keep their request affordances.
+      // disabled and the rows keep their request affordances — and it says why
+      // under the permissions, once, not a toast per window return (R387).
+      logFailure("recording.permissionProbe")(error);
       if (mounted.current && token === seq.current) {
         setPermission(DEFAULT_RECORDING_PERMISSION);
+        setFailure(RECORDING_PERMISSION_UNREAD);
       }
     }
   }, []);
@@ -136,10 +152,14 @@ export function useRecordingPermission(): UseRecordingPermission {
       if (mounted.current && token === seq.current) {
         setPermission(vm);
       }
-    } catch {
-      // A failed request round-trip degrades to a fresh live probe (which itself
-      // degrades to the safe default) — never a crash. refresh() takes a newer
-      // token, so it supersedes this request's dropped write.
+    } catch (error) {
+      // A failed request round-trip is said, then degrades to a fresh live probe
+      // (which itself degrades to the safe default) — never a crash. refresh()
+      // takes a newer token, so it supersedes this request's dropped write.
+      sayFailure(
+        "recording.requestScreenRecording",
+        "keeper couldn't ask for screen recording access.",
+      )(error);
       await refresh();
     }
   }, [refresh]);
@@ -150,9 +170,13 @@ export function useRecordingPermission(): UseRecordingPermission {
       // Audio card's enable fires. The outcome itself is not adopted here; the
       // refresh below re-probes the full three-leg pre-flight live.
       await requestMicrophonePermission();
-    } catch {
+    } catch (error) {
       // A failed round-trip makes no claim either way — the live re-probe
       // below resolves whatever is honest (or the safe default).
+      sayFailure(
+        "recording.requestMicrophone",
+        "keeper couldn't ask for microphone access.",
+      )(error);
     }
     await refresh();
   }, [refresh]);
@@ -160,24 +184,31 @@ export function useRecordingPermission(): UseRecordingPermission {
   const requestCamera = useCallback(async () => {
     try {
       await requestCameraPermission();
-    } catch {
+    } catch (error) {
       // Same no-claim degradation as the microphone request.
+      sayFailure("recording.requestCamera", "keeper couldn't ask for camera access.")(error);
     }
     await refresh();
   }, [refresh]);
 
   const openSettings = useCallback(() => {
-    // Best-effort deep link; a rejection is swallowed (the user can still open
+    // Best-effort deep link; a rejection is said (the user can still open
     // System Settings manually).
-    void openScreenRecordingSettings().catch(() => {});
+    void openScreenRecordingSettings().catch(
+      sayFailure("recording.openSettings", "keeper couldn't open System Settings."),
+    );
   }, []);
 
   const openMicrophoneSettings = useCallback(() => {
-    void ipcOpenMicrophoneSettings().catch(() => {});
+    void ipcOpenMicrophoneSettings().catch(
+      sayFailure("recording.openMicrophoneSettings", "keeper couldn't open System Settings."),
+    );
   }, []);
 
   const openCameraSettings = useCallback(() => {
-    void ipcOpenCameraSettings().catch(() => {});
+    void ipcOpenCameraSettings().catch(
+      sayFailure("recording.openCameraSettings", "keeper couldn't open System Settings."),
+    );
   }, []);
 
   useEffect(() => {
@@ -247,6 +278,7 @@ export function useRecordingPermission(): UseRecordingPermission {
 
   return {
     permission,
+    failure,
     request,
     openSettings,
     requestMicrophone,

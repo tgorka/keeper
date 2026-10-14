@@ -24,6 +24,7 @@
  * toast) — a failed report must never surface UI.
  */
 import { useEffect } from "react";
+import { logFailure } from "@/lib/failure";
 import { activeChatSet } from "@/lib/ipc/client";
 import { useIsReducedCapabilityPlatform } from "@/lib/stores/capabilities";
 import { roomsStore } from "@/lib/stores/rooms";
@@ -57,7 +58,7 @@ export function useActiveChatReporter(): void {
       reported = true;
       lastAccountId = nextAccountId;
       lastRoomId = nextRoomId;
-      void activeChatSet(selection).catch(() => {});
+      void activeChatSet(selection).catch(logFailure("chat.reportActive"));
     };
 
     // Report the CURRENT selection once at attach so a Chat already open (or one open when

@@ -54,6 +54,7 @@ import {
   type TransactionSpec,
 } from "@codemirror/state";
 import { Decoration, type DecorationSet, EditorView, WidgetType } from "@codemirror/view";
+import { logFailure } from "@/lib/failure";
 
 /** The fence's info word. Prefixed, so no Obsidian plugin can claim it. */
 export const MEDIA_BLOCK_INFO = "keeper-media";
@@ -518,7 +519,8 @@ export class MediaBlockWidget extends WidgetType {
         // Dynamic, and a static import cannot work here: this module is in the
         // editor's React-free chunk (NFR-27), and the host is React.
         mount = (await import("./media-block-host")).mountMediaBlock;
-      } catch {
+      } catch (raw) {
+        logFailure("media.blockHostLoad")(raw);
         // The fence's text stays on screen: the block cannot draw, and says
         // what it is.
         pressToShow(view, host);

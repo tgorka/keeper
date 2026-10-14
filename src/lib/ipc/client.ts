@@ -18,6 +18,7 @@ import type { DockBadgeMode } from "./gen/DockBadgeMode";
 import type { DocumentVm } from "./gen/DocumentVm";
 import type { EgressEndpointVm } from "./gen/EgressEndpointVm";
 import type { ExportReceiptVm } from "./gen/ExportReceiptVm";
+import type { FailureStateVm } from "./gen/FailureStateVm";
 import type { FilesDeletePlanVm } from "./gen/FilesDeletePlanVm";
 import type { FilesDeleteReceiptVm } from "./gen/FilesDeleteReceiptVm";
 import type { FilesListingVm } from "./gen/FilesListingVm";
@@ -316,6 +317,7 @@ export function telemetryStatus(): Promise<TelemetryStatusVm> {
 export function telemetryStudyStop(): Promise<void> {
   return invoke("telemetry_study_stop");
 }
+export type { TelemetrySurface } from "./gen/TelemetrySurface";
 export type { TelemetryConsentVm, TelemetryEventReq, TelemetryRemoteConfigVm, TelemetryStatusVm };
 
 export function telemetryConsentSet(consent: TelemetryConsentVm): Promise<TelemetryStatusVm> {
@@ -483,6 +485,10 @@ export type { ExportProgressVm } from "./gen/ExportProgressVm";
 export type { ExportReceiptVm } from "./gen/ExportReceiptVm";
 export type { ExportRequestVm } from "./gen/ExportRequestVm";
 export type { ExportScopeKind } from "./gen/ExportScopeKind";
+export type { FailureNoticeVm } from "./gen/FailureNoticeVm";
+export type { FailureOperation } from "./gen/FailureOperation";
+export type { FailureStateVm } from "./gen/FailureStateVm";
+export type { FailureSurface } from "./gen/FailureSurface";
 export type { FileSizeVm } from "./gen/FileSizeVm";
 export type { FilesDeletePlanVm } from "./gen/FilesDeletePlanVm";
 export type { FilesDeleteReceiptVm } from "./gen/FilesDeleteReceiptVm";
@@ -3837,6 +3843,22 @@ export async function listenUnifiedpushStatus(onChanged: () => void): Promise<()
   return await listen(UNIFIEDPUSH_STATUS_EVENT, () => {
     onChanged();
   });
+}
+
+/**
+ * Stream the standing background failures (Epic 100, R381 as amended by
+ * R387): failures Rust logged at WARN where no command was waiting, each
+ * standing until the same operation's next success. The current set arrives
+ * at once — a failure from before the webview listened is in it — then every
+ * change. Resolves with the subscription id for {@link failureUnsubscribe}.
+ */
+export async function failureSubscribe(onState: (state: FailureStateVm) => void): Promise<string> {
+  return await subscribeWithStringId<FailureStateVm>("failure_subscribe", onState);
+}
+
+/** End a {@link failureSubscribe} stream. */
+export async function failureUnsubscribe(subscriptionId: string): Promise<void> {
+  await invoke<void>("failure_unsubscribe", { subscriptionId });
 }
 
 /** Subscribe to {@link PUSH_OPEN_EVENT}; resolves with an unlisten function. */

@@ -36,6 +36,7 @@
  */
 import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { Label } from "@/components/ui/label";
+import { logFailure } from "@/lib/failure";
 import type { BotVm, VoiceAgentTargetVm, VoiceTargetSpeedVm } from "@/lib/ipc/client";
 import {
   botsBotsList,
@@ -106,9 +107,8 @@ export function BotVoiceTarget({ className }: { className?: string } = {}) {
           setAgents(read);
         }
       })
-      .catch(() => {
-        // Rust never refuses this read; with no shell there is nothing to list.
-      });
+      // Rust never refuses this read; with no shell there is nothing to list.
+      .catch(logFailure("voice.agentTargets"));
   }, []);
 
   useEffect(() => {
@@ -120,7 +120,8 @@ export function BotVoiceTarget({ className }: { className?: string } = {}) {
           setBots(read);
         }
       })
-      .catch(() => {
+      .catch((raw: unknown) => {
+        logFailure("voice.botsList")(raw);
         // The list could not be read: no bots to offer, and the turn's own
         // refusal still says where to go. Settings shows the read's failure itself.
         if (alive.current) {
@@ -133,9 +134,8 @@ export function BotVoiceTarget({ className }: { className?: string } = {}) {
           setSpeeds(read);
         }
       })
-      .catch(() => {
-        // No numbers: the names still choose. Nothing to say beside them.
-      });
+      // No numbers: the names still choose. Nothing to say beside them.
+      .catch(logFailure("voice.targetSpeeds"));
     return () => {
       alive.current = false;
     };
@@ -194,6 +194,7 @@ export function BotVoiceTarget({ className }: { className?: string } = {}) {
         setRefusal(null);
       })
       .catch((raw: unknown) => {
+        logFailure("voice.targetSet")(raw);
         setRefusal(syncErrorMessage(raw, VOICE_TARGET_WRITE_FAILED));
       })
       .finally(() => setBusy(false));

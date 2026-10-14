@@ -41,6 +41,8 @@
  * are drawn as absent rather than as empty cells, because an empty cell invites
  * an edit keeper will refuse: it does not add a field to a row it did not write.
  */
+
+import { logFailure } from "@/lib/failure";
 import { type NoteCsvVm, notesCsvRead, notesCsvSetCell } from "@/lib/ipc/client";
 
 /** What a cell's editor is announced as, so the control has a name. */
@@ -118,6 +120,7 @@ export async function renderCsvTableInto(
   try {
     table = await read(vaultId, target);
   } catch (error) {
+    logFailure("notes.csvRead")(error);
     if (options.cancelled?.() === true) {
       return;
     }
@@ -302,6 +305,7 @@ async function commit(
     }
     paint(host, vaultId, target, next, options);
   } catch (error) {
+    logFailure("notes.csvSetCell")(error);
     if (options.cancelled?.() === true) {
       return;
     }

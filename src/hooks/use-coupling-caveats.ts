@@ -11,6 +11,7 @@
  * authored here: the resolved `text` from Rust is rendered verbatim.
  */
 import { useEffect, useMemo, useState } from "react";
+import { logFailure } from "@/lib/failure";
 import type { CouplingCaveatVm, IpcError } from "@/lib/ipc/client";
 import { couplingCaveats } from "@/lib/ipc/client";
 
@@ -31,7 +32,8 @@ export function useCouplingCaveats(networkId: string | null): CouplingCaveatVm[]
           setCatalog(caveats);
         }
       })
-      .catch((_raw: IpcError) => {
+      .catch((raw: IpcError) => {
+        logFailure("bridges.couplingCaveats")(raw);
         if (!cancelled) {
           // Best-effort: an embedded-data parse failure leaves the catalog empty, so no
           // caveat surfaces (never a UI error for a disclosure hint).

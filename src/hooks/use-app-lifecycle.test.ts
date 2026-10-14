@@ -8,8 +8,10 @@ import { lifecycleStore } from "@/lib/stores/lifecycle";
 const appLifecycleChanged = vi.fn<(phase: "foreground" | "background") => Promise<void>>(() =>
   Promise.resolve(),
 );
+const frontendErrorReport = vi.fn((..._args: unknown[]) => Promise.resolve());
 vi.mock("@/lib/ipc/client", () => ({
   appLifecycleChanged: (phase: "foreground" | "background") => appLifecycleChanged(phase),
+  frontendErrorReport: (...args: unknown[]) => frontendErrorReport(...args),
 }));
 
 /** All seven capabilities present = the desktop tier (no listener attached). */
@@ -178,7 +180,7 @@ describe("useAppLifecycle", () => {
     expect(lifecycleStore.getState().phase).toBe("foreground");
   });
 
-  it("swallows an IPC rejection (no toast, no throw)", () => {
+  it("survives an IPC rejection (no toast, no throw)", () => {
     hydrateReducedTier();
     setVisibility("hidden");
     appLifecycleChanged.mockReturnValueOnce(Promise.reject(new Error("no tauri host")));

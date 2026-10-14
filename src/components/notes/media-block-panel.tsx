@@ -66,6 +66,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { IconHint } from "@/components/ui/tooltip";
+import { logFailure, sayFailure } from "@/lib/failure";
 import {
   listenTranscriptWritten,
   type MarkerEditReq,
@@ -309,6 +310,7 @@ export function MediaBlockPanel({
       setProblem(null);
       return true;
     } catch (cause) {
+      logFailure("media.blockEdit")(cause);
       setProblem(syncErrorMessage(cause));
       return false;
     }
@@ -461,7 +463,9 @@ export function MediaBlockPanel({
               }
             }}
             onCopyLink={() => {
-              void navigator.clipboard?.writeText(link(marker.name)).catch(() => {});
+              void navigator.clipboard
+                ?.writeText(link(marker.name))
+                .catch(sayFailure("notes.copyMarkerLink", "keeper couldn't copy the link."));
             }}
             onCopyClip={() => setClip({ from: marker.from, to: marker.to ?? marker.from + 1 })}
             onRename={() => setNaming({ mode: "rename", name: marker.name, marker: marker.name })}

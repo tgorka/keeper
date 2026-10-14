@@ -8,6 +8,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { logFailure } from "@/lib/failure";
 import { iosSyncDisclosureShownGet, iosSyncDisclosureShownSet } from "@/lib/ipc/client";
 import { useAccountsStore } from "@/lib/stores/accounts";
 import { useIsReducedCapabilityPlatform } from "@/lib/stores/capabilities";
@@ -94,7 +95,8 @@ export function NoBackgroundSyncDisclosure() {
           setShown(value);
         }
       })
-      .catch(() => {
+      .catch((raw: unknown) => {
+        logFailure("sync.iosDisclosureShownGet")(raw);
         // Read failure ⇒ treat as already shown (best-effort, never trap).
         if (!cancelled) {
           setShown(true);
@@ -112,10 +114,9 @@ export function NoBackgroundSyncDisclosure() {
   const acknowledge = () => {
     setDismissed(true);
     // Best-effort one-way latch: a failed persist still hides the card for this
-    // session (no toast); the card may then show once more after a relaunch.
-    void iosSyncDisclosureShownSet().catch(() => {
-      // Swallowed by design (non-trapping disclosure).
-    });
+    // session (no toast, by design: the disclosure never traps); the card may
+    // then show once more after a relaunch.
+    void iosSyncDisclosureShownSet().catch(logFailure("disclosure.markShown"));
   };
 
   return (

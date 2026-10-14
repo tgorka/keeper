@@ -21,6 +21,7 @@
  */
 import { useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
+import { logFailure } from "@/lib/failure";
 import {
   type NoteDiffVm,
   type NoteRevisionVm,
@@ -76,7 +77,8 @@ export function NoteHistoryPanel({ vaultId, noteId, onBack }: NoteHistoryPanelPr
         setRevisions(found);
         setSelected(found.length > 0 ? found[0].rev : null);
       })
-      .catch(() => {
+      .catch((raw: unknown) => {
+        logFailure("notes.history")(raw);
         if (live) {
           setFailure("keeper couldn't read this note's history.");
         }
@@ -100,7 +102,8 @@ export function NoteHistoryPanel({ vaultId, noteId, onBack }: NoteHistoryPanelPr
           setDiff(found);
         }
       })
-      .catch(() => {
+      .catch((raw: unknown) => {
+        logFailure("notes.diff")(raw);
         if (live) {
           setDiff(null);
         }
@@ -142,9 +145,10 @@ export function NoteHistoryPanel({ vaultId, noteId, onBack }: NoteHistoryPanelPr
               setArmed(null);
               void notesRestoreRevision(vaultId, noteId, selected)
                 .then(() => setRestored(selected))
-                .catch((raw: unknown) =>
-                  setFailure(syncErrorMessage(raw, RESTORE_REVISION_FAILED)),
-                );
+                .catch((raw: unknown) => {
+                  logFailure("notes.restoreRevision")(raw);
+                  setFailure(syncErrorMessage(raw, RESTORE_REVISION_FAILED));
+                });
             }}
           >
             {armed === selected ? RESTORE_REVISION_CONFIRM : RESTORE_REVISION}

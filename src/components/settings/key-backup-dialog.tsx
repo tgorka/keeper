@@ -34,6 +34,7 @@ import {
 } from "@/components/ui/dialog";
 import { InputGroup, InputGroupTextarea } from "@/components/ui/input-group";
 import { Label } from "@/components/ui/label";
+import { logFailure, sayFailure } from "@/lib/failure";
 import type { IpcError, IpcErrorCode } from "@/lib/ipc/client";
 import {
   backupEnable,
@@ -121,6 +122,7 @@ function EnableBody() {
         keyBackupStore.getState().setRecoveryKey(key);
       })
       .catch((raw) => {
+        logFailure("keyBackup.enable")(raw);
         if (keyBackupStore.getState().accountId !== targetAccount) {
           return;
         }
@@ -168,7 +170,7 @@ function EnableBody() {
               void navigator.clipboard
                 ?.writeText(recoveryKey)
                 .then(() => setCopied(true))
-                .catch(() => {});
+                .catch(sayFailure("keyBackup.copy", "keeper couldn't copy the recovery key."));
             }}
           >
             {copied ? "Copied" : "Copy"}
@@ -185,7 +187,10 @@ function EnableBody() {
               setSaveError(false);
               void backupSaveRecoveryKey(accountId, recoveryKey)
                 .then(() => setSaved(true))
-                .catch(() => setSaveError(true));
+                .catch((raw: unknown) => {
+                  logFailure("keyBackup.saveRecoveryKey")(raw);
+                  setSaveError(true);
+                });
             }}
           >
             {saved ? "Saved to Keychain" : "Save to Keychain"}
@@ -244,9 +249,8 @@ function RestoreBody() {
           setValue((current) => (current.length === 0 ? saved : current));
         }
       })
-      .catch(() => {
-        // No prefill on failure — the user can paste manually.
-      });
+      // No prefill on failure — the user can paste manually.
+      .catch(logFailure("keyBackup.readSavedKey"));
     return () => {
       cancelled = true;
     };
@@ -275,6 +279,7 @@ function RestoreBody() {
         }
       })
       .catch((raw) => {
+        logFailure("keyBackup.restore")(raw);
         if (keyBackupStore.getState().accountId === targetAccount) {
           keyBackupStore.getState().setError(errorCodeOf(raw));
         }

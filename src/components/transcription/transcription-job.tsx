@@ -5,6 +5,7 @@ import {
 } from "@/components/transcription/transcribe-again";
 import { TranscriptionProgress } from "@/components/transcription/transcription-progress";
 import { Button } from "@/components/ui/button";
+import { logFailure } from "@/lib/failure";
 import { transcriptionCancel } from "@/lib/ipc/client";
 import { syncErrorMessage } from "@/lib/stores/sync";
 import {
@@ -43,9 +44,10 @@ export function TranscriptionJob({
           variant="outline"
           disabled={!job.jobId}
           onClick={() => {
-            void transcriptionCancel(job.jobId).catch((cause: unknown) =>
-              setError(syncErrorMessage(cause)),
-            );
+            void transcriptionCancel(job.jobId).catch((cause: unknown) => {
+              logFailure("transcription.cancel")(cause);
+              setError(syncErrorMessage(cause));
+            });
           }}
         >
           Cancel transcription

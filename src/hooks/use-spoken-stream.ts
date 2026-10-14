@@ -18,6 +18,7 @@
  * was, which is the honest state for an environment with no turn to observe.
  */
 import { useEffect, useRef } from "react";
+import { logFailure } from "@/lib/failure";
 import type { BotStreamEvent } from "@/lib/ipc/client";
 import { listenSpokenStream } from "@/lib/ipc/client";
 import { useCapabilitiesStore } from "@/lib/stores/capabilities";
@@ -48,9 +49,8 @@ export function useSpokenStream(onEvent: (event: BotStreamEvent) => void): void 
             unlisten = fn;
           }
         })
-        .catch(() => {
-          // No Tauri host — nothing to observe in this environment.
-        });
+        // No Tauri host — nothing to observe in this environment.
+        .catch(logFailure("bots.listenSpokenStream"));
     } catch {
       // `listen` can throw synchronously when the Tauri IPC internals are absent.
     }

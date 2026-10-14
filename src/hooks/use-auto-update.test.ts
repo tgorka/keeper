@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 vi.mock("@/lib/ipc/client", () => ({
   autoUpdateGet: vi.fn(),
   autoUpdateRestartCheck: vi.fn(),
+  frontendErrorReport: vi.fn(() => Promise.resolve()),
 }));
 vi.mock("@tauri-apps/plugin-updater", () => ({
   check: vi.fn(),

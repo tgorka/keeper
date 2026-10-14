@@ -19,6 +19,7 @@
  * pending).
  */
 import { useEffect } from "react";
+import { logFailure } from "@/lib/failure";
 import type { ConnectionStatusBatch } from "@/lib/ipc/client";
 import { subscribeConnectionStatus, unsubscribeConnectionStatus } from "@/lib/ipc/client";
 import { accountStatusStore } from "@/lib/stores/account-status";
@@ -61,9 +62,8 @@ export function useAccountStatuses(): void {
           }
           subscriptionIds.set(accountId, id);
         })
-        .catch(() => {
-          // A failed connection stream is non-fatal: leave the account pending.
-        });
+        // A failed connection stream is non-fatal: leave the account pending.
+        .catch(logFailure("accountStatus.subscribe"));
     }
 
     return () => {

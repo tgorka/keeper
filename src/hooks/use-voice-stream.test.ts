@@ -10,11 +10,13 @@ const voiceWatch = vi.fn<(onState: (state: VoiceStateVm) => void) => Promise<num
 const voiceUnwatch = vi.fn<(id: number) => Promise<void>>();
 const voiceAvailability = vi.fn<() => Promise<VoiceUnavailableVm | null>>();
 const voiceWakeGet = vi.fn<() => Promise<VoiceWakeVm>>();
+const frontendErrorReport = vi.fn((..._args: unknown[]) => Promise.resolve());
 vi.mock("@/lib/ipc/client", () => ({
   voiceWatch: (onState: (state: VoiceStateVm) => void) => voiceWatch(onState),
   voiceUnwatch: (id: number) => voiceUnwatch(id),
   voiceAvailability: () => voiceAvailability(),
   voiceWakeGet: () => voiceWakeGet(),
+  frontendErrorReport: (...args: unknown[]) => frontendErrorReport(...args),
 }));
 
 import { useVoiceStream } from "@/hooks/use-voice-stream";

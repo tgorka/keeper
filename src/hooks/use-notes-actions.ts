@@ -29,6 +29,7 @@
  */
 import { useCallback } from "react";
 import { isPhoneTier } from "@/hooks/use-shell-layout";
+import { logFailure } from "@/lib/failure";
 import type {
   NoteCreateVm,
   NoteRefVm,
@@ -349,7 +350,9 @@ function enqueueSpaceEntry(
         activeVault === activeVaultId(),
     );
   });
-  spaceEntries = entry.catch(() => {});
+  // The caller holds `entry` and answers for its failure; the queue only must
+  // not inherit it, so the next entry still runs.
+  spaceEntries = entry.catch(logFailure("notes.spaceEntry"));
   return entry;
 }
 

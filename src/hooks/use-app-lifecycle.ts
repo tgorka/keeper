@@ -32,6 +32,7 @@
  * default and never sheds.
  */
 import { useEffect } from "react";
+import { logFailure } from "@/lib/failure";
 import { appLifecycleChanged } from "@/lib/ipc/client";
 import { useIsReducedCapabilityPlatform } from "@/lib/stores/capabilities";
 import { lifecycleStore } from "@/lib/stores/lifecycle";
@@ -69,8 +70,8 @@ export function useAppLifecycle(): void {
       // shed derives from this one listener (Story 14.5). Only reached on the
       // reduced tier, so desktop keeps the store at its "foreground" default.
       lifecycleStore.getState().setPhase(phase);
-      // Best-effort: swallow IPC errors (no toast).
-      void appLifecycleChanged(phase).catch(() => {});
+      // Best-effort: log IPC errors (no toast).
+      void appLifecycleChanged(phase).catch(logFailure("app.lifecycle"));
     };
 
     // Emit the CURRENT visibility once at attach so the "hidden ⇒ paused"

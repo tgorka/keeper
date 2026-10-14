@@ -8,6 +8,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { ACCOUNT_OFFERS_TITLE, offerUrlHost } from "@/lib/account-offers";
+import { logFailure, sayFailure } from "@/lib/failure";
 import type { AccountVm, IpcError, IpcErrorCode, MatrixOfferVm } from "@/lib/ipc/client";
 import {
   beeperRequestCode,
@@ -68,14 +69,11 @@ function errorCopy(code: FormErrorCode): string {
  * The anchors keep `href` + `target="_blank"` as a safe fallback: any activation
  * that bypasses this handler (middle-click, aux-click) then attempts a new window
  * — a harmless no-op in the webview — rather than navigating the login SPA away
- * in-place. Fire-and-forget: any rejection is swallowed (best-effort, mirrors the
- * existing `void cancelOidc().catch(() => {})` pattern in this file).
+ * in-place. Fire-and-forget: a failed open is said and logged, never thrown.
  */
 function openExternal(event: MouseEvent<HTMLAnchorElement>, url: string) {
   event.preventDefault();
-  void openUrl(url).catch(() => {
-    // Best-effort: nothing actionable if the system opener fails.
-  });
+  void openUrl(url).catch(sayFailure("login.openLink", "keeper couldn't open the link."));
 }
 
 /** Narrowing guard for the {@link IpcError} envelope thrown by the IPC client. */
@@ -288,9 +286,8 @@ function PasswordTab({
   useEffect(
     () => () => {
       if (oidcPendingRef.current) {
-        void cancelOidc().catch(() => {
-          // Best-effort: the backend flow also times out on its own.
-        });
+        // Best-effort: the backend flow also times out on its own.
+        void cancelOidc().catch(logFailure("login.cancelOidc"));
       }
     },
     [],
@@ -333,6 +330,7 @@ function PasswordTab({
       addAccount(account);
       onDone?.();
     } catch (err) {
+      logFailure("login.password")(err);
       setErrorCode(isIpcError(err) ? err.code : "internal");
     } finally {
       setSubmitting(false);
@@ -358,6 +356,7 @@ function PasswordTab({
       if (isIpcError(err) && err.code === "oauthCancelled") {
         // no-op: fall through to the form
       } else {
+        logFailure("login.oidc")(err);
         setErrorCode(isIpcError(err) ? err.code : "internal");
       }
     } finally {
@@ -370,8 +369,9 @@ function PasswordTab({
     // then rejects with `oauthCancelled` and we return to the form.
     try {
       await cancelOidc();
-    } catch {
-      // Best-effort: even if the cancel command fails, the flow will time out.
+    } catch (error) {
+      // Even if the cancel command fails, the flow will time out.
+      sayFailure("login.cancelOidc", "keeper couldn't cancel the sign-in.")(error);
     }
   }
 
@@ -526,9 +526,8 @@ function BeeperTab({ addMode, addAccount, onDone }: TabProps) {
   useEffect(
     () => () => {
       if (pendingRef.current || flowStartedRef.current) {
-        void cancelBeeper(flowEmailRef.current).catch(() => {
-          // Best-effort: an abandoned flow leaves only an in-memory entry.
-        });
+        // Best-effort: an abandoned flow leaves only an in-memory entry.
+        void cancelBeeper(flowEmailRef.current).catch(logFailure("login.cancelBeeper"));
       }
     },
     [],
@@ -550,7 +549,8 @@ function BeeperTab({ addMode, addAccount, onDone }: TabProps) {
       // an unmount before verification cancels it.
       flowStartedRef.current = true;
       setStep("code");
-    } catch {
+    } catch (raw) {
+      logFailure("login.beeperRequestCode")(raw);
       // Every Beeper failure collapses into the one named unavailable state.
       setFailed(true);
     } finally {
@@ -579,7 +579,8 @@ function BeeperTab({ addMode, addAccount, onDone }: TabProps) {
       // Auth succeeded — hold the account and render the coverage disclosure
       // gate. `addAccount`/`onDone` run only on explicit acknowledgment (FR-7).
       setPendingAccount(account);
-    } catch {
+    } catch (raw) {
+      logFailure("login.beeper")(raw);
       setFailed(true);
     } finally {
       setPending(false);

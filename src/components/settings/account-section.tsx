@@ -54,6 +54,8 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { reportFrontendError } from "@/lib/crash-report";
+import { logFailure } from "@/lib/failure";
 import {
   type AccountDeviceVm,
   accountCancelSignIn,
@@ -149,8 +151,9 @@ export function AccountSection({ open }: { open: boolean }) {
           accountStore.getState().setVm(next);
         }
       })
-      .catch(() => {
-        // The subscription's last snapshot stands.
+      .catch((raw: unknown) => {
+        // The subscription's last snapshot stands; the failed read is logged.
+        reportFrontendError("account.state", raw, null);
       });
     return () => {
       abandoned = true;
@@ -215,7 +218,10 @@ function ConfiguredAccount({ vm }: { vm: OrgAccountVm }) {
     setError(null);
     void call()
       .then((next) => accountStore.getState().setVm(next))
-      .catch((raw: unknown) => setError(syncErrorMessage(raw, ACCOUNT_ACTION_FAILED)))
+      .catch((raw: unknown) => {
+        logFailure("account.action")(raw);
+        setError(syncErrorMessage(raw, ACCOUNT_ACTION_FAILED));
+      })
       .finally(() => setBusy(false));
   };
 
@@ -230,7 +236,10 @@ function ConfiguredAccount({ vm }: { vm: OrgAccountVm }) {
       await answer();
       accountStore.getState().setVm(await accountState());
     })()
-      .catch((raw: unknown) => setError(syncErrorMessage(raw, failed)))
+      .catch((raw: unknown) => {
+        logFailure("account.answerListening")(raw);
+        setError(syncErrorMessage(raw, failed));
+      })
       .finally(() => setBusy(false));
   };
 
@@ -301,7 +310,16 @@ function ConfiguredAccount({ vm }: { vm: OrgAccountVm }) {
         </p>
       )}
 
-      {vm.sentence !== null && <p role="status">{vm.sentence}</p>}
+      {/* A failed step is Rust's `problem` (R381): said as an alert, never a
+          quiet line that reads like the signed-out instruction. */}
+      {vm.sentence !== null && (
+        <p
+          role={vm.problem ? "alert" : "status"}
+          className={vm.problem ? "text-destructive" : undefined}
+        >
+          {vm.sentence}
+        </p>
+      )}
       {vm.restore.sentence !== null && <p>{vm.restore.sentence}</p>}
       {vm.restore.pending.map((line) => (
         <p key={line}>{line}</p>
@@ -350,9 +368,10 @@ function ConfiguredAccount({ vm }: { vm: OrgAccountVm }) {
             variant="outline"
             size="sm"
             onClick={() =>
-              void accountCancelSignIn().catch((raw: unknown) =>
-                setError(syncErrorMessage(raw, ACCOUNT_ACTION_FAILED)),
-              )
+              void accountCancelSignIn().catch((raw: unknown) => {
+                logFailure("account.cancelSignIn")(raw);
+                setError(syncErrorMessage(raw, ACCOUNT_ACTION_FAILED));
+              })
             }
           >
             {ACCOUNT_CANCEL_SIGN_IN_LABEL}

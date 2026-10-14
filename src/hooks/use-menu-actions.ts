@@ -21,6 +21,7 @@
 import { listen } from "@tauri-apps/api/event";
 import { useEffect } from "react";
 import { dispatchPaletteAction } from "@/components/command-palette/actions";
+import { logFailure } from "@/lib/failure";
 import { effectiveIsUnread, roomsStore } from "@/lib/stores/rooms";
 
 /** Canonical (positive) toggle id → its opposite (negative) direction. */
@@ -92,9 +93,8 @@ export function useMenuActions(): void {
             unlisten = fn;
           }
         })
-        .catch(() => {
-          // No Tauri host — the menu bridge is inert in this environment.
-        });
+        // No Tauri host — the menu bridge is inert in this environment.
+        .catch(logFailure("menu.listen"));
     } catch {
       // `listen` can throw synchronously when the Tauri IPC internals are absent.
     }

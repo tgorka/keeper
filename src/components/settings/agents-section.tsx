@@ -42,6 +42,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import { Textarea } from "@/components/ui/textarea";
+import { logFailure } from "@/lib/failure";
 import {
   type AgentCopyVm,
   type AgentPersonVm,
@@ -136,6 +137,7 @@ export function AgentsSection({ open }: { open: boolean }) {
       setRows(await agentsCopies());
       setLoadError(null);
     } catch (error) {
+      logFailure("agents.copies")(error);
       setLoadError(messageOf(error));
     }
   }, []);
@@ -145,6 +147,7 @@ export function AgentsSection({ open }: { open: boolean }) {
       setOffer(await agentsSeedOffer());
       setOfferError(null);
     } catch (error) {
+      logFailure("agents.seedOffer")(error);
       setOfferError(messageOf(error));
     }
   }, []);
@@ -162,7 +165,10 @@ export function AgentsSection({ open }: { open: boolean }) {
         ),
       )
       // The sections below say what failed.
-      .catch(() => setMacKeeps(true));
+      .catch((raw: unknown) => {
+        logFailure("agents.macKeeps")(raw);
+        setMacKeeps(true);
+      });
     const timer = setInterval(() => void reload(), AGENTS_RELOAD_MS);
     return () => clearInterval(timer);
   }, [open, reload, reloadOffer]);
@@ -346,6 +352,7 @@ function PinReview({
         }),
       );
     } catch (failure) {
+      logFailure("agents.driveRepin")(failure);
       setError(messageOf(failure));
     } finally {
       setBusy(false);
@@ -439,6 +446,7 @@ function AgentRow({
       setPassword("");
       await onChanged();
     } catch (failure) {
+      logFailure("agents.copySignIn")(failure);
       setError(messageOf(failure));
     } finally {
       setBusy(false);
@@ -594,6 +602,7 @@ function SeedSetup({
     try {
       setPlan(await agentsSeedPlan(request()));
     } catch (failure) {
+      logFailure("agents.seedPlan")(failure);
       setError(messageOf(failure));
     } finally {
       setBusy(false);
@@ -608,6 +617,7 @@ function SeedSetup({
       setPlan(null);
       await onSeeded();
     } catch (failure) {
+      logFailure("agents.seedApply")(failure);
       setError(messageOf(failure));
     } finally {
       setBusy(false);

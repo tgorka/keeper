@@ -25,6 +25,7 @@ import {
 } from "@/components/ui/context-menu";
 import { useLongPress } from "@/hooks/use-long-press";
 import { useShellLayout } from "@/hooks/use-shell-layout";
+import { logFailure, sayFailure } from "@/lib/failure";
 import type { InboxRoomVm } from "@/lib/ipc/client";
 import { setFavoritesCollapsed, unfavoriteRoom } from "@/lib/ipc/client";
 import { favoritesUiStore, useFavoritesUiStore } from "@/lib/stores/favorites-ui";
@@ -57,9 +58,9 @@ export function FavoritesSection({ favorites, onSelect, selected }: FavoritesSec
   const onToggle = () => {
     const next = !isCollapsed;
     setCollapsed(next);
-    // Persist the collapse chrome (best-effort — a registry error is swallowed;
-    // the in-memory state still toggles).
-    void setFavoritesCollapsed(next).catch(() => {});
+    // Persist the collapse chrome (best-effort — a registry error is logged; the
+    // in-memory state still toggles).
+    void setFavoritesCollapsed(next).catch(logFailure("favorites.setCollapsed"));
   };
 
   return (
@@ -112,7 +113,9 @@ export function FavoritesSection({ favorites, onSelect, selected }: FavoritesSec
                     <ContextMenuItem
                       className={phone ? "min-h-11" : undefined}
                       onSelect={() => {
-                        void unfavoriteRoom(room.accountId, room.roomId).catch(() => {});
+                        void unfavoriteRoom(room.accountId, room.roomId).catch(
+                          sayFailure("chat.unfavorite", "keeper couldn't unfavorite the chat."),
+                        );
                       }}
                     >
                       Unfavorite
@@ -139,7 +142,8 @@ export async function hydrateFavoritesCollapsed(
   try {
     const collapsed = await getCollapsed();
     favoritesUiStore.getState().setCollapsed(collapsed);
-  } catch {
+  } catch (error) {
     // Missing/unreadable setting → keep the expanded default.
+    logFailure("favorites.getCollapsed")(error);
   }
 }

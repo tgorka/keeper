@@ -111,8 +111,10 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { useVoiceWakeMirror } from "@/hooks/use-voice-facts";
+import { logFailure } from "@/lib/failure";
 import type { VoiceUnavailableVm, VoiceWakeVm } from "@/lib/ipc/client";
 import { voiceAuthorize, voiceAvailability, voiceLocaleSet, voiceWakeSet } from "@/lib/ipc/client";
+import { useFailureNotice } from "@/lib/stores/failure-notices";
 import { syncErrorMessage } from "@/lib/stores/sync";
 import { isListening, useVoiceStore, voiceStore } from "@/lib/stores/voice";
 import { cn } from "@/lib/utils";
@@ -234,6 +236,9 @@ export function BotVoiceWake({
   const [draft, setDraft] = useState("");
   const [stopDraft, setStopDraft] = useState("");
   const [refusal, setRefusal] = useState<string | null>(null);
+  // A failure Rust met in the background — the phrase not re-armed, a synced
+  // phrase refused — said under the switch it belongs to (R381).
+  const background = useFailureNotice("voice");
   const [busy, setBusy] = useState(false);
 
   const held = wake?.phrase ?? null;
@@ -286,8 +291,10 @@ export function BotVoiceWake({
         setRefusal(null);
       })
       .catch((raw: unknown) => {
-        // A refusal is the phrase's, in Rust's words. The switch stays where
-        // Rust left it, because nothing was persisted.
+        // A refusal is the phrase's, in Rust's words, under the field; the log
+        // says it too (R387). The switch stays where Rust left it, because
+        // nothing was persisted.
+        logFailure("voice.wakeSet")(raw);
         setRefusal(syncErrorMessage(raw, WAKE_WRITE_FAILED));
       })
       .finally(() => setBusy(false));
@@ -307,6 +314,7 @@ export function BotVoiceWake({
       })
       .then((unavailable) => voiceStore.getState().applyAvailability(unavailable))
       .catch((raw: unknown) => {
+        logFailure("voice.localeSet")(raw);
         setRefusal(syncErrorMessage(raw, VOICE_LOCALE_WRITE_FAILED));
       })
       .finally(() => setBusy(false));
@@ -428,6 +436,11 @@ export function BotVoiceWake({
       {refusal !== null && (
         <p role="alert" className="text-destructive text-xs">
           {refusal}
+        </p>
+      )}
+      {background !== null && (
+        <p role="alert" className="text-destructive text-xs">
+          {background}
         </p>
       )}
       {unavailable !== null ? (

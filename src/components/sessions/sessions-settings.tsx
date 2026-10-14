@@ -42,6 +42,7 @@ import { useEffect, useRef, useState } from "react";
 import { FileControlled } from "@/components/settings/config-source-section";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
+import { logFailure } from "@/lib/failure";
 import { sessionsSpacesFoldedGet, sessionsSpacesFoldedSet } from "@/lib/ipc/client";
 import { sessionSpacesFoldStore, setSpacesFoldedDefault } from "@/lib/stores/session-spaces-fold";
 import { refreshSessionsRoots, useSessionsRootsStore } from "@/lib/stores/sessions-roots";
@@ -109,7 +110,8 @@ function SessionsSpacesFoldedRow() {
           setSpacesFoldedDefault(value);
         }
       })
-      .catch(() => {
+      .catch((raw: unknown) => {
+        logFailure("sessions.spacesFoldedGet")(raw);
         // The store's value, not a hard-coded `false`: it is what the spaces on
         // screen are actually obeying, and a switch that claimed the opposite of
         // them because a read failed — enabled, unchecked, and a flip that
@@ -140,7 +142,8 @@ function SessionsSpacesFoldedRow() {
     // until the next document. Chaining makes the last flip the last write.
     pending.current = pending.current
       .then(() => sessionsSpacesFoldedSet(next))
-      .catch(() => {
+      .catch((raw: unknown) => {
+        logFailure("sessions.spacesFoldedSet")(raw);
         if (id === writeId.current) {
           setFolded(previous);
           setSpacesFoldedDefault(previous);

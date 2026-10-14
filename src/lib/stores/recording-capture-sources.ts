@@ -27,6 +27,7 @@
  * whole, and a whole-VM write settles the DESTINATION and rebuilds the
  * recordings index. A camera toggle means none of that.
  */
+import { logFailure, sayFailure } from "@/lib/failure";
 import {
   type RecordingCaptureSourcesVm,
   recordingCaptureSourcesGet,
@@ -128,7 +129,8 @@ export async function ensureCaptureSourcesHydrated(): Promise<void> {
     .then((vm) => {
       seed(vm, before);
     })
-    .catch(() => {
+    .catch((raw: unknown) => {
+      logFailure("recording.captureSourcesGet")(raw);
       // Allow a later retry rather than caching the failure forever.
       hydration = null;
     });
@@ -145,9 +147,9 @@ export async function ensureCaptureSourcesHydrated(): Promise<void> {
  * actually chose — the very bug the spec exists to end, re-entered through its
  * own fix.
  *
- * Best-effort: a refused or unreachable write leaves the session value standing,
- * so the switch the person is looking at is still the one this session applies —
- * it simply will not survive the relaunch.
+ * A refused or unreachable write leaves the session value standing, so the
+ * switch the person is looking at is still the one this session applies — it
+ * simply will not survive the relaunch, which is said rather than discovered.
  */
 export async function persistCaptureSources(
   patch: Partial<Record<CaptureSource, boolean>>,
@@ -174,8 +176,9 @@ export async function persistCaptureSources(
         setSessionValue(source, effective[source]);
       }
     }
-  } catch {
+  } catch (error) {
     // The session value stands; nothing here fails a toggle.
+    sayFailure("recording.rememberSources", "keeper couldn't remember this for next time.")(error);
   }
 }
 

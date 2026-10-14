@@ -8,6 +8,7 @@
  * is a payload that can drift (AD-114).
  */
 import { useEffect } from "react";
+import { logFailure } from "@/lib/failure";
 import { listenSessionsChanged, sessionsList } from "@/lib/ipc/client";
 import { sessionsListStore } from "@/lib/stores/sessions-list";
 import { refreshSessionsRoots } from "@/lib/stores/sessions-roots";
@@ -20,6 +21,7 @@ async function readRows(rootId: string, isLive: () => boolean): Promise<void> {
       sessionsListStore.getState().reset(rootId, rows);
     }
   } catch (error) {
+    logFailure("sessions.list")(error);
     if (isLive()) {
       sessionsListStore.getState().setError(error instanceof Error ? error.message : String(error));
     }

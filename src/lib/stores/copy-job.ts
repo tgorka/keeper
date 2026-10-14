@@ -25,6 +25,7 @@
  */
 import { useStore } from "zustand";
 import { createStore } from "zustand/vanilla";
+import { logFailure } from "@/lib/failure";
 import {
   type CopyEntryVm,
   type CopyJobState,
@@ -190,6 +191,7 @@ export async function refreshCopyJob(): Promise<void> {
       copyJobStore.getState().applyJob(job);
     }
   } catch (raw) {
+    logFailure("copy.status")(raw);
     if (copyJobStore.getState().id === id) {
       copyJobStore.getState().fail(syncErrorMessage(raw, COPY_UNKNOWN_ERROR));
     }
@@ -220,6 +222,7 @@ export async function startCopyJob(
   try {
     copyJobStore.getState().started(await copyStart(source, destination, replaceExisting));
   } catch (raw) {
+    logFailure("copy.start")(raw);
     copyJobStore.getState().fail(syncErrorMessage(raw, COPY_UNKNOWN_ERROR));
     return;
   }
@@ -240,6 +243,7 @@ export async function cancelCopyJob(): Promise<void> {
   try {
     await copyCancel(id);
   } catch (raw) {
+    logFailure("copy.cancel")(raw);
     copyJobStore.getState().fail(syncErrorMessage(raw, COPY_UNKNOWN_ERROR));
     return;
   }

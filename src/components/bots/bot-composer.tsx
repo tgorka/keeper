@@ -62,6 +62,7 @@ import {
   slashToken,
 } from "@/components/bots/bot-slash-menu";
 import { Button } from "@/components/ui/button";
+import { logFailure } from "@/lib/failure";
 import type { BotCommandPreviewVm, BotCommandRowVm } from "@/lib/ipc/client";
 import { botsCommandPreview } from "@/lib/ipc/client";
 import { cn } from "@/lib/utils";
@@ -218,7 +219,8 @@ export function BotComposer({
       // A preview that failed leaves the menu closed. The draft is still
       // sendable — the submit path asks again and reports what happens there,
       // where a person is waiting for an answer rather than typing.
-      .catch(() => {
+      .catch((raw: unknown) => {
+        logFailure("bots.commandPreview")(raw);
         if (live) {
           setPreview(null);
         }
@@ -256,7 +258,10 @@ export function BotComposer({
                 .then((all) => setHelp({ rows: all.rows, escapeHint: all.escapeHint }))
                 // The narrowed answer is still the truth about this token, and
                 // a panel of one row beats a panel that never opened.
-                .catch(() => setHelp({ rows, escapeHint: answer.escapeHint }));
+                .catch((raw: unknown) => {
+                  logFailure("bots.commandHelp")(raw);
+                  setHelp({ rows, escapeHint: answer.escapeHint });
+                });
               return;
             }
             setRefusal(onCommand({ name: answer.verdict.name, args: answer.verdict.args }));
@@ -271,7 +276,8 @@ export function BotComposer({
           }
         }
       })
-      .catch(() => {
+      .catch((raw: unknown) => {
+        logFailure("bots.commandResolve")(raw);
         // Resolution is a pure, local call; a rejection means the shell is
         // gone, and sending text nobody resolved is the one thing this
         // component must not do.

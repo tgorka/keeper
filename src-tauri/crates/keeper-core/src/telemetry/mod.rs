@@ -78,12 +78,42 @@ impl TelemetryEventKind {
     }
 }
 
+/// Which declared surface a `keeper_interaction` belongs to (Epic 100,
+/// R381, 100.1 #9). A closed set of content-free names: never a command, a
+/// room, an agent or anything typed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum TelemetrySurface {
+    /// The chat composer's slash menu opened.
+    SlashMenuOpened,
+    /// A command was chosen from the slash menu.
+    SlashMenuChosen,
+    /// keeper opened at launch on the default agent's conversation.
+    LaunchDefaultAgent,
+}
+
+impl TelemetrySurface {
+    /// The value exported as the event's `surface` property.
+    fn name(self) -> &'static str {
+        match self {
+            Self::SlashMenuOpened => "slash_menu_opened",
+            Self::SlashMenuChosen => "slash_menu_chosen",
+            Self::LaunchDefaultAgent => "launch_default_agent",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[ts(export)]
 pub struct TelemetryEventReq {
     pub kind: TelemetryEventKind,
     pub duration_ms: Option<f64>,
+    /// Only on [`TelemetryEventKind::Interaction`]; absent everywhere else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub surface: Option<TelemetrySurface>,
 }
 
 impl TelemetryEventReq {
@@ -92,6 +122,9 @@ impl TelemetryEventReq {
             .duration_ms
             .is_some_and(|ms| !ms.is_finite() || !(0.0..=MAX_DURATION_MS).contains(&ms))
         {
+            return Err(TelemetryError::InvalidEvent);
+        }
+        if self.surface.is_some() && self.kind != TelemetryEventKind::Interaction {
             return Err(TelemetryError::InvalidEvent);
         }
         Ok(())
@@ -275,6 +308,8 @@ impl Operation {
 struct Record {
     operation: Operation,
     duration_ms: Option<f64>,
+    /// A declared interaction surface (closed set), never content.
+    surface: Option<TelemetrySurface>,
     start: u64,
     end: u64,
     trace_id: String,
@@ -290,6 +325,7 @@ impl Record {
         Self {
             operation: Operation::Frontend(event.kind),
             duration_ms: event.duration_ms,
+            surface: event.surface,
             start: end.saturating_sub(elapsed as u64),
             end,
             trace_id: random_id::<16>(),
@@ -564,6 +600,7 @@ impl Telemetry {
             ] {
                 inner.queue.push_back(Record {
                     operation,
+                    surface: None,
                     span_id,
                     parent_span_id: parent,
                     trace_id: trace_id.clone(),
@@ -660,6 +697,9 @@ fn batch_payload(config: &PublicConfig, id: &str, record: &Record) -> Option<ser
     });
     if let Some(duration) = record.duration_ms {
         properties["duration_ms"] = duration.into();
+    }
+    if let Some(surface) = record.surface {
+        properties["surface"] = surface.name().into();
     }
     let exception = matches!(kind, TelemetryEventKind::FrontendError).then(|| {
         // A fixed handled category, never the source exception, stack, query or URL.

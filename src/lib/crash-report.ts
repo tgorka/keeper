@@ -1,3 +1,4 @@
+import { describeFailure } from "@/lib/failure-envelope";
 import { frontendErrorReport } from "@/lib/ipc/client";
 
 /**
@@ -5,9 +6,13 @@ import { frontendErrorReport } from "@/lib/ipc/client";
  *
  * A render loop or a failing timer can raise the same error every frame; the
  * log is for reading the first few back off a user's machine, not for a
- * gigabyte of one line. Identical messages are written once.
+ * gigabyte of one line. The same failure from the same source — the same
+ * `source` and the same classification ({@link describeFailure}: an IPC
+ * envelope's code, an `Error`'s name and message) — is written once. A
+ * hundred, not twenty (R387): polled reads report their failures too, and
+ * twenty distinct lines could be spent on those before a later, different one.
  */
-const MAX_REPORTS_PER_LOAD = 20;
+const MAX_REPORTS_PER_LOAD = 100;
 const reported = new Set<string>();
 
 /**
@@ -22,13 +27,25 @@ export function reportFrontendError(
   error: unknown,
   componentStack: string | null,
 ): void {
-  const message = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
-  if (reported.has(message) || reported.size >= MAX_REPORTS_PER_LOAD) {
+  const { classification, message } = describeFailure(error);
+  const key = `${source}\u0000${classification}`;
+  if (reported.has(key) || reported.size >= MAX_REPORTS_PER_LOAD) {
     return;
   }
-  reported.add(message);
+  reported.add(key);
   const stack = error instanceof Error ? (error.stack ?? null) : null;
-  void frontendErrorReport(source, message, stack, componentStack).catch(() => {});
+  // The log itself refused the line, so the devtools console is the only
+  // witness left; never a second report, which would loop through here.
+  const refused = (failure: unknown) => {
+    console.error("crash-report: keeper.log refused a report", source, message, failure);
+  };
+  try {
+    void frontendErrorReport(source, message, stack, componentStack).catch(refused);
+  } catch (failure) {
+    // A wrapper that throws before it returns a promise is refused the same
+    // way: this runs inside other catch handlers, so it must not throw.
+    refused(failure);
+  }
 }
 
 /**

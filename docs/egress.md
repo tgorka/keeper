@@ -491,7 +491,7 @@ host `us.posthog.com` is used only by separate maintainer tooling, not by the ap
 
 | Consent | What may leave | What it cannot enable |
 | --- | --- | --- |
-| Diagnostics | Closed readiness/interaction durations, sanitized frontend-error categories and content-free diagnostic records/operation traces | Raw exception text, stack payloads, arbitrary tracing strings or wholesale application logs |
+| Diagnostics | Closed readiness/interaction durations, sanitized frontend-error categories and content-free diagnostic records/operation traces | Raw exception text, stack payloads, arbitrary tracing strings or wholesale application logs; Rust panics in any form (Epic 100, R387: they stay in `keeper.log`) |
 | Product statistics | Closed events for opening the command palette or settings | Search text, command names, setting values, person profiles or account identifiers |
 | Remote configuration | A request for the public `keeper-client-config` flag payload and a bounded support sentence | Collection, consent, security policy, destinations, grants, encryption changes or synchronized user preferences |
 | Synthetic usability study | Replay/heatmaps of a separate synthetic surface after explicit per-session start | Normal-app DOM or real account, drive, note, bot or recording content |
@@ -501,6 +501,16 @@ or email, and no implicit cross-device identity. Payloads exclude messages,
 filenames, local paths, notes, credentials, recordings, bot prompts/responses,
 normal-app URLs, arbitrary DOM attributes, console values and network bodies.
 Recording zero-egress and on-device speech guarantees are unchanged.
+
+**Epic 100 (R381, as amended by R387) adds one thing and nothing else:** a
+closed `surface` property on `keeper_interaction` — `slash_menu_opened`,
+`slash_menu_chosen`, `launch_default_agent` — never the command, its arguments,
+the room or the agent. A Rust panic is an `ERROR` line in `keeper.log` only and
+is not counted in telemetry at all: a process whose runtime workers poll agent
+and non-agent work alike has no boundary that could tell an agent's panic
+apart, and agents stay out of PostHog fail-closed (S-19, NFR-121). What is
+logged where, and what never leaves the device, is
+[docs/observability.md](observability.md).
 
 **Transport still reveals metadata.** Direct HTTPS necessarily exposes the
 client's source IP, request timing and ordinary connection metadata to PostHog

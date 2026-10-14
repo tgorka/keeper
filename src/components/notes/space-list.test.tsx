@@ -9,6 +9,7 @@ import { ALL_NOTES_SCOPE } from "@/lib/stores/notes-filters";
 // list opens reaches for four more commands, and the delete confirmation for
 // two, so they are stubbed here too.
 vi.mock("@/lib/ipc/client", () => ({
+  frontendErrorReport: vi.fn(async () => {}),
   notesSpaces: vi.fn(),
   notesSpacesRestoreDefaults: vi.fn(),
   notesSpaceTerms: vi.fn(),

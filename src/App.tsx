@@ -22,10 +22,12 @@ import { useSessionRestore } from "@/hooks/use-session-restore";
 import { useTelemetryReadiness } from "@/hooks/use-telemetry";
 import { useWebviewGuard } from "@/hooks/use-webview-guard";
 import { startAgentSurface } from "@/lib/agents/surface";
+import { logFailure } from "@/lib/failure";
 import { encryptionPosture, firstRunSetupSkippedGet, telemetryStudyStop } from "@/lib/ipc/client";
 import { useAccountsStore } from "@/lib/stores/accounts";
 import { useAddAccountStore } from "@/lib/stores/add-account";
 import { useCapabilitiesStore } from "@/lib/stores/capabilities";
+import { useFailureNotices } from "@/lib/stores/failure-notices";
 import { primaryViewStore } from "@/lib/stores/primary-view";
 import { useWizardStore, wizardStore } from "@/lib/stores/wizard";
 
@@ -52,10 +54,15 @@ function App() {
   useEffect(() => {
     // App is a different document: any former study recorder and its transport are gone.
     // Retry stale disclosure only here, never before the study's synchronous network fence.
+    // Safe overdisclosure if IPC is unavailable. The log line is a fixed sentence,
+    // never the arbitrary IPC error.
     void telemetryStudyStop().catch(() => {
-      // Safe overdisclosure if IPC is unavailable; never log an arbitrary IPC error.
+      logFailure("app.studyStop")("telemetry study stop failed");
     });
   }, []);
+  // Background failures Rust tells (R381): a toast, and the line under the
+  // surface's own switch.
+  useFailureNotices();
   // Surface requests from the person's own agent: opened at once,
   // because Rust drops a request nobody subscribed for yet; and the primary
   // view this device's presence publishes.
@@ -150,7 +157,8 @@ function App() {
           setSetupSkipped(value);
         }
       })
-      .catch(() => {
+      .catch((raw: unknown) => {
+        logFailure("app.setupSkippedRead")(raw);
         if (!cancelled) {
           setSetupSkipped(false);
         }
@@ -181,7 +189,8 @@ function App() {
           setPostureChosen(value);
         }
       })
-      .catch(() => {
+      .catch((raw: unknown) => {
+        logFailure("app.encryptionPosture")(raw);
         // On a read failure, treat the posture as chosen-off so the user is never
         // trapped before login (the honest default is FileVault only).
         if (!cancelled) {

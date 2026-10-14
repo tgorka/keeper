@@ -44,6 +44,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { IconHint } from "@/components/ui/tooltip";
+import { logFailure } from "@/lib/failure";
 import type { AgentFocusReq, ProxyRoomVm, ScopeDriveVm } from "@/lib/ipc/client";
 import { agentConversationNew, agentFocus, agentRoomsList, agentScopeSet } from "@/lib/ipc/client";
 import { useAccountsStore } from "@/lib/stores/accounts";
@@ -220,6 +221,7 @@ export function DockBody({ tellsNote = true }: { tellsNote?: boolean }) {
       }
       return next;
     } catch (error: unknown) {
+      logFailure("notes.agentRooms")(error);
       if (alive.current && mine === generation.current) {
         setListed((was) => was ?? []);
         setListError(syncErrorMessage(error, "keeper could not list your assistant's rooms."));
@@ -437,17 +439,19 @@ function NoteFocus({ accountId, roomId }: RoomRef) {
   focusRef.current = focus;
 
   useEffect(() => {
-    void agentFocus(accountId, roomId, nextFocusSeq(), focus).catch(() => {});
+    void agentFocus(accountId, roomId, nextFocusSeq(), focus).catch(logFailure("agent.focus"));
   }, [accountId, roomId, focus]);
 
   useEffect(() => {
     const timer = setInterval(() => {
       const now = focusRef.current;
-      if (now !== null) void agentFocus(accountId, roomId, nextFocusSeq(), now).catch(() => {});
+      if (now !== null) {
+        void agentFocus(accountId, roomId, nextFocusSeq(), now).catch(logFailure("agent.focus"));
+      }
     }, FOCUS_HEARTBEAT_MS);
     return () => {
       clearInterval(timer);
-      void agentFocus(accountId, roomId, nextFocusSeq(), null).catch(() => {});
+      void agentFocus(accountId, roomId, nextFocusSeq(), null).catch(logFailure("agent.focus"));
     };
   }, [accountId, roomId]);
 
@@ -481,6 +485,7 @@ function NewConversation({
         onAsked();
       })
       .catch((raw: unknown) => {
+        logFailure("notes.agentConversationNew")(raw);
         setError(syncErrorMessage(raw, `keeper could not ask ${proxyName}.`));
       })
       .finally(() => setAsking(false));
@@ -616,7 +621,10 @@ function ScopeEditor({
         setOpen(false);
         if (echoedNow.current === before) setWaiting("asked");
       })
-      .catch((raw: unknown) => setError(syncErrorMessage(raw, "keeper could not ask for that.")))
+      .catch((raw: unknown) => {
+        logFailure("notes.agentScopeSet")(raw);
+        setError(syncErrorMessage(raw, "keeper could not ask for that."));
+      })
       .finally(() => setSending(false));
   };
 

@@ -10590,3 +10590,38 @@ origin: makistack's electra (2026-10-14): in Nixi's DM, 283 of the newest 300 ev
 location: `keeper_agent::hosts` (claim renewal), `keeper_core::agents::claims`
 reason: 1 440 state events a day per served session room. A person's client must page through them to reach a message after any limited sync, and every Matrix client a person might use shows a session room as mostly invisible state. keeper's window now fills itself in 200-event pages (`conversation-body.tsx`), which hides the symptom. A fix at the source: renew less often (a longer lease with the same takeover semantics), or keep the lease's heartbeat out of the room's timeline — e.g. renew only near expiry, or move liveness to the host manifest in the control room and write the session claim only on acquire, release and takeover.
 status: open
+
+### DW-1386: Marta's organisation-account setup is proved against a stub callback, not against ZITADEL.
+
+origin: rung `agents-100-errors` (story 100.1 #2–#4, 2026-10-14)
+location: `keeper_core::org_account::oidc::authorize`, `account_ipc::converge`, `account-setup-sheet.tsx`
+reason: the live `access_denied` needs an account the keeper application refuses; proving it would mean a throwaway ZITADEL user with a password (a configuration change) or a person's own password, both outside the rung's leave. The stub callback proves every outcome (`each_way_a_sign_in_ends_without_a_code_reads_as_itself`, `a_refused_sign_in_leaves_one_warning_and_a_problem`). Owed on hesperia: set up Marta's account end to end, read the sheet's sentence and `keeper.log`'s `account: a step did not finish` line.
+status: open
+
+### DW-1387: A panic in a process that never ran `setup()` reaches no log.
+
+origin: rung `agents-100-errors` (story 100.1 #1, 2026-10-14); the same gap as DW-1263
+location: `debug_log::init` (installs the panic hook), iOS background launch (`push_ios.rs`)
+reason: the hook and the file writer are both installed by `setup()`. An iOS push wake that never reaches it panics to stderr only. Installing the hook earlier (in `run()` before the builder) would cover it, but the file writer would still be missing.
+status: open
+
+### DW-1388: A restored Matrix sign-in whose start flag does not read stays a log line.
+
+origin: rung `agents-100-errors` (story 100.1 #5 audit, 2026-10-14)
+location: `account_ipc::start_matrix_sign_in` (`registry::get_account_restore_matrix_started` → `warn` + return)
+reason: left as a `WARN`: the account still sits in Settings › Account's offers, so the person can sign it in by hand; a sentence would repeat the offer.
+status: open
+
+### DW-1389: A gateway's session list that does not read stays at `debug!`.
+
+origin: rung `agents-100-errors` (story 100.1 #5 audit, 2026-10-14)
+location: `bots_ipc` session refresh (`bots: gateway session list not read; local list stands`)
+reason: left at `debug`: it fires on every refresh while a gateway is offline and the local list stands unchanged, so a `WARN` would fill `keeper.log` with one line per refresh per bot. The transcript fallback beside it (`gateway transcript not read`) moved to `WARN`.
+status: open
+
+### DW-1390: The rung's shell edits are inspected, not compiled, for iOS and Android.
+
+origin: rung `agents-100-errors` (2026-10-14)
+location: `push_ios.rs`, `push_android.rs` (`failure_notice::tell`), `web_auth.rs` (`OAuthFlowRegistry::fail`), `voice_ipc.rs`
+reason: the macOS check compiles the desktop target only; the phone ports are `cfg(target_os = "ios" | "android")` and compile in CI's mobile jobs or a phone build. Owed: an iOS and an Android build, and a push registration the homeserver refuses read back as the toast and the line under Settings' push setting.
+status: open

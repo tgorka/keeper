@@ -51,6 +51,7 @@ use keeper_core::agents::unifiedpush::{
     self as up, DiscoveryRefusal, Distributor, DistributorChoice, Endpoint, KeptEndpoint,
     PhoneNotification, PusherChange, UnifiedPushStatus, UnifiedPushVm,
 };
+use keeper_core::failure::{FailureOperation, PUSH_NOT_REGISTERED};
 use keeper_core::org_account::layout::DeviceClass;
 use serde_json::{json, Value};
 use tauri::ipc::{Channel, InvokeResponseBody};
@@ -117,7 +118,12 @@ pub fn set_up(app: &AppHandle) {
     let _ = APP.set(app.clone());
     tauri::async_runtime::spawn(async {
         if let Err(error) = start().await {
-            tracing::warn!(error, "push: UnifiedPush could not start");
+            crate::failure_notice::tell(
+                FailureOperation::PushRegistration,
+                None,
+                "Push notifications could not start on this phone, so messages arrive only while keeper is open.",
+                &error,
+            );
         }
     });
 }
@@ -395,16 +401,34 @@ type Outcomes = Result<
 fn log_outcomes(outcomes: Outcomes) {
     match outcomes {
         Ok(outcomes) => {
+            // The registration reached the accounts: a failure of push as a
+            // whole is over; each account's own outcome sets or clears its
+            // own (R387).
+            crate::failure_notice::recovered(FailureOperation::PushRegistration, None);
             for (account, outcome) in outcomes {
                 match outcome {
-                    Ok(registered) => tracing::info!(account, ?registered, "push: pusher"),
-                    Err(error) => {
-                        tracing::warn!(account, %error, "push: could not register the pusher");
+                    Ok(registered) => {
+                        tracing::info!(account, ?registered, "push: pusher");
+                        crate::failure_notice::recovered(
+                            FailureOperation::PushRegistration,
+                            Some(account.as_str()),
+                        );
                     }
+                    Err(error) => crate::failure_notice::tell(
+                        FailureOperation::PushRegistration,
+                        Some(account.as_str()),
+                        PUSH_NOT_REGISTERED,
+                        &error,
+                    ),
                 }
             }
         }
-        Err(error) => tracing::warn!(%error, "push: could not list the accounts"),
+        Err(error) => crate::failure_notice::tell(
+            FailureOperation::PushRegistration,
+            None,
+            PUSH_NOT_REGISTERED,
+            &error,
+        ),
     }
 }
 

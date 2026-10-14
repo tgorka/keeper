@@ -71,6 +71,7 @@ import { Label } from "@/components/ui/label";
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import { Switch } from "@/components/ui/switch";
 import { IconHint } from "@/components/ui/tooltip";
+import { logFailure, sayFailure } from "@/lib/failure";
 import type {
   BotModelVm,
   BotVm,
@@ -712,6 +713,7 @@ export function TaskForm({
         }
         setProfiles(listed);
       } catch (raw) {
+        logFailure("taskForm.profiles")(raw);
         if (abandoned) {
           return;
         }
@@ -930,6 +932,7 @@ export function TaskForm({
       });
       onSaved?.(saved);
     } catch (raw) {
+      logFailure("taskForm.save")(raw);
       setError(syncErrorMessage(raw));
     } finally {
       setSaving(false);
@@ -1527,8 +1530,10 @@ function CopyTaskFields({ form, fieldId, saving, onChange }: KindFieldsProps) {
     try {
       const selection = await openFolder({ directory: true });
       if (typeof selection === "string") onChange({ [key]: selection });
-    } catch {
-      // The native copy card's rule: cancellation/failure keeps the prior choice.
+    } catch (error) {
+      // The native copy card's rule: a failure keeps the prior choice, and a
+      // cancellation resolves without a folder rather than landing here.
+      sayFailure("tasks.pickFolder", "keeper couldn't open the folder picker.")(error);
     }
   };
   return (

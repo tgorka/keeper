@@ -49,6 +49,7 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { logFailure } from "@/lib/failure";
 import type { BotVm } from "@/lib/ipc/client";
 import { botsBotIdentitySave } from "@/lib/ipc/client";
 import { syncErrorMessage } from "@/lib/stores/sync";
@@ -356,6 +357,7 @@ export function BotIdentityPicker({
       onSaved(saved);
       onOpenChange(false);
     } catch (raw: unknown) {
+      logFailure("bots.identitySave")(raw);
       setRefusal(syncErrorMessage(raw, "keeper couldn't save this identity."));
     } finally {
       setSaving(false);

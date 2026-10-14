@@ -6,8 +6,11 @@ vi.mock("@/lib/ipc/client", () => ({
   recordingStop: vi.fn(),
   recordingStatus: vi.fn(),
   recordingAcknowledge: vi.fn(),
+  frontendErrorReport: vi.fn(() => Promise.resolve()),
 }));
+vi.mock("sonner", () => ({ toast: { error: vi.fn() } }));
 
+import { toast } from "sonner";
 import { IDLE_RECORDING_STATUS, useRecordingSession } from "@/hooks/use-recording-session";
 import type { RecordingStatusVm } from "@/lib/ipc/client";
 import {
@@ -71,7 +74,7 @@ describe("useRecordingSession (Story 18.4 acknowledge)", () => {
     expect(result.current.status).toEqual(IDLE_RECORDING_STATUS);
   });
 
-  it("a failed acknowledge() keeps the honest failed snapshot", async () => {
+  it("a failed acknowledge() keeps the honest failed snapshot and says why", async () => {
     mockStatus.mockResolvedValue(FAILED);
     mockAcknowledge.mockRejectedValue({ message: "ipc unavailable" });
     const { result } = renderHook(() => useRecordingSession());
@@ -83,6 +86,8 @@ describe("useRecordingSession (Story 18.4 acknowledge)", () => {
     // Never an invented reset: the snapshot stays failed until Rust clears it.
     expect(result.current.status.state).toBe("failed");
     expect(result.current.status.error).toBe("keeper-rec exited unexpectedly");
+    // The dismiss the person asked for did not happen, so they hear Rust's reason.
+    expect(vi.mocked(toast.error)).toHaveBeenCalledWith("ipc unavailable");
   });
 });
 

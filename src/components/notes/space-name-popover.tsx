@@ -5,6 +5,7 @@ import { Label } from "@/components/ui/label";
 import { Popover, PopoverAnchor, PopoverContent } from "@/components/ui/popover";
 import { Switch } from "@/components/ui/switch";
 import { useShellLayout } from "@/hooks/use-shell-layout";
+import { logFailure } from "@/lib/failure";
 import { syncErrorMessage } from "@/lib/stores/sync";
 import { cn } from "@/lib/utils";
 
@@ -51,6 +52,7 @@ export function SpaceNamePopover({
       await onSave(name.trim(), { ttlHours: temporary ? Number(hours) : null });
       onClose();
     } catch (error) {
+      logFailure("notes.spaceName")(error);
       setFailure(syncErrorMessage(error, "keeper couldn't save this space."));
     } finally {
       pending.current = false;

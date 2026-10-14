@@ -15,6 +15,7 @@
  */
 import { useStore } from "zustand";
 import { createStore } from "zustand/vanilla";
+import { logFailure } from "@/lib/failure";
 import type { VerificationFlowVm } from "@/lib/ipc/client";
 import { verificationCancel } from "@/lib/ipc/client";
 
@@ -44,9 +45,11 @@ export const verificationStore = createStore<VerificationState>()((set, get) => 
     const { activeAccountId, flow } = get();
     // Best-effort cancel of a still-cancellable flow so we never leave a dangling
     // request on the SDK when the user dismisses the modal (the Rust core no-ops a
-    // missing/terminal flow). Failures are swallowed — the modal still closes.
+    // missing/terminal flow). Failures are logged — the modal still closes.
     if (activeAccountId && flow && shouldCancelOnClose(flow.phase)) {
-      void verificationCancel(activeAccountId, flow.flowId).catch(() => {});
+      void verificationCancel(activeAccountId, flow.flowId).catch(
+        logFailure("verification.cancel"),
+      );
     }
     set({ modalOpen: false, activeAccountId: null, flow: null });
   },

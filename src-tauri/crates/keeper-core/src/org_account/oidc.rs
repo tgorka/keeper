@@ -603,13 +603,25 @@ async fn authorize(
     .await;
 
     let callback = match outcome {
-        Err(_) | Ok(Err(_)) | Ok(Ok(OAuthCallback::Cancelled)) => {
-            return Err(AccountError::Cancelled)
+        Err(_) => return Err(AccountError::TimedOut),
+        Ok(Err(_)) => {
+            return Err(AccountError::Interrupted(
+                "the sign-in ended without an answer".to_owned(),
+            ))
         }
-        Ok(Ok(OAuthCallback::Error(error))) if error == "access_denied" => {
-            return Err(AccountError::Cancelled)
+        Ok(Ok(OAuthCallback::Cancelled)) => return Err(AccountError::Cancelled),
+        Ok(Ok(OAuthCallback::Failed(reason))) => {
+            return Err(AccountError::Interrupted(
+                provider_words(&reason).unwrap_or_else(|| "no reason was given".to_owned()),
+            ))
         }
-        Ok(Ok(OAuthCallback::Error(error))) => {
+        Ok(Ok(OAuthCallback::Error { error, description })) if error == "access_denied" => {
+            return Err(AccountError::Denied {
+                host: provider.host.clone(),
+                reason: description.as_deref().and_then(provider_words),
+            })
+        }
+        Ok(Ok(OAuthCallback::Error { error, .. })) => {
             return Err(AccountError::Refused(format!(
                 "{} refused the sign-in ({error}).",
                 provider.host
@@ -630,6 +642,31 @@ async fn authorize(
         nonce,
         redirect: redirect_url,
     })
+}
+
+/// The longest piece of a provider's or platform's own words a sentence
+/// quotes. An `error_description` is the provider's text, shown to a person:
+/// bounded, on one line, with no control characters.
+const PROVIDER_WORDS_MAX: usize = 200;
+
+/// `raw` as words a sentence can quote, or `None` when nothing is left.
+fn provider_words(raw: &str) -> Option<String> {
+    let words: String = raw
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect();
+    let words = words.trim_end_matches(['.', ' ']);
+    if words.is_empty() {
+        return None;
+    }
+    let mut bounded: String = words.chars().take(PROVIDER_WORDS_MAX).collect();
+    if words.chars().count() > PROVIDER_WORDS_MAX {
+        bounded.push('…');
+    }
+    Some(bounded)
 }
 
 type TokenError = RequestTokenError<
@@ -1861,6 +1898,18 @@ mod tests {
         ExtraState,
         /// Calls back for a different flow's state.
         ForeignState,
+        /// The identity provider answers `error=access_denied`, with an
+        /// `error_description` when one is given.
+        Denied(Option<&'static str>),
+        /// The person closes the sign-in sheet.
+        Closed,
+        /// The platform's sheet fails with this reason.
+        SheetFailed(&'static str),
+        /// The flow is dropped without any answer.
+        Dropped,
+        /// The sheet stays open, unanswered, until something in keeper ends
+        /// the flow.
+        Waits,
     }
 
     struct FakePlatform {
@@ -1915,7 +1964,12 @@ mod tests {
             self.seen.lock().expect("seen").nonce = Some(one(&url, "nonce"));
             let state = one(&url, "state");
             let states = match self.browser {
-                Browser::Honest => format!("state={state}"),
+                Browser::Honest
+                | Browser::Denied(_)
+                | Browser::Closed
+                | Browser::SheetFailed(_)
+                | Browser::Dropped
+                | Browser::Waits => format!("state={state}"),
                 Browser::ExtraState => format!("state=evil&state={state}"),
                 Browser::ForeignState => "state=someone-else".to_owned(),
             };
@@ -1994,7 +2048,29 @@ mod tests {
                 .expect("shown")
                 .push((url.to_owned(), Some(callback_scheme.to_owned())));
             let callback = self.visit(url)?;
-            self.flows.resolve(&callback);
+            let state = one(&Url::parse(url).expect("authorize url"), "state");
+            match self.browser {
+                Browser::Denied(description) => {
+                    let mut answer =
+                        Url::parse(&callback).map_err(|e| CoreError::Internal(e.to_string()))?;
+                    answer.set_query(None);
+                    answer
+                        .query_pairs_mut()
+                        .append_pair("error", "access_denied")
+                        .extend_pairs(description.map(|d| ("error_description", d)))
+                        .append_pair("state", &state);
+                    self.flows.resolve(answer.as_str());
+                }
+                Browser::Closed => self.flows.cancel(&state),
+                Browser::SheetFailed(reason) => {
+                    self.flows.fail(&state, reason);
+                }
+                Browser::Dropped => self.flows.remove(&state),
+                Browser::Waits => {}
+                Browser::Honest | Browser::ExtraState | Browser::ForeignState => {
+                    self.flows.resolve(&callback);
+                }
+            }
             Ok(())
         }
         fn notify(&self, _: &str, _: &str, _: &NotifyTarget) -> Result<(), CoreError> {
@@ -2141,9 +2217,284 @@ mod tests {
 
         let result = sign_in_within(&p, &p.flows, &http(), &d, Duration::from_millis(300)).await;
 
-        assert!(matches!(result, Err(AccountError::Cancelled)), "{result:?}");
+        assert!(matches!(result, Err(AccountError::TimedOut)), "{result:?}");
         assert!(fake.token_requests().is_empty());
         assert!(p.session("foreign-state").is_none());
+    }
+
+    /// R381 / 100.1 #2: a sign-in that ends without a code reads four ways —
+    /// closed by the person (quiet), refused by the identity provider (with
+    /// its own words when it sent any), timed out, or a broken round trip —
+    /// and none of them exchanges anything or stores a session.
+    #[tokio::test]
+    async fn each_way_a_sign_in_ends_without_a_code_reads_as_itself() {
+        let fake = start_fake(Behaviour::default());
+        let host = Url::parse(&fake.issuer)
+            .expect("issuer")
+            .host_str()
+            .expect("host")
+            .to_owned();
+        let cases: [(Browser, &str); 5] = [
+            (
+                Browser::Denied(Some("User is\nnot allowed to use this project.")),
+                "denied with words",
+            ),
+            (Browser::Denied(None), "denied"),
+            (Browser::Closed, "closed"),
+            (
+                Browser::SheetFailed("keeper was not in front"),
+                "sheet failed",
+            ),
+            (Browser::Dropped, "dropped"),
+        ];
+        for (browser, case) in cases {
+            let p = FakePlatform::new(&fake, browser);
+            let d = account(&fake, "ends", None);
+            let result = sign_in_short(&p, &d).await;
+            match (browser, &result) {
+                (Browser::Denied(Some(_)), Err(AccountError::Denied { host: h, reason })) => {
+                    assert_eq!(h, &host, "{case}");
+                    assert_eq!(
+                        reason.as_deref(),
+                        Some("User is not allowed to use this project"),
+                        "{case}: the provider's words, on one line"
+                    );
+                }
+                (Browser::Denied(None), Err(AccountError::Denied { reason: None, .. })) => {}
+                (Browser::Closed, Err(AccountError::Cancelled)) => {}
+                (Browser::SheetFailed(_), Err(AccountError::Interrupted(reason))) => {
+                    assert_eq!(reason, "keeper was not in front", "{case}");
+                }
+                (Browser::Dropped, Err(AccountError::Interrupted(_))) => {}
+                _ => panic!("{case}: {result:?}"),
+            }
+            assert!(p.session("ends").is_none(), "{case}");
+        }
+        assert!(fake.token_requests().is_empty(), "a code was exchanged");
+    }
+
+    /// Where a test's `fmt` subscriber writes, so its lines can be read back.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("captured").extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// R381 / 100.1 #3 — the Marta bug: an `access_denied` sign-in used to end
+    /// with no problem and no log line. It now leaves exactly one WARN line
+    /// naming the step, the account and the error's kind (never the
+    /// provider's words or a URL), and a problem the account's status shows.
+    #[tokio::test]
+    async fn a_refused_sign_in_leaves_one_warning_and_a_problem() {
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _logging = tracing::subscriber::set_default(subscriber);
+
+        let fake = start_fake(Behaviour::default());
+        let p = FakePlatform::new(&fake, Browser::Denied(Some("Marta may not use keeper")));
+        let d = account(&fake, "marta", None);
+        let error = sign_in_short(&p, &d)
+            .await
+            .expect_err("the provider refused");
+        let problem = crate::org_account::state::step_failed(
+            crate::org_account::state::AccountStep::SignIn,
+            &d.id,
+            error,
+        );
+
+        assert!(
+            matches!(
+                &problem,
+                Some(crate::org_account::state::AccountProblem::SignInDenied { .. })
+            ),
+            "{problem:?}"
+        );
+        let text = String::from_utf8(captured.0.lock().expect("captured").clone()).expect("utf-8");
+        let warnings: Vec<&str> = text
+            .lines()
+            .filter(|line| line.contains("account: a step did not finish"))
+            .collect();
+        assert_eq!(warnings.len(), 1, "{text}");
+        let line = warnings[0];
+        for field in [
+            "WARN",
+            r#"step="sign_in""#,
+            r#"account="marta""#,
+            r#"kind="denied""#,
+        ] {
+            assert!(line.contains(field), "{field} missing: {line}");
+        }
+        for private in ["Marta may not use keeper", "code=", "state="] {
+            assert!(!line.contains(private), "{private} leaked: {line}");
+        }
+    }
+
+    /// The `account: a step did not finish` lines a run wrote.
+    fn step_warnings(captured: &Captured) -> Vec<String> {
+        let text = String::from_utf8(captured.0.lock().expect("captured").clone()).expect("utf-8");
+        text.lines()
+            .filter(|line| line.contains("account: a step did not finish"))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// One interactive attempt through the account's attempt boundary, as
+    /// the shell's converge runs its sign-in step: `Done` past the sign-in,
+    /// or however the step ended the attempt.
+    async fn re_setup(
+        attempts: &crate::org_account::attempt::Attempts,
+        p: &FakePlatform,
+        d: &AccountDescriptor,
+    ) -> crate::org_account::attempt::Run<crate::org_account::state::AccountAttemptVm> {
+        use crate::org_account::state::{AccountAttemptVm, AccountStep};
+        let queued_at = attempts.epoch();
+        attempts
+            .run(queued_at, Some(d.id.as_str()), async {
+                match attempts
+                    .step(
+                        AccountStep::SignIn,
+                        &d.id,
+                        sign_in_within(p, &p.flows, &http(), d, FLOW_TIMEOUT),
+                    )
+                    .await
+                {
+                    Ok(_) => AccountAttemptVm::Done,
+                    Err(ended) => ended.attempt,
+                }
+            })
+            .await
+    }
+
+    /// R410 (R100E2-04), native close: Acme is already signed in on this
+    /// device (a restored session) and the person sets it up again, then
+    /// closes the platform's sign-in sheet — the flow answers `Cancelled`
+    /// through the registry. The attempt is closed, never done; the sign-in
+    /// step is logged exactly once, as closed; Acme's session stays as it
+    /// was.
+    #[tokio::test]
+    async fn closing_the_sheet_of_a_re_setup_closes_the_attempt_with_one_warning() {
+        use crate::org_account::attempt::Attempts;
+        use crate::org_account::state::AccountAttemptVm;
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _logging = tracing::subscriber::set_default(subscriber);
+        let fake = start_fake(Behaviour::default());
+        let p = FakePlatform::new(&fake, Browser::Closed);
+        let d = account(&fake, "acme", None);
+        seed_session(&p, &d, Vec::new(), now_ms() + 3_600_000);
+
+        let attempts = Attempts::default();
+        let attempt = re_setup(&attempts, &p, &d).await.attempt();
+
+        assert_eq!(attempt, AccountAttemptVm::Closed);
+        let warnings = step_warnings(&captured);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        for field in [r#"step="sign_in""#, r#"account="acme""#, r#"kind="closed""#] {
+            assert!(
+                warnings[0].contains(field),
+                "{field} missing: {}",
+                warnings[0]
+            );
+        }
+        assert_eq!(
+            p.session("acme").expect("the restored session stays")["refresh_token"],
+            "refresh-1"
+        );
+        assert!(fake.token_requests().is_empty(), "a code was exchanged");
+    }
+
+    /// R410 (R100E2-04), in-app Cancel: the same re-setup, but the sheet stays
+    /// open and the person presses Cancel in keeper. The shell's interrupt
+    /// stops the run and then ends the account's sheets — so the flow also
+    /// answers `Cancelled`; the run is dropped at the sign-in step it was on
+    /// and that step is logged exactly once, as closed. The attempt is closed,
+    /// never done, and the session stays. A sign-in still queued when the
+    /// person cancels never starts, logs nothing, and is closed too.
+    #[tokio::test]
+    async fn cancel_in_keeper_closes_a_re_setup_at_its_step_with_one_warning() {
+        use crate::org_account::attempt::{Attempts, Run};
+        use crate::org_account::state::AccountAttemptVm;
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _logging = tracing::subscriber::set_default(subscriber);
+        let fake = start_fake(Behaviour::default());
+        let p = FakePlatform::new(&fake, Browser::Waits);
+        let d = account(&fake, "acme", None);
+        seed_session(&p, &d, Vec::new(), now_ms() + 3_600_000);
+        let attempts = Attempts::default();
+
+        let cancel = async {
+            while p.shown.lock().expect("shown").is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            // What the shell's `interrupt_all` does, in its order.
+            attempts.interrupt();
+            p.flows.cancel_all();
+        };
+        let (run, ()) = tokio::join!(re_setup(&attempts, &p, &d), cancel);
+
+        assert_eq!(run, Run::Cancelled);
+        assert_eq!(run.attempt(), AccountAttemptVm::Closed);
+        let warnings = step_warnings(&captured);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        for field in [r#"step="sign_in""#, r#"account="acme""#, r#"kind="closed""#] {
+            assert!(
+                warnings[0].contains(field),
+                "{field} missing: {}",
+                warnings[0]
+            );
+        }
+        assert_eq!(
+            p.session("acme").expect("the restored session stays")["refresh_token"],
+            "refresh-1"
+        );
+
+        // Queued behind something else when the person cancels: never starts.
+        let queued_at = attempts.epoch();
+        attempts.interrupt();
+        let queued = attempts
+            .run(queued_at, Some(d.id.as_str()), async {
+                AccountAttemptVm::Done
+            })
+            .await;
+        assert_eq!(queued, Run::NotStarted);
+        assert_eq!(queued.attempt(), AccountAttemptVm::Closed);
+        assert_eq!(step_warnings(&captured).len(), 1);
+    }
+
+    #[test]
+    fn a_provider_s_words_are_bounded_to_one_clean_line() {
+        assert_eq!(provider_words(" \n. "), None);
+        assert_eq!(
+            provider_words("Not\tallowed.\u{7}").as_deref(),
+            Some("Not allowed")
+        );
+        let long = "a".repeat(PROVIDER_WORDS_MAX + 5);
+        let bounded = provider_words(&long).expect("words");
+        assert_eq!(bounded.chars().count(), PROVIDER_WORDS_MAX + 1);
+        assert!(bounded.ends_with('…'));
     }
 
     #[tokio::test]

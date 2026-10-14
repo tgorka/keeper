@@ -20,6 +20,7 @@
  * is written forwards, so those are the edges a writer most wants to see.
  */
 import { useEffect, useState } from "react";
+import { logFailure } from "@/lib/failure";
 import { type NoteRowVm, notesBacklinks, notesForwardlinks } from "@/lib/ipc/client";
 
 /** Which way round. `from` is inbound, `to` is outbound. */
@@ -130,7 +131,8 @@ export function LinksPanel({ vaultId, noteId, direction, refreshKey, onOpen }: L
           setRows(found);
         }
       })
-      .catch(() => {
+      .catch((raw: unknown) => {
+        logFailure("notes.links")(raw);
         // A failed projection is an empty list, never an error card: the note
         // itself is fine and this is the least important thing on screen.
         if (live) {

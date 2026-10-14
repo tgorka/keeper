@@ -23,6 +23,7 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
+import { logFailure } from "@/lib/failure";
 import { deleteMessage, type IpcError, roomNetworkLabel } from "@/lib/ipc/client";
 
 interface DeleteMessageDialogProps {
@@ -79,7 +80,8 @@ export function DeleteMessageDialog({
           setNetworkLabel(label);
         }
       })
-      .catch(() => {
+      .catch((raw: unknown) => {
+        logFailure("chat.networkLabel")(raw);
         // Probe failure → native framing (no fabricated Network name).
         if (!cancelled) {
           setNetworkLabel(null);
@@ -102,6 +104,7 @@ export function DeleteMessageDialog({
       // The redaction Set diff arrives over the timeline subscription; close.
       onClose();
     } catch (raw) {
+      logFailure("chat.deleteMessage")(raw);
       // Branch on retriability (Story 3.8 I/O matrix). A dispatch failure keeps the
       // dialog open with an honest error and a live retry; a vanished target is
       // terminal — surface an honest "no longer available" and withdraw the action

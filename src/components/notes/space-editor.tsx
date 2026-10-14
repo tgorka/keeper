@@ -58,6 +58,7 @@ import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { IconHint } from "@/components/ui/tooltip";
 import { spaceQueryText } from "@/hooks/use-notes-actions";
+import { logFailure } from "@/lib/failure";
 import type { NoteSpaceFieldVm, NoteSpaceVm, NoteTemplateVm } from "@/lib/ipc/client";
 import { notesSpaceSave, notesSpaceTerms, notesTagTree, notesTemplates } from "@/lib/ipc/client";
 import { flipTagTerm, type TagChip, tagChipState, withTagTerm } from "@/lib/stores/notes-filters";
@@ -311,7 +312,8 @@ export function SpaceEditor({
             : { kind: "frozen", reason: SPACE_TERMS_READONLY, terms: read.terms },
         );
       })
-      .catch(() => {
+      .catch((raw: unknown) => {
+        logFailure("notes.spaceTerms")(raw);
         // A query that does not parse is a state of the space, not a failed
         // command: its row already says so, and its editor says the same thing
         // rather than offering an empty chip set one Save away from selecting
@@ -333,12 +335,11 @@ export function SpaceEditor({
           setVaultTags(tagPaths(tree.nodes));
         }
       })
-      .catch(() => {
-        // A vocabulary that will not load leaves the chooser with nothing to
-        // browse, and since 44.13 that no longer means nothing to do: the
-        // field still takes a typed tag, because creating is allowed here.
-        // The chips already on the space still cycle and still come off.
-      });
+      // A vocabulary that will not load leaves the chooser with nothing to
+      // browse, and since 44.13 that no longer means nothing to do: the
+      // field still takes a typed tag, because creating is allowed here.
+      // The chips already on the space still cycle and still come off.
+      .catch(logFailure("spaceEditor.tagTree"));
     return () => {
       cancelled = true;
     };
@@ -353,12 +354,11 @@ export function SpaceEditor({
           setTemplatesLoaded(true);
         }
       })
-      .catch(() => {
-        // A list that will not load leaves the chooser with nothing to browse.
-        // The stored value is still rendered and still saved: a failed read of
-        // the vault's templates is not evidence that this space's one is gone,
-        // and clearing it here would turn a transient error into a lost setting.
-      });
+      // A list that will not load leaves the chooser with nothing to browse.
+      // The stored value is still rendered and still saved: a failed read of
+      // the vault's templates is not evidence that this space's one is gone,
+      // and clearing it here would turn a transient error into a lost setting.
+      .catch(logFailure("spaceEditor.templates"));
     return () => {
       cancelled = true;
     };
@@ -466,6 +466,7 @@ export function SpaceEditor({
       });
       onSaved(saved);
     } catch (error) {
+      logFailure("notes.spaceSave")(error);
       setFailure(syncErrorMessage(error, "keeper couldn't save this space. Nothing was changed."));
       setSaving(false);
     }

@@ -69,6 +69,7 @@ import {
   takeSurfaceRequests,
   watchSurfaceNote,
 } from "@/lib/agents/surface";
+import { logFailure } from "@/lib/failure";
 import {
   mediaBlockCheck,
   mediaBlockFindMarker,
@@ -988,7 +989,7 @@ export function NoteEditor({
               return;
             editorView.dispatch({ effects: preview.setSearchMarks.of(reply.ranges) });
           })
-          .catch(() => {});
+          .catch(logFailure("notes.searchMarks"));
       };
       const stopFilters = notesFiltersStore.subscribe((next, previous) => {
         if (next.text.trim() !== previous.text.trim()) {
@@ -1319,8 +1320,8 @@ export function NoteEditor({
       renamedFor.current = storedTitle;
       // Best effort, like every other rename path here: a name the vault will
       // not take is reported by the panel that offers renaming, and a failure
-      // in the background must not interrupt typing.
-      void notesRename(vaultId, noteId, storedTitle).catch(() => {});
+      // in the background must not interrupt typing — so it is logged only.
+      void notesRename(vaultId, noteId, storedTitle).catch(logFailure("notes.renameFromTitle"));
     }, RENAME_QUIET_MS);
     return () => clearTimeout(timer);
   }, [storedTitle, vaultId, noteId]);

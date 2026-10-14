@@ -37,6 +37,7 @@ import {
   grantSentence,
 } from "@/components/bots/bot-grant-bar";
 import { Button } from "@/components/ui/button";
+import { logFailure } from "@/lib/failure";
 import type {
   BotAuditRowVm,
   BotGrantVm,
@@ -152,7 +153,10 @@ export function BotGrantsSection({ open }: { open: boolean }) {
   const grantList = grants ?? [];
   const revoke = (grantId: string) => {
     void botsGrantRevoke(grantId)
-      .catch((raw: unknown) => setError(syncErrorMessage(raw, GRANTS_REVOKE_FAILED)))
+      .catch((raw: unknown) => {
+        logFailure("bots.grantRevoke")(raw);
+        setError(syncErrorMessage(raw, GRANTS_REVOKE_FAILED));
+      })
       .finally(refresh);
   };
 

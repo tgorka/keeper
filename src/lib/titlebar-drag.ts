@@ -21,6 +21,7 @@
  * Hence this module: issue the drag from the app, and report each stage so the app
  * log states which of the two happened rather than leaving the next person to guess.
  */
+import { logFailure } from "@/lib/failure";
 import { startWindowDragging, type TitlebarDragStage, titlebarDragReport } from "@/lib/ipc/client";
 
 /** Turn whatever the window plugin rejected with into one loggable line. */
@@ -46,10 +47,10 @@ function describeRefusal(error: unknown): string {
 /**
  * Report one stage, never letting the report itself become a failure path: a
  * diagnostic that cannot be recorded is not worth an unhandled rejection, still
- * less a broken drag.
+ * less a broken drag — only a line in the log through the front's own funnel.
  */
 function report(stage: TitlebarDragStage, detail?: string): void {
-  titlebarDragReport(stage, detail).catch(() => {});
+  titlebarDragReport(stage, detail).catch(logFailure("titlebar.report"));
 }
 
 /**

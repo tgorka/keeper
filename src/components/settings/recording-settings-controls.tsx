@@ -8,7 +8,9 @@
  * field keeps a local draft while focused, then clamps and persists on blur
  * (Rust clamps again defensively and echoes the effective VM back into the
  * store, so the displayed value is never an unsaved one). Edits apply to the
- * next Recording Session only — a running session is never mutated.
+ * next Recording Session only — a running session is never mutated. A first
+ * read that failed is said in place of the fields; a write Rust refused is said
+ * under them (R381, R410).
  */
 import { useEffect, useId, useState } from "react";
 import { AfterRecordingSwitch } from "@/components/settings/transcription-section";
@@ -16,7 +18,6 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { useCapabilitiesStore } from "@/lib/stores/capabilities";
 import {
-  applyRecordingSettings,
   ensureRecordingSettingsHydrated,
   RECORDING_DURATION_CAP_MINUTES_MAX,
   RECORDING_DURATION_CAP_MINUTES_MIN,
@@ -24,6 +25,8 @@ import {
   RECORDING_SEGMENT_MB_MIN,
   recordingSettingsStore,
   useRecordingSettings,
+  useRecordingSettingsReadError,
+  useRecordingSettingsWriter,
 } from "@/lib/stores/recording-settings";
 import { refreshTranscription, useTranscriptionStore } from "@/lib/stores/transcription";
 
@@ -43,6 +46,8 @@ function clamp(value: number, min: number, max: number): number {
 
 export function RecordingSettingsControls() {
   const settings = useRecordingSettings();
+  const unread = useRecordingSettingsReadError();
+  const { refusal, write } = useRecordingSettingsWriter();
   const canTranscribe = useCapabilitiesStore((s) => s.capabilities.transcription);
   const keepsVoices = useTranscriptionStore(
     (s) =>
@@ -103,8 +108,16 @@ export function RecordingSettingsControls() {
       field === "segment"
         ? { ...live, segmentMb: clamped }
         : { ...live, durationCapMinutes: clamped };
-    void applyRecordingSettings(next);
+    write(next);
   };
+
+  if (settings === null && unread !== null) {
+    return (
+      <p role="alert" className="text-destructive text-sm">
+        {unread}
+      </p>
+    );
+  }
 
   return (
     <div className="flex flex-col gap-2 text-sm">
@@ -152,6 +165,11 @@ export function RecordingSettingsControls() {
           }
         />
       </div>
+      {refusal !== null && (
+        <p role="alert" className="text-destructive text-xs">
+          {refusal}
+        </p>
+      )}
       <p className="text-muted-foreground">{NEXT_SESSION_NOTE}</p>
       {canTranscribe && keepsVoices && <AfterRecordingSwitch />}
     </div>

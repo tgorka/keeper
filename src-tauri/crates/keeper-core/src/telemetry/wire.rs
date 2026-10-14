@@ -231,6 +231,7 @@ mod tests {
         let record = Record::frontend(TelemetryEventReq {
             kind: TelemetryEventKind::FrontendError,
             duration_ms: Some(25.0),
+            surface: None,
         });
         let logs = LogRequest::decode(logs(&record).as_slice()).expect("decode log protobuf");
         let traces =
@@ -257,6 +258,7 @@ mod tests {
         let mut parent = Record::frontend(TelemetryEventReq {
             kind: TelemetryEventKind::Interaction,
             duration_ms: None,
+            surface: None,
         });
         parent.operation = crate::telemetry::Operation::RemoteConfig;
         let child = Record {
@@ -267,6 +269,7 @@ mod tests {
             start: parent.start,
             end: parent.end,
             duration_ms: None,
+            surface: None,
             outcome: 0,
         };
         let request = TraceRequest::decode(traces(&child).as_slice()).expect("child wire");

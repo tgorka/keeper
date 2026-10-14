@@ -6,6 +6,7 @@ vi.mock("@/lib/ipc/client", () => ({
   navStateSet: vi.fn(() => Promise.resolve()),
   navStateClear: vi.fn(() => Promise.resolve()),
   navStateGet: vi.fn(() => Promise.resolve(null)),
+  frontendErrorReport: vi.fn(() => Promise.resolve()),
 }));
 
 import { useNavStatePersistence } from "@/hooks/use-nav-state-persistence";

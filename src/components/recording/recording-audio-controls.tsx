@@ -47,6 +47,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
+import { logFailure } from "@/lib/failure";
 import { requestMicrophonePermission, type TccPermission } from "@/lib/ipc/client";
 import { setSystemAudioEnabled, useSystemAudioEnabled } from "@/lib/stores/recording-audio";
 import {
@@ -61,10 +62,10 @@ import {
   useMicEnabled,
 } from "@/lib/stores/recording-mic";
 import {
-  applyRecordingSettings,
   ensureRecordingSettingsHydrated,
   recordingSettingsStore,
   useRecordingSettings,
+  useRecordingSettingsWriter,
 } from "@/lib/stores/recording-settings";
 import { useRecordingSources } from "@/lib/stores/recording-source";
 
@@ -165,6 +166,8 @@ export function RecordingAudioControls({
   // `recording-settings` mirror Settings → Recording and the Advanced group
   // use — editing it here and there stays in lockstep.
   const settings = useRecordingSettings();
+  // A refused write reverts the switch; this is the sentence that says why.
+  const { refusal: echoRefusal, write } = useRecordingSettingsWriter();
   useEffect(() => {
     void ensureRecordingSettingsHydrated();
     // Which sources are on is a persisted answer too, read once per launch and
@@ -223,7 +226,8 @@ export function RecordingAudioControls({
         .then((status) => {
           if (requestId === micRequestSeq.current) setMicPermission(status);
         })
-        .catch(() => {
+        .catch((raw: unknown) => {
+          logFailure("recording.micPermission")(raw);
           if (requestId === micRequestSeq.current) setMicPermission(null);
         })
         .finally(() => {
@@ -255,7 +259,7 @@ export function RecordingAudioControls({
     if (live === null || checked === live.echoCancellation) {
       return;
     }
-    void applyRecordingSettings({ ...live, echoCancellation: checked });
+    write({ ...live, echoCancellation: checked });
   };
 
   return (
@@ -336,6 +340,11 @@ export function RecordingAudioControls({
           onCheckedChange={onEchoToggle}
         />
       </div>
+      {echoRefusal !== null && (
+        <p className="text-destructive text-xs" role="alert">
+          {echoRefusal}
+        </p>
+      )}
       <p className="text-muted-foreground text-xs">
         {ECHO_CANCELLATION_COST_NOTE} {ECHO_CANCELLATION_NEXT_SESSION_NOTE}
       </p>

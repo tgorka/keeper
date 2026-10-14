@@ -14,6 +14,7 @@
  */
 import { useEffect } from "react";
 import { saveNote } from "@/hooks/use-notes-body";
+import { logFailure } from "@/lib/failure";
 import { listenRecordingRemoved, mediaBlockWithoutSession } from "@/lib/ipc/client";
 import { editBuffer, notesEditorStore, readNoteDocument } from "@/lib/stores/notes-editor";
 
@@ -28,7 +29,12 @@ export async function forgetRecordingInOpenNotes(sessionId: string): Promise<voi
     Object.entries(documents).map(async ([key, document]) => {
       if (document.views === 0 || document.subscriptionId === null) return;
       if (!document.text.includes(sessionId)) return;
-      const next = await mediaBlockWithoutSession(document.text, sessionId).catch(() => null);
+      const next = await mediaBlockWithoutSession(document.text, sessionId).catch(
+        (error: unknown) => {
+          logFailure("recording.forgetInNote")(error);
+          return null;
+        },
+      );
       // The store keys a document by vault and note, joined by `\u0000`
       // (`documentKey`), which neither id can contain.
       const [vaultId, noteId] = key.split("\u0000");
@@ -50,9 +56,8 @@ export function useRecordingRemoved(): void {
           if (cancelled) fn();
           else unlisten = fn;
         })
-        .catch(() => {
-          // No Tauri host: nothing is ever removed in this environment.
-        });
+        // No Tauri host: nothing is ever removed in this environment.
+        .catch(logFailure("recording.listenRemoved"));
     } catch {
       // `listen` can throw synchronously when the Tauri IPC internals are absent.
     }

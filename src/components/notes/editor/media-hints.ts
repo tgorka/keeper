@@ -44,6 +44,7 @@ import {
   type ViewUpdate,
 } from "@codemirror/view";
 import type { SyntaxNode } from "@lezer/common";
+import { logFailure } from "@/lib/failure";
 import type {
   FilesEntryVm,
   FilesListingVm,
@@ -380,7 +381,8 @@ export function mediaBlockCompleteSource(sources: MediaHintSources): CompletionS
     const answer = question();
     const held = { token, answer };
     asked = held;
-    answer.catch(() => {
+    answer.catch((raw: unknown) => {
+      logFailure("notes.mediaHintAsk")(raw);
       if (asked === held) asked = null;
     });
     return answer;
@@ -397,7 +399,8 @@ export function mediaBlockCompleteSource(sources: MediaHintSources): CompletionS
     }
     if (schema === null) {
       schema = sources.schema();
-      schema.catch(() => {
+      schema.catch((raw: unknown) => {
+        logFailure("notes.mediaSchema")(raw);
         schema = null;
       });
     }
@@ -539,7 +542,8 @@ export function mediaBlockDiagnostics(
           if (!this.answers.has(fence.source)) {
             try {
               this.answers.set(fence.source, await check(fence.source));
-            } catch {
+            } catch (raw) {
+              logFailure("notes.mediaCheck")(raw);
               this.answers.set(fence.source, null);
             }
           }

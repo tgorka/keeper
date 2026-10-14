@@ -17,6 +17,7 @@
  */
 import { listen } from "@tauri-apps/api/event";
 import { useEffect } from "react";
+import { logFailure } from "@/lib/failure";
 import { toggleRecording } from "@/lib/recording-control";
 import { useCapabilitiesStore } from "@/lib/stores/capabilities";
 
@@ -44,9 +45,8 @@ export function useRecordingHotkey(): void {
             unlisten = fn;
           }
         })
-        .catch(() => {
-          // No Tauri host — the hotkey bridge is inert in this environment.
-        });
+        // No Tauri host — the hotkey bridge is inert in this environment.
+        .catch(logFailure("recording.listenHotkey"));
     } catch {
       // `listen` can throw synchronously when the Tauri IPC internals are absent.
     }

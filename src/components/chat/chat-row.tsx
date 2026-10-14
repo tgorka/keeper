@@ -21,7 +21,7 @@
  * low-priority tag: "Archive" when `!isArchived`, "Unarchive" otherwise. This is
  * best-effort with NO optimistic overlay — the row's move between the Inbox and
  * Archive windows is Rust-authoritative filtering (AD-20), so it waits on the tag
- * round-trip; a rejection is swallowed.
+ * round-trip; a rejection is said and logged.
  *
  * A third context-menu item (Story 4.3) pins / unpins the row: "Pin" when
  * `!isPinned`, "Unpin" otherwise. Pins are keeper-local; the row's move into the
@@ -58,6 +58,7 @@ import { useShellLayout } from "@/hooks/use-shell-layout";
 import { useSwipeActions } from "@/hooks/use-swipe-actions";
 import { accountHueVar } from "@/lib/account-hue";
 import { BRIDGE_HEALTH_LABEL, BRIDGE_HEALTH_LAMP } from "@/lib/bridges";
+import { logFailure, sayFailure } from "@/lib/failure";
 import { formatRoomTimestamp } from "@/lib/format-time";
 import type { ChatNotifyMode, InboxRoomVm } from "@/lib/ipc/client";
 import {
@@ -127,50 +128,66 @@ export const ChatRow = forwardRef<HTMLButtonElement, ChatRowProps>(function Chat
     // core) drop the override so the row reverts to the authoritative stream
     // rather than stranding a phantom-read overlay the stream never reconciles.
     setOptimisticUnread(room.accountId, room.roomId, false);
-    void markRoomRead(room.accountId, room.roomId).catch(() =>
-      clearOptimisticUnread(room.accountId, room.roomId),
-    );
+    void markRoomRead(room.accountId, room.roomId).catch((raw: unknown) => {
+      logFailure("chat.markRead")(raw);
+      clearOptimisticUnread(room.accountId, room.roomId);
+    });
   };
   const onMarkUnread = () => {
     setOptimisticUnread(room.accountId, room.roomId, true);
-    void markRoomUnread(room.accountId, room.roomId).catch(() =>
-      clearOptimisticUnread(room.accountId, room.roomId),
-    );
+    void markRoomUnread(room.accountId, room.roomId).catch((raw: unknown) => {
+      logFailure("chat.markUnread")(raw);
+      clearOptimisticUnread(room.accountId, room.roomId);
+    });
   };
   // Archive/unarchive are best-effort with no optimistic overlay (Story 4.2): row
   // membership between the Inbox and Archive windows is Rust-authoritative
   // filtering (AD-20), so the visible move waits on the tag round-trip. A rejection
-  // is swallowed — the stream is truth.
+  // is said and logged — the stream stays truth.
   const onArchive = () => {
-    void archiveRoom(room.accountId, room.roomId).catch(() => {});
+    void archiveRoom(room.accountId, room.roomId).catch(
+      sayFailure("chat.archive", "keeper couldn't archive the chat."),
+    );
   };
   const onUnarchive = () => {
-    void unarchiveRoom(room.accountId, room.roomId).catch(() => {});
+    void unarchiveRoom(room.accountId, room.roomId).catch(
+      sayFailure("chat.unarchive", "keeper couldn't unarchive the chat."),
+    );
   };
   // Pin/unpin are best-effort with no optimistic overlay (Story 4.3): the row's
-  // move into the Pins strip is Rust-authoritative (AD-20). A rejection is
-  // swallowed — the stream is truth.
+  // move into the Pins strip is Rust-authoritative (AD-20). A rejection is said
+  // and logged — the stream stays truth.
   const onPin = () => {
-    void pinRoom(room.accountId, room.roomId).catch(() => {});
+    void pinRoom(room.accountId, room.roomId).catch(
+      sayFailure("chat.pin", "keeper couldn't pin the chat."),
+    );
   };
   const onUnpin = () => {
-    void unpinRoom(room.accountId, room.roomId).catch(() => {});
+    void unpinRoom(room.accountId, room.roomId).catch(
+      sayFailure("chat.unpin", "keeper couldn't unpin the chat."),
+    );
   };
   // Favorite/unfavorite are best-effort with no optimistic overlay (Story 4.4):
   // favourite state rides the `m.favourite` notable tag, so the row's move into
-  // the Favorites section is Rust-authoritative (AD-20). A rejection is swallowed.
+  // the Favorites section is Rust-authoritative (AD-20). A rejection is said and logged.
   const onFavorite = () => {
-    void favoriteRoom(room.accountId, room.roomId).catch(() => {});
+    void favoriteRoom(room.accountId, room.roomId).catch(
+      sayFailure("chat.favorite", "keeper couldn't favorite the chat."),
+    );
   };
   const onUnfavorite = () => {
-    void unfavoriteRoom(room.accountId, room.roomId).catch(() => {});
+    void unfavoriteRoom(room.accountId, room.roomId).catch(
+      sayFailure("chat.unfavorite", "keeper couldn't unfavorite the chat."),
+    );
   };
   // Per-Chat notification mode (Story 10.2): a synced Matrix push rule. Best-effort
   // with NO optimistic overlay — the row's mute glyph is Rust-authoritative (resolved
   // at inbox emit from the synced rule + muted-Network set), so it waits on the
-  // round-trip; a rejection is swallowed and the stream stays truth.
+  // round-trip; a rejection is said and logged and the stream stays truth.
   const setNotifyMode = (mode: ChatNotifyMode) => {
-    void chatNotifyModeSet(room.accountId, room.roomId, mode).catch(() => {});
+    void chatNotifyModeSet(room.accountId, room.roomId, mode).catch(
+      sayFailure("chat.notifyMode", "keeper couldn't change the chat's notifications."),
+    );
   };
   // The Notifications radio reflects the durable per-Chat rule. `mention_only` maps to
   // the mention-only radio; both `muted` (a Chat rule OR a muted Network) and `none`

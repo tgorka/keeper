@@ -29,6 +29,7 @@
  */
 
 import { Button } from "@/components/ui/button";
+import { sayFailure } from "@/lib/failure";
 import { revealPath } from "@/lib/ipc/client";
 import { useCapabilitiesStore } from "@/lib/stores/capabilities";
 import { extensionOf } from "./registry";
@@ -179,7 +180,9 @@ export function UnknownViewer({ file, entry, reason }: UnknownViewerProps) {
             variant="outline"
             size="sm"
             onClick={() => {
-              void file.openWith?.().catch(() => undefined);
+              void file
+                .openWith?.()
+                .catch(sayFailure("viewer.openWith", "keeper couldn't open the file."));
             }}
           >
             {UNKNOWN_VIEWER_OPEN_LABEL}
@@ -191,7 +194,9 @@ export function UnknownViewer({ file, entry, reason }: UnknownViewerProps) {
             variant="outline"
             size="sm"
             onClick={() => {
-              void revealPath(absolutePath).catch(() => undefined);
+              void revealPath(absolutePath).catch(
+                sayFailure("viewer.reveal", "keeper couldn't show the file."),
+              );
             }}
           >
             {UNKNOWN_VIEWER_REVEAL_LABEL}

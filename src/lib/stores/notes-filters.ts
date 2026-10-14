@@ -33,6 +33,7 @@
  */
 import { useStore } from "zustand";
 import { createStore } from "zustand/vanilla";
+import { logFailure } from "@/lib/failure";
 import type { NoteQueryReq, NoteSpaceVm, NoteTagTerm } from "@/lib/ipc/client";
 import {
   notesHideServiceFilesGet,
@@ -433,7 +434,9 @@ export function persistHideServiceFiles(hidden: boolean): Promise<void> {
       throw error;
     }
   });
-  visibilityWrites = write.catch(() => {});
+  // The caller holds `write` and answers for its failure; the queue only must
+  // not inherit it, so the next write still runs.
+  visibilityWrites = write.catch(logFailure("notes.persistHideServiceFiles"));
   return write;
 }
 
@@ -469,7 +472,8 @@ export function persistIncludePrivate(value: boolean): Promise<void> {
       throw error;
     }
   });
-  privateWrites = write.catch(() => {});
+  // As above: the caller answers for `write`; the queue only must not inherit it.
+  privateWrites = write.catch(logFailure("notes.persistIncludePrivate"));
   return write;
 }
 

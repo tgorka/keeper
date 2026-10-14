@@ -7,11 +7,13 @@ import type { AccountVm, EncryptionStatusBatch } from "@/lib/ipc/client";
 // test can drive the streams.
 const subscribeEncryptionStatus = vi.fn();
 const unsubscribeEncryptionStatus = vi.fn();
+const frontendErrorReport = vi.fn((..._args: unknown[]) => Promise.resolve());
 vi.mock("@/lib/ipc/client", () => ({
   subscribeEncryptionStatus: (accountId: string, onBatch: (b: EncryptionStatusBatch) => void) =>
     subscribeEncryptionStatus(accountId, onBatch),
   unsubscribeEncryptionStatus: (accountId: string, id: number) =>
     unsubscribeEncryptionStatus(accountId, id),
+  frontendErrorReport: (...args: unknown[]) => frontendErrorReport(...args),
 }));
 
 import { useEncryptionStatuses } from "@/hooks/use-encryption-statuses";
@@ -118,7 +120,7 @@ describe("useEncryptionStatuses", () => {
     expect(encryptionStatusStore.getState().statuses).toEqual({});
   });
 
-  it("swallows a subscribe failure and leaves the account pending", async () => {
+  it("survives a subscribe failure and leaves the account pending", async () => {
     subscribeEncryptionStatus.mockRejectedValue(new Error("stream failed"));
     accountsStore.getState().hydrateAll([alice]);
     renderHook(() => useEncryptionStatuses());

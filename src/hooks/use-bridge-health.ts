@@ -15,6 +15,7 @@
  * and a subscribe failure is swallowed (health is a non-critical projection).
  */
 import { useEffect } from "react";
+import { logFailure } from "@/lib/failure";
 import type { BridgeHealthSnapshot } from "@/lib/ipc/client";
 import { subscribeBridgeHealth, unsubscribeBridgeHealth } from "@/lib/ipc/client";
 import { useAccountsStore } from "@/lib/stores/accounts";
@@ -54,9 +55,8 @@ export function useBridgeHealthSubscription(): void {
         }
         subscriptionId = id;
       })
-      .catch(() => {
-        // A failed health stream is non-fatal: leave the store empty (no health).
-      });
+      // A failed health stream is non-fatal: leave the store empty (no health).
+      .catch(logFailure("bridgeHealth.subscribe"));
 
     return () => {
       cancelled = true;

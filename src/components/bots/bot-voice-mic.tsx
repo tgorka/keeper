@@ -57,6 +57,7 @@
  */
 import { Mic, Square, Volume2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { logFailure, sayFailure } from "@/lib/failure";
 import type { VoiceStateVm } from "@/lib/ipc/client";
 import { iosOpenAppSettings, voiceAuthorize, voiceStart, voiceStop } from "@/lib/ipc/client";
 import { botsStore } from "@/lib/stores/bots";
@@ -133,6 +134,7 @@ export function BotVoiceMic() {
         return voiceStart();
       })
       .catch((raw: unknown) => {
+        logFailure("voice.start")(raw);
         botsStore.getState().setError(syncErrorMessage(raw, VOICE_START_FAILED));
       });
   };
@@ -144,7 +146,7 @@ export function BotVoiceMic() {
         return;
       case "listening":
       case "speaking":
-        void voiceStop().catch(() => {});
+        void voiceStop().catch(sayFailure("voice.stop", "keeper couldn't stop the voice turn."));
         return;
     }
   };
@@ -214,7 +216,9 @@ export function BotVoiceStatus() {
             size="sm"
             onClick={() => {
               // Best-effort deep link through the Rust opener; never re-prompts.
-              void iosOpenAppSettings().catch(() => {});
+              void iosOpenAppSettings().catch(
+                sayFailure("voice.openSettings", "keeper couldn't open Settings."),
+              );
             }}
           >
             {VOICE_OPEN_SETTINGS_LABEL}

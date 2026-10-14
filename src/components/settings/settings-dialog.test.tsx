@@ -35,6 +35,8 @@ vi.mock("@/lib/ipc/client", () => ({
       repoMode: null,
       state: "none",
       sentence: null,
+      problem: false,
+      attempt: null,
       identity: null,
       device: null,
       devices: [],

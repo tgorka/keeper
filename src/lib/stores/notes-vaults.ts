@@ -25,6 +25,7 @@
  */
 import { useStore } from "zustand";
 import { createStore } from "zustand/vanilla";
+import { logFailure } from "@/lib/failure";
 import {
   type NoteVaultVm,
   notesVaultActive,
@@ -115,6 +116,7 @@ export async function setActiveVault(vaultId: string): Promise<void> {
     state.setActiveVaultId(vaultId);
     state.setError(null);
   } catch (raw) {
+    logFailure("notes.vaultSetActive")(raw);
     notesVaultsStore.getState().setError(syncErrorMessage(raw, NOTES_UNKNOWN_ERROR));
   }
 }
@@ -151,6 +153,7 @@ export async function ensureNotesVaultsHydrated(): Promise<void> {
     return;
   }
   hydration ??= loadSnapshot().catch((raw: unknown) => {
+    logFailure("notes.vaultsHydrate")(raw);
     notesVaultsStore.getState().setError(syncErrorMessage(raw, NOTES_UNKNOWN_ERROR));
     // Allow a later retry rather than caching the failure forever.
     hydration = null;
@@ -168,6 +171,7 @@ export async function refreshNoteVaults(): Promise<void> {
   try {
     await loadSnapshot();
   } catch (raw) {
+    logFailure("notes.vaultsRefresh")(raw);
     notesVaultsStore.getState().setError(syncErrorMessage(raw, NOTES_UNKNOWN_ERROR));
   }
 }

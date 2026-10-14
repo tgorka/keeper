@@ -2,6 +2,7 @@ import { useEffect, useId, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { logFailure } from "@/lib/failure";
 import { type PushGatewayVm, pushGatewayGet, pushGatewaySet } from "@/lib/ipc/client";
 import { syncErrorMessage } from "@/lib/stores/sync";
 
@@ -59,7 +60,8 @@ export function PushGatewayField({ open }: { open: boolean }) {
           setDraft(vm.url ?? "");
         }
       })
-      .catch(() => {
+      .catch((raw: unknown) => {
+        logFailure("push.gatewayGet")(raw);
         if (!cancelled) {
           setHeld({ url: null, refusal: null });
           setDraft("");
@@ -79,7 +81,10 @@ export function PushGatewayField({ open }: { open: boolean }) {
         setDraft(vm.url ?? "");
         setRefusal(null);
       })
-      .catch((raw: unknown) => setRefusal(syncErrorMessage(raw, PUSH_GATEWAY_WRITE_FAILED)))
+      .catch((raw: unknown) => {
+        logFailure("push.gatewaySet")(raw);
+        setRefusal(syncErrorMessage(raw, PUSH_GATEWAY_WRITE_FAILED));
+      })
       .finally(() => setBusy(false));
   };
 

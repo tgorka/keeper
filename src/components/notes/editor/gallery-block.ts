@@ -66,6 +66,7 @@ import {
   WINDOW_VIEWPORT_ATTR,
   windowSlice,
 } from "@/components/ui/window-list";
+import { logFailure } from "@/lib/failure";
 import type { NoteGalleryItemVm, NoteGalleryVm } from "@/lib/ipc/client";
 import { primeFirstFrame, releaseMediaElement } from "./media-playback";
 import { WIKILINK_ATTR } from "./wikilink";
@@ -599,7 +600,8 @@ export async function renderGalleryInto(
   let listing: NoteGalleryVm;
   try {
     listing = await load(block.folder);
-  } catch {
+  } catch (raw) {
+    logFailure("notes.galleryBlock")(raw);
     // The same rule the recording embed follows: never throw out of a render,
     // and never leave the reader with less than the markdown already said.
     say(host, GALLERY_UNREACHABLE);

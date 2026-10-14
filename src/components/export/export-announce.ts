@@ -32,6 +32,7 @@
 
 import { toast } from "sonner";
 import type { ExportOutcome } from "@/lib/export/export-target";
+import { sayFailure } from "@/lib/failure";
 import { revealPath } from "@/lib/ipc/client";
 import { capabilitiesStore } from "@/lib/stores/capabilities";
 
@@ -54,10 +55,11 @@ export function announceExport(outcome: ExportOutcome): void {
           ? {
               label: EXPORT_REVEAL_LABEL,
               onClick: () => {
-                // Best effort, like every other Reveal: a file manager that
-                // will not open is not something to interrupt the person with
-                // a second time.
-                void revealPath(path).catch(() => undefined);
+                // A file manager that will not open is said once, in a toast of
+                // its own, and logged.
+                void revealPath(path).catch(
+                  sayFailure("export.reveal", "keeper couldn't reveal the export."),
+                );
               },
             }
           : undefined,

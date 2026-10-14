@@ -23,6 +23,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { logFailure, sayFailure } from "@/lib/failure";
 import {
   verificationConfirm,
   verificationMismatch,
@@ -79,7 +80,8 @@ function VerificationBody({ flow }: { flow: ReturnType<typeof useVerificationFlo
   useEffect(() => {
     if (flow === null && accountId && startedRef.current !== accountId) {
       startedRef.current = accountId;
-      void verificationStart(accountId).catch(() => {
+      void verificationStart(accountId).catch((raw: unknown) => {
+        logFailure("verification.start")(raw);
         // Surface an honest failure instead of hanging on "Waiting…" (e.g. no other
         // session signed in, or the crypto identity isn't ready yet).
         if (verificationStore.getState().activeAccountId === accountId) {
@@ -156,7 +158,8 @@ function WaitingOrReady({
           disabled={!accountId}
           onClick={() => {
             if (accountId) {
-              void verificationStartSas(accountId, flow.flowId).catch(() => {
+              void verificationStartSas(accountId, flow.flowId).catch((raw: unknown) => {
+                logFailure("verification.startSas")(raw);
                 // Surface a rejected SAS start as an honest failure instead of
                 // leaving the modal stuck on the "waiting" screen with a dead
                 // button and no feedback.
@@ -225,7 +228,9 @@ function Comparing({
           disabled={!accountId}
           onClick={() => {
             if (accountId) {
-              void verificationMismatch(accountId, flow.flowId).catch(() => {});
+              void verificationMismatch(accountId, flow.flowId).catch(
+                sayFailure("verification.mismatch", "keeper couldn't report the mismatch."),
+              );
             }
           }}
         >
@@ -237,7 +242,9 @@ function Comparing({
           disabled={!accountId}
           onClick={() => {
             if (accountId) {
-              void verificationConfirm(accountId, flow.flowId).catch(() => {});
+              void verificationConfirm(accountId, flow.flowId).catch(
+                sayFailure("verification.confirm", "keeper couldn't confirm the match."),
+              );
             }
           }}
         >

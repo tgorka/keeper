@@ -36,6 +36,7 @@ import { useEffect, useState } from "react";
 import { FoldSection } from "@/components/layout/sidebar-group";
 import { TagFilterChip } from "@/components/notes/note-filter-bar";
 import { DriveHeading } from "@/components/notes/space-list";
+import { logFailure } from "@/lib/failure";
 import type { NoteTagNodeVm } from "@/lib/ipc/client";
 import { notesTagTree } from "@/lib/ipc/client";
 import {
@@ -157,11 +158,10 @@ export function TagTree({ vaultId, driveName }: { vaultId: string | null; driveN
           setNodes(tree.nodes);
         }
       })
-      .catch(() => {
-        // A tree that will not load leaves the section empty rather than
-        // breaking the column: the list beside it still works, and tags are one
-        // way in among several.
-      });
+      // A tree that will not load leaves the section empty rather than
+      // breaking the column: the list beside it still works, and tags are one
+      // way in among several.
+      .catch(logFailure("notes.tagTree"));
     return () => {
       cancelled = true;
     };

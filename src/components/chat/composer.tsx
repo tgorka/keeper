@@ -39,6 +39,7 @@ import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { IconHint } from "@/components/ui/tooltip";
 import { useShellLayout } from "@/hooks/use-shell-layout";
+import { logFailure, sayFailure } from "@/lib/failure";
 import { formatFileSize } from "@/lib/file-size";
 import {
   clearDraft,
@@ -143,6 +144,14 @@ const DRAFT_SAVE_DEBOUNCE_MS = 200;
  */
 const DRAFT_MIRROR_DEBOUNCE_MS = 1000;
 
+/**
+ * What the composer says when its draft could not be saved (Epic 100, R387):
+ * leaving the chat or reloading would lose the words, so the person is told
+ * — once, under the composer, not a toast per keystroke.
+ */
+export const DRAFT_NOT_SAVED =
+  "keeper couldn't save this draft, so it is kept only while this chat stays open.";
+
 export function Composer({
   accountId,
   roomId,
@@ -163,6 +172,9 @@ export function Composer({
   // their connection and try again would be a lie: no retry can ever succeed, so
   // the two cases get distinct copy (AD-21 honesty, Story 3.4).
   const [error, setError] = useState<"retriable" | "terminal" | null>(null);
+  // The `account\0room` whose last draft save failed, or `null`: says
+  // DRAFT_NOT_SAVED under that chat's composer until a save there succeeds.
+  const [unsavedDraft, setUnsavedDraft] = useState<string | null>(null);
   // Phone-tier composer deltas (Story 13.5, UX-DR25): ≥44pt send/attach targets,
   // a 5-line autogrow cap, and Enter→newline (send is button-only on phone —
   // WKWebView cannot reliably distinguish a hardware keyboard, so the touch
@@ -254,6 +266,10 @@ export function Composer({
   roomIdRef.current = roomId;
   const draftSaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pendingDraft = useRef<string | null>(null);
+  // The latest draft write per `account\0room`: a save or deletion that
+  // finishes after a newer one for the same chat neither clears nor sets that
+  // chat's failure line (R410).
+  const draftWrites = useRef(new Map<string, number>());
   // Cross-device mirror (Story 7.2, AD-15) runs on its own looser debounce, off the
   // keystroke path. `pendingMirror` holds the body a debounced mirror will write;
   // `null` means nothing is queued. Best-effort — never blocks or fails local persistence.
@@ -284,9 +300,9 @@ export function Composer({
     // Best-effort: a mirror failure must never block or fail local persistence — the
     // only symptom is the absent cross-device echo. The Rust core dedupes by body.
     if (trimmed.length > 0) {
-      void mirrorDraft(a, r, trimmed).catch(() => {});
+      void mirrorDraft(a, r, trimmed).catch(logFailure("composer.mirrorDraft"));
     } else {
-      void clearDraftMirror(a, r).catch(() => {});
+      void clearDraftMirror(a, r).catch(logFailure("composer.clearDraftMirror"));
     }
   }, []);
 
@@ -297,7 +313,9 @@ export function Composer({
       draftMirrorTimer.current = null;
     }
     pendingMirror.current = null;
-    void clearDraftMirror(accountIdRef.current, roomIdRef.current).catch(() => {});
+    void clearDraftMirror(accountIdRef.current, roomIdRef.current).catch(
+      logFailure("composer.clearDraftMirror"),
+    );
   }, []);
 
   /** Queue `body` for a debounced cross-device mirror write (Story 7.2). */
@@ -326,12 +344,32 @@ export function Composer({
     const a = accountIdRef.current;
     const r = roomIdRef.current;
     const trimmed = body.trim();
-    // Fire-and-forget: a persist failure must never block or surface on the keystroke
-    // path — the composer's local state stays the visible truth.
+    const key = `${a}\u0000${r}`;
+    const write = (draftWrites.current.get(key) ?? 0) + 1;
+    draftWrites.current.set(key, write);
+    const latest = () => draftWrites.current.get(key) === write;
+    // Never awaited on the keystroke path. A failed save is said once under the
+    // composer and logged (de-duplicated by the funnel), and the chat is not marked
+    // as holding a saved draft: leaving it would lose the words (R387). The line
+    // goes once the chat's latest write lands — a save, or the deletion of a
+    // draft the person emptied (nothing is left unsaved then); a deletion that
+    // fails keeps it, because the chat may still hold older words (R410).
+    const failed = (source: string) => (raw: unknown) => {
+      logFailure(source)(raw);
+      if (latest()) {
+        draftsStore.getState().mark(a, r, false);
+        setUnsavedDraft(key);
+      }
+    };
+    const landed = () => {
+      if (latest()) {
+        setUnsavedDraft((unsaved) => (unsaved === key ? null : unsaved));
+      }
+    };
     if (trimmed.length > 0) {
-      void saveDraft(a, r, trimmed).catch(() => {});
+      void saveDraft(a, r, trimmed).then(landed, failed("composer.saveDraft"));
     } else {
-      void clearDraft(a, r).catch(() => {});
+      void clearDraft(a, r).then(landed, failed("composer.clearDraft"));
     }
     draftsStore.getState().mark(a, r, trimmed.length > 0);
   }, []);
@@ -349,8 +387,14 @@ export function Composer({
     pendingDraft.current = null;
     const a = accountIdRef.current;
     const r = roomIdRef.current;
-    void clearDraft(a, r).catch(() => {});
+    // Supersede any save still in flight: its late failure must not say a draft
+    // was lost after the message was sent.
+    const key = `${a}\u0000${r}`;
+    draftWrites.current.set(key, (draftWrites.current.get(key) ?? 0) + 1);
+    void clearDraft(a, r).catch(logFailure("composer.clearDraft"));
     draftsStore.getState().mark(a, r, false);
+    // Nothing is left to save, so nothing is left unsaved.
+    setUnsavedDraft(null);
     // Tombstone the cross-device mirror too (Story 7.2) so other devices stop showing
     // the sent/cleared draft. Best-effort — never blocks the send/clear path.
     clearMirror();
@@ -478,14 +522,20 @@ export function Composer({
   // via the conflict chip; it replaces the composer only into an empty, untouched one
   // (drafts follow the user). Reads refs only, so `[]` deps are exhaustive; it never
   // overwrites content the user has already established (see `restoreConsumed`). A load
-  // failure is swallowed (fall back to local / no chip, never a crash).
+  // failure is logged (fall back to local / no chip, never a crash).
   useEffect(() => {
     let cancelled = false;
     const a = accountIdRef.current;
     const r = roomIdRef.current;
     void Promise.all([
-      loadDraft(a, r).catch(() => null),
-      loadRemoteDraft(a, r).catch(() => null),
+      loadDraft(a, r).catch((error: unknown) => {
+        logFailure("composer.loadDraft")(error);
+        return null;
+      }),
+      loadRemoteDraft(a, r).catch((error: unknown) => {
+        logFailure("composer.loadRemoteDraft")(error);
+        return null;
+      }),
     ]).then(([local, remote]) => {
       // Bail if unmounted or the composer's content was already established during the
       // async load — the user typed, sent, or entered edit (`restoreConsumed`), any of
@@ -649,6 +699,7 @@ export function Composer({
       // edited) gets terminal copy: the generic "check your connection and try again"
       // would send the user chasing a retry that can never succeed. Anything that is not
       // a recognisable envelope is treated as retriable — the weaker, safer claim.
+      logFailure("composer.send")(raw);
       const err = raw as IpcError | null | undefined;
       setError(err?.retriable === false ? "terminal" : "retriable");
       // Re-persist the retained draft (the queued save was cancelled above) so a failed
@@ -685,8 +736,9 @@ export function Composer({
           filename: basename(path),
         })),
       );
-    } catch {
-      // A dialog failure is non-fatal — the user can retry; nothing to surface.
+    } catch (error) {
+      // A dialog failure is non-fatal — the user can retry once told.
+      sayFailure("composer.pickFiles", "keeper couldn't open the file picker.")(error);
     }
   }
 
@@ -932,6 +984,11 @@ export function Composer({
           {pending?.mode === "edit" ? "Save" : "Send"}
         </Button>
       </div>
+      {unsavedDraft === `${accountId}\u0000${roomId}` && (
+        <p role="alert" className="text-destructive text-xs">
+          {DRAFT_NOT_SAVED}
+        </p>
+      )}
       {error !== null && (
         <p role="alert" className="text-destructive text-xs">
           {error === "terminal"

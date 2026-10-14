@@ -71,6 +71,7 @@ import {
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { IconHint } from "@/components/ui/tooltip";
+import { logFailure, sayFailure } from "@/lib/failure";
 import { formatFileSize } from "@/lib/file-size";
 import {
   batchConflicts,
@@ -401,6 +402,7 @@ function BrowseFlow({
           setListing({ kind: "ready", sourceId, vm: answer, refreshing: false });
         }
       } catch (raw) {
+        logFailure("browseRepos.listing")(raw);
         if (current()) {
           setListing({ kind: "failed", sourceId, sentence: syncErrorMessage(raw) });
         }
@@ -538,9 +540,10 @@ function SourceProblem({ source }: { source: ForgeSourceVm }) {
       if (signIn) {
         accountStore.getState().setVm(await accountSignIn());
       }
-      await forgeRepos(source.id, true).catch(() => {});
+      await forgeRepos(source.id, true).catch(logFailure("forges.relist"));
       await refreshForgeSources();
     } catch (raw) {
+      logFailure("browseRepos.fixSource")(raw);
       setError(syncErrorMessage(raw));
     } finally {
       setBusy(false);
@@ -583,7 +586,7 @@ function ConnectPanel({ source, disconnected }: { source: ForgeSourceVm; disconn
     return () => {
       mounted.current = false;
       if (waiting.current) {
-        void forgeConnectCancel(source.id).catch(() => {});
+        void forgeConnectCancel(source.id).catch(logFailure("forges.connectCancel"));
       }
     };
   }, [source.id]);
@@ -594,13 +597,14 @@ function ConnectPanel({ source, disconnected }: { source: ForgeSourceVm; disconn
     try {
       code = await forgeConnectStart(source.id);
     } catch (raw) {
+      logFailure("browseRepos.connectStart")(raw);
       if (mounted.current) {
         setPhase({ kind: "idle", sentence: syncErrorMessage(raw) });
       }
       return;
     }
     if (!mounted.current) {
-      void forgeConnectCancel(source.id).catch(() => {});
+      void forgeConnectCancel(source.id).catch(logFailure("forges.connectCancel"));
       return;
     }
     waiting.current = true;
@@ -615,6 +619,7 @@ function ConnectPanel({ source, disconnected }: { source: ForgeSourceVm; disconn
         setPhase({ kind: "idle", sentence: next.sentence });
       }
     } catch (raw) {
+      logFailure("browseRepos.connectWait")(raw);
       waiting.current = false;
       if (mounted.current) {
         setPhase({ kind: "idle", sentence: syncErrorMessage(raw) });
@@ -661,9 +666,10 @@ function ConnectPanel({ source, disconnected }: { source: ForgeSourceVm; disconn
                   variant="link"
                   className="h-auto p-0"
                   onClick={() =>
-                    void openUrl(appsUrl).catch((raw) =>
-                      setPhase({ kind: "idle", sentence: syncErrorMessage(raw) }),
-                    )
+                    void openUrl(appsUrl).catch((raw) => {
+                      logFailure("browseRepos.openApps")(raw);
+                      setPhase({ kind: "idle", sentence: syncErrorMessage(raw) });
+                    })
                   }
                 >
                   {BROWSE_GITHUB_APPS_LABEL}
@@ -708,7 +714,10 @@ function ConnectPanel({ source, disconnected }: { source: ForgeSourceVm; disconn
           type="button"
           onClick={() => {
             copy(code.userCode);
-            forgeConnectOpen(source.id).catch((raw) => report(syncErrorMessage(raw)));
+            forgeConnectOpen(source.id).catch((raw) => {
+              logFailure("browseRepos.connectOpen")(raw);
+              report(syncErrorMessage(raw));
+            });
           }}
         >
           {browseOpenLabel(source.host)}
@@ -735,7 +744,11 @@ function ConnectPanel({ source, disconnected }: { source: ForgeSourceVm; disconn
           type="button"
           variant="ghost"
           size="sm"
-          onClick={() => void forgeConnectCancel(source.id).catch(() => {})}
+          onClick={() =>
+            void forgeConnectCancel(source.id).catch(
+              sayFailure("forges.connectCancel", "keeper couldn't cancel the connection."),
+            )
+          }
         >
           {BROWSE_CANCEL_LABEL}
         </Button>
@@ -959,7 +972,9 @@ function RepoBrowser({
                       onClick={() => {
                         const link = notice.link;
                         if (link !== null) {
-                          void openUrl(link).catch(() => {});
+                          void openUrl(link).catch(
+                            sayFailure("forges.openNoticeLink", "keeper couldn't open the link."),
+                          );
                         }
                       }}
                     >
@@ -1056,7 +1071,10 @@ function RepoBrowser({
               size="xs"
               onClick={() => {
                 setDisconnectError(null);
-                void onDisconnect().catch((raw) => setDisconnectError(syncErrorMessage(raw)));
+                void onDisconnect().catch((raw) => {
+                  logFailure("browseRepos.disconnect")(raw);
+                  setDisconnectError(syncErrorMessage(raw));
+                });
               }}
             >
               {BROWSE_DISCONNECT_LABEL}
@@ -1305,6 +1323,7 @@ function BatchStep({
         })),
       });
     } catch (raw) {
+      logFailure("browseRepos.add")(raw);
       // Rejected only when the source itself failed; its state says why.
       setError(syncErrorMessage(raw));
       setRunning(false);
@@ -1369,7 +1388,11 @@ function BatchStep({
                 variant="outline"
                 size="sm"
                 disabled={running}
-                onClick={() => void chooseBase().catch(() => {})}
+                onClick={() =>
+                  void chooseBase().catch(
+                    sayFailure("forges.chooseBase", "keeper couldn't open the folder picker."),
+                  )
+                }
               >
                 {SYNC_CHOOSE_FOLDER_LABEL}
               </Button>

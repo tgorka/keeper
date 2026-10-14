@@ -27,6 +27,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { logFailure } from "@/lib/failure";
 import type { BbctlAvailabilityVm } from "@/lib/ipc/client";
 import { bbctlAvailability } from "@/lib/ipc/client";
 import { bbctlStore, useBbctlStore } from "@/lib/stores/bbctl";
@@ -52,6 +53,7 @@ export function BbctlPanel({ accountId, onBridgeAdded }: BbctlPanelProps) {
         }
       })
       .catch((raw: { message?: string }) => {
+        logFailure("bbctl.availability")(raw);
         if (!cancelled) {
           setError(raw?.message ?? "Could not check for bbctl.");
         }

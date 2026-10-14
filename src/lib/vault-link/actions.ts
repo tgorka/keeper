@@ -37,6 +37,8 @@
  * from drifting: they are one feature in two directions, and the day one of
  * them learns something about focus the other has to learn it too.
  */
+
+import { logFailure } from "@/lib/failure";
 import { type NoteFolderVm, notesTree } from "@/lib/ipc/client";
 import { NOTES_UNKNOWN_ERROR, notesVaultsStore, setActiveVault } from "@/lib/stores/notes-vaults";
 import { panelsStore } from "@/lib/stores/panels";
@@ -152,6 +154,7 @@ export async function openNoteForFile(
   try {
     folder = await notesTree(resolved.vaultId, resolved.vaultDir);
   } catch (raw) {
+    logFailure("notes.openNoteForFile")(raw);
     return syncErrorMessage(raw, NOTES_UNKNOWN_ERROR);
   }
   const row = folder.notes.find((note) => note.path === resolved.vaultPath);

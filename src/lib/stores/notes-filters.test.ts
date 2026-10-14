@@ -23,6 +23,7 @@ import {
 } from "@/lib/stores/notes-filters";
 
 vi.mock("@/lib/ipc/client", () => ({
+  frontendErrorReport: vi.fn(async () => {}),
   notesHideServiceFilesGet: vi.fn(async () => true),
   notesHideServiceFilesSet: vi.fn(async () => {}),
   notesIncludePrivateGet: vi.fn(async () => false),

@@ -40,6 +40,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { logFailure } from "@/lib/failure";
 import type {
   TemplateUpdateNoteVm,
   TemplateUpdateOfferVm,
@@ -117,6 +118,7 @@ export function TemplateUpdateOffer({ vaultId, noteId, rev }: TemplateUpdateOffe
           setFailure(null);
         })
         .catch((raw: unknown) => {
+          logFailure("notes.templateUpdatePreview")(raw);
           if (live) {
             setOffer(null);
             setFailure(syncErrorMessage(raw, TEMPLATE_OFFER_FAILED));
@@ -220,7 +222,10 @@ function TemplateUpdateDialog({ vaultId, offer, onClose }: DialogProps) {
       selections,
     })
       .then(setResult)
-      .catch((raw: unknown) => setFailure(syncErrorMessage(raw, TEMPLATE_UPDATE_FAILED)))
+      .catch((raw: unknown) => {
+        logFailure("notes.templateUpdateApply")(raw);
+        setFailure(syncErrorMessage(raw, TEMPLATE_UPDATE_FAILED));
+      })
       .finally(() => setBusy(false));
   }, [vaultId, offer, chosen]);
 
@@ -397,7 +402,10 @@ function TemplateUpdateResult({ vaultId, result }: ResultProps) {
                 setFailure(null);
                 void notesRestoreRevision(vaultId, applied.noteId, applied.undoRev)
                   .then(() => setUndone((current) => new Set(current).add(applied.noteId)))
-                  .catch((raw: unknown) => setFailure(syncErrorMessage(raw, TEMPLATE_UNDO_FAILED)));
+                  .catch((raw: unknown) => {
+                    logFailure("notes.templateUpdateUndo")(raw);
+                    setFailure(syncErrorMessage(raw, TEMPLATE_UNDO_FAILED));
+                  });
               }}
             >
               {undone.has(applied.noteId) ? "Undone" : "Undo"}

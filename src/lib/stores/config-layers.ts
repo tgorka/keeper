@@ -23,6 +23,7 @@
  */
 import { useStore } from "zustand";
 import { createStore } from "zustand/vanilla";
+import { logFailure } from "@/lib/failure";
 import { type ConfigLayersVm, type ConfigOverrideVm, configLayers } from "@/lib/ipc/client";
 
 /**
@@ -72,7 +73,8 @@ export function useConfigLayersStore<T>(selector: (state: ConfigLayersState) => 
 export async function refreshConfigLayers(): Promise<void> {
   try {
     configLayersStore.getState().applySnapshot(await configLayers());
-  } catch {
+  } catch (raw) {
+    logFailure("config.layers")(raw);
     // The rejection body is not rendered. It would be an IPC envelope
     // describing a command that cannot fail for any reason a user can act on,
     // and the one useful thing to say is that the list may be incomplete.

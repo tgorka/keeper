@@ -32,6 +32,7 @@ import { ChevronDown, ChevronRight, Folder } from "lucide-react";
 import { useEffect, useState } from "react";
 import { FoldSection } from "@/components/layout/sidebar-group";
 import { DriveHeading } from "@/components/notes/space-list";
+import { logFailure } from "@/lib/failure";
 import { notesTree } from "@/lib/ipc/client";
 import { notesFiltersStore, useNotesFiltersStore } from "@/lib/stores/notes-filters";
 import { notesRailFoldStore, useNotesRailFold } from "@/lib/stores/notes-rail-fold";
@@ -73,7 +74,8 @@ function FolderNode({
           setDirs(folder.dirs);
         }
       })
-      .catch(() => {
+      .catch((raw: unknown) => {
+        logFailure("notes.tree")(raw);
         // An unreadable directory renders as a leaf rather than as an error: the
         // rest of the tree is still true, and the row can still be selected.
         if (!cancelled) {
@@ -183,7 +185,8 @@ export function PhysicalTree({
           setDirs(folder.dirs);
         }
       })
-      .catch(() => {
+      .catch((raw: unknown) => {
+        logFailure("notes.treeRoot")(raw);
         if (!cancelled) {
           setDirs([]);
         }

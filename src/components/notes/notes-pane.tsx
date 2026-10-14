@@ -64,6 +64,7 @@ import {
 } from "@/hooks/use-notes-actions";
 import { useNotesChanges } from "@/hooks/use-notes-changes";
 import { countLabel, NOTES } from "@/lib/count-label";
+import { logFailure } from "@/lib/failure";
 import type { NoteRailVaultVm, NoteRowVm, NoteSpaceVm } from "@/lib/ipc/client";
 import { notesSubscribeSearch, notesUnsubscribeChanges } from "@/lib/ipc/client";
 import { ALL_SPACE_ID } from "@/lib/notes/all-spaces";
@@ -215,6 +216,7 @@ export function NotesPane() {
     let cancelled = false;
     void Promise.all([hydrateHideServiceFiles(), hydrateIncludePrivate()])
       .catch((error: unknown) => {
+        logFailure("notes.hydrateVisibility")(error);
         if (!cancelled)
           setActionError(syncErrorMessage(error, "Could not restore service-file visibility."));
       })
@@ -238,6 +240,7 @@ export function NotesPane() {
         else subscriptionId = id;
       })
       .catch((error: unknown) => {
+        logFailure("notes.subscribeSearch")(error);
         if (!cancelled) setActionError(syncErrorMessage(error, "Search status is unavailable."));
       });
     return () => {

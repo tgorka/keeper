@@ -72,6 +72,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { logFailure, sayFailure } from "@/lib/failure";
 import type {
   RecordingDestinationKind,
   RecordingPathPreviewVm,
@@ -345,10 +346,11 @@ export function RecordingDestinationControls({
         // has to leave the picker.
         list.length === 0 && current.length === 0 ? current : list,
       );
-    } catch {
+    } catch (error) {
       // The command already answers `[]` for every "sync cannot say"; a failed
       // round trip is the same answer, and inventing a picker over it would
       // offer folders nothing can confirm exist.
+      logFailure("recording.destinationProfiles")(error);
     }
   }, []);
   useEffect(() => {
@@ -406,7 +408,8 @@ export function RecordingDestinationControls({
           setPreviewing(false);
         }
       })
-      .catch(() => {
+      .catch((raw: unknown) => {
+        logFailure("recording.pathPreview")(raw);
         // A failed round trip is not a verdict on the template: show no path,
         // invent no sentence, and leave save disabled until a preview lands.
         if (id === previewId.current) {
@@ -503,8 +506,9 @@ export function RecordingDestinationControls({
           destinationDir: selection,
         });
       }
-    } catch {
-      // Picker cancellation / failure → keep the current folder (no write).
+    } catch (error) {
+      // A cancelled picker resolves null; a failure keeps the current folder (no write).
+      sayFailure("recording.pickFolder", "keeper couldn't change the recording folder.")(error);
     }
   };
 
@@ -655,6 +659,7 @@ export function RecordingDestinationControls({
         headEdited.current = false;
       }
     } catch (raw) {
+      logFailure("recording.subfolderSave")(raw);
       // Rust-authored, beside the field it is about: "must not be empty", "must
       // be relative to the profile folder", "must not escape the profile folder",
       // "overlaps notes subfolder …". `headEdited` stays set, so the re-read above

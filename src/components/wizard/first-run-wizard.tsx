@@ -31,6 +31,7 @@ import { Label } from "@/components/ui/label";
 import { useBridgeCatalog } from "@/hooks/use-bridge-catalog";
 import { useBridgeDiscovery } from "@/hooks/use-bridge-discovery";
 import { COMPANION_STACK_DOCS_URL } from "@/lib/bridges";
+import { logFailure } from "@/lib/failure";
 import {
   type BridgeNetworkVm,
   firstRunSetupSkippedGet,
@@ -122,10 +123,9 @@ export function FirstRunWizard() {
           setSkipAtStartup(value);
         }
       })
-      .catch(() => {
-        // Unreadable ⇒ the box stays unchecked and a confirm writes nothing
-        // unless the person touches it (the honest default; skipping still works).
-      });
+      // Unreadable ⇒ the box stays unchecked and a confirm writes nothing
+      // unless the person touches it (the honest default; skipping still works).
+      .catch(logFailure("wizard.readSkipSetup"));
     return () => {
       cancelled = true;
     };

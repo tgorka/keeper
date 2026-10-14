@@ -25,6 +25,7 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { logFailure } from "@/lib/failure";
 import {
   type FilesEntryVm,
   type FilesListingVm,
@@ -79,6 +80,7 @@ export function MediaPickerDialog({
       setProblem(null);
       onPicked(block);
     } catch (cause) {
+      logFailure("media.blockCompose")(cause);
       setProblem(syncErrorMessage(cause));
     } finally {
       setBusy(false);

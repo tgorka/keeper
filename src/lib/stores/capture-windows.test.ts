@@ -18,6 +18,7 @@ const notesCaptureClose = vi.fn<(key: string) => Promise<void>>();
 const notesCaptureSetLocked = vi.fn<(key: string, locked: boolean) => Promise<void>>();
 
 vi.mock("@/lib/ipc/client", () => ({
+  frontendErrorReport: vi.fn(async () => {}),
   notesCaptureWindows: (...args: []) => notesCaptureWindows(...args),
   notesCaptureOpen: (target: unknown) => notesCaptureOpen(target),
   notesCaptureClose: (key: string) => notesCaptureClose(key),

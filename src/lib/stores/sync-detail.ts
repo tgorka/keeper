@@ -23,6 +23,7 @@
  */
 import { useStore } from "zustand";
 import { createStore } from "zustand/vanilla";
+import { logFailure } from "@/lib/failure";
 import {
   type SyncActivityVm,
   type SyncPendingVm,
@@ -314,8 +315,8 @@ export function startSyncDetailPolling(intervalMs: number = SYNC_DETAIL_POLL_MS)
  * The same race-safe shape as the bridge-health subscription: the sink is gated
  * so a late event after teardown never mutates the store, a teardown that beats
  * the subscribe id unsubscribes as soon as it lands, and a failed subscribe is
- * swallowed — progress detail is a refinement, and the polled status keeps the
- * view honest without it.
+ * logged, not said — progress detail is a refinement, and the polled status
+ * keeps the view honest without it.
  */
 export function startSyncProgressStream(): () => void {
   let stopped = false;
@@ -328,19 +329,18 @@ export function startSyncProgressStream(): () => void {
   })
     .then((id) => {
       if (stopped) {
-        void syncUnsubscribeProgress(id).catch(() => {});
+        void syncUnsubscribeProgress(id).catch(logFailure("sync.unsubscribeProgress"));
         return;
       }
       subscriptionId = id;
     })
-    .catch(() => {
-      // No stream: the polled status still carries state, counters and the line.
-    });
+    // No stream: the polled status still carries state, counters and the line.
+    .catch(logFailure("sync.subscribeProgress"));
 
   return () => {
     stopped = true;
     if (subscriptionId !== null) {
-      void syncUnsubscribeProgress(subscriptionId).catch(() => {});
+      void syncUnsubscribeProgress(subscriptionId).catch(logFailure("sync.unsubscribeProgress"));
       subscriptionId = null;
     }
   };

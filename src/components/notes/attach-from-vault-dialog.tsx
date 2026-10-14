@@ -155,6 +155,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
+import { logFailure } from "@/lib/failure";
 import { type NoteGalleryScope, type NoteGalleryVm, notesGallery } from "@/lib/ipc/client";
 import {
   attachmentName,
@@ -325,7 +326,8 @@ export function AttachFromVaultDialog({
           setListing(found);
         }
       })
-      .catch(() => {
+      .catch((raw: unknown) => {
+        logFailure("notes.gallery")(raw);
         if (live) {
           // An empty listing plus a sentence, never a stale one: offering the
           // previous folder's files would attach a file the person is no longer

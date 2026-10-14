@@ -9,6 +9,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { logFailure } from "@/lib/failure";
 import {
   type BotModelVm,
   botsModelsList,
@@ -54,7 +55,8 @@ export function SearchSettingsSection({ open }: { open: boolean }) {
         setModel(value);
         setLoaded(true);
       })
-      .catch(() => {
+      .catch((raw: unknown) => {
+        logFailure("notes.searchSettingsRead")(raw);
         if (live) setError("Notes search settings could not be read.");
       });
     if (showEmbedding)
@@ -85,7 +87,8 @@ export function SearchSettingsSection({ open }: { open: boolean }) {
             );
           }
         })
-        .catch(() => {
+        .catch((raw: unknown) => {
+          logFailure("notes.embeddingModels")(raw);
           if (live) setError("Embedding models could not be read. Check the provider in Settings.");
         });
     return () => {
@@ -106,7 +109,8 @@ export function SearchSettingsSection({ open }: { open: boolean }) {
       const saved = await notesServiceFileNamesGet();
       setNames(saved.join(", "));
       setSavedNames(saved.join(", "));
-    } catch {
+    } catch (raw) {
+      logFailure("notes.serviceFilesSave")(raw);
       setError("Service files could not be saved.");
     } finally {
       setSaving(false);
@@ -173,7 +177,8 @@ export function SearchSettingsSection({ open }: { open: boolean }) {
               setError(null);
               void notesEmbeddingModelSet(next)
                 .then(() => setModel(next))
-                .catch(() => {
+                .catch((raw: unknown) => {
+                  logFailure("notes.embeddingModelSet")(raw);
                   setError("The embedding model could not be saved.");
                 })
                 .finally(() => setSaving(false));

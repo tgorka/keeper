@@ -101,6 +101,8 @@ import type {
   DeviceCodeVm,
   DocumentVm,
   DriveFolderVm,
+  FailureOperation,
+  FailureStateVm,
   FileSizeVm,
   FilesEntrySyncVm,
   FilesEntryVm,
@@ -4743,6 +4745,12 @@ const copyJobs = new Map<string, CopyJobVm>();
 // through "Finish signing in…" (with Cancel sign-in) and the sync — and the
 // word `refuse` anywhere in it answers Rust's refusal instead, and the word
 // `registered` answers a device the repository already knows (UX-DR119).
+// The word `denied` walks the sign-in to the identity provider's refusal
+// (`access_denied`, Epic 100, R381): the sheet and Settings › Account then
+// show Rust's problem sentence as an alert. The word `forge` walks it to a
+// repository connection that failed after the identity sign-in (R387), the
+// same way. Cancel sign-in during a re-setup of `?account=ready` keeps the
+// account up to date and ends the attempt `closed` (R387).
 //
 // Every answer is what Rust would answer, sentences included (`state.rs`
 // `compose`), and every snapshot carries the next `revision`, as Rust's do. An
@@ -4760,6 +4768,8 @@ const NO_ACCOUNT_VM: OrgAccountVm = {
   repoMode: null,
   state: "none",
   sentence: null,
+  problem: false,
+  attempt: null,
   identity: null,
   device: null,
   devices: [],
@@ -4885,6 +4895,10 @@ function signedInAccount(state: AccountStateVm, device = ACCOUNT_THIS_DEVICE): O
     repoMode: "same",
     state,
     sentence: sentences[state] ?? null,
+    // Rust's `problem`: a policy stop and a dead grant are problems; offline
+    // with settings in hand, and the signed-out instruction, are not.
+    problem: state === "blocked" || state === "needsSignIn",
+    attempt: null,
     identity: signedOut
       ? null
       : {
@@ -5049,25 +5063,71 @@ function matrixSignedIn(
  * first, the signed-out state the confirm resolves with (it resolves, it does
  * not reject). The pauses are only long enough to see each state.
  */
-function accountSignInFlow(device: AccountDeviceVm): Promise<OrgAccountVm> {
+/** What Rust composes when the identity provider answers `access_denied` (R381). */
+function deniedAccount(): OrgAccountVm {
+  return {
+    ...signedInAccount("signedOut"),
+    state: "blocked",
+    sentence:
+      "id.acme.dev refused to sign you in to Acme: User is not allowed to use this project.",
+    problem: true,
+    attempt: "failed",
+  };
+}
+
+/**
+ * What Rust composes when the identity sign-in worked but connecting the `oauth`
+ * repository failed — its sign-in page did not open (R387): the failure, as a
+ * problem, never the neutral "Reconnect the repository".
+ */
+function forgeFailedAccount(device: AccountDeviceVm): OrgAccountVm {
+  return {
+    ...signedInAccount("needsSignIn", device),
+    repoMode: "oauth",
+    forgeConnected: false,
+    sentence:
+      "Connecting Acme's repository failed (keeper could not open the repository's sign-in page). Sign in again.",
+    problem: true,
+    attempt: "failed",
+  };
+}
+
+/** How a mock sign-in ends: Rust's `denied` refusal, a failed repository connection, or set up. */
+type MockSignInEnd = "denied" | "forgeFailed" | "done";
+
+function accountSignInFlow(
+  device: AccountDeviceVm,
+  end: MockSignInEnd = "done",
+): Promise<OrgAccountVm> {
   // The project's `lib` predates `Promise.withResolvers`.
   let resolve: (vm: OrgAccountVm) => void = () => {};
   const promise = new Promise<OrgAccountVm>((settle) => {
     resolve = settle;
   });
-  setAccount(signedInAccount("signingIn", device));
+  // An account already signed in here keeps its identity when a re-setup is
+  // closed: Rust's state still reads up to date; only `attempt` says closed.
+  const before = accountVm.identity !== null ? signedInAccount("ready", device) : null;
+  setAccount({ ...signedInAccount("signingIn", device), attempt: "running" });
   const signIn = setTimeout(() => {
     accountSignInCancel = null;
-    setAccount(signedInAccount("syncing", device));
+    if (end === "denied") {
+      resolve(setAccount(deniedAccount()));
+      return;
+    }
+    if (end === "forgeFailed") {
+      resolve(setAccount(forgeFailedAccount(device)));
+      return;
+    }
+    setAccount({ ...signedInAccount("syncing", device), attempt: "running" });
     setTimeout(() => {
       accountLastAttemptMs = Date.now();
-      resolve(setAccount(signedInAccount("ready", device)));
+      resolve(setAccount({ ...signedInAccount("ready", device), attempt: "done" }));
     }, 1000);
   }, 2500);
   accountSignInCancel = () => {
     clearTimeout(signIn);
     accountSignInCancel = null;
-    resolve(setAccount(signedInAccount("signedOut", device)));
+    resolve(setAccount({ ...(before ?? signedInAccount("signedOut", device)), attempt: "closed" }));
   };
   return promise;
 }
@@ -7363,12 +7423,81 @@ function mockPushGatewaySet(payload: Record<string, unknown>) {
   return pushGateway;
 }
 
+/**
+ * Rust's standing background failures (Epic 100, R387, `keeper_core::failure::Failures`).
+ * `?failure=push` starts with a push registration that failed before the webview
+ * subscribed, `?failure=voice` with the wake phrase not re-armed — both are in the
+ * snapshot `failure_subscribe` answers first. As in Rust (R410), only the success of
+ * the operation that failed clears it: saving a push gateway (iOS re-registers) or
+ * confirming the distributor (Android) clears the push registration's; setting or
+ * toggling the wake phrase clears the re-arm's.
+ */
+const failureParam = new URLSearchParams(window.location.search).get("failure") ?? "";
+let failureState: FailureStateVm = {
+  notices: [
+    ...(failureParam.includes("push")
+      ? [
+          {
+            surface: "push" as const,
+            operation: "pushRegistration" as const,
+            account: "acct-mock",
+            sentence:
+              "keeper could not turn on push notifications for one of your accounts, so its messages arrive only while keeper is open.",
+          },
+        ]
+      : []),
+    ...(failureParam.includes("voice")
+      ? [
+          {
+            surface: "voice" as const,
+            operation: "voiceRearm" as const,
+            account: null,
+            sentence:
+              "keeper could not start listening for the wake phrase again. Turn listening off and on to try once more.",
+          },
+        ]
+      : []),
+  ],
+};
+const failureWatchers = new Map<string, MockChannel<FailureStateVm>>();
+
+/** `operation` succeeded: Rust clears its own failures and tells every watcher. */
+function failureRecovered(operation: FailureOperation): void {
+  const notices = failureState.notices.filter((notice) => notice.operation !== operation);
+  if (notices.length === failureState.notices.length) {
+    return;
+  }
+  failureState = { notices };
+  for (const watcher of failureWatchers.values()) {
+    watcher.onmessage?.(failureState);
+  }
+}
+
 /** The tablet's distributor was confirmed in Settings this session (98.4). */
 let unifiedpushConfirmed = false;
 
 const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = {
   push_gateway_get: () => pushGateway,
   push_open_take: () => null,
+  failure_subscribe: (payload) => {
+    const id = `failure-subscription-${failureWatchers.size + 1}`;
+    const channel = payload.channel as MockChannel<FailureStateVm>;
+    failureWatchers.set(id, channel);
+    channel.onmessage?.(failureState);
+    return id;
+  },
+  // `?failure=draft`: saving a composer draft fails, deleting one works (R410).
+  set_draft: () => {
+    if (failureParam.includes("draft")) {
+      throw { code: "internal", message: "database is locked", accountId: null, retriable: true };
+    }
+    return null;
+  },
+  delete_draft: () => null,
+  failure_unsubscribe: (payload) => {
+    failureWatchers.delete(String(payload.subscriptionId));
+    return null;
+  },
   // Android's push status (98.4): the tablet first asks which distributor to use
   // (ntfy, by name and package), and once confirmed answers a registered pusher. Both
   // views are Rust's own `UnifiedPushVm`s, written by the keeper-core test
@@ -7392,10 +7521,16 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
       };
     }
     unifiedpushConfirmed = true;
+    failureRecovered("pushRegistration");
     void emit(UNIFIEDPUSH_STATUS_EVENT);
     return UNIFIEDPUSH_FIXTURE.registered;
   },
-  push_gateway_set: mockPushGatewaySet,
+  push_gateway_set: (payload) => {
+    const saved = mockPushGatewaySet(payload);
+    // Rust re-registers the pusher with the saved gateway; it succeeds here.
+    failureRecovered("pushRegistration");
+    return saved;
+  },
   inbox_subscribe: subscribeMockInbox,
   agent_approval_decide: mockApprovalDecide,
   agent_approval_payload: mockApprovalPayload,
@@ -8084,8 +8219,30 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
   // Handlers over a module-level object rather than an `ANSWERS` row, so a write
   // lands somewhere and the mirror store's confirm path is exercised: the set
   // echoes the effective VM, exactly as the Rust command does.
-  recording_settings_get: () => recordingSettings,
+  //
+  // `?failure=recordingRead` refuses the read (the controls say it in place of
+  // the fields), `?failure=recordingWrite` refuses every write (the control that
+  // reverted says why) — R410.
+  recording_settings_get: () => {
+    if (failureParam.includes("recordingRead")) {
+      throw {
+        code: "internal",
+        message: "keeper could not read its database.",
+        accountId: null,
+        retriable: false,
+      };
+    }
+    return recordingSettings;
+  },
   recording_settings_set: (payload) => {
+    if (failureParam.includes("recordingWrite")) {
+      throw {
+        code: "invalid",
+        message: "keeper could not write the recording settings: the disk is full.",
+        accountId: null,
+        retriable: false,
+      };
+    }
     const next = payload.settings as Partial<typeof recordingSettings> | undefined;
     recordingSettings = { ...recordingSettings, ...(next ?? {}) };
     return recordingSettings;
@@ -8137,12 +8294,14 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
     voiceWake = { ...voiceWake, enabled: payload.enabled === true, phrase, stopPhrase };
     listeningDecided();
     voiceWatcher?.onmessage?.(voiceIdle());
+    failureRecovered("voiceRearm");
     return voiceWakeVm();
   },
   // Epic 68 (AD-218): the one listening verb, flipped from the stored switch.
   voice_wake_toggle: () => {
     voiceWake = { ...voiceWake, enabled: !voiceWake.enabled };
     voiceWatcher?.onmessage?.(voiceIdle());
+    failureRecovered("voiceRearm");
     if (voiceWake.enabled) {
       listeningDecided();
     }
@@ -9137,7 +9296,13 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
       };
     }
     return {
-      setupId: "setup-mock",
+      // The link's `denied` rides the setup id to the confirm, as Rust keeps
+      // the resolved descriptor under it.
+      setupId: input.includes("denied")
+        ? "setup-mock-denied"
+        : input.includes("forge")
+          ? "setup-mock-forge"
+          : "setup-mock",
       name: "Acme",
       issuerHost: "id.acme.dev",
       repoHost: "git.acme.dev",
@@ -9160,7 +9325,11 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
   account_setup_confirm: (payload) => {
     forgeErrors.clear();
     const name = String(payload.deviceName ?? ACCOUNT_THIS_DEVICE.name);
-    return accountSignInFlow({ ...ACCOUNT_THIS_DEVICE, slug: name, name });
+    const setupId = String(payload.setupId ?? "");
+    return accountSignInFlow(
+      { ...ACCOUNT_THIS_DEVICE, slug: name, name },
+      setupId.includes("denied") ? "denied" : setupId.includes("forge") ? "forgeFailed" : "done",
+    );
   },
   account_sign_in: () => {
     forgeErrors.clear();

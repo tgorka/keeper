@@ -29,6 +29,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { IconHint } from "@/components/ui/tooltip";
+import { logFailure } from "@/lib/failure";
 import type { SessionRowVm } from "@/lib/ipc/client";
 import {
   revealPath,
@@ -173,9 +174,10 @@ export function SessionActions({ rootId, rootPath, row }: SessionActionsProps) {
                 setArchiveError(null);
                 void sessionsArchive(rootId, row.id, review.choices, true, review.revision)
                   .then(() => setConfirmArchive(false))
-                  .catch((raw: unknown) =>
-                    setArchiveError(syncErrorMessage(raw, "Could not archive this session.")),
-                  )
+                  .catch((raw: unknown) => {
+                    logFailure("sessions.archive")(raw);
+                    setArchiveError(syncErrorMessage(raw, "Could not archive this session."));
+                  })
                   .finally(() => setArchiving(false));
               }}
             >

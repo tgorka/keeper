@@ -8,6 +8,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
+import { logFailure } from "@/lib/failure";
 import {
   type DictionaryTermVm,
   dictionaryTermDelete,
@@ -92,7 +93,10 @@ function TranscriptionSettings() {
     let live = true;
     void transcriptionModelsAvailable()
       .then((next) => live && setModels(next))
-      .catch((cause: unknown) => live && setError(syncErrorMessage(cause)));
+      .catch((cause: unknown) => {
+        logFailure("transcription.modelsAvailable")(cause);
+        live && setError(syncErrorMessage(cause));
+      });
     return () => {
       live = false;
     };
@@ -105,6 +109,7 @@ function TranscriptionSettings() {
         await startTranscription(picked);
       }
     } catch (cause) {
+      logFailure("transcription.pick")(cause);
       setError(syncErrorMessage(cause));
     }
   };
@@ -154,7 +159,10 @@ function TranscriptionSettings() {
                 setError(null);
                 void transcriptionModelsFetch()
                   .then((next) => transcriptionStore.setState({ status: next }))
-                  .catch((cause: unknown) => setError(syncErrorMessage(cause)))
+                  .catch((cause: unknown) => {
+                    logFailure("transcription.modelsFetch")(cause);
+                    setError(syncErrorMessage(cause));
+                  })
                   .finally(() => setFetching(false));
               }}
             >
@@ -241,9 +249,10 @@ function TranscriptionSettings() {
           setView(null);
           // A speaker assigned in there may have added or merged a person.
           for (const drive of status?.voicesDrives ?? [])
-            void refreshVoicesDrive(drive.profileId).catch((cause: unknown) =>
-              setError(syncErrorMessage(cause)),
-            );
+            void refreshVoicesDrive(drive.profileId).catch((cause: unknown) => {
+              logFailure("transcription.voicesDriveRefresh")(cause);
+              setError(syncErrorMessage(cause));
+            });
         }}
       />
     </section>
@@ -317,6 +326,7 @@ function VoicesDrive({
   useEffect(() => {
     let live = true;
     void refreshVoicesDrive(profileId).catch((cause: unknown) => {
+      logFailure("transcription.voicesDrive")(cause);
       if (live) setError(syncErrorMessage(cause));
     });
     return () => {
@@ -331,6 +341,7 @@ function VoicesDrive({
       await operation();
       return true;
     } catch (cause) {
+      logFailure("transcription.voicesEdit")(cause);
       setError(syncErrorMessage(cause));
       return false;
     } finally {

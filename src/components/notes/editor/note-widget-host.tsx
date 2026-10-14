@@ -34,6 +34,7 @@ import { useCallback, useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 import type { BoardCard } from "@/components/notes/task-board";
 import { TaskBoard } from "@/components/notes/task-board";
+import { logFailure } from "@/lib/failure";
 import type { WidgetKind, WidgetRow } from "@/lib/ipc/client";
 import { notesWidget, notesWidgetMove } from "@/lib/ipc/client";
 import { panelsStore } from "@/lib/stores/panels";
@@ -123,6 +124,7 @@ export function NoteWidget({ vaultId, kind, argument }: NoteWidgetProps): React.
       setRows(await notesWidget(vaultId, kind, argument));
       setNotice(null);
     } catch (error) {
+      logFailure("notes.widget")(error);
       // keeper's own sentence when it sent one: it knows which term of the
       // query it refused and this component does not (UX-DR43).
       setNotice(syncErrorMessage(error, WIDGET_READ_FAILED));

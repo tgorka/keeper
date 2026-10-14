@@ -27,6 +27,7 @@
  * puts back a line the shell has moved past.
  */
 import { useEffect } from "react";
+import { logFailure } from "@/lib/failure";
 import { listenVoiceWake, voiceAvailability, voiceWakeGet } from "@/lib/ipc/client";
 import { askWakeTicket, voiceStore } from "@/lib/stores/voice";
 
@@ -42,9 +43,8 @@ export function readVoiceWake(cancelled: () => boolean = () => false): void {
         voiceStore.getState().applyWakeRead(ticket, wake);
       }
     })
-    .catch(() => {
-      // No settings read means no switch to draw.
-    });
+    // No settings read means no switch to draw.
+    .catch(logFailure("voice.readWake"));
 }
 
 /**
@@ -58,10 +58,9 @@ export function readVoiceFacts(cancelled: () => boolean): void {
         voiceStore.getState().applyAvailability(unavailable);
       }
     })
-    .catch(() => {
-      // Unanswered stays `undefined`: the affordance neither shows nor
-      // claims absence on a question that failed.
-    });
+    // Unanswered stays `undefined`: the affordance neither shows nor
+    // claims absence on a question that failed.
+    .catch(logFailure("voice.readAvailability"));
 
   readVoiceWake(cancelled);
 }
@@ -100,9 +99,8 @@ function startMirror(): () => void {
         unlisten = stop;
       }
     })
-    .catch(() => {
-      // No event means the line moves on the next open or visibility return.
-    });
+    // No event means the line moves on the next open or visibility return.
+    .catch(logFailure("voice.listenWake"));
   const onVisible = () => {
     if (document.visibilityState === "visible") {
       readVoiceWake();

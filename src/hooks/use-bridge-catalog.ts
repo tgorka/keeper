@@ -10,6 +10,7 @@
  * failure mode).
  */
 import { useEffect, useState } from "react";
+import { logFailure } from "@/lib/failure";
 import type { BridgeNetworkVm, IpcError } from "@/lib/ipc/client";
 import { bridgeCatalog } from "@/lib/ipc/client";
 
@@ -43,6 +44,7 @@ export function useBridgeCatalog(): BridgeCatalogState {
         }
       })
       .catch((raw: IpcError) => {
+        logFailure("bridges.catalog")(raw);
         if (!cancelled) {
           setState({ catalog: null, loading: false, error: raw.message });
         }

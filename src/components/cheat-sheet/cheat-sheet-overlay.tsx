@@ -26,6 +26,7 @@ import {
   CommandList,
 } from "@/components/ui/command";
 import { Kbd } from "@/components/ui/kbd";
+import { logFailure } from "@/lib/failure";
 import type { MenuSectionVm } from "@/lib/ipc/client";
 import { cheatSheetSections } from "@/lib/ipc/client";
 import { useCheatSheetStore } from "@/lib/stores/cheat-sheet";
@@ -49,9 +50,8 @@ export function CheatSheetOverlay() {
           setSections(next);
         }
       })
-      .catch(() => {
-        // Read-only reference; a transient failure just shows no rows.
-      });
+      // Read-only reference; a transient failure just shows no rows.
+      .catch(logFailure("cheatSheet.sections"));
     return () => {
       cancelled = true;
     };

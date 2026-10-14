@@ -60,6 +60,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { IconHint } from "@/components/ui/tooltip";
 import { useLongPress } from "@/hooks/use-long-press";
+import { logFailure, sayFailure } from "@/lib/failure";
 import { formatDraftAge } from "@/lib/format-time";
 import type { SessionEntryVm } from "@/lib/ipc/client";
 import { revealPath, sessionsFileDelete, syncOpenEntry } from "@/lib/ipc/client";
@@ -221,7 +222,10 @@ export function SessionTree({
     setNotice(null);
     sessionsFileDelete(rootId, sessionId, target.relPath)
       .then(onChanged)
-      .catch((raw: unknown) => setNotice(syncErrorMessage(raw, SESSION_TREE_DELETE_FAILED)));
+      .catch((raw: unknown) => {
+        logFailure("sessions.fileDelete")(raw);
+        setNotice(syncErrorMessage(raw, SESSION_TREE_DELETE_FAILED));
+      });
   }, [deleting, rootId, sessionId, onChanged]);
 
   const rows = useMemo(() => visibleRows(entries, open), [entries, open]);
@@ -462,7 +466,9 @@ export function SessionTree({
                       aria-label={SESSION_TREE_OPEN_EXTERNAL_LABEL}
                       className="size-6"
                       onClick={() => {
-                        void syncOpenEntry(rootId, entry.subpath).catch(() => undefined);
+                        void syncOpenEntry(rootId, entry.subpath).catch(
+                          sayFailure("sessions.openFile", "keeper couldn't open the file."),
+                        );
                       }}
                     >
                       <ExternalLink aria-hidden="true" className="size-3.5" />
@@ -478,7 +484,9 @@ export function SessionTree({
                         aria-label={SESSION_TREE_REVEAL_LABEL}
                         className="size-6"
                         onClick={() => {
-                          void revealPath(entry.absolutePath).catch(() => undefined);
+                          void revealPath(entry.absolutePath).catch(
+                            sayFailure("sessions.revealFile", "keeper couldn't reveal the file."),
+                          );
                         }}
                       >
                         <SquareArrowOutUpRight aria-hidden="true" className="size-3.5" />

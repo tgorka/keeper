@@ -1,6 +1,7 @@
 import { open as openFile } from "@tauri-apps/plugin-dialog";
 import { useStore } from "zustand";
 import { createStore } from "zustand/vanilla";
+import { logFailure } from "@/lib/failure";
 import {
   type DictionaryTermVm,
   dictionaryTerms,
@@ -42,6 +43,7 @@ export function refreshTranscription(): Promise<void> {
       transcriptionStore.setState({ status, error: null });
     })
     .catch((cause: unknown) => {
+      logFailure("transcription.status")(cause);
       transcriptionStore.setState({ error: syncErrorMessage(cause) });
     })
     .finally(() => {
@@ -68,6 +70,7 @@ export async function saveTranscriptionSettings(patch: {
     );
     transcriptionStore.setState({ status });
   } catch (cause) {
+    logFailure("transcription.settingsSet")(cause);
     transcriptionStore.setState({ error: syncErrorMessage(cause) });
   } finally {
     transcriptionStore.setState({ saving: false });
@@ -141,6 +144,7 @@ export async function startTranscription(
     if (current && !current.jobId && generations.get(path) === generation)
       put({ ...current, jobId });
   } catch (cause) {
+    logFailure("transcription.start")(cause);
     put({
       jobId: "",
       phase: "failed",

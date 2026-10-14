@@ -43,6 +43,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
+import { logFailure } from "@/lib/failure";
 import {
   type NoteAttachTargetVm,
   notesAttachSources,
@@ -115,7 +116,8 @@ export function AttachToNoteDialog({ vaultId, sources, onClose }: AttachToNoteDi
           setTargets(found);
         }
       })
-      .catch(() => {
+      .catch((raw: unknown) => {
+        logFailure("notes.attachTargets")(raw);
         // A failed search is an empty list plus a sentence, never a stale one:
         // offering the previous query's notes for this query would attach a
         // file to a note the person is no longer looking at.
@@ -202,6 +204,7 @@ export function AttachToNoteDialog({ vaultId, sources, onClose }: AttachToNoteDi
           ),
         );
       } catch (error) {
+        logFailure("notes.attachToNote")(error);
         setOutcome(
           `keeper could not attach to ${target.title}: ${
             error instanceof Error ? error.message : String(error)

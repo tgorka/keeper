@@ -38,7 +38,10 @@ impl From<AccountError> for ForgeError {
             AccountError::NeedsSignIn(s) => ForgeError::NeedsSignIn(s),
             AccountError::Unreachable(s) => ForgeError::Unreachable(s),
             AccountError::Refused(s) => ForgeError::Refused(s),
-            AccountError::Cancelled => ForgeError::NeedsSignIn("Sign in again.".to_owned()),
+            AccountError::Cancelled | AccountError::TimedOut | AccountError::Interrupted(_) => {
+                ForgeError::NeedsSignIn("Sign in again.".to_owned())
+            }
+            error @ AccountError::Denied { .. } => ForgeError::Refused(error.to_string()),
             AccountError::Internal(s) => ForgeError::Internal(s),
         }
     }

@@ -121,8 +121,13 @@ impl Write for GatedWriter {
 }
 
 /// Install the process-wide `tracing` subscriber and seed the gate from the
-/// persisted `debug.mode` setting. Idempotent-tolerant: a second install
-/// attempt (tests) is ignored rather than panicking.
+/// persisted `debug.mode` setting, then the panic hook (Epic 100, R381): a
+/// panic anywhere in the process becomes an `ERROR` line in `keeper.log`
+/// with its location and thread, and nothing else (R387: never counted in
+/// telemetry). The line is
+/// `keeper_sync::logfile::install_panic_hook`'s, tested there; this only
+/// installs it, once. Idempotent-tolerant: a second install attempt (tests)
+/// is ignored rather than panicking.
 pub fn init(data_dir: &Path) {
     let seeded = keeper_core::registry::get_debug_mode(data_dir).unwrap_or(false);
     ENABLED.store(seeded, Ordering::Relaxed);
@@ -141,6 +146,10 @@ pub fn init(data_dir: &Path) {
             }),
         )
         .try_init();
+    static PANIC_HOOK: std::sync::Once = std::sync::Once::new();
+    PANIC_HOOK.call_once(|| {
+        keeper_sync::logfile::install_panic_hook();
+    });
     if seeded {
         tracing::info!(path = %app_log_path().display(), "debug mode: on-disk logging enabled");
     }

@@ -12,6 +12,7 @@
  * on the splash forever.
  */
 import { useEffect } from "react";
+import { logFailure } from "@/lib/failure";
 import { sessionRestore } from "@/lib/ipc/client";
 import { accountsStore } from "@/lib/stores/accounts";
 
@@ -27,9 +28,8 @@ export function useSessionRestore(): void {
           accountsStore.getState().hydrateAll(accounts);
         }
       })
-      .catch(() => {
-        // A failed restore is fail-safe: fall through to the login screen.
-      })
+      // A failed restore is fail-safe: fall through to the login screen.
+      .catch(logFailure("session.restore"))
       .finally(() => {
         if (!cancelled) {
           // Always open the gate — success, null, or error — so the splash is

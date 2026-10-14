@@ -81,6 +81,7 @@ import {
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { IconHint } from "@/components/ui/tooltip";
+import { logFailure, sayFailure } from "@/lib/failure";
 import type {
   CredentialChoicesVm,
   CredentialSource,
@@ -1430,6 +1431,7 @@ export function AddFolderForm({
         // just entered is worse than no answer.
         setForm((live) => (live.token === "" ? { ...live, token: value } : live));
       } catch (raw) {
+        logFailure("addFolder.credentialRead")(raw);
         if (abandoned) {
           return;
         }
@@ -1498,10 +1500,9 @@ export function AddFolderForm({
           setSource(value);
         }
       })
-      .catch(() => {
-        // Unread ⇒ the keychain answer stands, which is what every folder was
-        // before accounts existed; the choice is still offered to change it.
-      });
+      // Unread ⇒ the keychain answer stands, which is what every folder was
+      // before accounts existed; the choice is still offered to change it.
+      .catch(logFailure("sync.readCredentialSource"));
     return () => {
       abandoned = true;
     };
@@ -1693,8 +1694,9 @@ export function AddFolderForm({
           // fail against the very path the Home control just wrote.
           setHome(resolved.replace(/\/+$/, "") || "/");
         }
-      } catch {
+      } catch (error) {
         // No home known; see above.
+        logFailure("sync.homeDir")(error);
       }
     })();
     return () => {
@@ -1722,8 +1724,10 @@ export function AddFolderForm({
         // before the picker opened, so a field typed meanwhile survives.
         setForm((live) => ({ ...live, localPath: selection }));
       }
-    } catch {
-      // Picker cancellation / failure → keep the current folder (no write).
+    } catch (error) {
+      // A cancellation resolves without a folder; only a picker that failed
+      // lands here, and the current folder stays.
+      sayFailure("sync.pickFolder", "keeper couldn't open the folder picker.")(error);
     }
   };
 
@@ -1924,6 +1928,7 @@ export function AddFolderForm({
         try {
           await syncCredentialSourceSet(saved.id, nextSource);
         } catch (raw) {
+          logFailure("addFolder.credentialSource")(raw);
           setError(`${SYNC_ACCOUNT_SOURCE_FAILED_PREFIX}${syncErrorMessage(raw)}`);
           onSaved?.(saved, false);
           return;
@@ -1972,6 +1977,7 @@ export function AddFolderForm({
             await syncSetCredential(saved.id, credential.value);
           }
         } catch (raw) {
+          logFailure("addFolder.credentialWrite")(raw);
           // A removal is only reachable from an edit form, since an add has no
           // stored token to remove — but "not stored" would describe the
           // opposite of what was attempted, so it gets its own wording.
@@ -2030,6 +2036,7 @@ export function AddFolderForm({
       }
       onSaved?.(saved, true);
     } catch (raw) {
+      logFailure("addFolder.save")(raw);
       setError(syncErrorMessage(raw));
     } finally {
       setSaving(false);

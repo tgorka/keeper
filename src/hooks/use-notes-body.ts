@@ -54,6 +54,7 @@
  * finds the document already there.
  */
 import { useCallback, useEffect, useRef } from "react";
+import { logFailure, sayFailure } from "@/lib/failure";
 import {
   type IpcError,
   type NoteReleaseReq,
@@ -129,10 +130,15 @@ function release(vaultId: string, noteId: string, subscriptionId: string, reques
         panelsStore.getState().closeTarget({ kind: "note", vaultId, noteId });
       }
     })
-    .catch(() => {
-      // Nothing left to tell: the surface that would have shown it is
-      // going away.
-    });
+    // The surface that would have shown it is going away, so a failed close
+    // is only logged — unless it carried unsaved words, which then never
+    // reached the disk: that the person has to hear, and the toast outlives
+    // the editor.
+    .catch(
+      request.text === null
+        ? logFailure("notes.release")
+        : sayFailure("notes.release", "keeper couldn't save the note."),
+    );
 }
 
 /**
@@ -211,6 +217,8 @@ async function writeNote(vaultId: string, noteId: string): Promise<boolean> {
     );
     return true;
   } catch (error: unknown) {
+    // The editor says it inline (the save bar); the log says it too (R387).
+    logFailure("notes.save")(error);
     markSaveFailed(vaultId, noteId, isIpcError(error) ? error.message : String(error));
     return false;
   }
@@ -265,8 +273,10 @@ export function useNotesBody(vaultId: string | null, noteId: string | null): Use
           return;
         }
         // Best-effort: a dropped heartbeat costs merge quality on the next
-        // external write, never the buffer, so it is not worth surfacing.
-        notesBufferReport(document.subscriptionId, document.text, document.rev).catch(() => {});
+        // external write, never the buffer, so it is only logged.
+        notesBufferReport(document.subscriptionId, document.text, document.rev).catch(
+          logFailure("notes.bufferReport"),
+        );
       }, NOTE_BUFFER_REPORT_IDLE_MS);
       clearTimeout(saveTimer.current);
       saveTimer.current = setTimeout(() => {
@@ -305,10 +315,11 @@ export function useNotesBody(vaultId: string | null, noteId: string | null): Use
               discard: mayDiscard(vaultId, noteId),
             });
           } else {
-            notesClose(subscriptionId, null).catch(() => {});
+            notesClose(subscriptionId, null).catch(logFailure("notes.close"));
           }
         })
         .catch((error: unknown) => {
+          logFailure("notes.open")(error);
           markSaveFailed(vaultId, noteId, isIpcError(error) ? error.message : String(error));
           if (isNoteNotFound(error)) {
             // A panel onto a note that is not there has nothing to offer:

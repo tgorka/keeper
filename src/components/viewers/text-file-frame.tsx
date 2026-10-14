@@ -133,6 +133,7 @@ import type { CsvTableOptions } from "@/components/notes/editor/csv-table";
 import { FileProperties, PROPERTIES_LABEL } from "@/components/notes/properties-panel";
 import { Button } from "@/components/ui/button";
 import { IconHint } from "@/components/ui/tooltip";
+import { logFailure } from "@/lib/failure";
 import { syncExportPdf } from "@/lib/ipc/client";
 import {
   fileFrameFoldStore,
@@ -865,9 +866,10 @@ export function TextFileFrame({
                     setPdfSaid(null);
                     void syncExportPdf(properties.profileId, properties.relativePath)
                       .then((name) => setPdfSaid(`Wrote ${name}`))
-                      .catch((error: unknown) =>
-                        setPdfSaid(error instanceof Error ? error.message : String(error)),
-                      )
+                      .catch((error: unknown) => {
+                        logFailure("viewer.exportPdf")(error);
+                        setPdfSaid(error instanceof Error ? error.message : String(error));
+                      })
                       .finally(() => setPdfWorking(false));
                   }}
                 >

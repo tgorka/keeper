@@ -20,6 +20,7 @@
  *   (the epic's first rule).
  */
 import { useEffect } from "react";
+import { logFailure } from "@/lib/failure";
 import {
   accountSubscribe,
   accountSync,
@@ -47,19 +48,21 @@ export function useAccountMirror(): void {
           return;
         }
         unlisten = fn;
-      } catch {
+      } catch (error) {
         // No Tauri host: no deep links either. The subscription below still runs.
+        logFailure("account.listenSetup")(error);
       }
       try {
         const id = await accountSubscribe(setVm);
         if (cancelled) {
-          void accountUnsubscribe(id).catch(() => {});
+          void accountUnsubscribe(id).catch(logFailure("account.unsubscribe"));
         } else {
           subscriptionId = id;
         }
-      } catch {
+      } catch (error) {
         // No Tauri host, or no account commands in this build: the store
         // keeps its "no account" default, which is the honest answer.
+        logFailure("account.subscribe")(error);
       }
     })();
 
@@ -70,10 +73,9 @@ export function useAccountMirror(): void {
       }
       void accountSync(false)
         .then(setVm)
-        .catch(() => {
-          // Rust's own sentence arrives over the subscription; a failed poke
-          // is not a second thing to report.
-        });
+        // Rust's own sentence arrives over the subscription; a failed poke
+        // is not a second thing to say, only to log.
+        .catch(logFailure("account.sync"));
     };
     const onVisibility = () => {
       if (document.visibilityState === "visible") {
@@ -89,7 +91,7 @@ export function useAccountMirror(): void {
       document.removeEventListener("visibilitychange", onVisibility);
       unlisten?.();
       if (subscriptionId !== null) {
-        void accountUnsubscribe(subscriptionId).catch(() => {});
+        void accountUnsubscribe(subscriptionId).catch(logFailure("account.unsubscribe"));
       }
     };
   }, []);

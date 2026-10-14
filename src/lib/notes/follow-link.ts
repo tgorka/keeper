@@ -15,6 +15,7 @@
  * and a Files panel are different places to put it.
  */
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { logFailure } from "@/lib/failure";
 import { type NoteRefVm, notesResolveLink } from "@/lib/ipc/client";
 
 /**
@@ -120,6 +121,7 @@ export async function resolveWikilink(vaultId: string, target: string): Promise<
   try {
     found = await notesResolveLink(vaultId, target);
   } catch (raw) {
+    logFailure("notes.resolveLink")(raw);
     const detail = raw instanceof Error ? raw.message : String(raw);
     return { note: null, reason: `keeper could not look up ${target}: ${detail}` };
   }
@@ -151,6 +153,7 @@ export async function followExternalUrl(url: string): Promise<string | null> {
     await openUrl(url);
     return null;
   } catch (raw) {
+    logFailure("notes.openExternal")(raw);
     return openerRefusedSentence(url, raw instanceof Error ? raw.message : String(raw));
   }
 }

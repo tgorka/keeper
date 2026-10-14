@@ -2,12 +2,14 @@ import { useCallback, useEffect, useState } from "react";
 import { NO_BACKGROUND_SYNC_SENTENCE } from "@/components/settings/no-background-sync-disclosure";
 import { PushGatewayField } from "@/components/settings/push-gateway-field";
 import { Button } from "@/components/ui/button";
+import { logFailure } from "@/lib/failure";
 import {
   listenUnifiedpushStatus,
   type UnifiedPushVm,
   unifiedpushConfirm,
   unifiedpushStatus,
 } from "@/lib/ipc/client";
+import { useFailureNotice } from "@/lib/stores/failure-notices";
 import { syncErrorMessage } from "@/lib/stores/sync";
 
 /** The heading of Android's push status (98.4). */
@@ -33,6 +35,9 @@ export function PhonePush({ open }: { open: boolean }) {
   const [android, setAndroid] = useState<UnifiedPushVm | null | undefined>(undefined);
   const [busy, setBusy] = useState(false);
   const [failure, setFailure] = useState<string | null>(null);
+  // A registration Rust could not make in the background (R381), said under
+  // the push setting as well as in the toast.
+  const background = useFailureNotice("push");
 
   useEffect(() => {
     if (!open) {
@@ -46,7 +51,8 @@ export function PhonePush({ open }: { open: boolean }) {
             setAndroid(status ?? null);
           }
         })
-        .catch(() => {
+        .catch((raw: unknown) => {
+          logFailure("push.unifiedpushStatus")(raw);
           if (!cancelled) {
             setAndroid((held) => held ?? null);
           }
@@ -68,7 +74,8 @@ export function PhonePush({ open }: { open: boolean }) {
           unlisten = stop;
         }
       })
-      .catch(() => {});
+      // The visibility re-read still keeps the status current without it.
+      .catch(logFailure("push.listenStatus"));
     return () => {
       cancelled = true;
       document.removeEventListener("visibilitychange", onVisible);
@@ -86,6 +93,7 @@ export function PhonePush({ open }: { open: boolean }) {
         }
       })
       .catch((error: unknown) => {
+        logFailure("push.unifiedpushConfirm")(error);
         setFailure(syncErrorMessage(error, UNIFIEDPUSH_CONFIRM_FAILED));
       })
       .finally(() => {
@@ -100,6 +108,11 @@ export function PhonePush({ open }: { open: boolean }) {
     return (
       <>
         <PushGatewayField open={open} />
+        {background !== null && (
+          <p role="alert" className="text-destructive">
+            {background}
+          </p>
+        )}
         <p className="text-muted-foreground">{NO_BACKGROUND_SYNC_SENTENCE}</p>
       </>
     );
@@ -125,6 +138,11 @@ export function PhonePush({ open }: { open: boolean }) {
         </div>
       )}
       {failure && <p role="alert">{failure}</p>}
+      {background !== null && (
+        <p role="alert" className="text-destructive">
+          {background}
+        </p>
+      )}
       <p className="text-muted-foreground">{android.note}</p>
     </section>
   );

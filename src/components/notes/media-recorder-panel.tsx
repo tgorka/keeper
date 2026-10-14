@@ -28,6 +28,7 @@ import { RecordingWebcamControls } from "@/components/recording/recording-webcam
 import { Button } from "@/components/ui/button";
 import { useRecordingPermission } from "@/hooks/use-recording-permission";
 import { isLiveRecording, useRecordingSession } from "@/hooks/use-recording-session";
+import { logFailure } from "@/lib/failure";
 import {
   type MediaBlockRecordingVm,
   mediaBlockRecording,
@@ -44,6 +45,7 @@ import { micDeviceId, micEnabled, useMicEnabled } from "@/lib/stores/recording-m
 import {
   ensureRecordingSettingsHydrated,
   useRecordingSettings,
+  useRecordingSettingsReadError,
 } from "@/lib/stores/recording-settings";
 import { selectedRecordingTarget, useSelectedRecordingTarget } from "@/lib/stores/recording-source";
 import { cameraDeviceId, webcamEnabled } from "@/lib/stores/recording-webcam";
@@ -212,12 +214,14 @@ function RecorderControls({
   saveNote,
   menu,
 }: MediaRecorderPanelProps) {
-  const { permission, refresh } = useRecordingPermission();
+  const { permission, failure: permissionFailure, refresh } = useRecordingPermission();
   const { status, elapsed, start, stop, acknowledge } = useRecordingSession();
   const [linked, setLinked] = useState<RecordingLinkedNoteVm | null>(null);
   /** This block started the live session but could not take its name. */
   const [unnamed, setUnnamed] = useState(false);
   const settings = useRecordingSettings();
+  // The echo switch below stays off without a read; this says why (R410).
+  const settingsUnread = useRecordingSettingsReadError();
   const live = isLiveRecording(status);
 
   useEffect(() => {
@@ -274,11 +278,18 @@ function RecorderControls({
       { profileId, path: at },
     );
     if (!started) return;
-    const now = await recordingLinkedNote().catch(() => null);
+    // Either read failing leaves the block unnamed, which the block then says.
+    const now = await recordingLinkedNote().catch((error: unknown) => {
+      logFailure("mediaBlock.linkedNote")(error);
+      return null;
+    });
     const named =
       now === null || now.profileId !== profileId || now.path !== at
         ? null
-        : await mediaBlockRecordStarted(source, now.sessionId).catch(() => null);
+        : await mediaBlockRecordStarted(source, now.sessionId).catch((error: unknown) => {
+            logFailure("mediaBlock.recordStarted")(error);
+            return null;
+          });
     if (named !== null && replaceSource(named)) {
       saveNote();
     } else {
@@ -352,6 +363,16 @@ function RecorderControls({
         )}
         {blockedBy !== null && (
           <p className="basis-full text-muted-foreground text-xs">{startBlockedNote(blockedBy)}</p>
+        )}
+        {permissionFailure !== null && (
+          <p role="alert" className="basis-full text-destructive text-xs">
+            {permissionFailure}
+          </p>
+        )}
+        {settings === null && settingsUnread !== null && (
+          <p role="alert" className="basis-full text-destructive text-xs">
+            {settingsUnread}
+          </p>
         )}
       </div>
     );

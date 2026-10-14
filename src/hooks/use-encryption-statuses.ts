@@ -12,11 +12,12 @@
  * account-set change, or unmount — every open subscription is torn down and its
  * account's entry removed from the store, so streams never leak and no stale
  * status lingers. Each per-account sink is gated so a late batch after cleanup
- * never mutates the store, and a subscribe failure is swallowed (the banner /
- * badge are non-critical projections — a failed stream simply leaves that
- * account pending, so no banner shows).
+ * never mutates the store, and a subscribe failure is logged, not said (the
+ * banner / badge are non-critical projections — a failed stream simply leaves
+ * that account pending, so no banner shows).
  */
 import { useEffect } from "react";
+import { logFailure } from "@/lib/failure";
 import type { EncryptionStatusBatch } from "@/lib/ipc/client";
 import { subscribeEncryptionStatus, unsubscribeEncryptionStatus } from "@/lib/ipc/client";
 import { useAccountsStore } from "@/lib/stores/accounts";
@@ -59,9 +60,8 @@ export function useEncryptionStatuses(): void {
           }
           subscriptionIds.set(accountId, id);
         })
-        .catch(() => {
-          // A failed encryption stream is non-fatal: leave the account pending.
-        });
+        // A failed encryption stream is non-fatal: leave the account pending.
+        .catch(logFailure("encryptionStatus.subscribe"));
     }
 
     return () => {

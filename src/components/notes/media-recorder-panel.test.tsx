@@ -30,9 +30,11 @@ vi.mock("@/lib/ipc/client", async (importOriginal) => ({
   mediaBlockRecordStarted: (source: string, sessionId: string) => recordStarted(source, sessionId),
 }));
 
+let settingsUnread: string | null = null;
 vi.mock("@/lib/stores/recording-settings", () => ({
   ensureRecordingSettingsHydrated: async () => {},
   useRecordingSettings: () => null,
+  useRecordingSettingsReadError: () => settingsUnread,
 }));
 
 const start = vi.fn(async (..._args: unknown[]) => true);
@@ -58,6 +60,7 @@ vi.mock("@/hooks/use-recording-permission", () => ({
       camera: "granted",
       canStart: true,
     },
+    failure: null,
     refresh: vi.fn(),
   }),
 }));
@@ -97,6 +100,7 @@ const LIVE: RecordingStatusVm = {
 describe("MediaRecorderPanel", () => {
   beforeEach(() => {
     status = IDLE_RECORDING_STATUS;
+    settingsUnread = null;
     start.mockClear();
     start.mockResolvedValue(true);
     replaceSource.mockClear();
@@ -123,6 +127,14 @@ describe("MediaRecorderPanel", () => {
           Node.DOCUMENT_POSITION_FOLLOWING,
       ).toBeTruthy();
     }
+  });
+
+  it("says beside Start that the recording settings could not be read (R410)", async () => {
+    settingsUnread = "keeper could not read the recording settings.";
+    render(<MediaRecorderPanel {...props()} />);
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "keeper could not read the recording settings.",
+    );
   });
 
   it("names the session in its own fence once Start answers, and writes the note", async () => {

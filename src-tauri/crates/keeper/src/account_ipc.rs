@@ -37,7 +37,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -46,6 +46,7 @@ use keeper_core::config::{self as layers, AccountLayerSource};
 use keeper_core::error::CoreError;
 use keeper_core::forges::{self, tokens::ForgeError, ForgeSource};
 use keeper_core::oauth::{OAuthCallback, OAuthFlowRegistry};
+use keeper_core::org_account::attempt::{Attempts, Run};
 use keeper_core::org_account::descriptor::{self, AccountDescriptor, RepoAuthConfig, SetupInput};
 use keeper_core::org_account::device_state::{self, DeviceStateFile, MatrixState, RestorePending};
 use keeper_core::org_account::layout::{
@@ -59,8 +60,9 @@ use keeper_core::org_account::settings_sync::{
     self, FirstSync, Merged, ProviderRef, SyncedFile, Values,
 };
 use keeper_core::org_account::state::{
-    self, AccountFacts, AccountIdentityVm, AccountOffersVm, AccountPhase, AccountProblem,
-    AccountSetupVm, AccountShareVm, AccountStateVm, AccountVm, RestoreFacts,
+    self, problem_of, step_failed, step_problem, AccountAttemptVm, AccountFacts, AccountIdentityVm,
+    AccountOffersVm, AccountPhase, AccountProblem, AccountSetupVm, AccountShareVm, AccountStateVm,
+    AccountStep, AccountVm, RestoreFacts,
 };
 use keeper_core::org_account::{oidc, AccountError};
 use keeper_core::platform::Platform;
@@ -107,6 +109,8 @@ struct Inner {
     forge_connected: bool,
     phase: AccountPhase,
     problem: Option<AccountProblem>,
+    /// How the person's last sign-in attempt ended (R387), or that it runs.
+    attempt: Option<AccountAttemptVm>,
     devices: Vec<DeviceEntry>,
     /// The name this install registered in the repository for this account
     /// (`account.<id>.device_slug`); `None` until a publish lands.
@@ -138,12 +142,11 @@ struct Runtime {
     /// One sign-in or sync at a time: two fetches into one clone, or two
     /// sign-ins racing for one keychain item, would each undo the other.
     gate: tokio::sync::Mutex<()>,
-    /// Ends the sign-in or sync in flight (the person pressed Cancel).
-    cancel: tokio::sync::Notify,
-    /// Bumped by every cancel, sign-out, forget and setup. Work that queued
-    /// for the gate before the bump never starts: `Notify` only reaches work
-    /// already running, and the gate is first come, first served.
-    epoch: AtomicU64,
+    /// Where the run in flight is cancelled (the person pressed Cancel, a
+    /// sign-out, forget or setup stopped it), the step it is on, and the
+    /// stop count that keeps queued work from starting — core's
+    /// (`keeper_core::org_account::attempt`, R410).
+    attempts: Attempts,
     /// Stops the blocking git transfer of the run in flight. Fresh for every
     /// run, so a new run can never un-cancel an old one's.
     interrupt: Mutex<Arc<AtomicBool>>,
@@ -332,10 +335,20 @@ pub fn clone_models(data_dir: &Path) -> (PathBuf, model_files::ModelSet) {
         return (PathBuf::new(), model_files::ModelSet::default());
     };
     let dir = clone_dir(data_dir, &d.id).join(model_files::CONFIG_MODELS_DIR);
-    let set = std::fs::read_to_string(dir.join(model_files::MODELS_TOML))
-        .ok()
-        .and_then(|raw| model_files::ModelSet::from_toml(&raw).ok())
-        .unwrap_or_default();
+    let path = dir.join(model_files::MODELS_TOML);
+    let set = match std::fs::read_to_string(&path) {
+        Ok(raw) => model_files::ModelSet::from_toml(&raw).unwrap_or_else(|error| {
+            tracing::warn!(%error, "account: models.toml does not parse; using the default set");
+            model_files::ModelSet::default()
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            model_files::ModelSet::default()
+        }
+        Err(error) => {
+            tracing::warn!(%error, "account: models.toml does not read; using the default set");
+            model_files::ModelSet::default()
+        }
+    };
     (dir, set)
 }
 
@@ -388,16 +401,28 @@ pub fn provider_has_credential(platform: &dyn Platform, provider_id: &str) -> bo
     if let Some(account_id) = account_id().as_deref() {
         let uses_account = platform.data_dir().ok().and_then(|dir| {
             registry::get_bots_provider_credential_source(&dir, provider_id, Some(account_id))
-                .ok()
-                .flatten()
+                .unwrap_or_else(|error| {
+                    tracing::warn!(
+                        %error,
+                        provider_id,
+                        "account: whether a provider uses the account does not read; its own key is checked instead"
+                    );
+                    None
+                })
         });
         if uses_account.as_deref() == Some("account") {
             return true;
         }
     }
     keeper_core::bots::resolve_token(platform, provider_id, None)
-        .ok()
-        .flatten()
+        .unwrap_or_else(|error| {
+            tracing::warn!(
+                %error,
+                provider_id,
+                "account: a provider's key does not read; it is shown as having none"
+            );
+            None
+        })
         .is_some()
 }
 
@@ -554,10 +579,20 @@ pub fn device_class() -> DeviceClass {
 /// The name this device goes by in `account_id`'s repository: the one it
 /// registered there when it has, else [`default_device_name`].
 fn device_name(data_dir: &Path, account_id: &str) -> String {
-    registry::get_account_device_slug(data_dir, account_id)
-        .ok()
-        .flatten()
-        .unwrap_or_else(default_device_name)
+    read_or_warn(
+        registry::get_account_device_slug(data_dir, account_id),
+        "this device's registered name; the default name is offered",
+    )
+    .unwrap_or_else(default_device_name)
+}
+
+/// A registry read whose failure leaves the default in place — logged at
+/// WARN with what was lost (R381, 100.1 #5), never silently `None`.
+fn read_or_warn<T>(read: Result<Option<T>, CoreError>, lost: &str) -> Option<T> {
+    read.unwrap_or_else(|error| {
+        tracing::warn!(%error, lost, "account: a stored value does not read");
+        None
+    })
 }
 
 /// On a phone, where there is no host name: the model plus a four-character
@@ -604,7 +639,7 @@ fn untouched_days(root: &Path, login: &str, slug: &str, now_secs: i64) -> Option
     let changed = |rel: String| match config_repo::last_change_secs(root, &rel) {
         Ok(secs) => secs,
         Err(error) => {
-            tracing::debug!(%error, rel, "account: a device's history was not read");
+            tracing::warn!(%error, rel, "account: a device's history was not read; a reinstall here may not be recognised");
             None
         }
     };
@@ -709,6 +744,7 @@ fn facts(inner: &Inner) -> AccountFacts {
         }),
         phase: inner.phase,
         problem: inner.problem.clone(),
+        attempt: inner.attempt,
         devices: inner.devices.clone(),
         this_device: inner.this_device.clone(),
         last_synced_ms: inner.last_synced_ms,
@@ -751,16 +787,6 @@ fn update(change: impl FnOnce(&mut Inner)) -> AccountVm {
     vm
 }
 
-fn problem_of(error: AccountError) -> Option<AccountProblem> {
-    match error {
-        AccountError::Cancelled => None,
-        AccountError::Unreachable(_) => Some(AccountProblem::Offline),
-        AccountError::NeedsSignIn(sentence) => Some(AccountProblem::NeedsSignIn(sentence)),
-        AccountError::Refused(sentence) => Some(AccountProblem::Refused(sentence)),
-        AccountError::Internal(sentence) => Some(AccountProblem::Failed(sentence)),
-    }
-}
-
 fn repo_problem(error: &SyncError, oauth: bool) -> Option<AccountProblem> {
     match error {
         SyncError::Cancelled => None,
@@ -787,8 +813,10 @@ pub(crate) fn account_ipc_error(error: AccountError) -> IpcError {
     let (code, retriable) = match &error {
         AccountError::NeedsSignIn(_) => (IpcErrorCode::OauthFailed, true),
         AccountError::Unreachable(_) => (IpcErrorCode::ServerUnreachable, true),
-        AccountError::Refused(_) => (IpcErrorCode::Internal, false),
+        AccountError::Refused(_) | AccountError::Denied { .. } => (IpcErrorCode::Internal, false),
         AccountError::Cancelled => (IpcErrorCode::OauthCancelled, true),
+        AccountError::TimedOut => (IpcErrorCode::OauthTimedOut, true),
+        AccountError::Interrupted(_) => (IpcErrorCode::OauthFailed, true),
         AccountError::Internal(_) => (IpcErrorCode::Internal, false),
     };
     IpcError {
@@ -931,12 +959,14 @@ fn load_local(platform: &dyn Platform, inner: &mut Inner) -> bool {
             None
         }
     };
-    inner.this_device = registry::get_account_device_slug(&data_dir, &d.id)
-        .ok()
-        .flatten();
-    inner.last_synced_ms = registry::get_account_last_synced_ms(&data_dir, &d.id)
-        .ok()
-        .flatten();
+    inner.this_device = read_or_warn(
+        registry::get_account_device_slug(&data_dir, &d.id),
+        "this device's registered name; it is registered again",
+    );
+    inner.last_synced_ms = read_or_warn(
+        registry::get_account_last_synced_ms(&data_dir, &d.id),
+        "when the settings last synced",
+    );
     inner.forge_connected = session::forge_connected(platform, &d);
     if let Some(identity) = inner.identity.clone() {
         let device = inner
@@ -1068,7 +1098,7 @@ pub fn note_local_change() {
 /// The stop count to capture before waiting for the gate; see
 /// [`cancellable`].
 fn epoch() -> u64 {
-    RUNTIME.epoch.load(Ordering::SeqCst)
+    RUNTIME.attempts.epoch()
 }
 
 /// The interrupt of the run holding the gate, for its blocking git calls.
@@ -1085,8 +1115,7 @@ fn fresh_interrupt() {
 /// flight is dropped, its blocking git transfer is told to stop and any
 /// sign-in sheet is closed.
 fn interrupt_all() {
-    RUNTIME.epoch.fetch_add(1, Ordering::SeqCst);
-    RUNTIME.cancel.notify_waiters();
+    RUNTIME.attempts.interrupt();
     lock(&RUNTIME.interrupt).store(true, Ordering::SeqCst);
     lock(&RUNTIME.models_interrupt).store(true, Ordering::SeqCst);
     // Only the account's sheets: a Matrix sign-in beside it is not ours.
@@ -1101,28 +1130,31 @@ async fn blocking_idle() {
     drop(RUNTIME.blocking.write().await);
 }
 
-/// Run `work` (the caller holds the gate) until it finishes or the person
-/// cancels, unless a stop came while it was queued (`queued_at` is the
-/// [`epoch`] from before the gate was awaited). Returns only once the
-/// blocking git work the run started has stopped, so the gate is never let
-/// go while something still writes into the clone.
-async fn cancellable(queued_at: u64, work: impl Future<Output = ()>) {
-    let cancelled = RUNTIME.cancel.notified();
-    tokio::pin!(cancelled);
-    cancelled.as_mut().enable();
-    // Fresh before the check: a stop after the check sets this very token.
+/// The run in flight has reached `step`, for a cancel to name.
+fn at_step(step: AccountStep) {
+    RUNTIME.attempts.at_step(step);
+}
+
+/// Run `work` (the caller holds the gate) through core's attempt boundary
+/// until it finishes or the person cancels, unless a stop came while it was
+/// queued (`queued_at` is the [`epoch`] from before the gate was awaited); a
+/// cancel logs the step it interrupted once (R387, R410). Returns only once
+/// the blocking git work the run started has stopped, so the gate is never
+/// let go while something still writes into the clone.
+async fn cancellable<T>(queued_at: u64, work: impl Future<Output = T>) -> Run<T> {
+    // Fresh before the boundary checks the stop count: a stop after the
+    // check sets this very token.
     fresh_interrupt();
-    if epoch() != queued_at {
-        return;
-    }
-    tokio::select! {
-        biased;
-        () = &mut cancelled => {
-            update(|inner| inner.phase = AccountPhase::Idle);
-        }
-        () = work => {}
+    let account = descriptor().map(|d| d.id);
+    let ran = RUNTIME
+        .attempts
+        .run(queued_at, account.as_deref(), work)
+        .await;
+    if matches!(ran, Run::Cancelled) {
+        update(|inner| inner.phase = AccountPhase::Idle);
     }
     blocking_idle().await;
+    ran
 }
 
 fn repo_auth(auth: GitAuth) -> RepoAuth {
@@ -1244,18 +1276,27 @@ fn clear_offers(inner: &mut Inner) {
 /// Sign in (when `interactive`), connect the forge, fetch, resolve, publish
 /// this person's and this device's files, and install the layers — each step
 /// reported through the subscription as it starts.
-async fn converge(platform: Arc<dyn Platform>, flows: Arc<OAuthFlowRegistry>, interactive: bool) {
+async fn converge(
+    platform: Arc<dyn Platform>,
+    flows: Arc<OAuthFlowRegistry>,
+    interactive: bool,
+) -> AccountAttemptVm {
     let Ok(data_dir) = platform.data_dir() else {
-        return;
+        return AccountAttemptVm::Failed;
     };
     let Some(d) = descriptor() else {
-        return;
+        return AccountAttemptVm::Failed;
     };
     let http = match http() {
         Ok(http) => http,
         Err(sentence) => {
-            update(|inner| inner.problem = Some(AccountProblem::Failed(sentence)));
-            return;
+            let problem = step_problem(
+                AccountStep::Client,
+                &d.id,
+                Some(AccountProblem::Failed(sentence)),
+            );
+            update(|inner| inner.problem = problem);
+            return AccountAttemptVm::Failed;
         }
     };
     update(|inner| inner.last_attempt_ms = Some(now_ms()));
@@ -1268,13 +1309,23 @@ async fn converge(platform: Arc<dyn Platform>, flows: Arc<OAuthFlowRegistry>, in
     };
     let identity = match &known {
         Some(identity) if !(interactive && grant_dead) => identity.clone(),
-        _ if !interactive => return,
+        _ if !interactive => return AccountAttemptVm::Done,
         _ => {
             update(|inner| {
                 inner.phase = AccountPhase::SigningIn;
                 inner.problem = None;
             });
-            match oidc::sign_in(platform.as_ref(), &flows, http, &d).await {
+            // A closed sheet ends here, through core's boundary: one WARN
+            // line, and the attempt closed (R410).
+            match RUNTIME
+                .attempts
+                .step(
+                    AccountStep::SignIn,
+                    &d.id,
+                    oidc::sign_in(platform.as_ref(), &flows, http, &d),
+                )
+                .await
+            {
                 Ok(identity) => {
                     // Someone else signed in on this device: nothing of the
                     // previous person's — layers, forge connection, device
@@ -1307,15 +1358,15 @@ async fn converge(platform: Arc<dyn Platform>, flows: Arc<OAuthFlowRegistry>, in
                     });
                     identity
                 }
-                Err(error) => {
+                Err(ended) => {
                     update(|inner| {
-                        if matches!(error, AccountError::Refused(_)) {
+                        if ended.refused {
                             refuse(inner);
                         }
                         inner.phase = AccountPhase::Idle;
-                        inner.problem = problem_of(error);
+                        inner.problem = ended.problem;
                     });
-                    return;
+                    return ended.attempt;
                 }
             }
         }
@@ -1325,43 +1376,59 @@ async fn converge(platform: Arc<dyn Platform>, flows: Arc<OAuthFlowRegistry>, in
     let forge_connected = lock(&RUNTIME.inner).forge_connected;
     if oauth && !forge_connected {
         if !interactive {
+            let problem = step_problem(
+                AccountStep::ForgeConnect,
+                &d.id,
+                Some(AccountProblem::NeedsSignIn(
+                    "Reconnect the repository.".to_owned(),
+                )),
+            );
             update(|inner| {
                 inner.phase = AccountPhase::Idle;
-                inner.problem = Some(AccountProblem::NeedsSignIn(
-                    "Reconnect the repository.".to_owned(),
-                ));
+                inner.problem = problem;
             });
-            return;
+            return AccountAttemptVm::Failed;
         }
         update(|inner| inner.phase = AccountPhase::SigningIn);
-        if let Err(error) =
-            oidc::forge_connect(platform.as_ref(), &flows, http, &d, &identity.login).await
+        if let Err(ended) = RUNTIME
+            .attempts
+            .step(
+                AccountStep::ForgeConnect,
+                &d.id,
+                oidc::forge_connect(platform.as_ref(), &flows, http, &d, &identity.login),
+            )
+            .await
         {
             update(|inner| {
                 inner.phase = AccountPhase::Idle;
-                inner.problem = problem_of(error);
+                inner.problem = ended.problem;
             });
-            return;
+            return ended.attempt;
         }
         update(|inner| inner.forge_connected = true);
     }
 
     // 3. The repository credential.
     update(|inner| inner.phase = AccountPhase::Syncing);
+    at_step(AccountStep::Credential);
     let mut auth = match repo_credential(platform.as_ref(), http, &d).await {
         Ok(auth) => auth,
         Err(error) => {
+            let needs_sign_in = matches!(error, AccountError::NeedsSignIn(_));
+            let refused = matches!(error, AccountError::Refused(_));
+            let problem = step_failed(AccountStep::Credential, &d.id, error);
             update(|inner| {
-                match &error {
-                    AccountError::NeedsSignIn(_) if oauth => inner.forge_connected = false,
-                    AccountError::NeedsSignIn(_) => inner.grant_dead = true,
-                    AccountError::Refused(_) => refuse(inner),
-                    _ => {}
+                if needs_sign_in && oauth {
+                    inner.forge_connected = false;
+                } else if needs_sign_in {
+                    inner.grant_dead = true;
+                } else if refused {
+                    refuse(inner);
                 }
                 inner.phase = AccountPhase::Idle;
-                inner.problem = problem_of(error);
+                inner.problem = problem;
             });
-            return;
+            return AccountAttemptVm::Failed;
         }
     };
 
@@ -1372,14 +1439,20 @@ async fn converge(platform: Arc<dyn Platform>, flows: Arc<OAuthFlowRegistry>, in
         dir: clone_dir(&data_dir, &d.id),
     };
     if let Err(error) = std::fs::create_dir_all(account_dir(&data_dir, &d.id)) {
+        let problem = step_problem(
+            AccountStep::Folder,
+            &d.id,
+            Some(AccountProblem::Failed(format!(
+                "keeper could not make a folder for the settings repository: {error}"
+            ))),
+        );
         update(|inner| {
             inner.phase = AccountPhase::Idle;
-            inner.problem = Some(AccountProblem::Failed(format!(
-                "keeper could not make a folder for the settings repository: {error}"
-            )));
+            inner.problem = problem;
         });
-        return;
+        return AccountAttemptVm::Failed;
     }
+    at_step(AccountStep::Fetch);
     let fetched = with_forge_retry(platform.as_ref(), http, &d, &mut auth, |auth| {
         let (spec, interrupt) = (spec.clone(), interrupt());
         on_blocking_pool(move || config_repo::clone_or_fetch(&spec, &auth, &interrupt))
@@ -1389,18 +1462,24 @@ async fn converge(platform: Arc<dyn Platform>, flows: Arc<OAuthFlowRegistry>, in
         Ok(Ok(_)) => {}
         Ok(Err(error)) => {
             tracing::warn!(%error, "account: the settings repository could not be fetched");
+            let problem = step_problem(AccountStep::Fetch, &d.id, repo_problem(&error, oauth));
             update(|inner| {
                 inner.phase = AccountPhase::Idle;
-                inner.problem = repo_problem(&error, oauth);
+                inner.problem = problem;
             });
-            return;
+            return AccountAttemptVm::Failed;
         }
         Err(sentence) => {
+            let problem = step_problem(
+                AccountStep::Fetch,
+                &d.id,
+                Some(AccountProblem::Failed(sentence)),
+            );
             update(|inner| {
                 inner.phase = AccountPhase::Idle;
-                inner.problem = Some(AccountProblem::Failed(sentence));
+                inner.problem = problem;
             });
-            return;
+            return AccountAttemptVm::Failed;
         }
     }
 
@@ -1458,8 +1537,10 @@ async fn converge(platform: Arc<dyn Platform>, flows: Arc<OAuthFlowRegistry>, in
         apply_clone(&mut inner, &spec.dir, &d, &identity, &device)
     };
     if matches!(found, Found::NotMine) {
+        let blocked = lock(&RUNTIME.inner).problem.clone();
+        step_problem(AccountStep::Fetch, &d.id, blocked);
         update(|inner| inner.phase = AccountPhase::Idle);
-        return;
+        return AccountAttemptVm::Failed;
     }
 
     // 6. Publish what is missing for this person and this device —
@@ -1510,6 +1591,7 @@ async fn converge(platform: Arc<dyn Platform>, flows: Arc<OAuthFlowRegistry>, in
             .unwrap_or_else(|| format!("{}@keeper.invalid", identity.login)),
     };
     let message = format!("{}: register {device}", identity.login);
+    at_step(AccountStep::Publish);
     let pushed = with_forge_retry(platform.as_ref(), http, &d, &mut auth, |auth| {
         let (spec, author, message, plan, interrupt) = (
             spec.clone(),
@@ -1553,8 +1635,13 @@ async fn converge(platform: Arc<dyn Platform>, flows: Arc<OAuthFlowRegistry>, in
         None => publish_version(platform.as_ref(), &leg, &mut auth, &identity.login, &device).await,
         problem => problem,
     };
-    let settings_problem =
-        sync_settings(Arc::clone(&platform), &leg, &mut auth, &identity, &device).await;
+    let problem = step_problem(AccountStep::Publish, &d.id, problem);
+    at_step(AccountStep::Settings);
+    let settings_problem = step_problem(
+        AccountStep::Settings,
+        &d.id,
+        sync_settings(Arc::clone(&platform), &leg, &mut auth, &identity, &device).await,
+    );
     let problem = problem.or(settings_problem);
 
     // 7. The layers, from the clone as it now stands. A first registration
@@ -1589,6 +1676,11 @@ async fn converge(platform: Arc<dyn Platform>, flows: Arc<OAuthFlowRegistry>, in
         }
         inner.phase = AccountPhase::Idle;
     });
+    if lock(&RUNTIME.inner).problem.is_some() {
+        AccountAttemptVm::Failed
+    } else {
+        AccountAttemptVm::Done
+    }
 }
 
 /// The keeper release this build is, and the source it was built from, as
@@ -2345,7 +2437,7 @@ fn plan_settings(root: &Path, input: &SettingsInput) -> (Vec<Write>, Option<Plan
     let last_change = |rel: &str| match config_repo::last_change_secs(root, rel) {
         Ok(secs) => secs,
         Err(error) => {
-            tracing::debug!(%error, rel, "account: a device's settings history was not read");
+            tracing::warn!(%error, rel, "account: a device's settings history was not read; the newer value may not win");
             None
         }
     };
@@ -2651,7 +2743,9 @@ async fn sync(
     };
     loop {
         RUNTIME.dirty.store(false, Ordering::SeqCst);
-        cancellable(
+        // A background sync is no attempt of the person's: its outcome is
+        // the account's state, not `attempt`.
+        let _ = cancellable(
             queued_at,
             converge(Arc::clone(&platform), Arc::clone(&flows), false),
         )
@@ -2667,9 +2761,16 @@ async fn sync(
 /// cancel, sign-out or forget comes while it waits.
 async fn sign_in_and_sync(platform: Arc<dyn Platform>, flows: Arc<OAuthFlowRegistry>) -> AccountVm {
     let queued_at = epoch();
+    update(|inner| inner.attempt = Some(AccountAttemptVm::Running));
     let gate = RUNTIME.gate.lock().await;
     RUNTIME.dirty.store(false, Ordering::SeqCst);
-    cancellable(queued_at, converge(platform, flows, true)).await;
+    // Cancelled while it ran, or stopped while it queued: the person closed
+    // it — core's `Run::attempt` decides (R387, R410). Set here, once,
+    // whichever way the attempt ended.
+    let attempt = cancellable(queued_at, converge(platform, flows, true))
+        .await
+        .attempt();
+    update(|inner| inner.attempt = Some(attempt));
     drop(gate);
     resync_if_dirty();
     current_vm()
@@ -3068,10 +3169,11 @@ pub async fn account_setup_resolve(
     };
     // Registered means this install published a device for *this* account;
     // a forgotten account, or another one, leaves the name free to edit.
-    let registered = registry::get_account_device_slug(&data_dir, &d.id)
-        .ok()
-        .flatten()
-        .is_some();
+    let registered = read_or_warn(
+        registry::get_account_device_slug(&data_dir, &d.id),
+        "this device's registered name; the setup offers a new one",
+    )
+    .is_some();
     let setup_id = ulid::Ulid::new().to_string();
     let vm = state::setup_vm(
         setup_id.clone(),
@@ -3135,19 +3237,29 @@ pub async fn account_setup_confirm(
     crate::forge_ipc::forget_identity();
     layers::install_account_layers(None);
     layers::set_account_faults(Vec::new());
-    let identity = session::identity(state.platform.as_ref(), &d)
-        .ok()
-        .flatten();
+    // A stored session that does not restore is not a stop here — Continue
+    // signs in afresh below — but it is logged, never dropped.
+    let identity = session::identity(state.platform.as_ref(), &d).unwrap_or_else(|error| {
+        tracing::warn!(
+            step = AccountStep::Restore.as_str(),
+            account = %d.id,
+            kind = error.kind(),
+            "account: the stored session was not restored; signing in afresh"
+        );
+        None
+    });
     let forge_connected = session::forge_connected(state.platform.as_ref(), &d);
-    let last_synced_ms = registry::get_account_last_synced_ms(&data_dir, &d.id)
-        .ok()
-        .flatten();
+    let last_synced_ms = read_or_warn(
+        registry::get_account_last_synced_ms(&data_dir, &d.id),
+        "when the settings last synced",
+    );
     // The name on the sheet is registered by the first publish that lands,
     // not here: a Continue whose sync never reached the repository must not
     // make the device look registered.
-    let this_device = registry::get_account_device_slug(&data_dir, &d.id)
-        .ok()
-        .flatten();
+    let this_device = read_or_warn(
+        registry::get_account_device_slug(&data_dir, &d.id),
+        "this device's registered name; it is registered again",
+    );
     let wanted_device = this_device.is_none().then_some(slug);
     update(|inner| {
         let setups = std::mem::take(&mut inner.setups);

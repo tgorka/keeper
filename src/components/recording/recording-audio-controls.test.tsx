@@ -397,8 +397,12 @@ describe("RecordingAudioControls", () => {
     fireEvent.click(toggle);
 
     await waitFor(() => expect(mockSettingsSet).toHaveBeenCalledTimes(1));
-    // Optimism is rolled back — the UI never claims an unsaved value.
+    // Optimism is rolled back — the UI never claims an unsaved value — and
+    // the refusal is said beside the switch (R410).
     await waitFor(() => expect(toggle).toHaveAttribute("aria-checked", "false"));
+    expect(
+      await screen.findByText("echo cancellation cannot be changed while a recording is running"),
+    ).toHaveAttribute("role", "alert");
   });
 
   it("is disabled while the card is not active (a live session owns the mic)", async () => {

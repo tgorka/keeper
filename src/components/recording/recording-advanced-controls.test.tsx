@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 vi.mock("@/lib/ipc/client", () => ({
   recordingSettingsGet: vi.fn(),
   recordingSettingsSet: vi.fn(),
+  frontendErrorReport: vi.fn(async () => undefined),
 }));
 
 import {
@@ -88,6 +89,26 @@ describe("RecordingAdvancedControls", () => {
 
     await waitFor(() => expect(mockSet).toHaveBeenCalledWith({ ...DEFAULTS, fps: 60 }));
     await waitFor(() => expect(screen.getByTestId(FPS_SELECT_TESTID)).toHaveTextContent("60"));
+  });
+
+  it("says why a refused pick reverted (R410)", async () => {
+    mockSet.mockRejectedValueOnce({
+      code: "internal",
+      message: "keeper could not write the recording settings.",
+      accountId: null,
+      retriable: false,
+    });
+    render(<RecordingAdvancedControls />);
+    fireEvent.click(screen.getByTestId(ADVANCED_TOGGLE_TESTID));
+    await waitFor(() => expect(screen.getByTestId(FPS_SELECT_TESTID)).toBeEnabled());
+
+    fireEvent.keyDown(screen.getByTestId(FPS_SELECT_TESTID), { key: "Enter" });
+    fireEvent.keyDown(await screen.findByRole("option", { name: "60" }), { key: "Enter" });
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "keeper could not write the recording settings.",
+    );
+    expect(screen.getByTestId(FPS_SELECT_TESTID)).toHaveTextContent("30");
   });
 
   it("mirrors a persisted 60 from the shared store", async () => {

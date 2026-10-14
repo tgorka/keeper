@@ -35,6 +35,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
+import { logFailure } from "@/lib/failure";
 import { requestCameraPermission, type TccPermission } from "@/lib/ipc/client";
 import {
   ensureCaptureSourcesHydrated,
@@ -172,7 +173,8 @@ export function RecordingWebcamControls({
         .then((status) => {
           if (requestId === cameraRequestSeq.current) setCameraPermission(status);
         })
-        .catch(() => {
+        .catch((raw: unknown) => {
+          logFailure("recording.cameraPermission")(raw);
           if (requestId === cameraRequestSeq.current) setCameraPermission(null);
         })
         .finally(() => {

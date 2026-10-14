@@ -23,6 +23,7 @@
 import { useEffect, useState } from "react";
 import { toast } from "sonner";
 import { openNotesSpace } from "@/hooks/use-notes-actions";
+import { logFailure } from "@/lib/failure";
 import type { NoteSpaceVm } from "@/lib/ipc/client";
 import { notesSpaces } from "@/lib/ipc/client";
 import {
@@ -69,7 +70,8 @@ export function useRecordingsSpace(): NoteSpaceVm | null {
           setSpace(rail.rows.find((one) => one.defaultKey === RECORDINGS_SPACE_KEY) ?? null);
         }
       })
-      .catch(() => {
+      .catch((raw: unknown) => {
+        logFailure("notes.recordingsSpace")(raw);
         if (live) {
           setSpace(null);
         }

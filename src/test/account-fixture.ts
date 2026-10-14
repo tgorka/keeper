@@ -15,6 +15,8 @@ export function accountVm(over: Partial<OrgAccountVm> = {}): OrgAccountVm {
     repoMode: "same",
     state: "ready",
     sentence: "Up to date.",
+    problem: false,
+    attempt: null,
     identity: {
       login: "tgorka",
       displayName: "Tomasz Gorka",

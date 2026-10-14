@@ -13,6 +13,7 @@
  */
 import { useStore } from "zustand";
 import { createStore } from "zustand/vanilla";
+import { logFailure } from "@/lib/failure";
 import { type ForgeSourceVm, forgesList } from "@/lib/ipc/client";
 import { FOLD_MAX_AGE, persistFold } from "@/lib/stores/fold-cookie";
 
@@ -37,8 +38,9 @@ export async function refreshForgeSources(): Promise<void> {
   try {
     const sources = await forgesList();
     forgesStore.setState({ sources });
-  } catch {
+  } catch (error) {
     // Kept as it was; see above.
+    logFailure("forges.list")(error);
   }
 }
 

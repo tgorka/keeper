@@ -15,6 +15,7 @@ import { matchTags } from "@/components/tags/tag-match";
 import { Button } from "@/components/ui/button";
 import { Popover, PopoverAnchor } from "@/components/ui/popover";
 import { IconHint } from "@/components/ui/tooltip";
+import { logFailure } from "@/lib/failure";
 import { tagsVocabulary } from "@/lib/ipc/client";
 import { type PromptToken, replaceSpan, tokenAtCaret } from "@/lib/notes/prompt-tokens";
 import { notesFiltersStore, type TagChip, useNotesFiltersStore } from "@/lib/stores/notes-filters";
@@ -99,7 +100,8 @@ export function SearchField({
       .then((vm) => {
         if (isCurrent()) setVocabulary(vm.entries.map((entry) => entry.path));
       })
-      .catch(() => {
+      .catch((raw: unknown) => {
+        logFailure("notes.tagsVocabulary")(raw);
         if (isCurrent())
           setError("Could not load tags. Search and existing filters are still available.");
       })

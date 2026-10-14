@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 vi.mock("@/lib/ipc/client", () => ({
   recordingSettingsGet: vi.fn(),
   recordingSettingsSet: vi.fn(),
+  frontendErrorReport: vi.fn(async () => undefined),
 }));
 
 import {
@@ -13,7 +14,10 @@ import {
 } from "@/components/settings/recording-settings-controls";
 import type { RecordingSettingsVm } from "@/lib/ipc/client";
 import { recordingSettingsGet, recordingSettingsSet } from "@/lib/ipc/client";
-import { resetRecordingSettingsForTest } from "@/lib/stores/recording-settings";
+import {
+  RECORDING_SETTINGS_UNREAD,
+  resetRecordingSettingsForTest,
+} from "@/lib/stores/recording-settings";
 
 const mockGet = vi.mocked(recordingSettingsGet);
 const mockSet = vi.mocked(recordingSettingsSet);
@@ -145,6 +149,44 @@ describe("RecordingSettingsControls", () => {
     // Optimistic first, then the honest revert once the write rejects.
     await waitFor(() => expect(segmentInput()).toHaveValue(500));
     expect(mockSet).toHaveBeenCalledWith({ ...DEFAULTS, segmentMb: 800 });
+  });
+
+  it("says in place of the blank fields that the settings could not be read (R410)", async () => {
+    mockGet.mockRejectedValue({
+      code: "internal",
+      message: "database is locked",
+      accountId: null,
+      retriable: false,
+    });
+    render(<RecordingSettingsControls />);
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(RECORDING_SETTINGS_UNREAD);
+    expect(screen.queryByLabelText(SEGMENT_SIZE_LABEL)).toBeNull();
+    expect(screen.queryByLabelText(DURATION_CAP_LABEL)).toBeNull();
+  });
+
+  it("says why a refused edit reverted, and stops saying it once an edit lands (R410)", async () => {
+    mockSet.mockRejectedValueOnce({
+      code: "invalid",
+      message: "keeper could not write the recording settings: the disk is full.",
+      accountId: null,
+      retriable: false,
+    });
+    render(<RecordingSettingsControls />);
+    await waitFor(() => expect(segmentInput()).toHaveValue(500));
+
+    fireEvent.change(segmentInput(), { target: { value: "800" } });
+    fireEvent.blur(segmentInput());
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "keeper could not write the recording settings: the disk is full.",
+    );
+    expect(segmentInput()).toHaveValue(500);
+
+    fireEvent.change(segmentInput(), { target: { value: "900" } });
+    fireEvent.blur(segmentInput());
+    await waitFor(() => expect(segmentInput()).toHaveValue(900));
+    expect(screen.queryByRole("alert")).toBeNull();
   });
 
   it("discards a non-numeric entry on blur without persisting", async () => {

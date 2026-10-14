@@ -43,9 +43,9 @@ import {
   SheetHeader,
   SheetTitle,
 } from "@/components/ui/sheet";
+import { reportFrontendError } from "@/lib/crash-report";
 import {
   type AccountSetupVm,
-  type AccountStateVm,
   accountCancelSignIn,
   accountSetupConfirm,
   accountSetupResolve,
@@ -90,6 +90,21 @@ export const SETUP_DONE_LABEL = "Done";
 export const SETUP_CLOSE_LABEL = "Close";
 /** What a failure says when Rust gave no sentence of its own. */
 export const SETUP_FAILED = "keeper couldn't set up the account.";
+/** What a failed "Cancel sign-in" says when Rust gave no sentence of its own. */
+export const SETUP_CANCEL_SIGN_IN_FAILED = "keeper couldn't cancel the sign-in.";
+
+/**
+ * What the sheet says after the person closed the sign-in themselves. Quiet
+ * (R381: "closed" is no problem), but never the signed-out instruction
+ * alone, which reads as if nothing had been tried (100.1 #4), and never "Up
+ * to date" for an account that was already signed in here (R387): `kept`
+ * says the account stays as it was.
+ */
+export function setupClosedSentence(name: string, kept: boolean): string {
+  return kept
+    ? `The sign-in was closed before it finished. ${name} stays as it was on this device.`
+    : `The sign-in was closed before it finished, so ${name} is not set up on this device yet. Sign in from Settings › Account when you are ready.`;
+}
 
 /**
  * The one sentence the confirm step adds when Continue would replace the
@@ -101,20 +116,25 @@ export function setupReplacesSentence(name: string): string {
 }
 
 /**
- * The states a confirm can resolve in that mean the account is NOT set up and
- * working: refused by policy, the grant needs renewing, the issuer or the
- * repository was unreachable, or the sign-in was cancelled.
+ * How a confirm's answer reads in the sheet: the outcome of this attempt as
+ * Rust recorded it (`attempt`, R387), never inferred from the account's
+ * state — a closed re-setup of an account already signed in here still reads
+ * "Up to date." there. Only Rust's `done` is Done; an attempt Rust did not
+ * call finished is never shown as one.
  */
-const FAILED_OUTCOME: Record<AccountStateVm, boolean> = {
-  none: false,
-  signingIn: false,
-  syncing: false,
-  ready: false,
-  blocked: true,
-  needsSignIn: true,
-  offline: true,
-  signedOut: true,
-};
+function outcomeOf(
+  vm: OrgAccountVm,
+  setup: AccountSetupVm,
+): { sentence: string | null; tone: Tone } {
+  switch (vm.attempt) {
+    case "done":
+      return { sentence: vm.sentence, tone: "done" };
+    case "closed":
+      return { sentence: setupClosedSentence(setup.name, vm.identity !== null), tone: "closed" };
+    default:
+      return { sentence: vm.sentence, tone: "failed" };
+  }
+}
 
 /** How each class reads. The wire word stays the wire word everywhere else. */
 export const DEVICE_CLASS_LABEL: Record<DeviceClassVm, string> = {
@@ -236,17 +256,21 @@ export function SetupLinkField({ id }: { id: string }) {
   );
 }
 
+/** A finished setup: set up, failed (an alert), or closed by the person (quiet). */
+type Tone = "done" | "failed" | "closed";
+
 type Phase =
   | { kind: "resolving" }
   | { kind: "refused"; sentence: string }
   | { kind: "confirm"; setup: AccountSetupVm }
   /** `before` is the mirror's snapshot at Continue: anything older is not this setup's progress. */
   | { kind: "working"; setup: AccountSetupVm; before: OrgAccountVm }
-  | { kind: "finished"; setup: AccountSetupVm; sentence: string | null; failed: boolean };
+  | { kind: "finished"; setup: AccountSetupVm; sentence: string | null; tone: Tone };
 
 function SetupFlow({ link }: { link: string }) {
   const [phase, setPhase] = useState<Phase>({ kind: "resolving" });
   const [deviceName, setDeviceName] = useState("");
+  const [cancelError, setCancelError] = useState<string | null>(null);
   const live = useAccountStore((s) => s.vm);
   const close = accountStore.getState().closeSetup;
 
@@ -260,6 +284,7 @@ function SetupFlow({ link }: { link: string }) {
         }
       })
       .catch((raw: unknown) => {
+        reportFrontendError("account.setupResolve", raw, null);
         if (!abandoned) {
           setPhase({ kind: "refused", sentence: syncErrorMessage(raw, SETUP_FAILED) });
         }
@@ -270,36 +295,43 @@ function SetupFlow({ link }: { link: string }) {
   }, [link]);
 
   // Leaving while the browser round trip is open cancels it: the sheet is the
-  // only surface that says a sign-in is waiting.
+  // only surface that says a sign-in is waiting. Nobody is left to read a
+  // sentence by then, so a failed cancel goes to the log.
   useEffect(() => {
     if (phase.kind !== "working") {
       return;
     }
     return () => {
       if (accountStore.getState().vm.state === "signingIn") {
-        void accountCancelSignIn().catch(() => {});
+        void accountCancelSignIn().catch((raw: unknown) =>
+          reportFrontendError("account.cancelSignIn", raw, null),
+        );
       }
     };
   }, [phase.kind]);
+
+  const cancelSignIn = () => {
+    setCancelError(null);
+    void accountCancelSignIn().catch((raw: unknown) => {
+      reportFrontendError("account.cancelSignIn", raw, null);
+      setCancelError(syncErrorMessage(raw, SETUP_CANCEL_SIGN_IN_FAILED));
+    });
+  };
 
   const confirm = (setup: AccountSetupVm) => {
     setPhase({ kind: "working", setup, before: accountStore.getState().vm });
     void accountSetupConfirm(setup.setupId, deviceName.trim())
       .then((vm) => {
         accountStore.getState().setVm(vm);
-        setPhase({
-          kind: "finished",
-          setup,
-          sentence: vm.sentence,
-          failed: FAILED_OUTCOME[vm.state],
-        });
+        setPhase({ kind: "finished", setup, ...outcomeOf(vm, setup) });
       })
       .catch((raw: unknown) => {
+        reportFrontendError("account.setupConfirm", raw, null);
         setPhase({
           kind: "finished",
           setup,
           sentence: syncErrorMessage(raw, SETUP_FAILED),
-          failed: true,
+          tone: "failed",
         });
       });
   };
@@ -379,14 +411,14 @@ function SetupFlow({ link }: { link: string }) {
           <>
             <Waiting sentence={progress?.sentence ?? null} />
             {progress?.state === "signingIn" && (
-              <Button
-                type="button"
-                variant="outline"
-                className="w-fit"
-                onClick={() => void accountCancelSignIn().catch(() => {})}
-              >
+              <Button type="button" variant="outline" className="w-fit" onClick={cancelSignIn}>
                 {SETUP_CANCEL_SIGN_IN_LABEL}
               </Button>
+            )}
+            {cancelError !== null && (
+              <p role="alert" className="text-destructive">
+                {cancelError}
+              </p>
             )}
           </>
         )}
@@ -395,14 +427,14 @@ function SetupFlow({ link }: { link: string }) {
           <>
             {phase.sentence !== null && (
               <p
-                role={phase.failed ? "alert" : "status"}
-                className={phase.failed ? "text-destructive" : undefined}
+                role={phase.tone === "failed" ? "alert" : "status"}
+                className={phase.tone === "failed" ? "text-destructive" : undefined}
               >
                 {phase.sentence}
               </p>
             )}
             <Button type="button" className="w-fit" onClick={close}>
-              {phase.failed ? SETUP_CLOSE_LABEL : SETUP_DONE_LABEL}
+              {phase.tone === "done" ? SETUP_DONE_LABEL : SETUP_CLOSE_LABEL}
             </Button>
           </>
         )}

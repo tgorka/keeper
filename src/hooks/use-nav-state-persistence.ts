@@ -22,10 +22,11 @@
  * state (including `detailOpen: true`) before any report, so the transient
  * selected-but-detail-not-yet-reopened window never writes `detailOpen: false` back to
  * Rust — a re-jettison in that window would otherwise lose the Detail level. IPC
- * errors are swallowed (best-effort, no toast). Unmount does NOT clear the Rust state
+ * errors are logged, not said (best-effort, no toast). Unmount does NOT clear the Rust state
  * — surviving the death of this JS context is the whole point.
  */
 import { useEffect, useRef } from "react";
+import { logFailure } from "@/lib/failure";
 import { type NavState, navStateClear, navStateGet, navStateSet } from "@/lib/ipc/client";
 import { useIsReducedCapabilityPlatform } from "@/lib/stores/capabilities";
 import { detailStore } from "@/lib/stores/detail-ui";
@@ -88,11 +89,11 @@ export function useNavStatePersistence(): void {
       lastAccountId = accountId;
       lastRoomId = roomId;
       lastDetailOpen = detailOpen;
-      // Best-effort: swallow IPC errors (no toast).
+      // Best-effort: log IPC errors (no toast).
       if (selected === null) {
-        void navStateClear().catch(() => {});
+        void navStateClear().catch(logFailure("navState.clear"));
       } else {
-        void navStateSet(selected, detailOpen).catch(() => {});
+        void navStateSet(selected, detailOpen).catch(logFailure("navState.set"));
       }
     };
 
@@ -123,7 +124,10 @@ export function useNavStatePersistence(): void {
     };
 
     if (restoreReadRef.current === null) {
-      restoreReadRef.current = navStateGet().catch(() => null);
+      restoreReadRef.current = navStateGet().catch((error: unknown) => {
+        logFailure("navState.read")(error);
+        return null;
+      });
     }
     const read = restoreReadRef.current;
     void read.then((nav) => {

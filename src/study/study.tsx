@@ -2,7 +2,14 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useEffect, useRef, useState } from "react";
 import type { TelemetryStudyPreviewVm } from "@/lib/ipc/gen/TelemetryStudyPreviewVm";
 import { telemetryStudyPreview, telemetryStudyStop } from "./commands";
+import { logStudyFailure } from "./failure";
 import { type StudyCapture, startStudyCapture } from "./session";
+
+/** A start that failed already said so in its notice; here it only decides what to stop. */
+function startFailed(error: unknown): null {
+  logStudyFailure("study.start")(error);
+  return null;
+}
 
 const CAPTURE_FAILURE =
   "Study capture stopped because a request failed, replay was unavailable, or a safety limit was reached. Some data may already have been transmitted and cannot be recalled. Destination disclosure may remain until the app can confirm cleanup. Reload for another explicit attempt.";
@@ -28,7 +35,7 @@ export function Study() {
       .then((status) => {
         if (alive) setDestination(status);
       })
-      .catch(() => {});
+      .catch(logStudyFailure("study.preview"));
     let unlisten: (() => void) | undefined;
     const registerClose = async () => {
       const dispose = await getCurrentWindow().onCloseRequested(async (event) => {
@@ -39,14 +46,14 @@ export function Study() {
         // after stopping; a hidden window must not keep a recorder or retry queue alive.
         const finish = async () => {
           try {
-            const running = capture.current ?? (await pending.current?.catch(() => null));
+            const running = capture.current ?? (await pending.current?.catch(startFailed));
             if (running) await running.stop();
             else await telemetryStudyStop();
           } finally {
             window.location.replace("index.html");
           }
         };
-        await finish().catch(() => {});
+        await finish().catch(logStudyFailure("study.closeStop"));
       });
       if (!alive) dispose();
       else {
@@ -54,7 +61,8 @@ export function Study() {
         setLifecycleReady(true);
       }
     };
-    void registerClose().catch(() => {
+    void registerClose().catch((raw: unknown) => {
+      logStudyFailure("study.registerClose")(raw);
       if (alive)
         setNotice(
           "Could not register the window-close safety guard. Study capture is unavailable.",
@@ -114,7 +122,8 @@ export function Study() {
       }
       capture.current = running;
       setPhase("active");
-    } catch {
+    } catch (raw) {
+      logStudyFailure("study.start")(raw);
       if (!abort.signal.aborted) {
         setPhase("failed");
         setNotice(CAPTURE_FAILURE);
@@ -126,10 +135,11 @@ export function Study() {
     controller.current?.abort();
     setPhase("stopped");
     try {
-      const running = capture.current ?? (await pending.current?.catch(() => null));
+      const running = capture.current ?? (await pending.current?.catch(startFailed));
       if (running) await running.stop();
       else await telemetryStudyStop();
-    } catch {
+    } catch (raw) {
+      logStudyFailure("study.stop")(raw);
       setNotice(
         "Capture is stopped locally. The app could not confirm removal of the destination disclosure.",
       );

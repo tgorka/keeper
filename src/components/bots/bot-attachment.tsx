@@ -36,6 +36,7 @@ import type { BotPasteContext, BotPasteDecision } from "@/components/bots/bot-pa
 import { botHumanBytes } from "@/components/bots/bot-paste";
 import { Button } from "@/components/ui/button";
 import { IconHint } from "@/components/ui/tooltip";
+import { logFailure, sayFailure } from "@/lib/failure";
 import type { BotDeliverableVm } from "@/lib/ipc/client";
 import {
   botsDeliverablePaths,
@@ -309,6 +310,7 @@ export function useBotImagePaste(
         );
       })
       .catch((raw: unknown) => {
+        logFailure("bots.imagePaste")(raw);
         // Rust refused, and Rust worded it. The half-added row is taken back
         // out so the tray never shows an image the send would silently drop.
         URL.revokeObjectURL(previewUrl);
@@ -325,7 +327,7 @@ export function useBotImagePaste(
       }
       URL.revokeObjectURL(going.previewUrl);
       if (going.id !== null) {
-        void botsImageDiscard(going.id).catch(() => {});
+        void botsImageDiscard(going.id).catch(logFailure("bots.discardImage"));
       }
       return current.filter((_, at) => at !== index);
     });
@@ -410,7 +412,8 @@ export function BotReplyPaths({
       })
       // A resolution that failed is a row with no controls, which is the same
       // safe direction every other refusal in this story takes.
-      .catch(() => {
+      .catch((raw: unknown) => {
+        logFailure("bots.deliverablePaths")(raw);
         if (live) {
           setPaths([]);
         }
@@ -423,9 +426,11 @@ export function BotReplyPaths({
     <BotDeliverablePaths
       paths={paths}
       onReveal={(profileId, subpath) => {
-        // Best-effort, like every other open verb in the tree: a file manager
-        // that refuses is not a reason to put an error on a conversation.
-        void syncOpenEntry(profileId, subpath).catch(() => {});
+        // A file manager that refuses is said in a toast, never as an error
+        // on the conversation itself.
+        void syncOpenEntry(profileId, subpath).catch(
+          sayFailure("bots.revealDeliverable", "keeper couldn't reveal the file."),
+        );
       }}
     />
   );

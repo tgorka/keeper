@@ -48,6 +48,7 @@ mod build_identity;
 // Epic 66 (AD-198); its three commands sit in the shared handler list.
 mod copy_ipc;
 mod debug_log;
+mod failure_notice;
 #[cfg(desktop)]
 #[cfg(target_os = "macos")]
 mod pdf_export;
@@ -1116,6 +1117,10 @@ pub fn run() {
                 voice_reach::voice_hotkey_get,
                 voice_reach::voice_hotkey_set,
                 voice_reach::voice_hotkey_clear,
+                // Background failures and their recovery (Epic 100, R387):
+                // every target, because push and voice fail on the phone too.
+                failure_notice::failure_subscribe,
+                failure_notice::failure_unsubscribe,
                 // The organisation account (Epic 82): every target, in the
                 // shared body, because the phone signs in too and the
                 // Account section is present on every tier.

@@ -28,6 +28,7 @@ pub mod document;
 pub mod drafts;
 pub mod egress;
 pub mod error;
+pub mod failure;
 pub mod file_asset;
 pub mod file_properties;
 pub mod forges;

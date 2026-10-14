@@ -24,6 +24,7 @@ import { useEffect, useId, useState } from "react";
 import { NO_TEMPLATE, TemplateSelect } from "@/components/notes/template-select";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { logFailure } from "@/lib/failure";
 import type { NoteTemplateVm, NoteVaultSettingsReq, NoteVaultVm } from "@/lib/ipc/client";
 import { notesCaptureImpact, notesTemplates, notesVaultSettingsSave } from "@/lib/ipc/client";
 import {
@@ -115,11 +116,10 @@ function CaptureSettingsForm({ vault }: { vault: NoteVaultVm }) {
           setChoicesLoaded(true);
         }
       })
-      .catch(() => {
-        // A list that will not load leaves the chooser with nothing to browse.
-        // The stored value is still rendered and still saved: a failed read is
-        // not evidence that the configured template is gone.
-      });
+      // A list that will not load leaves the chooser with nothing to browse.
+      // The stored value is still rendered and still saved: a failed read is
+      // not evidence that the configured template is gone.
+      .catch(logFailure("captureSettings.templates"));
     return () => {
       cancelled = true;
     };
@@ -136,7 +136,8 @@ function CaptureSettingsForm({ vault }: { vault: NoteVaultVm }) {
           setImpact(sentences);
         }
       })
-      .catch(() => {
+      .catch((raw: unknown) => {
+        logFailure("captureSettings.impact")(raw);
         // keeper could not work out the consequence. Showing none is the only
         // honest option — an invented sentence about Inbox would be a claim
         // about a query nobody evaluated.
@@ -201,7 +202,8 @@ function CaptureSettingsForm({ vault }: { vault: NoteVaultVm }) {
           );
         }
       })
-      .catch(() => {
+      .catch((raw: unknown) => {
+        logFailure("captureSettings.save")(raw);
         setFailure(CAPTURE_SAVE_FAILED);
       });
   };

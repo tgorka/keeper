@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 vi.mock("@/lib/ipc/client", () => ({
   recoveredSessionsList: vi.fn(),
   recoveredSessionAcknowledge: vi.fn(),
+  frontendErrorReport: vi.fn(() => Promise.resolve()),
 }));
 
 import { useRecoveredSessions } from "@/hooks/use-recovered-sessions";

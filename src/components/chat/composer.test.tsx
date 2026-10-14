@@ -1,6 +1,6 @@
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { Composer } from "@/components/chat/composer";
+import { Composer, DRAFT_NOT_SAVED } from "@/components/chat/composer";
 import { attachmentsStore } from "@/lib/stores/attachments";
 import { composerStore } from "@/lib/stores/composer";
 import { draftsStore } from "@/lib/stores/drafts";
@@ -46,6 +46,7 @@ beforeEach(() => {
   open.mockReset();
   vi.mocked(loadDraft).mockResolvedValue(null);
   vi.mocked(saveDraft).mockClear();
+  vi.mocked(saveDraft).mockResolvedValue(undefined);
   vi.mocked(clearDraft).mockClear();
   vi.mocked(loadRemoteDraft).mockResolvedValue(null);
   vi.mocked(mirrorDraft).mockClear();
@@ -638,6 +639,72 @@ describe("Composer persistent drafts (Story 7.1)", () => {
       vi.runOnlyPendingTimers();
       vi.useRealTimers();
     }
+  });
+
+  it("says once under the composer that a draft was not saved, unmarks it, and clears after a save lands (R387)", async () => {
+    vi.mocked(saveDraft).mockRejectedValue({
+      code: "internal",
+      message: "database is locked",
+      accountId: ACCT,
+      retriable: true,
+    });
+    render(<Composer accountId={ACCT} roomId={ROOM} onSend={vi.fn()} />);
+    const textarea = screen.getByLabelText<HTMLTextAreaElement>("Message");
+    fireEvent.change(textarea, { target: { value: "words" } });
+    fireEvent.change(textarea, { target: { value: "words that" } });
+
+    expect(await screen.findByText(DRAFT_NOT_SAVED, {}, { timeout: 2000 })).toHaveAttribute(
+      "role",
+      "alert",
+    );
+    expect(screen.getAllByText(DRAFT_NOT_SAVED)).toHaveLength(1);
+    // Leaving the chat would lose the words: it is not marked as holding a draft.
+    expect(draftsStore.getState().keys.has(`${ACCT} ${ROOM}`)).toBe(false);
+
+    vi.mocked(saveDraft).mockResolvedValue(undefined);
+    fireEvent.change(textarea, { target: { value: "words that stay" } });
+    await waitFor(() => expect(screen.queryByText(DRAFT_NOT_SAVED)).not.toBeInTheDocument(), {
+      timeout: 2000,
+    });
+    expect(draftsStore.getState().keys.has(`${ACCT} ${ROOM}`)).toBe(true);
+  });
+
+  it("stops saying a draft was not saved once the person empties it and the deletion lands (R410)", async () => {
+    vi.mocked(saveDraft).mockRejectedValue({
+      code: "internal",
+      message: "database is locked",
+      accountId: ACCT,
+      retriable: true,
+    });
+    render(<Composer accountId={ACCT} roomId={ROOM} onSend={vi.fn()} />);
+    const textarea = screen.getByLabelText<HTMLTextAreaElement>("Message");
+    fireEvent.change(textarea, { target: { value: "words" } });
+    expect(await screen.findByText(DRAFT_NOT_SAVED, {}, { timeout: 2000 })).toBeInTheDocument();
+
+    // Select all, delete: nothing is left to save once the deletion lands.
+    fireEvent.change(textarea, { target: { value: "" } });
+    await waitFor(() => expect(clearDraft).toHaveBeenCalledWith(ACCT, ROOM), { timeout: 2000 });
+    await waitFor(() => expect(screen.queryByText(DRAFT_NOT_SAVED)).not.toBeInTheDocument());
+  });
+
+  it("keeps saying it when deleting the emptied draft fails too (R410)", async () => {
+    const locked = {
+      code: "internal",
+      message: "database is locked",
+      accountId: ACCT,
+      retriable: true,
+    };
+    vi.mocked(saveDraft).mockRejectedValue(locked);
+    vi.mocked(clearDraft).mockRejectedValueOnce(locked);
+    render(<Composer accountId={ACCT} roomId={ROOM} onSend={vi.fn()} />);
+    const textarea = screen.getByLabelText<HTMLTextAreaElement>("Message");
+    fireEvent.change(textarea, { target: { value: "words" } });
+    expect(await screen.findByText(DRAFT_NOT_SAVED, {}, { timeout: 2000 })).toBeInTheDocument();
+
+    fireEvent.change(textarea, { target: { value: "" } });
+    await waitFor(() => expect(clearDraft).toHaveBeenCalledWith(ACCT, ROOM), { timeout: 2000 });
+    await new Promise((settle) => setTimeout(settle, 50));
+    expect(screen.getByText(DRAFT_NOT_SAVED)).toBeInTheDocument();
   });
 
   it("clears the draft (row + marker) when the body trims to empty", () => {
