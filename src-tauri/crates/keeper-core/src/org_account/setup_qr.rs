@@ -16,8 +16,10 @@ use qrcode::{EcLevel, QrCode};
 /// The mark's width as a share of the symbol's (quiet zone excluded).
 const LOGO_FRACTION: f64 = 0.22;
 /// The house green the app icon's tile is drawn in (`--bridge-healthy`, light).
+/// design-allow color: an SVG handed to a scanner carries literal fills.
 const TILE_GREEN: &str = "#0f6e5c";
 /// The paper the hex-bot is drawn in on that tile (`--background`, light).
+/// design-allow color: the same SVG, the same reason.
 const MARK_INK: &str = "#f4f2ec";
 /// Modules of quiet zone the renderer adds on each side.
 const QUIET: usize = 4;
