@@ -100,6 +100,14 @@ const NEAR_BOTTOM_PX = 80;
 const NEAR_TOP_PX = 200;
 /** Number of older events to request per back-pagination. */
 const PAGINATE_BATCH = 40;
+/**
+ * A page when the window shows nothing: an agent's session room carries its
+ * host's claim renewal as room state every minute, so a 40-event page there is
+ * mostly events nothing renders. Rust clamps a page at 200.
+ */
+const FILL_BATCH = 200;
+/** At most this many self-filling pages per opened room (10 000 events). */
+const FILL_MAX_PAGES = 50;
 /** Debounce before re-marking the room read after new content arrives while open. */
 const MARK_READ_DEBOUNCE_MS = 1000;
 
@@ -312,6 +320,11 @@ export function ConversationBody({
   // it has, `hitStart` is a default, not a fact, and filling the window could
   // page a room that has no history to page.
   const [paginationKnown, setPaginationKnown] = useState(false);
+  // Bumped each time a back-pagination settles, so the self-fill below looks
+  // again: the status stream can report `idle` while the request's promise is
+  // still settling, and the in-flight guard then turns that look away.
+  const [pagesSettled, setPagesSettled] = useState(0);
+  const fillPagesRef = useRef(0);
   // An honest, non-blocking note shown when a search deep-link target is further
   // back in history than the loaded window + bounded live paginate can reach
   // (archive-first seek-to-event is Story 5.6). `null` hides it.
@@ -378,6 +391,7 @@ export function ConversationBody({
     setPaginationKnown(false);
     setPaginationError(false);
     paginatingRef.current = false;
+    fillPagesRef.current = 0;
     prevScrollHeight.current = 0;
     wasNearBottom.current = true;
     prevItemCount.current = 0;
@@ -777,39 +791,47 @@ export function ConversationBody({
   // guard (cleared unconditionally when the promise settles); the resolved boolean
   // is authoritative for reaching the homeserver start, so pagination stops even if
   // the status stream is slow or silent, and a failure sets a sticky retriable error.
-  const runPaginate = useCallback(() => {
-    // `paginatingRef` is the sole in-flight guard: enforce it here so *every*
-    // entry point (the near-top scroll trigger and the boundary Retry button) is
-    // single-flight, not only the scroll path — a rapid Retry can no longer admit
-    // a concurrent fetch.
-    if (accountId === null || roomId === null || paginatingRef.current) {
-      return;
-    }
-    paginatingRef.current = true;
-    paginateBackwards(accountId, roomId, PAGINATE_BATCH)
-      .then((hitStart) => {
-        if (hitStart) {
-          setPagination((p) => ({ ...p, state: "idle", hitStart: true }));
-        }
-      })
-      .catch(() => {
-        // A failed pagination surfaces a retriable inline boundary error (and stops
-        // the spinner); it persists until the user retries — the status stream no
-        // longer clears it.
-        setPaginationError(true);
-      })
-      .finally(() => {
-        paginatingRef.current = false;
-      });
-  }, [accountId, roomId]);
+  const runPaginate = useCallback(
+    (batch: number = PAGINATE_BATCH) => {
+      // `paginatingRef` is the sole in-flight guard: enforce it here so *every*
+      // entry point (the near-top scroll trigger and the boundary Retry button) is
+      // single-flight, not only the scroll path — a rapid Retry can no longer admit
+      // a concurrent fetch.
+      if (accountId === null || roomId === null || paginatingRef.current) {
+        return;
+      }
+      paginatingRef.current = true;
+      paginateBackwards(accountId, roomId, batch)
+        .then((hitStart) => {
+          if (hitStart) {
+            setPagination((p) => ({ ...p, state: "idle", hitStart: true }));
+          }
+        })
+        .catch(() => {
+          // A failed pagination surfaces a retriable inline boundary error (and stops
+          // the spinner); it persists until the user retries — the status stream no
+          // longer clears it.
+          setPaginationError(true);
+        })
+        .finally(() => {
+          paginatingRef.current = false;
+          setPagesSettled((n) => n + 1);
+        });
+    },
+    [accountId, roomId],
+  );
 
   // A window that shows nothing, or too little to scroll, has no top to scroll
   // near, so the trigger below never fires and the room reads "No messages yet."
   // over a history the server holds. That is the ordinary state of an agent's
   // room: its burst of edits makes a sync come back limited, the SDK resets the
-  // room's timeline to the gap, and the window empties. Fill it: page back until
-  // there is something to scroll or the start is reached — one page per change
-  // of the pagination status, single-flight through `runPaginate`.
+  // room's timeline to the gap, and the window empties — and its host renews its
+  // claim as room state every minute, so the newest hundreds of events are ones
+  // nothing renders. Fill it: page back in large pages until there is something
+  // to scroll or the start is reached, looking again whenever the status changes
+  // or a page settles, single-flight through `runPaginate`, at most
+  // FILL_MAX_PAGES pages per opened room.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: `pagesSettled` is the trigger — a settled page must make the fill look again even when nothing it reads changed.
   useEffect(() => {
     if (
       !roomLoaded ||
@@ -823,11 +845,21 @@ export function ConversationBody({
     }
     const el = scrollRef.current;
     const scrollable = el !== null && el.scrollHeight > el.clientHeight + NEAR_TOP_PX;
-    if (hasRows && scrollable) {
+    if ((hasRows && scrollable) || fillPagesRef.current >= FILL_MAX_PAGES) {
       return;
     }
-    runPaginate();
-  }, [roomLoaded, paginationKnown, offline, paginationError, pagination, hasRows, runPaginate]);
+    fillPagesRef.current += 1;
+    runPaginate(FILL_BATCH);
+  }, [
+    roomLoaded,
+    paginationKnown,
+    offline,
+    paginationError,
+    pagination,
+    hasRows,
+    runPaginate,
+    pagesSettled,
+  ]);
 
   const onScroll = useCallback(() => {
     const el = scrollRef.current;
