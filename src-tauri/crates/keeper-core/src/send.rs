@@ -78,6 +78,7 @@ use matrix_sdk::ruma::events::room::message::{
 use matrix_sdk::ruma::events::AnyMessageLikeEventContent;
 use matrix_sdk::ruma::OwnedEventId;
 use matrix_sdk::send_queue::SendHandle;
+use matrix_sdk::{Room, RoomState};
 use matrix_sdk_ui::timeline::{AttachmentConfig, AttachmentSource, Timeline};
 use mime::Mime;
 
@@ -161,6 +162,7 @@ pub async fn submit(
 /// every send-state transition arrive through the room's existing
 /// `Timeline::subscribe()` diff stream, so keeper never synthesizes echo.
 pub(crate) async fn dispatch(timeline: &Timeline, text: &str) -> Result<SendHandle, SendError> {
+    join_if_invited(timeline.room()).await?;
     let content =
         AnyMessageLikeEventContent::RoomMessage(RoomMessageEventContent::text_plain(text));
     // SOLE-SEND-GATE: the one and only `Timeline::send` call site (FR-41 guard).
@@ -168,6 +170,26 @@ pub(crate) async fn dispatch(timeline: &Timeline, text: &str) -> Result<SendHand
         .send(content)
         .await
         .map_err(|e| SendError::Dispatch(e.to_string()))
+}
+
+/// A person's send into a room they are only invited to is their acceptance of
+/// the invite: join it first.
+///
+/// keeper lists an invited room beside the joined ones and offers its composer —
+/// an agent's session room, which its host creates and invites its person to, is
+/// the ordinary case — but the SDK's send queue refuses a room that is not in
+/// the joined state, and the outbox would retry that refusal forever. Joining is
+/// what the person asked for by writing there. Any other state is the queue's
+/// to refuse.
+async fn join_if_invited(room: &Room) -> Result<(), SendError> {
+    if room.state() != RoomState::Invited {
+        return Ok(());
+    }
+    room.join().await.map_err(|e| {
+        SendError::Dispatch(format!("could not join the room you were invited to: {e}"))
+    })?;
+    tracing::info!("joined an invited room to send into it");
+    Ok(())
 }
 
 /// Dispatch a plain-text reply to the message addressed by `in_reply_to_key`
@@ -202,6 +224,7 @@ pub async fn submit_reply(
             .map(|id| id.to_owned())
             .ok_or(SendError::TargetNotFound)?
     };
+    join_if_invited(timeline.room()).await?;
     let content = RoomMessageEventContentWithoutRelation::text_plain(text);
     // SOLE-REPLY-GATE: the one and only `Timeline::send_reply` call site (FR-41).
     timeline
@@ -388,6 +411,7 @@ pub async fn submit_attachment(
             .map(TextMessageEventContent::plain),
         ..AttachmentConfig::default()
     };
+    join_if_invited(timeline.room()).await?;
     // SOLE-ATTACHMENT-GATE: the one and only `Timeline::send_attachment` call site
     // (FR-41 guard). `.use_send_queue()` routes it through the text send plumbing.
     timeline

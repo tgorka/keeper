@@ -625,6 +625,12 @@ pub fn power_levels(kind: SessionKind, creator: &UserId, agents: &[OwnedUserId])
 /// `dev.keeper.agent.presence` (R37), and a drive's doorbell,
 /// `dev.keeper.agent.doorbell`, which a visiting agent rings (R59).
 /// `events_default` and `state_default` are 50.
+///
+/// `invite` is 0, so a person may invite (Q15): a steward's host joins a
+/// visited control room only on a person's invite (`rooms::visitor_decision`),
+/// and at 50 no person could send one. What an invite admits is still each
+/// host's to decide; a member who is not one of the principal's agents gains
+/// no power by being invited.
 pub fn control_power_levels(creator: &UserId, agents: &[OwnedUserId]) -> Value {
     let mut users = Map::new();
     for agent in agents {
@@ -640,7 +646,7 @@ pub fn control_power_levels(creator: &UserId, agents: &[OwnedUserId]) -> Value {
         "ban": 50,
         "kick": 50,
         "redact": 50,
-        "invite": 50,
+        "invite": 0,
     })
 }
 
@@ -648,29 +654,33 @@ pub fn control_power_levels(creator: &UserId, agents: &[OwnedUserId]) -> Value {
 /// at 0 that [`control_power_levels`] names.
 const OPEN_ROWS: [&str; 2] = [PRESENCE, DOORBELL];
 
-/// What a control room made before R37 or R59 needs so its people can
-/// publish their presence and a visiting agent can ring.
+/// What a control room made before R37, R59 or Q15's open invite needs so
+/// its people can publish their presence, invite a steward, and a visiting
+/// agent can ring.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ControlLevels {
-    /// Every open row is already at 0.
+    /// Every open row and `invite` are already at 0.
     UpToDate,
-    /// These levels: the room's, with the missing rows added.
+    /// These levels: the room's, with the missing rows added and `invite`
+    /// opened.
     Update(Value),
     /// `me` may not change the room's power levels.
     NoPower,
 }
 
 /// Whether the control room whose `m.room.power_levels` content is
-/// `levels` needs an open row, and whether `me` may write it.
+/// `levels` needs an open row or its `invite` opened, and whether `me` may
+/// write it. An absent `invite` is 0 (the Matrix default).
 pub fn control_levels(levels: &Value, me: &UserId) -> ControlLevels {
+    let level = |value: &Value, default: i64| value.as_i64().unwrap_or(default);
     let missing: Vec<&str> = OPEN_ROWS
         .into_iter()
         .filter(|row| levels["events"][*row] != json!(0))
         .collect();
-    if missing.is_empty() {
+    let invite_closed = level(&levels["invite"], 0) != 0;
+    if missing.is_empty() && !invite_closed {
         return ControlLevels::UpToDate;
     }
-    let level = |value: &Value, default: i64| value.as_i64().unwrap_or(default);
     let mine = level(
         &levels["users"][me.as_str()],
         level(&levels["users_default"], 0),
@@ -690,6 +700,9 @@ pub fn control_levels(levels: &Value, me: &UserId) -> ControlLevels {
         for row in missing {
             events.insert(row.to_owned(), json!(0));
         }
+    }
+    if invite_closed {
+        updated["invite"] = json!(0);
     }
     ControlLevels::Update(updated)
 }
@@ -864,6 +877,9 @@ mod tests {
         assert!(visitor.as_i64() >= levels["events"][DOORBELL].as_i64());
         assert!(visitor.as_i64() < levels["events"][HOST].as_i64());
         assert!(visitor.as_i64() < levels["events_default"].as_i64());
+        // A person may invite — a steward joins a visited control room only
+        // on a person's invite (Q15) — and gains no power by it.
+        assert!(level("@tgorka:example.org").as_i64() >= levels["invite"].as_i64());
     }
 
     #[test]
@@ -896,6 +912,37 @@ mod tests {
             ControlLevels::Update(_)
         ));
         assert_eq!(control_levels(&current, &amelia), ControlLevels::UpToDate);
+    }
+
+    #[test]
+    fn a_control_room_whose_invite_is_closed_is_opened_and_nothing_else_moves() {
+        let creator = user("@nixi:example.org");
+        let amelia = user("@amelia:example.org");
+        let current = control_power_levels(&creator, std::slice::from_ref(&amelia));
+        let mut old = current.clone();
+        old["invite"] = json!(50);
+        let ControlLevels::Update(updated) = control_levels(&old, &creator) else {
+            panic!("the creator opens a room whose invite is at 50");
+        };
+        assert_eq!(updated, current);
+        // Only who may write the power levels opens it.
+        let mut guarded = old.clone();
+        guarded["events"]["m.room.power_levels"] = json!(100);
+        assert_eq!(control_levels(&guarded, &amelia), ControlLevels::NoPower);
+        // Absent is the Matrix default, 0: nothing to do.
+        let mut absent = current.clone();
+        absent.as_object_mut().expect("levels").remove("invite");
+        assert_eq!(control_levels(&absent, &creator), ControlLevels::UpToDate);
+        // Both at once: the missing rows and the invite in one update.
+        let mut both = old.clone();
+        both["events"]
+            .as_object_mut()
+            .expect("events")
+            .remove(DOORBELL);
+        let ControlLevels::Update(updated) = control_levels(&both, &creator) else {
+            panic!("one update for both");
+        };
+        assert_eq!(updated, current);
     }
 
     #[test]

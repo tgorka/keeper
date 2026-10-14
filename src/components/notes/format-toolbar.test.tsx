@@ -99,6 +99,14 @@ afterAll(() => {
 
 const OPENED = "alpha\nbeta\n";
 
+/**
+ * The emoji picker loads its data lazily; under lefthook's pre-push, which
+ * runs this suite beside clippy and tsc, that took longer than the 1 s
+ * default and these tests failed one push in two. The wait is longer, the
+ * assertions are the same.
+ */
+const SLOW = { timeout: 10_000 };
+
 beforeEach(() => {
   vi.clearAllMocks();
   notesOpen.mockImplementation(async (_vault, _note, onBatch) => {
@@ -260,18 +268,18 @@ describe("the formatting toolbar, in the editor the user actually types into", (
       select(view, "beta");
 
       fireEvent.click(screen.getByRole("button", { name: "Emoji" }));
-      const search = await screen.findByLabelText("Search emoji");
+      const search = await screen.findByLabelText("Search emoji", undefined, SLOW);
       fireEvent.change(search, { target: { value: "tada" } });
 
       // Named by its shortcode, because the character alone is nothing a
       // screen reader can announce usefully.
-      fireEvent.click(await screen.findByRole("button", { name: "tada" }));
+      fireEvent.click(await screen.findByRole("button", { name: "tada" }, SLOW));
 
       await waitFor(() => {
         // The character, not `:tada:` — one buffer spelling whichever door the
         // emoji came through.
         expect(readNoteDocument("v1", "n1").text).toBe("alpha\n🎉\n");
-      });
+      }, SLOW);
       expect(screen.queryByLabelText("Search emoji")).toBeNull();
     });
 
@@ -360,12 +368,14 @@ describe("the formatting toolbar, in the editor the user actually types into", (
       await mounted();
 
       fireEvent.click(screen.getByRole("button", { name: "Emoji" }));
-      fireEvent.change(await screen.findByLabelText("Search emoji"), { target: { value: "tada" } });
+      fireEvent.change(await screen.findByLabelText("Search emoji", undefined, SLOW), {
+        target: { value: "tada" },
+      });
       fireEvent.click(screen.getByRole("button", { name: "Emoji" }));
       fireEvent.click(screen.getByRole("button", { name: "Emoji" }));
 
       // A stale query is a picker that lies about what it is showing.
-      expect(await screen.findByLabelText("Search emoji")).toHaveValue("");
+      expect(await screen.findByLabelText("Search emoji", undefined, SLOW)).toHaveValue("");
     });
   });
 

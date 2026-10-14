@@ -2609,7 +2609,12 @@ tell a decision from free text, so `m.room.encrypted` is allowed at 0 in every s
 (ruling R30): a person may talk in their proxy's rooms (`main`, `conversation`) and may decide
 approvals everywhere, and writes no state anywhere. A control room's power levels are the
 creating agent 100, every other agent of the principal 50 — each writes its host's manifest,
-`dev.keeper.agent.host`, at 50 (AD-374) — and people 0, with `state_default` 50.
+`dev.keeper.agent.host`, at 50 (AD-374) — and people 0, with `state_default` 50 and `invite` 0, so
+a person may invite a steward into it (§ *A drive several principals mount*). A control room made
+with `invite` at 50 is opened at start by its creator's host, as its presence and doorbell rows
+are. A person who writes in a room they are only invited to — an agent's session room, which its
+host invites them to — joins it by sending: keeper lists invited rooms beside joined ones, and
+the send queue refuses a room it has not joined.
 
 The same rule lets a person send *any* agent event type encrypted: a fake status, a scope, a turn
 or an edit of the agent's anchor reaches the room, and the server cannot tell. So the host checks
@@ -4445,7 +4450,10 @@ last fetch of a drive has not brought its commit gets at most one fetch of that 
 latest bell waits, and the poll still runs. Anything else is ignored.
 
 **A drive several principals mount.** neuradrive is mounted by `agentd-tgorka` and
-`agentd-neuraffica`, whose control rooms differ. A person who reads neuradrive invites its steward
+`agentd-neuraffica`, whose control rooms differ. (A principal with no hosted proxy has no control
+room of its own — only a proxy's copy creates one — so a steward-only principal such as
+`agentd-neuraffica` makes no `triage` or `harvest` session; the visit below gives its steward the
+doorbell, not those sessions.) A person who reads neuradrive invites its steward
 (`@lucyna-novak`) into their own control room from keeper or any Matrix client; the steward's host
 joins a control-room invite only from someone who is not an agent it knows and who reads the
 steward's home drive by its pins, and leaves every other control-room invite pending. In the visited
