@@ -10562,3 +10562,24 @@ origin: agentd's `materialize` (2026-10-14; makistack electra's first bootstrap 
 location: `keeper_sync::engine::Engine::do_lfs` (only `LfsMode::Disabled` declines), `keeper_agent::headless::engine::open_engine`
 reason: a checkout queues an `LfsDownload` per path its policy keeps, and `do_lfs` fetches a queued row whatever the policy says when it runs — so a drive checked out under `all` and moved to `zones` (or a folder that commits a `.keepervirtual` or a `virtualOverBytes` floor after a clone) keeps fetching everything the clone queued. Measured: a `.keeper/keeper.electra.toml` floor committed to tgdrive and neuradrive did not stop the downloads an earlier `init` had queued. The documented remedy is to clone again (docs/agents.md § *How much of a drive is on disk*). A fix would let `do_lfs` decline a background row (no one waiting, `materialize_landed`'s question) whose path the current policy resolves `Virtual`, retiring it rather than fetching.
 status: open
+
+### DW-1382: A steward-only principal has no control room, so its steward's daily sessions are never made.
+
+origin: makistack's electra (2026-10-14): `agentd-neuraffica` hosts Dr Lucyna Novak alone
+location: `keeper_agentd::init` (a control room is created only "once the hosted proxy's copy is signed in"), `keeper_agent::hosts` ("this host has no control room, so no steward's triage or harvest session is made here")
+reason: a principal's control room is made by its hosted proxy, and neuraffica hosts no proxy, so its host logs the sentence above on every start and Dr Lucyna Novak's `triage`/`harvest` never run. Inviting her into another principal's control room (Q15) gives her that room's doorbell only. A fix would let `init` create the control room as the principal's first hosted steward when there is no proxy, or let `agentd.toml` name a control room another principal's proxy made.
+status: open
+
+### DW-1383: An invited room has no accept or decline; sending into it is the only way in.
+
+origin: makistack's electra (2026-10-14): Nixi's DM and Tola Grey's session rooms invited @tgorka, keeper listed them, and every message stayed at "Sending in 0s"
+location: `keeper_core::send::join_if_invited` (the fix in this change), the room list
+reason: keeper lists invited rooms beside joined ones and draws no invite state, so a person cannot tell one from the other, cannot decline, and before this change could not send either (the SDK's queue refuses a room not joined; the outbox retried every 250 ms). Sending now joins; an invite the person never writes in stays pending and unmarked. A fix would mark invited rooms in the list and offer accept and decline — for an agent's session room from one of the person's own agents, possibly joining on its own.
+status: open
+
+### DW-1384: A room joined while keeper runs, by another client, wedges its event cache on a FOREIGN KEY failure.
+
+origin: makistack's electra (2026-10-14): Nixi's DM and Tola Grey's triage room were joined for @tgorka through the client-server API while keeper ran
+location: matrix-sdk 0.18 `event_cache` (`handling joined room update: FOREIGN KEY constraint failed`, `send_queue: Failed to save the sent event in the Event Cache`)
+reason: after the outside join, every update of those rooms failed to persist, so no incoming event was shown (the agent's replies never appeared) and, after one more send, the room's send queue stopped and its messages stayed at "Sending…". Quitting keeper and moving `accounts/<id>/sdk/matrix-sdk-event-cache.sqlite3*` aside (a cache, rebuilt from the server) cleared it; the queued messages went out at the next start. Whether a join made by keeper itself (`send::join_if_invited`) can reach the same state is not measured. A fix would catch the failure and clear that room's cache through the SDK, or reproduce it against the SDK and report upstream.
+status: open

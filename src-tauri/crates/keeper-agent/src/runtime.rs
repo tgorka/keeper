@@ -1728,7 +1728,7 @@ async fn update_control_room(client: &AgentClient, room: &RoomId, me: &UserId) -
                 .await
             {
                 Ok(_) => {
-                    tracing::info!(%room, "agentd: the control room now takes the person's presence and a visitor's doorbell")
+                    tracing::info!(%room, "agentd: the control room now takes the person's presence, a person's invite and a visitor's doorbell")
                 }
                 Err(error) => {
                     tracing::warn!(%room, %error, "agentd: the control room's power levels could not be updated")

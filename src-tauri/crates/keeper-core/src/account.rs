@@ -445,6 +445,12 @@ async fn run_outbox_scheduler(
     // WAL contention) would re-send the same body every tick. This in-memory set bounds
     // duplicates to a genuine crash/abort (which clears it), preserving at-least-once.
     let mut awaiting_delete: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // A row whose dispatch failed waits before it is tried again, doubling from
+    // one tick to a minute: a refusal that does not go away (a room the account
+    // has left) was retried every tick, four warnings a second for as long as
+    // keeper ran. Forgotten when the row is dispatched or deleted.
+    let mut backoff: std::collections::HashMap<String, (u32, i64)> =
+        std::collections::HashMap::new();
     loop {
         ticker.tick().await;
         let rows = match registry::list_outbox_rows_for_account(&data_dir, &account_id) {
@@ -463,6 +469,9 @@ async fn run_outbox_scheduler(
         {
             // Already dispatched to the SDK queue on a prior tick; only its delete is
             // pending. Retry the delete — never re-dispatch.
+            if backoff.get(&row.id).is_some_and(|(_, next)| now < *next) {
+                continue;
+            }
             if awaiting_delete.contains(&row.id) {
                 if registry::delete_outbox(&data_dir, &row.id).is_ok() {
                     awaiting_delete.remove(&row.id);
@@ -492,6 +501,7 @@ async fn run_outbox_scheduler(
             // retry next tick rather than deleting an undispatched message.
             match send::dispatch(&timeline, &row.body).await {
                 Ok(_) => {
+                    backoff.remove(&row.id);
                     if let Err(e) = registry::delete_outbox(&data_dir, &row.id) {
                         // Handed off but not yet deleted: remember it so the next tick
                         // retries the delete instead of re-dispatching a duplicate.
@@ -502,7 +512,10 @@ async fn run_outbox_scheduler(
                     tracing::info!(account_id = %account_id, room_id = %parsed_room, "held send dispatched after window elapsed");
                 }
                 Err(e) => {
-                    tracing::warn!(account_id = %account_id, error = %e, "outbox scheduler: dispatch failed; will retry next tick");
+                    let failures = backoff.get(&row.id).map_or(1, |(n, _)| n.saturating_add(1));
+                    let wait_ms = outbox_retry_delay_ms(failures);
+                    backoff.insert(row.id.clone(), (failures, now.saturating_add(wait_ms)));
+                    tracing::warn!(account_id = %account_id, error = %e, failures, wait_ms, "outbox scheduler: dispatch failed; will retry");
                 }
             }
         }
@@ -512,6 +525,15 @@ async fn run_outbox_scheduler(
             let _ = outbox_tx.send(OutboxChange);
         }
     }
+}
+
+/// How long the outbox waits after a held send's `failures`-th failed dispatch:
+/// 250 ms doubled per failure, at most a minute.
+fn outbox_retry_delay_ms(failures: u32) -> i64 {
+    const FIRST_MS: i64 = 250;
+    const MAX_MS: i64 = 60_000;
+    let doublings = failures.saturating_sub(1).min(16);
+    FIRST_MS.saturating_mul(1_i64 << doublings).min(MAX_MS)
 }
 
 /// Acquire a `Timeline` for dispatching a held send (Story 8.3): build a transient
@@ -8665,6 +8687,17 @@ mod tests {
         assert!(outbox_row_due(5, 6), "already-elapsed window is due");
         assert!(outbox_row_due(5, 5), "window ending exactly now is due");
         assert!(!outbox_row_due(6, 5), "still-future window is not yet due");
+    }
+
+    /// A held send that keeps failing is tried less and less often, never more
+    /// than a minute apart — not every 250 ms tick for as long as keeper runs.
+    #[test]
+    fn a_failing_held_send_backs_off_to_a_minute() {
+        assert_eq!(outbox_retry_delay_ms(1), 250);
+        assert_eq!(outbox_retry_delay_ms(2), 500);
+        assert_eq!(outbox_retry_delay_ms(3), 1_000);
+        assert_eq!(outbox_retry_delay_ms(9), 60_000);
+        assert_eq!(outbox_retry_delay_ms(u32::MAX), 60_000);
     }
 
     /// Story 8.3: `cancel_held_send` deletes the row, writes the body as the room
