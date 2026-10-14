@@ -639,7 +639,13 @@ async fn only_an_original_text_brief_from_a_known_agent_is_drawn_as_one() {
         ))
         .await;
     let icons = Arc::new(AgentIcons::default());
-    icons.replace([(NIXI.try_into().expect("user"), None)].into());
+    icons.replace(
+        [(
+            NIXI.try_into().expect("user"),
+            crate::agents::room::ZoneAgent::default(),
+        )]
+        .into(),
+    );
     let drawn = device.open(ROOM, Arc::clone(&icons)).await;
     drawn
         .until("the genuine brief whole", |drawn| {

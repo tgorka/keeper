@@ -44,4 +44,11 @@ problem: string | null,
  * The agent's model and level, and the bots it may run on (100.2 #4);
  * `None` on a folder's own row.
  */
-model: AgentModelVm | null, };
+model: AgentModelVm | null, 
+/**
+ * Why the agent's picture is not what its home's `avatar.*` says —
+ * a file too large, unreadable or of another format, or a publication
+ * to its Matrix profile that failed — naming the agent (story 100.4);
+ * `None` when nothing is wrong with it.
+ */
+avatarProblem: string | null, };

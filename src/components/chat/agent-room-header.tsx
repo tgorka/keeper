@@ -161,7 +161,8 @@ export function AgentRoomHeader({
   // The mark is the soul's icon where the agent's zone is on this device
   // (Rust checked it against the identity's bound), else the first letter of
   // the handle — its localpart — the only name the phone has for an agent
-  // whose soul it cannot read.
+  // whose soul it cannot read. The agent's picture (story 100.4), where Rust
+  // found one, is drawn over it; the mark stays the fallback.
   const mark =
     status === null ? null : (status.icon ?? [...status.handle][0]?.toUpperCase() ?? null);
   const doing =
@@ -195,7 +196,10 @@ export function AgentRoomHeader({
         <p className="text-muted-foreground text-sm">No status from the agent yet.</p>
       ) : (
         <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-sm">
-          <BotIdentityCell identity={{ shape: "hollow", colour: null, mark }} />
+          <BotIdentityCell
+            identity={{ shape: "hollow", colour: null, mark }}
+            image={status.avatar ?? null}
+          />
           <span className="min-w-0 truncate font-medium">{status.handle}</span>
           <Badge variant="outline" data-testid="agent-run">
             <Lamp state={RUN_LAMP[status.run]} label={null} />

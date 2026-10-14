@@ -117,6 +117,14 @@ pub fn completion_key(job: &str, drive: &str) -> String {
     format!("{job}:{drive}")
 }
 
+/// The state key of the claim in the principal's control room under which
+/// one host at a time publishes `agent`'s picture as its Matrix profile
+/// avatar (story 100.4, R399): only its holder uploads, and it reads the
+/// agent's record again once it holds it.
+pub fn picture_key(agent: &matrix_sdk::ruma::UserId) -> String {
+    format!("picture:{agent}")
+}
+
 /// Whether a host may write a new claim over `current` at `server_now` (ms):
 /// there is none, it is released, or its event is [`TTL`] old.
 pub fn may_acquire(current: Option<&ServerClaim>, server_now: u64) -> bool {

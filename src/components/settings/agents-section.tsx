@@ -526,6 +526,16 @@ function AgentRow({
       {agent.problem !== null && (
         <p className="text-muted-foreground text-xs [overflow-wrap:anywhere]">{agent.problem}</p>
       )}
+      {agent.avatarProblem !== null && (
+        // Why the agent's picture is not its home's `avatar.*` (story 100.4):
+        // Rust's sentence, naming the agent and the file or the failed upload.
+        <p
+          data-testid="agent-avatar-problem"
+          className="text-muted-foreground text-xs [overflow-wrap:anywhere]"
+        >
+          {agent.avatarProblem}
+        </p>
+      )}
       {error !== null && (
         <p role="alert" className="text-destructive text-xs [overflow-wrap:anywhere]">
           {error}

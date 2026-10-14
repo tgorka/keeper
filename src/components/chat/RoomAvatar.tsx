@@ -38,9 +38,13 @@ export function RoomAvatar({ room, size }: RoomAvatarProps) {
   // An `mxc://` URI cannot load in the webview (the media scheme handler is a
   // later epic); only a browser-loadable http(s) URL is rendered as an image.
   const httpAvatar = room.avatarUrl && /^https?:\/\//.test(room.avatarUrl) ? room.avatarUrl : null;
+  // An agent room's row draws its agent's picture (story 100.4, R384) — a URL
+  // Rust composed for an `<img>`, the same one its header draws; the initials
+  // stay the fallback while it loads and if it does not.
+  const picture = room.agentAvatar ?? httpAvatar;
   return (
     <Avatar size={size}>
-      {httpAvatar !== null && <AvatarImage src={httpAvatar} alt="" />}
+      {picture !== null && <AvatarImage src={picture} alt="" />}
       <AvatarFallback>{roomInitials(room.displayName)}</AvatarFallback>
       {/* Bridged-Network badge (Story 4.6, FR-24): a uniform 16 px neutral chip
           overlaid bottom-right, showing the Network label's first code point (labels

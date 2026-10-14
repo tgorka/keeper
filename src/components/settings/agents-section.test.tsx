@@ -105,6 +105,7 @@ function nixi(pin: AgentPinVm, signedIn = false): AgentCopyVm {
     pin,
     problem: null,
     model: null,
+    avatarProblem: null,
   };
 }
 
@@ -274,6 +275,7 @@ describe("Settings › Agents", () => {
         pin: null,
         problem: sentence,
         model: null,
+        avatarProblem: null,
       },
     ]);
     render(<AgentsSection open />);
@@ -302,6 +304,28 @@ describe("Settings › Agents", () => {
     });
     expect(agentsCopies).toHaveBeenCalledTimes(2);
     expect(screen.queryByText(waiting)).not.toBeInTheDocument();
+  });
+
+  // Story 100.4 #5: why the picture is not used, beside a signed-in copy's
+  // row, and gone when Rust says nothing is wrong.
+  it("says beside the agent's row why its picture is not used", async () => {
+    vi.useFakeTimers();
+    const tooLarge =
+      "Nixi's avatar.svg is 301 KiB; keeper draws a picture of at most 256 KiB, so it is not used.";
+    vi.mocked(agentsCopies)
+      .mockResolvedValueOnce([
+        { ...nixi({ ...unpinned, state: "pinned" }, true), avatarProblem: tooLarge },
+      ])
+      .mockResolvedValue([nixi({ ...unpinned, state: "pinned" }, true)]);
+    render(<AgentsSection open />);
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(screen.getByTestId("agent-avatar-problem")).toHaveTextContent(tooLarge);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(AGENTS_RELOAD_MS);
+    });
+    expect(screen.queryByTestId("agent-avatar-problem")).not.toBeInTheDocument();
   });
 
   it("names no host for a signed-in copy when the account has none", async () => {

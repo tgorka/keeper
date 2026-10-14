@@ -1321,6 +1321,7 @@ describe("SettingsDialog", () => {
         },
         problem: null,
         model: null,
+        avatarProblem: null,
       },
     ]);
     mockPosture.mockResolvedValue(false);

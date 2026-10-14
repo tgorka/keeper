@@ -34,6 +34,15 @@ icon?: string,
  */
 model?: AgentModelLineVm, 
 /**
+ * The agent's picture as a URL the webview loads in an `<img>` (story
+ * 100.4, R384): the home's `avatar.*` from the drive where its agents
+ * zone is on this device, else the agent's Matrix profile avatar as
+ * this room holds it (the original, never a thumbnail). Absent when it
+ * has neither; the mark is drawn then, and wherever the picture fails
+ * to load.
+ */
+avatar?: string, 
+/**
  * The host that wrote the status.
  */
 host: string | null, 

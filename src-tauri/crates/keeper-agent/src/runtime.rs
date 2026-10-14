@@ -631,6 +631,8 @@ pub(crate) struct Copy {
     /// The proxies every copy of this host runs: a narrowed session's
     /// person is told through theirs (R169).
     pub(crate) doors: Arc<ClientDoors>,
+    /// Its picture's publication as its profile avatar (story 100.4).
+    pub(crate) picture: Arc<tokio::sync::Mutex<crate::avatar::Picture>>,
 }
 
 /// The claim a worker writes under (story 90.6).
@@ -747,6 +749,7 @@ pub(crate) fn start_copy(
         doorbell,
         harvest_acks: Arc::default(),
         doors,
+        picture: Arc::default(),
     });
     register_handlers(&copy);
     let sync_client = copy.client.client().clone();
@@ -973,6 +976,9 @@ pub async fn run(
         copies.push(copy);
     }
 
+    // Why each agent's picture could not be published here: in the
+    // manifest, so every device's Settings › Agents row says it (R399).
+    let pictures = crate::avatar::Failures::default();
     let mut hosts = HostRuntime::agentd(
         &config,
         host.clone(),
@@ -981,7 +987,8 @@ pub async fn run(
         copies.clone(),
         sandbox.is_some(),
     )
-    .with_mcp(Arc::clone(&mcp));
+    .with_mcp(Arc::clone(&mcp))
+    .with_pictures(Arc::clone(&pictures));
     doorbell.set_principal_agents(hosts.principal_agents());
     // Each steward's triage and harvest sessions are made from the first
     // tick on, beside the lease clock (R66, R165).
@@ -1010,6 +1017,7 @@ pub async fn run(
         dirs.state.join(STATUS_FILE),
         sandbox_status,
         Arc::clone(&mcp),
+        Arc::clone(&pictures),
     );
     let trust = Arc::new(Mutex::new(Vec::<Value>::new()));
     let trust_reader = tokio::spawn(read_trust(
@@ -1083,6 +1091,10 @@ pub async fn run(
             }
             // A session the rescan no longer finds is handed back.
             hosts.scanned();
+            // Each agent's picture becomes its profile avatar when its file
+            // changed (story 100.4), beside the tick, under its picture
+            // claim (R399).
+            crate::avatar::publish_all(&copies, hosts.picture_round().as_ref(), &pictures, true);
         }
         hosts.tick(&stop_signal).await;
         ringer.tick(&hosts.round(&drives), &doorbell);
@@ -2941,16 +2953,25 @@ struct StatusFile {
     /// Each MCP server as it last answered, and each tool not offered with
     /// why (96.2 #3, #5).
     mcp: Arc<crate::mcp::McpServers>,
+    /// Why each copy's picture could not be published as its profile
+    /// avatar, said beside the copy (story 100.4).
+    pictures: crate::avatar::Failures,
     /// The last body written, without its time, and when.
     last: Option<(String, Instant)>,
 }
 
 impl StatusFile {
-    fn new(path: PathBuf, sandbox: String, mcp: Arc<crate::mcp::McpServers>) -> StatusFile {
+    fn new(
+        path: PathBuf,
+        sandbox: String,
+        mcp: Arc<crate::mcp::McpServers>,
+        pictures: crate::avatar::Failures,
+    ) -> StatusFile {
         StatusFile {
             path,
             sandbox,
             mcp,
+            pictures,
             last: None,
         }
     }
@@ -2982,9 +3003,23 @@ impl StatusFile {
                 .collect(),
             Err(error) => vec![json!({ "error": error.to_string() })],
         };
+        let pictures = self
+            .pictures
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
         let copies: Vec<Value> = copies
             .iter()
             .map(|copy| {
+                let picture = pictures.get(&copy.deps.home.config.matrix_user).map(|error| {
+                    keeper_core::agents::avatar::publish_failed(
+                        &copy.deps.home.config.name,
+                        &keeper_core::agents::avatar::PublishFailure {
+                            host: None,
+                            error: error.clone(),
+                        },
+                    )
+                });
                 let user = copy.deps.home.config.matrix_user.to_string();
                 let sessions: Vec<Value> = copy
                     .router
@@ -3003,6 +3038,7 @@ impl StatusFile {
                     "device": copy.client.device_id(),
                     "sessions": sessions,
                     "unserved": unserved,
+                    "picture": picture,
                 })
             })
             .collect();

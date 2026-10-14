@@ -9,6 +9,7 @@
 
 use std::path::{Path, PathBuf};
 
+use keeper_core::agents::avatar;
 use keeper_core::agents::drive::{self, DriveDecl};
 use keeper_core::agents::home::{self, AgentConfig, HomeRefusal};
 #[cfg(not(phone))]
@@ -21,6 +22,8 @@ use keeper_core::agents::zone::{self, ZoneAssessment, ZoneEntry};
 #[cfg(not(phone))]
 use keeper_core::sessions::model::ACTIVE_DIR;
 use keeper_sync::browse;
+use keeper_sync::lfs::pointer;
+use keeper_sync::lfs::store::LfsStore;
 use keeper_sync::SyncProfile;
 
 /// One agent this host may serve: its config, where its home is, and the
@@ -81,6 +84,100 @@ pub fn read_text(root: &Path, rel: &str) -> Result<Option<String>, String> {
         Ok(None) => Ok(None),
         Err(refusal) => Err(format!("{rel} is refused: {refusal}")),
     }
+}
+
+/// A home's picture as read under a root: `avatar::scan`'s verdict, and
+/// the root-relative path the chosen file landed at.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HomeAvatar {
+    pub scan: avatar::AvatarScan,
+    /// Where the picture landed, `/`-joined under the root
+    /// (`browse::Landing::relative`); `None` without a picture.
+    pub path: Option<String>,
+}
+
+/// The picture of the home `home` (root-relative) under `root` (story 100.4):
+/// each candidate reached through `browse::resolve_known` as every zone file
+/// is, its size read before its bytes; a git-LFS pointer is parsed and its
+/// object's size read from it before anything else (R399): past
+/// [`avatar::MAX_BYTES`] it is too large, an object in `store` (the drive's
+/// `.git/lfs`) is read as the picture's bytes, and an object not on this
+/// device is no picture here. The home's own entries are listed for any
+/// other `avatar.*`. `avatar::scan` decides.
+pub fn read_avatar(root: &Path, home: &str, store: &LfsStore) -> HomeAvatar {
+    let names: Vec<String> = match browse::resolve_known(root, home).map(browse::Known::landed) {
+        Ok(Some(landing)) => std::fs::read_dir(landing.path())
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .filter(|entry| entry.file_type().is_ok_and(|kind| !kind.is_dir()))
+                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    };
+    let mut landed: Vec<(&'static str, String)> = Vec::new();
+    let scan = avatar::scan(&names, |file| {
+        let rel = format!("{home}/{file}");
+        let landing = match browse::resolve_known(root, &rel).map(browse::Known::landed) {
+            Ok(Some(landing)) => landing,
+            Ok(None) => return avatar::Candidate::Absent,
+            Err(refusal) => return avatar::Candidate::Unreadable(refusal.to_string()),
+        };
+        let size = match std::fs::metadata(landing.path()) {
+            Ok(meta) if meta.is_file() => meta.len(),
+            Ok(_) => return avatar::Candidate::Unreadable("it is not a file".to_owned()),
+            Err(error) => return avatar::Candidate::Unreadable(error.to_string()),
+        };
+        if size > avatar::MAX_BYTES {
+            return avatar::Candidate::TooLarge(size);
+        }
+        let bytes = match std::fs::read(landing.path()) {
+            Ok(bytes) => bytes,
+            Err(error) => return avatar::Candidate::Unreadable(error.to_string()),
+        };
+        if !pointer::is_pointer_candidate(&bytes) {
+            landed.push((file, landing.relative()));
+            return avatar::Candidate::Bytes(bytes);
+        }
+        let Some(lfs) = pointer::Pointer::parse(&bytes) else {
+            return avatar::Candidate::Unreadable(
+                "it is a git-LFS pointer keeper cannot read".to_owned(),
+            );
+        };
+        if lfs.size > avatar::MAX_BYTES {
+            return avatar::Candidate::TooLarge(lfs.size);
+        }
+        if !store.contains(&lfs.oid, lfs.size) {
+            return avatar::Candidate::NotHere;
+        }
+        match std::fs::read(store.object_path(&lfs.oid)) {
+            Ok(object) => {
+                landed.push((file, landing.relative()));
+                avatar::Candidate::Bytes(object)
+            }
+            Err(error) => avatar::Candidate::Unreadable(error.to_string()),
+        }
+    });
+    let path = scan.avatar.as_ref().and_then(|picture| {
+        landed
+            .iter()
+            .find(|(file, _)| *file == picture.file)
+            .map(|(_, path)| path.clone())
+    });
+    HomeAvatar { scan, path }
+}
+
+/// The git-LFS object store of the drive checked out at `drive_root`.
+pub fn lfs_store(drive_root: &Path) -> LfsStore {
+    LfsStore::in_git_dir(drive_root.join(".git"))
+}
+
+/// [`read_avatar`] of `home`, under its agents zone, its pointers' objects
+/// in the store of the drive checked out at `drive_root`.
+pub fn home_avatar(home: &AgentHome, drive_root: &Path) -> HomeAvatar {
+    read_avatar(&home.zone, &home.config.id, &lfs_store(drive_root))
 }
 
 /// The real directories directly under `dir`, by name, sorted; a link is

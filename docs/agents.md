@@ -464,6 +464,56 @@ fields and lists what it did not carry over: activation steps, each menu item (a
 BMAD skill; keeper's menus run `_workflows/` folders), and any `file:` fact, which names a path in
 the BMAD project rather than in the home. It returns text; a person writes the file.
 
+### The agent's picture: `avatar.svg`
+
+An agent's home may hold its picture: `avatar.svg` (preferred), else `avatar.png`, `avatar.webp`
+or `avatar.jpg`, at most 256 KiB (262 144 bytes). keeper uses the first of those four that is
+there and reads; one that is too large, cannot be read, or is not the format its name says (an
+`avatar.svg` must be an SVG document whose `<svg>` element begins within its first 4 KiB, past
+any XML declaration, comments and doctype) is not used and the next is tried. A file the drive
+keeps in git-LFS is judged by its object: past 256 KiB by the size its pointer names, without
+fetching anything; while the object is not on this machine the agent keeps its letter here —
+not the agent's Matrix profile avatar, which may be an older picture — and nothing is published. Any other `avatar.*` beside them (`avatar.gif`, `avatar.jpeg`,
+`Avatar.PNG`) is ignored. Each file keeper does not use is a WARN line in `keeper.log` (on
+agentd, its journal) naming the agent and the file, and a sentence under the agent's row in
+Settings › Agents — *Nixi's avatar.svg is 301 KiB; keeper draws a picture of at most 256 KiB, so
+it is not used.* The seeded agents have no picture and keep their letter until you add a file.
+
+- **Where it is drawn.** Wherever the agent's mark is: the identity cell of its room's header —
+  in the chat and in the notes view's dock, which draws the same header — and its rooms' rows in
+  the Agents window. A row draws the agent working its session, as its status names it: a
+  delegated session's row draws the delegate, not the agent that made the room; a row whose
+  status is not read yet draws the letter. The picture is clipped to the cell; the letter (or
+  the soul's `icon`) stays the fallback while it loads, wherever it does not load, and for an
+  agent with no picture.
+- **On the Mac with the drive.** The file is drawn from the drive over `keeper-file://` (the
+  sync profile's root, which holds the agents zone), with a hash of its content in the URL, so a
+  changed file is drawn within a scan (five seconds).
+- **Everywhere else.** A host serving the agent — `keeper-agentd`, or the Mac that hosts it —
+  makes the same file the agent's Matrix profile avatar when its content changes. It first reads
+  the agent's record (`dev.keeper.agent.avatar` in the agent's own account data: the content's
+  hash and the avatar it became) and profile; when they show this file already, it uploads
+  nothing — not at a scan, not after a restart, not after the file was put back to what was
+  published. Otherwise only the host holding the agent's picture claim in the principal's
+  control room (`picture:<agent>`, taken as every keyed claim is) uploads the bytes (typed by
+  the extension), sets the avatar, records it and hands the claim back; a host that finds the
+  claim held elsewhere uploads nothing and looks again a minute later, when the holder's record
+  answers it. So the iPhone, another Mac and other clients show the picture too; keeper draws an
+  agent's profile avatar from the original file, never a server thumbnail, and never reads more
+  than 256 KiB of it: a larger one, which any client could set, is refused as the server
+  declares its size or as soon as the download runs past it, is never cached, and is one WARN
+  line on that device, which draws the letter. A failed upload is a WARN line on the host that
+  tried, and a sentence under the agent's row in Settings › Agents on every Mac of the
+  principal — the host carries it in its manifest in the control room, so a failure on electra
+  reads *… could not be set as its Matrix profile avatar on electra (…)* (on agentd also
+  `picture` beside the copy in `status.json`); it is tried again in ten minutes, and the
+  sentence goes once a publication succeeds. A failure never leaves the host believing the
+  profile is settled. Removing the file leaves the profile avatar as it was (DW-1421).
+- **SVG.** An SVG is only ever an `<img>` source, served as `image/svg+xml` with
+  `X-Content-Type-Options: nosniff`; it is never put into the page, so a script inside it never
+  runs. A profile avatar is served only for a member at an agent's power in that room and only
+  when its bytes are a PNG, JPEG, WebP or SVG.
+
 ### `USER.md` and `MEMORY.md`
 
 Both are markdown whose entries are separated by a line holding only `§`. A `§` inside a line is
@@ -2966,7 +3016,8 @@ keeper shows an agent's room in its own timeline, on the Mac and on the iPhone a
   sentence when the newest scope is from a newer keeper or cannot be read — never dropped) and
   the label chip (the readers by name, a reader keeper cannot name by user id, and the integrity
   as a word). The identity cell's mark is the first letter of the handle, which for the seeded
-  agents is the one glyph their souls name (`N`, `T`, `L`).
+  agents is the one glyph their souls name (`N`, `T`, `L`); an agent with a picture
+  ([`avatar.svg`](#the-agents-picture-avatarsvg)) is drawn by it instead, the mark its fallback.
 - **Whose status.** keeper reads status updates the way the host does: only from the agent the
   status names, at power 50 or more, never from you; the newest by server time wins, so an update
   arriving late never replaces a newer one. A status keeper cannot read — a run or kind it does
@@ -2977,7 +3028,7 @@ keeper shows an agent's room in its own timeline, on the Mac and on the iPhone a
   newest first, when the cache holds no status — once per room while keeper runs, when that
   history held none; a status sent later reaches the cache. The hosts' claim and manifest state,
   renewed every minute, never become timeline items either. A change of the agent's mark (its
-  soul's icon) redraws an open header.
+  soul's icon) or of its picture redraws an open header and its rows in the Agents window.
 - **The answer.** An answer is one message that grows in place and is never marked "Edited";
   while the run is `running`, its newest answer carries the growing caret. It is drawn up to
   `FINAL_CUT_BYTES` and the sentence naming the artifact, not cut at the 4096 characters an

@@ -185,6 +185,23 @@ describe("AgentRoomHeader", () => {
     expect(screen.queryByTestId("agent-model")).not.toBeInTheDocument();
   });
 
+  // Story 100.4 #2/#4: the agent's picture in the identity cell, an `<img>`
+  // (never inlined markup), with the letter back when it does not load.
+  it("draws the agent's picture in the cell and the letter when it does not load", () => {
+    const avatar = "keeper-file://p1/80-agents/tola/avatar.svg?v=0123456789ab";
+    const { container } = render(
+      <AgentRoomHeader header={header({ status: status({ handle: "tola@electra", avatar }) })} />,
+    );
+    const cell = container.querySelector('[data-slot="bot-identity"]');
+    const picture = cell?.querySelector("img");
+    expect(picture).toHaveAttribute("src", avatar);
+    expect(cell?.querySelector("svg image, foreignObject")).toBeNull();
+    expect(cell).not.toHaveTextContent("T");
+    fireEvent.error(picture as HTMLImageElement);
+    expect(cell?.querySelector("img")).toBeNull();
+    expect(cell).toHaveTextContent(/^T$/);
+  });
+
   it("says no status has arrived when the agent has sent none", () => {
     render(<AgentRoomHeader header={header({ status: null })} />);
     expect(within(region()).getByText("No status from the agent yet.")).toBeInTheDocument();

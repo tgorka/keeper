@@ -99,6 +99,11 @@ pub struct AgentCopyVm {
     /// The agent's model and level, and the bots it may run on (100.2 #4);
     /// `None` on a folder's own row.
     pub model: Option<crate::agents::model::AgentModelVm>,
+    /// Why the agent's picture is not what its home's `avatar.*` says —
+    /// a file too large, unreadable or of another format, or a publication
+    /// to its Matrix profile that failed — naming the agent (story 100.4);
+    /// `None` when nothing is wrong with it.
+    pub avatar_problem: Option<String>,
 }
 
 /// The owner, readers and `local_only` the person was shown and is pinning.

@@ -26,6 +26,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 use keeper_core::agents::agentd::DrivePin;
+use keeper_core::agents::avatar;
 use keeper_core::agents::copy::{self, AgentCopyVm};
 use keeper_core::agents::drive::DriveDecl;
 use keeper_core::agents::events::CONTROL_ROOM_TYPE;
@@ -38,7 +39,7 @@ use keeper_core::agents::matrix::{self, AgentClient, AgentMatrixError};
 use keeper_core::agents::model::{self, AgentModelLineVm, AgentModelReq};
 use keeper_core::agents::mount::pin_matches;
 use keeper_core::agents::proxy::ProxyFacts;
-use keeper_core::agents::room::ScopeDriveVm;
+use keeper_core::agents::room::{ScopeDriveVm, ZoneAgent, ZoneAvatar};
 use keeper_core::agents::run::SandboxTable;
 use keeper_core::agents::seed::AgentSeedBotVm;
 use keeper_core::agents::soul;
@@ -64,7 +65,7 @@ use crate::runtime::{
 use crate::sinks::ClientDoors;
 use crate::surface::declared;
 use crate::turn::TurnEnv;
-use crate::zone::{read_text, read_zone, AgentHome, ZoneRead};
+use crate::zone::{read_text, read_zone, AgentHome, HomeAvatar, ZoneRead};
 
 /// Why a pinnable drive hosts nothing before its first sign-in.
 pub const UNPINNED: &str =
@@ -261,6 +262,11 @@ pub type Problems = HashMap<OwnedUserId, String>;
 /// Display names by Matrix user.
 pub type Names = BTreeMap<OwnedUserId, String>;
 
+/// Each agent's failed publications of its picture as its Matrix profile
+/// avatar, by Matrix user: this Mac's own and those other hosts' manifests
+/// say (story 100.4, R399).
+pub type Pictures = HashMap<OwnedUserId, Vec<avatar::PublishFailure>>;
+
 /// The sentence for an agent whose server no signed-in account is on.
 pub fn no_homeserver(user: &UserId) -> String {
     format!(
@@ -277,7 +283,9 @@ pub fn no_homeserver(user: &UserId) -> String {
 ///
 /// Whether each copy is signed in is read from `platform`'s keychain;
 /// `names` are people's display names; `problems` what the running host
-/// found about a copy.
+/// found about a copy; `pictures` each host's failed publication of a
+/// copy's picture as its profile avatar (story 100.4, R399) — said beside
+/// what the home's own `avatar.*` files keep from being its picture.
 pub fn listing(
     facts: &DesktopFacts,
     rows: &[ProviderRow],
@@ -285,6 +293,7 @@ pub fn listing(
     platform: &dyn Platform,
     names: &Names,
     problems: &Problems,
+    pictures: &Pictures,
 ) -> Vec<AgentCopyVm> {
     let mut listed = Vec::new();
     for profile in facts.profiles.iter().filter(|p| p.agents.is_some()) {
@@ -303,6 +312,7 @@ pub fn listing(
                     pin: None,
                     problem: Some(sentence),
                     model: None,
+                    avatar_problem: None,
                 });
                 continue;
             }
@@ -338,6 +348,8 @@ pub fn listing(
             } else {
                 problems.get(user).cloned()
             };
+            let avatar_problem =
+                picture_sentence(profile, home, pictures.get(user).map(Vec::as_slice));
             listed.push(AgentCopyVm {
                 profile_id: profile.id.clone(),
                 drive: decl.id.clone(),
@@ -354,6 +366,7 @@ pub fn listing(
                     bots,
                     (!profile.direction.pushes()).then(|| model::pull_only(&decl.id)),
                 )),
+                avatar_problem,
             });
         }
     }
@@ -361,11 +374,14 @@ pub fn listing(
 }
 
 /// Every agent of a flagged folder of this principal's, by Matrix user, with
-/// its `SOUL.md` `icon` when its soul reads and names one: the agents this
-/// Mac knows, whose briefs its rooms draw as briefs (R114), and the mark
-/// each room's header draws (91.1 acceptance 6). keeper-core keeps only the
-/// marks the bot identity draws.
-pub fn zone_agents(facts: &DesktopFacts) -> BTreeMap<OwnedUserId, Option<String>> {
+/// its `SOUL.md` `icon` when its soul reads and names one, and its home's
+/// picture (story 100.4): the agents this Mac knows, whose briefs its rooms
+/// draw as briefs (R114), the mark each room's header draws (91.1
+/// acceptance 6) and the picture drawn over it. The picture is read under
+/// the sync profile's root — `keeper-file://`'s root — so the path it landed
+/// at is the one that URL serves. keeper-core keeps only the marks the bot
+/// identity draws.
+pub fn zone_agents(facts: &DesktopFacts) -> BTreeMap<OwnedUserId, ZoneAgent> {
     let mut agents = BTreeMap::new();
     for profile in facts.profiles.iter().filter(|p| p.agents.is_some()) {
         let Ok(decl) = declared(profile) else {
@@ -387,7 +403,26 @@ pub fn zone_agents(facts: &DesktopFacts) -> BTreeMap<OwnedUserId, Option<String>
                 .and_then(|text| soul::parse_soul(&text, &home.config.name).ok())
                 .map(|soul| soul.icon)
                 .filter(|icon| !icon.trim().is_empty());
-            agents.insert(home.config.matrix_user.clone(), icon);
+            let picture = profile_avatar(profile, home);
+            let avatar = picture
+                .scan
+                .avatar
+                .as_ref()
+                .zip(picture.path)
+                .map(|(file, path)| ZoneAvatar {
+                    profile: profile.id.clone(),
+                    path,
+                    hash: file.hash.clone(),
+                });
+            agents.insert(
+                home.config.matrix_user.clone(),
+                ZoneAgent {
+                    icon,
+                    avatar,
+                    problems: picture.scan.problems,
+                    not_here: picture.scan.not_here,
+                },
+            );
         }
     }
     agents
@@ -514,6 +549,44 @@ pub fn prepare_model(
             "{subpath} is inside a notes vault, which this Mac writes only from the notes view."
         )),
     }
+}
+
+/// `home`'s picture read under `profile`'s root (`keeper-file://`'s), the
+/// home named by the zone's folder and its own, its pointers' objects in
+/// the profile's own git-LFS store.
+fn profile_avatar(profile: &SyncProfile, home: &AgentHome) -> HomeAvatar {
+    let Some(zone) = profile.agents.as_ref() else {
+        return HomeAvatar::default();
+    };
+    let folder = zone.subfolder.trim().trim_matches('/');
+    crate::zone::read_avatar(
+        &profile.local_path,
+        &format!("{folder}/{}", home.config.id),
+        &crate::zone::lfs_store(&profile.local_path),
+    )
+}
+
+/// What `home`'s Settings › Agents row says of its picture: why its own
+/// `avatar.*` files are not its picture, then each host's failed
+/// publication, every sentence naming the agent; `None` when all is well.
+fn picture_sentence(
+    profile: &SyncProfile,
+    home: &AgentHome,
+    failures: Option<&[avatar::PublishFailure]>,
+) -> Option<String> {
+    let name = &home.config.name;
+    let sentences: Vec<String> = profile_avatar(profile, home)
+        .scan
+        .sentence(name)
+        .into_iter()
+        .chain(
+            failures
+                .into_iter()
+                .flatten()
+                .map(|failure| avatar::publish_failed(name, failure)),
+        )
+        .collect();
+    (!sentences.is_empty()).then(|| sentences.join(" "))
 }
 
 /// Each proxy of this principal's flagged folders, by Matrix user: its
@@ -735,6 +808,9 @@ pub struct DesktopHost {
     version: String,
     built: Option<Built>,
     problems: HashMap<OwnedUserId, String>,
+    /// Why each copy's picture could not be published as its profile
+    /// avatar (story 100.4), for the rows.
+    pictures: crate::avatar::Failures,
     /// The receiver every copy answers doorbells with.
     doorbell: Arc<Doorbell>,
     /// The doorbells' work over the app's engine, once handed over
@@ -751,6 +827,7 @@ impl DesktopHost {
             version: version.to_owned(),
             built: None,
             problems: HashMap::new(),
+            pictures: Arc::default(),
             doorbell: Arc::default(),
             engine: None,
         }
@@ -774,6 +851,37 @@ impl DesktopHost {
     /// What the running host found about each copy, for the listing.
     pub fn problems(&self) -> &HashMap<OwnedUserId, String> {
         &self.problems
+    }
+
+    /// Each failed publication of an agent's picture as its profile
+    /// avatar, for the listing's `pictures` (story 100.4, R399): this Mac's
+    /// own, and those the other live hosts' manifests said at the last
+    /// tick — agentd's on electra among them.
+    pub fn pictures(&self) -> Pictures {
+        let mut pictures = Pictures::new();
+        for (user, error) in self
+            .pictures
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+        {
+            pictures
+                .entry(user.clone())
+                .or_default()
+                .push(avatar::PublishFailure {
+                    host: None,
+                    error: error.clone(),
+                });
+        }
+        if let Some(built) = &self.built {
+            for (user, failure) in built.runtime.pictures_elsewhere() {
+                pictures
+                    .entry(user.clone())
+                    .or_default()
+                    .push(failure.clone());
+            }
+        }
+        pictures
     }
 
     /// The claims this host holds.
@@ -809,6 +917,17 @@ impl DesktopHost {
     pub async fn tick(&mut self, facts: Option<DesktopFacts>) {
         if let Some(facts) = facts {
             self.scan(facts).await;
+            // Each copy's picture becomes its profile avatar when its file
+            // changed (story 100.4), beside the tick; the draw scan says the
+            // home's file problems.
+            if let Some(built) = self.built.as_ref() {
+                crate::avatar::publish_all(
+                    &built.copies,
+                    built.runtime.picture_round().as_ref(),
+                    &self.pictures,
+                    false,
+                );
+            }
         }
         let Some(built) = self.built.as_mut() else {
             return;
@@ -1064,7 +1183,8 @@ impl DesktopHost {
             copies.clone(),
             sandbox.is_some(),
         )
-        .with_mcp(Arc::clone(&mcp));
+        .with_mcp(Arc::clone(&mcp))
+        .with_pictures(Arc::clone(&self.pictures));
         self.doorbell
             .set_principal_agents(runtime.principal_agents());
         let (stop, signal) = chat::cancellation();
@@ -1491,6 +1611,7 @@ mod tests {
             &platform(root.path()),
             &Names::new(),
             &Problems::new(),
+            &Pictures::new(),
         );
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert_eq!(rows[0].profile_id, "p1");
@@ -1540,6 +1661,7 @@ mod tests {
             &platform(root.path()),
             &Names::new(),
             &Problems::new(),
+            &Pictures::new(),
         );
         let shown = rows[0].model.clone().expect("a model");
         let current = keeper_core::agents::home::BotRef::parse(&current)
@@ -1591,6 +1713,7 @@ mod tests {
             &platform(root.path()),
             &Names::new(),
             &Problems::new(),
+            &Pictures::new(),
         );
         assert_eq!(
             pulled[0]
@@ -1689,8 +1812,15 @@ mod tests {
             ..DesktopFacts::default()
         };
         let nixi = OwnedUserId::try_from("@nixi:example.org").expect("user");
-        let nixi_with =
-            |icon: Option<&str>| BTreeMap::from([(nixi.clone(), icon.map(str::to_owned))]);
+        let nixi_with = |icon: Option<&str>| {
+            BTreeMap::from([(
+                nixi.clone(),
+                ZoneAgent {
+                    icon: icon.map(str::to_owned),
+                    ..ZoneAgent::default()
+                },
+            )])
+        };
         assert_eq!(
             zone_agents(&facts("tgorka")),
             nixi_with(None),
@@ -1706,6 +1836,164 @@ mod tests {
             nixi_with(None),
             "no icon named"
         );
+    }
+
+    /// Story 100.4 #1/#2: the home's picture, landed under the profile's
+    /// root as `keeper-file://` serves it, with its content's hash; a file
+    /// past 256 KiB or of another format is not the picture and is named.
+    #[test]
+    fn each_hosted_agent_carries_its_homes_picture_from_the_profile_root() {
+        let root = tempfile::tempdir().expect("tempdir");
+        nixi_drive(root.path());
+        let facts = DesktopFacts {
+            login: Some("tgorka".to_owned()),
+            profiles: vec![profile(root.path())],
+            ..DesktopFacts::default()
+        };
+        let nixi = OwnedUserId::try_from("@nixi:example.org").expect("user");
+        let read = || zone_agents(&facts).remove(&nixi).expect("nixi");
+        assert_eq!(read().avatar, None, "a seeded agent keeps its letter");
+
+        std::fs::write(root.path().join("80-agents/nixi/avatar.png"), PNG).expect("png");
+        write(root.path(), "80-agents/nixi/avatar.svg", "<svg/>");
+        let picture = read().avatar.expect("a picture");
+        assert_eq!(picture.profile, profile(root.path()).id);
+        assert_eq!(picture.path, "80-agents/nixi/avatar.svg");
+        let first = picture.hash;
+        write(root.path(), "80-agents/nixi/avatar.svg", "<svg></svg>");
+        assert_ne!(read().avatar.expect("a picture").hash, first);
+
+        let big = "x".repeat(256 * 1024 + 1);
+        write(root.path(), "80-agents/nixi/avatar.svg", &big);
+        write(root.path(), "80-agents/nixi/avatar.gif", "gif");
+        let agent = read();
+        assert_eq!(
+            agent.avatar.map(|picture| picture.path).as_deref(),
+            Some("80-agents/nixi/avatar.png")
+        );
+        let named: Vec<&str> = agent.problems.iter().map(|p| p.file()).collect();
+        assert_eq!(named, ["avatar.svg", "avatar.gif"]);
+    }
+
+    const PNG: &[u8] = b"\x89PNG\r\n\x1a\nnixi";
+
+    /// A git-LFS pointer as a drive's checkout holds it.
+    fn lfs_pointer(oid: &str, size: u64) -> String {
+        format!("version https://git-lfs.github.com/spec/v1\noid sha256:{oid}\nsize {size}\n")
+    }
+
+    /// R399 #6: a pointer is judged by its object — past 256 KiB by the
+    /// size it names (the next file is the picture), not on this Mac (the
+    /// letter), or in the drive's own store (the object's bytes are the
+    /// picture, at the pointer's path).
+    #[test]
+    fn a_pointers_object_decides_whether_it_is_the_picture() {
+        let root = tempfile::tempdir().expect("tempdir");
+        nixi_drive(root.path());
+        let facts = DesktopFacts {
+            login: Some("tgorka".to_owned()),
+            profiles: vec![profile(root.path())],
+            ..DesktopFacts::default()
+        };
+        let nixi = OwnedUserId::try_from("@nixi:example.org").expect("user");
+        let read = || zone_agents(&facts).remove(&nixi).expect("nixi");
+        std::fs::write(root.path().join("80-agents/nixi/avatar.png"), PNG).expect("png");
+
+        let large = 300 * 1024;
+        write(
+            root.path(),
+            "80-agents/nixi/avatar.svg",
+            &lfs_pointer(&"a".repeat(64), large),
+        );
+        let agent = read();
+        assert_eq!(
+            agent.avatar.map(|picture| picture.path).as_deref(),
+            Some("80-agents/nixi/avatar.png")
+        );
+        assert_eq!(
+            agent.problems,
+            [keeper_core::agents::avatar::AvatarProblem::TooLarge {
+                file: "avatar.svg".to_owned(),
+                bytes: large,
+            }]
+        );
+
+        let svg = b"<svg xmlns=\"http://www.w3.org/2000/svg\"/>";
+        let (oid, size) = keeper_sync::lfs::store::LfsStore::digest_of(&svg[..]).expect("digest");
+        write(
+            root.path(),
+            "80-agents/nixi/avatar.svg",
+            &lfs_pointer(&oid, size),
+        );
+        let agent = read();
+        assert_eq!(
+            agent.avatar, None,
+            "the letter, while the object is not here"
+        );
+        assert!(agent.problems.is_empty(), "{:?}", agent.problems);
+        assert!(agent.not_here);
+        // R100A2-05: the letter even where the room holds a profile avatar
+        // for the agent, which may be an older picture.
+        let icons = keeper_core::agents::room::AgentIcons::default();
+        icons.replace(zone_agents(&facts));
+        let room = matrix_sdk::ruma::RoomId::parse("!r:example.org").expect("room");
+        assert_eq!(
+            keeper_core::agents::room::agent_picture(&icons, "acct", &room, &nixi, Some("v1")),
+            None
+        );
+
+        let object = crate::zone::lfs_store(root.path()).object_path(&oid);
+        std::fs::create_dir_all(object.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&object, svg).expect("object");
+        icons.replace(zone_agents(&facts));
+        assert!(
+            keeper_core::agents::room::agent_picture(&icons, "acct", &room, &nixi, Some("v1"))
+                .is_some_and(|url| keeper_core::file_asset::parse_file_url(&url).is_some()),
+            "the object, once here, is the picture"
+        );
+        let picture = read().avatar.expect("the object is the picture");
+        assert_eq!(picture.path, "80-agents/nixi/avatar.svg");
+        assert_eq!(picture.hash, oid);
+    }
+
+    /// R399 #5: another host's failed publication of an agent's picture is
+    /// said in that agent's Settings › Agents row, naming the host, and the
+    /// row says nothing once it recovered.
+    #[test]
+    fn a_failed_publication_on_another_host_is_said_in_the_agents_row() {
+        let root = tempfile::tempdir().expect("tempdir");
+        nixi_drive(root.path());
+        let facts = DesktopFacts {
+            login: Some("tgorka".to_owned()),
+            device: Some("hesperia".to_owned()),
+            profiles: vec![profile(root.path())],
+            ..DesktopFacts::default()
+        };
+        let nixi = OwnedUserId::try_from("@nixi:example.org").expect("user");
+        let row = |pictures: &Pictures| {
+            listing(
+                &facts,
+                &[],
+                Ok(&[]),
+                &platform(root.path()),
+                &Names::new(),
+                &Problems::new(),
+                pictures,
+            )
+            .into_iter()
+            .find(|row| row.matrix_user == nixi.as_str())
+            .expect("nixi's row")
+        };
+        assert_eq!(row(&Pictures::new()).avatar_problem, None);
+        let failed = Pictures::from([(
+            nixi.clone(),
+            vec![avatar::PublishFailure {
+                host: Some("electra".to_owned()),
+                error: "the upload failed".to_owned(),
+            }],
+        )]);
+        let said = row(&failed).avatar_problem.expect("the row says it");
+        assert!(said.contains("electra"), "{said}");
     }
 
     /// A first sign-in that fails after its store was created must not

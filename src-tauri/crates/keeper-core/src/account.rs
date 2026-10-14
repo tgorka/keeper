@@ -1012,6 +1012,7 @@ impl AccountManager {
         // per-row SQLite open happens on the inbox hot path.
         let notify = self.notify.clone();
         let kinds = self.agent_kinds.clone();
+        let icons = self.agent_icons.clone();
         let span = tracing::info_span!("room_list_producer", account_id = %account_id);
         let reaper_subs = subs_arc.clone();
         let task = tokio::spawn(
@@ -1019,7 +1020,7 @@ impl AccountManager {
                 // `client` is captured to keep the account alive for the task's
                 // lifetime; the producer reads from the room list only.
                 let _keep_alive = client;
-                run_producer(room_list, sink, &account_id_owned, &notify, &kinds).await;
+                run_producer(room_list, sink, &account_id_owned, &notify, &kinds, &icons).await;
                 // A naturally-completed producer reaps its own subscription entry.
                 reaper_subs.lock().await.remove(&subscription_id);
             }
@@ -1165,6 +1166,7 @@ impl AccountManager {
             let notify_for_task = self.notify.clone();
             let kinds_for_task = self.agent_kinds.clone();
             let ready_for_task = self.launch_ready.clone();
+            let icons_for_task = self.agent_icons.clone();
             let task = tokio::spawn(
                 async move {
                     run_inbox_producer(
@@ -1174,6 +1176,7 @@ impl AccountManager {
                         &notify_for_task,
                         &kinds_for_task,
                         &ready_for_task,
+                        &icons_for_task,
                     )
                     .await;
                 }
@@ -5452,6 +5455,31 @@ impl AccountManager {
         Ok(bytes)
     }
 
+    /// The bytes behind an agent-avatar `keeper-media://` URL (story 100.4):
+    /// `user`'s profile avatar as `room_id` of `account_id` holds it, the
+    /// original ([`media::fetch_agent_avatar`]). Any account, room or member
+    /// it cannot resolve is [`MediaError::NotFound`].
+    pub async fn fetch_agent_avatar(
+        &self,
+        account_id: &str,
+        room_id: &str,
+        user_id: &str,
+    ) -> Result<MediaBytes, CoreError> {
+        let room_id: OwnedRoomId = RoomId::parse(room_id).map_err(|_| MediaError::NotFound)?;
+        let user_id =
+            matrix_sdk::ruma::OwnedUserId::try_from(user_id).map_err(|_| MediaError::NotFound)?;
+        let client = {
+            let accounts = self.accounts.lock().await;
+            accounts
+                .get(account_id)
+                .ok_or(MediaError::NotFound)?
+                .client
+                .clone()
+        };
+        let room = client.get_room(&room_id).ok_or(MediaError::NotFound)?;
+        Ok(media::fetch_agent_avatar(&client, &room, &user_id).await?)
+    }
+
     /// Resolve the exact open `Arc<Timeline>` for `room_id` on the live account,
     /// or a typed [`SendError::NoOpenTimeline`] if the account isn't live or no
     /// timeline for the room is subscribed.
@@ -6838,6 +6866,7 @@ async fn run_producer(
     account_id: &str,
     notify: &NotifyConfig,
     kinds: &AgentKinds,
+    icons: &AgentIcons,
 ) {
     let mut loading_state = room_list.loading_state();
     let (stream, controller) = room_list.entries_with_dynamic_adapters(ROOM_LIST_PAGE_SIZE);
@@ -6862,7 +6891,7 @@ async fn run_producer(
                     Some(diffs) => {
                         let mut ops = Vec::with_capacity(diffs.len());
                         for diff in diffs {
-                            ops.push(diff_to_op(diff, notify, kinds).await);
+                            ops.push(diff_to_op(diff, account_id, notify, kinds, icons).await);
                         }
                         if !(sink)(RoomListBatch { ops, total }) {
                             tracing::info!(account_id = %account_id, "room list channel closed, stopping producer");
@@ -6898,6 +6927,7 @@ async fn run_inbox_producer(
     notify: &NotifyConfig,
     kinds: &AgentKinds,
     launch_ready: &LaunchReadiness,
+    icons: &AgentIcons,
 ) {
     let mut loading_state = room_list.loading_state();
     let (stream, controller) = room_list.entries_with_dynamic_adapters(ROOM_LIST_PAGE_SIZE);
@@ -6914,6 +6944,13 @@ async fn run_inbox_producer(
         launch_ready.loaded(account_id);
     }
     let mut loading_done = false;
+    // The rows as the stream left them, so a change of the agents' pictures
+    // on this device (story 100.4) redraws the agent rooms' rows at once
+    // rather than at each room's next change.
+    let mut rows: matrix_sdk_ui::eyeball_im::Vector<RoomListItem> =
+        matrix_sdk_ui::eyeball_im::Vector::new();
+    let mut pictures = icons.subscribe();
+    let mut pictures_open = true;
 
     futures_util::pin_mut!(stream);
     loop {
@@ -6923,7 +6960,8 @@ async fn run_inbox_producer(
                     Some(diffs) => {
                         let mut ops = Vec::with_capacity(diffs.len());
                         for diff in diffs {
-                            ops.push(diff_to_op(diff, notify, kinds).await);
+                            diff.clone().apply(&mut rows);
+                            ops.push(diff_to_op(diff, account_id, notify, kinds, icons).await);
                         }
                         if !merger.apply_account_batch(account_id, RoomListBatch { ops, total }).await {
                             tracing::info!(account_id = %account_id, "inbox channel closed, stopping producer");
@@ -6934,6 +6972,28 @@ async fn run_inbox_producer(
                         tracing::info!(account_id = %account_id, "inbox room list stream ended");
                         break;
                     }
+                }
+            }
+            changed = pictures.changed(), if pictures_open => {
+                if changed.is_err() {
+                    pictures_open = false;
+                    continue;
+                }
+                let mut ops = Vec::new();
+                for (index, item) in rows.iter().enumerate() {
+                    if agent_room::AgentRoomKind::of(item.room_type().as_ref()).is_none() {
+                        continue;
+                    }
+                    ops.push(RoomListOp::Set {
+                        index: index as u32,
+                        room: room_item_to_vm(item, account_id, notify, kinds, icons).await,
+                    });
+                }
+                if !ops.is_empty()
+                    && !merger.apply_account_batch(account_id, RoomListBatch { ops, total }).await
+                {
+                    tracing::info!(account_id = %account_id, "inbox channel closed, stopping producer");
+                    break;
                 }
             }
             maybe_state = loading_state.next(), if !loading_done => {
@@ -7164,10 +7224,12 @@ fn loaded_total(state: &RoomListLoadingState) -> Option<u32> {
 /// [`vector_diff_to_op`] seam.
 async fn diff_to_op(
     diff: VectorDiff<RoomListItem>,
+    account_id: &str,
     notify: &NotifyConfig,
     kinds: &AgentKinds,
+    icons: &AgentIcons,
 ) -> RoomListOp {
-    let mapped = map_vector_diff(diff, notify, kinds).await;
+    let mapped = map_vector_diff(diff, account_id, notify, kinds, icons).await;
     vector_diff_to_op(mapped)
 }
 
@@ -7180,40 +7242,42 @@ async fn diff_to_op(
 /// `kinds` holds the agent rooms' session kinds read so far (UX-DR132).
 async fn map_vector_diff(
     diff: VectorDiff<RoomListItem>,
+    account_id: &str,
     notify: &NotifyConfig,
     kinds: &AgentKinds,
+    icons: &AgentIcons,
 ) -> VectorDiff<RoomVm> {
     match diff {
         VectorDiff::Append { values } => {
             let mut vms = Vec::with_capacity(values.len());
             for item in values {
-                vms.push(room_item_to_vm(&item, notify, kinds).await);
+                vms.push(room_item_to_vm(&item, account_id, notify, kinds, icons).await);
             }
             VectorDiff::Append { values: vms.into() }
         }
         VectorDiff::Clear => VectorDiff::Clear,
         VectorDiff::PushFront { value } => VectorDiff::PushFront {
-            value: room_item_to_vm(&value, notify, kinds).await,
+            value: room_item_to_vm(&value, account_id, notify, kinds, icons).await,
         },
         VectorDiff::PushBack { value } => VectorDiff::PushBack {
-            value: room_item_to_vm(&value, notify, kinds).await,
+            value: room_item_to_vm(&value, account_id, notify, kinds, icons).await,
         },
         VectorDiff::PopFront => VectorDiff::PopFront,
         VectorDiff::PopBack => VectorDiff::PopBack,
         VectorDiff::Insert { index, value } => VectorDiff::Insert {
             index,
-            value: room_item_to_vm(&value, notify, kinds).await,
+            value: room_item_to_vm(&value, account_id, notify, kinds, icons).await,
         },
         VectorDiff::Set { index, value } => VectorDiff::Set {
             index,
-            value: room_item_to_vm(&value, notify, kinds).await,
+            value: room_item_to_vm(&value, account_id, notify, kinds, icons).await,
         },
         VectorDiff::Remove { index } => VectorDiff::Remove { index },
         VectorDiff::Truncate { length } => VectorDiff::Truncate { length },
         VectorDiff::Reset { values } => {
             let mut vms = Vec::with_capacity(values.len());
             for item in values {
-                vms.push(room_item_to_vm(&item, notify, kinds).await);
+                vms.push(room_item_to_vm(&item, account_id, notify, kinds, icons).await);
             }
             VectorDiff::Reset { values: vms.into() }
         }
@@ -7281,7 +7345,13 @@ async fn resolve_mute_state(
 
 /// Resolve a [`RoomListItem`] to a non-secret [`RoomVm`]: display name plus a
 /// latest-event text preview and timestamp.
-async fn room_item_to_vm(item: &RoomListItem, notify: &NotifyConfig, kinds: &AgentKinds) -> RoomVm {
+async fn room_item_to_vm(
+    item: &RoomListItem,
+    account_id: &str,
+    notify: &NotifyConfig,
+    kinds: &AgentKinds,
+    icons: &AgentIcons,
+) -> RoomVm {
     let room_id = item.room_id().to_string();
     let resolved = item.display_name().await;
     if resolved.is_err() {
@@ -7339,6 +7409,11 @@ async fn room_item_to_vm(item: &RoomListItem, notify: &NotifyConfig, kinds: &Age
     // An agent room from its cached create type; a session room's proxy-or-watched
     // from its status's session kind, never guessed (UX-DR132).
     let agent_room = agent_room::room_kind_vm(item, kinds).await;
+    // The agent's picture on its row, in the Agents window (story 100.4).
+    let agent_avatar = match agent_room {
+        Some(agent_room::AgentRoomKindVm::Control) | None => None,
+        Some(_) => agent_room::row_picture(item, kinds, icons, account_id).await,
+    };
 
     RoomVm {
         room_id,
@@ -7355,6 +7430,7 @@ async fn room_item_to_vm(item: &RoomListItem, notify: &NotifyConfig, kinds: &Age
         network_id,
         mute_state,
         agent_room,
+        agent_avatar,
     }
 }
 
@@ -8941,6 +9017,7 @@ mod tests {
             network_id: None,
             mute_state: MuteState::None,
             agent_room: None,
+            agent_avatar: None,
         }
     }
 

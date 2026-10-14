@@ -182,6 +182,10 @@ import { platformStore } from "@/lib/stores/platform";
 // docs rather than holding a third copy.
 import ANDROID_DOC from "../docs/android.md?raw";
 import IOS_DOC from "../docs/ios.md?raw";
+// Nixi's picture (story 100.4): an SVG from her home, served by Vite here as
+// keeper-file:// serves it in the app — an `<img>` source, never inlined. The
+// other agents have none and keep their letter.
+import NIXI_AVATAR from "./agent-avatar-nixi.svg?url";
 import {
   MEDIA_BLOCK_FRONTMATTER,
   MEDIA_BLOCK_NOTES,
@@ -5654,6 +5658,11 @@ function agentRow(agent: string, name: string): AgentCopyVm {
     pin,
     problem: agentsParam === "differs" ? "tgdrive's agents zone hosts nothing here." : null,
     model: agentModel(agent, pin.localOnly),
+    // Story 100.4: Tara's home holds a picture keeper does not read.
+    avatarProblem:
+      agent === "tara"
+        ? "Tara's avatar.gif is not a picture keeper reads; name it avatar.svg, avatar.png, avatar.webp, or avatar.jpg."
+        : null,
   };
 }
 /** The header's model line for `agent`'s row (100.2 #7). */
@@ -5693,6 +5702,7 @@ const BROKEN_FOLDER: AgentCopyVm = {
   pin: null,
   problem: "`local_only` in _drive.toml must be true or false, not text.",
   model: null,
+  avatarProblem: null,
 };
 let agentRows: AgentCopyVm[] =
   agentsParam === "none"
@@ -6132,6 +6142,7 @@ function inboxRow(
   lastMessage: string,
   minutesAgo: number,
   agentRoom?: InboxRoomVm["agentRoom"],
+  agentAvatar?: string,
 ): InboxRoomVm {
   return {
     accountId: MOCK_ACCOUNT_ID,
@@ -6150,12 +6161,20 @@ function inboxRow(
     networkId: null,
     muteState: "none",
     ...(agentRoom ? { agentRoom } : {}),
+    ...(agentAvatar ? { agentAvatar } : {}),
   };
 }
 
 const AGENT_ROOM_ROWS: InboxRoomVm[] = [
-  inboxRow("!nixi-dm:example.org", "Nixi", "…", 1, "proxy"),
-  inboxRow("!nixi-reading:example.org", "Nixi — reading list", "Three left.", 40, "proxy"),
+  inboxRow("!nixi-dm:example.org", "Nixi", "…", 1, "proxy", NIXI_AVATAR),
+  inboxRow(
+    "!nixi-reading:example.org",
+    "Nixi — reading list",
+    "Three left.",
+    40,
+    "proxy",
+    NIXI_AVATAR,
+  ),
   inboxRow(
     "!tola-review:example.org",
     "Dr Tola Grey — review",
@@ -6226,9 +6245,11 @@ function nixiHeader(run: "running" | "done", caretKey: string | null): AgentRoom
       agent: NIXI,
       agentName: "Nixi",
       handle: "nixi@electra",
-      // Nixi's zone is on this (desktop) device: her soul's mark. The other
-      // rooms carry none, as on the phone, and draw the handle's first letter.
+      // Nixi's zone is on this (desktop) device: her soul's mark, and her
+      // home's picture drawn over it (story 100.4). The other rooms carry
+      // none, as on the phone, and draw the handle's first letter.
       icon: "N",
+      avatar: NIXI_AVATAR,
       host: "electra",
       title: "Nixi",
       kind: "main",
@@ -6271,6 +6292,7 @@ const AGENT_ROOM_TIMELINES: Record<
         agent: NIXI,
         agentName: "Nixi",
         handle: "nixi@hesperia",
+        avatar: NIXI_AVATAR,
         host: "hesperia",
         title: "Reading list",
         kind: "conversation",

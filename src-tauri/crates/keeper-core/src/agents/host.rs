@@ -8,6 +8,8 @@
 //! event is not encrypted, so the manifest names no provider's address: a
 //! bot is its [`bot_id`], a digest of its reference (S-33).
 
+use std::collections::BTreeMap;
+
 use chrono::DateTime;
 use matrix_sdk::ruma::{OwnedUserId, UserId};
 use serde::{Deserialize, Serialize};
@@ -41,6 +43,13 @@ pub struct HostManifest {
     pub agents: Vec<String>,
     pub renewed_at: String,
     pub expires_at: String,
+    /// Why this host could not set an agent's picture as the agent's
+    /// Matrix profile avatar, by the agent's Matrix user: the failure's
+    /// clause, which every device of the principal says in that agent's
+    /// Settings › Agents row naming this host (story 100.4, R399). Absent
+    /// when nothing failed; a build that does not read it ignores it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub picture_failures: BTreeMap<String, String>,
 }
 
 /// A drive as one host has it.
@@ -176,6 +185,7 @@ mod tests {
             agents: vec!["tgdrive/nixi".to_owned()],
             renewed_at: "2026-10-03T12:00:00Z".to_owned(),
             expires_at: "2026-10-03T12:03:00Z".to_owned(),
+            picture_failures: Default::default(),
         }
     }
 

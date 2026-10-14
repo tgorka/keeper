@@ -74,6 +74,9 @@ struct Runtime {
     ticks: AtomicU64,
     /// What the running host last found about each copy, for the rows.
     problems: Mutex<desktop::Problems>,
+    /// Each failed publication of a copy's picture as its profile avatar —
+    /// this Mac's and the other hosts' (R399) — for the rows (story 100.4).
+    pictures: Mutex<desktop::Pictures>,
     /// The running host's MCP servers and its sandbox's line, each with the
     /// revision of the tables it was built on, for Settings › Agents;
     /// `None` while this Mac hosts nothing.
@@ -198,6 +201,10 @@ pub fn tick(app: &tauri::AppHandle) {
                     .problems
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner) = host.problems().clone();
+                *RUNTIME
+                    .pictures
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = host.pictures();
                 *RUNTIME.mcp.lock().unwrap_or_else(PoisonError::into_inner) = host.mcp();
                 *RUNTIME
                     .sandbox
@@ -326,10 +333,16 @@ async fn rows(state: &AppState, facts: DesktopFacts) -> Result<Vec<AgentCopyVm>,
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .clone();
+    let pictures = RUNTIME
+        .pictures
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
     let (listed, provider_rows, bots) = {
         let platform = Arc::clone(&platform);
         let facts = facts.clone();
         let problems = problems.clone();
+        let pictures = pictures.clone();
         tokio::task::spawn_blocking(move || {
             let rows = store::list_providers(&dir)
                 .map(|l| l.rows)
@@ -342,6 +355,7 @@ async fn rows(state: &AppState, facts: DesktopFacts) -> Result<Vec<AgentCopyVm>,
                 platform.as_ref(),
                 &desktop::Names::new(),
                 &problems,
+                &pictures,
             );
             (listed, rows, bots)
         })
@@ -363,6 +377,7 @@ async fn rows(state: &AppState, facts: DesktopFacts) -> Result<Vec<AgentCopyVm>,
         platform.as_ref(),
         &names,
         &problems,
+        &pictures,
     ))
 }
 

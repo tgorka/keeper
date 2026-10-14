@@ -10704,3 +10704,73 @@ location: `keeper_core::agents::launch::choose`, `AccountManager::agents_launch_
 reason: The launch asks once, after the Agents window's first batch. On a device whose event cache holds no status for the default agent's DM yet (a fresh sign-in, a cleared cache), `proxy_rooms` does not list the DM, so Agents opens with nothing selected and the notice says the agent has no conversation here, although the room appears seconds later. The steady state (a restored session, cache warm) is unaffected. A fix would let the boot effect ask again once when the answer's reason is "no conversation" and the Agents window grows, still never over the person's navigation.
 status: done 2026-10-14
 resolution: closed by rung `agents-100-launch`'s fix round 1 (R397, R100L1-01): readiness is Rust's. `AccountManager::agents_launch` answers through `keeper_core::agents::launch::resolve` only once every signed-in account's room list has finished its first sync since launch (`LaunchReadiness`, fed by each inbox producer's `RoomListLoadingState::Loaded`, an account that cannot start or signs out no longer waited for) or as soon as the default agent's `main` room is here, re-reading the rooms every `LAUNCH_RECHECK_MS` (a status can become readable without a sync finishing), and never later than `LAUNCH_READY_MS` (15 s), when a still-missing room's reason says the conversation "has not arrived yet". The front asks once after hydration and no longer treats the Agents window's first batch as a barrier. Tests: `agents::launch::tests::{the_default_agents_room_arriving_late_within_the_bound_opens_it, a_room_that_never_arrives_answers_at_the_bound_saying_it_has_not_arrived, a_second_account_slow_to_sync_is_waited_for, readiness_waits_for_every_started_account_and_not_for_one_that_could_not_start}`. Completed by fix round 2 (R409, R100L2-01/-02): the 15 s bound now covers looking at the rooms too (`resolve` runs every look under one `tokio::time::timeout`; at the bound it answers from the last look that finished, starting none), and readiness certifies only a look that began and ended under the same ready generation (`LaunchReadiness::ready() -> Option<u64>`), so a look begun before the last account was ready is repeated. Tests: `agents::launch::tests::a_first_look_that_never_comes_back_is_answered_at_the_bound`, `a_later_look_that_never_comes_back_is_answered_at_the_bound_from_the_last_that_did`, `an_account_ready_while_an_older_look_ran_is_looked_at_again`.
+
+### DW-1420: The approval card, the sessions board and a gate's delegate lines draw no agent mark, so they draw no agent picture either.
+
+origin: story 100.4 #2 (rung `agents-100-avatar`, 2026-10-14): every call site of the agent's mark was listed; the mark is drawn only by `BotIdentityCell` in `agent-room-header.tsx` (the chat and the notes dock's `ConversationBody`), and the Agents window's rows draw `RoomAvatar`
+location: `src/components/agents/approval-card.tsx`, `src/components/sessions/session-board.tsx`, `src/components/chat/gate-line.tsx`
+reason: those surfaces name an agent in words and carry no identity cell today; the brief's list assumed one. Giving them the agent's picture is a design decision (which cell, where, at what size) and needs the agent's user on their view models (`ApprovalCardVm`, the board's cards, `GateLineVm`); `AgentStatusVm.avatar`'s rule (`agents::room::agent_picture`) is the one to reuse.
+status: open
+
+### DW-1421: Removing an agent's `avatar.*` leaves its Matrix profile avatar as it was.
+
+origin: story 100.4 #3 (rung `agents-100-avatar`, 2026-10-14)
+location: `keeper_agent::avatar::publish_all`, `keeper_core::agents::avatar::publish`
+reason: a host publishes when the file's hash changes and records `dev.keeper.agent.avatar` {hash, mxc}; a home with no picture publishes nothing, because a file missing for a moment (a sync mid-way, a pointer not hydrated) must not clear what every device draws. Clearing on a deliberate removal would need the record to say the profile avatar is keeper's own (it does: the recorded `mxc` equals the profile's) and a removal seen on two scans; until then a person clears it from another client.
+status: open
+
+### DW-1422: agentd's failed picture upload reaches `status.json` and its journal, not the person's Settings › Agents row.
+
+origin: story 100.4 #5, R381 (rung `agents-100-avatar`, 2026-10-14)
+location: `keeper_agent::runtime::StatusFile` (`picture` beside each copy), `keeper_agent::desktop::listing`
+reason: on the desktop the sentence is under the agent's row (`AgentCopyVm.avatar_problem`); on an agentd host the person looking is the operator (`keeper-agentd status`, `journalctl`), and keeper on the Mac has no channel from agentd's status file. Carrying it to the Mac would be a field on the host manifest the Mac already reads in the control room.
+status: closed (R399 #5, fix round 1 of rung `agents-100-avatar`, 2026-10-14): every host carries its failed publications in its manifest (`HostManifest::picture_failures`, the failure's clause by agent), republished as soon as they change; a Mac's runtime keeps each other live host's (`HostRuntime::pictures_elsewhere`) and `DesktopHost::pictures` merges them into the row's sentence naming the host (`avatar::publish_failed`), gone once the manifest no longer says it. Tests: `hosts::tests::another_live_hosts_failed_picture_is_kept_for_the_rows`, `desktop::tests::a_failed_publication_on_another_host_is_said_in_the_agents_row`. A Mac that hosts no copy reads no manifest (DW-1426).
+
+### DW-1423: The per-account room list (`run_producer`) does not redraw an agent room's row when a picture changes; the merged inbox does.
+
+origin: story 100.4 #2 (rung `agents-100-avatar`, 2026-10-14)
+location: `keeper_core::account::run_producer`
+reason: the Agents window is fed by the merged inbox (`run_inbox_producer`), which keeps the rows it was handed and sends a `Set` for each agent room when `AgentIcons` changes. `run_producer` (the single-account `subscribe_room_list` stream) computes the picture per diff but keeps no rows, so a changed file shows there at the room's next change. No surface draws agent rows from it today.
+status: open
+
+### DW-1424: A publication whose upload and profile succeeded but whose record write failed uploads the same bytes again at its retry.
+
+origin: review-100avatar-1's additional candidate, R399 fix round 1 (rung `agents-100-avatar`, 2026-10-14)
+location: `keeper_core::agents::avatar::publish`, `keeper_agent::avatar::publish_held`
+reason: after R399 #3 a failure leaves nothing settled, and the retry reads the record (old hash) and the profile (the new `mxc`), so it uploads the file again and the first upload's media object stays unreferenced on the homeserver. Keeping the pending `{hash, mxc}` in the host's memory (or reading the profile's `mxc` back against the file) would let the retry resume at the record. Correct either way; costs one extra upload per such failure.
+status: open
+
+### DW-1425: `BotIdentityCell` hides the agent's mark as soon as a picture URL exists, before the image has loaded.
+
+origin: review-100avatar-1's additional candidate (rung `agents-100-avatar`, 2026-10-14)
+location: `src/components/bots/bot-identity.tsx`
+reason: the mark returns when the image fails (`onError`), but while it loads the cell is empty rather than showing the mark, as docs/agents.md says. Keeping the mark under the image until `onLoad` is a front-end change with its own browser proof.
+status: open
+
+### DW-1426: A Mac that hosts no copy of the principal's agents does not say another host's failed picture publication in Settings › Agents.
+
+origin: R399 #5 (rung `agents-100-avatar`, fix round 1, 2026-10-14)
+location: `keeper_agent::desktop::DesktopHost::pictures`, `keeper_agent::hosts::HostRuntime::pictures_elsewhere`
+reason: the other hosts' manifests are read by the Mac's host runtime, which exists only while the Mac hosts a copy (an agent signed in here); a Mac with every agent signed out lists the rows but reads no control room. Reading the manifests through the person's own account, which is a member of the control room, would cover it.
+status: open
+
+### DW-1427: The picture lease is taken but not kept through a publication.
+
+origin: review-100avatar-2 R100A2-01 (lane 100stack, 2026-10-15)
+location: `keeper_agent::avatar` (`publish_held`: acquire → publish → release), `keeper_core::agents::avatar::publish` (upload, profile, record), `keeper_core::agents::claim` (renew 60 s, stop at 120 s, takeover at 180 s)
+reason: nothing renews or checks the claim while the upload, the profile change and the record run, and the SDK gives `upload(…, None)` at least five minutes. A slow upload or a Mac that sleeps can outlive the claim; another host takes it and publishes, and the old task then sets the profile and the record without holding it. Fix: keep the lease alive while publishing, check ownership before each later effect (profile, record), bound the requests and stop when a renewal fails; test a delayed upload → expiry/takeover → the old upload completing.
+status: open
+
+### DW-1428: A host whose picture is settled never notices another host's newer publication.
+
+origin: review-100avatar-2 R100A2-02 (lane 100stack, 2026-10-15)
+location: `keeper_core::agents::avatar` (the settled-hash memo), `keeper_agent::avatar` (`publish_held` skips the server read for a settled hash)
+reason: host A publishes revision A and settles; host B, still on an older revision B, later takes the free claim and publishes B. A's unchanged file never triggers another read, so the profile stays B while A's memo says A is published. Fix: invalidate or reconcile the settled state when another host's publication or ownership changes, with a publication authority or revision rule so two disagreeing copies do not oscillate, and keep the no-upload-per-tick rule; test two hosts publishing different hashes in turn. The existing two-host test uses one file for both.
+status: open
+
+### DW-1429: A drive checked out as a linked git worktree reads its pictures' LFS objects from the wrong place.
+
+origin: review-100avatar-2 R100A2-04 (lane 100stack, 2026-10-15)
+location: `keeper_agent::zone::lfs_store` (`LfsStore::in_git_dir(drive_root.join(".git"))`), `keeper_sync::lfs::store::LfsStore::in_git_dir` (wants the common git directory)
+reason: in a linked worktree `.git` is a file, not a directory, so the store path does not exist, `contains` reads false and a pointer whose object is in the common repository's store is `NotHere`: the agent draws the letter (R414) and nothing is published until the file is materialised another way. Fix: resolve the repository's common git directory through keeper-sync's git integration rather than assuming `<root>/.git`; test a real linked worktree with a present, below-bound object, keeping the absent-object behaviour.
+status: open
