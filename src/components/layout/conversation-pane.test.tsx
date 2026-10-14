@@ -1559,17 +1559,19 @@ describe("ConversationPane — receipts, typing, pagination (Story 3.9)", () => 
     );
     roomsStore.getState().selectRoom({ accountId: account.accountId, roomId: "!room:example.org" });
     const utils = render(<ConversationPane {...noopProps()} />);
-    // The subscribe effects run after mount; wait for all three sinks to be armed.
+    // The subscribe effects run after mount; wait for the timeline and typing sinks.
+    // The pagination status is subscribed once the timeline's first batch arrives
+    // (Rust refuses it for a room whose timeline is not open yet).
     await waitFor(() => {
       expect(captured.timeline).not.toBeNull();
       expect(captured.typing).not.toBeNull();
-      expect(captured.pagination).not.toBeNull();
     });
     return { captured, ...utils };
   }
 
   it("subscribes to typing + pagination status and marks the room read on view", async () => {
-    await renderOpen();
+    const { captured } = await renderOpen();
+    captured.timeline?.({ ops: [{ op: "reset", items: [] }] });
     await waitFor(() => {
       expect(subscribeTyping).toHaveBeenCalledWith(
         account.accountId,
@@ -1642,6 +1644,18 @@ describe("ConversationPane — receipts, typing, pagination (Story 3.9)", () => 
   // An agent's room after a limited sync: the SDK resets the timeline to the
   // gap and nothing renders, so there is no top to scroll near. The window
   // fills itself instead of reading "No messages yet." over a real history.
+  // Rust resolves the status from the room's open timeline and refuses a room
+  // whose timeline is not open yet; asked beside the timeline, an agent's room
+  // lost that race and never learned its status (no self-fill on hesperia).
+  it("subscribes to the pagination status only once the timeline's first batch arrived", async () => {
+    const { captured } = await renderOpen();
+    expect(subscribePaginationStatus).not.toHaveBeenCalled();
+    captured.timeline?.({
+      ops: [{ op: "reset", items: [messageItem("k1", "@bob:example.org", "hi")] }],
+    });
+    await waitFor(() => expect(subscribePaginationStatus).toHaveBeenCalledTimes(1));
+  });
+
   it("back-paginates on its own when the window shows nothing and the start is not reached", async () => {
     const { captured } = await renderOpen();
     captured.timeline?.({ ops: [{ op: "reset", items: [{ kind: "other", key: "o1" }] }] });
