@@ -375,6 +375,7 @@ fn set_up_agents_refuses_what_would_host_nothing() {
             .into_iter()
             .collect(),
         local_only: false,
+        materialize: Default::default(),
     };
     let refused =
         desktop_choices(&profiles, Some(&pin), login, &req(&[TGORKA, MARTA])).expect_err("pin");
@@ -407,6 +408,7 @@ fn local_pin() -> DrivePin {
         owner: user(TGORKA),
         readers: [user(TGORKA)].into_iter().collect(),
         local_only: true,
+        materialize: Default::default(),
     }
 }
 

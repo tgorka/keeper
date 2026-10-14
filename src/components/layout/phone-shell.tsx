@@ -947,7 +947,7 @@ export function PhoneShell() {
         onFocusCapture={captureFocusFor(0)}
         className={
           split
-            ? "relative min-h-0 w-[var(--tablet-list)] shrink-0 border-border border-r"
+            ? "relative min-h-0 w-[var(--tablet-list)] shrink-0 border-border border-r last:border-r-0"
             : "min-h-0 min-w-0 flex-1"
         }
       >

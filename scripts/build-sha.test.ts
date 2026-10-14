@@ -16,9 +16,18 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 const LIB = join(process.cwd(), "scripts/lib/build-sha.sh");
 const STAMP = "src-tauri/crates/keeper/build-sha.txt";
 
-/** `git` without the developer's own config: no signing, no hooks, no templates. */
+/**
+ * `git` without the developer's own config: no signing, no hooks, no templates.
+ *
+ * And without the caller's `GIT_*`: lefthook runs this suite from pre-push,
+ * where git exports `GIT_DIR`, and a fixture's `git init` then re-initialises
+ * the real repository instead of the temp directory — setting `core.bare=true`
+ * on the developer's checkout, which stops every git command in it.
+ */
 const GIT_ENV: Record<string, string> = {
-  ...(process.env as Record<string, string>),
+  ...(Object.fromEntries(
+    Object.entries(process.env).filter(([name]) => !name.startsWith("GIT_")),
+  ) as Record<string, string>),
   GIT_CONFIG_GLOBAL: "/dev/null",
   GIT_CONFIG_SYSTEM: "/dev/null",
   GIT_CONFIG_NOSYSTEM: "1",

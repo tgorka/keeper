@@ -221,21 +221,25 @@ serves her.
 ### The operator's steps
 
 0. Record the provider (§ *The provider*), committed, before any seeding.
-1. Create the agents' users on the homeserver (90.5's procedure), then on electra
-   `sudo -u agentd-tgorka keeper-agentd login tgdrive/nixi`, `… login tgdrive/tola-grey`, and
-   `sudo -u agentd-neuraffica keeper-agentd login neuradrive/lucyna-novak`. The `--owner` and
-   `--reader` flags are each `agentd.toml`'s pins.
+1. Create the agents' users on the homeserver (90.5's procedure). A drive larger than the host's
+   disk gets `materialize = "zones"` in `agentd.toml` before its first checkout (§ *How much of a
+   drive is on disk*). The `--owner` and `--reader` flags below are each `agentd.toml`'s pins.
+   `login` comes after seeding, not here: it reads the agent's Matrix user from its home
+   (`<zone>/<id>/agent.toml`) and refuses an agent whose home is not checked out yet ("… is not an
+   agent this host serves"), so step 3 seeds the zone and signs the copies in.
 2. Upgrade every machine that loads the drives' folder tier to a keeper that knows
    `[folder.agents]`, then add `[folder.agents] subfolder = "80-agents"` to each drive's
    `.keeper/keeper.toml` from the owner's own clone (§ *Turning the zone on*).
 3. tgdrive goes through review: `agents init tgdrive --into <lane checkout> --with nixi,tola-grey …`,
    sync the lane, open the pull request; after it merges, on electra:
-   `sudo systemctl stop keeper-agentd@tgorka`, the same command without `--into` (it leaves every
-   file and makes Nixi's DM), then `sudo systemctl start keeper-agentd@tgorka`, which commits and
-   pushes the session folder.
+   `sudo systemctl stop keeper-agentd@tgorka`, `sudo -u agentd-tgorka keeper-agentd login
+   tgdrive/nixi` and `… login tgdrive/tola-grey`, the same `agents init` without `--into` (it
+   leaves every file and makes Nixi's DM, which needs her copy signed in), then
+   `sudo systemctl start keeper-agentd@tgorka`, which commits and pushes the session folder.
 4. neuradrive: stop `keeper-agentd@neuraffica`, `sudo -u agentd-neuraffica keeper-agentd agents init
-   neuradrive --with lucyna-novak …` against agentd's own checkout, start the unit, then
-   `keeper-agentd status` shows the seed committed and pushed.
+   neuradrive --with lucyna-novak …` against agentd's own checkout, then `… login
+   neuradrive/lucyna-novak`, start the unit, and `keeper-agentd status` shows the seed committed
+   and pushed.
 
 ## The provider
 
@@ -2490,6 +2494,7 @@ credential = "secret:tgdrive"
 owner      = "@tgorka:<homeserver>"
 readers    = ["@tgorka:<homeserver>"]
 local_only = false                       # optional; true pins the drive to local models
+materialize = "all"                      # optional; "zones" keeps only the two zones' LFS content
 
 [[providers]]
 kind       = "openai"
@@ -2509,7 +2514,8 @@ The grammar is exact: `version` is read first, so a file of another version is r
 an unknown key is refused naming it; `host` and `principal` are
 `[a-z0-9-]{1,32}`; a provider's `kind` is `openai`, `ollama` or `hermes` and its `base_url` passes
 the bots' URL rules; an `[[agents]] drive` must be a `[[drives]] id`. Two `[[drives]]` may not name
-one `remote`. `[[trust]]` needs `user`;
+one `remote`. A drive's `materialize` is `"all"` (the default) or `"zones"` (§ *How much of a drive
+is on disk*). `[[trust]]` needs `user`;
 `master_key` (`ed25519:<unpadded base64>`) is written by a person after comparing the fingerprint
 with the person's own device, never by keeper, and without it the person is not pinned and no
 decision of theirs is accepted (*Deciding*). `[[mcp]]` names the agents' MCP servers (§ *MCP
@@ -2535,6 +2541,30 @@ start: a changed `base_url` updates its row, a removed entry deletes it. No toke
 database. `[[drives]]` are kept in step the same way, by `id`: a changed `remote` updates the
 drive's profile in place, and a removed entry's profile is deleted before anything syncs — its
 checkout under `drives/<id>/` stays on disk for the operator to remove.
+
+### How much of a drive is on disk: `materialize`
+
+A drive's checkout keeps every LFS object it tracks by default (`materialize = "all"`). A drive
+whose large files outweigh the host's disk — hundreds of gigabytes of media beside a few megabytes
+of agents — is `materialize = "zones"`: the agents and the sessions zone are kept whole, and every
+other LFS object stays on the server with its pointer in the worktree. It is written as a virtual
+policy on the drive's profile row, every path virtual (`**`) with the two zones protected
+(`!/80-agents/`, `!/60-sessions/`, or wherever the drive's `[folder.agents]` and
+`[folder.sessions]` put them). Not `pointerOnly`, which protects nothing: agentd reads every file of
+the two zones as bytes, and a log blob over the LFS threshold left as a pointer refuses its
+session's replay (`hydrate_blob`). A checkout queues a download only for a path the policy keeps,
+so a drive opened `zones` never queues its media.
+
+The key is the host's, not the drive's: what fits on one machine's disk is no fact about the
+repository, so `_drive.toml` has no say in it. The row's list is the profile tier's: it replaces
+a committed `.keepervirtual`'s permissive list and joins its `!` protections; a folder TOML that
+sets `virtualPatterns` outranks it, and if that leaves a zone as pointers the zone hosts nothing and
+`status` says which pattern. Moving a drive back to `all` removes the list. Patterns are judged one
+at a time, each under every protection, since a protection wins over any pattern.
+
+Set it before the drive's first checkout. Downloads a checkout already queued under `all` are work
+in agentd's journal, and a later `zones` does not cancel them: stop the unit, delete
+`drives/<id>/` and agentd's `sync.db`, and let the next start clone the drive again.
 
 ### The pins and the mount rule
 

@@ -385,6 +385,7 @@ fn a_local_only_seed_is_declared_and_runs_on_a_local_bot() {
         owner: decl.owner.clone(),
         readers: decl.readers.clone(),
         local_only: true,
+        materialize: Default::default(),
     };
     assert_eq!(local.check_hosting(&decl, Some(&pin)), Ok(()));
 
