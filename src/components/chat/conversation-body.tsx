@@ -503,7 +503,6 @@ export function ConversationBody({
     }
     let cancelled = false;
     let typingSub: number | null = null;
-    let paginationSub: number | null = null;
 
     subscribeTyping(accountId, roomId, (b: TypingBatch) => {
       if (!cancelled) {
@@ -519,6 +518,29 @@ export function ConversationBody({
       })
       .catch(() => {});
 
+    // Mark the room read on view (best-effort — swallow any rejection).
+    markRoomRead(accountId, roomId).catch(() => {});
+
+    return () => {
+      cancelled = true;
+      if (typingSub !== null) {
+        void unsubscribeTyping(accountId, typingSub);
+      }
+    };
+  }, [accountId, roomId]);
+
+  // The live back-pagination status, subscribed once the room's timeline is open.
+  // Rust resolves the status from the room's open timeline and refuses a room whose
+  // timeline is not open yet; subscribed beside the timeline it lost that race for
+  // any room whose first batch took a moment — an agent's room behind hundreds of
+  // claim renewals — the refusal was swallowed, and the window never learned its
+  // status: no boundary row, and no self-fill.
+  useEffect(() => {
+    if (accountId === null || roomId === null || !loaded) {
+      return;
+    }
+    let cancelled = false;
+    let paginationSub: number | null = null;
     subscribePaginationStatus(accountId, roomId, (b: PaginationStatusBatch) => {
       if (!cancelled) {
         // Mirror the SDK-streamed status verbatim. The in-flight guard and the
@@ -538,19 +560,13 @@ export function ConversationBody({
       })
       .catch(() => {});
 
-    // Mark the room read on view (best-effort — swallow any rejection).
-    markRoomRead(accountId, roomId).catch(() => {});
-
     return () => {
       cancelled = true;
-      if (typingSub !== null) {
-        void unsubscribeTyping(accountId, typingSub);
-      }
       if (paginationSub !== null) {
         void unsubscribePaginationStatus(accountId, paginationSub);
       }
     };
-  }, [accountId, roomId]);
+  }, [accountId, roomId, loaded]);
 
   // Refresh the effective Incognito VM into the mirror store on room open (Story 8.1),
   // so the header chip and composer ring reflect the resolved state for this chat.
