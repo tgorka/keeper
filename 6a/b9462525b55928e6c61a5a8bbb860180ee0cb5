@@ -1,0 +1,57 @@
+docs/agents.md
+  s_cbf9741c93ab65::t_f990bfb1f68d47 235-238,240-242
+  s_cbf9741c93ab65::t_13ad1bbf9466df 2497
+  s_cbf9741c93ab65::t_19b3c4ce822c23 2517-2518
+  s_cbf9741c93ab65::t_b8cd0843337f8b 224-229
+  s_cbf9741c93ab65::t_d91eefd4fa333a 2545-2568
+src-tauri/crates/keeper-core/src/agents/pins.rs
+  s_cbf9741c93ab65::t_8f1274c1f1f68d 123,186
+src-tauri/crates/keeper-core/src/agents/mount.rs
+  s_cbf9741c93ab65::t_8f1274c1f1f68d 223
+src-tauri/crates/keeper-core/src/agents/seed/tests.rs
+  s_cbf9741c93ab65::t_8f1274c1f1f68d 388
+src-tauri/crates/keeper-core/src/agents/agentd.rs
+  s_cbf9741c93ab65::t_db7fdf98399a8a 253
+  s_cbf9741c93ab65::t_2387e96d2134c9 787-808,813-815
+  s_cbf9741c93ab65::t_a6c95a1ae92020 98-140
+  s_cbf9741c93ab65::t_a89a75602b7beb 12-13
+  s_cbf9741c93ab65::t_4140f7d7264129 516
+  s_cbf9741c93ab65::t_4c88e66fcb16ff 809-812
+  s_cbf9741c93ab65::t_9eb5be20a05076 786
+src-tauri/crates/keeper-agent/src/seed/tests.rs
+  s_cbf9741c93ab65::t_8f1274c1f1f68d 378,411
+src-tauri/crates/keeper-core/src/agents/copy.rs
+  s_cbf9741c93ab65::t_8f1274c1f1f68d 169
+src-tauri/crates/keeper-agent/src/headless/engine.rs
+  s_cbf9741c93ab65::t_8c32f2cac09b52 74-76
+  s_cbf9741c93ab65::t_23db83e6edf8bf 283-296,298-300
+  s_cbf9741c93ab65::t_d97de9a8a56139 7
+  s_cbf9741c93ab65::t_4c1aa53331a266 136-142
+  s_cbf9741c93ab65::t_5ee055f9210fa7 158-196
+src-tauri/crates/keeper-agent/tests/headless_engine.rs
+  s_cbf9741c93ab65::t_4c88e66fcb16ff 499-502
+  s_cbf9741c93ab65::t_b828ab3dbb7675 326-350,356-410,494-498,503-551
+  s_cbf9741c93ab65::t_432de5c87dde96 351-355
+  s_cbf9741c93ab65::t_2d42c8d0b655a0 18
+  s_cbf9741c93ab65::t_2238f5776e6b1a 411-493
+src-tauri/crates/keeper-agent/src/promote/tests.rs
+  s_cbf9741c93ab65::t_8f1274c1f1f68d 199
+_bmad-output/implementation-artifacts/deferred-work.md
+  s_cbf9741c93ab65::t_1c05b56d9be3c7 10558-10564
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "6ab9462525b55928e6c61a5a8bbb860180ee0cb5",
+  "prompts": {},
+  "sessions": {
+    "s_cbf9741c93ab65": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5b400cc2-6399-4f94-b9bb-ce6893683e42",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
