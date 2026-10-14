@@ -104,6 +104,13 @@ const ACCOUNT: AccountVm = {
   hueIndex: 0,
   provider: "password",
 };
+/**
+ * The dock's re-list is a timer and a mocked IPC round trip; under lefthook's
+ * pre-push, which runs this suite beside clippy and tsc, it took longer than
+ * the 1 s default and D4 failed one push in two. The wait is longer, the
+ * assertions are the same.
+ */
+const SLOW = { timeout: 10_000 };
 const DM = "!nixi-dm:example.org";
 const READING = "!nixi-reading:example.org";
 const CHAT = "!marta:example.org";
@@ -457,11 +464,13 @@ describe("the assistant dock", () => {
       agentRoomsList.mockResolvedValueOnce([]);
       renderDock();
       openDock();
-      expect(await screen.findByText(/You have no assistant yet/)).toBeInTheDocument();
+      expect(
+        await screen.findByText(/You have no assistant yet/, undefined, SLOW),
+      ).toBeInTheDocument();
       await act(async () => {
         vi.advanceTimersByTime(RELIST_FIRST_MS);
       });
-      await waitFor(() => expect(streams.has(DM)).toBe(true));
+      await waitFor(() => expect(streams.has(DM)).toBe(true), SLOW);
     } finally {
       vi.useRealTimers();
     }
