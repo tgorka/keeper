@@ -32,6 +32,7 @@ pub mod index;
 pub mod knowledge;
 pub mod kvm;
 pub mod label;
+pub mod launch;
 pub mod log;
 pub mod mac_tables;
 pub mod matrix;

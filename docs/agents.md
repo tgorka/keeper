@@ -2986,6 +2986,29 @@ keeper shows an agent's room in its own timeline, on the Mac and on the iPhone a
   `dev.keeper.agent.turn` marker counts as one only in a session room, from a sender at power 50
   or more who is not you. Anyone else's marked message — in any room — is an ordinary message:
   it notifies, shows "Edited" when edited, is cut at 4096 characters and never carries the caret.
+- **At launch: the default agent (story 100.3, R383).** `agents.default` holds one agent's Matrix
+  user id, or nothing; choose it under Settings › *Default agent* (None, or one of the agents you
+  have a `main` conversation with here) or from the agent room header's menu (*Make default*,
+  *Stop opening at launch*). It is a user-global setting: a `keeper.toml` may set it and it travels
+  with your account's settings. When keeper starts and your signed-in accounts have at least one
+  agent room, it opens the Agents window; when the default agent's `main` room — your DM with that
+  proxy — is on one of those accounts, that room is open (and, on the Mac, its composer focused).
+  When it is not (an agent you have no conversation with here, or a value that is not a user id),
+  the Agents window opens with nothing selected, a notice says why, the Settings row says the same
+  sentence, and `keeper.log` has it at WARN. With no agent rooms, keeper opens the Inbox as before.
+  keeper decides once per launch when it knows: once every signed-in account has finished its
+  first sync since launch and keeper has looked at the rooms after that, or as soon as the default
+  agent's conversation is here. It never takes longer than 15 seconds, looking at the rooms
+  included (a slow homeserver cannot hold it): at that point it answers from the last look that
+  finished, and a conversation still missing is one that "has not arrived yet" (it is in Agents
+  once it does) — said in a notice on whichever window opens, the Inbox too when keeper had not
+  yet seen any agent room. It applies that answer once, and never over a room or window you
+  already chose. On the iPhone the same rule applies only when the restored navigation (after the
+  system reclaimed the webview) had nothing to restore. When a settings file sets
+  `agents.default`, Settings and the room header's menu say so and name the file: a choice made
+  there is kept, but the file's agent is what opens until the file stops setting it. A failed read
+  is a sentence where the choice or the menu would be; a failed save is said beside the control;
+  both reach `keeper.log`.
 
 ## Nixi beside your notes
 

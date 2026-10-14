@@ -22,6 +22,7 @@ use std::path::Path;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures_util::StreamExt;
 use matrix_sdk::encryption::VerificationState;
@@ -54,6 +55,10 @@ use crate::agents::events::{
 use crate::agents::events::{PresencePlatform, SurfaceResultContent};
 use crate::agents::focus::{FocusLanes, FocusPort, Named, SendFuture};
 use crate::agents::heard::HeardContent;
+use crate::agents::launch::{
+    self, AgentsLaunchVm, LaunchFacts, LaunchReadiness, LaunchSource, ReadinessState,
+    SetDefaultError, LAUNCH_READY_MS, LAUNCH_RECHECK_MS,
+};
 use crate::agents::proxy::{
     self, AgentOutbound, AgentProxies, KnownProxies, ProxyListEventContent, ProxyRoomRow,
     ProxyRoomVm,
@@ -663,6 +668,43 @@ pub struct AccountManager {
     /// digest, by `(account, room, binding digest)` (R186): only these are
     /// approved.
     agent_shown: Arc<std::sync::Mutex<std::collections::HashSet<(String, String, String)>>>,
+    /// Which signed-in accounts' room lists have finished their first sync
+    /// since launch (R397): what the launch into the default agent waits for.
+    launch_ready: LaunchReadiness,
+}
+
+/// The launch's view of the live accounts (R397): [`launch::resolve`] reads
+/// the key and the rooms here again whenever an account's readiness changes,
+/// and every [`LAUNCH_RECHECK_MS`] besides — an agent's status can become
+/// readable without any account finishing a sync.
+struct ManagerLaunch<'a> {
+    manager: &'a AccountManager,
+    data_dir: &'a Path,
+    ready: tokio::sync::watch::Receiver<ReadinessState>,
+}
+
+impl LaunchSource for ManagerLaunch<'_> {
+    fn chosen(&self) -> Result<Option<String>, CoreError> {
+        registry::get_agents_default(self.data_dir)
+    }
+
+    fn ready(&self) -> Option<u64> {
+        self.manager.launch_ready.ready()
+    }
+
+    fn facts(&self) -> impl Future<Output = LaunchFacts> + Send {
+        self.manager.agents_launch_facts()
+    }
+
+    fn changed(&mut self) -> impl Future<Output = ()> + Send {
+        let recheck = Duration::from_millis(LAUNCH_RECHECK_MS);
+        async move {
+            tokio::select! {
+                _ = self.ready.changed() => {}
+                () = tokio::time::sleep(recheck) => {}
+            }
+        }
+    }
 }
 
 /// Monotonic source of subscription ids handed back to the frontend.
@@ -760,6 +802,7 @@ impl AccountManager {
             agent_device: Arc::new(AgentDevice::default()),
             agent_hosted: Arc::new(HostedRooms::default()),
             agent_shown: Arc::default(),
+            launch_ready: LaunchReadiness::default(),
         }
     }
 
@@ -1036,6 +1079,9 @@ impl AccountManager {
         self.unsubscribe_inbox_inner().await;
 
         let accounts = auth::scan_restorable_accounts(platform.as_ref())?;
+        // The launch (R397) waits for each of these to finish its first sync.
+        self.launch_ready
+            .expect(accounts.iter().map(|a| a.vm.account_id.clone()));
         // Seed the merger's pin map from keeper-local state (Story 4.3): pins have
         // no Matrix representation, so membership + order come from the registry.
         let data_dir = platform.data_dir()?;
@@ -1099,6 +1145,7 @@ impl AccountManager {
                         error = %e,
                         "inbox: account could not start; skipping (others keep syncing)"
                     );
+                    self.launch_ready.gone(&account_id);
                     merger.remove_account(&account_id).await;
                     continue;
                 }
@@ -1117,6 +1164,7 @@ impl AccountManager {
             // reads (Story 10.2) — no per-row SQLite open on the inbox hot path.
             let notify_for_task = self.notify.clone();
             let kinds_for_task = self.agent_kinds.clone();
+            let ready_for_task = self.launch_ready.clone();
             let task = tokio::spawn(
                 async move {
                     run_inbox_producer(
@@ -1125,6 +1173,7 @@ impl AccountManager {
                         &account_id,
                         &notify_for_task,
                         &kinds_for_task,
+                        &ready_for_task,
                     )
                     .await;
                 }
@@ -4353,6 +4402,69 @@ impl AccountManager {
         rooms
     }
 
+    /// What the launch rule reads (R383): how many agent session rooms the
+    /// live accounts have — the Agents window's rooms — and every account's
+    /// proxy conversations, accounts in id order so the same state always
+    /// opens the same room.
+    pub async fn agents_launch_facts(&self) -> LaunchFacts {
+        let mut account_ids: Vec<String> = self.accounts.lock().await.keys().cloned().collect();
+        account_ids.sort();
+        let mut facts = LaunchFacts::default();
+        for account_id in account_ids {
+            let client = {
+                let accounts = self.accounts.lock().await;
+                match accounts.get(&account_id) {
+                    Some(handle) => handle.client.clone(),
+                    None => continue,
+                }
+            };
+            facts.agent_rooms += client
+                .joined_rooms()
+                .iter()
+                .filter(|room| {
+                    AgentRoomKind::of(room.room_type().as_ref()) == Some(AgentRoomKind::Session)
+                })
+                .count();
+            for room in self.agent_rooms(&account_id).await {
+                facts.proxies.push((account_id.clone(), room));
+            }
+        }
+        facts
+    }
+
+    /// What keeper opens at launch (story 100.3, R383, R397):
+    /// [`launch::resolve`] over `agents.default`, the accounts' first-sync
+    /// readiness and [`Self::agents_launch_facts`] — answered once every
+    /// signed-in account has synced or the default agent's room is here,
+    /// never later than [`LAUNCH_READY_MS`].
+    pub async fn agents_launch(&self, data_dir: &Path) -> Result<AgentsLaunchVm, CoreError> {
+        let mut source = ManagerLaunch {
+            manager: self,
+            data_dir,
+            ready: self.launch_ready.subscribe(),
+        };
+        let mut vm = launch::resolve(&mut source, Duration::from_millis(LAUNCH_READY_MS)).await?;
+        vm.file_set = launch::file_set_sentence();
+        Ok(vm)
+    }
+
+    /// The default agent as Settings › Agents and the agent room's menu show
+    /// it, from what is here now ([`launch::read`]); never waits.
+    pub async fn agents_default(&self, data_dir: &Path) -> Result<AgentsLaunchVm, CoreError> {
+        launch::read(data_dir, &self.agents_launch_facts().await)
+    }
+
+    /// Store `agent` as the default agent (`None`: none) and answer with the
+    /// default agent as it now reads ([`launch::set_default`]; every failure
+    /// is logged at WARN there).
+    pub async fn agents_default_set(
+        &self,
+        data_dir: &Path,
+        agent: Option<&str>,
+    ) -> Result<AgentsLaunchVm, SetDefaultError> {
+        launch::set_default(data_dir, agent, &self.agents_launch_facts().await)
+    }
+
     /// Send what the voice turn heard into `room_id`, the person's own
     /// proxy conversation on `account_id`, as their message (AD-384) —
     /// [`spoken_send`], with the conversation's open timeline when one is.
@@ -5393,6 +5505,7 @@ impl AccountManager {
         // until the frontend happened to re-subscribe the whole inbox.
         {
             let mut inbox = self.inbox.lock().await;
+            self.launch_ready.gone(account_id);
             if let Some(handle) = inbox.as_mut() {
                 handle.merger.remove_account(account_id).await;
                 if let Some(task) = handle.producers.remove(account_id) {
@@ -6784,6 +6897,7 @@ async fn run_inbox_producer(
     account_id: &str,
     notify: &NotifyConfig,
     kinds: &AgentKinds,
+    launch_ready: &LaunchReadiness,
 ) {
     let mut loading_state = room_list.loading_state();
     let (stream, controller) = room_list.entries_with_dynamic_adapters(ROOM_LIST_PAGE_SIZE);
@@ -6794,6 +6908,11 @@ async fn run_inbox_producer(
     let _controller = controller;
 
     let mut total = loaded_total(&loading_state.get());
+    // The room list's first sync is done once its loading state reads loaded
+    // (R397: what the launch into the default agent waits for).
+    if matches!(loading_state.get(), RoomListLoadingState::Loaded { .. }) {
+        launch_ready.loaded(account_id);
+    }
     let mut loading_done = false;
 
     futures_util::pin_mut!(stream);
@@ -6819,7 +6938,12 @@ async fn run_inbox_producer(
             }
             maybe_state = loading_state.next(), if !loading_done => {
                 match maybe_state {
-                    Some(state) => total = loaded_total(&state),
+                    Some(state) => {
+                        if matches!(state, RoomListLoadingState::Loaded { .. }) {
+                            launch_ready.loaded(account_id);
+                        }
+                        total = loaded_total(&state);
+                    }
                     None => loading_done = true,
                 }
             }

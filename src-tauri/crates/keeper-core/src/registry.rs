@@ -1040,6 +1040,30 @@ pub fn set_bots_voice_target(data_dir: &Path, target: Option<&str>) -> Result<()
     )
 }
 
+/// The `settings` key naming the default agent (Epic 100, story 100.3,
+/// R383): one agent's Matrix user id, or absent/blank for none. Which room
+/// opens at launch, and why none does, is
+/// `keeper_core::agents::launch::choose`'s answer.
+pub(crate) const AGENTS_DEFAULT_KEY: &str = "agents.default";
+
+/// Read the default agent as stored, trimmed. Absent or blank ⇒ `None`. Not
+/// checked here: a row that rotted out of shape is the launch's to name.
+pub fn get_agents_default(data_dir: &Path) -> Result<Option<String>, CoreError> {
+    Ok(get_setting(data_dir, AGENTS_DEFAULT_KEY)?
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty()))
+}
+
+/// Write the default agent: `None` clears it. Stored trimmed; the caller
+/// checked the shape (`keeper_core::agents::launch::set_default`).
+pub fn set_agents_default(data_dir: &Path, agent: Option<&str>) -> Result<(), CoreError> {
+    set_setting(
+        data_dir,
+        AGENTS_DEFAULT_KEY,
+        agent.map(str::trim).unwrap_or_default(),
+    )
+}
+
 /// The `settings` key holding the stop phrase as typed (Epic 67, Story 67.3,
 /// AD-208) — the word that ends a spoken answer. Absent or blank =
 /// [`crate::voice::DEFAULT_STOP_PHRASE`]. Stored raw, like the wake phrase:

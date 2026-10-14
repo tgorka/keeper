@@ -13,6 +13,7 @@ import { useActiveChatReporter } from "@/hooks/use-active-chat-reporter";
 import { useAppLifecycle } from "@/hooks/use-app-lifecycle";
 import { useAutoUpdate } from "@/hooks/use-auto-update";
 import { useCapabilitiesHydrate } from "@/hooks/use-capabilities-hydrate";
+import { useLaunchIntoAgents } from "@/hooks/use-launch-into-agents";
 import { useNavStatePersistence } from "@/hooks/use-nav-state-persistence";
 import { useNotesOpenNote } from "@/hooks/use-notes-open-note";
 import { useNotifyNavigate } from "@/hooks/use-notify-navigate";
@@ -101,8 +102,13 @@ function App() {
   // Persist the last phone-stack level in Rust and restore it after a reload on the
   // reduced-capability (iOS) tier only (Story 14.4): a webview reload after a
   // content-process jettison lands the user exactly where they were, and a cold
-  // launch starts fresh at the Inbox. Inert on desktop.
+  // launch starts fresh (at the Inbox, or in Agents by the rule below). Inert on desktop.
   useNavStatePersistence();
+  // Agents at launch, on the default agent (story 100.3, R383): once the accounts
+  // are hydrated and the Agents window's first rooms arrived, Rust's answer is
+  // applied once — never over the person's own navigation, and on the phone only
+  // when the restore above had nothing to restore.
+  useLaunchIntoAgents();
   // Reload a blank/frozen webview once (loop-guarded) on a resume that fails the
   // animation-frame liveness probe, on the reduced-capability (iOS) tier only
   // (Story 14.4, tauri#14371). Never reloads a healthy webview. Inert on desktop.

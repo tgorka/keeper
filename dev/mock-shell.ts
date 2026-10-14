@@ -76,6 +76,7 @@ import type {
   AgentSeedPlanVm,
   AgentSeedReq,
   AgentSeedResultVm,
+  AgentsLaunchVm,
   ApprovalCardVm,
   ApprovalDecideReq,
   ApprovalPayloadVm,
@@ -7269,6 +7270,152 @@ function subscribeMockTimeline(payload: Record<string, unknown>): number {
   return id;
 }
 
+// ---------------------------------------------------------------------------
+// What opens at launch (story 100.3, R383). Rust's `agents::launch::choose`,
+// mirrored over the harness's rooms: with agent rooms the Agents window, on
+// the default agent's `main` room when it has one. `?launch=default` makes
+// Nixi the default (her DM opens and is focused); `?launch=gone` names an
+// agent with no room here (Agents opens with nothing selected, the launch's
+// notice and Settings › Agents say why); `?launch=rotted` holds a value that
+// is not a user id; `?launch=none` streams no agent rooms (the Inbox, as
+// before); `?launch=failset` refuses every save the way a locked settings
+// table does. Absent: no default yet — Agents opens with nothing selected.
+//
+// R397: Rust answers the launch only when the accounts have synced or the
+// default's room is here. `?launch=late` makes Nixi the default and holds her
+// DM back: the Agents window's first batch lacks it, it arrives
+// `LATE_ROOM_MS` later, and only then does the launch answer — on it.
+// `?launch=lost` never brings it: the launch answers at the (shortened) bound
+// saying the conversation has not arrived yet. `?launch=file` has a settings
+// file set the default to Nixi: Settings and the room header say so and name
+// the file, and a choice made here is stored but does not change what opens.
+// `?launch=long` names an agent with no room here whose id is long enough to
+// wrap on the phone. `?launch=unseen` stops waiting before any room was seen:
+// the Inbox stays open and a notice says the conversation has not arrived.
+// ---------------------------------------------------------------------------
+
+const launchParam = new URLSearchParams(window.location.search).get("launch");
+let defaultAgent: string | null =
+  launchParam === "default" ||
+  launchParam === "late" ||
+  launchParam === "lost" ||
+  launchParam === "unseen"
+    ? NIXI
+    : launchParam === "gone"
+      ? "@tala:example.org"
+      : launchParam === "rotted"
+        ? "nixi"
+        : launchParam === "long"
+          ? "@an-agent-whose-matrix-id-is-far-too-long-to-fit:a.very.long.homeserver.example.org"
+          : null;
+/** `?launch=file`: the value a settings file gives `agents.default`. */
+const FILE_DEFAULT: string | null = launchParam === "file" ? NIXI : null;
+const FILE_PATH = "/Users/you/Library/Application Support/keeper/keeper.toml";
+/** `?launch=late`: when Nixi's DM arrives. `?launch=lost`: the bound (Rust's is 15 s). */
+const LATE_ROOM_MS = 2_500;
+const LOST_BOUND_MS = 4_000;
+let nixiDmHere = launchParam !== "late" && launchParam !== "lost";
+
+function mockAgentsLaunch(): AgentsLaunchVm {
+  const mains = proxyRooms.filter(
+    (room) => room.kind === "main" && (nixiDmHere || room.roomId !== DM_ROOM),
+  );
+  const choices = mains
+    .map((room) => ({ agent: room.agent, name: room.name }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+  // What keeper reads: a settings file's value shadows the stored one.
+  const effective = FILE_DEFAULT ?? defaultAgent;
+  const fileSet =
+    FILE_DEFAULT === null
+      ? null
+      : `${FILE_PATH} (user) sets agents.default to ${FILE_DEFAULT}, so ${FILE_DEFAULT} opens at launch whatever you choose here. Your choice is kept and takes effect once that file stops setting it.`;
+  const base = {
+    room: null,
+    defaultAgent: effective,
+    reason: null,
+    announce: false,
+    choices,
+    fileSet,
+  };
+  if (launchParam === "unseen") {
+    return {
+      ...base,
+      view: "inbox",
+      reason: `Your conversation with your default agent ${effective} has not arrived yet, so keeper opens the Inbox. It is in Agents once it arrives.`,
+      announce: true,
+    };
+  }
+  if (launchParam === "none") {
+    return {
+      ...base,
+      view: "inbox",
+      reason:
+        effective === null
+          ? null
+          : "You have no agent rooms on this device yet, so keeper opens the Inbox.",
+    };
+  }
+  if (effective === null) {
+    return { ...base, view: "agents" };
+  }
+  if (!/^@[^:]+:.+$/.test(effective)) {
+    return {
+      ...base,
+      view: "agents",
+      reason: `The default agent is set to "${effective}", which is not a Matrix user id, so Agents opens with nothing selected. Choose the default agent again.`,
+      announce: true,
+    };
+  }
+  const main = mains.find((room) => room.agent === effective);
+  return main === undefined
+    ? {
+        ...base,
+        view: "agents",
+        reason: !nixiDmHere
+          ? `Your conversation with your default agent ${effective} has not arrived yet, so Agents opens with nothing selected. It is in Agents once it arrives.`
+          : `Your default agent ${effective} has no conversation with you on this device's accounts, so Agents opens with nothing selected.`,
+        announce: true,
+      }
+    : { ...base, view: "agents", room: { accountId: MOCK_ACCOUNT_ID, roomId: main.roomId } };
+}
+
+/** The launch, answered as Rust's `resolve` does: when the default's room is here or at the bound. */
+function mockAgentsLaunchWhenKnown(): Promise<AgentsLaunchVm> {
+  if (launchParam === "late") {
+    return later(LATE_ROOM_MS + 50, mockAgentsLaunch);
+  }
+  if (launchParam === "lost" || launchParam === "unseen") {
+    return later(LOST_BOUND_MS, mockAgentsLaunch);
+  }
+  return later(300, mockAgentsLaunch);
+}
+
+function mockAgentsDefaultSet(payload: Record<string, unknown>): Promise<AgentsLaunchVm> {
+  // The executor form: the project compiles against ES2020, which has no
+  // `Promise.withResolvers` (as `App.test.tsx` notes).
+  return new Promise((resolve, reject) => {
+    setTimeout(() => {
+      const agent = typeof payload.agent === "string" ? payload.agent.trim() : "";
+      if (launchParam === "failset") {
+        reject({
+          code: "internal",
+          message: "keeper could not save the default agent: database is locked",
+          retriable: false,
+        });
+      } else if (agent !== "" && !/^@[^:]+:.+$/.test(agent)) {
+        reject({
+          code: "internal",
+          retriable: false,
+          message: `"${agent}" is not a Matrix user id, so it cannot be the default agent. An agent is named like @nixi:example.org.`,
+        });
+      } else {
+        defaultAgent = agent === "" ? null : agent;
+        resolve(mockAgentsLaunch());
+      }
+    }, 120);
+  });
+}
+
 function subscribeMockInbox(payload: Record<string, unknown>): number {
   const reset = (rooms: InboxRoomVm[]): InboxBatch => ({
     ops: [{ op: "reset", rooms }],
@@ -7279,7 +7426,20 @@ function subscribeMockInbox(payload: Record<string, unknown>): number {
     (payload[window] as MockChannel<InboxBatch>).onmessage?.(reset([]));
   }
   agentsWindow = payload.agents as MockChannel<InboxBatch>;
-  agentsWindow.onmessage?.(reset(AGENT_ROOM_ROWS));
+  if (launchParam === "none") {
+    agentsWindow.onmessage?.(reset([]));
+  } else if (!nixiDmHere) {
+    // R397's late DM: the first batch has every agent room but Nixi's DM.
+    agentsWindow.onmessage?.(reset(AGENT_ROOM_ROWS.filter((row) => row.roomId !== DM_ROOM)));
+    if (launchParam === "late") {
+      setTimeout(() => {
+        nixiDmHere = true;
+        agentsWindow?.onmessage?.(reset(AGENT_ROOM_ROWS));
+      }, LATE_ROOM_MS);
+    }
+  } else {
+    agentsWindow.onmessage?.(reset(AGENT_ROOM_ROWS));
+  }
   (payload.spaces as MockChannel<SpacesSnapshot>).onmessage?.({ spaces: [] });
   (payload.networks as MockChannel<NetworksSnapshot>).onmessage?.({ networks: [] });
   return 1;
@@ -8487,6 +8647,10 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
           }),
         )
       : [],
+  // Story 100.3 (R383): what opens at launch and the default agent.
+  agents_launch: () => mockAgentsLaunchWhenKnown(),
+  agents_default_get: () => mockAgentsLaunch(),
+  agents_default_set: mockAgentsDefaultSet,
   // --- Voice, the talk mode (Epic 62, Story 62.6; Epic 67, AD-205) ---------
   //
   // A scripted turn so the mic control's states can be looked at in

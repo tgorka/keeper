@@ -18,6 +18,7 @@ import {
 import { BotGrantsSection } from "@/components/settings/bot-grants-section";
 import { BotsSection } from "@/components/settings/bots-section";
 import { ConfigSourceSection, FileControlled } from "@/components/settings/config-source-section";
+import { DefaultAgentSection } from "@/components/settings/default-agent-section";
 import { BADGE_NOT_LIVE_SENTENCE } from "@/components/settings/no-background-sync-disclosure";
 import { PhonePush } from "@/components/settings/phone-push";
 import { RecordingSettingsControls } from "@/components/settings/recording-settings-controls";
@@ -267,6 +268,11 @@ export function SettingsBody({ open, onOpenChange }: SettingsDialogProps) {
           could name. `botTools` is strictly narrower than `bots` in Rust, so
           it is the one gate this section needs. */}
       {botTools && <BotGrantsSection open={open} />}
+      {/* Story 100.3 (R383): the one agent keeper opens at launch. On every
+          tier and behind no capability — the phone launches by the same rule
+          and the key travels with the account — and absent where there is no
+          agent to choose and none stored (AD-27). */}
+      <DefaultAgentSection open={open} />
       {/* Story 90.6: this Mac as a host for your agents. On `botTools` for the
           grants' reason — a host reads drives, and a phone is never one — and
           absent besides where no flagged folder holds an agent (AD-27). */}

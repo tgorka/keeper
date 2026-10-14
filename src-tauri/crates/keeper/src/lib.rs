@@ -1091,6 +1091,11 @@ pub fn run() {
                 agents_ipc::agent_presence_view,
                 // Story 91.4: the proxy conversations "Speak to" offers.
                 agents_ipc::voice_agent_targets,
+                // Story 100.3 (R383): what opens at launch and the one
+                // default agent, every target (the phone launches too).
+                agents_ipc::agents_launch,
+                agents_ipc::agents_default_get,
+                agents_ipc::agents_default_set,
                 // Voice (Story 62.4): every target, the port decides.
                 voice_ipc::voice_availability,
                 voice_ipc::voice_start,

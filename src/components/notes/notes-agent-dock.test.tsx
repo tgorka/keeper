@@ -21,6 +21,11 @@ const cancelHeldSend = vi.fn();
 /** Every `agentFocus` call's number, in call order. */
 let focusSeqs: number[];
 vi.mock("@/lib/ipc/client", () => ({
+  // The default agent (story 100.3): read by Settings › Agents and the agent
+  // room's menu on mount; a read that never answers renders neither.
+  agentsDefaultGet: vi.fn(() => new Promise(() => {})),
+  agentsDefaultSet: vi.fn(),
+  frontendErrorReport: vi.fn(() => Promise.resolve()),
   agentRoomsList: (accountId: string) => agentRoomsList(accountId),
   agentScopeSet: (accountId: string, roomId: string, drives: string[]) =>
     agentScopeSet(accountId, roomId, drives),

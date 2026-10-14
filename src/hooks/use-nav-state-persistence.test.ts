@@ -12,6 +12,7 @@ vi.mock("@/lib/ipc/client", () => ({
 import { useNavStatePersistence } from "@/hooks/use-nav-state-persistence";
 import { navStateClear, navStateGet, navStateSet } from "@/lib/ipc/client";
 import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
+import { defaultAgentStore } from "@/lib/stores/default-agent";
 import { detailStore } from "@/lib/stores/detail-ui";
 import { roomsStore } from "@/lib/stores/rooms";
 
@@ -64,6 +65,7 @@ beforeEach(() => {
   roomsStore.getState().selectRoom(null);
   detailStore.setState({ open: false });
   capabilitiesStore.setState({ capabilities: DEFAULT_CAPABILITIES, hydrated: false });
+  defaultAgentStore.setState({ navRestore: "pending" });
 });
 
 afterEach(() => {
@@ -94,6 +96,8 @@ describe("useNavStatePersistence", () => {
     // state, so no redundant (or destructive) write goes back to Rust.
     expect(mockNavStateSet).not.toHaveBeenCalled();
     expect(mockNavStateClear).not.toHaveBeenCalled();
+    // The launch into the default agent (story 100.3) must not override it.
+    expect(defaultAgentStore.getState().navRestore).toBe("restored");
   });
 
   it("restores a stored Detail level (deferred one macrotask) without ever writing detailOpen: false", async () => {
@@ -124,6 +128,8 @@ describe("useNavStatePersistence", () => {
     expect(roomsStore.getState().selected).toBeNull();
     expect(detailStore.getState().open).toBe(false);
     expect(mockNavStateSet).not.toHaveBeenCalled();
+    // Nothing restored: the launch rule may apply (story 100.3).
+    expect(defaultAgentStore.getState().navRestore).toBe("nothing");
   });
 
   it("treats a rejected read as a cold launch (start at the Inbox)", async () => {
@@ -168,6 +174,25 @@ describe("useNavStatePersistence", () => {
       { accountId: "a1", roomId: "!user:example.org" },
       false,
     );
+    expect(defaultAgentStore.getState().navRestore).toBe("restored");
+  });
+
+  it("a room chosen while the read is out counts as restored even when nothing was stored", async () => {
+    hydrateReducedTier();
+    let resolveRead: (nav: NavState | null) => void = () => {};
+    mockNavStateGet.mockReturnValue(
+      new Promise<NavState | null>((resolve) => {
+        resolveRead = resolve;
+      }),
+    );
+    renderHook(() => useNavStatePersistence());
+    act(() => {
+      roomsStore.getState().selectRoom({ accountId: "a1", roomId: "!user:example.org" });
+    });
+    act(() => resolveRead(null));
+    await flushRestore();
+    // The launch into the default agent (story 100.3) must not replace it.
+    expect(defaultAgentStore.getState().navRestore).toBe("restored");
   });
 
   it("reports each nav change after the restore settles: room, detail, back to Inbox", async () => {

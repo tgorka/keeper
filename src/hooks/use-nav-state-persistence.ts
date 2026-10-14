@@ -15,6 +15,9 @@
  * always wins: a selection made before the read resolves (or during the detail-reopen
  * window) aborts the restore. The read is held in a ref so a StrictMode effect re-run
  * reuses the same in-flight promise instead of re-issuing (or racing) it.
+ * Whether the restore put anything on screen is published to
+ * `defaultAgentStore.navRestore`: the launch into the default agent (story 100.3)
+ * applies on the phone only when it did not.
  *
  * Report (after the restore settles): mirrors `use-active-chat-reporter`'s shape —
  * value-deduped pushes of each nav change; a Chat open ⇒ `navStateSet`, back to the
@@ -29,6 +32,7 @@ import { useEffect, useRef } from "react";
 import { logFailure } from "@/lib/failure";
 import { type NavState, navStateClear, navStateGet, navStateSet } from "@/lib/ipc/client";
 import { useIsReducedCapabilityPlatform } from "@/lib/stores/capabilities";
+import { defaultAgentStore } from "@/lib/stores/default-agent";
 import { detailStore } from "@/lib/stores/detail-ui";
 import { roomsStore } from "@/lib/stores/rooms";
 
@@ -144,9 +148,19 @@ export function useNavStatePersistence(): void {
       // User navigation made before the read resolves always wins — including a
       // selection that already existed when the hook attached.
       if (nav === null || userNavigated || roomsStore.getState().selected !== null) {
+        // The launch rule (story 100.3) applies only when nothing was restored
+        // and nothing was chosen meanwhile.
+        defaultAgentStore
+          .getState()
+          .setNavRestore(
+            nav === null && !userNavigated && roomsStore.getState().selected === null
+              ? "nothing"
+              : "restored",
+          );
         finishRestore();
         return;
       }
+      defaultAgentStore.getState().setNavRestore("restored");
       // Seed the reporter baseline from the INTENDED restored state (Review R1):
       // during the detail-reopen macrotask below the stores transiently read
       // `detailOpen: false`, and reporting that would overwrite the stored `true`.

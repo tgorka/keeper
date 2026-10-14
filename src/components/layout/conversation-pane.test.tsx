@@ -38,6 +38,11 @@ const subscribePaginationStatus = vi.fn();
 const unsubscribePaginationStatus = vi.fn();
 const cancelHeldSend = vi.fn(async (_a: string, _r: string, _id: string): Promise<string> => "");
 vi.mock("@/lib/ipc/client", () => ({
+  // The default agent (story 100.3): read by Settings › Agents and the agent
+  // room's menu on mount; a read that never answers renders neither.
+  agentsDefaultGet: vi.fn(() => new Promise(() => {})),
+  agentsDefaultSet: vi.fn(),
+  frontendErrorReport: vi.fn(() => Promise.resolve()),
   subscribeTimeline: (accountId: string, roomId: string, onBatch: (b: TimelineBatch) => void) =>
     subscribeTimeline(accountId, roomId, onBatch),
   unsubscribeTimeline: (accountId: string, id: number) => unsubscribeTimeline(accountId, id),

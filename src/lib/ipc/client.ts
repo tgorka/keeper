@@ -374,6 +374,7 @@ export type { AgentSeedPlanVm } from "./gen/AgentSeedPlanVm";
 export type { AgentSeedReq } from "./gen/AgentSeedReq";
 export type { AgentSeedResultVm } from "./gen/AgentSeedResultVm";
 export type { AgentStatusVm } from "./gen/AgentStatusVm";
+export type { AgentsLaunchVm } from "./gen/AgentsLaunchVm";
 export type { ApprovalCardVm } from "./gen/ApprovalCardVm";
 export type { ApprovalDecideReq } from "./gen/ApprovalDecideReq";
 export type { ApprovalDecision } from "./gen/ApprovalDecision";
@@ -465,6 +466,7 @@ export type { CredentialChoicesVm } from "./gen/CredentialChoicesVm";
 export type { CredentialChoiceVm } from "./gen/CredentialChoiceVm";
 export type { DaemonPresence } from "./gen/DaemonPresence";
 export type { DeclassifyVm } from "./gen/DeclassifyVm";
+export type { DefaultAgentChoiceVm } from "./gen/DefaultAgentChoiceVm";
 export type { DemoBatch } from "./gen/DemoBatch";
 export type { DemoItem } from "./gen/DemoItem";
 export type { DestinationVm } from "./gen/DestinationVm";
@@ -537,6 +539,8 @@ export type { IpcError } from "./gen/IpcError";
 export type { IpcErrorCode } from "./gen/IpcErrorCode";
 export type { KnowledgeNoteVm } from "./gen/KnowledgeNoteVm";
 export type { LabelVm } from "./gen/LabelVm";
+export type { LaunchRoomVm } from "./gen/LaunchRoomVm";
+export type { LaunchView } from "./gen/LaunchView";
 export type { LifecyclePhase } from "./gen/LifecyclePhase";
 export type { LineSpan } from "./gen/LineSpan";
 export type { LoginFieldVm } from "./gen/LoginFieldVm";
@@ -810,6 +814,7 @@ import type { AgentSeedOfferVm } from "./gen/AgentSeedOfferVm";
 import type { AgentSeedPlanVm } from "./gen/AgentSeedPlanVm";
 import type { AgentSeedReq } from "./gen/AgentSeedReq";
 import type { AgentSeedResultVm } from "./gen/AgentSeedResultVm";
+import type { AgentsLaunchVm } from "./gen/AgentsLaunchVm";
 import type { ApprovalDecideReq } from "./gen/ApprovalDecideReq";
 import type { ApprovalDraftVm } from "./gen/ApprovalDraftVm";
 import type { ApprovalPayloadVm } from "./gen/ApprovalPayloadVm";
@@ -8653,6 +8658,35 @@ export async function voiceTargetSet(target: string | null): Promise<VoiceWakeVm
  */
 export async function voiceAgentTargets(): Promise<VoiceAgentTargetVm[]> {
   return await invoke<VoiceAgentTargetVm[]>("voice_agent_targets");
+}
+
+/**
+ * What keeper opens at launch (story 100.3, R383): the Agents window when the
+ * signed-in accounts have an agent room, else the Inbox; the default agent's
+ * `main` room when it has one here (`room`), else nothing selected and
+ * `reason` says why. Rust decides; the boot effect asks once, after the
+ * accounts are hydrated and the Agents window's first rooms arrived, and
+ * applies the answer once. A `reason` is also a WARN line in `keeper.log`.
+ */
+export async function agentsLaunch(): Promise<AgentsLaunchVm> {
+  return await invoke<AgentsLaunchVm>("agents_launch");
+}
+
+/**
+ * The default agent as Settings › Agents and the agent room's menu show it:
+ * the same answer as {@link agentsLaunch}, read again (no log line).
+ */
+export async function agentsDefaultGet(): Promise<AgentsLaunchVm> {
+  return await invoke<AgentsLaunchVm>("agents_default_get");
+}
+
+/**
+ * Make `agent` (a Matrix user id) the default agent, or clear it with `null`.
+ * Rejects with Rust's sentence when the value is not a user id or the setting
+ * could not be written; resolves with the new answer.
+ */
+export async function agentsDefaultSet(agent: string | null): Promise<AgentsLaunchVm> {
+  return await invoke<AgentsLaunchVm>("agents_default_set", { agent });
 }
 
 /**
