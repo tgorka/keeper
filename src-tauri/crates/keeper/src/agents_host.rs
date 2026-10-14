@@ -24,11 +24,12 @@ use keeper_core::agents::mac_tables::{
     self, AgentMcpDraftVm, AgentMcpListVm, AgentMcpServerReq, AgentSandboxReq, AgentSandboxVm,
     Heard, Hosted,
 };
+use keeper_core::agents::model::{self, AgentModelReq};
 use keeper_core::agents::pins;
 use keeper_core::agents::proxy::AgentProxies;
 use keeper_core::agents::room::AgentIcons;
 use keeper_core::agents::seed::{
-    self, AgentSeedOfferVm, AgentSeedPlanVm, AgentSeedReq, AgentSeedResultVm,
+    self, AgentSeedBotVm, AgentSeedOfferVm, AgentSeedPlanVm, AgentSeedReq, AgentSeedResultVm,
 };
 use keeper_core::bots::store;
 use keeper_core::platform::Platform;
@@ -146,12 +147,30 @@ pub fn tick(app: &tauri::AppHandle) {
                 };
                 let icons = desktop::zone_agents(&facts);
                 let proxies = desktop::agent_proxies(&facts);
-                (facts, icons, proxies)
+                // The header's model line names each bot as the person's
+                // bots name it (100.2 #7). Bots that cannot be read keep the
+                // names the headers have, said once in the log (R405).
+                let models = match bot_choices(platform.as_ref()) {
+                    Ok(bots) => {
+                        BOTS_UNREAD_LOGGED.store(false, Ordering::Relaxed);
+                        Some(desktop::zone_models(&facts, &bots))
+                    }
+                    Err(cause) => {
+                        if !BOTS_UNREAD_LOGGED.swap(true, Ordering::Relaxed) {
+                            tracing::warn!(%cause, "agents: your bots could not be read; the agent rooms keep the model names they had");
+                        }
+                        None
+                    }
+                };
+                (facts, icons, proxies, models)
             });
             match scanned.await {
-                Ok((facts, icons, proxies)) => {
+                Ok((facts, icons, proxies, models)) => {
                     if let Some(marks) = RUNTIME.icons.get() {
                         marks.replace(icons);
+                        if let Some(models) = models {
+                            marks.replace_models(models);
+                        }
                     }
                     if let Some(known) = RUNTIME.proxies.get() {
                         known.replace(proxies);
@@ -273,6 +292,30 @@ fn data_dir(platform: &dyn Platform) -> Result<PathBuf, IpcError> {
     platform.data_dir().map_err(to_ipc_error)
 }
 
+/// Whether the tick has logged that the person's bots cannot be read, so a
+/// store that stays unreadable is one WARN, not one per scan.
+static BOTS_UNREAD_LOGGED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The person's own bots, as *Set up agents* and each agent's model row
+/// offer them: `keeper.db`'s bots over its providers — or why they could
+/// not be read (R405), for the caller to log. Blocking.
+fn bot_choices(platform: &dyn Platform) -> Result<Vec<AgentSeedBotVm>, String> {
+    let dir = platform
+        .data_dir()
+        .map_err(|error| format!("keeper's data folder could not be found: {error}"))?;
+    seed::read_bot_choices(&dir)
+}
+
+/// `bot_choices`, with a failure logged WARN and turned into the sentence a
+/// person reads where the bots would be (R381, R405).
+fn bot_choices_or_sentence(platform: &dyn Platform) -> Result<Vec<AgentSeedBotVm>, String> {
+    bot_choices(platform).map_err(|cause| {
+        tracing::warn!(%cause, "agents: your bots could not be read; Settings › Agents says so where they would be");
+        model::BOTS_UNREAD.to_owned()
+    })
+}
+
 /// The rows for `facts`, with the people the pins name by display name
 /// where the person's own Matrix account can read one.
 async fn rows(state: &AppState, facts: DesktopFacts) -> Result<Vec<AgentCopyVm>, IpcError> {
@@ -283,7 +326,7 @@ async fn rows(state: &AppState, facts: DesktopFacts) -> Result<Vec<AgentCopyVm>,
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .clone();
-    let (listed, provider_rows) = {
+    let (listed, provider_rows, bots) = {
         let platform = Arc::clone(&platform);
         let facts = facts.clone();
         let problems = problems.clone();
@@ -291,14 +334,16 @@ async fn rows(state: &AppState, facts: DesktopFacts) -> Result<Vec<AgentCopyVm>,
             let rows = store::list_providers(&dir)
                 .map(|l| l.rows)
                 .unwrap_or_default();
+            let bots = bot_choices_or_sentence(platform.as_ref());
             let listed = desktop::listing(
                 &facts,
                 &rows,
+                bots.as_deref().map_err(String::as_str),
                 platform.as_ref(),
                 &desktop::Names::new(),
                 &problems,
             );
-            (listed, rows)
+            (listed, rows, bots)
         })
         .await
         .map_err(|error| refusal(error.to_string()))?
@@ -314,6 +359,7 @@ async fn rows(state: &AppState, facts: DesktopFacts) -> Result<Vec<AgentCopyVm>,
     Ok(desktop::listing(
         &facts,
         &provider_rows,
+        bots.as_deref().map_err(String::as_str),
         platform.as_ref(),
         &names,
         &problems,
@@ -446,16 +492,13 @@ pub async fn agents_drive_repin(
 
 /// Settings › Agents › *Set up agents* (UX-DR133): every synced folder that
 /// keeps agents, with what its form starts from, the catalogue, and the
-/// person's own bots — none chosen for them (S-20).
+/// person's own bots — none chosen for them (S-20); bots that cannot be
+/// read are a sentence where they would be and a WARN line (R405).
 #[tauri::command]
 pub async fn agents_seed_offer(state: State<'_, AppState>) -> Result<AgentSeedOfferVm, IpcError> {
     let facts = facts_now(&state).await?;
-    let dir = data_dir(platform_of(&state).as_ref())?;
+    let platform = platform_of(&state);
     tokio::task::spawn_blocking(move || {
-        let providers = store::list_providers(&dir)
-            .map(|l| l.rows)
-            .unwrap_or_default();
-        let bots = store::list_bots(&dir).unwrap_or_default();
         let accounts: Vec<String> = facts
             .homeservers
             .iter()
@@ -466,7 +509,7 @@ pub async fn agents_seed_offer(state: State<'_, AppState>) -> Result<AgentSeedOf
             &facts.pins,
             &accounts,
             facts.login.as_deref(),
-            seed::bot_choices(&providers, &bots),
+            bot_choices_or_sentence(platform.as_ref()),
         )
     })
     .await
@@ -516,6 +559,41 @@ pub async fn agents_seed_apply(
     })
     .await
     .map_err(|error| refusal(error.to_string()))?
+}
+
+/// Settings › Agents: save one agent's bot and level (100.2 #4, R382) —
+/// only `[model].bot` and `[model].effort` of its `agent.toml`, every other
+/// byte kept, through the drive's write path, as the person. The agent's
+/// next turn runs on it; the rows come back as they read now. A refusal is
+/// the row's sentence and a WARN line (R381).
+#[tauri::command]
+pub async fn agents_model_set(
+    state: State<'_, AppState>,
+    req: AgentModelReq,
+) -> Result<Vec<AgentCopyVm>, IpcError> {
+    let facts = facts_now(&state).await?;
+    let platform = platform_of(&state);
+    let saved = {
+        let profiles = facts.profiles.clone();
+        let req = req.clone();
+        tokio::task::spawn_blocking(move || {
+            let bots = bot_choices_or_sentence(platform.as_ref());
+            desktop::write_model(&profiles, &req, bots.as_deref().map_err(String::as_str))
+        })
+        .await
+        .map_err(|error| refusal(error.to_string()))?
+    };
+    if let Err(sentence) = saved {
+        tracing::warn!(agent = %req.agent, %sentence, "agents: an agent's model was not saved");
+        return Err(refusal(sentence));
+    }
+    tracing::info!(
+        agent = %req.agent,
+        effort = req.effort.map_or("default", |effort| effort.as_str()),
+        "agents: an agent's model was saved to its agent.toml"
+    );
+    scan_next_tick();
+    rows(&state, facts).await
 }
 
 /// The next tick scans: a saved table is hosted within a second, not at

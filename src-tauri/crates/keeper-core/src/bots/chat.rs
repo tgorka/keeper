@@ -175,6 +175,127 @@ pub enum ToolChoice {
     Function(String),
 }
 
+/// How hard a model reasons before it answers: an agent's `[model].effort`
+/// (R382). The words are the OpenAI Chat Completions `reasoning_effort`
+/// values keeper offers; which of them reach a provider, and under which
+/// field, is [`crate::bots::quirks::Quirks::efforts`]'s answer.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+    ts_rs::TS,
+)]
+#[serde(rename_all = "lowercase")]
+#[ts(export)]
+pub enum Effort {
+    Low,
+    Medium,
+    High,
+    Xhigh,
+}
+
+impl Effort {
+    /// Every level, lowest first: the order a person is offered them in.
+    pub const ALL: [Effort; 4] = [Effort::Low, Effort::Medium, Effort::High, Effort::Xhigh];
+
+    /// The word `agent.toml` and the wire spell it with.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+        }
+    }
+
+    /// The level a word names.
+    pub fn parse(word: &str) -> Option<Effort> {
+        Self::ALL.into_iter().find(|effort| effort.as_str() == word)
+    }
+}
+
+/// Why `kind` cannot be sent `effort`, as the clause a refusal ends with;
+/// `None` when it can. One answer for the home's load, a person's save and
+/// the wire, so the three cannot disagree.
+pub fn effort_refusal(kind: ProviderKind, effort: Effort) -> Option<String> {
+    let accepted = quirks(kind).efforts;
+    if accepted.contains(&effort) {
+        return None;
+    }
+    let kind = kind.as_registry_str();
+    Some(match accepted {
+        [] => format!(
+            "keeper sends {kind} bots no reasoning level, so remove effort or choose another bot"
+        ),
+        [only] => format!(
+            "{kind} bots take only {}, and {} is not it",
+            only.as_str(),
+            effort.as_str()
+        ),
+        [first @ .., last] => {
+            let words: Vec<&str> = first.iter().map(|effort| effort.as_str()).collect();
+            format!(
+                "{kind} bots take {} or {}, and {} is none of them",
+                words.join(", "),
+                last.as_str(),
+                effort.as_str()
+            )
+        }
+    })
+}
+
+/// Whether `error`, ending a request a `kind` endpoint was sent at
+/// `effort`, is that endpoint refusing the level (R405): the quirk table's
+/// own refusal ([`effort_refusal`]) before a byte went out, an HTTP 4xx
+/// other than 429 whose body names reasoning or the level's word in quotes,
+/// or an error frame that does. Anything else is another failure, said as
+/// one.
+pub fn rejected_effort(kind: ProviderKind, effort: Effort, error: &BotsError) -> bool {
+    let word = effort.as_str();
+    let names = |text: &str| {
+        let text = text.to_ascii_lowercase();
+        text.contains("reasoning")
+            || text.contains(&format!("\"{word}\""))
+            || text.contains(&format!("'{word}'"))
+    };
+    match error {
+        BotsError::Unsupported { detail } => {
+            effort_refusal(kind, effort).is_some_and(|reason| *detail == reason)
+        }
+        BotsError::Status { status, detail, .. } => {
+            (400..500).contains(status) && *status != 429 && names(detail)
+        }
+        BotsError::Provider { code, message } => {
+            names(message) || code.as_deref().is_some_and(names)
+        }
+        _ => false,
+    }
+}
+
+/// What of `error` a log line may carry (R405): the provider's words with
+/// control characters made spaces, bounded at 200 characters — never a body
+/// verbatim.
+pub fn log_excerpt(error: &BotsError) -> String {
+    let text = match error {
+        BotsError::Status { detail, .. } => detail.clone(),
+        BotsError::Provider { message, .. } => message.clone(),
+        other => other.to_string(),
+    };
+    let cleaned: String = text
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(200)
+        .collect();
+    cleaned.trim().to_owned()
+}
+
 /// Everything a chat completion needs, before the wire shape is decided.
 #[derive(Debug, Clone, Default)]
 pub struct ChatRequest {
@@ -190,6 +311,10 @@ pub struct ChatRequest {
     pub temperature: Option<f64>,
     /// Completion-length ceiling, if the caller set one.
     pub max_tokens: Option<u32>,
+    /// The reasoning level, if the agent set one (R382). `None` sends no
+    /// field at all: the body is byte-identical to one built before levels
+    /// existed.
+    pub effort: Option<Effort>,
     /// The server-side session this turn continues, where the endpoint keeps
     /// one (Epic 63, AD-176). Sent as the
     /// [`crate::bots::remote::SESSION_HEADER`] request header and never in the
@@ -212,7 +337,11 @@ pub struct ChatRequest {
 /// * an image part takes the shape that kind documents;
 /// * a remote `http(s)` image URL sent to a kind that will not fetch one is a
 ///   named refusal ([`BotsError::Unsupported`]) before a byte goes out, not a
-///   silently dropped image the model is then asked about.
+///   silently dropped image the model is then asked about;
+/// * a reasoning level goes out as `reasoning_effort` only to a kind whose
+///   [`crate::bots::quirks::Quirks::efforts`] row names it, and is a named
+///   refusal for any other (R382) — an agent's home is refused at load for
+///   the same answer ([`effort_refusal`]), so this arm is the backstop.
 pub fn build_body(kind: ProviderKind, request: &ChatRequest) -> Result<Value, BotsError> {
     let quirks = quirks(kind);
 
@@ -265,7 +394,12 @@ pub fn build_body(kind: ProviderKind, request: &ChatRequest) -> Result<Value, Bo
     if let Some(max_tokens) = request.max_tokens {
         body.insert("max_tokens".to_owned(), json!(max_tokens));
     }
-
+    if let Some(effort) = request.effort {
+        if let Some(reason) = effort_refusal(kind, effort) {
+            return Err(BotsError::Unsupported { detail: reason });
+        }
+        body.insert("reasoning_effort".to_owned(), json!(effort.as_str()));
+    }
     Ok(Value::Object(body))
 }
 
@@ -1656,6 +1790,128 @@ mod tests {
         assert!(build_body(ProviderKind::Hermes, &request).is_ok());
         // Unknown is permitted: the endpoint reports what it did with it.
         assert!(build_body(ProviderKind::OpenAi, &request).is_ok());
+    }
+
+    /// R382: a request without a level is the body keeper sent before
+    /// levels existed — the same fields with the same values, nothing added
+    /// — on every kind. (Key order is serde_json's map's, not this test's.)
+    #[test]
+    fn no_level_leaves_the_body_byte_identical() {
+        let request = ChatRequest {
+            model: "m".to_owned(),
+            messages: vec![ChatMessage::text(Role::User, "hi")],
+            ..ChatRequest::default()
+        };
+        for kind in [
+            ProviderKind::OpenAi,
+            ProviderKind::Ollama,
+            ProviderKind::Hermes,
+        ] {
+            let body = build_body(kind, &request).expect("body");
+            assert_eq!(
+                body,
+                json!({
+                    "model": "m",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": true,
+                    "stream_options": {"include_usage": true},
+                }),
+                "{kind:?}"
+            );
+        }
+    }
+
+    /// R382 on the wire: an `openai` endpoint is sent every level verbatim,
+    /// Ollama its three under the same field, Hermes none — each refusal a
+    /// named one before a byte goes out.
+    #[test]
+    fn a_level_reaches_the_kinds_that_take_it_and_is_refused_by_the_rest() {
+        let at = |effort: Effort| ChatRequest {
+            model: "m".to_owned(),
+            messages: vec![ChatMessage::text(Role::User, "hi")],
+            effort: Some(effort),
+            ..ChatRequest::default()
+        };
+        for effort in Effort::ALL {
+            let openai = build_body(ProviderKind::OpenAi, &at(effort)).expect("openai body");
+            assert_eq!(openai["reasoning_effort"], json!(effort.as_str()));
+            assert!(matches!(
+                build_body(ProviderKind::Hermes, &at(effort)),
+                Err(BotsError::Unsupported { .. })
+            ));
+        }
+        for effort in [Effort::Low, Effort::Medium, Effort::High] {
+            let ollama = build_body(ProviderKind::Ollama, &at(effort)).expect("ollama body");
+            assert_eq!(ollama["reasoning_effort"], json!(effort.as_str()));
+            assert!(ollama.get("think").is_none());
+        }
+        assert!(matches!(
+            build_body(ProviderKind::Ollama, &at(Effort::Xhigh)),
+            Err(BotsError::Unsupported { .. })
+        ));
+    }
+
+    /// R405: what counts as an endpoint refusing the level — the quirk
+    /// table's refusal, a 4xx naming reasoning or the quoted level, an error
+    /// frame that does — and what does not: a 429, a 5xx, a 400 about
+    /// something else, a level word unquoted in prose.
+    #[test]
+    fn only_a_refusal_of_the_level_is_read_as_one() {
+        let status = |status: u16, body: &str| BotsError::status(status, CHAT_ENDPOINT, body);
+        let xhigh = Effort::Xhigh;
+        let openai = ProviderKind::OpenAi;
+        assert!(rejected_effort(
+            openai,
+            xhigh,
+            &status(400, r#"{"error":{"param":"reasoning_effort"}}"#)
+        ));
+        assert!(rejected_effort(
+            openai,
+            xhigh,
+            &status(422, "level 'xhigh' unknown")
+        ));
+        assert!(!rejected_effort(
+            openai,
+            xhigh,
+            &status(429, "reasoning quota")
+        ));
+        assert!(!rejected_effort(
+            openai,
+            xhigh,
+            &status(500, "reasoning failed")
+        ));
+        assert!(!rejected_effort(
+            openai,
+            xhigh,
+            &status(400, "max_tokens too large")
+        ));
+        assert!(!rejected_effort(
+            openai,
+            Effort::High,
+            &status(400, "temperature too high")
+        ));
+        assert!(rejected_effort(
+            openai,
+            xhigh,
+            &BotsError::Provider {
+                code: None,
+                message: "Reasoning is not supported".to_owned()
+            }
+        ));
+        let ollama = ProviderKind::Ollama;
+        let unsupported = BotsError::Unsupported {
+            detail: effort_refusal(ollama, xhigh).expect("refused"),
+        };
+        assert!(rejected_effort(ollama, xhigh, &unsupported));
+        let image = BotsError::Unsupported {
+            detail: "ollama cannot fetch a remote image".to_owned(),
+        };
+        assert!(!rejected_effort(ollama, xhigh, &image));
+
+        let excerpt = log_excerpt(&status(400, &format!("\u{1b}[31mbad\n{}", "x".repeat(400))));
+        assert!(excerpt.starts_with("[31mbad x"), "{excerpt}");
+        assert!(!excerpt.chars().any(char::is_control), "{excerpt:?}");
+        assert!(excerpt.chars().count() <= 200, "{}", excerpt.len());
     }
 
     #[test]

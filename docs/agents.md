@@ -218,6 +218,15 @@ only, under this Mac's principal (the organisation account's login) for a zone w
 drive's readers on this Mac. Nixi's DM is made by `keeper-agentd agents init` on the host that
 serves her.
 
+The bot picked is the folder's; under it the person may pick the folder's reasoning level (only the
+levels that bot's kind is sent are offered) and, for each ticked agent, its own bot and level
+instead (100.2 #6). A folder whose agents are local-only — its `_drive.toml` says so, or the form's
+box is ticked — is offered only the person's bots that run locally, for its own bot and each
+agent's alike; ticking the box drops a choice it no longer offers (R405). Each seeded `agent.toml`
+and `_template/` gets its `[model]` written that way:
+the agent's own choice, else the folder's. A level its bot's kind is not sent, or a choice for an
+agent that is not ticked, is refused naming it.
+
 ### The operator's steps
 
 0. Record the provider (§ *The provider*), committed, before any seeding.
@@ -266,8 +275,10 @@ What the owner records here (owed, not yet written):
 
 An agent is a folder in the zone: `80-agents/<id>/`. The folder's name is the agent's id, and the
 drive the zone belongs to is the other half of its name, so `amelia/` in tgdrive and `amelia/` in
-neuradrive are two agents with two audiences. keeper reads the home; it never writes `agent.toml`,
-`SOUL.md`, `USER.md` or `MEMORY.md`.
+neuradrive are two agents with two audiences. keeper reads the home; it never writes `SOUL.md`,
+`USER.md` or `MEMORY.md`, and writes `agent.toml` only for two keys, `[model].bot` and
+`[model].effort`, when a person saves an agent's model in Settings › Agents (R382; see
+[An agent's model](#an-agents-model)).
 
 ```text
 80-agents/nixi/
@@ -291,6 +302,7 @@ human       = "@tgorka:example.org"
 
 [model]
 bot        = "bot:openai:https://provider.example:8452#claude-opus"
+effort     = "high"
 local_only = false
 
 [tools]
@@ -314,6 +326,7 @@ workflow    = "triage"
 | `matrix_user` | required | a Matrix user id; two homes in one zone may not share one |
 | `human` | none | required for a `proxy` and refused for every other kind; a reader of the drive |
 | `[model].bot` | required | `bot:<kind>:<base URL>#<model>`, kind `hermes`, `ollama` or `openai`. The base URL carries no user or password and is normalised as a saved provider's is. |
+| `[model].effort` | none | the reasoning level sent with every turn: `low`, `medium`, `high` or `xhigh`; absent sends nothing and the provider decides. An `openai` bot is sent `reasoning_effort` with any of the four; an `ollama` bot `reasoning_effort` with `low`, `medium` or `high` (Ollama's `/v1` door takes no `think`, and `xhigh` is not a level it documents); a `hermes` bot none. Any other word, or a level the bot's kind is not sent, refuses the home naming the four levels or the kind's. |
 | `[model].local_only` | `false` | `true` needs an `ollama` bot. A drive whose `_drive.toml` says `local_only = true` makes it true for every agent homed there. |
 | `[tools].allow` | the kind's defaults | names from the tool vocabulary below. An MCP tool is not named here but by its server in `[tools].mcp`. |
 | `[tools].drives` | the home drive | drive ids in scope; the home drive is always first |
@@ -358,6 +371,54 @@ refused, naming the tool ("agent.toml's tools.allow is refused: \"drive_read\" i
 Every key is checked and every refusal names it: "agent.toml has a key keeper does not know:
 tools.tool. Remove it or fix its spelling." A bound is refused one past its edge with the value
 and the range ("agent.toml's limits.hop_limit is refused: 4 is outside 0 to 3.").
+
+### An agent's model
+
+Every agent has its own `[model]`: one may run on Opus at `high`, another on Opus at `xhigh`, a
+third on Haiku and a fourth on GPT Astra with the provider's default. **Settings › Agents** on a Mac
+whose drive holds the home lists, on each agent's row, its bot — offered from the person's own bots
+(⌘9), and only the `ollama` ones when the agent is `local_only` — and its reasoning level, offered
+from the levels that bot's kind is sent. When keeper cannot read the person's bots (`keeper.db`), the
+row says so where the choices would be and offers only the agent's current bot, whose level can
+still change; *Set up agents* says the same instead of "You have no bots yet". *Save model* writes
+`[model].bot` and `[model].effort` of that `agent.toml` and nothing else: every comment, key
+order, spacing, line ending (a CRLF file stays CRLF), a missing final newline and every other table
+stays as it was — `keeper_core::agents::home::with_model` replaces the two values where `toml_edit`
+found them in the original text and serialises nothing else. The save reads the file once, checks
+and edits those very bytes, and writes them through the drive's own write path, as the person, like
+a file saved from the Files surface (`WriteScope::route`), only if the file still holds the bytes it
+read (`files_write::replace_unmanaged`, R405); the folder's sync commits and pushes it. That last
+check and the write are one step for every writer inside keeper — two saves, a save and a file
+saved from the Files surface, a bot's tool write: each waits for the one before it, so of two saves
+made from the same file exactly one lands and the other is refused (R412). An editor or the sync's
+own `git merge`, which run outside keeper's process, are not held off: one that writes the file in
+the instant between that check and the write is written over, and the drive's git history keeps
+the revision it wrote, which the next sync shows (DW-1408). It is
+refused, with a sentence beside the control and a WARN line in `keeper.log`, when:
+
+- the file says another model than the row showed — it changed on the drive meanwhile;
+- the file changed between the save's read and its write — another save, a sync, a hand edit:
+  "Nixi's agent.toml changed while you were saving — reopen and try again." — and nothing is
+  written over the change;
+- the person's bots could not be read and the save names another bot than the current one;
+- the bot is not one of the person's (the agent's current bot stays choosable for a level change);
+- the level is not one the bot's kind is sent;
+- the Mac only pulls the drive (the row says so and offers nothing to change);
+- the file does not read — a merge left its markers in it — or the disk refused the write.
+
+**It applies from the agent's next turn.** Every turn reads the home's `agent.toml` again through
+the zone's read path and runs on the `[model]` it names now, without restarting keeper or the host;
+the rest of the file still waits for the host's next build, as before. A home that stops reading, or
+a bot no provider on the host serves, refuses the turn with that sentence in the room. A provider
+that refuses the level itself — an HTTP 4xx naming the reasoning field or the level — ends the turn
+with "Nixi's bot claude-opus-5-5 does not accept reasoning level xhigh. Choose another level, or
+none, for Nixi in Settings › Agents." in the room, and a WARN line with the provider's status code
+and at most 200 characters of what it said, control characters removed. Every
+`assistant` line of the session log names the bot (`bot`) and the level (`effort`) that turn was
+sent, so a session whose model changed reads which turn ran on which.
+
+The agent room's header names the agent's model and level (`Opus · xhigh`) on a device whose drive
+holds the home; a phone without the drive shows none.
 
 ### `SOUL.md`
 
@@ -725,6 +786,9 @@ The journal and proposal tools above are not drive writes: they are keeper's own
 
 The zone's `README.md` and `AGENTS.md` are written as anywhere else in the drive. A folder without
 the agents flag refuses nothing new.
+
+A person's *Save model* in Settings › Agents is a person's edit, not a tool's: it writes the two
+`[model]` keys through the drive's write path without this fence, and no agent can reach it.
 
 ## What an agent is told
 
@@ -2147,7 +2211,7 @@ per date and host, compared as a number. Each host writes only its own chunks an
 | `claim` | `epoch, action` (`acquired`, `renewed`, `released`, `lost`), `from_host, claim_event, server_ts` |
 | `user` | `sender, text, attachments` |
 | `peer` | `sender, text`, optional `ask {id, question, room, label}` (another agent's question for the proxy's person, in the proxy's session), `answers {id, choice}` (the person's answer to this session's ask, relayed by their proxy; `choice` is `null` when the answer picks none) and `artifacts` |
-| `assistant` | `text, model, finish, usage {prompt, completion}, ttft_ms, duration_ms, anchor_event`; a round that called tools carries that round's own usage |
+| `assistant` | `text, model, finish, usage {prompt, completion}, ttft_ms, duration_ms, anchor_event`; a round that called tools carries that round's own usage. An agent's turn adds `bot` (its `bot:` reference as `[model].bot` named it for that turn) and `effort` when a level was sent (100.2 #3); a line without them is one written before 100.2, or a helper's step |
 | `tool_call` | `call_id, tool, args, tier`, optional `grant_id`; `args` is the string the model sent, verbatim |
 | `tool_result` | `call_id, outcome` (`ok`, `refused`, `failed`), `content`, optional `truncated {shown, total}`, `label`, optional `paseo {broker, id}` (the run a successful Paseo `create_agent` started) |
 | `approval` | `id, state` (`requested`, `decided`, `consumed`, `expired`, `refused`), optional `decision, by, result, reason, scope`; terminal: `consumed`, `expired`, `refused`, and `decided` with `decision: "deny"`; a `decided` line without `decision` is a decision ignored, `reason` saying why |

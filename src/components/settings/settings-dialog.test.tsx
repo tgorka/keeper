@@ -236,7 +236,14 @@ vi.mock("@/lib/ipc/client", () => ({
     Promise.resolve({ readExec: [], env: [], status: "", refusal: null }),
   ),
   agentsSeedOffer: vi.fn(() =>
-    Promise.resolve({ folders: [], catalogue: [], bots: [], accounts: [] }),
+    Promise.resolve({
+      folders: [],
+      catalogue: [],
+      bots: [],
+      localBots: [],
+      botsUnread: null,
+      accounts: [],
+    }),
   ),
   botsGrantsList: vi.fn(() => Promise.resolve({ grants: [], unknown: [] })),
   botsBotsList: vi.fn(() => Promise.resolve([])),
@@ -1308,6 +1315,7 @@ describe("SettingsDialog", () => {
           differences: [],
         },
         problem: null,
+        model: null,
       },
     ]);
     mockPosture.mockResolvedValue(false);

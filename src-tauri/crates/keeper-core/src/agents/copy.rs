@@ -96,6 +96,9 @@ pub struct AgentCopyVm {
     pub pin: Option<AgentPinVm>,
     /// Why this Mac does not host the agent now, in one sentence.
     pub problem: Option<String>,
+    /// The agent's model and level, and the bots it may run on (100.2 #4);
+    /// `None` on a folder's own row.
+    pub model: Option<crate::agents::model::AgentModelVm>,
 }
 
 /// The owner, readers and `local_only` the person was shown and is pinning.

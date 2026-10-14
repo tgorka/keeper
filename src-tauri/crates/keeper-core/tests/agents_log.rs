@@ -636,6 +636,8 @@ fn compact_replaces_the_lines_through_it_with_one_summary() {
         at(1),
         2,
         LineBody::Assistant(AssistantBody {
+            bot: None,
+            effort: None,
             text: "first answer".into(),
             model: "m".into(),
             finish: "stop".into(),
@@ -865,6 +867,8 @@ impl Logging {
             return id;
         }
         let body = LineBody::Assistant(AssistantBody {
+            bot: None,
+            effort: None,
             text: std::mem::take(&mut self.text),
             model: "llama3.1".into(),
             finish: self.finish.clone(),
@@ -1806,6 +1810,8 @@ fn helper_steps_are_in_the_log_and_out_of_the_replay() {
     };
     let assistant = |text: &str, finish: &str, tokens: u32| {
         LineBody::Assistant(AssistantBody {
+            bot: None,
+            effort: None,
             text: text.to_owned(),
             model: "m".to_owned(),
             finish: finish.to_owned(),

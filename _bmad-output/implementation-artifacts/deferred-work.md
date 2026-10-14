@@ -10625,3 +10625,66 @@ origin: rung `agents-100-errors` (2026-10-14)
 location: `push_ios.rs`, `push_android.rs` (`failure_notice::tell`), `web_auth.rs` (`OAuthFlowRegistry::fail`), `voice_ipc.rs`
 reason: the macOS check compiles the desktop target only; the phone ports are `cfg(target_os = "ios" | "android")` and compile in CI's mobile jobs or a phone build. Owed: an iOS and an Android build, and a push registration the homeserver refuses read back as the toast and the line under Settings' push setting.
 status: open
+
+### DW-1400: An agent's model save, its next turn and its header line are proved on Linux only.
+
+origin: rung `agents-100-model` (story 100.2, 2026-10-14)
+location: `keeper::agents_host::agents_model_set`, Settings › Agents, the agent room header
+reason: the write path, the per-turn re-read and the header line are proved by Linux tests and the mock shell. Owed on hesperia: save Nixi's model and level in Settings › Agents on a real synced drive, see the commit the folder's engine makes carry only the two `[model]` keys, send Nixi a message and read the new `bot`/`effort` on the turn's `assistant` line and the request in `keeper.log`, and see the room header's line change after the next scan. Also owed (review-100model-1): the owner's four-agent case — four agents saved on four bot/level pairs, the drive's commit published, agentd on electra receiving it, and each agent's next request and `assistant` line carrying its pair; "saved on the Mac" and "the remote host has it" are reported apart.
+status: open
+
+### DW-1401: The shell side of 100.2 is changed by inspection.
+
+origin: rung `agents-100-model` (story 100.2, 2026-10-14)
+location: `src-tauri/crates/keeper/src/agents_host.rs` (`agents_model_set`, `bot_choices`, `rows`, the scan's `replace_models`), `src-tauri/crates/keeper/src/lib.rs` (registration)
+reason: the shell crate does not compile on Linux; these edits are checked by the macOS check named in the rung's report or, failing that, by CI's macOS job. The first round's hesperia clippy compiled them (`mac-100model.log`); fix round 1 (R405) changed `bot_choices` to a fallible read with `bot_choices_or_sentence`, `agents_seed_offer` and the scan's once-only WARN, re-checked as its report says. What stays owed is behaviour on the device (DW-1400).
+status: open
+
+### DW-1402: A Hermes bot cannot be given a reasoning level.
+
+origin: rung `agents-100-model` (story 100.2, R382, R406)
+location: `keeper_core::bots::quirks` (`Quirks::efforts` for `Hermes` is empty), `keeper_core::bots::chat::build_body`
+reason: Hermes documents a request-scoped `model_options.reasoning_effort` (research §2.4), but keeper sends no `model_options`; R382 refuses `effort` on a Hermes bot at load instead of sending a field the wire does not carry. Sending it would be a second body shape for one kind, worth a story of its own with a live Hermes run.
+status: open
+
+### DW-1403: A home that stops reading drops out of Settings › Agents without its sentence.
+
+origin: rung `agents-100-model` (story 100.2, 2026-10-14)
+location: `keeper_agent::desktop::listing` (a home that does not read is skipped)
+reason: a hand edit that breaks `agent.toml` (an `effort = "max"`, say) refuses the agent's next turn with the home's sentence in its room (R407), but the Settings › Agents row disappears instead of showing that sentence. Pre-existing for every refusal of a home; a row per refused home, with its sentence and no controls, would close it.
+status: open
+
+### DW-1404: A helper or review layer running on the agent's own bot is not sent its level.
+
+origin: rung `agents-100-model` (story 100.2, 2026-10-14)
+location: `keeper_agent::helper` (the helper's `ChatRequest`), `keeper_agent::agent` (`AllowedTools` helper launch)
+reason: `[model].effort` rides every round of the agent's own turns; a `helper` call that runs on the agent's bot (no lens bot) sends no level, and its `assistant` steps carry no `bot`/`effort`. Whether a helper should think as hard as its caller is a decision, not a gap to fill silently.
+status: open
+
+### DW-1405: `keeper-agentd agents init` seeds one bot for every agent and no level.
+
+origin: rung `agents-100-model` (story 100.2 #6, 2026-10-14)
+location: `keeper-agentd` `agents init` (`SeedChoices::new` without `with_models`)
+reason: *Set up agents* on the Mac lets each seeded agent take its own bot and level (`SeedChoices::with_models`); the server's CLI still takes one `--bot` for all. Flags like `--effort` and `--model <agent>=<bot>[@level]` would bring it level.
+status: open
+
+### DW-1406: An agents zone inside a notes vault cannot have a model saved from Settings.
+
+origin: rung `agents-100-model` (story 100.2, R408)
+location: `keeper_agent::desktop::write_model` (`WriteRoute::Vault` arm)
+reason: the save writes through `WriteScope::route` with no vault, so a home inside a vault is refused ("inside a notes vault…") rather than written past the vault's own writer (which marks the vault dirty and touches its index). No zone is known to live in a vault; if one does, the save would route through the shell's `notes_vault` writer.
+status: open
+
+### DW-1407: A change to an agent's `local_only` alone waits for the host's next build.
+
+origin: rung `agents-100-model` (story 100.2, R407; review-100model-1)
+location: `keeper_agent::agent::current_model`
+reason: each turn re-reads `[model]`, but returns early when `bot` and `effort` are unchanged, so a hand edit of `local_only` alone is taken at the host's next build, not the next turn (a save from Settings never changes it). The same function clones `AgentDeps` on every turn once the model differs from the host's build; a lighter per-turn model context would avoid it. Neither is measured as a fault today.
+status: open
+
+### DW-1408: A writer outside keeper's process can still land between a model save's last check and its write.
+
+origin: rung `agents-100-model` (fix round 2, R412; review-100model-2 R100M2-01)
+location: `keeper_sync::files_write::publish_unmanaged` (`replace_unmanaged`), `keeper_sync::git::cli::GitCli::{merge_ff_only, merge_theirs, checkout_side}`
+reason: the final read-and-hash and the rename are held mutually exclusive with every keeper writer of the file in the same process (`Publishing`, R412). A writer in another process takes no lock of keeper's: an editor, or the sync engine's working-tree update — in-process on the Mac, but written by a child `git merge`/`git checkout`, not through a keeper-sync per-path API. One that writes `agent.toml` between the check and the rename is written over. Accepted by R412: the drive is a git repository, so the overwritten revision stays in its history and the next sync surfaces it. Closing it would take a conditional rename (no safe platform call exists) or an advisory file lock every writer honours (`git` and editors do not).
+status: open

@@ -341,7 +341,81 @@ fn req(readers: &[&str]) -> AgentSeedReq {
         local_only: false,
         bot: Some(BOT.to_owned()),
         with: vec!["nixi".to_owned()],
+        effort: None,
+        models: Vec::new(),
     }
+}
+
+/// 100.2 #6: *Set up agents* seeds each ticked agent on its own bot and
+/// level where the person chose one, and on the folder's otherwise —
+/// `_template/` too; a level the bot's kind is not sent, or a choice for an
+/// agent not ticked, is refused naming it.
+#[test]
+fn each_seeded_agent_takes_its_own_bot_and_level_or_the_folders() {
+    use keeper_core::agents::seed::{files, AgentSeedModelReq};
+    use keeper_core::bots::chat::Effort;
+
+    let root = tempfile::tempdir().expect("tempdir");
+    let profiles = vec![profile(root.path())];
+    let login = Some("tgorka");
+    let ollama = "bot:ollama:http://electra.example.org:11434#qwen3:32b";
+    let both = AgentSeedReq {
+        with: vec!["nixi".to_owned(), "tola-grey".to_owned()],
+        effort: Some(Effort::High),
+        models: vec![AgentSeedModelReq {
+            agent: "tola-grey".to_owned(),
+            bot: ollama.to_owned(),
+            effort: Some(Effort::Low),
+        }],
+        ..req(&[TGORKA])
+    };
+    let (choices, _) = desktop_choices(&profiles, None, login, &both).expect("seeded");
+    let written = files(&choices);
+    let model_of = |path: &str| {
+        let text = &written
+            .iter()
+            .find(|file| file.path == path)
+            .expect("written")
+            .text;
+        let table: toml::Table = text.parse().expect("toml");
+        (
+            table["model"]["bot"].as_str().map(str::to_owned),
+            table["model"]
+                .get("effort")
+                .and_then(|e| e.as_str())
+                .map(str::to_owned),
+        )
+    };
+    let folder = (Some(BOT.to_owned()), Some("high".to_owned()));
+    assert_eq!(model_of("nixi/agent.toml"), folder);
+    assert_eq!(model_of("_template/agent.toml"), folder);
+    assert_eq!(
+        model_of("tola-grey/agent.toml"),
+        (Some(ollama.to_owned()), Some("low".to_owned()))
+    );
+
+    let too_high = AgentSeedReq {
+        models: vec![AgentSeedModelReq {
+            agent: "tola-grey".to_owned(),
+            bot: ollama.to_owned(),
+            effort: Some(Effort::Xhigh),
+        }],
+        ..both.clone()
+    };
+    let refused = desktop_choices(&profiles, None, login, &too_high).expect_err("xhigh");
+    assert!(
+        refused.starts_with("Dr Tola Grey's level is refused: ollama bots take"),
+        "{refused}"
+    );
+    let unticked = AgentSeedReq {
+        with: vec!["nixi".to_owned()],
+        ..both
+    };
+    let refused = desktop_choices(&profiles, None, login, &unticked).expect_err("unticked");
+    assert!(
+        refused.contains("\"tola-grey\" is not one of the agents ticked"),
+        "{refused}"
+    );
 }
 
 /// *Set up agents* on a Mac: refused with no bot (S-20), against this Mac's
@@ -478,7 +552,7 @@ fn the_form_starts_from_the_zone_and_the_pin() {
     let pins = [("P2".to_owned(), local_pin())].into_iter().collect();
     let accounts = [TGORKA.to_owned()];
 
-    let offered = offer(&profiles, &pins, &accounts, Some("tgorka"), Vec::new());
+    let offered = offer(&profiles, &pins, &accounts, Some("tgorka"), Ok(Vec::new()));
     let [file, new] = offered.folders.as_slice() else {
         panic!("{:?}", offered.folders);
     };
@@ -490,7 +564,7 @@ fn the_form_starts_from_the_zone_and_the_pin() {
     assert_eq!(new.preselected, ["nixi", "tola-grey"]);
     assert_eq!(new.problem, None);
 
-    let no_account = offer(&profiles, &pins, &[], Some("tgorka"), Vec::new());
+    let no_account = offer(&profiles, &pins, &[], Some("tgorka"), Ok(Vec::new()));
     assert_eq!(
         no_account.folders[0].problem, None,
         "the file names the owner"

@@ -153,7 +153,13 @@ pub fn read_zone(drive_id: &str, profile: &SyncProfile, pinned: Option<&DriveDec
     }
 }
 
-fn read_home(zone_dir: &Path, folder: &str, decl: &DriveDecl) -> Result<AgentHome, String> {
+/// One home's `agent.toml`, read and parsed against `decl`: the scan's read,
+/// and every turn's re-read of its model (100.2 #5).
+pub(crate) fn read_home(
+    zone_dir: &Path,
+    folder: &str,
+    decl: &DriveDecl,
+) -> Result<AgentHome, String> {
     let rel = format!("{folder}/{}", home::FILE_NAME);
     let text = read_text(zone_dir, &rel)?
         .ok_or_else(|| format!("{folder}/ has no {}.", home::FILE_NAME))?;

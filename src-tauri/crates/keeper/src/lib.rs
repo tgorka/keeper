@@ -1702,6 +1702,9 @@ pub fn run() {
         agents_host::agents_seed_offer,
         agents_host::agents_seed_plan,
         agents_host::agents_seed_apply,
+        // An agent's model and level (100.2 #4, R382): a write of its
+        // `agent.toml`, which only a Mac with the drive can make.
+        agents_host::agents_model_set,
         // This Mac's own MCP servers and `[sandbox]` table (96.2 #11,
         // R213): device-local, desktop-only like the section.
         agents_host::agents_mcp_list,

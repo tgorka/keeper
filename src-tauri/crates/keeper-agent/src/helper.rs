@@ -305,6 +305,8 @@ impl ToolHost for Reads<'_> {
 /// A round of the helper's model, as its line.
 fn round(text: String, finish: String, usage: Usage, model: &str) -> Step {
     Step::Round(AssistantBody {
+        bot: None,
+        effort: None,
         text,
         model: model.to_owned(),
         finish,

@@ -2,11 +2,12 @@
  * The header line of an agent room, beside its timeline (UX-DR129).
  *
  * One line: the agent's identity cell, its `agent@host` handle, the run badge,
- * and what it is waiting for or doing. Under it, the scope chip (the drives in
+ * its model and reasoning level where its home is on this device (100.2), and
+ * what it is waiting for or doing. Under it, the scope chip (the drives in
  * scope, in the scope event's order) and the label chip (readers by name,
  * integrity as a word). Every word here that is not plain copy is Rust's — the
- * handle, the run, the detail drawn as sent, the unreadable sentence, the label
- * sentence — so this file only lays them out.
+ * handle, the run, the model line, the detail drawn as sent, the unreadable
+ * sentence, the label sentence — so this file only lays them out.
  *
  * In a gate room (UX-DR147) a line above them names the outside system: the
  * `system` the gate is the door for and its account, by the name Rust quoted
@@ -101,6 +102,17 @@ export function AgentRoomHeader({
             <span className="sr-only">run: </span>
             {status.run}
           </Badge>
+          {status.model != null && (
+            <span
+              data-testid="agent-model"
+              className="min-w-0 truncate text-muted-foreground text-xs"
+            >
+              <span className="sr-only">model: </span>
+              {status.model.effort === null
+                ? status.model.bot
+                : `${status.model.bot} · ${status.model.effort}`}
+            </span>
+          )}
           {doing !== null && (
             <span className="min-w-0 truncate text-muted-foreground">{doing}</span>
           )}

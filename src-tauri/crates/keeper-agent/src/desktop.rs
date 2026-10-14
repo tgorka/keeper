@@ -29,16 +29,18 @@ use keeper_core::agents::agentd::DrivePin;
 use keeper_core::agents::copy::{self, AgentCopyVm};
 use keeper_core::agents::drive::DriveDecl;
 use keeper_core::agents::events::CONTROL_ROOM_TYPE;
-use keeper_core::agents::home::AgentKind;
+use keeper_core::agents::home::{self, AgentKind};
 use keeper_core::agents::host::Materialized;
 use keeper_core::agents::index::Index;
 use keeper_core::agents::log::HostSlug;
 use keeper_core::agents::mac_tables::{self, Heard, HeardTool, MacTables};
 use keeper_core::agents::matrix::{self, AgentClient, AgentMatrixError};
+use keeper_core::agents::model::{self, AgentModelLineVm, AgentModelReq};
 use keeper_core::agents::mount::pin_matches;
 use keeper_core::agents::proxy::ProxyFacts;
 use keeper_core::agents::room::ScopeDriveVm;
 use keeper_core::agents::run::SandboxTable;
+use keeper_core::agents::seed::AgentSeedBotVm;
 use keeper_core::agents::soul;
 use keeper_core::agents::trust::{Anchor, OwnAccount};
 use keeper_core::bots::chat::{self, CancelHandle, CancelSignal};
@@ -279,6 +281,7 @@ pub fn no_homeserver(user: &UserId) -> String {
 pub fn listing(
     facts: &DesktopFacts,
     rows: &[ProviderRow],
+    bots: model::Choices<'_>,
     platform: &dyn Platform,
     names: &Names,
     problems: &Problems,
@@ -299,6 +302,7 @@ pub fn listing(
                     signed_in: false,
                     pin: None,
                     problem: Some(sentence),
+                    model: None,
                 });
                 continue;
             }
@@ -345,6 +349,11 @@ pub fn listing(
                 host: facts.device.clone(),
                 pin: Some(pin_vm.clone()),
                 problem,
+                model: Some(model::model_vm(
+                    &home.config,
+                    bots,
+                    (!profile.direction.pushes()).then(|| model::pull_only(&decl.id)),
+                )),
             });
         }
     }
@@ -382,6 +391,129 @@ pub fn zone_agents(facts: &DesktopFacts) -> BTreeMap<OwnedUserId, Option<String>
         }
     }
     agents
+}
+
+/// Each agent of this principal's flagged folders, by Matrix user, with its
+/// model line — its bot named as the person's bots name it, and its level
+/// — for the room header (100.2 #7). A home that does not read has none.
+pub fn zone_models(
+    facts: &DesktopFacts,
+    bots: &[AgentSeedBotVm],
+) -> BTreeMap<OwnedUserId, AgentModelLineVm> {
+    let mut models = BTreeMap::new();
+    for profile in facts.profiles.iter().filter(|p| p.agents.is_some()) {
+        let Ok(decl) = declared(profile) else {
+            continue;
+        };
+        if facts
+            .login
+            .as_deref()
+            .is_some_and(|login| copy::hosts_principal(&decl, login).is_err())
+        {
+            continue;
+        }
+        for (_, home) in read_zone(&decl.id, profile, Some(&decl)).homes {
+            let Ok(home) = home else { continue };
+            models.insert(
+                home.config.matrix_user.clone(),
+                model::line(&home.config, bots),
+            );
+        }
+    }
+    models
+}
+
+/// Settings › Agents' save of one agent's model (100.2 #4, #8; R382, R405):
+/// the home's `agent.toml` with `[model].bot` and `[model].effort` changed
+/// and every other byte kept, written through the drive's own write path —
+/// `WriteScope::route` and its compare-and-replace writer, as the Files
+/// surface saves a person's file — as the person. The folder's engine
+/// commits and pushes it like any edit; the agent's next turn runs on it
+/// ([`crate::agent::current_model`]). Each refusal is one sentence.
+pub fn write_model(
+    profiles: &[SyncProfile],
+    req: &AgentModelReq,
+    bots: model::Choices<'_>,
+) -> Result<(), String> {
+    prepare_model(profiles, req, bots)?.publish()
+}
+
+/// A model save made from one read of `agent.toml` (R405): the bytes it
+/// read, their revision, and what replaces them.
+#[derive(Debug)]
+pub struct ModelSave {
+    name: String,
+    target: keeper_sync::files_write::UnmanagedPath,
+    read: keeper_sync::files_write::Revision,
+    next: String,
+}
+
+impl ModelSave {
+    /// Write it, only over the bytes it was made from: a file changed since
+    /// — another save, a sync, a hand edit — keeps its change and the save
+    /// is refused, saying so.
+    pub fn publish(self) -> Result<(), String> {
+        use keeper_sync::files_write::{self, WriteRefusal};
+        match files_write::replace_unmanaged(&self.target, &self.read, &self.next) {
+            Ok(()) => Ok(()),
+            Err(WriteRefusal::ChangedSinceRead { .. }) => {
+                Err(model::changed_while_saving(&self.name))
+            }
+            Err(refusal) => Err(refusal.to_string()),
+        }
+    }
+}
+
+/// The first half of [`write_model`]: `agent.toml` read once, `req` checked
+/// against what those very bytes say — the row showed this model, the bot is
+/// offered — those bytes edited and parsed as the host will parse them, and
+/// the path routed through `WriteScope::route`. Nothing is written.
+pub fn prepare_model(
+    profiles: &[SyncProfile],
+    req: &AgentModelReq,
+    bots: model::Choices<'_>,
+) -> Result<ModelSave, String> {
+    use keeper_sync::files_write::{Revision, WriteRoute, WriteScope};
+
+    let (profile, decl, home) = find_home(profiles, &req.profile_id, &req.agent)?;
+    if !profile.direction.pushes() {
+        return Err(model::pull_only(&decl.id));
+    }
+    let file = format!("{}/{}", home.config.id, home::FILE_NAME);
+    let text = read_text(&home.zone, &file)?
+        .ok_or_else(|| format!("{file} is not on this Mac any more."))?;
+    let read = Revision::of(text.as_bytes());
+    let config = home::parse_agent_toml(&text, &home.config.id, &decl)
+        .map_err(|refusal| refusal.to_string())?;
+    let bot = model::check(req, &config, bots)?;
+    let next = home::with_model(&text, &bot.reference(), req.effort)
+        .map_err(|refusal| refusal.to_string())?;
+    home::parse_agent_toml(&next, &home.config.id, &decl).map_err(|refusal| refusal.to_string())?;
+    let subpath = format!(
+        "{}/{}",
+        crate::agent::drive_relative(&profile.local_path, &home.dir),
+        home::FILE_NAME
+    );
+    let scope = WriteScope::new(&profile.name, None).with_sessions(
+        profile
+            .sessions
+            .as_ref()
+            .map(|sessions| sessions.subfolder.as_str()),
+    );
+    match scope
+        .route(None::<()>, &profile.local_path, &subpath)
+        .map_err(|refusal| refusal.to_string())?
+    {
+        WriteRoute::Unmanaged(target) => Ok(ModelSave {
+            name: config.name,
+            target,
+            read,
+            next,
+        }),
+        WriteRoute::Vault { .. } => Err(format!(
+            "{subpath} is inside a notes vault, which this Mac writes only from the notes view."
+        )),
+    }
 }
 
 /// Each proxy of this principal's flagged folders, by Matrix user: its
@@ -1355,6 +1487,7 @@ mod tests {
         let rows = listing(
             &facts,
             &[],
+            Ok(&[]),
             &platform(root.path()),
             &Names::new(),
             &Problems::new(),
@@ -1364,6 +1497,178 @@ mod tests {
         assert_eq!(rows[0].agent, "");
         assert_eq!(rows[0].pin, None);
         assert_eq!(rows[0].problem.as_deref(), Some(sentence.as_str()));
+    }
+
+    /// 100.2 #4 and #8 (R382): Settings › Agents lists the agent's model
+    /// with the person's bots, and a save writes only `[model].bot` and
+    /// `[model].effort` of its `agent.toml` through the drive's write path;
+    /// a file changed meanwhile, a Mac that only pulls the drive and a file
+    /// a merge left unreadable are each refused with a sentence, the file
+    /// as it was.
+    #[test]
+    fn a_saved_model_writes_two_keys_of_agent_toml_or_says_why_not() {
+        use keeper_core::agents::model::{AgentModelReq, CHANGED_UNDERNEATH};
+        use keeper_core::bots::chat::Effort;
+
+        let root = tempfile::tempdir().expect("tempdir");
+        nixi_drive(root.path());
+        let file = root.path().join("80-agents/nixi/agent.toml");
+        let before = format!(
+            "# Nixi, by hand.\n{}\n[tools]  # mine\ndrives = [\"tgdrive\"]\n",
+            std::fs::read_to_string(&file).expect("agent.toml")
+        );
+        std::fs::write(&file, &before).expect("commented");
+        let current = format!("bot:ollama:{NIXI_BOT}#model");
+        const OPUS: &str = "bot:openai:https://provider.example:8452#claude-opus";
+        let bots = vec![AgentSeedBotVm {
+            reference: OPUS.to_owned(),
+            name: "Opus".to_owned(),
+            provider: "CLIProxyAPI".to_owned(),
+            efforts: Effort::ALL.to_vec(),
+        }];
+        let profile = profile(root.path());
+        let facts = DesktopFacts {
+            login: Some("tgorka".to_owned()),
+            device: Some("hesperia".to_owned()),
+            profiles: vec![profile.clone()],
+            ..DesktopFacts::default()
+        };
+        let rows = listing(
+            &facts,
+            &[],
+            Ok(&bots),
+            &platform(root.path()),
+            &Names::new(),
+            &Problems::new(),
+        );
+        let shown = rows[0].model.clone().expect("a model");
+        let current = keeper_core::agents::home::BotRef::parse(&current)
+            .expect("bot")
+            .reference();
+        assert_eq!(shown.bot, current);
+        assert_eq!(shown.effort, None);
+        let names: Vec<&str> = shown.bots.iter().map(|bot| bot.name.as_str()).collect();
+        assert_eq!(names, vec!["model", "Opus"]);
+        assert_eq!(shown.locked, None);
+
+        let save = |effort| AgentModelReq {
+            profile_id: "p1".to_owned(),
+            agent: "nixi".to_owned(),
+            bot: OPUS.to_owned(),
+            effort,
+            shown_bot: shown.bot.clone(),
+            shown_effort: shown.effort,
+        };
+        write_model(&facts.profiles, &save(Some(Effort::Xhigh)), Ok(&bots)).expect("saved");
+        let after = std::fs::read_to_string(&file).expect("agent.toml");
+        assert_eq!(
+            after,
+            before.replace(
+                &format!("bot:ollama:{NIXI_BOT}#model\""),
+                &format!("{OPUS}\"\neffort = \"xhigh\"")
+            )
+        );
+
+        // The row showed the old model: the file moved on since.
+        assert_eq!(
+            write_model(&facts.profiles, &save(Some(Effort::Low)), Ok(&bots)),
+            Err(CHANGED_UNDERNEATH.to_owned())
+        );
+        assert_eq!(std::fs::read_to_string(&file).expect("kept"), after);
+
+        let mut pulling = profile.clone();
+        pulling.direction = keeper_sync::profile::SyncDirection::PullOnly;
+        let refused =
+            write_model(&[pulling.clone()], &save(None), Ok(&bots)).expect_err("pull-only");
+        assert!(refused.contains("only pulls tgdrive"), "{refused}");
+        let pulled = listing(
+            &DesktopFacts {
+                profiles: vec![pulling],
+                ..facts.clone()
+            },
+            &[],
+            Ok(&bots),
+            &platform(root.path()),
+            &Names::new(),
+            &Problems::new(),
+        );
+        assert_eq!(
+            pulled[0]
+                .model
+                .as_ref()
+                .and_then(|model| model.locked.clone()),
+            Some(refused)
+        );
+
+        let merged = format!("{after}<<<<<<< ours\n");
+        std::fs::write(&file, &merged).expect("conflicted");
+        let refused = write_model(&facts.profiles, &save(None), Ok(&bots)).expect_err("unreadable");
+        assert!(refused.contains("not valid TOML"), "{refused}");
+        assert_eq!(std::fs::read_to_string(&file).expect("kept"), merged);
+    }
+
+    /// R405 (R100M1-01): a save's read and its write are one snapshot. A
+    /// competing save of the model, or a sync's edit to another table,
+    /// landing between them is never written over: the save is refused with
+    /// "changed while you were saving" and the file keeps the other change;
+    /// a save made from the file as it reads now then goes through.
+    #[test]
+    fn a_change_between_a_saves_read_and_its_write_is_never_overwritten() {
+        use keeper_core::agents::home::with_model;
+        use keeper_core::agents::model::AgentModelReq;
+        use keeper_core::bots::chat::Effort;
+
+        let root = tempfile::tempdir().expect("tempdir");
+        nixi_drive(root.path());
+        let file = root.path().join("80-agents/nixi/agent.toml");
+        let current =
+            keeper_core::agents::home::BotRef::parse(&format!("bot:ollama:{NIXI_BOT}#model"))
+                .expect("bot")
+                .reference();
+        const OPUS: &str = "bot:openai:https://provider.example:8452#claude-opus";
+        let bots = vec![AgentSeedBotVm {
+            reference: OPUS.to_owned(),
+            name: "Opus".to_owned(),
+            provider: "CLIProxyAPI".to_owned(),
+            efforts: Effort::ALL.to_vec(),
+        }];
+        let profiles = vec![profile(root.path())];
+        let save = |shown_effort| AgentModelReq {
+            profile_id: "p1".to_owned(),
+            agent: "nixi".to_owned(),
+            bot: OPUS.to_owned(),
+            effort: Some(Effort::Xhigh),
+            shown_bot: current.clone(),
+            shown_effort,
+        };
+        let before = std::fs::read_to_string(&file).expect("agent.toml");
+
+        // Another save of the model lands after this one read the file.
+        let mine = prepare_model(&profiles, &save(None), Ok(&bots)).expect("prepared");
+        let theirs = with_model(&before, &current, Some(Effort::Low)).expect("theirs");
+        std::fs::write(&file, &theirs).expect("their save");
+        assert_eq!(
+            mine.publish(),
+            Err(
+                "Nixi's agent.toml changed while you were saving — reopen and try again."
+                    .to_owned()
+            )
+        );
+        assert_eq!(std::fs::read_to_string(&file).expect("kept"), theirs);
+
+        // A sync edits another table after this save read the file.
+        let mine = prepare_model(&profiles, &save(Some(Effort::Low)), Ok(&bots)).expect("prepared");
+        let synced = format!("{theirs}\n[limits]\nrounds_per_turn = 4\n");
+        std::fs::write(&file, &synced).expect("a sync");
+        assert!(mine.publish().is_err());
+        assert_eq!(std::fs::read_to_string(&file).expect("kept"), synced);
+
+        // Made from the file as it reads now, the save writes its two keys.
+        write_model(&profiles, &save(Some(Effort::Low)), Ok(&bots)).expect("saved");
+        assert_eq!(
+            std::fs::read_to_string(&file).expect("saved"),
+            with_model(&synced, OPUS, Some(Effort::Xhigh)).expect("expected")
+        );
     }
 
     /// Each agent of the principal's flagged folders, by Matrix user, with

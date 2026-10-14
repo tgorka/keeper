@@ -190,6 +190,10 @@ pub enum WriteRefusal {
         relative_path: String,
         reason: String,
     },
+    /// A compare-and-replace found the file changed since the caller read
+    /// it ([`replace_unmanaged`], R405): nothing was written over the
+    /// change.
+    ChangedSinceRead { relative_path: String },
     /// The removal itself failed once everything had been allowed.
     ///
     /// A separate variant from [`Self::WriteFailed`] because the verb is what
@@ -304,6 +308,11 @@ impl std::fmt::Display for WriteRefusal {
                 relative_path,
                 reason,
             } => write!(f, "keeper could not write {relative_path}: {reason}"),
+            Self::ChangedSinceRead { relative_path } => write!(
+                f,
+                "{relative_path} changed while you were saving, so keeper wrote nothing over \
+                 it — reopen it and try again."
+            ),
             Self::DeleteFailed {
                 relative_path,
                 reason,
@@ -1074,7 +1083,61 @@ pub enum WriteRoute<V> {
 /// Exact bytes: no trailing-newline normalisation and no re-encoding, for the
 /// same reason the vault path does not do it either — a file the user did not
 /// change must not change.
+///
+/// The rename is made holding the file's [`Publishing`] lock, so it never
+/// lands between a [`replace_unmanaged`]'s final check and that replace's own
+/// rename (R412).
 pub fn write_unmanaged(target: &UnmanagedPath, content: &str) -> Result<(), WriteRefusal> {
+    publish_unmanaged(target, None, content)
+}
+
+/// What a file held when a caller read it: the SHA-256 of its bytes, for a
+/// write that must not land over a change made after that read
+/// ([`replace_unmanaged`], R405).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Revision([u8; 32]);
+
+impl Revision {
+    /// The revision of `bytes`, as read.
+    pub fn of(bytes: &[u8]) -> Revision {
+        use sha2::{Digest, Sha256};
+        Revision(Sha256::digest(bytes).into())
+    }
+}
+
+/// [`write_unmanaged`] as a compare-and-replace (R405, R412): `content`
+/// replaces the file only when the file still holds `read` — the revision
+/// the caller's edit was made from — and otherwise nothing is written and
+/// the refusal is [`WriteRefusal::ChangedSinceRead`].
+///
+/// The final read-and-compare and the rename are one step for every writer
+/// in keeper's process: both are made holding the file's [`Publishing`]
+/// lock, which every unmanaged writer of this module takes. Two saves made
+/// from one revision therefore cannot both pass the check — the second
+/// waits for the first's rename, then compares against it and is refused.
+///
+/// A writer outside this process — the sync engine's `git merge` (a child
+/// process), an editor — takes no lock of keeper's, and one that writes
+/// after the final read and before the rename is written over. That is the
+/// accepted residual of R412: the drive is a git repository, so the
+/// revision written over stays in its history and the next sync shows it.
+pub fn replace_unmanaged(
+    target: &UnmanagedPath,
+    read: &Revision,
+    content: &str,
+) -> Result<(), WriteRefusal> {
+    publish_unmanaged(target, Some(read), content)
+}
+
+/// The one temp-and-rename behind [`write_unmanaged`] and
+/// [`replace_unmanaged`]: the bytes are staged first, outside the lock, so
+/// what the lock covers is only the comparison (when there is a `read`) and
+/// the rename.
+fn publish_unmanaged(
+    target: &UnmanagedPath,
+    read: Option<&Revision>,
+    content: &str,
+) -> Result<(), WriteRefusal> {
     let failed = |error: std::io::Error| WriteRefusal::WriteFailed {
         relative_path: target.profile_relative.clone(),
         reason: error.to_string(),
@@ -1084,6 +1147,25 @@ pub fn write_unmanaged(target: &UnmanagedPath, content: &str) -> Result<(), Writ
     let directory = target.absolute.parent().unwrap_or_else(|| Path::new("."));
     let temp = directory.join(format!(".keeper.{}.tmp", ulid::Ulid::new()));
     std::fs::write(&temp, content.as_bytes()).map_err(failed)?;
+    let _held = Publishing::hold(&target.absolute);
+    if let Some(read) = read {
+        let now = match std::fs::read(&target.absolute) {
+            Ok(bytes) => Some(Revision::of(&bytes)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                let _ = std::fs::remove_file(&temp);
+                return Err(failed(error));
+            }
+        };
+        if now.as_ref() != Some(read) {
+            let _ = std::fs::remove_file(&temp);
+            return Err(WriteRefusal::ChangedSinceRead {
+                relative_path: target.profile_relative.clone(),
+            });
+        }
+    }
+    #[cfg(test)]
+    seam::fire(&target.absolute, seam::Point::Renaming);
     if let Err(error) = std::fs::rename(&temp, &target.absolute) {
         // A failed rename must not leave the temp behind. It is excluded from
         // sync, but it is still litter in the owner's folder.
@@ -1091,6 +1173,116 @@ pub fn write_unmanaged(target: &UnmanagedPath, content: &str) -> Result<(), Writ
         return Err(failed(error));
     }
     Ok(())
+}
+
+/// One file being published by keeper's unmanaged writers (R412): held from
+/// a replace's final check through its rename, and released on drop.
+///
+/// Process-wide and keyed by the resolved path ([`UnmanagedPath`] is
+/// canonical), so every thread of this process — the Settings save, the
+/// Files surface, a bot's tool call — waits for the one before it. A set of
+/// busy paths rather than a map of mutexes: an entry lives only while a
+/// rename is under way, so the set never grows past the writes in flight.
+struct Publishing<'a> {
+    path: &'a Path,
+}
+
+/// The paths being published, and the condition their waiters sleep on.
+type Busy = (
+    std::sync::Mutex<std::collections::HashSet<PathBuf>>,
+    std::sync::Condvar,
+);
+
+impl<'a> Publishing<'a> {
+    fn busy() -> &'static Busy {
+        static BUSY: std::sync::LazyLock<Busy> = std::sync::LazyLock::new(Busy::default);
+        &BUSY
+    }
+
+    /// Wait until no other writer of this process is publishing `path`,
+    /// then hold it.
+    fn hold(path: &'a Path) -> Publishing<'a> {
+        let (busy, freed) = Self::busy();
+        let mut busy = busy
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        #[cfg(test)]
+        if busy.contains(path) {
+            seam::fire(path, seam::Point::Waiting);
+        }
+        while busy.contains(path) {
+            busy = freed
+                .wait(busy)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        busy.insert(path.to_path_buf());
+        Publishing { path }
+    }
+}
+
+impl Drop for Publishing<'_> {
+    fn drop(&mut self) {
+        let (busy, freed) = Self::busy();
+        busy.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(self.path);
+        freed.notify_all();
+    }
+}
+
+/// A seam inside [`publish_unmanaged`], for tests only (R412): the race it
+/// closes is between two statements, and a thread racing another on a
+/// tempdir would be flakier than no test at all. Keyed on the file, so
+/// parallel tests, each in its own tempdir, cannot fire one another's hooks.
+/// Production builds carry neither the map nor the calls.
+#[cfg(test)]
+mod seam {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, LazyLock, Mutex, PoisonError};
+
+    /// Where a writer is.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum Point {
+        /// Holding the file, its check passed, about to rename.
+        Renaming,
+        /// Found the file held by another writer, about to wait for it.
+        Waiting,
+    }
+
+    type Hook = Arc<dyn Fn(Point) + Send + Sync>;
+
+    static HOOKS: LazyLock<Mutex<HashMap<PathBuf, Hook>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    /// Call `hook` at every point a writer of `path` reaches, until
+    /// [`remove`].
+    pub(super) fn install(path: &Path, hook: impl Fn(Point) + Send + Sync + 'static) {
+        HOOKS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(path.to_path_buf(), Arc::new(hook));
+    }
+
+    pub(super) fn remove(path: &Path) {
+        HOOKS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(path);
+    }
+
+    /// Called by the writers. The hook is cloned out of the map before it
+    /// runs, so one writer blocked in it does not stop another reaching it.
+    pub(super) fn fire(path: &Path, point: Point) {
+        let hook = HOOKS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(path)
+            .cloned();
+        if let Some(hook) = hook {
+            hook(point);
+        }
+    }
 }
 
 /// Where an out-of-vault removal puts the bytes (AD-102, NFR-30).
@@ -2280,6 +2472,155 @@ mod tests {
                 content
             );
         }
+    }
+
+    /// R405: a compare-and-replace writes only over the bytes its edit was
+    /// made from. A file changed after that read — by anyone — keeps the
+    /// change, nothing is written and no temp file is left; the file as it
+    /// reads now is then written over normally.
+    #[test]
+    fn a_compare_and_replace_never_writes_over_a_change_made_after_its_read() {
+        let root = profile();
+        let target = unmanaged(
+            scope()
+                .route(Some(FakeVault("live")), root.path(), "AGENTS.md")
+                .expect("routed"),
+        );
+        let file = root.path().join("AGENTS.md");
+        std::fs::write(&file, "read\r\n").expect("before");
+        let read = Revision::of(b"read\r\n");
+
+        std::fs::write(&file, "theirs\r\n").expect("a change after the read");
+        assert_eq!(
+            replace_unmanaged(&target, &read, "mine\r\n"),
+            Err(WriteRefusal::ChangedSinceRead {
+                relative_path: "AGENTS.md".to_owned()
+            })
+        );
+        assert_eq!(std::fs::read(&file).expect("kept"), b"theirs\r\n");
+        let litter = std::fs::read_dir(root.path())
+            .expect("listing")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with(".keeper."))
+            .count();
+        assert_eq!(litter, 0);
+
+        let now = Revision::of(&std::fs::read(&file).expect("now"));
+        assert_eq!(replace_unmanaged(&target, &now, "mine\r\n"), Ok(()));
+        assert_eq!(std::fs::read(&file).expect("written"), b"mine\r\n");
+    }
+
+    type Outcome = Result<(), WriteRefusal>;
+
+    /// `first` runs until it holds `file` with its check passed, the step
+    /// before its rename; only then does `second` start, and `first` renames
+    /// once `second` has either reached that same step or is waiting for the
+    /// file. Both outcomes, in order.
+    fn interleaved(
+        file: &Path,
+        first: impl FnOnce() -> Outcome + Send + 'static,
+        second: impl FnOnce() -> Outcome + Send + 'static,
+    ) -> (Outcome, Outcome) {
+        use std::sync::{mpsc, Mutex};
+        use std::time::Duration;
+        const PATIENCE: Duration = Duration::from_secs(30);
+
+        let key = file.canonicalize().expect("canonical");
+        let (events, seen) = mpsc::channel::<(String, seam::Point)>();
+        let (go, gate) = mpsc::channel::<()>();
+        let gate = Mutex::new(gate);
+        seam::install(&key, move |point| {
+            let who = std::thread::current().name().unwrap_or("").to_owned();
+            let held = who == "first" && point == seam::Point::Renaming;
+            let _ = events.send((who, point));
+            if held {
+                let _ = gate.lock().expect("gate").recv_timeout(PATIENCE);
+            }
+        });
+        let spawn = |name: &str, write: Box<dyn FnOnce() -> Outcome + Send>| {
+            std::thread::Builder::new()
+                .name(name.to_owned())
+                .spawn(write)
+                .expect("spawn")
+        };
+        let a = spawn("first", Box::new(first));
+        assert_eq!(
+            seen.recv_timeout(PATIENCE).expect("first at its rename"),
+            ("first".to_owned(), seam::Point::Renaming)
+        );
+        let b = spawn("second", Box::new(second));
+        let (who, _) = seen.recv_timeout(PATIENCE).expect("second under way");
+        assert_eq!(who, "second");
+        go.send(()).expect("go");
+        let outcomes = (a.join().expect("first"), b.join().expect("second"));
+        seam::remove(&key);
+        outcomes
+    }
+
+    /// R412 (R100M2-01): two saves made from one revision meet at the final
+    /// check — the second arrives while the first has passed it and not yet
+    /// renamed. Exactly one goes through, the other is refused as changed
+    /// since its read, and the file holds the winner's bytes.
+    #[test]
+    fn two_replaces_from_one_revision_never_both_land() {
+        let root = profile();
+        let target = unmanaged(
+            scope()
+                .route(Some(FakeVault("live")), root.path(), "AGENTS.md")
+                .expect("routed"),
+        );
+        let file = root.path().join("AGENTS.md");
+        let read = Revision::of(&std::fs::read(&file).expect("read"));
+        let (mine, theirs) = (target.clone(), read.clone());
+
+        let outcomes = interleaved(
+            &file,
+            move || replace_unmanaged(&mine, &theirs, "first\n"),
+            move || replace_unmanaged(&target, &read, "second\n"),
+        );
+
+        assert_eq!(
+            outcomes,
+            (
+                Ok(()),
+                Err(WriteRefusal::ChangedSinceRead {
+                    relative_path: "AGENTS.md".to_owned()
+                })
+            )
+        );
+        assert_eq!(std::fs::read(&file).expect("winner"), b"first\n");
+        let litter = std::fs::read_dir(root.path())
+            .expect("listing")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with(".keeper."))
+            .count();
+        assert_eq!(litter, 0);
+    }
+
+    /// R412: keeper's other writer of the same file — the Files surface, a
+    /// bot's tool call — never lands between a replace's check and its
+    /// rename, where the replace would write over it unseen: it waits, and
+    /// its bytes are the ones the file keeps.
+    #[test]
+    fn a_plain_write_waits_for_a_replace_under_way_and_is_not_written_over() {
+        let root = profile();
+        let target = unmanaged(
+            scope()
+                .route(Some(FakeVault("live")), root.path(), "AGENTS.md")
+                .expect("routed"),
+        );
+        let file = root.path().join("AGENTS.md");
+        let read = Revision::of(&std::fs::read(&file).expect("read"));
+        let mine = target.clone();
+
+        let outcomes = interleaved(
+            &file,
+            move || replace_unmanaged(&mine, &read, "replaced\n"),
+            move || write_unmanaged(&target, "typed\n"),
+        );
+
+        assert_eq!(outcomes, (Ok(()), Ok(())));
+        assert_eq!(std::fs::read(&file).expect("last"), b"typed\n");
     }
 
     /// **NFR-30 outside the vault: the bytes go to the OS trash and are still

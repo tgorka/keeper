@@ -3,8 +3,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   AGENTS_RELOAD_MS,
   AgentsSection,
+  MODEL_SAVE_LABEL,
   PIN_LABEL,
+  PROVIDER_DEFAULT_LABEL,
   REVIEW_READERS_LABEL,
+  SEED_NO_BOTS,
   SEED_PREVIEW_LABEL,
   SEED_WRITE_LABEL,
   SET_UP_AGENTS_LABEL,
@@ -12,10 +15,12 @@ import {
 } from "@/components/settings/agents-section";
 import type {
   AgentCopyVm,
+  AgentModelVm,
   AgentPersonVm,
   AgentPinVm,
   AgentSeedFolderVm,
   AgentSeedOfferVm,
+  Effort,
 } from "@/lib/ipc/client";
 import {
   agentsCopies,
@@ -23,6 +28,7 @@ import {
   agentsDriveRepin,
   agentsMcpList,
   agentsMcpRemove,
+  agentsModelSet,
   agentsSeedApply,
   agentsSeedOffer,
   agentsSeedPlan,
@@ -37,6 +43,7 @@ vi.mock("@/lib/ipc/client", () => ({
   agentsSeedApply: vi.fn(),
   agentsMcpList: vi.fn(),
   agentsMcpRemove: vi.fn(),
+  agentsModelSet: vi.fn(),
   agentsMcpDraft: vi.fn(() =>
     Promise.resolve({ floor: null, fixed: null, tools: [], conflicts: [], drop: null }),
   ),
@@ -97,10 +104,18 @@ function nixi(pin: AgentPinVm, signedIn = false): AgentCopyVm {
     signedIn,
     pin,
     problem: null,
+    model: null,
   };
 }
 
-const NO_FOLDERS: AgentSeedOfferVm = { folders: [], catalogue: [], bots: [], accounts: [] };
+const NO_FOLDERS: AgentSeedOfferVm = {
+  folders: [],
+  catalogue: [],
+  bots: [],
+  localBots: [],
+  botsUnread: null,
+  accounts: [],
+};
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -258,6 +273,7 @@ describe("Settings › Agents", () => {
         signedIn: false,
         pin: null,
         problem: sentence,
+        model: null,
       },
     ]);
     render(<AgentsSection open />);
@@ -326,6 +342,13 @@ const fresh: AgentSeedFolderVm = {
 };
 
 const WORK_BOT = "bot:openai:https://provider.example:8452/v1#gpt-5";
+const QWEN = "bot:ollama:http://electra.example:11434#qwen3:32b";
+const QWEN_BOT = {
+  reference: QWEN,
+  name: "Qwen on electra",
+  provider: "electra",
+  efforts: ["low", "medium", "high"] as Effort[],
+};
 
 function offerOf(...folders: AgentSeedFolderVm[]): AgentSeedOfferVm {
   return {
@@ -336,13 +359,17 @@ function offerOf(...folders: AgentSeedFolderVm[]): AgentSeedOfferVm {
       { id: "lucyna-novak", name: "Dr Lucyna Novak", kind: "steward", homeDrive: "neuradrive" },
     ],
     bots: [
-      { reference: WORK_BOT, name: "Work model", provider: "Provider" },
       {
-        reference: "bot:ollama:http://electra.example:11434#qwen3:32b",
-        name: "Qwen on electra",
-        provider: "electra",
+        reference: WORK_BOT,
+        name: "Work model",
+        provider: "Provider",
+        efforts: ["low", "medium", "high", "xhigh"],
       },
+      QWEN_BOT,
     ],
+    // Rust's `seed::local_choices` of the two.
+    localBots: [QWEN_BOT],
+    botsUnread: null,
     accounts: ["@tgorka:tgorka.org"],
   };
 }
@@ -355,7 +382,7 @@ async function openSetUp() {
 describe("Settings › Agents › Set up agents", () => {
   it("picks no bot for the person and asks Rust with none until they pick one", async () => {
     vi.mocked(agentsCopies).mockResolvedValue([]);
-    vi.mocked(agentsSeedOffer).mockResolvedValue(offerOf(declared));
+    vi.mocked(agentsSeedOffer).mockResolvedValue(offerOf({ ...declared, localOnly: false }));
     vi.mocked(agentsSeedPlan).mockResolvedValue({ write: ["README.md"], left: [] });
     await openSetUp();
 
@@ -408,7 +435,7 @@ describe("Settings › Agents › Set up agents", () => {
     expect(screen.queryByLabelText(/^Readers/)).not.toBeInTheDocument();
     expect(screen.getByRole("checkbox", { name: /^Nixi/ })).toBeChecked();
     expect(screen.getByRole("checkbox", { name: /^Dr Lucyna Novak/ })).not.toBeChecked();
-    fireEvent.click(screen.getByRole("radio", { name: /Work model/ }));
+    fireEvent.click(screen.getByRole("radio", { name: /Qwen on electra/ }));
     fireEvent.click(screen.getByRole("button", { name: SEED_PREVIEW_LABEL }));
 
     const toWrite = await screen.findByRole("list", { name: /^Files to write/ });
@@ -429,8 +456,10 @@ describe("Settings › Agents › Set up agents", () => {
       owner: "@tgorka:tgorka.org",
       readers: ["@marta:tgorka.org", "@tgorka:tgorka.org"],
       localOnly: true,
-      bot: WORK_BOT,
+      bot: QWEN,
       with: ["nixi", "tola-grey"],
+      effort: null,
+      models: [],
     });
   });
 
@@ -543,5 +572,208 @@ describe("Settings › Agents › Set up agents", () => {
     expect(screen.getByRole("heading", { name: "marta-notes" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: SET_UP_AGENTS_LABEL })).not.toBeInTheDocument();
     expect(screen.queryByRole("checkbox")).not.toBeInTheDocument();
+  });
+});
+
+const OPUS = "bot:openai:https://cliproxy.example:8452#claude-opus-5-5";
+
+/** Nixi on Opus at xhigh; Rust offers Opus (four levels) and Qwen (three). */
+const OPUS_XHIGH: AgentModelVm = {
+  bot: OPUS,
+  effort: "xhigh",
+  bots: [
+    {
+      reference: OPUS,
+      name: "Opus",
+      provider: "CLIProxyAPI",
+      efforts: ["low", "medium", "high", "xhigh"],
+    },
+    {
+      reference: QWEN,
+      name: "Qwen on electra",
+      provider: "electra",
+      efforts: ["low", "medium", "high"],
+    },
+  ],
+  locked: null,
+  unread: null,
+};
+
+function withModel(model: AgentModelVm): AgentCopyVm {
+  return { ...nixi({ ...unpinned, localOnly: false, state: "pinned" }, true), model };
+}
+
+async function choose(name: string, option: string) {
+  const control = screen.getByRole("combobox", { name });
+  fireEvent.keyDown(control, { key: "Enter" });
+  fireEvent.click(await screen.findByRole("option", { name: option }));
+  await waitFor(() => expect(control).toHaveTextContent(option));
+}
+
+describe("Settings › Agents › an agent's model (100.2)", () => {
+  it("offers the bots Rust lists with each one's levels, and saves the choice against what it showed", async () => {
+    vi.mocked(agentsCopies).mockResolvedValue([withModel(OPUS_XHIGH)]);
+    const saved: AgentModelVm = { ...OPUS_XHIGH, bot: QWEN, effort: "high" };
+    vi.mocked(agentsModelSet).mockResolvedValue([withModel(saved)]);
+    render(<AgentsSection open />);
+
+    const model = await screen.findByRole("combobox", { name: "Model" });
+    expect(model).toHaveTextContent("Opus — CLIProxyAPI");
+    expect(screen.getByRole("combobox", { name: "Reasoning" })).toHaveTextContent("xhigh");
+    // Nothing changed: nothing to save.
+    expect(screen.getByRole("button", { name: MODEL_SAVE_LABEL })).toBeDisabled();
+
+    // Qwen is sent no xhigh, so the level goes back to the provider's default.
+    await choose("Model", "Qwen on electra — electra");
+    expect(screen.getByRole("combobox", { name: "Reasoning" })).toHaveTextContent(
+      PROVIDER_DEFAULT_LABEL,
+    );
+    fireEvent.keyDown(screen.getByRole("combobox", { name: "Reasoning" }), { key: "Enter" });
+    const levels = await screen.findAllByRole("option");
+    expect(levels.map((level) => level.textContent)).toEqual([
+      PROVIDER_DEFAULT_LABEL,
+      "low",
+      "medium",
+      "high",
+    ]);
+    fireEvent.click(levels[3]);
+    fireEvent.click(screen.getByRole("button", { name: MODEL_SAVE_LABEL }));
+
+    await waitFor(() =>
+      expect(agentsModelSet).toHaveBeenCalledWith({
+        profileId: "p1",
+        agent: "nixi",
+        bot: QWEN,
+        effort: "high",
+        shownBot: OPUS,
+        shownEffort: "xhigh",
+      }),
+    );
+    expect(
+      await screen.findByText("Saved to Nixi's agent.toml. Its next turn runs on it."),
+    ).toHaveAttribute("role", "status");
+  });
+
+  it("says Rust's refusal beside the control and keeps the choice", async () => {
+    const sentence =
+      "This agent's agent.toml names another model than the one shown here: it changed on the drive meanwhile. Look at it again and choose.";
+    vi.mocked(agentsCopies).mockResolvedValue([withModel(OPUS_XHIGH)]);
+    vi.mocked(agentsModelSet).mockRejectedValue({
+      code: "internal",
+      message: sentence,
+      accountId: null,
+      retriable: false,
+    });
+    render(<AgentsSection open />);
+    await screen.findByRole("combobox", { name: "Model" });
+    await choose("Reasoning", "low");
+    fireEvent.click(screen.getByRole("button", { name: MODEL_SAVE_LABEL }));
+
+    expect((await screen.findByRole("alert")).textContent).toBe(sentence);
+    expect(screen.getByRole("combobox", { name: "Reasoning" })).toHaveTextContent("low");
+  });
+
+  it("offers nothing to change on a Mac that cannot write the drive, and says why", async () => {
+    const locked =
+      "This Mac only pulls tgdrive, so a change made here would never reach the drive. Change the model where the drive is written.";
+    vi.mocked(agentsCopies).mockResolvedValue([withModel({ ...OPUS_XHIGH, locked })]);
+    render(<AgentsSection open />);
+
+    expect(await screen.findByText(locked)).toBeInTheDocument();
+    expect(screen.getByRole("combobox", { name: "Model" })).toBeDisabled();
+    expect(screen.getByRole("combobox", { name: "Reasoning" })).toBeDisabled();
+    expect(screen.queryByRole("button", { name: MODEL_SAVE_LABEL })).not.toBeInTheDocument();
+  });
+
+  it("lets each seeded agent take its own bot and level, the rest the folder's", async () => {
+    vi.mocked(agentsCopies).mockResolvedValue([]);
+    vi.mocked(agentsSeedOffer).mockResolvedValue(offerOf({ ...declared, localOnly: false }));
+    vi.mocked(agentsSeedPlan).mockResolvedValue({ write: ["README.md"], left: [] });
+    await openSetUp();
+
+    fireEvent.click(screen.getByRole("radio", { name: /Work model/ }));
+    await choose("Their reasoning level", "xhigh");
+    await choose("Dr Tola Grey", "Qwen on electra");
+    await choose("Dr Tola Grey's level", "low");
+    fireEvent.click(screen.getByRole("button", { name: SEED_PREVIEW_LABEL }));
+
+    await waitFor(() =>
+      expect(agentsSeedPlan).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          bot: WORK_BOT,
+          effort: "xhigh",
+          with: ["nixi", "tola-grey"],
+          models: [{ agent: "tola-grey", bot: QWEN, effort: "low" }],
+        }),
+      ),
+    );
+  });
+
+  it("offers a local-only folder only the bots Rust lists as local, for the folder and each agent", async () => {
+    vi.mocked(agentsCopies).mockResolvedValue([]);
+    vi.mocked(agentsSeedOffer).mockResolvedValue(offerOf(declared));
+    await openSetUp();
+
+    const radios = screen.getAllByRole("radio");
+    expect(radios.map((radio) => radio.getAttribute("value"))).toEqual([QWEN]);
+    fireEvent.click(screen.getByRole("radio", { name: /Qwen on electra/ }));
+    fireEvent.keyDown(screen.getByRole("combobox", { name: "Dr Tola Grey" }), { key: "Enter" });
+    const options = await screen.findAllByRole("option");
+    expect(options.map((option) => option.textContent)).toEqual([
+      "The agents' bot and level",
+      "Qwen on electra",
+    ]);
+  });
+
+  it("takes back a choice the folder stops offering when its agents become local-only", async () => {
+    vi.mocked(agentsCopies).mockResolvedValue([]);
+    vi.mocked(agentsSeedOffer).mockResolvedValue(offerOf({ ...fresh, localOnly: false }));
+    vi.mocked(agentsSeedPlan).mockResolvedValue({ write: ["README.md"], left: [] });
+    await openSetUp();
+
+    fireEvent.click(screen.getByRole("radio", { name: /Work model/ }));
+    await choose("Dr Lucyna Novak", "Work model");
+    fireEvent.click(screen.getByRole("checkbox", { name: /^Local models only/ }));
+
+    expect(screen.queryByRole("radio", { name: /Work model/ })).not.toBeInTheDocument();
+    expect(screen.getByRole("radio", { name: /Qwen on electra/ })).not.toBeChecked();
+    // Nothing the folder no longer offers is asked for.
+    fireEvent.click(screen.getByRole("button", { name: SEED_PREVIEW_LABEL }));
+    await waitFor(() =>
+      expect(agentsSeedPlan).toHaveBeenLastCalledWith(
+        expect.objectContaining({ localOnly: true, bot: null, models: [] }),
+      ),
+    );
+    fireEvent.click(screen.getByRole("radio", { name: /Qwen on electra/ }));
+    expect(screen.getByRole("combobox", { name: "Dr Lucyna Novak" })).toHaveTextContent(
+      "The agents' bot and level",
+    );
+    fireEvent.click(screen.getByRole("button", { name: SEED_PREVIEW_LABEL }));
+    await waitFor(() =>
+      expect(agentsSeedPlan).toHaveBeenLastCalledWith(
+        expect.objectContaining({ localOnly: true, bot: QWEN, models: [] }),
+      ),
+    );
+  });
+
+  it("says Rust's sentence where the bots would be when they could not be read", async () => {
+    const sentence =
+      "Your bots could not be read on this Mac, so no other bot can be offered here. The reason is in keeper's log; look at Settings › Bots, then open this again.";
+    vi.mocked(agentsCopies).mockResolvedValue([
+      withModel({ ...OPUS_XHIGH, bots: [OPUS_XHIGH.bots[0]], unread: sentence }),
+    ]);
+    vi.mocked(agentsSeedOffer).mockResolvedValue({
+      ...offerOf({ ...declared, localOnly: false }),
+      bots: [],
+      localBots: [],
+      botsUnread: sentence,
+    });
+    await openSetUp();
+
+    const alerts = await screen.findAllByRole("alert");
+    expect(alerts.map((alert) => alert.textContent)).toEqual([sentence, sentence]);
+    expect(screen.queryByText(SEED_NO_BOTS)).not.toBeInTheDocument();
+    expect(screen.queryAllByRole("radio")).toHaveLength(0);
+    expect(screen.getByRole("combobox", { name: "Model" })).toHaveTextContent("Opus");
   });
 });

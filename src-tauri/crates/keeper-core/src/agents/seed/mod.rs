@@ -23,6 +23,7 @@ use super::agentd::DrivePin;
 use super::drive::{self, DriveDecl, DEFAULT_UNTRUSTED};
 use super::home::{not_local_bot, serves_local_models, BotRef};
 use super::mount::pin_matches;
+use crate::bots::chat::{effort_refusal, Effort};
 use crate::bots::store::ProviderRow;
 use crate::bots::Bot;
 use crate::bots::ProviderKind;
@@ -150,6 +151,12 @@ pub struct SeedChoices {
     /// `bot:{kind}:{base}#{target}`, normalised.
     pub bot: String,
     bot_kind: ProviderKind,
+    /// The folder's level, written beside its bot (R382); `None`: none.
+    pub effort: Option<Effort>,
+    /// A seeded agent's own bot and level where the person chose one
+    /// (100.2 #6): `(agent id, bot, its kind, level)`. Every other agent,
+    /// and `_template/`, takes the folder's.
+    models: Vec<(String, String, ProviderKind, Option<Effort>)>,
     /// The catalogue's agents to write, in catalogue order.
     pub with: Vec<&'static Catalogued>,
 }
@@ -202,10 +209,58 @@ impl SeedChoices {
             decl,
             bot,
             bot_kind,
+            effort: None,
+            models: Vec::new(),
             with: chosen,
         };
         choices.check_bot(&choices.decl, None)?;
         Ok(choices)
+    }
+
+    /// These choices with the folder's level `effort` and each ticked
+    /// agent's own bot and level in `models` (100.2 #6, R382): an agent
+    /// named there runs on its own; every other on the folder's. A level its
+    /// bot's kind is not sent, an agent not ticked, or a bot that does not
+    /// run locally on a `local_only` drive is refused, naming it.
+    pub fn with_models(
+        mut self,
+        effort: Option<Effort>,
+        models: &[AgentSeedModelReq],
+    ) -> Result<SeedChoices, String> {
+        if let Some(reason) = effort.and_then(|effort| effort_refusal(self.bot_kind, effort)) {
+            return Err(format!("The agents' level is refused: {reason}."));
+        }
+        self.effort = effort;
+        for model in models {
+            let Some(agent) = self.with.iter().find(|agent| agent.id == model.agent) else {
+                return Err(format!(
+                    "\"{}\" is not one of the agents ticked for this seed.",
+                    model.agent
+                ));
+            };
+            let bot = BotRef::parse(model.bot.trim())?;
+            if let Some(reason) = model
+                .effort
+                .and_then(|effort| effort_refusal(bot.kind, effort))
+            {
+                return Err(format!("{}'s level is refused: {reason}.", agent.name));
+            }
+            self.models.retain(|(id, ..)| id != agent.id);
+            self.models
+                .push((agent.id.to_owned(), bot.reference(), bot.kind, model.effort));
+        }
+        self.check_bot(&self.decl, None)?;
+        Ok(self)
+    }
+
+    /// The bot and level `agent` is seeded with: its own, else the folder's.
+    fn model_of(&self, agent: &str) -> (&str, Option<Effort>) {
+        self.models
+            .iter()
+            .find(|(id, ..)| id == agent)
+            .map_or((self.bot.as_str(), self.effort), |(_, bot, _, effort)| {
+                (bot.as_str(), *effort)
+            })
     }
 
     /// The homeserver the seeded agents' Matrix users are on: the owner's.
@@ -244,9 +299,13 @@ impl SeedChoices {
     /// (a host ORs them, review R34-03), as `home.rs` would refuse it.
     fn check_bot(&self, hosting: &DriveDecl, pin: Option<&DrivePin>) -> Result<(), String> {
         let local_only = hosting.local_only || pin.is_some_and(|pin| pin.local_only);
-        if local_only && !serves_local_models(self.bot_kind) {
-            let why = format!("_drive.toml's local_only is true for {}", hosting.id);
-            return Err(format!("{}.", not_local_bot(&why, self.bot_kind)));
+        let kinds =
+            std::iter::once(self.bot_kind).chain(self.models.iter().map(|(_, _, kind, _)| *kind));
+        for kind in kinds {
+            if local_only && !serves_local_models(kind) {
+                let why = format!("_drive.toml's local_only is true for {}", hosting.id);
+                return Err(format!("{}.", not_local_bot(&why, kind)));
+            }
         }
         Ok(())
     }
@@ -304,6 +363,18 @@ fn render(text: &str, choices: &SeedChoices) -> String {
         .replace("{{bot}}", &quoted(&choices.bot))
 }
 
+/// An `agent.toml` of the seed: [`render`] with `agent`'s own bot and level
+/// in its `[model]` (100.2 #6) — the folder's for `_template/` and for an
+/// agent the person gave none.
+fn render_agent(text: &str, choices: &SeedChoices, agent: &str) -> String {
+    let (bot, effort) = choices.model_of(agent);
+    let mut model = format!("bot = {}\n", quoted(bot));
+    if let Some(effort) = effort {
+        model.push_str(&format!("effort = {}\n", quoted(effort.as_str())));
+    }
+    render(&text.replace("bot = {{bot}}\n", &model), choices)
+}
+
 /// Every file the seed holds, zone-relative, whether or not it is there.
 pub fn files(choices: &SeedChoices) -> Vec<SeedFile> {
     let file = |path: String, text: String| SeedFile { path, text };
@@ -338,13 +409,13 @@ pub fn files(choices: &SeedChoices) -> Vec<SeedFile> {
     };
     files.extend(home(
         TEMPLATE_DIR,
-        render(TEMPLATE_AGENT, choices),
+        render_agent(TEMPLATE_AGENT, choices, TEMPLATE_DIR),
         TEMPLATE_SOUL.to_owned(),
     ));
     for agent in &choices.with {
         files.extend(home(
             agent.id,
-            render(agent.agent_toml, choices),
+            render_agent(agent.agent_toml, choices, agent.id),
             render(agent.soul, choices),
         ));
     }
@@ -470,6 +541,8 @@ pub struct AgentSeedBotVm {
     pub name: String,
     /// Its provider's name.
     pub provider: String,
+    /// The levels its kind is sent, lowest first (R382); empty: none.
+    pub efforts: Vec<Effort>,
 }
 
 /// A synced folder that keeps agents (`[folder.agents]`), with what the form
@@ -511,6 +584,13 @@ pub struct AgentSeedOfferVm {
     pub catalogue: Vec<AgentSeedAgentVm>,
     /// Never preselected (S-20).
     pub bots: Vec<AgentSeedBotVm>,
+    /// Those of `bots` that run locally ([`local_choices`]): all a folder
+    /// whose agents are `local_only` is offered, for its own bot and for
+    /// each agent's (R405).
+    pub local_bots: Vec<AgentSeedBotVm>,
+    /// Why `bots` is not the person's list — `keeper.db` could not be read
+    /// — in the sentence shown where the bots would be (R381, R405).
+    pub bots_unread: Option<String>,
     /// The signed-in Matrix accounts, for the owner and readers.
     pub accounts: Vec<String>,
 }
@@ -529,6 +609,25 @@ pub struct AgentSeedReq {
     pub bot: Option<String>,
     /// Catalogue ids.
     pub with: Vec<String>,
+    /// The folder's level, beside its bot; `None`: none (R382).
+    #[serde(default)]
+    pub effort: Option<Effort>,
+    /// A ticked agent's own bot and level, where the person chose one
+    /// (100.2 #6); every other agent takes the folder's.
+    #[serde(default)]
+    pub models: Vec<AgentSeedModelReq>,
+}
+
+/// One seeded agent's own bot and level (100.2 #6).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct AgentSeedModelReq {
+    /// A catalogue id among the ticked agents.
+    pub agent: String,
+    /// `bot:{kind}:{base}#{target}`.
+    pub bot: String,
+    pub effort: Option<Effort>,
 }
 
 /// What a seed would write and what it would leave, zone-relative.
@@ -592,8 +691,36 @@ pub fn bot_choices(providers: &[ProviderRow], bots: &[Bot]) -> Vec<AgentSeedBotV
                 .bot_reference(&bot.target),
                 name: bot.name.clone(),
                 provider: provider.provider.name.clone(),
+                efforts: crate::bots::quirks::quirks(provider.provider.kind)
+                    .efforts
+                    .to_vec(),
             })
         })
+        .collect()
+}
+
+/// The person's own bots as [`bot_choices`] offers them, read from
+/// `keeper.db` in `data_dir` — or why they could not be: its providers, or
+/// its bots, could not be read (R381, R405). A store with neither is an
+/// empty list, not a failure.
+pub fn read_bot_choices(data_dir: &std::path::Path) -> Result<Vec<AgentSeedBotVm>, String> {
+    let providers = crate::bots::store::list_providers(data_dir)
+        .map_err(|error| format!("keeper.db's bot providers could not be read: {error}"))?;
+    let bots = crate::bots::store::list_bots(data_dir)
+        .map_err(|error| format!("keeper.db's bots could not be read: {error}"))?;
+    Ok(bot_choices(&providers.rows, &bots))
+}
+
+/// Those of `choices` that run locally: the only bots a `local_only`
+/// folder's agents may run on, so the only ones *Set up agents* offers it
+/// — for the folder and for each agent alike (R405; `home::serves_local_models`).
+pub fn local_choices(choices: &[AgentSeedBotVm]) -> Vec<AgentSeedBotVm> {
+    choices
+        .iter()
+        .filter(|choice| {
+            BotRef::parse(&choice.reference).is_ok_and(|bot| serves_local_models(bot.kind))
+        })
+        .cloned()
         .collect()
 }
 

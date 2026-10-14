@@ -62,11 +62,16 @@ import type {
   AgentMcpListVm,
   AgentMcpServerReq,
   AgentMcpServerVm,
+  AgentModelBotVm,
+  AgentModelLineVm,
+  AgentModelReq,
+  AgentModelVm,
   AgentPersonVm,
   AgentPinVm,
   AgentRoomHeaderVm,
   AgentSandboxReq,
   AgentSandboxVm,
+  AgentSeedBotVm,
   AgentSeedOfferVm,
   AgentSeedPlanVm,
   AgentSeedReq,
@@ -101,6 +106,7 @@ import type {
   DeviceCodeVm,
   DocumentVm,
   DriveFolderVm,
+  Effort,
   FailureOperation,
   FailureStateVm,
   FileSizeVm,
@@ -5543,6 +5549,20 @@ function agentPin(): AgentPinVm {
       ],
     };
   }
+  if (agentsParam === "models") {
+    // A drive that is not local-only, pinned: its agents run on any of the
+    // person's bots (100.2).
+    return {
+      state: "pinned",
+      owner: AGENT_OWNER,
+      readers: AGENT_READERS,
+      localOnly: false,
+      pinnedOwner: AGENT_OWNER,
+      pinnedReaders: AGENT_READERS,
+      pinnedLocalOnly: false,
+      differences: [],
+    };
+  }
   return {
     state: "unpinned",
     owner: AGENT_OWNER,
@@ -5554,7 +5574,73 @@ function agentPin(): AgentPinVm {
     differences: [],
   };
 }
+/**
+ * Each agent's model (story 100.2): the person's bots with the levels Rust
+ * says each kind is sent — every level for an `openai` endpoint, three for
+ * Ollama. A local-only agent is offered only the local bot. `?agents=models`
+ * opens on a drive that is not local-only, where Nixi runs on Opus at xhigh and
+ * Tara on Haiku at high; `?modelsave=fails` refuses a save as a drive the Mac
+ * cannot write would. Every sentence is copied from `keeper_core::agents::model`.
+ */
+const AGENT_BOTS: AgentModelBotVm[] = [
+  {
+    reference: "bot:openai:https://cliproxy.example:8452#claude-opus-5-5",
+    name: "Opus",
+    provider: "CLIProxyAPI",
+    efforts: ["low", "medium", "high", "xhigh"],
+  },
+  {
+    reference: "bot:openai:https://cliproxy.example:8452#claude-haiku-4-5",
+    name: "Haiku",
+    provider: "CLIProxyAPI",
+    efforts: ["low", "medium", "high", "xhigh"],
+  },
+  {
+    reference: "bot:openai:https://cliproxy.example:8452#gpt-6-astra",
+    name: "GPT Astra",
+    provider: "CLIProxyAPI",
+    efforts: ["low", "medium", "high", "xhigh"],
+  },
+  {
+    reference: "bot:ollama:http://electra.example:11434#qwen3:32b",
+    name: "Qwen on electra",
+    provider: "electra",
+    efforts: ["low", "medium", "high"],
+  },
+];
+const MODEL_CHANGED_UNDERNEATH =
+  "This agent's agent.toml names another model than the one shown here: it changed on the drive meanwhile. Look at it again and choose.";
+const modelSaveFails = new URLSearchParams(window.location.search).get("modelsave") === "fails";
+/**
+ * `?botsunread=1`: keeper.db's bots could not be read (R405). Each row offers
+ * its current bot alone with the sentence, and *Set up agents* says it where
+ * the bots would be. Copied from `keeper_core::agents::model::BOTS_UNREAD`.
+ */
+const botsUnread = new URLSearchParams(window.location.search).get("botsunread") !== null;
+const BOTS_UNREAD =
+  "Your bots could not be read on this Mac, so no other bot can be offered here. The reason is in keeper's log; look at Settings › Bots, then open this again.";
+function agentModel(agent: string, localOnly: boolean): AgentModelVm {
+  const local = AGENT_BOTS.filter((bot) => bot.reference.startsWith("bot:ollama:"));
+  const [bot, effort]: [string, Effort | null] = localOnly
+    ? [AGENT_BOTS[3].reference, agent === "nixi" ? "high" : "low"]
+    : agent === "nixi"
+      ? [AGENT_BOTS[0].reference, "xhigh"]
+      : [AGENT_BOTS[1].reference, "high"];
+  if (botsUnread) {
+    const current = AGENT_BOTS.find((one) => one.reference === bot) as AgentModelBotVm;
+    const name = bot.slice(bot.indexOf("#") + 1);
+    return {
+      bot,
+      effort,
+      bots: [{ ...current, name, provider: "" }],
+      locked: null,
+      unread: BOTS_UNREAD,
+    };
+  }
+  return { bot, effort, bots: localOnly ? local : AGENT_BOTS, locked: null, unread: null };
+}
 function agentRow(agent: string, name: string): AgentCopyVm {
+  const pin = agentPin();
   return {
     profileId: "p1",
     drive: "tgdrive",
@@ -5564,9 +5650,35 @@ function agentRow(agent: string, name: string): AgentCopyVm {
     device: null,
     host: "hesperia",
     signedIn: false,
-    pin: agentPin(),
+    pin,
     problem: agentsParam === "differs" ? "tgdrive's agents zone hosts nothing here." : null,
+    model: agentModel(agent, pin.localOnly),
   };
+}
+/** The header's model line for `agent`'s row (100.2 #7). */
+function agentModelLine(agent: string): AgentModelLineVm | undefined {
+  const model = agentRows.find((row) => row.agent === agent)?.model;
+  if (model == null) return undefined;
+  const bot = model.bots.find((candidate) => candidate.reference === model.bot);
+  return { bot: bot?.name ?? model.bot, effort: model.effort };
+}
+function setAgentModel(req: AgentModelReq): AgentCopyVm[] {
+  const refuse = (message: string) => {
+    throw { code: "internal", message, accountId: null, retriable: false };
+  };
+  const row = agentRows.find((one) => one.profileId === req.profileId && one.agent === req.agent);
+  if (row?.model == null) refuse(`tgdrive has no agent ${req.agent}.`);
+  const model = row?.model as AgentModelVm;
+  if (model.bot !== req.shownBot || model.effort !== req.shownEffort) {
+    refuse(MODEL_CHANGED_UNDERNEATH);
+  }
+  if (modelSaveFails) {
+    refuse("80-agents/nixi/agent.toml could not be written: Read-only file system (os error 30)");
+  }
+  agentRows = agentRows.map((one) =>
+    one === row ? { ...one, model: { ...model, bot: req.bot, effort: req.effort } } : one,
+  );
+  return agentRows;
 }
 const BROKEN_FOLDER: AgentCopyVm = {
   profileId: "p2",
@@ -5579,6 +5691,7 @@ const BROKEN_FOLDER: AgentCopyVm = {
   signedIn: false,
   pin: null,
   problem: "`local_only` in _drive.toml must be true or false, not text.",
+  model: null,
 };
 let agentRows: AgentCopyVm[] =
   agentsParam === "none"
@@ -5594,6 +5707,20 @@ let agentRows: AgentCopyVm[] =
 // p2 is the folder whose `_drive.toml` does not read. No bot is preselected.
 const SEED_NO_BOT = "Name the bot the seeded agents run on: keeper never picks one for them.";
 const SEED_CATALOGUE = ["nixi", "tola-grey", "lucyna-novak"];
+const SEED_BOTS: AgentSeedBotVm[] = [
+  {
+    reference: "bot:openai:https://provider.example:8452/v1#gpt-5",
+    name: "Work model",
+    provider: "Provider",
+    efforts: ["low", "medium", "high", "xhigh"],
+  },
+  {
+    reference: "bot:ollama:http://electra.example:11434#qwen3:32b",
+    name: "Qwen on electra",
+    provider: "electra",
+    efforts: ["low", "medium", "high"],
+  },
+];
 const seedOffer = (): AgentSeedOfferVm => ({
   folders: [
     {
@@ -5635,18 +5762,10 @@ const seedOffer = (): AgentSeedOfferVm => ({
     { id: "tola-grey", name: "Dr Tola Grey", kind: "steward", homeDrive: "tgdrive" },
     { id: "lucyna-novak", name: "Dr Lucyna Novak", kind: "steward", homeDrive: "neuradrive" },
   ],
-  bots: [
-    {
-      reference: "bot:openai:https://provider.example:8452/v1#gpt-5",
-      name: "Work model",
-      provider: "Provider",
-    },
-    {
-      reference: "bot:ollama:http://electra.example:11434#qwen3:32b",
-      name: "Qwen on electra",
-      provider: "electra",
-    },
-  ],
+  bots: botsUnread ? [] : SEED_BOTS,
+  // Rust's `seed::local_choices`: the ones a local-only folder is offered.
+  localBots: botsUnread ? [] : SEED_BOTS.filter((bot) => bot.reference.startsWith("bot:ollama:")),
+  botsUnread: botsUnread ? BOTS_UNREAD : null,
   accounts: [AGENT_OWNER.matrixId],
 });
 const seedFiles = (dir: string): string[] =>
@@ -7073,6 +7192,14 @@ function mockApprovalDecide(payload: Record<string, unknown>): Promise<null> {
 const OWN_FINGERPRINT = "nKr8 3Ffq Wd9u Lx2T b7Qe Rm4Z sV1c Ah6P yJ0o Gk5N tX3i";
 
 /** Nixi's answer as it grows: each step is one `set` op on the anchor. */
+/**
+ * `?levelrefused=1`: Nixi's provider refuses the level she was sent (R405), so
+ * her turn ends with Rust's sentence instead of an answer. Copied from
+ * `keeper_core::agents::model::level_refused`.
+ */
+const levelRefused = new URLSearchParams(window.location.search).get("levelrefused") !== null;
+const LEVEL_REFUSED =
+  "Nixi's bot claude-opus-5-5 does not accept reasoning level xhigh. Choose another level, or none, for Nixi in Settings › Agents.";
 const NIXI_ANSWER_STEPS = [
   "Synapse",
   "Synapse accepted an encrypted final edit",
@@ -7083,6 +7210,17 @@ const NIXI_ANSWER_STEPS = [
 /** The running fake streams, by subscription id, so unsubscribe stops one. */
 const TIMELINE_STREAMS = new Map<number, ReturnType<typeof setInterval>>();
 let nextTimelineSubscription = 1;
+
+/**
+ * Nixi's header names her model where her home is on this device (100.2 #7):
+ * her Settings › Agents row's bot and level as they read when the room opens,
+ * so a save there shows the next time the room is opened.
+ */
+function withModelLine(header: AgentRoomHeaderVm): AgentRoomHeaderVm {
+  if (header.status?.agent !== NIXI) return header;
+  const model = agentModelLine("nixi");
+  return model === undefined ? header : { ...header, status: { ...header.status, model } };
+}
 
 function subscribeMockTimeline(payload: Record<string, unknown>): number {
   const channel = payload.channel as MockChannel<TimelineBatch>;
@@ -7102,7 +7240,7 @@ function subscribeMockTimeline(payload: Record<string, unknown>): number {
   }
   channel.onmessage?.({
     ops: [{ op: "reset", items: agent.items }],
-    header: agent.header,
+    header: withModelLine(agent.header),
     ...(roomId === APPROVAL_ROOM && mockApprovals.length > 0 ? { approvals: mockApprovals } : {}),
     ...(roomId === GATE_ROOM && gateApprovals.length > 0 ? { approvals: gateApprovals } : {}),
     ...(agent.heard ? { heard: agent.heard } : {}),
@@ -7112,13 +7250,14 @@ function subscribeMockTimeline(payload: Record<string, unknown>): number {
     return id;
   }
   let step = 0;
+  const steps = levelRefused ? [LEVEL_REFUSED] : NIXI_ANSWER_STEPS;
   const timer = setInterval(() => {
-    const body = NIXI_ANSWER_STEPS[step];
-    const last = step === NIXI_ANSWER_STEPS.length - 1;
+    const body = steps[step];
+    const last = step === steps.length - 1;
     const item = { ...textItem("nixi-answer", NIXI, "Nixi", body, 1) };
     channel.onmessage?.({
       ops: [{ op: "set", index: 1, item }],
-      ...(last ? { header: nixiHeader("done", null) } : {}),
+      ...(last ? { header: withModelLine(nixiHeader("done", null)) } : {}),
     });
     step += 1;
     if (last) {
@@ -7821,6 +7960,7 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
   agents_sandbox_save: (payload) => sandboxSave(payload.req as AgentSandboxReq),
   agents_seed_plan: (payload) => seedPlan(payload.req as AgentSeedReq),
   agents_seed_apply: (payload) => seedApply(payload.req as AgentSeedReq),
+  agents_model_set: (payload) => setAgentModel(payload.req as AgentModelReq),
   agents_drive_repin: (payload) => {
     agentRows = agentRows.map((row) =>
       row.profileId !== payload.profileId || row.pin === null

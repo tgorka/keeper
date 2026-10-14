@@ -351,6 +351,10 @@ export type { AgentMcpServerVm } from "./gen/AgentMcpServerVm";
 export type { AgentMcpStartedVm } from "./gen/AgentMcpStartedVm";
 export type { AgentMcpTierVm } from "./gen/AgentMcpTierVm";
 export type { AgentMcpToolVm } from "./gen/AgentMcpToolVm";
+export type { AgentModelBotVm } from "./gen/AgentModelBotVm";
+export type { AgentModelLineVm } from "./gen/AgentModelLineVm";
+export type { AgentModelReq } from "./gen/AgentModelReq";
+export type { AgentModelVm } from "./gen/AgentModelVm";
 export type { AgentPersonVm } from "./gen/AgentPersonVm";
 export type { AgentPinReq } from "./gen/AgentPinReq";
 export type { AgentPinState } from "./gen/AgentPinState";
@@ -364,6 +368,7 @@ export type { AgentSandboxVm } from "./gen/AgentSandboxVm";
 export type { AgentSeedAgentVm } from "./gen/AgentSeedAgentVm";
 export type { AgentSeedBotVm } from "./gen/AgentSeedBotVm";
 export type { AgentSeedFolderVm } from "./gen/AgentSeedFolderVm";
+export type { AgentSeedModelReq } from "./gen/AgentSeedModelReq";
 export type { AgentSeedOfferVm } from "./gen/AgentSeedOfferVm";
 export type { AgentSeedPlanVm } from "./gen/AgentSeedPlanVm";
 export type { AgentSeedReq } from "./gen/AgentSeedReq";
@@ -475,6 +480,7 @@ export type { DriveFolderVm } from "./gen/DriveFolderVm";
 export type { DriveOfferVm } from "./gen/DriveOfferVm";
 export type { EditVersionVm } from "./gen/EditVersionVm";
 export type { Effect } from "./gen/Effect";
+export type { Effort } from "./gen/Effort";
 export type { EgressEndpointVm } from "./gen/EgressEndpointVm";
 export type { EgressKind } from "./gen/EgressKind";
 export type { EmbeddingModelVm } from "./gen/EmbeddingModelVm";
@@ -796,6 +802,7 @@ import type { AgentFocusReq } from "./gen/AgentFocusReq";
 import type { AgentMcpDraftVm } from "./gen/AgentMcpDraftVm";
 import type { AgentMcpListVm } from "./gen/AgentMcpListVm";
 import type { AgentMcpServerReq } from "./gen/AgentMcpServerReq";
+import type { AgentModelReq } from "./gen/AgentModelReq";
 import type { AgentPinReq } from "./gen/AgentPinReq";
 import type { AgentSandboxReq } from "./gen/AgentSandboxReq";
 import type { AgentSandboxVm } from "./gen/AgentSandboxVm";
@@ -7684,6 +7691,16 @@ export async function agentsSeedPlan(req: AgentSeedReq): Promise<AgentSeedPlanVm
  */
 export async function agentsSeedApply(req: AgentSeedReq): Promise<AgentSeedResultVm> {
   return await invoke<AgentSeedResultVm>("agents_seed_apply", { req });
+}
+
+/**
+ * Settings › Agents: save one agent's bot and level (100.2 #4, R382). Rust
+ * writes only `[model].bot` and `[model].effort` of its `agent.toml`, refuses a
+ * file that changed since the row was read, and answers the rows as they read
+ * now; a refusal rejects with its sentence.
+ */
+export async function agentsModelSet(req: AgentModelReq): Promise<AgentCopyVm[]> {
+  return await invoke<AgentCopyVm[]>("agents_model_set", { req });
 }
 
 /**

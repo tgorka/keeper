@@ -145,6 +145,24 @@ describe("AgentRoomHeader", () => {
     expect(cell).toHaveTextContent(/^🜂$/);
   });
 
+  it("names the agent's model and level where its home is on this device, and nothing elsewhere", () => {
+    const { rerender } = render(
+      <AgentRoomHeader
+        header={header({ status: status({ model: { bot: "Opus", effort: "xhigh" } }) })}
+      />,
+    );
+    expect(screen.getByTestId("agent-model")).toHaveTextContent(/^model: Opus · xhigh$/);
+    rerender(
+      <AgentRoomHeader
+        header={header({ status: status({ model: { bot: "GPT Astra", effort: null } }) })}
+      />,
+    );
+    expect(screen.getByTestId("agent-model")).toHaveTextContent(/^model: GPT Astra$/);
+    // The phone: no home, no line.
+    rerender(<AgentRoomHeader header={header()} />);
+    expect(screen.queryByTestId("agent-model")).not.toBeInTheDocument();
+  });
+
   it("says no status has arrived when the agent has sent none", () => {
     render(<AgentRoomHeader header={header({ status: null })} />);
     expect(within(region()).getByText("No status from the agent yet.")).toBeInTheDocument();

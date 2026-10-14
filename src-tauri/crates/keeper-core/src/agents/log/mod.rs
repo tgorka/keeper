@@ -373,6 +373,15 @@ pub struct Usage {
 pub struct AssistantBody {
     pub text: String,
     pub model: String,
+    /// The bot this step was sent to, `bot:{kind}:{base}#{target}`, as the
+    /// agent's `[model].bot` named it for this turn (100.2 #3): a session
+    /// whose model changed reads which turn ran on which. Absent on lines
+    /// written before 100.2 and on steps no agent's bot sent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bot: Option<String>,
+    /// The reasoning level sent with it, absent when none was (R382).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<crate::bots::chat::Effort>,
     pub finish: String,
     pub usage: Usage,
     pub ttft_ms: Option<u64>,
@@ -1328,6 +1337,8 @@ mod tests {
                 artifacts: Some(vec!["artifacts/x.md".into()]),
             }),
             LineBody::Assistant(AssistantBody {
+                bot: None,
+                effort: None,
                 text: "done".into(),
                 model: "gpt".into(),
                 finish: "stop".into(),

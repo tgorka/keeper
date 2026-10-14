@@ -18,7 +18,7 @@ use std::time::Duration;
 use keeper_agent::agent::{
     arm_agent, reply_of, trail_of, AgentDeps, AgentProfiles, Arrived, ConversationPort, HeldFocus,
     Outcome, Probe, RoomFuture, ServedSession, Trail, TurnEnding, BRIEF_REFUSED, BRIEF_UNSENT,
-    BUDGET_SPENT, JOIN_POLL, LOCAL_ONLY_REFUSAL, NOT_THIS_DELEGATION, ROUNDS_SPENT,
+    BUDGET_SPENT, JOIN_POLL, LOCAL_ONLY_REFUSAL, NOT_THIS_DELEGATION, ROUNDS_SPENT, TURN_FAILED,
 };
 use keeper_agent::claims::{blocked_status, conflict_line, conflict_of, Lease};
 use keeper_agent::delegate::{
@@ -213,6 +213,27 @@ impl EditPort for Room {
     }
 }
 
+/// Every write of the process log, kept.
+#[derive(Clone, Default)]
+struct Captured(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for Captured {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("lock").extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+    type Writer = Captured;
+    fn make_writer(&'a self) -> Captured {
+        self.clone()
+    }
+}
+
 /// One completion: the SSE `data:` payloads it streams.
 type Completion = Vec<Value>;
 
@@ -334,14 +355,15 @@ impl Stub {
                     // long; an `{"after_requests": n}` holds them until the
                     // stub has received n chat requests in all; a
                     // `{"status": s, "retry_after": secs}` answers with that
-                    // status and no body at all.
+                    // status and no body at all, or `"body"`'s text.
                     let mut parts: Vec<(String, u64)> = Vec::new();
                     let mut hold = 0;
                     let mut after = None;
                     for data in completion {
                         if let Some(status) = data["status"].as_u64() {
                             let after = data["retry_after"].as_u64().unwrap_or(0);
-                            let _ = write!(socket, "HTTP/1.1 {status} Unavailable\r\nRetry-After: {after}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                            let body = data["body"].as_str().unwrap_or("");
+                            let _ = write!(socket, "HTTP/1.1 {status} Unavailable\r\nRetry-After: {after}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
                             return;
                         }
                         if let Some(ms) = data["hold_ms"].as_u64() {
@@ -790,6 +812,127 @@ async fn the_same_event_twice_makes_one_user_line_and_one_turn() {
     assert_eq!(anchors(&world.room), 1);
 }
 
+/// 100.2 #5 and #3 (R382): a model changed in the home's `agent.toml` — as
+/// Settings › Agents writes it — runs from the agent's very next turn on
+/// the same served session, with nothing restarted; every turn's
+/// `assistant` line names the bot and the level it was sent; and a home
+/// that stops reading refuses the next turn with its own sentence, sending
+/// nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_model_changed_in_the_home_runs_from_the_next_turn() {
+    use keeper_core::agents::home::{with_model, BotRef};
+    use keeper_core::bots::chat::Effort;
+
+    let mut world = world(
+        ProviderKind::OpenAi,
+        &["drive_read"],
+        vec![prose("one."), prose("two."), prose("three.")],
+    );
+    let mut served = world.open(SESSION);
+    report(world.ask(&mut served, "first").await);
+
+    let file = world.tgdrive.join("80-agents/nixi/agent.toml");
+    let before = std::fs::read_to_string(&file).expect("agent.toml");
+    let opus = format!("bot:openai:{}#opus", world.stub.url);
+    let saved = with_model(&before, &opus, Some(Effort::Xhigh)).expect("written");
+    std::fs::write(&file, &saved).expect("saved");
+    report(world.ask(&mut served, "second").await);
+
+    let requests = world.stub.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0]["model"], json!("model"));
+    assert!(requests[0].get("reasoning_effort").is_none());
+    assert_eq!(requests[1]["model"], json!("opus"));
+    assert_eq!(requests[1]["reasoning_effort"], json!("xhigh"));
+
+    let lines = world.lines(SESSION);
+    let sent: Vec<(Option<String>, Option<Effort>)> = kinds(&lines, LineKind::Assistant)
+        .into_iter()
+        .map(|line| match &line.body {
+            LineBody::Assistant(body) => (body.bot.clone(), body.effort),
+            other => panic!("not an assistant line: {other:?}"),
+        })
+        .collect();
+    let opus = BotRef::parse(&opus).expect("bot").reference();
+    assert_eq!(
+        sent,
+        vec![
+            (Some("bot:openai:http://127.0.0.1:9#model".to_owned()), None),
+            (Some(opus), Some(Effort::Xhigh)),
+        ]
+    );
+
+    std::fs::write(&file, saved.replace("\"xhigh\"", "\"max\"")).expect("broken");
+    let refused = report(world.ask(&mut served, "third").await);
+    assert_eq!(refused.ending, TurnEnding::Failed);
+    assert!(
+        final_edit(&world.room).contains("model.effort is refused: \"max\" is not one of"),
+        "{}",
+        final_edit(&world.room)
+    );
+    assert_eq!(world.stub.requests().len(), 2, "nothing was sent");
+}
+
+/// R405 (R100M1-03): a provider that refuses the reasoning level an agent
+/// was sent — HTTP 400 naming `reasoning_effort` — ends the turn with a
+/// sentence in the room naming the agent, its bot and the level, not the
+/// generic failure; the process log gets a WARN with the status code and a
+/// bounded, control-stripped excerpt of what the provider said.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_provider_refusing_the_level_ends_the_turn_naming_it() {
+    use keeper_core::agents::home::with_model;
+    use keeper_core::bots::chat::Effort;
+
+    const SAID: &str = "Unsupported value: 'xhigh' is not supported with this model.";
+    // Raw, as a careless gateway sends it: an escape sequence in the text.
+    let body = format!(
+        "{{\"error\":{{\"message\":\"\u{1b}[31m{SAID}\",\"param\":\"reasoning_effort\"}}}}"
+    );
+    let mut world = world(
+        ProviderKind::OpenAi,
+        &["drive_read"],
+        vec![vec![json!({"status": 400, "body": body})]],
+    );
+    let file = world.tgdrive.join("80-agents/nixi/agent.toml");
+    let before = std::fs::read_to_string(&file).expect("agent.toml");
+    // The stub's own endpoint, as a person's save names it: the host's
+    // provider row serves it.
+    let model = format!("bot:openai:{}#model", world.stub.url);
+    let level = with_model(&before, &model, Some(Effort::Xhigh)).expect("a level");
+    std::fs::write(&file, level).expect("saved");
+    let mut served = world.open(SESSION);
+
+    let captured = Captured::default();
+    let _guard = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish(),
+    );
+    let refused = report(world.ask(&mut served, "think hard").await);
+    assert_eq!(refused.ending, TurnEnding::Failed);
+    let requests = world.stub.requests();
+    assert_eq!(requests.len(), 1, "a 400 is not sent again");
+    assert_eq!(requests[0]["reasoning_effort"], json!("xhigh"));
+    let said = final_edit(&world.room);
+    assert!(
+        said.contains("Nixi's bot model does not accept reasoning level xhigh."),
+        "{said}"
+    );
+    assert!(!said.contains(TURN_FAILED), "{said}");
+
+    let process = String::from_utf8(captured.0.lock().expect("lock").clone()).expect("utf-8");
+    let warn = process
+        .lines()
+        .find(|line| line.contains("refused this agent's reasoning level"))
+        .unwrap_or_else(|| panic!("no WARN: {process}"));
+    assert!(warn.contains("WARN"), "{warn}");
+    assert!(warn.contains("status=400"), "{warn}");
+    assert!(warn.contains(SAID), "{warn}");
+    assert!(!warn.contains('\u{1b}'), "{warn:?}");
+}
+
 /// Text from anyone but the proxy's person writes nothing and runs nothing.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_ignored_arrival_writes_no_line() {
@@ -963,6 +1106,8 @@ async fn a_turn_cut_off_mid_tool_loop_is_closed_by_editing_its_anchor() {
                 None,
                 None,
                 LineBody::Assistant(AssistantBody {
+                    bot: None,
+                    effort: None,
                     text: String::new(),
                     model: "model".to_owned(),
                     finish: "tool_calls".to_owned(),
@@ -10991,27 +11136,6 @@ mod parks {
         assert_eq!(world.approval_lines().len(), 1, "only the request's line");
         assert!(approvals.events().is_empty());
         assert!(served.waiting());
-    }
-
-    /// Every write of the process log, kept.
-    #[derive(Clone, Default)]
-    struct Captured(Arc<Mutex<Vec<u8>>>);
-
-    impl std::io::Write for Captured {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().expect("lock").extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
-        type Writer = Captured;
-        fn make_writer(&'a self) -> Captured {
-            self.clone()
-        }
     }
 
     /// R182, R3-05: keys the sender's homeserver could not give whole are

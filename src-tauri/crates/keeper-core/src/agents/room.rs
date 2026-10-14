@@ -517,6 +517,12 @@ pub struct AgentStatusVm {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub icon: Option<String>,
+    /// The agent's model and level as its home's `[model]` names them,
+    /// where its agents zone is on this device (100.2 #7, R382). Absent
+    /// elsewhere: a device without the drive does not know them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub model: Option<crate::agents::model::AgentModelLineVm>,
     /// The host that wrote the status.
     pub host: Option<String>,
     /// The session's title.
@@ -878,6 +884,7 @@ fn status_vm(
             agent_name: name(&status.agent),
             handle: handle(&status.agent, Some(&status.host)),
             icon: icons.get(&status.agent),
+            model: icons.model(&status.agent),
             host: Some(status.host.clone()),
             title: Some(status.title.clone()),
             kind: Some(status.kind),
@@ -898,6 +905,7 @@ fn status_vm(
             agent_name: name(agent),
             handle: handle(agent, host.as_deref()),
             icon: icons.get(agent),
+            model: icons.model(agent),
             host: host.clone(),
             title: title.clone(),
             kind: None,
@@ -916,8 +924,12 @@ fn status_vm(
 #[derive(Debug, Default)]
 pub struct AgentIcons {
     zone: RwLock<Zone>,
-    /// Bumped when the agents or their marks change, so an open room's
-    /// header and briefs redraw without waiting for its next event.
+    /// Each agent's model line, replaced on each scan beside the marks
+    /// (100.2 #7).
+    models: RwLock<BTreeMap<OwnedUserId, crate::agents::model::AgentModelLineVm>>,
+    /// Bumped when the agents, their marks or their models change, so an
+    /// open room's header and briefs redraw without waiting for its next
+    /// event.
     changes: watch::Sender<u64>,
 }
 
@@ -960,6 +972,34 @@ impl AgentIcons {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .marks
+            .get(user)
+            .cloned()
+    }
+
+    /// Replace every agent's model line with `models` (100.2 #7): a model a
+    /// person saved shows in the room's header from the next scan.
+    pub fn replace_models(
+        &self,
+        models: BTreeMap<OwnedUserId, crate::agents::model::AgentModelLineVm>,
+    ) {
+        {
+            let mut held = self
+                .models
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if *held == models {
+                return;
+            }
+            *held = models;
+        }
+        self.changes.send_modify(|n| *n = n.wrapping_add(1));
+    }
+
+    /// `user`'s model line, when its zone is on this device.
+    pub fn model(&self, user: &UserId) -> Option<crate::agents::model::AgentModelLineVm> {
+        self.models
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(user)
             .cloned()
     }
@@ -2467,6 +2507,56 @@ mod tests {
         let mut odd = AgentRoomState::new(own());
         odd.apply(&status("$b", 10, content("wat", "electra", None)), &agents);
         assert_eq!(icon_of(&odd, &icons).as_deref(), Some("N"));
+    }
+
+    /// 100.2 #7: the header names the agent's model and level where its
+    /// home is on this device, the scan's new line redraws it, and another
+    /// agent's line is never this one's.
+    #[test]
+    fn the_header_names_the_agents_model_where_its_home_is() {
+        use crate::agents::model::AgentModelLineVm;
+        use crate::bots::chat::Effort;
+
+        let mut state = AgentRoomState::new(own());
+        state.apply(&status("$a", 10, content("idle", "electra", None)), &agents);
+        let icons = AgentIcons::default();
+        let mut changes = icons.subscribe();
+        let model_of = |icons: &AgentIcons| {
+            state
+                .header(&|user| user.to_string(), icons, None, None)
+                .status
+                .expect("a status")
+                .model
+        };
+        assert_eq!(model_of(&icons), None, "no home here, no line");
+        let line = |bot: &str, effort| AgentModelLineVm {
+            bot: bot.to_owned(),
+            effort,
+        };
+        let nixi = OwnedUserId::try_from(NIXI).expect("user");
+        icons.replace_models(BTreeMap::from([(
+            nixi.clone(),
+            line("Opus", Some(Effort::Xhigh)),
+        )]));
+        assert!(changes.has_changed().expect("open"));
+        changes.borrow_and_update();
+        assert_eq!(model_of(&icons), Some(line("Opus", Some(Effort::Xhigh))));
+        icons.replace_models(BTreeMap::from([(
+            nixi.clone(),
+            line("Opus", Some(Effort::Xhigh)),
+        )]));
+        assert!(
+            !changes.has_changed().expect("open"),
+            "the same scan redraws nothing"
+        );
+        icons.replace_models(BTreeMap::from([(nixi, line("Haiku", Some(Effort::High)))]));
+        assert!(changes.has_changed().expect("open"));
+        assert_eq!(model_of(&icons), Some(line("Haiku", Some(Effort::High))));
+        icons.replace_models(BTreeMap::from([(
+            OwnedUserId::try_from("@tola:example.org").expect("user"),
+            line("Astra", None),
+        )]));
+        assert_eq!(model_of(&icons), None);
     }
 
     #[test]

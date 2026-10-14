@@ -416,3 +416,60 @@ fn the_agents_written_for_a_drive_are_the_ones_preselected() {
     assert!(preselected("marta-notes").is_empty());
     assert!(preselected("").is_empty());
 }
+
+/// R405 (R100M1-04): a store that holds no bots is an empty list; one whose
+/// providers, or whose bots, cannot be read is a failure naming which —
+/// never an empty list that would say the person has none.
+#[test]
+fn bots_that_cannot_be_read_are_a_failure_not_an_empty_list() {
+    let empty = tempfile::tempdir().expect("data dir");
+    assert_eq!(read_bot_choices(empty.path()), Ok(Vec::new()));
+
+    // A table replaced by a view of another shape: the store opens, and
+    // that one read fails.
+    let broken = |table: &str| {
+        let dir = tempfile::tempdir().expect("data dir");
+        crate::bots::store::list_bots(dir.path()).expect("created");
+        let db = rusqlite::Connection::open(dir.path().join("keeper.db")).expect("db");
+        db.execute_batch(&format!(
+            "PRAGMA foreign_keys = OFF; DROP TABLE {table}; CREATE VIEW {table} AS SELECT 1 AS x;"
+        ))
+        .expect("broken");
+        dir
+    };
+    let providers = broken("bot_providers");
+    let refused = read_bot_choices(providers.path()).expect_err("providers unread");
+    assert!(
+        refused.contains("bot providers could not be read"),
+        "{refused}"
+    );
+    let bots = broken("bots");
+    let refused = read_bot_choices(bots.path()).expect_err("bots unread");
+    assert!(
+        refused.contains("keeper.db's bots could not be read"),
+        "{refused}"
+    );
+}
+
+/// R405 (R100M1-05): a `local_only` folder is offered only the person's
+/// bots that run locally — ollama ones — out of a mixed list.
+#[test]
+fn a_local_only_folder_is_offered_only_the_bots_that_run_locally() {
+    let choice = |reference: &str, name: &str| AgentSeedBotVm {
+        reference: reference.to_owned(),
+        name: name.to_owned(),
+        provider: "p".to_owned(),
+        efforts: Vec::new(),
+    };
+    let mixed = vec![
+        choice(BOT, "Opus"),
+        choice("bot:ollama:http://localhost:11434#qwen3", "Qwen"),
+        choice("bot:hermes:http://localhost:8642#nixie", "Nixie"),
+        choice("bot:ollama:http://gpu.lan:11434#llama", "Llama"),
+    ];
+    let names: Vec<String> = local_choices(&mixed)
+        .into_iter()
+        .map(|bot| bot.name)
+        .collect();
+    assert_eq!(names, vec!["Qwen", "Llama"]);
+}

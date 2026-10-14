@@ -37,6 +37,7 @@ pub mod mac_tables;
 pub mod matrix;
 pub mod mcp;
 pub mod memory;
+pub mod model;
 pub mod mount;
 pub mod nudge;
 pub mod paseo;
