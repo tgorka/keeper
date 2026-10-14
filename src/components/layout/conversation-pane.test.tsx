@@ -1658,6 +1658,22 @@ describe("ConversationPane — receipts, typing, pagination (Story 3.9)", () => 
     );
   });
 
+  // An agent's room: the newest hundreds of events are the host's claim
+  // renewals, which render nothing. The first page settles with the window
+  // still empty and no status change after it — the fill must look again on
+  // its own, in large pages.
+  it("keeps filling an empty window page after page, in large pages", async () => {
+    const { captured } = await renderOpen();
+    captured.timeline?.({ ops: [{ op: "reset", items: [{ kind: "other", key: "o1" }] }] });
+    await waitFor(() => expect(captured.pagination).not.toBeNull());
+    captured.pagination?.({ state: "idle", hitStart: false });
+
+    await waitFor(() => expect(paginateBackwards.mock.calls.length).toBeGreaterThanOrEqual(3));
+    for (const call of paginateBackwards.mock.calls) {
+      expect(call[2]).toBe(200);
+    }
+  });
+
   it("does not page an empty window once the start is reached", async () => {
     const { captured } = await renderOpen();
     captured.timeline?.({ ops: [{ op: "reset", items: [{ kind: "other", key: "o1" }] }] });

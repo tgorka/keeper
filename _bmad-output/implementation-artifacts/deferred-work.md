@@ -10583,3 +10583,10 @@ origin: makistack's electra (2026-10-14): Nixi's DM and Tola Grey's triage room 
 location: matrix-sdk 0.18 `event_cache` (`handling joined room update: FOREIGN KEY constraint failed`, `send_queue: Failed to save the sent event in the Event Cache`)
 reason: after the outside join, every update of those rooms failed to persist, so no incoming event was shown (the agent's replies never appeared) and, after one more send, the room's send queue stopped and its messages stayed at "Sending…". Quitting keeper and moving `accounts/<id>/sdk/matrix-sdk-event-cache.sqlite3*` aside (a cache, rebuilt from the server) cleared it; the queued messages went out at the next start. Whether a join made by keeper itself (`send::join_if_invited`) can reach the same state is not measured. A fix would catch the failure and clear that room's cache through the SDK, or reproduce it against the SDK and report upstream.
 status: open
+
+### DW-1385: A host renews its session claim as room state every minute, burying the conversation.
+
+origin: makistack's electra (2026-10-14): in Nixi's DM, 283 of the newest 300 events were `dev.keeper.agent.claim` (state key `""`, one per ~61 s; `renewed_at` moving)
+location: `keeper_agent::hosts` (claim renewal), `keeper_core::agents::claims`
+reason: 1 440 state events a day per served session room. A person's client must page through them to reach a message after any limited sync, and every Matrix client a person might use shows a session room as mostly invisible state. keeper's window now fills itself in 200-event pages (`conversation-body.tsx`), which hides the symptom. A fix at the source: renew less often (a longer lease with the same takeover semantics), or keep the lease's heartbeat out of the room's timeline — e.g. renew only near expiry, or move liveness to the host manifest in the control room and write the session claim only on acquire, release and takeover.
+status: open
