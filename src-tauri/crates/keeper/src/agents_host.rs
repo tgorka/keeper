@@ -611,6 +611,57 @@ pub async fn agents_model_set(
     rows(&state, facts).await
 }
 
+/// `/model` typed in the person's DM with an agent (story 100.5, DW-1431,
+/// R415): the agent is the DM's (`AccountManager::proxy_main_agent`), and
+/// what follows the name is `keeper_agent::desktop::model_command`'s —
+/// nothing after it says what the agent runs on, a bot and/or a level is
+/// saved by the very write Settings › Agents makes. The answer is the
+/// sentence the composer shows; a refusal is that sentence and a WARN line
+/// (R381).
+#[tauri::command]
+pub async fn agent_model_command(
+    state: State<'_, AppState>,
+    account_id: String,
+    room_id: String,
+    args: Option<String>,
+) -> Result<String, IpcError> {
+    let agent = state
+        .accounts
+        .proxy_main_agent(&account_id, &room_id)
+        .await
+        .map_err(to_ipc_error)?;
+    let facts = facts_now(&state).await?;
+    let platform = platform_of(&state);
+    let answered = {
+        let agent = agent.clone();
+        let args = args.clone();
+        tokio::task::spawn_blocking(move || {
+            let bots = bot_choices_or_sentence(platform.as_ref());
+            desktop::model_command(
+                &facts,
+                &agent,
+                args.as_deref(),
+                bots.as_deref().map_err(String::as_str),
+            )
+        })
+        .await
+        .map_err(|error| refusal(error.to_string()))?
+    };
+    match answered {
+        Ok(sentence) => {
+            if args.as_deref().is_some_and(|args| !args.trim().is_empty()) {
+                tracing::info!(agent = %agent, "agents: an agent's model was saved from /model");
+                scan_next_tick();
+            }
+            Ok(sentence)
+        }
+        Err(sentence) => {
+            tracing::warn!(agent = %agent, %sentence, "agents: /model did not change the agent's model");
+            Err(refusal(sentence))
+        }
+    }
+}
+
 /// The next tick scans: a saved table is hosted within a second, not at
 /// the next five-second scan.
 fn scan_next_tick() {

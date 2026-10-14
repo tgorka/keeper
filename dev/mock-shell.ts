@@ -101,6 +101,8 @@ import type {
   CapabilitiesVm,
   CardAgentVm,
   CardKeyVm,
+  ChatCommandPreviewVm,
+  ChatCommandRowVm,
   ChoiceVm,
   CopyJobVm,
   CredentialChoicesVm,
@@ -4270,6 +4272,253 @@ interface MockChannel<T> {
   onmessage?: (message: T) => void;
 }
 
+/**
+ * The dev shell's answer to `chat_command_preview` (Story 100.5).
+ *
+ * **A fake, as crude as `mockCommandPreview` and for the same reason**: the
+ * registry, the room sets, the power-level reasons and every sentence live in
+ * `keeper_core::chat::commands`; this only draws each shape once. A room the
+ * harness lists as an agent's gets the agent set (the Nixi DM also `/new`);
+ * every other room gets the chat set. `?slash=readonly` answers as a room whose
+ * power levels allow neither a topic nor an invite, so the reasons show.
+ * `/invite @refused:example.org` is refused by the fake server
+ * (`room_invite`), so the failure sentence shows too.
+ */
+/** Every message the composer sent, in order — read back by the browser proof. */
+const mockSends: Array<{ kind: string; body: string; line: string | null }> = [];
+(window as unknown as { __keeperMockSends: typeof mockSends }).__keeperMockSends = mockSends;
+
+/** Every room `/leave` left, as `accountId roomId` — read back by the browser proof. */
+const mockLeaves: string[] = [];
+(window as unknown as { __keeperMockLeaves: typeof mockLeaves }).__keeperMockLeaves = mockLeaves;
+
+function recordSend(kind: string, payload: Record<string, unknown>): null {
+  mockSends.push({
+    kind,
+    body: String(payload.body ?? ""),
+    line: payload.line == null ? null : String(payload.line),
+  });
+  return null;
+}
+
+function mockChatCommandPreview(payload: Record<string, unknown>): ChatCommandPreviewVm {
+  const draft = String(payload.draft ?? "");
+  const roomId = String(payload.roomId ?? "");
+  const replying = payload.replying === true;
+  const readonly = new URLSearchParams(window.location.search).get("slash") === "readonly";
+  const agentRoom = roomId in AGENT_ROOM_TIMELINES || roomId === DM_ROOM;
+  const escapeHint =
+    "To send a message that starts with a slash, double it: //etc sends /etc as text.";
+  type Spec = [string, string[], string, ChatCommandRowVm["args"], string | null, string | null];
+  const chatSet: Spec[] = [
+    [
+      "me",
+      ["emote"],
+      'Send the text as an action, the way "* Ana waves" reads.',
+      "required",
+      "what you do",
+      replying
+        ? "An action is sent as its own message, not as a reply. Cancel the reply first."
+        : null,
+    ],
+    [
+      "shrug",
+      [],
+      "Send ¯\\_(ツ)_/¯, before your text if you add some.",
+      "optionalRest",
+      "text",
+      null,
+    ],
+    [
+      "plain",
+      [],
+      "Send the text exactly as typed, even when it looks like a command.",
+      "required",
+      "text",
+      null,
+    ],
+    [
+      "topic",
+      [],
+      "Change this room's topic for everyone in it.",
+      "required",
+      "the new topic",
+      readonly ? "Your power level in this room does not let you change its topic." : null,
+    ],
+    [
+      "invite",
+      [],
+      "Invite someone to this room by their Matrix id.",
+      "required",
+      "@name:server",
+      readonly ? "Your power level in this room does not let you invite people." : null,
+    ],
+    ["leave", ["part"], "Leave this room, after you confirm.", "none", null, null],
+  ];
+  const agentSet: Spec[] =
+    roomId === DM_ROOM
+      ? [
+          [
+            "new",
+            ["conversation"],
+            "Ask your agent for a new conversation, with an optional title.",
+            "optionalRest",
+            "a title",
+            null,
+          ],
+          // DW-1431: `?slash=away` answers as a device without Nixi's home.
+          [
+            "model",
+            [],
+            "Say which model and reasoning level your agent runs on, or change them.",
+            "optionalRest",
+            "a bot, a level",
+            new URLSearchParams(window.location.search).get("slash") === "away"
+              ? "Your agent's home is not on this device, so its model is changed where its drive is: type /model there, or use Settings › Agents on that Mac."
+              : null,
+          ],
+        ]
+      : [];
+  const help: Spec = [
+    "help",
+    ["h", "commands"],
+    "List the commands this room offers.",
+    "none",
+    null,
+    null,
+  ];
+  const registry: ChatCommandRowVm[] = [...(agentRoom ? agentSet : chatSet), help].map(
+    ([name, aliases, description, args, argHint, reason]) => ({
+      name,
+      aliases,
+      description,
+      args,
+      argHint,
+      available: reason === null,
+      reason,
+    }),
+  );
+  const line = draft.startsWith("/") && !draft.startsWith("//") && !draft.includes("\n");
+  if (line && new TextEncoder().encode(draft).length > 512) {
+    return {
+      draft,
+      verdict: {
+        kind: "refusal",
+        message:
+          "That line is too long for a command, so nothing was sent. Shorten it, or start it with // to send it as a message.",
+      },
+      rows: [],
+      escapeHint,
+    };
+  }
+  if (!line) {
+    const text = draft.startsWith("//") ? draft.slice(1) : draft;
+    return { draft, verdict: { kind: "text", text }, rows: [], escapeHint };
+  }
+  const token = draft.slice(1).split(/\s/, 1)[0]?.toLowerCase() ?? "";
+  const args = draft.slice(1 + token.length).trim();
+  const spelled = (row: ChatCommandRowVm, prefix: boolean) =>
+    [row.name, ...row.aliases].some((name) => (prefix ? name.startsWith(token) : name === token));
+  const exact = registry.find((row) => spelled(row, false));
+  const rows = exact !== undefined ? [exact] : registry.filter((row) => spelled(row, true));
+  if (token === "") {
+    return { draft, verdict: { kind: "text", text: draft }, rows, escapeHint };
+  }
+  const spec = rows[0];
+  if (spec === undefined) {
+    return {
+      draft,
+      verdict: {
+        kind: "refusal",
+        message: `keeper has no /${token} command. Nothing was sent. Type /help for the list. ${escapeHint}`,
+      },
+      rows,
+      escapeHint,
+    };
+  }
+  const refuse = (message: string): ChatCommandPreviewVm => ({
+    draft,
+    verdict: { kind: "refusal", message },
+    rows,
+    escapeHint,
+  });
+  if (spec.reason !== null) {
+    return refuse(`/${spec.name} — ${spec.reason}`);
+  }
+  if (spec.args === "required" && args === "") {
+    return refuse(
+      `/${spec.name} needs ${spec.argHint}, so nothing was sent. Type /${spec.name} followed by it.`,
+    );
+  }
+  if (spec.args === "none" && args !== "") {
+    return refuse(
+      `/${spec.name} takes nothing after it, so nothing was sent. Send /${spec.name} on its own.`,
+    );
+  }
+  const verdict: ChatCommandPreviewVm["verdict"] =
+    spec.name === "me"
+      ? { kind: "emote", text: args }
+      : spec.name === "plain"
+        ? { kind: "text", text: args }
+        : spec.name === "shrug"
+          ? { kind: "text", text: args === "" ? "¯\\_(ツ)_/¯" : `¯\\_(ツ)_/¯ ${args}` }
+          : { kind: "command", name: spec.name, args: args === "" ? null : args };
+  return { draft, verdict, rows, escapeHint };
+}
+
+/**
+ * The dev shell's answer to `agent_model_command` (DW-1431): Nixi's row in
+ * Settings › Agents is the agent's `agent.toml`. A crude reading of what
+ * follows `/model` — the last word a level, the rest a bot's name — so the
+ * sentence and the row's change can be seen; the grammar is Rust's
+ * (`keeper_core::agents::model::command`).
+ */
+function mockAgentModelCommand(payload: Record<string, unknown>): Promise<string> {
+  const refuse = (message: string) =>
+    Promise.reject({ code: "internal", message, accountId: null, retriable: false });
+  const row = agentRows.find((one) => one.agent === "nixi");
+  const model = row?.model;
+  if (row === undefined || model == null) {
+    return refuse(
+      "Your agent's home is not on this device, so its model is changed where its drive is: type /model there, or use Settings › Agents on that Mac.",
+    );
+  }
+  const named = (reference: string) =>
+    model.bots.find((bot) => bot.reference === reference)?.name ?? reference;
+  const level = (effort: Effort | null) =>
+    effort === null ? "the provider's own reasoning level" : `reasoning level ${effort}`;
+  const args = typeof payload.args === "string" ? payload.args.trim() : "";
+  if (args === "") {
+    return later(150, () => `Nixi runs on ${named(model.bot)} at ${level(model.effort)}.`);
+  }
+  const words = args.split(/\s+/);
+  const last = (words[words.length - 1] ?? "").toLowerCase();
+  const levels = ["low", "medium", "high", "xhigh"];
+  const leveled = levels.includes(last) || last === "default";
+  const effort: Effort | null = leveled
+    ? last === "default"
+      ? null
+      : (last as Effort)
+    : model.effort;
+  const botName = (leveled ? words.slice(0, -1) : words).join(" ");
+  const bot =
+    botName === ""
+      ? model.bot
+      : model.bots.find((one) => one.name.toLowerCase() === botName.toLowerCase())?.reference;
+  if (bot === undefined) {
+    return refuse(
+      `Nixi cannot run on "${botName}": it can run on ${model.bots.map((one) => one.name).join(", ")}. Nothing was changed.`,
+    );
+  }
+  agentRows = agentRows.map((one) =>
+    one === row ? { ...one, model: { ...model, bot, effort } } : one,
+  );
+  return later(
+    200,
+    () => `Nixi now runs on ${named(bot)} at ${level(effort)}, from its next turn.`,
+  );
+}
+
 /** Which fake streams are running, so `bots_chat_stop` can stop one. */
 const BOT_LIVE_STREAMS = new Map<string, () => void>();
 
@@ -7873,6 +8122,34 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
       return null;
     }),
   agent_conversation_new: mockConversationNew,
+  agent_model_command: mockAgentModelCommand,
+  // Story 100.5: the messenger's slash commands. Sends and room acts succeed
+  // silently (the fake has no room state to change) except one refused invite.
+  // `?slash=slow` answers every preview after a second, so a second Enter and
+  // typing during a slow command can be seen in the browser (R393).
+  chat_command_preview: (payload) =>
+    new URLSearchParams(window.location.search).get("slash") === "slow"
+      ? later(1000, () => mockChatCommandPreview(payload))
+      : mockChatCommandPreview(payload),
+  send_text: (payload) => recordSend("text", payload),
+  send_emote: (payload) => recordSend("emote", payload),
+  // Recorded too, so the browser can see which context a slow line went out in (R411).
+  send_reply: (payload) => recordSend("reply", payload),
+  edit_message: (payload) => recordSend("edit", payload),
+  room_set_topic: () => later(200, () => null),
+  room_invite: (payload) =>
+    String(payload.userId) === "@refused:example.org"
+      ? Promise.reject({
+          code: "sendFailed",
+          message: "could not send the message: M_FORBIDDEN",
+          accountId: null,
+          retriable: true,
+        })
+      : later(200, () => null),
+  room_leave: (payload) => {
+    mockLeaves.push(`${String(payload.accountId)} ${String(payload.roomId)}`);
+    return later(300, () => null);
+  },
   agent_surface_subscribe: mockSurfaceSubscribe,
   agent_surface_result: (payload) => {
     surfaceResults.push({

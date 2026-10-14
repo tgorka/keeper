@@ -3060,6 +3060,35 @@ keeper shows an agent's room in its own timeline, on the Mac and on the iPhone a
   there is kept, but the file's agent is what opens until the file stops setting it. A failed read
   is a sentence where the choice or the menu would be; a failed save is said beside the control;
   both reach `keeper.log`.
+- **Slash commands.** Typing `/` at the start of the composer opens a menu above it (Story
+  100.5): every row is a command this room offers, with its other spellings, a sentence and the
+  argument it takes. It filters as you type; ↑/↓ move, Enter or Tab completes the name and a
+  second Enter runs it (once anything follows the name, Enter runs the line as typed), Escape
+  closes it until the word after the slash changes, and `//` sends a literal slash. In your
+  agent's DM the menu offers `/new [title]` (the dock's *New conversation*), `/model [bot]
+  [level]` and `/help`; in a conversation or a session you watch, `/help` alone. `/model` alone
+  says which bot and reasoning level the agent runs on; `/model Opus high`, `/model Qwen` (the
+  level kept) or `/model low` (the bot kept; `default` is the provider's own level) saves them
+  exactly as Settings › Agents does — the same two keys of its `agent.toml`, refused the same
+  way — and its next turn runs on them. Only a device that has the agent's home can write it:
+  elsewhere `/model` is listed with that reason and refused. Stop and pause, a scope and an
+  approval are not commands: an approval is decided on its card, never by a typed line.
+  In any other room the menu offers `/me`, `/shrug`, `/plain`, `/topic`, `/invite` and `/leave`
+  (which asks before leaving); `/topic` and `/invite` are listed with the reason when your power
+  level does not allow them, and `/me` is refused while a reply is pending, because an action is
+  its own message. A command keeper does not know is refused where you typed it and never sent as
+  text. What a `/` line means is decided in Rust (`keeper_core::chat::commands`); the menu is
+  off while you edit a message (its text is the message's body) or while attachments wait (the
+  text is their caption). The ⌘9 bot composer draws its own commands with the same menu.
+  A line runs once however often Enter is pressed while keeper is still asking what it means,
+  and whatever you type meanwhile stays in the field — and stays your saved draft, on this
+  device and the others. A line is sent where you submitted it: starting an edit or a reply
+  while keeper reads it does not turn it into that edit or reply, and if the reply it was
+  submitted under is cancelled, nothing is sent and the field says so. A one-line command longer than 512 bytes is
+  refused, not sent as a message (start it with `//` to send it as text). Undoing a held `/me`,
+  `//etc` or any other line puts back exactly what you typed. `/leave` asks about the room you
+  typed it in; switching rooms withdraws the question. If keeper cannot look the commands up,
+  one line under the field says so and the line is not sent.
 
 ## Nixi beside your notes
 

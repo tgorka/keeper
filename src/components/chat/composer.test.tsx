@@ -69,7 +69,7 @@ describe("Composer", () => {
     fireEvent.keyDown(textarea, { key: "Enter" });
 
     await waitFor(() => {
-      expect(onSend).toHaveBeenCalledWith("hello");
+      expect(onSend).toHaveBeenCalledWith("hello", expect.anything());
     });
     await waitFor(() => {
       expect(textarea.value).toBe("");
@@ -113,7 +113,7 @@ describe("Composer", () => {
     fireEvent.click(screen.getByRole("button", { name: "Send message" }));
 
     await waitFor(() => {
-      expect(onSend).toHaveBeenCalledWith("click send");
+      expect(onSend).toHaveBeenCalledWith("click send", expect.anything());
     });
   });
 
@@ -745,7 +745,7 @@ describe("Composer persistent drafts (Story 7.1)", () => {
     const textarea = screen.getByLabelText<HTMLTextAreaElement>("Message");
     fireEvent.change(textarea, { target: { value: "send me" } });
     fireEvent.keyDown(textarea, { key: "Enter" });
-    await waitFor(() => expect(onSend).toHaveBeenCalledWith("send me"));
+    await waitFor(() => expect(onSend).toHaveBeenCalledWith("send me", expect.anything()));
     await waitFor(() => expect(clearDraft).toHaveBeenCalledWith(ACCT, ROOM));
     expect(draftsStore.getState().keys.has(`${ACCT} ${ROOM}`)).toBe(false);
   });
@@ -780,7 +780,13 @@ describe("Composer persistent drafts (Story 7.1)", () => {
     // Type into the edit and save it.
     fireEvent.change(textarea, { target: { value: "old message body v2" } });
     fireEvent.keyDown(textarea, { key: "Enter" });
-    await waitFor(() => expect(onSend).toHaveBeenCalledWith("old message body v2"));
+    await waitFor(() =>
+      expect(onSend).toHaveBeenCalledWith("old message body v2", {
+        accountId: ACCT,
+        roomId: ROOM,
+        target: { mode: "edit", targetKey: "k9" },
+      }),
+    );
 
     // The persistent draft is pre-send state: an edit must not persist the edit body
     // nor delete the stored draft row.
@@ -1031,7 +1037,7 @@ describe("Composer phone deltas (Story 13.5)", () => {
     fireEvent.change(textarea, { target: { value: "tap to send" } });
     fireEvent.click(sendButton);
     await waitFor(() => {
-      expect(onSend).toHaveBeenCalledWith("tap to send");
+      expect(onSend).toHaveBeenCalledWith("tap to send", expect.anything());
     });
   });
 
@@ -1075,7 +1081,7 @@ describe("Composer phone deltas (Story 13.5)", () => {
     fireEvent.change(textarea, { target: { value: "desktop enter" } });
     fireEvent.keyDown(textarea, { key: "Enter" });
     await waitFor(() => {
-      expect(onSend).toHaveBeenCalledWith("desktop enter");
+      expect(onSend).toHaveBeenCalledWith("desktop enter", expect.anything());
     });
   });
 });

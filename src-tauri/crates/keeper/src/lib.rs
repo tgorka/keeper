@@ -1283,6 +1283,12 @@ pub fn run() {
                 ipc::backup_save_recovery_key,
                 ipc::backup_saved_recovery_key,
                 ipc::send_text,
+                // Story 100.5: the messenger's slash commands.
+                ipc::send_emote,
+                ipc::chat_command_preview,
+                ipc::room_set_topic,
+                ipc::room_invite,
+                ipc::room_leave,
                 ipc::undo_send_window,
                 ipc::set_undo_send_window,
                 ipc::hotkey_get,
@@ -1710,6 +1716,9 @@ pub fn run() {
         // An agent's model and level (100.2 #4, R382): a write of its
         // `agent.toml`, which only a Mac with the drive can make.
         agents_host::agents_model_set,
+        // `/model` in an agent's DM (100.5, DW-1431, R415): the same save,
+        // so desktop-only like it; a phone's menu refuses `/model` first.
+        agents_host::agent_model_command,
         // This Mac's own MCP servers and `[sandbox]` table (96.2 #11,
         // R213): device-local, desktop-only like the section.
         agents_host::agents_mcp_list,

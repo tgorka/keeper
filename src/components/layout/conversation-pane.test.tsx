@@ -37,6 +37,8 @@ const unsubscribeTyping = vi.fn();
 const subscribePaginationStatus = vi.fn();
 const unsubscribePaginationStatus = vi.fn();
 const cancelHeldSend = vi.fn(async (_a: string, _r: string, _id: string): Promise<string> => "");
+const chatCommandPreview = vi.fn();
+const roomLeave = vi.fn();
 vi.mock("@/lib/ipc/client", () => ({
   // The default agent (story 100.3): read by Settings › Agents and the agent
   // room's menu on mount; a read that never answers renders neither.
@@ -90,6 +92,10 @@ vi.mock("@/lib/ipc/client", () => ({
   unsubscribeOutbox: vi.fn(async (): Promise<void> => {}),
   cancelHeldSend: (accountId: string, roomId: string, id: string) =>
     cancelHeldSend(accountId, roomId, id),
+  // Story 100.5's slash path, for the `/leave` lifetime test (R393).
+  chatCommandPreview: (accountId: string, roomId: string, draft: string, replying: boolean) =>
+    chatCommandPreview(accountId, roomId, draft, replying),
+  roomLeave: (accountId: string, roomId: string) => roomLeave(accountId, roomId),
   // Composer persistent drafts (Story 7.1): no stored draft; persist/clear are no-ops.
   loadDraft: vi.fn(async (): Promise<string | null> => null),
   saveDraft: vi.fn(async (): Promise<void> => {}),
@@ -107,8 +113,10 @@ vi.mock("@tauri-apps/api/webview", () => ({
   getCurrentWebview: () => ({ onDragDropEvent }),
 }));
 
+import { COMPOSER_CONTEXT_CHANGED } from "@/components/chat/composer";
 import { ConversationPane } from "@/components/layout/conversation-pane";
 import type { CouplingCaveatVm, InboxRoomVm, IncognitoVm } from "@/lib/ipc/client";
+import { mirrorDraft, saveDraft } from "@/lib/ipc/client";
 import { archiveRoomsStore } from "@/lib/stores/archive-rooms";
 import { attachmentsStore } from "@/lib/stores/attachments";
 import { composerStore } from "@/lib/stores/composer";
@@ -212,6 +220,9 @@ beforeEach(() => {
   outboxStore.getState().clear();
   cancelHeldSend.mockReset();
   cancelHeldSend.mockResolvedValue("");
+  chatCommandPreview.mockReset();
+  roomLeave.mockReset();
+  roomLeave.mockResolvedValue(undefined);
 });
 
 afterEach(() => {
@@ -769,6 +780,247 @@ describe("ConversationPane", () => {
     await waitFor(() => {
       expect(sendText).toHaveBeenCalledWith(account.accountId, "!room:example.org", "hello there");
     });
+  });
+
+  it("asks about leaving only the room /leave was typed in, and a room switch withdraws the question (R393)", async () => {
+    const roomA = "!room-a:example.org";
+    const roomB = "!room-b:example.org";
+    const captured: { onBatch: ((b: TimelineBatch) => void) | null } = { onBatch: null };
+    let nextId = 1;
+    subscribeTimeline.mockImplementation((_a, _r, onBatch: (b: TimelineBatch) => void) => {
+      captured.onBatch = onBatch;
+      return Promise.resolve(nextId++);
+    });
+    const leaveVerdict = (draft: string) => ({
+      draft,
+      verdict:
+        draft === "/leave"
+          ? { kind: "command", name: "leave", args: null }
+          : { kind: "text", text: draft },
+      rows: [],
+      escapeHint: "",
+    });
+    // Every answer is held until the test lets it go.
+    const asks: Array<() => void> = [];
+    chatCommandPreview.mockImplementation(
+      (_a: string, _r: string, draft: string) =>
+        new Promise((answer) => asks.push(() => answer(leaveVerdict(draft)))),
+    );
+    const open = async (roomId: string) => {
+      roomsStore.getState().selectRoom({ accountId: account.accountId, roomId });
+      rerender(<ConversationPane {...noopProps()} />);
+      await waitFor(() =>
+        expect(subscribeTimeline).toHaveBeenCalledWith(
+          account.accountId,
+          roomId,
+          expect.any(Function),
+        ),
+      );
+      act(() => captured.onBatch?.({ ops: [message(`k-${roomId}`, "@bob:example.org", "hi")] }));
+      const field = await screen.findByLabelText("Message");
+      await waitFor(() => expect(field).not.toBeDisabled());
+      return field;
+    };
+    const typeLeave = (field: HTMLElement) => {
+      fireEvent.change(field, { target: { value: "/leave" } });
+      fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+    };
+    const releaseAll = async () => {
+      await act(async () => {
+        for (const answer of asks.splice(0)) {
+          answer();
+        }
+      });
+    };
+
+    roomsStore.getState().selectRoom({ accountId: account.accountId, roomId: roomA });
+    const { rerender } = render(<ConversationPane {...noopProps()} />);
+    // `/leave` in A, then B is opened before Rust answers: nothing is asked about B.
+    typeLeave(await open(roomA));
+    await open(roomB);
+    await releaseAll();
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+
+    // `/leave` in B opens its question; switching to A withdraws it, unanswered.
+    typeLeave(await open(roomB));
+    await releaseAll();
+    expect(await screen.findByRole("alertdialog")).toBeInTheDocument();
+    await open(roomA);
+    await waitFor(() => expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument());
+    expect(roomLeave).not.toHaveBeenCalled();
+
+    // `/leave` in A, confirmed: exactly A is left.
+    typeLeave(screen.getByLabelText("Message"));
+    await releaseAll();
+    fireEvent.click(await screen.findByRole("button", { name: "Leave" }));
+    await waitFor(() => expect(roomLeave).toHaveBeenCalledTimes(1));
+    expect(roomLeave).toHaveBeenCalledWith(account.accountId, roomA);
+  });
+
+  it("sends a slow / line where it was submitted, never into an edit or reply begun meanwhile (R411)", async () => {
+    const room = "!room:example.org";
+    const captured: { onBatch: ((b: TimelineBatch) => void) | null } = { onBatch: null };
+    subscribeTimeline.mockImplementation((_a, _r, onBatch: (b: TimelineBatch) => void) => {
+      captured.onBatch = onBatch;
+      return Promise.resolve(1);
+    });
+    // `/plain <text>` is text; every answer is held until the test lets it go.
+    const asks: Array<() => void> = [];
+    chatCommandPreview.mockImplementation(
+      (_a: string, _r: string, draft: string) =>
+        new Promise((answer) =>
+          asks.push(() =>
+            answer({
+              draft,
+              verdict: { kind: "text", text: draft.replace(/^\/plain /, "") },
+              rows: [],
+              escapeHint: "",
+            }),
+          ),
+        ),
+    );
+    const releaseAll = async () => {
+      await act(async () => {
+        for (const answer of asks.splice(0)) {
+          answer();
+        }
+      });
+    };
+    roomsStore.getState().selectRoom({ accountId: account.accountId, roomId: room });
+    render(<ConversationPane {...noopProps()} />);
+    act(() =>
+      captured.onBatch?.({
+        ops: [
+          message("orig-1", "@bob:example.org", "the original"),
+          {
+            op: "pushBack",
+            item: {
+              ...(messageItem("own-1", account.userId, "my message") as Extract<
+                TimelineItemVm,
+                { kind: "message" }
+              >),
+              isOwn: true,
+            },
+          },
+        ],
+      }),
+    );
+    const field = await screen.findByLabelText<HTMLTextAreaElement>("Message");
+    await waitFor(() => expect(field).not.toBeDisabled());
+    const submit = (line: string) => {
+      fireEvent.change(field, { target: { value: line } });
+      fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+    };
+
+    // An edit begun while Rust reads a new message: the line is that new message,
+    // and the edit is neither saved nor closed.
+    submit("/plain replacement");
+    fireEvent.click(await screen.findByRole("button", { name: "Edit" }));
+    await waitFor(() => expect(field.value).toBe("my message"));
+    await releaseAll();
+    await waitFor(() =>
+      expect(sendText).toHaveBeenCalledWith(account.accountId, room, "replacement"),
+    );
+    expect(editMessage).not.toHaveBeenCalled();
+    expect(screen.getByText("Editing your message")).toBeInTheDocument();
+    expect(field.value).toBe("my message");
+    // The text the edit set aside was that line, now sent: leaving the edit
+    // brings nothing back.
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(field.value).toBe(""));
+    expect(editMessage).not.toHaveBeenCalled();
+
+    // A reply begun meanwhile does not take the line either, and stays open.
+    sendText.mockClear();
+    submit("/plain second");
+    fireEvent.click(screen.getAllByRole("button", { name: "Reply" })[0] as HTMLElement);
+    expect(screen.getByText(/Replying to/)).toBeInTheDocument();
+    await releaseAll();
+    await waitFor(() => expect(sendText).toHaveBeenCalledWith(account.accountId, room, "second"));
+    expect(sendReply).not.toHaveBeenCalled();
+    expect(screen.getByText(/Replying to/)).toBeInTheDocument();
+
+    // A line submitted as that reply, which is then cancelled: nothing is sent.
+    sendText.mockClear();
+    submit("/plain third");
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    await releaseAll();
+    expect(await screen.findByRole("alert")).toHaveTextContent(COMPOSER_CONTEXT_CHANGED);
+    expect(sendText).not.toHaveBeenCalled();
+    expect(sendReply).not.toHaveBeenCalled();
+    expect(field.value).toBe("/plain third");
+  });
+
+  // R100S3-01: a slow `/` line that fails while an edit borrows the field stays
+  // the room's draft — saved and mirrored as the failed line, never as the
+  // edit's body — and leaving the edit brings it back.
+  it("keeps a failed slow / line as the room's draft, never an edit begun meanwhile", async () => {
+    const room = "!room:example.org";
+    const captured: { onBatch: ((b: TimelineBatch) => void) | null } = { onBatch: null };
+    subscribeTimeline.mockImplementation((_a, _r, onBatch: (b: TimelineBatch) => void) => {
+      captured.onBatch = onBatch;
+      return Promise.resolve(1);
+    });
+    const asks: Array<() => void> = [];
+    chatCommandPreview.mockImplementation(
+      (_a: string, _r: string, draft: string) =>
+        new Promise((answer) =>
+          asks.push(() =>
+            answer({
+              draft,
+              verdict: { kind: "text", text: draft.replace(/^\/plain /, "") },
+              rows: [],
+              escapeHint: "",
+            }),
+          ),
+        ),
+    );
+    roomsStore.getState().selectRoom({ accountId: account.accountId, roomId: room });
+    render(<ConversationPane {...noopProps()} />);
+    act(() =>
+      captured.onBatch?.({
+        ops: [
+          {
+            op: "pushBack",
+            item: {
+              ...(messageItem("own-1", account.userId, "my message") as Extract<
+                TimelineItemVm,
+                { kind: "message" }
+              >),
+              isOwn: true,
+            },
+          },
+        ],
+      }),
+    );
+    const field = await screen.findByLabelText<HTMLTextAreaElement>("Message");
+    await waitFor(() => expect(field).not.toBeDisabled());
+    fireEvent.change(field, { target: { value: "/plain replacement" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Edit" }));
+    await waitFor(() => expect(field.value).toBe("my message"));
+
+    vi.mocked(saveDraft).mockClear();
+    vi.mocked(mirrorDraft).mockClear();
+    sendText.mockRejectedValueOnce({ code: "sendFailed", message: "offline", retriable: true });
+    await act(async () => {
+      for (const answer of asks.splice(0)) {
+        answer();
+      }
+    });
+    await waitFor(() =>
+      expect(sendText).toHaveBeenCalledWith(account.accountId, room, "replacement"),
+    );
+    await waitFor(() => expect(mirrorDraft).toHaveBeenCalled());
+    expect(vi.mocked(saveDraft).mock.calls.map((call) => call[2])).toEqual(["/plain replacement"]);
+    expect(vi.mocked(mirrorDraft).mock.calls.map((call) => call[2])).toEqual([
+      "/plain replacement",
+    ]);
+    // The edit kept its body, and leaving it puts the failed line back.
+    expect(field.value).toBe("my message");
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(field.value).toBe("/plain replacement"));
+    expect(editMessage).not.toHaveBeenCalled();
   });
 
   it("pushes a dropped file path into the composer tray", async () => {

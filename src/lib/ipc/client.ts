@@ -450,6 +450,9 @@ export type { CaptureTargetVm } from "./gen/CaptureTargetVm";
 export type { CaptureWindowVm } from "./gen/CaptureWindowVm";
 export type { CardAgentVm } from "./gen/CardAgentVm";
 export type { CardKeyVm } from "./gen/CardKeyVm";
+export type { ChatCommandPreviewVm } from "./gen/ChatCommandPreviewVm";
+export type { ChatCommandRowVm } from "./gen/ChatCommandRowVm";
+export type { ChatCommandVerdictVm } from "./gen/ChatCommandVerdictVm";
 export type { ChatNotifyMode } from "./gen/ChatNotifyMode";
 export type { ChoiceVm } from "./gen/ChoiceVm";
 export type { ConfigFaultVm } from "./gen/ConfigFaultVm";
@@ -851,6 +854,7 @@ import type { BridgeNetworkVm } from "./gen/BridgeNetworkVm";
 import type { CapabilitiesVm } from "./gen/CapabilitiesVm";
 import type { CaptureTargetVm } from "./gen/CaptureTargetVm";
 import type { CaptureWindowVm } from "./gen/CaptureWindowVm";
+import type { ChatCommandPreviewVm } from "./gen/ChatCommandPreviewVm";
 import type { ChoiceVm } from "./gen/ChoiceVm";
 import type { ConfigLayersVm } from "./gen/ConfigLayersVm";
 import type { ConnectionStatusBatch } from "./gen/ConnectionStatusBatch";
@@ -2097,9 +2101,78 @@ export async function backupSavedRecoveryKey(accountId: string): Promise<string 
  * back over the room's existing timeline subscription (no echo is synthesized
  * here). Resolves on successful enqueue; rejects with the {@link IpcError}
  * envelope (`code: "sendFailed"`, `retriable: true`) on an enqueue-time failure.
+ *
+ * `line` is the composer line the person typed when it is not the body — `//etc`
+ * sent as `/etc`, `/plain …` (Story 100.5): a held send keeps it, so Undo puts back
+ * exactly that line (R393). Omitted, the body is the line.
  */
-export async function sendText(accountId: string, roomId: string, body: string): Promise<void> {
-  await invoke<void>("send_text", { accountId, roomId, body });
+export async function sendText(
+  accountId: string,
+  roomId: string,
+  body: string,
+  line?: string,
+): Promise<void> {
+  await invoke<void>("send_text", { accountId, roomId, body, line: line ?? null });
+}
+
+/**
+ * Send an action — the `m.emote` a `/me` line resolves to (Story 100.5) —
+ * through the same Rust dispatch gate and Undo-Send hold as {@link sendText}.
+ * `line` is the `/me …` line as typed, which Undo restores (R393). Rejects as
+ * {@link sendText}; Rust logs the failure at WARN.
+ */
+export async function sendEmote(
+  accountId: string,
+  roomId: string,
+  body: string,
+  line: string,
+): Promise<void> {
+  await invoke<void>("send_emote", { accountId, roomId, body, line });
+}
+
+/**
+ * What a messenger draft means, and what its `/` menu shows (Story 100.5,
+ * R385). Rust reads the room — chat or agent room, what the person's power
+ * levels allow — and decides; `replying` is the composer's own state.
+ *
+ * **`draft` is echoed back, and the caller must check it**: replies can land
+ * out of order. `rows` is the menu, already filtered and ordered (AD-20);
+ * empty means draw no menu.
+ *
+ * Rejects with the {@link IpcError} envelope when the room is not known on the
+ * account.
+ */
+export async function chatCommandPreview(
+  accountId: string,
+  roomId: string,
+  draft: string,
+  replying: boolean,
+): Promise<ChatCommandPreviewVm> {
+  return await invoke<ChatCommandPreviewVm>("chat_command_preview", {
+    accountId,
+    roomId,
+    draft,
+    replying,
+  });
+}
+
+/** `/topic`: change the room's topic (Story 100.5). Rejects with the envelope. */
+export async function roomSetTopic(
+  accountId: string,
+  roomId: string,
+  topic: string,
+): Promise<void> {
+  await invoke<void>("room_set_topic", { accountId, roomId, topic });
+}
+
+/** `/invite`: invite a Matrix user id to the room (Story 100.5). Rejects with the envelope. */
+export async function roomInvite(accountId: string, roomId: string, userId: string): Promise<void> {
+  await invoke<void>("room_invite", { accountId, roomId, userId });
+}
+
+/** `/leave`, once confirmed: leave the room (Story 100.5). Rejects with the envelope. */
+export async function roomLeave(accountId: string, roomId: string): Promise<void> {
+  await invoke<void>("room_leave", { accountId, roomId });
 }
 
 /**
@@ -7706,6 +7779,20 @@ export async function agentsSeedApply(req: AgentSeedReq): Promise<AgentSeedResul
  */
 export async function agentsModelSet(req: AgentModelReq): Promise<AgentCopyVm[]> {
   return await invoke<AgentCopyVm[]>("agents_model_set", { req });
+}
+
+/**
+ * `/model` typed in the person's DM with an agent (story 100.5, DW-1431,
+ * R415): `args` is what followed the name. Rust reads it against the agent's
+ * `agent.toml` and saves through Settings › Agents' own write; the answer is
+ * the sentence to show, a refusal rejects with its sentence.
+ */
+export async function agentModelCommand(
+  accountId: string,
+  roomId: string,
+  args: string | null,
+): Promise<string> {
+  return await invoke<string>("agent_model_command", { accountId, roomId, args });
 }
 
 /**

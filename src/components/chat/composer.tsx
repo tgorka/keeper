@@ -24,6 +24,14 @@
  * (×) control. `Esc` cancels the pending context: a reply keeps the typed draft; an
  * edit restores the pre-edit stashed draft (both "cancel without losing composer
  * text"). Entering edit prefills the textarea with the message body (`editPrefill`).
+ *
+ * A leading `/` opens the slash menu (Story 100.5, R385) — the shared
+ * {@link SlashMenuList}, anchored above the field. What a `/` line means is
+ * `keeper_core::chat::commands`' answer through {@link chatCommandPreview}: text,
+ * an action (`/me`), an act on the room, or a refusal shown here with the draft
+ * kept. A line with no leading slash is sent without asking, so prose costs no
+ * round trip. Commands are off while editing (the text is that message's body)
+ * and while attachments are pending (the text is their caption).
  */
 import { open } from "@tauri-apps/plugin-dialog";
 import { Paperclip, Plus, X } from "lucide-react";
@@ -35,13 +43,19 @@ import {
   useRef,
   useState,
 } from "react";
+import type { ChatCommandInvocation, ChatCommandOutcome } from "@/components/chat/chat-commands";
+import type { SlashRow } from "@/components/slash-menu/slash-menu";
+import { SlashHelp, SlashMenuList } from "@/components/slash-menu/slash-menu-list";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { IconHint } from "@/components/ui/tooltip";
 import { useShellLayout } from "@/hooks/use-shell-layout";
+import { useSlashMenu } from "@/hooks/use-slash-menu";
 import { logFailure, sayFailure } from "@/lib/failure";
 import { formatFileSize } from "@/lib/file-size";
 import {
+  type ChatCommandPreviewVm,
+  chatCommandPreview,
   clearDraft,
   clearDraftMirror,
   type IpcError,
@@ -72,6 +86,18 @@ function basename(path: string): string {
   return parts[parts.length - 1] || path;
 }
 
+/**
+ * Where a submission goes, fixed at the Enter or click that submits it (R411):
+ * the room, and the reply or edit it was submitted under (`null`: a new
+ * message). It travels with the request, so a `/` line Rust answers later is
+ * sent where it was submitted — never into a reply or edit begun meanwhile.
+ */
+export interface SendContext {
+  accountId: string;
+  roomId: string;
+  target: { mode: PendingContext["mode"]; targetKey: string } | null;
+}
+
 interface ComposerProps {
   /**
    * The open conversation's owning account id (Story 7.1). Keys the persistent
@@ -84,12 +110,14 @@ interface ComposerProps {
    */
   roomId: string;
   /**
-   * Dispatch the trimmed body. Resolves on success (the draft then clears);
-   * rejects if the send could not be enqueued (the draft is kept so the user can
-   * retry). The parent routes this to `sendReply` / `editMessage` / `sendText`
-   * based on the current `pending`.
+   * Dispatch the trimmed body into `context` — `sendReply` / `editMessage` /
+   * `sendText` by its target, never by whatever is pending when the dispatch
+   * runs (R411). Resolves on success (the draft then clears); rejects if the
+   * send could not be enqueued (the draft is kept so the user can retry).
+   * `line` is the `/` line the person typed when the body is what Rust resolved
+   * it to (`//etc` → `/etc`, Story 100.5): a held send keeps it for Undo (R393).
    */
-  onSend: (body: string) => Promise<void>;
+  onSend: (body: string, context: SendContext, line?: string) => Promise<void>;
   /**
    * Dispatch the pending attachments (Story 3.7). `caption` is the trimmed
    * composer text, passed only when exactly one attachment is pending (otherwise
@@ -127,7 +155,40 @@ interface ComposerProps {
    * dispatch failure. Absent → no typing is emitted.
    */
   onTyping?: (typing: boolean) => void;
+  /**
+   * Send an action — the `m.emote` a `/me` line resolves to (Story 100.5) —
+   * into `context`'s room. `line` is the `/me …` line as typed, which a held
+   * send keeps for Undo (R393). Rejects like {@link onSend}, and the same inline
+   * failure copy applies; Rust logs the failure at WARN.
+   */
+  onSendEmote?: (body: string, context: SendContext, line: string) => Promise<void>;
+  /**
+   * Run a command Rust resolved (Story 100.5): resolves to what to say beside
+   * the composer, or `null` when the act has its own surface (`/leave`'s
+   * confirmation). Never called for `/help`, which the composer answers.
+   * Absent (with {@link onSendEmote}) → no slash menu.
+   */
+  onCommand?: (command: ChatCommandInvocation) => Promise<ChatCommandOutcome | null>;
+  /**
+   * How a `/` line is resolved. The default asks Rust about this room; a test
+   * passes its own.
+   */
+  resolveCommand?: (draft: string, replying: boolean) => Promise<ChatCommandPreviewVm>;
 }
+
+/**
+ * What the composer says when it could not find out what a `/` line was: the
+ * one thing it refuses is sending text nobody resolved.
+ */
+export const COMPOSER_COMMAND_UNRESOLVED =
+  "keeper couldn't tell whether that was a command, so nothing was sent.";
+
+/**
+ * What the composer says when the reply a `/` line was submitted under was
+ * cancelled or changed before Rust answered: the line is not sent anywhere else.
+ */
+export const COMPOSER_CONTEXT_CHANGED =
+  "Nothing was sent: the reply that line was for changed before keeper read it.";
 
 /** Minimum interval between `setTyping(true)` emits while typing (≤1/3 s). */
 const TYPING_THROTTLE_MS = 3000;
@@ -163,6 +224,9 @@ export function Composer({
   onCancelPending,
   onEmptyArrowUp,
   onTyping,
+  onSendEmote,
+  onCommand,
+  resolveCommand,
 }: ComposerProps) {
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
@@ -187,6 +251,11 @@ export function Composer({
   // differing. Local text is never overwritten without the user tapping "Use that
   // version".
   const [remoteOffer, setRemoteOffer] = useState<string | null>(null);
+  // What the last slash command came to (Story 100.5): a quiet status, or a
+  // refusal/failure shown as an alert with the draft kept. Editing retires it.
+  const [commandNote, setCommandNote] = useState<ChatCommandOutcome | null>(null);
+  // `/help`'s panel, held whole: it outlives the draft that opened it.
+  const [help, setHelp] = useState<{ rows: readonly SlashRow[]; escapeHint: string } | null>(null);
 
   // Whether Incognito is effective for this chat (Story 8.1). Mirrored from the
   // Rust-resolved VM; drives the violet composer focus ring while it applies.
@@ -427,10 +496,11 @@ export function Composer({
   // taking `draft` as a dependency (which would re-run the effect every keystroke).
   const draftRef = useRef(draft);
   draftRef.current = draft;
-  // Mirror the pending mode in a ref so the remote-reconcile adopt callback can check
-  // "am I editing?" without taking `pending` as a dependency (Story 7.2).
-  const pendingModeRef = useRef(pending?.mode);
-  pendingModeRef.current = pending?.mode;
+  // Mirror the pending context in a ref so the remote-reconcile adopt callback can
+  // check "am I editing?" without taking `pending` as a dependency (Story 7.2), and a
+  // late `/` verdict can check whether its reply still stands (R411).
+  const pendingRef = useRef(pending);
+  pendingRef.current = pending;
   // The draft that was in the composer just before entering the current edit,
   // restored verbatim on Esc/cancel so an edit "cancels without losing composer
   // text" (Story 3.4, FR-11). Owned here because the draft lives in local state.
@@ -470,7 +540,7 @@ export function Composer({
       // so a remote draft must never be adopted into it — that would overwrite the edit
       // and persist/mirror it as the draft (Story 7.2/3.4). Defensive: callers already
       // gate on edit mode.
-      if (body.length === 0 || pendingModeRef.current === "edit") {
+      if (body.length === 0 || pendingRef.current?.mode === "edit") {
         return;
       }
       restoreConsumed.current = true;
@@ -500,7 +570,7 @@ export function Composer({
     }
     seenRestoreNonce.current = restoreNonce;
     const { restoreBody: body, restoreTarget: target } = composer.getState();
-    if (body === null || pendingModeRef.current === "edit") {
+    if (body === null || pendingRef.current?.mode === "edit") {
       return;
     }
     if (
@@ -618,15 +688,32 @@ export function Composer({
     !disabled &&
     !sending;
 
-  async function send() {
-    // Capture the mode before awaiting: an edit sends onto an existing message and
-    // must not touch this room's persistent draft, so it restores the pre-edit text
-    // instead of clearing (Story 7.1). A reply/text send owns the draft and clears it.
-    const wasEdit = pending?.mode === "edit";
-    const body = draft.trim();
+  /**
+   * Dispatch the draft into `context`, the room and reply/edit it was submitted
+   * under — or, for a `/` line Rust resolved (Story 100.5), the `message` it
+   * resolved to: its text, whether it is an action, and the line the person
+   * typed, which a held send keeps for Undo (R393).
+   *
+   * The draft is this send's only while it still holds the line that was sent
+   * (R393, R411): then its queued save and mirror are cancelled before the
+   * dispatch and the draft is cleared and persisted empty after it. Anything
+   * else — text typed during a slow send, or while Rust read a `/` line — is the
+   * person's next message: its text, its queued save and its mirror are left
+   * exactly as they are.
+   */
+  async function send(
+    context: SendContext,
+    message?: { body: string; emote: boolean; line: string },
+  ) {
+    // An edit sends onto an existing message and must not touch this room's
+    // persistent draft, so it restores the pre-edit text instead of clearing
+    // (Story 7.1). A reply/text send owns the draft and clears it.
+    const wasEdit = context.target?.mode === "edit";
+    const ran = message?.line ?? draft.trim();
+    const body = message?.body ?? draft.trim();
     const trayAttachments = tray.getState().pending;
     const dispatchAttachments =
-      onSendAttachments != null && pending?.mode !== "edit" && trayAttachments.length > 0;
+      message === undefined && onSendAttachments != null && !wasEdit && trayAttachments.length > 0;
     if ((body.length === 0 && !dispatchAttachments) || disabled || sending) {
       // Whitespace-only with no attachment / disabled / in-flight: never dispatch.
       return;
@@ -634,25 +721,26 @@ export function Composer({
     // A dispatch consumes/replaces the composer content; a late mount restore must not
     // resurrect a just-sent draft into the emptied composer. (Story 7.1)
     restoreConsumed.current = true;
-    // Cancel any queued debounced persist before the (possibly slow) send: otherwise
-    // a flush landing mid-send could re-`saveDraft` a row we then `clearDraft`, and the
-    // two fire-and-forget writes could reorder — leaving an orphan draft + amber marker
-    // on an already-sent chat that survives relaunch (Story 7.1).
-    if (draftSaveTimer.current !== null) {
-      clearTimeout(draftSaveTimer.current);
-      draftSaveTimer.current = null;
+    // While the draft is the line being sent, its queued save and mirror are this
+    // send's: cancel them before the (possibly slow) send. Otherwise a flush landing
+    // mid-send could re-`saveDraft` a row we then `clearDraft` (or write the mirror
+    // that the post-send tombstone then races), and the fire-and-forget writes could
+    // reorder — leaving an orphan draft + amber marker, or a resurrected draft on
+    // other devices, on an already-sent chat (Story 7.1, 7.2). A failed send
+    // re-queues them in the catch below.
+    const owned = draftIs(ran);
+    if (owned) {
+      if (draftSaveTimer.current !== null) {
+        clearTimeout(draftSaveTimer.current);
+        draftSaveTimer.current = null;
+      }
+      pendingDraft.current = null;
+      if (draftMirrorTimer.current !== null) {
+        clearTimeout(draftMirrorTimer.current);
+        draftMirrorTimer.current = null;
+      }
+      pendingMirror.current = null;
     }
-    pendingDraft.current = null;
-    // Same hazard for the cross-device mirror (Story 7.2): a queued debounced mirror
-    // landing during a slow `onSend` would write the draft to account data, and then
-    // reorder after the post-send tombstone (`clearPersistedDraft → clearMirror`),
-    // resurrecting the sent draft on other devices. Cancel it before the send; a
-    // failed non-edit send re-schedules the mirror in the catch below.
-    if (draftMirrorTimer.current !== null) {
-      clearTimeout(draftMirrorTimer.current);
-      draftMirrorTimer.current = null;
-    }
-    pendingMirror.current = null;
     // Sending stops typing (Story 3.9): clear the notice once as the message goes.
     stopTyping();
     setSending(true);
@@ -666,29 +754,29 @@ export function Composer({
         // If the text did not ride as a caption (multiple attachments) but the
         // user typed a body, dispatch it as its own message.
         if (caption === undefined && body.length > 0) {
-          await onSend(body);
+          await onSend(body, context);
         }
-        // Clear only on success so a failed enqueue keeps the tray + text. Attachments
-        // never ride an edit (guarded above), so the draft is always cleared here.
+        // Clear only on success so a failed enqueue keeps the tray + text.
         tray.getState().clear();
-        setDraft("");
-        clearPersistedDraft();
+        spendDraft(ran);
       } else {
-        await onSend(body);
+        if (message === undefined) {
+          await onSend(body, context);
+        } else if (message.emote && onSendEmote != null) {
+          await onSendEmote(body, context, message.line);
+        } else {
+          await onSend(body, context, message.line);
+        }
         // Clear only on success so a failed enqueue keeps the user's text.
         if (wasEdit) {
           // Editing an existing message leaves the persistent draft untouched: restore
           // the pre-edit composer text (the real draft) and keep the stored row/marker.
           setDraft(preEditDraft.current);
-          // Re-queue that text for persistence: entering edit may have cancelled a
-          // still-debounced keystroke (the queued save is dropped above before dispatch),
-          // so without this a pre-edit draft typed within the ~200 ms window would be
-          // restored on screen but never reach `keeper.db` — a relaunch would show the
-          // staler stored body. The stored row must track the restored composer (Story 7.1).
+          // Re-queue that text for persistence, so the stored row tracks the restored
+          // composer even if a pre-edit keystroke's save never landed (Story 7.1).
           scheduleDraftSave(preEditDraft.current);
         } else {
-          setDraft("");
-          clearPersistedDraft();
+          spendDraft(ran);
         }
       }
     } catch (raw) {
@@ -702,19 +790,183 @@ export function Composer({
       logFailure("composer.send")(raw);
       const err = raw as IpcError | null | undefined;
       setError(err?.retriable === false ? "terminal" : "retriable");
-      // Re-persist the retained draft (the queued save was cancelled above) so a failed
-      // non-edit send stays durable across relaunch. An edit never touched the stored
-      // draft, so there is nothing to re-persist. Read the live draft via `draftRef`
-      // (not the `draft` closure captured at send time): if the user retyped during the
-      // in-flight send, the composer now shows that newer text, and persisting the stale
-      // pre-send body would diverge from it.
-      if (!wasEdit) {
-        scheduleDraftSave(draftRef.current);
+      // Re-queue what was cancelled above while the draft is still the line that
+      // failed, so a failed send stays durable across relaunch. Text typed since is
+      // the next message and queued its own save; an edit never touched the stored
+      // draft, so there is nothing to re-persist. While an edit begun since borrows
+      // the field, the room's draft is the line that edit set aside — the failed
+      // line — never the edit's body (R100S3-01).
+      if (owned && !wasEdit && draftIs(ran)) {
+        scheduleDraftSave(roomDraft());
       }
     } finally {
       setSending(false);
     }
   }
+
+  // Slash commands (Story 100.5) — off while editing (the text is that
+  // message's body) and while attachments wait (the text is their caption).
+  const commandsEnabled =
+    onCommand != null && onSendEmote != null && pending?.mode !== "edit" && !hasAttachments;
+  const replying = pending?.mode === "reply";
+  const resolve = useCallback(
+    (line: string) =>
+      resolveCommand != null
+        ? resolveCommand(line, replying)
+        : chatCommandPreview(accountId, roomId, line, replying),
+    [resolveCommand, accountId, roomId, replying],
+  );
+
+  // One submission at a time (R393): taken synchronously by the Enter or click
+  // that starts it, before any preview is awaited, and released when the line
+  // has been sent, run or refused — so a second Enter while it is held does
+  // nothing, rather than running the same line twice.
+  const inFlight = useRef(false);
+  // This composer's room lifetime (it is keyed by room). An answer that arrives
+  // after the room was left belongs to a composer nobody is looking at: it is
+  // dropped, never obeyed — a late `/leave` must not ask about the room on screen.
+  const alive = useRef(true);
+  useEffect(() => {
+    alive.current = true;
+    return () => {
+      alive.current = false;
+    };
+  }, []);
+
+  /**
+   * Whether this room's draft is still `ran`: the field — or, while an edit
+   * borrows the field, the text that edit set aside (R411).
+   */
+  function draftIs(ran: string): boolean {
+    return roomDraft().trim() === ran;
+  }
+
+  /** This room's draft: the field, or the text an edit borrowing it set aside. */
+  function roomDraft(): string {
+    return pendingRef.current?.mode === "edit" ? preEditDraft.current : draftRef.current;
+  }
+
+  /**
+   * The draft is spent by what `ran` did — only if it is still that line, and
+   * then it is cleared and persisted empty (R393, R411). A changed draft is the
+   * person's next message and is not touched at all.
+   */
+  function spendDraft(ran: string) {
+    if (!draftIs(ran)) {
+      return;
+    }
+    restoreConsumed.current = true;
+    if (pendingRef.current?.mode === "edit") {
+      // The line was sent while an edit borrowed the field: the text that edit
+      // will put back is spent, not the edit's body.
+      preEditDraft.current = "";
+    } else {
+      setDraft("");
+      stopTyping();
+    }
+    clearPersistedDraft();
+  }
+
+  /** Obey what Rust said `ran`, a `/` line submitted in `context`, is. */
+  async function obey(answer: ChatCommandPreviewVm, ran: string, context: SendContext) {
+    const verdict = answer.verdict;
+    switch (verdict.kind) {
+      case "text":
+      case "emote": {
+        // The reply it was submitted under must still be the one pending (R411); a
+        // new message stands for the composer's whole life, which is its room's.
+        const target = context.target;
+        const now = pendingRef.current;
+        if (target !== null && (now?.mode !== target.mode || now.targetKey !== target.targetKey)) {
+          // Sent nowhere else: not as a new message, not into another reply.
+          setCommandNote({ tone: "failed", message: COMPOSER_CONTEXT_CHANGED });
+          return;
+        }
+        await send(context, { body: verdict.text, emote: verdict.kind === "emote", line: ran });
+        return;
+      }
+      case "refusal":
+        // The draft stays: it is one keystroke from being right. A refusal is
+        // the answer, not a failure, so nothing goes to `keeper.log` (R393).
+        setCommandNote({ tone: "failed", message: verdict.message });
+        return;
+      case "command": {
+        if (verdict.name === "help") {
+          spendDraft(ran);
+          // The narrowed answer is still true about this token, so the panel
+          // opens with it; the failed full list is said and logged once.
+          const all = await resolve("/").catch((raw: unknown) => {
+            menu.fail(raw);
+            return answer;
+          });
+          setHelp({ rows: all.rows, escapeHint: all.escapeHint });
+          return;
+        }
+        if (onCommand == null) {
+          return;
+        }
+        setSending(true);
+        try {
+          const outcome = await onCommand({ name: verdict.name, args: verdict.args });
+          setCommandNote(outcome);
+          if (outcome === null || outcome.tone === "done") {
+            spendDraft(ran);
+          }
+        } finally {
+          setSending(false);
+        }
+        return;
+      }
+    }
+  }
+
+  /**
+   * Enter / Send: prose goes straight out; a `/` line is asked about first. The
+   * room and reply/edit are fixed here, synchronously, and travel with it (R411).
+   */
+  function submit() {
+    if (inFlight.current || disabled || sending) {
+      return;
+    }
+    inFlight.current = true;
+    const release = () => {
+      inFlight.current = false;
+    };
+    const context: SendContext = {
+      accountId,
+      roomId,
+      target: pending === null ? null : { mode: pending.mode, targetKey: pending.targetKey },
+    };
+    const text = draft.trim();
+    if (!commandsEnabled || !text.startsWith("/")) {
+      void send(context).finally(release);
+      return;
+    }
+    setCommandNote(null);
+    void resolve(text)
+      .then((answer) => (alive.current ? obey(answer, text, context) : undefined))
+      .catch((raw: unknown) => {
+        // The shell could not say what the line was; sending it unresolved is
+        // the one thing this must not do.
+        menu.fail(raw);
+        setCommandNote({ tone: "failed", message: COMPOSER_COMMAND_UNRESOLVED });
+      })
+      .finally(release);
+  }
+
+  const menu = useSlashMenu({
+    draft,
+    enabled: commandsEnabled,
+    resolve,
+    onComplete: (completed) => {
+      restoreConsumed.current = true;
+      setDraft(completed);
+      setCommandNote(null);
+      scheduleDraftSave(completed);
+    },
+    onRun: submit,
+    reportAs: "chat-command-preview",
+  });
 
   /** Open the native file picker and add each chosen path to the tray. */
   async function pickFiles() {
@@ -792,6 +1044,11 @@ export function Composer({
   }
 
   function onKeyDown(e: KeyboardEvent<HTMLTextAreaElement>) {
+    // The open slash menu claims ↑/↓/Enter/Tab/Escape first; everything it does
+    // not claim — and every key while it is closed — keeps its meaning below.
+    if (menu.onKeyDown(e)) {
+      return;
+    }
     if (e.key === "Escape" && pending) {
       // Esc cancels the pending reply/edit without losing composer text.
       e.preventDefault();
@@ -817,7 +1074,7 @@ export function Composer({
     // composing Enter never sends on any tier.
     if (!phone && e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
       e.preventDefault();
-      void send();
+      submit();
     }
   }
 
@@ -901,7 +1158,11 @@ export function Composer({
           ))}
         </ul>
       )}
-      <div className="flex items-end gap-2">
+      {help !== null && (
+        <SlashHelp rows={help.rows} escapeHint={help.escapeHint} onClose={() => setHelp(null)} />
+      )}
+      <div className="relative flex items-end gap-2">
+        <SlashMenuList menu={menu} />
         {attachEnabled && pending?.mode !== "edit" && (
           <IconHint label="Attach file">
             <Button
@@ -922,6 +1183,7 @@ export function Composer({
         <Textarea
           ref={textareaRef}
           aria-label="Message"
+          {...menu.fieldProps}
           placeholder="Write a message…"
           value={draft}
           disabled={disabled}
@@ -933,6 +1195,9 @@ export function Composer({
             restoreConsumed.current = true;
             if (error !== null) {
               setError(null);
+            }
+            if (commandNote !== null) {
+              setCommandNote(null);
             }
             // Reconcile the conflict chip against the typed text (Story 7.2): dismiss it
             // once the local text matches the offered remote (nothing to adopt).
@@ -973,7 +1238,7 @@ export function Composer({
         />
         <Button
           type="button"
-          onClick={() => void send()}
+          onClick={submit}
           disabled={!canSend}
           aria-label={pending?.mode === "edit" ? "Save edit" : "Send message"}
           // Phone (Story 13.5): a ≥44pt primary-tinted hit target — the sole send
@@ -989,6 +1254,23 @@ export function Composer({
           {DRAFT_NOT_SAVED}
         </p>
       )}
+      {/* One line about the slash path: the command's own sentence when there is
+          one, else why the menu could not be asked (R381). */}
+      {commandNote === null && menu.failure !== null && (
+        <p role="alert" className="text-destructive text-xs">
+          {menu.failure}
+        </p>
+      )}
+      {commandNote !== null &&
+        (commandNote.tone === "failed" ? (
+          <p role="alert" className="text-destructive text-xs">
+            {commandNote.message}
+          </p>
+        ) : (
+          <p role="status" className="text-muted-foreground text-xs">
+            {commandNote.message}
+          </p>
+        ))}
       {error !== null && (
         <p role="alert" className="text-destructive text-xs">
           {error === "terminal"

@@ -33,7 +33,7 @@ use matrix_sdk::ruma::events::room::message::{
 use matrix_sdk::ruma::events::room::redaction::OriginalSyncRoomRedactionEvent;
 use matrix_sdk::ruma::events::room::MediaSource;
 use matrix_sdk::ruma::events::{
-    AnySyncMessageLikeEvent, AnySyncTimelineEvent, SyncMessageLikeEvent,
+    AnySyncMessageLikeEvent, AnySyncTimelineEvent, StateEventType, SyncMessageLikeEvent,
 };
 use matrix_sdk::ruma::{EventId, OwnedRoomId, RoomId};
 use matrix_sdk::{Client, Room};
@@ -79,6 +79,7 @@ use crate::bridges::login::{self, BridgeLoginSink};
 use crate::bridges::transport::bot::BotDriver;
 use crate::bridges::transport::provisioning::Provisioning;
 use crate::bridges::transport::BridgeTransport;
+use crate::chat;
 use crate::drafts;
 use crate::error::{
     AccountError, BackupError, BridgeError, CoreError, InboxError, MediaError, SendError,
@@ -90,7 +91,7 @@ use crate::notify::{self, NotifyConfig};
 use crate::palette::{PaletteEntry, PaletteIndex};
 use crate::platform::Platform;
 use crate::registry;
-use crate::send::{self, SendTrigger};
+use crate::send::{self, MessageKind, SendTrigger};
 use crate::signals;
 use crate::timeline;
 use crate::verification::{self, VerificationSink};
@@ -374,13 +375,17 @@ fn outbox_snapshot(data_dir: &Path, account_id: &str, room_id: &str) -> OutboxVm
     let rows = rows
         .into_iter()
         .filter(|r| r.room_id == room_id)
-        .map(|r| HeldSendVm {
-            id: r.id,
-            account_id: r.account_id,
-            room_id: r.room_id,
-            body: r.body,
-            held_at_ms: r.held_at_ts,
-            dispatch_at_ms: r.dispatch_at_ts,
+        .map(|r| {
+            // The held bubble reads the line as typed, which is also what Undo restores.
+            let body = r.typed_line().to_owned();
+            HeldSendVm {
+                id: r.id,
+                account_id: r.account_id,
+                room_id: r.room_id,
+                body,
+                held_at_ms: r.held_at_ts,
+                dispatch_at_ms: r.dispatch_at_ts,
+            }
         })
         .collect();
     OutboxVm { rows }
@@ -504,7 +509,7 @@ async fn run_outbox_scheduler(
             // Dispatch-then-delete: hand to the SDK send queue (which persists it),
             // then remove the row. A dispatch error is best-effort — leave the row to
             // retry next tick rather than deleting an undispatched message.
-            match send::dispatch(&timeline, &row.body).await {
+            match send::dispatch(&timeline, &row.body, row.kind).await {
                 Ok(_) => {
                     backoff.remove(&row.id);
                     if let Err(e) = registry::delete_outbox(&data_dir, &row.id) {
@@ -2928,21 +2933,48 @@ impl AccountManager {
         false
     }
 
-    /// Send a plain-text message to `room_id` on `account_id` through the single
+    /// Send a plain-text message — `m.text`, or the `m.emote` a `/me` line is
+    /// (`kind`, Story 100.5) — to `room_id` on `account_id` through the single
     /// dispatch gate (FR-41, AD-13). Resolves the live `AccountHandle` and the
     /// room's open `Arc<Timeline>`, then delegates to [`send::submit`]. The local
     /// echo and every send-state transition arrive through the room's existing
     /// timeline subscription — this call synthesizes nothing.
+    /// `line` is the composer line the person typed (`/me waves`, `//etc`): a
+    /// held send keeps it, so an Undo puts back exactly that line rather than
+    /// one rebuilt from the body (R393). For prose it is the body itself.
     ///
     /// Errors: an unparsable/unknown room id → [`SendError::RoomNotFound`]; a room
     /// with no open timeline subscription → [`SendError::NoOpenTimeline`]; an SDK
-    /// enqueue failure → [`SendError::Dispatch`].
+    /// enqueue failure → [`SendError::Dispatch`]. An action that fails here is
+    /// logged at WARN (R381): the composer's sentence is the person's half, this
+    /// is `keeper.log`'s.
     pub async fn send_text(
         &self,
         platform: &Arc<dyn Platform>,
         account_id: &str,
         room_id: &str,
         body: &str,
+        kind: MessageKind,
+        line: &str,
+    ) -> Result<(), CoreError> {
+        let sent = self
+            .send_composed(platform, account_id, room_id, body, kind, line)
+            .await;
+        if let (Err(error), MessageKind::Emote) = (&sent, kind) {
+            tracing::warn!(account_id = %account_id, room_id = %room_id, error = %error, "slash command: the action was not sent");
+        }
+        sent
+    }
+
+    /// [`Self::send_text`]'s body, so its one failure log sees every way out.
+    async fn send_composed(
+        &self,
+        platform: &Arc<dyn Platform>,
+        account_id: &str,
+        room_id: &str,
+        body: &str,
+        kind: MessageKind,
+        line: &str,
     ) -> Result<(), CoreError> {
         let room_id: OwnedRoomId = RoomId::parse(room_id).map_err(|_| SendError::RoomNotFound)?;
         // Undo-Send window (Story 8.3): a positive window holds the approved send in
@@ -2956,12 +2988,20 @@ impl AccountManager {
         let data_dir = platform.data_dir()?;
         let window = registry::get_undo_send_window(&data_dir)?;
         if window > 0 {
-            self.hold_send(&data_dir, account_id, room_id.as_str(), body, window)
-                .await?;
+            self.hold_send(
+                &data_dir,
+                account_id,
+                room_id.as_str(),
+                body,
+                kind,
+                line,
+                window,
+            )
+            .await?;
             return Ok(());
         }
         let timeline = self.open_timeline_for(account_id, &room_id).await?;
-        send::submit(&timeline, body, SendTrigger::ComposerSend).await?;
+        send::submit(&timeline, body, kind, SendTrigger::ComposerSend).await?;
         tracing::info!(account_id = %account_id, room_id = %room_id, "message dispatched");
         Ok(())
     }
@@ -2973,13 +3013,18 @@ impl AccountManager {
     /// the scheduler when its window elapses, or deleted by `cancel_held_send`. The
     /// row id is a fresh `TransactionId` so many holds may coexist in one room. The
     /// body is never logged. An insert failure surfaces to the caller as a send error
-    /// (the held message is never silently dropped).
+    /// (the held message is never silently dropped). `line` is what the person typed,
+    /// kept for Undo (R393).
+    // One argument per column of the held row, as `registry::insert_outbox`.
+    #[allow(clippy::too_many_arguments)]
     async fn hold_send(
         &self,
         data_dir: &Path,
         account_id: &str,
         room_id: &str,
         body: &str,
+        kind: MessageKind,
+        line: &str,
         window_secs: u16,
     ) -> Result<(), CoreError> {
         let id = matrix_sdk::ruma::TransactionId::new().to_string();
@@ -2991,6 +3036,8 @@ impl AccountManager {
             account_id,
             room_id,
             body,
+            kind,
+            line,
             held_at,
             dispatch_at,
         )?;
@@ -3052,14 +3099,17 @@ impl AccountManager {
         // is never lost to a draft-write error after the row is already gone. Restore into
         // the row's *own* room (`row.room_id`, the canonical room recorded at hold time),
         // not the caller-supplied `room_id`, so the draft can never land in the wrong room.
+        // The line exactly as typed comes back — `/me waves` stays an action, `//etc`
+        // keeps its escape, an alias stays the alias (R393).
+        let restored = row.typed_line().to_owned();
         if let Err(e) =
-            registry::set_draft(&data_dir, account_id, &row.room_id, &row.body, now_ms())
+            registry::set_draft(&data_dir, account_id, &row.room_id, &restored, now_ms())
         {
             tracing::warn!(account_id = %account_id, error = %e, "cancel: could not persist restored draft; returning body for live restore");
         }
         self.notify_outbox(account_id).await;
         tracing::info!(account_id = %account_id, room_id = %row.room_id, "held send cancelled; body restored as draft");
-        Ok(row.body)
+        Ok(restored)
     }
 
     /// Subscribe to the held sends for one open Chat (Story 8.3). Emits an initial
@@ -3326,8 +3376,17 @@ impl AccountManager {
         let data_dir = platform.data_dir()?;
         let window = registry::get_undo_send_window(&data_dir)?;
         if window > 0 {
-            self.hold_send(&data_dir, account_id, room_id.as_str(), body, window)
-                .await?;
+            self.hold_send(
+                &data_dir,
+                account_id,
+                room_id.as_str(),
+                body,
+                MessageKind::Text,
+                // An approved draft's line is its body: nothing was typed as a command.
+                body,
+                window,
+            )
+            .await?;
             return Ok(());
         }
         let room = self.room_for(account_id, &room_id).await?;
@@ -3344,7 +3403,10 @@ impl AccountManager {
                     .map_err(|e| TimelineError::Build(e.to_string()))?,
             ),
         };
-        send::submit(&timeline, body, SendTrigger::ApprovalPaneApprove).await?;
+        // An approved draft is text: a draft is never an action. One line, so the
+        // AD-13 caller scan reads the trigger at its call.
+        let kind = MessageKind::Text;
+        send::submit(&timeline, body, kind, SendTrigger::ApprovalPaneApprove).await?;
         tracing::info!(account_id = %account_id, room_id = %room_id, "draft approved and dispatched");
         Ok(())
     }
@@ -4119,6 +4181,118 @@ impl AccountManager {
                 .filter(|title| !title.is_empty()),
         };
         send_agent_event(&room, AgentOutbound::ConversationRequest(content)).await
+    }
+
+    /// What the messenger composer's slash commands may do in `room_id`
+    /// (Story 100.5, R385): which room it is — a chat, the person's agent DM,
+    /// another agent room — and what the person's power levels allow there.
+    /// Read from the room on every ask, never told by the webview; `replying`
+    /// is the composer's own state and is the one fact it passes.
+    ///
+    /// A room without a power-levels event reads as the spec's defaults
+    /// (`power_levels_or_default`), which is what the server enforces too.
+    pub async fn chat_command_context(
+        &self,
+        account_id: &str,
+        room_id: &str,
+        replying: bool,
+    ) -> Result<chat::commands::Context, CoreError> {
+        let parsed = RoomId::parse(room_id).map_err(|_| TimelineError::RoomNotFound)?;
+        let room = self.room_for(account_id, &parsed).await?;
+        let (kind, agent_home_here) =
+            if AgentRoomKind::of(room.room_type().as_ref()) == Some(AgentRoomKind::Session) {
+                match admit_proxy_room(&room, &self.agent_kinds, &self.agent_proxies).await {
+                    Ok((SessionKind::Main, agent)) => (
+                        chat::commands::RoomKind::AgentMain,
+                        self.agent_icons.is_here(&agent),
+                    ),
+                    _ => (chat::commands::RoomKind::Agent, false),
+                }
+            } else {
+                (chat::commands::RoomKind::Chat, false)
+            };
+        let me = room.own_user_id();
+        let levels = room.power_levels_or_default().await;
+        Ok(chat::commands::Context {
+            room: kind,
+            may_set_topic: levels.user_can_send_state(me, StateEventType::RoomTopic),
+            may_invite: levels.user_can_invite(me),
+            replying,
+            agent_home_here,
+        })
+    }
+
+    /// The agent whose `main` DM `room_id` is (`/model`, R415): a room that is
+    /// not the person's proxy DM is refused, as `/new` is.
+    pub async fn proxy_main_agent(
+        &self,
+        account_id: &str,
+        room_id: &str,
+    ) -> Result<matrix_sdk::ruma::OwnedUserId, CoreError> {
+        let (_, kind, agent) = self.proxy_room(account_id, room_id).await?;
+        if kind != SessionKind::Main {
+            return Err(CoreError::Unsupported(
+                "An agent's model is changed in your DM with it.".to_owned(),
+            ));
+        }
+        Ok(agent)
+    }
+
+    /// Change `room_id`'s topic, as the person typed it after `/topic` (Story
+    /// 100.5). A refusal from the server is logged at WARN with the room and
+    /// the error, and returned for the composer's sentence (R381).
+    pub async fn room_set_topic(
+        &self,
+        account_id: &str,
+        room_id: &str,
+        topic: &str,
+    ) -> Result<(), CoreError> {
+        let parsed = RoomId::parse(room_id).map_err(|_| TimelineError::RoomNotFound)?;
+        let room = self.room_for(account_id, &parsed).await?;
+        room.set_room_topic(topic).await.map_err(|error| {
+            tracing::warn!(account_id = %account_id, room_id = %parsed, error = %error, "slash command: the topic was not changed");
+            SendError::Dispatch(error.to_string())
+        })?;
+        tracing::info!(account_id = %account_id, room_id = %parsed, "room topic changed");
+        Ok(())
+    }
+
+    /// Invite `user_id` to `room_id`, as the person typed it after `/invite`
+    /// (Story 100.5). An id that does not parse is refused before anything is
+    /// sent; a refusal from the server is logged at WARN and returned (R381).
+    pub async fn room_invite(
+        &self,
+        account_id: &str,
+        room_id: &str,
+        user_id: &str,
+    ) -> Result<(), CoreError> {
+        let parsed = RoomId::parse(room_id).map_err(|_| TimelineError::RoomNotFound)?;
+        let user = matrix_sdk::ruma::UserId::parse(user_id).map_err(|_| {
+            CoreError::Unsupported(format!(
+                "\"{user_id}\" is not a Matrix id like @name:server."
+            ))
+        })?;
+        let room = self.room_for(account_id, &parsed).await?;
+        room.invite_user_by_id(&user).await.map_err(|error| {
+            tracing::warn!(account_id = %account_id, room_id = %parsed, error = %error, "slash command: the invite was not sent");
+            SendError::Dispatch(error.to_string())
+        })?;
+        tracing::info!(account_id = %account_id, room_id = %parsed, "invite sent");
+        Ok(())
+    }
+
+    /// Leave `room_id`, after the person confirmed `/leave` (Story 100.5). The
+    /// room leaves the list through the room-list stream like any leave from
+    /// another client; a refusal is logged at WARN and returned (R381).
+    pub async fn room_leave(&self, account_id: &str, room_id: &str) -> Result<(), CoreError> {
+        let parsed = RoomId::parse(room_id).map_err(|_| TimelineError::RoomNotFound)?;
+        let room = self.room_for(account_id, &parsed).await?;
+        room.leave().await.map_err(|error| {
+            tracing::warn!(account_id = %account_id, room_id = %parsed, error = %error, "slash command: the room was not left");
+            SendError::Dispatch(error.to_string())
+        })?;
+        tracing::info!(account_id = %account_id, room_id = %parsed, "room left");
+        Ok(())
     }
 
     /// Tell the agent in the person's proxy room `room_id` where they stopped
@@ -6039,7 +6213,10 @@ pub async fn spoken_send(
                 .map_err(|e| TimelineError::Build(e.to_string()))?,
         ),
     };
-    if let Some(handle) = send::submit(&timeline, text, SendTrigger::SpokenToAgent).await? {
+    // What was heard is text. One line, so the AD-13 caller scan reads the
+    // trigger at its call.
+    let kind = MessageKind::Text;
+    if let Some(handle) = send::submit(&timeline, text, kind, SendTrigger::SpokenToAgent).await? {
         answer.sent(&handle, text);
     }
     Ok(answer)
@@ -8762,7 +8939,14 @@ mod tests {
 
         // An unparsable room id is an honest typed error, never a panic.
         let bad_room = manager
-            .send_text(&platform, "acctA", "not-a-room-id", "hi")
+            .send_text(
+                &platform,
+                "acctA",
+                "not-a-room-id",
+                "hi",
+                MessageKind::Text,
+                "hi",
+            )
             .await;
         assert!(matches!(
             bad_room,
@@ -8773,7 +8957,14 @@ mod tests {
         // composer path reaches the gate boundary and returns the typed
         // `NoOpenTimeline` — never `Ok`, never a panic.
         let not_live = manager
-            .send_text(&platform, "acctA", "!room:example.org", "hi")
+            .send_text(
+                &platform,
+                "acctA",
+                "!room:example.org",
+                "hi",
+                MessageKind::Text,
+                "hi",
+            )
             .await;
         assert!(matches!(
             not_live,
@@ -8812,7 +9003,14 @@ mod tests {
         // A non-live account: with window 0 this would be `NoOpenTimeline`; with a
         // positive window it returns Ok because the send is held, never dispatched.
         manager
-            .send_text(&platform, "acctA", "!room:example.org", "held message")
+            .send_text(
+                &platform,
+                "acctA",
+                "!room:example.org",
+                "held message",
+                MessageKind::Text,
+                "held message",
+            )
             .await
             .expect("held send returns Ok without dispatching");
 
@@ -8850,6 +9048,8 @@ mod tests {
             "row-suspended",
             "acctA",
             "!room:example.org",
+            "queued across suspension",
+            MessageKind::Text,
             "queued across suspension",
             held_at,
             dispatch_at,
@@ -8911,7 +9111,14 @@ mod tests {
         let manager = AccountManager::new(&FakePlatform::new(data_dir.clone()), &data_dir);
 
         manager
-            .send_text(&platform, "acctA", "!room:example.org", "undo me")
+            .send_text(
+                &platform,
+                "acctA",
+                "!room:example.org",
+                "undo me",
+                MessageKind::Text,
+                "undo me",
+            )
             .await
             .expect("hold send");
         let rows = registry::list_outbox_rows_for_account(&data_dir, "acctA").expect("list outbox");
@@ -8942,6 +9149,49 @@ mod tests {
             .expect("idempotent cancel");
         assert_eq!(again, "", "cancel of an absent row returns empty");
 
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// R393: an undone send comes back byte-identical to the line the person typed,
+    /// never one rebuilt from what was sent — the escape keeps both slashes and an
+    /// alias stays the alias — and the held bubble reads the same line.
+    #[tokio::test]
+    async fn an_undone_send_restores_exactly_the_line_that_was_typed() {
+        let data_dir = outbox_test_dir("undo-line");
+        let platform: Arc<dyn Platform> = Arc::new(FakePlatform::new(data_dir.clone()));
+        registry::set_undo_send_window(&data_dir, 30).expect("set window 30");
+        let manager = AccountManager::new(&FakePlatform::new(data_dir.clone()), &data_dir);
+        let room = "!room:example.org";
+        // What the composer sends for each typed line: the body Rust resolved, its
+        // kind, and the line itself.
+        let typed = [
+            ("//etc", "/etc", MessageKind::Text),
+            ("///etc", "//etc", MessageKind::Text),
+            ("/emote waves", "waves", MessageKind::Emote),
+            ("/m waves", "waves", MessageKind::Emote),
+        ];
+        for (line, body, kind) in typed {
+            manager
+                .send_text(&platform, "acctA", room, body, kind, line)
+                .await
+                .expect("hold send");
+            let rows = registry::list_outbox_rows_for_account(&data_dir, "acctA").expect("list");
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                outbox_snapshot(&data_dir, "acctA", room).rows[0].body,
+                line,
+                "the held bubble reads the typed line"
+            );
+            let restored = manager
+                .cancel_held_send(&platform, "acctA", room, &rows[0].id)
+                .await
+                .expect("cancel");
+            assert_eq!(restored, line, "undo restores exactly what was typed");
+            assert_eq!(
+                registry::get_draft(&data_dir, "acctA", room).expect("get draft"),
+                Some(line.to_owned())
+            );
+        }
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 

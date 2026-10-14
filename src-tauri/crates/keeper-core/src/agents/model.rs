@@ -223,6 +223,125 @@ pub fn check(
     Ok(bot)
 }
 
+/// `/model` where the agent's home is not on this device (R415): only a
+/// device with its drive can write its `agent.toml`.
+pub const HOME_NOT_HERE: &str = "Your agent's home is not on this device, so its model is changed where its drive is: type /model there, or use Settings › Agents on that Mac.";
+
+/// The word after `/model` that sets the provider's own level.
+pub const DEFAULT_LEVEL: &str = "default";
+
+/// What `/model` in an agent's DM asks for (story 100.5, DW-1431, R415).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelCommand {
+    /// Nothing followed the name: say what the agent runs on.
+    Show,
+    /// Save this bot (`bot:` reference) and level, as Settings › Agents does.
+    Set { bot: String, effort: Option<Effort> },
+}
+
+/// What follows `/model`, read against `config` — the agent's `agent.toml` as
+/// it reads now — and the person's bots. The last word, when it is a level
+/// (`low`, `medium`, `high`, `xhigh`) or [`DEFAULT_LEVEL`], is the level; the
+/// rest names the bot by its name among the bots this agent is offered (any
+/// case) or its `bot:` reference, and nothing there keeps the current bot. A
+/// level left out stays as it is. Whether the level is one the bot's kind is
+/// sent is [`check`]'s, as for a save from Settings.
+pub fn command(
+    args: Option<&str>,
+    config: &AgentConfig,
+    choices: Choices<'_>,
+) -> Result<ModelCommand, String> {
+    let Some(args) = args.map(str::trim).filter(|args| !args.is_empty()) else {
+        return Ok(ModelCommand::Show);
+    };
+    let (named, level) = match args.rsplit_once(char::is_whitespace) {
+        Some((rest, last)) => match level_word(last) {
+            Some(level) => (rest.trim(), Some(level)),
+            None => (args, None),
+        },
+        None => match level_word(args) {
+            Some(level) => ("", Some(level)),
+            None => (args, None),
+        },
+    };
+    let effort = level.unwrap_or(config.effort);
+    let current = config.bot.reference();
+    if named.is_empty() {
+        return Ok(ModelCommand::Set {
+            bot: current,
+            effort,
+        });
+    }
+    let reference = BotRef::parse(named).ok().map(|bot| bot.reference());
+    let is_current = reference.as_deref() == Some(current.as_str())
+        || named.eq_ignore_ascii_case(&config.bot.target);
+    let offers = match choices {
+        Ok(choices) => offered(config, choices),
+        Err(_) if is_current => Vec::new(),
+        Err(sentence) => return Err(sentence.to_owned()),
+    };
+    let bot = offers
+        .iter()
+        .find(|offer| {
+            offer.name.eq_ignore_ascii_case(named) || Some(&offer.reference) == reference.as_ref()
+        })
+        .map(|offer| offer.reference.clone())
+        .or_else(|| is_current.then(|| current.clone()));
+    match bot {
+        Some(bot) => Ok(ModelCommand::Set { bot, effort }),
+        None => Err(not_a_bot(&config.name, named, &offers)),
+    }
+}
+
+/// A level word: one of [`Effort`]'s, or [`DEFAULT_LEVEL`] (`Some(None)`).
+fn level_word(word: &str) -> Option<Option<Effort>> {
+    let word = word.to_ascii_lowercase();
+    if word == DEFAULT_LEVEL {
+        return Some(None);
+    }
+    Effort::parse(&word).map(Some)
+}
+
+/// `/model` naming a bot this agent is not offered.
+fn not_a_bot(name: &str, named: &str, offers: &[AgentModelBotVm]) -> String {
+    let names: Vec<&str> = offers.iter().map(|offer| offer.name.as_str()).collect();
+    let list = if names.is_empty() {
+        "none of your bots is offered to it on this device".to_owned()
+    } else {
+        format!("it can run on {}", names.join(", "))
+    };
+    format!(
+        "{} cannot run on \"{named}\": {list}. Nothing was changed.",
+        capitalised(name)
+    )
+}
+
+/// What `/model` alone says: the agent's bot as the person's bots name it,
+/// and its level.
+pub fn running(config: &AgentConfig, choices: &[AgentSeedBotVm]) -> String {
+    format!(
+        "{} runs on {}.",
+        capitalised(&config.name),
+        shown(&line(config, choices))
+    )
+}
+
+/// What `/model` says once its save landed: the agent's next turn runs on it.
+pub fn now_running(name: &str, model: &AgentModelLineVm) -> String {
+    format!(
+        "{} now runs on {}, from its next turn.",
+        capitalised(name),
+        shown(model)
+    )
+}
+
+fn shown(model: &AgentModelLineVm) -> String {
+    match model.effort {
+        Some(effort) => format!("{} at reasoning level {}", model.bot, effort.as_str()),
+        None => format!("{} at the provider's own reasoning level", model.bot),
+    }
+}
+
 fn capitalised(name: &str) -> String {
     let mut chars = name.chars();
     match chars.next() {
@@ -399,6 +518,74 @@ mod tests {
         .is_ok());
         assert_eq!(
             check(&req(&config, QWEN, None), &config, Err(BOTS_UNREAD)),
+            Err(BOTS_UNREAD.to_owned())
+        );
+    }
+
+    /// DW-1431 (R415): `/model` names a bot by its name or reference and a
+    /// level by its word, last; a level alone keeps the bot, a bot alone
+    /// keeps the level, `default` is the provider's own, nothing is a look.
+    #[test]
+    fn model_typed_in_the_dm_reads_a_bot_and_a_level() {
+        let config = agent(OPUS, "effort = \"high\"\n", false);
+        let set = |args: &str| command(Some(args), &config, Ok(&choices()));
+        let qwen = BotRef::parse(QWEN).expect("bot").reference();
+        let opus = config.bot.reference();
+        assert_eq!(
+            command(None, &config, Ok(&choices())),
+            Ok(ModelCommand::Show)
+        );
+        assert_eq!(
+            command(Some("  "), &config, Ok(&choices())),
+            Ok(ModelCommand::Show)
+        );
+        assert_eq!(
+            set("qwen low"),
+            Ok(ModelCommand::Set {
+                bot: qwen.clone(),
+                effort: Some(Effort::Low)
+            })
+        );
+        assert_eq!(
+            set(QWEN),
+            Ok(ModelCommand::Set {
+                bot: qwen,
+                effort: Some(Effort::High)
+            }),
+            "a bot alone keeps the level"
+        );
+        assert_eq!(
+            set("XHIGH"),
+            Ok(ModelCommand::Set {
+                bot: opus.clone(),
+                effort: Some(Effort::Xhigh)
+            }),
+            "a level alone keeps the bot"
+        );
+        assert_eq!(
+            set("Opus default"),
+            Ok(ModelCommand::Set {
+                bot: opus,
+                effort: None
+            })
+        );
+        // A bot this agent is not offered is refused naming the ones it is.
+        let refused = set("gpt-9 low").expect_err("not a bot");
+        assert!(refused.contains("Opus, Qwen, Nixie"), "{refused}");
+        // A local-only agent is not offered a remote bot by name.
+        let local = agent(QWEN, "", true);
+        assert!(command(Some("Opus"), &local, Ok(&choices())).is_err());
+        // Bots that could not be read: the current bot's level still changes,
+        // another bot is refused with that sentence.
+        assert!(matches!(
+            command(Some("claude-opus medium"), &config, Err(BOTS_UNREAD)),
+            Ok(ModelCommand::Set {
+                effort: Some(Effort::Medium),
+                ..
+            })
+        ));
+        assert_eq!(
+            command(Some("Qwen"), &config, Err(BOTS_UNREAD)),
             Err(BOTS_UNREAD.to_owned())
         );
     }

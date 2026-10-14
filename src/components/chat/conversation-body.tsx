@@ -28,14 +28,17 @@ import {
   useCallback,
   useEffect,
   useLayoutEffect,
+  useMemo,
   useRef,
   useState,
 } from "react";
 import { ApprovalRequest } from "@/components/agents/approval-card";
 import { AgentRoomHeader } from "@/components/chat/agent-room-header";
-import { Composer } from "@/components/chat/composer";
+import { chatCommandHost } from "@/components/chat/chat-commands";
+import { Composer, type SendContext } from "@/components/chat/composer";
 import { DeleteMessageDialog } from "@/components/chat/delete-message-dialog";
 import { HistoryBoundary, type HistoryBoundaryState } from "@/components/chat/history-boundary";
+import { LeaveRoomDialog } from "@/components/chat/leave-room-dialog";
 import { MediaPreviewOverlay } from "@/components/chat/media-preview-overlay";
 import { MessageBubble, type MessageVm } from "@/components/chat/message-bubble";
 import { RedactedStub } from "@/components/chat/redacted-stub";
@@ -55,14 +58,19 @@ import type {
   TypistVm,
 } from "@/lib/ipc/client";
 import {
+  agentConversationNew,
+  agentModelCommand,
   cancelSend,
   editMessage,
   markRoomRead,
   paginateBackwards,
   resolveTimelineEventKey,
   retrySend,
+  roomInvite,
+  roomSetTopic,
   sendAttachmentBytes,
   sendAttachmentPath,
+  sendEmote,
   sendReply,
   sendText,
   setTyping,
@@ -759,32 +767,82 @@ export function ConversationBody({
           : "idle";
 
   const onSend = useCallback(
-    async (body: string) => {
+    async (body: string, context: SendContext, line?: string) => {
       if (accountId === null || roomId === null) {
         return;
       }
-      // Route the dispatch by the pending context: reply / edit / plain text
-      // (all through the single Rust send gate).
-      const current = composer.getState().pending;
-      if (current?.mode === "reply") {
-        await sendReply(accountId, roomId, current.targetKey, body);
-      } else if (current?.mode === "edit") {
-        await editMessage(accountId, roomId, current.targetKey, body);
+      // Route the dispatch by the context it was submitted in — reply / edit /
+      // plain text, all through the single Rust send gate — never by whatever is
+      // pending now: a reply or edit begun while a `/` line was being read must
+      // not capture it (R411).
+      const { target } = context;
+      if (target?.mode === "reply") {
+        await sendReply(context.accountId, context.roomId, target.targetKey, body);
+      } else if (target?.mode === "edit") {
+        await editMessage(context.accountId, context.roomId, target.targetKey, body);
       } else {
-        await sendText(accountId, roomId, body);
+        await sendText(context.accountId, context.roomId, body, line);
       }
       // Clear only the context we just dispatched: if the user started a *new*
       // reply/edit during the in-flight enqueue, it must survive.
       const afterSend = composer.getState().pending;
       if (
-        current !== null &&
-        afterSend?.mode === current.mode &&
-        afterSend?.targetKey === current.targetKey
+        target !== null &&
+        afterSend?.mode === target.mode &&
+        afterSend?.targetKey === target.targetKey
       ) {
         composer.getState().clear();
       }
     },
     [accountId, roomId, composer],
+  );
+
+  // `/me` (Story 100.5): an action through the same Rust send gate as text, into
+  // the room it was typed in. It carries no reply — Rust refuses `/me` while a
+  // reply is pending.
+  const onSendEmote = useCallback(
+    async (body: string, context: SendContext, line: string) => {
+      if (accountId === null || roomId === null) {
+        return;
+      }
+      await sendEmote(context.accountId, context.roomId, body, line);
+    },
+    [accountId, roomId],
+  );
+
+  // The room's slash commands (Story 100.5): each act through its existing IPC;
+  // `/leave` opens its confirmation and leaves nothing on its own.
+  //
+  // The confirmation is bound to the room `/leave` was typed in, never to
+  // whichever room is on screen when it opens (R393): the target carries both
+  // ids, Leave leaves exactly that room, and a target that is not the room on
+  // screen — an ask that arrived late, or a room switch while it was open — is
+  // withdrawn, never retargeted.
+  const [leaveTarget, setLeaveTarget] = useState<{ accountId: string; roomId: string } | null>(
+    null,
+  );
+  // Reset during render, not in an effect: a stale question must not draw for a
+  // frame in the next room, and an open room must not pay an extra render.
+  if (
+    leaveTarget !== null &&
+    (leaveTarget.accountId !== accountId || leaveTarget.roomId !== roomId)
+  ) {
+    setLeaveTarget(null);
+  }
+  const onCommand = useMemo(
+    () =>
+      chatCommandHost({
+        setTopic: (topic) => roomSetTopic(accountId ?? "", roomId ?? "", topic),
+        invite: (userId) => roomInvite(accountId ?? "", roomId ?? "", userId),
+        newConversation: (title) => agentConversationNew(accountId ?? "", roomId ?? "", title),
+        model: (args) => agentModelCommand(accountId ?? "", roomId ?? "", args),
+        askLeave: () => {
+          if (accountId !== null && roomId !== null) {
+            setLeaveTarget({ accountId, roomId });
+          }
+        },
+      }),
+    [accountId, roomId],
   );
 
   // Emit the account's typing notice (Story 3.9). Best-effort: a rejection is logged,
@@ -1540,6 +1598,8 @@ export function ConversationBody({
               onCancelPending={onCancelPending}
               onEmptyArrowUp={onComposerArrowUp}
               onTyping={onTyping}
+              onSendEmote={onSendEmote}
+              onCommand={onCommand}
             />
           </div>
         </div>
@@ -1557,6 +1617,15 @@ export function ConversationBody({
           roomId={roomId}
           itemKey={deleteKey}
           onClose={() => setDeleteKey(null)}
+        />
+      )}
+      {leaveTarget !== null && (
+        <LeaveRoomDialog
+          key={`${leaveTarget.accountId}:${leaveTarget.roomId}`}
+          accountId={leaveTarget.accountId}
+          roomId={leaveTarget.roomId}
+          open
+          onClose={() => setLeaveTarget(null)}
         />
       )}
     </div>

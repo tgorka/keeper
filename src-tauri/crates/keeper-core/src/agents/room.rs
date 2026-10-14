@@ -1111,6 +1111,16 @@ impl AgentIcons {
             .cloned()
     }
 
+    /// Whether `user`'s home is in a zone on this device (R415): where its
+    /// `agent.toml` can be read and written.
+    pub fn is_here(&self, user: &UserId) -> bool {
+        self.zone
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .agents
+            .contains(user)
+    }
+
     /// The agents whose zones are on this device.
     pub fn agents(&self) -> BTreeSet<OwnedUserId> {
         self.zone

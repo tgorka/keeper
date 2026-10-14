@@ -599,7 +599,7 @@ pub fn nearest(token: &str) -> Option<&'static CommandSpec> {
 /// Written here rather than taken as a dependency: it runs over a handful of
 /// seven-character names once per refusal, and the crate's rule is that a new
 /// dependency needs a reason bigger than twenty lines.
-fn distance(left: &str, right: &str) -> usize {
+pub(crate) fn distance(left: &str, right: &str) -> usize {
     let right: Vec<char> = right.chars().collect();
     let mut previous: Vec<usize> = (0..=right.len()).collect();
     let mut current = vec![0usize; right.len() + 1];

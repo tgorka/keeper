@@ -20,6 +20,7 @@ pub mod bots;
 pub mod bridge;
 pub mod bridges;
 pub mod capture;
+pub mod chat;
 pub mod config;
 pub mod container;
 pub mod demo;

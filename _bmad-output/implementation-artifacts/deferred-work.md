@@ -10774,3 +10774,33 @@ origin: review-100avatar-2 R100A2-04 (lane 100stack, 2026-10-15)
 location: `keeper_agent::zone::lfs_store` (`LfsStore::in_git_dir(drive_root.join(".git"))`), `keeper_sync::lfs::store::LfsStore::in_git_dir` (wants the common git directory)
 reason: in a linked worktree `.git` is a file, not a directory, so the store path does not exist, `contains` reads false and a pointer whose object is in the common repository's store is `NotHere`: the agent draws the letter (R414) and nothing is published until the file is materialised another way. Fix: resolve the repository's common git directory through keeper-sync's git integration rather than assuming `<root>/.git`; test a real linked worktree with a present, below-bound object, keeping the absent-object behaviour.
 status: open
+
+### DW-1430: The slash menu sends no analytics yet.
+
+origin: rung `agents-100-slash` (story 100.5 #5, 100.1 #9), 2026-10-14
+location: `src/hooks/use-slash-menu.ts` (opened, accepted), `src/components/chat/composer.tsx` (`obey`)
+reason: 100.1 owns `keeper_interaction`'s new closed surface values (slash menu opened, chosen); its helper is not on this rung's base (`agents-100-plan`), and inventing a second one would be two telemetry paths. At the stack step, once `agents-100-errors` is below this rung, the two counts are one call each at the places named above; nothing about a command's name or text may be sent (R381).
+status: done 2026-10-15
+resolution: closed by the stack step (lane 100stack, R415) in rung `agents-100-slash`'s commit "let a person type / in any chat: …": `useSlashMenu` (shared by the messenger and ⌘9 bot composers) calls `captureSurface("slashMenuOpened")` the first time the menu is drawn in a draft session and `captureSurface("slashMenuChosen")` the first time a row is accepted from it (completing a name and then running it is one choice); nothing about the command, the draft or the room is sent. Test: `composer-slash.test.tsx` "counts the menu opened and a row chosen once per draft session".
+
+### DW-1431: An agent room has no `/model` command.
+
+origin: rung `agents-100-slash` (story 100.5 #2, R394), 2026-10-14
+location: `keeper_core::chat::commands::COMMANDS` (the agent set), `src/components/chat/chat-commands.ts`
+reason: 100.2 builds the per-agent model and level and its Settings write; it is not on this rung's base, so the agent set offers `/new` and `/help` only. At the stack step, `/model [bot] [level]` belongs in the `AgentMain` set, resolved against the agent's `agent.toml` `[model]` in Rust and executed through 100.2's own write path.
+status: done 2026-10-15
+resolution: closed by the stack step (lane 100stack, R415) in rung `agents-100-slash`'s commit "let a person type / in any chat: …": `/model [bot] [level]` is in the agent DM's set (`chat::commands::COMMANDS`, `Need::HomeHere` from `AgentIcons::is_here`), read by `keeper_core::agents::model::command` against the agent's `agent.toml` and saved by `keeper_agent::desktop::model_command` through `write_model` — Settings › Agents' own save — from the shell's `agent_model_command`; elsewhere it is listed with its reason and refused. Tests: `chat_commands::model_is_the_agents_dms_and_needs_the_home_here`, `agents::model::tests::model_typed_in_the_dm_reads_a_bot_and_a_level`, `desktop::tests::model_typed_in_the_dm_saves_as_settings_does`, `chat-commands.test.ts` "runs /model through Rust and shows its sentence, or its refusal".
+
+### DW-1432: The person's room commands have no live test against a homeserver.
+
+origin: rung `agents-100-slash` (story 100.5), 2026-10-14
+location: `Accounts::send_text` with `MessageKind::Emote`, `Accounts::room_set_topic`, `room_invite`, `room_leave`, `chat_command_context` (power levels)
+reason: keeper-core has no harness that activates the person's `Accounts` against delectra's Synapse (the live tests drive `AgentClient`), so the emote's wire shape, a topic or invite refused by power levels and a leave are proven by the SDK calls they make and by the decision tests, not against a server. Owed: a hesperia run (send `/me`, `/topic`, `/invite`, `/leave` in a test room and read them in a second client), or a live `Accounts` harness.
+status: open
+
+### DW-1433: Stop, pause and the scope are not slash commands in an agent room.
+
+origin: rung `agents-100-slash` (story 100.5 #2, R394), 2026-10-14
+location: `keeper_core::agents::proxy::AgentOutbound` (closed, five variants), `src/components/notes/notes-agent-dock.tsx` (the scope editor)
+reason: the device has no stop or pause verb for a run (the host owns it), and a scope is edited only in the notes dock; a command for either would be a new agent protocol or a second editor, which R385 rules out. When either verb exists on the device, it joins the agent set in Rust.
+status: open

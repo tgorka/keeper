@@ -473,6 +473,69 @@ pub fn write_model(
     prepare_model(profiles, req, bots)?.publish()
 }
 
+/// `/model` typed in `agent`'s DM (story 100.5, DW-1431, R415): nothing
+/// after it says what the agent runs on; a bot and/or a level is saved by
+/// [`write_model`] — the very save Settings › Agents makes, from what this
+/// read of `agent.toml` showed, so a file changed meanwhile is refused. An
+/// agent with no home among this principal's drives here is refused with
+/// [`model::HOME_NOT_HERE`]. Each answer is one sentence.
+pub fn model_command(
+    facts: &DesktopFacts,
+    agent: &UserId,
+    args: Option<&str>,
+    bots: model::Choices<'_>,
+) -> Result<String, String> {
+    let (profile_id, folder, config) =
+        home_of(facts, agent).ok_or_else(|| model::HOME_NOT_HERE.to_owned())?;
+    let named = bots.unwrap_or(&[]);
+    match model::command(args, &config, bots)? {
+        model::ModelCommand::Show => Ok(model::running(&config, named)),
+        model::ModelCommand::Set { bot, effort } => {
+            let req = AgentModelReq {
+                profile_id,
+                agent: folder,
+                bot,
+                effort,
+                shown_bot: config.bot.reference(),
+                shown_effort: config.effort,
+            };
+            write_model(&facts.profiles, &req, bots)?;
+            let mut saved = config.clone();
+            saved.bot = home::BotRef::parse(&req.bot).map_err(|reason| format!("{reason}."))?;
+            saved.effort = req.effort;
+            Ok(model::now_running(
+                &config.name,
+                &model::line(&saved, named),
+            ))
+        }
+    }
+}
+
+/// The home of `agent` among this principal's flagged folders: its sync
+/// profile, its folder in the zone and its `agent.toml` as it reads now.
+fn home_of(facts: &DesktopFacts, agent: &UserId) -> Option<(String, String, home::AgentConfig)> {
+    for profile in facts.profiles.iter().filter(|p| p.agents.is_some()) {
+        let Ok(decl) = declared(profile) else {
+            continue;
+        };
+        if facts
+            .login
+            .as_deref()
+            .is_some_and(|login| copy::hosts_principal(&decl, login).is_err())
+        {
+            continue;
+        }
+        for (folder, home) in read_zone(&decl.id, profile, Some(&decl)).homes {
+            if let Ok(home) = home {
+                if home.config.matrix_user.as_str() == agent.as_str() {
+                    return Some((profile.id.clone(), folder, home.config));
+                }
+            }
+        }
+    }
+    None
+}
+
 /// A model save made from one read of `agent.toml` (R405): the bytes it
 /// read, their revision, and what replaces them.
 #[derive(Debug)]
@@ -1728,6 +1791,67 @@ mod tests {
         let refused = write_model(&facts.profiles, &save(None), Ok(&bots)).expect_err("unreadable");
         assert!(refused.contains("not valid TOML"), "{refused}");
         assert_eq!(std::fs::read_to_string(&file).expect("kept"), merged);
+    }
+
+    /// DW-1431 (R415): `/model` in Nixi's DM saves through Settings' own
+    /// write — only `[model]` changes, the next read names the new model —
+    /// a bare `/model` writes nothing, a bot she is not offered changes
+    /// nothing, and an agent with no home among this Mac's drives is refused.
+    #[test]
+    fn model_typed_in_the_dm_saves_as_settings_does() {
+        use keeper_core::bots::chat::Effort;
+
+        let root = tempfile::tempdir().expect("tempdir");
+        nixi_drive(root.path());
+        let file = root.path().join("80-agents/nixi/agent.toml");
+        const OPUS: &str = "bot:openai:https://provider.example:8452#claude-opus";
+        let bots = vec![AgentSeedBotVm {
+            reference: OPUS.to_owned(),
+            name: "Opus".to_owned(),
+            provider: "CLIProxyAPI".to_owned(),
+            efforts: Effort::ALL.to_vec(),
+        }];
+        let facts = DesktopFacts {
+            login: Some("tgorka".to_owned()),
+            profiles: vec![profile(root.path())],
+            ..DesktopFacts::default()
+        };
+        let nixi = OwnedUserId::try_from("@nixi:example.org").expect("user");
+        let before = std::fs::read_to_string(&file).expect("agent.toml");
+
+        model_command(&facts, &nixi, None, Ok(&bots)).expect("shown");
+        model_command(&facts, &nixi, Some("gpt-9"), Ok(&bots)).expect_err("not offered");
+        assert_eq!(std::fs::read_to_string(&file).expect("kept"), before);
+
+        model_command(&facts, &nixi, Some("opus xhigh"), Ok(&bots)).expect("saved");
+        let after = std::fs::read_to_string(&file).expect("agent.toml");
+        assert_eq!(
+            after,
+            before.replace(
+                &format!("bot:ollama:{NIXI_BOT}#model\""),
+                &format!("{OPUS}\"\neffort = \"xhigh\"")
+            )
+        );
+        let reread = home_of(&facts, &nixi).expect("home").2;
+        assert_eq!(reread.effort, Some(Effort::Xhigh));
+        // A level alone keeps the bot.
+        model_command(&facts, &nixi, Some("low"), Ok(&bots)).expect("saved");
+        let reread = home_of(&facts, &nixi).expect("home").2;
+        assert_eq!(
+            (reread.bot.reference(), reread.effort),
+            (
+                keeper_core::agents::home::BotRef::parse(OPUS)
+                    .expect("bot")
+                    .reference(),
+                Some(Effort::Low)
+            )
+        );
+
+        let tola = OwnedUserId::try_from("@tola:example.org").expect("user");
+        assert_eq!(
+            model_command(&facts, &tola, Some("opus"), Ok(&bots)),
+            Err(keeper_core::agents::model::HOME_NOT_HERE.to_owned())
+        );
     }
 
     /// R405 (R100M1-01): a save's read and its write are one snapshot. A
