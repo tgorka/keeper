@@ -308,6 +308,10 @@ export function ConversationBody({
   // spinner immediately, before the status stream reports `paginating`, and gates
   // the top-scroll trigger from firing again).
   const [paginationError, setPaginationError] = useState(false);
+  // Whether the pagination status stream has reported for this room yet: until
+  // it has, `hitStart` is a default, not a fact, and filling the window could
+  // page a room that has no history to page.
+  const [paginationKnown, setPaginationKnown] = useState(false);
   // An honest, non-blocking note shown when a search deep-link target is further
   // back in history than the loaded window + bounded live paginate can reach
   // (archive-first seek-to-event is Story 5.6). `null` hides it.
@@ -360,6 +364,7 @@ export function ConversationBody({
       setDeleteKey(null);
       setTypists([]);
       setPagination({ state: "idle", hitStart: false });
+      setPaginationKnown(false);
       setPaginationError(false);
       return;
     }
@@ -370,6 +375,7 @@ export function ConversationBody({
     setDeleteKey(null);
     setTypists([]);
     setPagination({ state: "idle", hitStart: false });
+    setPaginationKnown(false);
     setPaginationError(false);
     paginatingRef.current = false;
     prevScrollHeight.current = 0;
@@ -506,6 +512,7 @@ export function ConversationBody({
         // status stream — an idle/paginating batch must never silently clear a
         // genuine error boundary the user still needs to see and retry.
         setPagination(b);
+        setPaginationKnown(true);
       }
     })
       .then((id) => {
@@ -795,6 +802,32 @@ export function ConversationBody({
         paginatingRef.current = false;
       });
   }, [accountId, roomId]);
+
+  // A window that shows nothing, or too little to scroll, has no top to scroll
+  // near, so the trigger below never fires and the room reads "No messages yet."
+  // over a history the server holds. That is the ordinary state of an agent's
+  // room: its burst of edits makes a sync come back limited, the SDK resets the
+  // room's timeline to the gap, and the window empties. Fill it: page back until
+  // there is something to scroll or the start is reached — one page per change
+  // of the pagination status, single-flight through `runPaginate`.
+  useEffect(() => {
+    if (
+      !roomLoaded ||
+      !paginationKnown ||
+      offline ||
+      paginationError ||
+      pagination.hitStart ||
+      pagination.state === "paginating"
+    ) {
+      return;
+    }
+    const el = scrollRef.current;
+    const scrollable = el !== null && el.scrollHeight > el.clientHeight + NEAR_TOP_PX;
+    if (hasRows && scrollable) {
+      return;
+    }
+    runPaginate();
+  }, [roomLoaded, paginationKnown, offline, paginationError, pagination, hasRows, runPaginate]);
 
   const onScroll = useCallback(() => {
     const el = scrollRef.current;

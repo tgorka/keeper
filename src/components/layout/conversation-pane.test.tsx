@@ -1639,6 +1639,35 @@ describe("ConversationPane — receipts, typing, pagination (Story 3.9)", () => 
     );
   });
 
+  // An agent's room after a limited sync: the SDK resets the timeline to the
+  // gap and nothing renders, so there is no top to scroll near. The window
+  // fills itself instead of reading "No messages yet." over a real history.
+  it("back-paginates on its own when the window shows nothing and the start is not reached", async () => {
+    const { captured } = await renderOpen();
+    captured.timeline?.({ ops: [{ op: "reset", items: [{ kind: "other", key: "o1" }] }] });
+    await waitFor(() => expect(captured.pagination).not.toBeNull());
+    expect(paginateBackwards).not.toHaveBeenCalled();
+    captured.pagination?.({ state: "idle", hitStart: false });
+
+    await waitFor(() =>
+      expect(paginateBackwards).toHaveBeenCalledWith(
+        account.accountId,
+        "!room:example.org",
+        expect.any(Number),
+      ),
+    );
+  });
+
+  it("does not page an empty window once the start is reached", async () => {
+    const { captured } = await renderOpen();
+    captured.timeline?.({ ops: [{ op: "reset", items: [{ kind: "other", key: "o1" }] }] });
+    await waitFor(() => expect(captured.pagination).not.toBeNull());
+    captured.pagination?.({ state: "idle", hitStart: true });
+
+    await waitFor(() => expect(screen.getByText("No messages yet.")).toBeInTheDocument());
+    expect(paginateBackwards).not.toHaveBeenCalled();
+  });
+
   it("does NOT back-paginate near the top when offline", async () => {
     accountStatusStore.getState().setStatus(account.accountId, "offline");
     const { captured } = await renderOpen();
