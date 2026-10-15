@@ -17,7 +17,7 @@
 
 use std::collections::BTreeSet;
 
-use matrix_sdk::ruma::{OwnedUserId, UserId};
+use matrix_sdk::ruma::{OwnedRoomId, OwnedUserId, UserId};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use ulid::Ulid;
@@ -127,6 +127,48 @@ pub fn answer_content(text: &str, id: &str) -> Value {
 pub fn read_answer(content: &Value) -> Option<AnswerContent> {
     let read: AnswerContent = serde_json::from_value(content.get(ANSWER)?.clone()).ok()?;
     (read.v == CONTENT_VERSION && Ulid::from_string(&read.id).is_ok()).then_some(read)
+}
+
+/// The answer a message relays to an open ask (R100, R101): an
+/// `m.room.message` of `m.text`, no edit, its sender's device sealed it, it
+/// carries an answer this build reads, and its sender is `via_of(id)` — the
+/// proxy the open ask `id` went through. `None` for anything else, and for an
+/// answer naming no open ask. The one rule an asking session's host takes
+/// an answer by and a person's waiting question ends by: a cleartext marker,
+/// an edit carrying one, or one from anyone but that proxy ends nothing.
+pub fn relayed_answer<'a>(
+    event_type: &str,
+    content: &Value,
+    sealed: bool,
+    sender: &UserId,
+    via_of: impl FnOnce(&str) -> Option<&'a UserId>,
+) -> Option<AnswerContent> {
+    if event_type != "m.room.message"
+        || content["msgtype"] != "m.text"
+        || content["m.relates_to"]["rel_type"] == "m.replace"
+        || !sealed
+    {
+        return None;
+    }
+    let answer = read_answer(content)?;
+    (via_of(&answer.id)? == sender).then_some(answer)
+}
+
+/// Where an ask in a room is put to its person (R199): to the session that
+/// delegated into the room — `parent`, with its kind — when that is the
+/// proxy's own `main` or `conversation`, the sessions an ask is a turn of;
+/// else to `main`, the proxy's DM. The host routes an ask by it, and a
+/// person's device shows the ask above the composer of the room it names
+/// (Story 101.3, R435): the question is answered where the session that
+/// takes the answer is.
+pub fn ask_target(
+    parent: Option<(OwnedRoomId, SessionKind)>,
+    main: Option<OwnedRoomId>,
+) -> Option<OwnedRoomId> {
+    match parent {
+        Some((room, SessionKind::Main | SessionKind::Conversation)) => Some(room),
+        _ => main,
+    }
 }
 
 /// Whether a session of `session` kind, of an agent of `agent` kind, is
@@ -253,6 +295,69 @@ mod tests {
             check_sink(&label(&[TGORKA]), &proxy_dm(&user(TGORKA), None)),
             SinkVerdict::Allow
         );
+    }
+
+    /// R94A-03: an ask in a room a proxy's session delegated into goes to
+    /// that session only when it is the proxy's own `main` or
+    /// `conversation`; from any other, to the proxy's DM.
+    #[test]
+    fn an_ask_goes_to_a_parent_only_when_it_takes_asks() {
+        let (parent, main) = (
+            OwnedRoomId::try_from("!parent:example.org").expect("room"),
+            OwnedRoomId::try_from("!dm:example.org").expect("room"),
+        );
+        for kind in SessionKind::ALL {
+            let own = matches!(kind, SessionKind::Main | SessionKind::Conversation);
+            assert_eq!(
+                ask_target(Some((parent.clone(), kind)), Some(main.clone())),
+                Some(if own { parent.clone() } else { main.clone() }),
+                "{kind:?}"
+            );
+        }
+        assert_eq!(ask_target(None, Some(main.clone())), Some(main));
+        assert_eq!(
+            ask_target(Some((parent, SessionKind::Scheduled)), None),
+            None
+        );
+    }
+
+    /// Story 101.3 (R430 03): an answer ends an open ask only as a sealed,
+    /// unedited `m.text` from the proxy the ask went through; a marker from
+    /// anyone else, in clear, in an edit or in a notice ends nothing.
+    #[test]
+    fn only_the_asks_proxy_relays_its_answer() {
+        const ID: &str = "01J8ASKAAAAAAAAAAAAAAAAAAA";
+        let nixi = user(NIXI);
+        let via = |id: &str| (id == ID).then_some(&*nixi);
+        let answer = answer_content("Tatry", ID);
+        let relayed = relayed_answer("m.room.message", &answer, true, &nixi, via);
+        assert_eq!(relayed.map(|a| a.id), Some(ID.to_owned()));
+
+        let mut edit = answer.clone();
+        edit["m.relates_to"] = json!({"rel_type": "m.replace", "event_id": "$a"});
+        let mut notice = answer.clone();
+        notice["msgtype"] = json!("m.notice");
+        let other = answer_content("Tatry", "01J8ASKBBBBBBBBBBBBBBBBBBB");
+        for (case, event_type, content, sealed, sender) in [
+            ("wrong sender", "m.room.message", &answer, true, user(TOLA)),
+            ("unsealed", "m.room.message", &answer, false, user(NIXI)),
+            ("an edit", "m.room.message", &edit, true, user(NIXI)),
+            ("a notice", "m.room.message", &notice, true, user(NIXI)),
+            (
+                "another event type",
+                "m.reaction",
+                &answer,
+                true,
+                user(NIXI),
+            ),
+            ("no open ask", "m.room.message", &other, true, user(NIXI)),
+        ] {
+            assert_eq!(
+                relayed_answer(event_type, content, sealed, &sender, via),
+                None,
+                "{case}"
+            );
+        }
     }
     const MIRA: &str = "@mira:h";
     const TOLA: &str = "@tola:h";

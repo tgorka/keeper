@@ -3,14 +3,15 @@ import { useRef } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/lib/ipc/client", () => ({
-  cancelHeldSend: vi.fn(() => Promise.resolve("")),
+  cancelHeldSend: vi.fn(() => Promise.resolve({ line: "", reply: null, attachment: null })),
 }));
 
 import { UndoSendPill } from "@/components/chat/undo-send-pill";
 import type { HeldSendVm } from "@/lib/ipc/client";
 import { cancelHeldSend } from "@/lib/ipc/client";
 import { composerStore } from "@/lib/stores/composer";
-import { outboxStore } from "@/lib/stores/outbox";
+import { CHAT_STORES } from "@/lib/stores/conversation-stores";
+import { outboxStore, useHeldRestores } from "@/lib/stores/outbox";
 
 const mockCancel = vi.mocked(cancelHeldSend);
 
@@ -23,6 +24,8 @@ function held(id: string, dispatchInMs: number): HeldSendVm {
     body: `body-${id}`,
     heldAtMs: now,
     dispatchAtMs: now + dispatchInMs,
+    filename: null,
+    reply: false,
   };
 }
 
@@ -32,6 +35,8 @@ function held(id: string, dispatchInMs: number): HeldSendVm {
  */
 function Conversation() {
   const root = useRef<HTMLDivElement>(null);
+  // The conversation shows the room, as its body does: an undo lands here.
+  useHeldRestores("acctA", "!r1", CHAT_STORES);
   return (
     <>
       <textarea aria-label="Note" />
@@ -52,7 +57,7 @@ describe("UndoSendPill", () => {
   beforeEach(() => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     mockCancel.mockClear();
-    mockCancel.mockResolvedValue("");
+    mockCancel.mockResolvedValue({ line: "", reply: null, attachment: null });
     outboxStore.getState().clear();
     composerStore.getState().clear();
     composerStore.setState({ restoreBody: null, restoreNonce: 0, focusNonce: 0 });
@@ -91,7 +96,7 @@ describe("UndoSendPill", () => {
   });
 
   it("clicking Undo cancels the held send and restores the returned body", async () => {
-    mockCancel.mockResolvedValue("restored body");
+    mockCancel.mockResolvedValue({ line: "restored body", reply: null, attachment: null });
     act(() => {
       outboxStore.getState().applySnapshot("acctA", "!r1", [held("id1", 10_000)]);
     });
@@ -106,7 +111,7 @@ describe("UndoSendPill", () => {
   });
 
   it("an empty cancel result (already dispatched) does not restore the composer", async () => {
-    mockCancel.mockResolvedValue("");
+    mockCancel.mockResolvedValue({ line: "", reply: null, attachment: null });
     act(() => {
       outboxStore.getState().applySnapshot("acctA", "!r1", [held("id1", 10_000)]);
     });
@@ -118,7 +123,7 @@ describe("UndoSendPill", () => {
   });
 
   it("⌘⇧Z in the conversation undoes the oldest pending hold", async () => {
-    mockCancel.mockResolvedValue("oldest body");
+    mockCancel.mockResolvedValue({ line: "oldest body", reply: null, attachment: null });
     act(() => {
       outboxStore
         .getState()

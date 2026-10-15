@@ -1090,6 +1090,8 @@ pub fn run() {
                 agents_ipc::agent_conversation_new,
                 // Story 101.1: ask the proxy for the person's DM (R416).
                 agents_ipc::agent_main_dm_open,
+                agents_ipc::agent_asks_subscribe,
+                agents_ipc::agent_asks_unsubscribe,
                 // Story 93.3: the approval card's decision and the own
                 // fingerprint, every target (the phone decides too).
                 agents_ipc::agent_approval_decide,
@@ -1299,11 +1301,15 @@ pub fn run() {
                 // Story 100.5: the messenger's slash commands.
                 ipc::send_emote,
                 ipc::chat_command_preview,
+                // Story 101.3: a `/` in the middle of a message.
+                ipc::chat_inline_preview,
                 ipc::room_set_topic,
                 ipc::room_invite,
                 ipc::room_leave,
                 ipc::undo_send_window,
                 ipc::set_undo_send_window,
+                ipc::undo_send_agent_window,
+                ipc::set_undo_send_agent_window,
                 ipc::hotkey_get,
                 ipc::hotkey_set,
                 ipc::recording_hotkey_get,
@@ -1314,6 +1320,7 @@ pub fn run() {
                 ipc::subscribe_outbox,
                 ipc::unsubscribe_outbox,
                 ipc::send_reply,
+                ipc::send_reply_to_event,
                 ipc::edit_message,
                 ipc::toggle_reaction,
                 ipc::resolve_timeline_event_key,

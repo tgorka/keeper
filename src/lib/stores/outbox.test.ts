@@ -2,13 +2,29 @@ import { act, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/lib/ipc/client", () => ({
-  cancelHeldSend: vi.fn(() => Promise.resolve("")),
+  cancelHeldSend: vi.fn(() => Promise.resolve({ line: "", reply: null, attachment: null })),
 }));
 
-import type { HeldSendVm } from "@/lib/ipc/client";
+import type { HeldRestoreVm, HeldSendVm } from "@/lib/ipc/client";
 import { cancelHeldSend } from "@/lib/ipc/client";
+import { attachmentsStore } from "@/lib/stores/attachments";
 import { composerStore } from "@/lib/stores/composer";
-import { outboxStore, undoHeldSend, useHeldSends } from "@/lib/stores/outbox";
+import {
+  outboxStore,
+  REPLY_UNSHOWN_SENDER,
+  undoHeldSend,
+  useHeldRestores,
+  useHeldSends,
+} from "@/lib/stores/outbox";
+import { timelineStore } from "@/lib/stores/timeline";
+
+const STORES = { composer: composerStore, timeline: timelineStore, attachments: attachmentsStore };
+const restored = (over: Partial<HeldRestoreVm> = {}): HeldRestoreVm => ({
+  line: "",
+  reply: null,
+  attachment: null,
+  ...over,
+});
 
 const mockCancel = vi.mocked(cancelHeldSend);
 
@@ -24,6 +40,8 @@ function held(id: string, roomId: string, dispatchAtMs: number): HeldSendVm {
     body: `body-${id}`,
     heldAtMs: dispatchAtMs - 10_000,
     dispatchAtMs,
+    filename: null,
+    reply: false,
   };
 }
 
@@ -115,16 +133,101 @@ describe("outboxStore", () => {
 });
 
 describe("undoHeldSend (shared undo effect, Story 8.4)", () => {
+  // The conversation the undo is pressed in shows the held send's room.
+  let shown: { unmount: () => void } | null = null;
+  afterEach(() => {
+    shown?.unmount();
+    shown = null;
+  });
   beforeEach(() => {
+    shown = renderHook(() => useHeldRestores("acctA", "!r1", STORES));
     mockCancel.mockClear();
-    mockCancel.mockResolvedValue("");
+    mockCancel.mockResolvedValue(restored());
     composerStore.getState().clear();
     composerStore.setState({ restoreBody: null, restoreTarget: null, restoreNonce: 0 });
+    timelineStore.getState().clear();
+    attachmentsStore.getState().clear();
+  });
+
+  it("gives a held reply back replying, and a held attachment back to the tray (R432)", async () => {
+    timelineStore.setState({
+      items: [
+        {
+          kind: "message",
+          key: "k-original",
+          sender: "@tola:example.org",
+          senderDisplayName: "Tola Grey",
+          body: "Which   trip?\nTatry or Mazury",
+          timestamp: 1,
+          isOwn: false,
+          sendState: null,
+          isEdited: false,
+          reply: null,
+          reactions: [],
+          media: null,
+          readers: [],
+          brief: null,
+          gate: null,
+        },
+      ],
+    });
+    mockCancel.mockResolvedValue(
+      restored({
+        line: "the view",
+        reply: {
+          eventId: "$original:example.org",
+          key: "k-original",
+          sender: "@tola:example.org",
+          senderDisplayName: "Tola Grey",
+          body: "Which   trip?\nTatry or Mazury",
+        },
+        attachment: { path: "/data/outbox-files/h1/photo.png", filename: "photo.png" },
+      }),
+    );
+    await undoHeldSend("acctA", "!r1", "h1", STORES);
+    expect(composerStore.getState().restoreBody).toBe("the view");
+    expect(composerStore.getState().pending).toEqual({
+      mode: "reply",
+      targetKey: "k-original",
+      eventId: "$original:example.org",
+      sender: "Tola Grey",
+      bodyPreview: "Which trip? Tatry or Mazury",
+    });
+    expect(attachmentsStore.getState().pending).toEqual([
+      expect.objectContaining({
+        kind: "path",
+        path: "/data/outbox-files/h1/photo.png",
+        filename: "photo.png",
+      }),
+    ]);
+  });
+
+  it("gives a reply back replying to its event when the timeline does not show the original (R447)", async () => {
+    mockCancel.mockResolvedValue(
+      restored({
+        line: "Tatry first",
+        reply: {
+          eventId: "$unloaded:example.org",
+          key: null,
+          sender: "",
+          senderDisplayName: null,
+          body: "",
+        },
+      }),
+    );
+    await undoHeldSend("acctA", "!r1", "h1", STORES);
+    expect(composerStore.getState().pending).toEqual({
+      mode: "reply",
+      targetKey: "event:$unloaded:example.org",
+      eventId: "$unloaded:example.org",
+      sender: REPLY_UNSHOWN_SENDER,
+      bodyPreview: "",
+    });
   });
 
   it("cancels the held send and restores a non-empty returned body to the composer", async () => {
-    mockCancel.mockResolvedValue("restored body");
-    await undoHeldSend("acctA", "!r1", "id1", composerStore);
+    mockCancel.mockResolvedValue(restored({ line: "restored body" }));
+    await undoHeldSend("acctA", "!r1", "id1", STORES);
     expect(mockCancel).toHaveBeenCalledWith("acctA", "!r1", "id1");
     expect(composerStore.getState().restoreBody).toBe("restored body");
     // The restore is scoped to the originating chat (never lands in another room).
@@ -132,15 +235,15 @@ describe("undoHeldSend (shared undo effect, Story 8.4)", () => {
   });
 
   it("does not restore when the cancel returns an empty body (already dispatched)", async () => {
-    mockCancel.mockResolvedValue("");
-    await undoHeldSend("acctA", "!r1", "id1", composerStore);
+    mockCancel.mockResolvedValue(restored());
+    await undoHeldSend("acctA", "!r1", "id1", STORES);
     expect(mockCancel).toHaveBeenCalledWith("acctA", "!r1", "id1");
     expect(composerStore.getState().restoreBody).toBeNull();
   });
 
   it("swallows a cancel rejection and does not restore (mirrors the pill)", async () => {
     mockCancel.mockRejectedValue(new Error("boom"));
-    await expect(undoHeldSend("acctA", "!r1", "id1", composerStore)).resolves.toBeUndefined();
+    await expect(undoHeldSend("acctA", "!r1", "id1", STORES)).resolves.toBeUndefined();
     expect(composerStore.getState().restoreBody).toBeNull();
   });
 });

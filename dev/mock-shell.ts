@@ -56,6 +56,8 @@ import type {
   AccountShareVm,
   AccountStateVm,
   AccountVm,
+  AgentAsksVm,
+  AgentAskVm,
   AgentCopyVm,
   AgentFocusReq,
   AgentMcpDraftVm,
@@ -103,6 +105,8 @@ import type {
   CardKeyVm,
   ChatCommandPreviewVm,
   ChatCommandRowVm,
+  ChatInlinePreviewVm,
+  ChatInlineRowVm,
   ChoiceVm,
   CopyJobVm,
   CredentialChoicesVm,
@@ -127,6 +131,8 @@ import type {
   GateLineVm,
   GrantScope,
   HeardMarkVm,
+  HeldRestoreVm,
+  HeldSendVm,
   HotkeyVm,
   InboxBatch,
   InboxRoomVm,
@@ -8134,6 +8140,214 @@ function failureRecovered(operation: FailureOperation): void {
 /** The tablet's distributor was confirmed in Settings this session (98.4). */
 let unifiedpushConfirmed = false;
 
+// ---------------------------------------------------------------------------
+// Story 101.3 — undo windows, the mid-text `/`, the decisions panel
+// ---------------------------------------------------------------------------
+
+/** The two Undo-Send windows, as Settings last set them (Rust's defaults: 2 s, 0 s). */
+const mockUndoWindows = { chat: 2, agent: 0 };
+
+/**
+ * The dev shell's answer to `chat_inline_preview` (Story 101.3, R434). **A fake**:
+ * the token rule, the sets, the drive-qualified insert and every sentence are
+ * `keeper_core::chat::inline`'s; this draws each kind of row once — in an agent
+ * room Tola and Amelia to mention, files of two drives found by name (a note, a
+ * pdf and a csv on `tgdrive`, which has a notes vault, and the same csv path on
+ * `work`, which has none), and `/shrug`; in a chat `/shrug` alone. `?inline=partial`
+ * says a drive was searched in part.
+ */
+function mockChatInlinePreview(payload: Record<string, unknown>): ChatInlinePreviewVm {
+  const before = String(payload.before ?? "");
+  const after = String(payload.after ?? "");
+  const roomId = String(payload.roomId ?? "");
+  const agentRoom = roomId in AGENT_ROOM_TIMELINES || roomId === DM_ROOM;
+  const match = /\s(\/[^\s/]*)$/.exec(before);
+  const token = match !== null && (after === "" || /^\s/.test(after)) ? match[1] : null;
+  if (token === null) {
+    return { before, after, token: null, rows: [], note: null };
+  }
+  const query = token.slice(1).toLowerCase();
+  const rows: ChatInlineRowVm[] = [];
+  if (agentRoom) {
+    for (const [id, name] of [
+      ["amelia", "Amelia"],
+      ["tola-grey", "Tola Grey"],
+    ]) {
+      if (
+        id.startsWith(query) ||
+        name
+          .toLowerCase()
+          .split(" ")
+          .some((w) => w.startsWith(query))
+      ) {
+        rows.push({
+          kind: "mention",
+          key: `mention:@${id}:example.org`,
+          label: `@${id}`,
+          detail: name,
+          insert: `@${id}`,
+        });
+      }
+    }
+  }
+  if ("shrug".startsWith(query)) {
+    rows.push({
+      kind: "shrug",
+      key: "shrug",
+      label: "/shrug",
+      detail: "Insert ¯\\_(ツ)_/¯ here.",
+      insert: "¯\\_(ツ)_/¯",
+    });
+  }
+  const files = agentRoom && query !== "";
+  if (files) {
+    for (const [drive, id, path, title] of [
+      ["tgdrive", "01TGDRIVE", "notes/plans/trip-tatry.md", "Trip to Tatry"],
+      ["tgdrive", "01TGDRIVE", "scans/tatry-map.pdf", null],
+      ["tgdrive", "01TGDRIVE", "trips/tatry-budget.csv", null],
+      ["work", "01WORK", "trips/tatry-budget.csv", null],
+    ] as const) {
+      const file = path.slice(path.lastIndexOf("/") + 1);
+      const titled =
+        title
+          ?.toLowerCase()
+          .split(" ")
+          .some((w) => w.startsWith(query)) ?? false;
+      if (file.toLowerCase().includes(query) || titled) {
+        rows.push({
+          kind: "file",
+          key: `file:${id}:${path}`,
+          label: title ?? file,
+          detail: `${drive} · ${path}`,
+          insert: `${drive}:${path}`,
+        });
+      }
+    }
+  }
+  const partial = new URLSearchParams(window.location.search).get("inline") === "partial";
+  return {
+    before,
+    after,
+    token,
+    rows: rows.slice(0, 12),
+    note:
+      files && partial
+        ? "Only the first 5,000 entries of a large drive were searched; type more of the name to narrow it."
+        : null,
+  };
+}
+
+/**
+ * The held sends of agent rooms (Story 101.3, R432): a send into an agent room
+ * waits `mockUndoWindows.agent` seconds here, as Rust holds it, and Undo puts it
+ * back. Chats send at once in the fake, as before.
+ */
+const mockHeld: HeldSendVm[] = [];
+const outboxWatchers = new Map<
+  number,
+  { roomId: string; channel: MockChannel<{ rows: HeldSendVm[] }> }
+>();
+const askWatchers = new Map<number, { roomId: string; channel: MockChannel<AgentAsksVm> }>();
+let mockWatchSeq = 0;
+
+function emitHeld(): void {
+  for (const { roomId, channel } of outboxWatchers.values()) {
+    channel.onmessage?.({ rows: mockHeld.filter((row) => row.roomId === roomId) });
+  }
+  for (const { roomId, channel } of askWatchers.values()) {
+    channel.onmessage?.(mockAgentAsks(roomId));
+  }
+}
+
+function mockSendText(payload: Record<string, unknown>): null {
+  const roomId = String(payload.roomId ?? "");
+  const agentRoom = roomId in AGENT_ROOM_TIMELINES || roomId === DM_ROOM;
+  const seconds = mockUndoWindows.agent;
+  if (!agentRoom || seconds === 0) {
+    recordSend("text", payload);
+    emitHeld();
+    return null;
+  }
+  const now = Date.now();
+  const row: HeldSendVm = {
+    id: `held-${now}`,
+    accountId: String(payload.accountId ?? ""),
+    roomId,
+    body: String(payload.line ?? payload.body ?? ""),
+    heldAtMs: now,
+    dispatchAtMs: now + seconds * 1000,
+    filename: null,
+    reply: false,
+  };
+  mockHeld.push(row);
+  setTimeout(() => {
+    const at = mockHeld.indexOf(row);
+    if (at !== -1) {
+      mockHeld.splice(at, 1);
+      recordSend("text", payload);
+      emitHeld();
+    }
+  }, seconds * 1000);
+  emitHeld();
+  return null;
+}
+
+/**
+ * `?undo=slow-file` (Story 101.3, R447): the cancel answers after 2.5 s and hands
+ * back a staged file with the line, as Rust does for a held attachment — time to
+ * open another room before it lands, to see it land only where it was held.
+ */
+const undoParam = new URLSearchParams(window.location.search).get("undo");
+
+function mockCancelHeld(payload: Record<string, unknown>): HeldRestoreVm | Promise<HeldRestoreVm> {
+  const at = mockHeld.findIndex((row) => row.id === String(payload.id));
+  if (at === -1) {
+    return { line: "", reply: null, attachment: null };
+  }
+  const [row] = mockHeld.splice(at, 1);
+  emitHeld();
+  if (undoParam === "slow-file") {
+    return later(2500, () => ({
+      line: row.body,
+      reply: null,
+      attachment: { path: "/mock/outbox-files/held/trip-plan.pdf", filename: "trip-plan.pdf" },
+    }));
+  }
+  return { line: row.body, reply: null, attachment: null };
+}
+
+/**
+ * The dev shell's follow of the questions waiting in a room (Story 101.3, R430,
+ * R431): with `?ask=waiting`, Tola asks through Nixi which trip to plan, answered
+ * in the Nixi DM. While the person's choice is held for Undo-Send the question is
+ * `held`; Undo opens it again; once the choice is sent the proxy's relay ends it.
+ * `?ask=partial` adds the sentence Rust says when it read the rooms in part.
+ */
+function mockAgentAsks(roomId: string): AgentAsksVm {
+  const mode = new URLSearchParams(window.location.search).get("ask");
+  const note =
+    mode === "partial"
+      ? "keeper could not read every room a question for you may wait in, so one may be missing here. It still shows in the room it was asked in."
+      : null;
+  const choices = ["Tatry", "Bieszczady", "Mazury"];
+  const answered = mockSends.some((send) => choices.includes(send.body));
+  if ((mode !== "waiting" && mode !== "partial") || roomId !== DM_ROOM || answered) {
+    return { asks: [], note: roomId === DM_ROOM ? note : null };
+  }
+  const held = mockHeld.some((row) => row.roomId === roomId && choices.includes(row.body));
+  const ask: AgentAskVm = {
+    id: "01J8ASKAAAAAAAAAAAAAAAAAAA",
+    roomId: "!tola-triage:example.org",
+    askedBy: "Tola Grey",
+    question: "Which trip should I plan first?",
+    choices,
+    default: "Tatry",
+    askedAt: MOCK_NOW - 5 * 60_000,
+    state: held ? "held" : "open",
+  };
+  return { asks: [ask], note };
+}
+
 const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = {
   push_gateway_get: () => pushGateway,
   push_open_take: () => null,
@@ -8220,10 +8434,53 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
     new URLSearchParams(window.location.search).get("slash") === "slow"
       ? later(1000, () => mockChatCommandPreview(payload))
       : mockChatCommandPreview(payload),
-  send_text: (payload) => recordSend("text", payload),
+  send_text: mockSendText,
+  subscribe_outbox: (payload) => {
+    const id = ++mockWatchSeq;
+    const roomId = String(payload.roomId ?? "");
+    const channel = payload.channel as MockChannel<{ rows: HeldSendVm[] }>;
+    outboxWatchers.set(id, { roomId, channel });
+    channel.onmessage?.({ rows: mockHeld.filter((row) => row.roomId === roomId) });
+    return id;
+  },
+  unsubscribe_outbox: (payload) => {
+    outboxWatchers.delete(Number(payload.subscriptionId));
+    return null;
+  },
+  cancel_held_send: mockCancelHeld,
+  // Story 101.3: the two Undo-Send windows, the mid-text `/`, and the questions
+  // waiting in the Nixi DM (`?ask=waiting`).
+  undo_send_window: () => mockUndoWindows.chat,
+  set_undo_send_window: (payload) => {
+    mockUndoWindows.chat = Number(payload.seconds);
+    return null;
+  },
+  undo_send_agent_window: () => mockUndoWindows.agent,
+  set_undo_send_agent_window: (payload) => {
+    mockUndoWindows.agent = Number(payload.seconds);
+    return null;
+  },
+  chat_inline_preview: mockChatInlinePreview,
+  agent_asks_subscribe: (payload) => {
+    const id = ++mockWatchSeq;
+    const roomId = String(payload.roomId ?? "");
+    const channel = payload.channel as MockChannel<AgentAsksVm>;
+    askWatchers.set(id, { roomId, channel });
+    channel.onmessage?.(mockAgentAsks(roomId));
+    return id;
+  },
+  agent_asks_unsubscribe: (payload) => {
+    askWatchers.delete(Number(payload.subscriptionId));
+    return null;
+  },
   send_emote: (payload) => recordSend("emote", payload),
   // Recorded too, so the browser can see which context a slow line went out in (R411).
   send_reply: (payload) => recordSend("reply", payload),
+  send_reply_to_event: (payload) => recordSend("reply", payload),
+  // Recorded with its path and caption, so the browser can see which room's file
+  // a Send carried (R447).
+  send_attachment_path: (payload) =>
+    recordSend("attachment", { body: `${String(payload.path)} ${String(payload.caption ?? "")}` }),
   edit_message: (payload) => recordSend("edit", payload),
   room_set_topic: () => later(200, () => null),
   room_invite: (payload) =>

@@ -218,6 +218,20 @@ describe("renderCsvTableInto", () => {
     ]);
   });
 
+  it("lets the system rewrite nothing typed into a cell (R433)", async () => {
+    const host = document.createElement("div");
+    await renderCsvTableInto(host, VAULT, TARGET, { read: async () => table(), setCell: vi.fn() });
+
+    cellAt(host, 1, 0).dispatchEvent(new MouseEvent("click"));
+    const input = editing(host, CSV_CELL_LABEL);
+    // What WebKit and the iOS keyboard read: no capital, no correction, no
+    // substitution, no prediction.
+    expect(input.getAttribute("autocapitalize")).toBe("off");
+    expect(input.getAttribute("autocorrect")).toBe("off");
+    expect(input.getAttribute("spellcheck")).toBe("false");
+    expect(input.getAttribute("writingsuggestions")).toBe("false");
+  });
+
   it("sends an unchanged cell too, because whether to write is Rust's decision", async () => {
     const host = document.createElement("div");
     const setCell = vi.fn(async () => table());

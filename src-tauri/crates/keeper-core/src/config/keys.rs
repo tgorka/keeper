@@ -1102,14 +1102,24 @@ pub const KEYS: &[KeySpec] = &[
     },
     // ---- undo send -------------------------------------------------------
     KeySpec {
+        key: "undo_send.agent_window",
+        family: false,
+        scope: Scope::UserGlobal,
+        settable: Settable::AnyLayer,
+        shape: Shape::Int { min: 0, max: 60 },
+        default: "0",
+        summary: "How long a message to an agent is held before it dispatches, in seconds.",
+        example: "0",
+    },
+    KeySpec {
         key: "undo_send.window",
         family: false,
         scope: Scope::UserGlobal,
         settable: Settable::AnyLayer,
         shape: Shape::Int { min: 0, max: 60 },
-        default: "10",
-        summary: "How long a sent message is held before it dispatches, in seconds.",
-        example: "10",
+        default: "2",
+        summary: "How long a message to a chat is held before it dispatches, in seconds.",
+        example: "2",
     },
     // ---- update ----------------------------------------------------------
     KeySpec {

@@ -6548,10 +6548,17 @@ impl ServedSession {
         arrived: Arrived,
         stop: CancelSignal,
     ) -> Result<Outcome, ServeError> {
-        let open = keeper_core::agents::ask::read_answer(&arrived.content)
-            .and_then(|answer| self.context.asks.get(&answer.id))
-            .filter(|open| open.via == arrived.sender)
-            .cloned();
+        // `arrival_of` admitted only an unedited `m.text` its sender's device
+        // sealed; the rest is the shared rule a person's device ends a wait by.
+        let open = keeper_core::agents::ask::relayed_answer(
+            "m.room.message",
+            &arrived.content,
+            true,
+            &arrived.sender,
+            |id| self.context.asks.get(id).map(|open| &*open.via),
+        )
+        .and_then(|answer| self.context.asks.get(&answer.id))
+        .cloned();
         let Some(open) = open else {
             tracing::info!(session = %self.context.session.path, sender = %arrived.sender, note = NOT_ASKED, "agents: an answer is not taken");
             return Ok(Outcome::Ignored(NOT_ASKED));

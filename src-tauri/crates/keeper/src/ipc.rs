@@ -3770,6 +3770,122 @@ pub async fn chat_command_preview(
     ))
 }
 
+/// What a `/` at the caret offers in the middle of a message (Story 101.3,
+/// R418, R434): the draft split at the caret, the room's facts read in the
+/// core, and — when the core asks for files ([`inline::file_query`]) — each
+/// drive of this device walked by file name, bounded as the core says
+/// (`bots_fs::find_names`, [`inline::INLINE_WALK_ENTRIES`]), with its notes
+/// vault's titles where it has one. Every decision — the token, which names
+/// match, which folders are walked, the rows, what each inserts — is
+/// `keeper_core::chat::inline`'s; this only gathers and composes. Drives that
+/// cannot be listed are logged at WARN and said in the menu (R381).
+#[tauri::command]
+pub async fn chat_inline_preview(
+    state: State<'_, AppState>,
+    account_id: String,
+    room_id: String,
+    before: String,
+    after: String,
+) -> Result<keeper_core::vm::ChatInlinePreviewVm, IpcError> {
+    use keeper_core::chat::inline;
+    let context = state
+        .accounts
+        .chat_inline_context(&account_id, &room_id)
+        .await
+        .map_err(to_ipc_error)?;
+    let query =
+        inline::token(&before, &after).and_then(|token| inline::file_query(token, &context));
+    let mut unread = false;
+    let mut walked: Vec<(keeper_sync::SyncProfile, Vec<String>, bool)> = Vec::new();
+    if let Some(query) = query {
+        let profiles = crate::sync_ipc::engine_of(&state).and_then(|engine| {
+            engine
+                .list_profiles()
+                .map_err(|error| crate::sync_ipc::sync_ipc_error(&error))
+        });
+        match profiles {
+            Ok(profiles) => {
+                let walk = tokio::task::spawn_blocking(move || {
+                    let limits = keeper_sync::bots_fs::Limits {
+                        max_read_bytes: 0,
+                        max_entries: 0,
+                        max_matches: 0,
+                        max_paths: inline::INLINE_WALK_KEEP,
+                        max_walk_entries: inline::INLINE_WALK_ENTRIES,
+                        max_write_bytes: 0,
+                        max_match_line_bytes: 0,
+                    };
+                    profiles
+                        .into_iter()
+                        // An unplugged removable drive has nothing to offer.
+                        .filter(|profile| profile.local_path.is_dir())
+                        .map(|profile| {
+                            let found = keeper_sync::bots_fs::find_names(
+                                &profile.local_path,
+                                "",
+                                &limits,
+                                &inline::walk_enters,
+                                &|name| inline::walk_finds(&query, name),
+                            );
+                            match found {
+                                Ok(found) => (profile, found.paths, found.walk_capped),
+                                Err(error) => {
+                                    tracing::warn!(profile = %profile.id, ?error, "chat: a drive could not be walked for a file reference");
+                                    (profile, Vec::new(), true)
+                                }
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .await;
+                match walk {
+                    Ok(found) => walked = found,
+                    Err(error) => {
+                        tracing::warn!(%error, "chat: the drives' walk for a file reference failed");
+                        unread = true;
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    ?error,
+                    "chat: this device's drives could not be listed for a file reference"
+                );
+                unread = true;
+            }
+        }
+    }
+    let notes: Vec<
+        Option<(
+            String,
+            std::sync::Arc<keeper_core::notes::index::IndexSnapshot>,
+        )>,
+    > = walked
+        .iter()
+        .map(|(profile, _, _)| {
+            let vault = crate::notes_vault::vault(&profile.id)?;
+            let index = crate::notes_vault::snapshot(&profile.id)?;
+            Some((vault.config.subfolder.clone(), index))
+        })
+        .collect();
+    let drives: Vec<inline::InlineDrive<'_>> = walked
+        .iter()
+        .zip(&notes)
+        .map(|((profile, found, capped), notes)| inline::InlineDrive {
+            id: &profile.id,
+            name: &profile.name,
+            found,
+            capped: *capped,
+            notes: notes
+                .as_ref()
+                .map(|(folder, index)| (folder.as_str(), &**index)),
+        })
+        .collect();
+    Ok(keeper_core::vm::ChatInlinePreviewVm::compose(
+        &before, &after, &context, &drives, unread,
+    ))
+}
+
 /// `/topic`: change the room's topic (Story 100.5). A refusal is logged at
 /// WARN in the core and funnels through [`to_ipc_error`].
 #[tauri::command]
@@ -3818,7 +3934,7 @@ pub async fn room_leave(
 }
 
 /// Read the Undo-Send window in whole seconds (Story 8.3). Absent / unparsable ⇒ the
-/// default of 10; a stored value is clamped to `0..=60`. Sync — a small keeper-local
+/// default of 2 (Story 101.3); a stored value is clamped to `0..=60`. Sync — a small keeper-local
 /// read. Failures funnel through [`to_ipc_error`].
 #[tauri::command]
 pub fn undo_send_window(state: State<'_, AppState>) -> Result<u16, IpcError> {
@@ -3833,6 +3949,27 @@ pub fn undo_send_window(state: State<'_, AppState>) -> Result<u16, IpcError> {
 pub fn set_undo_send_window(state: State<'_, AppState>, seconds: u16) -> Result<(), IpcError> {
     let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
     keeper_core::registry::set_undo_send_window(&data_dir, seconds).map_err(to_ipc_error)
+}
+
+/// Read the agent rooms' Undo-Send window in whole seconds (Story 101.3, R418).
+/// Absent / unparsable ⇒ 0; clamped to `0..=60`. Failures funnel through
+/// [`to_ipc_error`].
+#[tauri::command]
+pub fn undo_send_agent_window(state: State<'_, AppState>) -> Result<u16, IpcError> {
+    let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
+    keeper_core::registry::get_undo_send_agent_window(&data_dir).map_err(to_ipc_error)
+}
+
+/// Set the agent rooms' Undo-Send window in whole seconds (Story 101.3), clamped
+/// to `0..=60` before persisting (0 sends at once). Failures funnel through
+/// [`to_ipc_error`].
+#[tauri::command]
+pub fn set_undo_send_agent_window(
+    state: State<'_, AppState>,
+    seconds: u16,
+) -> Result<(), IpcError> {
+    let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
+    keeper_core::registry::set_undo_send_agent_window(&data_dir, seconds).map_err(to_ipc_error)
 }
 
 /// Build the [`HotkeyVm`] for `accelerator`: `isDefault` vs the shipped default, `active`
@@ -4234,9 +4371,10 @@ pub fn recording_reveal_folder() -> Result<(), IpcError> {
 }
 
 /// Cancel a held send by its `id` (Story 8.3): delete the `outbox` row, persist its
-/// body as the Chat's Draft, and return the restored body so the composer can restore
-/// it. Performs **zero** network dispatch. Cancel of an already-dispatched/absent row
-/// is an idempotent no-op that resolves with an empty string. Failures funnel through
+/// body as the Chat's Draft, and return what the composer restores — the line, the
+/// message a held reply answered, a held attachment's staged file (Story 101.3).
+/// Performs **zero** network dispatch. Cancel of an already-dispatched/absent row
+/// is an idempotent no-op that resolves with an empty line. Failures funnel through
 /// [`to_ipc_error`]. The body is never logged.
 #[tauri::command]
 pub async fn cancel_held_send(
@@ -4244,7 +4382,7 @@ pub async fn cancel_held_send(
     account_id: String,
     room_id: String,
     id: String,
-) -> Result<String, IpcError> {
+) -> Result<keeper_core::vm::HeldRestoreVm, IpcError> {
     state
         .accounts
         .cancel_held_send(&state.platform, &account_id, &room_id, &id)
@@ -4304,7 +4442,33 @@ pub async fn send_reply(
 ) -> Result<(), IpcError> {
     state
         .accounts
-        .send_reply(&account_id, &room_id, &in_reply_to_key, &body)
+        .send_reply(
+            &state.platform,
+            &account_id,
+            &room_id,
+            &in_reply_to_key,
+            &body,
+        )
+        .await
+        .map_err(to_ipc_error)
+}
+
+/// Send a plain-text reply to the message `eventId` names (Story 101.3, R447):
+/// the reply an Undo gave back, whose original may be outside the loaded
+/// timeline, so it is named by event rather than by a render key. Held for the
+/// room kind's Undo-Send window like any reply. Failures funnel through
+/// [`to_ipc_error`] to `SendFailed`.
+#[tauri::command]
+pub async fn send_reply_to_event(
+    state: State<'_, AppState>,
+    account_id: String,
+    room_id: String,
+    event_id: String,
+    body: String,
+) -> Result<(), IpcError> {
+    state
+        .accounts
+        .send_reply_to_event(&state.platform, &account_id, &room_id, &event_id, &body)
         .await
         .map_err(to_ipc_error)
 }
@@ -4813,6 +4977,7 @@ pub async fn send_attachment_path(
     state
         .accounts
         .send_attachment_path(
+            &state.platform,
             &account_id,
             &room_id,
             std::path::Path::new(&path),
@@ -4855,6 +5020,7 @@ pub async fn send_attachment_bytes(
     state
         .accounts
         .send_attachment_bytes(
+            &state.platform,
             &account_id,
             &room_id,
             bytes,

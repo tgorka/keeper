@@ -189,6 +189,7 @@ import {
   transcriptionRunning,
   useTranscriptionStore,
 } from "@/lib/stores/transcription";
+import { NO_TEXT_SUBSTITUTION } from "@/lib/text-entry";
 import { cn } from "@/lib/utils";
 import { resolveViewer, VIEWER_ICON } from "@/lib/viewers";
 
@@ -3154,6 +3155,7 @@ export function FilesPane() {
         // to click first is a field that reads as decoration.
         // biome-ignore lint/a11y/noAutofocus: the row is created by the gesture that asks for it
         autoFocus
+        {...NO_TEXT_SUBSTITUTION}
         aria-label={FILES_NEW_FILE_NAME_LABEL}
         value={createName}
         onChange={(event) => setCreateName(event.target.value)}

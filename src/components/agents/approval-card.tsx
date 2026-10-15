@@ -43,7 +43,7 @@ import {
   Shield,
   ShieldAlert,
 } from "lucide-react";
-import { useId, useState } from "react";
+import { type ReactNode, useId, useState } from "react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
@@ -591,6 +591,78 @@ function Decide({
   );
 }
 
+/**
+ * Whether `card`'s approve options wait for its action to be shown: an attached
+ * `run` is never approved unseen (UX-DR139) — the card and the decisions panel
+ * alike (Story 101.3, R430 01).
+ */
+export function approvalUnseen(card: ApprovalCardVm, shown: boolean): boolean {
+  return card.tool === "run" && card.attachment !== null && !shown;
+}
+
+/**
+ * What an approval shows of its action: its tier, keeper's sentence (or the
+ * declassification's question) and disclosure, the exact run, KVM inputs or
+ * arguments, and an attached action fetched on request. The timeline card and
+ * the decisions panel above the composer draw it with this one component (Story
+ * 101.3, R430 01): nothing is approved from either without it in view.
+ */
+export function ApprovalAction({
+  card,
+  accountId,
+  roomId,
+  onShown,
+  badge,
+}: {
+  card: ApprovalCardVm;
+  accountId: string;
+  roomId: string;
+  /** Called once an attached action, checked against the card's digest, is shown. */
+  onShown: () => void;
+  /** Drawn beside the tier: the card's state. */
+  badge?: ReactNode;
+}) {
+  const weight = TIER_WEIGHT[card.tier] ?? HEAVIEST;
+  const TierIcon = weight.icon;
+  const head =
+    card.declassify !== null ? declassifyQuestion(card.declassify.readers) : card.summary;
+  return (
+    <>
+      <div className="flex flex-wrap items-start justify-between gap-2">
+        <span className={cn("inline-flex items-start gap-1 font-medium text-xs", weight.tone)}>
+          <TierIcon aria-hidden="true" className="mt-px size-3.5 shrink-0" />
+          {card.tierWord}
+        </span>
+        {badge}
+      </div>
+      <p className="font-medium">
+        <Summary text={head} />
+      </p>
+      {card.declassify !== null && <p className="text-sm">{card.declassify.sentence}</p>}
+      {card.run !== null && <RunPayload run={card.run} />}
+      {card.kvm !== null && <KvmPayload kvm={card.kvm} />}
+      {card.payload !== null && <Payload tool={card.tool} text={card.payload} />}
+      {card.attachment !== null && (
+        // One request's attachment state never outlives it: a panel that advances
+        // to the next approval fetches and shows that one's own action (R447).
+        <AttachedAction
+          key={`${accountId} ${roomId} ${card.id} ${card.bindingDigest}`}
+          card={card}
+          accountId={accountId}
+          roomId={roomId}
+          onShown={onShown}
+        />
+      )}
+    </>
+  );
+}
+
+/** At T4: who alone decides, and that it cannot be undone — said in the tier's tone. */
+export function ApprovalOnly({ card }: { card: ApprovalCardVm }) {
+  const weight = TIER_WEIGHT[card.tier] ?? HEAVIEST;
+  return card.only !== null ? <p className={cn("text-sm", weight.tone)}>{card.only}</p> : null;
+}
+
 /** One record's card. */
 function ApprovalCard({
   card,
@@ -605,10 +677,9 @@ function ApprovalCard({
   framed: boolean;
 }) {
   const weight = TIER_WEIGHT[card.tier] ?? HEAVIEST;
-  const TierIcon = weight.icon;
   const waiting = card.state.state === "pending" || card.state.state === "decided";
   const [shown, setShown] = useState(false);
-  const unseen = card.tool === "run" && card.attachment !== null && !shown;
+  const unseen = approvalUnseen(card, shown);
   const head =
     card.declassify !== null ? declassifyQuestion(card.declassify.readers) : card.summary;
   // At T4 Rust's `only` already says who decides; its `cannotDecide` for anyone
@@ -628,28 +699,13 @@ function ApprovalCard({
         framed && weight.edge,
       )}
     >
-      <div className="flex flex-wrap items-start justify-between gap-2">
-        <span className={cn("inline-flex items-start gap-1 font-medium text-xs", weight.tone)}>
-          <TierIcon aria-hidden="true" className="mt-px size-3.5 shrink-0" />
-          {card.tierWord}
-        </span>
-        <StateBadge state={card.state} />
-      </div>
-      <p className="font-medium">
-        <Summary text={head} />
-      </p>
-      {card.declassify !== null && <p className="text-sm">{card.declassify.sentence}</p>}
-      {card.run !== null && <RunPayload run={card.run} />}
-      {card.kvm !== null && <KvmPayload kvm={card.kvm} />}
-      {card.payload !== null && <Payload tool={card.tool} text={card.payload} />}
-      {card.attachment !== null && (
-        <AttachedAction
-          card={card}
-          accountId={accountId}
-          roomId={roomId}
-          onShown={() => setShown(true)}
-        />
-      )}
+      <ApprovalAction
+        card={card}
+        accountId={accountId}
+        roomId={roomId}
+        onShown={() => setShown(true)}
+        badge={<StateBadge state={card.state} />}
+      />
       <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-2 gap-y-0.5 text-xs">
         {card.gate !== null && (
           <>
@@ -686,7 +742,7 @@ function ApprovalCard({
           </>
         )}
       </dl>
-      {waiting && card.only !== null && <p className={cn("text-sm", weight.tone)}>{card.only}</p>}
+      {waiting && <ApprovalOnly card={card} />}
       {waiting && card.canDecide && (
         <Decide
           key={card.state.state}

@@ -1039,7 +1039,6 @@ function SeedSetup({
               id={`${id}-readers`}
               value={readers}
               disabled={busy}
-              spellCheck={false}
               onChange={(event) => {
                 setReaders(event.target.value);
                 edited();

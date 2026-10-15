@@ -10,7 +10,13 @@
 import { Text } from "@codemirror/state";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { AccountVm, AgentRoomHeaderVm, ProxyRoomVm, TimelineBatch } from "@/lib/ipc/client";
+import type {
+  AccountVm,
+  AgentRoomHeaderVm,
+  HeldRestoreVm,
+  ProxyRoomVm,
+  TimelineBatch,
+} from "@/lib/ipc/client";
 
 const subscribeTimeline = vi.fn();
 const agentRoomsList = vi.fn();
@@ -20,6 +26,7 @@ const agentConversationNew = vi.fn();
 const agentsDefaultGet = vi.fn();
 const agentMainDmOpen = vi.fn();
 const cancelHeldSend = vi.fn();
+const RESTORED_NOTHING: HeldRestoreVm = { line: "", reply: null, attachment: null };
 /** Every `agentFocus` call's number, in call order. */
 let focusSeqs: number[];
 vi.mock("@/lib/ipc/client", () => ({
@@ -28,6 +35,9 @@ vi.mock("@/lib/ipc/client", () => ({
   agentsDefaultGet: () => agentsDefaultGet(),
   agentMainDmOpen: (accountId: string, agent: string) => agentMainDmOpen(accountId, agent),
   agentsDefaultSet: vi.fn(),
+  // The questions waiting in an agent DM (story 101.3): none here.
+  subscribeAgentAsks: vi.fn(() => Promise.resolve(1)),
+  unsubscribeAgentAsks: vi.fn(() => Promise.resolve()),
   frontendErrorReport: vi.fn(() => Promise.resolve()),
   agentRoomsList: (accountId: string) => agentRoomsList(accountId),
   agentScopeSet: (accountId: string, roomId: string, drives: string[]) =>
@@ -202,7 +212,7 @@ function scopeChips(): string[] {
 beforeEach(() => {
   focusSeqs = [];
   cancelHeldSend.mockReset();
-  cancelHeldSend.mockResolvedValue("");
+  cancelHeldSend.mockResolvedValue(RESTORED_NOTHING);
   outboxStore.getState().clear();
   streams = new Map();
   subscribeTimeline.mockReset();
@@ -805,7 +815,7 @@ describe("the assistant dock", () => {
   });
 
   it("undoes its own held send into its own composer, and not from the note (U1, U4)", async () => {
-    cancelHeldSend.mockResolvedValue("held body");
+    cancelHeldSend.mockResolvedValue({ ...RESTORED_NOTHING, line: "held body" });
     render(
       <TooltipProvider>
         <textarea aria-label="Note" />
@@ -825,6 +835,8 @@ describe("the assistant dock", () => {
           body: "held body",
           heldAtMs: now,
           dispatchAtMs: now + 10_000,
+          filename: null,
+          reply: false,
         },
       ]),
     );

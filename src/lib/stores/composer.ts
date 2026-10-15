@@ -27,6 +27,13 @@ export type PendingContext =
       sender: string;
       /** A short preview of the original body, for the banner. */
       bodyPreview: string;
+      /**
+       * The original's event, for a reply an Undo gave back (Story 101.3, R447):
+       * the reply is sent to it by event, so it stays a reply even when the
+       * original is outside the loaded timeline — `targetKey` is then only this
+       * context's identity, never sent as a key.
+       */
+      eventId?: string;
     }
   | {
       mode: "edit";
@@ -39,6 +46,8 @@ export interface ReplyTarget {
   targetKey: string;
   sender: string;
   bodyPreview: string;
+  /** The original's event, for a reply an Undo gave back (Story 101.3, R447). */
+  eventId?: string;
 }
 
 /** An edit target: the own message's key plus its current body to prefill. */
@@ -119,6 +128,12 @@ export interface ComposerState {
   restore: (accountId: string, roomId: string, body: string) => void;
 }
 
+/** A body trimmed to the short single-line preview a reply banner and quote show. */
+export function replyPreviewOf(body: string): string {
+  const collapsed = body.replace(/\s+/g, " ").trim();
+  return collapsed.length > 120 ? `${collapsed.slice(0, 120)}…` : collapsed;
+}
+
 /**
  * A composer store for one open conversation. The chat's is
  * {@link composerStore}; the notes view's dock makes its own, so a reply, an
@@ -133,9 +148,18 @@ export function createComposerStore(): StoreApi<ComposerState> {
     restoreTarget: null,
     restoreNonce: 0,
     focusNonce: 0,
-    startReply: ({ targetKey, sender, bodyPreview }) =>
+    startReply: ({ targetKey, sender, bodyPreview, eventId }) =>
       // Reply leaves the typed draft alone: no stash, clear any prior edit stash.
-      set({ pending: { mode: "reply", targetKey, sender, bodyPreview }, stashedDraft: null }),
+      set({
+        pending: {
+          mode: "reply",
+          targetKey,
+          sender,
+          bodyPreview,
+          ...(eventId === undefined ? {} : { eventId }),
+        },
+        stashedDraft: null,
+      }),
     startEdit: ({ targetKey, body }, currentDraft) => {
       set({ pending: { mode: "edit", targetKey }, stashedDraft: currentDraft });
       return body;

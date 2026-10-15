@@ -10912,3 +10912,53 @@ origin: lane `files` (story 101.2 #3), 2026-10-15
 location: `keeper_agent::attachments::kind_of`, `runtime::arrival_of`
 reason: a `.docx`, `.pptx` or `.xlsx` is stored and named but its text is not written beside it, though `keeper_core::document` reads all three; `m.audio` and `m.video` are not turns at all. The first is a `<name>.txt` written from `open_document`'s view model; the second needs a transcription decision (Epic 87 is on this Mac only).
 status: open
+
+### DW-1460: The Mac's and iOS's own text input are not yet watched not rewriting a message.
+
+origin: lane `composer` (story 101.3 #2, R418; R433), 2026-10-15
+location: `src/lib/text-entry.ts`, every field it reaches (R433)
+reason: an owed device check the coordinator runs at install — not acceptance closed by this entry (R433). The container has no macOS WebKit: Chrome read the four attributes on the composer, the Settings fields, a CSV cell's input and a rendered file's editable runs, and WebKit's source (`Editor::markAndReplaceFor`, `AlternativeTextController::canEnableAutomaticSpellingCorrection`) says `spellcheck=false`/`autocorrect=off` stop its substitutions on the Mac. Owed on hesperia, in the installed keeper: in the message composer of a chat and of the Nixi DM, in the bot composer, in a note, in a CSV cell and in Settings' push-gateway field, type `test thsi teh` at the very start and press space — it must stay exactly `test thsi teh` (no capital T, no `this`/`the`), and no grey inline prediction may appear; on kalypso the same in the composer with the iOS keyboard (no shift on the first letter, no correction bubble). If the Mac still capitalises, the shell's `WKWebView` configuration is the next seam.
+status: owed (device check at install)
+
+### DW-1461: The person's `Accounts` reader of waiting questions has no live harness.
+
+origin: lane `composer` (story 101.3 #4), 2026-10-15; narrowed in fix round 1
+location: `Accounts::subscribe_agent_asks` (`account::read_agent_asks`), `Accounts::chat_inline_context`, `Accounts::undo_window`
+reason: as DW-1432 — keeper-core has no harness that activates the person's `Accounts` against delectra's Synapse. Since fix round 1 the room-level reader is live-tested (`agents_matrix_live::a_waiting_question_survives_a_restart_and_ends_on_the_proxys_answer`: a restart reads the room back to the ask; the proxy's answer from its own device ends it), and the routing, answer rule and answer state are pure-tested (`agents::waiting::tests`); what stays unproved against a server is the `Accounts` glue — the proxy rooms' kinds, the subscription's wake-ups, the send queue and outbox reads. Owed: a live `Accounts` harness, or the hesperia run (Tola asks through Nixi from a `/new test` delegation; the panel appears in that conversation, not the DM; choosing sends the answer the proxy relays; Undo with a 5 s agent window puts the question back).
+status: open
+
+### DW-1462: A question asked in a room this device does not read never reaches the panel.
+
+origin: lane `composer` (story 101.3 #4, R418; R431), 2026-10-15
+location: `account::read_agent_asks`
+reason: the panel reads asks from the session rooms this account has joined, each read back to `ASK_READ_BACK` events. An ask in a session the person neither watches nor was invited to — a delegation between two agents — reaches only the proxy, whose own message in the conversation asks it in its words; it has no panel, and the room it was asked in still shows it. A device-readable copy of the ask in the answering room would be a new protocol (R418 rules one out); R431 keeps this limit.
+status: open
+
+### DW-1463: A mid-text file reference found notes only.
+
+origin: lane `composer` (story 101.3 #3, R418), 2026-10-15
+location: `keeper_core::chat::inline::menu` (`files`), shell `chat_inline_preview`
+reason: the first build searched only each drive's notes index.
+status: closed in fix round 1 (R434): files come from a bounded name walk of every drive on this device (`bots_fs::find_names`), any kind of file, with a drive-qualified identity and insert; a notes vault's titles are kept as display. Tests: `chat::inline::tests::a_file_reference_names_its_drive`, `keeper-sync` `a_name_search_skips_refused_folders_and_is_bounded`.
+
+### DW-1464: A free-answer question holds the panel until it is answered.
+
+origin: review-101composer-1 (DW candidate "head-of-line"), fix round 1, 2026-10-15
+location: `src/components/agents/decisions-panel.tsx` (`decisions[0]`)
+reason: the panel offers the first open decision; a question with no choices offers "type below" and no options, so a later question or approval waits behind it until the person types an answer (or the proxy relays one). The counter says how many wait, and each later one still shows on its card or in its room. A way to step to the next decision without answering the first (a "Next" key, or ↓ past the last option) is the fix.
+status: open
+
+### DW-1465: A failed read-back of an asking room can look like a complete, empty snapshot.
+
+origin: review-101composer-2 (R101C2-03), fix round 2, 2026-10-15 (R447)
+location: `keeper_core::agents::waiting::read_room`, `account::read_agent_asks`, `account::mine_in`
+reason: a back-pagination that errors or times out logs a WARN and returns what was loaded with `reached_start = false` — which means "did not reach the start", not "read failed" — and `read_agent_asks` skips an empty fold without setting `partial`; `mine_in` ignores the flag; a failure to admit the answering proxy room returns the empty default with no note. When the missing ask lies behind the failed read-back, the panel shows `{ asks: [], note: null }` despite the WARN. The fix: a distinct read-failed/incomplete outcome from `read_room`, carried into `note` even when nothing was recovered, and unread proxy admission told apart from an ineligible room; tested with a pagination timeout over an empty cache.
+status: open
+
+### DW-1466: A failed or partial file lookup says nothing when it finds no rows.
+
+origin: review-101composer-2 (R101C2-04), fix round 2, 2026-10-15 (R447)
+location: `src/hooks/use-inline-slash.ts` (opens only with rows), `src/components/slash-menu/inline-slash-list.tsx`, shell `chat_inline_preview` (a walk error becomes `capped`), `keeper_core::chat::inline::files_note`
+reason: the inline menu opens only when it has rows, and its note is shown only while it is open, so an unread drive list or a capped search with no match looks like no match; a per-profile walk error is reported as the 5 000-entry bound being reached rather than as a drive that could not be read. The fix: the note rendered independently of selectable rows, and a walk failure carried apart from cap exhaustion with its own sentence; tested with unavailable and capped-empty previews.
+status: open
+

@@ -40,23 +40,28 @@ import {
   type KeyboardEvent,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useRef,
   useState,
 } from "react";
 import { CameraSheet, photoFilename } from "@/components/chat/camera-sheet";
 import type { ChatCommandInvocation, ChatCommandOutcome } from "@/components/chat/chat-commands";
-import type { SlashRow } from "@/components/slash-menu/slash-menu";
+import { InlineSlashList } from "@/components/slash-menu/inline-slash-list";
+import { isCommandLine, type SlashRow } from "@/components/slash-menu/slash-menu";
 import { SlashHelp, SlashMenuList } from "@/components/slash-menu/slash-menu-list";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { IconHint } from "@/components/ui/tooltip";
+import { useInlineSlash } from "@/hooks/use-inline-slash";
 import { useShellLayout } from "@/hooks/use-shell-layout";
 import { useSlashMenu } from "@/hooks/use-slash-menu";
 import { logFailure, sayFailure } from "@/lib/failure";
 import { formatFileSize } from "@/lib/file-size";
 import {
   type ChatCommandPreviewVm,
+  type ChatInlinePreviewVm,
   chatCommandPreview,
+  chatInlinePreview,
   clearDraft,
   clearDraftMirror,
   type IpcError,
@@ -97,7 +102,12 @@ function basename(path: string): string {
 export interface SendContext {
   accountId: string;
   roomId: string;
-  target: { mode: PendingContext["mode"]; targetKey: string } | null;
+  target: {
+    mode: PendingContext["mode"];
+    targetKey: string;
+    /** A reply an Undo gave back names its original by event (R447). */
+    eventId?: string;
+  } | null;
 }
 
 interface ComposerProps {
@@ -176,6 +186,11 @@ interface ComposerProps {
    * passes its own.
    */
   resolveCommand?: (draft: string, replying: boolean) => Promise<ChatCommandPreviewVm>;
+  /**
+   * What a `/` at the caret offers mid-text (Story 101.3). The default asks
+   * Rust about this room; a test passes its own.
+   */
+  resolveInline?: (before: string, after: string) => Promise<ChatInlinePreviewVm>;
 }
 
 /**
@@ -229,8 +244,14 @@ export function Composer({
   onSendEmote,
   onCommand,
   resolveCommand,
+  resolveInline,
 }: ComposerProps) {
   const [draft, setDraft] = useState("");
+  // Where the caret is, `null` while text is selected: the mid-text `/` menu is
+  // about the token right before it (Story 101.3).
+  const [caret, setCaret] = useState<number | null>(null);
+  // Where a mid-text insertion put the caret, applied once the field holds it.
+  const insertedCaret = useRef<number | null>(null);
   const [sending, setSending] = useState(false);
   // The surfaced send failure, or `null`. `terminal` is an `IpcError` with
   // `retriable: false` — a reply/edit target that vanished or can no longer be
@@ -941,7 +962,12 @@ export function Composer({
     const context: SendContext = {
       accountId,
       roomId,
-      target: pending === null ? null : { mode: pending.mode, targetKey: pending.targetKey },
+      target:
+        pending === null
+          ? null
+          : pending.mode === "reply" && pending.eventId !== undefined
+            ? { mode: pending.mode, targetKey: pending.targetKey, eventId: pending.eventId }
+            : { mode: pending.mode, targetKey: pending.targetKey },
     };
     const text = draft.trim();
     if (!commandsEnabled || !text.startsWith("/")) {
@@ -973,6 +999,42 @@ export function Composer({
     onRun: submit,
     reportAs: "chat-command-preview",
   });
+
+  // The mid-text `/` (Story 101.3, R418): wherever the composer has a slash
+  // menu, except over a whole-line command, which is that menu's.
+  const inlineEnabled =
+    onCommand != null && onSendEmote != null && !(commandsEnabled && isCommandLine(draft));
+  const resolveInlineHere = useCallback(
+    (before: string, after: string) =>
+      resolveInline != null
+        ? resolveInline(before, after)
+        : chatInlinePreview(accountId, roomId, before, after),
+    [resolveInline, accountId, roomId],
+  );
+  const inline = useInlineSlash({
+    draft,
+    caret,
+    enabled: inlineEnabled,
+    resolve: resolveInlineHere,
+    onInsert: (next, at) => {
+      restoreConsumed.current = true;
+      insertedCaret.current = at;
+      setDraft(next);
+      setCaret(at);
+      if (pendingRef.current?.mode !== "edit") {
+        scheduleDraftSave(next);
+      }
+    },
+    reportAs: "chat-inline-preview",
+  });
+  useLayoutEffect(() => {
+    const at = insertedCaret.current;
+    const field = textareaRef.current;
+    if (at !== null && field !== null && field.value === draft) {
+      insertedCaret.current = null;
+      field.setSelectionRange(at, at);
+    }
+  }, [draft]);
 
   /** Open the native file picker and add each chosen path to the tray. */
   async function pickFiles(filters?: DialogFilter[]) {
@@ -1075,7 +1137,7 @@ export function Composer({
   function onKeyDown(e: KeyboardEvent<HTMLTextAreaElement>) {
     // The open slash menu claims ↑/↓/Enter/Tab/Escape first; everything it does
     // not claim — and every key while it is closed — keeps its meaning below.
-    if (menu.onKeyDown(e)) {
+    if (menu.onKeyDown(e) || inline.onKeyDown(e)) {
       return;
     }
     if (e.key === "Escape" && pending) {
@@ -1192,6 +1254,7 @@ export function Composer({
       )}
       <div className="relative flex items-end gap-2">
         <SlashMenuList menu={menu} />
+        <InlineSlashList menu={inline} />
         {attachEnabled && pending?.mode !== "edit" && (
           <IconHint label="Attach file">
             <Button
@@ -1284,13 +1347,20 @@ export function Composer({
         <Textarea
           ref={textareaRef}
           aria-label="Message"
-          {...menu.fieldProps}
+          {...(inline.open ? inline.fieldProps : menu.fieldProps)}
           placeholder="Write a message…"
           value={draft}
           disabled={disabled}
+          onSelect={(e) => {
+            const field = e.currentTarget;
+            setCaret(field.selectionStart === field.selectionEnd ? field.selectionStart : null);
+          }}
           onChange={(e) => {
             const next = e.target.value;
             setDraft(next);
+            setCaret(
+              e.target.selectionStart === e.target.selectionEnd ? e.target.selectionStart : null,
+            );
             // The user has typed into this composer; a late mount restore must not
             // clobber their input (even after they clear it back to empty). (Story 7.1)
             restoreConsumed.current = true;
@@ -1365,6 +1435,11 @@ export function Composer({
       {commandNote === null && menu.failure !== null && (
         <p role="alert" className="text-destructive text-xs">
           {menu.failure}
+        </p>
+      )}
+      {commandNote === null && menu.failure === null && inline.failure !== null && (
+        <p role="alert" className="text-destructive text-xs">
+          {inline.failure}
         </p>
       )}
       {commandNote !== null &&

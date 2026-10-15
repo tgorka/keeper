@@ -76,6 +76,7 @@ import type { FormatAction } from "@/components/notes/editor/format-commands";
 import type { NoteWidgetOptions } from "@/components/notes/editor/note-widget";
 import { logFailure } from "@/lib/failure";
 import type { NoteGalleryVm } from "@/lib/ipc/client";
+import { NO_TEXT_SUBSTITUTION_ATTRIBUTES } from "@/lib/text-entry";
 
 /**
  * Where an edit goes, for a caller that wants the editable pane (Story 51.5).
@@ -318,6 +319,7 @@ export async function mountMarkdownPreview(
           ]
         : [
             view.EditorView.contentAttributes.of({ "aria-label": editing.label }),
+            view.EditorView.contentAttributes.of(NO_TEXT_SUBSTITUTION_ATTRIBUTES),
             commands.history(),
             view.keymap.of([
               ...commands.defaultKeymap,

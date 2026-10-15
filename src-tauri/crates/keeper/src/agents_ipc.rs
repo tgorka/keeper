@@ -333,6 +333,42 @@ pub async fn agent_main_dm_open(
         })
 }
 
+/// Follow the questions waiting for the person that are answered in
+/// `room_id` (Story 101.3, R430, R431): a snapshot now, then one whenever an
+/// agent's session room this account reads, or this room's held sends or
+/// send queue, change. Every decision — which asks wait, where each is
+/// answered, where its answer stands, what keeper could not read — is
+/// `keeper_core::agents::waiting`'s. Returns the subscription id.
+#[tauri::command]
+pub async fn agent_asks_subscribe(
+    state: State<'_, AppState>,
+    account_id: String,
+    room_id: String,
+    channel: Channel<keeper_core::agents::waiting::AgentAsksVm>,
+) -> Result<u64, IpcError> {
+    let sink =
+        Box::new(move |asks: keeper_core::agents::waiting::AgentAsksVm| channel.send(asks).is_ok());
+    state
+        .accounts
+        .subscribe_agent_asks(&state.platform, &account_id, &room_id, sink)
+        .await
+        .map_err(to_ipc_error)
+}
+
+/// End one [`agent_asks_subscribe`]. Idempotent.
+#[tauri::command]
+pub async fn agent_asks_unsubscribe(
+    state: State<'_, AppState>,
+    account_id: String,
+    subscription_id: u64,
+) -> Result<(), IpcError> {
+    state
+        .accounts
+        .unsubscribe_agent_asks(&account_id, subscription_id)
+        .await;
+    Ok(())
+}
+
 /// The person's decision on the approval card `req` names in the session
 /// room `room_id` (93.3), sent from this device. Refused at once, with the
 /// card's sentence, where the card shows no decide buttons; whether it

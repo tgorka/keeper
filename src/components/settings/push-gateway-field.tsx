@@ -104,9 +104,6 @@ export function PushGatewayField({ open }: { open: boolean }) {
           value={draft}
           placeholder={PUSH_GATEWAY_PLACEHOLDER}
           disabled={busy || held === undefined}
-          autoCapitalize="none"
-          autoCorrect="off"
-          spellCheck={false}
           onChange={(event) => setDraft(event.target.value)}
           className="min-w-0"
         />

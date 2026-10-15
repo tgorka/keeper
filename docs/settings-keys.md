@@ -124,8 +124,10 @@ file-controlled instead, and says which file.
 | | | | | The end-of-turn model voice loads, as a folder name under the hydrated `_models/`. Blank means the config repository's choice (`[smart_turn]` in `_models/models.toml`); every device that runs turn models fetches the folder named here, and one that is missing or incomplete on the device is refused, never replaced. |
 | `transcription.vad_model` | user-global | text | *(absent)* | `"transcription.vad_model" = "silero-vad"` |
 | | | | | The voice activity model voice loads, as a folder name under the hydrated `_models/`. Blank means the config repository's choice (`[vad]` in `_models/models.toml`); every device that runs turn models fetches the folder named here, and one that is missing or incomplete on the device is refused, never replaced. |
-| `undo_send.window` | user-global | integer 0..=60 | `10` | `"undo_send.window" = 10` |
-| | | | | How long a sent message is held before it dispatches, in seconds. |
+| `undo_send.agent_window` | user-global | integer 0..=60 | `0` | `"undo_send.agent_window" = 0` |
+| | | | | How long a message to an agent is held before it dispatches, in seconds. |
+| `undo_send.window` | user-global | integer 0..=60 | `2` | `"undo_send.window" = 2` |
+| | | | | How long a message to a chat is held before it dispatches, in seconds. |
 | `update.auto` | user-global | boolean (`1`/`0`) | `1` | `"update.auto" = false` |
 | | | | | Whether keeper checks for its own update on a cadence, installs it in the background, and then restarts itself into it once nobody is using keeper — overnight, or after hours away, and never while a recording is live. Off means the update endpoint is contacted only when somebody clicks Check for updates, and only a person restarts. |
 

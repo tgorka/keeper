@@ -2032,20 +2032,6 @@ fn register_handlers(copy: &Arc<Copy>) {
     );
 }
 
-/// Where an ask in a room goes (R199): to the session that delegated into
-/// the room — `parent`, with its kind — when that is the proxy's own `main`
-/// or `conversation`, the sessions an ask is a turn of; else to `main`, the
-/// proxy's DM.
-pub(crate) fn ask_target(
-    parent: Option<(OwnedRoomId, SessionKind)>,
-    main: Option<OwnedRoomId>,
-) -> Option<OwnedRoomId> {
-    match parent {
-        Some((room, SessionKind::Main | SessionKind::Conversation)) => Some(room),
-        _ => main,
-    }
-}
-
 /// An ask `value` (decrypted) in `room`, a room this copy serves no session
 /// of: when this copy's agent is a proxy with a person, the ask
 /// [`rooms::admit_ask`] admits is routed to the session it is a turn of
@@ -2100,7 +2086,7 @@ async fn intercept_ask(
 }
 
 /// Route `arrived`, an ask admitted in `room`, to the proxy's session it is
-/// a turn of ([`ask_target`]) as an [`Arrival::Ask`] whose `via` is `room`;
+/// a turn of ([`keeper_core::agents::ask::ask_target`]) as an [`Arrival::Ask`] whose `via` is `room`;
 /// the session dedupes it by its id. `false` when that session could not be
 /// named.
 async fn route_ask(copy: &Copy, room: &RoomId, arrived: Arrived) -> bool {
@@ -2125,7 +2111,7 @@ async fn route_ask(copy: &Copy, room: &RoomId, arrived: Arrived) -> bool {
                 .flatten()
         }
     };
-    let Some(target) = ask_target(parent, main) else {
+    let Some(target) = keeper_core::agents::ask::ask_target(parent, main) else {
         tracing::warn!(%room, "agents: an ask came for a proxy whose DM this host cannot name; it is read back later");
         return false;
     };
@@ -3953,30 +3939,6 @@ mod tests {
             "a left room is forgotten"
         );
         assert!(rooms.due(&joined).is_empty());
-    }
-
-    /// R94A-03: an ask in a room a proxy's session delegated into goes to
-    /// that session only when it is the proxy's own `main` or
-    /// `conversation`; from any other, to the proxy's DM.
-    #[test]
-    fn an_ask_goes_to_a_parent_only_when_it_takes_asks() {
-        let (parent, main) = (
-            OwnedRoomId::try_from("!parent:example.org").expect("room"),
-            OwnedRoomId::try_from("!dm:example.org").expect("room"),
-        );
-        for kind in SessionKind::ALL {
-            let own = matches!(kind, SessionKind::Main | SessionKind::Conversation);
-            assert_eq!(
-                ask_target(Some((parent.clone(), kind)), Some(main.clone())),
-                Some(if own { parent.clone() } else { main.clone() }),
-                "{kind:?}"
-            );
-        }
-        assert_eq!(ask_target(None, Some(main.clone())), Some(main));
-        assert_eq!(
-            ask_target(Some((parent, SessionKind::Scheduled)), None),
-            None
-        );
     }
 
     /// The follow room's messages for run end `c1`, as `NIXI`, the

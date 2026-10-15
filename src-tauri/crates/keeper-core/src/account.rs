@@ -18,7 +18,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -35,7 +35,7 @@ use matrix_sdk::ruma::events::room::MediaSource;
 use matrix_sdk::ruma::events::{
     AnySyncMessageLikeEvent, AnySyncTimelineEvent, StateEventType, SyncMessageLikeEvent,
 };
-use matrix_sdk::ruma::{EventId, OwnedRoomId, OwnedUserId, RoomId, UserId};
+use matrix_sdk::ruma::{EventId, OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, UserId};
 use matrix_sdk::{Client, Room};
 use matrix_sdk_ui::eyeball_im::VectorDiff;
 use matrix_sdk_ui::room_list_service::filters::new_filter_non_left;
@@ -68,6 +68,7 @@ use crate::agents::room::{self as agent_room, AgentIcons, AgentKinds, AgentRoomK
 use crate::agents::session::SessionKind;
 use crate::agents::spoken::SpokenAnswer;
 use crate::agents::surface::{SurfaceAnswerReq, SurfaceRequestArrived};
+use crate::agents::waiting as agent_waiting;
 use crate::archive::{self, ArchiveEvent, ArchiveHandle, ArchiveMedia, ArchiveWriter};
 use crate::auth::{self, session_keychain_key};
 use crate::backup::{self, BackupSink};
@@ -160,6 +161,14 @@ pub type DraftMirrorSink = Box<dyn Fn(DraftMirrorBatch) -> bool + Send + Sync>;
 /// a Tauri `Channel::send`; tests capture into a vector. Returns `true` if the snapshot
 /// was delivered, `false` if the channel is closed (the producer then stops).
 pub type OutboxSink = Box<dyn Fn(OutboxVm) -> bool + Send + Sync>;
+
+/// Sink that receives each [`agent_waiting::AgentAsksVm`] snapshot (Story 101.3).
+/// The shell wraps a Tauri `Channel::send`; `false` once the channel is closed.
+pub type AgentAsksSink = Box<dyn Fn(agent_waiting::AgentAsksVm) -> bool + Send + Sync>;
+
+/// How long the questions' follower lets a burst of room changes settle
+/// before it reads them again (Story 101.3).
+const ASKS_SETTLE: std::time::Duration = std::time::Duration::from_millis(300);
 
 /// Registry of an account's live open room timelines, keyed by the *timeline*
 /// subscription id → its room id and the exact `Arc<Timeline>` that produced the
@@ -386,6 +395,8 @@ fn outbox_snapshot(data_dir: &Path, account_id: &str, room_id: &str) -> OutboxVm
                 body,
                 held_at_ms: r.held_at_ts,
                 dispatch_at_ms: r.dispatch_at_ts,
+                filename: r.attachment.as_ref().map(|file| file.filename.clone()),
+                reply: r.reply_to.is_some(),
             }
         })
         .collect();
@@ -450,6 +461,7 @@ async fn run_outbox_scheduler(
     // next tick a full interval instead (this loop is already sequential, so bursts
     // would only add contention).
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    sweep_staged(&data_dir);
     // Ids handed to the SDK send queue whose `outbox` row delete has not yet succeeded.
     // A row here is already durable in the SDK queue, so it must be re-*deleted*, never
     // re-*dispatched* — otherwise a transient delete failure (e.g. `SQLITE_BUSY` under
@@ -486,6 +498,9 @@ async fn run_outbox_scheduler(
             if awaiting_delete.contains(&row.id) {
                 if registry::delete_outbox(&data_dir, &row.id).is_ok() {
                     awaiting_delete.remove(&row.id);
+                    if let Some(file) = &row.attachment {
+                        unstage(&file.path);
+                    }
                     changed = true;
                 }
                 continue;
@@ -510,14 +525,19 @@ async fn run_outbox_scheduler(
             // Dispatch-then-delete: hand to the SDK send queue (which persists it),
             // then remove the row. A dispatch error is best-effort — leave the row to
             // retry next tick rather than deleting an undispatched message.
-            match send::dispatch(&timeline, &row.body, row.kind).await {
-                Ok(_) => {
+            let sent = dispatch_held(&timeline, &row).await;
+            match sent {
+                Ok(()) => {
                     backoff.remove(&row.id);
                     if let Err(e) = registry::delete_outbox(&data_dir, &row.id) {
                         // Handed off but not yet deleted: remember it so the next tick
                         // retries the delete instead of re-dispatching a duplicate.
                         awaiting_delete.insert(row.id.clone());
                         tracing::warn!(account_id = %account_id, error = %e, "outbox scheduler: dispatched but could not delete row; will retry delete");
+                    } else if let Some(file) = &row.attachment {
+                        // Only once the row is gone: a row that outlives a crash
+                        // must still find its file.
+                        unstage(&file.path);
                     }
                     changed = true;
                     tracing::info!(account_id = %account_id, room_id = %parsed_room, "held send dispatched after window elapsed");
@@ -534,6 +554,112 @@ async fn run_outbox_scheduler(
             // Notify subscribers to re-snapshot (held bubble/pill removed; SDK echo
             // takes over). No live subscriber → swallowed no-op.
             let _ = outbox_tx.send(OutboxChange);
+        }
+    }
+}
+
+/// Dispatch one elapsed held row by its shape (Stories 8.3, 101.3, R432): an
+/// attachment through [`send::submit_attachment`] from its staged copy with
+/// the body as its caption, a reply through [`send::submit_reply_to`] to the
+/// event it names, anything else through [`send::dispatch`] as its kind.
+async fn dispatch_held(timeline: &Timeline, row: &registry::OutboxRow) -> Result<(), CoreError> {
+    if let Some(file) = &row.attachment {
+        let bytes = tokio::fs::read(&file.path)
+            .await
+            .map_err(|e| SendError::Upload(format!("could not read the held file: {e}")))?;
+        let mime = mime::Mime::from_str(&file.mime).unwrap_or(mime::APPLICATION_OCTET_STREAM);
+        let caption = (!row.body.trim().is_empty()).then_some(row.body.as_str());
+        send::submit_attachment(timeline, bytes, &file.filename, mime, caption).await?;
+        return Ok(());
+    }
+    if let Some(reply) = &row.reply_to {
+        let event = OwnedEventId::try_from(reply.event_id.as_str())
+            .map_err(|_| SendError::TargetNotFound)?;
+        send::submit_reply_to(timeline, event, &row.body).await?;
+        return Ok(());
+    }
+    send::dispatch(timeline, &row.body, row.kind).await?;
+    Ok(())
+}
+
+/// The longest body a held reply keeps of the message it answers: enough for
+/// the reply banner's one-line preview (Story 101.3, R447).
+const HELD_REPLY_BODY_CHARS: usize = 240;
+
+/// The message `event` names as `timeline` shows it (Story 101.3, R447): its
+/// render key, and the reply as a held row keeps it — its event, sender and
+/// body. `None` when the timeline does not show it.
+async fn shown_reply(
+    timeline: &Timeline,
+    event: &EventId,
+) -> Option<(String, registry::HeldReply)> {
+    timeline.items().await.iter().find_map(|item| {
+        let shown = item.as_event()?;
+        (shown.event_id()? == event).then_some(())?;
+        let sender_display_name = match shown.sender_profile() {
+            matrix_sdk_ui::timeline::TimelineDetails::Ready(profile) => {
+                profile.display_name.clone()
+            }
+            _ => None,
+        };
+        let body = shown
+            .content()
+            .as_message()
+            .and_then(|message| crate::timeline::text_body(message.msgtype()))
+            .unwrap_or_default();
+        Some((
+            item.unique_id().0.clone(),
+            registry::HeldReply {
+                event_id: event.to_string(),
+                sender: shown.sender().to_string(),
+                sender_display_name,
+                body: body.chars().take(HELD_REPLY_BODY_CHARS).collect(),
+            },
+        ))
+    })
+}
+
+/// Where a held attachment's copy is staged (Story 101.3): one folder per
+/// held row under the data directory.
+fn staging_dir(data_dir: &Path, id: &str) -> PathBuf {
+    data_dir.join("outbox-files").join(id)
+}
+
+/// Remove a staged copy and its row's folder once it is sent. Best-effort: a
+/// copy left behind is swept on a later start ([`sweep_staged`]).
+fn unstage(path: &str) {
+    if let Some(dir) = Path::new(path).parent() {
+        if let Err(error) = std::fs::remove_dir_all(dir) {
+            tracing::warn!(%error, "outbox: a sent attachment's staged copy could not be removed");
+        }
+    }
+}
+
+/// Remove staged copies no held row names any more and that are older than a
+/// day — an undone attachment's copy stays while the tray may still send it.
+fn sweep_staged(data_dir: &Path) {
+    let root = data_dir.join("outbox-files");
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return;
+    };
+    let held: std::collections::HashSet<String> = match registry::list_outbox_rows(data_dir) {
+        Ok(rows) => rows.into_iter().map(|row| row.id).collect(),
+        Err(error) => {
+            tracing::warn!(%error, "outbox: held rows unread; staged copies are kept");
+            return;
+        }
+    };
+    let day = std::time::Duration::from_secs(24 * 60 * 60);
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let old = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age > day);
+        if old && !held.contains(&name) {
+            let _ = std::fs::remove_dir_all(entry.path());
         }
     }
 }
@@ -2987,7 +3113,7 @@ impl AccountManager {
             return Ok(());
         }
         let data_dir = platform.data_dir()?;
-        let window = registry::get_undo_send_window(&data_dir)?;
+        let window = self.undo_window(&data_dir, account_id, &room_id).await?;
         if window > 0 {
             self.hold_send(
                 &data_dir,
@@ -3005,6 +3131,23 @@ impl AccountManager {
         send::submit(&timeline, body, kind, SendTrigger::ComposerSend).await?;
         tracing::info!(account_id = %account_id, room_id = %room_id, "message dispatched");
         Ok(())
+    }
+
+    /// The Undo-Send window for a send into `room_id` (Story 101.3, R418): an
+    /// agent's session room holds for `undo_send.agent_window`, every other
+    /// room for `undo_send.window`. A room this account does not hold live
+    /// has no kind keeper can read and is held as a chat is.
+    async fn undo_window(
+        &self,
+        data_dir: &Path,
+        account_id: &str,
+        room_id: &RoomId,
+    ) -> Result<u16, CoreError> {
+        let room = match self.room_for(account_id, room_id).await {
+            Ok(room) => undo_room_of(room.room_type().as_ref()),
+            Err(_) => registry::UndoRoom::Chat,
+        };
+        registry::undo_send_window_for(data_dir, room)
     }
 
     /// Hold an approved send in the durable `outbox` (Story 8.3): insert a row with
@@ -3030,21 +3173,78 @@ impl AccountManager {
     ) -> Result<(), CoreError> {
         let id = matrix_sdk::ruma::TransactionId::new().to_string();
         let held_at = now_ms();
-        let dispatch_at = held_at.saturating_add(i64::from(window_secs) * 1000);
-        registry::insert_outbox(
+        self.hold_row(
             data_dir,
-            &id,
-            account_id,
-            room_id,
-            body,
-            kind,
-            line,
-            held_at,
-            dispatch_at,
-        )?;
-        self.notify_outbox(account_id).await;
-        tracing::info!(account_id = %account_id, room_id = %room_id, "send held in undo-send window");
+            &registry::OutboxRow {
+                id,
+                account_id: account_id.to_owned(),
+                room_id: room_id.to_owned(),
+                body: body.to_owned(),
+                held_at_ts: held_at,
+                dispatch_at_ts: held_at.saturating_add(i64::from(window_secs) * 1000),
+                kind,
+                line: Some(line.to_owned()),
+                reply_to: None,
+                attachment: None,
+            },
+        )
+        .await
+    }
+
+    /// Hold `row` in the durable `outbox` whole (Stories 8.3, 101.3) and notify
+    /// the account's outbox broadcast. The body is never logged.
+    async fn hold_row(&self, data_dir: &Path, row: &registry::OutboxRow) -> Result<(), CoreError> {
+        registry::insert_held(data_dir, row)?;
+        self.notify_outbox(&row.account_id).await;
+        tracing::info!(account_id = %row.account_id, room_id = %row.room_id, reply = row.reply_to.is_some(), attachment = row.attachment.is_some(), "send held in undo-send window");
         Ok(())
+    }
+
+    /// A held row for `room_id` that elapses after `window_secs` (Story 101.3):
+    /// a fresh id, now, and nothing else of it filled in.
+    fn held_row(
+        account_id: &str,
+        room_id: &str,
+        body: &str,
+        window_secs: u16,
+    ) -> registry::OutboxRow {
+        let held_at = now_ms();
+        registry::OutboxRow {
+            id: matrix_sdk::ruma::TransactionId::new().to_string(),
+            account_id: account_id.to_owned(),
+            room_id: room_id.to_owned(),
+            body: body.to_owned(),
+            held_at_ts: held_at,
+            dispatch_at_ts: held_at.saturating_add(i64::from(window_secs) * 1000),
+            kind: MessageKind::Text,
+            line: Some(body.to_owned()),
+            reply_to: None,
+            attachment: None,
+        }
+    }
+
+    /// Stage `bytes` as the held attachment `filename` of the held row `id`
+    /// (Story 101.3): the copy the scheduler sends and Undo hands back.
+    async fn stage(
+        data_dir: &Path,
+        id: &str,
+        filename: &str,
+        mime: &str,
+        bytes: &[u8],
+    ) -> Result<registry::HeldAttachment, CoreError> {
+        let dir = staging_dir(data_dir, id);
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .map_err(|e| SendError::Upload(format!("could not hold the attached file: {e}")))?;
+        let path = dir.join(filename);
+        tokio::fs::write(&path, bytes)
+            .await
+            .map_err(|e| SendError::Upload(format!("could not hold the attached file: {e}")))?;
+        Ok(registry::HeldAttachment {
+            path: path.to_string_lossy().into_owned(),
+            filename: filename.to_owned(),
+            mime: mime.to_owned(),
+        })
     }
 
     /// Signal the account's outbox broadcast (Story 8.3) so every live
@@ -3073,7 +3273,7 @@ impl AccountManager {
         account_id: &str,
         room_id: &str,
         id: &str,
-    ) -> Result<String, CoreError> {
+    ) -> Result<crate::vm::HeldRestoreVm, CoreError> {
         let data_dir = platform.data_dir()?;
         // Find the row so we can restore its body; a missing row is an idempotent
         // no-op (the scheduler may have just dispatched it).
@@ -3081,7 +3281,7 @@ impl AccountManager {
             .into_iter()
             .find(|r| r.id == id);
         let Some(row) = row else {
-            return Ok(String::new());
+            return Ok(crate::vm::HeldRestoreVm::default());
         };
         // Delete first (zero network), then persist the body as the room Draft so the
         // composer restores it. Deleting before the draft write means a crash in the
@@ -3110,7 +3310,46 @@ impl AccountManager {
         }
         self.notify_outbox(account_id).await;
         tracing::info!(account_id = %account_id, room_id = %row.room_id, "held send cancelled; body restored as draft");
-        Ok(restored)
+        // A held reply comes back replying (Story 101.3, R432, R447): to its
+        // event, whether or not the room's open timeline still shows the
+        // original — with that item's key and what it says when it does, else
+        // with the sender and body kept when the reply was held.
+        let reply = match row.reply_to {
+            Some(held) => {
+                let shown = match (
+                    OwnedEventId::try_from(held.event_id.as_str()),
+                    RoomId::parse(&row.room_id),
+                ) {
+                    (Ok(event), Ok(room)) => {
+                        match self.open_timeline_for(account_id, &room).await {
+                            Ok(timeline) => shown_reply(&timeline, &event).await,
+                            Err(_) => None,
+                        }
+                    }
+                    _ => None,
+                };
+                let (key, quote) = match shown {
+                    Some((key, quote)) => (Some(key), quote),
+                    None => (None, held),
+                };
+                Some(crate::vm::HeldReplyVm {
+                    event_id: quote.event_id,
+                    key,
+                    sender: quote.sender,
+                    sender_display_name: quote.sender_display_name,
+                    body: quote.body,
+                })
+            }
+            None => None,
+        };
+        Ok(crate::vm::HeldRestoreVm {
+            line: restored,
+            reply,
+            attachment: row.attachment.map(|file| crate::vm::HeldFileVm {
+                path: file.path,
+                filename: file.filename,
+            }),
+        })
     }
 
     /// Subscribe to the held sends for one open Chat (Story 8.3). Emits an initial
@@ -3375,7 +3614,7 @@ impl AccountManager {
         // exactly. The approval trigger was already the user pressing approve — the
         // scheduler mints no new trigger (AD-13).
         let data_dir = platform.data_dir()?;
-        let window = registry::get_undo_send_window(&data_dir)?;
+        let window = self.undo_window(&data_dir, account_id, &room_id).await?;
         if window > 0 {
             self.hold_send(
                 &data_dir,
@@ -3424,6 +3663,7 @@ impl AccountManager {
     /// [`SendError::TargetNotFound`]; an SDK enqueue failure → [`SendError::Dispatch`].
     pub async fn send_reply(
         &self,
+        platform: &Arc<dyn Platform>,
         account_id: &str,
         room_id: &str,
         in_reply_to_key: &str,
@@ -3431,9 +3671,74 @@ impl AccountManager {
     ) -> Result<(), CoreError> {
         let room_id: OwnedRoomId = RoomId::parse(room_id).map_err(|_| SendError::RoomNotFound)?;
         let timeline = self.open_timeline_for(account_id, &room_id).await?;
+        // The room kind's Undo-Send window holds a reply as it holds text
+        // (Story 101.3, R432), naming its original by event.
+        let data_dir = platform.data_dir()?;
+        let window = self.undo_window(&data_dir, account_id, &room_id).await?;
+        if window > 0 && !body.trim().is_empty() {
+            let event = send::reply_target(&timeline, in_reply_to_key).await?;
+            let reply = match shown_reply(&timeline, &event).await {
+                Some((_, reply)) => reply,
+                None => registry::HeldReply::unshown(event.as_str()),
+            };
+            return self
+                .hold_reply(&data_dir, account_id, &room_id, body, window, reply)
+                .await;
+        }
         send::submit_reply(&timeline, in_reply_to_key, body).await?;
         tracing::info!(account_id = %account_id, room_id = %room_id, "reply dispatched");
         Ok(())
+    }
+
+    /// Send a plain-text reply to the message `event_id` names (Story 101.3,
+    /// R447): the reply an Undo gave back, whose original may be outside the
+    /// loaded timeline, so it is named by event rather than by a render key.
+    /// Held for the room kind's Undo-Send window like any reply; otherwise
+    /// through [`send::submit_reply_to`], the sole `Timeline::send_reply` call.
+    ///
+    /// Errors: an unparsable event id → [`SendError::TargetNotFound`]; the rest
+    /// as [`Self::send_reply`].
+    pub async fn send_reply_to_event(
+        &self,
+        platform: &Arc<dyn Platform>,
+        account_id: &str,
+        room_id: &str,
+        event_id: &str,
+        body: &str,
+    ) -> Result<(), CoreError> {
+        let event = OwnedEventId::try_from(event_id).map_err(|_| SendError::TargetNotFound)?;
+        let room_id: OwnedRoomId = RoomId::parse(room_id).map_err(|_| SendError::RoomNotFound)?;
+        let timeline = self.open_timeline_for(account_id, &room_id).await?;
+        let data_dir = platform.data_dir()?;
+        let window = self.undo_window(&data_dir, account_id, &room_id).await?;
+        if window > 0 && !body.trim().is_empty() {
+            let reply = match shown_reply(&timeline, &event).await {
+                Some((_, reply)) => reply,
+                None => registry::HeldReply::unshown(event.as_str()),
+            };
+            return self
+                .hold_reply(&data_dir, account_id, &room_id, body, window, reply)
+                .await;
+        }
+        send::submit_reply_to(&timeline, event, body).await?;
+        tracing::info!(account_id = %account_id, room_id = %room_id, "reply dispatched");
+        Ok(())
+    }
+
+    /// Hold a reply for `window` seconds, naming the message it answers
+    /// (Story 101.3, R432, R447).
+    async fn hold_reply(
+        &self,
+        data_dir: &Path,
+        account_id: &str,
+        room_id: &RoomId,
+        body: &str,
+        window: u16,
+        reply: registry::HeldReply,
+    ) -> Result<(), CoreError> {
+        let mut row = Self::held_row(account_id, room_id.as_str(), body, window);
+        row.reply_to = Some(reply);
+        self.hold_row(data_dir, &row).await
     }
 
     /// Edit the own message addressed by `item_key` (its opaque render key) in
@@ -3680,13 +3985,13 @@ impl AccountManager {
     /// [`SendError::Upload`]; an SDK enqueue failure → [`SendError::Upload`].
     pub async fn send_attachment_path(
         &self,
+        platform: &Arc<dyn Platform>,
         account_id: &str,
         room_id: &str,
         path: &Path,
         caption: Option<&str>,
     ) -> Result<(), CoreError> {
         let room_id: OwnedRoomId = RoomId::parse(room_id).map_err(|_| SendError::RoomNotFound)?;
-        let timeline = self.open_timeline_for(account_id, &room_id).await?;
         let bytes = tokio::fs::read(path)
             .await
             .map_err(|e| SendError::Upload(format!("could not read the attached file: {e}")))?;
@@ -3697,6 +4002,15 @@ impl AccountManager {
             .unwrap_or_else(|| "attachment".to_owned());
         let mime = mime_guess::from_path(path).first_or_octet_stream();
         let size = bytes.len();
+        if self
+            .hold_attachment(
+                platform, account_id, &room_id, &bytes, &filename, &mime, caption,
+            )
+            .await?
+        {
+            return Ok(());
+        }
+        let timeline = self.open_timeline_for(account_id, &room_id).await?;
         send::submit_attachment(&timeline, bytes, &filename, mime.clone(), caption).await?;
         tracing::info!(
             account_id = %account_id,
@@ -3722,8 +4036,12 @@ impl AccountManager {
     /// Errors: an unparsable/unknown room id → [`SendError::RoomNotFound`]; no open
     /// timeline → [`SendError::NoOpenTimeline`]; an SDK enqueue failure →
     /// [`SendError::Upload`].
+    // One argument per fact of the pasted file and where it goes, as
+    // `send::submit_attachment`; the platform finds the Undo-Send window.
+    #[allow(clippy::too_many_arguments)]
     pub async fn send_attachment_bytes(
         &self,
+        platform: &Arc<dyn Platform>,
         account_id: &str,
         room_id: &str,
         bytes: Vec<u8>,
@@ -3732,7 +4050,6 @@ impl AccountManager {
         caption: Option<&str>,
     ) -> Result<(), CoreError> {
         let room_id: OwnedRoomId = RoomId::parse(room_id).map_err(|_| SendError::RoomNotFound)?;
-        let timeline = self.open_timeline_for(account_id, &room_id).await?;
         let mime = mime::Mime::from_str(mime_str).unwrap_or(mime::APPLICATION_OCTET_STREAM);
         let size = bytes.len();
         // Defense-in-depth: the paste filename is frontend-supplied, so reduce it to
@@ -3743,6 +4060,15 @@ impl AccountManager {
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("attachment");
+        if self
+            .hold_attachment(
+                platform, account_id, &room_id, &bytes, safe_name, &mime, caption,
+            )
+            .await?
+        {
+            return Ok(());
+        }
+        let timeline = self.open_timeline_for(account_id, &room_id).await?;
         send::submit_attachment(&timeline, bytes, safe_name, mime.clone(), caption).await?;
         tracing::info!(
             account_id = %account_id,
@@ -3752,6 +4078,37 @@ impl AccountManager {
             "attachment dispatched from pasted bytes"
         );
         Ok(())
+    }
+
+    /// Hold an attachment for the room kind's Undo-Send window (Story 101.3,
+    /// R432): its bytes staged as a copy ([`Self::stage`]) and a held row whose
+    /// body is its caption. `false` — send it now — when the window is zero.
+    // One argument per fact of the attachment, as `send::submit_attachment`.
+    #[allow(clippy::too_many_arguments)]
+    async fn hold_attachment(
+        &self,
+        platform: &Arc<dyn Platform>,
+        account_id: &str,
+        room_id: &RoomId,
+        bytes: &[u8],
+        filename: &str,
+        mime: &mime::Mime,
+        caption: Option<&str>,
+    ) -> Result<bool, CoreError> {
+        let data_dir = platform.data_dir()?;
+        let window = self.undo_window(&data_dir, account_id, room_id).await?;
+        if window == 0 {
+            return Ok(false);
+        }
+        let caption = caption.map(str::trim).unwrap_or_default();
+        let mut row = Self::held_row(account_id, room_id.as_str(), caption, window);
+        row.attachment =
+            Some(Self::stage(&data_dir, &row.id, filename, mime.as_ref(), bytes).await?);
+        if let Err(error) = self.hold_row(&data_dir, &row).await {
+            let _ = tokio::fs::remove_dir_all(staging_dir(&data_dir, &row.id)).await;
+            return Err(error);
+        }
+        Ok(true)
     }
 
     /// Cancel an in-flight outgoing media (or text) echo by aborting its SDK send
@@ -4263,6 +4620,186 @@ impl AccountManager {
             may_invite: levels.user_can_invite(me),
             replying,
             agent_home_here,
+        })
+    }
+
+    /// Follow the questions answered in `room_id` (Story 101.3, R431): one
+    /// snapshot now, then a fresh one whenever an agent's session room this
+    /// account reads changes in its event cache — an ask, an answer, a
+    /// redaction, an edit, wherever it lands — or this room's held sends or
+    /// send queue move, each change settled for [`ASKS_SETTLE`] first. A
+    /// snapshot equal to the last is not sent again. A read that fails is
+    /// logged at WARN and sent as the last questions with
+    /// [`agent_waiting::ASKS_UNAVAILABLE`] beside them (R381). Returns the
+    /// subscription id; [`Self::unsubscribe_agent_asks`] ends it.
+    pub async fn subscribe_agent_asks(
+        &self,
+        platform: &Arc<dyn Platform>,
+        account_id: &str,
+        room_id: &str,
+        sink: AgentAsksSink,
+    ) -> Result<u64, CoreError> {
+        let room_id = RoomId::parse(room_id).map_err(|_| TimelineError::RoomNotFound)?;
+        let data_dir = platform.data_dir()?;
+        let (client, subs, mut outbox) = {
+            let accounts = self.accounts.lock().await;
+            let handle = accounts
+                .get(account_id)
+                .ok_or(TimelineError::RoomNotFound)?;
+            (
+                handle.client.clone(),
+                handle.subscriptions.clone(),
+                handle.outbox_tx.subscribe(),
+            )
+        };
+        let (kinds, proxies) = (
+            Arc::clone(&self.agent_kinds),
+            Arc::clone(&self.agent_proxies),
+        );
+        let account = account_id.to_owned();
+        let subscription_id = NEXT_SUBSCRIPTION_ID.fetch_add(1, Ordering::Relaxed);
+        let reaper = subs.clone();
+        let span = tracing::info_span!("agent_asks_producer", account_id = %account_id, room_id = %room_id);
+        let task = tokio::spawn(
+            async move {
+                let mut rooms = client.event_cache().subscribe_to_room_generic_updates();
+                let mut queue = client.send_queue().subscribe();
+                let mut last: Option<agent_waiting::AgentAsksVm> = None;
+                loop {
+                    let read =
+                        read_agent_asks(&client, &data_dir, &account, &room_id, &kinds, &proxies)
+                            .await;
+                    let vm = match read {
+                        Ok(vm) => vm,
+                        Err(error) => {
+                            tracing::warn!(%error, "agents: the questions waiting here could not be read");
+                            agent_waiting::AgentAsksVm {
+                                asks: last.as_ref().map(|vm| vm.asks.clone()).unwrap_or_default(),
+                                note: Some(agent_waiting::ASKS_UNAVAILABLE.to_owned()),
+                            }
+                        }
+                    };
+                    if last.as_ref() != Some(&vm) {
+                        if !sink(vm.clone()) {
+                            break;
+                        }
+                        last = Some(vm);
+                    }
+                    let session = |id: &RoomId| {
+                        client.get_room(id).is_some_and(|room| {
+                            AgentRoomKind::of(room.room_type().as_ref())
+                                == Some(AgentRoomKind::Session)
+                        })
+                    };
+                    let open = loop {
+                        tokio::select! {
+                            update = rooms.recv() => match update {
+                                Ok(update) if session(&update.room_id) => break true,
+                                Ok(_) => {}
+                                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => break true,
+                                Err(tokio::sync::broadcast::error::RecvError::Closed) => break false,
+                            },
+                            update = queue.recv() => match update {
+                                Ok(update) if update.room_id == room_id => break true,
+                                Ok(_) => {}
+                                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => break true,
+                                Err(tokio::sync::broadcast::error::RecvError::Closed) => break false,
+                            },
+                            change = outbox.recv() => match change {
+                                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => break true,
+                                Err(tokio::sync::broadcast::error::RecvError::Closed) => break false,
+                            },
+                        }
+                    };
+                    if !open {
+                        break;
+                    }
+                    // A burst — a streamed answer's edits, a sync batch — is
+                    // one read.
+                    tokio::time::sleep(ASKS_SETTLE).await;
+                    while rooms.try_recv().is_ok() || queue.try_recv().is_ok() || outbox.try_recv().is_ok() {}
+                }
+                reaper.lock().await.remove(&subscription_id);
+            }
+            .instrument(span),
+        );
+        subs.lock().await.insert(subscription_id, task);
+        tracing::info!(account_id = %account_id, subscription_id, "agent asks subscribed");
+        Ok(subscription_id)
+    }
+
+    /// End one [`Self::subscribe_agent_asks`]. Idempotent.
+    pub async fn unsubscribe_agent_asks(&self, account_id: &str, subscription_id: u64) {
+        if self.abort_subscription(account_id, subscription_id).await {
+            tracing::info!(account_id = %account_id, subscription_id, "agent asks unsubscribed");
+        }
+    }
+
+    /// What a `/` in the middle of a message may offer in `room_id` (Story
+    /// 101.3, R418): the room's kind as the whole-line commands read it, the
+    /// agent working its session when keeper has read one, and the agents this
+    /// account knows — the agents of its session rooms keeper has read, and
+    /// those whose homes are on this device — each with its display name where
+    /// a room of this account shows one.
+    pub async fn chat_inline_context(
+        &self,
+        account_id: &str,
+        room_id: &str,
+    ) -> Result<chat::inline::InlineContext, CoreError> {
+        let parsed = RoomId::parse(room_id).map_err(|_| TimelineError::RoomNotFound)?;
+        let room = self
+            .chat_command_context(account_id, room_id, false)
+            .await?
+            .room;
+        let client = {
+            let accounts = self.accounts.lock().await;
+            accounts
+                .get(account_id)
+                .ok_or(TimelineError::RoomNotFound)?
+                .client
+                .clone()
+        };
+        let mut agents: BTreeMap<matrix_sdk::ruma::OwnedUserId, Option<String>> = self
+            .agent_icons
+            .agents()
+            .into_iter()
+            .map(|agent| (agent, None))
+            .collect();
+        for joined in client.joined_rooms() {
+            if AgentRoomKind::of(joined.room_type().as_ref()) != Some(AgentRoomKind::Session) {
+                continue;
+            }
+            let Some(agent) = self
+                .agent_kinds
+                .agent(joined.own_user_id(), joined.room_id())
+            else {
+                continue;
+            };
+            let named = agents.get(&agent).is_some_and(Option::is_some);
+            let name = if named {
+                None
+            } else {
+                joined
+                    .get_member_no_sync(&agent)
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|member| member.display_name().map(str::to_owned))
+            };
+            let slot = agents.entry(agent).or_default();
+            if slot.is_none() {
+                *slot = name;
+            }
+        }
+        Ok(chat::inline::InlineContext {
+            room,
+            room_agent: client
+                .user_id()
+                .and_then(|own| self.agent_kinds.agent(own, &parsed)),
+            agents: agents
+                .into_iter()
+                .map(|(user, name)| chat::inline::InlineAgent { user, name })
+                .collect(),
         })
     }
 
@@ -6693,6 +7230,219 @@ pub async fn spoken_send(
         answer.sent(&handle, text);
     }
     Ok(answer)
+}
+
+/// Which Undo-Send window a room created with `room_type` holds a send for
+/// (Story 101.3, R418): an agent's session room is an agent room, every
+/// other room a chat (a control room has no composer).
+pub(crate) fn undo_room_of(
+    room_type: Option<&matrix_sdk::ruma::room::RoomType>,
+) -> registry::UndoRoom {
+    match AgentRoomKind::of(room_type) {
+        Some(AgentRoomKind::Session) => registry::UndoRoom::Agent,
+        _ => registry::UndoRoom::Chat,
+    }
+}
+
+/// The questions waiting for this person that are answered in `room_id`
+/// (Story 101.3, R430, R431), oldest first.
+///
+/// `room_id` must be one of the person's proxy rooms ([`proxy::admits`]);
+/// any other room answers none. Every other agent session room this account
+/// reads is read back to [`agent_waiting::ASK_READ_BACK`] events and folded
+/// ([`agent_waiting::fold`]); an ask is here when the host puts it to the
+/// person here ([`agent_waiting::answered_in`] over the proxy's rooms this
+/// account reads). Each carries where its answer stands
+/// ([`agent_waiting::answer_state`]) by the person's messages here: those in
+/// the timeline, those in the send queue that did not fail, and those held
+/// for Undo-Send. A room that could not be read, an ask that could not be
+/// placed, or a held/queued send that could not be read is logged at WARN
+/// and said beside the panel ([`agent_waiting::ASKS_PARTIAL`], R381).
+async fn read_agent_asks(
+    client: &Client,
+    data_dir: &Path,
+    account_id: &str,
+    room_id: &RoomId,
+    kinds: &AgentKinds,
+    proxies: &AgentProxies,
+) -> Result<agent_waiting::AgentAsksVm, CoreError> {
+    let here = client
+        .get_room(room_id)
+        .ok_or(TimelineError::RoomNotFound)?;
+    if AgentRoomKind::of(here.room_type().as_ref()) != Some(AgentRoomKind::Session) {
+        return Ok(agent_waiting::AgentAsksVm::default());
+    }
+    let Ok((_, proxy)) = admit_proxy_room(&here, kinds, proxies).await else {
+        return Ok(agent_waiting::AgentAsksVm::default());
+    };
+    let me = here.own_user_id().to_owned();
+    let known = known_proxies(client, proxies).await;
+    let mut own: HashMap<OwnedRoomId, SessionKind> = HashMap::new();
+    let mut others = Vec::new();
+    for room in client.joined_rooms() {
+        if AgentRoomKind::of(room.room_type().as_ref()) != Some(AgentRoomKind::Session) {
+            continue;
+        }
+        let row = proxy_row(room.clone(), kinds).await;
+        match proxy::admits(&row, &me, &known) {
+            Ok(admitted) if admitted.agent == &*proxy => {
+                own.insert(room.room_id().to_owned(), admitted.kind);
+            }
+            _ => others.push((room, row.kind)),
+        }
+    }
+    let main = own
+        .iter()
+        .find(|(_, kind)| **kind == SessionKind::Main)
+        .map(|(room, _)| room.clone());
+    let mut partial = false;
+    let mut waiting = Vec::new();
+    for (room, kind) in others {
+        let (seen, whole) = match agent_waiting::read_room(&room).await {
+            Ok(read) => read,
+            Err(error) => {
+                tracing::warn!(room = %room.room_id(), %error, "agents: a room's asks could not be read");
+                partial = true;
+                continue;
+            }
+        };
+        let levels = match room.power_levels().await {
+            Ok(levels) => levels,
+            Err(error) => {
+                tracing::warn!(room = %room.room_id(), %error, "agents: a room's power levels could not be read for its asks");
+                partial = true;
+                continue;
+            }
+        };
+        let agent =
+            |user: &matrix_sdk::ruma::UserId| agent_room::holds_agent_power(Some(&levels), user);
+        let asks = agent_waiting::fold(seen, &me, &proxy, &agent);
+        if asks.waiting.is_empty() {
+            continue;
+        }
+        let proxy_kind = |room: &RoomId| own.get(room).copied();
+        match agent_waiting::answered_in(kind, &asks, whole, &proxy_kind, main.as_deref()) {
+            Some(target) if &*target == room_id => {
+                waiting.extend(asks.waiting.into_iter().map(|ask| (ask, room.clone())));
+            }
+            Some(_) => {}
+            None => {
+                tracing::warn!(room = %room.room_id(), "agents: a room's asks could not be placed");
+                partial = true;
+            }
+        }
+    }
+    let mut asks = Vec::new();
+    if !waiting.is_empty() {
+        let (mine, read_whole) = mine_in(&here, &me, data_dir, account_id).await;
+        partial |= !read_whole;
+        for (ask, room) in waiting {
+            let asked_by = room
+                .get_member_no_sync(&ask.asker)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|member| member.display_name().map(str::to_owned))
+                .unwrap_or_else(|| ask.asker.localpart().to_owned());
+            let state = agent_waiting::answer_state(&ask, &mine);
+            asks.push(agent_waiting::AgentAskVm {
+                id: ask.ask.id,
+                room_id: room.room_id().to_string(),
+                asked_by,
+                question: ask.ask.question,
+                choices: ask.ask.choices,
+                default: ask.ask.default,
+                asked_at: ask.at,
+                state,
+            });
+        }
+        asks.sort_by_key(|ask| ask.asked_at);
+    }
+    Ok(agent_waiting::AgentAsksVm {
+        asks,
+        note: partial.then(|| agent_waiting::ASKS_PARTIAL.to_owned()),
+    })
+}
+
+/// The person's own text messages in `room` as [`agent_waiting::answer_state`]
+/// reads them, and whether every source was read: the room's events (read
+/// back as an ask's room is), the send queue's local echoes that have not
+/// failed, and the sends held for Undo-Send. A source that cannot be read is
+/// logged at WARN and left out.
+async fn mine_in(
+    room: &Room,
+    me: &matrix_sdk::ruma::UserId,
+    data_dir: &Path,
+    account_id: &str,
+) -> (Vec<agent_waiting::Mine>, bool) {
+    let text = |content: &serde_json::Value| {
+        (content["msgtype"] == "m.text" && content["m.relates_to"]["rel_type"] != "m.replace")
+            .then(|| content["body"].as_str().map(str::to_owned))
+            .flatten()
+    };
+    let mut mine = Vec::new();
+    let mut whole = true;
+    match agent_waiting::read_room(room).await {
+        Ok((seen, _)) => mine.extend(seen.iter().filter_map(|seen| {
+            let event = &seen.value;
+            (event["type"] == "m.room.message" && event["sender"] == me.as_str()).then_some(())?;
+            Some(agent_waiting::Mine {
+                body: text(&event["content"])?,
+                at: event["origin_server_ts"].as_u64()?,
+                held: false,
+            })
+        })),
+        Err(error) => {
+            tracing::warn!(room = %room.room_id(), %error, "agents: the person's answers could not be read");
+            whole = false;
+        }
+    }
+    match room.send_queue().subscribe().await {
+        Ok((echoes, _)) => mine.extend(echoes.iter().filter_map(|echo| {
+            let matrix_sdk::send_queue::LocalEchoContent::Event {
+                serialized_event,
+                send_handle,
+                send_error: None,
+                ..
+            } = &echo.content
+            else {
+                return None;
+            };
+            let (raw, event_type) = serialized_event.raw();
+            (event_type == "m.room.message").then_some(())?;
+            // Dated by when it was queued: written before the ask, it answers
+            // nothing however long it waits (R447).
+            Some(agent_waiting::Mine {
+                body: text(&raw.deserialize_as::<serde_json::Value>().ok()?)?,
+                at: u64::from(send_handle.created_at.0),
+                held: false,
+            })
+        })),
+        Err(error) => {
+            tracing::warn!(room = %room.room_id(), %error, "agents: the send queue could not be read for the person's answers");
+            whole = false;
+        }
+    }
+    match registry::list_outbox_rows_for_account(data_dir, account_id) {
+        Ok(rows) => mine.extend(
+            rows.into_iter()
+                .filter(|row| {
+                    row.room_id == room.room_id().as_str() && row.kind == MessageKind::Text
+                })
+                .filter_map(|row| {
+                    Some(agent_waiting::Mine {
+                        at: u64::try_from(row.held_at_ts).ok()?,
+                        body: row.body,
+                        held: true,
+                    })
+                }),
+        ),
+        Err(error) => {
+            tracing::warn!(room = %room.room_id(), %error, "agents: the held sends could not be read for the person's answers");
+            whole = false;
+        }
+    }
+    (mine, whole)
 }
 
 /// What the dock and the surface handler read of a session room to decide
@@ -9571,6 +10321,22 @@ mod tests {
     /// `dispatch_at_ts ≈ now + window*1000` and NO dispatch occurs (proven by the
     /// non-live account NOT returning `NoOpenTimeline`: the code never touched the
     /// gate). The body is preserved verbatim for later dispatch/undo.
+    /// Story 101.3 (R418): an agent's session room is held for the agent
+    /// window; a chat, a space or a control room for the chats' window.
+    #[test]
+    fn only_a_session_room_is_held_for_the_agent_window() {
+        use matrix_sdk::ruma::room::RoomType;
+        let session = RoomType::from(crate::agents::events::SESSION_ROOM_TYPE);
+        let control = RoomType::from(crate::agents::events::CONTROL_ROOM_TYPE);
+        assert_eq!(undo_room_of(Some(&session)), registry::UndoRoom::Agent);
+        assert_eq!(undo_room_of(Some(&control)), registry::UndoRoom::Chat);
+        assert_eq!(
+            undo_room_of(Some(&RoomType::Space)),
+            registry::UndoRoom::Chat
+        );
+        assert_eq!(undo_room_of(None), registry::UndoRoom::Chat);
+    }
+
     #[tokio::test]
     async fn send_text_with_positive_window_holds_instead_of_dispatching() {
         let data_dir = outbox_test_dir("hold");
@@ -9708,7 +10474,7 @@ mod tests {
             .cancel_held_send(&platform, "acctA", "!room:example.org", &id)
             .await
             .expect("cancel");
-        assert_eq!(restored, "undo me", "cancel returns the held body");
+        assert_eq!(restored.line, "undo me", "cancel returns the held body");
         assert!(
             registry::list_outbox_rows_for_account(&data_dir, "acctA")
                 .expect("list after cancel")
@@ -9726,8 +10492,91 @@ mod tests {
             .cancel_held_send(&platform, "acctA", "!room:example.org", &id)
             .await
             .expect("idempotent cancel");
-        assert_eq!(again, "", "cancel of an absent row returns empty");
+        assert_eq!(again.line, "", "cancel of an absent row returns empty");
 
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// Story 101.3 (R432): with a positive window an attachment is held like
+    /// text — its bytes staged, its caption the held body, nothing sent (a
+    /// non-live account would refuse a dispatch) — and Undo hands back both.
+    #[tokio::test]
+    async fn an_attachment_waits_for_the_window_and_comes_back_whole_on_undo() {
+        let data_dir = outbox_test_dir("attachment-hold");
+        let platform: Arc<dyn Platform> = Arc::new(FakePlatform::new(data_dir.clone()));
+        registry::set_undo_send_window(&data_dir, 5).expect("set window 5");
+        let manager = AccountManager::new(&FakePlatform::new(data_dir.clone()), &data_dir);
+        let room = "!room:example.org";
+        manager
+            .send_attachment_bytes(
+                &platform,
+                "acctA",
+                room,
+                b"PNG bytes".to_vec(),
+                "../photo.png",
+                "image/png",
+                Some("the view"),
+            )
+            .await
+            .expect("held, not dispatched");
+        let rows = registry::list_outbox_rows_for_account(&data_dir, "acctA").expect("list");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].body, "the view");
+        let file = rows[0].attachment.clone().expect("held attachment");
+        assert_eq!(file.filename, "photo.png");
+        assert_eq!(file.mime, "image/png");
+        assert_eq!(std::fs::read(&file.path).expect("staged"), b"PNG bytes");
+        let held = outbox_snapshot(&data_dir, "acctA", room).rows;
+        assert_eq!(held[0].filename.as_deref(), Some("photo.png"));
+
+        let restored = manager
+            .cancel_held_send(&platform, "acctA", room, &rows[0].id)
+            .await
+            .expect("cancel");
+        assert_eq!(restored.line, "the view");
+        let back = restored.attachment.expect("the file comes back");
+        assert_eq!(back.path, file.path);
+        assert_eq!(
+            std::fs::read(&back.path).expect("still staged"),
+            b"PNG bytes"
+        );
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// R447 (R101C2-06): an undone reply comes back a reply — to the event it
+    /// named, with the sender and body kept when it was held — even when no
+    /// open timeline shows the original (here, none can open at all).
+    #[tokio::test]
+    async fn an_undone_reply_keeps_its_original_when_the_timeline_does_not_show_it() {
+        let data_dir = outbox_test_dir("undo-reply-unloaded");
+        let platform: Arc<dyn Platform> = Arc::new(FakePlatform::new(data_dir.clone()));
+        let manager = AccountManager::new(&FakePlatform::new(data_dir.clone()), &data_dir);
+        let room = "!room:example.org";
+        let mut row = AccountManager::held_row("acctA", room, "Tatry first", 30);
+        row.reply_to = Some(registry::HeldReply {
+            event_id: "$original:example.org".to_owned(),
+            sender: "@tola:example.org".to_owned(),
+            sender_display_name: Some("Tola".to_owned()),
+            body: "Which trip first?".to_owned(),
+        });
+        registry::insert_held(&data_dir, &row).expect("hold the reply");
+
+        let restored = manager
+            .cancel_held_send(&platform, "acctA", room, &row.id)
+            .await
+            .expect("cancel");
+        assert_eq!(restored.line, "Tatry first");
+        assert_eq!(
+            restored.reply,
+            Some(crate::vm::HeldReplyVm {
+                event_id: "$original:example.org".to_owned(),
+                key: None,
+                sender: "@tola:example.org".to_owned(),
+                sender_display_name: Some("Tola".to_owned()),
+                body: "Which trip first?".to_owned(),
+            }),
+            "the restored draft still names the message it answers"
+        );
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 
@@ -9765,7 +10614,7 @@ mod tests {
                 .cancel_held_send(&platform, "acctA", room, &rows[0].id)
                 .await
                 .expect("cancel");
-            assert_eq!(restored, line, "undo restores exactly what was typed");
+            assert_eq!(restored.line, line, "undo restores exactly what was typed");
             assert_eq!(
                 registry::get_draft(&data_dir, "acctA", room).expect("get draft"),
                 Some(line.to_owned())

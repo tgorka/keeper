@@ -42,7 +42,7 @@ interface UndoSendPillProps {
  */
 export function UndoSendPill({ accountId, roomId, scope }: UndoSendPillProps) {
   const held = useHeldSends(accountId, roomId);
-  const { composer } = useConversationStores();
+  const stores = useConversationStores();
   // One shared tick drives every pill's countdown so N pills don't run N intervals.
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
@@ -58,8 +58,8 @@ export function UndoSendPill({ accountId, roomId, scope }: UndoSendPillProps) {
     // already-dispatched row returns ""); it only restores on a non-empty body. This is
     // the same helper the timeline Delete affordance on a held bubble calls, so the two
     // cannot drift.
-    (id: string) => void undoHeldSend(accountId, roomId, id, composer),
-    [accountId, roomId, composer],
+    (id: string) => void undoHeldSend(accountId, roomId, id, stores),
+    [accountId, roomId, stores],
   );
 
   // `⌘⇧Z` undoes the OLDEST pending hold for this conversation. Held is oldest-first,

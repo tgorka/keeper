@@ -3157,6 +3157,40 @@ keeper shows an agent's room in its own timeline, on the Mac and on the iPhone a
   `//etc` or any other line puts back exactly what you typed. `/leave` asks about the room you
   typed it in; switching rooms withdraws the question. If keeper cannot look the commands up,
   one line under the field says so and the line is not sent.
+- **A `/` in the middle of a message** (story 101.3, R418). After a space anywhere but the
+  message's start — never glued to a word, so `and/or` and a path stay text — `/` opens a short
+  menu of things that become words where you typed them: in an agent room `@tola-grey` for each
+  other agent this account knows (the agents of your agent rooms and those whose homes are on this
+  device, matched by id or a word of their name), a file from a drive on this device by its name —
+  any kind of file, found by a walk of each drive that looks at its first 5,000 entries and never
+  into hidden folders, or a note by a word of its title — inserted as `<drive>:<path>` (the
+  drive's name, or its id where the name is not one word naming one drive here; at most six), and
+  `/shrug`; in any other room `/shrug` alone. A drive searched in part is said under the menu. ↑/↓ move, Enter or Tab insert, Escape closes it for
+  that word; inserting replaces only the `/` word, and a message is never sent from this menu.
+  Which word it is and what it offers are Rust's (`keeper_core::chat::inline`).
+- **Decisions above the composer** (story 101.3, R430–R435). An approval this device may decide
+  (93.3's `canDecide`) waits in a panel above the room's composer with its whole action shown
+  above its options, as its card shows it — the tier, the sentence or the declassification and
+  who it reaches, the exact command, KVM inputs or arguments, and that a T4 decision cannot be
+  undone; an attached `run` offers its approve options once you show its full action there. A
+  question an agent asked you through your proxy waits where your proxy will take your answer: in
+  the conversation that handed the work on (a `/new` conversation, or the DM), else in your DM
+  with the proxy — the rule the proxy's host routes by. Its options are numbered, `1`–`9` pick one
+  whenever the focus is not in a field that holds text (an empty composer counts) and no input
+  method is composing, ↑/↓ move, Enter sends the highlighted one, Escape hides the panel to one
+  line. A pick alone never sends. An answer is your own message there — the choice's text, exactly
+  what typing it sends; while it waits for Undo-Send the question says so, Undo puts it back, and
+  it leaves when your proxy's sealed answer reaches the asking room. Keeper reads the agent rooms
+  you are in, each back to its last 300 events, so a question survives a restart; one asked in a
+  room you are not in shows only there, and the panel says when a room could not be read. The
+  timeline card keeps its buttons.
+- **Undo-Send per room kind** (story 101.3, R432). A message, reply or attachment you send to a
+  chat waits `undo_send.window` seconds (2 by default) before it leaves; one to one of your agents
+  waits `undo_send.agent_window` (0 by default: it leaves at once). Undo puts the text back, a reply
+  back to replying (to the same message, even one no longer loaded above), and an attachment back
+  in the tray — of the room it was sent in, even if you have opened another room since. An edit is sent at once, and so is what you
+  say aloud to an agent. Both windows are in Settings › Privacy; one keeper could not read or save
+  says so there.
 
 - **Your conversation, asked for (story 101.1, R416).** Only the proxy's host makes its DM
   (`keeper-agentd agents init` does it once); a room you made yourself would never count as it.
@@ -4164,7 +4198,10 @@ none — then `ask answered` and `run: running`, and a turn; a scheduled run's t
 the run would have. While a call of the asking round waits for a person, the answer is held with the
 session's other arrivals and its turn comes once that call has its result. While a scheduled run's
 ask waits, its card's later windows do not begin. Devices show the ask and the answer as plain text
-(an ask card is DW-534).
+(an ask card is DW-534); since story 101.3 the room the proxy's host puts a question to
+(`keeper_core::agents::ask::ask_target`) also draws it, unanswered, as a numbered panel above its
+composer (`agent_asks_subscribe`): choosing a choice sends it as the person's message there, which
+the proxy relays.
 
 ## Helpers and review layers
 

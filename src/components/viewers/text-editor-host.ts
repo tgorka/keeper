@@ -72,12 +72,14 @@
  * are already in the dependency tree via `@codemirror/lang-markdown`, so they
  * cost nothing and are used in preference wherever they apply.
  */
+
 import type { StreamParser } from "@codemirror/language";
 import type * as CodeMirrorState from "@codemirror/state";
 import type { Extension } from "@codemirror/state";
 import type * as CodeMirrorView from "@codemirror/view";
 import type { EditorView } from "@codemirror/view";
 import { logFailure } from "@/lib/failure";
+import { NO_TEXT_SUBSTITUTION_ATTRIBUTES } from "@/lib/text-entry";
 import type { FormatAction } from "../notes/editor/format-commands";
 
 /**
@@ -411,6 +413,8 @@ export async function mountTextEditor(options: TextEditorMountOptions): Promise<
       doc: options.content,
       extensions: [
         view.EditorView.lineWrapping,
+        // No capital or correction in a config file (Story 101.3).
+        view.EditorView.contentAttributes.of(NO_TEXT_SUBSTITUTION_ATTRIBUTES),
         // A gutter, unlike the note editor. A note is prose and a line number
         // beside a paragraph is noise; a config file is something people are
         // told about by line ("the error is on line 47"), and 45.4's parse-error

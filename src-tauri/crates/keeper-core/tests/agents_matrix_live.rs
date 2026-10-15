@@ -2071,3 +2071,172 @@ async fn an_unopened_rooms_row_follows_a_newer_status() {
         Some((SessionKind::Delegated, "test".to_owned()))
     );
 }
+
+/// Story 101.3 (R430, R431): a question for the person survives a restart of
+/// their device — the restored cache holds only the room's newest events, and
+/// the panel's reader reads the room back to the ask through the event cache
+/// — and the proxy's sealed answer, sent from its own device, ends the wait.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "live: Synapse on delectra"]
+async fn a_waiting_question_survives_a_restart_and_ends_on_the_proxys_answer() {
+    use keeper_core::agents::ask::{answer_content, ask_content, AskContent};
+    use keeper_core::agents::label::Label;
+    use keeper_core::agents::waiting::ASK_READ_BACK;
+
+    const ASK: &str = "01J8ASKAAAAAAAAAAAAAAAAAAA";
+    let smoke = Smoke::setup().await;
+    let root = TempDir::new();
+    let (tola, _) = smoke
+        .copy(
+            &root.path().join("tola"),
+            "nixi-paced",
+            "NIXI_PACED_PASSWORD",
+            "tola@smoke",
+        )
+        .await;
+    let (proxy, _) = smoke
+        .copy(
+            &root.path().join("nixi"),
+            "nixi-smoke",
+            "NIXI_SMOKE_PASSWORD",
+            "nixi@smoke",
+        )
+        .await;
+    let (person, _) = smoke
+        .copy(
+            &root.path().join("tgorka"),
+            "tgorka-smoke",
+            "TGORKA_SMOKE_PASSWORD",
+            "tgorka@smoke",
+        )
+        .await;
+    smoke.set_ratelimit(&smoke.user("nixi-paced"), 0, 0).await;
+    person
+        .client()
+        .event_cache()
+        .subscribe()
+        .expect("event cache");
+    let (me, via) = (smoke.user("tgorka-smoke"), smoke.user("nixi-smoke"));
+    let room = tola
+        .create_room(
+            RoomKind::Session(SessionKind::Delegated),
+            "tola 2026-10-15",
+            vec![me.clone(), via.clone()],
+            &[],
+        )
+        .await
+        .expect("create room");
+    sync_until(&person, || person.client().get_room(&room).is_some()).await;
+    person.join(&room).await.expect("join");
+    sync_until(&proxy, || proxy.client().get_room(&room).is_some()).await;
+    proxy.join(&room).await.expect("join");
+    tola.sync_once().await.expect("sync");
+
+    let ask = AskContent {
+        v: events::CONTENT_VERSION,
+        id: ASK.to_owned(),
+        question: "Which trip?".to_owned(),
+        choices: vec!["Tatry".to_owned(), "Bieszczady".to_owned()],
+        default: None,
+        to: me.clone(),
+        via: via.clone(),
+        label: Label::top(),
+    };
+    let asked = tola
+        .send(&room, "m.room.message", ask_content(&ask), None)
+        .await
+        .expect("ask");
+    // More than a restored cache holds, fewer than the panel reads back.
+    let fillers = usize::from(ASK_READ_BACK) / 3;
+    for n in 0..fillers {
+        tola.send(
+            &room,
+            "m.room.message",
+            json!({"msgtype": "m.text", "body": format!("working {n}")}),
+            None,
+        )
+        .await
+        .expect("filler");
+    }
+    let last = format!("working {}", fillers - 1);
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while !cached_events(&person, &room)
+        .await
+        .iter()
+        .any(|e| e["content"]["body"] == last.as_str())
+    {
+        assert!(Instant::now() < deadline, "the person never read the room");
+        person.sync_once().await.expect("sync");
+    }
+    let session = StoredSession::from_client(person.client())
+        .expect("session")
+        .to_json()
+        .expect("json");
+    drop(person);
+
+    let restored = AgentClient::open(
+        &smoke.homeserver,
+        &root.path().join("tgorka"),
+        "smoke-passphrase",
+    )
+    .await
+    .expect("reopen");
+    restored
+        .restore(StoredSession::from_json(&session).expect("session"))
+        .await
+        .expect("restore");
+    restored
+        .client()
+        .event_cache()
+        .subscribe()
+        .expect("event cache");
+    restored.sync_once().await.expect("sync");
+    let loaded = cached_events(&restored, &room).await;
+    assert!(
+        !loaded.iter().any(|e| e["event_id"] == asked.as_str()),
+        "the restored cache already held the ask ({} events): nothing to read back",
+        loaded.len()
+    );
+
+    let ids = waiting_ids(&restored, &room, &me, &via).await;
+    assert_eq!(ids, vec![ASK.to_owned()], "the question after a restart");
+
+    let answered = proxy
+        .send(&room, "m.room.message", answer_content("Tatry", ASK), None)
+        .await
+        .expect("answer");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !cached_events(&restored, &room)
+        .await
+        .iter()
+        .any(|e| e["event_id"] == answered.as_str())
+    {
+        assert!(Instant::now() < deadline, "the answer never arrived");
+        restored.sync_once().await.expect("sync");
+    }
+    let ids = waiting_ids(&restored, &room, &me, &via).await;
+    assert!(ids.is_empty(), "the proxy's answer ends the wait: {ids:?}");
+}
+
+/// The ids of the asks waiting for `me` through `via` in `room`, as the
+/// decisions panel's reader reads them: the room read back through its event
+/// cache, then folded.
+async fn waiting_ids(
+    client: &AgentClient,
+    room: &RoomId,
+    me: &OwnedUserId,
+    via: &OwnedUserId,
+) -> Vec<String> {
+    use keeper_core::agents::room::holds_agent_power;
+    use keeper_core::agents::waiting::{fold, read_room};
+    let room = client.client().get_room(room).expect("room");
+    let (seen, _) = read_room(&room).await.expect("read back");
+    let levels = room.power_levels().await.expect("power levels");
+    fold(seen, me, via, &|user| {
+        holds_agent_power(Some(&levels), user)
+    })
+    .waiting
+    .into_iter()
+    .map(|open| open.ask.id)
+    .collect()
+}

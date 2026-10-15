@@ -44,6 +44,7 @@
 
 import { logFailure } from "@/lib/failure";
 import { type NoteCsvVm, notesCsvRead, notesCsvSetCell } from "@/lib/ipc/client";
+import { withoutTextSubstitution } from "@/lib/text-entry";
 
 /** What a cell's editor is announced as, so the control has a name. */
 export const CSV_CELL_LABEL = "Edit cell";
@@ -238,6 +239,7 @@ function beginEdit(
   input.type = "text";
   input.className = "cm-csv-input";
   input.setAttribute("aria-label", CSV_CELL_LABEL);
+  withoutTextSubstitution(input);
   input.value = before;
   cell.replaceChildren(input);
   input.focus();

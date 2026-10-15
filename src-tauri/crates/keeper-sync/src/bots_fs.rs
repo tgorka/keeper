@@ -540,19 +540,69 @@ pub fn glob(
 
     let mut paths = Vec::new();
     let mut hits = 0usize;
-    let walk = walk(root, subpath, limits, &mut |candidate: &Candidate| {
-        // Matched against the path relative to the *searched* directory, so a
-        // pattern the model wrote is about the subtree it asked for and not
-        // about where that subtree happens to sit in the profile.
-        if matcher.is_match(&candidate.walk_relative) {
-            hits += 1;
-            if paths.len() < limits.max_paths {
-                paths.push(candidate.subpath.clone());
+    let walk = walk(
+        root,
+        subpath,
+        limits,
+        &|_| true,
+        &mut |candidate: &Candidate| {
+            // Matched against the path relative to the *searched* directory, so a
+            // pattern the model wrote is about the subtree it asked for and not
+            // about where that subtree happens to sit in the profile.
+            if matcher.is_match(&candidate.walk_relative) {
+                hits += 1;
+                if paths.len() < limits.max_paths {
+                    paths.push(candidate.subpath.clone());
+                }
             }
-        }
-        true
-    })?;
+            true
+        },
+    )?;
 
+    Ok(GlobResult {
+        truncated_at: (hits > paths.len()).then_some(paths.len()),
+        of_paths: hits,
+        paths,
+        walked: walk.walked,
+        walk_capped: walk.capped,
+    })
+}
+
+/// Files under `subpath` whose file name `matches` admits, bounded as
+/// [`glob`] is — at most [`Limits::max_paths`] kept, at most
+/// [`Limits::max_walk_entries`] looked at, no link followed — and never
+/// walking into a folder whose name `descend` refuses. The rules are the
+/// caller's: a mid-message file reference asks for the files a few typed
+/// letters name (keeper-core's `chat::inline`).
+pub fn find_names(
+    root: &Path,
+    subpath: &str,
+    limits: &Limits,
+    descend: &dyn Fn(&str) -> bool,
+    matches: &dyn Fn(&str) -> bool,
+) -> Result<GlobResult, FsRefusal> {
+    let mut paths = Vec::new();
+    let mut hits = 0usize;
+    let walk = walk(
+        root,
+        subpath,
+        limits,
+        descend,
+        &mut |candidate: &Candidate| {
+            let name = candidate
+                .subpath
+                .rsplit('/')
+                .next()
+                .unwrap_or(&candidate.subpath);
+            if !candidate.is_dir && matches(name) {
+                hits += 1;
+                if paths.len() < limits.max_paths {
+                    paths.push(candidate.subpath.clone());
+                }
+            }
+            true
+        },
+    )?;
     Ok(GlobResult {
         truncated_at: (hits > paths.len()).then_some(paths.len()),
         of_paths: hits,
@@ -617,44 +667,50 @@ pub fn grep(
     let mut files_searched = 0usize;
     let mut files_skipped = 0usize;
 
-    let walk = walk(root, subpath, limits, &mut |candidate: &Candidate| {
-        if candidate.is_dir {
-            return true;
-        }
-        let read = read(root, &candidate.subpath, LineRange::default(), limits);
-        let body = match read {
-            Ok(FileRead::Text { body, .. }) => body,
-            // A pointer holds no content to search, and materializing one to
-            // look would be the mass hydration epic 56 forbids.
-            Ok(FileRead::Pointer { .. }) | Err(_) => {
-                files_skipped += 1;
+    let walk = walk(
+        root,
+        subpath,
+        limits,
+        &|_| true,
+        &mut |candidate: &Candidate| {
+            if candidate.is_dir {
                 return true;
             }
-        };
-        files_searched += 1;
-        for (index, line) in body.lines().enumerate() {
-            let found = if case_sensitive {
-                line.contains(needle)
-            } else {
-                line.to_lowercase().contains(&folded_needle)
+            let read = read(root, &candidate.subpath, LineRange::default(), limits);
+            let body = match read {
+                Ok(FileRead::Text { body, .. }) => body,
+                // A pointer holds no content to search, and materializing one to
+                // look would be the mass hydration epic 56 forbids.
+                Ok(FileRead::Pointer { .. }) | Err(_) => {
+                    files_skipped += 1;
+                    return true;
+                }
             };
-            if !found {
-                continue;
+            files_searched += 1;
+            for (index, line) in body.lines().enumerate() {
+                let found = if case_sensitive {
+                    line.contains(needle)
+                } else {
+                    line.to_lowercase().contains(&folded_needle)
+                };
+                if !found {
+                    continue;
+                }
+                hits += 1;
+                if matches.len() >= limits.max_matches {
+                    continue;
+                }
+                let (text, line_truncated) = clip(line, limits.max_match_line_bytes);
+                matches.push(Match {
+                    subpath: candidate.subpath.clone(),
+                    line: index as u64 + 1,
+                    text,
+                    line_truncated,
+                });
             }
-            hits += 1;
-            if matches.len() >= limits.max_matches {
-                continue;
-            }
-            let (text, line_truncated) = clip(line, limits.max_match_line_bytes);
-            matches.push(Match {
-                subpath: candidate.subpath.clone(),
-                line: index as u64 + 1,
-                text,
-                line_truncated,
-            });
-        }
-        true
-    })?;
+            true
+        },
+    )?;
 
     Ok(GrepResult {
         truncated_at: (hits > matches.len()).then_some(matches.len()),
@@ -692,6 +748,7 @@ fn walk(
     root: &Path,
     subpath: &str,
     limits: &Limits,
+    descend: &dyn Fn(&str) -> bool,
     visit: &mut dyn FnMut(&Candidate) -> bool,
 ) -> Result<WalkReport, FsRefusal> {
     let start = resolve_existing(root, subpath)?;
@@ -740,7 +797,7 @@ fn walk(
             if !visit(&candidate) {
                 return Ok(WalkReport { walked, capped });
             }
-            if file_type.is_dir() {
+            if file_type.is_dir() && descend(&name) {
                 queue.push((dirent.path(), child_subpath, child_relative));
             }
         }

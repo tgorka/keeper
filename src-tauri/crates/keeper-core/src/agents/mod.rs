@@ -66,5 +66,6 @@ pub mod surface;
 pub mod tier;
 pub mod trust;
 pub mod unifiedpush;
+pub mod waiting;
 pub mod workflow;
 pub mod zone;

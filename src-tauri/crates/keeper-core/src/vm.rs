@@ -2697,6 +2697,52 @@ pub struct HeldSendVm {
     /// correct remaining time after a restart.
     #[ts(type = "number")]
     pub dispatch_at_ms: i64,
+    /// A held attachment's file name (Story 101.3, R432): the body is then
+    /// its caption, possibly empty.
+    pub filename: Option<String>,
+    /// Whether it is a reply (Story 101.3, R432).
+    pub reply: bool,
+}
+
+/// What Undo hands back to the composer for a held send (Stories 8.3, 101.3,
+/// R432, R447): the line exactly as typed, the message it replied to, and the
+/// staged file a held attachment carried.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct HeldRestoreVm {
+    pub line: String,
+    pub reply: Option<HeldReplyVm>,
+    pub attachment: Option<HeldFileVm>,
+}
+
+/// The message an undone reply answers (Story 101.3, R447). Its event id is
+/// what the restored reply names when it is sent again, so the draft stays a
+/// reply even when the original is outside the loaded timeline — the one
+/// event id this VM carries across IPC, scoped to that resend, as a search
+/// hit's is to its jump.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct HeldReplyVm {
+    pub event_id: String,
+    /// Its render key in the room's open timeline, when that shows it.
+    pub key: Option<String>,
+    /// Its sender's Matrix user id, empty when the timeline never showed it.
+    pub sender: String,
+    pub sender_display_name: Option<String>,
+    /// Its plain-text body as the timeline showed it, empty when it did not.
+    pub body: String,
+}
+
+/// A held attachment's file as Undo puts it back in the tray (Story 101.3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct HeldFileVm {
+    /// The staged copy keeper sends from.
+    pub path: String,
+    pub filename: String,
 }
 
 /// A full snapshot of the held sends streamed to the frontend for one open Chat
@@ -7479,6 +7525,102 @@ impl ChatCommandPreviewVm {
                 .map(|spec| ChatCommandRowVm::compose(spec, ctx))
                 .collect(),
             escape_hint: crate::bots::commands::ESCAPE_HINT.to_string(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Story 101.3 — a `/` in the middle of a message (R418)
+//
+// The whole-line menu's contract for the token at the caret: the webview asks
+// with the draft split at the caret and replaces the token Rust names with the
+// row's insert; which token it is and what it offers are Rust's.
+// ---------------------------------------------------------------------------
+
+/// What a mid-text menu row inserts (Story 101.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum ChatInlineKindVm {
+    /// Another agent, as `@<id>`.
+    Mention,
+    /// A drive file, by its path from the drive's root.
+    File,
+    /// `¯\_(ツ)_/¯`.
+    Shrug,
+}
+
+/// One row of the mid-text menu (Story 101.3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct ChatInlineRowVm {
+    pub kind: ChatInlineKindVm,
+    /// The row's identity, unique in one menu: a file's names its drive.
+    pub key: String,
+    /// What the row shows.
+    pub label: String,
+    /// Its one line of detail.
+    pub detail: String,
+    /// What replaces the token.
+    pub insert: String,
+}
+
+/// What a `/` at the caret offers mid-text (Story 101.3, R418).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct ChatInlinePreviewVm {
+    /// The draft before the caret, echoed: an answer for text the field no
+    /// longer holds is dropped.
+    pub before: String,
+    /// The draft after the caret, echoed for the same reason.
+    pub after: String,
+    /// The token the rows replace — the `/` and what follows it up to the
+    /// caret, the end of `before` — or `null` when the caret is at none.
+    pub token: Option<String>,
+    /// The rows, in order; empty means "draw no menu".
+    pub rows: Vec<ChatInlineRowVm>,
+    /// What the menu says beside its rows, when a drive was searched in
+    /// part.
+    pub note: Option<String>,
+}
+
+impl ChatInlinePreviewVm {
+    /// Find the token at the caret and project its rows in a room of `ctx`,
+    /// over `drives` — or none, `drives_unread`, when this device's drives
+    /// could not be read.
+    pub fn compose(
+        before: &str,
+        after: &str,
+        ctx: &crate::chat::inline::InlineContext,
+        drives: &[crate::chat::inline::InlineDrive<'_>],
+        drives_unread: bool,
+    ) -> Self {
+        use crate::chat::inline::{self, InlineKind};
+        let token = inline::token(before, after);
+        let rows = token
+            .map(|token| inline::menu(token, ctx, drives))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|item| ChatInlineRowVm {
+                kind: match item.kind {
+                    InlineKind::Mention => ChatInlineKindVm::Mention,
+                    InlineKind::File => ChatInlineKindVm::File,
+                    InlineKind::Shrug => ChatInlineKindVm::Shrug,
+                },
+                key: item.key,
+                label: item.label,
+                detail: item.detail,
+                insert: item.insert,
+            })
+            .collect();
+        ChatInlinePreviewVm {
+            before: before.to_owned(),
+            after: after.to_owned(),
+            token: token.map(str::to_owned),
+            rows,
+            note: token.and_then(|token| inline::files_note(token, ctx, drives, drives_unread)),
         }
     }
 }

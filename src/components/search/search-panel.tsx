@@ -38,6 +38,7 @@ import { useNetworksStore } from "@/lib/stores/networks";
 import { primaryViewStore } from "@/lib/stores/primary-view";
 import { roomsStore, useRoomsStore } from "@/lib/stores/rooms";
 import type { SearchScope } from "@/lib/stores/search";
+import { NO_TEXT_SUBSTITUTION } from "@/lib/text-entry";
 import { cn } from "@/lib/utils";
 
 /** Debounce (ms) before a keystroke fires `searchArchive`. */
@@ -354,6 +355,7 @@ export function SearchPanel({
       {/* Filter controls: sender field + Chat/Network/Account pickers. */}
       <div className="flex flex-wrap items-center gap-2">
         <input
+          {...NO_TEXT_SUBSTITUTION}
           type="text"
           list="search-sender-suggestions"
           placeholder="Sender (Matrix id)"
