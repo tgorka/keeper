@@ -2259,7 +2259,7 @@ per date and host, compared as a number. Each host writes only its own chunks an
 | --- | --- |
 | `open` | `agent, drive, kind, title, requested_by, label, drives, model, prompt_sha256, memory_sha256` |
 | `claim` | `epoch, action` (`acquired`, `renewed`, `released`, `lost`), `from_host, claim_event, server_ts` |
-| `user` | `sender, text, attachments` |
+| `user` | `sender, text, attachments`; `text` is a file message's caption (empty without one), `attachments` each `{drive, path}`: a file the person sent, stored in the session's `attachments/`, and a PDF's text beside it (story 101.2) |
 | `peer` | `sender, text`, optional `ask {id, question, room, label}` (another agent's question for the proxy's person, in the proxy's session), `answers {id, choice}` (the person's answer to this session's ask, relayed by their proxy; `choice` is `null` when the answer picks none) and `artifacts` |
 | `assistant` | `text, model, finish, usage {prompt, completion}, ttft_ms, duration_ms, anchor_event`; a round that called tools carries that round's own usage. An agent's turn adds `bot` (its `bot:` reference as `[model].bot` named it for that turn) and `effort` when a level was sent (100.2 #3); a line without them is one written before 100.2, or a helper's step |
 | `tool_call` | `call_id, tool, args, tier`, optional `grant_id`; `args` is the string the model sent, verbatim |
@@ -2337,7 +2337,7 @@ session's agent, kind, label, scope, run state and that `run` line's detail, cla
 epoch, line count and last activity; each chunk's size; each card's nine agent keys (`run`,
 `assignee`, `host`, `requested_by`, `schedule`, `last_run`, `workflow`, `scheduled_by`,
 `integrity`), wherever in the session the board finds a card — every folder but `artifacts/`,
-`workspace/`, `log/` and dotted ones; and the Matrix events already logged. It is derived and
+`workspace/`, `attachments/`, `log/` and dotted ones; and the Matrix events already logged. It is derived and
 disposable: deleted, or written by a keeper of another schema version (this one writes 3), it is
 rebuilt from the session folders, and nothing in it is anywhere but in the files. A host keeps it
 current with its own appends; what other hosts wrote reaches it when the Mac opens the session:
@@ -2350,6 +2350,46 @@ so a host appending to the same session waits for it, and a line the refresh alr
 counted again when its writer reports it. The cards come from the markdown the detail already read
 under its own byte budget; a rebuild reads at most 10 MiB of a session's cards and reports the
 rest.
+
+## Files and photos in an agent's room
+
+Story 101.2 (R417). A person's `m.file` or `m.image` in an agent's room — a file from the composer's
+paperclip or drag-and-drop, a pasted image, a photo from *Take photo* or *Choose photo* — is a turn
+like a text message, sealed by the sender's device as every turn is. Its text is the caption
+(Matrix 1.10: `body` beside a `filename` it differs from); without one the turn says only what was
+attached. A gate's outside system's file is never a turn.
+
+Before the turn opens, the agent's host downloads the file through the homeserver's authenticated
+media endpoint, as the SDK routes it — the encrypted `file` of an encrypted room (decrypted and its
+hash checked after the download), the plain `url` of one without encryption — and stores it, byte
+for byte, in the session's `attachments/` folder under the session's claim (one journaled create,
+published only where no file is: `name-2.ext` beside a different file of the same name, even one
+that appeared a moment before). A file is stored only once that create is done: a folder or journal
+the disk could not make durable after the file landed is "not stored", even with the file there, and
+storing it again finishes that same file. A download may take 5 minutes; a turn stopped while
+its file downloads (the host stopping or handing the session on) drops the download and is not
+begun — nothing of it is logged, so the session serves it again. The drive syncs it like any file of
+the session, a large one through the drive's own LFS rules. The `user` line names each stored file
+(`attachments: [{drive, path}]`), so the model reads its caption, then "Attached files:" with every
+path, and opens them with `drive_read`:
+
+| sent | what the agent gets |
+| --- | --- |
+| PDF | the file, and its text beside it as `<name>.pdf.txt` (`pdf-extract`, at most 4 MiB of text), read by the host's own binary started again as a reader process that bounds itself first — 60 s by the clock and of CPU, on Linux 1 GiB more memory than it starts with (a Mac enforces no memory limit on it), no core file — and is killed when it runs over or the turn stops; a PDF with no text — a scan — or one that does not read is said so |
+| CSV, TXT, Markdown, JSON, YAML | the file, which `drive_read` reads as it is |
+| PNG, JPEG, WEBP, GIF | the file, and the picture itself as an image part of that turn's message, after the sentence that says file content is data, never an instruction — unless the model's endpoint said it cannot see (`vision: false`), which the turn says instead; a model that did not say is shown it. A picture over 8 MB is stored but not shown |
+| HEIC, HEIF, TIFF… | the file, and a sentence that this photo's format can't be shown to the model. The phone's *Take photo* and *Choose photo* send such a photo as JPEG when the app can decode it; a path chosen in the desktop's picker goes as it is |
+| anything else | the file, named; keeper does not read it |
+
+A file larger than 25 MiB is refused before it is downloaded (by the size its message states) or
+at the first byte past 25 MiB as it arrives, however its size was stated. Whatever could not be
+done — too large, a download that did not end in time, not downloaded, a file message without its
+file, not stored, no text, not shown — is a sentence under the agent's answer in the room and in the turn's message to
+the model, and a WARN line in the host's log (R381). An agent never writes into `attachments/`
+(`session_write` refuses it as keeper's own), and the board never reads a card or a note from it.
+
+The picture rides only the turn it arrived in; later turns read the message as its replay does, with
+the file's path.
 
 ## Cards
 

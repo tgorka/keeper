@@ -589,21 +589,18 @@ impl AgentClient {
             .map_err(|err| AgentMatrixError::Other(format!("could not encode the file: {err}")))
     }
 
-    /// The bytes of the encrypted file `file` ([`Self::upload_encrypted`]'s
-    /// `EncryptedFile`), downloaded and decrypted, never cached.
-    pub async fn download_encrypted(&self, file: &Value) -> Result<Vec<u8>, AgentMatrixError> {
-        let file: matrix_sdk::ruma::events::room::EncryptedFile =
-            serde_json::from_value(file.clone())
-                .map_err(|err| AgentMatrixError::Other(format!("not an encrypted file: {err}")))?;
-        let request = matrix_sdk::media::MediaRequestParameters {
-            source: matrix_sdk::ruma::events::room::MediaSource::Encrypted(Box::new(file)),
-            format: matrix_sdk::media::MediaFormat::File,
-        };
-        self.client
-            .media()
-            .get_media_content(&request, false)
-            .await
-            .map_err(from_sdk)
+    /// The bytes of the media `source` names, at most `max` of them,
+    /// downloaded (and decrypted, its hash checked), never cached: an
+    /// encrypted file's object (a message's `file`), or a plain `mxc://`
+    /// URI string (a message's `url`, sent into a room without encryption
+    /// — story 101.2). [`crate::media::download_file`]: a body running past
+    /// `max` is refused at that byte (R444/01).
+    pub async fn download_media(
+        &self,
+        source: &Value,
+        max: u64,
+    ) -> Result<Vec<u8>, crate::media::Download> {
+        crate::media::download_file(&self.client, source, max).await
     }
 
     /// What `user`'s homeserver publishes now of their `device` and their

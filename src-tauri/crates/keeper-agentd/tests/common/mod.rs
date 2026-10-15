@@ -322,6 +322,48 @@ pub fn calls_paced(
     Stub { url, requests }
 }
 
+/// A model whose every chat request is answered with what `decide` makes of
+/// its messages: one SSE frame (a call or prose).
+pub fn scripted(decide: fn(&[Value]) -> Value) -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let url = format!("http://{}", listener.local_addr().expect("addr"));
+    std::thread::spawn(move || {
+        for socket in listener.incoming() {
+            let Ok(mut socket) = socket else { continue };
+            std::thread::spawn(move || {
+                let mut reader = BufReader::new(socket.try_clone().expect("clone"));
+                let mut first = String::new();
+                let _ = reader.read_line(&mut first);
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).is_err() || line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                    if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = v.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut body = vec![0; length];
+                let _ = reader.read_exact(&mut body);
+                if !first.contains("/chat/completions") {
+                    let _ = write!(
+                        socket,
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    return;
+                }
+                let request: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                let messages = request["messages"].as_array().cloned().unwrap_or_default();
+                let frame = decide(&messages);
+                let _ = write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n");
+                let _ = write!(socket, "data: {frame}\n\ndata: [DONE]\n\n");
+            });
+        }
+    });
+    url
+}
+
 // ---------------------------------------------------------------------------
 // The drive and the host
 // ---------------------------------------------------------------------------

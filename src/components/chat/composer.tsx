@@ -33,8 +33,8 @@
  * round trip. Commands are off while editing (the text is that message's body)
  * and while attachments are pending (the text is their caption).
  */
-import { open } from "@tauri-apps/plugin-dialog";
-import { Paperclip, Plus, X } from "lucide-react";
+import { type DialogFilter, open } from "@tauri-apps/plugin-dialog";
+import { Camera, Image, Paperclip, Plus, X } from "lucide-react";
 import {
   type ClipboardEvent,
   type KeyboardEvent,
@@ -43,6 +43,7 @@ import {
   useRef,
   useState,
 } from "react";
+import { CameraSheet, photoFilename } from "@/components/chat/camera-sheet";
 import type { ChatCommandInvocation, ChatCommandOutcome } from "@/components/chat/chat-commands";
 import type { SlashRow } from "@/components/slash-menu/slash-menu";
 import { SlashHelp, SlashMenuList } from "@/components/slash-menu/slash-menu-list";
@@ -64,6 +65,7 @@ import {
   mirrorDraft,
   saveDraft,
 } from "@/lib/ipc/client";
+import { asShownPhoto } from "@/lib/shown-photo";
 import { attachmentId, type PendingAttachment } from "@/lib/stores/attachments";
 import type { PendingContext } from "@/lib/stores/composer";
 import {
@@ -245,6 +247,10 @@ export function Composer({
   // default wins). Everything is tier-gated on the shared layout hook — never
   // user-agent sniffing, never a forked composer.
   const { phone } = useShellLayout();
+  const [cameraOpen, setCameraOpen] = useState(false);
+  const [photoError, setPhotoError] = useState<string | null>(null);
+  const captureInput = useRef<HTMLInputElement>(null);
+  const photoInput = useRef<HTMLInputElement>(null);
   // The remote (cross-device) draft body currently offered as a local-wins conflict
   // chip (Story 7.2), or `null` when nothing is offered. Set when a differing remote
   // draft arrives against non-empty local text; cleared on adopt / when it stops
@@ -969,12 +975,12 @@ export function Composer({
   });
 
   /** Open the native file picker and add each chosen path to the tray. */
-  async function pickFiles() {
+  async function pickFiles(filters?: DialogFilter[]) {
     if (!attachEnabled) {
       return;
     }
     try {
-      const selection = await open({ multiple: true });
+      const selection = await open({ multiple: true, filters });
       if (selection == null) {
         // Dialog cancelled → no-op.
         return;
@@ -991,6 +997,29 @@ export function Composer({
     } catch (error) {
       // A dialog failure is non-fatal — the user can retry once told.
       sayFailure("composer.pickFiles", "keeper couldn't open the file picker.")(error);
+    }
+  }
+
+  async function readPhotos(input: HTMLInputElement) {
+    const files = Array.from(input.files ?? []);
+    setPhotoError(null);
+    try {
+      for (const file of files) {
+        // A HEIC or other picture a model is not shown goes as JPEG when this
+        // webview can decode it, else as it is (R444/05).
+        const photo = await asShownPhoto(file, file.name || photoFilename());
+        tray.getState().add({
+          id: attachmentId(),
+          kind: "bytes",
+          ...photo,
+          size: photo.bytes.byteLength,
+        });
+      }
+    } catch (raw) {
+      logFailure("composer.photo")(raw);
+      setPhotoError("keeper couldn't read this photo. Choose it again to retry.");
+    } finally {
+      input.value = "";
     }
   }
 
@@ -1180,6 +1209,78 @@ export function Composer({
             </Button>
           </IconHint>
         )}
+        {attachEnabled && pending?.mode !== "edit" && (
+          <>
+            {(phone || typeof navigator.mediaDevices?.getUserMedia === "function") && (
+              <IconHint label="Take photo">
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  aria-label="Take photo"
+                  className={cn(phone && "size-11")}
+                  onClick={() => (phone ? captureInput.current?.click() : setCameraOpen(true))}
+                >
+                  <Camera aria-hidden="true" />
+                </Button>
+              </IconHint>
+            )}
+            <IconHint label="Choose photo">
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon"
+                aria-label="Choose photo"
+                className={cn(phone && "size-11")}
+                onClick={() =>
+                  phone
+                    ? photoInput.current?.click()
+                    : // A path the host sends as it is: a HEIC chosen here
+                      // reaches the agent with its host's note that its
+                      // format can't be shown to the model (R444/05).
+                      void pickFiles([
+                        {
+                          name: "Images",
+                          extensions: ["png", "jpg", "jpeg", "webp", "gif", "heic"],
+                        },
+                      ])
+                }
+              >
+                <Image aria-hidden="true" />
+              </Button>
+            </IconHint>
+            {phone && (
+              <>
+                <input
+                  ref={captureInput}
+                  type="file"
+                  accept="image/*"
+                  capture="environment"
+                  aria-label="Take a photo file"
+                  hidden
+                  onChange={(event) => void readPhotos(event.currentTarget)}
+                />
+                <input
+                  ref={photoInput}
+                  type="file"
+                  accept="image/*"
+                  multiple
+                  aria-label="Choose photo files"
+                  hidden
+                  onChange={(event) => void readPhotos(event.currentTarget)}
+                />
+              </>
+            )}
+            {cameraOpen && !phone && (
+              <CameraSheet
+                onClose={() => setCameraOpen(false)}
+                onPhoto={(photo) =>
+                  tray.getState().add({ id: attachmentId(), kind: "bytes", ...photo })
+                }
+              />
+            )}
+          </>
+        )}
         <Textarea
           ref={textareaRef}
           aria-label="Message"
@@ -1230,7 +1331,7 @@ export function Composer({
           // violet with the reserved `--incognito` token, overriding the base
           // ring/border color.
           className={cn(
-            "min-h-9 resize-none",
+            "min-h-9 min-w-0 flex-1 resize-none",
             phone ? "max-h-[calc(5*1.5rem+1rem)]" : "max-h-[calc(8*1.5rem+1rem)]",
             incognitoEffective && "focus-visible:border-incognito focus-visible:ring-incognito/50",
           )}
@@ -1249,6 +1350,11 @@ export function Composer({
           {pending?.mode === "edit" ? "Save" : "Send"}
         </Button>
       </div>
+      {photoError !== null && (
+        <p role="alert" className="text-destructive text-xs">
+          {photoError}
+        </p>
+      )}
       {unsavedDraft === `${accountId}\u0000${roomId}` && (
         <p role="alert" className="text-destructive text-xs">
           {DRAFT_NOT_SAVED}

@@ -51,9 +51,9 @@ use keeper_core::agents::label::{
 use keeper_core::agents::log::reader::{hydrate_blob, read_session};
 use keeper_core::agents::log::replay::{message_for, HelperSteps, ReplayRefusal};
 use keeper_core::agents::log::{
-    ApprovalBody, ApprovalState, AskBody, AskState, AssistantBody, ChildSession, DelegateBody,
-    DelegateReply, DelegateState, ErrorBody, HostSlug, LineBody, LogLine, MemoryBody, MemoryOp,
-    OpenBody, PeerAnswer, PeerAsk, PeerBody, RunBody, ScopeBody, ToldBody, ToolCallBody,
+    ApprovalBody, ApprovalState, AskBody, AskState, AssistantBody, Attachment, ChildSession,
+    DelegateBody, DelegateReply, DelegateState, ErrorBody, HostSlug, LineBody, LogLine, MemoryBody,
+    MemoryOp, OpenBody, PeerAnswer, PeerAsk, PeerBody, RunBody, ScopeBody, ToldBody, ToolCallBody,
     ToolOutcomeWord, ToolResultBody, Truncated, Usage, UserBody, NARROWER_THAN_ROOM, WITHHELD_CODE,
 };
 use keeper_core::agents::matrix::AgentMatrixError;
@@ -87,6 +87,7 @@ use ulid::Ulid;
 
 use crate::approvals::Parking;
 use crate::ask::{AskTools, OpenAsk, Relay};
+use crate::attachments;
 use crate::cards::{self, Begun, Scheduled};
 use crate::claims::Lease;
 use crate::delegate::{
@@ -103,7 +104,7 @@ use crate::matrix_sink::{
 use crate::ports::ProfileSource;
 use crate::rooms::{self, Arrival, BriefEvent, Disposition, Served};
 use crate::sessions::verbs::{self, CreateOutcome};
-use crate::sessions::write::session_write;
+use crate::sessions::write::{attachment_write, session_write};
 use crate::sinks::{
     room_audience, CallAudit, Gated, ProxyDoors, RoomGate, Sinks, Withheld, MEMBERS_UNREAD,
     NARROWED_STATUS,
@@ -1406,6 +1407,9 @@ pub struct AgentDeps {
     /// The tickets this agent's gate sessions hold open on this host, one
     /// count for all of its `[[gate]]`s (99.1 #6).
     pub gate_tickets: Arc<crate::gate::OpenTickets>,
+    /// The bounds a person's file is taken in under (R444): its download's
+    /// deadline and the PDF reader this host starts.
+    pub attachments: crate::attachments::Bounds,
 }
 
 impl AgentDeps {
@@ -4834,6 +4838,10 @@ pub enum ServeError {
     /// A harvest's room's members could not be read: it is handed again.
     #[error("the harvest room's members could not be read")]
     MembersUnread,
+    /// The turn was stopped while a person's file was taken in, before it
+    /// began: nothing of it was logged (R444/02).
+    #[error("the turn was stopped while its file was taken in; it was not begun")]
+    Stopped,
 }
 
 /// `<drive>/<path>` of each file a reply's content hands over.
@@ -5220,6 +5228,8 @@ impl ServedSession {
                     "agentd: a turn was answered"
                 ),
                 Ok(outcome) => tracing::debug!(%session, ?outcome, "agentd: an event"),
+                // Stopping is the host's own doing, already logged.
+                Err(ServeError::Stopped) => {}
                 Err(error) => {
                     tracing::error!(%session, %error, "agentd: a turn could not be served")
                 }
@@ -5481,6 +5491,7 @@ impl ServedSession {
             tools,
             None,
             None,
+            Vec::new(),
         )
         .await;
         let parent = ran.parent.or(Some(opened));
@@ -6151,7 +6162,10 @@ impl ServedSession {
         binding: &keeper_core::agents::paseo::Binding,
         completion: &str,
     ) -> Result<keeper_core::agents::log::PaseoBody, String> {
-        let bytes = port.download(&binding.file).await?;
+        let bytes = port
+            .download(&binding.file, crate::attachments::MAX_BYTES)
+            .await
+            .map_err(|refused| refused.to_string())?;
         keeper_core::agents::paseo::capture_of(&bytes, &binding.digest, completion)
             .ok_or_else(|| "the room's capture is not the one its message names".to_owned())
     }
@@ -7983,15 +7997,188 @@ impl ServedSession {
         }
     }
 
+    /// What the turn's user message gains of `intake` — pictures and notes
+    /// ([`attachments::shown`]) — for the model the agent's home names now,
+    /// asked once whether it can see when there is a picture; and the notes
+    /// the room reads under the answer. A note this adds is a WARN line
+    /// too, as the intake's own are (R381).
+    async fn shown(
+        deps: &AgentDeps,
+        intake: attachments::Intake,
+    ) -> (Vec<keeper_core::bots::chat::ContentPart>, Vec<String>) {
+        let current = current_model(deps).ok().flatten();
+        let deps = current.as_deref().unwrap_or(deps);
+        let model = &deps.bot.target;
+        let vision = if intake.pictures.is_empty() {
+            None
+        } else {
+            crate::turn::discovered_model(&deps.env, &deps.data_dir, &deps.bot, model)
+                .await
+                .and_then(|found| found.vision)
+        };
+        let said = intake.notes.len();
+        let (parts, notes) = attachments::shown(intake.pictures, intake.notes, vision, model);
+        for sentence in &notes[said..] {
+            tracing::warn!(agent = %deps.home.config.id, sentence, "agents: a photo a person sent was not shown to the model");
+        }
+        (parts, notes)
+    }
+
+    /// The file a person's message carries (story 101.2, R417), taken in
+    /// before its turn opens: downloaded through the room's port — refused
+    /// over [`attachments::MAX_BYTES`] by the size the message says, and by
+    /// the port at the first byte past it however the size was stated
+    /// (R444/01); the whole download bounded by the host's
+    /// `download_within` (R444/02) — and stored whole in the session's
+    /// `attachments/` under the session's claim, a PDF's text beside it,
+    /// read by the host's [`attachments::PdfReader`] (R444/03). The file is
+    /// the person's line's own, kept where that line is kept, so it is
+    /// written under the line's readers as the log is. What could not be
+    /// done is a note, and a WARN line (R381): a file message with no file
+    /// to fetch too (R444/06), and a photo in a format no model is shown
+    /// (R444/05). `None` when `stop` fired while the file was taken in: the
+    /// download is dropped and the turn is not begun. It is handed the
+    /// session's `path`, delegation `port` and writer `lease`, never the
+    /// session: the session's database connection is not `Sync`, so a
+    /// borrow of it may not live across the download's await.
+    async fn take_in(
+        deps: &AgentDeps,
+        arrived: &Arrived,
+        path: &str,
+        port: Option<Arc<dyn DelegationPort>>,
+        lease: Option<Arc<Lease>>,
+        stop: &CancelSignal,
+    ) -> Option<attachments::Intake> {
+        let mut intake = attachments::Intake::default();
+        if arrived.arrival != Arrival::Text || !attachments::is_attachment(&arrived.content) {
+            return Some(intake);
+        }
+        let sent = attachments::sent_of(&arrived.content);
+        let note = |intake: &mut attachments::Intake, sentence: String| {
+            tracing::warn!(session = %path, event = %arrived.event_id, sentence, "agents: a file a person sent did not wholly reach the agent");
+            intake.notes.push(sentence);
+        };
+        let Some(source) = &sent.source else {
+            note(&mut intake, attachments::no_source(&sent.name));
+            return Some(intake);
+        };
+        if let Some(size) = sent.declared.filter(|size| *size > attachments::MAX_BYTES) {
+            note(&mut intake, attachments::too_large(&sent.name, size));
+            return Some(intake);
+        }
+        let Some(port) = port else {
+            note(&mut intake, attachments::no_download(&sent.name));
+            return Some(intake);
+        };
+        let within = deps.attachments.download_within;
+        let mut stopped = stop.clone();
+        let fetched = tokio::select! {
+            biased;
+            () = stopped.cancelled() => {
+                tracing::info!(session = %path, event = %arrived.event_id, "agents: a turn stopped while its file downloaded; it was not begun");
+                return None;
+            }
+            fetched = tokio::time::timeout(within, port.download(source, attachments::MAX_BYTES)) => fetched,
+        };
+        let bytes = match fetched {
+            Ok(Ok(bytes)) => bytes,
+            Ok(Err(keeper_core::media::Download::TooLarge(read))) => {
+                note(&mut intake, attachments::too_large(&sent.name, read));
+                return Some(intake);
+            }
+            Ok(Err(keeper_core::media::Download::Failed(error))) => {
+                tracing::warn!(session = %path, %error, "agents: a person's file could not be downloaded");
+                note(&mut intake, attachments::not_downloaded(&sent.name));
+                return Some(intake);
+            }
+            Err(_) => {
+                note(
+                    &mut intake,
+                    attachments::download_timed_out(&sent.name, within),
+                );
+                return Some(intake);
+            }
+        };
+        let may_write = move || lease.as_ref().is_none_or(|lease| lease.may_write());
+        let store = |name: &str, bytes: &[u8]| {
+            off_the_runtime(|| attachment_write(&deps.sessions_zone, path, name, bytes, &may_write))
+                .map(|landed| {
+                    (
+                        format!("{}/{path}/{landed}", deps.sessions_subfolder),
+                        landed,
+                    )
+                })
+                .map_err(|error| error.to_string())
+        };
+        let landed = match store(&sent.name, &bytes) {
+            Ok((in_drive, landed)) => {
+                intake.stored.push(in_drive);
+                landed
+            }
+            Err(why) => {
+                note(&mut intake, attachments::not_stored(&sent.name, &why));
+                return Some(intake);
+            }
+        };
+        let stored_name = landed.rsplit('/').next().unwrap_or(&landed).to_owned();
+        match attachments::kind_of(&sent.mime, &sent.name) {
+            attachments::Kind::Image => intake.pictures.push(attachments::Picture {
+                name: stored_name,
+                mime: sent.mime,
+                bytes,
+            }),
+            attachments::Kind::Unshown(format) => {
+                note(
+                    &mut intake,
+                    attachments::format_not_shown(&stored_name, &format),
+                );
+            }
+            attachments::Kind::Pdf => {
+                let Some(reader) = deps.attachments.pdf.as_deref() else {
+                    note(&mut intake, attachments::no_pdf_reader(&stored_name));
+                    return Some(intake);
+                };
+                match reader.read(bytes, stop).await? {
+                    attachments::PdfText::Text(text) => {
+                        match store(&attachments::text_name(&stored_name), text.as_bytes()) {
+                            Ok((in_drive, _)) => intake.stored.push(in_drive),
+                            Err(why) => {
+                                note(
+                                    &mut intake,
+                                    attachments::text_not_stored(&stored_name, &why),
+                                );
+                            }
+                        }
+                    }
+                    attachments::PdfText::NoText => {
+                        note(&mut intake, attachments::no_text(&stored_name));
+                    }
+                    attachments::PdfText::Unreadable(why) => {
+                        tracing::warn!(session = %path, %why, "agents: a person's PDF did not read");
+                        note(&mut intake, attachments::pdf_unreadable(&stored_name));
+                    }
+                }
+            }
+            attachments::Kind::Text | attachments::Kind::Other => {}
+        }
+        Some(intake)
+    }
+
     /// The lines that open a turn, and the one its answer answers: for a
-    /// person's message, its label join and a `user` line; for a brief, the
-    /// session's `delegate accepted` (once), the delegation's label and a
-    /// `peer` line; for a delegation's reply, the `peer` line its receipt
+    /// person's message, its label join and a `user` line naming the files
+    /// it carried, `stored` (drive-relative in the home drive); for a brief,
+    /// the session's `delegate accepted` (once), the delegation's label and
+    /// a `peer` line; for a delegation's reply, the `peer` line its receipt
     /// stands for ([`Self::peer_the_reply`]); for another agent's ask in a
     /// proxy's DM, the asking session's label and a `peer` line carrying
     /// the ask (S-09); for the answer to this session's ask, a `peer` line
     /// naming it, then `ask answered`.
-    fn open_turn(&mut self, deps: &AgentDeps, arrived: &Arrived) -> Result<LogLine, ServeError> {
+    fn open_turn(
+        &mut self,
+        deps: &AgentDeps,
+        arrived: &Arrived,
+        stored: &[String],
+    ) -> Result<LogLine, ServeError> {
         if arrived.arrival == Arrival::Replied {
             return self.peer_the_reply()?.ok_or(ServeError::NoReceipt);
         }
@@ -8201,7 +8388,13 @@ impl ServedSession {
                     LineBody::User(UserBody {
                         sender: arrived.sender.clone(),
                         text: arrived.text.clone(),
-                        attachments: Vec::new(),
+                        attachments: stored
+                            .iter()
+                            .map(|path| Attachment {
+                                drive: deps.home.drive.id.clone(),
+                                path: path.clone(),
+                            })
+                            .collect(),
                     }),
                 )
             }
@@ -8267,9 +8460,31 @@ impl ServedSession {
     ) -> Result<TurnReport, ServeError> {
         let label_before = self.context.label.clone();
         let sinks = self.sinks(deps);
+        // A person's file (R417): what the model is shown with their
+        // message, and what the room is told could not be done.
+        let mut with_message = Vec::new();
+        let mut notes = Vec::new();
         let (user_id, question, received_at, harvest, resume) = match opening {
             Opening::Arrived(arrived) => {
-                let user = self.open_turn(deps, &arrived)?;
+                // A turn stopped while its file was taken in is not begun:
+                // nothing of it is logged, so the arrival is served again
+                // wherever the session is served next (R444/02).
+                let Some(intake) = Self::take_in(
+                    deps,
+                    &arrived,
+                    &self.context.session.path,
+                    self.delegations.clone(),
+                    self.writer.lease(),
+                    &stop,
+                )
+                .await
+                else {
+                    return Err(ServeError::Stopped);
+                };
+                let user = self.open_turn(deps, &arrived, &intake.stored)?;
+                if !intake.pictures.is_empty() || !intake.notes.is_empty() {
+                    (with_message, notes) = Self::shown(deps, intake).await;
+                }
                 // A harvest's anchor names its arrival, the closed session:
                 // each attempt asks the room as it is then, and a room its
                 // label no longer reaches hears only that a harvest ran
@@ -8349,6 +8564,7 @@ impl ServedSession {
             tools,
             resume,
             None,
+            with_message,
         )
         .await;
         let stream_end = Instant::now();
@@ -8402,6 +8618,11 @@ impl ServedSession {
                 (join_note(&visible, &note), shown.clone())
             }
         };
+        // What could not be done with a person's file is said under the
+        // answer, where they look (R381).
+        let final_text = notes
+            .iter()
+            .fold(final_text, |text, note| join_note(&text, note));
         // The room gets the log's redaction (S-17), and the artifact too, so
         // it equals the log's line.
         let final_text = redact_secrets(&final_text).text;
@@ -8708,6 +8929,7 @@ impl ServedSession {
                 marker: marker.id,
                 due,
             }),
+            Vec::new(),
         )
         .await;
         let mut parent = ran.parent.or(Some(marker.id));
@@ -9590,6 +9812,9 @@ impl ReviewPass {
 /// Run one turn of `context`'s agent: arm, compose, and drive the tool loop
 /// into `sink`, writing every round, call, result and label to the log. A
 /// review pass streams into no room and writes no `open` line.
+/// `with_message` rides this turn's own user message only — a person's
+/// photo and keeper's notes about their files (R417) — never the log, so a
+/// later turn reads that message as its replay does.
 #[allow(clippy::too_many_arguments)]
 async fn run_agent_turn(
     context: &mut SessionContext,
@@ -9601,6 +9826,7 @@ async fn run_agent_turn(
     tools: TurnTools,
     resume: Option<crate::approvals::Resume>,
     review: Option<ReviewPass>,
+    with_message: Vec<keeper_core::bots::chat::ContentPart>,
 ) -> Ran {
     let failed_as = |sent: Sent, error: String| Ran {
         sent,
@@ -9648,6 +9874,15 @@ async fn run_agent_turn(
         }
         None => config.allow.clone(),
     };
+    if let Some(said) = armed
+        .request
+        .messages
+        .iter_mut()
+        .rev()
+        .find(|message| message.role == Role::User)
+    {
+        said.content.extend(with_message);
+    }
     let failed = |error: String| failed_as(sent.clone(), error);
 
     // What the prompt carries beyond the conversation — the home's frozen

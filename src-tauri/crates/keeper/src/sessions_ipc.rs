@@ -471,7 +471,7 @@ fn exec_error(error: keeper_agent::sessions::exec::ExecError) -> IpcError {
         message: error.to_string(),
         account_id: None,
         // A refusal re-plans and may succeed; a disk failure is the OS's word.
-        retriable: matches!(error, ExecError::Refused(_)),
+        retriable: matches!(error, ExecError::Refused(_) | ExecError::Taken(_)),
     }
 }
 

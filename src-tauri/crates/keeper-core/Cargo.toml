@@ -21,6 +21,9 @@ thiserror = { workspace = true }
 # Homed here as the architectural owner (AD-6); not yet exercised in Story 1.1.
 matrix-sdk = { workspace = true }
 matrix-sdk-ui = { workspace = true }
+# `AttachmentDecryptor`: an agent's download of a person's encrypted file is
+# read through a bound, then decrypted and checked here (R444).
+matrix-sdk-crypto = { workspace = true }
 # The room's info observable, by name (`Room::subscribe_info`): an agent
 # room's timeline draws its briefs again when its members or power change
 # (R117). Already resolved in Cargo.lock via matrix-sdk; no new package.

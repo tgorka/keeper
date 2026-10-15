@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime};
 use keeper_agent::sessions::exec::{self, ExecError};
 use keeper_agent::sessions::scan;
 use keeper_agent::sessions::verbs::{self, CreateOutcome, CreateReq};
-use keeper_agent::sessions::write::session_write;
+use keeper_agent::sessions::write::{attachment_write, session_write};
 use keeper_core::sessions::model::SessionStatus;
 use keeper_core::sessions::plan::{compile_create, Plan, PlanStep};
 
@@ -413,11 +413,45 @@ fn session_write_refuses_log_approvals_and_keepers_files() {
         "notes.jsonl",
         "Workspace/x.md",
         "artifacts/../README.md",
+        "attachments/report.pdf.txt",
+        "Attachments/notes.md",
     ] {
         assert!(write(refused).is_err(), "{refused} was written");
     }
     assert!(!zone.path().join("active/s/log").exists());
     assert!(!zone.path().join("active/s/README.md").exists());
+}
+
+/// Story 101.2: a person's file lands in the session's `attachments/` as
+/// its exact bytes; the same file again is the same one (a turn run again),
+/// another file of that name takes the next free name and leaves the first
+/// as it was, and no claim writes nothing.
+#[test]
+fn a_persons_file_lands_whole_under_attachments_and_never_over_another() {
+    let zone = zone();
+    std::fs::create_dir_all(zone.path().join("active/s")).expect("session");
+    let pdf: &[u8] = b"%PDF-1.4\n\x00\xff\xfe binary";
+    let first =
+        attachment_write(zone.path(), "active/s", "report.pdf", pdf, &|| true).expect("stored");
+    assert_eq!(first, "attachments/report.pdf");
+    assert_eq!(
+        std::fs::read(zone.path().join("active/s/attachments/report.pdf")).expect("read"),
+        pdf
+    );
+    let again = attachment_write(zone.path(), "active/s", "report.pdf", pdf, &|| true)
+        .expect("the same file");
+    assert_eq!(again, first);
+    let other = attachment_write(zone.path(), "active/s", "report.pdf", b"other", &|| true)
+        .expect("stored beside");
+    assert_eq!(other, "attachments/report-2.pdf");
+    assert_eq!(
+        std::fs::read(zone.path().join("active/s/attachments/report.pdf")).expect("kept"),
+        pdf
+    );
+    let unclaimed = attachment_write(zone.path(), "active/s", "x.csv", b"a,b\n", &|| false)
+        .expect_err("no claim");
+    assert!(unclaimed.to_string().contains("claim"), "{unclaimed}");
+    assert!(!zone.path().join("active/s/attachments/x.csv").exists());
 }
 
 /// A write names a session that is there; it never makes one (a phantom the

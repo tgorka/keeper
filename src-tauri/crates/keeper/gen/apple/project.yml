@@ -96,6 +96,8 @@ targets:
         # bundle's, "on this Mac") over this file's output, and Info.ios.plist is the
         # only later step in that merge.
         NSMicrophoneUsageDescription: keeper listens through the microphone only while you talk to a model you configured — after you tap Talk or say your wake phrase — and turns your words into text on this phone. Nothing is recorded or uploaded.
+        # Epic 101, story 101.2: identical to Info.ios.plist's final-merge override.
+        NSCameraUsageDescription: keeper uses your camera only when you scan a setup code or take a photo for a chat on this phone. Setup scans stay local. A photo you take is sent only to the chat you send it in.
         NSSpeechRecognitionUsageDescription: keeper turns what you say into text on this phone, using on-device recognition only, so it can send your words to the model you chose. Your voice never leaves the device; keeper refuses server recognition.
         # Story 62.6 (the driving brief): a listening session ARMED in the foreground keeps
         # running when another app comes in front or the screen locks, because the audio

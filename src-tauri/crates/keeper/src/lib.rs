@@ -307,6 +307,14 @@ fn same_folder(a: &std::path::Path, b: &std::path::Path) -> bool {
 /// starts this binary as a filter, and a filter must not open a window.
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // A person's PDF sent to an agent served here is read by this binary
+    // started again as a worker under its own bounds, and nothing else
+    // (R444/03, `keeper_agent::attachments::PdfReader`).
+    #[cfg(desktop)]
+    if let Some(code) = keeper_agent::attachments::served_as_pdf_reader(std::env::args_os().skip(1))
+    {
+        std::process::exit(code);
+    }
     if served_as_lfs_filter() {
         return;
     }

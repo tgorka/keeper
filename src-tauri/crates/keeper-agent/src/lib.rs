@@ -57,6 +57,8 @@ pub mod approval;
 pub mod approvals;
 #[cfg(not(phone))]
 pub mod ask;
+#[cfg(not(phone))]
+pub mod attachments;
 #[cfg(all(unix, not(phone)))]
 pub mod avatar;
 pub mod bmad;

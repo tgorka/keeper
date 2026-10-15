@@ -3236,7 +3236,7 @@ mod tests {
             unreachable!("opening a run uploads nothing")
         }
 
-        fn download<'a>(&'a self, _file: &'a Value) -> crate::delegate::BytesFuture<'a> {
+        fn download<'a>(&'a self, _file: &'a Value, _max: u64) -> crate::delegate::BytesFuture<'a> {
             unreachable!("opening a run downloads nothing")
         }
 

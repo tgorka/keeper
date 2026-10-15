@@ -455,6 +455,7 @@ pub(crate) fn deps_over(
         mcp: None,
         kvm: None,
         gate_tickets: Default::default(),
+        attachments: crate::attachments::Bounds::this_host(),
     })
 }
 
@@ -1586,13 +1587,8 @@ impl DelegationPort for ClientRooms {
         })
     }
 
-    fn download<'a>(&'a self, file: &'a Value) -> crate::delegate::BytesFuture<'a> {
-        Box::pin(async move {
-            self.client
-                .download_encrypted(file)
-                .await
-                .map_err(|error| error.to_string())
-        })
+    fn download<'a>(&'a self, source: &'a Value, max: u64) -> crate::delegate::BytesFuture<'a> {
+        Box::pin(async move { self.client.download_media(source, max).await })
     }
 
     fn put_state<'a>(
@@ -2824,13 +2820,15 @@ pub struct GateDoor<'a> {
 }
 
 /// A decrypted timeline event as an [`Arrived`], or `None` for an event no
-/// session acts on (membership, state, reactions, attachments, notices).
+/// session acts on (membership, state, reactions, notices, audio, video).
 ///
-/// Text is a person's `m.text` only, and only when the sender's own device
-/// sealed it: a message in clear, or one whose sender does not match its
-/// Megolm session, is never a turn. In a gate's room (`gate`), its outside
-/// system's `m.notice` is text too, and so is its message in clear when the
-/// room is clear (Q9): a request, `untrusted` either way.
+/// Text is a person's `m.text`, or their `m.file` or `m.image` (story 101.2,
+/// R417) whose text is its caption ([`crate::attachments::caption_of`]),
+/// and only when the sender's own device sealed it: a message in clear, or
+/// one whose sender does not match its Megolm session, is never a turn. In
+/// a gate's room (`gate`), its outside system's `m.notice` is text too, and
+/// so is its message in clear when the room is clear (Q9): a request,
+/// `untrusted` either way — and that system's file is nothing.
 pub fn arrival_of(
     value: &Value,
     encryption: Option<&EncryptionInfo>,
@@ -2840,12 +2838,15 @@ pub fn arrival_of(
     let event_type = value["type"].as_str()?;
     let content = value["content"].clone();
     let from_peer = gate.is_some_and(|door| value["sender"].as_str() == Some(door.peer.as_str()));
+    let file = !from_peer && crate::attachments::is_attachment(&content);
     let arrival = if event_type == "m.room.message" {
         let clear_request =
             from_peer && gate.is_some_and(|door| door.clear) && encryption.is_none();
         if content["m.relates_to"]["rel_type"] == "m.replace" {
             Arrival::Edit
-        } else if content["msgtype"] != "m.text" && !(from_peer && content["msgtype"] == "m.notice")
+        } else if content["msgtype"] != "m.text"
+            && !(from_peer && content["msgtype"] == "m.notice")
+            && !file
         {
             return None;
         } else if !sealed_by_sender(encryption) && !clear_request {
@@ -2891,7 +2892,11 @@ pub fn arrival_of(
         event_id: OwnedEventId::try_from(value["event_id"].as_str()?).ok()?,
         sender: OwnedUserId::try_from(value["sender"].as_str()?).ok()?,
         arrival,
-        text: content["body"].as_str().unwrap_or_default().to_owned(),
+        text: if file {
+            crate::attachments::caption_of(&content)
+        } else {
+            content["body"].as_str().unwrap_or_default().to_owned()
+        },
         content,
         received_at,
         replay: false,
@@ -3195,9 +3200,10 @@ mod tests {
         })
     }
 
-    /// R30's envelope check and the text-only rule: a person's `m.text`
-    /// sealed by their device is a turn; the same text in clear or from a
-    /// mismatched Megolm sender, and any attachment or notice, is nothing.
+    /// R30's envelope check and the text rule: a person's `m.text`, and
+    /// their `m.file` or `m.image` with its caption as the text (R417),
+    /// sealed by their device is a turn; the same in clear or from a
+    /// mismatched Megolm sender, and a notice or audio, is nothing.
     #[test]
     fn only_sealed_text_from_its_sender_is_a_turn() {
         let now = Instant::now();
@@ -3217,8 +3223,30 @@ mod tests {
             "a mismatched sender"
         );
 
-        for msgtype in ["m.image", "m.file", "m.notice", "m.audio"] {
-            let other = message(json!({"msgtype": msgtype, "body": "photo.png"}));
+        let captioned = message(json!({
+            "msgtype": "m.file", "body": "what is the total?", "filename": "q.pdf",
+            "file": {"url": "mxc://example.org/q"},
+        }));
+        let arrived =
+            arrival_of(&captioned, Some(&unverified), now, None).expect("a file is a turn");
+        assert_eq!(arrived.arrival, Arrival::Text);
+        assert_eq!(arrived.text, "what is the total?");
+        let photo = message(
+            json!({"msgtype": "m.image", "body": "photo.png", "url": "mxc://example.org/p"}),
+        );
+        let arrived = arrival_of(&photo, Some(&unverified), now, None).expect("a photo is a turn");
+        assert_eq!(arrived.text, "", "a file without a caption says nothing");
+        assert!(
+            arrival_of(&photo, None, now, None).is_none(),
+            "a photo in clear"
+        );
+        assert!(
+            arrival_of(&photo, Some(&forged), now, None).is_none(),
+            "a photo from a mismatched sender"
+        );
+
+        for msgtype in ["m.notice", "m.audio", "m.video"] {
+            let other = message(json!({"msgtype": msgtype, "body": "clip"}));
             assert!(
                 arrival_of(&other, Some(&unverified), now, None).is_none(),
                 "{msgtype} is not a turn"
@@ -3269,6 +3297,12 @@ mod tests {
         let text = message(json!({"msgtype": "m.text", "body": "hi"}));
         assert!(arrival_of(&text, None, now, Some(someone_else)).is_none());
         assert!(arrival_of(&text, None, now, Some(clear)).is_some());
+        // The outside system's file is no turn, sealed or in clear (R417).
+        let file =
+            message(json!({"msgtype": "m.file", "body": "x.pdf", "url": "mxc://example.org/x"}));
+        assert!(arrival_of(&file, None, now, Some(clear)).is_none());
+        let sealed_peer = sealed(Some(VerificationLevel::UnverifiedIdentity));
+        assert!(arrival_of(&file, Some(&sealed_peer), now, Some(encrypted_room)).is_none());
     }
 
     /// R47 (and Q10 for a heard mark): a scope, a request for a conversation

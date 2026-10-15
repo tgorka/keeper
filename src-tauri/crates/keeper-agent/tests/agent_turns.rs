@@ -67,6 +67,8 @@ use serde_json::{json, Value};
 const TGORKA: &str = "@tgorka:example.org";
 const MARTA: &str = "@marta:example.org";
 const SESSION: &str = "active/2026-10-02-chat";
+/// The fake homeserver's media that opens and never sends a byte.
+const STALLED: usize = 999_999;
 /// In a scripted completion: the delegation id the request names.
 const DELEGATION: &str = "@DELEGATION@";
 /// What a `delegate` result says just before the delegation's id.
@@ -608,6 +610,7 @@ fn world_in(
         mcp: None,
         kvm: None,
         gate_tickets: Default::default(),
+        attachments: pdf_reading(),
     };
     World {
         _root: root,
@@ -751,6 +754,38 @@ impl World {
     fn lines(&self, path: &str) -> Vec<LogLine> {
         read_session(&self.dir(path)).lines
     }
+}
+
+/// This host's bounds on a person's file, its PDF reader this test binary
+/// answering as [`pdf_reader_child`].
+fn pdf_reading() -> keeper_agent::attachments::Bounds {
+    use keeper_agent::attachments::{self, Bounds, PdfReader};
+    Bounds {
+        download_within: attachments::DOWNLOAD_WITHIN,
+        pdf: Some(Arc::new(PdfReader {
+            program: std::env::current_exe().expect("this test binary"),
+            args: ["pdf_reader_child", "--exact", "--nocapture"]
+                .map(std::ffi::OsString::from)
+                .to_vec(),
+            ..PdfReader::this_binary().expect("this test binary")
+        })),
+    }
+}
+
+/// The PDF reader, when this binary was started as one by [`pdf_reading`]'s
+/// reader: what the hosts answer first, then the process ends.
+#[test]
+fn pdf_reader_child() {
+    let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    let Some(at) = args
+        .iter()
+        .position(|arg| arg == keeper_agent::attachments::PDF_READER_ARG)
+    else {
+        return;
+    };
+    let code = keeper_agent::attachments::served_as_pdf_reader(args[at..].iter().cloned())
+        .expect("a PDF reader's arguments");
+    std::process::exit(code);
 }
 
 fn kinds(lines: &[LogLine], kind: LineKind) -> Vec<&LogLine> {
@@ -2819,6 +2854,7 @@ fn tolas_deps(world: &World) -> AgentDeps {
         mcp: None,
         kvm: None,
         gate_tickets: Default::default(),
+        attachments: pdf_reading(),
     }
 }
 
@@ -3422,6 +3458,7 @@ fn deps_of(world: &World, folder: &str, agent_toml: &str) -> AgentDeps {
         mcp: None,
         kvm: None,
         gate_tickets: Default::default(),
+        attachments: pdf_reading(),
     }
 }
 
@@ -4145,14 +4182,31 @@ impl DelegationPort for Delegations {
         })
     }
 
-    fn download<'a>(&'a self, file: &'a Value) -> keeper_agent::delegate::BytesFuture<'a> {
+    fn download<'a>(
+        &'a self,
+        file: &'a Value,
+        max: u64,
+    ) -> keeper_agent::delegate::BytesFuture<'a> {
+        use keeper_core::media::Download;
         Box::pin(async move {
-            file["url"]
+            let at = file
                 .as_str()
+                .or(file["url"].as_str())
                 .and_then(|url| url.strip_prefix("mxc://example.org/"))
-                .and_then(|at| at.parse::<usize>().ok())
+                .and_then(|at| at.parse::<usize>().ok());
+            if at == Some(STALLED) {
+                // A media server that opened the response and sends nothing.
+                std::future::pending::<()>().await;
+            }
+            let bytes = at
                 .and_then(|at| self.uploads.lock().expect("lock").get(at).cloned())
-                .ok_or_else(|| "no such file".to_owned())
+                .ok_or_else(|| Download::Failed("no such file".to_owned()))?;
+            // As the homeserver's port reads it: refused past `max`, however
+            // the message stated its size.
+            if bytes.len() as u64 > max {
+                return Err(Download::TooLarge(bytes.len() as u64));
+            }
+            Ok(bytes)
         })
     }
 
@@ -7244,7 +7298,7 @@ fn a_harvest_into_a_wider_room_names_no_closed_session() -> Scenario {
         world.room.unread.store(false, Ordering::SeqCst);
         assert!(world.lines(&harvest).is_empty());
         assert!(world.stub.requests().is_empty());
-        assert!(world.room.sent().is_empty(), "{:?}", world.room.sent());
+        assert!(world.room.sent().is_empty(), "nothing goes into the room");
         let rows = keeper_core::bots::audit::list_audit(
             &world.deps.data_dir,
             Some(&served.context.agent.id.to_string()),
@@ -11533,6 +11587,7 @@ mod parks {
             mcp: world.deps.mcp.clone(),
             kvm: world.deps.kvm.clone(),
             gate_tickets: Default::default(),
+            attachments: world.deps.attachments.clone(),
         }
     }
 
@@ -24172,6 +24227,7 @@ mod workflows {
             mcp: deps.mcp.clone(),
             kvm: deps.kvm.clone(),
             gate_tickets: Default::default(),
+            attachments: deps.attachments.clone(),
         }
     }
 
@@ -28985,4 +29041,493 @@ async fn an_async_tickets_line_carries_what_was_said() {
     world.serve(&mut served, request(1, "job", None)).await;
     assert!(world.room.sent().is_empty());
     assert_eq!(ticket_event(&world), None);
+}
+
+/// A person's file message (story 101.2) as it arrives: a turn whose text
+/// is its caption, `content` naming the file the fake homeserver holds at
+/// `at` — encrypted (`file`) or, with `plain`, by its `mxc://` URI.
+fn file_message(
+    world: &mut World,
+    msgtype: &str,
+    name: &str,
+    mime: &str,
+    caption: &str,
+    at: usize,
+    size: usize,
+) -> Arrived {
+    let mut content = json!({
+        "msgtype": msgtype,
+        "body": if caption.is_empty() { name } else { caption },
+        "filename": name,
+        "info": {"mimetype": mime, "size": size},
+        "file": {"url": format!("mxc://example.org/{at}")},
+    });
+    if msgtype == "m.image" {
+        content["url"] = json!(format!("mxc://example.org/{at}"));
+        content.as_object_mut().expect("object").remove("file");
+    }
+    let mut arrived = world.event(TGORKA, Arrival::Text, content.clone());
+    arrived.text = keeper_agent::attachments::caption_of(&content);
+    arrived
+}
+
+fn fixture(name: &str) -> Vec<u8> {
+    std::fs::read(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/attachments")
+            .join(name),
+    )
+    .expect("fixture")
+}
+
+/// The text the model was sent as `request`'s last user message, every
+/// text part of it joined.
+fn last_user_text(request: &Value) -> String {
+    let user = request["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .rev()
+        .find(|message| message["role"] == "user")
+        .expect("a user message");
+    match &user["content"] {
+        Value::String(text) => text.clone(),
+        Value::Array(parts) => parts
+            .iter()
+            .filter_map(|part| part["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+/// Story 101.2 #1–#3 (R417): a captioned PDF and a bare CSV are turns; each
+/// file is stored as sent in the session's `attachments/`, the PDF's text
+/// beside it, and the `user` line names them, so the model reads its
+/// caption and "Attached files" with every path it can open.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_persons_pdf_and_csv_reach_the_agent_as_files_it_can_read() {
+    let mut world = world(
+        ProviderKind::OpenAi,
+        &["drive_read"],
+        vec![prose("read it."), prose("read that too.")],
+    );
+    let rooms = Delegations::over(known(&[TGORKA, MARTA]));
+    let pdf = fixture("quarterly.pdf");
+    let csv = fixture("devices.csv");
+    rooms
+        .uploads
+        .lock()
+        .expect("lock")
+        .extend([pdf.clone(), csv.clone()]);
+    let mut served = world.delegating(&rooms);
+
+    let sent = file_message(
+        &mut world,
+        "m.file",
+        "quarterly.pdf",
+        "application/pdf",
+        "what is the total?",
+        0,
+        pdf.len(),
+    );
+    report(world.serve(&mut served, sent).await);
+    let sent = file_message(
+        &mut world,
+        "m.file",
+        "devices.csv",
+        "text/csv",
+        "",
+        1,
+        csv.len(),
+    );
+    report(world.serve(&mut served, sent).await);
+
+    let attachments = world.dir(SESSION).join("attachments");
+    assert_eq!(
+        std::fs::read(attachments.join("quarterly.pdf")).expect("pdf"),
+        pdf
+    );
+    assert_eq!(
+        std::fs::read(attachments.join("devices.csv")).expect("csv"),
+        csv
+    );
+    let text = std::fs::read_to_string(attachments.join("quarterly.pdf.txt")).expect("its text");
+    assert!(text.contains("Quarterly total 4217"), "{text}");
+
+    let in_drive = |name: &str| format!("60-sessions/{SESSION}/attachments/{name}");
+    let lines = world.lines(SESSION);
+    let users: Vec<&UserBody> = lines
+        .iter()
+        .filter_map(|line| match &line.body {
+            LineBody::User(body) => Some(body),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(users.len(), 2);
+    assert_eq!(users[0].text, "what is the total?");
+    let named: Vec<(&str, &str)> = users[0]
+        .attachments
+        .iter()
+        .map(|a| (a.drive.as_str(), a.path.as_str()))
+        .collect();
+    assert_eq!(
+        named,
+        [
+            ("tgdrive", in_drive("quarterly.pdf").as_str()),
+            ("tgdrive", in_drive("quarterly.pdf.txt").as_str()),
+        ]
+    );
+    assert_eq!(users[1].text, "");
+    assert_eq!(users[1].attachments.len(), 1);
+
+    let requests = world.stub.requests();
+    let first = last_user_text(&requests[0]);
+    assert!(first.starts_with("what is the total?"), "{first}");
+    assert!(first.contains("Attached files:"), "{first}");
+    assert!(
+        first.contains(&format!("tgdrive:{}", in_drive("quarterly.pdf.txt"))),
+        "{first}"
+    );
+    let second = last_user_text(requests.last().expect("a request"));
+    assert!(
+        second.contains(&format!("tgdrive:{}", in_drive("devices.csv"))),
+        "{second}"
+    );
+}
+
+/// Story 101.2 #3 (R417): a photo goes to a model that did not say it
+/// cannot see as an image part of its message, and is stored as sent; a
+/// PDF with no text is stored, and the person and the model are told so.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_photo_is_shown_to_the_model_and_a_scan_is_said_to_have_no_text() {
+    let mut world = world(ProviderKind::OpenAi, &["drive_read"], vec![prose("a cat.")]);
+    let rooms = Delegations::over(known(&[TGORKA, MARTA]));
+    let photo = vec![0xff, 0xd8, 0xff, 0xe0, 1, 2, 3];
+    let scan = fixture("scan.pdf");
+    rooms
+        .uploads
+        .lock()
+        .expect("lock")
+        .extend([photo.clone(), scan.clone()]);
+    let mut served = world.delegating(&rooms);
+
+    let sent = file_message(
+        &mut world,
+        "m.image",
+        "photo-1.jpg",
+        "image/jpeg",
+        "what is on it?",
+        0,
+        photo.len(),
+    );
+    report(world.serve(&mut served, sent).await);
+    let request = world.stub.requests().last().cloned().expect("a request");
+    let user = request["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .rev()
+        .find(|message| message["role"] == "user")
+        .cloned()
+        .expect("user");
+    // R444/07: the person's words first, on their own; then the sentence
+    // every drive read carries, then the photo — file content, data.
+    let parts = user["content"].as_array().expect("parts");
+    let shown = parts
+        .iter()
+        .position(|part| part["type"] == "image_url")
+        .unwrap_or_else(|| panic!("no image: {user}"));
+    assert_eq!(
+        parts
+            .iter()
+            .filter(|part| part["type"] == "image_url")
+            .count(),
+        1,
+        "{user}"
+    );
+    assert!(parts[shown]["image_url"]["url"]
+        .as_str()
+        .is_some_and(|url| url.starts_with("data:image/jpeg;base64,")));
+    assert!(shown >= 2, "{user}");
+    assert_eq!(
+        parts[shown - 1]["text"],
+        json!(keeper_core::bots::tools::FILE_CONTENT_IS_DATA),
+        "{user}"
+    );
+    let words = parts[0]["text"].as_str().expect("the person's words");
+    assert!(words.starts_with("what is on it?"), "{words}");
+    assert!(
+        !words.contains(keeper_core::bots::tools::FILE_CONTENT_IS_DATA),
+        "{words}"
+    );
+    assert_eq!(
+        std::fs::read(world.dir(SESSION).join("attachments/photo-1.jpg")).expect("stored"),
+        photo
+    );
+
+    let sent = file_message(
+        &mut world,
+        "m.file",
+        "scan.pdf",
+        "application/pdf",
+        "",
+        1,
+        scan.len(),
+    );
+    report(world.serve(&mut served, sent).await);
+    let said = keeper_agent::attachments::no_text("scan.pdf");
+    assert!(
+        final_edit(&world.room).contains(&said),
+        "{}",
+        final_edit(&world.room)
+    );
+    let told = last_user_text(world.stub.requests().last().expect("a request"));
+    assert!(told.contains(&said), "{told}");
+    assert!(!world.dir(SESSION).join("attachments/scan.pdf.txt").exists());
+}
+
+/// Story 101.2 #2 and #5 (R417, R381): a file over the cap is refused by
+/// the size its message says, before anything is downloaded; the turn
+/// still runs, and the person and the model read why.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_file_over_the_cap_is_not_fetched_and_the_room_says_why() {
+    let mut world = world(ProviderKind::OpenAi, &["drive_read"], vec![prose("ok.")]);
+    let rooms = Delegations::over(known(&[TGORKA, MARTA]));
+    let mut served = world.delegating(&rooms);
+    let size = keeper_agent::attachments::MAX_BYTES as usize + 1;
+    let sent = file_message(
+        &mut world,
+        "m.file",
+        "huge.zip",
+        "application/zip",
+        "look",
+        7,
+        size,
+    );
+    report(world.serve(&mut served, sent).await);
+
+    let said = keeper_agent::attachments::too_large("huge.zip", size as u64);
+    assert!(
+        final_edit(&world.room).contains(&said),
+        "{}",
+        final_edit(&world.room)
+    );
+    let told = last_user_text(world.stub.requests().last().expect("a request"));
+    assert!(told.contains(&said), "{told}");
+    assert!(!world.dir(SESSION).join("attachments").exists());
+    let lines = world.lines(SESSION);
+    let user = lines
+        .iter()
+        .find_map(|line| match &line.body {
+            LineBody::User(body) => Some(body),
+            _ => None,
+        })
+        .expect("the user line");
+    assert!(user.attachments.is_empty());
+}
+
+/// Whether the process log has a WARN line saying `sentence`.
+fn warned(captured: &Captured, sentence: &str) -> bool {
+    let process = String::from_utf8(captured.0.lock().expect("lock").clone()).expect("utf-8");
+    process
+        .lines()
+        .any(|line| line.contains("WARN") && line.contains(sentence))
+}
+
+/// A process log of WARN and above, captured on this thread.
+fn capture_warnings(captured: &Captured) -> tracing::subscriber::DefaultGuard {
+    tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish(),
+    )
+}
+
+/// The room and the model read `said`, the log has it as a WARN, nothing
+/// was stored in `attachments/`, and the turn ran.
+fn told_everywhere(world: &World, captured: &Captured, said: &str) {
+    assert!(
+        final_edit(&world.room).contains(said),
+        "{}",
+        final_edit(&world.room)
+    );
+    let told = last_user_text(world.stub.requests().last().expect("a request"));
+    assert!(told.contains(said), "{told}");
+    assert!(warned(captured, said), "no WARN saying {said}");
+}
+
+/// R444/01 (R381): a file whose message leaves its size out, or states one
+/// under the bound, is refused by the port at the bound as it arrives —
+/// the person and the model read why, the log has a WARN, nothing is
+/// stored, and the turn still runs.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_file_whose_size_is_left_out_or_understated_is_refused_at_the_bound() {
+    let mut world = world(
+        ProviderKind::OpenAi,
+        &["drive_read"],
+        vec![prose("ok."), prose("ok.")],
+    );
+    let rooms = Delegations::over(known(&[TGORKA, MARTA]));
+    let huge = vec![0u8; keeper_agent::attachments::MAX_BYTES as usize + 1];
+    rooms
+        .uploads
+        .lock()
+        .expect("lock")
+        .extend([huge.clone(), huge]);
+    let mut served = world.delegating(&rooms);
+    let captured = Captured::default();
+    let _guard = capture_warnings(&captured);
+
+    let mut omitted = file_message(&mut world, "m.file", "a.zip", "application/zip", "", 0, 1);
+    omitted.content["info"]
+        .as_object_mut()
+        .expect("info")
+        .remove("size");
+    report(world.serve(&mut served, omitted).await);
+    let size = keeper_agent::attachments::MAX_BYTES + 1;
+    told_everywhere(
+        &world,
+        &captured,
+        &keeper_agent::attachments::too_large("a.zip", size),
+    );
+
+    let understated = file_message(&mut world, "m.file", "b.zip", "application/zip", "", 1, 10);
+    report(world.serve(&mut served, understated).await);
+    told_everywhere(
+        &world,
+        &captured,
+        &keeper_agent::attachments::too_large("b.zip", size),
+    );
+    assert!(!world.dir(SESSION).join("attachments").exists());
+}
+
+/// R444/02: a download that never ends is given up at the host's bound —
+/// the person and the model read that it was, the log has a WARN, and the
+/// turn runs without the file.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_download_that_never_ends_is_given_up_and_the_turn_runs() {
+    let mut world = world(ProviderKind::OpenAi, &["drive_read"], vec![prose("ok.")]);
+    let within = std::time::Duration::from_millis(300);
+    world.deps.attachments.download_within = within;
+    let rooms = Delegations::over(known(&[TGORKA, MARTA]));
+    let mut served = world.delegating(&rooms);
+    let captured = Captured::default();
+    let _guard = capture_warnings(&captured);
+
+    let sent = file_message(
+        &mut world,
+        "m.file",
+        "slow.pdf",
+        "application/pdf",
+        "look",
+        STALLED,
+        9,
+    );
+    let ran = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        world.serve(&mut served, sent),
+    )
+    .await
+    .expect("the turn does not wait for the download");
+    report(ran);
+    let said = keeper_agent::attachments::download_timed_out("slow.pdf", within);
+    told_everywhere(&world, &captured, &said);
+    assert!(!world.dir(SESSION).join("attachments").exists());
+}
+
+/// R444/02: a turn stopped while its file downloads drops the download and
+/// is not begun: no `user` line, nothing asked of the model, nothing sent
+/// into the room — the arrival is served again where the session goes on.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_turn_stopped_while_its_file_downloads_is_not_begun() {
+    let mut world = world(ProviderKind::OpenAi, &["drive_read"], vec![prose("ok.")]);
+    let rooms = Delegations::over(known(&[TGORKA, MARTA]));
+    let mut served = world.delegating(&rooms);
+    let sent = file_message(
+        &mut world,
+        "m.file",
+        "slow.pdf",
+        "application/pdf",
+        "look",
+        STALLED,
+        9,
+    );
+    let (handle, signal) = chat::cancellation();
+    let (served_it, ()) = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        tokio::join!(
+            served.serve(&world.deps, world.room.clone(), sent, signal),
+            async {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                handle.cancel();
+            }
+        )
+    })
+    .await
+    .expect("a stop ends the download");
+    assert!(
+        matches!(served_it, Err(keeper_agent::agent::ServeError::Stopped)),
+        "{served_it:?}"
+    );
+    assert!(world.stub.requests().is_empty());
+    assert!(world.room.sent().is_empty(), "nothing goes into the room");
+    assert!(!world
+        .lines(SESSION)
+        .iter()
+        .any(|line| matches!(line.body, LineBody::User(_))));
+}
+
+/// R444/06: a file message naming no file to fetch is no file message
+/// without one: the person and the model read that it came without its
+/// file, the log has a WARN, and a bare one is never an empty turn.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_file_message_without_its_file_is_said_never_an_empty_turn() {
+    let mut world = world(ProviderKind::OpenAi, &["drive_read"], vec![prose("ok.")]);
+    let rooms = Delegations::over(known(&[TGORKA, MARTA]));
+    let mut served = world.delegating(&rooms);
+    let captured = Captured::default();
+    let _guard = capture_warnings(&captured);
+    let content = json!({
+        "msgtype": "m.file", "body": "minutes.docx", "filename": "minutes.docx",
+        "info": {"mimetype": "application/vnd.openxmlformats-officedocument.wordprocessingml.document"},
+    });
+    let mut sent = world.event(TGORKA, Arrival::Text, content.clone());
+    sent.text = keeper_agent::attachments::caption_of(&content);
+    report(world.serve(&mut served, sent).await);
+    let said = keeper_agent::attachments::no_source("minutes.docx");
+    told_everywhere(&world, &captured, &said);
+}
+
+/// R444/05: a photo in a format no model is shown — HEIC, as an iPhone
+/// takes it — is stored as sent, and the person and the model read that
+/// its format can't be shown; the log has a WARN; no image part goes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_heic_photo_is_stored_and_said_not_to_be_shown() {
+    let mut world = world(ProviderKind::OpenAi, &["drive_read"], vec![prose("ok.")]);
+    let rooms = Delegations::over(known(&[TGORKA, MARTA]));
+    let heic = b"\0\0\0\x18ftypheic".to_vec();
+    rooms.uploads.lock().expect("lock").push(heic.clone());
+    let mut served = world.delegating(&rooms);
+    let captured = Captured::default();
+    let _guard = capture_warnings(&captured);
+    let sent = file_message(
+        &mut world,
+        "m.image",
+        "IMG_0042.HEIC",
+        "image/heic",
+        "",
+        0,
+        heic.len(),
+    );
+    report(world.serve(&mut served, sent).await);
+    let said = keeper_agent::attachments::format_not_shown("IMG_0042.HEIC", "HEIC");
+    told_everywhere(&world, &captured, &said);
+    assert_eq!(
+        std::fs::read(world.dir(SESSION).join("attachments/IMG_0042.HEIC")).expect("stored"),
+        heic
+    );
+    let request = world.stub.requests().last().cloned().expect("a request");
+    assert!(!request.to_string().contains("image_url"), "{request}");
 }

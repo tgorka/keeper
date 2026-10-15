@@ -24,7 +24,7 @@ use crate::agents::log::writer::AppendReceipt;
 use crate::agents::log::{ChunkName, ClaimAction, LineBody, LogLine, LOG_DIR};
 use crate::agents::session::{self, parse_session_agent_toml, SessionAgent};
 use crate::notes::frontmatter::Frontmatter;
-use crate::sessions::model::{ARTIFACTS_DIR, WORKSPACE_DIR};
+use crate::sessions::model::{ARTIFACTS_DIR, ATTACHMENTS_DIR, WORKSPACE_DIR};
 use crate::sessions::pool::{read_one, PoolFile};
 use crate::sessions::shape::KindTag;
 
@@ -964,10 +964,11 @@ fn insert_card(conn: &Connection, session: &str, rel: &str, text: &str) -> Resul
 
 /// Whether a session-relative path is where the board's pool reads a card:
 /// markdown in no dotted folder and under none of `artifacts/`,
-/// `workspace/` and `log/` (folded, as the drive folds) — [`card_rels`]'s
+/// `workspace/`, `attachments/` (a person's files, story 101.2) and `log/`
+/// (folded, as the drive folds) — [`card_rels`]'s
 /// walk, asked of one path.
 fn card_place(rel: &str) -> bool {
-    let skipped = [ARTIFACTS_DIR, WORKSPACE_DIR, LOG_DIR];
+    let skipped = [ARTIFACTS_DIR, WORKSPACE_DIR, ATTACHMENTS_DIR, LOG_DIR];
     let parts: Vec<&str> = rel.split('/').collect();
     let Some((name, folders)) = parts.split_last() else {
         return false;
@@ -981,11 +982,11 @@ fn card_place(rel: &str) -> bool {
 }
 
 /// Every `.md` file of a session the board's pool can hold, session-relative
-/// and sorted: each folder but a dotted one, `artifacts/`, `workspace/` and
-/// `log/` (folded, as the drive folds), no link followed, at most
+/// and sorted: each folder but a dotted one, `artifacts/`, `workspace/`,
+/// `attachments/` and `log/` (folded, as the drive folds), no link followed, at most
 /// [`CARD_WALK_BUDGET`] entries visited.
 fn card_rels(session: &str, dir: &Path, report: &mut RebuildReport) -> Vec<String> {
-    let skipped = [ARTIFACTS_DIR, WORKSPACE_DIR, LOG_DIR];
+    let skipped = [ARTIFACTS_DIR, WORKSPACE_DIR, ATTACHMENTS_DIR, LOG_DIR];
     let mut out = Vec::new();
     let mut budget = CARD_WALK_BUDGET;
     let mut pending = vec![String::new()];
@@ -1342,5 +1343,14 @@ mod tests {
         );
         assert_eq!(read.problems.len(), 1, "{:?}", read.problems);
         assert!(read.problems[0].contains("d.md"), "{:?}", read.problems);
+    }
+
+    /// Story 101.2: a person's files in `attachments/` are data the agent
+    /// reads, never a card of the board, in either spelling the drive folds.
+    #[test]
+    fn a_persons_attachment_is_never_a_card() {
+        assert!(card_place("cards/inbox.md"));
+        assert!(!card_place("attachments/notes.md"));
+        assert!(!card_place("Attachments/deep/notes.md"));
     }
 }

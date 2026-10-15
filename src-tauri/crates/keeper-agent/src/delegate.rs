@@ -195,8 +195,10 @@ pub type UnitFuture<'a> = Pin<Box<dyn Future<Output = Result<(), AgentMatrixErro
 pub type BriefRoomFuture<'a> = Pin<Box<dyn Future<Output = Option<BriefRoom>> + Send + 'a>>;
 /// A boxed future of an encrypted upload's `EncryptedFile` JSON.
 pub type FileFuture<'a> = Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>>;
-/// A boxed future of the bytes an encrypted file decrypts to.
-pub type BytesFuture<'a> = Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send + 'a>>;
+/// A boxed future of the bytes a room's file holds (decrypted), or why it
+/// was not had: larger than the bound asked for, or failed.
+pub type BytesFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Vec<u8>, keeper_core::media::Download>> + Send + 'a>>;
 /// A boxed future of a state event as the homeserver holds it now: its
 /// sender and content, `None` when there is none.
 pub type StateFuture<'a> =
@@ -245,8 +247,11 @@ pub trait DelegationPort: Send + Sync {
     ) -> EventsFuture<'a>;
     /// Encrypt `bytes` and upload them: their `EncryptedFile` JSON.
     fn upload(&self, bytes: Vec<u8>) -> FileFuture<'_>;
-    /// The bytes of the encrypted file `file`.
-    fn download<'a>(&'a self, file: &'a Value) -> BytesFuture<'a>;
+    /// The bytes of the media `source` names: an encrypted file's object,
+    /// or a plain `mxc://` URI string (a message sent without encryption) —
+    /// at most `max` of them, a body running past it refused at that byte
+    /// (R444/01).
+    fn download<'a>(&'a self, source: &'a Value, max: u64) -> BytesFuture<'a>;
     /// Put the state event `(event_type, key)` of `room`.
     fn put_state<'a>(
         &'a self,

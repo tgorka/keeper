@@ -10,7 +10,9 @@
 //!    nothing else started — applies landlock and seccomp to itself and
 //!    becomes the program.
 //! 2. git's LFS filter invocations are answered next: the engine registers
-//!    this binary as the filter, and git runs it with no configuration.
+//!    this binary as the filter, and git runs it with no configuration —
+//!    after a PDF reader's (R444/03): agentd re-executes itself to read a
+//!    person's PDF in a process of its own, under bounds it sets first.
 //! 3. The command line is parsed.
 //! 4. Every secret is read, the secret variables leave the environment and
 //!    the process makes itself non-dumpable — while it still has one thread.
@@ -40,6 +42,11 @@ fn main() -> ExitCode {
     #[cfg(target_os = "linux")]
     if let Some(code) = served_as_sandbox_trampoline() {
         return code;
+    }
+    // A person's PDF, read by a worker under its own bounds (R444/03).
+    if let Some(code) = keeper_agent::attachments::served_as_pdf_reader(std::env::args_os().skip(1))
+    {
+        return ExitCode::from(u8::try_from(code).unwrap_or(1));
     }
     if served_as_lfs_filter() {
         return ExitCode::SUCCESS;

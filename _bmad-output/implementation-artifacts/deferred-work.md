@@ -10877,3 +10877,38 @@ origin: lane `101stack` (the stack of epic 101; review-101rooms-3), 2026-10-16
 location: `src-tauri/crates/keeper-agentd/tests/live_claims.rs` `a_clean_shutdown_releases_and_the_other_takes_over_within_two_ticks`
 reason: release → the next host's claim took 11,357 ms at the base 4e186ce8 (`/tmp/agents-salvage/live-claims-101rooms-base.log`), 10,709 ms at 525f1e25 and 8,774 / 10,994 ms at f491e1f4, against the test's 2,000 ms. The test is unchanged from the base and compares two server event timestamps on delectra's shared Synapse; the minute lease it runs on is the base's. Pre-existing timing, not epic 101's lease. Fix: bound the takeover in the host's own ticks (or on an idle homeserver) rather than 2 s of server time, and keep the expiry-takeover case (180 s) as it is.
 status: open
+
+### DW-1450: The PDF reader brings in an unmaintained font parser.
+
+origin: lane `files` (story 101.2 #3, R417), 2026-10-15
+location: `src-tauri/Cargo.toml` (`pdf-extract = "0.12"`), `keeper-agent` `attachments::pdf_text`
+reason: `pdf-extract` 0.12.1 depends on `lopdf` 0.42, which depends unconditionally on `ttf-parser` 0.25 — RUSTSEC-2026-0192, unmaintained (no vulnerability). Whether `cargo deny check` passes is CI's to show: no run of it on this rung is recorded (the binary is on neither the Linux dev host nor delectra). Replace when `pdf-extract` moves to a `lopdf` that reads fonts through `skrifa` (lopdf 0.45's `font_embedding`), or move to `pdf_oxide` (MIT OR Apache-2.0) if it does first.
+status: open
+
+### DW-1451: A PDF whose text takes longer than a minute keeps a blocking thread busy.
+
+origin: lane `files` (story 101.2 #3), 2026-10-15
+location: `keeper_agent::agent` `ServedSession::take_in` (`attachments::PDF_READ`)
+reason: the text is read on `spawn_blocking` and the turn stops waiting after `PDF_READ` (60 s, the PDF said unreadable), but a blocking thread cannot be cancelled: a hostile PDF that loops keeps one tokio blocking thread busy until it ends. A reader in a child process with a CPU limit (the `run` sandbox's trampoline) would end it.
+status: closed (fix round 1 of lane `files`, R444/03) — the text is read by the host's own binary re-run as a worker process with `RLIMIT_CPU`, `RLIMIT_AS` on Linux and `RLIMIT_FSIZE`, killed and reaped at `PDF_READ` or when the turn stops (`attachments::PdfReader`).
+
+### DW-1452: A file whose message understates its size is downloaded whole before it is refused.
+
+origin: lane `files` (story 101.2 #2), 2026-10-15
+location: `keeper_core::agents::matrix::AgentClient::download_media`, `ServedSession::take_in`
+reason: the 25 MiB cap is checked against the size the message states before the download and against the bytes after it; the SDK's `get_media_content` reads the whole body, so a sender who lies about `info.size` makes the host hold the file in memory before it is refused. A streaming download with a byte limit (the SDK's media request has none in 0.18) would bound it.
+status: closed (fix round 1 of lane `files`, R444/01) — `keeper_core::media::download_file` streams the body through the bound and refuses at the first byte past it, before any whole body is held or decrypted.
+
+### DW-1453: A photo is shown to the model only in the turn it arrived in.
+
+origin: lane `files` (story 101.2 #3, R417), 2026-10-15
+location: `run_agent_turn`'s `with_message`, `keeper_core::agents::log::replay::user_text`
+reason: the image part rides that turn's own user message and never the log, so a later turn (or a replay after a restart) reads the message with the photo's path only; the model's own answer of that turn carries what it saw. Showing it again needs the replay to hydrate `attachments/` images, with the vision answer and the per-message image cap applied there.
+status: open
+
+### DW-1454: Office documents reach the agent as named files only; audio and video are ignored, not stored.
+
+origin: lane `files` (story 101.2 #3), 2026-10-15
+location: `keeper_agent::attachments::kind_of`, `runtime::arrival_of`
+reason: a `.docx`, `.pptx` or `.xlsx` is stored and named but its text is not written beside it, though `keeper_core::document` reads all three; `m.audio` and `m.video` are not turns at all. The first is a `<name>.txt` written from `open_document`'s view model; the second needs a transcription decision (Epic 87 is on this Mac only).
+status: open

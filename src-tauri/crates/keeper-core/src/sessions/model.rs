@@ -20,6 +20,10 @@ pub const TEMPLATE_DIR: &str = "_template";
 pub const WORKSPACE_DIR: &str = "workspace";
 /// The session subtree holding promoted output — versioned and synced.
 pub const ARTIFACTS_DIR: &str = "artifacts";
+/// The session subtree holding the files a person sent into an agent's
+/// room, as they sent them (story 101.2) — versioned and synced, written by
+/// the agent's host and never by the agent.
+pub const ATTACHMENTS_DIR: &str = "attachments";
 /// The session's record. Its frontmatter is the session's identity, tags,
 /// properties and pins (FR-227).
 pub const README: &str = "README.md";
