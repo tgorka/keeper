@@ -4,6 +4,8 @@ import { CLAIMS_LEASE_LABEL } from "@/components/settings/agents-claims-lease-ro
 import {
   AGENTS_RELOAD_MS,
   AgentsSection,
+  CONSOLE_ADD_FOLDER_LABEL,
+  CONSOLE_SAVE_LABEL,
   MODEL_SAVE_LABEL,
   PIN_LABEL,
   PROVIDER_DEFAULT_LABEL,
@@ -16,6 +18,7 @@ import {
   WEB_SEARCH_SWITCH_NOTE,
 } from "@/components/settings/agents-section";
 import type {
+  AgentConsoleVm,
   AgentCopyVm,
   AgentModelVm,
   AgentPersonVm,
@@ -26,6 +29,7 @@ import type {
   Effort,
 } from "@/lib/ipc/client";
 import {
+  agentsConsoleSet,
   agentsCopies,
   agentsCopySignIn,
   agentsDriveRepin,
@@ -48,6 +52,7 @@ vi.mock("@/lib/ipc/client", () => ({
   agentsMcpList: vi.fn(),
   agentsMcpRemove: vi.fn(),
   agentsModelSet: vi.fn(),
+  agentsConsoleSet: vi.fn(),
   agentsMcpDraft: vi.fn(() =>
     Promise.resolve({ floor: null, fixed: null, tools: [], conflicts: [], drop: null }),
   ),
@@ -115,6 +120,7 @@ function nixi(pin: AgentPinVm, signedIn = false): AgentCopyVm {
     problem: null,
     model: null,
     webSearch: null,
+    console: null,
     avatarProblem: null,
   };
 }
@@ -286,6 +292,7 @@ describe("Settings › Agents", () => {
         problem: sentence,
         model: null,
         webSearch: null,
+        console: null,
         avatarProblem: null,
       },
     ]);
@@ -938,5 +945,135 @@ describe("Settings › Agents › an agent's model (100.2)", () => {
     expect(screen.queryByText(SEED_NO_BOTS)).not.toBeInTheDocument();
     expect(screen.queryAllByRole("radio")).toHaveLength(0);
     expect(screen.getByRole("combobox", { name: "Model" })).toHaveTextContent("Opus");
+  });
+});
+
+/**
+ * Nixi's console as Rust shows it (101.5): sandboxed with one folder this Mac
+ * does not give her commands (R440), every mode offered, full access refused
+ * for her with Rust's reason.
+ */
+const SITE_REFUSED = "Not given to its commands on this Mac: it is not on this host.";
+const UNRESTRICTED = "Unrestricted — folders do not constrain full access.";
+const SANDBOXED: AgentConsoleVm = {
+  mode: "sandboxed",
+  paths: ["tgdrive/projects/site"],
+  modes: [
+    { mode: "off", label: "Off", description: "No console.", refused: null },
+    { mode: "supervised", label: "Supervised", description: "Every command asks.", refused: null },
+    { mode: "sandboxed", label: "Sandboxed", description: "Runs in the sandbox.", refused: null },
+    {
+      mode: "full",
+      label: "Full access",
+      description: "No sandbox.",
+      refused: "Nixi cannot have this mode: the gate forge names this one in its delegates.",
+    },
+  ],
+  drives: ["tgdrive"],
+  warning: "Full access: Nixi's commands run on its host without a sandbox and without asking.",
+  unrestricted: UNRESTRICTED,
+  refused: [{ path: "tgdrive/projects/site", refused: SITE_REFUSED }],
+  locked: null,
+};
+
+function withConsole(shown: AgentConsoleVm): AgentCopyVm {
+  return { ...nixi({ ...unpinned, localOnly: false, state: "pinned" }, true), console: shown };
+}
+
+describe("Settings › Agents › an agent's console (101.5)", () => {
+  it("saves the chosen mode and folders against the console it showed", async () => {
+    vi.mocked(agentsCopies).mockResolvedValue([withConsole(SANDBOXED)]);
+    vi.mocked(agentsConsoleSet).mockResolvedValue([
+      withConsole({ ...SANDBOXED, mode: "supervised", paths: ["/Users/tgorka/prj/keeper"] }),
+    ]);
+    render(<AgentsSection open />);
+
+    const mode = await screen.findByRole("combobox", { name: "Console" });
+    expect(mode).toHaveTextContent("Sandboxed");
+    // R440, R381: the folder this Mac does not give says why, beside it.
+    expect(screen.getByText(SITE_REFUSED)).toBeInTheDocument();
+    // Nothing changed: nothing to save.
+    expect(screen.getByRole("button", { name: CONSOLE_SAVE_LABEL })).toBeDisabled();
+
+    await choose("Console", "Supervised");
+    fireEvent.click(screen.getByRole("button", { name: "Remove tgdrive/projects/site" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "Folder" }), {
+      target: { value: " /Users/tgorka/prj/keeper " },
+    });
+    fireEvent.click(screen.getByRole("button", { name: CONSOLE_ADD_FOLDER_LABEL }));
+    fireEvent.click(screen.getByRole("button", { name: CONSOLE_SAVE_LABEL }));
+
+    await waitFor(() =>
+      expect(agentsConsoleSet).toHaveBeenCalledWith({
+        profileId: "p1",
+        agent: "nixi",
+        mode: "supervised",
+        paths: ["/Users/tgorka/prj/keeper"],
+        shownMode: "sandboxed",
+        shownPaths: ["tgdrive/projects/site"],
+      }),
+    );
+    expect(await screen.findByText(/^Saved to Nixi's agent\.toml\./)).toHaveAttribute(
+      "role",
+      "status",
+    );
+  });
+
+  it("does not offer a mode Rust refuses this agent, and says Rust's warning and no folders when full access is chosen", async () => {
+    vi.mocked(agentsCopies).mockResolvedValue([
+      withConsole(SANDBOXED),
+      {
+        ...withConsole({
+          ...SANDBOXED,
+          modes: SANDBOXED.modes.map((mode) => ({ ...mode, refused: null })),
+          warning: "Full access: Tara's commands run without a sandbox.",
+        }),
+        agent: "tara",
+        name: "Tara",
+      },
+    ]);
+    render(<AgentsSection open />);
+    const [nixiMode, taraMode] = await screen.findAllByRole("combobox", { name: "Console" });
+
+    fireEvent.keyDown(nixiMode, { key: "Enter" });
+    expect(await screen.findByRole("option", { name: "Full access" })).toHaveAttribute(
+      "aria-disabled",
+      "true",
+    );
+    fireEvent.keyDown(await screen.findByRole("listbox"), { key: "Escape" });
+    expect(screen.queryByTestId("agent-console-warning-nixi")).not.toBeInTheDocument();
+
+    fireEvent.keyDown(taraMode, { key: "Enter" });
+    fireEvent.click(await screen.findByRole("option", { name: "Full access" }));
+    expect((await screen.findByTestId("agent-console-warning-tara")).textContent).toBe(
+      "Full access: Tara's commands run without a sandbox.",
+    );
+    // Full access is held to no folder: Rust's sentence where the folders
+    // were, never "only the session's own workspace".
+    const tara = screen.getByTestId("agent-console-tara");
+    expect(screen.getByTestId("agent-console-unrestricted-tara").textContent).toBe(UNRESTRICTED);
+    expect(within(tara).queryByRole("textbox", { name: "Folder" })).not.toBeInTheDocument();
+    expect(within(tara).queryByText(/only the session's own workspace/)).not.toBeInTheDocument();
+  });
+
+  it("says Rust's refusal beside the control and keeps the choice", async () => {
+    const sentence = 'Nixi\'s console was not changed: "~/x" starts with ~.';
+    vi.mocked(agentsCopies).mockResolvedValue([withConsole(SANDBOXED)]);
+    vi.mocked(agentsConsoleSet).mockRejectedValue({
+      code: "internal",
+      message: sentence,
+      accountId: null,
+      retriable: false,
+    });
+    render(<AgentsSection open />);
+    await screen.findByRole("combobox", { name: "Console" });
+    fireEvent.change(screen.getByRole("textbox", { name: "Folder" }), {
+      target: { value: "~/x" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: CONSOLE_ADD_FOLDER_LABEL }));
+    fireEvent.click(screen.getByRole("button", { name: CONSOLE_SAVE_LABEL }));
+
+    expect((await screen.findByRole("alert")).textContent).toBe(sentence);
+    expect(screen.getByText("~/x")).toBeInTheDocument();
   });
 });

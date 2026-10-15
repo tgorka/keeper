@@ -1936,7 +1936,11 @@ impl ServedSession {
     /// edited for another host drifts), the folder `cwd` resolves to, the
     /// programs' paths and SHA-256 and every operand's — over the drives
     /// the agent's grants let it read now, and, with network, the workspace
-    /// set the card showed (S-03).
+    /// set the card showed (S-03); in the agent's console as its
+    /// `agent.toml` says it now, read again here rather than taken from what
+    /// the host loaded (story 101.5, R440 06): a console changed since — its
+    /// mode, a folder, a folder the run asked for landing elsewhere — is
+    /// drift, and nothing is consumed.
     fn run_moved(&self, deps: &AgentDeps, record: &ApprovalRecord, args: &Value) -> Option<String> {
         if record.action.tool != AgentTool::Run.as_wire() {
             return None;
@@ -1950,14 +1954,39 @@ impl ServedSession {
             zone: &deps.sessions_subfolder,
             path: &self.context.session.path,
         };
-        let now = match crate::agent::off_the_runtime(|| sandbox.prepare(args, session, &drives)) {
+        let now = crate::agent::off_the_runtime(|| {
+            let home = &deps.home;
+            let run = crate::zone::read_home(&home.zone, &home.config.id, &home.drive)
+                .map_err(|why| format!("its agent's agent.toml does not read now: {why}"))?
+                .config
+                .run;
+            if !run.mode.offers_run() {
+                return Err("its agent's console was turned off after it was approved".to_owned());
+            }
+            let folders: Vec<crate::run::Granted> = crate::agent::run_folders(&run, &drives, deps)
+                .into_iter()
+                .filter_map(|(_, landed)| landed.ok())
+                .collect();
+            let scope: Vec<String> = drives.iter().map(|(id, _)| id.clone()).collect();
+            let prepared = sandbox.prepare(args, session, &drives)?;
+            let extra = crate::agent::asked_folders(
+                &prepared.request,
+                run.mode,
+                &home.config.drives,
+                &crate::agent::console_guards(deps),
+                &scope,
+                sandbox,
+            )?;
+            Ok(prepared.in_console(run.mode, folders, extra))
+        });
+        let now = match now {
             Ok(now) => now,
             Err(reason) => return Some(reason),
         };
         if now.exec_binding != record.action.exec_binding {
-            tracing::warn!(approval = %record.id, "agents: a run's host, folder, program or the code it runs changed after its approval");
+            tracing::warn!(approval = %record.id, "agents: a run's host, folder, program, the code it runs or its agent's console changed after its approval");
             return Some(
-                "where it runs, its program, or the code it runs changed after it was approved"
+                "where it runs, its program, the code it runs or its agent's console changed after it was approved"
                     .to_owned(),
             );
         }

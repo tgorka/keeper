@@ -269,6 +269,10 @@ pub struct CallFacts {
     /// `web_search` sends out could carry their words, so a person releases
     /// it ([`crate::agents::web_search::facts`]).
     pub private_label: bool,
+    /// A `run` that asks for folders beyond its console's (story 101.5,
+    /// R440 08): T3, so a person approves that one run, naming them, and
+    /// no `session` approval ever covers it.
+    pub widens: bool,
 }
 
 /// The grant's answer for a drive verb, without its payload.
@@ -413,6 +417,25 @@ impl Classification {
             .collect::<Vec<_>>()
             .join(",")
     }
+
+    /// This classification as if the session's integrity raised nothing:
+    /// its base tier, unless another reason still raises it (one raise
+    /// however many reasons, R171). The reasons stay listed. For a run its
+    /// sandbox alone guards (R459, [`super::console::RunMode::guards_itself`]).
+    pub fn without_integrity_raise(self) -> Classification {
+        if self
+            .raised_by
+            .iter()
+            .all(|raise| *raise == Raise::Untrusted)
+        {
+            Classification {
+                tier: self.base_tier,
+                ..self
+            }
+        } else {
+            self
+        }
+    }
 }
 
 /// The table's row for `tool` over `facts` (AD-392 with epic 93's Q5, R81).
@@ -470,7 +493,7 @@ fn row(tool: AgentTool, facts: &CallFacts) -> Tier {
         AgentTool::MemoryApply | AgentTool::SkillApply => Tier::T2,
         AgentTool::Run if facts.privileged => Tier::T5,
         AgentTool::Run if facts.held_code || facts.force_push => Tier::T4,
-        AgentTool::Run if facts.network => Tier::T3,
+        AgentTool::Run if facts.network || facts.widens => Tier::T3,
         AgentTool::Run => Tier::T2,
         AgentTool::Mcp | AgentTool::KvmAct if facts.kvm_sensitive => Tier::T5,
         AgentTool::Mcp => facts.mcp.unwrap_or(Tier::T3),
@@ -999,6 +1022,74 @@ mod tests {
         let read = classify(AgentTool::DriveRead, &write, &watched_by_nobody);
         assert_eq!(read.tier, Tier::T0);
         assert_eq!(once.gate(), Gate::Person);
+        // R459: without the integrity raise a raised T4 is T4 again — not
+        // when another reason raises it too, and never below its row's T5.
+        let untrusted = Context {
+            integrity: Integrity::Untrusted,
+            ..attended()
+        };
+        let held = CallFacts {
+            held_code: true,
+            ..CallFacts::default()
+        };
+        let script = classify(AgentTool::Run, &held, &untrusted);
+        assert_eq!(script.tier, Tier::T5);
+        let unraised = script.without_integrity_raise();
+        assert_eq!((unraised.tier, unraised.gate()), (Tier::T4, Gate::Person));
+        assert_eq!(unraised.raised_by, vec![Raise::Untrusted]);
+        let delegated = Context {
+            delegated: true,
+            ..untrusted
+        };
+        let still = classify(AgentTool::Run, &held, &delegated).without_integrity_raise();
+        assert_eq!(still.tier, Tier::T5);
+        let privileged = CallFacts {
+            privileged: true,
+            ..CallFacts::default()
+        };
+        let sudo = classify(AgentTool::Run, &privileged, &untrusted).without_integrity_raise();
+        assert_eq!(sudo.gate(), Gate::Refuse);
+    }
+
+    /// R101K4-01: a run keeper refuses names its actual cause — the
+    /// privilege tool where its own row is T5, else what raised a row a
+    /// person could approve: held code in an untrusted session is not
+    /// refused as `sudo` is.
+    #[test]
+    fn a_refused_run_names_what_refused_it() {
+        use crate::agents::run::RunRefusal;
+        let untrusted = Context {
+            integrity: Integrity::Untrusted,
+            ..attended()
+        };
+        let held = CallFacts {
+            held_code: true,
+            ..CallFacts::default()
+        };
+        let script = classify(AgentTool::Run, &held, &untrusted);
+        assert_eq!(script.gate(), Gate::Refuse);
+        assert_eq!(
+            RunRefusal::of(&script),
+            RunRefusal::Raised(vec![Raise::Untrusted])
+        );
+        let privileged = CallFacts {
+            privileged: true,
+            ..CallFacts::default()
+        };
+        let sudo = classify(AgentTool::Run, &privileged, &untrusted);
+        assert_eq!(RunRefusal::of(&sudo), RunRefusal::Privileged);
+        let delegated = Context {
+            delegated: true,
+            ..untrusted
+        };
+        assert_eq!(
+            RunRefusal::of(&classify(AgentTool::Run, &held, &delegated)),
+            RunRefusal::Raised(vec![Raise::Delegated, Raise::Untrusted])
+        );
+        assert_ne!(
+            RunRefusal::of(&script).sentence(),
+            RunRefusal::of(&sudo).sentence()
+        );
     }
 
     /// R128 in the central table: the consolidator's host actions are T2 in

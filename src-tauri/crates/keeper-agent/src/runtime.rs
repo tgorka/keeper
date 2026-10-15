@@ -361,37 +361,63 @@ pub async fn open_copy(
     Ok(Some(client))
 }
 
+/// Every checkout agentd syncs — each of its pinned drives, `pins` — as a
+/// console's folder and a run at full access are checked against it (story
+/// 101.5, R456 01, 03): mounted where its declaration hosts here, each with
+/// its pin.
+pub fn checkouts(drives: &[DriveView], pins: &[DrivePin]) -> Vec<crate::run::Checkout> {
+    drives
+        .iter()
+        .map(|drive| crate::run::Checkout {
+            id: drive.id.clone(),
+            mounted: drive.hosts.is_ok(),
+            profile: drive.profile.clone(),
+            pin: pins.iter().find(|pin| pin.id == drive.id).cloned(),
+        })
+        .collect()
+}
+
 /// Everything one hosted agent's turns run with, over this host's mounted
-/// drives and provider rows.
+/// drives, its pins of them and its provider rows.
 pub fn agent_deps(
     platform: &Arc<HeadlessPlatform>,
     data_dir: &Path,
     host: &HostSlug,
     drives: &[DriveView],
+    pins: &[DrivePin],
     rows: &[keeper_core::bots::store::ProviderRow],
     home: &AgentHome,
 ) -> Result<AgentDeps, String> {
+    // agentd builds its copies once, for the life of the process: each
+    // agent's full-access counter is that build's own.
     deps_over(
         &TurnEnv::new(Arc::clone(platform) as Arc<dyn keeper_core::platform::Platform>),
         data_dir,
         host,
         drives,
+        checkouts(drives, pins),
         rows,
         home,
+        Default::default(),
     )
 }
 
 /// [`agent_deps`] over `base`: its platform and account, with the drive
 /// narrowed to the hosting drives, no notes-vault writer and nobody to
-/// approve. No host's copies write a vault, so placement may treat every
-/// host alike: a manifest has no word for "writes the person's vault".
+/// approve, `checkouts`, every checkout the host syncs, and
+/// `full_access_turns`, the agent's full-access counter on this host. No
+/// host's copies write a vault, so placement may treat every host alike: a
+/// manifest has no word for "writes the person's vault".
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn deps_over(
     base: &TurnEnv,
     data_dir: &Path,
     host: &HostSlug,
     drives: &[DriveView],
+    checkouts: Vec<crate::run::Checkout>,
     rows: &[keeper_core::bots::store::ProviderRow],
     home: &AgentHome,
+    full_access_turns: Arc<crate::agent::FullAccessTurns>,
 ) -> Result<AgentDeps, String> {
     let (row, bot) = bot_for(home, rows).ok_or_else(|| {
         format!(
@@ -457,6 +483,8 @@ pub(crate) fn deps_over(
         gate_tickets: Default::default(),
         attachments: crate::attachments::Bounds::this_host(),
         web_search: None,
+        checkouts,
+        full_access_turns,
     })
 }
 
@@ -955,7 +983,15 @@ pub async fn run(
                 continue;
             }
         };
-        let deps = match agent_deps(&platform, &dirs.data, &host, &drives, &rows, home) {
+        let deps = match agent_deps(
+            &platform,
+            &dirs.data,
+            &host,
+            &drives,
+            &config.drives,
+            &rows,
+            home,
+        ) {
             // Every call that needs a person parks, decided only by a
             // person whose master key `[[trust]]` pins: a pin that differs,
             // or none, accepts nothing (R77, R92; no trust on first use).

@@ -11011,3 +11011,59 @@ origin: rung `agents-101-web` fix round 2 (R457), 2026-10-16
 location: `keeper_core::agents::room::{ZoneAgent::searches_unasked, AgentIcons::unasked_mark}`, `keeper_agent::desktop::zone_agents`, `AgentStatusVm.searches_unasked`
 reason: R457 asks for the mark from the serving host's status, where 101.5 puts the console mode (`StatusContent.console`, R440-09); that path is on `agents-101-console`, not on this branch, so the mark is read from the agent's `agent.toml` where its home is on this device — a phone, or a device without the drive, shows none, and a host still running an older file shows the newer level. At stack time the host writes the level into its status beside the console mode and the header reads it from there (an older host's absent field reads "unknown", never "asks").
 status: open
+
+### DW-1480: A console's folder cannot be a run's `cwd`.
+
+origin: lane `console` (story 101.5 #1, R420), 2026-10-15
+location: `keeper_core::agents::run::parse_request` (`cwd` relative to `workspace/`), `keeper_agent::run::SandboxHost::prepare` (`cwd` resolved under the workspace, bound by identity in `Expected.cwd_id`), `run::summary`/`session_reach` and the approval card (`workspace/<cwd>`)
+reason: `[run].paths` are granted read, write and execute, but a run still starts in `workspace/`; a tool that works only from its own folder (`bun test`, `cargo` without `--manifest-path`) has to be given the folder's absolute path as an option (`git -C`, `--manifest-path`, `--cwd`). Letting `cwd` name a granted folder touches the request grammar, the identity binding, the summary, the session reach and the card — each must name the folder as it resolved, not `workspace/`.
+status: open
+
+### DW-1481: The full-access marker is drawn only where the agent's home is on the device.
+
+origin: lane `console` (story 101.5 #2, R420), 2026-10-15
+location: `keeper_core::agents::room::AgentStatusVm.full_access` (from `AgentIcons::full_access`, filled by the desktop's `zone_agents`)
+reason: the mode is read from the home's `agent.toml`, as the model line is (100.2 #7); a device without the drive — the phone — does not know it and draws no marker. Carrying it would be a new optional field of `dev.keeper.agent.status` (`StatusContent`), which older readers refuse by its strict deserialisation.
+status: closed — fix round 1 (R440 09): the serving host says the console in `StatusContent.console {mode, refused}` (`agent::host_console`), every device's header draws `AgentStatusVm.full_access`/`console` from the status, and a status without it reads "Console: unknown". The marker no longer comes from the local checkout (`ZoneAgent.full_access` removed). An older device reads a status carrying the field as unreadable (strict deserialisation), which says so rather than drawing a safe console.
+
+### DW-1482: The approval card does not list the console folders a run is given.
+
+origin: lane `console` (story 101.5 #2), 2026-10-15
+location: `keeper_core::agents::approval_card::run_card` / `RunCardVm`, `keeper_agent::run::Prepared::in_console` (`exec_binding["paths"]`, `exec_binding["unsandboxed"]`)
+reason: the folders and the full mode are bound into what a run's approval binds, so a run approved in one console never runs in another, but the card a person decides on shows the program, folder, reads, network and code — not the extra folders the sandbox will open. The card should name them (and say "without a sandbox" for a full-access run that parked on the integrity rule).
+status: open — matters more since fix round 1 (R440): a run may now ask for folders beyond its console's (08), whose card's summary names them, but the typed run view (`RunCardVm`) still names neither the console's own folders nor full access, and a full-access run parks whenever the integrity rule asks.
+
+### DW-1483: Full access needs a host whose sandbox probe passed.
+
+origin: lane `console` (story 101.5 #2, R420), 2026-10-15
+location: `keeper_agent::agent::run_offer`, `keeper_agent::run::SandboxHost::execute_unsandboxed`, `keeper_core::agents::home::derived_needs`
+reason: a full-access run uses the host's `SandboxHost` for everything but the sandbox — the allow-listed environment, the checks before the program starts, the process group — and `SandboxHost` exists only where the probe passed, so a host without a working sandbox offers `run` in no mode, full included, and placement still asks for `sandbox`. That is the conservative choice; an unsandboxed host for full access would be a second constructor and a placement need of its own.
+status: open
+
+### DW-1484: Settings has two `agent.toml` writers to merge with 101.4's.
+
+origin: lane `console` (story 101.5 #3), 2026-10-15
+location: `keeper_core::agents::home::{with_model, with_run}`, `keeper_agent::desktop::{prepare_model, prepare_console, routed_save, HomeSave}`
+reason: the brief let this lane write its own `[run]` writer on the 100.2 pattern while lane `web` generalises the writer to named keys for `[tools].allow`; both share `HomeSave` (compare-and-replace, R405/R412) and `routed_save` here. The stack lane merges the two splices into one named-key writer.
+status: closed (lane `101stack`, 2026-10-16, in this rung: one person-edit path, `keeper_agent::desktop::prepare_home` — read once, parse, the save's own check and edit, parse the result as the host will, route through `WriteScope::route`, `HomeSave::publish` compare-and-replace under R412's per-file lock — serves the model save, the web search level and the console, `routed_save` removed; `home::with_run` splices through the same helpers as `with_model` / `with_tool_allowed` / `with_web_search_ask` — `splice`, `pair_after`, `table_at_end`, `line_start` / `line_end` / `line_ending_at`. Every writer test of 100.2, 101.4 and 101.5 is unchanged)
+
+### DW-1485: Settings does not say the folders the serving sandbox refuses.
+
+origin: lane `console`, fix round 2 (review-101console-2 R101K2-05, R456), 2026-10-16
+location: `keeper_agent::desktop::console_refusals` (Settings › Agents row, `AgentConsoleVm.refused`), compare `keeper_agent::agent::landed_folders` (`run::land`, then `SandboxHost::folder_refusal`)
+reason: the Settings row lands each folder as a run would (`run::land`: the resolver, the protected-zone policy, every checkout of this Mac) but not through the sandbox's own refusal — the protected system trees, the host's secrets, the credentials under the home (`.ssh`, …) — because the row is drawn without the host's probed `SandboxHost`. A host folder such as `~/.ssh` therefore shows no refusal on the row while the serving host refuses it at every run: the host WARNs it, the room header counts it and the tool's description tells the model, but the row does not say which and why. The row should take the same admission facts as the runtime (the desktop's `desktop_sandbox` forbidden set), or mark a folder as not yet checked by the sandbox rather than imply it is given.
+status: open
+
+### DW-1486: Full access is refused on a Mac whose sync profile has no pin, and Settings does not say why.
+
+origin: lane `console`, fix round 4 (coordinator, R459), 2026-10-16
+location: `keeper_agent::run::checkout_labels` (`Checkout::label`, called by `AllowedTools::run_command` for an unsandboxed run, R456 03), compare `keeper_agent::desktop::console_refusals` (Settings › Agents row, `AgentConsoleVm`)
+reason: a run at full access is labelled by every checkout of its host, each by its pin; a checkout keeper cannot tell the readers of (a sync profile of this Mac with no pin) refuses every full-access run before it starts, naming the checkout. That is fail-safe and stays, but the Settings row still offers and shows `full` as if it would run: the person learns why only from the first refused command. The row should say, beside `full`, which checkout of this Mac has no pin and that full access is refused until it has one.
+status: open
+
+### DW-1487: An approval asked after console output made the session untrusted is not proved through to its run.
+
+origin: review-101console-4 (R101K4-02), recorded by lane `101stack`, 2026-10-16
+location: `keeper-agent/tests/agent_turns.rs` (the console folder tests), `keeper_agent::approvals` consumption
+reason: R458 makes every session that ran a console folder untrusted; the networked run after it parks (tested), but no test approves that park and checks one consumption and the command's effect while the granted folders stay unavailable. An earlier ordering of the test saw zero consumptions where one was expected, and the reordered final test proves consumption only while the session is still trusted.
+status: open

@@ -102,6 +102,9 @@ pub struct AgentCopyVm {
     /// The agent's *Web search* switch (101.4 #3, R419); `None` on a
     /// folder's own row.
     pub web_search: Option<crate::agents::web_search::AgentWebSearchVm>,
+    /// The agent's console: its mode, its folders and the modes it may
+    /// have (story 101.5, R420); `None` on a folder's own row.
+    pub console: Option<crate::agents::console::AgentConsoleVm>,
     /// Why the agent's picture is not what its home's `avatar.*` says —
     /// a file too large, unreadable or of another format, or a publication
     /// to its Matrix profile that failed — naming the agent (story 100.4);

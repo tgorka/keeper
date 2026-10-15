@@ -542,6 +542,20 @@ pub struct AgentStatusVm {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub searches_unasked: Option<String>,
+    /// The standing full-access warning (story 101.5, R420, R440 09) when
+    /// the host serving the agent says its console runs at `full`: the
+    /// header's marker and its sentence, on every device. Absent elsewhere.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub full_access: Option<String>,
+    /// What else the header says of the agent's console, from the serving
+    /// host's status: "console: unknown" for a host that does not say
+    /// (never read as a safe console), or how many of its folders that
+    /// host does not give its commands (R381). Absent when there is
+    /// nothing to say.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub console: Option<String>,
     /// The host that wrote the status.
     pub host: Option<String>,
     /// The session's title.
@@ -918,6 +932,27 @@ fn handle(agent: &UserId, host: Option<&str>) -> String {
     }
 }
 
+/// What a status says of its agent's console (story 101.5, R440 09): the
+/// standing full-access warning naming `name`, and the header's other
+/// sentence — "console: unknown" for a status without a console, from a
+/// host older than it, and never a safe console; else how many of its
+/// folders `host` does not give its commands.
+fn console_of(
+    console: Option<&crate::agents::events::StatusConsole>,
+    name: &str,
+    host: &str,
+) -> (Option<String>, Option<String>) {
+    use crate::agents::console::{self, RunMode};
+    let Some(said) = console else {
+        return (None, Some(console::CONSOLE_UNKNOWN.to_owned()));
+    };
+    (
+        (said.mode == RunMode::Full).then(|| console::full_access_warning(name)),
+        (said.mode.sandboxes() && said.refused > 0)
+            .then(|| console::folders_not_given(said.refused, host)),
+    )
+}
+
 fn status_vm(
     read: &StatusRead,
     name: &dyn Fn(&UserId) -> String,
@@ -925,22 +960,29 @@ fn status_vm(
     picture: &dyn Fn(&UserId) -> Option<String>,
 ) -> AgentStatusVm {
     match read {
-        StatusRead::Read(status) => AgentStatusVm {
-            agent: status.agent.to_string(),
-            agent_name: name(&status.agent),
-            handle: handle(&status.agent, Some(&status.host)),
-            icon: icons.get(&status.agent),
-            model: icons.model(&status.agent),
-            avatar: picture(&status.agent),
-            searches_unasked: icons.unasked_mark(&status.agent),
-            host: Some(status.host.clone()),
-            title: Some(status.title.clone()),
-            kind: Some(status.kind),
-            run: status.run.into(),
-            waiting: status.waiting.clone(),
-            detail: status.detail.clone(),
-            unreadable: None,
-        },
+        StatusRead::Read(status) => {
+            let agent_name = name(&status.agent);
+            let (full_access, console) =
+                console_of(status.console.as_ref(), &agent_name, &status.host);
+            AgentStatusVm {
+                agent: status.agent.to_string(),
+                agent_name,
+                handle: handle(&status.agent, Some(&status.host)),
+                icon: icons.get(&status.agent),
+                model: icons.model(&status.agent),
+                avatar: picture(&status.agent),
+                searches_unasked: icons.unasked_mark(&status.agent),
+                full_access,
+                console,
+                host: Some(status.host.clone()),
+                title: Some(status.title.clone()),
+                kind: Some(status.kind),
+                run: status.run.into(),
+                waiting: status.waiting.clone(),
+                detail: status.detail.clone(),
+                unreadable: None,
+            }
+        }
         StatusRead::Unreadable {
             agent,
             host,
@@ -956,6 +998,10 @@ fn status_vm(
             model: icons.model(agent),
             avatar: picture(agent),
             searches_unasked: icons.unasked_mark(agent),
+            full_access: None,
+            // A status keeper cannot read says nothing of a console: not a
+            // safe one.
+            console: Some(crate::agents::console::CONSOLE_UNKNOWN.to_owned()),
             host: host.clone(),
             title: title.clone(),
             kind: None,
@@ -2162,6 +2208,38 @@ mod tests {
 
     fn status_of(state: &AgentRoomState) -> AgentStatusVm {
         header(state).status.expect("a status")
+    }
+
+    /// R440 09: a device that holds no agent's home — the phone, its icons
+    /// empty — still draws the console the serving host runs: the
+    /// full-access warning from the host's status, how many folders that
+    /// host does not give, and "console: unknown" for a status without a
+    /// console — an older host's — never a safe console.
+    #[test]
+    fn the_console_warning_comes_from_the_serving_hosts_status() {
+        use crate::agents::console::{folders_not_given, full_access_warning, CONSOLE_UNKNOWN};
+        let with = |console: Option<Value>| {
+            let mut state = AgentRoomState::new(own());
+            let mut said = content("running", "electra", None);
+            if let Some(console) = console {
+                said["console"] = console;
+            }
+            assert!(state.apply(&status("$s", 10, said), &agents));
+            status_of(&state)
+        };
+        let full = with(Some(json!({"mode": "full"})));
+        assert_eq!(full.full_access, Some(full_access_warning("Nixi")));
+        assert_eq!(full.console, None);
+        let older = with(None);
+        assert_eq!(
+            (older.full_access, older.console),
+            (None, Some(CONSOLE_UNKNOWN.to_owned()))
+        );
+        let short = with(Some(json!({"mode": "sandboxed", "refused": 2})));
+        assert_eq!(short.full_access, None);
+        assert_eq!(short.console, Some(folders_not_given(2, "electra")));
+        let quiet = with(Some(json!({"mode": "supervised"})));
+        assert_eq!((quiet.full_access, quiet.console), (None, None));
     }
 
     fn event(json: Value) -> AnySyncTimelineEvent {

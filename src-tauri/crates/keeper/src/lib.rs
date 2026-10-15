@@ -1736,6 +1736,7 @@ pub fn run() {
         // An agent's model and level (100.2 #4, R382): a write of its
         // `agent.toml`, which only a Mac with the drive can make.
         agents_host::agents_model_set,
+        agents_host::agents_console_set,
         // `/model` in an agent's DM (100.5, DW-1431, R415): the same save,
         // so desktop-only like it; a phone's menu refuses `/model` first.
         agents_host::agent_model_command,

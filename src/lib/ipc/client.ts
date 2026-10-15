@@ -343,6 +343,8 @@ export type { AccountStateVm } from "./gen/AccountStateVm";
 export type { AccountVm } from "./gen/AccountVm";
 export type { AgentAsksVm } from "./gen/AgentAsksVm";
 export type { AgentAskVm } from "./gen/AgentAskVm";
+export type { AgentConsoleReq } from "./gen/AgentConsoleReq";
+export type { AgentConsoleVm } from "./gen/AgentConsoleVm";
 export type { AgentCopyVm } from "./gen/AgentCopyVm";
 export type { AgentFocusReq } from "./gen/AgentFocusReq";
 export type { AgentMcpConflictVm } from "./gen/AgentMcpConflictVm";
@@ -471,6 +473,8 @@ export type { ConfigOverrideVm } from "./gen/ConfigOverrideVm";
 export type { ConfigTierVm } from "./gen/ConfigTierVm";
 export type { ConnectionStatus } from "./gen/ConnectionStatus";
 export type { ConnectionStatusBatch } from "./gen/ConnectionStatusBatch";
+export type { ConsoleFolderVm } from "./gen/ConsoleFolderVm";
+export type { ConsoleModeVm } from "./gen/ConsoleModeVm";
 export type { CopyEntryVm } from "./gen/CopyEntryVm";
 export type { CopyJobState } from "./gen/CopyJobState";
 export type { CopyJobVm } from "./gen/CopyJobVm";
@@ -696,6 +700,7 @@ export type { RiskTier } from "./gen/RiskTier";
 export type { RoomListBatch } from "./gen/RoomListBatch";
 export type { RoomListOp } from "./gen/RoomListOp";
 export type { RoomVm } from "./gen/RoomVm";
+export type { RunMode } from "./gen/RunMode";
 export type { SasEmojiVm } from "./gen/SasEmojiVm";
 export type { ScopeDriveVm } from "./gen/ScopeDriveVm";
 export type { ScopeOfferVm } from "./gen/ScopeOfferVm";
@@ -820,6 +825,7 @@ import type { AccountSetupVm } from "./gen/AccountSetupVm";
 import type { AccountShareVm } from "./gen/AccountShareVm";
 import type { AccountVm } from "./gen/AccountVm";
 import type { AgentAsksVm } from "./gen/AgentAsksVm";
+import type { AgentConsoleReq } from "./gen/AgentConsoleReq";
 import type { AgentCopyVm } from "./gen/AgentCopyVm";
 import type { AgentFocusReq } from "./gen/AgentFocusReq";
 import type { AgentMcpDraftVm } from "./gen/AgentMcpDraftVm";
@@ -7858,6 +7864,16 @@ export async function agentsSeedApply(req: AgentSeedReq): Promise<AgentSeedResul
  */
 export async function agentsModelSet(req: AgentModelReq): Promise<AgentCopyVm[]> {
   return await invoke<AgentCopyVm[]>("agents_model_set", { req });
+}
+
+/**
+ * Settings › Agents: save one agent's console (story 101.5, R420) — only
+ * `[run].mode` and `[run].paths` of its `agent.toml`, written as the person
+ * through the drive's write path. Resolves to the rows as they read now; a
+ * refusal is Rust's sentence.
+ */
+export async function agentsConsoleSet(req: AgentConsoleReq): Promise<AgentCopyVm[]> {
+  return await invoke<AgentCopyVm[]>("agents_console_set", { req });
 }
 
 /**

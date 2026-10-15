@@ -1369,6 +1369,7 @@ describe("SettingsDialog", () => {
         problem: null,
         model: null,
         webSearch: null,
+        console: null,
         avatarProblem: null,
       },
     ]);

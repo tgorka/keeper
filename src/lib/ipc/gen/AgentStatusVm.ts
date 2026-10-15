@@ -50,6 +50,20 @@ avatar?: string,
  */
 searchesUnasked?: string, 
 /**
+ * The standing full-access warning (story 101.5, R420, R440 09) when
+ * the host serving the agent says its console runs at `full`: the
+ * header's marker and its sentence, on every device. Absent elsewhere.
+ */
+fullAccess?: string, 
+/**
+ * What else the header says of the agent's console, from the serving
+ * host's status: "console: unknown" for a host that does not say
+ * (never read as a safe console), or how many of its folders that
+ * host does not give its commands (R381). Absent when there is
+ * nothing to say.
+ */
+console?: string, 
+/**
  * The host that wrote the status.
  */
 host: string | null, 

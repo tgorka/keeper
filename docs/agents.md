@@ -333,8 +333,10 @@ workflow    = "triage"
 | `[tools].mcp` | none | MCP server names |
 | `[tools].skills` | `["*"]` | skill folders under `_skills/` to offer; `"*"` offers every valid one |
 | `[[gate]]` | none | a `gate`'s only, refused on every other kind: one table per outside system, its keys in § *Gates* |
+| `[run].mode` | `supervised` when `[tools].allow` names `run`, else `off` | `off`, `supervised`, `sandboxed` or `full`; required when `[run]` is there, and then it alone decides whether `run` is offered (§ *An agent's console*). A gate may say only `off`; an agent a gate names in its `delegates` may not say `full` |
+| `[run].paths` | none | at most 16 folders its commands may read and write: an absolute path (`/Users/tgorka/prj/keeper`) or a folder of a drive in scope (`tgdrive/projects/site`) — never `~`, `/`, a whole drive, a drive out of scope, `.`, `..`, `.git` or `.keeper` |
 | `[[menu]]` | none | `code` (2 to 4 capital letters, unique), `description` (at most 120 characters), and exactly one of `workflow` (a folder under `_workflows/`) or `prompt` (at most 2 KiB) |
-| `[host].needs` | derived | `sandbox`, `mcp:<name>`, `screen:mac`, `kvm:<id>` or `voice`; without the key, `sandbox` when `run` is allowed and `mcp:<server>` for each server |
+| `[host].needs` | derived | `sandbox`, `mcp:<name>`, `screen:mac`, `kvm:<id>` or `voice`; without the key, `sandbox` when `run` is offered (`[run].mode`, or `[tools].allow` without `[run]`) and `mcp:<server>` for each server |
 | `[host].pin` | `""` | a host slug |
 | `[host].prefer_always_on` | `true` | |
 | `[limits].rounds_per_turn` | `8` | 1 to 8 |
@@ -1137,7 +1139,15 @@ titled `<agent> <date>`, so its folder names no subject either.
   wider) is refused: the outside content may have chosen it. A later round goes to the agent its
   exchange was opened with; a call naming another agent with that exchange is refused;
 - any call whose tier (below) is T3 or more — a write outside the session, raised by the outside
-  content to T3 — needs a person's approval: it parks for the label's readers.
+  content to T3 — needs a person's approval: it parks for the label's readers. One exception: in
+  a `sandboxed` console a command without network, without a drive in `read` and asking for no
+  `folders` still runs at once (R458) and is not raised either — a run of code the session holds
+  stays T4 and runs at once as a plain program does, never T5 for the session's integrity alone
+  (R459) — the kernel confines what it writes to the folders the person granted and its
+  `workspace/`, and it reaches nobody, so its sandbox is its own guard (§ *An agent's console*).
+  The same command at full access, with network or reading a drive is raised as before: held
+  code there is T5, and refused — with the reason that raised it, never the sentence a `sudo`
+  gets (R101K4-01).
 
 A proxy's DM (`main`) starts each of its person's turns at their own word: the integrity goes back
 to `owner` at their next message, while who may read stays as narrow as before. Every other
@@ -1196,7 +1206,8 @@ A call that already needs a person (T2 or more) is held one tier stricter when:
 
 The raise is one tier however many of these hold: a `drive_write` outside the session is T2 in
 tgorka's DM, and T3 in a delegated session, in a scheduled run, and in a session that is all three.
-A T4 raised is T5, and refused. A T0 or T1 call is not raised — reads, `reply`, `delegate`, the
+A T4 raised is T5, and refused — except for a sandboxed run its sandbox alone guards, which the
+session's integrity does not raise (R459, above). A T0 or T1 call is not raised — reads, `reply`, `delegate`, the
 surface and the session's own files work in every session — but its audit row still names the
 reasons that held, in `raised_by`, as a comma list. The person's own DM resets to `owner` at their
 message (above), so a turn they started there raises nothing.
@@ -1211,9 +1222,10 @@ windows are not begun.
 
 ## Running a command
 
-An agent whose `[tools].allow` names `run` may run a program — on a host that offers `sandbox`
-(its `[host].needs` derives it, so such an agent waits for one). It is never a shell string:
-`run({argv, cwd?, network?, timeout_s?, read?})` takes the program and its arguments as a list,
+An agent whose console is on (§ *An agent's console*: `[run].mode`, or `[tools].allow` naming
+`run` in a home without `[run]`) may run a program — on a host that offers `sandbox` (its
+`[host].needs` derives it, so such an agent waits for one), in every mode, full access included. It is never a shell string:
+`run({argv, cwd?, network?, timeout_s?, read?, folders?})` takes the program and its arguments as a list,
 and a shell given `-c`/`--command`, reading its script from standard input, or given no script
 file is refused — directly or behind `env`, `nice`, `nohup`, `timeout`, `xargs`, `stdbuf`,
 `command`, `flock` and their kin (D-33). So is a program keeper knows runs a command line given as
@@ -1404,8 +1416,102 @@ environment the Mac does not show, or that also cleared its environment, can out
 still inside the same profile and keeping every grant the run had: the workspace, read and
 write; the drives the run asked to read, read-only, for a run without network (a networked run
 reads no drive); no secret, no other drive, and no network the run did not have (DW-757).
-Without a sandbox `run` is not offered and nothing runs unsandboxed. ⌘9 bots and scheduled tasks
-never have `run`.
+Without a sandbox `run` is not offered, and nothing runs unsandboxed but in an agent's `full`
+console. ⌘9 bots and scheduled tasks never have `run`.
+
+### An agent's console
+
+How an agent's `run` works is its home's `[run]` (story 101.5, R420), one of four modes:
+
+| mode | what a command does |
+| --- | --- |
+| `off` | there is no console: `run` is not offered, whatever `[tools].allow` says |
+| `supervised` | every command waits for a person's approval and runs in the host's sandbox — epic 96's console. A `session` approval of a T2 run still lets the same program run again (R146) |
+| `sandboxed` | a command without network, without a drive in `read` and asking for no `folders` runs at once, in the sandbox, writing only its `workspace/` and the console's folders — also in a session that read outside content (R458), code the session holds included (R459); one with network, reading a drive or asking for folders asks, as in `supervised` |
+| `full` | every command runs at once and without the sandbox, as the host's user — it can read, change and delete anything that user can and reach the network. Never for a gate, nor for an agent a gate names in its `delegates`: such a home is refused at load, naming the gate |
+
+A home without `[run]` keeps the console it had: `supervised` where `[tools].allow` names `run`,
+`off` elsewhere. With `[run]`, its mode alone decides: `off` takes `run` out of `allow`, any other
+mode puts it in. A session that has read outside content still asks before a command (the
+integrity rule) in `supervised` and `full` mode and for every command of `sandboxed` mode that
+the sandbox alone would not hold — network, a drive in `read`, extra `folders` — while a
+sandboxed command without them runs at once (R458), a script the session holds too (R459: it
+keeps T4, which the sandbox lets through, and is not raised to T5 by the session's integrity):
+the kernel confines what it writes to the folders the person granted read-write and its
+`workspace/`, so outside content can at worst change files there. At full access, with network
+or reading a drive, such a script in that session is raised to T5 and refused. T5 (`sudo` and
+its kin) is refused in every mode. A full-access run keeps
+everything else of a run: the program and its code checked once more before it starts, the same
+allow-listed environment with its own `HOME` and `TMPDIR`, its own process group ended with it,
+its time and output bounded. On Linux it starts through the trampoline with no landlock and, of
+the filter, only `setsid` and `setpgid` refused, so no process of it leaves the group keeper kills
+when it ends (a daemon it asks to start something starts a process of its own, as anything the
+host's user runs can); on a Mac the group and the sweep by `TMPDIR` hold, as for every run there,
+and its result says what was found (DW-757). Its network and what it writes are not held back by
+the session's label — choosing the mode is that approval — but having been able to read anything,
+its result is labelled as if it read every checkout its host syncs, at `untrusted` integrity
+(R440, R456): not only the drives whose `_drive.toml` hosts there but every other one — a
+declaration that no longer reads or differs from its pin, another principal's drive, a folder
+synced without agents — each by its pin's readers and `local_only`, narrowed by its
+`_drive.toml` where that reads. Where the host holds no pin of a checkout, keeper cannot tell who
+reads it, and a full-access run is refused before it starts, naming that checkout (pin the drive,
+or choose `sandboxed`).
+
+**Folders.** `[run].paths` names the folders a sandboxed command may read, write and run beside
+its `workspace/`. Each host resolves them through the drive's own resolver: a drive's folder
+under that drive's checkout here — only while the drive is in the session's scope — an absolute
+path from `/`. What keeper keeps to itself is never a console's folder (R441): of a drive, its
+root's `.git`, any `.keeper`, its agents zone (every `agent.toml`, `_drive.toml`) and its sessions
+zone — a folder inside one, holding one, or holding one at any depth is refused whole, since the
+sandbox cannot leave a folder out of a grant, and names are compared case-folded; a host folder
+may hold its own `.git`, but an absolute path inside or holding a drive's checkout is refused (name
+it as the drive's folder). A folder is checked against every checkout its host syncs, not only its
+drive's (R456): one inside another checkout — a drive nested in its drive, or its drive nested in
+another — or holding one is given as neither drive's, and is refused. A folder this host cannot
+give — not here, not a folder, out of scope, refused so, or one the sandbox never grants (a
+credential under the home, the host's secrets) — is
+left out: the tool's description tells the model which and why, the host's log WARNs it, the
+Settings row says it, and the room's header says how many. Each folder is the one keeper checked,
+by device and inode: every run lands it again, and a folder replaced, or a link put on its way,
+since is refused — on Linux the sandbox's rule is built from the folder opened by identity, on a Mac
+identity is checked right before the profile. A run with network is given no folder: it sees only
+its `workspace/`. What a run could read through a folder joins the session's label: a drive's
+folder carries that drive's readers and `local_only`, a host folder is the host's own files, read
+by the session's person alone — and what a run given any console folder returns is `untrusted`
+(R458): what was in the folder while the run read it is not known, since a file can arrive, be
+read and be gone again within one run, so keeper does not scan the folder to tell; before
+a run starts, everything it could read is checked against every place it could write — its
+workspace's drive, each folder's drive, the host's files — and refused when one would widen who
+reads it. A sandboxed run may ask for up to 4 more folders for itself alone (`run({…, folders:
+[...]})`, the `[run].paths` grammar): it then waits for a person, whose card names the folders as
+keeper landed them, read and write; approved,
+that one run gets them, and the console in `agent.toml` is unchanged. The mode, the folders by
+place and identity and whether the run is sandboxed are bound into what its approval binds and
+into a `session` approval's reach, so a run approved in one console never runs in another, and the
+approval's check reads `agent.toml` as it is then. `cwd` stays inside `workspace/` (DW-1480);
+name a folder by the absolute path the tool's description gives.
+
+**Settings › Agents.** Each agent row shows its console: the mode — a mode this agent may not
+have is offered disabled, with the reason — and its folders, which can be removed and added.
+*Save console* writes `[run].mode` and `[run].paths` and nothing else, through the drive's own
+compare-and-replace write as the person (the model's save, R405, R412); the person's choice is the
+approval for the mode. Choosing full access says, beside the choice, "Full access: <Agent>'s
+commands run on its host without a sandbox and without asking. They can read, change and delete
+anything that host's user can, and reach the network.", and where the folders were, "Unrestricted
+— folders do not constrain full access". Under each folder this Mac does not give the agent's
+commands, the row says why. The same full-access sentence is the standing *Full access* marker in
+the agent's room header on every device: the host serving the agent says its console in its
+status (`dev.keeper.agent.status`'s `console`: the mode, and how many folders it does not give), so
+a phone without the drive draws it too, and a status from a host that does not say reads "Console:
+unknown" — never a safe console. While a turn of the agent runs at full access, every status of
+the agent says full access, even if its console was saved to another mode meanwhile: the saved
+mode applies from the next turn, and the marker goes once that turn has ended (R456) — also when
+the Mac built its host again meanwhile, whose bounded stop can leave such a turn's command running:
+the new build counts in the same counter (R101K3-02). Every turn
+reads the home's `[run]` again, as it reads `[model]` (R407): a saved console — turned off
+included — runs from the agent's next turn, and at full access the zone is read every turn,
+changed or not, so an agent a gate names in its `delegates` — or one whose zone, or its
+`_drive.toml`, cannot be read — is refused the turn rather than run unsandboxed.
 
 ## Searching the web
 

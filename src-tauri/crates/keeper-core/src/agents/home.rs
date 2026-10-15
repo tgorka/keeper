@@ -358,6 +358,9 @@ pub struct AgentConfig {
     pub audience: BTreeSet<OwnedUserId>,
     /// `[[gate]]`, a gate's only; empty for every other kind.
     pub gates: Vec<GateConfig>,
+    /// `[run]`: the console's mode and folders (story 101.5, R420); a home
+    /// without the table has the mode its `[tools].allow` implies.
+    pub run: super::console::RunConfig,
 }
 
 impl AgentConfig {
@@ -424,9 +427,11 @@ const ROOT_KEYS: &[&str] = &[
     "memory",
     "gate",
     "web_search",
+    "run",
 ];
 const MODEL_KEYS: &[&str] = &["bot", "effort", "local_only"];
 const TOOLS_KEYS: &[&str] = &["allow", "drives", "mcp", "skills"];
+const RUN_KEYS: &[&str] = &["mode", "paths"];
 const MENU_KEYS: &[&str] = &["code", "description", "workflow", "prompt"];
 const HOST_KEYS: &[&str] = &["needs", "pin", "prefer_always_on"];
 const LIMITS_KEYS: &[&str] = &[
@@ -776,6 +781,19 @@ pub fn parse_agent_toml(
         });
     }
     let skills = field("skills")?.unwrap_or_else(|| vec!["*".to_owned()]);
+    let mut run = parse_run(&root, kind, &drives)?;
+    // The console's mode decides whether `run` is offered (R420): `allow`
+    // says it only where the file has no `[run]`, and there it means the
+    // console epic 96 shipped — every command asks, in the sandbox.
+    let mut allow = allow;
+    if run.said {
+        allow.retain(|tool| tool != super::run::RUN);
+        if run.mode.offers_run() {
+            allow.push(super::run::RUN.to_owned());
+        }
+    } else if allow.iter().any(|tool| tool == super::run::RUN) {
+        run.mode = super::console::RunMode::Supervised;
+    }
 
     let menu = parse_menu(&root)?;
 
@@ -862,6 +880,7 @@ pub fn parse_agent_toml(
         memory,
         audience: drive.readers.clone(),
         gates,
+        run,
     })
 }
 
@@ -882,6 +901,58 @@ fn parse_effort(model: &Section<'_>, kind: ProviderKind) -> Result<Option<Effort
         None => Ok(Some(effort)),
         Some(reason) => Err(model.invalid("effort", reason)),
     }
+}
+
+/// `[run]` (story 101.5, R420): `mode` one of the four words, required with
+/// the table; `paths` at most [`PATHS_MAX`](super::console::PATHS_MAX)
+/// folders, each an absolute path or a folder of a drive in `drives`, once
+/// each. A gate has no console, and never full access. Without the table,
+/// the mode is `supervised` where `[tools].allow` names `run` — the console
+/// as it was — and `off` elsewhere.
+fn parse_run(
+    root: &Section<'_>,
+    kind: AgentKind,
+    drives: &[String],
+) -> Result<super::console::RunConfig, HomeRefusal> {
+    use super::console::{self, RunConfig, RunMode};
+    let Some(section) = root.table("run", RUN_KEYS)? else {
+        return Ok(RunConfig::default());
+    };
+    let word = section.required_str("mode")?;
+    let mode = RunMode::parse(word).ok_or_else(|| {
+        section.invalid(
+            "mode",
+            format!("\"{word}\" is not one of off, supervised, sandboxed or full"),
+        )
+    })?;
+    if let Some(reason) = console::mode_refusal(kind, mode) {
+        return Err(section.invalid("mode", reason));
+    }
+    let texts = section.strings("paths")?.unwrap_or_default();
+    if texts.len() > console::PATHS_MAX {
+        return Err(section.invalid(
+            "paths",
+            format!(
+                "a console is given at most {} folders, and this one lists {}",
+                console::PATHS_MAX,
+                texts.len()
+            ),
+        ));
+    }
+    let mut paths = Vec::with_capacity(texts.len());
+    for text in &texts {
+        let path =
+            console::parse_path(text, drives).map_err(|reason| section.invalid("paths", reason))?;
+        if paths.contains(&path) {
+            return Err(section.invalid("paths", format!("\"{text}\" is listed twice")));
+        }
+        paths.push(path);
+    }
+    Ok(RunConfig {
+        mode,
+        paths,
+        said: true,
+    })
 }
 
 /// `text`, an `agent.toml`, with `[model].bot` set to `bot` and
@@ -931,22 +1002,14 @@ pub fn with_model(text: &str, bot: &str, effort: Option<Effort>) -> Result<Strin
     let mut edits: Vec<(Range<usize>, String)> = vec![(bot_value.clone(), quoted(bot))];
     match (present, effort) {
         (Some((_, value)), Some(effort)) => edits.push((value, quoted(effort.as_str()))),
-        (None, Some(effort)) if inline => edits.push((
-            bot_value.end..bot_value.end,
-            format!(", effort = {}", quoted(effort.as_str())),
+        // After `bot`, in its form: inside its inline table, or a line of
+        // its own ended as `bot`'s is, with its indent and dotted prefix.
+        (None, Some(effort)) => edits.push(pair_after(
+            text,
+            (bot_key.clone(), bot_value.clone()),
+            inline,
+            &format!("effort = {}", quoted(effort.as_str())),
         )),
-        (None, Some(effort)) => {
-            // A line of its own after `bot`'s, ended as `bot`'s is (the
-            // file's first ending where `bot`'s line is the last), with
-            // `bot`'s indent and dotted prefix (`model.` in `model.bot = …`).
-            let at = line_end(bot_value.end);
-            let ending = line_ending_at(text, at);
-            let prefix = &text[line_start(bot_key.start)..bot_key.start];
-            edits.push((
-                at..at,
-                format!("{ending}{prefix}effort = {}", quoted(effort.as_str())),
-            ));
-        }
         (Some((key, value)), None) if inline => {
             // `, effort = "x"` or `effort = "x", `: the pair and one comma.
             let before = text[..key.start].trim_end();
@@ -987,11 +1050,7 @@ pub fn with_model(text: &str, bot: &str, effort: Option<Effort>) -> Result<Strin
         }
         (None, None) => {}
     }
-    edits.sort_by_key(|(range, _)| std::cmp::Reverse(range.start));
-    let mut written = text.to_owned();
-    for (range, replacement) in edits {
-        written.replace_range(range, &replacement);
-    }
+    let written = splice(text, edits);
 
     // The splice is checked as a reader will read it: the two keys say what
     // was asked, or nothing is handed back.
@@ -1113,11 +1172,7 @@ pub fn with_tool_allowed(
             &format!("allow = [{}]", names(&expected)),
         )),
     }
-    edits.sort_by_key(|(range, _)| std::cmp::Reverse(range.start));
-    let mut written = text.to_owned();
-    for (range, replacement) in edits {
-        written.replace_range(range, &replacement);
-    }
+    let written = splice(text, edits);
 
     // Read back as a reader will: `allow` is what was asked, or nothing is
     // handed back.
@@ -1202,12 +1257,14 @@ fn key_line_into(
 }
 
 /// The edit that appends the table `[name]` holding `line` to `text`, in
-/// the file's line endings, after a blank line, a missing final newline
-/// kept missing.
+/// the file's line endings, after a blank line (none in an empty file), a
+/// missing final newline kept missing.
 fn table_at_end(text: &str, name: &str, line: &str) -> (std::ops::Range<usize>, String) {
     let ending = line_ending_at(text, text.len());
     let ended = text.is_empty() || text.ends_with('\n');
-    let lead = if ended {
+    let lead = if text.is_empty() {
+        String::new()
+    } else if ended {
         ending.to_owned()
     } else {
         format!("{ending}{ending}")
@@ -1259,8 +1316,7 @@ pub fn with_web_search_ask(text: &str, ask: bool) -> Result<String, HomeRefusal>
         (Some(section), None) => key_line_into(text, section, &line).ok_or_else(unplaced)?,
         (None, None) => table_at_end(text, "web_search", &line),
     };
-    let mut written = text.to_owned();
-    written.replace_range(edit.0, &edit.1);
+    let written = splice(text, vec![edit]);
 
     // Read back as a reader will: `ask` is what was asked, or nothing is
     // handed back.
@@ -1388,6 +1444,41 @@ fn tool_removal(
     ranges
 }
 
+/// `text` with each of `edits` — a byte range of it and what replaces it —
+/// applied. The ranges never overlap; they are applied from the end, so the
+/// earlier ones still point where they did. Every `agent.toml` writer here
+/// ([`with_model`], [`with_tool_allowed`], [`with_web_search_ask`],
+/// [`with_run`]) is a list of such edits over the person's own bytes.
+fn splice(text: &str, mut edits: Vec<(std::ops::Range<usize>, String)>) -> String {
+    edits.sort_by_key(|(range, _)| std::cmp::Reverse(range.start));
+    let mut written = text.to_owned();
+    for (range, replacement) in edits {
+        written.replace_range(range, &replacement);
+    }
+    written
+}
+
+/// The edit that puts the line `line` (`key = value`) after the pair whose
+/// key and value sit at `pair` in `text`, in that pair's own form: inside
+/// an inline table, `, <line>` right after the value; else a line of its
+/// own after the value's line, with the key's indent and dotted prefix
+/// (`model.` in `model.bot = …`), ended as that line is (the file's first
+/// ending where it is the last).
+fn pair_after(
+    text: &str,
+    (key, value): (std::ops::Range<usize>, std::ops::Range<usize>),
+    inline: bool,
+    line: &str,
+) -> (std::ops::Range<usize>, String) {
+    if inline {
+        return (value.end..value.end, format!(", {line}"));
+    }
+    let at = line_end(text, value.end);
+    let ending = line_ending_at(text, at);
+    let prefix = &text[line_start(text, key.start)..key.start];
+    (at..at, format!("{ending}{prefix}{line}"))
+}
+
 /// Where the line holding byte `at` of `text` starts.
 fn line_start(text: &str, at: usize) -> usize {
     text[..at].rfind('\n').map_or(0, |newline| newline + 1)
@@ -1415,6 +1506,88 @@ fn line_ending_at(text: &str, at: usize) -> &'static str {
     } else {
         "\n"
     }
+}
+
+/// `text`, an `agent.toml`, with `[run].mode` set to `mode` and
+/// `[run].paths` to `paths`, every other byte as it was (story 101.5, R420;
+/// the console's two keys, spliced as [`with_model`] splices `[model]`'s): a
+/// file without `[run]` gains the table at its end ([`table_at_end`]), ended
+/// as the file's lines are — a last line without an ending gets one; a file
+/// with one has the two values' spans replaced, and a missing `paths` added
+/// after `mode` in `mode`'s own form ([`pair_after`]). Nothing else is
+/// serialised again. A file that is not TOML is refused with the home's own
+/// sentence. The result is not checked against the drive: the writer parses
+/// it as the host will before a byte lands.
+pub fn with_run(
+    text: &str,
+    mode: super::console::RunMode,
+    paths: &[String],
+) -> Result<String, HomeRefusal> {
+    use toml_edit::{Array, Document, Item, Value as EditValue};
+
+    let syntax = |error: toml_edit::TomlError| HomeRefusal::Syntax(error.message().to_owned());
+    let unplaced = || HomeRefusal::Syntax("keeper could not find [run] in this file".to_owned());
+    let mode_text = EditValue::from(mode.as_str()).decorated("", "").to_string();
+    let paths_text = {
+        let mut array: Array = paths.iter().map(String::as_str).collect();
+        array.fmt();
+        EditValue::Array(array).decorated("", "").to_string()
+    };
+
+    let document = Document::parse(text).map_err(syntax)?;
+    let written = match document.get("run") {
+        None => {
+            let ending = line_ending_at(text, text.len());
+            let mut written = splice(
+                text,
+                vec![table_at_end(
+                    text,
+                    "run",
+                    &format!("mode = {mode_text}{ending}paths = {paths_text}"),
+                )],
+            );
+            if !written.ends_with('\n') {
+                written.push_str(ending);
+            }
+            written
+        }
+        Some(run) => {
+            let inline = matches!(run, Item::Value(EditValue::InlineTable(_)));
+            let table = run.as_table_like().ok_or_else(unplaced)?;
+            let (mode_key, mode_item) = table.get_key_value("mode").ok_or_else(unplaced)?;
+            let mode_key = mode_key.span().ok_or_else(unplaced)?;
+            let mode_value = mode_item.span().ok_or_else(unplaced)?;
+            let mut edits = vec![(mode_value.clone(), mode_text)];
+            match table.get("paths") {
+                Some(item) => edits.push((item.span().ok_or_else(unplaced)?, paths_text)),
+                None => edits.push(pair_after(
+                    text,
+                    (mode_key, mode_value),
+                    inline,
+                    &format!("paths = {paths_text}"),
+                )),
+            }
+            splice(text, edits)
+        }
+    };
+
+    // The splice is checked as a reader will read it: the two keys say what
+    // was asked, or nothing is handed back.
+    let check = Document::parse(written.as_str()).map_err(syntax)?;
+    let run = check
+        .get("run")
+        .and_then(Item::as_table_like)
+        .ok_or_else(unplaced)?;
+    let read_paths: Option<Vec<&str>> = run
+        .get("paths")
+        .and_then(Item::as_array)
+        .and_then(|array| array.iter().map(EditValue::as_str).collect());
+    if run.get("mode").and_then(Item::as_str) != Some(mode.as_str())
+        || read_paths != Some(paths.iter().map(String::as_str).collect())
+    {
+        return Err(unplaced());
+    }
+    Ok(written)
 }
 
 /// Why a bot that does not run locally is refused where `local_only` holds:
@@ -1751,7 +1924,9 @@ pub fn shared_matrix_users(homes: &[AgentConfig]) -> Vec<HomeRefusal> {
 /// What one file cannot say about its `[[gate]]` tables, read against the
 /// other homes of its zone: each `delegates` entry is an agent of this drive
 /// that is neither the gate itself nor another gate, and no `peer` is an
-/// agent's Matrix user. Each refusal names the gate's folder (99.1 #1).
+/// agent's Matrix user. Each refusal names the gate's folder (99.1 #1). An
+/// agent a gate hands outside work to may not have full access (R420): that
+/// refusal names the delegate's folder, at its `run.mode`.
 pub fn gate_zone_refusals(homes: &[AgentConfig]) -> Vec<(String, HomeRefusal)> {
     let mut refusals = Vec::new();
     for home in homes.iter().filter(|home| home.kind == AgentKind::Gate) {
@@ -1781,6 +1956,16 @@ pub fn gate_zone_refusals(homes: &[AgentConfig]) -> Vec<(String, HomeRefusal)> {
                     Some(other) if other.kind == AgentKind::Gate => GateZoneCause::AnotherGate {
                         delegate: delegate.clone(),
                     },
+                    Some(other) if other.run.mode == super::console::RunMode::Full => {
+                        refusals.push((
+                            other.id.clone(),
+                            HomeRefusal::Invalid {
+                                key: "run.mode".to_owned(),
+                                reason: super::console::delegate_refusal(&home.id),
+                            },
+                        ));
+                        continue;
+                    }
                     Some(_) => continue,
                 };
                 refusals.push((
@@ -1794,6 +1979,20 @@ pub fn gate_zone_refusals(homes: &[AgentConfig]) -> Vec<(String, HomeRefusal)> {
         }
     }
     refusals
+}
+
+/// The gate of `homes` that names agent `id` in its `delegates`, if any: an
+/// agent that takes outside work, which may not have full access (R420).
+pub fn delegated_by<'a>(homes: &'a [AgentConfig], id: &str) -> Option<&'a str> {
+    homes
+        .iter()
+        .filter(|home| home.kind == AgentKind::Gate && home.id != id)
+        .find(|home| {
+            home.gates
+                .iter()
+                .any(|gate| gate.delegates.iter().any(|delegate| delegate == id))
+        })
+        .map(|home| home.id.as_str())
 }
 
 #[cfg(test)]
@@ -3099,5 +3298,242 @@ promote               = true
         );
         assert_eq!(in_tgdrive.drives, ["tgdrive"], "the home drive is in scope");
         assert_eq!(in_neuradrive.drives, ["neuradrive"]);
+    }
+
+    // --- `[run]`, the console (story 101.5, R420) ---------------------------
+
+    fn console(extra: &str) -> Result<AgentConfig, HomeRefusal> {
+        parse_agent_toml(&minimal("specialist", extra), "amelia", &tgdrive())
+    }
+
+    /// 101.5 #1: a home without `[run]` keeps the console it had — epic
+    /// 96's, every command asked for in the sandbox, where `[tools].allow`
+    /// names `run`, and none elsewhere.
+    #[test]
+    fn a_home_without_run_keeps_the_console_its_allow_implies() {
+        use super::super::console::RunMode;
+        let with_run = console("[tools]\nallow = [\"drive_read\", \"run\"]").expect("parses");
+        assert_eq!(with_run.run.mode, RunMode::Supervised);
+        assert!(!with_run.run.said);
+        assert!(with_run.allow.iter().any(|tool| tool == "run"));
+        assert_eq!(with_run.host.needs, ["sandbox"]);
+        let without = console("[tools]\nallow = [\"drive_read\"]").expect("parses");
+        assert_eq!(without.run.mode, RunMode::Off);
+        assert!(!without.allow.iter().any(|tool| tool == "run"));
+        assert!(without.host.needs.is_empty());
+    }
+
+    /// 101.5 #1/#2: where `[run]` is, its mode alone decides whether `run`
+    /// is offered — `off` takes it out of an `allow` that names it, any
+    /// other mode puts it in one that does not — and a host must offer a
+    /// sandbox for every mode that has a console.
+    #[test]
+    fn the_run_mode_decides_whether_run_is_offered() {
+        use super::super::console::RunMode;
+        let off = console("[tools]\nallow = [\"drive_read\", \"run\"]\n[run]\nmode = \"off\"")
+            .expect("parses");
+        assert_eq!(off.run.mode, RunMode::Off);
+        assert!(off.run.said);
+        assert!(!off.allow.iter().any(|tool| tool == "run"));
+        assert!(off.host.needs.is_empty());
+        for (word, mode) in [
+            ("supervised", RunMode::Supervised),
+            ("sandboxed", RunMode::Sandboxed),
+            ("full", RunMode::Full),
+        ] {
+            let on = console(&format!(
+                "[tools]\nallow = [\"drive_read\"]\n[run]\nmode = \"{word}\""
+            ))
+            .expect("parses");
+            assert_eq!(on.run.mode, mode, "{word}");
+            assert_eq!(
+                on.allow.iter().filter(|tool| *tool == "run").count(),
+                1,
+                "{word}"
+            );
+            assert_eq!(on.host.needs, ["sandbox"], "{word}");
+        }
+        assert_eq!(refused_key(console("[run]\nmode = \"yolo\"")), "run.mode");
+        assert_eq!(refused_key(console("[run]\npaths = []")), "run.mode");
+        assert_eq!(
+            refused_key(console("[run]\nmode = \"full\"\nshell = true")),
+            "run.shell"
+        );
+    }
+
+    /// 101.5 #2: a gate has no console, and full access never; `off` is
+    /// the only `[run]` a gate may say.
+    #[test]
+    fn a_gate_has_no_console_and_never_full_access() {
+        use super::super::console::RunMode;
+        for mode in ["supervised", "sandboxed", "full"] {
+            let refused = gate_with(&format!("[run]\nmode = \"{mode}\"\n{GATE}"));
+            assert_eq!(refused_key(refused), "run.mode", "{mode}");
+        }
+        let off = gate_with(&format!("[run]\nmode = \"off\"\n{GATE}")).expect("parses");
+        assert_eq!(off.run.mode, RunMode::Off);
+        assert!(!off.allow.iter().any(|tool| tool == "run"));
+    }
+
+    /// 101.5 #1: a folder is an absolute path or a folder of a drive in the
+    /// agent's scope, plainly spelled, once; never `~`, `/`, a whole drive,
+    /// a drive out of scope or keeper's own folders, and at most sixteen.
+    #[test]
+    fn a_console_folder_is_an_absolute_path_or_a_folder_of_a_drive_in_scope() {
+        use super::super::console::RunPath;
+        let read = console(
+            "[tools]\ndrives = [\"neuradrive\"]\n[run]\nmode = \"sandboxed\"\n\
+             paths = [\"/Users/tgorka/prj/keeper/\", \"tgdrive/projects/site\", \"neuradrive/a\"]",
+        )
+        .expect("parses");
+        assert_eq!(
+            read.run.paths,
+            [
+                RunPath::Host("/Users/tgorka/prj/keeper".to_owned()),
+                RunPath::Drive {
+                    drive: "tgdrive".to_owned(),
+                    path: "projects/site".to_owned()
+                },
+                RunPath::Drive {
+                    drive: "neuradrive".to_owned(),
+                    path: "a".to_owned()
+                },
+            ]
+        );
+        for bad in [
+            "~/prj",
+            "/",
+            "",
+            "/a/../b",
+            "/a//b",
+            "tgdrive",
+            "tgdrive/",
+            "tgdrive/./x",
+            "neuradrive/a",
+            "tgdrive/.git/hooks",
+            "tgdrive/x/.keeper",
+            "projects/site",
+        ] {
+            let refused = console(&format!("[run]\nmode = \"sandboxed\"\npaths = [\"{bad}\"]"));
+            assert_eq!(refused_key(refused), "run.paths", "{bad:?}");
+        }
+        let twice = console("[run]\nmode = \"sandboxed\"\npaths = [\"/a\", \"/a/\"]");
+        assert_eq!(refused_key(twice), "run.paths");
+        let many: Vec<String> = (0..=16).map(|n| format!("\"/f{n}\"")).collect();
+        let over = console(&format!(
+            "[run]\nmode = \"sandboxed\"\npaths = [{}]",
+            many.join(", ")
+        ));
+        assert_eq!(refused_key(over), "run.paths");
+        let sixteen = console(&format!(
+            "[run]\nmode = \"sandboxed\"\npaths = [{}]",
+            many[..16].join(", ")
+        ));
+        assert_eq!(sixteen.expect("sixteen parse").run.paths.len(), 16);
+    }
+
+    /// 101.5 #2: an agent a gate hands outside work to may not have full
+    /// access — its home is refused at its `run.mode`, naming the gate —
+    /// while its other modes, and full access for an agent no gate names,
+    /// stand.
+    #[test]
+    fn full_access_is_refused_for_an_agent_a_gate_hands_work_to() {
+        let tola_text = fixture("zone-ok/tola-grey/agent.toml");
+        let tola_at = |mode: &str| {
+            parse_agent_toml(
+                &format!("{tola_text}\n[run]\nmode = \"{mode}\"\n"),
+                "tola-grey",
+                &tgdrive(),
+            )
+            .expect("Tola parses alone")
+        };
+        let gate = gate_with(GATE).expect("the gate parses");
+        let refusals = gate_zone_refusals(&[tola_at("full"), gate.clone()]);
+        assert_eq!(refusals.len(), 1);
+        let (folder, refusal) = &refusals[0];
+        assert_eq!(folder, "tola-grey");
+        assert_eq!(
+            refused_key(Err(refusal.clone())),
+            "run.mode",
+            "the delegate's own key is named"
+        );
+        assert!(refusal.to_string().contains("amelia"), "names the gate");
+        assert_eq!(
+            delegated_by(&[tola_at("off"), gate.clone()], "tola-grey"),
+            Some("amelia")
+        );
+        assert_eq!(
+            delegated_by(&[tola_at("off"), gate.clone()], "amelia"),
+            None
+        );
+        for mode in ["off", "supervised", "sandboxed"] {
+            assert_eq!(
+                gate_zone_refusals(&[tola_at(mode), gate.clone()]),
+                Vec::new(),
+                "{mode}"
+            );
+        }
+        let nixi = parse_agent_toml(
+            &format!("{}\n[run]\nmode = \"full\"\n", nixi()),
+            "nixi",
+            &tgdrive(),
+        )
+        .expect("Nixi parses");
+        assert_eq!(
+            gate_zone_refusals(&[nixi, tola_at("off"), gate]),
+            Vec::new()
+        );
+    }
+
+    /// 101.5 #3: a console save writes `[run].mode` and `[run].paths` and
+    /// keeps every other byte: a file without `[run]` gains the table at
+    /// its end in the file's own line endings; one with it has the two
+    /// values replaced in place, `paths` added after `mode` in `mode`'s own
+    /// form where it was missing — on its line, or inside an inline table.
+    #[test]
+    fn a_console_write_changes_two_keys_and_keeps_every_other_byte() {
+        use super::super::console::RunMode;
+        const BEFORE: &str = "# hand-written\nversion = 1\n\n[model]\nbot = \"x\" # mine\n";
+        let paths = [
+            "/Users/tgorka/prj/keeper".to_owned(),
+            "tgdrive/site".to_owned(),
+        ];
+        let added = with_run(BEFORE, RunMode::Sandboxed, &paths).expect("written");
+        assert_eq!(
+            added,
+            format!("{BEFORE}\n[run]\nmode = \"sandboxed\"\npaths = [\"/Users/tgorka/prj/keeper\", \"tgdrive/site\"]\n")
+        );
+        let changed = with_run(&added, RunMode::Full, &[]).expect("written");
+        assert_eq!(
+            changed,
+            format!("{BEFORE}\n[run]\nmode = \"full\"\npaths = []\n")
+        );
+
+        let crlf = "version = 1\r\n[model]\r\nbot = \"x\"";
+        let crlf_added = with_run(crlf, RunMode::Off, &[]).expect("written");
+        assert_eq!(
+            crlf_added,
+            format!("{crlf}\r\n\r\n[run]\r\nmode = \"off\"\r\npaths = []\r\n")
+        );
+
+        let mode_only = "[run]\n  mode = \"supervised\"  # asks\n\n[model]\nbot = \"x\"\n";
+        assert_eq!(
+            with_run(mode_only, RunMode::Sandboxed, &paths[..1]).expect("written"),
+            "[run]\n  mode = \"sandboxed\"  # asks\n  paths = [\"/Users/tgorka/prj/keeper\"]\n\n[model]\nbot = \"x\"\n"
+        );
+        let inline = "run = { mode = \"off\" }\n[model]\nbot = \"x\"\n";
+        assert_eq!(
+            with_run(inline, RunMode::Full, &paths[1..]).expect("written"),
+            "run = { mode = \"full\", paths = [\"tgdrive/site\"] }\n[model]\nbot = \"x\"\n"
+        );
+        let dotted = "run.mode = \"off\"\nrun.paths = [\"/a\"]\n[model]\nbot = \"x\"\n";
+        assert_eq!(
+            with_run(dotted, RunMode::Supervised, &[]).expect("written"),
+            "run.mode = \"supervised\"\nrun.paths = []\n[model]\nbot = \"x\"\n"
+        );
+        assert!(matches!(
+            with_run("version = 1\n<<<<<<< ours\n", RunMode::Off, &[]),
+            Err(HomeRefusal::Syntax(_))
+        ));
     }
 }

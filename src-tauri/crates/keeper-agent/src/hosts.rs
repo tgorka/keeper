@@ -332,11 +332,20 @@ pub(crate) trait CopyPort: Send + Sync {
     /// A new room for this copy's agent's memory review session, the home
     /// drive's readers invited (R128).
     fn review_room(&self) -> ClaimFuture<'_, Result<OwnedRoomId, String>>;
+    /// The console this host runs the copy's agent's commands in, as a
+    /// status says it (R440 09); `None` where the copy cannot say.
+    fn console(&self) -> Option<keeper_core::agents::events::StatusConsole> {
+        None
+    }
 }
 
 impl CopyPort for Copy {
     fn config(&self) -> &AgentConfig {
         &self.deps.home.config
+    }
+
+    fn console(&self) -> Option<keeper_core::agents::events::StatusConsole> {
+        Some(crate::agent::host_console(&self.deps))
     }
 
     fn principal_of(&self, drive: &str) -> Option<String> {
@@ -1715,6 +1724,8 @@ impl HostRuntime {
                             detail: None,
                             waiting: Some(text.clone()),
                             anchor: None,
+                            // Not placed yet: no host runs its commands.
+                            console: None,
                         };
                         match copy
                             .send_status(
@@ -2406,6 +2417,7 @@ impl HostRuntime {
             detail: detail.filter(|_| !narrowed),
             waiting,
             anchor: slot.status_anchor.clone(),
+            console: copy.console(),
         };
         match copy
             .send_status(room, serde_json::to_value(&status).unwrap_or(Value::Null))
@@ -2440,6 +2452,7 @@ impl HostRuntime {
             detail: None,
             waiting: None,
             anchor: None,
+            console: None,
         };
         let blocked = blocked_status(base, conflict);
         tracing::warn!(%room, "agents: {}", claims::conflict_line(conflict));

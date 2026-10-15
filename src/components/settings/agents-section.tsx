@@ -39,6 +39,13 @@
  * `[web_search].ask` of its `agent.toml`; the engine is the host's (on this
  * Mac: *Web search* below). *Without asking* carries Rust's standing warning.
  *
+ * **Each agent's console (Story 101.5, R420).** Every agent row shows its
+ * console's mode — Off, Supervised, Sandboxed or Full access, each with Rust's
+ * description, a mode this agent may not have disabled with Rust's reason —
+ * and the folders its commands may read and write. *Save console* writes only
+ * `[run].mode` and `[run].paths`; choosing Full access says Rust's standing
+ * warning beside the choice.
+ *
  * **Absent, not empty (AD-27).** No flagged folder and nothing this Mac keeps for
  * its agents — no MCP server, no `[sandbox]` row, no web search engine — renders nothing, and the
  * dialog renders the section only where `botTools` is true — a phone is never
@@ -68,6 +75,7 @@ import {
 import { Textarea } from "@/components/ui/textarea";
 import { logFailure } from "@/lib/failure";
 import {
+  type AgentConsoleVm,
   type AgentCopyVm,
   type AgentModelVm,
   type AgentPersonVm,
@@ -79,6 +87,7 @@ import {
   type AgentSeedReq,
   type AgentSeedResultVm,
   type AgentWebSearchVm,
+  agentsConsoleSet,
   agentsCopies,
   agentsCopySignIn,
   agentsDriveRepin,
@@ -91,6 +100,7 @@ import {
   agentsWebSearchGet,
   agentsWebSearchSet,
   type Effort,
+  type RunMode,
   type WebSearchLevel,
 } from "@/lib/ipc/client";
 
@@ -127,6 +137,8 @@ export const WEB_SEARCH_LEVELS: ReadonlyArray<readonly [WebSearchLevel, string]>
   ["ask", "Ask"],
   ["withoutAsking", "Without asking"],
 ];
+export const CONSOLE_SAVE_LABEL = "Save console";
+export const CONSOLE_ADD_FOLDER_LABEL = "Add folder";
 /** The level choice that sends none: the provider decides. */
 export const PROVIDER_DEFAULT_LABEL = "Provider's default";
 const DEFAULT_EFFORT = "default";
@@ -554,6 +566,9 @@ function AgentRow({
       {agent.webSearch !== null && (
         <AgentWebSearch agent={agent} webSearch={agent.webSearch} onRows={onRows} />
       )}
+      {agent.console !== null && (
+        <AgentConsole agent={agent} console={agent.console} onRows={onRows} />
+      )}
       {agent.problem !== null && (
         <p className="text-muted-foreground text-xs [overflow-wrap:anywhere]">{agent.problem}</p>
       )}
@@ -806,6 +821,243 @@ function AgentWebSearch({
           className="text-amber-700 text-xs [overflow-wrap:anywhere] dark:text-amber-400"
         >
           {webSearch.warning}
+        </p>
+      )}
+      {error !== null && (
+        <p role="alert" className="text-destructive text-xs [overflow-wrap:anywhere]">
+          {error}
+        </p>
+      )}
+    </div>
+  );
+}
+
+/**
+ * One agent's console (101.5 #3, R420): the mode Rust says the file sets, the
+ * modes it offers with each one's description — a mode this agent may not have
+ * is disabled and says why — and the folders its commands may read and write,
+ * each a drive's folder (`tgdrive/projects/site`) or an absolute path on a
+ * host, a folder this Mac does not give them saying why (R440, R381). At full
+ * access no folder holds its commands, and Rust's sentence says so where the
+ * folders would be. *Save console* writes only `[run].mode` and `[run].paths`;
+ * the person's choice is the approval for the mode. Choosing Full access says
+ * Rust's warning beside it. A refusal is Rust's sentence; a Mac that cannot
+ * write the drive says why and offers nothing.
+ */
+function AgentConsole({
+  agent,
+  console: shown,
+  onRows,
+}: {
+  agent: AgentCopyVm;
+  console: AgentConsoleVm;
+  onRows: (rows: AgentCopyVm[]) => void;
+}) {
+  const [mode, setMode] = useState<RunMode>(shown.mode);
+  const [paths, setPaths] = useState<string[]>(shown.paths);
+  const [folder, setFolder] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [saved, setSaved] = useState(false);
+  const id = useId();
+  const shownPaths = shown.paths.join("\n");
+  // A new reading of the file — another Mac's save, a hand edit — is what the
+  // row shows next.
+  useEffect(() => {
+    setMode(shown.mode);
+    setPaths(shownPaths === "" ? [] : shownPaths.split("\n"));
+  }, [shown.mode, shownPaths]);
+
+  const locked = shown.locked !== null;
+  const changed = mode !== shown.mode || paths.join("\n") !== shownPaths;
+  const chosen = shown.modes.find((candidate) => candidate.mode === mode);
+  const edited = () => {
+    setSaved(false);
+    setError(null);
+  };
+  const addFolder = () => {
+    const next = folder.trim();
+    if (next === "" || paths.includes(next)) {
+      return;
+    }
+    setPaths([...paths, next]);
+    setFolder("");
+    edited();
+  };
+
+  const save = async () => {
+    setBusy(true);
+    setError(null);
+    setSaved(false);
+    try {
+      onRows(
+        await agentsConsoleSet({
+          profileId: agent.profileId,
+          agent: agent.agent,
+          mode,
+          paths,
+          shownMode: shown.mode,
+          shownPaths: shown.paths,
+        }),
+      );
+      setSaved(true);
+    } catch (failure) {
+      logFailure("agents.consoleSet")(failure);
+      setError(messageOf(failure));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="flex min-w-0 flex-col gap-1" data-testid={`agent-console-${agent.agent}`}>
+      <div className="flex min-w-0 flex-wrap items-end gap-2">
+        <div className="flex min-w-0 flex-col gap-1">
+          <Label id={`${id}-mode`} className="text-xs">
+            Console
+          </Label>
+          <Select
+            value={mode}
+            disabled={busy || locked}
+            onValueChange={(next) => {
+              setMode(next as RunMode);
+              edited();
+            }}
+          >
+            <SelectTrigger
+              className="w-56 max-w-full"
+              aria-labelledby={`${id}-mode`}
+              data-testid={`agent-console-mode-${agent.agent}`}
+            >
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {shown.modes.map((candidate) => (
+                <SelectItem
+                  key={candidate.mode}
+                  value={candidate.mode}
+                  disabled={candidate.refused !== null && candidate.mode !== shown.mode}
+                >
+                  {candidate.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+        {!locked && (
+          <Button size="sm" disabled={busy || !changed} onClick={() => void save()}>
+            {CONSOLE_SAVE_LABEL}
+          </Button>
+        )}
+      </div>
+      {chosen !== undefined && (
+        <p className="text-muted-foreground text-xs [overflow-wrap:anywhere]">
+          {chosen.description}
+        </p>
+      )}
+      {chosen?.refused != null && (
+        <p className="text-muted-foreground text-xs [overflow-wrap:anywhere]">{chosen.refused}</p>
+      )}
+      {mode === "full" && (
+        <p
+          role="alert"
+          data-testid={`agent-console-warning-${agent.agent}`}
+          className="font-medium text-destructive text-xs [overflow-wrap:anywhere]"
+        >
+          {shown.warning}
+        </p>
+      )}
+      {mode === "full" && (
+        <p
+          data-testid={`agent-console-unrestricted-${agent.agent}`}
+          className="text-muted-foreground text-xs [overflow-wrap:anywhere]"
+        >
+          {shown.unrestricted}
+        </p>
+      )}
+      {mode !== "off" && mode !== "full" && (
+        <div className="flex min-w-0 flex-col gap-1">
+          <span id={`${id}-folders`} className="text-xs">
+            Folders its commands may read and write
+          </span>
+          {paths.length === 0 ? (
+            <p className="text-muted-foreground text-xs">None: only the session's own workspace.</p>
+          ) : (
+            <ul aria-labelledby={`${id}-folders`} className="flex min-w-0 flex-col gap-1">
+              {paths.map((path) => {
+                const refused = shown.refused.find((folder) => folder.path === path)?.refused;
+                return (
+                  <li key={path} className="flex min-w-0 flex-col gap-0.5">
+                    <div className="flex min-w-0 items-center gap-2">
+                      <code className="min-w-0 flex-1 text-xs [overflow-wrap:anywhere]">
+                        {path}
+                      </code>
+                      {!locked && (
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          disabled={busy}
+                          aria-label={`Remove ${path}`}
+                          onClick={() => {
+                            setPaths(paths.filter((kept) => kept !== path));
+                            edited();
+                          }}
+                        >
+                          Remove
+                        </Button>
+                      )}
+                    </div>
+                    {refused !== undefined && (
+                      <p className="text-destructive text-xs [overflow-wrap:anywhere]">{refused}</p>
+                    )}
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+          {!locked && (
+            <form
+              className="flex min-w-0 flex-wrap items-end gap-2"
+              aria-label={`Add a folder to ${agent.name}'s console`}
+              onSubmit={(event) => {
+                event.preventDefault();
+                addFolder();
+              }}
+            >
+              <Input
+                className="min-w-0 flex-1"
+                aria-label="Folder"
+                placeholder={
+                  shown.drives.length > 0
+                    ? `${shown.drives[0]}/folder or /absolute/path`
+                    : "/absolute/path"
+                }
+                autoCapitalize="off"
+                autoCorrect="off"
+                autoComplete="off"
+                spellCheck={false}
+                value={folder}
+                disabled={busy}
+                onChange={(event) => setFolder(event.target.value)}
+              />
+              <Button
+                type="submit"
+                size="sm"
+                variant="outline"
+                disabled={busy || folder.trim() === ""}
+              >
+                {CONSOLE_ADD_FOLDER_LABEL}
+              </Button>
+            </form>
+          )}
+        </div>
+      )}
+      {shown.locked !== null && (
+        <p className="text-muted-foreground text-xs [overflow-wrap:anywhere]">{shown.locked}</p>
+      )}
+      {saved && !changed && (
+        <p role="status" className="text-xs">
+          Saved to {agent.name}'s agent.toml. Its next turn runs with this console.
         </p>
       )}
       {error !== null && (

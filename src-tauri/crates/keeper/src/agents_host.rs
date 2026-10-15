@@ -19,6 +19,7 @@ use std::time::Duration;
 use keeper_agent::desktop::{self, DesktopFacts, DesktopHost, TickGate};
 use keeper_agent::seed as seeding;
 use keeper_core::agents::approval_card::HostedRooms;
+use keeper_core::agents::console::AgentConsoleReq;
 use keeper_core::agents::copy::{self, AgentCopyVm, AgentPinReq};
 use keeper_core::agents::mac_tables::{
     self, AgentMcpDraftVm, AgentMcpListVm, AgentMcpServerReq, AgentSandboxReq, AgentSandboxVm,
@@ -607,6 +608,39 @@ pub async fn agents_model_set(
         agent = %req.agent,
         effort = req.effort.map_or("default", |effort| effort.as_str()),
         "agents: an agent's model was saved to its agent.toml"
+    );
+    scan_next_tick();
+    rows(&state, facts).await
+}
+
+/// Settings › Agents: save one agent's console (story 101.5 #3, R420) —
+/// only `[run].mode` and `[run].paths` of its `agent.toml`, every other byte
+/// kept, through the drive's write path, as the person: the person's choice
+/// is the approval for the mode. The agent's next turn runs with it; the
+/// rows come back as they read now. A refusal is the row's
+/// sentence and a WARN line (R381).
+#[tauri::command]
+pub async fn agents_console_set(
+    state: State<'_, AppState>,
+    req: AgentConsoleReq,
+) -> Result<Vec<AgentCopyVm>, IpcError> {
+    let facts = facts_now(&state).await?;
+    let saved = {
+        let profiles = facts.profiles.clone();
+        let req = req.clone();
+        tokio::task::spawn_blocking(move || desktop::write_console(&profiles, &req))
+            .await
+            .map_err(|error| refusal(error.to_string()))?
+    };
+    if let Err(sentence) = saved {
+        tracing::warn!(agent = %req.agent, %sentence, "agents: an agent's console was not saved");
+        return Err(refusal(sentence));
+    }
+    tracing::info!(
+        agent = %req.agent,
+        mode = req.mode.as_str(),
+        folders = req.paths.len(),
+        "agents: an agent's console was saved to its agent.toml"
     );
     scan_next_tick();
     rows(&state, facts).await

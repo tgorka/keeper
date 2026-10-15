@@ -990,6 +990,7 @@ mod tests {
             detail: None,
             waiting: None,
             anchor: None,
+            console: None,
         }
     }
 

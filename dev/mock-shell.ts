@@ -58,6 +58,8 @@ import type {
   AccountVm,
   AgentAsksVm,
   AgentAskVm,
+  AgentConsoleReq,
+  AgentConsoleVm,
   AgentCopyVm,
   AgentFocusReq,
   AgentMcpDraftVm,
@@ -111,6 +113,7 @@ import type {
   ChatInlinePreviewVm,
   ChatInlineRowVm,
   ChoiceVm,
+  ConsoleModeVm,
   CopyJobVm,
   CredentialChoicesVm,
   DeviceCodeVm,
@@ -5903,6 +5906,122 @@ function agentModel(agent: string, localOnly: boolean): AgentModelVm {
   }
   return { bot, effort, bots: localOnly ? local : AGENT_BOTS, locked: null, unread: null };
 }
+// --- Each agent's console (story 101.5, R420) -------------------------------
+//
+// Nixi runs her console at full access (the header's standing marker, which
+// her serving host's status carries — R440 09 — and the Settings warning, with
+// Rust's "unrestricted" sentence where the folders would be); Tara is
+// sandboxed with two folders, one of which this Mac does not give her
+// commands (R440, R381), and a gate hands her outside work, so full access is
+// refused for her. `?consolesave=fails` makes every save fail as a read-only
+// drive would; `?headerconsole=unknown` makes Nixi's room's status come from a
+// host older than the console ("console: unknown", never a safe console).
+// Sentences are copied from `keeper_core::agents::console`.
+const consoleSaveFails = new URLSearchParams(window.location.search).get("consolesave") === "fails";
+const CONSOLE_CHANGED_UNDERNEATH =
+  "This agent's agent.toml names another console than the one shown here: it changed on the drive meanwhile. Look at it again and choose.";
+const CONSOLE_MODES: Array<Pick<ConsoleModeVm, "mode" | "label" | "description">> = [
+  { mode: "off", label: "Off", description: "No console: the agent runs no commands." },
+  {
+    mode: "supervised",
+    label: "Supervised",
+    description: "Every command waits for your approval, and runs in its host's sandbox.",
+  },
+  {
+    mode: "sandboxed",
+    label: "Sandboxed",
+    description:
+      "Commands run in its host's sandbox without asking, writing only the session's workspace and the folders below. A command that needs the network, reads a drive or asks for more folders asks.",
+  },
+  {
+    mode: "full",
+    label: "Full access",
+    description: "Commands run without a sandbox and without asking.",
+  },
+];
+const CONSOLE_UNRESTRICTED =
+  "Unrestricted — folders do not constrain full access: its commands reach anything its host's user can.";
+const CONSOLE_UNKNOWN = "Console: unknown. This agent's host does not say how its commands run.";
+const headerConsoleUnknown =
+  new URLSearchParams(window.location.search).get("headerconsole") === "unknown";
+function fullAccessWarning(name: string): string {
+  return `Full access: ${name}'s commands run on its host without a sandbox and without asking. They can read, change and delete anything that host's user can, and reach the network.`;
+}
+function agentConsole(agent: string, name: string): AgentConsoleVm {
+  const delegate = agent === "tara";
+  return {
+    mode: agent === "nixi" ? "full" : "sandboxed",
+    paths: agent === "nixi" ? [] : ["tgdrive/projects/site", "/Users/tgorka/prj/keeper"],
+    modes: CONSOLE_MODES.map((one) => ({
+      ...one,
+      refused:
+        delegate && one.mode === "full"
+          ? `${name} cannot have this mode: full access is never given to an agent a gate hands outside work to, and the gate forge names this one in its delegates.`
+          : null,
+    })),
+    drives: ["tgdrive"],
+    warning: fullAccessWarning(name),
+    unrestricted: CONSOLE_UNRESTRICTED,
+    refused:
+      agent === "nixi"
+        ? []
+        : [
+            {
+              path: "tgdrive/projects/site",
+              refused:
+                "Not given to its commands on this Mac: it holds a .keeper folder (notes/.keeper), which keeper keeps to itself.",
+            },
+          ],
+    locked: null,
+  };
+}
+/**
+ * The full-access marker `agent`'s serving host says in its status (101.5,
+ * R440 09): the mock's host reads the same row.
+ */
+function agentFullAccess(agent: string): string | undefined {
+  const row = agentRows.find((one) => one.agent === agent);
+  return row?.console?.mode === "full" ? row.console.warning : undefined;
+}
+function setAgentConsole(req: AgentConsoleReq): AgentCopyVm[] {
+  const refuse = (message: string) => {
+    throw { code: "internal", message, accountId: null, retriable: false };
+  };
+  const row = agentRows.find((one) => one.profileId === req.profileId && one.agent === req.agent);
+  if (row?.console == null) refuse(`tgdrive has no agent ${req.agent}.`);
+  const shown = row?.console as AgentConsoleVm;
+  if (shown.mode !== req.shownMode || shown.paths.join("\n") !== req.shownPaths.join("\n")) {
+    refuse(CONSOLE_CHANGED_UNDERNEATH);
+  }
+  const refused = shown.modes.find((one) => one.mode === req.mode)?.refused;
+  if (refused != null) refuse(refused);
+  for (const path of req.paths) {
+    if (!path.startsWith("/") && !path.startsWith("tgdrive/")) {
+      refuse(
+        `${row?.name}'s console was not changed: "${path}" is neither an absolute path nor a folder of a drive in this agent's scope (tgdrive).`,
+      );
+    }
+  }
+  if (consoleSaveFails) {
+    refuse(
+      `80-agents/${req.agent}/agent.toml could not be written: Read-only file system (os error 30)`,
+    );
+  }
+  agentRows = agentRows.map((one) =>
+    one === row
+      ? {
+          ...one,
+          console: {
+            ...shown,
+            mode: req.mode,
+            paths: req.paths,
+            refused: shown.refused.filter((folder) => req.paths.includes(folder.path)),
+          },
+        }
+      : one,
+  );
+  return agentRows;
+}
 function agentRow(agent: string, name: string): AgentCopyVm {
   const pin = agentPin();
   return {
@@ -5918,6 +6037,7 @@ function agentRow(agent: string, name: string): AgentCopyVm {
     problem: agentsParam === "differs" ? "tgdrive's agents zone hosts nothing here." : null,
     model: agentModel(agent, pin.localOnly),
     webSearch: agentWebSearch(agent, name, pin.localOnly),
+    console: agentConsole(agent, name),
     // Story 100.4: Tara's home holds a picture keeper does not read.
     avatarProblem:
       agent === "tara"
@@ -6030,6 +6150,7 @@ const BROKEN_FOLDER: AgentCopyVm = {
   problem: "`local_only` in _drive.toml must be true or false, not text.",
   model: null,
   webSearch: null,
+  console: null,
   avatarProblem: null,
 };
 let agentRows: AgentCopyVm[] =
@@ -7204,6 +7325,30 @@ function mockApprovalCards(): ApprovalCardVm[] {
         }),
       ];
     }
+    case "run-folders":
+      // A sandboxed run that asks for a folder beyond its console's (101.5,
+      // R440 08): T3, once only, the folder named as keeper landed it, read
+      // and write, for that run alone.
+      return [
+        approvalCard(id, 3, {
+          summary:
+            "Run `cargo` in `workspace/`, reading and writing `/Users/tgorka/prj/keeper-site` for this run only",
+          tool: "run",
+          payload: null,
+          scopes: [{ scope: "once", label: "Approve", detail: APPROVAL_SENTENCES.onceReach }],
+          run: {
+            argv: ["cargo", "build", "--manifest-path", "/Users/tgorka/prj/keeper-site/Cargo.toml"],
+            program: "/Users/tgorka/.cargo/bin/cargo · 7c0e5a91d2b4",
+            wrappers: [],
+            wrapped: null,
+            cwd: "workspace/",
+            reads: [],
+            timeoutS: 600,
+            held: [],
+            network: null,
+          },
+        }),
+      ];
     case "run-read":
       // A run without network that reads two drives — one named with a bidi
       // override, escaped as Rust escapes it — asks for the longest time,
@@ -7598,7 +7743,18 @@ let nextTimelineSubscription = 1;
 function withModelLine(header: AgentRoomHeaderVm): AgentRoomHeaderVm {
   if (header.status?.agent !== NIXI) return header;
   const model = agentModelLine("nixi");
-  return model === undefined ? header : { ...header, status: { ...header.status, model } };
+  // Her console as her serving host's status says it (story 101.5, R440 09);
+  // a host older than the console says nothing, read as "console: unknown".
+  const fullAccess = headerConsoleUnknown ? undefined : agentFullAccess("nixi");
+  return {
+    ...header,
+    status: {
+      ...header.status,
+      ...(model === undefined ? {} : { model }),
+      ...(fullAccess === undefined ? {} : { fullAccess }),
+      ...(headerConsoleUnknown ? { console: CONSOLE_UNKNOWN } : {}),
+    },
+  };
 }
 
 function subscribeMockTimeline(payload: Record<string, unknown>): number {
@@ -8854,6 +9010,7 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
   agents_seed_plan: (payload) => seedPlan(payload.req as AgentSeedReq),
   agents_seed_apply: (payload) => seedApply(payload.req as AgentSeedReq),
   agents_model_set: (payload) => setAgentModel(payload.req as AgentModelReq),
+  agents_console_set: (payload) => setAgentConsole(payload.req as AgentConsoleReq),
   agents_drive_repin: (payload) => {
     agentRows = agentRows.map((row) =>
       row.profileId !== payload.profileId || row.pin === null

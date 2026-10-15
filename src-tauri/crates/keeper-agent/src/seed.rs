@@ -951,6 +951,8 @@ mod dm {
             detail: None,
             waiting: None,
             anchor: None,
+            // Its host says its console once it serves the session.
+            console: None,
         };
         let content = serde_json::to_value(&status).map_err(|error| error.to_string())?;
         client

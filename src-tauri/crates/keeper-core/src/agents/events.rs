@@ -132,6 +132,27 @@ pub struct StatusContent {
     /// The status anchor this edit replaces.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchor: Option<OwnedEventId>,
+    /// The agent's console as the host writing this runs it (story 101.5,
+    /// R440 09): every device draws the room's console warning from it,
+    /// the home's drive on the device or not. A status without it is from
+    /// a host older than the console, read as "console: unknown".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub console: Option<StatusConsole>,
+}
+
+/// A status's `console`: the mode the host runs the agent's commands in —
+/// `off` where it offers no `run` — and how many of its console's folders
+/// the host does not give them (R381: which and why is on the host's log
+/// and the Settings row). No path: a status names none (S-16).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatusConsole {
+    pub mode: crate::agents::console::RunMode,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub refused: u32,
+}
+
+fn is_zero(count: &u32) -> bool {
+    *count == 0
 }
 
 /// A status's `run`: the five states a device shows; any other word is refused.
@@ -778,6 +799,7 @@ mod tests {
             detail: Some("2 tool calls".to_owned()),
             waiting: None,
             anchor: None,
+            console: None,
         };
         let value = serde_json::to_value(&status).expect("serialise");
         assert_eq!(value["kind"], "conversation");

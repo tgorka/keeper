@@ -14,6 +14,7 @@ pub mod ask;
 pub mod avatar;
 pub mod card;
 pub mod claim;
+pub mod console;
 pub mod consolidate;
 pub mod copy;
 pub mod curate;
