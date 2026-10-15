@@ -32,6 +32,7 @@
  */
 import { MessagesSquare, Plus, SlidersHorizontal } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { AGENT_ATTENTION_LABEL, AgentAttentionMark } from "@/components/agents/agent-attention";
 import { ConversationBody } from "@/components/chat/conversation-body";
 import { useSurfaceColumn } from "@/components/layout/surface-column";
 import { Button } from "@/components/ui/button";
@@ -48,7 +49,13 @@ import {
 } from "@/components/ui/select";
 import { IconHint } from "@/components/ui/tooltip";
 import { logFailure } from "@/lib/failure";
-import type { AgentFocusReq, MainDmAskVm, ProxyRoomVm, ScopeDriveVm } from "@/lib/ipc/client";
+import type {
+  AgentAttentionVm,
+  AgentFocusReq,
+  MainDmAskVm,
+  ProxyRoomVm,
+  ScopeDriveVm,
+} from "@/lib/ipc/client";
 import {
   agentConversationNew,
   agentFocus,
@@ -112,6 +119,12 @@ const RELIST_MOST_MS = 60_000;
 /** After asking for a new conversation, the dock looks for it this often, this long. */
 export const NEW_CONVERSATION_POLL_MS = 3_000;
 export const NEW_CONVERSATION_WAIT_MS = 120_000;
+
+/**
+ * While the dock lists rooms it reads them again this often, so each room's
+ * state (needs you, failed, working, done — story 101.6) moves with the agent.
+ */
+export const ATTENTION_RELIST_MS = 10_000;
 
 /** How long the scope editor waits for the host's answer before saying none came. */
 export const SCOPE_ANSWER_WAIT_MS = 30_000;
@@ -306,6 +319,13 @@ export function DockBody({ tellsNote = true }: { tellsNote?: boolean }) {
     });
   };
 
+  const listing = rooms !== null && !empty;
+  useEffect(() => {
+    if (!listing) return;
+    const timer = window.setInterval(() => void relist(), ATTENTION_RELIST_MS);
+    return () => clearInterval(timer);
+  }, [listing, relist]);
+
   useEffect(() => {
     if (!empty) return;
     let delay = RELIST_FIRST_MS;
@@ -398,6 +418,11 @@ export function DockBody({ tellsNote = true }: { tellsNote?: boolean }) {
   const manyAccounts = new Set(rooms.map((room) => room.accountId)).size > 1;
   const userOf = (accountId: string) =>
     accounts.find((account) => account.accountId === accountId)?.userId ?? accountId;
+  // Each room's state (story 101.6, R421): Rust's word, as the Agents
+  // window's row says it, drawn beside the room's name in the picker and its
+  // trigger.
+  const attentionOf = (room: DockRoom) => room.attention ?? null;
+  const currentAttention = attentionOf(current);
 
   return (
     <ConversationStoresProvider value={stores}>
@@ -415,17 +440,24 @@ export function DockBody({ tellsNote = true }: { tellsNote?: boolean }) {
             if (open) void relist();
           }}
         >
-          <SelectTrigger className="min-w-0 flex-1" aria-label={DOCK_PICKER_LABEL}>
+          <SelectTrigger
+            className="min-w-0 flex-1"
+            aria-label={
+              currentAttention === null
+                ? DOCK_PICKER_LABEL
+                : `${DOCK_PICKER_LABEL}, ${AGENT_ATTENTION_LABEL[currentAttention]}`
+            }
+          >
             <SelectValue placeholder={DOCK_PICKER_LABEL} />
           </SelectTrigger>
           <SelectContent>
             {rooms.map((room) => (
-              <SelectItem
+              <DockRoomItem
                 key={`${room.accountId} ${room.roomId}`}
                 value={`${room.accountId} ${room.roomId}`}
-              >
-                {manyAccounts ? `${room.name} · ${userOf(room.accountId)}` : room.name}
-              </SelectItem>
+                name={manyAccounts ? `${room.name} · ${userOf(room.accountId)}` : room.name}
+                attention={attentionOf(room)}
+              />
             ))}
           </SelectContent>
         </Select>
@@ -453,6 +485,16 @@ export function DockBody({ tellsNote = true }: { tellsNote?: boolean }) {
           />
         )}
       </div>
+      {listError !== null && (
+        // The rooms and their states stay as last read; this says they could
+        // not be read again, until a later look does (story 101.6, R381).
+        <p
+          role="alert"
+          className="shrink-0 border-border border-b px-3 py-2 text-destructive text-xs"
+        >
+          {listError}
+        </p>
+      )}
       {notice !== null && (
         <p
           role="status"
@@ -484,6 +526,36 @@ export function DockBody({ tellsNote = true }: { tellsNote?: boolean }) {
         }
       />
     </ConversationStoresProvider>
+  );
+}
+
+/**
+ * One room in the dock's picker: its name and, when Rust gave the room one, its
+ * state (story 101.6, R421). The mark beside the name is hidden from a screen
+ * reader, so the state is said in words it reads: Radix names the option by
+ * its text, not by an `aria-label`.
+ */
+function DockRoomItem({
+  value,
+  name,
+  attention,
+}: {
+  value: string;
+  name: string;
+  attention: AgentAttentionVm | null;
+}) {
+  return (
+    <SelectItem value={value}>
+      <span className="flex min-w-0 items-center gap-2">
+        <span className="truncate">{name}</span>
+        {attention !== null && (
+          <>
+            <span className="sr-only">, {AGENT_ATTENTION_LABEL[attention]}</span>
+            <AgentAttentionMark state={attention} />
+          </>
+        )}
+      </span>
+    </SelectItem>
   );
 }
 

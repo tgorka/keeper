@@ -350,6 +350,167 @@ fn capitalised(name: &str) -> String {
     }
 }
 
+/// Each `agent.toml` key keeper writes that an older build refuses, with
+/// the first keeper release that reads it and whether a file, as read,
+/// carries it (story 101.6, R422; R460). A host whose build predates a key
+/// refuses the whole home once the key reaches its drive — its key set is
+/// closed — and stops serving the agent. `[model].effort` came with story
+/// 100.2 (bc87bc37); `web_search` as a tool, `[web_search]` and `[run]`
+/// with epic 101 (stories 101.4 and 101.5): all first released after
+/// v0.10.3.
+pub const KEY_SINCE: &[KeySince] = &[
+    ("[model].effort", "0.10.4", |config| config.effort.is_some()),
+    (
+        "web_search in [tools].allow",
+        "0.10.4",
+        crate::agents::web_search::is_on,
+    ),
+    ("[web_search]", "0.10.4", |config| config.web_search_said),
+    ("[run]", "0.10.4", |config| config.run.said),
+];
+
+/// One row of [`KEY_SINCE`]: the key as a save's sentence names it, the
+/// first keeper release that reads it, and whether a parsed `agent.toml`
+/// carries it.
+pub type KeySince = (&'static str, &'static str, fn(&AgentConfig) -> bool);
+
+/// A host serving agents, as its live manifest says: its slug, its build's
+/// keeper version and the `<drive>/<id>` of each agent it hosts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServingHost {
+    pub host: String,
+    pub version: String,
+    pub agents: Vec<String>,
+}
+
+/// What a save that writes a key some build cannot read says when this Mac
+/// could not read which hosts serve the agent (story 101.6, R436): it cannot
+/// tell that no older host serves it, so nothing is written.
+pub const HOSTS_UNREAD: &str = "keeper could not read which hosts serve your agents, so it cannot tell whether an older one would stop serving this agent; nothing was saved. The reason is in keeper's log; try again.";
+
+/// The other live hosts serving this person's agents, as this Mac read their
+/// manifests, or [`HOSTS_UNREAD`]'s sentence when they could not be read. A
+/// successful read that found none is an empty list, never an error.
+pub type Inventory<'a> = Result<&'a [ServingHost], &'a str>;
+
+/// The live hosts `manifests` name — each `(state key, sender, content)` of
+/// a `dev.keeper.agent.host` in a principal's control room, believed only
+/// from one of `agents` ([`crate::agents::host::accept`]) — other than `me`
+/// (this device's own host, whose build is the one saving), live at
+/// `now_ms`; each host once (story 101.6, R422).
+pub fn serving_from<'a>(
+    manifests: impl IntoIterator<Item = (&'a str, &'a matrix_sdk::ruma::UserId, &'a serde_json::Value)>,
+    agents: &[matrix_sdk::ruma::OwnedUserId],
+    now_ms: u64,
+    me: Option<&str>,
+) -> Vec<ServingHost> {
+    let mut hosts: Vec<ServingHost> = manifests
+        .into_iter()
+        .filter_map(|(key, sender, content)| {
+            crate::agents::host::accept(key, sender, content, agents).ok()
+        })
+        .filter(|manifest| Some(manifest.host.as_str()) != me && manifest.is_live(now_ms))
+        .map(|manifest| ServingHost {
+            host: manifest.host,
+            version: manifest.version,
+            agents: manifest.agents,
+        })
+        .collect();
+    hosts.sort_by(|a, b| (&a.host, &a.version, &a.agents).cmp(&(&b.host, &b.version, &b.agents)));
+    hosts.dedup();
+    hosts
+}
+
+/// Whether a build of keeper `version` reads a key first released in
+/// `since`. The numbers are compared (`major.minor.patch`; anything after a
+/// `-` or `+` is not read); a version that does not read as one is no proof
+/// the key is read, so it does not.
+pub fn reads_since(version: &str, since: &str) -> bool {
+    fn triple(version: &str) -> Option<(u64, u64, u64)> {
+        let core = version.trim().trim_start_matches('v');
+        let core = core.split(['-', '+']).next()?;
+        let mut parts = core.split('.').map(|part| part.parse::<u64>().ok());
+        let triple = (parts.next()??, parts.next()??, parts.next()??);
+        parts.next().is_none().then_some(triple)
+    }
+    match (triple(version), triple(since)) {
+        (Some(have), Some(need)) => have >= need,
+        _ => false,
+    }
+}
+
+/// The keys of [`KEY_SINCE`] `config` carries.
+fn written_keys(config: &AgentConfig) -> Vec<(&'static str, &'static str)> {
+    KEY_SINCE
+        .iter()
+        .filter(|(_, _, carried)| carried(config))
+        .map(|(key, since, _)| (*key, *since))
+        .collect()
+}
+
+/// Whether saving `config` — the `agent.toml` of `agent` (`<drive>/<id>`)
+/// as a person's save would leave it — would hand a key to a host serving
+/// that agent whose build predates it: that host would refuse the home and
+/// stop serving `name` (story 101.6, R422; every save of Settings › Agents,
+/// R460). Each such host is one sentence naming the keys it does not read;
+/// nothing is written while any stands. A save writing such a key while the
+/// hosts could not be read is refused with the inventory's sentence (R436);
+/// one writing none — a file a build before them reads — is not held to
+/// the hosts at all.
+pub fn older_hosts(
+    config: &AgentConfig,
+    agent: &str,
+    serving: Inventory<'_>,
+) -> Result<(), String> {
+    let keys = written_keys(config);
+    if keys.is_empty() {
+        return Ok(());
+    }
+    let said: Vec<String> = serving
+        .map_err(str::to_owned)?
+        .iter()
+        .filter(|host| host.agents.iter().any(|served| served == agent))
+        .filter_map(|host| {
+            let unread: Vec<(&str, &str)> = keys
+                .iter()
+                .copied()
+                .filter(|(_, since)| !reads_since(&host.version, since))
+                .collect();
+            (!unread.is_empty()).then(|| predates(host, &unread, &config.name))
+        })
+        .collect();
+    if said.is_empty() {
+        Ok(())
+    } else {
+        Err(said.join(" "))
+    }
+}
+
+/// What a save says when `host` serves `name` on a build older than each
+/// of `keys` (`(key, since)`): the keys, and the release that reads them
+/// all.
+fn predates(host: &ServingHost, keys: &[(&str, &str)], name: &str) -> String {
+    let since = keys
+        .iter()
+        .map(|(_, since)| *since)
+        .reduce(|a, b| if reads_since(a, b) { a } else { b })
+        .unwrap_or_default();
+    let names: Vec<&str> = keys.iter().map(|(key, _)| *key).collect();
+    let listed = match names.split_last() {
+        Some((last, [])) => (*last).to_owned(),
+        Some((last, rest)) => format!("{} or {last}", rest.join(", ")),
+        None => String::new(),
+    };
+    format!(
+        "{} runs keeper {}, which does not read {listed} (keeper {since} does): saving it would stop {} serving {}. Update keeper on {} first; nothing was saved.",
+        host.host,
+        host.version,
+        host.host,
+        capitalised(name),
+        host.host
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -587,6 +748,196 @@ mod tests {
         assert_eq!(
             command(Some("Qwen"), &config, Err(BOTS_UNREAD)),
             Err(BOTS_UNREAD.to_owned())
+        );
+    }
+
+    /// 101.6 #3 (R422): a version is compared by its numbers; a version
+    /// that does not read as one is no proof of reading the key.
+    #[test]
+    fn a_version_reads_a_key_from_its_first_release_on() {
+        assert!(reads_since("0.10.4", "0.10.4"));
+        assert!(reads_since("0.11.0", "0.10.4"));
+        assert!(reads_since("1.0.0", "0.10.4"));
+        assert!(reads_since("0.10.10", "0.10.4"));
+        assert!(reads_since("v0.10.4+mac", "0.10.4"));
+        assert!(!reads_since("0.10.3", "0.10.4"));
+        assert!(!reads_since("0.9.99", "0.10.4"));
+        assert!(!reads_since("electra", "0.10.4"));
+        assert!(!reads_since("0.10", "0.10.4"));
+    }
+
+    /// 101.6 #3 (R422): saving `[model].effort` for an agent a host serves
+    /// on a build that predates it is refused naming that host; a host that
+    /// reads it, one serving another agent, or a save without the key,
+    /// passes.
+    #[test]
+    fn a_save_a_serving_host_cannot_read_is_refused_naming_the_host() {
+        let host = |slug: &str, version: &str, agents: &[&str]| ServingHost {
+            host: slug.to_owned(),
+            version: version.to_owned(),
+            agents: agents.iter().map(|agent| (*agent).to_owned()).collect(),
+        };
+        let with = agent(OPUS, "effort = \"high\"\n", false);
+        let without = agent(OPUS, "", false);
+        let electra = host("electra", "0.10.3", &["tgdrive/amelia"]);
+        let said = older_hosts(&with, "tgdrive/amelia", Ok(std::slice::from_ref(&electra)))
+            .expect_err("electra predates it");
+        assert!(
+            said.contains("electra") && said.contains("0.10.3"),
+            "{said}"
+        );
+        assert_eq!(
+            older_hosts(
+                &without,
+                "tgdrive/amelia",
+                Ok(std::slice::from_ref(&electra))
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            older_hosts(
+                &with,
+                "tgdrive/amelia",
+                Ok(&[host("electra", "0.10.4", &["tgdrive/amelia"])])
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            older_hosts(
+                &with,
+                "tgdrive/amelia",
+                Ok(&[host("electra", "0.10.3", &["tgdrive/nixi"])])
+            ),
+            Ok(())
+        );
+        let both = older_hosts(
+            &with,
+            "tgdrive/amelia",
+            Ok(&[electra, host("kalypso", "0.9.0", &["tgdrive/amelia"])]),
+        )
+        .expect_err("both predate it");
+        assert!(
+            both.contains("electra") && both.contains("kalypso"),
+            "{both}"
+        );
+    }
+
+    /// 101.6 #3 (R436, review 07): a save writing a key some build cannot
+    /// read is refused when the hosts could not be read, with the inventory's
+    /// own sentence; a read that found no host lets it through, and a save
+    /// writing no such key is not held to the hosts at all.
+    #[test]
+    fn an_unread_host_inventory_refuses_a_save_only_a_new_build_reads() {
+        let with = agent(OPUS, "effort = \"high\"\n", false);
+        let without = agent(OPUS, "", false);
+        assert_eq!(
+            older_hosts(&with, "tgdrive/amelia", Err(HOSTS_UNREAD)),
+            Err(HOSTS_UNREAD.to_owned())
+        );
+        assert_eq!(older_hosts(&with, "tgdrive/amelia", Ok(&[])), Ok(()));
+        assert_eq!(
+            older_hosts(&without, "tgdrive/amelia", Err(HOSTS_UNREAD)),
+            Ok(())
+        );
+    }
+
+    /// R460: every key epic 101 adds to `agent.toml` — `web_search` named
+    /// in `[tools].allow`, a `[web_search]` table (even one that only says
+    /// `ask = true`), a `[run]` table — is held to the serving hosts as
+    /// `[model].effort` is: a 0.10.3 host is named, once, with each key it
+    /// does not read; a 0.10.4 one is not; an unread inventory refuses; a
+    /// file a build before them reads passes either way.
+    #[test]
+    fn every_key_epic_101_writes_is_held_to_the_serving_hosts() {
+        let host = |version: &str| ServingHost {
+            host: "electra".to_owned(),
+            version: version.to_owned(),
+            agents: vec!["tgdrive/amelia".to_owned()],
+        };
+        let (old, new) = ([host("0.10.3")], [host("0.10.4")]);
+        let plain = agent(OPUS, "\n[tools]\nallow = [\"drive_read\"]\n", false);
+        for (extra, key) in [
+            (
+                "\n[tools]\nallow = [\"drive_read\", \"web_search\"]\n",
+                "web_search in [tools].allow",
+            ),
+            ("\n[web_search]\nask = true\n", "[web_search]"),
+            ("\n[run]\nmode = \"off\"\npaths = []\n", "[run]"),
+        ] {
+            let with = agent(OPUS, extra, false);
+            let said = older_hosts(&with, "tgdrive/amelia", Ok(&old)).expect_err(key);
+            assert!(
+                said.starts_with(&format!(
+                    "electra runs keeper 0.10.3, which does not read {key} (keeper 0.10.4 does)"
+                )),
+                "{said}"
+            );
+            assert_eq!(older_hosts(&with, "tgdrive/amelia", Ok(&new)), Ok(()));
+            assert_eq!(
+                older_hosts(&with, "tgdrive/amelia", Err(HOSTS_UNREAD)),
+                Err(HOSTS_UNREAD.to_owned())
+            );
+        }
+        let all = agent(
+            OPUS,
+            "effort = \"high\"\n\n[tools]\nallow = [\"web_search\", \"run\"]\n\n[web_search]\nask = false\n\n[run]\nmode = \"full\"\n",
+            false,
+        );
+        let said = older_hosts(&all, "tgdrive/amelia", Ok(&old)).expect_err("all four");
+        assert_eq!(said.matches("electra runs keeper").count(), 1, "{said}");
+        assert!(
+            said.contains(
+                "[model].effort, web_search in [tools].allow, [web_search] or [run] (keeper 0.10.4 does)"
+            ),
+            "{said}"
+        );
+        assert_eq!(older_hosts(&plain, "tgdrive/amelia", Ok(&old)), Ok(()));
+        assert_eq!(
+            older_hosts(&plain, "tgdrive/amelia", Err(HOSTS_UNREAD)),
+            Ok(())
+        );
+    }
+
+    /// 101.6 #3 (R422): the hosts a save is checked against are the live
+    /// manifests an agent of these zones sent, this device's own left out.
+    #[test]
+    fn the_hosts_a_save_is_checked_against_are_the_live_ones_agents_sent() {
+        use matrix_sdk::ruma::{OwnedUserId, UserId};
+        let manifest = |host: &str, expires: &str| {
+            serde_json::json!({
+                "v": 1, "host": host, "principal": "tgorka", "version": "0.10.3",
+                "always_on": true, "tools": [], "drives": [], "bots": [],
+                "agents": ["tgdrive/tola-grey"],
+                "renewed_at": "2026-10-15T11:59:00Z", "expires_at": expires,
+            })
+        };
+        let tola = UserId::parse("@tola:example.org").expect("tola");
+        let eve = UserId::parse("@eve:example.org").expect("eve");
+        let agents: Vec<OwnedUserId> = vec![tola.clone()];
+        let now = 1_760_529_600_000; // 2025-10-15T12:00:00Z
+        let live = manifest("electra", "2099-01-01T00:00:00Z");
+        let gone = manifest("delectra", "2020-01-01T00:00:00Z");
+        let mine = manifest("hesperia", "2099-01-01T00:00:00Z");
+        let forged = manifest("kalypso", "2099-01-01T00:00:00Z");
+        let hosts = serving_from(
+            [
+                ("electra", &*tola, &live),
+                ("electra", &*tola, &live),
+                ("delectra", &*tola, &gone),
+                ("hesperia", &*tola, &mine),
+                ("kalypso", &*eve, &forged),
+            ],
+            &agents,
+            now,
+            Some("hesperia"),
+        );
+        assert_eq!(
+            hosts,
+            [ServingHost {
+                host: "electra".to_owned(),
+                version: "0.10.3".to_owned(),
+                agents: vec!["tgdrive/tola-grey".to_owned()],
+            }]
         );
     }
 }

@@ -300,13 +300,21 @@ pub fn level(config: &AgentConfig) -> WebSearchLevel {
 /// two keys a level is — `web_search` named in `[tools].allow` or not
 /// ([`home::with_tool_allowed`]), and `[web_search].ask`
 /// ([`home::with_web_search_ask`]) — every other byte kept. Off and ask
-/// both leave `ask` asking, so a search switched on again asks first.
+/// both leave `ask` asking, so a search switched on again asks first. Off
+/// takes the `[web_search]` table out whole ([`home::without_table`]), so
+/// the file is one a build before epic 101 reads again (R460); a table
+/// written as dotted keys is left asking instead.
 pub fn with_level(
     text: &str,
     kind: AgentKind,
     level: WebSearchLevel,
 ) -> Result<String, HomeRefusal> {
     let allowed = home::with_tool_allowed(text, kind, WEB_SEARCH, level != WebSearchLevel::Off)?;
+    if level == WebSearchLevel::Off {
+        if let Some(bare) = home::without_table(&allowed, "web_search")? {
+            return Ok(bare);
+        }
+    }
     home::with_web_search_ask(&allowed, level != WebSearchLevel::WithoutAsking)
 }
 
@@ -772,7 +780,8 @@ mod tests {
 
     /// R457: a level is its two keys and no other byte — on writes the
     /// tool and leaves the file asking; without asking adds `ask = false`;
-    /// off takes the tool out and leaves it asking, so on again asks first.
+    /// off takes the tool and the `[web_search]` table out, the file as it
+    /// was before (R460), so on again asks first.
     #[test]
     fn a_level_writes_the_tool_and_its_ask_key_only() {
         use WebSearchLevel::{Ask, Off, WithoutAsking};
@@ -790,11 +799,8 @@ mod tests {
             unasked
         );
         let off = with_level(&unasked, kind, Off).expect("off");
-        assert_eq!(off, format!("{BEFORE}\n[web_search]\nask = true\n"));
-        assert_eq!(
-            with_level(&off, kind, Ask).expect("on again"),
-            format!("{ask}\n[web_search]\nask = true\n")
-        );
+        assert_eq!(off, BEFORE);
+        assert_eq!(with_level(&off, kind, Ask).expect("on again"), ask);
     }
 
     /// R428: a query is T1 only while anyone may read the session; a label

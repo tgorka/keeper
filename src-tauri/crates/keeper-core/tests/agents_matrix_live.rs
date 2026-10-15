@@ -2218,6 +2218,206 @@ async fn a_waiting_question_survives_a_restart_and_ends_on_the_proxys_answer() {
     assert!(ids.is_empty(), "the proxy's answer ends the wait: {ids:?}");
 }
 
+/// Story 101.6 (R453, review 04): a card waiting for the person survives a
+/// restart of their device in the room's state — the restored cache holds
+/// only the room's newest chunk, a newer status among it, and the card
+/// behind it; the row's reading reads the room back as 101.3's reader does
+/// and still says *Needs you*, where the restored chunk alone would not.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "live: Synapse on delectra"]
+async fn a_card_behind_a_restarts_chunk_still_needs_the_person() {
+    use keeper_core::agents::approval::{binding_digest, summary_of};
+    use keeper_core::agents::attention::{attention, of_room, AgentAttentionVm, Reader, RoomEvent};
+    use keeper_core::agents::room::holds_agent_power;
+    use keeper_core::agents::tier::AgentTool;
+    use keeper_core::agents::waiting::ASK_READ_BACK;
+
+    let smoke = Smoke::setup().await;
+    let root = TempDir::new();
+    let (tola, _) = smoke
+        .copy(
+            &root.path().join("tola"),
+            "nixi-paced",
+            "NIXI_PACED_PASSWORD",
+            "tola@smoke",
+        )
+        .await;
+    let (person, _) = smoke
+        .copy(
+            &root.path().join("tgorka"),
+            "tgorka-smoke",
+            "TGORKA_SMOKE_PASSWORD",
+            "tgorka@smoke",
+        )
+        .await;
+    smoke.set_ratelimit(&smoke.user("nixi-paced"), 0, 0).await;
+    person
+        .client()
+        .event_cache()
+        .subscribe()
+        .expect("event cache");
+    let (me, agent) = (smoke.user("tgorka-smoke"), smoke.user("nixi-paced"));
+    let room = tola
+        .create_room(
+            RoomKind::Session(SessionKind::Delegated),
+            "tola 2026-10-15",
+            vec![me.clone()],
+            &[],
+        )
+        .await
+        .expect("create room");
+    sync_until(&person, || person.client().get_room(&room).is_some()).await;
+    person.join(&room).await.expect("join");
+    tola.sync_once().await.expect("sync");
+
+    let status = |run: &str| {
+        json!({
+            "v": CONTENT_VERSION, "session": "01J9ZQ3W4K5M6N7P8Q9R0SESSN", "kind": "delegated",
+            "title": "Tola", "agent": agent.as_str(), "host": "delectra", "epoch": 1, "run": run,
+        })
+    };
+    tola.send(&room, events::STATUS, status("running"), None)
+        .await
+        .expect("status");
+    // A T2 card for a drive write, bound as a host binds it (R185), that
+    // the person may decide for an hour.
+    let args = json!({"profile": "tgdrive", "path": "notes/plan.md", "content": "hello"});
+    let preconditions = json!({
+        "files": [{"drive": "tgdrive", "path": "notes/plan.md",
+            "landing": "notes/plan.md", "sha256": null}],
+        "workspace": null, "screen": null, "max_staleness_s": null,
+    });
+    let (record, session) = (
+        "01J9ZQ3W4K5M6N7P8Q9R0APPRV",
+        "60-sessions/active/2026-10-15-tola",
+    );
+    let digest = binding_digest(
+        record,
+        session,
+        "tola",
+        "drive_write",
+        &args,
+        &Value::Null,
+        "c0ffee",
+        &preconditions,
+    )
+    .expect("digest");
+    let expires = chrono::Utc::now() + chrono::Duration::hours(1);
+    let card = tola
+        .send(
+            &room,
+            events::APPROVAL_REQUEST,
+            json!({
+                "v": CONTENT_VERSION, "id": record, "session": session,
+                "room": room.as_str(), "agent": "tola", "tier": 2,
+                "summary": summary_of(AgentTool::DriveWrite, &args, &Value::Null),
+                "action": {"tool": "drive_write", "args": args, "exec_binding": null},
+                "checkpoint_sha256": "c0ffee",
+                "preconditions": preconditions,
+                "binding_digest": digest, "scopes": ["once"],
+                "expires_at": expires.to_rfc3339(),
+                "approvers": [me.as_str()], "dispatch_chain": [me.as_str(), agent.as_str()],
+            }),
+            None,
+        )
+        .await
+        .expect("card");
+    // More than a restored cache holds, fewer than the reading reads back;
+    // then a newer status, inside the chunk a restart keeps.
+    let fillers = usize::from(ASK_READ_BACK) / 3;
+    for n in 0..fillers {
+        tola.send(
+            &room,
+            "m.room.message",
+            json!({"msgtype": "m.text", "body": format!("working {n}")}),
+            None,
+        )
+        .await
+        .expect("filler");
+    }
+    let newest = tola
+        .send(&room, events::STATUS, status("running"), None)
+        .await
+        .expect("newer status");
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while !cached_events(&person, &room)
+        .await
+        .iter()
+        .any(|e| e["event_id"] == newest.as_str())
+    {
+        assert!(Instant::now() < deadline, "the person never read the room");
+        person.sync_once().await.expect("sync");
+    }
+    let session = StoredSession::from_client(person.client())
+        .expect("session")
+        .to_json()
+        .expect("json");
+    drop(person);
+
+    let restored = AgentClient::open(
+        &smoke.homeserver,
+        &root.path().join("tgorka"),
+        "smoke-passphrase",
+    )
+    .await
+    .expect("reopen");
+    restored
+        .restore(StoredSession::from_json(&session).expect("session"))
+        .await
+        .expect("restore");
+    restored
+        .client()
+        .event_cache()
+        .subscribe()
+        .expect("event cache");
+    restored.sync_once().await.expect("sync");
+    let loaded = cached_events(&restored, &room).await;
+    assert!(
+        !loaded.iter().any(|e| e["event_id"] == card.as_str()),
+        "the restored cache already held the card ({} events): nothing to read back",
+        loaded.len()
+    );
+    assert!(
+        loaded.iter().any(|e| e["event_id"] == newest.as_str()),
+        "the restored chunk holds the newer status"
+    );
+    let joined = restored.client().get_room(&room).expect("room");
+    let levels = joined.power_levels().await.expect("power levels");
+    let is_agent = |user: &matrix_sdk::ruma::UserId| holds_agent_power(Some(&levels), user);
+    let owners = [agent.clone()];
+    let chunk_alone = attention(
+        loaded.iter().map(|event| RoomEvent {
+            event,
+            sealed: true,
+        }),
+        &Reader {
+            own: &me,
+            agent: &is_agent,
+            owners: &owners,
+            marker: None,
+            whole: true,
+        },
+        None,
+        chrono::Utc::now(),
+    );
+    assert_ne!(
+        chunk_alone.state,
+        Some(AgentAttentionVm::NeedsYou),
+        "the chunk alone holds no card"
+    );
+
+    let read = of_room(&joined, None).await;
+    assert_eq!(
+        read.state,
+        Some(AgentAttentionVm::NeedsYou),
+        "the card behind the restored chunk"
+    );
+    assert_eq!(
+        read.recheck_at.map(|at| at.timestamp()),
+        Some(expires.timestamp())
+    );
+}
+
 /// The ids of the asks waiting for `me` through `via` in `room`, as the
 /// decisions panel's reader reads them: the room read back through its event
 /// cache, then folded.

@@ -5027,6 +5027,7 @@ mod tests {
         };
         let copy = Arc::new(FakeCopy {
             known: Some(Arc::new(crate::rooms::Known {
+                refused: Vec::new(),
                 agents: vec![within.clone(), wider.clone()],
                 trust: Vec::new(),
             })),

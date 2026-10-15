@@ -343,6 +343,7 @@ export type { AccountStateVm } from "./gen/AccountStateVm";
 export type { AccountVm } from "./gen/AccountVm";
 export type { AgentAsksVm } from "./gen/AgentAsksVm";
 export type { AgentAskVm } from "./gen/AgentAskVm";
+export type { AgentAttentionVm } from "./gen/AgentAttentionVm";
 export type { AgentConsoleReq } from "./gen/AgentConsoleReq";
 export type { AgentConsoleVm } from "./gen/AgentConsoleVm";
 export type { AgentCopyVm } from "./gen/AgentCopyVm";

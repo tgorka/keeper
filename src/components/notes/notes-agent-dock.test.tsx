@@ -93,6 +93,7 @@ vi.mock("@tauri-apps/api/webview", () => ({
 
 import { COLUMN_COLLAPSE_PREFIX } from "@/components/layout/surface-column";
 import {
+  ATTENTION_RELIST_MS,
   DOCK_FOLDS_RAIL_BELOW_PX,
   DOCK_LOOK_AGAIN_LABEL,
   DOCK_NO_PROXY_SENTENCE,
@@ -855,5 +856,73 @@ describe("the assistant dock", () => {
     // Restored into the dock's draft, never the chat's.
     await waitFor(() => expect(message).toHaveValue("held body"));
     expect(composerStore.getState().restoreBody).toBeNull();
+  });
+  it("draws each room's state as Rust lists it, and follows it as it changes (story 101.6)", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      agentRoomsList.mockResolvedValue([
+        { ...proxyRoom(DM, "Nixi", "main"), attention: "working" },
+        { ...proxyRoom(READING, "Nixi — reading list", "conversation"), attention: "doneUnread" },
+      ]);
+      renderDock();
+      openDock();
+      const picker = await screen.findByRole("combobox", { name: "Conversation, working" }, SLOW);
+      expect(within(picker).getByTestId("agent-attention")).toHaveTextContent("Working");
+
+      agentRoomsList.mockResolvedValue([
+        { ...proxyRoom(DM, "Nixi", "main"), attention: "needsYou" },
+        proxyRoom(READING, "Nixi — reading list", "conversation"),
+      ]);
+      await act(async () => {
+        vi.advanceTimersByTime(ATTENTION_RELIST_MS);
+      });
+      const asked = await screen.findByRole("combobox", { name: "Conversation, needs you" }, SLOW);
+      expect(within(asked).getByTestId("agent-attention")).toHaveTextContent("Needs you");
+      fireEvent.keyDown(asked, { key: "Enter" });
+      expect(await screen.findByRole("option", { name: "Nixi, needs you" })).toBeInTheDocument();
+      expect(screen.getByRole("option", { name: "Nixi — reading list" })).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+  it("says a refresh failed beside the rooms it keeps, until one reads again (story 101.6, R436)", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const listed = [
+        { ...proxyRoom(DM, "Nixi", "main"), attention: "working" as const },
+        {
+          ...proxyRoom(READING, "Nixi — reading list", "conversation"),
+          attention: "doneUnread" as const,
+        },
+      ];
+      agentRoomsList.mockResolvedValue(listed);
+      renderDock();
+      openDock();
+      const picker = await screen.findByRole("combobox", { name: "Conversation, working" }, SLOW);
+      fireEvent.keyDown(picker, { key: "Enter" });
+      fireEvent.click(
+        await screen.findByRole("option", { name: "Nixi — reading list, done, unread" }),
+      );
+      await waitFor(() => expect(streams.has(READING)).toBe(true));
+
+      agentRoomsList.mockRejectedValue(new Error("offline"));
+      await act(async () => {
+        vi.advanceTimersByTime(ATTENTION_RELIST_MS);
+      });
+      expect(await screen.findByRole("alert")).toBeInTheDocument();
+      const kept = screen.getByRole("combobox", { name: "Conversation, done, unread" });
+      expect(kept).toHaveTextContent("Nixi — reading list");
+
+      agentRoomsList.mockResolvedValue(listed);
+      await act(async () => {
+        vi.advanceTimersByTime(ATTENTION_RELIST_MS);
+      });
+      await waitFor(() => expect(screen.queryByRole("alert")).not.toBeInTheDocument());
+      expect(
+        screen.getByRole("combobox", { name: "Conversation, done, unread" }),
+      ).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

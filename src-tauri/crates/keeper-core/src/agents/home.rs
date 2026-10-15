@@ -346,6 +346,9 @@ pub struct AgentConfig {
     /// agent searches without asking (R457); absent reads `true`. Says
     /// nothing unless `allow` names `web_search`.
     pub web_search_ask: bool,
+    /// Whether the file has a `[web_search]` table at all — a key a build
+    /// before epic 101 refuses ([`super::model::KEY_SINCE`], R460).
+    pub web_search_said: bool,
     /// Drive ids in scope, the home drive first.
     pub drives: Vec<String>,
     pub mcp: Vec<String>,
@@ -854,7 +857,9 @@ pub fn parse_agent_toml(
         promote: memory.bool("promote", true)?,
     };
     let gates = parse_gates(&root, kind, &matrix_user, drive)?;
-    let web_search_ask = match root.table("web_search", WEB_SEARCH_KEYS)? {
+    let web_search = root.table("web_search", WEB_SEARCH_KEYS)?;
+    let web_search_said = web_search.is_some();
+    let web_search_ask = match web_search {
         Some(section) => section.bool("ask", true)?,
         None => true,
     };
@@ -871,6 +876,7 @@ pub fn parse_agent_toml(
         local_only,
         allow,
         web_search_ask,
+        web_search_said,
         drives,
         mcp,
         skills,
@@ -1327,6 +1333,68 @@ pub fn with_web_search_ask(text: &str, ask: bool) -> Result<String, HomeRefusal>
     Ok(written)
 }
 
+/// `text`, an `agent.toml`, without its table `name`: the header line, the
+/// lines of its keys, and the blank line before the header that
+/// [`table_at_end`] writes — every other byte as it was (R460: the edit
+/// back to a file a build before epic 101 reads). `Ok(Some(text))`
+/// unchanged where the file has no `name`; `Ok(None)` where it is written
+/// in a form keeper does not lift out whole — dotted keys (`run.mode = …`),
+/// a table holding tables — so the caller writes its keys instead. A file
+/// that is not TOML is refused.
+pub fn without_table(text: &str, name: &str) -> Result<Option<String>, HomeRefusal> {
+    use toml_edit::{Document, Item, Value as EditValue};
+
+    let syntax = |error: toml_edit::TomlError| HomeRefusal::Syntax(error.message().to_owned());
+    let document = Document::parse(text).map_err(syntax)?;
+    let Some((key, item)) = document.as_table().get_key_value(name) else {
+        return Ok(Some(text.to_owned()));
+    };
+    // `(first byte, last byte, whether the blank line above goes too)`.
+    let lines = match item {
+        Item::Table(table) if !table.is_dotted() && !table.is_implicit() => {
+            table.span().and_then(|header| {
+                table
+                    .iter()
+                    .try_fold(header.end, |end, (_, item)| match item {
+                        Item::Value(value) => value.span().map(|span| end.max(span.end)),
+                        _ => None,
+                    })
+                    .map(|end| (header.start, end, true))
+            })
+        }
+        Item::Value(EditValue::InlineTable(_)) => key
+            .span()
+            .zip(item.span())
+            .map(|(key, value)| (key.start, value.end, false)),
+        _ => None,
+    };
+    let Some((start, end, blank_above)) = lines else {
+        return Ok(None);
+    };
+    let mut from = line_start(text, start);
+    if !text[from..start].trim().is_empty() {
+        return Ok(None);
+    }
+    if blank_above && from > 0 {
+        let above = line_start(text, from - 1);
+        if text[above..from].trim().is_empty() {
+            from = above;
+        }
+    }
+    let to = line_end(text, end);
+    let ending = if text[to..].starts_with("\r\n") {
+        2
+    } else {
+        usize::from(text[to..].starts_with('\n'))
+    };
+    let written = splice(text, vec![(from..to + ending, String::new())]);
+
+    // Read back as a reader will: the table is gone, or nothing is handed
+    // back.
+    let check = Document::parse(written.as_str()).map_err(syntax)?;
+    Ok(check.as_table().get(name).is_none().then_some(written))
+}
+
 /// The bytes of `text` switching a tool off removes from an array whose
 /// names sit at `spans`, its `]` at `close`, those `matched` going
 /// (R427): each matched string and its own comma — the one after it, or,
@@ -1448,7 +1516,8 @@ fn tool_removal(
 /// applied. The ranges never overlap; they are applied from the end, so the
 /// earlier ones still point where they did. Every `agent.toml` writer here
 /// ([`with_model`], [`with_tool_allowed`], [`with_web_search_ask`],
-/// [`with_run`]) is a list of such edits over the person's own bytes.
+/// [`with_run`], [`without_table`]) is a list of such edits over the
+/// person's own bytes.
 fn splice(text: &str, mut edits: Vec<(std::ops::Range<usize>, String)>) -> String {
     edits.sort_by_key(|(range, _)| std::cmp::Reverse(range.start));
     let mut written = text.to_owned();
@@ -2710,6 +2779,54 @@ promote               = true
             read(&format!("{}\n[web_search]\nasks = false\n", nixi())),
             Err(HomeRefusal::UnknownKey(_))
         ));
+    }
+
+    /// R460: a table keeper added is lifted out again with its header, its
+    /// keys and the blank line before it — the file as it was, in its line
+    /// endings; one between two others leaves them and their comments as
+    /// they were; an inline table goes as its line; a file without it is
+    /// handed back unchanged; dotted keys are not lifted (`None`), and the
+    /// host reads the result without the table.
+    #[test]
+    fn a_table_is_lifted_out_whole_or_not_at_all() {
+        const BEFORE: &str = "# Nixi\r\nversion = 1\r\n\r\n[tools]\r\nallow = [\"run\"]\r\n";
+        let added = with_run(BEFORE, super::super::console::RunMode::Full, &[]).expect("added");
+        assert_eq!(
+            without_table(&added, "run").expect("toml"),
+            Some(BEFORE.to_owned())
+        );
+        assert_eq!(
+            without_table(BEFORE, "run").expect("toml"),
+            Some(BEFORE.to_owned())
+        );
+
+        let between = "version = 1\n\n[run] # mine\n# why\nmode = \"full\"\npaths = [\n  \"/srv\",\n]\n\n# limits\n[limits]\nhop_limit = 1\n";
+        assert_eq!(
+            without_table(between, "run").expect("toml"),
+            Some("version = 1\n\n# limits\n[limits]\nhop_limit = 1\n".to_owned())
+        );
+        assert_eq!(
+            without_table(
+                "version = 1\nweb_search = { ask = false }\nid = \"x\"\n",
+                "web_search"
+            )
+            .expect("toml"),
+            Some("version = 1\nid = \"x\"\n".to_owned())
+        );
+        assert_eq!(
+            without_table("version = 1\nrun.mode = \"off\"\n", "run").expect("toml"),
+            None
+        );
+        assert!(without_table("<<<<<<< ours\n", "run").is_err());
+
+        let read = |text: &str| parse_agent_toml(text, "nixi", &tgdrive()).expect("parses");
+        let written = with_web_search_ask(&nixi(), false).expect("without asking");
+        assert!(read(&written).web_search_said);
+        let lifted = without_table(&written, "web_search")
+            .expect("toml")
+            .expect("lifted");
+        assert_eq!(lifted, nixi());
+        assert!(!read(&lifted).web_search_said);
     }
 
     #[test]

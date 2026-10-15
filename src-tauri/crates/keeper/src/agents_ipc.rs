@@ -200,13 +200,17 @@ pub async fn agent_surface_result(
 
 /// The person's proxy conversations on `account_id`, the DM first; each with
 /// the drives its scope chip may offer where the proxy's agents zone is on
-/// this device.
+/// this device, and its state as its Agents window row says it (story
+/// 101.6, R453).
 #[tauri::command]
 pub async fn agent_rooms_list(
     state: State<'_, AppState>,
     account_id: String,
 ) -> Result<Vec<ProxyRoomVm>, IpcError> {
-    Ok(state.accounts.agent_rooms(&account_id).await)
+    Ok(state
+        .accounts
+        .agent_rooms_attended(&state.platform, &account_id)
+        .await)
 }
 
 /// Ask the proxy in `room_id` for `drives` in scope (the scope chip).

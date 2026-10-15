@@ -47,6 +47,7 @@ use tokio::task::JoinHandle;
 use tracing::Instrument;
 
 use crate::agents::approval_card::{self, ApprovalDecideReq, HostedRooms, Viewer, NOTE_MAX};
+use crate::agents::attention as agent_attention;
 use crate::agents::device::{self as agent_device, AccountAgents, AgentDevice};
 use crate::agents::events::{
     ApprovalDecisionContent, ConversationRequestContent, Focus, MainDmRequestContent, ScopeContent,
@@ -1145,6 +1146,15 @@ impl AccountManager {
         let notify = self.notify.clone();
         let kinds = self.agent_kinds.clone();
         let icons = self.agent_icons.clone();
+        let proxies = self.agent_proxies.clone();
+        // Where the held sends are, for an agent row's questions (R453): a
+        // folder that cannot be named reads them in part.
+        let data_dir = platform
+            .data_dir()
+            .inspect_err(|error| {
+                tracing::warn!(%error, "room list: no data folder, so agent rows read the questions for you in part");
+            })
+            .ok();
         let span = tracing::info_span!("room_list_producer", account_id = %account_id);
         let reaper_subs = subs_arc.clone();
         let task = tokio::spawn(
@@ -1152,7 +1162,17 @@ impl AccountManager {
                 // `client` is captured to keep the account alive for the task's
                 // lifetime; the producer reads from the room list only.
                 let _keep_alive = client;
-                run_producer(room_list, sink, &account_id_owned, &notify, &kinds, &icons).await;
+                run_producer(
+                    room_list,
+                    sink,
+                    &account_id_owned,
+                    &notify,
+                    &kinds,
+                    &icons,
+                    &proxies,
+                    data_dir.as_deref(),
+                )
+                .await;
                 // A naturally-completed producer reaps its own subscription entry.
                 reaper_subs.lock().await.remove(&subscription_id);
             }
@@ -1299,6 +1319,13 @@ impl AccountManager {
             let kinds_for_task = self.agent_kinds.clone();
             let ready_for_task = self.launch_ready.clone();
             let icons_for_task = self.agent_icons.clone();
+            // The client's event cache says when an agent room's events
+            // change, so its row's state is read again (story 101.6); the
+            // proxies and the held sends are what 101.3's reading of the
+            // questions answered in a row's room needs (R453).
+            let client_for_inbox = client.clone();
+            let proxies_for_task = self.agent_proxies.clone();
+            let data_dir_for_task = data_dir.clone();
             let task = tokio::spawn(
                 async move {
                     run_inbox_producer(
@@ -1309,6 +1336,9 @@ impl AccountManager {
                         &kinds_for_task,
                         &ready_for_task,
                         &icons_for_task,
+                        client_for_inbox,
+                        &proxies_for_task,
+                        Some(&data_dir_for_task),
                     )
                     .await;
                 }
@@ -4342,6 +4372,73 @@ impl AccountManager {
         Ok(())
     }
 
+    /// The live hosts of the principals whose control rooms this app's
+    /// accounts are in, other than `me` (this device's own host), with
+    /// their builds' versions and the agents they serve, believed from the
+    /// agents whose zones are on this device: what a person's save of an
+    /// `agent.toml` key is checked against (story 101.6, R422). Read from
+    /// the store; never asks the server. A control room whose manifests the
+    /// store could not give is [`model::HOSTS_UNREAD`]'s sentence, with a
+    /// WARN naming why (R381, R436): never mistaken for no host at all.
+    ///
+    /// [`model::HOSTS_UNREAD`]: crate::agents::model::HOSTS_UNREAD
+    pub async fn serving_hosts(
+        &self,
+        me: Option<&str>,
+    ) -> Result<Vec<crate::agents::model::ServingHost>, String> {
+        use matrix_sdk::deserialized_responses::RawAnySyncOrStrippedState;
+        use matrix_sdk::ruma::{OwnedUserId, UserId};
+        use serde_json::Value;
+
+        let agents: Vec<OwnedUserId> = self.agent_icons.agents().into_iter().collect();
+        let clients: Vec<Client> = {
+            let accounts = self.accounts.lock().await;
+            accounts
+                .values()
+                .map(|handle| handle.client.clone())
+                .collect()
+        };
+        let mut manifests: Vec<(String, OwnedUserId, Value)> = Vec::new();
+        for client in clients {
+            for room in client.joined_rooms() {
+                if AgentRoomKind::of(room.room_type().as_ref()) != Some(AgentRoomKind::Control) {
+                    continue;
+                }
+                let states = room
+                    .get_state_events(StateEventType::from(crate::agents::events::HOST))
+                    .await
+                    .map_err(|error| {
+                        tracing::warn!(room = %room.room_id(), %error, "agents: a control room's host manifests could not be read; an agent.toml save that needs them is refused");
+                        crate::agents::model::HOSTS_UNREAD.to_owned()
+                    })?;
+                for state in states {
+                    let RawAnySyncOrStrippedState::Sync(raw) = state else {
+                        continue;
+                    };
+                    let Ok(event) = raw.deserialize_as::<Value>() else {
+                        continue;
+                    };
+                    let (Some(key), Some(sender)) = (
+                        event["state_key"].as_str(),
+                        event["sender"].as_str().and_then(|s| UserId::parse(s).ok()),
+                    ) else {
+                        continue;
+                    };
+                    manifests.push((key.to_owned(), sender, event["content"].clone()));
+                }
+            }
+        }
+        let now = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0);
+        Ok(crate::agents::model::serving_from(
+            manifests
+                .iter()
+                .map(|(key, sender, content)| (key.as_str(), &**sender, content)),
+            &agents,
+            now,
+            me,
+        ))
+    }
+
     /// The soul's marks of the agents whose zones are on this device, shared
     /// with the desktop's agents host, which replaces them on each scan; every
     /// agent room header reads its agent's mark here (91.1 acceptance 6).
@@ -4385,6 +4482,44 @@ impl AccountManager {
             }
         };
         agent_rooms_of(&client, account_id, &self.agent_kinds, &self.agent_proxies).await
+    }
+
+    /// [`Self::agent_rooms`], each with its state as its Agents window row
+    /// says it (story 101.6, R421, R453): what the notes dock lists.
+    pub async fn agent_rooms_attended(
+        &self,
+        platform: &Arc<dyn Platform>,
+        account_id: &str,
+    ) -> Vec<ProxyRoomVm> {
+        let client = {
+            let accounts = self.accounts.lock().await;
+            match accounts.get(account_id) {
+                Some(handle) => handle.client.clone(),
+                None => return Vec::new(),
+            }
+        };
+        let data_dir = platform
+            .data_dir()
+            .inspect_err(|error| {
+                tracing::warn!(%error, "agents: no data folder, so the dock reads the questions for you in part");
+            })
+            .ok();
+        let cx = AttentionCx {
+            account_id,
+            kinds: &self.agent_kinds,
+            proxies: &self.agent_proxies,
+            data_dir: data_dir.as_deref(),
+        };
+        let mut listed = self.agent_rooms(account_id).await;
+        for vm in &mut listed {
+            if let Some(room) = RoomId::parse(&vm.room_id)
+                .ok()
+                .and_then(|id| client.get_room(&id))
+            {
+                vm.attention = read_attention(&room, cx).await.state;
+            }
+        }
+        listed
     }
 
     /// The live agent session room `room_id` on `account_id`.
@@ -7245,19 +7380,8 @@ pub(crate) fn undo_room_of(
 }
 
 /// The questions waiting for this person that are answered in `room_id`
-/// (Story 101.3, R430, R431), oldest first.
-///
-/// `room_id` must be one of the person's proxy rooms ([`proxy::admits`]);
-/// any other room answers none. Every other agent session room this account
-/// reads is read back to [`agent_waiting::ASK_READ_BACK`] events and folded
-/// ([`agent_waiting::fold`]); an ask is here when the host puts it to the
-/// person here ([`agent_waiting::answered_in`] over the proxy's rooms this
-/// account reads). Each carries where its answer stands
-/// ([`agent_waiting::answer_state`]) by the person's messages here: those in
-/// the timeline, those in the send queue that did not fail, and those held
-/// for Undo-Send. A room that could not be read, an ask that could not be
-/// placed, or a held/queued send that could not be read is logged at WARN
-/// and said beside the panel ([`agent_waiting::ASKS_PARTIAL`], R381).
+/// (Story 101.3, R430, R431), oldest first: [`asks_answered_in`] of that
+/// room.
 async fn read_agent_asks(
     client: &Client,
     data_dir: &Path,
@@ -7269,14 +7393,58 @@ async fn read_agent_asks(
     let here = client
         .get_room(room_id)
         .ok_or(TimelineError::RoomNotFound)?;
+    Ok(
+        asks_answered_in(&here, Some(data_dir), account_id, kinds, proxies)
+            .await
+            .unwrap_or_default(),
+    )
+}
+
+/// The questions waiting for this person that are answered in `here`
+/// (Story 101.3, R430, R431; story 101.6, R453), oldest first: the one
+/// reading the decisions panel and the room's state in the list share.
+/// `None` for a room no question is answered in.
+///
+/// `here` must be one of the person's proxy rooms ([`proxy::admits`]); any
+/// other room answers none, but a session room whose status keeper has not
+/// read may be one, so it answers none read in part. Every other agent
+/// session room this account reads is read back to
+/// [`agent_waiting::ASK_READ_BACK`] events and folded
+/// ([`agent_waiting::fold`]); an ask is here when the host puts it to the
+/// person here ([`agent_waiting::answered_in`] over the proxy's rooms this
+/// account reads). Each carries where its answer stands
+/// ([`agent_waiting::answer_state`]) by the person's messages here: those in
+/// the timeline, those in the send queue that did not fail, and those held
+/// for Undo-Send (`data_dir`'s outbox; `None`: not readable). A room that
+/// could not be read or was read back only in part, an ask that could not
+/// be placed, or a held/queued send that could not be read is logged at
+/// WARN and said beside the panel ([`agent_waiting::ASKS_PARTIAL`], R381) —
+/// never a complete, empty answer (R453).
+pub(crate) async fn asks_answered_in(
+    here: &Room,
+    data_dir: Option<&Path>,
+    account_id: &str,
+    kinds: &AgentKinds,
+    proxies: &AgentProxies,
+) -> Option<agent_waiting::AgentAsksVm> {
+    let room_id = here.room_id();
     if AgentRoomKind::of(here.room_type().as_ref()) != Some(AgentRoomKind::Session) {
-        return Ok(agent_waiting::AgentAsksVm::default());
+        return None;
     }
-    let Ok((_, proxy)) = admit_proxy_room(&here, kinds, proxies).await else {
-        return Ok(agent_waiting::AgentAsksVm::default());
-    };
+    let client = here.client();
     let me = here.own_user_id().to_owned();
-    let known = known_proxies(client, proxies).await;
+    let known = known_proxies(&client, proxies).await;
+    let proxy = match proxy::admits(&proxy_row(here.clone(), kinds).await, &me, &known) {
+        Ok(admitted) => admitted.agent.to_owned(),
+        Err(proxy::Refusal::Unread) => {
+            tracing::warn!(room = %room_id, "agents: a room's status is unread, so the questions answered there could not be read");
+            return Some(agent_waiting::AgentAsksVm {
+                asks: Vec::new(),
+                note: Some(agent_waiting::ASKS_PARTIAL.to_owned()),
+            });
+        }
+        Err(_) => return None,
+    };
     let mut own: HashMap<OwnedRoomId, SessionKind> = HashMap::new();
     let mut others = Vec::new();
     for room in client.joined_rooms() {
@@ -7298,7 +7466,7 @@ async fn read_agent_asks(
     let mut partial = false;
     let mut waiting = Vec::new();
     for (room, kind) in others {
-        let (seen, whole) = match agent_waiting::read_room(&room).await {
+        let (seen, reach) = match agent_waiting::read_room(&room).await {
             Ok(read) => read,
             Err(error) => {
                 tracing::warn!(room = %room.room_id(), %error, "agents: a room's asks could not be read");
@@ -7306,6 +7474,9 @@ async fn read_agent_asks(
                 continue;
             }
         };
+        // An ask behind a failed read-back may be waiting (R453).
+        partial |= reach == agent_waiting::Reach::Part;
+        let whole = reach == agent_waiting::Reach::Start;
         let levels = match room.power_levels().await {
             Ok(levels) => levels,
             Err(error) => {
@@ -7334,7 +7505,7 @@ async fn read_agent_asks(
     }
     let mut asks = Vec::new();
     if !waiting.is_empty() {
-        let (mine, read_whole) = mine_in(&here, &me, data_dir, account_id).await;
+        let (mine, read_whole) = mine_in(here, &me, data_dir, account_id).await;
         partial |= !read_whole;
         for (ask, room) in waiting {
             let asked_by = room
@@ -7358,7 +7529,7 @@ async fn read_agent_asks(
         }
         asks.sort_by_key(|ask| ask.asked_at);
     }
-    Ok(agent_waiting::AgentAsksVm {
+    Some(agent_waiting::AgentAsksVm {
         asks,
         note: partial.then(|| agent_waiting::ASKS_PARTIAL.to_owned()),
     })
@@ -7366,13 +7537,14 @@ async fn read_agent_asks(
 
 /// The person's own text messages in `room` as [`agent_waiting::answer_state`]
 /// reads them, and whether every source was read: the room's events (read
-/// back as an ask's room is), the send queue's local echoes that have not
-/// failed, and the sends held for Undo-Send. A source that cannot be read is
-/// logged at WARN and left out.
+/// back as an ask's room is; one read back only in part is not whole), the
+/// send queue's local echoes that have not failed, and the sends held for
+/// Undo-Send in `data_dir`'s outbox (`None`: unreadable). A source that
+/// cannot be read is logged at WARN and left out.
 async fn mine_in(
     room: &Room,
     me: &matrix_sdk::ruma::UserId,
-    data_dir: &Path,
+    data_dir: Option<&Path>,
     account_id: &str,
 ) -> (Vec<agent_waiting::Mine>, bool) {
     let text = |content: &serde_json::Value| {
@@ -7383,15 +7555,19 @@ async fn mine_in(
     let mut mine = Vec::new();
     let mut whole = true;
     match agent_waiting::read_room(room).await {
-        Ok((seen, _)) => mine.extend(seen.iter().filter_map(|seen| {
-            let event = &seen.value;
-            (event["type"] == "m.room.message" && event["sender"] == me.as_str()).then_some(())?;
-            Some(agent_waiting::Mine {
-                body: text(&event["content"])?,
-                at: event["origin_server_ts"].as_u64()?,
-                held: false,
-            })
-        })),
+        Ok((seen, reach)) => {
+            whole &= reach != agent_waiting::Reach::Part;
+            mine.extend(seen.iter().filter_map(|seen| {
+                let event = &seen.value;
+                (event["type"] == "m.room.message" && event["sender"] == me.as_str())
+                    .then_some(())?;
+                Some(agent_waiting::Mine {
+                    body: text(&event["content"])?,
+                    at: event["origin_server_ts"].as_u64()?,
+                    held: false,
+                })
+            }));
+        }
         Err(error) => {
             tracing::warn!(room = %room.room_id(), %error, "agents: the person's answers could not be read");
             whole = false;
@@ -7423,8 +7599,8 @@ async fn mine_in(
             whole = false;
         }
     }
-    match registry::list_outbox_rows_for_account(data_dir, account_id) {
-        Ok(rows) => mine.extend(
+    match data_dir.map(|dir| registry::list_outbox_rows_for_account(dir, account_id)) {
+        Some(Ok(rows)) => mine.extend(
             rows.into_iter()
                 .filter(|row| {
                     row.room_id == room.room_id().as_str() && row.kind == MessageKind::Text
@@ -7437,8 +7613,12 @@ async fn mine_in(
                     })
                 }),
         ),
-        Err(error) => {
+        Some(Err(error)) => {
             tracing::warn!(room = %room.room_id(), %error, "agents: the held sends could not be read for the person's answers");
+            whole = false;
+        }
+        None => {
+            tracing::warn!(room = %room.room_id(), "agents: no data folder, so the held sends could not be read for the person's answers");
             whole = false;
         }
     }
@@ -8268,6 +8448,7 @@ fn map_encryption_status(state: &VerificationState) -> EncryptionStatus {
 /// Drive the recency-sorted entries stream, converting each `VectorDiff` batch
 /// into a [`RoomListBatch`] and forwarding it to `sink`. The stream yields
 /// nothing until the filter is set, then a `Reset` and live diffs.
+#[allow(clippy::too_many_arguments)]
 async fn run_producer(
     room_list: RoomList,
     sink: BatchSink,
@@ -8275,7 +8456,18 @@ async fn run_producer(
     notify: &NotifyConfig,
     kinds: &AgentKinds,
     icons: &AgentIcons,
+    proxies: &AgentProxies,
+    data_dir: Option<&Path>,
 ) {
+    let now = RowNow {
+        rows: None,
+        cx: AttentionCx {
+            account_id,
+            kinds,
+            proxies,
+            data_dir,
+        },
+    };
     let mut loading_state = room_list.loading_state();
     let (stream, controller) = room_list.entries_with_dynamic_adapters(ROOM_LIST_PAGE_SIZE);
     if !controller.set_filter(Box::new(new_filter_non_left())) {
@@ -8306,7 +8498,7 @@ async fn run_producer(
                         let mut ops = Vec::with_capacity(diffs.len());
                         for diff in diffs {
                             diff.clone().apply(&mut rows);
-                            ops.push(diff_to_op(diff, account_id, notify, kinds, icons).await);
+                            ops.push(diff_to_op(diff, account_id, notify, kinds, icons, now).await);
                         }
                         if !(sink)(RoomListBatch { ops, total }) {
                             tracing::info!(account_id = %account_id, "room list channel closed, stopping producer");
@@ -8324,7 +8516,7 @@ async fn run_producer(
                     seats_open = false;
                     continue;
                 }
-                let ops = agent_rows(&rows, account_id, notify, kinds, icons).await;
+                let ops = agent_rows(&rows, account_id, notify, kinds, icons, now).await;
                 if !ops.is_empty() && !(sink)(RoomListBatch { ops, total }) {
                     tracing::info!(account_id = %account_id, "room list channel closed, stopping producer");
                     break;
@@ -8347,6 +8539,7 @@ async fn agent_rows(
     notify: &NotifyConfig,
     kinds: &AgentKinds,
     icons: &AgentIcons,
+    now: RowNow<'_>,
 ) -> Vec<RoomListOp> {
     let mut ops = Vec::new();
     for (index, item) in rows.iter().enumerate() {
@@ -8355,7 +8548,7 @@ async fn agent_rows(
         }
         ops.push(RoomListOp::Set {
             index: index as u32,
-            room: room_item_to_vm(item, account_id, notify, kinds, icons).await,
+            room: room_item_to_vm(item, account_id, notify, kinds, icons, RowRead::Now(now)).await,
         });
     }
     ops
@@ -8367,6 +8560,7 @@ async fn agent_rows(
 /// [`InboxMerger`], which folds it into that account's slot and re-emits the
 /// merged window. Stops when the merger reports the output channel is closed or
 /// the entries stream ends.
+#[allow(clippy::too_many_arguments)]
 async fn run_inbox_producer(
     room_list: RoomList,
     merger: InboxMerger,
@@ -8375,7 +8569,16 @@ async fn run_inbox_producer(
     kinds: &AgentKinds,
     launch_ready: &LaunchReadiness,
     icons: &AgentIcons,
+    client: Option<Client>,
+    proxies: &AgentProxies,
+    data_dir: Option<&Path>,
 ) {
+    let cx = AttentionCx {
+        account_id,
+        kinds,
+        proxies,
+        data_dir,
+    };
     let mut loading_state = room_list.loading_state();
     let (stream, controller) = room_list.entries_with_dynamic_adapters(ROOM_LIST_PAGE_SIZE);
     if !controller.set_filter(Box::new(new_filter_non_left())) {
@@ -8401,6 +8604,22 @@ async fn run_inbox_producer(
     // A seat's kind, agent or title that changed redraws them too (R451).
     let mut seats = kinds.subscribe();
     let mut seats_open = true;
+    // An agent room's state in the list (story 101.6, R421) is read from
+    // events the room list does not watch — a status, an approval, a
+    // question — so a change of an agent room's events reads it again, and
+    // its row is redrawn when the state it names changed. `noted` is what
+    // each agent room's row last said, and when a card in it expires: then
+    // the room is read again with no event having come (R436).
+    let mut room_events = client
+        .as_ref()
+        .map(|client| client.event_cache().subscribe_to_room_generic_updates());
+    let mut events_open = room_events.is_some();
+    let noted = agent_attention::RowAttention::default();
+    // A question, or the answer its proxy relays, lands in an agent room
+    // other than the one the person answers it in (R453): when any agent
+    // session room changes, the rows that show questions asked elsewhere are
+    // read again once the burst settles.
+    let mut asks_due: Option<tokio::time::Instant> = None;
 
     futures_util::pin_mut!(stream);
     loop {
@@ -8411,7 +8630,7 @@ async fn run_inbox_producer(
                         let mut ops = Vec::with_capacity(diffs.len());
                         for diff in diffs {
                             diff.clone().apply(&mut rows);
-                            ops.push(diff_to_op(diff, account_id, notify, kinds, icons).await);
+                            ops.push(diff_to_op(diff, account_id, notify, kinds, icons, RowNow { rows: Some(&noted), cx }).await);
                         }
                         if !merger.apply_account_batch(account_id, RoomListBatch { ops, total }).await {
                             tracing::info!(account_id = %account_id, "inbox channel closed, stopping producer");
@@ -8429,7 +8648,7 @@ async fn run_inbox_producer(
                     pictures_open = false;
                     continue;
                 }
-                let ops = agent_rows(&rows, account_id, notify, kinds, icons).await;
+                let ops = agent_rows(&rows, account_id, notify, kinds, icons, RowNow { rows: Some(&noted), cx }).await;
                 if !ops.is_empty()
                     && !merger.apply_account_batch(account_id, RoomListBatch { ops, total }).await
                 {
@@ -8442,7 +8661,81 @@ async fn run_inbox_producer(
                     seats_open = false;
                     continue;
                 }
-                let ops = agent_rows(&rows, account_id, notify, kinds, icons).await;
+                let ops = agent_rows(&rows, account_id, notify, kinds, icons, RowNow { rows: Some(&noted), cx }).await;
+                if !ops.is_empty()
+                    && !merger.apply_account_batch(account_id, RoomListBatch { ops, total }).await
+                {
+                    tracing::info!(account_id = %account_id, "inbox channel closed, stopping producer");
+                    break;
+                }
+            }
+            update = async {
+                match room_events.as_mut() {
+                    Some(updates) => updates.recv().await,
+                    None => std::future::pending().await,
+                }
+            }, if events_open => {
+                let changed: Vec<OwnedRoomId> = match update {
+                    Ok(update) => {
+                        if asks_due.is_none()
+                            && rows.iter().any(|item| {
+                                item.room_id() == update.room_id
+                                    && agent_room::AgentRoomKind::of(item.room_type().as_ref())
+                                        == Some(agent_room::AgentRoomKind::Session)
+                            })
+                        {
+                            asks_due = Some(tokio::time::Instant::now() + ASKS_SETTLE);
+                        }
+                        vec![update.room_id]
+                    }
+                    // Missed updates: every agent room is read again.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => rows
+                        .iter()
+                        .map(|item| item.room_id().to_owned())
+                        .collect(),
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        events_open = false;
+                        continue;
+                    }
+                };
+                let ops = redraw_attention(&rows, &changed, &noted, notify, icons, cx).await;
+                if !ops.is_empty()
+                    && !merger.apply_account_batch(account_id, RoomListBatch { ops, total }).await
+                {
+                    tracing::info!(account_id = %account_id, "inbox channel closed, stopping producer");
+                    break;
+                }
+            }
+            () = async {
+                let wait = noted
+                    .next_recheck()
+                    .map(|at| (at - chrono::Utc::now()).to_std().unwrap_or_default());
+                match wait {
+                    Some(wait) => tokio::time::sleep(wait).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                // A card expired: its room is read again, no event having come.
+                let due = noted.due(chrono::Utc::now());
+                let ops = redraw_attention(&rows, &due, &noted, notify, icons, cx).await;
+                if !ops.is_empty()
+                    && !merger.apply_account_batch(account_id, RoomListBatch { ops, total }).await
+                {
+                    tracing::info!(account_id = %account_id, "inbox channel closed, stopping producer");
+                    break;
+                }
+            }
+            () = async {
+                match asks_due {
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                // An agent room changed: the rows showing questions asked
+                // elsewhere are read again (R453).
+                asks_due = None;
+                let ask_rooms = noted.ask_rooms();
+                let ops = redraw_attention(&rows, &ask_rooms, &noted, notify, icons, cx).await;
                 if !ops.is_empty()
                     && !merger.apply_account_batch(account_id, RoomListBatch { ops, total }).await
                 {
@@ -8463,6 +8756,42 @@ async fn run_inbox_producer(
             }
         }
     }
+}
+
+/// The rows of `changed` agent rooms whose state a fresh reading changed,
+/// each redrawn from that one reading (story 101.6, R436, R453); `noted`
+/// keeps what each row says now and when to read it again.
+async fn redraw_attention(
+    rows: &matrix_sdk_ui::eyeball_im::Vector<RoomListItem>,
+    changed: &[OwnedRoomId],
+    noted: &agent_attention::RowAttention,
+    notify: &NotifyConfig,
+    icons: &AgentIcons,
+    cx: AttentionCx<'_>,
+) -> Vec<RoomListOp> {
+    let (account_id, kinds) = (cx.account_id, cx.kinds);
+    let mut ops = Vec::new();
+    for (index, item) in rows.iter().enumerate() {
+        if !changed.iter().any(|room| room == item.room_id()) {
+            continue;
+        }
+        if !matches!(
+            agent_room::AgentRoomKind::of(item.room_type().as_ref()),
+            Some(kind) if kind != agent_room::AgentRoomKind::Control
+        ) {
+            continue;
+        }
+        let read = read_attention(item, cx).await;
+        if !noted.note(item.room_id(), &read) {
+            continue;
+        }
+        ops.push(RoomListOp::Set {
+            index: index as u32,
+            room: room_item_to_vm(item, account_id, notify, kinds, icons, RowRead::Read(read))
+                .await,
+        });
+    }
+    ops
 }
 
 /// Per-account Spaces producer (Story 4.5). Enumerates the account's joined
@@ -8682,8 +9011,9 @@ async fn diff_to_op(
     notify: &NotifyConfig,
     kinds: &AgentKinds,
     icons: &AgentIcons,
+    now: RowNow<'_>,
 ) -> RoomListOp {
-    let mapped = map_vector_diff(diff, account_id, notify, kinds, icons).await;
+    let mapped = map_vector_diff(diff, account_id, notify, kinds, icons, now).await;
     vector_diff_to_op(mapped)
 }
 
@@ -8700,38 +9030,49 @@ async fn map_vector_diff(
     notify: &NotifyConfig,
     kinds: &AgentKinds,
     icons: &AgentIcons,
+    now: RowNow<'_>,
 ) -> VectorDiff<RoomVm> {
     match diff {
         VectorDiff::Append { values } => {
             let mut vms = Vec::with_capacity(values.len());
             for item in values {
-                vms.push(room_item_to_vm(&item, account_id, notify, kinds, icons).await);
+                vms.push(
+                    room_item_to_vm(&item, account_id, notify, kinds, icons, RowRead::Now(now))
+                        .await,
+                );
             }
             VectorDiff::Append { values: vms.into() }
         }
         VectorDiff::Clear => VectorDiff::Clear,
         VectorDiff::PushFront { value } => VectorDiff::PushFront {
-            value: room_item_to_vm(&value, account_id, notify, kinds, icons).await,
+            value: room_item_to_vm(&value, account_id, notify, kinds, icons, RowRead::Now(now))
+                .await,
         },
         VectorDiff::PushBack { value } => VectorDiff::PushBack {
-            value: room_item_to_vm(&value, account_id, notify, kinds, icons).await,
+            value: room_item_to_vm(&value, account_id, notify, kinds, icons, RowRead::Now(now))
+                .await,
         },
         VectorDiff::PopFront => VectorDiff::PopFront,
         VectorDiff::PopBack => VectorDiff::PopBack,
         VectorDiff::Insert { index, value } => VectorDiff::Insert {
             index,
-            value: room_item_to_vm(&value, account_id, notify, kinds, icons).await,
+            value: room_item_to_vm(&value, account_id, notify, kinds, icons, RowRead::Now(now))
+                .await,
         },
         VectorDiff::Set { index, value } => VectorDiff::Set {
             index,
-            value: room_item_to_vm(&value, account_id, notify, kinds, icons).await,
+            value: room_item_to_vm(&value, account_id, notify, kinds, icons, RowRead::Now(now))
+                .await,
         },
         VectorDiff::Remove { index } => VectorDiff::Remove { index },
         VectorDiff::Truncate { length } => VectorDiff::Truncate { length },
         VectorDiff::Reset { values } => {
             let mut vms = Vec::with_capacity(values.len());
             for item in values {
-                vms.push(room_item_to_vm(&item, account_id, notify, kinds, icons).await);
+                vms.push(
+                    room_item_to_vm(&item, account_id, notify, kinds, icons, RowRead::Now(now))
+                        .await,
+                );
             }
             VectorDiff::Reset { values: vms.into() }
         }
@@ -8797,6 +9138,42 @@ async fn resolve_mute_state(
     MuteState::None
 }
 
+/// How a row's agent state is had (story 101.6, R436): read now and noted in
+/// the producer's `rows`, when it keeps them, or read already by the caller.
+enum RowRead<'a> {
+    Now(RowNow<'a>),
+    Read(agent_attention::Attention),
+}
+
+/// A row's agent state read now: noted in the producer's `rows` when it
+/// keeps them, read with `cx`.
+#[derive(Clone, Copy)]
+struct RowNow<'a> {
+    rows: Option<&'a agent_attention::RowAttention>,
+    cx: AttentionCx<'a>,
+}
+
+/// What reading an agent room's state needs beyond the room (story 101.6,
+/// R453): what 101.3's reading of the questions answered there needs — the
+/// account, the session kinds read so far, the agents this device knows as
+/// the person's proxies, and the data folder holding the held sends
+/// (`None`: unreadable, so that reading is in part).
+#[derive(Clone, Copy)]
+struct AttentionCx<'a> {
+    account_id: &'a str,
+    kinds: &'a AgentKinds,
+    proxies: &'a AgentProxies,
+    data_dir: Option<&'a Path>,
+}
+
+/// The state of the agent room `room` (story 101.6, R421, R453): its own
+/// events, read back as 101.3 reads an asking room, and the questions
+/// 101.3's projection ([`asks_answered_in`]) puts to the person there.
+async fn read_attention(room: &Room, cx: AttentionCx<'_>) -> agent_attention::Attention {
+    let asks = asks_answered_in(room, cx.data_dir, cx.account_id, cx.kinds, cx.proxies).await;
+    agent_attention::of_room(room, asks.as_ref()).await
+}
+
 /// Resolve a [`RoomListItem`] to a non-secret [`RoomVm`]: display name plus a
 /// latest-event text preview and timestamp.
 async fn room_item_to_vm(
@@ -8805,6 +9182,7 @@ async fn room_item_to_vm(
     notify: &NotifyConfig,
     kinds: &AgentKinds,
     icons: &AgentIcons,
+    read: RowRead<'_>,
 ) -> RoomVm {
     let room_id = item.room_id().to_string();
     let resolved = item.display_name().await;
@@ -8882,6 +9260,19 @@ async fn room_item_to_vm(
                 (titled.unwrap_or(display_name), mark)
             }
         };
+    // Whether the room needs the person, failed, works or finished unread
+    // (story 101.6, R421): Rust's word for the row, read once per row.
+    let agent_attention = match (agent_room, read) {
+        (Some(agent_room::AgentRoomKindVm::Control) | None, _) => None,
+        (Some(_), RowRead::Read(read)) => read.state,
+        (Some(_), RowRead::Now(now)) => {
+            let read = read_attention(item, now.cx).await;
+            if let Some(rows) = now.rows {
+                rows.note(item.room_id(), &read);
+            }
+            read.state
+        }
+    };
 
     RoomVm {
         room_id,
@@ -8900,6 +9291,7 @@ async fn room_item_to_vm(
         agent_room,
         agent_avatar,
         agent_mark,
+        agent_attention,
     }
 }
 
@@ -10697,6 +11089,7 @@ mod tests {
             agent_room: None,
             agent_avatar: None,
             agent_mark: None,
+            agent_attention: None,
         }
     }
 

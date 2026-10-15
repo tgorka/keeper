@@ -434,6 +434,11 @@ pub struct ProxyRoomVm {
     /// The drives the scope chip may offer (`[tools].drives`, the home drive
     /// first); `None` where the proxy's agents zone is not on this device.
     pub allowed: Option<Vec<ScopeDriveVm>>,
+    /// The room's state in the list (story 101.6, R421), as its Agents
+    /// window row says it: the dock draws it beside the room's name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub attention: Option<crate::agents::attention::AgentAttentionVm>,
 }
 
 /// The docked note as the notes view knows it: Rust names its drive, its
@@ -484,6 +489,7 @@ pub fn proxy_rooms(rows: &[ProxyRoomRow], me: &UserId, known: &KnownProxies) -> 
                     kind: admitted.kind,
                     agent: admitted.agent.to_string(),
                     allowed: admitted.facts.map(|facts| facts.allowed.clone()),
+                    attention: None,
                 },
             ))
         })

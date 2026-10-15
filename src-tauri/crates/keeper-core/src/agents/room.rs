@@ -800,6 +800,17 @@ impl AgentRoomState {
         matches!(&self.status, Some((_, StatusRead::Read(s))) if s.run == RunState::Running)
     }
 
+    /// The newest readable status's run and when it was sent (its
+    /// `origin_server_ts`, ms): what an agent room's row state is read from
+    /// (story 101.6, R421). `None` before a status, or while the newest one
+    /// cannot be read.
+    pub fn run_at(&self) -> Option<(RunState, u64)> {
+        match &self.status {
+            Some((at, StatusRead::Read(status))) => Some((status.run, *at)),
+            _ => None,
+        }
+    }
+
     /// The session's kind, the agent working it and its title, from the
     /// newest readable status, with that status's time: what an agent room's
     /// row is drawn by (R399) and what [`AgentKinds`] keeps (R416).

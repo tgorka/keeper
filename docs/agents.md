@@ -407,6 +407,26 @@ refused, with a sentence beside the control and a WARN line in `keeper.log`, whe
 - the bot is not one of the person's (the agent's current bot stays choosable for a level change);
 - the level is not one the bot's kind is sent;
 - the Mac only pulls the drive (the row says so and offers nothing to change);
+- a host serving the agent runs a keeper older than a key the saved file would carry —
+  `[model].effort`, `web_search` named in `[tools].allow`, a `[web_search]` table and a `[run]`
+  table, each first read by keeper 0.10.4 (`keeper_core::agents::model::KEY_SINCE`): that
+  host would refuse the whole home and stop serving the agent, so nothing is written and the row
+  says "electra runs keeper 0.10.3, which does not read [model].effort (keeper 0.10.4 does): saving
+  it would stop electra serving Nixi. Update keeper on electra first; nothing was saved." The hosts
+  are the live manifests in the control rooms your accounts are in, this Mac's own left out (story
+  101.6, R422); a host whose version does not read as numbers is taken as one that does not read
+  the key. A dev build of `main` between releases says the last release's version, so a host built
+  that way is warned about until the next release. The hosts are those agents your zones name
+  announce — their manifests, not an attestation of the machine (R438);
+- the save writes such a key and this Mac could not read which hosts serve your agents: it cannot
+  tell that none is older, so nothing is written and the row says so, with a WARN naming why
+  (R436). A read that found no host at all lets the save through, and a save writing no such key
+  is not held to the hosts. The same check holds the *Web search* and *Console* saves of the row
+  (R460): one host is one sentence naming every key it does not read ("… which does not read
+  web_search in [tools].allow or [web_search] (keeper 0.10.4 does) …"). With such a host serving the
+  agent, what still saves is what leaves the file free of those keys: a model without a level,
+  web search *Off* (the name and the `[web_search]` table go), and the console the file has without
+  `[run]` with no folders (the table goes);
 - the file does not read — a merge left its markers in it — or the disk refused the write.
 
 **It applies from the agent's next turn.** Every turn reads the home's `agent.toml` again through
@@ -1495,7 +1515,10 @@ name a folder by the absolute path the tool's description gives.
 have is offered disabled, with the reason — and its folders, which can be removed and added.
 *Save console* writes `[run].mode` and `[run].paths` and nothing else, through the drive's own
 compare-and-replace write as the person (the model's save, R405, R412); the person's choice is the
-approval for the mode. Choosing full access says, beside the choice, "Full access: <Agent>'s
+approval for the mode. A console with no folders whose mode is the one the file reads without
+`[run]` — `supervised` where `[tools].allow` names `run`, `off` elsewhere — is saved as no `[run]`
+at all (`home::without_table` takes a `[run]` that is there out whole, its blank line before it
+too), so a host on a build before epic 101 can serve the agent again (R460). Choosing full access says, beside the choice, "Full access: <Agent>'s
 commands run on its host without a sandbox and without asking. They can read, change and delete
 anything that host's user can, and reach the network.", and where the folders were, "Unrestricted
 — folders do not constrain full access". Under each folder this Mac does not give the agent's
@@ -1547,7 +1570,9 @@ and every byte of the names kept stay as they were, and a line left empty goes w
 — the kind's defaults — is written out as those defaults plus `"web_search"`, in the file's own form
 and line endings. `ask` is written by `home::with_web_search_ask`: over the value that is there, as
 a line of a `[web_search]` that has none, or as a new `[web_search]` table at the end; *Off* and
-*Ask* both leave it asking, so a search switched on again asks first. The choice is saved the way a
+*Ask* both leave it asking, so a search switched on again asks first. *Off* takes the
+`[web_search]` table out whole (`home::without_table`; one written as dotted keys is set back to
+`ask = true` instead), so the file is one a build before epic 101 reads (R460). The choice is saved the way a
 model save is: one read of the file, checked against what the row showed ("This agent's agent.toml
 changed on the drive meanwhile, so web search was not switched."), written by compare-and-replace
 under keeper's per-file lock (R405, R412), as the person. A Mac that only pulls the drive changes
@@ -3206,13 +3231,17 @@ An answer is one Matrix message the host keeps editing, not a stream of tokens:
   through the log's secret scan, so a token the model quotes reads `[REDACTED secret-like: …]` in
   the room too.
 - **The status runs with the turn.** Every turn — tool calls or none — first sets the session's
-  status `running` (the status anchor, or an update naming it), and sets it `idle` only once the
-  final edit is accepted, so a reader that sees the turn's status say `idle` knows the answer is
-  whole. A turn cut off before its final edit landed — the host stopping mid-send, the turn's
-  task dropped — sends no `idle`, and its status task stops with it. Tool progress goes out
-  between as status updates — each its own `dev.keeper.agent.status` event naming the session's
-  status anchor in `content.anchor`, not an edit of it — carrying counts only — "reading 2 files,
-  3 tool calls" — never a path, a title or a heading.
+  status `running` (the status anchor, or an update naming it), and leaves `running` only once the
+  final edit is accepted, so a reader that sees the turn's status leave `running` knows the answer
+  is whole. It says `done` when the model finished the turn and the session waits on no delegation's
+  reply and no answer to a question it asked — a delegation its target replied to waits for
+  nothing; any other end — stopped, failed, parked on a card, asking, handed on — says `idle`
+  (story 101.6, R437). A device's *Done* in the agent list is read from that `done`. A
+  turn cut off before its final edit landed — the host stopping mid-send, the turn's task dropped —
+  sends neither, and its status task stops with it. Tool progress goes out between as status
+  updates — each its own `dev.keeper.agent.status` event naming the session's status anchor in
+  `content.anchor`, not an edit of it — carrying counts only — "reading 2 files, 3 tool calls" —
+  never a path, a title or a heading.
 - **A long answer** is cut: past `FINAL_CUT_BYTES` the message is its first `FINAL_CUT_BYTES` (on a
   character boundary) and "The full answer is in artifacts/answer-<line>.md", written into the
   session; the log holds the whole text. When that file cannot be written, the message says
@@ -3253,6 +3282,36 @@ keeper shows an agent's room in its own timeline, on the Mac and on the iPhone a
   room is a session you watch, and its row says *Watching*. A room whose kind keeper has not read
   yet — no status among the events it holds — claims neither: no mark, and it is announced as
   "an agent room". A control room is in no window.
+- **Who needs you, who is working, who is done (story 101.6, R421).** Each agent room's row in the
+  Agents window — your DM with an agent among them — and each room in the notes dock's picker
+  carries one state Rust reads from the room's events (`keeper_core::agents::attention`), drawn as
+  an icon and a word where the row's time would be, and said in the row's accessible name:
+  *Needs you* (amber) when an approval card waits there that you may decide, or a question an
+  agent asked you waits for your answer there — in the room you answer it in, the one the
+  decisions panel shows it above: your proxy's conversation that handed the work on, else your DM
+  with the proxy, never the asking agent's own room. It goes when your answer is sent (one held for
+  Undo-Send still needs you) or the proxy relays an answer; another agent's message, an edit or a
+  notice carrying an answer ends nothing. *Unknown* (grey, a question mark, with the sentence
+  "keeper could not read all of this agent's rooms, so whether it needs you is unknown.") when
+  keeper could not read all it needs to say nothing waits — a room's history could not be read
+  back, a question could not be placed, a room's status is unread — so an unread room never looks
+  like one with nothing for you; otherwise *Failed*
+  (red) when the newest status says `blocked`, *Working* (blue, a dashed ring turning slowly; still
+  for a person who asked for reduced motion) when it says `running`, and *Done* (green) when it
+  says `done` — what a host's turn that finished, waiting on nothing, ends with; a stopped or
+  failed turn, or one handed on to another agent, ends `idle` and is no *Done* — and was sent after
+  the event your read marker stands on — your read receipt, public
+  or private, or your own newest message there. Opening the room moves the marker past it, on every
+  device of yours, and the *Done* goes. A room you never read nor wrote in is never *Done*: a
+  session you only watch finishing is not news. Every other room shows its time as before. A
+  room's history is read back as far as the decisions panel reads it (300 events, or its start),
+  so a card or question older than what a restart left loaded still counts. The row is read again
+  whenever the room's events change, so a status, a card or a question redraws it without a
+  message; the rows that show questions asked elsewhere are read again shortly after any agent
+  room changes; and a row is read again when a card waiting for you expires, with no event at all; the dock
+  reads its rooms every ten seconds while it is open, and when a read fails it keeps the rooms it
+  has and says so above the conversation until a read succeeds. *Working* means the last status
+  said `running`: a host that went away mid-turn leaves it until another status comes (DW-1494).
 - **The header.** Above the timeline, on the iPhone as well as the Mac: the status line — the
   agent's identity cell, `nixi@electra` (the agent and the host that answers), the run badge
   (`idle`, `running`, `blocked`, `waiting`, `done`, `unreadable`), `waiting: hesperia` when the
@@ -3702,7 +3761,16 @@ read it can open.
 
 **The two tools.** `delegate(agent, brief, drives?, card?, session?)` is offered when
 `[tools].allow` names it. `agent` is `<drive>/<id>`; an id alone works only when exactly one agent
-keeper knows has it, and otherwise the refusal names the candidates. `reply(text, artifacts?)` is
+keeper knows has it, and otherwise the refusal names the candidates. A name only a home whose
+`agent.toml` this host refuses answers to — a key its build does not know, a merge's markers — is
+refused with that home's own sentence, "tgdrive/tola-grey's agent.toml does not read on this host:
+agent.toml has a key keeper does not know: model.effort.", never as an agent nobody knows: the host
+keeps every refused home beside the agents it knows (`rooms::Known::refused`, story 101.6, R422),
+and `keeper-agentd agents list` prints the same verdict. The sentence is told only to a session
+whose readers that home's drive covers (and, for a `local_only` drive, one on a local model): it
+joins the session's label as reading that `agent.toml` would, and any other session hears the
+answer a name no drive has gets, learning neither the sentence nor that the home exists (R436).
+`reply(text, artifacts?)` is
 offered in every delegated session, whatever `[tools].allow` says, and in no other: it is how a
 delegated session answers. A ⌘9 bot has neither.
 

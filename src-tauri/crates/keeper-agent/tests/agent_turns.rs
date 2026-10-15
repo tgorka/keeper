@@ -27,8 +27,8 @@ use keeper_agent::delegate::{
 use keeper_agent::host::UNATTENDED_REFUSAL;
 use keeper_agent::matrix_sink::{EditPort, MembersFuture, SendFuture};
 use keeper_agent::rooms::{
-    Arrival, BriefRoom, Known, KnownAgent, NOT_THE_PERSON, NO_AGENT_POWER, OBSERVER_TEXT,
-    UNSIGNED_DEVICE,
+    Arrival, BriefRoom, Known, KnownAgent, RefusedHome, NOT_THE_PERSON, NO_AGENT_POWER,
+    OBSERVER_TEXT, UNSIGNED_DEVICE,
 };
 use keeper_agent::runtime::Router;
 use keeper_agent::turn::{DrivePorts, SessionRef, TurnEnv};
@@ -2314,13 +2314,14 @@ async fn tool_progress_carries_counts_not_paths() {
     }
     let last = statuses.last().expect("a status");
     assert_eq!(last["detail"], "reading 2 files, 2 tool calls");
-    assert_eq!(last["run"], "idle");
+    assert_eq!(last["run"], "done");
 }
 
-/// AD-384: a turn's status says `running` from its start and `idle` only
+/// AD-384: a turn's status says `running` from its start and leaves it only
 /// once the answer's final edit is sent — tool calls or none — so a device
 /// following a spoken question reads the status leaving `running` as the
-/// answer being whole. The next turn edits the same status anchor.
+/// answer being whole; a turn the model finished says `done` (R437). The
+/// next turn edits the same status anchor.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_turn_is_running_until_its_final_edit_is_sent() {
     let mut world = world(
@@ -2344,12 +2345,8 @@ async fn a_turn_is_running_until_its_final_edit_is_sent() {
         "the session's first status"
     );
     assert!(sent[first].1.get("detail").is_none(), "{}", sent[first].1);
-    assert_eq!(
-        last,
-        sent.len() - 1,
-        "the idle status is the turn's last send"
-    );
-    assert_eq!(sent[last].1["run"], "idle");
+    assert_eq!(last, sent.len() - 1, "the turn's end is its last send");
+    assert_eq!(sent[last].1["run"], "done");
     let final_edit_at = (0..sent.len())
         .rev()
         .find(|&i| sent[i].1["m.relates_to"]["rel_type"] == "m.replace")
@@ -2366,7 +2363,72 @@ async fn a_turn_is_running_until_its_final_edit_is_sent() {
         .expect("the second turn's status");
     assert_eq!(again[running].1["run"], "running");
     assert_eq!(again[running].1["anchor"], status_anchor.as_str());
-    assert_eq!(again.last().expect("a send").1["run"], "idle");
+    assert_eq!(again.last().expect("a send").1["run"], "done");
+}
+
+/// 101.6 (R436 finding 01, R437): the turn a host really runs ends its
+/// status `done`, and a device reading that room shows Done, unread, until
+/// the person's read marker passes the finish; a turn that failed ends
+/// `idle`, which is no Done.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_finished_turn_is_done_unread_until_the_person_reads_it() {
+    use keeper_core::agents::attention::{attention, AgentAttentionVm, Reader, RoomEvent};
+    const QUESTION: &str = "$question:example.org";
+    // The room as a device reads it: the person's question, then each send
+    // of the host, in order, as the fake room numbered them.
+    let timeline = |sent: &[(String, Value)]| -> Vec<Value> {
+        let question = json!({"type": "m.room.message", "event_id": QUESTION, "sender": TGORKA,
+            "origin_server_ts": 0, "content": {"msgtype": "m.text", "body": "sky?"}});
+        std::iter::once(question)
+            .chain(sent.iter().enumerate().map(|(i, (kind, content))| {
+                json!({"type": kind, "event_id": format!("$sent{}:example.org", i + 1),
+                    "sender": NIXI, "origin_server_ts": i as u64 + 1, "content": content})
+            }))
+            .collect()
+    };
+    let state = |events: &[Value], marker: &str| {
+        let own = user(TGORKA);
+        let agent = |who: &UserId| who.as_str() == NIXI;
+        attention(
+            events.iter().map(|event| RoomEvent {
+                event,
+                sealed: true,
+            }),
+            &Reader {
+                own: &own,
+                agent: &agent,
+                owners: &[],
+                marker: Some(marker),
+                whole: true,
+            },
+            None,
+            chrono::Utc::now(),
+        )
+        .state
+    };
+    let mut world = world(
+        ProviderKind::OpenAi,
+        &[],
+        vec![prose("The sky is blue."), broken("Half an answer")],
+    );
+    let mut served = world.open(SESSION);
+    report(world.ask(&mut served, "sky?").await);
+    let finished = timeline(&world.room.sent());
+    let finish = finished.last().expect("the finish")["event_id"]
+        .as_str()
+        .expect("an id")
+        .to_owned();
+    assert_eq!(
+        state(&finished, QUESTION),
+        Some(AgentAttentionVm::DoneUnread),
+        "read up to the question, the finish is news"
+    );
+    assert_eq!(state(&finished, &finish), None, "read past the finish");
+
+    let turn = report(world.ask(&mut served, "and now?").await);
+    assert_eq!(turn.ending, TurnEnding::Failed);
+    let failed = timeline(&world.room.sent());
+    assert_eq!(state(&failed, QUESTION), None, "a failed turn is no Done");
 }
 
 /// AD-384, review fix R5-F3: each answer's anchor names the person's
@@ -4501,6 +4563,7 @@ fn known_agent(drive: &str, id: &str, name: &str, user_id: &str, readers: &[&str
 /// Novak in neuradrive, read by tgorka and Marta.
 fn known(readers: &[&str]) -> Known {
     Known {
+        refused: Vec::new(),
         agents: vec![
             known_agent("tgdrive", "nixi", "Nixi", NIXI, readers),
             known_agent("tgdrive", "tola", "Dr Tola Grey", TOLA, readers),
@@ -4701,6 +4764,12 @@ async fn a_delegation_makes_a_session_in_the_targets_home() {
         waiting.last().expect("a status")["detail"],
         "waiting for Dr Tola Grey to join"
     );
+    // A turn that handed work on waits for it: none of its statuses is a
+    // `done` (R437).
+    assert!(
+        waiting.iter().all(|status| status["run"] != "done"),
+        "{waiting:?}"
+    );
     let opened = delegate_lines(&world.lines(SESSION));
     assert_eq!(opened.len(), 1);
     assert_eq!(opened[0].state, DelegateState::Opened);
@@ -4841,6 +4910,12 @@ async fn a_reply_closes_the_exchange() {
     // The reply reaches Nixi's session, as the host routes it.
     let replied = world.reply(&child, &reply);
     report(world.serve(&mut nixi, replied.clone()).await);
+    // Tola replied to the round: the turn that took her reply waits on
+    // nothing and ends `done`, though the delegation stays in the log (R437).
+    assert_eq!(
+        world.sent_of(STATUS).last().expect("a status")["run"],
+        "done"
+    );
     assert!(matches!(
         world.serve(&mut nixi, replied).await,
         Outcome::Duplicate
@@ -4909,6 +4984,179 @@ async fn a_delegation_beyond_the_label_is_refused_before_the_room_exists() {
     let result = &tool_results(&lines)[0];
     assert_eq!(result.outcome, ToolOutcomeWord::Refused);
     assert!(result.content.contains(MARTA));
+}
+
+/// Nixi's `delegate` to `name`, in her session read by `readers` and served
+/// by a `provider` model, over `known`: the call's result, its `delegate`
+/// lines and the session's label once the turn is over. Nothing is made for
+/// it.
+async fn delegating_to(
+    readers: &[&str],
+    provider: ProviderKind,
+    known: Known,
+    name: &str,
+) -> (ToolResultBody, Vec<DelegateBody>, Label) {
+    let mut world = world_read_by(
+        readers,
+        provider,
+        &["drive_read", "delegate"],
+        vec![
+            delegate_call("d1", json!({"agent": name, "brief": "Sort the inbox."})),
+            prose("I could not."),
+        ],
+    );
+    let rooms = Delegations::over(known);
+    let mut nixi = world.delegating(&rooms);
+    report(world.ask(&mut nixi, "hand the inbox on").await);
+    assert!(rooms.made().is_empty());
+    let lines = world.lines(SESSION);
+    (
+        tool_results(&lines)[0].clone(),
+        delegate_lines(&lines),
+        nixi.context.label.clone(),
+    )
+}
+
+/// 101.6 #3 (R422, R436; review 02 and 09): a drive whose pin this host
+/// accepted holds two homes sharing one Matrix user, so each is refused
+/// naming the other. A delegation to one from a session the drive's
+/// readers do not cover gets the answer a name no drive has gets — neither
+/// the sentence nor that the home exists; from a session they cover, the
+/// home's own sentence, which joins the session's label as reading that
+/// `agent.toml` would.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_home_is_named_only_to_a_session_its_drive_reaches() {
+    let closet = tempfile::tempdir().expect("tempdir");
+    write(
+        closet.path(),
+        "80-agents/_drive.toml",
+        &format!("version = 1\nid = \"closet\"\ntitle = \"closet\"\nprincipal = \"tgorka\"\nowner = \"{TGORKA}\"\nreaders = [\"{TGORKA}\"]\n"),
+    );
+    for folder in ["kit", "kat"] {
+        write(
+            closet.path(),
+            &format!("80-agents/{folder}/agent.toml"),
+            &format!("version = 1\nid = \"{folder}\"\nname = \"{folder}\"\nkind = \"specialist\"\nmatrix_user = \"@kit:example.org\"\n\n[model]\nbot = \"bot:openai:http://127.0.0.1:9#model\"\n"),
+        );
+    }
+    let drive = keeper_agent::runtime::view(
+        "closet",
+        profile("closet", closet.path()),
+        Ok(decl("closet", &[TGORKA], false)),
+    );
+    let refused = keeper_agent::runtime::refused_homes(std::slice::from_ref(&drive));
+    let kit = refused
+        .iter()
+        .find(|home| home.id == "kit")
+        .expect("kit is refused")
+        .clone();
+    assert!(kit.sentence.contains("kat"), "{}", kit.sentence);
+    let with = |refused: Vec<RefusedHome>| Known {
+        refused,
+        ..known(&[TGORKA, MARTA])
+    };
+
+    // Marta reads the session; the closet is tgorka's alone.
+    let shared = &[TGORKA, MARTA];
+    let (told, lines, label) = delegating_to(
+        shared,
+        ProviderKind::OpenAi,
+        with(refused.clone()),
+        "closet/kit",
+    )
+    .await;
+    let (nobodys, nobodys_lines, _) =
+        delegating_to(shared, ProviderKind::OpenAi, with(Vec::new()), "closet/kit").await;
+    assert_eq!(told.outcome, ToolOutcomeWord::Refused);
+    assert_eq!(told.content, nobodys.content);
+    assert_eq!(lines[0].reason, nobodys_lines[0].reason);
+    assert!(!told.content.contains("kat"), "{}", told.content);
+    assert_ne!(label.integrity, kit.label.integrity, "nothing joined");
+
+    // tgorka's own session: the home's sentence, and its label joined.
+    let (told, lines, label) =
+        delegating_to(&[TGORKA], ProviderKind::OpenAi, with(refused), "closet/kit").await;
+    assert_eq!(told.outcome, ToolOutcomeWord::Refused);
+    assert!(told.content.contains(&kit.sentence), "{}", told.content);
+    assert!(
+        lines[0]
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains(&kit.sentence)),
+        "{lines:?}"
+    );
+    assert_eq!(told.label, kit.label);
+    assert_eq!(
+        label.join(&kit.label),
+        label,
+        "the session's label holds it"
+    );
+    assert_eq!(label.integrity, kit.label.integrity);
+}
+
+/// R453 (re-review R101S2-01): a refused home in a local-only drive is
+/// told by the model the asking session's turn runs on, not by whether its
+/// label already requires a local one. Nixi's session, homed on an ordinary
+/// drive and read by readers the closet's cover, hears the home's sentence
+/// on a local model and the answer a name no drive has on a remote one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_local_only_drives_refused_home_is_told_to_a_local_model_only() {
+    let closet = tempfile::tempdir().expect("tempdir");
+    write(
+        closet.path(),
+        "80-agents/_drive.toml",
+        &format!("version = 1\nid = \"closet\"\ntitle = \"closet\"\nprincipal = \"tgorka\"\nowner = \"{TGORKA}\"\nreaders = [\"{TGORKA}\"]\nlocal_only = true\n"),
+    );
+    for folder in ["kit", "kat"] {
+        write(
+            closet.path(),
+            &format!("80-agents/{folder}/agent.toml"),
+            &format!("version = 1\nid = \"{folder}\"\nname = \"{folder}\"\nkind = \"specialist\"\nmatrix_user = \"@kit:example.org\"\n\n[model]\nbot = \"bot:openai:http://127.0.0.1:9#model\"\n"),
+        );
+    }
+    let drive = keeper_agent::runtime::view(
+        "closet",
+        profile("closet", closet.path()),
+        Ok(decl("closet", &[TGORKA], true)),
+    );
+    let refused = keeper_agent::runtime::refused_homes(std::slice::from_ref(&drive));
+    let kit = refused
+        .iter()
+        .find(|home| home.id == "kit")
+        .expect("kit is refused")
+        .clone();
+    assert!(kit.label.local_only, "the closet is local-only");
+    let with = |refused: Vec<RefusedHome>| Known {
+        refused,
+        ..known(&[TGORKA])
+    };
+
+    let (told, _, label) = delegating_to(
+        &[TGORKA],
+        ProviderKind::Ollama,
+        with(refused.clone()),
+        "closet/kit",
+    )
+    .await;
+    assert_eq!(told.outcome, ToolOutcomeWord::Refused);
+    assert!(told.content.contains(&kit.sentence), "{}", told.content);
+    assert!(
+        label.local_only,
+        "what it was told joins the session's label"
+    );
+
+    let (remote, _, label) =
+        delegating_to(&[TGORKA], ProviderKind::OpenAi, with(refused), "closet/kit").await;
+    let (nobodys, _, _) = delegating_to(
+        &[TGORKA],
+        ProviderKind::OpenAi,
+        with(Vec::new()),
+        "closet/kit",
+    )
+    .await;
+    assert_eq!(remote.content, nobodys.content);
+    assert!(!remote.content.contains("kat"), "{}", remote.content);
+    assert!(!label.local_only, "nothing joined");
 }
 
 /// 92.1 acceptance 8, the hand-off: a card with a schedule needs a person,
@@ -9395,6 +9643,7 @@ mod parks {
                 keeper_agent::desktop::write_web_search(
                     &[profile("tgdrive", &root)],
                     &switch(false, true),
+                    Ok(&[]),
                 )
                 .expect("off mid-turn");
             })),
@@ -9418,7 +9667,8 @@ mod parks {
         let mut served = open(&world, &approvals);
         let not_given = "web_search is not one of this agent's tools on this host.";
 
-        keeper_agent::desktop::write_web_search(&profiles, &switch(true, false)).expect("on");
+        keeper_agent::desktop::write_web_search(&profiles, &switch(true, false), Ok(&[]))
+            .expect("on");
         report(world.ask(&mut served, "search one").await);
         assert!(offered_names(&world.stub.requests()[0]).contains(&"web_search".to_owned()));
         let first = records(&world).remove(0);
@@ -9434,10 +9684,12 @@ mod parks {
         assert!(mid_turn.content.contains(not_given), "{}", mid_turn.content);
         assert_eq!(records(&world).len(), 1, "the revoked search waited");
 
-        keeper_agent::desktop::write_web_search(&profiles, &switch(true, false)).expect("on");
+        keeper_agent::desktop::write_web_search(&profiles, &switch(true, false), Ok(&[]))
+            .expect("on");
         report(world.ask(&mut served, "search three").await);
         assert!(served.waiting());
-        keeper_agent::desktop::write_web_search(&profiles, &switch(false, true)).expect("off");
+        keeper_agent::desktop::write_web_search(&profiles, &switch(false, true), Ok(&[]))
+            .expect("off");
         let second = records(&world)
             .into_iter()
             .find(|other| other.id != first.id)
@@ -9528,6 +9780,7 @@ mod parks {
                 level,
                 shown_level,
             },
+            Ok(&[]),
         )
         .expect("a level");
     }

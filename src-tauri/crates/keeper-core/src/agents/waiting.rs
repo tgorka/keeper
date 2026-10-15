@@ -217,16 +217,30 @@ pub fn answer_state(ask: &WaitingAsk, mine: &[Mine]) -> AskState {
     state
 }
 
-/// One room's events as the fold reads them, and whether they reach its
-/// start: the loaded events, read back through the room's event cache to
+/// How far back one room's events were read ([`read_room`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reach {
+    /// To the room's start: nothing older exists.
+    Start,
+    /// To the bound, [`ASK_READ_BACK`] events, as R431 reads every room:
+    /// what lies behind it is not looked for.
+    Bound,
+    /// Less than either: a read-back failed or took longer than
+    /// [`ASK_READ_BACK_WAIT`], so something pending may lie behind what was
+    /// read (R381, R453). Never a complete reading.
+    Part,
+}
+
+/// One room's events as the fold reads them, and how far back they reach:
+/// the loaded events, read back through the room's event cache to
 /// [`ASK_READ_BACK`] when fewer are loaded. A read-back that fails or takes
 /// longer than [`ASK_READ_BACK_WAIT`] leaves what was loaded, read in part
-/// (a WARN says so); only a room whose cache cannot be read at all is an
-/// error.
-pub async fn read_room(room: &Room) -> Result<(Vec<Seen>, bool), String> {
+/// ([`Reach::Part`]; a WARN says so); only a room whose cache cannot be read
+/// at all is an error.
+pub async fn read_room(room: &Room) -> Result<(Vec<Seen>, Reach), String> {
     let (cache, _handles) = room.event_cache().await.map_err(|e| e.to_string())?;
     let mut events = cache.events().await.map_err(|e| e.to_string())?;
-    let mut whole = false;
+    let mut reach = Reach::Bound;
     let loaded = u16::try_from(events.len()).unwrap_or(u16::MAX);
     if loaded < ASK_READ_BACK {
         match tokio::time::timeout(
@@ -238,14 +252,18 @@ pub async fn read_room(room: &Room) -> Result<(Vec<Seen>, bool), String> {
         .await
         {
             Ok(Ok(outcome)) => {
-                whole = outcome.reached_start;
+                if outcome.reached_start {
+                    reach = Reach::Start;
+                }
                 events = cache.events().await.map_err(|e| e.to_string())?;
             }
             Ok(Err(error)) => {
                 tracing::warn!(room = %room.room_id(), %error, "agents: a room's asks could not be read back; read in part");
+                reach = Reach::Part;
             }
             Err(_) => {
                 tracing::warn!(room = %room.room_id(), "agents: a room's asks took too long to read back; read in part");
+                reach = Reach::Part;
             }
         }
     }
@@ -258,7 +276,7 @@ pub async fn read_room(room: &Room) -> Result<(Vec<Seen>, bool), String> {
             })
         })
         .collect();
-    Ok((seen, whole))
+    Ok((seen, reach))
 }
 
 /// A question waiting for this person, as the decisions panel draws it

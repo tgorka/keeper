@@ -604,6 +604,7 @@ mod tests {
     #[test]
     fn only_a_known_proxy_or_a_pinned_ones_relays() {
         let known = Known {
+            refused: Vec::new(),
             agents: vec![
                 agent("nixi", AgentKind::Proxy, Some("@tgorka:h")),
                 agent("tola", AgentKind::Steward, None),
@@ -626,6 +627,7 @@ mod tests {
     fn a_pinned_proxy_is_its_persons_audience_and_no_one_elses() {
         let only = |id: &str| Some(Readers::Only(BTreeSet::from([user(id)])));
         let known = Known {
+            refused: Vec::new(),
             agents: vec![agent("tola", AgentKind::Steward, None)],
             trust: vec![
                 trust("@marta:h", "@mira:h", true),

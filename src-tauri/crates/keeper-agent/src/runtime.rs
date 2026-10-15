@@ -91,7 +91,7 @@ use crate::headless::{
 use crate::hosts::{read_back_rooms, HostRuntime, Opening, PendingBriefs};
 use crate::matrix_sink::{EditPort, MembersFuture, RoomPort, SendFuture};
 use crate::rooms::{
-    self, Arrival, BriefEvent, BriefRoom, Invite, InviteDecision, Known, KnownAgent,
+    self, Arrival, BriefEvent, BriefRoom, Invite, InviteDecision, Known, KnownAgent, RefusedHome,
 };
 use crate::sinks::{ClientDoors, ProxyDoors};
 use crate::surface::{self, PresenceFuture, SurfacePort};
@@ -194,7 +194,9 @@ pub fn inspect(config: &AgentdConfig, dirs: &XdgDirs) -> Inspection {
     Inspection { drives, hosted }
 }
 
-pub(crate) fn view(id: &str, profile: SyncProfile, hosts: Result<DriveDecl, String>) -> DriveView {
+/// Drive `id` as this host reads it from `profile`'s checkout: its agents
+/// zone under the declaration `hosts` accepted, and its active sessions.
+pub fn view(id: &str, profile: SyncProfile, hosts: Result<DriveDecl, String>) -> DriveView {
     let zone = read_zone(id, &profile, hosts.as_ref().ok());
     let sessions = if hosts.is_ok() {
         active_sessions(&profile)
@@ -274,9 +276,39 @@ pub(crate) fn known_with(
     hosted: &[AgentHome],
 ) -> Known {
     Known {
+        refused: refused_homes(drives),
         agents: known_agents(drives.iter().map(|drive| &drive.zone), hosted),
         trust,
     }
+}
+
+/// Every home `drives` hold whose `agent.toml` does not read here, with the
+/// sentence refusing it and the label reading that file carries under the
+/// declaration the drive's pin accepted (story 101.6, R422, R436): kept
+/// beside the known agents so a delegation from a session that label may
+/// reach hears why it cannot go there. A drive with no accepted declaration
+/// holds no homes.
+pub fn refused_homes(drives: &[DriveView]) -> Vec<RefusedHome> {
+    let mut refused = Vec::new();
+    for drive in drives {
+        let Ok(decl) = &drive.hosts else { continue };
+        let zone = drive
+            .profile
+            .agents
+            .as_ref()
+            .map_or("", |agents| agents.subfolder.trim());
+        for (folder, home) in &drive.zone.homes {
+            let Err(sentence) = home else { continue };
+            let file = format!("{zone}/{folder}/{}", keeper_core::agents::home::FILE_NAME);
+            refused.push(RefusedHome {
+                drive: drive.zone.drive.clone(),
+                id: folder.clone(),
+                sentence: sentence.clone(),
+                label: crate::agent::file_label(decl, &file, ""),
+            });
+        }
+    }
+    refused
 }
 
 /// Every agent `zones` home, each `hosted` when an entry of `hosted` is it.
@@ -3738,6 +3770,7 @@ mod tests {
             drives: vec!["tgdrive".to_owned()],
         };
         let known = Known {
+            refused: Vec::new(),
             agents: vec![agent(NIXI, false), agent(TOLA, true)],
             trust: Vec::new(),
         };
@@ -3838,6 +3871,7 @@ mod tests {
         use matrix_sdk::ruma::room_version_rules::AuthorizationRules;
         let readers = Readers::Only(std::collections::BTreeSet::from([user(TGORKA)]));
         let known = Known {
+            refused: Vec::new(),
             agents: vec![KnownAgent {
                 id: "tola".to_owned(),
                 drive: "tgdrive".to_owned(),

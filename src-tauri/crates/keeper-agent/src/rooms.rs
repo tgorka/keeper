@@ -71,6 +71,34 @@ pub struct Known {
     pub agents: Vec<KnownAgent>,
     /// `agentd.toml`'s `[[trust]]`.
     pub trust: Vec<TrustEntry>,
+    /// Every home of a drive this host mounts whose `agent.toml` does not
+    /// read here, with the sentence refusing it and its drive's label (story
+    /// 101.6, R422, R436): a delegation from a session the drive's readers
+    /// cover hears why, rather than that no such agent is known; any other
+    /// session learns nothing of it (`delegate::resolve`).
+    pub refused: Vec<RefusedHome>,
+}
+
+/// A home whose `agent.toml` this host refuses, as `known_agents` read it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefusedHome {
+    /// Its home drive's id.
+    pub drive: String,
+    /// Its folder in the drive's agents zone: the id a delegation names.
+    pub id: String,
+    /// Why it does not read here, as the zone's read said it.
+    pub sentence: String,
+    /// What reading its `agent.toml` is labelled, under the declaration the
+    /// drive's pin accepted: who may learn the sentence, and what it joins
+    /// into a session told it (R436).
+    pub label: Label,
+}
+
+impl RefusedHome {
+    /// `<drive>/<id>`, as a delegation names the agent (R67).
+    pub fn name_in_drive(&self) -> String {
+        format!("{}/{}", self.drive, self.id)
+    }
 }
 
 /// Join, or leave the invite pending: never declined, so a person can still
@@ -690,6 +718,7 @@ mod tests {
 
     fn known(trust: Vec<TrustEntry>) -> Known {
         Known {
+            refused: Vec::new(),
             agents: vec![
                 agent(
                     "@nixi:example.org",
@@ -785,6 +814,7 @@ mod tests {
         }
         // (c) a pinned person's proxy, when that person reads the invited home.
         let marta_reads = Known {
+            refused: Vec::new(),
             agents: vec![agent(
                 "@amelia:example.org",
                 AgentKind::Specialist,
@@ -846,6 +876,7 @@ mod tests {
             invited: user(invited),
         };
         let visiting = Known {
+            refused: Vec::new(),
             agents: vec![
                 agent(LUCYNA, AgentKind::Steward, None, &[TGORKA, MARTA], true),
                 agent(
@@ -913,6 +944,7 @@ mod tests {
         let lucyna = || agent(LUCYNA, AgentKind::Steward, None, &[TGORKA, MARTA], true);
         let nixi_invites = invite("@nixi:example.org", LUCYNA, true);
         let pinned_for_nixi = Known {
+            refused: Vec::new(),
             agents: vec![lucyna()],
             trust: vec![trust(TGORKA, "@nixi:example.org", true)],
         };
@@ -928,6 +960,7 @@ mod tests {
             },
         ] {
             let known = Known {
+                refused: Vec::new(),
                 agents: vec![lucyna()],
                 trust: vec![unpinned.clone()],
             };

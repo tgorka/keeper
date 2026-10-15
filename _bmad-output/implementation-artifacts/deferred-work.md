@@ -10953,7 +10953,7 @@ status: open
 origin: review-101composer-2 (R101C2-03), fix round 2, 2026-10-15 (R447)
 location: `keeper_core::agents::waiting::read_room`, `account::read_agent_asks`, `account::mine_in`
 reason: a back-pagination that errors or times out logs a WARN and returns what was loaded with `reached_start = false` — which means "did not reach the start", not "read failed" — and `read_agent_asks` skips an empty fold without setting `partial`; `mine_in` ignores the flag; a failure to admit the answering proxy room returns the empty default with no note. When the missing ask lies behind the failed read-back, the panel shows `{ asks: [], note: null }` despite the WARN. The fix: a distinct read-failed/incomplete outcome from `read_room`, carried into `note` even when nothing was recovered, and unread proxy admission told apart from an ineligible room; tested with a pagination timeout over an empty cache.
-status: open
+status: closed (R453, fix round 2 of lane `agents-101-status`, 2026-10-15): `waiting::read_room` returns `Reach::{Start, Bound, Part}` — a back-pagination that errors or times out is `Part`; `account::asks_answered_in` (what `read_agent_asks` now calls) sets `ASKS_PARTIAL` for a `Part` room before folding, so an empty fold no longer drops it; `mine_in` reads a `Part` room as not whole; a proxy room whose status is unread (`proxy::Refusal::Unread`) answers no question with `ASKS_PARTIAL`, an ineligible one none. The same reading feeds the list's *Unknown* (`attention::tests::an_incomplete_reading_is_never_nothing_pending`). Not written: a test that times a back-pagination out — no harness here fails one on demand; the `Part` outcome's consumers are what is tested.
 
 ### DW-1466: A failed or partial file lookup says nothing when it finds no rows.
 
@@ -11067,3 +11067,59 @@ origin: review-101console-4 (R101K4-02), recorded by lane `101stack`, 2026-10-16
 location: `keeper-agent/tests/agent_turns.rs` (the console folder tests), `keeper_agent::approvals` consumption
 reason: R458 makes every session that ran a console folder untrusted; the networked run after it parks (tested), but no test approves that park and checks one consumption and the command's effect while the granted folders stay unavailable. An earlier ordering of the test saw zero consumptions where one was expected, and the reordered final test proves consumption only while the session is still trusted.
 status: open
+
+### DW-1490: A card's expiry does not redraw its row.
+
+origin: lane `agents-101-status` (story 101.6 #1, R421), 2026-10-15
+location: `src-tauri/crates/keeper-core/src/account.rs` (`run_inbox_producer`, the event-cache arm), `keeper_core::agents::attention::attention`
+reason: the row's state is read again when the room's events change; an approval card that expires with nothing else happening leaves the row at *Needs you* until the room's next event (a claim renewal within a minute in a served room). A timer at `ApprovalFold::next_expiry` per agent room would close it exactly.
+status: closed (R436 #08, fix round 1 of lane `agents-101-status`, 2026-10-15): each reading of an agent room names its earliest open card's expiry (`Attention::recheck_at`, from `ApprovalFold::next_expiry`); `attention::RowAttention` keeps it per row, the inbox producer sleeps until the earliest one and reads those rooms again with no event having come, redrawing only a row whose state changed. Test: `agents::attention::tests::a_card_expiring_with_no_event_is_read_again_at_its_expiry`.
+
+### DW-1491: A question relayed into the proxy's DM is not *Needs you* on the DM's row.
+
+origin: lane `agents-101-status` (story 101.6 #1, R421), 2026-10-15
+location: `keeper_core::agents::attention`, `keeper-agent` `ask::relay` / `rooms::admit_ask`
+reason: an `ask_human` question is an `AskContent` in the asking session's room; the proxy relays it into the person's DM in its own words, carrying nothing structured, so only the asking room's row (when the person is in it) says *Needs you*. The DM's row could say it if the proxy's relay turn carried the ask's id (a `dev.keeper.agent.ask` echo the device reads), which is a host change.
+status: closed (R453, fix round 2 of lane `agents-101-status`, 2026-10-15): no host change — the device projects the correlation in Rust across rooms with 101.3's reader (`account::asks_answered_in`: the asking rooms it reads, folded by `waiting::fold`, placed by `ask_target`), so the room the person answers in — the proxy's DM, or the conversation that delegated the asking session — says *Needs you* in the Agents window, the DM row and the dock until the answer is sent or relayed (`attention::tests::a_delegated_question_needs_the_person_where_they_answer_it`). A question in a room this device does not read stays DW-1462's limit.
+
+### DW-1492: A host built from `main` between releases is warned about as older than the keys it reads.
+
+origin: lane `agents-101-status` (story 101.6 #3, R422), 2026-10-15
+location: `keeper_core::agents::model::{KEY_SINCE, reads_since}`, `HostManifest.version` (`CARGO_PKG_VERSION`)
+reason: the manifest's version is the workspace version, which stays at the last release until the release bump; a dev build of `main` carrying `[model].effort` says 0.10.3 and a Mac's save of `effort` for an agent it serves is refused until 0.10.4 is released. A build stamp in the manifest (the commit, or a grammar revision) would tell such a build apart; electra deployed from the release asset (101.7) is not affected.
+status: open
+
+### DW-1493: The notes dock reads its rooms' states every ten seconds rather than as they change.
+
+origin: lane `agents-101-status` (story 101.6 #2, R421), 2026-10-15
+location: `src/components/notes/notes-agent-dock.tsx` (`ATTENTION_RELIST_MS`), `AccountManager::agent_rooms`
+reason: the Agents-window stream that carries the state live is mounted with the chat list, not beside the notes, so the dock reads `ProxyRoomVm.attention` by listing its rooms again; a state change reaches the dock within ten seconds. A stream of the proxy rooms (or the Agents window subscribed by the shell rather than the chat list) would make it live. Since R453 each relist also reads 101.3's question projection once per listed proxy room (`agent_rooms_attended` → `asks_answered_in`: every other session room read back to `ASK_READ_BACK`), so the poll's cost grows with proxy rooms × session rooms; the stream would remove that as well.
+status: open
+
+### DW-1494: *Working* says the last readable status was `running`, not that a host is still running it.
+
+origin: lane `agents-101-status` fix round 1 (story 101.6 #2, R439), 2026-10-15
+location: `keeper_core::agents::attention::attention` (`AgentRoomState::run_at`)
+reason: a host that went away mid-turn, or whose claim lapsed, leaves its last `running` status as the room's newest; the row keeps saying *Working* until another status comes. The claim's lease (`dev.keeper.agent.claim` expiry) or the host's manifest liveness would let the fold say the run stopped being watched; neither is read by the row today.
+status: open
+
+### DW-1495: A row's *Needs you* is re-read on fewer changes than its questions are read from.
+
+origin: review-101status-3 (R101S3-01), recorded by lane `101stack`, 2026-10-16
+location: `keeper_core::account::run_inbox_producer` (`asks_due`, `redraw_attention`), `account::asks_answered_in`
+reason: the projection reads every joined session room, but the inbox re-reads destination rows only when the changed source room is already in its recency window, and it does not watch the send queue / outbox that `mine_in` reads; an off-window source's change, or a queued answer failing with no Matrix event, can leave a correctly placed marker stale until another qualifying event.
+status: open
+
+### DW-1496: Cross-room reading of questions runs inside the inbox producer, one room after another.
+
+origin: review-101status-3 (R101S3-02), recorded by lane `101stack`, 2026-10-16
+location: `keeper_core::account::run_inbox_producer`, `asks_answered_in`, `agents::waiting::read_room`
+reason: each proxy row's reading scans the joined rooms and reads the other session rooms serially inside the single inbox producer (five seconds per room's pagination at most), so slow history reads delay ordinary inbox updates and expiry wake-ups; nothing reuses one reading across a batch. Fix: a coalesced, subscription-owned worker publishing changed rows, keeping *Unknown* on incomplete reads.
+status: open
+
+### DW-1501: A web search or console save is not checked against older hosts that would refuse its keys.
+
+origin: lane `101stack` (merging 101.4 and 101.5 with 101.6's older-host check in one writer), 2026-10-16
+location: `keeper_agent::desktop::{prepare_web_search, prepare_console}` (their `admit`), `keeper_core::agents::model::{KEY_SINCE, older_hosts}`
+reason: R422's check runs for the model save only, and `KEY_SINCE` knows `[model].effort` alone. `[web_search]` and `[run]` are root tables a build before epic 101 does not know (its `agent.toml` key set is closed), so such a host — keeper-agentd on electra until it is upgraded — would refuse the home and stop serving the agent after a person's save. Fix: add both tables to `KEY_SINCE` with the first release that reads them and give the two saves the model save's `admit`.
+status: closed (lane `101stack`, stack fix 1, R460, 2026-10-16: `KEY_SINCE` also names `web_search` in `[tools].allow`, `[web_search]` and `[run]` (0.10.4); `prepare_home` holds every save to `model::older_hosts`; web search *Off* and the console the file reads without `[run]` lift the tables out (`home::without_table`), so they stay allowed; tests `model::tests::every_key_epic_101_writes_is_held_to_the_serving_hosts`, `desktop::tests::a_save_an_older_serving_host_cannot_read_is_refused_and_one_back_is_not`, `home::tests::a_table_is_lifted_out_whole_or_not_at_all`)

@@ -6614,6 +6614,70 @@ function inboxRow(
   };
 }
 
+/**
+ * Each agent room's state in the list (story 101.6, R421), as Rust would say
+ * it: one room per state, so every mark can be looked at. `?attention=none`
+ * shows the rows with none.
+ *
+ * *Done* is not declared: it is read as Rust reads it (`attention.rs`, R437)
+ * from the room's newest status — `done`, what a host's finished turn ends
+ * on — sent after the event the person's read marker stands on. Reading the
+ * room (`mark_room_read`) moves the marker to now, past the finish.
+ */
+const attentionParam = new URLSearchParams(window.location.search).get("attention");
+const MOCK_ATTENTION: Record<
+  string,
+  NonNullable<InboxRoomVm["agentAttention"]>
+> = attentionParam === "none"
+  ? {}
+  : {
+      "!nixi-dm:example.org": "working",
+      "!tola-review:example.org": "needsYou",
+      "!forge-github:example.org": "failed",
+    };
+
+/**
+ * A room's newest status as its host sent it and the person's read marker:
+ * the reading list's turn finished five minutes ago (its answer's time, the
+ * header's `done`), and the person last read it at their question, six.
+ */
+const MOCK_FINISHES: Record<string, { at: number; read: number | null }> =
+  attentionParam === "none"
+    ? {}
+    : {
+        "!nixi-reading:example.org": { at: MOCK_NOW - 5 * 60_000, read: MOCK_NOW - 6 * 60_000 },
+      };
+
+/**
+ * Whether the questions the decisions panel shows (`mockAgentAsks`) are
+ * declared yet: a row read at load says what its run says, and is read again
+ * once they are.
+ */
+let mockAsksDeclared = false;
+
+function mockAttention(roomId: string): InboxRoomVm["agentAttention"] {
+  // A question waiting for the person where they answer it outranks every run
+  // (R453), read as Rust reads it: from the questions 101.3's projection puts
+  // in this room — one not answered yet, or held for Undo-Send — and, when it
+  // read them in part, *Unknown* rather than nothing.
+  if (mockAsksDeclared) {
+    const asks = mockAgentAsks(roomId);
+    if (asks.asks.some((ask) => ask.state !== "answered")) return "needsYou";
+    if (asks.note !== null) return "unknown";
+  }
+  const declared = MOCK_ATTENTION[roomId];
+  if (declared !== undefined) return declared;
+  const finish = MOCK_FINISHES[roomId];
+  return finish !== undefined && finish.read !== null && finish.at > finish.read
+    ? "doneUnread"
+    : undefined;
+}
+
+function withAttention(row: InboxRoomVm): InboxRoomVm {
+  const state = mockAttention(row.roomId);
+  return state === undefined ? row : { ...row, agentAttention: state };
+}
+
 const AGENT_ROOM_ROWS: InboxRoomVm[] = [
   inboxRow("!nixi-dm:example.org", "Nixi", "…", 1, "proxy", NIXI_AVATAR),
   inboxRow(
@@ -6650,13 +6714,15 @@ const AGENT_ROOM_ROWS: InboxRoomVm[] = [
     300,
     "session",
   ),
-].map((row) =>
-  // Rust's `agentMark`: the working agent's initial on every session row
-  // whose status was read (the room's name is "<agent> — <title>").
-  row.agentRoom === undefined || row.agentRoom === "unknown"
-    ? row
-    : { ...row, agentMark: row.displayName.trim().charAt(0).toUpperCase() },
-);
+]
+  .map((row) =>
+    // Rust's `agentMark`: the working agent's initial on every session row
+    // whose status was read (the room's name is "<agent> — <title>").
+    row.agentRoom === undefined || row.agentRoom === "unknown"
+      ? row
+      : { ...row, agentMark: row.displayName.trim().charAt(0).toUpperCase() },
+  )
+  .map(withAttention);
 
 const CHAT_ROWS: InboxRoomVm[] = [inboxRow("!marta:example.org", "Marta", "See you on Friday", 15)];
 
@@ -6762,7 +6828,8 @@ const AGENT_ROOM_TIMELINES: Record<
         host: "hesperia",
         title: "Reading list",
         kind: "conversation",
-        run: "idle",
+        // The turn that answered finished: its status ends `done` (R437).
+        run: "done",
         waiting: null,
         detail: null,
         unreadable: null,
@@ -8074,6 +8141,28 @@ function subscribeMockInbox(payload: Record<string, unknown>): number {
 
 const dockParam = new URLSearchParams(window.location.search).get("dock");
 const dockListedFrom = Date.now() + (dockParam === "late" ? 8_000 : 0);
+
+/**
+ * `?dock=refresh-fails`: the dock's reads of its rooms fail from eight to
+ * sixteen seconds after its first (story 101.6, R436) — the ten-second
+ * refresh lands there — and read again after, so the failure said beside the
+ * rooms it keeps, and its clearing, can be looked at.
+ */
+let dockFirstRead: number | null = null;
+function mockAgentRoomsList(accountId: string): ProxyRoomVm[] {
+  if (accountId !== MOCK_ACCOUNT_ID || Date.now() < dockListedFrom) return [];
+  dockFirstRead ??= Date.now();
+  const since = Date.now() - dockFirstRead;
+  if (dockParam === "refresh-fails" && since >= 8_000 && since < 16_000) {
+    throw {
+      code: "internal",
+      message: "the room list could not be read",
+      accountId,
+      retriable: true,
+    };
+  }
+  return proxyRooms;
+}
 const DM_ROOM = "!nixi-dm:example.org";
 const NIXI_ALLOWED = [
   { id: "tgdrive", title: "tgdrive" },
@@ -8099,7 +8188,47 @@ let proxyRooms: ProxyRoomVm[] =
           agent: NIXI,
           allowed: NIXI_ALLOWED,
         },
-      ].map((room): ProxyRoomVm => (dockParam === "phone" ? { ...room, allowed: null } : room));
+      ]
+        .map((room): ProxyRoomVm => (dockParam === "phone" ? { ...room, allowed: null } : room))
+        .map((room): ProxyRoomVm => {
+          const state = mockAttention(room.roomId);
+          return state === undefined ? room : { ...room, attention: state };
+        });
+
+/**
+ * Reading an agent room that finished since it was last read clears its
+ * *done* (story 101.6): Rust's row and the dock's list say none from then on.
+ */
+function mockMarkRoomRead(roomId: string): null {
+  const finish = MOCK_FINISHES[roomId];
+  if (finish === undefined) return null;
+  finish.read = Date.now();
+  redrawMockAttention(roomId);
+  return null;
+}
+
+/** Rust reads `roomId`'s state again: its Agents window row and dock entry. */
+function redrawMockAttention(roomId: string): void {
+  const state = mockAttention(roomId);
+  const index = AGENT_ROOM_ROWS.findIndex((row) => row.roomId === roomId);
+  if (index >= 0) {
+    const { agentAttention: _was, ...rest } = AGENT_ROOM_ROWS[index];
+    const row: InboxRoomVm = state === undefined ? rest : { ...rest, agentAttention: state };
+    AGENT_ROOM_ROWS[index] = row;
+    const shown = nixiDmHere
+      ? AGENT_ROOM_ROWS
+      : AGENT_ROOM_ROWS.filter((r) => r.roomId !== DM_ROOM);
+    const at = shown.findIndex((r) => r.roomId === roomId);
+    if (at >= 0) {
+      agentsWindow?.onmessage?.({ ops: [{ op: "set", index: at, room: row }], total: null });
+    }
+  }
+  proxyRooms = proxyRooms.map((room) => {
+    if (room.roomId !== roomId) return room;
+    const { attention: _was, ...rest } = room;
+    return state === undefined ? rest : { ...rest, attention: state };
+  });
+}
 
 /** Open timelines by subscription id, so a scope echo reaches the dock. */
 const dockChannels = new Map<number, { roomId: string; channel: MockChannel<TimelineBatch> }>();
@@ -8490,6 +8619,8 @@ const outboxWatchers = new Map<
 >();
 const askWatchers = new Map<number, { roomId: string; channel: MockChannel<AgentAsksVm> }>();
 let mockWatchSeq = 0;
+mockAsksDeclared = true;
+redrawMockAttention(DM_ROOM);
 
 function emitHeld(): void {
   for (const { roomId, channel } of outboxWatchers.values()) {
@@ -8498,6 +8629,8 @@ function emitHeld(): void {
   for (const { roomId, channel } of askWatchers.values()) {
     channel.onmessage?.(mockAgentAsks(roomId));
   }
+  // The DM's row and dock entry follow the questions answered there (R453).
+  redrawMockAttention(DM_ROOM);
 }
 
 function mockSendText(payload: Record<string, unknown>): null {
@@ -8648,8 +8781,8 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
   agent_approval_decide: mockApprovalDecide,
   agent_approval_payload: mockApprovalPayload,
   agent_own_fingerprint: () => (fingerprintParam === "none" ? null : OWN_FINGERPRINT),
-  agent_rooms_list: (payload) =>
-    payload.accountId === MOCK_ACCOUNT_ID && Date.now() >= dockListedFrom ? proxyRooms : [],
+  mark_room_read: (payload) => mockMarkRoomRead(String(payload.roomId)),
+  agent_rooms_list: (payload) => mockAgentRoomsList(String(payload.accountId)),
   agent_scope_set: mockScopeSet,
   agent_focus: (payload) =>
     later(40, () => {

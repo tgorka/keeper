@@ -9293,9 +9293,17 @@ impl ServedSession {
         if withheld {
             gate.suppressed("answer");
         }
-        // Only now is the status `idle`: a device following the answer takes
-        // that as the answer being whole (AD-384).
-        if let Some(anchor) = board.finish(&delivered).await {
+        // Only now does the status leave `running`: a device following the
+        // answer takes that as the answer being whole (AD-384). A turn the
+        // model finished, with no delegation of the session waiting for its
+        // target's reply and no question of it waiting for an answer, says
+        // `done`; any other end — stopped, failed, parked, asking, waiting
+        // on a delegation — says `idle` (R437). A delegation whose target
+        // replied to its latest round waits for nothing.
+        let done = ran.ending == TurnEnding::Complete
+            && self.context.delegations.values().all(|open| open.replied)
+            && self.context.asks.is_empty();
+        if let Some(anchor) = board.finish(&delivered, done).await {
             self.context.status_anchor = Some(anchor);
         }
 
@@ -10817,7 +10825,8 @@ async fn run_agent_turn(
             &tools.sinks,
         )
         .with_outputs(outputs)
-        .serving(tools.desk),
+        .serving(tools.desk)
+        .model_local(local),
         memory,
         search,
         view: &log,
@@ -10943,7 +10952,8 @@ async fn run_agent_turn(
         // What the call read: a drive verb's file, or the home drive's
         // files a BMAD or skill tool read, each labelled by where it landed
         // and the bytes it returned, as they were at the read (R195); a
-        // helper's, everything it read.
+        // helper's, everything it read; a refused home's `agent.toml` a
+        // `delegate` refusal told of (R436).
         let home = &deps.home.drive;
         let helped = (wire.name == helper::HELPER)
             .then(|| host.helpers.take(&wire.id))
@@ -10951,6 +10961,7 @@ async fn run_agent_turn(
         let reads: Vec<(Label, String)> = read_label(deps, &read_profiles, record, outcome)
             .into_iter()
             .chain(host.search.take_reads())
+            .chain(host.delegation.take_reads())
             .chain(
                 host.bmad
                     .take_reads()
@@ -11882,6 +11893,7 @@ pub(crate) fn current_model(deps: &AgentDeps) -> Result<Option<Box<AgentDeps>>, 
             effort: now.effort,
             local_only: now.local_only,
             web_search_ask: now.web_search_ask,
+            web_search_said: now.web_search_said,
             run: now.run,
             ..home.config.clone()
         },

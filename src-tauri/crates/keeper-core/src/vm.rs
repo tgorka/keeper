@@ -792,6 +792,13 @@ pub struct RoomVm {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub agent_mark: Option<String>,
+    /// An agent room's state in the list (story 101.6, R421): needs you,
+    /// failed, working or done since the person last read it — Rust's word,
+    /// drawn by the row and never derived; absent for every other room and
+    /// for an agent room in none of them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub agent_attention: Option<crate::agents::attention::AgentAttentionVm>,
 }
 
 /// One Matrix Space the user belongs to, surfaced as a filter view (Story 4.5,
@@ -2034,6 +2041,13 @@ pub struct InboxRoomVm {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub agent_mark: Option<String>,
+    /// An agent room's state in the list (story 101.6, R421): needs you,
+    /// failed, working or done since the person last read it — Rust's word,
+    /// drawn by the row and never derived; absent for every other room and
+    /// for an agent room in none of them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub agent_attention: Option<crate::agents::attention::AgentAttentionVm>,
 }
 
 /// One index-based merged-inbox operation mirroring an eyeball-im `VectorDiff`
@@ -8480,6 +8494,7 @@ mod tests {
             agent_room: None,
             agent_avatar: None,
             agent_mark: None,
+            agent_attention: None,
         }
     }
 
@@ -8666,6 +8681,7 @@ mod tests {
             agent_room: None,
             agent_avatar: None,
             agent_mark: None,
+            agent_attention: None,
         }
     }
 
@@ -8702,6 +8718,7 @@ mod tests {
             agent_room: None,
             agent_avatar: None,
             agent_mark: None,
+            agent_attention: None,
         };
         let json = serde_json::to_string(&vm).expect("serialize");
         assert!(json.contains("\"lastMessage\":null"), "json was: {json}");

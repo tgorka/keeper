@@ -72,7 +72,7 @@ use ulid::Ulid;
 
 use crate::agent::RoomFuture;
 use crate::matrix_sink::{EditPort, MembersFuture, SendFuture};
-use crate::rooms::{BriefRoom, Known, KnownAgent};
+use crate::rooms::{BriefRoom, Known, KnownAgent, RefusedHome};
 use crate::sessions::verbs::VerbError;
 use crate::sinks::{room_audience, Blocked, CallAudit, Sinks, Withheld};
 
@@ -564,33 +564,97 @@ fn handed_on(
     None
 }
 
-/// The agent `name` names (R67): `<drive>/<id>`, or a bare id only when
-/// exactly one known agent has it.
-pub fn resolve<'k>(known: &'k Known, name: &str) -> Result<&'k KnownAgent, String> {
+/// Why a name is no agent a delegation can go to: the sentence the asking
+/// session is told, and the label of what it says of a refused home's
+/// `agent.toml` — `None` when it says nothing read from a drive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unresolved {
+    pub sentence: String,
+    pub read: Option<Label>,
+}
+
+impl From<String> for Unresolved {
+    fn from(sentence: String) -> Unresolved {
+        Unresolved {
+            sentence,
+            read: None,
+        }
+    }
+}
+
+/// The agent `name` names (R67) for a session labelled `asking`:
+/// `<drive>/<id>`, or a bare id only when exactly one known agent has it.
+/// A name only homes this host refuses answer to is refused with each
+/// home's own sentence (story 101.6, R422) — but only a home whose label may
+/// reach `asking`'s readers and the session's model is said at all (R436):
+/// for any other session the name is one nobody knows, the same answer as
+/// for a name no drive has, so it learns neither the sentence nor that the
+/// home exists. `model_local`: whether the model the asking session's turn
+/// runs on is local (`AgentDeps::model_is_local`) — where the sentence
+/// goes, never `asking.local_only`, which says what its content requires
+/// (R453).
+pub fn resolve<'k>(
+    known: &'k Known,
+    name: &str,
+    asking: &Label,
+    model_local: bool,
+) -> Result<&'k KnownAgent, Unresolved> {
     let name = name.trim();
-    let found: Vec<&KnownAgent> = match name.split_once('/') {
-        Some((drive, id)) => known
-            .agents
-            .iter()
-            .filter(|agent| agent.drive == drive && agent.id == id)
-            .collect(),
-        None => known
-            .agents
-            .iter()
-            .filter(|agent| agent.id == name)
-            .collect(),
+    let named = |drive: &str, id: &str| match name.split_once('/') {
+        Some((wanted_drive, wanted_id)) => drive == wanted_drive && id == wanted_id,
+        None => id == name,
     };
+    let found: Vec<&KnownAgent> = known
+        .agents
+        .iter()
+        .filter(|agent| named(&agent.drive, &agent.id))
+        .collect();
     match found.as_slice() {
         [one] => Ok(one),
-        [] => Err(format!("No agent named {name} is known on this host.")),
+        [] => {
+            let told: Vec<&RefusedHome> = known
+                .refused
+                .iter()
+                .filter(|home| named(&home.drive, &home.id))
+                .filter(|home| {
+                    home.label.may_reach(&asking.readers) && home.label.may_use_model(model_local)
+                })
+                .collect();
+            let read = told
+                .iter()
+                .map(|home| home.label.clone())
+                .reduce(|joined, label| joined.join(&label));
+            match read {
+                None => Err(format!("No agent named {name} is known on this host.").into()),
+                Some(read) => Err(Unresolved {
+                    sentence: told
+                        .iter()
+                        .map(|home| refused_here(home))
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    read: Some(read),
+                }),
+            }
+        }
         many => Err(format!(
             "{name} names more than one agent: {}. Name one as <drive>/<id>.",
             many.iter()
                 .map(|agent| agent.name_in_drive())
                 .collect::<Vec<_>>()
                 .join(", ")
-        )),
+        )
+        .into()),
     }
+}
+
+/// What a delegation to `home` says: its `agent.toml` does not read on this
+/// host, and why (story 101.6, R422).
+fn refused_here(home: &RefusedHome) -> String {
+    format!(
+        "{}'s agent.toml does not read on this host: {}",
+        home.name_in_drive(),
+        home.sentence
+    )
 }
 
 /// The delegation `args` (a `delegate` call's) describes from `from` to
@@ -883,6 +947,12 @@ pub struct DelegateTools<'t> {
     /// A gate's turn: the request its `reply` answers (codemap Q6).
     pub serving: Option<crate::gate::Serving>,
     lines: Mutex<Vec<LineBody>>,
+    /// What the last call told the session of a drive, labelled, with where
+    /// it came from: a refused home's sentence (R436).
+    reads: Mutex<Vec<(Label, String)>>,
+    /// Whether the model this session's turn runs on is local: what a
+    /// refused home's sentence may be told to (R453).
+    model_local: bool,
 }
 
 fn refused(reason: impl Into<String>) -> Option<ToolOutcome> {
@@ -912,6 +982,18 @@ impl<'t> DelegateTools<'t> {
             outputs: Vec::new(),
             serving: None,
             lines: Mutex::new(Vec::new()),
+            reads: Mutex::new(Vec::new()),
+            model_local: false,
+        }
+    }
+
+    /// Whether the model this session's turn runs on is local (R453); a
+    /// toolset not told reads it as remote, which tells a local-only drive's
+    /// refused home to nobody.
+    pub fn model_local(self, model_local: bool) -> DelegateTools<'t> {
+        DelegateTools {
+            model_local,
+            ..self
         }
     }
 
@@ -929,6 +1011,19 @@ impl<'t> DelegateTools<'t> {
     /// call's reporter writes them under its `tool_call` line.
     pub fn take_lines(&self) -> Vec<LineBody> {
         std::mem::take(&mut *self.lines.lock().unwrap_or_else(|p| p.into_inner()))
+    }
+
+    /// What the last call told the session of a drive, once: each label and
+    /// where it came from, joined into the session's label as a read is.
+    pub fn take_reads(&self) -> Vec<(Label, String)> {
+        std::mem::take(&mut *self.reads.lock().unwrap_or_else(|p| p.into_inner()))
+    }
+
+    fn read(&self, label: Label, from: &str) {
+        self.reads
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push((label, from.to_owned()));
     }
 
     fn line(&self, body: LineBody) {
@@ -1055,7 +1150,7 @@ impl<'t> DelegateTools<'t> {
             .agents
             .iter()
             .find(|agent| agent.matrix_user.as_str() == name)
-            .or_else(|| resolve(&known, &name).ok());
+            .or_else(|| resolve(&known, &name, &self.view.label(), self.model_local).ok());
         match target {
             Some(target) => (target.drive.clone(), target.matrix_user.to_string()),
             None => (String::new(), name),
@@ -1079,7 +1174,7 @@ impl<'t> DelegateTools<'t> {
             let audience = audience_of(&known, &delegation.to);
             return Some((delegation.to.to_string(), audience));
         }
-        let audience = resolve(&known, &args.agent)
+        let audience = resolve(&known, &args.agent, &self.view.label(), self.model_local)
             .ok()
             .map(|target| target.home_readers.clone());
         Some((args.agent, audience))
@@ -1144,9 +1239,16 @@ impl<'t> DelegateTools<'t> {
         // A resumed call approved for these bytes sends under the same id.
         let id = audit.delegation_id(handoff.unwrap_or_else(|| Ulid::new().to_string()));
         let known = port.known();
-        let target = match resolve(&known, &args.agent) {
+        let target = match resolve(&known, &args.agent, &self.view.label(), self.model_local) {
             Ok(target) => target,
-            Err(sentence) => return self.refuse(&id, args.agent.trim(), None, sentence),
+            Err(unresolved) => {
+                // What it says of a refused home joins the session's label,
+                // as a read of that `agent.toml` would (R436).
+                if let Some(label) = unresolved.read {
+                    self.read(label, args.agent.trim());
+                }
+                return self.refuse(&id, args.agent.trim(), None, unresolved.sentence);
+            }
         };
         let to = target.matrix_user.to_string();
         if target.matrix_user == self.from.user {
@@ -1353,7 +1455,11 @@ impl<'t> DelegateTools<'t> {
         else {
             return refused(format!("{to} is no longer known on this host."));
         };
-        if resolve(&known, agent).map(|named| &named.matrix_user) != Ok(&delegation.to) {
+        if resolve(&known, agent, &self.view.label(), self.model_local)
+            .ok()
+            .map(|named| &named.matrix_user)
+            != Some(&delegation.to)
+        {
             return self.refuse(
                 id,
                 &to,
@@ -1665,6 +1771,7 @@ mod tests {
     #[test]
     fn a_target_is_named_by_drive_and_id() {
         let known = Known {
+            refused: Vec::new(),
             agents: vec![
                 agent("tgdrive", "amelia"),
                 agent("neuradrive", "amelia"),
@@ -1672,17 +1779,105 @@ mod tests {
             ],
             trust: Vec::new(),
         };
+        let anyone = Label::top();
         assert_eq!(
-            resolve(&known, "neuradrive/amelia").expect("one").drive,
+            resolve(&known, "neuradrive/amelia", &anyone, false)
+                .expect("one")
+                .drive,
             "neuradrive"
         );
-        assert_eq!(resolve(&known, "tola-grey").expect("one").id, "tola-grey");
-        let both = resolve(&known, "amelia").expect_err("two");
+        assert_eq!(
+            resolve(&known, "tola-grey", &anyone, false)
+                .expect("one")
+                .id,
+            "tola-grey"
+        );
+        let both = resolve(&known, "amelia", &anyone, false)
+            .expect_err("two")
+            .sentence;
         assert!(
             both.contains("tgdrive/amelia") && both.contains("neuradrive/amelia"),
             "{both}"
         );
-        assert!(resolve(&known, "tgdrive/winston").is_err());
+        assert!(resolve(&known, "tgdrive/winston", &anyone, false).is_err());
+    }
+
+    /// 101.6 #3 (R422, R436): a refused home is told only to a session its
+    /// drive's label may reach — readers and model — with that label to join;
+    /// to any other the name is one nobody knows, the same answer a name no
+    /// drive has gets. A readable agent of the same id wins either way.
+    #[test]
+    fn a_refused_home_is_told_only_to_a_session_its_drive_may_reach() {
+        let user = |id: &str| OwnedUserId::try_from(id).expect("user");
+        let only = |ids: &[&str]| Readers::Only(ids.iter().map(|id| user(id)).collect());
+        let label = |ids: &[&str], local_only: bool| Label {
+            readers: only(ids),
+            integrity: Integrity::Agent,
+            local_only,
+        };
+        let home = |drive: &str, label: Label| RefusedHome {
+            drive: drive.to_owned(),
+            id: "kit".to_owned(),
+            sentence: format!("{drive} refuses kit."),
+            label,
+        };
+        let private = home("private", label(&["@tgorka:h"], false));
+        let shared = home("shared", label(&["@tgorka:h", "@marta:h"], false));
+        let local = home("local", label(&["@tgorka:h", "@marta:h"], true));
+        let known = Known {
+            agents: vec![agent("neuradrive", "amelia")],
+            trust: Vec::new(),
+            refused: vec![private.clone(), shared.clone(), local.clone()],
+        };
+        let nobody = Known {
+            refused: Vec::new(),
+            ..known.clone()
+        };
+        let session = |ids: &[&str], local_only: bool| Label {
+            integrity: Integrity::Owner,
+            ..label(ids, local_only)
+        };
+
+        // Marta's and tgorka's session: the shared home's sentence alone.
+        let both = session(&["@tgorka:h", "@marta:h"], false);
+        let told = resolve(&known, "kit", &both, false).expect_err("refused");
+        assert!(told.sentence.contains(&shared.sentence), "{told:?}");
+        assert!(!told.sentence.contains(&private.sentence), "{told:?}");
+        assert!(!told.sentence.contains(&local.sentence), "{told:?}");
+        assert_eq!(told.read, Some(shared.label.clone()));
+        // The private home by its whole name: nothing about it.
+        assert_eq!(
+            resolve(&known, "private/kit", &both, false).expect_err("refused"),
+            resolve(&nobody, "private/kit", &both, false).expect_err("nobody's")
+        );
+        // The same unrestricted session on a local model hears of the
+        // local-only drive's home too (R453): the model it runs on decides,
+        // not whether its label already requires a local one.
+        let told = resolve(&known, "local/kit", &both, true).expect_err("refused");
+        assert!(told.sentence.contains(&local.sentence), "{told:?}");
+        assert_eq!(told.read, Some(local.label.clone()));
+        // On a remote model: nothing about it, whatever its label requires.
+        assert_eq!(
+            resolve(&known, "local/kit", &both, false).expect_err("refused"),
+            resolve(&nobody, "local/kit", &both, false).expect_err("nobody's")
+        );
+        let local_label = session(&["@tgorka:h", "@marta:h"], true);
+        assert_eq!(
+            resolve(&known, "local/kit", &local_label, false).expect_err("refused"),
+            resolve(&nobody, "local/kit", &local_label, false).expect_err("nobody's")
+        );
+        // tgorka's own session: the private home too, every label joined.
+        let mine = session(&["@tgorka:h"], false);
+        let told = resolve(&known, "kit", &mine, false).expect_err("refused");
+        assert!(told.sentence.contains(&private.sentence), "{told:?}");
+        assert_eq!(told.read, Some(private.label.join(&shared.label)));
+
+        assert_eq!(
+            resolve(&known, "amelia", &both, false)
+                .expect("the readable one")
+                .drive,
+            "neuradrive"
+        );
     }
 
     /// FR-795: a declassification names the whole brief event, so

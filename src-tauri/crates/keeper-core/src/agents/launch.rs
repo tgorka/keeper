@@ -551,6 +551,7 @@ mod tests {
             kind,
             agent: agent.to_owned(),
             allowed: None,
+            attention: None,
         }
     }
 
