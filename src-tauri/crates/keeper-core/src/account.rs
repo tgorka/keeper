@@ -35,7 +35,7 @@ use matrix_sdk::ruma::events::room::MediaSource;
 use matrix_sdk::ruma::events::{
     AnySyncMessageLikeEvent, AnySyncTimelineEvent, StateEventType, SyncMessageLikeEvent,
 };
-use matrix_sdk::ruma::{EventId, OwnedRoomId, RoomId};
+use matrix_sdk::ruma::{EventId, OwnedRoomId, OwnedUserId, RoomId, UserId};
 use matrix_sdk::{Client, Room};
 use matrix_sdk_ui::eyeball_im::VectorDiff;
 use matrix_sdk_ui::room_list_service::filters::new_filter_non_left;
@@ -49,16 +49,17 @@ use tracing::Instrument;
 use crate::agents::approval_card::{self, ApprovalDecideReq, HostedRooms, Viewer, NOTE_MAX};
 use crate::agents::device::{self as agent_device, AccountAgents, AgentDevice};
 use crate::agents::events::{
-    ApprovalDecisionContent, ConversationRequestContent, Focus, ScopeContent, ScopeDrive,
-    CONTENT_VERSION,
+    ApprovalDecisionContent, ConversationRequestContent, Focus, MainDmRequestContent, ScopeContent,
+    ScopeDrive, CONTENT_VERSION, MAIN_DM_ANSWER,
 };
 use crate::agents::events::{PresencePlatform, SurfaceResultContent};
 use crate::agents::focus::{FocusLanes, FocusPort, Named, SendFuture};
 use crate::agents::heard::HeardContent;
 use crate::agents::launch::{
-    self, AgentsLaunchVm, LaunchFacts, LaunchReadiness, LaunchSource, ReadinessState,
-    SetDefaultError, LAUNCH_READY_MS, LAUNCH_RECHECK_MS,
+    self, AgentsLaunchVm, LaunchFacts, LaunchReadiness, LaunchRoomVm, LaunchSource, MainDmAskVm,
+    ReadinessState, SetDefaultError, LAUNCH_READY_MS, LAUNCH_RECHECK_MS,
 };
+use crate::agents::main_dm;
 use crate::agents::proxy::{
     self, AgentOutbound, AgentProxies, KnownProxies, ProxyListEventContent, ProxyRoomRow,
     ProxyRoomVm,
@@ -800,7 +801,7 @@ impl AccountManager {
             palette: Arc::new(Mutex::new(PaletteIndex::new())),
             notify,
             badge,
-            agent_kinds: Arc::new(AgentKinds::default()),
+            agent_kinds: Arc::new(AgentKinds::kept(data_dir)),
             agent_icons: Arc::new(AgentIcons::default()),
             agent_proxies: Arc::new(AgentProxies::default()),
             agent_focus: Arc::new(FocusLanes::default()),
@@ -4011,25 +4012,22 @@ impl AccountManager {
     /// whose status is not read yet is not listed; nothing is listed for an
     /// account that is not live.
     pub async fn agent_rooms(&self, account_id: &str) -> Vec<ProxyRoomVm> {
+        self.agent_rooms_and_asks(account_id).await.0
+    }
+
+    /// [`Self::agent_rooms`], and the person's own proxies with no `main`
+    /// room among them — the ones keeper may ask for one (R416). An invite
+    /// to one of the person's agents' session rooms that is still waiting is
+    /// joined first ([`join_agent_invites`]).
+    async fn agent_rooms_and_asks(&self, account_id: &str) -> (Vec<ProxyRoomVm>, Vec<MainDmAskVm>) {
         let client = {
             let accounts = self.accounts.lock().await;
             match accounts.get(account_id) {
                 Some(handle) => handle.client.clone(),
-                None => return Vec::new(),
+                None => return (Vec::new(), Vec::new()),
             }
         };
-        let Some(me) = client.user_id().map(ToOwned::to_owned) else {
-            return Vec::new();
-        };
-        let mut rows = Vec::new();
-        for room in client.joined_rooms() {
-            if AgentRoomKind::of(room.room_type().as_ref()) != Some(AgentRoomKind::Session) {
-                continue;
-            }
-            rows.push(proxy_row(room, &self.agent_kinds).await);
-        }
-        let known = known_proxies(&client, &self.agent_proxies).await;
-        proxy::proxy_rooms(&rows, &me, &known)
+        agent_rooms_of(&client, account_id, &self.agent_kinds, &self.agent_proxies).await
     }
 
     /// The live agent session room `room_id` on `account_id`.
@@ -4181,6 +4179,52 @@ impl AccountManager {
                 .filter(|title| !title.is_empty()),
         };
         send_agent_event(&room, AgentOutbound::ConversationRequest(content)).await
+    }
+
+    /// Open the person's `main` DM with `agent` on `account_id` (story 101.1
+    /// #4–#5, R416): the room when it is here; otherwise one
+    /// [`AgentOutbound::MainDmRequest`] into the control room the person
+    /// shares with the agent, whose host answers with the DM it opened (or
+    /// adopted) or a refusal. The invite is joined as it lands — `main` as
+    /// direct — and the room is answered once it admits as the person's DM,
+    /// waited for at most [`main_dm::MAIN_DM_WAIT`]. Every way it does not
+    /// open is a sentence for where the person is looking and a WARN.
+    pub async fn agent_main_dm_open(
+        &self,
+        account_id: &str,
+        agent: &str,
+    ) -> Result<LaunchRoomVm, CoreError> {
+        // The one deadline over the whole ask, from the moment it was made
+        // (R450): the account's client is looked up under it too — the
+        // accounts are held across an activation or a shutdown, which can
+        // outlast it (review-101rooms-2 02).
+        let deadline = tokio::time::Instant::now() + main_dm::MAIN_DM_WAIT;
+        let agent = UserId::parse(agent).map_err(|_| {
+            tracing::warn!(
+                account_id,
+                "agents: a DM was asked of a value that is not a user id"
+            );
+            CoreError::Unsupported(format!("\"{agent}\" is not a Matrix user id."))
+        })?;
+        let looked_up = tokio::time::timeout_at(deadline, async {
+            let accounts = self.accounts.lock().await;
+            accounts.get(account_id).map(|handle| handle.client.clone())
+        })
+        .await;
+        let client = match looked_up {
+            Ok(Some(client)) => client,
+            Ok(None) => return Err(SendError::RoomNotFound.into()),
+            Err(_) => return Err(CoreError::Unsupported(main_dm::not_reached_in_time(&agent))),
+        };
+        open_main_dm(
+            &client,
+            account_id,
+            &agent,
+            &self.agent_kinds,
+            &self.agent_proxies,
+            deadline,
+        )
+        .await
     }
 
     /// What the messenger composer's slash commands may do in `room_id`
@@ -4602,9 +4646,11 @@ impl AccountManager {
                     AgentRoomKind::of(room.room_type().as_ref()) == Some(AgentRoomKind::Session)
                 })
                 .count();
-            for room in self.agent_rooms(&account_id).await {
+            let (rooms, asks) = self.agent_rooms_and_asks(&account_id).await;
+            for room in rooms {
                 facts.proxies.push((account_id.clone(), room));
             }
+            facts.askable.extend(asks);
         }
         facts
     }
@@ -5843,6 +5889,16 @@ impl AccountManager {
                 );
             }
         }
+        // The account's kept agent-room seats go with it: titles it read
+        // stay nobody's once it signed out (R451).
+        if let Some(own) = platform
+            .data_dir()
+            .ok()
+            .and_then(|dir| registry::get_account(&dir, account_id).ok().flatten())
+            .and_then(|row| matrix_sdk::ruma::OwnedUserId::try_from(row.user_id).ok())
+        {
+            self.agent_kinds.forget_account(&own);
+        }
         self.shutdown(account_id).await;
         crate::auth::sign_out_cleanup(platform.as_ref(), account_id)?;
         Ok(())
@@ -6052,10 +6108,23 @@ pub async fn decide_approval(
 /// `room` with `Room::send_raw` — this file's only `send_raw` — and only into an encrypted room (R30:
 /// every session room is); the event id. These are not messages, so they
 /// are outside AD-13's two dispatch triggers (`send.rs`'s Scope paragraph).
+/// The one state variant, the ask for a DM ([`AgentOutbound::state_key`]),
+/// is a control-room state event under the person's own key, as their
+/// presence is (R416).
 pub(crate) async fn send_agent_event(
     room: &Room,
     event: AgentOutbound,
 ) -> Result<String, CoreError> {
+    if let Some(key) = event.state_key(room.own_user_id()) {
+        let content = event
+            .content()
+            .map_err(|error| CoreError::Internal(error.to_string()))?;
+        return room
+            .send_state_event_raw(event.event_type(), &key, content)
+            .await
+            .map(|sent| sent.event_id.to_string())
+            .map_err(|error| SendError::Dispatch(error.to_string()).into());
+    }
     if !room.encryption_state().is_encrypted() {
         return Err(CoreError::Unsupported(
             proxy::Refusal::Unencrypted.to_string(),
@@ -6150,10 +6219,414 @@ pub(crate) async fn known_proxies(client: &Client, proxies: &AgentProxies) -> Kn
     known
 }
 
+/// The agents `client`'s account knows (story 101.1, R416): its own proxies
+/// ([`proxy::own_proxies`] over `known`) and every agent at an agent's power
+/// in a control room one of them made — the principal's agents, who make
+/// the person's delegated and scheduled sessions.
+pub(crate) async fn known_agents(client: &Client, known: &KnownProxies) -> BTreeSet<OwnedUserId> {
+    let Some(me) = client.user_id().map(ToOwned::to_owned) else {
+        return BTreeSet::new();
+    };
+    let own = proxy::own_proxies(&me, known);
+    let mut agents = own.clone();
+    for room in client.joined_rooms() {
+        if AgentRoomKind::of(room.room_type().as_ref()) != Some(AgentRoomKind::Control)
+            || !proxy::is_own_control_room(&room.creators().unwrap_or_default(), &own)
+        {
+            continue;
+        }
+        let Ok(levels) = room.power_levels().await else {
+            continue;
+        };
+        agents.extend(
+            levels
+                .users
+                .keys()
+                .filter(|user| **user != me && agent_room::holds_agent_power(Some(&levels), user))
+                .cloned(),
+        );
+    }
+    agents
+}
+
+/// Join `room`, an invite to this account, when [`proxy::joins_invite`]
+/// says it is one of the person's own agents' session rooms (R416). The
+/// SDK's join marks a direct invite — a `main` DM — in the person's
+/// `m.direct`, which is what admits it as their DM. Whether it joined; a
+/// failed join is a WARN, and the invite stays for the next look.
+pub async fn join_agent_invite(room: &Room, known: &BTreeSet<OwnedUserId>) -> bool {
+    if room.state() != matrix_sdk::RoomState::Invited {
+        return false;
+    }
+    let session = AgentRoomKind::of(room.room_type().as_ref()) == Some(AgentRoomKind::Session);
+    if !session {
+        return false;
+    }
+    let Ok(invite) = room.invite_details().await else {
+        return false;
+    };
+    let creators = room.creators().unwrap_or_default();
+    if !proxy::joins_invite(session, &creators, &invite.inviter_id, known) {
+        tracing::debug!(room = %room.room_id(), inviter = %invite.inviter_id, "agents: an invite waits for the person");
+        return false;
+    }
+    match room.join().await {
+        Ok(()) => {
+            tracing::info!(room = %room.room_id(), inviter = %invite.inviter_id, "agents: joined an agent's session room on its invite");
+            true
+        }
+        Err(error) => {
+            tracing::warn!(room = %room.room_id(), %error, "agents: an agent's session room could not be joined");
+            false
+        }
+    }
+}
+
+/// Join every invite waiting on `client` that [`join_agent_invite`] takes:
+/// an invite that arrived while keeper was closed is joined at the next look.
+pub(crate) async fn join_agent_invites(client: &Client, proxies: &AgentProxies) -> usize {
+    let invited = client.invited_rooms();
+    if invited.is_empty() {
+        return 0;
+    }
+    let known = known_agents(client, &known_proxies(client, proxies).await).await;
+    let mut joined = 0;
+    for room in invited {
+        joined += usize::from(join_agent_invite(&room, &known).await);
+    }
+    joined
+}
+
+/// `agent`'s name as the account's agent rooms hold it, else its user id's
+/// localpart: what keeper calls an agent it has no DM with yet.
+async fn proxy_name(client: &Client, agent: &UserId) -> String {
+    for room in client.joined_rooms() {
+        if AgentRoomKind::of(room.room_type().as_ref()).is_none() {
+            continue;
+        }
+        let name = agent_room::agent_name(&room, agent).await;
+        if name != agent.localpart() {
+            return name;
+        }
+    }
+    agent.localpart().to_owned()
+}
+
+/// The control room `client`'s account shares with `agent`, one of its own
+/// proxies (`own`): one `agent` made, else one another own proxy made where
+/// `agent` holds an agent's power.
+async fn control_room_with(
+    client: &Client,
+    agent: &UserId,
+    own: &BTreeSet<OwnedUserId>,
+) -> Option<Room> {
+    let mut shared = None;
+    for room in client.joined_rooms() {
+        if AgentRoomKind::of(room.room_type().as_ref()) != Some(AgentRoomKind::Control) {
+            continue;
+        }
+        let creators = room.creators().unwrap_or_default();
+        if creators.as_slice() == [agent.to_owned()] {
+            return Some(room);
+        }
+        if shared.is_none() && proxy::is_own_control_room(&creators, own) {
+            let levels = room.power_levels().await.ok();
+            if agent_room::holds_agent_power(levels.as_ref(), agent) {
+                shared = Some(room);
+            }
+        }
+    }
+    shared
+}
+
+/// The person's proxy conversations on `client`'s account (UX-DR130) —
+/// every agent session room [`proxy::admits`] admits, the DM first — and the
+/// person's own proxies with no `main` room among them, the ones keeper may
+/// ask for one (R416). An invite to one of the person's agents' session
+/// rooms that is still waiting is joined first ([`join_agent_invites`]).
+pub async fn agent_rooms_of(
+    client: &Client,
+    account_id: &str,
+    kinds: &AgentKinds,
+    proxies: &AgentProxies,
+) -> (Vec<ProxyRoomVm>, Vec<MainDmAskVm>) {
+    let Some(me) = client.user_id().map(ToOwned::to_owned) else {
+        return (Vec::new(), Vec::new());
+    };
+    join_agent_invites(client, proxies).await;
+    let mut rows = Vec::new();
+    for room in client.joined_rooms() {
+        if AgentRoomKind::of(room.room_type().as_ref()) != Some(AgentRoomKind::Session) {
+            continue;
+        }
+        rows.push(proxy_row(room, kinds).await);
+    }
+    let known = known_proxies(client, proxies).await;
+    let rooms = proxy::proxy_rooms(&rows, &me, &known);
+    let mut asks = Vec::new();
+    for agent in proxy::own_proxies(&me, &known) {
+        let has_main = rooms
+            .iter()
+            .any(|room| room.kind == SessionKind::Main && room.agent == agent.as_str());
+        if has_main {
+            continue;
+        }
+        let name = proxy_name(client, &agent).await;
+        asks.push(MainDmAskVm {
+            account_id: account_id.to_owned(),
+            agent: agent.to_string(),
+            opening: launch::opening_sentence(&name),
+            name,
+        });
+    }
+    (rooms, asks)
+}
+
+/// Open the person's `main` DM with `agent` on `client`'s account (story
+/// 101.1 #4–#5, R416, R450): the room when it is here; otherwise one
+/// [`AgentOutbound::MainDmRequest`] into the control room the person shares
+/// with the agent, whose host answers with the DM it opened (or adopted) or
+/// a refusal. The answered room is joined — `main` as direct — its status
+/// searched for page after page, and it is answered once it admits as the
+/// person's DM. Everything of it is bounded by `deadline`
+/// ([`main_dm::open_within`]); every way it does not open is a sentence for
+/// where the person is looking and a WARN.
+pub async fn open_main_dm(
+    client: &Client,
+    account_id: &str,
+    agent: &UserId,
+    kinds: &AgentKinds,
+    proxies: &AgentProxies,
+    deadline: tokio::time::Instant,
+) -> Result<LaunchRoomVm, CoreError> {
+    let mut port = ClientDmOpening {
+        client,
+        account_id,
+        agent: agent.to_owned(),
+        kinds,
+        proxies,
+        answers: tokio::sync::Mutex::new(None),
+        _hearing: None,
+        request: None,
+    };
+    let opened = main_dm::open_within(&mut port, deadline)
+        .await
+        .map_err(CoreError::Unsupported)?;
+    tracing::info!(account_id, agent = %agent, room = %opened.room_id, "agents: the person's DM with an agent opened");
+    Ok(opened)
+}
+
+/// [`main_dm::DmOpening`] over one account's client.
+struct ClientDmOpening<'a> {
+    client: &'a Client,
+    account_id: &'a str,
+    agent: matrix_sdk::ruma::OwnedUserId,
+    kinds: &'a AgentKinds,
+    proxies: &'a AgentProxies,
+    /// The control room's answers, heard from before the request left.
+    answers: tokio::sync::Mutex<Option<mpsc::UnboundedReceiver<serde_json::Value>>>,
+    _hearing: Option<matrix_sdk::event_handler::EventHandlerDropGuard>,
+    /// The request's event id.
+    request: Option<String>,
+}
+
+impl ClientDmOpening<'_> {
+    /// The DM among `rooms` as the launch answers it.
+    fn main_in(&self, rooms: Vec<ProxyRoomVm>) -> Option<LaunchRoomVm> {
+        rooms
+            .into_iter()
+            .find(|room| room.kind == SessionKind::Main && room.agent == self.agent.as_str())
+            .map(|room| LaunchRoomVm {
+                account_id: self.account_id.to_owned(),
+                room_id: room.room_id,
+            })
+    }
+}
+
+impl main_dm::DmOpening for ClientDmOpening<'_> {
+    type Opened = LaunchRoomVm;
+
+    fn agent(&self) -> &UserId {
+        &self.agent
+    }
+
+    async fn found(&self) -> Option<LaunchRoomVm> {
+        // Only the rooms the agent made and this account marked direct with
+        // it — its DM, and seldom anything else — are read; no invite is
+        // joined (review-101rooms-2 06).
+        for room in self.client.joined_rooms() {
+            let own = room
+                .creators()
+                .is_some_and(|creators| creators.as_slice() == [self.agent.clone()]);
+            let direct = room
+                .direct_targets()
+                .iter()
+                .any(|target| target.as_user_id() == Some(self.agent.as_ref()));
+            if !own
+                || !direct
+                || AgentRoomKind::of(room.room_type().as_ref()) != Some(AgentRoomKind::Session)
+            {
+                continue;
+            }
+            if let Ok((SessionKind::Main, agent)) =
+                admit_proxy_room(&room, self.kinds, self.proxies).await
+            {
+                if agent == self.agent {
+                    return Some(LaunchRoomVm {
+                        account_id: self.account_id.to_owned(),
+                        room_id: room.room_id().to_string(),
+                    });
+                }
+            }
+        }
+        None
+    }
+
+    async fn listed(&self) -> Option<LaunchRoomVm> {
+        let (rooms, _) =
+            agent_rooms_of(self.client, self.account_id, self.kinds, self.proxies).await;
+        self.main_in(rooms)
+    }
+
+    async fn name(&self) -> String {
+        proxy_name(self.client, &self.agent).await
+    }
+
+    async fn ask(&mut self) -> Result<(), String> {
+        let name = proxy_name(self.client, &self.agent).await;
+        let Some(me) = self.client.user_id().map(ToOwned::to_owned) else {
+            return Err(main_dm::not_sent_sentence(
+                &name,
+                "this account is not signed in",
+            ));
+        };
+        let known = known_proxies(self.client, self.proxies).await;
+        let own = proxy::own_proxies(&me, &known);
+        let Some(control) = control_room_with(self.client, &self.agent, &own).await else {
+            return Err(main_dm::no_control_room_sentence(&name));
+        };
+        // The answer is heard from before the request leaves, so a fast host
+        // is never missed.
+        let (answers, answered) = mpsc::unbounded_channel::<serde_json::Value>();
+        let handle = self.client.add_room_event_handler(
+            control.room_id(),
+            move |event: matrix_sdk::ruma::serde::Raw<AnySyncTimelineEvent>| {
+                let answers = answers.clone();
+                async move {
+                    if event.get_field::<&str>("type").ok().flatten() == Some(MAIN_DM_ANSWER) {
+                        if let Ok(value) = event.deserialize_as::<serde_json::Value>() {
+                            let _ = answers.send(value);
+                        }
+                    }
+                }
+            },
+        );
+        self._hearing = Some(self.client.event_handler_drop_guard(handle));
+        *self.answers.get_mut() = Some(answered);
+        let request = MainDmRequestContent {
+            v: CONTENT_VERSION,
+            agent: self.agent.clone(),
+            ask: ulid::Ulid::new().to_string(),
+        };
+        let request = send_agent_event(&control, AgentOutbound::MainDmRequest(request))
+            .await
+            .map_err(|error| main_dm::not_sent_sentence(&name, &error.to_string()))?;
+        tracing::info!(account_id = self.account_id, agent = %self.agent, "agents: asked an agent to open the person's DM");
+        self.request = Some(request);
+        Ok(())
+    }
+
+    async fn answer(&self) -> main_dm::Answer {
+        let mut answers = self.answers.lock().await;
+        loop {
+            let (Some(answers), Some(request)) = (answers.as_mut(), self.request.as_deref()) else {
+                return std::future::pending().await;
+            };
+            let Some(answer) = answers.recv().await else {
+                return std::future::pending().await;
+            };
+            if answer["sender"].as_str() != Some(self.agent.as_str())
+                || answer["content"]["request"].as_str() != Some(request)
+            {
+                continue;
+            }
+            if let Some(refused) = answer["content"]["refused"].as_str() {
+                return main_dm::Answer::Refused(refused.to_owned());
+            }
+            if let Some(room) = answer["content"]["room"]
+                .as_str()
+                .and_then(|room| matrix_sdk::ruma::OwnedRoomId::try_from(room).ok())
+            {
+                return main_dm::Answer::Room(room);
+            }
+        }
+    }
+
+    async fn settle(&self, room: &RoomId) -> bool {
+        settle_answered_dm(self.client, room, &self.agent).await
+    }
+
+    async fn admit(&self, room: &RoomId) -> Option<LaunchRoomVm> {
+        let joined = self.client.get_room(room)?;
+        agent_room::HeaderReader::open_searching(joined.clone(), self.kinds).await;
+        match admit_proxy_room(&joined, self.kinds, self.proxies).await {
+            Ok((SessionKind::Main, agent)) if agent == self.agent => Some(LaunchRoomVm {
+                account_id: self.account_id.to_owned(),
+                room_id: room.to_string(),
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// Settle `room_id`, the room `agent`'s host answered with as the person's
+/// DM, on `client`'s account: an invite is joined, and the room — joined
+/// now or before, outside keeper included — is marked direct with `agent`
+/// unless it already is (a DM the person left and forgot lost its mark, and
+/// a re-invite does not carry one). Whether it is joined and direct now; a
+/// room not here yet (the invite has not arrived) or left is not, and the
+/// caller keeps the answer to settle it when it lands (R450). Failures are
+/// WARNs.
+pub async fn settle_answered_dm(client: &Client, room_id: &RoomId, agent: &UserId) -> bool {
+    let Some(room) = client.get_room(room_id) else {
+        return false;
+    };
+    let made_by_agent = room
+        .creators()
+        .is_some_and(|creators| creators.as_slice() == [agent.to_owned()]);
+    if !made_by_agent
+        || AgentRoomKind::of(room.room_type().as_ref()) != Some(AgentRoomKind::Session)
+    {
+        tracing::warn!(room = %room.room_id(), "agents: the room an agent answered with is not its own session room");
+        return false;
+    }
+    match room.state() {
+        matrix_sdk::RoomState::Invited => {
+            if let Err(error) = room.join().await {
+                tracing::warn!(room = %room.room_id(), %error, "agents: the agent's DM could not be joined");
+                return false;
+            }
+        }
+        matrix_sdk::RoomState::Joined => {}
+        _ => return false,
+    }
+    let direct = room
+        .direct_targets()
+        .iter()
+        .any(|target| target.as_user_id() == Some(agent));
+    if !direct {
+        if let Err(error) = room.set_is_direct(true).await {
+            tracing::warn!(room = %room.room_id(), %error, "agents: the agent's DM could not be marked direct");
+            return false;
+        }
+    }
+    true
+}
+
 /// Whether `room` is one of its own user's proxy conversations
 /// ([`proxy::admits`] over [`known_proxies`]): its kind and agent, or
 /// `unsupported` with the refusal's sentence.
-async fn admit_proxy_room(
+pub async fn admit_proxy_room(
     room: &Room,
     kinds: &AgentKinds,
     proxies: &AgentProxies,
@@ -6241,18 +6714,26 @@ pub(crate) async fn proxy_row(room: Room, kinds: &AgentKinds) -> ProxyRoomRow {
         .iter()
         .filter_map(|target| target.as_user_id().map(ToOwned::to_owned))
         .collect();
-    let reader = agent_room::HeaderReader::open(room, kinds).await;
+    let reader = agent_room::HeaderReader::open_row(room.clone(), kinds).await;
     let state = reader.state();
-    let agent = state.agent().map(ToOwned::to_owned);
-    let scope = agent
-        .as_deref()
-        .and_then(|agent| state.scope_drives_of(agent));
+    // The newer of the status read now and the seat the last one left names
+    // the room — with none in reach (buried under claim renewals, or not in
+    // the cache since a restart) the seat does (R416, R451).
+    let seat = kinds.seat_after(room.own_user_id(), room.room_id(), state);
+    let scope = seat
+        .as_ref()
+        .and_then(|seat| state.scope_drives_of(&seat.agent));
+    let agent_name = match &seat {
+        Some(seat) => Some(agent_room::agent_name(&room, &seat.agent).await),
+        None => None,
+    };
     ProxyRoomRow {
         room_id,
         name,
-        kind: state.kind(),
-        agent,
-        title: state.title().map(ToOwned::to_owned),
+        kind: seat.as_ref().map(|seat| seat.kind),
+        agent: seat.as_ref().map(|seat| seat.agent.clone()),
+        title: seat.map(|seat| seat.title),
+        agent_name,
         recency,
         creators,
         encrypted,
@@ -7059,6 +7540,12 @@ async fn run_producer(
     // Once the loading-state stream terminates, its `select!` branch is disabled
     // so it is never re-polled after returning `None`.
     let mut loading_done = false;
+    // The rows as the stream left them, so a seat's changed kind, agent or
+    // title redraws the agent rooms' rows at once (R451).
+    let mut rows: matrix_sdk_ui::eyeball_im::Vector<RoomListItem> =
+        matrix_sdk_ui::eyeball_im::Vector::new();
+    let mut seats = kinds.subscribe();
+    let mut seats_open = true;
 
     futures_util::pin_mut!(stream);
     loop {
@@ -7068,6 +7555,7 @@ async fn run_producer(
                     Some(diffs) => {
                         let mut ops = Vec::with_capacity(diffs.len());
                         for diff in diffs {
+                            diff.clone().apply(&mut rows);
                             ops.push(diff_to_op(diff, account_id, notify, kinds, icons).await);
                         }
                         if !(sink)(RoomListBatch { ops, total }) {
@@ -7081,6 +7569,17 @@ async fn run_producer(
                     }
                 }
             }
+            changed = seats.changed(), if seats_open => {
+                if changed.is_err() {
+                    seats_open = false;
+                    continue;
+                }
+                let ops = agent_rows(&rows, account_id, notify, kinds, icons).await;
+                if !ops.is_empty() && !(sink)(RoomListBatch { ops, total }) {
+                    tracing::info!(account_id = %account_id, "room list channel closed, stopping producer");
+                    break;
+                }
+            }
             maybe_state = loading_state.next(), if !loading_done => {
                 match maybe_state {
                     Some(state) => total = loaded_total(&state),
@@ -7089,6 +7588,27 @@ async fn run_producer(
             }
         }
     }
+}
+
+/// Every agent room's row of `rows` drawn again, as `Set` ops at its index.
+async fn agent_rows(
+    rows: &matrix_sdk_ui::eyeball_im::Vector<RoomListItem>,
+    account_id: &str,
+    notify: &NotifyConfig,
+    kinds: &AgentKinds,
+    icons: &AgentIcons,
+) -> Vec<RoomListOp> {
+    let mut ops = Vec::new();
+    for (index, item) in rows.iter().enumerate() {
+        if agent_room::AgentRoomKind::of(item.room_type().as_ref()).is_none() {
+            continue;
+        }
+        ops.push(RoomListOp::Set {
+            index: index as u32,
+            room: room_item_to_vm(item, account_id, notify, kinds, icons).await,
+        });
+    }
+    ops
 }
 
 /// Drive one account's recency-sorted entries stream for the merged inbox:
@@ -7128,6 +7648,9 @@ async fn run_inbox_producer(
         matrix_sdk_ui::eyeball_im::Vector::new();
     let mut pictures = icons.subscribe();
     let mut pictures_open = true;
+    // A seat's kind, agent or title that changed redraws them too (R451).
+    let mut seats = kinds.subscribe();
+    let mut seats_open = true;
 
     futures_util::pin_mut!(stream);
     loop {
@@ -7156,16 +7679,20 @@ async fn run_inbox_producer(
                     pictures_open = false;
                     continue;
                 }
-                let mut ops = Vec::new();
-                for (index, item) in rows.iter().enumerate() {
-                    if agent_room::AgentRoomKind::of(item.room_type().as_ref()).is_none() {
-                        continue;
-                    }
-                    ops.push(RoomListOp::Set {
-                        index: index as u32,
-                        room: room_item_to_vm(item, account_id, notify, kinds, icons).await,
-                    });
+                let ops = agent_rows(&rows, account_id, notify, kinds, icons).await;
+                if !ops.is_empty()
+                    && !merger.apply_account_batch(account_id, RoomListBatch { ops, total }).await
+                {
+                    tracing::info!(account_id = %account_id, "inbox channel closed, stopping producer");
+                    break;
                 }
+            }
+            changed = seats.changed(), if seats_open => {
+                if changed.is_err() {
+                    seats_open = false;
+                    continue;
+                }
+                let ops = agent_rows(&rows, account_id, notify, kinds, icons).await;
                 if !ops.is_empty()
                     && !merger.apply_account_batch(account_id, RoomListBatch { ops, total }).await
                 {
@@ -7591,6 +8118,20 @@ async fn room_item_to_vm(
         Some(agent_room::AgentRoomKindVm::Control) | None => None,
         Some(_) => agent_room::row_picture(item, kinds, icons, account_id).await,
     };
+    // A titled session is listed as "<agent> — <title>", and its row's letter
+    // is its agent's initial (story 101.1 #6, R416).
+    let (display_name, agent_mark) =
+        match (agent_room, kinds.seat(item.own_user_id(), item.room_id())) {
+            (Some(agent_room::AgentRoomKindVm::Control) | None, _) | (_, None) => {
+                (display_name, None)
+            }
+            (Some(_), Some(seat)) => {
+                let agent_name = agent_room::agent_name(item, &seat.agent).await;
+                let mark = agent_room::agent_mark(&agent_name);
+                let titled = agent_room::titled_room_name(seat.kind, &agent_name, &seat.title);
+                (titled.unwrap_or(display_name), mark)
+            }
+        };
 
     RoomVm {
         room_id,
@@ -7608,6 +8149,7 @@ async fn room_item_to_vm(
         mute_state,
         agent_room,
         agent_avatar,
+        agent_mark,
     }
 }
 
@@ -8035,6 +8577,43 @@ mod tests {
             .await
             .expect("second sign_out should succeed");
 
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// R450 (review-101rooms-2 02): the one deadline runs from the moment
+    /// the person asked, the account lookup included. With the accounts held
+    /// past it — a stand-in for an activation or a shutdown — the ask ends
+    /// at the deadline with the sentence and a WARN, not when the lock is
+    /// let go.
+    #[tokio::test(start_paused = true)]
+    async fn a_dm_asked_while_the_accounts_are_held_ends_at_the_deadline() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "keeper-account-dm-held-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let manager = AccountManager::new(&FakePlatform::new(data_dir.clone()), &data_dir);
+        let activating = manager.accounts.lock().await;
+        let asked = tokio::time::Instant::now();
+        let (opened, log) = crate::agents::main_dm::tests::warned(
+            manager.agent_main_dm_open("01ARZ3NDEKTSV4RRFFQ69G5FAV", "@nixi:example.org"),
+        )
+        .await;
+        assert_eq!(asked.elapsed(), main_dm::MAIN_DM_WAIT);
+        drop(activating);
+        match opened.err() {
+            Some(CoreError::Unsupported(sentence)) => {
+                assert_eq!(sentence, main_dm::not_answered_sentence("nixi"));
+            }
+            other => panic!("the sentence at the deadline, not {other:?}"),
+        }
+        assert!(
+            log.contains("WARN") && log.contains("did not open"),
+            "{log}"
+        );
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 
@@ -9268,6 +9847,7 @@ mod tests {
             mute_state: MuteState::None,
             agent_room: None,
             agent_avatar: None,
+            agent_mark: None,
         }
     }
 

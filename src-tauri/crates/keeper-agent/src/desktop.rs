@@ -879,6 +879,9 @@ pub struct DesktopHost {
     /// The doorbells' work over the app's engine, once handed over
     /// ([`Self::attach_engine`]).
     engine: Option<Ringer>,
+    /// `agents.claims_lease` as the last scan read it (R455): the minute
+    /// lease unless the person turned the quarter-hour one on.
+    lease_setting: keeper_core::agents::claim::ClaimsLease,
 }
 
 impl DesktopHost {
@@ -893,6 +896,7 @@ impl DesktopHost {
             pictures: Arc::default(),
             doorbell: Arc::default(),
             engine: None,
+            lease_setting: keeper_core::agents::claim::ClaimsLease::Short,
         }
     }
 
@@ -1021,7 +1025,10 @@ impl DesktopHost {
                 }
             }
         }
+        built.runtime.set_lease_setting(self.lease_setting);
         built.runtime.tick(&built.signal).await;
+        // The person's asks for a DM, with the clock the tick calibrated (R450).
+        crate::dm_request::serve_all(&built.copies, &built.runtime.dm_round());
     }
 
     async fn scan(&mut self, facts: DesktopFacts) {
@@ -1064,6 +1071,7 @@ impl DesktopHost {
             let drives = desktop_drives(&facts.profiles, &facts.pins, &login);
             let checkouts = checkouts(&facts.profiles);
             let rows = store::list_providers(&data_dir).map(|listing| listing.rows);
+            let lease = keeper_core::registry::get_agents_claims_lease(&data_dir);
             let homes: Vec<AgentHome> = drives
                 .iter()
                 .filter(|drive| drive.view.hosts.is_ok())
@@ -1076,13 +1084,18 @@ impl DesktopHost {
                     signed_in_device(platform.as_ref(), &home.config.matrix_user).is_some()
                 })
                 .collect();
-            (facts, login, drives, checkouts, rows, signed)
+            (facts, login, drives, checkouts, rows, signed, lease)
         })
         .await;
-        let Ok((facts, login, drives, checkouts, rows, signed)) = read else {
+        let Ok((facts, login, drives, checkouts, rows, signed, lease)) = read else {
             tracing::error!("agents: the desktop's zones could not be read");
             return;
         };
+        // A setting that cannot be read is the minute lease (R455).
+        self.lease_setting = lease.unwrap_or_else(|error| {
+            tracing::warn!(%error, "agents: agents.claims_lease could not be read; claims stay on the minute lease");
+            keeper_core::agents::claim::ClaimsLease::Short
+        });
         // A checkout moved, came or went: the sandbox built on the old set
         // could grant a folder that now holds one (R228).
         if self

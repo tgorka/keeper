@@ -1,5 +1,6 @@
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { CLAIMS_LEASE_LABEL } from "@/components/settings/agents-claims-lease-row";
 import {
   AGENTS_RELOAD_MS,
   AgentsSection,
@@ -47,6 +48,8 @@ vi.mock("@/lib/ipc/client", () => ({
   agentsMcpDraft: vi.fn(() =>
     Promise.resolve({ floor: null, fixed: null, tools: [], conflicts: [], drop: null }),
   ),
+  agentsClaimsLeaseGet: vi.fn(() => Promise.resolve("short")),
+  agentsClaimsLeaseSet: vi.fn(),
   agentsSandboxGet: vi.fn(() =>
     Promise.resolve({ readExec: [], env: [], status: "", refusal: null }),
   ),
@@ -595,7 +598,10 @@ describe("Settings › Agents › Set up agents", () => {
     expect(await screen.findByText(sentence)).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "marta-notes" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: SET_UP_AGENTS_LABEL })).not.toBeInTheDocument();
-    expect(screen.queryByRole("checkbox")).not.toBeInTheDocument();
+    // No seed form's checkboxes: the one left is this Mac's claims lease.
+    expect(screen.getAllByRole("checkbox")).toEqual([
+      screen.getByRole("checkbox", { name: CLAIMS_LEASE_LABEL }),
+    ]);
   });
 });
 

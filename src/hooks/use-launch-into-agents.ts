@@ -19,6 +19,12 @@
  * 14.4) had nothing to restore: a webview reload after a jettison lands where
  * the person was, never on the default agent.
  *
+ * When the default agent is one of the person's own agents with no
+ * conversation here (`AgentsLaunchVm.ask`, R416), Rust is asked to open one
+ * (`openMainDm`): "Opening a conversation with Nixi…" while it waits, the
+ * room selected once it lands — if the person has not moved meanwhile — or
+ * Rust's sentence for why not.
+ *
  * When Rust says its reason is to be announced (`AgentsLaunchVm.announce`:
  * the Agents window opens with nothing selected because the default agent
  * has no room here, or the launch stopped waiting before it knew — the Inbox
@@ -32,6 +38,8 @@ import { useEffect, useRef } from "react";
 import { toast } from "sonner";
 import { captureSurface } from "@/hooks/use-telemetry";
 import { reportFrontendError } from "@/lib/crash-report";
+import type { LaunchRoomVm } from "@/lib/ipc/client";
+import { openMainDm } from "@/lib/main-dm";
 import { useAccountsStore } from "@/lib/stores/accounts";
 import { useCapabilitiesStore, useIsReducedCapabilityPlatform } from "@/lib/stores/capabilities";
 import { composerStore } from "@/lib/stores/composer";
@@ -113,25 +121,39 @@ export function useLaunchIntoAgents(): void {
             return;
           }
           void captureSurface("launchDefaultAgent");
-          applyingRef.current = true;
-          primaryViewStore.getState().setView("agents");
-          if (vm.room !== null) {
-            roomsStore.getState().selectRoom(vm.room);
-            // Desktop keeps focus-on-open; the phone never steals composer
-            // focus when a room opens (UX-DR22). After the room's composer has
-            // mounted: a fresh composer seeds its focus nonce at mount, so a
-            // bump made in the same tick as the selection is never seen.
+          // Desktop keeps focus-on-open; the phone never steals composer
+          // focus when a room opens (UX-DR22). After the room's composer has
+          // mounted: a fresh composer seeds its focus nonce at mount, so a
+          // bump made in the same tick as the selection is never seen.
+          const open = (room: LaunchRoomVm) => {
+            applyingRef.current = true;
+            roomsStore.getState().selectRoom(room);
+            applyingRef.current = false;
             if (!phone) {
               window.setTimeout(() => {
-                const selected = roomsStore.getState().selected;
-                if (selected?.roomId === vm.room?.roomId) {
+                if (roomsStore.getState().selected?.roomId === room.roomId) {
                   composerStore.getState().requestFocus();
                 }
               }, 0);
             }
-          }
+          };
+          applyingRef.current = true;
+          primaryViewStore.getState().setView("agents");
           applyingRef.current = false;
+          if (vm.room !== null) {
+            open(vm.room);
+          }
           announce();
+          // The default agent has no conversation here: Rust asks it for one
+          // and the room opens when it lands — unless the person has moved
+          // on meanwhile (story 101.1 #4, R416).
+          if (vm.ask !== null) {
+            void openMainDm(vm.ask).then((room) => {
+              if (room !== null && !navigatedRef.current) {
+                open(room);
+              }
+            });
+          }
         },
         (error: unknown) => {
           reportFrontendError("agents.launch", error, null);

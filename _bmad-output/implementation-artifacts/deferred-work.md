@@ -10589,7 +10589,8 @@ status: open
 origin: makistack's electra (2026-10-14): in Nixi's DM, 283 of the newest 300 events were `dev.keeper.agent.claim` (state key `""`, one per ~61 s; `renewed_at` moving)
 location: `keeper_agent::hosts` (claim renewal), `keeper_core::agents::claims`
 reason: 1 440 state events a day per served session room. A person's client must page through them to reach a message after any limited sync, and every Matrix client a person might use shows a session room as mostly invisible state. keeper's window now fills itself in 200-event pages (`conversation-body.tsx`), which hides the symptom. A fix at the source: renew less often (a longer lease with the same takeover semantics), or keep the lease's heartbeat out of the room's timeline — e.g. renew only near expiry, or move liveness to the host manifest in the control room and write the session claim only on acquire, release and takeover.
-status: open
+status: done 2026-10-15
+resolution: closed by story 101.1 #7 (lane `rooms`, R416; fix round 1, R449): a session's claim runs on `claim::LeaseKind::QuarterHour` — renewed every 15 min, stopped after 30, lapsed after 45, the takeover margin a whole renewal — while every live host manifest in the control room advertises `lease: "quarter-hour"` (`LeaseKind::for_fleet`); beside a host built before it the claim stays on the minute lease (60/120/180 s) and a holder drops to it at its next step when such a host appears (`beside_an_old_host_the_claim_never_looks_free_while_its_holder_writes`, `a_holder_drops_to_the_minute_lease_when_an_old_host_appears`, `a_claim_lapses_by_the_lease_it_says`). 96 renewals a day instead of 1 440 on an updated fleet; control-room claims (maintenance, pictures, the DM request) keep the minute lease. A host that vanishes holds its sessions for up to 45 min; one that stops cleanly releases them at once. The residual is DW-1444. Fix round 2 (R455): the quarter-hour lease is an operator's cutover, off by default (`agentd.toml` `[claims] lease`, the Mac's `agents.claims_lease`); until it is turned on every claim stays on the minute lease and this entry's timeline cost stays as it was.
 
 ### DW-1386: Marta's organisation-account setup is proved against a stub callback, not against ZITADEL.
 
@@ -10803,4 +10804,76 @@ status: open
 origin: rung `agents-100-slash` (story 100.5 #2, R394), 2026-10-14
 location: `keeper_core::agents::proxy::AgentOutbound` (closed, five variants), `src/components/notes/notes-agent-dock.tsx` (the scope editor)
 reason: the device has no stop or pause verb for a run (the host owns it), and a scope is edited only in the notes dock; a command for either would be a new agent protocol or a second editor, which R385 rules out. When either verb exists on the device, it joins the agent set in Rust.
+status: open
+
+### DW-1440: `live_consolidate` now sleeps 45 minutes.
+
+origin: lane `rooms` (story 101.1 #7, R416), 2026-10-15
+location: `src-tauri/crates/keeper-agentd/tests/live_consolidate.rs` (`tokio::time::sleep(claim::STOP_WITHOUT_RENEWAL + RENEW_EVERY)`)
+reason: the test holds a maintenance claim "longer than a holder may go unrenewed" in real time against Synapse; with the lease scaled to a quarter-hour cadence that is 45 minutes. It still proves what it proved, but no lane will run it in a gate. A lease length injectable per claim port (or a test-only `ServerClock` wall) would let it run in seconds; not built here, because every caller would carry a parameter only this test needs.
+status: done 2026-10-15
+resolution: fix round 1 (R449): only a session's own claim takes the quarter-hour lease; a maintenance claim keeps the minute lease, so `live_consolidate` sleeps `STOP_WITHOUT_RENEWAL + RENEW_EVERY` = 180 s again, as on the parent.
+
+### DW-1441: The kept seats are never pruned.
+
+origin: lane `rooms` (story 101.1 #2, R416), 2026-10-15
+location: `keeper_core::agents::seats` (`agent_room_seats` in `keeper.db`)
+reason: a seat is written when a status first admits a room and replaced by a newer one; a room the person left or forgot keeps its row. The rows are small (ids, kind, a title) and read once per launch, so nothing breaks, but the table only grows. Fix round 1 (R451) removes an account's rows at sign-out (`AgentKinds::forget_account`, `SeatStore::forget`); the sweep when a room is forgotten belongs with the room-list's own forgetting and is what is left.
+status: open
+
+### DW-1442: The launch's reason does not count session rooms whose status is unread.
+
+origin: lane `rooms` (survey seam 3, story 101.1), 2026-10-15
+location: `keeper_core::agents::launch::LaunchFacts`, `no_main_room_sentence`
+reason: with the kept seat and the DM request, a default agent whose DM is out of reach is admitted (or asked for) rather than reported missing, so the case the survey's seam 3 named — "no conversation" said when the conversation exists but is unread — is now only a room no seat was ever kept for (a first launch on a new device with its status buried). Counting joined session rooms with no readable status in `LaunchFacts` would let that one sentence say "has not arrived" instead; not needed by any acceptance item.
+status: open
+
+### DW-1443: The DM request is not proved through the Mac's desktop host.
+
+origin: lane `rooms` (story 101.1 #4, R416), 2026-10-15
+location: `keeper_agent::dm_request`, `keeper_agent::desktop` (both hosts hear it through `runtime::start_copy` → `register_handlers` and serve it at their tick, `dm_request::serve_all`)
+reason: the live test runs agentd's host (`live_main_dm.rs`); the Mac's desktop host shares the handler but runs only on macOS. Owed on hesperia: with Nixi served by the Mac and no DM (a test account), ask from the dock and read the answer and `keeper.log`.
+status: open
+
+### DW-1444: A host built before R449 may take a quarter-hour claim at its first tick.
+
+origin: lane `rooms` fix round 1 (review-101rooms-1 R101R1-01, R449), 2026-10-15
+location: `keeper_core::agents::claim::LeaseKind::for_fleet`, `keeper_agent::hosts::HostRuntime::tick_session` (`lease.want`, `contested`)
+reason: the quarter-hour lease is taken only while every live manifest advertises it, and a holder drops to the minute lease at its next step once a host without it appears — but an old host that comes back publishes its manifest and, in the same tick, may judge a quarter-hour claim older than 180 s free and take it (placement prefers it when it is always-on and the holder is busy). The holder then sees a later epoch or another host in the cached claim and renews at once, which loses the lease (`contested` → `Step::Renew` → `renew` → `Lost`); the window is one host tick plus a sync, and the log's `(epoch, claim)` fence is the backstop for a line written in it. Closing it at the old host needs that host updated; the cutover is: update every host, then the quarter-hour lease follows on its own.
+status: closed
+resolution: replaced by R455 (lane `rooms` fix round 2, review-101rooms-2 R101R2-01), 2026-10-16. Not an acceptable residual: no automatic switch is safe against a released host that advertises nothing and can come back at any time, and "one tick plus a sync" is no bound during a partition. The quarter-hour lease is now an operator's cutover — off by default everywhere (`agentd.toml` `[claims] lease`, the Mac's `agents.claims_lease`), taken only where it is turned on and every live manifest advertises it, and a holder on it halts at its first sight of a live claim or manifest from a host that does not advertise it until its minute-lease renewal is confirmed (`claims::tests::by_default_an_old_host_returning_first_never_finds_a_written_claim_free`, `turned_on_a_holder_stops_at_first_sight_of_an_old_hosts_claim`, `a_holder_leaving_the_quarter_hour_lease_writes_nothing_until_its_minute_renewal`). With it turned on, the window this entry named remains by the operator's choice: docs/agents.md says the cutover order.
+
+### DW-1445: A new device without the room's keys cannot read a buried DM status.
+
+origin: lane `rooms` fix round 1 (review-101rooms-1 R101R1-03, R450), 2026-10-15
+location: `keeper_core::account::open_main_dm` (`ClientDmOpening::admit` → `HeaderReader::open_searching`)
+reason: after the host answers with an existing DM, keeper searches that room's history back to its status page after page — enough for an upgraded keeper (its device holds the room's keys, its `keeper.db` no seat). A device that joined after the status was sent and has no key backup reads the status as unreadable and the room is not admitted until a newer status (the next turn's) arrives. The host re-publishing its current status was the alternative R448 offered; it was not taken, because the host's newest status is an edit of the session's anchor that a running holder keeps writing, and a second, unedited status from the answering copy could stand newer than the holder's next edit.
+status: open
+
+### DW-1446: Sign-out deletes an account's kept seats before its readers stop.
+
+origin: lane `rooms` fix round 2 (review-101rooms-2 R101R2-04, R455), 2026-10-16
+location: `keeper_core::account::AccountManager::sign_out` (`AgentKinds::forget_account`, `SeatStore::forget` before `shutdown`), `keeper_core::agents::room::{fold_status, AgentKinds::remember}`, `keeper_core::agents::device::register`
+reason: the account's seats are removed from memory and keeper.db before its sync status handler and row producers are stopped; a status fold or row redraw in that window inserts the seat again and queues a fresh write, so a signed-out account can keep a seat. Not a cross-account disclosure (seats stay keyed by the account's own user), retained data only. Fix: an account-level seat generation invalidated before teardown, readers and handlers quiesced, then memory and rows removed; late writers under the old generation dropped. Test: an in-flight fold completing during sign-out leaves no seat.
+status: open
+
+### DW-1447: Two different statuses with one timestamp may persist in reverse order.
+
+origin: lane `rooms` fix round 2 (review-101rooms-2 R101R2-05, R455), 2026-10-16
+location: `keeper_core::agents::room::AgentKinds::remember` (write-current check on `status_ts` only), `keeper_core::agents::seats` (`>=` update)
+reason: A@100 then a different B@100 leaves B in memory and queues two blocking writes; both pass the timestamp check, and if B's write takes the writer lock first, A's overwrites it, so a restart reads A. Fix: under the writer lock persist the seat held in memory now (or require a per-key observation generation to match). Test: two equal-timestamp observations with their writes scheduled in reverse, then a restart.
+status: open
+
+### DW-1448: With several control rooms made by one agent, keeper asks for the DM in the first it finds.
+
+origin: lane `rooms` fix round 2 (live run of `an_existing_buried_dm_opens_on_a_device_that_kept_no_seat` on a populated smoke account, R455), 2026-10-16
+location: `keeper_core::account::control_room_with`
+reason: the request goes into the first joined control room whose sole creator is the agent; an agent re-initialised (or a person in an old one never left) has more than one, and its host reads only the one its `agentd.toml` names, so the ask ends at the 30 s bound with "did not answer". The populated live run found exactly this: earlier runs left the smoke person in many of the agent's control rooms, and the test's host now answers whichever one keeper chose. Fix: prefer the control room holding a live host manifest of the agent's principal (the room a host is serving), else the newest. Test: two control rooms of one agent, a manifest live in the second; the request goes there.
+status: open
+
+### DW-1449: `live_claims`' clean-shutdown takeover misses its two-tick bound on delectra — on the base too.
+
+origin: lane `101stack` (the stack of epic 101; review-101rooms-3), 2026-10-16
+location: `src-tauri/crates/keeper-agentd/tests/live_claims.rs` `a_clean_shutdown_releases_and_the_other_takes_over_within_two_ticks`
+reason: release → the next host's claim took 11,357 ms at the base 4e186ce8 (`/tmp/agents-salvage/live-claims-101rooms-base.log`), 10,709 ms at 525f1e25 and 8,774 / 10,994 ms at f491e1f4, against the test's 2,000 ms. The test is unchanged from the base and compares two server event timestamps on delectra's shared Synapse; the minute lease it runs on is the base's. Pre-existing timing, not epic 101's lease. Fix: bound the takeover in the host's own ticks (or on an idle homeserver) rather than 2 s of server time, and keep the expiry-takeover case (180 s) as it is.
 status: open

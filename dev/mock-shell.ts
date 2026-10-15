@@ -132,6 +132,7 @@ import type {
   InboxRoomVm,
   IpcError,
   LabelVm,
+  LaunchRoomVm,
   NetworksSnapshot,
   NoteBodyBatch,
   NoteIntentVm,
@@ -6441,7 +6442,22 @@ const AGENT_ROOM_ROWS: InboxRoomVm[] = [
     120,
     "session",
   ),
-];
+  // Story 101.1 #6: Tola's triage handed to Nixi is listed by its delegate and
+  // its title, and its letter is Nixi's — never "N2" from "nixi 2026-10-15".
+  inboxRow(
+    "!nixi-triage:example.org",
+    "Nixi — triage of inbox",
+    "Sorted 12 notes.",
+    300,
+    "session",
+  ),
+].map((row) =>
+  // Rust's `agentMark`: the working agent's initial on every session row
+  // whose status was read (the room's name is "<agent> — <title>").
+  row.agentRoom === undefined || row.agentRoom === "unknown"
+    ? row
+    : { ...row, agentMark: row.displayName.trim().charAt(0).toUpperCase() },
+);
 
 const CHAT_ROWS: InboxRoomVm[] = [inboxRow("!marta:example.org", "Marta", "See you on Friday", 15)];
 
@@ -7568,6 +7584,7 @@ function subscribeMockTimeline(payload: Record<string, unknown>): number {
 const launchParam = new URLSearchParams(window.location.search).get("launch");
 let defaultAgent: string | null =
   launchParam === "default" ||
+  launchParam === "ask" ||
   launchParam === "late" ||
   launchParam === "lost" ||
   launchParam === "unseen"
@@ -7585,7 +7602,56 @@ const FILE_PATH = "/Users/you/Library/Application Support/keeper/keeper.toml";
 /** `?launch=late`: when Nixi's DM arrives. `?launch=lost`: the bound (Rust's is 15 s). */
 const LATE_ROOM_MS = 2_500;
 const LOST_BOUND_MS = 4_000;
-let nixiDmHere = launchParam !== "late" && launchParam !== "lost";
+let nixiDmHere = launchParam !== "late" && launchParam !== "lost" && launchParam !== "ask";
+
+// Story 101.1 #4–#5 (R416): `?launch=ask` makes Nixi the default with no DM
+// here — Agents opens and keeper asks her host for one; `agent_main_dm_open`
+// answers after `MAIN_DM_MS` with the DM, which then lands in the Agents
+// window and the dock. `?dm=refused` answers with the sentence Rust gives
+// when the person shares no control room with the agent. `?dock=ask` lists no
+// proxy room in the notes Assistant, which offers to ask Nixi; `?dock=asklate`
+// lists none and Rust knows Nixi only from `ASK_LATE_MS` on, so the offer
+// appears at a later look (*Look again*) without the dock being remounted.
+const dmParam = new URLSearchParams(window.location.search).get("dm");
+const MAIN_DM_MS = 2_500;
+const ASK_LATE_MS = 6_000;
+const askLateFrom = Date.now() + ASK_LATE_MS;
+
+/** Rust's `MainDmAskVm` for Nixi. */
+const NIXI_ASK = {
+  accountId: MOCK_ACCOUNT_ID,
+  agent: NIXI,
+  name: "Nixi",
+  opening: "Opening a conversation with Nixi…",
+};
+
+function mockMainDmOpen(payload: Record<string, unknown>): Promise<LaunchRoomVm> {
+  return new Promise((resolve, reject) => {
+    setTimeout(() => {
+      if (dmParam === "refused" || payload.agent !== NIXI) {
+        reject({
+          code: "unsupported",
+          retriable: false,
+          message:
+            "keeper cannot ask Nixi for a conversation: you are in no control room with it. Run `keeper-agentd agents init` on its host (it makes the control room and your conversation), then ask again.",
+        });
+        return;
+      }
+      nixiDmHere = true;
+      if (!proxyRooms.some((room) => room.roomId === DM_ROOM)) {
+        proxyRooms = [
+          { roomId: DM_ROOM, name: "Nixi", kind: "main", agent: NIXI, allowed: NIXI_ALLOWED },
+          ...proxyRooms,
+        ];
+      }
+      agentsWindow?.onmessage?.({
+        ops: [{ op: "reset", rooms: AGENT_ROOM_ROWS }],
+        total: AGENT_ROOM_ROWS.length,
+      });
+      resolve({ accountId: MOCK_ACCOUNT_ID, roomId: DM_ROOM });
+    }, MAIN_DM_MS);
+  });
+}
 
 function mockAgentsLaunch(): AgentsLaunchVm {
   const mains = proxyRooms.filter(
@@ -7600,6 +7666,14 @@ function mockAgentsLaunch(): AgentsLaunchVm {
     FILE_DEFAULT === null
       ? null
       : `${FILE_PATH} (user) sets agents.default to ${FILE_DEFAULT}, so ${FILE_DEFAULT} opens at launch whatever you choose here. Your choice is kept and takes effect once that file stops setting it.`;
+  const hasNixiDm = mains.some((room) => room.agent === NIXI);
+  const askable =
+    hasNixiDm ||
+    launchParam === "none" ||
+    (new URLSearchParams(window.location.search).get("dock") === "asklate" &&
+      Date.now() < askLateFrom)
+      ? []
+      : [NIXI_ASK];
   const base = {
     room: null,
     defaultAgent: effective,
@@ -7607,7 +7681,18 @@ function mockAgentsLaunch(): AgentsLaunchVm {
     announce: false,
     choices,
     fileSet,
+    ask: null,
+    askable,
   };
+  if (launchParam === "ask" && effective === NIXI && !hasNixiDm) {
+    return {
+      ...base,
+      view: "agents",
+      reason:
+        "Your default agent Nixi has no conversation with you on this device's accounts yet, so keeper asks it to open one.",
+      ask: NIXI_ASK,
+    };
+  }
   if (launchParam === "unseen") {
     return {
       ...base,
@@ -7660,6 +7745,9 @@ function mockAgentsLaunchWhenKnown(): Promise<AgentsLaunchVm> {
   }
   return later(300, mockAgentsLaunch);
 }
+
+/** This Mac's claims lease (R455), as the Settings row last stored it. */
+let mockClaimsLease: "short" | "quarter-hour" = "short";
 
 function mockAgentsDefaultSet(payload: Record<string, unknown>): Promise<AgentsLaunchVm> {
   // The executor form: the project compiles against ES2020, which has no
@@ -7747,7 +7835,7 @@ const NIXI_ALLOWED = [
 ];
 
 let proxyRooms: ProxyRoomVm[] =
-  dockParam === "none"
+  dockParam === "none" || dockParam === "ask" || dockParam === "asklate"
     ? []
     : [
         {
@@ -8122,6 +8210,7 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
       return null;
     }),
   agent_conversation_new: mockConversationNew,
+  agent_main_dm_open: mockMainDmOpen,
   agent_model_command: mockAgentModelCommand,
   // Story 100.5: the messenger's slash commands. Sends and room acts succeed
   // silently (the fake has no room state to change) except one refused invite.
@@ -8950,6 +9039,12 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
   agents_launch: () => mockAgentsLaunchWhenKnown(),
   agents_default_get: () => mockAgentsLaunch(),
   agents_default_set: mockAgentsDefaultSet,
+  // R455: this Mac's claims lease, kept for the page's life.
+  agents_claims_lease_get: () => mockClaimsLease,
+  agents_claims_lease_set: (payload: Record<string, unknown>) => {
+    mockClaimsLease = payload.lease === "quarter-hour" ? "quarter-hour" : "short";
+    return mockClaimsLease;
+  },
   // --- Voice, the talk mode (Epic 62, Story 62.6; Epic 67, AD-205) ---------
   //
   // A scripted turn so the mic control's states can be looked at in

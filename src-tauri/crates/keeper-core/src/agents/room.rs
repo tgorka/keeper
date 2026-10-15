@@ -16,7 +16,7 @@
 //! newer `v` — is shown as *unreadable*, never dropped.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::sync::{Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use chrono::{DateTime, Utc};
 use matrix_sdk::deserialized_responses::{EncryptionInfo, VerificationLevel, VerificationState};
@@ -48,6 +48,8 @@ use crate::agents::gate_room::{GateHeaderVm, GateInput, GateLineVm, GateView};
 use crate::agents::heard::RoomMarks;
 use crate::agents::label::{Label, LabelVm, Readers};
 use crate::agents::proxy::ProxyListEventContent;
+pub use crate::agents::seats::Seat;
+use crate::agents::seats::SeatStore;
 use crate::agents::session::SessionKind;
 use crate::bots::identity::parse_identity;
 
@@ -755,6 +757,15 @@ impl AgentRoomState {
         self.status.is_some()
     }
 
+    /// The time of the newest status when it could not be read: what an
+    /// older kept seat does not stand for (R451).
+    pub fn unread_status_ts(&self) -> Option<u64> {
+        match &self.status {
+            Some((ts, StatusRead::Unreadable { .. })) => Some(*ts),
+            _ => None,
+        }
+    }
+
     /// The session's kind, from the newest readable status.
     pub fn kind(&self) -> Option<SessionKind> {
         match &self.status {
@@ -768,11 +779,17 @@ impl AgentRoomState {
         matches!(&self.status, Some((_, StatusRead::Read(s))) if s.run == RunState::Running)
     }
 
-    /// The session's kind and the agent working it, from the newest
-    /// readable status: what an agent room's row is drawn by (R399).
-    pub fn seat(&self) -> Option<(SessionKind, OwnedUserId)> {
+    /// The session's kind, the agent working it and its title, from the
+    /// newest readable status, with that status's time: what an agent room's
+    /// row is drawn by (R399) and what [`AgentKinds`] keeps (R416).
+    pub fn seat(&self) -> Option<Seat> {
         match &self.status {
-            Some((_, StatusRead::Read(status))) => Some((status.kind, status.agent.clone())),
+            Some((ts, StatusRead::Read(status))) => Some(Seat {
+                kind: status.kind,
+                agent: status.agent.clone(),
+                title: status.title.clone(),
+                status_ts: *ts,
+            }),
             _ => None,
         }
     }
@@ -1137,61 +1154,189 @@ impl AgentIcons {
     }
 }
 
-/// The session kind of every agent room an account has read a status in,
-/// and the agent working the session — the one its status names, the
+/// The seat of every agent room an account has read a status in: the
+/// session's kind, the agent working it — the one its status names, the
 /// delegate in a delegated room rather than the agent that made the room
-/// (R399). A session's kind and agent never change, so once read they are
-/// kept for the process's life; the room list reads them here before the
-/// event cache.
+/// (R399) — and its title, with that status's time. Each is the account's
+/// own: keyed by the account's Matrix user and the room (R451), so a second
+/// account in the same room never draws or admits it by a status only the
+/// first could read. The room list and the proxy rows read them here before
+/// the event cache. A newer readable status replaces a seat, whatever kind
+/// or agent it names; an older one never does ([`Seat::replaces`]).
+///
+/// Made with [`Self::kept`], every seat is also kept in `keeper.db` per
+/// account and room ([`SeatStore`], R416) and read back at the next launch:
+/// a status buried under claim renewals or a quiet night is out of the
+/// header's reach, and the seat it left stands for it. Every newer status
+/// moves the kept row's time, so after a restart an older status read again
+/// still never replaces it (R451). The write runs on the blocking pool, so a
+/// slow disk never holds the room list or a bounded wait (R450).
 #[derive(Debug, Default)]
 pub struct AgentKinds {
-    kinds: Mutex<HashMap<OwnedRoomId, (SessionKind, OwnedUserId)>>,
-    /// Session rooms whose history was searched back for a status and held
-    /// none: not searched again in this process, since a status sent later
-    /// reaches the event cache.
-    searched: Mutex<HashSet<OwnedRoomId>>,
+    seats: Arc<Mutex<HashMap<SeatKey, Seat>>>,
+    /// Session rooms whose whole history an account searched back for a
+    /// status and found none: not searched again by it in this process,
+    /// since a status sent later reaches the event cache.
+    searched: Mutex<HashSet<SeatKey>>,
+    store: Option<SeatStore>,
+    /// Held across a seat's write and an account's forgetting, so a write
+    /// queued before a sign-out never brings the account's rows back.
+    writing: Arc<Mutex<()>>,
+    /// Bumped when a seat's kind, agent or title changes, so the room
+    /// lists redraw an agent room's row without waiting for its next event.
+    changes: watch::Sender<u64>,
+}
+
+/// An account (its own Matrix user) and a room.
+type SeatKey = (OwnedUserId, OwnedRoomId);
+
+fn seat_key(own: &UserId, room: &RoomId) -> SeatKey {
+    (own.to_owned(), room.to_owned())
 }
 
 impl AgentKinds {
-    pub fn get(&self, room: &RoomId) -> Option<SessionKind> {
-        self.kinds
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(room)
-            .map(|(kind, _)| *kind)
+    /// Seats kept in `data_dir`'s `keeper.db`, starting from the ones kept
+    /// there. A store that cannot be read starts empty, with a WARN: the
+    /// rooms are read from their statuses as before.
+    pub fn kept(data_dir: &std::path::Path) -> AgentKinds {
+        let store = SeatStore::new(data_dir);
+        let seats = store.all().unwrap_or_else(|error| {
+            tracing::warn!(%error, "agents: the agent rooms' kept seats could not be read");
+            HashMap::new()
+        });
+        AgentKinds {
+            seats: Arc::new(Mutex::new(seats)),
+            store: Some(store),
+            ..AgentKinds::default()
+        }
     }
 
-    /// The agent working `room`'s session, as its status named it.
-    pub fn agent(&self, room: &RoomId) -> Option<OwnedUserId> {
-        self.kinds
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(room)
-            .map(|(_, agent)| agent.clone())
+    /// `own`'s account's kind of `room`'s session.
+    pub fn get(&self, own: &UserId, room: &RoomId) -> Option<SessionKind> {
+        self.seat(own, room).map(|seat| seat.kind)
     }
 
-    /// `room`'s session is of `kind`, worked by `agent`.
-    pub fn insert(&self, room: &RoomId, kind: SessionKind, agent: OwnedUserId) {
-        self.kinds
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(room.to_owned(), (kind, agent));
+    /// The agent working `room`'s session, as a status `own`'s account read
+    /// named it.
+    pub fn agent(&self, own: &UserId, room: &RoomId) -> Option<OwnedUserId> {
+        self.seat(own, room).map(|seat| seat.agent)
     }
 
-    /// Whether `room`'s history was already searched and held no status.
-    pub fn searched_empty(&self, room: &RoomId) -> bool {
+    /// `room`'s seat, as the newest status `own`'s account read named it.
+    pub fn seat(&self, own: &UserId, room: &RoomId) -> Option<Seat> {
+        self.seats
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&seat_key(own, room))
+            .cloned()
+    }
+
+    /// Bumped whenever a seat's kind, agent or title changes.
+    pub fn subscribe(&self) -> watch::Receiver<u64> {
+        self.changes.subscribe()
+    }
+
+    /// `own`'s account read `seat` in `room`: kept unless what is held is
+    /// newer. A newer status moves the kept row (its time is the high-water
+    /// mark a restart reads back); a change of kind, agent or title also
+    /// redraws the rows ([`Self::subscribe`]).
+    pub fn insert(&self, own: &UserId, room: &RoomId, seat: Seat) {
+        let key = seat_key(own, room);
+        let (newer, changed) = {
+            let mut seats = self
+                .seats
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let held = seats.get(&key);
+            if !seat.replaces(held) {
+                return;
+            }
+            let newer = held.is_none_or(|held| seat.status_ts > held.status_ts);
+            let changed = held.is_none_or(|held| {
+                (held.kind, &held.agent, &held.title) != (seat.kind, &seat.agent, &seat.title)
+            });
+            seats.insert(key.clone(), seat.clone());
+            (newer, changed)
+        };
+        if changed {
+            self.changes.send_modify(|n| *n = n.wrapping_add(1));
+        }
+        if let (true, Some(store)) = (newer || changed, self.store.clone()) {
+            let (seats, writing) = (Arc::clone(&self.seats), Arc::clone(&self.writing));
+            let write = move || {
+                let _writing = writing.lock().unwrap_or_else(|p| p.into_inner());
+                // Forgotten since (a sign-out), or overtaken: nothing to keep.
+                let current = seats
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .get(&key)
+                    .is_some_and(|held| held.status_ts == seat.status_ts);
+                if !current {
+                    return;
+                }
+                if let Err(error) = store.put(&key.0, &key.1, &seat) {
+                    tracing::warn!(room = %key.1, %error, "agents: an agent room's seat could not be kept");
+                }
+            };
+            match tokio::runtime::Handle::try_current() {
+                Ok(runtime) => drop(runtime.spawn_blocking(write)),
+                Err(_) => write(),
+            }
+        }
+    }
+
+    /// The seat `own`'s account draws and admits `room` by, after `state`
+    /// — what a reader just read of the room — was folded in by the one
+    /// rule [`Self::insert`] keeps (R451): the newer of the readable status
+    /// and the kept seat. A newest status that cannot be read is not covered
+    /// by an older seat: then there is none.
+    pub fn seat_after(&self, own: &UserId, room: &RoomId, state: &AgentRoomState) -> Option<Seat> {
+        if let Some(seat) = state.seat() {
+            self.insert(own, room, seat);
+        }
+        let kept = self.seat(own, room)?;
+        match state.unread_status_ts() {
+            Some(unread) if unread >= kept.status_ts => None,
+            _ => Some(kept),
+        }
+    }
+
+    /// Forget every seat of `own`'s account, here and in `keeper.db`: it
+    /// signed out.
+    pub fn forget_account(&self, own: &UserId) {
+        let _writing = self.writing.lock().unwrap_or_else(|p| p.into_inner());
+        self.seats
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|(account, _), _| account != own);
+        self.searched
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|(account, _)| account != own);
+        if let Some(store) = &self.store {
+            if let Err(error) = store.forget(own) {
+                tracing::warn!(%error, "agents: a signed-out account's kept seats could not be removed");
+            }
+        }
+        self.changes.send_modify(|n| *n = n.wrapping_add(1));
+    }
+
+    /// Whether `own`'s account already searched `room`'s whole history and
+    /// found no status.
+    pub fn searched_empty(&self, own: &UserId, room: &RoomId) -> bool {
         self.searched
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .contains(room)
+            .contains(&seat_key(own, room))
     }
 
-    /// Note that `room`'s history was searched and held no status.
-    pub fn note_searched_empty(&self, room: &RoomId) {
+    /// Note that `own`'s account searched `room`'s history and found no
+    /// status.
+    pub fn note_searched_empty(&self, own: &UserId, room: &RoomId) {
         self.searched
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(room.to_owned());
+            .insert(seat_key(own, room));
     }
 }
 
@@ -1232,25 +1377,33 @@ fn header_event(raw: &Raw<AnySyncTimelineEvent>) -> Option<Value> {
 }
 
 /// The room-list row's agent room: its create type, and for a session room
-/// the session kind from `kinds` or else from the newest readable status in
-/// the event cache's loaded events.
+/// the session kind the account's seat in `kinds` holds once the newest
+/// readable status in the event cache's loaded events is folded into it —
+/// a newer status replaces a kept seat here, so an unopened room's row
+/// follows it (R451).
 pub async fn room_kind_vm(room: &Room, kinds: &AgentKinds) -> Option<AgentRoomKindVm> {
     let kind = AgentRoomKind::of(room.room_type().as_ref())?;
     if kind == AgentRoomKind::Control {
         return Some(AgentRoomKindVm::Control);
     }
-    if let Some(session) = kinds.get(room.room_id()) {
-        return Some(AgentRoomKindVm::of(kind, Some(session)));
+    let own = room.own_user_id();
+    if let Some(seat) = newest_cached_seat(room).await {
+        kinds.insert(own, room.room_id(), seat);
     }
+    Some(AgentRoomKindVm::of(kind, kinds.get(own, room.room_id())))
+}
+
+/// The seat the newest readable status among `room`'s cached events names.
+pub async fn newest_cached_seat(room: &Room) -> Option<Seat> {
     let levels = room.power_levels().await.ok();
     let trusted = |user: &UserId| holds_agent_power(levels.as_ref(), user);
     let mut state = AgentRoomState::new(room.own_user_id().to_owned());
-    let session = match room.event_cache().await {
+    match room.event_cache().await {
         Ok((cache, _handles)) => cache
             .rfind_map_event_in_memory_by(|event| {
                 let value = header_event(event.raw())?;
                 // Each status is read on its own, newest first: the newest
-                // readable one names the kind.
+                // readable one names the seat.
                 state.status = None;
                 state.apply(&value, &trusted);
                 state.seat()
@@ -1259,14 +1412,25 @@ pub async fn room_kind_vm(room: &Room, kinds: &AgentKinds) -> Option<AgentRoomKi
             .ok()
             .flatten(),
         Err(_) => None,
-    };
-    if let Some((session, agent)) = &session {
-        kinds.insert(room.room_id(), *session, agent.clone());
     }
-    Some(AgentRoomKindVm::of(
-        kind,
-        session.map(|(session, _)| session),
-    ))
+}
+
+/// Fold `value`, an event `room` received, into `kinds` when it is a
+/// readable status (R451): an unopened agent room's seat follows its newest
+/// status, and its row redraws when the kind, agent or title changed.
+pub async fn fold_status(room: &Room, value: &Value, kinds: &AgentKinds) {
+    if value["type"].as_str() != Some(STATUS)
+        || AgentRoomKind::of(room.room_type().as_ref()) != Some(AgentRoomKind::Session)
+    {
+        return;
+    }
+    let levels = room.power_levels().await.ok();
+    let trusted = |user: &UserId| holds_agent_power(levels.as_ref(), user);
+    let mut state = AgentRoomState::new(room.own_user_id().to_owned());
+    state.apply(value, &trusted);
+    if let Some(seat) = state.seat() {
+        kinds.insert(room.own_user_id(), room.room_id(), seat);
+    }
 }
 
 /// The agents the person's own `dev.keeper.agent.proxies` lists (R72): on
@@ -1313,10 +1477,37 @@ pub struct HeaderReader {
 impl HeaderReader {
     /// Read `room`'s status and scope from its event cache, and when the
     /// cache holds no status, from the server's history newest page first,
-    /// as the host's `latest_status` does — once per process for a room
-    /// whose history held none. Only its power levels are read for that;
-    /// whose brief to draw is [`Self::refresh`]'s.
+    /// as the host's `latest_status` does. A history that ended without a
+    /// status is not searched again in this process; one whose search
+    /// stopped at its page budget is (R416): a status further back is out of
+    /// this look's reach, not absent. Only its power levels are read for
+    /// that; whose brief to draw is [`Self::refresh`]'s.
     pub async fn open(room: Room, kinds: &AgentKinds) -> HeaderReader {
+        Self::open_with(room, kinds, true, Some(HEADER_PAGES)).await
+    }
+
+    /// [`Self::open`] with the history searched back with no page budget,
+    /// page after page until its newest status or the room's beginning: for
+    /// the one room the person's own agent just named as their DM, under
+    /// the deadline of the person's ask (R450) — a status buried under more
+    /// than the budget's renewals is found on a device that kept no seat.
+    pub async fn open_searching(room: Room, kinds: &AgentKinds) -> HeaderReader {
+        Self::open_with(room, kinds, true, None).await
+    }
+
+    /// [`Self::open`] for a row (a proxy room's admission): a room whose
+    /// seat `kinds` keeps is drawn by it and its history is not searched —
+    /// a listing looks at every agent room, and a seat answers it.
+    pub async fn open_row(room: Room, kinds: &AgentKinds) -> HeaderReader {
+        Self::open_with(room, kinds, false, Some(HEADER_PAGES)).await
+    }
+
+    async fn open_with(
+        room: Room,
+        kinds: &AgentKinds,
+        seated_pages: bool,
+        pages: Option<usize>,
+    ) -> HeaderReader {
         let mut reader = HeaderReader {
             state: AgentRoomState::new(room.own_user_id().to_owned()),
             trust: Trust {
@@ -1343,21 +1534,27 @@ impl HeaderReader {
         }
         reader.approvals = approvals_of(&reader.room).await;
         if !reader.state.has_status()
-            && !kinds.searched_empty(reader.room.room_id())
-            && reader.page_back().await
+            && (seated_pages
+                || kinds
+                    .seat(reader.room.own_user_id(), reader.room.room_id())
+                    .is_none())
+            && !kinds.searched_empty(reader.room.own_user_id(), reader.room.room_id())
+            && reader.page_back(pages).await
         {
-            kinds.note_searched_empty(reader.room.room_id());
+            kinds.note_searched_empty(reader.room.own_user_id(), reader.room.room_id());
         }
         reader.remember(kinds);
         reader
     }
 
-    /// Search the server's history back for a status; returns whether the
-    /// search ran to its end and found none (a failed request is not that).
-    async fn page_back(&mut self) -> bool {
+    /// Search the server's history back for a status, at most `pages` pages
+    /// (`None`: until the beginning); returns whether the search reached the
+    /// room's beginning and found none. A failed request is not that, and
+    /// neither is a search that stopped at its page budget.
+    async fn page_back(&mut self, pages: Option<usize>) -> bool {
         use matrix_sdk::room::MessagesOptions;
         let mut from: Option<String> = None;
-        for _ in 0..HEADER_PAGES {
+        for _ in 0..pages.unwrap_or(usize::MAX) {
             let mut options = MessagesOptions::backward().from(from.as_deref());
             options.limit = HEADER_PAGE.into();
             let Ok(page) = self.room.messages(options).await else {
@@ -1380,7 +1577,7 @@ impl HeaderReader {
                 _ => return true,
             }
         }
-        true
+        false
     }
 
     /// Fold the person's mark of where they stopped listening, if `event`
@@ -1400,8 +1597,8 @@ impl HeaderReader {
     }
 
     fn remember(&self, kinds: &AgentKinds) {
-        if let Some((kind, agent)) = self.state.seat() {
-            kinds.insert(self.room.room_id(), kind, agent);
+        if let Some(seat) = self.state.seat() {
+            kinds.insert(self.room.own_user_id(), self.room.room_id(), seat);
         }
     }
 
@@ -1624,7 +1821,7 @@ pub async fn row_picture(
     icons: &AgentIcons,
     account_id: &str,
 ) -> Option<String> {
-    let agent = kinds.agent(room.room_id())?;
+    let agent = kinds.agent(room.own_user_id(), room.room_id())?;
     let member = member_picture(room, &agent).await;
     agent_picture(icons, account_id, room.room_id(), &agent, member.as_deref())
 }
@@ -1638,6 +1835,41 @@ pub async fn member_picture(room: &Room, user: &UserId) -> Option<String> {
         .flatten()?
         .avatar_url()
         .map(picture_version)
+}
+
+/// `agent`'s display name as `room` holds it, else its user id's localpart:
+/// what an agent room's list name and mark are made of.
+pub async fn agent_name(room: &Room, agent: &UserId) -> String {
+    room.get_member_no_sync(agent)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|member| member.display_name().map(str::to_owned))
+        .map(|name| name.trim().to_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| agent.localpart().to_owned())
+}
+
+/// The name an agent room is listed by (story 101.1 #6, R416): a session
+/// with a title other than the person's `main` DM — a conversation, a
+/// delegation, a run — is "<agent> — <title>", the agent the one working
+/// it; `None` keeps the room's own name (the DM is named for its agent).
+pub fn titled_room_name(kind: SessionKind, agent_name: &str, title: &str) -> Option<String> {
+    let title = title.trim();
+    if kind == SessionKind::Main || title.is_empty() {
+        return None;
+    }
+    Some(format!("{} — {title}", agent_name.trim()))
+}
+
+/// The letter an agent room's row draws without a picture: its agent's
+/// initial, never the initials of the room's title.
+pub fn agent_mark(agent_name: &str) -> Option<String> {
+    agent_name
+        .trim()
+        .chars()
+        .next()
+        .map(|first| first.to_uppercase().collect())
 }
 
 /// Whether event-cache `diffs` may change a room's approvals: anything but
@@ -2775,10 +3007,9 @@ mod tests {
         let mut state = AgentRoomState::new(own());
         assert!(state.apply(&event, &agents));
         let kinds = AgentKinds::default();
-        let (kind, agent) = state.seat().expect("a seat");
-        kinds.insert(&room, kind, agent);
-        assert_eq!(kinds.get(&room), Some(SessionKind::Delegated));
-        let working = kinds.agent(&room).expect("the working agent");
+        kinds.insert(&own(), &room, state.seat().expect("a seat"));
+        assert_eq!(kinds.get(&own(), &room), Some(SessionKind::Delegated));
+        let working = kinds.agent(&own(), &room).expect("the working agent");
         assert_eq!(working, user(TOLA));
 
         let icons = AgentIcons::default();
@@ -2841,10 +3072,223 @@ mod tests {
         let kinds = AgentKinds::default();
         let quiet = OwnedRoomId::try_from("!quiet:example.org").expect("room");
         let other = OwnedRoomId::try_from("!other:example.org").expect("room");
-        assert!(!kinds.searched_empty(&quiet));
-        kinds.note_searched_empty(&quiet);
-        assert!(kinds.searched_empty(&quiet));
-        assert!(!kinds.searched_empty(&other));
+        assert!(!kinds.searched_empty(&own(), &quiet));
+        kinds.note_searched_empty(&own(), &quiet);
+        assert!(kinds.searched_empty(&own(), &quiet));
+        assert!(!kinds.searched_empty(&own(), &other));
+        assert!(
+            !kinds.searched_empty(&user(MARTA), &quiet),
+            "another account searched nothing"
+        );
+    }
+
+    fn seat_of(kind: SessionKind, agent: &str, title: &str, status_ts: u64) -> Seat {
+        Seat {
+            kind,
+            agent: user(agent),
+            title: title.to_owned(),
+            status_ts,
+        }
+    }
+
+    /// R416: the seat a status left outlives the process — a fresh
+    /// `AgentKinds` on the same `keeper.db` draws the room by it with no
+    /// status read — and a newer status replaces it, another kind and agent
+    /// included, while an older one read later never does.
+    #[test]
+    fn a_rooms_seat_survives_a_restart_and_a_newer_status_replaces_it() {
+        let dir = tempfile::tempdir().expect("dir");
+        let dm = OwnedRoomId::try_from("!dm:example.org").expect("room");
+        let before = AgentKinds::kept(dir.path());
+        before.insert(&own(), &dm, seat_of(SessionKind::Main, NIXI, "main", 100));
+        drop(before);
+
+        let after = AgentKinds::kept(dir.path());
+        assert_eq!(
+            after.get(&own(), &dm),
+            Some(SessionKind::Main),
+            "read back, no status"
+        );
+        assert_eq!(after.agent(&own(), &dm), Some(user(NIXI)));
+        after.insert(
+            &own(),
+            &dm,
+            seat_of(SessionKind::Delegated, "@tola:example.org", "old", 50),
+        );
+        assert_eq!(
+            after.get(&own(), &dm),
+            Some(SessionKind::Main),
+            "an older status"
+        );
+        after.insert(
+            &own(),
+            &dm,
+            seat_of(SessionKind::Conversation, "@tola:example.org", "test", 200),
+        );
+        let again = AgentKinds::kept(dir.path());
+        assert_eq!(
+            again.seat(&own(), &dm).map(|s| (s.kind, s.agent, s.title)),
+            Some((
+                SessionKind::Conversation,
+                user("@tola:example.org"),
+                "test".to_owned()
+            )),
+            "the newer status is what is kept"
+        );
+    }
+
+    /// R451 (review-101rooms-1 02): two accounts in one room keep their own
+    /// seats. Only the first reads the room's status; the second never draws
+    /// or admits the room by the first's seat — not in this process, not
+    /// after a restart — and once the first signs out its seat is gone from
+    /// memory and from `keeper.db`.
+    #[test]
+    fn two_accounts_in_one_room_keep_their_own_seats() {
+        let dir = tempfile::tempdir().expect("dir");
+        let dm = OwnedRoomId::try_from("!dm:example.org").expect("room");
+        let (reader, other) = (own(), user(MARTA));
+        let kinds = AgentKinds::kept(dir.path());
+        let mut read = AgentRoomState::new(reader.clone());
+        assert!(read.apply(
+            &status("$s", 100, content("idle", "electra", None)),
+            &agents
+        ));
+        assert_eq!(
+            kinds.seat_after(&reader, &dm, &read).map(|s| s.kind),
+            Some(SessionKind::Main)
+        );
+        // The other account read nothing it could: no status, no seat.
+        let blind = AgentRoomState::new(other.clone());
+        assert_eq!(kinds.seat_after(&other, &dm, &blind), None);
+        assert_eq!(kinds.get(&other, &dm), None);
+
+        let restarted = AgentKinds::kept(dir.path());
+        assert_eq!(restarted.get(&reader, &dm), Some(SessionKind::Main));
+        assert_eq!(
+            restarted.seat_after(&other, &dm, &blind),
+            None,
+            "after a restart"
+        );
+
+        restarted.forget_account(&reader);
+        assert_eq!(restarted.get(&reader, &dm), None, "signed out");
+        let again = AgentKinds::kept(dir.path());
+        assert_eq!(again.get(&reader, &dm), None, "nor kept in keeper.db");
+        assert_eq!(again.get(&other, &dm), None);
+    }
+
+    /// R451 (review-101rooms-1 04): the newest status seen is the seat's
+    /// high-water mark through a restart, and the row's reader chooses
+    /// between a status it reads now and the kept seat by that same mark —
+    /// an older status, read now or after a restart, never stands for the
+    /// room over a newer one already seen.
+    #[test]
+    fn the_newest_status_seen_wins_through_a_restart_and_at_the_row() {
+        let dir = tempfile::tempdir().expect("dir");
+        let dm = OwnedRoomId::try_from("!dm:example.org").expect("room");
+        let kinds = AgentKinds::kept(dir.path());
+        // A at 100, then the same A again at 300: nothing about it changed
+        // but its time.
+        kinds.insert(&own(), &dm, seat_of(SessionKind::Main, NIXI, "main", 100));
+        kinds.insert(&own(), &dm, seat_of(SessionKind::Main, NIXI, "main", 300));
+        drop(kinds);
+        let restarted = AgentKinds::kept(dir.path());
+        // B at 200 is older than what was seen.
+        restarted.insert(
+            &own(),
+            &dm,
+            seat_of(SessionKind::Conversation, NIXI, "older", 200),
+        );
+        assert_eq!(
+            restarted.seat(&own(), &dm).map(|s| (s.title, s.status_ts)),
+            Some(("main".to_owned(), 300))
+        );
+
+        // At the row: the reader finds the status at 200 in reach, the
+        // kept seat is from 300 — the kept one names the room.
+        let mut older = content("idle", "electra", None);
+        older["kind"] = json!("conversation");
+        older["title"] = json!("older");
+        let mut state = AgentRoomState::new(own());
+        assert!(state.apply(&status("$older", 200, older), &agents));
+        let seat = restarted.seat_after(&own(), &dm, &state).expect("a seat");
+        assert_eq!(
+            (seat.kind, seat.title),
+            (SessionKind::Main, "main".to_owned())
+        );
+        // A newer status read now names it instead, and is kept.
+        let mut newer = content("idle", "electra", None);
+        newer["title"] = json!("renamed");
+        let mut state = AgentRoomState::new(own());
+        assert!(state.apply(&status("$newer", 400, newer), &agents));
+        assert_eq!(
+            restarted.seat_after(&own(), &dm, &state).map(|s| s.title),
+            Some("renamed".to_owned())
+        );
+        assert_eq!(
+            AgentKinds::kept(dir.path())
+                .seat(&own(), &dm)
+                .map(|s| s.status_ts),
+            Some(400)
+        );
+    }
+
+    /// R451 (review-101rooms-1 05): a newer status folded into a kept seat
+    /// replaces it before anything reads it again, and the rows are told to
+    /// redraw when its kind, agent or title changed — not for a status that
+    /// only moved the time.
+    #[test]
+    fn a_newer_status_redraws_the_rows_only_when_it_changes_them() {
+        let dm = OwnedRoomId::try_from("!dm:example.org").expect("room");
+        let kinds = AgentKinds::default();
+        let mut rows = kinds.subscribe();
+        kinds.insert(
+            &own(),
+            &dm,
+            seat_of(SessionKind::Conversation, NIXI, "draft", 100),
+        );
+        assert!(rows.has_changed().expect("open"));
+        rows.borrow_and_update();
+        kinds.insert(
+            &own(),
+            &dm,
+            seat_of(SessionKind::Conversation, NIXI, "draft", 150),
+        );
+        assert!(!rows.has_changed().expect("open"), "only its time moved");
+        kinds.insert(
+            &own(),
+            &dm,
+            seat_of(SessionKind::Conversation, NIXI, "test", 200),
+        );
+        assert!(rows.has_changed().expect("open"), "renamed");
+        assert_eq!(
+            kinds.seat(&own(), &dm).map(|s| s.title),
+            Some("test".to_owned())
+        );
+    }
+
+    /// 101.1 #6, R416: a titled conversation or session is listed as
+    /// "<agent> — <title>" — a delegation by its delegate — and its mark is
+    /// the agent's initial; the DM keeps its own name, and a blank title
+    /// names nothing.
+    #[test]
+    fn a_titled_session_is_listed_by_its_agent_and_title() {
+        assert_eq!(
+            titled_room_name(SessionKind::Conversation, "Nixi", "test").as_deref(),
+            Some("Nixi — test")
+        );
+        assert_eq!(
+            titled_room_name(SessionKind::Delegated, "Nixi", " triage of inbox ").as_deref(),
+            Some("Nixi — triage of inbox")
+        );
+        assert_eq!(titled_room_name(SessionKind::Main, "Nixi", "main"), None);
+        assert_eq!(
+            titled_room_name(SessionKind::Conversation, "Nixi", "  "),
+            None
+        );
+        // "nixi 2026-10-15" drew "N2": the mark is the agent's, not the title's.
+        assert_eq!(agent_mark("nixi").as_deref(), Some("N"));
+        assert_eq!(agent_mark(" "), None);
     }
 
     #[test]

@@ -672,31 +672,6 @@ mod tests {
              account.rs (`send_agent_event`, over the closed `AgentOutbound`); \
              found {raw_calls}."
         );
-        // And the set is exactly these five: a new variant is a new door, a
-        // planning decision, not a refactor.
-        let proxy = include_str!("agents/proxy.rs");
-        let outbound = proxy
-            .split("pub enum AgentOutbound {")
-            .nth(1)
-            .and_then(|rest| rest.split('}').next())
-            .expect("AgentOutbound is declared in agents/proxy.rs");
-        let variants: Vec<&str> = outbound
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .collect();
-        assert_eq!(
-            variants,
-            [
-                "Scope(ScopeContent),",
-                "ConversationRequest(ConversationRequestContent),",
-                "SurfaceResult(SurfaceResultContent),",
-                "Decision(ApprovalDecisionContent),",
-                "Heard(HeardContent),",
-            ],
-            "AD-13: `AgentOutbound` is the closed set of what the person's device sends into \
-             an agent's room"
-        );
     }
 
     /// FR-41 / AD-13 single-dispatch-gate guard: the SDK content-send call

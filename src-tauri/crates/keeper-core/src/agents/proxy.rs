@@ -33,11 +33,12 @@ use ts_rs::TS;
 use ulid::Ulid;
 
 use crate::agents::events::{
-    ApprovalDecisionContent, ConversationRequestContent, ScopeContent, SurfaceResultContent,
-    APPROVAL_DECISION, CONTENT_VERSION, CONVERSATION_REQUEST, HEARD, SCOPE, SURFACE_RESULT,
+    ApprovalDecisionContent, ConversationRequestContent, MainDmRequestContent, ScopeContent,
+    SurfaceResultContent, APPROVAL_DECISION, CONTENT_VERSION, CONVERSATION_REQUEST, HEARD,
+    MAIN_DM_REQUEST, SCOPE, SURFACE_RESULT,
 };
 use crate::agents::heard::HeardContent;
-use crate::agents::room::ScopeDriveVm;
+use crate::agents::room::{titled_room_name, ScopeDriveVm};
 use crate::agents::session::SessionKind;
 
 /// The title of a conversation the person asked for without naming one.
@@ -223,6 +224,9 @@ pub struct ProxyRoomRow {
     pub agent: Option<OwnedUserId>,
     /// The title its newest readable status says.
     pub title: Option<String>,
+    /// The display name of the agent its status names, as the room holds
+    /// it; `None` before a status is read.
+    pub agent_name: Option<String>,
     /// Larger is more recent.
     pub recency: u64,
     /// Who created the room (`m.room.create`'s sender and any additional
@@ -344,13 +348,29 @@ pub fn is_own_control_room(creators: &[OwnedUserId], own: &BTreeSet<OwnedUserId>
     matches!(creators, [creator] if own.contains(creator))
 }
 
+/// Whether keeper joins an invite on its own (story 101.1, R416): one to an
+/// agent session room whose only creator is the agent that sent it, and
+/// that agent one this account knows (`known`: its own proxies, and the
+/// agents of their control rooms). A session room is made by its agent, so
+/// anyone else's invite — another person's, an agent's into a room it did
+/// not make, an agent nobody vouched for — waits for the person.
+pub fn joins_invite(
+    session_room: bool,
+    creators: &[OwnedUserId],
+    inviter: &UserId,
+    known: &BTreeSet<OwnedUserId>,
+) -> bool {
+    session_room && matches!(creators, [creator] if creator == inviter) && known.contains(inviter)
+}
+
 /// What the person's device may send into an agent's room: a closed set,
 /// each with its fixed event type. A scope (with or without drives, with the
 /// focus or none), a request for a conversation, a surface result for a
 /// request this device was handed (91.3), the person's decision on an
-/// approval card (93.3), and where the person stopped listening to a spoken
-/// answer (97.3, AD-411) — never a status, a claim, a turn or a `consumed`,
-/// which are the agent's own.
+/// approval card (93.3), where the person stopped listening to a spoken
+/// answer (97.3, AD-411), and — in the person's control room — the ask that
+/// their proxy open its DM with them (101.1, R416) — never a status, a
+/// claim, a turn or a `consumed`, which are the agent's own.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentOutbound {
     Scope(ScopeContent),
@@ -358,6 +378,7 @@ pub enum AgentOutbound {
     SurfaceResult(SurfaceResultContent),
     Decision(ApprovalDecisionContent),
     Heard(HeardContent),
+    MainDmRequest(MainDmRequestContent),
 }
 
 impl AgentOutbound {
@@ -369,6 +390,7 @@ impl AgentOutbound {
             AgentOutbound::SurfaceResult(_) => SURFACE_RESULT,
             AgentOutbound::Decision(_) => APPROVAL_DECISION,
             AgentOutbound::Heard(_) => HEARD,
+            AgentOutbound::MainDmRequest(_) => MAIN_DM_REQUEST,
         }
     }
 
@@ -380,6 +402,20 @@ impl AgentOutbound {
             AgentOutbound::SurfaceResult(content) => serde_json::to_value(content),
             AgentOutbound::Decision(content) => serde_json::to_value(content),
             AgentOutbound::Heard(content) => serde_json::to_value(content),
+            AgentOutbound::MainDmRequest(content) => serde_json::to_value(content),
+        }
+    }
+
+    /// The state key it is sent under, when it is a state event: the
+    /// person's ask for their DM is a control-room state event keyed by
+    /// the asker (`own`), as their presence is — a control room's timeline
+    /// is the agents' (`events_default` 50), and an encrypted event there
+    /// reaches the server as `m.room.encrypted` at that level (R416). Every
+    /// other variant is an encrypted timeline event.
+    pub fn state_key(&self, own: &UserId) -> Option<String> {
+        match self {
+            AgentOutbound::MainDmRequest(_) => Some(own.to_string()),
+            _ => None,
         }
     }
 }
@@ -422,17 +458,23 @@ pub struct AgentFocusReq {
 /// The rooms among `rows` that are `me`'s proxy conversations ([`admits`]),
 /// the `main` DM first and then the most recent first. A room whose status
 /// is not read yet is not listed — it is listed once its status arrives,
-/// never guessed from the room's shape. A conversation is named by its
-/// status's title, which travels encrypted; its room name is generic.
+/// never guessed from the room's shape. A conversation is named "<agent> —
+/// <title>" by its status's title, which travels encrypted (its room name is
+/// generic, the agent's: R416); the DM keeps its room's name.
 pub fn proxy_rooms(rows: &[ProxyRoomRow], me: &UserId, known: &KnownProxies) -> Vec<ProxyRoomVm> {
     let mut listed: Vec<(bool, u64, ProxyRoomVm)> = rows
         .iter()
         .filter_map(|row| {
             let admitted = admits(row, me, known).ok()?;
-            let name = match (admitted.kind, &row.title) {
-                (SessionKind::Conversation, Some(title)) => title.clone(),
-                _ => row.name.clone(),
-            };
+            let agent_name = row
+                .agent_name
+                .as_deref()
+                .unwrap_or_else(|| admitted.agent.localpart());
+            let name = row
+                .title
+                .as_deref()
+                .and_then(|title| titled_room_name(admitted.kind, agent_name, title))
+                .unwrap_or_else(|| row.name.clone());
             Some((
                 admitted.kind == SessionKind::Main,
                 row.recency,
@@ -486,6 +528,7 @@ mod tests {
             kind,
             agent: Some(agent.clone()),
             title: Some(id.trim_start_matches('!').to_owned()),
+            agent_name: Some("Nixi".to_owned()),
             recency,
             creators: vec![agent.clone()],
             encrypted: true,
@@ -579,10 +622,11 @@ mod tests {
         assert_eq!(ids, ["!dm", "!conv", "!older"]);
         assert_eq!(listed[0].kind, SessionKind::Main);
         assert_eq!(listed[0].allowed, None);
-        // The DM is named by its room; a conversation by its status's
-        // title, which travels encrypted (its room name is generic).
+        // The DM is named by its room; a conversation by its agent and its
+        // status's title, which travels encrypted (its room name is
+        // generic): "Nixi — test" (R416).
         let names: Vec<&str> = listed.iter().map(|room| room.name.as_str()).collect();
-        assert_eq!(names, ["Nixi", "conv", "older"]);
+        assert_eq!(names, ["Nixi", "Nixi — conv", "Nixi — older"]);
 
         // Where the zone is on the device, its allowed drives come along.
         let allowed = vec![ScopeDriveVm {
@@ -803,6 +847,51 @@ mod tests {
             ..dm
         };
         assert_eq!(room_proxy(&made_by_marta, &me, &phone), None);
+    }
+
+    /// R416: the person's own agents' session rooms are joined on their
+    /// own; a room made by someone other than its inviter, an agent this
+    /// account does not know, or a room that is not a session waits.
+    #[test]
+    fn only_a_known_agents_own_session_room_is_joined_on_its_own() {
+        let (nixi, tola, marta) = (
+            user("@nixi:example.org"),
+            user("@tola:example.org"),
+            user("@marta:example.org"),
+        );
+        let known = BTreeSet::from([nixi.clone(), tola.clone()]);
+        assert!(joins_invite(
+            true,
+            std::slice::from_ref(&nixi),
+            &nixi,
+            &known
+        ));
+        assert!(joins_invite(
+            true,
+            std::slice::from_ref(&tola),
+            &tola,
+            &known
+        ));
+        assert!(
+            !joins_invite(false, std::slice::from_ref(&nixi), &nixi, &known),
+            "not a session"
+        );
+        assert!(
+            !joins_invite(true, std::slice::from_ref(&marta), &marta, &known),
+            "unknown"
+        );
+        assert!(
+            !joins_invite(true, std::slice::from_ref(&marta), &nixi, &known),
+            "Nixi inviting into Marta's room"
+        );
+        assert!(
+            !joins_invite(true, &[nixi.clone(), marta], &nixi, &known),
+            "two creators"
+        );
+        assert!(
+            !joins_invite(true, &[], &nixi, &known),
+            "creators unknown yet"
+        );
     }
 
     /// A presence says whether the person is at their keyboard: it goes into

@@ -26,6 +26,9 @@
  *   (`allowed` is null) there is no editor.
  * - **A new conversation.** Asked for in the DM; the proxy's host makes the
  *   room, and the dock looks for it and opens it once its status has arrived.
+ * - **No conversation at all.** When the person's own agent has no DM on this
+ *   device, the dock offers to ask it for one (story 101.1, R416): Rust sends
+ *   the request through the control room and the DM opens here when it lands.
  */
 import { MessagesSquare, Plus, SlidersHorizontal } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -45,8 +48,15 @@ import {
 } from "@/components/ui/select";
 import { IconHint } from "@/components/ui/tooltip";
 import { logFailure } from "@/lib/failure";
-import type { AgentFocusReq, ProxyRoomVm, ScopeDriveVm } from "@/lib/ipc/client";
-import { agentConversationNew, agentFocus, agentRoomsList, agentScopeSet } from "@/lib/ipc/client";
+import type { AgentFocusReq, MainDmAskVm, ProxyRoomVm, ScopeDriveVm } from "@/lib/ipc/client";
+import {
+  agentConversationNew,
+  agentFocus,
+  agentRoomsList,
+  agentScopeSet,
+  agentsDefaultGet,
+} from "@/lib/ipc/client";
+import { openMainDm } from "@/lib/main-dm";
 import { useAccountsStore } from "@/lib/stores/accounts";
 import { columnFoldStore } from "@/lib/stores/column-fold";
 import {
@@ -72,6 +82,15 @@ export const DOCK_LOADING_LABEL = "Finding your assistant…";
 /** What the dock says to a person with no proxy. */
 export const DOCK_NO_PROXY_SENTENCE =
   "You have no assistant yet. Once an agent is set up as yours (Settings › Agents › Set up agents), its conversation with you opens here.";
+
+/** What the dock says when the person's own agent has no conversation here yet. */
+export const DOCK_NO_CONVERSATION_SENTENCE =
+  "Your assistant has no conversation with you on this device yet. Ask it to open one.";
+
+/** The control that asks an agent to open the person's conversation with it. */
+export function openConversationLabel(name: string): string {
+  return `Open a conversation with ${name}`;
+}
 
 /** The control that lists the proxy's rooms again. */
 export const DOCK_LOOK_AGAIN_LABEL = "Look again";
@@ -204,10 +223,20 @@ export function DockBody({ tellsNote = true }: { tellsNote?: boolean }) {
     };
   }, []);
 
+  // With no assistant listed: the person's own agents Rust says have no
+  // conversation here, which the dock offers to ask for one (story 101.1 #5).
+  // Looked up with every listing that finds no room — the accounts changing,
+  // a retry, the next look while it stays empty — so an agent that became
+  // known is offered and a signed-out account's offer goes (R450).
+  const [asks, setAsks] = useState<MainDmAskVm[]>([]);
+  const [askError, setAskError] = useState<string | null>(null);
+  const [asking, setAsking] = useState(false);
+
   // The newest listing wins: one the accounts outdated, or a slow one that a
-  // later look overtook, is dropped.
+  // later look overtook, is dropped — and so is its lookup of the offers.
   const relist = useCallback(async (): Promise<DockRoom[] | null> => {
     const mine = ++generation.current;
+    const current = () => alive.current && mine === generation.current;
     try {
       const per = await Promise.all(
         accounts.map(async ({ accountId }) =>
@@ -215,14 +244,35 @@ export function DockBody({ tellsNote = true }: { tellsNote?: boolean }) {
         ),
       );
       const next = per.flat();
-      if (alive.current && mine === generation.current) {
+      if (current()) {
         setListed(next);
         setListError(null);
+        // No account, nothing to offer: nobody to ask for.
+        if (next.length > 0 || accounts.length === 0) {
+          setAsks([]);
+          setAskError(null);
+        } else {
+          agentsDefaultGet().then(
+            (vm) => {
+              if (!current()) return;
+              setAsks(vm.askable);
+              setAskError(null);
+            },
+            (error: unknown) => {
+              logFailure("notes.agentAskable")(error);
+              if (!current()) return;
+              setAsks([]);
+              setAskError(
+                syncErrorMessage(error, "keeper could not look for your assistant's conversation."),
+              );
+            },
+          );
+        }
       }
       return next;
     } catch (error: unknown) {
       logFailure("notes.agentRooms")(error);
-      if (alive.current && mine === generation.current) {
+      if (current()) {
         setListed((was) => was ?? []);
         setListError(syncErrorMessage(error, "keeper could not list your assistant's rooms."));
       }
@@ -234,13 +284,27 @@ export function DockBody({ tellsNote = true }: { tellsNote?: boolean }) {
     void relist();
   }, [relist]);
 
-  // A signed-out account's rooms go now, not when the relist answers.
-  const rooms = useMemo(() => {
-    if (listed === null) return null;
-    const live = new Set(accounts.map((account) => account.accountId));
-    return listed.filter((room) => live.has(room.accountId));
-  }, [listed, accounts]);
+  // A signed-out account's rooms and offers go now, not when the relist
+  // answers.
+  const live = useMemo(() => new Set(accounts.map((account) => account.accountId)), [accounts]);
+  const rooms = useMemo(
+    () => (listed === null ? null : listed.filter((room) => live.has(room.accountId))),
+    [listed, live],
+  );
+  const offers = useMemo(() => asks.filter((wanted) => live.has(wanted.accountId)), [asks, live]);
   const empty = rooms !== null && rooms.length === 0;
+
+  const ask = (wanted: MainDmAskVm) => {
+    setAsking(true);
+    void openMainDm(wanted).then(async (room) => {
+      if (room !== null) {
+        await relist();
+      }
+      if (!alive.current) return;
+      setAsking(false);
+      if (room !== null) setChosen(room);
+    });
+  };
 
   useEffect(() => {
     if (!empty) return;
@@ -301,13 +365,26 @@ export function DockBody({ tellsNote = true }: { tellsNote?: boolean }) {
   if (current === null) {
     return (
       <div className="flex flex-col items-start gap-2 p-3 text-sm">
-        {listError === null ? (
+        {(listError ?? askError) !== null ? (
+          <p role="alert" className="text-destructive text-xs">
+            {listError ?? askError}
+          </p>
+        ) : offers.length === 0 ? (
           <p className="text-muted-foreground">{DOCK_NO_PROXY_SENTENCE}</p>
         ) : (
-          <p role="alert" className="text-destructive text-xs">
-            {listError}
-          </p>
+          <p className="text-muted-foreground">{DOCK_NO_CONVERSATION_SENTENCE}</p>
         )}
+        {offers.map((wanted) => (
+          <Button
+            key={`${wanted.accountId} ${wanted.agent}`}
+            type="button"
+            size="sm"
+            disabled={asking}
+            onClick={() => ask(wanted)}
+          >
+            {openConversationLabel(wanted.name)}
+          </Button>
+        ))}
         <Button type="button" variant="outline" size="sm" onClick={() => void relist()}>
           {DOCK_LOOK_AGAIN_LABEL}
         </Button>

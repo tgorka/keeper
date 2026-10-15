@@ -2650,6 +2650,16 @@ folders also go on its `PATH`); an `env` name is upper-case and never one keeper
 a drive's checkout, agentd's own configuration, data or state folder or `$CREDENTIALS_DIRECTORY`,
 or holds its user's home; `keeper-agentd status` names which.
 
+`[claims]` has one key, `lease`: `"short"` (the default, and what an absent table means) renews
+each session's claim every minute; `"quarter-hour"` turns on the quarter-hour lease, which you do
+only after every device and keeper-agentd serving your agents runs a build that reads it (§ *Which
+host answers*, *The lease*). Any other value is refused naming the two.
+
+```toml
+[claims]
+lease = "quarter-hour"
+```
+
 `[[providers]]` become `keeper.db` rows, one per entry and kept in step with the file at every
 start: a changed `base_url` updates its row, a removed entry deletes it. No token enters the
 database. `[[drives]]` are kept in step the same way, by `id`: a changed `remote` updates the
@@ -2724,11 +2734,13 @@ tell a decision from free text, so `m.room.encrypted` is allowed at 0 in every s
 approvals everywhere, and writes no state anywhere. A control room's power levels are the
 creating agent 100, every other agent of the principal 50 — each writes its host's manifest,
 `dev.keeper.agent.host`, at 50 (AD-374) — and people 0, with `state_default` 50 and `invite` 0, so
-a person may invite a steward into it (§ *A drive several principals mount*). A control room made
+a person may invite a steward into it (§ *A drive several principals mount*), and the person's ask
+for their DM, `dev.keeper.agent.main_dm.request`, at 0 (R416). A control room made
 with `invite` at 50 is opened at start by its creator's host, as its presence and doorbell rows
 are. A person who writes in a room they are only invited to — an agent's session room, which its
 host invites them to — joins it by sending: keeper lists invited rooms beside joined ones, and
-the send queue refuses a room it has not joined.
+the send queue refuses a room it has not joined. An invite from one of the person's own agents to
+a session room that agent made is joined on its own (R416, *An agent's room*).
 
 The same rule lets a person send *any* agent event type encrypted: a fake status, a scope, a turn
 or an edit of the agent's anchor reaches the room, and the server cannot tell. So the host checks
@@ -3025,9 +3037,22 @@ keeper shows an agent's room in its own timeline, on the Mac and on the iPhone a
   why, never hidden.
 - **Where the header comes from.** Status and scope events are not timeline items: keeper reads
   them from the room's local event cache beside the timeline, and from the server's history,
-  newest first, when the cache holds no status — once per room while keeper runs, when that
-  history held none; a status sent later reaches the cache. The hosts' claim and manifest state,
-  renewed every minute, never become timeline items either. A change of the agent's mark (its
+  newest first (four pages of 50), when the cache holds no status — once per room while keeper
+  runs when that history ended without one; a look that ran out of pages first is not taken for
+  "no status", and the next look searches again (R416). The hosts' claim and manifest state never
+  become timeline items either.
+- **The seat keeper keeps (R416, R451).** What a room's newest readable status said — its kind, the
+  agent working it and its title — is kept per account and room, in memory and in `keeper.db`
+  (`agent_room_seats`), and stands for the status when no status is in reach: a status far back
+  under a quiet night's claims, or one the cache does not hold after a restart. Each account has
+  its own: a second account in the same room never draws or admits it by a status only the first
+  could read, and an account's seats go when it signs out. A newer readable status replaces the
+  seat, another kind or agent included — the room's row follows it without the room being opened —
+  and an older one never does, after a restart too.
+- **Names.** A conversation or session with a title is listed as "<agent> — <title>" — `/new test`
+  in Nixi's DM is "Nixi — test", Tola's triage handed to Nixi "Nixi — triage of …" (the agent
+  working it) — in the Agents window, the dock's picker and the room's header; your DM keeps its
+  name. A row without a picture draws the agent's initial, never the initials of the title. A change of the agent's mark (its
   soul's icon) or of its picture redraws an open header and its rows in the Agents window.
 - **The answer.** An answer is one message that grows in place and is never marked "Edited";
   while the run is `running`, its newest answer carries the growing caret. It is drawn up to
@@ -3047,6 +3072,9 @@ keeper shows an agent's room in its own timeline, on the Mac and on the iPhone a
   When it is not (an agent you have no conversation with here, or a value that is not a user id),
   the Agents window opens with nothing selected, a notice says why, the Settings row says the same
   sentence, and `keeper.log` has it at WARN. With no agent rooms, keeper opens the Inbox as before.
+  When the default agent is your own proxy and has no conversation with you here — agent rooms or
+  none — the Agents window opens and keeper asks it for one (*Your conversation, asked for*,
+  below): "Opening a conversation with Nixi…", then the room, once it lands.
   keeper decides once per launch when it knows: once every signed-in account has finished its
   first sync since launch and keeper has looked at the rooms after that, or as soon as the default
   agent's conversation is here. It never takes longer than 15 seconds, looking at the rooms
@@ -3090,6 +3118,31 @@ keeper shows an agent's room in its own timeline, on the Mac and on the iPhone a
   typed it in; switching rooms withdraws the question. If keeper cannot look the commands up,
   one line under the field says so and the line is not sent.
 
+- **Your conversation, asked for (story 101.1, R416).** Only the proxy's host makes its DM
+  (`keeper-agentd agents init` does it once); a room you made yourself would never count as it.
+  So when your own proxy has no DM with you here, keeper writes one state event,
+  `dev.keeper.agent.main_dm.request` (`{v, agent, ask}`, keyed by your user id, as your presence
+  is), into the control room you share with it — the room the proxy made, open to it at 0 — and
+  the proxy's running host (agentd or the Mac's)
+  answers it under a claim in that room (one host answers) with the same DM `agents init`
+  makes: found by its session folder, adopted when the copy is already in it, or made, and you
+  invited again if you had left it. Its answer, `dev.keeper.agent.main_dm.answer`, names the room
+  or says why not: the host answers only its agent's `human` and refuses anyone else with a
+  sentence. (A state event is not encrypted, so the sender is the homeserver's word; it is enough,
+  because the request can only make the DM between the agent and its own `human`.) A host
+  answers a request it can tell is under 2 minutes old — by the server's age, else by the
+  homeserver's clock — and refuses a stranger at most once every 10 minutes. keeper joins the
+  invite as direct (an answer that comes before the invite is kept until the invite lands), finds
+  the room's status however far back it is, and opens the room — all of it within 30 s of your
+  ask; else it says why — no control room (run `keeper-agentd agents init` on the agent's host),
+  the host's refusal, or no answer — and `keeper.log` has it at WARN.
+- **Invites from your agents.** An agent's new conversation, a delegation handed to it or its DM
+  arrives as an invite. keeper joins an invite on its own when the room is a session room made by
+  the agent that invited you, and that agent is one of yours — your proxy, or an agent of a
+  control room your proxy made; a DM invite is joined as direct. Any other invite waits for you.
+  Agent power in such a control room is that authority: a bridge or a person given agent power
+  there has its session-room invites joined too (R452).
+
 ## Nixi beside your notes
 
 Your proxy's room can sit beside the notes view, docked, on the Mac (on the iPhone it is a room
@@ -3102,7 +3155,10 @@ like any other). What keeper and the proxy's host do for it:
   timeline and composer. It is its own open conversation: it never changes the chat you have
   selected, and a file dropped on the window goes to the note, not to the dock. Opened in a
   window too narrow for every column, it folds the notes rail to its strip. With no proxy it says
-  so, looks again on its own and offers *Look again*.
+  so, looks again on its own and offers *Look again*. When your own agent has no conversation
+  with you here, it offers *Open a conversation with Nixi*, which asks for it as the launch does
+  (*Your conversation, asked for*) and docks it when it lands; the offer is looked up again with
+  every look, follows your accounts, and a lookup that failed says so beside *Look again*.
 - **On an Android tablet** (story 98.3, UX-DR146) the same dock is a sheet: *Assistant* in the
   Inbox header opens it over whatever is showing, with the same picker, header, timeline and
   composer. It tells your proxy no note, because over the Inbox none is in front of you. A phone
@@ -3113,8 +3169,9 @@ like any other). What keeper and the proxy's host do for it:
   encrypted, made by the agent its status names (its only creator), and — for `main` — your
   direct conversation with that agent; anything else is never listed and nothing is sent there.
   A room whose status keeper has not read yet is not listed; it is listed once its status
-  arrives, never guessed from the room's shape. A conversation is listed by the title in its
-  status; its room is named after the proxy, because a room's name is not encrypted.
+  arrives, never guessed from the room's shape — or, once read, by the seat keeper kept of it. A
+  conversation is listed as "<agent> — <title>" from the title in its status; its room is named
+  after the proxy, because a room's name is not encrypted.
 - **Whose proxy (ruling R72).** Whose proxy an agent is fails closed. It is yours only when the
   agents zone on this device says so (its `agent.toml`'s `human` is you — the Mac that keeps
   it), or when your own account data `dev.keeper.agent.proxies` (`{v: 1, agents: [...]}`) lists
@@ -4462,25 +4519,66 @@ when the claim changes hands or another host served the session meanwhile. `agen
 **The claim.** `dev.keeper.agent.claim` (state key `""`) in the session's room holds the host, its
 copy's device, the agent, an **epoch**, and when the claim was taken, renewed and expires. A claim
 is a host's only when the agent's own Matrix user sent it. The host placement names takes it when
-there is no claim, the claim is released, or the claim's event is 180 s old by the homeserver's
-clock: it writes `epoch + 1`, reads the claim back from the server, waits twice the longest round
-trip it has measured or one `/sync` round, whichever is longer, and reads it again. It proceeds
-only if both reads name its own event; otherwise it yields and writes nothing. Its first log line
-is `claim acquired`, with the claim event and the server's time, and every line it writes after
-carries the epoch and that event. It renews every 60 s. The homeserver's clock is this host's
+there is no claim, the claim is released, or the claim's event is as old as its lease's life by the
+homeserver's clock: it writes `epoch + 1`, reads the claim back from the server, waits twice the
+longest round trip it has measured or one `/sync` round, whichever is longer, and reads it again. It
+proceeds only if both reads name its own event; otherwise it yields and writes nothing. Its first
+log line is `claim acquired`, with the claim event and the server's time, and every line it writes
+after carries the epoch and that event.
+
+**The lease (R449, R455).** A renewal is a state event in the session's room, and one a minute
+buries a quiet DM's status under hundreds of them (DW-1385). Every claim runs on the **minute
+lease** — renewed every 60 s, stopped after 120 s, free after 180 s — unless you turn the
+**quarter-hour lease** on: renewed every 15 minutes, stopped after 30, free after 45. It is never
+turned on for you. A host built before it (keeper and keeper-agentd 0.10.x and older) reads every
+claim as free 180 s after its event, advertises nothing, and can come back from being offline at
+any moment — so only you know when none is left. A host takes the quarter-hour lease only when
+both hold:
+
+- its own setting turns it on — `[claims] lease = "quarter-hour"` in `agentd.toml` for
+  keeper-agentd, *Renew claims every 15 minutes* in Settings › Agents (`agents.claims_lease`) on a
+  Mac — and
+- every live host in the control room says in its manifest that it reads it
+  (`lease: "quarter-hour"`), and no live claim it sees was written on the minute lease by a host
+  whose manifest does not say so.
+
+A holder on the quarter-hour lease that sees a manifest or a live claim from a host that does not
+read it — or whose setting is turned off — drops to the minute lease at that tick and writes nothing
+more until its minute-lease renewal is confirmed; if the old host already took the claim, that
+renewal finds it lost. The drop holds until that renewal lands: a fleet that reads the
+quarter-hour lease again before it is sent does not take it back, so a holder never renews a
+claim it does not write (R101R3-01). A holder that sees another host's later claim checks it with the server at
+once. The claim says its own lease in its times (its `expires_at` is its lease's life after
+`renewed_at`), and every reader honours it. Claims in the control room — maintenance, pictures, a
+DM request — keep the minute lease.
+
+**Turning the quarter-hour lease on, in order:** (1) update every device and every keeper-agentd
+that serves your agents — every Mac that hosts them, every server — to a build that reads it,
+including any that is switched off today; (2) check that every live host's manifest says
+`lease: "quarter-hour"` (each host's `keeper-agentd status`, or the control room's host state
+events); (3) then turn it on host by host. A host that is off when you turn it on and comes back
+on an old build is exactly the case the setting cannot see: with the lease on, such a host may take
+a session within one tick of its return while its holder still writes it, and the log's
+`(epoch, claim)` fence is the only backstop. To go back, turn it off; each holder drops to the
+minute lease at its next tick. makistack's agentd role does not write `[claims]`, so a server it
+deploys stays on the minute lease until its `agentd.toml` says otherwise.
+
+Both leases keep the same proportions: stop after two missed renewals, free after
+three. The homeserver's clock is this host's
 clock plus the offset its last read-back of its own event showed; until the first read-back (the
 manifest's, at start) a host takes no claim, and a host with no control room yet takes another
 host's claim only after a claim of its own has calibrated it.
 
-**When a host goes away.** A host that cannot confirm a renewal for 120 s stops writing the
-session, logs `claim lost` and parks its status as blocked, 60 s before anyone may take over; a
-line it writes anyway is dropped by every reader (§ *The log*). The 120 s are counted on both of
-the host's clocks: the monotonic one stands still while a laptop's lid is closed or a VM is paused,
-the wall clock does not, so a Mac that slept ten minutes writes nothing when it wakes. After a
+**When a host goes away.** A host that cannot confirm a renewal for two renewals (30 minutes on the
+quarter-hour lease, 120 s on the minute one) stops writing the session, logs `claim lost` and parks
+its status as blocked, a whole renewal before anyone may take over; a line it writes anyway is
+dropped by every reader (§ *The log*). The interval is counted on both of the host's clocks: the
+monotonic one stands still while a laptop's lid is closed or a VM is paused, the wall clock does
+not, so a Mac that slept past it writes nothing when it wakes. After a
 shorter sleep (the wall clock more than 5 s ahead of the monotonic one) it writes nothing until its
 next renewal has read the claim back as its own. A host that stops cleanly releases its claims, and
-the next host takes over within two ticks. A host that crashes is taken over 180 s after its last
-renewal. The always-on host owns its agents' main sessions: when it comes back, the host that took
+the next host takes over within two ticks. A host that crashes is taken over 45 minutes after its
+last renewal on the quarter-hour lease, 180 s on the minute one. The always-on host owns its agents' main sessions: when it comes back, the host that took
 over hands the session back at its next idle moment, never during a turn (`claim released`), and
 the always-on host takes it at the next epoch. A session pinned to another host is handed back the
 same way, even while the pinned host cannot serve it, so its status says what it waits for. A

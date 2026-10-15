@@ -1095,6 +1095,29 @@ pub fn set_agents_default(data_dir: &Path, agent: Option<&str>) -> Result<(), Co
     )
 }
 
+/// The `settings` key naming the lease this desktop host takes a session's
+/// claim on (R455): `short` (absent included) or `quarter-hour`.
+pub const AGENTS_CLAIMS_LEASE_KEY: &str = "agents.claims_lease";
+
+/// Read this desktop host's claims lease. Absent, blank or a value that is
+/// not one of the two is the minute lease: a quarter-hour lease is never
+/// taken on a value nobody chose.
+pub fn get_agents_claims_lease(
+    data_dir: &Path,
+) -> Result<crate::agents::claim::ClaimsLease, CoreError> {
+    Ok(get_setting(data_dir, AGENTS_CLAIMS_LEASE_KEY)?
+        .and_then(|value| crate::agents::claim::ClaimsLease::parse(&value))
+        .unwrap_or_default())
+}
+
+/// Write this desktop host's claims lease.
+pub fn set_agents_claims_lease(
+    data_dir: &Path,
+    lease: crate::agents::claim::ClaimsLease,
+) -> Result<(), CoreError> {
+    set_setting(data_dir, AGENTS_CLAIMS_LEASE_KEY, lease.as_str())
+}
+
 /// The `settings` key holding the stop phrase as typed (Epic 67, Story 67.3,
 /// AD-208) — the word that ends a spoken answer. Absent or blank =
 /// [`crate::voice::DEFAULT_STOP_PHRASE`]. Stored raw, like the wake phrase:

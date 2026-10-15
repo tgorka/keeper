@@ -786,6 +786,12 @@ pub struct RoomVm {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub agent_avatar: Option<String>,
+    /// An agent room's letter where it draws no picture: the initial of the
+    /// agent working it (story 101.1 #6, R416), never the initials of the
+    /// room's title; absent for every other room.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub agent_mark: Option<String>,
 }
 
 /// One Matrix Space the user belongs to, surfaced as a filter view (Story 4.5,
@@ -2017,6 +2023,12 @@ pub struct InboxRoomVm {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub agent_avatar: Option<String>,
+    /// An agent room's letter where it draws no picture: the initial of the
+    /// agent working it (story 101.1 #6, R416), never the initials of the
+    /// room's title; absent for every other room.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub agent_mark: Option<String>,
 }
 
 /// One index-based merged-inbox operation mirroring an eyeball-im `VectorDiff`
@@ -8320,6 +8332,7 @@ mod tests {
             mute_state: MuteState::None,
             agent_room: None,
             agent_avatar: None,
+            agent_mark: None,
         }
     }
 
@@ -8505,6 +8518,7 @@ mod tests {
             mute_state: MuteState::None,
             agent_room: None,
             agent_avatar: None,
+            agent_mark: None,
         }
     }
 
@@ -8540,6 +8554,7 @@ mod tests {
             mute_state: MuteState::None,
             agent_room: None,
             agent_avatar: None,
+            agent_mark: None,
         };
         let json = serde_json::to_string(&vm).expect("serialize");
         assert!(json.contains("\"lastMessage\":null"), "json was: {json}");

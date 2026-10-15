@@ -8,7 +8,7 @@
 
 use std::time::Duration;
 
-use matrix_sdk::ruma::{OwnedEventId, OwnedUserId, UserId};
+use matrix_sdk::ruma::{OwnedEventId, OwnedRoomId, OwnedUserId, UserId};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use ts_rs::TS;
@@ -53,6 +53,13 @@ pub const HOST: &str = "dev.keeper.agent.host";
 /// A person's ask, in their proxy's `main` DM, for a new conversation
 /// (ruling R36): only the main session's claim holder acts on it.
 pub const CONVERSATION_REQUEST: &str = "dev.keeper.agent.conversation.request";
+/// A person's ask, in their control room, that their proxy open its `main`
+/// DM with them (story 101.1, R416; state, key = the asker's user id):
+/// answered by the proxy's host with [`MAIN_DM_ANSWER`].
+pub const MAIN_DM_REQUEST: &str = "dev.keeper.agent.main_dm.request";
+/// A proxy's answer to [`MAIN_DM_REQUEST`], in the same control room: the
+/// DM it opened, or why it did not.
+pub const MAIN_DM_ANSWER: &str = "dev.keeper.agent.main_dm.answer";
 /// A host's ask to the one device of its person that is in front: open a
 /// note, highlight, point, scroll, or propose an edit (AD-383).
 pub const SURFACE_REQUEST: &str = "dev.keeper.agent.surface.request";
@@ -201,6 +208,36 @@ pub struct ConversationRequestContent {
     pub v: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+}
+
+/// `dev.keeper.agent.main_dm.request` (state in the person's control room,
+/// key = the asker's user id, unencrypted, at 0 there): open `agent`'s
+/// `main` DM with the sender.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MainDmRequestContent {
+    pub v: u32,
+    /// The proxy asked: only it answers.
+    pub agent: OwnedUserId,
+    /// This ask's own id (a ULID): a state event the room already holds is
+    /// not sent again by the homeserver, so asking twice must differ.
+    pub ask: String,
+}
+
+/// `dev.keeper.agent.main_dm.answer` (timeline, encrypted, in the control
+/// room the request was sent in): the DM `agent` opened for `request`, or
+/// the sentence saying why it did not.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MainDmAnswerContent {
+    pub v: u32,
+    /// The request's event id.
+    pub request: OwnedEventId,
+    pub agent: OwnedUserId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub room: Option<OwnedRoomId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refused: Option<String>,
 }
 
 /// `dev.keeper.agent.claim` (state, key `""`, unencrypted): who writes the
@@ -640,7 +677,7 @@ pub fn control_power_levels(creator: &UserId, agents: &[OwnedUserId]) -> Value {
     json!({
         "users": users,
         "users_default": 0,
-        "events": { HOST: 50, PRESENCE: 0, DOORBELL: 0 },
+        "events": { HOST: 50, PRESENCE: 0, DOORBELL: 0, MAIN_DM_REQUEST: 0 },
         "events_default": 50,
         "state_default": 50,
         "ban": 50,
@@ -650,9 +687,10 @@ pub fn control_power_levels(creator: &UserId, agents: &[OwnedUserId]) -> Value {
     })
 }
 
-/// The rows a control room made before them lacks: each state event open
-/// at 0 that [`control_power_levels`] names.
-const OPEN_ROWS: [&str; 2] = [PRESENCE, DOORBELL];
+/// The rows a control room made before them lacks: each event open at 0
+/// that [`control_power_levels`] names — the person's ask for their DM
+/// (R416) among them.
+const OPEN_ROWS: [&str; 3] = [PRESENCE, DOORBELL, MAIN_DM_REQUEST];
 
 /// What a control room made before R37, R59 or Q15's open invite needs so
 /// its people can publish their presence, invite a steward, and a visiting
@@ -880,6 +918,9 @@ mod tests {
         // A person may invite — a steward joins a visited control room only
         // on a person's invite (Q15) — and gains no power by it.
         assert!(level("@tgorka:example.org").as_i64() >= levels["invite"].as_i64());
+        // A person may ask their proxy for their DM (R416), and a visitor
+        // may send it too — the proxy's host answers only its own human.
+        assert_eq!(levels["events"][MAIN_DM_REQUEST], 0);
     }
 
     #[test]
@@ -894,7 +935,12 @@ mod tests {
             }
             old
         };
-        for rows in [&[PRESENCE][..], &[DOORBELL], &[PRESENCE, DOORBELL]] {
+        for rows in [
+            &[PRESENCE][..],
+            &[DOORBELL],
+            &[MAIN_DM_REQUEST],
+            &[PRESENCE, DOORBELL, MAIN_DM_REQUEST],
+        ] {
             let old = without(rows);
             let ControlLevels::Update(updated) = control_levels(&old, &creator) else {
                 panic!("the creator updates a room without {rows:?}");

@@ -1080,6 +1080,8 @@ pub fn run() {
                 agents_ipc::agent_scope_set,
                 agents_ipc::agent_focus,
                 agents_ipc::agent_conversation_new,
+                // Story 101.1: ask the proxy for the person's DM (R416).
+                agents_ipc::agent_main_dm_open,
                 // Story 93.3: the approval card's decision and the own
                 // fingerprint, every target (the phone decides too).
                 agents_ipc::agent_approval_decide,
@@ -1096,6 +1098,9 @@ pub fn run() {
                 agents_ipc::agents_launch,
                 agents_ipc::agents_default_get,
                 agents_ipc::agents_default_set,
+                // R455: the claims lease Settings › Agents turns on.
+                agents_ipc::agents_claims_lease_get,
+                agents_ipc::agents_claims_lease_set,
                 // Voice (Story 62.4): every target, the port decides.
                 voice_ipc::voice_availability,
                 voice_ipc::voice_start,

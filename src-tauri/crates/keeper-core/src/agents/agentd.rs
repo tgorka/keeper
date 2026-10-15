@@ -59,6 +59,10 @@ pub struct AgentdConfig {
     pub mcp: Vec<crate::agents::mcp::McpEntry>,
     /// `[[kvm]]` (`kvm::check`): never in a drive.
     pub kvm: Vec<crate::agents::kvm::KvmEntry>,
+    /// `[claims] lease` (R455): `short` (the default, absent included) or
+    /// `quarter-hour`, which an operator writes only once every device and
+    /// agentd serving these agents runs a build that reads it.
+    pub claims_lease: crate::agents::claim::ClaimsLease,
 }
 
 /// `[homeserver]`.
@@ -230,6 +234,14 @@ struct RawConfig {
     mcp: Vec<crate::agents::mcp::RawMcp>,
     #[serde(default)]
     kvm: Vec<crate::agents::kvm::RawKvm>,
+    #[serde(default)]
+    claims: Option<RawClaims>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawClaims {
+    lease: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -432,6 +444,7 @@ impl AgentdConfig {
             sandbox_env,
             mcp,
             kvm,
+            claims_lease: claims_lease(raw.claims)?,
         })
     }
 
@@ -465,6 +478,24 @@ impl AgentdConfig {
         all.sort_by(|a, b| a.0.cmp(&b.0));
         all.dedup();
         all
+    }
+}
+
+/// `[claims] lease`: absent (or the table absent) is the minute lease.
+fn claims_lease(
+    raw: Option<RawClaims>,
+) -> Result<crate::agents::claim::ClaimsLease, ConfigRefusal> {
+    use crate::agents::claim::ClaimsLease;
+    match raw.and_then(|claims| claims.lease) {
+        None => Ok(ClaimsLease::Short),
+        Some(lease) => ClaimsLease::parse(&lease).ok_or_else(|| {
+            invalid(
+                "[claims] `lease`",
+                format!(
+                    "\"{lease}\" is not a choice; write \"short\" (a claim renewed every minute, the default) or \"quarter-hour\" (renewed every 15 minutes — only once every device and keeper-agentd serving your agents runs a build that reads it)"
+                ),
+            )
+        }),
     }
 }
 
@@ -718,6 +749,29 @@ readers     = ["@tgorka:example.org"]
         assert!(refused(&text).contains("flavour"));
         let text = EXAMPLE.replace("ids   = [", "colour = 1\nids   = [");
         assert!(refused(&text).contains("colour"));
+    }
+
+    /// R455: an `agentd.toml` that names no `[claims]` keeps the minute
+    /// lease; `quarter-hour` turns the cutover on; anything else is refused
+    /// with the two choices, and an unknown key in the table is refused too.
+    #[test]
+    fn the_quarter_hour_lease_is_on_only_where_the_file_says_so() {
+        use crate::agents::claim::ClaimsLease;
+        let lease = |text: &str| AgentdConfig::parse(text).expect("parses").claims_lease;
+        assert_eq!(lease(EXAMPLE), ClaimsLease::Short);
+        let table = |body: &str| format!("{EXAMPLE}\n[claims]\n{body}\n");
+        assert_eq!(lease(&table("")), ClaimsLease::Short);
+        assert_eq!(lease(&table("lease = \"short\"")), ClaimsLease::Short);
+        assert_eq!(
+            lease(&table("lease = \"quarter-hour\"")),
+            ClaimsLease::QuarterHour
+        );
+        let sentence = refused(&table("lease = \"hourly\""));
+        assert!(
+            sentence.contains("[claims] `lease`") && sentence.contains("\"quarter-hour\""),
+            "{sentence}"
+        );
+        assert!(refused(&table("renew = 60")).contains("renew"));
     }
 
     #[test]

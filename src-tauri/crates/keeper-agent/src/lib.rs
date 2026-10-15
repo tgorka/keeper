@@ -74,6 +74,8 @@ pub mod delegate;
 #[cfg(all(unix, not(phone)))]
 pub mod desktop;
 #[cfg(all(unix, not(phone)))]
+pub mod dm_request;
+#[cfg(all(unix, not(phone)))]
 pub mod doorbell;
 pub mod drive;
 #[cfg(not(phone))]

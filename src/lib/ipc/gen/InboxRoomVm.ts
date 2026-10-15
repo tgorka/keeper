@@ -113,4 +113,10 @@ agentRoom?: AgentRoomKindVm,
  * R384): a URL for an `<img>`; absent for every other room and for an
  * agent with none, whose row keeps its initials.
  */
-agentAvatar?: string, };
+agentAvatar?: string, 
+/**
+ * An agent room's letter where it draws no picture: the initial of the
+ * agent working it (story 101.1 #6, R416), never the initials of the
+ * room's title; absent for every other room.
+ */
+agentMark?: string, };

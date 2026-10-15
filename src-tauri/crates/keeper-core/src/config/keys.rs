@@ -456,6 +456,16 @@ pub const KEYS: &[KeySpec] = &[
         summary: "The default agent: one agent's Matrix user id. At launch, an account with at least one agent room opens the Agents window, on this agent's main conversation when it has one on this account; otherwise nothing is selected and Settings › Agents says why. Blank means no default agent; with no agent rooms, keeper opens the Inbox as before (R383).",
         example: "\"@nixi:example.org\"",
     },
+    KeySpec {
+        key: "agents.claims_lease",
+        family: false,
+        scope: Scope::UserGlobal,
+        settable: Settable::AnyLayer,
+        shape: Shape::Choice(&["short", "quarter-hour"]),
+        default: "short",
+        summary: "Which lease this Mac takes a session's claim on while it hosts your agents (R455). `short` renews it every minute. `quarter-hour` renews it every 15 minutes, so a quiet room is not filled with renewals, and is taken only while every live host in the control room says it reads it; turn it on only after every device and keeper-agentd that serves your agents runs a build that reads it (keeper-agentd's own is `[claims] lease` in `agentd.toml`).",
+        example: "\"quarter-hour\"",
+    },
     // ---- bots ------------------------------------------------------------
     KeySpec {
         key: "bots.provider_credential_source.",

@@ -42,6 +42,7 @@
  * or removed.
  */
 import { useCallback, useEffect, useId, useState } from "react";
+import { AgentsClaimsLeaseRow } from "@/components/settings/agents-claims-lease-row";
 import { AgentsMcpSection, AgentsSandboxSection } from "@/components/settings/agents-mcp-section";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -276,6 +277,7 @@ export function AgentsSection({ open }: { open: boolean }) {
       ))}
       <AgentsMcpSection open={open} />
       <AgentsSandboxSection open={open} />
+      <AgentsClaimsLeaseRow open={open} />
     </section>
   );
 }

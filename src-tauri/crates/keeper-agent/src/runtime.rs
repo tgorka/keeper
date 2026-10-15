@@ -43,8 +43,8 @@ use keeper_core::agents::agentd::{AgentdConfig, DrivePin, TrustEntry};
 use keeper_core::agents::drive::{self, DriveDecl};
 use keeper_core::agents::events::{
     control_levels, ControlLevels, ANSWER, APPROVAL_DECISION, ASK, CONTROL_ROOM_TYPE,
-    CONVERSATION_REQUEST, DELEGATE, DOORBELL, HEARD, PRESENCE, SCOPE, SESSION_ROOM_TYPE,
-    SURFACE_REQUEST, SURFACE_RESULT, TURN,
+    CONVERSATION_REQUEST, DELEGATE, DOORBELL, HEARD, MAIN_DM_REQUEST, PRESENCE, SCOPE,
+    SESSION_ROOM_TYPE, SURFACE_REQUEST, SURFACE_RESULT, TURN,
 };
 use keeper_core::agents::home::AgentKind;
 use keeper_core::agents::index::Index;
@@ -633,6 +633,9 @@ pub(crate) struct Copy {
     pub(crate) doors: Arc<ClientDoors>,
     /// Its picture's publication as its profile avatar (story 100.4).
     pub(crate) picture: Arc<tokio::sync::Mutex<crate::avatar::Picture>>,
+    /// The person's asks for their DM it heard, served at the host's tick
+    /// (R450).
+    pub(crate) dm_asks: crate::dm_request::SharedAsks,
 }
 
 /// The claim a worker writes under (story 90.6).
@@ -750,6 +753,7 @@ pub(crate) fn start_copy(
         harvest_acks: Arc::default(),
         doors,
         picture: Arc::default(),
+        dm_asks: Arc::default(),
     });
     register_handlers(&copy);
     let sync_client = copy.client.client().clone();
@@ -1097,6 +1101,7 @@ pub async fn run(
             crate::avatar::publish_all(&copies, hosts.picture_round().as_ref(), &pictures, true);
         }
         hosts.tick(&stop_signal).await;
+        crate::dm_request::serve_all(&copies, &hosts.dm_round());
         ringer.tick(&hosts.round(&drives), &doorbell);
         nights.tick(hosts.night(&drives));
         sweeps.tick(hosts.night(&drives));
@@ -1932,6 +1937,15 @@ fn register_handlers(copy: &Arc<Copy>) {
                 // state handler (`doorbell::listen`), which a timeline's
                 // state event reaches as well, and never routed (R59).
                 if value["type"] == DOORBELL {
+                    return;
+                }
+                // A person's ask for their DM is the host's, never a
+                // session's (R416): answered off the sync loop, since the
+                // DM may be made and its folder written.
+                if value["type"] == MAIN_DM_REQUEST {
+                    if value["sender"].as_str() != Some(copy.deps.home.config.matrix_user.as_str()) {
+                        crate::dm_request::hear(&copy, &room, value);
+                    }
                     return;
                 }
                 // A gate's outside system asks and does nothing else: no

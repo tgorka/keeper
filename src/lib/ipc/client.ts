@@ -23,6 +23,7 @@ import type { FilesDeletePlanVm } from "./gen/FilesDeletePlanVm";
 import type { FilesDeleteReceiptVm } from "./gen/FilesDeleteReceiptVm";
 import type { FilesListingVm } from "./gen/FilesListingVm";
 import type { IpcError } from "./gen/IpcError";
+import type { LaunchRoomVm } from "./gen/LaunchRoomVm";
 import type { LifecyclePhase } from "./gen/LifecyclePhase";
 import type { LineEditVm } from "./gen/LineEditVm";
 import type { MarkerEditReq } from "./gen/MarkerEditReq";
@@ -455,6 +456,7 @@ export type { ChatCommandRowVm } from "./gen/ChatCommandRowVm";
 export type { ChatCommandVerdictVm } from "./gen/ChatCommandVerdictVm";
 export type { ChatNotifyMode } from "./gen/ChatNotifyMode";
 export type { ChoiceVm } from "./gen/ChoiceVm";
+export type { ClaimsLease } from "./gen/ClaimsLease";
 export type { ConfigFaultVm } from "./gen/ConfigFaultVm";
 export type { ConfigLayersVm } from "./gen/ConfigLayersVm";
 export type { ConfigOverrideVm } from "./gen/ConfigOverrideVm";
@@ -548,6 +550,7 @@ export type { LifecyclePhase } from "./gen/LifecyclePhase";
 export type { LineSpan } from "./gen/LineSpan";
 export type { LoginFieldVm } from "./gen/LoginFieldVm";
 export type { LoginFlowVm } from "./gen/LoginFlowVm";
+export type { MainDmAskVm } from "./gen/MainDmAskVm";
 export type { MatrixOfferVm } from "./gen/MatrixOfferVm";
 export type { MediaKindVm } from "./gen/MediaKindVm";
 export type { MediaVm } from "./gen/MediaVm";
@@ -856,6 +859,7 @@ import type { CaptureTargetVm } from "./gen/CaptureTargetVm";
 import type { CaptureWindowVm } from "./gen/CaptureWindowVm";
 import type { ChatCommandPreviewVm } from "./gen/ChatCommandPreviewVm";
 import type { ChoiceVm } from "./gen/ChoiceVm";
+import type { ClaimsLease } from "./gen/ClaimsLease";
 import type { ConfigLayersVm } from "./gen/ConfigLayersVm";
 import type { ConnectionStatusBatch } from "./gen/ConnectionStatusBatch";
 import type { CopyJobVm } from "./gen/CopyJobVm";
@@ -7937,6 +7941,16 @@ export async function agentConversationNew(
 }
 
 /**
+ * Open the person's `main` DM with `agent` on `accountId` (story 101.1, R416):
+ * the room when it is here; otherwise Rust asks the agent's host for it through
+ * the control room and answers once the room has landed, within 30 s. A
+ * rejection's `message` is Rust's sentence for why it did not open.
+ */
+export async function agentMainDmOpen(accountId: string, agent: string): Promise<LaunchRoomVm> {
+  return await invoke<LaunchRoomVm>("agent_main_dm_open", { accountId, agent });
+}
+
+/**
  * The person's decision on an approval card (93.3), sent from this device
  * into the session room `roomId`: `req.id` and `req.bindingDigest` are the
  * card's, `req.scope` one of its `scopes` (`once` with a deny). A decision in
@@ -8774,6 +8788,22 @@ export async function agentsDefaultGet(): Promise<AgentsLaunchVm> {
  */
 export async function agentsDefaultSet(agent: string | null): Promise<AgentsLaunchVm> {
   return await invoke<AgentsLaunchVm>("agents_default_set", { agent });
+}
+
+/**
+ * The lease this Mac takes a session's claim on while it hosts the person's
+ * agents (R455): `short` unless the quarter-hour one was turned on.
+ */
+export async function agentsClaimsLeaseGet(): Promise<ClaimsLease> {
+  return await invoke<ClaimsLease>("agents_claims_lease_get");
+}
+
+/**
+ * Store this Mac's claims lease; resolves with it as it now reads (a
+ * settings file may still decide it), rejects with Rust's sentence.
+ */
+export async function agentsClaimsLeaseSet(lease: ClaimsLease): Promise<ClaimsLease> {
+  return await invoke<ClaimsLease>("agents_claims_lease_set", { lease });
 }
 
 /**
