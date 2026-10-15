@@ -18,6 +18,7 @@
  * live state first (never a frontend guess).
  */
 import { isLiveRecording } from "@/hooks/use-recording-session";
+import { logFailure } from "@/lib/failure";
 import { recordingStart, recordingStatus, recordingStop } from "@/lib/ipc/client";
 import { captureSourcesForStart } from "@/lib/stores/recording-capture-sources";
 import { micDeviceId } from "@/lib/stores/recording-mic";
@@ -49,6 +50,7 @@ export async function startRecordingWithCurrentSelections(): Promise<void> {
       cameraDeviceId(),
     );
   } catch (error) {
+    logFailure("recording.start")(error);
     console.warn("recording-control: start failed (surfaced via the loud-failure pipeline)", error);
   }
 }
@@ -62,6 +64,7 @@ export async function stopRecording(): Promise<void> {
   try {
     await recordingStop();
   } catch (error) {
+    logFailure("recording.stop")(error);
     console.warn("recording-control: stop failed", error);
   }
 }
@@ -76,7 +79,8 @@ export async function toggleRecording(): Promise<void> {
   let live: boolean;
   try {
     live = isLiveRecording(await recordingStatus());
-  } catch {
+  } catch (raw) {
+    logFailure("recording.status")(raw);
     return;
   }
   if (live) {

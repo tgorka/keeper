@@ -22,6 +22,7 @@
  * full of embeds costs nothing to open.
  */
 import type { EditorView } from "@codemirror/view";
+import { logFailure, sayFailure } from "@/lib/failure";
 import { type LineEditVm, mediaBlockForEmbed, revealPath } from "@/lib/ipc/client";
 import { capabilitiesStore } from "@/lib/stores/capabilities";
 import { fileNameOf } from "./media-element";
@@ -145,6 +146,7 @@ export async function playInPlayer(
     try {
       edits = await mediaBlockForEmbed(profileId, doc.toString(), line, target);
     } catch (cause) {
+      logFailure("media.playInPlayer")(cause);
       const message = (cause as { message?: unknown } | null)?.message;
       return typeof message === "string" && message !== ""
         ? message
@@ -200,13 +202,17 @@ export function mediaChip(
   if (capabilitiesStore.getState().capabilities.revealInFileManager) {
     node.append(
       action(MEDIA_CHIP_REVEAL_LABEL, name, () => {
-        void revealPath(file.absolutePath).catch(() => {});
+        void revealPath(file.absolutePath).catch(
+          sayFailure("notes.revealMedia", "keeper couldn't reveal the file."),
+        );
       }),
     );
   }
   node.append(
     action(MEDIA_CHIP_COPY_PATH_LABEL, name, () => {
-      void navigator.clipboard?.writeText(file.absolutePath).catch(() => {});
+      void navigator.clipboard
+        ?.writeText(file.absolutePath)
+        .catch(sayFailure("notes.copyMediaPath", "keeper couldn't copy the path."));
     }),
   );
   node.append(status);

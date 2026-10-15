@@ -70,6 +70,7 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { logFailure } from "@/lib/failure";
 import type { SessionEntryVm, SessionFileKind } from "@/lib/ipc/client";
 import {
   sessionsDirNew,
@@ -210,7 +211,10 @@ export function SessionFileActions({
       // space's directory (Story 52.5). The empty id is what says so.
       sessionsFileNewKind(rootId, sessionId, tag, "", "")
         .then(opened)
-        .catch((raw: unknown) => setNotice(syncErrorMessage(raw, fallback)))
+        .catch((raw: unknown) => {
+          logFailure("sessions.fileNewKind")(raw);
+          setNotice(syncErrorMessage(raw, fallback));
+        })
         .finally(() => onBusy(false));
     },
     [rootId, sessionId, opened, onBusy],
@@ -228,7 +232,10 @@ export function SessionFileActions({
     setNotice(null);
     sessionsLogToday(rootId, sessionId)
       .then(() => onChanged())
-      .catch((raw: unknown) => setNotice(syncErrorMessage(raw, SESSION_FILE_NEW_LOG_FAILED)))
+      .catch((raw: unknown) => {
+        logFailure("sessions.logToday")(raw);
+        setNotice(syncErrorMessage(raw, SESSION_FILE_NEW_LOG_FAILED));
+      })
       .finally(() => onBusy(false));
   }, [shape, rootId, sessionId, onChanged, newKind, onBusy]);
 
@@ -243,7 +250,10 @@ export function SessionFileActions({
         setTitle("");
         opened(subpath);
       })
-      .catch((raw: unknown) => setNotice(syncErrorMessage(raw, SESSION_FILE_NEW_FAILED)))
+      .catch((raw: unknown) => {
+        logFailure("sessions.fileNew")(raw);
+        setNotice(syncErrorMessage(raw, SESSION_FILE_NEW_FAILED));
+      })
       .finally(() => onBusy(false));
   }, [rootId, sessionId, parent, title, kind, opened, onBusy]);
 
@@ -259,7 +269,10 @@ export function SessionFileActions({
         setDirPath("");
         onChanged();
       })
-      .catch((raw: unknown) => setNotice(syncErrorMessage(raw, SESSION_DIR_NEW_FAILED)))
+      .catch((raw: unknown) => {
+        logFailure("sessions.dirNew")(raw);
+        setNotice(syncErrorMessage(raw, SESSION_DIR_NEW_FAILED));
+      })
       .finally(() => onBusy(false));
   }, [rootId, sessionId, dirPath, onChanged, onBusy]);
 

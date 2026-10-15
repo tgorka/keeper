@@ -674,6 +674,9 @@ pub async fn open_timeline(
 struct AgentHeader {
     reader: HeaderReader,
     own_user_id: OwnedUserId,
+    /// The account the room is read for: an agent's profile avatar is
+    /// served for it (story 100.4).
+    account_id: String,
     /// The newest answer anchor by origin time: `(ms, render key)`.
     newest_turn: Option<(u64, String)>,
     sent: Option<AgentRoomHeaderVm>,
@@ -822,6 +825,7 @@ impl AgentHeader {
             .reader
             .header(
                 &self.icons,
+                &self.account_id,
                 self.newest_turn.as_ref().map(|(_, key)| key.as_str()),
                 peer.as_deref(),
             )
@@ -1148,6 +1152,7 @@ pub async fn forward_timeline(
             let mut header = AgentHeader {
                 reader,
                 own_user_id: own_user_id.clone(),
+                account_id: account_id.clone(),
                 newest_turn: None,
                 sent: None,
                 kinds,

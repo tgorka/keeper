@@ -22,6 +22,7 @@
 //!
 //! Every row below carries the source it was read from.
 
+use crate::bots::chat::Effort;
 use crate::bots::ProviderKind;
 
 /// A three-valued answer, because two values would force a lie.
@@ -223,6 +224,24 @@ pub struct Quirks {
     /// * OpenAi — **No**. Chat Completions is stateless; the conversation is
     ///   the request's `messages`.
     pub server_sessions: Support,
+
+    /// The reasoning levels this kind is sent as `reasoning_effort` (R382);
+    /// empty when keeper sends it none, and an agent naming a level is then
+    /// refused at load rather than sent a field the endpoint drops.
+    ///
+    /// * OpenAi — all four. `reasoning_effort` is OpenAI's own Chat
+    ///   Completions field, and CLIProxyAPI answered `xhigh` with
+    ///   `reasoning_content` on 2026-10-14 (epic 100's probe;
+    ///   `tests/bots_openai_live.rs`).
+    /// * Ollama — `low`, `medium`, `high`. Its OpenAI-compatibility matrix
+    ///   lists `reasoning_effort` on `/v1/chat/completions`, and the native
+    ///   `think` field does not work on that door (ollama/ollama#14820);
+    ///   `xhigh` is not a level Ollama documents — it is aliased to another
+    ///   per model — so the level keeper would log is not the one that ran.
+    /// * Hermes — none. Its documented knob is
+    ///   `model_options.reasoning_effort` (research §2.4), which this wire
+    ///   does not send (R382).
+    pub efforts: &'static [Effort],
 }
 
 /// The divergence table, keyed by provider kind.
@@ -243,6 +262,7 @@ pub const fn quirks(kind: ProviderKind) -> Quirks {
             keepalive_secs: Some(30),
             named_events: Support::Yes,
             server_sessions: Support::Unknown,
+            efforts: &[],
         },
         ProviderKind::Ollama => Quirks {
             embeddings: Support::Yes,
@@ -256,6 +276,7 @@ pub const fn quirks(kind: ProviderKind) -> Quirks {
             keepalive_secs: None,
             named_events: Support::No,
             server_sessions: Support::No,
+            efforts: &[Effort::Low, Effort::Medium, Effort::High],
         },
         // A gateway in front of other providers (CLIProxyAPI, research §11.1).
         ProviderKind::OpenAi => Quirks {
@@ -270,6 +291,7 @@ pub const fn quirks(kind: ProviderKind) -> Quirks {
             keepalive_secs: None,
             named_events: Support::No,
             server_sessions: Support::No,
+            efforts: &Effort::ALL,
         },
     }
 }

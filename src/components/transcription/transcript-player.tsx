@@ -56,6 +56,7 @@ import { Button } from "@/components/ui/button";
 import { Toggle } from "@/components/ui/toggle";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { HoverHint, IconHint } from "@/components/ui/tooltip";
+import { logFailure } from "@/lib/failure";
 import type { MediaRef, TranscriptMediaVm } from "@/lib/ipc/client";
 import { fileAssetUrl } from "@/lib/viewers/file-asset-url";
 import { locate, sessionLength } from "./session-timeline";
@@ -283,9 +284,10 @@ export function TranscriptPlayer({
 
   const start = useCallback((element: HTMLMediaElement) => {
     setRefused(null);
-    void Promise.resolve(element.play()).catch((cause: unknown) =>
-      setRefused(cause instanceof Error ? cause.message : String(cause)),
-    );
+    void Promise.resolve(element.play()).catch((cause: unknown) => {
+      logFailure("transcript.play")(cause);
+      setRefused(cause instanceof Error ? cause.message : String(cause));
+    });
   }, []);
 
   const applySound = useCallback(
@@ -365,7 +367,10 @@ export function TranscriptPlayer({
     onPlay: (event: React.SyntheticEvent<HTMLMediaElement>) => {
       if (event.currentTarget !== main.current) return;
       setPlaying(true);
-      if (camera.current) void Promise.resolve(camera.current.play()).catch(() => {});
+      // The camera only follows the main track; a refused play leaves the
+      // picture still while the sound goes on, which is only worth a log line.
+      if (camera.current)
+        void Promise.resolve(camera.current.play()).catch(logFailure("transcript.cameraPlay"));
     },
     onPause: (event: React.SyntheticEvent<HTMLMediaElement>) => {
       if (event.currentTarget !== main.current) return;
@@ -406,7 +411,9 @@ export function TranscriptPlayer({
                 if (!leader) return;
                 event.currentTarget.currentTime = leader.currentTime;
                 if (!leader.paused)
-                  void Promise.resolve(event.currentTarget.play()).catch(() => {});
+                  void Promise.resolve(event.currentTarget.play()).catch(
+                    logFailure("transcript.cameraPlay"),
+                  );
               }}
             />
           )}

@@ -14,6 +14,7 @@
  * what arrived.
  */
 import { Button } from "@/components/ui/button";
+import { logFailure } from "@/lib/failure";
 import { notesMarkRead } from "@/lib/ipc/client";
 import {
   acceptPending,
@@ -40,11 +41,10 @@ function acceptAndAcknowledge(vaultId: string, noteId: string): void {
   if (pending === null) {
     return;
   }
-  notesMarkRead(vaultId, noteId, pending.rev).catch(() => {
-    // The mark stays set. That is the honest outcome: the user has read the
-    // change, but keeper could not record that it had, and a mark that lingers
-    // costs a second look while a mark wrongly cleared costs the review.
-  });
+  // The mark stays set. That is the honest outcome: the user has read the
+  // change, but keeper could not record that it had, and a mark that lingers
+  // costs a second look while a mark wrongly cleared costs the review.
+  notesMarkRead(vaultId, noteId, pending.rev).catch(logFailure("notes.markRead"));
 }
 
 export interface NoteDiffBarProps {

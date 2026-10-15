@@ -33,6 +33,7 @@
  * failing: no such profile, the drive was unplugged, the file is gone.
  */
 import { useCallback, useEffect, useRef, useState } from "react";
+import { logFailure } from "@/lib/failure";
 import { type DocumentVm, syncReadDocument } from "@/lib/ipc/client";
 
 export interface UseDocumentFileArgs {
@@ -124,6 +125,7 @@ export function useDocumentFile({
         setLoading(false);
       })
       .catch((rejection: unknown) => {
+        logFailure("viewer.readDocument")(rejection);
         if (generation.current !== mine) {
           return;
         }

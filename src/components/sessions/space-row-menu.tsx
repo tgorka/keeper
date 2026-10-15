@@ -63,6 +63,7 @@ import {
   ContextMenuTrigger,
 } from "@/components/ui/context-menu";
 import { Input } from "@/components/ui/input";
+import { logFailure, sayFailure } from "@/lib/failure";
 import {
   revealPath,
   sessionsFileDelete,
@@ -266,7 +267,10 @@ export function SpaceRowMenu({
     onNotice(null);
     void sessionsFilePath(rootId, subpath)
       .then(use)
-      .catch((raw: unknown) => onNotice(syncErrorMessage(raw, SPACE_ROW_PATH_FAILED)));
+      .catch((raw: unknown) => {
+        logFailure("sessions.filePath")(raw);
+        onNotice(syncErrorMessage(raw, SPACE_ROW_PATH_FAILED));
+      });
   };
 
   /**
@@ -343,7 +347,10 @@ export function SpaceRowMenu({
         });
         onChanged();
       })
-      .catch((raw: unknown) => onNotice(syncErrorMessage(raw, SPACE_ROW_RENAME_FAILED)));
+      .catch((raw: unknown) => {
+        logFailure("sessions.fileRename")(raw);
+        onNotice(syncErrorMessage(raw, SPACE_ROW_RENAME_FAILED));
+      });
   };
 
   const confirmDelete = (): void => {
@@ -353,7 +360,10 @@ export function SpaceRowMenu({
       .then(() => {
         onChanged();
       })
-      .catch((raw: unknown) => onNotice(syncErrorMessage(raw, SPACE_ROW_DELETE_FAILED)));
+      .catch((raw: unknown) => {
+        logFailure("sessions.fileDelete")(raw);
+        onNotice(syncErrorMessage(raw, SPACE_ROW_DELETE_FAILED));
+      });
   };
 
   return (
@@ -380,7 +390,9 @@ export function SpaceRowMenu({
               <ContextMenuSeparator />
               <ContextMenuItem
                 onSelect={() => {
-                  void syncOpenEntry(rootId, subpath).catch(() => undefined);
+                  void syncOpenEntry(rootId, subpath).catch(
+                    sayFailure("sessions.openFile", "keeper couldn't open the file."),
+                  );
                 }}
               >
                 {SPACE_ROW_OPEN_LABEL}
@@ -391,7 +403,9 @@ export function SpaceRowMenu({
             <ContextMenuItem
               onSelect={() =>
                 withPath((absolutePath) => {
-                  void revealPath(absolutePath).catch(() => undefined);
+                  void revealPath(absolutePath).catch(
+                    sayFailure("sessions.revealFile", "keeper couldn't show the file."),
+                  );
                 })
               }
             >
@@ -401,10 +415,11 @@ export function SpaceRowMenu({
           <ContextMenuItem
             onSelect={() =>
               withPath((absolutePath) => {
-                // Best effort, exactly as the Files pane's is: a clipboard the
-                // webview refuses is not worth a sentence, and the path is one
-                // press from being on screen either way.
-                void navigator.clipboard?.writeText(absolutePath).catch(() => undefined);
+                // The person asked for the path on the clipboard; a clipboard
+                // the webview refuses is said, not left for them to discover.
+                void navigator.clipboard
+                  ?.writeText(absolutePath)
+                  .catch(sayFailure("sessions.copyPath", "keeper couldn't copy the path."));
               })
             }
           >

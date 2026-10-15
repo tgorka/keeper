@@ -2,6 +2,7 @@ import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { logFailure } from "@/lib/failure";
 import {
   type SyncProfileVm,
   syncProfiles,
@@ -36,6 +37,7 @@ export function TasksSection({ open }: { open: boolean }) {
         setTasks(listing.tasks.filter((task) => task.kind === "copy"));
       })
       .catch((cause: unknown) => {
+        logFailure("tasks.ledgerRead")(cause);
         if (mine === generation.current) setError(syncErrorMessage(cause));
       })
       .finally(() => {
@@ -62,6 +64,7 @@ export function TasksSection({ open }: { open: boolean }) {
       setSubfolder(next.subfolder);
       setTasks(listing.tasks.filter((task) => task.kind === "copy"));
     } catch (cause) {
+      logFailure("tasks.ledgerSet")(cause);
       if (mine === generation.current) setError(syncErrorMessage(cause));
     } finally {
       if (mine === generation.current) setBusy(false);

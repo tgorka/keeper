@@ -422,8 +422,15 @@ whenever Settings opens.
 - **Other desktops** (Linux, Windows) open the default browser and receive the callback
   through the `keeper://` link.
 
-*Cancel*, in keeper or in the sign-in window, ends the attempt as cancelled, not failed. An
-abandoned sign-in ends by itself after five minutes.
+*Cancel*, in keeper or in the sign-in window, ends the attempt as cancelled, not failed: the
+setup sheet says the sign-in was closed and nothing was set up (or, for an account already
+signed in on this device, that it stays as it was — never "Up to date"). Connecting an `oauth`
+repository that fails after the identity sign-in is said as that failure, not as "Reconnect". Every other ending is a
+problem said as an alert where you are looking, and a `WARN` line in `keeper.log`
+(Epic 100): the identity provider refusing you (`access_denied`, with its own reason when it
+gives one — "*host* refused to sign you in to *account*: …"), the sign-in timing out (an
+abandoned sign-in ends by itself after five minutes), or the browser round trip breaking.
+See [observability.md](observability.md#the-organisation-account-sign-in).
 
 **What keeper checks.** keeper checks every sign-in as a public native client must:
 - a fresh `state`, `nonce` and PKCE S256 verifier per attempt, each used once;

@@ -1,10 +1,16 @@
 import { useEffect, useRef } from "react";
-import { type TelemetryEventReq, telemetryCapture } from "@/lib/ipc/client";
+import { logFailure } from "@/lib/failure";
+import { type TelemetryEventReq, type TelemetrySurface, telemetryCapture } from "@/lib/ipc/client";
 
-/** No payload, DOM, account context, or exception can cross this boundary. Rust enforces consent. */
+/**
+ * No payload, DOM, account context, or exception can cross this boundary. Rust enforces consent.
+ * `surface` names a declared `keeper_interaction` surface (a closed set, Epic 100) and is only
+ * accepted with `kind: "interaction"`.
+ */
 export async function captureTelemetry(
   kind: TelemetryEventReq["kind"],
   durationMs: number | null = null,
+  surface: TelemetrySurface | null = null,
 ): Promise<void> {
   try {
     await telemetryCapture({
@@ -13,10 +19,25 @@ export async function captureTelemetry(
         durationMs !== null && Number.isFinite(durationMs)
           ? Math.min(60_000, Math.max(0, Math.round(durationMs)))
           : null,
+      ...(surface === null ? {} : { surface }),
     });
-  } catch {
-    // Observability is never on the critical path, including when the IPC service is absent.
+  } catch (error) {
+    // Observability is never on the critical path, including when the IPC service is absent:
+    // a refused capture is a log line, never a sentence.
+    logFailure("telemetry.capture")(error);
   }
+}
+
+/**
+ * Count one use of a declared epic-100 surface — the slash menu opened or a command chosen
+ * from it, keeper opening on the default agent — as a `keeper_interaction` carrying only that
+ * closed name (R381). Never pass anything typed, a room or an agent.
+ */
+export function captureSurface(
+  surface: TelemetrySurface,
+  durationMs: number | null = null,
+): Promise<void> {
+  return captureTelemetry("interaction", durationMs, surface);
 }
 
 /** Time from navigation to the first painted non-splash UI, not Matrix sync or web vitals. */

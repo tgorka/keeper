@@ -11,6 +11,7 @@
  * bridge is inert.
  */
 import { useEffect } from "react";
+import { logFailure, sayFailure } from "@/lib/failure";
 import { listenPushOpen, pushOpenTake } from "@/lib/ipc/client";
 import { primaryViewStore } from "@/lib/stores/primary-view";
 import { roomsStore } from "@/lib/stores/rooms";
@@ -29,9 +30,8 @@ export function usePushOpen(): void {
     let unlisten: (() => void) | undefined;
     let cancelled = false;
     const open = () => {
-      openWaiting().catch(() => {
-        // No Tauri host — nothing waits.
-      });
+      // A tapped push that opens nothing is a tap the person has to hear about.
+      openWaiting().catch(sayFailure("push.open", "keeper couldn't open the session."));
     };
     try {
       open();
@@ -43,9 +43,8 @@ export function usePushOpen(): void {
             unlisten = fn;
           }
         })
-        .catch(() => {
-          // No Tauri host — the bridge is inert in this environment.
-        });
+        // No Tauri host — the bridge is inert in this environment.
+        .catch(logFailure("push.listenOpen"));
     } catch {
       // `listen` can throw synchronously when the Tauri IPC internals are absent.
     }

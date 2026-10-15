@@ -37,7 +37,7 @@
     {
       "name": "keeper_interaction",
       "category": "diagnostics",
-      "description": "Bounded interaction duration; no target text or input values."
+      "description": "Bounded interaction duration; no target text or input values. An optional closed surface property is one of slash_menu_opened, slash_menu_chosen or launch_default_agent (Epic 100); never a command, argument, room or agent."
     }
   ],
   "remoteConfig": {

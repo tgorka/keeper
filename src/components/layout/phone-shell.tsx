@@ -106,6 +106,7 @@ import { useReducedMotion } from "@/hooks/use-reduced-motion";
 import { useShellLayout } from "@/hooks/use-shell-layout";
 import { useStaleResumePill } from "@/hooks/use-stale-resume-pill";
 import { useSurfaceStore } from "@/lib/agents/surface";
+import { logFailure } from "@/lib/failure";
 import { syncNow } from "@/lib/ipc/client";
 import { type PhoneSurface, phoneSurfaceFor } from "@/lib/phone-surfaces";
 import { accountStatusStore, useShellOffline } from "@/lib/stores/account-status";
@@ -718,7 +719,10 @@ export function PhoneShell() {
       // re-arming the spinner timeout while a refresh is already in flight.
       if (!refreshing) {
         setRefreshing(true);
-        void syncNow().catch(() => setRefreshing(false));
+        void syncNow().catch((raw: unknown) => {
+          logFailure("phone.pullRefresh")(raw);
+          setRefreshing(false);
+        });
       }
       return;
     }

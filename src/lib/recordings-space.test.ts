@@ -2,6 +2,7 @@ import { act, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/lib/ipc/client", () => ({
+  frontendErrorReport: vi.fn(async () => {}),
   notesSpaces: vi.fn(),
   notesSpaceTouch: vi.fn(),
   notesSpacePark: vi.fn(),

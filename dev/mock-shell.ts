@@ -62,15 +62,21 @@ import type {
   AgentMcpListVm,
   AgentMcpServerReq,
   AgentMcpServerVm,
+  AgentModelBotVm,
+  AgentModelLineVm,
+  AgentModelReq,
+  AgentModelVm,
   AgentPersonVm,
   AgentPinVm,
   AgentRoomHeaderVm,
   AgentSandboxReq,
   AgentSandboxVm,
+  AgentSeedBotVm,
   AgentSeedOfferVm,
   AgentSeedPlanVm,
   AgentSeedReq,
   AgentSeedResultVm,
+  AgentsLaunchVm,
   ApprovalCardVm,
   ApprovalDecideReq,
   ApprovalPayloadVm,
@@ -95,12 +101,17 @@ import type {
   CapabilitiesVm,
   CardAgentVm,
   CardKeyVm,
+  ChatCommandPreviewVm,
+  ChatCommandRowVm,
   ChoiceVm,
   CopyJobVm,
   CredentialChoicesVm,
   DeviceCodeVm,
   DocumentVm,
   DriveFolderVm,
+  Effort,
+  FailureOperation,
+  FailureStateVm,
   FileSizeVm,
   FilesEntrySyncVm,
   FilesEntryVm,
@@ -173,6 +184,10 @@ import { platformStore } from "@/lib/stores/platform";
 // docs rather than holding a third copy.
 import ANDROID_DOC from "../docs/android.md?raw";
 import IOS_DOC from "../docs/ios.md?raw";
+// Nixi's picture (story 100.4): an SVG from her home, served by Vite here as
+// keeper-file:// serves it in the app — an `<img>` source, never inlined. The
+// other agents have none and keep their letter.
+import NIXI_AVATAR from "./agent-avatar-nixi.svg?url";
 import {
   MEDIA_BLOCK_FRONTMATTER,
   MEDIA_BLOCK_NOTES,
@@ -4257,6 +4272,253 @@ interface MockChannel<T> {
   onmessage?: (message: T) => void;
 }
 
+/**
+ * The dev shell's answer to `chat_command_preview` (Story 100.5).
+ *
+ * **A fake, as crude as `mockCommandPreview` and for the same reason**: the
+ * registry, the room sets, the power-level reasons and every sentence live in
+ * `keeper_core::chat::commands`; this only draws each shape once. A room the
+ * harness lists as an agent's gets the agent set (the Nixi DM also `/new`);
+ * every other room gets the chat set. `?slash=readonly` answers as a room whose
+ * power levels allow neither a topic nor an invite, so the reasons show.
+ * `/invite @refused:example.org` is refused by the fake server
+ * (`room_invite`), so the failure sentence shows too.
+ */
+/** Every message the composer sent, in order — read back by the browser proof. */
+const mockSends: Array<{ kind: string; body: string; line: string | null }> = [];
+(window as unknown as { __keeperMockSends: typeof mockSends }).__keeperMockSends = mockSends;
+
+/** Every room `/leave` left, as `accountId roomId` — read back by the browser proof. */
+const mockLeaves: string[] = [];
+(window as unknown as { __keeperMockLeaves: typeof mockLeaves }).__keeperMockLeaves = mockLeaves;
+
+function recordSend(kind: string, payload: Record<string, unknown>): null {
+  mockSends.push({
+    kind,
+    body: String(payload.body ?? ""),
+    line: payload.line == null ? null : String(payload.line),
+  });
+  return null;
+}
+
+function mockChatCommandPreview(payload: Record<string, unknown>): ChatCommandPreviewVm {
+  const draft = String(payload.draft ?? "");
+  const roomId = String(payload.roomId ?? "");
+  const replying = payload.replying === true;
+  const readonly = new URLSearchParams(window.location.search).get("slash") === "readonly";
+  const agentRoom = roomId in AGENT_ROOM_TIMELINES || roomId === DM_ROOM;
+  const escapeHint =
+    "To send a message that starts with a slash, double it: //etc sends /etc as text.";
+  type Spec = [string, string[], string, ChatCommandRowVm["args"], string | null, string | null];
+  const chatSet: Spec[] = [
+    [
+      "me",
+      ["emote"],
+      'Send the text as an action, the way "* Ana waves" reads.',
+      "required",
+      "what you do",
+      replying
+        ? "An action is sent as its own message, not as a reply. Cancel the reply first."
+        : null,
+    ],
+    [
+      "shrug",
+      [],
+      "Send ¯\\_(ツ)_/¯, before your text if you add some.",
+      "optionalRest",
+      "text",
+      null,
+    ],
+    [
+      "plain",
+      [],
+      "Send the text exactly as typed, even when it looks like a command.",
+      "required",
+      "text",
+      null,
+    ],
+    [
+      "topic",
+      [],
+      "Change this room's topic for everyone in it.",
+      "required",
+      "the new topic",
+      readonly ? "Your power level in this room does not let you change its topic." : null,
+    ],
+    [
+      "invite",
+      [],
+      "Invite someone to this room by their Matrix id.",
+      "required",
+      "@name:server",
+      readonly ? "Your power level in this room does not let you invite people." : null,
+    ],
+    ["leave", ["part"], "Leave this room, after you confirm.", "none", null, null],
+  ];
+  const agentSet: Spec[] =
+    roomId === DM_ROOM
+      ? [
+          [
+            "new",
+            ["conversation"],
+            "Ask your agent for a new conversation, with an optional title.",
+            "optionalRest",
+            "a title",
+            null,
+          ],
+          // DW-1431: `?slash=away` answers as a device without Nixi's home.
+          [
+            "model",
+            [],
+            "Say which model and reasoning level your agent runs on, or change them.",
+            "optionalRest",
+            "a bot, a level",
+            new URLSearchParams(window.location.search).get("slash") === "away"
+              ? "Your agent's home is not on this device, so its model is changed where its drive is: type /model there, or use Settings › Agents on that Mac."
+              : null,
+          ],
+        ]
+      : [];
+  const help: Spec = [
+    "help",
+    ["h", "commands"],
+    "List the commands this room offers.",
+    "none",
+    null,
+    null,
+  ];
+  const registry: ChatCommandRowVm[] = [...(agentRoom ? agentSet : chatSet), help].map(
+    ([name, aliases, description, args, argHint, reason]) => ({
+      name,
+      aliases,
+      description,
+      args,
+      argHint,
+      available: reason === null,
+      reason,
+    }),
+  );
+  const line = draft.startsWith("/") && !draft.startsWith("//") && !draft.includes("\n");
+  if (line && new TextEncoder().encode(draft).length > 512) {
+    return {
+      draft,
+      verdict: {
+        kind: "refusal",
+        message:
+          "That line is too long for a command, so nothing was sent. Shorten it, or start it with // to send it as a message.",
+      },
+      rows: [],
+      escapeHint,
+    };
+  }
+  if (!line) {
+    const text = draft.startsWith("//") ? draft.slice(1) : draft;
+    return { draft, verdict: { kind: "text", text }, rows: [], escapeHint };
+  }
+  const token = draft.slice(1).split(/\s/, 1)[0]?.toLowerCase() ?? "";
+  const args = draft.slice(1 + token.length).trim();
+  const spelled = (row: ChatCommandRowVm, prefix: boolean) =>
+    [row.name, ...row.aliases].some((name) => (prefix ? name.startsWith(token) : name === token));
+  const exact = registry.find((row) => spelled(row, false));
+  const rows = exact !== undefined ? [exact] : registry.filter((row) => spelled(row, true));
+  if (token === "") {
+    return { draft, verdict: { kind: "text", text: draft }, rows, escapeHint };
+  }
+  const spec = rows[0];
+  if (spec === undefined) {
+    return {
+      draft,
+      verdict: {
+        kind: "refusal",
+        message: `keeper has no /${token} command. Nothing was sent. Type /help for the list. ${escapeHint}`,
+      },
+      rows,
+      escapeHint,
+    };
+  }
+  const refuse = (message: string): ChatCommandPreviewVm => ({
+    draft,
+    verdict: { kind: "refusal", message },
+    rows,
+    escapeHint,
+  });
+  if (spec.reason !== null) {
+    return refuse(`/${spec.name} — ${spec.reason}`);
+  }
+  if (spec.args === "required" && args === "") {
+    return refuse(
+      `/${spec.name} needs ${spec.argHint}, so nothing was sent. Type /${spec.name} followed by it.`,
+    );
+  }
+  if (spec.args === "none" && args !== "") {
+    return refuse(
+      `/${spec.name} takes nothing after it, so nothing was sent. Send /${spec.name} on its own.`,
+    );
+  }
+  const verdict: ChatCommandPreviewVm["verdict"] =
+    spec.name === "me"
+      ? { kind: "emote", text: args }
+      : spec.name === "plain"
+        ? { kind: "text", text: args }
+        : spec.name === "shrug"
+          ? { kind: "text", text: args === "" ? "¯\\_(ツ)_/¯" : `¯\\_(ツ)_/¯ ${args}` }
+          : { kind: "command", name: spec.name, args: args === "" ? null : args };
+  return { draft, verdict, rows, escapeHint };
+}
+
+/**
+ * The dev shell's answer to `agent_model_command` (DW-1431): Nixi's row in
+ * Settings › Agents is the agent's `agent.toml`. A crude reading of what
+ * follows `/model` — the last word a level, the rest a bot's name — so the
+ * sentence and the row's change can be seen; the grammar is Rust's
+ * (`keeper_core::agents::model::command`).
+ */
+function mockAgentModelCommand(payload: Record<string, unknown>): Promise<string> {
+  const refuse = (message: string) =>
+    Promise.reject({ code: "internal", message, accountId: null, retriable: false });
+  const row = agentRows.find((one) => one.agent === "nixi");
+  const model = row?.model;
+  if (row === undefined || model == null) {
+    return refuse(
+      "Your agent's home is not on this device, so its model is changed where its drive is: type /model there, or use Settings › Agents on that Mac.",
+    );
+  }
+  const named = (reference: string) =>
+    model.bots.find((bot) => bot.reference === reference)?.name ?? reference;
+  const level = (effort: Effort | null) =>
+    effort === null ? "the provider's own reasoning level" : `reasoning level ${effort}`;
+  const args = typeof payload.args === "string" ? payload.args.trim() : "";
+  if (args === "") {
+    return later(150, () => `Nixi runs on ${named(model.bot)} at ${level(model.effort)}.`);
+  }
+  const words = args.split(/\s+/);
+  const last = (words[words.length - 1] ?? "").toLowerCase();
+  const levels = ["low", "medium", "high", "xhigh"];
+  const leveled = levels.includes(last) || last === "default";
+  const effort: Effort | null = leveled
+    ? last === "default"
+      ? null
+      : (last as Effort)
+    : model.effort;
+  const botName = (leveled ? words.slice(0, -1) : words).join(" ");
+  const bot =
+    botName === ""
+      ? model.bot
+      : model.bots.find((one) => one.name.toLowerCase() === botName.toLowerCase())?.reference;
+  if (bot === undefined) {
+    return refuse(
+      `Nixi cannot run on "${botName}": it can run on ${model.bots.map((one) => one.name).join(", ")}. Nothing was changed.`,
+    );
+  }
+  agentRows = agentRows.map((one) =>
+    one === row ? { ...one, model: { ...model, bot, effort } } : one,
+  );
+  return later(
+    200,
+    () => `Nixi now runs on ${named(bot)} at ${level(effort)}, from its next turn.`,
+  );
+}
+
 /** Which fake streams are running, so `bots_chat_stop` can stop one. */
 const BOT_LIVE_STREAMS = new Map<string, () => void>();
 
@@ -4743,6 +5005,12 @@ const copyJobs = new Map<string, CopyJobVm>();
 // through "Finish signing in…" (with Cancel sign-in) and the sync — and the
 // word `refuse` anywhere in it answers Rust's refusal instead, and the word
 // `registered` answers a device the repository already knows (UX-DR119).
+// The word `denied` walks the sign-in to the identity provider's refusal
+// (`access_denied`, Epic 100, R381): the sheet and Settings › Account then
+// show Rust's problem sentence as an alert. The word `forge` walks it to a
+// repository connection that failed after the identity sign-in (R387), the
+// same way. Cancel sign-in during a re-setup of `?account=ready` keeps the
+// account up to date and ends the attempt `closed` (R387).
 //
 // Every answer is what Rust would answer, sentences included (`state.rs`
 // `compose`), and every snapshot carries the next `revision`, as Rust's do. An
@@ -4760,6 +5028,8 @@ const NO_ACCOUNT_VM: OrgAccountVm = {
   repoMode: null,
   state: "none",
   sentence: null,
+  problem: false,
+  attempt: null,
   identity: null,
   device: null,
   devices: [],
@@ -4885,6 +5155,10 @@ function signedInAccount(state: AccountStateVm, device = ACCOUNT_THIS_DEVICE): O
     repoMode: "same",
     state,
     sentence: sentences[state] ?? null,
+    // Rust's `problem`: a policy stop and a dead grant are problems; offline
+    // with settings in hand, and the signed-out instruction, are not.
+    problem: state === "blocked" || state === "needsSignIn",
+    attempt: null,
     identity: signedOut
       ? null
       : {
@@ -5049,25 +5323,71 @@ function matrixSignedIn(
  * first, the signed-out state the confirm resolves with (it resolves, it does
  * not reject). The pauses are only long enough to see each state.
  */
-function accountSignInFlow(device: AccountDeviceVm): Promise<OrgAccountVm> {
+/** What Rust composes when the identity provider answers `access_denied` (R381). */
+function deniedAccount(): OrgAccountVm {
+  return {
+    ...signedInAccount("signedOut"),
+    state: "blocked",
+    sentence:
+      "id.acme.dev refused to sign you in to Acme: User is not allowed to use this project.",
+    problem: true,
+    attempt: "failed",
+  };
+}
+
+/**
+ * What Rust composes when the identity sign-in worked but connecting the `oauth`
+ * repository failed — its sign-in page did not open (R387): the failure, as a
+ * problem, never the neutral "Reconnect the repository".
+ */
+function forgeFailedAccount(device: AccountDeviceVm): OrgAccountVm {
+  return {
+    ...signedInAccount("needsSignIn", device),
+    repoMode: "oauth",
+    forgeConnected: false,
+    sentence:
+      "Connecting Acme's repository failed (keeper could not open the repository's sign-in page). Sign in again.",
+    problem: true,
+    attempt: "failed",
+  };
+}
+
+/** How a mock sign-in ends: Rust's `denied` refusal, a failed repository connection, or set up. */
+type MockSignInEnd = "denied" | "forgeFailed" | "done";
+
+function accountSignInFlow(
+  device: AccountDeviceVm,
+  end: MockSignInEnd = "done",
+): Promise<OrgAccountVm> {
   // The project's `lib` predates `Promise.withResolvers`.
   let resolve: (vm: OrgAccountVm) => void = () => {};
   const promise = new Promise<OrgAccountVm>((settle) => {
     resolve = settle;
   });
-  setAccount(signedInAccount("signingIn", device));
+  // An account already signed in here keeps its identity when a re-setup is
+  // closed: Rust's state still reads up to date; only `attempt` says closed.
+  const before = accountVm.identity !== null ? signedInAccount("ready", device) : null;
+  setAccount({ ...signedInAccount("signingIn", device), attempt: "running" });
   const signIn = setTimeout(() => {
     accountSignInCancel = null;
-    setAccount(signedInAccount("syncing", device));
+    if (end === "denied") {
+      resolve(setAccount(deniedAccount()));
+      return;
+    }
+    if (end === "forgeFailed") {
+      resolve(setAccount(forgeFailedAccount(device)));
+      return;
+    }
+    setAccount({ ...signedInAccount("syncing", device), attempt: "running" });
     setTimeout(() => {
       accountLastAttemptMs = Date.now();
-      resolve(setAccount(signedInAccount("ready", device)));
+      resolve(setAccount({ ...signedInAccount("ready", device), attempt: "done" }));
     }, 1000);
   }, 2500);
   accountSignInCancel = () => {
     clearTimeout(signIn);
     accountSignInCancel = null;
-    resolve(setAccount(signedInAccount("signedOut", device)));
+    resolve(setAccount({ ...(before ?? signedInAccount("signedOut", device)), attempt: "closed" }));
   };
   return promise;
 }
@@ -5483,6 +5803,20 @@ function agentPin(): AgentPinVm {
       ],
     };
   }
+  if (agentsParam === "models") {
+    // A drive that is not local-only, pinned: its agents run on any of the
+    // person's bots (100.2).
+    return {
+      state: "pinned",
+      owner: AGENT_OWNER,
+      readers: AGENT_READERS,
+      localOnly: false,
+      pinnedOwner: AGENT_OWNER,
+      pinnedReaders: AGENT_READERS,
+      pinnedLocalOnly: false,
+      differences: [],
+    };
+  }
   return {
     state: "unpinned",
     owner: AGENT_OWNER,
@@ -5494,7 +5828,73 @@ function agentPin(): AgentPinVm {
     differences: [],
   };
 }
+/**
+ * Each agent's model (story 100.2): the person's bots with the levels Rust
+ * says each kind is sent — every level for an `openai` endpoint, three for
+ * Ollama. A local-only agent is offered only the local bot. `?agents=models`
+ * opens on a drive that is not local-only, where Nixi runs on Opus at xhigh and
+ * Tara on Haiku at high; `?modelsave=fails` refuses a save as a drive the Mac
+ * cannot write would. Every sentence is copied from `keeper_core::agents::model`.
+ */
+const AGENT_BOTS: AgentModelBotVm[] = [
+  {
+    reference: "bot:openai:https://cliproxy.example:8452#claude-opus-5-5",
+    name: "Opus",
+    provider: "CLIProxyAPI",
+    efforts: ["low", "medium", "high", "xhigh"],
+  },
+  {
+    reference: "bot:openai:https://cliproxy.example:8452#claude-haiku-4-5",
+    name: "Haiku",
+    provider: "CLIProxyAPI",
+    efforts: ["low", "medium", "high", "xhigh"],
+  },
+  {
+    reference: "bot:openai:https://cliproxy.example:8452#gpt-6-astra",
+    name: "GPT Astra",
+    provider: "CLIProxyAPI",
+    efforts: ["low", "medium", "high", "xhigh"],
+  },
+  {
+    reference: "bot:ollama:http://electra.example:11434#qwen3:32b",
+    name: "Qwen on electra",
+    provider: "electra",
+    efforts: ["low", "medium", "high"],
+  },
+];
+const MODEL_CHANGED_UNDERNEATH =
+  "This agent's agent.toml names another model than the one shown here: it changed on the drive meanwhile. Look at it again and choose.";
+const modelSaveFails = new URLSearchParams(window.location.search).get("modelsave") === "fails";
+/**
+ * `?botsunread=1`: keeper.db's bots could not be read (R405). Each row offers
+ * its current bot alone with the sentence, and *Set up agents* says it where
+ * the bots would be. Copied from `keeper_core::agents::model::BOTS_UNREAD`.
+ */
+const botsUnread = new URLSearchParams(window.location.search).get("botsunread") !== null;
+const BOTS_UNREAD =
+  "Your bots could not be read on this Mac, so no other bot can be offered here. The reason is in keeper's log; look at Settings › Bots, then open this again.";
+function agentModel(agent: string, localOnly: boolean): AgentModelVm {
+  const local = AGENT_BOTS.filter((bot) => bot.reference.startsWith("bot:ollama:"));
+  const [bot, effort]: [string, Effort | null] = localOnly
+    ? [AGENT_BOTS[3].reference, agent === "nixi" ? "high" : "low"]
+    : agent === "nixi"
+      ? [AGENT_BOTS[0].reference, "xhigh"]
+      : [AGENT_BOTS[1].reference, "high"];
+  if (botsUnread) {
+    const current = AGENT_BOTS.find((one) => one.reference === bot) as AgentModelBotVm;
+    const name = bot.slice(bot.indexOf("#") + 1);
+    return {
+      bot,
+      effort,
+      bots: [{ ...current, name, provider: "" }],
+      locked: null,
+      unread: BOTS_UNREAD,
+    };
+  }
+  return { bot, effort, bots: localOnly ? local : AGENT_BOTS, locked: null, unread: null };
+}
 function agentRow(agent: string, name: string): AgentCopyVm {
+  const pin = agentPin();
   return {
     profileId: "p1",
     drive: "tgdrive",
@@ -5504,9 +5904,40 @@ function agentRow(agent: string, name: string): AgentCopyVm {
     device: null,
     host: "hesperia",
     signedIn: false,
-    pin: agentPin(),
+    pin,
     problem: agentsParam === "differs" ? "tgdrive's agents zone hosts nothing here." : null,
+    model: agentModel(agent, pin.localOnly),
+    // Story 100.4: Tara's home holds a picture keeper does not read.
+    avatarProblem:
+      agent === "tara"
+        ? "Tara's avatar.gif is not a picture keeper reads; name it avatar.svg, avatar.png, avatar.webp, or avatar.jpg."
+        : null,
   };
+}
+/** The header's model line for `agent`'s row (100.2 #7). */
+function agentModelLine(agent: string): AgentModelLineVm | undefined {
+  const model = agentRows.find((row) => row.agent === agent)?.model;
+  if (model == null) return undefined;
+  const bot = model.bots.find((candidate) => candidate.reference === model.bot);
+  return { bot: bot?.name ?? model.bot, effort: model.effort };
+}
+function setAgentModel(req: AgentModelReq): AgentCopyVm[] {
+  const refuse = (message: string) => {
+    throw { code: "internal", message, accountId: null, retriable: false };
+  };
+  const row = agentRows.find((one) => one.profileId === req.profileId && one.agent === req.agent);
+  if (row?.model == null) refuse(`tgdrive has no agent ${req.agent}.`);
+  const model = row?.model as AgentModelVm;
+  if (model.bot !== req.shownBot || model.effort !== req.shownEffort) {
+    refuse(MODEL_CHANGED_UNDERNEATH);
+  }
+  if (modelSaveFails) {
+    refuse("80-agents/nixi/agent.toml could not be written: Read-only file system (os error 30)");
+  }
+  agentRows = agentRows.map((one) =>
+    one === row ? { ...one, model: { ...model, bot: req.bot, effort: req.effort } } : one,
+  );
+  return agentRows;
 }
 const BROKEN_FOLDER: AgentCopyVm = {
   profileId: "p2",
@@ -5519,6 +5950,8 @@ const BROKEN_FOLDER: AgentCopyVm = {
   signedIn: false,
   pin: null,
   problem: "`local_only` in _drive.toml must be true or false, not text.",
+  model: null,
+  avatarProblem: null,
 };
 let agentRows: AgentCopyVm[] =
   agentsParam === "none"
@@ -5534,6 +5967,20 @@ let agentRows: AgentCopyVm[] =
 // p2 is the folder whose `_drive.toml` does not read. No bot is preselected.
 const SEED_NO_BOT = "Name the bot the seeded agents run on: keeper never picks one for them.";
 const SEED_CATALOGUE = ["nixi", "tola-grey", "lucyna-novak"];
+const SEED_BOTS: AgentSeedBotVm[] = [
+  {
+    reference: "bot:openai:https://provider.example:8452/v1#gpt-5",
+    name: "Work model",
+    provider: "Provider",
+    efforts: ["low", "medium", "high", "xhigh"],
+  },
+  {
+    reference: "bot:ollama:http://electra.example:11434#qwen3:32b",
+    name: "Qwen on electra",
+    provider: "electra",
+    efforts: ["low", "medium", "high"],
+  },
+];
 const seedOffer = (): AgentSeedOfferVm => ({
   folders: [
     {
@@ -5575,18 +6022,10 @@ const seedOffer = (): AgentSeedOfferVm => ({
     { id: "tola-grey", name: "Dr Tola Grey", kind: "steward", homeDrive: "tgdrive" },
     { id: "lucyna-novak", name: "Dr Lucyna Novak", kind: "steward", homeDrive: "neuradrive" },
   ],
-  bots: [
-    {
-      reference: "bot:openai:https://provider.example:8452/v1#gpt-5",
-      name: "Work model",
-      provider: "Provider",
-    },
-    {
-      reference: "bot:ollama:http://electra.example:11434#qwen3:32b",
-      name: "Qwen on electra",
-      provider: "electra",
-    },
-  ],
+  bots: botsUnread ? [] : SEED_BOTS,
+  // Rust's `seed::local_choices`: the ones a local-only folder is offered.
+  localBots: botsUnread ? [] : SEED_BOTS.filter((bot) => bot.reference.startsWith("bot:ollama:")),
+  botsUnread: botsUnread ? BOTS_UNREAD : null,
   accounts: [AGENT_OWNER.matrixId],
 });
 const seedFiles = (dir: string): string[] =>
@@ -5952,6 +6391,7 @@ function inboxRow(
   lastMessage: string,
   minutesAgo: number,
   agentRoom?: InboxRoomVm["agentRoom"],
+  agentAvatar?: string,
 ): InboxRoomVm {
   return {
     accountId: MOCK_ACCOUNT_ID,
@@ -5970,12 +6410,20 @@ function inboxRow(
     networkId: null,
     muteState: "none",
     ...(agentRoom ? { agentRoom } : {}),
+    ...(agentAvatar ? { agentAvatar } : {}),
   };
 }
 
 const AGENT_ROOM_ROWS: InboxRoomVm[] = [
-  inboxRow("!nixi-dm:example.org", "Nixi", "…", 1, "proxy"),
-  inboxRow("!nixi-reading:example.org", "Nixi — reading list", "Three left.", 40, "proxy"),
+  inboxRow("!nixi-dm:example.org", "Nixi", "…", 1, "proxy", NIXI_AVATAR),
+  inboxRow(
+    "!nixi-reading:example.org",
+    "Nixi — reading list",
+    "Three left.",
+    40,
+    "proxy",
+    NIXI_AVATAR,
+  ),
   inboxRow(
     "!tola-review:example.org",
     "Dr Tola Grey — review",
@@ -6046,9 +6494,11 @@ function nixiHeader(run: "running" | "done", caretKey: string | null): AgentRoom
       agent: NIXI,
       agentName: "Nixi",
       handle: "nixi@electra",
-      // Nixi's zone is on this (desktop) device: her soul's mark. The other
-      // rooms carry none, as on the phone, and draw the handle's first letter.
+      // Nixi's zone is on this (desktop) device: her soul's mark, and her
+      // home's picture drawn over it (story 100.4). The other rooms carry
+      // none, as on the phone, and draw the handle's first letter.
       icon: "N",
+      avatar: NIXI_AVATAR,
       host: "electra",
       title: "Nixi",
       kind: "main",
@@ -6091,6 +6541,7 @@ const AGENT_ROOM_TIMELINES: Record<
         agent: NIXI,
         agentName: "Nixi",
         handle: "nixi@hesperia",
+        avatar: NIXI_AVATAR,
         host: "hesperia",
         title: "Reading list",
         kind: "conversation",
@@ -7013,6 +7464,14 @@ function mockApprovalDecide(payload: Record<string, unknown>): Promise<null> {
 const OWN_FINGERPRINT = "nKr8 3Ffq Wd9u Lx2T b7Qe Rm4Z sV1c Ah6P yJ0o Gk5N tX3i";
 
 /** Nixi's answer as it grows: each step is one `set` op on the anchor. */
+/**
+ * `?levelrefused=1`: Nixi's provider refuses the level she was sent (R405), so
+ * her turn ends with Rust's sentence instead of an answer. Copied from
+ * `keeper_core::agents::model::level_refused`.
+ */
+const levelRefused = new URLSearchParams(window.location.search).get("levelrefused") !== null;
+const LEVEL_REFUSED =
+  "Nixi's bot claude-opus-5-5 does not accept reasoning level xhigh. Choose another level, or none, for Nixi in Settings › Agents.";
 const NIXI_ANSWER_STEPS = [
   "Synapse",
   "Synapse accepted an encrypted final edit",
@@ -7023,6 +7482,17 @@ const NIXI_ANSWER_STEPS = [
 /** The running fake streams, by subscription id, so unsubscribe stops one. */
 const TIMELINE_STREAMS = new Map<number, ReturnType<typeof setInterval>>();
 let nextTimelineSubscription = 1;
+
+/**
+ * Nixi's header names her model where her home is on this device (100.2 #7):
+ * her Settings › Agents row's bot and level as they read when the room opens,
+ * so a save there shows the next time the room is opened.
+ */
+function withModelLine(header: AgentRoomHeaderVm): AgentRoomHeaderVm {
+  if (header.status?.agent !== NIXI) return header;
+  const model = agentModelLine("nixi");
+  return model === undefined ? header : { ...header, status: { ...header.status, model } };
+}
 
 function subscribeMockTimeline(payload: Record<string, unknown>): number {
   const channel = payload.channel as MockChannel<TimelineBatch>;
@@ -7042,7 +7512,7 @@ function subscribeMockTimeline(payload: Record<string, unknown>): number {
   }
   channel.onmessage?.({
     ops: [{ op: "reset", items: agent.items }],
-    header: agent.header,
+    header: withModelLine(agent.header),
     ...(roomId === APPROVAL_ROOM && mockApprovals.length > 0 ? { approvals: mockApprovals } : {}),
     ...(roomId === GATE_ROOM && gateApprovals.length > 0 ? { approvals: gateApprovals } : {}),
     ...(agent.heard ? { heard: agent.heard } : {}),
@@ -7052,13 +7522,14 @@ function subscribeMockTimeline(payload: Record<string, unknown>): number {
     return id;
   }
   let step = 0;
+  const steps = levelRefused ? [LEVEL_REFUSED] : NIXI_ANSWER_STEPS;
   const timer = setInterval(() => {
-    const body = NIXI_ANSWER_STEPS[step];
-    const last = step === NIXI_ANSWER_STEPS.length - 1;
+    const body = steps[step];
+    const last = step === steps.length - 1;
     const item = { ...textItem("nixi-answer", NIXI, "Nixi", body, 1) };
     channel.onmessage?.({
       ops: [{ op: "set", index: 1, item }],
-      ...(last ? { header: nixiHeader("done", null) } : {}),
+      ...(last ? { header: withModelLine(nixiHeader("done", null)) } : {}),
     });
     step += 1;
     if (last) {
@@ -7068,6 +7539,152 @@ function subscribeMockTimeline(payload: Record<string, unknown>): number {
   }, 900);
   TIMELINE_STREAMS.set(id, timer);
   return id;
+}
+
+// ---------------------------------------------------------------------------
+// What opens at launch (story 100.3, R383). Rust's `agents::launch::choose`,
+// mirrored over the harness's rooms: with agent rooms the Agents window, on
+// the default agent's `main` room when it has one. `?launch=default` makes
+// Nixi the default (her DM opens and is focused); `?launch=gone` names an
+// agent with no room here (Agents opens with nothing selected, the launch's
+// notice and Settings › Agents say why); `?launch=rotted` holds a value that
+// is not a user id; `?launch=none` streams no agent rooms (the Inbox, as
+// before); `?launch=failset` refuses every save the way a locked settings
+// table does. Absent: no default yet — Agents opens with nothing selected.
+//
+// R397: Rust answers the launch only when the accounts have synced or the
+// default's room is here. `?launch=late` makes Nixi the default and holds her
+// DM back: the Agents window's first batch lacks it, it arrives
+// `LATE_ROOM_MS` later, and only then does the launch answer — on it.
+// `?launch=lost` never brings it: the launch answers at the (shortened) bound
+// saying the conversation has not arrived yet. `?launch=file` has a settings
+// file set the default to Nixi: Settings and the room header say so and name
+// the file, and a choice made here is stored but does not change what opens.
+// `?launch=long` names an agent with no room here whose id is long enough to
+// wrap on the phone. `?launch=unseen` stops waiting before any room was seen:
+// the Inbox stays open and a notice says the conversation has not arrived.
+// ---------------------------------------------------------------------------
+
+const launchParam = new URLSearchParams(window.location.search).get("launch");
+let defaultAgent: string | null =
+  launchParam === "default" ||
+  launchParam === "late" ||
+  launchParam === "lost" ||
+  launchParam === "unseen"
+    ? NIXI
+    : launchParam === "gone"
+      ? "@tala:example.org"
+      : launchParam === "rotted"
+        ? "nixi"
+        : launchParam === "long"
+          ? "@an-agent-whose-matrix-id-is-far-too-long-to-fit:a.very.long.homeserver.example.org"
+          : null;
+/** `?launch=file`: the value a settings file gives `agents.default`. */
+const FILE_DEFAULT: string | null = launchParam === "file" ? NIXI : null;
+const FILE_PATH = "/Users/you/Library/Application Support/keeper/keeper.toml";
+/** `?launch=late`: when Nixi's DM arrives. `?launch=lost`: the bound (Rust's is 15 s). */
+const LATE_ROOM_MS = 2_500;
+const LOST_BOUND_MS = 4_000;
+let nixiDmHere = launchParam !== "late" && launchParam !== "lost";
+
+function mockAgentsLaunch(): AgentsLaunchVm {
+  const mains = proxyRooms.filter(
+    (room) => room.kind === "main" && (nixiDmHere || room.roomId !== DM_ROOM),
+  );
+  const choices = mains
+    .map((room) => ({ agent: room.agent, name: room.name }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+  // What keeper reads: a settings file's value shadows the stored one.
+  const effective = FILE_DEFAULT ?? defaultAgent;
+  const fileSet =
+    FILE_DEFAULT === null
+      ? null
+      : `${FILE_PATH} (user) sets agents.default to ${FILE_DEFAULT}, so ${FILE_DEFAULT} opens at launch whatever you choose here. Your choice is kept and takes effect once that file stops setting it.`;
+  const base = {
+    room: null,
+    defaultAgent: effective,
+    reason: null,
+    announce: false,
+    choices,
+    fileSet,
+  };
+  if (launchParam === "unseen") {
+    return {
+      ...base,
+      view: "inbox",
+      reason: `Your conversation with your default agent ${effective} has not arrived yet, so keeper opens the Inbox. It is in Agents once it arrives.`,
+      announce: true,
+    };
+  }
+  if (launchParam === "none") {
+    return {
+      ...base,
+      view: "inbox",
+      reason:
+        effective === null
+          ? null
+          : "You have no agent rooms on this device yet, so keeper opens the Inbox.",
+    };
+  }
+  if (effective === null) {
+    return { ...base, view: "agents" };
+  }
+  if (!/^@[^:]+:.+$/.test(effective)) {
+    return {
+      ...base,
+      view: "agents",
+      reason: `The default agent is set to "${effective}", which is not a Matrix user id, so Agents opens with nothing selected. Choose the default agent again.`,
+      announce: true,
+    };
+  }
+  const main = mains.find((room) => room.agent === effective);
+  return main === undefined
+    ? {
+        ...base,
+        view: "agents",
+        reason: !nixiDmHere
+          ? `Your conversation with your default agent ${effective} has not arrived yet, so Agents opens with nothing selected. It is in Agents once it arrives.`
+          : `Your default agent ${effective} has no conversation with you on this device's accounts, so Agents opens with nothing selected.`,
+        announce: true,
+      }
+    : { ...base, view: "agents", room: { accountId: MOCK_ACCOUNT_ID, roomId: main.roomId } };
+}
+
+/** The launch, answered as Rust's `resolve` does: when the default's room is here or at the bound. */
+function mockAgentsLaunchWhenKnown(): Promise<AgentsLaunchVm> {
+  if (launchParam === "late") {
+    return later(LATE_ROOM_MS + 50, mockAgentsLaunch);
+  }
+  if (launchParam === "lost" || launchParam === "unseen") {
+    return later(LOST_BOUND_MS, mockAgentsLaunch);
+  }
+  return later(300, mockAgentsLaunch);
+}
+
+function mockAgentsDefaultSet(payload: Record<string, unknown>): Promise<AgentsLaunchVm> {
+  // The executor form: the project compiles against ES2020, which has no
+  // `Promise.withResolvers` (as `App.test.tsx` notes).
+  return new Promise((resolve, reject) => {
+    setTimeout(() => {
+      const agent = typeof payload.agent === "string" ? payload.agent.trim() : "";
+      if (launchParam === "failset") {
+        reject({
+          code: "internal",
+          message: "keeper could not save the default agent: database is locked",
+          retriable: false,
+        });
+      } else if (agent !== "" && !/^@[^:]+:.+$/.test(agent)) {
+        reject({
+          code: "internal",
+          retriable: false,
+          message: `"${agent}" is not a Matrix user id, so it cannot be the default agent. An agent is named like @nixi:example.org.`,
+        });
+      } else {
+        defaultAgent = agent === "" ? null : agent;
+        resolve(mockAgentsLaunch());
+      }
+    }, 120);
+  });
 }
 
 function subscribeMockInbox(payload: Record<string, unknown>): number {
@@ -7080,7 +7697,20 @@ function subscribeMockInbox(payload: Record<string, unknown>): number {
     (payload[window] as MockChannel<InboxBatch>).onmessage?.(reset([]));
   }
   agentsWindow = payload.agents as MockChannel<InboxBatch>;
-  agentsWindow.onmessage?.(reset(AGENT_ROOM_ROWS));
+  if (launchParam === "none") {
+    agentsWindow.onmessage?.(reset([]));
+  } else if (!nixiDmHere) {
+    // R397's late DM: the first batch has every agent room but Nixi's DM.
+    agentsWindow.onmessage?.(reset(AGENT_ROOM_ROWS.filter((row) => row.roomId !== DM_ROOM)));
+    if (launchParam === "late") {
+      setTimeout(() => {
+        nixiDmHere = true;
+        agentsWindow?.onmessage?.(reset(AGENT_ROOM_ROWS));
+      }, LATE_ROOM_MS);
+    }
+  } else {
+    agentsWindow.onmessage?.(reset(AGENT_ROOM_ROWS));
+  }
   (payload.spaces as MockChannel<SpacesSnapshot>).onmessage?.({ spaces: [] });
   (payload.networks as MockChannel<NetworksSnapshot>).onmessage?.({ networks: [] });
   return 1;
@@ -7363,12 +7993,81 @@ function mockPushGatewaySet(payload: Record<string, unknown>) {
   return pushGateway;
 }
 
+/**
+ * Rust's standing background failures (Epic 100, R387, `keeper_core::failure::Failures`).
+ * `?failure=push` starts with a push registration that failed before the webview
+ * subscribed, `?failure=voice` with the wake phrase not re-armed — both are in the
+ * snapshot `failure_subscribe` answers first. As in Rust (R410), only the success of
+ * the operation that failed clears it: saving a push gateway (iOS re-registers) or
+ * confirming the distributor (Android) clears the push registration's; setting or
+ * toggling the wake phrase clears the re-arm's.
+ */
+const failureParam = new URLSearchParams(window.location.search).get("failure") ?? "";
+let failureState: FailureStateVm = {
+  notices: [
+    ...(failureParam.includes("push")
+      ? [
+          {
+            surface: "push" as const,
+            operation: "pushRegistration" as const,
+            account: "acct-mock",
+            sentence:
+              "keeper could not turn on push notifications for one of your accounts, so its messages arrive only while keeper is open.",
+          },
+        ]
+      : []),
+    ...(failureParam.includes("voice")
+      ? [
+          {
+            surface: "voice" as const,
+            operation: "voiceRearm" as const,
+            account: null,
+            sentence:
+              "keeper could not start listening for the wake phrase again. Turn listening off and on to try once more.",
+          },
+        ]
+      : []),
+  ],
+};
+const failureWatchers = new Map<string, MockChannel<FailureStateVm>>();
+
+/** `operation` succeeded: Rust clears its own failures and tells every watcher. */
+function failureRecovered(operation: FailureOperation): void {
+  const notices = failureState.notices.filter((notice) => notice.operation !== operation);
+  if (notices.length === failureState.notices.length) {
+    return;
+  }
+  failureState = { notices };
+  for (const watcher of failureWatchers.values()) {
+    watcher.onmessage?.(failureState);
+  }
+}
+
 /** The tablet's distributor was confirmed in Settings this session (98.4). */
 let unifiedpushConfirmed = false;
 
 const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = {
   push_gateway_get: () => pushGateway,
   push_open_take: () => null,
+  failure_subscribe: (payload) => {
+    const id = `failure-subscription-${failureWatchers.size + 1}`;
+    const channel = payload.channel as MockChannel<FailureStateVm>;
+    failureWatchers.set(id, channel);
+    channel.onmessage?.(failureState);
+    return id;
+  },
+  // `?failure=draft`: saving a composer draft fails, deleting one works (R410).
+  set_draft: () => {
+    if (failureParam.includes("draft")) {
+      throw { code: "internal", message: "database is locked", accountId: null, retriable: true };
+    }
+    return null;
+  },
+  delete_draft: () => null,
+  failure_unsubscribe: (payload) => {
+    failureWatchers.delete(String(payload.subscriptionId));
+    return null;
+  },
   // Android's push status (98.4): the tablet first asks which distributor to use
   // (ntfy, by name and package), and once confirmed answers a registered pusher. Both
   // views are Rust's own `UnifiedPushVm`s, written by the keeper-core test
@@ -7392,10 +8091,16 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
       };
     }
     unifiedpushConfirmed = true;
+    failureRecovered("pushRegistration");
     void emit(UNIFIEDPUSH_STATUS_EVENT);
     return UNIFIEDPUSH_FIXTURE.registered;
   },
-  push_gateway_set: mockPushGatewaySet,
+  push_gateway_set: (payload) => {
+    const saved = mockPushGatewaySet(payload);
+    // Rust re-registers the pusher with the saved gateway; it succeeds here.
+    failureRecovered("pushRegistration");
+    return saved;
+  },
   inbox_subscribe: subscribeMockInbox,
   agent_approval_decide: mockApprovalDecide,
   agent_approval_payload: mockApprovalPayload,
@@ -7417,6 +8122,34 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
       return null;
     }),
   agent_conversation_new: mockConversationNew,
+  agent_model_command: mockAgentModelCommand,
+  // Story 100.5: the messenger's slash commands. Sends and room acts succeed
+  // silently (the fake has no room state to change) except one refused invite.
+  // `?slash=slow` answers every preview after a second, so a second Enter and
+  // typing during a slow command can be seen in the browser (R393).
+  chat_command_preview: (payload) =>
+    new URLSearchParams(window.location.search).get("slash") === "slow"
+      ? later(1000, () => mockChatCommandPreview(payload))
+      : mockChatCommandPreview(payload),
+  send_text: (payload) => recordSend("text", payload),
+  send_emote: (payload) => recordSend("emote", payload),
+  // Recorded too, so the browser can see which context a slow line went out in (R411).
+  send_reply: (payload) => recordSend("reply", payload),
+  edit_message: (payload) => recordSend("edit", payload),
+  room_set_topic: () => later(200, () => null),
+  room_invite: (payload) =>
+    String(payload.userId) === "@refused:example.org"
+      ? Promise.reject({
+          code: "sendFailed",
+          message: "could not send the message: M_FORBIDDEN",
+          accountId: null,
+          retriable: true,
+        })
+      : later(200, () => null),
+  room_leave: (payload) => {
+    mockLeaves.push(`${String(payload.accountId)} ${String(payload.roomId)}`);
+    return later(300, () => null);
+  },
   agent_surface_subscribe: mockSurfaceSubscribe,
   agent_surface_result: (payload) => {
     surfaceResults.push({
@@ -7686,6 +8419,7 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
   agents_sandbox_save: (payload) => sandboxSave(payload.req as AgentSandboxReq),
   agents_seed_plan: (payload) => seedPlan(payload.req as AgentSeedReq),
   agents_seed_apply: (payload) => seedApply(payload.req as AgentSeedReq),
+  agents_model_set: (payload) => setAgentModel(payload.req as AgentModelReq),
   agents_drive_repin: (payload) => {
     agentRows = agentRows.map((row) =>
       row.profileId !== payload.profileId || row.pin === null
@@ -8084,8 +8818,30 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
   // Handlers over a module-level object rather than an `ANSWERS` row, so a write
   // lands somewhere and the mirror store's confirm path is exercised: the set
   // echoes the effective VM, exactly as the Rust command does.
-  recording_settings_get: () => recordingSettings,
+  //
+  // `?failure=recordingRead` refuses the read (the controls say it in place of
+  // the fields), `?failure=recordingWrite` refuses every write (the control that
+  // reverted says why) — R410.
+  recording_settings_get: () => {
+    if (failureParam.includes("recordingRead")) {
+      throw {
+        code: "internal",
+        message: "keeper could not read its database.",
+        accountId: null,
+        retriable: false,
+      };
+    }
+    return recordingSettings;
+  },
   recording_settings_set: (payload) => {
+    if (failureParam.includes("recordingWrite")) {
+      throw {
+        code: "invalid",
+        message: "keeper could not write the recording settings: the disk is full.",
+        accountId: null,
+        retriable: false,
+      };
+    }
     const next = payload.settings as Partial<typeof recordingSettings> | undefined;
     recordingSettings = { ...recordingSettings, ...(next ?? {}) };
     return recordingSettings;
@@ -8137,12 +8893,14 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
     voiceWake = { ...voiceWake, enabled: payload.enabled === true, phrase, stopPhrase };
     listeningDecided();
     voiceWatcher?.onmessage?.(voiceIdle());
+    failureRecovered("voiceRearm");
     return voiceWakeVm();
   },
   // Epic 68 (AD-218): the one listening verb, flipped from the stored switch.
   voice_wake_toggle: () => {
     voiceWake = { ...voiceWake, enabled: !voiceWake.enabled };
     voiceWatcher?.onmessage?.(voiceIdle());
+    failureRecovered("voiceRearm");
     if (voiceWake.enabled) {
       listeningDecided();
     }
@@ -8188,6 +8946,10 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
           }),
         )
       : [],
+  // Story 100.3 (R383): what opens at launch and the default agent.
+  agents_launch: () => mockAgentsLaunchWhenKnown(),
+  agents_default_get: () => mockAgentsLaunch(),
+  agents_default_set: mockAgentsDefaultSet,
   // --- Voice, the talk mode (Epic 62, Story 62.6; Epic 67, AD-205) ---------
   //
   // A scripted turn so the mic control's states can be looked at in
@@ -9137,7 +9899,13 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
       };
     }
     return {
-      setupId: "setup-mock",
+      // The link's `denied` rides the setup id to the confirm, as Rust keeps
+      // the resolved descriptor under it.
+      setupId: input.includes("denied")
+        ? "setup-mock-denied"
+        : input.includes("forge")
+          ? "setup-mock-forge"
+          : "setup-mock",
       name: "Acme",
       issuerHost: "id.acme.dev",
       repoHost: "git.acme.dev",
@@ -9160,7 +9928,11 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
   account_setup_confirm: (payload) => {
     forgeErrors.clear();
     const name = String(payload.deviceName ?? ACCOUNT_THIS_DEVICE.name);
-    return accountSignInFlow({ ...ACCOUNT_THIS_DEVICE, slug: name, name });
+    const setupId = String(payload.setupId ?? "");
+    return accountSignInFlow(
+      { ...ACCOUNT_THIS_DEVICE, slug: name, name },
+      setupId.includes("denied") ? "denied" : setupId.includes("forge") ? "forgeFailed" : "done",
+    );
   },
   account_sign_in: () => {
     forgeErrors.clear();

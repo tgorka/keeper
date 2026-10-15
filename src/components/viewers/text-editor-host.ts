@@ -77,6 +77,7 @@ import type * as CodeMirrorState from "@codemirror/state";
 import type { Extension } from "@codemirror/state";
 import type * as CodeMirrorView from "@codemirror/view";
 import type { EditorView } from "@codemirror/view";
+import { logFailure } from "@/lib/failure";
 import type { FormatAction } from "../notes/editor/format-commands";
 
 /**
@@ -483,6 +484,7 @@ export async function mountTextEditor(options: TextEditorMountOptions): Promise<
         options.onLanguageSettled?.(id, true);
       })
       .catch((error: unknown) => {
+        logFailure("editor.grammarLoad")(error);
         // A chunk that will not fetch. The file stays open, editable and
         // saveable; only the colour is missing, and the reason is on the record
         // at INFO because `tracing::debug!`-grade logging never reaches a

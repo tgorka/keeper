@@ -69,6 +69,7 @@ import { Button } from "@/components/ui/button";
 import { IconHint } from "@/components/ui/tooltip";
 import { saveNote } from "@/hooks/use-notes-body";
 import { captureKey } from "@/lib/capture-target";
+import { logFailure } from "@/lib/failure";
 import {
   type CaptureTargetVm,
   type CaptureWindowVm,
@@ -234,11 +235,10 @@ export function CaptureWindowChrome({ captureKey, onClose }: CaptureWindowChrome
         }
         stop = unlisten;
       })
-      .catch(() => {
-        // A listener that could not be attached costs this cluster its live
-        // lock state, never its buttons: both actions read their argument from
-        // the props, not from the store.
-      });
+      // A listener that could not be attached costs this cluster its live
+      // lock state, never its buttons: both actions read their argument from
+      // the props, not from the store.
+      .catch(logFailure("capture.listenWindows"));
     return () => {
       cancelled = true;
       stop?.();

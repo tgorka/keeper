@@ -45,6 +45,7 @@
 
 import { open as openFolder } from "@tauri-apps/plugin-dialog";
 import { saveNote } from "@/hooks/use-notes-body";
+import { logFailure } from "@/lib/failure";
 // `PanelTargetVm` from the generated bindings, not from the panel store: the
 // store declares the type locally and does not re-export it, and adding an
 // export there would make it a second source for a type Rust generates.
@@ -148,6 +149,7 @@ export async function exportTarget(target: PanelTargetVm): Promise<ExportOutcome
         : await syncExportEntry(target.profileId, target.relativePath, destination);
     return { status: "exported", receipt };
   } catch (error: unknown) {
+    logFailure("export.target")(error);
     // `syncErrorMessage` rather than a fourth structural guard in this repo:
     // an `IpcError` is an `IpcError` whichever command rejected. Its fallback
     // is a finished sentence, so a rejection that is not one still says

@@ -109,6 +109,8 @@ pub enum Shape {
     AbsolutePath,
     /// An OS accelerator string, opaque to `keeper-core`; empty means unset.
     Accelerator,
+    /// A Matrix user id (`@name:server`), or empty for "none chosen".
+    MatrixUserId,
     /// A JSON document keeper wrote.
     Json,
 }
@@ -129,6 +131,7 @@ impl Shape {
             Shape::AbsolutePath => "absolute path".to_owned(),
             Shape::Accelerator => "accelerator".to_owned(),
             Shape::Json => "JSON".to_owned(),
+            Shape::MatrixUserId => "Matrix user id (`@name:server`), or empty".to_owned(),
         }
     }
 
@@ -202,6 +205,15 @@ impl Shape {
                 toml::Value::String(raw) => Ok(raw.clone()),
                 _ => refuse("a string"),
             },
+            Shape::MatrixUserId => match value {
+                toml::Value::String(raw)
+                    if raw.trim().is_empty()
+                        || matrix_sdk::ruma::UserId::parse(raw.trim()).is_ok() =>
+                {
+                    Ok(raw.trim().to_owned())
+                }
+                _ => refuse("a Matrix user id such as \"@nixi:example.org\", or \"\" for none"),
+            },
         }
     }
 
@@ -229,9 +241,11 @@ impl Shape {
             Shape::FlagOnOff => flag("on", "off"),
             Shape::FlagTrueFalse => flag("true", "false"),
             Shape::Int { .. } | Shape::Choice(_) => number(),
-            Shape::Text | Shape::AbsolutePath | Shape::Accelerator | Shape::Json => {
-                toml::Value::String(stored.to_owned())
-            }
+            Shape::Text
+            | Shape::AbsolutePath
+            | Shape::Accelerator
+            | Shape::Json
+            | Shape::MatrixUserId => toml::Value::String(stored.to_owned()),
         }
     }
 }
@@ -430,6 +444,17 @@ pub const KEYS: &[KeySpec] = &[
                   account deletes them all but `restored`, so a second sign-in never \
                   restores over what the person removed.",
         example: "",
+    },
+    // ---- agents ----------------------------------------------------------
+    KeySpec {
+        key: "agents.default",
+        family: false,
+        scope: Scope::UserGlobal,
+        settable: Settable::AnyLayer,
+        shape: Shape::MatrixUserId,
+        default: "",
+        summary: "The default agent: one agent's Matrix user id. At launch, an account with at least one agent room opens the Agents window, on this agent's main conversation when it has one on this account; otherwise nothing is selected and Settings › Agents says why. Blank means no default agent; with no agent rooms, keeper opens the Inbox as before (R383).",
+        example: "\"@nixi:example.org\"",
     },
     // ---- bots ------------------------------------------------------------
     KeySpec {
@@ -1728,6 +1753,7 @@ mod tests {
                     vec![String::new(), "Cmd+Shift+K".into(), "42".into()]
                 }
                 Shape::Json => vec!["{\"provider\":\"p\",\"model\":\"m\"}".into()],
+                Shape::MatrixUserId => vec![String::new(), "@nixi:example.org".into()],
             };
             for stored in samples {
                 let value = spec.shape.to_toml(&stored);
@@ -1938,6 +1964,31 @@ mod tests {
             Shape::Choice(&["10", "15", "30", "60"]).coerce("recording.fps", &toml_value("30")),
             Ok("30".to_owned())
         );
+    }
+
+    #[test]
+    fn a_default_agent_must_be_a_matrix_user_id_or_none() {
+        let shape = spec("agents.default").expect("classified").shape;
+        assert_eq!(
+            shape.coerce("agents.default", &toml_value("\" @nixi:example.org \"")),
+            Ok("@nixi:example.org".to_owned())
+        );
+        assert_eq!(
+            shape.coerce("agents.default", &toml_value("\"\"")),
+            Ok(String::new())
+        );
+        for wrong in [
+            "\"nixi\"",
+            "\"nixi@example.org\"",
+            "\"!room:example.org\"",
+            "true",
+        ] {
+            let error = shape
+                .coerce("agents.default", &toml_value(wrong))
+                .expect_err("not a user id");
+            assert!(error.to_string().contains("agents.default"), "{error}");
+            assert!(error.to_string().contains("Matrix user id"), "{error}");
+        }
     }
 
     #[test]

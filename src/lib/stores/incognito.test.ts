@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 // Mock the IPC client so refreshIncognito can be driven deterministically.
 const incognitoGet = vi.fn();
 vi.mock("@/lib/ipc/client", () => ({
+  frontendErrorReport: vi.fn(async () => {}),
   incognitoGet: (accountId: string, roomId: string) => incognitoGet(accountId, roomId),
 }));
 

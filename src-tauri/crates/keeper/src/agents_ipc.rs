@@ -16,6 +16,7 @@ use std::sync::Mutex;
 use keeper_agent::surface::{drive_of, locate, Located};
 use keeper_core::agents::approval_card::{ApprovalDecideReq, ApprovalPayloadVm};
 use keeper_core::agents::events::{Focus, PresencePlatform, SurfaceOutcome};
+use keeper_core::agents::launch::{self, AgentsLaunchVm};
 use keeper_core::agents::proxy::{AgentFocusReq, ProxyRoomVm};
 use keeper_core::agents::spoken::{FollowSlot, SpokenStep};
 use keeper_core::agents::surface::{
@@ -24,7 +25,7 @@ use keeper_core::agents::surface::{
 use keeper_core::bots::voice_target;
 use keeper_core::notes::outline::{heading_at, heading_in};
 use keeper_core::panels::PanelTargetVm;
-use keeper_core::vm::{IpcError, VoiceAgentTargetVm};
+use keeper_core::vm::{IpcError, IpcErrorCode, VoiceAgentTargetVm};
 use tauri::ipc::Channel;
 use tauri::{AppHandle, Manager, State};
 
@@ -366,6 +367,62 @@ pub async fn voice_agent_targets(
     Ok(voice_target::agent_targets(
         state.accounts.agent_rooms_everywhere().await,
     ))
+}
+
+/// What keeper opens at launch (story 100.3, R383, R397): asked once by the
+/// webview after the accounts are hydrated; answered by
+/// `keeper_core::agents::launch::resolve` once every signed-in account has
+/// synced or the default agent's room is here, never later than
+/// `LAUNCH_READY_MS`. A default agent whose room does not open is written to
+/// the log at WARN; a failure is reported by the webview.
+#[tauri::command]
+pub async fn agents_launch(state: State<'_, AppState>) -> Result<AgentsLaunchVm, IpcError> {
+    let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
+    let vm = state
+        .accounts
+        .agents_launch(&data_dir)
+        .await
+        .map_err(to_ipc_error)?;
+    launch::warn_launch(&vm);
+    Ok(vm)
+}
+
+/// The default agent as Settings › Agents and the agent room's menu show
+/// it, from what is here now (never waits); a failure is reported by the
+/// webview.
+#[tauri::command]
+pub async fn agents_default_get(state: State<'_, AppState>) -> Result<AgentsLaunchVm, IpcError> {
+    let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
+    state
+        .accounts
+        .agents_default(&data_dir)
+        .await
+        .map_err(to_ipc_error)
+}
+
+/// Make `agent` (a Matrix user id) the default agent, or clear it with
+/// `None`, and answer with the default agent as it now reads. Every failure
+/// is a WARN line (R381): the core's for a refusal, a failed write or a
+/// failed read-back, this one's when there is no data directory.
+#[tauri::command]
+pub async fn agents_default_set(
+    state: State<'_, AppState>,
+    agent: Option<String>,
+) -> Result<AgentsLaunchVm, IpcError> {
+    let data_dir = state.platform.data_dir().map_err(|error| {
+        tracing::warn!(%error, "agents: the default agent was not saved (no data directory)");
+        to_ipc_error(error)
+    })?;
+    state
+        .accounts
+        .agents_default_set(&data_dir, agent.as_deref())
+        .await
+        .map_err(|error| IpcError {
+            code: IpcErrorCode::Internal,
+            message: error.to_string(),
+            account_id: None,
+            retriable: false,
+        })
 }
 
 /// The send and then the following of the answer to the voice turn's

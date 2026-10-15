@@ -159,12 +159,13 @@ pub fn deliver(flows: &OAuthFlowRegistry, state: &str, answer: AuthTabAnswer) {
 /// [`OAuthFlowRegistry::resolve`] exactly as a deep link would. A callback
 /// the sheet hands back without it — an identity provider's error page that
 /// drops `state`, or some other `keeper://` address — still ends this sheet's
-/// sign-in: it ends it as an error at once (the provider's own `error` when
-/// it sent one) rather than leaving it to wait out its five-minute timeout,
-/// and it is never offered to another flow. A cancel ends only that flow, so
-/// a sign-in waiting beside it keeps waiting. A failure is delivered as the
-/// provider would deliver a refusal — an `error=` callback for the same
-/// `state` — so the waiting flow ends at once with the reason.
+/// sign-in at once rather than leaving it to wait out its five-minute
+/// timeout, and it is never offered to another flow: as the provider's
+/// refusal when the provider sent an `error`, otherwise as a broken round
+/// trip. A cancel ends only that flow, so a sign-in waiting beside it keeps
+/// waiting. A sheet that failed ends its flow as a broken round trip with
+/// the reason ([`OAuthFlowRegistry::fail`]) — never as the provider's
+/// refusal, which it is not (Epic 100, R381).
 pub fn finish(flows: &OAuthFlowRegistry, state: &str, ending: Ending) {
     match ending {
         Ending::Callback(url) => {
@@ -172,28 +173,41 @@ pub fn finish(flows: &OAuthFlowRegistry, state: &str, ending: Ending) {
                 return;
             }
             tracing::debug!("web auth: the callback did not carry this sign-in's state");
-            let reason = query_param(&url, "error").unwrap_or_else(|| FOREIGN_CALLBACK.to_owned());
-            if !flows.resolve(&failure_url(state, &reason)) {
+            let ended = match query_param(&url, "error") {
+                Some(error) => flows.resolve(&failure_url(
+                    state,
+                    &error,
+                    query_param(&url, "error_description").as_deref(),
+                )),
+                None => flows.fail(state, FOREIGN_CALLBACK),
+            };
+            if !ended {
                 tracing::debug!("web auth: the sign-in had already ended");
             }
         }
         Ending::Cancelled => flows.cancel(state),
         Ending::Failed(reason) => {
             tracing::warn!(%reason, "web auth: the sign-in sheet failed");
-            if !flows.resolve(&failure_url(state, &reason)) {
+            if !flows.fail(state, &reason) {
                 tracing::debug!("web auth: the failure matched no waiting sign-in");
             }
         }
     }
 }
 
-/// A callback URL that carries `reason` as the OAuth `error` for `state`.
-fn failure_url(state: &str, reason: &str) -> String {
-    format!(
+/// A callback URL that carries the provider's `error` (and its
+/// `error_description`, when it sent one) for `state`.
+fn failure_url(state: &str, error: &str, description: Option<&str>) -> String {
+    let mut url = format!(
         "keeper://oauth/web-auth?state={}&error={}",
         utf8_percent_encode(state, NON_ALPHANUMERIC),
-        utf8_percent_encode(reason, NON_ALPHANUMERIC)
-    )
+        utf8_percent_encode(error, NON_ALPHANUMERIC)
+    );
+    if let Some(description) = description {
+        url.push_str("&error_description=");
+        url.extend(utf8_percent_encode(description, NON_ALPHANUMERIC));
+    }
+    url
 }
 
 /// The window the sheet is presented over: keeper's main window, which is
@@ -482,11 +496,12 @@ mod tests {
     }
 
     /// A sheet that comes back without its own state ends its own flow at
-    /// once, as an error carrying the provider's reason, and is never
-    /// offered to another waiting flow. `try_recv`, not `await`: a flow left
-    /// waiting must fail the test, not hang it.
+    /// once — as the provider's refusal when it carried an `error`, with its
+    /// description, otherwise as a broken round trip — and is never offered
+    /// to another waiting flow. `try_recv`, not `await`: a flow left waiting
+    /// must fail the test, not hang it.
     #[test]
-    fn a_callback_without_this_state_ends_the_original_flow_as_an_error() {
+    fn a_callback_without_this_state_ends_the_original_flow() {
         let flows = OAuthFlowRegistry::new();
         let mut mine = flows.register("mine".to_owned());
         let _other = flows.register("other".to_owned());
@@ -496,8 +511,8 @@ mod tests {
             Ending::Callback("keeper://oauth/acme/callback?code=c&state=other".to_owned()),
         );
         match mine.try_recv() {
-            Ok(OAuthCallback::Error(reason)) => assert_eq!(reason, FOREIGN_CALLBACK),
-            other => panic!("expected an error callback, got {other:?}"),
+            Ok(OAuthCallback::Failed(reason)) => assert_eq!(reason, FOREIGN_CALLBACK),
+            other => panic!("expected a failed round trip, got {other:?}"),
         }
         // The other flow was not resolved by the foreign callback.
         assert!(flows.resolve("keeper://oauth/acme/callback?state=other&code=c"));
@@ -506,11 +521,15 @@ mod tests {
         finish(
             &flows,
             "s2",
-            Ending::Callback("keeper://oauth/acme/callback?error=access_denied".to_owned()),
+            Ending::Callback(
+                "keeper://oauth/acme/callback?error=access_denied&error_description=Not%20you"
+                    .to_owned(),
+            ),
         );
         assert!(matches!(
             dropped.try_recv(),
-            Ok(OAuthCallback::Error(reason)) if reason == "access_denied"
+            Ok(OAuthCallback::Error { error, description })
+                if error == "access_denied" && description.as_deref() == Some("Not you")
         ));
     }
 
@@ -537,9 +556,9 @@ mod tests {
     }
 
     /// A sheet that could not be shown ends the flow with its reason at once,
-    /// instead of leaving it to time out.
+    /// as a broken round trip rather than the provider's refusal.
     #[tokio::test]
-    async fn a_failure_reaches_the_flow_as_an_error_with_its_reason() {
+    async fn a_failure_reaches_the_flow_as_a_failed_round_trip_with_its_reason() {
         let flows = OAuthFlowRegistry::new();
         let waiting = flows.register("s&1".to_owned());
         finish(
@@ -548,10 +567,10 @@ mod tests {
             Ending::Failed("the window is not in a foreground scene".to_owned()),
         );
         match waiting.await {
-            Ok(OAuthCallback::Error(reason)) => {
+            Ok(OAuthCallback::Failed(reason)) => {
                 assert_eq!(reason, "the window is not in a foreground scene");
             }
-            other => panic!("expected an error callback, got {other:?}"),
+            other => panic!("expected a failed round trip, got {other:?}"),
         }
     }
 

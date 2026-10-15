@@ -218,6 +218,78 @@ impl Write for RotatingFile {
     }
 }
 
+/// The longest panic message a log line carries. A message is whatever the
+/// panicking code formatted; the location and thread are what a bug report
+/// needs, and a runaway message must not fill the file.
+pub const PANIC_MESSAGE_MAX: usize = 500;
+
+/// What one panic's log line says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PanicRecord {
+    /// `file:line:column`, when the panic carries a location.
+    pub location: Option<String>,
+    /// The panicking thread's name, or `unnamed`.
+    pub thread: String,
+    /// The panic's message, bounded to [`PANIC_MESSAGE_MAX`] characters.
+    pub message: String,
+}
+
+impl PanicRecord {
+    /// The record of the panic `info` describes, on the current thread.
+    pub fn of(info: &std::panic::PanicHookInfo<'_>) -> Self {
+        let payload = info.payload();
+        let message = payload
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("a panic without a message");
+        let mut bounded: String = message.chars().take(PANIC_MESSAGE_MAX).collect();
+        if bounded.len() < message.len() {
+            bounded.push('…');
+        }
+        Self {
+            location: info
+                .location()
+                .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column())),
+            thread: std::thread::current()
+                .name()
+                .unwrap_or("unnamed")
+                .to_owned(),
+            message: bounded,
+        }
+    }
+}
+
+/// Install the process's panic hook (Epic 100, R381 as amended by R387,
+/// 100.1 #1): every panic is written to the `tracing` log at `ERROR` with its
+/// location and thread — so it lands in `keeper.log`, which records `WARN`
+/// and above always — then the hook that was installed before this one runs,
+/// so the default stderr report and any test harness still see it.
+///
+/// That line is all a panic becomes. It is never counted in telemetry: a
+/// process whose runtime workers poll agent and non-agent work alike has no
+/// boundary that could tell an agent's panic apart, and agents stay out of
+/// telemetry fail-closed (S-19). Nor does the hook do anything that could
+/// itself panic beyond formatting the line — no lock it would wait on, no
+/// random number, no queue.
+///
+/// Here rather than in a host because both hosts could install it and
+/// neither compiles on the other's machine (see this module's header).
+pub fn install_panic_hook() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let record = PanicRecord::of(info);
+        tracing::error!(
+            target: "keeper::panic",
+            location = record.location.as_deref().unwrap_or("unknown"),
+            thread = %record.thread,
+            reason = %record.message,
+            "keeper panicked"
+        );
+        previous(info);
+    }));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -448,5 +520,94 @@ mod tests {
             "gix_attributes::search::attributes",
             tracing::Level::TRACE
         ));
+    }
+
+    /// Set in the child process [`a_panic_on_another_thread_is_an_error_line_with_where_and_which_thread`]
+    /// re-executes: the directory its log and witness files go to.
+    const PANIC_CHILD_DIR: &str = "KEEPER_PANIC_HOOK_CHILD_DIR";
+
+    /// Where a test subscriber writes: a real rotating log file, read back.
+    #[derive(Clone)]
+    struct FileSink(std::sync::Arc<std::sync::Mutex<RotatingFile>>);
+    impl Write for FileSink {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("sink").write(bytes)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.0.lock().expect("sink").flush()
+        }
+    }
+
+    /// The child half: install a previous hook that leaves a witness file,
+    /// then the panic hook, then panic on a named thread with the log going
+    /// to a real rotating file. Its own process, so no other test's hook can
+    /// see this panic or replace this hook.
+    fn panic_in_this_process(dir: &Path) {
+        let witness = dir.join("previous-hook-ran");
+        std::panic::set_hook(Box::new(move |_| {
+            let _ = std::fs::write(&witness, b"ran");
+        }));
+        install_panic_hook();
+        let sink = FileSink(std::sync::Arc::new(std::sync::Mutex::new(
+            RotatingFile::open(dir.join("keeper.log")),
+        )));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || sink.clone())
+            .finish();
+        tracing::subscriber::set_global_default(subscriber).expect("the child's only subscriber");
+        let joined = std::thread::Builder::new()
+            .name("sync-worker".to_owned())
+            .spawn(|| panic!("the index is {} past its end", 3))
+            .expect("spawn")
+            .join();
+        assert!(joined.is_err(), "the thread panicked");
+    }
+
+    /// R381 / 100.1 #1: a panic on a spawned thread is an `ERROR` line in the
+    /// log file with its location, thread and message, and the hook installed
+    /// before still runs. The panic happens in a re-executed copy of this
+    /// test binary (R387, FIX 09): a panic hook is process-global, and the
+    /// parallel test runner's other hook-replacing tests would race it here.
+    #[test]
+    fn a_panic_on_another_thread_is_an_error_line_with_where_and_which_thread() {
+        if let Some(dir) = std::env::var_os(PANIC_CHILD_DIR) {
+            panic_in_this_process(Path::new(&dir));
+            return;
+        }
+        let dir = tempfile::tempdir().expect("temp dir");
+        let status = std::process::Command::new(std::env::current_exe().expect("this test binary"))
+            .args([
+                "--exact",
+                "logfile::tests::a_panic_on_another_thread_is_an_error_line_with_where_and_which_thread",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env(PANIC_CHILD_DIR, dir.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("the child runs");
+        assert!(status.success(), "the child process: {status}");
+
+        let log =
+            std::fs::read_to_string(dir.path().join("keeper.log")).expect("the line is on disk");
+        let line = log
+            .lines()
+            .find(|line| line.contains("keeper panicked"))
+            .unwrap_or_else(|| panic!("no panic line in {log:?}"));
+        assert!(line.contains("ERROR"), "{line}");
+        assert!(line.contains("keeper::panic"), "{line}");
+        assert!(line.contains("thread=sync-worker"), "{line}");
+        assert!(line.contains("logfile.rs:"), "{line}");
+        assert!(
+            line.contains("reason=the index is 3 past its end"),
+            "{line}"
+        );
+        assert_eq!(log.matches("keeper panicked").count(), 1, "one line: {log}");
+        assert!(
+            dir.path().join("previous-hook-ran").exists(),
+            "the previous hook ran"
+        );
     }
 }

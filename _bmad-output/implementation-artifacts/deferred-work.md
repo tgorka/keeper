@@ -10590,3 +10590,217 @@ origin: makistack's electra (2026-10-14): in Nixi's DM, 283 of the newest 300 ev
 location: `keeper_agent::hosts` (claim renewal), `keeper_core::agents::claims`
 reason: 1 440 state events a day per served session room. A person's client must page through them to reach a message after any limited sync, and every Matrix client a person might use shows a session room as mostly invisible state. keeper's window now fills itself in 200-event pages (`conversation-body.tsx`), which hides the symptom. A fix at the source: renew less often (a longer lease with the same takeover semantics), or keep the lease's heartbeat out of the room's timeline — e.g. renew only near expiry, or move liveness to the host manifest in the control room and write the session claim only on acquire, release and takeover.
 status: open
+
+### DW-1386: Marta's organisation-account setup is proved against a stub callback, not against ZITADEL.
+
+origin: rung `agents-100-errors` (story 100.1 #2–#4, 2026-10-14)
+location: `keeper_core::org_account::oidc::authorize`, `account_ipc::converge`, `account-setup-sheet.tsx`
+reason: the live `access_denied` needs an account the keeper application refuses; proving it would mean a throwaway ZITADEL user with a password (a configuration change) or a person's own password, both outside the rung's leave. The stub callback proves every outcome (`each_way_a_sign_in_ends_without_a_code_reads_as_itself`, `a_refused_sign_in_leaves_one_warning_and_a_problem`). Owed on hesperia: set up Marta's account end to end, read the sheet's sentence and `keeper.log`'s `account: a step did not finish` line.
+status: open
+
+### DW-1387: A panic in a process that never ran `setup()` reaches no log.
+
+origin: rung `agents-100-errors` (story 100.1 #1, 2026-10-14); the same gap as DW-1263
+location: `debug_log::init` (installs the panic hook), iOS background launch (`push_ios.rs`)
+reason: the hook and the file writer are both installed by `setup()`. An iOS push wake that never reaches it panics to stderr only. Installing the hook earlier (in `run()` before the builder) would cover it, but the file writer would still be missing.
+status: open
+
+### DW-1388: A restored Matrix sign-in whose start flag does not read stays a log line.
+
+origin: rung `agents-100-errors` (story 100.1 #5 audit, 2026-10-14)
+location: `account_ipc::start_matrix_sign_in` (`registry::get_account_restore_matrix_started` → `warn` + return)
+reason: left as a `WARN`: the account still sits in Settings › Account's offers, so the person can sign it in by hand; a sentence would repeat the offer.
+status: open
+
+### DW-1389: A gateway's session list that does not read stays at `debug!`.
+
+origin: rung `agents-100-errors` (story 100.1 #5 audit, 2026-10-14)
+location: `bots_ipc` session refresh (`bots: gateway session list not read; local list stands`)
+reason: left at `debug`: it fires on every refresh while a gateway is offline and the local list stands unchanged, so a `WARN` would fill `keeper.log` with one line per refresh per bot. The transcript fallback beside it (`gateway transcript not read`) moved to `WARN`.
+status: open
+
+### DW-1390: The rung's shell edits are inspected, not compiled, for iOS and Android.
+
+origin: rung `agents-100-errors` (2026-10-14)
+location: `push_ios.rs`, `push_android.rs` (`failure_notice::tell`), `web_auth.rs` (`OAuthFlowRegistry::fail`), `voice_ipc.rs`
+reason: the macOS check compiles the desktop target only; the phone ports are `cfg(target_os = "ios" | "android")` and compile in CI's mobile jobs or a phone build. Owed: an iOS and an Android build, and a push registration the homeserver refuses read back as the toast and the line under Settings' push setting.
+status: open
+
+### DW-1400: An agent's model save, its next turn and its header line are proved on Linux only.
+
+origin: rung `agents-100-model` (story 100.2, 2026-10-14)
+location: `keeper::agents_host::agents_model_set`, Settings › Agents, the agent room header
+reason: the write path, the per-turn re-read and the header line are proved by Linux tests and the mock shell. Owed on hesperia: save Nixi's model and level in Settings › Agents on a real synced drive, see the commit the folder's engine makes carry only the two `[model]` keys, send Nixi a message and read the new `bot`/`effort` on the turn's `assistant` line and the request in `keeper.log`, and see the room header's line change after the next scan. Also owed (review-100model-1): the owner's four-agent case — four agents saved on four bot/level pairs, the drive's commit published, agentd on electra receiving it, and each agent's next request and `assistant` line carrying its pair; "saved on the Mac" and "the remote host has it" are reported apart.
+status: open
+
+### DW-1401: The shell side of 100.2 is changed by inspection.
+
+origin: rung `agents-100-model` (story 100.2, 2026-10-14)
+location: `src-tauri/crates/keeper/src/agents_host.rs` (`agents_model_set`, `bot_choices`, `rows`, the scan's `replace_models`), `src-tauri/crates/keeper/src/lib.rs` (registration)
+reason: the shell crate does not compile on Linux; these edits are checked by the macOS check named in the rung's report or, failing that, by CI's macOS job. The first round's hesperia clippy compiled them (`mac-100model.log`); fix round 1 (R405) changed `bot_choices` to a fallible read with `bot_choices_or_sentence`, `agents_seed_offer` and the scan's once-only WARN, re-checked as its report says. What stays owed is behaviour on the device (DW-1400).
+status: open
+
+### DW-1402: A Hermes bot cannot be given a reasoning level.
+
+origin: rung `agents-100-model` (story 100.2, R382, R406)
+location: `keeper_core::bots::quirks` (`Quirks::efforts` for `Hermes` is empty), `keeper_core::bots::chat::build_body`
+reason: Hermes documents a request-scoped `model_options.reasoning_effort` (research §2.4), but keeper sends no `model_options`; R382 refuses `effort` on a Hermes bot at load instead of sending a field the wire does not carry. Sending it would be a second body shape for one kind, worth a story of its own with a live Hermes run.
+status: open
+
+### DW-1403: A home that stops reading drops out of Settings › Agents without its sentence.
+
+origin: rung `agents-100-model` (story 100.2, 2026-10-14)
+location: `keeper_agent::desktop::listing` (a home that does not read is skipped)
+reason: a hand edit that breaks `agent.toml` (an `effort = "max"`, say) refuses the agent's next turn with the home's sentence in its room (R407), but the Settings › Agents row disappears instead of showing that sentence. Pre-existing for every refusal of a home; a row per refused home, with its sentence and no controls, would close it.
+status: open
+
+### DW-1404: A helper or review layer running on the agent's own bot is not sent its level.
+
+origin: rung `agents-100-model` (story 100.2, 2026-10-14)
+location: `keeper_agent::helper` (the helper's `ChatRequest`), `keeper_agent::agent` (`AllowedTools` helper launch)
+reason: `[model].effort` rides every round of the agent's own turns; a `helper` call that runs on the agent's bot (no lens bot) sends no level, and its `assistant` steps carry no `bot`/`effort`. Whether a helper should think as hard as its caller is a decision, not a gap to fill silently.
+status: open
+
+### DW-1405: `keeper-agentd agents init` seeds one bot for every agent and no level.
+
+origin: rung `agents-100-model` (story 100.2 #6, 2026-10-14)
+location: `keeper-agentd` `agents init` (`SeedChoices::new` without `with_models`)
+reason: *Set up agents* on the Mac lets each seeded agent take its own bot and level (`SeedChoices::with_models`); the server's CLI still takes one `--bot` for all. Flags like `--effort` and `--model <agent>=<bot>[@level]` would bring it level.
+status: open
+
+### DW-1406: An agents zone inside a notes vault cannot have a model saved from Settings.
+
+origin: rung `agents-100-model` (story 100.2, R408)
+location: `keeper_agent::desktop::write_model` (`WriteRoute::Vault` arm)
+reason: the save writes through `WriteScope::route` with no vault, so a home inside a vault is refused ("inside a notes vault…") rather than written past the vault's own writer (which marks the vault dirty and touches its index). No zone is known to live in a vault; if one does, the save would route through the shell's `notes_vault` writer.
+status: open
+
+### DW-1407: A change to an agent's `local_only` alone waits for the host's next build.
+
+origin: rung `agents-100-model` (story 100.2, R407; review-100model-1)
+location: `keeper_agent::agent::current_model`
+reason: each turn re-reads `[model]`, but returns early when `bot` and `effort` are unchanged, so a hand edit of `local_only` alone is taken at the host's next build, not the next turn (a save from Settings never changes it). The same function clones `AgentDeps` on every turn once the model differs from the host's build; a lighter per-turn model context would avoid it. Neither is measured as a fault today.
+status: open
+
+### DW-1408: A writer outside keeper's process can still land between a model save's last check and its write.
+
+origin: rung `agents-100-model` (fix round 2, R412; review-100model-2 R100M2-01)
+location: `keeper_sync::files_write::publish_unmanaged` (`replace_unmanaged`), `keeper_sync::git::cli::GitCli::{merge_ff_only, merge_theirs, checkout_side}`
+reason: the final read-and-hash and the rename are held mutually exclusive with every keeper writer of the file in the same process (`Publishing`, R412). A writer in another process takes no lock of keeper's: an editor, or the sync engine's working-tree update — in-process on the Mac, but written by a child `git merge`/`git checkout`, not through a keeper-sync per-path API. One that writes `agent.toml` between the check and the rename is written over. Accepted by R412: the drive is a git repository, so the overwritten revision stays in its history and the next sync surfaces it. Closing it would take a conditional rename (no safe platform call exists) or an advisory file lock every writer honours (`git` and editors do not).
+status: open
+
+### DW-1410: The launch into the default agent is not counted in `keeper_interaction`.
+
+origin: rung `agents-100-launch` (2026-10-14), epic 100 story 100.1 #9
+location: `src/hooks/use-launch-into-agents.ts` (the answer applied), `keeper-core/src/telemetry`
+reason: 100.1 #9 names a closed, content-free `keeper_interaction` surface value for "the launch into the default agent". 100.1's telemetry helper is built on the sibling rung `agents-100-errors` and is not on this rung's base (`agents-100-plan`), so nothing is counted here and no helper was invented. At the stack step: count once where the hook applies an answer with `view: agents` (with consent; no agent id, no room id).
+status: done 2026-10-15
+resolution: closed by the stack step (lane 100stack, R413) in rung `agents-100-launch`'s commit "let a person open keeper on their default agent: …": `useLaunchIntoAgents` calls `captureSurface("launchDefaultAgent")` (100.1's helper) once, where it applies an answer with `view: agents` and the person has not moved; nothing about the agent or the room is sent. Test: `use-launch-into-agents.test.ts` "asks once the accounts are hydrated, …" (one `telemetryCapture` with `surface: "launchDefaultAgent"`), "never overrides the person's navigation…" and the two Inbox cases (none).
+
+### DW-1411: A default agent whose DM status is not in the local cache yet at launch opens nothing.
+
+origin: rung `agents-100-launch` (2026-10-14)
+location: `keeper_core::agents::launch::choose`, `AccountManager::agents_launch_facts` (`proxy_rooms` lists only rooms whose newest status is read)
+reason: The launch asks once, after the Agents window's first batch. On a device whose event cache holds no status for the default agent's DM yet (a fresh sign-in, a cleared cache), `proxy_rooms` does not list the DM, so Agents opens with nothing selected and the notice says the agent has no conversation here, although the room appears seconds later. The steady state (a restored session, cache warm) is unaffected. A fix would let the boot effect ask again once when the answer's reason is "no conversation" and the Agents window grows, still never over the person's navigation.
+status: done 2026-10-14
+resolution: closed by rung `agents-100-launch`'s fix round 1 (R397, R100L1-01): readiness is Rust's. `AccountManager::agents_launch` answers through `keeper_core::agents::launch::resolve` only once every signed-in account's room list has finished its first sync since launch (`LaunchReadiness`, fed by each inbox producer's `RoomListLoadingState::Loaded`, an account that cannot start or signs out no longer waited for) or as soon as the default agent's `main` room is here, re-reading the rooms every `LAUNCH_RECHECK_MS` (a status can become readable without a sync finishing), and never later than `LAUNCH_READY_MS` (15 s), when a still-missing room's reason says the conversation "has not arrived yet". The front asks once after hydration and no longer treats the Agents window's first batch as a barrier. Tests: `agents::launch::tests::{the_default_agents_room_arriving_late_within_the_bound_opens_it, a_room_that_never_arrives_answers_at_the_bound_saying_it_has_not_arrived, a_second_account_slow_to_sync_is_waited_for, readiness_waits_for_every_started_account_and_not_for_one_that_could_not_start}`. Completed by fix round 2 (R409, R100L2-01/-02): the 15 s bound now covers looking at the rooms too (`resolve` runs every look under one `tokio::time::timeout`; at the bound it answers from the last look that finished, starting none), and readiness certifies only a look that began and ended under the same ready generation (`LaunchReadiness::ready() -> Option<u64>`), so a look begun before the last account was ready is repeated. Tests: `agents::launch::tests::a_first_look_that_never_comes_back_is_answered_at_the_bound`, `a_later_look_that_never_comes_back_is_answered_at_the_bound_from_the_last_that_did`, `an_account_ready_while_an_older_look_ran_is_looked_at_again`.
+
+### DW-1420: The approval card, the sessions board and a gate's delegate lines draw no agent mark, so they draw no agent picture either.
+
+origin: story 100.4 #2 (rung `agents-100-avatar`, 2026-10-14): every call site of the agent's mark was listed; the mark is drawn only by `BotIdentityCell` in `agent-room-header.tsx` (the chat and the notes dock's `ConversationBody`), and the Agents window's rows draw `RoomAvatar`
+location: `src/components/agents/approval-card.tsx`, `src/components/sessions/session-board.tsx`, `src/components/chat/gate-line.tsx`
+reason: those surfaces name an agent in words and carry no identity cell today; the brief's list assumed one. Giving them the agent's picture is a design decision (which cell, where, at what size) and needs the agent's user on their view models (`ApprovalCardVm`, the board's cards, `GateLineVm`); `AgentStatusVm.avatar`'s rule (`agents::room::agent_picture`) is the one to reuse.
+status: open
+
+### DW-1421: Removing an agent's `avatar.*` leaves its Matrix profile avatar as it was.
+
+origin: story 100.4 #3 (rung `agents-100-avatar`, 2026-10-14)
+location: `keeper_agent::avatar::publish_all`, `keeper_core::agents::avatar::publish`
+reason: a host publishes when the file's hash changes and records `dev.keeper.agent.avatar` {hash, mxc}; a home with no picture publishes nothing, because a file missing for a moment (a sync mid-way, a pointer not hydrated) must not clear what every device draws. Clearing on a deliberate removal would need the record to say the profile avatar is keeper's own (it does: the recorded `mxc` equals the profile's) and a removal seen on two scans; until then a person clears it from another client.
+status: open
+
+### DW-1422: agentd's failed picture upload reaches `status.json` and its journal, not the person's Settings › Agents row.
+
+origin: story 100.4 #5, R381 (rung `agents-100-avatar`, 2026-10-14)
+location: `keeper_agent::runtime::StatusFile` (`picture` beside each copy), `keeper_agent::desktop::listing`
+reason: on the desktop the sentence is under the agent's row (`AgentCopyVm.avatar_problem`); on an agentd host the person looking is the operator (`keeper-agentd status`, `journalctl`), and keeper on the Mac has no channel from agentd's status file. Carrying it to the Mac would be a field on the host manifest the Mac already reads in the control room.
+status: closed (R399 #5, fix round 1 of rung `agents-100-avatar`, 2026-10-14): every host carries its failed publications in its manifest (`HostManifest::picture_failures`, the failure's clause by agent), republished as soon as they change; a Mac's runtime keeps each other live host's (`HostRuntime::pictures_elsewhere`) and `DesktopHost::pictures` merges them into the row's sentence naming the host (`avatar::publish_failed`), gone once the manifest no longer says it. Tests: `hosts::tests::another_live_hosts_failed_picture_is_kept_for_the_rows`, `desktop::tests::a_failed_publication_on_another_host_is_said_in_the_agents_row`. A Mac that hosts no copy reads no manifest (DW-1426).
+
+### DW-1423: The per-account room list (`run_producer`) does not redraw an agent room's row when a picture changes; the merged inbox does.
+
+origin: story 100.4 #2 (rung `agents-100-avatar`, 2026-10-14)
+location: `keeper_core::account::run_producer`
+reason: the Agents window is fed by the merged inbox (`run_inbox_producer`), which keeps the rows it was handed and sends a `Set` for each agent room when `AgentIcons` changes. `run_producer` (the single-account `subscribe_room_list` stream) computes the picture per diff but keeps no rows, so a changed file shows there at the room's next change. No surface draws agent rows from it today.
+status: open
+
+### DW-1424: A publication whose upload and profile succeeded but whose record write failed uploads the same bytes again at its retry.
+
+origin: review-100avatar-1's additional candidate, R399 fix round 1 (rung `agents-100-avatar`, 2026-10-14)
+location: `keeper_core::agents::avatar::publish`, `keeper_agent::avatar::publish_held`
+reason: after R399 #3 a failure leaves nothing settled, and the retry reads the record (old hash) and the profile (the new `mxc`), so it uploads the file again and the first upload's media object stays unreferenced on the homeserver. Keeping the pending `{hash, mxc}` in the host's memory (or reading the profile's `mxc` back against the file) would let the retry resume at the record. Correct either way; costs one extra upload per such failure.
+status: open
+
+### DW-1425: `BotIdentityCell` hides the agent's mark as soon as a picture URL exists, before the image has loaded.
+
+origin: review-100avatar-1's additional candidate (rung `agents-100-avatar`, 2026-10-14)
+location: `src/components/bots/bot-identity.tsx`
+reason: the mark returns when the image fails (`onError`), but while it loads the cell is empty rather than showing the mark, as docs/agents.md says. Keeping the mark under the image until `onLoad` is a front-end change with its own browser proof.
+status: open
+
+### DW-1426: A Mac that hosts no copy of the principal's agents does not say another host's failed picture publication in Settings › Agents.
+
+origin: R399 #5 (rung `agents-100-avatar`, fix round 1, 2026-10-14)
+location: `keeper_agent::desktop::DesktopHost::pictures`, `keeper_agent::hosts::HostRuntime::pictures_elsewhere`
+reason: the other hosts' manifests are read by the Mac's host runtime, which exists only while the Mac hosts a copy (an agent signed in here); a Mac with every agent signed out lists the rows but reads no control room. Reading the manifests through the person's own account, which is a member of the control room, would cover it.
+status: open
+
+### DW-1427: The picture lease is taken but not kept through a publication.
+
+origin: review-100avatar-2 R100A2-01 (lane 100stack, 2026-10-15)
+location: `keeper_agent::avatar` (`publish_held`: acquire → publish → release), `keeper_core::agents::avatar::publish` (upload, profile, record), `keeper_core::agents::claim` (renew 60 s, stop at 120 s, takeover at 180 s)
+reason: nothing renews or checks the claim while the upload, the profile change and the record run, and the SDK gives `upload(…, None)` at least five minutes. A slow upload or a Mac that sleeps can outlive the claim; another host takes it and publishes, and the old task then sets the profile and the record without holding it. Fix: keep the lease alive while publishing, check ownership before each later effect (profile, record), bound the requests and stop when a renewal fails; test a delayed upload → expiry/takeover → the old upload completing.
+status: open
+
+### DW-1428: A host whose picture is settled never notices another host's newer publication.
+
+origin: review-100avatar-2 R100A2-02 (lane 100stack, 2026-10-15)
+location: `keeper_core::agents::avatar` (the settled-hash memo), `keeper_agent::avatar` (`publish_held` skips the server read for a settled hash)
+reason: host A publishes revision A and settles; host B, still on an older revision B, later takes the free claim and publishes B. A's unchanged file never triggers another read, so the profile stays B while A's memo says A is published. Fix: invalidate or reconcile the settled state when another host's publication or ownership changes, with a publication authority or revision rule so two disagreeing copies do not oscillate, and keep the no-upload-per-tick rule; test two hosts publishing different hashes in turn. The existing two-host test uses one file for both.
+status: open
+
+### DW-1429: A drive checked out as a linked git worktree reads its pictures' LFS objects from the wrong place.
+
+origin: review-100avatar-2 R100A2-04 (lane 100stack, 2026-10-15)
+location: `keeper_agent::zone::lfs_store` (`LfsStore::in_git_dir(drive_root.join(".git"))`), `keeper_sync::lfs::store::LfsStore::in_git_dir` (wants the common git directory)
+reason: in a linked worktree `.git` is a file, not a directory, so the store path does not exist, `contains` reads false and a pointer whose object is in the common repository's store is `NotHere`: the agent draws the letter (R414) and nothing is published until the file is materialised another way. Fix: resolve the repository's common git directory through keeper-sync's git integration rather than assuming `<root>/.git`; test a real linked worktree with a present, below-bound object, keeping the absent-object behaviour.
+status: open
+
+### DW-1430: The slash menu sends no analytics yet.
+
+origin: rung `agents-100-slash` (story 100.5 #5, 100.1 #9), 2026-10-14
+location: `src/hooks/use-slash-menu.ts` (opened, accepted), `src/components/chat/composer.tsx` (`obey`)
+reason: 100.1 owns `keeper_interaction`'s new closed surface values (slash menu opened, chosen); its helper is not on this rung's base (`agents-100-plan`), and inventing a second one would be two telemetry paths. At the stack step, once `agents-100-errors` is below this rung, the two counts are one call each at the places named above; nothing about a command's name or text may be sent (R381).
+status: done 2026-10-15
+resolution: closed by the stack step (lane 100stack, R415) in rung `agents-100-slash`'s commit "let a person type / in any chat: …": `useSlashMenu` (shared by the messenger and ⌘9 bot composers) calls `captureSurface("slashMenuOpened")` the first time the menu is drawn in a draft session and `captureSurface("slashMenuChosen")` the first time a row is accepted from it (completing a name and then running it is one choice); nothing about the command, the draft or the room is sent. Test: `composer-slash.test.tsx` "counts the menu opened and a row chosen once per draft session".
+
+### DW-1431: An agent room has no `/model` command.
+
+origin: rung `agents-100-slash` (story 100.5 #2, R394), 2026-10-14
+location: `keeper_core::chat::commands::COMMANDS` (the agent set), `src/components/chat/chat-commands.ts`
+reason: 100.2 builds the per-agent model and level and its Settings write; it is not on this rung's base, so the agent set offers `/new` and `/help` only. At the stack step, `/model [bot] [level]` belongs in the `AgentMain` set, resolved against the agent's `agent.toml` `[model]` in Rust and executed through 100.2's own write path.
+status: done 2026-10-15
+resolution: closed by the stack step (lane 100stack, R415) in rung `agents-100-slash`'s commit "let a person type / in any chat: …": `/model [bot] [level]` is in the agent DM's set (`chat::commands::COMMANDS`, `Need::HomeHere` from `AgentIcons::is_here`), read by `keeper_core::agents::model::command` against the agent's `agent.toml` and saved by `keeper_agent::desktop::model_command` through `write_model` — Settings › Agents' own save — from the shell's `agent_model_command`; elsewhere it is listed with its reason and refused. Tests: `chat_commands::model_is_the_agents_dms_and_needs_the_home_here`, `agents::model::tests::model_typed_in_the_dm_reads_a_bot_and_a_level`, `desktop::tests::model_typed_in_the_dm_saves_as_settings_does`, `chat-commands.test.ts` "runs /model through Rust and shows its sentence, or its refusal".
+
+### DW-1432: The person's room commands have no live test against a homeserver.
+
+origin: rung `agents-100-slash` (story 100.5), 2026-10-14
+location: `Accounts::send_text` with `MessageKind::Emote`, `Accounts::room_set_topic`, `room_invite`, `room_leave`, `chat_command_context` (power levels)
+reason: keeper-core has no harness that activates the person's `Accounts` against delectra's Synapse (the live tests drive `AgentClient`), so the emote's wire shape, a topic or invite refused by power levels and a leave are proven by the SDK calls they make and by the decision tests, not against a server. Owed: a hesperia run (send `/me`, `/topic`, `/invite`, `/leave` in a test room and read them in a second client), or a live `Accounts` harness.
+status: open
+
+### DW-1433: Stop, pause and the scope are not slash commands in an agent room.
+
+origin: rung `agents-100-slash` (story 100.5 #2, R394), 2026-10-14
+location: `keeper_core::agents::proxy::AgentOutbound` (closed, five variants), `src/components/notes/notes-agent-dock.tsx` (the scope editor)
+reason: the device has no stop or pause verb for a run (the host owns it), and a scope is edited only in the notes dock; a command for either would be a new agent protocol or a second editor, which R385 rules out. When either verb exists on the device, it joins the agent set in Rust.
+status: open

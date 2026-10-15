@@ -26,19 +26,22 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 use keeper_core::agents::agentd::DrivePin;
+use keeper_core::agents::avatar;
 use keeper_core::agents::copy::{self, AgentCopyVm};
 use keeper_core::agents::drive::DriveDecl;
 use keeper_core::agents::events::CONTROL_ROOM_TYPE;
-use keeper_core::agents::home::AgentKind;
+use keeper_core::agents::home::{self, AgentKind};
 use keeper_core::agents::host::Materialized;
 use keeper_core::agents::index::Index;
 use keeper_core::agents::log::HostSlug;
 use keeper_core::agents::mac_tables::{self, Heard, HeardTool, MacTables};
 use keeper_core::agents::matrix::{self, AgentClient, AgentMatrixError};
+use keeper_core::agents::model::{self, AgentModelLineVm, AgentModelReq};
 use keeper_core::agents::mount::pin_matches;
 use keeper_core::agents::proxy::ProxyFacts;
-use keeper_core::agents::room::ScopeDriveVm;
+use keeper_core::agents::room::{ScopeDriveVm, ZoneAgent, ZoneAvatar};
 use keeper_core::agents::run::SandboxTable;
+use keeper_core::agents::seed::AgentSeedBotVm;
 use keeper_core::agents::soul;
 use keeper_core::agents::trust::{Anchor, OwnAccount};
 use keeper_core::bots::chat::{self, CancelHandle, CancelSignal};
@@ -62,7 +65,7 @@ use crate::runtime::{
 use crate::sinks::ClientDoors;
 use crate::surface::declared;
 use crate::turn::TurnEnv;
-use crate::zone::{read_text, read_zone, AgentHome, ZoneRead};
+use crate::zone::{read_text, read_zone, AgentHome, HomeAvatar, ZoneRead};
 
 /// Why a pinnable drive hosts nothing before its first sign-in.
 pub const UNPINNED: &str =
@@ -259,6 +262,11 @@ pub type Problems = HashMap<OwnedUserId, String>;
 /// Display names by Matrix user.
 pub type Names = BTreeMap<OwnedUserId, String>;
 
+/// Each agent's failed publications of its picture as its Matrix profile
+/// avatar, by Matrix user: this Mac's own and those other hosts' manifests
+/// say (story 100.4, R399).
+pub type Pictures = HashMap<OwnedUserId, Vec<avatar::PublishFailure>>;
+
 /// The sentence for an agent whose server no signed-in account is on.
 pub fn no_homeserver(user: &UserId) -> String {
     format!(
@@ -275,13 +283,17 @@ pub fn no_homeserver(user: &UserId) -> String {
 ///
 /// Whether each copy is signed in is read from `platform`'s keychain;
 /// `names` are people's display names; `problems` what the running host
-/// found about a copy.
+/// found about a copy; `pictures` each host's failed publication of a
+/// copy's picture as its profile avatar (story 100.4, R399) — said beside
+/// what the home's own `avatar.*` files keep from being its picture.
 pub fn listing(
     facts: &DesktopFacts,
     rows: &[ProviderRow],
+    bots: model::Choices<'_>,
     platform: &dyn Platform,
     names: &Names,
     problems: &Problems,
+    pictures: &Pictures,
 ) -> Vec<AgentCopyVm> {
     let mut listed = Vec::new();
     for profile in facts.profiles.iter().filter(|p| p.agents.is_some()) {
@@ -299,6 +311,8 @@ pub fn listing(
                     signed_in: false,
                     pin: None,
                     problem: Some(sentence),
+                    model: None,
+                    avatar_problem: None,
                 });
                 continue;
             }
@@ -334,6 +348,8 @@ pub fn listing(
             } else {
                 problems.get(user).cloned()
             };
+            let avatar_problem =
+                picture_sentence(profile, home, pictures.get(user).map(Vec::as_slice));
             listed.push(AgentCopyVm {
                 profile_id: profile.id.clone(),
                 drive: decl.id.clone(),
@@ -345,6 +361,12 @@ pub fn listing(
                 host: facts.device.clone(),
                 pin: Some(pin_vm.clone()),
                 problem,
+                model: Some(model::model_vm(
+                    &home.config,
+                    bots,
+                    (!profile.direction.pushes()).then(|| model::pull_only(&decl.id)),
+                )),
+                avatar_problem,
             });
         }
     }
@@ -352,11 +374,14 @@ pub fn listing(
 }
 
 /// Every agent of a flagged folder of this principal's, by Matrix user, with
-/// its `SOUL.md` `icon` when its soul reads and names one: the agents this
-/// Mac knows, whose briefs its rooms draw as briefs (R114), and the mark
-/// each room's header draws (91.1 acceptance 6). keeper-core keeps only the
-/// marks the bot identity draws.
-pub fn zone_agents(facts: &DesktopFacts) -> BTreeMap<OwnedUserId, Option<String>> {
+/// its `SOUL.md` `icon` when its soul reads and names one, and its home's
+/// picture (story 100.4): the agents this Mac knows, whose briefs its rooms
+/// draw as briefs (R114), the mark each room's header draws (91.1
+/// acceptance 6) and the picture drawn over it. The picture is read under
+/// the sync profile's root — `keeper-file://`'s root — so the path it landed
+/// at is the one that URL serves. keeper-core keeps only the marks the bot
+/// identity draws.
+pub fn zone_agents(facts: &DesktopFacts) -> BTreeMap<OwnedUserId, ZoneAgent> {
     let mut agents = BTreeMap::new();
     for profile in facts.profiles.iter().filter(|p| p.agents.is_some()) {
         let Ok(decl) = declared(profile) else {
@@ -378,10 +403,253 @@ pub fn zone_agents(facts: &DesktopFacts) -> BTreeMap<OwnedUserId, Option<String>
                 .and_then(|text| soul::parse_soul(&text, &home.config.name).ok())
                 .map(|soul| soul.icon)
                 .filter(|icon| !icon.trim().is_empty());
-            agents.insert(home.config.matrix_user.clone(), icon);
+            let picture = profile_avatar(profile, home);
+            let avatar = picture
+                .scan
+                .avatar
+                .as_ref()
+                .zip(picture.path)
+                .map(|(file, path)| ZoneAvatar {
+                    profile: profile.id.clone(),
+                    path,
+                    hash: file.hash.clone(),
+                });
+            agents.insert(
+                home.config.matrix_user.clone(),
+                ZoneAgent {
+                    icon,
+                    avatar,
+                    problems: picture.scan.problems,
+                    not_here: picture.scan.not_here,
+                },
+            );
         }
     }
     agents
+}
+
+/// Each agent of this principal's flagged folders, by Matrix user, with its
+/// model line — its bot named as the person's bots name it, and its level
+/// — for the room header (100.2 #7). A home that does not read has none.
+pub fn zone_models(
+    facts: &DesktopFacts,
+    bots: &[AgentSeedBotVm],
+) -> BTreeMap<OwnedUserId, AgentModelLineVm> {
+    let mut models = BTreeMap::new();
+    for profile in facts.profiles.iter().filter(|p| p.agents.is_some()) {
+        let Ok(decl) = declared(profile) else {
+            continue;
+        };
+        if facts
+            .login
+            .as_deref()
+            .is_some_and(|login| copy::hosts_principal(&decl, login).is_err())
+        {
+            continue;
+        }
+        for (_, home) in read_zone(&decl.id, profile, Some(&decl)).homes {
+            let Ok(home) = home else { continue };
+            models.insert(
+                home.config.matrix_user.clone(),
+                model::line(&home.config, bots),
+            );
+        }
+    }
+    models
+}
+
+/// Settings › Agents' save of one agent's model (100.2 #4, #8; R382, R405):
+/// the home's `agent.toml` with `[model].bot` and `[model].effort` changed
+/// and every other byte kept, written through the drive's own write path —
+/// `WriteScope::route` and its compare-and-replace writer, as the Files
+/// surface saves a person's file — as the person. The folder's engine
+/// commits and pushes it like any edit; the agent's next turn runs on it
+/// ([`crate::agent::current_model`]). Each refusal is one sentence.
+pub fn write_model(
+    profiles: &[SyncProfile],
+    req: &AgentModelReq,
+    bots: model::Choices<'_>,
+) -> Result<(), String> {
+    prepare_model(profiles, req, bots)?.publish()
+}
+
+/// `/model` typed in `agent`'s DM (story 100.5, DW-1431, R415): nothing
+/// after it says what the agent runs on; a bot and/or a level is saved by
+/// [`write_model`] — the very save Settings › Agents makes, from what this
+/// read of `agent.toml` showed, so a file changed meanwhile is refused. An
+/// agent with no home among this principal's drives here is refused with
+/// [`model::HOME_NOT_HERE`]. Each answer is one sentence.
+pub fn model_command(
+    facts: &DesktopFacts,
+    agent: &UserId,
+    args: Option<&str>,
+    bots: model::Choices<'_>,
+) -> Result<String, String> {
+    let (profile_id, folder, config) =
+        home_of(facts, agent).ok_or_else(|| model::HOME_NOT_HERE.to_owned())?;
+    let named = bots.unwrap_or(&[]);
+    match model::command(args, &config, bots)? {
+        model::ModelCommand::Show => Ok(model::running(&config, named)),
+        model::ModelCommand::Set { bot, effort } => {
+            let req = AgentModelReq {
+                profile_id,
+                agent: folder,
+                bot,
+                effort,
+                shown_bot: config.bot.reference(),
+                shown_effort: config.effort,
+            };
+            write_model(&facts.profiles, &req, bots)?;
+            let mut saved = config.clone();
+            saved.bot = home::BotRef::parse(&req.bot).map_err(|reason| format!("{reason}."))?;
+            saved.effort = req.effort;
+            Ok(model::now_running(
+                &config.name,
+                &model::line(&saved, named),
+            ))
+        }
+    }
+}
+
+/// The home of `agent` among this principal's flagged folders: its sync
+/// profile, its folder in the zone and its `agent.toml` as it reads now.
+fn home_of(facts: &DesktopFacts, agent: &UserId) -> Option<(String, String, home::AgentConfig)> {
+    for profile in facts.profiles.iter().filter(|p| p.agents.is_some()) {
+        let Ok(decl) = declared(profile) else {
+            continue;
+        };
+        if facts
+            .login
+            .as_deref()
+            .is_some_and(|login| copy::hosts_principal(&decl, login).is_err())
+        {
+            continue;
+        }
+        for (folder, home) in read_zone(&decl.id, profile, Some(&decl)).homes {
+            if let Ok(home) = home {
+                if home.config.matrix_user.as_str() == agent.as_str() {
+                    return Some((profile.id.clone(), folder, home.config));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// A model save made from one read of `agent.toml` (R405): the bytes it
+/// read, their revision, and what replaces them.
+#[derive(Debug)]
+pub struct ModelSave {
+    name: String,
+    target: keeper_sync::files_write::UnmanagedPath,
+    read: keeper_sync::files_write::Revision,
+    next: String,
+}
+
+impl ModelSave {
+    /// Write it, only over the bytes it was made from: a file changed since
+    /// — another save, a sync, a hand edit — keeps its change and the save
+    /// is refused, saying so.
+    pub fn publish(self) -> Result<(), String> {
+        use keeper_sync::files_write::{self, WriteRefusal};
+        match files_write::replace_unmanaged(&self.target, &self.read, &self.next) {
+            Ok(()) => Ok(()),
+            Err(WriteRefusal::ChangedSinceRead { .. }) => {
+                Err(model::changed_while_saving(&self.name))
+            }
+            Err(refusal) => Err(refusal.to_string()),
+        }
+    }
+}
+
+/// The first half of [`write_model`]: `agent.toml` read once, `req` checked
+/// against what those very bytes say — the row showed this model, the bot is
+/// offered — those bytes edited and parsed as the host will parse them, and
+/// the path routed through `WriteScope::route`. Nothing is written.
+pub fn prepare_model(
+    profiles: &[SyncProfile],
+    req: &AgentModelReq,
+    bots: model::Choices<'_>,
+) -> Result<ModelSave, String> {
+    use keeper_sync::files_write::{Revision, WriteRoute, WriteScope};
+
+    let (profile, decl, home) = find_home(profiles, &req.profile_id, &req.agent)?;
+    if !profile.direction.pushes() {
+        return Err(model::pull_only(&decl.id));
+    }
+    let file = format!("{}/{}", home.config.id, home::FILE_NAME);
+    let text = read_text(&home.zone, &file)?
+        .ok_or_else(|| format!("{file} is not on this Mac any more."))?;
+    let read = Revision::of(text.as_bytes());
+    let config = home::parse_agent_toml(&text, &home.config.id, &decl)
+        .map_err(|refusal| refusal.to_string())?;
+    let bot = model::check(req, &config, bots)?;
+    let next = home::with_model(&text, &bot.reference(), req.effort)
+        .map_err(|refusal| refusal.to_string())?;
+    home::parse_agent_toml(&next, &home.config.id, &decl).map_err(|refusal| refusal.to_string())?;
+    let subpath = format!(
+        "{}/{}",
+        crate::agent::drive_relative(&profile.local_path, &home.dir),
+        home::FILE_NAME
+    );
+    let scope = WriteScope::new(&profile.name, None).with_sessions(
+        profile
+            .sessions
+            .as_ref()
+            .map(|sessions| sessions.subfolder.as_str()),
+    );
+    match scope
+        .route(None::<()>, &profile.local_path, &subpath)
+        .map_err(|refusal| refusal.to_string())?
+    {
+        WriteRoute::Unmanaged(target) => Ok(ModelSave {
+            name: config.name,
+            target,
+            read,
+            next,
+        }),
+        WriteRoute::Vault { .. } => Err(format!(
+            "{subpath} is inside a notes vault, which this Mac writes only from the notes view."
+        )),
+    }
+}
+
+/// `home`'s picture read under `profile`'s root (`keeper-file://`'s), the
+/// home named by the zone's folder and its own, its pointers' objects in
+/// the profile's own git-LFS store.
+fn profile_avatar(profile: &SyncProfile, home: &AgentHome) -> HomeAvatar {
+    let Some(zone) = profile.agents.as_ref() else {
+        return HomeAvatar::default();
+    };
+    let folder = zone.subfolder.trim().trim_matches('/');
+    crate::zone::read_avatar(
+        &profile.local_path,
+        &format!("{folder}/{}", home.config.id),
+        &crate::zone::lfs_store(&profile.local_path),
+    )
+}
+
+/// What `home`'s Settings › Agents row says of its picture: why its own
+/// `avatar.*` files are not its picture, then each host's failed
+/// publication, every sentence naming the agent; `None` when all is well.
+fn picture_sentence(
+    profile: &SyncProfile,
+    home: &AgentHome,
+    failures: Option<&[avatar::PublishFailure]>,
+) -> Option<String> {
+    let name = &home.config.name;
+    let sentences: Vec<String> = profile_avatar(profile, home)
+        .scan
+        .sentence(name)
+        .into_iter()
+        .chain(
+            failures
+                .into_iter()
+                .flatten()
+                .map(|failure| avatar::publish_failed(name, failure)),
+        )
+        .collect();
+    (!sentences.is_empty()).then(|| sentences.join(" "))
 }
 
 /// Each proxy of this principal's flagged folders, by Matrix user: its
@@ -603,6 +871,9 @@ pub struct DesktopHost {
     version: String,
     built: Option<Built>,
     problems: HashMap<OwnedUserId, String>,
+    /// Why each copy's picture could not be published as its profile
+    /// avatar (story 100.4), for the rows.
+    pictures: crate::avatar::Failures,
     /// The receiver every copy answers doorbells with.
     doorbell: Arc<Doorbell>,
     /// The doorbells' work over the app's engine, once handed over
@@ -619,6 +890,7 @@ impl DesktopHost {
             version: version.to_owned(),
             built: None,
             problems: HashMap::new(),
+            pictures: Arc::default(),
             doorbell: Arc::default(),
             engine: None,
         }
@@ -642,6 +914,37 @@ impl DesktopHost {
     /// What the running host found about each copy, for the listing.
     pub fn problems(&self) -> &HashMap<OwnedUserId, String> {
         &self.problems
+    }
+
+    /// Each failed publication of an agent's picture as its profile
+    /// avatar, for the listing's `pictures` (story 100.4, R399): this Mac's
+    /// own, and those the other live hosts' manifests said at the last
+    /// tick — agentd's on electra among them.
+    pub fn pictures(&self) -> Pictures {
+        let mut pictures = Pictures::new();
+        for (user, error) in self
+            .pictures
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+        {
+            pictures
+                .entry(user.clone())
+                .or_default()
+                .push(avatar::PublishFailure {
+                    host: None,
+                    error: error.clone(),
+                });
+        }
+        if let Some(built) = &self.built {
+            for (user, failure) in built.runtime.pictures_elsewhere() {
+                pictures
+                    .entry(user.clone())
+                    .or_default()
+                    .push(failure.clone());
+            }
+        }
+        pictures
     }
 
     /// The claims this host holds.
@@ -677,6 +980,17 @@ impl DesktopHost {
     pub async fn tick(&mut self, facts: Option<DesktopFacts>) {
         if let Some(facts) = facts {
             self.scan(facts).await;
+            // Each copy's picture becomes its profile avatar when its file
+            // changed (story 100.4), beside the tick; the draw scan says the
+            // home's file problems.
+            if let Some(built) = self.built.as_ref() {
+                crate::avatar::publish_all(
+                    &built.copies,
+                    built.runtime.picture_round().as_ref(),
+                    &self.pictures,
+                    false,
+                );
+            }
         }
         let Some(built) = self.built.as_mut() else {
             return;
@@ -932,7 +1246,8 @@ impl DesktopHost {
             copies.clone(),
             sandbox.is_some(),
         )
-        .with_mcp(Arc::clone(&mcp));
+        .with_mcp(Arc::clone(&mcp))
+        .with_pictures(Arc::clone(&self.pictures));
         self.doorbell
             .set_principal_agents(runtime.principal_agents());
         let (stop, signal) = chat::cancellation();
@@ -1355,15 +1670,252 @@ mod tests {
         let rows = listing(
             &facts,
             &[],
+            Ok(&[]),
             &platform(root.path()),
             &Names::new(),
             &Problems::new(),
+            &Pictures::new(),
         );
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert_eq!(rows[0].profile_id, "p1");
         assert_eq!(rows[0].agent, "");
         assert_eq!(rows[0].pin, None);
         assert_eq!(rows[0].problem.as_deref(), Some(sentence.as_str()));
+    }
+
+    /// 100.2 #4 and #8 (R382): Settings › Agents lists the agent's model
+    /// with the person's bots, and a save writes only `[model].bot` and
+    /// `[model].effort` of its `agent.toml` through the drive's write path;
+    /// a file changed meanwhile, a Mac that only pulls the drive and a file
+    /// a merge left unreadable are each refused with a sentence, the file
+    /// as it was.
+    #[test]
+    fn a_saved_model_writes_two_keys_of_agent_toml_or_says_why_not() {
+        use keeper_core::agents::model::{AgentModelReq, CHANGED_UNDERNEATH};
+        use keeper_core::bots::chat::Effort;
+
+        let root = tempfile::tempdir().expect("tempdir");
+        nixi_drive(root.path());
+        let file = root.path().join("80-agents/nixi/agent.toml");
+        let before = format!(
+            "# Nixi, by hand.\n{}\n[tools]  # mine\ndrives = [\"tgdrive\"]\n",
+            std::fs::read_to_string(&file).expect("agent.toml")
+        );
+        std::fs::write(&file, &before).expect("commented");
+        let current = format!("bot:ollama:{NIXI_BOT}#model");
+        const OPUS: &str = "bot:openai:https://provider.example:8452#claude-opus";
+        let bots = vec![AgentSeedBotVm {
+            reference: OPUS.to_owned(),
+            name: "Opus".to_owned(),
+            provider: "CLIProxyAPI".to_owned(),
+            efforts: Effort::ALL.to_vec(),
+        }];
+        let profile = profile(root.path());
+        let facts = DesktopFacts {
+            login: Some("tgorka".to_owned()),
+            device: Some("hesperia".to_owned()),
+            profiles: vec![profile.clone()],
+            ..DesktopFacts::default()
+        };
+        let rows = listing(
+            &facts,
+            &[],
+            Ok(&bots),
+            &platform(root.path()),
+            &Names::new(),
+            &Problems::new(),
+            &Pictures::new(),
+        );
+        let shown = rows[0].model.clone().expect("a model");
+        let current = keeper_core::agents::home::BotRef::parse(&current)
+            .expect("bot")
+            .reference();
+        assert_eq!(shown.bot, current);
+        assert_eq!(shown.effort, None);
+        let names: Vec<&str> = shown.bots.iter().map(|bot| bot.name.as_str()).collect();
+        assert_eq!(names, vec!["model", "Opus"]);
+        assert_eq!(shown.locked, None);
+
+        let save = |effort| AgentModelReq {
+            profile_id: "p1".to_owned(),
+            agent: "nixi".to_owned(),
+            bot: OPUS.to_owned(),
+            effort,
+            shown_bot: shown.bot.clone(),
+            shown_effort: shown.effort,
+        };
+        write_model(&facts.profiles, &save(Some(Effort::Xhigh)), Ok(&bots)).expect("saved");
+        let after = std::fs::read_to_string(&file).expect("agent.toml");
+        assert_eq!(
+            after,
+            before.replace(
+                &format!("bot:ollama:{NIXI_BOT}#model\""),
+                &format!("{OPUS}\"\neffort = \"xhigh\"")
+            )
+        );
+
+        // The row showed the old model: the file moved on since.
+        assert_eq!(
+            write_model(&facts.profiles, &save(Some(Effort::Low)), Ok(&bots)),
+            Err(CHANGED_UNDERNEATH.to_owned())
+        );
+        assert_eq!(std::fs::read_to_string(&file).expect("kept"), after);
+
+        let mut pulling = profile.clone();
+        pulling.direction = keeper_sync::profile::SyncDirection::PullOnly;
+        let refused =
+            write_model(&[pulling.clone()], &save(None), Ok(&bots)).expect_err("pull-only");
+        assert!(refused.contains("only pulls tgdrive"), "{refused}");
+        let pulled = listing(
+            &DesktopFacts {
+                profiles: vec![pulling],
+                ..facts.clone()
+            },
+            &[],
+            Ok(&bots),
+            &platform(root.path()),
+            &Names::new(),
+            &Problems::new(),
+            &Pictures::new(),
+        );
+        assert_eq!(
+            pulled[0]
+                .model
+                .as_ref()
+                .and_then(|model| model.locked.clone()),
+            Some(refused)
+        );
+
+        let merged = format!("{after}<<<<<<< ours\n");
+        std::fs::write(&file, &merged).expect("conflicted");
+        let refused = write_model(&facts.profiles, &save(None), Ok(&bots)).expect_err("unreadable");
+        assert!(refused.contains("not valid TOML"), "{refused}");
+        assert_eq!(std::fs::read_to_string(&file).expect("kept"), merged);
+    }
+
+    /// DW-1431 (R415): `/model` in Nixi's DM saves through Settings' own
+    /// write — only `[model]` changes, the next read names the new model —
+    /// a bare `/model` writes nothing, a bot she is not offered changes
+    /// nothing, and an agent with no home among this Mac's drives is refused.
+    #[test]
+    fn model_typed_in_the_dm_saves_as_settings_does() {
+        use keeper_core::bots::chat::Effort;
+
+        let root = tempfile::tempdir().expect("tempdir");
+        nixi_drive(root.path());
+        let file = root.path().join("80-agents/nixi/agent.toml");
+        const OPUS: &str = "bot:openai:https://provider.example:8452#claude-opus";
+        let bots = vec![AgentSeedBotVm {
+            reference: OPUS.to_owned(),
+            name: "Opus".to_owned(),
+            provider: "CLIProxyAPI".to_owned(),
+            efforts: Effort::ALL.to_vec(),
+        }];
+        let facts = DesktopFacts {
+            login: Some("tgorka".to_owned()),
+            profiles: vec![profile(root.path())],
+            ..DesktopFacts::default()
+        };
+        let nixi = OwnedUserId::try_from("@nixi:example.org").expect("user");
+        let before = std::fs::read_to_string(&file).expect("agent.toml");
+
+        model_command(&facts, &nixi, None, Ok(&bots)).expect("shown");
+        model_command(&facts, &nixi, Some("gpt-9"), Ok(&bots)).expect_err("not offered");
+        assert_eq!(std::fs::read_to_string(&file).expect("kept"), before);
+
+        model_command(&facts, &nixi, Some("opus xhigh"), Ok(&bots)).expect("saved");
+        let after = std::fs::read_to_string(&file).expect("agent.toml");
+        assert_eq!(
+            after,
+            before.replace(
+                &format!("bot:ollama:{NIXI_BOT}#model\""),
+                &format!("{OPUS}\"\neffort = \"xhigh\"")
+            )
+        );
+        let reread = home_of(&facts, &nixi).expect("home").2;
+        assert_eq!(reread.effort, Some(Effort::Xhigh));
+        // A level alone keeps the bot.
+        model_command(&facts, &nixi, Some("low"), Ok(&bots)).expect("saved");
+        let reread = home_of(&facts, &nixi).expect("home").2;
+        assert_eq!(
+            (reread.bot.reference(), reread.effort),
+            (
+                keeper_core::agents::home::BotRef::parse(OPUS)
+                    .expect("bot")
+                    .reference(),
+                Some(Effort::Low)
+            )
+        );
+
+        let tola = OwnedUserId::try_from("@tola:example.org").expect("user");
+        assert_eq!(
+            model_command(&facts, &tola, Some("opus"), Ok(&bots)),
+            Err(keeper_core::agents::model::HOME_NOT_HERE.to_owned())
+        );
+    }
+
+    /// R405 (R100M1-01): a save's read and its write are one snapshot. A
+    /// competing save of the model, or a sync's edit to another table,
+    /// landing between them is never written over: the save is refused with
+    /// "changed while you were saving" and the file keeps the other change;
+    /// a save made from the file as it reads now then goes through.
+    #[test]
+    fn a_change_between_a_saves_read_and_its_write_is_never_overwritten() {
+        use keeper_core::agents::home::with_model;
+        use keeper_core::agents::model::AgentModelReq;
+        use keeper_core::bots::chat::Effort;
+
+        let root = tempfile::tempdir().expect("tempdir");
+        nixi_drive(root.path());
+        let file = root.path().join("80-agents/nixi/agent.toml");
+        let current =
+            keeper_core::agents::home::BotRef::parse(&format!("bot:ollama:{NIXI_BOT}#model"))
+                .expect("bot")
+                .reference();
+        const OPUS: &str = "bot:openai:https://provider.example:8452#claude-opus";
+        let bots = vec![AgentSeedBotVm {
+            reference: OPUS.to_owned(),
+            name: "Opus".to_owned(),
+            provider: "CLIProxyAPI".to_owned(),
+            efforts: Effort::ALL.to_vec(),
+        }];
+        let profiles = vec![profile(root.path())];
+        let save = |shown_effort| AgentModelReq {
+            profile_id: "p1".to_owned(),
+            agent: "nixi".to_owned(),
+            bot: OPUS.to_owned(),
+            effort: Some(Effort::Xhigh),
+            shown_bot: current.clone(),
+            shown_effort,
+        };
+        let before = std::fs::read_to_string(&file).expect("agent.toml");
+
+        // Another save of the model lands after this one read the file.
+        let mine = prepare_model(&profiles, &save(None), Ok(&bots)).expect("prepared");
+        let theirs = with_model(&before, &current, Some(Effort::Low)).expect("theirs");
+        std::fs::write(&file, &theirs).expect("their save");
+        assert_eq!(
+            mine.publish(),
+            Err(
+                "Nixi's agent.toml changed while you were saving — reopen and try again."
+                    .to_owned()
+            )
+        );
+        assert_eq!(std::fs::read_to_string(&file).expect("kept"), theirs);
+
+        // A sync edits another table after this save read the file.
+        let mine = prepare_model(&profiles, &save(Some(Effort::Low)), Ok(&bots)).expect("prepared");
+        let synced = format!("{theirs}\n[limits]\nrounds_per_turn = 4\n");
+        std::fs::write(&file, &synced).expect("a sync");
+        assert!(mine.publish().is_err());
+        assert_eq!(std::fs::read_to_string(&file).expect("kept"), synced);
+
+        // Made from the file as it reads now, the save writes its two keys.
+        write_model(&profiles, &save(Some(Effort::Low)), Ok(&bots)).expect("saved");
+        assert_eq!(
+            std::fs::read_to_string(&file).expect("saved"),
+            with_model(&synced, OPUS, Some(Effort::Xhigh)).expect("expected")
+        );
     }
 
     /// Each agent of the principal's flagged folders, by Matrix user, with
@@ -1384,8 +1936,15 @@ mod tests {
             ..DesktopFacts::default()
         };
         let nixi = OwnedUserId::try_from("@nixi:example.org").expect("user");
-        let nixi_with =
-            |icon: Option<&str>| BTreeMap::from([(nixi.clone(), icon.map(str::to_owned))]);
+        let nixi_with = |icon: Option<&str>| {
+            BTreeMap::from([(
+                nixi.clone(),
+                ZoneAgent {
+                    icon: icon.map(str::to_owned),
+                    ..ZoneAgent::default()
+                },
+            )])
+        };
         assert_eq!(
             zone_agents(&facts("tgorka")),
             nixi_with(None),
@@ -1401,6 +1960,164 @@ mod tests {
             nixi_with(None),
             "no icon named"
         );
+    }
+
+    /// Story 100.4 #1/#2: the home's picture, landed under the profile's
+    /// root as `keeper-file://` serves it, with its content's hash; a file
+    /// past 256 KiB or of another format is not the picture and is named.
+    #[test]
+    fn each_hosted_agent_carries_its_homes_picture_from_the_profile_root() {
+        let root = tempfile::tempdir().expect("tempdir");
+        nixi_drive(root.path());
+        let facts = DesktopFacts {
+            login: Some("tgorka".to_owned()),
+            profiles: vec![profile(root.path())],
+            ..DesktopFacts::default()
+        };
+        let nixi = OwnedUserId::try_from("@nixi:example.org").expect("user");
+        let read = || zone_agents(&facts).remove(&nixi).expect("nixi");
+        assert_eq!(read().avatar, None, "a seeded agent keeps its letter");
+
+        std::fs::write(root.path().join("80-agents/nixi/avatar.png"), PNG).expect("png");
+        write(root.path(), "80-agents/nixi/avatar.svg", "<svg/>");
+        let picture = read().avatar.expect("a picture");
+        assert_eq!(picture.profile, profile(root.path()).id);
+        assert_eq!(picture.path, "80-agents/nixi/avatar.svg");
+        let first = picture.hash;
+        write(root.path(), "80-agents/nixi/avatar.svg", "<svg></svg>");
+        assert_ne!(read().avatar.expect("a picture").hash, first);
+
+        let big = "x".repeat(256 * 1024 + 1);
+        write(root.path(), "80-agents/nixi/avatar.svg", &big);
+        write(root.path(), "80-agents/nixi/avatar.gif", "gif");
+        let agent = read();
+        assert_eq!(
+            agent.avatar.map(|picture| picture.path).as_deref(),
+            Some("80-agents/nixi/avatar.png")
+        );
+        let named: Vec<&str> = agent.problems.iter().map(|p| p.file()).collect();
+        assert_eq!(named, ["avatar.svg", "avatar.gif"]);
+    }
+
+    const PNG: &[u8] = b"\x89PNG\r\n\x1a\nnixi";
+
+    /// A git-LFS pointer as a drive's checkout holds it.
+    fn lfs_pointer(oid: &str, size: u64) -> String {
+        format!("version https://git-lfs.github.com/spec/v1\noid sha256:{oid}\nsize {size}\n")
+    }
+
+    /// R399 #6: a pointer is judged by its object — past 256 KiB by the
+    /// size it names (the next file is the picture), not on this Mac (the
+    /// letter), or in the drive's own store (the object's bytes are the
+    /// picture, at the pointer's path).
+    #[test]
+    fn a_pointers_object_decides_whether_it_is_the_picture() {
+        let root = tempfile::tempdir().expect("tempdir");
+        nixi_drive(root.path());
+        let facts = DesktopFacts {
+            login: Some("tgorka".to_owned()),
+            profiles: vec![profile(root.path())],
+            ..DesktopFacts::default()
+        };
+        let nixi = OwnedUserId::try_from("@nixi:example.org").expect("user");
+        let read = || zone_agents(&facts).remove(&nixi).expect("nixi");
+        std::fs::write(root.path().join("80-agents/nixi/avatar.png"), PNG).expect("png");
+
+        let large = 300 * 1024;
+        write(
+            root.path(),
+            "80-agents/nixi/avatar.svg",
+            &lfs_pointer(&"a".repeat(64), large),
+        );
+        let agent = read();
+        assert_eq!(
+            agent.avatar.map(|picture| picture.path).as_deref(),
+            Some("80-agents/nixi/avatar.png")
+        );
+        assert_eq!(
+            agent.problems,
+            [keeper_core::agents::avatar::AvatarProblem::TooLarge {
+                file: "avatar.svg".to_owned(),
+                bytes: large,
+            }]
+        );
+
+        let svg = b"<svg xmlns=\"http://www.w3.org/2000/svg\"/>";
+        let (oid, size) = keeper_sync::lfs::store::LfsStore::digest_of(&svg[..]).expect("digest");
+        write(
+            root.path(),
+            "80-agents/nixi/avatar.svg",
+            &lfs_pointer(&oid, size),
+        );
+        let agent = read();
+        assert_eq!(
+            agent.avatar, None,
+            "the letter, while the object is not here"
+        );
+        assert!(agent.problems.is_empty(), "{:?}", agent.problems);
+        assert!(agent.not_here);
+        // R100A2-05: the letter even where the room holds a profile avatar
+        // for the agent, which may be an older picture.
+        let icons = keeper_core::agents::room::AgentIcons::default();
+        icons.replace(zone_agents(&facts));
+        let room = matrix_sdk::ruma::RoomId::parse("!r:example.org").expect("room");
+        assert_eq!(
+            keeper_core::agents::room::agent_picture(&icons, "acct", &room, &nixi, Some("v1")),
+            None
+        );
+
+        let object = crate::zone::lfs_store(root.path()).object_path(&oid);
+        std::fs::create_dir_all(object.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&object, svg).expect("object");
+        icons.replace(zone_agents(&facts));
+        assert!(
+            keeper_core::agents::room::agent_picture(&icons, "acct", &room, &nixi, Some("v1"))
+                .is_some_and(|url| keeper_core::file_asset::parse_file_url(&url).is_some()),
+            "the object, once here, is the picture"
+        );
+        let picture = read().avatar.expect("the object is the picture");
+        assert_eq!(picture.path, "80-agents/nixi/avatar.svg");
+        assert_eq!(picture.hash, oid);
+    }
+
+    /// R399 #5: another host's failed publication of an agent's picture is
+    /// said in that agent's Settings › Agents row, naming the host, and the
+    /// row says nothing once it recovered.
+    #[test]
+    fn a_failed_publication_on_another_host_is_said_in_the_agents_row() {
+        let root = tempfile::tempdir().expect("tempdir");
+        nixi_drive(root.path());
+        let facts = DesktopFacts {
+            login: Some("tgorka".to_owned()),
+            device: Some("hesperia".to_owned()),
+            profiles: vec![profile(root.path())],
+            ..DesktopFacts::default()
+        };
+        let nixi = OwnedUserId::try_from("@nixi:example.org").expect("user");
+        let row = |pictures: &Pictures| {
+            listing(
+                &facts,
+                &[],
+                Ok(&[]),
+                &platform(root.path()),
+                &Names::new(),
+                &Problems::new(),
+                pictures,
+            )
+            .into_iter()
+            .find(|row| row.matrix_user == nixi.as_str())
+            .expect("nixi's row")
+        };
+        assert_eq!(row(&Pictures::new()).avatar_problem, None);
+        let failed = Pictures::from([(
+            nixi.clone(),
+            vec![avatar::PublishFailure {
+                host: Some("electra".to_owned()),
+                error: "the upload failed".to_owned(),
+            }],
+        )]);
+        let said = row(&failed).avatar_problem.expect("the row says it");
+        assert!(said.contains("electra"), "{said}");
     }
 
     /// A first sign-in that fails after its store was created must not

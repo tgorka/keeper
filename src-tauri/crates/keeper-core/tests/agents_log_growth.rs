@@ -74,6 +74,8 @@ fn body(i: u64) -> LineBody {
             attachments: Vec::new(),
         }),
         19 => LineBody::Assistant(AssistantBody {
+            bot: None,
+            effort: None,
             text: prose(600 + (i * 13 % 2400) as usize),
             model: "llama3.1".into(),
             finish: "stop".into(),

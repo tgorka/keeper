@@ -47,6 +47,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Progress } from "@/components/ui/progress";
 import { ACCOUNT_OFFERS_TITLE } from "@/lib/account-offers";
+import { logFailure } from "@/lib/failure";
 import type {
   DriveFolderVm,
   SyncDeviceVm,
@@ -278,6 +279,7 @@ export function SyncFolderPath({
         // clear the last sync report. A refusal — a folder that is gone, a
         // volume that is out — still lands where action errors are shown.
         void syncOpenPath(profile.id).catch((raw: unknown) => {
+          logFailure("sync.openPath")(raw);
           onError(syncErrorMessage(raw));
         });
       }}
@@ -412,6 +414,7 @@ export function SyncSection({ open }: { open: boolean }) {
           setUnfoldedText(String(read.unfolded));
         }
       } catch (raw) {
+        logFailure("sync.listSettingsGet")(raw);
         if (live) {
           setListsError(syncErrorMessage(raw));
         }
@@ -443,6 +446,7 @@ export function SyncSection({ open }: { open: boolean }) {
       setSyncListSizes(stored);
       setListsSaved(true);
     } catch (raw) {
+      logFailure("sync.listSettingsSet")(raw);
       setListsError(syncErrorMessage(raw));
     } finally {
       setListsBusy(false);
@@ -661,6 +665,7 @@ function DriveFolderRow({ open }: { open: boolean }) {
     try {
       setFolder(await syncDriveFolderSet(next));
     } catch (raw) {
+      logFailure("sync.driveFolderSet")(raw);
       // Rust's refusal, in its words; the folder shown is still the one in force.
       setError(syncErrorMessage(raw));
     } finally {
@@ -672,7 +677,8 @@ function DriveFolderRow({ open }: { open: boolean }) {
     let selection: string | string[] | null = null;
     try {
       selection = await openFolder({ directory: true });
-    } catch {
+    } catch (raw) {
+      logFailure("sync.pickDriveFolder")(raw);
       return;
     }
     if (typeof selection === "string") {
@@ -764,6 +770,7 @@ function SyncProfileRow({
     try {
       await action();
     } catch (raw) {
+      logFailure("sync.action")(raw);
       setActionError(syncErrorMessage(raw));
     } finally {
       setBusy(false);
@@ -1015,6 +1022,7 @@ export function DeviceSection({ open }: { open: boolean }) {
           setDeviceName(read.label);
         }
       } catch (raw) {
+        logFailure("sync.device")(raw);
         if (live) {
           setDeviceError(syncErrorMessage(raw));
         }
@@ -1037,6 +1045,7 @@ export function DeviceSection({ open }: { open: boolean }) {
       setDeviceName(stored.label);
       setDeviceRenamed(true);
     } catch (raw) {
+      logFailure("sync.deviceSetLabel")(raw);
       setDeviceError(syncErrorMessage(raw));
     } finally {
       setDeviceBusy(false);

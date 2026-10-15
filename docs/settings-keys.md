@@ -58,6 +58,8 @@ file-controlled instead, and says which file.
 | | | | | Whether a remote redaction also removes the archived copy locally. |
 | `favorites_collapsed` | user-global | boolean (`true`/`false`) | `false` | `"favorites_collapsed" = true` |
 | | | | | Whether the Favorites section of the room list starts collapsed. |
+| `agents.default` | user-global | Matrix user id (`@name:server`), or empty | *(absent)* | `"agents.default" = "@nixi:example.org"` |
+| | | | | The default agent: one agent's Matrix user id. At launch, an account with at least one agent room opens the Agents window, on this agent's main conversation when it has one on this account; otherwise nothing is selected and Settings › Agents says why. Blank means no default agent; with no agent rooms, keeper opens the Inbox as before (R383). |
 | `bots.message_details` | user-global | boolean (`1`/`0`) | `0` | `"bots.message_details" = true` |
 | | | | | Whether an answer shows its metadata caption — model, tokens, timings, finish reason, request id. |
 | `bots.wake_phrase` | user-global | text | `nixie` | `"bots.wake_phrase" = "hej keeper"` |

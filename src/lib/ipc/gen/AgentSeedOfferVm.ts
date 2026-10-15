@@ -12,6 +12,17 @@ export type AgentSeedOfferVm = { folders: Array<AgentSeedFolderVm>, catalogue: A
  */
 bots: Array<AgentSeedBotVm>, 
 /**
+ * Those of `bots` that run locally ([`local_choices`]): all a folder
+ * whose agents are `local_only` is offered, for its own bot and for
+ * each agent's (R405).
+ */
+localBots: Array<AgentSeedBotVm>, 
+/**
+ * Why `bots` is not the person's list — `keeper.db` could not be read
+ * — in the sentence shown where the bots would be (R381, R405).
+ */
+botsUnread: string | null, 
+/**
  * The signed-in Matrix accounts, for the owner and readers.
  */
 accounts: Array<string>, };

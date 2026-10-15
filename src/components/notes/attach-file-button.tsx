@@ -70,6 +70,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { IconHint } from "@/components/ui/tooltip";
+import { logFailure } from "@/lib/failure";
 import { notesAttachSources } from "@/lib/ipc/client";
 import { planAttachments } from "@/lib/notes/attach";
 import { ATTACH_FROM_VAULT_LABEL, AttachFromVaultDialog } from "./attach-from-vault-dialog";
@@ -183,6 +184,7 @@ export function AttachFileButton({ vaultId, body, onInsert, onOutcome }: AttachF
       ].filter((clause): clause is string => clause !== null);
       onOutcome(clauses.length === 0 ? null : clauses.join(" "));
     } catch (error) {
+      logFailure("notes.attachFile")(error);
       onOutcome(
         `keeper could not attach that: ${error instanceof Error ? error.message : String(error)}`,
       );

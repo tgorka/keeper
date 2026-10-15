@@ -45,26 +45,19 @@
  *   component's hands and the pane has nothing to add to them. Every other
  *   command leaves through `onCommand`.
  */
-import { type KeyboardEvent, type ReactNode, useCallback, useEffect, useState } from "react";
+import { type KeyboardEvent, type ReactNode, useCallback, useRef, useState } from "react";
 import {
   type BotPasteContext,
   type BotPasteDecision,
   botPasteDecision,
 } from "@/components/bots/bot-paste";
-import {
-  acceptedDraft,
-  argumentHint,
-  type BotCommandContext,
-  type BotCommandInvocation,
-  isCommandLine,
-  menuKeyAction,
-  nextIndex,
-  slashToken,
-} from "@/components/bots/bot-slash-menu";
+import type { BotCommandContext, BotCommandInvocation } from "@/components/bots/bot-slash-menu";
+import type { SlashRow } from "@/components/slash-menu/slash-menu";
+import { SlashHelp, SlashMenuList } from "@/components/slash-menu/slash-menu-list";
 import { Button } from "@/components/ui/button";
-import type { BotCommandPreviewVm, BotCommandRowVm } from "@/lib/ipc/client";
+import { useSlashMenu } from "@/hooks/use-slash-menu";
+import type { BotCommandPreviewVm } from "@/lib/ipc/client";
 import { botsCommandPreview } from "@/lib/ipc/client";
-import { cn } from "@/lib/utils";
 
 /** The textarea's accessible name and its placeholder. */
 export const BOT_COMPOSER_LABEL = "Message";
@@ -88,13 +81,6 @@ export const botComposerNoBot = (place: string) =>
 
 /** Where the desktop chooses a bot: the picker row over the transcript. */
 export const BOT_COMPOSER_PICKER_ABOVE = "above";
-
-/** The command menu's accessible name. */
-export const BOT_COMPOSER_MENU_LABEL = "Commands";
-
-/** The help panel's accessible name, and its close verb. */
-export const BOT_COMPOSER_HELP_LABEL = "Commands keeper knows";
-export const BOT_COMPOSER_HELP_CLOSE = "Close";
 
 /**
  * The whole registry, as `/help` asks for it.
@@ -179,15 +165,12 @@ export function BotComposer({
   pickerPlace?: string;
 }) {
   const [draft, setDraft] = useState("");
-  const [preview, setPreview] = useState<BotCommandPreviewVm | null>(null);
-  const [highlight, setHighlight] = useState(0);
-  const [dismissed, setDismissed] = useState<string | null>(null);
   const [refusal, setRefusal] = useState<string | null>(null);
   // The whole answer to `/help`, held together: the panel outlives the draft
   // that opened it, so it cannot read the escape hint off a preview the
   // cleared field has already discarded.
   const [help, setHelp] = useState<{
-    rows: readonly BotCommandRowVm[];
+    rows: readonly SlashRow[];
     escapeHint: string;
   } | null>(null);
 
@@ -198,42 +181,16 @@ export function BotComposer({
     [resolveDraft, providerKind, hasProvider, hasBot, hasSession, modelTools],
   );
 
-  // Asked only while the draft could be a command, so a keystroke of prose
-  // costs nothing. The echoed `draft` is compared before anything is stored:
-  // replies can land out of order, and a menu drawn for text the field no
-  // longer holds is worse than no menu.
-  useEffect(() => {
-    if (!isCommandLine(draft)) {
-      setPreview(null);
-      return;
-    }
-    let live = true;
-    void resolve(draft)
-      .then((answer) => {
-        if (live && answer.draft === draft) {
-          setPreview(answer);
-          setHighlight(0);
-        }
-      })
-      // A preview that failed leaves the menu closed. The draft is still
-      // sendable — the submit path asks again and reports what happens there,
-      // where a person is waiting for an answer rather than typing.
-      .catch(() => {
-        if (live) {
-          setPreview(null);
-        }
-      });
-    return () => {
-      live = false;
-    };
-  }, [draft, resolve]);
+  // One submission at a time (R393): taken by the Enter or click that starts
+  // it, before the preview is awaited, so a second Enter while Rust is asked
+  // does nothing instead of running the line twice.
+  const inFlight = useRef(false);
 
-  const token = slashToken(draft);
-  const rows = preview === null ? [] : preview.rows;
-  const menuOpen = rows.length > 0 && token !== null && token !== dismissed;
-  const active = rows[Math.min(highlight, rows.length - 1)];
+  /** Clear the field only if it still holds `ran`: newer typing is kept (R393). */
+  const spend = (ran: string) => setDraft((current) => (current.trim() === ran ? "" : current));
 
   const submit = (text: string) => {
+    inFlight.current = true;
     void resolve(text)
       .then((answer) => {
         switch (answer.verdict.kind) {
@@ -243,20 +200,24 @@ export function BotComposer({
             if (disabled || streaming) {
               return;
             }
-            setDraft("");
+            spend(text);
             setRefusal(null);
             onSend(answer.verdict.text);
             return;
           }
           case "command": {
-            setDraft("");
+            spend(text);
             setRefusal(null);
             if (answer.verdict.name === "help") {
               void resolve(HELP_DRAFT)
                 .then((all) => setHelp({ rows: all.rows, escapeHint: all.escapeHint }))
                 // The narrowed answer is still the truth about this token, and
-                // a panel of one row beats a panel that never opened.
-                .catch(() => setHelp({ rows, escapeHint: answer.escapeHint }));
+                // a panel of one row beats a panel that never opened; the
+                // failed full list is said and logged once (R381).
+                .catch((raw: unknown) => {
+                  menu.fail(raw);
+                  setHelp({ rows: answer.rows, escapeHint: answer.escapeHint });
+                });
               return;
             }
             setRefusal(onCommand({ name: answer.verdict.name, args: answer.verdict.args }));
@@ -265,23 +226,27 @@ export function BotComposer({
           case "refusal": {
             // The draft is left in the field on purpose: it is one keystroke
             // from being right, and clearing it would make a typo cost the
-            // whole sentence.
+            // whole sentence. A refusal is the answer, not a failure: nothing
+            // goes to `keeper.log` (R393).
             setRefusal(answer.verdict.message);
             return;
           }
         }
       })
-      .catch(() => {
-        // Resolution is a pure, local call; a rejection means the shell is
-        // gone, and sending text nobody resolved is the one thing this
-        // component must not do.
+      .catch((raw: unknown) => {
+        // A rejection means the shell is gone, and sending text nobody
+        // resolved is the one thing this component must not do.
+        menu.fail(raw);
         setRefusal(BOT_COMPOSER_UNRESOLVED);
+      })
+      .finally(() => {
+        inFlight.current = false;
       });
   };
 
   const send = () => {
     const text = draft.trim();
-    if (text.length === 0 || streaming) {
+    if (text.length === 0 || streaming || inFlight.current) {
       return;
     }
     // **A draft with no leading slash is prose, and is sent without asking.**
@@ -301,47 +266,22 @@ export function BotComposer({
     submit(text);
   };
 
-  const accept = (row: BotCommandRowVm) => {
-    const completed = acceptedDraft(row);
-    // Completing first and running on the second press is Claude Code's model
-    // (R5 §2) and the one that works for a command with an argument: accepting
-    // `/bot` must leave the caret where the name goes, not run a command with
-    // nothing after it.
-    if (draft !== completed) {
+  const menu = useSlashMenu({
+    draft,
+    enabled: true,
+    resolve,
+    onComplete: (completed) => {
       setDraft(completed);
       setRefusal(null);
-      return;
-    }
-    send();
-  };
+    },
+    onRun: send,
+    reportAs: "bots-command-preview",
+  });
 
   const onKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
     // A composing IME delivers Enter as a candidate selection; acting on it
     // would lose the composition.
-    if (event.nativeEvent.isComposing) {
-      return;
-    }
-    const action = menuKeyAction(event.key, menuOpen, {
-      shiftKey: event.shiftKey,
-      metaKey: event.metaKey,
-      ctrlKey: event.ctrlKey,
-      altKey: event.altKey,
-    });
-    if (action !== null) {
-      event.preventDefault();
-      if (action === "dismiss") {
-        // Dismissed for this token only: Escape means "not this one", never
-        // "never again".
-        setDismissed(token);
-        return;
-      }
-      if (action === "accept") {
-        if (active !== undefined) {
-          accept(active);
-        }
-        return;
-      }
-      setHighlight(nextIndex(highlight, rows.length, action));
+    if (event.nativeEvent.isComposing || menu.onKeyDown(event)) {
       return;
     }
     // Everything the menu did not claim falls through untouched — including
@@ -356,75 +296,19 @@ export function BotComposer({
   return (
     <div className="flex shrink-0 flex-col gap-2 border-border border-t px-6 py-3">
       {help !== null && (
-        <section
-          aria-label={BOT_COMPOSER_HELP_LABEL}
-          className="flex flex-col gap-2 rounded-md border border-border p-3"
-        >
-          <ul className="flex flex-col gap-1 text-sm">
-            {help.rows.map((row) => (
-              <li key={row.name} className="flex min-w-0 gap-2">
-                <span className="font-mono">
-                  /{row.name}
-                  {argumentHint(row) === null ? "" : ` ${argumentHint(row)}`}
-                </span>
-                <span className="min-w-0 flex-1 text-muted-foreground">{row.description}</span>
-              </li>
-            ))}
-          </ul>
-          <p className="text-muted-foreground text-xs">{help.escapeHint}</p>
-          <div className="flex">
-            <Button type="button" variant="outline" size="sm" onClick={() => setHelp(null)}>
-              {BOT_COMPOSER_HELP_CLOSE}
-            </Button>
-          </div>
-        </section>
-      )}
-
-      {menuOpen && (
-        <ul aria-label={BOT_COMPOSER_MENU_LABEL} className="flex flex-col gap-1 text-sm">
-          {rows.map((row, index) => (
-            <li
-              key={row.name}
-              aria-current={row === active}
-              className={cn(
-                "flex min-w-0 flex-col rounded px-2 py-1",
-                index === Math.min(highlight, rows.length - 1) && "bg-accent",
-              )}
-            >
-              <span className="flex min-w-0 gap-2">
-                <span className="font-mono">
-                  /{row.name}
-                  {argumentHint(row) === null ? "" : ` ${argumentHint(row)}`}
-                </span>
-                <span className="min-w-0 flex-1 text-muted-foreground">{row.description}</span>
-              </span>
-              {/* A reason says why Enter will not run it; a warning says what to
-                  expect when Enter does. Both are the registry's words, printed
-                  where the decision is made rather than restated here. */}
-              {row.reason !== null && (
-                <span className="text-muted-foreground text-xs">{row.reason}</span>
-              )}
-              {row.warning !== null && (
-                <span className="text-muted-foreground text-xs">{row.warning}</span>
-              )}
-            </li>
-          ))}
-        </ul>
-      )}
-
-      {menuOpen && preview !== null && preview.note !== null && (
-        <p className="text-muted-foreground text-xs">{preview.note}</p>
-      )}
-
-      {/* Taught where it is relevant: the moment a leading slash is on screen
-          is the moment somebody may have meant a path. */}
-      {menuOpen && preview !== null && (
-        <p className="text-muted-foreground text-xs">{preview.escapeHint}</p>
+        <SlashHelp rows={help.rows} escapeHint={help.escapeHint} onClose={() => setHelp(null)} />
       )}
 
       {refusal !== null && (
         <p role="alert" className="text-destructive text-sm">
           {refusal}
+        </p>
+      )}
+      {/* One line about the slash path: the refusal when there is one, else why
+          the menu could not be asked (R381). */}
+      {refusal === null && menu.failure !== null && (
+        <p role="alert" className="text-destructive text-sm">
+          {menu.failure}
         </p>
       )}
 
@@ -433,9 +317,11 @@ export function BotComposer({
       {/* The field and its verb share one row (Story 61.14): stacked, the
           verb's row was a 40px band of its own under a three-line field, and
           every band here is height the transcript above does not get. */}
-      <div className="flex items-end gap-2">
+      <div className="relative flex items-end gap-2">
+        <SlashMenuList menu={menu} />
         <textarea
           aria-label={BOT_COMPOSER_LABEL}
+          {...menu.fieldProps}
           placeholder={BOT_COMPOSER_PLACEHOLDER}
           value={draft}
           rows={3}

@@ -117,6 +117,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Lamp } from "@/components/ui/lamp";
 import { IconHint } from "@/components/ui/tooltip";
+import { logFailure } from "@/lib/failure";
 import { formatDraftAge } from "@/lib/format-time";
 import type { SessionSpaceFilesVm, SessionSpaceVm } from "@/lib/ipc/client";
 import {
@@ -444,7 +445,10 @@ export function SessionSpaces({
         );
         onChanged();
       })
-      .catch((raw: unknown) => setNotice(syncErrorMessage(raw, SESSION_SPACES_RESTORE_FAILED)))
+      .catch((raw: unknown) => {
+        logFailure("sessions.spacesRestore")(raw);
+        setNotice(syncErrorMessage(raw, SESSION_SPACES_RESTORE_FAILED));
+      })
       .finally(() => setRestoring(false));
   }, [rootId, onChanged]);
 
@@ -457,7 +461,10 @@ export function SessionSpaces({
     setNotice(null);
     sessionsSpaceDelete(rootId, target.id)
       .then(onChanged)
-      .catch((raw: unknown) => setNotice(syncErrorMessage(raw, SESSION_SPACE_DELETE_FAILED)));
+      .catch((raw: unknown) => {
+        logFailure("sessions.spaceDelete")(raw);
+        setNotice(syncErrorMessage(raw, SESSION_SPACE_DELETE_FAILED));
+      });
   }, [deleting, rootId, onChanged]);
 
   /**
@@ -759,11 +766,12 @@ function SpaceSection({
       // alternative was a second live region inside the section: more DOM, one
       // more thing for a screen reader to find, and Story 49.3 moves this
       // section's sentences into the fold's `notice` anyway.
-      .catch((raw: unknown) =>
+      .catch((raw: unknown) => {
+        logFailure("sessions.spaceNewNote")(raw);
         onNotice(
           `${SESSION_SPACE_NEW_NOTE} ${space.name}: ${syncErrorMessage(raw, SESSION_SPACE_NEW_NOTE_FAILED)}`,
-        ),
-      )
+        );
+      })
       .finally(() => onWriting(false));
   }, [kind, rootId, sessionId, space.id, space.name, onOpen, onNotice, onChanged, onWriting]);
 
@@ -796,9 +804,10 @@ function SpaceSection({
         onNotice(`${SESSION_SPACE_NARROWED} ${space.name} to ${narrowTo}.`);
         onChanged();
       })
-      .catch((raw: unknown) =>
-        onNotice(`${space.name}: ${syncErrorMessage(raw, SESSION_SPACE_NARROW_FAILED)}`),
-      )
+      .catch((raw: unknown) => {
+        logFailure("sessions.spaceNarrow")(raw);
+        onNotice(`${space.name}: ${syncErrorMessage(raw, SESSION_SPACE_NARROW_FAILED)}`);
+      })
       .finally(() => onWriting(false));
   }, [narrowTo, rootId, space.id, space.name, onNotice, onChanged, onWriting]);
 

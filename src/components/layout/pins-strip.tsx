@@ -40,6 +40,7 @@ import {
 import { type LongPressDetail, useLongPress } from "@/hooks/use-long-press";
 import { usePointerDrag } from "@/hooks/use-pointer-drag";
 import { useShellLayout } from "@/hooks/use-shell-layout";
+import { sayFailure } from "@/lib/failure";
 import type { InboxRoomVm } from "@/lib/ipc/client";
 import { reorderPins, unpinRoom } from "@/lib/ipc/client";
 import type { RoomSelection } from "@/lib/stores/rooms";
@@ -76,10 +77,10 @@ function movePin(pins: InboxRoomVm[], from: number, to: number): InboxRoomVm[] {
   return next;
 }
 
-/** Dispatch the authoritative full-order reorder; best-effort (stream is truth). */
+/** Dispatch the authoritative full-order reorder; a failure is said (the stream is truth). */
 function persistOrder(next: InboxRoomVm[]): void {
   void reorderPins(next.map((room) => ({ accountId: room.accountId, roomId: room.roomId }))).catch(
-    () => {},
+    sayFailure("pins.reorder", "keeper couldn't reorder the pins."),
   );
 }
 
@@ -378,7 +379,9 @@ export function PinsStrip({ pins, onSelect, selected, reorderable = true }: Pins
                   <ContextMenuItem
                     className={phone ? "min-h-11" : undefined}
                     onSelect={() => {
-                      void unpinRoom(room.accountId, room.roomId).catch(() => {});
+                      void unpinRoom(room.accountId, room.roomId).catch(
+                        sayFailure("chat.unpin", "keeper couldn't unpin the chat."),
+                      );
                     }}
                   >
                     Unpin

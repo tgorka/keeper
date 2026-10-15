@@ -48,6 +48,7 @@ mod build_identity;
 // Epic 66 (AD-198); its three commands sit in the shared handler list.
 mod copy_ipc;
 mod debug_log;
+mod failure_notice;
 #[cfg(desktop)]
 #[cfg(target_os = "macos")]
 mod pdf_export;
@@ -1090,6 +1091,11 @@ pub fn run() {
                 agents_ipc::agent_presence_view,
                 // Story 91.4: the proxy conversations "Speak to" offers.
                 agents_ipc::voice_agent_targets,
+                // Story 100.3 (R383): what opens at launch and the one
+                // default agent, every target (the phone launches too).
+                agents_ipc::agents_launch,
+                agents_ipc::agents_default_get,
+                agents_ipc::agents_default_set,
                 // Voice (Story 62.4): every target, the port decides.
                 voice_ipc::voice_availability,
                 voice_ipc::voice_start,
@@ -1116,6 +1122,10 @@ pub fn run() {
                 voice_reach::voice_hotkey_get,
                 voice_reach::voice_hotkey_set,
                 voice_reach::voice_hotkey_clear,
+                // Background failures and their recovery (Epic 100, R387):
+                // every target, because push and voice fail on the phone too.
+                failure_notice::failure_subscribe,
+                failure_notice::failure_unsubscribe,
                 // The organisation account (Epic 82): every target, in the
                 // shared body, because the phone signs in too and the
                 // Account section is present on every tier.
@@ -1273,6 +1283,12 @@ pub fn run() {
                 ipc::backup_save_recovery_key,
                 ipc::backup_saved_recovery_key,
                 ipc::send_text,
+                // Story 100.5: the messenger's slash commands.
+                ipc::send_emote,
+                ipc::chat_command_preview,
+                ipc::room_set_topic,
+                ipc::room_invite,
+                ipc::room_leave,
                 ipc::undo_send_window,
                 ipc::set_undo_send_window,
                 ipc::hotkey_get,
@@ -1697,6 +1713,12 @@ pub fn run() {
         agents_host::agents_seed_offer,
         agents_host::agents_seed_plan,
         agents_host::agents_seed_apply,
+        // An agent's model and level (100.2 #4, R382): a write of its
+        // `agent.toml`, which only a Mac with the drive can make.
+        agents_host::agents_model_set,
+        // `/model` in an agent's DM (100.5, DW-1431, R415): the same save,
+        // so desktop-only like it; a phone's menu refuses `/model` first.
+        agents_host::agent_model_command,
         // This Mac's own MCP servers and `[sandbox]` table (96.2 #11,
         // R213): device-local, desktop-only like the section.
         agents_host::agents_mcp_list,

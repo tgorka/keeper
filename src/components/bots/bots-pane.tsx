@@ -100,6 +100,7 @@ import { useSurfaceColumn } from "@/components/layout/surface-column";
 import { useSpokenStream } from "@/hooks/use-spoken-stream";
 import { useVoiceStream } from "@/hooks/use-voice-stream";
 import { type CountNoun, countLabel } from "@/lib/count-label";
+import { logFailure } from "@/lib/failure";
 import type { BotModelVm, BotStreamEvent } from "@/lib/ipc/client";
 import {
   botsApprovalAnswer,
@@ -171,6 +172,7 @@ export function onStreamEvent(event: BotStreamEvent): void {
       request: event.request,
       answer: (answer) => {
         void botsApprovalAnswer(requestId, answer !== "deny").catch((raw: unknown) => {
+          logFailure("bots.approvalAnswer")(raw);
           botsStore.getState().setError(syncErrorMessage(raw, BOTS_READ_FAILED));
         });
       },
@@ -268,6 +270,7 @@ export function BotsPane() {
     void botsSessionOpen(sessionId)
       .then((read) => botsStore.getState().openConversation(read))
       .catch((raw: unknown) => {
+        logFailure("bots.sessionOpen")(raw);
         botsStore.getState().setError(syncErrorMessage(raw, BOTS_READ_FAILED));
       });
   };
@@ -292,6 +295,7 @@ export function BotsPane() {
       // BEFORE any event: an unknown bot, a refused credential, an endpoint
       // that never answered.
       .catch((raw: unknown) => {
+        logFailure("bots.send")(raw);
         botsStore.getState().setError(syncErrorMessage(raw, BOTS_READ_FAILED));
       })
       // The list order is `updated_ms`, which the send just changed.
@@ -307,6 +311,7 @@ export function BotsPane() {
       { sessionId: conversation.session.id, messageId, model: selectedModel },
       onStreamEvent,
     ).catch((raw: unknown) => {
+      logFailure("bots.retry")(raw);
       botsStore.getState().setError(syncErrorMessage(raw, BOTS_READ_FAILED));
     });
   };

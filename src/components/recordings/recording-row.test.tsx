@@ -11,6 +11,7 @@ vi.mock("@/lib/ipc/client", () => ({
   revealPath: vi.fn(),
   transcriptionCancel: vi.fn(() => Promise.resolve()),
   transcriptionStart: vi.fn(),
+  frontendErrorReport: vi.fn(() => Promise.resolve()),
 }));
 
 import {
@@ -221,7 +222,7 @@ describe("RecordingRow", () => {
     expect(await screen.findByText(RECORDINGS_COPIED_LABEL)).toBeInTheDocument();
   });
 
-  it("swallows a clipboard the browser refuses rather than surfacing an error", async () => {
+  it("claims no copy when the browser refuses the clipboard", async () => {
     Object.assign(navigator, {
       clipboard: { writeText: vi.fn(() => Promise.reject(new Error("denied"))) },
     });
@@ -230,9 +231,8 @@ describe("RecordingRow", () => {
     fireEvent.click(screen.getByRole("button", { name: `${RECORDINGS_COPY_ID_LABEL}: Standup` }));
 
     await waitFor(() => expect(navigator.clipboard.writeText).toHaveBeenCalled());
-    // No confirmation, no alert — the id simply did not make it.
+    // No confirmation — the id did not make it.
     expect(screen.queryByText(RECORDINGS_COPIED_LABEL)).not.toBeInTheDocument();
-    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 
   describe("transcription", () => {

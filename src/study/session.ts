@@ -1,4 +1,5 @@
 import { telemetryStudyConfig, telemetryStudyStop } from "./commands";
+import { logStudyFailure } from "./failure";
 import type { StudyRecorder } from "./recorder";
 import { installStudyTransport, type StudyTransport } from "./transport";
 
@@ -35,12 +36,12 @@ export async function startStudyCapture(
     return stopped;
   };
   const abort = () => {
-    void stop().catch(() => {});
+    void stop().catch(logStudyFailure("study.stop"));
   };
   const fail = () => {
     if (failed || stopped) return;
     failed = true;
-    void stop().catch(() => {});
+    void stop().catch(logStudyFailure("study.stop"));
     onFailure();
   };
   try {
@@ -81,8 +82,10 @@ export async function startStudyCapture(
   } catch {
     try {
       await stop();
-    } catch {
-      // Do not let SDK/IPC cleanup errors replace the redacted failure below.
+    } catch (error) {
+      // Do not let SDK/IPC cleanup errors replace the redacted failure below;
+      // the cleanup's own (redacted) failure goes to the log.
+      logStudyFailure("study.stop")(error);
     }
     throw new Error("Study unavailable or cancelled");
   }

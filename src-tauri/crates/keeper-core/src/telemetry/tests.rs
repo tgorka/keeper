@@ -20,6 +20,7 @@ fn event(kind: TelemetryEventKind) -> TelemetryEventReq {
     TelemetryEventReq {
         kind,
         duration_ms: Some(12.0),
+        surface: None,
     }
 }
 fn diagnostics() -> TelemetryConsentVm {
@@ -46,6 +47,7 @@ fn unknown_content_and_invalid_timings_cannot_enter_export_queue() {
             .capture(TelemetryEventReq {
                 kind: TelemetryEventKind::Interaction,
                 duration_ms: Some(duration),
+                surface: None,
             })
             .is_err());
     }
@@ -487,4 +489,42 @@ fn agent_host_records_are_never_exported() {
         })
         .collect();
     assert_eq!(names, ["keeper_interaction"]);
+}
+
+/// Epic 100, R381, 100.1 #9: an interaction names its declared surface from a
+/// closed set, exported as one `surface` property; a surface on any other
+/// kind, or a surface outside the set, never enters the queue.
+#[test]
+fn an_interaction_carries_only_a_declared_surface() {
+    let local = LocalDir::new();
+    let telemetry = Telemetry::open(Some(&local.0), Some(config()));
+    telemetry.set_consent(diagnostics()).expect("consent");
+    assert!(serde_json::from_str::<TelemetryEventReq>(
+        r#"{"kind":"interaction","durationMs":null,"surface":"slashMenuCommand:/invite"}"#
+    )
+    .is_err());
+    assert!(telemetry
+        .capture(TelemetryEventReq {
+            kind: TelemetryEventKind::FrontendError,
+            duration_ms: None,
+            surface: Some(TelemetrySurface::SlashMenuOpened),
+        })
+        .is_err());
+    for (surface, exported) in [
+        (TelemetrySurface::SlashMenuOpened, "slash_menu_opened"),
+        (TelemetrySurface::SlashMenuChosen, "slash_menu_chosen"),
+        (TelemetrySurface::LaunchDefaultAgent, "launch_default_agent"),
+    ] {
+        let wire: TelemetryEventReq = serde_json::from_value(serde_json::json!({
+            "kind": "interaction", "durationMs": null, "surface": surface
+        }))
+        .expect("a declared surface");
+        let record = Record::frontend(wire);
+        let payload = batch_payload(&config(), "synthetic-installation", &record).expect("batch");
+        assert_eq!(payload["batch"][0]["event"], "keeper_interaction");
+        assert_eq!(payload["batch"][0]["properties"]["surface"], exported);
+    }
+    let plain = Record::frontend(event(TelemetryEventKind::Interaction));
+    let payload = batch_payload(&config(), "synthetic-installation", &plain).expect("batch");
+    assert!(payload["batch"][0]["properties"].get("surface").is_none());
 }

@@ -47,6 +47,7 @@ import { useId, useState } from "react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
+import { logFailure } from "@/lib/failure";
 import {
   type ApprovalCardVm,
   type ApprovalDecision,
@@ -330,6 +331,7 @@ function AttachedAction({
       setOpen(true);
       onShown();
     } catch (error) {
+      logFailure("agents.approvalPayload")(error);
       setRefusal(syncErrorMessage(error, APPROVAL_PAYLOAD_FAILED));
     } finally {
       setLoading(false);
@@ -492,6 +494,7 @@ function Decide({
       });
       setSent(true);
     } catch (error) {
+      logFailure("agents.approvalDecide")(error);
       setRefusal(syncErrorMessage(error, APPROVAL_DECIDE_FAILED));
     } finally {
       setSending(false);
@@ -844,6 +847,7 @@ export function ApprovalRequest({
           note: null,
         });
       } catch (error) {
+        logFailure("agents.approvalDenyAll")(error);
         const refusal = denyAllRefusal(denied, rows.length, error);
         setRun((r) => ({ sent: r.sent, sending: new Set(), refusal }));
         return;

@@ -165,6 +165,7 @@ fn open(data_dir: &Path) -> Result<Connection, CoreError> {
         [],
     )
     .map_err(|e| CoreError::Internal(format!("could not ensure outbox schema: {e}")))?;
+    ensure_outbox_columns(&conn)?;
     // Per-Network mute set (Story 10.2, FR-52). A present row mutes every Chat bridged
     // to that Network's label across all accounts; an absent row means "not muted".
     // Matrix has no "network" concept, so this is keeper-local (evaluated in the notify
@@ -639,6 +640,36 @@ fn ensure_incognito_column(conn: &Connection) -> Result<(), CoreError> {
     Ok(())
 }
 
+/// Add the nullable `kind` and `line` columns to `outbox` if they are not
+/// present yet (Story 100.5): a held `/me` must leave as the action it was, not
+/// as text, and an undone send must come back as exactly the line the person
+/// typed (R393).
+///
+/// Idempotent and non-destructive, exactly like [`ensure_hue_index_column`]. A
+/// row held before the columns existed keeps `NULL` in both, which reads as
+/// text — the only kind there was ([`crate::send::MessageKind::from_stored`]) —
+/// typed as its body, which is what a line was then.
+fn ensure_outbox_columns(conn: &Connection) -> Result<(), CoreError> {
+    let mut stmt = conn
+        .prepare("PRAGMA table_info(outbox)")
+        .map_err(|e| CoreError::Internal(format!("could not inspect outbox schema: {e}")))?;
+    let existing: Vec<String> = stmt
+        .query_map([], |r| r.get::<_, String>(1))
+        .map_err(|e| CoreError::Internal(format!("could not read outbox columns: {e}")))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| CoreError::Internal(format!("could not read outbox columns: {e}")))?;
+    drop(stmt);
+    for column in ["kind", "line"] {
+        if !existing.iter().any(|c| c == column) {
+            conn.execute(&format!("ALTER TABLE outbox ADD COLUMN {column} TEXT"), [])
+                .map_err(|e| {
+                    CoreError::Internal(format!("could not add outbox {column} column: {e}"))
+                })?;
+        }
+    }
+    Ok(())
+}
+
 /// The `settings` key holding the global Incognito default (Story 8.1). Stored as
 /// `"1"`/`"0"`; absent = off (Incognito off by default).
 const INCOGNITO_GLOBAL_KEY: &str = "incognito.global";
@@ -1037,6 +1068,30 @@ pub fn set_bots_voice_target(data_dir: &Path, target: Option<&str>) -> Result<()
         data_dir,
         BOTS_VOICE_TARGET_KEY,
         target.map(str::trim).unwrap_or_default(),
+    )
+}
+
+/// The `settings` key naming the default agent (Epic 100, story 100.3,
+/// R383): one agent's Matrix user id, or absent/blank for none. Which room
+/// opens at launch, and why none does, is
+/// `keeper_core::agents::launch::choose`'s answer.
+pub(crate) const AGENTS_DEFAULT_KEY: &str = "agents.default";
+
+/// Read the default agent as stored, trimmed. Absent or blank ⇒ `None`. Not
+/// checked here: a row that rotted out of shape is the launch's to name.
+pub fn get_agents_default(data_dir: &Path) -> Result<Option<String>, CoreError> {
+    Ok(get_setting(data_dir, AGENTS_DEFAULT_KEY)?
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty()))
+}
+
+/// Write the default agent: `None` clears it. Stored trimmed; the caller
+/// checked the shape (`keeper_core::agents::launch::set_default`).
+pub fn set_agents_default(data_dir: &Path, agent: Option<&str>) -> Result<(), CoreError> {
+    set_setting(
+        data_dir,
+        AGENTS_DEFAULT_KEY,
+        agent.map(str::trim).unwrap_or_default(),
     )
 }
 
@@ -3052,24 +3107,51 @@ pub struct OutboxRow {
     pub held_at_ts: i64,
     /// When the hold elapses and the row must dispatch, in ms since the Unix epoch.
     pub dispatch_at_ts: i64,
+    /// What the held message is: text, or a `/me` action (Story 100.5).
+    pub kind: crate::send::MessageKind,
+    /// The composer line the person typed to make it — `/me waves`, `//etc`
+    /// — or `None` for a row held before keeper kept it (Story 100.5, R393).
+    pub line: Option<String>,
+}
+
+impl OutboxRow {
+    /// What an undo puts back in the composer, and what the held bubble reads:
+    /// the line exactly as typed, never one rebuilt from the body. A row from
+    /// before the column is text whose line was its body.
+    pub fn typed_line(&self) -> &str {
+        self.line.as_deref().unwrap_or(&self.body)
+    }
 }
 
 /// Insert a held-send row into the `outbox` (Story 8.3). Keyed by the unique `id`, so
 /// many rows may coexist for one `(account_id, room_id)`. The body is never logged.
+// One argument per column: a row type here would only rename the table.
+#[allow(clippy::too_many_arguments)]
 pub fn insert_outbox(
     data_dir: &Path,
     id: &str,
     account_id: &str,
     room_id: &str,
     body: &str,
+    kind: crate::send::MessageKind,
+    line: &str,
     held_at_ts: i64,
     dispatch_at_ts: i64,
 ) -> Result<(), CoreError> {
     let conn = open(data_dir)?;
     conn.execute(
-        "INSERT INTO outbox(id, account_id, room_id, body, held_at_ts, dispatch_at_ts) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        rusqlite::params![id, account_id, room_id, body, held_at_ts, dispatch_at_ts],
+        "INSERT INTO outbox(id, account_id, room_id, body, held_at_ts, dispatch_at_ts, kind, \
+         line) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        rusqlite::params![
+            id,
+            account_id,
+            room_id,
+            body,
+            held_at_ts,
+            dispatch_at_ts,
+            kind.as_stored(),
+            line
+        ],
     )
     .map_err(|e| CoreError::Internal(format!("could not insert outbox row: {e}")))?;
     Ok(())
@@ -3094,8 +3176,8 @@ pub fn list_outbox_rows_for_account(
     let conn = open(data_dir)?;
     let mut stmt = conn
         .prepare(
-            "SELECT id, account_id, room_id, body, held_at_ts, dispatch_at_ts FROM outbox \
-             WHERE account_id = ?1 ORDER BY held_at_ts ASC",
+            "SELECT id, account_id, room_id, body, held_at_ts, dispatch_at_ts, kind, line \
+             FROM outbox WHERE account_id = ?1 ORDER BY held_at_ts ASC",
         )
         .map_err(|e| CoreError::Internal(format!("could not prepare outbox list: {e}")))?;
     let rows = stmt
@@ -3113,8 +3195,8 @@ pub fn list_outbox_rows(data_dir: &Path) -> Result<Vec<OutboxRow>, CoreError> {
     let conn = open(data_dir)?;
     let mut stmt = conn
         .prepare(
-            "SELECT id, account_id, room_id, body, held_at_ts, dispatch_at_ts FROM outbox \
-             ORDER BY held_at_ts ASC",
+            "SELECT id, account_id, room_id, body, held_at_ts, dispatch_at_ts, kind, line \
+             FROM outbox ORDER BY held_at_ts ASC",
         )
         .map_err(|e| CoreError::Internal(format!("could not prepare outbox list: {e}")))?;
     let rows = stmt
@@ -3127,8 +3209,8 @@ pub fn list_outbox_rows(data_dir: &Path) -> Result<Vec<OutboxRow>, CoreError> {
     Ok(out)
 }
 
-/// Map a `SELECT id, account_id, room_id, body, held_at_ts, dispatch_at_ts` row into
-/// an [`OutboxRow`]. Shared by the two outbox list queries.
+/// Map a `SELECT id, account_id, room_id, body, held_at_ts, dispatch_at_ts, kind, line`
+/// row into an [`OutboxRow`]. Shared by the two outbox list queries.
 fn map_outbox_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<OutboxRow> {
     Ok(OutboxRow {
         id: r.get(0)?,
@@ -3137,6 +3219,8 @@ fn map_outbox_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<OutboxRow> {
         body: r.get(3)?,
         held_at_ts: r.get(4)?,
         dispatch_at_ts: r.get(5)?,
+        kind: crate::send::MessageKind::from_stored(r.get::<_, Option<String>>(6)?.as_deref()),
+        line: r.get(7)?,
     })
 }
 
@@ -3407,6 +3491,7 @@ pub fn get_account(data_dir: &Path, account_id: &str) -> Result<Option<AccountRo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::send::MessageKind;
 
     #[test]
     fn service_file_names_default_corrupt_and_normalized_round_trip() {
@@ -5210,6 +5295,63 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A held `/me` leaves as the action it was (Story 100.5): the kind survives
+    /// the row, and a row held by a build that predates the column — `NULL`
+    /// after the in-place upgrade — is the text it was then.
+    #[test]
+    fn outbox_keeps_a_held_rows_kind_and_line_and_reads_a_pre_kind_row_as_typed_text() {
+        let dir = temp_dir();
+        insert_outbox(
+            &dir,
+            "e1",
+            "acctA",
+            "!r1",
+            "waves",
+            MessageKind::Emote,
+            "/me waves",
+            1,
+            2,
+        )
+        .expect("insert emote");
+        insert_outbox(
+            &dir,
+            "t1",
+            "acctA",
+            "!r1",
+            "hello",
+            MessageKind::Text,
+            "hello",
+            3,
+            4,
+        )
+        .expect("insert text");
+        // A row as an older build wrote it: no kind at all.
+        open(&dir)
+            .expect("open")
+            .execute(
+                "INSERT INTO outbox(id, account_id, room_id, body, held_at_ts, dispatch_at_ts) \
+                 VALUES ('old', 'acctA', '!r1', 'before', 5, 6)",
+                [],
+            )
+            .expect("insert a pre-kind row");
+        // The typed line rides with the row; a row from before the column was typed
+        // as its body (R393).
+        let kinds: Vec<(String, MessageKind, String)> = list_outbox_rows_for_account(&dir, "acctA")
+            .expect("list")
+            .into_iter()
+            .map(|row| (row.typed_line().to_owned(), row.kind, row.id))
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                ("/me waves".to_owned(), MessageKind::Emote, "e1".to_owned()),
+                ("hello".to_owned(), MessageKind::Text, "t1".to_owned()),
+                ("before".to_owned(), MessageKind::Text, "old".to_owned()),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn outbox_crud_insert_list_for_account_and_delete() {
         let dir = temp_dir();
@@ -5223,9 +5365,42 @@ mod tests {
             .is_empty());
 
         // Insert three rows out of held-at order; list returns oldest-first.
-        insert_outbox(&dir, "id2", "acctA", "!r1", "second", 200, 210_000).expect("ins id2");
-        insert_outbox(&dir, "id1", "acctA", "!r1", "first", 100, 110_000).expect("ins id1");
-        insert_outbox(&dir, "id3", "acctB", "!r9", "other", 150, 160_000).expect("ins id3");
+        insert_outbox(
+            &dir,
+            "id2",
+            "acctA",
+            "!r1",
+            "second",
+            MessageKind::Text,
+            "second",
+            200,
+            210_000,
+        )
+        .expect("ins id2");
+        insert_outbox(
+            &dir,
+            "id1",
+            "acctA",
+            "!r1",
+            "first",
+            MessageKind::Text,
+            "first",
+            100,
+            110_000,
+        )
+        .expect("ins id1");
+        insert_outbox(
+            &dir,
+            "id3",
+            "acctB",
+            "!r9",
+            "other",
+            MessageKind::Text,
+            "other",
+            150,
+            160_000,
+        )
+        .expect("ins id3");
 
         let a = list_outbox_rows_for_account(&dir, "acctA").expect("list acctA");
         assert_eq!(a.len(), 2, "acctA has two held rows");
@@ -5263,6 +5438,8 @@ mod tests {
             "acctA",
             "!r1",
             "surviving",
+            MessageKind::Text,
+            "surviving",
             1_000,
             9_999_999_999,
         )
@@ -5279,9 +5456,42 @@ mod tests {
     #[test]
     fn delete_account_drops_its_outbox_rows() {
         let dir = temp_dir();
-        insert_outbox(&dir, "o1", "acctA", "!r1", "a1", 1, 2).expect("outbox A o1");
-        insert_outbox(&dir, "o2", "acctA", "!r2", "a2", 3, 4).expect("outbox A o2");
-        insert_outbox(&dir, "o3", "acctB", "!r3", "b3", 5, 6).expect("outbox B o3");
+        insert_outbox(
+            &dir,
+            "o1",
+            "acctA",
+            "!r1",
+            "a1",
+            MessageKind::Text,
+            "a1",
+            1,
+            2,
+        )
+        .expect("outbox A o1");
+        insert_outbox(
+            &dir,
+            "o2",
+            "acctA",
+            "!r2",
+            "a2",
+            MessageKind::Text,
+            "a2",
+            3,
+            4,
+        )
+        .expect("outbox A o2");
+        insert_outbox(
+            &dir,
+            "o3",
+            "acctB",
+            "!r3",
+            "b3",
+            MessageKind::Text,
+            "b3",
+            5,
+            6,
+        )
+        .expect("outbox B o3");
 
         delete_account(&dir, "acctA").expect("delete acctA");
         let all = list_outbox_rows(&dir).expect("list after account delete");

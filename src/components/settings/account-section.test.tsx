@@ -122,6 +122,50 @@ describe("AccountSection signed in", () => {
     expect(within(roles).getByText("staff")).toBeInTheDocument();
   });
 
+  it.each([
+    [
+      "the identity provider refused it (R381)",
+      accountVm({
+        state: "blocked",
+        problem: true,
+        identity: null,
+        device: null,
+        sentence:
+          "id.acme.dev refused to sign you in to Acme: User is not allowed to use this project.",
+      }),
+    ],
+    [
+      "connecting the repository could not open its page (R387)",
+      accountVm({
+        state: "needsSignIn",
+        problem: true,
+        repoMode: "oauth",
+        forgeConnected: false,
+        sentence:
+          "Connecting Acme's repository failed (keeper could not open the repository's sign-in page). Sign in again.",
+      }),
+    ],
+    [
+      "the repository was unreachable while connecting it (R387)",
+      accountVm({
+        state: "offline",
+        problem: true,
+        repoMode: "oauth",
+        forgeConnected: false,
+        sentence:
+          "keeper could not reach Acme's repository to connect it. Check the connection, then sign in again.",
+      }),
+    ],
+  ])("says a failed sign-in as an alert in Rust's words: %s", (_case, vm) => {
+    accountStore.getState().setVm(vm);
+    render(<AccountSection open />);
+
+    const alert = screen.getByRole("alert");
+    expect(alert).toHaveTextContent(vm.sentence ?? "");
+    expect(alert).toHaveClass("text-destructive");
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+  });
+
   it("says in the sign-out dialog that the repository's files are kept", async () => {
     vi.mocked(accountSignOut).mockResolvedValue(accountVm({ state: "signedOut", identity: null }));
     render(<AccountSection open />);

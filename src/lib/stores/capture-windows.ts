@@ -39,6 +39,7 @@
  */
 import { useStore } from "zustand";
 import { createStore } from "zustand/vanilla";
+import { logFailure } from "@/lib/failure";
 import {
   type CaptureTargetVm,
   type CaptureWindowVm,
@@ -84,8 +85,9 @@ export const captureWindowsStore = createStore<CaptureWindowsState>()(() => ({
 export async function hydrateCaptureWindows(): Promise<void> {
   try {
     captureWindowsStore.setState({ windows: await notesCaptureWindows() });
-  } catch {
+  } catch (error) {
     // Left as it was, deliberately. See above.
+    logFailure("capture.listWindows")(error);
   }
 }
 

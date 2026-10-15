@@ -54,6 +54,7 @@ import {
   ContextMenuTrigger,
 } from "@/components/ui/context-menu";
 import { usePointerDrag } from "@/hooks/use-pointer-drag";
+import { logFailure, sayFailure } from "@/lib/failure";
 import type { BotVm } from "@/lib/ipc/client";
 import { botsBotRemove, botsBotsList, botsBotsReorder } from "@/lib/ipc/client";
 import { botsStore } from "@/lib/stores/bots";
@@ -160,7 +161,7 @@ export function BotPinsStrip({
   const persistOrder = (next: BotVm[]) => {
     void botsBotsReorder(next.map((bot) => bot.id))
       .then((rows) => botsStore.getState().applyBots(rows))
-      .catch(() => {});
+      .catch(sayFailure("bots.reorder", "keeper couldn't reorder the bots."));
   };
 
   const moveBy = (index: number, delta: number) => {
@@ -375,7 +376,7 @@ export function BotPinsStrip({
             // order and every other row stay Rust's answer.
             void botsBotsList()
               .then((rows) => botsStore.getState().applyBots(rows))
-              .catch(() => {});
+              .catch(logFailure("bots.relist"));
           }}
         />
       )}
@@ -405,7 +406,7 @@ export function BotPinsStrip({
                 void botsBotRemove(bot.id)
                   .then(() => botsBotsList())
                   .then((rows) => botsStore.getState().applyBots(rows))
-                  .catch(() => {});
+                  .catch(sayFailure("bots.unpin", "keeper couldn't unpin the bot."));
               }}
             >
               {BOT_PINS_UNPIN}

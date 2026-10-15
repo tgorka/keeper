@@ -30,6 +30,7 @@ import { useCallback, useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { logFailure } from "@/lib/failure";
 import { capabilities, type SyncGitVm, syncGitPathSet, syncGitStatus } from "@/lib/ipc/client";
 import { capabilitiesStore } from "@/lib/stores/capabilities";
 import { syncErrorMessage } from "@/lib/stores/sync";
@@ -89,6 +90,7 @@ export function SyncGitRow({ open }: { open: boolean }) {
       setPath(vm.configuredPath ?? "");
       setError(null);
     } catch (raw) {
+      logFailure("syncGit.status")(raw);
       // `syncErrorMessage`, never `String(raw)`: an IPC rejection is a
       // `{ code, message }` object, and stringifying one prints
       // "[object Object]" exactly where the Rust-authored reason belongs.
@@ -117,12 +119,14 @@ export function SyncGitRow({ open }: { open: boolean }) {
       // makes a repaired path reveal that section without reopening the dialog.
       try {
         capabilitiesStore.getState().applySnapshot(await capabilities());
-      } catch {
+      } catch (error) {
         // The path change itself succeeded and is reported above. A failed
         // capability re-read costs a stale section until the dialog is reopened,
         // which is not worth replacing a success message with an error.
+        logFailure("syncGit.rereadCapabilities")(error);
       }
     } catch (raw) {
+      logFailure("syncGit.pathSet")(raw);
       setError(syncErrorMessage(raw));
     } finally {
       setBusy(false);

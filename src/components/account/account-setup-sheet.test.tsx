@@ -15,6 +15,7 @@ import {
   SETUP_DEVICE_LABEL,
   SETUP_DONE_LABEL,
   SETUP_FORGE_HOSTS_LABEL,
+  setupClosedSentence,
   setupReplacesSentence,
 } from "@/components/account/account-setup-sheet";
 import type { AccountSetupVm, OrgAccountVm } from "@/lib/ipc/client";
@@ -58,7 +59,7 @@ afterEach(() => {
 describe("AccountSetupSheet", () => {
   it("shows both hosts before anything is written, and sends the edited device name", async () => {
     mockResolve.mockResolvedValue(setupVm());
-    mockConfirm.mockResolvedValue(accountVm({ sentence: "Up to date." }));
+    mockConfirm.mockResolvedValue(accountVm({ sentence: "Up to date.", attempt: "done" }));
     open();
 
     expect(await screen.findByText("id.acme.dev")).toBeInTheDocument();
@@ -160,7 +161,15 @@ describe("AccountSetupSheet", () => {
     const refusal = "Your Acme account does not have the keeper role. Ask your administrator.";
     mockResolve.mockResolvedValue(setupVm());
     mockConfirm.mockResolvedValue(
-      accountVm({ state: "blocked", identity: null, device: null, devices: [], sentence: refusal }),
+      accountVm({
+        state: "blocked",
+        problem: true,
+        attempt: "failed",
+        identity: null,
+        device: null,
+        devices: [],
+        sentence: refusal,
+      }),
     );
     open();
     fireEvent.click(await screen.findByRole("button", { name: SETUP_CONTINUE_LABEL }));
@@ -168,6 +177,101 @@ describe("AccountSetupSheet", () => {
     const outcome = await screen.findByRole("alert");
     expect(outcome).toHaveTextContent(refusal);
     expect(outcome).toHaveClass("text-destructive");
+    expect(screen.queryByRole("button", { name: SETUP_DONE_LABEL })).not.toBeInTheDocument();
+  });
+
+  it.each([
+    [
+      // Marta's case: the identity provider answered access_denied. Rust's
+      // `problem` sentence names the provider, the account and its reason.
+      "the identity provider refused it (R381)",
+      accountVm({
+        state: "blocked",
+        problem: true,
+        attempt: "failed",
+        identity: null,
+        device: null,
+        devices: [],
+        sentence:
+          "id.acme.dev refused to sign you in to Acme: User is not allowed to use this project.",
+      }),
+    ],
+    [
+      "connecting the repository could not open its page (R387)",
+      accountVm({
+        state: "needsSignIn",
+        problem: true,
+        attempt: "failed",
+        repoMode: "oauth",
+        forgeConnected: false,
+        sentence:
+          "Connecting Acme's repository failed (keeper could not open the repository's sign-in page). Sign in again.",
+      }),
+    ],
+    [
+      "the repository was unreachable while connecting it (R387)",
+      accountVm({
+        state: "offline",
+        problem: true,
+        attempt: "failed",
+        repoMode: "oauth",
+        forgeConnected: false,
+        sentence:
+          "keeper could not reach Acme's repository to connect it. Check the connection, then sign in again.",
+      }),
+    ],
+  ])("says why a sign-in failed, as an alert, never a neutral line: %s", async (_case, vm) => {
+    mockResolve.mockResolvedValue(setupVm());
+    mockConfirm.mockResolvedValue(vm);
+    open();
+    fireEvent.click(await screen.findByRole("button", { name: SETUP_CONTINUE_LABEL }));
+
+    const outcome = await screen.findByRole("alert");
+    expect(outcome).toHaveTextContent(vm.sentence ?? "");
+    expect(outcome).toHaveClass("text-destructive");
+    expect(screen.queryByText(/to use your settings on this device/)).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: SETUP_DONE_LABEL })).not.toBeInTheDocument();
+  });
+
+  it("says quietly that a sign-in the person closed set nothing up", async () => {
+    mockResolve.mockResolvedValue(setupVm());
+    mockConfirm.mockResolvedValue(
+      accountVm({
+        state: "signedOut",
+        problem: false,
+        attempt: "closed",
+        identity: null,
+        device: null,
+        devices: [],
+        sentence: "Sign in to Acme to use your settings on this device.",
+      }),
+    );
+    open();
+    fireEvent.click(await screen.findByRole("button", { name: SETUP_CONTINUE_LABEL }));
+
+    expect(await screen.findByText(setupClosedSentence("Acme", false))).toHaveAttribute(
+      "role",
+      "status",
+    );
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("says a closed re-setup of an account signed in here was closed, never Up to date or Done (R387)", async () => {
+    // The native sheet closed, or Cancel sign-in was pressed, while the
+    // account already had a session here: its state still composes "Up to
+    // date.", and only Rust's `attempt` says this attempt was closed.
+    mockResolve.mockResolvedValue(setupVm());
+    mockConfirm.mockResolvedValue(
+      accountVm({ state: "ready", sentence: "Up to date.", attempt: "closed" }),
+    );
+    open();
+    fireEvent.click(await screen.findByRole("button", { name: SETUP_CONTINUE_LABEL }));
+
+    expect(await screen.findByText(setupClosedSentence("Acme", true))).toHaveAttribute(
+      "role",
+      "status",
+    );
+    expect(screen.queryByText("Up to date.")).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: SETUP_DONE_LABEL })).not.toBeInTheDocument();
   });
 

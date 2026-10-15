@@ -39,6 +39,7 @@
  * barrel so the component table does not follow it in.
  */
 import { type EditorView, WidgetType } from "@codemirror/view";
+import { logFailure } from "@/lib/failure";
 import { type NoteEmbedPathVm, notesEmbedPaths } from "@/lib/ipc/client";
 import { resolveViewer } from "@/lib/viewers/registry";
 import { mediaChip } from "./media-chip";
@@ -135,7 +136,8 @@ export async function renderVaultEmbedInto(
     // every failure is supposed to leave the reader the link.
     const resolve = options.resolve ?? notesEmbedPaths;
     [resolved = null] = await resolve(vaultId, [target]);
-  } catch {
+  } catch (raw) {
+    logFailure("notes.embedResolve")(raw);
     // An unreachable volume, a vault that has gone away, a command that is not
     // there. All of them mean "no better answer than the link", and none of
     // them is this decoration's to report — the note is still readable.

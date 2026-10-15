@@ -107,4 +107,10 @@ muteState: MuteState,
  * Copied through from [`RoomVm::agent_room`]: `proxy` or `session` for a
  * row in the Agents window; absent for every other row.
  */
-agentRoom?: AgentRoomKindVm, };
+agentRoom?: AgentRoomKindVm, 
+/**
+ * An agent room's agent's picture, as its header draws it (story 100.4,
+ * R384): a URL for an `<img>`; absent for every other room and for an
+ * agent with none, whose row keeps its initials.
+ */
+agentAvatar?: string, };

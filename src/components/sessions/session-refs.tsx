@@ -27,6 +27,7 @@
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { AudioLines, ExternalLink, FileQuestion, FileText, Folders, Paperclip } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { sayFailure } from "@/lib/failure";
 import type { SessionReferenceVm } from "@/lib/ipc/client";
 import { panelsStore } from "@/lib/stores/panels";
 
@@ -149,10 +150,7 @@ function SessionRefRow({ row }: { row: SessionReferenceVm }) {
     if (row.url !== null) {
       // The app's one external-link path — never a raw `window.open`, which in
       // a webview would navigate the app itself.
-      void openUrl(row.url).catch(() => {
-        /* Best-effort: a browser that will not open is not this widget's error
-           to report. */
-      });
+      void openUrl(row.url).catch(sayFailure("sessions.openRef", "keeper couldn't open the link."));
       return;
     }
     if (row.panelTarget !== null) {

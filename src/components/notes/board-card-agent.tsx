@@ -35,6 +35,7 @@ import {
 import { Fragment, type ReactNode, useState } from "react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { logFailure } from "@/lib/failure";
 import type { CardAgentVm, CardKeyVm } from "@/lib/ipc/client";
 import { syncErrorMessage } from "@/lib/stores/sync";
 import { cn } from "@/lib/utils";
@@ -210,6 +211,7 @@ export function BoardCardAgent({
       await onAllow();
       setAllowedFor(agent);
     } catch (error) {
+      logFailure("notes.boardAllow")(error);
       // keeper's own sentence — it knows whom to sign in as, and the board
       // does not (UX-DR43).
       setRefusal(syncErrorMessage(error, BOARD_ALLOW_FAILED));

@@ -23,6 +23,7 @@
 import { useStore } from "zustand";
 import { createStore } from "zustand/vanilla";
 import { isPhoneTier } from "@/hooks/use-shell-layout";
+import { logFailure } from "@/lib/failure";
 import {
   agentPresenceView,
   agentSurfaceResult,
@@ -173,15 +174,14 @@ function answer(
   expiries.delete(request.requestId);
   brought.delete(request.requestId);
   forget(request.requestId);
+  // Rust refuses only a request it no longer waits for; the host has stopped
+  // listening, so there is nobody left to tell but the log.
   void agentSurfaceResult(request.accountId, request.roomId, {
     requestId: request.requestId,
     outcome,
     applied,
     detail,
-  }).catch(() => {
-    // Rust refuses only a request it no longer waits for; the host has
-    // stopped listening, so there is nobody left to tell.
-  });
+  }).catch(logFailure("agents.surfaceResult"));
 }
 
 function isExpired(request: SurfaceRequestVm): boolean {
@@ -238,7 +238,7 @@ function bringNoteForward(vaultId: string, noteId: string): boolean {
     sameTarget(activePanel(panelsStore.getState()).target, target);
   primaryViewStore.getState().setView("notes");
   if (notesVaultsStore.getState().activeVaultId !== vaultId) {
-    void setActiveVault(vaultId).catch(() => {});
+    void setActiveVault(vaultId).catch(logFailure("agents.surfaceVault"));
   }
   showTarget(target);
   surfaceStore.setState((state) => ({ revealed: state.revealed + 1 }));
@@ -479,7 +479,8 @@ function reportView(view: PrimaryView): void {
     return;
   }
   reportedView = id;
-  void agentPresenceView(id).catch(() => {
+  void agentPresenceView(id).catch((raw: unknown) => {
+    logFailure("agents.presenceView")(raw);
     // No account to publish for yet; the next change tries again.
     reportedView = null;
   });
@@ -496,7 +497,7 @@ export function startAgentSurface(): void {
   }
   started = true;
   try {
-    void agentSurfaceSubscribe(handleSurfaceRequest).catch(() => {});
+    void agentSurfaceSubscribe(handleSurfaceRequest).catch(logFailure("agents.surfaceSubscribe"));
     reportView(primaryViewStore.getState().view);
     primaryViewStore.subscribe((state) => reportView(state.view));
   } catch {

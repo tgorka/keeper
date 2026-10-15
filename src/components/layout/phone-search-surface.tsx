@@ -32,6 +32,7 @@ import { SearchPanel } from "@/components/search/search-panel";
 import { Command, CommandEmpty, CommandGroup, CommandList } from "@/components/ui/command";
 import { InputGroup, InputGroupAddon, InputGroupInput } from "@/components/ui/input-group";
 import { IconHint } from "@/components/ui/tooltip";
+import { logFailure } from "@/lib/failure";
 import type { PaletteChatVm, PaletteMode, PaletteResultsVm } from "@/lib/ipc/client";
 import { paletteQuery } from "@/lib/ipc/client";
 import { primaryViewStore } from "@/lib/stores/primary-view";
@@ -121,7 +122,8 @@ export function PhoneSearchSurface() {
             setHasResponded(true);
           }
         })
-        .catch(() => {
+        .catch((raw: unknown) => {
+          logFailure("phoneSearch.palette")(raw);
           if (seq === requestSeq.current && searchSurfaceStore.getState().isOpen) {
             setResults(EMPTY_RESULTS);
             setHasResponded(true);

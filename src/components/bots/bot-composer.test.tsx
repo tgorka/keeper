@@ -25,12 +25,10 @@
  * component actually promises is that it does not intercept those chords. A
  * test that checked for a `"\n"` would be testing jsdom.
  */
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import {
-  BOT_COMPOSER_HELP_LABEL,
   BOT_COMPOSER_LABEL,
-  BOT_COMPOSER_MENU_LABEL,
   BOT_COMPOSER_PICKER_ABOVE,
   BOT_COMPOSER_SEND_LABEL,
   BOT_COMPOSER_STOP_LABEL,
@@ -38,6 +36,7 @@ import {
   botComposerNoBot,
 } from "@/components/bots/bot-composer";
 import type { BotCommandContext } from "@/components/bots/bot-slash-menu";
+import { SLASH_HELP_LABEL, SLASH_MENU_LABEL } from "@/components/slash-menu/slash-menu-list";
 import type { BotCommandPreviewVm, BotCommandRowVm } from "@/lib/ipc/client";
 
 /** A context in which everything is configured. */
@@ -98,6 +97,8 @@ function mount(
     context?: BotCommandContext;
     hostSays?: string;
     pickerPlace?: string;
+    /** Answers instead of the table — a test that holds an answer back. */
+    resolver?: (draft: string) => Promise<BotCommandPreviewVm>;
   } = {},
 ) {
   const onSend = vi.fn();
@@ -106,9 +107,10 @@ function mount(
   const onCommand = vi.fn<(command: { name: string; args: string | null }) => string | null>(
     () => overrides.hostSays ?? null,
   );
-  const resolveDraft = vi.fn(
-    async (draft: string) =>
-      answers[draft] ?? preview({ draft, verdict: { kind: "prose", text: draft } }),
+  const resolveDraft = vi.fn(async (draft: string) =>
+    overrides.resolver !== undefined
+      ? await overrides.resolver(draft)
+      : (answers[draft] ?? preview({ draft, verdict: { kind: "prose", text: draft } })),
   );
   render(
     <BotComposer
@@ -223,7 +225,7 @@ describe("BotComposer slash path", () => {
       "//etc": preview({ draft: "//etc", verdict: { kind: "prose", text: "/etc" } }),
     });
     type(field, "//etc");
-    expect(screen.queryByLabelText(BOT_COMPOSER_MENU_LABEL)).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(SLASH_MENU_LABEL)).not.toBeInTheDocument();
     key(field);
     await waitFor(() => expect(onSend).toHaveBeenCalledWith("/etc"));
     expect(onCommand).not.toHaveBeenCalled();
@@ -324,7 +326,7 @@ describe("BotComposer slash path", () => {
       { context: { ...READY, hasBot: false, providerKind: null } },
     );
     type(field, "/new");
-    const menu = await screen.findByLabelText(BOT_COMPOSER_MENU_LABEL);
+    const menu = await screen.findByLabelText(SLASH_MENU_LABEL);
     expect(menu).toHaveTextContent(reason);
     // `/new` is already complete, so Enter runs it rather than completing it.
     key(field);
@@ -358,7 +360,7 @@ describe("BotComposer slash path", () => {
       }),
     });
     type(field, "/h");
-    await screen.findByLabelText(BOT_COMPOSER_MENU_LABEL);
+    await screen.findByLabelText(SLASH_MENU_LABEL);
     expect(screen.queryByText(/Hermes/)).not.toBeInTheDocument();
   });
 });
@@ -375,8 +377,10 @@ describe("BotComposer command menu", () => {
   it("draws the rows the preview carried, in the order it carried them", async () => {
     const { field } = mount(MENU);
     type(field, "/h");
-    const menu = await screen.findByLabelText(BOT_COMPOSER_MENU_LABEL);
-    const names = Array.from(menu.querySelectorAll("li")).map((item) => item.textContent ?? "");
+    const menu = await screen.findByLabelText(SLASH_MENU_LABEL);
+    const names = within(menu)
+      .getAllByRole("option")
+      .map((item) => item.textContent ?? "");
     expect(names[0]).toContain("/history");
     expect(names[1]).toContain("/help");
   });
@@ -384,11 +388,11 @@ describe("BotComposer command menu", () => {
   it("moves the highlight with the arrows, wrapping", async () => {
     const { field } = mount(MENU);
     type(field, "/h");
-    const menu = await screen.findByLabelText(BOT_COMPOSER_MENU_LABEL);
+    const menu = await screen.findByLabelText(SLASH_MENU_LABEL);
     const current = () =>
-      Array.from(menu.querySelectorAll("li")).findIndex(
-        (item) => item.getAttribute("aria-current") === "true",
-      );
+      within(menu)
+        .getAllByRole("option")
+        .findIndex((item) => item.getAttribute("aria-selected") === "true");
     expect(current()).toBe(0);
     expect(key(field, { key: "ArrowDown" })).toBe(true);
     expect(current()).toBe(1);
@@ -413,7 +417,7 @@ describe("BotComposer command menu", () => {
       }),
     });
     type(field, "/h");
-    await screen.findByLabelText(BOT_COMPOSER_MENU_LABEL);
+    await screen.findByLabelText(SLASH_MENU_LABEL);
     key(field, { key: "ArrowDown" });
     key(field);
     await waitFor(() => expect(field).toHaveValue("/help"));
@@ -423,7 +427,7 @@ describe("BotComposer command menu", () => {
   it("accepts with Tab as well", async () => {
     const { field } = mount(MENU);
     type(field, "/h");
-    await screen.findByLabelText(BOT_COMPOSER_MENU_LABEL);
+    await screen.findByLabelText(SLASH_MENU_LABEL);
     expect(key(field, { key: "Tab" })).toBe(true);
     await waitFor(() => expect(field).toHaveValue("/history "));
   });
@@ -443,20 +447,16 @@ describe("BotComposer command menu", () => {
       }),
     });
     type(field, "/h");
-    await screen.findByLabelText(BOT_COMPOSER_MENU_LABEL);
+    await screen.findByLabelText(SLASH_MENU_LABEL);
     expect(key(field, { key: "Escape" })).toBe(true);
-    await waitFor(() =>
-      expect(screen.queryByLabelText(BOT_COMPOSER_MENU_LABEL)).not.toBeInTheDocument(),
-    );
+    await waitFor(() => expect(screen.queryByLabelText(SLASH_MENU_LABEL)).not.toBeInTheDocument());
     // The same token again: still dismissed.
     type(field, "/h ");
     type(field, "/h");
-    await waitFor(() =>
-      expect(screen.queryByLabelText(BOT_COMPOSER_MENU_LABEL)).not.toBeInTheDocument(),
-    );
+    await waitFor(() => expect(screen.queryByLabelText(SLASH_MENU_LABEL)).not.toBeInTheDocument());
     // A different token: the menu is owed again.
     type(field, "/hi");
-    expect(await screen.findByLabelText(BOT_COMPOSER_MENU_LABEL)).toBeInTheDocument();
+    expect(await screen.findByLabelText(SLASH_MENU_LABEL)).toBeInTheDocument();
   });
 
   /**
@@ -467,12 +467,12 @@ describe("BotComposer command menu", () => {
   it("never eats a keystroke it did not handle", async () => {
     const { field } = mount(MENU);
     type(field, "/h");
-    await screen.findByLabelText(BOT_COMPOSER_MENU_LABEL);
+    await screen.findByLabelText(SLASH_MENU_LABEL);
     expect(key(field, { key: "a" })).toBe(false);
     expect(key(field, { key: "Backspace" })).toBe(false);
     expect(key(field, { key: "Home" })).toBe(false);
     // Still open — none of those dismissed it either.
-    expect(screen.getByLabelText(BOT_COMPOSER_MENU_LABEL)).toBeInTheDocument();
+    expect(screen.getByLabelText(SLASH_MENU_LABEL)).toBeInTheDocument();
   });
 
   /**
@@ -491,10 +491,59 @@ describe("BotComposer command menu", () => {
     });
     type(field, "/help");
     key(field);
-    const panel = await screen.findByLabelText(BOT_COMPOSER_HELP_LABEL);
+    const panel = await screen.findByLabelText(SLASH_HELP_LABEL);
     expect(panel).toHaveTextContent("/history");
     expect(panel).toHaveTextContent("/help");
     expect(panel).toHaveTextContent(ESCAPE_HINT);
     expect(onCommand).not.toHaveBeenCalled();
+  });
+});
+
+describe("BotComposer lifetimes and the field's ARIA (R393)", () => {
+  it("runs a command once however often Enter is pressed while it is resolved", async () => {
+    const held: Array<() => void> = [];
+    const { onCommand, field } = mount(
+      {},
+      {
+        resolver: (draft) =>
+          new Promise((answer) =>
+            held.push(() =>
+              answer(
+                preview({
+                  draft,
+                  verdict: { kind: "command", name: "history", args: "trip" },
+                }),
+              ),
+            ),
+          ),
+      },
+    );
+    type(field, "/history trip");
+    key(field);
+    key(field);
+    fireEvent.click(screen.getByRole("button", { name: BOT_COMPOSER_SEND_LABEL }));
+    await act(async () => {
+      for (const answer of held.splice(0)) {
+        answer();
+      }
+    });
+    expect(onCommand).toHaveBeenCalledTimes(1);
+  });
+
+  it("points the field at the list and at the option the arrows highlight", async () => {
+    const { field } = mount({
+      "/h": preview({
+        draft: "/h",
+        verdict: { kind: "command", name: "help", args: null },
+        rows: [HISTORY_ROW, HELP_ROW],
+      }),
+    });
+    type(field, "/h");
+    const list = await screen.findByLabelText(SLASH_MENU_LABEL);
+    const options = within(list).getAllByRole("option");
+    await waitFor(() => expect(field).toHaveAttribute("aria-activedescendant", options[0]?.id));
+    expect(field).toHaveAttribute("aria-controls", list.id);
+    key(field, { key: "ArrowDown" });
+    await waitFor(() => expect(field).toHaveAttribute("aria-activedescendant", options[1]?.id));
   });
 });

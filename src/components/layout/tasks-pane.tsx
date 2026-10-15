@@ -153,6 +153,7 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { HoverHint, IconHint } from "@/components/ui/tooltip";
 import { columnMinWidth } from "@/lib/column-widths";
 import { type CountNoun, countLabel, RUNS } from "@/lib/count-label";
+import { logFailure } from "@/lib/failure";
 import type {
   PacedWorkVm,
   TaskBatchReceiptVm,
@@ -1164,7 +1165,10 @@ function CopyPathFact({
                 if (!resolvedPath) return;
                 void revealPath(resolvedPath)
                   .then(() => setError(null))
-                  .catch((cause: unknown) => setError(messageOf(cause)));
+                  .catch((cause: unknown) => {
+                    logFailure("tasks.revealFolder")(cause);
+                    setError(messageOf(cause));
+                  });
               }}
             >
               <FolderSearch className="size-4" />
@@ -1385,6 +1389,7 @@ function RunRow({ entry, now }: { entry: TaskRunVm; now: number }) {
       else await navigator.clipboard.writeText(log.path);
       setError(null);
     } catch (cause) {
+      logFailure("tasks.runLogPath")(cause);
       setError(messageOf(cause));
     }
   };
@@ -1560,7 +1565,10 @@ function TaskRow({
     if (!path) return;
     void revealPath(path)
       .then(() => setPathError(null))
-      .catch((cause: unknown) => setPathError(messageOf(cause)));
+      .catch((cause: unknown) => {
+        logFailure("tasks.reveal")(cause);
+        setPathError(messageOf(cause));
+      });
   };
   return (
     <ContextMenu
@@ -2476,12 +2484,12 @@ export function TasksPane() {
    * is exactly the "second place for one preference to be honoured differently"
    * that `list-fold.tsx` was extracted to prevent.
    *
-   * The rejection is ignored on purpose, `SyncPane`'s reason: the fallbacks equal
-   * the Rust defaults, and a list that folds at ten is not a failure worth a
-   * banner over.
+   * The rejection is logged and nothing more, `SyncPane`'s reason: the fallbacks
+   * equal the Rust defaults, and a list that folds at ten is not a failure worth
+   * a banner over.
    */
   useEffect(() => {
-    void hydrateSyncListSizes().catch(() => {});
+    void hydrateSyncListSizes().catch(logFailure("tasks.listSizes"));
   }, []);
 
   /**
@@ -2533,6 +2541,7 @@ export function TasksPane() {
         }
         openHistory({ id, runs, error: null });
       } catch (cause) {
+        logFailure("tasks.history")(cause);
         if (mine !== historyToken.current) {
           return;
         }
@@ -2594,6 +2603,7 @@ export function TasksPane() {
       try {
         await syncTaskRunNow(id);
       } catch (cause) {
+        logFailure("tasks.runNow")(cause);
         // Quoted on the row and nowhere else. An engine that refuses — the task
         // is off, or the other host on this machine holds the lease — is not a
         // failure of this surface, and the sentence it gives is the actionable
@@ -2645,6 +2655,7 @@ export function TasksPane() {
         // Only a row that is gone can have no form open on it.
         setEditingId((open) => (open === id ? null : open));
       } catch (cause) {
+        logFailure("tasks.forget")(cause);
         setRefusals((prior) => ({ ...prior, [id]: messageOf(cause) }));
       } finally {
         setDeleting((prior) => {
@@ -2963,6 +2974,7 @@ export function TasksPane() {
       try {
         applyReceipt(await syncTasksSetEnabled(ids, enabled));
       } catch (cause) {
+        logFailure("tasks.setEnabled")(cause);
         // The one whole-batch failure: the task record would not read at all.
         setBulkError(messageOf(cause));
       } finally {
@@ -2988,6 +3000,7 @@ export function TasksPane() {
         ),
       );
     } catch (cause) {
+      logFailure("tasks.toggleEnabled")(cause);
       setBulkError(messageOf(cause));
     } finally {
       await refresh(true);
@@ -3014,6 +3027,7 @@ export function TasksPane() {
         setSelected(new Set());
         setAnchorKey(null);
       } catch (cause) {
+        logFailure("tasks.forgetSelection")(cause);
         setBulkError(messageOf(cause));
       } finally {
         await refresh(true);

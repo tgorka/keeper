@@ -18,6 +18,7 @@ import {
   PopoverTitle,
   PopoverTrigger,
 } from "@/components/ui/popover";
+import { logFailure } from "@/lib/failure";
 import { formatMessageTime } from "@/lib/format-time";
 import type { EditVersionVm } from "@/lib/ipc/client";
 import { getEditHistory } from "@/lib/ipc/client";
@@ -67,7 +68,8 @@ export function EditHistoryPopover({
         .then((versions) => {
           if (id === requestId.current) setState({ status: "loaded", versions });
         })
-        .catch(() => {
+        .catch((raw: unknown) => {
+          logFailure("chat.editHistory")(raw);
           if (id === requestId.current) setState({ status: "error" });
         });
     },

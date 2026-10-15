@@ -58,6 +58,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { InputGroup, InputGroupInput } from "@/components/ui/input-group";
 import { IconHint } from "@/components/ui/tooltip";
+import { logFailure } from "@/lib/failure";
 import { formatDraftAge } from "@/lib/format-time";
 import type { SessionPatternVm, SessionTemplateEntryVm } from "@/lib/ipc/client";
 import {
@@ -432,7 +433,10 @@ export function SessionTemplates({
           setEditing(null);
           onChanged();
         })
-        .catch((raw: unknown) => setNotice(syncErrorMessage(raw, SESSION_TEMPLATE_RENAME_FAILED)))
+        .catch((raw: unknown) => {
+          logFailure("sessions.templateRename")(raw);
+          setNotice(syncErrorMessage(raw, SESSION_TEMPLATE_RENAME_FAILED));
+        })
         .finally(() => setRenaming(false));
     },
     [rootId, onChanged],
@@ -893,7 +897,10 @@ function TemplateSection({
         setMinting(null);
         onChanged();
       })
-      .catch((raw: unknown) => onNotice(syncErrorMessage(raw, SESSION_TEMPLATE_NEW_FAILED)))
+      .catch((raw: unknown) => {
+        logFailure("sessions.templateEntryNew")(raw);
+        onNotice(syncErrorMessage(raw, SESSION_TEMPLATE_NEW_FAILED));
+      })
       .finally(() => setBusy(false));
   }, [minting, rootId, name, onNotice, onChanged]);
 
@@ -919,9 +926,10 @@ function TemplateSection({
         setRenamingEntry(null);
         onChanged();
       })
-      .catch((raw: unknown) =>
-        onNotice(syncErrorMessage(raw, SESSION_TEMPLATE_ENTRY_RENAME_FAILED)),
-      )
+      .catch((raw: unknown) => {
+        logFailure("sessions.templateEntryRename")(raw);
+        onNotice(syncErrorMessage(raw, SESSION_TEMPLATE_ENTRY_RENAME_FAILED));
+      })
       .finally(() => setBusy(false));
   }, [renamingEntry, rootId, name, onNotice, onChanged]);
 
@@ -934,9 +942,10 @@ function TemplateSection({
     onNotice(null);
     sessionsTemplateDeleteEntry(rootId, name, target.relPath)
       .then(onChanged)
-      .catch((raw: unknown) =>
-        onNotice(syncErrorMessage(raw, SESSION_TEMPLATE_ENTRY_DELETE_FAILED)),
-      );
+      .catch((raw: unknown) => {
+        logFailure("sessions.templateEntryDelete")(raw);
+        onNotice(syncErrorMessage(raw, SESSION_TEMPLATE_ENTRY_DELETE_FAILED));
+      });
   }, [deleting, rootId, name, onNotice, onChanged]);
 
   const onKeyDown = useCallback(

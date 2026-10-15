@@ -46,6 +46,7 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
+import { logFailure } from "@/lib/failure";
 import type { Effect } from "@/lib/ipc/client";
 import { botsGrantSave } from "@/lib/ipc/client";
 import { botsStore, useBotsStore } from "@/lib/stores/bots";
@@ -162,9 +163,10 @@ export function BotApprovalDialog({
       .then(() => onAnswer(requestId, "always"))
       // The ask stays open on a failed write: answering "always" when no grant
       // was stored would approve a call under a permission that does not exist.
-      .catch((raw: unknown) =>
-        setFailure({ requestId, message: syncErrorMessage(raw, APPROVAL_SAVE_FAILED) }),
-      )
+      .catch((raw: unknown) => {
+        logFailure("bots.approvalGrantSave")(raw);
+        setFailure({ requestId, message: syncErrorMessage(raw, APPROVAL_SAVE_FAILED) });
+      })
       .finally(() => setSavingId((held) => (held === requestId ? null : held)));
   };
 

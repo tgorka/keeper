@@ -68,6 +68,7 @@ import { InputGroup, InputGroupAddon, InputGroupInput } from "@/components/ui/in
 import { IconHint } from "@/components/ui/tooltip";
 import { useWindowedRows } from "@/components/ui/window-list";
 import { countLabel, SESSIONS } from "@/lib/count-label";
+import { logFailure, sayFailure } from "@/lib/failure";
 import type { IpcError, RecordingFilterVm, RecordingHitVm } from "@/lib/ipc/client";
 import {
   listenRecordingsReconciled,
@@ -219,6 +220,7 @@ export function RecordingsPane() {
         setLoaded(true);
       })
       .catch((e: unknown) => {
+        logFailure("recordings.search")(e);
         if (seq !== seqRef.current) {
           return;
         }
@@ -277,7 +279,10 @@ export function RecordingsPane() {
   const reconcileNow = useCallback(() => {
     recordingsReconcileNow()
       .then((started) => setReconcileNote(started ? null : RECORDINGS_RECONCILE_WAITING))
-      .catch((e: unknown) => setReconcileNote(isIpcError(e) ? e.message : String(e)));
+      .catch((e: unknown) => {
+        logFailure("recordings.reconcileNow")(e);
+        setReconcileNote(isIpcError(e) ? e.message : String(e));
+      });
   }, []);
 
   // Tag choices are seeded from the current result set, the way the message
@@ -563,13 +568,17 @@ export function RecordingsPane() {
                         // retitle and 42.1's row follows the session, so the
                         // row's path is the current one and Reveal never points
                         // at where it used to be.
-                        void revealPath(h.absolutePath).catch(() => {});
+                        void revealPath(h.absolutePath).catch(
+                          sayFailure("recordings.reveal", "keeper couldn't reveal the recording."),
+                        );
                       }}
                       onPlay={(h) => {
                         if (h.playablePath === null) {
                           return;
                         }
-                        void recordingOpenPath(h.playablePath).catch(() => {});
+                        void recordingOpenPath(h.playablePath).catch(
+                          sayFailure("recordings.play", "keeper couldn't open the recording."),
+                        );
                       }}
                       canTranscribe={canTranscribe}
                       job={transcriptionJobs[hit.absolutePath]}

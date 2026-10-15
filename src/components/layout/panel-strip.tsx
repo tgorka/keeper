@@ -52,6 +52,7 @@ import { taskOutcomeText, taskReportText } from "@/components/layout/tasks-pane"
 import { deriveTitle, NoteEditor } from "@/components/notes/note-editor";
 import { Button } from "@/components/ui/button";
 import { IconHint } from "@/components/ui/tooltip";
+import { logFailure } from "@/lib/failure";
 import {
   type FilesEntryVm,
   type FilesListingVm,
@@ -230,6 +231,7 @@ function useFileResolution(target: PanelTargetVm | null, folded: boolean): FileR
         }
       })
       .catch((error: unknown) => {
+        logFailure("panel.resolveFile")(error);
         if (live) {
           setResolution({
             status: "unresolved",
@@ -260,7 +262,14 @@ function useRunResolution(target: PanelTargetVm | null, folded: boolean): RunRes
     if (taskId === null || runId === null || folded) return;
     let live = true;
     setResolution(null);
-    void Promise.all([syncTaskHistory(taskId, 50), syncTasks().catch(() => null)])
+    void Promise.all([
+      syncTaskHistory(taskId, 50),
+      // The run still resolves without its task's name; the listing is a nicety.
+      syncTasks().catch((error: unknown) => {
+        logFailure("panel.syncTasks")(error);
+        return null;
+      }),
+    ])
       .then(([runs, listing]) => {
         if (!live) return;
         const run = runs.find((entry) => entry.id === runId);
@@ -282,6 +291,7 @@ function useRunResolution(target: PanelTargetVm | null, folded: boolean): RunRes
         );
       })
       .catch((cause: unknown) => {
+        logFailure("panel.resolveRun")(cause);
         if (live)
           setResolution({
             status: "unresolved",
@@ -509,6 +519,7 @@ function RunLog({ runId }: { runId: number }) {
         }
         setPage(next);
       } catch (cause: unknown) {
+        logFailure("panel.runLog")(cause);
         if (mine === sequence.current) setError(isIpcError(cause) ? cause.message : String(cause));
       } finally {
         if (mine === sequence.current) {

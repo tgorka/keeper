@@ -2,6 +2,11 @@ import { act, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/lib/ipc/client", () => ({
+  // The default agent (story 100.3): read by Settings › Agents and the agent
+  // room's menu on mount; a read that never answers renders neither.
+  agentsDefaultGet: vi.fn(() => new Promise(() => {})),
+  agentsDefaultSet: vi.fn(),
+  frontendErrorReport: vi.fn(() => Promise.resolve()),
   // The About sub-block's background-update plan and its writer.
   autoUpdateGet: vi.fn(() =>
     Promise.resolve({
@@ -35,6 +40,8 @@ vi.mock("@/lib/ipc/client", () => ({
       repoMode: null,
       state: "none",
       sentence: null,
+      problem: false,
+      attempt: null,
       identity: null,
       device: null,
       devices: [],
@@ -234,7 +241,14 @@ vi.mock("@/lib/ipc/client", () => ({
     Promise.resolve({ readExec: [], env: [], status: "", refusal: null }),
   ),
   agentsSeedOffer: vi.fn(() =>
-    Promise.resolve({ folders: [], catalogue: [], bots: [], accounts: [] }),
+    Promise.resolve({
+      folders: [],
+      catalogue: [],
+      bots: [],
+      localBots: [],
+      botsUnread: null,
+      accounts: [],
+    }),
   ),
   botsGrantsList: vi.fn(() => Promise.resolve({ grants: [], unknown: [] })),
   botsBotsList: vi.fn(() => Promise.resolve([])),
@@ -1306,6 +1320,8 @@ describe("SettingsDialog", () => {
           differences: [],
         },
         problem: null,
+        model: null,
+        avatarProblem: null,
       },
     ]);
     mockPosture.mockResolvedValue(false);

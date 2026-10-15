@@ -124,6 +124,8 @@ mod tests {
 
     fn round(finish: &str) -> LineBody {
         LineBody::Assistant(AssistantBody {
+            bot: None,
+            effort: None,
             text: String::new(),
             model: "m".to_owned(),
             finish: finish.to_owned(),

@@ -10,6 +10,7 @@ import {
 } from "@/components/ui/card";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
+import { logFailure } from "@/lib/failure";
 import { setEncryptionPosture } from "@/lib/ipc/client";
 
 /**
@@ -89,7 +90,8 @@ export function AtRestEncryptionChoice({ onResolved }: AtRestEncryptionChoicePro
     try {
       await setEncryptionPosture(switchOn);
       onResolved();
-    } catch {
+    } catch (raw) {
+      logFailure("encryption.postureSet")(raw);
       // Persisting the posture failed; surface it and allow a retry rather than
       // trapping the user before login with a Continue that silently does nothing.
       resolvedRef.current = false;

@@ -13,6 +13,7 @@
  */
 import { listen } from "@tauri-apps/api/event";
 import { useEffect } from "react";
+import { logFailure } from "@/lib/failure";
 import { chatListFocusStore } from "@/lib/stores/chat-list-focus";
 import { primaryViewStore } from "@/lib/stores/primary-view";
 
@@ -37,9 +38,8 @@ export function useGlobalHotkey(): void {
             unlisten = fn;
           }
         })
-        .catch(() => {
-          // No Tauri host — the hotkey bridge is inert in this environment.
-        });
+        // No Tauri host — the hotkey bridge is inert in this environment.
+        .catch(logFailure("hotkey.listen"));
     } catch {
       // `listen` can throw synchronously when the Tauri IPC internals are absent.
     }

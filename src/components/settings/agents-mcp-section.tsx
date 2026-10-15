@@ -51,6 +51,7 @@ import {
   SheetTitle,
 } from "@/components/ui/sheet";
 import { Textarea } from "@/components/ui/textarea";
+import { logFailure } from "@/lib/failure";
 import {
   type AgentMcpDraftVm,
   type AgentMcpListVm,
@@ -115,6 +116,7 @@ export function AgentsMcpSection({ open }: { open: boolean }) {
       setList(await agentsMcpList());
       setError(null);
     } catch (failure) {
+      logFailure("agents.mcpList")(failure);
       setError(messageOf(failure));
     }
   }, []);
@@ -133,6 +135,7 @@ export function AgentsMcpSection({ open }: { open: boolean }) {
       setList(await agentsMcpRemove(name));
       setError(null);
     } catch (failure) {
+      logFailure("agents.mcpRemove")(failure);
       setError(messageOf(failure));
     }
   };
@@ -357,6 +360,7 @@ function ServerSheet({
         }),
       );
     } catch (failure) {
+      logFailure("agents.mcpSave")(failure);
       setError(messageOf(failure));
     } finally {
       setBusy(false);
@@ -685,11 +689,17 @@ export function AgentsSandboxSection({ open }: { open: boolean }) {
     }
     agentsSandboxGet()
       .then(show)
-      .catch((failure: unknown) => setError(messageOf(failure)));
+      .catch((failure: unknown) => {
+        logFailure("agents.sandboxGet")(failure);
+        setError(messageOf(failure));
+      });
     const timer = setInterval(() => {
       agentsSandboxGet()
         .then(setTable)
-        .catch((failure: unknown) => setError(messageOf(failure)));
+        .catch((failure: unknown) => {
+          logFailure("agents.sandboxReread")(failure);
+          setError(messageOf(failure));
+        });
     }, MCP_RELOAD_MS);
     return () => clearInterval(timer);
   }, [open, show]);
@@ -700,6 +710,7 @@ export function AgentsSandboxSection({ open }: { open: boolean }) {
     try {
       show(await agentsSandboxSave({ readExec, env }));
     } catch (failure) {
+      logFailure("agents.sandboxSave")(failure);
       setError(messageOf(failure));
     } finally {
       setBusy(false);

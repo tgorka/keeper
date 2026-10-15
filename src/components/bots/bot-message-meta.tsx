@@ -68,6 +68,7 @@ import { ChevronDown, ChevronRight } from "lucide-react";
 import { useEffect, useId, useState } from "react";
 import { formatElapsed } from "@/hooks/use-recording-session";
 import { countLabel, TOKENS } from "@/lib/count-label";
+import { logFailure } from "@/lib/failure";
 import type { BotMessageVm } from "@/lib/ipc/client";
 import { botsMessageDetailsGet, botsMessageDetailsSet } from "@/lib/ipc/client";
 import { botsStore, useBotsStore } from "@/lib/stores/bots";
@@ -267,9 +268,8 @@ export function BotMetaToggle() {
           botsStore.getState().setMetaShown(value);
         }
       })
-      .catch(() => {
-        // Off is already the state; nothing to correct and nothing to say.
-      });
+      // Off is already the state; nothing to correct and nothing to say.
+      .catch(logFailure("bots.metaShownGet"));
     return () => {
       live = false;
     };

@@ -1360,7 +1360,9 @@ impl ProfileSource for AgentProfiles {
     }
 }
 
-/// Everything one hosted agent's turns run with.
+/// Everything one hosted agent's turns run with. Cloned only when a turn
+/// finds its home names another model ([`current_model`]).
+#[derive(Clone)]
 pub struct AgentDeps {
     /// The platform, and the drive ports with [`AgentProfiles`] and no
     /// approver: every ask is refused (C4).
@@ -5494,6 +5496,8 @@ impl ServedSession {
                 let outcome = ran.outcome.as_ref();
                 let usage = outcome.and_then(|o| o.usage.as_ref());
                 LineBody::Assistant(AssistantBody {
+                    bot: Some(ran.sent.bot.clone()),
+                    effort: ran.sent.effort,
                     text: if ran.ending == TurnEnding::Stopped {
                         format!("{said}{}", shutdown_suffix(deps.host.as_str()))
                     } else {
@@ -5501,7 +5505,7 @@ impl ServedSession {
                     },
                     model: outcome
                         .and_then(|o| o.model.clone())
-                        .unwrap_or_else(|| deps.bot.target.clone()),
+                        .unwrap_or_else(|| ran.sent.target.clone()),
                     finish: outcome
                         .map_or_else(|| "stop".to_owned(), |o| finish_word(&o.finish_reason)),
                     usage: Usage {
@@ -8378,7 +8382,13 @@ impl ServedSession {
                 ),
                 shown.clone(),
             ),
-            TurnEnding::Failed => (join_note(&visible, TURN_FAILED), shown.clone()),
+            TurnEnding::Failed => (
+                join_note(
+                    &visible,
+                    ran.room_sentence.as_deref().unwrap_or(TURN_FAILED),
+                ),
+                shown.clone(),
+            ),
             TurnEnding::Asked => (visible, shown.clone()),
             TurnEnding::Parked => {
                 let summary = ran.parked.as_ref().map_or_else(String::new, |parked| {
@@ -8469,12 +8479,14 @@ impl ServedSession {
                 ran.parent,
                 Some(delivered.final_event.clone()),
                 LineBody::Assistant(AssistantBody {
+                    bot: Some(ran.sent.bot.clone()),
+                    effort: ran.sent.effort,
                     text: if ran.round_logged {
                         String::new()
                     } else {
                         ran.round_text.clone()
                     },
-                    model: deps.bot.target.clone(),
+                    model: ran.sent.target.clone(),
                     finish: "stop".to_owned(),
                     usage: Usage::default(),
                     ttft_ms: None,
@@ -8490,6 +8502,8 @@ impl ServedSession {
                     ran.parent,
                     Some(delivered.final_event.clone()),
                     LineBody::Assistant(AssistantBody {
+                        bot: Some(ran.sent.bot.clone()),
+                        effort: ran.sent.effort,
                         // A turn stopped between rounds has said the last
                         // round's prose on that round's line already.
                         text: if ran.ending == TurnEnding::Stopped {
@@ -8508,7 +8522,7 @@ impl ServedSession {
                         },
                         model: outcome
                             .and_then(|o| o.model.clone())
-                            .unwrap_or_else(|| deps.bot.target.clone()),
+                            .unwrap_or_else(|| ran.sent.target.clone()),
                         finish: outcome
                             .map_or_else(|| "stop".to_owned(), |o| finish_word(&o.finish_reason)),
                         usage: Usage {
@@ -8535,8 +8549,10 @@ impl ServedSession {
                         parent,
                         None,
                         LineBody::Assistant(AssistantBody {
+                            bot: Some(ran.sent.bot.clone()),
+                            effort: ran.sent.effort,
                             text: ran.round_text.clone(),
-                            model: deps.bot.target.clone(),
+                            model: ran.sent.target.clone(),
                             finish: "failed".to_owned(),
                             usage: Usage::default(),
                             ttft_ms: None,
@@ -8710,10 +8726,12 @@ impl ServedSession {
                 parent,
                 None,
                 LineBody::Assistant(AssistantBody {
+                    bot: Some(ran.sent.bot.clone()),
+                    effort: ran.sent.effort,
                     text: ran.round_text.clone(),
                     model: outcome
                         .and_then(|o| o.model.clone())
-                        .unwrap_or_else(|| deps.bot.target.clone()),
+                        .unwrap_or_else(|| ran.sent.target.clone()),
                     finish: outcome
                         .map_or_else(|| "stop".to_owned(), |o| finish_word(&o.finish_reason)),
                     usage: Usage {
@@ -8989,8 +9007,31 @@ fn join_note(shown: &str, note: &str) -> String {
     }
 }
 
+/// What a turn was sent to: the bot `[model].bot` named and the level
+/// `[model].effort` set, as each `assistant` line records them (100.2 #3).
+#[derive(Debug, Clone)]
+struct Sent {
+    /// `bot:{kind}:{base}#{target}`.
+    bot: String,
+    /// The model the request named.
+    target: String,
+    effort: Option<chat::Effort>,
+}
+
+impl Sent {
+    fn of(config: &keeper_core::agents::home::AgentConfig) -> Sent {
+        Sent {
+            bot: config.bot.reference(),
+            target: config.bot.target.clone(),
+            effort: config.effort,
+        }
+    }
+}
+
 /// What the tool loop left for the close.
 struct Ran {
+    /// The bot and level this turn was sent to (100.2 #3).
+    sent: Sent,
     ending: TurnEnding,
     outcome: Option<chat::ChatOutcome>,
     /// The last round's prose: the final `assistant` line's text.
@@ -9008,6 +9049,9 @@ struct Ran {
     /// The tool loop's rounds ran out: its last completion was offered no
     /// tools (R106).
     exhausted: bool,
+    /// A failure the room may read in its own words instead of
+    /// [`TURN_FAILED`]: the agent's home refusing its model (100.2, R381).
+    room_sentence: Option<String>,
 }
 
 /// How a turn opens: on an arrival, or at a call that waited for a person.
@@ -9022,6 +9066,8 @@ struct TurnLog<'a> {
     context: &'a mut SessionContext,
     writer: &'a mut SessionWriter,
     model: String,
+    /// The bot and level every round is sent to (100.2 #3).
+    sent: Sent,
     round_text: String,
     round_line: Option<Ulid>,
     last_line: Option<Ulid>,
@@ -9035,6 +9081,9 @@ struct TurnLog<'a> {
     /// Why the model's stream broke, when it did: the partial answer is
     /// returned as an outcome, the cause only to the event sink.
     broken: Option<String>,
+    /// The provider refused the turn's reasoning level, in the stream
+    /// (R405).
+    level_refused: Option<LevelRefused>,
     /// The parked call's `tool_call` line and wire call (R73).
     parked: Option<(Option<Ulid>, chat::ToolCall)>,
     /// Why the round gate stopped a workflow's run before its next round:
@@ -9448,6 +9497,8 @@ async fn arm_session(
         probe == Probe::Ask,
     )
     .await;
+    // The agent's level rides every round of its turns (R382).
+    armed.request.effort = config.effort;
     let model_tools = std::mem::take(&mut armed.request.tools);
     armed.request.tools = agent_offer(
         config,
@@ -9474,12 +9525,7 @@ fn open_body(context: &SessionContext, deps: &AgentDeps, composed: &ComposedProm
         requested_by: context.agent.requested_by.clone(),
         label: context.label.clone(),
         drives: context.scope.clone(),
-        model: format!(
-            "bot:{}:{}#{}",
-            config.bot.kind.as_registry_str(),
-            config.bot.base,
-            config.bot.target
-        ),
+        model: config.bot.reference(),
         prompt_sha256: composed.prompt_sha256.clone(),
         memory_sha256: composed.memory_sha256.clone(),
         encrypted: context
@@ -9556,6 +9602,35 @@ async fn run_agent_turn(
     resume: Option<crate::approvals::Resume>,
     review: Option<ReviewPass>,
 ) -> Ran {
+    let failed_as = |sent: Sent, error: String| Ran {
+        sent,
+        ending: TurnEnding::Failed,
+        outcome: None,
+        round_text: String::new(),
+        round_logged: false,
+        parent: None,
+        prompt_sha256: None,
+        error: Some(error),
+        bound: None,
+        parked: None,
+        exhausted: false,
+        room_sentence: None,
+    };
+    // The model is the home's now, not the host's start's: a person's save
+    // in Settings › Agents, or a hand edit, applies from this turn (100.2
+    // #5, R382).
+    let current = match current_model(deps) {
+        Ok(current) => current,
+        Err(sentence) => {
+            tracing::warn!(agent = %deps.home.config.id, %sentence, "agents: this agent's home no longer names a model it can run on; the turn is refused");
+            return Ran {
+                room_sentence: Some(sentence.clone()),
+                ..failed_as(Sent::of(&deps.home.config), sentence)
+            };
+        }
+    };
+    let deps = current.as_deref().unwrap_or(deps);
+    let sent = Sent::of(&deps.home.config);
     let config = &deps.home.config;
     let local = deps.model_is_local();
     let (mut armed, model_tools) =
@@ -9573,18 +9648,7 @@ async fn run_agent_turn(
         }
         None => config.allow.clone(),
     };
-    let failed = |error: String| Ran {
-        ending: TurnEnding::Failed,
-        outcome: None,
-        round_text: String::new(),
-        round_logged: false,
-        parent: None,
-        prompt_sha256: None,
-        error: Some(error),
-        bound: None,
-        parked: None,
-        exhausted: false,
-    };
+    let failed = |error: String| failed_as(sent.clone(), error);
 
     // What the prompt carries beyond the conversation — the home's frozen
     // files and the drives' context files — joins the label before it is
@@ -9809,6 +9873,7 @@ async fn run_agent_turn(
         context,
         writer,
         model: deps.bot.target.clone(),
+        sent: sent.clone(),
         round_text: String::new(),
         round_line: None,
         last_line: None,
@@ -9818,6 +9883,7 @@ async fn run_agent_turn(
         bound: None,
         round_usage: Usage::default(),
         broken: None,
+        level_refused: None,
         parked: None,
         stopped: None,
         tokens_at_start,
@@ -9971,7 +10037,9 @@ async fn run_agent_turn(
             }
         }
         ToolLoopEvent::Chat(ChatEvent::Failed { error }) => {
-            lock().broken = Some(error.to_string());
+            let mut log = lock();
+            log.level_refused = LevelRefused::of(config, sent.effort, &error);
+            log.broken = Some(error.to_string());
         }
         _ => {}
     };
@@ -10149,6 +10217,8 @@ async fn run_agent_turn(
         let mut log = lock();
         if log.round_line.is_none() {
             let body = LineBody::Assistant(AssistantBody {
+                bot: Some(log.sent.bot.clone()),
+                effort: log.sent.effort,
                 text: log.round_text.clone(),
                 model: log.model.clone(),
                 finish: ROUND_FINISH.to_owned(),
@@ -10463,8 +10533,12 @@ async fn run_agent_turn(
     let spent = log.spent;
     let waits = parked.is_some();
     let exhausted = matches!(&result, Some(Ok(done)) if done.exhausted);
+    let level = sent.effort;
+    let level_refused = log.level_refused;
+    let sent = sent.clone();
     let ran =
         move |ending: TurnEnding, outcome: Option<chat::ChatOutcome>, error: Option<String>| Ran {
+            sent,
             ending,
             outcome,
             round_text,
@@ -10475,6 +10549,7 @@ async fn run_agent_turn(
             bound,
             parked,
             exhausted,
+            room_sentence: None,
         };
     if let Some(error) = log.failure {
         return ran(TurnEnding::Failed, None, Some(error.to_string()));
@@ -10493,9 +10568,14 @@ async fn run_agent_turn(
                 ran(TurnEnding::Stopped, Some(done.final_outcome), None)
             } else if done.final_outcome.finish_reason == chat::FinishReason::Failed {
                 // A stream that broke hands back what had arrived; the turn
-                // still failed.
+                // still failed — in its room's words where the provider
+                // refused the level (R405).
                 let error = log.broken.unwrap_or_else(|| TURN_FAILED.to_owned());
-                ran(TurnEnding::Failed, Some(done.final_outcome), Some(error))
+                let failed = ran(TurnEnding::Failed, Some(done.final_outcome), Some(error));
+                match level_refused {
+                    Some(refused) => refused.say(failed, config),
+                    None => failed,
+                }
             } else if review_spent {
                 ran(TurnEnding::Spent, Some(done.final_outcome), None)
             } else {
@@ -10508,8 +10588,63 @@ async fn run_agent_turn(
             Some(ending) => ran(ending, None, None),
             None if bound.is_some() => ran(TurnEnding::Bounded, None, None),
             None if spent => ran(TurnEnding::Spent, None, None),
-            None => ran(TurnEnding::Failed, None, Some(error.to_string())),
+            None => {
+                let failed = ran(TurnEnding::Failed, None, Some(error.to_string()));
+                match LevelRefused::of(config, level, &error) {
+                    Some(refused) => refused.say(failed, config),
+                    None => failed,
+                }
+            }
         },
+    }
+}
+
+/// The provider's refusal of the reasoning level a turn was sent (R405):
+/// what its WARN line carries — the status, and a bounded excerpt of the
+/// provider's words, never its body verbatim.
+#[derive(Debug)]
+struct LevelRefused {
+    effort: chat::Effort,
+    status: Option<u16>,
+    excerpt: String,
+}
+
+impl LevelRefused {
+    /// `error` as the refusal of `effort` by `config`'s bot, when it is one
+    /// ([`chat::rejected_effort`]).
+    fn of(
+        config: &keeper_core::agents::home::AgentConfig,
+        effort: Option<chat::Effort>,
+        error: &BotsError,
+    ) -> Option<LevelRefused> {
+        let effort = effort?;
+        chat::rejected_effort(config.bot.kind, effort, error).then(|| LevelRefused {
+            effort,
+            status: match error {
+                BotsError::Status { status, .. } => Some(*status),
+                _ => None,
+            },
+            excerpt: chat::log_excerpt(error),
+        })
+    }
+
+    /// `ran`, ending in its room with the sentence naming the agent, its
+    /// bot and the level (R381), logged WARN.
+    fn say(self, mut ran: Ran, config: &keeper_core::agents::home::AgentConfig) -> Ran {
+        tracing::warn!(
+            agent = %config.id,
+            bot = %config.bot.reference(),
+            effort = self.effort.as_str(),
+            status = %self.status.map_or_else(|| "none".to_owned(), |status| status.to_string()),
+            excerpt = %self.excerpt,
+            "agents: the provider refused this agent's reasoning level; the turn ends saying so"
+        );
+        ran.room_sentence = Some(keeper_core::agents::model::level_refused(
+            &config.name,
+            &config.bot.target,
+            self.effort,
+        ));
+        ran
     }
 }
 
@@ -10782,6 +10917,52 @@ pub fn bot_for(home: &AgentHome, rows: &[ProviderRow]) -> Option<(ProviderRow, B
             created_ms: 0,
         },
     ))
+}
+
+/// `deps` over the model its home's `agent.toml` names now, read through
+/// the zone's own read path ([`crate::zone::read_home`]) as every turn
+/// begins (100.2 #5, R382): a person's save in Settings › Agents, or a hand
+/// edit, runs from the agent's next turn without restarting the host. Only
+/// `[model]` is taken from the file — every other key still waits for the
+/// host's next build, as before. `Ok(None)` when the model is the one
+/// `deps` holds. A home that no longer reads, or a bot no provider here
+/// serves, refuses the turn with its sentence.
+/// Boxed: the turn's future holds it across every await, and an inline
+/// `AgentDeps` there overflows the stacks of deep test runtimes.
+pub(crate) fn current_model(deps: &AgentDeps) -> Result<Option<Box<AgentDeps>>, String> {
+    let home = &deps.home;
+    let read = crate::zone::read_home(&home.zone, &home.config.id, &home.drive)?;
+    let now = read.config;
+    if now.bot == home.config.bot && now.effort == home.config.effort {
+        return Ok(None);
+    }
+    let fresh = AgentHome {
+        config: keeper_core::agents::home::AgentConfig {
+            bot: now.bot,
+            effort: now.effort,
+            local_only: now.local_only,
+            ..home.config.clone()
+        },
+        ..home.clone()
+    };
+    let (row, bot) = bot_for(&fresh, &deps.rows).ok_or_else(|| {
+        format!(
+            "No bot provider on this host serves {}'s model {} at {}. Add one under Bots.",
+            fresh.config.name, fresh.config.bot.target, fresh.config.bot.base
+        )
+    })?;
+    tracing::info!(
+        agent = %fresh.config.id,
+        bot = %fresh.config.bot.reference(),
+        effort = fresh.config.effort.map_or("default", chat::Effort::as_str),
+        "agents: this agent's model changed in its agent.toml; this turn runs on it"
+    );
+    Ok(Some(Box::new(AgentDeps {
+        row,
+        bot,
+        home: fresh,
+        ..deps.clone()
+    })))
 }
 
 impl From<CoreError> for ServeError {

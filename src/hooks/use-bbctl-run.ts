@@ -14,6 +14,7 @@
  * `cancel` only tears down keeper's streaming task, not the detached bridge process.
  */
 import { useCallback, useEffect, useRef, useState } from "react";
+import { logFailure } from "@/lib/failure";
 import type { BbctlProgressVm, IpcError } from "@/lib/ipc/client";
 import { bbctlRunCancel, bbctlRunStart } from "@/lib/ipc/client";
 
@@ -54,9 +55,8 @@ export function useBbctlRun(accountId: string, networkId: string, active: boolea
     const id = sessionIdRef.current;
     sessionIdRef.current = null;
     if (id !== null) {
-      void bbctlRunCancel(id).catch(() => {
-        // Cancel is best-effort.
-      });
+      // Cancel is best-effort.
+      void bbctlRunCancel(id).catch(logFailure("bbctl.cancel"));
     }
     setVm(null);
   }, []);
@@ -80,13 +80,14 @@ export function useBbctlRun(accountId: string, networkId: string, active: boolea
       .then((id) => {
         if (cancelled || cancelledRef.current) {
           // Torn down (or user-cancelled) before the id resolved — cancel it now.
-          void bbctlRunCancel(id).catch(() => {});
+          void bbctlRunCancel(id).catch(logFailure("bbctl.cancel"));
           return;
         }
         resolvedId = id;
         sessionIdRef.current = id;
       })
       .catch((raw: IpcError) => {
+        logFailure("bbctl.runStart")(raw);
         if (!cancelled && !cancelledRef.current) {
           // Render an honest failure VM so the Sheet offers Retry.
           setVm({
@@ -103,7 +104,7 @@ export function useBbctlRun(accountId: string, networkId: string, active: boolea
       const id = resolvedId ?? sessionIdRef.current;
       sessionIdRef.current = null;
       if (id !== null) {
-        void bbctlRunCancel(id).catch(() => {});
+        void bbctlRunCancel(id).catch(logFailure("bbctl.cancel"));
       }
     };
   }, [accountId, networkId, active, attempt]);

@@ -514,6 +514,8 @@ mod tests {
             self.push(
                 parent,
                 LineBody::Assistant(AssistantBody {
+                    bot: None,
+                    effort: None,
                     text: text.to_owned(),
                     model: "model".to_owned(),
                     finish: if anchor.is_some() {

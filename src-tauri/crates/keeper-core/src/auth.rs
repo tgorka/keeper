@@ -210,7 +210,10 @@ impl AuthProvider for OidcAuthProvider {
 
         match outcome {
             OAuthCallback::Cancelled => Err(CoreError::Auth(AuthError::OAuthCancelled)),
-            OAuthCallback::Error(e) => Err(CoreError::Auth(AuthError::OAuthFailed(e))),
+            OAuthCallback::Error { error, .. } => {
+                Err(CoreError::Auth(AuthError::OAuthFailed(error)))
+            }
+            OAuthCallback::Failed(reason) => Err(CoreError::Auth(AuthError::OAuthFailed(reason))),
             OAuthCallback::Redirect(url) => {
                 let parsed = url::Url::parse(&url).map_err(|e| {
                     CoreError::Auth(AuthError::OAuthFailed(format!("invalid callback URL: {e}")))

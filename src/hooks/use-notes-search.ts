@@ -13,6 +13,7 @@
  * query can never paint the results of its own three-character prefix.
  */
 import { useEffect, useState } from "react";
+import { logFailure } from "@/lib/failure";
 import { type IpcError, type NoteSearchHitVm, notesSearch } from "@/lib/ipc/client";
 
 /** How long the query rests before a scan is started. */
@@ -70,6 +71,7 @@ export function useNotesSearch(
           setRunning(false);
         }
       }).catch((failure: unknown) => {
+        logFailure("notes.search")(failure);
         if (live) {
           setRunning(false);
           setError(isIpcError(failure) ? failure.message : String(failure));

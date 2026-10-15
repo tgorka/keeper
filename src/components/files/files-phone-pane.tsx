@@ -85,6 +85,7 @@ import {
 } from "@/components/ui/context-menu";
 import { IconHint } from "@/components/ui/tooltip";
 import { useLongPress } from "@/hooks/use-long-press";
+import { logFailure, sayFailure } from "@/lib/failure";
 import type { FilesEntryVm, FilesListingVm, SyncProfileVm } from "@/lib/ipc/client";
 import {
   revealPath,
@@ -261,6 +262,7 @@ export function FilesPhonePane() {
         }
         return answer;
       } catch (raw: unknown) {
+        logFailure("phoneFiles.browse")(raw);
         if (token === readToken.current) {
           setListing(null);
           setNotice(syncErrorMessage(raw));
@@ -295,6 +297,7 @@ export function FilesPhonePane() {
         }
       })
       .catch((raw: unknown) => {
+        logFailure("phoneFiles.profiles")(raw);
         if (!cancelled) {
           setProfiles([]);
           setNotice(syncErrorMessage(raw));
@@ -394,6 +397,7 @@ export function FilesPhonePane() {
       try {
         await syncMaterializeEntry(profileId, entry.relativePath);
       } catch (raw: unknown) {
+        logFailure("phoneFiles.materialize")(raw);
         setNotice(syncErrorMessage(raw));
         return null;
       } finally {
@@ -428,6 +432,7 @@ export function FilesPhonePane() {
     try {
       await shareOut(place.profileId, ready.relativePath);
     } catch (raw: unknown) {
+      logFailure("phoneFiles.share")(raw);
       setNotice(syncErrorMessage(raw));
     }
   };
@@ -441,6 +446,7 @@ export function FilesPhonePane() {
     try {
       await syncFolderNow(place.profileId);
     } catch (raw: unknown) {
+      logFailure("phoneFiles.syncNow")(raw);
       setNotice(syncErrorMessage(raw));
     } finally {
       setRefreshing(false);
@@ -697,7 +703,9 @@ export function FilesPhonePane() {
             size="sm"
             className="min-h-11"
             onClick={() => {
-              void revealPath(place.entry.absolutePath).catch(() => undefined);
+              void revealPath(place.entry.absolutePath).catch(
+                sayFailure("files.reveal", "keeper couldn't reveal the file."),
+              );
             }}
           >
             {FILES_REVEAL_LABEL}

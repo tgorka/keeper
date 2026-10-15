@@ -39,6 +39,7 @@
 import { useCallback, useEffect } from "react";
 import { BotMessage } from "@/components/bots/bot-message";
 import { useWindowedRows } from "@/components/ui/window-list";
+import { logFailure } from "@/lib/failure";
 import { type BotMessageVm, botsSessionFollow } from "@/lib/ipc/client";
 import { botsStore, useBotsStore } from "@/lib/stores/bots";
 
@@ -98,7 +99,8 @@ export function useBotFollow(): void {
             timer = window.setTimeout(read, vm.nextPollMs);
           }
         })
-        .catch(() => {
+        .catch((raw: unknown) => {
+          logFailure("bots.sessionFollow")(raw);
           if (!cancelled) {
             botsStore.getState().stopFollowing();
           }

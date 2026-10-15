@@ -31,6 +31,7 @@ import { useReducedMotion } from "@/hooks/use-reduced-motion";
 import { useShellLayout } from "@/hooks/use-shell-layout";
 import { useSwipeActions } from "@/hooks/use-swipe-actions";
 import { accountHueVar } from "@/lib/account-hue";
+import { logFailure, sayFailure } from "@/lib/failure";
 import { formatDraftAge } from "@/lib/format-time";
 import {
   type ApprovalDraftVm,
@@ -121,7 +122,8 @@ export function ApprovalPane() {
         setRows(next);
         setQueryFailed(false);
       })
-      .catch(() => {
+      .catch((raw: unknown) => {
+        logFailure("approval.listDrafts")(raw);
         // A query failure leaves the last-known rows in place rather than blanking
         // the airlock, and flags the failure so the empty branch offers a retry.
         setQueryFailed(true);
@@ -164,8 +166,10 @@ export function ApprovalPane() {
           toast.error("Couldn't send this draft. It's still here — try again.");
           return;
         }
-        clearDraft(draft.accountId, draft.roomId).catch(() => {});
-        clearDraftMirror(draft.accountId, draft.roomId).catch(() => {});
+        clearDraft(draft.accountId, draft.roomId).catch(logFailure("approval.clearDraft"));
+        clearDraftMirror(draft.accountId, draft.roomId).catch(
+          logFailure("approval.clearDraftMirror"),
+        );
         draftsStore.getState().mark(draft.accountId, draft.roomId, false);
         removeRow(draft.accountId, draft.roomId);
       } finally {
@@ -181,8 +185,12 @@ export function ApprovalPane() {
   // restore can't race the re-query into a transient absent state.
   const onDiscard = useCallback(
     (draft: ApprovalDraftVm) => {
-      clearDraft(draft.accountId, draft.roomId).catch(() => {});
-      clearDraftMirror(draft.accountId, draft.roomId).catch(() => {});
+      clearDraft(draft.accountId, draft.roomId).catch(
+        sayFailure("approval.discard", "keeper couldn't discard the draft."),
+      );
+      clearDraftMirror(draft.accountId, draft.roomId).catch(
+        logFailure("approval.clearDraftMirror"),
+      );
       draftsStore.getState().mark(draft.accountId, draft.roomId, false);
       removeRow(draft.accountId, draft.roomId);
       toast("Draft discarded", {
@@ -191,9 +199,13 @@ export function ApprovalPane() {
           label: "Undo",
           onClick: () => {
             void (async () => {
-              await saveDraft(draft.accountId, draft.roomId, draft.body).catch(() => {});
+              await saveDraft(draft.accountId, draft.roomId, draft.body).catch(
+                sayFailure("approval.undoDiscard", "keeper couldn't restore the draft."),
+              );
               draftsStore.getState().mark(draft.accountId, draft.roomId, true);
-              mirrorDraft(draft.accountId, draft.roomId, draft.body).catch(() => {});
+              mirrorDraft(draft.accountId, draft.roomId, draft.body).catch(
+                logFailure("approval.mirrorDraft"),
+              );
             })();
           },
         },
@@ -214,8 +226,12 @@ export function ApprovalPane() {
       if (nextBody === draft.body) {
         return;
       }
-      saveDraft(draft.accountId, draft.roomId, nextBody).catch(() => {});
-      mirrorDraft(draft.accountId, draft.roomId, nextBody).catch(() => {});
+      saveDraft(draft.accountId, draft.roomId, nextBody).catch(
+        sayFailure("approval.saveEdit", "keeper couldn't save the draft."),
+      );
+      mirrorDraft(draft.accountId, draft.roomId, nextBody).catch(
+        logFailure("approval.mirrorDraft"),
+      );
       // Reflect the new body locally so the preview updates before the re-query.
       setRows((prev) =>
         prev.map((r) =>

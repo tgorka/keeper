@@ -25,6 +25,7 @@ use std::sync::Arc;
 use matrix_sdk::media::{MediaFormat, MediaRequestParameters, MediaThumbnailSettings};
 use matrix_sdk::ruma::events::room::message::MessageType;
 use matrix_sdk::ruma::events::room::MediaSource;
+use matrix_sdk::ruma::{MxcUri, OwnedMxcUri};
 use matrix_sdk::Client;
 use matrix_sdk_ui::timeline::Timeline;
 use matrix_sdk_ui::timeline::{MsgLikeKind, TimelineItemContent, TimelineItemKind};
@@ -322,9 +323,357 @@ fn msgtype_of(item: &Arc<matrix_sdk_ui::timeline::TimelineItem>) -> Option<Messa
     Some(message.msgtype().clone())
 }
 
+/// The fixed host of a `keeper-media://` URL that names an agent's profile
+/// avatar rather than a timeline item (story 100.4).
+const AVATAR_HOST: &str = "avatar";
+
+/// A resolved agent-avatar handle: the room and the member whose profile
+/// avatar it names. Carries no `mxc`: the member's avatar is read again from
+/// the room's state when the bytes are fetched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AvatarHandle {
+    pub account_id: String,
+    pub room_id: String,
+    pub user_id: String,
+}
+
+/// The URL of `user`'s profile avatar as `room` of `account_id` holds it, in
+/// `form`: `keeper-media://avatar/<account>/<room>/<user>?v=<version>`,
+/// each segment percent-encoded. `version` changes with the avatar, so a
+/// webview never draws a replaced picture from its cache; it is a hash, never
+/// the `mxc` itself (AD-4).
+pub fn avatar_url_in(
+    form: UrlForm,
+    account_id: &str,
+    room_id: &str,
+    user_id: &str,
+    version: &str,
+) -> String {
+    let mut url = Url::parse(&format!("{SCHEME}://{AVATAR_HOST}"))
+        .expect("static keeper-media base URL is always valid");
+    {
+        let mut segments = url
+            .path_segments_mut()
+            .expect("keeper-media URL always has a base");
+        segments.push(account_id).push(room_id).push(user_id);
+    }
+    url.query_pairs_mut().append_pair("v", version);
+    let rest = url.as_str().get(SCHEME.len() + 3..).unwrap_or_default();
+    asset_url::compose(form, SCHEME, rest)
+}
+
+/// Parse an agent-avatar URL in either spelling, or `None` for anything
+/// else (an item's URL included). The version is a cache key and is dropped.
+pub fn parse_avatar_url(raw: &str) -> Option<AvatarHandle> {
+    let rest = asset_url::strip(raw, SCHEME)?;
+    let url = Url::parse(&asset_url::compose(UrlForm::Scheme, SCHEME, rest)).ok()?;
+    if url.host_str() != Some(AVATAR_HOST) {
+        return None;
+    }
+    let segments: Vec<String> = url
+        .path_segments()?
+        .map(percent_decode)
+        .collect::<Option<Vec<String>>>()?;
+    let [account_id, room_id, user_id] = segments.as_slice() else {
+        return None;
+    };
+    Some(AvatarHandle {
+        account_id: account_id.clone(),
+        room_id: room_id.clone(),
+        user_id: user_id.clone(),
+    })
+}
+
+/// The profile avatar of `user` as `room`'s state holds it, downloaded
+/// whole — the original, never a server thumbnail: an SVG has none worth
+/// drawing, and a thumbnail would be the server's rendering of a file
+/// keeper only ever hands to an `<img>` — and never past
+/// [`crate::agents::avatar::MAX_BYTES`] (R399): a declared size past it is
+/// refused before a byte is read, and a body that runs past it is cut off
+/// there. Nothing of it goes to the SDK's media cache, so no original past
+/// the bound is ever kept. Served only for a member holding an agent's
+/// power in the room (an agent's picture, story 100.4) and only in one of
+/// the four picture formats ([`crate::agents::avatar::sniff`]); anything
+/// else is [`MediaError::NotFound`], and the device draws the agent's
+/// letter. A profile avatar refused as too large or as no picture is a WARN
+/// line once in this process, and is not downloaded again.
+pub async fn fetch_agent_avatar(
+    client: &Client,
+    room: &matrix_sdk::Room,
+    user: &matrix_sdk::ruma::UserId,
+) -> Result<MediaBytes, MediaError> {
+    let levels = room.power_levels().await.ok();
+    if !crate::agents::room::holds_agent_power(levels.as_ref(), user) {
+        return Err(MediaError::NotFound);
+    }
+    let mxc = room
+        .get_member_no_sync(user)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|member| member.avatar_url().map(ToOwned::to_owned))
+        .ok_or(MediaError::NotFound)?;
+    if refused_avatars()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(&mxc)
+    {
+        return Err(MediaError::NotFound);
+    }
+    let refuse = |why: &str| {
+        refused_avatars()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(mxc.clone());
+        tracing::warn!(
+            room = %room.room_id(),
+            agent = %user,
+            "keeper-media: an agent's profile avatar {why}; its letter is drawn instead"
+        );
+        MediaError::NotFound
+    };
+    let bytes = match download_avatar(client, &mxc).await {
+        Ok(bytes) => bytes,
+        Err(Download::TooLarge(bytes)) => {
+            return Err(refuse(&format!(
+                "is larger than {} KiB ({} KiB or more), so it is not downloaded",
+                crate::agents::avatar::MAX_BYTES / 1024,
+                bytes.div_ceil(1024)
+            )))
+        }
+        Err(Download::Failed(error)) => return Err(MediaError::Fetch(error)),
+    };
+    let Some(mimetype) = crate::agents::avatar::sniff(&bytes) else {
+        return Err(refuse("is not a PNG, JPEG, WebP or SVG image"));
+    };
+    Ok(MediaBytes {
+        bytes,
+        mimetype: mimetype.to_owned(),
+    })
+}
+
+/// The profile avatars this process refused, by `mxc`: each is said once
+/// and never downloaded again (a changed avatar is another `mxc`).
+fn refused_avatars() -> &'static std::sync::Mutex<std::collections::HashSet<OwnedMxcUri>> {
+    static REFUSED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<OwnedMxcUri>>> =
+        std::sync::LazyLock::new(Default::default);
+    &REFUSED
+}
+
+/// How long a profile avatar's download may take, whole.
+const AVATAR_DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Why a bounded download brought nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Download {
+    /// The body is larger than the bound: the size it declared, or as much
+    /// as was read when it ran past it.
+    TooLarge(u64),
+    /// The request failed: why, without its URL or token.
+    Failed(String),
+}
+
+/// The original of the plain media `mxc`, through the homeserver's
+/// authenticated media endpoint where it has one (else the legacy one), as
+/// the SDK chooses — read at most [`crate::agents::avatar::MAX_BYTES`].
+async fn download_avatar(client: &Client, mxc: &MxcUri) -> Result<Vec<u8>, Download> {
+    use matrix_sdk::ruma::api::auth_scheme::SendAccessToken;
+    use matrix_sdk::ruma::api::client::authenticated_media::get_content::v1 as authenticated;
+    use matrix_sdk::ruma::api::{Metadata, OutgoingRequest};
+    let failed = |what: &str| Download::Failed(what.to_owned());
+    let versions = client
+        .supported_versions()
+        .await
+        .map_err(|error| Download::Failed(format!("the homeserver's versions: {error}")))?;
+    let token = client.access_token().unwrap_or_default();
+    let homeserver = client.homeserver();
+    let request = if authenticated::Request::PATH_BUILDER.is_supported(&versions) {
+        authenticated::Request::from_uri(mxc)
+            .map_err(|_| failed("the avatar's address does not read"))?
+            .try_into_http_request::<Vec<u8>>(
+                homeserver.as_str(),
+                SendAccessToken::IfRequired(&token),
+                std::borrow::Cow::Borrowed(&versions),
+            )
+    } else {
+        #[allow(deprecated)]
+        let legacy = matrix_sdk::ruma::api::client::media::get_content::v3::Request::from_url(mxc)
+            .map_err(|_| failed("the avatar's address does not read"))?;
+        legacy.try_into_http_request::<Vec<u8>>(
+            homeserver.as_str(),
+            SendAccessToken::IfRequired(&token),
+            std::borrow::Cow::Borrowed(&versions),
+        )
+    }
+    .map_err(|_| failed("the avatar's request could not be made"))?;
+    let authorization = request
+        .headers()
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let http = reqwest::Client::builder()
+        .timeout(AVATAR_DOWNLOAD_TIMEOUT)
+        .build()
+        .map_err(|_| failed("no HTTP client could be made"))?;
+    download(
+        &http,
+        &request.uri().to_string(),
+        authorization.as_deref(),
+        crate::agents::avatar::MAX_BYTES,
+    )
+    .await
+}
+
+/// GET `url` (with `authorization`, when there is one) and read its body,
+/// at most `max` bytes: a `Content-Length` past it is refused before the
+/// body is read, and a body without one is cut off as soon as it runs past.
+async fn download(
+    http: &reqwest::Client,
+    url: &str,
+    authorization: Option<&str>,
+    max: u64,
+) -> Result<Vec<u8>, Download> {
+    let mut request = http.get(url);
+    if let Some(authorization) = authorization {
+        request = request.header(reqwest::header::AUTHORIZATION, authorization);
+    }
+    let mut response = request
+        .send()
+        .await
+        .map_err(|_| Download::Failed("the homeserver could not be reached".to_owned()))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(Download::Failed(format!(
+            "the homeserver answered {status}"
+        )));
+    }
+    if let Some(declared) = response.content_length() {
+        if declared > max {
+            return Err(Download::TooLarge(declared));
+        }
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| Download::Failed("the download broke off".to_owned()))?
+    {
+        let read = body.len() as u64 + chunk.len() as u64;
+        if read > max {
+            return Err(Download::TooLarge(read));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A one-shot HTTP server on this machine that answers its first
+    /// request with `response` as written, then closes; its URL.
+    async fn answering(response: Vec<u8>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let url = format!("http://{}/media", listener.local_addr().expect("addr"));
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut request = [0u8; 4096];
+            let _ = socket.read(&mut request).await;
+            let _ = socket.write_all(&response).await;
+            // A declared body never sent: a reader that waits for it hangs.
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        });
+        url
+    }
+
+    fn declared(length: usize, body: &[u8]) -> Vec<u8> {
+        let mut response =
+            format!("HTTP/1.1 200 OK\r\nContent-Length: {length}\r\n\r\n").into_bytes();
+        response.extend_from_slice(body);
+        response
+    }
+
+    fn chunked(chunks: &[&[u8]]) -> Vec<u8> {
+        let mut response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        for chunk in chunks {
+            response.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
+            response.extend_from_slice(chunk);
+            response.extend_from_slice(b"\r\n");
+        }
+        response.extend_from_slice(b"0\r\n\r\n");
+        response
+    }
+
+    async fn fetched(response: Vec<u8>, max: u64) -> Result<Vec<u8>, Download> {
+        let url = answering(response).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            download(&reqwest::Client::new(), &url, Some("Bearer t"), max),
+        )
+        .await
+        .expect("the download ends without the rest of a declared body")
+    }
+
+    /// R399 #1: a profile avatar is read up to the bound and no further —
+    /// at the bound it is served; a size declared past it is refused before
+    /// a byte of the body is read; a body without a declared size is cut
+    /// off as it runs past.
+    #[tokio::test]
+    async fn an_avatars_download_stops_at_the_bound() {
+        let max = 16;
+        let at = vec![b'a'; 16];
+        assert_eq!(fetched(declared(16, &at), max).await, Ok(at.clone()));
+        assert_eq!(
+            fetched(chunked(&[&at[..10], &at[10..]]), max).await,
+            Ok(at.clone())
+        );
+        assert_eq!(
+            fetched(declared(17, b""), max).await,
+            Err(Download::TooLarge(17))
+        );
+        assert_eq!(
+            fetched(chunked(&[&at[..10], &at[..10]]), max).await,
+            Err(Download::TooLarge(20))
+        );
+        let refused = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_vec();
+        assert!(matches!(
+            fetched(refused, max).await,
+            Err(Download::Failed(_))
+        ));
+    }
+
+    #[test]
+    fn an_avatar_url_round_trips_in_both_forms_and_is_no_item_url() {
+        for form in [UrlForm::Scheme, UrlForm::Localhost] {
+            let url = avatar_url_in(form, "acct/1", "!r:h", "@nixi:example.org", "abc123");
+            assert_eq!(
+                parse_avatar_url(&url),
+                Some(AvatarHandle {
+                    account_id: "acct/1".into(),
+                    room_id: "!r:h".into(),
+                    user_id: "@nixi:example.org".into(),
+                }),
+                "{url}"
+            );
+            assert_eq!(parse_media_url(&url), None, "{url}");
+            assert!(!url.contains("mxc"), "{url}");
+        }
+        let item = media_url("a", "!r:h", "k", MediaVariant::Full);
+        assert_eq!(parse_avatar_url(&item), None);
+        // Three segments under the item host are no avatar either.
+        assert_eq!(
+            parse_avatar_url("keeper-media://media/a/!r:h/@u:h?v=1"),
+            None
+        );
+        assert_ne!(
+            avatar_url_in(UrlForm::Scheme, "a", "!r:h", "@u:h", "one"),
+            avatar_url_in(UrlForm::Scheme, "a", "!r:h", "@u:h", "two"),
+        );
+    }
 
     #[test]
     fn media_url_round_trips_via_parse() {

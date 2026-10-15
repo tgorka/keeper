@@ -28,6 +28,7 @@
  * label *is* the state and a chip with no state would be a chip lying.
  */
 
+import { sayFailure } from "@/lib/failure";
 import type { VoiceWakeVm } from "@/lib/ipc/client";
 import { voiceAvailability, voiceWakeToggle } from "@/lib/ipc/client";
 import { useCapabilitiesStore } from "@/lib/stores/capabilities";
@@ -80,7 +81,11 @@ export function BotListeningToggle({ phone = false }: { phone?: boolean } = {}) 
       type="button"
       aria-label={LISTENING_TOGGLE_LABEL}
       aria-pressed={wake.enabled}
-      onClick={() => void toggleVoiceListening()}
+      onClick={() =>
+        void toggleVoiceListening().catch(
+          sayFailure("voice.toggle", "keeper couldn't switch listening for the wake phrase."),
+        )
+      }
       className={cn(
         "shrink-0 rounded-md border border-border",
         phone ? "h-11 px-3 text-sm" : "px-2 py-1 text-xs",

@@ -32,6 +32,7 @@ import { Button } from "@/components/ui/button";
 import { InputGroup, InputGroupInput } from "@/components/ui/input-group";
 import { useSessionsChanges } from "@/hooks/use-sessions-changes";
 import { countLabel, SESSIONS } from "@/lib/count-label";
+import { logFailure } from "@/lib/failure";
 import type { SessionPatternVm, SessionRowVm } from "@/lib/ipc/client";
 import {
   sessionsCreate,
@@ -280,6 +281,7 @@ export function SessionsPane() {
       // refusal with no catch left that room on "Reading templates…" forever,
       // with nothing said and nothing to press.
       .catch((raw: unknown) => {
+        logFailure("sessions.patterns")(raw);
         if (!live) {
           return;
         }
@@ -330,6 +332,7 @@ export function SessionsPane() {
           return null;
         })
         .catch((raw: unknown) => {
+          logFailure("sessions.templateInstall")(raw);
           const refusal = syncErrorMessage(raw, SESSION_PATTERN_INSTALL_FAILED);
           setInstallError(refusal);
           return refusal;

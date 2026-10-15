@@ -8,6 +8,7 @@ import type { AccountVm, VerificationFlowVm } from "@/lib/ipc/client";
 const subscribeVerification = vi.fn();
 const unsubscribeVerification = vi.fn();
 const verificationAccept = vi.fn();
+const frontendErrorReport = vi.fn((..._args: unknown[]) => Promise.resolve());
 vi.mock("@/lib/ipc/client", () => ({
   subscribeVerification: (accountId: string, onBatch: (b: VerificationFlowVm) => void) =>
     subscribeVerification(accountId, onBatch),
@@ -15,6 +16,7 @@ vi.mock("@/lib/ipc/client", () => ({
     unsubscribeVerification(accountId, id),
   verificationAccept: (accountId: string, flowId: string) => verificationAccept(accountId, flowId),
   verificationCancel: () => Promise.resolve(),
+  frontendErrorReport: (...args: unknown[]) => frontendErrorReport(...args),
 }));
 
 import { useVerification } from "@/hooks/use-verification";
@@ -175,7 +177,7 @@ describe("useVerification", () => {
     expect(unsubscribeVerification).toHaveBeenCalledWith(bob.accountId, 2);
   });
 
-  it("swallows a subscribe failure", async () => {
+  it("survives a subscribe failure without opening the modal", async () => {
     subscribeVerification.mockRejectedValue(new Error("stream failed"));
     accountsStore.getState().hydrateAll([alice]);
     renderHook(() => useVerification());

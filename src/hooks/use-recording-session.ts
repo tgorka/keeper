@@ -14,9 +14,11 @@
  *
  * Error-safe by design: a failed `start()` surfaces as a failed snapshot (never
  * a crash); a failed poll keeps the previous snapshot (transient IPC noise must
- * not flicker the UI back to idle mid-recording).
+ * not flicker the UI back to idle mid-recording) and is only logged; a failed
+ * stop or dismiss the person asked for is said.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { logFailure, sayFailure } from "@/lib/failure";
 import type {
   RecordingNoteLink,
   RecordingStatusVm,
@@ -173,9 +175,8 @@ export function useRecordingSession(): UseRecordingSession {
     mounted.current = true;
     void recordingStatus()
       .then(adopt)
-      .catch(() => {
-        // No runtime / early boot: keep the idle default.
-      });
+      // No runtime / early boot: keep the idle default.
+      .catch(logFailure("recording.status"));
     return () => {
       mounted.current = false;
     };
@@ -203,7 +204,7 @@ export function useRecordingSession(): UseRecordingSession {
       pollInFlight.current = true;
       void recordingStatus()
         .then(adopt)
-        .catch(() => {})
+        .catch(logFailure("recording.status"))
         .finally(() => {
           pollInFlight.current = false;
         });
@@ -262,6 +263,7 @@ export function useRecordingSession(): UseRecordingSession {
         }
         return true;
       } catch (raw) {
+        logFailure("recording.start")(raw);
         // An honest failed snapshot — never a crash, never a silent no-op.
         if (mounted.current) {
           const message =
@@ -281,8 +283,11 @@ export function useRecordingSession(): UseRecordingSession {
   );
 
   const stop = useCallback(async () => {
-    // Best-effort: the outcome arrives through the poll (stopping → finalized).
-    await recordingStop().catch(() => {});
+    // The outcome arrives through the poll (stopping → finalized); a refused
+    // stop leaves the recording running, which the person has to hear.
+    await recordingStop().catch(
+      sayFailure("recording.stop", "keeper couldn't stop the recording."),
+    );
   }, []);
 
   // Dismiss a terminal outcome (Story 18.4): Rust owns the clear (terminal →
@@ -294,8 +299,9 @@ export function useRecordingSession(): UseRecordingSession {
       if (mounted.current) {
         setStatus(vm);
       }
-    } catch {
-      // Best-effort: keep the honest failed snapshot; the user can retry.
+    } catch (error) {
+      // Keep the honest failed snapshot; the user can retry.
+      sayFailure("recording.acknowledge", "keeper couldn't dismiss the recording outcome.")(error);
     }
   }, []);
 

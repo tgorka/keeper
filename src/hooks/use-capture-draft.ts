@@ -37,6 +37,7 @@
  */
 import { useCallback, useEffect, useState } from "react";
 import { saveNote } from "@/hooks/use-notes-body";
+import { logFailure } from "@/lib/failure";
 import {
   type IpcError,
   listenNotesCaptureShown,
@@ -125,6 +126,7 @@ export function useCaptureDraft(
       );
       setError(null);
     } catch (failure: unknown) {
+      logFailure("capture.draft")(failure);
       setError(reasonOf(failure));
     }
   }, [captureKey]);
@@ -149,10 +151,9 @@ export function useCaptureDraft(
         }
         stop = unlisten;
       })
-      .catch(() => {
-        // A listener that could not be attached costs the belt, never the page:
-        // `dismiss` re-arms on the path that matters.
-      });
+      // A listener that could not be attached costs the belt, never the page:
+      // `dismiss` re-arms on the path that matters.
+      .catch(logFailure("capture.listenShown"));
     return () => {
       cancelled = true;
       stop?.();
@@ -186,6 +187,7 @@ export function useCaptureDraft(
       try {
         await hide();
       } catch (failure: unknown) {
+        logFailure("capture.hide")(failure);
         // Said rather than swallowed, and the page is kept: a window that would
         // not hide is a window problem, and throwing the note away over it
         // would be capture losing words, which it may never do.

@@ -45,6 +45,7 @@
 import { relaunch } from "@tauri-apps/plugin-process";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import { useEffect } from "react";
+import { logFailure } from "@/lib/failure";
 import {
   type AutoUpdateRestartVm,
   type AutoUpdateVm,
@@ -130,8 +131,9 @@ export function useAutoUpdate() {
       }
       try {
         plan = await autoUpdateGet();
-      } catch {
+      } catch (error) {
         // Keep the last known plan rather than stopping over one failed read.
+        logFailure("update.readPlan")(error);
       }
       if (stopped || plan === null || !plan.supported || !plan.enabled) {
         return;
@@ -140,7 +142,8 @@ export function useAutoUpdate() {
       let verdict: AutoUpdateRestartVm;
       try {
         verdict = await autoUpdateRestartCheck(now - phase.atMs, now - lastInteraction);
-      } catch {
+      } catch (raw) {
+        logFailure("update.restartCheck")(raw);
         // A wedged answer is not a reason to restart; ask again next minute.
         restartLater(plan.restartCheckIntervalMs);
         return;
@@ -152,8 +155,9 @@ export function useAutoUpdate() {
           // refused one changes nothing on disk: the build is still installed
           // and still waiting, so keep asking.
           await relaunch();
-        } catch {
-          // Reported nowhere on purpose: nobody is watching, by construction.
+        } catch (error) {
+          // Nobody is watching, by construction: the log is the only witness.
+          logFailure("update.relaunch")(error);
         }
       }
       if (!stopped && plan !== null) {
@@ -173,6 +177,7 @@ export function useAutoUpdate() {
       try {
         found = await check();
       } catch (raw: unknown) {
+        logFailure("update.check")(raw);
         setPhase({ kind: "error", message: updateErrorMessage(raw) });
         return false;
       }
@@ -186,6 +191,7 @@ export function useAutoUpdate() {
         // Nothing here relaunches — see the header.
         await found.downloadAndInstall();
       } catch (raw: unknown) {
+        logFailure("update.install")(raw);
         setPhase({ kind: "error", message: updateErrorMessage(raw) });
         return false;
       }
@@ -199,9 +205,10 @@ export function useAutoUpdate() {
       }
       try {
         plan = await autoUpdateGet();
-      } catch {
+      } catch (error) {
         // Keep the last known plan; a first-cycle failure is handled by the
         // caller below, which never schedules a cycle without one.
+        logFailure("update.readPlan")(error);
       }
       if (plan === null || stopped) {
         return;
@@ -255,9 +262,8 @@ export function useAutoUpdate() {
         }
         later(first.enabled ? first.firstCheckDelayMs : first.checkIntervalMs);
       })
-      .catch(() => {
-        // No plan, no background updates this launch. The About button stands.
-      });
+      // No plan, no background updates this launch. The About button stands.
+      .catch(logFailure("update.readPlan"));
 
     return () => {
       stopped = true;

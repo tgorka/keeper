@@ -123,6 +123,7 @@ import { Progress } from "@/components/ui/progress";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Separator } from "@/components/ui/separator";
 import { IconHint } from "@/components/ui/tooltip";
+import { logFailure, sayFailure } from "@/lib/failure";
 import { formatDraftAge } from "@/lib/format-time";
 import type {
   CopyJobState,
@@ -294,10 +295,11 @@ function SyncFolderFootprint({ profileId }: { profileId: string }): React.ReactE
         if (live) {
           setFootprint(measured);
         }
-      } catch {
+      } catch (error) {
         // A folder on an unmounted volume cannot be measured, and saying so
         // here would be a second error message about a fact the card's status
         // line already carries.
+        logFailure("sync.footprint")(error);
       }
     })();
     return () => {
@@ -793,9 +795,9 @@ export function SyncPane() {
     // read runs with: hydrating after the first read would fetch the fallback
     // 100 and then quietly disagree with the saved setting until the next poll.
     // A failure is not worth surfacing — the fallbacks match the Rust defaults,
-    // so the lists render correctly either way.
+    // so the lists render correctly either way — and is logged.
     void hydrateSyncListSizes()
-      .catch(() => {})
+      .catch(logFailure("sync.listSizes"))
       .then(ensureSyncHydrated)
       .then(refreshSyncDetailAll);
     const stopStatuses = startSyncStatusPolling();
@@ -1025,6 +1027,7 @@ function SyncProfileCard({
     try {
       await action();
     } catch (raw) {
+      logFailure("syncPane.action")(raw);
       setActionError(syncErrorMessage(raw));
     } finally {
       if (refresh) {
@@ -1853,8 +1856,9 @@ function CopyCard() {
       if (typeof selection === "string") {
         choose(selection);
       }
-    } catch {
-      // Picker cancellation / failure → keep the current choice (no write).
+    } catch (error) {
+      // A cancelled picker resolves null; a failure keeps the current choice (no write).
+      sayFailure("sync.pick", "keeper couldn't open the picker.")(error);
     }
   };
 

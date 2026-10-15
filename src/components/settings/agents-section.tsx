@@ -27,6 +27,13 @@
  * agent to its sign-in row above. It signs nothing in itself. A folder this
  * Mac cannot seed shows Rust's sentence instead of the form.
  *
+ * **Each agent's model (Story 100.2, R382).** Every agent row shows the bot its
+ * `agent.toml` names and its reasoning level, offered from the bots and levels
+ * Rust lists for that agent; *Save model* writes those two keys and nothing
+ * else, and the agent's next turn runs on them. *Set up agents* takes the
+ * folder's level beside its bot, and each ticked agent may take its own bot and
+ * level instead.
+ *
  * **Absent, not empty (AD-27).** No flagged folder and nothing this Mac keeps for
  * its agents — no MCP server, no `[sandbox]` row — renders nothing, and the
  * dialog renders the section only where `botTools` is true — a phone is never
@@ -41,12 +48,22 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
+import { logFailure } from "@/lib/failure";
 import {
   type AgentCopyVm,
+  type AgentModelVm,
   type AgentPersonVm,
   type AgentPinVm,
   type AgentSeedFolderVm,
+  type AgentSeedModelReq,
   type AgentSeedOfferVm,
   type AgentSeedPlanVm,
   type AgentSeedReq,
@@ -55,10 +72,12 @@ import {
   agentsCopySignIn,
   agentsDriveRepin,
   agentsMcpList,
+  agentsModelSet,
   agentsSandboxGet,
   agentsSeedApply,
   agentsSeedOffer,
   agentsSeedPlan,
+  type Effort,
 } from "@/lib/ipc/client";
 
 /** The section heading, so the dialog and its test cannot disagree about it. */
@@ -77,8 +96,17 @@ export const SEED_WRITE_LABEL = "Write the files";
 export const SEED_NO_BOTS =
   "You have no bots yet. A bot you add in Settings › Bots is offered here.";
 
+/** What *Set up agents* says when a local-only folder has none of the person's bots to run on. */
+export const SEED_NO_LOCAL_BOTS =
+  "None of your bots runs locally, and this folder's agents may run only on a model on your own machines. Add an ollama bot in Settings › Bots.";
+
 /** How often the open section reads the rows again: the host rescans every 5 s. */
 export const AGENTS_RELOAD_MS = 5000;
+
+export const MODEL_SAVE_LABEL = "Save model";
+/** The level choice that sends none: the provider decides. */
+export const PROVIDER_DEFAULT_LABEL = "Provider's default";
+const DEFAULT_EFFORT = "default";
 
 /** Rust's sentence from a rejected command. */
 function messageOf(error: unknown): string {
@@ -136,6 +164,7 @@ export function AgentsSection({ open }: { open: boolean }) {
       setRows(await agentsCopies());
       setLoadError(null);
     } catch (error) {
+      logFailure("agents.copies")(error);
       setLoadError(messageOf(error));
     }
   }, []);
@@ -145,6 +174,7 @@ export function AgentsSection({ open }: { open: boolean }) {
       setOffer(await agentsSeedOffer());
       setOfferError(null);
     } catch (error) {
+      logFailure("agents.seedOffer")(error);
       setOfferError(messageOf(error));
     }
   }, []);
@@ -162,7 +192,10 @@ export function AgentsSection({ open }: { open: boolean }) {
         ),
       )
       // The sections below say what failed.
-      .catch(() => setMacKeeps(true));
+      .catch((raw: unknown) => {
+        logFailure("agents.macKeeps")(raw);
+        setMacKeeps(true);
+      });
     const timer = setInterval(() => void reload(), AGENTS_RELOAD_MS);
     return () => clearInterval(timer);
   }, [open, reload, reloadOffer]);
@@ -299,6 +332,7 @@ function DriveAgents({
             agent={agent}
             pin={pin}
             onChanged={onChanged}
+            onRows={onRows}
           />
         ))}
       {/* The same sentence from both reads is said once. */}
@@ -346,6 +380,7 @@ function PinReview({
         }),
       );
     } catch (failure) {
+      logFailure("agents.driveRepin")(failure);
       setError(messageOf(failure));
     } finally {
       setBusy(false);
@@ -412,11 +447,13 @@ function AgentRow({
   agent,
   pin,
   onChanged,
+  onRows,
 }: {
   id: string;
   agent: AgentCopyVm;
   pin: AgentPinVm;
   onChanged: () => Promise<void>;
+  onRows: (rows: AgentCopyVm[]) => void;
 }) {
   const [password, setPassword] = useState("");
   const [busy, setBusy] = useState(false);
@@ -439,6 +476,7 @@ function AgentRow({
       setPassword("");
       await onChanged();
     } catch (failure) {
+      logFailure("agents.copySignIn")(failure);
       setError(messageOf(failure));
     } finally {
       setBusy(false);
@@ -484,14 +522,216 @@ function AgentRow({
           </Button>
         </form>
       )}
+      {agent.model !== null && <AgentModel agent={agent} model={agent.model} onRows={onRows} />}
       {agent.problem !== null && (
         <p className="text-muted-foreground text-xs [overflow-wrap:anywhere]">{agent.problem}</p>
+      )}
+      {agent.avatarProblem !== null && (
+        // Why the agent's picture is not its home's `avatar.*` (story 100.4):
+        // Rust's sentence, naming the agent and the file or the failed upload.
+        <p
+          data-testid="agent-avatar-problem"
+          className="text-muted-foreground text-xs [overflow-wrap:anywhere]"
+        >
+          {agent.avatarProblem}
+        </p>
       )}
       {error !== null && (
         <p role="alert" className="text-destructive text-xs [overflow-wrap:anywhere]">
           {error}
         </p>
       )}
+    </div>
+  );
+}
+
+/**
+ * One agent's bot and level (100.2 #4, R382): the bots Rust offers this agent
+ * — the person's own, only the local ones where the agent is local-only — each
+ * with the levels its kind is sent. *Save model* writes only `[model].bot` and
+ * `[model].effort` of its `agent.toml`; the agent's next turn runs on it. A
+ * refusal is Rust's sentence beside the control; a Mac that cannot write the
+ * drive says why and offers nothing; bots that could not be read are Rust's
+ * sentence where they would be, never an empty list (R405).
+ */
+function AgentModel({
+  agent,
+  model,
+  onRows,
+}: {
+  agent: AgentCopyVm;
+  model: AgentModelVm;
+  onRows: (rows: AgentCopyVm[]) => void;
+}) {
+  const [bot, setBot] = useState(model.bot);
+  const [effort, setEffort] = useState<Effort | null>(model.effort);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [saved, setSaved] = useState(false);
+  const id = useId();
+  // A new reading of the file — another Mac's save, a hand edit — is what the
+  // row shows next.
+  useEffect(() => {
+    setBot(model.bot);
+    setEffort(model.effort);
+  }, [model.bot, model.effort]);
+
+  const chosen = model.bots.find((candidate) => candidate.reference === bot);
+  const efforts = chosen?.efforts ?? [];
+  const changed = bot !== model.bot || effort !== model.effort;
+  const locked = model.locked !== null;
+
+  const save = async () => {
+    setBusy(true);
+    setError(null);
+    setSaved(false);
+    try {
+      onRows(
+        await agentsModelSet({
+          profileId: agent.profileId,
+          agent: agent.agent,
+          bot,
+          effort,
+          shownBot: model.bot,
+          shownEffort: model.effort,
+        }),
+      );
+      setSaved(true);
+    } catch (failure) {
+      setError(messageOf(failure));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="flex min-w-0 flex-col gap-1">
+      <div className="flex min-w-0 flex-wrap items-end gap-2">
+        <div className="flex min-w-0 flex-col gap-1">
+          <Label id={`${id}-bot`} className="text-xs">
+            Model
+          </Label>
+          <Select
+            value={bot}
+            disabled={busy || locked}
+            onValueChange={(next) => {
+              setBot(next);
+              const offered =
+                model.bots.find((candidate) => candidate.reference === next)?.efforts ?? [];
+              if (effort !== null && !offered.includes(effort)) {
+                setEffort(null);
+              }
+              setSaved(false);
+            }}
+          >
+            <SelectTrigger
+              className="w-56 max-w-full"
+              aria-labelledby={`${id}-bot`}
+              data-testid={`agent-model-bot-${agent.agent}`}
+            >
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {model.bots.map((candidate) => (
+                <SelectItem key={candidate.reference} value={candidate.reference}>
+                  {candidate.provider === ""
+                    ? candidate.name
+                    : `${candidate.name} — ${candidate.provider}`}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+        <EffortSelect
+          label="Reasoning"
+          value={effort}
+          efforts={efforts}
+          disabled={busy || locked}
+          testId={`agent-model-effort-${agent.agent}`}
+          onChange={(next) => {
+            setEffort(next);
+            setSaved(false);
+          }}
+        />
+        {!locked && (
+          <Button size="sm" disabled={busy || !changed} onClick={() => void save()}>
+            {MODEL_SAVE_LABEL}
+          </Button>
+        )}
+      </div>
+      {model.unread !== null && (
+        <p role="alert" className="text-destructive text-xs [overflow-wrap:anywhere]">
+          {model.unread}
+        </p>
+      )}
+      {efforts.length === 0 && (
+        <p className="text-muted-foreground text-xs">
+          This bot is sent no reasoning level: its provider decides.
+        </p>
+      )}
+      {model.locked !== null && (
+        <p className="text-muted-foreground text-xs [overflow-wrap:anywhere]">{model.locked}</p>
+      )}
+      {saved && !changed && (
+        <p role="status" className="text-xs">
+          Saved to {agent.name}'s agent.toml. Its next turn runs on it.
+        </p>
+      )}
+      {error !== null && (
+        <p role="alert" className="text-destructive text-xs [overflow-wrap:anywhere]">
+          {error}
+        </p>
+      )}
+    </div>
+  );
+}
+
+/** The sentinel a seeded agent's bot choice uses for "the folder's". */
+const FOLDER_BOT = "folder";
+
+/**
+ * A reasoning level among `efforts` — the levels Rust says the chosen bot's
+ * kind is sent — or the provider's default, which sends none. With no level
+ * to offer only the default is shown.
+ */
+function EffortSelect({
+  label,
+  value,
+  efforts,
+  disabled,
+  testId,
+  onChange,
+}: {
+  label: string;
+  value: Effort | null;
+  efforts: Effort[];
+  disabled: boolean;
+  testId?: string;
+  onChange: (next: Effort | null) => void;
+}) {
+  const id = useId();
+  return (
+    <div className="flex min-w-0 flex-col gap-1">
+      <Label id={id} className="text-xs">
+        {label}
+      </Label>
+      <Select
+        value={value ?? DEFAULT_EFFORT}
+        disabled={disabled || efforts.length === 0}
+        onValueChange={(next) => onChange(next === DEFAULT_EFFORT ? null : (next as Effort))}
+      >
+        <SelectTrigger className="w-40" aria-labelledby={id} data-testid={testId}>
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem value={DEFAULT_EFFORT}>{PROVIDER_DEFAULT_LABEL}</SelectItem>
+          {efforts.map((level) => (
+            <SelectItem key={level} value={level}>
+              {level}
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
     </div>
   );
 }
@@ -541,11 +781,19 @@ function SeedSetup({
   const [localOnly, setLocalOnly] = useState(folder.localOnly);
   const [picked, setPicked] = useState<string[]>([]);
   const [bot, setBot] = useState<string | null>(null);
+  const [effort, setEffort] = useState<Effort | null>(null);
+  // A ticked agent's own bot and level (100.2 #6); an agent absent here runs
+  // on the folder's.
+  const [own, setOwn] = useState<Record<string, AgentSeedModelReq>>({});
   const [plan, setPlan] = useState<AgentSeedPlanVm | null>(null);
   const [result, setResult] = useState<AgentSeedResultVm | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const id = useId();
+  // The bots Rust offers this folder: only those that run locally where its
+  // agents are local-only — for its own bot and each agent's alike (R405).
+  const local = folder.declared ? folder.localOnly : localOnly;
+  const offered = local ? offer.localBots : offer.bots;
 
   const start = () => {
     setDrive(folder.drive);
@@ -554,6 +802,8 @@ function SeedSetup({
     setLocalOnly(folder.localOnly);
     setPicked(folder.preselected);
     setBot(null);
+    setEffort(null);
+    setOwn({});
     setPlan(null);
     setResult(null);
     setError(null);
@@ -585,6 +835,8 @@ function SeedSetup({
     localOnly: folder.declared ? folder.localOnly : localOnly,
     bot,
     with: offer.catalogue.map((agent) => agent.id).filter((agent) => picked.includes(agent)),
+    effort,
+    models: Object.values(own).filter((model) => picked.includes(model.agent)),
   });
 
   const preview = async () => {
@@ -594,6 +846,7 @@ function SeedSetup({
     try {
       setPlan(await agentsSeedPlan(request()));
     } catch (failure) {
+      logFailure("agents.seedPlan")(failure);
       setError(messageOf(failure));
     } finally {
       setBusy(false);
@@ -608,6 +861,7 @@ function SeedSetup({
       setPlan(null);
       await onSeeded();
     } catch (failure) {
+      logFailure("agents.seedApply")(failure);
       setError(messageOf(failure));
     } finally {
       setBusy(false);
@@ -796,6 +1050,17 @@ function SeedSetup({
               disabled={busy}
               onCheckedChange={(next) => {
                 setLocalOnly(next === true);
+                // A choice the folder no longer offers is no longer chosen.
+                const nowOffered = next === true ? offer.localBots : offer.bots;
+                const kept = (reference: string) =>
+                  nowOffered.some((candidate) => candidate.reference === reference);
+                if (bot !== null && !kept(bot)) {
+                  setBot(null);
+                  setEffort(null);
+                }
+                setOwn((current) =>
+                  Object.fromEntries(Object.entries(current).filter(([, mine]) => kept(mine.bot))),
+                );
                 edited();
               }}
             />
@@ -809,8 +1074,14 @@ function SeedSetup({
         <p id={`${id}-bot`} className="font-medium text-xs">
           Bot the agents run on
         </p>
-        {offer.bots.length === 0 ? (
-          <p className="text-muted-foreground text-xs">{SEED_NO_BOTS}</p>
+        {offer.botsUnread !== null ? (
+          <p role="alert" className="text-destructive text-xs [overflow-wrap:anywhere]">
+            {offer.botsUnread}
+          </p>
+        ) : offered.length === 0 ? (
+          <p className="text-muted-foreground text-xs">
+            {offer.bots.length === 0 ? SEED_NO_BOTS : SEED_NO_LOCAL_BOTS}
+          </p>
         ) : (
           <>
             <p className="text-muted-foreground text-xs">
@@ -821,11 +1092,16 @@ function SeedSetup({
               value={bot ?? ""}
               onValueChange={(next) => {
                 setBot(next);
+                const levels =
+                  offered.find((candidate) => candidate.reference === next)?.efforts ?? [];
+                if (effort !== null && !levels.includes(effort)) {
+                  setEffort(null);
+                }
                 edited();
               }}
               className="gap-1.5"
             >
-              {offer.bots.map((candidate, index) => (
+              {offered.map((candidate, index) => (
                 <div key={candidate.reference} className="flex min-w-0 items-center gap-2">
                   <RadioGroupItem
                     id={`${id}-bot-${index}`}
@@ -845,6 +1121,89 @@ function SeedSetup({
           </>
         )}
       </div>
+      {bot !== null && (
+        <div className="flex min-w-0 flex-col gap-2">
+          <EffortSelect
+            label="Their reasoning level"
+            value={effort}
+            efforts={offered.find((candidate) => candidate.reference === bot)?.efforts ?? []}
+            disabled={busy}
+            onChange={(next) => {
+              setEffort(next);
+              edited();
+            }}
+          />
+          {picked.length > 0 && (
+            <fieldset className="flex min-w-0 flex-col gap-2">
+              <legend className="mb-1 font-medium text-xs">Each agent's model</legend>
+              {offer.catalogue
+                .filter((agent) => picked.includes(agent.id))
+                .map((agent) => {
+                  const mine = own[agent.id];
+                  return (
+                    <div key={agent.id} className="flex min-w-0 flex-wrap items-end gap-2">
+                      <div className="flex min-w-0 flex-col gap-1">
+                        <Label id={`${id}-own-${agent.id}`} className="text-xs">
+                          {agent.name}
+                        </Label>
+                        <Select
+                          value={mine?.bot ?? FOLDER_BOT}
+                          disabled={busy}
+                          onValueChange={(next) => {
+                            setOwn((current) => {
+                              const rest = { ...current };
+                              delete rest[agent.id];
+                              return next === FOLDER_BOT
+                                ? rest
+                                : {
+                                    ...rest,
+                                    [agent.id]: { agent: agent.id, bot: next, effort: null },
+                                  };
+                            });
+                            edited();
+                          }}
+                        >
+                          <SelectTrigger
+                            className="w-56 max-w-full"
+                            aria-labelledby={`${id}-own-${agent.id}`}
+                          >
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value={FOLDER_BOT}>The agents' bot and level</SelectItem>
+                            {offered.map((candidate) => (
+                              <SelectItem key={candidate.reference} value={candidate.reference}>
+                                {candidate.name}
+                              </SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+                      </div>
+                      {mine !== undefined && (
+                        <EffortSelect
+                          label={`${agent.name}'s level`}
+                          value={mine.effort}
+                          efforts={
+                            offered.find((candidate) => candidate.reference === mine.bot)
+                              ?.efforts ?? []
+                          }
+                          disabled={busy}
+                          onChange={(next) => {
+                            setOwn((current) => ({
+                              ...current,
+                              [agent.id]: { ...mine, effort: next },
+                            }));
+                            edited();
+                          }}
+                        />
+                      )}
+                    </div>
+                  );
+                })}
+            </fieldset>
+          )}
+        </div>
+      )}
       <div className="flex min-w-0 flex-wrap gap-2">
         <Button size="sm" variant="outline" disabled={busy} onClick={() => void preview()}>
           {SEED_PREVIEW_LABEL}

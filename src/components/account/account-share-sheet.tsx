@@ -28,6 +28,7 @@ import {
   SheetHeader,
   SheetTitle,
 } from "@/components/ui/sheet";
+import { logFailure } from "@/lib/failure";
 import { type AccountShareVm, accountShare } from "@/lib/ipc/client";
 import { syncErrorMessage } from "@/lib/stores/sync";
 
@@ -82,6 +83,7 @@ function ShareBody() {
         }
       })
       .catch((raw: unknown) => {
+        logFailure("account.share")(raw);
         if (!abandoned) {
           setShare(syncErrorMessage(raw, SHARE_FAILED));
         }

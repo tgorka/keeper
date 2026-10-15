@@ -5,6 +5,7 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
+import { logFailure } from "@/lib/failure";
 import type {
   ArtifactOfferVm,
   ChoiceVm,
@@ -237,6 +238,7 @@ function PromotionRow({
       setEditing(false);
       await onChanged();
     } catch (raw) {
+      logFailure("promote.file")(raw);
       setError(syncErrorMessage(raw, "Could not promote this file."));
     } finally {
       setBusy(false);
@@ -374,6 +376,7 @@ function useNoteRead(
         onRead(next.revision);
       }
     } catch (raw) {
+      logFailure("promote.readNote")(raw);
       if (seq === reads.current) setError(syncErrorMessage(raw, "Could not open the note."));
     } finally {
       if (seq === reads.current) setReading(false);
@@ -447,6 +450,7 @@ function KnowledgeCard({
       focusAfterPromotion.current = true;
       await onChange(path, { consent: null, copy: null });
     } catch (raw) {
+      logFailure("promote.note")(raw);
       setError(syncErrorMessage(raw, "Could not promote the note."));
       await onChanged();
     } finally {
@@ -461,6 +465,7 @@ function KnowledgeCard({
       await track(sessionsKnowledgeReview(rootId, sessionId, path, checked, copy.read.revision));
       await onChanged();
     } catch (raw) {
+      logFailure("promote.review")(raw);
       setError(syncErrorMessage(raw, "Could not change the review."));
     } finally {
       setBusy(false);
@@ -693,6 +698,7 @@ function ArtifactOffer({
       focusAction(offer.path);
       await onChanged();
     } catch (raw) {
+      logFailure("promote.artifact")(raw);
       setError(syncErrorMessage(raw, "Could not promote the artifact."));
     } finally {
       setBusy(false);
@@ -778,6 +784,7 @@ export function PromotePanel({ rootId, sessionId, onArchiveReview }: Props) {
         setVm(next);
       }
     } catch (raw) {
+      logFailure("promote.table")(raw);
       if (current === request.current) {
         setVm(null);
         setError(syncErrorMessage(raw, "Could not read the promote table."));

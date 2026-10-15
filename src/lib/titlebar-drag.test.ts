@@ -4,6 +4,7 @@ const startWindowDragging = vi.fn();
 const titlebarDragReport = vi.fn();
 
 vi.mock("@/lib/ipc/client", () => ({
+  frontendErrorReport: vi.fn(async () => {}),
   startWindowDragging: () => startWindowDragging(),
   titlebarDragReport: (...args: unknown[]) => titlebarDragReport(...args),
 }));

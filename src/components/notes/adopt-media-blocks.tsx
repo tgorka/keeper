@@ -20,6 +20,7 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
+import { logFailure } from "@/lib/failure";
 import { type MediaAdoptionVm, recordingNotesAdoptMediaBlock } from "@/lib/ipc/client";
 import { syncErrorMessage } from "@/lib/stores/sync";
 
@@ -74,6 +75,7 @@ export function AdoptMediaBlocksDialog({
       setDone(await recordingNotesAdoptMediaBlock(vaultId, false));
       setProblem(null);
     } catch (cause) {
+      logFailure("media.adopt")(cause);
       setProblem(syncErrorMessage(cause));
     } finally {
       setBusy(false);

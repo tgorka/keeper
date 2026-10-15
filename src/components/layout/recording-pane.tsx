@@ -170,6 +170,7 @@ const SETUP_CARDS: readonly string[] = [
 export function RecordingPane() {
   const {
     permission,
+    failure: permissionFailure,
     request,
     openSettings,
     requestMicrophone,
@@ -453,6 +454,11 @@ export function RecordingPane() {
                   }}
                   onOpenSettings={openCameraSettings}
                 />
+              )}
+              {permissionFailure !== null && (
+                <p role="alert" className="text-destructive text-xs">
+                  {permissionFailure}
+                </p>
               )}
             </CardContent>
           </Card>

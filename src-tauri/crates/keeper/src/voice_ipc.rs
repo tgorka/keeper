@@ -73,6 +73,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use keeper_core::agents::spoken::{HeardMark, HEARD_MARK_WAIT};
+use keeper_core::failure::FailureOperation;
 use keeper_core::registry;
 use keeper_core::vm::{IpcError, IpcErrorCode, VoiceStateVm, VoiceUnavailableVm, VoiceWakeVm};
 use keeper_core::voice::end_of_turn::Heard;
@@ -1045,6 +1046,11 @@ pub fn voice_wake_set(
     let mut voice = voice();
     voice.turn.set_stop(Some(stop));
     arm(&mut voice, enabled.then_some(parsed));
+    // The person set the phrases and the switch here, and the phrase was
+    // armed from them — turning listening off and on is the remedy the
+    // re-arm's failure names, so that failure is over (R387, R410). A synced
+    // setting keeper refused is another operation's and stands.
+    crate::failure_notice::recovered(FailureOperation::VoiceRearm, None);
     let port = Arc::clone(&voice.port);
     wake_vm(&data_dir, enabled, phrase.trim().to_owned(), port.as_ref())
 }
@@ -1214,9 +1220,13 @@ pub fn voice_rearm() {
         let Some(data_dir) = voice.data_dir.clone() else {
             return;
         };
-        if let Err(error) = rearm_locked(&mut voice, &data_dir) {
-            tracing::warn!(?error, "voice: could not re-arm the phrase");
-        }
+        let outcome = rearm_locked(&mut voice, &data_dir);
+        // Only a re-arm that armed clears its failure; one that had nothing
+        // to do proves nothing (R410).
+        crate::failure_notice::rearm_finished(match &outcome {
+            Ok(armed) => Ok(*armed),
+            Err(error) => Err(&error.message as &dyn std::fmt::Display),
+        });
     });
 }
 
@@ -1237,7 +1247,12 @@ pub fn voice_settings_applied() {
         let (locale, enabled, phrase, stop_phrase) = match synced_voice_settings(&data_dir) {
             Ok(read) => read,
             Err(error) => {
-                tracing::warn!(%error, "voice: the synced settings could not be read");
+                crate::failure_notice::tell(
+                    FailureOperation::VoiceSyncedSettings,
+                    None,
+                    "keeper could not apply the voice settings from your other device; the ones here stay.",
+                    &error,
+                );
                 return;
             }
         };
@@ -1249,11 +1264,17 @@ pub fn voice_settings_applied() {
             (Ok(wake), Ok(stop)) => {
                 voice.turn.set_stop(Some(stop));
                 arm(&mut voice, enabled.then_some(wake));
+                crate::failure_notice::recovered(FailureOperation::VoiceSyncedSettings, None);
             }
-            (wake, stop) => tracing::warn!(
-                wake_refused = wake.is_err(),
-                stop_refused = stop.is_err(),
-                "voice: a synced phrase was refused; the phrase stays as it was"
+            (wake, stop) => crate::failure_notice::tell(
+                FailureOperation::VoiceSyncedSettings,
+                None,
+                "A wake or stop phrase from your other device is one keeper cannot use, so the phrases here stay as they were.",
+                &format_args!(
+                    "wake refused: {}, stop refused: {}",
+                    wake.is_err(),
+                    stop.is_err()
+                ),
             ),
         }
     });

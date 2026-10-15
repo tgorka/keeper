@@ -91,6 +91,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { useReducedMotion } from "@/hooks/use-reduced-motion";
 import { useSessionsChanges } from "@/hooks/use-sessions-changes";
+import { logFailure } from "@/lib/failure";
 import type { InboxRoomVm, SessionDetailVm, SessionRowVm } from "@/lib/ipc/client";
 import { listenSessionsChanged, sessionsDetail, sessionsTaskMove } from "@/lib/ipc/client";
 import { agentRoomsStore } from "@/lib/stores/agent-rooms";
@@ -358,9 +359,8 @@ export function SessionsPhoneBoard({
           stop();
         }
       })
-      .catch(() => {
-        // No Tauri host — nothing will announce a change.
-      });
+      // No Tauri host — nothing will announce a change.
+      .catch(logFailure("sessions.listenChanged"));
     return () => {
       live = false;
       unlisten?.();
@@ -421,6 +421,7 @@ export function SessionsPhoneBoard({
       setNotice(moved.unpushed);
       setReload((n) => n + 1);
     } catch (refusal) {
+      logFailure("sessions.taskMove")(refusal);
       // keeper's own sentence when it sent one (UX-DR43).
       setNotice(syncErrorMessage(refusal, SESSION_BOARD_MOVE_FAILED));
     }

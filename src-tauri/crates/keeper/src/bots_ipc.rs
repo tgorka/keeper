@@ -667,7 +667,7 @@ async fn remote_history(
     match remote::fetch_messages(&client, &endpoint, remote_id).await {
         Ok(found) => Some(found),
         Err(error) => {
-            tracing::debug!(%error, "bots: gateway transcript not read; replaying keeper's copy");
+            tracing::warn!(%error, "bots: gateway transcript not read; replaying keeper's copy");
             None
         }
     }

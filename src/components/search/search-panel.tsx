@@ -27,6 +27,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { InputGroup, InputGroupAddon, InputGroupInput } from "@/components/ui/input-group";
+import { logFailure } from "@/lib/failure";
 import type { IpcError, SearchHitVm } from "@/lib/ipc/client";
 import { searchArchive } from "@/lib/ipc/client";
 import { buildSearchFilter, type SearchUiFilter } from "@/lib/search-filter";
@@ -192,6 +193,7 @@ export function SearchPanel({
           setHasSearched(true);
         })
         .catch((e: unknown) => {
+          logFailure("search.archive")(e);
           if (seq !== seqRef.current) {
             return;
           }

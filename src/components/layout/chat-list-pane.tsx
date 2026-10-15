@@ -24,6 +24,7 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { Skeleton } from "@/components/ui/skeleton";
 import { IconHint } from "@/components/ui/tooltip";
 import { useShellLayout } from "@/hooks/use-shell-layout";
+import { logFailure, sayFailure } from "@/lib/failure";
 import type { InboxBatch, InboxRoomVm, NetworksSnapshot, SpacesSnapshot } from "@/lib/ipc/client";
 import {
   archiveRoom,
@@ -242,7 +243,7 @@ export function ChatListPane() {
           !snapshot.spaces.some((s) => s.accountId === sel.accountId && s.spaceId === sel.spaceId)
         ) {
           spacesStore.getState().setActiveSpace(null);
-          void setSpaceFilter(null, null).catch(() => {});
+          void setSpaceFilter(null, null).catch(logFailure("inbox.clearSpaceFilter"));
         }
       }
     };
@@ -257,7 +258,7 @@ export function ChatListPane() {
         const sel = networksStore.getState().activeNetwork;
         if (sel !== null && !snapshot.networks.some((n) => n.name === sel)) {
           networksStore.getState().setActiveNetwork(null);
-          void setNetworkFilter(null).catch(() => {});
+          void setNetworkFilter(null).catch(logFailure("inbox.clearNetworkFilter"));
         }
       }
     };
@@ -273,16 +274,19 @@ export function ChatListPane() {
         // an account-set re-subscribe (Story 4.5). The Rust merger starts each new
         // subscription unfiltered, so a carried-over selection must be re-poked.
         if (carriedSpace !== null) {
-          void setSpaceFilter(carriedSpace.accountId, carriedSpace.spaceId).catch(() => {});
+          void setSpaceFilter(carriedSpace.accountId, carriedSpace.spaceId).catch(
+            logFailure("inbox.reapplySpaceFilter"),
+          );
         }
         // Re-apply the ephemeral Network filter too (Story 4.6): the Rust merger
         // starts each new subscription unfiltered, so a carried-over selection must
         // be re-poked (survive resubscribe, compose AND with the Space filter).
         if (carriedNetwork !== null) {
-          void setNetworkFilter(carriedNetwork).catch(() => {});
+          void setNetworkFilter(carriedNetwork).catch(logFailure("inbox.reapplyNetworkFilter"));
         }
       })
-      .catch(() => {
+      .catch((raw: unknown) => {
+        logFailure("inbox.subscribe")(raw);
         if (!cancelled) {
           setErrored(true);
         }
@@ -311,7 +315,7 @@ export function ChatListPane() {
   // Seed the inbox draft markers from `keeper.db` (Story 7.1, AD-15) so a chat with a
   // pending draft shows its amber pencil after relaunch, cross-account. Re-seeded
   // whenever the signed-in account set changes (an add/sign-out) so the markers cover
-  // exactly the live accounts. A read failure is swallowed — no markers, no crash.
+  // exactly the live accounts. A read failure is logged — no markers, no crash.
   // biome-ignore lint/correctness/useExhaustiveDependencies: re-seed keyed on the account-id set so an add/sign-out refreshes markers; `accountKey` is intentionally the trigger, not read in the body.
   useEffect(() => {
     let cancelled = false;
@@ -321,7 +325,7 @@ export function ChatListPane() {
           draftsStore.getState().applyKeys(keys);
         }
       })
-      .catch(() => {});
+      .catch(logFailure("inbox.listDrafts"));
     return () => {
       cancelled = true;
     };
@@ -331,7 +335,7 @@ export function ChatListPane() {
   // pump each observed `dev.keeper.draft` edit into the drafts store's `remote` map so
   // an open composer can offer local-wins adoption. Mounted once (not keyed on the
   // account set — the backend relay spans every account); torn down on unmount. A
-  // subscribe failure is swallowed — no live remote stream, no crash; the next chat
+  // subscribe failure is logged — no live remote stream, no crash; the next chat
   // open still reconciles via `loadRemoteDraft`.
   useEffect(() => {
     let cancelled = false;
@@ -343,16 +347,16 @@ export function ChatListPane() {
     })
       .then((id) => {
         if (cancelled) {
-          void unsubscribeDraftMirror(id).catch(() => {});
+          void unsubscribeDraftMirror(id).catch(logFailure("inbox.unsubscribeDraftMirror"));
         } else {
           subId = id;
         }
       })
-      .catch(() => {});
+      .catch(logFailure("inbox.subscribeDraftMirror"));
     return () => {
       cancelled = true;
       if (subId !== null) {
-        void unsubscribeDraftMirror(subId).catch(() => {});
+        void unsubscribeDraftMirror(subId).catch(logFailure("inbox.unsubscribeDraftMirror"));
       }
     };
   }, []);
@@ -388,13 +392,17 @@ export function ChatListPane() {
   // its Rust filter, leaving any active Network filter intact (Story 4.5 + 4.6).
   const clearSpaceFilter = () => {
     spacesStore.getState().setActiveSpace(null);
-    void setSpaceFilter(null, null).catch(() => {});
+    void setSpaceFilter(null, null).catch(
+      sayFailure("inbox.clearSpaceFilter", "keeper couldn't clear the Space filter."),
+    );
   };
   // Clear ONLY the Network filter (the Network chip's ✕): drop the Network selection
   // and its Rust filter, leaving any active Space filter intact (Story 4.5 + 4.6).
   const clearNetworkFilter = () => {
     networksStore.getState().setActiveNetwork(null);
-    void setNetworkFilter(null).catch(() => {});
+    void setNetworkFilter(null).catch(
+      sayFailure("inbox.clearNetworkFilter", "keeper couldn't clear the Network filter."),
+    );
   };
   // Clear ALL active filters (Esc / empty-state "Clear filter" button): drop both the
   // Space and Network selections and clear both Rust filters so the full inbox is
@@ -462,17 +470,29 @@ export function ChatListPane() {
   const runVerb = (room: InboxRoomVm, verb: "e" | "u" | "p" | "f" | "m") => {
     if (verb === "e") {
       const fn = room.isArchived ? unarchiveRoom : archiveRoom;
-      void fn(room.accountId, room.roomId).catch(() => {});
+      void fn(room.accountId, room.roomId).catch(
+        room.isArchived
+          ? sayFailure("chat.unarchive", "keeper couldn't unarchive the chat.")
+          : sayFailure("chat.archive", "keeper couldn't archive the chat."),
+      );
       return;
     }
     if (verb === "p") {
       const fn = room.isPinned ? unpinRoom : pinRoom;
-      void fn(room.accountId, room.roomId).catch(() => {});
+      void fn(room.accountId, room.roomId).catch(
+        room.isPinned
+          ? sayFailure("chat.unpin", "keeper couldn't unpin the chat.")
+          : sayFailure("chat.pin", "keeper couldn't pin the chat."),
+      );
       return;
     }
     if (verb === "f") {
       const fn = room.isFavourite ? unfavoriteRoom : favoriteRoom;
-      void fn(room.accountId, room.roomId).catch(() => {});
+      void fn(room.accountId, room.roomId).catch(
+        room.isFavourite
+          ? sayFailure("chat.unfavorite", "keeper couldn't unfavorite the chat.")
+          : sayFailure("chat.favorite", "keeper couldn't favorite the chat."),
+      );
       return;
     }
     if (verb === "m") {
@@ -484,7 +504,9 @@ export function ChatListPane() {
           : room.muteState === "mention_only"
             ? "mute"
             : "all";
-      void chatNotifyModeSet(room.accountId, room.roomId, next).catch(() => {});
+      void chatNotifyModeSet(room.accountId, room.roomId, next).catch(
+        sayFailure("chat.notifyMode", "keeper couldn't change the chat's notifications."),
+      );
       return;
     }
     // `u`: toggle read/unread with the optimistic overlay, reverting on hard reject.
@@ -492,9 +514,10 @@ export function ChatListPane() {
     const intendedRead = effectiveIsUnread(room, store.optimisticUnread);
     store.setOptimisticUnread(room.accountId, room.roomId, !intendedRead);
     const mark = intendedRead ? markRoomRead : markRoomUnread;
-    void mark(room.accountId, room.roomId).catch(() =>
-      roomsStore.getState().clearOptimisticUnread(room.accountId, room.roomId),
-    );
+    void mark(room.accountId, room.roomId).catch((raw: unknown) => {
+      logFailure("chat.markReadToggle")(raw);
+      roomsStore.getState().clearOptimisticUnread(room.accountId, room.roomId);
+    });
   };
 
   // Resolve the roving cursor's key to a position in the CURRENT `visibleRooms`

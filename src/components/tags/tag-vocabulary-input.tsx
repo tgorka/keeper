@@ -28,6 +28,7 @@
  */
 import { useEffect, useState } from "react";
 import { Input } from "@/components/ui/input";
+import { logFailure } from "@/lib/failure";
 import { tagsVocabulary } from "@/lib/ipc/client";
 
 /** The `<datalist>` id paired with an input id. Exported so callers (and their
@@ -96,11 +97,10 @@ export function TagVocabularyInput({
           setVocabulary(vm.entries.map((entry) => entry.path));
         }
       })
-      .catch(() => {
-        // A vocabulary that will not load leaves an ordinary text field behind.
-        // Completion is an aid: typing a tag by hand still works, and what the
-        // typed text means is settled in Rust either way.
-      });
+      // A vocabulary that will not load leaves an ordinary text field behind.
+      // Completion is an aid: typing a tag by hand still works, and what the
+      // typed text means is settled in Rust either way.
+      .catch(logFailure("tags.readVocabulary"));
     return () => {
       cancelled = true;
     };

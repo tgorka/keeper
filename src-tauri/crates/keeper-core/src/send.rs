@@ -121,8 +121,45 @@ impl SendTrigger {
     }
 }
 
+/// What a new message is (Story 100.5): ordinary text, or an action — the
+/// `m.emote` a `/me` line sends.
+///
+/// **Not a trigger.** It says what the content is, never who caused the send:
+/// a `/me` from the composer is still [`SendTrigger::ComposerSend`], held for
+/// Undo-Send like any composer send (the kind travels with the held row), and
+/// the AD-13 accounting of [`SendTrigger`] is unchanged by it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MessageKind {
+    /// An ordinary `m.text` message.
+    #[default]
+    Text,
+    /// An action, `m.emote` ("* Ana waves").
+    Emote,
+}
+
+impl MessageKind {
+    /// How a held row stores the kind (`outbox.kind`).
+    pub fn as_stored(self) -> &'static str {
+        match self {
+            MessageKind::Text => "text",
+            MessageKind::Emote => "emote",
+        }
+    }
+
+    /// The kind a held row stored. A row written before the column existed
+    /// (`NULL`) is text, which is the only kind that existed then; a value this
+    /// build does not know is text too, so a held message is never dropped.
+    pub fn from_stored(stored: Option<&str>) -> Self {
+        match stored {
+            Some("emote") => MessageKind::Emote,
+            _ => MessageKind::Text,
+        }
+    }
+}
+
 /// The sole content-dispatch gate (FR-41, AD-13): enqueue `text` as a plain-text
-/// `m.room.message` on `timeline`'s send queue.
+/// `m.room.message` — `m.text`, or `m.emote` for [`MessageKind::Emote`] — on
+/// `timeline`'s send queue.
 ///
 /// This is the only place in the crate that calls `Timeline::send(..)`. The
 /// message's local echo and every subsequent send-state transition arrive through
@@ -134,6 +171,7 @@ impl SendTrigger {
 pub async fn submit(
     timeline: &Timeline,
     text: &str,
+    kind: MessageKind,
     trigger: SendTrigger,
 ) -> Result<Option<SendHandle>, SendError> {
     if text.trim().is_empty() {
@@ -146,7 +184,7 @@ pub async fn submit(
         trigger = trigger.as_label(),
         "dispatching content through send gate"
     );
-    dispatch(timeline, text).await.map(Some)
+    dispatch(timeline, text, kind).await.map(Some)
 }
 
 /// The sole SDK-enqueue primitive (FR-41, AD-13): enqueue `text` as a plain-text
@@ -161,10 +199,17 @@ pub async fn submit(
 /// already-approved hold is not a new dispatch decision (AD-13). The local echo and
 /// every send-state transition arrive through the room's existing
 /// `Timeline::subscribe()` diff stream, so keeper never synthesizes echo.
-pub(crate) async fn dispatch(timeline: &Timeline, text: &str) -> Result<SendHandle, SendError> {
+pub(crate) async fn dispatch(
+    timeline: &Timeline,
+    text: &str,
+    kind: MessageKind,
+) -> Result<SendHandle, SendError> {
     join_if_invited(timeline.room()).await?;
-    let content =
-        AnyMessageLikeEventContent::RoomMessage(RoomMessageEventContent::text_plain(text));
+    let message = match kind {
+        MessageKind::Text => RoomMessageEventContent::text_plain(text),
+        MessageKind::Emote => RoomMessageEventContent::emote_plain(text),
+    };
+    let content = AnyMessageLikeEventContent::RoomMessage(message);
     // SOLE-SEND-GATE: the one and only `Timeline::send` call site (FR-41 guard).
     timeline
         .send(content)

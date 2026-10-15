@@ -46,6 +46,7 @@
  */
 import { useEffect, useRef, useState } from "react";
 import { Textarea } from "@/components/ui/textarea";
+import { logFailure } from "@/lib/failure";
 import type { RecordingNoteStubVm } from "@/lib/ipc/client";
 import {
   recordingNoteStub,
@@ -149,7 +150,8 @@ export function RecordingNoteStub({ folder }: RecordingNoteStubProps) {
       let resolved: RecordingNoteStubVm | null;
       try {
         resolved = await recordingNoteStub(folder);
-      } catch {
+      } catch (raw) {
+        logFailure("recording.noteStub")(raw);
         // A stub that cannot be resolved is absent, not an error: the recording
         // finalized, and this surface is never allowed to say otherwise.
         return;
@@ -228,6 +230,7 @@ export function RecordingNoteStub({ folder }: RecordingNoteStubProps) {
       await write(stub, draft);
       setSaved(true);
     } catch (raw) {
+      logFailure("recording.noteStubSave")(raw);
       // `syncErrorMessage`, never `String(raw)`: an IPC rejection is a
       // `{ code, message }` object and stringifying one prints
       // "[object Object]" exactly where the reason belongs. The draft stays on
@@ -268,6 +271,7 @@ export function RecordingNoteStub({ folder }: RecordingNoteStubProps) {
       dismissedFolder.current = folder;
       setOutcome(deleted ? "deleted" : "kept");
     } catch (raw) {
+      logFailure("recording.noteStubDismiss")(raw);
       // Either the words never landed or the dismissal did not: the note is
       // still on disk and the draft is still on screen. Stay open rather than
       // trapping the text behind a closed surface.

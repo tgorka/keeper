@@ -23,13 +23,13 @@ import {
 } from "@/components/ui/select";
 import type { RecordingSourcesVm, RecordingTargetVm } from "@/lib/ipc/client";
 import {
-  applyRecordingSettings,
   ensureRecordingSettingsHydrated,
   RECORDING_CODEC_ALLOWED,
   RECORDING_FPS_ALLOWED,
   RECORDING_SCALE_ALLOWED,
   recordingSettingsStore,
   useRecordingSettings,
+  useRecordingSettingsWriter,
 } from "@/lib/stores/recording-settings";
 import { useRecordingSources, useSelectedRecordingTarget } from "@/lib/stores/recording-source";
 
@@ -109,6 +109,8 @@ export const SCALE_SELECT_TESTID = "recording-scale-select";
 
 export function RecordingAdvancedControls() {
   const settings = useRecordingSettings();
+  // A refused write reverts the picker; this is the sentence that says why.
+  const { refusal, write } = useRecordingSettingsWriter();
   // Story 22.1: the live effective-resolution hint tracks the picker's
   // selected target and the enumerated displays' true pixel dims.
   const selectedTarget = useSelectedRecordingTarget();
@@ -135,7 +137,7 @@ export function RecordingAdvancedControls() {
     if (live === null || !RECORDING_FPS_ALLOWED.includes(fps) || fps === live.fps) {
       return;
     }
-    void applyRecordingSettings({ ...live, fps });
+    write({ ...live, fps });
   };
 
   /** Persist a picked codec via the shared optimistic-mirror store. */
@@ -144,7 +146,7 @@ export function RecordingAdvancedControls() {
     if (live === null || !RECORDING_CODEC_ALLOWED.includes(value) || value === live.codec) {
       return;
     }
-    void applyRecordingSettings({ ...live, codec: value });
+    write({ ...live, codec: value });
   };
 
   /** Persist a picked capture scale via the shared optimistic-mirror store. */
@@ -158,7 +160,7 @@ export function RecordingAdvancedControls() {
     ) {
       return;
     }
-    void applyRecordingSettings({ ...live, scalePercent });
+    write({ ...live, scalePercent });
   };
 
   return (
@@ -249,6 +251,11 @@ export function RecordingAdvancedControls() {
           {resolutionHint !== null && (
             <p className="text-muted-foreground text-xs" data-testid="recording-resolution-hint">
               Output resolution: <span className="font-mono">{resolutionHint}</span>
+            </p>
+          )}
+          {refusal !== null && (
+            <p role="alert" className="text-destructive text-xs">
+              {refusal}
             </p>
           )}
           <p className="text-muted-foreground">{FPS_NEXT_SESSION_NOTE}</p>

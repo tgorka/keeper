@@ -16,6 +16,7 @@
  */
 import { useStore } from "zustand";
 import { createStore } from "zustand/vanilla";
+import { logFailure } from "@/lib/failure";
 import { type IncognitoVm, incognitoGet } from "@/lib/ipc/client";
 
 /** The composite key for a chat: `` `${accountId} ${roomId}` ``. */
@@ -98,8 +99,9 @@ export async function refreshIncognito(
       return;
     }
     incognitoStore.getState().applyVm(accountId, roomId, vm);
-  } catch {
+  } catch (error) {
     // Best-effort mirror refresh — never surface a UI error for a receipt-policy read.
+    logFailure("incognito.read")(error);
   }
 }
 

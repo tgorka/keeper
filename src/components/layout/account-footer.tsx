@@ -73,6 +73,7 @@ import { useSignOut } from "@/hooks/use-sign-out";
 import { accountHueVar } from "@/lib/account-hue";
 import { initials } from "@/lib/account-initials";
 import { isBeeperAccount } from "@/lib/beeper";
+import { logFailure } from "@/lib/failure";
 import {
   type AccountVm,
   type ConnectionStatus,
@@ -231,7 +232,8 @@ function SignOutDialog({
     try {
       await signOut(account.accountId);
       // On success this row unmounts (account removed); no need to close.
-    } catch {
+    } catch (raw) {
+      logFailure("account.signOut")(raw);
       // A cleanup failure keeps the account signed in; close for a retry.
       setSigningOut(false);
       handleOpenChange(false);
@@ -247,7 +249,8 @@ function SignOutDialog({
       // thrown here (the hook removes the account first, then surfaces a purge
       // rejection via toast), so reaching a rejection means the sign-out itself
       // failed — the account stays; show a dialog-local retry error.
-    } catch {
+    } catch (raw) {
+      logFailure("account.signOutDeleteArchive")(raw);
       setSigningOut(false);
       setError("Could not sign out. Please try again.");
     }
@@ -380,7 +383,8 @@ function AccountIncognitoSubmenu({ accountId }: { accountId: string }) {
           setValue(v);
         }
       })
-      .catch(() => {
+      .catch((raw: unknown) => {
+        logFailure("incognito.getAccount")(raw);
         if (!cancelled) {
           setValue(null);
         }
@@ -403,7 +407,8 @@ function AccountIncognitoSubmenu({ accountId }: { accountId: string }) {
         // header chip and composer ring reconcile without a room reopen (Story 8.1).
         incognitoStore.getState().bumpPolicyVersion();
       })
-      .catch(() => {
+      .catch((raw: unknown) => {
+        logFailure("incognito.setAccount")(raw);
         // Revert on a persist failure — but only if no newer write superseded this
         // one, so a stale failed write never clobbers a newer successful selection.
         if (id === writeId.current) {
@@ -456,7 +461,8 @@ function GlobalDndToggle() {
           setEnabled(v);
         }
       })
-      .catch(() => {
+      .catch((raw: unknown) => {
+        logFailure("dnd.getGlobal")(raw);
         if (!cancelled) {
           setEnabled(false);
         }
@@ -472,7 +478,8 @@ function GlobalDndToggle() {
     const prev = enabled ?? false;
     const next = !prev;
     setEnabled(next);
-    void dndSetGlobal(next).catch(() => {
+    void dndSetGlobal(next).catch((raw: unknown) => {
+      logFailure("dnd.setGlobal")(raw);
       if (id === writeId.current) {
         setEnabled(prev);
       }

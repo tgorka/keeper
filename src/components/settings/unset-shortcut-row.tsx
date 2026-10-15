@@ -20,6 +20,7 @@ import { FileControlled } from "@/components/settings/config-source-section";
 import { Button } from "@/components/ui/button";
 import { Kbd } from "@/components/ui/kbd";
 import { Label } from "@/components/ui/label";
+import { logFailure } from "@/lib/failure";
 import { acceleratorFromEvent, formatAccelerator } from "@/lib/hotkey";
 import type { HotkeyVm } from "@/lib/ipc/client";
 import { syncErrorMessage } from "@/lib/stores/sync";
@@ -27,6 +28,10 @@ import { syncErrorMessage } from "@/lib/stores/sync";
 /** The unset-state label: the binding ships unset — no chord is registered
  * until the user assigns one. */
 export const HOTKEY_NOT_SET_LABEL = "Not set";
+
+/** What the row says when its binding could not be read (R387): never a
+ * loading state that never ends, never a binding it does not know. */
+export const HOTKEY_READ_FAILED = "keeper couldn't read this shortcut.";
 
 export function UnsetShortcutRow({
   open,
@@ -80,9 +85,13 @@ export function UnsetShortcutRow({
           setHotkey(vm);
         }
       })
-      .catch(() => {
-        // On a read failure leave the row in its loading state rather than
-        // asserting a (possibly wrong) binding.
+      // A read failure asserts no (possibly wrong) binding: the row says it
+      // could not be read, and the log says why (R387).
+      .catch((raw: unknown) => {
+        logFailure("shortcut.read")(raw);
+        if (!cancelled) {
+          setError(syncErrorMessage(raw, HOTKEY_READ_FAILED));
+        }
       });
     return () => {
       cancelled = true;
@@ -100,6 +109,7 @@ export function UnsetShortcutRow({
         }
       })
       .catch((raw: unknown) => {
+        logFailure("shortcut.write")(raw);
         if (id !== writeId.current) {
           return;
         }
@@ -148,8 +158,20 @@ export function UnsetShortcutRow({
           ) : unset ? (
             <span className="text-muted-foreground text-xs">{HOTKEY_NOT_SET_LABEL}</span>
           ) : (
-            <Kbd aria-label={hotkey === undefined ? "Loading shortcut" : hotkey.accelerator}>
-              {hotkey === undefined ? "…" : formatAccelerator(hotkey.accelerator)}
+            <Kbd
+              aria-label={
+                hotkey !== undefined
+                  ? hotkey.accelerator
+                  : error !== null
+                    ? "Shortcut not read"
+                    : "Loading shortcut"
+              }
+            >
+              {hotkey === undefined
+                ? error !== null
+                  ? "?"
+                  : "…"
+                : formatAccelerator(hotkey.accelerator)}
             </Kbd>
           )}
           <Button

@@ -7,6 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { useVoiceFacts } from "@/hooks/use-voice-facts";
+import { logFailure, sayFailure } from "@/lib/failure";
 import {
   type AutoUpdateHold,
   type AutoUpdateVm,
@@ -86,15 +87,13 @@ export const MACOS_DISCLOSURE_LINES: ReadonlyArray<string> = [
 ];
 
 /**
- * Open the iOS docs page externally via the system opener, best-effort. Prevents
- * the default in-webview navigation and swallows any opener rejection — mirrors the
- * `void openUrl(url).catch(() => {})` pattern in `login-screen.tsx`.
+ * Open the iOS docs page externally via the system opener. Prevents the default
+ * in-webview navigation; an opener rejection is said, since the person clicked a
+ * link that then did nothing.
  */
 function openExternal(event: MouseEvent<HTMLAnchorElement>, url: string) {
   event.preventDefault();
-  void openUrl(url).catch(() => {
-    // Best-effort: nothing actionable if the system opener fails.
-  });
+  void openUrl(url).catch(sayFailure("about.openLink", "keeper couldn't open the link."));
 }
 
 /**
@@ -217,7 +216,8 @@ export function AboutSection({ open }: { open: boolean }) {
           setAppVersion(version);
         }
       })
-      .catch(() => {
+      .catch((raw: unknown) => {
+        logFailure("about.version")(raw);
         // No Tauri runtime / read failure: render an honest "unknown", never a guess.
         if (!cancelled) {
           setAppVersion(null);
@@ -229,7 +229,8 @@ export function AboutSection({ open }: { open: boolean }) {
           setDebugMode(value);
         }
       })
-      .catch(() => {
+      .catch((raw: unknown) => {
+        logFailure("about.debugModeGet")(raw);
         // A read failure renders the honest default (off) rather than a stuck spinner.
         if (!cancelled) {
           setDebugMode(false);
@@ -244,10 +245,9 @@ export function AboutSection({ open }: { open: boolean }) {
             setAutoPlan(plan);
           }
         })
-        .catch(() => {
-          // Unanswered: the switch stays disabled rather than claiming an
-          // answer. The manual control below is unaffected.
-        });
+        // Unanswered: the switch stays disabled rather than claiming an
+        // answer. The manual control below is unaffected.
+        .catch(logFailure("about.readAutoUpdate"));
     }
     void debugLogPath()
       .then((path) => {
@@ -255,7 +255,8 @@ export function AboutSection({ open }: { open: boolean }) {
           setLogPath(path);
         }
       })
-      .catch(() => {
+      .catch((raw: unknown) => {
+        logFailure("about.logPath")(raw);
         // Unanswered: the sentence names the file and no folder, never the
         // Mac's folder on a phone.
         if (!cancelled) {
@@ -269,7 +270,8 @@ export function AboutSection({ open }: { open: boolean }) {
         .then((list) => {
           if (!cancelled && request === egressRead) setEndpoints(list);
         })
-        .catch(() => {
+        .catch((raw: unknown) => {
+          logFailure("about.egress")(raw);
           if (!cancelled && request === egressRead) setEndpoints(null);
         });
     };
@@ -297,6 +299,7 @@ export function AboutSection({ open }: { open: boolean }) {
         setUpdateSafe({ kind: "available", version: result.version });
       })
       .catch((raw: unknown) => {
+        logFailure("update.check")(raw);
         setUpdateSafe({ kind: "error", message: updateErrorMessage(raw) });
       });
   };
@@ -324,12 +327,14 @@ export function AboutSection({ open }: { open: boolean }) {
           // resolves without actually restarting, never leave the flow stuck on
           // "downloading" — the update is already on disk, so ask for a restart.
           setUpdateSafe({ kind: "installedNeedsRestart", version: null, atMs: Date.now() });
-        } catch {
+        } catch (raw) {
+          logFailure("update.relaunch")(raw);
           // Install succeeded but the relaunch failed; the update is on disk.
           setUpdateSafe({ kind: "installedNeedsRestart", version: null, atMs: Date.now() });
         }
       })
       .catch((raw: unknown) => {
+        logFailure("update.install")(raw);
         setUpdateSafe({ kind: "error", message: updateErrorMessage(raw) });
       });
   };
@@ -340,6 +345,7 @@ export function AboutSection({ open }: { open: boolean }) {
   // not undone by a relaunch that did not happen.
   const onRestart = () => {
     void relaunch().catch((raw: unknown) => {
+      logFailure("update.restart")(raw);
       setUpdateSafe({ kind: "error", message: updateErrorMessage(raw) });
     });
   };
@@ -362,7 +368,8 @@ export function AboutSection({ open }: { open: boolean }) {
           setAutoPlan(effective);
         }
       })
-      .catch(() => {
+      .catch((raw: unknown) => {
+        logFailure("about.autoUpdateSet")(raw);
         if (id === autoWriteId.current && mounted.current) {
           setAutoPlan(prev);
         }
@@ -376,7 +383,8 @@ export function AboutSection({ open }: { open: boolean }) {
     const id = debugWriteId.current;
     const prev = debugMode ?? false;
     setDebugMode(next);
-    void debugModeSet(next).catch(() => {
+    void debugModeSet(next).catch((raw: unknown) => {
+      logFailure("about.debugModeSet")(raw);
       if (id === debugWriteId.current) {
         setDebugMode(prev);
       }

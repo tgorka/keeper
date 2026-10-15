@@ -100,4 +100,10 @@ muteState: MuteState,
  * session kind (UX-DR132); absent for every other room. The merge puts a
  * session room in the Agents window only and a control room in none.
  */
-agentRoom?: AgentRoomKindVm, };
+agentRoom?: AgentRoomKindVm, 
+/**
+ * An agent room's agent's picture, as its header draws it (story 100.4,
+ * R384): a URL for an `<img>`; absent for every other room and for an
+ * agent with none, whose row keeps its initials.
+ */
+agentAvatar?: string, };

@@ -3695,16 +3695,124 @@ pub async fn timeline_unsubscribe(
 /// open `Timeline`; the local echo and every send-state transition arrive back
 /// over the existing timeline subscription (no echo is synthesized). An
 /// enqueue-time failure funnels through [`to_ipc_error`] to `SendFailed`.
+///
+/// `line` is the composer line the person typed when it differs from `body` —
+/// `//etc` sent as `/etc`, `/plain …` (Story 100.5): a held send keeps it so
+/// Undo restores exactly that (R393). Absent, the body is the line.
 #[tauri::command]
 pub async fn send_text(
     state: State<'_, AppState>,
     account_id: String,
     room_id: String,
     body: String,
+    line: Option<String>,
 ) -> Result<(), IpcError> {
     state
         .accounts
-        .send_text(&state.platform, &account_id, &room_id, &body)
+        .send_text(
+            &state.platform,
+            &account_id,
+            &room_id,
+            &body,
+            keeper_core::send::MessageKind::Text,
+            line.as_deref().unwrap_or(&body),
+        )
+        .await
+        .map_err(to_ipc_error)
+}
+
+/// Send an action — the `m.emote` a `/me` line resolves to (Story 100.5) —
+/// through the same single dispatch gate and Undo-Send hold as [`send_text`].
+/// `line` is the `/me …` line as typed, kept for Undo (R393). A failure is
+/// logged at WARN in the core and funnels through [`to_ipc_error`] to
+/// `SendFailed`.
+#[tauri::command]
+pub async fn send_emote(
+    state: State<'_, AppState>,
+    account_id: String,
+    room_id: String,
+    body: String,
+    line: String,
+) -> Result<(), IpcError> {
+    state
+        .accounts
+        .send_text(
+            &state.platform,
+            &account_id,
+            &room_id,
+            &body,
+            keeper_core::send::MessageKind::Emote,
+            &line,
+        )
+        .await
+        .map_err(to_ipc_error)
+}
+
+/// What a messenger draft means and what its `/` menu shows (Story 100.5,
+/// R385). The room's facts — its kind, the person's power levels — are read
+/// in the core from the room; `replying` is the composer's own state. Every
+/// decision is `keeper_core::chat::commands`'; this only composes the VM.
+#[tauri::command]
+pub async fn chat_command_preview(
+    state: State<'_, AppState>,
+    account_id: String,
+    room_id: String,
+    draft: String,
+    replying: bool,
+) -> Result<keeper_core::vm::ChatCommandPreviewVm, IpcError> {
+    let context = state
+        .accounts
+        .chat_command_context(&account_id, &room_id, replying)
+        .await
+        .map_err(to_ipc_error)?;
+    Ok(keeper_core::vm::ChatCommandPreviewVm::compose(
+        &draft, &context,
+    ))
+}
+
+/// `/topic`: change the room's topic (Story 100.5). A refusal is logged at
+/// WARN in the core and funnels through [`to_ipc_error`].
+#[tauri::command]
+pub async fn room_set_topic(
+    state: State<'_, AppState>,
+    account_id: String,
+    room_id: String,
+    topic: String,
+) -> Result<(), IpcError> {
+    state
+        .accounts
+        .room_set_topic(&account_id, &room_id, &topic)
+        .await
+        .map_err(to_ipc_error)
+}
+
+/// `/invite`: invite a Matrix user to the room (Story 100.5). A refusal is
+/// logged at WARN in the core and funnels through [`to_ipc_error`].
+#[tauri::command]
+pub async fn room_invite(
+    state: State<'_, AppState>,
+    account_id: String,
+    room_id: String,
+    user_id: String,
+) -> Result<(), IpcError> {
+    state
+        .accounts
+        .room_invite(&account_id, &room_id, &user_id)
+        .await
+        .map_err(to_ipc_error)
+}
+
+/// `/leave`, after the person confirmed it: leave the room (Story 100.5). A
+/// refusal is logged at WARN in the core and funnels through [`to_ipc_error`].
+#[tauri::command]
+pub async fn room_leave(
+    state: State<'_, AppState>,
+    account_id: String,
+    room_id: String,
+) -> Result<(), IpcError> {
+    state
+        .accounts
+        .room_leave(&account_id, &room_id)
         .await
         .map_err(to_ipc_error)
 }

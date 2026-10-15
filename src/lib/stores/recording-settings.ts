@@ -16,8 +16,10 @@
  * reverts on failure — guarded by a monotonic write token so a stale rejection
  * never clobbers a newer edit.
  */
+import { useCallback, useRef, useState } from "react";
 import { useStore } from "zustand";
 import { createStore } from "zustand/vanilla";
+import { logFailure } from "@/lib/failure";
 import {
   type RecordingSettingsVm,
   recordingSettingsGet,
@@ -27,6 +29,10 @@ import { syncErrorMessage } from "@/lib/stores/sync";
 
 /** Last-resort message when a save rejection carries no readable sentence. */
 export const RECORDING_SETTINGS_UNKNOWN_ERROR = "keeper could not save these recording settings.";
+
+/** Said in place of the controls when the first read of the settings failed (R381, R410). */
+export const RECORDING_SETTINGS_UNREAD =
+  "keeper could not read the recording settings, so they cannot be changed here. Close this and open it again to try once more.";
 
 /** Default segment size in MB (mirrors the Rust registry default). */
 export const RECORDING_SEGMENT_MB_DEFAULT = 500;
@@ -71,6 +77,12 @@ export interface RecordingSettingsState {
    * resolves (controls render disabled until then — never a fake value).
    */
   settings: RecordingSettingsVm | null;
+  /**
+   * {@link RECORDING_SETTINGS_UNREAD} while the last read failed and no VM was
+   * ever read; `null` otherwise. The surfaces say it in place of the controls
+   * the failed read left blank.
+   */
+  readError: string | null;
   /** Replace the mirrored VM (hydration, effective-persist echo, or revert). */
   setSettings: (settings: RecordingSettingsVm | null) => void;
 }
@@ -78,6 +90,7 @@ export interface RecordingSettingsState {
 /** The vanilla store instance, created once at module load and shared app-wide. */
 export const recordingSettingsStore = createStore<RecordingSettingsState>()((set) => ({
   settings: null,
+  readError: null,
   setSettings: (settings) => set({ settings }),
 }));
 
@@ -101,8 +114,9 @@ let lastConfirmed: RecordingSettingsVm | null = null;
 /**
  * Lazily hydrate the mirror from `recordingSettingsGet` (once per app lifetime;
  * concurrent callers share one read). Called by each surface on mount/open.
- * Best-effort: a read failure leaves the store unhydrated (controls stay
- * disabled) and allows a retry on the next call.
+ * A read failure leaves the store unhydrated (controls stay disabled), says
+ * {@link RECORDING_SETTINGS_UNREAD} through `readError` for the surfaces to
+ * print, and allows a retry on the next call.
  */
 export async function ensureRecordingSettingsHydrated(): Promise<void> {
   if (recordingSettingsStore.getState().settings !== null) {
@@ -117,11 +131,16 @@ export async function ensureRecordingSettingsHydrated(): Promise<void> {
         lastConfirmed = vm;
         recordingSettingsStore.getState().setSettings(vm);
       }
+      recordingSettingsStore.setState({ readError: null });
       // The capture switches are NOT seeded here: which sources are on is its
       // own command and its own module (`recording-capture-sources.ts`), so a
       // toggle never rides along on a whole-VM write.
     })
-    .catch(() => {
+    .catch((raw: unknown) => {
+      logFailure("recording.settingsGet")(raw);
+      if (recordingSettingsStore.getState().settings === null) {
+        recordingSettingsStore.setState({ readError: RECORDING_SETTINGS_UNREAD });
+      }
       // Allow a later retry rather than caching the failure forever.
       hydration = null;
     });
@@ -154,9 +173,10 @@ export async function refreshRecordingSettings(): Promise<void> {
       lastConfirmed = vm;
       recordingSettingsStore.getState().setSettings(vm);
     }
-  } catch {
+  } catch (error) {
     // Keep the value on screen: this read is a refinement of a VM the surface
     // already has, never its only source.
+    logFailure("recording.refreshSettings")(error);
   }
 }
 
@@ -189,6 +209,7 @@ export async function applyRecordingSettings(next: RecordingSettingsVm): Promise
     }
     return null;
   } catch (raw) {
+    logFailure("recording.settingsSet")(raw);
     if (id === writeId) {
       recordingSettingsStore.getState().setSettings(revertTo);
     }
@@ -207,10 +228,40 @@ export function useRecordingSettings(): RecordingSettingsVm | null {
   return useStore(recordingSettingsStore, (state) => state.settings);
 }
 
+/** The sentence a failed first read leaves, or `null`. */
+export function useRecordingSettingsReadError(): string | null {
+  return useStore(recordingSettingsStore, (state) => state.readError);
+}
+
+/**
+ * A surface's writes through {@link applyRecordingSettings}, with the refusal of
+ * its latest one (R381, R410): `null` once a write lands, the Rust-authored
+ * sentence when it was refused — for the surface to print beside the control
+ * that reverted. An older write that finishes after a newer one never
+ * overwrites the newer one's answer.
+ */
+export function useRecordingSettingsWriter(): {
+  refusal: string | null;
+  write: (next: RecordingSettingsVm) => void;
+} {
+  const [refusal, setRefusal] = useState<string | null>(null);
+  const latest = useRef(0);
+  const write = useCallback((next: RecordingSettingsVm) => {
+    latest.current += 1;
+    const id = latest.current;
+    void applyRecordingSettings(next).then((refused) => {
+      if (id === latest.current) {
+        setRefusal(refused);
+      }
+    });
+  }, []);
+  return { refusal, write };
+}
+
 /** Test-only reset: clear the mirror and forget any in-flight hydration/write. */
 export function resetRecordingSettingsForTest(): void {
   hydration = null;
   writeId = 0;
   lastConfirmed = null;
-  recordingSettingsStore.getState().setSettings(null);
+  recordingSettingsStore.setState({ settings: null, readError: null });
 }

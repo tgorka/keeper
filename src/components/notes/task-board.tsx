@@ -96,6 +96,7 @@ import { BoardCardAgent } from "@/components/notes/board-card-agent";
 import { Badge } from "@/components/ui/badge";
 import { type PointerDragDelta, usePointerDrag } from "@/hooks/use-pointer-drag";
 import { useReducedMotion } from "@/hooks/use-reduced-motion";
+import { logFailure } from "@/lib/failure";
 import type { CardAgentVm } from "@/lib/ipc/client";
 import { syncErrorMessage } from "@/lib/stores/sync";
 import { cn } from "@/lib/utils";
@@ -397,6 +398,7 @@ export function TaskBoard({
         setNotice(said);
       }
     } catch (error) {
+      logFailure("notes.boardMove")(error);
       // keeper's own sentence when it sent one — it knows what it refused and
       // this component does not (UX-DR43).
       setNotice(syncErrorMessage(error, moveFailed));

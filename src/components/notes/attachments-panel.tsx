@@ -88,6 +88,7 @@
  */
 import { useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
+import { logFailure } from "@/lib/failure";
 import {
   mediaBlockSources,
   notesEmbedPaths,
@@ -299,7 +300,8 @@ export function AttachmentsPanel({ vaultId, frontmatter, body, onInsert }: Attac
           setTargets(resolved);
         }
       })
-      .catch(() => {
+      .catch((raw: unknown) => {
+        logFailure("notes.recordingTargets")(raw);
         if (live) {
           setTargets(null);
         }
@@ -352,7 +354,8 @@ export function AttachmentsPanel({ vaultId, frontmatter, body, onInsert }: Attac
           setResolved(new Map(asked.map((target, at) => [target, paths[at]?.relPath ?? null])));
         }
       })
-      .catch(() => {
+      .catch((raw: unknown) => {
+        logFailure("notes.embedPaths")(raw);
         if (live) {
           setResolved(null);
         }

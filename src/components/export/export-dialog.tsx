@@ -38,6 +38,7 @@ import { Label } from "@/components/ui/label";
 import { Progress } from "@/components/ui/progress";
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import { Switch } from "@/components/ui/switch";
+import { logFailure, sayFailure } from "@/lib/failure";
 import type { ExportRequestVm, ExportScopeKind, IpcError } from "@/lib/ipc/client";
 import { cancelExport, revealPath, startExport } from "@/lib/ipc/client";
 import { exportStore, useExportStore } from "@/lib/stores/export";
@@ -98,7 +99,9 @@ function ExportJobWatcher() {
           ? {
               label: "Reveal in Finder",
               onClick: () => {
-                revealPath(firstPath).catch(() => {});
+                revealPath(firstPath).catch(
+                  sayFailure("export.reveal", "keeper couldn't reveal the export."),
+                );
               },
             }
           : undefined,
@@ -161,8 +164,9 @@ function ExportDialogInner() {
       if (typeof selection === "string") {
         setDestination(selection);
       }
-    } catch {
-      // Folder-picker cancellation / failure → keep the current destination.
+    } catch (error) {
+      // A cancelled picker resolves null; a failure keeps the current destination.
+      sayFailure("export.pickDestination", "keeper couldn't open the folder picker.")(error);
     }
   }, []);
 
@@ -186,6 +190,7 @@ function ExportDialogInner() {
       );
       exportStore.getState().startJob(exportId);
     } catch (e: unknown) {
+      logFailure("export.start")(e);
       setStartError(
         isIpcError(e)
           ? e
@@ -196,7 +201,9 @@ function ExportDialogInner() {
 
   const onCancel = useCallback(() => {
     if (job !== null) {
-      cancelExport(job.exportId).catch(() => {});
+      cancelExport(job.exportId).catch(
+        sayFailure("export.cancel", "keeper couldn't cancel the export."),
+      );
     }
   }, [job]);
 
@@ -343,7 +350,9 @@ function ExportDialogInner() {
                 onClick={() => {
                   const p = job.outputPaths[0];
                   if (p !== undefined) {
-                    revealPath(p).catch(() => {});
+                    revealPath(p).catch(
+                      sayFailure("export.reveal", "keeper couldn't reveal the export."),
+                    );
                   }
                 }}
               >

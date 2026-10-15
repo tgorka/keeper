@@ -33,6 +33,7 @@ import { transcribeAFile } from "@/components/transcription/transcribe-a-file";
 import { createNote, openJournalToday, showCapture } from "@/hooks/use-notes-actions";
 import { logTodayInCurrentSession } from "@/hooks/use-sessions-shortcut";
 import { isPhoneTier } from "@/hooks/use-shell-layout";
+import { logFailure } from "@/lib/failure";
 import {
   archiveRoom,
   chatNotifyModeSet,
@@ -114,6 +115,7 @@ export const paletteActionHandlers: Record<string, PaletteActionHandler> = {
     try {
       await recordingRevealFolder();
     } catch (error) {
+      logFailure("palette.revealRecordings")(error);
       console.warn("command-palette: could not reveal the recordings folder", error);
     }
   },

@@ -46,6 +46,7 @@ import {
 } from "@/components/ui/context-menu";
 import { useLongPress } from "@/hooks/use-long-press";
 import { useShellLayout } from "@/hooks/use-shell-layout";
+import { logFailure, sayFailure } from "@/lib/failure";
 import type { NetworkVm } from "@/lib/ipc/client";
 import { networkMuteGet, networkMuteSet, setNetworkFilter } from "@/lib/ipc/client";
 import { networksStore, useNetworksStore } from "@/lib/stores/networks";
@@ -81,7 +82,8 @@ function NetworkRow({
           setMuted(v);
         }
       })
-      .catch(() => {
+      .catch((raw: unknown) => {
+        logFailure("networks.muteGet")(raw);
         if (!cancelled) {
           setMuted(false);
         }
@@ -95,10 +97,14 @@ function NetworkRow({
     if (isActive) {
       // Toggle off: clear the selection and the Rust filter.
       networksStore.getState().setActiveNetwork(null);
-      void setNetworkFilter(null).catch(() => {});
+      void setNetworkFilter(null).catch(
+        sayFailure("inbox.clearNetworkFilter", "keeper couldn't clear the Network filter."),
+      );
     } else {
       networksStore.getState().setActiveNetwork(network.name);
-      void setNetworkFilter(network.name).catch(() => {});
+      void setNetworkFilter(network.name).catch(
+        sayFailure("inbox.setNetworkFilter", "keeper couldn't filter by the Network."),
+      );
     }
   };
 
@@ -108,7 +114,8 @@ function NetworkRow({
     const prev = muted ?? false;
     const next = !prev;
     setMuted(next);
-    void networkMuteSet(network.name, next).catch(() => {
+    void networkMuteSet(network.name, next).catch((raw: unknown) => {
+      logFailure("networks.muteSet")(raw);
       // Revert only if no newer toggle superseded this one.
       if (id === writeId.current) {
         setMuted(prev);

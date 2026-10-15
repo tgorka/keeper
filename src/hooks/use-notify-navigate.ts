@@ -23,6 +23,7 @@
  * means the bridge is inert — it never crashes the shell.
  */
 import { useEffect } from "react";
+import { logFailure } from "@/lib/failure";
 import { listenNotifyNavigate } from "@/lib/ipc/client";
 import { bridgeRelinkStore } from "@/lib/stores/bridge-relink";
 import { primaryViewStore } from "@/lib/stores/primary-view";
@@ -61,9 +62,8 @@ export function useNotifyNavigate(): void {
             unlisten = fn;
           }
         })
-        .catch(() => {
-          // No Tauri host — the navigate bridge is inert in this environment.
-        });
+        // No Tauri host — the navigate bridge is inert in this environment.
+        .catch(logFailure("notify.listenNavigate"));
     } catch {
       // `listen` can throw synchronously when the Tauri IPC internals are absent.
     }

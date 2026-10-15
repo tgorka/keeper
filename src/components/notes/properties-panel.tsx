@@ -94,6 +94,7 @@ import {
 } from "@/components/ui/resizable-columns";
 import { Switch } from "@/components/ui/switch";
 import { IconHint } from "@/components/ui/tooltip";
+import { logFailure, sayFailure } from "@/lib/failure";
 import {
   type NoteWriteVm,
   notesFieldVocabulary,
@@ -818,7 +819,8 @@ export function PropertiesPanel(props: PropertiesPanelProps) {
           setTargets(resolved);
         }
       })
-      .catch(() => {
+      .catch((raw: unknown) => {
+        logFailure("notes.recordingTargets")(raw);
         if (live) {
           setTargets(null);
         }
@@ -846,6 +848,7 @@ export function PropertiesPanel(props: PropertiesPanelProps) {
         setFailure(null);
       })
       .catch((error: unknown) => {
+        logFailure("properties.write")(error);
         // Said out loud, because the control has already moved and a silent
         // failure would leave the panel showing a value the file does not have.
         // The message is whichever address worded it: Rust's own refusal for a
@@ -1149,7 +1152,8 @@ export function FileProperties({
           setBlock(read);
         }
       })
-      .catch(() => {
+      .catch((raw: unknown) => {
+        logFailure("properties.readFrontmatter")(raw);
         // No panel. Rust has already said why on whichever surface asked for
         // the file itself; a second copy of the sentence here would be the same
         // refusal twice.
@@ -1285,7 +1289,10 @@ function SuggestedProperty({
       .then(setOptions)
       // A vocabulary that will not load is a control with no suggestions, never
       // an error: the field still takes whatever is typed into it.
-      .catch(() => setOptions([]));
+      .catch((raw: unknown) => {
+        logFailure("properties.fieldVocabulary")(raw);
+        setOptions([]);
+      });
   };
 
   return (
@@ -1660,7 +1667,8 @@ function TagsProperty({ entry, sessionId, onChange }: TagsPropertyProps) {
           setVocabulary(vm.entries.map((tag) => tag.path));
         }
       })
-      .catch(() => {
+      .catch((raw: unknown) => {
+        logFailure("properties.tagsVocabulary")(raw);
         // Nothing to browse, and typing still works: creating is allowed here,
         // so an unreadable vocabulary costs the completion and not the edit.
         if (!cancelled) {
@@ -1915,7 +1923,8 @@ function RecordAnotherLikeThis({ targets }: { targets: RecordingNoteTargetVm[] |
               });
               primaryViewStore.getState().setView("recording");
             })
-            .catch(() => {
+            .catch((raw: unknown) => {
+              logFailure("properties.recordAnother")(raw);
               setFault(RECORD_ANOTHER_UNREADABLE);
             });
         }}
@@ -2026,9 +2035,11 @@ function RecordingPath({ relativePath, target, canReveal }: RecordingPathProps) 
           {canReveal && target !== undefined && (
             <DropdownMenuItem
               onSelect={() => {
-                // Best effort: the reveal either happens or the file manager
-                // said no, and neither is something to interrupt a note with.
-                void revealPath(target.absolutePath).catch(() => {});
+                // The reveal either happens or the file manager said no, and a
+                // no is said in a toast rather than inside the note.
+                void revealPath(target.absolutePath).catch(
+                  sayFailure("notes.revealRecording", "keeper couldn't reveal the file."),
+                );
               }}
             >
               <FolderOpen aria-hidden="true" />
@@ -2038,7 +2049,9 @@ function RecordingPath({ relativePath, target, canReveal }: RecordingPathProps) 
           {target?.kind === "video" && (
             <DropdownMenuItem
               onSelect={() => {
-                void recordingOpenPath(target.absolutePath).catch(() => {});
+                void recordingOpenPath(target.absolutePath).catch(
+                  sayFailure("notes.previewRecording", "keeper couldn't open the recording."),
+                );
               }}
             >
               <Play aria-hidden="true" />
@@ -2053,7 +2066,7 @@ function RecordingPath({ relativePath, target, canReveal }: RecordingPathProps) 
               // note says, and copying what is on screen is never wrong.
               void navigator.clipboard
                 ?.writeText(target?.absolutePath ?? relativePath)
-                .catch(() => {});
+                .catch(sayFailure("notes.copyRecordingPath", "keeper couldn't copy the path."));
             }}
           >
             <Copy aria-hidden="true" />

@@ -37,8 +37,11 @@ export function VoiceWindow() {
       })
       // Outside a Tauri webview (jsdom, `bun run dev`) there is nothing to
       // listen to and nothing to show; the pill sits empty rather than
-      // throwing.
-      .catch(() => {});
+      // throwing. This window may call no command, `frontend_error_report`
+      // included, so the console is the only place the failure can go.
+      .catch((error: unknown) => {
+        console.error("voice-pill: could not listen for voice state", error);
+      });
     return () => {
       gone = true;
       unlisten?.();

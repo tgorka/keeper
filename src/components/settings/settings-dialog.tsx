@@ -18,6 +18,7 @@ import {
 import { BotGrantsSection } from "@/components/settings/bot-grants-section";
 import { BotsSection } from "@/components/settings/bots-section";
 import { ConfigSourceSection, FileControlled } from "@/components/settings/config-source-section";
+import { DefaultAgentSection } from "@/components/settings/default-agent-section";
 import { BADGE_NOT_LIVE_SENTENCE } from "@/components/settings/no-background-sync-disclosure";
 import { PhonePush } from "@/components/settings/phone-push";
 import { RecordingSettingsControls } from "@/components/settings/recording-settings-controls";
@@ -42,6 +43,7 @@ import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import { Switch } from "@/components/ui/switch";
 import { useTelemetryOpening } from "@/hooks/use-telemetry";
 import { useVoiceFacts } from "@/hooks/use-voice-facts";
+import { logFailure, sayFailure } from "@/lib/failure";
 import { acceleratorFromEvent, DEFAULT_GLOBAL_HOTKEY, formatAccelerator } from "@/lib/hotkey";
 import {
   agentOwnFingerprint,
@@ -193,7 +195,8 @@ export function SettingsBody({ open, onOpenChange }: SettingsDialogProps) {
           setPosture(value);
         }
       })
-      .catch(() => {
+      .catch((raw: unknown) => {
+        logFailure("settings.encryptionPosture")(raw);
         // On a read failure, fall back to the honest FileVault-only status.
         if (!cancelled) {
           setPosture(false);
@@ -265,6 +268,11 @@ export function SettingsBody({ open, onOpenChange }: SettingsDialogProps) {
           could name. `botTools` is strictly narrower than `bots` in Rust, so
           it is the one gate this section needs. */}
       {botTools && <BotGrantsSection open={open} />}
+      {/* Story 100.3 (R383): the one agent keeper opens at launch. On every
+          tier and behind no capability — the phone launches by the same rule
+          and the key travels with the account — and absent where there is no
+          agent to choose and none stored (AD-27). */}
+      <DefaultAgentSection open={open} />
       {/* Story 90.6: this Mac as a host for your agents. On `botTools` for the
           grants' reason — a host reads drives, and a phone is never one — and
           absent besides where no flagged folder holds an agent (AD-27). */}
@@ -326,7 +334,8 @@ function HonorRemoteDeletionsRow() {
           setEnabled(value);
         }
       })
-      .catch(() => {
+      .catch((raw: unknown) => {
+        logFailure("settings.honorRemoteDeletionsGet")(raw);
         if (!cancelled) {
           setEnabled(false);
         }
@@ -345,7 +354,8 @@ function HonorRemoteDeletionsRow() {
     const id = writeId.current;
     const prev = enabled ?? false;
     setEnabled(next);
-    void setHonorRemoteDeletions(next).catch(() => {
+    void setHonorRemoteDeletions(next).catch((raw: unknown) => {
+      logFailure("settings.honorRemoteDeletionsSet")(raw);
       // Persist failed — revert, but only if this is still the latest toggle.
       if (id === writeId.current) {
         setEnabled(prev);
@@ -441,7 +451,8 @@ function NotificationsSection({ open }: { open: boolean }) {
           setEnabled(value);
         }
       })
-      .catch(() => {
+      .catch((raw: unknown) => {
+        logFailure("settings.previewEnabledGet")(raw);
         // On a read failure, fall back to the honest default (previews on).
         if (!cancelled) {
           setEnabled(true);
@@ -456,7 +467,8 @@ function NotificationsSection({ open }: { open: boolean }) {
             setBadgeMode(value);
           }
         })
-        .catch(() => {
+        .catch((raw: unknown) => {
+          logFailure("settings.dockBadgeModeGet")(raw);
           // On a read failure, fall back to the honest default (badge all unreads).
           if (!cancelled) {
             setBadgeMode("all");
@@ -468,7 +480,8 @@ function NotificationsSection({ open }: { open: boolean }) {
             setPermission(value);
           }
         })
-        .catch(() => {
+        .catch((raw: unknown) => {
+          logFailure("settings.notificationPermission")(raw);
           // On a read failure treat as unknown — hide the persistent "off" surface.
           if (!cancelled) {
             setPermission("unknown");
@@ -489,7 +502,8 @@ function NotificationsSection({ open }: { open: boolean }) {
     const id = writeId.current;
     const prev = enabled ?? true;
     setEnabled(next);
-    void notifySetPreviewEnabled(next).catch(() => {
+    void notifySetPreviewEnabled(next).catch((raw: unknown) => {
+      logFailure("settings.previewEnabledSet")(raw);
       if (id === writeId.current) {
         setEnabled(prev);
       }
@@ -502,7 +516,8 @@ function NotificationsSection({ open }: { open: boolean }) {
     const id = badgeWriteId.current;
     const prev = badgeMode ?? "all";
     setBadgeMode(value);
-    void dockBadgeModeSet(value).catch(() => {
+    void dockBadgeModeSet(value).catch((raw: unknown) => {
+      logFailure("settings.dockBadgeModeSet")(raw);
       if (id === badgeWriteId.current) {
         setBadgeMode(prev);
       }
@@ -564,8 +579,10 @@ function NotificationsSection({ open }: { open: boolean }) {
                 size="sm"
                 className="self-start"
                 onClick={() => {
-                  // Best-effort deep link through the Rust opener; never re-prompts.
-                  void iosOpenAppSettings().catch(() => {});
+                  // Deep link through the Rust opener; never re-prompts.
+                  void iosOpenAppSettings().catch(
+                    sayFailure("settings.openAppSettings", "keeper couldn't open Settings."),
+                  );
                 }}
               >
                 Open Settings
@@ -627,7 +644,8 @@ function BackgroundSection({ open }: { open: boolean }) {
           setMode(value);
         }
       })
-      .catch(() => {
+      .catch((raw: unknown) => {
+        logFailure("settings.dockBadgeModeGet")(raw);
         // On a read failure, fall back to the honest default (badge all unreads).
         if (!cancelled) {
           setMode("all");
@@ -643,7 +661,8 @@ function BackgroundSection({ open }: { open: boolean }) {
             setLaunch(value);
           }
         })
-        .catch(() => {
+        .catch((raw: unknown) => {
+          logFailure("settings.launchAtLoginGet")(raw);
           if (!cancelled) {
             setLaunch(false);
           }
@@ -656,7 +675,8 @@ function BackgroundSection({ open }: { open: boolean }) {
             setMenuBar(value);
           }
         })
-        .catch(() => {
+        .catch((raw: unknown) => {
+          logFailure("settings.menuBarGet")(raw);
           if (!cancelled) {
             setMenuBar(false);
           }
@@ -673,7 +693,8 @@ function BackgroundSection({ open }: { open: boolean }) {
     const id = modeWriteId.current;
     const prev = mode ?? "all";
     setMode(value);
-    void dockBadgeModeSet(value).catch(() => {
+    void dockBadgeModeSet(value).catch((raw: unknown) => {
+      logFailure("settings.dockBadgeModeSet")(raw);
       if (id === modeWriteId.current) {
         setMode(prev);
       }
@@ -685,7 +706,8 @@ function BackgroundSection({ open }: { open: boolean }) {
     const id = launchWriteId.current;
     const prev = launch ?? false;
     setLaunch(next);
-    void launchAtLoginSet(next).catch(() => {
+    void launchAtLoginSet(next).catch((raw: unknown) => {
+      logFailure("settings.launchAtLoginSet")(raw);
       if (id === launchWriteId.current) {
         setLaunch(prev);
       }
@@ -697,7 +719,8 @@ function BackgroundSection({ open }: { open: boolean }) {
     const id = menuBarWriteId.current;
     const prev = menuBar ?? false;
     setMenuBar(next);
-    void menuBarPresenceSet(next).catch(() => {
+    void menuBarPresenceSet(next).catch((raw: unknown) => {
+      logFailure("settings.menuBarSet")(raw);
       if (id === menuBarWriteId.current) {
         setMenuBar(prev);
       }
@@ -784,7 +807,8 @@ function PrivacySection({ open }: { open: boolean }) {
           setEnabled(value);
         }
       })
-      .catch(() => {
+      .catch((raw: unknown) => {
+        logFailure("settings.incognitoGetGlobal")(raw);
         if (!cancelled) {
           setEnabled(false);
         }
@@ -810,7 +834,8 @@ function PrivacySection({ open }: { open: boolean }) {
       .then(() => {
         incognitoStore.getState().bumpPolicyVersion();
       })
-      .catch(() => {
+      .catch((raw: unknown) => {
+        logFailure("settings.incognitoSetGlobal")(raw);
         if (id === writeId.current) {
           setEnabled(prev);
           incognitoStore.getState().applyGlobal(prev);
@@ -839,7 +864,8 @@ function PrivacySection({ open }: { open: boolean }) {
           setUndoWindow(value);
         }
       })
-      .catch(() => {
+      .catch((raw: unknown) => {
+        logFailure("settings.undoSendWindowGet")(raw);
         if (!cancelled) {
           setUndoWindow(UNDO_SEND_WINDOW_DEFAULT);
         }
@@ -861,7 +887,8 @@ function PrivacySection({ open }: { open: boolean }) {
     const id = windowWriteId.current;
     const prev = undoWindow ?? UNDO_SEND_WINDOW_DEFAULT;
     setUndoWindow(clamped);
-    void setUndoSendWindow(clamped).catch(() => {
+    void setUndoSendWindow(clamped).catch((raw: unknown) => {
+      logFailure("settings.undoSendWindowSet")(raw);
       if (id === windowWriteId.current) {
         setUndoWindow(prev);
       }
@@ -1007,10 +1034,9 @@ function ShortcutsSection({ open }: { open: boolean }) {
           setHotkey(vm);
         }
       })
-      .catch(() => {
-        // On a read failure leave the section in its loading state rather than
-        // asserting a (possibly wrong) binding.
-      });
+      // On a read failure leave the section in its loading state rather than
+      // asserting a (possibly wrong) binding.
+      .catch(logFailure("settings.readHotkey"));
     return () => {
       cancelled = true;
     };
@@ -1029,6 +1055,7 @@ function ShortcutsSection({ open }: { open: boolean }) {
         }
       })
       .catch((raw: unknown) => {
+        logFailure("settings.hotkeySet")(raw);
         if (id !== writeId.current) {
           return;
         }

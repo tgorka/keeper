@@ -20,6 +20,7 @@ import { emit } from "@tauri-apps/api/event";
 import { useEffect, useRef, useState } from "react";
 import ReactDOM from "react-dom/client";
 import { buildHtmlView } from "@/components/viewers/html-view";
+import { logFailure } from "@/lib/failure";
 import { syncReadText } from "@/lib/ipc/client";
 
 /** The word the window says when the document is on screen and laid out. */
@@ -91,6 +92,7 @@ export function PrintDocument({ search }: { search: string }) {
         });
       })
       .catch((error: unknown) => {
+        logFailure("print.readText")(error);
         const said = error instanceof Error ? error.message : String(error);
         if (live) {
           setFailure(said);

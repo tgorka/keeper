@@ -10,6 +10,7 @@
  */
 import { useStore } from "zustand";
 import { createStore } from "zustand/vanilla";
+import { logFailure } from "@/lib/failure";
 import { type SessionRootVm, sessionsRoots } from "@/lib/ipc/client";
 
 export interface SessionsRootsState {
@@ -63,6 +64,7 @@ export async function refreshSessionsRoots(): Promise<void> {
   try {
     sessionsRootsStore.getState().setRoots(await sessionsRoots());
   } catch (error) {
+    logFailure("sessions.roots")(error);
     sessionsRootsStore.getState().setError(error instanceof Error ? error.message : String(error));
   }
 }

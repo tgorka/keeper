@@ -218,6 +218,15 @@ only, under this Mac's principal (the organisation account's login) for a zone w
 drive's readers on this Mac. Nixi's DM is made by `keeper-agentd agents init` on the host that
 serves her.
 
+The bot picked is the folder's; under it the person may pick the folder's reasoning level (only the
+levels that bot's kind is sent are offered) and, for each ticked agent, its own bot and level
+instead (100.2 #6). A folder whose agents are local-only — its `_drive.toml` says so, or the form's
+box is ticked — is offered only the person's bots that run locally, for its own bot and each
+agent's alike; ticking the box drops a choice it no longer offers (R405). Each seeded `agent.toml`
+and `_template/` gets its `[model]` written that way:
+the agent's own choice, else the folder's. A level its bot's kind is not sent, or a choice for an
+agent that is not ticked, is refused naming it.
+
 ### The operator's steps
 
 0. Record the provider (§ *The provider*), committed, before any seeding.
@@ -266,8 +275,10 @@ What the owner records here (owed, not yet written):
 
 An agent is a folder in the zone: `80-agents/<id>/`. The folder's name is the agent's id, and the
 drive the zone belongs to is the other half of its name, so `amelia/` in tgdrive and `amelia/` in
-neuradrive are two agents with two audiences. keeper reads the home; it never writes `agent.toml`,
-`SOUL.md`, `USER.md` or `MEMORY.md`.
+neuradrive are two agents with two audiences. keeper reads the home; it never writes `SOUL.md`,
+`USER.md` or `MEMORY.md`, and writes `agent.toml` only for two keys, `[model].bot` and
+`[model].effort`, when a person saves an agent's model in Settings › Agents (R382; see
+[An agent's model](#an-agents-model)).
 
 ```text
 80-agents/nixi/
@@ -291,6 +302,7 @@ human       = "@tgorka:example.org"
 
 [model]
 bot        = "bot:openai:https://provider.example:8452#claude-opus"
+effort     = "high"
 local_only = false
 
 [tools]
@@ -314,6 +326,7 @@ workflow    = "triage"
 | `matrix_user` | required | a Matrix user id; two homes in one zone may not share one |
 | `human` | none | required for a `proxy` and refused for every other kind; a reader of the drive |
 | `[model].bot` | required | `bot:<kind>:<base URL>#<model>`, kind `hermes`, `ollama` or `openai`. The base URL carries no user or password and is normalised as a saved provider's is. |
+| `[model].effort` | none | the reasoning level sent with every turn: `low`, `medium`, `high` or `xhigh`; absent sends nothing and the provider decides. An `openai` bot is sent `reasoning_effort` with any of the four; an `ollama` bot `reasoning_effort` with `low`, `medium` or `high` (Ollama's `/v1` door takes no `think`, and `xhigh` is not a level it documents); a `hermes` bot none. Any other word, or a level the bot's kind is not sent, refuses the home naming the four levels or the kind's. |
 | `[model].local_only` | `false` | `true` needs an `ollama` bot. A drive whose `_drive.toml` says `local_only = true` makes it true for every agent homed there. |
 | `[tools].allow` | the kind's defaults | names from the tool vocabulary below. An MCP tool is not named here but by its server in `[tools].mcp`. |
 | `[tools].drives` | the home drive | drive ids in scope; the home drive is always first |
@@ -359,6 +372,54 @@ Every key is checked and every refusal names it: "agent.toml has a key keeper do
 tools.tool. Remove it or fix its spelling." A bound is refused one past its edge with the value
 and the range ("agent.toml's limits.hop_limit is refused: 4 is outside 0 to 3.").
 
+### An agent's model
+
+Every agent has its own `[model]`: one may run on Opus at `high`, another on Opus at `xhigh`, a
+third on Haiku and a fourth on GPT Astra with the provider's default. **Settings › Agents** on a Mac
+whose drive holds the home lists, on each agent's row, its bot — offered from the person's own bots
+(⌘9), and only the `ollama` ones when the agent is `local_only` — and its reasoning level, offered
+from the levels that bot's kind is sent. When keeper cannot read the person's bots (`keeper.db`), the
+row says so where the choices would be and offers only the agent's current bot, whose level can
+still change; *Set up agents* says the same instead of "You have no bots yet". *Save model* writes
+`[model].bot` and `[model].effort` of that `agent.toml` and nothing else: every comment, key
+order, spacing, line ending (a CRLF file stays CRLF), a missing final newline and every other table
+stays as it was — `keeper_core::agents::home::with_model` replaces the two values where `toml_edit`
+found them in the original text and serialises nothing else. The save reads the file once, checks
+and edits those very bytes, and writes them through the drive's own write path, as the person, like
+a file saved from the Files surface (`WriteScope::route`), only if the file still holds the bytes it
+read (`files_write::replace_unmanaged`, R405); the folder's sync commits and pushes it. That last
+check and the write are one step for every writer inside keeper — two saves, a save and a file
+saved from the Files surface, a bot's tool write: each waits for the one before it, so of two saves
+made from the same file exactly one lands and the other is refused (R412). An editor or the sync's
+own `git merge`, which run outside keeper's process, are not held off: one that writes the file in
+the instant between that check and the write is written over, and the drive's git history keeps
+the revision it wrote, which the next sync shows (DW-1408). It is
+refused, with a sentence beside the control and a WARN line in `keeper.log`, when:
+
+- the file says another model than the row showed — it changed on the drive meanwhile;
+- the file changed between the save's read and its write — another save, a sync, a hand edit:
+  "Nixi's agent.toml changed while you were saving — reopen and try again." — and nothing is
+  written over the change;
+- the person's bots could not be read and the save names another bot than the current one;
+- the bot is not one of the person's (the agent's current bot stays choosable for a level change);
+- the level is not one the bot's kind is sent;
+- the Mac only pulls the drive (the row says so and offers nothing to change);
+- the file does not read — a merge left its markers in it — or the disk refused the write.
+
+**It applies from the agent's next turn.** Every turn reads the home's `agent.toml` again through
+the zone's read path and runs on the `[model]` it names now, without restarting keeper or the host;
+the rest of the file still waits for the host's next build, as before. A home that stops reading, or
+a bot no provider on the host serves, refuses the turn with that sentence in the room. A provider
+that refuses the level itself — an HTTP 4xx naming the reasoning field or the level — ends the turn
+with "Nixi's bot claude-opus-5-5 does not accept reasoning level xhigh. Choose another level, or
+none, for Nixi in Settings › Agents." in the room, and a WARN line with the provider's status code
+and at most 200 characters of what it said, control characters removed. Every
+`assistant` line of the session log names the bot (`bot`) and the level (`effort`) that turn was
+sent, so a session whose model changed reads which turn ran on which.
+
+The agent room's header names the agent's model and level (`Opus · xhigh`) on a device whose drive
+holds the home; a phone without the drive shows none.
+
 ### `SOUL.md`
 
 ```markdown
@@ -402,6 +463,56 @@ A BMAD agent becomes a soul by BMAD's own merge rule (`customize.toml`, then
 fields and lists what it did not carry over: activation steps, each menu item (a BMAD menu runs a
 BMAD skill; keeper's menus run `_workflows/` folders), and any `file:` fact, which names a path in
 the BMAD project rather than in the home. It returns text; a person writes the file.
+
+### The agent's picture: `avatar.svg`
+
+An agent's home may hold its picture: `avatar.svg` (preferred), else `avatar.png`, `avatar.webp`
+or `avatar.jpg`, at most 256 KiB (262 144 bytes). keeper uses the first of those four that is
+there and reads; one that is too large, cannot be read, or is not the format its name says (an
+`avatar.svg` must be an SVG document whose `<svg>` element begins within its first 4 KiB, past
+any XML declaration, comments and doctype) is not used and the next is tried. A file the drive
+keeps in git-LFS is judged by its object: past 256 KiB by the size its pointer names, without
+fetching anything; while the object is not on this machine the agent keeps its letter here —
+not the agent's Matrix profile avatar, which may be an older picture — and nothing is published. Any other `avatar.*` beside them (`avatar.gif`, `avatar.jpeg`,
+`Avatar.PNG`) is ignored. Each file keeper does not use is a WARN line in `keeper.log` (on
+agentd, its journal) naming the agent and the file, and a sentence under the agent's row in
+Settings › Agents — *Nixi's avatar.svg is 301 KiB; keeper draws a picture of at most 256 KiB, so
+it is not used.* The seeded agents have no picture and keep their letter until you add a file.
+
+- **Where it is drawn.** Wherever the agent's mark is: the identity cell of its room's header —
+  in the chat and in the notes view's dock, which draws the same header — and its rooms' rows in
+  the Agents window. A row draws the agent working its session, as its status names it: a
+  delegated session's row draws the delegate, not the agent that made the room; a row whose
+  status is not read yet draws the letter. The picture is clipped to the cell; the letter (or
+  the soul's `icon`) stays the fallback while it loads, wherever it does not load, and for an
+  agent with no picture.
+- **On the Mac with the drive.** The file is drawn from the drive over `keeper-file://` (the
+  sync profile's root, which holds the agents zone), with a hash of its content in the URL, so a
+  changed file is drawn within a scan (five seconds).
+- **Everywhere else.** A host serving the agent — `keeper-agentd`, or the Mac that hosts it —
+  makes the same file the agent's Matrix profile avatar when its content changes. It first reads
+  the agent's record (`dev.keeper.agent.avatar` in the agent's own account data: the content's
+  hash and the avatar it became) and profile; when they show this file already, it uploads
+  nothing — not at a scan, not after a restart, not after the file was put back to what was
+  published. Otherwise only the host holding the agent's picture claim in the principal's
+  control room (`picture:<agent>`, taken as every keyed claim is) uploads the bytes (typed by
+  the extension), sets the avatar, records it and hands the claim back; a host that finds the
+  claim held elsewhere uploads nothing and looks again a minute later, when the holder's record
+  answers it. So the iPhone, another Mac and other clients show the picture too; keeper draws an
+  agent's profile avatar from the original file, never a server thumbnail, and never reads more
+  than 256 KiB of it: a larger one, which any client could set, is refused as the server
+  declares its size or as soon as the download runs past it, is never cached, and is one WARN
+  line on that device, which draws the letter. A failed upload is a WARN line on the host that
+  tried, and a sentence under the agent's row in Settings › Agents on every Mac of the
+  principal — the host carries it in its manifest in the control room, so a failure on electra
+  reads *… could not be set as its Matrix profile avatar on electra (…)* (on agentd also
+  `picture` beside the copy in `status.json`); it is tried again in ten minutes, and the
+  sentence goes once a publication succeeds. A failure never leaves the host believing the
+  profile is settled. Removing the file leaves the profile avatar as it was (DW-1421).
+- **SVG.** An SVG is only ever an `<img>` source, served as `image/svg+xml` with
+  `X-Content-Type-Options: nosniff`; it is never put into the page, so a script inside it never
+  runs. A profile avatar is served only for a member at an agent's power in that room and only
+  when its bytes are a PNG, JPEG, WebP or SVG.
 
 ### `USER.md` and `MEMORY.md`
 
@@ -725,6 +836,9 @@ The journal and proposal tools above are not drive writes: they are keeper's own
 
 The zone's `README.md` and `AGENTS.md` are written as anywhere else in the drive. A folder without
 the agents flag refuses nothing new.
+
+A person's *Save model* in Settings › Agents is a person's edit, not a tool's: it writes the two
+`[model]` keys through the drive's write path without this fence, and no agent can reach it.
 
 ## What an agent is told
 
@@ -2147,7 +2261,7 @@ per date and host, compared as a number. Each host writes only its own chunks an
 | `claim` | `epoch, action` (`acquired`, `renewed`, `released`, `lost`), `from_host, claim_event, server_ts` |
 | `user` | `sender, text, attachments` |
 | `peer` | `sender, text`, optional `ask {id, question, room, label}` (another agent's question for the proxy's person, in the proxy's session), `answers {id, choice}` (the person's answer to this session's ask, relayed by their proxy; `choice` is `null` when the answer picks none) and `artifacts` |
-| `assistant` | `text, model, finish, usage {prompt, completion}, ttft_ms, duration_ms, anchor_event`; a round that called tools carries that round's own usage |
+| `assistant` | `text, model, finish, usage {prompt, completion}, ttft_ms, duration_ms, anchor_event`; a round that called tools carries that round's own usage. An agent's turn adds `bot` (its `bot:` reference as `[model].bot` named it for that turn) and `effort` when a level was sent (100.2 #3); a line without them is one written before 100.2, or a helper's step |
 | `tool_call` | `call_id, tool, args, tier`, optional `grant_id`; `args` is the string the model sent, verbatim |
 | `tool_result` | `call_id, outcome` (`ok`, `refused`, `failed`), `content`, optional `truncated {shown, total}`, `label`, optional `paseo {broker, id}` (the run a successful Paseo `create_agent` started) |
 | `approval` | `id, state` (`requested`, `decided`, `consumed`, `expired`, `refused`), optional `decision, by, result, reason, scope`; terminal: `consumed`, `expired`, `refused`, and `decided` with `decision: "deny"`; a `decided` line without `decision` is a decision ignored, `reason` saying why |
@@ -2902,7 +3016,8 @@ keeper shows an agent's room in its own timeline, on the Mac and on the iPhone a
   sentence when the newest scope is from a newer keeper or cannot be read — never dropped) and
   the label chip (the readers by name, a reader keeper cannot name by user id, and the integrity
   as a word). The identity cell's mark is the first letter of the handle, which for the seeded
-  agents is the one glyph their souls name (`N`, `T`, `L`).
+  agents is the one glyph their souls name (`N`, `T`, `L`); an agent with a picture
+  ([`avatar.svg`](#the-agents-picture-avatarsvg)) is drawn by it instead, the mark its fallback.
 - **Whose status.** keeper reads status updates the way the host does: only from the agent the
   status names, at power 50 or more, never from you; the newest by server time wins, so an update
   arriving late never replaces a newer one. A status keeper cannot read — a run or kind it does
@@ -2913,7 +3028,7 @@ keeper shows an agent's room in its own timeline, on the Mac and on the iPhone a
   newest first, when the cache holds no status — once per room while keeper runs, when that
   history held none; a status sent later reaches the cache. The hosts' claim and manifest state,
   renewed every minute, never become timeline items either. A change of the agent's mark (its
-  soul's icon) redraws an open header.
+  soul's icon) or of its picture redraws an open header and its rows in the Agents window.
 - **The answer.** An answer is one message that grows in place and is never marked "Edited";
   while the run is `running`, its newest answer carries the growing caret. It is drawn up to
   `FINAL_CUT_BYTES` and the sentence naming the artifact, not cut at the 4096 characters an
@@ -2922,6 +3037,58 @@ keeper shows an agent's room in its own timeline, on the Mac and on the iPhone a
   `dev.keeper.agent.turn` marker counts as one only in a session room, from a sender at power 50
   or more who is not you. Anyone else's marked message — in any room — is an ordinary message:
   it notifies, shows "Edited" when edited, is cut at 4096 characters and never carries the caret.
+- **At launch: the default agent (story 100.3, R383).** `agents.default` holds one agent's Matrix
+  user id, or nothing; choose it under Settings › *Default agent* (None, or one of the agents you
+  have a `main` conversation with here) or from the agent room header's menu (*Make default*,
+  *Stop opening at launch*). It is a user-global setting: a `keeper.toml` may set it and it travels
+  with your account's settings. When keeper starts and your signed-in accounts have at least one
+  agent room, it opens the Agents window; when the default agent's `main` room — your DM with that
+  proxy — is on one of those accounts, that room is open (and, on the Mac, its composer focused).
+  When it is not (an agent you have no conversation with here, or a value that is not a user id),
+  the Agents window opens with nothing selected, a notice says why, the Settings row says the same
+  sentence, and `keeper.log` has it at WARN. With no agent rooms, keeper opens the Inbox as before.
+  keeper decides once per launch when it knows: once every signed-in account has finished its
+  first sync since launch and keeper has looked at the rooms after that, or as soon as the default
+  agent's conversation is here. It never takes longer than 15 seconds, looking at the rooms
+  included (a slow homeserver cannot hold it): at that point it answers from the last look that
+  finished, and a conversation still missing is one that "has not arrived yet" (it is in Agents
+  once it does) — said in a notice on whichever window opens, the Inbox too when keeper had not
+  yet seen any agent room. It applies that answer once, and never over a room or window you
+  already chose. On the iPhone the same rule applies only when the restored navigation (after the
+  system reclaimed the webview) had nothing to restore. When a settings file sets
+  `agents.default`, Settings and the room header's menu say so and name the file: a choice made
+  there is kept, but the file's agent is what opens until the file stops setting it. A failed read
+  is a sentence where the choice or the menu would be; a failed save is said beside the control;
+  both reach `keeper.log`.
+- **Slash commands.** Typing `/` at the start of the composer opens a menu above it (Story
+  100.5): every row is a command this room offers, with its other spellings, a sentence and the
+  argument it takes. It filters as you type; ↑/↓ move, Enter or Tab completes the name and a
+  second Enter runs it (once anything follows the name, Enter runs the line as typed), Escape
+  closes it until the word after the slash changes, and `//` sends a literal slash. In your
+  agent's DM the menu offers `/new [title]` (the dock's *New conversation*), `/model [bot]
+  [level]` and `/help`; in a conversation or a session you watch, `/help` alone. `/model` alone
+  says which bot and reasoning level the agent runs on; `/model Opus high`, `/model Qwen` (the
+  level kept) or `/model low` (the bot kept; `default` is the provider's own level) saves them
+  exactly as Settings › Agents does — the same two keys of its `agent.toml`, refused the same
+  way — and its next turn runs on them. Only a device that has the agent's home can write it:
+  elsewhere `/model` is listed with that reason and refused. Stop and pause, a scope and an
+  approval are not commands: an approval is decided on its card, never by a typed line.
+  In any other room the menu offers `/me`, `/shrug`, `/plain`, `/topic`, `/invite` and `/leave`
+  (which asks before leaving); `/topic` and `/invite` are listed with the reason when your power
+  level does not allow them, and `/me` is refused while a reply is pending, because an action is
+  its own message. A command keeper does not know is refused where you typed it and never sent as
+  text. What a `/` line means is decided in Rust (`keeper_core::chat::commands`); the menu is
+  off while you edit a message (its text is the message's body) or while attachments wait (the
+  text is their caption). The ⌘9 bot composer draws its own commands with the same menu.
+  A line runs once however often Enter is pressed while keeper is still asking what it means,
+  and whatever you type meanwhile stays in the field — and stays your saved draft, on this
+  device and the others. A line is sent where you submitted it: starting an edit or a reply
+  while keeper reads it does not turn it into that edit or reply, and if the reply it was
+  submitted under is cancelled, nothing is sent and the field says so. A one-line command longer than 512 bytes is
+  refused, not sent as a message (start it with `//` to send it as text). Undoing a held `/me`,
+  `//etc` or any other line puts back exactly what you typed. `/leave` asks about the room you
+  typed it in; switching rooms withdraws the question. If keeper cannot look the commands up,
+  one line under the field says so and the line is not sent.
 
 ## Nixi beside your notes
 

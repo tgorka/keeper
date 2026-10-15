@@ -50,6 +50,7 @@ import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { TextFileViewer } from "@/components/viewers/text-file-viewer";
 import { TextEditorSurface } from "@/components/viewers/text-viewer";
+import { logFailure } from "@/lib/failure";
 import {
   dictionaryAcceptSuggestion,
   listenTranscriptWritten,
@@ -410,6 +411,7 @@ export function TranscriptViewer({
         if (generation.current === mine && next.path === path) setVm(next);
       })
       .catch((cause: unknown) => {
+        logFailure("transcript.read")(cause);
         if (generation.current !== mine) return;
         if (unreadable.current) unreadable.current();
         else setError(syncErrorMessage(cause));
@@ -434,6 +436,7 @@ export function TranscriptViewer({
         if (live) setFetchedMedia(next);
       })
       .catch((cause: unknown) => {
+        logFailure("transcript.media")(cause);
         if (live) setMediaError(syncErrorMessage(cause));
       });
     return () => {
@@ -453,13 +456,14 @@ export function TranscriptViewer({
         .then((next) => {
           if (generation.current === mine && next.path === path) setVm(next);
         })
-        .catch(() => {});
+        // The lines on screen stand until the next write is read.
+        .catch(logFailure("transcript.reread"));
     })
       .then((stop) => {
         if (live) unlisten = stop;
         else stop();
       })
-      .catch(() => {});
+      .catch(logFailure("transcript.listenWritten"));
     return () => {
       live = false;
       unlisten?.();
@@ -479,6 +483,7 @@ export function TranscriptViewer({
           people: { ...s.people, [bank.profileId]: next.people },
         }));
     } catch (cause) {
+      logFailure("transcript.edit")(cause);
       if (mine === generation.current) setError(syncErrorMessage(cause));
     } finally {
       if (mine === generation.current) setBusy(false);

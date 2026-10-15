@@ -147,6 +147,7 @@ import { useWindowedRows } from "@/components/ui/window-list";
 import { useLongPress } from "@/hooks/use-long-press";
 import { SURFACE_COLUMNS } from "@/lib/column-widths";
 import { countLabel, ITEMS } from "@/lib/count-label";
+import { logFailure, sayFailure } from "@/lib/failure";
 import { formatFileSize } from "@/lib/file-size";
 import { formatDraftAge, formatReleaseIn, formatReleaseSpoken } from "@/lib/format-time";
 import type {
@@ -1295,7 +1296,8 @@ export function FilesPane() {
           setProfiles(list);
         }
       })
-      .catch(() => {
+      .catch((raw: unknown) => {
+        logFailure("files.profiles")(raw);
         // The profile list failing is the whole surface failing; an empty list
         // is the honest rendering, and the Sync pane is where that failure is
         // diagnosed. This pane does not grow a second sync-health readout.
@@ -1344,6 +1346,7 @@ export function FilesPane() {
         });
       })
       .catch((error: unknown) => {
+        logFailure("files.browse")(error);
         // The message is composed in Rust to be shown verbatim — it names the
         // folder and the next step — so it is rendered rather than replaced.
         setFailures((prev) =>
@@ -1435,19 +1438,19 @@ export function FilesPane() {
         answered.current = true;
         setProfiles(list);
       })
-      .catch(() => undefined);
+      .catch(logFailure("files.refreshProfiles"));
     for (const key of expanded) {
       load(nodeKeyProfile(key), nodeKeySubpath(key));
     }
   }, [expanded, load]);
 
   const copyPath = useCallback((absolutePath: string) => {
-    // Best effort, and deliberately so: a clipboard the browser refuses is not
-    // a reason to show an error, and the path is on screen either way.
+    // The path is on screen either way, but a copy that did not happen is said,
+    // so nobody pastes something else believing it went.
     void navigator.clipboard
       ?.writeText(absolutePath)
       .then(() => setCopied(absolutePath))
-      .catch(() => undefined);
+      .catch(sayFailure("files.copyPath", "keeper couldn't copy the path."));
   }, []);
 
   /**
@@ -1516,6 +1519,7 @@ export function FilesPane() {
             load(node.profileId, nodeKeySubpath(node.parentKey ?? nodeKey(node.profileId, ""))),
           )
           .catch((error: unknown) => {
+            logFailure("files.rowVerb")(error);
             const sentence = isIpcError(error) ? error.message : String(error);
             setWriteError((standing) => (standing === null ? sentence : `${standing} ${sentence}`));
           })
@@ -2000,6 +2004,7 @@ export function FilesPane() {
     )
       .then((plan) => setPending({ profileId, parents, plan }))
       .catch((error: unknown) => {
+        logFailure("files.deletePlan")(error);
         setWriteError(isIpcError(error) ? error.message : String(error));
       });
   }, []);
@@ -2036,6 +2041,7 @@ export function FilesPane() {
         }
       })
       .catch((error: unknown) => {
+        logFailure("files.delete")(error);
         setWriteError(isIpcError(error) ? error.message : String(error));
       });
   }, [load, pending]);
@@ -2052,6 +2058,7 @@ export function FilesPane() {
           load(profileId, subpath);
         })
         .catch((error: unknown) => {
+          logFailure("files.create")(error);
           // The row stays open with what was typed still in it: a refused name
           // is a name to edit, and clearing the field would make the user
           // retype the part that was fine.
@@ -2567,7 +2574,9 @@ export function FilesPane() {
                     label: FILES_OPEN_LABEL,
                     icon: ExternalLink,
                     onSelect: () => {
-                      void syncOpenEntry(node.profileId, entry.relativePath).catch(() => undefined);
+                      void syncOpenEntry(node.profileId, entry.relativePath).catch(
+                        sayFailure("files.open", "keeper couldn't open the file."),
+                      );
                     },
                   },
                 ]),
@@ -2685,7 +2694,9 @@ export function FilesPane() {
                     label: FILES_REVEAL_LABEL,
                     icon: FolderSearch,
                     onSelect: () => {
-                      void revealPath(entry.absolutePath).catch(() => undefined);
+                      void revealPath(entry.absolutePath).catch(
+                        sayFailure("files.reveal", "keeper couldn't reveal the file."),
+                      );
                     },
                   },
                 ]

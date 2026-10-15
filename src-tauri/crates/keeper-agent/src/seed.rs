@@ -293,13 +293,16 @@ pub const NO_ACCOUNT: &str =
 
 /// The folders that keep agents, with what the form starts from: the
 /// zone's `_drive.toml` when it has one, else the first signed-in account
-/// and this Mac's pin for the folder (`pins`, by profile id).
+/// and this Mac's pin for the folder (`pins`, by profile id). `bots` is the
+/// person's bots, or the sentence a person reads where they would be when
+/// they could not be read; those that run locally are offered apart, for a
+/// `local_only` folder (R405).
 pub fn offer(
     profiles: &[SyncProfile],
     pins: &BTreeMap<String, DrivePin>,
     accounts: &[String],
     login: Option<&str>,
-    bots: Vec<keeper_core::agents::seed::AgentSeedBotVm>,
+    bots: Result<Vec<keeper_core::agents::seed::AgentSeedBotVm>, String>,
 ) -> AgentSeedOfferVm {
     let first = accounts.first().cloned().unwrap_or_default();
     let folders = profiles
@@ -349,10 +352,16 @@ pub fn offer(
             })
         })
         .collect();
+    let (bots, bots_unread) = match bots {
+        Ok(bots) => (bots, None),
+        Err(sentence) => (Vec::new(), Some(sentence)),
+    };
     AgentSeedOfferVm {
         folders,
         catalogue: seed::catalogue_vm(),
+        local_bots: seed::local_choices(&bots),
         bots,
+        bots_unread,
         accounts: accounts.to_vec(),
     }
 }
@@ -404,7 +413,8 @@ pub fn desktop_choices(
         req.local_only,
         req.bot.as_deref(),
         &req.with,
-    )?;
+    )?
+    .with_models(req.effort, &req.models)?;
     let hosting = check_declared(&choices, &zone)?;
     choices.check_hosting(&hosting, pin)?;
     Ok((choices, zone))

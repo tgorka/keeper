@@ -1391,3 +1391,153 @@ async fn the_homeserver_keeps_the_pusher_keeper_registers() {
     assert_eq!(removed, Registered::Removed);
     assert_eq!(mine().await, Vec::<Value>::new());
 }
+
+/// Story 100.4 #3 (R384): the host makes the home's picture the agent's
+/// profile avatar once — not again at the next scan, after a restart or from
+/// a second host while the file is unchanged — and again when it changes; a
+/// person's device in the agent's room fetches that avatar whole, typed as
+/// the picture it is.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "live: Synapse on delectra"]
+async fn the_agents_picture_is_its_profile_avatar_once_until_the_file_changes() {
+    use keeper_core::agents::avatar::{self, AvatarPort, Candidate, Published};
+    let smoke = Smoke::setup().await;
+    let root = TempDir::new();
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let svg = |n: u8| {
+        format!("<svg xmlns=\"http://www.w3.org/2000/svg\"><!-- {stamp}-{n} --></svg>").into_bytes()
+    };
+    let picture = |bytes: Vec<u8>| {
+        avatar::scan(&[], move |file| {
+            if file == "avatar.svg" {
+                Candidate::Bytes(bytes.clone())
+            } else {
+                Candidate::Absent
+            }
+        })
+        .avatar
+        .expect("a picture")
+    };
+
+    let (nixi, person, room) = joined_pair(&smoke, SessionKind::Main, root.path()).await;
+    let first = picture(svg(1));
+    let Published::Uploaded(mxc) = avatar::publish(nixi.client(), &first)
+        .await
+        .expect("publish")
+    else {
+        panic!("a new file is uploaded");
+    };
+    let profile = nixi
+        .client()
+        .account()
+        .get_avatar_url()
+        .await
+        .expect("profile");
+    assert_eq!(profile.as_deref(), Some(&*mxc));
+
+    // The next scan, and a second host's copy, find the record: nothing is
+    // uploaded and the profile keeps its avatar.
+    assert_eq!(
+        avatar::publish(nixi.client(), &first).await,
+        Ok(Published::Unchanged)
+    );
+    let (second, _) = smoke
+        .copy(
+            &root.path().join("second"),
+            "nixi-smoke",
+            "NIXI_SMOKE_PASSWORD",
+            "nixi@second",
+        )
+        .await;
+    assert_eq!(
+        avatar::publish(second.client(), &first).await,
+        Ok(Published::Unchanged)
+    );
+    let profile = nixi
+        .client()
+        .account()
+        .get_avatar_url()
+        .await
+        .expect("profile");
+    assert_eq!(profile.as_deref(), Some(&*mxc));
+
+    // A changed file is a new avatar.
+    let changed = picture(svg(2));
+    let Published::Uploaded(newer) = avatar::publish(second.client(), &changed)
+        .await
+        .expect("publish")
+    else {
+        panic!("a changed file is uploaded");
+    };
+    assert_ne!(newer, mxc);
+
+    // The person's device reads the agent's new avatar from the room and
+    // fetches the original bytes, typed as an SVG.
+    let joined = person.client().get_room(&room).expect("the room");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        person.sync_once().await.expect("sync");
+        let held = joined
+            .get_member_no_sync(&smoke.user("nixi-smoke"))
+            .await
+            .expect("member")
+            .and_then(|member| member.avatar_url().map(ToOwned::to_owned));
+        if held.as_deref() == Some(&*newer) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the room never held the new avatar: {held:?}"
+        );
+    }
+    let fetched =
+        keeper_core::media::fetch_agent_avatar(person.client(), &joined, &smoke.user("nixi-smoke"))
+            .await
+            .expect("the avatar");
+    assert_eq!(fetched.mimetype, "image/svg+xml");
+    assert_eq!(fetched.bytes, svg(2));
+    // The person holds no agent's power: their own avatar is never served.
+    assert!(keeper_core::media::fetch_agent_avatar(
+        person.client(),
+        &joined,
+        &smoke.user("tgorka-smoke"),
+    )
+    .await
+    .is_err());
+
+    // R399 #1: a profile avatar past 256 KiB — any client may set one — is
+    // never served: the device stops reading at the bound and draws the
+    // letter.
+    let mut huge = b"\x89PNG\r\n\x1a\n".to_vec();
+    huge.resize(300 * 1024, 0);
+    let huge = AvatarPort::upload(nixi.client(), "image/png", huge)
+        .await
+        .expect("the large upload");
+    AvatarPort::set_profile(nixi.client(), &huge)
+        .await
+        .expect("the large avatar");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        person.sync_once().await.expect("sync");
+        let held = joined
+            .get_member_no_sync(&smoke.user("nixi-smoke"))
+            .await
+            .expect("member")
+            .and_then(|member| member.avatar_url().map(ToOwned::to_owned));
+        if held.as_deref() == Some(&*huge) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the room never held the large avatar: {held:?}"
+        );
+    }
+    assert!(matches!(
+        keeper_core::media::fetch_agent_avatar(person.client(), &joined, &smoke.user("nixi-smoke"))
+            .await,
+        Err(keeper_core::error::MediaError::NotFound)
+    ));
+}

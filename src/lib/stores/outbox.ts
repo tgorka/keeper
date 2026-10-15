@@ -13,6 +13,7 @@
  */
 import { useStore } from "zustand";
 import { createStore, type StoreApi } from "zustand/vanilla";
+import { logFailure } from "@/lib/failure";
 import type { HeldSendVm } from "@/lib/ipc/client";
 import { cancelHeldSend } from "@/lib/ipc/client";
 import type { ComposerState } from "@/lib/stores/composer";
@@ -119,7 +120,10 @@ export async function undoHeldSend(
   id: string,
   composer: StoreApi<ComposerState>,
 ): Promise<void> {
-  const body = await cancelHeldSend(accountId, roomId, id).catch(() => "");
+  const body = await cancelHeldSend(accountId, roomId, id).catch((raw: unknown) => {
+    logFailure("outbox.cancelHeldSend")(raw);
+    return "";
+  });
   if (body.length > 0) {
     composer.getState().restore(accountId, roomId, body);
   }

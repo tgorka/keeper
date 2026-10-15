@@ -1,4 +1,5 @@
 import { useEffect, useRef } from "react";
+import { logFailure } from "@/lib/failure";
 import type { NoteListVm } from "@/lib/ipc/client";
 import {
   notesList,
@@ -81,6 +82,7 @@ export function useNotesChanges(vaultId: string | null, ready = true): void {
           if (current()) notesListStore.getState().reset(vm);
         })
         .catch((error: unknown) => {
+          logFailure("notes.listWindow")(error);
           if (!current()) return;
           const sentence = syncErrorMessage(error, "Search could not be read. Try again.");
           if (!initial && !notesFiltersStore.getState().text.trim()) {
@@ -119,9 +121,8 @@ export function useNotesChanges(vaultId: string | null, ready = true): void {
           if (cancelled) void notesUnsubscribeChanges(subscription);
           else subscriptions.push(subscription);
         })
-        .catch(() => {
-          // Subscription failure does not discard the independently loaded query.
-        });
+        // Subscription failure does not discard the independently loaded query.
+        .catch(logFailure("notes.subscribeChanges"));
     }
     return () => {
       cancelled = true;

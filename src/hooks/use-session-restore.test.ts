@@ -4,8 +4,10 @@ import type { AccountVm } from "@/lib/ipc/client";
 
 // Mock the typed IPC wrapper so the hook never touches Tauri.
 const sessionRestore = vi.fn();
+const frontendErrorReport = vi.fn((..._args: unknown[]) => Promise.resolve());
 vi.mock("@/lib/ipc/client", () => ({
   sessionRestore: () => sessionRestore(),
+  frontendErrorReport: (...args: unknown[]) => frontendErrorReport(...args),
 }));
 
 import { useSessionRestore } from "@/hooks/use-session-restore";

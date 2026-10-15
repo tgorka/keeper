@@ -13,6 +13,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
+import { logFailure } from "@/lib/failure";
 import {
   type TelemetryConsentVm,
   type TelemetryStatusVm,
@@ -67,9 +68,8 @@ export function TelemetrySection({ open }: { open: boolean }) {
         if (alive) unlisten = dispose;
         else dispose();
       })
-      .catch(() => {
-        // Focus/periodic local reads remain the fail-closed fallback if subscription fails.
-      });
+      // Focus/periodic local reads remain the fail-closed fallback if subscription fails.
+      .catch(logFailure("telemetry.listenStatus"));
     const refresh = async () => {
       if (reading || writing.current) return;
       reading = true;
@@ -80,7 +80,8 @@ export function TelemetrySection({ open }: { open: boolean }) {
           setStatus(next);
           setError(false);
         }
-      } catch {
+      } catch (raw) {
+        logFailure("telemetry.status")(raw);
         if (alive && request === generation.current) {
           setStatus(null);
           setError(true);
@@ -113,9 +114,8 @@ export function TelemetrySection({ open }: { open: boolean }) {
       .then((config) => {
         if (!cancelled) setMessage(config.supportMessage);
       })
-      .catch(() => {
-        // Shipped fallback is no message. Never display an arbitrary IPC error.
-      });
+      // Shipped fallback is no message. Never display an arbitrary IPC error.
+      .catch(logFailure("telemetry.readRemoteConfig"));
     return () => {
       cancelled = true;
     };
@@ -132,7 +132,8 @@ export function TelemetrySection({ open }: { open: boolean }) {
       const next = await telemetryConsentSet({ ...status.consent, [key]: enabled });
       if (request === generation.current) setStatus(next);
       window.dispatchEvent(new Event("keeper-telemetry-consent-changed"));
-    } catch {
+    } catch (raw) {
+      logFailure("telemetry.consentSet")(raw);
       setError(true);
       if (request === generation.current) {
         // Never pretend a rejected write saved, especially a failed revocation.

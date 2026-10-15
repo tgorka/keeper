@@ -11,6 +11,7 @@ vi.mock("@/lib/ipc/client", () => ({
   accountSetupConfirm: vi.fn(),
   accountCancelSignIn: vi.fn(),
   openCameraSettings: vi.fn(),
+  frontendErrorReport: vi.fn(() => Promise.resolve()),
 }));
 
 import { prepareZXingModule, readBarcodes } from "zxing-wasm/reader";
@@ -161,7 +162,7 @@ describe("SetupLinkField's scan", () => {
 
   it("says how to allow a denied camera, and opens Camera settings", async () => {
     stubCamera(new DOMException("Permission denied", "NotAllowedError"));
-    // A deep link that fails is swallowed, not thrown at the person.
+    // A deep link that fails is never thrown at the person.
     vi.mocked(openCameraSettings).mockRejectedValue(new Error("no System Settings"));
     renderField();
 

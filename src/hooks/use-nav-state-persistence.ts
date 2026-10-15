@@ -15,6 +15,9 @@
  * always wins: a selection made before the read resolves (or during the detail-reopen
  * window) aborts the restore. The read is held in a ref so a StrictMode effect re-run
  * reuses the same in-flight promise instead of re-issuing (or racing) it.
+ * Whether the restore put anything on screen is published to
+ * `defaultAgentStore.navRestore`: the launch into the default agent (story 100.3)
+ * applies on the phone only when it did not.
  *
  * Report (after the restore settles): mirrors `use-active-chat-reporter`'s shape —
  * value-deduped pushes of each nav change; a Chat open ⇒ `navStateSet`, back to the
@@ -22,12 +25,14 @@
  * state (including `detailOpen: true`) before any report, so the transient
  * selected-but-detail-not-yet-reopened window never writes `detailOpen: false` back to
  * Rust — a re-jettison in that window would otherwise lose the Detail level. IPC
- * errors are swallowed (best-effort, no toast). Unmount does NOT clear the Rust state
+ * errors are logged, not said (best-effort, no toast). Unmount does NOT clear the Rust state
  * — surviving the death of this JS context is the whole point.
  */
 import { useEffect, useRef } from "react";
+import { logFailure } from "@/lib/failure";
 import { type NavState, navStateClear, navStateGet, navStateSet } from "@/lib/ipc/client";
 import { useIsReducedCapabilityPlatform } from "@/lib/stores/capabilities";
+import { defaultAgentStore } from "@/lib/stores/default-agent";
 import { detailStore } from "@/lib/stores/detail-ui";
 import { roomsStore } from "@/lib/stores/rooms";
 
@@ -88,11 +93,11 @@ export function useNavStatePersistence(): void {
       lastAccountId = accountId;
       lastRoomId = roomId;
       lastDetailOpen = detailOpen;
-      // Best-effort: swallow IPC errors (no toast).
+      // Best-effort: log IPC errors (no toast).
       if (selected === null) {
-        void navStateClear().catch(() => {});
+        void navStateClear().catch(logFailure("navState.clear"));
       } else {
-        void navStateSet(selected, detailOpen).catch(() => {});
+        void navStateSet(selected, detailOpen).catch(logFailure("navState.set"));
       }
     };
 
@@ -123,7 +128,10 @@ export function useNavStatePersistence(): void {
     };
 
     if (restoreReadRef.current === null) {
-      restoreReadRef.current = navStateGet().catch(() => null);
+      restoreReadRef.current = navStateGet().catch((error: unknown) => {
+        logFailure("navState.read")(error);
+        return null;
+      });
     }
     const read = restoreReadRef.current;
     void read.then((nav) => {
@@ -140,9 +148,19 @@ export function useNavStatePersistence(): void {
       // User navigation made before the read resolves always wins — including a
       // selection that already existed when the hook attached.
       if (nav === null || userNavigated || roomsStore.getState().selected !== null) {
+        // The launch rule (story 100.3) applies only when nothing was restored
+        // and nothing was chosen meanwhile.
+        defaultAgentStore
+          .getState()
+          .setNavRestore(
+            nav === null && !userNavigated && roomsStore.getState().selected === null
+              ? "nothing"
+              : "restored",
+          );
         finishRestore();
         return;
       }
+      defaultAgentStore.getState().setNavRestore("restored");
       // Seed the reporter baseline from the INTENDED restored state (Review R1):
       // during the detail-reopen macrotask below the stores transiently read
       // `detailOpen: false`, and reporting that would overwrite the stored `true`.

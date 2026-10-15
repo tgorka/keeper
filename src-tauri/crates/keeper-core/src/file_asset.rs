@@ -182,6 +182,37 @@ fn decode(segment: &str) -> Option<String> {
         .map(std::borrow::Cow::into_owned)
 }
 
+/// RFC 3986's unreserved set kept, everything else escaped: the TypeScript
+/// composer's `segment` (`encodeURIComponent` with `!'()*` escaped too).
+const SEGMENT: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~');
+
+/// The `keeper-file://` URL for `rel` inside the profile `profile_id`, in
+/// `form` — what `fileAssetUrl` in `src/lib/viewers/file-asset-url.ts`
+/// composes, for a URL Rust hands the webview whole (an agent's picture,
+/// story 100.4). Segment by segment, a `.`/`..` segment escaped whole rather
+/// than dropped; pinned to the TypeScript composer by the shared vector
+/// table. Checks nothing: the handler that serves the URL refuses.
+pub fn file_url_in(form: crate::asset_url::UrlForm, profile_id: &str, rel: &str) -> String {
+    let segment = |part: &str| -> String {
+        if part == "." || part == ".." {
+            part.replace('.', "%2E")
+        } else {
+            percent_encoding::utf8_percent_encode(part, SEGMENT).to_string()
+        }
+    };
+    let path: Vec<String> = rel.split('/').map(segment).collect();
+    let rest = format!(
+        "{}/{}",
+        percent_encoding::utf8_percent_encode(profile_id, SEGMENT),
+        path.join("/")
+    );
+    crate::asset_url::compose(form, SCHEME, &rest)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,6 +259,26 @@ mod tests {
                     "{url} did not take apart into its two halves",
                 );
             }
+        }
+    }
+
+    #[test]
+    fn the_rust_composer_writes_every_shared_vector_in_both_forms() {
+        use crate::asset_url::UrlForm;
+        let table = vectors();
+        for vector in table.ok.iter().chain(&table.refused) {
+            assert_eq!(
+                file_url_in(UrlForm::Scheme, &vector.profile_id, &vector.relative_path),
+                vector.url
+            );
+            assert_eq!(
+                file_url_in(
+                    UrlForm::Localhost,
+                    &vector.profile_id,
+                    &vector.relative_path
+                ),
+                vector.localhost_url
+            );
         }
     }
 

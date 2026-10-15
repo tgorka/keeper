@@ -16,6 +16,7 @@ use toml::{Table, Value};
 
 use super::drive::DriveDecl;
 use super::label::Readers;
+use crate::bots::chat::{effort_refusal, Effort};
 use crate::bots::{parse_base_url, ProviderKind};
 
 /// The file's name inside a home.
@@ -217,6 +218,16 @@ impl BotRef {
             target: target.to_owned(),
         })
     }
+
+    /// `bot:{kind}:{base}#{target}`, normalised: what the file says, read.
+    pub fn reference(&self) -> String {
+        format!(
+            "bot:{}:{}#{}",
+            self.kind.as_registry_str(),
+            self.base,
+            self.target
+        )
+    }
 }
 
 /// One `[[menu]]` item: BMAD's `[[agent.menu]]` shape (§10.1).
@@ -324,6 +335,9 @@ pub struct AgentConfig {
     /// The person a proxy is the door for; `None` for every other kind.
     pub human: Option<OwnedUserId>,
     pub bot: BotRef,
+    /// `[model].effort`: the reasoning level sent with every turn, `None`
+    /// for the provider's own default (R382).
+    pub effort: Option<Effort>,
     /// Effective: `true` when the file says so or the drive is `local_only`.
     pub local_only: bool,
     pub allow: Vec<String>,
@@ -405,7 +419,7 @@ const ROOT_KEYS: &[&str] = &[
     "memory",
     "gate",
 ];
-const MODEL_KEYS: &[&str] = &["bot", "local_only"];
+const MODEL_KEYS: &[&str] = &["bot", "effort", "local_only"];
 const TOOLS_KEYS: &[&str] = &["allow", "drives", "mcp", "skills"];
 const MENU_KEYS: &[&str] = &["code", "description", "workflow", "prompt"];
 const HOST_KEYS: &[&str] = &["needs", "pin", "prefer_always_on"];
@@ -686,6 +700,7 @@ pub fn parse_agent_toml(
         };
         return Err(model.invalid("bot", not_local_bot(&why, bot.kind)));
     }
+    let effort = parse_effort(&model, bot.kind)?;
 
     let tools = root.table("tools", TOOLS_KEYS)?;
     let field = |key: &str| match &tools {
@@ -819,6 +834,7 @@ pub fn parse_agent_toml(
         matrix_user,
         human,
         bot,
+        effort,
         local_only,
         allow,
         drives,
@@ -831,6 +847,164 @@ pub fn parse_agent_toml(
         audience: drive.readers.clone(),
         gates,
     })
+}
+
+/// `[model].effort`: one of the four levels, and one `bot`'s kind is sent
+/// (R382). A level the kind would not be sent refuses the home now, rather
+/// than at a turn.
+fn parse_effort(model: &Section<'_>, kind: ProviderKind) -> Result<Option<Effort>, HomeRefusal> {
+    let Some(word) = model.str("effort")? else {
+        return Ok(None);
+    };
+    let effort = Effort::parse(word).ok_or_else(|| {
+        model.invalid(
+            "effort",
+            format!("\"{word}\" is not one of low, medium, high or xhigh"),
+        )
+    })?;
+    match effort_refusal(kind, effort) {
+        None => Ok(Some(effort)),
+        Some(reason) => Err(model.invalid("effort", reason)),
+    }
+}
+
+/// `text`, an `agent.toml`, with `[model].bot` set to `bot` and
+/// `[model].effort` to `effort` (removed when `None`), every other byte as it
+/// was — comments, key order, spacing, line endings (CRLF stays CRLF), a
+/// missing final newline and the other tables (R382, R405: the only two keys
+/// keeper writes in an existing home). The file is parsed with `toml_edit`
+/// only to find where the two values sit; the result is the original text
+/// with those spans replaced, a new `effort` line added after `bot`'s in the
+/// bot line's own ending, or `effort`'s line taken out — nothing else is
+/// serialised again. A file that is not TOML (a merge left its markers in
+/// it) or has no `[model].bot` is refused with the home's own sentence, so
+/// nothing is handed back to write over it. The result is not checked
+/// against the drive: the writer parses it as the host will before a byte
+/// lands.
+pub fn with_model(text: &str, bot: &str, effort: Option<Effort>) -> Result<String, HomeRefusal> {
+    use std::ops::Range;
+    use toml_edit::{Document, Item, Value as EditValue};
+
+    let syntax = |error: toml_edit::TomlError| HomeRefusal::Syntax(error.message().to_owned());
+    let missing = || HomeRefusal::Missing("[model].bot".to_owned());
+    // A span `toml_edit` did not record cannot be spliced: refused as
+    // unwritable rather than guessed.
+    let unplaced = || HomeRefusal::Syntax("keeper could not find [model] in this file".to_owned());
+    let quoted = |word: &str| EditValue::from(word).decorated("", "").to_string();
+    // Where the line holding byte `at` starts, and where it ends — before
+    // its `\n` or `\r\n`, or at the end of the file.
+    let line_start = |at: usize| text[..at].rfind('\n').map_or(0, |newline| newline + 1);
+    let line_end = |at: usize| match text[at..].find('\n') {
+        Some(newline) if text[..at + newline].ends_with('\r') => at + newline - 1,
+        Some(newline) => at + newline,
+        None => text.len(),
+    };
+
+    let document = Document::parse(text).map_err(syntax)?;
+    let model = document.get("model").ok_or_else(missing)?;
+    let inline = matches!(model, Item::Value(EditValue::InlineTable(_)));
+    let table = model.as_table_like().ok_or_else(missing)?;
+    let (bot_key, bot_item) = table.get_key_value("bot").ok_or_else(missing)?;
+    let bot_key = bot_key.span().ok_or_else(unplaced)?;
+    let bot_value = bot_item.span().ok_or_else(unplaced)?;
+    let present = match table.get_key_value("effort") {
+        Some((key, item)) => Some((
+            key.span().ok_or_else(unplaced)?,
+            item.span().ok_or_else(unplaced)?,
+        )),
+        None => None,
+    };
+
+    // Each edit is a byte range of the original and its replacement; they
+    // never overlap, and are applied from the end so the earlier ranges
+    // still point where they did.
+    let mut edits: Vec<(Range<usize>, String)> = vec![(bot_value.clone(), quoted(bot))];
+    match (present, effort) {
+        (Some((_, value)), Some(effort)) => edits.push((value, quoted(effort.as_str()))),
+        (None, Some(effort)) if inline => edits.push((
+            bot_value.end..bot_value.end,
+            format!(", effort = {}", quoted(effort.as_str())),
+        )),
+        (None, Some(effort)) => {
+            // A line of its own after `bot`'s, ended as `bot`'s is (the
+            // file's first ending where `bot`'s line is the last), with
+            // `bot`'s indent and dotted prefix (`model.` in `model.bot = …`).
+            let at = line_end(bot_value.end);
+            let ending = if text[at..].starts_with("\r\n") {
+                "\r\n"
+            } else if text[at..].starts_with('\n') {
+                "\n"
+            } else if text.find('\n').is_some_and(|n| text[..n].ends_with('\r')) {
+                "\r\n"
+            } else {
+                "\n"
+            };
+            let prefix = &text[line_start(bot_key.start)..bot_key.start];
+            edits.push((
+                at..at,
+                format!("{ending}{prefix}effort = {}", quoted(effort.as_str())),
+            ));
+        }
+        (Some((key, value)), None) if inline => {
+            // `, effort = "x"` or `effort = "x", `: the pair and one comma.
+            let before = text[..key.start].trim_end();
+            let after = &text[value.end..];
+            let range = if before.ends_with(',') {
+                before.len() - 1..value.end
+            } else if after.trim_start().starts_with(',') {
+                let comma = value.end + (after.len() - after.trim_start().len()) + 1;
+                let rest = &text[comma..];
+                key.start..comma + (rest.len() - rest.trim_start().len())
+            } else {
+                key.start..value.end
+            };
+            edits.push((range, String::new()));
+        }
+        (Some((key, value)), None) => {
+            // The whole line, its ending with it; on a last line with none,
+            // the ending before it instead, so the file still ends as it did.
+            let start = line_start(key.start);
+            let end = line_end(value.end);
+            let range = if end < text.len() {
+                let newline = if text[end..].starts_with("\r\n") {
+                    2
+                } else {
+                    1
+                };
+                start..end + newline
+            } else {
+                let before = &text[..start];
+                let ending = if before.ends_with("\r\n") {
+                    2
+                } else {
+                    usize::from(before.ends_with('\n'))
+                };
+                start - ending..end
+            };
+            edits.push((range, String::new()));
+        }
+        (None, None) => {}
+    }
+    edits.sort_by_key(|(range, _)| std::cmp::Reverse(range.start));
+    let mut written = text.to_owned();
+    for (range, replacement) in edits {
+        written.replace_range(range, &replacement);
+    }
+
+    // The splice is checked as a reader will read it: the two keys say what
+    // was asked, or nothing is handed back.
+    let check = Document::parse(written.as_str()).map_err(syntax)?;
+    let model = check
+        .get("model")
+        .and_then(Item::as_table_like)
+        .ok_or_else(unplaced)?;
+    let reads = |key: &str| model.get(key).and_then(Item::as_str).map(str::to_owned);
+    if reads("bot").as_deref() != Some(bot)
+        || reads("effort").as_deref() != effort.map(Effort::as_str)
+    {
+        return Err(unplaced());
+    }
+    Ok(written)
 }
 
 /// Why a bot that does not run locally is refused where `local_only` holds:
@@ -1513,6 +1687,163 @@ promote               = true
         assert!(config.local_only, "the drive makes it effective");
         let own = parse_agent_toml(&nixi(), "nixi", &tgdrive()).expect("parses");
         assert!(!own.local_only);
+    }
+
+    /// 100.2 #1, #2: `[model].effort` is one of four words, read for the
+    /// bot's kind — every level for `openai`, three for `ollama`, none for
+    /// `hermes` — and absent is the provider's own default.
+    #[test]
+    fn effort_is_one_of_four_levels_its_bots_kind_is_sent() {
+        let with = |bot: &str, effort: &str| {
+            let text = minimal("steward", "").replace(
+                "bot = \"bot:ollama:http://localhost:11434#qwen3\"\n",
+                &format!("bot = \"{bot}\"\n{effort}"),
+            );
+            parse_agent_toml(&text, "amelia", &tgdrive())
+        };
+        const OPENAI: &str = "bot:openai:https://provider.example:8452#claude-opus";
+        const OLLAMA: &str = "bot:ollama:http://localhost:11434#qwen3";
+        const HERMES: &str = "bot:hermes:http://localhost:8642#nixie";
+
+        assert_eq!(with(OPENAI, "").expect("no level").effort, None);
+        for effort in Effort::ALL {
+            let line = format!("effort = \"{}\"\n", effort.as_str());
+            assert_eq!(with(OPENAI, &line).expect("openai").effort, Some(effort));
+            let hermes = sentence(with(HERMES, &line));
+            assert!(hermes.contains("model.effort"), "{hermes}");
+            assert!(
+                hermes.contains("keeper sends hermes bots no reasoning level"),
+                "{hermes}"
+            );
+        }
+        assert_eq!(
+            with(OLLAMA, "effort = \"high\"\n")
+                .expect("ollama high")
+                .effort,
+            Some(Effort::High)
+        );
+        let xhigh = sentence(with(OLLAMA, "effort = \"xhigh\"\n"));
+        assert!(
+            xhigh.contains("ollama bots take low, medium or high, and xhigh is none of them"),
+            "{xhigh}"
+        );
+
+        let unknown = sentence(with(OPENAI, "effort = \"max\"\n"));
+        assert_eq!(
+            unknown,
+            "agent.toml's model.effort is refused: \"max\" is not one of low, medium, high or xhigh."
+        );
+        let wrong = sentence(with(OPENAI, "effort = 3\n"));
+        assert!(wrong.contains("model.effort must be a string"), "{wrong}");
+    }
+
+    /// 100.2 #4, R382, R405: keeper writes `[model].bot` and `[model].effort`
+    /// and nothing else — every comment, key, spacing and table stays, and
+    /// a level set and then cleared gives back the very file it started from.
+    #[test]
+    fn a_model_write_changes_two_keys_and_keeps_every_other_byte() {
+        const BEFORE: &str = "# Nixi's file, hand-written.\nversion = 1\nid = \"nixi\"\n\n[model]\n# which bot\nbot        = \"bot:ollama:http://localhost:11434#qwen3\" # local first\nlocal_only = false\n\n[tools]\ndrives = [\"tgdrive\"]  # mine\n";
+        const OPUS: &str = "bot:openai:https://provider.example:8452#claude-opus";
+
+        let set = with_model(BEFORE, OPUS, Some(Effort::Xhigh)).expect("written");
+        assert_eq!(
+            set,
+            "# Nixi's file, hand-written.\nversion = 1\nid = \"nixi\"\n\n[model]\n# which bot\nbot        = \"bot:openai:https://provider.example:8452#claude-opus\" # local first\neffort = \"xhigh\"\nlocal_only = false\n\n[tools]\ndrives = [\"tgdrive\"]  # mine\n"
+        );
+        // A level changed in place; then cleared, which removes its line.
+        let lower = with_model(&set, OPUS, Some(Effort::High)).expect("written");
+        assert_eq!(lower, set.replace("\"xhigh\"", "\"high\""));
+        let cleared =
+            with_model(&lower, "bot:ollama:http://localhost:11434#qwen3", None).expect("written");
+        assert_eq!(cleared, BEFORE);
+
+        let merge = format!("{BEFORE}<<<<<<< ours\nbot = \"x\"\n=======\n");
+        assert!(matches!(
+            with_model(&merge, OPUS, None),
+            Err(HomeRefusal::Syntax(_))
+        ));
+        assert_eq!(
+            with_model("version = 1\n\n[tools]\ndrives = []\n", OPUS, None),
+            Err(HomeRefusal::Missing("[model].bot".to_owned()))
+        );
+    }
+
+    /// R405: line endings are bytes too. A CRLF file stays CRLF — the new
+    /// `effort` line included — a file with no final newline still has
+    /// none, a mixed file keeps each line's own ending, and the comment
+    /// beside a removed level goes with its line while the ones around it
+    /// stay. `[model]` written inline or as dotted keys is edited in place.
+    #[test]
+    fn a_model_write_keeps_line_endings_and_a_missing_final_newline() {
+        const OPUS: &str = "bot:openai:https://provider.example:8452#claude-opus";
+        const QWEN: &str = "bot:ollama:http://localhost:11434#qwen3";
+        let crlf = format!("# hand-written\r\nversion = 1\r\n\r\n[model]\r\nbot = \"{QWEN}\" # mine\r\nlocal_only = false\r\n\r\n[tools]\r\ndrives = [\"tgdrive\"]\r\n");
+        let set = with_model(&crlf, OPUS, Some(Effort::Low)).expect("written");
+        assert_eq!(
+            set,
+            crlf.replace(
+                &format!("bot = \"{QWEN}\" # mine\r\n"),
+                &format!("bot = \"{OPUS}\" # mine\r\neffort = \"low\"\r\n")
+            )
+        );
+        assert!(
+            !set.replace("\r\n", "").contains('\n'),
+            "an LF crept in: {set:?}"
+        );
+        assert_eq!(with_model(&set, QWEN, None).expect("cleared"), crlf);
+
+        // No final newline, the level on the last line: set, changed and
+        // cleared, the file still ends without one.
+        let open = format!("[tools]\r\ndrives = []\r\n\r\n[model]\r\nbot = \"{QWEN}\"");
+        let set = with_model(&open, QWEN, Some(Effort::High)).expect("written");
+        assert_eq!(set, format!("{open}\r\neffort = \"high\""));
+        let lower = with_model(&set, QWEN, Some(Effort::Medium)).expect("written");
+        assert_eq!(lower, format!("{open}\r\neffort = \"medium\""));
+        assert_eq!(with_model(&lower, QWEN, None).expect("cleared"), open);
+
+        // Mixed endings; comments around a level that is removed.
+        let mixed = format!("version = 1\n\n[model]\r\nbot = \"{QWEN}\"\n# above the level\r\n  effort = \"low\"   # this level\n# below the level\nlocal_only = true\r\n");
+        assert_eq!(
+            with_model(&mixed, OPUS, None).expect("cleared"),
+            format!("version = 1\n\n[model]\r\nbot = \"{OPUS}\"\n# above the level\r\n# below the level\nlocal_only = true\r\n")
+        );
+        assert_eq!(
+            with_model(&mixed, QWEN, Some(Effort::High)).expect("changed"),
+            mixed.replace("\"low\"   #", "\"high\"   #")
+        );
+
+        // A new level line ends as `bot`'s line does, not as the file's first.
+        let crlf_bot = format!("version = 1\n[model]\r\nbot = \"{QWEN}\"\r\nlocal_only = true\n");
+        assert_eq!(
+            with_model(&crlf_bot, QWEN, Some(Effort::Low)).expect("added"),
+            crlf_bot.replace(
+                &format!("{QWEN}\"\r\n"),
+                &format!("{QWEN}\"\r\neffort = \"low\"\r\n")
+            )
+        );
+
+        let inline =
+            format!("version = 1\r\nmodel = {{ bot = \"{QWEN}\", local_only = true }}\r\n");
+        let set = with_model(&inline, QWEN, Some(Effort::Low)).expect("inline");
+        assert_eq!(
+            set,
+            format!("version = 1\r\nmodel = {{ bot = \"{QWEN}\", effort = \"low\", local_only = true }}\r\n")
+        );
+        assert_eq!(
+            with_model(&set, QWEN, None).expect("inline cleared"),
+            inline
+        );
+
+        let dotted = format!("version = 1\nmodel.bot = \"{QWEN}\"\nmodel.local_only = true\n");
+        let set = with_model(&dotted, OPUS, Some(Effort::Xhigh)).expect("dotted");
+        assert_eq!(
+            set,
+            format!("version = 1\nmodel.bot = \"{OPUS}\"\nmodel.effort = \"xhigh\"\nmodel.local_only = true\n")
+        );
+        assert_eq!(
+            with_model(&set, QWEN, None).expect("dotted cleared"),
+            dotted
+        );
     }
 
     #[test]

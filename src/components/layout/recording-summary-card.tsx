@@ -45,6 +45,7 @@ import { RecordingNoteStub } from "@/components/recording/recording-note-stub";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
+import { logFailure } from "@/lib/failure";
 import type { RecordingSessionMetaVm, RecordingSummaryVm } from "@/lib/ipc/client";
 import {
   recordingMetaUpdate,
@@ -381,7 +382,8 @@ export function RecordingSummaryCard({
         seededWith.current = { ...loaded, title: seededWith.current.title };
         setStored(meta);
       })
-      .catch(() => {
+      .catch((raw: unknown) => {
+        logFailure("recording.sessionMeta")(raw);
         setDetailsUnavailable(true);
       });
   }, []);
@@ -460,6 +462,7 @@ export function RecordingSummaryCard({
       }
       setEditing(false);
     } catch (raw) {
+      logFailure("recording.retitle")(raw);
       // `syncErrorMessage`, never `String(raw)`: an IPC rejection is a
       // `{ code, message }` object, and stringifying one prints
       // "[object Object]" exactly where the Rust-authored reason belongs. The

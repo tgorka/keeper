@@ -30,6 +30,7 @@ import {
   Waiting,
 } from "@/components/account/account-setup-sheet";
 import { Button } from "@/components/ui/button";
+import { logFailure, sayFailure } from "@/lib/failure";
 import { openCameraSettings } from "@/lib/ipc/client";
 import { cn } from "@/lib/utils";
 
@@ -157,7 +158,14 @@ export function SetupCodeScanner({
           return;
         }
       }
-      timer = window.setTimeout(() => void tick().catch(() => fail("failed")), FRAME_INTERVAL_MS);
+      timer = window.setTimeout(
+        () =>
+          void tick().catch((raw: unknown) => {
+            logFailure("setup.scanFrame")(raw);
+            fail("failed");
+          }),
+        FRAME_INTERVAL_MS,
+      );
     };
 
     void navigator.mediaDevices
@@ -193,7 +201,10 @@ export function SetupCodeScanner({
         // never worded as one.
         (raw: unknown) => fail(failureOf(raw)),
       )
-      .catch(() => fail("failed"));
+      .catch((raw: unknown) => {
+        logFailure("setup.camera")(raw);
+        fail("failed");
+      });
 
     return () => {
       document.removeEventListener("visibilitychange", onVisibility);
@@ -225,7 +236,11 @@ export function SetupCodeScanner({
           <Button
             type="button"
             variant="outline"
-            onClick={() => void openCameraSettings().catch(() => {})}
+            onClick={() =>
+              void openCameraSettings().catch(
+                sayFailure("setup.openCameraSettings", "keeper couldn't open camera settings."),
+              )
+            }
           >
             {SCAN_OPEN_CAMERA_SETTINGS_LABEL}
           </Button>

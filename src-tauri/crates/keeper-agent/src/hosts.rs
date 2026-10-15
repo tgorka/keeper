@@ -775,6 +775,21 @@ pub struct HostRuntime {
     /// The MCP servers this host names: each is `mcp:<name>` in the
     /// manifest only while it answered its last `tools/list` (96.2 #3).
     mcp: Option<McpOffer>,
+    /// Its agents' pictures' failed publications, as its manifest says
+    /// them and as other hosts' manifests do (story 100.4, R399).
+    pictures: Option<PictureReport>,
+}
+
+/// A host's failed publications of its agents' pictures as its manifest
+/// carries them, and those the other live hosts' manifests carry.
+struct PictureReport {
+    failures: crate::avatar::Failures,
+    /// What the manifest the homeserver took last said; `None` while that
+    /// is unknown, so the next tick publishes.
+    published: Option<BTreeMap<String, String>>,
+    /// Each other live host's failure, by agent, as its manifest said at
+    /// the last tick.
+    elsewhere: Vec<(OwnedUserId, keeper_core::agents::avatar::PublishFailure)>,
 }
 
 /// A host's MCP servers as its manifest offers them: the refresh running
@@ -947,6 +962,7 @@ impl HostRuntime {
             harvesters: HashMap::new(),
             stewards: Stewarding::default(),
             mcp: None,
+            pictures: None,
         }
     }
 
@@ -992,6 +1008,7 @@ impl HostRuntime {
             harvesters: HashMap::new(),
             stewards: Stewarding::default(),
             mcp: None,
+            pictures: None,
         }
     }
 
@@ -1030,6 +1047,39 @@ impl HostRuntime {
         }
         offer.offering = offer.servers.answering();
         offer.published.as_ref() != Some(&offer.offering)
+    }
+
+    /// Carry `failures` — why this host's publications of its agents'
+    /// pictures failed — in its manifest, published again as soon as they
+    /// change, and read the other hosts' (story 100.4, R399).
+    pub(crate) fn with_pictures(mut self, failures: crate::avatar::Failures) -> HostRuntime {
+        self.pictures = Some(PictureReport {
+            failures,
+            published: None,
+            elsewhere: Vec::new(),
+        });
+        self
+    }
+
+    /// What this host's picture publications need of its claims: `None`
+    /// until the principal's control room is known.
+    pub(crate) fn picture_round(&self) -> Option<crate::avatar::PictureRound> {
+        Some(crate::avatar::PictureRound {
+            control: self.control_room.clone()?,
+            host: self.host.clone(),
+            clock: Arc::clone(&self.clock),
+            rtt: Arc::clone(&self.rtt),
+        })
+    }
+
+    /// Each other live host's failed publication of an agent's picture, as
+    /// its manifest said at the last tick.
+    pub(crate) fn pictures_elsewhere(
+        &self,
+    ) -> &[(OwnedUserId, keeper_core::agents::avatar::PublishFailure)] {
+        self.pictures
+            .as_ref()
+            .map_or(&[], |report| report.elsewhere.as_slice())
     }
 
     /// The principal's control room, once known.
@@ -1168,6 +1218,11 @@ impl HostRuntime {
             } else {
                 server_now
             }),
+            picture_failures: self
+                .pictures
+                .as_ref()
+                .map(|report| crate::avatar::reported(&report.failures))
+                .unwrap_or_default(),
         }
     }
 
@@ -1225,6 +1280,32 @@ impl HostRuntime {
         hosts
     }
 
+    /// Keep what the other live hosts' manifests in `hosts` say of their
+    /// failed picture publications (R399): what this device's Settings ›
+    /// Agents rows say beside its own.
+    fn read_pictures(&mut self, hosts: &[HostManifest]) {
+        let server_now = self.clock.now();
+        let me = self.host.as_str();
+        let Some(report) = &mut self.pictures else {
+            return;
+        };
+        report.elsewhere = hosts
+            .iter()
+            .filter(|host| host.host != me && host.is_live(server_now))
+            .flat_map(|host| {
+                host.picture_failures.iter().filter_map(|(user, error)| {
+                    Some((
+                        OwnedUserId::try_from(user.as_str()).ok()?,
+                        keeper_core::agents::avatar::PublishFailure {
+                            host: Some(host.host.clone()),
+                            error: error.clone(),
+                        },
+                    ))
+                })
+            })
+            .collect();
+    }
+
     /// Join the control room `agentd.toml` names with every copy invited to
     /// it: its id is the operator's, so the invite needs no other rule.
     async fn join_control_room(&self) {
@@ -1243,8 +1324,17 @@ impl HostRuntime {
         let due = self
             .manifest_sent
             .is_none_or(|at| at.elapsed() >= RENEW_EVERY);
-        // A server that came to answer, or stopped, renews it at once.
-        if self.tick_mcp(due) || due {
+        // A server that came to answer, or stopped, renews it at once; so
+        // does a picture's publication that failed or recovered.
+        let pictures = self
+            .pictures
+            .as_ref()
+            .map(|report| crate::avatar::reported(&report.failures));
+        let pictures_changed = self
+            .pictures
+            .as_ref()
+            .is_some_and(|report| report.published.as_ref() != pictures.as_ref());
+        if self.tick_mcp(due) || pictures_changed || due {
             match self.publish(true).await {
                 Ok(true) => {
                     let now = Instant::now();
@@ -1252,6 +1342,9 @@ impl HostRuntime {
                     self.first_published.get_or_insert(now);
                     if let Some(offer) = &mut self.mcp {
                         offer.published = Some(offer.offering.clone());
+                    }
+                    if let Some(report) = &mut self.pictures {
+                        report.published = pictures;
                     }
                 }
                 // No copy has the control room yet: nothing was sent, so
@@ -1263,11 +1356,15 @@ impl HostRuntime {
                     if let Some(offer) = &mut self.mcp {
                         offer.published = None;
                     }
+                    if let Some(report) = &mut self.pictures {
+                        report.published = None;
+                    }
                     tracing::warn!(%error, "agents: the host manifest was not renewed");
                 }
             }
         }
         let hosts = self.manifests().await;
+        self.read_pictures(&hosts);
         let rooms: Vec<OwnedRoomId> = self.slots.keys().cloned().collect();
         for room in rooms {
             self.tick_session(&room, &hosts, stop).await;
@@ -3673,6 +3770,7 @@ mod tests {
             harvesters: HashMap::new(),
             stewards: Stewarding::default(),
             mcp: None,
+            pictures: None,
         };
         let (cancel, stop) = cancellation();
         let now = Arc::new(std::sync::atomic::AtomicI64::new(wall_ms() as i64));
@@ -4421,6 +4519,7 @@ mod tests {
             agents: Vec::new(),
             renewed_at: "2026-10-05T00:00:00Z".to_owned(),
             expires_at: "2026-10-05T00:03:00Z".to_owned(),
+            picture_failures: Default::default(),
         })
         .expect("manifest")
     }
@@ -7764,6 +7863,70 @@ mod tests {
     /// 96.1 #11: a host's manifest offers `sandbox` exactly when its probe
     /// passed, so an agent needing it waits for a host that can; an
     /// `[[mcp]]` server nobody asked yet is not offered (96.2 #3).
+    /// R399 #5: agentd's failed picture publication travels in its
+    /// manifest; a Mac's runtime keeps each other live host's — never its
+    /// own manifest's twice, never an expired host's — for the Settings ›
+    /// Agents rows, and forgets it once the manifest no longer says it.
+    #[test]
+    fn another_live_hosts_failed_picture_is_kept_for_the_rows() {
+        let nixi = OwnedUserId::try_from("@nixi:example.org").expect("user");
+        let failures = crate::avatar::Failures::default();
+        failures
+            .lock()
+            .expect("lock")
+            .insert(nixi.clone(), "the upload failed".to_owned());
+        let electra = HostRuntime::desktop(
+            HostSlug::new("electra").expect("slug"),
+            "tgorka",
+            "t",
+            &[],
+            Vec::new(),
+            false,
+        )
+        .with_pictures(failures);
+        let said = electra.manifest(electra.clock.now(), true);
+        assert_eq!(
+            said.picture_failures.get(nixi.as_str()).map(String::as_str),
+            Some("the upload failed")
+        );
+
+        let mut mac = HostRuntime::desktop(
+            HostSlug::new("hesperia").expect("slug"),
+            "tgorka",
+            "t",
+            &[],
+            Vec::new(),
+            false,
+        )
+        .with_pictures(crate::avatar::Failures::default());
+        let expired = HostManifest {
+            host: "argo".to_owned(),
+            expires_at: "2000-01-01T00:00:00Z".to_owned(),
+            ..said.clone()
+        };
+        let own = HostManifest {
+            host: "hesperia".to_owned(),
+            ..said.clone()
+        };
+        mac.read_pictures(&[said.clone(), expired, own]);
+        assert_eq!(
+            mac.pictures_elsewhere(),
+            [(
+                nixi.clone(),
+                keeper_core::agents::avatar::PublishFailure {
+                    host: Some("electra".to_owned()),
+                    error: "the upload failed".to_owned(),
+                }
+            )]
+        );
+        let recovered = HostManifest {
+            picture_failures: BTreeMap::new(),
+            ..said
+        };
+        mac.read_pictures(&[recovered]);
+        assert!(mac.pictures_elsewhere().is_empty());
+    }
+
     #[test]
     fn sandbox_capability_follows_the_probe() {
         let config = AgentdConfig::parse(

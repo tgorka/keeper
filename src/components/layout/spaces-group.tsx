@@ -32,6 +32,7 @@ import { FOLD_STRIP } from "@/components/layout/fold-strip";
 import { FoldableGroup } from "@/components/layout/sidebar-group";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { HoverHint } from "@/components/ui/tooltip";
+import { sayFailure } from "@/lib/failure";
 import type { SpaceVm } from "@/lib/ipc/client";
 import { setSpaceFilter } from "@/lib/ipc/client";
 import { spacesStore, useSpacesStore } from "@/lib/stores/spaces";
@@ -52,11 +53,15 @@ export function SpacesGroup({ collapsed = false }: { collapsed?: boolean }) {
     if (isActive) {
       // Toggle off: clear the selection and the Rust filter.
       spacesStore.getState().setActiveSpace(null);
-      void setSpaceFilter(null, null).catch(() => {});
+      void setSpaceFilter(null, null).catch(
+        sayFailure("inbox.clearSpaceFilter", "keeper couldn't clear the Space filter."),
+      );
     } else {
       const selection = { accountId: space.accountId, spaceId: space.spaceId };
       spacesStore.getState().setActiveSpace(selection);
-      void setSpaceFilter(space.accountId, space.spaceId).catch(() => {});
+      void setSpaceFilter(space.accountId, space.spaceId).catch(
+        sayFailure("inbox.setSpaceFilter", "keeper couldn't filter by the Space."),
+      );
     }
   };
 

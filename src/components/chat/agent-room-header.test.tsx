@@ -1,7 +1,29 @@
-import { render, screen, within } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
-import { AgentRoomHeader, GATE_ANYONE } from "@/components/chat/agent-room-header";
-import type { AgentRoomHeaderVm, AgentStatusVm } from "@/lib/ipc/client";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import type {
+  AgentRoomHeaderVm,
+  AgentStatusVm,
+  AgentsLaunchVm,
+  InboxRoomVm,
+} from "@/lib/ipc/client";
+
+vi.mock("@/lib/ipc/client", () => ({
+  agentsDefaultGet: vi.fn(() => new Promise(() => {})),
+  agentsDefaultSet: vi.fn(),
+  frontendErrorReport: vi.fn(() => Promise.resolve()),
+}));
+vi.mock("sonner", () => ({ toast: Object.assign(vi.fn(), { error: vi.fn() }) }));
+
+import { toast } from "sonner";
+import {
+  AgentRoomHeader,
+  CLEAR_DEFAULT_LABEL,
+  GATE_ANYONE,
+  MAKE_DEFAULT_LABEL,
+} from "@/components/chat/agent-room-header";
+import { agentsDefaultGet, agentsDefaultSet } from "@/lib/ipc/client";
+import { agentRoomsStore } from "@/lib/stores/agent-rooms";
+import { defaultAgentStore, readFailedSentence } from "@/lib/stores/default-agent";
 
 function status(overrides: Partial<AgentStatusVm> = {}): AgentStatusVm {
   return {
@@ -145,6 +167,41 @@ describe("AgentRoomHeader", () => {
     expect(cell).toHaveTextContent(/^🜂$/);
   });
 
+  it("names the agent's model and level where its home is on this device, and nothing elsewhere", () => {
+    const { rerender } = render(
+      <AgentRoomHeader
+        header={header({ status: status({ model: { bot: "Opus", effort: "xhigh" } }) })}
+      />,
+    );
+    expect(screen.getByTestId("agent-model")).toHaveTextContent(/^model: Opus · xhigh$/);
+    rerender(
+      <AgentRoomHeader
+        header={header({ status: status({ model: { bot: "GPT Astra", effort: null } }) })}
+      />,
+    );
+    expect(screen.getByTestId("agent-model")).toHaveTextContent(/^model: GPT Astra$/);
+    // The phone: no home, no line.
+    rerender(<AgentRoomHeader header={header()} />);
+    expect(screen.queryByTestId("agent-model")).not.toBeInTheDocument();
+  });
+
+  // Story 100.4 #2/#4: the agent's picture in the identity cell, an `<img>`
+  // (never inlined markup), with the letter back when it does not load.
+  it("draws the agent's picture in the cell and the letter when it does not load", () => {
+    const avatar = "keeper-file://p1/80-agents/tola/avatar.svg?v=0123456789ab";
+    const { container } = render(
+      <AgentRoomHeader header={header({ status: status({ handle: "tola@electra", avatar }) })} />,
+    );
+    const cell = container.querySelector('[data-slot="bot-identity"]');
+    const picture = cell?.querySelector("img");
+    expect(picture).toHaveAttribute("src", avatar);
+    expect(cell?.querySelector("svg image, foreignObject")).toBeNull();
+    expect(cell).not.toHaveTextContent("T");
+    fireEvent.error(picture as HTMLImageElement);
+    expect(cell?.querySelector("img")).toBeNull();
+    expect(cell).toHaveTextContent(/^T$/);
+  });
+
   it("says no status has arrived when the agent has sent none", () => {
     render(<AgentRoomHeader header={header({ status: null })} />);
     expect(within(region()).getByText("No status from the agent yet.")).toBeInTheDocument();
@@ -205,5 +262,145 @@ describe("AgentRoomHeader — a gate room (UX-DR147)", () => {
     );
     expect(within(region()).getByTestId("agent-label")).toHaveTextContent("anyone · owner");
     expect(within(region()).queryByTestId("agent-gate")).toBeNull();
+  });
+});
+
+describe("AgentRoomHeader's default-agent menu", () => {
+  const NIXI = "@nixi:example.org";
+  function launch(overrides: Partial<AgentsLaunchVm> = {}): AgentsLaunchVm {
+    return {
+      view: "agents",
+      room: null,
+      defaultAgent: null,
+      reason: null,
+      announce: false,
+      choices: [{ agent: NIXI, name: "Nixi" }],
+      fileSet: null,
+      ...overrides,
+    };
+  }
+  function agentRoom(roomId: string): InboxRoomVm {
+    return {
+      accountId: "acctA",
+      hueIndex: 0,
+      roomId,
+      displayName: roomId,
+      lastMessage: null,
+      timestamp: null,
+      avatarUrl: null,
+      isUnread: false,
+      mentionCount: 0,
+      isArchived: false,
+      isPinned: false,
+      isFavourite: false,
+      network: null,
+      networkId: null,
+      muteState: "none",
+    };
+  }
+  async function openMenu() {
+    const trigger = screen.getByRole("button", { name: "Agent menu" });
+    fireEvent.pointerDown(trigger, { button: 0, ctrlKey: false });
+    fireEvent.pointerUp(trigger, { button: 0 });
+    return await screen.findByRole("menu");
+  }
+
+  beforeEach(() => {
+    vi.mocked(agentsDefaultSet).mockReset();
+    // A read that never answers unless a test says otherwise.
+    vi.mocked(agentsDefaultGet).mockReset();
+    vi.mocked(agentsDefaultGet).mockReturnValue(new Promise(() => {}));
+    vi.mocked(toast).mockClear();
+    vi.mocked(toast.error).mockClear();
+    agentRoomsStore.getState().clear();
+    defaultAgentStore.setState({
+      vm: null,
+      readError: null,
+      saveError: null,
+      saving: false,
+      navRestore: "pending",
+    });
+  });
+
+  it("offers the action once Rust's choices gain the agent, when the Agents window's rooms change", async () => {
+    // The launch's answer came before Nixi's conversation was readable.
+    defaultAgentStore.setState({ vm: launch({ choices: [] }) });
+    vi.mocked(agentsDefaultGet)
+      .mockResolvedValueOnce(launch({ choices: [] }))
+      .mockResolvedValueOnce(launch());
+    render(<AgentRoomHeader header={header()} />);
+    await waitFor(() => expect(agentsDefaultGet).toHaveBeenCalledTimes(1));
+    expect(screen.queryByRole("button", { name: "Agent menu" })).not.toBeInTheDocument();
+    act(() => {
+      agentRoomsStore
+        .getState()
+        .applyBatch({ ops: [{ op: "reset", rooms: [agentRoom("!nixi-dm:x")] }], total: 1 });
+    });
+    expect(await screen.findByRole("button", { name: "Agent menu" })).toBeInTheDocument();
+    expect(agentsDefaultGet).toHaveBeenCalledTimes(2);
+  });
+
+  it("says a file decides the default and never announces an agent that will not open", async () => {
+    const fileSet =
+      "/etc/keeper.toml (user) sets agents.default to @tala:example.org, so @tala:example.org opens at launch whatever you choose here. Your choice is kept and takes effect once that file stops setting it.";
+    const shadowed = launch({ defaultAgent: "@tala:example.org", fileSet });
+    defaultAgentStore.setState({ vm: shadowed });
+    vi.mocked(agentsDefaultSet).mockResolvedValue(shadowed);
+    render(<AgentRoomHeader header={header()} />);
+    const menu = await openMenu();
+    expect(within(menu).getByText(fileSet)).toBeInTheDocument();
+    fireEvent.click(within(menu).getByRole("menuitem", { name: MAKE_DEFAULT_LABEL }));
+    await waitFor(() => expect(toast).toHaveBeenCalledWith(fileSet));
+    expect(toast).not.toHaveBeenCalledWith("Nixi opens when keeper starts.");
+  });
+
+  it("says where the menu would be that the default agent could not be read", async () => {
+    vi.mocked(agentsDefaultGet).mockReset();
+    vi.mocked(agentsDefaultGet).mockRejectedValue(new Error("no data directory here"));
+    render(<AgentRoomHeader header={header()} />);
+    expect(await within(region()).findByRole("alert")).toHaveTextContent(
+      readFailedSentence(new Error("no data directory here")),
+    );
+    expect(screen.queryByRole("button", { name: "Agent menu" })).not.toBeInTheDocument();
+  });
+
+  it("makes an agent Rust offers the default", async () => {
+    defaultAgentStore.setState({ vm: launch() });
+    vi.mocked(agentsDefaultSet).mockResolvedValue(launch({ defaultAgent: NIXI }));
+    render(<AgentRoomHeader header={header()} />);
+    const menu = await openMenu();
+    fireEvent.click(within(menu).getByRole("menuitem", { name: MAKE_DEFAULT_LABEL }));
+    await waitFor(() => expect(agentsDefaultSet).toHaveBeenCalledWith(NIXI));
+    await waitFor(() => expect(defaultAgentStore.getState().vm?.defaultAgent).toBe(NIXI));
+  });
+
+  it("stops the default agent being one", async () => {
+    defaultAgentStore.setState({ vm: launch({ defaultAgent: NIXI }) });
+    vi.mocked(agentsDefaultSet).mockResolvedValue(launch());
+    render(<AgentRoomHeader header={header()} />);
+    const menu = await openMenu();
+    fireEvent.click(within(menu).getByRole("menuitem", { name: CLEAR_DEFAULT_LABEL }));
+    await waitFor(() => expect(agentsDefaultSet).toHaveBeenCalledWith(null));
+  });
+
+  it("is not offered for an agent Rust does not list as a choice", () => {
+    defaultAgentStore.setState({ vm: launch({ choices: [] }) });
+    render(<AgentRoomHeader header={header()} />);
+    expect(screen.queryByRole("button", { name: "Agent menu" })).not.toBeInTheDocument();
+  });
+
+  it("says why a save failed", async () => {
+    defaultAgentStore.setState({ vm: launch() });
+    vi.mocked(agentsDefaultSet).mockRejectedValue({
+      message: "keeper could not save the default agent: database is locked",
+    });
+    render(<AgentRoomHeader header={header()} />);
+    const menu = await openMenu();
+    fireEvent.click(within(menu).getByRole("menuitem", { name: MAKE_DEFAULT_LABEL }));
+    await waitFor(() =>
+      expect(toast.error).toHaveBeenCalledWith(
+        "keeper could not save the default agent: database is locked",
+      ),
+    );
   });
 });

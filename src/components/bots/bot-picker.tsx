@@ -42,6 +42,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { logFailure } from "@/lib/failure";
 import type { BotModelVm, BotProviderVm, BotVm } from "@/lib/ipc/client";
 import { botsModelsList } from "@/lib/ipc/client";
 import { syncErrorMessage } from "@/lib/stores/sync";
@@ -122,6 +123,7 @@ export function BotPicker({
         }
       })
       .catch((raw: unknown) => {
+        logFailure("bots.modelsList")(raw);
         if (!cancelled) {
           // The tree's one `IpcError`-envelope reader, rather than a fourth
           // hand-rolled structural guard: Rust composes the sentence and the

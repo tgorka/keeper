@@ -40,6 +40,7 @@ use std::time::Duration;
 use keeper_core::archive::db::{insert_event, open_archive_db};
 use keeper_core::archive::{fts, ArchiveEvent};
 use keeper_core::registry::{get_setting, insert_outbox, list_outbox_rows, set_setting};
+use keeper_core::send::MessageKind;
 use rusqlite::Connection;
 
 /// The env var that switches a child entry-point test from "no-op" to "write
@@ -215,8 +216,18 @@ fn crash_child_outbox() {
     let mut i: i64 = 0;
     loop {
         let id = format!("outbox-{i}");
-        insert_outbox(&dir, &id, "acctA", "!room:example.org", "body", i, i + 1000)
-            .expect("child: insert outbox row");
+        insert_outbox(
+            &dir,
+            &id,
+            "acctA",
+            "!room:example.org",
+            "body",
+            MessageKind::Text,
+            "body",
+            i,
+            i + 1000,
+        )
+        .expect("child: insert outbox row");
         let mut lock = stdout.lock();
         let _ = writeln!(lock, "committed {id}");
         let _ = lock.flush();

@@ -19,6 +19,7 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { logFailure } from "@/lib/failure";
 import type { MediaClipVm } from "@/lib/ipc/client";
 import { syncErrorMessage } from "@/lib/stores/sync";
 import { timestamp } from "./transcript-lines";
@@ -96,6 +97,7 @@ function ClipForm({
           setRefusal(null);
         })
         .catch((cause: unknown) => {
+          logFailure("transcript.clipCompose")(cause);
           if (generation.current === mine) setRefusal(syncErrorMessage(cause));
         });
     }, CHECK_DELAY_MS);
@@ -111,7 +113,10 @@ function ClipForm({
         void navigator.clipboard
           ?.writeText(markdown)
           .then(() => setCopied(COPIED_SENTENCE))
-          .catch((cause: unknown) => setRefusal(syncErrorMessage(cause, "keeper could not copy.")));
+          .catch((cause: unknown) => {
+            logFailure("transcript.clipCopy")(cause);
+            setRefusal(syncErrorMessage(cause, "keeper could not copy."));
+          });
       }}
     >
       <div className="flex flex-wrap gap-3">

@@ -7,6 +7,7 @@ vi.mock("@/lib/ipc/client", () => ({
   notesSpaceSave: vi.fn(),
   notesTagTree: vi.fn(),
   notesTemplates: vi.fn(),
+  frontendErrorReport: vi.fn(() => Promise.resolve()),
 }));
 
 import {

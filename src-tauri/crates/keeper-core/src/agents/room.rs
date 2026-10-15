@@ -37,6 +37,7 @@ use tokio::sync::watch;
 use ts_rs::TS;
 
 use crate::agents::approval_card::{ApprovalFold, ApprovalVm, Senders, Viewer};
+use crate::agents::avatar::AvatarProblem;
 use crate::agents::delegation::{enveloped_brief, trusted_brief, DelegateContent};
 use crate::agents::events::{
     RunState, StatusContent, APPROVAL_CONSUMED, APPROVAL_DECISION, APPROVAL_REQUEST, CLAIM,
@@ -517,6 +518,21 @@ pub struct AgentStatusVm {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub icon: Option<String>,
+    /// The agent's model and level as its home's `[model]` names them,
+    /// where its agents zone is on this device (100.2 #7, R382). Absent
+    /// elsewhere: a device without the drive does not know them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub model: Option<crate::agents::model::AgentModelLineVm>,
+    /// The agent's picture as a URL the webview loads in an `<img>` (story
+    /// 100.4, R384): the home's `avatar.*` from the drive where its agents
+    /// zone is on this device, else the agent's Matrix profile avatar as
+    /// this room holds it (the original, never a thumbnail). Absent when it
+    /// has neither; the mark is drawn then, and wherever the picture fails
+    /// to load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub avatar: Option<String>,
     /// The host that wrote the status.
     pub host: Option<String>,
     /// The session's title.
@@ -752,6 +768,15 @@ impl AgentRoomState {
         matches!(&self.status, Some((_, StatusRead::Read(s))) if s.run == RunState::Running)
     }
 
+    /// The session's kind and the agent working it, from the newest
+    /// readable status: what an agent room's row is drawn by (R399).
+    pub fn seat(&self) -> Option<(SessionKind, OwnedUserId)> {
+        match &self.status {
+            Some((_, StatusRead::Read(status))) => Some((status.kind, status.agent.clone())),
+            _ => None,
+        }
+    }
+
     /// The agent the newest readable status names.
     pub fn agent(&self) -> Option<&UserId> {
         match &self.status {
@@ -818,20 +843,22 @@ impl AgentRoomState {
     }
 
     /// The header, naming users as `name` does, marking the agent with its
-    /// soul's icon from `icons`, drawing the caret on `newest_turn` while the
-    /// run is `running`, and, in a gate room, naming `peer` — the outside
-    /// system's account as the gate's words show it ([`GateView::peer`]).
+    /// soul's icon from `icons` and its picture from `picture`, drawing the
+    /// caret on `newest_turn` while the run is `running`, and, in a gate
+    /// room, naming `peer` — the outside system's account as the gate's
+    /// words show it ([`GateView::peer`]).
     pub fn header(
         &self,
         name: &dyn Fn(&UserId) -> String,
         icons: &AgentIcons,
+        picture: &dyn Fn(&UserId) -> Option<String>,
         newest_turn: Option<&str>,
         peer: Option<&UserId>,
     ) -> AgentRoomHeaderVm {
         let status = self
             .status
             .as_ref()
-            .map(|(_, read)| status_vm(read, name, icons));
+            .map(|(_, read)| status_vm(read, name, icons, picture));
         let (scope, label, scope_unreadable) = match &self.scope {
             Some((_, ScopeRead::Read { drives, label })) => (
                 Some(drives.clone()),
@@ -871,6 +898,7 @@ fn status_vm(
     read: &StatusRead,
     name: &dyn Fn(&UserId) -> String,
     icons: &AgentIcons,
+    picture: &dyn Fn(&UserId) -> Option<String>,
 ) -> AgentStatusVm {
     match read {
         StatusRead::Read(status) => AgentStatusVm {
@@ -878,6 +906,8 @@ fn status_vm(
             agent_name: name(&status.agent),
             handle: handle(&status.agent, Some(&status.host)),
             icon: icons.get(&status.agent),
+            model: icons.model(&status.agent),
+            avatar: picture(&status.agent),
             host: Some(status.host.clone()),
             title: Some(status.title.clone()),
             kind: Some(status.kind),
@@ -898,6 +928,8 @@ fn status_vm(
             agent_name: name(agent),
             handle: handle(agent, host.as_deref()),
             icon: icons.get(agent),
+            model: icons.model(agent),
+            avatar: picture(agent),
             host: host.clone(),
             title: title.clone(),
             kind: None,
@@ -909,15 +941,19 @@ fn status_vm(
     }
 }
 
-/// The agents whose agents zones are on this device, by Matrix user, and
-/// the soul's mark of each that has one: the desktop's host replaces them
-/// on each scan; on the phone they stay empty. An agent here is one this
-/// device knows (R114).
+/// The agents whose agents zones are on this device, by Matrix user, the
+/// soul's mark of each that has one and the picture of each whose home holds
+/// one (story 100.4): the desktop's host replaces them on each scan; on the
+/// phone they stay empty. An agent here is one this device knows (R114).
 #[derive(Debug, Default)]
 pub struct AgentIcons {
     zone: RwLock<Zone>,
-    /// Bumped when the agents or their marks change, so an open room's
-    /// header and briefs redraw without waiting for its next event.
+    /// Each agent's model line, replaced on each scan beside the marks
+    /// (100.2 #7).
+    models: RwLock<BTreeMap<OwnedUserId, crate::agents::model::AgentModelLineVm>>,
+    /// Bumped when the agents, their marks, their models or their pictures
+    /// change, so an open room's header and briefs redraw without waiting
+    /// for its next event.
     changes: watch::Sender<u64>,
 }
 
@@ -925,19 +961,59 @@ pub struct AgentIcons {
 struct Zone {
     agents: BTreeSet<OwnedUserId>,
     marks: BTreeMap<OwnedUserId, String>,
+    avatars: BTreeMap<OwnedUserId, ZoneAvatar>,
+    /// The agents whose home's picture is an object not on this device.
+    not_here: BTreeSet<OwnedUserId>,
+    /// What each home's scan did not use, as last warned.
+    problems: BTreeMap<OwnedUserId, Vec<AvatarProblem>>,
+}
+
+/// One agent of a zone on this device, as a scan read its home.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ZoneAgent {
+    /// Its `SOUL.md` `icon`, when the soul reads and names one.
+    pub icon: Option<String>,
+    /// Its picture, when the home holds one keeper uses.
+    pub avatar: Option<ZoneAvatar>,
+    /// The `avatar.*` files of its home keeper did not use.
+    pub problems: Vec<AvatarProblem>,
+    /// Its home's picture is a git-LFS pointer whose object is not on this
+    /// device: the letter is drawn, not the profile avatar (R414).
+    pub not_here: bool,
+}
+
+/// Where a home's picture is on this device: its sync profile, the
+/// profile-relative path the drive's resolver landed it at, and the hash of
+/// its content (story 100.4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ZoneAvatar {
+    pub profile: String,
+    pub path: String,
+    pub hash: String,
 }
 
 impl AgentIcons {
     /// Replace every agent with `agents`, each with its `SOUL.md` `icon` as
     /// read when it names one, keeping only the marks the bot identity
     /// draws: a mark it would refuse is dropped, and that agent is drawn by
-    /// its first letter.
-    pub fn replace(&self, agents: BTreeMap<OwnedUserId, Option<String>>) {
+    /// its first letter. Each file a home's scan did not use and was not
+    /// already said is a WARN line naming the agent and the file (R381).
+    pub fn replace(&self, agents: BTreeMap<OwnedUserId, ZoneAgent>) {
         let mut zone = Zone::default();
-        for (user, icon) in agents {
-            let mark = icon.and_then(|icon| parse_identity(None, None, Some(&icon)).ok()?.mark);
+        for (user, agent) in agents {
+            let mark = agent
+                .icon
+                .and_then(|icon| parse_identity(None, None, Some(&icon)).ok()?.mark);
             if let Some(mark) = mark {
                 zone.marks.insert(user.clone(), mark);
+            }
+            if let Some(avatar) = agent.avatar {
+                zone.avatars.insert(user.clone(), avatar);
+            } else if agent.not_here {
+                zone.not_here.insert(user.clone());
+            }
+            if !agent.problems.is_empty() {
+                zone.problems.insert(user.clone(), agent.problems);
             }
             zone.agents.insert(user);
         }
@@ -949,9 +1025,52 @@ impl AgentIcons {
             if *held == zone {
                 return;
             }
+            for (user, problems) in &zone.problems {
+                let said = held.problems.get(user);
+                for problem in problems {
+                    if said.is_none_or(|said| !said.contains(problem)) {
+                        tracing::warn!(
+                            agent = %user,
+                            file = problem.file(),
+                            problem = %problem.sentence(user.localpart()),
+                            "agents: a file in an agent's home is not its picture"
+                        );
+                    }
+                }
+            }
             *held = zone;
         }
         self.changes.send_modify(|n| *n = n.wrapping_add(1));
+    }
+
+    /// The URL of `user`'s picture on the drive, when its zone is on this
+    /// device and its home holds one: `keeper-file://`, with the content's
+    /// hash as a cache key, so a changed file is a new URL.
+    pub fn avatar_url(&self, user: &UserId) -> Option<String> {
+        let zone = self
+            .zone
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let avatar = zone.avatars.get(user)?;
+        Some(format!(
+            "{}?v={}",
+            crate::file_asset::file_url_in(
+                crate::asset_url::UrlForm::HOST,
+                &avatar.profile,
+                &avatar.path
+            ),
+            crate::agents::avatar::version(&avatar.hash)
+        ))
+    }
+
+    /// Whether `user`'s home on this device names a picture whose git-LFS
+    /// object is not here (R414): the letter, and no profile avatar.
+    pub fn picture_not_here(&self, user: &UserId) -> bool {
+        self.zone
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .not_here
+            .contains(user)
     }
 
     /// `user`'s mark, when its zone is on this device.
@@ -962,6 +1081,44 @@ impl AgentIcons {
             .marks
             .get(user)
             .cloned()
+    }
+
+    /// Replace every agent's model line with `models` (100.2 #7): a model a
+    /// person saved shows in the room's header from the next scan.
+    pub fn replace_models(
+        &self,
+        models: BTreeMap<OwnedUserId, crate::agents::model::AgentModelLineVm>,
+    ) {
+        {
+            let mut held = self
+                .models
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if *held == models {
+                return;
+            }
+            *held = models;
+        }
+        self.changes.send_modify(|n| *n = n.wrapping_add(1));
+    }
+
+    /// `user`'s model line, when its zone is on this device.
+    pub fn model(&self, user: &UserId) -> Option<crate::agents::model::AgentModelLineVm> {
+        self.models
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(user)
+            .cloned()
+    }
+
+    /// Whether `user`'s home is in a zone on this device (R415): where its
+    /// `agent.toml` can be read and written.
+    pub fn is_here(&self, user: &UserId) -> bool {
+        self.zone
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .agents
+            .contains(user)
     }
 
     /// The agents whose zones are on this device.
@@ -980,12 +1137,15 @@ impl AgentIcons {
     }
 }
 
-/// The session kind of every agent room an account has read a status in.
-/// A session's kind never changes, so once read it is kept for the
-/// process's life; the room list reads it here before the event cache.
+/// The session kind of every agent room an account has read a status in,
+/// and the agent working the session — the one its status names, the
+/// delegate in a delegated room rather than the agent that made the room
+/// (R399). A session's kind and agent never change, so once read they are
+/// kept for the process's life; the room list reads them here before the
+/// event cache.
 #[derive(Debug, Default)]
 pub struct AgentKinds {
-    kinds: Mutex<HashMap<OwnedRoomId, SessionKind>>,
+    kinds: Mutex<HashMap<OwnedRoomId, (SessionKind, OwnedUserId)>>,
     /// Session rooms whose history was searched back for a status and held
     /// none: not searched again in this process, since a status sent later
     /// reaches the event cache.
@@ -998,14 +1158,24 @@ impl AgentKinds {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(room)
-            .copied()
+            .map(|(kind, _)| *kind)
     }
 
-    pub fn insert(&self, room: &RoomId, kind: SessionKind) {
+    /// The agent working `room`'s session, as its status named it.
+    pub fn agent(&self, room: &RoomId) -> Option<OwnedUserId> {
         self.kinds
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(room.to_owned(), kind);
+            .get(room)
+            .map(|(_, agent)| agent.clone())
+    }
+
+    /// `room`'s session is of `kind`, worked by `agent`.
+    pub fn insert(&self, room: &RoomId, kind: SessionKind, agent: OwnedUserId) {
+        self.kinds
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(room.to_owned(), (kind, agent));
     }
 
     /// Whether `room`'s history was already searched and held no status.
@@ -1083,17 +1253,20 @@ pub async fn room_kind_vm(room: &Room, kinds: &AgentKinds) -> Option<AgentRoomKi
                 // readable one names the kind.
                 state.status = None;
                 state.apply(&value, &trusted);
-                state.kind()
+                state.seat()
             })
             .await
             .ok()
             .flatten(),
         Err(_) => None,
     };
-    if let Some(session) = session {
-        kinds.insert(room.room_id(), session);
+    if let Some((session, agent)) = &session {
+        kinds.insert(room.room_id(), *session, agent.clone());
     }
-    Some(AgentRoomKindVm::of(kind, session))
+    Some(AgentRoomKindVm::of(
+        kind,
+        session.map(|(session, _)| session),
+    ))
 }
 
 /// The agents the person's own `dev.keeper.agent.proxies` lists (R72): on
@@ -1123,6 +1296,9 @@ pub struct HeaderReader {
     trust: Trust,
     /// The display names the header resolved, until a member event.
     names: HashMap<OwnedUserId, String>,
+    /// The cache key of each named user's profile avatar as the room holds
+    /// it (`None`: none), until a member event (story 100.4).
+    pictures: HashMap<OwnedUserId, Option<String>>,
     /// The room's approval cards' requests, decisions and `consumed`, in
     /// the room's order.
     approvals: ApprovalFold,
@@ -1149,6 +1325,7 @@ impl HeaderReader {
             },
             room,
             names: HashMap::new(),
+            pictures: HashMap::new(),
             approvals: ApprovalFold::default(),
             approvals_stale: false,
             marks: RoomMarks::default(),
@@ -1223,8 +1400,8 @@ impl HeaderReader {
     }
 
     fn remember(&self, kinds: &AgentKinds) {
-        if let Some(kind) = self.state.kind() {
-            kinds.insert(self.room.room_id(), kind);
+        if let Some((kind, agent)) = self.state.seat() {
+            kinds.insert(self.room.room_id(), kind, agent);
         }
     }
 
@@ -1314,6 +1491,7 @@ impl HeaderReader {
                     // A member event may rename the agent or a reader.
                     Some("m.room.member") => {
                         self.names.clear();
+                        self.pictures.clear();
                         changed = true;
                     }
                     Some(HEARD) => changed |= self.mark(event),
@@ -1330,11 +1508,13 @@ impl HeaderReader {
     }
 
     /// The header now, with `newest_turn` as the caret's candidate, the
-    /// agent's mark from `icons` and, in a gate room, `peer` as the outside
-    /// system's account.
+    /// agent's mark from `icons`, its picture from `icons` or else its
+    /// profile avatar here (served for `account_id`), and, in a gate room,
+    /// `peer` as the outside system's account.
     pub async fn header(
         &mut self,
         icons: &AgentIcons,
+        account_id: &str,
         newest_turn: Option<&str>,
         peer: Option<&UserId>,
     ) -> AgentRoomHeaderVm {
@@ -1343,7 +1523,13 @@ impl HeaderReader {
         self.resolve(named).await;
         let names = &self.names;
         let name = |user: &UserId| names.get(user).cloned().unwrap_or_else(|| user.to_string());
-        self.state.header(&name, icons, newest_turn, peer)
+        let pictures = &self.pictures;
+        let room_id = self.room.room_id();
+        let picture = |user: &UserId| {
+            let member = pictures.get(user).and_then(Option::as_deref);
+            agent_picture(icons, account_id, room_id, user, member)
+        };
+        self.state.header(&name, icons, &picture, newest_turn, peer)
     }
 
     /// The room's approval cards as `viewer` reads them at `now`.
@@ -1368,24 +1554,90 @@ impl HeaderReader {
         &self.marks
     }
 
-    /// Resolve the display names of `users` not resolved yet.
+    /// Resolve the display names and avatars of `users` not resolved yet.
     async fn resolve(&mut self, users: Vec<OwnedUserId>) {
         for user in users {
             if self.names.contains_key(&user) {
                 continue;
             }
-            let name = self
-                .room
-                .get_member_no_sync(&user)
-                .await
-                .ok()
-                .flatten()
+            let member = self.room.get_member_no_sync(&user).await.ok().flatten();
+            let name = member
+                .as_ref()
                 .and_then(|member| member.display_name().map(str::to_owned))
                 .filter(|name| !name.trim().is_empty())
                 .unwrap_or_else(|| user.to_string());
+            let picture = member
+                .as_ref()
+                .and_then(|member| member.avatar_url())
+                .map(picture_version);
+            self.pictures.insert(user.clone(), picture);
             self.names.insert(user, name);
         }
     }
+}
+
+/// The cache key of a profile avatar: a short hash of its `mxc`, so a URL
+/// changes with the avatar and never carries the `mxc` (AD-4).
+fn picture_version(mxc: &matrix_sdk::ruma::MxcUri) -> String {
+    use sha2::{Digest, Sha256};
+    let hash = hex::encode(Sha256::digest(mxc.as_str().as_bytes()));
+    crate::agents::avatar::version(&hash).to_owned()
+}
+
+/// `agent`'s picture in `room` of `account_id` (story 100.4, R384): its
+/// home's file from the drive when its zone is on this device, else — when
+/// the room holds a profile avatar for it (`member`, that avatar's cache
+/// key) — the profile avatar, served whole over `keeper-media://`. A home
+/// here whose picture is a git-LFS object not on this device draws the
+/// letter (R399 #6, R414): the profile avatar may be an older picture.
+pub fn agent_picture(
+    icons: &AgentIcons,
+    account_id: &str,
+    room: &RoomId,
+    agent: &UserId,
+    member: Option<&str>,
+) -> Option<String> {
+    if let Some(url) = icons.avatar_url(agent) {
+        return Some(url);
+    }
+    if icons.picture_not_here(agent) {
+        return None;
+    }
+    member.map(|version| {
+        crate::media::avatar_url_in(
+            crate::asset_url::UrlForm::HOST,
+            account_id,
+            room.as_str(),
+            agent.as_str(),
+            version,
+        )
+    })
+}
+
+/// The picture on an agent room's row (story 100.4, R399): the picture of
+/// the agent working the room's session — the one its status names, as the
+/// header draws it, never the agent that made the room — as
+/// [`agent_picture`] chooses it; none (the letter) until a status is read.
+pub async fn row_picture(
+    room: &Room,
+    kinds: &AgentKinds,
+    icons: &AgentIcons,
+    account_id: &str,
+) -> Option<String> {
+    let agent = kinds.agent(room.room_id())?;
+    let member = member_picture(room, &agent).await;
+    agent_picture(icons, account_id, room.room_id(), &agent, member.as_deref())
+}
+
+/// The cache key of `user`'s profile avatar as `room` holds it, or `None`
+/// when it holds none.
+pub async fn member_picture(room: &Room, user: &UserId) -> Option<String> {
+    room.get_member_no_sync(user)
+        .await
+        .ok()
+        .flatten()?
+        .avatar_url()
+        .map(picture_version)
 }
 
 /// Whether event-cache `diffs` may change a room's approvals: anything but
@@ -1598,7 +1850,13 @@ mod tests {
             MARTA => "Marta".to_owned(),
             other => other.to_owned(),
         };
-        state.header(&name, &AgentIcons::default(), Some("turn-key"), None)
+        state.header(
+            &name,
+            &AgentIcons::default(),
+            &|_| None,
+            Some("turn-key"),
+            None,
+        )
     }
 
     /// UX-DR147: a gate room's header names the system its status titles
@@ -1619,7 +1877,9 @@ mod tests {
         assert!(state.apply(&status("$g", 10, gate), &agents));
         let icons = AgentIcons::default();
         assert_eq!(
-            state.header(&name, &icons, None, Some(&peer)).gate,
+            state
+                .header(&name, &icons, &|_| None, None, Some(&peer))
+                .gate,
             Some(GateHeaderVm {
                 system: "github".to_owned(),
                 peer: Some(peer.to_string()),
@@ -1627,13 +1887,17 @@ mod tests {
             })
         );
         let unspoken = state
-            .header(&name, &icons, None, None)
+            .header(&name, &icons, &|_| None, None, None)
             .gate
             .expect("a gate");
         assert_eq!((unspoken.peer, unspoken.peer_name), (None, None));
         let mut main = AgentRoomState::new(own());
         assert!(main.apply(&status("$m", 10, content("idle", "electra", None)), &agents));
-        assert_eq!(main.header(&name, &icons, None, Some(&peer)).gate, None);
+        assert_eq!(
+            main.header(&name, &icons, &|_| None, None, Some(&peer))
+                .gate,
+            None
+        );
     }
 
     fn status_of(state: &AgentRoomState) -> AgentStatusVm {
@@ -2385,6 +2649,166 @@ mod tests {
         assert_eq!(header.scope.map(|drives| drives.len()), Some(1));
     }
 
+    /// Each agent with its soul's icon and no picture.
+    fn marks<const N: usize>(
+        agents: [(OwnedUserId, Option<&str>); N],
+    ) -> BTreeMap<OwnedUserId, ZoneAgent> {
+        agents
+            .into_iter()
+            .map(|(user, icon)| {
+                (
+                    user,
+                    ZoneAgent {
+                        icon: icon.map(str::to_owned),
+                        ..ZoneAgent::default()
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn pictured(hash: &str) -> BTreeMap<OwnedUserId, ZoneAgent> {
+        BTreeMap::from([(
+            user(NIXI),
+            ZoneAgent {
+                icon: Some("N".to_owned()),
+                avatar: Some(ZoneAvatar {
+                    profile: "01PROFILE".to_owned(),
+                    path: "80-agents/nixi/avatar.svg".to_owned(),
+                    hash: hash.to_owned(),
+                }),
+                problems: Vec::new(),
+                not_here: false,
+            },
+        )])
+    }
+
+    /// Story 100.4 #2/#3: the home's file where the zone is on this device,
+    /// else the profile avatar the room holds, else nothing (the mark).
+    #[test]
+    fn the_picture_is_the_zones_file_else_the_rooms_profile_avatar() {
+        let icons = AgentIcons::default();
+        let room = RoomId::parse("!r:example.org").expect("room");
+        let nixi = user(NIXI);
+        assert_eq!(agent_picture(&icons, "acct", &room, &nixi, None), None);
+        let profile = agent_picture(&icons, "acct", &room, &nixi, Some("v1")).expect("profile");
+        assert_eq!(
+            crate::media::parse_avatar_url(&profile).map(|h| h.user_id),
+            Some(NIXI.to_owned())
+        );
+        icons.replace(pictured("0123456789abcdef"));
+        let file = agent_picture(&icons, "acct", &room, &nixi, Some("v1")).expect("file");
+        assert_eq!(
+            crate::file_asset::parse_file_url(&file),
+            Some((
+                "01PROFILE".to_owned(),
+                "80-agents/nixi/avatar.svg".to_owned()
+            ))
+        );
+        assert!(file.ends_with("?v=0123456789ab"), "{file}");
+        // Another agent's file is never this one's.
+        let tola = user("@tola:example.org");
+        assert_eq!(agent_picture(&icons, "acct", &room, &tola, None), None);
+    }
+
+    /// R100A2-05 (R399 #6, R414): a home whose picture is a git-LFS pointer
+    /// with its object absent here draws the letter, even with a profile
+    /// avatar in the room — which may be an older picture — and the profile
+    /// avatar is back once the home names no picture at all.
+    #[test]
+    fn an_absent_object_draws_the_letter_never_the_profile_avatar() {
+        let icons = AgentIcons::default();
+        let room = RoomId::parse("!r:example.org").expect("room");
+        let nixi = user(NIXI);
+        icons.replace(BTreeMap::from([(
+            nixi.clone(),
+            ZoneAgent {
+                icon: Some("N".to_owned()),
+                not_here: true,
+                ..ZoneAgent::default()
+            },
+        )]));
+        assert_eq!(
+            agent_picture(&icons, "acct", &room, &nixi, Some("v1")),
+            None
+        );
+        // Another agent's absent object is not this one's.
+        let tola = user("@tola:example.org");
+        assert!(agent_picture(&icons, "acct", &room, &tola, Some("v1")).is_some());
+        icons.replace(marks([(nixi.clone(), Some("N"))]));
+        let profile = agent_picture(&icons, "acct", &room, &nixi, Some("v1")).expect("profile");
+        assert_eq!(
+            crate::media::parse_avatar_url(&profile).map(|h| h.user_id),
+            Some(NIXI.to_owned())
+        );
+    }
+
+    #[test]
+    fn a_changed_picture_redraws_and_is_a_new_url() {
+        let icons = AgentIcons::default();
+        let mut changes = icons.subscribe();
+        icons.replace(pictured("aaaaaaaaaaaaaaaa"));
+        let before = icons.avatar_url(&user(NIXI));
+        changes.borrow_and_update();
+        icons.replace(pictured("aaaaaaaaaaaaaaaa"));
+        assert!(!changes.has_changed().expect("open"));
+        icons.replace(pictured("bbbbbbbbbbbbbbbb"));
+        assert!(changes.has_changed().expect("open"));
+        assert_ne!(icons.avatar_url(&user(NIXI)), before);
+        icons.replace(marks([(user(NIXI), Some("N"))]));
+        assert_eq!(icons.avatar_url(&user(NIXI)), None);
+    }
+
+    /// R399 #2: a delegated session's room is made by the delegating agent
+    /// (Nixi) and worked by the delegate (Tola); its row draws the agent
+    /// its status names — Tola's file where her zone is here, else Tola's
+    /// profile avatar — never the maker's.
+    #[test]
+    fn a_delegated_rooms_row_draws_the_working_agents_picture() {
+        const TOLA: &str = "@tola:example.org";
+        let room = RoomId::parse("!delegated:example.org").expect("room");
+        let mut delegated = content("running", "electra", None);
+        delegated["agent"] = json!(TOLA);
+        delegated["kind"] = json!("delegated");
+        let mut event = status("$d", 10, delegated);
+        event["sender"] = json!(TOLA);
+        let mut state = AgentRoomState::new(own());
+        assert!(state.apply(&event, &agents));
+        let kinds = AgentKinds::default();
+        let (kind, agent) = state.seat().expect("a seat");
+        kinds.insert(&room, kind, agent);
+        assert_eq!(kinds.get(&room), Some(SessionKind::Delegated));
+        let working = kinds.agent(&room).expect("the working agent");
+        assert_eq!(working, user(TOLA));
+
+        let icons = AgentIcons::default();
+        let profile = agent_picture(&icons, "acct", &room, &working, Some("v1")).expect("profile");
+        assert_eq!(
+            crate::media::parse_avatar_url(&profile).map(|handle| handle.user_id),
+            Some(TOLA.to_owned())
+        );
+        let mut both = pictured("aaaaaaaaaaaaaaaa");
+        both.insert(
+            user(TOLA),
+            ZoneAgent {
+                icon: Some("T".to_owned()),
+                avatar: Some(ZoneAvatar {
+                    profile: "01PROFILE".to_owned(),
+                    path: "80-agents/tola/avatar.png".to_owned(),
+                    hash: "bbbbbbbbbbbbbbbb".to_owned(),
+                }),
+                problems: Vec::new(),
+                not_here: false,
+            },
+        );
+        icons.replace(both);
+        let file = agent_picture(&icons, "acct", &room, &working, Some("v1")).expect("file");
+        assert_eq!(
+            crate::file_asset::parse_file_url(&file).map(|(_, path)| path),
+            Some("80-agents/tola/avatar.png".to_owned())
+        );
+    }
+
     /// The agents this device knows and their marks: a change of either
     /// redraws — a header's mark, a brief's drawing (R114) — and a rescan
     /// that finds the same does not.
@@ -2392,7 +2816,7 @@ mod tests {
     fn a_change_of_agents_or_marks_redraws_and_a_rescan_without_one_does_not() {
         let icons = AgentIcons::default();
         let mut changes = icons.subscribe();
-        let nixi = |icon: Option<&str>| BTreeMap::from([(user(NIXI), icon.map(str::to_owned))]);
+        let nixi = |icon: Option<&str>| marks([(user(NIXI), icon)]);
         icons.replace(nixi(Some("N")));
         assert!(changes.has_changed().expect("open"));
         changes.borrow_and_update();
@@ -2430,7 +2854,7 @@ mod tests {
         let icons = AgentIcons::default();
         let icon_of = |state: &AgentRoomState, icons: &AgentIcons| {
             state
-                .header(&|user| user.to_string(), icons, None, None)
+                .header(&|user| user.to_string(), icons, &|_| None, None, None)
                 .status
                 .expect("a status")
                 .icon
@@ -2439,34 +2863,78 @@ mod tests {
         assert_eq!(icon_of(&state, &icons), None);
         let nixi = OwnedUserId::try_from(NIXI).expect("user");
         let tola = OwnedUserId::try_from("@tola:example.org").expect("user");
-        icons.replace(BTreeMap::from([
-            (nixi.clone(), Some("N".to_owned())),
-            (tola, Some("🜂".to_owned())),
-        ]));
+        icons.replace(marks([(nixi.clone(), Some("N")), (tola, Some("🜂"))]));
         assert_eq!(icon_of(&state, &icons).as_deref(), Some("N"));
         // An icon name is a mark too.
-        icons.replace(BTreeMap::from([(
-            nixi.clone(),
-            Some("sparkles".to_owned()),
-        )]));
+        icons.replace(marks([(nixi.clone(), Some("sparkles"))]));
         assert_eq!(icon_of(&state, &icons).as_deref(), Some("sparkles"));
         // A mark the bot identity refuses — too long, or not drawable — is
         // dropped, never cut or shown as text.
         for refused in ["Nixie", "N x", "  "] {
-            icons.replace(BTreeMap::from([(nixi.clone(), Some(refused.to_owned()))]));
+            icons.replace(marks([(nixi.clone(), Some(refused))]));
             assert_eq!(icon_of(&state, &icons), None, "{refused:?}");
         }
         // Another agent's mark is never this one's.
-        icons.replace(BTreeMap::from([(
+        icons.replace(marks([(
             OwnedUserId::try_from("@tola:example.org").expect("user"),
-            Some("T".to_owned()),
+            Some("T"),
         )]));
         assert_eq!(icon_of(&state, &icons), None);
         // An unreadable status still names its agent's mark.
-        icons.replace(BTreeMap::from([(nixi, Some("N".to_owned()))]));
+        icons.replace(marks([(nixi, Some("N"))]));
         let mut odd = AgentRoomState::new(own());
         odd.apply(&status("$b", 10, content("wat", "electra", None)), &agents);
         assert_eq!(icon_of(&odd, &icons).as_deref(), Some("N"));
+    }
+
+    /// 100.2 #7: the header names the agent's model and level where its
+    /// home is on this device, the scan's new line redraws it, and another
+    /// agent's line is never this one's.
+    #[test]
+    fn the_header_names_the_agents_model_where_its_home_is() {
+        use crate::agents::model::AgentModelLineVm;
+        use crate::bots::chat::Effort;
+
+        let mut state = AgentRoomState::new(own());
+        state.apply(&status("$a", 10, content("idle", "electra", None)), &agents);
+        let icons = AgentIcons::default();
+        let mut changes = icons.subscribe();
+        let model_of = |icons: &AgentIcons| {
+            state
+                .header(&|user| user.to_string(), icons, &|_| None, None, None)
+                .status
+                .expect("a status")
+                .model
+        };
+        assert_eq!(model_of(&icons), None, "no home here, no line");
+        let line = |bot: &str, effort| AgentModelLineVm {
+            bot: bot.to_owned(),
+            effort,
+        };
+        let nixi = OwnedUserId::try_from(NIXI).expect("user");
+        icons.replace_models(BTreeMap::from([(
+            nixi.clone(),
+            line("Opus", Some(Effort::Xhigh)),
+        )]));
+        assert!(changes.has_changed().expect("open"));
+        changes.borrow_and_update();
+        assert_eq!(model_of(&icons), Some(line("Opus", Some(Effort::Xhigh))));
+        icons.replace_models(BTreeMap::from([(
+            nixi.clone(),
+            line("Opus", Some(Effort::Xhigh)),
+        )]));
+        assert!(
+            !changes.has_changed().expect("open"),
+            "the same scan redraws nothing"
+        );
+        icons.replace_models(BTreeMap::from([(nixi, line("Haiku", Some(Effort::High)))]));
+        assert!(changes.has_changed().expect("open"));
+        assert_eq!(model_of(&icons), Some(line("Haiku", Some(Effort::High))));
+        icons.replace_models(BTreeMap::from([(
+            OwnedUserId::try_from("@tola:example.org").expect("user"),
+            line("Astra", None),
+        )]));
+        assert_eq!(model_of(&icons), None);
     }
 
     #[test]

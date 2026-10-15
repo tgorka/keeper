@@ -74,6 +74,7 @@ import type { ensureSyntaxTree } from "@codemirror/language";
 import type { EditorState } from "@codemirror/state";
 import type { FormatAction } from "@/components/notes/editor/format-commands";
 import type { NoteWidgetOptions } from "@/components/notes/editor/note-widget";
+import { logFailure } from "@/lib/failure";
 import type { NoteGalleryVm } from "@/lib/ipc/client";
 
 /**
@@ -268,7 +269,10 @@ export async function mountMarkdownPreview(
     // ~45 KB emoji table is downloaded by a reader who can type into this
     // document and by nobody else (NFR-27).
     editing === null ? null : import("@/components/notes/editor/writing-tools"),
-  ]).catch((error: unknown) => (error instanceof Error ? error.message : String(error)));
+  ]).catch((error: unknown) => {
+    logFailure("preview.editorLoad")(error);
+    return error instanceof Error ? error.message : String(error);
+  });
   if (typeof loaded === "string") {
     console.info(
       `viewers: the markdown preview's editor could not be loaded, showing the source instead: ${loaded}`,

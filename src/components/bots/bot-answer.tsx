@@ -37,6 +37,7 @@ import {
   type MdInline,
   parseAnswer,
 } from "@/lib/bots-markdown";
+import { sayFailure } from "@/lib/failure";
 import { cn } from "@/lib/utils";
 
 /** How long the copy control stays confirmed. Long enough to read, short
@@ -160,13 +161,12 @@ function CodeBlock({
           size="sm"
           className="h-6 px-2 text-xs"
           onClick={() => {
-            // Best effort, exactly as the recordings row and the recovery-key
-            // card are: a clipboard the webview refuses is not worth a dialog,
-            // and the code is on screen either way.
+            // The code is on screen either way, but a copy that did not happen
+            // is said, so nobody pastes something else believing it went.
             void navigator.clipboard
               ?.writeText(text)
               .then(() => setCopied(true))
-              .catch(() => {});
+              .catch(sayFailure("bots.copyCode", "keeper couldn't copy the code."));
           }}
         >
           {copied ? BOT_CODE_COPIED_LABEL : BOT_CODE_COPY_LABEL}

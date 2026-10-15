@@ -10,6 +10,7 @@ use ts_rs::TS;
 
 use super::descriptor::AccountDescriptor;
 use super::layout::{DeviceClass, DeviceEntry};
+use super::AccountError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
@@ -42,6 +43,14 @@ pub struct AccountVm {
     pub repo_mode: Option<String>,
     pub state: AccountStateVm,
     pub sentence: Option<String>,
+    /// The sentence reports something that went wrong (R381): the UI renders
+    /// it as an alert, never as a quiet status line.
+    pub problem: bool,
+    /// How the person's sign-in attempt in this process ended — or that it
+    /// is still running — never inferred from `state` (R387): a closed
+    /// re-setup of an account already signed in here is `closed`, even
+    /// while the state still reads up to date. `None` before any attempt.
+    pub attempt: Option<AccountAttemptVm>,
     pub identity: Option<AccountIdentityVm>,
     /// This device, once it is registered.
     pub device: Option<AccountDeviceVm>,
@@ -218,6 +227,35 @@ pub struct AccountShareVm {
     pub qr_svg: Option<String>,
 }
 
+/// How a sign-in the person started (a setup's Continue, "Sign in again")
+/// ended (Epic 100, R387, R410): the outcome of its run through
+/// `org_account::attempt`, closed whether the person closed the browser
+/// sheet or pressed Cancel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum AccountAttemptVm {
+    /// Still signing in or syncing.
+    Running,
+    /// Signed in and synced.
+    Done,
+    /// The person closed the sign-in (the browser sheet, or Cancel): quiet.
+    Closed,
+    /// A step failed; the account's sentence says which and why.
+    Failed,
+}
+
+impl AccountAttemptVm {
+    /// How an attempt that stopped on `error` ended: closed when the person
+    /// closed it, failed otherwise.
+    pub fn of_error(error: &AccountError) -> Self {
+        match error {
+            AccountError::Cancelled => Self::Closed,
+            _ => Self::Failed,
+        }
+    }
+}
+
 /// What the shell is doing right now.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum AccountPhase {
@@ -243,6 +281,121 @@ pub enum AccountProblem {
     },
     /// A sync failed for a reason that is neither offline nor policy.
     Failed(String),
+    /// The identity provider refused the sign-in (`access_denied`), with its
+    /// own words when it sent any ([`AccountError::Denied`]).
+    SignInDenied {
+        host: String,
+        reason: Option<String>,
+    },
+    /// The sign-in timed out before the browser answered.
+    SignInTimedOut,
+    /// The browser round trip broke; the platform's reason.
+    SignInInterrupted(String),
+}
+
+impl AccountProblem {
+    /// The closed name of this problem's kind, for a log line.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Offline => "offline",
+            Self::NeedsSignIn(_) => "needs_sign_in",
+            Self::Refused(_) => "refused",
+            Self::Blocked { .. } => "blocked",
+            Self::Failed(_) => "failed",
+            Self::SignInDenied { .. } => "denied",
+            Self::SignInTimedOut => "timed_out",
+            Self::SignInInterrupted(_) => "interrupted",
+        }
+    }
+}
+
+/// What an account error leaves standing for the person. A sign-in the
+/// person closed themselves is no problem (R381: "closed" stays quiet);
+/// every other error is one, with its own sentence ([`vm`]).
+pub fn problem_of(error: AccountError) -> Option<AccountProblem> {
+    match error {
+        AccountError::Cancelled => None,
+        AccountError::Unreachable(_) => Some(AccountProblem::Offline),
+        AccountError::NeedsSignIn(sentence) => Some(AccountProblem::NeedsSignIn(sentence)),
+        AccountError::Refused(sentence) => Some(AccountProblem::Refused(sentence)),
+        AccountError::Internal(sentence) => Some(AccountProblem::Failed(sentence)),
+        AccountError::Denied { host, reason } => {
+            Some(AccountProblem::SignInDenied { host, reason })
+        }
+        AccountError::TimedOut => Some(AccountProblem::SignInTimedOut),
+        AccountError::Interrupted(reason) => Some(AccountProblem::SignInInterrupted(reason)),
+    }
+}
+
+/// The step of setting up or syncing an account a failure came from, as the
+/// log line names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountStep {
+    /// keeper's own HTTP client could not be built.
+    Client,
+    SignIn,
+    ForgeConnect,
+    /// The repository's credential (a token, a refresh).
+    Credential,
+    /// The local folder the repository is cloned into.
+    Folder,
+    Fetch,
+    Publish,
+    Settings,
+    /// A stored session that did not restore at launch or at Continue.
+    Restore,
+}
+
+impl AccountStep {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Client => "client",
+            Self::SignIn => "sign_in",
+            Self::ForgeConnect => "forge_connect",
+            Self::Credential => "credential",
+            Self::Folder => "folder",
+            Self::Fetch => "fetch",
+            Self::Publish => "publish",
+            Self::Settings => "settings",
+            Self::Restore => "restore",
+        }
+    }
+}
+
+/// One failed step, logged once at WARN and turned into what it leaves
+/// standing (R381, 100.1 #3). The line carries the step, the account's id
+/// and the error's kind — never its sentence, a token or a URL with a code —
+/// so it is safe in `keeper.log` whatever the identity provider said.
+pub fn step_failed(
+    step: AccountStep,
+    account: &str,
+    error: AccountError,
+) -> Option<AccountProblem> {
+    tracing::warn!(
+        step = step.as_str(),
+        account,
+        kind = error.kind(),
+        "account: a step did not finish"
+    );
+    problem_of(error)
+}
+
+/// A problem the shell composed itself (a repository error, a folder it
+/// could not make), logged like [`step_failed`] and handed back.
+pub fn step_problem(
+    step: AccountStep,
+    account: &str,
+    problem: Option<AccountProblem>,
+) -> Option<AccountProblem> {
+    if let Some(problem) = &problem {
+        tracing::warn!(
+            step = step.as_str(),
+            account,
+            kind = problem.kind(),
+            "account: a step did not finish"
+        );
+    }
+    problem
 }
 
 /// Whatever the shell knows. `now_ms` makes the offline sentence's time
@@ -254,6 +407,8 @@ pub struct AccountFacts {
     pub identity: Option<AccountIdentityVm>,
     pub phase: AccountPhase,
     pub problem: Option<AccountProblem>,
+    /// See [`AccountVm::attempt`].
+    pub attempt: Option<AccountAttemptVm>,
     pub devices: Vec<DeviceEntry>,
     /// This device's slug.
     pub this_device: Option<String>,
@@ -281,7 +436,8 @@ pub struct RestoreFacts {
 
 /// Compose the state and its sentence. Precedence, first match wins: a
 /// sign-in in progress; a policy stop; a dead grant; a sync in progress; a
-/// repository that needs connecting; offline or a failed sync; up to date.
+/// repository that needs connecting — said as the failure when connecting it
+/// was tried and failed; offline or a failed sync; up to date.
 pub fn vm(facts: &AccountFacts) -> AccountVm {
     let devices: Vec<AccountDeviceVm> = facts
         .devices
@@ -310,7 +466,9 @@ pub fn vm(facts: &AccountFacts) -> AccountVm {
             repo_host: None,
             repo_mode: None,
             state: AccountStateVm::None,
+            problem: sentence.is_some(),
             sentence,
+            attempt: facts.attempt,
             identity: None,
             device: None,
             devices: Vec::new(),
@@ -323,7 +481,7 @@ pub fn vm(facts: &AccountFacts) -> AccountVm {
         };
     };
 
-    let (state, sentence) = compose(facts, &d.name);
+    let (state, sentence, problem) = compose(facts, &d.name);
     AccountVm {
         configured: true,
         id: Some(d.id.clone()),
@@ -333,6 +491,8 @@ pub fn vm(facts: &AccountFacts) -> AccountVm {
         repo_mode: Some(d.repo_mode().to_owned()),
         state,
         sentence: Some(sentence),
+        problem,
+        attempt: facts.attempt,
         identity: facts.identity.clone(),
         device,
         devices,
@@ -379,63 +539,139 @@ fn restore_vm(facts: &RestoreFacts) -> AccountRestoreVm {
     }
 }
 
-fn compose(facts: &AccountFacts, name: &str) -> (AccountStateVm, String) {
+/// The state, its sentence, and whether that sentence reports a problem.
+fn compose(facts: &AccountFacts, name: &str) -> (AccountStateVm, String, bool) {
     use AccountStateVm as S;
 
     if facts.phase == AccountPhase::SigningIn {
         return (
             S::SigningIn,
             format!("Finish signing in to {name} in the browser."),
+            false,
         );
     }
     match &facts.problem {
-        Some(AccountProblem::Refused(sentence)) => return (S::Blocked, sentence.clone()),
+        Some(AccountProblem::Refused(sentence)) => return (S::Blocked, sentence.clone(), true),
         Some(AccountProblem::Blocked { login, .. }) => {
             return (
                 S::Blocked,
                 format!(
                     "This sign-in belongs to someone else: {login}/user.toml records a different account. Settings from the repository were not loaded."
                 ),
+                true,
+            );
+        }
+        Some(AccountProblem::SignInDenied { host, reason }) => {
+            let sentence = match reason {
+                Some(reason) => format!("{host} refused to sign you in to {name}: {reason}."),
+                None => format!(
+                    "{host} refused to sign you in to {name}. Ask whoever runs {name} to let your account use keeper."
+                ),
+            };
+            return (S::Blocked, sentence, true);
+        }
+        Some(AccountProblem::SignInTimedOut) => {
+            return (
+                S::NeedsSignIn,
+                format!(
+                    "Signing in to {name} timed out before the browser answered. Sign in again."
+                ),
+                true,
+            );
+        }
+        Some(AccountProblem::SignInInterrupted(reason)) => {
+            return (
+                S::NeedsSignIn,
+                format!(
+                    "Signing in to {name} did not come back from the browser ({reason}). Sign in again."
+                ),
+                true,
             );
         }
         Some(AccountProblem::NeedsSignIn(_)) => {
             return (
                 S::NeedsSignIn,
                 "Sign in again to keep your settings in sync.".to_owned(),
+                true,
             );
         }
         _ => {}
     }
     if facts.identity.is_none() {
-        return (
-            S::SignedOut,
-            format!("Sign in to {name} to use your settings on this device."),
-        );
+        // Nobody is signed in, so a sign-in is what failed: say that, never
+        // the neutral instruction alone (R381, 100.1 #4).
+        return match &facts.problem {
+            Some(AccountProblem::Offline) => (
+                S::Offline,
+                format!("keeper could not reach {name} to sign you in. Check the connection, then sign in again."),
+                true,
+            ),
+            Some(AccountProblem::Failed(reason)) => (
+                S::NeedsSignIn,
+                format!(
+                    "Signing in to {name} failed ({}). Sign in again.",
+                    reason.trim_end_matches('.')
+                ),
+                true,
+            ),
+            _ => (
+                S::SignedOut,
+                format!("Sign in to {name} to use your settings on this device."),
+                false,
+            ),
+        };
     }
     if facts.phase == AccountPhase::Syncing {
-        return (S::Syncing, "Syncing your settings…".to_owned());
+        return (S::Syncing, "Syncing your settings…".to_owned(), false);
     }
     if facts.forge_needed && !facts.forge_connected {
-        return (
-            S::NeedsSignIn,
-            "Reconnect the repository to keep your settings in sync.".to_owned(),
-        );
+        // Connecting the repository is what failed — its sign-in page did
+        // not open, or its server could not be reached — so that failure is
+        // what is said, as a problem, never the neutral instruction alone
+        // (R387). An account whose repository was connected before keeps its
+        // quiet offline status below.
+        return match &facts.problem {
+            Some(AccountProblem::Offline) => (
+                S::Offline,
+                format!("keeper could not reach {name}'s repository to connect it. Check the connection, then sign in again."),
+                true,
+            ),
+            Some(AccountProblem::Failed(reason)) => (
+                S::NeedsSignIn,
+                format!(
+                    "Connecting {name}'s repository failed ({}). Sign in again.",
+                    reason.trim_end_matches('.')
+                ),
+                true,
+            ),
+            _ => (
+                S::NeedsSignIn,
+                "Reconnect the repository to keep your settings in sync.".to_owned(),
+                false,
+            ),
+        };
     }
     let since = facts
         .last_synced_ms
         .map(|at| format!("from {}", clock(at, facts.now_ms)))
         .unwrap_or_else(|| "kept on this device".to_owned());
     match &facts.problem {
-        Some(AccountProblem::Offline) => (S::Offline, format!("Offline — using settings {since}.")),
+        Some(AccountProblem::Offline) => (
+            S::Offline,
+            format!("Offline — using settings {since}."),
+            false,
+        ),
         Some(AccountProblem::Failed(reason)) => (
             S::Offline,
             format!("Your settings could not be synced ({reason}). Using settings {since}."),
+            true,
         ),
         _ if facts.last_synced_ms.is_none() => (
             S::Syncing,
             "Your settings have not been synced yet.".to_owned(),
+            false,
         ),
-        _ => (S::Ready, "Up to date.".to_owned()),
+        _ => (S::Ready, "Up to date.".to_owned(), false),
     }
 }
 
@@ -564,6 +800,163 @@ mod tests {
         assert_eq!(vm.issuer_host.as_deref(), Some("id.acme.dev"));
         assert_eq!(vm.repo_host.as_deref(), Some("git.acme.dev"));
         assert_eq!(vm.repo_mode.as_deref(), Some("same"));
+    }
+
+    /// R381 / 100.1 #2, #4: every way a sign-in fails but the person's own
+    /// close is a problem whose sentence names the account; the close, and
+    /// only the close, leaves the quiet signed-out instruction.
+    #[test]
+    fn a_failed_sign_in_is_a_problem_naming_the_account_and_a_closed_one_is_not() {
+        let signed_out = |problem: Option<AccountProblem>| {
+            vm(&AccountFacts {
+                descriptor: Some(descriptor()),
+                problem,
+                ..AccountFacts::default()
+            })
+        };
+        let closed = signed_out(problem_of(AccountError::Cancelled));
+        assert_eq!(closed.state, AccountStateVm::SignedOut);
+        assert!(!closed.problem);
+
+        let cases = [
+            (
+                AccountError::Denied {
+                    host: "id.acme.dev".to_owned(),
+                    reason: Some("User is not allowed to use this project".to_owned()),
+                },
+                AccountStateVm::Blocked,
+                "id.acme.dev refused to sign you in to Acme: User is not allowed to use this project.",
+            ),
+            (
+                AccountError::Denied {
+                    host: "id.acme.dev".to_owned(),
+                    reason: None,
+                },
+                AccountStateVm::Blocked,
+                "id.acme.dev refused to sign you in to Acme. Ask whoever runs Acme to let your account use keeper.",
+            ),
+            (
+                AccountError::TimedOut,
+                AccountStateVm::NeedsSignIn,
+                "Signing in to Acme timed out before the browser answered. Sign in again.",
+            ),
+            (
+                AccountError::Interrupted("no browser".to_owned()),
+                AccountStateVm::NeedsSignIn,
+                "Signing in to Acme did not come back from the browser (no browser). Sign in again.",
+            ),
+            (
+                AccountError::Unreachable("keeper could not reach id.acme.dev.".to_owned()),
+                AccountStateVm::Offline,
+                "keeper could not reach Acme to sign you in. Check the connection, then sign in again.",
+            ),
+            (
+                AccountError::Internal("keeper could not open the sign-in page: denied.".to_owned()),
+                AccountStateVm::NeedsSignIn,
+                "Signing in to Acme failed (keeper could not open the sign-in page: denied). Sign in again.",
+            ),
+        ];
+        for (error, state, sentence) in cases {
+            let vm = signed_out(problem_of(error));
+            assert_eq!(
+                (vm.state, vm.sentence.as_deref(), vm.problem),
+                (state, Some(sentence), true)
+            );
+        }
+    }
+
+    #[test]
+    fn a_signed_in_offline_account_is_a_status_and_a_failed_sync_a_problem() {
+        let mut facts = signed_in();
+        facts.problem = Some(AccountProblem::Offline);
+        assert!(!vm(&facts).problem);
+        facts.problem = Some(AccountProblem::Failed("disk full".to_owned()));
+        assert!(vm(&facts).problem);
+        facts.problem = None;
+        assert!(!vm(&facts).problem);
+    }
+
+    /// R387 (FIX 06): signed in, but connecting the `oauth` repository failed
+    /// during setup — its page did not open, or its server was unreachable.
+    /// That failure is the account's sentence, as a problem; the neutral
+    /// "Reconnect" instruction is only for a repository nobody tried yet. A
+    /// cached account whose repository was connected and is simply offline
+    /// stays a quiet status.
+    #[test]
+    fn a_failed_repository_connection_is_the_problem_not_the_neutral_reconnect() {
+        let forge_down = |problem: Option<AccountProblem>| {
+            let mut facts = signed_in();
+            facts.forge_needed = true;
+            facts.forge_connected = false;
+            facts.problem = problem;
+            vm(&facts)
+        };
+        let opened = forge_down(problem_of(AccountError::Internal(
+            "keeper could not open the repository's sign-in page.".to_owned(),
+        )));
+        assert_eq!(
+            (opened.state, opened.sentence.as_deref(), opened.problem),
+            (
+                AccountStateVm::NeedsSignIn,
+                Some("Connecting Acme's repository failed (keeper could not open the repository's sign-in page). Sign in again."),
+                true
+            )
+        );
+        let unreachable = forge_down(problem_of(AccountError::Unreachable(
+            "keeper could not reach git.acme.dev.".to_owned(),
+        )));
+        assert_eq!(
+            (unreachable.state, unreachable.sentence.as_deref(), unreachable.problem),
+            (
+                AccountStateVm::Offline,
+                Some("keeper could not reach Acme's repository to connect it. Check the connection, then sign in again."),
+                true
+            )
+        );
+        let untried = forge_down(None);
+        assert_eq!(
+            (untried.state, untried.problem),
+            (AccountStateVm::NeedsSignIn, false)
+        );
+
+        let mut cached = signed_in();
+        cached.forge_needed = true;
+        cached.forge_connected = true;
+        cached.problem = problem_of(AccountError::Unreachable("offline".to_owned()));
+        let cached = vm(&cached);
+        assert_eq!(
+            (cached.state, cached.problem),
+            (AccountStateVm::Offline, false)
+        );
+    }
+
+    /// R387 (FIX 07): the person closing the sign-in — the native sheet's
+    /// close is `Cancelled` — ends the attempt `closed`, while any other
+    /// error ends it `failed`; and an account already signed in here keeps
+    /// composing "Up to date", so the attempt, not the state, is what says it
+    /// was closed.
+    #[test]
+    fn a_closed_re_setup_of_a_signed_in_account_is_closed_not_done() {
+        assert_eq!(
+            AccountAttemptVm::of_error(&AccountError::Cancelled),
+            AccountAttemptVm::Closed
+        );
+        for failed in [
+            AccountError::TimedOut,
+            AccountError::Interrupted("no browser".to_owned()),
+            AccountError::Unreachable("offline".to_owned()),
+        ] {
+            assert_eq!(
+                AccountAttemptVm::of_error(&failed),
+                AccountAttemptVm::Failed
+            );
+        }
+        let mut facts = signed_in();
+        facts.problem = problem_of(AccountError::Cancelled);
+        facts.attempt = Some(AccountAttemptVm::of_error(&AccountError::Cancelled));
+        let after = vm(&facts);
+        assert_eq!(after.state, AccountStateVm::Ready);
+        assert_eq!(after.attempt, Some(AccountAttemptVm::Closed));
     }
 
     #[test]

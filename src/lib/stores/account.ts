@@ -41,6 +41,8 @@ export const NO_ACCOUNT: OrgAccountVm = {
   repoMode: null,
   state: "none",
   sentence: null,
+  problem: false,
+  attempt: null,
   identity: null,
   device: null,
   devices: [],

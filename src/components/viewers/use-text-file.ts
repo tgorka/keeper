@@ -58,6 +58,7 @@
  * for the same reason `tracing::debug!` does not reach a packaged app's log.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { logFailure } from "@/lib/failure";
 import { syncReadText, syncWriteEntry, type TextFileVm } from "@/lib/ipc/client";
 
 /**
@@ -250,6 +251,7 @@ export function useTextBuffer(source: TextFileSource): UseTextFileResult {
       // off the VM itself.
       setError(next.binary ? next.detail : null);
     } catch (failure) {
+      logFailure("textFile.read")(failure);
       if (generation.current !== mine) {
         return;
       }
@@ -302,6 +304,7 @@ export function useTextBuffer(source: TextFileSource): UseTextFileResult {
       setPersisted(content);
       setError(null);
     } catch (failure) {
+      logFailure("textFile.save")(failure);
       setError(sentence(failure, `keeper could not save ${source.label}.`));
     }
   }, [content, persisted, source, vm]);

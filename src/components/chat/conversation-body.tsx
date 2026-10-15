@@ -28,14 +28,17 @@ import {
   useCallback,
   useEffect,
   useLayoutEffect,
+  useMemo,
   useRef,
   useState,
 } from "react";
 import { ApprovalRequest } from "@/components/agents/approval-card";
 import { AgentRoomHeader } from "@/components/chat/agent-room-header";
-import { Composer } from "@/components/chat/composer";
+import { chatCommandHost } from "@/components/chat/chat-commands";
+import { Composer, type SendContext } from "@/components/chat/composer";
 import { DeleteMessageDialog } from "@/components/chat/delete-message-dialog";
 import { HistoryBoundary, type HistoryBoundaryState } from "@/components/chat/history-boundary";
+import { LeaveRoomDialog } from "@/components/chat/leave-room-dialog";
 import { MediaPreviewOverlay } from "@/components/chat/media-preview-overlay";
 import { MessageBubble, type MessageVm } from "@/components/chat/message-bubble";
 import { RedactedStub } from "@/components/chat/redacted-stub";
@@ -44,6 +47,7 @@ import { UndoSendPill } from "@/components/chat/undo-send-pill";
 import { UtdStub } from "@/components/chat/utd-stub";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useShellLayout } from "@/hooks/use-shell-layout";
+import { logFailure, sayFailure } from "@/lib/failure";
 import type {
   AgentRoomHeaderVm,
   ApprovalVm,
@@ -54,14 +58,19 @@ import type {
   TypistVm,
 } from "@/lib/ipc/client";
 import {
+  agentConversationNew,
+  agentModelCommand,
   cancelSend,
   editMessage,
   markRoomRead,
   paginateBackwards,
   resolveTimelineEventKey,
   retrySend,
+  roomInvite,
+  roomSetTopic,
   sendAttachmentBytes,
   sendAttachmentPath,
+  sendEmote,
   sendReply,
   sendText,
   setTyping,
@@ -434,7 +443,8 @@ export function ConversationBody({
         }
         subscriptionId = id;
       })
-      .catch(() => {
+      .catch((raw: unknown) => {
+        logFailure("chat.subscribeTimeline")(raw);
         if (!cancelled) {
           setErrored(true);
         }
@@ -477,10 +487,9 @@ export function ConversationBody({
         }
         subscriptionId = id;
       })
-      .catch(() => {
-        // A held-send subscription failure is non-fatal: the Chat still works, just
-        // without live held-send surfaces (they re-appear on the next successful open).
-      });
+      // A held-send subscription failure is non-fatal: the Chat still works, just
+      // without live held-send surfaces (they re-appear on the next successful open).
+      .catch(logFailure("conversation.subscribeOutbox"));
     return () => {
       cancelled = true;
       if (subscriptionId !== null) {
@@ -516,10 +525,10 @@ export function ConversationBody({
         }
         typingSub = id;
       })
-      .catch(() => {});
+      .catch(logFailure("conversation.subscribeTyping"));
 
-    // Mark the room read on view (best-effort — swallow any rejection).
-    markRoomRead(accountId, roomId).catch(() => {});
+    // Mark the room read on view (best-effort — a rejection is logged).
+    markRoomRead(accountId, roomId).catch(logFailure("conversation.markRead"));
 
     return () => {
       cancelled = true;
@@ -558,7 +567,7 @@ export function ConversationBody({
         }
         paginationSub = id;
       })
-      .catch(() => {});
+      .catch(logFailure("conversation.subscribePagination"));
 
     return () => {
       cancelled = true;
@@ -604,7 +613,7 @@ export function ConversationBody({
     }
     const timer = setTimeout(() => {
       lastMarkedKey.current = newestKey;
-      markRoomRead(accountId, roomId).catch(() => {});
+      markRoomRead(accountId, roomId).catch(logFailure("conversation.markRead"));
     }, MARK_READ_DEBOUNCE_MS);
     return () => clearTimeout(timer);
   }, [items, accountId, roomId]);
@@ -652,7 +661,7 @@ export function ConversationBody({
         }
         unlisten = fn;
       })
-      .catch(() => {});
+      .catch(logFailure("conversation.listenDragDrop"));
     return () => {
       cancelled = true;
       unlisten?.();
@@ -758,27 +767,29 @@ export function ConversationBody({
           : "idle";
 
   const onSend = useCallback(
-    async (body: string) => {
+    async (body: string, context: SendContext, line?: string) => {
       if (accountId === null || roomId === null) {
         return;
       }
-      // Route the dispatch by the pending context: reply / edit / plain text
-      // (all through the single Rust send gate).
-      const current = composer.getState().pending;
-      if (current?.mode === "reply") {
-        await sendReply(accountId, roomId, current.targetKey, body);
-      } else if (current?.mode === "edit") {
-        await editMessage(accountId, roomId, current.targetKey, body);
+      // Route the dispatch by the context it was submitted in — reply / edit /
+      // plain text, all through the single Rust send gate — never by whatever is
+      // pending now: a reply or edit begun while a `/` line was being read must
+      // not capture it (R411).
+      const { target } = context;
+      if (target?.mode === "reply") {
+        await sendReply(context.accountId, context.roomId, target.targetKey, body);
+      } else if (target?.mode === "edit") {
+        await editMessage(context.accountId, context.roomId, target.targetKey, body);
       } else {
-        await sendText(accountId, roomId, body);
+        await sendText(context.accountId, context.roomId, body, line);
       }
       // Clear only the context we just dispatched: if the user started a *new*
       // reply/edit during the in-flight enqueue, it must survive.
       const afterSend = composer.getState().pending;
       if (
-        current !== null &&
-        afterSend?.mode === current.mode &&
-        afterSend?.targetKey === current.targetKey
+        target !== null &&
+        afterSend?.mode === target.mode &&
+        afterSend?.targetKey === target.targetKey
       ) {
         composer.getState().clear();
       }
@@ -786,14 +797,62 @@ export function ConversationBody({
     [accountId, roomId, composer],
   );
 
-  // Emit the account's typing notice (Story 3.9). Best-effort: swallow rejections so
-  // a typing dispatch is never an unhandled promise or a UI error.
+  // `/me` (Story 100.5): an action through the same Rust send gate as text, into
+  // the room it was typed in. It carries no reply — Rust refuses `/me` while a
+  // reply is pending.
+  const onSendEmote = useCallback(
+    async (body: string, context: SendContext, line: string) => {
+      if (accountId === null || roomId === null) {
+        return;
+      }
+      await sendEmote(context.accountId, context.roomId, body, line);
+    },
+    [accountId, roomId],
+  );
+
+  // The room's slash commands (Story 100.5): each act through its existing IPC;
+  // `/leave` opens its confirmation and leaves nothing on its own.
+  //
+  // The confirmation is bound to the room `/leave` was typed in, never to
+  // whichever room is on screen when it opens (R393): the target carries both
+  // ids, Leave leaves exactly that room, and a target that is not the room on
+  // screen — an ask that arrived late, or a room switch while it was open — is
+  // withdrawn, never retargeted.
+  const [leaveTarget, setLeaveTarget] = useState<{ accountId: string; roomId: string } | null>(
+    null,
+  );
+  // Reset during render, not in an effect: a stale question must not draw for a
+  // frame in the next room, and an open room must not pay an extra render.
+  if (
+    leaveTarget !== null &&
+    (leaveTarget.accountId !== accountId || leaveTarget.roomId !== roomId)
+  ) {
+    setLeaveTarget(null);
+  }
+  const onCommand = useMemo(
+    () =>
+      chatCommandHost({
+        setTopic: (topic) => roomSetTopic(accountId ?? "", roomId ?? "", topic),
+        invite: (userId) => roomInvite(accountId ?? "", roomId ?? "", userId),
+        newConversation: (title) => agentConversationNew(accountId ?? "", roomId ?? "", title),
+        model: (args) => agentModelCommand(accountId ?? "", roomId ?? "", args),
+        askLeave: () => {
+          if (accountId !== null && roomId !== null) {
+            setLeaveTarget({ accountId, roomId });
+          }
+        },
+      }),
+    [accountId, roomId],
+  );
+
+  // Emit the account's typing notice (Story 3.9). Best-effort: a rejection is logged,
+  // never an unhandled promise or a UI error.
   const onTyping = useCallback(
     (typing: boolean) => {
       if (accountId === null || roomId === null) {
         return;
       }
-      setTyping(accountId, roomId, typing).catch(() => {});
+      setTyping(accountId, roomId, typing).catch(logFailure("conversation.setTyping"));
     },
     [accountId, roomId],
   );
@@ -823,7 +882,8 @@ export function ConversationBody({
             setPagination((p) => ({ ...p, state: "idle", hitStart: true }));
           }
         })
-        .catch(() => {
+        .catch((raw: unknown) => {
+          logFailure("chat.paginate")(raw);
           // A failed pagination surfaces a retriable inline boundary error (and stops
           // the spinner); it persists until the user retries — the status stream no
           // longer clears it.
@@ -913,8 +973,10 @@ export function ConversationBody({
       }
       // A failed retry (e.g. the echo reconciled away → `EchoNotFound`) leaves
       // the persistent `Failed — Retry` caption in place, inviting another
-      // attempt; swallow the rejection so it is never an unhandled promise.
-      retrySend(accountId, roomId, key).catch(() => {});
+      // attempt; the rejection is said, never an unhandled promise.
+      retrySend(accountId, roomId, key).catch(
+        sayFailure("conversation.retrySend", "keeper couldn't retry the message."),
+      );
     },
     [accountId, roomId],
   );
@@ -955,14 +1017,16 @@ export function ConversationBody({
 
   // Cancel an in-flight outgoing media echo by aborting its queued send (Story
   // 3.7). Best-effort: if it already dispatched, the abort is a no-op and the
-  // message stays sent. A rejection (e.g. the echo reconciled away) is swallowed
-  // so it is never an unhandled promise.
+  // message stays sent. A rejection (e.g. the echo reconciled away) is said, never
+  // an unhandled promise.
   const onCancelSend = useCallback(
     (key: string) => {
       if (accountId === null || roomId === null) {
         return;
       }
-      cancelSend(accountId, roomId, key).catch(() => {});
+      cancelSend(accountId, roomId, key).catch(
+        sayFailure("conversation.cancelSend", "keeper couldn't cancel the send."),
+      );
     },
     [accountId, roomId],
   );
@@ -1047,13 +1111,15 @@ export function ConversationBody({
   // action-bar Popover pick and a click on an existing pill. Reactions are
   // stateless on the frontend: fire the IPC and let the diff stream re-render the
   // pills. A rejection (e.g. the target reconciled away → `TargetNotFound`) is
-  // swallowed so it is never an unhandled promise.
+  // said, never an unhandled promise.
   const onToggleReaction = useCallback(
     (key: string, emoji: string) => {
       if (gateRoom || accountId === null || roomId === null) {
         return;
       }
-      toggleReaction(accountId, roomId, key, emoji).catch(() => {});
+      toggleReaction(accountId, roomId, key, emoji).catch(
+        sayFailure("conversation.toggleReaction", "keeper couldn't change the reaction."),
+      );
     },
     [accountId, roomId, gateRoom],
   );
@@ -1144,7 +1210,8 @@ export function ConversationBody({
         let key: string | null;
         try {
           key = await resolveTimelineEventKey(targetAccount, targetRoom, targetEvent);
-        } catch {
+        } catch (raw) {
+          logFailure("chat.deepLinkResolve")(raw);
           // An unparsable id (should not happen for a real hit) — degrade honestly.
           key = null;
           break;
@@ -1182,7 +1249,8 @@ export function ConversationBody({
           if (reachedStart) {
             break;
           }
-        } catch {
+        } catch (raw) {
+          logFailure("chat.deepLinkPaginate")(raw);
           break;
         }
         // Give the prepend ops a frame to apply to the store/DOM before re-resolving.
@@ -1530,6 +1598,8 @@ export function ConversationBody({
               onCancelPending={onCancelPending}
               onEmptyArrowUp={onComposerArrowUp}
               onTyping={onTyping}
+              onSendEmote={onSendEmote}
+              onCommand={onCommand}
             />
           </div>
         </div>
@@ -1547,6 +1617,15 @@ export function ConversationBody({
           roomId={roomId}
           itemKey={deleteKey}
           onClose={() => setDeleteKey(null)}
+        />
+      )}
+      {leaveTarget !== null && (
+        <LeaveRoomDialog
+          key={`${leaveTarget.accountId}:${leaveTarget.roomId}`}
+          accountId={leaveTarget.accountId}
+          roomId={leaveTarget.roomId}
+          open
+          onClose={() => setLeaveTarget(null)}
         />
       )}
     </div>

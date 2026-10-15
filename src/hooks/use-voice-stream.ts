@@ -13,7 +13,7 @@
  * forgotten (DW-4: no stream outlives its surface), so a chip cannot keep
  * saying "listening" on a pane that is gone. The sink is gated so a late
  * snapshot after cleanup never mutates the store, and a subscribe failure is
- * swallowed (the chip stays off, which is the honest default).
+ * logged, not said (the chip stays off, which is the honest default).
  *
  * The two one-shot reads — availability and the persisted wake settings —
  * ride the same effect through {@link readVoiceFacts}: they are what the
@@ -36,6 +36,7 @@
  */
 import { useEffect } from "react";
 import { readVoiceFacts } from "@/hooks/use-voice-facts";
+import { logFailure } from "@/lib/failure";
 import type { VoiceStateVm } from "@/lib/ipc/client";
 import { voiceUnwatch, voiceWatch } from "@/lib/ipc/client";
 import { useCapabilitiesStore } from "@/lib/stores/capabilities";
@@ -74,9 +75,8 @@ export function useVoiceStream(): void {
         }
         watchId = id;
       })
-      .catch(() => {
-        // A failed watch is non-fatal: the store stays at `null` (not listening).
-      });
+      // A failed watch is non-fatal: the store stays at `null` (not listening).
+      .catch(logFailure("voice.watch"));
 
     return () => {
       cancelled = true;

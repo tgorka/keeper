@@ -136,3 +136,7 @@ image = { workspace = true }
 # The container move's tests (Epic 98) move real directories; already in the
 # graph through keeper-sync.
 tempfile = { workspace = true }
+# A failed account step's WARN line is read back from a real `fmt` subscriber
+# (Epic 100, 100.1 #3). Already in the workspace catalog and linked by both
+# hosts and keeper-sync's tests, so no new crate is resolved.
+tracing-subscriber = { workspace = true }

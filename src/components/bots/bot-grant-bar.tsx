@@ -53,6 +53,7 @@ import { useCallback, useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { logFailure } from "@/lib/failure";
 import type {
   BotGrantVm,
   BotModelVm,
@@ -235,7 +236,10 @@ export function BotGrantBar({
         setGrants(listing.grants);
         setError(null);
       })
-      .catch((raw: unknown) => setError(syncErrorMessage(raw, GRANT_READ_FAILED)));
+      .catch((raw: unknown) => {
+        logFailure("bots.grantsList")(raw);
+        setError(syncErrorMessage(raw, GRANT_READ_FAILED));
+      });
   }, [offered, providerId]);
 
   useEffect(refresh, [refresh]);
@@ -255,7 +259,10 @@ export function BotGrantBar({
 
   const revoke = (grantId: string) => {
     void botsGrantRevoke(grantId)
-      .catch((raw: unknown) => setError(syncErrorMessage(raw, GRANT_REVOKE_FAILED)))
+      .catch((raw: unknown) => {
+        logFailure("bots.grantRevoke")(raw);
+        setError(syncErrorMessage(raw, GRANT_REVOKE_FAILED));
+      })
       // A re-read rather than a local splice: the store is the truth, and a bar
       // that removed the row itself would keep saying so if the write failed.
       .finally(refresh);
@@ -393,7 +400,10 @@ export function BotGrantEditor({
       .then(onDone)
       // Rust's sentence verbatim: the path grammar is its decision and its
       // wording names exactly what was wrong.
-      .catch((raw: unknown) => setError(syncErrorMessage(raw, GRANT_SAVE_FAILED)))
+      .catch((raw: unknown) => {
+        logFailure("bots.grantSave")(raw);
+        setError(syncErrorMessage(raw, GRANT_SAVE_FAILED));
+      })
       .finally(() => setSaving(false));
   };
 

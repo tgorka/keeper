@@ -38,6 +38,7 @@
  * failure means the bridge is inert, never that the shell crashes.
  */
 import { useEffect } from "react";
+import { logFailure, sayFailure } from "@/lib/failure";
 import { listenNotesOpenNote } from "@/lib/ipc/client";
 import { notesVaultsStore, setActiveVault } from "@/lib/stores/notes-vaults";
 import { panelsStore } from "@/lib/stores/panels";
@@ -54,8 +55,11 @@ export function useNotesOpenNote(): void {
           // Tells Rust first and mirrors the answer, so the webview never holds
           // an active vault the shell disagrees with. A rejection leaves the
           // previous vault active and the selection below simply does not
-          // render — the note is still on disk and still in the list.
-          void setActiveVault(ref.vaultId).catch(() => {});
+          // render — the note is still on disk and still in the list, but the
+          // person asked to see it, so they hear why they don't.
+          void setActiveVault(ref.vaultId).catch(
+            sayFailure("notes.openNote", "keeper couldn't open the note."),
+          );
         }
         panelsStore
           .getState()
@@ -68,9 +72,8 @@ export function useNotesOpenNote(): void {
             unlisten = fn;
           }
         })
-        .catch(() => {
-          // No Tauri host — the open-note bridge is inert in this environment.
-        });
+        // No Tauri host — the open-note bridge is inert in this environment.
+        .catch(logFailure("notes.listenOpenNote"));
     } catch {
       // `listen` can throw synchronously when the Tauri IPC internals are absent.
     }

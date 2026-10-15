@@ -26,6 +26,7 @@
  * the reader the working link they would have had without this module.
  */
 import { type EditorView, WidgetType } from "@codemirror/view";
+import { logFailure, sayFailure } from "@/lib/failure";
 import { type RecordingNoteTargetVm, recordingNoteTargets, revealPath } from "@/lib/ipc/client";
 import { capabilitiesStore } from "@/lib/stores/capabilities";
 import {
@@ -120,13 +121,17 @@ function fileChip(target: RecordingNoteTargetVm): HTMLElement {
   if (capabilitiesStore.getState().capabilities.revealInFileManager) {
     node.append(
       chipAction(MEDIA_CHIP_REVEAL_LABEL, name, () => {
-        void revealPath(target.absolutePath).catch(() => {});
+        void revealPath(target.absolutePath).catch(
+          sayFailure("notes.revealRecording", "keeper couldn't reveal the file."),
+        );
       }),
     );
   }
   node.append(
     chipAction(MEDIA_CHIP_COPY_PATH_LABEL, name, () => {
-      void navigator.clipboard?.writeText(target.absolutePath).catch(() => {});
+      void navigator.clipboard
+        ?.writeText(target.absolutePath)
+        .catch(sayFailure("notes.copyRecordingPath", "keeper couldn't copy the path."));
     }),
   );
   return node;
@@ -150,7 +155,8 @@ export async function renderRecordingEmbedInto(
   let targets: RecordingNoteTargetVm[] | null = null;
   try {
     targets = await load(sessionId);
-  } catch {
+  } catch (raw) {
+    logFailure("notes.recordingEmbedTargets")(raw);
     // The index could not answer: the same fact as an unknown session to the
     // person reading the note, and the same answer — the link.
     return false;

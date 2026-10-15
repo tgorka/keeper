@@ -49,6 +49,7 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { logFailure } from "@/lib/failure";
 import type { BotVm } from "@/lib/ipc/client";
 import { botsBotIdentitySave } from "@/lib/ipc/client";
 import { syncErrorMessage } from "@/lib/stores/sync";
@@ -218,7 +219,15 @@ export function botPinLabel(bot: BotVm): string {
 }
 
 /**
- * The cell itself: shape, ink, mark.
+ * The cell's own outline as a clip, so a picture drawn in it never spills past
+ * the hexagon: `CELL`'s six points on the 24-unit grid, as percentages.
+ */
+const CELL_CLIP =
+  "polygon(29.17% 8.33%, 70.83% 8.33%, 91.67% 50%, 70.83% 91.67%, 29.17% 91.67%, 8.33% 50%)";
+
+/**
+ * The cell itself: shape, ink, mark — or, for an agent whose home holds one,
+ * its picture (story 100.4, R384).
  *
  * `aria-hidden`, always. The identity is spoken by the control that owns it
  * through {@link botPinLabel} — the lamp's rule, and for the lamp's measured
@@ -226,19 +235,31 @@ export function botPinLabel(bot: BotVm): string {
  * rendered in here would be announced to nobody, and where the name is built
  * from contents instead the algorithm concatenates trimmed text nodes into one
  * unreadable token.
+ *
+ * `image` is a URL Rust composed (`AgentStatusVm.avatar`): drawn as an `<img>`
+ * — never inlined, so an SVG's script never runs — clipped to the cell, in
+ * place of the mark. A picture that does not load is dropped for that URL and
+ * the mark is drawn: the letter is always the fallback.
  */
 export function BotIdentityCell({
   identity,
+  image = null,
   className,
 }: {
   identity: BotIdentityFields;
+  image?: string | null;
   className?: string;
 }) {
+  const [failed, setFailed] = useState<string | null>(null);
+  const picture = image !== null && image !== failed ? image : null;
   const shape = isBotIdentityShape(identity.shape) ? identity.shape : null;
   // The pairing, in one expression: no shape, no ink. Removing this guard is
   // exactly the defect `DESIGN.md:172` bans — a bare coloured dot.
   const ink = shape !== null && isBotIdentityColour(identity.colour) ? identity.colour : null;
-  const mark = identity.mark !== null && identity.mark.trim() !== "" ? identity.mark : null;
+  const mark =
+    picture === null && identity.mark !== null && identity.mark.trim() !== ""
+      ? identity.mark
+      : null;
   const Glyph = mark !== null && mark in SPACE_ICONS ? spaceIcon(mark) : null;
   return (
     <span
@@ -252,6 +273,17 @@ export function BotIdentityCell({
         className,
       )}
     >
+      {picture !== null && (
+        <img
+          src={picture}
+          alt=""
+          draggable={false}
+          data-slot="bot-identity-picture"
+          onError={() => setFailed(picture)}
+          className="absolute inset-0 size-full object-cover"
+          style={{ clipPath: CELL_CLIP }}
+        />
+      )}
       {shape !== null && (
         <svg
           aria-hidden="true"
@@ -356,6 +388,7 @@ export function BotIdentityPicker({
       onSaved(saved);
       onOpenChange(false);
     } catch (raw: unknown) {
+      logFailure("bots.identitySave")(raw);
       setRefusal(syncErrorMessage(raw, "keeper couldn't save this identity."));
     } finally {
       setSaving(false);

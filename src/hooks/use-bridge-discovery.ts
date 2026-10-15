@@ -9,6 +9,7 @@
  * an honest error string with its retriability so the pane can offer a retry.
  */
 import { useEffect, useState } from "react";
+import { logFailure } from "@/lib/failure";
 import type { BridgeDiscoveryVm, IpcError } from "@/lib/ipc/client";
 import { bridgeDiscover } from "@/lib/ipc/client";
 
@@ -79,6 +80,7 @@ export function useBridgeDiscovery(accountId: string): BridgeDiscoveryState {
         }
       })
       .catch((raw: IpcError) => {
+        logFailure("bridges.discover")(raw);
         if (!cancelled) {
           setState((prev) => ({
             ...prev,

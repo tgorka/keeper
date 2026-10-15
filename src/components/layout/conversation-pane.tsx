@@ -21,6 +21,7 @@ import { useCouplingCaveats } from "@/hooks/use-coupling-caveats";
 import { useSelectedRoomVm } from "@/hooks/use-selected-room-vm";
 import { accountHueVar } from "@/lib/account-hue";
 import { initials } from "@/lib/account-initials";
+import { sayFailure } from "@/lib/failure";
 import type { IncognitoVm } from "@/lib/ipc/client";
 import { incognitoSetChat, releaseReceipt } from "@/lib/ipc/client";
 import { useAccountsStore } from "@/lib/stores/accounts";
@@ -155,13 +156,13 @@ export function ConversationIncognitoChip({
   const label = incognitoChipLabel(vm.source);
 
   // Write the per-Chat scope (`true`/`false` to override, `null` to clear back to
-  // inheriting account/global), then re-read the authoritative VM. Best-effort: a
-  // write failure is swallowed (never an unhandled rejection); the mirror keeps its
+  // inheriting account/global), then re-read the authoritative VM. A write failure
+  // is said and logged (never an unhandled rejection); the mirror keeps its
   // last-observed state and the next read reconciles.
   const setChat = (enabled: boolean | null) => {
     void incognitoSetChat(accountId, roomId, enabled)
       .then(() => refreshIncognito(accountId, roomId))
-      .catch(() => {});
+      .catch(sayFailure("incognito.setChat", "keeper couldn't change Incognito for this chat."));
   };
 
   // Clearing only means something while an explicit per-Chat override exists; with
@@ -218,10 +219,12 @@ export function ConversationIncognitoChip({
               variant="secondary"
               size="sm"
               onClick={() => {
-                // Explicit user release: dispatch exactly one public m.read. Best-effort
-                // — a failure is swallowed (never a UI error). Close the popover so a
-                // stale/rapid re-click can't double-fire the release.
-                void releaseReceipt(accountId, roomId).catch(() => {});
+                // Explicit user release: dispatch exactly one public m.read. A failure
+                // is said and logged. Close the popover so a stale/rapid re-click can't
+                // double-fire the release.
+                void releaseReceipt(accountId, roomId).catch(
+                  sayFailure("incognito.releaseReceipt", "keeper couldn't mark the chat read."),
+                );
                 setOpen(false);
               }}
             >

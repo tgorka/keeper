@@ -1,6 +1,6 @@
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { Composer } from "@/components/chat/composer";
+import { Composer, DRAFT_NOT_SAVED } from "@/components/chat/composer";
 import { attachmentsStore } from "@/lib/stores/attachments";
 import { composerStore } from "@/lib/stores/composer";
 import { draftsStore } from "@/lib/stores/drafts";
@@ -46,6 +46,7 @@ beforeEach(() => {
   open.mockReset();
   vi.mocked(loadDraft).mockResolvedValue(null);
   vi.mocked(saveDraft).mockClear();
+  vi.mocked(saveDraft).mockResolvedValue(undefined);
   vi.mocked(clearDraft).mockClear();
   vi.mocked(loadRemoteDraft).mockResolvedValue(null);
   vi.mocked(mirrorDraft).mockClear();
@@ -68,7 +69,7 @@ describe("Composer", () => {
     fireEvent.keyDown(textarea, { key: "Enter" });
 
     await waitFor(() => {
-      expect(onSend).toHaveBeenCalledWith("hello");
+      expect(onSend).toHaveBeenCalledWith("hello", expect.anything());
     });
     await waitFor(() => {
       expect(textarea.value).toBe("");
@@ -112,7 +113,7 @@ describe("Composer", () => {
     fireEvent.click(screen.getByRole("button", { name: "Send message" }));
 
     await waitFor(() => {
-      expect(onSend).toHaveBeenCalledWith("click send");
+      expect(onSend).toHaveBeenCalledWith("click send", expect.anything());
     });
   });
 
@@ -640,6 +641,72 @@ describe("Composer persistent drafts (Story 7.1)", () => {
     }
   });
 
+  it("says once under the composer that a draft was not saved, unmarks it, and clears after a save lands (R387)", async () => {
+    vi.mocked(saveDraft).mockRejectedValue({
+      code: "internal",
+      message: "database is locked",
+      accountId: ACCT,
+      retriable: true,
+    });
+    render(<Composer accountId={ACCT} roomId={ROOM} onSend={vi.fn()} />);
+    const textarea = screen.getByLabelText<HTMLTextAreaElement>("Message");
+    fireEvent.change(textarea, { target: { value: "words" } });
+    fireEvent.change(textarea, { target: { value: "words that" } });
+
+    expect(await screen.findByText(DRAFT_NOT_SAVED, {}, { timeout: 2000 })).toHaveAttribute(
+      "role",
+      "alert",
+    );
+    expect(screen.getAllByText(DRAFT_NOT_SAVED)).toHaveLength(1);
+    // Leaving the chat would lose the words: it is not marked as holding a draft.
+    expect(draftsStore.getState().keys.has(`${ACCT} ${ROOM}`)).toBe(false);
+
+    vi.mocked(saveDraft).mockResolvedValue(undefined);
+    fireEvent.change(textarea, { target: { value: "words that stay" } });
+    await waitFor(() => expect(screen.queryByText(DRAFT_NOT_SAVED)).not.toBeInTheDocument(), {
+      timeout: 2000,
+    });
+    expect(draftsStore.getState().keys.has(`${ACCT} ${ROOM}`)).toBe(true);
+  });
+
+  it("stops saying a draft was not saved once the person empties it and the deletion lands (R410)", async () => {
+    vi.mocked(saveDraft).mockRejectedValue({
+      code: "internal",
+      message: "database is locked",
+      accountId: ACCT,
+      retriable: true,
+    });
+    render(<Composer accountId={ACCT} roomId={ROOM} onSend={vi.fn()} />);
+    const textarea = screen.getByLabelText<HTMLTextAreaElement>("Message");
+    fireEvent.change(textarea, { target: { value: "words" } });
+    expect(await screen.findByText(DRAFT_NOT_SAVED, {}, { timeout: 2000 })).toBeInTheDocument();
+
+    // Select all, delete: nothing is left to save once the deletion lands.
+    fireEvent.change(textarea, { target: { value: "" } });
+    await waitFor(() => expect(clearDraft).toHaveBeenCalledWith(ACCT, ROOM), { timeout: 2000 });
+    await waitFor(() => expect(screen.queryByText(DRAFT_NOT_SAVED)).not.toBeInTheDocument());
+  });
+
+  it("keeps saying it when deleting the emptied draft fails too (R410)", async () => {
+    const locked = {
+      code: "internal",
+      message: "database is locked",
+      accountId: ACCT,
+      retriable: true,
+    };
+    vi.mocked(saveDraft).mockRejectedValue(locked);
+    vi.mocked(clearDraft).mockRejectedValueOnce(locked);
+    render(<Composer accountId={ACCT} roomId={ROOM} onSend={vi.fn()} />);
+    const textarea = screen.getByLabelText<HTMLTextAreaElement>("Message");
+    fireEvent.change(textarea, { target: { value: "words" } });
+    expect(await screen.findByText(DRAFT_NOT_SAVED, {}, { timeout: 2000 })).toBeInTheDocument();
+
+    fireEvent.change(textarea, { target: { value: "" } });
+    await waitFor(() => expect(clearDraft).toHaveBeenCalledWith(ACCT, ROOM), { timeout: 2000 });
+    await new Promise((settle) => setTimeout(settle, 50));
+    expect(screen.getByText(DRAFT_NOT_SAVED)).toBeInTheDocument();
+  });
+
   it("clears the draft (row + marker) when the body trims to empty", () => {
     vi.useFakeTimers();
     try {
@@ -678,7 +745,7 @@ describe("Composer persistent drafts (Story 7.1)", () => {
     const textarea = screen.getByLabelText<HTMLTextAreaElement>("Message");
     fireEvent.change(textarea, { target: { value: "send me" } });
     fireEvent.keyDown(textarea, { key: "Enter" });
-    await waitFor(() => expect(onSend).toHaveBeenCalledWith("send me"));
+    await waitFor(() => expect(onSend).toHaveBeenCalledWith("send me", expect.anything()));
     await waitFor(() => expect(clearDraft).toHaveBeenCalledWith(ACCT, ROOM));
     expect(draftsStore.getState().keys.has(`${ACCT} ${ROOM}`)).toBe(false);
   });
@@ -713,7 +780,13 @@ describe("Composer persistent drafts (Story 7.1)", () => {
     // Type into the edit and save it.
     fireEvent.change(textarea, { target: { value: "old message body v2" } });
     fireEvent.keyDown(textarea, { key: "Enter" });
-    await waitFor(() => expect(onSend).toHaveBeenCalledWith("old message body v2"));
+    await waitFor(() =>
+      expect(onSend).toHaveBeenCalledWith("old message body v2", {
+        accountId: ACCT,
+        roomId: ROOM,
+        target: { mode: "edit", targetKey: "k9" },
+      }),
+    );
 
     // The persistent draft is pre-send state: an edit must not persist the edit body
     // nor delete the stored draft row.
@@ -964,7 +1037,7 @@ describe("Composer phone deltas (Story 13.5)", () => {
     fireEvent.change(textarea, { target: { value: "tap to send" } });
     fireEvent.click(sendButton);
     await waitFor(() => {
-      expect(onSend).toHaveBeenCalledWith("tap to send");
+      expect(onSend).toHaveBeenCalledWith("tap to send", expect.anything());
     });
   });
 
@@ -1008,7 +1081,7 @@ describe("Composer phone deltas (Story 13.5)", () => {
     fireEvent.change(textarea, { target: { value: "desktop enter" } });
     fireEvent.keyDown(textarea, { key: "Enter" });
     await waitFor(() => {
-      expect(onSend).toHaveBeenCalledWith("desktop enter");
+      expect(onSend).toHaveBeenCalledWith("desktop enter", expect.anything());
     });
   });
 });

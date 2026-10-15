@@ -34,6 +34,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { useBridgeCatalog } from "@/hooks/use-bridge-catalog";
+import { logFailure } from "@/lib/failure";
 import type { BridgeNetworkVm, IpcError, ResolveSupportVm } from "@/lib/ipc/client";
 import { bridgeResolveSupport, resolveBridgeIdentifier } from "@/lib/ipc/client";
 import { useAccountsStore } from "@/lib/stores/accounts";
@@ -117,7 +118,8 @@ function NewChatBody() {
           setSupport(vm);
         }
       })
-      .catch(() => {
+      .catch((raw: unknown) => {
+        logFailure("newChat.resolveSupport")(raw);
         // Fail CLOSED: a capability read failure must not open the gate on a network
         // that could be unsupported. Synthesize an unsupported result so the dialog
         // points at the manual Bridge Bot escape hatch instead of attempting a resolve.
@@ -160,6 +162,7 @@ function NewChatBody() {
       composerStore.getState().requestFocus();
       newChatStore.getState().close();
     } catch (raw) {
+      logFailure("newChat.resolve")(raw);
       // The dialog stays open and the identifier is retained for correction (FR-32) —
       // never a dismissal, never a cleared input. The bridge's own message rides in
       // the envelope for context.

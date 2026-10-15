@@ -24,6 +24,7 @@ import { matchTags } from "@/components/tags/tag-match";
 import { Button } from "@/components/ui/button";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { HoverHint, IconHint } from "@/components/ui/tooltip";
+import { logFailure } from "@/lib/failure";
 import { notesCreate, tagsVocabulary } from "@/lib/ipc/client";
 import {
   ALL_NOTES_SCOPE,
@@ -198,7 +199,8 @@ export function NoteFilterBar({
       .then((vm) => {
         if (!cancelled) setVocabulary(vm.entries.map((entry) => entry.path));
       })
-      .catch(() => {
+      .catch((raw: unknown) => {
+        logFailure("notes.tagsVocabulary")(raw);
         if (!cancelled)
           setTagsError("Could not load tags. Search and existing filters are still available.");
       })
@@ -300,6 +302,7 @@ export function NoteFilterBar({
         .setActiveTarget({ kind: "note", vaultId: id, noteId: created.note.id });
       setMenu(null);
     } catch (error) {
+      logFailure("notes.createFromSearch")(error);
       setActionError(syncErrorMessage(error, "Could not create a note from this search."));
     } finally {
       setCreating(false);
@@ -565,11 +568,12 @@ export function NoteFilterBar({
               aria-label="Include private notes"
               aria-pressed={includePrivate}
               onClick={() => {
-                void persistIncludePrivate(!includePrivate).catch((error) =>
+                void persistIncludePrivate(!includePrivate).catch((error) => {
+                  logFailure("notes.includePrivateSet")(error);
                   setActionError(
                     syncErrorMessage(error, "Could not save private-note visibility."),
-                  ),
-                );
+                  );
+                });
               }}
             >
               {includePrivate ? (

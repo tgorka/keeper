@@ -17,6 +17,7 @@ vi.mock("@/lib/ipc/client", () => ({
   syncFolderNow: vi.fn(),
   syncRescan: vi.fn(),
   syncVerify: vi.fn(),
+  frontendErrorReport: vi.fn(() => Promise.resolve()),
 }));
 
 // The OS-native directory picker (the export-dialog mock pattern).

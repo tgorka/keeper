@@ -50,6 +50,7 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { logFailure } from "@/lib/failure";
 import type { SessionRefAddedVm, SessionRefCandidateVm } from "@/lib/ipc/client";
 import { sessionsRefAdd, sessionsRefCandidates } from "@/lib/ipc/client";
 import { syncErrorMessage } from "@/lib/stores/sync";
@@ -165,6 +166,7 @@ export function SessionAddRef({ rootId, sessionId, onChanged }: SessionAddRefPro
           setFile((current) => (current === "" ? vm.defaultTarget : current));
         })
         .catch((raw: unknown) => {
+          logFailure("sessions.refCandidates")(raw);
           if (!live) return;
           setNotice(syncErrorMessage(raw, SESSION_ADD_REF_LIST_FAILED));
         });
@@ -205,7 +207,10 @@ export function SessionAddRef({ rootId, sessionId, onChanged }: SessionAddRefPro
         setPicked(null);
         onChanged();
       })
-      .catch((raw: unknown) => setNotice(syncErrorMessage(raw, SESSION_ADD_REF_FAILED)))
+      .catch((raw: unknown) => {
+        logFailure("sessions.refAdd")(raw);
+        setNotice(syncErrorMessage(raw, SESSION_ADD_REF_FAILED));
+      })
       .finally(() => setBusy(false));
   }, [rootId, sessionId, picked, url, alias, file, promote, onChanged]);
 

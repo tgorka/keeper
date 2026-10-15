@@ -780,6 +780,12 @@ pub struct RoomVm {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub agent_room: Option<AgentRoomKindVm>,
+    /// An agent room's agent's picture, as its header draws it (story 100.4,
+    /// R384): a URL for an `<img>`; absent for every other room and for an
+    /// agent with none, whose row keeps its initials.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub agent_avatar: Option<String>,
 }
 
 /// One Matrix Space the user belongs to, surfaced as a filter view (Story 4.5,
@@ -2005,6 +2011,12 @@ pub struct InboxRoomVm {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub agent_room: Option<AgentRoomKindVm>,
+    /// An agent room's agent's picture, as its header draws it (story 100.4,
+    /// R384): a URL for an `<img>`; absent for every other room and for an
+    /// agent with none, whose row keeps its initials.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub agent_avatar: Option<String>,
 }
 
 /// One index-based merged-inbox operation mirroring an eyeball-im `VectorDiff`
@@ -7328,6 +7340,138 @@ impl BotCommandPreviewVm {
 }
 
 // ---------------------------------------------------------------------------
+// Story 100.5 — the messenger composer's slash menu (R385)
+//
+// The bot composer's contract, restated for chats and agent rooms: one round
+// trip answers what the draft is and what the menu shows, and the webview
+// filters and ranks nothing (AD-20). The context is not on the wire: Rust reads
+// the room (its kind, the person's power levels) itself.
+// ---------------------------------------------------------------------------
+
+/// One row of the messenger's slash menu (Story 100.5).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct ChatCommandRowVm {
+    /// The registry name, without the slash.
+    pub name: String,
+    /// Every other spelling that reaches it.
+    pub aliases: Vec<String>,
+    /// The one sentence the registry holds.
+    pub description: String,
+    /// What may follow the name.
+    pub args: crate::bots::commands::ArgMode,
+    /// What the argument is, in the hint's own words; `null` exactly when
+    /// nothing may follow.
+    pub arg_hint: Option<String>,
+    /// Whether Enter may run it right now.
+    pub available: bool,
+    /// Why not, where it may not; `null` exactly when `available`.
+    pub reason: Option<String>,
+}
+
+impl ChatCommandRowVm {
+    /// Project one registry entry against a room's context.
+    pub fn compose(
+        spec: &crate::chat::commands::CommandSpec,
+        ctx: &crate::chat::commands::Context,
+    ) -> Self {
+        let availability = crate::chat::commands::availability(spec, ctx);
+        ChatCommandRowVm {
+            name: spec.name.to_string(),
+            aliases: spec
+                .aliases
+                .iter()
+                .map(|alias| (*alias).to_string())
+                .collect(),
+            description: spec.description.to_string(),
+            args: spec.args,
+            arg_hint: spec.arg_hint.map(|hint| hint.to_string()),
+            available: availability.reason().is_none(),
+            reason: availability.reason().map(|reason| reason.to_string()),
+        }
+    }
+}
+
+/// What one messenger draft is (Story 100.5): two ways to send, an act on the
+/// room, or a refusal — and no arm through which an unknown command could
+/// leave as text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+#[ts(export)]
+pub enum ChatCommandVerdictVm {
+    /// Send this as an ordinary text message (prose, the escaped slash,
+    /// `/plain`, `/shrug`).
+    Text {
+        /// What to send.
+        text: String,
+    },
+    /// Send this as an action, `m.emote` (`/me`).
+    Emote {
+        /// What to send.
+        text: String,
+    },
+    /// Run this command on the room.
+    Command {
+        /// The registry name, never the alias that was typed.
+        name: String,
+        /// What followed it, trimmed; `null` when nothing did.
+        args: Option<String>,
+    },
+    /// Send nothing, and say this.
+    Refusal {
+        /// keeper's whole sentence, shown verbatim.
+        message: String,
+    },
+}
+
+/// Everything the messenger composer needs about one draft (Story 100.5).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct ChatCommandPreviewVm {
+    /// The draft this answers, echoed verbatim: the caller drops an answer
+    /// for a draft the field no longer holds.
+    pub draft: String,
+    /// What the draft is.
+    pub verdict: ChatCommandVerdictVm,
+    /// The menu rows for the token as typed, in registry order; empty means
+    /// "draw no menu".
+    pub rows: Vec<ChatCommandRowVm>,
+    /// How to send a message that really does start with a slash.
+    pub escape_hint: String,
+}
+
+impl ChatCommandPreviewVm {
+    /// Resolve one draft in a room and project the menu beside it.
+    pub fn compose(draft: &str, ctx: &crate::chat::commands::Context) -> Self {
+        use crate::chat::commands::{self, Resolution};
+        let verdict = match commands::resolve(draft, ctx) {
+            Resolution::Text(text) => ChatCommandVerdictVm::Text { text },
+            Resolution::Emote(text) => ChatCommandVerdictVm::Emote { text },
+            Resolution::Command { name, args } => ChatCommandVerdictVm::Command {
+                name: name.to_string(),
+                args,
+            },
+            Resolution::Refusal { message, .. } => ChatCommandVerdictVm::Refusal { message },
+        };
+        ChatCommandPreviewVm {
+            draft: draft.to_string(),
+            verdict,
+            rows: commands::menu(draft, ctx)
+                .into_iter()
+                .map(|spec| ChatCommandRowVm::compose(spec, ctx))
+                .collect(),
+            escape_hint: crate::bots::commands::ESCAPE_HINT.to_string(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Story 61.12 — an image you can paste, a path you can open (FR-392, FR-393)
 // ---------------------------------------------------------------------------
 
@@ -8175,6 +8319,7 @@ mod tests {
             network_id: None,
             mute_state: MuteState::None,
             agent_room: None,
+            agent_avatar: None,
         }
     }
 
@@ -8359,6 +8504,7 @@ mod tests {
             network_id: None,
             mute_state: MuteState::None,
             agent_room: None,
+            agent_avatar: None,
         }
     }
 
@@ -8393,6 +8539,7 @@ mod tests {
             network_id: None,
             mute_state: MuteState::None,
             agent_room: None,
+            agent_avatar: None,
         };
         let json = serde_json::to_string(&vm).expect("serialize");
         assert!(json.contains("\"lastMessage\":null"), "json was: {json}");

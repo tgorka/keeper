@@ -85,6 +85,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { useVoiceFacts } from "@/hooks/use-voice-facts";
 import { ACCOUNT_OFFERS_TITLE, offerUrlHost } from "@/lib/account-offers";
+import { logFailure } from "@/lib/failure";
 import type {
   BotProbeVm,
   BotProviderVm,
@@ -295,7 +296,8 @@ function VoiceEventsBlock({ open }: { open: boolean }) {
             setNow(Date.now());
           }
         })
-        .catch(() => {
+        .catch((raw: unknown) => {
+          logFailure("voice.events")(raw);
           if (!cancelled) {
             setEvents(null);
           }
@@ -447,6 +449,7 @@ export function BotsSection({ open }: { open: boolean }) {
     void botsProviderProbe(providerId)
       .then((probe) => setVerdicts((held) => ({ ...held, [providerId]: botProbeSentence(probe) })))
       .catch((raw: unknown) => {
+        logFailure("bots.providerProbe")(raw);
         setVerdicts((held) => ({
           ...held,
           [providerId]: syncErrorMessage(raw, BOTS_SECTION_READ_FAILED),
@@ -460,6 +463,7 @@ export function BotsSection({ open }: { open: boolean }) {
     void botsBotProbe(bot.providerId, bot.target)
       .then((probe) => setVerdicts((held) => ({ ...held, [bot.id]: botProbeSentence(probe) })))
       .catch((raw: unknown) => {
+        logFailure("bots.botProbe")(raw);
         setVerdicts((held) => ({
           ...held,
           [bot.id]: syncErrorMessage(raw, BOTS_SECTION_READ_FAILED),
@@ -476,7 +480,10 @@ export function BotsSection({ open }: { open: boolean }) {
     const call =
       target.kind === "provider" ? botsProviderRemove(target.id) : botsBotRemove(target.id);
     void call
-      .catch((raw: unknown) => setError(syncErrorMessage(raw, BOTS_SECTION_READ_FAILED)))
+      .catch((raw: unknown) => {
+        logFailure("bots.remove")(raw);
+        setError(syncErrorMessage(raw, BOTS_SECTION_READ_FAILED));
+      })
       .finally(refresh);
   };
 
@@ -485,12 +492,13 @@ export function BotsSection({ open }: { open: boolean }) {
     setOfferErrors(({ [offer.key]: _cleared, ...rest }) => rest);
     void accountOfferAddProvider(offer.key)
       .then(() => setOfferAdded((held) => [...held, offer.key]))
-      .catch((raw: unknown) =>
+      .catch((raw: unknown) => {
+        logFailure("bots.offerAddProvider")(raw);
         setOfferErrors((held) => ({
           ...held,
           [offer.key]: syncErrorMessage(raw, BOTS_OFFER_ADD_FAILED),
-        })),
-      )
+        }));
+      })
       .finally(() => {
         setOfferBusy(null);
         refresh();
@@ -876,7 +884,8 @@ export function BotProviderForm({
           setSource(value);
         }
       })
-      .catch(() => {});
+      // The keychain default stands; the stored choice is a refinement.
+      .catch(logFailure("bots.readCredentialSource"));
     return () => {
       abandoned = true;
     };
@@ -903,6 +912,7 @@ export function BotProviderForm({
           try {
             await botsProviderCredentialSourceSet(saved.id, nextSource);
           } catch (raw) {
+            logFailure("bots.providerCredentialSource")(raw);
             if (provider === undefined) {
               setCreatedId(saved.id);
             }
@@ -913,6 +923,7 @@ export function BotProviderForm({
         onDone();
       })
       .catch((raw: unknown) => {
+        logFailure("bots.providerSave")(raw);
         // Rust's sentence verbatim: the base-URL grammar is its decision and
         // its wording names exactly what was wrong.
         setError(syncErrorMessage(raw, BOTS_SECTION_READ_FAILED));
@@ -1038,7 +1049,10 @@ export function BotForm({
       clearToken: false,
     })
       .then(onDone)
-      .catch((raw: unknown) => setError(syncErrorMessage(raw, BOTS_SECTION_READ_FAILED)))
+      .catch((raw: unknown) => {
+        logFailure("bots.botSave")(raw);
+        setError(syncErrorMessage(raw, BOTS_SECTION_READ_FAILED));
+      })
       .finally(() => setSaving(false));
   };
 
