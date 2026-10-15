@@ -185,6 +185,20 @@ describe("AgentRoomHeader", () => {
     expect(screen.queryByTestId("agent-model")).not.toBeInTheDocument();
   });
 
+  // R457: the marker while the agent searches the web without asking, with
+  // Rust's sentence for anyone reading it; none at any other level.
+  it("marks an agent that searches without asking with Rust's sentence, and no other", () => {
+    const sentence = "Searches the web without asking: its queries go out unreviewed.";
+    const { rerender } = render(
+      <AgentRoomHeader header={header({ status: status({ searchesUnasked: sentence }) })} />,
+    );
+    const mark = screen.getByTestId("agent-searches-unasked");
+    expect(mark).toHaveTextContent(sentence);
+    expect(mark).toHaveAttribute("title", sentence);
+    rerender(<AgentRoomHeader header={header({ status: status({}) })} />);
+    expect(screen.queryByTestId("agent-searches-unasked")).not.toBeInTheDocument();
+  });
+
   // Story 100.4 #2/#4: the agent's picture in the identity cell, an `<img>`
   // (never inlined markup), with the letter back when it does not load.
   it("draws the agent's picture in the cell and the letter when it does not load", () => {

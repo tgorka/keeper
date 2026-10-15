@@ -115,6 +115,8 @@ pub mod surface;
 pub mod task;
 pub mod turn;
 #[cfg(not(phone))]
+pub mod web;
+#[cfg(not(phone))]
 pub mod workflow;
 #[cfg(not(phone))]
 pub mod writer;

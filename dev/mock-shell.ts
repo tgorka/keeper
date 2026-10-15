@@ -79,6 +79,9 @@ import type {
   AgentSeedReq,
   AgentSeedResultVm,
   AgentsLaunchVm,
+  AgentWebSearchReq,
+  AgentWebSearchUrlVm,
+  AgentWebSearchVm,
   ApprovalCardVm,
   ApprovalDecideReq,
   ApprovalPayloadVm,
@@ -5914,6 +5917,7 @@ function agentRow(agent: string, name: string): AgentCopyVm {
     pin,
     problem: agentsParam === "differs" ? "tgdrive's agents zone hosts nothing here." : null,
     model: agentModel(agent, pin.localOnly),
+    webSearch: agentWebSearch(agent, name, pin.localOnly),
     // Story 100.4: Tara's home holds a picture keeper does not read.
     avatarProblem:
       agent === "tara"
@@ -5927,6 +5931,73 @@ function agentModelLine(agent: string): AgentModelLineVm | undefined {
   if (model == null) return undefined;
   const bot = model.bots.find((candidate) => candidate.reference === model.bot);
   return { bot: bot?.name ?? model.bot, effort: model.effort };
+}
+/**
+ * Story 101.4: each row's *Web search* switch. On a pinned drive that is not
+ * local-only (`?agents=models`) Nixi searches and Tara does not; a local-only
+ * drive's agents are never offered one (Rust's `web_search::never`).
+ */
+// Rust's sentences for the level *without asking* (R457): the header's mark,
+// and the row's standing warning naming this Mac's engine where it names one.
+const UNASKED_MARK =
+  "Searches the web without asking: its queries go to the search engine unreviewed and may contain words from your files.";
+function unaskedWarning(): string {
+  const host = webSearchUrl.url === null ? null : new URL(webSearchUrl.url).host;
+  return host === null
+    ? "Queries go to the search engine of the host that serves this agent and its upstream search engines without asking — they may contain words from your files."
+    : `Queries go to ${host} and its upstream search engines without asking — they may contain words from your files. A host other than this Mac sends them to its own engine.`;
+}
+/** Nixi searches without asking (her room's header carries the mark); the others are off. */
+function agentWebSearch(agent: string, name: string, localOnly: boolean): AgentWebSearchVm {
+  const level = agent === "nixi" && !localOnly ? "withoutAsking" : "off";
+  return {
+    level,
+    locked: null,
+    unavailable: localOnly
+      ? `${name} uses only models that run on its readers' own machines, and a web search sends its query out, so it is never offered one.`
+      : null,
+    warning: level === "withoutAsking" ? unaskedWarning() : null,
+  };
+}
+const WEB_SEARCH_CHANGED_UNDERNEATH =
+  "This agent's agent.toml changed on the drive meanwhile, so web search was not switched. Look at it again and choose.";
+function setAgentWebSearch(req: AgentWebSearchReq): AgentCopyVm[] {
+  const refuse = (message: string) => {
+    throw { code: "internal", message, accountId: null, retriable: false };
+  };
+  const row = agentRows.find((one) => one.profileId === req.profileId && one.agent === req.agent);
+  if (row?.webSearch == null) refuse(`tgdrive has no agent ${req.agent}.`);
+  const webSearch = row?.webSearch as AgentWebSearchVm;
+  if (webSearch.level !== req.shownLevel) refuse(WEB_SEARCH_CHANGED_UNDERNEATH);
+  if (req.level !== "off" && webSearch.unavailable !== null) refuse(webSearch.unavailable);
+  const warning = req.level === "withoutAsking" ? unaskedWarning() : null;
+  agentRows = agentRows.map((one) =>
+    one === row ? { ...one, webSearch: { ...webSearch, level: req.level, warning } } : one,
+  );
+  return agentRows;
+}
+/** This Mac's search engine (101.4 #2): none until one is saved. */
+let webSearchUrl: AgentWebSearchUrlVm = { url: null, refusal: null };
+function webSearchSave(url: string): AgentWebSearchUrlVm {
+  const trimmed = url.trim();
+  if (trimmed === "") {
+    webSearchUrl = { url: null, refusal: null };
+    return webSearchUrl;
+  }
+  const scheme = /^([a-z][a-z0-9+.-]*):/i.exec(trimmed)?.[1]?.toLowerCase();
+  if (scheme !== "http" && scheme !== "https") {
+    throw {
+      code: "internal",
+      message:
+        scheme === undefined
+          ? `this does not read as a URL: ${trimmed}.`
+          : `keeper searches over http or https — ${scheme} is not something it can speak.`,
+      accountId: null,
+      retriable: false,
+    };
+  }
+  webSearchUrl = { url: trimmed.replace(/\/+$/, ""), refusal: null };
+  return webSearchUrl;
 }
 function setAgentModel(req: AgentModelReq): AgentCopyVm[] {
   const refuse = (message: string) => {
@@ -5958,6 +6029,7 @@ const BROKEN_FOLDER: AgentCopyVm = {
   pin: null,
   problem: "`local_only` in _drive.toml must be true or false, not text.",
   model: null,
+  webSearch: null,
   avatarProblem: null,
 };
 let agentRows: AgentCopyVm[] =
@@ -6521,6 +6593,8 @@ function nixiHeader(run: "running" | "done", caretKey: string | null): AgentRoom
       // none, as on the phone, and draw the handle's first letter.
       icon: "N",
       avatar: NIXI_AVATAR,
+      // Her home says she searches without asking (R457): the header's mark.
+      searchesUnasked: UNASKED_MARK,
       host: "electra",
       title: "Nixi",
       kind: "main",
@@ -6932,7 +7006,9 @@ AGENT_ROOM_TIMELINES[GATE_ROOM] = {
 // the argv, the program, the folder, the Network chip and its file list),
 // `run-large` (a T2 run attached: its run's own session allowance, and once
 // shown the typed run view with escaped arguments), `kvm` (a T4 `kvm_act`:
-// its inputs as keeper reads them, no raw arguments).
+// its inputs as keeper reads them, no raw arguments), `web-search` (101.4,
+// R428: a search from a session whose label names its readers — the exact
+// query and the engine's host, once only).
 // `agent_approval_decide` answers as Rust does: refused with the card's own
 // sentence where it shows no buttons, for another digest or a scope the card
 // does not offer, and for an attached action not shown yet; else the card
@@ -7056,6 +7132,15 @@ function mockApprovalCards(): ApprovalCardVm[] {
       ];
     case "t4":
       return [approvalCard(id, 4)];
+    case "web-search":
+      return [
+        approvalCard(id, 2, {
+          summary: "Search the web for `otter facts` with `127.0.0.1:5191`",
+          tool: "web_search",
+          payload: JSON.stringify({ query: "otter facts" }, null, 2),
+          scopes: [{ scope: "once", label: "Approve", detail: APPROVAL_SENTENCES.onceReach }],
+        }),
+      ];
     case "t4-other":
       return [
         approvalCard(id, 4, {
@@ -8763,6 +8848,9 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
   },
   agents_sandbox_get: () => sandboxTable,
   agents_sandbox_save: (payload) => sandboxSave(payload.req as AgentSandboxReq),
+  agents_web_search_get: () => webSearchUrl,
+  agents_web_search_save: (payload) => webSearchSave(payload.url as string),
+  agents_web_search_set: (payload) => setAgentWebSearch(payload.req as AgentWebSearchReq),
   agents_seed_plan: (payload) => seedPlan(payload.req as AgentSeedReq),
   agents_seed_apply: (payload) => seedApply(payload.req as AgentSeedReq),
   agents_model_set: (payload) => setAgentModel(payload.req as AgentModelReq),

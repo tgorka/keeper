@@ -2,12 +2,14 @@
  * The header line of an agent room, beside its timeline (UX-DR129).
  *
  * One line: the agent's identity cell, its `agent@host` handle, the run badge,
- * its model and reasoning level where its home is on this device (100.2), and
- * what it is waiting for or doing. Under it, the scope chip (the drives in
- * scope, in the scope event's order) and the label chip (readers by name,
- * integrity as a word). Every word here that is not plain copy is Rust's — the
- * handle, the run, the model line, the detail drawn as sent, the unreadable
- * sentence, the label sentence — so this file only lays them out.
+ * its model and reasoning level where its home is on this device (100.2), a
+ * marker while it searches the web without asking (R457), and what it is
+ * waiting for or doing. Under it, the scope chip (the drives in scope, in the
+ * scope event's order) and the label chip (readers by name, integrity as a
+ * word). Every word here that is not plain copy is Rust's — the handle, the
+ * run, the model line, the unasked-search sentence, the detail drawn as sent,
+ * the unreadable sentence, the label sentence — so this file only lays them
+ * out.
  *
  * In a gate room (UX-DR147) a line above them names the outside system: the
  * `system` the gate is the door for and its account, by the name Rust quoted
@@ -28,7 +30,7 @@
  * an agent that will not open. A failed read is a sentence where the menu
  * would be; a failed save is a notice; both reach `keeper.log`.
  */
-import { Ellipsis } from "lucide-react";
+import { Ellipsis, Globe } from "lucide-react";
 import type { ReactNode } from "react";
 import { useEffect } from "react";
 import { toast } from "sonner";
@@ -216,6 +218,17 @@ export function AgentRoomHeader({
                 ? status.model.bot
                 : `${status.model.bot} · ${status.model.effort}`}
             </span>
+          )}
+          {status.searchesUnasked != null && (
+            <Badge
+              variant="outline"
+              data-testid="agent-searches-unasked"
+              title={status.searchesUnasked}
+              className="text-amber-700 dark:text-amber-400"
+            >
+              <Globe aria-hidden="true" />
+              <span className="sr-only">{status.searchesUnasked}</span>
+            </Badge>
           )}
           {doing !== null && (
             <span className="min-w-0 truncate text-muted-foreground">{doing}</span>

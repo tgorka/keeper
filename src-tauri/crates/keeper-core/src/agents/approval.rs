@@ -413,6 +413,7 @@ pub fn summary_of(tool: AgentTool, args: &Value, exec_binding: &Value) -> String
         AgentTool::KvmSnapshot | AgentTool::KvmAct => {
             crate::agents::kvm::summary(tool.as_wire(), args)
         }
+        AgentTool::WebSearch => crate::agents::web_search::summary(args, exec_binding),
     }
 }
 
@@ -614,8 +615,10 @@ impl ApprovalRecord {
             preconditions: parking.preconditions,
             // No host keeps a `session` allowance for an MCP tool: its
             // approval is for the one call; nor for a gate's delegation,
-            // a person's for each ticket (codemap Q7, S-23).
+            // a person's for each ticket (codemap Q7, S-23); nor for a web
+            // search, whose approval releases that one query (R428).
             scopes: if classification.tool == AgentTool::Mcp
+                || classification.tool == AgentTool::WebSearch
                 || (classification.tool == AgentTool::Delegate
                     && parking.session_kind == SessionKind::Gate)
             {

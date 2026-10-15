@@ -244,6 +244,7 @@ vi.mock("@/lib/ipc/client", () => ({
   agentsSandboxGet: vi.fn(() =>
     Promise.resolve({ readExec: [], env: [], status: "", refusal: null }),
   ),
+  agentsWebSearchGet: vi.fn(() => Promise.resolve({ url: null, refusal: null })),
   agentsSeedOffer: vi.fn(() =>
     Promise.resolve({
       folders: [],
@@ -1367,6 +1368,7 @@ describe("SettingsDialog", () => {
         },
         problem: null,
         model: null,
+        webSearch: null,
         avatarProblem: null,
       },
     ]);

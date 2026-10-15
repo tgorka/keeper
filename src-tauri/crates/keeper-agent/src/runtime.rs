@@ -456,6 +456,7 @@ pub(crate) fn deps_over(
         kvm: None,
         gate_tickets: Default::default(),
         attachments: crate::attachments::Bounds::this_host(),
+        web_search: None,
     })
 }
 
@@ -898,6 +899,9 @@ pub async fn run(
             })
             .collect(),
     ));
+    // `[web_search] url` (101.4, R419): the engine this host's agents that
+    // name `web_search` search with.
+    let web_search = crate::web::engine_from(config.web_search.as_ref());
 
     let sessions_zones: Vec<PathBuf> = drives
         .iter()
@@ -963,6 +967,7 @@ pub async fn run(
                 sandbox: sandbox.clone(),
                 mcp: Some(Arc::clone(&mcp)),
                 kvm: Some(Arc::clone(&kvm)),
+                web_search: web_search.clone(),
                 ..deps
             }),
             Err(sentence) => {

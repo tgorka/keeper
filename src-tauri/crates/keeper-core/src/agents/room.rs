@@ -535,6 +535,13 @@ pub struct AgentStatusVm {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub avatar: Option<String>,
+    /// The small marker while the agent searches the web without asking
+    /// (R457): [`crate::agents::web_search::UNASKED_MARK`], where its home
+    /// is on this device and says so. Absent elsewhere and at every other
+    /// level.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub searches_unasked: Option<String>,
     /// The host that wrote the status.
     pub host: Option<String>,
     /// The session's title.
@@ -925,6 +932,7 @@ fn status_vm(
             icon: icons.get(&status.agent),
             model: icons.model(&status.agent),
             avatar: picture(&status.agent),
+            searches_unasked: icons.unasked_mark(&status.agent),
             host: Some(status.host.clone()),
             title: Some(status.title.clone()),
             kind: Some(status.kind),
@@ -947,6 +955,7 @@ fn status_vm(
             icon: icons.get(agent),
             model: icons.model(agent),
             avatar: picture(agent),
+            searches_unasked: icons.unasked_mark(agent),
             host: host.clone(),
             title: title.clone(),
             kind: None,
@@ -981,6 +990,8 @@ struct Zone {
     avatars: BTreeMap<OwnedUserId, ZoneAvatar>,
     /// The agents whose home's picture is an object not on this device.
     not_here: BTreeSet<OwnedUserId>,
+    /// The agents whose home says they search the web without asking.
+    unasked: BTreeSet<OwnedUserId>,
     /// What each home's scan did not use, as last warned.
     problems: BTreeMap<OwnedUserId, Vec<AvatarProblem>>,
 }
@@ -997,6 +1008,9 @@ pub struct ZoneAgent {
     /// Its home's picture is a git-LFS pointer whose object is not on this
     /// device: the letter is drawn, not the profile avatar (R414).
     pub not_here: bool,
+    /// Its home says it searches the web without asking (R457), and it is
+    /// an agent that is offered a search at all.
+    pub searches_unasked: bool,
 }
 
 /// Where a home's picture is on this device: its sync profile, the
@@ -1031,6 +1045,9 @@ impl AgentIcons {
             }
             if !agent.problems.is_empty() {
                 zone.problems.insert(user.clone(), agent.problems);
+            }
+            if agent.searches_unasked {
+                zone.unasked.insert(user.clone());
             }
             zone.agents.insert(user);
         }
@@ -1088,6 +1105,17 @@ impl AgentIcons {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .not_here
             .contains(user)
+    }
+
+    /// The header's marker for `user` while its home on this device says
+    /// it searches the web without asking (R457).
+    pub fn unasked_mark(&self, user: &UserId) -> Option<String> {
+        self.zone
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unasked
+            .contains(user)
+            .then(|| crate::agents::web_search::UNASKED_MARK.to_owned())
     }
 
     /// `user`'s mark, when its zone is on this device.
@@ -2911,6 +2939,7 @@ mod tests {
                 }),
                 problems: Vec::new(),
                 not_here: false,
+                searches_unasked: false,
             },
         )])
     }
@@ -3030,6 +3059,7 @@ mod tests {
                 }),
                 problems: Vec::new(),
                 not_here: false,
+                searches_unasked: false,
             },
         );
         icons.replace(both);
@@ -3379,6 +3409,42 @@ mod tests {
             line("Astra", None),
         )]));
         assert_eq!(model_of(&icons), None);
+    }
+
+    /// R457: the header marks an agent whose home on this device says it
+    /// searches the web without asking, with keeper's sentence; a scan that
+    /// no longer says so takes the mark away, and another agent's mark is
+    /// never this one's.
+    #[test]
+    fn the_header_marks_an_agent_that_searches_without_asking() {
+        use crate::agents::web_search::UNASKED_MARK;
+
+        let mut state = AgentRoomState::new(own());
+        state.apply(&status("$a", 10, content("idle", "electra", None)), &agents);
+        let icons = AgentIcons::default();
+        let mark_of = |icons: &AgentIcons| {
+            state
+                .header(&|user| user.to_string(), icons, &|_| None, None, None)
+                .status
+                .expect("a status")
+                .searches_unasked
+        };
+        let scan = |user: &str, searches_unasked| {
+            BTreeMap::from([(
+                OwnedUserId::try_from(user).expect("user"),
+                ZoneAgent {
+                    searches_unasked,
+                    ..ZoneAgent::default()
+                },
+            )])
+        };
+        assert_eq!(mark_of(&icons), None, "no home here, no mark");
+        icons.replace(scan(NIXI, true));
+        assert_eq!(mark_of(&icons).as_deref(), Some(UNASKED_MARK));
+        icons.replace(scan(NIXI, false));
+        assert_eq!(mark_of(&icons), None, "asks again");
+        icons.replace(scan("@tola:example.org", true));
+        assert_eq!(mark_of(&icons), None, "another agent's");
     }
 
     #[test]

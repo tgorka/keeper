@@ -1703,6 +1703,11 @@ pub enum EgressKind {
     /// event ids for this device. Present only on a phone, and only while
     /// the setting holds an address keeper registers.
     PushGateway,
+    /// The web search engine this Mac's agents search with (story 101.4,
+    /// R419): its host and port, never its path. Present only while
+    /// Settings › Agents › *Web search* names one; only agents a person
+    /// switched web search on for send it their queries.
+    WebSearch,
 }
 
 /// One network destination keeper contacts, derived from live app state (Story

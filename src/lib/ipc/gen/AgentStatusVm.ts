@@ -43,6 +43,13 @@ model?: AgentModelLineVm,
  */
 avatar?: string, 
 /**
+ * The small marker while the agent searches the web without asking
+ * (R457): [`crate::agents::web_search::UNASKED_MARK`], where its home
+ * is on this device and says so. Absent elsewhere and at every other
+ * level.
+ */
+searchesUnasked?: string, 
+/**
  * The host that wrote the status.
  */
 host: string | null, 

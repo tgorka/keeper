@@ -10962,3 +10962,52 @@ location: `src/hooks/use-inline-slash.ts` (opens only with rows), `src/component
 reason: the inline menu opens only when it has rows, and its note is shown only while it is open, so an unread drive list or a capped search with no match looks like no match; a per-profile walk error is reported as the 5 000-entry bound being reached rather than as a drive that could not be read. The fix: the note rendered independently of selectable rows, and a walk failure carried apart from cap exhaustion with its own sentence; tested with unavailable and capped-empty previews.
 status: open
 
+
+### DW-1470: A web search query can carry a session's private words to the engine.
+
+origin: rung `agents-101-web` (story 101.4 #1, R419), 2026-10-15
+location: `keeper_core::agents::web_search::sink_refusal`, `keeper_agent::agent::AllowedTools::web_search`
+reason: R419 makes `web_search` T1 with the person's per-agent switch as their say over where queries go (as their choice of a model provider is), so only a `local_only` label stops a query; a session whose label is narrowed to its readers, or `untrusted` after reading outside content, still sends the words its model chose — which may quote a private file — to the engine and through it to the engines SearXNG asks. Blocking on the readers would make the tool unusable in every session of a private drive (its opening label is already narrowed), and blocking under `untrusted` would allow one search per session (its own answer lowers the integrity). A narrower rule — a person asked once per session when the label is narrowed and the session has read a drive file, or a query checked against the session's read paths — is a design decision for the coordinator.
+status: closed (R428, fix round 1 of rung `agents-101-web`, 2026-10-15): a search from a session whose label names its readers waits for a person's approval of that exact query to that engine — digest-bound through the approval machinery, `once` only, refused unsent on denial, expiry or a changed engine, never widening the label (`parks::a_search_from_a_private_session_waits_for_that_query`, `parks::an_approved_search_goes_only_to_the_engine_it_was_approved_for`)
+
+### DW-1471: Placement does not know which hosts can search the web.
+
+origin: rung `agents-101-web` (story 101.4 #2), 2026-10-15
+location: `keeper_core::agents::home::derived_needs`, `keeper_agent::hosts` (manifest capabilities), `src/components/settings/agents-section.tsx` (the switch's note)
+reason: an agent whose `[tools].allow` names `web_search`, served by a host with no `[web_search] url` (or a Mac with no engine saved), is simply not offered the tool there; its manifest carries no `web_search` capability, `[host].needs` cannot ask for one, and the Settings row does not say which of the person's hosts can search. Adding a capability changes placement for every agent that names the tool, which is beyond this story.
+status: open
+
+### DW-1472: Only SearXNG's `results` are read.
+
+origin: rung `agents-101-web` (story 101.4 #1), 2026-10-15
+location: `keeper_core::agents::web_search::parse_answer`
+reason: SearXNG's JSON also carries `answers`, `infoboxes`, `suggestions` and `unresponsive_engines`; keeper reads the first ten `results` only, so an engine whose upstreams all failed reads as "0 results" rather than naming the engines that did not answer.
+status: open
+
+### DW-1473: A web search's approval card reads T2's generic tier sentence.
+
+origin: rung `agents-101-web` fix round 1 (R428), 2026-10-15
+location: `keeper_core::agents::approval_card::tier_word`, `keeper_core::agents::tier` (`AgentTool::WebSearch` row)
+reason: a search from a label naming its readers is T2 so a person decides it once; the card's tier line is the tier's own sentence, "T2: it changes something that can be put back", while a query once sent cannot be called back (seen in the mock shell at `?approval=web-search`). The card's summary names the query and the engine exactly, so the decision is informed; a per-tool sentence on the card is a change to every card's tier line, beyond this fix.
+status: open
+
+### DW-1474: A turn whose web search level did not change cloned the whole allow list (R101W2-02).
+
+origin: review-101web-2 (R101W2-02), recorded by lane `101stack`, 2026-10-16
+location: `keeper_agent::agent::current_model`, `keeper_core::agents::web_search::allow_as`
+reason: `current_model` called `allow_as` — which copies the list and every tool name — before its unchanged fast return, on every turn.
+status: closed (fix round 2 of lane `web`, f4fc5089: the levels are compared before the fast return and the list is built only for a fresh dependency set; kept so by the stack's merge of 101.4 with 101.5 in `current_model`)
+
+### DW-1475: No test holds a web search whose engine answers its body slowly to the deadline.
+
+origin: review-101web-2 (verification gap), recorded by lane `101stack`, 2026-10-16
+location: `keeper_agent::web` (the SearXNG transport's deadline), `keeper-agent/src/web.rs` tests
+reason: the HTTP fixtures cover redirects, oversize bodies without `Content-Length` and engine status codes, but none sends headers and then stalls the body: the deadline that bounds a slow body is unexercised.
+status: open
+
+### DW-1477: The *without asking* mark in a room's header comes from the local home, not the serving host.
+
+origin: rung `agents-101-web` fix round 2 (R457), 2026-10-16
+location: `keeper_core::agents::room::{ZoneAgent::searches_unasked, AgentIcons::unasked_mark}`, `keeper_agent::desktop::zone_agents`, `AgentStatusVm.searches_unasked`
+reason: R457 asks for the mark from the serving host's status, where 101.5 puts the console mode (`StatusContent.console`, R440-09); that path is on `agents-101-console`, not on this branch, so the mark is read from the agent's `agent.toml` where its home is on this device — a phone, or a device without the drive, shows none, and a host still running an older file shows the newer level. At stack time the host writes the level into its status beside the console mode and the header reads it from there (an older host's absent field reads "unknown", never "asks").
+status: open

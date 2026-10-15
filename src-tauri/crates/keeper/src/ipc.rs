@@ -13225,12 +13225,17 @@ pub async fn egress_list(
         descriptor.as_ref(),
         keeper_core::forges::BUILTIN_GITHUB_CLIENT_ID,
     ));
-    // This Mac's MCP servers (96.2 #10): the table Settings › Agents
-    // writes, read on every call, each server's host or program once.
+    // This Mac's MCP servers (96.2 #10) and web search engine (101.4,
+    // R419): the tables Settings › Agents writes, read in one snapshot on
+    // every call, each server's host or program once.
     #[cfg(desktop)]
-    destinations.extend(keeper_core::egress::agent_egress(
-        &keeper_core::agents::mac_tables::read(&data_dir).mcp,
-    ));
+    {
+        let tables = keeper_core::agents::mac_tables::read(&data_dir);
+        destinations.extend(keeper_core::egress::agent_egress(&tables.mcp));
+        destinations.extend(keeper_core::egress::web_search_egress(
+            tables.web_search.as_ref().ok().and_then(Option::as_ref),
+        ));
+    }
     // The push gateway the person named (98.1 #8, R330): only the iPhone
     // registers a pusher to it, and only while the setting holds an address
     // keeper registers; keeper never contacts it, its homeserver does.

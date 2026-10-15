@@ -31,6 +31,7 @@ use keeper_core::agents::room::AgentIcons;
 use keeper_core::agents::seed::{
     self, AgentSeedBotVm, AgentSeedOfferVm, AgentSeedPlanVm, AgentSeedReq, AgentSeedResultVm,
 };
+use keeper_core::agents::web_search::{AgentWebSearchReq, AgentWebSearchUrlVm};
 use keeper_core::bots::store;
 use keeper_core::platform::Platform;
 use keeper_core::registry;
@@ -660,6 +661,67 @@ pub async fn agent_model_command(
             Err(refusal(sentence))
         }
     }
+}
+
+/// Settings › Agents: choose one agent's web search level (101.4 #3, R419,
+/// R457) — only `[tools].allow` and `[web_search].ask` of its `agent.toml`,
+/// every other byte kept, through the drive's write path, as the person, as
+/// a model save is (R405, R412).
+/// The rows come back as they read now. A refusal is the row's sentence
+/// and a WARN line (R381).
+#[tauri::command]
+pub async fn agents_web_search_set(
+    state: State<'_, AppState>,
+    req: AgentWebSearchReq,
+) -> Result<Vec<AgentCopyVm>, IpcError> {
+    let facts = facts_now(&state).await?;
+    let saved = {
+        let profiles = facts.profiles.clone();
+        let req = req.clone();
+        tokio::task::spawn_blocking(move || desktop::write_web_search(&profiles, &req))
+            .await
+            .map_err(|error| refusal(error.to_string()))?
+    };
+    if let Err(sentence) = saved {
+        tracing::warn!(agent = %req.agent, %sentence, "agents: an agent's web search was not switched");
+        return Err(refusal(sentence));
+    }
+    tracing::info!(agent = %req.agent, level = ?req.level, "agents: an agent's web search was switched in its agent.toml");
+    scan_next_tick();
+    rows(&state, facts).await
+}
+
+/// Settings › Agents › *Web search*: this Mac's engine as stored, and why
+/// it is not used when it no longer checks.
+#[tauri::command]
+pub async fn agents_web_search_get(
+    state: State<'_, AppState>,
+) -> Result<AgentWebSearchUrlVm, IpcError> {
+    let dir = data_dir(platform_of(&state).as_ref())?;
+    tokio::task::spawn_blocking(move || mac_tables::web_search_listing(&dir).map_err(refusal))
+        .await
+        .map_err(|error| refusal(error.to_string()))?
+}
+
+/// Name this Mac's web search engine (`keeper.db` only, never a file of the
+/// account's), checked by the one check agentd's `[web_search] url` is;
+/// blank names none. A refusal is Rust's sentence and a WARN line (R381).
+/// The host is built again on it at the next tick.
+#[tauri::command]
+pub async fn agents_web_search_save(
+    state: State<'_, AppState>,
+    url: String,
+) -> Result<AgentWebSearchUrlVm, IpcError> {
+    let dir = data_dir(platform_of(&state).as_ref())?;
+    let saved = tokio::task::spawn_blocking(move || mac_tables::save_web_search(&dir, &url))
+        .await
+        .map_err(|error| refusal(error.to_string()))?;
+    if let Err(sentence) = saved {
+        tracing::warn!(%sentence, "agents: this Mac's web search engine was not saved");
+        return Err(refusal(sentence));
+    }
+    scan_next_tick();
+    agents_web_search_get(state).await
 }
 
 /// The next tick scans: a saved table is hosted within a second, not at

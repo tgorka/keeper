@@ -1747,6 +1747,12 @@ pub fn run() {
         agents_host::agents_mcp_remove,
         agents_host::agents_sandbox_get,
         agents_host::agents_sandbox_save,
+        // Each agent's *Web search* switch and this Mac's engine (101.4,
+        // R419): the switch is a save of `agent.toml` as the model's is,
+        // the engine device-local like the tables above.
+        agents_host::agents_web_search_set,
+        agents_host::agents_web_search_get,
+        agents_host::agents_web_search_save,
     );
     // The commands that touch a window or a file manager have `Unsupported`
     // twins so the handler list is identical on every target and

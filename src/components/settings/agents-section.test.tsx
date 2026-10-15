@@ -13,6 +13,7 @@ import {
   SEED_WRITE_LABEL,
   SET_UP_AGENTS_LABEL,
   SIGN_IN_LABEL,
+  WEB_SEARCH_SWITCH_NOTE,
 } from "@/components/settings/agents-section";
 import type {
   AgentCopyVm,
@@ -21,6 +22,7 @@ import type {
   AgentPinVm,
   AgentSeedFolderVm,
   AgentSeedOfferVm,
+  AgentWebSearchVm,
   Effort,
 } from "@/lib/ipc/client";
 import {
@@ -33,6 +35,7 @@ import {
   agentsSeedApply,
   agentsSeedOffer,
   agentsSeedPlan,
+  agentsWebSearchSet,
 } from "@/lib/ipc/client";
 
 vi.mock("@/lib/ipc/client", () => ({
@@ -53,6 +56,9 @@ vi.mock("@/lib/ipc/client", () => ({
   agentsSandboxGet: vi.fn(() =>
     Promise.resolve({ readExec: [], env: [], status: "", refusal: null }),
   ),
+  agentsWebSearchGet: vi.fn(() => Promise.resolve({ url: null, refusal: null })),
+  agentsWebSearchSave: vi.fn(),
+  agentsWebSearchSet: vi.fn(),
 }));
 
 const OWNER: AgentPersonVm = { matrixId: "@tgorka:tgorka.org", displayName: "Tomasz Gorka" };
@@ -108,6 +114,7 @@ function nixi(pin: AgentPinVm, signedIn = false): AgentCopyVm {
     pin,
     problem: null,
     model: null,
+    webSearch: null,
     avatarProblem: null,
   };
 }
@@ -278,6 +285,7 @@ describe("Settings › Agents", () => {
         pin: null,
         problem: sentence,
         model: null,
+        webSearch: null,
         avatarProblem: null,
       },
     ]);
@@ -639,6 +647,131 @@ async function choose(name: string, option: string) {
   fireEvent.click(await screen.findByRole("option", { name: option }));
   await waitFor(() => expect(control).toHaveTextContent(option));
 }
+
+function withWebSearch(webSearch: AgentWebSearchVm): AgentCopyVm {
+  return { ...nixi({ ...unpinned, localOnly: false, state: "pinned" }, true), webSearch };
+}
+
+const SEARCH_OFF: AgentWebSearchVm = {
+  level: "off",
+  locked: null,
+  unavailable: null,
+  warning: null,
+};
+
+const WARNING =
+  "Queries go to search.example.org and its upstream search engines without asking — they may contain words from your files. A host other than this Mac sends them to its own engine.";
+
+function level(name: string) {
+  return screen.getByRole("radio", { name });
+}
+
+describe("Settings › Agents › an agent's web search (101.4, R457)", () => {
+  it("chooses a level against what the row showed and draws the rows Rust answers", async () => {
+    vi.mocked(agentsCopies).mockResolvedValue([withWebSearch(SEARCH_OFF)]);
+    vi.mocked(agentsWebSearchSet).mockResolvedValue([
+      withWebSearch({ ...SEARCH_OFF, level: "ask" }),
+    ]);
+    render(<AgentsSection open />);
+
+    const group = await screen.findByRole("radiogroup", { name: "Web search" });
+    expect(group).toHaveAccessibleDescription(WEB_SEARCH_SWITCH_NOTE);
+    expect(level("Off")).toBeChecked();
+    fireEvent.click(level("Ask"));
+
+    await waitFor(() =>
+      expect(agentsWebSearchSet).toHaveBeenCalledWith({
+        profileId: "p1",
+        agent: "nixi",
+        level: "ask",
+        shownLevel: "off",
+      }),
+    );
+    await waitFor(() => expect(level("Ask")).toBeChecked());
+  });
+
+  it("stands Rust's warning beside without asking while it is the level, and takes it away after", async () => {
+    vi.mocked(agentsCopies).mockResolvedValue([withWebSearch({ ...SEARCH_OFF, level: "ask" })]);
+    vi.mocked(agentsWebSearchSet).mockResolvedValueOnce([
+      withWebSearch({ ...SEARCH_OFF, level: "withoutAsking", warning: WARNING }),
+    ]);
+    render(<AgentsSection open />);
+    await screen.findByRole("radiogroup", { name: "Web search" });
+    expect(screen.queryByText(WARNING)).not.toBeInTheDocument();
+
+    fireEvent.click(level("Without asking"));
+    await waitFor(() =>
+      expect(agentsWebSearchSet).toHaveBeenLastCalledWith({
+        profileId: "p1",
+        agent: "nixi",
+        level: "withoutAsking",
+        shownLevel: "ask",
+      }),
+    );
+    await waitFor(() => expect(level("Without asking")).toBeChecked());
+    expect(screen.getByText(WARNING)).toBeInTheDocument();
+    expect(level("Without asking")).toHaveAccessibleDescription(WARNING);
+
+    vi.mocked(agentsWebSearchSet).mockResolvedValueOnce([
+      withWebSearch({ ...SEARCH_OFF, level: "ask" }),
+    ]);
+    fireEvent.click(level("Ask"));
+    await waitFor(() =>
+      expect(agentsWebSearchSet).toHaveBeenLastCalledWith({
+        profileId: "p1",
+        agent: "nixi",
+        level: "ask",
+        shownLevel: "withoutAsking",
+      }),
+    );
+    await waitFor(() => expect(level("Ask")).toBeChecked());
+    expect(screen.queryByText(WARNING)).not.toBeInTheDocument();
+  });
+
+  it("says Rust's refusal beside the choice and leaves it as the file says", async () => {
+    const sentence =
+      "This agent's agent.toml changed on the drive meanwhile, so web search was not switched. Look at it again and choose.";
+    vi.mocked(agentsCopies).mockResolvedValue([withWebSearch(SEARCH_OFF)]);
+    vi.mocked(agentsWebSearchSet).mockRejectedValue({
+      code: "internal",
+      message: sentence,
+      accountId: null,
+      retriable: false,
+    });
+    render(<AgentsSection open />);
+    await screen.findByRole("radiogroup", { name: "Web search" });
+    fireEvent.click(level("Ask"));
+
+    expect((await screen.findByRole("alert")).textContent).toBe(sentence);
+    expect(level("Off")).toBeChecked();
+  });
+
+  it("offers only off for an agent Rust offers no search, so one that is on can be switched off", async () => {
+    const unavailable =
+      "Nixi uses only models that run on its readers' own machines, and a web search sends its query out, so it is never offered one.";
+    vi.mocked(agentsCopies).mockResolvedValue([
+      withWebSearch({ ...SEARCH_OFF, level: "withoutAsking", unavailable }),
+    ]);
+    render(<AgentsSection open />);
+    const group = await screen.findByRole("radiogroup", { name: "Web search" });
+    expect(group).toHaveAccessibleDescription(unavailable);
+    expect(level("Ask")).toBeDisabled();
+    expect(level("Without asking")).toBeDisabled();
+    expect(level("Off")).toBeEnabled();
+  });
+
+  it("changes nothing on a Mac that only pulls the drive, and says why", async () => {
+    const locked =
+      "This Mac only pulls tgdrive, so a change made here would never reach the drive. Switch web search where the drive is written.";
+    vi.mocked(agentsCopies).mockResolvedValue([
+      withWebSearch({ ...SEARCH_OFF, level: "ask", locked }),
+    ]);
+    render(<AgentsSection open />);
+    const group = await screen.findByRole("radiogroup", { name: "Web search" });
+    expect(group).toHaveAccessibleDescription(locked);
+    for (const name of ["Off", "Ask", "Without asking"]) expect(level(name)).toBeDisabled();
+  });
+});
 
 describe("Settings › Agents › an agent's model (100.2)", () => {
   it("offers the bots Rust lists with each one's levels, and saves the choice against what it showed", async () => {

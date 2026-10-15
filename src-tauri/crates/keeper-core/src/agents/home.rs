@@ -61,6 +61,7 @@ pub const TOOL_VOCABULARY: &[&str] = &[
     "surface_propose_edit",
     "kvm_snapshot",
     "kvm_act",
+    "web_search",
 ];
 
 const PROXY_DEFAULTS: &[&str] = &[
@@ -341,6 +342,10 @@ pub struct AgentConfig {
     /// Effective: `true` when the file says so or the drive is `local_only`.
     pub local_only: bool,
     pub allow: Vec<String>,
+    /// `[web_search].ask`: `false` only where a person chose that this
+    /// agent searches without asking (R457); absent reads `true`. Says
+    /// nothing unless `allow` names `web_search`.
+    pub web_search_ask: bool,
     /// Drive ids in scope, the home drive first.
     pub drives: Vec<String>,
     pub mcp: Vec<String>,
@@ -418,6 +423,7 @@ const ROOT_KEYS: &[&str] = &[
     "limits",
     "memory",
     "gate",
+    "web_search",
 ];
 const MODEL_KEYS: &[&str] = &["bot", "effort", "local_only"];
 const TOOLS_KEYS: &[&str] = &["allow", "drives", "mcp", "skills"];
@@ -432,6 +438,11 @@ const LIMITS_KEYS: &[&str] = &[
     "max_concurrent_sessions",
 ];
 const MEMORY_KEYS: &[&str] = &["nudge_user_turns", "nudge_tool_iterations", "promote"];
+/// `[web_search]`: how an agent whose `[tools].allow` names `web_search`
+/// searches (R457). `ask = false` is a person's standing consent to search
+/// without asking; absent, every search from a session whose label names
+/// its readers asks (R428).
+const WEB_SEARCH_KEYS: &[&str] = &["ask"];
 const GATE_KEYS: &[&str] = &[
     "system",
     "peer",
@@ -825,6 +836,10 @@ pub fn parse_agent_toml(
         promote: memory.bool("promote", true)?,
     };
     let gates = parse_gates(&root, kind, &matrix_user, drive)?;
+    let web_search_ask = match root.table("web_search", WEB_SEARCH_KEYS)? {
+        Some(section) => section.bool("ask", true)?,
+        None => true,
+    };
 
     Ok(AgentConfig {
         drive: drive.id.clone(),
@@ -837,6 +852,7 @@ pub fn parse_agent_toml(
         effort,
         local_only,
         allow,
+        web_search_ask,
         drives,
         mcp,
         skills,
@@ -891,14 +907,8 @@ pub fn with_model(text: &str, bot: &str, effort: Option<Effort>) -> Result<Strin
     // unwritable rather than guessed.
     let unplaced = || HomeRefusal::Syntax("keeper could not find [model] in this file".to_owned());
     let quoted = |word: &str| EditValue::from(word).decorated("", "").to_string();
-    // Where the line holding byte `at` starts, and where it ends — before
-    // its `\n` or `\r\n`, or at the end of the file.
-    let line_start = |at: usize| text[..at].rfind('\n').map_or(0, |newline| newline + 1);
-    let line_end = |at: usize| match text[at..].find('\n') {
-        Some(newline) if text[..at + newline].ends_with('\r') => at + newline - 1,
-        Some(newline) => at + newline,
-        None => text.len(),
-    };
+    let line_start = |at: usize| line_start(text, at);
+    let line_end = |at: usize| line_end(text, at);
 
     let document = Document::parse(text).map_err(syntax)?;
     let model = document.get("model").ok_or_else(missing)?;
@@ -930,15 +940,7 @@ pub fn with_model(text: &str, bot: &str, effort: Option<Effort>) -> Result<Strin
             // file's first ending where `bot`'s line is the last), with
             // `bot`'s indent and dotted prefix (`model.` in `model.bot = …`).
             let at = line_end(bot_value.end);
-            let ending = if text[at..].starts_with("\r\n") {
-                "\r\n"
-            } else if text[at..].starts_with('\n') {
-                "\n"
-            } else if text.find('\n').is_some_and(|n| text[..n].ends_with('\r')) {
-                "\r\n"
-            } else {
-                "\n"
-            };
+            let ending = line_ending_at(text, at);
             let prefix = &text[line_start(bot_key.start)..bot_key.start];
             edits.push((
                 at..at,
@@ -1005,6 +1007,414 @@ pub fn with_model(text: &str, bot: &str, effort: Option<Effort>) -> Result<Strin
         return Err(unplaced());
     }
     Ok(written)
+}
+
+/// `text`, an `agent.toml` of an agent of `kind`, with `tool` named in
+/// `[tools].allow` when `on` and named nowhere in it when not — every other
+/// byte as it was, as [`with_model`] keeps them (R405; story 101.4, R419: the
+/// per-agent switches of Settings › Agents write only this key). An `allow`
+/// that is there gains `, "<tool>"` after its last name or loses each
+/// occurrence, each with only its own comma ([`tool_removal`]); an absent one — the kind's defaults
+/// ([`default_allow`]) — is written out as those defaults plus `tool`, as a
+/// line of `[tools]` (inline, dotted or a table, the file's own form), or
+/// as a new `[tools]` table at the end of a file that has none, in the
+/// file's line endings, a missing final newline kept missing. Switching off
+/// a tool the defaults hold is refused: an absent `allow` cannot drop one
+/// name without writing every other. A file that is not TOML, or whose
+/// result would not read as asked, is refused, nothing handed back.
+pub fn with_tool_allowed(
+    text: &str,
+    kind: AgentKind,
+    tool: &str,
+    on: bool,
+) -> Result<String, HomeRefusal> {
+    use std::ops::Range;
+    use toml_edit::{Document, Item, Value as EditValue};
+
+    let syntax = |error: toml_edit::TomlError| HomeRefusal::Syntax(error.message().to_owned());
+    let unplaced =
+        || HomeRefusal::Syntax("keeper could not find [tools].allow in this file".to_owned());
+    let quoted = |word: &str| EditValue::from(word).decorated("", "").to_string();
+    let names = |values: &[String]| {
+        values
+            .iter()
+            .map(|name| quoted(name))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
+    let document = Document::parse(text).map_err(syntax)?;
+    let tools = document.get("tools");
+    let allow = tools
+        .and_then(Item::as_table_like)
+        .and_then(|table| table.get("allow"));
+    let before: Vec<String> = match allow {
+        Some(item) => item
+            .as_array()
+            .ok_or_else(unplaced)?
+            .iter()
+            .map(|value| value.as_str().map(str::to_owned).ok_or_else(unplaced))
+            .collect::<Result<_, _>>()?,
+        None => default_allow(kind).iter().map(|&t| t.to_owned()).collect(),
+    };
+    let expected: Vec<String> = if on {
+        let mut names = before.clone();
+        if !names.iter().any(|name| name == tool) {
+            names.push(tool.to_owned());
+        }
+        names
+    } else {
+        before
+            .iter()
+            .filter(|name| *name != tool)
+            .cloned()
+            .collect()
+    };
+    if expected == before {
+        return Ok(text.to_owned());
+    }
+
+    let mut edits: Vec<(Range<usize>, String)> = Vec::new();
+    match (tools, allow) {
+        (_, Some(item)) => {
+            let array = item.as_array().ok_or_else(unplaced)?;
+            let spans: Vec<Range<usize>> = array
+                .iter()
+                .map(|value| value.span().ok_or_else(unplaced))
+                .collect::<Result<_, _>>()?;
+            if on {
+                match spans.last() {
+                    Some(last) => edits.push((last.end..last.end, format!(", {}", quoted(tool)))),
+                    None => {
+                        let whole = array.span().ok_or_else(unplaced)?;
+                        edits.push((whole.start + 1..whole.start + 1, quoted(tool)));
+                    }
+                }
+            } else {
+                let matched: Vec<bool> = array.iter().map(|v| v.as_str() == Some(tool)).collect();
+                let whole = array.span().ok_or_else(unplaced)?;
+                let close = text[..whole.end].rfind(']').ok_or_else(unplaced)?;
+                edits.extend(
+                    tool_removal(text, close, &spans, &matched)
+                        .into_iter()
+                        .map(|range| (range, String::new())),
+                );
+            }
+        }
+        (Some(_), None) if !on => return Err(default_held(tool)),
+        (Some(tools), None) => {
+            let line = format!("allow = [{}]", names(&expected));
+            edits.push(key_line_into(text, tools, &line).ok_or_else(unplaced)?);
+        }
+        (None, None) if !on => return Err(default_held(tool)),
+        (None, None) => edits.push(table_at_end(
+            text,
+            "tools",
+            &format!("allow = [{}]", names(&expected)),
+        )),
+    }
+    edits.sort_by_key(|(range, _)| std::cmp::Reverse(range.start));
+    let mut written = text.to_owned();
+    for (range, replacement) in edits {
+        written.replace_range(range, &replacement);
+    }
+
+    // Read back as a reader will: `allow` is what was asked, or nothing is
+    // handed back.
+    let check = Document::parse(written.as_str()).map_err(syntax)?;
+    let reads: Option<Vec<String>> = check
+        .get("tools")
+        .and_then(Item::as_table_like)
+        .and_then(|table| table.get("allow"))
+        .and_then(Item::as_array)
+        .map(|array| {
+            array
+                .iter()
+                .filter_map(|value| value.as_str().map(str::to_owned))
+                .collect()
+        });
+    if reads.as_ref() != Some(&expected) {
+        return Err(unplaced());
+    }
+    Ok(written)
+}
+
+/// Why a tool a kind's defaults hold cannot be switched off alone.
+fn default_held(tool: &str) -> HomeRefusal {
+    HomeRefusal::Invalid {
+        key: "tools.allow".to_owned(),
+        reason: format!(
+            "\"{tool}\" is one of this kind's default tools and the file names no allow list, so keeper cannot leave it out without writing every other; write [tools].allow by hand"
+        ),
+    }
+}
+
+/// The edit that puts the line `line` (`key = value`) into the table
+/// `item` of `text`: an inline table gains `, <line>` after its last value,
+/// or ` <line> ` inside an empty `{}`; a table gains it before its first
+/// key, with that key's indent and dotted prefix (`tools.` in
+/// `tools.drives = …`), or, in an empty table, on the line after its
+/// header — in that line's ending. `None` where `toml_edit` recorded no
+/// span to place it by.
+fn key_line_into(
+    text: &str,
+    item: &toml_edit::Item,
+    line: &str,
+) -> Option<(std::ops::Range<usize>, String)> {
+    use toml_edit::{Item, Value as EditValue};
+    match item {
+        Item::Value(EditValue::InlineTable(inline)) => {
+            let last = inline
+                .iter()
+                .filter_map(|(_, value)| value.span())
+                .map(|span| span.end)
+                .max();
+            match last {
+                Some(end) => Some((end..end, format!(", {line}"))),
+                None => {
+                    let whole = inline.span()?;
+                    Some((whole.start + 1..whole.start + 1, format!(" {line} ")))
+                }
+            }
+        }
+        Item::Table(table) => {
+            let first = table
+                .iter()
+                .filter_map(|(key, _)| table.key(key).and_then(toml_edit::Key::span))
+                .min_by_key(|span| span.start);
+            match first {
+                Some(key) => {
+                    let start = line_start(text, key.start);
+                    let prefix = &text[start..key.start];
+                    let ending = line_ending_at(text, line_end(text, key.start));
+                    Some((start..start, format!("{prefix}{line}{ending}")))
+                }
+                None => {
+                    let header = table.span()?;
+                    let at = line_end(text, header.end);
+                    let ending = line_ending_at(text, at);
+                    Some((at..at, format!("{ending}{line}")))
+                }
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The edit that appends the table `[name]` holding `line` to `text`, in
+/// the file's line endings, after a blank line, a missing final newline
+/// kept missing.
+fn table_at_end(text: &str, name: &str, line: &str) -> (std::ops::Range<usize>, String) {
+    let ending = line_ending_at(text, text.len());
+    let ended = text.is_empty() || text.ends_with('\n');
+    let lead = if ended {
+        ending.to_owned()
+    } else {
+        format!("{ending}{ending}")
+    };
+    let tail = if ended { ending } else { "" };
+    (
+        text.len()..text.len(),
+        format!("{lead}[{name}]{ending}{line}{tail}"),
+    )
+}
+
+/// `text`, an `agent.toml`, with `[web_search].ask` reading `ask` (R457) —
+/// every other byte as it was, as [`with_model`] keeps them. `false`, a
+/// person's standing consent to search without asking, is written over the
+/// value that is there, as a line of a `[web_search]` that has none (in the
+/// file's own form), or as a new `[web_search]` table at the end; `true`
+/// — what an absent key reads — is written over a `false` that is there and
+/// adds nothing to a file that has none. A file that is not TOML, or whose
+/// result would not read as asked, is refused, nothing handed back.
+pub fn with_web_search_ask(text: &str, ask: bool) -> Result<String, HomeRefusal> {
+    use toml_edit::{Document, Item, Value as EditValue};
+
+    let syntax = |error: toml_edit::TomlError| HomeRefusal::Syntax(error.message().to_owned());
+    let unplaced =
+        || HomeRefusal::Syntax("keeper could not find [web_search].ask in this file".to_owned());
+    let reads = |section: Option<&Item>| -> Result<bool, HomeRefusal> {
+        match section
+            .map(|item| item.as_table_like().ok_or_else(unplaced))
+            .transpose()?
+            .and_then(|table| table.get("ask"))
+        {
+            None => Ok(true),
+            Some(item) => item.as_bool().ok_or_else(unplaced),
+        }
+    };
+
+    let document = Document::parse(text).map_err(syntax)?;
+    if reads(document.get("web_search"))? == ask {
+        return Ok(text.to_owned());
+    }
+    let section = document.get("web_search");
+    let value = section
+        .and_then(Item::as_table_like)
+        .and_then(|table| table.get("ask"));
+    let quoted = EditValue::from(ask).decorated("", "").to_string();
+    let line = format!("ask = {quoted}");
+    let edit = match (section, value) {
+        (_, Some(item)) => (item.span().ok_or_else(unplaced)?, quoted),
+        (Some(section), None) => key_line_into(text, section, &line).ok_or_else(unplaced)?,
+        (None, None) => table_at_end(text, "web_search", &line),
+    };
+    let mut written = text.to_owned();
+    written.replace_range(edit.0, &edit.1);
+
+    // Read back as a reader will: `ask` is what was asked, or nothing is
+    // handed back.
+    let check = Document::parse(written.as_str()).map_err(syntax)?;
+    if reads(check.get("web_search"))? != ask {
+        return Err(unplaced());
+    }
+    Ok(written)
+}
+
+/// The bytes of `text` switching a tool off removes from an array whose
+/// names sit at `spans`, its `]` at `close`, those `matched` going
+/// (R427): each matched string and its own comma — the one after it, or,
+/// for the list's last name with none after it, the one before it where
+/// the two share a line with only spaces between — with the spaces that
+/// set them apart on their line; a line left holding nothing else goes
+/// whole, its line ending with it. A comment, and every byte of a name
+/// kept and of its own comma, stays as it was.
+fn tool_removal(
+    text: &str,
+    close: usize,
+    spans: &[std::ops::Range<usize>],
+    matched: &[bool],
+) -> Vec<std::ops::Range<usize>> {
+    let bytes = text.as_bytes();
+    let horizontal = |b: &u8| *b == b' ' || *b == b'\t';
+    // The separator after name `i`: past spaces, line endings and
+    // comments, the first byte is a comma or there is none.
+    let comma_after = |i: usize| -> Option<usize> {
+        let limit = spans.get(i + 1).map_or(close, |next| next.start);
+        let mut at = spans[i].end;
+        while at < limit {
+            match bytes[at] {
+                b' ' | b'\t' | b'\r' | b'\n' => at += 1,
+                b'#' => at = text[at..limit].find('\n').map_or(limit, |n| at + n),
+                b',' => return Some(at),
+                _ => return None,
+            }
+        }
+        None
+    };
+    let mut gone = vec![false; bytes.len()];
+    let mark = |range: std::ops::Range<usize>, gone: &mut [bool]| {
+        gone[range].iter_mut().for_each(|byte| *byte = true);
+    };
+    for (i, span) in spans.iter().enumerate().filter(|(i, _)| matched[*i]) {
+        mark(span.clone(), &mut gone);
+        if let Some(comma) = comma_after(i) {
+            if bytes[span.end..comma].iter().all(horizontal) {
+                mark(span.end..comma, &mut gone);
+            }
+            mark(comma..comma + 1, &mut gone);
+        }
+    }
+    // The last names going with no comma after them, on the line of the
+    // name kept before them: the comma between is theirs.
+    let last = spans.len().saturating_sub(1);
+    if let Some(kept) = matched.iter().rposition(|hit| !hit) {
+        if kept < last && comma_after(last).is_none() {
+            if let Some(comma) = comma_after(kept) {
+                let next = spans[kept + 1].start;
+                if bytes[comma + 1..next].iter().all(horizontal) {
+                    mark(comma..next, &mut gone);
+                }
+            }
+        }
+    }
+    // The spaces that set a removed run apart on its line: those before it
+    // after a name kept, else those after it before one.
+    let mut at = 0;
+    while at < bytes.len() {
+        if !gone[at] {
+            at += 1;
+            continue;
+        }
+        let start = at;
+        while at < bytes.len() && gone[at] {
+            at += 1;
+        }
+        let mut before = start;
+        while before > 0 && horizontal(&bytes[before - 1]) && !gone[before - 1] {
+            before -= 1;
+        }
+        let mut after = at;
+        while after < close && horizontal(&bytes[after]) {
+            after += 1;
+        }
+        if before < start && before > 0 && !matches!(bytes[before - 1], b'\n' | b'[') {
+            mark(before..start, &mut gone);
+        } else if after > at && !matches!(bytes[after], b'\r' | b'\n' | b']') {
+            mark(at..after, &mut gone);
+            at = after;
+        }
+    }
+    // A line left with nothing but white space goes whole.
+    let mut line = 0;
+    while line < bytes.len() {
+        let end = text[line..]
+            .find('\n')
+            .map_or(bytes.len(), |n| line + n + 1);
+        let held = &bytes[line..end];
+        let touched = gone[line..end].iter().any(|byte| *byte);
+        let empty = held
+            .iter()
+            .zip(&gone[line..end])
+            .all(|(byte, gone)| *gone || byte.is_ascii_whitespace());
+        if touched && empty {
+            mark(line..end, &mut gone);
+        }
+        line = end;
+    }
+    let mut ranges = Vec::new();
+    let mut at = 0;
+    while at < bytes.len() {
+        if gone[at] {
+            let start = at;
+            while at < bytes.len() && gone[at] {
+                at += 1;
+            }
+            ranges.push(start..at);
+        } else {
+            at += 1;
+        }
+    }
+    ranges
+}
+
+/// Where the line holding byte `at` of `text` starts.
+fn line_start(text: &str, at: usize) -> usize {
+    text[..at].rfind('\n').map_or(0, |newline| newline + 1)
+}
+
+/// Where the line holding byte `at` of `text` ends: before its `\n` or
+/// `\r\n`, or at the end of the text.
+fn line_end(text: &str, at: usize) -> usize {
+    match text[at..].find('\n') {
+        Some(newline) if text[..at + newline].ends_with('\r') => at + newline - 1,
+        Some(newline) => at + newline,
+        None => text.len(),
+    }
+}
+
+/// The line ending at byte `at` (a line's end): its own, or — on a last
+/// line with none — the file's first, `\n` in a file with none at all.
+fn line_ending_at(text: &str, at: usize) -> &'static str {
+    if text[at..].starts_with("\r\n") {
+        "\r\n"
+    } else if text[at..].starts_with('\n') {
+        "\n"
+    } else if text.find('\n').is_some_and(|n| text[..n].ends_with('\r')) {
+        "\r\n"
+    } else {
+        "\n"
+    }
 }
 
 /// Why a bot that does not run locally is refused where `local_only` holds:
@@ -1844,6 +2254,263 @@ promote               = true
             with_model(&set, QWEN, None).expect("dotted cleared"),
             dotted
         );
+    }
+
+    /// 101.4 #3, R419: the switch writes `[tools].allow` and nothing else.
+    /// A list that is there gains the name after its last one, or loses
+    /// every occurrence with one comma each, whatever its layout; comments,
+    /// spacing and the other keys stay byte for byte, and switching back
+    /// gives the file it started as.
+    #[test]
+    fn a_tool_switch_writes_only_the_allow_list() {
+        const BEFORE: &str = "# Nixi's file\nversion = 1\n\n[tools]\n# mine\nallow  = [\"drive_read\", \"reply\",\n          \"skill_view\"]  # kept\ndrives = [\"tgdrive\"]\n\n[limits]\nhop_limit = 1\n";
+        let on = with_tool_allowed(BEFORE, AgentKind::Proxy, "web_search", true).expect("on");
+        assert_eq!(
+            on,
+            BEFORE.replace("\"skill_view\"]", "\"skill_view\", \"web_search\"]")
+        );
+        assert_eq!(
+            with_tool_allowed(&on, AgentKind::Proxy, "web_search", true).expect("again"),
+            on,
+            "switching on what is on changes nothing"
+        );
+        assert_eq!(
+            with_tool_allowed(&on, AgentKind::Proxy, "web_search", false).expect("off"),
+            BEFORE
+        );
+
+        // First, middle, last, twice, alone; a trailing comma.
+        let off = |list: &str| {
+            let text = format!("version = 1\r\n[tools]\r\nallow = {list}\r\n");
+            with_tool_allowed(&text, AgentKind::Proxy, "web_search", false)
+                .expect("off")
+                .replace("version = 1\r\n[tools]\r\nallow = ", "")
+        };
+        assert_eq!(off(r#"["web_search", "reply"]"#), "[\"reply\"]\r\n");
+        assert_eq!(
+            off(r#"["reply", "web_search", "delegate"]"#),
+            "[\"reply\", \"delegate\"]\r\n"
+        );
+        assert_eq!(
+            off(r#"["web_search", "web_search", "reply", "web_search"]"#),
+            "[\"reply\"]\r\n"
+        );
+        assert_eq!(off(r#"[ "web_search" ]"#), "[  ]\r\n");
+        assert_eq!(
+            off("[\"reply\",\r\n  \"web_search\",\r\n]"),
+            "[\"reply\",\r\n]\r\n"
+        );
+        let empty = "version = 1\n[tools]\nallow = []\n";
+        assert_eq!(
+            with_tool_allowed(empty, AgentKind::Proxy, "web_search", true).expect("on"),
+            "version = 1\n[tools]\nallow = [\"web_search\"]\n"
+        );
+    }
+
+    /// R427 (R101W1-04, -05): switching off takes each name with only its
+    /// own comma — a sole name or a run of duplicates with a trailing comma
+    /// leaves `[]`, on one line or many, LF or CRLF — and never a comment or
+    /// a byte of a name kept: one after the kept name before it, one before
+    /// the kept name after it, and one between duplicates that go stay
+    /// where they were. Whatever the layout, `allow` then reads without it.
+    #[test]
+    fn a_tool_switched_off_takes_only_its_own_comma() {
+        for ending in ["\n", "\r\n"] {
+            let off = |list: &str| {
+                let list = list.replace('\n', ending);
+                let text = format!("version = 1{ending}[tools]{ending}allow = {list}{ending}");
+                let written =
+                    with_tool_allowed(&text, AgentKind::Proxy, "web_search", false).expect("off");
+                let reads: Vec<String> = toml_edit::Document::parse(written.as_str())
+                    .expect("toml")["tools"]["allow"]
+                    .as_array()
+                    .expect("an allow list")
+                    .iter()
+                    .filter_map(|name| name.as_str().map(str::to_owned))
+                    .collect();
+                assert!(
+                    !reads.iter().any(|name| name == "web_search"),
+                    "{written:?}"
+                );
+                written
+                    .strip_prefix(&format!("version = 1{ending}[tools]{ending}allow = "))
+                    .and_then(|rest| rest.strip_suffix(ending))
+                    .expect("only allow changed")
+                    .replace(ending, "\n")
+            };
+            assert_eq!(off(r#"["web_search",]"#), "[]");
+            assert_eq!(off(r#"["web_search", "web_search",]"#), "[]");
+            assert_eq!(off(r#"["reply", "web_search",]"#), r#"["reply",]"#);
+            assert_eq!(off("[\n  \"web_search\",\n  \"web_search\",\n]"), "[\n]");
+            assert_eq!(
+                off("[\n  \"reply\", # keep replies available\n  \"web_search\"\n]"),
+                "[\n  \"reply\", # keep replies available\n]"
+            );
+            assert_eq!(
+                off("[\n  \"web_search\",\n  # replies stay\n  \"reply\",\n]"),
+                "[\n  # replies stay\n  \"reply\",\n]"
+            );
+            assert_eq!(
+                off(
+                    "[\n  \"web_search\", # once\n  # and again\n  \"web_search\",\n  \"reply\"\n]"
+                ),
+                "[\n  # once\n  # and again\n  \"reply\"\n]"
+            );
+        }
+    }
+
+    /// An absent `allow` is the kind's defaults: switching a tool on writes
+    /// them out with it — a line of `[tools]` in the file's own form, or a
+    /// new `[tools]` table at the end, in the file's line endings, a missing
+    /// final newline kept missing — and the result reads as the defaults
+    /// plus the tool. Switching off a default alone is refused; a file that
+    /// is not TOML is refused.
+    #[test]
+    fn a_tool_switch_over_the_kinds_defaults_writes_them_out() {
+        let defaults = |kind| {
+            let mut names: Vec<String> = default_allow(kind)
+                .iter()
+                .map(|t| format!("\"{t}\""))
+                .collect();
+            names.push("\"web_search\"".to_owned());
+            format!("allow = [{}]", names.join(", "))
+        };
+        let allow = defaults(AgentKind::Specialist);
+        let on = |text: &str| {
+            with_tool_allowed(text, AgentKind::Specialist, "web_search", true).expect("on")
+        };
+
+        let table = "version = 1\r\n\r\n[tools]\r\n  drives = [\"tgdrive\"] # mine\r\nmcp = []\r\n";
+        assert_eq!(
+            on(table),
+            format!("version = 1\r\n\r\n[tools]\r\n  {allow}\r\n  drives = [\"tgdrive\"] # mine\r\nmcp = []\r\n")
+        );
+        let header_only = "version = 1\n[tools] # nothing yet\n\n[host]\npin = \"\"\n";
+        assert_eq!(
+            on(header_only),
+            format!("version = 1\n[tools] # nothing yet\n{allow}\n\n[host]\npin = \"\"\n")
+        );
+        let dotted = "version = 1\ntools.drives = [\"tgdrive\"]\n";
+        assert_eq!(
+            on(dotted),
+            format!("version = 1\ntools.{allow}\ntools.drives = [\"tgdrive\"]\n")
+        );
+        let inline = "version = 1\ntools = { drives = [\"tgdrive\"] }\n";
+        assert_eq!(
+            on(inline),
+            format!("version = 1\ntools = {{ drives = [\"tgdrive\"], {allow} }}\n")
+        );
+        let none = "version = 1\r\n[model]\r\nbot = \"x\"";
+        assert_eq!(on(none), format!("{none}\r\n\r\n[tools]\r\n{allow}"));
+        let ended = "version = 1\n[model]\nbot = \"x\"\n";
+        assert_eq!(on(ended), format!("{ended}\n[tools]\n{allow}\n"));
+
+        // What is off by default stays as it is when switched off.
+        assert_eq!(
+            with_tool_allowed(ended, AgentKind::Specialist, "web_search", false).expect("off"),
+            ended
+        );
+        assert!(matches!(
+            with_tool_allowed(ended, AgentKind::Specialist, "drive_read", false),
+            Err(HomeRefusal::Invalid { .. })
+        ));
+        assert!(matches!(
+            with_tool_allowed("<<<<<<< ours\n", AgentKind::Proxy, "web_search", true),
+            Err(HomeRefusal::Syntax(_))
+        ));
+        assert!(matches!(
+            with_tool_allowed(
+                "[tools]\nallow = \"web_search\"\n",
+                AgentKind::Proxy,
+                "web_search",
+                false
+            ),
+            Err(HomeRefusal::Syntax(_))
+        ));
+    }
+
+    /// R457: a search level writes `[web_search].ask` and nothing else. An
+    /// absent key reads `true` (ask), so asking again adds nothing; `false`
+    /// goes over the value that is there (its comment and spacing kept), as
+    /// a line of a `[web_search]` without one — a table's or an inline
+    /// table's — or as a new table at the end, in the file's line endings, a
+    /// missing final newline kept missing; back to asking writes `true`
+    /// over it. The file reads as asked; a value that is not a boolean, or a
+    /// file that is not TOML, is refused.
+    #[test]
+    fn a_search_level_writes_only_its_ask_key() {
+        const BEFORE: &str =
+            "# Nixi's file\r\nversion = 1\r\n\r\n[tools]\r\nallow = [\"web_search\"] # mine\r\n";
+        let unasked = with_web_search_ask(BEFORE, false).expect("without asking");
+        assert_eq!(
+            unasked,
+            format!("{BEFORE}\r\n[web_search]\r\nask = false\r\n")
+        );
+        assert_eq!(
+            with_web_search_ask(BEFORE, true).expect("asks"),
+            BEFORE,
+            "an absent key already asks"
+        );
+        let back = with_web_search_ask(&unasked, true).expect("back to asking");
+        assert_eq!(back, format!("{BEFORE}\r\n[web_search]\r\nask = true\r\n"));
+        assert_eq!(with_web_search_ask(&back, false).expect("again"), unasked);
+
+        let there = "version = 1\n[web_search]\n# the person's\nask  =  true   # chosen\n\n[limits]\nhop_limit = 1";
+        assert_eq!(
+            with_web_search_ask(there, false).expect("over the value"),
+            there.replace("ask  =  true", "ask  =  false")
+        );
+        let header_only = "version = 1\n[web_search] # mine\n\n[limits]\nhop_limit = 1\n";
+        assert_eq!(
+            with_web_search_ask(header_only, false).expect("into the table"),
+            "version = 1\n[web_search] # mine\nask = false\n\n[limits]\nhop_limit = 1\n"
+        );
+        assert_eq!(
+            with_web_search_ask("version = 1\nweb_search = {}\n", false).expect("inline"),
+            "version = 1\nweb_search = { ask = false }\n"
+        );
+        assert_eq!(
+            with_web_search_ask("version = 1\nweb_search.ask = true\n", false).expect("dotted"),
+            "version = 1\nweb_search.ask = false\n"
+        );
+        assert_eq!(
+            with_web_search_ask("version = 1\n[model]\nbot = \"x\"", false).expect("unended"),
+            "version = 1\n[model]\nbot = \"x\"\n\n[web_search]\nask = false"
+        );
+        for refused in [
+            "<<<<<<< ours\n",
+            "web_search = 3\n",
+            "[web_search]\nask = \"no\"\n",
+        ] {
+            assert!(
+                matches!(
+                    with_web_search_ask(refused, false),
+                    Err(HomeRefusal::Syntax(_))
+                ),
+                "{refused:?}"
+            );
+        }
+
+        // The host reads what was written: absent or true asks, false does
+        // not; any other key or value is the home's refusal.
+        let read = |text: &str| parse_agent_toml(text, "nixi", &tgdrive());
+        assert!(read(&nixi()).expect("nixi").web_search_ask);
+        let written = with_web_search_ask(&nixi(), false).expect("nixi without asking");
+        assert!(!read(&written).expect("parses").web_search_ask);
+        assert_eq!(
+            written.strip_suffix("\n[web_search]\nask = false\n"),
+            Some(nixi().as_str())
+        );
+        let back = with_web_search_ask(&written, true).expect("nixi asks");
+        assert!(read(&back).expect("parses").web_search_ask);
+        assert!(matches!(
+            read(&format!("{}\n[web_search]\nask = \"no\"\n", nixi())),
+            Err(HomeRefusal::WrongType { .. })
+        ));
+        assert!(matches!(
+            read(&format!("{}\n[web_search]\nasks = false\n", nixi())),
+            Err(HomeRefusal::UnknownKey(_))
+        ));
     }
 
     #[test]

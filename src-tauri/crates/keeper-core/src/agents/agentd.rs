@@ -63,6 +63,10 @@ pub struct AgentdConfig {
     /// `quarter-hour`, which an operator writes only once every device and
     /// agentd serving these agents runs a build that reads it.
     pub claims_lease: crate::agents::claim::ClaimsLease,
+    /// `[web_search].url` (story 101.4, R419): the SearXNG JSON engine this
+    /// host's agents search with, for those whose `[tools].allow` names
+    /// `web_search`; `None` offers none of them a search.
+    pub web_search: Option<BaseUrl>,
 }
 
 /// `[homeserver]`.
@@ -236,12 +240,20 @@ struct RawConfig {
     kvm: Vec<crate::agents::kvm::RawKvm>,
     #[serde(default)]
     claims: Option<RawClaims>,
+    #[serde(default)]
+    web_search: Option<RawWebSearch>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawClaims {
     lease: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawWebSearch {
+    url: String,
 }
 
 #[derive(Deserialize)]
@@ -431,6 +443,14 @@ impl AgentdConfig {
         let mcp = crate::agents::mcp::check(raw.mcp, &kvm, crate::agents::mcp::AGENTD)
             .map_err(|(at, reason)| invalid(at, reason))?;
 
+        let web_search = raw
+            .web_search
+            .map(|table| {
+                crate::agents::web_search::parse_url(&table.url)
+                    .map_err(|reason| invalid("[web_search] `url`", reason))
+            })
+            .transpose()?;
+
         Ok(AgentdConfig {
             principal: raw.principal,
             host: raw.host,
@@ -445,6 +465,7 @@ impl AgentdConfig {
             mcp,
             kvm,
             claims_lease: claims_lease(raw.claims)?,
+            web_search,
         })
     }
 
@@ -718,6 +739,37 @@ readers     = ["@tgorka:example.org"]
         );
         let names: Vec<&str> = config.secrets().iter().map(|s| s.name()).collect();
         assert_eq!(names, ["cliproxy", "desk-kvm", "paseo", "tgdrive"]);
+    }
+
+    /// 101.4 #2, R423: makistack's marked block — exactly this grammar —
+    /// names the host's engine; anything but an http(s) URL, or another key,
+    /// is refused naming `[web_search]`; no table names none.
+    #[test]
+    fn a_web_search_engine_is_one_http_url() {
+        assert_eq!(
+            AgentdConfig::parse(EXAMPLE).expect("parses").web_search,
+            None
+        );
+        let block = "\n[web_search]\nurl = \"http://127.0.0.1:5191\"\n";
+        let config = AgentdConfig::parse(&format!("{EXAMPLE}{block}")).expect("parses");
+        assert_eq!(
+            config.web_search.map(|url| url.normalized),
+            Some("http://127.0.0.1:5191".to_owned())
+        );
+        let file = refused(&format!(
+            "{EXAMPLE}\n[web_search]\nurl = \"file:///etc/passwd\"\n"
+        ));
+        assert!(
+            file.starts_with(
+                "[web_search] `url` in agentd.toml is refused: keeper searches over http or https"
+            ),
+            "{file}"
+        );
+        assert!(refused(&format!(
+            "{EXAMPLE}\n[web_search]\nurl = \"http://127.0.0.1:5191\"\nkey = \"x\"\n"
+        ))
+        .contains("key"));
+        assert!(refused(&format!("{EXAMPLE}\n[web_search]\n")).contains("url"));
     }
 
     #[test]

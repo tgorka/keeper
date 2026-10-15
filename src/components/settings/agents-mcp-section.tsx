@@ -1,7 +1,8 @@
 /**
- * Settings → Agents → *MCP servers* and *Sandbox* (Story 96.2, UX-DR140; R213):
- * this Mac's own servers and `[sandbox]` table, kept in `keeper.db` on this Mac
- * only — what `agentd.toml` says on a Linux host.
+ * Settings → Agents → *MCP servers*, *Sandbox* and *Web search* (Story 96.2,
+ * UX-DR140; R213; Story 101.4, R419): this Mac's own servers, `[sandbox]` table
+ * and search engine, kept in `keeper.db` on this Mac only — what `agentd.toml`
+ * says on a Linux host.
  *
  * Everything shown is Rust's: whether a server answers and why not, the tier of
  * each tool it lists as the cards name it, a program's floor, a role's fixed
@@ -61,12 +62,15 @@ import {
   type AgentMcpTierVm,
   type AgentSandboxEnvVm,
   type AgentSandboxVm,
+  type AgentWebSearchUrlVm,
   agentsMcpDraft,
   agentsMcpList,
   agentsMcpRemove,
   agentsMcpSave,
   agentsSandboxGet,
   agentsSandboxSave,
+  agentsWebSearchGet,
+  agentsWebSearchSave,
 } from "@/lib/ipc/client";
 
 export const MCP_SECTION_TITLE = "MCP servers";
@@ -87,6 +91,11 @@ export const SANDBOX_SECTION_TITLE = "Sandbox";
 export const SANDBOX_SECTION_NOTE =
   "Folders a command an agent runs on this Mac may read and run, and variables naming folders, for toolchains installed outside the system's folders.";
 export const SANDBOX_SAVE_LABEL = "Save sandbox";
+export const WEB_SEARCH_SECTION_TITLE = "Web search";
+export const WEB_SEARCH_SECTION_NOTE =
+  "The search engine your agents on this Mac search the web with: a SearXNG address with its JSON format on. Only agents you switch web search on for use it, and their queries go to it. Leave it empty for none. Kept on this Mac only.";
+export const WEB_SEARCH_URL_LABEL = "Search engine address";
+export const WEB_SEARCH_SAVE_LABEL = "Save search engine";
 
 /** How often the open sections read again: the host asks each server every minute. */
 export const MCP_RELOAD_MS = 5000;
@@ -833,6 +842,101 @@ export function AgentsSandboxSection({ open }: { open: boolean }) {
           </Button>
         </div>
       </form>
+    </section>
+  );
+}
+
+/**
+ * This Mac's web search engine (101.4 #2, R419): one address, checked by Rust
+ * with the check agentd's `[web_search] url` goes through. Empty names none.
+ * A stored address that no longer checks shows Rust's sentence.
+ */
+export function AgentsWebSearchSection({ open }: { open: boolean }) {
+  const [stored, setStored] = useState<AgentWebSearchUrlVm | undefined>(undefined);
+  const [url, setUrl] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const id = useId();
+
+  const show = useCallback((read: AgentWebSearchUrlVm) => {
+    setStored(read);
+    setUrl(read.url ?? "");
+  }, []);
+
+  useEffect(() => {
+    if (!open) {
+      return;
+    }
+    agentsWebSearchGet()
+      .then(show)
+      .catch((failure: unknown) => {
+        logFailure("agents.webSearchGet")(failure);
+        setError(messageOf(failure));
+      });
+  }, [open, show]);
+
+  const save = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      show(await agentsWebSearchSave(url));
+    } catch (failure) {
+      logFailure("agents.webSearchSave")(failure);
+      setError(messageOf(failure));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <section aria-labelledby={`${id}-title`} className="flex min-w-0 flex-col gap-2 border-t pt-2">
+      <h4 id={`${id}-title`} className="font-medium">
+        {WEB_SEARCH_SECTION_TITLE}
+      </h4>
+      <p className="text-muted-foreground text-xs">{WEB_SEARCH_SECTION_NOTE}</p>
+      {stored?.refusal != null && (
+        <p className="text-destructive text-xs [overflow-wrap:anywhere]">{stored.refusal}</p>
+      )}
+      <form
+        aria-label={WEB_SEARCH_SECTION_TITLE}
+        className="flex min-w-0 flex-wrap items-end gap-2"
+        onSubmit={(event) => {
+          event.preventDefault();
+          void save();
+        }}
+      >
+        <div className="flex min-w-0 flex-1 flex-col gap-1">
+          <Label htmlFor={`${id}-url`} className="text-xs">
+            {WEB_SEARCH_URL_LABEL}
+          </Label>
+          <Input
+            id={`${id}-url`}
+            type="text"
+            inputMode="url"
+            autoComplete="off"
+            autoCapitalize="none"
+            autoCorrect="off"
+            spellCheck={false}
+            placeholder="http://127.0.0.1:8888"
+            className="min-w-0 font-mono text-xs"
+            value={url}
+            disabled={busy || stored === undefined}
+            onChange={(event) => setUrl(event.target.value)}
+          />
+        </div>
+        <Button
+          type="submit"
+          size="sm"
+          disabled={busy || stored === undefined || url.trim() === (stored.url ?? "")}
+        >
+          {WEB_SEARCH_SAVE_LABEL}
+        </Button>
+      </form>
+      {error !== null && (
+        <p role="alert" className="text-destructive text-xs [overflow-wrap:anywhere]">
+          {error}
+        </p>
+      )}
     </section>
   );
 }

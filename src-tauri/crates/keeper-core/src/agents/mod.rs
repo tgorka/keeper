@@ -67,5 +67,6 @@ pub mod tier;
 pub mod trust;
 pub mod unifiedpush;
 pub mod waiting;
+pub mod web_search;
 pub mod workflow;
 pub mod zone;

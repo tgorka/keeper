@@ -2374,12 +2374,13 @@ async fn kvm_moved(deps: &AgentDeps, record: &ApprovalRecord) -> Option<String> 
     None
 }
 
-/// What a consumed `run`, MCP or KVM record was checked against; `None`
-/// for every other tool.
+/// What a consumed `run`, MCP, KVM or web search record was checked
+/// against; `None` for every other tool.
 fn approved_run(record: &ApprovalRecord) -> Option<Box<ApprovedRun>> {
     (record.action.tool == AgentTool::Run.as_wire()
         || record.action.tool == AgentTool::Mcp.as_wire()
-        || record.action.tool == AgentTool::KvmAct.as_wire())
+        || record.action.tool == AgentTool::KvmAct.as_wire()
+        || record.action.tool == AgentTool::WebSearch.as_wire())
     .then(|| {
         Box::new(ApprovedRun {
             exec_binding: record.action.exec_binding.clone(),
@@ -2497,8 +2498,9 @@ async fn mcp_moved(deps: &AgentDeps, record: &ApprovalRecord) -> Option<String> 
 }
 
 /// What a record's call reaches outside keeper, read again before its
-/// approval is consumed: its MCP server (R144), then the Mac's screen or
-/// the KVM's screen it acts on. The first that moved, and how.
+/// approval is consumed: its MCP server (R144), the Mac's screen or the
+/// KVM's screen it acts on, or the web search engine its query goes to
+/// (R428). The first that moved, and how.
 async fn outside_moved(deps: &AgentDeps, record: &ApprovalRecord) -> Option<String> {
     if let Some(moved) = mcp_moved(deps, record).await {
         return Some(moved);
@@ -2506,7 +2508,28 @@ async fn outside_moved(deps: &AgentDeps, record: &ApprovalRecord) -> Option<Stri
     if let Some(moved) = screen_moved(deps, record).await {
         return Some(moved);
     }
+    if let Some(moved) = web_moved(deps, record) {
+        return Some(moved);
+    }
     kvm_moved(deps, record).await
+}
+
+/// A web search record's engine, against the one this host names now
+/// (R428): an approval releases its query to the engine it bound, so a
+/// host with none, or another, consumes nothing.
+fn web_moved(deps: &AgentDeps, record: &ApprovalRecord) -> Option<String> {
+    use keeper_core::agents::web_search as core_web;
+    if record.action.tool != AgentTool::WebSearch.as_wire() {
+        return None;
+    }
+    let now = deps
+        .web_search
+        .as_ref()
+        .map(|engine| core_web::binding(engine.engine()));
+    (now.as_ref() != Some(&record.action.exec_binding)).then(|| {
+        tracing::warn!(approval = %record.id, "agents: a web search's engine changed after its approval");
+        "this host's web search engine is not the one it was approved for".to_owned()
+    })
 }
 
 /// What a screen action's record was pinned by, read from the screen again

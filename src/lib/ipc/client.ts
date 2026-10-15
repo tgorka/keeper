@@ -378,6 +378,9 @@ export type { AgentSeedReq } from "./gen/AgentSeedReq";
 export type { AgentSeedResultVm } from "./gen/AgentSeedResultVm";
 export type { AgentStatusVm } from "./gen/AgentStatusVm";
 export type { AgentsLaunchVm } from "./gen/AgentsLaunchVm";
+export type { AgentWebSearchReq } from "./gen/AgentWebSearchReq";
+export type { AgentWebSearchUrlVm } from "./gen/AgentWebSearchUrlVm";
+export type { AgentWebSearchVm } from "./gen/AgentWebSearchVm";
 export type { ApprovalCardVm } from "./gen/ApprovalCardVm";
 export type { ApprovalDecideReq } from "./gen/ApprovalDecideReq";
 export type { ApprovalDecision } from "./gen/ApprovalDecision";
@@ -805,6 +808,7 @@ export type { VoiceStateVm } from "./gen/VoiceStateVm";
 export type { VoiceTargetSpeedVm } from "./gen/VoiceTargetSpeedVm";
 export type { VoiceUnavailableVm } from "./gen/VoiceUnavailableVm";
 export type { VoiceWakeVm } from "./gen/VoiceWakeVm";
+export type { WebSearchLevel } from "./gen/WebSearchLevel";
 export type { WidgetKind } from "./gen/WidgetKind";
 export type { WidgetRow } from "./gen/WidgetRow";
 export type { WordBlockStyle } from "./gen/WordBlockStyle";
@@ -830,6 +834,8 @@ import type { AgentSeedPlanVm } from "./gen/AgentSeedPlanVm";
 import type { AgentSeedReq } from "./gen/AgentSeedReq";
 import type { AgentSeedResultVm } from "./gen/AgentSeedResultVm";
 import type { AgentsLaunchVm } from "./gen/AgentsLaunchVm";
+import type { AgentWebSearchReq } from "./gen/AgentWebSearchReq";
+import type { AgentWebSearchUrlVm } from "./gen/AgentWebSearchUrlVm";
 import type { ApprovalDecideReq } from "./gen/ApprovalDecideReq";
 import type { ApprovalDraftVm } from "./gen/ApprovalDraftVm";
 import type { ApprovalPayloadVm } from "./gen/ApprovalPayloadVm";
@@ -7935,6 +7941,37 @@ export async function agentsSandboxGet(): Promise<AgentSandboxVm> {
  */
 export async function agentsSandboxSave(req: AgentSandboxReq): Promise<AgentSandboxVm> {
   return await invoke<AgentSandboxVm>("agents_sandbox_save", { req });
+}
+
+/**
+ * Settings › Agents: choose one agent's web search level (101.4 #3, R419,
+ * R457). Rust writes only `[tools].allow` and `[web_search].ask` of its
+ * `agent.toml`, refuses a file that changed since the row was read and any
+ * level but off for a gate or a local-only agent, and answers the rows as they
+ * read now; a refusal rejects with its sentence.
+ */
+export async function agentsWebSearchSet(req: AgentWebSearchReq): Promise<AgentCopyVm[]> {
+  return await invoke<AgentCopyVm[]>("agents_web_search_set", { req });
+}
+
+/**
+ * Settings › Agents › *Web search*: this Mac's engine (a SearXNG URL) as
+ * stored in `keeper.db`, and why it is not used when it no longer checks.
+ *
+ * Rejects with: `internal`.
+ */
+export async function agentsWebSearchGet(): Promise<AgentWebSearchUrlVm> {
+  return await invoke<AgentWebSearchUrlVm>("agents_web_search_get");
+}
+
+/**
+ * Name this Mac's web search engine, checked by the same check agentd's
+ * `[web_search] url` goes through; `""` names none. Answers it again.
+ *
+ * Rejects with: `internal`, its message Rust's refusal to show verbatim.
+ */
+export async function agentsWebSearchSave(url: string): Promise<AgentWebSearchUrlVm> {
+  return await invoke<AgentWebSearchUrlVm>("agents_web_search_save", { url });
 }
 
 // ---------------------------------------------------------------------------

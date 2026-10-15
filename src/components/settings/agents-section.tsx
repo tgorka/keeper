@@ -34,8 +34,13 @@
  * folder's level beside its bot, and each ticked agent may take its own bot and
  * level instead.
  *
+ * **Each agent's web search (Story 101.4, R419, R457).** A *Web search* choice
+ * per agent — off, ask, without asking — writes only `[tools].allow` and
+ * `[web_search].ask` of its `agent.toml`; the engine is the host's (on this
+ * Mac: *Web search* below). *Without asking* carries Rust's standing warning.
+ *
  * **Absent, not empty (AD-27).** No flagged folder and nothing this Mac keeps for
- * its agents — no MCP server, no `[sandbox]` row — renders nothing, and the
+ * its agents — no MCP server, no `[sandbox]` row, no web search engine — renders nothing, and the
  * dialog renders the section only where `botTools` is true — a phone is never
  * a host. A Mac with stored MCP servers or a sandbox table shows the section
  * whether or not any folder is flagged, so what it keeps can always be edited
@@ -43,7 +48,11 @@
  */
 import { useCallback, useEffect, useId, useState } from "react";
 import { AgentsClaimsLeaseRow } from "@/components/settings/agents-claims-lease-row";
-import { AgentsMcpSection, AgentsSandboxSection } from "@/components/settings/agents-mcp-section";
+import {
+  AgentsMcpSection,
+  AgentsSandboxSection,
+  AgentsWebSearchSection,
+} from "@/components/settings/agents-mcp-section";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
@@ -69,6 +78,7 @@ import {
   type AgentSeedPlanVm,
   type AgentSeedReq,
   type AgentSeedResultVm,
+  type AgentWebSearchVm,
   agentsCopies,
   agentsCopySignIn,
   agentsDriveRepin,
@@ -78,7 +88,10 @@ import {
   agentsSeedApply,
   agentsSeedOffer,
   agentsSeedPlan,
+  agentsWebSearchGet,
+  agentsWebSearchSet,
   type Effort,
+  type WebSearchLevel,
 } from "@/lib/ipc/client";
 
 /** The section heading, so the dialog and its test cannot disagree about it. */
@@ -105,6 +118,15 @@ export const SEED_NO_LOCAL_BOTS =
 export const AGENTS_RELOAD_MS = 5000;
 
 export const MODEL_SAVE_LABEL = "Save model";
+export const WEB_SEARCH_SWITCH_LABEL = "Web search";
+export const WEB_SEARCH_SWITCH_NOTE =
+  "Lets this agent search the web through the engine its host names. Its queries leave the host.";
+/** The three levels, in the order the row offers them (R457). */
+export const WEB_SEARCH_LEVELS: ReadonlyArray<readonly [WebSearchLevel, string]> = [
+  ["off", "Off"],
+  ["ask", "Ask"],
+  ["withoutAsking", "Without asking"],
+];
 /** The level choice that sends none: the provider decides. */
 export const PROVIDER_DEFAULT_LABEL = "Provider's default";
 const DEFAULT_EFFORT = "default";
@@ -186,10 +208,13 @@ export function AgentsSection({ open }: { open: boolean }) {
     }
     void reload();
     void reloadOffer();
-    Promise.all([agentsMcpList(), agentsSandboxGet()])
-      .then(([mcp, sandbox]) =>
+    Promise.all([agentsMcpList(), agentsSandboxGet(), agentsWebSearchGet()])
+      .then(([mcp, sandbox, webSearch]) =>
         setMacKeeps(
-          mcp.servers.length > 0 || sandbox.readExec.length > 0 || sandbox.env.length > 0,
+          mcp.servers.length > 0 ||
+            sandbox.readExec.length > 0 ||
+            sandbox.env.length > 0 ||
+            webSearch.url !== null,
         ),
       )
       // The sections below say what failed.
@@ -278,6 +303,7 @@ export function AgentsSection({ open }: { open: boolean }) {
       <AgentsMcpSection open={open} />
       <AgentsSandboxSection open={open} />
       <AgentsClaimsLeaseRow open={open} />
+      <AgentsWebSearchSection open={open} />
     </section>
   );
 }
@@ -525,6 +551,9 @@ function AgentRow({
         </form>
       )}
       {agent.model !== null && <AgentModel agent={agent} model={agent.model} onRows={onRows} />}
+      {agent.webSearch !== null && (
+        <AgentWebSearch agent={agent} webSearch={agent.webSearch} onRows={onRows} />
+      )}
       {agent.problem !== null && (
         <p className="text-muted-foreground text-xs [overflow-wrap:anywhere]">{agent.problem}</p>
       )}
@@ -677,6 +706,106 @@ function AgentModel({
       {saved && !changed && (
         <p role="status" className="text-xs">
           Saved to {agent.name}'s agent.toml. Its next turn runs on it.
+        </p>
+      )}
+      {error !== null && (
+        <p role="alert" className="text-destructive text-xs [overflow-wrap:anywhere]">
+          {error}
+        </p>
+      )}
+    </div>
+  );
+}
+
+/**
+ * One agent's *Web search* level (101.4 #3, R419, R457): off, ask, or without
+ * asking. Rust writes only `[tools].allow` and `[web_search].ask` of its
+ * `agent.toml`, against what this row showed. A Mac that only pulls the drive
+ * changes nothing and says why; an agent Rust never offers a search (a gate, a
+ * local-only agent) is offered only off, and says why. While the agent searches
+ * without asking, Rust's standing warning stands beside that choice. A refusal
+ * is Rust's sentence beside the choice.
+ */
+function AgentWebSearch({
+  agent,
+  webSearch,
+  onRows,
+}: {
+  agent: AgentCopyVm;
+  webSearch: AgentWebSearchVm;
+  onRows: (rows: AgentCopyVm[]) => void;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const id = useId();
+  const why = webSearch.locked ?? webSearch.unavailable;
+
+  const choose = async (level: WebSearchLevel) => {
+    if (level === webSearch.level) return;
+    setBusy(true);
+    setError(null);
+    try {
+      onRows(
+        await agentsWebSearchSet({
+          profileId: agent.profileId,
+          agent: agent.agent,
+          level,
+          shownLevel: webSearch.level,
+        }),
+      );
+    } catch (failure) {
+      logFailure("agents.webSearchSet")(failure);
+      setError(messageOf(failure));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="flex min-w-0 flex-col gap-1">
+      <span id={`${id}-label`} className="font-medium text-xs">
+        {WEB_SEARCH_SWITCH_LABEL}
+      </span>
+      <RadioGroup
+        value={webSearch.level}
+        aria-labelledby={`${id}-label`}
+        aria-describedby={`${id}-note`}
+        data-testid={`agent-web-search-${agent.agent}`}
+        className="flex min-w-0 flex-wrap gap-x-4 gap-y-1"
+        onValueChange={(level) => void choose(level as WebSearchLevel)}
+      >
+        {WEB_SEARCH_LEVELS.map(([level, label]) => (
+          <div key={level} className="flex items-center gap-1.5">
+            <RadioGroupItem
+              id={`${id}-${level}`}
+              value={level}
+              disabled={
+                busy ||
+                webSearch.locked !== null ||
+                (level !== "off" && webSearch.unavailable !== null)
+              }
+              aria-describedby={
+                level === "withoutAsking" && webSearch.warning !== null
+                  ? `${id}-warning`
+                  : undefined
+              }
+            />
+            <Label htmlFor={`${id}-${level}`} className="text-xs">
+              {label}
+            </Label>
+          </div>
+        ))}
+      </RadioGroup>
+      <p id={`${id}-note`} className="text-muted-foreground text-xs [overflow-wrap:anywhere]">
+        {why ?? WEB_SEARCH_SWITCH_NOTE}
+      </p>
+      {webSearch.warning !== null && (
+        <p
+          id={`${id}-warning`}
+          data-testid={`agent-web-search-warning-${agent.agent}`}
+          className="text-amber-700 text-xs [overflow-wrap:anywhere] dark:text-amber-400"
+        >
+          {webSearch.warning}
         </p>
       )}
       {error !== null && (

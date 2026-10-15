@@ -10,7 +10,7 @@
 //! | tier | what | the host |
 //! |---|---|---|
 //! | T0 | reads | runs it |
-//! | T1 | reversible inside the session, the surface, `delegate`, `reply`, `bmad_render`, `bmad_memlog`, `ask_human`, `journal_append`, `memory_propose`, `skill_propose` | runs it |
+//! | T1 | reversible inside the session, the surface, `delegate`, `reply`, `bmad_render`, `bmad_memlog`, `ask_human`, `journal_append`, `memory_propose`, `skill_propose`, `web_search` | runs it |
 //! | T2 | a drive write outside the session, a first write the grant asks for, a sandboxed `run`, an MCP tool of a server keeper starts | asks a person |
 //! | T3 | a schedule or workflow set by an agent, a declassification, a `run` with network, an MCP tool nobody vouched for | asks a person, once |
 //! | T4 | a `run` of code the session holds or given inline, a `git push --force`, every input through a KVM | the requester decides |
@@ -133,11 +133,13 @@ pub enum AgentTool {
     KvmSnapshot,
     /// Inputs to another machine through a KVM (AD-409).
     KvmAct,
+    /// A query to the host's web search engine (story 101.4, R419).
+    WebSearch,
 }
 
 impl AgentTool {
     /// Every tool, in the table's order.
-    pub const ALL: [AgentTool; 36] = [
+    pub const ALL: [AgentTool; 37] = [
         AgentTool::DriveList,
         AgentTool::DriveRead,
         AgentTool::DriveGlob,
@@ -174,6 +176,7 @@ impl AgentTool {
         AgentTool::Mcp,
         AgentTool::KvmSnapshot,
         AgentTool::KvmAct,
+        AgentTool::WebSearch,
     ];
 
     /// The name the model calls (an action's own word for the actions).
@@ -215,6 +218,7 @@ impl AgentTool {
             AgentTool::Mcp => "mcp",
             AgentTool::KvmSnapshot => crate::agents::kvm::SNAPSHOT,
             AgentTool::KvmAct => crate::agents::kvm::ACT,
+            AgentTool::WebSearch => crate::agents::web_search::WEB_SEARCH,
         }
     }
 
@@ -261,6 +265,10 @@ pub struct CallFacts {
     /// system's request to an agent that can read a drive, so the raise
     /// reaches it at T1 — a person decides each one (AD-416, 99.2 #2).
     pub gate_send: bool,
+    /// The calling session's label names its readers (R428): what a
+    /// `web_search` sends out could carry their words, so a person releases
+    /// it ([`crate::agents::web_search::facts`]).
+    pub private_label: bool,
 }
 
 /// The grant's answer for a drive verb, without its payload.
@@ -471,6 +479,13 @@ fn row(tool: AgentTool, facts: &CallFacts) -> Tier {
         // Typing, clicking, a chord, a paste: what it does, as on a screen,
         // is T3; the KVM's raise makes it T4 (AD-409).
         AgentTool::KvmAct => Tier::T3,
+        // A query to the engine the host names, for an agent a person
+        // switched it on for (R419): it changes nothing, and its answer is
+        // outside content, labelled so — T1 while anyone may read the
+        // session; from a label naming its readers its words are theirs to
+        // release, so a person decides it (R428).
+        AgentTool::WebSearch if facts.private_label => Tier::T2,
+        AgentTool::WebSearch => Tier::T1,
     }
 }
 
@@ -824,7 +839,8 @@ mod tests {
                 | AgentTool::WorkflowStart
                 | AgentTool::JournalAppend
                 | AgentTool::MemoryPropose
-                | AgentTool::SkillPropose => {
+                | AgentTool::SkillPropose
+                | AgentTool::WebSearch => {
                     assert_eq!(tier(tool, CallFacts::default()), Tier::T1, "{tool:?}");
                 }
                 AgentTool::Declassify => {

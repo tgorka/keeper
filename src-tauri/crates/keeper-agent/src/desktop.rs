@@ -44,6 +44,7 @@ use keeper_core::agents::run::SandboxTable;
 use keeper_core::agents::seed::AgentSeedBotVm;
 use keeper_core::agents::soul;
 use keeper_core::agents::trust::{Anchor, OwnAccount};
+use keeper_core::agents::web_search::{self, AgentWebSearchReq};
 use keeper_core::bots::chat::{self, CancelHandle, CancelSignal};
 use keeper_core::bots::store::{self, ProviderRow};
 use keeper_core::platform::Platform;
@@ -312,6 +313,7 @@ pub fn listing(
                     pin: None,
                     problem: Some(sentence),
                     model: None,
+                    web_search: None,
                     avatar_problem: None,
                 });
                 continue;
@@ -365,6 +367,16 @@ pub fn listing(
                     &home.config,
                     bots,
                     (!profile.direction.pushes()).then(|| model::pull_only(&decl.id)),
+                )),
+                web_search: Some(web_search::switch_vm(
+                    &home.config,
+                    (!profile.direction.pushes()).then(|| web_search::pull_only(&decl.id)),
+                    facts
+                        .tables
+                        .web_search
+                        .as_ref()
+                        .ok()
+                        .and_then(Option::as_ref),
                 )),
                 avatar_problem,
             });
@@ -421,6 +433,9 @@ pub fn zone_agents(facts: &DesktopFacts) -> BTreeMap<OwnedUserId, ZoneAgent> {
                     avatar,
                     problems: picture.scan.problems,
                     not_here: picture.scan.not_here,
+                    searches_unasked: web_search::level(&home.config)
+                        == web_search::WebSearchLevel::WithoutAsking
+                        && web_search::never(&home.config).is_none(),
                 },
             );
         }
@@ -536,17 +551,18 @@ fn home_of(facts: &DesktopFacts, agent: &UserId) -> Option<(String, String, home
     None
 }
 
-/// A model save made from one read of `agent.toml` (R405): the bytes it
-/// read, their revision, and what replaces them.
+/// A save of one home's `agent.toml` made from one read of it (R405): the
+/// bytes it read, their revision, and what replaces them — a model save
+/// (100.2) or a tool switch (101.4).
 #[derive(Debug)]
-pub struct ModelSave {
+pub struct HomeSave {
     name: String,
     target: keeper_sync::files_write::UnmanagedPath,
     read: keeper_sync::files_write::Revision,
     next: String,
 }
 
-impl ModelSave {
+impl HomeSave {
     /// Write it, only over the bytes it was made from: a file changed since
     /// — another save, a sync, a hand edit — keeps its change and the save
     /// is refused, saying so.
@@ -570,12 +586,65 @@ pub fn prepare_model(
     profiles: &[SyncProfile],
     req: &AgentModelReq,
     bots: model::Choices<'_>,
-) -> Result<ModelSave, String> {
+) -> Result<HomeSave, String> {
+    prepare_home(
+        profiles,
+        (&req.profile_id, &req.agent),
+        model::pull_only,
+        |text, config| {
+            let bot = model::check(req, config, bots)?;
+            home::with_model(text, &bot.reference(), req.effort)
+                .map_err(|refusal| refusal.to_string())
+        },
+    )
+}
+
+/// Settings › Agents' *Web search* choice of one agent (101.4 #3, R419,
+/// R457): only the two keys a level is — `web_search` named in
+/// `[tools].allow` or not, and `[web_search].ask` — changed in its
+/// `agent.toml`, every other byte kept ([`web_search::with_level`]),
+/// checked against what the row showed and the agent's kind
+/// ([`web_search::check`]), and written as a model save is: one read,
+/// compare-and-replace, as the person (R405, R412).
+pub fn write_web_search(profiles: &[SyncProfile], req: &AgentWebSearchReq) -> Result<(), String> {
+    prepare_web_search(profiles, req)?.publish()
+}
+
+/// The first half of [`write_web_search`]. Nothing is written.
+pub fn prepare_web_search(
+    profiles: &[SyncProfile],
+    req: &AgentWebSearchReq,
+) -> Result<HomeSave, String> {
+    prepare_home(
+        profiles,
+        (&req.profile_id, &req.agent),
+        web_search::pull_only,
+        |text, config| {
+            web_search::check(req, config)?;
+            web_search::with_level(text, config.kind, req.level)
+                .map_err(|refusal| refusal.to_string())
+        },
+    )
+}
+
+/// One person's edit of the home `agent` of the drive synced as
+/// `profile_id` (R405, R408): its `agent.toml` read once, `edit` making the
+/// new text from those bytes and what they parse to, the result parsed as
+/// the host will parse it, and the path routed through `WriteScope::route`
+/// — no vault, the sessions fence on, no agent-home fence. A Mac that only
+/// pulls the drive is refused with `pull_only`'s sentence. Nothing is
+/// written.
+fn prepare_home(
+    profiles: &[SyncProfile],
+    (profile_id, agent): (&str, &str),
+    pull_only: fn(&str) -> String,
+    edit: impl FnOnce(&str, &home::AgentConfig) -> Result<String, String>,
+) -> Result<HomeSave, String> {
     use keeper_sync::files_write::{Revision, WriteRoute, WriteScope};
 
-    let (profile, decl, home) = find_home(profiles, &req.profile_id, &req.agent)?;
+    let (profile, decl, home) = find_home(profiles, profile_id, agent)?;
     if !profile.direction.pushes() {
-        return Err(model::pull_only(&decl.id));
+        return Err(pull_only(&decl.id));
     }
     let file = format!("{}/{}", home.config.id, home::FILE_NAME);
     let text = read_text(&home.zone, &file)?
@@ -583,9 +652,7 @@ pub fn prepare_model(
     let read = Revision::of(text.as_bytes());
     let config = home::parse_agent_toml(&text, &home.config.id, &decl)
         .map_err(|refusal| refusal.to_string())?;
-    let bot = model::check(req, &config, bots)?;
-    let next = home::with_model(&text, &bot.reference(), req.effort)
-        .map_err(|refusal| refusal.to_string())?;
+    let next = edit(&text, &config)?;
     home::parse_agent_toml(&next, &home.config.id, &decl).map_err(|refusal| refusal.to_string())?;
     let subpath = format!(
         "{}/{}",
@@ -602,7 +669,7 @@ pub fn prepare_model(
         .route(None::<()>, &profile.local_path, &subpath)
         .map_err(|refusal| refusal.to_string())?
     {
-        WriteRoute::Unmanaged(target) => Ok(ModelSave {
+        WriteRoute::Unmanaged(target) => Ok(HomeSave {
             name: config.name,
             target,
             read,
@@ -1196,6 +1263,16 @@ impl DesktopHost {
         let mcp = Arc::new(crate::agent::off_the_runtime(|| {
             mac_servers(self.platform.as_ref(), &facts.tables)
         }));
+        // This Mac's web search engine (101.4, R419), from the tables the
+        // host is built on: a saved one that no longer checks offers none.
+        let web_search = crate::web::engine_from(
+            facts
+                .tables
+                .web_search
+                .as_ref()
+                .ok()
+                .and_then(Option::as_ref),
+        );
         for home in &signed {
             let user = home.config.matrix_user.clone();
             let Some(homeserver) = homeserver_for(&user, &facts.homeservers) else {
@@ -1226,6 +1303,7 @@ impl DesktopHost {
                     })),
                     sandbox: sandbox.clone(),
                     mcp: Some(Arc::clone(&mcp)),
+                    web_search: web_search.clone(),
                     ..deps
                 }),
                 Err(sentence) => {
@@ -1804,6 +1882,135 @@ mod tests {
         let refused = write_model(&facts.profiles, &save(None), Ok(&bots)).expect_err("unreadable");
         assert!(refused.contains("not valid TOML"), "{refused}");
         assert_eq!(std::fs::read_to_string(&file).expect("kept"), merged);
+    }
+
+    /// 101.4 #3 (R419, R405, R412, R457): the *Web search* choice writes
+    /// only its two keys — Nixi's absent list written out as a proxy's
+    /// defaults plus `web_search`; *without asking* adds `[web_search] ask =
+    /// false`, which the row shows with its standing warning and the room
+    /// header with its mark; off removes that name alone and leaves it
+    /// asking — and the row reads it back; a choice made from a row that no
+    /// longer says what the file does writes nothing; a change landing
+    /// between a choice's read and its write is never written over; a Mac
+    /// that only pulls the drive is refused.
+    #[test]
+    fn the_web_search_choice_writes_only_its_two_keys() {
+        use keeper_core::agents::home::{default_allow, AgentKind};
+        use keeper_core::agents::web_search::WebSearchLevel::{Ask, Off, WithoutAsking};
+
+        let root = tempfile::tempdir().expect("tempdir");
+        nixi_drive(root.path());
+        let file = root.path().join("80-agents/nixi/agent.toml");
+        let profiles = vec![profile(root.path())];
+        let switch = |level, shown_level| AgentWebSearchReq {
+            profile_id: "p1".to_owned(),
+            agent: "nixi".to_owned(),
+            level,
+            shown_level,
+        };
+        let before = std::fs::read_to_string(&file).expect("agent.toml");
+        let facts = DesktopFacts {
+            login: Some("tgorka".to_owned()),
+            profiles: profiles.clone(),
+            ..DesktopFacts::default()
+        };
+        let row = || {
+            listing(
+                &facts,
+                &[],
+                Ok(&[]),
+                &platform(root.path()),
+                &Names::new(),
+                &Problems::new(),
+                &Pictures::new(),
+            )
+            .into_iter()
+            .find(|row| row.agent == "nixi")
+            .expect("nixi's row")
+            .web_search
+            .expect("a choice")
+        };
+        let marked = || {
+            zone_agents(&facts)
+                .into_values()
+                .next()
+                .expect("nixi")
+                .searches_unasked
+        };
+
+        write_web_search(&profiles, &switch(Ask, Off)).expect("on");
+        let on = std::fs::read_to_string(&file).expect("on");
+        let mut names: Vec<String> = default_allow(AgentKind::Proxy)
+            .iter()
+            .map(|tool| format!("\"{tool}\""))
+            .collect();
+        names.push("\"web_search\"".to_owned());
+        assert_eq!(
+            on,
+            format!("{before}\n[tools]\nallow = [{}]\n", names.join(", "))
+        );
+        assert_eq!(
+            row(),
+            web_search::AgentWebSearchVm {
+                level: Ask,
+                locked: None,
+                unavailable: None,
+                warning: None,
+            }
+        );
+        assert!(!marked());
+
+        write_web_search(&profiles, &switch(WithoutAsking, Ask)).expect("without asking");
+        let unasked = std::fs::read_to_string(&file).expect("without asking");
+        assert_eq!(unasked, format!("{on}\n[web_search]\nask = false\n"));
+        assert_eq!(
+            row(),
+            web_search::AgentWebSearchVm {
+                level: WithoutAsking,
+                locked: None,
+                unavailable: None,
+                warning: Some(web_search::unasked_warning(None)),
+            }
+        );
+        assert!(marked());
+        write_web_search(&profiles, &switch(Ask, WithoutAsking)).expect("asks again");
+        let asks = std::fs::read_to_string(&file).expect("asks");
+        assert_eq!(asks, format!("{on}\n[web_search]\nask = true\n"));
+        assert_eq!(row().warning, None);
+        assert!(!marked());
+
+        // The row still says off: nothing is written.
+        assert_eq!(
+            write_web_search(&profiles, &switch(Ask, Off)),
+            Err(web_search::CHANGED_UNDERNEATH.to_owned())
+        );
+        assert_eq!(std::fs::read_to_string(&file).expect("kept"), asks);
+
+        // A sync lands between the choice's read and its write.
+        let mine = prepare_web_search(&profiles, &switch(Off, Ask)).expect("prepared");
+        let synced = format!("{asks}\n[limits]\nrounds_per_turn = 4\n");
+        std::fs::write(&file, &synced).expect("a sync");
+        assert_eq!(
+            mine.publish(),
+            Err(
+                "Nixi's agent.toml changed while you were saving — reopen and try again."
+                    .to_owned()
+            )
+        );
+        assert_eq!(std::fs::read_to_string(&file).expect("kept"), synced);
+
+        write_web_search(&profiles, &switch(Off, Ask)).expect("off");
+        assert_eq!(
+            std::fs::read_to_string(&file).expect("off"),
+            synced.replace(", \"web_search\"]", "]")
+        );
+
+        let mut pulling = profile(root.path());
+        pulling.direction = keeper_sync::profile::SyncDirection::PullOnly;
+        assert_eq!(
+            write_web_search(&[pulling], &switch(Ask, Off)),
+            Err(web_search::pull_only("tgdrive"))
+        );
     }
 
     /// DW-1431 (R415): `/model` in Nixi's DM saves through Settings' own

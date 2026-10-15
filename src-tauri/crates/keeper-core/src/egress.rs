@@ -430,6 +430,27 @@ pub fn agent_egress(servers: &[crate::agents::mcp::McpEntry]) -> Vec<EgressEndpo
     endpoints
 }
 
+/// The row an egress list carries for the web search engine (101.4, R419).
+pub const WEB_SEARCH_LABEL: &str =
+    "Web search engine — the agents you switched web search on for send it their queries";
+
+/// This Mac's web search engine (story 101.4, R419), as one
+/// [`EgressKind::WebSearch`] row: its host and port as an MCP server's row
+/// is composed, never its path. No engine, no row. Kept beside
+/// [`compute_egress`] for [`forge_egress`]'s reason: the shell appends it
+/// from the Mac's own table.
+pub fn web_search_egress(engine: Option<&crate::bots::url::BaseUrl>) -> Vec<EgressEndpointVm> {
+    engine
+        .and_then(|engine| crate::agents::mcp::url_host(&engine.normalized))
+        .map(|host| EgressEndpointVm {
+            url: host,
+            kind: EgressKind::WebSearch,
+            label: WEB_SEARCH_LABEL.to_owned(),
+        })
+        .into_iter()
+        .collect()
+}
+
 /// The row an egress list carries for the push gateway (98.1 #8, Q6).
 pub const PUSH_GATEWAY_LABEL: &str =
     "Push gateway — your homeserver sends it event ids for this device";
@@ -1031,6 +1052,7 @@ mod tests {
             EgressKind::Forge,
             EgressKind::McpServer,
             EgressKind::PushGateway,
+            EgressKind::WebSearch,
         ];
 
         // Wildcard-free exhaustive match: a new `EgressKind` variant makes this
@@ -1047,6 +1069,7 @@ mod tests {
                 EgressKind::Forge => {}
                 EgressKind::McpServer => {}
                 EgressKind::PushGateway => {}
+                EgressKind::WebSearch => {}
             }
         }
 
@@ -1077,6 +1100,9 @@ mod tests {
             "https://notes.example.org/mcp",
         )])));
         out.extend(push_egress(Some("https://push.example.org")));
+        out.extend(web_search_egress(Some(
+            &crate::agents::web_search::parse_url("http://127.0.0.1:5191").expect("engine"),
+        )));
 
         for kind in ALL_KINDS {
             assert!(
@@ -1137,6 +1163,17 @@ mod tests {
     /// 96.2 #10: each `url` server's host (with its port) once, never its
     /// path, query or token; each `command` server as the program keeper
     /// starts, once; no server, no row.
+    #[test]
+    fn a_web_search_engine_is_disclosed_by_host_and_port_only() {
+        let engine =
+            crate::agents::web_search::parse_url("http://127.0.0.1:5191/searx").expect("an engine");
+        let rows = web_search_egress(Some(&engine));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].url, "127.0.0.1:5191");
+        assert_eq!(rows[0].kind, EgressKind::WebSearch);
+        assert!(web_search_egress(None).is_empty());
+    }
+
     #[test]
     fn mcp_servers_are_disclosed_by_host_and_program() {
         assert!(agent_egress(&[]).is_empty());

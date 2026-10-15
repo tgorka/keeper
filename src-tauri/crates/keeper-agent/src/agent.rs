@@ -1410,6 +1410,9 @@ pub struct AgentDeps {
     /// The bounds a person's file is taken in under (R444): its download's
     /// deadline and the PDF reader this host starts.
     pub attachments: crate::attachments::Bounds,
+    /// The web search engine this host names (101.4, R419): `web_search` is
+    /// offered only with it, to an agent whose `[tools].allow` names it.
+    pub web_search: Option<Arc<crate::web::WebSearch>>,
 }
 
 impl AgentDeps {
@@ -1454,6 +1457,9 @@ struct AllowedTools<'t> {
     /// The agent's classic NanoKVMs on this host (96.5); `None` where it
     /// may use none.
     kvm: Option<KvmTools>,
+    /// `web_search` (101.4): this host's engine; `None` where it names
+    /// none, or the turn is a review pass's or a gate's.
+    web: Option<WebTools>,
     view: &'t dyn TurnView,
     sinks: &'t Sinks,
     /// The declarations of the drives this host mounts: a write's audience.
@@ -1763,6 +1769,13 @@ impl AllowedTools<'_> {
                 let landed = self.landed_facts(&self.home.id, &self.card_at(tool, args));
                 tier::named_facts(tool, args, landed)
             }
+            Err(_) if tool == AgentTool::WebSearch => keeper_core::agents::web_search::facts(
+                &self.view.label(),
+                self.web.as_ref().map_or(
+                    keeper_core::agents::web_search::WebSearchLevel::Ask,
+                    |web| keeper_core::agents::web_search::level(&web.home.config),
+                ),
+            ),
             Err(_) => tier::named_facts(tool, args, CallFacts::default()),
         };
 
@@ -2006,6 +2019,48 @@ impl RunTools {
     /// The label of the run the call that just ended made, if it ran.
     fn take_label(&self) -> Option<Label> {
         self.labels.lock().unwrap_or_else(|p| p.into_inner()).pop()
+    }
+}
+
+/// What a turn's `web_search` calls work with (101.4, R419): the host's
+/// engine, the agent's home — read again at each call, so a person's switch
+/// to off, or from *without asking* back to *ask*, reaches a turn already
+/// running (R427, R457) — and the label and engine of each answer that
+/// just came back.
+struct WebTools {
+    engine: Arc<crate::web::WebSearch>,
+    home: crate::zone::AgentHome,
+    answers: Mutex<Vec<(Label, String)>>,
+}
+
+impl WebTools {
+    /// The label of the answer the call that just ended read, and where
+    /// it came from.
+    fn take(&self) -> Option<(Label, String)> {
+        self.answers.lock().unwrap_or_else(|p| p.into_inner()).pop()
+    }
+
+    /// The level the agent searches at, read from its `agent.toml` as it is
+    /// on the drive this moment (R427, R457) — or why it may not search
+    /// now: its switch off, or the agent one
+    /// [`keeper_core::agents::web_search::never`] offers none — a gate, or
+    /// `local_only` (R101W1-03).
+    fn level_now(
+        &self,
+        wire: &str,
+    ) -> Result<keeper_core::agents::web_search::WebSearchLevel, String> {
+        use keeper_core::agents::web_search::{self as core_web, WebSearchLevel};
+        let home = &self.home;
+        let now = crate::zone::read_home(&home.zone, &home.config.id, &home.drive)?.config;
+        if let Some(never) = core_web::never(&now) {
+            return Err(never);
+        }
+        match core_web::level(&now) {
+            WebSearchLevel::Off => Err(format!(
+                "{wire} is not one of this agent's tools on this host."
+            )),
+            level => Ok(level),
+        }
     }
 }
 
@@ -2870,6 +2925,148 @@ impl AllowedTools<'_> {
                         ended: done.ended,
                     });
                 ToolOutcome::Answered { text }
+            }
+            Err(reason) => ToolOutcome::Refused { reason },
+        };
+        audit.finish(&outcome);
+        outcome
+    }
+}
+
+impl AllowedTools<'_> {
+    /// A `web_search` call (101.4, R419, R427, R428, R457), in the order
+    /// every call keeps (R82, R90): refused unsent where this agent is not
+    /// given it here — offered this turn and, read from its `agent.toml`
+    /// now, still switched on and neither a gate nor `local_only` — or its
+    /// query does not read, or the session's label is `local_only`, at
+    /// every level. Classified by the label and the level that read found
+    /// (R428, R457): at *ask*, T1 while anyone may read the session, else
+    /// it waits for a person's approval of this exact query to this engine,
+    /// bound to both; *without asking*, T1. An approval whose engine is not
+    /// this host's now is refused. Its one audit row before the query
+    /// leaves; then the query on its own task, bounded in time and bytes,
+    /// its answer — outside content, labelled `untrusted` and read by
+    /// anyone — what the model reads under the not-instructions sentence.
+    fn web_search(&self, wire: &chat::ToolCall) -> ToolOutcome {
+        use keeper_core::agents::web_search::{self as core_web, WebSearchLevel};
+        let label = self.view.label();
+        let now = self
+            .web
+            .as_ref()
+            .filter(|_| self.allow.iter().any(|name| name == core_web::WEB_SEARCH))
+            .ok_or_else(|| {
+                format!(
+                    "{} is not one of this agent's tools on this host.",
+                    wire.name
+                )
+            })
+            .and_then(|web| web.level_now(&wire.name).map(|level| (web, level)));
+        // A refused call is classified as one that asks: its row says so.
+        let level = now
+            .as_ref()
+            .map_or(WebSearchLevel::Ask, |(_, level)| *level);
+        let classification = self.classify(
+            &wire.id,
+            AgentTool::WebSearch,
+            &core_web::facts(&label, level),
+            None,
+        );
+        let at = self
+            .web
+            .as_ref()
+            .map(|web| core_web::engine(web.engine.engine()))
+            .unwrap_or_default();
+        let refused = |gated: Gated, reason: String| {
+            CallAudit::new(
+                self.sinks,
+                &wire.name,
+                Effect::Write,
+                &classification,
+                gated,
+                ("", &at),
+            )
+            .refuse(reason)
+        };
+        let approved = || {
+            Gated::Run(
+                self.bound_approval(&wire.id, &wire.name)
+                    .map(Approval::Approved),
+            )
+        };
+        let web = match now {
+            Ok((web, _)) => web,
+            Err(reason) => return refused(approved(), reason),
+        };
+        let query = match core_web::Query::parse(wire.arguments.as_ref().unwrap_or(&Value::Null)) {
+            Ok(query) => query,
+            Err(reason) => return refused(approved(), reason),
+        };
+        if let Some(reason) = core_web::sink_refusal(&label) {
+            return refused(approved(), reason);
+        }
+        let binding = core_web::binding(web.engine.engine());
+        let gated = match self.gated(&wire.id, &wire.name, &classification, &[], Vec::new()) {
+            Gated::Park(approval) => {
+                if let Some(parking) = self
+                    .parked
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .as_mut()
+                {
+                    parking.exec_binding = binding;
+                }
+                Gated::Park(approval)
+            }
+            Gated::Run(Some(approval)) => {
+                // What the person approved is this query to this engine:
+                // a host whose engine changed since sends nothing.
+                let checked = self.bound_checked(&wire.id, &wire.name);
+                if checked.as_ref().map(|run| &run.exec_binding) != Some(&binding) {
+                    return refused(
+                        Gated::Run(Some(approval)),
+                        format!(
+                            "It was not searched: this host's web search engine is no longer {}, the one it was approved for.",
+                            checked
+                                .as_ref()
+                                .and_then(|run| run.exec_binding["engine"].as_str())
+                                .and_then(|url| core_web::parse_url(url).ok())
+                                .map(|base| core_web::engine(&base))
+                                .unwrap_or_default()
+                        ),
+                    );
+                }
+                Gated::Run(Some(approval))
+            }
+            gated => gated,
+        };
+        let audit = CallAudit::new(
+            self.sinks,
+            &wire.name,
+            Effect::Write,
+            &classification,
+            gated,
+            ("", &at),
+        );
+        if let Err(withheld) = audit.admit("", &at) {
+            let outcome = withheld.into();
+            audit.finish(&outcome);
+            return outcome;
+        }
+        let searched = {
+            let engine = Arc::clone(&web.engine);
+            let query = query.clone();
+            delegate::block_on(tokio::spawn(async move { engine.search(&query).await }))
+                .unwrap_or_else(|_| Err(core_web::unreachable(web.engine.engine(), false)))
+        };
+        let outcome = match searched {
+            Ok(results) => {
+                web.answers
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push((core_web::result_label(), at.clone()));
+                ToolOutcome::Answered {
+                    text: core_web::render(&query, &results),
+                }
             }
             Err(reason) => ToolOutcome::Refused { reason },
         };
@@ -4183,6 +4380,9 @@ impl AllowedTools<'_> {
         }
         if wire.name == keeper_core::agents::run::RUN {
             return Some(self.run_command(wire));
+        }
+        if wire.name == keeper_core::agents::web_search::WEB_SEARCH {
+            return Some(self.web_search(wire));
         }
         if keeper_core::agents::mcp::decode(&wire.name).is_some() {
             return Some(self.mcp_call(wire));
@@ -9565,10 +9765,12 @@ fn reply_offer(session: SessionKind, relays_waiting: bool, kind: AgentKind) -> R
 /// `workflow_start` outside a proxy's own conversation (AD-380) and the
 /// memory tools `allow` names, by the session's kind (R127),
 /// `drive_search` as `allow` says (95.4), `run` as `allow` says where
-/// this host's sandbox passed its probe, `sandboxed` (96.1 #11), and the
+/// this host's sandbox passed its probe, `sandboxed` (96.1 #11), the
 /// tools of each server `[tools].mcp` names that answered its last
 /// `tools/list` on this host, `mcp`, each that can travel and has a tier
-/// (96.2 #3, #5). Arming and a workflow's start check both ask it (R202).
+/// (96.2 #3, #5), and `web_search` as `allow` says where this host names
+/// an engine, `searches`, to an agent that is not `local_only` (101.4,
+/// R419). Arming and a workflow's start check both ask it (R202).
 #[allow(clippy::too_many_arguments)]
 fn agent_offer(
     config: &keeper_core::agents::home::AgentConfig,
@@ -9579,6 +9781,7 @@ fn agent_offer(
     sandboxed: bool,
     mcp: Option<&crate::mcp::McpServers>,
     kvm: &[String],
+    searches: bool,
     mut tools: Vec<chat::ToolSpec>,
 ) -> Vec<chat::ToolSpec> {
     // Whether this model is offered tools at all: the surface tools ride on
@@ -9640,6 +9843,12 @@ fn agent_offer(
     if let Some(servers) = mcp {
         tools.extend(servers.specs(&config.mcp));
     }
+    if searches
+        && keeper_core::agents::web_search::is_on(config)
+        && keeper_core::agents::web_search::never(config).is_none()
+    {
+        tools.push(keeper_core::agents::web_search::spec());
+    }
     if !kvm.is_empty() {
         for (name, description, parameters) in keeper_core::agents::kvm::specs(kvm) {
             if config.allow.iter().any(|allowed| allowed == name) {
@@ -9680,6 +9889,7 @@ fn workflow_offer(
         deps.sandbox.is_some(),
         deps.mcp.as_deref(),
         &kvm_ids(config, deps.kvm.as_deref()),
+        deps.web_search.is_some(),
         model_tools.to_vec(),
     )
     .into_iter()
@@ -9738,6 +9948,7 @@ async fn arm_session(
         deps.sandbox.is_some(),
         deps.mcp.as_deref(),
         &kvm_ids(config, deps.kvm.as_deref()),
+        deps.web_search.is_some(),
         model_tools.clone(),
     );
     (armed, model_tools)
@@ -10241,6 +10452,22 @@ async fn run_agent_turn(
                 zone: deps.sessions_zone.clone(),
                 answers: Mutex::new(Vec::new()),
             }),
+        // A review pass reads and proposes, a gate turn answers: neither
+        // searches the web; nor does an agent `web_search::never` offers
+        // one — a gate, or `local_only` — whatever its label (R101W1-03).
+        web: deps
+            .web_search
+            .as_ref()
+            .filter(|_| {
+                review.is_none()
+                    && !in_gate
+                    && keeper_core::agents::web_search::never(config).is_none()
+            })
+            .map(|engine| WebTools {
+                engine: Arc::clone(engine),
+                home: deps.home.clone(),
+                answers: Mutex::new(Vec::new()),
+            }),
     };
     let tool_loop = ToolLoop {
         client: &client,
@@ -10319,6 +10546,8 @@ async fn run_agent_turn(
         let fetched = host.mcp.as_ref().and_then(McpTools::take);
         // A KVM's frame is outside content, read by the KVM's readers.
         let framed = host.kvm.as_ref().and_then(KvmTools::take);
+        // A web search's answer is outside content, read by anyone.
+        let searched = host.web.as_ref().and_then(WebTools::take);
         let result_label = if helped.is_some() {
             reads
                 .iter()
@@ -10332,6 +10561,7 @@ async fn run_agent_turn(
                 .chain(ran.clone())
                 .chain(fetched.as_ref().map(|answer| answer.label.clone()))
                 .chain(framed.as_ref().map(|answer| answer.label.clone()))
+                .chain(searched.as_ref().map(|(label, _)| label.clone()))
                 .reduce(|joined, label| joined.join(&label))
                 .unwrap_or_else(|| log.context.label.clone())
         };
@@ -10417,7 +10647,8 @@ async fn run_agent_turn(
         let outside = fetched
             .map(|answer| (answer.label, answer.at))
             .into_iter()
-            .chain(framed.map(|answer| (answer.label, answer.at)));
+            .chain(framed.map(|answer| (answer.label, answer.at)))
+            .chain(searched);
         for (label, at) in outside {
             let joined = log.context.label.join(&label);
             if joined != log.context.label {
@@ -11161,32 +11392,54 @@ pub fn bot_for(home: &AgentHome, rows: &[ProviderRow]) -> Option<(ProviderRow, B
     ))
 }
 
-/// `deps` over the model its home's `agent.toml` names now, read through
-/// the zone's own read path ([`crate::zone::read_home`]) as every turn
-/// begins (100.2 #5, R382): a person's save in Settings › Agents, or a hand
-/// edit, runs from the agent's next turn without restarting the host. Only
-/// `[model]` is taken from the file — every other key still waits for the
-/// host's next build, as before. `Ok(None)` when the model is the one
-/// `deps` holds. A home that no longer reads, or a bot no provider here
-/// serves, refuses the turn with its sentence.
+/// `deps` over the model and the web search level its home's `agent.toml`
+/// names now, read through the zone's own read path
+/// ([`crate::zone::read_home`]) as every turn begins (100.2 #5, R382,
+/// R427, R457): a person's save in Settings › Agents, or a hand edit, runs
+/// from the agent's next turn without restarting the host. Only `[model]`,
+/// whether `[tools].allow` names `web_search` and `[web_search].ask` are
+/// taken from the file — every other key still waits for the host's next
+/// build, as before — so the turn's offer and its dispatch read one
+/// permission ([`keeper_core::agents::web_search::allow_as`]). `Ok(None)`
+/// when all are the ones `deps` holds, nothing copied. A home that no
+/// longer reads, or a bot no provider here serves, refuses the turn with
+/// its sentence.
 /// Boxed: the turn's future holds it across every await, and an inline
 /// `AgentDeps` there overflows the stacks of deep test runtimes.
 pub(crate) fn current_model(deps: &AgentDeps) -> Result<Option<Box<AgentDeps>>, String> {
+    use keeper_core::agents::web_search;
     let home = &deps.home;
     let read = crate::zone::read_home(&home.zone, &home.config.id, &home.drive)?;
     let now = read.config;
-    if now.bot == home.config.bot && now.effort == home.config.effort {
+    let model_moved = now.bot != home.config.bot
+        || now.effort != home.config.effort
+        || now.local_only != home.config.local_only;
+    let search_moved = web_search::level(&now) != web_search::level(&home.config);
+    if !model_moved && !search_moved {
         return Ok(None);
     }
     let fresh = AgentHome {
         config: keeper_core::agents::home::AgentConfig {
+            allow: web_search::allow_as(&home.config.allow, &now),
             bot: now.bot,
             effort: now.effort,
             local_only: now.local_only,
+            web_search_ask: now.web_search_ask,
             ..home.config.clone()
         },
         ..home.clone()
     };
+    if !model_moved {
+        tracing::info!(
+            agent = %fresh.config.id,
+            web_search = ?web_search::level(&fresh.config),
+            "agents: this agent's web search was switched in its agent.toml; this turn runs so"
+        );
+        return Ok(Some(Box::new(AgentDeps {
+            home: fresh,
+            ..deps.clone()
+        })));
+    }
     let (row, bot) = bot_for(&fresh, &deps.rows).ok_or_else(|| {
         format!(
             "No bot provider on this host serves {}'s model {} at {}. Add one under Bots.",
