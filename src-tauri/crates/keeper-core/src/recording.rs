@@ -394,6 +394,60 @@ pub fn parse_event(line: &str) -> Option<RecordingEvent> {
     }
 }
 
+/// How loud a sidecar diagnostic line is in `keeper.log` ([`parse_log`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SidecarLogLevel {
+    /// Written only while Debug mode is on — the trail (which microphone a
+    /// session opened).
+    Info,
+    /// Written always — something went wrong (a microphone that vanished or
+    /// went quiet, and what the recording switched to).
+    Warn,
+}
+
+/// One line `keeper-rec` wants in `keeper.log` and nowhere else
+/// (`{"event":"log","level":"info"|"warn","message":…}`). Never a
+/// [`RecordingEvent`]: it changes no state and nobody is shown it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SidecarLog {
+    /// The level the line is written at.
+    pub level: SidecarLogLevel,
+    /// The sidecar's sentence, control characters removed and at most
+    /// [`SIDECAR_LOG_MAX_CHARS`] long — one line in the log, always.
+    pub message: String,
+}
+
+/// The longest sidecar log message kept, in characters.
+pub const SIDECAR_LOG_MAX_CHARS: usize = 500;
+
+/// Parse one `keeper-rec` stdout line as a [`SidecarLog`], or `None` when it
+/// is not a `log` event or carries no message. An unknown or missing `level`
+/// is written as [`SidecarLogLevel::Warn`]: a line the sidecar thought worth
+/// sending must not vanish behind Debug mode because its level was garbled.
+pub fn parse_log(line: &str) -> Option<SidecarLog> {
+    let value: serde_json::Value = serde_json::from_str(line).ok()?;
+    let obj = value.as_object()?;
+    if obj.get("event")?.as_str()? != "log" {
+        return None;
+    }
+    let level = match obj.get("level").and_then(serde_json::Value::as_str) {
+        Some("info") => SidecarLogLevel::Info,
+        _ => SidecarLogLevel::Warn,
+    };
+    let message: String = obj
+        .get("message")?
+        .as_str()?
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(SIDECAR_LOG_MAX_CHARS)
+        .collect();
+    let message = message.trim();
+    (!message.is_empty()).then(|| SidecarLog {
+        level,
+        message: message.to_owned(),
+    })
+}
+
 // --- NDJSON-RPC request/response wire half (Story 16.4, AD-34) -----------------
 //
 // The host→sidecar request channel: id-correlated, one JSON object per line.
@@ -3116,6 +3170,65 @@ mod tests {
             parse_event(r#"{"event":"warning","code":"micLost","message":"m","extra":true}"#),
             Some(warning("m"))
         );
+    }
+
+    #[test]
+    fn a_log_line_is_never_an_event_and_an_event_is_never_a_log_line() {
+        // The sidecar's diagnostic channel must not move the session machine,
+        // and a warning must not be swallowed as a mere log line.
+        let log = r#"{"event":"log","level":"warn","message":"microphone went quiet"}"#;
+        assert_eq!(parse_event(log), None);
+        assert_eq!(
+            parse_log(log),
+            Some(SidecarLog {
+                level: SidecarLogLevel::Warn,
+                message: "microphone went quiet".to_owned(),
+            })
+        );
+        let warning_line = r#"{"event":"warning","code":"micLost","message":"m"}"#;
+        assert_eq!(parse_log(warning_line), None);
+        assert!(parse_event(warning_line).is_some());
+    }
+
+    #[test]
+    fn a_log_line_keeps_its_level_and_a_garbled_level_is_written_always() {
+        let level = |line: &str| parse_log(line).map(|log| log.level);
+        assert_eq!(
+            level(r#"{"event":"log","level":"info","message":"m"}"#),
+            Some(SidecarLogLevel::Info)
+        );
+        for line in [
+            r#"{"event":"log","level":"loud","message":"m"}"#,
+            r#"{"event":"log","level":3,"message":"m"}"#,
+            r#"{"event":"log","message":"m"}"#,
+        ] {
+            assert_eq!(level(line), Some(SidecarLogLevel::Warn), "line {line:?}");
+        }
+    }
+
+    #[test]
+    fn a_log_line_stays_one_bounded_line_and_an_empty_one_is_nothing() {
+        let forged = parse_log(
+            r#"{"event":"log","level":"warn","message":"mic\n2026-10-16 ERROR forged\r"}"#,
+        )
+        .expect("a message with control characters is still logged");
+        assert!(!forged.message.contains(['\n', '\r']));
+        let long = format!(
+            r#"{{"event":"log","level":"warn","message":"{}"}}"#,
+            "é".repeat(SIDECAR_LOG_MAX_CHARS + 1)
+        );
+        assert_eq!(
+            parse_log(&long).expect("long").message.chars().count(),
+            SIDECAR_LOG_MAX_CHARS
+        );
+        for line in [
+            r#"{"event":"log","level":"warn","message":"  "}"#,
+            r#"{"event":"log","level":"warn"}"#,
+            r#"{"event":"log","level":"warn","message":7}"#,
+            "not json",
+        ] {
+            assert_eq!(parse_log(line), None, "line {line:?}");
+        }
     }
 
     #[tokio::test]

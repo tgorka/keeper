@@ -63,6 +63,24 @@ func emitEvent(_ object: [String: Any]) {
     _ = writeLine(object)
 }
 
+/// How loud one diagnostic line is in the host's `keeper.log`.
+enum LogLevel: String {
+    /// Written only while the person has Debug mode on — the trail of what
+    /// the recording did (which microphone it opened).
+    case info
+    /// Written always — something went wrong and the evidence must already be
+    /// on disk by the time anyone asks.
+    case warn
+}
+
+/// Emit one diagnostic line for the host's `keeper.log`
+/// (`{"event":"log","level":…,"message":…}`). Never shown to the person and
+/// never a state change: the host writes it to the log at `level` and moves on.
+/// Device names belong here; paths, media and anything typed never do.
+func emitLog(_ level: LogLevel, _ message: String) {
+    emitEvent(["event": "log", "level": level.rawValue, "message": message])
+}
+
 /// Map this process's AVFoundation authorization for `mediaType` onto the wire's
 /// TCC tri-state string (Story 19.3). Unlike the Screen Recording preflight,
 /// AVFoundation reports the authoritative granted / denied / notDetermined

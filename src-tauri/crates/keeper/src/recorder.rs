@@ -27,12 +27,12 @@ use keeper_core::error::CoreError;
 use keeper_core::platform::Platform;
 #[cfg(desktop)]
 use keeper_core::recording::{
-    capabilities_request, list_sources_request, parse_capabilities_result, parse_event,
+    capabilities_request, list_sources_request, parse_capabilities_result, parse_event, parse_log,
     parse_request_camera_result, parse_request_microphone_result,
     parse_request_screen_recording_result, parse_sources_result, request_camera_request,
     request_microphone_request, request_screen_recording_request, response_id,
     response_protocol_version, start_recording_request, stop_recording_request,
-    verify_protocol_version, RecordingEvent, SessionParams,
+    verify_protocol_version, RecordingEvent, SessionParams, SidecarLogLevel,
 };
 use keeper_core::vm::{RecordingCapabilitiesVm, RecordingSourcesVm, TccPermission};
 
@@ -519,14 +519,40 @@ impl keeper_core::recording::Recorder for DesktopRecorder {
         }));
 
         // Consume NDJSON lines, forwarding each recognized event as it arrives. An
-        // unrecognized / malformed line parses to `None` and is dropped.
+        // unrecognized / malformed line parses to `None` and is dropped. Every
+        // warning and failure is also written to `keeper.log`, and the sidecar's
+        // own `log` lines (which microphone it opened, what it switched to)
+        // go only there: a recording that went wrong has to leave evidence
+        // behind, not just a sticky banner that ends with the session.
         while let Some(raw) = rx.recv().await {
             let line = String::from_utf8_lossy(&raw);
             let trimmed = line.trim_end_matches(['\n', '\r']);
             if trimmed.is_empty() {
                 continue;
             }
+            if let Some(log) = parse_log(trimmed) {
+                match log.level {
+                    SidecarLogLevel::Info => {
+                        tracing::info!(target: "keeper::recording", "keeper-rec: {}", log.message);
+                    }
+                    SidecarLogLevel::Warn => {
+                        tracing::warn!(target: "keeper::recording", "keeper-rec: {}", log.message);
+                    }
+                }
+                continue;
+            }
             if let Some(event) = parse_event(trimmed) {
+                match &event {
+                    RecordingEvent::Warning { code, message } => tracing::warn!(
+                        target: "keeper::recording",
+                        code = %code,
+                        "recording warning: {message}"
+                    ),
+                    RecordingEvent::Failed { message } => {
+                        tracing::error!(target: "keeper::recording", "recording failed: {message}");
+                    }
+                    _ => {}
+                }
                 on_event(event);
             }
         }

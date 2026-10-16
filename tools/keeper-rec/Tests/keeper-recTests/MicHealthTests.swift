@@ -89,4 +89,71 @@ final class MicHealthTests: XCTestCase {
         XCTAssertTrue(decision.shouldWarn)
         XCTAssertEqual(decision.message, MicHealth.noInputMessage)
     }
+
+    // MARK: - a feed that went quiet (the watchdog)
+
+    func testAStalledFeedWarnsWithItsOwnSentenceAndFallsBack() {
+        // A ScreenCaptureKit mic whose device vanished just stops; the
+        // watchdog names no device, and the person is told the mic stopped,
+        // not that something was unplugged.
+        let decision = MicHealth.decide(
+            micEnabled: true, removedDeviceId: nil, activeDeviceId: "mic-A",
+            fallbackAvailable: true, cause: .stalled)
+        XCTAssertTrue(decision.shouldWarn)
+        XCTAssertEqual(decision.code, MicHealth.warningCode)
+        XCTAssertEqual(decision.message, MicHealth.stalledMessage)
+        XCTAssertTrue(decision.fallbackToDefault)
+    }
+
+    func testAStalledFeedWithNoInputLeftSaysSo() {
+        let decision = MicHealth.decide(
+            micEnabled: true, removedDeviceId: nil, activeDeviceId: "mic-A",
+            fallbackAvailable: false, cause: .stalled)
+        XCTAssertEqual(decision.message, MicHealth.noInputMessage)
+        XCTAssertFalse(decision.fallbackToDefault)
+    }
+
+    func testAStalledFeedOnAMicOffSessionIsNothing() {
+        let decision = MicHealth.decide(
+            micEnabled: false, removedDeviceId: nil, activeDeviceId: nil,
+            fallbackAvailable: true, cause: .stalled)
+        XCTAssertFalse(decision.shouldWarn)
+    }
+
+    func testStallStartsExactlyAtTheThreshold() {
+        let last = 100.0
+        XCTAssertFalse(MicHealth.isStalled(lastSampleUptime: last, now: last))
+        XCTAssertFalse(
+            MicHealth.isStalled(lastSampleUptime: last, now: last + MicHealth.stallSeconds - 0.01))
+        XCTAssertTrue(
+            MicHealth.isStalled(lastSampleUptime: last, now: last + MicHealth.stallSeconds))
+    }
+
+    // MARK: - digital silence
+
+    func testAllZeroBytesAreDigitalSilence() {
+        let zeros = [UInt8](repeating: 0, count: 1024)
+        zeros.withUnsafeBytes { XCTAssertTrue(MicHealth.isDigitalSilence($0)) }
+    }
+
+    func testOneNonZeroByteAnywhereIsSound() {
+        // The quietest real microphone still has a noise floor: a single
+        // least-significant bit set at the very end must count as sound.
+        var samples = [Int16](repeating: 0, count: 512)
+        samples[511] = 1
+        samples.withUnsafeBytes { XCTAssertFalse(MicHealth.isDigitalSilence($0)) }
+    }
+
+    func testFloatZeroIsSilenceAndTheSmallestFloatIsNot() {
+        [Float](repeating: 0, count: 480).withUnsafeBytes {
+            XCTAssertTrue(MicHealth.isDigitalSilence($0))
+        }
+        var samples = [Float](repeating: 0, count: 480)
+        samples[0] = .leastNonzeroMagnitude
+        samples.withUnsafeBytes { XCTAssertFalse(MicHealth.isDigitalSilence($0)) }
+    }
+
+    func testAnEmptyBufferSaysNothing() {
+        [UInt8]().withUnsafeBytes { XCTAssertFalse(MicHealth.isDigitalSilence($0)) }
+    }
 }

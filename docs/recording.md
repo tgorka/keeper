@@ -56,6 +56,31 @@ Two things to know about what "on" means:
   When it does, the switch takes the effective answer straight back — it will
   refuse to move rather than promise a session that will not happen.
 
+## When the microphone goes away mid-recording
+
+The microphone a session opened is the one it records — the system default
+input *at Start* when you did not pick one. If that device disappears (AirPods
+put back in their case, a USB mic unplugged) or simply stops sending sound,
+keeper notices within about two seconds, fills the gap with silence so the
+track stays in sync with the video, and carries on from whatever the system
+default input is now. The recording shows the warning *microphone stopped
+sending sound — using system default input* (or *…disconnected…*), and
+`keeper.log` names both devices ([observability](observability.md)).
+
+This was not always so. On macOS 15 and later the microphone rides
+ScreenCaptureKit's stream, and when the device it was bound to vanishes the
+stream's microphone goes quiet for good without an error or a disconnect
+notice — measured on macOS 27 by destroying the default input mid-session.
+Before the watchdog, the rest of that recording had no microphone at all and
+nothing said so.
+
+A microphone that delivers nothing but exact zeros for eight seconds — a muted
+input, input volume at zero, or a virtual audio device that became the system
+default — raises *“device” is recording silence* while you are still
+recording. A real microphone never produces exact digital silence, so this is
+the one way a wrong default input can show itself; keeper does not switch away
+from it on its own.
+
 ## Audio processing
 
 **Echo cancellation** (**off by default**, under the microphone picker) stops the
