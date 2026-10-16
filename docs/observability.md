@@ -56,6 +56,14 @@ trace to read back) is a defect, and the guards below fail on the common shapes.
     `account` (push is per account; `-` for the operation as a whole) and the
     sentence shown; `a background failure recovered` when that operation
     itself next succeeds.
+  - `keeper::recording` — a screen recording. `recording warning: …` (with its
+    `code`, e.g. `micLost`, `micSilent`) and `recording failed: …` for every
+    warning and failure the capture sidecar reports, and `keeper-rec: …` for
+    the sidecar's own lines: which microphone a session opened (`INFO`), and —
+    at `WARN` — a microphone that was disconnected or stopped sending sound,
+    which device the recording switched to, and a microphone delivering only
+    digital silence. Device names and their unique ids appear here; paths and
+    media never do.
 
 ### Rust panics
 

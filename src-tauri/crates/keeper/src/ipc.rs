@@ -5786,6 +5786,7 @@ fn fail_recording_snapshot(
     platform: &dyn Platform,
     message: String,
 ) {
+    tracing::error!(target: "keeper::recording", "recording failed: {message}");
     let fault_onset = {
         let mut snapshot = status_lock(status);
         if snapshot.state.is_live() || snapshot.state == RecordingUiState::Idle {

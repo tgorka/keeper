@@ -7,8 +7,10 @@
 // is unit-testable (Tests/keeper-recTests/MicHealthTests.swift) without capture
 // hardware or code-signing. `CaptureEngine.handleMicLost` (Capture.swift) feeds
 // every removal signal — a real device disconnect, a 13–14 session runtime
-// error, or the `simulateMicRemoval` RPC — through this one branch and performs
-// the side effects (warning event, silence-fill, fallback) it decides.
+// error, a stalled producer (the mic watchdog), or the `simulateMicRemoval`
+// RPC — through this one branch and performs the side effects (warning event,
+// silence-fill, fallback) it decides. The watchdog's and the silence check's
+// thresholds live here too, for the same reason.
 
 import Foundation
 
@@ -33,6 +35,62 @@ enum MicHealth {
     /// The honest warning message when NO input device remains — the mic
     /// track stays silence-filled for the rest of the session.
     static let noInputMessage = "microphone disconnected — no microphone input"
+
+    /// The honest warning message when the microphone did not disappear but
+    /// simply stopped delivering audio — the watchdog's finding, measured on
+    /// macOS 27: a ScreenCaptureKit microphone bound to the system default
+    /// input goes quiet for good when that device (AirPods leaving) vanishes,
+    /// and no disconnect notification reaches this process. The engine falls
+    /// back to the system default input.
+    static let stalledMessage = "microphone stopped sending sound — using system default input"
+
+    /// What made the engine suspect the microphone, which only changes the
+    /// sentence: every cause takes the same warn + silence-fill + fallback path.
+    enum Cause: Equatable {
+        /// A device removal signal (disconnect, runtime error, simulation).
+        case removed
+        /// The watchdog saw no microphone sample for [`stallSeconds`].
+        case stalled
+    }
+
+    /// How long the live microphone may go without delivering a single sample
+    /// before the watchdog treats it as lost. Every producer keeper uses
+    /// delivers a buffer every ~10–20 ms while it runs, so two seconds of
+    /// nothing is not a quiet room, it is a dead feed.
+    static let stallSeconds: Double = 2
+
+    /// Whether a producer whose last sample arrived at `lastSampleUptime`
+    /// has stalled at `now` (both `ProcessInfo.systemUptime` seconds).
+    static func isStalled(lastSampleUptime: Double, now: Double) -> Bool {
+        now - lastSampleUptime >= stallSeconds
+    }
+
+    /// The wire code for "the microphone is delivering digital silence".
+    static let silentCode = "micSilent"
+
+    /// How long the microphone must deliver nothing but zero samples before
+    /// the engine says so. A real microphone never produces exact digital
+    /// zero — even a silent room has a noise floor — so a stretch this long
+    /// means a muted input, an input volume of zero, or a device that is not a
+    /// microphone at all (a virtual audio device that became the default).
+    static let silenceSeconds: Double = 8
+
+    /// The warning shown while the microphone records digital silence. Names
+    /// the device when it is known, because the fix is to pick another one.
+    static func silentMessage(deviceName: String?) -> String {
+        let device = deviceName.map { "“\($0)”" } ?? "the microphone"
+        return "\(device) is recording silence — check the microphone in "
+            + "System Settings › Sound › Input"
+    }
+
+    /// Whether `bytes` — one buffer of PCM samples in any layout — is digital
+    /// silence. All-zero bytes are zero for every integer and IEEE float
+    /// sample format, so the check needs no format description. An empty
+    /// buffer says nothing and counts as not silent.
+    static func isDigitalSilence(_ bytes: UnsafeRawBufferPointer) -> Bool {
+        guard !bytes.isEmpty else { return false }
+        return !bytes.contains { $0 != 0 }
+    }
 
     /// What the engine should do about one removal signal.
     struct Decision: Equatable {
@@ -64,9 +122,11 @@ enum MicHealth {
     /// - `activeDeviceId`: the uniqueID of the device feeding the mic track,
     ///   or `nil` when unknown (same conservative treatment).
     /// - `fallbackAvailable`: whether a system default input device exists.
+    /// - `cause`: why the engine is asking — only the fallback sentence
+    ///   differs; a stall names no device, so it is always "ours".
     static func decide(
         micEnabled: Bool, removedDeviceId: String?, activeDeviceId: String?,
-        fallbackAvailable: Bool
+        fallbackAvailable: Bool, cause: Cause = .removed
     ) -> Decision {
         // No mic track — no mic to lose; every removal is someone else's.
         guard micEnabled else { return ignore }
@@ -76,10 +136,11 @@ enum MicHealth {
         if let removedDeviceId, let activeDeviceId, removedDeviceId != activeDeviceId {
             return ignore
         }
+        let recovering = cause == .stalled ? stalledMessage : fallbackMessage
         return Decision(
             shouldWarn: true,
             code: warningCode,
-            message: fallbackAvailable ? fallbackMessage : noInputMessage,
+            message: fallbackAvailable ? recovering : noInputMessage,
             fallbackToDefault: fallbackAvailable)
     }
 }

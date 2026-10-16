@@ -212,6 +212,31 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
     /// would fire `handleMicLost` N times for a single later error). Removed at
     /// stop with the rest.
     private var micSessionRuntimeObserver: NSObjectProtocol?
+    /// The display name of the device feeding the mic track, when known —
+    /// for the `keeper.log` lines and the silence warning, never for logic
+    /// (that is `activeMicDeviceId`'s job).
+    private var activeMicDeviceName: String?
+    /// Whether the macOS 15+ in-stream `.microphone` output is the live mic
+    /// producer. Cleared the moment a fallback takes over: from then on the
+    /// stream's mic samples are dropped, so a stream that comes back to life
+    /// can never interleave a second device into the one track.
+    private var micRidesStream = false
+    /// Host uptime of the last sample ANY mic producer delivered, on
+    /// `mediaQueue` — the watchdog's input. Counted on arrival, before any
+    /// writer gate, because it measures the producer, not the writer.
+    private var lastMicSampleUptime: Double = 0
+    /// The repeating mic watchdog on `mediaQueue`, armed once the capture is
+    /// live and cancelled at stop. It exists because a ScreenCaptureKit
+    /// microphone bound to a device that vanishes stops delivering without a
+    /// word (measured on macOS 27: no stream error, no disconnect
+    /// notification reaching this process) — the only signal is the silence.
+    private var micWatchdogTimer: DispatchSourceTimer?
+    /// Host uptime at which the current unbroken run of all-zero mic buffers
+    /// began, or `nil` while the microphone is delivering sound.
+    private var micSilentSince: Double?
+    /// Whether the current run of digital silence has been reported, so one
+    /// run raises one warning and sound coming back re-arms it.
+    private var micSilenceWarned = false
 
     // MARK: - Acoustic echo cancellation (Story 22.7)
 
@@ -541,7 +566,7 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
             // default input (whose concrete id the in-stream 15+ path never
             // reports). `nil` (no default input either) stays conservative:
             // any audio removal then warns rather than silently gapping.
-            activeMicDeviceId = micDeviceId ?? AVCaptureDevice.default(for: .audio)?.uniqueID
+            noteMicDevice(uid: micDeviceId ?? AVCaptureDevice.default(for: .audio)?.uniqueID)
             installMicDisconnectObserver()
             // Story 22.7: the echo-cancelling producer is stood up BEFORE the
             // first writer, because whether it runs decides the mic track's
@@ -617,12 +642,16 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
                 // `mediaQueue` as every other sample — writer state stays
                 // queue-confined, no locks.
                 try stream.addStreamOutput(self, type: .microphone, sampleHandlerQueue: mediaQueue)
+                micRidesStream = true
             } else {
                 // macOS 13–14 (AD-36): no in-stream mic — stand up the parallel
                 // audio-only AVCaptureSession feeding the same per-segment
                 // `micInput`. User-invisible: same writer, same second track.
                 try startMicCaptureSession(deviceId: micDeviceId)
             }
+        }
+        if micEnabled {
+            logMicStart(picked: micDeviceId != nil)
         }
 
         // Story 20.1 (FR-70): the separate camera leg — a dedicated
@@ -654,8 +683,12 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
             }
             // Arm the idle heartbeat (Story 20.5 soak fix): a 1 s tick on the
             // media queue that re-appends the last frame whenever the screen
-            // goes static and SCK stops delivering.
-            self.mediaQueue.async { self.armHeartbeat() }
+            // goes static and SCK stops delivering. The mic watchdog arms
+            // beside it — from here on, a mic that delivers nothing is lost.
+            self.mediaQueue.async {
+                self.armHeartbeat()
+                self.armMicWatchdog()
+            }
         }
     }
 
@@ -800,7 +833,7 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
     ) throws {
         wantsAudio = false
         wantsMic = true
-        activeMicDeviceId = micDeviceId ?? AVCaptureDevice.default(for: .audio)?.uniqueID
+        noteMicDevice(uid: micDeviceId ?? AVCaptureDevice.default(for: .audio)?.uniqueID)
         installMicDisconnectObserver()
         // Story 22.7: the same third producer, before the writer — the mic
         // track's channel count is fixed for the whole session by this answer.
@@ -825,6 +858,8 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
         if !echoCancellationActive {
             try startMicCaptureSession(deviceId: micDeviceId)
         }
+        logMicStart(picked: micDeviceId != nil)
+        mediaQueue.async { [self] in armMicWatchdog() }
         // `recording` is emitted by the first anchored mic sample (the honest
         // moment audio is actually flowing), not here.
     }
@@ -1034,7 +1069,7 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
         // Story 19.4: the concrete device now feeding the mic track (the
         // resolved default when `deviceId` was nil) — the identity
         // `MicHealth.decide` matches removals against.
-        activeMicDeviceId = device.uniqueID
+        noteMicDevice(uid: device.uniqueID)
         // Story 19.4 (closes the 19.3 deferred gap): a yanked device on this
         // path surfaces as a *session runtime error*, not a stream teardown —
         // observe it and route it into the same non-fatal mic-loss branch a
@@ -1070,6 +1105,11 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
     /// rotation handover boundary as system audio.
     private func appendMicSample(_ sampleBuffer: CMSampleBuffer) {
         guard sampleBuffer.isValid, !stopping else { return }
+        // A producer is alive whether or not the writer can take this sample
+        // yet — the watchdog measures the feed, not the track.
+        let arrived = ProcessInfo.processInfo.systemUptime
+        lastMicSampleUptime = arrived
+        trackMicSilence(sampleBuffer, now: arrived)
         let anchorPTS = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         // Story 21.3: in an audio-only session the mic may be the ONLY source
         // (no SCStream at all) — the first mic sample then anchors the writer
@@ -1167,13 +1207,13 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
     }
 
     /// The one mic-loss branch (Story 19.4) — on `mediaQueue`, fed by a device
-    /// disconnect, a 13–14 session runtime error, or `simulateMicRemoval`
-    /// (identical path for all three). NEVER emits `error` and never exits:
-    /// mic loss is non-fatal — video + system audio keep rolling, the mic
-    /// track is silence-filled, and a fallback to the system default input is
-    /// attempted. The host renders the sticky warning; on-hardware silence /
-    /// fallback A/V-sync correctness is Story 20.6.
-    private func handleMicLost(removedDeviceId: String?) {
+    /// disconnect, a 13–14 session runtime error, the mic watchdog (a feed
+    /// that went quiet, `cause: .stalled`), or `simulateMicRemoval`. NEVER
+    /// emits `error` and never exits: mic loss is non-fatal — video + system
+    /// audio keep rolling, the mic track is silence-filled, and a fallback to
+    /// the system default input is attempted. The host renders the sticky
+    /// warning and writes it, with the `log` lines below, to `keeper.log`.
+    private func handleMicLost(removedDeviceId: String?, cause: MicHealth.Cause = .removed) {
         guard !stopping else { return }
         // Idempotent while already lost (Story 19.4): a repeated disconnect
         // notification, the fallback session's own runtime error, or a repeated
@@ -1186,8 +1226,14 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
             micEnabled: wantsMic,
             removedDeviceId: removedDeviceId,
             activeDeviceId: activeMicDeviceId,
-            fallbackAvailable: AVCaptureDevice.default(for: .audio) != nil)
+            fallbackAvailable: AVCaptureDevice.default(for: .audio) != nil,
+            cause: cause)
         guard decision.shouldWarn else { return }
+        emitLog(
+            .warn,
+            cause == .stalled
+                ? "microphone \(describeMic()) delivered no sound for \(Int(MicHealth.stallSeconds)) s"
+                : "microphone \(describeMic()) was disconnected")
         emitEvent([
             "event": "warning",
             "code": decision.code,
@@ -1202,12 +1248,15 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
 
     /// Attempt to re-feed the mic track from the system default input (Story
     /// 19.4) — on `mediaQueue`. Reuses the 13–14 parallel-AVCaptureSession
-    /// machinery on every OS version: on 15+ the SCStream's own `.microphone`
-    /// output stays attached, and whichever source delivers first wins via the
-    /// PTS trim (real churn behavior is Story 20.6). Best-effort: a failure
-    /// downgrades the warning to the honest no-input message (last-write-wins
-    /// on the host) and the track stays silence-filled.
+    /// machinery on every OS version. On 15+ the SCStream's own `.microphone`
+    /// output is retired first (`micRidesStream`): its samples are dropped
+    /// from here on, so the track has exactly one producer — a stream mic
+    /// that later wakes up on some other device cannot interleave into it.
+    /// Best-effort: a failure downgrades the warning to the honest no-input
+    /// message (last-write-wins on the host) and the track stays
+    /// silence-filled.
     private func attemptMicFallback() {
+        micRidesStream = false
         // Retire a dead 13–14 session first — off the media queue
         // (`stopRunning` blocks, and its output delivers here).
         if let dead = micSession {
@@ -1225,7 +1274,8 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
             voiceProcessingMic = nil
             switch attachVoiceProcessingMic(deviceId: nil) {
             case .success:
-                activeMicDeviceId = AVCaptureDevice.default(for: .audio)?.uniqueID
+                noteMicDevice(uid: AVCaptureDevice.default(for: .audio)?.uniqueID)
+                emitLog(.warn, "microphone: now recording from \(describeMic()) (echo cancelled)")
                 return
             case .failure:
                 echoCancellationActive = false
@@ -1238,13 +1288,129 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
         }
         do {
             try startMicCaptureSession(deviceId: nil)
+            emitLog(.warn, "microphone: now recording from \(describeMic())")
         } catch {
+            emitLog(.warn, "microphone: no input to fall back to (\(error))")
             emitEvent([
                 "event": "warning",
                 "code": MicHealth.warningCode,
                 "message": MicHealth.noInputMessage,
             ])
         }
+    }
+
+    // MARK: - Microphone watchdog, silence check and log lines
+
+    /// Record which device feeds the mic track: its uniqueID for
+    /// `MicHealth.decide`, its name for the log and the silence warning.
+    private func noteMicDevice(uid: String?) {
+        activeMicDeviceId = uid
+        activeMicDeviceName = uid.flatMap { AVCaptureDevice(uniqueID: $0)?.localizedName }
+    }
+
+    /// The mic as a log line names it: `“MacBook Air Microphone” (BuiltIn…)`.
+    private func describeMic() -> String {
+        let name = activeMicDeviceName.map { "“\($0)”" } ?? "(unnamed device)"
+        return "\(name) [\(activeMicDeviceId ?? "unknown id")]"
+    }
+
+    /// The one `keeper.log` line naming the microphone a session opened —
+    /// the fact nobody could read back after the recording that lost a voice.
+    private func logMicStart(picked: Bool) {
+        let producer: String
+        if echoCancellationActive {
+            producer = "voice processing"
+        } else if micRidesStream {
+            producer = "ScreenCaptureKit"
+        } else {
+            producer = "AVCaptureSession"
+        }
+        emitLog(
+            .info,
+            "microphone: recording from \(describeMic()), "
+                + "\(picked ? "picked in keeper" : "the system default input"), via \(producer)")
+    }
+
+    /// Arm the mic watchdog (on `mediaQueue`, once): every half second it asks
+    /// whether the live producer has delivered anything in
+    /// `MicHealth.stallSeconds`, and routes a dead feed into the one mic-loss
+    /// branch. The clock starts now, so a microphone that never delivers a
+    /// first sample is caught too.
+    private func armMicWatchdog() {
+        guard wantsMic, micWatchdogTimer == nil, !stopping else { return }
+        lastMicSampleUptime = ProcessInfo.processInfo.systemUptime
+        let timer = DispatchSource.makeTimerSource(queue: mediaQueue)
+        timer.schedule(deadline: .now() + .milliseconds(500), repeating: .milliseconds(500))
+        timer.setEventHandler { [weak self] in self?.micWatchdogTick() }
+        timer.resume()
+        micWatchdogTimer = timer
+    }
+
+    /// One watchdog check, on `mediaQueue`. Quiet while the mic is already
+    /// lost (the fallback's own first sample re-arms it) and before the
+    /// session is anchored (a warning is only legal on a live session).
+    private func micWatchdogTick() {
+        guard !stopping, !micLost, sessionStarted,
+            MicHealth.isStalled(
+                lastSampleUptime: lastMicSampleUptime, now: ProcessInfo.processInfo.systemUptime)
+        else { return }
+        handleMicLost(removedDeviceId: nil, cause: .stalled)
+    }
+
+    /// Follow runs of digital silence on the mic feed (on `mediaQueue`) and
+    /// say so once per run that lasts `MicHealth.silenceSeconds`: a warning
+    /// the person sees while still recording, and a `keeper.log` line. A real
+    /// microphone is never exactly zero, so this is the one symptom a wrong
+    /// default input (a virtual device) or a muted input cannot hide.
+    private func trackMicSilence(_ sampleBuffer: CMSampleBuffer, now: Double) {
+        guard let silent = isDigitalSilence(sampleBuffer) else { return }
+        guard silent else {
+            if micSilenceWarned {
+                emitLog(.warn, "microphone \(describeMic()) is sending sound again")
+            }
+            micSilentSince = nil
+            micSilenceWarned = false
+            return
+        }
+        let since = micSilentSince ?? now
+        micSilentSince = since
+        guard !micSilenceWarned, sessionStarted, now - since >= MicHealth.silenceSeconds else {
+            return
+        }
+        micSilenceWarned = true
+        emitLog(
+            .warn,
+            "microphone \(describeMic()) has delivered only digital silence for "
+                + "\(Int(now - since)) s")
+        emitEvent([
+            "event": "warning",
+            "code": MicHealth.silentCode,
+            "message": MicHealth.silentMessage(deviceName: activeMicDeviceName),
+        ])
+    }
+
+    /// Whether every byte of the sample's PCM is zero; `nil` when the buffer
+    /// carries no readable data (then it says nothing either way).
+    private func isDigitalSilence(_ sampleBuffer: CMSampleBuffer) -> Bool? {
+        guard let block = CMSampleBufferGetDataBuffer(sampleBuffer) else { return nil }
+        let total = CMBlockBufferGetDataLength(block)
+        guard total > 0 else { return nil }
+        var offset = 0
+        while offset < total {
+            var length = 0
+            var pointer: UnsafeMutablePointer<CChar>?
+            guard
+                CMBlockBufferGetDataPointer(
+                    block, atOffset: offset, lengthAtOffsetOut: &length, totalLengthOut: nil,
+                    dataPointerOut: &pointer) == kCMBlockBufferNoErr,
+                let pointer, length > 0
+            else { return nil }
+            if !MicHealth.isDigitalSilence(UnsafeRawBufferPointer(start: pointer, count: length)) {
+                return false
+            }
+            offset += length
+        }
+        return true
     }
 
     /// Arm the repeating silence-fill (Story 19.4) — on `mediaQueue`. While
@@ -1261,33 +1427,40 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
         silenceTimer = timer
     }
 
-    /// Append one chunk of silence up to "now" (host clock — the same
-    /// timeline SCStream and AVCaptureSession stamp samples with), on
-    /// `mediaQueue`. The fill cursor is the shared written-tail lower bound;
-    /// a cursor that fell far behind (a stalled queue) is clamped so one tick
-    /// never fabricates minutes of audio.
+    /// Append silence up to "now" (host clock — the same timeline SCStream
+    /// and AVCaptureSession stamp samples with), on `mediaQueue`, in buffers of
+    /// at most 100 ms — measured on macOS 27, every one-second buffer handed
+    /// to the AAC writer came out with a full-scale click at its start, and
+    /// 100 ms buffers came out clean. The fill cursor is the shared
+    /// written-tail lower bound, and it may reach back up to `maxBackfill`: the
+    /// watchdog only notices a dead feed `MicHealth.stallSeconds` after its
+    /// last sample, and that stretch must be filled too, or every later mic
+    /// sample would sit seconds early against the video. A cursor further
+    /// behind (a stalled queue) is clamped so one tick never fabricates
+    /// minutes of audio.
     private func appendSilenceChunk() {
-        guard micLost, !stopping, sessionStarted,
-            let micInput = current?.micInput, micInput.isReadyForMoreMediaData
-        else { return }
+        guard micLost, !stopping, sessionStarted, let micInput = current?.micInput else { return }
         let sampleRate: Int32 = 48_000
         let now = CMClockGetTime(CMClockGetHostTimeClock())
-        let maxFill = CMTime(value: CMTimeValue(sampleRate), timescale: sampleRate)  // 1 s
+        let maxBackfill = CMTime(value: CMTimeValue(sampleRate) * 5, timescale: sampleRate)  // 5 s
         let tick = CMTime(value: CMTimeValue(sampleRate / 4), timescale: sampleRate)  // 250 ms
         var cursor = micPTSLowerBound
-        if !cursor.isNumeric || CMTimeCompare(CMTimeSubtract(now, cursor), maxFill) > 0 {
+        if !cursor.isNumeric || CMTimeCompare(CMTimeSubtract(now, cursor), maxBackfill) > 0 {
             cursor = CMTimeSubtract(now, tick)
         }
-        let duration = CMTimeSubtract(now, cursor)
-        guard duration.isNumeric, duration.seconds > 0 else { return }
-        let frames = min(Int(sampleRate), Int((duration.seconds * Double(sampleRate)).rounded(.down)))
-        guard frames > 0, let buffer = makeSilenceBuffer(at: cursor, frames: frames) else {
-            return
+        while micInput.isReadyForMoreMediaData {
+            let duration = CMTimeSubtract(now, cursor)
+            guard duration.isNumeric, duration.seconds > 0 else { return }
+            let frames = min(
+                Int(sampleRate / 10), Int((duration.seconds * Double(sampleRate)).rounded(.down)))
+            guard frames > 0, let buffer = makeSilenceBuffer(at: cursor, frames: frames) else {
+                return
+            }
+            micInput.append(buffer)
+            appendMicToCamera(buffer)
+            cursor = CMTimeAdd(cursor, CMTime(value: CMTimeValue(frames), timescale: sampleRate))
+            micPTSLowerBound = cursor
         }
-        micInput.append(buffer)
-        appendMicToCamera(buffer)
-        micPTSLowerBound = CMTimeAdd(
-            cursor, CMTime(value: CMTimeValue(frames), timescale: sampleRate))
     }
 
     /// Build a mono 16-bit 48 kHz LPCM buffer of `frames` zero samples at
@@ -2003,6 +2176,9 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
             // Story 20.5: the idle heartbeat has nothing more to keep warm.
             self.heartbeatTimer?.cancel()
             self.heartbeatTimer = nil
+            // Nor the mic watchdog anything to watch.
+            self.micWatchdogTimer?.cancel()
+            self.micWatchdogTimer = nil
         }
         guard let stream else {
             // NO SCStream: either the stop arrived before capture ever started,
@@ -2248,9 +2424,10 @@ final class CaptureEngine: NSObject, SCStreamDelegate, SCStreamOutput,
             audioInput.append(sampleBuffer)
         default:
             // `.microphone` (macOS 15+, Story 19.3) rides the same SCStream —
-            // route it to the current segment's own mic track. Any other
-            // future output type is dropped.
-            if #available(macOS 15.0, *), type == .microphone {
+            // route it to the current segment's own mic track, unless a
+            // fallback has retired it (`micRidesStream`). Any other future
+            // output type is dropped.
+            if #available(macOS 15.0, *), type == .microphone, micRidesStream {
                 appendMicSample(sampleBuffer)
             }
         }
