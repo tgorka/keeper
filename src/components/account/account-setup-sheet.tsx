@@ -230,7 +230,6 @@ export function SetupLinkField({ id }: { id: string }) {
           id={id}
           className="min-w-48 flex-1 font-mono"
           autoComplete="off"
-          spellCheck={false}
           placeholder={SETUP_LINK_PLACEHOLDER}
           value={link}
           onChange={(event) => setLink(event.target.value)}
@@ -386,7 +385,6 @@ function SetupFlow({ link }: { link: string }) {
                   id="account-setup-device"
                   className="font-mono"
                   autoComplete="off"
-                  spellCheck={false}
                   value={deviceName}
                   onChange={(event) => setDeviceName(event.target.value)}
                 />

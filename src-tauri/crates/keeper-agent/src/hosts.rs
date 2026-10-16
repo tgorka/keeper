@@ -2,7 +2,7 @@
 //! (AD-374, AD-378, AD-379; story 90.6).
 //!
 //! Each tick it renews its manifest in the principal's control room (every
-//! 60 s, live for 180 s), places every active session of the agents it hosts
+//! [`MANIFEST_RENEW_EVERY`], live for [`MANIFEST_TTL`]), places every active session of the agents it hosts
 //! over the live manifests, and acts on [`claims::step`]: acquire what it
 //! wins, renew what it holds, stop writing a claim it cannot confirm, and
 //! hand a session back at an idle moment when placement prefers another live
@@ -29,14 +29,16 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use keeper_core::agents::agentd::AgentdConfig;
-use keeper_core::agents::claim::{self, Claimant, ServerClaim, RENEW_EVERY};
+use keeper_core::agents::claim::{self, Claimant, ClaimsLease, LeaseKind, ServerClaim};
 use keeper_core::agents::delegation::{session_title, DelegateContent};
 use keeper_core::agents::events::{
     RunState, StatusContent, CLAIM, CONTENT_VERSION, CONTROL_ROOM_TYPE, DOORBELL, HOST, STATUS,
     STEWARD_ROOM,
 };
 use keeper_core::agents::home::AgentConfig;
-use keeper_core::agents::host::{accept, bot_id, HostDrive, HostManifest, Materialized};
+use keeper_core::agents::host::{
+    accept, bot_id, HostDrive, HostManifest, Materialized, MANIFEST_RENEW_EVERY, MANIFEST_TTL,
+};
 use keeper_core::agents::label::{check_sink, Label, SinkVerdict};
 use keeper_core::agents::log::reader::ClaimConflict;
 use keeper_core::agents::log::{ClaimAction, HostSlug, LineBody};
@@ -330,11 +332,20 @@ pub(crate) trait CopyPort: Send + Sync {
     /// A new room for this copy's agent's memory review session, the home
     /// drive's readers invited (R128).
     fn review_room(&self) -> ClaimFuture<'_, Result<OwnedRoomId, String>>;
+    /// The console this host runs the copy's agent's commands in, as a
+    /// status says it (R440 09); `None` where the copy cannot say.
+    fn console(&self) -> Option<keeper_core::agents::events::StatusConsole> {
+        None
+    }
 }
 
 impl CopyPort for Copy {
     fn config(&self) -> &AgentConfig {
         &self.deps.home.config
+    }
+
+    fn console(&self) -> Option<keeper_core::agents::events::StatusConsole> {
+        Some(crate::agent::host_console(&self.deps))
     }
 
     fn principal_of(&self, drive: &str) -> Option<String> {
@@ -607,7 +618,7 @@ impl CopyPort for Copy {
                 let now = chrono::Local::now();
                 let files = stewards::folder_files(&config, &decl, duty, &zone)?;
                 let agent = stewards::session(&config, &decl, duty, &room, now);
-                crate::seed::make_folder(&zone, &agent, files, false, now)
+                crate::seed::make_folder(&zone, &agent, files, false, now, &|| true)
                     .map(|settled| settled.folder_made)
             })
             .await
@@ -778,6 +789,14 @@ pub struct HostRuntime {
     /// Its agents' pictures' failed publications, as its manifest says
     /// them and as other hosts' manifests do (story 100.4, R399).
     pictures: Option<PictureReport>,
+    /// The lease a session's claim is taken and renewed on, as this host's
+    /// setting and the manifests and claims read at this tick allow (R449,
+    /// R455).
+    lease_kind: LeaseKind,
+    /// Whether this host's own configuration turns the quarter-hour lease
+    /// on (R455): `agentd.toml`'s `[claims] lease`, the Mac's
+    /// `agents.claims_lease`.
+    lease_setting: ClaimsLease,
 }
 
 /// A host's failed publications of its agents' pictures as its manifest
@@ -963,6 +982,8 @@ impl HostRuntime {
             stewards: Stewarding::default(),
             mcp: None,
             pictures: None,
+            lease_kind: LeaseKind::Minute,
+            lease_setting: config.claims_lease,
         }
     }
 
@@ -1009,6 +1030,8 @@ impl HostRuntime {
             stewards: Stewarding::default(),
             mcp: None,
             pictures: None,
+            lease_kind: LeaseKind::Minute,
+            lease_setting: ClaimsLease::Short,
         }
     }
 
@@ -1059,6 +1082,23 @@ impl HostRuntime {
             elsewhere: Vec::new(),
         });
         self
+    }
+
+    /// Take a session's claim on the quarter-hour lease from now on only
+    /// when `setting` says so (R455): the Mac's `agents.claims_lease`, read
+    /// at every scan. Turned off, a holder on it drops at the next tick.
+    pub(crate) fn set_lease_setting(&mut self, setting: ClaimsLease) {
+        self.lease_setting = setting;
+    }
+
+    /// What this host answers its copies' DM asks with: its name and its
+    /// claims' calibrated server clock (R450).
+    pub(crate) fn dm_round(&self) -> crate::dm_request::DmRound {
+        crate::dm_request::DmRound {
+            host: self.host.as_str().to_owned(),
+            clock: Arc::clone(&self.clock),
+            rtt: Arc::clone(&self.rtt),
+        }
     }
 
     /// What this host's picture publications need of its claims: `None`
@@ -1214,7 +1254,7 @@ impl HostRuntime {
                 .collect(),
             renewed_at: claim::rfc3339(server_now),
             expires_at: claim::rfc3339(if live {
-                server_now.saturating_add(claim::TTL.as_millis() as u64)
+                server_now.saturating_add(MANIFEST_TTL.as_millis() as u64)
             } else {
                 server_now
             }),
@@ -1223,6 +1263,8 @@ impl HostRuntime {
                 .as_ref()
                 .map(|report| crate::avatar::reported(&report.failures))
                 .unwrap_or_default(),
+            // This build reads and writes the quarter-hour lease (R449).
+            lease: Some(claim::QUARTER_HOUR_LEASE.to_owned()),
         }
     }
 
@@ -1258,6 +1300,27 @@ impl HostRuntime {
                 .observe(u64::from(state.origin_server_ts.get()), sent, answered);
         }
         Ok(true)
+    }
+
+    /// Every claim this host sees as its cache holds it: each session's it
+    /// serves and every one in the control room. A host that does not read
+    /// the quarter-hour lease is known by what it writes, whether or not its
+    /// manifest has arrived (R455).
+    async fn claims_seen(&self) -> Vec<ServerClaim> {
+        let mut seen = Vec::new();
+        if let Some((copy, room)) = self.publisher() {
+            for (_, state) in copy.cached_states(room, CLAIM).await {
+                seen.extend(ServerClaim::read(&state).ok());
+            }
+        }
+        for (room, slot) in &self.slots {
+            for (key, state) in slot.copy.cached_states(room, CLAIM).await {
+                if key.is_empty() {
+                    seen.extend(ServerClaim::read(&state).ok());
+                }
+            }
+        }
+        seen
     }
 
     /// The live manifests this host believes, its own as it is now.
@@ -1323,7 +1386,7 @@ impl HostRuntime {
         self.join_control_room().await;
         let due = self
             .manifest_sent
-            .is_none_or(|at| at.elapsed() >= RENEW_EVERY);
+            .is_none_or(|at| at.elapsed() >= MANIFEST_RENEW_EVERY);
         // A server that came to answer, or stopped, renews it at once; so
         // does a picture's publication that failed or recovered.
         let pictures = self
@@ -1364,6 +1427,23 @@ impl HostRuntime {
             }
         }
         let hosts = self.manifests().await;
+        // The quarter-hour lease only where this host's setting turns it on
+        // and every live host reads it — no claim from a host that does not
+        // included; without the control room the others are not seen, so
+        // the minute one (R449, R455). Every held lease is told at once: a
+        // holder on the quarter-hour lease that must leave it writes nothing
+        // more until its minute-lease renewal is confirmed.
+        self.lease_kind = if self.publisher().is_some() {
+            let claims = self.claims_seen().await;
+            LeaseKind::for_fleet(self.lease_setting, &hosts, &claims, self.clock.now())
+        } else {
+            LeaseKind::Minute
+        };
+        for slot in self.slots.values() {
+            if let Some(held) = &slot.claim {
+                held.lease.want(self.lease_kind);
+            }
+        }
         self.read_pictures(&hosts);
         let rooms: Vec<OwnedRoomId> = self.slots.keys().cloned().collect();
         for room in rooms {
@@ -1644,6 +1724,8 @@ impl HostRuntime {
                             detail: None,
                             waiting: Some(text.clone()),
                             anchor: None,
+                            // Not placed yet: no host runs its commands.
+                            console: None,
                         };
                         match copy
                             .send_status(
@@ -1854,6 +1936,15 @@ impl HostRuntime {
             slot.shown = None;
         }
         let held = slot.claim.as_ref().map(|held| held.lease.as_ref());
+        // A claim this host sees written over its own — another host's, or
+        // a later epoch — is read from the server now rather than at the
+        // next renewal: the renewal's read loses the lease when it is gone.
+        let contested = held.is_some_and(|lease| {
+            cached.as_ref().is_some_and(|c| {
+                c.content.epoch > lease.epoch
+                    || (c.content.epoch == lease.epoch && c.content.host != me)
+            })
+        });
         let holding = held.is_some();
         let busy = slot
             .claim
@@ -1874,7 +1965,10 @@ impl HostRuntime {
             // Another live host holds it and answers what arrives.
             copy.forget(room);
         }
-        let action = claims::step(held, &placement, &me, busy, may, Moment::now());
+        let action = match claims::step(held, &placement, &me, busy, may, Moment::now()) {
+            Step::Nothing if contested => Step::Renew,
+            action => action,
+        };
         // A host that has just started may not have seen the others'
         // manifests yet: it says nothing until it has been in the control
         // room a while, so a waiting session is said by one host.
@@ -2085,11 +2179,15 @@ impl HostRuntime {
         let me = claimant(&self.host, copy.as_ref());
         let port = copy.claims(room);
         let scheduled = agent.kind == SessionKind::Scheduled;
-        let acquired = if scheduled {
-            claims::acquire_carrying(port.as_ref(), &me, &self.clock, &self.rtt).await
-        } else {
-            acquire(port.as_ref(), &me, &self.clock, &self.rtt, None).await
-        };
+        let acquired = claims::acquire_session(
+            port.as_ref(),
+            &me,
+            &self.clock,
+            &self.rtt,
+            self.lease_kind,
+            scheduled,
+        )
+        .await;
         match acquired {
             Ok(Acquired::Won {
                 lease,
@@ -2319,6 +2417,7 @@ impl HostRuntime {
             detail: detail.filter(|_| !narrowed),
             waiting,
             anchor: slot.status_anchor.clone(),
+            console: copy.console(),
         };
         match copy
             .send_status(room, serde_json::to_value(&status).unwrap_or(Value::Null))
@@ -2353,6 +2452,7 @@ impl HostRuntime {
             detail: None,
             waiting: None,
             anchor: None,
+            console: None,
         };
         let blocked = blocked_status(base, conflict);
         tracing::warn!(%room, "agents: {}", claims::conflict_line(conflict));
@@ -3149,7 +3249,7 @@ mod tests {
             unreachable!("opening a run uploads nothing")
         }
 
-        fn download<'a>(&'a self, _file: &'a Value) -> crate::delegate::BytesFuture<'a> {
+        fn download<'a>(&'a self, _file: &'a Value, _max: u64) -> crate::delegate::BytesFuture<'a> {
             unreachable!("opening a run downloads nothing")
         }
 
@@ -3692,6 +3792,7 @@ mod tests {
                     vec![(duty.card_file(), "card\n".to_owned())],
                     false,
                     now,
+                    &|| true,
                 )
                 .map(|settled| settled.folder_made)
             })
@@ -3771,6 +3872,8 @@ mod tests {
             stewards: Stewarding::default(),
             mcp: None,
             pictures: None,
+            lease_kind: LeaseKind::Minute,
+            lease_setting: ClaimsLease::Short,
         };
         let (cancel, stop) = cancellation();
         let now = Arc::new(std::sync::atomic::AtomicI64::new(wall_ms() as i64));
@@ -3787,6 +3890,12 @@ mod tests {
     }
 
     impl World {
+        /// How often this host renews a session's claim on the lease its
+        /// fleet allows at the last tick (R449).
+        fn cadence(&self) -> Duration {
+            self.rt.lease_kind.renew_every()
+        }
+
         fn server(&self) -> &Server {
             &self.copy.server
         }
@@ -3892,7 +4001,7 @@ mod tests {
         // electra comes back: a is placed there, b stays pinned here, and
         // b's renewal is due on the same tick.
         w.electra(true);
-        tokio::time::advance(RENEW_EVERY).await;
+        tokio::time::advance(w.cadence()).await;
         let renewed = w.server().claim(&b).expect("b").event_id;
         tokio::time::timeout(Duration::from_secs(1), w.rt.tick(&w.stop))
             .await
@@ -4119,7 +4228,7 @@ mod tests {
             .expect("lock")
             .extend([unnamed.clone(), named.clone()]);
         let key = stewards::session_id(&config(), Duty::Triage).to_string();
-        let lapsed = wall_ms() - 600_000;
+        let lapsed = wall_ms() - claim::TTL.as_millis() as u64 - 60_000;
         let electra = Claimant {
             host: OTHER.to_owned(),
             device: "ELECTRA1".to_owned(),
@@ -4185,7 +4294,7 @@ mod tests {
                 started.elapsed() < Duration::from_secs(1),
                 "the tick waited"
             );
-            tokio::time::advance(RENEW_EVERY).await;
+            tokio::time::advance(w.cadence()).await;
         }
         assert!(w.held_by_me(&a));
         assert!(
@@ -4520,6 +4629,7 @@ mod tests {
             renewed_at: "2026-10-05T00:00:00Z".to_owned(),
             expires_at: "2026-10-05T00:03:00Z".to_owned(),
             picture_failures: Default::default(),
+            lease: Some(claim::QUARTER_HOUR_LEASE.to_owned()),
         })
         .expect("manifest")
     }
@@ -4844,6 +4954,40 @@ mod tests {
             .expect("bounded");
     }
 
+    /// R449 (review-101rooms-1 01): a holder that sees another host's later
+    /// claim in its cache checks it with the server at once — not at its
+    /// next renewal, a quarter-hour away — and stops writing the session
+    /// when the server says it is lost.
+    #[tokio::test(start_paused = true)]
+    async fn a_holder_that_sees_a_later_claim_stops_at_once() {
+        let mut w = world(Duration::ZERO, true);
+        let a = room(1);
+        w.offer(&a, Some(ME));
+        w.tick().await;
+        assert!(w.held_by_me(&a));
+        let held = w.server().claim(&a).expect("claim");
+        let other = Claimant {
+            host: OTHER.to_owned(),
+            device: "ELECTRA1".to_owned(),
+            agent: held.sender.clone(),
+        };
+        let now = wall_ms();
+        w.server().put(
+            &a,
+            CLAIM,
+            "",
+            &held.sender,
+            serde_json::to_value(other.content(held.content.epoch + 1, now, now, false, None))
+                .expect("claim"),
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        w.tick().await;
+        assert!(
+            w.rt.slots.get(&a).is_some_and(|slot| slot.claim.is_none()),
+            "the lease ended at the next tick"
+        );
+    }
+
     /// NFR-120: renewals fail; at 120 s the holder stops, closes the room
     /// and parks the session blocked with why.
     #[tokio::test(start_paused = true)]
@@ -4854,10 +4998,10 @@ mod tests {
         w.tick().await;
         assert!(w.held_by_me(&a));
         w.server().fail_claims.store(true, Ordering::Relaxed);
-        tokio::time::advance(RENEW_EVERY).await;
+        tokio::time::advance(w.cadence()).await;
         w.tick().await;
         assert!(w.server().statuses().is_empty());
-        tokio::time::advance(RENEW_EVERY).await;
+        tokio::time::advance(w.cadence()).await;
         w.tick().await;
         let statuses = w.server().statuses();
         assert_eq!(statuses.len(), 1, "{statuses:?}");
@@ -4883,6 +5027,7 @@ mod tests {
         };
         let copy = Arc::new(FakeCopy {
             known: Some(Arc::new(crate::rooms::Known {
+                refused: Vec::new(),
                 agents: vec![within.clone(), wider.clone()],
                 trust: Vec::new(),
             })),
@@ -4905,7 +5050,7 @@ mod tests {
         w.tick().await;
         w.server().fail_claims.store(true, Ordering::Relaxed);
         for _ in 0..4 {
-            tokio::time::advance(RENEW_EVERY).await;
+            tokio::time::advance(w.cadence()).await;
             w.tick().await;
         }
         let statuses = w.server().statuses();
@@ -4963,9 +5108,9 @@ mod tests {
         w.offer(&a, None);
         w.tick().await;
         w.server().fail_claims.store(true, Ordering::Relaxed);
-        tokio::time::advance(RENEW_EVERY).await;
+        tokio::time::advance(w.cadence()).await;
         w.tick().await;
-        tokio::time::advance(RENEW_EVERY).await;
+        tokio::time::advance(w.cadence()).await;
         w.tick().await;
         let statuses = w.server().statuses();
         assert_eq!(statuses.len(), 1, "{statuses:?}");
@@ -5565,7 +5710,8 @@ mod tests {
     /// `room`'s claim, as the server holds it now, ten minutes old by the
     /// server's clock: lapsed.
     fn lapse(server: &Server, room: &OwnedRoomId) {
-        let lapsed = wall_ms() - 600_000;
+        // Past the longest lease, whichever the claim was written on.
+        let lapsed = wall_ms() - LeaseKind::QuarterHour.ttl().as_millis() as u64 - 60_000;
         server
             .states
             .lock()
@@ -5577,7 +5723,7 @@ mod tests {
 
     /// Electra's lapsed claim on `room` at epoch 4, naming `window`.
     fn electra_lapsed(server: &Server, room: &OwnedRoomId, window: Option<String>) {
-        let lapsed = wall_ms() - 600_000;
+        let lapsed = wall_ms() - claim::TTL.as_millis() as u64 - 60_000;
         let electra = Claimant {
             host: OTHER.to_owned(),
             device: "ELECTRA1".to_owned(),
@@ -5615,7 +5761,7 @@ mod tests {
         // the card as written, and a renewal is due.
         w.tick().await;
         w.offer_scheduled(&a);
-        tokio::time::advance(RENEW_EVERY).await;
+        tokio::time::advance(w.cadence()).await;
         w.tick().await;
         let routed = w.copy.routed();
         assert_eq!(
@@ -6031,7 +6177,7 @@ mod tests {
             w.offer_scheduled(&a);
             for _ in 0..3 {
                 w.tick().await;
-                tokio::time::advance(RENEW_EVERY).await;
+                tokio::time::advance(w.cadence()).await;
             }
         }
         assert_eq!(w.copy.routed().len(), 1, "{:?}", w.copy.routed());
@@ -6051,7 +6197,7 @@ mod tests {
         taker.offer_scheduled(&a);
         for _ in 0..4 {
             taker.tick().await;
-            tokio::time::advance(RENEW_EVERY).await;
+            tokio::time::advance(taker.cadence()).await;
         }
         let claim = server.claim(&a).expect("claim");
         assert_eq!(claim.content.host, OTHER, "the taker holds it");
@@ -8315,7 +8461,7 @@ mod tests {
         assert!(w.held_by_me(&a));
         tokio::time::pause();
         let renewed = w.server().claim(&a).expect("a").event_id;
-        tokio::time::advance(RENEW_EVERY).await;
+        tokio::time::advance(w.cadence()).await;
         tokio::time::timeout(Duration::from_secs(1), w.rt.tick(&w.stop))
             .await
             .expect("the tick waits for no MCP server");

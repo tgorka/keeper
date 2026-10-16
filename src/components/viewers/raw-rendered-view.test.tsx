@@ -1733,6 +1733,12 @@ describe("HTML gets a page, and its text can be retyped (Story 55.5)", () => {
       // file whose markup only Source may change would be a second way to
       // write markup.
       expect(span.getAttribute("contenteditable")).toBe("plaintext-only");
+      // Retyped words are the reader's own: the system capitalises, corrects
+      // and predicts none of them (R433).
+      expect(span.getAttribute("autocapitalize")).toBe("off");
+      expect(span.getAttribute("autocorrect")).toBe("off");
+      expect(span.getAttribute("spellcheck")).toBe("false");
+      expect(span.getAttribute("writingsuggestions")).toBe("false");
     }
     // A run of pure whitespace — the newline after a `</p>` — keeps its index
     // and is not an edit target: it is nothing a reader can see.

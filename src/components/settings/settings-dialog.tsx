@@ -70,7 +70,9 @@ import {
   recordingHotkeyGet,
   recordingHotkeySet,
   setHonorRemoteDeletions,
+  setUndoSendAgentWindow,
   setUndoSendWindow,
+  undoSendAgentWindow,
   undoSendWindow,
   voiceHotkeyClear,
   voiceHotkeyGet,
@@ -389,13 +391,100 @@ function HonorRemoteDeletionsRow() {
 const INCOGNITO_GLOBAL_SENTENCE =
   "Reading a chat sends a private read receipt: your read position still syncs across your own devices, but the other person keeps seeing the message as unread. This is the default for every chat; you can override it per account or per chat.";
 
-/** The default Undo-Send window in seconds (mirrors the Rust registry default). */
-const UNDO_SEND_WINDOW_DEFAULT = 10;
 /** The maximum Undo-Send window in seconds (values clamp to 0..=60). */
 const UNDO_SEND_WINDOW_MAX = 60;
 /** The honest copy explaining the Undo-Send window (Story 8.3). */
 const UNDO_SEND_SENTENCE =
-  "Each message you send waits this many seconds before it leaves, so you can undo it. Set to 0 to send immediately.";
+  "Each message, reply and attachment you send in a chat waits this many seconds before it leaves, so you can undo it. Set to 0 to send immediately. An edit is sent at once.";
+/** The copy for the agent rooms' Undo-Send window (Story 101.3, R432). */
+const UNDO_SEND_AGENT_SENTENCE =
+  "A message, reply or attachment to one of your agents waits this many seconds before the agent sees it. 0 sends it at once. An edit is sent at once, and so is what you say aloud.";
+/** What a window setting says when keeper could not read it (R381). */
+export const UNDO_SEND_UNREAD =
+  "keeper couldn't read this setting, so its value is not shown. Typing one sets it.";
+/** What a window setting says when keeper could not save it (R381). */
+export function undoSendUnsaved(seconds: number): string {
+  return `keeper couldn't save that. It is still ${seconds} seconds.`;
+}
+
+/** One Undo-Send window setting as the field shows it. */
+interface WindowSetting {
+  /** The seconds keeper read or set; `undefined` while loading or when unread. */
+  value: number | undefined;
+  /** Whether the field takes input: once read, or once the read failed. */
+  ready: boolean;
+  /** The sentence beside the field when a read or a write failed (R381). */
+  failure: string | null;
+  onChange: (raw: string) => void;
+}
+
+/**
+ * One Undo-Send window setting (Story 8.3, Story 101.3): load on open, an
+ * optimistic write clamped to 0..=60 that reverts if the write fails and no newer
+ * write superseded it. A non-numeric entry is ignored (keeps the prior value). A
+ * failed read shows no value and says so — never a plausible default — and a
+ * failed write says what the setting still is (R430 10, R381).
+ */
+function useWindowSetting(
+  open: boolean,
+  read: () => Promise<number>,
+  write: (seconds: number) => Promise<void>,
+  source: string,
+): WindowSetting {
+  const [value, setValue] = useState<number | undefined>(undefined);
+  const [ready, setReady] = useState(false);
+  const [failure, setFailure] = useState<string | null>(null);
+  const writeId = useRef(0);
+
+  useEffect(() => {
+    if (!open) {
+      return;
+    }
+    setValue(undefined);
+    setReady(false);
+    setFailure(null);
+    let cancelled = false;
+    void read()
+      .then((seconds) => {
+        if (!cancelled) {
+          setValue(seconds);
+          setReady(true);
+        }
+      })
+      .catch((raw: unknown) => {
+        logFailure(`${source}Get`)(raw);
+        if (!cancelled) {
+          setReady(true);
+          setFailure(UNDO_SEND_UNREAD);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [open, read, source]);
+
+  const onChange = (raw: string) => {
+    const parsed = Number.parseInt(raw, 10);
+    if (Number.isNaN(parsed)) {
+      return;
+    }
+    const clamped = Math.min(UNDO_SEND_WINDOW_MAX, Math.max(0, parsed));
+    writeId.current += 1;
+    const id = writeId.current;
+    const prev = value;
+    setValue(clamped);
+    setFailure(null);
+    void write(clamped).catch((raw: unknown) => {
+      logFailure(`${source}Set`)(raw);
+      if (id === writeId.current) {
+        setValue(prev);
+        setFailure(prev === undefined ? UNDO_SEND_UNREAD : undoSendUnsaved(prev));
+      }
+    });
+  };
+
+  return { value, ready, failure, onChange };
+}
 
 /**
  * The plain disclosure for the message-previews toggle (Story 10.1). Sentence case,
@@ -844,56 +933,20 @@ function PrivacySection({ open }: { open: boolean }) {
       });
   };
 
-  // Undo-Send window in seconds (Story 8.3): `undefined` = still loading; otherwise the
-  // resolved 0..=60 value (0 disables holding). Load-on-open + optimistic write with
-  // revert, mirroring the Incognito toggle above.
-  // Named `undoWindow` (not `window`) so it does not shadow the browser global in this
-  // component's scope.
-  const [undoWindow, setUndoWindow] = useState<number | undefined>(undefined);
-  const windowWriteId = useRef(0);
-
-  useEffect(() => {
-    if (!open) {
-      return;
-    }
-    setUndoWindow(undefined);
-    let cancelled = false;
-    void undoSendWindow()
-      .then((value) => {
-        if (!cancelled) {
-          setUndoWindow(value);
-        }
-      })
-      .catch((raw: unknown) => {
-        logFailure("settings.undoSendWindowGet")(raw);
-        if (!cancelled) {
-          setUndoWindow(UNDO_SEND_WINDOW_DEFAULT);
-        }
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [open]);
-
-  const onWindowChange = (raw: string) => {
-    // Parse + clamp to 0..=60 locally so the field never shows an out-of-range value;
-    // Rust clamps again defensively. A non-numeric entry is ignored (keeps the prior).
-    const parsed = Number.parseInt(raw, 10);
-    if (Number.isNaN(parsed)) {
-      return;
-    }
-    const clamped = Math.min(UNDO_SEND_WINDOW_MAX, Math.max(0, parsed));
-    windowWriteId.current += 1;
-    const id = windowWriteId.current;
-    const prev = undoWindow ?? UNDO_SEND_WINDOW_DEFAULT;
-    setUndoWindow(clamped);
-    void setUndoSendWindow(clamped).catch((raw: unknown) => {
-      logFailure("settings.undoSendWindowSet")(raw);
-      if (id === windowWriteId.current) {
-        setUndoWindow(prev);
-      }
-    });
-  };
+  // Undo-Send windows in seconds (Story 8.3; per room kind since Story 101.3):
+  // `undefined` = still loading, else the resolved 0..=60 value (0 sends at once).
+  const chatWindow = useWindowSetting(
+    open,
+    undoSendWindow,
+    setUndoSendWindow,
+    "settings.undoSendWindow",
+  );
+  const agentWindow = useWindowSetting(
+    open,
+    undoSendAgentWindow,
+    setUndoSendAgentWindow,
+    "settings.undoSendAgentWindow",
+  );
 
   return (
     <div className="mt-2 flex flex-col gap-2 border-border border-t pt-3 text-sm">
@@ -921,13 +974,40 @@ function PrivacySection({ open }: { open: boolean }) {
             min={0}
             max={UNDO_SEND_WINDOW_MAX}
             className="w-20"
-            value={undoWindow ?? ""}
-            disabled={undoWindow === undefined}
-            onChange={(e) => onWindowChange(e.target.value)}
+            value={chatWindow.value ?? ""}
+            disabled={!chatWindow.ready}
+            onChange={(e) => chatWindow.onChange(e.target.value)}
           />
         </div>
       </div>
+      {chatWindow.failure !== null && (
+        <p role="status" className="text-destructive">
+          {chatWindow.failure}
+        </p>
+      )}
       <p className="text-muted-foreground">{UNDO_SEND_SENTENCE}</p>
+      <div className="mt-1 flex items-center justify-between gap-2">
+        <Label htmlFor="undo-send-agent-window">Undo-Send window for agents (seconds)</Label>
+        <div className="flex shrink-0 items-center gap-2">
+          <FileControlled settingKey="undo_send.agent_window" />
+          <Input
+            id="undo-send-agent-window"
+            type="number"
+            min={0}
+            max={UNDO_SEND_WINDOW_MAX}
+            className="w-20"
+            value={agentWindow.value ?? ""}
+            disabled={!agentWindow.ready}
+            onChange={(e) => agentWindow.onChange(e.target.value)}
+          />
+        </div>
+      </div>
+      {agentWindow.failure !== null && (
+        <p role="status" className="text-destructive">
+          {agentWindow.failure}
+        </p>
+      )}
+      <p className="text-muted-foreground">{UNDO_SEND_AGENT_SENTENCE}</p>
     </div>
   );
 }

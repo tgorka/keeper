@@ -137,13 +137,17 @@ pub fn starts_over(line: &LogLine) -> bool {
     matches!(&line.body, LineBody::Gate(body) if body.state == GateState::Request)
 }
 
-/// A person's text, then the drive files they attached, one per line.
+/// A person's text, then the drive files they attached, one per line; a
+/// file sent without a caption (story 101.2) is the list alone.
 fn user_text(body: &UserBody) -> String {
     if body.attachments.is_empty() {
         return body.text.clone();
     }
     let mut text = body.text.clone();
-    text.push_str("\n\nAttached files:");
+    if !text.is_empty() {
+        text.push_str("\n\n");
+    }
+    text.push_str("Attached files:");
     for attachment in &body.attachments {
         text.push_str(&format!("\n- {}:{}", attachment.drive, attachment.path));
     }

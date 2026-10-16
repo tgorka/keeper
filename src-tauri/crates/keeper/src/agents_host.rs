@@ -19,6 +19,7 @@ use std::time::Duration;
 use keeper_agent::desktop::{self, DesktopFacts, DesktopHost, TickGate};
 use keeper_agent::seed as seeding;
 use keeper_core::agents::approval_card::HostedRooms;
+use keeper_core::agents::console::AgentConsoleReq;
 use keeper_core::agents::copy::{self, AgentCopyVm, AgentPinReq};
 use keeper_core::agents::mac_tables::{
     self, AgentMcpDraftVm, AgentMcpListVm, AgentMcpServerReq, AgentSandboxReq, AgentSandboxVm,
@@ -31,6 +32,7 @@ use keeper_core::agents::room::AgentIcons;
 use keeper_core::agents::seed::{
     self, AgentSeedBotVm, AgentSeedOfferVm, AgentSeedPlanVm, AgentSeedReq, AgentSeedResultVm,
 };
+use keeper_core::agents::web_search::{AgentWebSearchReq, AgentWebSearchUrlVm};
 use keeper_core::bots::store;
 use keeper_core::platform::Platform;
 use keeper_core::registry;
@@ -588,12 +590,18 @@ pub async fn agents_model_set(
 ) -> Result<Vec<AgentCopyVm>, IpcError> {
     let facts = facts_now(&state).await?;
     let platform = platform_of(&state);
+    let serving = serving_hosts(&state, &facts).await;
     let saved = {
         let profiles = facts.profiles.clone();
         let req = req.clone();
         tokio::task::spawn_blocking(move || {
             let bots = bot_choices_or_sentence(platform.as_ref());
-            desktop::write_model(&profiles, &req, bots.as_deref().map_err(String::as_str))
+            desktop::write_model(
+                &profiles,
+                &req,
+                bots.as_deref().map_err(String::as_str),
+                serving.as_deref().map_err(String::as_str),
+            )
         })
         .await
         .map_err(|error| refusal(error.to_string()))?
@@ -606,6 +614,43 @@ pub async fn agents_model_set(
         agent = %req.agent,
         effort = req.effort.map_or("default", |effort| effort.as_str()),
         "agents: an agent's model was saved to its agent.toml"
+    );
+    scan_next_tick();
+    rows(&state, facts).await
+}
+
+/// Settings › Agents: save one agent's console (story 101.5 #3, R420) —
+/// only `[run].mode` and `[run].paths` of its `agent.toml`, every other byte
+/// kept, through the drive's write path, as the person: the person's choice
+/// is the approval for the mode. Checked, as a model save is, against the
+/// hosts serving the agent (R460). The agent's next turn runs with it; the
+/// rows come back as they read now. A refusal is the row's
+/// sentence and a WARN line (R381).
+#[tauri::command]
+pub async fn agents_console_set(
+    state: State<'_, AppState>,
+    req: AgentConsoleReq,
+) -> Result<Vec<AgentCopyVm>, IpcError> {
+    let facts = facts_now(&state).await?;
+    let serving = serving_hosts(&state, &facts).await;
+    let saved = {
+        let profiles = facts.profiles.clone();
+        let req = req.clone();
+        tokio::task::spawn_blocking(move || {
+            desktop::write_console(&profiles, &req, serving.as_deref().map_err(String::as_str))
+        })
+        .await
+        .map_err(|error| refusal(error.to_string()))?
+    };
+    if let Err(sentence) = saved {
+        tracing::warn!(agent = %req.agent, %sentence, "agents: an agent's console was not saved");
+        return Err(refusal(sentence));
+    }
+    tracing::info!(
+        agent = %req.agent,
+        mode = req.mode.as_str(),
+        folders = req.paths.len(),
+        "agents: an agent's console was saved to its agent.toml"
     );
     scan_next_tick();
     rows(&state, facts).await
@@ -632,6 +677,7 @@ pub async fn agent_model_command(
         .map_err(to_ipc_error)?;
     let facts = facts_now(&state).await?;
     let platform = platform_of(&state);
+    let serving = serving_hosts(&state, &facts).await;
     let answered = {
         let agent = agent.clone();
         let args = args.clone();
@@ -642,6 +688,7 @@ pub async fn agent_model_command(
                 &agent,
                 args.as_deref(),
                 bots.as_deref().map_err(String::as_str),
+                serving.as_deref().map_err(String::as_str),
             )
         })
         .await
@@ -660,6 +707,85 @@ pub async fn agent_model_command(
             Err(refusal(sentence))
         }
     }
+}
+
+/// Settings › Agents: choose one agent's web search level (101.4 #3, R419,
+/// R457) — only `[tools].allow` and `[web_search].ask` of its `agent.toml`,
+/// every other byte kept, through the drive's write path, as the person, as
+/// a model save is (R405, R412), and checked as it is against the hosts
+/// serving the agent (R460).
+/// The rows come back as they read now. A refusal is the row's sentence
+/// and a WARN line (R381).
+#[tauri::command]
+pub async fn agents_web_search_set(
+    state: State<'_, AppState>,
+    req: AgentWebSearchReq,
+) -> Result<Vec<AgentCopyVm>, IpcError> {
+    let facts = facts_now(&state).await?;
+    let serving = serving_hosts(&state, &facts).await;
+    let saved = {
+        let profiles = facts.profiles.clone();
+        let req = req.clone();
+        tokio::task::spawn_blocking(move || {
+            desktop::write_web_search(&profiles, &req, serving.as_deref().map_err(String::as_str))
+        })
+        .await
+        .map_err(|error| refusal(error.to_string()))?
+    };
+    if let Err(sentence) = saved {
+        tracing::warn!(agent = %req.agent, %sentence, "agents: an agent's web search was not switched");
+        return Err(refusal(sentence));
+    }
+    tracing::info!(agent = %req.agent, level = ?req.level, "agents: an agent's web search was switched in its agent.toml");
+    scan_next_tick();
+    rows(&state, facts).await
+}
+
+/// Settings › Agents › *Web search*: this Mac's engine as stored, and why
+/// it is not used when it no longer checks.
+#[tauri::command]
+pub async fn agents_web_search_get(
+    state: State<'_, AppState>,
+) -> Result<AgentWebSearchUrlVm, IpcError> {
+    let dir = data_dir(platform_of(&state).as_ref())?;
+    tokio::task::spawn_blocking(move || mac_tables::web_search_listing(&dir).map_err(refusal))
+        .await
+        .map_err(|error| refusal(error.to_string()))?
+}
+
+/// Name this Mac's web search engine (`keeper.db` only, never a file of the
+/// account's), checked by the one check agentd's `[web_search] url` is;
+/// blank names none. A refusal is Rust's sentence and a WARN line (R381).
+/// The host is built again on it at the next tick.
+#[tauri::command]
+pub async fn agents_web_search_save(
+    state: State<'_, AppState>,
+    url: String,
+) -> Result<AgentWebSearchUrlVm, IpcError> {
+    let dir = data_dir(platform_of(&state).as_ref())?;
+    let saved = tokio::task::spawn_blocking(move || mac_tables::save_web_search(&dir, &url))
+        .await
+        .map_err(|error| refusal(error.to_string()))?;
+    if let Err(sentence) = saved {
+        tracing::warn!(%sentence, "agents: this Mac's web search engine was not saved");
+        return Err(refusal(sentence));
+    }
+    scan_next_tick();
+    agents_web_search_get(state).await
+}
+
+/// The other live hosts serving this principal's agents, as the control
+/// rooms the accounts are in hold their manifests — this Mac's own host
+/// (named by its device) left out, its build being the one saving: what
+/// every save of an agent's `agent.toml` is checked against before it
+/// writes (story 101.6, R422, R460), or the sentence saying they could not
+/// be read (R436), its WARN already written by
+/// `AccountManager::serving_hosts`.
+async fn serving_hosts(
+    state: &State<'_, AppState>,
+    facts: &DesktopFacts,
+) -> Result<Vec<keeper_core::agents::model::ServingHost>, String> {
+    state.accounts.serving_hosts(facts.device.as_deref()).await
 }
 
 /// The next tick scans: a saved table is hosted within a second, not at

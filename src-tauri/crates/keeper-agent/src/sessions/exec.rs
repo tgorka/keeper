@@ -41,11 +41,15 @@ struct JournalRow {
 }
 
 /// Everything the executor can refuse or fail with. `Refused` is a decision
-/// (the caller re-plans); `Failed` is the disk saying no.
+/// (the caller re-plans); `Taken` is the one refusal a create makes when
+/// another file has its name — kept, nothing written — so a caller that
+/// picks names may pick the next; `Failed` is the disk saying no.
 #[derive(Debug, thiserror::Error)]
 pub enum ExecError {
     #[error("{0}")]
     Refused(String),
+    #[error("{0}")]
+    Taken(String),
     #[error("step {step} of {verb} failed: {reason}")]
     Failed {
         verb: String,
@@ -136,7 +140,7 @@ fn resume_held(zone: &Path) -> Result<(), ExecError> {
 fn run_from(zone: &Path, journal: &Path, plan: Plan, from: usize) -> Result<(), ExecError> {
     for (index, step) in plan.steps.iter().enumerate().skip(from) {
         run_step(zone, step).map_err(|error| match error {
-            ExecError::Refused(_) => {
+            ExecError::Refused(_) | ExecError::Taken(_) => {
                 // A refusal abandons the plan: the journal clears, because a
                 // re-run would refuse identically and the caller re-plans.
                 let _ = std::fs::remove_file(journal);
@@ -591,23 +595,8 @@ fn run_step(zone: &Path, step: &PlanStep) -> Result<(), ExecError> {
         }
         PlanStep::WriteFile { path, content } => write_durable(&rel(zone, path)?, content)
             .map_err(|e| failed(format!("write {path}: {e}"))),
-        PlanStep::CreateFile { path, content } => {
-            let target = rel(zone, path)?;
-            match target.symlink_metadata() {
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(failed(format!("write {path}: {e}"))),
-                // A resume re-running a completed create sees its own bytes.
-                Ok(_) if std::fs::read(&target).is_ok_and(|bytes| bytes == content.as_bytes()) => {
-                    return sync_parent(&target).map_err(|e| failed(format!("write {path}: {e}")))
-                }
-                Ok(_) => {
-                    return Err(ExecError::Refused(format!(
-                    "{path} appeared while this was being planned; nothing was written — try again"
-                )))
-                }
-            }
-            write_durable(&target, content).map_err(|e| failed(format!("write {path}: {e}")))
-        }
+        PlanStep::CreateFile { path, content } => create_new(zone, path, content.as_bytes()),
+        PlanStep::CreateBytes { path, bytes } => create_new(zone, path, bytes),
         PlanStep::GuardedWrite {
             path,
             expect_len,
@@ -764,6 +753,43 @@ fn run_step(zone: &Path, step: &PlanStep) -> Result<(), ExecError> {
             std::fs::rename(&source, &target).map_err(|e| failed(format!("trash {path}: {e}")))
         }
         PlanStep::EmptyDirKeep { path, decided } => empty_as_decided(zone, path, decided.as_ref()),
+    }
+}
+
+/// [`PlanStep::CreateFile`] and [`PlanStep::CreateBytes`]: `bytes` written
+/// to `path`, which must not be there unless it already holds them (a
+/// resume finding its own write). The stage is published with an atomic
+/// no-replace ([`write_durable_new`]): a file that takes the name after
+/// the look and before the publication — an editor's, another writer's —
+/// is kept, and the step is [`ExecError::Taken`] so its caller plans again.
+/// Any other failure, before the publication or after it, is not a name
+/// taken and is never told as one.
+fn create_new(zone: &Path, path: &str, bytes: &[u8]) -> Result<(), ExecError> {
+    let failed = |e: std::io::Error| ExecError::Refused(format!("write {path}: {e}"));
+    let target = rel(zone, path)?;
+    let theirs = || {
+        ExecError::Taken(format!(
+            "{path} appeared while this was being planned; it was kept and nothing was written — try again"
+        ))
+    };
+    let ours = |target: &Path| std::fs::read(target).is_ok_and(|held| held == bytes);
+    match target.symlink_metadata() {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(failed(e)),
+        Ok(_) if ours(&target) => return sync_parent(&target).map_err(failed),
+        Ok(_) => return Err(theirs()),
+    }
+    match write_durable_new(&target, bytes) {
+        Ok(()) => {
+            #[cfg(test)]
+            seam::published();
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && ours(&target) => {
+            sync_parent(&target).map_err(failed)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(theirs()),
+        Err(e) => Err(failed(e)),
     }
 }
 
@@ -975,13 +1001,14 @@ fn target_fact_at(
 }
 
 /// A test's hold on the moment between an emptying's last check and its
-/// first removal.
+/// first removal, and on the moment a create has published its file.
 #[cfg(test)]
 pub(crate) mod seam {
     use std::cell::RefCell;
 
     thread_local! {
         static AFTER_CHECK: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+        static AFTER_PUBLISH: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
     }
 
     /// Run `then` on this thread once the next emptying has checked
@@ -993,6 +1020,19 @@ pub(crate) mod seam {
     /// The emptying has checked everything: run what a test holds there.
     pub(super) fn reached() {
         if let Some(then) = AFTER_CHECK.with(|hold| hold.borrow_mut().take()) {
+            then();
+        }
+    }
+
+    /// Run `then` on this thread once the next create has published its
+    /// file, before its plan goes on.
+    pub(crate) fn after_publish(then: impl FnOnce() + 'static) {
+        AFTER_PUBLISH.with(|hold| *hold.borrow_mut() = Some(Box::new(then)));
+    }
+
+    /// A create has published its file: run what a test holds there.
+    pub(super) fn published() {
+        if let Some(then) = AFTER_PUBLISH.with(|hold| hold.borrow_mut().take()) {
             then();
         }
     }
@@ -1101,7 +1141,27 @@ fn contained(zone: &Path, path: &str, reach: Reach) -> Result<PathBuf, ExecError
 /// a crash or a power cut leaves the old file or the new one whole and the
 /// rename on the disk (`memlog.py`'s `write_atomic`, NFR-117). A folder it
 /// has to make is made as [`make_dirs`] makes it.
-pub(crate) fn write_durable(target: &Path, content: &str) -> std::io::Result<()> {
+pub(crate) fn write_durable(target: &Path, content: impl AsRef<[u8]>) -> std::io::Result<()> {
+    write_staged(target, content.as_ref(), Publish::Replace)
+}
+
+/// [`write_durable`] for a file that must not be there: the stage is
+/// published only where nothing is ([`publish_new`]), and a name taken
+/// meanwhile is `AlreadyExists`, its file untouched.
+pub(crate) fn write_durable_new(target: &Path, content: &[u8]) -> std::io::Result<()> {
+    write_staged(target, content, Publish::New)
+}
+
+/// How a stage takes its target's name.
+#[derive(Clone, Copy)]
+enum Publish {
+    /// Over whatever is there.
+    Replace,
+    /// Only where nothing is.
+    New,
+}
+
+fn write_staged(target: &Path, content: &[u8], publish: Publish) -> std::io::Result<()> {
     use std::io::Write as _;
     let parent = target.parent().unwrap_or_else(|| Path::new("."));
     if parent.symlink_metadata().is_err() {
@@ -1109,9 +1169,9 @@ pub(crate) fn write_durable(target: &Path, content: &str) -> std::io::Result<()>
     }
     let (tmp, mut file) = stage_beside(target)?;
     let written = file
-        .write_all(content.as_bytes())
+        .write_all(content)
         .and_then(|()| file.sync_all())
-        .and_then(|()| publish_stage(&tmp, &file, target));
+        .and_then(|()| publish_stage(&tmp, &file, target, publish));
     if written.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
@@ -1156,10 +1216,16 @@ fn stage_beside(target: &Path) -> std::io::Result<(PathBuf, std::fs::File)> {
     Ok((tmp, file))
 }
 
-/// Rename the stage `tmp` over `target` once the name still holds the
-/// file `held` is a handle of: what is published is that regular file,
-/// never an entry put in its place meanwhile.
-fn publish_stage(tmp: &Path, held: &std::fs::File, target: &Path) -> std::io::Result<()> {
+/// Rename the stage `tmp` to `target` once the name still holds the file
+/// `held` is a handle of: what is published is that regular file, never an
+/// entry put in its place meanwhile — over what is there, or, for
+/// [`Publish::New`], only where nothing is ([`publish_new`]).
+fn publish_stage(
+    tmp: &Path,
+    held: &std::fs::File,
+    target: &Path,
+    publish: Publish,
+) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt as _;
@@ -1173,7 +1239,35 @@ fn publish_stage(tmp: &Path, held: &std::fs::File, target: &Path) -> std::io::Re
     }
     #[cfg(not(unix))]
     let _ = held;
-    std::fs::rename(tmp, target)
+    match publish {
+        Publish::Replace => std::fs::rename(tmp, target),
+        Publish::New => publish_new(tmp, target),
+    }
+}
+
+/// Give the file at `tmp` the name `target` only where nothing has it, in
+/// one step the kernel makes atomic: `renameat2(RENAME_NOREPLACE)` on
+/// Linux, `renameatx_np(RENAME_EXCL)` on a Mac (rustix's safe
+/// `renameat_with`); on a file system that has neither, a hard link —
+/// which never replaces either — then the stage's name removed. A name
+/// taken is `AlreadyExists`, and its file is left as it is.
+fn publish_new(tmp: &Path, target: &Path) -> std::io::Result<()> {
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    {
+        use rustix::fs::{renameat_with, RenameFlags, CWD};
+        use rustix::io::Errno;
+        match renameat_with(CWD, tmp, CWD, target, RenameFlags::NOREPLACE) {
+            Ok(()) => return Ok(()),
+            // This file system cannot rename without replacing.
+            Err(errno) if [Errno::INVAL, Errno::NOSYS, Errno::NOTSUP].contains(&errno) => {}
+            Err(errno) => return Err(errno.into()),
+        }
+    }
+    std::fs::hard_link(tmp, target)?;
+    // The file is published; a stage name left behind is removed by the
+    // next stage beside it.
+    let _ = std::fs::remove_file(tmp);
+    Ok(())
 }
 
 /// The lowercase hex SHA-256 of the file at `path`, read as one version.
@@ -1205,7 +1299,7 @@ fn copy_checked(source: &Path, target: &Path, sha256: &str) -> std::io::Result<b
             if held != sha256 {
                 return Ok(false);
             }
-            publish_stage(&tmp, &staged, target).map(|()| true)
+            publish_stage(&tmp, &staged, target, Publish::Replace).map(|()| true)
         });
     match copied {
         Ok(true) => {
@@ -1417,6 +1511,43 @@ mod tests {
             .join("active/2026-08-12-research/workspace")
             .is_dir());
         assert!(!zone.path().join(JOURNAL_REL).exists(), "journal cleared");
+    }
+
+    /// R444/04: a create's stage is published only where nothing is. A file
+    /// that takes the name after the stage is written and before it is
+    /// published keeps its bytes; the publication is `AlreadyExists` and the
+    /// stage is gone. The same bytes written again where they already are
+    /// is the create done (a resume), and a free name takes them.
+    #[test]
+    fn a_created_file_never_lands_over_one_that_took_its_name_meanwhile() {
+        let zone = zone();
+        let target = zone.path().join("active/report.pdf");
+        let (tmp, mut staged) = stage_beside(&target).expect("stage");
+        std::io::Write::write_all(&mut staged, b"the person's file").expect("staged");
+        std::fs::write(&target, b"an editor's file").expect("theirs");
+        let published = publish_stage(&tmp, &staged, &target, Publish::New);
+        assert_eq!(
+            published.map_err(|error| error.kind()),
+            Err(std::io::ErrorKind::AlreadyExists)
+        );
+        assert_eq!(std::fs::read(&target).expect("kept"), b"an editor's file");
+        std::fs::remove_file(&tmp).expect("the stage, as a failed write removes it");
+
+        let refused = create_new(zone.path(), "active/report.pdf", b"the person's file");
+        assert!(matches!(refused, Err(ExecError::Taken(_))), "{refused:?}");
+        assert_eq!(std::fs::read(&target).expect("kept"), b"an editor's file");
+        create_new(zone.path(), "active/report.pdf", b"an editor's file").expect("a resume");
+        create_new(zone.path(), "active/report-2.pdf", b"the person's file").expect("free");
+        assert_eq!(
+            std::fs::read(zone.path().join("active/report-2.pdf")).expect("written"),
+            b"the person's file"
+        );
+        let left: Vec<_> = std::fs::read_dir(zone.path().join("active"))
+            .expect("dir")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".keeper-tmp"))
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
     }
 
     /// The archive's crash story (NFR-38): kill the run before the move, and

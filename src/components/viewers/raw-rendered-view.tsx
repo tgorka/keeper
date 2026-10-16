@@ -61,6 +61,7 @@ import { readFrontmatter } from "@/components/notes/properties-panel";
 import { writeCookie } from "@/components/ui/cookie-writer";
 import { useWindowedRows } from "@/components/ui/window-list";
 import { notesCsvSetCell } from "@/lib/ipc/client";
+import { withoutTextSubstitution } from "@/lib/text-entry";
 import type { LanguageId, RenderedView, ViewerFormat } from "@/lib/viewers";
 import { buildHtmlView, spliceText, TEXT_RUN_ATTR } from "./html-view";
 import type { JsonParseError, JsonRow, JsonStructure } from "./json-structure";
@@ -366,7 +367,7 @@ function HtmlPane({
       // know the value treats it as `inherit` and the text is simply not
       // editable — a lost capability, never a wrong edit.
       span.setAttribute("contenteditable", "plaintext-only");
-      span.spellcheck = false;
+      withoutTextSubstitution(span);
     }
     const onInput = (event: Event): void => {
       const span = (event.target as HTMLElement | null)?.closest<HTMLElement>(`[${TEXT_RUN_ATTR}]`);

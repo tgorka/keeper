@@ -31,6 +31,8 @@ function answer(defaultAgent: string | null): AgentsLaunchVm {
       { agent: TALA, name: "Tala" },
     ],
     fileSet: null,
+    ask: null,
+    askable: [],
   };
 }
 

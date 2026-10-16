@@ -27,6 +27,7 @@ use std::sync::{Arc, RwLock};
 
 use keeper_core::agents::agentd::DrivePin;
 use keeper_core::agents::avatar;
+use keeper_core::agents::console::{self, AgentConsoleReq};
 use keeper_core::agents::copy::{self, AgentCopyVm};
 use keeper_core::agents::drive::DriveDecl;
 use keeper_core::agents::events::CONTROL_ROOM_TYPE;
@@ -44,6 +45,7 @@ use keeper_core::agents::run::SandboxTable;
 use keeper_core::agents::seed::AgentSeedBotVm;
 use keeper_core::agents::soul;
 use keeper_core::agents::trust::{Anchor, OwnAccount};
+use keeper_core::agents::web_search::{self, AgentWebSearchReq};
 use keeper_core::bots::chat::{self, CancelHandle, CancelSignal};
 use keeper_core::bots::store::{self, ProviderRow};
 use keeper_core::platform::Platform;
@@ -223,6 +225,31 @@ pub fn checkouts(profiles: &[SyncProfile]) -> Vec<(String, PathBuf)> {
     roots
 }
 
+/// Every checkout this Mac syncs as a console's folder and a run at full
+/// access are checked against it (story 101.5, R456 01, 03), each with this
+/// Mac's pin of it where there is one: `named` says, of a profile, the id
+/// of its drive and whether that drive's folders may be named here — a
+/// profile it says nothing of is a checkout no console is given, named by
+/// its folder's name.
+pub fn console_checkouts(
+    profiles: &[SyncProfile],
+    pins: &BTreeMap<String, DrivePin>,
+    named: impl Fn(&SyncProfile) -> Option<(String, bool)>,
+) -> Vec<crate::run::Checkout> {
+    profiles
+        .iter()
+        .map(|profile| {
+            let (id, mounted) = named(profile).unwrap_or_else(|| (profile.name.clone(), false));
+            crate::run::Checkout {
+                id,
+                mounted,
+                profile: profile.clone(),
+                pin: pins.get(&profile.id).cloned(),
+            }
+        })
+        .collect()
+}
+
 /// What the doorbell is set with (R162): each pinned drive by its pin's id
 /// — never a `_drive.toml` the pin refused — and its profile, and every
 /// agent the pinned zones home, `hosted` among them hosted here.
@@ -296,6 +323,14 @@ pub fn listing(
     pictures: &Pictures,
 ) -> Vec<AgentCopyVm> {
     let mut listed = Vec::new();
+    // Every checkout this Mac syncs — a drive by its declared id, whose
+    // folders may be named; any other by its folder's name: what a
+    // console's folder is landed against on this Mac (R440, R441, R456 01).
+    let guards = crate::run::guards(&console_checkouts(
+        &facts.profiles,
+        &facts.pins,
+        |profile| declared(profile).ok().map(|decl| (decl.id, true)),
+    ));
     for profile in facts.profiles.iter().filter(|p| p.agents.is_some()) {
         let decl = match declared(profile) {
             Ok(decl) => decl,
@@ -312,6 +347,8 @@ pub fn listing(
                     pin: None,
                     problem: Some(sentence),
                     model: None,
+                    web_search: None,
+                    console: None,
                     avatar_problem: None,
                 });
                 continue;
@@ -328,6 +365,11 @@ pub fn listing(
         let pin_vm = copy::pin_vm(&decl, pin, &|user: &UserId| names.get(user).cloned());
         let differs = pin.and_then(|pin| pin_matches(&decl, pin).err());
         let zone = read_zone(&decl.id, profile, Some(&decl));
+        let configs: Vec<home::AgentConfig> = zone
+            .homes
+            .iter()
+            .filter_map(|(_, home)| home.as_ref().ok().map(|home| home.config.clone()))
+            .collect();
         for (_, home) in &zone.homes {
             let Ok(home) = home else { continue };
             let user = &home.config.matrix_user;
@@ -365,6 +407,22 @@ pub fn listing(
                     &home.config,
                     bots,
                     (!profile.direction.pushes()).then(|| model::pull_only(&decl.id)),
+                )),
+                web_search: Some(web_search::switch_vm(
+                    &home.config,
+                    (!profile.direction.pushes()).then(|| web_search::pull_only(&decl.id)),
+                    facts
+                        .tables
+                        .web_search
+                        .as_ref()
+                        .ok()
+                        .and_then(Option::as_ref),
+                )),
+                console: Some(console::console_vm(
+                    &home.config,
+                    home::delegated_by(&configs, &home.config.id),
+                    (!profile.direction.pushes()).then(|| console::pull_only(&decl.id)),
+                    console_refusals(&home.config, &guards),
                 )),
                 avatar_problem,
             });
@@ -421,6 +479,9 @@ pub fn zone_agents(facts: &DesktopFacts) -> BTreeMap<OwnedUserId, ZoneAgent> {
                     avatar,
                     problems: picture.scan.problems,
                     not_here: picture.scan.not_here,
+                    searches_unasked: web_search::level(&home.config)
+                        == web_search::WebSearchLevel::WithoutAsking
+                        && web_search::never(&home.config).is_none(),
                 },
             );
         }
@@ -465,12 +526,18 @@ pub fn zone_models(
 /// surface saves a person's file — as the person. The folder's engine
 /// commits and pushes it like any edit; the agent's next turn runs on it
 /// ([`crate::agent::current_model`]). Each refusal is one sentence.
+///
+/// A key a host serving the agent cannot read yet — its live manifest's
+/// version predates it ([`model::older_hosts`], story 101.6, R422) — is
+/// refused before anything is written, naming the host: written, it would
+/// stop that host serving the agent.
 pub fn write_model(
     profiles: &[SyncProfile],
     req: &AgentModelReq,
     bots: model::Choices<'_>,
+    serving: model::Inventory<'_>,
 ) -> Result<(), String> {
-    prepare_model(profiles, req, bots)?.publish()
+    prepare_model(profiles, req, bots, serving)?.publish()
 }
 
 /// `/model` typed in `agent`'s DM (story 100.5, DW-1431, R415): nothing
@@ -484,6 +551,7 @@ pub fn model_command(
     agent: &UserId,
     args: Option<&str>,
     bots: model::Choices<'_>,
+    serving: model::Inventory<'_>,
 ) -> Result<String, String> {
     let (profile_id, folder, config) =
         home_of(facts, agent).ok_or_else(|| model::HOME_NOT_HERE.to_owned())?;
@@ -499,7 +567,7 @@ pub fn model_command(
                 shown_bot: config.bot.reference(),
                 shown_effort: config.effort,
             };
-            write_model(&facts.profiles, &req, bots)?;
+            write_model(&facts.profiles, &req, bots, serving)?;
             let mut saved = config.clone();
             saved.bot = home::BotRef::parse(&req.bot).map_err(|reason| format!("{reason}."))?;
             saved.effort = req.effort;
@@ -536,17 +604,18 @@ fn home_of(facts: &DesktopFacts, agent: &UserId) -> Option<(String, String, home
     None
 }
 
-/// A model save made from one read of `agent.toml` (R405): the bytes it
-/// read, their revision, and what replaces them.
+/// A save of one home's `agent.toml` made from one read of it (R405): the
+/// bytes it read, their revision, and what replaces them — a model save
+/// (100.2), a tool switch or search level (101.4) or a console (101.5).
 #[derive(Debug)]
-pub struct ModelSave {
+pub struct HomeSave {
     name: String,
     target: keeper_sync::files_write::UnmanagedPath,
     read: keeper_sync::files_write::Revision,
     next: String,
 }
 
-impl ModelSave {
+impl HomeSave {
     /// Write it, only over the bytes it was made from: a file changed since
     /// — another save, a sync, a hand edit — keeps its change and the save
     /// is refused, saying so.
@@ -570,12 +639,82 @@ pub fn prepare_model(
     profiles: &[SyncProfile],
     req: &AgentModelReq,
     bots: model::Choices<'_>,
-) -> Result<ModelSave, String> {
+    serving: model::Inventory<'_>,
+) -> Result<HomeSave, String> {
+    prepare_home(
+        profiles,
+        (&req.profile_id, &req.agent),
+        model::pull_only,
+        serving,
+        |text, config, _| {
+            let bot = model::check(req, config, bots)?;
+            home::with_model(text, &bot.reference(), req.effort)
+                .map_err(|refusal| refusal.to_string())
+        },
+    )
+}
+
+/// Settings › Agents' *Web search* choice of one agent (101.4 #3, R419,
+/// R457): only the two keys a level is — `web_search` named in
+/// `[tools].allow` or not, and `[web_search].ask` — changed in its
+/// `agent.toml`, every other byte kept ([`web_search::with_level`]; off
+/// takes `[web_search]` out whole), checked against what the row showed and
+/// the agent's kind ([`web_search::check`]), and written as a model save
+/// is: one read, compare-and-replace, as the person (R405, R412), never
+/// handing a host serving the agent a key its build does not read (R460).
+pub fn write_web_search(
+    profiles: &[SyncProfile],
+    req: &AgentWebSearchReq,
+    serving: model::Inventory<'_>,
+) -> Result<(), String> {
+    prepare_web_search(profiles, req, serving)?.publish()
+}
+
+/// The first half of [`write_web_search`]. Nothing is written.
+pub fn prepare_web_search(
+    profiles: &[SyncProfile],
+    req: &AgentWebSearchReq,
+    serving: model::Inventory<'_>,
+) -> Result<HomeSave, String> {
+    prepare_home(
+        profiles,
+        (&req.profile_id, &req.agent),
+        web_search::pull_only,
+        serving,
+        |text, config, _| {
+            web_search::check(req, config)?;
+            web_search::with_level(text, config.kind, req.level)
+                .map_err(|refusal| refusal.to_string())
+        },
+    )
+}
+
+/// The one person's edit of an agent's `agent.toml` (R405, R408, R412;
+/// DW-1484): the model save (100.2), the web search level (101.4) and the
+/// console (101.5) all go through it. The home `agent` of the drive synced
+/// as `profile_id` has its `agent.toml` read once; `edit` makes the new text
+/// from those bytes, what they parse to and the drive they sit in (checking
+/// the person's request against them first); the result is parsed as the
+/// host will parse it and held to the hosts `serving` the agent — none may
+/// run a build that predates a key the file would carry
+/// ([`model::older_hosts`], R422, R460; an unread inventory refuses a file
+/// carrying any, R436) — and the path routed through `WriteScope::route` —
+/// no vault, the sessions fence on, no agent-home fence. A Mac that only
+/// pulls the drive is refused with `pull_only`'s sentence. Nothing is
+/// written: [`HomeSave::publish`] writes it, compare-and-replace over the
+/// bytes read.
+fn prepare_home(
+    profiles: &[SyncProfile],
+    (profile_id, agent): (&str, &str),
+    pull_only: fn(&str) -> String,
+    serving: model::Inventory<'_>,
+    edit: impl FnOnce(&str, &home::AgentConfig, (&SyncProfile, &DriveDecl)) -> Result<String, String>,
+) -> Result<HomeSave, String> {
     use keeper_sync::files_write::{Revision, WriteRoute, WriteScope};
 
-    let (profile, decl, home) = find_home(profiles, &req.profile_id, &req.agent)?;
+    let (profile, decl, home) = find_home(profiles, profile_id, agent)?;
     if !profile.direction.pushes() {
-        return Err(model::pull_only(&decl.id));
+        return Err(pull_only(&decl.id));
     }
     let file = format!("{}/{}", home.config.id, home::FILE_NAME);
     let text = read_text(&home.zone, &file)?
@@ -583,10 +722,14 @@ pub fn prepare_model(
     let read = Revision::of(text.as_bytes());
     let config = home::parse_agent_toml(&text, &home.config.id, &decl)
         .map_err(|refusal| refusal.to_string())?;
-    let bot = model::check(req, &config, bots)?;
-    let next = home::with_model(&text, &bot.reference(), req.effort)
+    let next = edit(&text, &config, (&profile, &decl))?;
+    let written = home::parse_agent_toml(&next, &home.config.id, &decl)
         .map_err(|refusal| refusal.to_string())?;
-    home::parse_agent_toml(&next, &home.config.id, &decl).map_err(|refusal| refusal.to_string())?;
+    model::older_hosts(
+        &written,
+        &format!("{}/{}", written.drive, written.id),
+        serving,
+    )?;
     let subpath = format!(
         "{}/{}",
         crate::agent::drive_relative(&profile.local_path, &home.dir),
@@ -602,7 +745,7 @@ pub fn prepare_model(
         .route(None::<()>, &profile.local_path, &subpath)
         .map_err(|refusal| refusal.to_string())?
     {
-        WriteRoute::Unmanaged(target) => Ok(ModelSave {
+        WriteRoute::Unmanaged(target) => Ok(HomeSave {
             name: config.name,
             target,
             read,
@@ -612,6 +755,93 @@ pub fn prepare_model(
             "{subpath} is inside a notes vault, which this Mac writes only from the notes view."
         )),
     }
+}
+
+/// The folders of `config`'s console this Mac does not give its commands,
+/// each with why (R440, R381): landed as a run here lands them
+/// ([`crate::run::land`]) against `guards` — every drive this Mac checks
+/// out — and the agent's own drives, so a folder that does not resolve, or
+/// is refused, here is said on its row, not only to the model. None while
+/// the console holds no folder (`off`, `full`).
+fn console_refusals(
+    config: &home::AgentConfig,
+    guards: &[crate::run::DriveGuard],
+) -> Vec<console::ConsoleFolderVm> {
+    if !config.run.mode.sandboxes() {
+        return Vec::new();
+    }
+    config
+        .run
+        .paths
+        .iter()
+        .filter_map(|path| {
+            crate::run::land(path, guards, &config.drives)
+                .err()
+                .map(|why| console::ConsoleFolderVm {
+                    path: path.written(),
+                    refused: console::not_given_here(&why),
+                })
+        })
+        .collect()
+}
+
+/// Settings › Agents' save of one agent's console (story 101.5 #3, R420):
+/// the home's `agent.toml` with `[run].mode` and `[run].paths` changed and
+/// every other byte kept, written through the drive's own write path as the
+/// person — [`write_model`]'s path, compare-and-replace (R405, R412). The
+/// person's choice is the approval for the mode (R420). The agent's next
+/// turn runs with it ([`crate::agent::current_model`]). A console a build
+/// before epic 101 already reads — the mode `[tools].allow` gives a file
+/// without `[run]`, and no folder — is saved as no `[run]` at all, so a
+/// host serving the agent on such a build keeps serving it; any other is
+/// refused while one does (R460). Each refusal is one sentence.
+pub fn write_console(
+    profiles: &[SyncProfile],
+    req: &AgentConsoleReq,
+    serving: model::Inventory<'_>,
+) -> Result<(), String> {
+    prepare_console(profiles, req, serving)?.publish()
+}
+
+/// The first half of [`write_console`] ([`prepare_home`]'s edit): `req`
+/// checked against what the bytes read say and against its zone read now
+/// ([`console::check`] with [`home::delegated_by`]: an agent a gate hands
+/// work to is never saved at full access), those bytes edited — `[run]`
+/// taken out ([`home::without_table`]) where the file without it reads as
+/// `req` asks, else written ([`home::with_run`]). Nothing is written.
+pub fn prepare_console(
+    profiles: &[SyncProfile],
+    req: &AgentConsoleReq,
+    serving: model::Inventory<'_>,
+) -> Result<HomeSave, String> {
+    prepare_home(
+        profiles,
+        (&req.profile_id, &req.agent),
+        console::pull_only,
+        serving,
+        |text, config, (profile, decl)| {
+            let zone: Vec<home::AgentConfig> = read_zone(&decl.id, profile, Some(decl))
+                .homes
+                .into_iter()
+                .filter_map(|(_, home)| home.ok().map(|home| home.config))
+                .filter(|other| other.id != config.id)
+                .collect();
+            let paths = console::check(req, config, home::delegated_by(&zone, &config.id))?;
+            if paths.is_empty() {
+                let bare =
+                    home::without_table(text, "run").map_err(|refusal| refusal.to_string())?;
+                if let Some(bare) = bare {
+                    let before = home::parse_agent_toml(&bare, &config.id, decl)
+                        .map_err(|refusal| refusal.to_string())?;
+                    if before.run.mode == req.mode {
+                        return Ok(bare);
+                    }
+                }
+            }
+            let written: Vec<String> = paths.iter().map(console::RunPath::written).collect();
+            home::with_run(text, req.mode, &written).map_err(|refusal| refusal.to_string())
+        },
+    )
 }
 
 /// `home`'s picture read under `profile`'s root (`keeper-file://`'s), the
@@ -879,6 +1109,14 @@ pub struct DesktopHost {
     /// The doorbells' work over the app's engine, once handed over
     /// ([`Self::attach_engine`]).
     engine: Option<Ringer>,
+    /// `agents.claims_lease` as the last scan read it (R455): the minute
+    /// lease unless the person turned the quarter-hour one on.
+    lease_setting: keeper_core::agents::claim::ClaimsLease,
+    /// Each agent's turns running at full access, across every build of
+    /// this host: a rebuild's bounded stop can leave an old build's
+    /// full-access command running, and the new build's statuses still say
+    /// full access until it ends (story 101.5; R101K3-02).
+    full_access: crate::agent::FullAccessHosts,
 }
 
 impl DesktopHost {
@@ -893,6 +1131,8 @@ impl DesktopHost {
             pictures: Arc::default(),
             doorbell: Arc::default(),
             engine: None,
+            lease_setting: keeper_core::agents::claim::ClaimsLease::Short,
+            full_access: Default::default(),
         }
     }
 
@@ -1021,7 +1261,10 @@ impl DesktopHost {
                 }
             }
         }
+        built.runtime.set_lease_setting(self.lease_setting);
         built.runtime.tick(&built.signal).await;
+        // The person's asks for a DM, with the clock the tick calibrated (R450).
+        crate::dm_request::serve_all(&built.copies, &built.runtime.dm_round());
     }
 
     async fn scan(&mut self, facts: DesktopFacts) {
@@ -1064,6 +1307,7 @@ impl DesktopHost {
             let drives = desktop_drives(&facts.profiles, &facts.pins, &login);
             let checkouts = checkouts(&facts.profiles);
             let rows = store::list_providers(&data_dir).map(|listing| listing.rows);
+            let lease = keeper_core::registry::get_agents_claims_lease(&data_dir);
             let homes: Vec<AgentHome> = drives
                 .iter()
                 .filter(|drive| drive.view.hosts.is_ok())
@@ -1076,13 +1320,18 @@ impl DesktopHost {
                     signed_in_device(platform.as_ref(), &home.config.matrix_user).is_some()
                 })
                 .collect();
-            (facts, login, drives, checkouts, rows, signed)
+            (facts, login, drives, checkouts, rows, signed, lease)
         })
         .await;
-        let Ok((facts, login, drives, checkouts, rows, signed)) = read else {
+        let Ok((facts, login, drives, checkouts, rows, signed, lease)) = read else {
             tracing::error!("agents: the desktop's zones could not be read");
             return;
         };
+        // A setting that cannot be read is the minute lease (R455).
+        self.lease_setting = lease.unwrap_or_else(|error| {
+            tracing::warn!(%error, "agents: agents.claims_lease could not be read; claims stay on the minute lease");
+            keeper_core::agents::claim::ClaimsLease::Short
+        });
         // A checkout moved, came or went: the sandbox built on the old set
         // could grant a folder that now holds one (R228).
         if self
@@ -1183,6 +1432,24 @@ impl DesktopHost {
         let mcp = Arc::new(crate::agent::off_the_runtime(|| {
             mac_servers(self.platform.as_ref(), &facts.tables)
         }));
+        // This Mac's web search engine (101.4, R419), from the tables the
+        // host is built on: a saved one that no longer checks offers none.
+        let web_search = crate::web::engine_from(
+            facts
+                .tables
+                .web_search
+                .as_ref()
+                .ok()
+                .and_then(Option::as_ref),
+        );
+        // Every checkout this Mac syncs, a drive whose zone hosts here
+        // mounted (R456 01, 03).
+        let inventory = console_checkouts(&facts.profiles, &facts.pins, |profile| {
+            drives
+                .iter()
+                .find(|drive| drive.profile_id == profile.id)
+                .map(|drive| (drive.view.id.clone(), drive.view.hosts.is_ok()))
+        });
         for home in &signed {
             let user = home.config.matrix_user.clone();
             let Some(homeserver) = homeserver_for(&user, &facts.homeservers) else {
@@ -1203,7 +1470,16 @@ impl DesktopHost {
                     continue;
                 }
             };
-            let deps = match deps_over(&self.base, &self.data_dir, &host, &views, rows, home) {
+            let deps = match deps_over(
+                &self.base,
+                &self.data_dir,
+                &host,
+                &views,
+                inventory.clone(),
+                rows,
+                home,
+                self.full_access.of(&user),
+            ) {
                 // Every call that needs a person parks, decided under this
                 // Mac's own verified accounts, never a pin (R87, R92).
                 Ok(deps) => Arc::new(AgentDeps {
@@ -1213,6 +1489,7 @@ impl DesktopHost {
                     })),
                     sandbox: sandbox.clone(),
                     mcp: Some(Arc::clone(&mcp)),
+                    web_search: web_search.clone(),
                     ..deps
                 }),
                 Err(sentence) => {
@@ -1744,7 +2021,41 @@ mod tests {
             shown_bot: shown.bot.clone(),
             shown_effort: shown.effort,
         };
-        write_model(&facts.profiles, &save(Some(Effort::Xhigh)), Ok(&bots)).expect("saved");
+        // A host serving Nixi on a build that predates `[model].effort`
+        // would refuse the home: nothing is written (101.6 #3, R422).
+        let electra = model::ServingHost {
+            host: "electra".to_owned(),
+            version: "0.10.3".to_owned(),
+            agents: vec!["tgdrive/nixi".to_owned()],
+        };
+        let refused = write_model(
+            &facts.profiles,
+            &save(Some(Effort::Xhigh)),
+            Ok(&bots),
+            Ok(std::slice::from_ref(&electra)),
+        )
+        .expect_err("electra predates effort");
+        assert!(refused.contains("electra"), "{refused}");
+        assert_eq!(std::fs::read_to_string(&file).expect("kept"), before);
+        // The hosts could not be read: no proof none is older, so nothing
+        // is written either (R436).
+        assert_eq!(
+            write_model(
+                &facts.profiles,
+                &save(Some(Effort::Xhigh)),
+                Ok(&bots),
+                Err(model::HOSTS_UNREAD),
+            ),
+            Err(model::HOSTS_UNREAD.to_owned())
+        );
+        assert_eq!(std::fs::read_to_string(&file).expect("kept"), before);
+        write_model(
+            &facts.profiles,
+            &save(Some(Effort::Xhigh)),
+            Ok(&bots),
+            Ok(&[]),
+        )
+        .expect("saved");
         let after = std::fs::read_to_string(&file).expect("agent.toml");
         assert_eq!(
             after,
@@ -1756,15 +2067,20 @@ mod tests {
 
         // The row showed the old model: the file moved on since.
         assert_eq!(
-            write_model(&facts.profiles, &save(Some(Effort::Low)), Ok(&bots)),
+            write_model(
+                &facts.profiles,
+                &save(Some(Effort::Low)),
+                Ok(&bots),
+                Ok(&[])
+            ),
             Err(CHANGED_UNDERNEATH.to_owned())
         );
         assert_eq!(std::fs::read_to_string(&file).expect("kept"), after);
 
         let mut pulling = profile.clone();
         pulling.direction = keeper_sync::profile::SyncDirection::PullOnly;
-        let refused =
-            write_model(&[pulling.clone()], &save(None), Ok(&bots)).expect_err("pull-only");
+        let refused = write_model(&[pulling.clone()], &save(None), Ok(&bots), Ok(&[]))
+            .expect_err("pull-only");
         assert!(refused.contains("only pulls tgdrive"), "{refused}");
         let pulled = listing(
             &DesktopFacts {
@@ -1788,9 +2104,277 @@ mod tests {
 
         let merged = format!("{after}<<<<<<< ours\n");
         std::fs::write(&file, &merged).expect("conflicted");
-        let refused = write_model(&facts.profiles, &save(None), Ok(&bots)).expect_err("unreadable");
+        let refused =
+            write_model(&facts.profiles, &save(None), Ok(&bots), Ok(&[])).expect_err("unreadable");
         assert!(refused.contains("not valid TOML"), "{refused}");
         assert_eq!(std::fs::read_to_string(&file).expect("kept"), merged);
+    }
+
+    /// 101.4 #3 (R419, R405, R412, R457): the *Web search* choice writes
+    /// only its two keys — Nixi's absent list written out as a proxy's
+    /// defaults plus `web_search`; *without asking* adds `[web_search] ask =
+    /// false`, which the row shows with its standing warning and the room
+    /// header with its mark; off removes that name and the `[web_search]`
+    /// table (R460), asking again — and the row reads it back; a choice made from a row that no
+    /// longer says what the file does writes nothing; a change landing
+    /// between a choice's read and its write is never written over; a Mac
+    /// that only pulls the drive is refused.
+    #[test]
+    fn the_web_search_choice_writes_only_its_two_keys() {
+        use keeper_core::agents::home::{default_allow, AgentKind};
+        use keeper_core::agents::web_search::WebSearchLevel::{Ask, Off, WithoutAsking};
+
+        let root = tempfile::tempdir().expect("tempdir");
+        nixi_drive(root.path());
+        let file = root.path().join("80-agents/nixi/agent.toml");
+        let profiles = vec![profile(root.path())];
+        let switch = |level, shown_level| AgentWebSearchReq {
+            profile_id: "p1".to_owned(),
+            agent: "nixi".to_owned(),
+            level,
+            shown_level,
+        };
+        let before = std::fs::read_to_string(&file).expect("agent.toml");
+        let facts = DesktopFacts {
+            login: Some("tgorka".to_owned()),
+            profiles: profiles.clone(),
+            ..DesktopFacts::default()
+        };
+        let row = || {
+            listing(
+                &facts,
+                &[],
+                Ok(&[]),
+                &platform(root.path()),
+                &Names::new(),
+                &Problems::new(),
+                &Pictures::new(),
+            )
+            .into_iter()
+            .find(|row| row.agent == "nixi")
+            .expect("nixi's row")
+            .web_search
+            .expect("a choice")
+        };
+        let marked = || {
+            zone_agents(&facts)
+                .into_values()
+                .next()
+                .expect("nixi")
+                .searches_unasked
+        };
+
+        write_web_search(&profiles, &switch(Ask, Off), Ok(&[])).expect("on");
+        let on = std::fs::read_to_string(&file).expect("on");
+        let mut names: Vec<String> = default_allow(AgentKind::Proxy)
+            .iter()
+            .map(|tool| format!("\"{tool}\""))
+            .collect();
+        names.push("\"web_search\"".to_owned());
+        assert_eq!(
+            on,
+            format!("{before}\n[tools]\nallow = [{}]\n", names.join(", "))
+        );
+        assert_eq!(
+            row(),
+            web_search::AgentWebSearchVm {
+                level: Ask,
+                locked: None,
+                unavailable: None,
+                warning: None,
+            }
+        );
+        assert!(!marked());
+
+        write_web_search(&profiles, &switch(WithoutAsking, Ask), Ok(&[])).expect("without asking");
+        let unasked = std::fs::read_to_string(&file).expect("without asking");
+        assert_eq!(unasked, format!("{on}\n[web_search]\nask = false\n"));
+        assert_eq!(
+            row(),
+            web_search::AgentWebSearchVm {
+                level: WithoutAsking,
+                locked: None,
+                unavailable: None,
+                warning: Some(web_search::unasked_warning(None)),
+            }
+        );
+        assert!(marked());
+        write_web_search(&profiles, &switch(Ask, WithoutAsking), Ok(&[])).expect("asks again");
+        let asks = std::fs::read_to_string(&file).expect("asks");
+        assert_eq!(asks, format!("{on}\n[web_search]\nask = true\n"));
+        assert_eq!(row().warning, None);
+        assert!(!marked());
+
+        // The row still says off: nothing is written.
+        assert_eq!(
+            write_web_search(&profiles, &switch(Ask, Off), Ok(&[])),
+            Err(web_search::CHANGED_UNDERNEATH.to_owned())
+        );
+        assert_eq!(std::fs::read_to_string(&file).expect("kept"), asks);
+
+        // A sync lands between the choice's read and its write.
+        let mine = prepare_web_search(&profiles, &switch(Off, Ask), Ok(&[])).expect("prepared");
+        let synced = format!("{asks}\n[limits]\nrounds_per_turn = 4\n");
+        std::fs::write(&file, &synced).expect("a sync");
+        assert_eq!(
+            mine.publish(),
+            Err(
+                "Nixi's agent.toml changed while you were saving — reopen and try again."
+                    .to_owned()
+            )
+        );
+        assert_eq!(std::fs::read_to_string(&file).expect("kept"), synced);
+
+        write_web_search(&profiles, &switch(Off, Ask), Ok(&[])).expect("off");
+        assert_eq!(
+            std::fs::read_to_string(&file).expect("off"),
+            synced
+                .replace(", \"web_search\"]", "]")
+                .replace("\n[web_search]\nask = true\n", "")
+        );
+
+        let mut pulling = profile(root.path());
+        pulling.direction = keeper_sync::profile::SyncDirection::PullOnly;
+        assert_eq!(
+            write_web_search(&[pulling], &switch(Ask, Off), Ok(&[])),
+            Err(web_search::pull_only("tgdrive"))
+        );
+    }
+
+    /// R460 (DW-1501): a web search level or a console a host serving the
+    /// agent cannot read — its live manifest says a build before epic 101 —
+    /// is refused before a byte is written, naming the host; so is one
+    /// made while the hosts could not be read (R436). Hosts on 0.10.4 and
+    /// later take it. Switching web search off, or the console back to the
+    /// one `[tools].allow` gives without `[run]`, leaves a file such a host
+    /// reads, so it goes through with that host serving and with the hosts
+    /// unread.
+    #[test]
+    fn a_save_an_older_serving_host_cannot_read_is_refused_and_one_back_is_not() {
+        use keeper_core::agents::console::{AgentConsoleReq, AgentConsoleVm, RunMode};
+        use keeper_core::agents::web_search::WebSearchLevel::{self, Ask, Off, WithoutAsking};
+
+        let root = tempfile::tempdir().expect("tempdir");
+        nixi_drive(root.path());
+        let file = root.path().join("80-agents/nixi/agent.toml");
+        let profiles = vec![profile(root.path())];
+        let facts = DesktopFacts {
+            login: Some("tgorka".to_owned()),
+            device: Some("hesperia".to_owned()),
+            profiles: profiles.clone(),
+            ..DesktopFacts::default()
+        };
+        let host = |slug: &str, version: &str| model::ServingHost {
+            host: slug.to_owned(),
+            version: version.to_owned(),
+            agents: vec!["tgdrive/nixi".to_owned()],
+        };
+        let older = [host("electra", "0.10.3")];
+        let newer = [host("electra", "0.10.4"), host("kalypso", "0.11.0")];
+        let read = || std::fs::read_to_string(&file).expect("agent.toml");
+        let refused_by_electra = |said: Result<(), String>| {
+            let said = said.expect_err("electra predates the key");
+            assert!(
+                said.starts_with("electra runs keeper 0.10.3") && said.contains("Nixi"),
+                "{said}"
+            );
+        };
+
+        // Web search.
+        let level = |level: WebSearchLevel, shown_level| AgentWebSearchReq {
+            profile_id: "p1".to_owned(),
+            agent: "nixi".to_owned(),
+            level,
+            shown_level,
+        };
+        let before = read();
+        for on in [Ask, WithoutAsking] {
+            refused_by_electra(write_web_search(&profiles, &level(on, Off), Ok(&older)));
+            assert_eq!(read(), before);
+            assert_eq!(
+                write_web_search(&profiles, &level(on, Off), Err(model::HOSTS_UNREAD)),
+                Err(model::HOSTS_UNREAD.to_owned())
+            );
+            assert_eq!(read(), before);
+        }
+        write_web_search(&profiles, &level(WithoutAsking, Off), Ok(&newer)).expect("newer");
+        assert!(read().contains("ask = false"), "{}", read());
+        write_web_search(&profiles, &level(Off, WithoutAsking), Ok(&older)).expect("off");
+        assert!(!read().contains("web_search"), "{}", read());
+        write_web_search(&profiles, &level(Ask, Off), Ok(&newer)).expect("on again");
+        write_web_search(&profiles, &level(Off, Ask), Err(model::HOSTS_UNREAD)).expect("off");
+        assert!(!read().contains("web_search"), "{}", read());
+
+        // The console.
+        let shown = || {
+            listing(
+                &facts,
+                &[],
+                Ok(&[]),
+                &platform(root.path()),
+                &Names::new(),
+                &Problems::new(),
+                &Pictures::new(),
+            )
+            .into_iter()
+            .find(|row| row.agent == "nixi")
+            .and_then(|row| row.console)
+            .expect("Nixi's console")
+        };
+        let console = |mode, paths: &[&str], shown: &AgentConsoleVm| AgentConsoleReq {
+            profile_id: "p1".to_owned(),
+            agent: "nixi".to_owned(),
+            mode,
+            paths: paths.iter().map(|path| (*path).to_owned()).collect(),
+            shown_mode: shown.mode,
+            shown_paths: shown.paths.clone(),
+        };
+        let before = read();
+        let off = shown();
+        assert_eq!(off.mode, RunMode::Off);
+        for (mode, paths) in [
+            (RunMode::Sandboxed, &["/srv/site"][..]),
+            (RunMode::Supervised, &[][..]),
+        ] {
+            refused_by_electra(write_console(
+                &profiles,
+                &console(mode, paths, &off),
+                Ok(&older),
+            ));
+            assert_eq!(read(), before);
+            assert_eq!(
+                write_console(
+                    &profiles,
+                    &console(mode, paths, &off),
+                    Err(model::HOSTS_UNREAD)
+                ),
+                Err(model::HOSTS_UNREAD.to_owned())
+            );
+            assert_eq!(read(), before);
+        }
+        write_console(
+            &profiles,
+            &console(RunMode::Sandboxed, &["/srv/site"], &off),
+            Ok(&newer),
+        )
+        .expect("newer");
+        assert!(read().contains("[run]"), "{}", read());
+        let sandboxed = shown();
+        write_console(
+            &profiles,
+            &console(RunMode::Off, &[], &sandboxed),
+            Ok(&older),
+        )
+        .expect("back to the console a build before epic 101 reads");
+        assert_eq!(read(), before);
+        assert_eq!(shown().mode, RunMode::Off);
+        write_console(
+            &profiles,
+            &console(RunMode::Off, &[], &off),
+            Err(model::HOSTS_UNREAD),
+        )
+        .expect("nothing a build before epic 101 cannot read");
+        assert_eq!(read(), before);
     }
 
     /// DW-1431 (R415): `/model` in Nixi's DM saves through Settings' own
@@ -1819,11 +2403,24 @@ mod tests {
         let nixi = OwnedUserId::try_from("@nixi:example.org").expect("user");
         let before = std::fs::read_to_string(&file).expect("agent.toml");
 
-        model_command(&facts, &nixi, None, Ok(&bots)).expect("shown");
-        model_command(&facts, &nixi, Some("gpt-9"), Ok(&bots)).expect_err("not offered");
+        model_command(&facts, &nixi, None, Ok(&bots), Ok(&[])).expect("shown");
+        model_command(&facts, &nixi, Some("gpt-9"), Ok(&bots), Ok(&[])).expect_err("not offered");
+        assert_eq!(std::fs::read_to_string(&file).expect("kept"), before);
+        // `/model` saving a level while the hosts could not be read: refused
+        // with the inventory's sentence, the file as it was (R436).
+        assert_eq!(
+            model_command(
+                &facts,
+                &nixi,
+                Some("opus xhigh"),
+                Ok(&bots),
+                Err(model::HOSTS_UNREAD)
+            ),
+            Err(model::HOSTS_UNREAD.to_owned())
+        );
         assert_eq!(std::fs::read_to_string(&file).expect("kept"), before);
 
-        model_command(&facts, &nixi, Some("opus xhigh"), Ok(&bots)).expect("saved");
+        model_command(&facts, &nixi, Some("opus xhigh"), Ok(&bots), Ok(&[])).expect("saved");
         let after = std::fs::read_to_string(&file).expect("agent.toml");
         assert_eq!(
             after,
@@ -1835,7 +2432,7 @@ mod tests {
         let reread = home_of(&facts, &nixi).expect("home").2;
         assert_eq!(reread.effort, Some(Effort::Xhigh));
         // A level alone keeps the bot.
-        model_command(&facts, &nixi, Some("low"), Ok(&bots)).expect("saved");
+        model_command(&facts, &nixi, Some("low"), Ok(&bots), Ok(&[])).expect("saved");
         let reread = home_of(&facts, &nixi).expect("home").2;
         assert_eq!(
             (reread.bot.reference(), reread.effort),
@@ -1849,7 +2446,7 @@ mod tests {
 
         let tola = OwnedUserId::try_from("@tola:example.org").expect("user");
         assert_eq!(
-            model_command(&facts, &tola, Some("opus"), Ok(&bots)),
+            model_command(&facts, &tola, Some("opus"), Ok(&bots), Ok(&[])),
             Err(keeper_core::agents::model::HOME_NOT_HERE.to_owned())
         );
     }
@@ -1891,7 +2488,7 @@ mod tests {
         let before = std::fs::read_to_string(&file).expect("agent.toml");
 
         // Another save of the model lands after this one read the file.
-        let mine = prepare_model(&profiles, &save(None), Ok(&bots)).expect("prepared");
+        let mine = prepare_model(&profiles, &save(None), Ok(&bots), Ok(&[])).expect("prepared");
         let theirs = with_model(&before, &current, Some(Effort::Low)).expect("theirs");
         std::fs::write(&file, &theirs).expect("their save");
         assert_eq!(
@@ -1904,18 +2501,169 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&file).expect("kept"), theirs);
 
         // A sync edits another table after this save read the file.
-        let mine = prepare_model(&profiles, &save(Some(Effort::Low)), Ok(&bots)).expect("prepared");
+        let mine = prepare_model(&profiles, &save(Some(Effort::Low)), Ok(&bots), Ok(&[]))
+            .expect("prepared");
         let synced = format!("{theirs}\n[limits]\nrounds_per_turn = 4\n");
         std::fs::write(&file, &synced).expect("a sync");
         assert!(mine.publish().is_err());
         assert_eq!(std::fs::read_to_string(&file).expect("kept"), synced);
 
         // Made from the file as it reads now, the save writes its two keys.
-        write_model(&profiles, &save(Some(Effort::Low)), Ok(&bots)).expect("saved");
+        write_model(&profiles, &save(Some(Effort::Low)), Ok(&bots), Ok(&[])).expect("saved");
         assert_eq!(
             std::fs::read_to_string(&file).expect("saved"),
             with_model(&synced, OPUS, Some(Effort::Xhigh)).expect("expected")
         );
+    }
+
+    /// 101.5 #3 (R420): Settings' console save writes `[run].mode` and
+    /// `[run].paths` and nothing else, through the drive's own compare-and-
+    /// replace write; the row reads it back, with each folder this Mac does
+    /// not give and why (R440, R381); a row that showed another console, a
+    /// Mac that only pulls, and full access for an agent a gate hands
+    /// outside work to are refused, the file untouched.
+    #[test]
+    fn a_saved_console_writes_two_keys_of_agent_toml_or_says_why_not() {
+        use keeper_core::agents::console::{AgentConsoleReq, RunMode, CHANGED_UNDERNEATH};
+
+        let root = tempfile::tempdir().expect("tempdir");
+        nixi_drive(root.path());
+        let file = root.path().join("80-agents/nixi/agent.toml");
+        let before = std::fs::read_to_string(&file).expect("agent.toml");
+        let profile = profile(root.path());
+        let facts = DesktopFacts {
+            login: Some("tgorka".to_owned()),
+            device: Some("hesperia".to_owned()),
+            profiles: vec![profile.clone()],
+            ..DesktopFacts::default()
+        };
+        let row = |facts: &DesktopFacts| {
+            listing(
+                facts,
+                &[],
+                Ok(&[]),
+                &platform(root.path()),
+                &Names::new(),
+                &Problems::new(),
+                &Pictures::new(),
+            )
+            .into_iter()
+            .find(|row| row.agent == "nixi")
+            .and_then(|row| row.console)
+            .expect("Nixi's console")
+        };
+        let shown = row(&facts);
+        assert_eq!((shown.mode, shown.paths.len()), (RunMode::Off, 0));
+        let save = |mode, paths: &[&str], shown: &keeper_core::agents::console::AgentConsoleVm| {
+            AgentConsoleReq {
+                profile_id: "p1".to_owned(),
+                agent: "nixi".to_owned(),
+                mode,
+                paths: paths.iter().map(|path| (*path).to_owned()).collect(),
+                shown_mode: shown.mode,
+                shown_paths: shown.paths.clone(),
+            }
+        };
+
+        write_console(
+            &facts.profiles,
+            &save(
+                RunMode::Sandboxed,
+                &["/srv/site/", "tgdrive/projects"],
+                &shown,
+            ),
+            Ok(&[]),
+        )
+        .expect("saved");
+        let after = std::fs::read_to_string(&file).expect("agent.toml");
+        assert_eq!(
+            after,
+            format!("{before}\n[run]\nmode = \"sandboxed\"\npaths = [\"/srv/site\", \"tgdrive/projects\"]\n")
+        );
+        let sandboxed = row(&facts);
+        assert_eq!(sandboxed.mode, RunMode::Sandboxed);
+        assert_eq!(sandboxed.paths, ["/srv/site", "tgdrive/projects"]);
+        // R440, R381: a folder this Mac does not give is said on the row,
+        // with why — `tgdrive/projects` is not on this Mac — and one it
+        // gives is not.
+        let missing: Vec<&str> = sandboxed
+            .refused
+            .iter()
+            .map(|folder| folder.path.as_str())
+            .collect();
+        assert!(
+            missing.contains(&"tgdrive/projects"),
+            "{:?}",
+            sandboxed.refused
+        );
+        std::fs::create_dir_all(root.path().join("projects")).expect("projects");
+        assert!(
+            !row(&facts)
+                .refused
+                .iter()
+                .any(|folder| folder.path == "tgdrive/projects"),
+            "a folder that lands is given"
+        );
+
+        // The row showed the console before this save: refused, kept.
+        assert_eq!(
+            write_console(&facts.profiles, &save(RunMode::Full, &[], &shown), Ok(&[])),
+            Err(CHANGED_UNDERNEATH.to_owned())
+        );
+        assert_eq!(std::fs::read_to_string(&file).expect("kept"), after);
+
+        let mut pulling = profile.clone();
+        pulling.direction = keeper_sync::profile::SyncDirection::PullOnly;
+        let refused = write_console(&[pulling], &save(RunMode::Full, &[], &sandboxed), Ok(&[]))
+            .expect_err("pull-only");
+        assert!(refused.contains("only pulls tgdrive"), "{refused}");
+
+        write_console(
+            &facts.profiles,
+            &save(RunMode::Full, &[], &sandboxed),
+            Ok(&[]),
+        )
+        .expect("saved");
+        let full = row(&facts);
+        assert_eq!(full.mode, RunMode::Full);
+        assert!(full.refused.is_empty(), "full access is held to no folder");
+
+        // A gate of the zone hands Nixi outside work: full access is refused
+        // on her row and on save; the other modes stand.
+        std::fs::write(&file, &after).expect("back to sandboxed");
+        write(
+            root.path(),
+            "80-agents/forge/agent.toml",
+            &format!(
+                "version = 1\nid = \"forge\"\nname = \"Forge\"\nkind = \"gate\"\nmatrix_user = \"@forge:example.org\"\n\n[model]\nbot = \"bot:ollama:{NIXI_BOT}#model\"\n\n[[gate]]\nsystem = \"github\"\npeer = \"@github:example.org\"\naudience = [\"@github:example.org\", \"{TG}\"]\ndelegates = [\"nixi\"]\nmodes = [\"async\"]\n"
+            ),
+        );
+        let delegated = row(&facts);
+        let full = delegated
+            .modes
+            .iter()
+            .find(|mode| mode.mode == RunMode::Full)
+            .expect("full is listed");
+        assert!(
+            full.refused
+                .as_deref()
+                .is_some_and(|why| why.contains("forge")),
+            "{full:?}"
+        );
+        let refused = write_console(
+            &facts.profiles,
+            &save(RunMode::Full, &[], &delegated),
+            Ok(&[]),
+        )
+        .expect_err("a delegate never gets full access");
+        assert!(refused.contains("forge"), "{refused}");
+        assert_eq!(std::fs::read_to_string(&file).expect("kept"), after);
+        write_console(
+            &facts.profiles,
+            &save(RunMode::Supervised, &[], &delegated),
+            Ok(&[]),
+        )
+        .expect("saved");
     }
 
     /// Each agent of the principal's flagged folders, by Matrix user, with
@@ -2924,7 +3672,17 @@ mod tests {
             ..TurnEnv::new(platform)
         };
         let host = HostSlug::new("hesperia").expect("slug");
-        let deps = deps_over(&base, &data, &host, &views, &rows, &home).expect("served");
+        let deps = deps_over(
+            &base,
+            &data,
+            &host,
+            &views,
+            Vec::new(),
+            &rows,
+            &home,
+            Default::default(),
+        )
+        .expect("served");
         let ports = deps.env.drive.expect("the hosting drives");
         assert!(ports.vault.is_none());
     }

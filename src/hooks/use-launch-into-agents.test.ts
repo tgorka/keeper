@@ -6,10 +6,17 @@ vi.mock("@/lib/ipc/client", () => ({
   agentsLaunch: vi.fn(),
   agentsDefaultGet: vi.fn(),
   agentsDefaultSet: vi.fn(),
+  agentMainDmOpen: vi.fn(),
   frontendErrorReport: vi.fn(() => Promise.resolve()),
   telemetryCapture: vi.fn(() => Promise.resolve()),
 }));
-vi.mock("sonner", () => ({ toast: Object.assign(vi.fn(), { error: vi.fn() }) }));
+vi.mock("sonner", () => ({
+  toast: Object.assign(vi.fn(), {
+    error: vi.fn(),
+    loading: vi.fn(() => "waiting"),
+    dismiss: vi.fn(),
+  }),
+}));
 
 import { toast } from "sonner";
 import {
@@ -17,7 +24,12 @@ import {
   REASON_NOTICE_MS,
   useLaunchIntoAgents,
 } from "@/hooks/use-launch-into-agents";
-import { agentsLaunch, frontendErrorReport, telemetryCapture } from "@/lib/ipc/client";
+import {
+  agentMainDmOpen,
+  agentsLaunch,
+  frontendErrorReport,
+  telemetryCapture,
+} from "@/lib/ipc/client";
 import { accountsStore } from "@/lib/stores/accounts";
 import { agentRoomsStore } from "@/lib/stores/agent-rooms";
 import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
@@ -47,6 +59,8 @@ function answer(overrides: Partial<AgentsLaunchVm>): AgentsLaunchVm {
     announce: false,
     choices: [],
     fileSet: null,
+    ask: null,
+    askable: [],
     ...overrides,
   };
 }
@@ -73,7 +87,9 @@ async function settle(): Promise<void> {
 
 function reset(): void {
   mockLaunch.mockReset();
+  vi.mocked(agentMainDmOpen).mockReset();
   vi.mocked(toast).mockClear();
+  vi.mocked(toast.loading).mockClear();
   vi.mocked(toast.error).mockClear();
   vi.mocked(frontendErrorReport).mockClear();
   vi.mocked(telemetryCapture).mockClear();
@@ -120,6 +136,58 @@ describe("useLaunchIntoAgents", () => {
       durationMs: null,
       surface: "launchDefaultAgent",
     });
+  });
+
+  it("asks the default agent for its conversation when it has none here, and opens it when it lands (101.1 #4)", async () => {
+    const ask = {
+      accountId: account.accountId,
+      agent: "@nixi:example.org",
+      name: "Nixi",
+      opening: "Opening a conversation with Nixi…",
+    };
+    let land: (room: typeof DM) => void = () => {};
+    vi.mocked(agentMainDmOpen).mockReturnValue(
+      new Promise((resolve) => {
+        land = resolve;
+      }),
+    );
+    mockLaunch.mockResolvedValue(answer({ defaultAgent: ask.agent, ask }));
+    renderHook(() => useLaunchIntoAgents());
+    boot();
+    await settle();
+    expect(primaryViewStore.getState().view).toBe("agents");
+    expect(agentMainDmOpen).toHaveBeenCalledWith(account.accountId, ask.agent);
+    expect(toast.loading).toHaveBeenCalledWith("Opening a conversation with Nixi…");
+    expect(roomsStore.getState().selected).toBeNull();
+
+    land(DM);
+    await settle();
+    expect(roomsStore.getState().selected).toEqual(DM);
+  });
+
+  it("leaves the person where they went while the conversation was being opened (101.1 #4)", async () => {
+    const ask = {
+      accountId: account.accountId,
+      agent: "@nixi:example.org",
+      name: "Nixi",
+      opening: "Opening a conversation with Nixi…",
+    };
+    let land: (room: typeof DM) => void = () => {};
+    vi.mocked(agentMainDmOpen).mockReturnValue(
+      new Promise((resolve) => {
+        land = resolve;
+      }),
+    );
+    mockLaunch.mockResolvedValue(answer({ defaultAgent: ask.agent, ask }));
+    renderHook(() => useLaunchIntoAgents());
+    boot();
+    await settle();
+    const elsewhere = { accountId: account.accountId, roomId: "!marta:example.org" };
+    act(() => roomsStore.getState().selectRoom(elsewhere));
+
+    land(DM);
+    await settle();
+    expect(roomsStore.getState().selected).toEqual(elsewhere);
   });
 
   it("applies the answer once: a later return to the Inbox and new batches stay put", async () => {

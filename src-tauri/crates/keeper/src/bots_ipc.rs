@@ -1320,6 +1320,7 @@ mod tests {
                 kind: keeper_core::agents::session::SessionKind::Main,
                 agent: "@nixi:example.org".to_owned(),
                 allowed: None,
+                attention: None,
             },
         )];
         match spoken_target(&dir, &rooms).expect("the proxy room") {

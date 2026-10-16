@@ -23,6 +23,7 @@ import type { FilesDeletePlanVm } from "./gen/FilesDeletePlanVm";
 import type { FilesDeleteReceiptVm } from "./gen/FilesDeleteReceiptVm";
 import type { FilesListingVm } from "./gen/FilesListingVm";
 import type { IpcError } from "./gen/IpcError";
+import type { LaunchRoomVm } from "./gen/LaunchRoomVm";
 import type { LifecyclePhase } from "./gen/LifecyclePhase";
 import type { LineEditVm } from "./gen/LineEditVm";
 import type { LogUploadVm } from "./gen/LogUploadVm";
@@ -341,6 +342,11 @@ export type { AccountSetupVm } from "./gen/AccountSetupVm";
 export type { AccountShareVm } from "./gen/AccountShareVm";
 export type { AccountStateVm } from "./gen/AccountStateVm";
 export type { AccountVm } from "./gen/AccountVm";
+export type { AgentAsksVm } from "./gen/AgentAsksVm";
+export type { AgentAskVm } from "./gen/AgentAskVm";
+export type { AgentAttentionVm } from "./gen/AgentAttentionVm";
+export type { AgentConsoleReq } from "./gen/AgentConsoleReq";
+export type { AgentConsoleVm } from "./gen/AgentConsoleVm";
 export type { AgentCopyVm } from "./gen/AgentCopyVm";
 export type { AgentFocusReq } from "./gen/AgentFocusReq";
 export type { AgentMcpConflictVm } from "./gen/AgentMcpConflictVm";
@@ -376,6 +382,9 @@ export type { AgentSeedReq } from "./gen/AgentSeedReq";
 export type { AgentSeedResultVm } from "./gen/AgentSeedResultVm";
 export type { AgentStatusVm } from "./gen/AgentStatusVm";
 export type { AgentsLaunchVm } from "./gen/AgentsLaunchVm";
+export type { AgentWebSearchReq } from "./gen/AgentWebSearchReq";
+export type { AgentWebSearchUrlVm } from "./gen/AgentWebSearchUrlVm";
+export type { AgentWebSearchVm } from "./gen/AgentWebSearchVm";
 export type { ApprovalCardVm } from "./gen/ApprovalCardVm";
 export type { ApprovalDecideReq } from "./gen/ApprovalDecideReq";
 export type { ApprovalDecision } from "./gen/ApprovalDecision";
@@ -386,6 +395,7 @@ export type { ApprovalScope } from "./gen/ApprovalScope";
 export type { ApprovalStateVm } from "./gen/ApprovalStateVm";
 export type { ApprovalVm } from "./gen/ApprovalVm";
 export type { ArtifactOfferVm } from "./gen/ArtifactOfferVm";
+export type { AskState } from "./gen/AskState";
 export type { AuditOutcome } from "./gen/AuditOutcome";
 export type { AuditVerdict } from "./gen/AuditVerdict";
 export type { AutoUpdateHold } from "./gen/AutoUpdateHold";
@@ -454,14 +464,19 @@ export type { CardKeyVm } from "./gen/CardKeyVm";
 export type { ChatCommandPreviewVm } from "./gen/ChatCommandPreviewVm";
 export type { ChatCommandRowVm } from "./gen/ChatCommandRowVm";
 export type { ChatCommandVerdictVm } from "./gen/ChatCommandVerdictVm";
+export type { ChatInlinePreviewVm } from "./gen/ChatInlinePreviewVm";
+export type { ChatInlineRowVm } from "./gen/ChatInlineRowVm";
 export type { ChatNotifyMode } from "./gen/ChatNotifyMode";
 export type { ChoiceVm } from "./gen/ChoiceVm";
+export type { ClaimsLease } from "./gen/ClaimsLease";
 export type { ConfigFaultVm } from "./gen/ConfigFaultVm";
 export type { ConfigLayersVm } from "./gen/ConfigLayersVm";
 export type { ConfigOverrideVm } from "./gen/ConfigOverrideVm";
 export type { ConfigTierVm } from "./gen/ConfigTierVm";
 export type { ConnectionStatus } from "./gen/ConnectionStatus";
 export type { ConnectionStatusBatch } from "./gen/ConnectionStatusBatch";
+export type { ConsoleFolderVm } from "./gen/ConsoleFolderVm";
+export type { ConsoleModeVm } from "./gen/ConsoleModeVm";
 export type { CopyEntryVm } from "./gen/CopyEntryVm";
 export type { CopyJobState } from "./gen/CopyJobState";
 export type { CopyJobVm } from "./gen/CopyJobVm";
@@ -532,6 +547,9 @@ export type { GateStepVm } from "./gen/GateStepVm";
 export type { GrantMode } from "./gen/GrantMode";
 export type { GrantScope } from "./gen/GrantScope";
 export type { HeardMarkVm } from "./gen/HeardMarkVm";
+export type { HeldFileVm } from "./gen/HeldFileVm";
+export type { HeldReplyVm } from "./gen/HeldReplyVm";
+export type { HeldRestoreVm } from "./gen/HeldRestoreVm";
 export type { HeldSendVm } from "./gen/HeldSendVm";
 export type { HotkeyVm } from "./gen/HotkeyVm";
 export type { InboxBatch } from "./gen/InboxBatch";
@@ -551,6 +569,7 @@ export type { LoginFieldVm } from "./gen/LoginFieldVm";
 export type { LoginFlowVm } from "./gen/LoginFlowVm";
 export type { LogUploadOutcomeVm } from "./gen/LogUploadOutcomeVm";
 export type { LogUploadVm } from "./gen/LogUploadVm";
+export type { MainDmAskVm } from "./gen/MainDmAskVm";
 export type { MatrixOfferVm } from "./gen/MatrixOfferVm";
 export type { MediaKindVm } from "./gen/MediaKindVm";
 export type { MediaVm } from "./gen/MediaVm";
@@ -685,6 +704,7 @@ export type { RiskTier } from "./gen/RiskTier";
 export type { RoomListBatch } from "./gen/RoomListBatch";
 export type { RoomListOp } from "./gen/RoomListOp";
 export type { RoomVm } from "./gen/RoomVm";
+export type { RunMode } from "./gen/RunMode";
 export type { SasEmojiVm } from "./gen/SasEmojiVm";
 export type { ScopeDriveVm } from "./gen/ScopeDriveVm";
 export type { ScopeOfferVm } from "./gen/ScopeOfferVm";
@@ -797,6 +817,7 @@ export type { VoiceStateVm } from "./gen/VoiceStateVm";
 export type { VoiceTargetSpeedVm } from "./gen/VoiceTargetSpeedVm";
 export type { VoiceUnavailableVm } from "./gen/VoiceUnavailableVm";
 export type { VoiceWakeVm } from "./gen/VoiceWakeVm";
+export type { WebSearchLevel } from "./gen/WebSearchLevel";
 export type { WidgetKind } from "./gen/WidgetKind";
 export type { WidgetRow } from "./gen/WidgetRow";
 export type { WordBlockStyle } from "./gen/WordBlockStyle";
@@ -807,6 +828,8 @@ export type { WordsVm } from "./gen/WordsVm";
 import type { AccountSetupVm } from "./gen/AccountSetupVm";
 import type { AccountShareVm } from "./gen/AccountShareVm";
 import type { AccountVm } from "./gen/AccountVm";
+import type { AgentAsksVm } from "./gen/AgentAsksVm";
+import type { AgentConsoleReq } from "./gen/AgentConsoleReq";
 import type { AgentCopyVm } from "./gen/AgentCopyVm";
 import type { AgentFocusReq } from "./gen/AgentFocusReq";
 import type { AgentMcpDraftVm } from "./gen/AgentMcpDraftVm";
@@ -821,6 +844,8 @@ import type { AgentSeedPlanVm } from "./gen/AgentSeedPlanVm";
 import type { AgentSeedReq } from "./gen/AgentSeedReq";
 import type { AgentSeedResultVm } from "./gen/AgentSeedResultVm";
 import type { AgentsLaunchVm } from "./gen/AgentsLaunchVm";
+import type { AgentWebSearchReq } from "./gen/AgentWebSearchReq";
+import type { AgentWebSearchUrlVm } from "./gen/AgentWebSearchUrlVm";
 import type { ApprovalDecideReq } from "./gen/ApprovalDecideReq";
 import type { ApprovalDraftVm } from "./gen/ApprovalDraftVm";
 import type { ApprovalPayloadVm } from "./gen/ApprovalPayloadVm";
@@ -858,7 +883,9 @@ import type { CapabilitiesVm } from "./gen/CapabilitiesVm";
 import type { CaptureTargetVm } from "./gen/CaptureTargetVm";
 import type { CaptureWindowVm } from "./gen/CaptureWindowVm";
 import type { ChatCommandPreviewVm } from "./gen/ChatCommandPreviewVm";
+import type { ChatInlinePreviewVm } from "./gen/ChatInlinePreviewVm";
 import type { ChoiceVm } from "./gen/ChoiceVm";
+import type { ClaimsLease } from "./gen/ClaimsLease";
 import type { ConfigLayersVm } from "./gen/ConfigLayersVm";
 import type { ConnectionStatusBatch } from "./gen/ConnectionStatusBatch";
 import type { CopyJobVm } from "./gen/CopyJobVm";
@@ -876,6 +903,7 @@ import type { ForgeAddReq } from "./gen/ForgeAddReq";
 import type { ForgeAddResultVm } from "./gen/ForgeAddResultVm";
 import type { ForgeReposVm } from "./gen/ForgeReposVm";
 import type { ForgeSourceVm } from "./gen/ForgeSourceVm";
+import type { HeldRestoreVm } from "./gen/HeldRestoreVm";
 import type { HotkeyVm } from "./gen/HotkeyVm";
 import type { InboxBatch } from "./gen/InboxBatch";
 import type { IncognitoVm } from "./gen/IncognitoVm";
@@ -2159,6 +2187,31 @@ export async function chatCommandPreview(
   });
 }
 
+/**
+ * What a `/` at the caret offers in the middle of a message (Story 101.3,
+ * R418): the draft split at the caret, the token Rust found there and its
+ * rows — in an agent room mentions of other agents and drive files, and
+ * `/shrug` everywhere. Choosing a row replaces `token` (the end of `before`)
+ * with the row's `insert`.
+ *
+ * **`before` and `after` are echoed back, and the caller must check them**:
+ * an answer for text the field no longer holds is dropped. Rejects with the
+ * {@link IpcError} envelope when the room is not known on the account.
+ */
+export async function chatInlinePreview(
+  accountId: string,
+  roomId: string,
+  before: string,
+  after: string,
+): Promise<ChatInlinePreviewVm> {
+  return await invoke<ChatInlinePreviewVm>("chat_inline_preview", {
+    accountId,
+    roomId,
+    before,
+    after,
+  });
+}
+
 /** `/topic`: change the room's topic (Story 100.5). Rejects with the envelope. */
 export async function roomSetTopic(
   accountId: string,
@@ -2180,7 +2233,7 @@ export async function roomLeave(accountId: string, roomId: string): Promise<void
 
 /**
  * Read the Undo-Send window in whole seconds (Story 8.3, FR-46). Absent/unparsable =
- * the default of 10; a stored value is clamped to `0..=60` (0 disables holding).
+ * the default of 2 (Story 101.3); a stored value is clamped to `0..=60` (0 disables holding).
  * Rejects with the {@link IpcError} envelope on a registry failure.
  */
 export async function undoSendWindow(): Promise<number> {
@@ -2193,6 +2246,23 @@ export async function undoSendWindow(): Promise<number> {
  */
 export async function setUndoSendWindow(seconds: number): Promise<void> {
   await invoke<void>("set_undo_send_window", { seconds });
+}
+
+/**
+ * Read the agent rooms' Undo-Send window in whole seconds (Story 101.3, R418).
+ * Absent/unparsable = 0 (a message to an agent leaves at once); clamped to `0..=60`.
+ * Rejects with the {@link IpcError} envelope on a registry failure.
+ */
+export async function undoSendAgentWindow(): Promise<number> {
+  return await invoke<number>("undo_send_agent_window");
+}
+
+/**
+ * Set the agent rooms' Undo-Send window in whole seconds (Story 101.3), clamped to
+ * `0..=60` before persisting. Resolves once persisted.
+ */
+export async function setUndoSendAgentWindow(seconds: number): Promise<void> {
+  await invoke<void>("set_undo_send_agent_window", { seconds });
 }
 
 /**
@@ -2296,16 +2366,17 @@ export async function recordingRevealFolder(): Promise<void> {
 
 /**
  * Cancel a held send by its `id` (Story 8.3, FR-46): deletes the durable `outbox`
- * row, persists its body as the Chat's Draft, and resolves with the restored body so
- * the composer can restore it. Performs **zero** network dispatch. Cancel of an
- * already-dispatched/absent row is an idempotent no-op resolving with an empty string.
+ * row, persists its body as the Chat's Draft, and resolves with what the composer
+ * restores — the line, the message a held reply answered and a held attachment's
+ * staged file (Story 101.3, R432). Performs **zero** network dispatch. Cancel of an
+ * already-dispatched/absent row is an idempotent no-op resolving with an empty line.
  */
 export async function cancelHeldSend(
   accountId: string,
   roomId: string,
   id: string,
-): Promise<string> {
-  return await invoke<string>("cancel_held_send", { accountId, roomId, id });
+): Promise<HeldRestoreVm> {
+  return await invoke<HeldRestoreVm>("cancel_held_send", { accountId, roomId, id });
 }
 
 /**
@@ -2347,6 +2418,21 @@ export async function sendReply(
   body: string,
 ): Promise<void> {
   await invoke<void>("send_reply", { accountId, roomId, inReplyToKey, body });
+}
+
+/**
+ * Send a plain-text reply to the message `eventId` names (Story 101.3, R447):
+ * a reply an Undo gave back, whose original may be outside the loaded timeline,
+ * so it is named by event rather than by a render key. Held for the room kind's
+ * Undo-Send window like any reply; rejects as {@link sendReply} does.
+ */
+export async function sendReplyToEvent(
+  accountId: string,
+  roomId: string,
+  eventId: string,
+  body: string,
+): Promise<void> {
+  await invoke<void>("send_reply_to_event", { accountId, roomId, eventId, body });
 }
 
 /**
@@ -7798,6 +7884,16 @@ export async function agentsModelSet(req: AgentModelReq): Promise<AgentCopyVm[]>
 }
 
 /**
+ * Settings › Agents: save one agent's console (story 101.5, R420) — only
+ * `[run].mode` and `[run].paths` of its `agent.toml`, written as the person
+ * through the drive's write path. Resolves to the rows as they read now; a
+ * refusal is Rust's sentence.
+ */
+export async function agentsConsoleSet(req: AgentConsoleReq): Promise<AgentCopyVm[]> {
+  return await invoke<AgentCopyVm[]>("agents_console_set", { req });
+}
+
+/**
  * `/model` typed in the person's DM with an agent (story 100.5, DW-1431,
  * R415): `args` is what followed the name. Rust reads it against the agent's
  * `agent.toml` and saves through Settings › Agents' own write; the answer is
@@ -7880,6 +7976,37 @@ export async function agentsSandboxSave(req: AgentSandboxReq): Promise<AgentSand
   return await invoke<AgentSandboxVm>("agents_sandbox_save", { req });
 }
 
+/**
+ * Settings › Agents: choose one agent's web search level (101.4 #3, R419,
+ * R457). Rust writes only `[tools].allow` and `[web_search].ask` of its
+ * `agent.toml`, refuses a file that changed since the row was read and any
+ * level but off for a gate or a local-only agent, and answers the rows as they
+ * read now; a refusal rejects with its sentence.
+ */
+export async function agentsWebSearchSet(req: AgentWebSearchReq): Promise<AgentCopyVm[]> {
+  return await invoke<AgentCopyVm[]>("agents_web_search_set", { req });
+}
+
+/**
+ * Settings › Agents › *Web search*: this Mac's engine (a SearXNG URL) as
+ * stored in `keeper.db`, and why it is not used when it no longer checks.
+ *
+ * Rejects with: `internal`.
+ */
+export async function agentsWebSearchGet(): Promise<AgentWebSearchUrlVm> {
+  return await invoke<AgentWebSearchUrlVm>("agents_web_search_get");
+}
+
+/**
+ * Name this Mac's web search engine, checked by the same check agentd's
+ * `[web_search] url` goes through; `""` names none. Answers it again.
+ *
+ * Rejects with: `internal`, its message Rust's refusal to show verbatim.
+ */
+export async function agentsWebSearchSave(url: string): Promise<AgentWebSearchUrlVm> {
+  return await invoke<AgentWebSearchUrlVm>("agents_web_search_save", { url });
+}
+
 // ---------------------------------------------------------------------------
 // The proxy beside the notes view (story 91.2, UX-DR130)
 // ---------------------------------------------------------------------------
@@ -7950,6 +8077,38 @@ export async function agentConversationNew(
   title: string | null,
 ): Promise<string> {
   return await invoke<string>("agent_conversation_new", { accountId, roomId, title });
+}
+
+/**
+ * Open the person's `main` DM with `agent` on `accountId` (story 101.1, R416):
+ * the room when it is here; otherwise Rust asks the agent's host for it through
+ * the control room and answers once the room has landed, within 30 s. A
+ * rejection's `message` is Rust's sentence for why it did not open.
+ */
+export async function agentMainDmOpen(accountId: string, agent: string): Promise<LaunchRoomVm> {
+  return await invoke<LaunchRoomVm>("agent_main_dm_open", { accountId, agent });
+}
+
+/**
+ * Follow the questions waiting for the person that are answered in `roomId`
+ * (Story 101.3, R430, R431): Rust sends a snapshot now and another whenever an
+ * agent's session room this account reads, or this room's held sends or send
+ * queue, change — which asks wait, where each is answered, where its answer
+ * stands and what keeper could not read are all Rust's. Choosing a choice is the
+ * person's own message in the room ({@link sendText}), exactly what typing it
+ * sends. Resolves with the subscription id.
+ */
+export async function subscribeAgentAsks(
+  accountId: string,
+  roomId: string,
+  onBatch: (batch: AgentAsksVm) => void,
+): Promise<number> {
+  return await subscribe<AgentAsksVm>("agent_asks_subscribe", onBatch, { accountId, roomId });
+}
+
+/** End one {@link subscribeAgentAsks}. Idempotent. */
+export async function unsubscribeAgentAsks(accountId: string, id: number): Promise<void> {
+  await invoke<void>("agent_asks_unsubscribe", { accountId, subscriptionId: id });
 }
 
 /**
@@ -8790,6 +8949,22 @@ export async function agentsDefaultGet(): Promise<AgentsLaunchVm> {
  */
 export async function agentsDefaultSet(agent: string | null): Promise<AgentsLaunchVm> {
   return await invoke<AgentsLaunchVm>("agents_default_set", { agent });
+}
+
+/**
+ * The lease this Mac takes a session's claim on while it hosts the person's
+ * agents (R455): `short` unless the quarter-hour one was turned on.
+ */
+export async function agentsClaimsLeaseGet(): Promise<ClaimsLease> {
+  return await invoke<ClaimsLease>("agents_claims_lease_get");
+}
+
+/**
+ * Store this Mac's claims lease; resolves with it as it now reads (a
+ * settings file may still decide it), rejects with Rust's sentence.
+ */
+export async function agentsClaimsLeaseSet(lease: ClaimsLease): Promise<ClaimsLease> {
+  return await invoke<ClaimsLease>("agents_claims_lease_set", { lease });
 }
 
 /**

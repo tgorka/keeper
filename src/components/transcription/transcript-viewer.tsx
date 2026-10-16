@@ -84,6 +84,7 @@ import {
   transcriptionStore,
   useTranscriptionStore,
 } from "@/lib/stores/transcription";
+import { NO_TEXT_SUBSTITUTION } from "@/lib/text-entry";
 import { cn } from "@/lib/utils";
 import { FILE_FORMATS } from "@/lib/viewers/registry";
 import type { ViewerProps } from "@/lib/viewers/types";
@@ -1251,6 +1252,7 @@ function EditLine({
   return (
     <div className="mt-1 space-y-2">
       <textarea
+        {...NO_TEXT_SUBSTITUTION}
         ref={fieldRef}
         aria-label={`Edit ${utterance.id}`}
         className="min-h-20 w-full rounded-md border bg-background p-2 text-title font-normal leading-relaxed"

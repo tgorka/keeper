@@ -435,7 +435,12 @@ impl ServedSession {
         let named = crate::delegate::agent_of(&call.arguments_raw)
             .ok_or_else(|| "its arguments do not read".to_owned())?;
         let known = rooms.known();
-        let target = crate::delegate::resolve(&known, &named)?;
+        // Under the gate's own label and model: a refused home is named only
+        // to an audience its drive's readers cover, and to a session whose
+        // model its drive may reach (R436, R453).
+        let target =
+            crate::delegate::resolve(&known, &named, &self.context.label, deps.model_is_local())
+                .map_err(|unresolved| unresolved.sentence)?;
         if !keeper_core::agents::gate::selects(&gate.delegates, &target.drive, &target.id) {
             return Err(crate::delegate::not_a_delegate(&named));
         }

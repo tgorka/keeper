@@ -1,8 +1,11 @@
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { CLAIMS_LEASE_LABEL } from "@/components/settings/agents-claims-lease-row";
 import {
   AGENTS_RELOAD_MS,
   AgentsSection,
+  CONSOLE_ADD_FOLDER_LABEL,
+  CONSOLE_SAVE_LABEL,
   MODEL_SAVE_LABEL,
   PIN_LABEL,
   PROVIDER_DEFAULT_LABEL,
@@ -12,17 +15,21 @@ import {
   SEED_WRITE_LABEL,
   SET_UP_AGENTS_LABEL,
   SIGN_IN_LABEL,
+  WEB_SEARCH_SWITCH_NOTE,
 } from "@/components/settings/agents-section";
 import type {
+  AgentConsoleVm,
   AgentCopyVm,
   AgentModelVm,
   AgentPersonVm,
   AgentPinVm,
   AgentSeedFolderVm,
   AgentSeedOfferVm,
+  AgentWebSearchVm,
   Effort,
 } from "@/lib/ipc/client";
 import {
+  agentsConsoleSet,
   agentsCopies,
   agentsCopySignIn,
   agentsDriveRepin,
@@ -32,6 +39,7 @@ import {
   agentsSeedApply,
   agentsSeedOffer,
   agentsSeedPlan,
+  agentsWebSearchSet,
 } from "@/lib/ipc/client";
 
 vi.mock("@/lib/ipc/client", () => ({
@@ -44,12 +52,18 @@ vi.mock("@/lib/ipc/client", () => ({
   agentsMcpList: vi.fn(),
   agentsMcpRemove: vi.fn(),
   agentsModelSet: vi.fn(),
+  agentsConsoleSet: vi.fn(),
   agentsMcpDraft: vi.fn(() =>
     Promise.resolve({ floor: null, fixed: null, tools: [], conflicts: [], drop: null }),
   ),
+  agentsClaimsLeaseGet: vi.fn(() => Promise.resolve("short")),
+  agentsClaimsLeaseSet: vi.fn(),
   agentsSandboxGet: vi.fn(() =>
     Promise.resolve({ readExec: [], env: [], status: "", refusal: null }),
   ),
+  agentsWebSearchGet: vi.fn(() => Promise.resolve({ url: null, refusal: null })),
+  agentsWebSearchSave: vi.fn(),
+  agentsWebSearchSet: vi.fn(),
 }));
 
 const OWNER: AgentPersonVm = { matrixId: "@tgorka:tgorka.org", displayName: "Tomasz Gorka" };
@@ -105,6 +119,8 @@ function nixi(pin: AgentPinVm, signedIn = false): AgentCopyVm {
     pin,
     problem: null,
     model: null,
+    webSearch: null,
+    console: null,
     avatarProblem: null,
   };
 }
@@ -275,6 +291,8 @@ describe("Settings › Agents", () => {
         pin: null,
         problem: sentence,
         model: null,
+        webSearch: null,
+        console: null,
         avatarProblem: null,
       },
     ]);
@@ -595,7 +613,10 @@ describe("Settings › Agents › Set up agents", () => {
     expect(await screen.findByText(sentence)).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "marta-notes" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: SET_UP_AGENTS_LABEL })).not.toBeInTheDocument();
-    expect(screen.queryByRole("checkbox")).not.toBeInTheDocument();
+    // No seed form's checkboxes: the one left is this Mac's claims lease.
+    expect(screen.getAllByRole("checkbox")).toEqual([
+      screen.getByRole("checkbox", { name: CLAIMS_LEASE_LABEL }),
+    ]);
   });
 });
 
@@ -633,6 +654,131 @@ async function choose(name: string, option: string) {
   fireEvent.click(await screen.findByRole("option", { name: option }));
   await waitFor(() => expect(control).toHaveTextContent(option));
 }
+
+function withWebSearch(webSearch: AgentWebSearchVm): AgentCopyVm {
+  return { ...nixi({ ...unpinned, localOnly: false, state: "pinned" }, true), webSearch };
+}
+
+const SEARCH_OFF: AgentWebSearchVm = {
+  level: "off",
+  locked: null,
+  unavailable: null,
+  warning: null,
+};
+
+const WARNING =
+  "Queries go to search.example.org and its upstream search engines without asking — they may contain words from your files. A host other than this Mac sends them to its own engine.";
+
+function level(name: string) {
+  return screen.getByRole("radio", { name });
+}
+
+describe("Settings › Agents › an agent's web search (101.4, R457)", () => {
+  it("chooses a level against what the row showed and draws the rows Rust answers", async () => {
+    vi.mocked(agentsCopies).mockResolvedValue([withWebSearch(SEARCH_OFF)]);
+    vi.mocked(agentsWebSearchSet).mockResolvedValue([
+      withWebSearch({ ...SEARCH_OFF, level: "ask" }),
+    ]);
+    render(<AgentsSection open />);
+
+    const group = await screen.findByRole("radiogroup", { name: "Web search" });
+    expect(group).toHaveAccessibleDescription(WEB_SEARCH_SWITCH_NOTE);
+    expect(level("Off")).toBeChecked();
+    fireEvent.click(level("Ask"));
+
+    await waitFor(() =>
+      expect(agentsWebSearchSet).toHaveBeenCalledWith({
+        profileId: "p1",
+        agent: "nixi",
+        level: "ask",
+        shownLevel: "off",
+      }),
+    );
+    await waitFor(() => expect(level("Ask")).toBeChecked());
+  });
+
+  it("stands Rust's warning beside without asking while it is the level, and takes it away after", async () => {
+    vi.mocked(agentsCopies).mockResolvedValue([withWebSearch({ ...SEARCH_OFF, level: "ask" })]);
+    vi.mocked(agentsWebSearchSet).mockResolvedValueOnce([
+      withWebSearch({ ...SEARCH_OFF, level: "withoutAsking", warning: WARNING }),
+    ]);
+    render(<AgentsSection open />);
+    await screen.findByRole("radiogroup", { name: "Web search" });
+    expect(screen.queryByText(WARNING)).not.toBeInTheDocument();
+
+    fireEvent.click(level("Without asking"));
+    await waitFor(() =>
+      expect(agentsWebSearchSet).toHaveBeenLastCalledWith({
+        profileId: "p1",
+        agent: "nixi",
+        level: "withoutAsking",
+        shownLevel: "ask",
+      }),
+    );
+    await waitFor(() => expect(level("Without asking")).toBeChecked());
+    expect(screen.getByText(WARNING)).toBeInTheDocument();
+    expect(level("Without asking")).toHaveAccessibleDescription(WARNING);
+
+    vi.mocked(agentsWebSearchSet).mockResolvedValueOnce([
+      withWebSearch({ ...SEARCH_OFF, level: "ask" }),
+    ]);
+    fireEvent.click(level("Ask"));
+    await waitFor(() =>
+      expect(agentsWebSearchSet).toHaveBeenLastCalledWith({
+        profileId: "p1",
+        agent: "nixi",
+        level: "ask",
+        shownLevel: "withoutAsking",
+      }),
+    );
+    await waitFor(() => expect(level("Ask")).toBeChecked());
+    expect(screen.queryByText(WARNING)).not.toBeInTheDocument();
+  });
+
+  it("says Rust's refusal beside the choice and leaves it as the file says", async () => {
+    const sentence =
+      "This agent's agent.toml changed on the drive meanwhile, so web search was not switched. Look at it again and choose.";
+    vi.mocked(agentsCopies).mockResolvedValue([withWebSearch(SEARCH_OFF)]);
+    vi.mocked(agentsWebSearchSet).mockRejectedValue({
+      code: "internal",
+      message: sentence,
+      accountId: null,
+      retriable: false,
+    });
+    render(<AgentsSection open />);
+    await screen.findByRole("radiogroup", { name: "Web search" });
+    fireEvent.click(level("Ask"));
+
+    expect((await screen.findByRole("alert")).textContent).toBe(sentence);
+    expect(level("Off")).toBeChecked();
+  });
+
+  it("offers only off for an agent Rust offers no search, so one that is on can be switched off", async () => {
+    const unavailable =
+      "Nixi uses only models that run on its readers' own machines, and a web search sends its query out, so it is never offered one.";
+    vi.mocked(agentsCopies).mockResolvedValue([
+      withWebSearch({ ...SEARCH_OFF, level: "withoutAsking", unavailable }),
+    ]);
+    render(<AgentsSection open />);
+    const group = await screen.findByRole("radiogroup", { name: "Web search" });
+    expect(group).toHaveAccessibleDescription(unavailable);
+    expect(level("Ask")).toBeDisabled();
+    expect(level("Without asking")).toBeDisabled();
+    expect(level("Off")).toBeEnabled();
+  });
+
+  it("changes nothing on a Mac that only pulls the drive, and says why", async () => {
+    const locked =
+      "This Mac only pulls tgdrive, so a change made here would never reach the drive. Switch web search where the drive is written.";
+    vi.mocked(agentsCopies).mockResolvedValue([
+      withWebSearch({ ...SEARCH_OFF, level: "ask", locked }),
+    ]);
+    render(<AgentsSection open />);
+    const group = await screen.findByRole("radiogroup", { name: "Web search" });
+    expect(group).toHaveAccessibleDescription(locked);
+    for (const name of ["Off", "Ask", "Without asking"]) expect(level(name)).toBeDisabled();
+  });
+});
 
 describe("Settings › Agents › an agent's model (100.2)", () => {
   it("offers the bots Rust lists with each one's levels, and saves the choice against what it showed", async () => {
@@ -799,5 +945,135 @@ describe("Settings › Agents › an agent's model (100.2)", () => {
     expect(screen.queryByText(SEED_NO_BOTS)).not.toBeInTheDocument();
     expect(screen.queryAllByRole("radio")).toHaveLength(0);
     expect(screen.getByRole("combobox", { name: "Model" })).toHaveTextContent("Opus");
+  });
+});
+
+/**
+ * Nixi's console as Rust shows it (101.5): sandboxed with one folder this Mac
+ * does not give her commands (R440), every mode offered, full access refused
+ * for her with Rust's reason.
+ */
+const SITE_REFUSED = "Not given to its commands on this Mac: it is not on this host.";
+const UNRESTRICTED = "Unrestricted — folders do not constrain full access.";
+const SANDBOXED: AgentConsoleVm = {
+  mode: "sandboxed",
+  paths: ["tgdrive/projects/site"],
+  modes: [
+    { mode: "off", label: "Off", description: "No console.", refused: null },
+    { mode: "supervised", label: "Supervised", description: "Every command asks.", refused: null },
+    { mode: "sandboxed", label: "Sandboxed", description: "Runs in the sandbox.", refused: null },
+    {
+      mode: "full",
+      label: "Full access",
+      description: "No sandbox.",
+      refused: "Nixi cannot have this mode: the gate forge names this one in its delegates.",
+    },
+  ],
+  drives: ["tgdrive"],
+  warning: "Full access: Nixi's commands run on its host without a sandbox and without asking.",
+  unrestricted: UNRESTRICTED,
+  refused: [{ path: "tgdrive/projects/site", refused: SITE_REFUSED }],
+  locked: null,
+};
+
+function withConsole(shown: AgentConsoleVm): AgentCopyVm {
+  return { ...nixi({ ...unpinned, localOnly: false, state: "pinned" }, true), console: shown };
+}
+
+describe("Settings › Agents › an agent's console (101.5)", () => {
+  it("saves the chosen mode and folders against the console it showed", async () => {
+    vi.mocked(agentsCopies).mockResolvedValue([withConsole(SANDBOXED)]);
+    vi.mocked(agentsConsoleSet).mockResolvedValue([
+      withConsole({ ...SANDBOXED, mode: "supervised", paths: ["/Users/tgorka/prj/keeper"] }),
+    ]);
+    render(<AgentsSection open />);
+
+    const mode = await screen.findByRole("combobox", { name: "Console" });
+    expect(mode).toHaveTextContent("Sandboxed");
+    // R440, R381: the folder this Mac does not give says why, beside it.
+    expect(screen.getByText(SITE_REFUSED)).toBeInTheDocument();
+    // Nothing changed: nothing to save.
+    expect(screen.getByRole("button", { name: CONSOLE_SAVE_LABEL })).toBeDisabled();
+
+    await choose("Console", "Supervised");
+    fireEvent.click(screen.getByRole("button", { name: "Remove tgdrive/projects/site" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "Folder" }), {
+      target: { value: " /Users/tgorka/prj/keeper " },
+    });
+    fireEvent.click(screen.getByRole("button", { name: CONSOLE_ADD_FOLDER_LABEL }));
+    fireEvent.click(screen.getByRole("button", { name: CONSOLE_SAVE_LABEL }));
+
+    await waitFor(() =>
+      expect(agentsConsoleSet).toHaveBeenCalledWith({
+        profileId: "p1",
+        agent: "nixi",
+        mode: "supervised",
+        paths: ["/Users/tgorka/prj/keeper"],
+        shownMode: "sandboxed",
+        shownPaths: ["tgdrive/projects/site"],
+      }),
+    );
+    expect(await screen.findByText(/^Saved to Nixi's agent\.toml\./)).toHaveAttribute(
+      "role",
+      "status",
+    );
+  });
+
+  it("does not offer a mode Rust refuses this agent, and says Rust's warning and no folders when full access is chosen", async () => {
+    vi.mocked(agentsCopies).mockResolvedValue([
+      withConsole(SANDBOXED),
+      {
+        ...withConsole({
+          ...SANDBOXED,
+          modes: SANDBOXED.modes.map((mode) => ({ ...mode, refused: null })),
+          warning: "Full access: Tara's commands run without a sandbox.",
+        }),
+        agent: "tara",
+        name: "Tara",
+      },
+    ]);
+    render(<AgentsSection open />);
+    const [nixiMode, taraMode] = await screen.findAllByRole("combobox", { name: "Console" });
+
+    fireEvent.keyDown(nixiMode, { key: "Enter" });
+    expect(await screen.findByRole("option", { name: "Full access" })).toHaveAttribute(
+      "aria-disabled",
+      "true",
+    );
+    fireEvent.keyDown(await screen.findByRole("listbox"), { key: "Escape" });
+    expect(screen.queryByTestId("agent-console-warning-nixi")).not.toBeInTheDocument();
+
+    fireEvent.keyDown(taraMode, { key: "Enter" });
+    fireEvent.click(await screen.findByRole("option", { name: "Full access" }));
+    expect((await screen.findByTestId("agent-console-warning-tara")).textContent).toBe(
+      "Full access: Tara's commands run without a sandbox.",
+    );
+    // Full access is held to no folder: Rust's sentence where the folders
+    // were, never "only the session's own workspace".
+    const tara = screen.getByTestId("agent-console-tara");
+    expect(screen.getByTestId("agent-console-unrestricted-tara").textContent).toBe(UNRESTRICTED);
+    expect(within(tara).queryByRole("textbox", { name: "Folder" })).not.toBeInTheDocument();
+    expect(within(tara).queryByText(/only the session's own workspace/)).not.toBeInTheDocument();
+  });
+
+  it("says Rust's refusal beside the control and keeps the choice", async () => {
+    const sentence = 'Nixi\'s console was not changed: "~/x" starts with ~.';
+    vi.mocked(agentsCopies).mockResolvedValue([withConsole(SANDBOXED)]);
+    vi.mocked(agentsConsoleSet).mockRejectedValue({
+      code: "internal",
+      message: sentence,
+      accountId: null,
+      retriable: false,
+    });
+    render(<AgentsSection open />);
+    await screen.findByRole("combobox", { name: "Console" });
+    fireEvent.change(screen.getByRole("textbox", { name: "Folder" }), {
+      target: { value: "~/x" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: CONSOLE_ADD_FOLDER_LABEL }));
+    fireEvent.click(screen.getByRole("button", { name: CONSOLE_SAVE_LABEL }));
+
+    expect((await screen.findByRole("alert")).textContent).toBe(sentence);
+    expect(screen.getByText("~/x")).toBeInTheDocument();
   });
 });

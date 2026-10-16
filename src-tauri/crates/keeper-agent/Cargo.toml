@@ -58,6 +58,12 @@ sse-stream = { workspace = true }
 image = { workspace = true, features = ["jpeg"] }
 base64 = { workspace = true }
 
+# The text of a PDF a person sends into an agent's room, written beside it
+# (story 101.2, R417). The session worker that does it is not built on a
+# phone (`cfg(phone)`), so neither is the reader.
+[target.'cfg(not(any(target_os = "ios", target_os = "android")))'.dependencies]
+pdf-extract = { workspace = true }
+
 # The headless host's process layer: no secret variable and no core dump
 # after start (S-07), `prctl` on Linux; a `run`'s own process group, killed
 # whole at its timeout.

@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/keeper-core", "crates/keeper", "crates/keeper-sync", "crates/keeper-syncd", "crates/keeper-ported", "crates/keeper-agent", "crates/keeper-agentd", "crates/keeper-nse"]
 
 [workspace.package]
-version = "0.10.3"
+version = "0.10.4"
 authors = ["Tomasz Gorka"]
 license = "Apache-2.0"
 repository = "https://github.com/tgorka/keeper"
@@ -60,6 +60,10 @@ thiserror = "2"
 # Matrix core (homed in keeper-core; unused in 1.1 but owned here per AD-6)
 matrix-sdk = { version = "0.18", features = ["e2e-encryption", "qrcode", "sqlite", "sso-login"] }
 matrix-sdk-ui = "0.18"
+# A person's encrypted file decrypted from a bounded download (story 101.2,
+# R444): the SDK's own `AttachmentDecryptor`, with its SHA-256 integrity check,
+# which `matrix-sdk` does not re-export. Already in the tree through it.
+matrix-sdk-crypto = { version = "0.18", default-features = false }
 # QR-code rendering for device-verification *display* (Story 3.2). The matrix-sdk
 # `qrcode` feature (above) pulls this same crate for `QrVerification::to_qr_code`;
 # depended on directly for the `svg` renderer. `default-features = false` drops
@@ -463,6 +467,15 @@ quick-xml = "0.39"
 # reqwest already pulls into `keeper-core`, so the direct edge adds no package
 # to Cargo.lock. MIT OR Apache-2.0 — passes `cargo deny check`.
 flate2 = "1"
+# The text of a PDF a person sends into an agent's room (Epic 101, story
+# 101.2, R417): the agent's host writes it beside the file, so the agent
+# reads it with `drive_read`. Pure Rust over `lopdf` (pdf-extract turns
+# lopdf's default features off: no rayon), MIT, as are its parsers
+# (adobe-cmap-parser, cff-parser, type1-encoding-parser, postscript); its
+# advisory is DW-1450, and CI's deny job is the licence gate. Linked by
+# keeper-agent only, and only off the phone, and run only in the host's PDF
+# reader process (R444/03).
+pdf-extract = "0.12"
 # Wake-phrase normalisation (Epic 62, Story 62.4, FR-404): a phrase a person
 # types is matched against what the recogniser heard case- and
 # diacritic-insensitively, and the diacritic half is NFD decomposition plus

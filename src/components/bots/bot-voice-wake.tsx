@@ -368,9 +368,6 @@ export function BotVoiceWake({
           id={phraseId}
           value={draft}
           disabled={busy}
-          autoCapitalize="none"
-          autoCorrect="off"
-          spellCheck={false}
           onChange={(event) => setDraft(event.target.value)}
         />
         <Button type="submit" variant="outline" size="sm" disabled={busy || draft === held}>
@@ -391,9 +388,6 @@ export function BotVoiceWake({
           id={stopId}
           value={stopDraft}
           disabled={busy}
-          autoCapitalize="none"
-          autoCorrect="off"
-          spellCheck={false}
           onChange={(event) => setStopDraft(event.target.value)}
         />
         <Button type="submit" variant="outline" size="sm" disabled={busy || stopDraft === heldStop}>

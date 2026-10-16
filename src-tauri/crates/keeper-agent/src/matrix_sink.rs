@@ -290,11 +290,14 @@ struct Paced {
     edits: usize,
 }
 
-/// The text so far, and whether the turn is over.
+/// The text so far, whether the turn is over, and whether it ended done.
 #[derive(Debug, Clone, Default)]
 struct Progress {
     text: String,
     finished: bool,
+    /// The turn finished what it was asked, with nothing it still waits
+    /// for (story 101.6, R437): its last status says `done`, not `idle`.
+    done: bool,
 }
 
 /// Edit `anchor` with the newest progress, no closer than [`MIN_EDIT_GAP`],
@@ -531,14 +534,16 @@ impl ToolProgress {
 /// The session's status anchor and its paced edits for one turn.
 ///
 /// The status says `running` from the turn's start, whatever the turn does,
-/// and `idle` only once [`StatusBoard::finish`] is handed the answer's
+/// and leaves it only once [`StatusBoard::finish`] is handed the answer's
 /// accepted final edit, so a device following the answer reads the status
-/// leaving `running` as "the answer is whole" (AD-384). A board dropped
-/// without that — the turn cancelled, or unwinding — stops its task where it
-/// is and publishes nothing more: never an `idle` for an answer that did
-/// not land. Every attempt asks the gate: narrowed below its room, the
-/// status keeps `session` and says [`NARROWED_STATUS`] with no detail
-/// (R64), and the suppression is audited (R65).
+/// leaving `running` as "the answer is whole" (AD-384): `done` for a turn
+/// that finished with nothing left waiting, `idle` for any other end (story
+/// 101.6, R437). A board dropped without that — the turn cancelled, or
+/// unwinding — stops its task where it is and publishes nothing more: never
+/// an end for an answer that did not land. Every attempt asks the gate:
+/// narrowed below its room, the status keeps `session` and says
+/// [`NARROWED_STATUS`] with no detail (R64), and the suppression is audited
+/// (R65).
 pub struct StatusBoard {
     progress: watch::Sender<Progress>,
     task: Mutex<Option<JoinHandle<Option<OwnedEventId>>>>,
@@ -626,19 +631,20 @@ impl StatusBoard {
             .await;
             // The pacer also returns when the board's owner went without
             // finishing: only a finish says the answer landed.
-            let (finished, detail) = {
+            let (finished, done, detail) = {
                 let now = receiver.borrow();
-                (now.finished, now.text.clone())
+                (now.finished, now.done, now.text.clone())
             };
             if !finished {
                 return None;
             }
-            // The turn is over: the status says so, with the last counts.
+            // The turn is over: the status says how, with the last counts.
+            let end = if done { RunState::Done } else { RunState::Idle };
             deliver_gated(
                 port.as_ref(),
                 STATUS,
                 gate.as_deref(),
-                &|narrowed| status(Some(&anchor), RunState::Idle, &detail, narrowed),
+                &|narrowed| status(Some(&anchor), end, &detail, narrowed),
                 paced.last_send + MIN_EDIT_GAP,
             )
             .await;
@@ -667,10 +673,14 @@ impl StatusBoard {
     }
 
     /// The answer's final edit was accepted (`delivered`, which only
-    /// [`MatrixSink::finish`] makes): the status goes `idle`. The session's
-    /// status anchor, when there is one.
-    pub async fn finish(&self, _delivered: &Delivered) -> Option<OwnedEventId> {
-        self.progress.send_modify(|now| now.finished = true);
+    /// [`MatrixSink::finish`] makes): the status goes `done` when `done` —
+    /// the turn finished with nothing it waits for — and `idle` otherwise.
+    /// The session's status anchor, when there is one.
+    pub async fn finish(&self, _delivered: &Delivered, done: bool) -> Option<OwnedEventId> {
+        self.progress.send_modify(|now| {
+            now.finished = true;
+            now.done = done;
+        });
         let task = self.task.lock().unwrap_or_else(|p| p.into_inner()).take();
         match task {
             // Held so that a finish dropped mid-wait still stops the task.
@@ -990,6 +1000,7 @@ mod tests {
             detail: None,
             waiting: None,
             anchor: None,
+            console: None,
         }
     }
 
@@ -1015,7 +1026,7 @@ mod tests {
         sink.push("Half an answer");
         let turn = async move {
             let delivered = sink.finish("Half an answer", "").await;
-            board.finish(&delivered).await
+            board.finish(&delivered, true).await
         };
         assert!(
             tokio::time::timeout(Duration::from_secs(5), turn)

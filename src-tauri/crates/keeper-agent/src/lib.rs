@@ -57,6 +57,8 @@ pub mod approval;
 pub mod approvals;
 #[cfg(not(phone))]
 pub mod ask;
+#[cfg(not(phone))]
+pub mod attachments;
 #[cfg(all(unix, not(phone)))]
 pub mod avatar;
 pub mod bmad;
@@ -73,6 +75,8 @@ pub mod deciding;
 pub mod delegate;
 #[cfg(all(unix, not(phone)))]
 pub mod desktop;
+#[cfg(all(unix, not(phone)))]
+pub mod dm_request;
 #[cfg(all(unix, not(phone)))]
 pub mod doorbell;
 pub mod drive;
@@ -110,6 +114,8 @@ pub mod stewards;
 pub mod surface;
 pub mod task;
 pub mod turn;
+#[cfg(not(phone))]
+pub mod web;
 #[cfg(not(phone))]
 pub mod workflow;
 #[cfg(not(phone))]

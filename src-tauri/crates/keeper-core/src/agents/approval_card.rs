@@ -1127,6 +1127,19 @@ impl ApprovalFold {
             .min()
     }
 
+    /// Whether a card waits for `own` at `now`: one nobody's decision has
+    /// closed yet, before its expiry, that `own` may decide by what it
+    /// shows wherever they read it ([`decidable_by`], R336) — what puts an
+    /// agent room's row at *needs you* (story 101.6, R421). The device's own
+    /// standing (verified, hosting) is not asked: the person is needed, on
+    /// whichever of their devices can decide it.
+    pub fn waits_for(&self, own: &UserId, now: DateTime<Utc>) -> bool {
+        self.records().any(|(request, record)| {
+            matches!(self.state(request, record, now), State::Pending)
+                && decidable_by(record, own.as_str())
+        })
+    }
+
     /// Whether `viewer` may send a decision on `id` with `binding_digest`
     /// and `scope` at `now`: the card's own rules, with the sentence it
     /// shows when not. A decision already in the room does not close it

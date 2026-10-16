@@ -446,6 +446,7 @@ mod tests {
             kind: Some(SessionKind::Main),
             agent: Some(nixi().agent),
             title: None,
+            agent_name: None,
             recency: 1,
             creators: vec![nixi().agent],
             encrypted: true,

@@ -29,6 +29,8 @@ function vm(overrides: Partial<AgentsLaunchVm>): AgentsLaunchVm {
     announce: false,
     choices: [{ agent: NIXI, name: "Nixi" }],
     fileSet: null,
+    ask: null,
+    askable: [],
     ...overrides,
   };
 }

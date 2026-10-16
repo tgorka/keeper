@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   AgentsMcpSection,
   AgentsSandboxSection,
+  AgentsWebSearchSection,
   MCP_ADD_ARGUMENT_LABEL,
   MCP_ADD_LABEL,
   MCP_DROP_ROWS_LABEL,
@@ -12,6 +13,8 @@ import {
   MCP_STARTED_LABEL,
   MCP_TRUST_LABEL,
   SANDBOX_SAVE_LABEL,
+  WEB_SEARCH_SAVE_LABEL,
+  WEB_SEARCH_URL_LABEL,
 } from "@/components/settings/agents-mcp-section";
 import type {
   AgentMcpDraftVm,
@@ -28,6 +31,8 @@ import {
   agentsMcpSave,
   agentsSandboxGet,
   agentsSandboxSave,
+  agentsWebSearchGet,
+  agentsWebSearchSave,
 } from "@/lib/ipc/client";
 
 vi.mock("@/lib/ipc/client", () => ({
@@ -37,6 +42,8 @@ vi.mock("@/lib/ipc/client", () => ({
   agentsMcpRemove: vi.fn(),
   agentsSandboxGet: vi.fn(),
   agentsSandboxSave: vi.fn(),
+  agentsWebSearchGet: vi.fn(),
+  agentsWebSearchSave: vi.fn(),
 }));
 
 const T0 = "T0: it only reads or changes what can be put back";
@@ -672,5 +679,47 @@ describe("AgentsSandboxSection — this Mac's [sandbox] table (R213)", () => {
     fireEvent.click(screen.getByRole("button", { name: SANDBOX_SAVE_LABEL }));
     expect(await screen.findByRole("alert")).toHaveTextContent(sentence);
     expect(screen.getByRole("textbox", { name: "Folder 1" })).toHaveValue("bin");
+  });
+});
+
+describe("Settings › Agents › Web search (101.4)", () => {
+  beforeEach(() => {
+    vi.mocked(agentsWebSearchGet).mockReset();
+    vi.mocked(agentsWebSearchSave).mockReset();
+  });
+
+  it("saves the address the person typed and shows what Rust stored", async () => {
+    vi.mocked(agentsWebSearchGet).mockResolvedValue({ url: null, refusal: null });
+    vi.mocked(agentsWebSearchSave).mockResolvedValue({
+      url: "http://127.0.0.1:5191",
+      refusal: null,
+    });
+    render(<AgentsWebSearchSection open />);
+    const field = await screen.findByRole("textbox", { name: WEB_SEARCH_URL_LABEL });
+    await waitFor(() => expect(field).toBeEnabled());
+    const save = screen.getByRole("button", { name: WEB_SEARCH_SAVE_LABEL });
+    // Nothing typed differs from what is stored: nothing to save.
+    expect(save).toBeDisabled();
+    fireEvent.change(field, { target: { value: "http://127.0.0.1:5191/" } });
+    fireEvent.click(save);
+
+    await waitFor(() => expect(agentsWebSearchSave).toHaveBeenCalledWith("http://127.0.0.1:5191/"));
+    await waitFor(() => expect(field).toHaveValue("http://127.0.0.1:5191"));
+  });
+
+  it("says Rust's refusal and keeps what was typed; a stored address that no longer checks says why", async () => {
+    const refused = "keeper searches over http or https — ftp is not something it can speak.";
+    const stale = "This Mac's web search engine is not used: this does not read as a URL: x.";
+    vi.mocked(agentsWebSearchGet).mockResolvedValue({ url: "x", refusal: stale });
+    vi.mocked(agentsWebSearchSave).mockRejectedValue({ code: "internal", message: refused });
+    render(<AgentsWebSearchSection open />);
+
+    expect(await screen.findByText(stale)).toBeInTheDocument();
+    const field = screen.getByRole("textbox", { name: WEB_SEARCH_URL_LABEL });
+    fireEvent.change(field, { target: { value: "ftp://search.example.org" } });
+    fireEvent.click(screen.getByRole("button", { name: WEB_SEARCH_SAVE_LABEL }));
+
+    expect((await screen.findByRole("alert")).textContent).toBe(refused);
+    expect(field).toHaveValue("ftp://search.example.org");
   });
 });

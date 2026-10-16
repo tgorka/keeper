@@ -1,5 +1,6 @@
-//! The Mac's own `[[mcp]]` servers and `[sandbox]` table (96.2 #11, Q9(a),
-//! R149, R213): what agentd reads from `agentd.toml`, this Mac keeps in
+//! The Mac's own `[[mcp]]` servers, `[sandbox]` table and web search engine
+//! (96.2 #11, Q9(a), R149, R213; 101.4, R419): what agentd reads from
+//! `agentd.toml`, this Mac keeps in
 //! `keeper.db` — device-local, never in `settings.toml`, a device file or
 //! the account's repository — and checks with the same functions
 //! ([`mcp::check`], [`SandboxTable::check`]).
@@ -47,6 +48,8 @@ use crate::agents::approval_card::tier_word;
 use crate::agents::copy::AgentPersonVm;
 use crate::agents::mcp::{self, Hints, HostRules, McpEntry, Program, RawMcp, RawTier};
 use crate::agents::run::SandboxTable;
+use crate::agents::web_search::{self, AgentWebSearchUrlVm};
+use crate::bots::url::BaseUrl;
 use crate::platform::Platform;
 
 const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -371,6 +374,10 @@ fn open(data_dir: &Path) -> Result<Connection, String> {
             name TEXT PRIMARY KEY, \
             path TEXT NOT NULL\
         );\
+        CREATE TABLE IF NOT EXISTS agent_web_search(\
+            id INTEGER PRIMARY KEY CHECK (id = 1), \
+            url TEXT NOT NULL\
+        );\
         CREATE TABLE IF NOT EXISTS agent_mac_revision(\
             id INTEGER PRIMARY KEY CHECK (id = 1), \
             revision INTEGER NOT NULL\
@@ -585,6 +592,8 @@ struct Stored {
     /// Each server as written, and the token its row publishes.
     servers: Vec<(RawMcp, Saved)>,
     sandbox: SandboxRows,
+    /// The web search engine's URL as saved.
+    web_search: Option<String>,
 }
 
 /// The store now, from one SQLite snapshot (R228): its revision and every
@@ -612,11 +621,19 @@ fn snapshot_with(data_dir: &Path, between: &mut dyn FnMut()) -> Result<Stored, S
     between();
     let servers = raw_servers(&tx, between)?;
     let sandbox = sandbox_rows(&tx, between)?;
+    between();
+    let web_search = tx
+        .query_row("SELECT url FROM agent_web_search WHERE id = 1", [], |row| {
+            row.get::<_, String>(0)
+        })
+        .optional()
+        .map_err(&read)?;
     tx.commit().map_err(&read)?;
     Ok(Stored {
         revision,
         servers,
         sandbox,
+        web_search,
     })
 }
 
@@ -645,6 +662,9 @@ fn check_sandbox(
 pub struct MacTables {
     pub mcp: Vec<McpEntry>,
     pub sandbox: Result<SandboxTable, String>,
+    /// The web search engine this Mac's agents search with (101.4, R419):
+    /// `Ok(None)` names none; `Err` says why the saved one is not used.
+    pub web_search: Result<Option<BaseUrl>, String>,
     /// The store's revision: every save makes it greater, so a host built
     /// on an older one is built again.
     pub revision: i64,
@@ -655,6 +675,7 @@ impl Default for MacTables {
         MacTables {
             mcp: Vec::new(),
             sandbox: Ok(SandboxTable::default()),
+            web_search: Ok(None),
             revision: 0,
         }
     }
@@ -669,6 +690,7 @@ pub fn read(data_dir: &Path) -> MacTables {
         Err(sentence) => {
             tracing::warn!(%sentence, "agents: this Mac's MCP servers and sandbox table could not be read");
             return MacTables {
+                web_search: Err(sentence.clone()),
                 sandbox: Err(sentence),
                 ..MacTables::default()
             };
@@ -689,6 +711,7 @@ pub fn read(data_dir: &Path) -> MacTables {
     MacTables {
         mcp,
         sandbox: check_sandbox(read_exec, env),
+        web_search: checked_engine(stored.web_search.as_deref()),
         revision: stored.revision,
     }
 }
@@ -1076,6 +1099,56 @@ pub fn save_sandbox(data_dir: &Path, req: AgentSandboxReq) -> Result<(), String>
     }
     bump(&tx)?;
     tx.commit().map_err(&write)
+}
+
+/// A saved engine URL read by the one check agentd's `[web_search] url` is
+/// read by ([`web_search::parse_url`]).
+fn checked_engine(saved: Option<&str>) -> Result<Option<BaseUrl>, String> {
+    saved
+        .map(|url| {
+            web_search::parse_url(url).map_err(|reason| {
+                let sentence = format!("This Mac's web search engine is not used: {reason}.");
+                tracing::warn!(%sentence, "agents: this Mac's web search engine no longer checks");
+                sentence
+            })
+        })
+        .transpose()
+}
+
+/// Name this Mac's web search engine (101.4 #2, R419): `url` read by the
+/// one check agentd's `[web_search] url` is, stored normalised; blank names
+/// none. `Err` is the sentence a person reads, and nothing changed. The
+/// host is built again on it at the next tick.
+pub fn save_web_search(data_dir: &Path, url: &str) -> Result<(), String> {
+    let engine = if url.trim().is_empty() {
+        None
+    } else {
+        Some(web_search::parse_url(url).map_err(|reason| format!("{reason}."))?)
+    };
+    let write = store("saved");
+    let mut conn = open(data_dir)?;
+    let tx = begin_write(&mut conn)?;
+    tx.execute("DELETE FROM agent_web_search", [])
+        .map_err(&write)?;
+    if let Some(engine) = &engine {
+        tx.execute(
+            "INSERT INTO agent_web_search(id, url) VALUES (1, ?1)",
+            params![engine.normalized],
+        )
+        .map_err(&write)?;
+    }
+    bump(&tx)?;
+    tx.commit().map_err(&write)
+}
+
+/// This Mac's web search engine as stored, and why it is not used when it
+/// no longer checks.
+pub fn web_search_listing(data_dir: &Path) -> Result<AgentWebSearchUrlVm, String> {
+    let stored = snapshot(data_dir)?;
+    Ok(AgentWebSearchUrlVm {
+        refusal: checked_engine(stored.web_search.as_deref()).err(),
+        url: stored.web_search,
+    })
 }
 
 // --- what Settings shows ---------------------------------------------------
@@ -1702,7 +1775,8 @@ mod tests {
 
     /// R96MM-01: a read is one snapshot. A save that lands between the
     /// tables a read reads — a server's tiers and readers replaced, its
-    /// URL moved, the sandbox's folders and variables replaced — is seen
+    /// URL moved, the sandbox's folders and variables replaced, the web
+    /// search engine moved — is seen
     /// whole or not at all, by the host's read and by a listing alike.
     #[test]
     fn a_read_sees_a_concurrent_save_whole_or_not_at_all() {
@@ -1737,6 +1811,7 @@ mod tests {
             let (server, sandbox) = version(n);
             save_server(&dir, &p, server).expect("server");
             save_sandbox(&dir, sandbox).expect("sandbox");
+            save_web_search(&dir, &format!("http://127.0.0.1:519{n}")).expect("engine");
         };
         // `RawMcp` has no `PartialEq`: a read is compared by all it holds.
         let whole = |stored: Stored| format!("{stored:?}");
@@ -1747,12 +1822,13 @@ mod tests {
         assert!(
             format!("{:?}", first.servers) != format!("{:?}", second.servers)
                 && first.sandbox != second.sandbox
+                && first.web_search != second.web_search
         );
 
         // At every point between two of the read's own reads, the other
         // version is saved: the read is all of what was before, or all of
         // what is after.
-        for at in 0..6 {
+        for at in 0..7 {
             save(1);
             let before = whole(snapshot(&dir).expect("before"));
             let mut step = 0;
@@ -1776,6 +1852,40 @@ mod tests {
                 "a save at step {at} was read in part: {read:?}"
             );
         }
+    }
+
+    /// 101.4 #2: this Mac's engine is saved by the one check agentd's
+    /// `[web_search] url` is read by, normalised, each save a new revision
+    /// the host is built again on; a refused URL changes nothing, blank
+    /// names none.
+    #[test]
+    fn this_macs_web_search_engine_is_saved_checked_and_cleared() {
+        let p = FakePlatform::default();
+        let dir = p.data_dir.clone();
+        assert_eq!(read(&dir).web_search, Ok(None));
+        save_web_search(&dir, " http://127.0.0.1:5191/ ").expect("saved");
+        let saved = read(&dir);
+        assert_eq!(
+            saved.web_search.clone().map(|e| e.map(|e| e.normalized)),
+            Ok(Some("http://127.0.0.1:5191".to_owned()))
+        );
+        let refused = save_web_search(&dir, "file:///etc/passwd").expect_err("refused");
+        assert!(
+            refused.starts_with("keeper searches over http or https"),
+            "{refused}"
+        );
+        assert_eq!(read(&dir), saved, "a refused save changes nothing");
+        save_web_search(&dir, "  ").expect("cleared");
+        let cleared = read(&dir);
+        assert_eq!(cleared.web_search, Ok(None));
+        assert!(cleared.revision > saved.revision);
+        assert_eq!(
+            web_search_listing(&dir).expect("listing"),
+            AgentWebSearchUrlVm {
+                url: None,
+                refusal: None
+            }
+        );
     }
 
     /// One server as the host connects it: where, and the bearer or not.

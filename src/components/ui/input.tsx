@@ -1,11 +1,15 @@
 import type * as React from "react";
 
 import { FOCUS_RING, INVALID_RING } from "@/components/ui/focus-ring";
+import { NO_TEXT_SUBSTITUTION } from "@/lib/text-entry";
 import { cn } from "@/lib/utils";
 
 function Input({ className, type, ...props }: React.ComponentProps<"input">) {
   return (
     <input
+      // No capital, correction or prediction keeper's person did not type
+      // (Story 101.3); a caller may still override one.
+      {...NO_TEXT_SUBSTITUTION}
       type={type}
       data-slot="input"
       className={cn(

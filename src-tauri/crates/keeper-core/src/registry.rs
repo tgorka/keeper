@@ -643,7 +643,10 @@ fn ensure_incognito_column(conn: &Connection) -> Result<(), CoreError> {
 /// Add the nullable `kind` and `line` columns to `outbox` if they are not
 /// present yet (Story 100.5): a held `/me` must leave as the action it was, not
 /// as text, and an undone send must come back as exactly the line the person
-/// typed (R393).
+/// typed (R393). Story 101.3 (R432) adds `reply_to` — the event a held reply
+/// answers — and `attachment`, a held file's JSON ([`HeldAttachment`]), so a
+/// reply or an attachment waits for the same window and comes back whole on
+/// Undo; `NULL` in both is a plain message, which every older row is.
 ///
 /// Idempotent and non-destructive, exactly like [`ensure_hue_index_column`]. A
 /// row held before the columns existed keeps `NULL` in both, which reads as
@@ -659,7 +662,7 @@ fn ensure_outbox_columns(conn: &Connection) -> Result<(), CoreError> {
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| CoreError::Internal(format!("could not read outbox columns: {e}")))?;
     drop(stmt);
-    for column in ["kind", "line"] {
+    for column in ["kind", "line", "reply_to", "attachment"] {
         if !existing.iter().any(|c| c == column) {
             conn.execute(&format!("ALTER TABLE outbox ADD COLUMN {column} TEXT"), [])
                 .map_err(|e| {
@@ -1093,6 +1096,29 @@ pub fn set_agents_default(data_dir: &Path, agent: Option<&str>) -> Result<(), Co
         AGENTS_DEFAULT_KEY,
         agent.map(str::trim).unwrap_or_default(),
     )
+}
+
+/// The `settings` key naming the lease this desktop host takes a session's
+/// claim on (R455): `short` (absent included) or `quarter-hour`.
+pub const AGENTS_CLAIMS_LEASE_KEY: &str = "agents.claims_lease";
+
+/// Read this desktop host's claims lease. Absent, blank or a value that is
+/// not one of the two is the minute lease: a quarter-hour lease is never
+/// taken on a value nobody chose.
+pub fn get_agents_claims_lease(
+    data_dir: &Path,
+) -> Result<crate::agents::claim::ClaimsLease, CoreError> {
+    Ok(get_setting(data_dir, AGENTS_CLAIMS_LEASE_KEY)?
+        .and_then(|value| crate::agents::claim::ClaimsLease::parse(&value))
+        .unwrap_or_default())
+}
+
+/// Write this desktop host's claims lease.
+pub fn set_agents_claims_lease(
+    data_dir: &Path,
+    lease: crate::agents::claim::ClaimsLease,
+) -> Result<(), CoreError> {
+    set_setting(data_dir, AGENTS_CLAIMS_LEASE_KEY, lease.as_str())
 }
 
 /// The `settings` key holding the stop phrase as typed (Epic 67, Story 67.3,
@@ -2396,25 +2422,23 @@ pub fn forget_account_state(data_dir: &Path, account_id: &str) -> Result<(), Cor
 }
 
 /// The `settings` key holding the Undo-Send window in whole seconds (Story 8.3).
-/// Stored as a decimal string; absent / unparsable ⇒ the default of 10 s.
+/// Stored as a decimal string; absent / unparsable ⇒ the default of 2 s.
 const UNDO_SEND_WINDOW_KEY: &str = "undo_send.window";
 
-/// The default Undo-Send window in seconds when the setting is absent or unparsable.
-pub const UNDO_SEND_WINDOW_DEFAULT: u16 = 10;
+/// The default Undo-Send window in seconds when the setting is absent or
+/// unparsable: long enough to catch a slip, short enough not to read as a
+/// delay (Story 101.3, R418; it was 10 s).
+pub const UNDO_SEND_WINDOW_DEFAULT: u16 = 2;
 
 /// The maximum Undo-Send window in seconds; values are clamped to `0..=60`.
 pub const UNDO_SEND_WINDOW_MAX: u16 = 60;
 
 /// Read the Undo-Send window in seconds (Story 8.3). Absent / unparsable ⇒ the
-/// default of 10 s; a stored value is clamped to `0..=60` defensively. Stored in the
+/// default of 2 s; a stored value is clamped to `0..=60` defensively. Stored in the
 /// `settings` k/v table under `undo_send.window`.
 pub fn get_undo_send_window(data_dir: &Path) -> Result<u16, CoreError> {
     let raw = get_setting(data_dir, UNDO_SEND_WINDOW_KEY)?;
-    let secs = raw
-        .as_deref()
-        .and_then(|v| v.parse::<u16>().ok())
-        .unwrap_or(UNDO_SEND_WINDOW_DEFAULT);
-    Ok(secs.min(UNDO_SEND_WINDOW_MAX))
+    Ok(window_of(raw.as_deref(), UNDO_SEND_WINDOW_DEFAULT))
 }
 
 /// Write the Undo-Send window in seconds (Story 8.3), clamping to `0..=60` before
@@ -2423,6 +2447,56 @@ pub fn get_undo_send_window(data_dir: &Path) -> Result<u16, CoreError> {
 pub fn set_undo_send_window(data_dir: &Path, secs: u16) -> Result<(), CoreError> {
     let clamped = secs.min(UNDO_SEND_WINDOW_MAX);
     set_setting(data_dir, UNDO_SEND_WINDOW_KEY, &clamped.to_string())
+}
+
+/// The `settings` key holding the Undo-Send window of agent rooms in whole
+/// seconds (Story 101.3, R418): a message to an agent is a turn it starts on,
+/// so by default it leaves at once.
+const UNDO_SEND_AGENT_WINDOW_KEY: &str = "undo_send.agent_window";
+
+/// The default Undo-Send window of agent rooms in seconds: none.
+pub const UNDO_SEND_AGENT_WINDOW_DEFAULT: u16 = 0;
+
+/// Read the agent rooms' Undo-Send window in seconds (Story 101.3). Absent /
+/// unparsable ⇒ 0; a stored value is clamped to `0..=60`, as the chats' is.
+pub fn get_undo_send_agent_window(data_dir: &Path) -> Result<u16, CoreError> {
+    let raw = get_setting(data_dir, UNDO_SEND_AGENT_WINDOW_KEY)?;
+    Ok(window_of(raw.as_deref(), UNDO_SEND_AGENT_WINDOW_DEFAULT))
+}
+
+/// Write the agent rooms' Undo-Send window in seconds (Story 101.3), clamped
+/// to `0..=60` before persisting.
+pub fn set_undo_send_agent_window(data_dir: &Path, secs: u16) -> Result<(), CoreError> {
+    let clamped = secs.min(UNDO_SEND_WINDOW_MAX);
+    set_setting(data_dir, UNDO_SEND_AGENT_WINDOW_KEY, &clamped.to_string())
+}
+
+/// Which room a send leaves for, as far as the Undo-Send window cares
+/// (Story 101.3, R418).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UndoRoom {
+    /// Any room that is not an agent's.
+    Chat,
+    /// An agent's session room: the person's DM or a conversation with
+    /// their agent, or a session they watch.
+    Agent,
+}
+
+/// The Undo-Send window, in seconds, for a send into a room of `room`'s kind:
+/// `undo_send.agent_window` in an agent room, `undo_send.window` anywhere else.
+pub fn undo_send_window_for(data_dir: &Path, room: UndoRoom) -> Result<u16, CoreError> {
+    match room {
+        UndoRoom::Chat => get_undo_send_window(data_dir),
+        UndoRoom::Agent => get_undo_send_agent_window(data_dir),
+    }
+}
+
+/// A window key's stored value in whole seconds: `default` when absent or
+/// unparsable, clamped to `0..=60`.
+fn window_of(raw: Option<&str>, default: u16) -> u16 {
+    raw.and_then(|v| v.parse::<u16>().ok())
+        .unwrap_or(default)
+        .min(UNDO_SEND_WINDOW_MAX)
 }
 
 /// The `settings` key holding the recording segment size in decimal MB (Story
@@ -3131,6 +3205,52 @@ pub struct OutboxRow {
     /// The composer line the person typed to make it — `/me waves`, `//etc`
     /// — or `None` for a row held before keeper kept it (Story 100.5, R393).
     pub line: Option<String>,
+    /// The message a held reply answers (Story 101.3, R432, R447); `None` for a
+    /// message that answers none.
+    pub reply_to: Option<HeldReply>,
+    /// A held attachment (Story 101.3, R432): `body` is then its caption.
+    pub attachment: Option<HeldAttachment>,
+}
+
+/// A file held for Undo-Send (Story 101.3, R432): a copy keeper staged
+/// under its data directory when the send was held — what is sent when the
+/// window elapses, and what Undo hands back to the composer — with the name
+/// and type it is sent under.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HeldAttachment {
+    /// The staged copy's absolute path.
+    pub path: String,
+    pub filename: String,
+    pub mime: String,
+}
+
+/// The message a held reply answers (Story 101.3, R432, R447): its event — what
+/// the reply names when it is sent, and what Undo gives back so the restored
+/// draft is still a reply even when the original is no longer loaded — and its
+/// sender and body as the timeline showed them when the reply was held, so the
+/// reply banner can say what it answers. Sender and body are empty when the
+/// timeline did not show the original.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HeldReply {
+    pub event_id: String,
+    #[serde(default)]
+    pub sender: String,
+    #[serde(default)]
+    pub sender_display_name: Option<String>,
+    #[serde(default)]
+    pub body: String,
+}
+
+impl HeldReply {
+    /// A reply to `event_id` whose original the timeline did not show.
+    pub fn unshown(event_id: &str) -> Self {
+        Self {
+            event_id: event_id.to_owned(),
+            sender: String::new(),
+            sender_display_name: None,
+            body: String::new(),
+        }
+    }
 }
 
 impl OutboxRow {
@@ -3157,19 +3277,54 @@ pub fn insert_outbox(
     held_at_ts: i64,
     dispatch_at_ts: i64,
 ) -> Result<(), CoreError> {
+    insert_held(
+        data_dir,
+        &OutboxRow {
+            id: id.to_owned(),
+            account_id: account_id.to_owned(),
+            room_id: room_id.to_owned(),
+            body: body.to_owned(),
+            held_at_ts,
+            dispatch_at_ts,
+            kind,
+            line: Some(line.to_owned()),
+            reply_to: None,
+            attachment: None,
+        },
+    )
+}
+
+/// Insert `row` into the `outbox` whole, in one statement (Stories 8.3,
+/// 101.3): a held reply never waits as a plain message, nor an attachment as
+/// its caption, not even for a moment. The body is never logged.
+pub fn insert_held(data_dir: &Path, row: &OutboxRow) -> Result<(), CoreError> {
+    let attachment = row
+        .attachment
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|e| CoreError::Internal(format!("could not write a held attachment: {e}")))?;
+    let reply_to = row
+        .reply_to
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|e| CoreError::Internal(format!("could not write a held reply: {e}")))?;
     let conn = open(data_dir)?;
     conn.execute(
         "INSERT INTO outbox(id, account_id, room_id, body, held_at_ts, dispatch_at_ts, kind, \
-         line) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+         line, reply_to, attachment) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         rusqlite::params![
-            id,
-            account_id,
-            room_id,
-            body,
-            held_at_ts,
-            dispatch_at_ts,
-            kind.as_stored(),
-            line
+            row.id,
+            row.account_id,
+            row.room_id,
+            row.body,
+            row.held_at_ts,
+            row.dispatch_at_ts,
+            row.kind.as_stored(),
+            row.line,
+            reply_to,
+            attachment
         ],
     )
     .map_err(|e| CoreError::Internal(format!("could not insert outbox row: {e}")))?;
@@ -3195,8 +3350,8 @@ pub fn list_outbox_rows_for_account(
     let conn = open(data_dir)?;
     let mut stmt = conn
         .prepare(
-            "SELECT id, account_id, room_id, body, held_at_ts, dispatch_at_ts, kind, line \
-             FROM outbox WHERE account_id = ?1 ORDER BY held_at_ts ASC",
+            "SELECT id, account_id, room_id, body, held_at_ts, dispatch_at_ts, kind, line, \
+             reply_to, attachment FROM outbox WHERE account_id = ?1 ORDER BY held_at_ts ASC",
         )
         .map_err(|e| CoreError::Internal(format!("could not prepare outbox list: {e}")))?;
     let rows = stmt
@@ -3214,8 +3369,8 @@ pub fn list_outbox_rows(data_dir: &Path) -> Result<Vec<OutboxRow>, CoreError> {
     let conn = open(data_dir)?;
     let mut stmt = conn
         .prepare(
-            "SELECT id, account_id, room_id, body, held_at_ts, dispatch_at_ts, kind, line \
-             FROM outbox ORDER BY held_at_ts ASC",
+            "SELECT id, account_id, room_id, body, held_at_ts, dispatch_at_ts, kind, line, \
+             reply_to, attachment FROM outbox ORDER BY held_at_ts ASC",
         )
         .map_err(|e| CoreError::Internal(format!("could not prepare outbox list: {e}")))?;
     let rows = stmt
@@ -3228,9 +3383,32 @@ pub fn list_outbox_rows(data_dir: &Path) -> Result<Vec<OutboxRow>, CoreError> {
     Ok(out)
 }
 
-/// Map a `SELECT id, account_id, room_id, body, held_at_ts, dispatch_at_ts, kind, line`
-/// row into an [`OutboxRow`]. Shared by the two outbox list queries.
+/// Map a `SELECT id, account_id, room_id, body, held_at_ts, dispatch_at_ts, kind, line,
+/// reply_to, attachment` row into an [`OutboxRow`]. Shared by the two outbox list
+/// queries. An attachment or a reply keeper cannot read fails the read rather than
+/// letting the row leave as its bare caption or as a plain message. A `reply_to`
+/// holding a bare event id — how a build before R447 kept it — is a reply to that
+/// event whose original was not shown.
 fn map_outbox_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<OutboxRow> {
+    let unreadable = |column: usize, e: serde_json::Error| {
+        rusqlite::Error::FromSqlConversionFailure(column, rusqlite::types::Type::Text, Box::new(e))
+    };
+    let attachment = r
+        .get::<_, Option<String>>(9)?
+        .map(|json| serde_json::from_str::<HeldAttachment>(&json))
+        .transpose()
+        .map_err(|e| unreadable(9, e))?;
+    let reply_to = r
+        .get::<_, Option<String>>(8)?
+        .map(|stored| {
+            if stored.starts_with('{') {
+                serde_json::from_str::<HeldReply>(&stored)
+            } else {
+                Ok(HeldReply::unshown(&stored))
+            }
+        })
+        .transpose()
+        .map_err(|e| unreadable(8, e))?;
     Ok(OutboxRow {
         id: r.get(0)?,
         account_id: r.get(1)?,
@@ -3240,6 +3418,8 @@ fn map_outbox_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<OutboxRow> {
         dispatch_at_ts: r.get(5)?,
         kind: crate::send::MessageKind::from_stored(r.get::<_, Option<String>>(6)?.as_deref()),
         line: r.get(7)?,
+        reply_to,
+        attachment,
     })
 }
 
@@ -4830,10 +5010,41 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Story 101.3 (R418): an agent room's send is held for
+    /// `undo_send.agent_window` (none by default), every other room's for
+    /// `undo_send.window` (2 s by default) — two keys that never stand in for
+    /// each other.
+    #[test]
+    fn the_undo_window_is_chosen_by_the_room_kind() {
+        let dir = temp_dir();
+        assert_eq!(undo_send_window_for(&dir, UndoRoom::Chat).expect("chat"), 2);
+        assert_eq!(
+            undo_send_window_for(&dir, UndoRoom::Agent).expect("agent"),
+            0
+        );
+        set_undo_send_window(&dir, 5).expect("set chat 5");
+        assert_eq!(undo_send_window_for(&dir, UndoRoom::Chat).expect("chat"), 5);
+        assert_eq!(
+            undo_send_window_for(&dir, UndoRoom::Agent).expect("agent"),
+            0
+        );
+        set_undo_send_agent_window(&dir, 7).expect("set agent 7");
+        assert_eq!(
+            undo_send_window_for(&dir, UndoRoom::Agent).expect("agent"),
+            7
+        );
+        assert_eq!(undo_send_window_for(&dir, UndoRoom::Chat).expect("chat"), 5);
+        set_undo_send_agent_window(&dir, 99).expect("set agent 99");
+        assert_eq!(get_undo_send_agent_window(&dir).expect("clamped"), 60);
+        set_setting(&dir, UNDO_SEND_AGENT_WINDOW_KEY, "soon").expect("set garbage");
+        assert_eq!(get_undo_send_agent_window(&dir).expect("garbage"), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn undo_send_window_defaults_and_clamps() {
         let dir = temp_dir();
-        // Absent setting reads the default of 10.
+        // Absent setting reads the default of 2.
         assert_eq!(
             get_undo_send_window(&dir).expect("get default"),
             UNDO_SEND_WINDOW_DEFAULT
@@ -5317,6 +5528,56 @@ mod tests {
     /// A held `/me` leaves as the action it was (Story 100.5): the kind survives
     /// the row, and a row held by a build that predates the column — `NULL`
     /// after the in-place upgrade — is the text it was then.
+    /// Story 101.3 (R432, R447): a held reply keeps the event it answers and the
+    /// sender and body it showed, and a held attachment its staged file, across a
+    /// re-read; a plain row has neither.
+    #[test]
+    fn a_held_reply_and_attachment_keep_what_they_carry() {
+        let dir = temp_dir();
+        let row = |id: &str| OutboxRow {
+            id: id.to_owned(),
+            account_id: "acctA".to_owned(),
+            room_id: "!r1".to_owned(),
+            body: "caption".to_owned(),
+            held_at_ts: 1,
+            dispatch_at_ts: 2,
+            kind: MessageKind::Text,
+            line: Some("caption".to_owned()),
+            reply_to: None,
+            attachment: None,
+        };
+        let reply = OutboxRow {
+            reply_to: Some(HeldReply {
+                event_id: "$original".to_owned(),
+                sender: "@tola:example.org".to_owned(),
+                sender_display_name: Some("Tola".to_owned()),
+                body: "Which trip first?".to_owned(),
+            }),
+            ..row("reply")
+        };
+        let file = OutboxRow {
+            attachment: Some(HeldAttachment {
+                path: "/data/outbox-files/file/a.pdf".to_owned(),
+                filename: "a.pdf".to_owned(),
+                mime: "application/pdf".to_owned(),
+            }),
+            held_at_ts: 3,
+            ..row("file")
+        };
+        let plain = OutboxRow {
+            held_at_ts: 5,
+            ..row("plain")
+        };
+        for held in [&reply, &file, &plain] {
+            insert_held(&dir, held).expect("insert");
+        }
+        assert_eq!(
+            list_outbox_rows_for_account(&dir, "acctA").expect("list"),
+            vec![reply, file, plain]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn outbox_keeps_a_held_rows_kind_and_line_and_reads_a_pre_kind_row_as_typed_text() {
         let dir = temp_dir();

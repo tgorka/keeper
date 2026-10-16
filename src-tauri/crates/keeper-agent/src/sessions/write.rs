@@ -17,15 +17,24 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use keeper_core::sessions::files;
-use keeper_core::sessions::model::{classify, ARTIFACTS_DIR, WORKSPACE_DIR};
+use keeper_core::sessions::model::{classify, ARTIFACTS_DIR, ATTACHMENTS_DIR, WORKSPACE_DIR};
 use keeper_core::sessions::plan::{Plan, PlanStep};
 use keeper_sync::{browse, names};
 
 use super::exec;
 use super::verbs::VerbError;
 
-/// Top-level session entries an agent never writes: keeper keeps them.
-const KEEPERS_FILES: [&str; 5] = ["log", "approvals", "agent.toml", "README.md", "AGENTS.md"];
+/// Top-level session entries an agent never writes: keeper keeps them. The
+/// person's own files (`attachments/`) are written only by the host, through
+/// [`attachment_write`].
+const KEEPERS_FILES: [&str; 6] = [
+    "log",
+    "approvals",
+    "agent.toml",
+    "README.md",
+    "AGENTS.md",
+    ATTACHMENTS_DIR,
+];
 
 /// What a write whose host no longer holds the session's claim says.
 pub const NO_CLAIM: &str =
@@ -62,12 +71,19 @@ enum Place {
 /// own, compared as the Mac's volume compares names (`readme.md`,
 /// `Approvals/`), so a link inside `workspace/` cannot reach `agent.toml`.
 pub fn landing(zone: &Path, session: &str, rel: &str) -> Result<String, VerbError> {
-    land(zone, session, rel, None)
+    land(zone, session, rel, None, None)
 }
 
 /// [`landing`], where the last name may be the dotted `leaf` — the one
-/// exception [`memlog_write`] makes — and no other name is dotted.
-fn land(zone: &Path, session: &str, rel: &str, leaf: Option<&str>) -> Result<String, VerbError> {
+/// exception [`memlog_write`] makes — and no other name is dotted, and the
+/// top name may be `kept`, the one of keeper's own entries this door writes.
+fn land(
+    zone: &Path,
+    session: &str,
+    rel: &str,
+    leaf: Option<&str>,
+    kept: Option<&str>,
+) -> Result<String, VerbError> {
     if classify(session).is_none() {
         return Err(VerbError::Refused(format!(
             "{session} is not a session folder"
@@ -112,7 +128,7 @@ fn land(zone: &Path, session: &str, rel: &str, leaf: Option<&str>) -> Result<Str
     }
     if KEEPERS_FILES
         .iter()
-        .any(|kept| names::same_entry_folded(kept, top))
+        .any(|keepers| names::same_entry_folded(keepers, top) && kept != Some(top.as_str()))
     {
         return Err(VerbError::Refused(format!(
             "{top} is keeper's own record of this session; an agent writes its own files beside it"
@@ -193,6 +209,98 @@ pub fn session_write_with(
     Ok(exec::run_held(plan, &held)?)
 }
 
+/// How many names [`attachment_write`] tries for one file before it gives up:
+/// `name`, then `name-2` … `name-<this>` before its extension.
+const ATTACHMENT_NAMES: usize = 99;
+
+/// Store `bytes`, a file a person sent into an agent's room under the plain
+/// file name `name`, in the session at `session`'s `attachments/` (story
+/// 101.2): the session-relative path it is at. A file of that name holding
+/// these bytes already is the one (a turn run again after a crash), counted
+/// once the create has made it durable as its own; one holding others keeps
+/// them, and the next free `name-2`, `name-3` … is taken. One journaled
+/// create of exactly these bytes, made only while `may_write` — the
+/// session's claim — says this host may; the landing is the disk's, as every
+/// session write's is, and must be in `attachments/` itself, not wherever a
+/// link there leads. Stored means the create is done: any failure but a
+/// name taken meanwhile is returned, whatever can be read at the name.
+pub fn attachment_write(
+    zone: &Path,
+    session: &str,
+    name: &str,
+    bytes: &[u8],
+    may_write: &dyn Fn() -> bool,
+) -> Result<String, VerbError> {
+    let held = exec::hold(zone)?;
+    let dir = browse::lexical_join(held.zone(), session)
+        .map_err(|_| VerbError::NoSuchSession(session.to_owned()))?;
+    for n in 1..=ATTACHMENT_NAMES {
+        let wanted = format!("{ATTACHMENTS_DIR}/{}", numbered(name, n));
+        let landed = land(held.zone(), session, &wanted, None, Some(ATTACHMENTS_DIR))?;
+        if landed != wanted {
+            return Err(VerbError::Refused(format!(
+                "{wanted} does not land in this session's {ATTACHMENTS_DIR}/ folder, so nothing was written."
+            )));
+        }
+        let file = browse::lexical_join(&dir, &landed)
+            .map_err(|refusal| VerbError::Refused(refusal.to_string()))?;
+        match std::fs::read(&file) {
+            // The create below finds these bytes its own and makes them
+            // durable before they count as stored.
+            Ok(there) if there == bytes => {}
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(VerbError::Refused(format!(
+                    "{landed} is there but could not be read ({error}); nothing was written."
+                )))
+            }
+        }
+        let plan = Plan {
+            verb: "attachment".to_owned(),
+            session: session.to_owned(),
+            steps: vec![
+                PlanStep::MkDir {
+                    path: format!("{session}/{ATTACHMENTS_DIR}"),
+                },
+                PlanStep::CreateBytes {
+                    path: format!("{session}/{landed}"),
+                    bytes: bytes.to_vec(),
+                },
+            ],
+        };
+        if !may_write() {
+            return Err(VerbError::Refused(NO_CLAIM.to_owned()));
+        }
+        match exec::run_held(plan, &held) {
+            Ok(()) => return Ok(landed),
+            // The create publishes only where nothing is: a file that took
+            // the name between the look above and the publication is kept,
+            // and the next name is tried. Only that: any other failure — a
+            // folder or a journal that could not be made durable after the
+            // file was published — is this write's, and is said, even with
+            // these bytes there to be read.
+            Err(exec::ExecError::Taken(_)) => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(VerbError::Refused(format!(
+        "{ATTACHMENTS_DIR}/ already holds {ATTACHMENT_NAMES} other files named like {name}, so it was not stored."
+    )))
+}
+
+/// `name` as the `n`th try takes it: as it is first, then `-n` before its
+/// extension (`report-2.pdf`), or at its end where it has none.
+fn numbered(name: &str, n: usize) -> String {
+    if n == 1 {
+        return name.to_owned();
+    }
+    match name.rsplit_once('.') {
+        Some((stem, extension)) if !stem.is_empty() => format!("{stem}-{n}.{extension}"),
+        _ => format!("{name}-{n}"),
+    }
+}
+
 /// Write the memlog at `rel`, session-relative, in the session at
 /// `session`, with what `compose` makes of its bytes as they are while the
 /// zone is held (`None` when there is no memlog yet), or refuse with the
@@ -210,7 +318,7 @@ pub fn memlog_write(
     let refused = |refusal: files::FileVerbError| VerbError::Refused(refusal.to_string());
     files::check_memlog(rel).map_err(refused)?;
     let held = exec::hold(zone)?;
-    let landed = land(held.zone(), session, rel, Some(files::MEMLOG))?;
+    let landed = land(held.zone(), session, rel, Some(files::MEMLOG), None)?;
     files::check_memlog(&landed).map_err(refused)?;
     let dir = browse::lexical_join(held.zone(), session)
         .map_err(|_| VerbError::NoSuchSession(session.to_owned()))?;
@@ -346,4 +454,49 @@ pub fn in_session<'p>(dir: &str, path: &'p str) -> &'p str {
     path.strip_prefix(dir)
         .and_then(|rest| rest.strip_prefix('/'))
         .unwrap_or(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// R454 (R101F2-02): a person's file published, then the plan's journal
+    /// cannot be written — the write is not done, and says so, though its
+    /// bytes can be read where they landed; no other name is taken. The
+    /// journal keeps the run, so the file stored again later is that same
+    /// file, finished.
+    #[test]
+    fn a_stored_file_whose_run_cannot_be_made_durable_is_not_stored() {
+        let zone = tempfile::tempdir().expect("zone");
+        std::fs::create_dir_all(zone.path().join("active/s")).expect("session");
+        // The journal's stage name held by a folder: the next journal
+        // write cannot stage, so it fails.
+        let blocker = zone
+            .path()
+            .join(".keeper/.sessions-journal.json.keeper-tmp");
+        let planted = blocker.clone();
+        exec::seam::after_publish(move || {
+            std::fs::create_dir_all(planted.join("held")).expect("plant");
+        });
+        let pdf: &[u8] = b"%PDF-1.4\n\x00\xff binary";
+        let failed = attachment_write(zone.path(), "active/s", "report.pdf", pdf, &|| true);
+        assert!(
+            matches!(
+                &failed,
+                Err(VerbError::Exec(exec::ExecError::Failed { .. }))
+            ),
+            "{failed:?}"
+        );
+        let attachments = zone.path().join("active/s/attachments");
+        assert_eq!(
+            std::fs::read(attachments.join("report.pdf")).expect("published"),
+            pdf
+        );
+        assert!(!attachments.join("report-2.pdf").exists());
+        std::fs::remove_dir_all(&blocker).expect("unblock");
+        let stored =
+            attachment_write(zone.path(), "active/s", "report.pdf", pdf, &|| true).expect("stored");
+        assert_eq!(stored, "attachments/report.pdf");
+        assert!(!zone.path().join(".keeper/sessions-journal.json").exists());
+    }
 }

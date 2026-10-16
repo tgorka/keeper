@@ -2,12 +2,14 @@
  * The header line of an agent room, beside its timeline (UX-DR129).
  *
  * One line: the agent's identity cell, its `agent@host` handle, the run badge,
- * its model and reasoning level where its home is on this device (100.2), and
- * what it is waiting for or doing. Under it, the scope chip (the drives in
- * scope, in the scope event's order) and the label chip (readers by name,
- * integrity as a word). Every word here that is not plain copy is Rust's — the
- * handle, the run, the model line, the detail drawn as sent, the unreadable
- * sentence, the label sentence — so this file only lays them out.
+ * its model and reasoning level where its home is on this device (100.2), a
+ * marker while it searches the web without asking (R457), and what it is
+ * waiting for or doing. Under it, the scope chip (the drives in scope, in the
+ * scope event's order) and the label chip (readers by name, integrity as a
+ * word). Every word here that is not plain copy is Rust's — the handle, the
+ * run, the model line, the unasked-search sentence, the detail drawn as sent,
+ * the unreadable sentence, the label sentence — so this file only lays them
+ * out.
  *
  * In a gate room (UX-DR147) a line above them names the outside system: the
  * `system` the gate is the door for and its account, by the name Rust quoted
@@ -28,7 +30,7 @@
  * an agent that will not open. A failed read is a sentence where the menu
  * would be; a failed save is a notice; both reach `keeper.log`.
  */
-import { Ellipsis } from "lucide-react";
+import { Ellipsis, Globe, LockOpen } from "lucide-react";
 import type { ReactNode } from "react";
 import { useEffect } from "react";
 import { toast } from "sonner";
@@ -217,6 +219,27 @@ export function AgentRoomHeader({
                 : `${status.model.bot} · ${status.model.effort}`}
             </span>
           )}
+          {status.searchesUnasked != null && (
+            <Badge
+              variant="outline"
+              data-testid="agent-searches-unasked"
+              title={status.searchesUnasked}
+              className="text-amber-700 dark:text-amber-400"
+            >
+              <Globe aria-hidden="true" />
+              <span className="sr-only">{status.searchesUnasked}</span>
+            </Badge>
+          )}
+          {status.fullAccess != null && (
+            // The console's standing full-access marker (story 101.5, R420),
+            // from the serving host's status on every device (R440 09):
+            // Rust's sentence says what it means, for the eye and the reader.
+            <Badge variant="destructive" data-testid="agent-full-access" title={status.fullAccess}>
+              <LockOpen aria-hidden="true" />
+              Full access
+              <span className="sr-only">. {status.fullAccess}</span>
+            </Badge>
+          )}
           {doing !== null && (
             <span className="min-w-0 truncate text-muted-foreground">{doing}</span>
           )}
@@ -225,6 +248,17 @@ export function AgentRoomHeader({
       )}
       {status?.unreadable != null && (
         <p className="text-muted-foreground text-xs">{status.unreadable}</p>
+      )}
+      {status?.console != null && (
+        // What else the serving host says of the console (R440 09, R381):
+        // "console: unknown" from a host that does not say — never a safe
+        // console — or the folders it does not give.
+        <p
+          data-testid="agent-console-note"
+          className="text-muted-foreground text-xs [overflow-wrap:anywhere]"
+        >
+          {status.console}
+        </p>
       )}
       <div className="flex min-w-0 flex-wrap items-center gap-1 text-xs">
         {scopeUnreadable !== null ? (

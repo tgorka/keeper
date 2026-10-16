@@ -553,7 +553,7 @@ if otool -L "\$bin" | grep -q 'Speech.framework'; then
 else
   echo "  Speech.framework:               NOT linked — voice will answer NoRecognizer; check project.yml's dependencies and regenerate"
 fi
-for key in NSMicrophoneUsageDescription NSSpeechRecognitionUsageDescription; do
+for key in NSMicrophoneUsageDescription NSSpeechRecognitionUsageDescription NSCameraUsageDescription; do
   text="\$(/usr/libexec/PlistBuddy -c "Print :\$key" "\$plist" 2>/dev/null || echo '(absent — the app will crash on requestAuthorization)')"
   echo "  \$key:"
   echo "      \$text"

@@ -458,7 +458,10 @@ pub(crate) use dm::Settled;
 #[cfg(unix)]
 pub(crate) use dm::{discard, make_folder};
 #[cfg(unix)]
-pub use dm::{gate_room, main_dm, main_session, GateRoom, GateRoomError, Made, MainDm};
+pub use dm::{
+    gate_room, main_dm, main_dm_synced, main_session, Fence, GateRoom, GateRoomError, Made, MainDm,
+    FENCE_LOST,
+};
 
 #[cfg(unix)]
 mod dm {
@@ -485,6 +488,23 @@ mod dm {
 
     /// The title of a proxy's `main` session.
     pub const MAIN_TITLE: &str = "main";
+
+    /// Whether the claim a running host makes a DM under still holds:
+    /// checked right before each effect — the room's creation, the session
+    /// folder's publication, the anchor's send (R120, R450).
+    pub type Fence = std::sync::Arc<dyn Fn() -> bool + Send + Sync>;
+
+    /// What a fenced [`main_dm_synced`] says when its claim lapsed before an
+    /// effect: nothing more was made.
+    pub const FENCE_LOST: &str =
+        "its host's claim on the request lapsed before the conversation was made; ask again";
+
+    fn fenced(fence: Option<&Fence>) -> Result<(), String> {
+        match fence {
+            Some(holds) if !holds() => Err(FENCE_LOST.to_owned()),
+            _ => Ok(()),
+        }
+    }
 
     /// What one call of [`main_dm`] made.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -563,6 +583,9 @@ mod dm {
     ///
     /// No claim is taken: a session with no claim event is acquirable
     /// (AD-378), so placement chooses the holder once a host serves it.
+    ///
+    /// It syncs the copy once first; a running host, whose sync loop keeps
+    /// the copy current, calls [`main_dm_synced`] instead (R416).
     pub async fn main_dm(
         client: &AgentClient,
         proxy: &AgentConfig,
@@ -571,6 +594,41 @@ mod dm {
         sessions_subfolder: &str,
         host: &str,
         now: chrono::DateTime<chrono::Local>,
+    ) -> Result<MainDm, String> {
+        client
+            .sync_once()
+            .await
+            .map_err(|error| error.to_string())?;
+        main_dm_synced(
+            client,
+            proxy,
+            decl,
+            sessions,
+            sessions_subfolder,
+            host,
+            now,
+            None,
+        )
+        .await
+    }
+
+    /// [`main_dm`] on a copy whose sync loop is running: its rooms are
+    /// current, and a second sync beside the loop's is not started. A
+    /// running host makes it under a claim, and `fence` is that claim:
+    /// each effect — the room made, the folder written, the anchor sent —
+    /// happens only while it holds, else nothing more is made and the
+    /// answer is [`FENCE_LOST`] (R450). Offline setup (`agents init`, under
+    /// the zone's lock with no host running) has none.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn main_dm_synced(
+        client: &AgentClient,
+        proxy: &AgentConfig,
+        decl: &DriveDecl,
+        sessions: &Path,
+        sessions_subfolder: &str,
+        host: &str,
+        now: chrono::DateTime<chrono::Local>,
+        fence: Option<Fence>,
     ) -> Result<MainDm, String> {
         let human = proxy
             .human
@@ -589,12 +647,9 @@ mod dm {
             host,
             scope: None,
         };
-        client
-            .sync_once()
-            .await
-            .map_err(|error| error.to_string())?;
+        // The copy is current: [`main_dm`] synced it, or its loop does.
         if let Some((path, room)) = existing(sessions, &id.to_string())? {
-            ensure_anchor(client, &me, &anchor, &room, &path).await?;
+            ensure_anchor(client, &me, &anchor, &room, &path, fence.as_ref()).await?;
             return Ok(MainDm {
                 room,
                 path,
@@ -605,22 +660,37 @@ mod dm {
         let (room, made_room) = match find_main_dm(client, &me, &human).await {
             Some(room) => (room, false),
             None => (
-                client
-                    .create_room(
-                        RoomKind::Session(SessionKind::Main),
-                        &proxy.name,
-                        vec![human.clone()],
-                        &[],
-                    )
-                    .await
-                    .map_err(|error| error.to_string())?,
+                {
+                    fenced(fence.as_ref())?;
+                    client
+                        .create_room(
+                            RoomKind::Session(SessionKind::Main),
+                            &proxy.name,
+                            vec![human.clone()],
+                            &[],
+                        )
+                        .await
+                        .map_err(|error| error.to_string())?
+                },
                 true,
             ),
         };
         let agent = main_session(proxy, decl, &human, &room, now);
         let folder = sessions.to_owned();
+        let publish = fence.clone();
         let settled = tokio::task::spawn_blocking(move || {
-            make_folder(&folder, &agent, Vec::new(), made_room, now)
+            fenced(publish.as_ref())?;
+            // Asked again under the zone's lock, right before the folder is
+            // made: a claim lost while the lock was waited for makes none
+            // (R120, review-101rooms-2 03).
+            let holds = || publish.as_ref().is_none_or(|holds| holds());
+            make_folder(&folder, &agent, Vec::new(), made_room, now, &holds).map_err(|sentence| {
+                if holds() {
+                    sentence
+                } else {
+                    FENCE_LOST.to_owned()
+                }
+            })
         })
         .await
         .map_err(|error| error.to_string())
@@ -643,7 +713,7 @@ mod dm {
             (_, false) => Made::Nothing,
         };
         let Settled { room, path, .. } = settled;
-        ensure_anchor(client, &me, &anchor, &room, &path).await?;
+        ensure_anchor(client, &me, &anchor, &room, &path, fence.as_ref()).await?;
         Ok(MainDm { room, path, made })
     }
 
@@ -663,21 +733,21 @@ mod dm {
     /// a card first) in the same plan — made under the zone's lock unless a
     /// session with its id is there by then; `made_room` says whether
     /// `agent.room` was made by this call (and so is discarded when another
-    /// folder won).
+    /// folder won). `may_write` is the claim it is made under, asked under
+    /// the zone's lock right before the folder is written
+    /// ([`verbs::create_claimed_session`], R120); an unclaimed maker passes
+    /// `&|| true`.
     pub(crate) fn make_folder(
         sessions: &Path,
         agent: &SessionAgent,
         files: Vec<(String, String)>,
         made_room: bool,
         now: chrono::DateTime<chrono::Local>,
+        may_write: &dyn Fn() -> bool,
     ) -> Result<Settled, String> {
         std::fs::create_dir_all(sessions)
             .map_err(|error| format!("{} could not be made: {error}", sessions.display()))?;
-        let outcome = if files.is_empty() {
-            verbs::create_agent_session(sessions, agent, now)
-        } else {
-            verbs::create_carded_session(sessions, agent, files, now)
-        };
+        let outcome = verbs::create_claimed_session(sessions, agent, files, now, may_write);
         match outcome.map_err(|e| e.to_string())? {
             CreateOutcome::Created { path, .. } => Ok(Settled {
                 room: agent.room.clone(),
@@ -861,12 +931,14 @@ mod dm {
         anchor: &Anchor<'_>,
         room: &OwnedRoomId,
         path: &str,
+        fence: Option<&Fence>,
     ) -> Result<(), String> {
         if let Some(joined) = client.client().get_room(room) {
             if crate::runtime::latest_status(&joined, me).await.is_some() {
                 return Ok(());
             }
         }
+        fenced(fence)?;
         let status = StatusContent {
             v: CONTENT_VERSION,
             session: format!("{}/{path}", anchor.sessions_subfolder),
@@ -879,6 +951,8 @@ mod dm {
             detail: None,
             waiting: None,
             anchor: None,
+            // Its host says its console once it serves the session.
+            console: None,
         };
         let content = serde_json::to_value(&status).map_err(|error| error.to_string())?;
         client
@@ -974,7 +1048,7 @@ mod dm {
             .await
             .map_err(|error| error.to_string())?;
         if let Some((path, room)) = existing(sessions, &id.to_string())? {
-            ensure_anchor(client, &me, &anchor, &room, &path).await?;
+            ensure_anchor(client, &me, &anchor, &room, &path, None).await?;
             return Ok(GateRoom {
                 room,
                 path,
@@ -1003,7 +1077,7 @@ mod dm {
         let session = gate_session(agent, gate, &room, owner, now.with_timezone(&chrono::Utc));
         let folder = sessions.to_owned();
         let settled = tokio::task::spawn_blocking(move || {
-            make_folder(&folder, &session, Vec::new(), made_room, now)
+            make_folder(&folder, &session, Vec::new(), made_room, now, &|| true)
         })
         .await
         .map_err(|error| error.to_string())
@@ -1026,7 +1100,7 @@ mod dm {
             (_, false) => Made::Nothing,
         };
         let Settled { room, path, .. } = settled;
-        ensure_anchor(client, &me, &anchor, &room, &path).await?;
+        ensure_anchor(client, &me, &anchor, &room, &path, None).await?;
         Ok(GateRoom { room, path, made })
     }
 

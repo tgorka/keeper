@@ -4,6 +4,7 @@ import type {
   AccountVm,
   AgentRunVm,
   ApprovalCardVm,
+  HeldRestoreVm,
   IpcError,
   TimelineBatch,
   TimelineItemVm,
@@ -19,6 +20,7 @@ const subscribeTimeline = vi.fn();
 const unsubscribeTimeline = vi.fn();
 const sendText = vi.fn();
 const sendReply = vi.fn();
+const sendReplyToEvent = vi.fn();
 const editMessage = vi.fn();
 const retrySend = vi.fn();
 const sendAttachmentPath = vi.fn();
@@ -36,7 +38,10 @@ const subscribeTyping = vi.fn();
 const unsubscribeTyping = vi.fn();
 const subscribePaginationStatus = vi.fn();
 const unsubscribePaginationStatus = vi.fn();
-const cancelHeldSend = vi.fn(async (_a: string, _r: string, _id: string): Promise<string> => "");
+const RESTORED_NOTHING: HeldRestoreVm = { line: "", reply: null, attachment: null };
+const cancelHeldSend = vi.fn(
+  async (_a: string, _r: string, _id: string): Promise<HeldRestoreVm> => RESTORED_NOTHING,
+);
 const chatCommandPreview = vi.fn();
 const roomLeave = vi.fn();
 vi.mock("@/lib/ipc/client", () => ({
@@ -44,6 +49,9 @@ vi.mock("@/lib/ipc/client", () => ({
   // room's menu on mount; a read that never answers renders neither.
   agentsDefaultGet: vi.fn(() => new Promise(() => {})),
   agentsDefaultSet: vi.fn(),
+  // The questions waiting in an agent DM (story 101.3): none here.
+  subscribeAgentAsks: vi.fn(() => Promise.resolve(1)),
+  unsubscribeAgentAsks: vi.fn(() => Promise.resolve()),
   frontendErrorReport: vi.fn(() => Promise.resolve()),
   subscribeTimeline: (accountId: string, roomId: string, onBatch: (b: TimelineBatch) => void) =>
     subscribeTimeline(accountId, roomId, onBatch),
@@ -67,6 +75,8 @@ vi.mock("@/lib/ipc/client", () => ({
   sendText: (accountId: string, roomId: string, body: string) => sendText(accountId, roomId, body),
   sendReply: (accountId: string, roomId: string, inReplyToKey: string, body: string) =>
     sendReply(accountId, roomId, inReplyToKey, body),
+  sendReplyToEvent: (accountId: string, roomId: string, eventId: string, body: string) =>
+    sendReplyToEvent(accountId, roomId, eventId, body),
   editMessage: (accountId: string, roomId: string, itemKey: string, body: string) =>
     editMessage(accountId, roomId, itemKey, body),
   retrySend: (accountId: string, roomId: string, itemKey: string) =>
@@ -177,6 +187,8 @@ beforeEach(() => {
   sendText.mockResolvedValue(undefined);
   sendReply.mockReset();
   sendReply.mockResolvedValue(undefined);
+  sendReplyToEvent.mockReset();
+  sendReplyToEvent.mockResolvedValue(undefined);
   editMessage.mockReset();
   editMessage.mockResolvedValue(undefined);
   retrySend.mockReset();
@@ -219,7 +231,7 @@ beforeEach(() => {
   attachmentsStore.getState().clear();
   outboxStore.getState().clear();
   cancelHeldSend.mockReset();
-  cancelHeldSend.mockResolvedValue("");
+  cancelHeldSend.mockResolvedValue(RESTORED_NOTHING);
   chatCommandPreview.mockReset();
   roomLeave.mockReset();
   roomLeave.mockResolvedValue(undefined);
@@ -1661,12 +1673,14 @@ describe("ConversationPane — held-aware Delete (Story 8.4)", () => {
         body,
         heldAtMs: now,
         dispatchAtMs: now + 10_000,
+        filename: null,
+        reply: false,
       },
     ]);
   }
 
   it("held-bubble Delete resolves as an undo (cancelHeldSend) and never opens the delete dialog", async () => {
-    cancelHeldSend.mockResolvedValue("held body");
+    cancelHeldSend.mockResolvedValue({ ...RESTORED_NOTHING, line: "held body" });
     await renderWithOwnMessage();
     act(() => {
       seedHeld();
@@ -1702,7 +1716,7 @@ describe("ConversationPane — held-aware Delete (Story 8.4)", () => {
   });
 
   it("`⌫` on a selected held bubble resolves as an undo and never opens the delete dialog", async () => {
-    cancelHeldSend.mockResolvedValue("held body");
+    cancelHeldSend.mockResolvedValue({ ...RESTORED_NOTHING, line: "held body" });
     await renderWithOwnMessage();
     act(() => {
       seedHeld();
@@ -2643,5 +2657,131 @@ describe("ConversationPane — an agent room", () => {
     push({ ops: [], heard: [] });
     await waitFor(() => expect(markOwners()).toEqual([]));
     expect(screen.getByText("Synapse took it. The cut sits at 45 KiB.")).toBeInTheDocument();
+  });
+});
+
+describe("ConversationPane — an Undo lands in the room it was held in (R447)", () => {
+  const roomA = "!room-a:example.org";
+  const roomB = "!room-b:example.org";
+
+  function harness() {
+    const captured: { onBatch: ((b: TimelineBatch) => void) | null } = { onBatch: null };
+    let nextId = 1;
+    subscribeTimeline.mockImplementation((_a, _r, onBatch: (b: TimelineBatch) => void) => {
+      captured.onBatch = onBatch;
+      return Promise.resolve(nextId++);
+    });
+    roomsStore.getState().selectRoom({ accountId: account.accountId, roomId: roomA });
+    const { rerender } = render(<ConversationPane {...noopProps()} />);
+    const open = async (roomId: string) => {
+      roomsStore.getState().selectRoom({ accountId: account.accountId, roomId });
+      rerender(<ConversationPane {...noopProps()} />);
+      await waitFor(() =>
+        expect(subscribeTimeline).toHaveBeenCalledWith(
+          account.accountId,
+          roomId,
+          expect.any(Function),
+        ),
+      );
+      act(() => captured.onBatch?.({ ops: [message(`k-${roomId}`, "@bob:example.org", "hi")] }));
+      const field = await screen.findByLabelText<HTMLTextAreaElement>("Message");
+      await waitFor(() => expect(field).not.toBeDisabled());
+      return field;
+    };
+    const hold = (roomId: string, filename: string | null) => {
+      const now = Date.now();
+      act(() => {
+        outboxStore.getState().applySnapshot(account.accountId, roomId, [
+          {
+            id: "held-1",
+            accountId: account.accountId,
+            roomId,
+            body: "for A",
+            heldAtMs: now,
+            dispatchAtMs: now + 30_000,
+            filename,
+            reply: false,
+          },
+        ]);
+      });
+    };
+    return { open, hold };
+  }
+
+  it("keeps an attachment undone in one room out of the room opened before it resolved", async () => {
+    let resolve: (restored: HeldRestoreVm) => void = () => {};
+    cancelHeldSend.mockImplementation(
+      () => new Promise<HeldRestoreVm>((answer) => (resolve = answer)),
+    );
+    const { open, hold } = harness();
+    await open(roomA);
+    hold(roomA, "plan.pdf");
+    fireEvent.click(await screen.findByTestId("held-delete-button"));
+    await waitFor(() =>
+      expect(cancelHeldSend).toHaveBeenCalledWith(account.accountId, roomA, "held-1"),
+    );
+
+    // B is opened before the cancel resolves.
+    const inB = await open(roomB);
+    await act(async () => {
+      resolve({
+        line: "for A",
+        reply: null,
+        attachment: { path: "/data/outbox-files/held-1/plan.pdf", filename: "plan.pdf" },
+      });
+    });
+    expect(attachmentsStore.getState().pending).toEqual([]);
+    expect(inB.value).toBe("");
+    fireEvent.change(inB, { target: { value: "hello B" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => expect(sendText).toHaveBeenCalledWith(account.accountId, roomB, "hello B"));
+    expect(sendAttachmentPath).not.toHaveBeenCalled();
+
+    // Back in A, the line and the file are where they were held.
+    const inA = await open(roomA);
+    await waitFor(() => expect(inA.value).toBe("for A"));
+    expect(attachmentsStore.getState().pending).toEqual([
+      expect.objectContaining({ path: "/data/outbox-files/held-1/plan.pdf", filename: "plan.pdf" }),
+    ]);
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() =>
+      expect(sendAttachmentPath).toHaveBeenCalledWith(
+        account.accountId,
+        roomA,
+        "/data/outbox-files/held-1/plan.pdf",
+        "for A",
+      ),
+    );
+  });
+
+  it("sends an undone reply to its original by event when the timeline does not show it", async () => {
+    cancelHeldSend.mockResolvedValue({
+      line: "for A",
+      reply: {
+        eventId: "$gone:example.org",
+        key: null,
+        sender: "@tola:example.org",
+        senderDisplayName: "Tola Grey",
+        body: "Which trip first?",
+      },
+      attachment: null,
+    });
+    const { open, hold } = harness();
+    const field = await open(roomA);
+    hold(roomA, null);
+    fireEvent.click(await screen.findByTestId("held-delete-button"));
+    expect(await screen.findByText("Replying to Tola Grey")).toBeInTheDocument();
+    await waitFor(() => expect(field.value).toBe("for A"));
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() =>
+      expect(sendReplyToEvent).toHaveBeenCalledWith(
+        account.accountId,
+        roomA,
+        "$gone:example.org",
+        "for A",
+      ),
+    );
+    expect(sendReply).not.toHaveBeenCalled();
+    expect(sendText).not.toHaveBeenCalled();
   });
 });

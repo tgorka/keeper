@@ -58,6 +58,7 @@ import { Button } from "@/components/ui/button";
 import { useSlashMenu } from "@/hooks/use-slash-menu";
 import type { BotCommandPreviewVm } from "@/lib/ipc/client";
 import { botsCommandPreview } from "@/lib/ipc/client";
+import { NO_TEXT_SUBSTITUTION } from "@/lib/text-entry";
 
 /** The textarea's accessible name and its placeholder. */
 export const BOT_COMPOSER_LABEL = "Message";
@@ -320,6 +321,7 @@ export function BotComposer({
       <div className="relative flex items-end gap-2">
         <SlashMenuList menu={menu} />
         <textarea
+          {...NO_TEXT_SUBSTITUTION}
           aria-label={BOT_COMPOSER_LABEL}
           {...menu.fieldProps}
           placeholder={BOT_COMPOSER_PLACEHOLDER}

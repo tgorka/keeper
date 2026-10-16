@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::path::Path;
 
 use keeper_core::agents::home;
 use keeper_core::agents::label::Readers;
@@ -190,6 +191,7 @@ fn the_main_dm_is_the_room_its_folder_names() {
         Vec::new(),
         true,
         now,
+        &|| true,
     )
     .expect("first");
     assert_eq!(made.room.as_str(), "!first:example.org");
@@ -203,6 +205,7 @@ fn the_main_dm_is_the_room_its_folder_names() {
         Vec::new(),
         true,
         now,
+        &|| true,
     )
     .expect("raced");
     assert_eq!(raced.room.as_str(), "!first:example.org");
@@ -219,10 +222,56 @@ fn the_main_dm_is_the_room_its_folder_names() {
         Vec::new(),
         false,
         now,
+        &|| true,
     )
     .expect("adopted");
     assert_eq!(adopted.room.as_str(), "!first:example.org");
     assert_eq!(adopted.discard, None);
+}
+
+/// R120, R450 (review-101rooms-2 03): the claim a DM is made under holds
+/// when the folder's maker starts and lapses while it waits for the zone's
+/// lock — another writer holds it. Asked again under the lock, right before
+/// the folder would be written, it no longer holds: no folder is made. The
+/// maker says it saw the claim hold before the claim lapses (R101R3-03): no
+/// sleep decides the order.
+#[test]
+fn a_claim_lost_while_the_zone_lock_was_waited_for_makes_no_folder() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    let root = tempfile::tempdir().expect("tempdir");
+    let zone = root.path().join("60-sessions");
+    std::fs::create_dir_all(&zone).expect("zone");
+    let other_writer = crate::sessions::exec::hold(&zone).expect("the zone's lock");
+    let holds = Arc::new(AtomicBool::new(true));
+    let (started, maker_started) = std::sync::mpsc::channel();
+    let maker = {
+        let (zone, holds) = (zone.clone(), Arc::clone(&holds));
+        std::thread::spawn(move || {
+            let fence = || holds.load(Ordering::SeqCst);
+            assert!(fence(), "the claim holds when the maker starts");
+            started.send(()).expect("the test waits");
+            make_folder(
+                &zone,
+                &main_session("!dm:example.org"),
+                Vec::new(),
+                true,
+                chrono::Local::now(),
+                &fence,
+            )
+        })
+    };
+    maker_started.recv().expect("the maker started");
+    assert!(!maker.is_finished(), "the maker waits for the zone's lock");
+    holds.store(false, Ordering::SeqCst);
+    drop(other_writer);
+    let made = maker.join().expect("the maker");
+    assert!(made.is_err(), "{made:?}");
+    let active = zone.join(keeper_core::sessions::model::ACTIVE_DIR);
+    assert!(
+        !active.exists() || std::fs::read_dir(&active).expect("read").next().is_none(),
+        "no session folder"
+    );
 }
 
 /// The copy's DM with its person, found among its rooms: a session room of
@@ -601,4 +650,75 @@ fn agents_new_copies_any_template_and_refuses_a_link() {
     let refused = new_agent(&zone, "bea", "Bea", "2026-10-03", None).expect_err("link");
     assert!(refused.contains("_template/shared is a link"), "{refused}");
     assert!(!zone.join("bea").exists(), "nothing written");
+}
+
+/// A copy's client restored from a session against a homeserver that is not
+/// there: whatever it would send fails, but nothing is asked of it before
+/// the first effect.
+async fn offline_copy(dir: &Path, user: &str) -> keeper_core::agents::matrix::AgentClient {
+    use matrix_sdk::authentication::matrix::MatrixSession;
+    let client = keeper_core::agents::matrix::AgentClient::open(
+        "http://127.0.0.1:9",
+        &dir.join("store"),
+        "passphrase",
+    )
+    .await
+    .expect("client");
+    client
+        .restore(keeper_core::auth::StoredSession::Password(MatrixSession {
+            meta: matrix_sdk::SessionMeta {
+                user_id: OwnedUserId::try_from(user).expect("user"),
+                device_id: "NIXI1".into(),
+            },
+            tokens: matrix_sdk::SessionTokens {
+                access_token: "not-a-token".to_owned(),
+                refresh_token: None,
+            },
+        }))
+        .await
+        .expect("restored");
+    client
+}
+
+/// R450 (review-101rooms-1 08): a running host makes the DM under its
+/// request's claim, checked right before each effect; once the claim no
+/// longer holds — lost between taking it and making the room — no room is
+/// made and no folder written, and the answer says why.
+#[tokio::test]
+async fn a_dm_whose_claim_lapsed_makes_no_room_and_no_folder() {
+    let dir = tempfile::tempdir().expect("dir");
+    let choices = choices(&[TGORKA]);
+    let files = seed::files(&choices);
+    let toml = files
+        .iter()
+        .find(|file| file.path == "nixi/agent.toml")
+        .expect("nixi");
+    let mut nixi = home::parse_agent_toml(&toml.text, "nixi", &choices.decl).expect("nixi parses");
+    nixi.human = Some(user(TGORKA));
+    let client = offline_copy(dir.path(), nixi.matrix_user.as_str()).await;
+    let sessions = dir.path().join("60-sessions");
+    let holds = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let fence: Fence = {
+        let holds = std::sync::Arc::clone(&holds);
+        std::sync::Arc::new(move || holds.load(std::sync::atomic::Ordering::Relaxed))
+    };
+    // Lost after the claim was taken, before anything was made.
+    holds.store(false, std::sync::atomic::Ordering::Relaxed);
+    let made = main_dm_synced(
+        &client,
+        &nixi,
+        &choices.decl,
+        &sessions,
+        "60-sessions",
+        "electra",
+        chrono::Local::now(),
+        Some(fence),
+    )
+    .await;
+    assert_eq!(made, Err(FENCE_LOST.to_owned()));
+    assert!(client.client().rooms().is_empty(), "no room");
+    assert!(
+        !sessions.exists() || std::fs::read_dir(&sessions).expect("read").next().is_none(),
+        "no folder"
+    );
 }

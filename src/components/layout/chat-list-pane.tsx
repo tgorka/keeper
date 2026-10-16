@@ -785,7 +785,10 @@ export function ChatListPane() {
             </p>
           </div>
         ) : visibleRooms.length > 0 ? (
-          <ScrollArea className="flex-1">
+          // `fitWidth`: a row truncates to the pane. Without it the widest row's
+          // content widened every row past the pane's edge, cutting the time —
+          // and an agent row's state word (story 101.6) — at the right.
+          <ScrollArea fitWidth className="flex-1">
             <ul aria-label="Conversations" className="flex flex-col">
               {visibleRooms.map((room, index) => (
                 <li key={`${room.accountId}:${room.roomId}`}>

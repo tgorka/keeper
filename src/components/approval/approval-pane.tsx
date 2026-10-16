@@ -43,6 +43,7 @@ import {
   saveDraft,
 } from "@/lib/ipc/client";
 import { draftsStore, usePendingDraftKeys } from "@/lib/stores/drafts";
+import { NO_TEXT_SUBSTITUTION } from "@/lib/text-entry";
 import { cn } from "@/lib/utils";
 
 /** Exact empty-state copy (Story 7.3 acceptance) — kept verbatim. */
@@ -548,6 +549,7 @@ function ApprovalRow({
           </div>
           {editing ? (
             <textarea
+              {...NO_TEXT_SUBSTITUTION}
               ref={textareaRef}
               data-slot="approval-editor"
               value={editValue}

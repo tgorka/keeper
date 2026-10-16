@@ -10,21 +10,34 @@
 import { Text } from "@codemirror/state";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { AccountVm, AgentRoomHeaderVm, ProxyRoomVm, TimelineBatch } from "@/lib/ipc/client";
+import type {
+  AccountVm,
+  AgentRoomHeaderVm,
+  HeldRestoreVm,
+  ProxyRoomVm,
+  TimelineBatch,
+} from "@/lib/ipc/client";
 
 const subscribeTimeline = vi.fn();
 const agentRoomsList = vi.fn();
 const agentScopeSet = vi.fn();
 const agentFocus = vi.fn();
 const agentConversationNew = vi.fn();
+const agentsDefaultGet = vi.fn();
+const agentMainDmOpen = vi.fn();
 const cancelHeldSend = vi.fn();
+const RESTORED_NOTHING: HeldRestoreVm = { line: "", reply: null, attachment: null };
 /** Every `agentFocus` call's number, in call order. */
 let focusSeqs: number[];
 vi.mock("@/lib/ipc/client", () => ({
   // The default agent (story 100.3): read by Settings › Agents and the agent
   // room's menu on mount; a read that never answers renders neither.
-  agentsDefaultGet: vi.fn(() => new Promise(() => {})),
+  agentsDefaultGet: () => agentsDefaultGet(),
+  agentMainDmOpen: (accountId: string, agent: string) => agentMainDmOpen(accountId, agent),
   agentsDefaultSet: vi.fn(),
+  // The questions waiting in an agent DM (story 101.3): none here.
+  subscribeAgentAsks: vi.fn(() => Promise.resolve(1)),
+  unsubscribeAgentAsks: vi.fn(() => Promise.resolve()),
   frontendErrorReport: vi.fn(() => Promise.resolve()),
   agentRoomsList: (accountId: string) => agentRoomsList(accountId),
   agentScopeSet: (accountId: string, roomId: string, drives: string[]) =>
@@ -60,6 +73,19 @@ vi.mock("@/lib/ipc/client", () => ({
   mirrorDraft: vi.fn(async () => {}),
   clearDraftMirror: vi.fn(async () => {}),
 }));
+// What the dock says in a toast: a failed ask's sentence among them.
+const toastError = vi.fn();
+vi.mock("sonner", () => ({
+  toast: Object.assign(vi.fn(), {
+    error: (...args: unknown[]) => toastError(...args),
+    loading: vi.fn(() => "waiting"),
+    dismiss: vi.fn(),
+    success: vi.fn(),
+    info: vi.fn(),
+    warning: vi.fn(),
+    message: vi.fn(),
+  }),
+}));
 const onDragDropEvent = vi.fn(() => Promise.resolve(() => {}));
 vi.mock("@tauri-apps/api/webview", () => ({
   getCurrentWebview: () => ({ onDragDropEvent }),
@@ -67,7 +93,10 @@ vi.mock("@tauri-apps/api/webview", () => ({
 
 import { COLUMN_COLLAPSE_PREFIX } from "@/components/layout/surface-column";
 import {
+  ATTENTION_RELIST_MS,
   DOCK_FOLDS_RAIL_BELOW_PX,
+  DOCK_LOOK_AGAIN_LABEL,
+  DOCK_NO_PROXY_SENTENCE,
   FOCUS_HEARTBEAT_MS,
   NEW_CONVERSATION_POLL_MS,
   NotesAgentDock,
@@ -184,7 +213,7 @@ function scopeChips(): string[] {
 beforeEach(() => {
   focusSeqs = [];
   cancelHeldSend.mockReset();
-  cancelHeldSend.mockResolvedValue("");
+  cancelHeldSend.mockResolvedValue(RESTORED_NOTHING);
   outboxStore.getState().clear();
   streams = new Map();
   subscribeTimeline.mockReset();
@@ -205,6 +234,9 @@ beforeEach(() => {
   agentFocus.mockResolvedValue(undefined);
   agentConversationNew.mockReset();
   agentConversationNew.mockResolvedValue("$request:example.org");
+  agentsDefaultGet.mockReset();
+  agentsDefaultGet.mockReturnValue(new Promise(() => {}));
+  agentMainDmOpen.mockReset();
   accountsStore.setState({ accounts: [ACCOUNT] });
   roomsStore.getState().selectRoom({ accountId: ACCOUNT.accountId, roomId: CHAT });
   timelineStore.getState().clear();
@@ -463,6 +495,173 @@ describe("the assistant dock", () => {
     expect(screen.queryByRole("combobox", { name: "Conversation" })).not.toBeInTheDocument();
   });
 
+  it("offers to ask the person's own agent for its conversation, and opens it when it lands (101.1 #5)", async () => {
+    // No room here yet; Rust says Nixi is the person's own agent with none.
+    agentRoomsList.mockResolvedValue([]);
+    agentsDefaultGet.mockResolvedValue({
+      view: "agents",
+      room: null,
+      defaultAgent: null,
+      reason: null,
+      announce: false,
+      choices: [],
+      fileSet: null,
+      ask: null,
+      askable: [
+        {
+          accountId: ACCOUNT.accountId,
+          agent: "@nixi:example.org",
+          name: "Nixi",
+          opening: "Opening a conversation with Nixi…",
+        },
+      ],
+    });
+    agentMainDmOpen.mockImplementation(async () => {
+      // The host made the DM: the next listing has it.
+      agentRoomsList.mockResolvedValue([proxyRoom(DM, "Nixi", "main")]);
+      return { accountId: ACCOUNT.accountId, roomId: DM };
+    });
+    renderDock();
+    openDock();
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Open a conversation with Nixi" }, SLOW),
+    );
+    expect(agentMainDmOpen).toHaveBeenCalledWith(ACCOUNT.accountId, "@nixi:example.org");
+    await waitFor(() => expect(streams.has(DM)).toBe(true), SLOW);
+  });
+
+  it("says why when the agent's conversation did not open (101.1 #5)", async () => {
+    agentRoomsList.mockResolvedValue([]);
+    agentsDefaultGet.mockResolvedValue({
+      view: "inbox",
+      room: null,
+      defaultAgent: null,
+      reason: null,
+      announce: false,
+      choices: [],
+      fileSet: null,
+      ask: null,
+      askable: [
+        {
+          accountId: ACCOUNT.accountId,
+          agent: "@nixi:example.org",
+          name: "Nixi",
+          opening: "Opening a conversation with Nixi…",
+        },
+      ],
+    });
+    const sentence =
+      "keeper cannot ask Nixi for a conversation: you are in no control room with it.";
+    agentMainDmOpen.mockRejectedValue({ code: "unsupported", message: sentence, retriable: false });
+    renderDock();
+    openDock();
+
+    const button = await screen.findByRole(
+      "button",
+      { name: "Open a conversation with Nixi" },
+      SLOW,
+    );
+    fireEvent.click(button);
+    await waitFor(() => expect(toastError).toHaveBeenCalledWith(sentence), SLOW);
+    expect(button).not.toBeDisabled();
+    expect(subscribeTimeline).not.toHaveBeenCalled();
+  });
+
+  /** Rust's launch answer naming `askable` and nothing else. */
+  function askableVm(askable: { accountId: string; agent: string; name: string }[]) {
+    return {
+      view: "inbox" as const,
+      room: null,
+      defaultAgent: null,
+      reason: null,
+      announce: false,
+      choices: [],
+      fileSet: null,
+      ask: null,
+      askable: askable.map((one) => ({
+        ...one,
+        opening: `Opening a conversation with ${one.name}…`,
+      })),
+    };
+  }
+
+  it("offers an agent that became known while it stayed empty, without remounting (R450)", async () => {
+    agentRoomsList.mockResolvedValue([]);
+    agentsDefaultGet.mockResolvedValue(askableVm([]));
+    renderDock();
+    openDock();
+    const again = await screen.findByRole("button", { name: DOCK_LOOK_AGAIN_LABEL }, SLOW);
+    expect(screen.queryByRole("button", { name: "Open a conversation with Nixi" })).toBeNull();
+
+    // The agent's proxy is known now: the next look offers it.
+    agentsDefaultGet.mockResolvedValue(
+      askableVm([{ accountId: ACCOUNT.accountId, agent: "@nixi:example.org", name: "Nixi" }]),
+    );
+    fireEvent.click(again);
+    expect(
+      await screen.findByRole("button", { name: "Open a conversation with Nixi" }, SLOW),
+    ).toBeInTheDocument();
+  });
+
+  it("drops a signed-out account's offer and offers the new account's (R450)", async () => {
+    const OTHER: AccountVm = {
+      ...ACCOUNT,
+      accountId: "01ARZ3NDEKTSV4RRFFQ69G5FAW",
+      userId: "@marta:example.org",
+    };
+    agentRoomsList.mockResolvedValue([]);
+    agentsDefaultGet.mockResolvedValue(
+      askableVm([{ accountId: ACCOUNT.accountId, agent: "@nixi:example.org", name: "Nixi" }]),
+    );
+    renderDock();
+    openDock();
+    await screen.findByRole("button", { name: "Open a conversation with Nixi" }, SLOW);
+
+    // Rust's answer for the new accounts is slow; the old offer is gone at once.
+    let answer: (vm: ReturnType<typeof askableVm>) => void = () => {};
+    agentsDefaultGet.mockReturnValue(
+      new Promise((resolve) => {
+        answer = resolve;
+      }),
+    );
+    act(() => accountsStore.setState({ accounts: [OTHER] }));
+    await waitFor(
+      () =>
+        expect(screen.queryByRole("button", { name: "Open a conversation with Nixi" })).toBeNull(),
+      SLOW,
+    );
+    await waitFor(() => expect(agentsDefaultGet.mock.calls.length).toBeGreaterThanOrEqual(2), SLOW);
+    act(() =>
+      answer(askableVm([{ accountId: OTHER.accountId, agent: "@tola:example.org", name: "Tola" }])),
+    );
+    expect(
+      await screen.findByRole("button", { name: "Open a conversation with Tola" }, SLOW),
+    ).toBeInTheDocument();
+  });
+
+  it("says when it could not look for the agent, and finds it on looking again (R381, R450)", async () => {
+    agentRoomsList.mockResolvedValue([]);
+    agentsDefaultGet.mockRejectedValue({
+      code: "internal",
+      message: "keeper.db is locked",
+      retriable: true,
+    });
+    renderDock();
+    openDock();
+    expect(await screen.findByRole("alert", {}, SLOW)).toBeInTheDocument();
+    expect(screen.queryByText(DOCK_NO_PROXY_SENTENCE)).toBeNull();
+
+    agentsDefaultGet.mockResolvedValue(
+      askableVm([{ accountId: ACCOUNT.accountId, agent: "@nixi:example.org", name: "Nixi" }]),
+    );
+    fireEvent.click(screen.getByRole("button", { name: DOCK_LOOK_AGAIN_LABEL }));
+    expect(
+      await screen.findByRole("button", { name: "Open a conversation with Nixi" }, SLOW),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
   it("looks again while it lists no assistant, and opens the DM once it is listed (D4)", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     try {
@@ -617,7 +816,7 @@ describe("the assistant dock", () => {
   });
 
   it("undoes its own held send into its own composer, and not from the note (U1, U4)", async () => {
-    cancelHeldSend.mockResolvedValue("held body");
+    cancelHeldSend.mockResolvedValue({ ...RESTORED_NOTHING, line: "held body" });
     render(
       <TooltipProvider>
         <textarea aria-label="Note" />
@@ -637,6 +836,8 @@ describe("the assistant dock", () => {
           body: "held body",
           heldAtMs: now,
           dispatchAtMs: now + 10_000,
+          filename: null,
+          reply: false,
         },
       ]),
     );
@@ -655,5 +856,73 @@ describe("the assistant dock", () => {
     // Restored into the dock's draft, never the chat's.
     await waitFor(() => expect(message).toHaveValue("held body"));
     expect(composerStore.getState().restoreBody).toBeNull();
+  });
+  it("draws each room's state as Rust lists it, and follows it as it changes (story 101.6)", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      agentRoomsList.mockResolvedValue([
+        { ...proxyRoom(DM, "Nixi", "main"), attention: "working" },
+        { ...proxyRoom(READING, "Nixi — reading list", "conversation"), attention: "doneUnread" },
+      ]);
+      renderDock();
+      openDock();
+      const picker = await screen.findByRole("combobox", { name: "Conversation, working" }, SLOW);
+      expect(within(picker).getByTestId("agent-attention")).toHaveTextContent("Working");
+
+      agentRoomsList.mockResolvedValue([
+        { ...proxyRoom(DM, "Nixi", "main"), attention: "needsYou" },
+        proxyRoom(READING, "Nixi — reading list", "conversation"),
+      ]);
+      await act(async () => {
+        vi.advanceTimersByTime(ATTENTION_RELIST_MS);
+      });
+      const asked = await screen.findByRole("combobox", { name: "Conversation, needs you" }, SLOW);
+      expect(within(asked).getByTestId("agent-attention")).toHaveTextContent("Needs you");
+      fireEvent.keyDown(asked, { key: "Enter" });
+      expect(await screen.findByRole("option", { name: "Nixi, needs you" })).toBeInTheDocument();
+      expect(screen.getByRole("option", { name: "Nixi — reading list" })).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+  it("says a refresh failed beside the rooms it keeps, until one reads again (story 101.6, R436)", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const listed = [
+        { ...proxyRoom(DM, "Nixi", "main"), attention: "working" as const },
+        {
+          ...proxyRoom(READING, "Nixi — reading list", "conversation"),
+          attention: "doneUnread" as const,
+        },
+      ];
+      agentRoomsList.mockResolvedValue(listed);
+      renderDock();
+      openDock();
+      const picker = await screen.findByRole("combobox", { name: "Conversation, working" }, SLOW);
+      fireEvent.keyDown(picker, { key: "Enter" });
+      fireEvent.click(
+        await screen.findByRole("option", { name: "Nixi — reading list, done, unread" }),
+      );
+      await waitFor(() => expect(streams.has(READING)).toBe(true));
+
+      agentRoomsList.mockRejectedValue(new Error("offline"));
+      await act(async () => {
+        vi.advanceTimersByTime(ATTENTION_RELIST_MS);
+      });
+      expect(await screen.findByRole("alert")).toBeInTheDocument();
+      const kept = screen.getByRole("combobox", { name: "Conversation, done, unread" });
+      expect(kept).toHaveTextContent("Nixi — reading list");
+
+      agentRoomsList.mockResolvedValue(listed);
+      await act(async () => {
+        vi.advanceTimersByTime(ATTENTION_RELIST_MS);
+      });
+      await waitFor(() => expect(screen.queryByRole("alert")).not.toBeInTheDocument());
+      expect(
+        screen.getByRole("combobox", { name: "Conversation, done, unread" }),
+      ).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

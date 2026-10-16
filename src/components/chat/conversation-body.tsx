@@ -21,6 +21,7 @@
  *
  * Renders a fragment: the caller's column is the flex container.
  */
+
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import {
   type KeyboardEvent,
@@ -33,6 +34,7 @@ import {
   useState,
 } from "react";
 import { ApprovalRequest } from "@/components/agents/approval-card";
+import { DecisionsPanel } from "@/components/agents/decisions-panel";
 import { AgentRoomHeader } from "@/components/chat/agent-room-header";
 import { chatCommandHost } from "@/components/chat/chat-commands";
 import { Composer, type SendContext } from "@/components/chat/composer";
@@ -47,6 +49,7 @@ import { UndoSendPill } from "@/components/chat/undo-send-pill";
 import { UtdStub } from "@/components/chat/utd-stub";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useShellLayout } from "@/hooks/use-shell-layout";
+import { useWaitingAsks } from "@/hooks/use-waiting-asks";
 import { logFailure, sayFailure } from "@/lib/failure";
 import type {
   AgentRoomHeaderVm,
@@ -72,6 +75,7 @@ import {
   sendAttachmentPath,
   sendEmote,
   sendReply,
+  sendReplyToEvent,
   sendText,
   setTyping,
   subscribeOutbox,
@@ -87,21 +91,16 @@ import {
 import { useAccountStatus } from "@/lib/stores/account-status";
 import { attachmentId, type PendingAttachment } from "@/lib/stores/attachments";
 import { useIsReducedCapabilityPlatform } from "@/lib/stores/capabilities";
+import { replyPreviewOf } from "@/lib/stores/composer";
 import {
   useConversationComposer,
   useConversationStores,
   useConversationTimeline,
 } from "@/lib/stores/conversation-stores";
 import { refreshIncognito, useIncognitoPolicyVersion } from "@/lib/stores/incognito";
-import { outboxStore, undoHeldSend, useHeldSends } from "@/lib/stores/outbox";
+import { outboxStore, undoHeldSend, useHeldRestores, useHeldSends } from "@/lib/stores/outbox";
 import { roomsStore, useRoomsStore } from "@/lib/stores/rooms";
 import { cn } from "@/lib/utils";
-
-/** Trim a body to a short single-line preview for the reply banner/quote. */
-function previewOf(body: string): string {
-  const collapsed = body.replace(/\s+/g, " ").trim();
-  return collapsed.length > 120 ? `${collapsed.slice(0, 120)}…` : collapsed;
-}
 
 /** Distance from the bottom (px) still counted as "near the bottom" for auto-scroll. */
 const NEAR_BOTTOM_PX = 80;
@@ -269,7 +268,8 @@ export function ConversationBody({
   acceptsWindowDrops,
   scopeControl,
 }: ConversationBodyProps) {
-  const { timeline, composer, attachments: tray } = useConversationStores();
+  const stores = useConversationStores();
+  const { timeline, composer, attachments: tray } = stores;
   // Phone tier (Story 13.5): gates the composer footer's keyboard/safe-area
   // bottom inset and the keyboard-resize bottom-pin. Desktop/tablet renders
   // byte-for-byte as before.
@@ -289,6 +289,15 @@ export function ConversationBody({
   // An agent room's approval requests, by id; the stream's `approval` items say
   // where each is drawn.
   const approvals = useConversationTimeline((s) => s.approvals);
+  // The questions answered in this room (Story 101.3, R430, R431): in the
+  // person's own rooms with a proxy — its DM and its conversations — as Rust
+  // follows them across every agent room this account reads.
+  const proxyKind = agentHeader?.status?.kind;
+  const waitingAsks = useWaitingAsks(
+    accountId,
+    roomId,
+    proxyKind === "main" || proxyKind === "conversation",
+  );
   // Where the person stopped listening to a spoken answer, by its key: Rust
   // sends the split already in the body's UTF-16 units (UX-DR143).
   const heard = useConversationTimeline((s) => s.heard);
@@ -458,6 +467,11 @@ export function ConversationBody({
       timeline.getState().clear();
     };
   }, [accountId, roomId, timeline, composer, tray]);
+
+  // What an Undo held in this room puts back lands here, and only in the room it
+  // was held in (R447): after the switch above cleared the composer and tray, so a
+  // restore that resolved while another room was open is not cleared away.
+  useHeldRestores(accountId, roomId, stores);
 
   // Undo-Send held-send subscription (Story 8.3): opened on room view and torn down on
   // room change / unmount (mirroring the timeline subscription lifecycle). Each snapshot
@@ -776,7 +790,10 @@ export function ConversationBody({
       // pending now: a reply or edit begun while a `/` line was being read must
       // not capture it (R411).
       const { target } = context;
-      if (target?.mode === "reply") {
+      if (target?.mode === "reply" && target.eventId !== undefined) {
+        // A reply an Undo gave back: to its original by event, loaded or not (R447).
+        await sendReplyToEvent(context.accountId, context.roomId, target.eventId, body);
+      } else if (target?.mode === "reply") {
         await sendReply(context.accountId, context.roomId, target.targetKey, body);
       } else if (target?.mode === "edit") {
         await editMessage(context.accountId, context.roomId, target.targetKey, body);
@@ -1040,7 +1057,7 @@ export function ConversationBody({
       composer.getState().startReply({
         targetKey: key,
         sender: target.senderDisplayName ?? target.sender,
-        bodyPreview: previewOf(target.body),
+        bodyPreview: replyPreviewOf(target.body),
       });
     },
     [items, composer, gateRoom],
@@ -1076,12 +1093,12 @@ export function ConversationBody({
       if (accountId !== null && roomId !== null) {
         const id = key.slice("held:".length);
         if (heldSends.some((h) => h.id === id)) {
-          void undoHeldSend(accountId, roomId, id, composer);
+          void undoHeldSend(accountId, roomId, id, stores);
         }
       }
       return true;
     },
-    [heldSends, accountId, roomId, composer],
+    [heldSends, accountId, roomId, stores],
   );
 
   // Open the delete-for-everyone confirmation for an own message (Story 3.8,
@@ -1526,10 +1543,17 @@ export function ConversationBody({
                     >
                       {/* Block <span> (not <p>) so the bubble stays valid phrasing
                           content inside a <button>. */}
+                      {row.filename !== null && (
+                        <span className="block break-words font-medium text-sm">
+                          {row.filename}
+                        </span>
+                      )}
                       <span className="block whitespace-pre-wrap break-words text-sm">
                         {row.body}
                       </span>
-                      <span className="mt-0.5 block text-held text-xs">Held</span>
+                      <span className="mt-0.5 block text-held text-xs">
+                        {row.reply ? "Held reply" : "Held"}
+                      </span>
                     </button>
                   </div>
                 </li>
@@ -1580,6 +1604,19 @@ export function ConversationBody({
             {/* Typing indicator (Story 3.9): "<name> is typing…" between the
                 timeline and composer; renders an empty live region when idle. */}
             <TypingIndicator typists={typists} />
+            {/* Decisions panel (Story 101.3, R418): what waits for this person in
+                this agent room — an approval this device may decide, a question
+                answered in this DM — numbered, above the composer. */}
+            {accountId !== null && roomId !== null && agentHeader !== null && (
+              <DecisionsPanel
+                key={`decisions:${accountId}:${roomId}`}
+                accountId={accountId}
+                roomId={roomId}
+                approvals={approvals}
+                asks={waitingAsks}
+                scope={rootRef}
+              />
+            )}
             <Composer
               // Key on the full (account, room) identity, not roomId alone: a draft is
               // keyed by (accountId, roomId) and roomId is not unique across accounts

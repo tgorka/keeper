@@ -43,8 +43,8 @@ use keeper_core::agents::agentd::{AgentdConfig, DrivePin, TrustEntry};
 use keeper_core::agents::drive::{self, DriveDecl};
 use keeper_core::agents::events::{
     control_levels, ControlLevels, ANSWER, APPROVAL_DECISION, ASK, CONTROL_ROOM_TYPE,
-    CONVERSATION_REQUEST, DELEGATE, DOORBELL, HEARD, PRESENCE, SCOPE, SESSION_ROOM_TYPE,
-    SURFACE_REQUEST, SURFACE_RESULT, TURN,
+    CONVERSATION_REQUEST, DELEGATE, DOORBELL, HEARD, MAIN_DM_REQUEST, PRESENCE, SCOPE,
+    SESSION_ROOM_TYPE, SURFACE_REQUEST, SURFACE_RESULT, TURN,
 };
 use keeper_core::agents::home::AgentKind;
 use keeper_core::agents::index::Index;
@@ -91,7 +91,7 @@ use crate::headless::{
 use crate::hosts::{read_back_rooms, HostRuntime, Opening, PendingBriefs};
 use crate::matrix_sink::{EditPort, MembersFuture, RoomPort, SendFuture};
 use crate::rooms::{
-    self, Arrival, BriefEvent, BriefRoom, Invite, InviteDecision, Known, KnownAgent,
+    self, Arrival, BriefEvent, BriefRoom, Invite, InviteDecision, Known, KnownAgent, RefusedHome,
 };
 use crate::sinks::{ClientDoors, ProxyDoors};
 use crate::surface::{self, PresenceFuture, SurfacePort};
@@ -194,7 +194,9 @@ pub fn inspect(config: &AgentdConfig, dirs: &XdgDirs) -> Inspection {
     Inspection { drives, hosted }
 }
 
-pub(crate) fn view(id: &str, profile: SyncProfile, hosts: Result<DriveDecl, String>) -> DriveView {
+/// Drive `id` as this host reads it from `profile`'s checkout: its agents
+/// zone under the declaration `hosts` accepted, and its active sessions.
+pub fn view(id: &str, profile: SyncProfile, hosts: Result<DriveDecl, String>) -> DriveView {
     let zone = read_zone(id, &profile, hosts.as_ref().ok());
     let sessions = if hosts.is_ok() {
         active_sessions(&profile)
@@ -274,9 +276,39 @@ pub(crate) fn known_with(
     hosted: &[AgentHome],
 ) -> Known {
     Known {
+        refused: refused_homes(drives),
         agents: known_agents(drives.iter().map(|drive| &drive.zone), hosted),
         trust,
     }
+}
+
+/// Every home `drives` hold whose `agent.toml` does not read here, with the
+/// sentence refusing it and the label reading that file carries under the
+/// declaration the drive's pin accepted (story 101.6, R422, R436): kept
+/// beside the known agents so a delegation from a session that label may
+/// reach hears why it cannot go there. A drive with no accepted declaration
+/// holds no homes.
+pub fn refused_homes(drives: &[DriveView]) -> Vec<RefusedHome> {
+    let mut refused = Vec::new();
+    for drive in drives {
+        let Ok(decl) = &drive.hosts else { continue };
+        let zone = drive
+            .profile
+            .agents
+            .as_ref()
+            .map_or("", |agents| agents.subfolder.trim());
+        for (folder, home) in &drive.zone.homes {
+            let Err(sentence) = home else { continue };
+            let file = format!("{zone}/{folder}/{}", keeper_core::agents::home::FILE_NAME);
+            refused.push(RefusedHome {
+                drive: drive.zone.drive.clone(),
+                id: folder.clone(),
+                sentence: sentence.clone(),
+                label: crate::agent::file_label(decl, &file, ""),
+            });
+        }
+    }
+    refused
 }
 
 /// Every agent `zones` home, each `hosted` when an entry of `hosted` is it.
@@ -361,37 +393,63 @@ pub async fn open_copy(
     Ok(Some(client))
 }
 
+/// Every checkout agentd syncs — each of its pinned drives, `pins` — as a
+/// console's folder and a run at full access are checked against it (story
+/// 101.5, R456 01, 03): mounted where its declaration hosts here, each with
+/// its pin.
+pub fn checkouts(drives: &[DriveView], pins: &[DrivePin]) -> Vec<crate::run::Checkout> {
+    drives
+        .iter()
+        .map(|drive| crate::run::Checkout {
+            id: drive.id.clone(),
+            mounted: drive.hosts.is_ok(),
+            profile: drive.profile.clone(),
+            pin: pins.iter().find(|pin| pin.id == drive.id).cloned(),
+        })
+        .collect()
+}
+
 /// Everything one hosted agent's turns run with, over this host's mounted
-/// drives and provider rows.
+/// drives, its pins of them and its provider rows.
 pub fn agent_deps(
     platform: &Arc<HeadlessPlatform>,
     data_dir: &Path,
     host: &HostSlug,
     drives: &[DriveView],
+    pins: &[DrivePin],
     rows: &[keeper_core::bots::store::ProviderRow],
     home: &AgentHome,
 ) -> Result<AgentDeps, String> {
+    // agentd builds its copies once, for the life of the process: each
+    // agent's full-access counter is that build's own.
     deps_over(
         &TurnEnv::new(Arc::clone(platform) as Arc<dyn keeper_core::platform::Platform>),
         data_dir,
         host,
         drives,
+        checkouts(drives, pins),
         rows,
         home,
+        Default::default(),
     )
 }
 
 /// [`agent_deps`] over `base`: its platform and account, with the drive
 /// narrowed to the hosting drives, no notes-vault writer and nobody to
-/// approve. No host's copies write a vault, so placement may treat every
-/// host alike: a manifest has no word for "writes the person's vault".
+/// approve, `checkouts`, every checkout the host syncs, and
+/// `full_access_turns`, the agent's full-access counter on this host. No
+/// host's copies write a vault, so placement may treat every host alike: a
+/// manifest has no word for "writes the person's vault".
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn deps_over(
     base: &TurnEnv,
     data_dir: &Path,
     host: &HostSlug,
     drives: &[DriveView],
+    checkouts: Vec<crate::run::Checkout>,
     rows: &[keeper_core::bots::store::ProviderRow],
     home: &AgentHome,
+    full_access_turns: Arc<crate::agent::FullAccessTurns>,
 ) -> Result<AgentDeps, String> {
     let (row, bot) = bot_for(home, rows).ok_or_else(|| {
         format!(
@@ -455,6 +513,10 @@ pub(crate) fn deps_over(
         mcp: None,
         kvm: None,
         gate_tickets: Default::default(),
+        attachments: crate::attachments::Bounds::this_host(),
+        web_search: None,
+        checkouts,
+        full_access_turns,
     })
 }
 
@@ -633,6 +695,9 @@ pub(crate) struct Copy {
     pub(crate) doors: Arc<ClientDoors>,
     /// Its picture's publication as its profile avatar (story 100.4).
     pub(crate) picture: Arc<tokio::sync::Mutex<crate::avatar::Picture>>,
+    /// The person's asks for their DM it heard, served at the host's tick
+    /// (R450).
+    pub(crate) dm_asks: crate::dm_request::SharedAsks,
 }
 
 /// The claim a worker writes under (story 90.6).
@@ -750,6 +815,7 @@ pub(crate) fn start_copy(
         harvest_acks: Arc::default(),
         doors,
         picture: Arc::default(),
+        dm_asks: Arc::default(),
     });
     register_handlers(&copy);
     let sync_client = copy.client.client().clone();
@@ -893,6 +959,9 @@ pub async fn run(
             })
             .collect(),
     ));
+    // `[web_search] url` (101.4, R419): the engine this host's agents that
+    // name `web_search` search with.
+    let web_search = crate::web::engine_from(config.web_search.as_ref());
 
     let sessions_zones: Vec<PathBuf> = drives
         .iter()
@@ -946,7 +1015,15 @@ pub async fn run(
                 continue;
             }
         };
-        let deps = match agent_deps(&platform, &dirs.data, &host, &drives, &rows, home) {
+        let deps = match agent_deps(
+            &platform,
+            &dirs.data,
+            &host,
+            &drives,
+            &config.drives,
+            &rows,
+            home,
+        ) {
             // Every call that needs a person parks, decided only by a
             // person whose master key `[[trust]]` pins: a pin that differs,
             // or none, accepts nothing (R77, R92; no trust on first use).
@@ -958,6 +1035,7 @@ pub async fn run(
                 sandbox: sandbox.clone(),
                 mcp: Some(Arc::clone(&mcp)),
                 kvm: Some(Arc::clone(&kvm)),
+                web_search: web_search.clone(),
                 ..deps
             }),
             Err(sentence) => {
@@ -1097,6 +1175,7 @@ pub async fn run(
             crate::avatar::publish_all(&copies, hosts.picture_round().as_ref(), &pictures, true);
         }
         hosts.tick(&stop_signal).await;
+        crate::dm_request::serve_all(&copies, &hosts.dm_round());
         ringer.tick(&hosts.round(&drives), &doorbell);
         nights.tick(hosts.night(&drives));
         sweeps.tick(hosts.night(&drives));
@@ -1581,13 +1660,8 @@ impl DelegationPort for ClientRooms {
         })
     }
 
-    fn download<'a>(&'a self, file: &'a Value) -> crate::delegate::BytesFuture<'a> {
-        Box::pin(async move {
-            self.client
-                .download_encrypted(file)
-                .await
-                .map_err(|error| error.to_string())
-        })
+    fn download<'a>(&'a self, source: &'a Value, max: u64) -> crate::delegate::BytesFuture<'a> {
+        Box::pin(async move { self.client.download_media(source, max).await })
     }
 
     fn put_state<'a>(
@@ -1934,6 +2008,15 @@ fn register_handlers(copy: &Arc<Copy>) {
                 if value["type"] == DOORBELL {
                     return;
                 }
+                // A person's ask for their DM is the host's, never a
+                // session's (R416): answered off the sync loop, since the
+                // DM may be made and its folder written.
+                if value["type"] == MAIN_DM_REQUEST {
+                    if value["sender"].as_str() != Some(copy.deps.home.config.matrix_user.as_str()) {
+                        crate::dm_request::hear(&copy, &room, value);
+                    }
+                    return;
+                }
                 // A gate's outside system asks and does nothing else: no
                 // event of its but a message reaches a call, a session or
                 // a person's path (AD-416).
@@ -2022,20 +2105,6 @@ fn register_handlers(copy: &Arc<Copy>) {
     );
 }
 
-/// Where an ask in a room goes (R199): to the session that delegated into
-/// the room — `parent`, with its kind — when that is the proxy's own `main`
-/// or `conversation`, the sessions an ask is a turn of; else to `main`, the
-/// proxy's DM.
-pub(crate) fn ask_target(
-    parent: Option<(OwnedRoomId, SessionKind)>,
-    main: Option<OwnedRoomId>,
-) -> Option<OwnedRoomId> {
-    match parent {
-        Some((room, SessionKind::Main | SessionKind::Conversation)) => Some(room),
-        _ => main,
-    }
-}
-
 /// An ask `value` (decrypted) in `room`, a room this copy serves no session
 /// of: when this copy's agent is a proxy with a person, the ask
 /// [`rooms::admit_ask`] admits is routed to the session it is a turn of
@@ -2090,7 +2159,7 @@ async fn intercept_ask(
 }
 
 /// Route `arrived`, an ask admitted in `room`, to the proxy's session it is
-/// a turn of ([`ask_target`]) as an [`Arrival::Ask`] whose `via` is `room`;
+/// a turn of ([`keeper_core::agents::ask::ask_target`]) as an [`Arrival::Ask`] whose `via` is `room`;
 /// the session dedupes it by its id. `false` when that session could not be
 /// named.
 async fn route_ask(copy: &Copy, room: &RoomId, arrived: Arrived) -> bool {
@@ -2115,7 +2184,7 @@ async fn route_ask(copy: &Copy, room: &RoomId, arrived: Arrived) -> bool {
                 .flatten()
         }
     };
-    let Some(target) = ask_target(parent, main) else {
+    let Some(target) = keeper_core::agents::ask::ask_target(parent, main) else {
         tracing::warn!(%room, "agents: an ask came for a proxy whose DM this host cannot name; it is read back later");
         return false;
     };
@@ -2810,13 +2879,15 @@ pub struct GateDoor<'a> {
 }
 
 /// A decrypted timeline event as an [`Arrived`], or `None` for an event no
-/// session acts on (membership, state, reactions, attachments, notices).
+/// session acts on (membership, state, reactions, notices, audio, video).
 ///
-/// Text is a person's `m.text` only, and only when the sender's own device
-/// sealed it: a message in clear, or one whose sender does not match its
-/// Megolm session, is never a turn. In a gate's room (`gate`), its outside
-/// system's `m.notice` is text too, and so is its message in clear when the
-/// room is clear (Q9): a request, `untrusted` either way.
+/// Text is a person's `m.text`, or their `m.file` or `m.image` (story 101.2,
+/// R417) whose text is its caption ([`crate::attachments::caption_of`]),
+/// and only when the sender's own device sealed it: a message in clear, or
+/// one whose sender does not match its Megolm session, is never a turn. In
+/// a gate's room (`gate`), its outside system's `m.notice` is text too, and
+/// so is its message in clear when the room is clear (Q9): a request,
+/// `untrusted` either way — and that system's file is nothing.
 pub fn arrival_of(
     value: &Value,
     encryption: Option<&EncryptionInfo>,
@@ -2826,12 +2897,15 @@ pub fn arrival_of(
     let event_type = value["type"].as_str()?;
     let content = value["content"].clone();
     let from_peer = gate.is_some_and(|door| value["sender"].as_str() == Some(door.peer.as_str()));
+    let file = !from_peer && crate::attachments::is_attachment(&content);
     let arrival = if event_type == "m.room.message" {
         let clear_request =
             from_peer && gate.is_some_and(|door| door.clear) && encryption.is_none();
         if content["m.relates_to"]["rel_type"] == "m.replace" {
             Arrival::Edit
-        } else if content["msgtype"] != "m.text" && !(from_peer && content["msgtype"] == "m.notice")
+        } else if content["msgtype"] != "m.text"
+            && !(from_peer && content["msgtype"] == "m.notice")
+            && !file
         {
             return None;
         } else if !sealed_by_sender(encryption) && !clear_request {
@@ -2877,7 +2951,11 @@ pub fn arrival_of(
         event_id: OwnedEventId::try_from(value["event_id"].as_str()?).ok()?,
         sender: OwnedUserId::try_from(value["sender"].as_str()?).ok()?,
         arrival,
-        text: content["body"].as_str().unwrap_or_default().to_owned(),
+        text: if file {
+            crate::attachments::caption_of(&content)
+        } else {
+            content["body"].as_str().unwrap_or_default().to_owned()
+        },
         content,
         received_at,
         replay: false,
@@ -3181,9 +3259,10 @@ mod tests {
         })
     }
 
-    /// R30's envelope check and the text-only rule: a person's `m.text`
-    /// sealed by their device is a turn; the same text in clear or from a
-    /// mismatched Megolm sender, and any attachment or notice, is nothing.
+    /// R30's envelope check and the text rule: a person's `m.text`, and
+    /// their `m.file` or `m.image` with its caption as the text (R417),
+    /// sealed by their device is a turn; the same in clear or from a
+    /// mismatched Megolm sender, and a notice or audio, is nothing.
     #[test]
     fn only_sealed_text_from_its_sender_is_a_turn() {
         let now = Instant::now();
@@ -3203,8 +3282,30 @@ mod tests {
             "a mismatched sender"
         );
 
-        for msgtype in ["m.image", "m.file", "m.notice", "m.audio"] {
-            let other = message(json!({"msgtype": msgtype, "body": "photo.png"}));
+        let captioned = message(json!({
+            "msgtype": "m.file", "body": "what is the total?", "filename": "q.pdf",
+            "file": {"url": "mxc://example.org/q"},
+        }));
+        let arrived =
+            arrival_of(&captioned, Some(&unverified), now, None).expect("a file is a turn");
+        assert_eq!(arrived.arrival, Arrival::Text);
+        assert_eq!(arrived.text, "what is the total?");
+        let photo = message(
+            json!({"msgtype": "m.image", "body": "photo.png", "url": "mxc://example.org/p"}),
+        );
+        let arrived = arrival_of(&photo, Some(&unverified), now, None).expect("a photo is a turn");
+        assert_eq!(arrived.text, "", "a file without a caption says nothing");
+        assert!(
+            arrival_of(&photo, None, now, None).is_none(),
+            "a photo in clear"
+        );
+        assert!(
+            arrival_of(&photo, Some(&forged), now, None).is_none(),
+            "a photo from a mismatched sender"
+        );
+
+        for msgtype in ["m.notice", "m.audio", "m.video"] {
+            let other = message(json!({"msgtype": msgtype, "body": "clip"}));
             assert!(
                 arrival_of(&other, Some(&unverified), now, None).is_none(),
                 "{msgtype} is not a turn"
@@ -3255,6 +3356,12 @@ mod tests {
         let text = message(json!({"msgtype": "m.text", "body": "hi"}));
         assert!(arrival_of(&text, None, now, Some(someone_else)).is_none());
         assert!(arrival_of(&text, None, now, Some(clear)).is_some());
+        // The outside system's file is no turn, sealed or in clear (R417).
+        let file =
+            message(json!({"msgtype": "m.file", "body": "x.pdf", "url": "mxc://example.org/x"}));
+        assert!(arrival_of(&file, None, now, Some(clear)).is_none());
+        let sealed_peer = sealed(Some(VerificationLevel::UnverifiedIdentity));
+        assert!(arrival_of(&file, Some(&sealed_peer), now, Some(encrypted_room)).is_none());
     }
 
     /// R47 (and Q10 for a heard mark): a scope, a request for a conversation
@@ -3663,6 +3770,7 @@ mod tests {
             drives: vec!["tgdrive".to_owned()],
         };
         let known = Known {
+            refused: Vec::new(),
             agents: vec![agent(NIXI, false), agent(TOLA, true)],
             trust: Vec::new(),
         };
@@ -3763,6 +3871,7 @@ mod tests {
         use matrix_sdk::ruma::room_version_rules::AuthorizationRules;
         let readers = Readers::Only(std::collections::BTreeSet::from([user(TGORKA)]));
         let known = Known {
+            refused: Vec::new(),
             agents: vec![KnownAgent {
                 id: "tola".to_owned(),
                 drive: "tgdrive".to_owned(),
@@ -3905,30 +4014,6 @@ mod tests {
             "a left room is forgotten"
         );
         assert!(rooms.due(&joined).is_empty());
-    }
-
-    /// R94A-03: an ask in a room a proxy's session delegated into goes to
-    /// that session only when it is the proxy's own `main` or
-    /// `conversation`; from any other, to the proxy's DM.
-    #[test]
-    fn an_ask_goes_to_a_parent_only_when_it_takes_asks() {
-        let (parent, main) = (
-            OwnedRoomId::try_from("!parent:example.org").expect("room"),
-            OwnedRoomId::try_from("!dm:example.org").expect("room"),
-        );
-        for kind in SessionKind::ALL {
-            let own = matches!(kind, SessionKind::Main | SessionKind::Conversation);
-            assert_eq!(
-                ask_target(Some((parent.clone(), kind)), Some(main.clone())),
-                Some(if own { parent.clone() } else { main.clone() }),
-                "{kind:?}"
-            );
-        }
-        assert_eq!(ask_target(None, Some(main.clone())), Some(main));
-        assert_eq!(
-            ask_target(Some((parent, SessionKind::Scheduled)), None),
-            None
-        );
     }
 
     /// The follow room's messages for run end `c1`, as `NIXI`, the

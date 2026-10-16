@@ -43,7 +43,7 @@ use serde_json::{json, Value};
 
 mod common;
 
-use common::{bare_drive, git, record, stub, syncing, Smoke, Stub};
+use common::{bare_drive, git, record, scripted, stub, syncing, Smoke, Stub};
 
 const BIN: &str = env!("CARGO_BIN_EXE_keeper-agentd");
 const SESSION: &str = "active/2026-10-03-smoke";
@@ -1361,5 +1361,152 @@ async fn heard_event_is_validated_and_logged_once() {
         *stub.requests.lock().expect("lock"),
         1,
         "no mark started a turn"
+    );
+}
+
+/// A message's text: its string content, or its text parts joined.
+fn message_text(message: &Value) -> String {
+    match &message["content"] {
+        Value::String(text) => text.clone(),
+        Value::Array(parts) => parts
+            .iter()
+            .filter_map(|part| part["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+/// The model of the attachments test: it reads, with `drive_read`, every
+/// `.txt` and `.csv` its newest user message lists under "Attached files",
+/// one call a round, then answers with what the reads returned.
+fn reads_attachments(messages: &[Value]) -> Value {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let start = messages
+        .iter()
+        .rposition(|m| m["role"] == "user")
+        .unwrap_or(0);
+    let said = message_text(&messages[start]);
+    let files: Vec<String> = said
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("- smoke:"))
+        .filter(|path| path.ends_with(".txt") || path.ends_with(".csv"))
+        .map(str::to_owned)
+        .collect();
+    let read: Vec<String> = messages[start + 1..]
+        .iter()
+        .filter(|m| m["role"] == "tool")
+        .map(message_text)
+        .collect();
+    if let Some(next) = files.get(read.len()) {
+        let id = format!(
+            "call_{}",
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let args = json!({ "path": next }).to_string();
+        return json!({"model":"stub","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":id,"type":"function","function":{"name":"drive_read","arguments":args}}]},"finish_reason":"tool_calls"}]});
+    }
+    let answer = format!("From the files: {}", read.join(" | "));
+    json!({"model":"stub","choices":[{"index":0,"delta":{"content":answer},"finish_reason":"stop"}]})
+}
+
+/// Story 101.2 #5 (R417), live: a PDF with a caption and a bare CSV, sent
+/// into an agent's DM encrypted, as keeper sends them, are each a turn the
+/// host downloads and stores; the agent reads the PDF's text and the CSV
+/// through `drive_read` and answers from their content.
+#[ignore = "live: Synapse on delectra"]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pdf_and_a_csv_sent_into_the_dm_are_answered_from_their_content() {
+    let smoke = Smoke::from_env();
+    let agent = smoke.user("nixi-smoke");
+    smoke.set_ratelimit(&agent, 0, 0).await;
+    let model = Model {
+        base_url: scripted(reads_attachments),
+        target: "stub".to_owned(),
+        token: None,
+    };
+    let mut host = host(&smoke, "nixi-smoke", "NIXI_SMOKE_PASSWORD", &model, None).await;
+    host.start();
+    host.wait_serving(&host.room.clone()).await;
+    let dir = host.root.path().join("person");
+    let (client, seen, _sync) = person(&smoke, &dir, &host.room).await;
+    let fixtures =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../keeper-agent/tests/fixtures/attachments");
+    for (name, mime, caption, content) in [
+        (
+            "quarterly.pdf",
+            "application/pdf",
+            "What is the total?",
+            "Quarterly total 4217",
+        ),
+        ("devices.csv", "text/csv", "", "hesperia,tgorka"),
+    ] {
+        let bytes = std::fs::read(fixtures.join(name)).expect("fixture");
+        let file = client.upload_encrypted(&bytes).await.expect("upload");
+        let sent = client
+            .send(
+                &host.room,
+                "m.room.message",
+                json!({
+                    "msgtype": "m.file",
+                    "body": if caption.is_empty() { name } else { caption },
+                    "filename": name,
+                    "info": {"mimetype": mime, "size": bytes.len()},
+                    "file": file,
+                }),
+                None,
+            )
+            .await
+            .expect("send")
+            .to_string();
+        let answer = answer_to(&seen, &agent, &sent, name, &|text| {
+            text.starts_with("From the files:")
+        })
+        .await;
+        assert!(
+            answer.final_text.contains(content),
+            "{name}: {}\n{}",
+            answer.final_text,
+            host.log_text()
+        );
+    }
+
+    // R444/01, live: a file past 25 MiB whose message says it is 1 kB is
+    // refused by the homeserver's answer as it arrives, never held whole;
+    // the room reads why and the turn still runs.
+    let big = vec![7u8; keeper_agent::attachments::MAX_BYTES as usize + 4096];
+    let file = client.upload_encrypted(&big).await.expect("upload");
+    let sent = client
+        .send(
+            &host.room,
+            "m.room.message",
+            json!({
+                "msgtype": "m.file",
+                "body": "big.bin",
+                "filename": "big.bin",
+                "info": {"mimetype": "application/octet-stream", "size": 1024},
+                "file": file,
+            }),
+            None,
+        )
+        .await
+        .expect("send")
+        .to_string();
+    let answer = answer_to(&seen, &agent, &sent, "big.bin", &|text| {
+        text.starts_with("From the files:")
+    })
+    .await;
+    assert!(
+        answer
+            .final_text
+            .contains("an agent takes at most 25.0 MB from one message"),
+        "{}\n{}",
+        answer.final_text,
+        host.log_text()
+    );
+    assert!(
+        host.log_text().contains("did not wholly reach the agent"),
+        "{}",
+        host.log_text()
     );
 }

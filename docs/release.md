@@ -1,10 +1,13 @@
 # Release runbook
 
-keeper ships a Developer-ID-signed, hardened-runtime, Apple-notarized Apple Silicon
-(`aarch64-apple-darwin`) `.dmg`. Releases are produced by the tag-triggered
-`.github/workflows/release.yml` workflow, which uses
-[`tauri-apps/tauri-action`](https://github.com/tauri-apps/tauri-action). All signing and
-notarization material lives in GitHub Actions secrets — never in the repository.
+keeper's current macOS release path builds an Apple-Silicon (`aarch64-apple-darwin`)
+app and dmg on hesperia with an identity-based Apple Development signature. It is
+**not Developer-ID-signed or notarized**: this project does not have the paid Apple
+Developer Program credentials (D-1). `scripts/release-macos.sh` signs the updater
+payload separately and uploads the app artifacts. The tag-triggered
+`.github/workflows/release.yml` still attempts the Developer ID/notarized path,
+but its credential gate fails here; its independent `keeper-agentd` jobs build,
+sign, and attach both Linux targets to the tag's draft release.
 
 > **Apple Silicon only.** The pipeline builds `aarch64-apple-darwin`; Intel (`x86_64`) and
 > universal binaries are intentionally out of scope (macOS-first). Intel Macs are unsupported —
@@ -14,12 +17,10 @@ notarization material lives in GitHub Actions secrets — never in the repositor
 
 Configure these under **Settings → Secrets and variables → Actions**.
 
-**All of them are required.** The release job's second step names every missing Apple secret
-and fails in seconds; it does not fall back to an unsigned build. That fallback existed until
-2026-07-29 and is why v0.4.0–v0.4.2 published Gatekeeper-rejected artifacts behind a green run
-(DW-113). An ad-hoc-signed build is also keychain-incompatible with a signed one — its identity
-is a cdhash that changes on every build — so shipping one costs the user their stored accounts
-on the next update.
+**These secrets are required for the CI Developer ID/notarized path, not for the
+current hesperia release path.** The release job names every missing Apple secret
+and fails instead of publishing an unsigned build. An ad-hoc signature is also
+keychain-incompatible with a signed one: its identity changes on every build.
 
 ### Developer ID signing
 
@@ -89,33 +90,31 @@ bunx tauri signer generate --ci -p "<password>" -w /tmp/keeper-updater.key
 — Terminal.app, not a bare ssh shell. Two steps read the login keychain and a non-GUI session
 cannot: `codesign` fails with `errSecInternalComponent`, and `gh`, whose token lives in the keyring,
 fails with `401 Unauthorized`. The script builds signed via `build-macos-signed.sh`, packs the
-`.app` as the updater payload, signs it with the key from 1Password, composes `latest.json`, uploads
-all four assets to the release, and then fetches `releases/latest/download/latest.json` to prove the
-app can see it.
+`.app` as the updater payload, signs it with the key from 1Password, composes `latest.json` and
+uploads all four assets. Its final fetch checks that `/releases/latest/` still answers; while the
+new release is a draft this is the **previous** version, not proof the new update is live.
 
-**Driving it from the Linux box.** The keychain rule is about the *session*, not the machine, so an
-ssh command that lands inside the GUI session works — which is how v0.6.5 was published:
+**Driving it from the Linux box.** First merge the four-file version bump and tag
+that exact main commit. The Mac build reads the login keychain, so dispatch it into
+Terminal.app rather than a bare ssh shell. Stamp the merged checkout before syncing
+to an isolated Mac build directory (do not publish a build stamped `-dirty`):
 
 ```sh
-rsync -az --delete --exclude .git --exclude node_modules/ --exclude target/ ./ hesperia:keeper-check/
-ssh hesperia 'osascript -e '"'"'tell application "Terminal" to do script "cd ~/keeper-check && scripts/release-macos.sh v0.6.5 2>&1 | tee /tmp/release.log"'"'"''
-ssh hesperia 'tail -f /tmp/release.log'   # ~11 minutes: sidecar, vite, cargo release, sign, upload
+source scripts/lib/build-sha.sh && keeper_stamp_build_sha "$PWD"
+rsync -az --exclude .git --exclude node_modules/ --exclude target/ --exclude dist/ \
+  --exclude 'src-tauri/crates/keeper/binaries/' ./ hesperia:keeper-release/
+ssh hesperia "osascript -e 'tell application \"Terminal\" to do script \"cd ~/keeper-release && scripts/release-macos.sh v0.10.4 2>&1 | tee /tmp/keeper-release-0.10.4.log\"'"
+ssh hesperia 'tail -f /tmp/keeper-release-0.10.4.log'
 ```
 
-The script passes `--repo` explicitly because that synced copy has no `.git`, and `gh` without a
-repository to infer reports "release not found" rather than saying it cannot tell.
-
-**State as of 2026-08-05.** `v0.6.5` carries the dmg, `keeper_0.6.5_aarch64.app.tar.gz`, its `.sig`
-and `latest.json`; the endpoint returns 200 and names `0.6.5`. The channel is closed for good only
-once every install runs a build carrying the rotated pubkey `F73E48FF43358CDF` — `hesperia`'s
-`/Applications/keeper.app` does; anything installed before this release does not, and will fail
-signature verification instead of the old fetch error until it is replaced from the dmg by hand.
-
-CI would do this instead if it could: `tauri-action` reads the two secrets above and, with
-`bundle.createUpdaterArtifacts: true`, produces the artifacts itself. It cannot, because the
-workflow's Apple-signing gate demands three notarization secrets from a paid Developer Program this
-project does not have (decision D-1). `--no-bundle` builds (CI's `check`) skip updater artifacts, so
-they stay green without any key.
+Use a **draft** release while building: `agentd-release` creates one after the
+tag push if none exists; the Mac script uploads into it. A release published
+before its `latest.json` is attached can temporarily break the updater endpoint.
+The script names the repository explicitly because the synced copy has no `.git`.
+For the historical key rotation and manually reinstalled copies, see the
+v0.6.5 release history. CI could produce updater artifacts itself if it had
+the Apple signing and notarization material; its failed app job does not
+prevent the independent agentd builds.
 
 ## How the workflow maps secrets to Tauri env
 
@@ -199,25 +198,29 @@ build; a value that is not a sha is ignored with a warning rather than believed.
 
 ## How to cut a release
 
-1. Ensure `main` is green (CI passes, including the license firewall).
-2. Bump the version if needed in `src-tauri/crates/keeper/tauri.conf.json` and `package.json`.
-3. Create and push a `v*` tag:
-
-   ```sh
-   git tag v0.1.0
-   git push origin v0.1.0
-   ```
-
-4. The `Release` workflow triggers on the tag, builds on `macos-latest`, signs and
-   notarizes the `aarch64-apple-darwin` `.dmg`, then checks the uncompressed
-   `.app` contents and frontend assets **before** creating/uploading the draft.
-   Companion syncd uploads require this job to succeed and each packaged daemon
-   to pass its own credential check.
-5. Review the draft, all release jobs, egress diff, artifact inventory and the
-   [credential gates](#observability-and-credential-release-gates), then **publish it**.
-   A failed gate is a publication blocker for the maintainer. Workflow ordering
-   blocks its automated uploads; it cannot stop an owner manually publishing
-   an existing draft or uploading assets through another path.
+1. Ensure the merged `main` commit passed CI. For v0.10.4 the release tree is
+   that commit, not a developer branch with additional unmerged commits.
+2. Bump `package.json`, the workspace version in `src-tauri/Cargo.toml`, and
+   `src-tauri/crates/keeper/tauri.conf.json` to the same version; regenerate
+   `src-tauri/Cargo.lock` with `cargo update -w --offline`. Merge the version
+   bump through its own PR and wait for its CI. Do not tag a tree whose manifest
+   still names the preceding version.
+3. Push an annotated `v0.10.4` tag at the merged bump commit. The tag starts
+   `Release`: the macOS CI job fails its missing-notarization-material gate
+   (D-1), while `agentd-release` finds or makes a **draft** and both signed
+   `keeper-agentd` Linux builds attach their binaries, checksums, and signatures.
+   The `keeper-syncd` jobs depend on the failed macOS CI job and do not attach
+   in this release path; do not claim they shipped with v0.10.4.
+4. Sync the same tree to hesperia (as above), build and upload the app through
+   `release-macos.sh v0.10.4` in its GUI session, and check the actual app,
+   updater archive, signature, dmg, and both agentd targets. Record the manual
+   macOS gate evidence; the failed CI job is not evidence of a notarized app.
+5. Review the egress diff, release notes, artifact inventory and the
+   [credential gates](#observability-and-credential-release-gates) before
+   publishing the draft. Publish only once `latest.json` exists, then fetch
+   the unauthenticated `/releases/latest/download/latest.json` endpoint and
+   verify that its version, URL and signing key ID match the built artifact.
+   A failed independent agentd gate or missing app asset blocks publication.
 
    > **Auto-updates require the release to be published, not left as a draft.** The
    > updater endpoint is `.../releases/latest/download/latest.json`, and GitHub's
@@ -250,17 +253,19 @@ the release checkout uses `fetch-depth: 0`.
 
 ## Release-time verification (requires the built artifacts)
 
-Run these on the downloaded, notarized artifacts to confirm signing and stapling:
+For the current Mac-built release, verify the **downloaded** app's designated
+requirement is identity-based and stable across rebuilds, not a cdhash-only
+ad-hoc signature; inspect the updater tarball without macOS tar's AppleDouble
+filtering, scan the extracted app for credentials, and match the manifest's
+signature key ID against `plugins.updater.pubkey`. Do not describe this build
+as Developer-ID-signed or notarized; `spctl` and stapler checks below apply
+only if a future CI release actually has Developer ID and notarization:
 
 ```sh
-# Developer ID authority + hardened runtime flag on the app bundle.
 codesign -dv --verbose=4 keeper.app
-# Expect an "Authority=Developer ID Application: …" line and "flags=…(runtime)".
-
-# Gatekeeper accepts the notarized dmg.
+codesign -dr - keeper.app
+# Future notarized path only:
 spctl -a -t open --context context:primary-signature keeper.dmg
-
-# The notarization ticket is stapled to the app.
 xcrun stapler validate keeper.app
 ```
 
@@ -293,6 +298,7 @@ build was inert.
 | CI `build`: synthetic management-env canary | `POSTHOG_PERSONAL_API_KEY=KEEPER_PRIVILEGED_KEY_MUST_NOT_SHIP_71` is supplied only as a noncredential to the real app build; scanner requires absence from `dist`, the release `keeper` executable and staged `keeper-rec` |
 | Release app pre-upload gate | `scripts/posthog/release-build.mjs` is tauri-action's build runner. It runs Tauri, requires real executable `Contents/MacOS/keeper` and `keeper-rec`, scans `dist` and all regular files in the actual uncompressed `.app`, and returns failure before tauri-action can upload assets |
 | Release companion gate | Both Linux and macOS syncd jobs require app-job success, scan `src-tauri/keeper-syncd-$TARGET` after packaging, then attach it and its checksum to the existing draft; no fallback release creation |
+| Release agentd gate | Independent of the app job: `agentd-release` finds the tag's release or makes a draft; each Linux target scans `src-tauri/keeper-agentd-$TARGET`, verifies the systemd unit, signs with the updater key and checks the signature (and that a flipped byte fails) before attaching the binary, `.sha256` and `.sig` |
 | `posthog.yml` manual operations | Secret-free preflight verifies required `tgorka` reviewer and a single `main` branch policy before the protected personal-key job can start. Main-only trusted checkout and reviewed manifest hash required for apply/smoke. Not a PR status check; never runs with PR code |
 | Egress release note | Diff `docs/egress.md` against the preceding tag and review all changed destinations/consent boundaries |
 
@@ -315,10 +321,13 @@ the compile-only iOS job is not a shipped-bundle credential check.
 
 Before publishing:
 
-- [ ] App and **both** syncd targets passed their artifact gates; draft contains
-  the expected signed app/updater assets and daemon/checksum pairs.
-- [ ] Downloaded distribution contents were unpacked/mounted, scanned and
-  checked for signing, version and expected sidecar contents.
+- [ ] App dmg, updater archive, signature, and `latest.json` are uploaded and
+  verified from their **downloaded, unpacked** contents. The local build is
+  identity-signed but not notarized; record that distinction explicitly.
+- [ ] **Both** keeper-agentd targets passed and the release carries each
+  binary, `.sha256` and `.sig`; a draft's asset URL is not publicly usable.
+- [ ] `keeper-syncd` is **not** included when the CI macOS job fails; state
+  this in the release notes, rather than checking off absent daemon assets.
 - [ ] Review the egress diff and confirm fresh-install default-off, separate
   category behavior, revocation and synthetic-only replay using real requests
   on each platform/surface claimed for this release.

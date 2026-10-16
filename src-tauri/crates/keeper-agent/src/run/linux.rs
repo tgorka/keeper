@@ -58,6 +58,15 @@
 //! library falls back to `clone`. The x32 numbers of each are refused too.
 //! The cost of the metadata rule: a program cannot set a mode or a time
 //! even inside `workspace/` (`chmod +x`, `tar x`, `cp -p`).
+//!
+//! **Full access** (story 101.5, R440 05): the console's `full` mode starts
+//! through the trampoline too — descriptors closed, the program checked and
+//! started by its handle as above — with no landlock and, of the filter,
+//! only [`LIFETIME`] (`setsid`, `setpgid`): the program reaches what the
+//! host's user can, but no process of it leaves the group keeper kills when
+//! the run ends or its time is up. A daemon the program asks to start
+//! something (`systemd-run`, `at`) starts a process of its own, not the
+//! run's — as anything the host's user runs can.
 
 use std::collections::BTreeMap;
 use std::ffi::CString;
@@ -90,6 +99,9 @@ pub const REQUIRED_ABI: ABI = ABI::V6;
 const SYS_SETXATTRAT: libc::c_long = 463;
 const SYS_REMOVEXATTRAT: libc::c_long = 466;
 
+/// `fchmodat2` is 452 on both Linux targets; libc exposes it only on x86_64.
+const SYS_FCHMODAT2: libc::c_long = 452;
+
 /// The `CLONE_NEW*` flags: a `clone` holding any makes a namespace.
 const CLONE_NAMESPACES: [u64; 8] = [
     libc::CLONE_NEWNS as u64,
@@ -104,7 +116,7 @@ const CLONE_NAMESPACES: [u64; 8] = [
 
 /// Every call refused with `EPERM` in every run, whatever its arguments.
 pub fn refused() -> Vec<libc::c_long> {
-    let mut calls = vec![
+    let calls = vec![
         // Into another process.
         libc::SYS_ptrace,
         libc::SYS_process_vm_readv,
@@ -148,7 +160,7 @@ pub fn refused() -> Vec<libc::c_long> {
         // Metadata, which landlock does not mediate.
         libc::SYS_fchmod,
         libc::SYS_fchmodat,
-        libc::SYS_fchmodat2,
+        SYS_FCHMODAT2,
         libc::SYS_fchown,
         libc::SYS_fchownat,
         libc::SYS_setxattr,
@@ -162,6 +174,8 @@ pub fn refused() -> Vec<libc::c_long> {
         libc::SYS_utimensat,
     ];
     // The older spellings x86_64 still has.
+    #[cfg(target_arch = "x86_64")]
+    let mut calls = calls;
     #[cfg(target_arch = "x86_64")]
     calls.extend([
         libc::SYS_chmod,
@@ -233,9 +247,20 @@ pub fn trampoline(plan_path: &Path) -> ExitCode {
         let link = CString::new(link.into_os_string().into_vec())
             .map_err(|_| "its folder holds a NUL byte".to_owned())?;
         let reserved = reserve(plan_path, &mut plan)?;
-        let (abi, cwd) = restrict(&plan)?;
+        // The console's full mode (story 101.5, R440 05): no landlock, and
+        // of the filter only what keeps every process of the run in the
+        // group keeper kills — `setsid` and `setpgid` refused.
+        let (abi, cwd) = if plan.unsandboxed {
+            (0, checked_dir(&plan.cwd, plan.expect.cwd_id, "its folder")?)
+        } else {
+            restrict(&plan)?
+        };
         let mut behind = hand(&plan, reserved)?;
-        apply_filter(plan.network)?;
+        if plan.unsandboxed {
+            apply_lifetime_filter()?;
+        } else {
+            apply_filter(plan.network)?;
+        }
         super::verify_program(&plan, &mut program, &mut behind)?;
         Ok((plan, abi, cwd, program, link, behind))
     });
@@ -467,18 +492,27 @@ fn restrict(plan: &SandboxPlan) -> Result<(i32, OwnedFd), String> {
     let mut created = ruleset.create().map_err(failed)?;
     let mut workspace = Some(workspace);
     for (path, access) in &plan.grants {
-        let rule = match workspace.take_if(|_| *path == plan.expect.workspace) {
-            Some(fd) => PathBeneath::new(fd, rights(path, access)),
+        // `workspace/` and each console folder (R440 01) are the folders
+        // keeper checked, opened without following a link and by identity:
+        // the rule is that folder's, never whatever is at its path now.
+        let held = match workspace.take_if(|_| *path == plan.expect.workspace) {
+            Some(fd) => Some(fd),
+            None => plan
+                .pinned
+                .iter()
+                .find(|(pinned, _)| pinned == path)
+                .map(|(_, id)| checked_dir(path, *id, &format!("the folder {}", path.display())))
+                .transpose()?,
+        };
+        created = match held {
+            Some(fd) => created.add_rule(PathBeneath::new(fd, rights(path, access))),
             None => {
                 let fd = PathFd::new(path)
                     .map_err(|error| format!("{} could not be opened: {error}", path.display()))?;
-                created = created
-                    .add_rule(PathBeneath::new(fd, rights(path, access)))
-                    .map_err(failed)?;
-                continue;
+                created.add_rule(PathBeneath::new(fd, rights(path, access)))
             }
-        };
-        created = created.add_rule(rule).map_err(failed)?;
+        }
+        .map_err(failed)?;
     }
     let status: RestrictionStatus = created.restrict_self().map_err(failed)?;
     if status.ruleset != RulesetStatus::FullyEnforced || !status.no_new_privs {
@@ -576,6 +610,38 @@ fn apply_filter(network: bool) -> Result<(), String> {
         seccompiler::apply_filter(&program).map_err(|error| format!("seccomp: {error}"))?;
     }
     Ok(())
+}
+
+/// The calls a full-access run may not make (story 101.5, R440 05): those
+/// that leave the process group keeper kills whole when the run ends.
+pub const LIFETIME: [libc::c_long; 2] = [libc::SYS_setsid, libc::SYS_setpgid];
+
+/// The filter a full-access run gets: only [`LIFETIME`] refused with
+/// `EPERM`, their x32 numbers too — no other rule of the sandbox.
+pub fn lifetime_filter() -> Result<BpfProgram, String> {
+    let failed = |error: seccompiler::BackendError| format!("seccomp: {error}");
+    let arch = TargetArch::try_from(std::env::consts::ARCH)
+        .map_err(|error| format!("seccomp: {error}"))?;
+    let mut rules: BTreeMap<i64, Vec<SeccompRule>> =
+        LIFETIME.iter().map(|call| (*call, Vec::new())).collect();
+    if arch == TargetArch::x86_64 {
+        const X32: i64 = 0x4000_0000;
+        for call in LIFETIME {
+            rules.insert(call | X32, Vec::new());
+        }
+    }
+    SeccompFilter::new(
+        rules,
+        SeccompAction::Allow,
+        SeccompAction::Errno(libc::EPERM as u32),
+        arch,
+    )
+    .and_then(BpfProgram::try_from)
+    .map_err(failed)
+}
+
+fn apply_lifetime_filter() -> Result<(), String> {
+    seccompiler::apply_filter(&lifetime_filter()?).map_err(|error| format!("seccomp: {error}"))
 }
 
 #[cfg(test)]
@@ -752,7 +818,7 @@ mod tests {
         ("setpgid", libc::SYS_setpgid),
         ("fchmod", libc::SYS_fchmod),
         ("fchmodat", libc::SYS_fchmodat),
-        ("fchmodat2", libc::SYS_fchmodat2),
+        ("fchmodat2", 452),
         ("fchown", libc::SYS_fchown),
         ("fchownat", libc::SYS_fchownat),
         ("setxattr", libc::SYS_setxattr),
@@ -765,6 +831,37 @@ mod tests {
         ("removexattrat", 466),
         ("utimensat", libc::SYS_utimensat),
     ];
+
+    /// R440 05: a full-access run's filter refuses leaving the process
+    /// group — `setsid`, `setpgid`, on x86_64 their x32 numbers too — and
+    /// nothing else of the sandbox's: every other call it lets through.
+    #[test]
+    fn the_full_access_filter_keeps_the_group_and_nothing_else() {
+        let eperm = ERRNO | libc::EPERM as u32;
+        let program = lifetime_filter().expect("the filter");
+        for (name, call) in REQUIRED {
+            let expected = if matches!(*name, "setsid" | "setpgid") {
+                eperm
+            } else {
+                ALLOW
+            };
+            assert_eq!(
+                verdict(&program, native(), *call, [0; 6]),
+                expected,
+                "{name}"
+            );
+            if cfg!(target_arch = "x86_64") && expected == eperm {
+                assert_eq!(
+                    verdict(&program, native(), *call | 0x4000_0000, [0; 6]),
+                    eperm,
+                    "x32 {name}"
+                );
+            }
+        }
+        for call in [libc::SYS_socket, libc::SYS_clone, libc::SYS_clone3] {
+            assert_eq!(verdict(&program, native(), call, [0; 6]), ALLOW, "{call}");
+        }
+    }
 
     /// R147, R213, R96R-22, R96R2-12: the generated filters themselves,
     /// call by call, against [`REQUIRED`] — a list of its own, so a rule
