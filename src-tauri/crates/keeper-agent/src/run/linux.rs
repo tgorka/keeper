@@ -99,6 +99,9 @@ pub const REQUIRED_ABI: ABI = ABI::V6;
 const SYS_SETXATTRAT: libc::c_long = 463;
 const SYS_REMOVEXATTRAT: libc::c_long = 466;
 
+/// `fchmodat2` is 452 on both Linux targets; libc exposes it only on x86_64.
+const SYS_FCHMODAT2: libc::c_long = 452;
+
 /// The `CLONE_NEW*` flags: a `clone` holding any makes a namespace.
 const CLONE_NAMESPACES: [u64; 8] = [
     libc::CLONE_NEWNS as u64,
@@ -113,7 +116,7 @@ const CLONE_NAMESPACES: [u64; 8] = [
 
 /// Every call refused with `EPERM` in every run, whatever its arguments.
 pub fn refused() -> Vec<libc::c_long> {
-    let mut calls = vec![
+    let calls = vec![
         // Into another process.
         libc::SYS_ptrace,
         libc::SYS_process_vm_readv,
@@ -157,7 +160,7 @@ pub fn refused() -> Vec<libc::c_long> {
         // Metadata, which landlock does not mediate.
         libc::SYS_fchmod,
         libc::SYS_fchmodat,
-        libc::SYS_fchmodat2,
+        SYS_FCHMODAT2,
         libc::SYS_fchown,
         libc::SYS_fchownat,
         libc::SYS_setxattr,
@@ -171,6 +174,8 @@ pub fn refused() -> Vec<libc::c_long> {
         libc::SYS_utimensat,
     ];
     // The older spellings x86_64 still has.
+    #[cfg(target_arch = "x86_64")]
+    let mut calls = calls;
     #[cfg(target_arch = "x86_64")]
     calls.extend([
         libc::SYS_chmod,
@@ -813,7 +818,7 @@ mod tests {
         ("setpgid", libc::SYS_setpgid),
         ("fchmod", libc::SYS_fchmod),
         ("fchmodat", libc::SYS_fchmodat),
-        ("fchmodat2", libc::SYS_fchmodat2),
+        ("fchmodat2", 452),
         ("fchown", libc::SYS_fchown),
         ("fchownat", libc::SYS_fchownat),
         ("setxattr", libc::SYS_setxattr),
