@@ -11117,6 +11117,13 @@ location: `keeper_core::account::run_inbox_producer`, `asks_answered_in`, `agent
 reason: each proxy row's reading scans the joined rooms and reads the other session rooms serially inside the single inbox producer (five seconds per room's pagination at most), so slow history reads delay ordinary inbox updates and expiry wake-ups; nothing reuses one reading across a batch. Fix: a coalesced, subscription-owned worker publishing changed rows, keeping *Unknown* on incomplete reads.
 status: open
 
+### DW-1500: No tag's release has carried keeper-agentd since v0.10.0.
+
+origin: lane `electra` (story 101.7, R423/R424), 2026-10-15; recorded and closed by lane `101stack`
+location: `.github/workflows/release.yml` jobs `release` and `agentd`
+reason: `agentd` ran only when `needs.release.result == 'success'`, and the macOS `release` job fails on every tag in CI ("Apple signing material must be present", D-1) — the app is released from hesperia by `scripts/release-macos.sh` — so `keeper-agentd-x86_64-unknown-linux-gnu{,.sha256,.sig}` was never attached and makistack's `keeper_agentd` role had no asset to pin.
+status: closed (lane `101stack`, release rung, 2026-10-16: `agentd` needs only the new `agentd-release` job, which finds the tag's release or makes it as a draft; each target keeps its credential scan, unit check and signature check and uploads with `--clobber`; docs/release.md says so)
+
 ### DW-1501: A web search or console save is not checked against older hosts that would refuse its keys.
 
 origin: lane `101stack` (merging 101.4 and 101.5 with 101.6's older-host check in one writer), 2026-10-16

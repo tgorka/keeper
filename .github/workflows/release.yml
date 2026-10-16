@@ -334,14 +334,45 @@ jobs:
   # signature made with the app's updater key (S-30): agentd holds every
   # agent's Matrix session and the drives' write tokens, so a download is
   # checked against keeper's public key before it is installed
-  # (docs/agents.md § keeper-agentd gives the command). On a tag it waits for
-  # the app's gate and uploads to its draft; on `workflow_dispatch` it is a
-  # dry run whose artifacts stay on the workflow run.
+  # (docs/agents.md § keeper-agentd gives the command). On a tag it uploads
+  # to the tag's release, which `agentd-release` finds or makes; on
+  # `workflow_dispatch` it is a dry run whose artifacts stay on the workflow
+  # run.
+  #
+  # It does not wait for the macOS job. That job fails on every tag here —
+  # this repository holds no Apple notarization material (D-1) — and the app
+  # is released from the Mac by scripts/release-macos.sh, so waiting for it
+  # withheld keeper-agentd from every tag since v0.10.0, and makistack's
+  # keeper_agentd role had no asset to install (DW-1500). keeper-agentd's own
+  # gates — its credential scan, its unit check and its signature, checked
+  # against keeper's public key and against a flipped byte — stay.
   # -------------------------------------------------------------------------
+  agentd-release:
+    name: keeper-agentd's release
+    if: ${{ github.event_name == 'push' }}
+    runs-on: ubuntu-latest
+    steps:
+      # The tag's release, found or made as a draft, once, before the two
+      # targets upload: the Mac's release script uploads into the same one,
+      # and only a person publishes it.
+      - name: Find or make the tag's release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          REF: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if gh release view "$REF" --json tagName >/dev/null 2>&1; then
+            echo "release $REF exists"
+          else
+            gh release create "$REF" --draft --verify-tag --title "keeper $REF" --notes "keeper $REF"
+            echo "made a draft release for $REF"
+          fi
+
   agentd:
     name: keeper-agentd (${{ matrix.target }})
-    needs: release
-    if: ${{ always() && (needs.release.result == 'success' || github.event_name == 'workflow_dispatch') }}
+    needs: agentd-release
+    if: ${{ always() && (needs.agentd-release.result == 'success' || github.event_name == 'workflow_dispatch') }}
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -453,10 +484,8 @@ jobs:
           REF: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          test "$(gh release view "$REF" --json isDraft --jq '.isDraft')" = true || {
-            echo "::error::companion assets require the existing human-reviewed draft"
-            exit 1
-          }
+          # The release `agentd-release` found or made, draft or published;
+          # --clobber so a re-run replaces the three assets.
           gh release upload "$REF" \
             "keeper-agentd-$TARGET" "keeper-agentd-$TARGET.sha256" "keeper-agentd-$TARGET.sig" \
             --clobber

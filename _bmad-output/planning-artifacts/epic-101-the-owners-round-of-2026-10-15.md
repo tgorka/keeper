@@ -248,5 +248,9 @@ Stack fix 1 (lane `101stack`, 2026-10-16; R460, DW-1501 closed):
 2. keeper's release workflow publishes the keeper-agentd asset where the role can fetch it (verify against the v0.10.3 release, which lists no agentd asset).
 3. Runbook: how to deploy, verify (`keeper-agentd agents list`), roll back.
 
+#### As built — the release rung (lane `101stack`, 2026-10-16; 101.7 #2, DW-1500)
+- `.github/workflows/release.yml`: `agentd` no longer waits for the macOS job; `agentd-release` finds the tag's release or makes a draft, and each Linux target attaches `keeper-agentd-<target>{,.sha256,.sig}` after its credential scan, systemd-unit check and signature check. `docs/release.md` § *How to cut a release* and the gate table say so. Checked by `actionlint` and `yamllint`; the first tag that runs it is owed.
+- The version is not bumped here. The Settings row *Renew claims every 15 minutes* interpolates the app's version (R101R3-02), so the release that ships epic 101 must be ≥ 0.10.4.
+
 ## Owed on devices
 hesperia: launch into Nixi's DM; notes Assistant; "Nixi — test"; photo from the Mac camera; autocapitalisation off; undo 2 s / 0 s. electra: deploy the role, delegation Nixi → Tola, web search. kalypso: camera, autocapitalisation.
