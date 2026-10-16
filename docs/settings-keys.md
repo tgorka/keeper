@@ -74,6 +74,8 @@ file-controlled instead, and says which file.
 | | | | | The word that ends a spoken answer, as typed; matched case- and diacritic-insensitively while the answer is read aloud. |
 | `debug.mode` | user-global | boolean (`1`/`0`) | `0` | `"debug.mode" = true` |
 | | | | | On-disk event and error logging. Read before anything else at boot, so a file can turn it on for the boot that goes wrong. |
+| `diagnostics.log_upload` | user-global | boolean (`1`/`0`) | `1` | `"diagnostics.log_upload" = false` |
+| | | | | Whether keeper publishes the tail of this device's keeper.log to your directory of the organisation account's config repository once a day, as `<login>/logs/<device>.log`. Send log now in Settings › About sends it at once either way. |
 | `incognito.global` | user-global | boolean (`1`/`0`) | `0` | `"incognito.global" = true` |
 | | | | | Suppress read receipts and typing notifications everywhere. |
 | `notes.service_file_names` | user-global | JSON | `["index.md","agents.md","claude.md","log.md"]` | `"notes.service_file_names" = '["index.md","agents.md","claude.md","log.md"]'` |

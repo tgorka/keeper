@@ -556,6 +556,17 @@ pub const KEYS: &[KeySpec] = &[
         summary: "On-disk event and error logging. Read before anything else at boot, so a file can turn it on for the boot that goes wrong.",
         example: "true",
     },
+    // ---- diagnostics -----------------------------------------------------
+    KeySpec {
+        key: "diagnostics.log_upload",
+        family: false,
+        scope: Scope::UserGlobal,
+        settable: Settable::AnyLayer,
+        shape: Shape::Flag01,
+        default: "1",
+        summary: "Whether keeper publishes the tail of this device's keeper.log to your directory of the organisation account's config repository once a day, as `<login>/logs/<device>.log`. Send log now in Settings › About sends it at once either way.",
+        example: "false",
+    },
     // ---- hotkeys ---------------------------------------------------------
     KeySpec {
         key: "hotkey.global",

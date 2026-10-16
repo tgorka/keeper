@@ -145,6 +145,7 @@ import type {
   IpcError,
   LabelVm,
   LaunchRoomVm,
+  LogUploadVm,
   NetworksSnapshot,
   NoteBodyBatch,
   NoteIntentVm,
@@ -4996,6 +4997,12 @@ let autoUpdate: AutoUpdateVm = {
   restartCheckIntervalMs: 60_000,
 };
 
+/**
+ * `diagnostics.log_upload`, on for an install that never answered. Round-trips
+ * for the same reason `autoUpdate` does: the switch applies the echo.
+ */
+let logUpload = true;
+
 // A browser has no filesystem. These are explicitly fixture files, dated on
 // either side of a day boundary so the date controls can be exercised honestly.
 const COPY_FIXTURES = [
@@ -9041,6 +9048,11 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
     autoUpdate = { ...autoUpdate, enabled: payload.enabled === true };
     return autoUpdate;
   },
+  log_upload_get: () => logUpload,
+  log_upload_set: (payload) => {
+    logUpload = payload.enabled === true;
+    return logUpload;
+  },
   // Browser development never contacts PostHog or exposes a real project token.
   telemetry_status: () => ({
     consent: { diagnostics: false, productAnalytics: false, remoteConfig: false },
@@ -10696,6 +10708,23 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
       device: renamed,
       devices: accountVm.devices.map((device) => (device.thisDevice ? renamed : device)),
     });
+  },
+  // In `keeper_core::org_account::log_upload::LogUploadVm`'s words: a signed-in,
+  // registered device sends; anything else is told to sign in. The switch is not
+  // consulted — the button works either way.
+  account_send_log: (): LogUploadVm => {
+    const device = accountVm.device;
+    if (accountVm.identity === null || device === null) {
+      return {
+        outcome: "signedOut",
+        sentence:
+          "No log was sent: this device is not signed in to an organisation account. Sign in under Settings › Account, then send it again.",
+      };
+    }
+    return {
+      outcome: "sent",
+      sentence: `Sent. This device's log is in the settings repository at ${accountVm.identity.login}/logs/${device.slug}.log.`,
+    };
   },
   account_share: (): AccountShareVm => {
     const link =

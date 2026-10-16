@@ -57,6 +57,7 @@ export function validateManifest(m) {
     "keeper_settings_opened",
     "keeper_frontend_error",
     "keeper_interaction",
+    "keeper_recording_mic_lost",
   ];
   if (
     !Array.isArray(m.events) ||

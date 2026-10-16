@@ -16,6 +16,7 @@ pub mod claims;
 pub mod descriptor;
 pub mod device_state;
 pub mod layout;
+pub mod log_upload;
 pub mod manifest;
 pub mod settings_sync;
 pub mod setup_qr;

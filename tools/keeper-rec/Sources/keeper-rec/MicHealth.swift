@@ -24,8 +24,14 @@ import Foundation
 /// only ever yields a warning + silence-fill + optional fallback — never an
 /// `error` event or a process exit.
 enum MicHealth {
-    /// The stable wire code for a mic-loss warning (`{"event":"warning",...}`).
+    /// The stable wire code for a mic-loss warning (`{"event":"warning",...}`):
+    /// a device removal signal.
     static let warningCode = "micLost"
+
+    /// The wire code for a microphone that stopped delivering without any
+    /// removal signal (the watchdog's finding). Its own code so the host can
+    /// count the two apart without reading the sentence.
+    static let stalledCode = "micStalled"
 
     /// The honest warning message when a system default input exists — the
     /// engine falls back to it (the mic track keeps recording from the
@@ -45,7 +51,8 @@ enum MicHealth {
     static let stalledMessage = "microphone stopped sending sound — using system default input"
 
     /// What made the engine suspect the microphone, which only changes the
-    /// sentence: every cause takes the same warn + silence-fill + fallback path.
+    /// code and the sentence: every cause takes the same warn + silence-fill +
+    /// fallback path.
     enum Cause: Equatable {
         /// A device removal signal (disconnect, runtime error, simulation).
         case removed
@@ -139,7 +146,7 @@ enum MicHealth {
         let recovering = cause == .stalled ? stalledMessage : fallbackMessage
         return Decision(
             shouldWarn: true,
-            code: warningCode,
+            code: cause == .stalled ? stalledCode : warningCode,
             message: fallbackAvailable ? recovering : noInputMessage,
             fallbackToDefault: fallbackAvailable)
     }
