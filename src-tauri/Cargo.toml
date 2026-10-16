@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/keeper-core", "crates/keeper", "crates/keeper-sync", "crates/keeper-syncd", "crates/keeper-ported", "crates/keeper-agent", "crates/keeper-agentd", "crates/keeper-nse"]
 
 [workspace.package]
-version = "0.10.3"
+version = "0.10.4"
 authors = ["Tomasz Gorka"]
 license = "Apache-2.0"
 repository = "https://github.com/tgorka/keeper"
