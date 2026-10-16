@@ -465,7 +465,7 @@ const AVATAR_DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 
 /// Why a bounded download brought nothing.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Download {
+pub enum Download {
     /// The body is larger than the bound: the size it declared, or as much
     /// as was read when it ran past it.
     TooLarge(u64),
@@ -473,10 +473,40 @@ enum Download {
     Failed(String),
 }
 
+impl std::fmt::Display for Download {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Download::TooLarge(bytes) => write!(f, "larger than the bound ({bytes} bytes or more)"),
+            Download::Failed(why) => f.write_str(why),
+        }
+    }
+}
+
 /// The original of the plain media `mxc`, through the homeserver's
 /// authenticated media endpoint where it has one (else the legacy one), as
 /// the SDK chooses — read at most [`crate::agents::avatar::MAX_BYTES`].
 async fn download_avatar(client: &Client, mxc: &MxcUri) -> Result<Vec<u8>, Download> {
+    let (url, authorization) = content_request(client, mxc).await?;
+    let http = reqwest::Client::builder()
+        .timeout(AVATAR_DOWNLOAD_TIMEOUT)
+        .build()
+        .map_err(|_| Download::Failed("no HTTP client could be made".to_owned()))?;
+    download(
+        &http,
+        &url,
+        authorization.as_deref(),
+        crate::agents::avatar::MAX_BYTES,
+    )
+    .await
+}
+
+/// The URL of `mxc`'s original and the `Authorization` it is fetched with:
+/// the homeserver's authenticated media endpoint where it has one, else
+/// the legacy one, as the SDK chooses — the URL and token never logged.
+async fn content_request(
+    client: &Client,
+    mxc: &MxcUri,
+) -> Result<(String, Option<String>), Download> {
     use matrix_sdk::ruma::api::auth_scheme::SendAccessToken;
     use matrix_sdk::ruma::api::client::authenticated_media::get_content::v1 as authenticated;
     use matrix_sdk::ruma::api::{Metadata, OutgoingRequest};
@@ -489,7 +519,7 @@ async fn download_avatar(client: &Client, mxc: &MxcUri) -> Result<Vec<u8>, Downl
     let homeserver = client.homeserver();
     let request = if authenticated::Request::PATH_BUILDER.is_supported(&versions) {
         authenticated::Request::from_uri(mxc)
-            .map_err(|_| failed("the avatar's address does not read"))?
+            .map_err(|_| failed("the media's address does not read"))?
             .try_into_http_request::<Vec<u8>>(
                 homeserver.as_str(),
                 SendAccessToken::IfRequired(&token),
@@ -498,30 +528,77 @@ async fn download_avatar(client: &Client, mxc: &MxcUri) -> Result<Vec<u8>, Downl
     } else {
         #[allow(deprecated)]
         let legacy = matrix_sdk::ruma::api::client::media::get_content::v3::Request::from_url(mxc)
-            .map_err(|_| failed("the avatar's address does not read"))?;
+            .map_err(|_| failed("the media's address does not read"))?;
         legacy.try_into_http_request::<Vec<u8>>(
             homeserver.as_str(),
             SendAccessToken::IfRequired(&token),
             std::borrow::Cow::Borrowed(&versions),
         )
     }
-    .map_err(|_| failed("the avatar's request could not be made"))?;
+    .map_err(|_| failed("the media's request could not be made"))?;
     let authorization = request
         .headers()
         .get("authorization")
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
+    Ok((request.uri().to_string(), authorization))
+}
+
+/// The bytes of the file a person's message names (story 101.2, R444/01):
+/// `source` is an encrypted file's object (a message's `file`) or a plain
+/// `mxc://` URI string (its `url`). The body is read at most `max` bytes —
+/// refused at the first byte past it, before any whole body is held or
+/// decrypted — through the homeserver's authenticated media endpoint as the
+/// SDK routes it; an encrypted file's ciphertext (as long as its plaintext:
+/// AES-CTR) is then decrypted by the SDK's own `AttachmentDecryptor`, whose
+/// SHA-256 check refuses a file that is not the one sent. No total timeout
+/// here: the caller bounds the whole download and drops it when its turn
+/// stops.
+pub async fn download_file(
+    client: &Client,
+    source: &serde_json::Value,
+    max: u64,
+) -> Result<Vec<u8>, Download> {
+    let encrypted: Option<matrix_sdk::ruma::events::room::EncryptedFile> = match source.as_str() {
+        Some(_) => None,
+        None => Some(
+            serde_json::from_value(source.clone())
+                .map_err(|_| Download::Failed("the message's file does not read".to_owned()))?,
+        ),
+    };
+    let mxc: OwnedMxcUri = match (&encrypted, source.as_str()) {
+        (Some(file), _) => file.url.clone(),
+        (None, Some(uri)) => uri.into(),
+        (None, None) => return Err(Download::Failed("the message names no file".to_owned())),
+    };
+    let (url, authorization) = content_request(client, &mxc).await?;
     let http = reqwest::Client::builder()
-        .timeout(AVATAR_DOWNLOAD_TIMEOUT)
+        .connect_timeout(std::time::Duration::from_secs(30))
         .build()
-        .map_err(|_| failed("no HTTP client could be made"))?;
-    download(
-        &http,
-        &request.uri().to_string(),
-        authorization.as_deref(),
-        crate::agents::avatar::MAX_BYTES,
-    )
-    .await
+        .map_err(|_| Download::Failed("no HTTP client could be made".to_owned()))?;
+    let body = download(&http, &url, authorization.as_deref(), max).await?;
+    match encrypted {
+        Some(file) => decrypted(body, file),
+        None => Ok(body),
+    }
+}
+
+/// `ciphertext` decrypted as `file` says, its SHA-256 checked: a file
+/// whose hash is not the message's is refused, never handed on.
+fn decrypted(
+    ciphertext: Vec<u8>,
+    file: matrix_sdk::ruma::events::room::EncryptedFile,
+) -> Result<Vec<u8>, Download> {
+    use std::io::Read as _;
+    let mut cursor = std::io::Cursor::new(ciphertext);
+    let capacity = cursor.get_ref().len();
+    let mut reader = matrix_sdk_crypto::AttachmentDecryptor::new(&mut cursor, file.into())
+        .map_err(|_| Download::Failed("the file's keys do not read".to_owned()))?;
+    let mut plaintext = Vec::with_capacity(capacity);
+    reader
+        .read_to_end(&mut plaintext)
+        .map_err(|_| Download::Failed("the file is not the one its message names".to_owned()))?;
+    Ok(plaintext)
 }
 
 /// GET `url` (with `authorization`, when there is one) and read its body,
@@ -616,6 +693,45 @@ mod tests {
         )
         .await
         .expect("the download ends without the rest of a declared body")
+    }
+
+    /// R444/01: a person's encrypted file is read through the bound — its
+    /// ciphertext refused at the first byte past it when no size, or a
+    /// smaller one, came with it, before anything is decrypted — then
+    /// decrypted and checked: bytes that are not the file its message names
+    /// are refused.
+    #[tokio::test]
+    async fn an_encrypted_file_is_read_through_the_bound_then_checked() {
+        use std::io::Read as _;
+        let plaintext = b"Quarterly total 4217".to_vec();
+        let mut source = std::io::Cursor::new(plaintext.clone());
+        let mut encryptor = matrix_sdk_crypto::AttachmentEncryptor::new(&mut source);
+        let mut ciphertext = Vec::new();
+        encryptor.read_to_end(&mut ciphertext).expect("encrypted");
+        let keys = encryptor.finish();
+        let file = || {
+            matrix_sdk::ruma::events::room::EncryptedFile::new(
+                OwnedMxcUri::from("mxc://example.org/1"),
+                keys.encryption_info.clone(),
+                keys.hashes.clone(),
+            )
+        };
+        let max = ciphertext.len() as u64;
+
+        let body = fetched(chunked(&[&ciphertext]), max)
+            .await
+            .expect("at the bound");
+        assert_eq!(decrypted(body, file()).expect("its own file"), plaintext);
+        assert_eq!(
+            fetched(chunked(&[&ciphertext]), max - 1).await,
+            Err(Download::TooLarge(max))
+        );
+        let mut tampered = ciphertext.clone();
+        tampered[0] ^= 1;
+        assert!(matches!(
+            decrypted(tampered, file()),
+            Err(Download::Failed(_))
+        ));
     }
 
     /// R399 #1: a profile avatar is read up to the bound and no further —

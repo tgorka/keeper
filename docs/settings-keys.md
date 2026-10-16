@@ -60,6 +60,8 @@ file-controlled instead, and says which file.
 | | | | | Whether the Favorites section of the room list starts collapsed. |
 | `agents.default` | user-global | Matrix user id (`@name:server`), or empty | *(absent)* | `"agents.default" = "@nixi:example.org"` |
 | | | | | The default agent: one agent's Matrix user id. At launch, an account with at least one agent room opens the Agents window, on this agent's main conversation when it has one on this account; otherwise nothing is selected and Settings › Agents says why. Blank means no default agent; with no agent rooms, keeper opens the Inbox as before (R383). |
+| `agents.claims_lease` | user-global | one of `short`, `quarter-hour` | `short` | `"agents.claims_lease" = "quarter-hour"` |
+| | | | | Which lease this Mac takes a session's claim on while it hosts your agents (R455). `short` renews it every minute. `quarter-hour` renews it every 15 minutes, so a quiet room is not filled with renewals, and is taken only while every live host in the control room says it reads it; turn it on only after every device and keeper-agentd that serves your agents runs a build that reads it (keeper-agentd's own is `[claims] lease` in `agentd.toml`). |
 | `bots.message_details` | user-global | boolean (`1`/`0`) | `0` | `"bots.message_details" = true` |
 | | | | | Whether an answer shows its metadata caption — model, tokens, timings, finish reason, request id. |
 | `bots.wake_phrase` | user-global | text | `nixie` | `"bots.wake_phrase" = "hej keeper"` |
@@ -122,8 +124,10 @@ file-controlled instead, and says which file.
 | | | | | The end-of-turn model voice loads, as a folder name under the hydrated `_models/`. Blank means the config repository's choice (`[smart_turn]` in `_models/models.toml`); every device that runs turn models fetches the folder named here, and one that is missing or incomplete on the device is refused, never replaced. |
 | `transcription.vad_model` | user-global | text | *(absent)* | `"transcription.vad_model" = "silero-vad"` |
 | | | | | The voice activity model voice loads, as a folder name under the hydrated `_models/`. Blank means the config repository's choice (`[vad]` in `_models/models.toml`); every device that runs turn models fetches the folder named here, and one that is missing or incomplete on the device is refused, never replaced. |
-| `undo_send.window` | user-global | integer 0..=60 | `10` | `"undo_send.window" = 10` |
-| | | | | How long a sent message is held before it dispatches, in seconds. |
+| `undo_send.agent_window` | user-global | integer 0..=60 | `0` | `"undo_send.agent_window" = 0` |
+| | | | | How long a message to an agent is held before it dispatches, in seconds. |
+| `undo_send.window` | user-global | integer 0..=60 | `2` | `"undo_send.window" = 2` |
+| | | | | How long a message to a chat is held before it dispatches, in seconds. |
 | `update.auto` | user-global | boolean (`1`/`0`) | `1` | `"update.auto" = false` |
 | | | | | Whether keeper checks for its own update on a cadence, installs it in the background, and then restarts itself into it once nobody is using keeper — overnight, or after hours away, and never while a recording is live. Off means the update endpoint is contacted only when somebody clicks Check for updates, and only a person restarts. |
 

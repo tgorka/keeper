@@ -20,6 +20,7 @@ import { tagsVocabulary } from "@/lib/ipc/client";
 import { type PromptToken, replaceSpan, tokenAtCaret } from "@/lib/notes/prompt-tokens";
 import { notesFiltersStore, type TagChip, useNotesFiltersStore } from "@/lib/stores/notes-filters";
 import { notesVaultsStore, useNotesVaultsStore } from "@/lib/stores/notes-vaults";
+import { NO_TEXT_SUBSTITUTION } from "@/lib/text-entry";
 import { cn } from "@/lib/utils";
 
 export function SearchField({
@@ -238,6 +239,7 @@ export function SearchField({
               {children}
             </div>
             <textarea
+              {...NO_TEXT_SUBSTITUTION}
               ref={attach}
               rows={1}
               role="combobox"

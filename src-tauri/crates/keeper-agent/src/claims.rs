@@ -6,9 +6,14 @@
 //! again: it proceeds only if the claim is still its own event. Then it holds
 //! a [`Lease`]: its [`SessionWriter`](crate::writer::SessionWriter) stamps
 //! every line with the lease's epoch and claim event and writes nothing once
-//! the lease is lost or unconfirmed for [`claim::STOP_WITHOUT_RENEWAL`] — by
-//! the monotonic clock or by the wall clock, since only the second runs on
-//! while the machine sleeps.
+//! the lease is lost or unconfirmed for its kind's
+//! [`LeaseKind::stop_without_renewal`] — by the monotonic clock or by the
+//! wall clock, since only the second runs on while the machine sleeps. A
+//! session's lease is on the kind its host allows (R449, R455,
+//! [`LeaseKind::for_fleet`]): [`Lease::want`] changes it at the next renewal,
+//! which is due at once; a holder on the quarter-hour lease told to drop to
+//! the minute one writes nothing from that moment until its minute-lease
+//! renewal is confirmed.
 //!
 //! The log records transitions only — `acquired`, `released`, `lost` — each
 //! with its claim event and the server's time; renewals are not logged.
@@ -21,7 +26,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use keeper_core::agents::claim::{self, Claimant, ServerClaim, RENEW_EVERY};
+use keeper_core::agents::claim::{self, Claimant, LeaseKind, ServerClaim};
 use keeper_core::agents::events::{RunState, StatusContent, CLAIM};
 use keeper_core::agents::log::reader::{read_session, ClaimConflict};
 use keeper_core::agents::log::{ClaimAction, ClaimBody};
@@ -253,11 +258,32 @@ pub struct Lease {
     window: Mutex<Option<String>>,
     confirmed: Mutex<Moment>,
     lost: AtomicBool,
+    /// The lease the claim on the server is on: what stopping and the next
+    /// renewal are timed by.
+    kind: Mutex<LeaseKind>,
+    /// The lease the next renewal writes.
+    wanted: Mutex<LeaseKind>,
+    /// Told to leave the quarter-hour lease: nothing is written until a
+    /// renewal on the minute one is confirmed (R455).
+    halted: AtomicBool,
 }
 
 impl Lease {
-    /// A lease acquired by `claim_event`, its claim last confirmed at `at`.
+    /// A minute lease acquired by `claim_event`, its claim last confirmed at
+    /// `at`.
     pub fn new(
+        epoch: u64,
+        claim_event: OwnedEventId,
+        server_ts: u64,
+        window: Option<String>,
+        at: Moment,
+    ) -> Lease {
+        Lease::on(LeaseKind::Minute, epoch, claim_event, server_ts, window, at)
+    }
+
+    /// [`Self::new`] on a `kind` lease.
+    pub fn on(
+        kind: LeaseKind,
         epoch: u64,
         claim_event: OwnedEventId,
         server_ts: u64,
@@ -271,7 +297,40 @@ impl Lease {
             window: Mutex::new(window),
             confirmed: Mutex::new(at),
             lost: AtomicBool::new(false),
+            kind: Mutex::new(kind),
+            wanted: Mutex::new(kind),
+            halted: AtomicBool::new(false),
         }
+    }
+
+    /// The lease the claim on the server is on now.
+    pub fn kind(&self) -> LeaseKind {
+        *self.kind.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Renew on `kind` from the next renewal on, which is due at once when
+    /// it differs from [`Self::kind`] (R449). Told the minute lease while
+    /// the claim is on the quarter-hour one — a host that does not read it
+    /// was seen, or this host's setting was turned off — the holder writes
+    /// nothing more until that renewal is confirmed (R455): an old host
+    /// judges the claim by 180 s and may already be taking it. That
+    /// downgrade stays wanted until its renewal is confirmed, whatever the
+    /// fleet says meanwhile (R101R3-01): only a confirmed minute renewal
+    /// lets a halted holder write again.
+    pub fn want(&self, kind: LeaseKind) {
+        let mut wanted = self.wanted.lock().unwrap_or_else(|p| p.into_inner());
+        if self.halted.load(Ordering::SeqCst) {
+            *wanted = LeaseKind::Minute;
+            return;
+        }
+        *wanted = kind;
+        if kind == LeaseKind::Minute && self.kind() == LeaseKind::QuarterHour {
+            self.halted.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn wanted(&self) -> LeaseKind {
+        *self.wanted.lock().unwrap_or_else(|p| p.into_inner())
     }
 
     /// The window the claim names now.
@@ -293,28 +352,30 @@ impl Lease {
     }
 
     /// Whether a line may be written at `now`: not lost, confirmed within
-    /// [`claim::STOP_WITHOUT_RENEWAL`] by both clocks, and no sleep since
-    /// the confirmation — after one, the next renewal's read decides first.
+    /// its kind's stop by both clocks, no sleep since the confirmation —
+    /// after one, the next renewal's read decides first — and not halted on
+    /// its way down to the minute lease (R455).
     fn may_write_at(&self, now: Moment) -> bool {
-        !self.must_stop(now) && !self.slept(now)
+        !self.must_stop(now) && !self.slept(now) && !self.halted.load(Ordering::SeqCst)
     }
 
     /// Whether the holder must stop at `now`: the lease is lost, or no
-    /// renewal was confirmed for [`claim::STOP_WITHOUT_RENEWAL`] by either
-    /// clock.
+    /// renewal was confirmed for its kind's stop by either clock.
     pub fn must_stop(&self, now: Moment) -> bool {
-        let confirmed = self.confirmed();
+        let (kind, confirmed) = (self.kind(), self.confirmed());
         let (_, wall) = now.since(confirmed);
         self.is_lost()
-            || claim::holder_must_stop(confirmed.at.into_std(), now.at.into_std())
-            || wall >= claim::STOP_WITHOUT_RENEWAL
+            || claim::holder_must_stop(kind, confirmed.at.into_std(), now.at.into_std())
+            || wall >= kind.stop_without_renewal()
     }
 
-    /// Whether a renewal is due at `now`: [`RENEW_EVERY`] by either clock,
-    /// or the machine slept since the last confirmation.
+    /// Whether a renewal is due at `now`: its kind's renewal by either
+    /// clock, the machine slept since the last confirmation, or the claim is
+    /// to change its lease (R449).
     pub fn renewal_due(&self, now: Moment) -> bool {
+        let every = self.kind().renew_every();
         let (monotonic, wall) = now.since(self.confirmed());
-        monotonic >= RENEW_EVERY || wall >= RENEW_EVERY || self.slept(now)
+        monotonic >= every || wall >= every || self.slept(now) || self.wanted() != self.kind()
     }
 
     /// Whether the wall clock ran ahead of the monotonic one since the last
@@ -413,9 +474,10 @@ fn current(state: Option<&ServerState>, me: &Claimant, server_now: u64) -> Curre
                 host: None,
                 window: None,
                 released: false,
+                // Its lease cannot be told: the longest this build knows.
                 acquirable: server_now
                     >= u64::from(state.origin_server_ts.get())
-                        .saturating_add(claim::TTL.as_millis() as u64),
+                        .saturating_add(LeaseKind::QuarterHour.ttl().as_millis() as u64),
                 clocked: true,
             }
         }
@@ -444,7 +506,24 @@ pub async fn acquire(
     rtt: &Rtt,
     window: Option<String>,
 ) -> Result<Acquired, AgentMatrixError> {
-    acquire_naming(port, me, clock, rtt, |_| window).await
+    acquire_naming(port, me, clock, rtt, LeaseKind::Minute, |_| window).await
+}
+
+/// [`acquire`] (or, `carrying`, [`acquire_carrying`]) for a session's own
+/// claim, on the `kind` lease its host's fleet allows (R449).
+pub async fn acquire_session(
+    port: &dyn ClaimPort,
+    me: &Claimant,
+    clock: &ServerClock,
+    rtt: &Rtt,
+    kind: LeaseKind,
+    carrying: bool,
+) -> Result<Acquired, AgentMatrixError> {
+    if carrying {
+        acquire_naming(port, me, clock, rtt, kind, |found| found).await
+    } else {
+        acquire_naming(port, me, clock, rtt, kind, |_| None).await
+    }
 }
 
 /// [`acquire`] for a scheduled session: the claim it writes names the
@@ -457,7 +536,7 @@ pub async fn acquire_carrying(
     clock: &ServerClock,
     rtt: &Rtt,
 ) -> Result<Acquired, AgentMatrixError> {
-    acquire_naming(port, me, clock, rtt, |found| found).await
+    acquire_naming(port, me, clock, rtt, LeaseKind::Minute, |found| found).await
 }
 
 async fn acquire_naming(
@@ -465,6 +544,7 @@ async fn acquire_naming(
     me: &Claimant,
     clock: &ServerClock,
     rtt: &Rtt,
+    kind: LeaseKind,
     window: impl FnOnce(Option<String>) -> Option<String>,
 ) -> Result<Acquired, AgentMatrixError> {
     let before = timed(rtt, port.read()).await?;
@@ -475,7 +555,7 @@ async fn acquire_naming(
     }
     let epoch = found.epoch.saturating_add(1).max(1);
     let window = window(found.window.clone());
-    let content = me.content(epoch, server_now, server_now, false, window.clone());
+    let content = me.content_on(kind, epoch, server_now, server_now, false, window.clone());
     let sent_at = Moment::now();
     let sent_wall = sent_at.wall_ms;
     let event = timed(
@@ -501,7 +581,7 @@ async fn acquire_naming(
         return Ok(Acquired::Yielded);
     }
     Ok(Acquired::Won {
-        lease: std::sync::Arc::new(Lease::new(epoch, event, server_ts, window, sent_at)),
+        lease: std::sync::Arc::new(Lease::on(kind, epoch, event, server_ts, window, sent_at)),
         from_host: found.host.filter(|host| *host != me.host),
         from_window: found.window,
         from_released: found.released,
@@ -524,7 +604,9 @@ pub async fn renew(
     }
     let sent_at = Moment::now();
     let server_now = clock.now();
-    let content = me.content(
+    let kind = lease.wanted();
+    let content = me.content_on(
+        kind,
         lease.epoch,
         lease.server_ts,
         server_now,
@@ -537,6 +619,10 @@ pub async fn renew(
     )
     .await?;
     lease.confirm(sent_at);
+    *lease.kind.lock().unwrap_or_else(|p| p.into_inner()) = kind;
+    if kind == LeaseKind::Minute {
+        lease.halted.store(false, Ordering::SeqCst);
+    }
     Ok(true)
 }
 
@@ -665,9 +751,16 @@ mod tests {
     use matrix_sdk::ruma::{MilliSecondsSinceUnixEpoch, OwnedUserId, UInt};
     use tokio::sync::Barrier;
 
+    use keeper_core::agents::claim::{ClaimsLease, RENEW_EVERY};
+
     use super::*;
 
     const T0: u64 = 1_790_000_000_000;
+
+    /// A claim's life, ms.
+    fn ttl_ms() -> u64 {
+        claim::TTL.as_millis() as u64
+    }
 
     fn claimant(host: &str) -> Claimant {
         Claimant {
@@ -833,12 +926,12 @@ mod tests {
         server.hold(&electra.content(2, T0, T0, false, Some(window.clone())), T0);
         let port = Port::new(&server, None, 0);
         let rtt = Rtt::default();
-        let clock = clock_at(T0 + 179_000);
+        let clock = clock_at(T0 + ttl_ms() - 1_000);
         let held = acquire(&port, &claimant("hesperia"), &clock, &rtt, None).await;
         assert!(matches!(held.expect("read"), Acquired::HeldElsewhere));
         assert_eq!(*server.sent.lock().expect("lock"), 0, "nothing was written");
 
-        let clock = clock_at(T0 + 180_000);
+        let clock = clock_at(T0 + ttl_ms());
         match acquire(&port, &claimant("hesperia"), &clock, &rtt, None)
             .await
             .expect("acquire")
@@ -871,7 +964,7 @@ mod tests {
             T0,
         );
         let port = Port::new(&server, None, 0);
-        let (rtt, clock) = (Rtt::default(), clock_at(T0 + 180_000));
+        let (rtt, clock) = (Rtt::default(), clock_at(T0 + ttl_ms()));
         let Acquired::Won {
             lease, from_window, ..
         } = acquire_carrying(&port, &claimant("hesperia"), &clock, &rtt)
@@ -889,9 +982,9 @@ mod tests {
         assert_eq!(from_window, Some(window));
     }
 
-    /// NFR-120: renewals fail from T; the lease stops writing at T + 120 s,
-    /// a taker may acquire from T + 180 s by the server's clock, and the
-    /// 60 s between them is the margin.
+    /// NFR-120, R416: renewals fail from T; the lease stops writing at
+    /// T + two renewals, a taker may acquire from T + three by the server's
+    /// clock, and the renewal between them is the margin.
     #[tokio::test(start_paused = true)]
     async fn a_holder_that_cannot_renew_stops_writing_before_another_may_take_over() {
         let server = Arc::new(Server::default());
@@ -917,11 +1010,14 @@ mod tests {
 
         tokio::time::advance(RENEW_EVERY).await;
         assert!(renew(&port, &me, &lease, &clock, &rtt).await.is_err());
-        tokio::time::advance(Duration::from_secs(59)).await;
-        assert_eq!(t.elapsed(), Duration::from_secs(119));
-        assert!(lease.may_write(), "at T + 119 s");
+        tokio::time::advance(RENEW_EVERY - Duration::from_secs(1)).await;
+        assert_eq!(
+            t.elapsed(),
+            claim::STOP_WITHOUT_RENEWAL - Duration::from_secs(1)
+        );
+        assert!(lease.may_write(), "a second before the stop");
         tokio::time::advance(Duration::from_secs(1)).await;
-        assert!(!lease.may_write(), "from T + 120 s the writer refuses");
+        assert!(!lease.may_write(), "from the stop the writer refuses");
         assert_eq!(
             step(
                 Some(&lease),
@@ -938,7 +1034,11 @@ mod tests {
         let takeover = renewed.lapses_at();
         assert!(!claim::may_acquire(Some(&renewed), takeover - 1));
         assert!(claim::may_acquire(Some(&renewed), takeover));
-        assert_eq!(takeover - stop_at, 60_000, "the margin");
+        assert_eq!(
+            takeover - stop_at,
+            RENEW_EVERY.as_millis() as u64,
+            "the margin"
+        );
     }
 
     /// R56: a window set on a held lease is named by the next renewal and
@@ -1089,19 +1189,22 @@ mod tests {
     }
 
     /// NFR-120 across a sleep: the monotonic clock stands while the lid is
-    /// closed, the wall clock does not. Ten minutes asleep stop the writer;
+    /// closed, the wall clock does not. A sleep past the stop stops the writer;
     /// a shorter sleep leaves the lease unconfirmed until a renewal's read
     /// decides.
     #[tokio::test(start_paused = true)]
-    async fn a_lease_asleep_for_ten_minutes_writes_nothing() {
+    async fn a_lease_asleep_past_its_stop_writes_nothing() {
         let now = Moment::now();
         let lease = lease_at(now);
         let here = Placement::Host("hesperia".to_owned());
-        assert!(lease.may_write_at(awake(now, Duration::from_secs(119))));
+        assert!(lease.may_write_at(awake(
+            now,
+            claim::STOP_WITHOUT_RENEWAL - Duration::from_secs(1)
+        )));
 
         let woke = Moment {
             at: now.at + Duration::from_secs(10),
-            wall_ms: now.wall_ms + 600_000,
+            wall_ms: now.wall_ms + claim::STOP_WITHOUT_RENEWAL.as_millis() as u64 + 60_000,
         };
         assert!(!lease.may_write_at(woke), "the writer refuses");
         assert_eq!(
@@ -1128,7 +1231,7 @@ mod tests {
     /// this host's own copy is not, and taking it calibrates the clock.
     #[tokio::test(start_paused = true)]
     async fn an_uncalibrated_clock_never_takes_another_hosts_claim() {
-        let lapsed = wall_ms() - 200_000;
+        let lapsed = wall_ms() - ttl_ms() - 20_000;
         let server = Arc::new(Server::default());
         server.hold(
             &claimant("argo").content(4, lapsed, lapsed, false, None),
@@ -1146,12 +1249,354 @@ mod tests {
         assert!(matches!(own, Acquired::Won { .. }), "{own:?}");
         assert!(clock.calibrated());
 
-        let lapsed = clock.now() - 200_000;
+        let lapsed = clock.now() - ttl_ms() - 20_000;
         server.hold(
             &claimant("argo").content(6, lapsed, lapsed, false, None),
             lapsed,
         );
         let calibrated = acquire(&port, &me, &clock, &rtt, None).await.expect("a");
         assert!(matches!(calibrated, Acquired::Won { .. }), "{calibrated:?}");
+    }
+
+    /// The reader of a host built before R449: every claim lapses 180 s
+    /// after its event, whatever its content says — the parent's arithmetic,
+    /// written out here so this build's constants cannot move it.
+    fn old_reader_may_take(claim: &ServerClaim, server_now: u64) -> bool {
+        claim.content.released || server_now >= claim.origin_server_ts.saturating_add(180_000)
+    }
+
+    /// A homeserver whose clock is `T0` plus the paused tokio clock since
+    /// `start`: a claim it keeps is stamped with that time.
+    struct TimedServer {
+        start: Instant,
+        current: Mutex<Option<ServerState>>,
+        sent: AtomicU64,
+        /// Sends fail: the holder cannot reach the homeserver.
+        unreachable: AtomicBool,
+    }
+
+    impl TimedServer {
+        fn new() -> TimedServer {
+            TimedServer {
+                start: Instant::now(),
+                current: Mutex::new(None),
+                sent: AtomicU64::new(0),
+                unreachable: AtomicBool::new(false),
+            }
+        }
+
+        fn now(&self) -> u64 {
+            T0 + self.start.elapsed().as_millis() as u64
+        }
+
+        fn claim(&self) -> ServerClaim {
+            let state = self.current.lock().expect("lock").clone().expect("a claim");
+            ServerClaim::read(&state).expect("reads")
+        }
+    }
+
+    impl ClaimPort for TimedServer {
+        fn send(&self, content: Value) -> ClaimFuture<'_, Result<OwnedEventId, AgentMatrixError>> {
+            Box::pin(async move {
+                if self.unreachable.load(Ordering::Relaxed) {
+                    return Err(AgentMatrixError::Network("unreachable".to_owned()));
+                }
+                let n = self.sent.fetch_add(1, Ordering::Relaxed);
+                let event = OwnedEventId::try_from(format!("$t{n}:example.org")).expect("event");
+                *self.current.lock().expect("lock") = Some(ServerState {
+                    event_id: event.clone(),
+                    sender: OwnedUserId::try_from("@nixi:example.org").expect("user"),
+                    origin_server_ts: MilliSecondsSinceUnixEpoch(
+                        UInt::new(self.now()).expect("ts"),
+                    ),
+                    content,
+                });
+                Ok(event)
+            })
+        }
+
+        fn read(&self) -> ClaimFuture<'_, Result<Option<ServerState>, AgentMatrixError>> {
+            Box::pin(async move { Ok(self.current.lock().expect("lock").clone()) })
+        }
+
+        fn next_sync(&self) -> ClaimFuture<'_, Duration> {
+            Box::pin(async move { Duration::from_millis(30) })
+        }
+    }
+
+    /// A manifest of `host`, live for three more minutes on `server`'s
+    /// clock; `new` when it advertises the quarter-hour lease.
+    fn manifest(
+        server: &TimedServer,
+        host: &str,
+        new: bool,
+    ) -> keeper_core::agents::host::HostManifest {
+        keeper_core::agents::host::HostManifest {
+            v: 1,
+            host: host.to_owned(),
+            principal: "tgorka".to_owned(),
+            version: "0.101.0".to_owned(),
+            always_on: true,
+            tools: Vec::new(),
+            drives: Vec::new(),
+            bots: Vec::new(),
+            agents: Vec::new(),
+            renewed_at: claim::rfc3339(server.now()),
+            expires_at: claim::rfc3339(server.now() + 180_000),
+            picture_failures: Default::default(),
+            lease: new.then(|| claim::QUARTER_HOUR_LEASE.to_owned()),
+        }
+    }
+
+    /// One tick of a holder that is busy (no hand-back) on `fleet`'s lease,
+    /// as the host's tick runs it: what it stepped, and whether a renewal
+    /// it sent was confirmed.
+    async fn tick_holder(
+        server: &TimedServer,
+        lease: &Lease,
+        fleet: LeaseKind,
+    ) -> (Step, Option<bool>) {
+        let me = claimant("hesperia");
+        lease.want(fleet);
+        let here = Placement::Host("hesperia".to_owned());
+        let stepped = step(Some(lease), &here, "hesperia", true, false, Moment::now());
+        let mut renewed = None;
+        if stepped == Step::Renew {
+            let clock = clock_at(server.now());
+            renewed = Some(
+                renew(server, &me, lease, &clock, &Rtt::default())
+                    .await
+                    .unwrap_or(false),
+            );
+        }
+        (stepped, renewed)
+    }
+
+    /// The lease a host with `setting` takes at `server`'s now beside the
+    /// manifests `hosts` (`(host, advertises)`), the claim the server holds
+    /// among what it sees.
+    fn fleet_of(server: &TimedServer, setting: ClaimsLease, hosts: &[(&str, bool)]) -> LeaseKind {
+        let manifests: Vec<_> = hosts
+            .iter()
+            .map(|(host, new)| manifest(server, host, *new))
+            .collect();
+        let claims: Vec<ServerClaim> = server
+            .current
+            .lock()
+            .expect("lock")
+            .as_ref()
+            .and_then(|state| ServerClaim::read(state).ok())
+            .into_iter()
+            .collect();
+        LeaseKind::for_fleet(setting, &manifests, &claims, server.now())
+    }
+
+    async fn won(server: &TimedServer, kind: LeaseKind) -> Arc<Lease> {
+        let Acquired::Won { lease, .. } = acquire_session(
+            server,
+            &claimant("hesperia"),
+            &clock_at(server.now()),
+            &Rtt::default(),
+            kind,
+            false,
+        )
+        .await
+        .expect("acquire") else {
+            panic!("not won")
+        };
+        lease
+    }
+
+    /// R455 (review-101rooms-2 01): with the default setting a holder takes
+    /// the minute lease even when every live manifest advertises the
+    /// quarter-hour one — here a host built before R449 is offline, so it
+    /// has no manifest at all — and through two hours of a turn that never
+    /// ends that old host, coming back at any second and looking BEFORE the
+    /// holder's tick as well as after it, never finds the claim free while
+    /// its holder may write.
+    #[tokio::test(start_paused = true)]
+    async fn by_default_an_old_host_returning_first_never_finds_a_written_claim_free() {
+        let server = TimedServer::new();
+        let fleet =
+            |server: &TimedServer| fleet_of(server, ClaimsLease::default(), &[("hesperia", true)]);
+        assert_eq!(fleet(&server), LeaseKind::Minute);
+        let lease = won(&server, fleet(&server)).await;
+        for second in 0..2 * 3600 {
+            let looks = |when: &str| {
+                if lease.may_write_at(Moment::now()) {
+                    assert!(
+                        !old_reader_may_take(&server.claim(), server.now()),
+                        "an old host takes the claim at {second} s ({when}) while its holder writes"
+                    );
+                }
+            };
+            looks("before the holder's tick");
+            let (stepped, renewed) = tick_holder(&server, &lease, fleet(&server)).await;
+            assert_ne!(stepped, Step::Stop, "at {second} s");
+            assert_ne!(renewed, Some(false), "at {second} s");
+            looks("after it");
+            tokio::time::advance(Duration::from_secs(1)).await;
+        }
+    }
+
+    /// R449, R455 (review-101rooms-1 01): turned on, but beside a live host
+    /// built before the quarter-hour lease, a holder stays on the minute
+    /// lease and the old reader never finds the claim free while the holder
+    /// may still write.
+    #[tokio::test(start_paused = true)]
+    async fn beside_an_old_host_the_claim_never_looks_free_while_its_holder_writes() {
+        let server = TimedServer::new();
+        let fleet = |server: &TimedServer| {
+            fleet_of(
+                server,
+                ClaimsLease::QuarterHour,
+                &[("hesperia", true), ("argo", false)],
+            )
+        };
+        assert_eq!(fleet(&server), LeaseKind::Minute);
+        let lease = won(&server, fleet(&server)).await;
+        for second in 0..2 * 3600 {
+            let (stepped, renewed) = tick_holder(&server, &lease, fleet(&server)).await;
+            assert_ne!(stepped, Step::Stop, "at {second} s");
+            assert_ne!(renewed, Some(false), "at {second} s");
+            if lease.may_write_at(Moment::now()) {
+                assert!(
+                    !old_reader_may_take(&server.claim(), server.now()),
+                    "an old host takes the claim at {second} s while its holder writes"
+                );
+            }
+            tokio::time::advance(Duration::from_secs(1)).await;
+        }
+    }
+
+    /// R455 (review-101rooms-2 01): turned on with every live host
+    /// advertising it, the holder runs on the quarter-hour lease. Ten
+    /// minutes in, a host built before R449 comes back and — before the
+    /// holder's next tick, the ordering the operator's cutover accepts —
+    /// takes the claim by its 180 s. At its first sight of that claim the
+    /// holder writes nothing more, before any renewal, and its renewal then
+    /// finds the lease lost.
+    #[tokio::test(start_paused = true)]
+    async fn turned_on_a_holder_stops_at_first_sight_of_an_old_hosts_claim() {
+        let server = TimedServer::new();
+        let fleet = |server: &TimedServer| {
+            fleet_of(server, ClaimsLease::QuarterHour, &[("hesperia", true)])
+        };
+        assert_eq!(fleet(&server), LeaseKind::QuarterHour);
+        let lease = won(&server, fleet(&server)).await;
+        assert_eq!(lease.kind(), LeaseKind::QuarterHour);
+        for _ in 0..600 {
+            assert_eq!(
+                tick_holder(&server, &lease, fleet(&server)).await,
+                (Step::Nothing, None)
+            );
+            tokio::time::advance(Duration::from_secs(1)).await;
+        }
+        let held = server.claim();
+        assert_eq!(LeaseKind::of(&held.content), LeaseKind::QuarterHour);
+        assert!(lease.may_write(), "the holder writes ten minutes in");
+
+        // The old host comes back first: by its arithmetic the claim is free.
+        assert!(old_reader_may_take(&held, server.now()));
+        let argo = claimant("argo").content(
+            held.content.epoch + 1,
+            server.now(),
+            server.now(),
+            false,
+            None,
+        );
+        ClaimPort::send(&server, serde_json::to_value(&argo).expect("content"))
+            .await
+            .expect("argo's claim");
+
+        let seen = fleet(&server);
+        assert_eq!(seen, LeaseKind::Minute, "argo's live minute claim is seen");
+        lease.want(seen);
+        assert!(!lease.may_write(), "the holder stops at first sight");
+        let (stepped, renewed) = tick_holder(&server, &lease, seen).await;
+        assert_eq!((stepped, renewed), (Step::Renew, Some(false)));
+        assert!(lease.is_lost() && !lease.may_write());
+    }
+
+    /// R455: a holder on the quarter-hour lease told to leave it — a live
+    /// manifest of a host that does not read it — writes nothing from that
+    /// moment, through a renewal that cannot be sent, until its minute-lease
+    /// renewal is confirmed; then it writes again, on the minute lease.
+    /// Turning the setting off drops it the same way.
+    #[tokio::test(start_paused = true)]
+    async fn a_holder_leaving_the_quarter_hour_lease_writes_nothing_until_its_minute_renewal() {
+        for trigger in ["an old host's manifest", "the setting turned off"] {
+            let server = TimedServer::new();
+            let lease = won(&server, LeaseKind::QuarterHour).await;
+            tokio::time::advance(Duration::from_secs(60)).await;
+            assert!(lease.may_write(), "{trigger}");
+            let fleet = match trigger {
+                "an old host's manifest" => fleet_of(
+                    &server,
+                    ClaimsLease::QuarterHour,
+                    &[("hesperia", true), ("argo", false)],
+                ),
+                _ => fleet_of(&server, ClaimsLease::Short, &[("hesperia", true)]),
+            };
+            assert_eq!(fleet, LeaseKind::Minute, "{trigger}");
+
+            server.unreachable.store(true, Ordering::Relaxed);
+            let (stepped, renewed) = tick_holder(&server, &lease, fleet).await;
+            assert_eq!((stepped, renewed), (Step::Renew, Some(false)), "{trigger}");
+            assert!(!lease.is_lost(), "{trigger}");
+            assert!(!lease.may_write(), "{trigger}: halted while unconfirmed");
+
+            server.unreachable.store(false, Ordering::Relaxed);
+            let (stepped, renewed) = tick_holder(&server, &lease, fleet).await;
+            assert_eq!((stepped, renewed), (Step::Renew, Some(true)), "{trigger}");
+            assert_eq!(lease.kind(), LeaseKind::Minute, "{trigger}");
+            assert_eq!(
+                LeaseKind::of(&server.claim().content),
+                LeaseKind::Minute,
+                "{trigger}"
+            );
+            assert!(lease.may_write(), "{trigger}: writing again");
+        }
+    }
+
+    /// R101R3-01: a holder halted on its way down from the quarter-hour
+    /// lease whose minute renewal could not be sent keeps that downgrade
+    /// when the fleet reads the quarter-hour lease again before it is sent:
+    /// the next renewal still goes to the minute lease, and only its
+    /// confirmation lets the holder write — never a quarter-hour renewal of
+    /// a claim that writes nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_downgrade_the_fleet_takes_back_before_it_is_sent_still_lands() {
+        let server = TimedServer::new();
+        let lease = won(&server, LeaseKind::QuarterHour).await;
+        tokio::time::advance(Duration::from_secs(60)).await;
+        let old_host = fleet_of(
+            &server,
+            ClaimsLease::QuarterHour,
+            &[("hesperia", true), ("argo", false)],
+        );
+        assert_eq!(old_host, LeaseKind::Minute);
+        server.unreachable.store(true, Ordering::Relaxed);
+        let (stepped, renewed) = tick_holder(&server, &lease, old_host).await;
+        assert_eq!((stepped, renewed), (Step::Renew, Some(false)));
+        assert!(!lease.may_write(), "halted while unconfirmed");
+
+        // The old host's manifest is gone: the fleet reads the quarter-hour
+        // lease again, and the network is back.
+        let advertising = fleet_of(&server, ClaimsLease::QuarterHour, &[("hesperia", true)]);
+        assert_eq!(advertising, LeaseKind::QuarterHour);
+        server.unreachable.store(false, Ordering::Relaxed);
+        let (stepped, renewed) = tick_holder(&server, &lease, advertising).await;
+        assert_eq!(
+            (stepped, renewed),
+            (Step::Renew, Some(true)),
+            "the downgrade is still due"
+        );
+        assert_eq!(lease.kind(), LeaseKind::Minute);
+        assert_eq!(LeaseKind::of(&server.claim().content), LeaseKind::Minute);
+        assert!(
+            lease.may_write(),
+            "writing again once the minute renewal is confirmed"
+        );
     }
 }

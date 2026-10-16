@@ -80,6 +80,7 @@ import {
 import { useCapabilitiesStore } from "@/lib/stores/capabilities";
 import { primaryViewStore } from "@/lib/stores/primary-view";
 import { startTranscription, useTranscriptionStore } from "@/lib/stores/transcription";
+import { NO_TEXT_SUBSTITUTION } from "@/lib/text-entry";
 
 /** Debounce (ms) before a filter change fires `searchRecordings`. */
 const DEBOUNCE_MS = 200;
@@ -439,6 +440,7 @@ export function RecordingsPane() {
 
         <div className="flex flex-wrap items-center gap-2">
           <input
+            {...NO_TEXT_SUBSTITUTION}
             type="text"
             placeholder="Participant"
             aria-label="Participant"

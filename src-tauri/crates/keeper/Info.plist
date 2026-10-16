@@ -39,8 +39,10 @@
 	  WebKit exposes `navigator.mediaDevices` only to an app that declares this
 	  key, so it is also what makes "Scan a QR code" exist on the Mac. Frames are
 	  decoded in the window and never stored or sent anywhere.
+	  Epic 101, story 101.2: the composer also captures a photo for a chat.
+	  Unlike recordings and setup scans, that photo is sent on the person's Send.
 	-->
 	<key>NSCameraUsageDescription</key>
-	<string>keeper uses your camera only when you turn it on for a recording or scan a setup code. Recordings are saved locally on this Mac; a scanned code never leaves it. Nothing uploads.</string>
+	<string>keeper uses your camera only when you turn it on for a recording, scan a setup code, or take a photo for a chat. Recordings and setup scans stay local on this Mac. A photo you take is sent only to the chat you send it in.</string>
 </dict>
 </plist>

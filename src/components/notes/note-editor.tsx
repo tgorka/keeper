@@ -28,6 +28,7 @@
  * the editor stays alive behind them so Escape returns to the caret it left,
  * which is a promise a remount could not keep.
  */
+
 import {
   ArrowLeft,
   ArrowRight,
@@ -104,6 +105,7 @@ import {
 import { notesFiltersStore } from "@/lib/stores/notes-filters";
 import { ensureNotesVaultsHydrated, useNotesVaultsStore } from "@/lib/stores/notes-vaults";
 import { type PanelHistoryEntry, panelsStore, usePanelsStore } from "@/lib/stores/panels";
+import { NO_TEXT_SUBSTITUTION_ATTRIBUTES } from "@/lib/text-entry";
 import { filePathForNote, SHOW_IN_FILES_LABEL, showNoteInFiles } from "@/lib/vault-link";
 import { ADOPT_MEDIA_BLOCKS_LABEL, AdoptMediaBlocksDialog } from "./adopt-media-blocks";
 import { AttachFileButton } from "./attach-file-button";
@@ -816,6 +818,9 @@ export function NoteEditor({
             // be a second configuration of one editor — the thing AD-93 exists
             // to prevent — and because the notes pane had the same gap.
             view.EditorView.contentAttributes.of({ "aria-label": "Note" }),
+            // CodeMirror's own defaults today; stated so a change of them
+            // cannot bring back a capital or a correction (Story 101.3).
+            view.EditorView.contentAttributes.of(NO_TEXT_SUBSTITUTION_ATTRIBUTES),
             commands.history(),
             // In-document find (FR-267). `⌘F` is claimed app-wide by the
             // shortcut hook, which stands down when an editor has focus — so

@@ -58,7 +58,7 @@ fn make(
 ) -> crate::seed::Settled {
     let agent = session(config, decl, duty, &room(room_name), now);
     let files = folder_files(config, decl, duty, zone).expect("her files");
-    crate::seed::make_folder(zone, &agent, files, true, now).expect("made")
+    crate::seed::make_folder(zone, &agent, files, true, now, &|| true).expect("made")
 }
 
 fn card_text(zone: &Path, path: &str, duty: Duty) -> Option<String> {

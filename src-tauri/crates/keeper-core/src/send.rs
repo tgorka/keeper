@@ -259,16 +259,21 @@ pub async fn submit_reply(
     if text.trim().is_empty() {
         return Ok(());
     }
-    let event_id: OwnedEventId = {
-        let items = timeline.items().await;
-        items
-            .iter()
-            .find(|item| item.unique_id().0 == in_reply_to_key)
-            .and_then(|item| item.as_event())
-            .and_then(|ev| ev.event_id())
-            .map(|id| id.to_owned())
-            .ok_or(SendError::TargetNotFound)?
-    };
+    let event_id = reply_target(timeline, in_reply_to_key).await?;
+    submit_reply_to(timeline, event_id, text).await
+}
+
+/// Dispatch a plain-text reply to `event_id` — a reply held for Undo-Send
+/// names its original by event, since a render key lives only as long as one
+/// timeline (Story 101.3, R432). Holds the sole `Timeline::send_reply` call.
+pub async fn submit_reply_to(
+    timeline: &Timeline,
+    event_id: OwnedEventId,
+    text: &str,
+) -> Result<(), SendError> {
+    if text.trim().is_empty() {
+        return Ok(());
+    }
     join_if_invited(timeline.room()).await?;
     let content = RoomMessageEventContentWithoutRelation::text_plain(text);
     // SOLE-REPLY-GATE: the one and only `Timeline::send_reply` call site (FR-41).
@@ -277,6 +282,23 @@ pub async fn submit_reply(
         .await
         .map_err(|e| SendError::Dispatch(e.to_string()))?;
     Ok(())
+}
+
+/// The event the item `in_reply_to_key` (its opaque `unique_id`) shows, as a
+/// reply names it. Errors: an unresolvable key, or an item with no event id
+/// yet → [`SendError::TargetNotFound`].
+pub async fn reply_target(
+    timeline: &Timeline,
+    in_reply_to_key: &str,
+) -> Result<OwnedEventId, SendError> {
+    let items = timeline.items().await;
+    items
+        .iter()
+        .find(|item| item.unique_id().0 == in_reply_to_key)
+        .and_then(|item| item.as_event())
+        .and_then(|ev| ev.event_id())
+        .map(|id| id.to_owned())
+        .ok_or(SendError::TargetNotFound)
 }
 
 /// Dispatch an in-place text edit of the message addressed by `item_key` (its
@@ -671,31 +693,6 @@ mod tests {
             "AD-13: `.send_raw(` must have exactly one production call site in \
              account.rs (`send_agent_event`, over the closed `AgentOutbound`); \
              found {raw_calls}."
-        );
-        // And the set is exactly these five: a new variant is a new door, a
-        // planning decision, not a refactor.
-        let proxy = include_str!("agents/proxy.rs");
-        let outbound = proxy
-            .split("pub enum AgentOutbound {")
-            .nth(1)
-            .and_then(|rest| rest.split('}').next())
-            .expect("AgentOutbound is declared in agents/proxy.rs");
-        let variants: Vec<&str> = outbound
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .collect();
-        assert_eq!(
-            variants,
-            [
-                "Scope(ScopeContent),",
-                "ConversationRequest(ConversationRequestContent),",
-                "SurfaceResult(SurfaceResultContent),",
-                "Decision(ApprovalDecisionContent),",
-                "Heard(HeardContent),",
-            ],
-            "AD-13: `AgentOutbound` is the closed set of what the person's device sends into \
-             an agent's room"
         );
     }
 

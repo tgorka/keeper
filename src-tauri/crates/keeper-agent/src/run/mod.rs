@@ -12,9 +12,11 @@
 //! checks once more that what runs is what was checked ([`verify`]) and
 //! starts the program in its own process group through the host's sandbox,
 //! bounds its time, its output and the draining of its pipes, kills the
-//! whole group and removes both folders. There is no path through here that
-//! starts a program without the sandbox: a host whose probe failed has no
-//! [`SandboxHost`], and `run` is not offered there.
+//! whole group and removes both folders. A program starts without the
+//! sandbox only through [`SandboxHost::execute_unsandboxed`], the console's
+//! `full` mode a person chose for the agent (story 101.5, R420) — and only
+//! on a host whose probe passed: a host whose probe failed has no
+//! [`SandboxHost`], and `run` is not offered there in any mode.
 //!
 //! [`resolve`]: keeper_sync::browse::resolve
 
@@ -141,6 +143,416 @@ impl Forbidden {
             credentials,
         )
     }
+
+    /// Why a console's folder (story 101.5) may not be granted: a host
+    /// path as every grant is checked, a drive's folder as a mounted drive
+    /// is — inside a drive by design, so only the trees never granted, the
+    /// host's secrets and the credentials under its home refuse it.
+    fn folder_refusal(&self, folder: &Granted, credentials: &[PathBuf]) -> Option<String> {
+        match folder.origin {
+            Origin::Drive { .. } => core_run::grant_refusal(
+                &canonical(&folder.path),
+                &[],
+                &self.secrets,
+                self.home.as_deref(),
+                credentials,
+            ),
+            Origin::Host => self.refusal(&folder.path, credentials),
+        }
+    }
+}
+
+/// Where a console's folder is from (story 101.5, R440 02): a drive's —
+/// what a run reads there carries that drive's readers and `local_only`,
+/// and `untrusted` where the folder may hold one of its untrusted zones'
+/// files (`at`, where it landed, drive-relative) — or this host's own
+/// files, which only the session's person reads and keeper never labelled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Origin {
+    Drive { drive: String, at: String },
+    Host,
+}
+
+/// One checkout this host syncs (story 101.5; R456, review-101console-2
+/// 01 and 03): a drive this host mounts — its `_drive.toml` hosts here,
+/// `mounted`, named by its id — or any other: a drive whose declaration
+/// does not read or differs from its pin, another principal's, one synced
+/// without agents. `id` is its drive's id where it declares one, its
+/// folder's name where not. A console's folder is landed against every
+/// checkout — inside or holding another than its own is refused — and a
+/// run at full access, which could read any, is labelled by every one.
+#[derive(Debug, Clone)]
+pub struct Checkout {
+    pub id: String,
+    pub mounted: bool,
+    pub profile: keeper_sync::SyncProfile,
+    /// This host's pin of its audience, where it holds one.
+    pub pin: Option<keeper_core::agents::agentd::DrivePin>,
+}
+
+/// Who may read what is in a checkout, and whether it is `local_only`.
+pub type CheckoutLabel = (BTreeSet<matrix_sdk::ruma::OwnedUserId>, bool);
+
+impl Checkout {
+    /// Who reads this checkout and whether it is `local_only`, read now
+    /// (R456 03): its pin's readers and `local_only`, narrowed by its
+    /// `_drive.toml` where that reads — a file never widens its pin, and a
+    /// stricter one binds. `Err` names it and says why it cannot be told:
+    /// this host holds no pin of its readers (R381).
+    pub fn label(&self) -> Result<CheckoutLabel, String> {
+        use keeper_core::agents::drive;
+        let pin = self.pin.as_ref().ok_or_else(|| {
+            format!(
+                "keeper cannot tell who reads {}, checked out at {}: this host holds no pin of its readers",
+                self.id,
+                self.profile.local_path.display()
+            )
+        })?;
+        let mut readers = pin.readers.clone();
+        let mut local_only = pin.local_only;
+        if let Some(declared) = self
+            .profile
+            .agents_root()
+            .and_then(|zone| {
+                crate::zone::read_text(&zone, drive::FILE_NAME)
+                    .ok()
+                    .flatten()
+            })
+            .and_then(|text| drive::parse(&text).ok())
+        {
+            readers.retain(|reader| declared.readers.contains(reader));
+            local_only |= declared.local_only;
+        }
+        Ok((readers, local_only))
+    }
+}
+
+/// The label of every checkout of `checkouts` ([`Checkout::label`]), or
+/// the first one's sentence that cannot be told.
+pub fn checkout_labels(checkouts: &[Checkout]) -> Result<Vec<CheckoutLabel>, String> {
+    checkouts.iter().map(Checkout::label).collect()
+}
+
+/// One checkout this host syncs, as a console's folder is checked against
+/// it (R441, R456 01): its checkout, and the folders of it keeper keeps to
+/// itself — its agents zone (every `agent.toml`, `_drive.toml`), its
+/// sessions zone and its root's `.git` — each as its profile names it,
+/// whether it is there yet or not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DriveGuard {
+    /// [`Checkout::id`].
+    pub id: String,
+    /// A drive this host mounts: only such a drive's folder is named by
+    /// its id.
+    pub mounted: bool,
+    /// Canonical.
+    pub root: PathBuf,
+    pub kept: Vec<PathBuf>,
+}
+
+/// The guard of each checkout of `checkouts` (R441, R456 01).
+pub fn guards(checkouts: &[Checkout]) -> Vec<DriveGuard> {
+    checkouts
+        .iter()
+        .map(|checkout| {
+            let profile = &checkout.profile;
+            let root = canonical(&profile.local_path);
+            // Each kept folder as the profile names it under the checkout as
+            // it resolves; where it is there, also as it resolves itself.
+            let named = |at: Option<PathBuf>| {
+                at.and_then(|at| {
+                    at.strip_prefix(&profile.local_path)
+                        .ok()
+                        .map(|rel| root.join(rel))
+                })
+            };
+            let mut kept: Vec<PathBuf> = [
+                named(profile.agents_root()),
+                named(profile.sessions_root()),
+                Some(root.join(".git")),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            let resolved: Vec<PathBuf> = kept
+                .iter()
+                .filter_map(|at| at.canonicalize().ok())
+                .filter(|at| !kept.contains(at))
+                .collect();
+            kept.extend(resolved);
+            DriveGuard {
+                id: checkout.id.clone(),
+                mounted: checkout.mounted,
+                root,
+                kept,
+            }
+        })
+        .collect()
+}
+
+/// A folder of the agent's console — `[run].paths`, or a run's `folders`
+/// (R440 08) — as it landed on this host (story 101.5, R420, R440 01):
+/// granted read, write and execute to a run without network, beside its
+/// workspace. It is the folder keeper checked, by device and inode: every
+/// run lands it again ([`Granted::again`]) and the sandbox's rule is built
+/// from that very folder, so a folder replaced, or a link put on its way,
+/// since keeper checked it is refused, never followed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Granted {
+    /// As the agent's `agent.toml` (or the run) spells it.
+    pub written: String,
+    pub origin: Origin,
+    /// Canonical, as the drive's resolver landed it.
+    pub path: PathBuf,
+    /// Its device and inode as keeper checked it.
+    pub id: (u64, u64),
+    spelled: keeper_core::agents::console::RunPath,
+    guards: Vec<DriveGuard>,
+    scope: Vec<String>,
+}
+
+impl Granted {
+    /// This folder landed once more, as it is now ([`land`]): `Err` names
+    /// why it may not be given any more — it lands elsewhere, it is another
+    /// folder, or the protected-zone policy refuses it now.
+    pub fn again(&self) -> Result<(), String> {
+        let now = land(&self.spelled, &self.guards, &self.scope)
+            .map_err(|why| format!("the folder {} is not given now: {why}", self.written))?;
+        if now.path != self.path || now.id != self.id {
+            return Err(format!(
+                "the folder {} changed after keeper checked it: it now lands elsewhere, or is another folder",
+                self.written
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// `spelled` landed on this host (story 101.5, R440 01, R441, R456 01): a
+/// drive's folder — its drive one of `scope`, the drives in the session's
+/// scope this host may run in — under that drive's checkout, one of the
+/// mounted among `guards`, a host path from `/`, each through keeper-sync's
+/// resolver (AD-65, AD-159), a folder there, by its device and inode.
+/// `guards` is every checkout of this host. A drive's folder is refused
+/// when it is the whole drive; when it is inside, or holds, another
+/// checkout — a drive nested in its drive, or its drive nested in another
+/// — which is never given as either drive's folder, its files being that
+/// other's too; when it is inside or holds a folder keeper keeps to itself
+/// (any checkout's agents zone, sessions zone or root's `.git`, any
+/// `.keeper`, by identity and — `.git`/`.keeper` — by name, case-folded);
+/// or when it holds a `.keeper`, one of those folders or another checkout
+/// at any depth: the sandbox cannot leave a folder out of a grant, so the
+/// grant is refused whole. A host path is refused when it is inside, or
+/// holds, any checkout or a folder keeper keeps to itself — a drive's
+/// folder named as the drive's folder, its rules apply. `Err` is the
+/// clause that says why.
+pub fn land(
+    spelled: &keeper_core::agents::console::RunPath,
+    guards: &[DriveGuard],
+    scope: &[String],
+) -> Result<Granted, String> {
+    use keeper_core::agents::console::RunPath;
+    let (mut origin, own, inside) = match spelled {
+        RunPath::Drive { drive, path } => {
+            if !scope.iter().any(|id| id == drive) {
+                return Err(format!(
+                    "{drive} is not a drive this session may run in on this host"
+                ));
+            }
+            let guard = guards
+                .iter()
+                .find(|guard| guard.mounted && guard.id == *drive)
+                .ok_or_else(|| format!("{drive} is not on this host"))?;
+            (
+                Origin::Drive {
+                    drive: drive.clone(),
+                    at: String::new(),
+                },
+                Some(guard),
+                path.as_str(),
+            )
+        }
+        RunPath::Host(path) => (Origin::Host, None, path.trim_start_matches('/')),
+    };
+    let root = own.map_or_else(|| PathBuf::from("/"), |guard| guard.root.clone());
+    let found = match keeper_sync::browse::resolve(&root, inside) {
+        Ok(Some(found)) if found.is_dir() => found,
+        Ok(Some(_)) => return Err("it is not a folder on this host".to_owned()),
+        Ok(None) => return Err("it is not on this host".to_owned()),
+        Err(_) => return Err("it leads outside where it is named".to_owned()),
+    };
+    let id = identity(&found).map_err(|error| format!("it could not be read ({error})"))?;
+    match (&mut origin, own) {
+        (Origin::Drive { at, .. }, Some(own)) => {
+            kept_out_of(&found, id, own, guards)?;
+            *at = found
+                .strip_prefix(&root)
+                .ok()
+                .and_then(|rel| {
+                    rel.components()
+                        .map(|part| part.as_os_str().to_str())
+                        .collect::<Option<Vec<_>>>()
+                })
+                .map(|names| names.join("/"))
+                .ok_or_else(|| "it lands where keeper cannot name it in its drive".to_owned())?;
+        }
+        _ => {
+            let meets = |at: &Path| {
+                found.starts_with(at)
+                    || at.starts_with(&found)
+                    || below(&found, at)
+                    || below(at, &found)
+            };
+            for guard in guards {
+                if meets(guard.root.as_path()) {
+                    return Err(if guard.mounted {
+                        format!(
+                            "it is inside, or holds, the checkout of the drive {}: name it as that drive's folder",
+                            guard.id
+                        )
+                    } else {
+                        format!(
+                            "it is inside, or holds, {}, a checkout of this host no console is given",
+                            guard.id
+                        )
+                    });
+                }
+                if guard.kept.iter().any(|kept| meets(kept.as_path())) {
+                    return Err(format!(
+                        "it is inside, or holds, {}'s agents zone, sessions zone or .git folder, which keeper keeps to itself",
+                        guard.id
+                    ));
+                }
+            }
+        }
+    }
+    Ok(Granted {
+        written: spelled.written(),
+        origin,
+        path: found,
+        id,
+        spelled: spelled.clone(),
+        guards: guards.to_vec(),
+        scope: scope.to_vec(),
+    })
+}
+
+/// Whether `inner` is `outer` or below it, by the device and inode of
+/// each folder from `inner` up — what a case-insensitive volume or a
+/// second spelling cannot hide.
+fn below(outer: &Path, inner: &Path) -> bool {
+    let Ok(outer) = identity(outer) else {
+        return false;
+    };
+    inner
+        .ancestors()
+        .any(|at| identity(at).is_ok_and(|id| id == outer))
+}
+
+/// Whether `name` is `.git` or `.keeper` as a case-insensitive volume
+/// reads it.
+fn kept_name(name: &std::ffi::OsStr, which: &str) -> bool {
+    name.to_str()
+        .is_some_and(|name| name.eq_ignore_ascii_case(which))
+}
+
+/// [`land`]'s policy for `found`, a folder of the drive checked out where
+/// `own` guards, among every checkout of this host, `guards` (R441, R456
+/// 01).
+fn kept_out_of(
+    found: &Path,
+    id: (u64, u64),
+    own: &DriveGuard,
+    guards: &[DriveGuard],
+) -> Result<(), String> {
+    let (drive, root) = (own.id.as_str(), own.root.as_path());
+    let mine = |clause: &str| format!("it {clause}, which keeper keeps to itself");
+    if identity(root).is_ok_and(|root| root == id) {
+        return Err(format!("it is the whole drive {drive}"));
+    }
+    // Another checkout: a folder inside one — its drive's checkout nested
+    // in another's, or another nested in its drive — or holding one is
+    // given as neither drive's, by name or by identity: its files are that
+    // other checkout's too, under that one's readers and `local_only`.
+    let others: Vec<&DriveGuard> = guards.iter().filter(|guard| *guard != own).collect();
+    if let Some(other) = others.iter().find(|other| {
+        found.starts_with(&other.root)
+            || other.root.starts_with(found)
+            || below(&other.root, found)
+            || below(found, &other.root)
+    }) {
+        return Err(format!(
+            "it is inside, or holds, {}, another checkout of this host: a folder of two checkouts is given as neither's",
+            other.id
+        ));
+    }
+    let kept: Vec<(&str, &PathBuf)> = guards
+        .iter()
+        .flat_map(|guard| guard.kept.iter().map(move |at| (guard.id.as_str(), at)))
+        .collect();
+    let kept_ids: Vec<(u64, u64)> = kept
+        .iter()
+        .map(|(_, at)| *at)
+        .chain(others.iter().map(|other| &other.root))
+        .filter_map(|at| identity(at).ok())
+        .collect();
+    // Inside one: the folder or a folder above it, up to the checkout.
+    for at in found.ancestors().take_while(|at| *at != root) {
+        let name = at.file_name().unwrap_or_default();
+        if kept_name(name, ".keeper") {
+            return Err(mine(&format!("is inside {drive}'s .keeper folder")));
+        }
+        if at.parent() == Some(root) && kept_name(name, ".git") {
+            return Err(mine(&format!("is inside {drive}'s .git folder")));
+        }
+        if let Some((whose, _)) = kept.iter().find(|(_, kept)| at == kept.as_path()) {
+            return Err(mine(&format!(
+                "is inside {whose}'s agents zone, sessions zone or .git folder"
+            )));
+        }
+        if identity(at).is_ok_and(|at| kept_ids.contains(&at)) {
+            return Err(mine(
+                "is inside an agents zone, a sessions zone, a .git folder or another checkout",
+            ));
+        }
+    }
+    // Holding one: a kept folder below it, by name or by identity.
+    if let Some((whose, _)) = kept
+        .iter()
+        .find(|(_, kept)| kept.starts_with(found) || below(found, kept))
+    {
+        return Err(mine(&format!(
+            "holds {whose}'s agents zone, sessions zone or .git folder"
+        )));
+    }
+    // Below it at any depth: a `.keeper`, or a kept folder or another
+    // checkout by another name. Links are not followed — the sandbox does
+    // not grant through one either.
+    let mut pending = vec![found.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let unread =
+            |error: std::io::Error| format!("{} could not be read ({error})", dir.display());
+        for entry in std::fs::read_dir(&dir).map_err(unread)? {
+            let entry = entry.map_err(unread)?;
+            if !entry.file_type().map_err(unread)?.is_dir() {
+                continue;
+            }
+            let path = entry.path();
+            if kept_name(&entry.file_name(), ".keeper") {
+                return Err(mine(&format!(
+                    "holds a .keeper folder ({})",
+                    path.strip_prefix(found).unwrap_or(&path).display()
+                )));
+            }
+            if identity(&path).is_ok_and(|at| kept_ids.contains(&at)) {
+                return Err(mine(
+                    "holds an agents zone, a sessions zone, a .git folder or another checkout by another name",
+                ));
+            }
+            pending.push(path);
+        }
+    }
+    Ok(())
 }
 
 /// Why nothing is granted when `path`, a credential or what is below one,
@@ -359,6 +771,16 @@ impl SandboxHost {
         Ok(sandbox)
     }
 
+    /// Why `folder` may not be given to this host's runs, as it resolves
+    /// now: what [`Self::plan`] refuses it with. The console's offer leaves
+    /// such a folder out, saying why, rather than refuse every run.
+    pub fn folder_refusal(&self, folder: &Granted) -> Option<String> {
+        match self.forbidden.credentials() {
+            Ok(credentials) => self.forbidden.folder_refusal(folder, &credentials),
+            Err(reason) => Some(reason),
+        }
+    }
+
     /// Read what the call `args` relies on, in `session`, among `drives` —
     /// the drives in its scope this host mounts and the agent's grants let
     /// it read, by id and checkout — and compose what its approval binds.
@@ -525,6 +947,9 @@ impl SandboxHost {
             workspace: root,
             cwd,
             mounted,
+            paths: Vec::new(),
+            extra: Vec::new(),
+            unsandboxed: false,
             expect,
         })
     }
@@ -584,6 +1009,25 @@ impl SandboxHost {
             grants.push((PathBuf::from(device), Access::Read));
         }
         let mut drives = Vec::new();
+        // The console's folders and those this run asked for (story 101.5,
+        // R440 01, 08), only for a run without network: one with it sees
+        // only its workspace (S-03). Each is landed once more, as it is
+        // now, and pinned by its device and inode, so the sandbox's rule is
+        // built from the folder checked here — overlapping folders each
+        // checked on their own.
+        let mut pinned = Vec::new();
+        if !request.network {
+            for folder in prepared.paths.iter().chain(&prepared.extra) {
+                folder
+                    .again()
+                    .map_err(|why| format!("This run was refused: {why}."))?;
+                if let Some(reason) = self.forbidden.folder_refusal(folder, &credentials) {
+                    return Err(refused(reason));
+                }
+                grants.push((folder.path.clone(), Access::ReadWrite));
+                pinned.push((folder.path.clone(), folder.id));
+            }
+        }
         for (id, root) in &prepared.mounted {
             if let Some(reason) = core_run::grant_refusal(
                 &canonical(root),
@@ -620,6 +1064,8 @@ impl SandboxHost {
             drives,
             expect: prepared.expect.clone(),
             timeout_s: request.timeout_s,
+            pinned,
+            unsandboxed: prepared.unsandboxed,
         })
     }
 
@@ -629,8 +1075,37 @@ impl SandboxHost {
     /// its own process group, which keeper's filter lets nothing leave,
     /// killed whole when it ends or its time is up; each stream kept to
     /// [`STREAM_CAP`] bytes and counted, and drained for at most [`DRAIN`]
-    /// after.
+    /// after. Refused for a call prepared for the console's `full` mode.
     pub fn execute(&self, prepared: &Prepared) -> Result<Ran, String> {
+        if prepared.unsandboxed {
+            return Err(
+                "This run did not start: it was prepared to run without a sandbox.".to_owned(),
+            );
+        }
+        let dir = tempfile_dir("run")?;
+        let ran = self.execute_in(prepared, &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        ran
+    }
+
+    /// Run `prepared` without the sandbox: the console's `full` mode
+    /// (story 101.5, R420), which a person chose for the agent. Everything
+    /// else is [`Self::execute`]'s — what runs checked once more, the same
+    /// allow-listed environment with its own `HOME` and `TMPDIR`, its own
+    /// process group killed whole, its time and output bounded — and its
+    /// lifetime bound is kept apart from the sandbox (R440 05): on Linux it
+    /// starts through the trampoline, which applies no landlock and no
+    /// filter but the one refusing `setsid` and `setpgid`, so no process of
+    /// it leaves the group keeper kills; on the Mac the group and the sweep
+    /// by `TMPDIR` are what holds, as for every run there (DW-757), and the
+    /// result says what was found. Refused for a call not prepared for it,
+    /// so a sandboxed call never runs here.
+    pub fn execute_unsandboxed(&self, prepared: &Prepared) -> Result<Ran, String> {
+        if !prepared.unsandboxed {
+            return Err(
+                "This run did not start: it was not prepared to run without a sandbox.".to_owned(),
+            );
+        }
         let dir = tempfile_dir("run")?;
         let ran = self.execute_in(prepared, &dir);
         let _ = std::fs::remove_dir_all(&dir);
@@ -648,6 +1123,9 @@ impl SandboxHost {
         }
         let plan = self.plan(prepared, &home, &tmp)?;
         verify(&plan).map_err(|reason| format!("This run did not start: {reason}"))?;
+        // Right before the profile is built, or the trampoline opens them:
+        // each pinned folder still the one checked (R440 01).
+        pinned_still(&plan).map_err(|reason| format!("This run did not start: {reason}"))?;
         let mut command = match &self.kind {
             Kind::Trampoline { program, args } => {
                 let plan_path = dir.join("plan.json");
@@ -656,6 +1134,16 @@ impl SandboxHost {
                 std::fs::write(&plan_path, text).map_err(failed)?;
                 let mut command = Command::new(program);
                 command.args(args).arg(&plan_path).env_clear();
+                command
+            }
+            #[cfg(target_os = "macos")]
+            Kind::SandboxExec if plan.unsandboxed => {
+                let mut command = Command::new(&plan.exe);
+                command
+                    .args(plan.argv.iter().skip(1))
+                    .env_clear()
+                    .envs(plan.env.iter().map(|(name, value)| (name, value)))
+                    .current_dir(&plan.cwd);
                 command
             }
             #[cfg(target_os = "macos")]
@@ -854,6 +1342,26 @@ pub fn verify_program(
     Ok(())
 }
 
+/// Whether each folder `plan` pins (story 101.5, R440 01) is still the one
+/// keeper checked, right before the host's sandbox is built from it: the
+/// same device and inode at the same place, reached through no link — a
+/// folder swapped for another, or for a link, since is refused. On the Mac
+/// the profile names the folder by its path, so this is the last check;
+/// on Linux the trampoline opens it by identity after.
+pub fn pinned_still(plan: &SandboxPlan) -> Result<(), String> {
+    for (path, id) in &plan.pinned {
+        let same = identity(path).is_ok_and(|at| at == *id)
+            && path.canonicalize().is_ok_and(|at| at == *path);
+        if !same {
+            return Err(format!(
+                "the folder {} changed after keeper checked it",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// What a call relies on, read from the disk.
 #[derive(Debug, Clone)]
 pub struct Prepared {
@@ -870,8 +1378,66 @@ pub struct Prepared {
     pub cwd: PathBuf,
     /// The drives it reads, by id and canonical checkout.
     pub mounted: Vec<(String, PathBuf)>,
+    /// The console's folders it may read and write (story 101.5).
+    pub paths: Vec<Granted>,
+    /// The folders this run asked for beyond them, a person approving
+    /// them for it alone (R440 08).
+    pub extra: Vec<Granted>,
+    /// Prepared for the console's `full` mode: started without the
+    /// sandbox, and bound so.
+    pub unsandboxed: bool,
     /// What the host checks once more before the program starts.
     pub expect: Expected,
+}
+
+/// A granted folder as an approval binds it: where it landed and, by
+/// device and inode, which folder it is (R440 01).
+fn bound_folder(folder: &Granted) -> Value {
+    serde_json::json!({
+        "path": folder.path.display().to_string(),
+        "written": folder.written,
+        "folder": [folder.id.0, folder.id.1],
+    })
+}
+
+impl Prepared {
+    /// This call as the agent's console in `mode` gives it (story 101.5,
+    /// R420, R440 06, 08): the console's `folders` and the `extra` ones it
+    /// asked for — a sandboxed run without network only — or, at `full`,
+    /// no sandbox and no folder. The mode (but `supervised`, epic 96's), each
+    /// folder by place and identity and whether it runs without the
+    /// sandbox are bound into what an approval binds — the one-shot record
+    /// and a `session` allowance's key alike — so a run approved in one
+    /// console never runs in another. A supervised console with no folders
+    /// binds what it bound before.
+    pub fn in_console(
+        mut self,
+        mode: keeper_core::agents::console::RunMode,
+        folders: Vec<Granted>,
+        extra: Vec<Granted>,
+    ) -> Prepared {
+        use keeper_core::agents::console::RunMode;
+        if mode != RunMode::Supervised {
+            self.exec_binding["mode"] = Value::String(mode.as_str().to_owned());
+        }
+        if mode == RunMode::Full {
+            self.exec_binding["unsandboxed"] = Value::Bool(true);
+            self.unsandboxed = true;
+            return self;
+        }
+        if self.request.network {
+            return self;
+        }
+        if !folders.is_empty() {
+            self.exec_binding["paths"] = folders.iter().map(bound_folder).collect();
+            self.paths = folders;
+        }
+        if !extra.is_empty() {
+            self.exec_binding["extra"] = extra.iter().map(bound_folder).collect();
+            self.extra = extra;
+        }
+        self
+    }
 }
 
 /// What a run came to.
@@ -1251,14 +1817,15 @@ fn mount(dir: &Path) -> std::io::Result<(Vec<PathBuf>, bool)> {
     Ok((grants, excluded))
 }
 
-/// The readers and `local_only` of each drive a run mounted, for its label.
-pub fn mounted_labels(
-    mounted: &[(String, PathBuf)],
+/// The readers and `local_only` of each drive of `ids` — a run mounted it,
+/// or was given a folder of it (R440 02) — for its label: a drive this host
+/// has no declaration of is read by nobody.
+pub fn drive_labels(
+    ids: &[String],
     drives: &std::collections::BTreeMap<String, keeper_core::agents::drive::DriveDecl>,
 ) -> Vec<(BTreeSet<matrix_sdk::ruma::OwnedUserId>, bool)> {
-    mounted
-        .iter()
-        .map(|(id, _)| {
+    ids.iter()
+        .map(|id| {
             drives.get(id).map_or_else(
                 || (BTreeSet::new(), false),
                 |decl| (decl.readers.clone(), decl.local_only),
@@ -1303,6 +1870,259 @@ mod tests {
             zone: "60-sessions",
             path: "active/s",
         }
+    }
+
+    /// A drive checked out at `root` with keeper's own folders — its agents
+    /// and sessions zones and its `.git` — a project folder, and a nested
+    /// `.keeper` below another: the drive's guard, as its profile names
+    /// them.
+    fn console_drive(root: &Path) -> Vec<DriveGuard> {
+        for dir in [
+            "80-agents/nixi",
+            "60-sessions/active",
+            ".git",
+            "projects/site",
+            "projects/notes/.keeper",
+        ] {
+            std::fs::create_dir_all(root.join(dir)).expect("folder");
+        }
+        std::fs::write(root.join("80-agents/nixi/agent.toml"), "x").expect("home");
+        let mut profile = keeper_sync::SyncProfile::new("tgdrive", "tgdrive", root, "unused");
+        profile.agents = Some(Default::default());
+        profile.sessions = Some(Default::default());
+        guards(&[Checkout {
+            id: "tgdrive".to_owned(),
+            mounted: true,
+            profile,
+            pin: None,
+        }])
+    }
+
+    fn drive_path(path: &str) -> keeper_core::agents::console::RunPath {
+        keeper_core::agents::console::RunPath::Drive {
+            drive: "tgdrive".to_owned(),
+            path: path.to_owned(),
+        }
+    }
+
+    /// R440 01, 04, R441: a console's folder lands through the drive's
+    /// resolver and is kept from every folder keeper keeps to itself —
+    /// inside or holding the agents or sessions zone or the root's `.git`,
+    /// holding a `.keeper` at any depth, a harmless name linked to one,
+    /// case-folded — and from a drive out of the session's scope; a host
+    /// path inside a drive's checkout is refused (named as the drive's
+    /// folder, the drive's rules apply), a host folder's own `.git` is not.
+    /// A folder replaced since it landed — by a link to the agents zone, or
+    /// by another folder at its name — no longer lands as it was.
+    #[test]
+    fn a_console_folder_is_landed_by_identity_and_kept_from_keepers_own() {
+        use keeper_core::agents::console::RunPath;
+        let tree = tempfile::tempdir().expect("tree");
+        let root = tree
+            .path()
+            .canonicalize()
+            .expect("canonical")
+            .join("tgdrive");
+        let guards = console_drive(&root);
+        let scope = ["tgdrive".to_owned()];
+        let land_at = |path: &str| land(&drive_path(path), &guards, &scope);
+        let site = land_at("projects/site").expect("a plain folder");
+        assert_eq!(site.path, root.join("projects/site"));
+        assert_eq!(
+            site.origin,
+            Origin::Drive {
+                drive: "tgdrive".to_owned(),
+                at: "projects/site".to_owned(),
+            }
+        );
+        let links = root.join("projects/site");
+        std::os::unix::fs::symlink(root.join(".git"), root.join("projects/alias")).expect("link");
+        std::os::unix::fs::symlink(root.join("80-agents"), root.join("projects/up")).expect("link");
+        std::os::unix::fs::symlink(root.join("projects/notes/.keeper"), root.join("projects/k"))
+            .expect("link");
+        std::fs::create_dir_all(root.join("projects/loud/.KEEPER")).expect("loud");
+        for refused in [
+            "projects",
+            "projects/notes",
+            "projects/alias",
+            "projects/up",
+            "projects/k",
+            "projects/loud",
+            "80-agents/nixi",
+            "60-sessions/active",
+        ] {
+            assert!(land_at(refused).is_err(), "{refused}");
+        }
+        assert!(
+            land(&drive_path("projects/site"), &guards, &[]).is_err(),
+            "out of scope"
+        );
+        let inside = RunPath::Host(links.display().to_string());
+        assert!(
+            land(&inside, &guards, &scope).is_err(),
+            "a host path in a drive"
+        );
+        let own = tempfile::tempdir().expect("own");
+        std::fs::create_dir(own.path().join(".git")).expect("a repository");
+        let host = RunPath::Host(own.path().display().to_string());
+        assert_eq!(
+            land(&host, &guards, &scope).expect("a host folder").origin,
+            Origin::Host
+        );
+
+        assert_eq!(site.again(), Ok(()));
+        std::fs::rename(&links, root.join("projects/site-old")).expect("moved");
+        std::os::unix::fs::symlink(root.join("80-agents"), &links).expect("swapped");
+        assert!(site.again().is_err(), "a link to the agents zone");
+        std::fs::remove_file(&links).expect("unlinked");
+        std::fs::create_dir(&links).expect("another folder");
+        assert!(site.again().is_err(), "another folder at its name");
+    }
+
+    /// R456 01: a console folder is checked against every checkout of its
+    /// host, not only its drive's. Inside another checkout nested in its
+    /// drive, or holding one, it is given as neither drive's; inside or
+    /// holding another checkout's agents zone wherever that resolves —
+    /// linked into its drive's tree — it is refused, and so is a host folder
+    /// holding one linked out of every checkout; a checkout this host does
+    /// not mount is never named as a drive. A plain folder is given.
+    #[test]
+    fn a_console_folder_is_kept_from_every_checkout_of_its_host() {
+        use keeper_core::agents::console::RunPath;
+        let tree = tempfile::tempdir().expect("tree");
+        let base = tree.path().canonicalize().expect("canonical");
+        let root = base.join("tgdrive");
+        let mut guards = console_drive(&root);
+        let checkout = |id: &str, at: &Path| {
+            let mut profile = keeper_sync::SyncProfile::new(id, id, at, "unused");
+            profile.agents = Some(Default::default());
+            profile.sessions = Some(Default::default());
+            Checkout {
+                id: id.to_owned(),
+                mounted: false,
+                profile,
+                pin: None,
+            }
+        };
+        // A checkout nested in tgdrive; one configured under tgdrive's
+        // `docs` and not synced yet; one beside it whose agents zone is a
+        // link into tgdrive's projects; one whose agents zone is a link out
+        // of every checkout.
+        std::fs::create_dir_all(root.join("docs")).expect("docs");
+        std::fs::create_dir_all(root.join("projects/inner/notes")).expect("inner");
+        std::fs::create_dir_all(root.join("projects/shared/zone")).expect("a zone in tgdrive");
+        let (beside, far, away) = (base.join("beside"), base.join("far"), base.join("away"));
+        std::fs::create_dir_all(beside.join("docs")).expect("beside");
+        std::fs::create_dir_all(&far).expect("far");
+        std::fs::create_dir_all(away.join("zone")).expect("away");
+        symlink(root.join("projects/shared/zone"), beside.join("80-agents")).expect("link");
+        symlink(away.join("zone"), far.join("80-agents")).expect("link");
+        guards.extend(super::guards(&[
+            checkout("inner", &root.join("projects/inner")),
+            checkout("later", &root.join("docs/later")),
+            checkout("beside", &beside),
+            checkout("far", &far),
+        ]));
+        let scope = ["tgdrive".to_owned(), "beside".to_owned()];
+        let land_at = |path: &str| land(&drive_path(path), &guards, &scope);
+        for refused in [
+            "projects",
+            "projects/inner",
+            "projects/inner/notes",
+            "projects/shared",
+            "projects/shared/zone",
+            "docs",
+        ] {
+            assert!(land_at(refused).is_err(), "{refused}");
+        }
+        assert!(land_at("projects/site").is_ok(), "a plain folder");
+        let unmounted = RunPath::Drive {
+            drive: "beside".to_owned(),
+            path: "docs".to_owned(),
+        };
+        assert!(
+            land(&unmounted, &guards, &scope).is_err(),
+            "a checkout mounted for no agent"
+        );
+        let host = RunPath::Host(away.display().to_string());
+        assert!(
+            land(&host, &guards, &scope).is_err(),
+            "a host folder holding a checkout's agents zone"
+        );
+    }
+
+    /// R440 01, 06, 08: what an approval binds of a console — its mode but
+    /// epic 96's `supervised`, each folder by place and identity, the
+    /// folders one run asked for, and no sandbox at full access — and what
+    /// a plan grants: each folder read-write, pinned by identity, to a run
+    /// without network only; a call prepared for one mode never runs in
+    /// the other's path.
+    #[test]
+    fn a_console_is_bound_and_pinned_as_it_was_checked() {
+        use keeper_core::agents::console::RunMode;
+        let (_root, zone, _) = zone();
+        let folder = tempfile::tempdir().expect("folder");
+        let spelled =
+            keeper_core::agents::console::RunPath::Host(folder.path().display().to_string());
+        let granted = land(&spelled, &[], &[]).expect("landed");
+        let prepare = |args: Value| {
+            host()
+                .prepare(&args, session(&zone), &[])
+                .expect("prepared")
+        };
+        let own = tempfile::tempdir().expect("own");
+        let plan = |prepared: &Prepared| {
+            host()
+                .plan(prepared, own.path(), own.path())
+                .expect("planned")
+        };
+        let plain = prepare(serde_json::json!({"argv": ["true"]}));
+        let before = plain.exec_binding.clone();
+        assert_eq!(
+            plain
+                .clone()
+                .in_console(RunMode::Supervised, Vec::new(), Vec::new())
+                .exec_binding,
+            before
+        );
+        let given = plain.in_console(RunMode::Sandboxed, vec![granted.clone()], Vec::new());
+        assert_eq!(given.exec_binding["mode"], "sandboxed");
+        assert_eq!(
+            given.exec_binding["paths"][0]["folder"],
+            serde_json::json!([granted.id.0, granted.id.1])
+        );
+        let planned = plan(&given);
+        assert!(planned
+            .grants
+            .contains(&(granted.path.clone(), Access::ReadWrite)));
+        assert_eq!(planned.pinned, [(granted.path.clone(), granted.id)]);
+        let asked = prepare(serde_json::json!({"argv": ["true"], "folders": ["/x"]})).in_console(
+            RunMode::Sandboxed,
+            Vec::new(),
+            vec![granted.clone()],
+        );
+        assert_ne!(asked.exec_binding["extra"], Value::Null);
+        assert_eq!(asked.exec_binding.get("paths"), None);
+
+        let networked = prepare(serde_json::json!({"argv": ["true"], "network": true})).in_console(
+            RunMode::Sandboxed,
+            vec![granted.clone()],
+            Vec::new(),
+        );
+        assert_eq!(networked.exec_binding.get("paths"), None);
+        assert!(plan(&networked).pinned.is_empty());
+
+        let full = prepare(serde_json::json!({"argv": ["true"]})).in_console(
+            RunMode::Full,
+            vec![granted.clone()],
+            Vec::new(),
+        );
+        assert_eq!(full.exec_binding["unsandboxed"], serde_json::json!(true));
+        assert!(full.paths.is_empty() && plan(&full).unsandboxed);
+        assert!(host().execute(&full).is_err());
+        assert!(host()
+            .execute_unsandboxed(&prepare(serde_json::json!({"argv": ["true"]})))
+            .is_err());
     }
 
     /// R96R2-01, R231: the walk to `workspace/` starts at the drive and

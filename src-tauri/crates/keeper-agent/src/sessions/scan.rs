@@ -17,7 +17,7 @@ use keeper_core::notes::frontmatter::Frontmatter;
 use keeper_core::notes::naming::title_from_body;
 use keeper_core::sessions::model::{
     classify, freshness, lineage, Freshness, SessionStatus, ACTIVE_DIR, ARCHIVE_DIR, ARTIFACTS_DIR,
-    README, WORKSPACE_DIR,
+    ATTACHMENTS_DIR, README, WORKSPACE_DIR,
 };
 use keeper_core::sessions::pool::{log_candidates, read_one, PoolFile};
 use keeper_core::sessions::shape::{shape as shape_of, KindTag, Shape, PROMPTS_DIR, REFS_DIR};
@@ -527,14 +527,16 @@ pub const REF_DIRS: [&str; 2] = [REFS_DIR, PROMPTS_DIR];
 /// a reference from the artifact, not from the session. `workspace/` — scratch
 /// that dies with the session (AD-113), so a task or a log filed there would be
 /// a card that vanishes, and a broken pointer in a file nobody keeps is not
-/// worth reporting.
+/// worth reporting. `attachments/` — the files a person sent into an agent's
+/// room (story 101.2): data the agent reads, never a card or a note of the
+/// session, whatever its frontmatter says.
 ///
 /// Public, with [`scans_markdown`], because it is the one list: a directory
 /// keeper offers to create but never reads is a directory whose files are in no
 /// pool, no space and not even *Unfiled* — the exact defect this scan was
 /// widened to fix. Two lists is how the create side and the read side come to
 /// disagree, and the disagreement is silent.
-pub const UNSCANNED_DIRS: [&str; 2] = [ARTIFACTS_DIR, WORKSPACE_DIR];
+pub const UNSCANNED_DIRS: [&str; 3] = [ARTIFACTS_DIR, WORKSPACE_DIR, ATTACHMENTS_DIR];
 
 /// Whether the markdown scan enters a session subdirectory of this name.
 ///
@@ -1382,10 +1384,9 @@ mod tests {
             scans_markdown("spaces") && scans_markdown("log"),
             "a directory the operator makes is a real home"
         );
-        assert_eq!(
-            UNSCANNED_DIRS.len(),
-            2,
-            "two names and a prefix rule — a third name would need its own reason"
+        assert!(
+            !scans_markdown("attachments") && !scans_markdown("Attachments"),
+            "a person's files are data the agent reads, never cards (R417)"
         );
     }
 

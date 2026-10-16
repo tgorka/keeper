@@ -338,6 +338,40 @@ fn a_glob_is_bounded_and_does_not_cross_a_separator() {
     ));
 }
 
+/// Story 101.3 (R434): a name search finds files of any kind by the caller's
+/// rule, never walks into a folder it refuses, keeps at most `max_paths`
+/// and says how many matched.
+#[test]
+fn a_name_search_skips_refused_folders_and_is_bounded() {
+    let dir = tempfile::tempdir().expect("root");
+    let root = dir.path();
+    write(root, "trips/tatry-budget.csv", "a,b\n");
+    write(root, "scans/tatry-map.pdf", "%PDF\n");
+    write(root, "notes/tatry.md", "x\n");
+    write(root, ".git/tatry-object", "x\n");
+    write(root, "other.md", "x\n");
+    let tatry = |name: &str| name.starts_with("tatry");
+    let visible = |name: &str| !name.starts_with('.');
+
+    let mut found = bots_fs::find_names(root, "", &roomy(), &visible, &tatry)
+        .expect("search")
+        .paths;
+    found.sort();
+    assert_eq!(
+        found,
+        vec![
+            "notes/tatry.md".to_owned(),
+            "scans/tatry-map.pdf".to_owned(),
+            "trips/tatry-budget.csv".to_owned(),
+        ]
+    );
+
+    let capped = bots_fs::find_names(root, "", &limits(), &visible, &tatry).expect("search");
+    assert_eq!(capped.paths.len(), 2);
+    assert_eq!(capped.of_paths, 3);
+    assert_eq!(capped.truncated_at, Some(2));
+}
+
 // ---------------------------------------------------------------------------
 // Binary and pointer files — the two things that are not what they look like
 // ---------------------------------------------------------------------------

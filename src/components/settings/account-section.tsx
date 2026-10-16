@@ -546,7 +546,6 @@ function DeviceList({
                   aria-label={`${ACCOUNT_RENAME_LABEL} ${device.name}`}
                   className="min-w-40 flex-1 font-mono"
                   autoComplete="off"
-                  spellCheck={false}
                   value={draft}
                   onChange={(event) => setDraft(event.target.value)}
                 />

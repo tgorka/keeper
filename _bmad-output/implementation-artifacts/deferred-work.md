@@ -10589,7 +10589,8 @@ status: open
 origin: makistack's electra (2026-10-14): in Nixi's DM, 283 of the newest 300 events were `dev.keeper.agent.claim` (state key `""`, one per ~61 s; `renewed_at` moving)
 location: `keeper_agent::hosts` (claim renewal), `keeper_core::agents::claims`
 reason: 1 440 state events a day per served session room. A person's client must page through them to reach a message after any limited sync, and every Matrix client a person might use shows a session room as mostly invisible state. keeper's window now fills itself in 200-event pages (`conversation-body.tsx`), which hides the symptom. A fix at the source: renew less often (a longer lease with the same takeover semantics), or keep the lease's heartbeat out of the room's timeline — e.g. renew only near expiry, or move liveness to the host manifest in the control room and write the session claim only on acquire, release and takeover.
-status: open
+status: done 2026-10-15
+resolution: closed by story 101.1 #7 (lane `rooms`, R416; fix round 1, R449): a session's claim runs on `claim::LeaseKind::QuarterHour` — renewed every 15 min, stopped after 30, lapsed after 45, the takeover margin a whole renewal — while every live host manifest in the control room advertises `lease: "quarter-hour"` (`LeaseKind::for_fleet`); beside a host built before it the claim stays on the minute lease (60/120/180 s) and a holder drops to it at its next step when such a host appears (`beside_an_old_host_the_claim_never_looks_free_while_its_holder_writes`, `a_holder_drops_to_the_minute_lease_when_an_old_host_appears`, `a_claim_lapses_by_the_lease_it_says`). 96 renewals a day instead of 1 440 on an updated fleet; control-room claims (maintenance, pictures, the DM request) keep the minute lease. A host that vanishes holds its sessions for up to 45 min; one that stops cleanly releases them at once. The residual is DW-1444. Fix round 2 (R455): the quarter-hour lease is an operator's cutover, off by default (`agentd.toml` `[claims] lease`, the Mac's `agents.claims_lease`); until it is turned on every claim stays on the minute lease and this entry's timeline cost stays as it was.
 
 ### DW-1386: Marta's organisation-account setup is proved against a stub callback, not against ZITADEL.
 
@@ -10804,3 +10805,328 @@ origin: rung `agents-100-slash` (story 100.5 #2, R394), 2026-10-14
 location: `keeper_core::agents::proxy::AgentOutbound` (closed, five variants), `src/components/notes/notes-agent-dock.tsx` (the scope editor)
 reason: the device has no stop or pause verb for a run (the host owns it), and a scope is edited only in the notes dock; a command for either would be a new agent protocol or a second editor, which R385 rules out. When either verb exists on the device, it joins the agent set in Rust.
 status: open
+
+### DW-1440: `live_consolidate` now sleeps 45 minutes.
+
+origin: lane `rooms` (story 101.1 #7, R416), 2026-10-15
+location: `src-tauri/crates/keeper-agentd/tests/live_consolidate.rs` (`tokio::time::sleep(claim::STOP_WITHOUT_RENEWAL + RENEW_EVERY)`)
+reason: the test holds a maintenance claim "longer than a holder may go unrenewed" in real time against Synapse; with the lease scaled to a quarter-hour cadence that is 45 minutes. It still proves what it proved, but no lane will run it in a gate. A lease length injectable per claim port (or a test-only `ServerClock` wall) would let it run in seconds; not built here, because every caller would carry a parameter only this test needs.
+status: done 2026-10-15
+resolution: fix round 1 (R449): only a session's own claim takes the quarter-hour lease; a maintenance claim keeps the minute lease, so `live_consolidate` sleeps `STOP_WITHOUT_RENEWAL + RENEW_EVERY` = 180 s again, as on the parent.
+
+### DW-1441: The kept seats are never pruned.
+
+origin: lane `rooms` (story 101.1 #2, R416), 2026-10-15
+location: `keeper_core::agents::seats` (`agent_room_seats` in `keeper.db`)
+reason: a seat is written when a status first admits a room and replaced by a newer one; a room the person left or forgot keeps its row. The rows are small (ids, kind, a title) and read once per launch, so nothing breaks, but the table only grows. Fix round 1 (R451) removes an account's rows at sign-out (`AgentKinds::forget_account`, `SeatStore::forget`); the sweep when a room is forgotten belongs with the room-list's own forgetting and is what is left.
+status: open
+
+### DW-1442: The launch's reason does not count session rooms whose status is unread.
+
+origin: lane `rooms` (survey seam 3, story 101.1), 2026-10-15
+location: `keeper_core::agents::launch::LaunchFacts`, `no_main_room_sentence`
+reason: with the kept seat and the DM request, a default agent whose DM is out of reach is admitted (or asked for) rather than reported missing, so the case the survey's seam 3 named — "no conversation" said when the conversation exists but is unread — is now only a room no seat was ever kept for (a first launch on a new device with its status buried). Counting joined session rooms with no readable status in `LaunchFacts` would let that one sentence say "has not arrived" instead; not needed by any acceptance item.
+status: open
+
+### DW-1443: The DM request is not proved through the Mac's desktop host.
+
+origin: lane `rooms` (story 101.1 #4, R416), 2026-10-15
+location: `keeper_agent::dm_request`, `keeper_agent::desktop` (both hosts hear it through `runtime::start_copy` → `register_handlers` and serve it at their tick, `dm_request::serve_all`)
+reason: the live test runs agentd's host (`live_main_dm.rs`); the Mac's desktop host shares the handler but runs only on macOS. Owed on hesperia: with Nixi served by the Mac and no DM (a test account), ask from the dock and read the answer and `keeper.log`.
+status: open
+
+### DW-1444: A host built before R449 may take a quarter-hour claim at its first tick.
+
+origin: lane `rooms` fix round 1 (review-101rooms-1 R101R1-01, R449), 2026-10-15
+location: `keeper_core::agents::claim::LeaseKind::for_fleet`, `keeper_agent::hosts::HostRuntime::tick_session` (`lease.want`, `contested`)
+reason: the quarter-hour lease is taken only while every live manifest advertises it, and a holder drops to the minute lease at its next step once a host without it appears — but an old host that comes back publishes its manifest and, in the same tick, may judge a quarter-hour claim older than 180 s free and take it (placement prefers it when it is always-on and the holder is busy). The holder then sees a later epoch or another host in the cached claim and renews at once, which loses the lease (`contested` → `Step::Renew` → `renew` → `Lost`); the window is one host tick plus a sync, and the log's `(epoch, claim)` fence is the backstop for a line written in it. Closing it at the old host needs that host updated; the cutover is: update every host, then the quarter-hour lease follows on its own.
+status: closed
+resolution: replaced by R455 (lane `rooms` fix round 2, review-101rooms-2 R101R2-01), 2026-10-16. Not an acceptable residual: no automatic switch is safe against a released host that advertises nothing and can come back at any time, and "one tick plus a sync" is no bound during a partition. The quarter-hour lease is now an operator's cutover — off by default everywhere (`agentd.toml` `[claims] lease`, the Mac's `agents.claims_lease`), taken only where it is turned on and every live manifest advertises it, and a holder on it halts at its first sight of a live claim or manifest from a host that does not advertise it until its minute-lease renewal is confirmed (`claims::tests::by_default_an_old_host_returning_first_never_finds_a_written_claim_free`, `turned_on_a_holder_stops_at_first_sight_of_an_old_hosts_claim`, `a_holder_leaving_the_quarter_hour_lease_writes_nothing_until_its_minute_renewal`). With it turned on, the window this entry named remains by the operator's choice: docs/agents.md says the cutover order.
+
+### DW-1445: A new device without the room's keys cannot read a buried DM status.
+
+origin: lane `rooms` fix round 1 (review-101rooms-1 R101R1-03, R450), 2026-10-15
+location: `keeper_core::account::open_main_dm` (`ClientDmOpening::admit` → `HeaderReader::open_searching`)
+reason: after the host answers with an existing DM, keeper searches that room's history back to its status page after page — enough for an upgraded keeper (its device holds the room's keys, its `keeper.db` no seat). A device that joined after the status was sent and has no key backup reads the status as unreadable and the room is not admitted until a newer status (the next turn's) arrives. The host re-publishing its current status was the alternative R448 offered; it was not taken, because the host's newest status is an edit of the session's anchor that a running holder keeps writing, and a second, unedited status from the answering copy could stand newer than the holder's next edit.
+status: open
+
+### DW-1446: Sign-out deletes an account's kept seats before its readers stop.
+
+origin: lane `rooms` fix round 2 (review-101rooms-2 R101R2-04, R455), 2026-10-16
+location: `keeper_core::account::AccountManager::sign_out` (`AgentKinds::forget_account`, `SeatStore::forget` before `shutdown`), `keeper_core::agents::room::{fold_status, AgentKinds::remember}`, `keeper_core::agents::device::register`
+reason: the account's seats are removed from memory and keeper.db before its sync status handler and row producers are stopped; a status fold or row redraw in that window inserts the seat again and queues a fresh write, so a signed-out account can keep a seat. Not a cross-account disclosure (seats stay keyed by the account's own user), retained data only. Fix: an account-level seat generation invalidated before teardown, readers and handlers quiesced, then memory and rows removed; late writers under the old generation dropped. Test: an in-flight fold completing during sign-out leaves no seat.
+status: open
+
+### DW-1447: Two different statuses with one timestamp may persist in reverse order.
+
+origin: lane `rooms` fix round 2 (review-101rooms-2 R101R2-05, R455), 2026-10-16
+location: `keeper_core::agents::room::AgentKinds::remember` (write-current check on `status_ts` only), `keeper_core::agents::seats` (`>=` update)
+reason: A@100 then a different B@100 leaves B in memory and queues two blocking writes; both pass the timestamp check, and if B's write takes the writer lock first, A's overwrites it, so a restart reads A. Fix: under the writer lock persist the seat held in memory now (or require a per-key observation generation to match). Test: two equal-timestamp observations with their writes scheduled in reverse, then a restart.
+status: open
+
+### DW-1448: With several control rooms made by one agent, keeper asks for the DM in the first it finds.
+
+origin: lane `rooms` fix round 2 (live run of `an_existing_buried_dm_opens_on_a_device_that_kept_no_seat` on a populated smoke account, R455), 2026-10-16
+location: `keeper_core::account::control_room_with`
+reason: the request goes into the first joined control room whose sole creator is the agent; an agent re-initialised (or a person in an old one never left) has more than one, and its host reads only the one its `agentd.toml` names, so the ask ends at the 30 s bound with "did not answer". The populated live run found exactly this: earlier runs left the smoke person in many of the agent's control rooms, and the test's host now answers whichever one keeper chose. Fix: prefer the control room holding a live host manifest of the agent's principal (the room a host is serving), else the newest. Test: two control rooms of one agent, a manifest live in the second; the request goes there.
+status: open
+
+### DW-1449: `live_claims`' clean-shutdown takeover misses its two-tick bound on delectra — on the base too.
+
+origin: lane `101stack` (the stack of epic 101; review-101rooms-3), 2026-10-16
+location: `src-tauri/crates/keeper-agentd/tests/live_claims.rs` `a_clean_shutdown_releases_and_the_other_takes_over_within_two_ticks`
+reason: release → the next host's claim took 11,357 ms at the base 4e186ce8 (`/tmp/agents-salvage/live-claims-101rooms-base.log`), 10,709 ms at 525f1e25 and 8,774 / 10,994 ms at f491e1f4, against the test's 2,000 ms. The test is unchanged from the base and compares two server event timestamps on delectra's shared Synapse; the minute lease it runs on is the base's. Pre-existing timing, not epic 101's lease. Fix: bound the takeover in the host's own ticks (or on an idle homeserver) rather than 2 s of server time, and keep the expiry-takeover case (180 s) as it is.
+status: open
+
+### DW-1450: The PDF reader brings in an unmaintained font parser.
+
+origin: lane `files` (story 101.2 #3, R417), 2026-10-15
+location: `src-tauri/Cargo.toml` (`pdf-extract = "0.12"`), `keeper-agent` `attachments::pdf_text`
+reason: `pdf-extract` 0.12.1 depends on `lopdf` 0.42, which depends unconditionally on `ttf-parser` 0.25 — RUSTSEC-2026-0192, unmaintained (no vulnerability). Whether `cargo deny check` passes is CI's to show: no run of it on this rung is recorded (the binary is on neither the Linux dev host nor delectra). Replace when `pdf-extract` moves to a `lopdf` that reads fonts through `skrifa` (lopdf 0.45's `font_embedding`), or move to `pdf_oxide` (MIT OR Apache-2.0) if it does first.
+status: open
+
+### DW-1451: A PDF whose text takes longer than a minute keeps a blocking thread busy.
+
+origin: lane `files` (story 101.2 #3), 2026-10-15
+location: `keeper_agent::agent` `ServedSession::take_in` (`attachments::PDF_READ`)
+reason: the text is read on `spawn_blocking` and the turn stops waiting after `PDF_READ` (60 s, the PDF said unreadable), but a blocking thread cannot be cancelled: a hostile PDF that loops keeps one tokio blocking thread busy until it ends. A reader in a child process with a CPU limit (the `run` sandbox's trampoline) would end it.
+status: closed (fix round 1 of lane `files`, R444/03) — the text is read by the host's own binary re-run as a worker process with `RLIMIT_CPU`, `RLIMIT_AS` on Linux and `RLIMIT_FSIZE`, killed and reaped at `PDF_READ` or when the turn stops (`attachments::PdfReader`).
+
+### DW-1452: A file whose message understates its size is downloaded whole before it is refused.
+
+origin: lane `files` (story 101.2 #2), 2026-10-15
+location: `keeper_core::agents::matrix::AgentClient::download_media`, `ServedSession::take_in`
+reason: the 25 MiB cap is checked against the size the message states before the download and against the bytes after it; the SDK's `get_media_content` reads the whole body, so a sender who lies about `info.size` makes the host hold the file in memory before it is refused. A streaming download with a byte limit (the SDK's media request has none in 0.18) would bound it.
+status: closed (fix round 1 of lane `files`, R444/01) — `keeper_core::media::download_file` streams the body through the bound and refuses at the first byte past it, before any whole body is held or decrypted.
+
+### DW-1453: A photo is shown to the model only in the turn it arrived in.
+
+origin: lane `files` (story 101.2 #3, R417), 2026-10-15
+location: `run_agent_turn`'s `with_message`, `keeper_core::agents::log::replay::user_text`
+reason: the image part rides that turn's own user message and never the log, so a later turn (or a replay after a restart) reads the message with the photo's path only; the model's own answer of that turn carries what it saw. Showing it again needs the replay to hydrate `attachments/` images, with the vision answer and the per-message image cap applied there.
+status: open
+
+### DW-1454: Office documents reach the agent as named files only; audio and video are ignored, not stored.
+
+origin: lane `files` (story 101.2 #3), 2026-10-15
+location: `keeper_agent::attachments::kind_of`, `runtime::arrival_of`
+reason: a `.docx`, `.pptx` or `.xlsx` is stored and named but its text is not written beside it, though `keeper_core::document` reads all three; `m.audio` and `m.video` are not turns at all. The first is a `<name>.txt` written from `open_document`'s view model; the second needs a transcription decision (Epic 87 is on this Mac only).
+status: open
+
+### DW-1460: The Mac's and iOS's own text input are not yet watched not rewriting a message.
+
+origin: lane `composer` (story 101.3 #2, R418; R433), 2026-10-15
+location: `src/lib/text-entry.ts`, every field it reaches (R433)
+reason: an owed device check the coordinator runs at install — not acceptance closed by this entry (R433). The container has no macOS WebKit: Chrome read the four attributes on the composer, the Settings fields, a CSV cell's input and a rendered file's editable runs, and WebKit's source (`Editor::markAndReplaceFor`, `AlternativeTextController::canEnableAutomaticSpellingCorrection`) says `spellcheck=false`/`autocorrect=off` stop its substitutions on the Mac. Owed on hesperia, in the installed keeper: in the message composer of a chat and of the Nixi DM, in the bot composer, in a note, in a CSV cell and in Settings' push-gateway field, type `test thsi teh` at the very start and press space — it must stay exactly `test thsi teh` (no capital T, no `this`/`the`), and no grey inline prediction may appear; on kalypso the same in the composer with the iOS keyboard (no shift on the first letter, no correction bubble). If the Mac still capitalises, the shell's `WKWebView` configuration is the next seam.
+status: owed (device check at install)
+
+### DW-1461: The person's `Accounts` reader of waiting questions has no live harness.
+
+origin: lane `composer` (story 101.3 #4), 2026-10-15; narrowed in fix round 1
+location: `Accounts::subscribe_agent_asks` (`account::read_agent_asks`), `Accounts::chat_inline_context`, `Accounts::undo_window`
+reason: as DW-1432 — keeper-core has no harness that activates the person's `Accounts` against delectra's Synapse. Since fix round 1 the room-level reader is live-tested (`agents_matrix_live::a_waiting_question_survives_a_restart_and_ends_on_the_proxys_answer`: a restart reads the room back to the ask; the proxy's answer from its own device ends it), and the routing, answer rule and answer state are pure-tested (`agents::waiting::tests`); what stays unproved against a server is the `Accounts` glue — the proxy rooms' kinds, the subscription's wake-ups, the send queue and outbox reads. Owed: a live `Accounts` harness, or the hesperia run (Tola asks through Nixi from a `/new test` delegation; the panel appears in that conversation, not the DM; choosing sends the answer the proxy relays; Undo with a 5 s agent window puts the question back).
+status: open
+
+### DW-1462: A question asked in a room this device does not read never reaches the panel.
+
+origin: lane `composer` (story 101.3 #4, R418; R431), 2026-10-15
+location: `account::read_agent_asks`
+reason: the panel reads asks from the session rooms this account has joined, each read back to `ASK_READ_BACK` events. An ask in a session the person neither watches nor was invited to — a delegation between two agents — reaches only the proxy, whose own message in the conversation asks it in its words; it has no panel, and the room it was asked in still shows it. A device-readable copy of the ask in the answering room would be a new protocol (R418 rules one out); R431 keeps this limit.
+status: open
+
+### DW-1463: A mid-text file reference found notes only.
+
+origin: lane `composer` (story 101.3 #3, R418), 2026-10-15
+location: `keeper_core::chat::inline::menu` (`files`), shell `chat_inline_preview`
+reason: the first build searched only each drive's notes index.
+status: closed in fix round 1 (R434): files come from a bounded name walk of every drive on this device (`bots_fs::find_names`), any kind of file, with a drive-qualified identity and insert; a notes vault's titles are kept as display. Tests: `chat::inline::tests::a_file_reference_names_its_drive`, `keeper-sync` `a_name_search_skips_refused_folders_and_is_bounded`.
+
+### DW-1464: A free-answer question holds the panel until it is answered.
+
+origin: review-101composer-1 (DW candidate "head-of-line"), fix round 1, 2026-10-15
+location: `src/components/agents/decisions-panel.tsx` (`decisions[0]`)
+reason: the panel offers the first open decision; a question with no choices offers "type below" and no options, so a later question or approval waits behind it until the person types an answer (or the proxy relays one). The counter says how many wait, and each later one still shows on its card or in its room. A way to step to the next decision without answering the first (a "Next" key, or ↓ past the last option) is the fix.
+status: open
+
+### DW-1465: A failed read-back of an asking room can look like a complete, empty snapshot.
+
+origin: review-101composer-2 (R101C2-03), fix round 2, 2026-10-15 (R447)
+location: `keeper_core::agents::waiting::read_room`, `account::read_agent_asks`, `account::mine_in`
+reason: a back-pagination that errors or times out logs a WARN and returns what was loaded with `reached_start = false` — which means "did not reach the start", not "read failed" — and `read_agent_asks` skips an empty fold without setting `partial`; `mine_in` ignores the flag; a failure to admit the answering proxy room returns the empty default with no note. When the missing ask lies behind the failed read-back, the panel shows `{ asks: [], note: null }` despite the WARN. The fix: a distinct read-failed/incomplete outcome from `read_room`, carried into `note` even when nothing was recovered, and unread proxy admission told apart from an ineligible room; tested with a pagination timeout over an empty cache.
+status: closed (R453, fix round 2 of lane `agents-101-status`, 2026-10-15): `waiting::read_room` returns `Reach::{Start, Bound, Part}` — a back-pagination that errors or times out is `Part`; `account::asks_answered_in` (what `read_agent_asks` now calls) sets `ASKS_PARTIAL` for a `Part` room before folding, so an empty fold no longer drops it; `mine_in` reads a `Part` room as not whole; a proxy room whose status is unread (`proxy::Refusal::Unread`) answers no question with `ASKS_PARTIAL`, an ineligible one none. The same reading feeds the list's *Unknown* (`attention::tests::an_incomplete_reading_is_never_nothing_pending`). Not written: a test that times a back-pagination out — no harness here fails one on demand; the `Part` outcome's consumers are what is tested.
+
+### DW-1466: A failed or partial file lookup says nothing when it finds no rows.
+
+origin: review-101composer-2 (R101C2-04), fix round 2, 2026-10-15 (R447)
+location: `src/hooks/use-inline-slash.ts` (opens only with rows), `src/components/slash-menu/inline-slash-list.tsx`, shell `chat_inline_preview` (a walk error becomes `capped`), `keeper_core::chat::inline::files_note`
+reason: the inline menu opens only when it has rows, and its note is shown only while it is open, so an unread drive list or a capped search with no match looks like no match; a per-profile walk error is reported as the 5 000-entry bound being reached rather than as a drive that could not be read. The fix: the note rendered independently of selectable rows, and a walk failure carried apart from cap exhaustion with its own sentence; tested with unavailable and capped-empty previews.
+status: open
+
+
+### DW-1470: A web search query can carry a session's private words to the engine.
+
+origin: rung `agents-101-web` (story 101.4 #1, R419), 2026-10-15
+location: `keeper_core::agents::web_search::sink_refusal`, `keeper_agent::agent::AllowedTools::web_search`
+reason: R419 makes `web_search` T1 with the person's per-agent switch as their say over where queries go (as their choice of a model provider is), so only a `local_only` label stops a query; a session whose label is narrowed to its readers, or `untrusted` after reading outside content, still sends the words its model chose — which may quote a private file — to the engine and through it to the engines SearXNG asks. Blocking on the readers would make the tool unusable in every session of a private drive (its opening label is already narrowed), and blocking under `untrusted` would allow one search per session (its own answer lowers the integrity). A narrower rule — a person asked once per session when the label is narrowed and the session has read a drive file, or a query checked against the session's read paths — is a design decision for the coordinator.
+status: closed (R428, fix round 1 of rung `agents-101-web`, 2026-10-15): a search from a session whose label names its readers waits for a person's approval of that exact query to that engine — digest-bound through the approval machinery, `once` only, refused unsent on denial, expiry or a changed engine, never widening the label (`parks::a_search_from_a_private_session_waits_for_that_query`, `parks::an_approved_search_goes_only_to_the_engine_it_was_approved_for`)
+
+### DW-1471: Placement does not know which hosts can search the web.
+
+origin: rung `agents-101-web` (story 101.4 #2), 2026-10-15
+location: `keeper_core::agents::home::derived_needs`, `keeper_agent::hosts` (manifest capabilities), `src/components/settings/agents-section.tsx` (the switch's note)
+reason: an agent whose `[tools].allow` names `web_search`, served by a host with no `[web_search] url` (or a Mac with no engine saved), is simply not offered the tool there; its manifest carries no `web_search` capability, `[host].needs` cannot ask for one, and the Settings row does not say which of the person's hosts can search. Adding a capability changes placement for every agent that names the tool, which is beyond this story.
+status: open
+
+### DW-1472: Only SearXNG's `results` are read.
+
+origin: rung `agents-101-web` (story 101.4 #1), 2026-10-15
+location: `keeper_core::agents::web_search::parse_answer`
+reason: SearXNG's JSON also carries `answers`, `infoboxes`, `suggestions` and `unresponsive_engines`; keeper reads the first ten `results` only, so an engine whose upstreams all failed reads as "0 results" rather than naming the engines that did not answer.
+status: open
+
+### DW-1473: A web search's approval card reads T2's generic tier sentence.
+
+origin: rung `agents-101-web` fix round 1 (R428), 2026-10-15
+location: `keeper_core::agents::approval_card::tier_word`, `keeper_core::agents::tier` (`AgentTool::WebSearch` row)
+reason: a search from a label naming its readers is T2 so a person decides it once; the card's tier line is the tier's own sentence, "T2: it changes something that can be put back", while a query once sent cannot be called back (seen in the mock shell at `?approval=web-search`). The card's summary names the query and the engine exactly, so the decision is informed; a per-tool sentence on the card is a change to every card's tier line, beyond this fix.
+status: open
+
+### DW-1474: A turn whose web search level did not change cloned the whole allow list (R101W2-02).
+
+origin: review-101web-2 (R101W2-02), recorded by lane `101stack`, 2026-10-16
+location: `keeper_agent::agent::current_model`, `keeper_core::agents::web_search::allow_as`
+reason: `current_model` called `allow_as` — which copies the list and every tool name — before its unchanged fast return, on every turn.
+status: closed (fix round 2 of lane `web`, f4fc5089: the levels are compared before the fast return and the list is built only for a fresh dependency set; kept so by the stack's merge of 101.4 with 101.5 in `current_model`)
+
+### DW-1475: No test holds a web search whose engine answers its body slowly to the deadline.
+
+origin: review-101web-2 (verification gap), recorded by lane `101stack`, 2026-10-16
+location: `keeper_agent::web` (the SearXNG transport's deadline), `keeper-agent/src/web.rs` tests
+reason: the HTTP fixtures cover redirects, oversize bodies without `Content-Length` and engine status codes, but none sends headers and then stalls the body: the deadline that bounds a slow body is unexercised.
+status: open
+
+### DW-1477: The *without asking* mark in a room's header comes from the local home, not the serving host.
+
+origin: rung `agents-101-web` fix round 2 (R457), 2026-10-16
+location: `keeper_core::agents::room::{ZoneAgent::searches_unasked, AgentIcons::unasked_mark}`, `keeper_agent::desktop::zone_agents`, `AgentStatusVm.searches_unasked`
+reason: R457 asks for the mark from the serving host's status, where 101.5 puts the console mode (`StatusContent.console`, R440-09); that path is on `agents-101-console`, not on this branch, so the mark is read from the agent's `agent.toml` where its home is on this device — a phone, or a device without the drive, shows none, and a host still running an older file shows the newer level. At stack time the host writes the level into its status beside the console mode and the header reads it from there (an older host's absent field reads "unknown", never "asks").
+status: open
+
+### DW-1480: A console's folder cannot be a run's `cwd`.
+
+origin: lane `console` (story 101.5 #1, R420), 2026-10-15
+location: `keeper_core::agents::run::parse_request` (`cwd` relative to `workspace/`), `keeper_agent::run::SandboxHost::prepare` (`cwd` resolved under the workspace, bound by identity in `Expected.cwd_id`), `run::summary`/`session_reach` and the approval card (`workspace/<cwd>`)
+reason: `[run].paths` are granted read, write and execute, but a run still starts in `workspace/`; a tool that works only from its own folder (`bun test`, `cargo` without `--manifest-path`) has to be given the folder's absolute path as an option (`git -C`, `--manifest-path`, `--cwd`). Letting `cwd` name a granted folder touches the request grammar, the identity binding, the summary, the session reach and the card — each must name the folder as it resolved, not `workspace/`.
+status: open
+
+### DW-1481: The full-access marker is drawn only where the agent's home is on the device.
+
+origin: lane `console` (story 101.5 #2, R420), 2026-10-15
+location: `keeper_core::agents::room::AgentStatusVm.full_access` (from `AgentIcons::full_access`, filled by the desktop's `zone_agents`)
+reason: the mode is read from the home's `agent.toml`, as the model line is (100.2 #7); a device without the drive — the phone — does not know it and draws no marker. Carrying it would be a new optional field of `dev.keeper.agent.status` (`StatusContent`), which older readers refuse by its strict deserialisation.
+status: closed — fix round 1 (R440 09): the serving host says the console in `StatusContent.console {mode, refused}` (`agent::host_console`), every device's header draws `AgentStatusVm.full_access`/`console` from the status, and a status without it reads "Console: unknown". The marker no longer comes from the local checkout (`ZoneAgent.full_access` removed). An older device reads a status carrying the field as unreadable (strict deserialisation), which says so rather than drawing a safe console.
+
+### DW-1482: The approval card does not list the console folders a run is given.
+
+origin: lane `console` (story 101.5 #2), 2026-10-15
+location: `keeper_core::agents::approval_card::run_card` / `RunCardVm`, `keeper_agent::run::Prepared::in_console` (`exec_binding["paths"]`, `exec_binding["unsandboxed"]`)
+reason: the folders and the full mode are bound into what a run's approval binds, so a run approved in one console never runs in another, but the card a person decides on shows the program, folder, reads, network and code — not the extra folders the sandbox will open. The card should name them (and say "without a sandbox" for a full-access run that parked on the integrity rule).
+status: open — matters more since fix round 1 (R440): a run may now ask for folders beyond its console's (08), whose card's summary names them, but the typed run view (`RunCardVm`) still names neither the console's own folders nor full access, and a full-access run parks whenever the integrity rule asks.
+
+### DW-1483: Full access needs a host whose sandbox probe passed.
+
+origin: lane `console` (story 101.5 #2, R420), 2026-10-15
+location: `keeper_agent::agent::run_offer`, `keeper_agent::run::SandboxHost::execute_unsandboxed`, `keeper_core::agents::home::derived_needs`
+reason: a full-access run uses the host's `SandboxHost` for everything but the sandbox — the allow-listed environment, the checks before the program starts, the process group — and `SandboxHost` exists only where the probe passed, so a host without a working sandbox offers `run` in no mode, full included, and placement still asks for `sandbox`. That is the conservative choice; an unsandboxed host for full access would be a second constructor and a placement need of its own.
+status: open
+
+### DW-1484: Settings has two `agent.toml` writers to merge with 101.4's.
+
+origin: lane `console` (story 101.5 #3), 2026-10-15
+location: `keeper_core::agents::home::{with_model, with_run}`, `keeper_agent::desktop::{prepare_model, prepare_console, routed_save, HomeSave}`
+reason: the brief let this lane write its own `[run]` writer on the 100.2 pattern while lane `web` generalises the writer to named keys for `[tools].allow`; both share `HomeSave` (compare-and-replace, R405/R412) and `routed_save` here. The stack lane merges the two splices into one named-key writer.
+status: closed (lane `101stack`, 2026-10-16, in this rung: one person-edit path, `keeper_agent::desktop::prepare_home` — read once, parse, the save's own check and edit, parse the result as the host will, route through `WriteScope::route`, `HomeSave::publish` compare-and-replace under R412's per-file lock — serves the model save, the web search level and the console, `routed_save` removed; `home::with_run` splices through the same helpers as `with_model` / `with_tool_allowed` / `with_web_search_ask` — `splice`, `pair_after`, `table_at_end`, `line_start` / `line_end` / `line_ending_at`. Every writer test of 100.2, 101.4 and 101.5 is unchanged)
+
+### DW-1485: Settings does not say the folders the serving sandbox refuses.
+
+origin: lane `console`, fix round 2 (review-101console-2 R101K2-05, R456), 2026-10-16
+location: `keeper_agent::desktop::console_refusals` (Settings › Agents row, `AgentConsoleVm.refused`), compare `keeper_agent::agent::landed_folders` (`run::land`, then `SandboxHost::folder_refusal`)
+reason: the Settings row lands each folder as a run would (`run::land`: the resolver, the protected-zone policy, every checkout of this Mac) but not through the sandbox's own refusal — the protected system trees, the host's secrets, the credentials under the home (`.ssh`, …) — because the row is drawn without the host's probed `SandboxHost`. A host folder such as `~/.ssh` therefore shows no refusal on the row while the serving host refuses it at every run: the host WARNs it, the room header counts it and the tool's description tells the model, but the row does not say which and why. The row should take the same admission facts as the runtime (the desktop's `desktop_sandbox` forbidden set), or mark a folder as not yet checked by the sandbox rather than imply it is given.
+status: open
+
+### DW-1486: Full access is refused on a Mac whose sync profile has no pin, and Settings does not say why.
+
+origin: lane `console`, fix round 4 (coordinator, R459), 2026-10-16
+location: `keeper_agent::run::checkout_labels` (`Checkout::label`, called by `AllowedTools::run_command` for an unsandboxed run, R456 03), compare `keeper_agent::desktop::console_refusals` (Settings › Agents row, `AgentConsoleVm`)
+reason: a run at full access is labelled by every checkout of its host, each by its pin; a checkout keeper cannot tell the readers of (a sync profile of this Mac with no pin) refuses every full-access run before it starts, naming the checkout. That is fail-safe and stays, but the Settings row still offers and shows `full` as if it would run: the person learns why only from the first refused command. The row should say, beside `full`, which checkout of this Mac has no pin and that full access is refused until it has one.
+status: open
+
+### DW-1487: An approval asked after console output made the session untrusted is not proved through to its run.
+
+origin: review-101console-4 (R101K4-02), recorded by lane `101stack`, 2026-10-16
+location: `keeper-agent/tests/agent_turns.rs` (the console folder tests), `keeper_agent::approvals` consumption
+reason: R458 makes every session that ran a console folder untrusted; the networked run after it parks (tested), but no test approves that park and checks one consumption and the command's effect while the granted folders stay unavailable. An earlier ordering of the test saw zero consumptions where one was expected, and the reordered final test proves consumption only while the session is still trusted.
+status: open
+
+### DW-1490: A card's expiry does not redraw its row.
+
+origin: lane `agents-101-status` (story 101.6 #1, R421), 2026-10-15
+location: `src-tauri/crates/keeper-core/src/account.rs` (`run_inbox_producer`, the event-cache arm), `keeper_core::agents::attention::attention`
+reason: the row's state is read again when the room's events change; an approval card that expires with nothing else happening leaves the row at *Needs you* until the room's next event (a claim renewal within a minute in a served room). A timer at `ApprovalFold::next_expiry` per agent room would close it exactly.
+status: closed (R436 #08, fix round 1 of lane `agents-101-status`, 2026-10-15): each reading of an agent room names its earliest open card's expiry (`Attention::recheck_at`, from `ApprovalFold::next_expiry`); `attention::RowAttention` keeps it per row, the inbox producer sleeps until the earliest one and reads those rooms again with no event having come, redrawing only a row whose state changed. Test: `agents::attention::tests::a_card_expiring_with_no_event_is_read_again_at_its_expiry`.
+
+### DW-1491: A question relayed into the proxy's DM is not *Needs you* on the DM's row.
+
+origin: lane `agents-101-status` (story 101.6 #1, R421), 2026-10-15
+location: `keeper_core::agents::attention`, `keeper-agent` `ask::relay` / `rooms::admit_ask`
+reason: an `ask_human` question is an `AskContent` in the asking session's room; the proxy relays it into the person's DM in its own words, carrying nothing structured, so only the asking room's row (when the person is in it) says *Needs you*. The DM's row could say it if the proxy's relay turn carried the ask's id (a `dev.keeper.agent.ask` echo the device reads), which is a host change.
+status: closed (R453, fix round 2 of lane `agents-101-status`, 2026-10-15): no host change — the device projects the correlation in Rust across rooms with 101.3's reader (`account::asks_answered_in`: the asking rooms it reads, folded by `waiting::fold`, placed by `ask_target`), so the room the person answers in — the proxy's DM, or the conversation that delegated the asking session — says *Needs you* in the Agents window, the DM row and the dock until the answer is sent or relayed (`attention::tests::a_delegated_question_needs_the_person_where_they_answer_it`). A question in a room this device does not read stays DW-1462's limit.
+
+### DW-1492: A host built from `main` between releases is warned about as older than the keys it reads.
+
+origin: lane `agents-101-status` (story 101.6 #3, R422), 2026-10-15
+location: `keeper_core::agents::model::{KEY_SINCE, reads_since}`, `HostManifest.version` (`CARGO_PKG_VERSION`)
+reason: the manifest's version is the workspace version, which stays at the last release until the release bump; a dev build of `main` carrying `[model].effort` says 0.10.3 and a Mac's save of `effort` for an agent it serves is refused until 0.10.4 is released. A build stamp in the manifest (the commit, or a grammar revision) would tell such a build apart; electra deployed from the release asset (101.7) is not affected.
+status: open
+
+### DW-1493: The notes dock reads its rooms' states every ten seconds rather than as they change.
+
+origin: lane `agents-101-status` (story 101.6 #2, R421), 2026-10-15
+location: `src/components/notes/notes-agent-dock.tsx` (`ATTENTION_RELIST_MS`), `AccountManager::agent_rooms`
+reason: the Agents-window stream that carries the state live is mounted with the chat list, not beside the notes, so the dock reads `ProxyRoomVm.attention` by listing its rooms again; a state change reaches the dock within ten seconds. A stream of the proxy rooms (or the Agents window subscribed by the shell rather than the chat list) would make it live. Since R453 each relist also reads 101.3's question projection once per listed proxy room (`agent_rooms_attended` → `asks_answered_in`: every other session room read back to `ASK_READ_BACK`), so the poll's cost grows with proxy rooms × session rooms; the stream would remove that as well.
+status: open
+
+### DW-1494: *Working* says the last readable status was `running`, not that a host is still running it.
+
+origin: lane `agents-101-status` fix round 1 (story 101.6 #2, R439), 2026-10-15
+location: `keeper_core::agents::attention::attention` (`AgentRoomState::run_at`)
+reason: a host that went away mid-turn, or whose claim lapsed, leaves its last `running` status as the room's newest; the row keeps saying *Working* until another status comes. The claim's lease (`dev.keeper.agent.claim` expiry) or the host's manifest liveness would let the fold say the run stopped being watched; neither is read by the row today.
+status: open
+
+### DW-1495: A row's *Needs you* is re-read on fewer changes than its questions are read from.
+
+origin: review-101status-3 (R101S3-01), recorded by lane `101stack`, 2026-10-16
+location: `keeper_core::account::run_inbox_producer` (`asks_due`, `redraw_attention`), `account::asks_answered_in`
+reason: the projection reads every joined session room, but the inbox re-reads destination rows only when the changed source room is already in its recency window, and it does not watch the send queue / outbox that `mine_in` reads; an off-window source's change, or a queued answer failing with no Matrix event, can leave a correctly placed marker stale until another qualifying event.
+status: open
+
+### DW-1496: Cross-room reading of questions runs inside the inbox producer, one room after another.
+
+origin: review-101status-3 (R101S3-02), recorded by lane `101stack`, 2026-10-16
+location: `keeper_core::account::run_inbox_producer`, `asks_answered_in`, `agents::waiting::read_room`
+reason: each proxy row's reading scans the joined rooms and reads the other session rooms serially inside the single inbox producer (five seconds per room's pagination at most), so slow history reads delay ordinary inbox updates and expiry wake-ups; nothing reuses one reading across a batch. Fix: a coalesced, subscription-owned worker publishing changed rows, keeping *Unknown* on incomplete reads.
+status: open
+
+### DW-1500: No tag's release has carried keeper-agentd since v0.10.0.
+
+origin: lane `electra` (story 101.7, R423/R424), 2026-10-15; recorded and closed by lane `101stack`
+location: `.github/workflows/release.yml` jobs `release` and `agentd`
+reason: `agentd` ran only when `needs.release.result == 'success'`, and the macOS `release` job fails on every tag in CI ("Apple signing material must be present", D-1) — the app is released from hesperia by `scripts/release-macos.sh` — so `keeper-agentd-x86_64-unknown-linux-gnu{,.sha256,.sig}` was never attached and makistack's `keeper_agentd` role had no asset to pin.
+status: closed (lane `101stack`, release rung, 2026-10-16: `agentd` needs only the new `agentd-release` job, which finds the tag's release or makes it as a draft; each target keeps its credential scan, unit check and signature check and uploads with `--clobber`; docs/release.md says so)
+
+### DW-1501: A web search or console save is not checked against older hosts that would refuse its keys.
+
+origin: lane `101stack` (merging 101.4 and 101.5 with 101.6's older-host check in one writer), 2026-10-16
+location: `keeper_agent::desktop::{prepare_web_search, prepare_console}` (their `admit`), `keeper_core::agents::model::{KEY_SINCE, older_hosts}`
+reason: R422's check runs for the model save only, and `KEY_SINCE` knows `[model].effort` alone. `[web_search]` and `[run]` are root tables a build before epic 101 does not know (its `agent.toml` key set is closed), so such a host — keeper-agentd on electra until it is upgraded — would refuse the home and stop serving the agent after a person's save. Fix: add both tables to `KEY_SINCE` with the first release that reads them and give the two saves the model save's `admit`.
+status: closed (lane `101stack`, stack fix 1, R460, 2026-10-16: `KEY_SINCE` also names `web_search` in `[tools].allow`, `[web_search]` and `[run]` (0.10.4); `prepare_home` holds every save to `model::older_hosts`; web search *Off* and the console the file reads without `[run]` lift the tables out (`home::without_table`), so they stay allowed; tests `model::tests::every_key_epic_101_writes_is_held_to_the_serving_hosts`, `desktop::tests::a_save_an_older_serving_host_cannot_read_is_refused_and_one_back_is_not`, `home::tests::a_table_is_lifted_out_whole_or_not_at_all`)

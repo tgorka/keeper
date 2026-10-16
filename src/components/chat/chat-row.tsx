@@ -36,6 +36,7 @@
 
 import { AtSign, BellOff, Eye, Pencil } from "lucide-react";
 import { forwardRef, type MouseEvent as ReactMouseEvent } from "react";
+import { AgentAttentionMark, agentAttentionLabel } from "@/components/agents/agent-attention";
 import { RoomAvatar } from "@/components/chat/RoomAvatar";
 import { Badge } from "@/components/ui/badge";
 import {
@@ -246,6 +247,10 @@ export const ChatRow = forwardRef<HTMLButtonElement, ChatRowProps>(function Chat
         : room.agentRoom === "unknown"
           ? ", an agent room"
           : "";
+  // Whether the agent needs the person, failed, works or finished unread
+  // (story 101.6, R421) — Rust's word, said in the name as it is drawn.
+  const attention = room.agentAttention ?? null;
+  const attentionLabel = agentAttentionLabel(attention);
 
   // ---- Phone touch idioms (Story 13.6) ------------------------------------
   // Long-press opens the identical ContextMenu above (the non-gesture duplicate
@@ -291,7 +296,7 @@ export const ChatRow = forwardRef<HTMLButtonElement, ChatRowProps>(function Chat
       type="button"
       tabIndex={tabIndex}
       onClick={onRowClick}
-      aria-label={`Conversation with ${room.displayName}${agentLabel}${unreadLabel}${healthLabel}`}
+      aria-label={`Conversation with ${room.displayName}${agentLabel}${attentionLabel}${unreadLabel}${healthLabel}`}
       aria-current={selected ? "true" : undefined}
       className={cn(
         "relative flex h-16 w-full shrink-0 items-center gap-3 py-0 pr-3 pl-4 text-left",
@@ -347,8 +352,15 @@ export const ChatRow = forwardRef<HTMLButtonElement, ChatRowProps>(function Chat
           {/* A column of times read down the list: tabular so a 1 is as wide as
               a 7 and the column edge does not ripple row to row. Sans, not the
               register's mono, because this slot also says "Yesterday". */}
-          {timestamp !== null && (
-            <span className="figures shrink-0 text-muted-foreground text-xs">{timestamp}</span>
+          {/* An agent room's state stands where its time would (t3code's
+              sidebar): what the person wants to know of an agent is whether
+              it needs them, not when it last spoke. */}
+          {attention !== null ? (
+            <AgentAttentionMark state={attention} />
+          ) : (
+            timestamp !== null && (
+              <span className="figures shrink-0 text-muted-foreground text-xs">{timestamp}</span>
+            )
           )}
         </div>
         <div className="flex items-center justify-between gap-2">

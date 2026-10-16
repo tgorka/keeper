@@ -51,9 +51,9 @@ use keeper_core::agents::label::{
 use keeper_core::agents::log::reader::{hydrate_blob, read_session};
 use keeper_core::agents::log::replay::{message_for, HelperSteps, ReplayRefusal};
 use keeper_core::agents::log::{
-    ApprovalBody, ApprovalState, AskBody, AskState, AssistantBody, ChildSession, DelegateBody,
-    DelegateReply, DelegateState, ErrorBody, HostSlug, LineBody, LogLine, MemoryBody, MemoryOp,
-    OpenBody, PeerAnswer, PeerAsk, PeerBody, RunBody, ScopeBody, ToldBody, ToolCallBody,
+    ApprovalBody, ApprovalState, AskBody, AskState, AssistantBody, Attachment, ChildSession,
+    DelegateBody, DelegateReply, DelegateState, ErrorBody, HostSlug, LineBody, LogLine, MemoryBody,
+    MemoryOp, OpenBody, PeerAnswer, PeerAsk, PeerBody, RunBody, ScopeBody, ToldBody, ToolCallBody,
     ToolOutcomeWord, ToolResultBody, Truncated, Usage, UserBody, NARROWER_THAN_ROOM, WITHHELD_CODE,
 };
 use keeper_core::agents::matrix::AgentMatrixError;
@@ -87,6 +87,7 @@ use ulid::Ulid;
 
 use crate::approvals::Parking;
 use crate::ask::{AskTools, OpenAsk, Relay};
+use crate::attachments;
 use crate::cards::{self, Begun, Scheduled};
 use crate::claims::Lease;
 use crate::delegate::{
@@ -103,7 +104,7 @@ use crate::matrix_sink::{
 use crate::ports::ProfileSource;
 use crate::rooms::{self, Arrival, BriefEvent, Disposition, Served};
 use crate::sessions::verbs::{self, CreateOutcome};
-use crate::sessions::write::session_write;
+use crate::sessions::write::{attachment_write, session_write};
 use crate::sinks::{
     room_audience, CallAudit, Gated, ProxyDoors, RoomGate, Sinks, Withheld, MEMBERS_UNREAD,
     NARROWED_STATUS,
@@ -1406,12 +1407,81 @@ pub struct AgentDeps {
     /// The tickets this agent's gate sessions hold open on this host, one
     /// count for all of its `[[gate]]`s (99.1 #6).
     pub gate_tickets: Arc<crate::gate::OpenTickets>,
+    /// The bounds a person's file is taken in under (R444): its download's
+    /// deadline and the PDF reader this host starts.
+    pub attachments: crate::attachments::Bounds,
+    /// The web search engine this host names (101.4, R419): `web_search` is
+    /// offered only with it, to an agent whose `[tools].allow` names it.
+    pub web_search: Option<Arc<crate::web::WebSearch>>,
+    /// Every checkout this host syncs (story 101.5, R456): what a console's
+    /// folder is landed against — a folder inside or holding another
+    /// checkout than its drive's is refused — and what a run at full
+    /// access, which could read any of them, is labelled by.
+    pub checkouts: Vec<crate::run::Checkout>,
+    /// This agent's turns running at full access now (R456 06): while one
+    /// runs, every status of the agent says full access, whatever its
+    /// `agent.toml` says for the next turn.
+    pub full_access_turns: Arc<FullAccessTurns>,
 }
 
 impl AgentDeps {
     /// Whether this agent's model runs on a machine its readers control.
     pub fn model_is_local(&self) -> bool {
         serves_local_models(self.row.provider.kind)
+    }
+}
+
+/// How many of one agent's turns are running at full access now (story
+/// 101.5; R456, review-101console-2 06): a console saved while one runs
+/// applies from the next turn, so until that turn ends the agent's status
+/// keeps saying full access.
+#[derive(Debug, Default)]
+pub struct FullAccessTurns(std::sync::atomic::AtomicUsize);
+
+impl FullAccessTurns {
+    /// One turn at full access, counted until what this returns is dropped
+    /// — when the turn ends, however it ends.
+    pub(crate) fn enter(self: &Arc<Self>) -> FullAccessTurn {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        FullAccessTurn(Arc::clone(self))
+    }
+
+    /// Whether a turn of the agent is running at full access now.
+    pub(crate) fn any(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::SeqCst) > 0
+    }
+}
+
+/// One turn counted by [`FullAccessTurns::enter`].
+pub(crate) struct FullAccessTurn(Arc<FullAccessTurns>);
+
+impl Drop for FullAccessTurn {
+    fn drop(&mut self) {
+        self.0 .0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Each agent's [`FullAccessTurns`] on one host, kept for as long as the
+/// host lives rather than for one build of it (story 101.5; R101K3-02): a
+/// rebuild waits for the running turns only up to a bound, and a
+/// full-access command of the old build may still run while the new one
+/// says the agent's status — so every build is handed the counter the
+/// earlier ones counted in, and the warning stays until that command's
+/// turn has ended.
+#[derive(Debug, Default)]
+pub struct FullAccessHosts(Mutex<HashMap<matrix_sdk::ruma::OwnedUserId, Arc<FullAccessTurns>>>);
+
+impl FullAccessHosts {
+    /// The counter of the agent whose copy is `user`: the one every
+    /// earlier build of this host was handed.
+    pub fn of(&self, user: &matrix_sdk::ruma::UserId) -> Arc<FullAccessTurns> {
+        Arc::clone(
+            self.0
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .entry(user.to_owned())
+                .or_default(),
+        )
     }
 }
 
@@ -1450,6 +1520,9 @@ struct AllowedTools<'t> {
     /// The agent's classic NanoKVMs on this host (96.5); `None` where it
     /// may use none.
     kvm: Option<KvmTools>,
+    /// `web_search` (101.4): this host's engine; `None` where it names
+    /// none, or the turn is a review pass's or a gate's.
+    web: Option<WebTools>,
     view: &'t dyn TurnView,
     sinks: &'t Sinks,
     /// The declarations of the drives this host mounts: a write's audience.
@@ -1759,6 +1832,13 @@ impl AllowedTools<'_> {
                 let landed = self.landed_facts(&self.home.id, &self.card_at(tool, args));
                 tier::named_facts(tool, args, landed)
             }
+            Err(_) if tool == AgentTool::WebSearch => keeper_core::agents::web_search::facts(
+                &self.view.label(),
+                self.web.as_ref().map_or(
+                    keeper_core::agents::web_search::WebSearchLevel::Ask,
+                    |web| keeper_core::agents::web_search::level(&web.home.config),
+                ),
+            ),
             Err(_) => tier::named_facts(tool, args, CallFacts::default()),
         };
 
@@ -1989,6 +2069,17 @@ impl crate::helper::Parent for AllowedTools<'_> {
 /// the call's result.
 struct RunTools {
     host: Arc<crate::run::SandboxHost>,
+    /// The agent's console (story 101.5, R420) as the turn began: its
+    /// `[run]`, and its folders as they landed here for this session.
+    run: keeper_core::agents::console::RunConfig,
+    folders: Vec<crate::run::Granted>,
+    /// What a run's own `folders` land against (R440 08): every checkout
+    /// this host syncs, and the agent's drives, their grammar.
+    guards: Vec<crate::run::DriveGuard>,
+    agent_drives: Vec<String>,
+    /// Every checkout this host syncs: what a run at full access is
+    /// labelled by (R456 03).
+    checkouts: Vec<crate::run::Checkout>,
     /// The home drive's checkout and its sessions zone's folder in it.
     drive: PathBuf,
     zone: String,
@@ -2002,6 +2093,48 @@ impl RunTools {
     /// The label of the run the call that just ended made, if it ran.
     fn take_label(&self) -> Option<Label> {
         self.labels.lock().unwrap_or_else(|p| p.into_inner()).pop()
+    }
+}
+
+/// What a turn's `web_search` calls work with (101.4, R419): the host's
+/// engine, the agent's home — read again at each call, so a person's switch
+/// to off, or from *without asking* back to *ask*, reaches a turn already
+/// running (R427, R457) — and the label and engine of each answer that
+/// just came back.
+struct WebTools {
+    engine: Arc<crate::web::WebSearch>,
+    home: crate::zone::AgentHome,
+    answers: Mutex<Vec<(Label, String)>>,
+}
+
+impl WebTools {
+    /// The label of the answer the call that just ended read, and where
+    /// it came from.
+    fn take(&self) -> Option<(Label, String)> {
+        self.answers.lock().unwrap_or_else(|p| p.into_inner()).pop()
+    }
+
+    /// The level the agent searches at, read from its `agent.toml` as it is
+    /// on the drive this moment (R427, R457) — or why it may not search
+    /// now: its switch off, or the agent one
+    /// [`keeper_core::agents::web_search::never`] offers none — a gate, or
+    /// `local_only` (R101W1-03).
+    fn level_now(
+        &self,
+        wire: &str,
+    ) -> Result<keeper_core::agents::web_search::WebSearchLevel, String> {
+        use keeper_core::agents::web_search::{self as core_web, WebSearchLevel};
+        let home = &self.home;
+        let now = crate::zone::read_home(&home.zone, &home.config.id, &home.drive)?.config;
+        if let Some(never) = core_web::never(&now) {
+            return Err(never);
+        }
+        match core_web::level(&now) {
+            WebSearchLevel::Off => Err(format!(
+                "{wire} is not one of this agent's tools on this host."
+            )),
+            level => Ok(level),
+        }
     }
 }
 
@@ -2388,19 +2521,207 @@ pub(crate) fn run_drives(context: &SessionContext, deps: &AgentDeps) -> Vec<(Str
         .collect()
 }
 
+/// The guard of every checkout this host syncs (R441, R456 01) — the
+/// drives it mounts and every other checkout of it: what a console's folder
+/// is kept from.
+pub(crate) fn console_guards(deps: &AgentDeps) -> Vec<crate::run::DriveGuard> {
+    crate::run::guards(&deps.checkouts)
+}
+
+/// The folders of the console `run` on this host (story 101.5, R420, R440
+/// 01–04), each as written and as it landed ([`crate::run::land`]: the
+/// drive's resolver, the protected-zone policy, by identity) — a drive's
+/// folder only for a drive of `drives`, the session's scope this host may
+/// run in (R440 03) — or why a run here is not given it: not in scope, not
+/// on this host, not a folder, inside or holding what keeper keeps to
+/// itself, or what the sandbox may never grant. None for a mode that does
+/// not sandbox: full access is held to no folder.
+fn landed_folders(
+    run: &keeper_core::agents::console::RunConfig,
+    drives: &[(String, PathBuf)],
+    deps: &AgentDeps,
+) -> Vec<(String, Result<crate::run::Granted, String>)> {
+    if !run.mode.sandboxes() {
+        return Vec::new();
+    }
+    let guards = console_guards(deps);
+    let scope: Vec<String> = drives.iter().map(|(id, _)| id.clone()).collect();
+    run.paths
+        .iter()
+        .map(|path| {
+            let landed = crate::run::land(path, &guards, &scope).and_then(|granted| {
+                match deps
+                    .sandbox
+                    .as_ref()
+                    .and_then(|sandbox| sandbox.folder_refusal(&granted))
+                {
+                    Some(reason) => Err(reason),
+                    None => Ok(granted),
+                }
+            });
+            (path.written(), landed)
+        })
+        .collect()
+}
+
+/// [`landed_folders`], each folder not given a WARN on this host (R381):
+/// what a turn's runs, its offer and an approval's check are given.
+pub(crate) fn run_folders(
+    run: &keeper_core::agents::console::RunConfig,
+    drives: &[(String, PathBuf)],
+    deps: &AgentDeps,
+) -> Vec<(String, Result<crate::run::Granted, String>)> {
+    let folders = landed_folders(run, drives, deps);
+    for (written, landed) in &folders {
+        if let Err(why) = landed {
+            tracing::warn!(
+                agent = %deps.home.config.id,
+                folder = %written,
+                %why,
+                "agents: a folder of this agent's console is not given to its commands on this host"
+            );
+        }
+    }
+    folders
+}
+
+/// The console this host runs `deps`' agent's commands in, as a status
+/// says it to every device (R440 09): full access while a turn of the
+/// agent runs at full access (R456 06) — a console saved meanwhile applies
+/// from its next turn, and the warning stays until that turn ends; else
+/// `[run]` as its `agent.toml` says it now — what the agent's next turn
+/// runs on (R407) — its mode where `run` is offered here and `off` where it
+/// is not, and how many of its folders in the agent's own drives this host
+/// does not give its commands. A file that does not read now says the
+/// console the host loaded; the turn it would start is refused anyway.
+pub(crate) fn host_console(deps: &AgentDeps) -> keeper_core::agents::events::StatusConsole {
+    use keeper_core::agents::console::RunMode;
+    if deps.full_access_turns.any() {
+        return keeper_core::agents::events::StatusConsole {
+            mode: RunMode::Full,
+            refused: 0,
+        };
+    }
+    let home = &deps.home;
+    let run = crate::zone::read_home(&home.zone, &home.config.id, &home.drive)
+        .map(|read| read.config.run)
+        .unwrap_or_else(|_| home.config.run.clone());
+    if deps.sandbox.is_none() || !run.mode.offers_run() {
+        return keeper_core::agents::events::StatusConsole {
+            mode: RunMode::Off,
+            refused: 0,
+        };
+    }
+    let drives: Vec<(String, PathBuf)> = deps
+        .env
+        .drive
+        .as_ref()
+        .map(|drive| drive.profiles.profiles())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|profile| home.config.drives.contains(&profile.id))
+        .map(|profile| (profile.id, profile.local_path))
+        .collect();
+    let refused = landed_folders(&run, &drives, deps)
+        .iter()
+        .filter(|(_, landed)| landed.is_err())
+        .count();
+    keeper_core::agents::events::StatusConsole {
+        mode: run.mode,
+        refused: u32::try_from(refused).unwrap_or(u32::MAX),
+    }
+}
+
+/// The folders a run call asks for beyond its console's (R440 08): each of
+/// its `folders` read as `[run].paths` reads one against the agent's
+/// `drives`, landed as a console's folder is among `guards` for `scope`,
+/// and checked against what `sandbox` may never grant. One that cannot be
+/// given refuses the call, saying which and why; a console at full access
+/// is held to no folder, so a call there asks for none.
+pub(crate) fn asked_folders(
+    request: &keeper_core::agents::run::RunRequest,
+    mode: keeper_core::agents::console::RunMode,
+    drives: &[String],
+    guards: &[crate::run::DriveGuard],
+    scope: &[String],
+    sandbox: &crate::run::SandboxHost,
+) -> Result<Vec<crate::run::Granted>, String> {
+    if request.folders.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !mode.sandboxes() {
+        return Err("This run was refused: a run at full access is held to no folder, so it asks for none. Leave `folders` out.".to_owned());
+    }
+    request
+        .folders
+        .iter()
+        .map(|text| {
+            let refused = |why: String| {
+                format!("This run was refused: the folder \"{text}\" cannot be given: {why}.")
+            };
+            let spelled =
+                keeper_core::agents::console::parse_path(text, drives).map_err(refused)?;
+            let granted = crate::run::land(&spelled, guards, scope).map_err(refused)?;
+            match sandbox.folder_refusal(&granted) {
+                Some(why) => Err(refused(why)),
+                None => Ok(granted),
+            }
+        })
+        .collect()
+}
+
+/// `run`'s spec for this agent on this host, when the host's sandbox passed
+/// its probe (96.1 #11) — the console's mode decides what it says, its
+/// folders where each lands here for a session working in `drives`
+/// (story 101.5, R440 03).
+fn run_offer(deps: &AgentDeps, drives: &[(String, PathBuf)]) -> Option<chat::ToolSpec> {
+    deps.sandbox.as_ref()?;
+    let folders: Vec<(String, Result<String, String>)> =
+        run_folders(&deps.home.config.run, drives, deps)
+            .into_iter()
+            .map(|(written, landed)| {
+                (
+                    written,
+                    landed.map(|granted| granted.path.display().to_string()),
+                )
+            })
+            .collect();
+    Some(keeper_core::agents::run::spec(
+        deps.home.config.run.mode,
+        &folders,
+    ))
+}
+
 impl AllowedTools<'_> {
     /// A `run` call (96.1, D-33), in the order every call keeps (R82,
     /// R90): what it relies on read and its tier classified from that;
     /// T5 refused; a call an approval bound runs only on the facts that
-    /// approval was checked against (R213); its writable workspace checked
-    /// as a write to the session's home drive, against the label joined with
-    /// every drive it would read (R213); a networked run — a send to anyone
-    /// (AD-391) — only on its own T3 approval, which names the workspace set
-    /// it releases (R145, S-03); a T2 run a `session` approval covers goes
-    /// without asking (R146); its one audit row before the program starts;
-    /// then the sandboxed run, its result labelled by what the run could
-    /// read.
+    /// approval was checked against (R213); every place it may write — its
+    /// workspace on the session's home drive, each drive a console folder
+    /// of it is in, the host's own files for a host folder — checked as a
+    /// write there against the label joined with everything it could read
+    /// (R213, R440 02); a networked run — a send to anyone (AD-391) — only
+    /// on its own T3 approval, which names the workspace set it releases
+    /// (R145, S-03); a T2 run a `session` approval covers goes without
+    /// asking (R146); its one audit row before the program starts; then the
+    /// sandboxed run, its result labelled by what the run could read. The
+    /// agent's console (story 101.5, R420) decides the rest: in `sandboxed`
+    /// mode a run without network, without a drive mounted and asking for
+    /// no folder goes without asking — also in a session that read outside
+    /// content, its sandbox being its own guard (R458), which the integrity
+    /// rule then does not raise either, held code included (R459) — in `full` mode
+    /// every run does, unsandboxed, and its network is not held back by the
+    /// label — the person's choice of the mode is that approval, as is
+    /// every other flow of a program keeper does not sandbox, whose result
+    /// is labelled as if it read every drive of this host — while the
+    /// integrity rule still asks in a session that read outside content
+    /// (R82) and T5 is refused in every mode; the console's folders, and
+    /// those one run asks for on a person's approval (R440 08), are granted
+    /// to a sandboxed run without network, and what a run given one returns
+    /// is outside content (R458).
     fn run_command(&self, wire: &chat::ToolCall) -> ToolOutcome {
+        use crate::run::Origin;
+        use keeper_core::agents::console::RunMode;
         use keeper_core::agents::run as core_run;
         let tool = AgentTool::Run;
         let name = wire.name.as_str();
@@ -2422,8 +2743,20 @@ impl AllowedTools<'_> {
                     zone: &runs.zone,
                     path: &runs.session,
                 };
+                let scope: Vec<String> = runs.drives.iter().map(|(id, _)| id.clone()).collect();
                 runs.host
                     .prepare(args, session, &runs.drives)
+                    .and_then(|prepared| {
+                        let extra = asked_folders(
+                            &prepared.request,
+                            runs.run.mode,
+                            &runs.agent_drives,
+                            &runs.guards,
+                            &scope,
+                            &runs.host,
+                        )?;
+                        Ok(prepared.in_console(runs.run.mode, runs.folders.clone(), extra))
+                    })
                     .map(|prepared| (prepared, runs))
             });
         let facts = ready.as_ref().map_or_else(
@@ -2431,6 +2764,22 @@ impl AllowedTools<'_> {
             |(prepared, _)| prepared.call_facts,
         );
         let classification = self.classify(&wire.id, tool, &facts, None);
+        // A run its sandbox alone guards keeps its row's tier in a session
+        // that read outside content: held code is T4 there, unasked as a
+        // plain program is, never T5 for the session's integrity alone
+        // (R459). A row's own T5 and every other raise still hold.
+        let guarded = ready.as_ref().is_ok_and(|(prepared, runs)| {
+            runs.run.mode.guards_itself(
+                prepared.request.network,
+                !prepared.request.read.is_empty(),
+                !prepared.request.folders.is_empty(),
+            )
+        });
+        let classification = if guarded {
+            self.keep_tier(&wire.id, classification.without_integrity_raise())
+        } else {
+            classification
+        };
         let refused = |reason: String| {
             CallAudit::new(
                 self.sinks,
@@ -2447,7 +2796,7 @@ impl AllowedTools<'_> {
             Err(reason) => return refused(reason),
         };
         if classification.gate() == Gate::Refuse {
-            return refused(core_run::PRIVILEGED.to_owned());
+            return refused(core_run::RunRefusal::of(&classification).sentence());
         }
         let bound = self.bound_approval(&wire.id, name);
         if bound.is_some() {
@@ -2462,13 +2811,65 @@ impl AllowedTools<'_> {
                 );
             }
         }
-        // Its workspace is written, whatever the program does: a write to
-        // the session's home drive, by the label as it would be once the
-        // run read every drive it mounts.
+        // A run at full access could read every checkout of this host: its
+        // result is labelled by every one of them, each by its pin read now,
+        // and where keeper cannot tell who reads one it does not run (R456
+        // 03, R381).
+        let every = if prepared.unsandboxed {
+            match crate::agent::off_the_runtime(|| crate::run::checkout_labels(&runs.checkouts)) {
+                Ok(every) => Some(every),
+                Err(why) => {
+                    tracing::warn!(call = %wire.id, %why, "agents: a run at full access was refused: a checkout of this host has no label keeper can tell");
+                    return refused(format!(
+                        "This run was refused: at full access it could read every checkout of this host, and {why}. Nothing was run."
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+        // What it could read: every drive it mounts or was given a folder
+        // of, and the host's own files for a host folder, which only the
+        // session's person reads (R440 02).
+        let person = self
+            .agent
+            .dispatch_chain
+            .first()
+            .unwrap_or(&self.agent.requested_by);
+        let folders: Vec<&crate::run::Granted> =
+            prepared.paths.iter().chain(&prepared.extra).collect();
+        let mut folder_drives: Vec<String> = folders
+            .iter()
+            .filter_map(|folder| match &folder.origin {
+                Origin::Drive { drive, .. } => Some(drive.clone()),
+                Origin::Host => None,
+            })
+            .collect();
+        folder_drives.sort();
+        folder_drives.dedup();
+        let host_folder = folders.iter().any(|folder| folder.origin == Origin::Host);
+        // Outside content it could read: the network, a drive mounted
+        // whole, and any console folder — what is in a folder while the
+        // run reads it is not known, whatever was there before or after
+        // (R458; a host folder is counted by `result_label` itself).
+        let untrusted =
+            prepared.request.network || !prepared.mounted.is_empty() || !folders.is_empty();
+        let read_drives: Vec<String> = prepared
+            .mounted
+            .iter()
+            .map(|(id, _)| id.clone())
+            .chain(folder_drives.iter().cloned())
+            .collect();
+        let read_drives = crate::run::drive_labels(&read_drives, self.drives);
         let reading = self.view.label().join(&core_run::result_label(
             false,
-            &crate::run::mounted_labels(&prepared.mounted, self.drives),
+            &read_drives,
+            host_folder.then_some(person),
         ));
+        // Every place it may write, whatever the program does, by the label
+        // as it would be once the run read all of that: its workspace on
+        // the session's home drive, each drive a folder of it is in, and the
+        // host's own files.
         let home_readers = Sink::DriveWrite {
             drive_readers: Readers::Only(self.home.readers.clone()),
         };
@@ -2477,12 +2878,53 @@ impl AllowedTools<'_> {
                 "This run was refused: its workspace is on {drive}, and {reason}"
             ));
         }
+        for id in &folder_drives {
+            let readers = self.drives.get(id).map_or_else(
+                || Readers::Only(std::collections::BTreeSet::new()),
+                |decl| Readers::Only(decl.readers.clone()),
+            );
+            let sink = Sink::DriveWrite {
+                drive_readers: readers,
+            };
+            if let SinkVerdict::Block { reason, .. } = check_sink(&reading, &sink) {
+                return refused(format!(
+                    "This run was refused: it writes a folder of {id}, and {reason}"
+                ));
+            }
+        }
+        if host_folder {
+            let sink = Sink::DriveWrite {
+                drive_readers: Readers::Only(std::collections::BTreeSet::from([person.clone()])),
+            };
+            if let SinkVerdict::Block { reason, .. } = check_sink(&reading, &sink) {
+                return refused(format!(
+                    "This run was refused: it writes a folder of this host, which {person} reads, and {reason}"
+                ));
+            }
+        }
         let blocked = match check_sink(&self.view.label(), &core_run::network_sink()) {
-            SinkVerdict::Block { reason, .. } if prepared.request.network && bound.is_none() => {
+            SinkVerdict::Block { reason, .. }
+                if prepared.request.network
+                    && bound.is_none()
+                    && runs.run.mode != RunMode::Full =>
+            {
                 Some(reason)
             }
             _ => None,
         };
+        // What the console lets run without asking: the integrity rule
+        // decides for a full-access run; a sandboxed run without network,
+        // drive or folder asked for is its own guard (R458).
+        let unasked = bound.is_none()
+            && runs.run.mode.runs_unasked(
+                prepared.request.network,
+                !prepared.request.read.is_empty(),
+                !prepared.request.folders.is_empty(),
+                matches!(
+                    check_call(&self.view.label(), name, classification.tier, &[]),
+                    CallVerdict::Allow
+                ),
+            );
         let allowed = runs
             .allowances
             .iter()
@@ -2504,6 +2946,7 @@ impl AllowedTools<'_> {
             .and_then(|allowance| Ulid::from_string(&allowance.approval).ok());
         let gated = match allowed {
             Some(approval) => Gated::Run(Some(Approval::Approved(approval))),
+            None if unasked => Gated::Run(None),
             None => match self.gated(&wire.id, name, &classification, &[], Vec::new()) {
                 Gated::Park(approval) => {
                     if let Some(parking) = self
@@ -2535,15 +2978,29 @@ impl AllowedTools<'_> {
             audit.finish(&outcome);
             return outcome;
         }
-        let outcome = match crate::agent::off_the_runtime(|| runs.host.execute(&prepared)) {
+        let outcome = match crate::agent::off_the_runtime(|| {
+            if prepared.unsandboxed {
+                runs.host.execute_unsandboxed(&prepared)
+            } else {
+                runs.host.execute(&prepared)
+            }
+        }) {
             Ok(ran) => {
+                // An unsandboxed run could have read anything: labelled as
+                // if it read every checkout of this host (R440 02, R456 03);
+                // a sandboxed one by what it could read (R458).
+                let label = match &every {
+                    Some(every) => core_run::full_access_label(every),
+                    None => core_run::result_label(
+                        untrusted,
+                        &read_drives,
+                        host_folder.then_some(person),
+                    ),
+                };
                 runs.labels
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
-                    .push(core_run::result_label(
-                        prepared.request.network,
-                        &crate::run::mounted_labels(&prepared.mounted, self.drives),
-                    ));
+                    .push(label);
                 ToolOutcome::Answered { text: ran.render() }
             }
             Err(reason) => ToolOutcome::Refused { reason },
@@ -2866,6 +3323,148 @@ impl AllowedTools<'_> {
                         ended: done.ended,
                     });
                 ToolOutcome::Answered { text }
+            }
+            Err(reason) => ToolOutcome::Refused { reason },
+        };
+        audit.finish(&outcome);
+        outcome
+    }
+}
+
+impl AllowedTools<'_> {
+    /// A `web_search` call (101.4, R419, R427, R428, R457), in the order
+    /// every call keeps (R82, R90): refused unsent where this agent is not
+    /// given it here — offered this turn and, read from its `agent.toml`
+    /// now, still switched on and neither a gate nor `local_only` — or its
+    /// query does not read, or the session's label is `local_only`, at
+    /// every level. Classified by the label and the level that read found
+    /// (R428, R457): at *ask*, T1 while anyone may read the session, else
+    /// it waits for a person's approval of this exact query to this engine,
+    /// bound to both; *without asking*, T1. An approval whose engine is not
+    /// this host's now is refused. Its one audit row before the query
+    /// leaves; then the query on its own task, bounded in time and bytes,
+    /// its answer — outside content, labelled `untrusted` and read by
+    /// anyone — what the model reads under the not-instructions sentence.
+    fn web_search(&self, wire: &chat::ToolCall) -> ToolOutcome {
+        use keeper_core::agents::web_search::{self as core_web, WebSearchLevel};
+        let label = self.view.label();
+        let now = self
+            .web
+            .as_ref()
+            .filter(|_| self.allow.iter().any(|name| name == core_web::WEB_SEARCH))
+            .ok_or_else(|| {
+                format!(
+                    "{} is not one of this agent's tools on this host.",
+                    wire.name
+                )
+            })
+            .and_then(|web| web.level_now(&wire.name).map(|level| (web, level)));
+        // A refused call is classified as one that asks: its row says so.
+        let level = now
+            .as_ref()
+            .map_or(WebSearchLevel::Ask, |(_, level)| *level);
+        let classification = self.classify(
+            &wire.id,
+            AgentTool::WebSearch,
+            &core_web::facts(&label, level),
+            None,
+        );
+        let at = self
+            .web
+            .as_ref()
+            .map(|web| core_web::engine(web.engine.engine()))
+            .unwrap_or_default();
+        let refused = |gated: Gated, reason: String| {
+            CallAudit::new(
+                self.sinks,
+                &wire.name,
+                Effect::Write,
+                &classification,
+                gated,
+                ("", &at),
+            )
+            .refuse(reason)
+        };
+        let approved = || {
+            Gated::Run(
+                self.bound_approval(&wire.id, &wire.name)
+                    .map(Approval::Approved),
+            )
+        };
+        let web = match now {
+            Ok((web, _)) => web,
+            Err(reason) => return refused(approved(), reason),
+        };
+        let query = match core_web::Query::parse(wire.arguments.as_ref().unwrap_or(&Value::Null)) {
+            Ok(query) => query,
+            Err(reason) => return refused(approved(), reason),
+        };
+        if let Some(reason) = core_web::sink_refusal(&label) {
+            return refused(approved(), reason);
+        }
+        let binding = core_web::binding(web.engine.engine());
+        let gated = match self.gated(&wire.id, &wire.name, &classification, &[], Vec::new()) {
+            Gated::Park(approval) => {
+                if let Some(parking) = self
+                    .parked
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .as_mut()
+                {
+                    parking.exec_binding = binding;
+                }
+                Gated::Park(approval)
+            }
+            Gated::Run(Some(approval)) => {
+                // What the person approved is this query to this engine:
+                // a host whose engine changed since sends nothing.
+                let checked = self.bound_checked(&wire.id, &wire.name);
+                if checked.as_ref().map(|run| &run.exec_binding) != Some(&binding) {
+                    return refused(
+                        Gated::Run(Some(approval)),
+                        format!(
+                            "It was not searched: this host's web search engine is no longer {}, the one it was approved for.",
+                            checked
+                                .as_ref()
+                                .and_then(|run| run.exec_binding["engine"].as_str())
+                                .and_then(|url| core_web::parse_url(url).ok())
+                                .map(|base| core_web::engine(&base))
+                                .unwrap_or_default()
+                        ),
+                    );
+                }
+                Gated::Run(Some(approval))
+            }
+            gated => gated,
+        };
+        let audit = CallAudit::new(
+            self.sinks,
+            &wire.name,
+            Effect::Write,
+            &classification,
+            gated,
+            ("", &at),
+        );
+        if let Err(withheld) = audit.admit("", &at) {
+            let outcome = withheld.into();
+            audit.finish(&outcome);
+            return outcome;
+        }
+        let searched = {
+            let engine = Arc::clone(&web.engine);
+            let query = query.clone();
+            delegate::block_on(tokio::spawn(async move { engine.search(&query).await }))
+                .unwrap_or_else(|_| Err(core_web::unreachable(web.engine.engine(), false)))
+        };
+        let outcome = match searched {
+            Ok(results) => {
+                web.answers
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push((core_web::result_label(), at.clone()));
+                ToolOutcome::Answered {
+                    text: core_web::render(&query, &results),
+                }
             }
             Err(reason) => ToolOutcome::Refused { reason },
         };
@@ -4180,6 +4779,9 @@ impl AllowedTools<'_> {
         if wire.name == keeper_core::agents::run::RUN {
             return Some(self.run_command(wire));
         }
+        if wire.name == keeper_core::agents::web_search::WEB_SEARCH {
+            return Some(self.web_search(wire));
+        }
         if keeper_core::agents::mcp::decode(&wire.name).is_some() {
             return Some(self.mcp_call(wire));
         }
@@ -4834,6 +5436,10 @@ pub enum ServeError {
     /// A harvest's room's members could not be read: it is handed again.
     #[error("the harvest room's members could not be read")]
     MembersUnread,
+    /// The turn was stopped while a person's file was taken in, before it
+    /// began: nothing of it was logged (R444/02).
+    #[error("the turn was stopped while its file was taken in; it was not begun")]
+    Stopped,
 }
 
 /// `<drive>/<path>` of each file a reply's content hands over.
@@ -5076,7 +5682,9 @@ impl ServedSession {
 
     /// The status every edit of this session's status anchor carries; a
     /// send under a narrowed room makes its title the fixed sentence and
-    /// drops its detail ([`status_content`], R64).
+    /// drops its detail ([`status_content`], R64). It says the console this
+    /// host runs the agent's commands in (R440 09), which every device's
+    /// room header draws.
     fn status_base(&self, deps: &AgentDeps) -> StatusContent {
         StatusContent {
             v: CONTENT_VERSION,
@@ -5090,6 +5698,7 @@ impl ServedSession {
             detail: None,
             waiting: None,
             anchor: None,
+            console: Some(host_console(deps)),
         }
     }
 
@@ -5220,6 +5829,8 @@ impl ServedSession {
                     "agentd: a turn was answered"
                 ),
                 Ok(outcome) => tracing::debug!(%session, ?outcome, "agentd: an event"),
+                // Stopping is the host's own doing, already logged.
+                Err(ServeError::Stopped) => {}
                 Err(error) => {
                     tracing::error!(%session, %error, "agentd: a turn could not be served")
                 }
@@ -5481,6 +6092,7 @@ impl ServedSession {
             tools,
             None,
             None,
+            Vec::new(),
         )
         .await;
         let parent = ran.parent.or(Some(opened));
@@ -6151,7 +6763,10 @@ impl ServedSession {
         binding: &keeper_core::agents::paseo::Binding,
         completion: &str,
     ) -> Result<keeper_core::agents::log::PaseoBody, String> {
-        let bytes = port.download(&binding.file).await?;
+        let bytes = port
+            .download(&binding.file, crate::attachments::MAX_BYTES)
+            .await
+            .map_err(|refused| refused.to_string())?;
         keeper_core::agents::paseo::capture_of(&bytes, &binding.digest, completion)
             .ok_or_else(|| "the room's capture is not the one its message names".to_owned())
     }
@@ -6534,10 +7149,17 @@ impl ServedSession {
         arrived: Arrived,
         stop: CancelSignal,
     ) -> Result<Outcome, ServeError> {
-        let open = keeper_core::agents::ask::read_answer(&arrived.content)
-            .and_then(|answer| self.context.asks.get(&answer.id))
-            .filter(|open| open.via == arrived.sender)
-            .cloned();
+        // `arrival_of` admitted only an unedited `m.text` its sender's device
+        // sealed; the rest is the shared rule a person's device ends a wait by.
+        let open = keeper_core::agents::ask::relayed_answer(
+            "m.room.message",
+            &arrived.content,
+            true,
+            &arrived.sender,
+            |id| self.context.asks.get(id).map(|open| &*open.via),
+        )
+        .and_then(|answer| self.context.asks.get(&answer.id))
+        .cloned();
         let Some(open) = open else {
             tracing::info!(session = %self.context.session.path, sender = %arrived.sender, note = NOT_ASKED, "agents: an answer is not taken");
             return Ok(Outcome::Ignored(NOT_ASKED));
@@ -7793,6 +8415,7 @@ impl ServedSession {
             detail: None,
             waiting: None,
             anchor: None,
+            console: Some(host_console(deps)),
         };
         let content = serde_json::to_value(&anchor).unwrap_or(Value::Null);
         match rooms.send(&room, STATUS, content).await {
@@ -7983,15 +8606,188 @@ impl ServedSession {
         }
     }
 
+    /// What the turn's user message gains of `intake` — pictures and notes
+    /// ([`attachments::shown`]) — for the model the agent's home names now,
+    /// asked once whether it can see when there is a picture; and the notes
+    /// the room reads under the answer. A note this adds is a WARN line
+    /// too, as the intake's own are (R381).
+    async fn shown(
+        deps: &AgentDeps,
+        intake: attachments::Intake,
+    ) -> (Vec<keeper_core::bots::chat::ContentPart>, Vec<String>) {
+        let current = current_model(deps).ok().flatten();
+        let deps = current.as_deref().unwrap_or(deps);
+        let model = &deps.bot.target;
+        let vision = if intake.pictures.is_empty() {
+            None
+        } else {
+            crate::turn::discovered_model(&deps.env, &deps.data_dir, &deps.bot, model)
+                .await
+                .and_then(|found| found.vision)
+        };
+        let said = intake.notes.len();
+        let (parts, notes) = attachments::shown(intake.pictures, intake.notes, vision, model);
+        for sentence in &notes[said..] {
+            tracing::warn!(agent = %deps.home.config.id, sentence, "agents: a photo a person sent was not shown to the model");
+        }
+        (parts, notes)
+    }
+
+    /// The file a person's message carries (story 101.2, R417), taken in
+    /// before its turn opens: downloaded through the room's port — refused
+    /// over [`attachments::MAX_BYTES`] by the size the message says, and by
+    /// the port at the first byte past it however the size was stated
+    /// (R444/01); the whole download bounded by the host's
+    /// `download_within` (R444/02) — and stored whole in the session's
+    /// `attachments/` under the session's claim, a PDF's text beside it,
+    /// read by the host's [`attachments::PdfReader`] (R444/03). The file is
+    /// the person's line's own, kept where that line is kept, so it is
+    /// written under the line's readers as the log is. What could not be
+    /// done is a note, and a WARN line (R381): a file message with no file
+    /// to fetch too (R444/06), and a photo in a format no model is shown
+    /// (R444/05). `None` when `stop` fired while the file was taken in: the
+    /// download is dropped and the turn is not begun. It is handed the
+    /// session's `path`, delegation `port` and writer `lease`, never the
+    /// session: the session's database connection is not `Sync`, so a
+    /// borrow of it may not live across the download's await.
+    async fn take_in(
+        deps: &AgentDeps,
+        arrived: &Arrived,
+        path: &str,
+        port: Option<Arc<dyn DelegationPort>>,
+        lease: Option<Arc<Lease>>,
+        stop: &CancelSignal,
+    ) -> Option<attachments::Intake> {
+        let mut intake = attachments::Intake::default();
+        if arrived.arrival != Arrival::Text || !attachments::is_attachment(&arrived.content) {
+            return Some(intake);
+        }
+        let sent = attachments::sent_of(&arrived.content);
+        let note = |intake: &mut attachments::Intake, sentence: String| {
+            tracing::warn!(session = %path, event = %arrived.event_id, sentence, "agents: a file a person sent did not wholly reach the agent");
+            intake.notes.push(sentence);
+        };
+        let Some(source) = &sent.source else {
+            note(&mut intake, attachments::no_source(&sent.name));
+            return Some(intake);
+        };
+        if let Some(size) = sent.declared.filter(|size| *size > attachments::MAX_BYTES) {
+            note(&mut intake, attachments::too_large(&sent.name, size));
+            return Some(intake);
+        }
+        let Some(port) = port else {
+            note(&mut intake, attachments::no_download(&sent.name));
+            return Some(intake);
+        };
+        let within = deps.attachments.download_within;
+        let mut stopped = stop.clone();
+        let fetched = tokio::select! {
+            biased;
+            () = stopped.cancelled() => {
+                tracing::info!(session = %path, event = %arrived.event_id, "agents: a turn stopped while its file downloaded; it was not begun");
+                return None;
+            }
+            fetched = tokio::time::timeout(within, port.download(source, attachments::MAX_BYTES)) => fetched,
+        };
+        let bytes = match fetched {
+            Ok(Ok(bytes)) => bytes,
+            Ok(Err(keeper_core::media::Download::TooLarge(read))) => {
+                note(&mut intake, attachments::too_large(&sent.name, read));
+                return Some(intake);
+            }
+            Ok(Err(keeper_core::media::Download::Failed(error))) => {
+                tracing::warn!(session = %path, %error, "agents: a person's file could not be downloaded");
+                note(&mut intake, attachments::not_downloaded(&sent.name));
+                return Some(intake);
+            }
+            Err(_) => {
+                note(
+                    &mut intake,
+                    attachments::download_timed_out(&sent.name, within),
+                );
+                return Some(intake);
+            }
+        };
+        let may_write = move || lease.as_ref().is_none_or(|lease| lease.may_write());
+        let store = |name: &str, bytes: &[u8]| {
+            off_the_runtime(|| attachment_write(&deps.sessions_zone, path, name, bytes, &may_write))
+                .map(|landed| {
+                    (
+                        format!("{}/{path}/{landed}", deps.sessions_subfolder),
+                        landed,
+                    )
+                })
+                .map_err(|error| error.to_string())
+        };
+        let landed = match store(&sent.name, &bytes) {
+            Ok((in_drive, landed)) => {
+                intake.stored.push(in_drive);
+                landed
+            }
+            Err(why) => {
+                note(&mut intake, attachments::not_stored(&sent.name, &why));
+                return Some(intake);
+            }
+        };
+        let stored_name = landed.rsplit('/').next().unwrap_or(&landed).to_owned();
+        match attachments::kind_of(&sent.mime, &sent.name) {
+            attachments::Kind::Image => intake.pictures.push(attachments::Picture {
+                name: stored_name,
+                mime: sent.mime,
+                bytes,
+            }),
+            attachments::Kind::Unshown(format) => {
+                note(
+                    &mut intake,
+                    attachments::format_not_shown(&stored_name, &format),
+                );
+            }
+            attachments::Kind::Pdf => {
+                let Some(reader) = deps.attachments.pdf.as_deref() else {
+                    note(&mut intake, attachments::no_pdf_reader(&stored_name));
+                    return Some(intake);
+                };
+                match reader.read(bytes, stop).await? {
+                    attachments::PdfText::Text(text) => {
+                        match store(&attachments::text_name(&stored_name), text.as_bytes()) {
+                            Ok((in_drive, _)) => intake.stored.push(in_drive),
+                            Err(why) => {
+                                note(
+                                    &mut intake,
+                                    attachments::text_not_stored(&stored_name, &why),
+                                );
+                            }
+                        }
+                    }
+                    attachments::PdfText::NoText => {
+                        note(&mut intake, attachments::no_text(&stored_name));
+                    }
+                    attachments::PdfText::Unreadable(why) => {
+                        tracing::warn!(session = %path, %why, "agents: a person's PDF did not read");
+                        note(&mut intake, attachments::pdf_unreadable(&stored_name));
+                    }
+                }
+            }
+            attachments::Kind::Text | attachments::Kind::Other => {}
+        }
+        Some(intake)
+    }
+
     /// The lines that open a turn, and the one its answer answers: for a
-    /// person's message, its label join and a `user` line; for a brief, the
-    /// session's `delegate accepted` (once), the delegation's label and a
-    /// `peer` line; for a delegation's reply, the `peer` line its receipt
+    /// person's message, its label join and a `user` line naming the files
+    /// it carried, `stored` (drive-relative in the home drive); for a brief,
+    /// the session's `delegate accepted` (once), the delegation's label and
+    /// a `peer` line; for a delegation's reply, the `peer` line its receipt
     /// stands for ([`Self::peer_the_reply`]); for another agent's ask in a
     /// proxy's DM, the asking session's label and a `peer` line carrying
     /// the ask (S-09); for the answer to this session's ask, a `peer` line
     /// naming it, then `ask answered`.
-    fn open_turn(&mut self, deps: &AgentDeps, arrived: &Arrived) -> Result<LogLine, ServeError> {
+    fn open_turn(
+        &mut self,
+        deps: &AgentDeps,
+        arrived: &Arrived,
+        stored: &[String],
+    ) -> Result<LogLine, ServeError> {
         if arrived.arrival == Arrival::Replied {
             return self.peer_the_reply()?.ok_or(ServeError::NoReceipt);
         }
@@ -8201,7 +8997,13 @@ impl ServedSession {
                     LineBody::User(UserBody {
                         sender: arrived.sender.clone(),
                         text: arrived.text.clone(),
-                        attachments: Vec::new(),
+                        attachments: stored
+                            .iter()
+                            .map(|path| Attachment {
+                                drive: deps.home.drive.id.clone(),
+                                path: path.clone(),
+                            })
+                            .collect(),
                     }),
                 )
             }
@@ -8267,9 +9069,31 @@ impl ServedSession {
     ) -> Result<TurnReport, ServeError> {
         let label_before = self.context.label.clone();
         let sinks = self.sinks(deps);
+        // A person's file (R417): what the model is shown with their
+        // message, and what the room is told could not be done.
+        let mut with_message = Vec::new();
+        let mut notes = Vec::new();
         let (user_id, question, received_at, harvest, resume) = match opening {
             Opening::Arrived(arrived) => {
-                let user = self.open_turn(deps, &arrived)?;
+                // A turn stopped while its file was taken in is not begun:
+                // nothing of it is logged, so the arrival is served again
+                // wherever the session is served next (R444/02).
+                let Some(intake) = Self::take_in(
+                    deps,
+                    &arrived,
+                    &self.context.session.path,
+                    self.delegations.clone(),
+                    self.writer.lease(),
+                    &stop,
+                )
+                .await
+                else {
+                    return Err(ServeError::Stopped);
+                };
+                let user = self.open_turn(deps, &arrived, &intake.stored)?;
+                if !intake.pictures.is_empty() || !intake.notes.is_empty() {
+                    (with_message, notes) = Self::shown(deps, intake).await;
+                }
                 // A harvest's anchor names its arrival, the closed session:
                 // each attempt asks the room as it is then, and a room its
                 // label no longer reaches hears only that a harvest ran
@@ -8349,6 +9173,7 @@ impl ServedSession {
             tools,
             resume,
             None,
+            with_message,
         )
         .await;
         let stream_end = Instant::now();
@@ -8402,6 +9227,11 @@ impl ServedSession {
                 (join_note(&visible, &note), shown.clone())
             }
         };
+        // What could not be done with a person's file is said under the
+        // answer, where they look (R381).
+        let final_text = notes
+            .iter()
+            .fold(final_text, |text, note| join_note(&text, note));
         // The room gets the log's redaction (S-17), and the artifact too, so
         // it equals the log's line.
         let final_text = redact_secrets(&final_text).text;
@@ -8463,9 +9293,17 @@ impl ServedSession {
         if withheld {
             gate.suppressed("answer");
         }
-        // Only now is the status `idle`: a device following the answer takes
-        // that as the answer being whole (AD-384).
-        if let Some(anchor) = board.finish(&delivered).await {
+        // Only now does the status leave `running`: a device following the
+        // answer takes that as the answer being whole (AD-384). A turn the
+        // model finished, with no delegation of the session waiting for its
+        // target's reply and no question of it waiting for an answer, says
+        // `done`; any other end — stopped, failed, parked, asking, waiting
+        // on a delegation — says `idle` (R437). A delegation whose target
+        // replied to its latest round waits for nothing.
+        let done = ran.ending == TurnEnding::Complete
+            && self.context.delegations.values().all(|open| open.replied)
+            && self.context.asks.is_empty();
+        if let Some(anchor) = board.finish(&delivered, done).await {
             self.context.status_anchor = Some(anchor);
         }
 
@@ -8708,6 +9546,7 @@ impl ServedSession {
                 marker: marker.id,
                 due,
             }),
+            Vec::new(),
         )
         .await;
         let mut parent = ran.parent.or(Some(marker.id));
@@ -9336,10 +10175,12 @@ fn reply_offer(session: SessionKind, relays_waiting: bool, kind: AgentKind) -> R
 /// `workflow_start` outside a proxy's own conversation (AD-380) and the
 /// memory tools `allow` names, by the session's kind (R127),
 /// `drive_search` as `allow` says (95.4), `run` as `allow` says where
-/// this host's sandbox passed its probe, `sandboxed` (96.1 #11), and the
+/// this host's sandbox passed its probe, `sandboxed` (96.1 #11), the
 /// tools of each server `[tools].mcp` names that answered its last
 /// `tools/list` on this host, `mcp`, each that can travel and has a tier
-/// (96.2 #3, #5). Arming and a workflow's start check both ask it (R202).
+/// (96.2 #3, #5), and `web_search` as `allow` says where this host names
+/// an engine, `searches`, to an agent that is not `local_only` (101.4,
+/// R419). Arming and a workflow's start check both ask it (R202).
 #[allow(clippy::too_many_arguments)]
 fn agent_offer(
     config: &keeper_core::agents::home::AgentConfig,
@@ -9347,9 +10188,10 @@ fn agent_offer(
     relays_waiting: bool,
     grants: &dyn GrantSource,
     home: &str,
-    sandboxed: bool,
+    run: Option<chat::ToolSpec>,
     mcp: Option<&crate::mcp::McpServers>,
     kvm: &[String],
+    searches: bool,
     mut tools: Vec<chat::ToolSpec>,
 ) -> Vec<chat::ToolSpec> {
     // Whether this model is offered tools at all: the surface tools ride on
@@ -9400,16 +10242,22 @@ fn agent_offer(
     if config.allow.iter().any(|name| crate::search::serves(name)) {
         tools.push(crate::search::spec());
     }
-    if sandboxed
-        && config
+    if let Some(run) = run.filter(|_| {
+        config
             .allow
             .iter()
             .any(|name| name == keeper_core::agents::run::RUN)
-    {
-        tools.push(keeper_core::agents::run::spec());
+    }) {
+        tools.push(run);
     }
     if let Some(servers) = mcp {
         tools.extend(servers.specs(&config.mcp));
+    }
+    if searches
+        && keeper_core::agents::web_search::is_on(config)
+        && keeper_core::agents::web_search::never(config).is_none()
+    {
+        tools.push(keeper_core::agents::web_search::spec());
     }
     if !kvm.is_empty() {
         for (name, description, parameters) in keeper_core::agents::kvm::specs(kvm) {
@@ -9448,9 +10296,11 @@ fn workflow_offer(
         false,
         &grants,
         &deps.home.drive.id,
-        deps.sandbox.is_some(),
+        // The tool's name is all a workflow's start reads (R202).
+        run_offer(deps, &[]),
         deps.mcp.as_deref(),
         &kvm_ids(config, deps.kvm.as_deref()),
+        deps.web_search.is_some(),
         model_tools.to_vec(),
     )
     .into_iter()
@@ -9506,9 +10356,10 @@ async fn arm_session(
         !context.relays.is_empty(),
         grants.as_ref(),
         &deps.home.drive.id,
-        deps.sandbox.is_some(),
+        run_offer(deps, &run_drives(context, deps)),
         deps.mcp.as_deref(),
         &kvm_ids(config, deps.kvm.as_deref()),
+        deps.web_search.is_some(),
         model_tools.clone(),
     );
     (armed, model_tools)
@@ -9590,6 +10441,9 @@ impl ReviewPass {
 /// Run one turn of `context`'s agent: arm, compose, and drive the tool loop
 /// into `sink`, writing every round, call, result and label to the log. A
 /// review pass streams into no room and writes no `open` line.
+/// `with_message` rides this turn's own user message only — a person's
+/// photo and keeper's notes about their files (R417) — never the log, so a
+/// later turn reads that message as its replay does.
 #[allow(clippy::too_many_arguments)]
 async fn run_agent_turn(
     context: &mut SessionContext,
@@ -9601,6 +10455,7 @@ async fn run_agent_turn(
     tools: TurnTools,
     resume: Option<crate::approvals::Resume>,
     review: Option<ReviewPass>,
+    with_message: Vec<keeper_core::bots::chat::ContentPart>,
 ) -> Ran {
     let failed_as = |sent: Sent, error: String| Ran {
         sent,
@@ -9630,6 +10485,11 @@ async fn run_agent_turn(
         }
     };
     let deps = current.as_deref().unwrap_or(deps);
+    // While this turn runs at full access, every status of its agent says
+    // so: a console saved meanwhile applies from its next turn (R456 06).
+    let _full_access = (deps.sandbox.is_some()
+        && deps.home.config.run.mode == keeper_core::agents::console::RunMode::Full)
+        .then(|| deps.full_access_turns.enter());
     let sent = Sent::of(&deps.home.config);
     let config = &deps.home.config;
     let local = deps.model_is_local();
@@ -9648,6 +10508,15 @@ async fn run_agent_turn(
         }
         None => config.allow.clone(),
     };
+    if let Some(said) = armed
+        .request
+        .messages
+        .iter_mut()
+        .rev()
+        .find(|message| message.role == Role::User)
+    {
+        said.content.extend(with_message);
+    }
     let failed = |error: String| failed_as(sent.clone(), error);
 
     // What the prompt carries beyond the conversation — the home's frozen
@@ -9854,14 +10723,28 @@ async fn run_agent_turn(
     // `run`'s place on this host: the session's workspace, the drives the
     // agent may read in its scope this host mounts, and the `session`
     // approvals of runs it holds (96.1, R146).
-    let runs = deps.sandbox.as_ref().map(|host| RunTools {
-        host: Arc::clone(host),
-        drive: deps.drive_root.clone(),
-        zone: deps.sessions_subfolder.clone(),
-        session: context.session.path.clone(),
-        drives: run_drives(context, deps),
-        allowances: context.run_allowances.clone(),
-        labels: Mutex::new(Vec::new()),
+    let runs = deps.sandbox.as_ref().map(|host| {
+        // The drives this session may run in on this host: its scope, under
+        // the agent's grants — the console's drive folders among them only
+        // (R440 03), for the offer, the run and the approval's check alike.
+        let drives = run_drives(context, deps);
+        RunTools {
+            host: Arc::clone(host),
+            run: deps.home.config.run.clone(),
+            folders: run_folders(&deps.home.config.run, &drives, deps)
+                .into_iter()
+                .filter_map(|(_, landed)| landed.ok())
+                .collect(),
+            guards: console_guards(deps),
+            agent_drives: deps.home.config.drives.clone(),
+            checkouts: deps.checkouts.clone(),
+            drive: deps.drive_root.clone(),
+            zone: deps.sessions_subfolder.clone(),
+            session: context.session.path.clone(),
+            drives,
+            allowances: context.run_allowances.clone(),
+            labels: Mutex::new(Vec::new()),
+        }
     });
     // Whose screen reads a read of this turn is: the session's folder.
     let screen_session = deps
@@ -9942,7 +10825,8 @@ async fn run_agent_turn(
             &tools.sinks,
         )
         .with_outputs(outputs)
-        .serving(tools.desk),
+        .serving(tools.desk)
+        .model_local(local),
         memory,
         search,
         view: &log,
@@ -9999,6 +10883,22 @@ async fn run_agent_turn(
                 zone: deps.sessions_zone.clone(),
                 answers: Mutex::new(Vec::new()),
             }),
+        // A review pass reads and proposes, a gate turn answers: neither
+        // searches the web; nor does an agent `web_search::never` offers
+        // one — a gate, or `local_only` — whatever its label (R101W1-03).
+        web: deps
+            .web_search
+            .as_ref()
+            .filter(|_| {
+                review.is_none()
+                    && !in_gate
+                    && keeper_core::agents::web_search::never(config).is_none()
+            })
+            .map(|engine| WebTools {
+                engine: Arc::clone(engine),
+                home: deps.home.clone(),
+                answers: Mutex::new(Vec::new()),
+            }),
     };
     let tool_loop = ToolLoop {
         client: &client,
@@ -10052,7 +10952,8 @@ async fn run_agent_turn(
         // What the call read: a drive verb's file, or the home drive's
         // files a BMAD or skill tool read, each labelled by where it landed
         // and the bytes it returned, as they were at the read (R195); a
-        // helper's, everything it read.
+        // helper's, everything it read; a refused home's `agent.toml` a
+        // `delegate` refusal told of (R436).
         let home = &deps.home.drive;
         let helped = (wire.name == helper::HELPER)
             .then(|| host.helpers.take(&wire.id))
@@ -10060,6 +10961,7 @@ async fn run_agent_turn(
         let reads: Vec<(Label, String)> = read_label(deps, &read_profiles, record, outcome)
             .into_iter()
             .chain(host.search.take_reads())
+            .chain(host.delegation.take_reads())
             .chain(
                 host.bmad
                     .take_reads()
@@ -10077,6 +10979,8 @@ async fn run_agent_turn(
         let fetched = host.mcp.as_ref().and_then(McpTools::take);
         // A KVM's frame is outside content, read by the KVM's readers.
         let framed = host.kvm.as_ref().and_then(KvmTools::take);
+        // A web search's answer is outside content, read by anyone.
+        let searched = host.web.as_ref().and_then(WebTools::take);
         let result_label = if helped.is_some() {
             reads
                 .iter()
@@ -10090,6 +10994,7 @@ async fn run_agent_turn(
                 .chain(ran.clone())
                 .chain(fetched.as_ref().map(|answer| answer.label.clone()))
                 .chain(framed.as_ref().map(|answer| answer.label.clone()))
+                .chain(searched.as_ref().map(|(label, _)| label.clone()))
                 .reduce(|joined, label| joined.join(&label))
                 .unwrap_or_else(|| log.context.label.clone())
         };
@@ -10175,7 +11080,8 @@ async fn run_agent_turn(
         let outside = fetched
             .map(|answer| (answer.label, answer.at))
             .into_iter()
-            .chain(framed.map(|answer| (answer.label, answer.at)));
+            .chain(framed.map(|answer| (answer.label, answer.at)))
+            .chain(searched);
         for (label, at) in outside {
             let joined = log.context.label.join(&label);
             if joined != log.context.label {
@@ -10919,32 +11825,92 @@ pub fn bot_for(home: &AgentHome, rows: &[ProviderRow]) -> Option<(ProviderRow, B
     ))
 }
 
-/// `deps` over the model its home's `agent.toml` names now, read through
-/// the zone's own read path ([`crate::zone::read_home`]) as every turn
-/// begins (100.2 #5, R382): a person's save in Settings › Agents, or a hand
-/// edit, runs from the agent's next turn without restarting the host. Only
-/// `[model]` is taken from the file — every other key still waits for the
-/// host's next build, as before. `Ok(None)` when the model is the one
-/// `deps` holds. A home that no longer reads, or a bot no provider here
-/// serves, refuses the turn with its sentence.
+/// `deps` over the model, the web search level and the console its home's
+/// `agent.toml` names now, read through the zone's own read path
+/// ([`crate::zone::read_home`]) as every turn begins (100.2 #5, R382; R427,
+/// R457; 101.5, R420): a person's save in Settings › Agents, or a hand edit,
+/// runs from the agent's next turn without restarting the host — a console
+/// turned off or down stops at the next turn, not the next restart. Only
+/// `[model]`, whether `[tools].allow` names `web_search`, `[web_search].ask`
+/// and `[run]` (with `run`'s place in `[tools].allow`, which `[run]` decides)
+/// are taken from the file — every other key still waits for the host's next
+/// build, as before — so the turn's offer and its dispatch read one
+/// permission ([`keeper_core::agents::web_search::allow_as`]). A console at
+/// full access is read with its zone every turn, changed or not (R440 07): an
+/// agent a gate hands work to — or whose zone cannot be read to tell — is
+/// refused the turn, never run at full access. `Ok(None)` when all are the
+/// ones `deps` holds, nothing copied. A home that no longer reads, or a bot
+/// no provider here serves, refuses the turn with its sentence.
 /// Boxed: the turn's future holds it across every await, and an inline
 /// `AgentDeps` there overflows the stacks of deep test runtimes.
 pub(crate) fn current_model(deps: &AgentDeps) -> Result<Option<Box<AgentDeps>>, String> {
+    use keeper_core::agents::web_search;
     let home = &deps.home;
     let read = crate::zone::read_home(&home.zone, &home.config.id, &home.drive)?;
     let now = read.config;
-    if now.bot == home.config.bot && now.effort == home.config.effort {
+    // At full access, whether a gate hands this agent outside work is read
+    // every turn, whatever changed (R440 07): a gate made a delegate since
+    // refuses the next turn, and a zone that cannot be read is not "no
+    // gate".
+    if now.run.mode == keeper_core::agents::console::RunMode::Full {
+        match crate::zone::delegated_by(&home.zone, &home.drive, &now.id) {
+            Ok(None) => {}
+            Ok(Some(gate)) => {
+                return Err(format!(
+                    "{}'s agent.toml is refused: {}.",
+                    now.name,
+                    keeper_core::agents::console::delegate_refusal(&gate)
+                ))
+            }
+            Err(why) => {
+                return Err(format!(
+                    "{}'s console is at full access, and keeper cannot tell whether a gate hands it outside work: {why}. Nothing was run.",
+                    now.name
+                ))
+            }
+        }
+    }
+    let model_moved = now.bot != home.config.bot
+        || now.effort != home.config.effort
+        || now.local_only != home.config.local_only;
+    let search_moved = web_search::level(&now) != web_search::level(&home.config);
+    let console_moved = now.run != home.config.run;
+    if !model_moved && !search_moved && !console_moved {
         return Ok(None);
+    }
+    let run = keeper_core::agents::run::RUN;
+    let mut allow: Vec<String> = web_search::allow_as(&home.config.allow, &now)
+        .into_iter()
+        .filter(|tool| tool != run)
+        .collect();
+    if now.allow.iter().any(|tool| tool == run) {
+        allow.push(run.to_owned());
     }
     let fresh = AgentHome {
         config: keeper_core::agents::home::AgentConfig {
+            allow,
             bot: now.bot,
             effort: now.effort,
             local_only: now.local_only,
+            web_search_ask: now.web_search_ask,
+            web_search_said: now.web_search_said,
+            run: now.run,
             ..home.config.clone()
         },
         ..home.clone()
     };
+    if !model_moved {
+        tracing::info!(
+            agent = %fresh.config.id,
+            web_search = ?web_search::level(&fresh.config),
+            mode = fresh.config.run.mode.as_str(),
+            "agents: this agent's web search or console changed in its agent.toml; this turn runs on it"
+        );
+        return Ok(Some(Box::new(AgentDeps {
+            home: fresh,
+            ..deps.clone()
+        })));
+    }
     let (row, bot) = bot_for(&fresh, &deps.rows).ok_or_else(|| {
         format!(
             "No bot provider on this host serves {}'s model {} at {}. Add one under Bots.",

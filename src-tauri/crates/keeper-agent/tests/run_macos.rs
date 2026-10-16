@@ -176,6 +176,139 @@ fn the_sandbox_holds_files_to_the_plan() {
     );
 }
 
+/// 101.5 (R420) through `sandbox-exec`: a console's folder is the run's to
+/// write — the profile's `(allow file-read* file-write* …)` for it — while
+/// a folder it was not given stays refused; the console's full mode runs
+/// the same program without the profile and writes there.
+#[test]
+fn a_console_folder_is_written_through_the_profile_and_full_access_needs_none() {
+    use keeper_agent::run::land;
+    use keeper_core::agents::console::{RunMode, RunPath};
+    let tree = tree();
+    let host = host(&tree);
+    let base = tree.home.parent().expect("base").to_path_buf();
+    let given = base.join("given");
+    let other = base.join("other");
+    for dir in [&given, &other] {
+        std::fs::create_dir_all(dir).expect("folder");
+    }
+    let session = Session {
+        drive: &tree.drive,
+        zone: "60-sessions",
+        path: SESSION,
+    };
+    let touch = |dir: &Path, name: &str| json!({"argv": ["/usr/bin/touch", dir.join(name).display().to_string()]});
+    let folder = vec![land(&RunPath::Host(given.display().to_string()), &[], &[]).expect("landed")];
+    for (dir, written) in [(&given, true), (&other, false)] {
+        let prepared = host
+            .prepare(&touch(dir, "sandboxed"), session, &[])
+            .expect("prepared")
+            .in_console(RunMode::Sandboxed, folder.clone(), Vec::new());
+        let ran = host.execute(&prepared).expect("ran");
+        assert_eq!(ran.exit == Exit::Code(0), written, "{}", dir.display());
+        assert_eq!(dir.join("sandboxed").exists(), written, "{}", dir.display());
+    }
+    let prepared = host
+        .prepare(&touch(&other, "full"), session, &[])
+        .expect("prepared")
+        .in_console(RunMode::Full, Vec::new(), Vec::new());
+    let ran = host.execute_unsandboxed(&prepared).expect("ran");
+    assert_eq!(ran.exit, Exit::Code(0));
+    assert!(other.join("full").exists());
+}
+
+/// R440 01, 04, R441 through `sandbox-exec`: a console's folder never
+/// reaches what keeper keeps to itself. A drive folder holding a nested
+/// `.keeper`, and a harmless name linked to the drive's `.git`, are not
+/// given; writing through either is the profile's to refuse, the bytes
+/// kept. Of two overlapping folders, the inner one swapped for a link to
+/// the agents zone after it was granted is refused at the run — every
+/// folder landed again, by identity, right before the profile — and the
+/// agent's own `agent.toml`, never granted, is the kernel's to refuse.
+#[test]
+fn a_console_folder_never_reaches_keepers_own_folders_on_the_mac() {
+    use keeper_agent::run::{land, DriveGuard};
+    use keeper_core::agents::console::{RunMode, RunPath};
+    let tree = tree();
+    let host = host(&tree);
+    let drive = &tree.drive;
+    write(
+        &drive.join("80-agents/nixi/agent.toml"),
+        "mode = \"safe\"\n",
+    );
+    write(&drive.join("projects/site/page.md"), "a page\n");
+    write(&drive.join("projects/notes/.keeper/index"), "kept\n");
+    std::os::unix::fs::symlink(drive.join(".git"), drive.join("projects/alias")).expect("link");
+    write(&tree.workspace.join("evil.toml"), "mode = \"full\"\n");
+    let guards = vec![DriveGuard {
+        id: "tgdrive".to_owned(),
+        mounted: true,
+        root: drive.clone(),
+        kept: vec![
+            drive.join("80-agents"),
+            drive.join("60-sessions"),
+            drive.join(".git"),
+        ],
+    }];
+    let scope = ["tgdrive".to_owned()];
+    let at = |path: &str| {
+        land(
+            &RunPath::Drive {
+                drive: "tgdrive".to_owned(),
+                path: path.to_owned(),
+            },
+            &guards,
+            &scope,
+        )
+    };
+    for refused in [
+        "projects",
+        "projects/notes",
+        "projects/alias",
+        "80-agents/nixi",
+    ] {
+        assert!(at(refused).is_err(), "{refused}");
+    }
+    let session = Session {
+        drive,
+        zone: "60-sessions",
+        path: SESSION,
+    };
+    let copy = |to: &Path| json!({"argv": ["/bin/cp", "evil.toml", to.display().to_string()]});
+    let site = at("projects/site").expect("a plain folder");
+    let home = drive.join("80-agents/nixi/agent.toml");
+    for target in [drive.join("projects/alias/config"), home.clone()] {
+        let prepared = host
+            .prepare(&copy(&target), session, &[])
+            .expect("prepared")
+            .in_console(RunMode::Sandboxed, vec![site.clone()], Vec::new());
+        let ran = host.execute(&prepared).expect("ran");
+        assert_ne!(ran.exit, Exit::Code(0), "{}", target.display());
+    }
+    assert_eq!(
+        std::fs::read_to_string(drive.join(".git/config")).expect("config"),
+        "[core]\n"
+    );
+    let prepared = host
+        .prepare(
+            &copy(&drive.join("projects/site/nixi/agent.toml")),
+            session,
+            &[],
+        )
+        .expect("prepared")
+        .in_console(RunMode::Sandboxed, vec![site.clone()], Vec::new());
+    std::fs::rename(drive.join("projects/site"), drive.join("projects/site-old")).expect("moved");
+    std::os::unix::fs::symlink(drive.join("80-agents"), drive.join("projects/site")).expect("swap");
+    assert!(
+        host.execute(&prepared).is_err(),
+        "a swapped folder is refused"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&home).expect("agent.toml"),
+        "mode = \"safe\"\n"
+    );
+}
+
 /// TCP and UDP follow the plan; a pathname Unix socket is unreachable with
 /// network and without (R147, R213), its control outside connecting.
 #[test]

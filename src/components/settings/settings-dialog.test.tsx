@@ -87,6 +87,8 @@ vi.mock("@/lib/ipc/client", () => ({
   menuBarPresenceSet: vi.fn(() => Promise.resolve()),
   undoSendWindow: vi.fn(() => Promise.resolve(10)),
   setUndoSendWindow: vi.fn(() => Promise.resolve()),
+  undoSendAgentWindow: vi.fn(() => Promise.resolve(0)),
+  setUndoSendAgentWindow: vi.fn(() => Promise.resolve()),
   // The Recording section mounts the shared segmentation + destination + fps
   // controls (Story 17.5 + 19.5), which lazily hydrate from this read when
   // `recording` is on.
@@ -237,9 +239,12 @@ vi.mock("@/lib/ipc/client", () => ({
   // Settings → Agents (Story 90.6) and Grants, mounted only under `botTools`.
   agentsCopies: vi.fn(() => Promise.resolve([])),
   agentsMcpList: vi.fn(() => Promise.resolve({ servers: [], tiers: [] })),
+  agentsClaimsLeaseGet: vi.fn(() => Promise.resolve("short")),
+  agentsClaimsLeaseSet: vi.fn(),
   agentsSandboxGet: vi.fn(() =>
     Promise.resolve({ readExec: [], env: [], status: "", refusal: null }),
   ),
+  agentsWebSearchGet: vi.fn(() => Promise.resolve({ url: null, refusal: null })),
   agentsSeedOffer: vi.fn(() =>
     Promise.resolve({
       folders: [],
@@ -289,6 +294,8 @@ import { PUSH_GATEWAY_LABEL } from "@/components/settings/push-gateway-field";
 import {
   OWN_FINGERPRINT_NONE,
   SettingsDialog,
+  UNDO_SEND_UNREAD,
+  undoSendUnsaved,
   VOICE_SHORTCUT_LABEL,
   VOICE_SHORTCUT_NOTE,
 } from "@/components/settings/settings-dialog";
@@ -314,9 +321,11 @@ import {
   recordingHotkeyGet,
   recordingHotkeySet,
   setHonorRemoteDeletions,
+  setUndoSendAgentWindow,
   setUndoSendWindow,
   syncGitStatus,
   syncProfiles,
+  undoSendAgentWindow,
   undoSendWindow,
   unifiedpushConfirm,
   unifiedpushStatus,
@@ -341,6 +350,8 @@ const mockHonorGet = vi.mocked(honorRemoteDeletions);
 const mockHonorSet = vi.mocked(setHonorRemoteDeletions);
 const mockUndoGet = vi.mocked(undoSendWindow);
 const mockUndoSet = vi.mocked(setUndoSendWindow);
+const mockAgentUndoGet = vi.mocked(undoSendAgentWindow);
+const mockAgentUndoSet = vi.mocked(setUndoSendAgentWindow);
 const mockHotkeyGet = vi.mocked(hotkeyGet);
 const mockHotkeySet = vi.mocked(hotkeySet);
 const mockRecordingHotkeyGet = vi.mocked(recordingHotkeyGet);
@@ -430,6 +441,10 @@ beforeEach(() => {
   mockUndoSet.mockClear();
   mockUndoGet.mockResolvedValue(10);
   mockUndoSet.mockResolvedValue(undefined);
+  mockAgentUndoGet.mockClear();
+  mockAgentUndoSet.mockClear();
+  mockAgentUndoGet.mockResolvedValue(0);
+  mockAgentUndoSet.mockResolvedValue(undefined);
   mockHotkeyGet.mockClear();
   mockHotkeySet.mockClear();
   mockHotkeyGet.mockResolvedValue(DEFAULT_HOTKEY_VM);
@@ -816,6 +831,38 @@ describe("SettingsDialog", () => {
     fireEvent.change(input, { target: { value: "99" } });
     await waitFor(() => expect(mockUndoSet).toHaveBeenCalledWith(60));
     expect(input).toHaveValue(60);
+  });
+
+  it("keeps the agent rooms' Undo-Send window apart from the chats' (Story 101.3)", async () => {
+    mockPosture.mockResolvedValue(false);
+    mockUndoGet.mockResolvedValue(2);
+    mockAgentUndoGet.mockResolvedValue(0);
+    render(<SettingsDialog open onOpenChange={() => {}} />);
+
+    const agents = await screen.findByLabelText("Undo-Send window for agents (seconds)");
+    await waitFor(() => expect(agents).toHaveValue(0));
+    fireEvent.change(agents, { target: { value: "4" } });
+    await waitFor(() => expect(mockAgentUndoSet).toHaveBeenCalledWith(4));
+    expect(mockUndoSet).not.toHaveBeenCalled();
+    expect(screen.getByLabelText("Undo-Send window (seconds)")).toHaveValue(2);
+  });
+
+  it("says when an Undo-Send window could not be read or saved, never showing a default (R381)", async () => {
+    mockPosture.mockResolvedValue(false);
+    mockAgentUndoGet.mockRejectedValue({ code: "internal", message: "database is locked" });
+    mockUndoSet.mockRejectedValue({ code: "internal", message: "database is locked" });
+    render(<SettingsDialog open onOpenChange={() => {}} />);
+
+    const agents = await screen.findByLabelText("Undo-Send window for agents (seconds)");
+    expect(await screen.findByText(UNDO_SEND_UNREAD)).toBeInTheDocument();
+    expect(agents).toHaveValue(null);
+    expect(agents).toBeEnabled();
+
+    const chats = screen.getByLabelText("Undo-Send window (seconds)");
+    await waitFor(() => expect(chats).toHaveValue(10));
+    fireEvent.change(chats, { target: { value: "5" } });
+    expect(await screen.findByText(undoSendUnsaved(10))).toBeInTheDocument();
+    expect(chats).toHaveValue(10);
   });
 
   it("'Run setup again' starts the wizard and closes Settings", async () => {
@@ -1321,6 +1368,8 @@ describe("SettingsDialog", () => {
         },
         problem: null,
         model: null,
+        webSearch: null,
+        console: null,
         avatarProblem: null,
       },
     ]);

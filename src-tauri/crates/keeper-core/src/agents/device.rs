@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use matrix_sdk::event_handler::EventHandlerDropGuard;
+use matrix_sdk::ruma::events::room::member::{MembershipState, StrippedRoomMemberEvent};
 use matrix_sdk::ruma::events::AnySyncTimelineEvent;
 use matrix_sdk::ruma::serde::Raw;
 use matrix_sdk::ruma::RoomId;
@@ -26,9 +27,9 @@ use serde_json::Value;
 use tokio::sync::{broadcast, watch};
 use tokio::task::JoinHandle;
 
-use crate::account::{known_proxies, proxy_row, send_agent_event};
+use crate::account::{join_agent_invite, known_agents, known_proxies, proxy_row, send_agent_event};
 use crate::agents::events::{
-    PresencePlatform, SurfaceOutcome, SurfaceResultContent, CONTENT_VERSION, PRESENCE,
+    PresencePlatform, SurfaceOutcome, SurfaceResultContent, CONTENT_VERSION, PRESENCE, STATUS,
     SURFACE_REQUEST,
 };
 use crate::agents::presence::{
@@ -102,6 +103,9 @@ pub fn farewell(state: Option<DevicePresence>) -> Option<DevicePresence> {
 /// publisher, and the requests it handed on. Dropping it stops both.
 pub(crate) struct AccountAgents {
     _handler: EventHandlerDropGuard,
+    /// Joins the person's own agents' session-room invites as they arrive
+    /// (R416).
+    _invites: EventHandlerDropGuard,
     presence: JoinHandle<()>,
     inbox: Arc<Mutex<SurfaceInbox>>,
     publisher: Arc<Publisher>,
@@ -174,6 +178,14 @@ pub(crate) fn register(
             let kinds = Arc::clone(&handler_kinds);
             let proxies = Arc::clone(&handler_proxies);
             async move {
+                // A status in any agent room folds into the account's seat
+                // for it, opened or not, and its row redraws (R451).
+                if event.get_field::<&str>("type").ok().flatten() == Some(STATUS) {
+                    if let Ok(value) = event.deserialize_as::<Value>() {
+                        crate::agents::room::fold_status(&room, &value, &kinds).await;
+                    }
+                    return;
+                }
                 if event.get_field::<&str>("type").ok().flatten() != Some(SURFACE_REQUEST)
                     || AgentRoomKind::of(room.room_type().as_ref()) != Some(AgentRoomKind::Session)
                 {
@@ -251,6 +263,24 @@ pub(crate) fn register(
             }
         },
     );
+    // An agent's new conversation, delegation or DM arrives as an invite:
+    // joined at once when it is one of the person's own agents' session
+    // rooms, so it is listed without the person sending into it first (R416).
+    let invite_proxies = Arc::clone(&proxies);
+    let invites = client.add_event_handler(
+        move |event: StrippedRoomMemberEvent, room: Room, client: Client| {
+            let proxies = Arc::clone(&invite_proxies);
+            async move {
+                if client.user_id() != Some(event.state_key.as_ref())
+                    || event.content.membership != MembershipState::Invite
+                {
+                    return;
+                }
+                let known = known_agents(&client, &known_proxies(&client, &proxies).await).await;
+                join_agent_invite(&room, &known).await;
+            }
+        },
+    );
     let publisher = Arc::new(Publisher {
         client: client.clone(),
         proxies,
@@ -261,6 +291,7 @@ pub(crate) fn register(
     ));
     AccountAgents {
         _handler: client.event_handler_drop_guard(handle),
+        _invites: client.event_handler_drop_guard(invites),
         presence,
         inbox,
         publisher,

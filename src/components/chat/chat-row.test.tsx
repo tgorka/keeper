@@ -1,5 +1,9 @@
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  AGENT_ATTENTION_LABEL,
+  AGENT_ATTENTION_UNKNOWN,
+} from "@/components/agents/agent-attention";
 import { ChatRow } from "@/components/chat/chat-row";
 import type { BridgeHealth, InboxBatch, InboxRoomVm } from "@/lib/ipc/client";
 import { bridgeHealthStore } from "@/lib/stores/bridge-health";
@@ -852,5 +856,43 @@ describe("ChatRow phone touch idioms", () => {
     // The next tap opens the conversation as usual.
     fireEvent.click(screen.getByRole("button", { name: "Conversation with Alice Smith" }));
     expect(onSelect).toHaveBeenCalledTimes(1);
+  });
+  it("an agent room says Rust's state for it, drawn and in its name (story 101.6)", () => {
+    const agent = (agentAttention?: InboxRoomVm["agentAttention"]) =>
+      room({ agentRoom: "proxy", ...(agentAttention ? { agentAttention } : {}) });
+    const { rerender } = render(<ChatRow room={agent("needsYou")} />);
+    expect(
+      screen.getByRole("button", {
+        name: "Conversation with Alice Smith, an agent conversation, needs you",
+      }),
+    ).toBeInTheDocument();
+    expect(screen.getByTestId("agent-attention")).toHaveTextContent("Needs you");
+
+    rerender(<ChatRow room={agent("doneUnread")} />);
+    expect(
+      screen.getByRole("button", {
+        name: "Conversation with Alice Smith, an agent conversation, done, unread",
+      }),
+    ).toBeInTheDocument();
+    expect(screen.getByTestId("agent-attention")).toHaveTextContent("Done");
+
+    rerender(<ChatRow room={agent("working")} />);
+    expect(screen.getByTestId("agent-attention")).toHaveTextContent("Working");
+
+    // Rust could not read all it needs (R381, R453): the row says so in its
+    // name, and the mark carries the sentence where the person looks.
+    rerender(<ChatRow room={agent("unknown")} />);
+    expect(
+      screen.getByRole("button", {
+        name: `Conversation with Alice Smith, an agent conversation, ${AGENT_ATTENTION_LABEL.unknown}`,
+      }),
+    ).toBeInTheDocument();
+    expect(screen.getByTestId("agent-attention")).toHaveAttribute("title", AGENT_ATTENTION_UNKNOWN);
+
+    rerender(<ChatRow room={agent()} />);
+    expect(screen.queryByTestId("agent-attention")).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Conversation with Alice Smith, an agent conversation" }),
+    ).toBeInTheDocument();
   });
 });

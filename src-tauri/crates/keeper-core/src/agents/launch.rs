@@ -84,6 +84,27 @@ pub struct DefaultAgentChoiceVm {
     pub name: String,
 }
 
+/// One of the person's own proxies with no `main` room on a live account
+/// here: keeper may ask it to open one (story 101.1, R416).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct MainDmAskVm {
+    pub account_id: String,
+    /// The agent's Matrix user id.
+    pub agent: String,
+    /// The agent's name, as the rooms here hold it.
+    pub name: String,
+    /// What keeper says while it waits for the conversation:
+    /// [`opening_sentence`].
+    pub opening: String,
+}
+
+/// What keeper says while it waits for `name` to open its conversation.
+pub fn opening_sentence(name: &str) -> String {
+    format!("Opening a conversation with {name}…")
+}
+
 /// What keeper opens at launch, and the default agent as Settings shows it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
@@ -112,6 +133,13 @@ pub struct AgentsLaunchVm {
     /// so and names the file ([`file_set_sentence`]). A choice made here is
     /// still stored, and takes effect once the file stops setting the key.
     pub file_set: Option<String>,
+    /// The default agent, when it is one of the person's own proxies with no
+    /// `main` room here: at launch keeper asks it for one and opens it when
+    /// it lands (R416).
+    pub ask: Option<MainDmAskVm>,
+    /// Every own proxy with no `main` room here: what the notes Assistant
+    /// offers to ask (101.1 #5).
+    pub askable: Vec<MainDmAskVm>,
 }
 
 /// What the launch rule reads besides the key, gathered by
@@ -123,6 +151,8 @@ pub struct LaunchFacts {
     /// Every live account's proxy conversations, by account id, accounts in
     /// a stable order and each account's `main` rooms first.
     pub proxies: Vec<(String, ProxyRoomVm)>,
+    /// The person's own proxies with no `main` room on their account here.
+    pub askable: Vec<MainDmAskVm>,
 }
 
 /// The sentence when the default agent's `main` room is not on any
@@ -131,6 +161,15 @@ pub fn no_main_room_sentence(agent: &str) -> String {
     format!(
         "Your default agent {agent} has no conversation with you on this device's accounts, \
          so Agents opens with nothing selected."
+    )
+}
+
+/// The sentence when the default agent has no `main` room here but is the
+/// person's own proxy, so keeper asks it for one (R416).
+pub fn asks_sentence(name: &str) -> String {
+    format!(
+        "Your default agent {name} has no conversation with you on this device's accounts yet, \
+         so keeper asks it to open one."
     )
 }
 
@@ -199,6 +238,8 @@ pub fn choose(chosen: Option<&str>, facts: &LaunchFacts) -> AgentsLaunchVm {
         announce: false,
         choices,
         file_set: None,
+        ask: None,
+        askable: facts.askable.clone(),
     };
     let Some(agent) = default_agent else {
         if facts.agent_rooms > 0 {
@@ -206,6 +247,26 @@ pub fn choose(chosen: Option<&str>, facts: &LaunchFacts) -> AgentsLaunchVm {
         }
         return vm;
     };
+    // The default agent is the person's own proxy and has no DM on any
+    // account here: Agents opens and keeper asks it for one, agent rooms or
+    // none (R416).
+    let has_main = facts
+        .proxies
+        .iter()
+        .any(|(_, room)| room.kind == SessionKind::Main && room.agent == agent);
+    if let Some(ask) = facts
+        .askable
+        .iter()
+        .find(|ask| ask.agent == agent)
+        .filter(|_| !has_main)
+    {
+        vm.view = LaunchView::Agents;
+        // Settings says why; at launch the ask itself is said ("Opening a
+        // conversation with Nixi…"), and then the room or why it did not open.
+        vm.reason = Some(asks_sentence(&ask.name));
+        vm.ask = Some(ask.clone());
+        return vm;
+    }
     if facts.agent_rooms == 0 {
         vm.reason = Some(NO_AGENT_ROOMS_SENTENCE.to_owned());
         return vm;
@@ -390,7 +451,8 @@ pub async fn resolve<S: LaunchSource>(
     }
     let chosen = source.chosen()?;
     let mut vm = choose(chosen.as_deref(), &seen);
-    if awaits_room(&vm) {
+    // A default agent keeper asks for its conversation is said by the ask.
+    if awaits_room(&vm) && vm.ask.is_none() {
         if let Some(agent) = vm.default_agent.as_deref() {
             vm.reason = Some(not_arrived_sentence(agent, vm.view));
             // Not knowing is not knowing there is none: said on either
@@ -489,6 +551,7 @@ mod tests {
             kind,
             agent: agent.to_owned(),
             allowed: None,
+            attention: None,
         }
     }
 
@@ -499,11 +562,59 @@ mod tests {
                 .iter()
                 .map(|(account, room)| ((*account).to_owned(), room.clone()))
                 .collect(),
+            askable: Vec::new(),
         }
     }
 
     const NIXI: &str = "@nixi:example.org";
     const TALA: &str = "@tala:example.org";
+
+    fn ask(account: &str, agent: &str, name: &str) -> MainDmAskVm {
+        MainDmAskVm {
+            account_id: account.to_owned(),
+            agent: agent.to_owned(),
+            name: name.to_owned(),
+            opening: opening_sentence(name),
+        }
+    }
+
+    /// R416, 101.1 #4: a default agent that is the person's own proxy with
+    /// no DM here opens Agents — with no agent room at all, too — and the
+    /// launch asks it for one, saying so; a DM on another account opens
+    /// that DM and asks nothing.
+    #[test]
+    fn a_default_proxy_without_a_dm_opens_agents_and_is_asked_for_one() {
+        let nobody_here = LaunchFacts {
+            askable: vec![ask("a1", NIXI, "Nixi")],
+            ..facts(0, &[])
+        };
+        let vm = choose(Some(NIXI), &nobody_here);
+        assert_eq!(vm.view, LaunchView::Agents);
+        assert_eq!(vm.room, None);
+        assert_eq!(vm.ask, Some(ask("a1", NIXI, "Nixi")));
+        assert_eq!(vm.reason, Some(asks_sentence("Nixi")));
+        assert!(!vm.announce, "the ask is what is said");
+        // Another agent is the default: nothing is asked, and the Assistant
+        // still offers Nixi.
+        let other = choose(Some(TALA), &nobody_here);
+        assert_eq!(other.ask, None);
+        assert_eq!(other.view, LaunchView::Inbox);
+        assert_eq!(other.askable, vec![ask("a1", NIXI, "Nixi")]);
+
+        let elsewhere = LaunchFacts {
+            askable: vec![ask("a1", NIXI, "Nixi")],
+            ..facts(1, &[("a2", room("!dm:x", NIXI, SessionKind::Main, "Nixi"))])
+        };
+        let vm = choose(Some(NIXI), &elsewhere);
+        assert_eq!(vm.ask, None);
+        assert_eq!(
+            vm.room,
+            Some(LaunchRoomVm {
+                account_id: "a2".into(),
+                room_id: "!dm:x".into()
+            })
+        );
+    }
 
     #[test]
     fn the_default_agents_main_room_opens_and_not_its_conversations() {

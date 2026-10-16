@@ -193,6 +193,7 @@ mod tests {
             renewed_at: rfc3339(NOW - 30_000),
             expires_at: rfc3339(NOW + 150_000),
             picture_failures: Default::default(),
+            lease: None,
         }
     }
 

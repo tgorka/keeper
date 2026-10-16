@@ -734,9 +734,6 @@ export function SpaceEditor({
               value={folder}
               onChange={(event) => setFolder(event.target.value)}
               placeholder="Vault root"
-              spellCheck={false}
-              autoCapitalize="off"
-              autoCorrect="off"
             />
             <p className="text-muted-foreground text-sm">
               {/* The whole reason this field exists: a `path:` query already

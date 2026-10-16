@@ -59,6 +59,14 @@ pub struct AgentdConfig {
     pub mcp: Vec<crate::agents::mcp::McpEntry>,
     /// `[[kvm]]` (`kvm::check`): never in a drive.
     pub kvm: Vec<crate::agents::kvm::KvmEntry>,
+    /// `[claims] lease` (R455): `short` (the default, absent included) or
+    /// `quarter-hour`, which an operator writes only once every device and
+    /// agentd serving these agents runs a build that reads it.
+    pub claims_lease: crate::agents::claim::ClaimsLease,
+    /// `[web_search].url` (story 101.4, R419): the SearXNG JSON engine this
+    /// host's agents search with, for those whose `[tools].allow` names
+    /// `web_search`; `None` offers none of them a search.
+    pub web_search: Option<BaseUrl>,
 }
 
 /// `[homeserver]`.
@@ -230,6 +238,22 @@ struct RawConfig {
     mcp: Vec<crate::agents::mcp::RawMcp>,
     #[serde(default)]
     kvm: Vec<crate::agents::kvm::RawKvm>,
+    #[serde(default)]
+    claims: Option<RawClaims>,
+    #[serde(default)]
+    web_search: Option<RawWebSearch>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawClaims {
+    lease: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawWebSearch {
+    url: String,
 }
 
 #[derive(Deserialize)]
@@ -419,6 +443,14 @@ impl AgentdConfig {
         let mcp = crate::agents::mcp::check(raw.mcp, &kvm, crate::agents::mcp::AGENTD)
             .map_err(|(at, reason)| invalid(at, reason))?;
 
+        let web_search = raw
+            .web_search
+            .map(|table| {
+                crate::agents::web_search::parse_url(&table.url)
+                    .map_err(|reason| invalid("[web_search] `url`", reason))
+            })
+            .transpose()?;
+
         Ok(AgentdConfig {
             principal: raw.principal,
             host: raw.host,
@@ -432,6 +464,8 @@ impl AgentdConfig {
             sandbox_env,
             mcp,
             kvm,
+            claims_lease: claims_lease(raw.claims)?,
+            web_search,
         })
     }
 
@@ -465,6 +499,24 @@ impl AgentdConfig {
         all.sort_by(|a, b| a.0.cmp(&b.0));
         all.dedup();
         all
+    }
+}
+
+/// `[claims] lease`: absent (or the table absent) is the minute lease.
+fn claims_lease(
+    raw: Option<RawClaims>,
+) -> Result<crate::agents::claim::ClaimsLease, ConfigRefusal> {
+    use crate::agents::claim::ClaimsLease;
+    match raw.and_then(|claims| claims.lease) {
+        None => Ok(ClaimsLease::Short),
+        Some(lease) => ClaimsLease::parse(&lease).ok_or_else(|| {
+            invalid(
+                "[claims] `lease`",
+                format!(
+                    "\"{lease}\" is not a choice; write \"short\" (a claim renewed every minute, the default) or \"quarter-hour\" (renewed every 15 minutes — only once every device and keeper-agentd serving your agents runs a build that reads it)"
+                ),
+            )
+        }),
     }
 }
 
@@ -689,6 +741,37 @@ readers     = ["@tgorka:example.org"]
         assert_eq!(names, ["cliproxy", "desk-kvm", "paseo", "tgdrive"]);
     }
 
+    /// 101.4 #2, R423: makistack's marked block — exactly this grammar —
+    /// names the host's engine; anything but an http(s) URL, or another key,
+    /// is refused naming `[web_search]`; no table names none.
+    #[test]
+    fn a_web_search_engine_is_one_http_url() {
+        assert_eq!(
+            AgentdConfig::parse(EXAMPLE).expect("parses").web_search,
+            None
+        );
+        let block = "\n[web_search]\nurl = \"http://127.0.0.1:5191\"\n";
+        let config = AgentdConfig::parse(&format!("{EXAMPLE}{block}")).expect("parses");
+        assert_eq!(
+            config.web_search.map(|url| url.normalized),
+            Some("http://127.0.0.1:5191".to_owned())
+        );
+        let file = refused(&format!(
+            "{EXAMPLE}\n[web_search]\nurl = \"file:///etc/passwd\"\n"
+        ));
+        assert!(
+            file.starts_with(
+                "[web_search] `url` in agentd.toml is refused: keeper searches over http or https"
+            ),
+            "{file}"
+        );
+        assert!(refused(&format!(
+            "{EXAMPLE}\n[web_search]\nurl = \"http://127.0.0.1:5191\"\nkey = \"x\"\n"
+        ))
+        .contains("key"));
+        assert!(refused(&format!("{EXAMPLE}\n[web_search]\n")).contains("url"));
+    }
+
     #[test]
     fn a_pasted_secret_is_refused_with_the_sentence() {
         let text = EXAMPLE.replace("\"secret:cliproxy\"", "\"ghp_0123456789abcdef\"");
@@ -718,6 +801,29 @@ readers     = ["@tgorka:example.org"]
         assert!(refused(&text).contains("flavour"));
         let text = EXAMPLE.replace("ids   = [", "colour = 1\nids   = [");
         assert!(refused(&text).contains("colour"));
+    }
+
+    /// R455: an `agentd.toml` that names no `[claims]` keeps the minute
+    /// lease; `quarter-hour` turns the cutover on; anything else is refused
+    /// with the two choices, and an unknown key in the table is refused too.
+    #[test]
+    fn the_quarter_hour_lease_is_on_only_where_the_file_says_so() {
+        use crate::agents::claim::ClaimsLease;
+        let lease = |text: &str| AgentdConfig::parse(text).expect("parses").claims_lease;
+        assert_eq!(lease(EXAMPLE), ClaimsLease::Short);
+        let table = |body: &str| format!("{EXAMPLE}\n[claims]\n{body}\n");
+        assert_eq!(lease(&table("")), ClaimsLease::Short);
+        assert_eq!(lease(&table("lease = \"short\"")), ClaimsLease::Short);
+        assert_eq!(
+            lease(&table("lease = \"quarter-hour\"")),
+            ClaimsLease::QuarterHour
+        );
+        let sentence = refused(&table("lease = \"hourly\""));
+        assert!(
+            sentence.contains("[claims] `lease`") && sentence.contains("\"quarter-hour\""),
+            "{sentence}"
+        );
+        assert!(refused(&table("renew = 60")).contains("renew"));
     }
 
     #[test]

@@ -1541,3 +1541,902 @@ async fn the_agents_picture_is_its_profile_avatar_once_until_the_file_changes() 
         Err(keeper_core::error::MediaError::NotFound)
     ));
 }
+
+/// The proxy facts of a Mac whose zone says `person` is `agent`'s human.
+fn proxies_of(
+    agent: &OwnedUserId,
+    person: &OwnedUserId,
+) -> keeper_core::agents::proxy::AgentProxies {
+    use keeper_core::agents::proxy::{AgentProxies, ProxyFacts};
+    let proxies = AgentProxies::default();
+    proxies.replace(
+        [(
+            agent.clone(),
+            ProxyFacts {
+                human: person.clone(),
+                allowed: Vec::new(),
+            },
+        )]
+        .into_iter()
+        .collect(),
+    );
+    proxies
+}
+
+/// 101.1 #1, #2, #8 (R416): a DM whose status is buried under more than
+/// 200 claim renewals, read by a device whose cache holds nothing of it, is
+/// still the person's DM by the seat an earlier read kept in `keeper.db`;
+/// without that seat it is not, and the page-back that ran out of its budget
+/// is not taken for "this room has no status".
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "live: Synapse on delectra"]
+async fn a_dm_buried_under_claims_is_admitted_by_its_kept_seat() {
+    use keeper_core::account::admit_proxy_room;
+    use keeper_core::agents::room::{AgentKinds, HeaderReader};
+
+    let smoke = Smoke::setup().await;
+    let root = TempDir::new();
+    let keeper_dir = root.path().join("keeper");
+    let agent = smoke.user("nixi-smoke");
+    let person_user = smoke.user("tgorka-smoke");
+    smoke.set_ratelimit(&agent, 0, 0).await;
+    let (nixi, person, room) = joined_pair(&smoke, SessionKind::Main, root.path()).await;
+    person
+        .client()
+        .event_cache()
+        .subscribe()
+        .expect("event cache");
+    nixi.send(
+        &room,
+        events::STATUS,
+        json!({
+            "v": 1, "session": "sessions/nixi/main", "kind": "main", "title": "main",
+            "agent": agent, "host": "electra", "epoch": 1, "run": "idle",
+        }),
+        None,
+    )
+    .await
+    .expect("status");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !cached_events(&person, &room)
+        .await
+        .iter()
+        .any(|e| e["type"] == events::STATUS)
+    {
+        assert!(Instant::now() < deadline, "the status never arrived");
+        person.sync_once().await.expect("sync");
+    }
+    let proxies = proxies_of(&agent, &person_user);
+    let joined = person.client().get_room(&room).expect("room");
+    let seen = AgentKinds::kept(&keeper_dir);
+    let (kind, admitted) = admit_proxy_room(&joined, &seen, &proxies)
+        .await
+        .expect("the DM, read from its status");
+    assert_eq!((kind, admitted), (SessionKind::Main, agent.clone()));
+
+    // A host renews its claim, over and over, while nobody speaks.
+    let start = chrono::Utc::now();
+    for n in 0..220_i64 {
+        let at = (start + chrono::Duration::seconds(n)).to_rfc3339();
+        nixi.send_state(
+            &room,
+            events::CLAIM,
+            "",
+            &json!({
+                "v": 1, "host": "electra", "device": "ELECTRA", "agent": agent, "epoch": 1,
+                "acquired_at": start.to_rfc3339(), "renewed_at": at, "expires_at": at,
+                "released": false,
+            }),
+        )
+        .await
+        .expect("a renewal");
+    }
+
+    // A device with nothing of the room in its cache — keeper restarted
+    // with an empty cache, a new device — reads the room.
+    let (fresh, _) = smoke
+        .copy(
+            &root.path().join("fresh"),
+            "tgorka-smoke",
+            "TGORKA_SMOKE_PASSWORD",
+            "tgorka@fresh",
+        )
+        .await;
+    fresh
+        .client()
+        .event_cache()
+        .subscribe()
+        .expect("event cache");
+    fresh.sync_once().await.expect("sync");
+    let buried = fresh.client().get_room(&room).expect("the room, joined");
+    let unseated = AgentKinds::default();
+    assert!(
+        admit_proxy_room(&buried, &unseated, &proxies)
+            .await
+            .is_err(),
+        "without a seat the status is out of reach"
+    );
+    let header = HeaderReader::open(buried.clone(), &unseated).await;
+    assert!(!header.state().has_status());
+    assert!(
+        !unseated.searched_empty(&person_user, &room),
+        "a page-back that ran out of its budget searched nothing to its end"
+    );
+    let restarted = AgentKinds::kept(&keeper_dir);
+    let (kind, admitted) = admit_proxy_room(&buried, &restarted, &proxies)
+        .await
+        .expect("the DM, by the seat kept in keeper.db");
+    assert_eq!((kind, admitted), (SessionKind::Main, agent));
+}
+
+/// 101.1 #3, #8 (R416): the person's own agent's new conversation and DM
+/// arrive as invites and are joined without the person sending first — the
+/// DM as direct; a room that is not a session room waits.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "live: Synapse on delectra"]
+async fn an_own_agents_invites_are_joined_and_the_dm_is_direct() {
+    use keeper_core::account::join_agent_invite;
+    use std::collections::BTreeSet;
+
+    let smoke = Smoke::setup().await;
+    let root = TempDir::new();
+    let agent = smoke.user("nixi-smoke");
+    let (nixi, _) = smoke
+        .copy(
+            &root.path().join("nixi"),
+            "nixi-smoke",
+            "NIXI_SMOKE_PASSWORD",
+            "nixi@smoke",
+        )
+        .await;
+    let (person, _) = smoke
+        .copy(
+            &root.path().join("tgorka"),
+            "tgorka-smoke",
+            "TGORKA_SMOKE_PASSWORD",
+            "tgorka@smoke",
+        )
+        .await;
+    let invite = |kind: RoomKind| {
+        let nixi = &nixi;
+        let person_user = smoke.user("tgorka-smoke");
+        async move {
+            nixi.create_room(kind, "Nixi", vec![person_user], &[])
+                .await
+                .expect("room")
+        }
+    };
+    let conversation = invite(RoomKind::Session(SessionKind::Conversation)).await;
+    let dm = invite(RoomKind::Session(SessionKind::Main)).await;
+    let control = invite(RoomKind::Control).await;
+    sync_until(&person, || {
+        [&conversation, &dm, &control]
+            .iter()
+            .all(|room| person.client().get_room(room).is_some())
+    })
+    .await;
+    let known = BTreeSet::from([agent.clone()]);
+    let room = |id: &OwnedRoomId| person.client().get_room(id).expect("room");
+    assert!(join_agent_invite(&room(&conversation), &known).await);
+    assert!(join_agent_invite(&room(&dm), &known).await);
+    assert!(
+        !join_agent_invite(&room(&control), &known).await,
+        "not a session room"
+    );
+    assert!(
+        !join_agent_invite(&room(&conversation), &BTreeSet::new()).await,
+        "already joined, and nobody known"
+    );
+    person.sync_once().await.expect("sync");
+    assert_eq!(room(&conversation).state(), matrix_sdk::RoomState::Joined);
+    assert_eq!(room(&control).state(), matrix_sdk::RoomState::Invited);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let direct = room(&dm)
+            .direct_targets()
+            .iter()
+            .any(|target| target.as_user_id() == Some(&agent));
+        if direct {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the DM was not marked direct");
+        person.sync_once().await.expect("sync");
+    }
+}
+
+/// A status for `agent`'s session of `kind` titled `title`.
+fn status_of(agent: &OwnedUserId, kind: &str, title: &str) -> Value {
+    json!({
+        "v": 1, "session": "sessions/nixi/x", "kind": kind, "title": title,
+        "agent": agent, "host": "electra", "epoch": 1, "run": "idle",
+    })
+}
+
+/// R450 (review-101rooms-1 03, 06): the person's DM already exists, its
+/// status buried under more than 200 claim renewals, and this device kept no
+/// seat for it — an upgraded keeper. keeper asks the agent's host; the host
+/// answers with the existing room, sending no new status; keeper searches
+/// that one room back page after page, admits it and opens it, within the
+/// one bound of the ask.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "live: Synapse on delectra"]
+async fn an_existing_buried_dm_opens_on_a_device_that_kept_no_seat() {
+    use keeper_core::account::{admit_proxy_room, open_main_dm};
+    use keeper_core::agents::main_dm::MAIN_DM_WAIT;
+    use keeper_core::agents::room::AgentKinds;
+
+    let smoke = Smoke::setup().await;
+    let root = TempDir::new();
+    let agent = smoke.user("nixi-smoke");
+    let person_user = smoke.user("tgorka-smoke");
+    smoke.set_ratelimit(&agent, 0, 0).await;
+    smoke.set_ratelimit(&person_user, 0, 0).await;
+    // Earlier runs leave the person in many agent rooms and invites, each one
+    // a whole listing reads; they stay: the request goes out before any of
+    // them is read (review-101rooms-2 06).
+    let (nixi, person, room) = joined_pair(&smoke, SessionKind::Main, root.path()).await;
+    let control = nixi
+        .create_room(
+            RoomKind::Control,
+            "tgorka's agents",
+            vec![person_user.clone()],
+            &[],
+        )
+        .await
+        .expect("control room");
+    sync_until(&person, || person.client().get_room(&control).is_some()).await;
+    person.join(&control).await.expect("join the control room");
+    nixi.sync_once().await.expect("sync");
+    nixi.send(
+        &room,
+        events::STATUS,
+        status_of(&agent, "main", "main"),
+        None,
+    )
+    .await
+    .expect("status");
+    // The person's device is away while the host renews, over and over.
+    let start = chrono::Utc::now();
+    for n in 0..220_i64 {
+        let at = (start + chrono::Duration::seconds(n)).to_rfc3339();
+        nixi.send_state(
+            &room,
+            events::CLAIM,
+            "",
+            &json!({
+                "v": 1, "host": "electra", "device": "ELECTRA", "agent": agent, "epoch": 1,
+                "acquired_at": start.to_rfc3339(), "renewed_at": at, "expires_at": at,
+                "released": false,
+            }),
+        )
+        .await
+        .expect("a renewal");
+    }
+    person
+        .client()
+        .event_cache()
+        .subscribe()
+        .expect("event cache");
+    person.sync_once().await.expect("sync");
+    let proxies = proxies_of(&agent, &person_user);
+    let keeper_dir = root.path().join("keeper");
+    let kinds = AgentKinds::kept(&keeper_dir);
+    let joined = person.client().get_room(&room).expect("room");
+    assert!(
+        admit_proxy_room(&joined, &kinds, &proxies).await.is_err(),
+        "the status is out of the row's reach and no seat was kept"
+    );
+
+    // The agent's host: it answers the ask with the DM that exists, and
+    // sends no status. Earlier runs left the agent and the person in older
+    // control rooms of the agent's, with their own old requests: the host
+    // answers the request that is new, in whichever of them keeper chose.
+    let control_rooms = |nixi: &AgentClient| {
+        nixi.client()
+            .joined_rooms()
+            .into_iter()
+            .filter(|room| {
+                room.room_type().map(|kind| kind.to_string()).as_deref() == Some(CONTROL_ROOM_TYPE)
+            })
+            .map(|room| room.room_id().to_owned())
+            .collect::<Vec<_>>()
+    };
+    let mut old_requests = std::collections::BTreeSet::new();
+    for asked_in in control_rooms(&nixi) {
+        for (key, state) in nixi.cached_states(&asked_in, events::MAIN_DM_REQUEST).await {
+            if key == person_user.as_str() {
+                old_requests.insert(state.event_id);
+            }
+        }
+    }
+    assert!(
+        control_rooms(&nixi).contains(&control),
+        "this run's control room"
+    );
+    let host = {
+        let (nixi, person_user, room) = (nixi.clone(), person_user.clone(), room.clone());
+        tokio::spawn(async move {
+            loop {
+                nixi.sync_once().await.expect("sync");
+                let mut asked = None;
+                for asked_in in control_rooms(&nixi) {
+                    if let Some((_, state)) = nixi
+                        .cached_states(&asked_in, events::MAIN_DM_REQUEST)
+                        .await
+                        .into_iter()
+                        .find(|(key, state)| {
+                            key == person_user.as_str() && !old_requests.contains(&state.event_id)
+                        })
+                    {
+                        asked = Some((asked_in, state));
+                        break;
+                    }
+                }
+                if let Some((control, state)) = asked {
+                    nixi.send(
+                        &control,
+                        events::MAIN_DM_ANSWER,
+                        json!({"v": 1, "request": state.event_id, "agent": state.content["agent"], "room": room}),
+                        None,
+                    )
+                    .await
+                    .expect("answer");
+                    return;
+                }
+            }
+        })
+    };
+    let syncing = {
+        let person = person.clone();
+        tokio::spawn(async move {
+            loop {
+                let _ = person.sync_once().await;
+            }
+        })
+    };
+    let asked = tokio::time::Instant::now();
+    let opened = open_main_dm(
+        person.client(),
+        "acct",
+        &agent,
+        &kinds,
+        &proxies,
+        asked + MAIN_DM_WAIT,
+    )
+    .await;
+    syncing.abort();
+    host.abort();
+    let opened = opened.expect("the DM opened");
+    assert_eq!(opened.room_id, room.as_str());
+    assert!(asked.elapsed() < MAIN_DM_WAIT);
+    assert!(
+        admit_proxy_room(&joined, &kinds, &proxies).await.is_ok(),
+        "and its seat is kept now"
+    );
+}
+
+/// R450 (review-101rooms-1 09): a DM the person left and forgot loses its
+/// direct mark, and the host's re-invite carries none. An answer that names
+/// it before the invite arrives settles nothing yet; once the invite is
+/// here — and when the answer comes while it is — keeper joins it and marks
+/// it direct with the agent.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "live: Synapse on delectra"]
+async fn a_dm_left_and_reinvited_is_joined_and_direct_again() {
+    use keeper_core::account::settle_answered_dm;
+
+    let smoke = Smoke::setup().await;
+    let root = TempDir::new();
+    let agent = smoke.user("nixi-smoke");
+    let person_user = smoke.user("tgorka-smoke");
+    let (nixi, person, room) = joined_pair(&smoke, SessionKind::Main, root.path()).await;
+    let direct = |person: &AgentClient| {
+        person.client().get_room(&room).is_some_and(|joined| {
+            joined
+                .direct_targets()
+                .iter()
+                .any(|target| target.as_user_id() == Some(&agent))
+        })
+    };
+    for answered_before_invite in [true, false] {
+        let joined = person.client().get_room(&room).expect("room");
+        joined.leave().await.expect("leave");
+        joined.forget().await.expect("forget");
+        person.sync_once().await.expect("sync");
+        nixi.sync_once().await.expect("sync");
+        if answered_before_invite {
+            assert!(
+                !settle_answered_dm(person.client(), &room, &agent).await,
+                "the invite has not arrived"
+            );
+        }
+        nixi.client()
+            .get_room(&room)
+            .expect("the agent's room")
+            .invite_user_by_id(&person_user)
+            .await
+            .expect("invite again");
+        sync_until(&person, || {
+            person
+                .client()
+                .get_room(&room)
+                .is_some_and(|r| r.state() == matrix_sdk::RoomState::Invited)
+        })
+        .await;
+        assert!(settle_answered_dm(person.client(), &room, &agent).await);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !direct(&person) {
+            assert!(Instant::now() < deadline, "not marked direct");
+            person.sync_once().await.expect("sync");
+        }
+        assert_eq!(
+            person.client().get_room(&room).expect("room").state(),
+            matrix_sdk::RoomState::Joined
+        );
+    }
+}
+
+/// R451 (review-101rooms-1 05): a room whose seat this device kept follows
+/// a newer status without being opened: the row's read folds the cached
+/// status into the seat (and the account-level fold does the same from the
+/// event it is handed), its kind and title are the newer status's, and the
+/// rows are told to redraw.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "live: Synapse on delectra"]
+async fn an_unopened_rooms_row_follows_a_newer_status() {
+    use keeper_core::agents::room::{fold_status, room_kind_vm, AgentKinds, AgentRoomKindVm};
+
+    let smoke = Smoke::setup().await;
+    let root = TempDir::new();
+    let agent = smoke.user("nixi-smoke");
+    let person_user = smoke.user("tgorka-smoke");
+    let (nixi, person, room) = joined_pair(&smoke, SessionKind::Conversation, root.path()).await;
+    person
+        .client()
+        .event_cache()
+        .subscribe()
+        .expect("event cache");
+    let seen = record(&person);
+    nixi.send(
+        &room,
+        events::STATUS,
+        status_of(&agent, "conversation", "draft"),
+        None,
+    )
+    .await
+    .expect("status");
+    sync_until(&person, || {
+        seen.lock()
+            .expect("lock")
+            .iter()
+            .any(|e| e["type"] == events::STATUS && e["content"]["title"] == "draft")
+    })
+    .await;
+    let kinds = AgentKinds::default();
+    let joined = person.client().get_room(&room).expect("room");
+    assert_eq!(
+        room_kind_vm(&joined, &kinds).await,
+        Some(AgentRoomKindVm::of(
+            keeper_core::agents::room::AgentRoomKind::Session,
+            Some(SessionKind::Conversation)
+        ))
+    );
+    let mut rows = kinds.subscribe();
+    rows.borrow_and_update();
+
+    nixi.send(
+        &room,
+        events::STATUS,
+        status_of(&agent, "delegated", "test"),
+        None,
+    )
+    .await
+    .expect("a newer status");
+    sync_until(&person, || {
+        seen.lock()
+            .expect("lock")
+            .iter()
+            .any(|e| e["type"] == events::STATUS && e["content"]["title"] == "test")
+    })
+    .await;
+    assert_eq!(
+        room_kind_vm(&joined, &kinds).await,
+        Some(AgentRoomKindVm::of(
+            keeper_core::agents::room::AgentRoomKind::Session,
+            Some(SessionKind::Delegated)
+        )),
+        "the row follows the newer status"
+    );
+    assert_eq!(
+        kinds.seat(&person_user, &room).map(|seat| seat.title),
+        Some("test".to_owned())
+    );
+    assert!(rows.has_changed().expect("open"), "the rows redraw");
+
+    // The account-level fold, from the event alone.
+    let folded = AgentKinds::default();
+    let newest = seen
+        .lock()
+        .expect("lock")
+        .iter()
+        .rev()
+        .find(|e| e["type"] == events::STATUS)
+        .cloned()
+        .expect("a status");
+    fold_status(&joined, &newest, &folded).await;
+    assert_eq!(
+        folded
+            .seat(&person_user, &room)
+            .map(|seat| (seat.kind, seat.title)),
+        Some((SessionKind::Delegated, "test".to_owned()))
+    );
+}
+
+/// Story 101.3 (R430, R431): a question for the person survives a restart of
+/// their device — the restored cache holds only the room's newest events, and
+/// the panel's reader reads the room back to the ask through the event cache
+/// — and the proxy's sealed answer, sent from its own device, ends the wait.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "live: Synapse on delectra"]
+async fn a_waiting_question_survives_a_restart_and_ends_on_the_proxys_answer() {
+    use keeper_core::agents::ask::{answer_content, ask_content, AskContent};
+    use keeper_core::agents::label::Label;
+    use keeper_core::agents::waiting::ASK_READ_BACK;
+
+    const ASK: &str = "01J8ASKAAAAAAAAAAAAAAAAAAA";
+    let smoke = Smoke::setup().await;
+    let root = TempDir::new();
+    let (tola, _) = smoke
+        .copy(
+            &root.path().join("tola"),
+            "nixi-paced",
+            "NIXI_PACED_PASSWORD",
+            "tola@smoke",
+        )
+        .await;
+    let (proxy, _) = smoke
+        .copy(
+            &root.path().join("nixi"),
+            "nixi-smoke",
+            "NIXI_SMOKE_PASSWORD",
+            "nixi@smoke",
+        )
+        .await;
+    let (person, _) = smoke
+        .copy(
+            &root.path().join("tgorka"),
+            "tgorka-smoke",
+            "TGORKA_SMOKE_PASSWORD",
+            "tgorka@smoke",
+        )
+        .await;
+    smoke.set_ratelimit(&smoke.user("nixi-paced"), 0, 0).await;
+    person
+        .client()
+        .event_cache()
+        .subscribe()
+        .expect("event cache");
+    let (me, via) = (smoke.user("tgorka-smoke"), smoke.user("nixi-smoke"));
+    let room = tola
+        .create_room(
+            RoomKind::Session(SessionKind::Delegated),
+            "tola 2026-10-15",
+            vec![me.clone(), via.clone()],
+            &[],
+        )
+        .await
+        .expect("create room");
+    sync_until(&person, || person.client().get_room(&room).is_some()).await;
+    person.join(&room).await.expect("join");
+    sync_until(&proxy, || proxy.client().get_room(&room).is_some()).await;
+    proxy.join(&room).await.expect("join");
+    tola.sync_once().await.expect("sync");
+
+    let ask = AskContent {
+        v: events::CONTENT_VERSION,
+        id: ASK.to_owned(),
+        question: "Which trip?".to_owned(),
+        choices: vec!["Tatry".to_owned(), "Bieszczady".to_owned()],
+        default: None,
+        to: me.clone(),
+        via: via.clone(),
+        label: Label::top(),
+    };
+    let asked = tola
+        .send(&room, "m.room.message", ask_content(&ask), None)
+        .await
+        .expect("ask");
+    // More than a restored cache holds, fewer than the panel reads back.
+    let fillers = usize::from(ASK_READ_BACK) / 3;
+    for n in 0..fillers {
+        tola.send(
+            &room,
+            "m.room.message",
+            json!({"msgtype": "m.text", "body": format!("working {n}")}),
+            None,
+        )
+        .await
+        .expect("filler");
+    }
+    let last = format!("working {}", fillers - 1);
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while !cached_events(&person, &room)
+        .await
+        .iter()
+        .any(|e| e["content"]["body"] == last.as_str())
+    {
+        assert!(Instant::now() < deadline, "the person never read the room");
+        person.sync_once().await.expect("sync");
+    }
+    let session = StoredSession::from_client(person.client())
+        .expect("session")
+        .to_json()
+        .expect("json");
+    drop(person);
+
+    let restored = AgentClient::open(
+        &smoke.homeserver,
+        &root.path().join("tgorka"),
+        "smoke-passphrase",
+    )
+    .await
+    .expect("reopen");
+    restored
+        .restore(StoredSession::from_json(&session).expect("session"))
+        .await
+        .expect("restore");
+    restored
+        .client()
+        .event_cache()
+        .subscribe()
+        .expect("event cache");
+    restored.sync_once().await.expect("sync");
+    let loaded = cached_events(&restored, &room).await;
+    assert!(
+        !loaded.iter().any(|e| e["event_id"] == asked.as_str()),
+        "the restored cache already held the ask ({} events): nothing to read back",
+        loaded.len()
+    );
+
+    let ids = waiting_ids(&restored, &room, &me, &via).await;
+    assert_eq!(ids, vec![ASK.to_owned()], "the question after a restart");
+
+    let answered = proxy
+        .send(&room, "m.room.message", answer_content("Tatry", ASK), None)
+        .await
+        .expect("answer");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !cached_events(&restored, &room)
+        .await
+        .iter()
+        .any(|e| e["event_id"] == answered.as_str())
+    {
+        assert!(Instant::now() < deadline, "the answer never arrived");
+        restored.sync_once().await.expect("sync");
+    }
+    let ids = waiting_ids(&restored, &room, &me, &via).await;
+    assert!(ids.is_empty(), "the proxy's answer ends the wait: {ids:?}");
+}
+
+/// Story 101.6 (R453, review 04): a card waiting for the person survives a
+/// restart of their device in the room's state — the restored cache holds
+/// only the room's newest chunk, a newer status among it, and the card
+/// behind it; the row's reading reads the room back as 101.3's reader does
+/// and still says *Needs you*, where the restored chunk alone would not.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "live: Synapse on delectra"]
+async fn a_card_behind_a_restarts_chunk_still_needs_the_person() {
+    use keeper_core::agents::approval::{binding_digest, summary_of};
+    use keeper_core::agents::attention::{attention, of_room, AgentAttentionVm, Reader, RoomEvent};
+    use keeper_core::agents::room::holds_agent_power;
+    use keeper_core::agents::tier::AgentTool;
+    use keeper_core::agents::waiting::ASK_READ_BACK;
+
+    let smoke = Smoke::setup().await;
+    let root = TempDir::new();
+    let (tola, _) = smoke
+        .copy(
+            &root.path().join("tola"),
+            "nixi-paced",
+            "NIXI_PACED_PASSWORD",
+            "tola@smoke",
+        )
+        .await;
+    let (person, _) = smoke
+        .copy(
+            &root.path().join("tgorka"),
+            "tgorka-smoke",
+            "TGORKA_SMOKE_PASSWORD",
+            "tgorka@smoke",
+        )
+        .await;
+    smoke.set_ratelimit(&smoke.user("nixi-paced"), 0, 0).await;
+    person
+        .client()
+        .event_cache()
+        .subscribe()
+        .expect("event cache");
+    let (me, agent) = (smoke.user("tgorka-smoke"), smoke.user("nixi-paced"));
+    let room = tola
+        .create_room(
+            RoomKind::Session(SessionKind::Delegated),
+            "tola 2026-10-15",
+            vec![me.clone()],
+            &[],
+        )
+        .await
+        .expect("create room");
+    sync_until(&person, || person.client().get_room(&room).is_some()).await;
+    person.join(&room).await.expect("join");
+    tola.sync_once().await.expect("sync");
+
+    let status = |run: &str| {
+        json!({
+            "v": CONTENT_VERSION, "session": "01J9ZQ3W4K5M6N7P8Q9R0SESSN", "kind": "delegated",
+            "title": "Tola", "agent": agent.as_str(), "host": "delectra", "epoch": 1, "run": run,
+        })
+    };
+    tola.send(&room, events::STATUS, status("running"), None)
+        .await
+        .expect("status");
+    // A T2 card for a drive write, bound as a host binds it (R185), that
+    // the person may decide for an hour.
+    let args = json!({"profile": "tgdrive", "path": "notes/plan.md", "content": "hello"});
+    let preconditions = json!({
+        "files": [{"drive": "tgdrive", "path": "notes/plan.md",
+            "landing": "notes/plan.md", "sha256": null}],
+        "workspace": null, "screen": null, "max_staleness_s": null,
+    });
+    let (record, session) = (
+        "01J9ZQ3W4K5M6N7P8Q9R0APPRV",
+        "60-sessions/active/2026-10-15-tola",
+    );
+    let digest = binding_digest(
+        record,
+        session,
+        "tola",
+        "drive_write",
+        &args,
+        &Value::Null,
+        "c0ffee",
+        &preconditions,
+    )
+    .expect("digest");
+    let expires = chrono::Utc::now() + chrono::Duration::hours(1);
+    let card = tola
+        .send(
+            &room,
+            events::APPROVAL_REQUEST,
+            json!({
+                "v": CONTENT_VERSION, "id": record, "session": session,
+                "room": room.as_str(), "agent": "tola", "tier": 2,
+                "summary": summary_of(AgentTool::DriveWrite, &args, &Value::Null),
+                "action": {"tool": "drive_write", "args": args, "exec_binding": null},
+                "checkpoint_sha256": "c0ffee",
+                "preconditions": preconditions,
+                "binding_digest": digest, "scopes": ["once"],
+                "expires_at": expires.to_rfc3339(),
+                "approvers": [me.as_str()], "dispatch_chain": [me.as_str(), agent.as_str()],
+            }),
+            None,
+        )
+        .await
+        .expect("card");
+    // More than a restored cache holds, fewer than the reading reads back;
+    // then a newer status, inside the chunk a restart keeps.
+    let fillers = usize::from(ASK_READ_BACK) / 3;
+    for n in 0..fillers {
+        tola.send(
+            &room,
+            "m.room.message",
+            json!({"msgtype": "m.text", "body": format!("working {n}")}),
+            None,
+        )
+        .await
+        .expect("filler");
+    }
+    let newest = tola
+        .send(&room, events::STATUS, status("running"), None)
+        .await
+        .expect("newer status");
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while !cached_events(&person, &room)
+        .await
+        .iter()
+        .any(|e| e["event_id"] == newest.as_str())
+    {
+        assert!(Instant::now() < deadline, "the person never read the room");
+        person.sync_once().await.expect("sync");
+    }
+    let session = StoredSession::from_client(person.client())
+        .expect("session")
+        .to_json()
+        .expect("json");
+    drop(person);
+
+    let restored = AgentClient::open(
+        &smoke.homeserver,
+        &root.path().join("tgorka"),
+        "smoke-passphrase",
+    )
+    .await
+    .expect("reopen");
+    restored
+        .restore(StoredSession::from_json(&session).expect("session"))
+        .await
+        .expect("restore");
+    restored
+        .client()
+        .event_cache()
+        .subscribe()
+        .expect("event cache");
+    restored.sync_once().await.expect("sync");
+    let loaded = cached_events(&restored, &room).await;
+    assert!(
+        !loaded.iter().any(|e| e["event_id"] == card.as_str()),
+        "the restored cache already held the card ({} events): nothing to read back",
+        loaded.len()
+    );
+    assert!(
+        loaded.iter().any(|e| e["event_id"] == newest.as_str()),
+        "the restored chunk holds the newer status"
+    );
+    let joined = restored.client().get_room(&room).expect("room");
+    let levels = joined.power_levels().await.expect("power levels");
+    let is_agent = |user: &matrix_sdk::ruma::UserId| holds_agent_power(Some(&levels), user);
+    let owners = [agent.clone()];
+    let chunk_alone = attention(
+        loaded.iter().map(|event| RoomEvent {
+            event,
+            sealed: true,
+        }),
+        &Reader {
+            own: &me,
+            agent: &is_agent,
+            owners: &owners,
+            marker: None,
+            whole: true,
+        },
+        None,
+        chrono::Utc::now(),
+    );
+    assert_ne!(
+        chunk_alone.state,
+        Some(AgentAttentionVm::NeedsYou),
+        "the chunk alone holds no card"
+    );
+
+    let read = of_room(&joined, None).await;
+    assert_eq!(
+        read.state,
+        Some(AgentAttentionVm::NeedsYou),
+        "the card behind the restored chunk"
+    );
+    assert_eq!(
+        read.recheck_at.map(|at| at.timestamp()),
+        Some(expires.timestamp())
+    );
+}
+
+/// The ids of the asks waiting for `me` through `via` in `room`, as the
+/// decisions panel's reader reads them: the room read back through its event
+/// cache, then folded.
+async fn waiting_ids(
+    client: &AgentClient,
+    room: &RoomId,
+    me: &OwnedUserId,
+    via: &OwnedUserId,
+) -> Vec<String> {
+    use keeper_core::agents::room::holds_agent_power;
+    use keeper_core::agents::waiting::{fold, read_room};
+    let room = client.client().get_room(room).expect("room");
+    let (seen, _) = read_room(&room).await.expect("read back");
+    let levels = room.power_levels().await.expect("power levels");
+    fold(seen, me, via, &|user| {
+        holds_agent_power(Some(&levels), user)
+    })
+    .waiting
+    .into_iter()
+    .map(|open| open.ask.id)
+    .collect()
+}

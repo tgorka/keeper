@@ -250,6 +250,48 @@ pub fn read_zone(drive_id: &str, profile: &SyncProfile, pinned: Option<&DriveDec
     }
 }
 
+/// The gate of the zone at `zone_dir` that names agent `id` in its
+/// `delegates`, read now — every home of the zone parsed against `decl` as a
+/// scan reads it: an agent that takes outside work, which may not have full
+/// access (story 101.5, R420). `Err` when the zone, an entry of it, its
+/// `_drive.toml` or any of its homes cannot be read, or the zone hosts
+/// nothing now because its `_drive.toml` is missing or refused: keeper
+/// cannot tell then whether a gate names it, and that is not "no gate"
+/// (R440 07, R456 04).
+pub(crate) fn delegated_by(
+    zone_dir: &Path,
+    decl: &DriveDecl,
+    id: &str,
+) -> Result<Option<String>, String> {
+    let listed = known_listing(zone_dir)
+        .map_err(|error| format!("its agents zone could not be read ({error})"))?;
+    let drive_text = read_text(zone_dir, drive::FILE_NAME)?;
+    let assessed = zone::assess(&listed, drive_text.as_deref());
+    if let Some(why) = assessed.hosts_nothing_because {
+        return Err(why);
+    }
+    let mut homes: Vec<AgentConfig> = Vec::new();
+    for folder in &assessed.homes {
+        let home = read_home(zone_dir, folder, decl)
+            .map_err(|why| format!("the home {folder} does not read ({why})"))?;
+        homes.push(home.config);
+    }
+    Ok(home::delegated_by(&homes, id).map(str::to_owned))
+}
+
+/// [`listing`], every entry read or the error that kept one from being.
+fn known_listing(dir: &Path) -> std::io::Result<Vec<ZoneEntry>> {
+    let mut listed = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        listed.push(ZoneEntry {
+            name: entry.file_name().to_string_lossy().into_owned(),
+            is_dir: entry.file_type()?.is_dir(),
+        });
+    }
+    Ok(listed)
+}
+
 /// One home's `agent.toml`, read and parsed against `decl`: the scan's read,
 /// and every turn's re-read of its model (100.2 #5).
 pub(crate) fn read_home(

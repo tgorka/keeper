@@ -49,6 +49,15 @@ pub enum PlanStep {
     /// finding its own write), so a file that appeared since the plan was
     /// compiled is never replaced.
     CreateFile { path: String, content: String },
+    /// [`PlanStep::CreateFile`] for bytes that need not be text — a file a
+    /// person sent into an agent's room (story 101.2): written whole to a
+    /// file that is not there, atomically; a file there already is refused
+    /// unless it holds these bytes. They ride the journal as base64.
+    CreateBytes {
+        path: String,
+        #[serde(with = "base64_bytes")]
+        bytes: Vec<u8>,
+    },
     /// Create one directory that is not there, inside a parent that is: a
     /// resume accepts it there only as a real directory, never a link, so
     /// nothing written into it can be carried somewhere else.
@@ -168,6 +177,23 @@ impl PlanStep {
             expect_sha256: Some(sha256_hex(read)),
             content,
         }
+    }
+}
+
+/// [`PlanStep::CreateBytes`]'s bytes in the journal: one base64 string, not
+/// an array of numbers several times its size.
+mod base64_bytes {
+    use base64::Engine as _;
+
+    pub fn serialize<S: serde::Serializer>(bytes: &[u8], to: S) -> Result<S::Ok, S::Error> {
+        to.serialize_str(&base64::engine::general_purpose::STANDARD.encode(bytes))
+    }
+
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(from: D) -> Result<Vec<u8>, D::Error> {
+        let text = <String as serde::Deserialize>::deserialize(from)?;
+        base64::engine::general_purpose::STANDARD
+            .decode(text)
+            .map_err(serde::de::Error::custom)
     }
 }
 
@@ -990,5 +1016,19 @@ mod tests {
                 },
             ]
         );
+    }
+
+    /// Story 101.2: a person's file rides the journal whole — any byte, as
+    /// one base64 string — so a resume writes exactly what was sent.
+    #[test]
+    fn created_bytes_survive_the_journal_whole() {
+        let step = PlanStep::CreateBytes {
+            path: "active/s/attachments/photo.jpg".to_owned(),
+            bytes: vec![0, 0xff, 0xd8, 0x0a, 0x80],
+        };
+        let journal = serde_json::to_value(&step).expect("encode");
+        assert_eq!(journal["bytes"], "AP/YCoA=");
+        let back: PlanStep = serde_json::from_value(journal).expect("decode");
+        assert_eq!(back, step);
     }
 }

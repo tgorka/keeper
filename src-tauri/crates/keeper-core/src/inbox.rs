@@ -638,6 +638,8 @@ fn to_inbox_room(account_id: &str, hue_index: u8, room: &RoomVm) -> InboxRoomVm 
         // Proxy or watched session, read on the `RoomVm`; the merge routes on it.
         agent_room: room.agent_room,
         agent_avatar: room.agent_avatar.clone(),
+        agent_mark: room.agent_mark.clone(),
+        agent_attention: room.agent_attention,
     }
 }
 
@@ -773,6 +775,8 @@ mod tests {
             mute_state: crate::vm::MuteState::None,
             agent_room: None,
             agent_avatar: None,
+            agent_mark: None,
+            agent_attention: None,
         }
     }
 
@@ -866,6 +870,8 @@ mod tests {
             mute_state: crate::vm::MuteState::Muted,
             agent_room: None,
             agent_avatar: None,
+            agent_mark: None,
+            agent_attention: None,
         };
         let inbox_room = to_inbox_room("acctA", 4, &src);
         assert!(inbox_room.is_unread);

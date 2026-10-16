@@ -56,6 +56,10 @@ import type {
   AccountShareVm,
   AccountStateVm,
   AccountVm,
+  AgentAsksVm,
+  AgentAskVm,
+  AgentConsoleReq,
+  AgentConsoleVm,
   AgentCopyVm,
   AgentFocusReq,
   AgentMcpDraftVm,
@@ -77,6 +81,9 @@ import type {
   AgentSeedReq,
   AgentSeedResultVm,
   AgentsLaunchVm,
+  AgentWebSearchReq,
+  AgentWebSearchUrlVm,
+  AgentWebSearchVm,
   ApprovalCardVm,
   ApprovalDecideReq,
   ApprovalPayloadVm,
@@ -103,7 +110,10 @@ import type {
   CardKeyVm,
   ChatCommandPreviewVm,
   ChatCommandRowVm,
+  ChatInlinePreviewVm,
+  ChatInlineRowVm,
   ChoiceVm,
+  ConsoleModeVm,
   CopyJobVm,
   CredentialChoicesVm,
   DeviceCodeVm,
@@ -127,11 +137,14 @@ import type {
   GateLineVm,
   GrantScope,
   HeardMarkVm,
+  HeldRestoreVm,
+  HeldSendVm,
   HotkeyVm,
   InboxBatch,
   InboxRoomVm,
   IpcError,
   LabelVm,
+  LaunchRoomVm,
   NetworksSnapshot,
   NoteBodyBatch,
   NoteIntentVm,
@@ -5893,6 +5906,122 @@ function agentModel(agent: string, localOnly: boolean): AgentModelVm {
   }
   return { bot, effort, bots: localOnly ? local : AGENT_BOTS, locked: null, unread: null };
 }
+// --- Each agent's console (story 101.5, R420) -------------------------------
+//
+// Nixi runs her console at full access (the header's standing marker, which
+// her serving host's status carries — R440 09 — and the Settings warning, with
+// Rust's "unrestricted" sentence where the folders would be); Tara is
+// sandboxed with two folders, one of which this Mac does not give her
+// commands (R440, R381), and a gate hands her outside work, so full access is
+// refused for her. `?consolesave=fails` makes every save fail as a read-only
+// drive would; `?headerconsole=unknown` makes Nixi's room's status come from a
+// host older than the console ("console: unknown", never a safe console).
+// Sentences are copied from `keeper_core::agents::console`.
+const consoleSaveFails = new URLSearchParams(window.location.search).get("consolesave") === "fails";
+const CONSOLE_CHANGED_UNDERNEATH =
+  "This agent's agent.toml names another console than the one shown here: it changed on the drive meanwhile. Look at it again and choose.";
+const CONSOLE_MODES: Array<Pick<ConsoleModeVm, "mode" | "label" | "description">> = [
+  { mode: "off", label: "Off", description: "No console: the agent runs no commands." },
+  {
+    mode: "supervised",
+    label: "Supervised",
+    description: "Every command waits for your approval, and runs in its host's sandbox.",
+  },
+  {
+    mode: "sandboxed",
+    label: "Sandboxed",
+    description:
+      "Commands run in its host's sandbox without asking, writing only the session's workspace and the folders below. A command that needs the network, reads a drive or asks for more folders asks.",
+  },
+  {
+    mode: "full",
+    label: "Full access",
+    description: "Commands run without a sandbox and without asking.",
+  },
+];
+const CONSOLE_UNRESTRICTED =
+  "Unrestricted — folders do not constrain full access: its commands reach anything its host's user can.";
+const CONSOLE_UNKNOWN = "Console: unknown. This agent's host does not say how its commands run.";
+const headerConsoleUnknown =
+  new URLSearchParams(window.location.search).get("headerconsole") === "unknown";
+function fullAccessWarning(name: string): string {
+  return `Full access: ${name}'s commands run on its host without a sandbox and without asking. They can read, change and delete anything that host's user can, and reach the network.`;
+}
+function agentConsole(agent: string, name: string): AgentConsoleVm {
+  const delegate = agent === "tara";
+  return {
+    mode: agent === "nixi" ? "full" : "sandboxed",
+    paths: agent === "nixi" ? [] : ["tgdrive/projects/site", "/Users/tgorka/prj/keeper"],
+    modes: CONSOLE_MODES.map((one) => ({
+      ...one,
+      refused:
+        delegate && one.mode === "full"
+          ? `${name} cannot have this mode: full access is never given to an agent a gate hands outside work to, and the gate forge names this one in its delegates.`
+          : null,
+    })),
+    drives: ["tgdrive"],
+    warning: fullAccessWarning(name),
+    unrestricted: CONSOLE_UNRESTRICTED,
+    refused:
+      agent === "nixi"
+        ? []
+        : [
+            {
+              path: "tgdrive/projects/site",
+              refused:
+                "Not given to its commands on this Mac: it holds a .keeper folder (notes/.keeper), which keeper keeps to itself.",
+            },
+          ],
+    locked: null,
+  };
+}
+/**
+ * The full-access marker `agent`'s serving host says in its status (101.5,
+ * R440 09): the mock's host reads the same row.
+ */
+function agentFullAccess(agent: string): string | undefined {
+  const row = agentRows.find((one) => one.agent === agent);
+  return row?.console?.mode === "full" ? row.console.warning : undefined;
+}
+function setAgentConsole(req: AgentConsoleReq): AgentCopyVm[] {
+  const refuse = (message: string) => {
+    throw { code: "internal", message, accountId: null, retriable: false };
+  };
+  const row = agentRows.find((one) => one.profileId === req.profileId && one.agent === req.agent);
+  if (row?.console == null) refuse(`tgdrive has no agent ${req.agent}.`);
+  const shown = row?.console as AgentConsoleVm;
+  if (shown.mode !== req.shownMode || shown.paths.join("\n") !== req.shownPaths.join("\n")) {
+    refuse(CONSOLE_CHANGED_UNDERNEATH);
+  }
+  const refused = shown.modes.find((one) => one.mode === req.mode)?.refused;
+  if (refused != null) refuse(refused);
+  for (const path of req.paths) {
+    if (!path.startsWith("/") && !path.startsWith("tgdrive/")) {
+      refuse(
+        `${row?.name}'s console was not changed: "${path}" is neither an absolute path nor a folder of a drive in this agent's scope (tgdrive).`,
+      );
+    }
+  }
+  if (consoleSaveFails) {
+    refuse(
+      `80-agents/${req.agent}/agent.toml could not be written: Read-only file system (os error 30)`,
+    );
+  }
+  agentRows = agentRows.map((one) =>
+    one === row
+      ? {
+          ...one,
+          console: {
+            ...shown,
+            mode: req.mode,
+            paths: req.paths,
+            refused: shown.refused.filter((folder) => req.paths.includes(folder.path)),
+          },
+        }
+      : one,
+  );
+  return agentRows;
+}
 function agentRow(agent: string, name: string): AgentCopyVm {
   const pin = agentPin();
   return {
@@ -5907,6 +6036,8 @@ function agentRow(agent: string, name: string): AgentCopyVm {
     pin,
     problem: agentsParam === "differs" ? "tgdrive's agents zone hosts nothing here." : null,
     model: agentModel(agent, pin.localOnly),
+    webSearch: agentWebSearch(agent, name, pin.localOnly),
+    console: agentConsole(agent, name),
     // Story 100.4: Tara's home holds a picture keeper does not read.
     avatarProblem:
       agent === "tara"
@@ -5920,6 +6051,73 @@ function agentModelLine(agent: string): AgentModelLineVm | undefined {
   if (model == null) return undefined;
   const bot = model.bots.find((candidate) => candidate.reference === model.bot);
   return { bot: bot?.name ?? model.bot, effort: model.effort };
+}
+/**
+ * Story 101.4: each row's *Web search* switch. On a pinned drive that is not
+ * local-only (`?agents=models`) Nixi searches and Tara does not; a local-only
+ * drive's agents are never offered one (Rust's `web_search::never`).
+ */
+// Rust's sentences for the level *without asking* (R457): the header's mark,
+// and the row's standing warning naming this Mac's engine where it names one.
+const UNASKED_MARK =
+  "Searches the web without asking: its queries go to the search engine unreviewed and may contain words from your files.";
+function unaskedWarning(): string {
+  const host = webSearchUrl.url === null ? null : new URL(webSearchUrl.url).host;
+  return host === null
+    ? "Queries go to the search engine of the host that serves this agent and its upstream search engines without asking — they may contain words from your files."
+    : `Queries go to ${host} and its upstream search engines without asking — they may contain words from your files. A host other than this Mac sends them to its own engine.`;
+}
+/** Nixi searches without asking (her room's header carries the mark); the others are off. */
+function agentWebSearch(agent: string, name: string, localOnly: boolean): AgentWebSearchVm {
+  const level = agent === "nixi" && !localOnly ? "withoutAsking" : "off";
+  return {
+    level,
+    locked: null,
+    unavailable: localOnly
+      ? `${name} uses only models that run on its readers' own machines, and a web search sends its query out, so it is never offered one.`
+      : null,
+    warning: level === "withoutAsking" ? unaskedWarning() : null,
+  };
+}
+const WEB_SEARCH_CHANGED_UNDERNEATH =
+  "This agent's agent.toml changed on the drive meanwhile, so web search was not switched. Look at it again and choose.";
+function setAgentWebSearch(req: AgentWebSearchReq): AgentCopyVm[] {
+  const refuse = (message: string) => {
+    throw { code: "internal", message, accountId: null, retriable: false };
+  };
+  const row = agentRows.find((one) => one.profileId === req.profileId && one.agent === req.agent);
+  if (row?.webSearch == null) refuse(`tgdrive has no agent ${req.agent}.`);
+  const webSearch = row?.webSearch as AgentWebSearchVm;
+  if (webSearch.level !== req.shownLevel) refuse(WEB_SEARCH_CHANGED_UNDERNEATH);
+  if (req.level !== "off" && webSearch.unavailable !== null) refuse(webSearch.unavailable);
+  const warning = req.level === "withoutAsking" ? unaskedWarning() : null;
+  agentRows = agentRows.map((one) =>
+    one === row ? { ...one, webSearch: { ...webSearch, level: req.level, warning } } : one,
+  );
+  return agentRows;
+}
+/** This Mac's search engine (101.4 #2): none until one is saved. */
+let webSearchUrl: AgentWebSearchUrlVm = { url: null, refusal: null };
+function webSearchSave(url: string): AgentWebSearchUrlVm {
+  const trimmed = url.trim();
+  if (trimmed === "") {
+    webSearchUrl = { url: null, refusal: null };
+    return webSearchUrl;
+  }
+  const scheme = /^([a-z][a-z0-9+.-]*):/i.exec(trimmed)?.[1]?.toLowerCase();
+  if (scheme !== "http" && scheme !== "https") {
+    throw {
+      code: "internal",
+      message:
+        scheme === undefined
+          ? `this does not read as a URL: ${trimmed}.`
+          : `keeper searches over http or https — ${scheme} is not something it can speak.`,
+      accountId: null,
+      retriable: false,
+    };
+  }
+  webSearchUrl = { url: trimmed.replace(/\/+$/, ""), refusal: null };
+  return webSearchUrl;
 }
 function setAgentModel(req: AgentModelReq): AgentCopyVm[] {
   const refuse = (message: string) => {
@@ -5951,6 +6149,8 @@ const BROKEN_FOLDER: AgentCopyVm = {
   pin: null,
   problem: "`local_only` in _drive.toml must be true or false, not text.",
   model: null,
+  webSearch: null,
+  console: null,
   avatarProblem: null,
 };
 let agentRows: AgentCopyVm[] =
@@ -6414,6 +6614,70 @@ function inboxRow(
   };
 }
 
+/**
+ * Each agent room's state in the list (story 101.6, R421), as Rust would say
+ * it: one room per state, so every mark can be looked at. `?attention=none`
+ * shows the rows with none.
+ *
+ * *Done* is not declared: it is read as Rust reads it (`attention.rs`, R437)
+ * from the room's newest status — `done`, what a host's finished turn ends
+ * on — sent after the event the person's read marker stands on. Reading the
+ * room (`mark_room_read`) moves the marker to now, past the finish.
+ */
+const attentionParam = new URLSearchParams(window.location.search).get("attention");
+const MOCK_ATTENTION: Record<
+  string,
+  NonNullable<InboxRoomVm["agentAttention"]>
+> = attentionParam === "none"
+  ? {}
+  : {
+      "!nixi-dm:example.org": "working",
+      "!tola-review:example.org": "needsYou",
+      "!forge-github:example.org": "failed",
+    };
+
+/**
+ * A room's newest status as its host sent it and the person's read marker:
+ * the reading list's turn finished five minutes ago (its answer's time, the
+ * header's `done`), and the person last read it at their question, six.
+ */
+const MOCK_FINISHES: Record<string, { at: number; read: number | null }> =
+  attentionParam === "none"
+    ? {}
+    : {
+        "!nixi-reading:example.org": { at: MOCK_NOW - 5 * 60_000, read: MOCK_NOW - 6 * 60_000 },
+      };
+
+/**
+ * Whether the questions the decisions panel shows (`mockAgentAsks`) are
+ * declared yet: a row read at load says what its run says, and is read again
+ * once they are.
+ */
+let mockAsksDeclared = false;
+
+function mockAttention(roomId: string): InboxRoomVm["agentAttention"] {
+  // A question waiting for the person where they answer it outranks every run
+  // (R453), read as Rust reads it: from the questions 101.3's projection puts
+  // in this room — one not answered yet, or held for Undo-Send — and, when it
+  // read them in part, *Unknown* rather than nothing.
+  if (mockAsksDeclared) {
+    const asks = mockAgentAsks(roomId);
+    if (asks.asks.some((ask) => ask.state !== "answered")) return "needsYou";
+    if (asks.note !== null) return "unknown";
+  }
+  const declared = MOCK_ATTENTION[roomId];
+  if (declared !== undefined) return declared;
+  const finish = MOCK_FINISHES[roomId];
+  return finish !== undefined && finish.read !== null && finish.at > finish.read
+    ? "doneUnread"
+    : undefined;
+}
+
+function withAttention(row: InboxRoomVm): InboxRoomVm {
+  const state = mockAttention(row.roomId);
+  return state === undefined ? row : { ...row, agentAttention: state };
+}
+
 const AGENT_ROOM_ROWS: InboxRoomVm[] = [
   inboxRow("!nixi-dm:example.org", "Nixi", "…", 1, "proxy", NIXI_AVATAR),
   inboxRow(
@@ -6441,7 +6705,24 @@ const AGENT_ROOM_ROWS: InboxRoomVm[] = [
     120,
     "session",
   ),
-];
+  // Story 101.1 #6: Tola's triage handed to Nixi is listed by its delegate and
+  // its title, and its letter is Nixi's — never "N2" from "nixi 2026-10-15".
+  inboxRow(
+    "!nixi-triage:example.org",
+    "Nixi — triage of inbox",
+    "Sorted 12 notes.",
+    300,
+    "session",
+  ),
+]
+  .map((row) =>
+    // Rust's `agentMark`: the working agent's initial on every session row
+    // whose status was read (the room's name is "<agent> — <title>").
+    row.agentRoom === undefined || row.agentRoom === "unknown"
+      ? row
+      : { ...row, agentMark: row.displayName.trim().charAt(0).toUpperCase() },
+  )
+  .map(withAttention);
 
 const CHAT_ROWS: InboxRoomVm[] = [inboxRow("!marta:example.org", "Marta", "See you on Friday", 15)];
 
@@ -6499,6 +6780,8 @@ function nixiHeader(run: "running" | "done", caretKey: string | null): AgentRoom
       // none, as on the phone, and draw the handle's first letter.
       icon: "N",
       avatar: NIXI_AVATAR,
+      // Her home says she searches without asking (R457): the header's mark.
+      searchesUnasked: UNASKED_MARK,
       host: "electra",
       title: "Nixi",
       kind: "main",
@@ -6545,7 +6828,8 @@ const AGENT_ROOM_TIMELINES: Record<
         host: "hesperia",
         title: "Reading list",
         kind: "conversation",
-        run: "idle",
+        // The turn that answered finished: its status ends `done` (R437).
+        run: "done",
         waiting: null,
         detail: null,
         unreadable: null,
@@ -6910,7 +7194,9 @@ AGENT_ROOM_TIMELINES[GATE_ROOM] = {
 // the argv, the program, the folder, the Network chip and its file list),
 // `run-large` (a T2 run attached: its run's own session allowance, and once
 // shown the typed run view with escaped arguments), `kvm` (a T4 `kvm_act`:
-// its inputs as keeper reads them, no raw arguments).
+// its inputs as keeper reads them, no raw arguments), `web-search` (101.4,
+// R428: a search from a session whose label names its readers — the exact
+// query and the engine's host, once only).
 // `agent_approval_decide` answers as Rust does: refused with the card's own
 // sentence where it shows no buttons, for another digest or a scope the card
 // does not offer, and for an attached action not shown yet; else the card
@@ -7034,6 +7320,15 @@ function mockApprovalCards(): ApprovalCardVm[] {
       ];
     case "t4":
       return [approvalCard(id, 4)];
+    case "web-search":
+      return [
+        approvalCard(id, 2, {
+          summary: "Search the web for `otter facts` with `127.0.0.1:5191`",
+          tool: "web_search",
+          payload: JSON.stringify({ query: "otter facts" }, null, 2),
+          scopes: [{ scope: "once", label: "Approve", detail: APPROVAL_SENTENCES.onceReach }],
+        }),
+      ];
     case "t4-other":
       return [
         approvalCard(id, 4, {
@@ -7097,6 +7392,30 @@ function mockApprovalCards(): ApprovalCardVm[] {
         }),
       ];
     }
+    case "run-folders":
+      // A sandboxed run that asks for a folder beyond its console's (101.5,
+      // R440 08): T3, once only, the folder named as keeper landed it, read
+      // and write, for that run alone.
+      return [
+        approvalCard(id, 3, {
+          summary:
+            "Run `cargo` in `workspace/`, reading and writing `/Users/tgorka/prj/keeper-site` for this run only",
+          tool: "run",
+          payload: null,
+          scopes: [{ scope: "once", label: "Approve", detail: APPROVAL_SENTENCES.onceReach }],
+          run: {
+            argv: ["cargo", "build", "--manifest-path", "/Users/tgorka/prj/keeper-site/Cargo.toml"],
+            program: "/Users/tgorka/.cargo/bin/cargo · 7c0e5a91d2b4",
+            wrappers: [],
+            wrapped: null,
+            cwd: "workspace/",
+            reads: [],
+            timeoutS: 600,
+            held: [],
+            network: null,
+          },
+        }),
+      ];
     case "run-read":
       // A run without network that reads two drives — one named with a bidi
       // override, escaped as Rust escapes it — asks for the longest time,
@@ -7491,7 +7810,18 @@ let nextTimelineSubscription = 1;
 function withModelLine(header: AgentRoomHeaderVm): AgentRoomHeaderVm {
   if (header.status?.agent !== NIXI) return header;
   const model = agentModelLine("nixi");
-  return model === undefined ? header : { ...header, status: { ...header.status, model } };
+  // Her console as her serving host's status says it (story 101.5, R440 09);
+  // a host older than the console says nothing, read as "console: unknown".
+  const fullAccess = headerConsoleUnknown ? undefined : agentFullAccess("nixi");
+  return {
+    ...header,
+    status: {
+      ...header.status,
+      ...(model === undefined ? {} : { model }),
+      ...(fullAccess === undefined ? {} : { fullAccess }),
+      ...(headerConsoleUnknown ? { console: CONSOLE_UNKNOWN } : {}),
+    },
+  };
 }
 
 function subscribeMockTimeline(payload: Record<string, unknown>): number {
@@ -7568,6 +7898,7 @@ function subscribeMockTimeline(payload: Record<string, unknown>): number {
 const launchParam = new URLSearchParams(window.location.search).get("launch");
 let defaultAgent: string | null =
   launchParam === "default" ||
+  launchParam === "ask" ||
   launchParam === "late" ||
   launchParam === "lost" ||
   launchParam === "unseen"
@@ -7585,7 +7916,56 @@ const FILE_PATH = "/Users/you/Library/Application Support/keeper/keeper.toml";
 /** `?launch=late`: when Nixi's DM arrives. `?launch=lost`: the bound (Rust's is 15 s). */
 const LATE_ROOM_MS = 2_500;
 const LOST_BOUND_MS = 4_000;
-let nixiDmHere = launchParam !== "late" && launchParam !== "lost";
+let nixiDmHere = launchParam !== "late" && launchParam !== "lost" && launchParam !== "ask";
+
+// Story 101.1 #4–#5 (R416): `?launch=ask` makes Nixi the default with no DM
+// here — Agents opens and keeper asks her host for one; `agent_main_dm_open`
+// answers after `MAIN_DM_MS` with the DM, which then lands in the Agents
+// window and the dock. `?dm=refused` answers with the sentence Rust gives
+// when the person shares no control room with the agent. `?dock=ask` lists no
+// proxy room in the notes Assistant, which offers to ask Nixi; `?dock=asklate`
+// lists none and Rust knows Nixi only from `ASK_LATE_MS` on, so the offer
+// appears at a later look (*Look again*) without the dock being remounted.
+const dmParam = new URLSearchParams(window.location.search).get("dm");
+const MAIN_DM_MS = 2_500;
+const ASK_LATE_MS = 6_000;
+const askLateFrom = Date.now() + ASK_LATE_MS;
+
+/** Rust's `MainDmAskVm` for Nixi. */
+const NIXI_ASK = {
+  accountId: MOCK_ACCOUNT_ID,
+  agent: NIXI,
+  name: "Nixi",
+  opening: "Opening a conversation with Nixi…",
+};
+
+function mockMainDmOpen(payload: Record<string, unknown>): Promise<LaunchRoomVm> {
+  return new Promise((resolve, reject) => {
+    setTimeout(() => {
+      if (dmParam === "refused" || payload.agent !== NIXI) {
+        reject({
+          code: "unsupported",
+          retriable: false,
+          message:
+            "keeper cannot ask Nixi for a conversation: you are in no control room with it. Run `keeper-agentd agents init` on its host (it makes the control room and your conversation), then ask again.",
+        });
+        return;
+      }
+      nixiDmHere = true;
+      if (!proxyRooms.some((room) => room.roomId === DM_ROOM)) {
+        proxyRooms = [
+          { roomId: DM_ROOM, name: "Nixi", kind: "main", agent: NIXI, allowed: NIXI_ALLOWED },
+          ...proxyRooms,
+        ];
+      }
+      agentsWindow?.onmessage?.({
+        ops: [{ op: "reset", rooms: AGENT_ROOM_ROWS }],
+        total: AGENT_ROOM_ROWS.length,
+      });
+      resolve({ accountId: MOCK_ACCOUNT_ID, roomId: DM_ROOM });
+    }, MAIN_DM_MS);
+  });
+}
 
 function mockAgentsLaunch(): AgentsLaunchVm {
   const mains = proxyRooms.filter(
@@ -7600,6 +7980,14 @@ function mockAgentsLaunch(): AgentsLaunchVm {
     FILE_DEFAULT === null
       ? null
       : `${FILE_PATH} (user) sets agents.default to ${FILE_DEFAULT}, so ${FILE_DEFAULT} opens at launch whatever you choose here. Your choice is kept and takes effect once that file stops setting it.`;
+  const hasNixiDm = mains.some((room) => room.agent === NIXI);
+  const askable =
+    hasNixiDm ||
+    launchParam === "none" ||
+    (new URLSearchParams(window.location.search).get("dock") === "asklate" &&
+      Date.now() < askLateFrom)
+      ? []
+      : [NIXI_ASK];
   const base = {
     room: null,
     defaultAgent: effective,
@@ -7607,7 +7995,18 @@ function mockAgentsLaunch(): AgentsLaunchVm {
     announce: false,
     choices,
     fileSet,
+    ask: null,
+    askable,
   };
+  if (launchParam === "ask" && effective === NIXI && !hasNixiDm) {
+    return {
+      ...base,
+      view: "agents",
+      reason:
+        "Your default agent Nixi has no conversation with you on this device's accounts yet, so keeper asks it to open one.",
+      ask: NIXI_ASK,
+    };
+  }
   if (launchParam === "unseen") {
     return {
       ...base,
@@ -7660,6 +8059,9 @@ function mockAgentsLaunchWhenKnown(): Promise<AgentsLaunchVm> {
   }
   return later(300, mockAgentsLaunch);
 }
+
+/** This Mac's claims lease (R455), as the Settings row last stored it. */
+let mockClaimsLease: "short" | "quarter-hour" = "short";
 
 function mockAgentsDefaultSet(payload: Record<string, unknown>): Promise<AgentsLaunchVm> {
   // The executor form: the project compiles against ES2020, which has no
@@ -7739,6 +8141,28 @@ function subscribeMockInbox(payload: Record<string, unknown>): number {
 
 const dockParam = new URLSearchParams(window.location.search).get("dock");
 const dockListedFrom = Date.now() + (dockParam === "late" ? 8_000 : 0);
+
+/**
+ * `?dock=refresh-fails`: the dock's reads of its rooms fail from eight to
+ * sixteen seconds after its first (story 101.6, R436) — the ten-second
+ * refresh lands there — and read again after, so the failure said beside the
+ * rooms it keeps, and its clearing, can be looked at.
+ */
+let dockFirstRead: number | null = null;
+function mockAgentRoomsList(accountId: string): ProxyRoomVm[] {
+  if (accountId !== MOCK_ACCOUNT_ID || Date.now() < dockListedFrom) return [];
+  dockFirstRead ??= Date.now();
+  const since = Date.now() - dockFirstRead;
+  if (dockParam === "refresh-fails" && since >= 8_000 && since < 16_000) {
+    throw {
+      code: "internal",
+      message: "the room list could not be read",
+      accountId,
+      retriable: true,
+    };
+  }
+  return proxyRooms;
+}
 const DM_ROOM = "!nixi-dm:example.org";
 const NIXI_ALLOWED = [
   { id: "tgdrive", title: "tgdrive" },
@@ -7747,7 +8171,7 @@ const NIXI_ALLOWED = [
 ];
 
 let proxyRooms: ProxyRoomVm[] =
-  dockParam === "none"
+  dockParam === "none" || dockParam === "ask" || dockParam === "asklate"
     ? []
     : [
         {
@@ -7764,7 +8188,47 @@ let proxyRooms: ProxyRoomVm[] =
           agent: NIXI,
           allowed: NIXI_ALLOWED,
         },
-      ].map((room): ProxyRoomVm => (dockParam === "phone" ? { ...room, allowed: null } : room));
+      ]
+        .map((room): ProxyRoomVm => (dockParam === "phone" ? { ...room, allowed: null } : room))
+        .map((room): ProxyRoomVm => {
+          const state = mockAttention(room.roomId);
+          return state === undefined ? room : { ...room, attention: state };
+        });
+
+/**
+ * Reading an agent room that finished since it was last read clears its
+ * *done* (story 101.6): Rust's row and the dock's list say none from then on.
+ */
+function mockMarkRoomRead(roomId: string): null {
+  const finish = MOCK_FINISHES[roomId];
+  if (finish === undefined) return null;
+  finish.read = Date.now();
+  redrawMockAttention(roomId);
+  return null;
+}
+
+/** Rust reads `roomId`'s state again: its Agents window row and dock entry. */
+function redrawMockAttention(roomId: string): void {
+  const state = mockAttention(roomId);
+  const index = AGENT_ROOM_ROWS.findIndex((row) => row.roomId === roomId);
+  if (index >= 0) {
+    const { agentAttention: _was, ...rest } = AGENT_ROOM_ROWS[index];
+    const row: InboxRoomVm = state === undefined ? rest : { ...rest, agentAttention: state };
+    AGENT_ROOM_ROWS[index] = row;
+    const shown = nixiDmHere
+      ? AGENT_ROOM_ROWS
+      : AGENT_ROOM_ROWS.filter((r) => r.roomId !== DM_ROOM);
+    const at = shown.findIndex((r) => r.roomId === roomId);
+    if (at >= 0) {
+      agentsWindow?.onmessage?.({ ops: [{ op: "set", index: at, room: row }], total: null });
+    }
+  }
+  proxyRooms = proxyRooms.map((room) => {
+    if (room.roomId !== roomId) return room;
+    const { attention: _was, ...rest } = room;
+    return state === undefined ? rest : { ...rest, attention: state };
+  });
+}
 
 /** Open timelines by subscription id, so a scope echo reaches the dock. */
 const dockChannels = new Map<number, { roomId: string; channel: MockChannel<TimelineBatch> }>();
@@ -8046,6 +8510,218 @@ function failureRecovered(operation: FailureOperation): void {
 /** The tablet's distributor was confirmed in Settings this session (98.4). */
 let unifiedpushConfirmed = false;
 
+// ---------------------------------------------------------------------------
+// Story 101.3 — undo windows, the mid-text `/`, the decisions panel
+// ---------------------------------------------------------------------------
+
+/** The two Undo-Send windows, as Settings last set them (Rust's defaults: 2 s, 0 s). */
+const mockUndoWindows = { chat: 2, agent: 0 };
+
+/**
+ * The dev shell's answer to `chat_inline_preview` (Story 101.3, R434). **A fake**:
+ * the token rule, the sets, the drive-qualified insert and every sentence are
+ * `keeper_core::chat::inline`'s; this draws each kind of row once — in an agent
+ * room Tola and Amelia to mention, files of two drives found by name (a note, a
+ * pdf and a csv on `tgdrive`, which has a notes vault, and the same csv path on
+ * `work`, which has none), and `/shrug`; in a chat `/shrug` alone. `?inline=partial`
+ * says a drive was searched in part.
+ */
+function mockChatInlinePreview(payload: Record<string, unknown>): ChatInlinePreviewVm {
+  const before = String(payload.before ?? "");
+  const after = String(payload.after ?? "");
+  const roomId = String(payload.roomId ?? "");
+  const agentRoom = roomId in AGENT_ROOM_TIMELINES || roomId === DM_ROOM;
+  const match = /\s(\/[^\s/]*)$/.exec(before);
+  const token = match !== null && (after === "" || /^\s/.test(after)) ? match[1] : null;
+  if (token === null) {
+    return { before, after, token: null, rows: [], note: null };
+  }
+  const query = token.slice(1).toLowerCase();
+  const rows: ChatInlineRowVm[] = [];
+  if (agentRoom) {
+    for (const [id, name] of [
+      ["amelia", "Amelia"],
+      ["tola-grey", "Tola Grey"],
+    ]) {
+      if (
+        id.startsWith(query) ||
+        name
+          .toLowerCase()
+          .split(" ")
+          .some((w) => w.startsWith(query))
+      ) {
+        rows.push({
+          kind: "mention",
+          key: `mention:@${id}:example.org`,
+          label: `@${id}`,
+          detail: name,
+          insert: `@${id}`,
+        });
+      }
+    }
+  }
+  if ("shrug".startsWith(query)) {
+    rows.push({
+      kind: "shrug",
+      key: "shrug",
+      label: "/shrug",
+      detail: "Insert ¯\\_(ツ)_/¯ here.",
+      insert: "¯\\_(ツ)_/¯",
+    });
+  }
+  const files = agentRoom && query !== "";
+  if (files) {
+    for (const [drive, id, path, title] of [
+      ["tgdrive", "01TGDRIVE", "notes/plans/trip-tatry.md", "Trip to Tatry"],
+      ["tgdrive", "01TGDRIVE", "scans/tatry-map.pdf", null],
+      ["tgdrive", "01TGDRIVE", "trips/tatry-budget.csv", null],
+      ["work", "01WORK", "trips/tatry-budget.csv", null],
+    ] as const) {
+      const file = path.slice(path.lastIndexOf("/") + 1);
+      const titled =
+        title
+          ?.toLowerCase()
+          .split(" ")
+          .some((w) => w.startsWith(query)) ?? false;
+      if (file.toLowerCase().includes(query) || titled) {
+        rows.push({
+          kind: "file",
+          key: `file:${id}:${path}`,
+          label: title ?? file,
+          detail: `${drive} · ${path}`,
+          insert: `${drive}:${path}`,
+        });
+      }
+    }
+  }
+  const partial = new URLSearchParams(window.location.search).get("inline") === "partial";
+  return {
+    before,
+    after,
+    token,
+    rows: rows.slice(0, 12),
+    note:
+      files && partial
+        ? "Only the first 5,000 entries of a large drive were searched; type more of the name to narrow it."
+        : null,
+  };
+}
+
+/**
+ * The held sends of agent rooms (Story 101.3, R432): a send into an agent room
+ * waits `mockUndoWindows.agent` seconds here, as Rust holds it, and Undo puts it
+ * back. Chats send at once in the fake, as before.
+ */
+const mockHeld: HeldSendVm[] = [];
+const outboxWatchers = new Map<
+  number,
+  { roomId: string; channel: MockChannel<{ rows: HeldSendVm[] }> }
+>();
+const askWatchers = new Map<number, { roomId: string; channel: MockChannel<AgentAsksVm> }>();
+let mockWatchSeq = 0;
+mockAsksDeclared = true;
+redrawMockAttention(DM_ROOM);
+
+function emitHeld(): void {
+  for (const { roomId, channel } of outboxWatchers.values()) {
+    channel.onmessage?.({ rows: mockHeld.filter((row) => row.roomId === roomId) });
+  }
+  for (const { roomId, channel } of askWatchers.values()) {
+    channel.onmessage?.(mockAgentAsks(roomId));
+  }
+  // The DM's row and dock entry follow the questions answered there (R453).
+  redrawMockAttention(DM_ROOM);
+}
+
+function mockSendText(payload: Record<string, unknown>): null {
+  const roomId = String(payload.roomId ?? "");
+  const agentRoom = roomId in AGENT_ROOM_TIMELINES || roomId === DM_ROOM;
+  const seconds = mockUndoWindows.agent;
+  if (!agentRoom || seconds === 0) {
+    recordSend("text", payload);
+    emitHeld();
+    return null;
+  }
+  const now = Date.now();
+  const row: HeldSendVm = {
+    id: `held-${now}`,
+    accountId: String(payload.accountId ?? ""),
+    roomId,
+    body: String(payload.line ?? payload.body ?? ""),
+    heldAtMs: now,
+    dispatchAtMs: now + seconds * 1000,
+    filename: null,
+    reply: false,
+  };
+  mockHeld.push(row);
+  setTimeout(() => {
+    const at = mockHeld.indexOf(row);
+    if (at !== -1) {
+      mockHeld.splice(at, 1);
+      recordSend("text", payload);
+      emitHeld();
+    }
+  }, seconds * 1000);
+  emitHeld();
+  return null;
+}
+
+/**
+ * `?undo=slow-file` (Story 101.3, R447): the cancel answers after 2.5 s and hands
+ * back a staged file with the line, as Rust does for a held attachment — time to
+ * open another room before it lands, to see it land only where it was held.
+ */
+const undoParam = new URLSearchParams(window.location.search).get("undo");
+
+function mockCancelHeld(payload: Record<string, unknown>): HeldRestoreVm | Promise<HeldRestoreVm> {
+  const at = mockHeld.findIndex((row) => row.id === String(payload.id));
+  if (at === -1) {
+    return { line: "", reply: null, attachment: null };
+  }
+  const [row] = mockHeld.splice(at, 1);
+  emitHeld();
+  if (undoParam === "slow-file") {
+    return later(2500, () => ({
+      line: row.body,
+      reply: null,
+      attachment: { path: "/mock/outbox-files/held/trip-plan.pdf", filename: "trip-plan.pdf" },
+    }));
+  }
+  return { line: row.body, reply: null, attachment: null };
+}
+
+/**
+ * The dev shell's follow of the questions waiting in a room (Story 101.3, R430,
+ * R431): with `?ask=waiting`, Tola asks through Nixi which trip to plan, answered
+ * in the Nixi DM. While the person's choice is held for Undo-Send the question is
+ * `held`; Undo opens it again; once the choice is sent the proxy's relay ends it.
+ * `?ask=partial` adds the sentence Rust says when it read the rooms in part.
+ */
+function mockAgentAsks(roomId: string): AgentAsksVm {
+  const mode = new URLSearchParams(window.location.search).get("ask");
+  const note =
+    mode === "partial"
+      ? "keeper could not read every room a question for you may wait in, so one may be missing here. It still shows in the room it was asked in."
+      : null;
+  const choices = ["Tatry", "Bieszczady", "Mazury"];
+  const answered = mockSends.some((send) => choices.includes(send.body));
+  if ((mode !== "waiting" && mode !== "partial") || roomId !== DM_ROOM || answered) {
+    return { asks: [], note: roomId === DM_ROOM ? note : null };
+  }
+  const held = mockHeld.some((row) => row.roomId === roomId && choices.includes(row.body));
+  const ask: AgentAskVm = {
+    id: "01J8ASKAAAAAAAAAAAAAAAAAAA",
+    roomId: "!tola-triage:example.org",
+    askedBy: "Tola Grey",
+    question: "Which trip should I plan first?",
+    choices,
+    default: "Tatry",
+    askedAt: MOCK_NOW - 5 * 60_000,
+    state: held ? "held" : "open",
+  };
+  return { asks: [ask], note };
+}
+
 const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = {
   push_gateway_get: () => pushGateway,
   push_open_take: () => null,
@@ -8105,8 +8781,8 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
   agent_approval_decide: mockApprovalDecide,
   agent_approval_payload: mockApprovalPayload,
   agent_own_fingerprint: () => (fingerprintParam === "none" ? null : OWN_FINGERPRINT),
-  agent_rooms_list: (payload) =>
-    payload.accountId === MOCK_ACCOUNT_ID && Date.now() >= dockListedFrom ? proxyRooms : [],
+  mark_room_read: (payload) => mockMarkRoomRead(String(payload.roomId)),
+  agent_rooms_list: (payload) => mockAgentRoomsList(String(payload.accountId)),
   agent_scope_set: mockScopeSet,
   agent_focus: (payload) =>
     later(40, () => {
@@ -8122,6 +8798,7 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
       return null;
     }),
   agent_conversation_new: mockConversationNew,
+  agent_main_dm_open: mockMainDmOpen,
   agent_model_command: mockAgentModelCommand,
   // Story 100.5: the messenger's slash commands. Sends and room acts succeed
   // silently (the fake has no room state to change) except one refused invite.
@@ -8131,10 +8808,53 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
     new URLSearchParams(window.location.search).get("slash") === "slow"
       ? later(1000, () => mockChatCommandPreview(payload))
       : mockChatCommandPreview(payload),
-  send_text: (payload) => recordSend("text", payload),
+  send_text: mockSendText,
+  subscribe_outbox: (payload) => {
+    const id = ++mockWatchSeq;
+    const roomId = String(payload.roomId ?? "");
+    const channel = payload.channel as MockChannel<{ rows: HeldSendVm[] }>;
+    outboxWatchers.set(id, { roomId, channel });
+    channel.onmessage?.({ rows: mockHeld.filter((row) => row.roomId === roomId) });
+    return id;
+  },
+  unsubscribe_outbox: (payload) => {
+    outboxWatchers.delete(Number(payload.subscriptionId));
+    return null;
+  },
+  cancel_held_send: mockCancelHeld,
+  // Story 101.3: the two Undo-Send windows, the mid-text `/`, and the questions
+  // waiting in the Nixi DM (`?ask=waiting`).
+  undo_send_window: () => mockUndoWindows.chat,
+  set_undo_send_window: (payload) => {
+    mockUndoWindows.chat = Number(payload.seconds);
+    return null;
+  },
+  undo_send_agent_window: () => mockUndoWindows.agent,
+  set_undo_send_agent_window: (payload) => {
+    mockUndoWindows.agent = Number(payload.seconds);
+    return null;
+  },
+  chat_inline_preview: mockChatInlinePreview,
+  agent_asks_subscribe: (payload) => {
+    const id = ++mockWatchSeq;
+    const roomId = String(payload.roomId ?? "");
+    const channel = payload.channel as MockChannel<AgentAsksVm>;
+    askWatchers.set(id, { roomId, channel });
+    channel.onmessage?.(mockAgentAsks(roomId));
+    return id;
+  },
+  agent_asks_unsubscribe: (payload) => {
+    askWatchers.delete(Number(payload.subscriptionId));
+    return null;
+  },
   send_emote: (payload) => recordSend("emote", payload),
   // Recorded too, so the browser can see which context a slow line went out in (R411).
   send_reply: (payload) => recordSend("reply", payload),
+  send_reply_to_event: (payload) => recordSend("reply", payload),
+  // Recorded with its path and caption, so the browser can see which room's file
+  // a Send carried (R447).
+  send_attachment_path: (payload) =>
+    recordSend("attachment", { body: `${String(payload.path)} ${String(payload.caption ?? "")}` }),
   edit_message: (payload) => recordSend("edit", payload),
   room_set_topic: () => later(200, () => null),
   room_invite: (payload) =>
@@ -8417,9 +9137,13 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
   },
   agents_sandbox_get: () => sandboxTable,
   agents_sandbox_save: (payload) => sandboxSave(payload.req as AgentSandboxReq),
+  agents_web_search_get: () => webSearchUrl,
+  agents_web_search_save: (payload) => webSearchSave(payload.url as string),
+  agents_web_search_set: (payload) => setAgentWebSearch(payload.req as AgentWebSearchReq),
   agents_seed_plan: (payload) => seedPlan(payload.req as AgentSeedReq),
   agents_seed_apply: (payload) => seedApply(payload.req as AgentSeedReq),
   agents_model_set: (payload) => setAgentModel(payload.req as AgentModelReq),
+  agents_console_set: (payload) => setAgentConsole(payload.req as AgentConsoleReq),
   agents_drive_repin: (payload) => {
     agentRows = agentRows.map((row) =>
       row.profileId !== payload.profileId || row.pin === null
@@ -8950,6 +9674,12 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
   agents_launch: () => mockAgentsLaunchWhenKnown(),
   agents_default_get: () => mockAgentsLaunch(),
   agents_default_set: mockAgentsDefaultSet,
+  // R455: this Mac's claims lease, kept for the page's life.
+  agents_claims_lease_get: () => mockClaimsLease,
+  agents_claims_lease_set: (payload: Record<string, unknown>) => {
+    mockClaimsLease = payload.lease === "quarter-hour" ? "quarter-hour" : "short";
+    return mockClaimsLease;
+  },
   // --- Voice, the talk mode (Epic 62, Story 62.6; Epic 67, AD-205) ---------
   //
   // A scripted turn so the mic control's states can be looked at in

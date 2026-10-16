@@ -33,29 +33,35 @@
  * round trip. Commands are off while editing (the text is that message's body)
  * and while attachments are pending (the text is their caption).
  */
-import { open } from "@tauri-apps/plugin-dialog";
-import { Paperclip, Plus, X } from "lucide-react";
+import { type DialogFilter, open } from "@tauri-apps/plugin-dialog";
+import { Camera, Image, Paperclip, Plus, X } from "lucide-react";
 import {
   type ClipboardEvent,
   type KeyboardEvent,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useRef,
   useState,
 } from "react";
+import { CameraSheet, photoFilename } from "@/components/chat/camera-sheet";
 import type { ChatCommandInvocation, ChatCommandOutcome } from "@/components/chat/chat-commands";
-import type { SlashRow } from "@/components/slash-menu/slash-menu";
+import { InlineSlashList } from "@/components/slash-menu/inline-slash-list";
+import { isCommandLine, type SlashRow } from "@/components/slash-menu/slash-menu";
 import { SlashHelp, SlashMenuList } from "@/components/slash-menu/slash-menu-list";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { IconHint } from "@/components/ui/tooltip";
+import { useInlineSlash } from "@/hooks/use-inline-slash";
 import { useShellLayout } from "@/hooks/use-shell-layout";
 import { useSlashMenu } from "@/hooks/use-slash-menu";
 import { logFailure, sayFailure } from "@/lib/failure";
 import { formatFileSize } from "@/lib/file-size";
 import {
   type ChatCommandPreviewVm,
+  type ChatInlinePreviewVm,
   chatCommandPreview,
+  chatInlinePreview,
   clearDraft,
   clearDraftMirror,
   type IpcError,
@@ -64,6 +70,7 @@ import {
   mirrorDraft,
   saveDraft,
 } from "@/lib/ipc/client";
+import { asShownPhoto } from "@/lib/shown-photo";
 import { attachmentId, type PendingAttachment } from "@/lib/stores/attachments";
 import type { PendingContext } from "@/lib/stores/composer";
 import {
@@ -95,7 +102,12 @@ function basename(path: string): string {
 export interface SendContext {
   accountId: string;
   roomId: string;
-  target: { mode: PendingContext["mode"]; targetKey: string } | null;
+  target: {
+    mode: PendingContext["mode"];
+    targetKey: string;
+    /** A reply an Undo gave back names its original by event (R447). */
+    eventId?: string;
+  } | null;
 }
 
 interface ComposerProps {
@@ -174,6 +186,11 @@ interface ComposerProps {
    * passes its own.
    */
   resolveCommand?: (draft: string, replying: boolean) => Promise<ChatCommandPreviewVm>;
+  /**
+   * What a `/` at the caret offers mid-text (Story 101.3). The default asks
+   * Rust about this room; a test passes its own.
+   */
+  resolveInline?: (before: string, after: string) => Promise<ChatInlinePreviewVm>;
 }
 
 /**
@@ -227,8 +244,14 @@ export function Composer({
   onSendEmote,
   onCommand,
   resolveCommand,
+  resolveInline,
 }: ComposerProps) {
   const [draft, setDraft] = useState("");
+  // Where the caret is, `null` while text is selected: the mid-text `/` menu is
+  // about the token right before it (Story 101.3).
+  const [caret, setCaret] = useState<number | null>(null);
+  // Where a mid-text insertion put the caret, applied once the field holds it.
+  const insertedCaret = useRef<number | null>(null);
   const [sending, setSending] = useState(false);
   // The surfaced send failure, or `null`. `terminal` is an `IpcError` with
   // `retriable: false` — a reply/edit target that vanished or can no longer be
@@ -245,6 +268,10 @@ export function Composer({
   // default wins). Everything is tier-gated on the shared layout hook — never
   // user-agent sniffing, never a forked composer.
   const { phone } = useShellLayout();
+  const [cameraOpen, setCameraOpen] = useState(false);
+  const [photoError, setPhotoError] = useState<string | null>(null);
+  const captureInput = useRef<HTMLInputElement>(null);
+  const photoInput = useRef<HTMLInputElement>(null);
   // The remote (cross-device) draft body currently offered as a local-wins conflict
   // chip (Story 7.2), or `null` when nothing is offered. Set when a differing remote
   // draft arrives against non-empty local text; cleared on adopt / when it stops
@@ -935,7 +962,12 @@ export function Composer({
     const context: SendContext = {
       accountId,
       roomId,
-      target: pending === null ? null : { mode: pending.mode, targetKey: pending.targetKey },
+      target:
+        pending === null
+          ? null
+          : pending.mode === "reply" && pending.eventId !== undefined
+            ? { mode: pending.mode, targetKey: pending.targetKey, eventId: pending.eventId }
+            : { mode: pending.mode, targetKey: pending.targetKey },
     };
     const text = draft.trim();
     if (!commandsEnabled || !text.startsWith("/")) {
@@ -968,13 +1000,49 @@ export function Composer({
     reportAs: "chat-command-preview",
   });
 
+  // The mid-text `/` (Story 101.3, R418): wherever the composer has a slash
+  // menu, except over a whole-line command, which is that menu's.
+  const inlineEnabled =
+    onCommand != null && onSendEmote != null && !(commandsEnabled && isCommandLine(draft));
+  const resolveInlineHere = useCallback(
+    (before: string, after: string) =>
+      resolveInline != null
+        ? resolveInline(before, after)
+        : chatInlinePreview(accountId, roomId, before, after),
+    [resolveInline, accountId, roomId],
+  );
+  const inline = useInlineSlash({
+    draft,
+    caret,
+    enabled: inlineEnabled,
+    resolve: resolveInlineHere,
+    onInsert: (next, at) => {
+      restoreConsumed.current = true;
+      insertedCaret.current = at;
+      setDraft(next);
+      setCaret(at);
+      if (pendingRef.current?.mode !== "edit") {
+        scheduleDraftSave(next);
+      }
+    },
+    reportAs: "chat-inline-preview",
+  });
+  useLayoutEffect(() => {
+    const at = insertedCaret.current;
+    const field = textareaRef.current;
+    if (at !== null && field !== null && field.value === draft) {
+      insertedCaret.current = null;
+      field.setSelectionRange(at, at);
+    }
+  }, [draft]);
+
   /** Open the native file picker and add each chosen path to the tray. */
-  async function pickFiles() {
+  async function pickFiles(filters?: DialogFilter[]) {
     if (!attachEnabled) {
       return;
     }
     try {
-      const selection = await open({ multiple: true });
+      const selection = await open({ multiple: true, filters });
       if (selection == null) {
         // Dialog cancelled → no-op.
         return;
@@ -991,6 +1059,29 @@ export function Composer({
     } catch (error) {
       // A dialog failure is non-fatal — the user can retry once told.
       sayFailure("composer.pickFiles", "keeper couldn't open the file picker.")(error);
+    }
+  }
+
+  async function readPhotos(input: HTMLInputElement) {
+    const files = Array.from(input.files ?? []);
+    setPhotoError(null);
+    try {
+      for (const file of files) {
+        // A HEIC or other picture a model is not shown goes as JPEG when this
+        // webview can decode it, else as it is (R444/05).
+        const photo = await asShownPhoto(file, file.name || photoFilename());
+        tray.getState().add({
+          id: attachmentId(),
+          kind: "bytes",
+          ...photo,
+          size: photo.bytes.byteLength,
+        });
+      }
+    } catch (raw) {
+      logFailure("composer.photo")(raw);
+      setPhotoError("keeper couldn't read this photo. Choose it again to retry.");
+    } finally {
+      input.value = "";
     }
   }
 
@@ -1046,7 +1137,7 @@ export function Composer({
   function onKeyDown(e: KeyboardEvent<HTMLTextAreaElement>) {
     // The open slash menu claims ↑/↓/Enter/Tab/Escape first; everything it does
     // not claim — and every key while it is closed — keeps its meaning below.
-    if (menu.onKeyDown(e)) {
+    if (menu.onKeyDown(e) || inline.onKeyDown(e)) {
       return;
     }
     if (e.key === "Escape" && pending) {
@@ -1163,6 +1254,7 @@ export function Composer({
       )}
       <div className="relative flex items-end gap-2">
         <SlashMenuList menu={menu} />
+        <InlineSlashList menu={inline} />
         {attachEnabled && pending?.mode !== "edit" && (
           <IconHint label="Attach file">
             <Button
@@ -1180,16 +1272,95 @@ export function Composer({
             </Button>
           </IconHint>
         )}
+        {attachEnabled && pending?.mode !== "edit" && (
+          <>
+            {(phone || typeof navigator.mediaDevices?.getUserMedia === "function") && (
+              <IconHint label="Take photo">
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  aria-label="Take photo"
+                  className={cn(phone && "size-11")}
+                  onClick={() => (phone ? captureInput.current?.click() : setCameraOpen(true))}
+                >
+                  <Camera aria-hidden="true" />
+                </Button>
+              </IconHint>
+            )}
+            <IconHint label="Choose photo">
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon"
+                aria-label="Choose photo"
+                className={cn(phone && "size-11")}
+                onClick={() =>
+                  phone
+                    ? photoInput.current?.click()
+                    : // A path the host sends as it is: a HEIC chosen here
+                      // reaches the agent with its host's note that its
+                      // format can't be shown to the model (R444/05).
+                      void pickFiles([
+                        {
+                          name: "Images",
+                          extensions: ["png", "jpg", "jpeg", "webp", "gif", "heic"],
+                        },
+                      ])
+                }
+              >
+                <Image aria-hidden="true" />
+              </Button>
+            </IconHint>
+            {phone && (
+              <>
+                <input
+                  ref={captureInput}
+                  type="file"
+                  accept="image/*"
+                  capture="environment"
+                  aria-label="Take a photo file"
+                  hidden
+                  onChange={(event) => void readPhotos(event.currentTarget)}
+                />
+                <input
+                  ref={photoInput}
+                  type="file"
+                  accept="image/*"
+                  multiple
+                  aria-label="Choose photo files"
+                  hidden
+                  onChange={(event) => void readPhotos(event.currentTarget)}
+                />
+              </>
+            )}
+            {cameraOpen && !phone && (
+              <CameraSheet
+                onClose={() => setCameraOpen(false)}
+                onPhoto={(photo) =>
+                  tray.getState().add({ id: attachmentId(), kind: "bytes", ...photo })
+                }
+              />
+            )}
+          </>
+        )}
         <Textarea
           ref={textareaRef}
           aria-label="Message"
-          {...menu.fieldProps}
+          {...(inline.open ? inline.fieldProps : menu.fieldProps)}
           placeholder="Write a message…"
           value={draft}
           disabled={disabled}
+          onSelect={(e) => {
+            const field = e.currentTarget;
+            setCaret(field.selectionStart === field.selectionEnd ? field.selectionStart : null);
+          }}
           onChange={(e) => {
             const next = e.target.value;
             setDraft(next);
+            setCaret(
+              e.target.selectionStart === e.target.selectionEnd ? e.target.selectionStart : null,
+            );
             // The user has typed into this composer; a late mount restore must not
             // clobber their input (even after they clear it back to empty). (Story 7.1)
             restoreConsumed.current = true;
@@ -1230,7 +1401,7 @@ export function Composer({
           // violet with the reserved `--incognito` token, overriding the base
           // ring/border color.
           className={cn(
-            "min-h-9 resize-none",
+            "min-h-9 min-w-0 flex-1 resize-none",
             phone ? "max-h-[calc(5*1.5rem+1rem)]" : "max-h-[calc(8*1.5rem+1rem)]",
             incognitoEffective && "focus-visible:border-incognito focus-visible:ring-incognito/50",
           )}
@@ -1249,6 +1420,11 @@ export function Composer({
           {pending?.mode === "edit" ? "Save" : "Send"}
         </Button>
       </div>
+      {photoError !== null && (
+        <p role="alert" className="text-destructive text-xs">
+          {photoError}
+        </p>
+      )}
       {unsavedDraft === `${accountId}\u0000${roomId}` && (
         <p role="alert" className="text-destructive text-xs">
           {DRAFT_NOT_SAVED}
@@ -1259,6 +1435,11 @@ export function Composer({
       {commandNote === null && menu.failure !== null && (
         <p role="alert" className="text-destructive text-xs">
           {menu.failure}
+        </p>
+      )}
+      {commandNote === null && menu.failure === null && inline.failure !== null && (
+        <p role="alert" className="text-destructive text-xs">
+          {inline.failure}
         </p>
       )}
       {commandNote !== null &&

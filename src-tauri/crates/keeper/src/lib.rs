@@ -307,6 +307,14 @@ fn same_folder(a: &std::path::Path, b: &std::path::Path) -> bool {
 /// starts this binary as a filter, and a filter must not open a window.
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // A person's PDF sent to an agent served here is read by this binary
+    // started again as a worker under its own bounds, and nothing else
+    // (R444/03, `keeper_agent::attachments::PdfReader`).
+    #[cfg(desktop)]
+    if let Some(code) = keeper_agent::attachments::served_as_pdf_reader(std::env::args_os().skip(1))
+    {
+        std::process::exit(code);
+    }
     if served_as_lfs_filter() {
         return;
     }
@@ -1080,6 +1088,10 @@ pub fn run() {
                 agents_ipc::agent_scope_set,
                 agents_ipc::agent_focus,
                 agents_ipc::agent_conversation_new,
+                // Story 101.1: ask the proxy for the person's DM (R416).
+                agents_ipc::agent_main_dm_open,
+                agents_ipc::agent_asks_subscribe,
+                agents_ipc::agent_asks_unsubscribe,
                 // Story 93.3: the approval card's decision and the own
                 // fingerprint, every target (the phone decides too).
                 agents_ipc::agent_approval_decide,
@@ -1096,6 +1108,9 @@ pub fn run() {
                 agents_ipc::agents_launch,
                 agents_ipc::agents_default_get,
                 agents_ipc::agents_default_set,
+                // R455: the claims lease Settings › Agents turns on.
+                agents_ipc::agents_claims_lease_get,
+                agents_ipc::agents_claims_lease_set,
                 // Voice (Story 62.4): every target, the port decides.
                 voice_ipc::voice_availability,
                 voice_ipc::voice_start,
@@ -1286,11 +1301,15 @@ pub fn run() {
                 // Story 100.5: the messenger's slash commands.
                 ipc::send_emote,
                 ipc::chat_command_preview,
+                // Story 101.3: a `/` in the middle of a message.
+                ipc::chat_inline_preview,
                 ipc::room_set_topic,
                 ipc::room_invite,
                 ipc::room_leave,
                 ipc::undo_send_window,
                 ipc::set_undo_send_window,
+                ipc::undo_send_agent_window,
+                ipc::set_undo_send_agent_window,
                 ipc::hotkey_get,
                 ipc::hotkey_set,
                 ipc::recording_hotkey_get,
@@ -1301,6 +1320,7 @@ pub fn run() {
                 ipc::subscribe_outbox,
                 ipc::unsubscribe_outbox,
                 ipc::send_reply,
+                ipc::send_reply_to_event,
                 ipc::edit_message,
                 ipc::toggle_reaction,
                 ipc::resolve_timeline_event_key,
@@ -1716,6 +1736,7 @@ pub fn run() {
         // An agent's model and level (100.2 #4, R382): a write of its
         // `agent.toml`, which only a Mac with the drive can make.
         agents_host::agents_model_set,
+        agents_host::agents_console_set,
         // `/model` in an agent's DM (100.5, DW-1431, R415): the same save,
         // so desktop-only like it; a phone's menu refuses `/model` first.
         agents_host::agent_model_command,
@@ -1727,6 +1748,12 @@ pub fn run() {
         agents_host::agents_mcp_remove,
         agents_host::agents_sandbox_get,
         agents_host::agents_sandbox_save,
+        // Each agent's *Web search* switch and this Mac's engine (101.4,
+        // R419): the switch is a save of `agent.toml` as the model's is,
+        // the engine device-local like the tables above.
+        agents_host::agents_web_search_set,
+        agents_host::agents_web_search_get,
+        agents_host::agents_web_search_save,
     );
     // The commands that touch a window or a file manager have `Unsupported`
     // twins so the handler list is identical on every target and

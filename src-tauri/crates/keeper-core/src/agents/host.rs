@@ -3,12 +3,15 @@
 //!
 //! It says what the host can do — its capabilities, its drives and how much
 //! of each is on disk, the bots it resolves, the agents it hosts — and is
-//! renewed every 60 s with an expiry 180 s ahead, so placement
-//! ([`crate::agents::placement`]) reads only hosts that are alive. A state
-//! event is not encrypted, so the manifest names no provider's address: a
-//! bot is its [`bot_id`], a digest of its reference (S-33).
+//! renewed every [`MANIFEST_RENEW_EVERY`] with an expiry [`MANIFEST_TTL`]
+//! ahead, so placement ([`crate::agents::placement`]) reads only hosts that
+//! are alive. It lives in the control room, never a session's, so its
+//! cadence is its own and not a session claim's (R416). A state event is not
+//! encrypted, so the manifest names no provider's address: a bot is its
+//! [`bot_id`], a digest of its reference (S-33).
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use chrono::DateTime;
 use matrix_sdk::ruma::{OwnedUserId, UserId};
@@ -22,6 +25,12 @@ use crate::agents::home::BotRef;
 
 /// How many hex digits of the reference's SHA-256 a bot id keeps.
 pub const BOT_ID_HEX: usize = 16;
+
+/// How often a host renews its manifest: placement's view of which hosts
+/// are alive follows it.
+pub const MANIFEST_RENEW_EVERY: Duration = Duration::from_secs(60);
+/// How long a manifest is live past its renewal.
+pub const MANIFEST_TTL: Duration = Duration::from_secs(180);
 
 /// `dev.keeper.agent.host`. A key this build does not know is ignored, so a
 /// newer host that adds one at the same `v` is still believed; a higher `v`
@@ -50,6 +59,12 @@ pub struct HostManifest {
     /// when nothing failed; a build that does not read it ignores it.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub picture_failures: BTreeMap<String, String>,
+    /// [`crate::agents::claim::QUARTER_HOUR_LEASE`] when this host reads and
+    /// writes a session's claim on the quarter-hour lease (R449). Absent from
+    /// a host built before it, whose presence keeps every holder on the
+    /// minute lease ([`crate::agents::claim::LeaseKind::for_fleet`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease: Option<String>,
 }
 
 /// A drive as one host has it.
@@ -186,6 +201,7 @@ mod tests {
             renewed_at: "2026-10-03T12:00:00Z".to_owned(),
             expires_at: "2026-10-03T12:03:00Z".to_owned(),
             picture_failures: Default::default(),
+            lease: None,
         }
     }
 

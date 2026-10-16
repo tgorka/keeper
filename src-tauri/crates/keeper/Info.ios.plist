@@ -22,6 +22,13 @@
 	<key>NSMicrophoneUsageDescription</key>
 	<string>keeper listens through the microphone only while you talk to a model you configured — after you tap Talk or say your wake phrase — and turns your words into text on this phone. Nothing is recorded or uploaded.</string>
 	<!--
+	  Epic 101, story 101.2: override the macOS camera sentence at the last
+	  merge step so the phone's permission prompt names this phone, not a Mac.
+	  This string MUST equal the one in `gen/apple/project.yml`.
+	-->
+	<key>NSCameraUsageDescription</key>
+	<string>keeper uses your camera only when you scan a setup code or take a photo for a chat on this phone. Setup scans stay local. A photo you take is sent only to the chat you send it in.</string>
+	<!--
 	  Story 63.4 gave the macOS bundle its own speech sentence, and the merge
 	  carried it onto the phone: the installed IPA's prompt read "into text on
 	  this Mac itself" on an iPhone, caught by install-ios.sh's own proof step

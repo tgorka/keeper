@@ -11,6 +11,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { InputGroup, InputGroupAddon } from "@/components/ui/input-group";
+import { NO_TEXT_SUBSTITUTION } from "@/lib/text-entry";
 import { cn } from "@/lib/utils";
 
 function Command({ className, ...props }: React.ComponentProps<typeof CommandPrimitive>) {
@@ -68,6 +69,8 @@ function CommandInput({
     <div data-slot="command-input-wrapper" className="p-1 pb-0">
       <InputGroup className="h-8! rounded-lg! *:data-[slot=input-group-addon]:pl-2!">
         <CommandPrimitive.Input
+          // No capital, correction or prediction (Story 101.3).
+          {...NO_TEXT_SUBSTITUTION}
           data-slot="command-input"
           className={cn(
             "w-full text-sm outline-hidden disabled:cursor-not-allowed disabled:opacity-50",

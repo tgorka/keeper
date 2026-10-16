@@ -11,12 +11,15 @@
  * It feeds the amber "Held" bubble at the timeline tail and the floating undo-send
  * pill(s) above the composer, both scoped to the open Chat.
  */
+import { useEffect } from "react";
 import { useStore } from "zustand";
-import { createStore, type StoreApi } from "zustand/vanilla";
+import { createStore } from "zustand/vanilla";
 import { logFailure } from "@/lib/failure";
-import type { HeldSendVm } from "@/lib/ipc/client";
+import type { HeldRestoreVm, HeldSendVm } from "@/lib/ipc/client";
 import { cancelHeldSend } from "@/lib/ipc/client";
-import type { ComposerState } from "@/lib/stores/composer";
+import { attachmentId } from "@/lib/stores/attachments";
+import { replyPreviewOf } from "@/lib/stores/composer";
+import type { ConversationStores } from "@/lib/stores/conversation-stores";
 
 /** The composite key for a chat: `` `${accountId} ${roomId}` ``. */
 function roomKey(accountId: string, roomId: string): string {
@@ -97,36 +100,142 @@ export const outboxStore = createStore<OutboxState>()((set) => ({
     }),
   clear: () => {
     holders.clear();
+    waiting.clear();
     set({ rooms: new Map<string, readonly HeldSendVm[]>() });
   },
 }));
 
+/** The stores an Undo puts a held send back into: one open conversation's. */
+type RestoreStores = Pick<ConversationStores, "composer" | "timeline" | "attachments">;
+
+/**
+ * Undo restores waiting for their room to be shown again (Story 101.3, R447),
+ * keyed by `` `${accountId} ${roomId}` ``: a cancel that resolves after the
+ * person left the room it was pressed in.
+ */
+const waiting = new Map<string, HeldRestoreVm[]>();
+/** The room each open conversation shows, by its stores: not state anyone renders. */
+const showing = new Map<RestoreStores, string>();
+/** Each shown conversation's take of the restores waiting for its room. */
+const drains = new Set<() => void>();
+
+/** How the reply banner names an original the timeline never showed (R447). */
+export const REPLY_UNSHOWN_SENDER = "an earlier message";
+
+/** Put `restored` back into `stores`, the conversation showing the room it was held in. */
+function putBack(
+  accountId: string,
+  roomId: string,
+  restored: HeldRestoreVm,
+  stores: RestoreStores,
+): void {
+  const composer = stores.composer.getState();
+  if (restored.line.length > 0) {
+    composer.restore(accountId, roomId, restored.line);
+  }
+  const reply = restored.reply;
+  if (reply !== null) {
+    // Named by its event, so the draft is still a reply even when the original is
+    // outside the loaded timeline (R447); the key is only this context's identity.
+    composer.startReply({
+      targetKey: reply.key ?? `event:${reply.eventId}`,
+      eventId: reply.eventId,
+      sender: reply.senderDisplayName ?? (reply.sender || REPLY_UNSHOWN_SENDER),
+      bodyPreview: replyPreviewOf(reply.body),
+    });
+  }
+  if (restored.attachment !== null) {
+    stores.attachments.getState().add({
+      id: attachmentId(),
+      kind: "path",
+      path: restored.attachment.path,
+      filename: restored.attachment.filename,
+    });
+  }
+}
+
 /**
  * Undo a held send (Story 8.3/8.4): the single shared effect behind BOTH the
  * undo-send pill's Undo and the timeline Delete affordance on a held bubble. Cancels
- * the durable `outbox` row via {@link cancelHeldSend} (zero network activity) and, only
- * when a non-empty body comes back, restores it into the `(accountId, roomId)` draft of
- * `composer` — the store of the conversation the undo was pressed in, the chat's or
- * the notes dock's.
+ * the durable `outbox` row via {@link cancelHeldSend} (zero network activity) and
+ * puts back what it held — the line as typed into the composer, a held reply's
+ * reply context (named by its event, loaded or not) and a held attachment's staged
+ * file into the tray (Story 101.3, R432) — into the room it was held in, and only
+ * there (R447): into `stores`, the conversation the undo was pressed in, while it
+ * still shows that room; otherwise it waits for the next conversation that shows
+ * that room ({@link useHeldRestores}). A cancel resolving after a room switch never
+ * lands in the room now open, so the next Send there carries nothing of it.
  *
  * `cancelHeldSend` is idempotent in Rust — an already-dispatched (window-elapsed) row
- * returns `""`, so nothing is restored. Errors are swallowed (mirrors the pill): a
- * failed cancel never crashes the affordance and never restores stale text. Keeping this
- * in one place stops the pill-undo and delete-undo from drifting apart.
+ * comes back empty, so nothing is restored. Errors are logged and swallowed (mirrors
+ * the pill): a failed cancel never crashes the affordance and never restores stale
+ * text. Keeping this in one place stops the pill-undo and delete-undo from drifting
+ * apart.
  */
 export async function undoHeldSend(
   accountId: string,
   roomId: string,
   id: string,
-  composer: StoreApi<ComposerState>,
+  stores: RestoreStores,
 ): Promise<void> {
-  const body = await cancelHeldSend(accountId, roomId, id).catch((raw: unknown) => {
+  const restored = await cancelHeldSend(accountId, roomId, id).catch((raw: unknown) => {
     logFailure("outbox.cancelHeldSend")(raw);
-    return "";
+    return null;
   });
-  if (body.length > 0) {
-    composer.getState().restore(accountId, roomId, body);
+  if (
+    restored === null ||
+    (restored.line.length === 0 && restored.reply === null && restored.attachment === null)
+  ) {
+    return;
   }
+  const key = roomKey(accountId, roomId);
+  if (showing.get(stores) === key) {
+    putBack(accountId, roomId, restored, stores);
+    return;
+  }
+  waiting.set(key, [...(waiting.get(key) ?? []), restored]);
+  for (const drain of [...drains]) {
+    drain();
+  }
+}
+
+/**
+ * A conversation shows `(accountId, roomId)` in `stores` (Story 101.3, R447): it
+ * receives the Undo restores held for that room — those that resolve while it shows
+ * it, and those that resolved while no conversation did. Call it after the effect
+ * that clears the conversation's composer and tray on a room switch, so what it
+ * puts back is not cleared away.
+ */
+export function useHeldRestores(
+  accountId: string | null,
+  roomId: string | null,
+  stores: RestoreStores,
+): void {
+  useEffect(() => {
+    if (accountId === null || roomId === null) {
+      return;
+    }
+    const key = roomKey(accountId, roomId);
+    showing.set(stores, key);
+    const drain = () => {
+      const restores = waiting.get(key);
+      if (restores === undefined) {
+        return;
+      }
+      waiting.delete(key);
+      for (const restored of restores) {
+        putBack(accountId, roomId, restored, stores);
+      }
+    };
+    drain();
+    drains.add(drain);
+    return () => {
+      drains.delete(drain);
+      if (showing.get(stores) === key) {
+        showing.delete(stores);
+      }
+    };
+  }, [accountId, roomId, stores]);
 }
 
 /**

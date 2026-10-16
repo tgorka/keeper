@@ -2,6 +2,7 @@
 import type { DefaultAgentChoiceVm } from "./DefaultAgentChoiceVm";
 import type { LaunchRoomVm } from "./LaunchRoomVm";
 import type { LaunchView } from "./LaunchView";
+import type { MainDmAskVm } from "./MainDmAskVm";
 
 /**
  * What keeper opens at launch, and the default agent as Settings shows it.
@@ -40,4 +41,15 @@ choices: Array<DefaultAgentChoiceVm>,
  * so and names the file ([`file_set_sentence`]). A choice made here is
  * still stored, and takes effect once the file stops setting the key.
  */
-fileSet: string | null, };
+fileSet: string | null, 
+/**
+ * The default agent, when it is one of the person's own proxies with no
+ * `main` room here: at launch keeper asks it for one and opens it when
+ * it lands (R416).
+ */
+ask: MainDmAskVm | null, 
+/**
+ * Every own proxy with no `main` room here: what the notes Assistant
+ * offers to ask (101.1 #5).
+ */
+askable: Array<MainDmAskVm>, };

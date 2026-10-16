@@ -45,7 +45,9 @@ export function RoomAvatar({ room, size }: RoomAvatarProps) {
   return (
     <Avatar size={size}>
       {picture !== null && <AvatarImage src={picture} alt="" />}
-      <AvatarFallback>{roomInitials(room.displayName)}</AvatarFallback>
+      {/* An agent room's letter is its agent's initial (Rust's `agentMark`,
+          story 101.1), never the initials of a titled room's name. */}
+      <AvatarFallback>{room.agentMark ?? roomInitials(room.displayName)}</AvatarFallback>
       {/* Bridged-Network badge (Story 4.6, FR-24): a uniform 16 px neutral chip
           overlaid bottom-right, showing the Network label's first code point (labels
           are ASCII protocol names like Telegram/Signal). Same neutral color for every

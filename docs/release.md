@@ -212,7 +212,13 @@ build; a value that is not a sha is ignored with a warning rather than believed.
    notarizes the `aarch64-apple-darwin` `.dmg`, then checks the uncompressed
    `.app` contents and frontend assets **before** creating/uploading the draft.
    Companion syncd uploads require this job to succeed and each packaged daemon
-   to pass its own credential check.
+   to pass its own credential check. keeper-agentd does **not** wait for it: that
+   job fails on every tag here (no notarization material, D-1) and the app ships
+   from the Mac (`release-macos.sh`, above), so the `agentd-release` job finds the
+   tag's release or makes it as a draft, and both `keeper-agentd-<target>`
+   builds attach their binary, `.sha256` and `.sig` to it once they pass their
+   own credential scan, systemd-unit check and signature check (DW-1500).
+   `release-macos.sh` then uploads the app's assets into that same release.
 5. Review the draft, all release jobs, egress diff, artifact inventory and the
    [credential gates](#observability-and-credential-release-gates), then **publish it**.
    A failed gate is a publication blocker for the maintainer. Workflow ordering
@@ -293,6 +299,7 @@ build was inert.
 | CI `build`: synthetic management-env canary | `POSTHOG_PERSONAL_API_KEY=KEEPER_PRIVILEGED_KEY_MUST_NOT_SHIP_71` is supplied only as a noncredential to the real app build; scanner requires absence from `dist`, the release `keeper` executable and staged `keeper-rec` |
 | Release app pre-upload gate | `scripts/posthog/release-build.mjs` is tauri-action's build runner. It runs Tauri, requires real executable `Contents/MacOS/keeper` and `keeper-rec`, scans `dist` and all regular files in the actual uncompressed `.app`, and returns failure before tauri-action can upload assets |
 | Release companion gate | Both Linux and macOS syncd jobs require app-job success, scan `src-tauri/keeper-syncd-$TARGET` after packaging, then attach it and its checksum to the existing draft; no fallback release creation |
+| Release agentd gate | Independent of the app job: `agentd-release` finds the tag's release or makes a draft; each Linux target scans `src-tauri/keeper-agentd-$TARGET`, verifies the systemd unit, signs with the updater key and checks the signature (and that a flipped byte fails) before attaching the binary, `.sha256` and `.sig` |
 | `posthog.yml` manual operations | Secret-free preflight verifies required `tgorka` reviewer and a single `main` branch policy before the protected personal-key job can start. Main-only trusted checkout and reviewed manifest hash required for apply/smoke. Not a PR status check; never runs with PR code |
 | Egress release note | Diff `docs/egress.md` against the preceding tag and review all changed destinations/consent boundaries |
 
@@ -317,6 +324,10 @@ Before publishing:
 
 - [ ] App and **both** syncd targets passed their artifact gates; draft contains
   the expected signed app/updater assets and daemon/checksum pairs.
+- [ ] **Both** keeper-agentd targets passed and the release carries
+  `keeper-agentd-<target>`, `.sha256` and `.sig` for each — makistack's
+  `keeper_agentd` role downloads it by URL, which a draft's asset does not
+  answer until the release is published.
 - [ ] Downloaded distribution contents were unpacked/mounted, scanned and
   checked for signing, version and expected sidecar contents.
 - [ ] Review the egress diff and confirm fresh-install default-off, separate

@@ -38,4 +38,13 @@ heldAtMs: number,
  * the frontend computes its countdown from this so a resumed Chat picks up the
  * correct remaining time after a restart.
  */
-dispatchAtMs: number, };
+dispatchAtMs: number, 
+/**
+ * A held attachment's file name (Story 101.3, R432): the body is then
+ * its caption, possibly empty.
+ */
+filename: string | null, 
+/**
+ * Whether it is a reply (Story 101.3, R432).
+ */
+reply: boolean, };

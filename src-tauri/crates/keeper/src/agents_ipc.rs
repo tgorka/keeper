@@ -15,14 +15,16 @@ use std::sync::Mutex;
 
 use keeper_agent::surface::{drive_of, locate, Located};
 use keeper_core::agents::approval_card::{ApprovalDecideReq, ApprovalPayloadVm};
+use keeper_core::agents::claim::ClaimsLease;
 use keeper_core::agents::events::{Focus, PresencePlatform, SurfaceOutcome};
-use keeper_core::agents::launch::{self, AgentsLaunchVm};
+use keeper_core::agents::launch::{self, AgentsLaunchVm, LaunchRoomVm};
 use keeper_core::agents::proxy::{AgentFocusReq, ProxyRoomVm};
 use keeper_core::agents::spoken::{FollowSlot, SpokenStep};
 use keeper_core::agents::surface::{
     SurfaceAnswerReq, SurfaceRequestArrived, SurfaceRequestVm, CANNOT_SHOW,
 };
 use keeper_core::bots::voice_target;
+use keeper_core::error::CoreError;
 use keeper_core::notes::outline::{heading_at, heading_in};
 use keeper_core::panels::PanelTargetVm;
 use keeper_core::vm::{IpcError, IpcErrorCode, VoiceAgentTargetVm};
@@ -198,13 +200,17 @@ pub async fn agent_surface_result(
 
 /// The person's proxy conversations on `account_id`, the DM first; each with
 /// the drives its scope chip may offer where the proxy's agents zone is on
-/// this device.
+/// this device, and its state as its Agents window row says it (story
+/// 101.6, R453).
 #[tauri::command]
 pub async fn agent_rooms_list(
     state: State<'_, AppState>,
     account_id: String,
 ) -> Result<Vec<ProxyRoomVm>, IpcError> {
-    Ok(state.accounts.agent_rooms(&account_id).await)
+    Ok(state
+        .accounts
+        .agent_rooms_attended(&state.platform, &account_id)
+        .await)
 }
 
 /// Ask the proxy in `room_id` for `drives` in scope (the scope chip).
@@ -303,6 +309,68 @@ pub async fn agent_conversation_new(
         .agent_conversation_new(&account_id, &room_id, title)
         .await
         .map_err(to_ipc_error)
+}
+
+/// Open the person's `main` DM with `agent` on `account_id` (story 101.1,
+/// R416): the room when it is here, else the agent's host is asked through
+/// the control room and the room is answered once it lands, within 30 s.
+/// Every way it does not open is keeper-core's sentence (and its WARN line),
+/// carried as the message so the webview shows it as said.
+#[tauri::command]
+pub async fn agent_main_dm_open(
+    state: State<'_, AppState>,
+    account_id: String,
+    agent: String,
+) -> Result<LaunchRoomVm, IpcError> {
+    state
+        .accounts
+        .agent_main_dm_open(&account_id, &agent)
+        .await
+        .map_err(|error| match error {
+            CoreError::Unsupported(sentence) => IpcError {
+                code: IpcErrorCode::Unsupported,
+                message: sentence,
+                account_id: Some(account_id.clone()),
+                retriable: false,
+            },
+            other => to_ipc_error(other),
+        })
+}
+
+/// Follow the questions waiting for the person that are answered in
+/// `room_id` (Story 101.3, R430, R431): a snapshot now, then one whenever an
+/// agent's session room this account reads, or this room's held sends or
+/// send queue, change. Every decision — which asks wait, where each is
+/// answered, where its answer stands, what keeper could not read — is
+/// `keeper_core::agents::waiting`'s. Returns the subscription id.
+#[tauri::command]
+pub async fn agent_asks_subscribe(
+    state: State<'_, AppState>,
+    account_id: String,
+    room_id: String,
+    channel: Channel<keeper_core::agents::waiting::AgentAsksVm>,
+) -> Result<u64, IpcError> {
+    let sink =
+        Box::new(move |asks: keeper_core::agents::waiting::AgentAsksVm| channel.send(asks).is_ok());
+    state
+        .accounts
+        .subscribe_agent_asks(&state.platform, &account_id, &room_id, sink)
+        .await
+        .map_err(to_ipc_error)
+}
+
+/// End one [`agent_asks_subscribe`]. Idempotent.
+#[tauri::command]
+pub async fn agent_asks_unsubscribe(
+    state: State<'_, AppState>,
+    account_id: String,
+    subscription_id: u64,
+) -> Result<(), IpcError> {
+    state
+        .accounts
+        .unsubscribe_agent_asks(&account_id, subscription_id)
+        .await;
+    Ok(())
 }
 
 /// The person's decision on the approval card `req` names in the session
@@ -423,6 +491,41 @@ pub async fn agents_default_set(
             account_id: None,
             retriable: false,
         })
+}
+
+/// The lease this Mac takes a session's claim on while it hosts the
+/// person's agents (R455), as it reads now — a settings file that sets
+/// `agents.claims_lease` included. Absent or unreadable is `short`.
+#[tauri::command]
+pub async fn agents_claims_lease_get(state: State<'_, AppState>) -> Result<ClaimsLease, IpcError> {
+    let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        keeper_core::registry::get_agents_claims_lease(&data_dir)
+    })
+    .await
+    .map_err(|error| to_ipc_error(CoreError::Internal(error.to_string())))?
+    .map_err(to_ipc_error)
+}
+
+/// Store this Mac's claims lease and answer with it as it now reads (a
+/// settings file may still decide it). The host reads it at its next scan;
+/// a failure is a WARN line (R381).
+#[tauri::command]
+pub async fn agents_claims_lease_set(
+    state: State<'_, AppState>,
+    lease: ClaimsLease,
+) -> Result<ClaimsLease, IpcError> {
+    let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        keeper_core::registry::set_agents_claims_lease(&data_dir, lease)?;
+        keeper_core::registry::get_agents_claims_lease(&data_dir)
+    })
+    .await
+    .map_err(|error| to_ipc_error(CoreError::Internal(error.to_string())))?
+    .map_err(|error| {
+        tracing::warn!(%error, "agents: the claims lease was not saved");
+        to_ipc_error(error)
+    })
 }
 
 /// The send and then the following of the answer to the voice turn's

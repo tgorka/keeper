@@ -388,6 +388,7 @@ fn told(
         &host.dirs.data,
         &slug,
         &inspection.drives,
+        &config.drives,
         &rows,
         home,
     )
