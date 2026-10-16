@@ -48,6 +48,7 @@ use keeper_core::recording::{
     SessionState, RECORDING_MIN_FREE_BYTES, RECORDING_WARN_FREE_BYTES, RECOVERY_MAX_DEPTH,
     RECOVERY_MAX_VISITS,
 };
+use keeper_core::telemetry::MicLossCause;
 use keeper_core::vm::{
     AccountVm, ApprovalDraftVm, AutoUpdateVm, BackupStatus, BbctlAvailabilityVm, BbctlProgressVm,
     BridgeDiscoveryVm, BridgeHealthSnapshot, BridgeLoginInput, BridgeLoginVm, BridgeNetworkVm,
@@ -6660,6 +6661,15 @@ struct RecordingSink {
     /// no `archive.db` open. Shared with the status path's durability reader —
     /// same session, same row, one place that knows how to describe it.
     archive: Option<Arc<RecordingArchiveSession>>,
+    /// Reports a microphone loss the machine accepted. A closure so the sink
+    /// unit-tests without the app's managed telemetry; production hands it to
+    /// [`keeper_core::telemetry::Telemetry::capture_mic_lost`].
+    mic_lost: Box<dyn FnMut(MicLossCause) + Send>,
+    /// Which causes this session already reported, indexed by the cause. The
+    /// sidecar repeats a loss — a failed fallback sends a second `micLost`,
+    /// silence and loss re-arm when audio returns — and the count is of
+    /// sessions that lost the microphone for a cause, not of warning lines.
+    mic_lost_reported: [bool; 3],
 }
 
 impl RecordingSink {
@@ -6678,6 +6688,10 @@ impl RecordingSink {
             crate::debug_log::session_event(self.manifest.folder(), &format!("{event:?}"));
         }
         let segment = segment_ledger_entry(&event);
+        let mic_loss = match &event {
+            RecordingEvent::Warning { code, .. } => MicLossCause::from_warning_code(code),
+            _ => None,
+        };
         // Machine + snapshot fold, plus the Story 18.4 onset-deduped fault/
         // warning notification (see `fold_recording_event`).
         if !fold_recording_event(
@@ -6687,6 +6701,13 @@ impl RecordingSink {
             event,
         ) {
             return;
+        }
+        // Only a warning the machine accepted counts: one before capture
+        // started or after the session settled is not a recording's loss.
+        let first = mic_loss.filter(|&cause| !self.mic_lost_reported[cause as usize]);
+        if let Some(cause) = first {
+            self.mic_lost_reported[cause as usize] = true;
+            (self.mic_lost)(cause);
         }
         if let Some(entry) = segment {
             // The absolute path is built from the ledger entry, before it moves
@@ -7388,6 +7409,7 @@ impl RecordingArchiveSession {
 pub async fn recording_start(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
+    telemetry: State<'_, Arc<keeper_core::telemetry::Telemetry>>,
     target: Option<RecordingTargetVm>,
     system_audio: Option<bool>,
     microphone_enabled: Option<bool>,
@@ -7793,6 +7815,9 @@ pub async fn recording_start(
     // above holds the other `Arc` — one session, one row, two writers of it —
     // so this is the last use and moves rather than clones.
     let task_archive = archive;
+    // A content-free count of microphone losses, gated by diagnostics consent
+    // inside telemetry; the sink decides only which losses are new.
+    let task_telemetry = Arc::clone(telemetry.inner());
     // What the driver task needs to run a recordings-index refresh that a
     // trigger deferred while this session recorded (the archive follows every
     // recordings root) — cloned out now, because the task outlives this call.
@@ -7815,6 +7840,8 @@ pub async fn recording_start(
             platform: task_platform.clone(),
             sync,
             archive: task_archive,
+            mic_lost: Box::new(move |cause| task_telemetry.capture_mic_lost(cause)),
+            mic_lost_reported: [false; 3],
         };
         let sink = Box::new(move |event: RecordingEvent| sink_state.handle(event))
             as Box<dyn FnMut(RecordingEvent) + Send>;
@@ -12226,6 +12253,24 @@ pub fn auto_update_set(
         effective,
         BACKGROUND_UPDATE_SUPPORTED,
     ))
+}
+
+/// Whether this device's log goes to the config repository daily
+/// (`diagnostics.log_upload`), as a layer file leaves it in force.
+#[tauri::command]
+pub fn log_upload_get(state: State<'_, AppState>) -> Result<bool, IpcError> {
+    let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
+    keeper_core::registry::get_log_upload(&data_dir).map_err(to_ipc_error)
+}
+
+/// Set the daily log upload, and answer with the effective value: persist,
+/// then re-read, so a `keeper.toml` pin makes the switch visibly refuse to
+/// move instead of promising an upload that will not happen.
+#[tauri::command]
+pub fn log_upload_set(state: State<'_, AppState>, enabled: bool) -> Result<bool, IpcError> {
+    let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
+    keeper_core::registry::set_log_upload(&data_dir, enabled).map_err(to_ipc_error)?;
+    keeper_core::registry::get_log_upload(&data_dir).map_err(to_ipc_error)
 }
 
 /// Whether keeper may restart itself into a build that is installed and waiting
@@ -18290,6 +18335,8 @@ mod tests {
             platform: Arc::new(CapturingPlatform::new()),
             sync,
             archive,
+            mic_lost: Box::new(|_: MicLossCause| {}),
+            mic_lost_reported: [false; 3],
         }
     }
 
@@ -18387,6 +18434,63 @@ mod tests {
             Some(7.0),
             "the terminal reconcile kept the host-clock bounds by index"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A sink whose microphone-loss reports land in the returned list.
+    fn mic_loss_sink(folder: &Path) -> (RecordingSink, Arc<Mutex<Vec<MicLossCause>>>) {
+        let reported = Arc::new(Mutex::new(Vec::new()));
+        let mut sink = recording_sink_in(folder, None);
+        let into = Arc::clone(&reported);
+        sink.mic_lost = Box::new(move |cause: MicLossCause| {
+            into.lock().expect("reports").push(cause);
+        });
+        (sink, reported)
+    }
+
+    fn warning(code: &str) -> RecordingEvent {
+        RecordingEvent::Warning {
+            code: code.to_owned(),
+            message: "microphone disconnected".to_owned(),
+        }
+    }
+
+    /// The sidecar repeats a loss (a failed fallback re-sends `micLost`,
+    /// silence re-arms): each cause is reported once per session, in the
+    /// order the session first hit it.
+    #[test]
+    fn a_session_reports_each_microphone_loss_cause_once() {
+        let root = scan_temp_dir("rec-mic-loss-once");
+        let (mut sink, reported) = mic_loss_sink(&root.join("session"));
+        sink.handle(RecordingEvent::PreflightStarted);
+        sink.handle(RecordingEvent::CaptureStarted);
+        for code in ["micLost", "micLost", "micStalled", "micSilent", "micSilent"] {
+            sink.handle(warning(code));
+        }
+        assert_eq!(
+            *reported.lock().expect("reports"),
+            [
+                MicLossCause::Removed,
+                MicLossCause::Stalled,
+                MicLossCause::Silent
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Only a microphone warning the machine accepted counts: one before
+    /// capture started is rejected, and a camera loss is not a microphone's.
+    #[test]
+    fn a_rejected_or_unrelated_warning_reports_no_microphone_loss() {
+        let root = scan_temp_dir("rec-mic-loss-none");
+        let (mut sink, reported) = mic_loss_sink(&root.join("session"));
+        sink.handle(RecordingEvent::PreflightStarted);
+        sink.handle(warning("micLost"));
+        sink.handle(RecordingEvent::CaptureStarted);
+        sink.handle(warning("cameraLost"));
+        assert!(reported.lock().expect("reports").is_empty());
+        sink.handle(warning("micLost"));
+        assert_eq!(*reported.lock().expect("reports"), [MicLossCause::Removed]);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -19367,6 +19471,8 @@ mod tests {
             platform: Arc::new(CapturingPlatform::new()),
             sync: None,
             archive: None,
+            mic_lost: Box::new(|_: MicLossCause| {}),
+            mic_lost_reported: [false; 3],
         }
     }
 

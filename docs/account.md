@@ -502,6 +502,8 @@ keeper-config.git/
     devices/
       macbook.toml               # name, class, platform, created, machine (a fingerprint, below), version, commit, updated
       iphone-3f2a.toml
+    logs/
+      macbook.log                # the newest 512 KB of this device's keeper.log (keeper replaces it, below)
 ```
 
 `user.toml`, as keeper writes it:
@@ -569,14 +571,16 @@ Settings › Account shows *keeper 0.8.33* beside each device that records one.
    `docs/transcription.md`.
 
 **The rules keeper keeps:**
-- **Create-only, except six files and three keys.** A file that already exists is never
+- **Create-only, except seven files and three keys.** A file that already exists is never
   re-copied or rewritten, apart from the six files keeper keeps in step, directly in your
   `<login>/`: `settings.toml`, `settings.<device>.toml`, `drives.toml`, `bots.toml`,
-  `matrix.toml` and `device.<device>.toml`, and this device's `devices/<device>.toml`,
-  where only `version`, `commit` and `updated` ever change. Only the device a
-  `device.<device>.toml` or `devices/<device>.toml` names ever writes it. `user.toml`,
-  `keeper.toml` and `keeper.<device>.toml` are never rewritten. At one of these names, a
-  symbolic link, a folder, or a path under a file is refused, never written through.
+  `matrix.toml` and `device.<device>.toml`; this device's log, `logs/<device>.log` (see
+  *This device's log*), which each upload replaces whole; and this device's
+  `devices/<device>.toml`, where only `version`, `commit` and `updated` ever change. Only
+  the device a `device.<device>.toml`, `logs/<device>.log` or `devices/<device>.toml` names
+  ever writes it. `user.toml`, `keeper.toml` and `keeper.<device>.toml` are never
+  rewritten. At one of these names, a symbolic link, a folder, or a path under a file is
+  refused, never written through.
 - **Your directory only.** Only paths under your own `<login>/` are ever written or staged.
   Any other path, and any absolute path or path with `..`, is refused before it reaches
   git.
@@ -603,10 +607,55 @@ Settings › Account shows *keeper 0.8.33* beside each device that records one.
   does not restore itself (DW-318). On Linux and Windows, reinstalling the operating system
   gives a new machine id; reinstalling keeper does not.
 - **Renaming later.** Settings › Account › *Rename* moves this device's files (its record,
-  `keeper.<device>.toml`, `settings.<device>.toml` and `device.<device>.toml`) in one
-  commit.
+  `keeper.<device>.toml`, `settings.<device>.toml`, `device.<device>.toml` and
+  `logs/<device>.log`) in one commit.
 - **The class.** `desktop` on macOS, Linux and Windows. On iOS, `tablet` on an iPad and
   `mobile` otherwise.
+
+### This device's log
+
+keeper publishes the newest part of this device's `keeper.log` to
+`<login>/logs/<device>.log`, so a failure on one person's machine (a recording whose
+microphone went away, a sync that would not finish) can be read without asking them for
+the file.
+
+- **What it holds.** A two-line header naming the device, the keeper release and the commit
+  it was built from, then the last 512 KB of the log (the newest rotated file followed by
+  the live one), cut at a line. When neither file holds a line yet, nothing is uploaded.
+- **What is taken out.** The log is not free of secrets by itself: a git diagnostic, for
+  one, can quote a repository's address whole. So before it leaves the device, every line,
+  old ones included, is scrubbed: your home folder is written as `~`; a web address's user
+  name and password become `***` (`https://***@host`); so does the value of a query or
+  fragment parameter named `token`, `access_token`, `refresh_token`, `id_token`, `code`,
+  `password`, `passwd`, `secret`, `key`, `api_key`, `sig`, `signature` or `auth`, or ending
+  in one of them as its own word (`client_secret`, `X-Amz-Signature`, `apiKey`, but not
+  `monkey`); and the value after `Authorization:` (a known scheme such as `Bearer` stays in
+  front of it), `Bearer` or `Basic`.
+- **What stays.** Everything else the log says: your account and Matrix ids, the names of
+  your devices and microphones, folders outside your home folder, and the text of errors.
+- **When.** Once a day while **Send this device's log to your account daily** (Settings ›
+  About, the setting `diagnostics.log_upload`) is on, which it is unless you switch it off
+  (see *Keeping up in the background*); and at once when you press **Send log now** beside
+  it, whatever the switch says. The button answers under itself: where the log went, that
+  nothing was new since the last upload, that there is no log yet, that the device must be
+  signed in first, that `<login>/` in the repository is not yours, or why the repository
+  did not take it. A sign-out or *Forget* while it runs stops it, and the answer says so;
+  what already reached the repository stays there.
+- **How.** Each upload replaces the file whole, as `<login>: <device> log`, and only while
+  the repository's `<login>/user.toml` records you: it is checked again on the very tip the
+  upload commits on, so a directory given to someone else since the last sync gets nothing.
+  The file carries no upload time, so a log that gained no line since the last upload
+  commits nothing. A log file that is there and cannot be read stops the upload rather than
+  replacing the repository's copy with less.
+- **What it never changes.** A repository that refuses the upload's token gets one
+  refreshed token and one more try; a refusal after that is only the upload's answer. It
+  does not disconnect the repository or change what Settings › Account says.
+- **Who can read it.** Everyone with access to the repository, as for every other file in
+  your directory (see *Who can change your settings*).
+- **Switching it off** stops the daily upload on every device you sign in on, because the
+  setting travels in `settings.toml`. To keep it on one device only, pin it in that
+  device's `keeper.<device>.toml`. Switching it off does not remove the file already in
+  the repository.
 
 ### Transport
 
@@ -668,9 +717,9 @@ other layer files' faults.
 
 Your preferences, the drives you sync, your bot providers and your Matrix accounts follow
 you from device to device through your directory in the config repository. keeper keeps
-six files there in step with your devices. They are the only files it ever rewrites. One
-of them describes this device so completely that a reinstalled device restores itself
-from it.
+six files there in step with your devices. Apart from this device's log (see *This
+device's log*), they are the only files it ever rewrites. One of them describes this
+device so completely that a reinstalled device restores itself from it.
 
 ### The two settings files
 
@@ -989,6 +1038,19 @@ day, even if you never open it.
   syncs when you open it (DW-314).
 - keeper-syncd, the Linux background service, does not use the account, and does not pull
   the config repository.
+
+While the daily log upload is on (see *This device's log*), every sync, the background one
+included, looks for `<login>/logs/<device>.log` in the repository. When it is not there
+(never uploaded, or deleted since), the sync uploads this device's newest log, after your
+settings. When it is there, the sync uploads once a day has passed both since the file
+last changed in the repository and since this run of keeper last found it up to date — so
+a quiet log, whose unchanged bytes commit nothing, is checked once a day and once per
+launch, not at every sync. Only a device already registered uploads. An upload that fails
+is a `WARN` line in `keeper.log` and is tried again at the next sync; it never becomes the
+account's problem, and Settings › Account does not show it. The one exception is not
+about the log: when the repository turns out to record someone else in `<login>/`, nothing
+is uploaded, and Settings › Account says the account is blocked, as any sync that finds it
+does.
 
 ## Signing out, and forgetting the account
 
@@ -1576,6 +1638,7 @@ that person's other devices of the same class has one. Both are optional and use
 | Your preferences | `<login>/settings.toml` (every device), `<login>/settings.<device>.toml` (this device) |
 | Your drives, bot providers and Matrix accounts | `<login>/drives.toml`, `<login>/bots.toml`, `<login>/matrix.toml` |
 | This device, so it can be restored | `<login>/device.<device>.toml` (written only by that device) |
+| This device's log | `<login>/logs/<device>.log` (written only by that device); daily while `diagnostics.log_upload` is on, and on *Send log now* |
 | Settings templates (optional) | `_template/settings.toml`, `_template/settings/<class>.toml` |
 | What this device last synced | settings keys `account.<id>.settings_base.shared`, `account.<id>.settings_base.device` (keeper-owned; cleared by *Forget this account*) |
 | Whether this device has restored itself, and what waits | settings keys `account.<id>.restored`, `account.<id>.restore_pending`, `account.<id>.restore_matrix_started` (keeper-owned; cleared by *Forget this account*) |

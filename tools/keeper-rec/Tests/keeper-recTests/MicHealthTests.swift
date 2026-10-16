@@ -100,7 +100,7 @@ final class MicHealthTests: XCTestCase {
             micEnabled: true, removedDeviceId: nil, activeDeviceId: "mic-A",
             fallbackAvailable: true, cause: .stalled)
         XCTAssertTrue(decision.shouldWarn)
-        XCTAssertEqual(decision.code, MicHealth.warningCode)
+        XCTAssertEqual(decision.code, "micStalled")
         XCTAssertEqual(decision.message, MicHealth.stalledMessage)
         XCTAssertTrue(decision.fallbackToDefault)
     }

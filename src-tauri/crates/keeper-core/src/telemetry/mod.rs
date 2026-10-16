@@ -1,5 +1,6 @@
 //! Optional, local-consent observability. No app-log subscriber, account state,
-//! arbitrary attributes, error messages or recording operations enter this module.
+//! arbitrary attributes, error messages or recording content enter this module;
+//! the one recording signal is a closed microphone-loss cause ([`MicLossCause`]).
 mod wire;
 
 use std::collections::VecDeque;
@@ -100,6 +101,42 @@ impl TelemetrySurface {
             Self::SlashMenuOpened => "slash_menu_opened",
             Self::SlashMenuChosen => "slash_menu_chosen",
             Self::LaunchDefaultAgent => "launch_default_agent",
+        }
+    }
+}
+
+/// Why a recording lost its microphone, exported as the `cause` property of
+/// `keeper_recording_mic_lost`. Raised by the shell, never the webview, so it
+/// has no serde or TypeScript form. A closed set: never the device name, the
+/// sidecar's message or anything about the recording itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MicLossCause {
+    /// The microphone went away (unplugged, or its fallback failed).
+    Removed,
+    /// The microphone stayed attached but stopped delivering audio.
+    Stalled,
+    /// The microphone delivered only digital silence.
+    Silent,
+}
+
+impl MicLossCause {
+    /// Maps a recording sidecar warning code to its cause. Any other code
+    /// (camera, echo cancellation, segments, unknown) is not a microphone loss.
+    pub fn from_warning_code(code: &str) -> Option<Self> {
+        match code {
+            "micLost" => Some(Self::Removed),
+            "micStalled" => Some(Self::Stalled),
+            "micSilent" => Some(Self::Silent),
+            _ => None,
+        }
+    }
+
+    /// The value exported as the event's `cause` property.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Removed => "removed",
+            Self::Stalled => "stalled",
+            Self::Silent => "silent",
         }
     }
 }
@@ -290,6 +327,7 @@ fn unix_nanos() -> u64 {
 #[derive(Clone, Copy)]
 enum Operation {
     Frontend(TelemetryEventKind),
+    MicLost(MicLossCause),
     RemoteConfig,
     FlagsRequest,
 }
@@ -298,6 +336,7 @@ impl Operation {
     fn name(self) -> &'static str {
         match self {
             Self::Frontend(kind) => kind.name(),
+            Self::MicLost(_) => "keeper_recording_mic_lost",
             Self::RemoteConfig => "keeper.remote_config",
             Self::FlagsRequest => "keeper.flags_request",
         }
@@ -332,6 +371,23 @@ impl Record {
             span_id: random_id::<8>(),
             parent_span_id: None,
             outcome: u32::from(event.kind == TelemetryEventKind::FrontendError),
+        }
+    }
+
+    /// A count with no duration: the span has zero length and no outcome
+    /// error, since a lost microphone is a warning the recording survives.
+    fn mic_lost(cause: MicLossCause) -> Self {
+        let end = unix_nanos();
+        Self {
+            operation: Operation::MicLost(cause),
+            duration_ms: None,
+            surface: None,
+            start: end,
+            end,
+            trace_id: random_id::<16>(),
+            span_id: random_id::<8>(),
+            parent_span_id: None,
+            outcome: 0,
         }
     }
 
@@ -482,26 +538,39 @@ impl Telemetry {
 
     pub fn capture(&self, event: TelemetryEventReq) -> Result<(), TelemetryError> {
         event.validate()?;
+        self.enqueue(event.kind.diagnostic(), || Record::frontend(event));
+        Ok(())
+    }
+
+    /// The shell's microphone-loss count, under the same diagnostics consent,
+    /// rate limit and queue as a webview event. Never blocks; dropped silently
+    /// like any other event when not admitted.
+    pub fn capture_mic_lost(&self, cause: MicLossCause) {
+        self.enqueue(true, || Record::mic_lost(cause));
+    }
+
+    /// The one admission path for every captured event. The record is built
+    /// only once admitted, so a refused event costs no IDs.
+    fn enqueue(&self, diagnostic: bool, record: impl FnOnce() -> Record) {
         if self.config.is_none() {
-            return Ok(());
+            return;
         }
         // Contended persistence/export is not allowed to stall an app operation.
         let Ok(mut inner) = self.inner.try_lock() else {
-            return Ok(());
+            return;
         };
         let consent = inner.stored.consent;
-        let allowed = if event.kind.diagnostic() {
+        let allowed = if diagnostic {
             consent.diagnostics
         } else {
             consent.product_analytics
         };
         if !allowed || !admit(&mut inner) {
-            return Ok(());
+            return;
         }
-        inner.queue.push_back(Record::frontend(event));
+        inner.queue.push_back(record());
         drop(inner);
         self.wake.notify_one();
-        Ok(())
     }
 
     /// Run once on the shell runtime. No HTTP client, task per event or flag
@@ -683,15 +752,17 @@ async fn post(
 }
 
 fn batch_payload(config: &PublicConfig, id: &str, record: &Record) -> Option<serde_json::Value> {
-    let Operation::Frontend(kind) = record.operation else {
-        return None;
+    let (name, diagnostic, source) = match record.operation {
+        Operation::Frontend(kind) => (kind.name(), kind.diagnostic(), "frontend"),
+        Operation::MicLost(_) => (record.operation.name(), true, "shell"),
+        Operation::RemoteConfig | Operation::FlagsRequest => return None,
     };
     let timestamp = chrono::DateTime::from_timestamp_nanos(i64::try_from(record.end).ok()?)
         .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let mut properties = serde_json::json!({
         "distinct_id": id,
-        "consent_category": if kind.diagnostic() { "diagnostics" } else { "productAnalytics" },
-        "event_source": "frontend", "synthetic": false,
+        "consent_category": if diagnostic { "diagnostics" } else { "productAnalytics" },
+        "event_source": source, "synthetic": false,
         "$process_person_profile": false, "$geoip_disable": true,
         "trace_id": record.trace_id, "span_id": record.span_id
     });
@@ -701,7 +772,14 @@ fn batch_payload(config: &PublicConfig, id: &str, record: &Record) -> Option<ser
     if let Some(surface) = record.surface {
         properties["surface"] = surface.name().into();
     }
-    let exception = matches!(kind, TelemetryEventKind::FrontendError).then(|| {
+    if let Operation::MicLost(cause) = record.operation {
+        properties["cause"] = cause.name().into();
+    }
+    let exception = matches!(
+        record.operation,
+        Operation::Frontend(TelemetryEventKind::FrontendError)
+    )
+    .then(|| {
         // A fixed handled category, never the source exception, stack, query or URL.
         let mut error = properties.clone();
         error["$exception_list"] = serde_json::json!([{
@@ -713,9 +791,8 @@ fn batch_payload(config: &PublicConfig, id: &str, record: &Record) -> Option<ser
         error["$exception_level"] = "error".into();
         serde_json::json!({"event": "$exception", "timestamp": timestamp, "properties": error})
     });
-    let mut batch = vec![
-        serde_json::json!({"event": kind.name(), "timestamp": timestamp, "properties": properties}),
-    ];
+    let mut batch =
+        vec![serde_json::json!({"event": name, "timestamp": timestamp, "properties": properties})];
     if let Some(exception) = exception {
         batch.push(exception);
     }

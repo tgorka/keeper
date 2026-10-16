@@ -27,7 +27,7 @@ const CATEGORIES = [
     key: "diagnostics",
     label: "Optional diagnostics",
     detail:
-      "Content-free readiness and interaction timings, fixed error categories and operation traces. Never app logs or exception text.",
+      "Content-free readiness and interaction timings, fixed error categories, operation traces and why a recording lost its microphone (removed, stalled or silent). Never app logs, exception text, device names or anything recorded.",
   },
   {
     key: "productAnalytics",

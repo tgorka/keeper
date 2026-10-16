@@ -25,6 +25,7 @@ import type { FilesListingVm } from "./gen/FilesListingVm";
 import type { IpcError } from "./gen/IpcError";
 import type { LifecyclePhase } from "./gen/LifecyclePhase";
 import type { LineEditVm } from "./gen/LineEditVm";
+import type { LogUploadVm } from "./gen/LogUploadVm";
 import type { MarkerEditReq } from "./gen/MarkerEditReq";
 import type { MediaAdoptionVm } from "./gen/MediaAdoptionVm";
 import type { MediaBlockVm } from "./gen/MediaBlockVm";
@@ -548,6 +549,8 @@ export type { LifecyclePhase } from "./gen/LifecyclePhase";
 export type { LineSpan } from "./gen/LineSpan";
 export type { LoginFieldVm } from "./gen/LoginFieldVm";
 export type { LoginFlowVm } from "./gen/LoginFlowVm";
+export type { LogUploadOutcomeVm } from "./gen/LogUploadOutcomeVm";
+export type { LogUploadVm } from "./gen/LogUploadVm";
 export type { MatrixOfferVm } from "./gen/MatrixOfferVm";
 export type { MediaKindVm } from "./gen/MediaKindVm";
 export type { MediaVm } from "./gen/MediaVm";
@@ -3450,6 +3453,19 @@ export async function autoUpdateGet(): Promise<AutoUpdateVm> {
  */
 export async function autoUpdateSet(enabled: boolean): Promise<AutoUpdateVm> {
   return invoke<AutoUpdateVm>("auto_update_set", { enabled });
+}
+
+/** Whether this device's log goes to the config repository daily, as the layer files leave it. */
+export async function logUploadGet(): Promise<boolean> {
+  return invoke<boolean>("log_upload_get");
+}
+
+/**
+ * Turn the daily log upload on or off, resolving with the **effective** value:
+ * a `diagnostics.log_upload` pinned by a layer file comes back unchanged.
+ */
+export async function logUploadSet(enabled: boolean): Promise<boolean> {
+  return invoke<boolean>("log_upload_set", { enabled });
 }
 
 /**
@@ -8960,6 +8976,15 @@ export async function accountSync(force: boolean): Promise<OrgAccountVm> {
 /** Rename this device; its two files inside the person's directory move in one commit. */
 export async function accountRenameDevice(name: string): Promise<OrgAccountVm> {
   return await invoke<OrgAccountVm>("account_rename_device", { name });
+}
+
+/**
+ * Send this device's log to the person's directory of the config repository
+ * now, whatever the daily switch says. Resolves with Rust's sentence for every
+ * ending, a refusal included.
+ */
+export async function accountSendLog(): Promise<LogUploadVm> {
+  return await invoke<LogUploadVm>("account_send_log");
 }
 
 /** The setup link for another device or person, and its QR code as SVG. */

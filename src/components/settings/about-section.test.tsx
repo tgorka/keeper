@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/lib/ipc/client", () => ({
@@ -39,6 +39,11 @@ vi.mock("@/lib/ipc/client", () => ({
     Promise.resolve({ kind: "unsupported", message: "voice is not available in this build" }),
   ),
   voiceWakeGet: vi.fn(() => Promise.reject(new Error("not answered"))),
+  // The daily log upload (`diagnostics.log_upload`): on by default, and the
+  // setter echoes the effective value the way Rust re-reads it.
+  logUploadGet: vi.fn(() => Promise.resolve(true)),
+  logUploadSet: vi.fn((enabled: boolean) => Promise.resolve(enabled)),
+  accountSendLog: vi.fn(() => Promise.reject(new Error("not answered"))),
 }));
 vi.mock("@tauri-apps/api/app", () => ({
   getVersion: vi.fn(() => Promise.resolve("0.0.0-test")),
@@ -65,14 +70,18 @@ import {
   selfRestartNote,
 } from "@/components/settings/about-section";
 import {
+  accountSendLog,
   autoUpdateGet,
   autoUpdateSet,
   debugLogPath,
   type EgressEndpointVm,
   egressList,
+  logUploadGet,
+  logUploadSet,
   type PlatformDisclosureVm,
   voiceAvailability,
 } from "@/lib/ipc/client";
+import { accountStore, NO_ACCOUNT } from "@/lib/stores/account";
 import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
 import { platformStore } from "@/lib/stores/platform";
 import { updateStore } from "@/lib/stores/update";
@@ -87,6 +96,25 @@ const mockVoiceAvailability = vi.mocked(voiceAvailability);
 const mockDebugLogPath = vi.mocked(debugLogPath);
 const mockAutoUpdateGet = vi.mocked(autoUpdateGet);
 const mockAutoUpdateSet = vi.mocked(autoUpdateSet);
+const mockLogUploadGet = vi.mocked(logUploadGet);
+const mockLogUploadSet = vi.mocked(logUploadSet);
+const mockAccountSendLog = vi.mocked(accountSendLog);
+
+/** Signed in, with this device registered as `marta-air`: the log has a place to go. */
+const SIGNED_IN = {
+  ...NO_ACCOUNT,
+  configured: true,
+  state: "ready" as const,
+  identity: { login: "marta", displayName: "Marta", email: null, roles: [] },
+  device: {
+    slug: "marta-air",
+    name: "marta-air",
+    class: null,
+    platform: "macos",
+    version: null,
+    thisDevice: true,
+  },
+};
 
 /** All seven capabilities present = the desktop tier (updater block renders). */
 const DESKTOP_CAPABILITIES = {
@@ -182,6 +210,12 @@ beforeEach(() => {
   updateStore.getState().reset();
   mockAutoUpdateGet.mockClear();
   mockAutoUpdateSet.mockClear();
+  mockLogUploadGet.mockReset();
+  mockLogUploadGet.mockResolvedValue(true);
+  mockLogUploadSet.mockReset();
+  mockLogUploadSet.mockImplementation((enabled: boolean) => Promise.resolve(enabled));
+  mockAccountSendLog.mockReset();
+  accountStore.setState({ vm: NO_ACCOUNT });
   // Default the mirror to the desktop tier so the software-update block renders for
   // the egress/update-flow assertions; the reduced-platform cases opt in explicitly.
   capabilitiesStore.getState().applySnapshot(DESKTOP_CAPABILITIES);
@@ -499,6 +533,86 @@ describe("AboutSection update flow", () => {
     expect(autoUpdateSentence(plan)).toContain("never while a recording is running");
     // Unanswered: no invented number.
     expect(autoUpdateSentence(undefined)).toContain("on a cadence");
+  });
+});
+
+describe("AboutSection device log", () => {
+  it("persists the daily-upload switch and shows the effective answer a file pinned", async () => {
+    render(<AboutSection open />);
+    const upload = await screen.findByLabelText("Send this device's log to your account daily");
+    // The stored answer, absent meaning on.
+    await waitFor(() => expect(upload).toBeChecked());
+
+    // A layer file pins `diagnostics.log_upload`: Rust re-reads it and answers
+    // on, so the switch refuses to move rather than promising no upload.
+    mockLogUploadSet.mockResolvedValueOnce(true);
+    fireEvent.click(upload);
+    expect(mockLogUploadSet).toHaveBeenCalledWith(false);
+    await waitFor(() => expect(upload).toBeChecked());
+
+    // With nothing pinning it, the same click sticks.
+    fireEvent.click(upload);
+    await waitFor(() => expect(upload).not.toBeChecked());
+  });
+
+  // Two quick toggles from a confirmed on, both writes failing: the switch
+  // must end on what Rust last confirmed, never on the first toggle's
+  // optimistic off, and say why beside it.
+  it("takes one write at a time and returns to the value Rust last confirmed", async () => {
+    const rejections: Array<(reason: unknown) => void> = [];
+    mockLogUploadSet.mockImplementation(
+      () =>
+        new Promise<boolean>((_, reject) => {
+          rejections.push(reject);
+        }),
+    );
+    render(<AboutSection open />);
+    const upload = await screen.findByLabelText("Send this device's log to your account daily");
+    await waitFor(() => expect(upload).toBeChecked());
+
+    fireEvent.click(upload);
+    expect(upload).not.toBeChecked();
+    expect(upload).toBeDisabled();
+    fireEvent.click(upload);
+    expect(mockLogUploadSet).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      for (const reject of rejections) reject(new Error("database is locked"));
+    });
+    await waitFor(() => expect(upload).toBeChecked());
+    expect(screen.getByText("The switch was not saved: database is locked")).toHaveClass(
+      "text-destructive",
+    );
+    expect(upload).toBeEnabled();
+  });
+
+  it("cannot send without an account to send to, and says why", async () => {
+    render(<AboutSection open />);
+    const button = await screen.findByRole("button", { name: "Send log now" });
+    expect(button).toBeDisabled();
+    expect(screen.getByText(/Sign in to an organisation account/)).toBeInTheDocument();
+  });
+
+  it("shows Rust's sentence under the button once the log is sent", async () => {
+    accountStore.setState({ vm: SIGNED_IN });
+    const sentence =
+      "Sent. This device's log is in the settings repository at marta/logs/marta-air.log.";
+    mockAccountSendLog.mockResolvedValueOnce({ outcome: "sent", sentence });
+    render(<AboutSection open />);
+    const button = await screen.findByRole("button", { name: "Send log now" });
+    expect(button).toBeEnabled();
+    fireEvent.click(button);
+    expect(await screen.findByText(sentence)).toHaveAttribute("role", "status");
+  });
+
+  it("shows a command failure inline, not as a sentence of success", async () => {
+    accountStore.setState({ vm: SIGNED_IN });
+    mockAccountSendLog.mockRejectedValueOnce({ code: "internal", message: "keeper stopped" });
+    render(<AboutSection open />);
+    fireEvent.click(await screen.findByRole("button", { name: "Send log now" }));
+    expect(await screen.findByText("keeper stopped")).toHaveClass("text-destructive");
+    // The button is usable again for another try.
+    await waitFor(() => expect(screen.getByRole("button", { name: "Send log now" })).toBeEnabled());
   });
 });
 

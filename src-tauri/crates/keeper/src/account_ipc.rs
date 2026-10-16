@@ -64,7 +64,7 @@ use keeper_core::org_account::state::{
     AccountOffersVm, AccountPhase, AccountProblem, AccountSetupVm, AccountShareVm, AccountStateVm,
     AccountStep, AccountVm, RestoreFacts,
 };
-use keeper_core::org_account::{oidc, AccountError};
+use keeper_core::org_account::{log_upload, oidc, AccountError};
 use keeper_core::platform::Platform;
 use keeper_core::registry;
 use keeper_core::transcription::models as model_files;
@@ -178,6 +178,12 @@ struct Runtime {
     /// Stops the models hydration in flight (AD-341); its own flag, because
     /// it runs beside syncs rather than inside one.
     models_interrupt: Mutex<Arc<AtomicBool>>,
+    /// When this process last found this device's log in the repository up
+    /// to date — pushed, or already holding the same bytes — for which
+    /// account and path, in seconds. The daily upload's own clock: a quiet
+    /// log commits nothing, so the repository's history alone would make
+    /// every sync after the first day check again.
+    log_checked: Mutex<Option<(String, String, i64)>>,
 }
 
 static RUNTIME: LazyLock<Runtime> = LazyLock::new(Runtime::default);
@@ -1231,14 +1237,33 @@ where
     F: Fn(RepoAuth) -> Fut,
     Fut: Future<Output = Result<Result<T, SyncError>, String>>,
 {
+    let outcome = with_forge_refresh(platform, http, d, auth, op).await;
+    if matches!(d.config.auth, RepoAuthConfig::Oauth(_)) && forge_refused(&outcome) {
+        disconnect_forge(platform, d);
+    }
+    outcome
+}
+
+/// [`with_forge_retry`] without its consequence: the one refresh and retry,
+/// and a refusal even so handed back as it came — the account's forge
+/// connection is left as it was. For work that must never change the
+/// account's state, the log upload.
+async fn with_forge_refresh<T, F, Fut>(
+    platform: &dyn Platform,
+    http: &reqwest::Client,
+    d: &AccountDescriptor,
+    auth: &mut RepoAuth,
+    op: F,
+) -> Result<Result<T, SyncError>, String>
+where
+    F: Fn(RepoAuth) -> Fut,
+    Fut: Future<Output = Result<Result<T, SyncError>, String>>,
+{
     let first = op(auth.clone()).await;
-    let refused = |outcome: &Result<Result<T, SyncError>, String>| {
-        matches!(outcome, Ok(Err(SyncError::Auth { .. })))
-    };
-    if !matches!(d.config.auth, RepoAuthConfig::Oauth(_)) || !refused(&first) {
+    if !matches!(d.config.auth, RepoAuthConfig::Oauth(_)) || !forge_refused(&first) {
         return first;
     }
-    let outcome = match oidc::forge_token_refreshed(platform, http, d).await {
+    match oidc::forge_token_refreshed(platform, http, d).await {
         Ok(token) => {
             *auth = repo_auth(session::git_credential(d, &token));
             op(auth.clone()).await
@@ -1247,11 +1272,12 @@ where
             tracing::warn!(%error, "account: the forge token could not be refreshed");
             first
         }
-    };
-    if refused(&outcome) {
-        disconnect_forge(platform, d);
     }
-    outcome
+}
+
+/// Whether the forge refused the token an operation sent (401).
+fn forge_refused<T>(outcome: &Result<Result<T, SyncError>, String>) -> bool {
+    matches!(outcome, Ok(Err(SyncError::Auth { .. })))
 }
 
 /// A refused sign-in (a role taken away, a username keeper cannot use): the
@@ -1644,6 +1670,24 @@ async fn converge(
     );
     let problem = problem.or(settings_problem);
 
+    // 6c. This device's log, once a day while `diagnostics.log_upload` is
+    //     on — only for a registered device, whose name the path needs. It
+    //     is never the account's problem: a log that did not go is a WARN
+    //     line (`publish_log`'s), and the next sync tries again.
+    if registered.is_some() {
+        let due = {
+            let rel = log_upload::path(&identity.login, &device);
+            let last_checked = log_checked_secs(&d.id, &rel);
+            let (data_dir, clone) = (data_dir.clone(), spec.dir.clone());
+            on_blocking_pool(move || log_upload_due(&data_dir, &clone, &rel, last_checked))
+                .await
+                .unwrap_or(false)
+        };
+        if due {
+            publish_log(platform.as_ref(), &leg, &mut auth, &identity, &device).await;
+        }
+    }
+
     // 7. The layers, from the clone as it now stands. A first registration
     //    counts only once the repository holds it.
     let synced = now_ms();
@@ -1760,6 +1804,243 @@ async fn publish_version(
         }
         Err(sentence) => Some(AccountProblem::Failed(sentence)),
     }
+}
+
+/// What publishing this device's log came to.
+enum LogPublished {
+    Sent,
+    /// The repository's copy already held these bytes: nothing committed.
+    Unchanged,
+    /// Neither log file holds a line: there was nothing to send.
+    NoLog,
+    /// The tip the push would have landed on records someone else in
+    /// `<login>/`: nothing was written.
+    Blocked,
+    /// The log could not be read, or the repository did not take it.
+    Failed(Option<AccountProblem>),
+}
+
+/// Replace `<login>/logs/<device>.log` with the tail of this device's
+/// keeper.log, as `"{login}: {device} log"`. The bundle carries no time, so a
+/// log that gained no line since the last upload commits nothing.
+///
+/// Never changes the account's state: a forge that refuses the token gets
+/// [`with_forge_refresh`]'s one retry, and a refusal even so is this answer's
+/// failure, not a dropped forge connection.
+async fn publish_log(
+    platform: &dyn Platform,
+    leg: &RepoLeg<'_>,
+    auth: &mut RepoAuth,
+    identity: &Identity,
+    device: &str,
+) -> LogPublished {
+    let login = identity.login.as_str();
+    let bytes = {
+        let device = device.to_owned();
+        match on_blocking_pool(move || log_bundle(&device))
+            .await
+            .and_then(|read| read)
+        {
+            Ok(bytes) if bytes.is_empty() => return LogPublished::NoLog,
+            Ok(bytes) => Arc::new(bytes),
+            Err(sentence) => {
+                tracing::warn!(error = %sentence, "account: this device's log could not be read");
+                return LogPublished::Failed(Some(AccountProblem::Failed(sentence)));
+            }
+        }
+    };
+    // Set by every attempt's plan: whether the tip it planned on records
+    // someone else in `<login>/`.
+    let not_mine = Arc::new(AtomicBool::new(false));
+    let plan = {
+        let (identity, field, device, not_mine) = (
+            identity.clone(),
+            leg.d.config.identity_field.clone(),
+            device.to_owned(),
+            Arc::clone(&not_mine),
+        );
+        move |root: &Path| -> Vec<Write> {
+            let writes = plan_log(root, &identity, &field, &device, &bytes);
+            not_mine.store(writes.is_none(), Ordering::SeqCst);
+            writes.unwrap_or_default()
+        }
+    };
+    let message = format!("{login}: {device} log");
+    let http = leg.http;
+    let pushed = with_forge_refresh(platform, http, leg.d, auth, |auth| {
+        let (spec, author, message, plan, interrupt) = (
+            leg.spec.clone(),
+            leg.author.clone(),
+            message.clone(),
+            plan.clone(),
+            interrupt(),
+        );
+        off_runtime(move || async move {
+            config_repo::commit_and_push(http, &spec, &auth, &author, &message, plan, &interrupt)
+                .await
+        })
+    })
+    .await;
+    let rel = log_upload::path(login, device);
+    match pushed {
+        Ok(Ok(PushResult::Pushed { head })) => {
+            tracing::info!(%head, "account: published this device's log");
+            record_log_checked(&leg.d.id, &rel);
+            LogPublished::Sent
+        }
+        Ok(Ok(PushResult::NothingToDo)) if not_mine.load(Ordering::SeqCst) => {
+            tracing::warn!(
+                login,
+                "account: this device's log was not published: the repository records someone else in this directory"
+            );
+            LogPublished::Blocked
+        }
+        Ok(Ok(PushResult::NothingToDo)) => {
+            record_log_checked(&leg.d.id, &rel);
+            LogPublished::Unchanged
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "account: this device's log could not be published");
+            LogPublished::Failed(repo_problem(&error, leg.oauth))
+        }
+        Err(sentence) => {
+            tracing::warn!(error = %sentence, "account: this device's log could not be published");
+            LogPublished::Failed(Some(AccountProblem::Failed(sentence)))
+        }
+    }
+}
+
+/// The log write one attempt makes against the worktree at `root` — the
+/// tip it commits on, refreshed by that attempt — or `None` when
+/// `<login>/user.toml` there does not record this sign-in: a directory
+/// reassigned since the last sync gets nothing of this device's.
+fn plan_log(
+    root: &Path,
+    identity: &Identity,
+    identity_field: &str,
+    device: &str,
+    bytes: &[u8],
+) -> Option<Vec<Write>> {
+    let login = identity.login.as_str();
+    let mine = matches!(
+        layout::resolve(
+            &WorktreeFiles(root),
+            login,
+            &identity.sub,
+            &identity.iss,
+            identity_field,
+        ),
+        Resolution::Mine { .. }
+    );
+    if !mine {
+        return None;
+    }
+    let rel = log_upload::path(login, device);
+    // The staging guard: this device's own log is the one log file it may
+    // write.
+    if !log_upload::is_own_log(login, device, &rel) {
+        return Some(Vec::new());
+    }
+    Some(vec![Write {
+        rel: PathBuf::from(rel),
+        bytes: bytes.to_vec(),
+        replace: true,
+    }])
+}
+
+/// When this process last found this device's log in the repository up to
+/// date (`rel`, of account `account`), in seconds.
+fn log_checked_secs(account: &str, rel: &str) -> Option<i64> {
+    lock(&RUNTIME.log_checked)
+        .as_ref()
+        .filter(|(checked_account, checked_rel, _)| {
+            checked_account == account && checked_rel == rel
+        })
+        .map(|&(_, _, at)| at)
+}
+
+/// The repository now holds this device's newest log, pushed or already
+/// there: the daily upload's clock starts again.
+fn record_log_checked(account: &str, rel: &str) {
+    *lock(&RUNTIME.log_checked) = Some((account.to_owned(), rel.to_owned(), now_ms() / 1000));
+}
+
+/// This device's log as the upload carries it: the newest rotated generation,
+/// then the live file, either read as empty when it is not there. Empty when
+/// neither holds a line. Blocking.
+///
+/// Only each file's tail is read — the live file may be 64 MiB and the
+/// upload keeps 512 KiB — with a little more than the cap, so `bundle` still
+/// finds a line break to start the kept tail on. A file that is there and
+/// cannot be read fails the whole upload rather than replacing the
+/// repository's copy with less than the log holds.
+fn log_bundle(device: &str) -> Result<Vec<u8>, String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let path = crate::debug_log::app_log_path();
+    let want = (log_upload::MAX_BYTES + 64 * 1024) as u64;
+    let tail = |path: &Path| -> std::io::Result<Vec<u8>> {
+        let mut file = std::fs::File::open(path)?;
+        let len = file.metadata()?.len();
+        let start = len.saturating_sub(want);
+        file.seek(SeekFrom::Start(start))?;
+        let mut bytes = Vec::with_capacity(len.min(want) as usize);
+        file.take(want).read_to_end(&mut bytes)?;
+        if start > 0 {
+            log_upload::drop_partial_first_line(&mut bytes);
+        }
+        Ok(bytes)
+    };
+    let read = |path: &Path| match tail(path) {
+        Ok(bytes) => Ok(String::from_utf8_lossy(&bytes).into_owned()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(error) => Err(format!(
+            "keeper could not read its log file {}: {error}.",
+            path.display()
+        )),
+    };
+    let older = read(&keeper_sync::logfile::RotatingFile::generation(&path, 1))?;
+    let current = read(&path)?;
+    let home = std::env::var("HOME").ok();
+    Ok(log_upload::bundle(
+        &older,
+        &current,
+        home.as_deref(),
+        log_upload::Header {
+            device,
+            version: KEEPER_VERSION,
+            commit: KEEPER_COMMIT,
+        },
+    ))
+}
+
+/// Whether the daily log upload is due: switched on, and
+/// [`log_upload::is_due`] for the repository's copy (`rel`, in the clone at
+/// `clone`) and `last_checked` ([`log_checked_secs`]). Blocking — a settings
+/// read and a walk of the clone's history. A history that cannot be read is
+/// not a reason to upload on every sync.
+fn log_upload_due(data_dir: &Path, clone: &Path, rel: &str, last_checked: Option<i64>) -> bool {
+    match registry::get_log_upload(data_dir) {
+        Ok(true) => {}
+        Ok(false) => return false,
+        Err(error) => {
+            tracing::warn!(%error, "account: whether to upload this device's log could not be read");
+            return false;
+        }
+    }
+    let present = std::fs::symlink_metadata(clone.join(rel)).is_ok_and(|meta| meta.is_file());
+    let last_change = if present {
+        match config_repo::last_change_secs(clone, rel) {
+            Ok(last) => last,
+            Err(error) => {
+                tracing::warn!(%error, "account: when this device's log was last uploaded could not be read");
+                return false;
+            }
+        }
+    } else {
+        None
+    };
+    log_upload::is_due(present, last_change, last_checked, now_ms() / 1000)
 }
 
 /// What every push to the config repository in one run shares.
@@ -3448,6 +3729,107 @@ async fn rename_device(state: State<'_, AppState>, name: String) -> Result<Accou
     }))
 }
 
+/// Send this device's log to the person's directory of the config repository
+/// now — Settings › About › *Send log now* — whether or not the daily upload
+/// is on: pressing the button is the person asking for it.
+///
+/// Every ending is a sentence in the answer; none of them changes the
+/// account's status.
+#[tauri::command]
+pub async fn account_send_log(
+    state: State<'_, AppState>,
+) -> Result<log_upload::LogUploadVm, IpcError> {
+    let sent = send_log(state).await;
+    // The gate is free again: a change noted during the upload goes now.
+    resync_if_dirty();
+    sent
+}
+
+async fn send_log(state: State<'_, AppState>) -> Result<log_upload::LogUploadVm, IpcError> {
+    let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
+    // Captured before the wait: a sign-out or forget that comes while this
+    // queues behind a sync, or while it runs, stops it (R410).
+    let queued_at = epoch();
+    let _gate = RUNTIME.gate.lock().await;
+    let ran = cancellable(queued_at, send_log_now(state.platform.as_ref(), &data_dir)).await;
+    Ok(match ran {
+        Run::Finished(answer) => answer,
+        Run::Cancelled | Run::NotStarted => log_upload::LogUploadVm::failed(None),
+    })
+}
+
+/// [`send_log`]'s work, inside the attempt boundary and holding the gate.
+async fn send_log_now(platform: &dyn Platform, data_dir: &Path) -> log_upload::LogUploadVm {
+    use log_upload::LogUploadVm;
+    // Read after the wait: a sign-out may have run while a sync held the gate.
+    let (d, identity, device) = {
+        let inner = lock(&RUNTIME.inner);
+        (
+            inner.descriptor.clone(),
+            inner.identity.clone(),
+            inner.this_device.clone(),
+        )
+    };
+    let (Some(d), Some(identity), Some(device)) = (d, identity, device) else {
+        return LogUploadVm::signed_out();
+    };
+    let clone = clone_dir(data_dir, &d.id);
+    if !clone.join(".git").exists() {
+        return LogUploadVm::signed_out();
+    }
+    let blocked = || {
+        LogUploadVm::failed(Some(&AccountProblem::Blocked {
+            login: identity.login.clone(),
+            recorded: None,
+        }))
+    };
+    // Before any network: the clone as the last sync left it already says
+    // whose directory this is. Every push attempt checks again on its tip.
+    if plan_log(&clone, &identity, &d.config.identity_field, &device, &[]).is_none() {
+        return blocked();
+    }
+    let http = match http() {
+        Ok(http) => http,
+        Err(sentence) => return LogUploadVm::failed(Some(&AccountProblem::Failed(sentence))),
+    };
+    let mut auth = match repo_credential(platform, http, &d).await {
+        Ok(auth) => auth,
+        Err(error) => return LogUploadVm::failed(problem_of(error).as_ref()),
+    };
+    let spec = RepoSpec {
+        url: d.config.url.clone(),
+        branch: d.config.branch.clone(),
+        dir: clone.clone(),
+    };
+    let author = Author {
+        name: identity.display_name.clone(),
+        email: identity
+            .email
+            .clone()
+            .unwrap_or_else(|| format!("{}@keeper.invalid", identity.login)),
+    };
+    let leg = RepoLeg {
+        http,
+        d: &d,
+        spec: &spec,
+        author: &author,
+        oauth: matches!(d.config.auth, RepoAuthConfig::Oauth(_)),
+    };
+    let published = publish_log(platform, &leg, &mut auth, &identity, &device).await;
+    // The push refreshed the clone to the remote's tip: keep the account's
+    // layers in step with it, as a rename does.
+    update(|inner| {
+        apply_clone(inner, &clone, &d, &identity, &device);
+    });
+    match published {
+        LogPublished::Sent => LogUploadVm::sent(&identity.login, &device),
+        LogPublished::Unchanged => LogUploadVm::unchanged(&identity.login, &device),
+        LogPublished::NoLog => LogUploadVm::no_log(),
+        LogPublished::Blocked => blocked(),
+        LogPublished::Failed(problem) => LogUploadVm::failed(problem.as_ref()),
+    }
+}
+
 /// The setup link for another device or another person, and its QR code with
 /// the keeper mark in the middle.
 #[tauri::command]
@@ -4121,5 +4503,133 @@ mod tests {
             ),
             None
         );
+    }
+
+    fn signed_in(sub: &str) -> Identity {
+        Identity {
+            iss: "https://id.acme.dev".to_owned(),
+            sub: sub.to_owned(),
+            login: "tgorka".to_owned(),
+            display_name: "Tomasz".to_owned(),
+            email: None,
+            roles: Vec::new(),
+        }
+    }
+
+    /// The log plan reads `user.toml` on the tip each attempt commits on: a
+    /// directory reassigned since the last sync, or one nobody claims, gets
+    /// nothing of this device's — the refusal the publish reports as
+    /// blocked rather than as an unchanged log.
+    #[test]
+    fn the_log_is_planned_only_into_a_directory_that_records_this_sign_in() {
+        let root = tree("log-owner");
+        let me = signed_in("s-1");
+        std::fs::write(root.join("tgorka/user.toml"), b"sub = \"s-1\"\n").expect("mine");
+        let writes = plan_log(&root, &me, "sub", "air", b"line\n").expect("mine");
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].rel, PathBuf::from("tgorka/logs/air.log"));
+        assert_eq!(writes[0].bytes, b"line\n");
+        assert!(writes[0].replace);
+
+        std::fs::write(root.join("tgorka/user.toml"), b"sub = \"someone-else\"\n").expect("taken");
+        assert!(plan_log(&root, &me, "sub", "air", b"line\n").is_none());
+        std::fs::remove_file(root.join("tgorka/user.toml")).expect("unclaimed");
+        assert!(plan_log(&root, &me, "sub", "air", b"line\n").is_none());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// An `oauth`-mode descriptor: core's own fixture (descriptor.rs,
+    /// spec §2.5 A).
+    const FORGE: &str = r#"{
+        "version": 1,
+        "id": "acme",
+        "name": "Acme",
+        "auth": {
+            "issuer": "https://id.acme.dev",
+            "client_id": "283746519283746519@keeper",
+            "extra_scopes": ["urn:zitadel:iam:org:projects:roles"],
+            "trusted_audiences": ["283746519283746001"],
+            "roles_claim": "urn:zitadel:iam:org:project:283746519283746001:roles",
+            "required_role": "keeper"
+        },
+        "config": {
+            "url": "https://git.acme.dev/git/people/keeper-config.git",
+            "api_base": "https://git.acme.dev/git/api/v1",
+            "identity_field": "zitadel_id",
+            "auth": {
+                "mode": "oauth",
+                "issuer": "https://git.acme.dev/git",
+                "client_id": "6f1c2a8e",
+                "scope": "openid profile read:user write:repository",
+                "signin_url": "https://git.acme.dev/git/user/oauth2/acme-id?redirect_to={authorize_path_and_query}"
+            }
+        }
+    }"#;
+
+    /// A keychain with no forge item, which records what is deleted from it.
+    #[derive(Default)]
+    struct Keychain {
+        deleted: Mutex<Vec<String>>,
+    }
+
+    impl Platform for Keychain {
+        fn data_dir(&self) -> Result<PathBuf, CoreError> {
+            Ok(std::env::temp_dir())
+        }
+        fn keychain_set(&self, _key: &str, _value: &str) -> Result<(), CoreError> {
+            Ok(())
+        }
+        fn keychain_get(&self, _key: &str) -> Result<Option<String>, CoreError> {
+            Ok(None)
+        }
+        fn keychain_delete(&self, key: &str) -> Result<(), CoreError> {
+            lock(&self.deleted).push(key.to_owned());
+            Ok(())
+        }
+        fn open_url(&self, _url: &str) -> Result<(), CoreError> {
+            Ok(())
+        }
+        fn notify(
+            &self,
+            _title: &str,
+            _body: &str,
+            _target: &keeper_core::vm::NotifyTarget,
+        ) -> Result<(), CoreError> {
+            Ok(())
+        }
+        fn sidecar_path(&self, _name: &str) -> Result<PathBuf, CoreError> {
+            Err(CoreError::Unsupported("no sidecar in tests".to_owned()))
+        }
+        fn exclude_from_backup(&self, _path: &Path) -> Result<(), CoreError> {
+            Ok(())
+        }
+        fn set_badge_count(&self, _count: Option<u32>) -> Result<(), CoreError> {
+            Ok(())
+        }
+    }
+
+    /// A forge that refuses the log's push, with no refresh to be had:
+    /// the log's retry hands the refusal back and leaves the forge
+    /// connection where it was, while the account's own retry drops it —
+    /// the difference the log upload depends on.
+    #[tokio::test]
+    async fn a_refused_log_push_leaves_the_forge_connection_alone() {
+        let d = descriptor::parse_json(FORGE).expect("descriptor");
+        let http = reqwest::Client::new();
+        let platform = Keychain::default();
+        let refused = |_: RepoAuth| async {
+            Ok::<Result<(), SyncError>, String>(Err(SyncError::Auth {
+                host: "git.acme.dev".to_owned(),
+            }))
+        };
+        let mut auth = RepoAuth::None;
+
+        let outcome = with_forge_refresh(&platform, &http, &d, &mut auth, refused).await;
+        assert!(forge_refused(&outcome));
+        assert!(lock(&platform.deleted).is_empty());
+
+        let outcome = with_forge_retry(&platform, &http, &d, &mut auth, refused).await;
+        assert!(forge_refused(&outcome));
+        assert_eq!(lock(&platform.deleted).len(), 1);
     }
 }

@@ -38,6 +38,11 @@
       "name": "keeper_interaction",
       "category": "diagnostics",
       "description": "Bounded interaction duration; no target text or input values. An optional closed surface property is one of slash_menu_opened, slash_menu_chosen or launch_default_agent (Epic 100); never a command, argument, room or agent."
+    },
+    {
+      "name": "keeper_recording_mic_lost",
+      "category": "diagnostics",
+      "description": "A recording lost its microphone, raised by the app shell at most once per cause per session. One closed cause property: removed, stalled or silent. No device name, warning message, path or recording content."
     }
   ],
   "remoteConfig": {

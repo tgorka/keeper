@@ -452,6 +452,7 @@ fn exported_name(operation: Operation) -> &'static str {
             TelemetryEventKind::FrontendError => "keeper_frontend_error",
             TelemetryEventKind::Interaction => "keeper_interaction",
         },
+        Operation::MicLost(_) => "keeper_recording_mic_lost",
         Operation::RemoteConfig => "keeper.remote_config",
         Operation::FlagsRequest => "keeper.flags_request",
     }
@@ -527,4 +528,83 @@ fn an_interaction_carries_only_a_declared_surface() {
     let plain = Record::frontend(event(TelemetryEventKind::Interaction));
     let payload = batch_payload(&config(), "synthetic-installation", &plain).expect("batch");
     assert!(payload["batch"][0]["properties"].get("surface").is_none());
+}
+
+/// A recording's lost microphone leaves as one shell-raised diagnostics count
+/// whose only property is a closed cause: no duration, no device, no message.
+#[test]
+fn a_mic_loss_carries_only_a_closed_cause() {
+    let local = LocalDir::new();
+    let telemetry = Telemetry::open(Some(&local.0), Some(config()));
+    telemetry.set_consent(diagnostics()).expect("consent");
+    assert!(serde_json::from_str::<TelemetryEventReq>(
+        r#"{"kind":"recordingMicLost","durationMs":null}"#
+    )
+    .is_err());
+    assert!(serde_json::from_str::<TelemetryEventReq>(
+        r#"{"kind":"interaction","durationMs":null,"cause":"removed"}"#
+    )
+    .is_err());
+    for (cause, exported) in [
+        (MicLossCause::Removed, "removed"),
+        (MicLossCause::Stalled, "stalled"),
+        (MicLossCause::Silent, "silent"),
+    ] {
+        telemetry.capture_mic_lost(cause);
+        let record = Record::mic_lost(cause);
+        let payload = batch_payload(&config(), "synthetic-installation", &record).expect("batch");
+        let batch = payload["batch"].as_array().expect("event array");
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0]["event"], "keeper_recording_mic_lost");
+        let props = &batch[0]["properties"];
+        assert_eq!(props["cause"], exported);
+        assert_eq!(props["consent_category"], "diagnostics");
+        assert_eq!(props["event_source"], "shell");
+        assert!(props.get("duration_ms").is_none());
+        assert!(props.get("surface").is_none());
+    }
+    let inner = telemetry.inner.lock().expect("state");
+    let names: Vec<&str> = inner
+        .queue
+        .iter()
+        .map(|record| exported_name(record.operation))
+        .collect();
+    assert_eq!(names, ["keeper_recording_mic_lost"; 3]);
+    assert!(inner.queue.iter().all(Record::diagnostic));
+}
+
+#[test]
+fn a_mic_loss_needs_diagnostics_consent() {
+    let local = LocalDir::new();
+    let telemetry = Telemetry::open(Some(&local.0), Some(config()));
+    telemetry.capture_mic_lost(MicLossCause::Removed);
+    assert!(telemetry.inner.lock().expect("state").queue.is_empty());
+    telemetry
+        .set_consent(TelemetryConsentVm {
+            product_analytics: true,
+            remote_config: true,
+            ..Default::default()
+        })
+        .expect("product only");
+    telemetry.capture_mic_lost(MicLossCause::Stalled);
+    assert!(telemetry.inner.lock().expect("state").queue.is_empty());
+    telemetry.set_consent(diagnostics()).expect("diagnostics");
+    telemetry.capture_mic_lost(MicLossCause::Silent);
+    assert_eq!(telemetry.inner.lock().expect("state").queue.len(), 1);
+}
+
+#[test]
+fn only_microphone_warning_codes_map_to_a_cause() {
+    for (code, cause) in [
+        ("micLost", Some(MicLossCause::Removed)),
+        ("micStalled", Some(MicLossCause::Stalled)),
+        ("micSilent", Some(MicLossCause::Silent)),
+        ("cameraLost", None),
+        ("echoReferenceStale", None),
+        ("unknown", None),
+        ("MicLost", None),
+        ("", None),
+    ] {
+        assert_eq!(MicLossCause::from_warning_code(code), cause, "{code}");
+    }
 }

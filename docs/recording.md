@@ -2,7 +2,10 @@
 
 keeper records your screen to a folder on this Mac. **Nothing uploads** — the
 recording feature adds zero network destinations (verified by an automated
-egress-diff gate in CI), has no telemetry, and writes only where you point it.
+egress-diff gate in CI) and writes only where you point it. The one thing it
+can report is a count, with optional diagnostics turned on: that a recording
+lost its microphone, and why — removed, stalled or silent — never the device
+name, a message or anything recorded (`docs/observability.md`).
 A finished recording can be transcribed, **on this Mac only**: no audio or text
 leaves it for that (see *Transcription* below, and `docs/transcription.md`).
 

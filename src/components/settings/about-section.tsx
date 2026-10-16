@@ -3,6 +3,7 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { check } from "@tauri-apps/plugin-updater";
 import { type MouseEvent, useEffect, useRef, useState } from "react";
+import { FileControlled } from "@/components/settings/config-source-section";
 import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
@@ -11,6 +12,7 @@ import { logFailure, sayFailure } from "@/lib/failure";
 import {
   type AutoUpdateHold,
   type AutoUpdateVm,
+  accountSendLog,
   autoUpdateGet,
   autoUpdateSet,
   debugLogPath,
@@ -18,9 +20,14 @@ import {
   debugModeSet,
   type EgressEndpointVm,
   egressList,
+  type LogUploadVm,
+  logUploadGet,
+  logUploadSet,
 } from "@/lib/ipc/client";
+import { useAccountStore } from "@/lib/stores/account";
 import { useCapabilitiesStore, useIsReducedCapabilityPlatform } from "@/lib/stores/capabilities";
 import { usePlatformStore } from "@/lib/stores/platform";
+import { syncErrorMessage } from "@/lib/stores/sync";
 import { isUpdateBusy, type UpdatePhase, updateStore, useUpdateStore } from "@/lib/stores/update";
 import { useVoiceStore } from "@/lib/stores/voice";
 import { updateErrorMessage } from "@/lib/update-error";
@@ -39,9 +46,14 @@ import { updateErrorMessage } from "@/lib/update-error";
  * with no scheme and no path, and a person reading "computed from your live
  * accounts" beside `github.com` would reasonably conclude the list had invented an
  * entry. Naming the second input is what makes the row legible as a disclosure.
+ *
+ * The log upload is said here too: it adds no server to the list (it goes to
+ * the organisation account's repository, already listed), but it is the one
+ * thing sent there that is on unless switched off, so "optional diagnostics
+ * are off by default" alone would read as covering it.
  */
 const EGRESS_HONESTY_SENTENCE =
-  "These are the servers keeper connects to, computed from live accounts, folder-sync profiles, model providers and local observability consent. A folder-sync entry shows only the host, never the repository path or credentials. Optional diagnostics, product statistics and remote configuration are off by default; control them in Diagnostics & studies. App-update files are delivered by GitHub's release CDN (githubusercontent.com).";
+  "These are the servers keeper connects to, computed from live accounts, folder-sync profiles, model providers and local observability consent. A folder-sync entry shows only the host, never the repository path or credentials. Optional diagnostics, product statistics and remote configuration are off by default; control them in Diagnostics & studies. With an organisation account, this device's log also goes to that account's settings repository once a day unless you switch it off below. App-update files are delivered by GitHub's release CDN (githubusercontent.com).";
 
 /**
  * The honest copy for the signed-update control (Story 11.2, NFR-12). Explains that
@@ -53,7 +65,7 @@ const UPDATE_HONESTY_SENTENCE =
 
 /**
  * The honest debug-mode disclosure (Story 22.5, FR-79): names exactly what
- * lands on disk and where, and that it is local-only. Off by default.
+ * lands on disk and where, and which of it leaves the device. Off by default.
  *
  * `logPath` is what Rust answers for this device (`debug_log_path`, Story
  * 65.3, AD-192) — the Mac's `~/Library/Logs/keeper/keeper.log`, the phone's
@@ -62,8 +74,19 @@ const UPDATE_HONESTY_SENTENCE =
  * `null` is the answer not yet in, and names the file without a folder.
  */
 export function debugModeSentence(logPath: string | null): string {
-  return `Writes app logs to ${logPath ?? "keeper.log"} and a per-recording events.log beside each session's manifest. Local files only — nothing is uploaded.`;
+  return `Writes app logs to ${logPath ?? "keeper.log"} and a per-recording events.log beside each session's manifest. The events logs stay on this device; the app log's newest lines go to your organisation account as described below.`;
 }
+
+/**
+ * What the daily log upload sends, where to, and who can read it — the switch
+ * is on by default, so the line under it has to say all of it.
+ */
+const LOG_UPLOAD_SENTENCE =
+  "Once a day, the newest 512 KB of the app log go to logs/ in your directory of the organisation account's settings repository. Before it leaves this device, your home folder is written as ~, and passwords and tokens in web addresses and sign-in headers as ***. What else the log says stays in it — your account and Matrix ids, device and microphone names, folders outside your home folder, error messages — and everyone with access to that repository can read it.";
+
+/** Why "Send log now" is disabled: there is no directory for the log to go to. */
+const SEND_LOG_NEEDS_ACCOUNT =
+  "Sign in to an organisation account under Settings › Account to send this device's log.";
 
 /**
  * The honesty lines of the desktop tier's "On this Mac" voice disclosure
@@ -182,6 +205,22 @@ export function AboutSection({ open }: { open: boolean }) {
   // Where this device's app log is, as Rust answers it (Story 65.3): `null`
   // until it has, or when it could not.
   const [logPath, setLogPath] = useState<string | null>(null);
+  // The daily log upload, effective (a layer file may pin it): `undefined`
+  // until Rust answers.
+  const [logUpload, setLogUpload] = useState<boolean | undefined>(undefined);
+  // The last value Rust confirmed — what a failed write goes back to, never
+  // the switch's own optimistic value — and the one write in flight.
+  const logUploadConfirmed = useRef<boolean | undefined>(undefined);
+  const logUploadPending = useRef(false);
+  const [logUploadSaving, setLogUploadSaving] = useState(false);
+  const [logUploadError, setLogUploadError] = useState<string | null>(null);
+  // "Send log now": in flight, Rust's answer, or why the command failed.
+  const [sendingLog, setSendingLog] = useState(false);
+  const [logSent, setLogSent] = useState<LogUploadVm | null>(null);
+  const [sendLogError, setSendLogError] = useState<string | null>(null);
+  // The log goes to this person's directory under this device's name: with
+  // neither, there is nowhere for it to go.
+  const canSendLog = useAccountStore((s) => s.vm.identity !== null && s.vm.device !== null);
   // Guards every async resolution below so it never sets state after unmount.
   const mounted = useRef(true);
   useEffect(() => {
@@ -263,6 +302,15 @@ export function AboutSection({ open }: { open: boolean }) {
           setLogPath(null);
         }
       });
+    void logUploadGet()
+      .then((enabled) => {
+        if (!cancelled) {
+          logUploadConfirmed.current = enabled;
+          setLogUpload(enabled);
+        }
+      })
+      // Unanswered: the switch stays disabled rather than claiming an answer.
+      .catch(logFailure("about.logUploadGet"));
     let egressRead = 0;
     const refreshEgress = () => {
       const request = ++egressRead;
@@ -391,6 +439,53 @@ export function AboutSection({ open }: { open: boolean }) {
     });
   };
 
+  // One write at a time: the switch is disabled while one is pending. Shown
+  // at once; Rust's answer is the effective value (a `diagnostics.log_upload`
+  // pinned by a layer file snaps back to the file's), and a failure returns
+  // to the last value Rust confirmed and says why beside the switch.
+  const onLogUploadChange = (next: boolean) => {
+    if (logUploadPending.current) {
+      return;
+    }
+    logUploadPending.current = true;
+    setLogUploadSaving(true);
+    setLogUploadError(null);
+    setLogUpload(next);
+    void logUploadSet(next)
+      .then((effective) => {
+        logUploadConfirmed.current = effective;
+        if (mounted.current) setLogUpload(effective);
+      })
+      .catch((raw: unknown) => {
+        logFailure("about.logUploadSet")(raw);
+        if (mounted.current) {
+          setLogUpload(logUploadConfirmed.current);
+          setLogUploadError(`The switch was not saved: ${syncErrorMessage(raw)}`);
+        }
+      })
+      .finally(() => {
+        logUploadPending.current = false;
+        if (mounted.current) setLogUploadSaving(false);
+      });
+  };
+
+  // The answer goes inline under the button, in Rust's words — a refusal
+  // included; only a command that failed outright is said here.
+  const onSendLog = async () => {
+    setSendingLog(true);
+    setLogSent(null);
+    setSendLogError(null);
+    try {
+      const answer = await accountSendLog();
+      if (mounted.current) setLogSent(answer);
+    } catch (raw) {
+      logFailure("about.sendLog")(raw);
+      if (mounted.current) setSendLogError(syncErrorMessage(raw));
+    } finally {
+      if (mounted.current) setSendingLog(false);
+    }
+  };
+
   return (
     <div className="mt-2 flex flex-col gap-2 border-border border-t pt-3 text-sm">
       <p className="font-medium">About</p>
@@ -513,6 +608,51 @@ export function AboutSection({ open }: { open: boolean }) {
           />
         </div>
         <p className="text-muted-foreground text-xs">{debugModeSentence(logPath)}</p>
+      </div>
+
+      <div className="mt-1 flex flex-col gap-1.5">
+        <div className="flex items-center justify-between gap-2">
+          <Label htmlFor="log-upload">Send this device's log to your account daily</Label>
+          <div className="flex shrink-0 items-center gap-2">
+            <FileControlled settingKey="diagnostics.log_upload" />
+            <Switch
+              id="log-upload"
+              checked={logUpload ?? false}
+              disabled={logUpload === undefined || logUploadSaving}
+              onCheckedChange={onLogUploadChange}
+            />
+          </div>
+        </div>
+        {logUploadError !== null && <p className="text-destructive text-xs">{logUploadError}</p>}
+        <p className="text-muted-foreground text-xs">{LOG_UPLOAD_SENTENCE}</p>
+        <div className="flex items-center justify-between gap-2">
+          <span>Device log</span>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            disabled={!canSendLog || sendingLog}
+            onClick={() => void onSendLog()}
+          >
+            {sendingLog ? "Sending…" : "Send log now"}
+          </Button>
+        </div>
+        {!canSendLog && <p className="text-muted-foreground text-xs">{SEND_LOG_NEEDS_ACCOUNT}</p>}
+        {logSent !== null && (
+          // Inline under the button, never a toast; Rust worded it. A refusal
+          // takes the destructive colour but stays a status, not an alert.
+          <p
+            role="status"
+            className={
+              logSent.outcome === "failed"
+                ? "text-destructive text-xs"
+                : "text-muted-foreground text-xs"
+            }
+          >
+            {logSent.sentence}
+          </p>
+        )}
+        {sendLogError !== null && <p className="text-destructive text-xs">{sendLogError}</p>}
       </div>
 
       {macVoice && (

@@ -555,9 +555,9 @@ pub struct RenameOp {
 }
 
 /// Rename this device: move `devices/<from>.toml` and, when present,
-/// `keeper.<from>.toml`, `settings.<from>.toml` and `device.<from>.toml`
-/// inside `<login>/`. Refused when `from` is not registered, `to` is not a
-/// slug, or `to` is already taken.
+/// `keeper.<from>.toml`, `settings.<from>.toml`, `device.<from>.toml` and
+/// `logs/<from>.log` inside `<login>/`. Refused when `from` is not
+/// registered, `to` is not a slug, or `to` is already taken.
 pub fn plan_rename(
     files: &dyn RepoFiles,
     login: &str,
@@ -607,6 +607,19 @@ pub fn plan_rename(
                 to: destination,
             });
         }
+    }
+    // The uploaded log follows the device when there is one to move and the
+    // new name has none. It never decides whether the name is free: a log a
+    // deleted device left behind is not a registered device.
+    let (log_from, log_to) = (
+        super::log_upload::path(login, from),
+        super::log_upload::path(login, to),
+    );
+    if files.read(&log_from).is_some() && !taken(&log_to) {
+        ops.push(RenameOp {
+            from: log_from,
+            to: log_to,
+        });
     }
     if ops
         .iter()

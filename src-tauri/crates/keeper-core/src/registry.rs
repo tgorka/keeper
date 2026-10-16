@@ -1273,6 +1273,25 @@ pub fn set_auto_update(data_dir: &Path, enabled: bool) -> Result<(), CoreError> 
     set_setting(data_dir, AUTO_UPDATE_KEY, if enabled { "1" } else { "0" })
 }
 
+/// The daily log upload's settings key.
+const LOG_UPLOAD_KEY: &str = "diagnostics.log_upload";
+
+/// Read whether this device's log goes to the config repository daily.
+/// **Absent ⇒ on** ([`crate::org_account::log_upload::DEFAULT_ENABLED`]), and
+/// a layer file's pin wins, as for every key read through [`get_setting`].
+pub fn get_log_upload(data_dir: &Path) -> Result<bool, CoreError> {
+    Ok(match get_setting(data_dir, LOG_UPLOAD_KEY)?.as_deref() {
+        Some("0") => false,
+        Some("1") => true,
+        _ => crate::org_account::log_upload::DEFAULT_ENABLED,
+    })
+}
+
+/// Write whether this device's log goes to the config repository daily.
+pub fn set_log_upload(data_dir: &Path, enabled: bool) -> Result<(), CoreError> {
+    set_setting(data_dir, LOG_UPLOAD_KEY, if enabled { "1" } else { "0" })
+}
+
 /// List every muted Network label (Story 10.2, FR-52). Returns the `network_id`
 /// (display-label) of each present row; an empty vector means no Network is muted.
 /// Sorted ascending for determinism. Keeper-local — Matrix has no Network concept.
@@ -5990,6 +6009,23 @@ mod tests {
         assert!(!get_auto_update(&dir).expect("read back off"));
         set_auto_update(&dir, true).expect("enable");
         assert!(get_auto_update(&dir).expect("read back on"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Absent must read as on: the daily log upload is default-on, and every
+    /// install that predates the key has no row. An explicit `"0"` is the
+    /// only way off.
+    #[test]
+    fn log_upload_defaults_on_and_round_trips() {
+        let dir = temp_dir();
+        assert!(
+            get_log_upload(&dir).expect("read default"),
+            "an install that never answered uploads its log daily"
+        );
+        set_log_upload(&dir, false).expect("disable");
+        assert!(!get_log_upload(&dir).expect("read back off"));
+        set_log_upload(&dir, true).expect("enable");
+        assert!(get_log_upload(&dir).expect("read back on"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

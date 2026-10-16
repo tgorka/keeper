@@ -24,7 +24,7 @@ and it is enforced in two ways:
 | **`api.beeper.com`** | Only when at least one account is a Beeper account (by provider tag **or** by homeserver host `matrix.beeper.com`) | Beeper's unofficial email-code login and account service. Appears exactly once. |
 | Each sync profile's **git remote host** (e.g. `github.com`, `forgejo.example.org`) | One entry per distinct remote *host* across your folder-sync profiles (duplicates collapse to one); absent entirely for a profile whose remote is a local path or a pendrive, which reaches no network | Fetch, push and LFS transfer for that folder. Only the **host** is shown — never the repository path, the username, or a credential that a badly-stored profile put in the URL. See `egress::remote_host`. |
 | Each configured **AI provider's host** (e.g. `localhost`, `127.0.0.1`, `gw.example.org`) | One entry per distinct provider *host* across your Bots providers (duplicates collapse to one); absent entirely when no provider is configured, which is how keeper ships | Chat completions, model and capability discovery, and a bot probe against the Hermes, Ollama or OpenAI-compatible (`openai`) endpoint you typed. Only the **host** is shown — never the `/v1` path, a profile prefix, or a credential. See the provider chapter below, and `egress::remote_host`. |
-| Each **organisation account destination** (e.g. `id.acme.dev`, `git.acme.dev`) | Only while an account is set up in Settings › Account (`~/.keeper/account.toml`); absent entirely without one, which is how keeper ships. One entry per distinct host the account's descriptor names: its identity provider and any endpoint it overrides, the address the setup link was read from (while keeper still knows it), the settings repository and its `api_base`, and in `oauth` mode the forge's own sign-in | Sign-in, token refresh and sign-out against the identity provider; fetch and push of your own directory in the settings repository; reading the descriptor once when you paste or open a setup link (HTTPS only, no redirects, 64 KiB cap). Only the **host** is shown. The identity provider's discovery document may name further hosts (for example a `jwks_uri` on a CDN); those are the provider's choice and are reached only as it names them. See `egress::org_account_egress`. |
+| Each **organisation account destination** (e.g. `id.acme.dev`, `git.acme.dev`) | Only while an account is set up in Settings › Account (`~/.keeper/account.toml`); absent entirely without one, which is how keeper ships. One entry per distinct host the account's descriptor names: its identity provider and any endpoint it overrides, the address the setup link was read from (while keeper still knows it), the settings repository and its `api_base`, and in `oauth` mode the forge's own sign-in | Sign-in, token refresh and sign-out against the identity provider; fetch and push of your own directory in the settings repository; reading the descriptor once when you paste or open a setup link (HTTPS only, no redirects, 64 KiB cap). The push includes **this device's log**: the newest 512 KB of `keeper.log`, cut at a line, replacing `<login>/logs/<device>.log`, where everyone with access to the repository can read it. Before it leaves, every line is scrubbed: your home folder is written as `~`, and URL user names and passwords, credential-named query and fragment parameters (`access_token`, `code`, `client_secret`, …) and `Authorization`, `Bearer` and `Basic` values as `***`. The rest of the log goes as it is — account and Matrix ids, device and microphone names, paths outside your home folder, error text. It goes once a day while **Send this device's log to your account daily** in Settings › About (`diagnostics.log_upload`) is on, which it is unless switched off, and whenever you press **Send log now** there. See `docs/account.md` § *This device's log*. Only the **host** is shown. The identity provider's discovery document may name further hosts (for example a `jwks_uri` on a CDN); those are the provider's choice and are reached only as it names them. See `egress::org_account_egress`. |
 | **GitHub, for browsing repositories** (`api.github.com`; also `github.com` with a connection) | Only while GitHub is a repository source in use. While the account's descriptor names a GitHub broker (`[github_broker]`): `api.github.com`, the host the broker's tokens are sent to. While this device holds a GitHub connection made with *Connect GitHub*: that source's web host and API host, `github.com` and `api.github.com`. Absent otherwise, which is how keeper ships, since keeper's own GitHub app is not registered yet | `api.github.com`: listing the repositories the person may reach (`/installation/repositories` with a broker's token; `/user` and `/user/repos` with a connection). `github.com`: *Connect GitHub*'s device code, the wait for approval, and the refresh of an expiring connection. A GitHub drive's git and LFS traffic is the sync-remote row above. Only the **host** is shown, labelled *`<source name>` repositories* (*GitHub repositories* for the `github` source). See `egress::forge_egress` and the browsing chapter below. |
 | **The GitHub broker's host** (e.g. `broker.acme.dev`) | Only while the account's descriptor names `[github_broker]`; absent without an account | `GET /v1/whoami` and `POST /v1/token`, each carrying the account's sign-in access token, to get one-hour GitHub tokens for listing and for GitHub drives. See `docs/account.md` § *GitHub through your organization's broker*. Only the **host** is shown, labelled *GitHub access broker*. See `egress::forge_egress`. |
 | **`github.com/tgorka/keeper/releases/...`** (the signed-update `latest.json` endpoint) | On a cadence while the app runs (about every 6 hours, starting 2 minutes after launch) while **Update automatically** is on, and on every "Check for updates" click. Off — the switch in Settings → About, or `update.auto = false` in a config file — leaves the click as the only time it is contacted | Signed auto-updates (NFR-12). Downloads are cryptographically verified against keeper's minisign public key before installing. |
@@ -271,7 +271,10 @@ land in the local destination folder. A finished recording may be transcribed, o
 therefore empty. Like the update endpoint, this is enforced by tests: source-scan audits fail
 the build if a network API ever appears in the sidecar's Swift sources
 (`keeper_rec_sidecar_sources_are_network_free` in the `keeper` crate) or a network call or an
-upload, share or cloud affordance in the recording frontend (`zero-egress.test.ts`).
+upload, share or cloud affordance in the recording frontend (`zero-egress.test.ts`). With
+diagnostics consent, the app shell (not the sidecar or the recording UI) counts a lost microphone
+as one closed `keeper_recording_mic_lost` cause sent to the PostHog row already listed — see
+[the observability consent boundary](#the-observability-consent-boundary); no destination is added.
 
 ## Transcription adds no egress
 
@@ -491,7 +494,7 @@ host `us.posthog.com` is used only by separate maintainer tooling, not by the ap
 
 | Consent | What may leave | What it cannot enable |
 | --- | --- | --- |
-| Diagnostics | Closed readiness/interaction durations, sanitized frontend-error categories and content-free diagnostic records/operation traces | Raw exception text, stack payloads, arbitrary tracing strings or wholesale application logs; Rust panics in any form (Epic 100, R387: they stay in `keeper.log`) |
+| Diagnostics | Closed readiness/interaction durations, sanitized frontend-error categories, a closed microphone-loss cause per recording (`removed`, `stalled` or `silent`) and content-free diagnostic records/operation traces | Raw exception text, stack payloads, arbitrary tracing strings or wholesale application logs; Rust panics in any form (Epic 100, R387: they stay in `keeper.log`); the microphone's name, the sidecar's warning text or anything recorded |
 | Product statistics | Closed events for opening the command palette or settings | Search text, command names, setting values, person profiles or account identifiers |
 | Remote configuration | A request for the public `keeper-client-config` flag payload and a bounded support sentence | Collection, consent, security policy, destinations, grants, encryption changes or synchronized user preferences |
 | Synthetic usability study | Replay/heatmaps of a separate synthetic surface after explicit per-session start | Normal-app DOM or real account, drive, note, bot or recording content |
@@ -500,7 +503,9 @@ Normal observations carry a random installation identifier, never a Matrix ID
 or email, and no implicit cross-device identity. Payloads exclude messages,
 filenames, local paths, notes, credentials, recordings, bot prompts/responses,
 normal-app URLs, arbitrary DOM attributes, console values and network bodies.
-Recording zero-egress and on-device speech guarantees are unchanged.
+Recording sends no content and adds no destination, and on-device speech
+guarantees are unchanged; the one recording signal is the closed microphone-loss
+cause below, under diagnostics consent.
 
 **Epic 100 (R381, as amended by R387) adds one thing and nothing else:** a
 closed `surface` property on `keeper_interaction` — `slash_menu_opened`,
@@ -511,6 +516,15 @@ and non-agent work alike has no boundary that could tell an agent's panic
 apart, and agents stay out of PostHog fail-closed (S-19, NFR-121). What is
 logged where, and what never leaves the device, is
 [docs/observability.md](observability.md).
+
+**A lost microphone adds one closed count and nothing else:** when a recording
+loses its microphone, the app shell sends `keeper_recording_mic_lost` with one
+`cause` property — `removed` (unplugged, or its fallback failed), `stalled` (the
+feed stopped) or `silent` (only digital silence arrived) — at most once per cause
+per session, and only with diagnostics consent. It carries no duration, no
+device name, no warning message, no path and nothing recorded; the destination
+is the PostHog host already listed, and the recording sidecar itself still
+contacts no network host.
 
 **Transport still reveals metadata.** Direct HTTPS necessarily exposes the
 client's source IP, request timing and ordinary connection metadata to PostHog

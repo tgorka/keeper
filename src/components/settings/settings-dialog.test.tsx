@@ -185,6 +185,10 @@ vi.mock("@/lib/ipc/client", () => ({
   debugModeSet: vi.fn(() => Promise.resolve()),
   // Story 65.3: where this device's log is, and the voice port's record.
   debugLogPath: vi.fn(() => Promise.resolve("/Users/alice/Library/Logs/keeper/keeper.log")),
+  // About's daily log upload switch, and "Send log now" (disabled here: no account).
+  logUploadGet: vi.fn(() => Promise.resolve(true)),
+  logUploadSet: vi.fn((enabled: boolean) => Promise.resolve(enabled)),
+  accountSendLog: vi.fn(),
   voiceEvents: vi.fn(() => Promise.resolve([])),
   verificationCancel: vi.fn(() => Promise.resolve()),
   iosSyncDisclosureShownGet: vi.fn(() => Promise.resolve(true)),
