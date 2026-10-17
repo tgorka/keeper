@@ -14,7 +14,17 @@ const patterns = [
   },
   // Encoded JSON capsules distinguish service tokens from ordinary ops_ identifiers.
   { name: "1Password service credential", value: /ops_eyJ[A-Za-z0-9+/_-]{250,}={0,3}/ },
-  { name: "GitHub credential", value: /(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]{20,}/ },
+  // Real GitHub tokens are fixed-length: classic PATs, OAuth and app tokens are
+  // the prefix plus exactly 36 base62 chars (40 total); fine-grained PATs are
+  // `github_pat_` plus exactly 82. The previous {20,} run refused a good
+  // aarch64 release binary (tag v0.10.4, run 38985969948): machine code is full
+  // of incidental `[A-Za-z0-9_]{20,}` runs, and one formed the shape. The
+  // sibling x86_64 binary from the same commit passed, which a genuine
+  // credential in rodata could not. Length-anchored with a trailing boundary,
+  // so a run that merely CONTAINS the prefix+36 inside longer bytes does not
+  // match; a real credential still does.
+  { name: "GitHub credential", value: /gh[pousr]_[A-Za-z0-9]{36}(?![A-Za-z0-9_])/ },
+  { name: "GitHub credential", value: /github_pat_[A-Za-z0-9_]{82}(?![A-Za-z0-9_])/ },
   { name: "private key", value: /-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/ },
   {
     name: "minisign private key",

@@ -465,8 +465,11 @@ jobs:
           fi
           rm -f flipped keeper.pub "$OUT.minisig" "$OUT.checked"
 
+      # The dry run keeps its artifacts; a failed gate run keeps them too, so a
+      # refusal can be examined against the real binary instead of guessed at
+      # (a scan that refused a good aarch64 build cost the tag once).
       - name: Keep the dry run's artifacts
-        if: ${{ github.event_name == 'workflow_dispatch' }}
+        if: ${{ !success() || github.event_name == 'workflow_dispatch' }}
         uses: actions/upload-artifact@v4
         with:
           name: keeper-agentd-${{ matrix.target }}
