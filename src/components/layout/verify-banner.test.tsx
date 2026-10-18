@@ -5,6 +5,7 @@ import type { AccountVm } from "@/lib/ipc/client";
 import { accountsStore } from "@/lib/stores/accounts";
 import { encryptionStatusStore } from "@/lib/stores/encryption-status";
 import { primaryViewStore } from "@/lib/stores/primary-view";
+import { verificationStore } from "@/lib/stores/verification";
 
 function account(accountId: string): AccountVm {
   return {
@@ -16,17 +17,15 @@ function account(accountId: string): AccountVm {
   };
 }
 
-beforeEach(() => {
+function reset() {
   encryptionStatusStore.getState().reset();
   accountsStore.getState().clear();
   primaryViewStore.getState().setView("inbox");
-});
+  verificationStore.setState({ modalOpen: false, activeAccountId: null, flow: null });
+}
 
-afterEach(() => {
-  encryptionStatusStore.getState().reset();
-  accountsStore.getState().clear();
-  primaryViewStore.getState().setView("inbox");
-});
+beforeEach(reset);
+afterEach(reset);
 
 describe("VerifyBanner", () => {
   it("is hidden when no account is unverified", () => {
@@ -51,13 +50,15 @@ describe("VerifyBanner", () => {
     expect(VERIFY_BANNER_TEXT).toBe("Verify this device to read encrypted history");
   });
 
-  it("its CTA goes to the Settings view", () => {
-    primaryViewStore.getState().setView("inbox");
-    accountsStore.getState().hydrateAll([account("a")]);
-    encryptionStatusStore.getState().setStatus("a", "unverified");
+  it("its CTA opens verification for the unverified account, not just Settings", () => {
+    accountsStore.getState().hydrateAll([account("a"), account("b")]);
+    encryptionStatusStore.getState().setStatus("a", "verified");
+    encryptionStatusStore.getState().setStatus("b", "unverified");
     render(<VerifyBanner />);
     fireEvent.click(screen.getByRole("button", { name: "Verify" }));
-    expect(primaryViewStore.getState().view).toBe("settings");
+    expect(verificationStore.getState().modalOpen).toBe(true);
+    expect(verificationStore.getState().activeAccountId).toBe("b");
+    expect(primaryViewStore.getState().view).toBe("inbox");
   });
 
   it("dismissing hides it and sets the dismissal flag (collapses to badge)", () => {

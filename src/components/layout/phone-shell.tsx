@@ -98,6 +98,7 @@ import { PhoneSearchSurface } from "@/components/layout/phone-search-surface";
 import { SettingsPane } from "@/components/layout/settings-pane";
 import { OFFLINE_PILL_TEXT } from "@/components/layout/sidebar-pane";
 import { SyncPane } from "@/components/layout/sync-pane";
+import { VerifyBanner } from "@/components/layout/verify-banner";
 import { NotesPhoneList, NotesPhoneNote } from "@/components/notes/notes-phone-pane";
 import { SESSIONS_PANE_TITLE } from "@/components/sessions/sessions-pane";
 import { SessionsPhoneBoard, SessionsPhoneList } from "@/components/sessions/sessions-phone-pane";
@@ -962,6 +963,9 @@ export function PhoneShell() {
         {level === 0 && pullIndicator}
         {level === 0 && statusBand}
         <PhoneInboxHeader drawerButtonRef={drawerButtonRef} magnifierRef={magnifierRef} />
+        {/* Under the header, which already clears the status bar; the shell
+            above the stack has no safe-area padding of its own. */}
+        <VerifyBanner />
         <div className="flex min-h-0 min-w-0 flex-1">
           <ChatListPane />
         </div>

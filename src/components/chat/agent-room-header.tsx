@@ -224,7 +224,7 @@ export function AgentRoomHeader({
               variant="outline"
               data-testid="agent-searches-unasked"
               title={status.searchesUnasked}
-              className="text-amber-700 dark:text-amber-400"
+              className="text-held"
             >
               <Globe aria-hidden="true" />
               <span className="sr-only">{status.searchesUnasked}</span>
