@@ -154,6 +154,7 @@ import {
   ensureSyncHydrated,
   removeSyncProfile,
   rescanSyncProfile,
+  resetSyncProfile,
   setSyncProfileEnabled,
   startSyncStatusPolling,
   syncErrorMessage,
@@ -367,6 +368,20 @@ function SyncFolderFootprint({ profileId }: { profileId: string }): React.ReactE
 export const SYNC_RESCAN_LABEL = "Recheck all files";
 export const SYNC_RESCAN_NOTE =
   "Forget what keeper remembers about this folder and look at every file again. Use it when a file is on disk but never appears as waiting to sync — a copy that kept its original modification time can look identical to a file keeper has already accounted for.";
+
+/**
+ * "Reset this copy" — the phone's second way out of a divergence (AD-199),
+ * offered beside the sentence that names it and nowhere else: Rust says when
+ * (`SyncStatusVm.resettable`), and composes what the reset did
+ * (`SyncResetVm.line`). The confirmation says what is kept, because a person
+ * reading "reset" fears the one thing this does not do.
+ */
+export const SYNC_RESET_LABEL = "Reset this copy";
+export const SYNC_RESET_CONFIRM_TITLE = "Reset this copy to the remote?";
+export const SYNC_RESET_CONFIRM_SENTENCE =
+  "This copy takes the remote's files. Nothing of the phone's is lost: every file it changed is kept beside the remote's as a .sync-conflict-… copy, a file only the phone has stays where it is, both are pushed so a Mac can see them, and the phone's history is kept on this device.";
+export const SYNC_RESET_CONFIRM_LABEL = "Reset";
+export const SYNC_RESET_CANCEL_LABEL = "Cancel";
 
 /** The parked-unit action label. */
 export const SYNC_RETRY_LABEL = "Retry";
@@ -1008,6 +1023,10 @@ function SyncProfileCard({
   const [editing, setEditing] = useState(false);
   /** Whether this folder's remove confirmation is open. Also per card. */
   const [confirmOpen, setConfirmOpen] = useState(false);
+  /** Whether this folder's reset confirmation is open. */
+  const [resetOpen, setResetOpen] = useState(false);
+  /** What the last reset on this card did, in Rust's words. */
+  const [resetLine, setResetLine] = useState<string | null>(null);
 
   /**
    * Run a card action with the shared busy/error lifecycle, then re-read this
@@ -1024,6 +1043,7 @@ function SyncProfileCard({
     // Any action supersedes the last sync report: Pause and Remove make it
     // stale, and a fresh Sync now is about to replace it.
     setOutcome(null);
+    setResetLine(null);
     try {
       await action();
     } catch (raw) {
@@ -1301,6 +1321,26 @@ function SyncProfileCard({
             {outcome.line}
           </p>
         )}
+        {status?.resettable === true && (
+          // Beside the divergence sentence the status line above carries, and
+          // only there: the one condition a reset exists for.
+          <div className="flex flex-wrap items-center gap-2">
+            <Button
+              type="button"
+              variant="outline"
+              size="xs"
+              disabled={busy}
+              onClick={() => setResetOpen(true)}
+            >
+              {SYNC_RESET_LABEL}
+            </Button>
+          </div>
+        )}
+        {resetLine !== null && (
+          <p role="status" className="text-muted-foreground text-xs">
+            {resetLine}
+          </p>
+        )}
         {actionError !== null && <p className="text-destructive text-xs">{actionError}</p>}
         {detail?.error != null && (
           <p role="alert" className="text-destructive text-xs">
@@ -1337,6 +1377,27 @@ function SyncProfileCard({
           onRetryAll={retryAllUnits}
         />
       </CardContent>
+      <AlertDialog open={resetOpen} onOpenChange={setResetOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>{SYNC_RESET_CONFIRM_TITLE}</AlertDialogTitle>
+            <AlertDialogDescription>{SYNC_RESET_CONFIRM_SENTENCE}</AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>{SYNC_RESET_CANCEL_LABEL}</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={() => {
+                void run(async () => {
+                  const reset = await resetSyncProfile(profile.id);
+                  setResetLine(reset.line);
+                });
+              }}
+            >
+              {SYNC_RESET_CONFIRM_LABEL}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
       {/* The Settings row's confirmation, verbatim: same title, same sentence,
           same two labels, same store action. Removal is the one thing on this
           card that cannot be undone, so what it keeps has to be worded in

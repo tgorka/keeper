@@ -1452,6 +1452,7 @@ pub fn run() {
                 sync_ipc::sync_profile_remove,
                 sync_ipc::sync_profile_set_enabled,
                 sync_ipc::sync_folder_now,
+                sync_ipc::sync_folder_reset,
                 sync_ipc::sync_verify,
                 sync_ipc::sync_rescan,
                 sync_ipc::sync_footprint,

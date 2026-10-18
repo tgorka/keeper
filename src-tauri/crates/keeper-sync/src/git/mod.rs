@@ -48,6 +48,7 @@ pub mod fetch;
 pub mod history;
 pub mod push_http;
 pub mod repo;
+pub mod reset;
 pub mod resolve;
 
 pub use cli::{GitCapabilities, GitCli};

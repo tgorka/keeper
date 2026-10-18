@@ -26,6 +26,7 @@ vi.mock("@/lib/ipc/client", () => ({
   syncProfileRemove: vi.fn(),
   syncProfileSetEnabled: vi.fn(),
   syncFolderNow: vi.fn(),
+  syncFolderReset: vi.fn(),
   syncVerify: vi.fn(),
   // The path control (Story 32.4): resolves and opens the folder in Rust.
   syncOpenPath: vi.fn(),
@@ -96,6 +97,9 @@ import {
   SYNC_PROBLEMS_TITLE,
   SYNC_RESCAN_LABEL,
   SYNC_RESCAN_NOTE,
+  SYNC_RESET_CONFIRM_LABEL,
+  SYNC_RESET_CONFIRM_SENTENCE,
+  SYNC_RESET_LABEL,
   SYNC_RETRY_ALL_LABEL,
   SYNC_RETRY_LABEL,
   SYNC_SETTLING_NOTE,
@@ -148,6 +152,7 @@ import {
   copyStatus,
   syncActivity,
   syncFolderNow,
+  syncFolderReset,
   syncFootprint,
   syncGetCredential,
   syncListSettingsGet,
@@ -189,6 +194,7 @@ const mockPending = vi.mocked(syncPending);
 const mockProblems = vi.mocked(syncProblems);
 const mockRetryParked = vi.mocked(syncRetryParked);
 const mockFolderNow = vi.mocked(syncFolderNow);
+const mockFolderReset = vi.mocked(syncFolderReset);
 const mockSetEnabled = vi.mocked(syncProfileSetEnabled);
 const mockSubscribe = vi.mocked(syncSubscribeProgress);
 const mockUnsubscribe = vi.mocked(syncUnsubscribeProgress);
@@ -277,6 +283,7 @@ function statusVm(over: Partial<SyncStatusVm> = {}): SyncStatusVm {
     error: null,
     lastSyncMs: null,
     needsAttention: false,
+    resettable: false,
     ...over,
   };
 }
@@ -554,6 +561,51 @@ describe("SyncPane profile header", () => {
     expect(
       await screen.findByText("Nothing to sync — this folder already matches the remote."),
     ).toBeInTheDocument();
+  });
+
+  /**
+   * AD-199's second way out. The button stands beside the divergence sentence
+   * only where Rust says the sentence is that one (`resettable`), asks first,
+   * and then says what the reset did in Rust's words.
+   */
+  it("offers Reset this copy beside a phone's divergence and says what it kept", async () => {
+    const sentence =
+      "tgdrive — this phone has 1 commit the remote does not; push them, or reset this copy — nothing is merged on a phone";
+    mockStatuses.mockResolvedValue([
+      statusVm({
+        state: "needsAttention",
+        pending: 0,
+        error: sentence,
+        needsAttention: true,
+        resettable: true,
+        line: RUST_LINE,
+      }),
+    ]);
+    mockFolderReset.mockResolvedValue({
+      copies: ["README.sync-conflict-20261018-120000-kalypso.md"],
+      kept: [],
+      saved: "refs/keeper/reset/20261018-120000",
+      pushed: true,
+      line: "This copy is the remote's again. 1 of the phone's files is kept beside the remote's as .sync-conflict-… copies.",
+    });
+    await renderPane();
+
+    fireEvent.click(screen.getByRole("button", { name: SYNC_RESET_LABEL }));
+    expect(await screen.findByText(SYNC_RESET_CONFIRM_SENTENCE)).toBeInTheDocument();
+    expect(mockFolderReset).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: SYNC_RESET_CONFIRM_LABEL }));
+
+    await waitFor(() => expect(mockFolderReset).toHaveBeenCalledWith("p1"));
+    const report = await screen.findByText(/^This copy is the remote's again\./);
+    expect(report).toHaveAttribute("role", "status");
+  });
+
+  it("offers no reset where Rust has not said the folder is resettable", async () => {
+    mockStatuses.mockResolvedValue([
+      statusVm({ state: "needsAttention", error: "some other failure", needsAttention: true }),
+    ]);
+    await renderPane();
+    expect(screen.queryByRole("button", { name: SYNC_RESET_LABEL })).not.toBeInTheDocument();
   });
 
   it("does not dress a conflict up as a success", async () => {

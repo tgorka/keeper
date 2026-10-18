@@ -42,4 +42,11 @@ warning: string | null, error: string | null, lastSyncMs: number | null,
  * Whether this condition needs a human before the profile can progress.
  * Drives the split between a passive amber line and an actionable notice.
  */
-needsAttention: boolean, };
+needsAttention: boolean, 
+/**
+ * Whether `error` is the phone's divergence sentence (AD-199), beside
+ * which the Sync surface offers "Reset this copy" (`sync_folder_reset`).
+ * Decided in Rust (`keeper_sync::engine::is_phone_divergence`) so the
+ * webview never reads the sentence to find out.
+ */
+resettable: boolean, };

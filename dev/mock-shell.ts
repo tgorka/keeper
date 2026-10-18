@@ -1778,6 +1778,7 @@ const ANSWERS: Record<string, unknown> = {
     warning: null,
     error: null,
     needsAttention: false,
+    resettable: false,
   })) satisfies SyncStatusVm[],
   sync_problems: {
     warning: null,

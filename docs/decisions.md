@@ -824,7 +824,11 @@ shortcut.
   recorded beside the profile and shown as its status. (AD-198, AD-199; FR-460…FR-463,
   NFR-57; Epic 66, Story 66.2; `docs/ios.md`, *The folder on the phone*)
 - **The costs, stated so they are chosen:** a divergence needs a person and a Mac — the
-  phone can only name it; a worktree lane and a profile with subpaths refuse on the phone
+  phone names it and can only *reset this copy* (`Engine::phone_reset`: the remote wins
+  every path, the phone's revisions are kept beside them as conflict copies and pushed,
+  its history under `refs/keeper/reset/<stamp>`), so choosing between the two revisions
+  happens on the Mac; a phone's history starts one commit deep at its first fetch
+  (`PHONE_FIRST_FETCH_DEPTH`, kalypso 2026-10-18); a worktree lane and a profile with subpaths refuse on the phone
   at their first sync (the `cli.rs` sentences); nothing repacks on the phone, so the Mac
   keeps the folder's objects bounded; a folder converges only while keeper is in front,
   so a note written on the Mac arrives on the phone the next time keeper opens, not

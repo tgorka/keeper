@@ -769,6 +769,7 @@ export type { SyncProblemsVm } from "./gen/SyncProblemsVm";
 export type { SyncProfileReq } from "./gen/SyncProfileReq";
 export type { SyncProfileVm } from "./gen/SyncProfileVm";
 export type { SyncProgressVm } from "./gen/SyncProgressVm";
+export type { SyncResetVm } from "./gen/SyncResetVm";
 export type { SyncStatusVm } from "./gen/SyncStatusVm";
 export type { SyncUnspellableVm } from "./gen/SyncUnspellableVm";
 export type { SyncVerifyVm } from "./gen/SyncVerifyVm";
@@ -1015,6 +1016,7 @@ import type { SyncProblemsVm } from "./gen/SyncProblemsVm";
 import type { SyncProfileReq } from "./gen/SyncProfileReq";
 import type { SyncProfileVm } from "./gen/SyncProfileVm";
 import type { SyncProgressVm } from "./gen/SyncProgressVm";
+import type { SyncResetVm } from "./gen/SyncResetVm";
 import type { SyncStatusVm } from "./gen/SyncStatusVm";
 import type { SyncVerifyVm } from "./gen/SyncVerifyVm";
 import type { TagVocabularyVm } from "./gen/TagVocabularyVm";
@@ -4136,6 +4138,19 @@ export async function syncProfileSetEnabled(id: string, enabled: boolean): Promi
  */
 export async function syncFolderNow(id: string): Promise<SyncOutcomeVm> {
   return await invoke<SyncOutcomeVm>("sync_folder_now", { id });
+}
+
+/**
+ * Reset a diverged phone folder onto the remote (AD-199): the remote's files
+ * take every path, the phone's own revisions are kept beside them as conflict
+ * copies and pushed, and its history stays under a local ref. Offered only
+ * where `SyncStatusVm.resettable` says so; a desktop refuses.
+ *
+ * Rejects with: `unsupported`, `serverUnreachable` (retriable),
+ * `invalidCredentials`, `internal`.
+ */
+export async function syncFolderReset(id: string): Promise<SyncResetVm> {
+  return await invoke<SyncResetVm>("sync_folder_reset", { id });
 }
 
 /**
