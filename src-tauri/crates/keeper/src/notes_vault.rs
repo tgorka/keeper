@@ -351,16 +351,46 @@ pub fn refresh(app: &AppHandle) {
     // The untouched new notes a previous run left (AD-304) are settled on the
     // same thread and the same terms: they are read from the vault, which can
     // stall like the seeding.
+    //
+    // **Never into a drive that has no history yet.** A seed written before
+    // the first clone makes the folder non-empty, so the engine adopts it
+    // instead of cloning, and the ten default notes become the root commit of
+    // a history the remote has never seen. A desktop merges its way out; a
+    // phone never merges (AD-199) and says "reset this copy" for ever — both
+    // of kalypso's drives, for two weeks (2026-10-18). The seed waits for the
+    // first pass that brings history down, which is also the pass that
+    // usually brings the remote's own ledgers with it; the phone refreshes
+    // after every pass (`phone_synced`) and the desktop on its next refresh.
+    // Asked on the spawned thread, because opening the repository is a read
+    // of the vault's volume like the seed's own.
     let data_dir = app.state::<crate::ipc::AppState>().platform.data_dir().ok();
+    let drives: HashMap<&str, (&str, bool)> = profiles
+        .iter()
+        .map(|p| (p.id.as_str(), (p.branch.as_str(), p.removable)))
+        .collect();
     for vault in registered {
         let data_dir = data_dir.clone();
+        let drive = drives
+            .get(vault.id.as_str())
+            .map(|(branch, removable)| ((*branch).to_owned(), *removable));
         tauri::async_runtime::spawn_blocking(move || {
-            crate::notes_ipc::seed_default_spaces(&vault);
-            // The templates go in beside the spaces, on the same terms:
-            // idempotent by construction, planned against the directory rather
-            // than the index, and never on a vault that has already been
-            // offered them (Story 44.7).
-            crate::notes_ipc::seed_default_templates(&vault);
+            let seedable = drive.is_some_and(|(branch, removable)| {
+                keeper_sync::git::repo::has_history(&vault.local_path, &branch, removable)
+            });
+            if seedable {
+                crate::notes_ipc::seed_default_spaces(&vault);
+                // The templates go in beside the spaces, on the same terms:
+                // idempotent by construction, planned against the directory
+                // rather than the index, and never on a vault that has
+                // already been offered them (Story 44.7).
+                crate::notes_ipc::seed_default_templates(&vault);
+            } else {
+                tracing::info!(
+                    vault = %vault.id,
+                    "notes: this drive has no history yet; the default spaces and templates \
+                     wait for its first sync"
+                );
+            }
             if let Some(dir) = &data_dir {
                 crate::notes_ipc::sweep_pristine(dir, &vault);
             }

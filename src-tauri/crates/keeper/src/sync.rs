@@ -690,6 +690,13 @@ pub fn phone_sync_all(app: &tauri::AppHandle, when: &'static str) {
                 return;
             }
         };
+        // The account credential answers a drive by its remote, read from a
+        // cache that only a listing fills (AD-330). On a cold launch nothing has
+        // listed yet: the first drive was refused "keeper does not know this
+        // drive's remote yet" on every launch while the miss refilled the cache
+        // for the drives after it — kalypso's tgdrive, every open for two weeks
+        // (2026-10-18). This is a listing, so it says so.
+        crate::account_ipc::note_drives(&profiles);
         // A card move a crash cut short is finished before any pass can
         // commit half of it (98.2, R346).
         crate::sessions_root::finish_interrupted_before_pass(&profiles).await;

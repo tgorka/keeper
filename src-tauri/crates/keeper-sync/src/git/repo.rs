@@ -2265,6 +2265,34 @@ pub fn head_commit_id(repo: &gix::Repository) -> Result<Option<gix::hash::Object
     Ok(id.map(gix::Id::detach))
 }
 
+/// Whether the folder at `root` holds history a write could be made on top
+/// of: a commit on `HEAD`, or the remote's `branch` already fetched.
+///
+/// `false` for a folder that is not a repository yet — a drive before its
+/// first clone — and for an unborn branch nothing has been fetched into.
+/// Anything written into such a folder becomes the root of a history of its
+/// own: `Engine::open_repo` adopts a non-empty folder
+/// instead of cloning it, the first commit has no parent, and on a phone,
+/// which never merges, that copy can then never take the remote's history
+/// (AD-199). Kalypso's two drives sat in exactly that state for two weeks
+/// over ten default notes written before the first clone (2026-10-18).
+///
+/// Read-only, and every failure to open or resolve answers `false`: the
+/// caller is deciding whether to *wait*, and waiting is the safe answer to a
+/// folder it cannot read.
+pub fn has_history(root: &Path, branch: &str, trust_full: bool) -> bool {
+    let Ok(repo) = open_read_only(root, trust_full) else {
+        return false;
+    };
+    if matches!(head_commit_id(&repo), Ok(Some(_))) {
+        return true;
+    }
+    matches!(
+        resolve_reference(&repo, &format!("refs/remotes/origin/{branch}")),
+        Ok(Some(_))
+    )
+}
+
 /// Whether this repository's index holds no entries at all.
 ///
 /// A repository that has never been staged answers `true` and so does one
@@ -5536,6 +5564,54 @@ mod tests {
     fn head_commit_id_follows_a_commit() {
         let (_dir, repo) = repo_with_two_files();
         assert!(head_commit_id(&repo).expect("head").is_some());
+    }
+
+    /// A folder nothing has cloned into yet has no history to write on top
+    /// of, and neither has an unborn branch: either way the first commit made
+    /// there would be a root of its own.
+    #[test]
+    fn has_history_is_false_before_anything_was_cloned_or_committed() {
+        let plain = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(plain.path().join("10-notes")).expect("vault folder");
+        assert!(
+            !has_history(plain.path(), "main", false),
+            "not a repository"
+        );
+
+        let unborn = tempfile::tempdir().expect("tempdir");
+        gix::init(unborn.path()).expect("init");
+        assert!(
+            !has_history(unborn.path(), "main", false),
+            "an unborn branch"
+        );
+    }
+
+    #[test]
+    fn has_history_follows_a_commit_on_head() {
+        let (dir, _repo) = repo_with_two_files();
+        assert!(has_history(dir.path(), "main", false));
+    }
+
+    /// The phone's first pass: the fetch has landed the remote's branch and
+    /// the local one is still unborn. That is history — the fast-forward will
+    /// adopt it — so nothing needs to wait for it.
+    #[test]
+    fn has_history_counts_a_fetched_tracking_branch_on_an_unborn_head() {
+        let (dir, repo) = repo_with_two_files();
+        let tip = head_commit_id(&repo).expect("head").expect("a commit");
+        let git_dir = dir.path().join(".git");
+        let head = std::fs::read_to_string(git_dir.join("HEAD")).expect("HEAD");
+        let branch = head
+            .trim()
+            .strip_prefix("ref: ")
+            .expect("HEAD names a branch");
+        std::fs::remove_file(git_dir.join(branch)).expect("unborn again");
+        std::fs::create_dir_all(git_dir.join("refs/remotes/origin")).expect("remotes");
+        std::fs::write(git_dir.join("refs/remotes/origin/main"), format!("{tip}\n"))
+            .expect("tracking ref");
+
+        assert!(!has_history(dir.path(), "trunk", false), "another branch");
+        assert!(has_history(dir.path(), "main", false));
     }
 
     #[test]
