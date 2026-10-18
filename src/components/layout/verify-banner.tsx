@@ -4,8 +4,8 @@
  * Shows only when at least one signed-in account's device is `Unverified` AND the
  * banner has not been dismissed this session ({@link useShowVerifyBanner}). Never
  * shows on `Unknown` (no nag before crypto has synced) and clears on `Verified`.
- * The CTA opens the global Settings dialog (the honest destination — the
- * interactive verify flow lands in Story 3.2); the dismiss button collapses the
+ * The CTA opens the verification flow itself ({@link openDeviceVerification});
+ * the dismiss button collapses the
  * banner to a persistent Settings badge for this session (never gone). Dismissal
  * is session-scoped (zustand only; no persistence), so a restart re-nudges a
  * still-unverified device.
@@ -15,7 +15,7 @@ import { Alert, AlertAction, AlertDescription } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { IconHint } from "@/components/ui/tooltip";
 import { encryptionStatusStore, useShowVerifyBanner } from "@/lib/stores/encryption-status";
-import { primaryViewStore } from "@/lib/stores/primary-view";
+import { openDeviceVerification } from "@/lib/verify-device";
 
 /** The honest, verbatim banner copy (Story 3.1 fixed string). */
 export const VERIFY_BANNER_TEXT = "Verify this device to read encrypted history";
@@ -38,12 +38,7 @@ export function VerifyBanner() {
       <Alert role="status" className="pr-24">
         <AlertDescription className="text-foreground">{VERIFY_BANNER_TEXT}</AlertDescription>
         <AlertAction className="flex items-center gap-1">
-          <Button
-            type="button"
-            variant="outline"
-            size="xs"
-            onClick={() => primaryViewStore.getState().setView("settings")}
-          >
+          <Button type="button" variant="outline" size="xs" onClick={openDeviceVerification}>
             Verify
           </Button>
           <IconHint label="Dismiss">

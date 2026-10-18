@@ -1,15 +1,20 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { UTD_STUB_TEXT, UtdStub } from "@/components/chat/utd-stub";
+import { accountsStore } from "@/lib/stores/accounts";
+import { encryptionStatusStore } from "@/lib/stores/encryption-status";
 import { primaryViewStore } from "@/lib/stores/primary-view";
+import { verificationStore } from "@/lib/stores/verification";
 
-beforeEach(() => {
+function reset() {
   primaryViewStore.getState().setView("inbox");
-});
+  accountsStore.getState().clear();
+  encryptionStatusStore.getState().reset();
+  verificationStore.setState({ modalOpen: false, activeAccountId: null, flow: null });
+}
 
-afterEach(() => {
-  primaryViewStore.getState().setView("inbox");
-});
+beforeEach(reset);
+afterEach(reset);
 
 describe("UtdStub", () => {
   it("renders the honest undecryptable copy (never blank)", () => {
@@ -18,12 +23,30 @@ describe("UtdStub", () => {
     expect(UTD_STUB_TEXT).toBe("Can't decrypt yet — verify this device or restore key backup");
   });
 
-  it("its inline Verify action goes to the Settings view", () => {
-    primaryViewStore.getState().setView("inbox");
+  // Inside a room on the phone a view change is invisible — the room outranks
+  // it — so the action has to open the dialog itself (kalypso, 2026-10-18).
+  it("its inline Verify action opens verification for the unverified device", () => {
+    accountsStore.getState().hydrateAll([
+      {
+        accountId: "a",
+        userId: "@a:example.org",
+        homeserverUrl: "https://matrix.example.org/",
+        hueIndex: 0,
+        provider: "password",
+      },
+    ]);
+    encryptionStatusStore.getState().setStatus("a", "unverified");
     render(<UtdStub />);
     fireEvent.click(screen.getByRole("button", { name: "Verify" }));
-    // Settings is a primary view now, not a dialog — the action still has to
-    // land the user on the surface that can actually verify the device.
+    expect(verificationStore.getState().modalOpen).toBe(true);
+    expect(verificationStore.getState().activeAccountId).toBe("a");
+    expect(primaryViewStore.getState().view).toBe("inbox");
+  });
+
+  it("falls back to Settings when no device is known to be unverified", () => {
+    render(<UtdStub />);
+    fireEvent.click(screen.getByRole("button", { name: "Verify" }));
+    expect(verificationStore.getState().modalOpen).toBe(false);
     expect(primaryViewStore.getState().view).toBe("settings");
   });
 

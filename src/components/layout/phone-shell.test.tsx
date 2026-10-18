@@ -20,6 +20,7 @@ import { archiveRoomsStore } from "@/lib/stores/archive-rooms";
 import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
 import { composerStore } from "@/lib/stores/composer";
 import { detailStore } from "@/lib/stores/detail-ui";
+import { encryptionStatusStore } from "@/lib/stores/encryption-status";
 import { favoritesRoomsStore } from "@/lib/stores/favorites-rooms";
 import { leadingDrawerStore } from "@/lib/stores/leading-drawer";
 import { pinsRoomsStore } from "@/lib/stores/pins-rooms";
@@ -165,6 +166,7 @@ import { PhoneShell, TABLET_NO_ROOM_SENTENCE } from "@/components/layout/phone-s
 import { PROXY_DOCK_LABEL } from "@/components/layout/proxy-dock-sheet";
 import { sidebarViews } from "@/components/layout/sidebar-pane";
 import { COPY_SUBMIT_LABEL } from "@/components/layout/sync-pane";
+import { VERIFY_BANNER_TEXT } from "@/components/layout/verify-banner";
 import {
   SESSIONS_PHONE_OPEN_ROOM,
   SESSIONS_PHONE_ROOM_ABSENT,
@@ -764,6 +766,32 @@ describe("PhoneShell", () => {
     expect(screen.queryByRole("tablist")).not.toBeInTheDocument();
     // The chat list renders below the header (its loading state with no account).
     expect(screen.getByLabelText("Loading conversations")).toBeInTheDocument();
+  });
+
+  // Above the stack it sat under the status bar, untappable (kalypso,
+  // 2026-10-18); the Inbox header is what clears the safe area.
+  it("puts the verify banner under the Inbox header, inside the safe area", () => {
+    accountsStore.getState().hydrateAll([
+      {
+        accountId: "a",
+        userId: "@a:example.org",
+        homeserverUrl: "https://matrix.example.org/",
+        hueIndex: 0,
+        provider: "password",
+      },
+    ]);
+    encryptionStatusStore.getState().setStatus("a", "unverified");
+    try {
+      render(<PhoneShell />);
+      const header = screen.getByRole("banner");
+      const banner = screen.getByText(VERIFY_BANNER_TEXT);
+      expect(
+        header.compareDocumentPosition(banner) & Node.DOCUMENT_POSITION_FOLLOWING,
+      ).toBeTruthy();
+      expect(header).not.toContainElement(banner);
+    } finally {
+      encryptionStatusStore.getState().reset();
+    }
   });
 
   it("opens the leading drawer from the Inbox header avatar and renders the reused sidebar", async () => {

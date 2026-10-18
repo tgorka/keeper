@@ -357,7 +357,11 @@ export function AppShell() {
             />
           </div>
         )}
-        <VerifyBanner />
+        {/* Not on the phone: here it sat above the stack, outside the safe
+            area every phone header pads for, so the status bar covered it and
+            its Verify could not be tapped (kalypso, 2026-10-18). The phone
+            renders it inside the Inbox level, under its header. */}
+        {!phone && <VerifyBanner />}
         <div className="flex min-h-0 min-w-0 flex-1">
           {phone ? (
             // The single-pane stack replaces the sidebar + panes row (Story
