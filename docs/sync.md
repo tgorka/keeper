@@ -3564,8 +3564,10 @@ fsmonitor; it feeds the walk directly.
    per request and keeper asks for one; a first materialize of a hundred
    thousand objects is a hundred thousand round trips, bounded by latency, not
    bandwidth. Recorded, not fixed (review 2026-09-08, F-LFS-4).
-9. **Every clone is full.** Nothing is shallow or partial; a fresh clone pays
-   the whole history and all heads. Two clones of one remote on one machine
+9. **Every desktop clone is full.** Nothing is shallow or partial on a Mac; a
+   fresh clone pays the whole history and all heads. A phone is the exception:
+   its first clone or fetch is one commit deep (`PHONE_FIRST_FETCH_DEPTH`,
+   `docs/ios.md`), and its history starts there. Two clones of one remote on one machine
    share nothing and cannot reach each other while the remote is down.
 10. **A foreign `.gitattributes` rule other than `filter=lfs`** (`text=auto`,
     `ident`, another filter) is not applied by keeper's staging, so a path

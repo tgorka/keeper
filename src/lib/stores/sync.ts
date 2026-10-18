@@ -25,9 +25,11 @@ import {
   type SyncOutcomeVm,
   type SyncProfileReq,
   type SyncProfileVm,
+  type SyncResetVm,
   type SyncStatusVm,
   type SyncVerifyVm,
   syncFolderNow,
+  syncFolderReset,
   syncProfileRemove,
   syncProfileSave,
   syncProfileSetEnabled,
@@ -590,6 +592,18 @@ export async function syncProfileNow(id: string): Promise<SyncOutcomeVm> {
   const outcome = await syncFolderNow(id);
   await refreshSyncStatuses();
   return outcome;
+}
+
+/**
+ * Reset a diverged phone folder onto the remote (AD-199), then re-read the
+ * statuses: the divergence sentence is retired by the reset, and the poll is
+ * too slow to take the button away by itself. The answer's `line` is the
+ * caller's to render — Rust composed it.
+ */
+export async function resetSyncProfile(id: string): Promise<SyncResetVm> {
+  const reset = await syncFolderReset(id);
+  await refreshSyncStatuses();
+  return reset;
 }
 
 /**

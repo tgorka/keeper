@@ -122,17 +122,35 @@ fn entry_at(tree: &gix::Tree<'_>, rel: &str) -> Result<Option<gix::ObjectId>> {
         .map_err(|err| walk_error(&err))
 }
 
-/// The first parent's tree, or the empty tree for a root commit.
+/// The parents this copy holds for `commit`: its own, or none at a shallow
+/// boundary — a phone's first fetch is one commit deep, and the boundary
+/// commit still names parents it was never sent. Read as a root there, the
+/// way gitoxide's own walk reads it, rather than failing on an object that
+/// is not missing by accident.
+fn held_parents(repo: &gix::Repository, commit: &gix::Commit<'_>) -> Result<Vec<gix::ObjectId>> {
+    let shallow = repo.shallow_commits().map_err(|err| walk_error(&err))?;
+    if shallow
+        .as_ref()
+        .is_some_and(|boundary| boundary.contains(&commit.id))
+    {
+        return Ok(Vec::new());
+    }
+    Ok(commit.parent_ids().map(|id| id.detach()).collect())
+}
+
+/// The first parent's tree, or the empty tree for a root commit — or for a
+/// shallow boundary ([`held_parents`]).
 fn parent_tree<'repo>(
     repo: &'repo gix::Repository,
     commit: &gix::Commit<'repo>,
 ) -> Result<gix::Tree<'repo>> {
-    let Some(parent) = commit.parent_ids().next() else {
+    let Some(parent) = held_parents(repo, commit)?.into_iter().next() else {
         return Ok(repo.empty_tree());
     };
-    let object = parent.object().map_err(|err| walk_error(&err))?;
-    let commit = object.try_into_commit().map_err(|err| walk_error(&err))?;
-    commit.tree().map_err(|err| walk_error(&err))
+    repo.find_commit(parent)
+        .map_err(|err| walk_error(&err))?
+        .tree()
+        .map_err(|err| walk_error(&err))
 }
 
 /// The commits that changed `rel` — added it, rewrote it, or removed it —
@@ -271,7 +289,7 @@ pub fn path_changes(
         }
         let commit = commit_of(id)?;
         let here = entry_at(&commit.tree().map_err(|err| walk_error(&err))?, rel)?;
-        let parents: Vec<gix::ObjectId> = commit.parent_ids().map(|id| id.detach()).collect();
+        let parents = held_parents(&repo, &commit)?;
         let mut differing = Vec::with_capacity(parents.len());
         let mut same = None;
         for parent in parents {

@@ -2735,6 +2735,23 @@ pub fn fast_forward(
     target: gix::ObjectId,
     interrupt: &AtomicBool,
 ) -> Result<FastForward> {
+    move_branch_to(repo, target, interrupt, "keeper: fast-forward")
+}
+
+/// [`fast_forward`]'s worktree, index and reference writes, with the reflog
+/// line the caller names — `HEAD`'s history precondition is the caller's.
+///
+/// Shared with [`super::reset::reset_to`], which moves a diverged branch onto
+/// the remote's tip by exactly these writes once it has kept the phone's own
+/// history and files aside: the safety argument above (refuse a local change
+/// in the way, worktree before index before reference, the branch compared
+/// against the `HEAD` it was read at) is the same argument for both.
+pub(crate) fn move_branch_to(
+    repo: &gix::Repository,
+    target: gix::ObjectId,
+    interrupt: &AtomicBool,
+    reflog: &str,
+) -> Result<FastForward> {
     let workdir = workdir(repo)?;
     let head = head_commit_id(repo)?;
     if head == Some(target) {
@@ -2886,7 +2903,7 @@ pub fn fast_forward(
             log: gix::refs::transaction::LogChange {
                 mode: gix::refs::transaction::RefLog::AndReference,
                 force_create_reflog: false,
-                message: "keeper: fast-forward".into(),
+                message: reflog.into(),
             },
             expected,
             new: gix::refs::Target::Object(target),

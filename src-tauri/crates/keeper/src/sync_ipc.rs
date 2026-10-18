@@ -497,6 +497,11 @@ pub struct SyncStatusVm {
     /// Whether this condition needs a human before the profile can progress.
     /// Drives the split between a passive amber line and an actionable notice.
     pub needs_attention: bool,
+    /// Whether `error` is the phone's divergence sentence (AD-199), beside
+    /// which the Sync surface offers "Reset this copy" (`sync_folder_reset`).
+    /// Decided in Rust (`keeper_sync::engine::is_phone_divergence`) so the
+    /// webview never reads the sentence to find out.
+    pub resettable: bool,
 }
 
 impl From<&SyncStatus> for SyncStatusVm {
@@ -519,8 +524,32 @@ impl From<&SyncStatus> for SyncStatusVm {
             error: s.error.clone(),
             last_sync_ms: s.last_sync_ms,
             needs_attention: s.state.is_warning() || s.error.is_some(),
+            resettable: s
+                .error
+                .as_deref()
+                .is_some_and(keeper_sync::engine::is_phone_divergence),
         }
     }
+}
+
+/// What "Reset this copy" did (AD-199): the remote's tip is the phone's
+/// again, and this is where the phone's own work went.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncResetVm {
+    /// The phone's revisions kept beside the remote's under a conflict name,
+    /// repository-relative.
+    pub copies: Vec<String>,
+    /// Files only the phone held, left at their own path.
+    pub kept: Vec<String>,
+    /// The local reference holding the phone's former history, if it had any.
+    pub saved: Option<String>,
+    /// Whether the copies and the kept files reached the remote.
+    pub pushed: bool,
+    /// One sentence naming what happened, composed in Rust
+    /// (`PhoneReset::line`).
+    pub line: String,
 }
 
 /// What one manual sync did.
@@ -1690,6 +1719,47 @@ pub async fn sync_folder_now(
         line: outcome_line(&outcome),
         stale: outcome.stale.clone(),
         conflicts: outcome.conflicts,
+    })
+}
+
+/// "Reset this copy" — the phone's second way out of a divergence (AD-199),
+/// offered beside the sentence that names it (`SyncStatusVm::resettable`).
+///
+/// The engine moves the branch onto the remote's tip, keeps the phone's
+/// history under a local ref and its own revisions beside the remote's, and
+/// pushes those copies ([`keeper_sync::Engine::phone_reset`]). A desktop
+/// engine refuses: a Mac merges its own divergences.
+#[tauri::command]
+pub async fn sync_folder_reset(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    id: String,
+) -> Result<SyncResetVm, IpcError> {
+    let engine = engine_of(&state)?;
+    let reset = engine
+        .phone_reset(&id)
+        .await
+        .map_err(|e| sync_ipc_error(&e))?;
+    // The reset rewrote the folder, as a pull does: the phone's notes index
+    // and sessions registry learn it the way they learn a pull's writes.
+    #[cfg(not(desktop))]
+    crate::notes_vault::phone_synced(&app);
+    #[cfg(not(desktop))]
+    crate::sessions_root::phone_synced(&app);
+    #[cfg(desktop)]
+    let _ = app;
+    let relative = |paths: &[std::path::PathBuf]| -> Vec<String> {
+        paths
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect()
+    };
+    Ok(SyncResetVm {
+        copies: relative(&reset.copies),
+        kept: relative(&reset.kept),
+        saved: reset.saved.clone(),
+        pushed: matches!(reset.push, keeper_sync::PhonePush::Pushed),
+        line: reset.line(),
     })
 }
 

@@ -25,6 +25,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
+use std::num::NonZeroU32;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
@@ -952,6 +953,37 @@ struct SweepFailure {
 /// never raises a notification for something that fixed itself.
 const TRANSIENT_FAILURES_BEFORE_WARNING: u32 = 3;
 
+/// How much history a phone asks for the first time it fetches a folder: the
+/// remote's tip, and nothing behind it.
+///
+/// # Why (kalypso, 2026-10-18)
+///
+/// The owner's tgdrive is a ~1 GB pack — 157 k files, a 2.3 GB tree, years of
+/// history — and the phone's first fetch of it never finished: `do_pull`'s
+/// [`git::fetch::FETCH_DEADLINE`] stopped it at ten minutes, iOS suspended
+/// keeper the moment it left the foreground, and the next launch started the
+/// pack from byte zero, because a git pack is not resumable. Asking for less
+/// is the only lever the protocol has. One commit deep, the transfer is the
+/// tip's own objects — and on a fully virtual phone (AD-199) the large files
+/// among them are pointers.
+///
+/// # What a phone gives up, and why it is nothing it used
+///
+/// History behind the boundary. A phone merges nothing and only ever asks two
+/// questions of its history — is the remote's tip one of mine, is mine one of
+/// the remote's — and both are answered by the commits *above* the boundary:
+/// every later fetch is sent everything new down to the boundary, which both
+/// tips descend from. gitoxide's merge-base walk treats the boundary commit as
+/// a root, so a genuine divergence still counts the phone's own commits, and
+/// the reader of a note's history ([`git::history`]) stops at the boundary
+/// instead of failing on a parent it was never sent. The Mac keeps the whole
+/// history; nothing here changes what it fetches or pushes.
+///
+/// Only the first fetch: a repository that has fetched the branch keeps its
+/// boundary where that fetch left it, and is never deepened or truncated
+/// again by a pass.
+const PHONE_FIRST_FETCH_DEPTH: NonZeroU32 = NonZeroU32::MIN;
+
 /// The sentence a phone's profile carries when its history cannot be
 /// fast-forwarded (AD-199).
 ///
@@ -960,10 +992,24 @@ const TRANSIENT_FAILURES_BEFORE_WARNING: u32 = 3;
 /// counted: the commits this copy holds that the remote does not.
 pub fn phone_divergence_sentence(ahead: usize) -> String {
     let commits = if ahead == 1 { "commit" } else { "commits" };
-    format!(
-        "this phone has {ahead} {commits} the remote does not; push them, or reset this copy — \
-         nothing is merged on a phone"
-    )
+    format!("this phone has {ahead} {commits} the remote does not; {PHONE_DIVERGENCE_WAYS_OUT}")
+}
+
+/// The tail of [`phone_divergence_sentence`]: the two ways out, the second of
+/// which is [`Engine::phone_reset`].
+const PHONE_DIVERGENCE_WAYS_OUT: &str =
+    "push them, or reset this copy — nothing is merged on a phone";
+
+/// Whether a profile's recorded error is the phone's divergence sentence — the
+/// one condition [`Engine::phone_reset`] exists for, so the one beside which a
+/// surface offers it.
+///
+/// Read off the sentence because the sentence is what survives a relaunch
+/// (`profiles.last_error`): a flag beside it in memory would be gone the next
+/// time keeper opened on a phone that is still diverged. Both halves are
+/// composed here, so they cannot drift apart.
+pub fn is_phone_divergence(error: &str) -> bool {
+    error.contains(PHONE_DIVERGENCE_WAYS_OUT)
 }
 
 /// What became of a write a phone made, once it was written (98.2, R346):
@@ -1010,6 +1056,73 @@ impl PhonePush {
             )),
             Self::Deferred(err) => Some(format!("Saved on this phone, not on the remote: {err}.")),
         }
+    }
+}
+
+/// What [`Engine::phone_reset`] did: the remote's tip is this copy's again,
+/// and this is where the phone's own work went (AD-199).
+#[derive(Debug)]
+pub struct PhoneReset {
+    /// The local reference holding the phone's former history
+    /// (`refs/keeper/reset/<stamp>`); `None` when there was none to keep.
+    pub saved: Option<String>,
+    /// The phone's revisions written beside the remote's under a conflict
+    /// name, repository-relative.
+    pub copies: Vec<PathBuf>,
+    /// Files only the phone held, left at their own path.
+    pub kept: Vec<PathBuf>,
+    /// The phone's revisions that had no file on disk to copy; they are in
+    /// [`Self::saved`] alone.
+    pub only_saved: usize,
+    /// Whether the copies and the kept files reached the remote.
+    pub push: PhonePush,
+}
+
+impl PhoneReset {
+    /// The sentence a person reads beside the folder once the reset is done:
+    /// what is the remote's, where the phone's work is, and whether it is on
+    /// the remote yet. Composed here so the Sync surface never words it.
+    pub fn line(&self) -> String {
+        let mut line = "This copy is the remote's again.".to_owned();
+        let files = |n: usize| if n == 1 { "file" } else { "files" };
+        if !self.copies.is_empty() {
+            line.push_str(&format!(
+                " {} of the phone's {} kept beside the remote's as .sync-conflict-… copies.",
+                self.copies.len(),
+                if self.copies.len() == 1 {
+                    "files is"
+                } else {
+                    "files are"
+                }
+            ));
+        }
+        if !self.kept.is_empty() {
+            line.push_str(&format!(
+                " {} {} only the phone had stayed where {}.",
+                self.kept.len(),
+                files(self.kept.len()),
+                if self.kept.len() == 1 {
+                    "it was"
+                } else {
+                    "they were"
+                }
+            ));
+        }
+        if self.only_saved > 0 {
+            line.push_str(&format!(
+                " {} {} had nothing on disk to copy and {} only in the phone's saved history.",
+                self.only_saved,
+                files(self.only_saved),
+                if self.only_saved == 1 { "is" } else { "are" }
+            ));
+        }
+        if self.copies.is_empty() && self.kept.is_empty() && self.only_saved == 0 {
+            line.push_str(" Nothing the phone held differed from the remote.");
+        } else if let Some(unpushed) = self.push.unpushed() {
+            line.push(' ');
+            line.push_str(&unpushed);
+        }
+        line
     }
 }
 
@@ -1889,6 +2002,10 @@ struct RemoteRelationKey {
     remote_url: String,
     head: gix::ObjectId,
     tracking: gix::ObjectId,
+    /// Whether the history is truncated (`.git/shallow`): a phone's first
+    /// fetch is one commit deep. Part of the key so deepening or truncating a
+    /// repository invalidates an earlier verdict.
+    shallow: bool,
 }
 
 struct RemoteRelationMemo {
@@ -3154,6 +3271,12 @@ impl Engine {
             // Match the history reader's cache, only for a cold comparison.
             repo.object_cache_size_if_unset(4 * 1024 * 1024);
             Self::known_remote_relation(&repo, key.head, key.tracking)
+                // A truncated history proves reachability and never its
+                // absence: a walk that met the other tip met it, and two walks
+                // that ran out ran out at the boundary. Every phone is shallow
+                // from its first fetch (`PHONE_FIRST_FETCH_DEPTH`), so dropping
+                // the proven answers too would leave it never saying "behind".
+                .filter(|relation| !key.shallow || *relation != RemoteRelation::Diverged)
         };
         snapshot.remote_relation = relation;
         // Missing parent objects can arrive without either ref moving. Only
@@ -3215,13 +3338,10 @@ impl Engine {
         if tracking != head {
             repo.find_commit(tracking).ok()?.decode().ok()?;
         }
-        // Negative ancestry from truncated history cannot prove divergence.
-        // Conservatively leave unequal shallow tips unknown; equality needs
-        // no parent history. Read this before the memo, so deepening or
-        // truncating a repository invalidates an earlier verdict.
-        if repo.shallow_commits().ok()?.is_some() && head != tracking {
-            return None;
-        }
+        // Read before the memo, so deepening or truncating a repository
+        // invalidates an earlier verdict: see `fill_remote_relation` for what
+        // a truncated history may and may not prove.
+        let shallow = repo.shallow_commits().ok()?.is_some();
         let key = RemoteRelationKey {
             root,
             git_dir: repo.git_dir().canonicalize().ok()?,
@@ -3229,6 +3349,7 @@ impl Engine {
             remote_url: profile.remote_url.clone(),
             head,
             tracking,
+            shallow,
         };
         Some((repo, key))
     }
@@ -9173,7 +9294,7 @@ impl Engine {
                 &profile.remote_url,
                 &profile.local_path,
                 &profile.branch,
-                None,
+                (self.git.engine() == GitEngine::Gix).then_some(PHONE_FIRST_FETCH_DEPTH),
                 self.credential(profile)?.as_ref(),
                 &self.interrupt,
             ) {
@@ -9434,6 +9555,7 @@ impl Engine {
         let repo_path = profile.local_path.clone();
         let removable = profile.removable;
         let branch = profile.branch.clone();
+        let phone = self.git.engine() == GitEngine::Gix;
 
         // gitoxide's progress tree is the only place a fetch's volume is
         // observable, and it is throttled to one call per 100 ms per node
@@ -9447,8 +9569,15 @@ impl Engine {
             // as `clone` clears it, so no `credential.helper` in any scope is
             // consulted by the leg that talks to the remote.
             let repo = git::repo::open_for_fetch(&repo_path, removable)?;
+            // A phone that has never fetched this branch asks for its tip
+            // alone ([`PHONE_FIRST_FETCH_DEPTH`]); every later fetch asks for
+            // what is new on top of the boundary that left, which gitoxide
+            // keeps as it is.
+            let first = phone
+                && git::repo::resolve_reference(&repo, &format!("refs/remotes/origin/{branch}"))?
+                    .is_none();
             let options = git::fetch::FetchOptions {
-                shallow: None,
+                shallow: first.then_some(PHONE_FIRST_FETCH_DEPTH),
                 refspecs: vec![format!("+refs/heads/{branch}:refs/remotes/origin/{branch}")],
             };
             let report: git::fetch::TransferProgress = Arc::new(move |done, total| {
@@ -13313,6 +13442,113 @@ impl Engine {
             return Ok((value, PhonePush::Paused));
         }
         Ok((value, self.phone_push(id).await))
+    }
+
+    /// "Reset this copy" (AD-199): the second way out of a phone's divergence,
+    /// which until now the sentence named and nothing performed.
+    ///
+    /// The branch, the index and the worktree move onto the remote's tip as the
+    /// last fetch left it in `refs/remotes/origin/<branch>` — no network: the
+    /// divergence was measured against that ref, and a remote that has moved
+    /// further since is a fast-forward from it on the next pass. Nothing the
+    /// phone held is lost on the way ([`git::reset`]): its history is kept
+    /// under `refs/keeper/reset/<stamp>`, its revisions of the remote's files
+    /// are written beside them as conflict copies, and a file only it had
+    /// stays where it is. The phone's settled writes are committed first, so
+    /// an unpushed note is one of those revisions and not an edit in the way.
+    ///
+    /// Then the divergence sentence is retired — the branch it described is
+    /// gone — and [`Self::phone_push`] commits the copies and the kept files
+    /// and pushes them: that is how the phone's work reaches a Mac, where a
+    /// person decides between the two revisions as after any merge.
+    ///
+    /// Only a phone resets: a Mac merges a divergence itself (AD-43) and never
+    /// reaches the sentence. The reset holds the folder's reservation, so a
+    /// folder another pass holds answers [`SyncError::Busy`]. A failure is the
+    /// caller's to show and is not recorded beside the profile, where the
+    /// divergence sentence it failed to resolve still stands.
+    pub async fn phone_reset(&self, id: &str) -> Result<PhoneReset> {
+        if self.git.engine() != GitEngine::Gix {
+            return Err(SyncError::Config(
+                "only a phone resets its copy onto the remote; a Mac merges a divergence itself"
+                    .to_owned(),
+            ));
+        }
+        let Some(profile) = self.with_db(|conn| db::get_profile(conn, id))? else {
+            return Err(SyncError::Config(format!("no such sync profile: {id}")));
+        };
+        if !profile.local_path.join(".git").exists() {
+            return Err(SyncError::Config(
+                "this folder has not been cloned yet, so there is nothing to reset".to_owned(),
+            ));
+        }
+        if let Err(error) = self.prime_worktree_changes(id) {
+            tracing::warn!(id, %error, "sync: the phone could not declare its writes before a reset");
+        }
+        let reset = {
+            let _reservation = self
+                .reserve(&profile.id)
+                .ok_or_else(|| SyncError::Busy(profile.name.clone()))?;
+            self.settle_commit_paths(&profile)?;
+            Self::blocking(|| self.commit_local(&profile, SyncSource::Manual, None))?;
+            let stamp = conflict_stamp(self.platform.now_ms());
+            let device = self.device().label;
+            let path = profile.local_path.clone();
+            let removable = profile.removable;
+            let tracking = format!("refs/remotes/origin/{}", profile.branch);
+            let interrupt = Arc::clone(&self.interrupt);
+            tokio::task::spawn_blocking(move || -> Result<git::reset::Reset> {
+                let repo = git::repo::open(&path, removable)?;
+                let Some(target) = git::repo::resolve_reference(&repo, &tracking)? else {
+                    return Err(SyncError::Config(
+                        "nothing has been fetched from the remote yet, so there is nothing to \
+                         reset this copy to; sync this folder first"
+                            .to_owned(),
+                    ));
+                };
+                git::reset::reset_to(&repo, target, &stamp, &device, &interrupt)
+            })
+            .await
+            .map_err(|err| SyncError::Journal(format!("reset task failed: {err}")))??
+        };
+        tracing::info!(
+            profile = profile.name,
+            saved = reset.saved.as_deref().unwrap_or("-"),
+            copies = reset.copies.len(),
+            kept = reset.kept.len(),
+            only_saved = reset.only_saved.len(),
+            written = reset.moved.written,
+            removed = reset.moved.removed,
+            "sync: reset the phone's copy onto the remote"
+        );
+        if !reset.copies.is_empty() {
+            // The copies are the one thing a person has to look at, named
+            // where the merge's copies are named (`do_pull`).
+            let rows: Vec<db::ActivityEntry> = reset
+                .copies
+                .iter()
+                .map(|copy| db::ActivityEntry {
+                    kind: ActivityKind::Conflict,
+                    path: copy.to_string_lossy().into_owned(),
+                    size_bytes: std::fs::metadata(profile.local_path.join(copy))
+                        .ok()
+                        .map(|md| md.len()),
+                    unit_id: None,
+                })
+                .collect();
+            let now = self.platform.now_ms();
+            self.with_db(|conn| db::record_activity(conn, &profile.id, now, &rows))?;
+        }
+        self.set_error(&profile.id, None);
+        self.note_unit_succeeded(&profile, RemoteContact::Skipped);
+        let push = self.phone_push(id).await;
+        Ok(PhoneReset {
+            saved: reset.saved,
+            copies: reset.copies,
+            kept: reset.kept,
+            only_saved: reset.only_saved.len(),
+            push,
+        })
     }
 
     /// Release local LFS objects whose content is still in the worktree, whose
@@ -18909,7 +19145,7 @@ mod tests {
     #[test]
     fn status_history_recovers_missing_ancestry_without_refs_moving() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let (engine, p, repo, [_, middle, _]) = history_fixture(dir.path());
+        let (engine, p, repo, [root, middle, _]) = history_fixture(dir.path());
         let hex = middle.to_string();
         let object = repo
             .git_dir()
@@ -18942,6 +19178,18 @@ mod tests {
             engine.status(&p.id).expect("deepened").remote_relation,
             Some(RemoteRelation::Behind)
         );
+        // A boundary at or below `HEAD` still proves "behind": the walk from
+        // the remote's tip meets `HEAD` before it runs out — a phone's shape
+        // after its one-commit-deep first fetch.
+        std::fs::write(&shallow, format!("{root}\n")).expect("truncate at HEAD");
+        assert_eq!(
+            engine
+                .status(&p.id)
+                .expect("shallow at HEAD")
+                .remote_relation,
+            Some(RemoteRelation::Behind)
+        );
+        std::fs::remove_file(&shallow).expect("deepen history");
         std::fs::create_dir(&shallow).expect("unreadable shallow file");
         assert_eq!(
             engine
@@ -35226,6 +35474,346 @@ mod tests {
                 .has_unpushed_commits(&p)
                 .expect("answered in-process"),
             "the phone reads its own history without a binary"
+        );
+    }
+
+    /// Every conflict copy directly under `dir`, by name.
+    fn conflict_copies_in(dir: &Path) -> Vec<String> {
+        let mut copies: Vec<String> = std::fs::read_dir(dir)
+            .expect("list")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".sync-conflict-"))
+            .collect();
+        copies.sort();
+        copies
+    }
+
+    /// "Reset this copy" (AD-199): the second way out the divergence sentence
+    /// names. The remote's tip is the phone's again, every path the remote
+    /// holds has the remote's bytes, the phone's revision of a file both sides
+    /// changed is beside it as a conflict copy, a file only the phone wrote
+    /// stays where it was, the phone's history is under a ref — and the
+    /// sentence is gone from beside the profile.
+    #[tokio::test]
+    async fn a_phone_resets_a_divergence_onto_the_remote_and_keeps_its_work_beside_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let remote = dir.path().join("remote.git");
+        if gix::init_bare(&remote).is_err() {
+            return;
+        }
+        let Some(mac) = Mac::publish_into(dir.path(), &remote) else {
+            return;
+        };
+        mac.write("README.md", b"hello\n");
+        mac.commit_and_push("first");
+        let (platform, engine, p) = phone(dir.path(), &remote);
+        engine
+            .sync_once_recording(&p.id, SyncSource::Manual)
+            .await
+            .expect("clone");
+
+        std::fs::write(p.local_path.join("README.md"), b"hello from the phone\n").expect("write");
+        std::fs::write(p.local_path.join("captured.md"), b"from the phone\n").expect("write");
+        assert_eq!(commit_after_settling(&engine, &platform, &p), 2);
+        let local = phone_head(&p).expect("a local commit");
+        mac.write("README.md", b"hello from the mac\n");
+        let moved = mac.commit_and_push("mac moved on");
+        engine
+            .sync_once_recording(&p.id, SyncSource::Manual)
+            .await
+            .expect_err("diverged");
+        let error = engine.status(&p.id).expect("a status").error;
+        assert!(
+            error.as_deref().is_some_and(is_phone_divergence),
+            "the reset is offered beside exactly this sentence: {error:?}"
+        );
+
+        let reset = engine.phone_reset(&p.id).await.expect("the reset");
+
+        assert_eq!(
+            std::fs::read(p.local_path.join("README.md")).expect("the remote's"),
+            b"hello from the mac\n"
+        );
+        let copies = conflict_copies_in(&p.local_path);
+        assert_eq!(copies.len(), 1, "{copies:?}");
+        assert!(copies[0].starts_with("README.sync-conflict-"), "{copies:?}");
+        assert_eq!(
+            std::fs::read(p.local_path.join(&copies[0])).expect("the phone's"),
+            b"hello from the phone\n"
+        );
+        assert_eq!(reset.copies, vec![PathBuf::from(&copies[0])]);
+        assert_eq!(
+            std::fs::read(p.local_path.join("captured.md")).expect("kept"),
+            b"from the phone\n"
+        );
+        assert_eq!(reset.kept, vec![PathBuf::from("captured.md")]);
+        assert_eq!(reset.only_saved, 0);
+
+        let repo = gix::open(&p.local_path).expect("open");
+        let saved = reset.saved.as_deref().expect("the phone's history is kept");
+        assert!(saved.starts_with(git::reset::SAVED_PREFIX), "{saved}");
+        assert_eq!(
+            git::repo::resolve_reference(&repo, saved).expect("resolve"),
+            Some(local),
+            "every commit the phone made is still reachable"
+        );
+        // The push leg committed the copy and the kept file on top of the
+        // remote's tip: from here on this is a phone that is ahead, which
+        // pushing settles, never one that is diverged.
+        let head = phone_head(&p).expect("HEAD");
+        assert_ne!(head, moved, "the copy and the kept file are committed");
+        assert!(git::repo::is_ancestor(&repo, moved, head).expect("ancestry"));
+        assert!(!git::repo::is_ancestor(&repo, local, head).expect("ancestry"));
+        assert!(reset.line().starts_with("This copy is the remote's again."));
+        assert!(reset
+            .line()
+            .contains("1 of the phone's files is kept beside"));
+
+        let error = engine.status(&p.id).expect("a status").error;
+        assert!(
+            !error.as_deref().is_some_and(is_phone_divergence),
+            "the divergence is gone with the branch it described: {error:?}"
+        );
+    }
+
+    /// A Mac merges its own divergences (AD-43): the reset is a phone's verb,
+    /// and a desktop engine refuses it before it touches anything.
+    #[tokio::test]
+    async fn a_desktop_is_refused_a_phone_reset() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(desktop) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = adoptable(dir.path());
+        desktop.upsert_profile(&p).expect("upsert");
+        let err = desktop
+            .phone_reset(&p.id)
+            .await
+            .expect_err("a desktop never resets");
+        assert!(matches!(err, SyncError::Config(_)), "{err:?}");
+        assert!(err.to_string().contains("only a phone"), "{err}");
+    }
+
+    /// A phone's first fetch is one commit deep (`PHONE_FIRST_FETCH_DEPTH`) —
+    /// kalypso's tgdrive could never finish a whole history in the foreground
+    /// — and everything a phone asks of its history still works on top of
+    /// the boundary: a fast-forward, the status row's "up to date", a note's
+    /// history, the divergence count, and the reset.
+    #[tokio::test]
+    async fn a_phone_clones_one_commit_deep_and_still_follows_diverges_and_resets() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Canonical, because the clone records the remote's URL canonical and
+        // the status row compares it with the profile's: `/var` is a link to
+        // `/private/var` on macOS.
+        let root = dir.path().canonicalize().expect("canonical");
+        let remote = root.join("remote.git");
+        if gix::init_bare(&remote).is_err() {
+            return;
+        }
+        let Some(mac) = Mac::publish_into(&root, &remote) else {
+            return;
+        };
+        mac.write("notes/one.md", b"v1\n");
+        let first = mac.commit_and_push("v1");
+        mac.write("notes/one.md", b"v2\n");
+        mac.commit_and_push("v2");
+        mac.write("notes/one.md", b"v3\n");
+        let tip = mac.commit_and_push("v3");
+
+        let (platform, engine, p) = phone(&root, &remote);
+        engine
+            .sync_once_recording(&p.id, SyncSource::Manual)
+            .await
+            .expect("the first sync clones");
+        assert_eq!(phone_head(&p), Some(tip));
+        let repo = gix::open(&p.local_path).expect("open");
+        let boundary: Vec<gix::ObjectId> = repo
+            .shallow_commits()
+            .expect("readable")
+            .expect("a phone's clone is shallow")
+            .iter()
+            .copied()
+            .collect();
+        assert_eq!(boundary, vec![tip], "the tip, and nothing behind it");
+        assert!(
+            repo.find_commit(first).is_err(),
+            "history behind the tip was never sent"
+        );
+        assert_eq!(
+            engine.status(&p.id).expect("status").remote_relation,
+            Some(RemoteRelation::Same)
+        );
+        let log = git::history::file_log(&p.local_path, "notes/one.md", 10).expect("a log");
+        assert_eq!(
+            log.len(),
+            1,
+            "the boundary reads as the note's first revision"
+        );
+
+        // The Mac moves on: a later fetch brings what is new, down to the
+        // boundary, and the phone fast-forwards.
+        mac.write("notes/one.md", b"v4\n");
+        let fourth = mac.commit_and_push("v4");
+        engine
+            .sync_once_recording(&p.id, SyncSource::Manual)
+            .await
+            .expect("a fast-forward on a shallow history");
+        assert_eq!(phone_head(&p), Some(fourth));
+        assert_eq!(
+            std::fs::read(p.local_path.join("notes/one.md")).expect("rewritten"),
+            b"v4\n"
+        );
+        let repo = gix::open(&p.local_path).expect("open");
+        let boundary: Vec<gix::ObjectId> = repo
+            .shallow_commits()
+            .expect("readable")
+            .expect("still shallow")
+            .iter()
+            .copied()
+            .collect();
+        assert_eq!(
+            boundary,
+            vec![tip],
+            "a later fetch never moves the boundary"
+        );
+        let log = git::history::file_log(&p.local_path, "notes/one.md", 10).expect("a log");
+        assert_eq!(log.len(), 2);
+
+        // The phone behind the remote says so, shallow or not.
+        mac.write("notes/one.md", b"v5\n");
+        let fifth = mac.commit_and_push("v5");
+        {
+            let repo = gix::open(&p.local_path).expect("open");
+            let fetched = git::fetch::fetch(
+                &repo,
+                "origin",
+                &git::fetch::FetchOptions::default(),
+                None,
+                &(Arc::new(|_, _| {}) as git::fetch::TransferProgress),
+                &AtomicBool::new(false),
+            )
+            .expect("a fetch on its own");
+            assert_eq!(fetched.remote_id, Some(fifth));
+        }
+        assert_eq!(
+            engine.status(&p.id).expect("status").remote_relation,
+            Some(RemoteRelation::Behind),
+            "reachability above the boundary is proof"
+        );
+        engine
+            .sync_once_recording(&p.id, SyncSource::Manual)
+            .await
+            .expect("caught up");
+        assert_eq!(phone_head(&p), Some(fifth));
+
+        // A divergence on a shallow history counts the phone's own commits.
+        std::fs::write(p.local_path.join("notes/one.md"), b"from the phone\n").expect("write");
+        assert_eq!(commit_after_settling(&engine, &platform, &p), 1);
+        mac.write("notes/one.md", b"v6\n");
+        let sixth = mac.commit_and_push("v6");
+        let err = engine
+            .sync_once_recording(&p.id, SyncSource::Manual)
+            .await
+            .expect_err("diverged");
+        let SyncError::Diverged { reason, .. } = &err else {
+            panic!("a divergence, got {err:?}");
+        };
+        assert_eq!(reason, &phone_divergence_sentence(1));
+
+        let reset = engine.phone_reset(&p.id).await.expect("the reset");
+        assert_eq!(
+            std::fs::read(p.local_path.join("notes/one.md")).expect("the remote's"),
+            b"v6\n"
+        );
+        assert_eq!(reset.copies.len(), 1, "{:?}", reset.copies);
+        assert_eq!(
+            std::fs::read(p.local_path.join(&reset.copies[0])).expect("the phone's"),
+            b"from the phone\n"
+        );
+        let repo = gix::open(&p.local_path).expect("open");
+        let head = phone_head(&p).expect("HEAD");
+        assert!(git::repo::is_ancestor(&repo, sixth, head).expect("ancestry"));
+    }
+
+    /// Kalypso, 2026-10-18: the phone seeded its notes into the folder and
+    /// committed them before it had ever fetched, so its history was a
+    /// parentless root with nothing in common with the drive's. The first
+    /// fetch into that adopted folder is one commit deep too, the divergence
+    /// is named — and now the person can reset: the drive's files are the
+    /// drive's, the seeds it also holds are beside them, and the seeds it
+    /// does not hold stay where they are.
+    #[tokio::test]
+    async fn a_phone_that_rooted_its_own_history_fetches_one_commit_deep_and_resets() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let remote = dir.path().join("remote.git");
+        if gix::init_bare(&remote).is_err() {
+            return;
+        }
+        let Some(mac) = Mac::publish_into(dir.path(), &remote) else {
+            return;
+        };
+        mac.write("README.md", b"drive\n");
+        let old = mac.commit_and_push("years ago");
+        mac.write("notes/index.md", b"the drive's index\n");
+        let tip = mac.commit_and_push("the drive today");
+
+        let (platform, engine, p) = phone(dir.path(), &remote);
+        std::fs::create_dir_all(p.local_path.join("notes")).expect("notes");
+        std::fs::write(p.local_path.join("notes/index.md"), b"seeded index\n").expect("seed");
+        std::fs::write(p.local_path.join("notes/inbox.md"), b"seeded inbox\n").expect("seed");
+        assert_eq!(commit_after_settling(&engine, &platform, &p), 2);
+        let root = phone_head(&p).expect("the phone's own root");
+
+        let err = engine
+            .sync_once_recording(&p.id, SyncSource::Manual)
+            .await
+            .expect_err("two unrelated histories");
+        let SyncError::Diverged { reason, .. } = &err else {
+            panic!("a divergence, got {err:?}");
+        };
+        assert_eq!(reason, &phone_divergence_sentence(1));
+        let repo = gix::open(&p.local_path).expect("open");
+        let boundary: Vec<gix::ObjectId> = repo
+            .shallow_commits()
+            .expect("readable")
+            .expect("the first fetch into an adopted folder is shallow")
+            .iter()
+            .copied()
+            .collect();
+        assert_eq!(boundary, vec![tip]);
+        assert!(repo.find_commit(old).is_err());
+
+        let reset = engine.phone_reset(&p.id).await.expect("the reset");
+        assert_eq!(
+            std::fs::read(p.local_path.join("README.md")).expect("the drive's"),
+            b"drive\n"
+        );
+        assert_eq!(
+            std::fs::read(p.local_path.join("notes/index.md")).expect("the drive's"),
+            b"the drive's index\n"
+        );
+        let copies = conflict_copies_in(&p.local_path.join("notes"));
+        assert_eq!(copies.len(), 1, "{copies:?}");
+        assert!(copies[0].starts_with("index.sync-conflict-"));
+        assert_eq!(
+            std::fs::read(p.local_path.join("notes").join(&copies[0])).expect("the seed"),
+            b"seeded index\n"
+        );
+        assert_eq!(
+            std::fs::read(p.local_path.join("notes/inbox.md")).expect("kept"),
+            b"seeded inbox\n"
+        );
+        assert_eq!(reset.kept, vec![PathBuf::from("notes/inbox.md")]);
+        let repo = gix::open(&p.local_path).expect("open");
+        assert_eq!(
+            git::repo::resolve_reference(&repo, reset.saved.as_deref().expect("saved"))
+                .expect("resolve"),
+            Some(root)
+        );
+        assert!(
+            git::repo::is_ancestor(&repo, tip, phone_head(&p).expect("HEAD")).expect("ancestry")
         );
     }
 

@@ -890,6 +890,29 @@ the second is a problem. Three shapes:
    git-driven "Mac" and a Gix engine — beside `a_phone_clones_and_fast_forwards_with_gitoxide`
    in `engine.rs`'s tests (Story 66.2).
 
+   **"Reset this copy" is the second way out** (kalypso, 2026-10-18). Beside the
+   sentence — `SyncStatusVm.resettable`, decided by `keeper_sync::engine::is_phone_divergence`
+   — the Sync card offers *Reset this copy* (`sync_folder_reset` →
+   `Engine::phone_reset` → `git::reset::reset_to`). The remote wins every path, by the
+   same worktree-index-reference writes a fast-forward makes, and nothing the phone held
+   is lost: its history is kept under the local ref `refs/keeper/reset/<stamp>`, each
+   file its own commits changed and the remote holds differently is written beside the
+   remote's as a `.sync-conflict-<stamp>-<device>` copy, a file only the phone has stays
+   at its path, and the next pass commits and pushes both, so the Mac sees the pair. A
+   phone deletion is not re-applied. No network: the reset moves onto the
+   `refs/remotes/origin/<branch>` the divergence was measured against.
+
+   **A phone's first fetch is one commit deep** (`PHONE_FIRST_FETCH_DEPTH`): kalypso's
+   tgdrive is a ~1 GB pack, and a whole history could not arrive inside the ten-minute
+   fetch deadline before iOS suspended keeper — a pack does not resume. Both the clone of
+   an empty folder and the first fetch into an adopted one ask for the tip alone; later
+   fetches keep that boundary. Ancestry still answers above it (gitoxide reads the
+   boundary as a root), `git::history` stops there instead of failing on a parent it was
+   never sent, and the status row reports *behind*/*ahead* where a walk proves it and
+   never *diverged* from a truncated walk. Proofs:
+   `a_phone_clones_one_commit_deep_and_still_follows_diverges_and_resets` and
+   `a_phone_that_rooted_its_own_history_fetches_one_commit_deep_and_resets`.
+
    **The sessions board meets this more than notes do.** A drive's sessions zone is
    written by agents on other hosts all day, so a card moved on top of the phone's last
    fast-forward would almost always diverge. That is why a move pulls first and is refused

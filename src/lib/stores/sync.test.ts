@@ -107,6 +107,7 @@ function statusVm(over: Partial<SyncStatusVm> = {}): SyncStatusVm {
     error: null,
     lastSyncMs: null,
     needsAttention: false,
+    resettable: false,
     ...over,
   };
 }
