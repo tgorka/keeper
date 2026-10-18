@@ -818,7 +818,7 @@ function AgentWebSearch({
         <p
           id={`${id}-warning`}
           data-testid={`agent-web-search-warning-${agent.agent}`}
-          className="text-amber-700 text-xs [overflow-wrap:anywhere] dark:text-amber-400"
+          className="text-held text-xs [overflow-wrap:anywhere]"
         >
           {webSearch.warning}
         </p>
