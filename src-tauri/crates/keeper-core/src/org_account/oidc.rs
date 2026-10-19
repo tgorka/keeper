@@ -1362,12 +1362,34 @@ async fn forge_token_with(
 
     let oauth_http = ReqwestClient::from(http.clone());
     let provider = forge_provider(&oauth_http, forge).await?;
-    let tokens = provider
+    let tokens = match provider
         .client(None)
         .exchange_refresh_token(&RefreshToken::new(refresh))
         .request_async(&oauth_http)
         .await
-        .map_err(|e| refresh_error(&provider.host, e, "Reconnect the repository."))?;
+    {
+        Ok(tokens) => tokens,
+        Err(error) => {
+            // The forge itself refused the refresh token: it is dead, not
+            // unreachable. Forgejo keeps one grant per person and app, so any
+            // other device's sign-in kills this one ("refresh token ... was
+            // used twice"). Kept in the keychain, the dead item read as
+            // "connected", so the next sign-in skipped the forge leg and the
+            // account asked to sign in again for ever — hesperia after
+            // kalypso signed in, 2026-10-05 and again 2026-10-18. Forgotten,
+            // the next sign-in connects the repository anew.
+            let dead = matches!(error, RequestTokenError::ServerResponse(_));
+            let answer = refresh_error(&provider.host, error, "Reconnect the repository.");
+            if dead {
+                tracing::warn!(
+                    account = %d.id,
+                    "account: the forge refused its refresh token; forgetting it so the next sign-in reconnects the repository"
+                );
+                session::forget_forge(platform, &d.id)?;
+            }
+            return Err(answer);
+        }
+    };
     stored.access_token = tokens.access_token().secret().clone();
     stored.expires_ms = expiry_ms(tokens.expires_in());
     if let Some(rotated) = tokens.refresh_token() {
@@ -3146,6 +3168,37 @@ mod tests {
         assert_eq!(
             forge_token(&p, &http(), &d).await.expect("stored"),
             "access-2"
+        );
+    }
+
+    /// A forge that refuses the refresh token has killed it — another device's
+    /// sign-in to the same Forgejo grant does exactly that. The dead item must
+    /// not keep reading as "connected", or the next sign-in skips the forge leg.
+    #[tokio::test]
+    async fn a_refused_forge_refresh_forgets_the_forge_token() {
+        let fake = start_fake(Behaviour {
+            reject_refresh: true,
+            ..Behaviour::default()
+        });
+        let p = FakePlatform::new(&fake, Browser::Honest);
+        let d = forge_account(&fake, "forge-dead");
+        forge_connect_within(&p, &p.flows, &http(), &d, "tgorka", SHORT)
+            .await
+            .expect("connected");
+        assert!(
+            session::forge_connected(&p, &d),
+            "connected before the refresh"
+        );
+
+        let refused = forge_token_refreshed(&p, &http(), &d).await;
+
+        assert!(
+            matches!(refused, Err(AccountError::NeedsSignIn(_))),
+            "{refused:?}"
+        );
+        assert!(
+            !session::forge_connected(&p, &d),
+            "a refused refresh token is forgotten, so the next sign-in reconnects"
         );
     }
 
