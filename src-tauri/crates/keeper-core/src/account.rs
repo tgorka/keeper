@@ -42,12 +42,11 @@ use matrix_sdk_ui::room_list_service::filters::new_filter_non_left;
 use matrix_sdk_ui::room_list_service::{RoomList, RoomListItem, RoomListLoadingState};
 use matrix_sdk_ui::sync_service::{State, SyncService};
 use matrix_sdk_ui::timeline::{Timeline, TimelineBuilder};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{broadcast, mpsc, Mutex};
 use tokio::task::JoinHandle;
 use tracing::Instrument;
 
 use crate::agents::approval_card::{self, ApprovalDecideReq, HostedRooms, Viewer, NOTE_MAX};
-use crate::agents::attention as agent_attention;
 use crate::agents::device::{self as agent_device, AccountAgents, AgentDevice};
 use crate::agents::events::{
     ApprovalDecisionContent, ConversationRequestContent, Focus, MainDmRequestContent, ScopeContent,
@@ -60,6 +59,7 @@ use crate::agents::launch::{
     self, AgentsLaunchVm, LaunchFacts, LaunchReadiness, LaunchRoomVm, LaunchSource, MainDmAskVm,
     ReadinessState, SetDefaultError, LAUNCH_READY_MS, LAUNCH_RECHECK_MS,
 };
+use crate::agents::list_rows::{ListRowStore, RowWriter};
 use crate::agents::main_dm;
 use crate::agents::proxy::{
     self, AgentOutbound, AgentProxies, KnownProxies, ProxyListEventContent, ProxyRoomRow,
@@ -88,7 +88,7 @@ use crate::error::{
     AccountError, BackupError, BridgeError, CoreError, InboxError, MediaError, SendError,
     TimelineError,
 };
-use crate::inbox::{InboxMerger, NetworksSink, SpacesSink};
+use crate::inbox::{AgentListTrouble, InboxMerger, NetworksSink, SpacesSink};
 use crate::media::{self, MediaBytes, MediaHandle, MediaVariant};
 use crate::notify::{self, NotifyConfig};
 use crate::palette::{PaletteEntry, PaletteIndex};
@@ -105,6 +105,15 @@ use crate::vm::{
     MuteState, OutboxVm, PaginationStatusBatch, PaletteMode, PaletteResultsVm, RemoteDraftVm,
     RoomListBatch, RoomListOp, RoomVm, SpaceVm, TimelineBatch, TypingBatch, TypistVm,
 };
+
+mod agent_list;
+use agent_list::AgentLists;
+mod inbox_owners;
+pub(crate) mod lifetime;
+pub use agent_list::AttentionBoard;
+use agent_list::{asks_answered_in, KEPT_ROWS_NOT_REMOVED};
+use inbox_owners::{InboxOwners, Owner};
+use lifetime::{AccountLifetimes, Lifetime};
 
 /// Number of rooms in the initial fixed window (seeded windowing per AD-20).
 const ROOM_LIST_PAGE_SIZE: usize = 200;
@@ -692,23 +701,15 @@ async fn build_dispatch_timeline(client: &Client, room_id: &RoomId) -> Result<Ti
 }
 
 /// A live merged-inbox subscription (AD-20): the merger the per-account
-/// room-list producers feed, and their abort handles keyed by account id (so a
-/// single account's producer can be torn down on that account's sign-out, not
-/// only on a whole-inbox unsubscribe). There is at most one at a time in the
-/// shell.
+/// room-list producers feed, published from the moment it is built so a
+/// sign-out removes its account from it even while the subscription is
+/// still acquiring other accounts. Its producers are not here: they are
+/// registered in [`InboxOwners`] under `generation` before they run (R519).
+/// There is at most one at a time in the shell.
 struct InboxHandle {
     subscription_id: u64,
+    generation: u64,
     merger: InboxMerger,
-    producers: HashMap<String, JoinHandle<()>>,
-    /// Per-account Spaces producers (Story 4.5): each recomputes the account's
-    /// joined Spaces + child membership on every sync batch and pokes the merger.
-    /// Tracked separately from `producers` so teardown aborts them too.
-    spaces_producers: HashMap<String, JoinHandle<()>>,
-    /// Per-account palette producers (Story 9.1): each refreshes that account's
-    /// **full** room set into the shared [`PaletteIndex`] on every sync batch (the
-    /// palette must find any of ~10k rooms, not just the recency window). Tracked
-    /// so teardown aborts them too.
-    palette_producers: HashMap<String, JoinHandle<()>>,
 }
 
 /// A live bridge-session-health subscription (Story 6.5, FR-28, AD-16): the shared
@@ -807,6 +808,22 @@ pub struct AccountManager {
     /// Which signed-in accounts' room lists have finished their first sync
     /// since launch (R397): what the launch into the default agent waits for.
     launch_ready: LaunchReadiness,
+    /// What every account's agent rows say of their rooms now, written by
+    /// each account's list worker (story 102.5, R468).
+    agent_attention: Arc<AttentionBoard>,
+    /// Where each account's Agents rows are kept for the next launch (story
+    /// 102.5).
+    agent_list_rows: ListRowStore,
+    /// Each live account's list worker and seat finder, from its activation
+    /// to its teardown (story 102.5, R501).
+    agent_lists: AgentLists,
+    /// Each account's lifetime: what its activation opens, its teardown ends
+    /// at its start, and every registration of its Agents list checks
+    /// (story 102.5, R516).
+    lifetimes: AccountLifetimes,
+    /// Every inbox producer of every account, held until registered here,
+    /// and which inbox subscription is the newest (story 102.5, R519).
+    inbox_owners: InboxOwners,
 }
 
 /// The launch's view of the live accounts (R397): [`launch::resolve`] reads
@@ -940,6 +957,11 @@ impl AccountManager {
             agent_hosted: Arc::new(HostedRooms::default()),
             agent_shown: Arc::default(),
             launch_ready: LaunchReadiness::default(),
+            agent_attention: Arc::default(),
+            agent_list_rows: ListRowStore::new(data_dir),
+            agent_lists: AgentLists::default(),
+            lifetimes: AccountLifetimes::default(),
+            inbox_owners: InboxOwners::default(),
         }
     }
 
@@ -1073,7 +1095,7 @@ impl AccountManager {
                     self.archive.clone(),
                     self.draft_mirror_tx.clone(),
                     self.notify.clone(),
-                    self.agents_wiring(),
+                    self.agents_wiring(account_id)?,
                 )
                 .await?;
                 accounts.insert(
@@ -1129,6 +1151,7 @@ impl AccountManager {
                             dead.reconnect_supervisor.abort();
                             dead.session_persister.abort();
                             dead.outbox_scheduler.abort();
+                            drop(self.agent_lists.take(account_id));
                             dead.sync.stop().await;
                             tracing::info!(
                                 account_id = %account_id,
@@ -1150,15 +1173,8 @@ impl AccountManager {
         let notify = self.notify.clone();
         let kinds = self.agent_kinds.clone();
         let icons = self.agent_icons.clone();
-        let proxies = self.agent_proxies.clone();
-        // Where the held sends are, for an agent row's questions (R453): a
-        // folder that cannot be named reads them in part.
-        let data_dir = platform
-            .data_dir()
-            .inspect_err(|error| {
-                tracing::warn!(%error, "room list: no data folder, so agent rows read the questions for you in part");
-            })
-            .ok();
+        // An agent row's state is the list worker's (story 102.5).
+        let board = self.agent_attention.clone();
         let span = tracing::info_span!("room_list_producer", account_id = %account_id);
         let reaper_subs = subs_arc.clone();
         let task = tokio::spawn(
@@ -1173,8 +1189,7 @@ impl AccountManager {
                     &notify,
                     &kinds,
                     &icons,
-                    &proxies,
-                    data_dir.as_deref(),
+                    &board,
                 )
                 .await;
                 // A naturally-completed producer reaps its own subscription entry.
@@ -1231,14 +1246,38 @@ impl AccountManager {
         spaces_sink: SpacesSink,
         networks_sink: NetworksSink,
     ) -> Result<u64, CoreError> {
-        // Only one inbox subscription at a time: tear down any prior one so its
-        // producers stop feeding a stale merger/channel.
-        self.unsubscribe_inbox_inner().await;
+        // Only one inbox subscription at a time (R519, review R102L7-01): this
+        // one is the newest from here, and every producer of an older one —
+        // published or still being built — is stopped and awaited now. An
+        // older one still being built registers nothing more, never replaces
+        // this one's merger and changes nothing every subscription shares.
+        let (generation, older) = self.inbox_owners.begin();
+        inbox_owners::stop(older).await;
+        {
+            let mut inbox = self.inbox.lock().await;
+            if self.inbox_owners.is_current(generation) {
+                *inbox = None;
+            }
+        }
 
+        // Every account's lifetime as it stands before anything of this
+        // subscription is read or started (R516, review R102L6-01): an account
+        // whose sign-out or teardown begins after this point is registered
+        // nowhere by this subscription — no writer, no producer — however
+        // late its work resumes.
+        let seen = self.lifetimes.seen();
         let accounts = auth::scan_restorable_accounts(platform.as_ref())?;
-        // The launch (R397) waits for each of these to finish its first sync.
-        self.launch_ready
-            .expect(accounts.iter().map(|a| a.vm.account_id.clone()));
+        let lives: HashMap<String, Lifetime> = accounts
+            .iter()
+            .map(|a| (a.vm.account_id.clone(), seen.of(&a.vm.account_id)))
+            .collect();
+        let ended = |account_id: &str| lives.get(account_id).is_some_and(Lifetime::ended);
+        // The launch (R397) waits for each of these to finish its first sync,
+        // as the newest subscription says (review R102L7-02).
+        self.inbox_owners.if_current(generation, || {
+            self.launch_ready
+                .expect(accounts.iter().map(|a| a.vm.account_id.clone()))
+        });
         // Seed the merger's pin map from keeper-local state (Story 4.3): pins have
         // no Matrix representation, so membership + order come from the registry.
         let data_dir = platform.data_dir()?;
@@ -1258,27 +1297,58 @@ impl AccountManager {
             self.badge.clone(),
         );
         let subscription_id = NEXT_SUBSCRIPTION_ID.fetch_add(1, Ordering::Relaxed);
+        // Published before any account is put in it (R519): a sign-out from
+        // here on removes its account from this merger, built or not.
+        {
+            let mut inbox = self.inbox.lock().await;
+            if self.inbox_owners.is_current(generation) {
+                *inbox = Some(InboxHandle {
+                    subscription_id,
+                    generation,
+                    merger: merger.clone(),
+                });
+            }
+        }
+        // Rebuild the palette index from scratch for this subscription: drop any
+        // stale entries so a re-subscribe (StrictMode remount, account add/remove)
+        // never leaves a departed account's rooms behind — unless a newer
+        // subscription already began filling it (review R102L7-02).
+        {
+            let mut index = self.palette.lock().await;
+            self.inbox_owners
+                .if_current(generation, || *index = PaletteIndex::new());
+        }
 
         // Register every account slot up front so the merge reflects the full set
         // even before any batch arrives, then start each account's producer.
-        let mut producers: HashMap<String, JoinHandle<()>> = HashMap::with_capacity(accounts.len());
-        let mut spaces_producers: HashMap<String, JoinHandle<()>> =
-            HashMap::with_capacity(accounts.len());
-        let mut palette_producers: HashMap<String, JoinHandle<()>> =
-            HashMap::with_capacity(accounts.len());
-        // Rebuild the palette index from scratch for this subscription: drop any
-        // stale entries so a re-subscribe (StrictMode remount, account add/remove)
-        // never leaves a departed account's rooms behind.
-        {
-            let mut index = self.palette.lock().await;
-            *index = PaletteIndex::new();
-        }
         for restorable in &accounts {
+            if ended(&restorable.vm.account_id) {
+                continue;
+            }
             merger
                 .register_account(&restorable.vm.account_id, restorable.vm.hue_index)
                 .await;
         }
+        // The Agents rows kept from the last run are the Agents window's
+        // first emission, before any account is activated (story 102.5 #1,
+        // R468); the live rows replace them as each account's list lands.
+        for restorable in &accounts {
+            if ended(&restorable.vm.account_id) {
+                continue;
+            }
+            agent_list::draw_kept_rows(
+                &self.agent_list_rows,
+                &self.agent_attention,
+                &merger,
+                &restorable.vm.account_id,
+            )
+            .await;
+        }
         for restorable in accounts {
+            // A newer subscription took over: this one builds nothing more.
+            if !self.inbox_owners.is_current(generation) {
+                break;
+            }
             // Split the pair the scan returned: the rest of this loop works on the
             // non-secret VM, and the session blob the scan already read goes
             // straight into activation. Re-reading `session/<id>` there would cost
@@ -1288,24 +1358,62 @@ impl AccountManager {
                 session,
             } = restorable;
             let account_id = account.account_id.clone();
+            let life = seen.of(&account_id);
+            life.pause(lifetime::Pause::Acquiring).await;
             // Activate + acquire the room list. A single account's activation
-            // failure is not fatal to the whole inbox: skip it (its rooms simply
-            // don't appear) so the other accounts keep syncing.
+            // failure is not fatal to the whole inbox: skip it so the other
+            // accounts keep syncing. Its Agents rows kept from the last run
+            // stay, and the list says they are not live (story 102.5, R501,
+            // R381); they go only when the account itself is removed.
             let room_list = match self
-                .acquire_room_list(platform, &account_id, Some(session))
+                .acquire_room_list(platform, &account_id, Some(session), &life)
                 .await
             {
                 Ok(room_list) => room_list,
+                Err(e) if life.ended() => {
+                    // It began signing out or shutting down since this
+                    // subscription looked (R516): its teardown said so and
+                    // took what it had; nothing of it stays in this
+                    // subscription's own merger (review R102L7-02).
+                    tracing::warn!(
+                        account_id = %account_id,
+                        error = %e,
+                        "inbox: the account began closing while the inbox started; nothing of it is registered"
+                    );
+                    self.inbox_owners
+                        .if_current(generation, || self.launch_ready.gone(&account_id));
+                    merger.remove_account(&account_id).await;
+                    continue;
+                }
                 Err(e) => {
                     tracing::warn!(
                         account_id = %account_id,
                         error = %e,
-                        "inbox: account could not start; skipping (others keep syncing)"
+                        "inbox: account could not start; skipping (others keep syncing, its kept agents stay)"
                     );
-                    self.launch_ready.gone(&account_id);
-                    merger.remove_account(&account_id).await;
+                    self.inbox_owners
+                        .if_current(generation, || self.launch_ready.gone(&account_id));
+                    merger
+                        .trouble(&account_id, AgentListTrouble::NotStarted, true)
+                        .await;
                     continue;
                 }
+            };
+            life.pause(lifetime::Pause::TakingWriter).await;
+            // The rows are kept for the next launch through a writer of the
+            // lifetime this subscription took before it awaited anything: a
+            // sign-out that began since gives it none, and this subscription
+            // then registers no producer of the account (R501, R516; review
+            // R102L6-01).
+            let Some(keep_for_task) = self.agent_list_rows.writer(&life) else {
+                tracing::warn!(
+                    account_id = %account_id,
+                    "inbox: the account began closing while its list started; no writer, no producer"
+                );
+                self.inbox_owners
+                    .if_current(generation, || self.launch_ready.gone(&account_id));
+                merger.remove_account(&account_id).await;
+                continue;
             };
             // The account is now live (acquire_room_list activated it): fetch its
             // `Client` to drive the Spaces producer (Story 4.5), which enumerates
@@ -1315,6 +1423,12 @@ impl AccountManager {
                 let accounts = self.accounts.lock().await;
                 accounts.get(&account_id).map(|h| h.client.clone())
             };
+            // Each producer below is spawned held and registered under this
+            // subscription and the account's lifetime before it runs, and
+            // checks both before each effect (R519, review R102L7-01): the
+            // account's teardown or a newer subscription finds and stops it
+            // from the moment it exists, however long this one still builds.
+            let owner = self.inbox_owners.owner(generation, &life);
             let merger_for_task = merger.clone();
             // Thread the in-memory `NotifyConfig` into the producer so each row's
             // `MuteState` consults the same live muted-Network set the notify handler
@@ -1323,49 +1437,60 @@ impl AccountManager {
             let kinds_for_task = self.agent_kinds.clone();
             let ready_for_task = self.launch_ready.clone();
             let icons_for_task = self.agent_icons.clone();
-            // The client's event cache says when an agent room's events
-            // change, so its row's state is read again (story 101.6); the
-            // proxies and the held sends are what 101.3's reading of the
-            // questions answered in a row's room needs (R453).
-            let client_for_inbox = client.clone();
-            let proxies_for_task = self.agent_proxies.clone();
-            let data_dir_for_task = data_dir.clone();
-            let task = tokio::spawn(
-                async move {
-                    run_inbox_producer(
-                        room_list,
-                        merger_for_task,
-                        &account_id,
-                        &notify_for_task,
-                        &kinds_for_task,
-                        &ready_for_task,
-                        &icons_for_task,
-                        client_for_inbox,
-                        &proxies_for_task,
-                        Some(&data_dir_for_task),
-                    )
-                    .await;
-                }
-                .instrument(
-                    tracing::info_span!("inbox_producer", account_id = %account.account_id),
-                ),
-            );
-            producers.insert(account.account_id.clone(), task);
+            let board_for_task = self.agent_attention.clone();
+            let owner_for_task = owner.clone();
+            // The account's agent rows are read off the room list's path by
+            // its one worker, and the statuses out of the cache's reach are
+            // looked for by its one finder, both alive since its activation
+            // (story 102.5, R468, R501): the producer hands the worker the
+            // rooms it redrew and redraws the rows the worker's readings
+            // changed, for as long as it runs.
+            let worker_for_task = self.agent_lists.attach(&account_id);
+            let producer = async move {
+                run_inbox_producer(
+                    room_list,
+                    InboxRows {
+                        merger: merger_for_task,
+                        account_id: &account_id,
+                        notify: &notify_for_task,
+                        kinds: &kinds_for_task,
+                        launch_ready: &ready_for_task,
+                        icons: &icons_for_task,
+                        board: &board_for_task,
+                        worker: worker_for_task,
+                        keep: Some(keep_for_task),
+                        owner: owner_for_task,
+                    },
+                )
+                .await;
+            }
+            .instrument(tracing::info_span!("inbox_producer", account_id = %account.account_id));
+            if !self.inbox_owners.spawn(&owner, producer).await {
+                // Its lifetime ended or a newer subscription began since its
+                // writer was taken: nothing of it runs (the end of this
+                // subscription says which).
+                continue;
+            }
             if let Some(client) = client {
                 // Reuse the one client handle for both producers: clone once for the
                 // palette producer before moving the original into the Spaces closure.
                 let client_for_palette = client.clone();
                 let merger_for_spaces = merger.clone();
                 let spaces_account_id = account.account_id.clone();
-                let spaces_task = tokio::spawn(
-                    async move {
-                        run_spaces_producer(client, merger_for_spaces, &spaces_account_id).await;
-                    }
-                    .instrument(
-                        tracing::info_span!("spaces_producer", account_id = %account.account_id),
-                    ),
+                let spaces_owner = owner.clone();
+                let spaces = async move {
+                    run_spaces_producer(
+                        client,
+                        merger_for_spaces,
+                        &spaces_account_id,
+                        &spaces_owner,
+                    )
+                    .await;
+                }
+                .instrument(
+                    tracing::info_span!("spaces_producer", account_id = %account.account_id),
                 );
-                spaces_producers.insert(account.account_id.clone(), spaces_task);
+                self.inbox_owners.spawn(&owner, spaces).await;
 
                 // Palette producer (Story 9.1): refresh this account's FULL room set
                 // into the shared index on every sync batch. It enumerates
@@ -1374,87 +1499,108 @@ impl AccountManager {
                 let palette = self.palette.clone();
                 let palette_account_id = account.account_id.clone();
                 let hue_index = account.hue_index;
-                let palette_task = tokio::spawn(
-                    async move {
-                        run_palette_producer(
-                            client_for_palette,
-                            palette,
-                            &palette_account_id,
-                            hue_index,
-                        )
-                        .await;
-                    }
-                    .instrument(
-                        tracing::info_span!("palette_producer", account_id = %account.account_id),
-                    ),
+                let palette_owner = owner.clone();
+                let palette_task = async move {
+                    run_palette_producer(
+                        client_for_palette,
+                        palette,
+                        &palette_account_id,
+                        hue_index,
+                        &palette_owner,
+                    )
+                    .await;
+                }
+                .instrument(
+                    tracing::info_span!("palette_producer", account_id = %account.account_id),
                 );
-                palette_producers.insert(account.account_id.clone(), palette_task);
+                self.inbox_owners.spawn(&owner, palette_task).await;
             }
         }
 
-        {
-            let mut inbox = self.inbox.lock().await;
-            *inbox = Some(InboxHandle {
+        self.lifetimes.pause(lifetime::Pause::Publishing).await;
+        if !self.inbox_owners.is_current(generation) {
+            // A newer subscription replaced this one while it was built (R519,
+            // reviews R102L7-01, R102L7-02): it took this one's producers and
+            // owns what every subscription shares. This one stops whatever it
+            // still registered and leaves the rest alone.
+            inbox_owners::stop(self.inbox_owners.take_generation(generation)).await;
+            tracing::warn!(
                 subscription_id,
-                merger,
-                producers,
-                spaces_producers,
-                palette_producers,
-            });
+                "merged inbox: a newer subscription replaced this one while it started; what it started is stopped"
+            );
+            return Ok(subscription_id);
+        }
+        // An account whose sign-out or teardown began after this subscription
+        // looked: its teardown stopped and awaited every producer of it
+        // registered here, and none registers once it began (R519). What stays
+        // is its slot in this subscription's own merger.
+        for (account_id, life) in &lives {
+            if !life.ended() {
+                continue;
+            }
+            tracing::warn!(
+                account_id = %account_id,
+                "inbox: the account began closing while the inbox started; nothing of it is registered"
+            );
+            self.inbox_owners
+                .if_current(generation, || self.launch_ready.gone(account_id));
+            merger.remove_account(account_id).await;
         }
         tracing::info!(subscription_id, "merged inbox subscribed");
         Ok(subscription_id)
     }
 
-    /// Unsubscribe the merged inbox for `subscription_id`, aborting every
-    /// per-account producer. Idempotent — a mismatched/unknown id is a no-op.
+    /// Unsubscribe the merged inbox for `subscription_id`, stopping and
+    /// awaiting every per-account producer. Idempotent — a mismatched/unknown
+    /// id is a no-op.
     pub async fn unsubscribe_inbox(&self, subscription_id: u64) {
-        let matches = {
-            let inbox = self.inbox.lock().await;
-            inbox
+        let handle = {
+            let mut inbox = self.inbox.lock().await;
+            if inbox
                 .as_ref()
                 .is_some_and(|h| h.subscription_id == subscription_id)
+            {
+                inbox.take()
+            } else {
+                None
+            }
         };
-        if matches {
-            self.unsubscribe_inbox_inner().await;
-            tracing::info!(subscription_id, "merged inbox unsubscribed");
-        }
-    }
-
-    /// Tear down any active inbox subscription: abort its producers and drop the
-    /// handle. Idempotent.
-    async fn unsubscribe_inbox_inner(&self) {
-        let handle = self.inbox.lock().await.take();
-        if let Some(handle) = handle {
-            for (_, task) in handle.producers {
-                task.abort();
-            }
-            for (_, task) in handle.spaces_producers {
-                task.abort();
-            }
-            for (_, task) in handle.palette_producers {
-                task.abort();
-            }
-        }
-        // Clear the palette index too — a torn-down inbox has no live rooms to find.
-        {
+        let Some(handle) = handle else {
+            return;
+        };
+        // No subscription is the newest now (R519): its producers stop, and
+        // the palette it filled is cleared — a torn-down inbox has no live
+        // rooms to find — unless a newer subscription already began.
+        if let Some((none, producers)) = self.inbox_owners.retire(handle.generation) {
+            inbox_owners::stop(producers).await;
             let mut index = self.palette.lock().await;
-            *index = PaletteIndex::new();
+            self.inbox_owners
+                .if_current(none, || *index = PaletteIndex::new());
         }
+        tracing::info!(subscription_id, "merged inbox unsubscribed");
     }
 
     /// Activate `account_id` if needed and return its recency-sorted room list.
     /// Mirrors the activation/teardown contract of [`subscribe_room_list`]
     /// (partial-account cleanup on a room-list start failure) but hands the
     /// `RoomList` back to the caller rather than spawning a producer.
+    ///
+    /// `life` is the account's lifetime as the caller took it before it
+    /// awaited anything: opened here, under the accounts lock, by the
+    /// activation or for the account found live — refused once a sign-out
+    /// or a teardown began since (R516).
     async fn acquire_room_list(
         &self,
         platform: &Arc<dyn Platform>,
         account_id: &str,
         session: Option<auth::SessionBlob>,
+        life: &Lifetime,
     ) -> Result<RoomList, CoreError> {
         let (sync, did_activate) = {
             let mut accounts = self.accounts.lock().await;
+            self.lifetimes
+                .open(life)
+                .map_err(|_| account_closing(account_id))?;
             let did_activate = !accounts.contains_key(account_id);
             if did_activate {
                 let (
@@ -1476,7 +1622,7 @@ impl AccountManager {
                     self.archive.clone(),
                     self.draft_mirror_tx.clone(),
                     self.notify.clone(),
-                    self.agents_wiring(),
+                    self.wiring_in(life.clone()),
                 )
                 .await?;
                 accounts.insert(
@@ -1522,6 +1668,7 @@ impl AccountManager {
                             dead.reconnect_supervisor.abort();
                             dead.session_persister.abort();
                             dead.outbox_scheduler.abort();
+                            drop(self.agent_lists.take(account_id));
                             dead.sync.stop().await;
                             tracing::info!(
                                 account_id = %account_id,
@@ -1577,7 +1724,7 @@ impl AccountManager {
                     self.archive.clone(),
                     self.draft_mirror_tx.clone(),
                     self.notify.clone(),
-                    self.agents_wiring(),
+                    self.agents_wiring(account_id)?,
                 )
                 .await?;
                 accounts.insert(
@@ -1637,6 +1784,7 @@ impl AccountManager {
                             dead.reconnect_supervisor.abort();
                             dead.session_persister.abort();
                             dead.outbox_scheduler.abort();
+                            drop(self.agent_lists.take(account_id));
                             dead.sync.stop().await;
                             tracing::info!(
                                 account_id = %account_id,
@@ -1742,7 +1890,7 @@ impl AccountManager {
                     self.archive.clone(),
                     self.draft_mirror_tx.clone(),
                     self.notify.clone(),
-                    self.agents_wiring(),
+                    self.agents_wiring(account_id)?,
                 )
                 .await?;
                 accounts.insert(
@@ -1870,7 +2018,7 @@ impl AccountManager {
                     self.archive.clone(),
                     self.draft_mirror_tx.clone(),
                     self.notify.clone(),
-                    self.agents_wiring(),
+                    self.agents_wiring(account_id)?,
                 )
                 .await?;
                 accounts.insert(
@@ -1997,7 +2145,7 @@ impl AccountManager {
                     self.archive.clone(),
                     self.draft_mirror_tx.clone(),
                     self.notify.clone(),
-                    self.agents_wiring(),
+                    self.agents_wiring(account_id)?,
                 )
                 .await?;
                 accounts.insert(
@@ -2168,7 +2316,7 @@ impl AccountManager {
                     self.archive.clone(),
                     self.draft_mirror_tx.clone(),
                     self.notify.clone(),
-                    self.agents_wiring(),
+                    self.agents_wiring(account_id)?,
                 )
                 .await?;
                 accounts.insert(
@@ -2365,7 +2513,7 @@ impl AccountManager {
                 self.archive.clone(),
                 self.draft_mirror_tx.clone(),
                 self.notify.clone(),
-                self.agents_wiring(),
+                self.agents_wiring(account_id)?,
             )
             .await?;
             accounts.insert(
@@ -3433,7 +3581,7 @@ impl AccountManager {
                     self.archive.clone(),
                     self.draft_mirror_tx.clone(),
                     self.notify.clone(),
-                    self.agents_wiring(),
+                    self.agents_wiring(account_id)?,
                 )
                 .await?;
                 accounts.insert(
@@ -4457,12 +4605,27 @@ impl AccountManager {
         self.agent_proxies.clone()
     }
 
-    /// What an account's agents are wired to at activation.
-    fn agents_wiring(&self) -> AgentsWiring<'_> {
+    /// What an account's agents are wired to at an activation, in a lifetime
+    /// begun now, under the accounts lock: none while the account is closing
+    /// (R516) — a sign-out or a teardown under way is not undone by an
+    /// activation that starts meanwhile.
+    fn agents_wiring(&self, account_id: &str) -> Result<AgentsWiring<'_>, CoreError> {
+        let life = self
+            .lifetimes
+            .begin(account_id)
+            .map_err(|_| account_closing(account_id))?;
+        Ok(self.wiring_in(life))
+    }
+
+    /// What an account's agents are wired to at an activation in `life`.
+    fn wiring_in(&self, life: Lifetime) -> AgentsWiring<'_> {
         AgentsWiring {
             device: &self.agent_device,
             kinds: &self.agent_kinds,
             proxies: &self.agent_proxies,
+            board: &self.agent_attention,
+            lists: &self.agent_lists,
+            life,
         }
     }
 
@@ -4490,38 +4653,14 @@ impl AccountManager {
     }
 
     /// [`Self::agent_rooms`], each with its state as its Agents window row
-    /// says it (story 101.6, R421, R453): what the notes dock lists.
-    pub async fn agent_rooms_attended(
-        &self,
-        platform: &Arc<dyn Platform>,
-        account_id: &str,
-    ) -> Vec<ProxyRoomVm> {
-        let client = {
-            let accounts = self.accounts.lock().await;
-            match accounts.get(account_id) {
-                Some(handle) => handle.client.clone(),
-                None => return Vec::new(),
-            }
-        };
-        let data_dir = platform
-            .data_dir()
-            .inspect_err(|error| {
-                tracing::warn!(%error, "agents: no data folder, so the dock reads the questions for you in part");
-            })
-            .ok();
-        let cx = AttentionCx {
-            account_id,
-            kinds: &self.agent_kinds,
-            proxies: &self.agent_proxies,
-            data_dir: data_dir.as_deref(),
-        };
+    /// says it (story 101.6, R421, R453): what the notes dock lists. The
+    /// states are the list worker's ([`AttentionBoard`], story 102.5): the
+    /// dock reads no room again.
+    pub async fn agent_rooms_attended(&self, account_id: &str) -> Vec<ProxyRoomVm> {
         let mut listed = self.agent_rooms(account_id).await;
         for vm in &mut listed {
-            if let Some(room) = RoomId::parse(&vm.room_id)
-                .ok()
-                .and_then(|id| client.get_room(&id))
-            {
-                vm.attention = read_attention(&room, cx).await.state;
+            if let Ok(room) = RoomId::parse(&vm.room_id) {
+                vm.attention = self.agent_attention.said(account_id, &room);
             }
         }
         listed
@@ -6406,7 +6545,17 @@ impl AccountManager {
     /// Tear down the whole account: remove it from the merged inbox (so its rooms
     /// leave immediately while other accounts keep syncing), abort every
     /// subscription, and drop the live `Client`/`SyncService`.
+    ///
+    /// Its lifetime ends the moment this begins (R516): work that resumes
+    /// later — an activation, an inbox subscription — registers nothing of
+    /// it, and nothing activates it until this returns.
     pub async fn shutdown(&self, account_id: &str) {
+        let _closing = self.lifetimes.close(account_id);
+        self.teardown(account_id).await;
+    }
+
+    /// [`Self::shutdown`]'s work, its lifetime ended by the caller.
+    async fn teardown(&self, account_id: &str) {
         // The docked note's focus is cleared while the client can still send
         // (quit, sign-out): the host would otherwise state it until its TTL.
         // Bounded, so a homeserver that does not answer never holds the quit.
@@ -6421,45 +6570,48 @@ impl AccountManager {
         // sessions from the shared health snapshot — so a signed-out account's health
         // leaves the UI immediately and no handler leaks past teardown.
         self.drain_account_health(account_id).await;
-        // Remove the account from the active merged inbox first, so its rows are
-        // dropped from the emitted window, then abort *its* inbox producer and
-        // wait for it to finish. This releases the producer's `RoomList` (and the
-        // SQLite handles it holds through the `Client`) before `sign_out` deletes
-        // the store dir — without it the producer, which lives in `InboxHandle`
-        // rather than the account's `subscriptions`, would keep the store open
-        // until the frontend happened to re-subscribe the whole inbox.
+        // Stop and await every inbox producer of the account — the room-list,
+        // Spaces and palette producers of the subscription published and of
+        // one still being built, of every subscription that registered one
+        // (R519, review R102L7-01) — then remove what they drew. They hold
+        // its `RoomList` and `Client` clones (and the SQLite handles behind
+        // them), released here before `sign_out` deletes the store dir; its
+        // lifetime ended before this began, so none registers after this
+        // took them, and none that runs until then has an effect.
+        self.lifetimes
+            .pause(lifetime::Pause::StoppingProducers)
+            .await;
+        inbox_owners::stop(self.inbox_owners.take_account(account_id)).await;
         {
-            let mut inbox = self.inbox.lock().await;
+            let inbox = self.inbox.lock().await;
             self.launch_ready.gone(account_id);
-            if let Some(handle) = inbox.as_mut() {
+            if let Some(handle) = inbox.as_ref() {
                 handle.merger.remove_account(account_id).await;
-                if let Some(task) = handle.producers.remove(account_id) {
-                    task.abort();
-                    let _ = task.await;
-                }
-                // Abort + await the account's Spaces producer too (Story 4.5): it
-                // holds a `Client` clone, so it must be dropped before `sign_out`
-                // deletes the store dir (same reasoning as the room-list producer).
-                if let Some(task) = handle.spaces_producers.remove(account_id) {
-                    task.abort();
-                    let _ = task.await;
-                }
-                // Abort + await the account's palette producer too (Story 9.1): it
-                // holds a `Client` clone and keeps feeding this account's full room
-                // set into the shared `PaletteIndex`, so it must be dropped before
-                // `sign_out` deletes the store dir (same reasoning as above).
-                if let Some(task) = handle.palette_producers.remove(account_id) {
-                    task.abort();
-                    let _ = task.await;
-                }
             }
         }
         // Prune this account's slice from the shared palette index so a signed-out
         // account's rooms stop being queryable (the whole index is only rebuilt on a
         // full inbox re-subscribe; single-account sign-out must prune here). Idempotent.
         self.palette.lock().await.remove_account(account_id);
-        let mut accounts = self.accounts.lock().await;
-        if let Some(handle) = accounts.remove(account_id) {
+        // The account and its list worker and seat finder are taken out under
+        // the accounts lock every activation holds (R516, review R102L6-02): an
+        // activation under way when this began has published both by now, and
+        // one that starts later is refused while the account is closing.
+        self.lifetimes.pause(lifetime::Pause::Detaching).await;
+        let (handle, list) = {
+            let mut accounts = self.accounts.lock().await;
+            (
+                accounts.remove(account_id),
+                self.agent_lists.take(account_id),
+            )
+        };
+        // The list worker and seat finder hold a `Client` clone (story 102.5,
+        // R501): stopped and awaited outside the lock, before `sign_out`
+        // deletes the store dir, as the producers above.
+        if let Some(list) = list {
+            list.stop().await;
+        }
+        if let Some(handle) = handle {
             // Remove the account-wide archive event handlers (Story 5.1/5.2) so no
             // further events are ingested and no redaction is marked after the
             // account goes down, and no handler (holding a `Client` clone) leaks
@@ -6566,6 +6718,11 @@ impl AccountManager {
                 );
             }
         }
+        // The sign-out's teardown begins (R516, review R102L6-01): every
+        // lifetime of the account ends now, and none opens until it is over —
+        // its session is gone by then, or, when its rows could not be removed,
+        // it is still signed in and may start again.
+        let _closing = self.lifetimes.close(account_id);
         // The account's kept agent-room seats go with it: titles it read
         // stay nobody's once it signed out (R451).
         if let Some(own) = platform
@@ -6576,7 +6733,26 @@ impl AccountManager {
         {
             self.agent_kinds.forget_account(&own);
         }
-        self.shutdown(account_id).await;
+        self.teardown(account_id).await;
+        // So do its kept Agents rows and what its rows said (story 102.5),
+        // once its producer — the rows' writer — is stopped.
+        self.agent_attention.forget(account_id);
+        // Its lifetime ended above, so a write queued before this ran never
+        // lands after it (R501, R516). A removal that fails is said — the
+        // sign-out fails before the session goes, so signing out again
+        // removes them.
+        let store = self.agent_list_rows.clone();
+        let forgotten = {
+            let account_id = account_id.to_owned();
+            tokio::task::spawn_blocking(move || store.forget(&account_id))
+                .await
+                .map_err(|error| CoreError::Internal(error.to_string()))
+                .and_then(|removed| removed)
+        };
+        if let Err(error) = forgotten {
+            tracing::warn!(account_id = %account_id, %error, "agents: a signed-out account's kept Agents rows could not be removed");
+            return Err(CoreError::Internal(KEPT_ROWS_NOT_REMOVED.to_owned()));
+        }
         crate::auth::sign_out_cleanup(platform.as_ref(), account_id)?;
         Ok(())
     }
@@ -6823,6 +6999,21 @@ struct AgentsWiring<'a> {
     device: &'a AgentDevice,
     kinds: &'a Arc<AgentKinds>,
     proxies: &'a Arc<AgentProxies>,
+    /// Where the account's list worker writes its rows' states.
+    board: &'a Arc<AttentionBoard>,
+    /// Where the account's list worker and seat finder are kept until its
+    /// teardown.
+    lists: &'a AgentLists,
+    /// The lifetime this activation opened: the activation publishes
+    /// nothing once it ended (R516).
+    life: Lifetime,
+}
+
+/// What refuses work on an account whose lifetime ended or that is closing
+/// (R516, R381: said, and logged).
+fn account_closing(account_id: &str) -> CoreError {
+    tracing::warn!(account_id = %account_id, "account: it is signing out or shutting down; nothing of it starts now");
+    AccountError::SyncStart("this account is signing out or shutting down".to_owned()).into()
 }
 
 /// Send the notes view's `answer` into the session room `room_id`, as this
@@ -7308,7 +7499,7 @@ pub async fn admit_proxy_room(
     kinds: &AgentKinds,
     proxies: &AgentProxies,
 ) -> Result<(SessionKind, matrix_sdk::ruma::OwnedUserId), CoreError> {
-    let row = proxy_row(room.clone(), kinds).await;
+    let row = admission_row(room.clone(), kinds).await;
     let known = known_proxies(&room.client(), proxies).await;
     let admitted = proxy::admits(&row, room.own_user_id(), &known)
         .map_err(|refusal| CoreError::Unsupported(refusal.to_string()))?;
@@ -7405,234 +7596,23 @@ async fn read_agent_asks(
     )
 }
 
-/// The questions waiting for this person that are answered in `here`
-/// (Story 101.3, R430, R431; story 101.6, R453), oldest first: the one
-/// reading the decisions panel and the room's state in the list share.
-/// `None` for a room no question is answered in.
-///
-/// `here` must be one of the person's proxy rooms ([`proxy::admits`]); any
-/// other room answers none, but a session room whose status keeper has not
-/// read may be one, so it answers none read in part. Every other agent
-/// session room this account reads is read back to
-/// [`agent_waiting::ASK_READ_BACK`] events and folded
-/// ([`agent_waiting::fold`]); an ask is here when the host puts it to the
-/// person here ([`agent_waiting::answered_in`] over the proxy's rooms this
-/// account reads). Each carries where its answer stands
-/// ([`agent_waiting::answer_state`]) by the person's messages here: those in
-/// the timeline, those in the send queue that did not fail, and those held
-/// for Undo-Send (`data_dir`'s outbox; `None`: not readable). A room that
-/// could not be read or was read back only in part, an ask that could not
-/// be placed, or a held/queued send that could not be read is logged at
-/// WARN and said beside the panel ([`agent_waiting::ASKS_PARTIAL`], R381) —
-/// never a complete, empty answer (R453).
-pub(crate) async fn asks_answered_in(
-    here: &Room,
-    data_dir: Option<&Path>,
-    account_id: &str,
-    kinds: &AgentKinds,
-    proxies: &AgentProxies,
-) -> Option<agent_waiting::AgentAsksVm> {
-    let room_id = here.room_id();
-    if AgentRoomKind::of(here.room_type().as_ref()) != Some(AgentRoomKind::Session) {
-        return None;
-    }
-    let client = here.client();
-    let me = here.own_user_id().to_owned();
-    let known = known_proxies(&client, proxies).await;
-    let proxy = match proxy::admits(&proxy_row(here.clone(), kinds).await, &me, &known) {
-        Ok(admitted) => admitted.agent.to_owned(),
-        Err(proxy::Refusal::Unread) => {
-            tracing::warn!(room = %room_id, "agents: a room's status is unread, so the questions answered there could not be read");
-            return Some(agent_waiting::AgentAsksVm {
-                asks: Vec::new(),
-                note: Some(agent_waiting::ASKS_PARTIAL.to_owned()),
-            });
-        }
-        Err(_) => return None,
-    };
-    let mut own: HashMap<OwnedRoomId, SessionKind> = HashMap::new();
-    let mut others = Vec::new();
-    for room in client.joined_rooms() {
-        if AgentRoomKind::of(room.room_type().as_ref()) != Some(AgentRoomKind::Session) {
-            continue;
-        }
-        let row = proxy_row(room.clone(), kinds).await;
-        match proxy::admits(&row, &me, &known) {
-            Ok(admitted) if admitted.agent == &*proxy => {
-                own.insert(room.room_id().to_owned(), admitted.kind);
-            }
-            _ => others.push((room, row.kind)),
-        }
-    }
-    let main = own
-        .iter()
-        .find(|(_, kind)| **kind == SessionKind::Main)
-        .map(|(room, _)| room.clone());
-    let mut partial = false;
-    let mut waiting = Vec::new();
-    for (room, kind) in others {
-        let (seen, reach) = match agent_waiting::read_room(&room).await {
-            Ok(read) => read,
-            Err(error) => {
-                tracing::warn!(room = %room.room_id(), %error, "agents: a room's asks could not be read");
-                partial = true;
-                continue;
-            }
-        };
-        // An ask behind a failed read-back may be waiting (R453).
-        partial |= reach == agent_waiting::Reach::Part;
-        let whole = reach == agent_waiting::Reach::Start;
-        let levels = match room.power_levels().await {
-            Ok(levels) => levels,
-            Err(error) => {
-                tracing::warn!(room = %room.room_id(), %error, "agents: a room's power levels could not be read for its asks");
-                partial = true;
-                continue;
-            }
-        };
-        let agent =
-            |user: &matrix_sdk::ruma::UserId| agent_room::holds_agent_power(Some(&levels), user);
-        let asks = agent_waiting::fold(seen, &me, &proxy, &agent);
-        if asks.waiting.is_empty() {
-            continue;
-        }
-        let proxy_kind = |room: &RoomId| own.get(room).copied();
-        match agent_waiting::answered_in(kind, &asks, whole, &proxy_kind, main.as_deref()) {
-            Some(target) if &*target == room_id => {
-                waiting.extend(asks.waiting.into_iter().map(|ask| (ask, room.clone())));
-            }
-            Some(_) => {}
-            None => {
-                tracing::warn!(room = %room.room_id(), "agents: a room's asks could not be placed");
-                partial = true;
-            }
-        }
-    }
-    let mut asks = Vec::new();
-    if !waiting.is_empty() {
-        let (mine, read_whole) = mine_in(here, &me, data_dir, account_id).await;
-        partial |= !read_whole;
-        for (ask, room) in waiting {
-            let asked_by = room
-                .get_member_no_sync(&ask.asker)
-                .await
-                .ok()
-                .flatten()
-                .and_then(|member| member.display_name().map(str::to_owned))
-                .unwrap_or_else(|| ask.asker.localpart().to_owned());
-            let state = agent_waiting::answer_state(&ask, &mine);
-            asks.push(agent_waiting::AgentAskVm {
-                id: ask.ask.id,
-                room_id: room.room_id().to_string(),
-                asked_by,
-                question: ask.ask.question,
-                choices: ask.ask.choices,
-                default: ask.ask.default,
-                asked_at: ask.at,
-                state,
-            });
-        }
-        asks.sort_by_key(|ask| ask.asked_at);
-    }
-    Some(agent_waiting::AgentAsksVm {
-        asks,
-        note: partial.then(|| agent_waiting::ASKS_PARTIAL.to_owned()),
-    })
-}
-
-/// The person's own text messages in `room` as [`agent_waiting::answer_state`]
-/// reads them, and whether every source was read: the room's events (read
-/// back as an ask's room is; one read back only in part is not whole), the
-/// send queue's local echoes that have not failed, and the sends held for
-/// Undo-Send in `data_dir`'s outbox (`None`: unreadable). A source that
-/// cannot be read is logged at WARN and left out.
-async fn mine_in(
-    room: &Room,
-    me: &matrix_sdk::ruma::UserId,
-    data_dir: Option<&Path>,
-    account_id: &str,
-) -> (Vec<agent_waiting::Mine>, bool) {
-    let text = |content: &serde_json::Value| {
-        (content["msgtype"] == "m.text" && content["m.relates_to"]["rel_type"] != "m.replace")
-            .then(|| content["body"].as_str().map(str::to_owned))
-            .flatten()
-    };
-    let mut mine = Vec::new();
-    let mut whole = true;
-    match agent_waiting::read_room(room).await {
-        Ok((seen, reach)) => {
-            whole &= reach != agent_waiting::Reach::Part;
-            mine.extend(seen.iter().filter_map(|seen| {
-                let event = &seen.value;
-                (event["type"] == "m.room.message" && event["sender"] == me.as_str())
-                    .then_some(())?;
-                Some(agent_waiting::Mine {
-                    body: text(&event["content"])?,
-                    at: event["origin_server_ts"].as_u64()?,
-                    held: false,
-                })
-            }));
-        }
-        Err(error) => {
-            tracing::warn!(room = %room.room_id(), %error, "agents: the person's answers could not be read");
-            whole = false;
-        }
-    }
-    match room.send_queue().subscribe().await {
-        Ok((echoes, _)) => mine.extend(echoes.iter().filter_map(|echo| {
-            let matrix_sdk::send_queue::LocalEchoContent::Event {
-                serialized_event,
-                send_handle,
-                send_error: None,
-                ..
-            } = &echo.content
-            else {
-                return None;
-            };
-            let (raw, event_type) = serialized_event.raw();
-            (event_type == "m.room.message").then_some(())?;
-            // Dated by when it was queued: written before the ask, it answers
-            // nothing however long it waits (R447).
-            Some(agent_waiting::Mine {
-                body: text(&raw.deserialize_as::<serde_json::Value>().ok()?)?,
-                at: u64::from(send_handle.created_at.0),
-                held: false,
-            })
-        })),
-        Err(error) => {
-            tracing::warn!(room = %room.room_id(), %error, "agents: the send queue could not be read for the person's answers");
-            whole = false;
-        }
-    }
-    match data_dir.map(|dir| registry::list_outbox_rows_for_account(dir, account_id)) {
-        Some(Ok(rows)) => mine.extend(
-            rows.into_iter()
-                .filter(|row| {
-                    row.room_id == room.room_id().as_str() && row.kind == MessageKind::Text
-                })
-                .filter_map(|row| {
-                    Some(agent_waiting::Mine {
-                        at: u64::try_from(row.held_at_ts).ok()?,
-                        body: row.body,
-                        held: true,
-                    })
-                }),
-        ),
-        Some(Err(error)) => {
-            tracing::warn!(room = %room.room_id(), %error, "agents: the held sends could not be read for the person's answers");
-            whole = false;
-        }
-        None => {
-            tracing::warn!(room = %room.room_id(), "agents: no data folder, so the held sends could not be read for the person's answers");
-            whole = false;
-        }
-    }
-    (mine, whole)
-}
-
-/// What the dock and the surface handler read of a session room to decide
-/// whether it is one of the person's proxy conversations ([`proxy::admits`]).
+/// What a listing reads of a session room to decide whether it is one of the
+/// person's proxy conversations ([`proxy::admits`]): the event cache and the
+/// seat kept for it, never the server (story 102.5, R468) — a status out of
+/// the cache's reach is the seat finder's to look for.
 pub(crate) async fn proxy_row(room: Room, kinds: &AgentKinds) -> ProxyRoomRow {
+    let reader = agent_room::HeaderReader::open_row(room.clone(), kinds).await;
+    row_of(room, kinds, reader).await
+}
+
+/// [`proxy_row`] for one room the person acts in (an admission): a room
+/// with no seat kept is searched back a few pages for its status (R416).
+pub(crate) async fn admission_row(room: Room, kinds: &AgentKinds) -> ProxyRoomRow {
+    let reader = agent_room::HeaderReader::open_admitting(room.clone(), kinds).await;
+    row_of(room, kinds, reader).await
+}
+
+async fn row_of(room: Room, kinds: &AgentKinds, reader: agent_room::HeaderReader) -> ProxyRoomRow {
     let room_id = room.room_id().to_string();
     let name = room
         .cached_display_name()
@@ -7649,7 +7629,6 @@ pub(crate) async fn proxy_row(room: Room, kinds: &AgentKinds) -> ProxyRoomRow {
         .iter()
         .filter_map(|target| target.as_user_id().map(ToOwned::to_owned))
         .collect();
-    let reader = agent_room::HeaderReader::open_row(room.clone(), kinds).await;
     let state = reader.state();
     // The newer of the status read now and the seat the last one left names
     // the room — with none in reach (buried under claim renewals, or not in
@@ -7818,6 +7797,16 @@ async fn activate(
     // before sync starts, so a request in the first batch is read; and this
     // device's presence publisher into the account's own control rooms. Both
     // read which rooms are the person's proxy conversations as the dock does.
+    let lists = agents.lists;
+    let life = agents.life;
+    let list = agent_list::ListWorker {
+        client: client.clone(),
+        account_id: account_id.to_owned(),
+        kinds: Arc::clone(agents.kinds),
+        proxies: Arc::clone(agents.proxies),
+        data_dir: Some(data_dir.clone()),
+        board: Arc::clone(agents.board),
+    };
     let agents = agent_device::register(
         &client,
         account_id,
@@ -7901,6 +7890,32 @@ async fn activate(
         )
         .instrument(tracing::info_span!("outbox_scheduler", account_id = %account_id)),
     );
+
+    // The publication boundary (R516, review R102L6-02): a sign-out or a
+    // teardown that began while this activation ran waits on the accounts
+    // lock it holds; nothing of the account is published into that closing
+    // lifetime — what was built is stopped here and the activation refused.
+    life.pause(lifetime::Pause::CheckingLife).await;
+    if !life.is_live() {
+        client.remove_event_handler(archive_handler);
+        client.remove_event_handler(redaction_handler);
+        client.remove_event_handler(draft_handler);
+        client.remove_event_handler(notify_handler);
+        agents.goodbye(std::time::Duration::from_secs(1)).await;
+        drop(agents);
+        sync.stop().await;
+        reconnect_supervisor.abort();
+        outbox_scheduler.abort();
+        session_persister.abort();
+        let _ = session_persister.await;
+        return Err(account_closing(account_id));
+    }
+    life.pause(lifetime::Pause::StartingList).await;
+    // The account's Agents rows are read by one worker, and the statuses out
+    // of the cache's reach looked for by one finder, from now until the
+    // account's teardown, whatever surface reads them (story 102.5, R468,
+    // R501): started last, so an activation that fails leaves none running.
+    lists.start(list);
 
     Ok((
         client,
@@ -8452,8 +8467,8 @@ fn map_encryption_status(state: &VerificationState) -> EncryptionStatus {
 
 /// Drive the recency-sorted entries stream, converting each `VectorDiff` batch
 /// into a [`RoomListBatch`] and forwarding it to `sink`. The stream yields
-/// nothing until the filter is set, then a `Reset` and live diffs.
-#[allow(clippy::too_many_arguments)]
+/// nothing until the filter is set, then a `Reset` and live diffs. An agent
+/// row's state is what `board` says now (story 102.5).
 async fn run_producer(
     room_list: RoomList,
     sink: BatchSink,
@@ -8461,18 +8476,8 @@ async fn run_producer(
     notify: &NotifyConfig,
     kinds: &AgentKinds,
     icons: &AgentIcons,
-    proxies: &AgentProxies,
-    data_dir: Option<&Path>,
+    board: &AttentionBoard,
 ) {
-    let now = RowNow {
-        rows: None,
-        cx: AttentionCx {
-            account_id,
-            kinds,
-            proxies,
-            data_dir,
-        },
-    };
     let mut loading_state = room_list.loading_state();
     let (stream, controller) = room_list.entries_with_dynamic_adapters(ROOM_LIST_PAGE_SIZE);
     if !controller.set_filter(Box::new(new_filter_non_left())) {
@@ -8503,7 +8508,7 @@ async fn run_producer(
                         let mut ops = Vec::with_capacity(diffs.len());
                         for diff in diffs {
                             diff.clone().apply(&mut rows);
-                            ops.push(diff_to_op(diff, account_id, notify, kinds, icons, now).await);
+                            ops.push(diff_to_op(diff, account_id, notify, kinds, icons, board).await);
                         }
                         if !(sink)(RoomListBatch { ops, total }) {
                             tracing::info!(account_id = %account_id, "room list channel closed, stopping producer");
@@ -8521,7 +8526,7 @@ async fn run_producer(
                     seats_open = false;
                     continue;
                 }
-                let ops = agent_rows(&rows, account_id, notify, kinds, icons, now).await;
+                let ops = agent_rows(&rows, None, account_id, notify, kinds, icons, board).await;
                 if !ops.is_empty() && !(sink)(RoomListBatch { ops, total }) {
                     tracing::info!(account_id = %account_id, "room list channel closed, stopping producer");
                     break;
@@ -8537,26 +8542,85 @@ async fn run_producer(
     }
 }
 
-/// Every agent room's row of `rows` drawn again, as `Set` ops at its index.
+/// The agent rooms' rows of `rows` drawn again — every one, or those of
+/// `only` — as `Set` ops at their index. Nothing is read: each row says
+/// what `board` says of its room (story 102.5).
 async fn agent_rows(
     rows: &matrix_sdk_ui::eyeball_im::Vector<RoomListItem>,
+    only: Option<&[OwnedRoomId]>,
     account_id: &str,
     notify: &NotifyConfig,
     kinds: &AgentKinds,
     icons: &AgentIcons,
-    now: RowNow<'_>,
+    board: &AttentionBoard,
 ) -> Vec<RoomListOp> {
     let mut ops = Vec::new();
     for (index, item) in rows.iter().enumerate() {
-        if agent_room::AgentRoomKind::of(item.room_type().as_ref()).is_none() {
+        if agent_room::AgentRoomKind::of(item.room_type().as_ref()).is_none()
+            || only.is_some_and(|only| !only.iter().any(|room| room == item.room_id()))
+        {
             continue;
         }
         ops.push(RoomListOp::Set {
             index: index as u32,
-            room: room_item_to_vm(item, account_id, notify, kinds, icons, RowRead::Now(now)).await,
+            room: room_item_to_vm(item, account_id, notify, kinds, icons, board).await,
         });
     }
     ops
+}
+
+/// The agent session rooms a room-list diff carries: rows the list redrew,
+/// whose state the list worker reads again (story 102.5).
+fn agent_rooms_in(diff: &VectorDiff<RoomListItem>) -> Vec<OwnedRoomId> {
+    let session = |item: &RoomListItem| {
+        (agent_room::AgentRoomKind::of(item.room_type().as_ref())
+            == Some(agent_room::AgentRoomKind::Session))
+        .then(|| item.room_id().to_owned())
+    };
+    match diff {
+        VectorDiff::Append { values } | VectorDiff::Reset { values } => {
+            values.iter().filter_map(session).collect()
+        }
+        VectorDiff::PushFront { value }
+        | VectorDiff::PushBack { value }
+        | VectorDiff::Insert { value, .. }
+        | VectorDiff::Set { value, .. } => session(value).into_iter().collect(),
+        VectorDiff::Clear
+        | VectorDiff::PopFront
+        | VectorDiff::PopBack
+        | VectorDiff::Remove { .. }
+        | VectorDiff::Truncate { .. } => Vec::new(),
+    }
+}
+
+/// How long the Agents rows settle before they are kept for the next run.
+const KEEP_SETTLE: Duration = Duration::from_secs(2);
+
+/// What one account's inbox producer draws with beyond its room list (story
+/// 102.5): the merger it feeds, the readiness it marks, where its agent
+/// rows' states are, the account's list worker it hands the rooms it redrew
+/// and hears the changed rows from, and where the Agents rows are kept for
+/// the next run.
+struct InboxRows<'a> {
+    merger: InboxMerger,
+    account_id: &'a str,
+    notify: &'a NotifyConfig,
+    kinds: &'a AgentKinds,
+    launch_ready: &'a LaunchReadiness,
+    icons: &'a AgentIcons,
+    board: &'a AttentionBoard,
+    /// The account's list worker ([`AgentLists::attach`]): where the rooms
+    /// the list redrew go, and where the rooms whose state it changed come
+    /// from; `None` for an account with none.
+    worker: Option<(
+        mpsc::UnboundedSender<agent_list::Due>,
+        broadcast::Receiver<Vec<OwnedRoomId>>,
+    )>,
+    keep: Option<RowWriter>,
+    /// Its account's lifetime and its subscription, checked before each
+    /// emission and readiness it says (R519): a producer that outlived
+    /// either has no effect and stops.
+    owner: Owner,
 }
 
 /// Drive one account's recency-sorted entries stream for the merged inbox:
@@ -8564,239 +8628,176 @@ async fn agent_rows(
 /// the exact same conversion as [`run_producer`]) and hand it to the shared
 /// [`InboxMerger`], which folds it into that account's slot and re-emits the
 /// merged window. Stops when the merger reports the output channel is closed or
-/// the entries stream ends.
-#[allow(clippy::too_many_arguments)]
-async fn run_inbox_producer(
-    room_list: RoomList,
-    merger: InboxMerger,
-    account_id: &str,
-    notify: &NotifyConfig,
-    kinds: &AgentKinds,
-    launch_ready: &LaunchReadiness,
-    icons: &AgentIcons,
-    client: Option<Client>,
-    proxies: &AgentProxies,
-    data_dir: Option<&Path>,
-) {
-    let cx = AttentionCx {
-        account_id,
-        kinds,
-        proxies,
-        data_dir,
-    };
-    let mut loading_state = room_list.loading_state();
+/// the entries stream ends. A room list that cannot be read leaves the rows
+/// kept from the last run, said not live (R501).
+async fn run_inbox_producer(room_list: RoomList, inbox: InboxRows<'_>) {
+    let loading_state = room_list.loading_state();
     let (stream, controller) = room_list.entries_with_dynamic_adapters(ROOM_LIST_PAGE_SIZE);
     if !controller.set_filter(Box::new(new_filter_non_left())) {
-        tracing::warn!(account_id = %account_id, "inbox room list filter not applied (stream dropped)");
+        tracing::warn!(account_id = %inbox.account_id, "inbox room list filter not applied (stream dropped)");
+        if inbox.owner.holds() {
+            inbox
+                .merger
+                .trouble(inbox.account_id, AgentListTrouble::NotStarted, true)
+                .await;
+        }
         return;
     }
     let _controller = controller;
+    let initial = loading_state.get();
+    drive_inbox(stream, initial, loading_state, inbox).await;
+}
 
-    let mut total = loaded_total(&loading_state.get());
+/// [`run_inbox_producer`] over any stream of room-list diffs and loading
+/// states. A row is drawn the moment its diff comes, from what the board
+/// says of its state: drawing never reads a room, so neither the first
+/// Agents batch nor the launch's readiness (R397) waits on a room's
+/// reading (story 102.5 #2, #4). The agent rooms a diff carries are handed
+/// to the list worker, and the rows whose state it changed are redrawn.
+async fn drive_inbox(
+    stream: impl futures_util::Stream<Item = Vec<VectorDiff<RoomListItem>>>,
+    initial: RoomListLoadingState,
+    loading: impl futures_util::Stream<Item = RoomListLoadingState>,
+    inbox: InboxRows<'_>,
+) {
+    let (account_id, notify, kinds, icons, board) = (
+        inbox.account_id,
+        inbox.notify,
+        inbox.kinds,
+        inbox.icons,
+        inbox.board,
+    );
+    let merger = inbox.merger.clone();
+    let (due, mut redraws) = inbox.worker.unzip();
+    let mut total = loaded_total(&initial);
     // The room list's first sync is done once its loading state reads loaded
     // (R397: what the launch into the default agent waits for).
-    if matches!(loading_state.get(), RoomListLoadingState::Loaded { .. }) {
-        launch_ready.loaded(account_id);
+    if matches!(initial, RoomListLoadingState::Loaded { .. }) && inbox.owner.holds() {
+        inbox.launch_ready.loaded(account_id);
     }
     let mut loading_done = false;
     // The rows as the stream left them, so a change of the agents' pictures
-    // on this device (story 100.4) redraws the agent rooms' rows at once
-    // rather than at each room's next change.
+    // on this device (story 100.4), of a seat (R451) or of a room's state
+    // (story 102.5) redraws the agent rooms' rows at once.
     let mut rows: matrix_sdk_ui::eyeball_im::Vector<RoomListItem> =
         matrix_sdk_ui::eyeball_im::Vector::new();
     let mut pictures = icons.subscribe();
     let mut pictures_open = true;
-    // A seat's kind, agent or title that changed redraws them too (R451).
     let mut seats = kinds.subscribe();
     let mut seats_open = true;
-    // An agent room's state in the list (story 101.6, R421) is read from
-    // events the room list does not watch — a status, an approval, a
-    // question — so a change of an agent room's events reads it again, and
-    // its row is redrawn when the state it names changed. `noted` is what
-    // each agent room's row last said, and when a card in it expires: then
-    // the room is read again with no event having come (R436).
-    let mut room_events = client
-        .as_ref()
-        .map(|client| client.event_cache().subscribe_to_room_generic_updates());
-    let mut events_open = room_events.is_some();
-    let noted = agent_attention::RowAttention::default();
-    // A question, or the answer its proxy relays, lands in an agent room
-    // other than the one the person answers it in (R453): when any agent
-    // session room changes, the rows that show questions asked elsewhere are
-    // read again once the burst settles.
-    let mut asks_due: Option<tokio::time::Instant> = None;
+    let mut changed_open = redraws.is_some();
+    // The Agents rows are kept for the next run once a change settles.
+    let mut keep_due: Option<tokio::time::Instant> = None;
+    let mut kept: Option<Vec<RoomVm>> = None;
 
     futures_util::pin_mut!(stream);
+    futures_util::pin_mut!(loading);
     loop {
-        tokio::select! {
+        let ops = tokio::select! {
             maybe_diffs = stream.next() => {
-                match maybe_diffs {
-                    Some(diffs) => {
-                        let mut ops = Vec::with_capacity(diffs.len());
-                        for diff in diffs {
-                            diff.clone().apply(&mut rows);
-                            ops.push(diff_to_op(diff, account_id, notify, kinds, icons, RowNow { rows: Some(&noted), cx }).await);
-                        }
-                        if !merger.apply_account_batch(account_id, RoomListBatch { ops, total }).await {
-                            tracing::info!(account_id = %account_id, "inbox channel closed, stopping producer");
-                            break;
-                        }
-                    }
-                    None => {
-                        tracing::info!(account_id = %account_id, "inbox room list stream ended");
-                        break;
-                    }
+                let Some(diffs) = maybe_diffs else {
+                    tracing::info!(account_id = %account_id, "inbox room list stream ended");
+                    break;
+                };
+                let mut ops = Vec::with_capacity(diffs.len());
+                let mut redrawn = Vec::new();
+                for diff in diffs {
+                    redrawn.extend(agent_rooms_in(&diff));
+                    diff.clone().apply(&mut rows);
+                    ops.push(diff_to_op(diff, account_id, notify, kinds, icons, board).await);
                 }
+                if let (Some(due), false) = (&due, redrawn.is_empty()) {
+                    // A worker gone (its client shut down) reads nothing more;
+                    // the rows keep what the board says.
+                    let _ = due.send(agent_list::Due::Rooms(redrawn));
+                }
+                ops
             }
             changed = pictures.changed(), if pictures_open => {
                 if changed.is_err() {
                     pictures_open = false;
                     continue;
                 }
-                let ops = agent_rows(&rows, account_id, notify, kinds, icons, RowNow { rows: Some(&noted), cx }).await;
-                if !ops.is_empty()
-                    && !merger.apply_account_batch(account_id, RoomListBatch { ops, total }).await
-                {
-                    tracing::info!(account_id = %account_id, "inbox channel closed, stopping producer");
-                    break;
-                }
+                agent_rows(&rows, None, account_id, notify, kinds, icons, board).await
             }
             changed = seats.changed(), if seats_open => {
                 if changed.is_err() {
                     seats_open = false;
                     continue;
                 }
-                let ops = agent_rows(&rows, account_id, notify, kinds, icons, RowNow { rows: Some(&noted), cx }).await;
-                if !ops.is_empty()
-                    && !merger.apply_account_batch(account_id, RoomListBatch { ops, total }).await
-                {
-                    tracing::info!(account_id = %account_id, "inbox channel closed, stopping producer");
-                    break;
-                }
+                // The worker watches the seats itself: this redraws the
+                // rows' kinds and titles from them.
+                agent_rows(&rows, None, account_id, notify, kinds, icons, board).await
             }
-            update = async {
-                match room_events.as_mut() {
-                    Some(updates) => updates.recv().await,
+            read = async {
+                match redraws.as_mut() {
+                    Some(redraws) => redraws.recv().await,
                     None => std::future::pending().await,
                 }
-            }, if events_open => {
-                let changed: Vec<OwnedRoomId> = match update {
-                    Ok(update) => {
-                        if asks_due.is_none()
-                            && rows.iter().any(|item| {
-                                item.room_id() == update.room_id
-                                    && agent_room::AgentRoomKind::of(item.room_type().as_ref())
-                                        == Some(agent_room::AgentRoomKind::Session)
-                            })
-                        {
-                            asks_due = Some(tokio::time::Instant::now() + ASKS_SETTLE);
-                        }
-                        vec![update.room_id]
-                    }
-                    // Missed updates: every agent room is read again.
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => rows
-                        .iter()
-                        .map(|item| item.room_id().to_owned())
-                        .collect(),
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        events_open = false;
-                        continue;
-                    }
-                };
-                let ops = redraw_attention(&rows, &changed, &noted, notify, icons, cx).await;
-                if !ops.is_empty()
-                    && !merger.apply_account_batch(account_id, RoomListBatch { ops, total }).await
-                {
-                    tracing::info!(account_id = %account_id, "inbox channel closed, stopping producer");
-                    break;
+            }, if changed_open => match read {
+                Ok(read) => {
+                    agent_rows(&rows, Some(&read), account_id, notify, kinds, icons, board).await
                 }
-            }
+                // Fallen behind the worker: every agent row is drawn again
+                // from the board.
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    agent_rows(&rows, None, account_id, notify, kinds, icons, board).await
+                }
+                Err(broadcast::error::RecvError::Closed) => {
+                    changed_open = false;
+                    continue;
+                }
+            },
             () = async {
-                let wait = noted
-                    .next_recheck()
-                    .map(|at| (at - chrono::Utc::now()).to_std().unwrap_or_default());
-                match wait {
-                    Some(wait) => tokio::time::sleep(wait).await,
-                    None => std::future::pending().await,
-                }
-            } => {
-                // A card expired: its room is read again, no event having come.
-                let due = noted.due(chrono::Utc::now());
-                let ops = redraw_attention(&rows, &due, &noted, notify, icons, cx).await;
-                if !ops.is_empty()
-                    && !merger.apply_account_batch(account_id, RoomListBatch { ops, total }).await
-                {
-                    tracing::info!(account_id = %account_id, "inbox channel closed, stopping producer");
-                    break;
-                }
-            }
-            () = async {
-                match asks_due {
+                match keep_due {
                     Some(at) => tokio::time::sleep_until(at).await,
                     None => std::future::pending().await,
                 }
             } => {
-                // An agent room changed: the rows showing questions asked
-                // elsewhere are read again (R453).
-                asks_due = None;
-                let ask_rooms = noted.ask_rooms();
-                let ops = redraw_attention(&rows, &ask_rooms, &noted, notify, icons, cx).await;
-                if !ops.is_empty()
-                    && !merger.apply_account_batch(account_id, RoomListBatch { ops, total }).await
+                keep_due = None;
+                if let (Some(writer), Some(now)) =
+                    (inbox.keep.as_ref(), merger.live_agent_rows(account_id).await)
                 {
-                    tracing::info!(account_id = %account_id, "inbox channel closed, stopping producer");
-                    break;
+                    if kept.as_ref() != Some(&now) {
+                        // Written off this loop; its outcome is the writer's
+                        // and the list's to say (R501).
+                        drop(agent_list::keep_rows(writer, &merger, account_id, now.clone()));
+                        kept = Some(now);
+                    }
                 }
+                continue;
             }
-            maybe_state = loading_state.next(), if !loading_done => {
+            maybe_state = loading.next(), if !loading_done => {
                 match maybe_state {
                     Some(state) => {
-                        if matches!(state, RoomListLoadingState::Loaded { .. }) {
-                            launch_ready.loaded(account_id);
+                        if matches!(state, RoomListLoadingState::Loaded { .. })
+                            && inbox.owner.holds()
+                        {
+                            inbox.launch_ready.loaded(account_id);
                         }
                         total = loaded_total(&state);
                     }
                     None => loading_done = true,
                 }
+                continue;
             }
+        };
+        if ops.is_empty() {
+            continue;
         }
+        if !inbox.owner.holds() {
+            tracing::info!(account_id = %account_id, "inbox: the account or its subscription ended, stopping producer");
+            break;
+        }
+        if !merger
+            .apply_account_batch(account_id, RoomListBatch { ops, total })
+            .await
+        {
+            tracing::info!(account_id = %account_id, "inbox channel closed, stopping producer");
+            break;
+        }
+        keep_due.get_or_insert_with(|| tokio::time::Instant::now() + KEEP_SETTLE);
     }
-}
-
-/// The rows of `changed` agent rooms whose state a fresh reading changed,
-/// each redrawn from that one reading (story 101.6, R436, R453); `noted`
-/// keeps what each row says now and when to read it again.
-async fn redraw_attention(
-    rows: &matrix_sdk_ui::eyeball_im::Vector<RoomListItem>,
-    changed: &[OwnedRoomId],
-    noted: &agent_attention::RowAttention,
-    notify: &NotifyConfig,
-    icons: &AgentIcons,
-    cx: AttentionCx<'_>,
-) -> Vec<RoomListOp> {
-    let (account_id, kinds) = (cx.account_id, cx.kinds);
-    let mut ops = Vec::new();
-    for (index, item) in rows.iter().enumerate() {
-        if !changed.iter().any(|room| room == item.room_id()) {
-            continue;
-        }
-        if !matches!(
-            agent_room::AgentRoomKind::of(item.room_type().as_ref()),
-            Some(kind) if kind != agent_room::AgentRoomKind::Control
-        ) {
-            continue;
-        }
-        let read = read_attention(item, cx).await;
-        if !noted.note(item.room_id(), &read) {
-            continue;
-        }
-        ops.push(RoomListOp::Set {
-            index: index as u32,
-            room: room_item_to_vm(item, account_id, notify, kinds, icons, RowRead::Read(read))
-                .await,
-        });
-    }
-    ops
 }
 
 /// Per-account Spaces producer (Story 4.5). Enumerates the account's joined
@@ -8814,29 +8815,39 @@ async fn redraw_attention(
 /// child set from `m.space.child` state (`get_state_events_static`), keeping only
 /// children the account has actually joined. A read error on one Space is logged
 /// at `debug!` and that Space skipped — the others still update.
-async fn run_spaces_producer(client: Client, merger: InboxMerger, account_id: &str) {
+///
+/// Each push checks `owner` first (R519): once the account's lifetime or its
+/// subscription ended, nothing is pushed and the producer stops.
+async fn run_spaces_producer(client: Client, merger: InboxMerger, account_id: &str, owner: &Owner) {
     let mut updates = client.subscribe_to_all_room_updates();
     // Initial compute so the Space list is present before the first sync batch.
-    compute_and_push_spaces(&client, &merger, account_id).await;
-    loop {
-        match updates.recv().await {
-            Ok(_) => compute_and_push_spaces(&client, &merger, account_id).await,
+    let mut pushed = compute_and_push_spaces(&client, &merger, account_id, owner).await;
+    while pushed {
+        pushed = match updates.recv().await {
+            Ok(_) => compute_and_push_spaces(&client, &merger, account_id, owner).await,
             Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                 tracing::debug!(account_id = %account_id, skipped, "spaces updates lagged; forcing recompute");
-                compute_and_push_spaces(&client, &merger, account_id).await;
+                compute_and_push_spaces(&client, &merger, account_id, owner).await
             }
             Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                 tracing::info!(account_id = %account_id, "spaces updates closed, stopping producer");
-                break;
+                return;
             }
-        }
+        };
     }
+    tracing::info!(account_id = %account_id, "spaces: the account or its subscription ended, stopping producer");
 }
 
 /// Compute the account's joined Spaces + child membership from local state and
-/// push them into the merger (Story 4.5). Factored out of [`run_spaces_producer`]
-/// so the initial compute and each sync-driven recompute share one path.
-async fn compute_and_push_spaces(client: &Client, merger: &InboxMerger, account_id: &str) {
+/// push them into the merger (Story 4.5), if `owner` still holds: false when
+/// it no longer does. Factored out of [`run_spaces_producer`] so the initial
+/// compute and each sync-driven recompute share one path.
+async fn compute_and_push_spaces(
+    client: &Client,
+    merger: &InboxMerger,
+    account_id: &str,
+    owner: &Owner,
+) -> bool {
     use matrix_sdk::deserialized_responses::SyncOrStrippedState;
     use matrix_sdk::ruma::events::space::child::SpaceChildEventContent;
     use matrix_sdk::ruma::events::SyncStateEvent;
@@ -8911,7 +8922,11 @@ async fn compute_and_push_spaces(client: &Client, merger: &InboxMerger, account_
             .then_with(|| a.space_id.cmp(&b.space_id))
     });
 
+    if !owner.holds() {
+        return false;
+    }
     merger.update_spaces(account_id, spaces, memberships).await;
+    true
 }
 
 /// Per-account palette producer (Story 9.1). Projects the account's **full**
@@ -8922,27 +8937,36 @@ async fn compute_and_push_spaces(client: &Client, merger: &InboxMerger, account_
 /// Mirrors [`run_spaces_producer`]: it computes once, then loops on
 /// `Client::subscribe_to_all_room_updates()` — recomputing on each batch, forcing a
 /// full recompute on `Lagged`, and stopping on `Closed`.
+///
+/// Each write checks `owner` under the palette's lock (R519): once the
+/// account's lifetime or its subscription ended, nothing is written and the
+/// producer stops.
 async fn run_palette_producer(
     client: Client,
     palette: Arc<Mutex<PaletteIndex>>,
     account_id: &str,
     hue_index: u8,
+    owner: &Owner,
 ) {
     let mut updates = client.subscribe_to_all_room_updates();
-    compute_and_push_palette(&client, &palette, account_id, hue_index).await;
-    loop {
-        match updates.recv().await {
-            Ok(_) => compute_and_push_palette(&client, &palette, account_id, hue_index).await,
+    let mut written =
+        compute_and_push_palette(&client, &palette, account_id, hue_index, owner).await;
+    while written {
+        written = match updates.recv().await {
+            Ok(_) => {
+                compute_and_push_palette(&client, &palette, account_id, hue_index, owner).await
+            }
             Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                 tracing::debug!(account_id = %account_id, skipped, "palette updates lagged; forcing recompute");
-                compute_and_push_palette(&client, &palette, account_id, hue_index).await;
+                compute_and_push_palette(&client, &palette, account_id, hue_index, owner).await
             }
             Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                 tracing::info!(account_id = %account_id, "palette updates closed, stopping producer");
-                break;
+                return;
             }
-        }
+        };
     }
+    tracing::info!(account_id = %account_id, "palette: the account or its subscription ended, stopping producer");
 }
 
 /// Project the account's full room set into palette entries and replace that
@@ -8951,12 +8975,15 @@ async fn run_palette_producer(
 /// it as chat vs contact; a resolve error on `is_direct` degrades to `false`
 /// (treated as a chat) rather than dropping the room. Reads local state only — no
 /// network fetch. Factored out so the seed and each refresh share one path.
+/// Written only while `owner` holds, checked under the index's lock: false
+/// when it no longer does.
 async fn compute_and_push_palette(
     client: &Client,
     palette: &Arc<Mutex<PaletteIndex>>,
     account_id: &str,
     hue_index: u8,
-) {
+    owner: &Owner,
+) -> bool {
     let rooms = client.rooms();
     let mut entries: Vec<PaletteEntry> = Vec::with_capacity(rooms.len());
     for room in rooms {
@@ -8984,7 +9011,11 @@ async fn compute_and_push_palette(
         ));
     }
     let mut index = palette.lock().await;
+    if !owner.holds() {
+        return false;
+    }
     index.set_account_rooms(account_id, entries);
+    true
 }
 
 /// Load keeper-local pins from the registry into a merger-shaped map keyed by
@@ -9016,9 +9047,9 @@ async fn diff_to_op(
     notify: &NotifyConfig,
     kinds: &AgentKinds,
     icons: &AgentIcons,
-    now: RowNow<'_>,
+    board: &AttentionBoard,
 ) -> RoomListOp {
-    let mapped = map_vector_diff(diff, account_id, notify, kinds, icons, now).await;
+    let mapped = map_vector_diff(diff, account_id, notify, kinds, icons, board).await;
     vector_diff_to_op(mapped)
 }
 
@@ -9035,49 +9066,39 @@ async fn map_vector_diff(
     notify: &NotifyConfig,
     kinds: &AgentKinds,
     icons: &AgentIcons,
-    now: RowNow<'_>,
+    board: &AttentionBoard,
 ) -> VectorDiff<RoomVm> {
     match diff {
         VectorDiff::Append { values } => {
             let mut vms = Vec::with_capacity(values.len());
             for item in values {
-                vms.push(
-                    room_item_to_vm(&item, account_id, notify, kinds, icons, RowRead::Now(now))
-                        .await,
-                );
+                vms.push(room_item_to_vm(&item, account_id, notify, kinds, icons, board).await);
             }
             VectorDiff::Append { values: vms.into() }
         }
         VectorDiff::Clear => VectorDiff::Clear,
         VectorDiff::PushFront { value } => VectorDiff::PushFront {
-            value: room_item_to_vm(&value, account_id, notify, kinds, icons, RowRead::Now(now))
-                .await,
+            value: room_item_to_vm(&value, account_id, notify, kinds, icons, board).await,
         },
         VectorDiff::PushBack { value } => VectorDiff::PushBack {
-            value: room_item_to_vm(&value, account_id, notify, kinds, icons, RowRead::Now(now))
-                .await,
+            value: room_item_to_vm(&value, account_id, notify, kinds, icons, board).await,
         },
         VectorDiff::PopFront => VectorDiff::PopFront,
         VectorDiff::PopBack => VectorDiff::PopBack,
         VectorDiff::Insert { index, value } => VectorDiff::Insert {
             index,
-            value: room_item_to_vm(&value, account_id, notify, kinds, icons, RowRead::Now(now))
-                .await,
+            value: room_item_to_vm(&value, account_id, notify, kinds, icons, board).await,
         },
         VectorDiff::Set { index, value } => VectorDiff::Set {
             index,
-            value: room_item_to_vm(&value, account_id, notify, kinds, icons, RowRead::Now(now))
-                .await,
+            value: room_item_to_vm(&value, account_id, notify, kinds, icons, board).await,
         },
         VectorDiff::Remove { index } => VectorDiff::Remove { index },
         VectorDiff::Truncate { length } => VectorDiff::Truncate { length },
         VectorDiff::Reset { values } => {
             let mut vms = Vec::with_capacity(values.len());
             for item in values {
-                vms.push(
-                    room_item_to_vm(&item, account_id, notify, kinds, icons, RowRead::Now(now))
-                        .await,
-                );
+                vms.push(room_item_to_vm(&item, account_id, notify, kinds, icons, board).await);
             }
             VectorDiff::Reset { values: vms.into() }
         }
@@ -9143,51 +9164,16 @@ async fn resolve_mute_state(
     MuteState::None
 }
 
-/// How a row's agent state is had (story 101.6, R436): read now and noted in
-/// the producer's `rows`, when it keeps them, or read already by the caller.
-enum RowRead<'a> {
-    Now(RowNow<'a>),
-    Read(agent_attention::Attention),
-}
-
-/// A row's agent state read now: noted in the producer's `rows` when it
-/// keeps them, read with `cx`.
-#[derive(Clone, Copy)]
-struct RowNow<'a> {
-    rows: Option<&'a agent_attention::RowAttention>,
-    cx: AttentionCx<'a>,
-}
-
-/// What reading an agent room's state needs beyond the room (story 101.6,
-/// R453): what 101.3's reading of the questions answered there needs — the
-/// account, the session kinds read so far, the agents this device knows as
-/// the person's proxies, and the data folder holding the held sends
-/// (`None`: unreadable, so that reading is in part).
-#[derive(Clone, Copy)]
-struct AttentionCx<'a> {
-    account_id: &'a str,
-    kinds: &'a AgentKinds,
-    proxies: &'a AgentProxies,
-    data_dir: Option<&'a Path>,
-}
-
-/// The state of the agent room `room` (story 101.6, R421, R453): its own
-/// events, read back as 101.3 reads an asking room, and the questions
-/// 101.3's projection ([`asks_answered_in`]) puts to the person there.
-async fn read_attention(room: &Room, cx: AttentionCx<'_>) -> agent_attention::Attention {
-    let asks = asks_answered_in(room, cx.data_dir, cx.account_id, cx.kinds, cx.proxies).await;
-    agent_attention::of_room(room, asks.as_ref()).await
-}
-
 /// Resolve a [`RoomListItem`] to a non-secret [`RoomVm`]: display name plus a
-/// latest-event text preview and timestamp.
+/// latest-event text preview and timestamp. An agent room's state is what
+/// `board` says of it now (story 102.5): drawing a row never reads it.
 async fn room_item_to_vm(
     item: &RoomListItem,
     account_id: &str,
     notify: &NotifyConfig,
     kinds: &AgentKinds,
     icons: &AgentIcons,
-    read: RowRead<'_>,
+    board: &AttentionBoard,
 ) -> RoomVm {
     let room_id = item.room_id().to_string();
     let resolved = item.display_name().await;
@@ -9266,17 +9252,11 @@ async fn room_item_to_vm(
             }
         };
     // Whether the room needs the person, failed, works or finished unread
-    // (story 101.6, R421): Rust's word for the row, read once per row.
-    let agent_attention = match (agent_room, read) {
-        (Some(agent_room::AgentRoomKindVm::Control) | None, _) => None,
-        (Some(_), RowRead::Read(read)) => read.state,
-        (Some(_), RowRead::Now(now)) => {
-            let read = read_attention(item, now.cx).await;
-            if let Some(rows) = now.rows {
-                rows.note(item.room_id(), &read);
-            }
-            read.state
-        }
+    // (story 101.6, R421): Rust's word for the row, as the list worker last
+    // read it (story 102.5, R468).
+    let agent_attention = match agent_room {
+        Some(agent_room::AgentRoomKindVm::Control) | None => None,
+        Some(_) => board.said(account_id, item.room_id()),
     };
 
     RoomVm {
@@ -10162,6 +10142,11 @@ mod tests {
                 device: &AgentDevice::default(),
                 kinds: &Arc::default(),
                 proxies: &Arc::default(),
+                board: &Arc::default(),
+                lists: &AgentLists::default(),
+                life: AccountLifetimes::default()
+                    .begin(account_id)
+                    .expect("a lifetime"),
             },
         )
         .await
@@ -10190,6 +10175,11 @@ mod tests {
                 device: &AgentDevice::default(),
                 kinds: &Arc::default(),
                 proxies: &Arc::default(),
+                board: &Arc::default(),
+                lists: &AgentLists::default(),
+                life: AccountLifetimes::default()
+                    .begin(account_id)
+                    .expect("a lifetime"),
             },
         )
         .await
@@ -10228,6 +10218,11 @@ mod tests {
                 device: &AgentDevice::default(),
                 kinds: &Arc::default(),
                 proxies: &Arc::default(),
+                board: &Arc::default(),
+                lists: &AgentLists::default(),
+                life: AccountLifetimes::default()
+                    .begin(account_id)
+                    .expect("a lifetime"),
             },
         )
         .await
@@ -10294,6 +10289,11 @@ mod tests {
                     device: &AgentDevice::default(),
                     kinds: &Arc::default(),
                     proxies: &Arc::default(),
+                    board: &Arc::default(),
+                    lists: &AgentLists::default(),
+                    life: AccountLifetimes::default()
+                        .begin(&vm.account_id)
+                        .expect("a lifetime"),
                 },
             )
             .await
@@ -10348,6 +10348,11 @@ mod tests {
                 device: &AgentDevice::default(),
                 kinds: &Arc::default(),
                 proxies: &Arc::default(),
+                board: &Arc::default(),
+                lists: &AgentLists::default(),
+                life: AccountLifetimes::default()
+                    .begin(account_id)
+                    .expect("a lifetime"),
             },
         )
         .await
@@ -10428,6 +10433,11 @@ mod tests {
                     device: &AgentDevice::default(),
                     kinds: &Arc::default(),
                     proxies: &Arc::default(),
+                    board: &Arc::default(),
+                    lists: &AgentLists::default(),
+                    life: AccountLifetimes::default()
+                        .begin(&vm.account_id)
+                        .expect("a lifetime"),
                 },
             )
             .await

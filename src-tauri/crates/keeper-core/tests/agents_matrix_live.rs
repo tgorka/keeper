@@ -2325,7 +2325,7 @@ async fn a_waiting_question_survives_a_restart_and_ends_on_the_proxys_answer() {
 #[ignore = "live: Synapse on delectra"]
 async fn a_card_behind_a_restarts_chunk_still_needs_the_person() {
     use keeper_core::agents::approval::{binding_digest, summary_of};
-    use keeper_core::agents::attention::{attention, of_room, AgentAttentionVm, Reader, RoomEvent};
+    use keeper_core::agents::attention::{attention, read, AgentAttentionVm, Reader, RoomEvent};
     use keeper_core::agents::room::holds_agent_power;
     use keeper_core::agents::tier::AgentTool;
     use keeper_core::agents::waiting::ASK_READ_BACK;
@@ -2504,7 +2504,7 @@ async fn a_card_behind_a_restarts_chunk_still_needs_the_person() {
         "the chunk alone holds no card"
     );
 
-    let read = of_room(&joined, None).await;
+    let read = read(&joined).await.facts.with(None);
     assert_eq!(
         read.state,
         Some(AgentAttentionVm::NeedsYou),

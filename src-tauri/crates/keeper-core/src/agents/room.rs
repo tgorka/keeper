@@ -1637,6 +1637,28 @@ async fn listed_proxies(room: &Room) -> BTreeSet<OwnedUserId> {
     }
 }
 
+/// What one look of the seat finder found ([`HeaderReader::find`], story
+/// 102.5, R468).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Found {
+    /// The room has a seat now: a status was read, or one was kept.
+    Seat,
+    /// The room's history ended with no status: searched empty (R416).
+    Empty,
+    /// The look stopped at its page budget; the next one goes on from here.
+    Further(String),
+    /// A request failed: the next look starts where this one did.
+    Failed,
+}
+
+/// Where a search of a room's history back for a status ended.
+enum Search {
+    Status,
+    Start,
+    Budget(String),
+    Failed,
+}
+
 /// A session room's header reader: the folded state, what it last read of
 /// whose brief to draw ([`Trust`]) and the room it reads.
 pub struct HeaderReader {
@@ -1685,11 +1707,52 @@ impl HeaderReader {
         Self::open_with(room, kinds, true, None).await
     }
 
-    /// [`Self::open`] for a row (a proxy room's admission): a room whose
-    /// seat `kinds` keeps is drawn by it and its history is not searched —
-    /// a listing looks at every agent room, and a seat answers it.
+    /// [`Self::open`] for a row (a proxy room as a listing reads it): the
+    /// event cache and the seat `kinds` keeps, and never the server — a
+    /// listing looks at every agent room, and a status out of the cache's
+    /// reach is the seat finder's to look for ([`Self::find`], story 102.5,
+    /// R468).
     pub async fn open_row(room: Room, kinds: &AgentKinds) -> HeaderReader {
+        Self::open_with(room, kinds, false, Some(0)).await
+    }
+
+    /// [`Self::open`] for one room the person acts in (an admission: a
+    /// send, a scope, a push's answer): a room whose seat `kinds` keeps is
+    /// drawn by it and its history is not searched; one with no seat is
+    /// searched back [`HEADER_PAGES`] pages, as a row once was (R416).
+    pub async fn open_admitting(room: Room, kinds: &AgentKinds) -> HeaderReader {
         Self::open_with(room, kinds, false, Some(HEADER_PAGES)).await
+    }
+
+    /// The seat finder's one look at `room` (story 102.5, R416, R468): a
+    /// status in the event cache or a seat `kinds` keeps answers it at once;
+    /// a history already searched empty is not searched again; otherwise the
+    /// server's history is searched back from `from` (`None`: the newest
+    /// page) at most `pages` pages, and a status found there is kept as the
+    /// room's seat.
+    pub async fn find(room: Room, kinds: &AgentKinds, from: Option<String>, pages: usize) -> Found {
+        let mut reader = Self::open_row(room, kinds).await;
+        let (own, room_id) = (reader.room.own_user_id(), reader.room.room_id());
+        if reader.state.has_status() || kinds.seat(own, room_id).is_some() {
+            return Found::Seat;
+        }
+        if kinds.searched_empty(own, room_id) {
+            return Found::Empty;
+        }
+        let found = match reader.search(from, Some(pages)).await {
+            Search::Status => Found::Seat,
+            Search::Start => Found::Empty,
+            Search::Budget(from) => Found::Further(from),
+            Search::Failed => Found::Failed,
+        };
+        match &found {
+            Found::Seat => reader.remember(kinds),
+            Found::Empty => {
+                kinds.note_searched_empty(reader.room.own_user_id(), reader.room.room_id())
+            }
+            Found::Further(_) | Found::Failed => {}
+        }
+        found
     }
 
     async fn open_with(
@@ -1744,13 +1807,18 @@ impl HeaderReader {
     /// room's beginning and found none. A failed request is not that, and
     /// neither is a search that stopped at its page budget.
     async fn page_back(&mut self, pages: Option<usize>) -> bool {
+        matches!(self.search(None, pages).await, Search::Start)
+    }
+
+    /// [`Self::page_back`] from `from` (`None`: the newest page), saying
+    /// where a search stopped at its budget so the next one goes on there.
+    async fn search(&mut self, mut from: Option<String>, pages: Option<usize>) -> Search {
         use matrix_sdk::room::MessagesOptions;
-        let mut from: Option<String> = None;
         for _ in 0..pages.unwrap_or(usize::MAX) {
             let mut options = MessagesOptions::backward().from(from.as_deref());
             options.limit = HEADER_PAGE.into();
             let Ok(page) = self.room.messages(options).await else {
-                return false;
+                return Search::Failed;
             };
             let mut events: Vec<Value> = page
                 .chunk
@@ -1762,14 +1830,17 @@ impl HeaderReader {
                 self.apply(event);
             }
             if self.state.has_status() {
-                return false;
+                return Search::Status;
             }
             match page.end {
                 Some(end) if !page.chunk.is_empty() => from = Some(end),
-                _ => return true,
+                _ => return Search::Start,
             }
         }
-        false
+        match from {
+            Some(from) => Search::Budget(from),
+            None => Search::Failed,
+        }
     }
 
     /// Fold the person's mark of where they stopped listening, if `event`

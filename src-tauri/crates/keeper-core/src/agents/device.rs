@@ -27,7 +27,9 @@ use serde_json::Value;
 use tokio::sync::{broadcast, watch};
 use tokio::task::JoinHandle;
 
-use crate::account::{join_agent_invite, known_agents, known_proxies, proxy_row, send_agent_event};
+use crate::account::{
+    admission_row, join_agent_invite, known_agents, known_proxies, send_agent_event,
+};
 use crate::agents::events::{
     PresencePlatform, SurfaceOutcome, SurfaceResultContent, CONTENT_VERSION, PRESENCE, STATUS,
     SURFACE_REQUEST,
@@ -207,7 +209,7 @@ pub(crate) fn register(
                 let levels = room.power_levels().await.ok();
                 // The room as one of this person's proxy conversations, and
                 // the proxy whose it is: the one sender acted on here.
-                let row = proxy_row(room.clone(), &kinds).await;
+                let row = admission_row(room.clone(), &kinds).await;
                 let known = known_proxies(&client, &proxies).await;
                 let proxy = proxy::room_proxy(&row, me, &known);
                 let now = now_ms();

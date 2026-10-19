@@ -36,6 +36,7 @@ pub mod knowledge;
 pub mod kvm;
 pub mod label;
 pub mod launch;
+pub mod list_rows;
 pub mod log;
 pub mod mac_tables;
 pub mod main_dm;

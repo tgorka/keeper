@@ -207,10 +207,7 @@ pub async fn agent_rooms_list(
     state: State<'_, AppState>,
     account_id: String,
 ) -> Result<Vec<ProxyRoomVm>, IpcError> {
-    Ok(state
-        .accounts
-        .agent_rooms_attended(&state.platform, &account_id)
-        .await)
+    Ok(state.accounts.agent_rooms_attended(&account_id).await)
 }
 
 /// Ask the proxy in `room_id` for `drives` in scope (the scope chip).

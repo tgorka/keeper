@@ -11094,7 +11094,7 @@ status: open
 origin: lane `agents-101-status` (story 101.6 #2, R421), 2026-10-15
 location: `src/components/notes/notes-agent-dock.tsx` (`ATTENTION_RELIST_MS`), `AccountManager::agent_rooms`
 reason: the Agents-window stream that carries the state live is mounted with the chat list, not beside the notes, so the dock reads `ProxyRoomVm.attention` by listing its rooms again; a state change reaches the dock within ten seconds. A stream of the proxy rooms (or the Agents window subscribed by the shell rather than the chat list) would make it live. Since R453 each relist also reads 101.3's question projection once per listed proxy room (`agent_rooms_attended` → `asks_answered_in`: every other session room read back to `ASK_READ_BACK`), so the poll's cost grows with proxy rooms × session rooms; the stream would remove that as well.
-status: open
+status: open (narrowed by lane `list`, story 102.5: the dock reads the list worker's states (`AttentionBoard`) and no room's events, so the poll costs one listing from the cache; since R501 that worker lives with the account, not with the Chats view, so the states it reads are fresh while Notes is open; it is still a ten-second poll rather than a stream)
 
 ### DW-1494: *Working* says the last readable status was `running`, not that a host is still running it.
 
@@ -11108,14 +11108,14 @@ status: open
 origin: review-101status-3 (R101S3-01), recorded by lane `101stack`, 2026-10-16
 location: `keeper_core::account::run_inbox_producer` (`asks_due`, `redraw_attention`), `account::asks_answered_in`
 reason: the projection reads every joined session room, but the inbox re-reads destination rows only when the changed source room is already in its recency window, and it does not watch the send queue / outbox that `mine_in` reads; an off-window source's change, or a queued answer failing with no Matrix event, can leave a correctly placed marker stale until another qualifying event.
-status: open
+status: open (narrowed by lane `list`, story 102.5: the list worker hears every joined session room's event-cache updates, in the window or not, and places every row's questions on each pass; the send queue and the Undo-Send outbox are still read only when a pass runs)
 
 ### DW-1496: Cross-room reading of questions runs inside the inbox producer, one room after another.
 
 origin: review-101status-3 (R101S3-02), recorded by lane `101stack`, 2026-10-16
 location: `keeper_core::account::run_inbox_producer`, `asks_answered_in`, `agents::waiting::read_room`
 reason: each proxy row's reading scans the joined rooms and reads the other session rooms serially inside the single inbox producer (five seconds per room's pagination at most), so slow history reads delay ordinary inbox updates and expiry wake-ups; nothing reuses one reading across a batch. Fix: a coalesced, subscription-owned worker publishing changed rows, keeping *Unknown* on incomplete reads.
-status: open
+status: closed (lane `list`, story 102.5, R468, R502, 2026-10-19: `account::agent_list::run_attention_worker` reads each changed room once per pass off the producer and places every row's questions from kept readings with one projection per pass (`place_all`, R501); rows draw `AttentionBoard`'s state; tests `account::agent_list::tests::{the_agents_list_paints_before_any_room_is_read, a_pass_reads_each_changed_room_once_and_places_questions_in_memory, many_conversations_of_one_proxy_are_placed_in_one_visit_per_room}`)
 
 ### DW-1500: No tag's release has carried keeper-agentd since v0.10.0.
 
@@ -11270,3 +11270,45 @@ origin: lane `attachments` (story 102.4 #3), 2026-10-19
 location: `keeper_agent::agent::ServedSession::unopened`, called from `run_turn` when `open_turn` fails
 reason: `agent_turns`' world has no seam that makes the session writer fail on the `user` line, so the notice replying to the person's message (and the early `running` board going `idle`) is proved by reading the code only; the undecryptable message's notice has a test (`a_persons_undecrypted_message_is_answered_with_a_notice`). Fix: a writer fault switch in the test world (the `Room.limited`-style knob on the session writer) and a test asserting one `TURN_FAILED` notice in reply to the message and no anchor.
 status: closed (fix round 1 of lane `attachments`, R489/02) — `agent_turns::a_turn_whose_opening_cannot_be_written_is_answered_with_a_failure` (the session's `log/` folder becomes a file while the file downloads: one `TURN_FAILED` replying to the message, the status `running` then `idle`, no model asked) and `agent_turns::a_claim_lost_while_a_file_downloads_leaves_the_message_to_its_holder` (a lost claim sends nothing after `running`; the holder answers).
+
+### DW-1550: A kept Agents row can be written just after its account signed out.
+
+origin: lane `list` (story 102.5 #1, R468), 2026-10-19
+location: `keeper_core::account::agent_list::keep_rows`, `AccountManager::sign_out`
+reason: the producer keeps the Agents rows on the blocking pool 2 s after a change settles; sign-out stops the producer and then forgets the account's rows, but a write already queued on the blocking pool may land after the forget, leaving that account's rows in `agent_list_rows` until its next sign-in replaces them. They are drawn only for an account the keychain still restores, so a signed-out account's rows are never shown; the seats store's `writing` guard (held across a write and a forget) is the pattern that would close it.
+status: closed (lane `list` fix rounds 1, 2 and 3, R501, R516 and R519, 2026-10-19: every write goes through an `agents::list_rows::RowWriter` made in one account lifetime (`account::lifetime::Lifetime`) and carrying its snapshot's place, under one gate with the removal; a sign-out ends the lifetime when its teardown begins, so a write queued before it finds itself fenced, no writer is made for an ended lifetime — a subscription that resumes after the sign-out gets none and registers no producer — and an older snapshot never overwrites a newer one; a failed removal is the sign-out's error and the next sign-out removes the rows; tests `agents::list_rows::tests::{a_write_queued_before_a_sign_out_never_brings_the_rows_back, an_older_snapshot_landing_after_a_newer_one_is_dropped}`, `account::agent_list::tests::{a_row_write_queued_before_a_sign_out_brings_no_row_back, a_sign_out_that_cannot_remove_the_kept_rows_says_so_and_the_next_one_does, a_subscription_that_resumes_after_a_sign_out_registers_nothing_of_it, a_subscription_that_publishes_after_a_sign_out_stops_what_it_built, a_sign_out_while_the_inbox_waits_on_another_account_stops_every_producer_of_it}`; round 3: every inbox producer is registered before it runs and a teardown aborts and awaits them all, so none outlives the sign-out to act for the account)
+
+### DW-1551: The kept rows' unread counts reach the dock badge until the live list lands.
+
+origin: lane `list` (story 102.5 #1), 2026-10-19
+location: `keeper_core::inbox::{emit, InboxMerger::seed_agents}`
+reason: the merger's badge is computed over every slot, and a slot not live yet holds the kept Agents rows with the unread count they had at the last run; when another account's live batch emits before this one's, the badge counts the old numbers for the second or two until this account's list replaces them. Since R501 an account that cannot start keeps its kept rows (said not live above the Agents list) until it starts, so their old counts stay in the badge that long too. Counting only live slots would fix it.
+status: open
+
+### DW-1552: A seated room whose newest status cannot be read stays *Unknown*, and nothing looks for a newer one.
+
+origin: lane `list` (story 102.5 #3; triage-102-perf "not established": hesperia's `!IgRFBk…`), 2026-10-19
+location: `keeper_core::agents::room::{AgentKinds::seat_after, HeaderReader::find}`, `account::agent_list::run_seat_finder`
+reason: the finder looks only at rooms with no seat. A room whose seat is kept but whose newest status reads `Unreadable` has no seat by `seat_after`, so its row stays unread (*Unknown*) until a readable status arrives; why such a status is unreadable on hesperia was not established.
+status: open
+
+### DW-1553: The decisions panel still reads every session room again on each change of one.
+
+origin: lane `list` (story 102.5 #2; DW-1496's "the four readers become one"), 2026-10-19
+location: `keeper_core::account::{subscribe_agent_asks, read_agent_asks}` → `account::agent_list::asks_answered_in`
+reason: the rows and the dock read the list worker's states; the open room's decisions panel still places its questions from fresh readings of every other session room (no network on its row reads now, but each room is read back through its event cache), once per settled change while it is open. Reading the worker's kept readings would make it one reader; it was left out to keep this story to the list. Owed in the epic's list (R502).
+status: open
+
+### DW-1554: An inbox subscription being built can draw a closing account's kept rows for a moment.
+
+origin: lane `list` fix round 3 (story 102.5; R519, review RR102list3), 2026-10-19
+location: `keeper_core::account::AccountManager::subscribe_inbox` (the slot registration and `agent_list::draw_kept_rows` before the account loop)
+reason: the subscription skips an account whose lifetime already ended when it registers its slot and draws its kept rows, but it checks before it acts: a sign-out that begins between the check and the draw removes the account from the published merger first, and the draw then puts the rows kept from the last run back into this subscription's merger until the subscription reaches that account (its acquisition is refused and the slot removed) or finishes (its sweep removes it). No producer runs, nothing is kept and nothing reaches the palette; only the chat list may show the account's last-run rows while the list starts. Closing it needs the merger's slot writes to carry the account's lifetime and refuse an ended one under the merger's own lock.
+status: open
+
+### DW-1555: The Agents list's producer set and an open room's views are two held-spawn registries.
+
+origin: lane `102stack` (the stack of epic 102: the list × open seam), 2026-10-19
+location: `keeper_core::account::inbox_owners::InboxOwners` (102.5, R519) and `keeper_core::account::open_views` (102.6, R509 05)
+reason: both spawn a producer held and register it before it runs, and both abort and await what they hold at teardown, but they are keyed differently — by account and inbox-subscription generation under an account lifetime, against by subscription id with the sliding-sync subscription of each open room — and stop on different events. One helper for both would change when each stops; they were left as two.
+status: open

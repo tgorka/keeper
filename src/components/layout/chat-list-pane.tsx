@@ -90,6 +90,7 @@ export function ChatListPane() {
   const inboxRooms = useRoomsStore((s) => s.rooms);
   const archiveRooms = useArchiveRoomsStore((s) => s.rooms);
   const agentRooms = useAgentRoomsStore((s) => s.rooms);
+  const agentNote = useAgentRoomsStore((s) => s.note);
   const pinsRooms = usePinsRoomsStore((s) => s.rooms);
   const favoritesRooms = useFavoritesRoomsStore((s) => s.rooms);
   const selected = useRoomsStore((s) => s.selected);
@@ -777,6 +778,16 @@ export function ChatListPane() {
             onSelect={selectRoom}
             selected={selected}
           />
+        )}
+        {/* Why some Agents rows are not live (story 102.5, R501): Rust's
+          sentence, said above the rows it is about. */}
+        {view === "agents" && agentNote !== null && (
+          <p
+            role="status"
+            className="shrink-0 border-border border-b px-3 py-2 text-muted-foreground text-xs"
+          >
+            {agentNote}
+          </p>
         )}
         {errored ? (
           <div className="flex flex-1 items-center justify-center p-4">

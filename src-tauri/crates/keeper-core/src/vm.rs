@@ -2126,6 +2126,13 @@ pub struct InboxBatch {
     /// Archive window, so this is per-window, not a cross-account server total.
     #[ts(type = "number | null")]
     pub total: Option<u32>,
+    /// The Agents window only: why some of its rows are not live — kept
+    /// from the last run because an account could not start, or the kept
+    /// list could not be read or kept (story 102.5, R501, R381) — as the
+    /// sentence said above the list; absent when every row is live.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub note: Option<String>,
 }
 
 /// The single error envelope every fallible command rejects with (AD-8, AD-21).
@@ -8545,6 +8552,7 @@ mod tests {
                 rooms: vec![sample_inbox_room()],
             }],
             total: Some(11),
+            note: None,
         };
         let json = serde_json::to_string(&batch).expect("serialize batch");
         assert!(json.contains("\"total\":11"), "json was: {json}");

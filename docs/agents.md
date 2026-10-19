@@ -3375,13 +3375,42 @@ keeper shows an agent's room in its own timeline, on the Mac and on the iPhone a
   device of yours, and the *Done* goes. A room you never read nor wrote in is never *Done*: a
   session you only watch finishing is not news. Every other room shows its time as before. A
   room's history is read back as far as the decisions panel reads it (300 events, or its start),
-  so a card or question older than what a restart left loaded still counts. The row is read again
-  whenever the room's events change, so a status, a card or a question redraws it without a
-  message; the rows that show questions asked elsewhere are read again shortly after any agent
-  room changes; and a row is read again when a card waiting for you expires, with no event at all; the dock
-  reads its rooms every ten seconds while it is open, and when a read fails it keeps the rooms it
-  has and says so above the conversation until a read succeeds. *Working* means the last status
-  said `running`: a host that went away mid-turn leaves it until another status comes (DW-1494).
+  so a card or question older than what a restart left loaded still counts. Drawing a row never
+  reads a room (story 102.5, R468): a row says what keeper last read of its room, and a room not
+  read yet says *Unknown*. One reader per account reads the rooms that changed — a status, a card,
+  a question, a claim renewal, a read receipt — each once, settled for 300 ms with whatever else
+  changed, keeps what it read, and places every row's questions from what it keeps, so a question
+  asked in one room turns the row you answer it in to *Needs you* without that room being read
+  again, and a claim renewal reads only the room it landed in. A row is also read again when a
+  card waiting for you expires, with no event at all. That reader, and the finder below, run for
+  as long as the account is signed in on this device, whichever view is open (R501): the dock
+  lists its rooms every ten seconds while it is open, with the states that reader last read —
+  fresh while you work in Notes — and when a listing fails it keeps the
+  rooms it has and says so above the conversation until one succeeds. *Working* means the last
+  status said `running`: a host that went away mid-turn leaves it until another status comes
+  (DW-1494).
+- **The list is there when you open keeper (story 102.5, R468).** What each account's Agents
+  window last showed — each room, its name (`<agent> — <title>`), kind, the agent's letter and
+  picture, its state, its last activity and unread count — is kept in `keeper.db`
+  (`agent_list_rows`, never a message's text) and drawn before the account is even signed in
+  again, so the list paints from disk; the live rows replace it as the account's list arrives. A
+  kept *nothing pending* is drawn *Unknown* until the room is read: an old reading is no grounds to
+  say nothing waits. Nothing that lists the agent rooms asks the server: a room whose status is
+  out of what keeper holds (buried under claim renewals, or a restart) is read from the seat kept
+  for it; with no seat, one finder per account looks back for its status in the background —
+  twenty pages per look, each look going on where the last stopped, the next one after 1, 5 and 30
+  minutes and then hourly — and the seat it finds redraws the row; opening and closing the chat
+  list does not restart its looks. The launch into your default agent waits only for each
+  account's room list, never for a room's reading. If an account cannot start (or its list could
+  not be read), its kept rows stay and the Agents list says above them that they are as keeper
+  last saw them, until the account's live list arrives; if keeper cannot read or keep the list it
+  saved, it says that there too. Signing out removes the account's kept rows — even a save
+  already on its way, or a list still starting when you signed out, cannot bring them back. By
+  the time the sign-out is done, nothing of the account still reads its rooms, looks for
+  statuses or puts its rooms in search, even while the chat list was still starting another
+  account or was being opened twice at once; a chat list opened again after the account came
+  back is not undone by the older one. If the rows cannot be removed, the sign-out says so and
+  the account stays signed in, so signing out again removes them.
 - **The header.** Above the timeline, on the iPhone as well as the Mac: the status line — the
   agent's identity cell, `nixi@electra` (the agent and the host that answers), the run badge
   (`idle`, `running`, `blocked`, `waiting`, `done`, `unreadable`), `waiting: hesperia` when the

@@ -8260,29 +8260,41 @@ function mockAgentsDefaultSet(payload: Record<string, unknown>): Promise<AgentsL
   });
 }
 
+/**
+ * Story 102.5 (R501): `?agentlist=stale` draws the Agents window as Rust does
+ * when an account could not start — its rows kept from the last run, and the
+ * sentence `AgentListTrouble::NotStarted` says above them, on every Agents
+ * batch.
+ */
+const agentListParam = new URLSearchParams(window.location.search).get("agentlist");
+const AGENT_LIST_NOT_STARTED =
+  "keeper could not start one of your accounts just now, so its agents are shown as keeper last saw them.";
+
 function subscribeMockInbox(payload: Record<string, unknown>): number {
   const reset = (rooms: InboxRoomVm[]): InboxBatch => ({
     ops: [{ op: "reset", rooms }],
     total: rooms.length,
   });
+  const agentsReset = (rooms: InboxRoomVm[]): InboxBatch =>
+    agentListParam === "stale" ? { ...reset(rooms), note: AGENT_LIST_NOT_STARTED } : reset(rooms);
   (payload.channel as MockChannel<InboxBatch>).onmessage?.(reset(CHAT_ROWS));
   for (const window of ["archive", "pins", "favourites"]) {
     (payload[window] as MockChannel<InboxBatch>).onmessage?.(reset([]));
   }
   agentsWindow = payload.agents as MockChannel<InboxBatch>;
   if (launchParam === "none") {
-    agentsWindow.onmessage?.(reset([]));
+    agentsWindow.onmessage?.(agentsReset([]));
   } else if (!nixiDmHere) {
     // R397's late DM: the first batch has every agent room but Nixi's DM.
-    agentsWindow.onmessage?.(reset(AGENT_ROOM_ROWS.filter((row) => row.roomId !== DM_ROOM)));
+    agentsWindow.onmessage?.(agentsReset(AGENT_ROOM_ROWS.filter((row) => row.roomId !== DM_ROOM)));
     if (launchParam === "late") {
       setTimeout(() => {
         nixiDmHere = true;
-        agentsWindow?.onmessage?.(reset(AGENT_ROOM_ROWS));
+        agentsWindow?.onmessage?.(agentsReset(AGENT_ROOM_ROWS));
       }, LATE_ROOM_MS);
     }
   } else {
-    agentsWindow.onmessage?.(reset(AGENT_ROOM_ROWS));
+    agentsWindow.onmessage?.(agentsReset(AGENT_ROOM_ROWS));
   }
   (payload.spaces as MockChannel<SpacesSnapshot>).onmessage?.({ spaces: [] });
   (payload.networks as MockChannel<NetworksSnapshot>).onmessage?.({ networks: [] });
