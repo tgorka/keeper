@@ -785,6 +785,9 @@ pub struct AccountManager {
     /// acceptance 6): the desktop's agents host replaces it on each scan
     /// through [`AccountManager::agent_icons`]; on the phone it stays empty.
     agent_icons: Arc<AgentIcons>,
+    /// Each control room's host manifests as the server last gave them
+    /// (story 102.3, R466): reused by the headers' refresh for a minute.
+    host_reads: HostReads,
     /// The proxies whose agents zones are on this device (91.2): their person
     /// and the drives a dock's scope chip offers. Replaced by the desktop's
     /// agents host on each scan; empty on the phone.
@@ -930,6 +933,7 @@ impl AccountManager {
             badge,
             agent_kinds: Arc::new(AgentKinds::kept(data_dir)),
             agent_icons: Arc::new(AgentIcons::default()),
+            host_reads: HostReads::default(),
             agent_proxies: Arc::new(AgentProxies::default()),
             agent_focus: Arc::new(FocusLanes::default()),
             agent_device: Arc::new(AgentDevice::default()),
@@ -4374,22 +4378,49 @@ impl AccountManager {
 
     /// The live hosts of the principals whose control rooms this app's
     /// accounts are in, other than `me` (this device's own host), with
-    /// their builds' versions and the agents they serve, believed from the
-    /// agents whose zones are on this device: what a person's save of an
-    /// `agent.toml` key is checked against (story 101.6, R422). Read from
-    /// the store; never asks the server. A control room whose manifests the
-    /// store could not give is [`model::HOSTS_UNREAD`]'s sentence, with a
-    /// WARN naming why (R381, R436): never mistaken for no host at all.
+    /// their builds' versions, the agents they serve and what they can do,
+    /// believed from the agents whose zones are on this device: what a
+    /// person's save of an `agent.toml` key is checked against (story 101.6,
+    /// R422). Each control room's manifests are the server's room state,
+    /// read now ([`HostsFor::Save`], R466, R484): a store whose every
+    /// manifest is live still need not hold every host's, so it is never
+    /// believed for a save. A control room the server did not give them for
+    /// is [`model::HOSTS_UNREAD`], with a WARN naming why (R381, R436):
+    /// never mistaken for no host at all.
     ///
     /// [`model::HOSTS_UNREAD`]: crate::agents::model::HOSTS_UNREAD
     pub async fn serving_hosts(
         &self,
         me: Option<&str>,
     ) -> Result<Vec<crate::agents::model::ServingHost>, String> {
-        use matrix_sdk::deserialized_responses::RawAnySyncOrStrippedState;
-        use matrix_sdk::ruma::{OwnedUserId, UserId};
-        use serde_json::Value;
+        self.hosts_read(me, HostsFor::Save).await
+    }
 
+    /// Every live host serving this person's agents, this device's own
+    /// among them, for the agent rooms' headers and the Settings rows' note
+    /// (story 102.3): what each serving host can do beside what an
+    /// `agent.toml` asks for. Shown, never a save's check
+    /// ([`HostsFor::Showing`]): the store's manifests while every one it
+    /// holds is live, else a server read of the last
+    /// [`crate::agents::host::MANIFEST_RENEW_EVERY`], so a scan every few
+    /// seconds asks the server once a minute at most. The headers are told
+    /// what was read, or that it could not be.
+    pub async fn refresh_serving_hosts(&self) {
+        let read = self
+            .hosts_read(
+                None,
+                HostsFor::Showing(crate::agents::host::MANIFEST_RENEW_EVERY),
+            )
+            .await;
+        self.agent_icons.replace_hosts(read.ok());
+    }
+
+    async fn hosts_read(
+        &self,
+        me: Option<&str>,
+        purpose: HostsFor,
+    ) -> Result<Vec<crate::agents::model::ServingHost>, String> {
+        use matrix_sdk::ruma::OwnedUserId;
         let agents: Vec<OwnedUserId> = self.agent_icons.agents().into_iter().collect();
         let clients: Vec<Client> = {
             let accounts = self.accounts.lock().await;
@@ -4398,37 +4429,11 @@ impl AccountManager {
                 .map(|handle| handle.client.clone())
                 .collect()
         };
-        let mut manifests: Vec<(String, OwnedUserId, Value)> = Vec::new();
-        for client in clients {
-            for room in client.joined_rooms() {
-                if AgentRoomKind::of(room.room_type().as_ref()) != Some(AgentRoomKind::Control) {
-                    continue;
-                }
-                let states = room
-                    .get_state_events(StateEventType::from(crate::agents::events::HOST))
-                    .await
-                    .map_err(|error| {
-                        tracing::warn!(room = %room.room_id(), %error, "agents: a control room's host manifests could not be read; an agent.toml save that needs them is refused");
-                        crate::agents::model::HOSTS_UNREAD.to_owned()
-                    })?;
-                for state in states {
-                    let RawAnySyncOrStrippedState::Sync(raw) = state else {
-                        continue;
-                    };
-                    let Ok(event) = raw.deserialize_as::<Value>() else {
-                        continue;
-                    };
-                    let (Some(key), Some(sender)) = (
-                        event["state_key"].as_str(),
-                        event["sender"].as_str().and_then(|s| UserId::parse(s).ok()),
-                    ) else {
-                        continue;
-                    };
-                    manifests.push((key.to_owned(), sender, event["content"].clone()));
-                }
-            }
-        }
         let now = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0);
+        let mut manifests = Vec::new();
+        for client in clients {
+            manifests.extend(control_manifests(&client, now, &self.host_reads, purpose).await?);
+        }
         Ok(crate::agents::model::serving_from(
             manifests
                 .iter()
@@ -9395,8 +9400,155 @@ pub fn vector_diff_to_op(diff: VectorDiff<RoomVm>) -> RoomListOp {
     }
 }
 
+/// A control room's `dev.keeper.agent.host` events, each as `(state key,
+/// sender, content)`.
+pub type Manifests = Vec<(String, OwnedUserId, serde_json::Value)>;
+
+/// Each control room's host manifests as the server last gave them, and
+/// when (story 102.3, R466).
+#[derive(Debug, Default)]
+pub struct HostReads(std::sync::Mutex<HashMap<OwnedRoomId, (std::time::Instant, Manifests)>>);
+
+impl HostReads {
+    fn recent(&self, room: &RoomId, within: Duration) -> Option<Manifests> {
+        let reads = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reads
+            .get(room)
+            .filter(|(at, _)| at.elapsed() < within)
+            .map(|(_, read)| read.clone())
+    }
+
+    fn keep(&self, room: OwnedRoomId, read: Manifests) {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(room, (std::time::Instant::now(), read));
+    }
+}
+
+/// How long a control room's state read from the server may take (R466).
+pub const HOST_READ_WITHIN: Duration = Duration::from_secs(10);
+
+/// What the serving hosts are read for (story 102.3; R466, R484).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostsFor {
+    /// A person's save of an `agent.toml` key: every control room's state
+    /// as the server holds it now, every time. A store whose every
+    /// manifest is live proves only that those are live, never that it
+    /// holds every host's (the sliding sync keeps none of them fresh).
+    Save,
+    /// What a header or a Settings row shows: the store's manifests while
+    /// it holds at least one and every one is live, else a server read
+    /// younger than the window, else the server's now.
+    Showing(Duration),
+}
+
+/// The host manifests of `client`'s joined control rooms at `now_ms`
+/// (story 102.3, R466, R484), as `purpose` reads them: for a save, the
+/// server's (`GET /rooms/{id}/state`, bounded by [`HOST_READ_WITHIN`]) and
+/// nothing else; for showing, the store's while it holds them live, else a
+/// recent server read kept in `reads`, else the server's. A room whose
+/// manifests the server did not give is [`HOSTS_UNREAD`], with a WARN
+/// naming the room and why (R381): never read as no host at all.
+///
+/// [`HOSTS_UNREAD`]: crate::agents::model::HOSTS_UNREAD
+pub async fn control_manifests(
+    client: &Client,
+    now_ms: u64,
+    reads: &HostReads,
+    purpose: HostsFor,
+) -> Result<Manifests, String> {
+    let mut found = Vec::new();
+    for room in client.joined_rooms() {
+        if AgentRoomKind::of(room.room_type().as_ref()) != Some(AgentRoomKind::Control) {
+            continue;
+        }
+        let room_id = room.room_id().to_owned();
+        if let HostsFor::Showing(within) = purpose {
+            if let Ok(stored) = stored_manifests(&room).await {
+                let live = |content: &serde_json::Value| {
+                    serde_json::from_value::<crate::agents::host::HostManifest>(content.clone())
+                        .is_ok_and(|manifest| manifest.is_live(now_ms))
+                };
+                if !stored.is_empty() && stored.iter().all(|(_, _, content)| live(content)) {
+                    found.extend(stored);
+                    continue;
+                }
+            }
+            if let Some(read) = reads.recent(&room_id, within) {
+                found.extend(read);
+                continue;
+            }
+        }
+        match server_manifests(client, &room_id).await {
+            Ok(read) => {
+                reads.keep(room_id, read.clone());
+                found.extend(read);
+            }
+            Err(error) => {
+                tracing::warn!(room = %room_id, %error, ?purpose, "agents: the server did not give a control room's host manifests; an agent.toml save that needs them is refused");
+                return Err(crate::agents::model::HOSTS_UNREAD.to_owned());
+            }
+        }
+    }
+    Ok(found)
+}
+
+/// `room`'s host manifests as this device's store holds them.
+async fn stored_manifests(room: &Room) -> Result<Manifests, String> {
+    use matrix_sdk::deserialized_responses::RawAnySyncOrStrippedState;
+    let states = room
+        .get_state_events(StateEventType::from(crate::agents::events::HOST))
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(states
+        .into_iter()
+        .filter_map(|state| match state {
+            RawAnySyncOrStrippedState::Sync(raw) => {
+                manifest_event(&raw.deserialize_as::<serde_json::Value>().ok()?)
+            }
+            RawAnySyncOrStrippedState::Stripped(_) => None,
+        })
+        .collect())
+}
+
+/// `room`'s host manifests as the server holds its state now.
+async fn server_manifests(client: &Client, room: &RoomId) -> Result<Manifests, String> {
+    use matrix_sdk::ruma::api::client::state::get_state_events;
+    let request = get_state_events::v3::Request::new(room.to_owned());
+    let response = tokio::time::timeout(HOST_READ_WITHIN, client.send(request))
+        .await
+        .map_err(|_| {
+            format!(
+                "the server did not answer within {} s",
+                HOST_READ_WITHIN.as_secs()
+            )
+        })?
+        .map_err(|error| error.to_string())?;
+    Ok(response
+        .room_state
+        .iter()
+        .filter_map(|raw| raw.deserialize_as::<serde_json::Value>().ok())
+        .filter(|event| event["type"] == crate::agents::events::HOST)
+        .filter_map(|event| manifest_event(&event))
+        .collect())
+}
+
+/// A host manifest event as `(state key, sender, content)`.
+fn manifest_event(event: &serde_json::Value) -> Option<(String, OwnedUserId, serde_json::Value)> {
+    let key = event["state_key"].as_str()?;
+    let sender = UserId::parse(event["sender"].as_str()?).ok()?;
+    Some((key.to_owned(), sender, event["content"].clone()))
+}
+
 #[cfg(test)]
 mod tests {
+    // Story 102.3 #1 (R466): the serving hosts' reader, in its own file.
+    mod hosts;
+
     use super::*;
     use crate::error::CoreError;
     use crate::platform::SecretCache;

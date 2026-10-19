@@ -194,6 +194,7 @@ mod tests {
             expires_at: rfc3339(NOW + 150_000),
             picture_failures: Default::default(),
             lease: None,
+            web_search: None,
         }
     }
 

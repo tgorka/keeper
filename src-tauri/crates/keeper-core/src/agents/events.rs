@@ -143,12 +143,30 @@ pub struct StatusContent {
 /// A status's `console`: the mode the host runs the agent's commands in —
 /// `off` where it offers no `run` — and how many of its console's folders
 /// the host does not give them (R381: which and why is on the host's log
-/// and the Settings row). No path: a status names none (S-16).
+/// and the Settings row). No path: a status names none (S-16). It also
+/// carries the host's other tool that a person asks for and the host
+/// cannot give (`no_engine`, story 102.3, R483): this is the one object
+/// inside a status that every reader since 101.5 reads leniently, and a
+/// new top-level key would make the strict [`StatusContent`] reader drop
+/// the whole status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StatusConsole {
     pub mode: crate::agents::console::RunMode,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub refused: u32,
+    /// `mode` is `off` because the agent's home asks for a console and the
+    /// host's sandbox did not pass its probe — by failure, not by choice
+    /// (story 102.3). Absent otherwise and from a host built before it; a
+    /// build that does not read it ignores it, as this struct reads unknown
+    /// keys.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_sandbox: bool,
+    /// The agent's home asks for web search and this host names no search
+    /// engine, so the agent is offered none here (story 102.3, R483): every
+    /// device's header says so, whether or not it holds the agent's drive.
+    /// Absent otherwise and from a host built before it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_engine: bool,
 }
 
 fn is_zero(count: &u32) -> bool {

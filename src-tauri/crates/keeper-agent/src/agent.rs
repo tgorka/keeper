@@ -2594,22 +2594,31 @@ pub(crate) fn run_folders(
 /// is not, and how many of its folders in the agent's own drives this host
 /// does not give its commands. A file that does not read now says the
 /// console the host loaded; the turn it would start is refused anyway.
+/// Beside it, whether the home asks for web search this host has no engine
+/// for (story 102.3, R483), so every device's header can say it.
 pub(crate) fn host_console(deps: &AgentDeps) -> keeper_core::agents::events::StatusConsole {
     use keeper_core::agents::console::RunMode;
+    let home = &deps.home;
+    let read = crate::zone::read_home(&home.zone, &home.config.id, &home.drive).ok();
+    let config = read.as_ref().map_or(&home.config, |read| &read.config);
+    let no_engine = searches_without_an_engine(deps, config);
     if deps.full_access_turns.any() {
         return keeper_core::agents::events::StatusConsole {
             mode: RunMode::Full,
             refused: 0,
+            no_sandbox: false,
+            no_engine,
         };
     }
-    let home = &deps.home;
-    let run = crate::zone::read_home(&home.zone, &home.config.id, &home.drive)
-        .map(|read| read.config.run)
-        .unwrap_or_else(|_| home.config.run.clone());
+    let run = &config.run;
     if deps.sandbox.is_none() || !run.mode.offers_run() {
+        // Off by failure, not by choice, when the home asks for a console
+        // this host's sandbox cannot give (story 102.3).
         return keeper_core::agents::events::StatusConsole {
             mode: RunMode::Off,
             refused: 0,
+            no_sandbox: run.mode.offers_run(),
+            no_engine,
         };
     }
     let drives: Vec<(String, PathBuf)> = deps
@@ -2622,14 +2631,27 @@ pub(crate) fn host_console(deps: &AgentDeps) -> keeper_core::agents::events::Sta
         .filter(|profile| home.config.drives.contains(&profile.id))
         .map(|profile| (profile.id, profile.local_path))
         .collect();
-    let refused = landed_folders(&run, &drives, deps)
+    let refused = landed_folders(run, &drives, deps)
         .iter()
         .filter(|(_, landed)| landed.is_err())
         .count();
     keeper_core::agents::events::StatusConsole {
         mode: run.mode,
         refused: u32::try_from(refused).unwrap_or(u32::MAX),
+        no_sandbox: false,
+        no_engine,
     }
+}
+
+/// Whether `config` asks for web search — offered to its kind at all — on
+/// a host (`deps`) that names no search engine, so it is offered none
+/// (story 102.3, R483).
+fn searches_without_an_engine(
+    deps: &AgentDeps,
+    config: &keeper_core::agents::home::AgentConfig,
+) -> bool {
+    use keeper_core::agents::web_search;
+    deps.web_search.is_none() && web_search::is_on(config) && web_search::never(config).is_none()
 }
 
 /// The folders a run call asks for beyond its console's (R440 08): each of
@@ -10273,6 +10295,63 @@ fn agent_offer(
     tools
 }
 
+/// What a turn of `deps`'s agent asks for and is not offered, `withheld`
+/// being why its model was offered no tools at all (story 102.3): each a
+/// sentence for the log, and the status's detail when it has no tools.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Dropped {
+    pub sentences: Vec<String>,
+    pub detail: Option<&'static str>,
+}
+
+/// [`Dropped`] for a turn of `deps`'s agent as its home reads now: no tools
+/// at all (no drive of its scope granted, a model that takes none, a
+/// Hermes bot), a web search on a host that names no engine, a console on
+/// a host whose sandbox failed its probe.
+pub fn dropped_tools(deps: &AgentDeps, withheld: Option<&'static str>) -> Dropped {
+    use keeper_core::bots::grant;
+    let config = &deps.home.config;
+    let name = &config.name;
+    let mut dropped = Dropped::default();
+    if let Some(reason) = withheld {
+        let (why, detail) =
+            if reason == grant::NO_GRANT_NO_TOOLS || reason == grant::GRANTS_ALL_NONE_NO_TOOLS {
+                (
+                    "none of its [tools].drives is granted in this session's scope".to_owned(),
+                    "no tools this turn: no drive is granted in this session",
+                )
+            } else if reason == grant::HERMES_RUNS_ITS_OWN_TOOLS {
+                (reason.to_owned(), "no keeper tools: Hermes runs its own")
+            } else {
+                (
+                    reason.to_owned(),
+                    "no tools this turn: its model takes none",
+                )
+            };
+        dropped
+            .sentences
+            .push(format!("{name} was offered no tools this turn: {why}"));
+        dropped.detail = Some(detail);
+    }
+    if searches_without_an_engine(deps, config) {
+        dropped.sentences.push(format!(
+            "{name} asks for web search, but this host names no search engine, so it is offered none"
+        ));
+    }
+    if deps.sandbox.is_none()
+        && config.run.mode.offers_run()
+        && config
+            .allow
+            .iter()
+            .any(|tool| tool == keeper_core::agents::run::RUN)
+    {
+        dropped.sentences.push(format!(
+            "{name}'s console is set, but this host's sandbox did not pass its check, so it is offered no run"
+        ));
+    }
+    dropped
+}
+
 /// The wire names a turn of a workflow's run of this agent, working in
 /// `drives`, would be offered: [`agent_offer`] for a session of kind
 /// `workflow` under its own grants, its model offered `model_tools` —
@@ -10495,6 +10574,16 @@ async fn run_agent_turn(
     let local = deps.model_is_local();
     let (mut armed, model_tools) =
         arm_session(context, deps, context.messages.clone(), Probe::Ask).await;
+    // A tool the agent asks for that this turn is not offered is said: in
+    // the log, and on the status when it is offered none at all (story
+    // 102.3, R381).
+    let dropped = dropped_tools(deps, armed.withheld);
+    for sentence in &dropped.sentences {
+        tracing::warn!(agent = %config.id, session = %context.session.path, %sentence, "agents: a tool this agent asks for is not offered this turn");
+    }
+    if let (Some(board), Some(detail)) = (board, dropped.detail) {
+        board.say(detail);
+    }
     let allow: Vec<String> = match review {
         Some(pass) => {
             armed.request.tools.retain(|spec| pass.offers(&spec.name));

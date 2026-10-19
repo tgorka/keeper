@@ -419,9 +419,14 @@ refused, with a sentence beside the control and a WARN line in `keeper.log`, whe
   that way is warned about until the next release. The hosts are those agents your zones name
   announce — their manifests, not an attestation of the machine (R438);
 - the save writes such a key and this Mac could not read which hosts serve your agents: it cannot
-  tell that none is older, so nothing is written and the row says so, with a WARN naming why
-  (R436). A read that found no host at all lets the save through, and a save writing no such key
-  is not held to the hosts. The same check holds the *Web search* and *Console* saves of the row
+  tell that none is older, so nothing is written and the row says so, naming the agent, with a
+  WARN naming why (R436, R466). For a save, every control room's manifests are read from the
+  server (`GET /rooms/{id}/state`, ten seconds at most per room), every time (R484): this Mac's
+  store keeps no manifest fresh, and one whose every manifest is live still need not hold every
+  host's. Only a room the server does not answer for is "could not read". The store, and a server
+  read of the last minute, serve only what the headers and rows show (story 102.3). A read that
+  found no live host serving the agent lets the save through, and a save writing no such key is
+  not held to the hosts. The same check holds the *Web search* and *Console* saves of the row
   (R460): one host is one sentence naming every key it does not read ("… which does not read
   web_search in [tools].allow or [web_search] (keeper 0.10.4 does) …"). With such a host serving the
   agent, what still saves is what leaves the file free of those keys: a model without a level,
@@ -1585,7 +1590,44 @@ keeper's own file, and every write of it by the agent is refused (T5).
 While an agent searches **without asking**, its row shows a standing warning beside that choice —
 "Queries go to `<this Mac's engine>` and its upstream search engines without asking — they may
 contain words from your files." — and its room's header a small globe mark whose sentence says the
-same. The mark is read from the agent's home where it is on this device (a phone shows none).
+same. The level is read from the agent's home where it is on this device (a phone shows none).
+
+**What the serving host can do** (story 102.3). Each host's manifest says whether it names a search
+engine (`web_search: true|false`; a build before 102.3 says nothing). The globe is drawn only while
+the host serving the room's agent says it does; where the home asks for a search (*Ask* or *Without
+asking*) and that host names no engine, runs a keeper without web search (before 0.10.4), does not
+say, or has not been heard from, the header says so in a warning line instead — "Nixi asks for web
+search, but electra names no search engine, so it searches none there.", "electra runs keeper 0.9.0,
+which has no web search …", "… whether Nixi can search the web is unknown on this host." — and the
+agent's Settings row says the same for every live host serving it. A host is read only for the
+agents its manifest says it serves (R485): another person's host of the same name is not this
+agent's, and two of that name that say different things are "unknown". This Mac reads the
+manifests on its agents scan, from the server at most once a minute per control room. Every device,
+the phone included, also hears it from the host itself: on a host naming no engine, every status of
+an agent asking for web search says so (`console.no_engine`), and its room's header says "Nixi asks
+for web search, but electra names no search engine …" whether or not that device holds the drive,
+through every progress line of the turn.
+
+**Switching from the chat** (story 102.3, R469, R486). On this Mac, the agent's menu at the end of
+its room's header (`…`) offers *Web search* — Off / Ask / Without asking — and *Console* — the modes
+its Settings row offers, a mode it may not have disabled — as radio items. Each choice is saved by
+the very command its Settings row saves with, against what the menu showed, so the older-host
+check, the compare-and-replace and every refusal sentence are the same. *Full access* is not saved
+when it is picked: the menu first says what it gives — its description, the full-access warning and
+that no folder holds it — and saves it only on *Give full access*. A saved choice says it is saved
+and takes effect once the host serving the agent has it (an agent served elsewhere gets it when the
+drive's sync has pushed it, DW-1533). The menu reads the row again whenever it opens; a read that
+was out when a save answered never replaces what the save handed back. The console's folders are
+chosen in Settings › Agents; the menu keeps them.
+
+**When a tool is not offered** (story 102.3, R381). A turn's model offered no tools at all — none of
+the agent's `[tools].drives` is in the session's scope, the model says it takes none, or the bot is
+Hermes — says why on the room's status ("no tools this turn: no drive is granted in this session")
+and in a WARN line; so does an agent that asks for web search on a host naming no engine, or for a
+console on a host whose sandbox did not pass its probe. That host's status says its console is off
+by that failure (`console.no_sandbox`), and every device's header says "Console off on electra: …
+electra's sandbox did not pass its check …" rather than nothing. `keeper-agentd status` lists
+`web_search`, the surface tools and `kvm_*` as offered or not as the offer itself gates them.
 
 A level reaches an agent its host is already running (R427, R457): every turn reads the level as it
 reads the model, and every call reads it again, so switched off, the next call — in a turn already

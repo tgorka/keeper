@@ -266,6 +266,15 @@ pub fn folders_not_given(count: u32, host: &str) -> String {
     }
 }
 
+/// What a room's header says when the agent's home asks for a console and
+/// `host`'s sandbox did not pass its probe, so it runs no command there
+/// (story 102.3): off by failure, not by choice. That host's log says why.
+pub fn sandbox_failed(name: &str, host: &str) -> String {
+    format!(
+        "Console off on {host}: {name}'s console is set, but {host}'s sandbox did not pass its check, so {name} runs no commands there. The reason is in that host's log."
+    )
+}
+
 /// Why `drive`'s agents' consoles cannot be changed on a Mac that only
 /// pulls it: a change made here would never reach the drive.
 pub fn pull_only(drive: &str) -> String {

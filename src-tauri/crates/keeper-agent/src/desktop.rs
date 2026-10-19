@@ -79,14 +79,25 @@ pub const UNPINNED: &str =
 pub const NO_CONTROL_ROOM: &str = "This Mac has not found your agents' control room yet, so it takes no conversation. It is found once an agent's copy has been invited to it.";
 
 /// One host tick at a time: a tick that finds the last one still running
-/// skips rather than queues.
+/// skips rather than queues. Also one serving-hosts read at a time (story
+/// 102.3), from a `static` gate: [`TickGate::new`].
 #[derive(Debug, Default)]
 pub struct TickGate(AtomicBool);
 
 impl TickGate {
+    /// An open gate, for a `static`.
+    pub const fn new() -> TickGate {
+        TickGate(AtomicBool::new(false))
+    }
+
     /// The pass a tick runs under, or `None` while another tick holds one.
+    /// The pass is made only when the gate was open: a pass made and dropped
+    /// on a refusal would open the gate under the holder (R494).
     pub fn enter(&self) -> Option<TickPass<'_>> {
-        (!self.0.swap(true, Ordering::SeqCst)).then_some(TickPass(&self.0))
+        if self.0.swap(true, Ordering::SeqCst) {
+            return None;
+        }
+        Some(TickPass(&self.0))
     }
 }
 
@@ -99,7 +110,7 @@ pub struct TickPass<'a>(&'a AtomicBool);
 impl Drop for TickPass<'_> {
     fn drop(&mut self) {
         if std::thread::panicking() {
-            tracing::error!("agents: a host tick panicked; the next tick runs again");
+            tracing::error!("agents: a host tick or read panicked; the next one runs again");
         }
         self.0.store(false, Ordering::SeqCst);
     }
@@ -479,9 +490,13 @@ pub fn zone_agents(facts: &DesktopFacts) -> BTreeMap<OwnedUserId, ZoneAgent> {
                     avatar,
                     problems: picture.scan.problems,
                     not_here: picture.scan.not_here,
-                    searches_unasked: web_search::level(&home.config)
-                        == web_search::WebSearchLevel::WithoutAsking
-                        && web_search::never(&home.config).is_none(),
+                    web_search: if web_search::never(&home.config).is_none() {
+                        web_search::level(&home.config)
+                    } else {
+                        web_search::WebSearchLevel::Off
+                    },
+                    // As a host manifest names the agents it serves (R483).
+                    home: Some(format!("{}/{}", home.config.drive, home.config.id)),
                 },
             );
         }
@@ -1524,7 +1539,8 @@ impl DesktopHost {
             sandbox.is_some(),
         )
         .with_mcp(Arc::clone(&mcp))
-        .with_pictures(Arc::clone(&self.pictures));
+        .with_pictures(Arc::clone(&self.pictures))
+        .with_web_search(web_search.is_some());
         self.doorbell
             .set_principal_agents(runtime.principal_agents());
         let (stop, signal) = chat::cancellation();
@@ -2027,6 +2043,8 @@ mod tests {
             host: "electra".to_owned(),
             version: "0.10.3".to_owned(),
             agents: vec!["tgdrive/nixi".to_owned()],
+            web_search: None,
+            sandbox: false,
         };
         let refused = write_model(
             &facts.profiles,
@@ -2046,7 +2064,7 @@ mod tests {
                 Ok(&bots),
                 Err(model::HOSTS_UNREAD),
             ),
-            Err(model::HOSTS_UNREAD.to_owned())
+            Err(model::hosts_unread("nixi", model::HOSTS_UNREAD))
         );
         assert_eq!(std::fs::read_to_string(&file).expect("kept"), before);
         write_model(
@@ -2161,7 +2179,8 @@ mod tests {
                 .into_values()
                 .next()
                 .expect("nixi")
-                .searches_unasked
+                .web_search
+                == WithoutAsking
         };
 
         write_web_search(&profiles, &switch(Ask, Off), Ok(&[])).expect("on");
@@ -2182,6 +2201,7 @@ mod tests {
                 locked: None,
                 unavailable: None,
                 warning: None,
+                host: None,
             }
         );
         assert!(!marked());
@@ -2196,6 +2216,7 @@ mod tests {
                 locked: None,
                 unavailable: None,
                 warning: Some(web_search::unasked_warning(None)),
+                host: None,
             }
         );
         assert!(marked());
@@ -2268,6 +2289,8 @@ mod tests {
             host: slug.to_owned(),
             version: version.to_owned(),
             agents: vec!["tgdrive/nixi".to_owned()],
+            web_search: None,
+            sandbox: false,
         };
         let older = [host("electra", "0.10.3")];
         let newer = [host("electra", "0.10.4"), host("kalypso", "0.11.0")];
@@ -2293,7 +2316,7 @@ mod tests {
             assert_eq!(read(), before);
             assert_eq!(
                 write_web_search(&profiles, &level(on, Off), Err(model::HOSTS_UNREAD)),
-                Err(model::HOSTS_UNREAD.to_owned())
+                Err(model::hosts_unread("nixi", model::HOSTS_UNREAD))
             );
             assert_eq!(read(), before);
         }
@@ -2348,7 +2371,7 @@ mod tests {
                     &console(mode, paths, &off),
                     Err(model::HOSTS_UNREAD)
                 ),
-                Err(model::HOSTS_UNREAD.to_owned())
+                Err(model::hosts_unread("nixi", model::HOSTS_UNREAD))
             );
             assert_eq!(read(), before);
         }
@@ -2416,7 +2439,7 @@ mod tests {
                 Ok(&bots),
                 Err(model::HOSTS_UNREAD)
             ),
-            Err(model::HOSTS_UNREAD.to_owned())
+            Err(model::hosts_unread("nixi", model::HOSTS_UNREAD))
         );
         assert_eq!(std::fs::read_to_string(&file).expect("kept"), before);
 
@@ -2689,6 +2712,8 @@ mod tests {
                 nixi.clone(),
                 ZoneAgent {
                     icon: icon.map(str::to_owned),
+                    // As a host manifest names the agent (R483).
+                    home: Some("tgdrive/nixi".to_owned()),
                     ..ZoneAgent::default()
                 },
             )])
@@ -2905,6 +2930,37 @@ mod tests {
         }));
         assert!(panicked.is_err());
         assert!(gate.enter().is_some(), "the gate is open after the panic");
+    }
+
+    /// R494 (review R102T2-01): a refused entry leaves the gate shut under
+    /// the pass that holds it — however often it is refused — and only that
+    /// pass, dropped, opens it again.
+    #[test]
+    fn a_refused_entry_never_opens_the_gate_under_its_holder() {
+        let gate = TickGate::default();
+        let held = gate.enter().expect("open");
+        assert!(gate.enter().is_none(), "one tick at a time");
+        assert!(
+            gate.enter().is_none(),
+            "the refusal before opened the gate under its holder"
+        );
+        drop(held);
+        assert!(gate.enter().is_some(), "open again once the holder is done");
+    }
+
+    /// Story 102.3 (review R102T1-06): a `static` gate whose pass is moved
+    /// into a detached task — the desktop's serving-hosts read — opens
+    /// again when that task panics, so the next scan reads again.
+    #[tokio::test]
+    async fn a_read_that_panics_in_its_task_opens_its_static_gate_again() {
+        static READ: TickGate = TickGate::new();
+        let pass = READ.enter().expect("open");
+        let read = tokio::spawn(async move {
+            let _pass = pass;
+            panic!("a read panics");
+        });
+        assert!(read.await.is_err());
+        assert!(READ.enter().is_some(), "the gate is open after the panic");
     }
 
     /// A host built under `trust` and `tables` over no checkout, hosting

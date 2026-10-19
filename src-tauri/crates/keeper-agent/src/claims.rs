@@ -1345,6 +1345,7 @@ mod tests {
             expires_at: claim::rfc3339(server.now() + 180_000),
             picture_failures: Default::default(),
             lease: new.then(|| claim::QUARTER_HOUR_LEASE.to_owned()),
+            web_search: None,
         }
     }
 

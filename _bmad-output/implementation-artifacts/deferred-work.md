@@ -7207,7 +7207,7 @@ An MCP server the person names (96.2) can offer search. Its results are labelled
 Until such a server is configured, a skill's "search the web" step receives row 14's sentence and continues without it.
 
 Revisit when the owner wants agents to search the web without running a server: a `web_search` tool through a provider the person configures, at T0, with `untrusted` results and a row in the egress list.
-status: open
+status: closed (lane `tools`, story 102.3 #2, 2026-10-19: keeper has a `web_search` tool since 101.4; the CAPABILITIES web row answers with it — `tools: [web_search]`, "searches none" said only while it is not offered — test `workflow::tests::every_bmad_capability_is_answered_for_every_offer`)
 
 ### DW-382: BMAD's other 39 helper scripts have no Rust port.
 
@@ -10975,7 +10975,7 @@ status: closed (R428, fix round 1 of rung `agents-101-web`, 2026-10-15): a searc
 origin: rung `agents-101-web` (story 101.4 #2), 2026-10-15
 location: `keeper_core::agents::home::derived_needs`, `keeper_agent::hosts` (manifest capabilities), `src/components/settings/agents-section.tsx` (the switch's note)
 reason: an agent whose `[tools].allow` names `web_search`, served by a host with no `[web_search] url` (or a Mac with no engine saved), is simply not offered the tool there; its manifest carries no `web_search` capability, `[host].needs` cannot ask for one, and the Settings row does not say which of the person's hosts can search. Adding a capability changes placement for every agent that names the tool, which is beyond this story.
-status: open
+status: open — narrowed (lane `tools`, story 102.3 #3, 2026-10-19): the manifest says whether a host names an engine (`HostManifest.web_search`) and the Settings row says what each live serving host makes of the level (`AgentWebSearchVm.host`); placement and `[host].needs` still do not know it (DW-1532)
 
 ### DW-1472: Only SearXNG's `results` are read.
 
@@ -11010,7 +11010,7 @@ status: open
 origin: rung `agents-101-web` fix round 2 (R457), 2026-10-16
 location: `keeper_core::agents::room::{ZoneAgent::searches_unasked, AgentIcons::unasked_mark}`, `keeper_agent::desktop::zone_agents`, `AgentStatusVm.searches_unasked`
 reason: R457 asks for the mark from the serving host's status, where 101.5 puts the console mode (`StatusContent.console`, R440-09); that path is on `agents-101-console`, not on this branch, so the mark is read from the agent's `agent.toml` where its home is on this device — a phone, or a device without the drive, shows none, and a host still running an older file shows the newer level. At stack time the host writes the level into its status beside the console mode and the header reads it from there (an older host's absent field reads "unknown", never "asks").
-status: open
+status: open — narrowed (lane `tools`, story 102.3 #3, 2026-10-19; reopened by fix round 1, R483): the globe is drawn only where the serving host that names this agent's home says it names a search engine (`AgentIcons::searching`, `HostManifest.web_search`, `ZoneAgent.home`), a warning sentence otherwise, and every device — the phone included — says when the serving host's status names no engine for it (`StatusConsole.no_engine`). What is left: the level the globe draws (*without asking*) still comes from the home on this device, which may be ahead of what the serving host loaded (an unpushed save, DW-1533), and the phone draws no globe; the serving host's effective level on its status would close it. Tests `room::tests::{the_header_draws_the_globe_only_where_the_serving_host_searches, the_no_engine_warning_comes_from_the_serving_hosts_status}`.
 
 ### DW-1480: A console's folder cannot be a run's `cwd`.
 
@@ -11206,4 +11206,46 @@ status: open
 origin: review RR102sync4 (R102S4-02, R520), recorded by lane `102stack`, 2026-10-19
 location: `keeper-sync/src/lfs/store.rs` (`discard_unpublished`), `keeper-sync/src/engine.rs` (repair replay)
 reason: `discard_unpublished` runs only after a successful `insert_durable`. An object recovered another way — repair replay verifying an original that became readable again (`make_durable`), or a normal download — keeps its `unpublished/<oid>` copy, and nothing bounds or reconciles `unpublished/` across objects, so duplicate bytes stay on the drive after publishing resumes.
+status: open
+
+### DW-1530: A host whose manifest has expired is not held to a save's keys.
+
+origin: lane `tools` (story 102.3 #1, R466), 2026-10-19
+location: `keeper_core::agents::model::serving_from`, `keeper_core::account::control_manifests`
+reason: R438 checks a save against the live manifests only. A host serving the agent that is down when the person saves (its manifest expired) is not named, and if it runs a build older than a key the save writes, it refuses the home when it starts again. Holding expired manifests too would refuse saves forever beside a host that was retired without withdrawing its manifest; a withdrawal (`live: false`) cannot be told from a crash in the event.
+status: open
+
+### DW-1531: The phone's header does not say what the serving host can do with web search.
+
+origin: lane `tools` (story 102.3 #3), 2026-10-19
+location: `keeper_core::agents::room::AgentIcons::searching`, `keeper_core::account::refresh_serving_hosts` (called from the desktop's agents scan only)
+reason: the level an agent's home asks for is known only where its agents zone is on the device, and the serving hosts are read by the desktop's scan; a phone shows neither the globe nor the warning. A status field would make older devices read the whole status as unreadable (`StatusContent` denies unknown keys).
+status: closed (lane `tools`, fix round 1, R483 02, 2026-10-19): promoted into story 102.3. The host writes `no_engine` inside the status's `console` object — the one object in a status every reader since 101.5 reads leniently, never a new top-level key — on every status of an agent whose home asks for web search on a host naming no engine, and every device's header says `web_search::no_engine` from the status alone, a progress line keeping it. Tests `agent_turns::a_host_with_no_search_engine_says_it_on_every_status_every_device_reads` (a real turn, then the header with empty icons), `room::tests::the_no_engine_warning_comes_from_the_serving_hosts_status`. A host that names an engine but runs an older build than 0.10.4, or does not say, is still said only where the serving hosts are read (the desktop); DW-1477 holds the rest.
+
+### DW-1532: Placement does not prefer a host that searches the web.
+
+origin: lane `tools` (story 102.3 #3; the rest of DW-1471), 2026-10-19
+location: `keeper_core::agents::placement`, `keeper_core::agents::home::derived_needs`
+reason: the manifest says `web_search: true|false` now, but placement does not read it and `[host].needs` cannot ask for it, so an agent that searches can still be served by a host naming no engine — the header and Settings say so, and the turn's log WARNs.
+status: open
+
+### DW-1533: A saved switch does not say when the drive has not reached its remote yet.
+
+origin: lane `tools` (story 102.3 #4; triage 102-agent-tools §5.3), 2026-10-19
+location: `src/components/chat/agent-room-header.tsx` (`AgentMenu`), `keeper_agent::desktop::prepare_home`
+reason: a switch saved on this Mac reaches a host elsewhere only once the drive's sync pushed it; since fix round 1 (R486) the menu says "Saved; it takes effect once the host serving <Name> has it", never that it applies, but not whether the push has happened (the 2026-10-17 web search choice sat unpushed for two days behind a stopped upload, story 102.2). Saying "saved on this Mac; not on <drive>'s remote yet" needs the profile's ahead-count beside the rows.
+status: open
+
+### DW-1534: No `/search` or `/console` command in the chat.
+
+origin: lane `tools` (story 102.3 #4; triage 102-agent-tools §5.2, optional by the R415 precedent), 2026-10-19
+location: `keeper_core::chat::commands`
+reason: the header's menu switches both; a typed command beside `/model` was left out of this story.
+status: open
+
+### DW-1535: An authoritative save reads the control rooms one after another, with no deadline over them all.
+
+origin: review RR102tools2 (R102T2-02, R494), recorded by lane `102stack`, 2026-10-19
+location: `keeper_core::account` (the authoritative serving-hosts read of a save, `HostsFor::Save`), `src/components/chat/agent-room-header.tsx` (the header's menu)
+reason: every save reads each account's control rooms one after another, ten seconds per room (R484) and no deadline over the whole inventory, and the menu's `busy` flag disables the choices without a pending sentence: ten rooms answering in nine seconds each make a switch wait about ninety seconds before its file is written, with nothing said meanwhile. A failed room still refuses the save.
 status: open

@@ -190,6 +190,7 @@ import type {
   VoiceStateVm,
   VoiceUnavailableVm,
   VoiceWakeVm,
+  WebSearchLevel,
 } from "@/lib/ipc/client";
 import { UNIFIEDPUSH_STATUS_EVENT, VOICE_WAKE_EVENT } from "@/lib/ipc/client";
 import { DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
@@ -6036,6 +6037,15 @@ const CONSOLE_UNRESTRICTED =
 const CONSOLE_UNKNOWN = "Console: unknown. This agent's host does not say how its commands run.";
 const headerConsoleUnknown =
   new URLSearchParams(window.location.search).get("headerconsole") === "unknown";
+/**
+ * `?headerconsole=nosandbox`: electra's sandbox failed its probe, so Nixi's
+ * console is off by failure, not by choice (story 102.3): Rust's
+ * `console::sandbox_failed`.
+ */
+const headerNoSandbox =
+  new URLSearchParams(window.location.search).get("headerconsole") === "nosandbox";
+const CONSOLE_NO_SANDBOX =
+  "Console off on electra: Nixi's console is set, but electra's sandbox did not pass its check, so Nixi runs no commands there. The reason is in that host's log.";
 function fullAccessWarning(name: string): string {
   return `Full access: ${name}'s commands run on its host without a sandbox and without asking. They can read, change and delete anything that host's user can, and reach the network.`;
 }
@@ -6112,6 +6122,7 @@ function setAgentConsole(req: AgentConsoleReq): AgentCopyVm[] {
         }
       : one,
   );
+  redrawAgentHeaders();
   return agentRows;
 }
 function agentRow(agent: string, name: string): AgentCopyVm {
@@ -6121,7 +6132,9 @@ function agentRow(agent: string, name: string): AgentCopyVm {
     drive: "tgdrive",
     agent,
     name,
-    matrixUser: `@${agent}:tgorka.org`,
+    // Nixi's is the agent of her room's header, so its menu finds her row
+    // (story 102.3).
+    matrixUser: agent === "nixi" ? "@nixi:example.org" : `@${agent}:tgorka.org`,
     device: null,
     host: "hesperia",
     signedIn: false,
@@ -6159,6 +6172,27 @@ function unaskedWarning(): string {
     ? "Queries go to the search engine of the host that serves this agent and its upstream search engines without asking — they may contain words from your files."
     : `Queries go to ${host} and its upstream search engines without asking — they may contain words from your files. A host other than this Mac sends them to its own engine.`;
 }
+/**
+ * Story 102.3: what electra, the host serving Nixi, says it can do — by
+ * default it names a search engine; `?agenthost=noengine` names none,
+ * `?agenthost=old` runs keeper 0.9.0, `?agenthost=unknown` runs a build that
+ * does not say. Rust's `web_search::host_note` sentences, for her header and
+ * her Settings row; nothing while she asks for no search.
+ */
+const agentHostParam = new URLSearchParams(window.location.search).get("agenthost");
+function hostNote(name: string, level: WebSearchLevel): string | null {
+  if (level === "off") return null;
+  switch (agentHostParam) {
+    case "noengine":
+      return `${name} asks for web search, but electra names no search engine, so it searches none there.`;
+    case "old":
+      return `electra runs keeper 0.9.0, which has no web search, so ${name} searches none there. Update keeper on electra.`;
+    case "unknown":
+      return `electra runs keeper 0.10.5, which does not say whether it names a search engine: whether ${name} can search the web is unknown on this host.`;
+    default:
+      return null;
+  }
+}
 /** Nixi searches without asking (her room's header carries the mark); the others are off. */
 function agentWebSearch(agent: string, name: string, localOnly: boolean): AgentWebSearchVm {
   const level = agent === "nixi" && !localOnly ? "withoutAsking" : "off";
@@ -6169,6 +6203,7 @@ function agentWebSearch(agent: string, name: string, localOnly: boolean): AgentW
       ? `${name} uses only models that run on its readers' own machines, and a web search sends its query out, so it is never offered one.`
       : null,
     warning: level === "withoutAsking" ? unaskedWarning() : null,
+    host: hostNote(name, level),
   };
 }
 const WEB_SEARCH_CHANGED_UNDERNEATH =
@@ -6183,9 +6218,11 @@ function setAgentWebSearch(req: AgentWebSearchReq): AgentCopyVm[] {
   if (webSearch.level !== req.shownLevel) refuse(WEB_SEARCH_CHANGED_UNDERNEATH);
   if (req.level !== "off" && webSearch.unavailable !== null) refuse(webSearch.unavailable);
   const warning = req.level === "withoutAsking" ? unaskedWarning() : null;
+  const host = hostNote(row?.name ?? req.agent, req.level);
   agentRows = agentRows.map((one) =>
-    one === row ? { ...one, webSearch: { ...webSearch, level: req.level, warning } } : one,
+    one === row ? { ...one, webSearch: { ...webSearch, level: req.level, warning, host } } : one,
   );
+  redrawAgentHeaders();
   return agentRows;
 }
 /** This Mac's search engine (101.4 #2): none until one is saved. */
@@ -6872,8 +6909,8 @@ function nixiHeader(run: "running" | "done", caretKey: string | null): AgentRoom
       // none, as on the phone, and draw the handle's first letter.
       icon: "N",
       avatar: NIXI_AVATAR,
-      // Her home says she searches without asking (R457): the header's mark.
-      searchesUnasked: UNASKED_MARK,
+      // Her globe and her host's web search note come from her row and her
+      // host (R457, story 102.3): `withModelLine`.
       host: "electra",
       title: "Nixi",
       kind: "main",
@@ -7904,16 +7941,41 @@ function withModelLine(header: AgentRoomHeaderVm): AgentRoomHeaderVm {
   const model = agentModelLine("nixi");
   // Her console as her serving host's status says it (story 101.5, R440 09);
   // a host older than the console says nothing, read as "console: unknown".
-  const fullAccess = headerConsoleUnknown ? undefined : agentFullAccess("nixi");
+  const fullAccess = headerConsoleUnknown || headerNoSandbox ? undefined : agentFullAccess("nixi");
+  // Her globe only while electra searches; Rust's note in its place where it
+  // does not or does not say (R457, story 102.3).
+  const level = agentRows.find((row) => row.agent === "nixi")?.webSearch?.level ?? "off";
+  const webSearch = hostNote("Nixi", level);
+  const searches =
+    webSearch !== null
+      ? { webSearch }
+      : level === "withoutAsking"
+        ? { searchesUnasked: UNASKED_MARK }
+        : {};
+  const { searchesUnasked: _mark, webSearch: _note, ...status } = header.status;
   return {
     ...header,
     status: {
-      ...header.status,
+      ...status,
+      ...searches,
       ...(model === undefined ? {} : { model }),
       ...(fullAccess === undefined ? {} : { fullAccess }),
       ...(headerConsoleUnknown ? { console: CONSOLE_UNKNOWN } : {}),
+      ...(headerNoSandbox ? { console: CONSOLE_NO_SANDBOX } : {}),
     },
   };
+}
+
+/**
+ * A save in Nixi's menu or her Settings row redraws her open rooms' headers,
+ * as Rust's next scan does (story 102.3).
+ */
+function redrawAgentHeaders(): void {
+  for (const { roomId, channel } of dockChannels.values()) {
+    const agent = AGENT_ROOM_TIMELINES[roomId];
+    if (agent?.header.status?.agent !== NIXI) continue;
+    channel.onmessage?.({ ops: [], header: withModelLine(agent.header) });
+  }
 }
 
 function subscribeMockTimeline(payload: Record<string, unknown>): number {
@@ -9226,7 +9288,7 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
     if (payload.password === "wrong") {
       throw {
         code: "internal",
-        message: "The homeserver did not accept that password for @nixi:tgorka.org.",
+        message: "The homeserver did not accept that password for @nixi:example.org.",
         accountId: null,
         retriable: false,
       };

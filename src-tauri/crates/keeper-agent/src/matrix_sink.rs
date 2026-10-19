@@ -657,6 +657,14 @@ impl StatusBoard {
         }
     }
 
+    /// What the status says of the turn before any count: `detail`, drawn
+    /// as sent (counts and plain words, never a path, S-16) — a turn
+    /// offered no tools says why (story 102.3).
+    pub fn say(&self, detail: &str) {
+        self.progress
+            .send_modify(|now| detail.clone_into(&mut now.text));
+    }
+
     /// The turn's progress now.
     pub fn update(&self, progress: ToolProgress) {
         let detail = progress.detail();

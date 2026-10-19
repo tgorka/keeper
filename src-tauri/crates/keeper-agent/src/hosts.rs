@@ -797,6 +797,10 @@ pub struct HostRuntime {
     /// on (R455): `agentd.toml`'s `[claims] lease`, the Mac's
     /// `agents.claims_lease`.
     lease_setting: ClaimsLease,
+    /// Whether this host names a web search engine (story 102.3): its
+    /// manifest says so, so a device draws what the host can do, not only
+    /// what an `agent.toml` asks for.
+    web_search: bool,
 }
 
 /// A host's failed publications of its agents' pictures as its manifest
@@ -984,6 +988,7 @@ impl HostRuntime {
             pictures: None,
             lease_kind: LeaseKind::Minute,
             lease_setting: config.claims_lease,
+            web_search: false,
         }
     }
 
@@ -1032,6 +1037,7 @@ impl HostRuntime {
             pictures: None,
             lease_kind: LeaseKind::Minute,
             lease_setting: ClaimsLease::Short,
+            web_search: false,
         }
     }
 
@@ -1075,6 +1081,13 @@ impl HostRuntime {
     /// Carry `failures` — why this host's publications of its agents'
     /// pictures failed — in its manifest, published again as soon as they
     /// change, and read the other hosts' (story 100.4, R399).
+    /// The host's web search engine, as its manifest says it (story 102.3):
+    /// `searches` when it names one that checks.
+    pub(crate) fn with_web_search(mut self, searches: bool) -> HostRuntime {
+        self.web_search = searches;
+        self
+    }
+
     pub(crate) fn with_pictures(mut self, failures: crate::avatar::Failures) -> HostRuntime {
         self.pictures = Some(PictureReport {
             failures,
@@ -1265,6 +1278,7 @@ impl HostRuntime {
                 .unwrap_or_default(),
             // This build reads and writes the quarter-hour lease (R449).
             lease: Some(claim::QUARTER_HOUR_LEASE.to_owned()),
+            web_search: Some(self.web_search),
         }
     }
 
@@ -3874,6 +3888,7 @@ mod tests {
             pictures: None,
             lease_kind: LeaseKind::Minute,
             lease_setting: ClaimsLease::Short,
+            web_search: false,
         };
         let (cancel, stop) = cancellation();
         let now = Arc::new(std::sync::atomic::AtomicI64::new(wall_ms() as i64));
@@ -4630,6 +4645,7 @@ mod tests {
             expires_at: "2026-10-05T00:03:00Z".to_owned(),
             picture_failures: Default::default(),
             lease: Some(claim::QUARTER_HOUR_LEASE.to_owned()),
+            web_search: None,
         })
         .expect("manifest")
     }

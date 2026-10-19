@@ -103,6 +103,7 @@ import {
   type RunMode,
   type WebSearchLevel,
 } from "@/lib/ipc/client";
+import { WEB_SEARCH_LEVELS } from "@/lib/web-search-levels";
 
 /** The section heading, so the dialog and its test cannot disagree about it. */
 export const AGENTS_SECTION_TITLE = "Agents";
@@ -131,12 +132,6 @@ export const MODEL_SAVE_LABEL = "Save model";
 export const WEB_SEARCH_SWITCH_LABEL = "Web search";
 export const WEB_SEARCH_SWITCH_NOTE =
   "Lets this agent search the web through the engine its host names. Its queries leave the host.";
-/** The three levels, in the order the row offers them (R457). */
-export const WEB_SEARCH_LEVELS: ReadonlyArray<readonly [WebSearchLevel, string]> = [
-  ["off", "Off"],
-  ["ask", "Ask"],
-  ["withoutAsking", "Without asking"],
-];
 export const CONSOLE_SAVE_LABEL = "Save console";
 export const CONSOLE_ADD_FOLDER_LABEL = "Add folder";
 /** The level choice that sends none: the provider decides. */
@@ -738,8 +733,10 @@ function AgentModel({
  * `agent.toml`, against what this row showed. A Mac that only pulls the drive
  * changes nothing and says why; an agent Rust never offers a search (a gate, a
  * local-only agent) is offered only off, and says why. While the agent searches
- * without asking, Rust's standing warning stands beside that choice. A refusal
- * is Rust's sentence beside the choice.
+ * without asking, Rust's standing warning stands beside that choice. What the
+ * hosts serving the agent make of its level — none names a search engine, one
+ * runs a build without web search or does not say (story 102.3) — is Rust's
+ * warning under it. A refusal is Rust's sentence beside the choice.
  */
 function AgentWebSearch({
   agent,
@@ -814,6 +811,17 @@ function AgentWebSearch({
       <p id={`${id}-note`} className="text-muted-foreground text-xs [overflow-wrap:anywhere]">
         {why ?? WEB_SEARCH_SWITCH_NOTE}
       </p>
+      {webSearch.host !== null && (
+        // What the hosts serving the agent make of this level (story 102.3):
+        // a host that names no engine, runs a build without web search or
+        // does not say is a warning here, never read as one that searches.
+        <p
+          data-testid={`agent-web-search-host-${agent.agent}`}
+          className="text-held text-xs [overflow-wrap:anywhere]"
+        >
+          {webSearch.host}
+        </p>
+      )}
       {webSearch.warning !== null && (
         <p
           id={`${id}-warning`}

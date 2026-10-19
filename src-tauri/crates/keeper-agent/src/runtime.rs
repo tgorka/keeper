@@ -1066,7 +1066,8 @@ pub async fn run(
         sandbox.is_some(),
     )
     .with_mcp(Arc::clone(&mcp))
-    .with_pictures(Arc::clone(&pictures));
+    .with_pictures(Arc::clone(&pictures))
+    .with_web_search(web_search.is_some());
     doorbell.set_principal_agents(hosts.principal_agents());
     // Each steward's triage and harvest sessions are made from the first
     // tick on, beside the lease clock (R66, R165).

@@ -871,6 +871,104 @@ async fn a_second_agent_of_the_principal_writes_its_manifest_in_the_control_room
     }
 }
 
+/// Story 102.3 #1 (R466) on Synapse: a host manifest that reached the
+/// control room after the person's device last synced — so its store holds
+/// none — is read from the server, and a save of a key that host's build
+/// predates is refused naming it.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "live: Synapse on delectra"]
+async fn a_manifest_only_on_the_server_is_read_by_the_serving_hosts() {
+    let smoke = Smoke::setup().await;
+    let root = TempDir::new();
+    let (nixi, _) = smoke
+        .copy(
+            &root.path().join("nixi"),
+            "nixi-smoke",
+            "NIXI_SMOKE_PASSWORD",
+            "nixi@smoke",
+        )
+        .await;
+    let (person, _) = smoke
+        .copy(
+            &root.path().join("tgorka"),
+            "tgorka-smoke",
+            "TGORKA_SMOKE_PASSWORD",
+            "tgorka@smoke",
+        )
+        .await;
+    let room = nixi
+        .create_room(
+            RoomKind::Control,
+            "tgorka's agents",
+            vec![smoke.user("tgorka-smoke")],
+            &[],
+        )
+        .await
+        .expect("control room");
+    sync_until(&person, || person.client().get_room(&room).is_some()).await;
+    person.join(&room).await.expect("join");
+    person.sync_once().await.expect("sync");
+
+    // electra's manifest arrives after the person's last sync.
+    let expires = chrono::Utc::now() + chrono::Duration::hours(1);
+    let manifest = json!({
+        "v": CONTENT_VERSION, "host": "electra-smoke", "principal": "tgorka",
+        "version": "0.9.0", "always_on": true, "tools": ["sandbox"], "drives": [],
+        "bots": [], "agents": ["tgdrive/nixi"],
+        "renewed_at": chrono::Utc::now().to_rfc3339(), "expires_at": expires.to_rfc3339(),
+    });
+    nixi.send_state(&room, HOST, "electra-smoke", &manifest)
+        .await
+        .expect("the manifest");
+    let stored = person
+        .client()
+        .get_room(&room)
+        .expect("joined")
+        .get_state_events(matrix_sdk::ruma::events::StateEventType::from(HOST))
+        .await
+        .expect("store");
+    assert!(stored.is_empty(), "the store holds no manifest yet");
+
+    let now = u64::try_from(chrono::Utc::now().timestamp_millis()).expect("now");
+    let manifests = keeper_core::account::control_manifests(
+        person.client(),
+        now,
+        &keeper_core::account::HostReads::default(),
+        keeper_core::account::HostsFor::Save,
+    )
+    .await
+    .expect("read from the server");
+    let hosts = keeper_core::agents::model::serving_from(
+        manifests
+            .iter()
+            .map(|(key, sender, content)| (key.as_str(), &**sender, content)),
+        &[smoke.user("nixi-smoke")],
+        now,
+        None,
+    );
+    assert_eq!(hosts.len(), 1, "{hosts:?}");
+    assert_eq!(
+        (hosts[0].host.as_str(), hosts[0].version.as_str()),
+        ("electra-smoke", "0.9.0")
+    );
+    let drive = keeper_core::agents::drive::parse(
+        "version = 1\nid = \"tgdrive\"\ntitle = \"tgdrive\"\nprincipal = \"tgorka\"\nowner = \"@tgorka:example.org\"\nreaders = [\"@tgorka:example.org\"]\n",
+    )
+    .expect("drive");
+    let config = keeper_core::agents::home::parse_agent_toml(
+        "version = 1\nid = \"nixi\"\nname = \"nixi\"\nkind = \"steward\"\nmatrix_user = \"@nixi:example.org\"\n\n[model]\nbot = \"bot:openai:https://provider.example:8452#claude-opus\"\n\n[web_search]\nask = false\n",
+        "nixi",
+        &drive,
+    )
+    .expect("home");
+    let refused = keeper_core::agents::model::older_hosts(&config, "tgdrive/nixi", Ok(&hosts))
+        .expect_err("0.9.0 does not read [web_search]");
+    assert!(
+        refused.starts_with("electra-smoke runs keeper 0.9.0"),
+        "{refused}"
+    );
+}
+
 /// 91.1 acceptance 7: an agent's room as a person's keeper reads it — one
 /// header line from a status anchor and five updates and a scope, one answer
 /// message grown by twelve edits and not marked edited, and the room in the

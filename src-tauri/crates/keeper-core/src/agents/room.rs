@@ -537,11 +537,23 @@ pub struct AgentStatusVm {
     pub avatar: Option<String>,
     /// The small marker while the agent searches the web without asking
     /// (R457): [`crate::agents::web_search::UNASKED_MARK`], where its home
-    /// is on this device and says so. Absent elsewhere and at every other
+    /// is on this device and says so and the host serving it says it names
+    /// a search engine (story 102.3). Absent elsewhere and at every other
     /// level.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub searches_unasked: Option<String>,
+    /// What the host serving the agent makes of the web search it asks for,
+    /// when it cannot honour it or does not say (story 102.3): a warning
+    /// sentence, drawn in place of the globe. On every device while that
+    /// host's status says it names no engine for it (R483,
+    /// [`crate::agents::web_search::no_engine`]); where the home is on this
+    /// device, also as the hosts serving it say
+    /// ([`crate::agents::web_search::host_note`]). Absent while it asks for
+    /// none and while the host searches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub web_search: Option<String>,
     /// The standing full-access warning (story 101.5, R420, R440 09) when
     /// the host serving the agent says its console runs at `full`: the
     /// header's marker and its sentence, on every device. Absent elsewhere.
@@ -946,7 +958,8 @@ fn handle(agent: &UserId, host: Option<&str>) -> String {
 /// What a status says of its agent's console (story 101.5, R440 09): the
 /// standing full-access warning naming `name`, and the header's other
 /// sentence — "console: unknown" for a status without a console, from a
-/// host older than it, and never a safe console; else how many of its
+/// host older than it, and never a safe console; a console off because
+/// `host`'s sandbox failed its probe (story 102.3); else how many of its
 /// folders `host` does not give its commands.
 fn console_of(
     console: Option<&crate::agents::events::StatusConsole>,
@@ -957,10 +970,15 @@ fn console_of(
     let Some(said) = console else {
         return (None, Some(console::CONSOLE_UNKNOWN.to_owned()));
     };
+    let note = if said.mode == RunMode::Off && said.no_sandbox {
+        Some(console::sandbox_failed(name, host))
+    } else {
+        (said.mode.sandboxes() && said.refused > 0)
+            .then(|| console::folders_not_given(said.refused, host))
+    };
     (
         (said.mode == RunMode::Full).then(|| console::full_access_warning(name)),
-        (said.mode.sandboxes() && said.refused > 0)
-            .then(|| console::folders_not_given(said.refused, host)),
+        note,
     )
 }
 
@@ -975,6 +993,9 @@ fn status_vm(
             let agent_name = name(&status.agent);
             let (full_access, console) =
                 console_of(status.console.as_ref(), &agent_name, &status.host);
+            let no_engine = status.console.is_some_and(|console| console.no_engine);
+            let (searches_unasked, web_search) =
+                icons.searching(&status.agent, &agent_name, Some(&status.host), no_engine);
             AgentStatusVm {
                 agent: status.agent.to_string(),
                 agent_name,
@@ -982,7 +1003,8 @@ fn status_vm(
                 icon: icons.get(&status.agent),
                 model: icons.model(&status.agent),
                 avatar: picture(&status.agent),
-                searches_unasked: icons.unasked_mark(&status.agent),
+                searches_unasked,
+                web_search,
                 full_access,
                 console,
                 host: Some(status.host.clone()),
@@ -1008,7 +1030,12 @@ fn status_vm(
             icon: icons.get(agent),
             model: icons.model(agent),
             avatar: picture(agent),
-            searches_unasked: icons.unasked_mark(agent),
+            searches_unasked: icons
+                .searching(agent, &name(agent), host.as_deref(), false)
+                .0,
+            web_search: icons
+                .searching(agent, &name(agent), host.as_deref(), false)
+                .1,
             full_access: None,
             // A status keeper cannot read says nothing of a console: not a
             // safe one.
@@ -1034,9 +1061,13 @@ pub struct AgentIcons {
     /// Each agent's model line, replaced on each scan beside the marks
     /// (100.2 #7).
     models: RwLock<BTreeMap<OwnedUserId, crate::agents::model::AgentModelLineVm>>,
-    /// Bumped when the agents, their marks, their models or their pictures
-    /// change, so an open room's header and briefs redraw without waiting
-    /// for its next event.
+    /// The live hosts serving this person's agents, as this device last
+    /// read their manifests (story 102.3): `None` before a read and when
+    /// the last one failed.
+    hosts: RwLock<Option<Vec<crate::agents::model::ServingHost>>>,
+    /// Bumped when the agents, their marks, their models, their pictures or
+    /// their serving hosts change, so an open room's header and briefs
+    /// redraw without waiting for its next event.
     changes: watch::Sender<u64>,
 }
 
@@ -1047,8 +1078,10 @@ struct Zone {
     avatars: BTreeMap<OwnedUserId, ZoneAvatar>,
     /// The agents whose home's picture is an object not on this device.
     not_here: BTreeSet<OwnedUserId>,
-    /// The agents whose home says they search the web without asking.
-    unasked: BTreeSet<OwnedUserId>,
+    /// Each agent whose home asks for web search, at its level (R457), and
+    /// its home as `<drive>/<id>`, which binds it to the hosts that say
+    /// they serve it (R483).
+    searching: BTreeMap<OwnedUserId, (crate::agents::web_search::WebSearchLevel, Option<String>)>,
     /// What each home's scan did not use, as last warned.
     problems: BTreeMap<OwnedUserId, Vec<AvatarProblem>>,
 }
@@ -1065,9 +1098,12 @@ pub struct ZoneAgent {
     /// Its home's picture is a git-LFS pointer whose object is not on this
     /// device: the letter is drawn, not the profile avatar (R414).
     pub not_here: bool,
-    /// Its home says it searches the web without asking (R457), and it is
-    /// an agent that is offered a search at all.
-    pub searches_unasked: bool,
+    /// The web search its home asks for (R457): `Off` as well for an agent
+    /// that is never offered a search.
+    pub web_search: crate::agents::web_search::WebSearchLevel,
+    /// Its home as `<drive>/<id>`: which agent a host manifest's `agents`
+    /// names (story 102.3, R483).
+    pub home: Option<String>,
 }
 
 /// Where a home's picture is on this device: its sync profile, the
@@ -1103,8 +1139,9 @@ impl AgentIcons {
             if !agent.problems.is_empty() {
                 zone.problems.insert(user.clone(), agent.problems);
             }
-            if agent.searches_unasked {
-                zone.unasked.insert(user.clone());
+            if agent.web_search != crate::agents::web_search::WebSearchLevel::Off {
+                zone.searching
+                    .insert(user.clone(), (agent.web_search, agent.home));
             }
             zone.agents.insert(user);
         }
@@ -1164,15 +1201,67 @@ impl AgentIcons {
             .contains(user)
     }
 
-    /// The header's marker for `user` while its home on this device says
-    /// it searches the web without asking (R457).
-    pub fn unasked_mark(&self, user: &UserId) -> Option<String> {
-        self.zone
+    /// The header's web search for `user` served by `host` (R457; story
+    /// 102.3): the warning [`crate::agents::web_search::no_engine`] on every
+    /// device — this one holding the agent's drive or not — while that
+    /// host's status says the agent asks for a search it has no engine for
+    /// (`no_engine`, R483); else the globe's marker while its home on this
+    /// device says it searches without asking and the host serving that
+    /// home says it names a search engine; else the warning
+    /// [`crate::agents::web_search::host_note`] says while the home asks for
+    /// a search that host cannot run or does not say it runs.
+    pub fn searching(
+        &self,
+        user: &UserId,
+        name: &str,
+        host: Option<&str>,
+        no_engine: bool,
+    ) -> (Option<String>, Option<String>) {
+        use crate::agents::web_search::{self, host_note, WebSearchLevel, UNASKED_MARK};
+        if let (true, Some(host)) = (no_engine, host) {
+            return (None, Some(web_search::no_engine(name, host)));
+        }
+        let (level, home) = self
+            .zone
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .unasked
-            .contains(user)
-            .then(|| crate::agents::web_search::UNASKED_MARK.to_owned())
+            .searching
+            .get(user)
+            .cloned()
+            .unwrap_or((WebSearchLevel::Off, None));
+        let hosts = self
+            .hosts
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let note = host_note(name, level, host, home.as_deref(), hosts.as_deref());
+        let mark = (level == WebSearchLevel::WithoutAsking && note.is_none())
+            .then(|| UNASKED_MARK.to_owned());
+        (mark, note)
+    }
+
+    /// Replace the serving hosts with `hosts` as this device read them now,
+    /// `None` when it could not (story 102.3): the headers redraw on a
+    /// change.
+    pub fn replace_hosts(&self, hosts: Option<Vec<crate::agents::model::ServingHost>>) {
+        {
+            let mut held = self
+                .hosts
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if *held == hosts {
+                return;
+            }
+            *held = hosts;
+        }
+        self.changes.send_modify(|n| *n = n.wrapping_add(1));
+    }
+
+    /// The serving hosts as this device last read them (story 102.3).
+    pub fn hosts(&self) -> Option<Vec<crate::agents::model::ServingHost>> {
+        self.hosts
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     /// `user`'s mark, when its zone is on this device.
@@ -2228,7 +2317,9 @@ mod tests {
     /// console — an older host's — never a safe console.
     #[test]
     fn the_console_warning_comes_from_the_serving_hosts_status() {
-        use crate::agents::console::{folders_not_given, full_access_warning, CONSOLE_UNKNOWN};
+        use crate::agents::console::{
+            folders_not_given, full_access_warning, sandbox_failed, CONSOLE_UNKNOWN,
+        };
         let with = |console: Option<Value>| {
             let mut state = AgentRoomState::new(own());
             let mut said = content("running", "electra", None);
@@ -2251,6 +2342,15 @@ mod tests {
         assert_eq!(short.console, Some(folders_not_given(2, "electra")));
         let quiet = with(Some(json!({"mode": "supervised"})));
         assert_eq!((quiet.full_access, quiet.console), (None, None));
+        // Story 102.3 #5: off by a failed sandbox is said on every device,
+        // naming the host; off by choice says nothing.
+        let failed = with(Some(json!({"mode": "off", "no_sandbox": true})));
+        assert_eq!(
+            (failed.full_access, failed.console),
+            (None, Some(sandbox_failed("Nixi", "electra")))
+        );
+        let chosen = with(Some(json!({"mode": "off"})));
+        assert_eq!((chosen.full_access, chosen.console), (None, None));
     }
 
     fn event(json: Value) -> AnySyncTimelineEvent {
@@ -3028,7 +3128,8 @@ mod tests {
                 }),
                 problems: Vec::new(),
                 not_here: false,
-                searches_unasked: false,
+                web_search: Default::default(),
+                home: None,
             },
         )])
     }
@@ -3148,7 +3249,8 @@ mod tests {
                 }),
                 problems: Vec::new(),
                 not_here: false,
-                searches_unasked: false,
+                web_search: Default::default(),
+                home: None,
             },
         );
         icons.replace(both);
@@ -3500,40 +3602,191 @@ mod tests {
         assert_eq!(model_of(&icons), None);
     }
 
-    /// R457: the header marks an agent whose home on this device says it
-    /// searches the web without asking, with keeper's sentence; a scan that
-    /// no longer says so takes the mark away, and another agent's mark is
-    /// never this one's.
+    /// R457, story 102.3 (DW-1477): the header's globe says an agent whose
+    /// home on this device searches without asking only while the host
+    /// serving it — the status's `electra` — says it names a search engine;
+    /// a host that names none, runs a build without web search, does not
+    /// say, was not read or is not live is a warning sentence instead, and
+    /// never a globe. A home asking for no search says nothing; another
+    /// agent's level is never this one's.
     #[test]
-    fn the_header_marks_an_agent_that_searches_without_asking() {
-        use crate::agents::web_search::UNASKED_MARK;
+    fn the_header_draws_the_globe_only_where_the_serving_host_searches() {
+        use crate::agents::model::ServingHost;
+        use crate::agents::web_search::{WebSearchLevel, UNASKED_MARK};
+        use WebSearchLevel::{Ask, Off, WithoutAsking};
 
         let mut state = AgentRoomState::new(own());
         state.apply(&status("$a", 10, content("idle", "electra", None)), &agents);
         let icons = AgentIcons::default();
-        let mark_of = |icons: &AgentIcons| {
-            state
-                .header(&|user| user.to_string(), icons, &|_| None, None, None)
+        let drawn = |icons: &AgentIcons| {
+            let status = state
+                .header(&|_| "Nixi".to_owned(), icons, &|_| None, None, None)
                 .status
-                .expect("a status")
-                .searches_unasked
+                .expect("a status");
+            (status.searches_unasked, status.web_search)
         };
-        let scan = |user: &str, searches_unasked| {
+        let scan = |user: &str, web_search| {
             BTreeMap::from([(
                 OwnedUserId::try_from(user).expect("user"),
                 ZoneAgent {
-                    searches_unasked,
+                    web_search,
+                    home: Some("tgdrive/nixi".to_owned()),
                     ..ZoneAgent::default()
                 },
             )])
         };
-        assert_eq!(mark_of(&icons), None, "no home here, no mark");
-        icons.replace(scan(NIXI, true));
-        assert_eq!(mark_of(&icons).as_deref(), Some(UNASKED_MARK));
-        icons.replace(scan(NIXI, false));
-        assert_eq!(mark_of(&icons), None, "asks again");
-        icons.replace(scan("@tola:example.org", true));
-        assert_eq!(mark_of(&icons), None, "another agent's");
+        let electra = |version: &str, web_search| {
+            Some(vec![ServingHost {
+                host: "electra".to_owned(),
+                version: version.to_owned(),
+                agents: vec!["tgdrive/nixi".to_owned()],
+                web_search,
+                sandbox: true,
+            }])
+        };
+        assert_eq!(drawn(&icons), (None, None), "no home here, nothing");
+        icons.replace(scan(NIXI, WithoutAsking));
+        icons.replace_hosts(electra("0.10.6", Some(true)));
+        assert_eq!(drawn(&icons), (Some(UNASKED_MARK.to_owned()), None));
+        icons.replace(scan(NIXI, Ask));
+        assert_eq!(drawn(&icons), (None, None), "asks: no globe, nothing wrong");
+        icons.replace(scan(NIXI, WithoutAsking));
+        for (hosts, says) in [
+            (
+                electra("0.10.6", Some(false)),
+                "electra names no search engine",
+            ),
+            (
+                electra("0.9.0", None),
+                "electra runs keeper 0.9.0, which has no web search",
+            ),
+            (electra("0.10.5", None), "unknown on this host"),
+            (None, "keeper could not read what electra can do now"),
+            (Some(Vec::new()), "electra has not said what it can do"),
+        ] {
+            icons.replace_hosts(hosts);
+            let (mark, note) = drawn(&icons);
+            assert_eq!(mark, None, "{says}");
+            let note = note.expect(says);
+            assert!(note.contains(says) && note.contains("Nixi"), "{note}");
+        }
+        icons.replace_hosts(electra("0.9.0", None));
+        icons.replace(scan(NIXI, Off));
+        assert_eq!(drawn(&icons), (None, None), "asks for none");
+        icons.replace(scan("@tola:example.org", WithoutAsking));
+        assert_eq!(drawn(&icons), (None, None), "another agent's");
+    }
+
+    /// R483 (review R102T1-03): the header reads only the host of that slug
+    /// that says it serves this agent. `electra` serving Lucyna for another
+    /// principal says the opposite of the `electra` serving Nixi, in either
+    /// order: Nixi's header follows Nixi's host. Two that both say they
+    /// serve Nixi and disagree, or a home keeper cannot name, are unknown.
+    #[test]
+    fn the_header_reads_the_host_serving_this_agent_not_a_same_named_one() {
+        use crate::agents::model::ServingHost;
+        use crate::agents::web_search::{WebSearchLevel, UNASKED_MARK};
+
+        let mut state = AgentRoomState::new(own());
+        state.apply(&status("$a", 10, content("idle", "electra", None)), &agents);
+        let icons = AgentIcons::default();
+        let drawn = || {
+            let status = state
+                .header(&|_| "Nixi".to_owned(), &icons, &|_| None, None, None)
+                .status
+                .expect("a status");
+            (status.searches_unasked, status.web_search)
+        };
+        let scan = |home: Option<&str>| {
+            BTreeMap::from([(
+                OwnedUserId::try_from(NIXI).expect("user"),
+                ZoneAgent {
+                    web_search: WebSearchLevel::WithoutAsking,
+                    home: home.map(str::to_owned),
+                    ..ZoneAgent::default()
+                },
+            )])
+        };
+        let electra = |agent: &str, web_search| ServingHost {
+            host: "electra".to_owned(),
+            version: "0.10.6".to_owned(),
+            agents: vec![agent.to_owned()],
+            web_search: Some(web_search),
+            sandbox: true,
+        };
+        icons.replace(scan(Some("tgdrive/nixi")));
+        for (nixis, lucynas) in [(true, false), (false, true)] {
+            let nixi = electra("tgdrive/nixi", nixis);
+            let lucyna = electra("neuradrive/lucyna", lucynas);
+            for hosts in [
+                vec![nixi.clone(), lucyna.clone()],
+                vec![lucyna.clone(), nixi.clone()],
+            ] {
+                icons.replace_hosts(Some(hosts));
+                let (mark, note) = drawn();
+                if nixis {
+                    assert_eq!((mark.as_deref(), note), (Some(UNASKED_MARK), None));
+                } else {
+                    assert_eq!(mark, None);
+                    assert!(note
+                        .expect("a warning")
+                        .contains("electra names no search engine"),);
+                }
+            }
+        }
+        icons.replace_hosts(Some(vec![
+            electra("tgdrive/nixi", true),
+            electra("tgdrive/nixi", false),
+        ]));
+        let (mark, note) = drawn();
+        assert_eq!(mark, None);
+        assert!(note.expect("ambiguous").contains("they do not agree"));
+        icons.replace_hosts(Some(vec![electra("tgdrive/nixi", true)]));
+        icons.replace(scan(None));
+        let (mark, note) = drawn();
+        assert_eq!(mark, None);
+        assert!(note.expect("no home").contains("unknown on this host"));
+    }
+
+    /// R483 (review R102T1-02): a host that names no search engine for an
+    /// agent asking for one says it on every status, so a device holding
+    /// none of the agent's drive — the iPhone, its icons empty — draws the
+    /// warning, and a later progress line does not take it away. A status
+    /// that does not say it draws nothing there.
+    #[test]
+    fn the_no_engine_warning_comes_from_the_serving_hosts_status() {
+        use crate::agents::web_search::no_engine;
+        let icons = AgentIcons::default();
+        let mut state = AgentRoomState::new(own());
+        let said = |run: &str, detail: Option<&str>, no_engine: bool| {
+            let mut content = content(run, "electra", None);
+            content["console"] = json!({"mode": "off", "no_engine": no_engine});
+            if let Some(detail) = detail {
+                content["detail"] = json!(detail);
+            }
+            content
+        };
+        let drawn = |state: &AgentRoomState| {
+            let status = state
+                .header(&|_| "Nixi".to_owned(), &icons, &|_| None, None, None)
+                .status
+                .expect("a status");
+            (status.searches_unasked, status.web_search, status.detail)
+        };
+        state.apply(&status("$a", 10, said("running", None, true)), &agents);
+        let warning = Some(no_engine("Nixi", "electra"));
+        assert_eq!(drawn(&state), (None, warning.clone(), None));
+        state.apply(
+            &status("$b", 11, said("running", Some("2 reads"), true)),
+            &agents,
+        );
+        assert_eq!(
+            drawn(&state),
+            (None, warning, Some("2 reads".to_owned())),
+            "a progress line keeps it"
+        );
+        state.apply(&status("$c", 12, said("done", None, false)), &agents);
+        assert_eq!(drawn(&state), (None, None, None));
     }
 
     #[test]

@@ -2317,6 +2317,159 @@ async fn tool_progress_carries_counts_not_paths() {
     assert_eq!(last["run"], "done");
 }
 
+/// Story 102.3 #5, R483 (review R102T1-02): on a host that names no search
+/// engine, every status of a turn of an agent asking for web search says
+/// so — its progress lines too — and a device holding none of the agent's
+/// drive (its icons empty, as on the iPhone) draws the warning from the
+/// status alone.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_host_with_no_search_engine_says_it_on_every_status_every_device_reads() {
+    use keeper_core::agents::room::{AgentIcons, AgentRoomState};
+    let mut world = world(
+        ProviderKind::OpenAi,
+        &["drive_read", "web_search"],
+        vec![
+            calls(&[(
+                "r1",
+                "drive_read",
+                json!({"profile":"tgdrive","path":"notes/plan.md"}),
+            )]),
+            prose("done."),
+        ],
+    );
+    assert!(world.deps.web_search.is_none());
+    let mut served = world.open(SESSION);
+    report(world.ask(&mut served, "look").await);
+    let statuses: Vec<Value> = world
+        .room
+        .sent()
+        .into_iter()
+        .filter(|(kind, _)| kind == STATUS)
+        .map(|(_, content)| content)
+        .collect();
+    assert!(
+        statuses.iter().any(|status| status["detail"].is_string()),
+        "a progress line: {statuses:?}"
+    );
+    assert!(
+        statuses
+            .iter()
+            .all(|status| status["console"]["no_engine"] == json!(true)),
+        "{statuses:?}"
+    );
+    let last = statuses.last().expect("a status");
+    let host = last["host"].as_str().expect("a host");
+    let mut state = AgentRoomState::new(
+        matrix_sdk::ruma::OwnedUserId::try_from("@tgorka:example.org").expect("person"),
+    );
+    state.apply(
+        &json!({
+            "type": STATUS, "event_id": "$last", "sender": last["agent"],
+            "origin_server_ts": 10, "content": last,
+        }),
+        &|_| true,
+    );
+    let header = state
+        .header(
+            &|_| "Nixi".to_owned(),
+            &AgentIcons::default(),
+            &|_| None,
+            None,
+            None,
+        )
+        .status
+        .expect("a status");
+    assert_eq!(
+        header.web_search,
+        Some(keeper_core::agents::web_search::no_engine("Nixi", host))
+    );
+    assert_eq!(header.searches_unasked, None);
+}
+
+/// Story 102.3 #5 (R381): what an agent asks for and a turn is not offered
+/// is said — a web search on a host that names no engine, a console on a
+/// host whose sandbox failed its probe, no tools at all — and nothing is
+/// said where it is offered.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_tools_an_agent_asks_for_and_is_not_offered_are_said() {
+    use keeper_agent::agent::dropped_tools;
+    use keeper_core::bots::grant::NO_GRANT_NO_TOOLS;
+    let asking = world(
+        ProviderKind::OpenAi,
+        &["drive_read", "web_search", "run"],
+        Vec::new(),
+    );
+    assert!(asking.deps.web_search.is_none() && asking.deps.sandbox.is_none());
+    let dropped = dropped_tools(&asking.deps, None);
+    assert_eq!(dropped.detail, None);
+    assert_eq!(dropped.sentences.len(), 2, "{dropped:?}");
+    assert!(dropped.sentences[0].contains("this host names no search engine"));
+    assert!(dropped.sentences[1].contains("sandbox did not pass its check"));
+    let none = dropped_tools(&asking.deps, Some(NO_GRANT_NO_TOOLS));
+    assert_eq!(
+        none.detail,
+        Some("no tools this turn: no drive is granted in this session")
+    );
+    assert!(none.sentences[0].starts_with("Nixi was offered no tools this turn"));
+
+    let mut searching = world(
+        ProviderKind::OpenAi,
+        &["drive_read", "web_search"],
+        Vec::new(),
+    );
+    searching.deps.web_search = keeper_agent::web::engine_from(Some(
+        &keeper_core::agents::web_search::parse_url("http://127.0.0.1:9").expect("url"),
+    ));
+    assert!(searching.deps.web_search.is_some());
+    assert_eq!(dropped_tools(&searching.deps, None), Default::default());
+}
+
+/// Story 102.3 #5 (R381): a turn of an agent none of whose drives is in
+/// the session's scope is offered no tools — and says so, on its status
+/// where the person looks, not only in a DEBUG line.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_turn_offered_no_tools_says_why_on_its_status() {
+    let mut world = world(ProviderKind::OpenAi, &["drive_read"], vec![prose("done.")]);
+    let toml = world.tgdrive.join("80-agents/nixi/agent.toml");
+    let text = std::fs::read_to_string(&toml).expect("agent.toml");
+    // Nixi's drives are her home drive alone (it is always one of them).
+    let home_only = text.replace(
+        "drives = [\"tgdrive\", \"private\"]",
+        "drives = [\"tgdrive\"]",
+    );
+    assert_ne!(home_only, text);
+    std::fs::write(&toml, home_only).expect("agent.toml");
+    let decl = world.deps.drives["tgdrive"].clone();
+    world.deps.home = read_zone("tgdrive", &profile("tgdrive", &world.tgdrive), Some(&decl))
+        .homes
+        .into_iter()
+        .find_map(|(folder, home)| (folder == "nixi").then_some(home))
+        .expect("nixi's folder")
+        .expect("nixi reads");
+    // The session works in the private drive alone: none of Nixi's drives
+    // is in it.
+    let session_toml = world.dir(SESSION).join("agent.toml");
+    let session = std::fs::read_to_string(&session_toml).expect("the session's agent.toml");
+    let private_only = session.replace("\"tgdrive\", \"private\"", "\"private\"");
+    assert_ne!(private_only, session);
+    std::fs::write(&session_toml, private_only).expect("the session's agent.toml");
+    let mut served = world.open(SESSION);
+    report(world.ask(&mut served, "look").await);
+    let last = world
+        .room
+        .sent()
+        .into_iter()
+        .filter(|(kind, _)| kind == STATUS)
+        .map(|(_, content)| content)
+        .next_back()
+        .expect("a status");
+    assert_eq!(
+        last["detail"],
+        "no tools this turn: no drive is granted in this session"
+    );
+    assert_eq!(last["run"], "done");
+}
+
 /// AD-384: a turn's status says `running` from its start and leaves it only
 /// once the answer's final edit is sent — tool calls or none — so a device
 /// following a spoken question reads the status leaving `running` as the
@@ -14083,6 +14236,28 @@ mod parks {
     const TGDRIVE: &str = "../../../..";
     #[cfg(target_os = "linux")]
     const PRIVATE: &str = "../../../../../private";
+
+    /// Story 102.3 #5: on a host whose sandbox did not pass its probe, an
+    /// agent whose home sets a console is offered no `run`, and every status
+    /// says its console is off by that failure — not as if a person had
+    /// chosen off.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_console_off_by_a_failed_sandbox_says_so_on_the_status() {
+        use keeper_core::agents::console::RunMode;
+        let (mut world, _approvals, mut served) = running(vec![prose("Done.")], &[]);
+        console(&mut world, RunMode::Sandboxed, &[]);
+        world.deps.sandbox = None;
+        report(world.ask(&mut served, "hello").await);
+        let said = world.sent_of(STATUS);
+        assert!(
+            !said.is_empty()
+                && said
+                    .iter()
+                    .all(|status| status["console"] == json!({"mode": "off", "no_sandbox": true})),
+            "{said:?}"
+        );
+    }
 
     /// 101.5 #2, #4 on Linux (landlock): supervised asks for every run, as
     /// epic 96's console did; sandboxed runs a run without network or a
