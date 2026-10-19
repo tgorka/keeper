@@ -56,7 +56,9 @@ use super::session::{
     StoredSession,
 };
 use super::{claims, AccountError};
-use crate::oauth::{OAuthCallback, OAuthFlowRegistry};
+use crate::oauth::{
+    address_of, no_answer, open_failure, OAuthCallback, OAuthFlowRegistry, REACH_TIMEOUT,
+};
 use crate::platform::Platform;
 
 /// How long a sign-in waits for the browser to come back.
@@ -186,11 +188,15 @@ fn bad_url(what: &str, host: &str) -> AccountError {
     AccountError::Refused(format!("{host} published an unusable {what} address."))
 }
 
-fn discovery_error<E: std::error::Error>(host: &str, error: DiscoveryError<E>) -> AccountError {
+/// `address` is the `host[:port]` the request went to, which a person needs
+/// when the port is what a network rule blocks; `host` names the provider.
+fn discovery_error<E: std::error::Error>(
+    host: &str,
+    address: &str,
+    error: DiscoveryError<E>,
+) -> AccountError {
     match error {
-        DiscoveryError::Request(_) => {
-            AccountError::Unreachable(format!("keeper could not reach {host}."))
-        }
+        DiscoveryError::Request(_) => AccountError::Unreachable(format!("Can't reach {address}.")),
         // A server having a bad minute is not a policy answer: "Blocked"
         // would tell the person to call an administrator about a 503.
         DiscoveryError::Response(status, ..) if status.is_server_error() => {
@@ -264,7 +270,7 @@ async fn fetch_jwks(
 ) -> Result<CoreJsonWebKeySet, AccountError> {
     let jwks = CoreJsonWebKeySet::fetch_async(url, http)
         .await
-        .map_err(|e| discovery_error(host, e))?;
+        .map_err(|e| discovery_error(host, &address_of(url.as_str()), e))?;
     require_asymmetric(host, jwks)
 }
 
@@ -281,7 +287,7 @@ async fn discover(
     let issuer_url = IssuerUrl::new(issuer.to_owned()).map_err(|_| bad_url("issuer", &host))?;
     let metadata = Metadata::discover_async(issuer_url.clone(), http)
         .await
-        .map_err(|e| discovery_error(&host, e))?;
+        .map_err(|e| discovery_error(&host, &address_of(issuer), e))?;
 
     let algs: Vec<CoreJwsSigningAlgorithm> = metadata
         .id_token_signing_alg_values_supported()
@@ -366,6 +372,24 @@ async fn discover(
             end_session_url,
         }),
     })
+}
+
+/// `work` — discovery, everything a sign-in asks before the browser opens —
+/// within [`REACH_TIMEOUT`], or the sentence naming `address`. A provider
+/// behind a network that drops the packets never refuses the connection, and
+/// the sign-in would otherwise sit silent until the browser's own timeout.
+/// Only the interactive legs are bounded: a background refresh keeps the
+/// HTTP client's own timeouts and its quiet offline status.
+async fn within_reach<T>(
+    address: &str,
+    work: impl Future<Output = Result<T, AccountError>>,
+) -> Result<T, AccountError> {
+    tokio::time::timeout(REACH_TIMEOUT, work)
+        .await
+        .unwrap_or_else(|_| {
+            tracing::warn!(%address, "the sign-in server did not answer in time");
+            Err(AccountError::NoAnswer(no_answer(address)))
+        })
 }
 
 async fn account_provider(
@@ -564,20 +588,27 @@ async fn authorize(
         None => auth_url.to_string(),
     };
 
-    // Registered before the browser opens, so a fast callback cannot race it.
+    // Registered before the browser opens, so a fast callback cannot race it,
+    // and with its page, so a person whose browser stays shut can open it.
     let rx = flows.register(state.secret().clone());
     let _guard = FlowGuard {
         flows,
         state: state.secret(),
     };
+    flows.offer_link(state.secret(), &open);
     let opened = if listener.is_some() {
         platform.open_url(&open)
     } else {
         platform.start_web_auth(&open, redirect.scheme())
     };
-    opened.map_err(|e| {
-        AccountError::Internal(format!("keeper could not open the sign-in page: {e}"))
-    })?;
+    // A page keeper could not open is still a page the person can: the flow
+    // keeps waiting, and the link is offered with the reason.
+    if let Err(e) = opened {
+        // The platform's words go to the person only: an opener may quote the
+        // URL in a form `open_failure` cannot recognise.
+        tracing::warn!(host = %provider.host, "account: the sign-in page did not open; its link is offered instead");
+        flows.open_failed(state.secret(), &open_failure(&e, &open));
+    }
 
     let outcome = tokio::time::timeout(wait, async {
         let mut rx = rx;
@@ -933,7 +964,11 @@ async fn sign_in_within(
     wait: Duration,
 ) -> Result<Identity, AccountError> {
     let oauth_http = ReqwestClient::from(http.clone());
-    let mut provider = account_provider(&oauth_http, d).await?;
+    let mut provider = within_reach(
+        &address_of(&d.auth.issuer),
+        account_provider(&oauth_http, d),
+    )
+    .await?;
     let scopes: Vec<String> = d
         .auth
         .scopes
@@ -1091,7 +1126,14 @@ async fn forge_connect_within(
         AccountError::Internal("the repository has no forge redirect address".to_owned())
     })?;
     let oauth_http = ReqwestClient::from(http.clone());
-    let mut provider = forge_provider(&oauth_http, forge).await?;
+    let forge_address = address_of(
+        forge
+            .issuer
+            .as_deref()
+            .or(forge.authorize_url.as_deref())
+            .unwrap_or_default(),
+    );
+    let mut provider = within_reach(&forge_address, forge_provider(&oauth_http, forge)).await?;
     let leg = ForgeLeg {
         platform,
         flows,
@@ -1933,6 +1975,10 @@ mod tests {
     }
 
     fn start_fake(behaviour: Behaviour) -> Fake {
+        // The key is generated here, not inside the first discovery: an
+        // unoptimised RSA generation on a loaded machine can outlast the
+        // sign-in's reach budget (`REACH_TIMEOUT`).
+        std::sync::LazyLock::force(&TEST_KEY);
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake provider");
         let issuer = format!("http://{}", listener.local_addr().expect("addr"));
         let seen = Arc::new(Mutex::new(Seen::default()));
@@ -2279,6 +2325,8 @@ mod tests {
         Waits,
         /// Answers the first sign-in honestly and closes every later sheet.
         HonestThenClosed,
+        /// Nothing opens: the platform refuses to show the page at all.
+        WontOpen,
     }
 
     struct FakePlatform {
@@ -2343,6 +2391,7 @@ mod tests {
                 | Browser::SheetFailed(_)
                 | Browser::Dropped
                 | Browser::Waits
+                | Browser::WontOpen
                 | Browser::HonestThenClosed => format!("state={state}"),
                 Browser::ExtraState => format!("state=evil&state={state}"),
                 Browser::ForeignState => "state=someone-else".to_owned(),
@@ -2393,6 +2442,9 @@ mod tests {
                 .lock()
                 .expect("shown")
                 .push((url.to_owned(), None));
+            if matches!(self.browser, Browser::WontOpen) {
+                return Err(CoreError::Internal("no browser here".to_owned()));
+            }
             // A loopback redirect: the browser GETs the listener, which routes
             // the callback through the registry itself.
             let callback =
@@ -2421,6 +2473,9 @@ mod tests {
                 .lock()
                 .expect("shown")
                 .push((url.to_owned(), Some(callback_scheme.to_owned())));
+            if matches!(self.browser, Browser::WontOpen) {
+                return Err(CoreError::Internal("no browser here".to_owned()));
+            }
             let callback = self.visit(url)?;
             // From the callback: behind a `signin_url` the authorization
             // request, and its state, ride inside `redirect_to`.
@@ -2445,7 +2500,7 @@ mod tests {
                     self.flows.fail(&state, reason);
                 }
                 Browser::Dropped => self.flows.remove(&state),
-                Browser::Waits => {}
+                Browser::Waits | Browser::WontOpen => {}
                 Browser::Honest
                 | Browser::ExtraState
                 | Browser::ForeignState
@@ -3443,6 +3498,106 @@ mod tests {
             access_token(&p, &http(), &d).await.expect("refreshed"),
             "access-2"
         );
+    }
+
+    /// A provider behind a network that drops the packets (a tailnet ACL
+    /// without a grant) accepts nothing and refuses nothing. The sign-in
+    /// stops at `REACH_TIMEOUT` with a sentence naming the host and port,
+    /// not at the browser's five-minute timeout with none, and no browser
+    /// opens. Paused time: the provider never answers, so the budget is all
+    /// that ends it.
+    #[tokio::test(start_paused = true)]
+    async fn a_provider_that_never_answers_is_named_with_its_port_before_any_browser() {
+        // Accepts the connection (the kernel does) and never answers.
+        let silent = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = silent.local_addr().expect("addr");
+        let fake = Fake {
+            issuer: format!("http://{address}"),
+            seen: Arc::default(),
+        };
+        let p = FakePlatform::new(&fake, Browser::Honest);
+        let d = account(&fake, "acme", None);
+
+        let error = sign_in_within(&p, &p.flows, &http(), &d, FLOW_TIMEOUT)
+            .await
+            .expect_err("nobody answered");
+
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "Can't reach {address}: it did not answer within 10 seconds. \
+                 Check that this device is on a network (or VPN) that can reach it."
+            )
+        );
+        assert!(matches!(error, AccountError::NoAnswer(_)), "{error:?}");
+        assert!(
+            p.shown.lock().expect("shown").is_empty(),
+            "no browser opened"
+        );
+        drop(silent);
+    }
+
+    /// The page keeper could not open is still one the person can: the
+    /// sign-in keeps waiting and offers its link with the reason, and the
+    /// link opened by hand finishes it. The link leaves with the flow and is
+    /// never written to the log.
+    #[tokio::test]
+    async fn a_browser_that_will_not_open_leaves_the_link_and_the_sign_in_waiting() {
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _logging = tracing::subscriber::set_default(subscriber);
+
+        for redirect in [None, Some("http://127.0.0.1/callback")] {
+            let fake = start_fake(Behaviour::default());
+            let p = FakePlatform::new(&fake, Browser::WontOpen);
+            let d = account(&fake, "acme", redirect);
+
+            let person = async {
+                // Bounded: a sign-in that ended first must fail the test, not hang it.
+                let link = tokio::time::timeout(Duration::from_secs(30), async {
+                    loop {
+                        match p.flows.link() {
+                            Some(link) if link.open_failed.is_some() => break link,
+                            _ => tokio::time::sleep(Duration::from_millis(5)).await,
+                        }
+                    }
+                })
+                .await
+                .expect("the link was offered while the sign-in waited");
+                // Pasted into a browser of their own, which calls back.
+                let callback = p.visit(&link.url).expect("a sign-in page");
+                assert!(p.flows.resolve(&callback), "the flow still waits");
+                link
+            };
+            let client = http();
+            let (signed_in, link) = tokio::join!(
+                sign_in_within(&p, &p.flows, &client, &d, Duration::from_secs(30)),
+                person
+            );
+
+            assert_eq!(signed_in.expect("signed in by the link").login, "tgorka");
+            assert!(link.url.starts_with(&fake.issuer), "{redirect:?}");
+            let reason = link.open_failed.expect("the reason");
+            assert!(
+                reason.starts_with("keeper could not open your browser (")
+                    && reason.contains("no browser here"),
+                "{reason}"
+            );
+            assert_eq!(p.flows.link(), None, "the link left with the flow");
+
+            let logs =
+                String::from_utf8(captured.0.lock().expect("captured").clone()).expect("utf-8");
+            assert!(logs.contains("the sign-in page did not open"), "{logs}");
+            assert!(
+                !logs.contains(&link.url) && !logs.contains("code_challenge"),
+                "{logs}"
+            );
+        }
     }
 
     #[tokio::test]

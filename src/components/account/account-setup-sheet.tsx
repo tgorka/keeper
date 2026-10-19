@@ -33,6 +33,7 @@
  */
 import { ScanQrCode } from "lucide-react";
 import { lazy, Suspense, useEffect, useState } from "react";
+import { SignInLink } from "@/components/auth/sign-in-link";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -49,6 +50,7 @@ import {
   accountCancelSignIn,
   accountSetupConfirm,
   accountSetupResolve,
+  accountSignInLink,
   type DeviceClassVm,
   type OrgAccountVm,
 } from "@/lib/ipc/client";
@@ -409,9 +411,12 @@ function SetupFlow({ link }: { link: string }) {
           <>
             <Waiting sentence={progress?.sentence ?? null} />
             {progress?.state === "signingIn" && (
-              <Button type="button" variant="outline" className="w-fit" onClick={cancelSignIn}>
-                {SETUP_CANCEL_SIGN_IN_LABEL}
-              </Button>
+              <>
+                <SignInLink fetchLink={accountSignInLink} />
+                <Button type="button" variant="outline" className="w-fit" onClick={cancelSignIn}>
+                  {SETUP_CANCEL_SIGN_IN_LABEL}
+                </Button>
+              </>
             )}
             {cancelError !== null && (
               <p role="alert" className="text-destructive">

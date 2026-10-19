@@ -36,7 +36,7 @@ impl From<AccountError> for ForgeError {
     fn from(error: AccountError) -> Self {
         match error {
             AccountError::NeedsSignIn(s) => ForgeError::NeedsSignIn(s),
-            AccountError::Unreachable(s) => ForgeError::Unreachable(s),
+            AccountError::Unreachable(s) | AccountError::NoAnswer(s) => ForgeError::Unreachable(s),
             AccountError::Refused(s) => ForgeError::Refused(s),
             AccountError::Cancelled | AccountError::TimedOut | AccountError::Interrupted(_) => {
                 ForgeError::NeedsSignIn("Sign in again.".to_owned())

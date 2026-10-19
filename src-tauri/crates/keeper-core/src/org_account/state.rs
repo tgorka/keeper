@@ -270,6 +270,9 @@ pub enum AccountPhase {
 pub enum AccountProblem {
     /// The repository (or issuer) could not be reached.
     Offline,
+    /// A sign-in's server did not answer before the browser opened; the
+    /// sentence names it ([`AccountError::NoAnswer`]). Otherwise offline.
+    NoAnswer(String),
     /// The sign-in needs repeating; the message is the reason, for logs.
     NeedsSignIn(String),
     /// A policy refusal, already a sentence ([`super::AccountError::Refused`]).
@@ -298,6 +301,7 @@ impl AccountProblem {
     pub fn kind(&self) -> &'static str {
         match self {
             Self::Offline => "offline",
+            Self::NoAnswer(_) => "no_answer",
             Self::NeedsSignIn(_) => "needs_sign_in",
             Self::Refused(_) => "refused",
             Self::Blocked { .. } => "blocked",
@@ -316,6 +320,7 @@ pub fn problem_of(error: AccountError) -> Option<AccountProblem> {
     match error {
         AccountError::Cancelled => None,
         AccountError::Unreachable(_) => Some(AccountProblem::Offline),
+        AccountError::NoAnswer(sentence) => Some(AccountProblem::NoAnswer(sentence)),
         AccountError::NeedsSignIn(sentence) => Some(AccountProblem::NeedsSignIn(sentence)),
         AccountError::Refused(sentence) => Some(AccountProblem::Refused(sentence)),
         AccountError::Internal(sentence) => Some(AccountProblem::Failed(sentence)),
@@ -606,6 +611,12 @@ fn compose(facts: &AccountFacts, name: &str) -> (AccountStateVm, String, bool) {
                 format!("keeper could not reach {name} to sign you in. Check the connection, then sign in again."),
                 true,
             ),
+            // Which server, on which port: what a network rule blocks.
+            Some(AccountProblem::NoAnswer(sentence)) => (
+                S::Offline,
+                format!("{sentence} Then sign in again."),
+                true,
+            ),
             Some(AccountProblem::Failed(reason)) => (
                 S::NeedsSignIn,
                 format!(
@@ -636,6 +647,11 @@ fn compose(facts: &AccountFacts, name: &str) -> (AccountStateVm, String, bool) {
                 format!("keeper could not reach {name}'s repository to connect it. Check the connection, then sign in again."),
                 true,
             ),
+            Some(AccountProblem::NoAnswer(sentence)) => (
+                S::Offline,
+                format!("{sentence} Then sign in again."),
+                true,
+            ),
             Some(AccountProblem::Failed(reason)) => (
                 S::NeedsSignIn,
                 format!(
@@ -656,7 +672,7 @@ fn compose(facts: &AccountFacts, name: &str) -> (AccountStateVm, String, bool) {
         .map(|at| format!("from {}", clock(at, facts.now_ms)))
         .unwrap_or_else(|| "kept on this device".to_owned());
     match &facts.problem {
-        Some(AccountProblem::Offline) => (
+        Some(AccountProblem::Offline | AccountProblem::NoAnswer(_)) => (
             S::Offline,
             format!("Offline — using settings {since}."),
             false,
@@ -849,6 +865,12 @@ mod tests {
                 AccountError::Unreachable("keeper could not reach id.acme.dev.".to_owned()),
                 AccountStateVm::Offline,
                 "keeper could not reach Acme to sign you in. Check the connection, then sign in again.",
+            ),
+            (
+                AccountError::NoAnswer(crate::oauth::no_answer("id.acme.dev:8451")),
+                AccountStateVm::Offline,
+                "Can't reach id.acme.dev:8451: it did not answer within 10 seconds. Check that \
+                 this device is on a network (or VPN) that can reach it. Then sign in again.",
             ),
             (
                 AccountError::Internal("keeper could not open the sign-in page: denied.".to_owned()),

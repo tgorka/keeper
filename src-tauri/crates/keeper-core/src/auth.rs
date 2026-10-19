@@ -33,7 +33,10 @@ use matrix_sdk::Client;
 use ulid::Ulid;
 
 use crate::error::{AuthError, CoreError};
-use crate::oauth::{registration_data, OAuthCallback, OAuthFlowRegistry};
+use crate::oauth::{
+    address_of, no_answer, open_failure, registration_data, OAuthCallback, OAuthFlowRegistry,
+    REACH_TIMEOUT,
+};
 use crate::platform::Platform;
 use crate::registry;
 use crate::vm::{AccountVm, Provider};
@@ -162,27 +165,46 @@ impl AuthProvider for OidcAuthProvider {
         let oauth = client.oauth();
 
         // Discover the authorization server; a not-supported response means this
-        // homeserver does not offer OIDC (before any browser work).
-        oauth.server_metadata().await.map_err(|e| {
-            if e.is_not_supported() {
-                CoreError::Auth(AuthError::OAuthUnsupported)
-            } else {
-                CoreError::Auth(AuthError::ServerUnreachable(e.to_string()))
-            }
-        })?;
+        // homeserver does not offer OIDC (before any browser work). matrix-sdk
+        // retries a request that got no answer indefinitely, so the wait is
+        // bounded here and the sentence names the server.
+        let address = address_of(client.homeserver().as_str());
+        let metadata = tokio::time::timeout(REACH_TIMEOUT, oauth.server_metadata())
+            .await
+            .map_err(|_| CoreError::Auth(AuthError::NoAnswer(no_answer(&address))))?
+            .map_err(|e| {
+                if e.is_not_supported() {
+                    CoreError::Auth(AuthError::OAuthUnsupported)
+                } else {
+                    CoreError::Auth(AuthError::ServerUnreachable(e.to_string()))
+                }
+            })?;
 
         // Build the authorization URL (registers the client dynamically and
-        // stashes PKCE/state in the in-memory oauth handle).
-        let data = oauth
-            .login(
-                crate::oauth::redirect_uri()?,
-                None,
-                Some(registration_data()?),
-                None,
-            )
-            .build()
-            .await
-            .map_err(|e| CoreError::Auth(AuthError::OAuthFailed(e.to_string())))?;
+        // stashes PKCE/state in the in-memory oauth handle). Registration goes
+        // to the authorization server, often another host and port than the
+        // homeserver's, so it has its own budget naming that server.
+        let registrar = address_of(
+            metadata
+                .registration_endpoint
+                .as_ref()
+                .unwrap_or(&metadata.issuer)
+                .as_str(),
+        );
+        let data = tokio::time::timeout(
+            REACH_TIMEOUT,
+            oauth
+                .login(
+                    crate::oauth::redirect_uri()?,
+                    None,
+                    Some(registration_data()?),
+                    None,
+                )
+                .build(),
+        )
+        .await
+        .map_err(|_| CoreError::Auth(AuthError::NoAnswer(no_answer(&registrar))))?
+        .map_err(|e| CoreError::Auth(AuthError::OAuthFailed(e.to_string())))?;
 
         // Register the pending flow BEFORE opening the browser so a fast
         // callback can never race ahead of the receiver.
@@ -196,7 +218,18 @@ impl AuthProvider for OidcAuthProvider {
             flows: self.flows.as_ref(),
             state: &state,
         };
-        platform.open_url(data.url.as_str())?;
+        // The page goes with the flow, so a person whose browser stays shut
+        // can open it themselves (`oidc_sign_in_link`); a page keeper could
+        // not open is still one they can, so the flow keeps waiting and the
+        // link is offered with the reason. The URL is never logged.
+        self.flows.offer_link(&state, data.url.as_str());
+        if let Err(error) = platform.open_url(data.url.as_str()) {
+            // The platform's words go to the person only: an opener may quote
+            // the URL in a form `open_failure` cannot recognise.
+            tracing::warn!("oidc: the sign-in page did not open; its link is offered instead");
+            self.flows
+                .open_failed(&state, &open_failure(&error, data.url.as_str()));
+        }
 
         // Await the callback, but never hang: a ~5-minute timeout abandons the
         // flow (add_account then rolls back, leaving zero residue).
@@ -567,19 +600,13 @@ pub async fn login_oidc(
     add_account(platform, homeserver, &provider).await
 }
 
-/// Shared add-account orchestration used by every [`AuthProvider`] mechanism
-/// (AD-17). The strict ordering: store-less SSS capability gate (Phase A) →
-/// persistent store dir → `provider.authenticate` → Keychain session → registry
-/// row with a freshly assigned hue index (Phase B), rolling back the store dir
-/// and Keychain entry on any Phase-B failure so a rejected/unreachable server
-/// leaves zero residue. Never enforces an account-count limit, so the Nth add
-/// is identical to the 2nd.
-pub async fn add_account<P: AuthProvider>(
-    platform: &dyn Platform,
+/// The store-less probe of [`add_account`]'s Phase A: resolve `homeserver`
+/// (`.well-known`) and read its `/versions`, persisting nothing. Returns the
+/// resolved homeserver URL, reused so discovery runs exactly once, and what
+/// it supports.
+async fn probe_homeserver(
     homeserver: &str,
-    provider: &P,
-) -> Result<AccountVm, CoreError> {
-    // --- Phase A: store-less SSS probe (NOTHING persisted) --------------------
+) -> Result<(url::Url, matrix_sdk::ruma::api::SupportedVersions), AuthError> {
     // Default in-memory store (no `.sqlite_store`), so a non-SSS or unreachable
     // server leaves zero state on disk.
     let probe = Client::builder()
@@ -599,6 +626,29 @@ pub async fn add_account<P: AuthProvider>(
         .supported_versions()
         .await
         .map_err(|e| AuthError::ServerUnreachable(e.to_string()))?;
+    Ok((probe.homeserver(), supported))
+}
+
+/// Shared add-account orchestration used by every [`AuthProvider`] mechanism
+/// (AD-17). The strict ordering: store-less SSS capability gate (Phase A) →
+/// persistent store dir → `provider.authenticate` → Keychain session → registry
+/// row with a freshly assigned hue index (Phase B), rolling back the store dir
+/// and Keychain entry on any Phase-B failure so a rejected/unreachable server
+/// leaves zero residue. Never enforces an account-count limit, so the Nth add
+/// is identical to the 2nd.
+pub async fn add_account<P: AuthProvider>(
+    platform: &dyn Platform,
+    homeserver: &str,
+    provider: &P,
+) -> Result<AccountVm, CoreError> {
+    // --- Phase A: store-less SSS probe (NOTHING persisted) --------------------
+    // matrix-sdk retries a request that got no answer indefinitely, so a
+    // homeserver behind a network that drops the packets would hang the add
+    // with no word: the probe gets `REACH_TIMEOUT`, and the sentence names
+    // the server.
+    let (resolved, supported) = tokio::time::timeout(REACH_TIMEOUT, probe_homeserver(homeserver))
+        .await
+        .map_err(|_| AuthError::NoAnswer(no_answer(&address_of(homeserver))))??;
     if !supported.features.contains(&FeatureFlag::Msc4186) {
         tracing::info!(sss_supported = false, "SSS probe: homeserver lacks MSC4186");
         return Err(AuthError::SlidingSyncUnsupported.into());
@@ -607,10 +657,6 @@ pub async fn add_account<P: AuthProvider>(
         sss_supported = true,
         "SSS probe: homeserver supports MSC4186"
     );
-
-    // Reuse the discovered homeserver URL so discovery runs exactly once.
-    let resolved = probe.homeserver();
-    drop(probe);
 
     // --- Phase B: persistent account (rollback on any failure below) ---------
     let account_id = Ulid::new().to_string();
@@ -1666,5 +1712,212 @@ mod tests {
         // still succeed (the delete tolerates a missing entry).
         sign_out_cleanup(&platform, id).expect("cleanup without passphrase should succeed");
         let _ = std::fs::remove_dir_all(&platform.data_dir);
+    }
+
+    /// Matrix sign-ins against a homeserver that does not answer, and one
+    /// whose page keeper cannot open.
+    mod reach {
+        use std::io::{Read, Write};
+        use std::net::{TcpListener, TcpStream};
+
+        use super::*;
+
+        /// A homeserver behind a network that drops the packets accepts
+        /// nothing and refuses nothing; matrix-sdk would retry it forever.
+        /// The add stops at `REACH_TIMEOUT` with the host and port named.
+        /// Paused time: nothing answers, so the budget is all that ends it.
+        #[tokio::test(start_paused = true)]
+        async fn a_homeserver_that_never_answers_is_named_with_its_port() {
+            let silent = TcpListener::bind("127.0.0.1:0").expect("bind");
+            let address = silent.local_addr().expect("addr");
+            let platform = FakePlatform::new(temp_dir("no-answer"));
+
+            let error = login_password(&platform, &format!("http://{address}"), "alice", "pw")
+                .await
+                .expect_err("nobody answered");
+
+            match error {
+                CoreError::Auth(AuthError::NoAnswer(sentence)) => assert_eq!(
+                    sentence,
+                    format!(
+                        "Can't reach {address}: it did not answer within 10 seconds. \
+                         Check that this device is on a network (or VPN) that can reach it."
+                    )
+                ),
+                other => panic!("expected NoAnswer, got {other:?}"),
+            }
+            drop(silent);
+        }
+
+        /// A platform with no browser: everything else is unused by
+        /// `authenticate`.
+        struct NoBrowser;
+
+        impl Platform for NoBrowser {
+            fn data_dir(&self) -> Result<PathBuf, CoreError> {
+                Err(CoreError::Unsupported("unused".to_owned()))
+            }
+            fn keychain_set(&self, _: &str, _: &str) -> Result<(), CoreError> {
+                Ok(())
+            }
+            fn keychain_get(&self, _: &str) -> Result<Option<String>, CoreError> {
+                Ok(None)
+            }
+            fn keychain_delete(&self, _: &str) -> Result<(), CoreError> {
+                Ok(())
+            }
+            fn open_url(&self, _: &str) -> Result<(), CoreError> {
+                Err(CoreError::Internal("no browser here".to_owned()))
+            }
+            fn notify(
+                &self,
+                _: &str,
+                _: &str,
+                _: &crate::vm::NotifyTarget,
+            ) -> Result<(), CoreError> {
+                Ok(())
+            }
+            fn sidecar_path(&self, _: &str) -> Result<PathBuf, CoreError> {
+                Err(CoreError::Unsupported("unused".to_owned()))
+            }
+            fn exclude_from_backup(&self, _: &std::path::Path) -> Result<(), CoreError> {
+                Ok(())
+            }
+            fn set_badge_count(&self, _: Option<u32>) -> Result<(), CoreError> {
+                Ok(())
+            }
+        }
+
+        fn reply(stream: &mut TcpStream, status: &str, body: &str) {
+            let _ = write!(
+                stream,
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+
+        /// The request line's target, after reading the whole request.
+        fn target(stream: &mut TcpStream) -> Option<String> {
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let n = stream.read(&mut chunk).ok()?;
+                if n == 0 {
+                    return None;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                let text = String::from_utf8_lossy(&buf);
+                if let Some(end) = text.find("\r\n\r\n") {
+                    let length = text[..end]
+                        .lines()
+                        .find_map(|l| {
+                            let (name, value) = l.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())?
+                        })
+                        .unwrap_or(0);
+                    if buf.len() >= end + 4 + length {
+                        return text.lines().next()?.split(' ').nth(1).map(str::to_owned);
+                    }
+                }
+            }
+        }
+
+        /// A homeserver that delegates to an OAuth 2.0 server on itself:
+        /// `/versions`, the authorization server metadata and dynamic client
+        /// registration — everything before the browser opens.
+        fn start_homeserver() -> String {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+            let base = format!("http://{}", listener.local_addr().expect("addr"));
+            let issuer = base.clone();
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else { continue };
+                    let issuer = issuer.clone();
+                    std::thread::spawn(move || {
+                        let Some(target) = target(&mut stream) else {
+                            return;
+                        };
+                        if target.ends_with("/versions") {
+                            reply(&mut stream, "200 OK", r#"{"versions":["v1.15"]}"#);
+                        } else if target.ends_with("/auth_metadata") {
+                            let metadata = serde_json::json!({
+                                "issuer": format!("{issuer}/"),
+                                "authorization_endpoint": format!("{issuer}/authorize"),
+                                "token_endpoint": format!("{issuer}/token"),
+                                "registration_endpoint": format!("{issuer}/register"),
+                                "revocation_endpoint": format!("{issuer}/revoke"),
+                                "response_types_supported": ["code"],
+                                "response_modes_supported": ["query", "fragment"],
+                                "grant_types_supported": ["authorization_code", "refresh_token"],
+                                "code_challenge_methods_supported": ["S256"],
+                            });
+                            reply(&mut stream, "200 OK", &metadata.to_string());
+                        } else if target.ends_with("/register") {
+                            reply(&mut stream, "201 Created", r#"{"client_id":"keeper-test"}"#);
+                        } else {
+                            reply(
+                                &mut stream,
+                                "404 Not Found",
+                                r#"{"errcode":"M_UNRECOGNIZED","error":"no"}"#,
+                            );
+                        }
+                    });
+                }
+            });
+            base
+        }
+
+        /// A page keeper could not open (Matrix's open failure used to end
+        /// the sign-in with the generic "Something went wrong signing in")
+        /// keeps the sign-in waiting and offers its link with the reason;
+        /// the person's cancel still ends it, and the link with it.
+        #[tokio::test]
+        async fn a_browser_that_will_not_open_leaves_the_link_and_the_sign_in_waiting() {
+            let homeserver = start_homeserver();
+            let client = Client::builder()
+                .homeserver_url(&homeserver)
+                .build()
+                .await
+                .expect("client");
+            let flows = Arc::new(OAuthFlowRegistry::new());
+            let provider = OidcAuthProvider {
+                flows: Arc::clone(&flows),
+            };
+
+            let person = async {
+                // Bounded: a sign-in that ended first must fail the test, not hang it.
+                let link = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                    loop {
+                        match flows.link() {
+                            Some(link) if link.open_failed.is_some() => break link,
+                            _ => tokio::time::sleep(std::time::Duration::from_millis(5)).await,
+                        }
+                    }
+                })
+                .await
+                .expect("the link was offered while the sign-in waited");
+                flows.cancel_all();
+                link
+            };
+            let (result, link) = tokio::join!(provider.authenticate(&client, &NoBrowser), person);
+
+            assert!(
+                link.url.starts_with(&format!("{homeserver}/authorize?")),
+                "the authorization page"
+            );
+            assert!(link.url.contains("state="));
+            let reason = link.open_failed.expect("the reason");
+            assert!(
+                reason.starts_with("keeper could not open your browser (")
+                    && reason.contains("no browser here"),
+                "{reason}"
+            );
+            assert!(
+                matches!(result, Err(CoreError::Auth(AuthError::OAuthCancelled))),
+                "the flow waited for the person: {result:?}"
+            );
+            assert_eq!(flows.link(), None, "the link left with the flow");
+        }
     }
 }

@@ -13,6 +13,7 @@ const cancelOidc = vi.fn();
 const beeperRequestCode = vi.fn();
 const loginBeeper = vi.fn();
 const cancelBeeper = vi.fn();
+const oidcSignInLink = vi.fn();
 vi.mock("@/lib/ipc/client", () => ({
   loginPassword: (...args: [string, string, string]) => loginPassword(...args),
   loginOidc: (...args: [string]) => loginOidc(...args),
@@ -20,6 +21,7 @@ vi.mock("@/lib/ipc/client", () => ({
   beeperRequestCode: (...args: [string]) => beeperRequestCode(...args),
   loginBeeper: (...args: [string, string]) => loginBeeper(...args),
   cancelBeeper: (...args: [string]) => cancelBeeper(...args),
+  oidcSignInLink: (...args: []) => oidcSignInLink(...args),
 }));
 
 // Mock the opener plugin so external links route through a spy instead of Tauri.
@@ -70,6 +72,8 @@ describe("LoginScreen", () => {
     loginBeeper.mockReset();
     cancelBeeper.mockReset();
     cancelBeeper.mockResolvedValue(undefined);
+    oidcSignInLink.mockReset();
+    oidcSignInLink.mockResolvedValue(null);
     openUrl.mockReset();
     openUrl.mockResolvedValue(undefined);
   });
@@ -273,6 +277,48 @@ describe("LoginScreen", () => {
     fireEvent.click(screen.getByRole("button", { name: "Sign in with single sign-on" }));
     expect(await screen.findByText("Complete sign-in in your browser…")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Cancel" })).toBeInTheDocument();
+  });
+
+  it("offers the waiting sign-in's page to copy while OIDC is in flight", async () => {
+    const page = "https://mas.example/authorize?client_id=k&state=s1";
+    oidcSignInLink.mockResolvedValue({ url: page, openFailed: null });
+    loginOidc.mockReturnValue(new Promise(() => {}));
+    render(<LoginScreen />);
+    fireEvent.change(screen.getByLabelText("Homeserver"), { target: { value: "mas.example" } });
+    fireEvent.click(screen.getByRole("button", { name: "Sign in with single sign-on" }));
+
+    expect(
+      await screen.findByText("Browser didn't open? Copy the sign-in link"),
+    ).toBeInTheDocument();
+    expect(screen.getByLabelText("Sign-in link")).toHaveValue(page);
+    expect(screen.getByRole("button", { name: "Cancel" })).toBeInTheDocument();
+  });
+
+  it("says why keeper could not open the browser, beside the link, and keeps waiting", async () => {
+    oidcSignInLink.mockResolvedValue({
+      url: "https://mas.example/authorize?state=s1",
+      openFailed: "keeper could not open your browser (no handler for https).",
+    });
+    loginOidc.mockReturnValue(new Promise(() => {}));
+    render(<LoginScreen />);
+    fireEvent.change(screen.getByLabelText("Homeserver"), { target: { value: "mas.example" } });
+    fireEvent.click(screen.getByRole("button", { name: "Sign in with single sign-on" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "keeper could not open your browser (no handler for https). Copy the sign-in link and open it in your browser.",
+    );
+    expect(screen.queryByText(/Something went wrong signing in/)).not.toBeInTheDocument();
+    expect(screen.getByText("Complete sign-in in your browser…")).toBeInTheDocument();
+  });
+
+  it("names the homeserver that did not answer (noAnswer)", async () => {
+    const sentence =
+      "Can't reach matrix.acme.dev:8448: it did not answer within 10 seconds. Check that this device is on a network (or VPN) that can reach it.";
+    loginOidc.mockRejectedValue({ ...ipcError("noAnswer"), message: sentence });
+    render(<LoginScreen />);
+    fireEvent.change(screen.getByLabelText("Homeserver"), { target: { value: "mas.example" } });
+    fireEvent.click(screen.getByRole("button", { name: "Sign in with single sign-on" }));
+    expect(await screen.findByText(sentence)).toBeInTheDocument();
   });
 
   it("calls cancel_oidc when Cancel is clicked during a pending OIDC flow", async () => {

@@ -5,6 +5,9 @@ vi.mock("@/lib/ipc/client", () => ({
   accountSetupResolve: vi.fn(),
   accountSetupConfirm: vi.fn(),
   accountCancelSignIn: vi.fn(),
+  accountSignInLink: vi.fn(() =>
+    Promise.resolve({ url: "https://id.acme.dev/authorize?state=s1", openFailed: null }),
+  ),
 }));
 
 import {
@@ -18,6 +21,7 @@ import {
   setupClosedSentence,
   setupReplacesSentence,
 } from "@/components/account/account-setup-sheet";
+import { SIGN_IN_LINK_LABEL } from "@/components/auth/sign-in-link";
 import type { AccountSetupVm, OrgAccountVm } from "@/lib/ipc/client";
 import { accountCancelSignIn, accountSetupConfirm, accountSetupResolve } from "@/lib/ipc/client";
 import { accountStore, NO_ACCOUNT } from "@/lib/stores/account";
@@ -299,6 +303,10 @@ describe("AccountSetupSheet", () => {
     );
     expect(screen.getByRole("status")).toHaveTextContent(
       "Finish signing in to Acme in the browser.",
+    );
+    // The first sign-in's page is offered here too, for a browser that did not open.
+    expect(await screen.findByLabelText(SIGN_IN_LINK_LABEL)).toHaveValue(
+      "https://id.acme.dev/authorize?state=s1",
     );
     fireEvent.click(screen.getByRole("button", { name: SETUP_CANCEL_SIGN_IN_LABEL }));
     expect(accountCancelSignIn).toHaveBeenCalledTimes(1);

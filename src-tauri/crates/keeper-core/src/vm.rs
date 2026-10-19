@@ -345,6 +345,12 @@ pub enum IpcErrorCode {
     /// failure). Retriable — the sign-in may be started again. Serializes as
     /// `"oauthFailed"`.
     OauthFailed,
+    /// A sign-in's server did not answer before any browser opened, within
+    /// `oauth::REACH_TIMEOUT` (discovery, the homeserver probe). The message
+    /// is a sentence naming the server's `host[:port]`, rendered as written.
+    /// Retriable — the network between may come back. Serializes as
+    /// `"noAnswer"`.
+    NoAnswer,
     /// The Beeper unofficial email-code login flow is unavailable (Story 2.3):
     /// a non-2xx / timeout / transport failure from `api.beeper.com`, a
     /// missing/renamed field (the private API changed shape), an abandoned flow,
@@ -435,6 +441,32 @@ pub enum IpcErrorCode {
     /// all" (no usable `git` on this machine) IS retriable, because installing
     /// one changes the answer. Serializes as `"recordingDestinationRefused"`.
     RecordingDestinationRefused,
+}
+
+/// The sign-in page of a sign-in still waiting for its browser round trip
+/// (`OAuthFlowRegistry::link`), for the person whose browser did not open it.
+///
+/// The URL carries the flow's `state`, PKCE challenge and nonce but no secret
+/// that finishes the sign-in elsewhere, so it is shown to the person at the
+/// keyboard; it is still never logged, which is why `Debug` is hand-written.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct SignInLinkVm {
+    /// The authorization address the browser was asked to open.
+    pub url: String,
+    /// Why keeper could not open it itself, when it could not; `None` when the
+    /// browser was asked and said nothing.
+    pub open_failed: Option<String>,
+}
+
+impl std::fmt::Debug for SignInLinkVm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SignInLinkVm")
+            .field("url", &"<redacted>")
+            .field("open_failed", &self.open_failed)
+            .finish()
+    }
 }
 
 /// The account's live server-side key-backup posture, mapped from the SDK

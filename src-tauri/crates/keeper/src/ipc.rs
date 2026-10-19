@@ -64,8 +64,8 @@ use keeper_core::vm::{
     RecordingSessionMetaVm, RecordingSettingsVm, RecordingSourcesVm, RecordingStatusVm,
     RecordingSummaryVm, RecordingTargetVm, RecordingUiState, RecordingVolumeState,
     RecordingVolumeVm, RemoteDraftVm, ResolveSupportVm, RoomListBatch, ScreenRecordingAccess,
-    SearchFilterVm, SearchHitVm, SpacesSnapshot, SyncListSettingsVm, TccPermission, TimelineBatch,
-    TypingBatch, VerificationFlowVm,
+    SearchFilterVm, SearchHitVm, SignInLinkVm, SpacesSnapshot, SyncListSettingsVm, TccPermission,
+    TimelineBatch, TypingBatch, VerificationFlowVm,
 };
 use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;
@@ -1411,6 +1411,9 @@ pub(crate) fn to_ipc_error(err: CoreError) -> IpcError {
         CoreError::Platform(PlatformError::BackupExclusion(_)) => (IpcErrorCode::Internal, false),
         CoreError::Internal(_) => (IpcErrorCode::Internal, false),
         CoreError::Auth(AuthError::ServerUnreachable(_)) => (IpcErrorCode::ServerUnreachable, true),
+        // The server did not answer before the browser opened: the message
+        // is the sentence naming it, retriable once the network allows.
+        CoreError::Auth(AuthError::NoAnswer(_)) => (IpcErrorCode::NoAnswer, true),
         CoreError::Auth(AuthError::InvalidCredentials) => (IpcErrorCode::InvalidCredentials, false),
         CoreError::Auth(AuthError::UnsupportedLoginType(_)) => {
             (IpcErrorCode::UnsupportedLoginType, false)
@@ -2575,6 +2578,16 @@ pub(crate) async fn sign_in_oidc(
 pub fn cancel_oidc(state: State<'_, AppState>) -> Result<(), IpcError> {
     state.oauth_flows.cancel_all();
     Ok(())
+}
+
+/// The sign-in page of the Matrix single sign-on still waiting for its
+/// browser, for the person whose browser did not open it — with keeper's
+/// reason when it could not open the page itself. `None` while no flow waits
+/// or before its page exists. An organisation-account sign-in has its own
+/// (`account_sign_in_link`).
+#[tauri::command]
+pub fn oidc_sign_in_link(state: State<'_, AppState>) -> Option<SignInLinkVm> {
+    state.oauth_flows.link()
 }
 
 /// Request a Beeper email login code (Story 2.3, step 1). Delegates to the core,
@@ -16883,6 +16896,17 @@ mod tests {
         )));
         assert_eq!(ipc.code, IpcErrorCode::ServerUnreachable);
         assert!(ipc.retriable, "unreachable server should be retriable");
+    }
+
+    /// A homeserver that did not answer is its own code, retriable, and its
+    /// message is the sentence naming the server — rendered as written.
+    #[test]
+    fn auth_no_answer_maps_to_retriable_code_with_the_sentence() {
+        let sentence = keeper_core::oauth::no_answer("matrix.acme.dev:8448");
+        let ipc = to_ipc_error(CoreError::Auth(AuthError::NoAnswer(sentence.clone())));
+        assert_eq!(ipc.code, IpcErrorCode::NoAnswer);
+        assert!(ipc.retriable);
+        assert_eq!(ipc.message, sentence);
     }
 
     #[test]

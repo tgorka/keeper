@@ -148,10 +148,12 @@ impl LogUploadVm {
             None => "The log upload was stopped. Anything it had already pushed stays in the \
                      settings repository."
                 .to_owned(),
-            Some(AccountProblem::Offline) => "The log was not sent: keeper could not reach the \
+            Some(AccountProblem::Offline | AccountProblem::NoAnswer(_)) => {
+                "The log was not sent: keeper could not reach the \
                                               settings repository. Check the connection, then \
                                               send it again."
-                .to_owned(),
+                    .to_owned()
+            }
             Some(AccountProblem::Blocked { login, .. }) => {
                 format!("The log was not sent: {login}/ in the settings repository is not yours.")
             }

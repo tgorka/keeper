@@ -44,6 +44,7 @@ import type { NotifyTarget } from "./gen/NotifyTarget";
 import type { PersonVm } from "./gen/PersonVm";
 import type { PushGatewayVm } from "./gen/PushGatewayVm";
 import type { PushOpenVm } from "./gen/PushOpenVm";
+import type { SignInLinkVm } from "./gen/SignInLinkVm";
 import type { TelemetryConsentVm } from "./gen/TelemetryConsentVm";
 import type { TelemetryEventReq } from "./gen/TelemetryEventReq";
 import type { TelemetryRemoteConfigVm } from "./gen/TelemetryRemoteConfigVm";
@@ -747,6 +748,7 @@ export type { SessionTemplateEntryVm } from "./gen/SessionTemplateEntryVm";
 export type { SessionTreeVm } from "./gen/SessionTreeVm";
 export type { SheetsVm } from "./gen/SheetsVm";
 export type { SheetVm } from "./gen/SheetVm";
+export type { SignInLinkVm } from "./gen/SignInLinkVm";
 export type { SlidesVm } from "./gen/SlidesVm";
 export type { SlideVm } from "./gen/SlideVm";
 export type { SpacesSnapshot } from "./gen/SpacesSnapshot";
@@ -1323,6 +1325,16 @@ export async function loginOidc(homeserver: string): Promise<AccountVm> {
  */
 export async function cancelOidc(): Promise<void> {
   await invoke<void>("cancel_oidc");
+}
+
+/**
+ * The sign-in page of the Matrix single sign-on still waiting for its browser,
+ * for the person whose browser did not open it — with keeper's reason when it
+ * could not open the page itself. `null` while no flow waits or before its page
+ * exists. Never log it: it carries the flow's state.
+ */
+export async function oidcSignInLink(): Promise<SignInLinkVm | null> {
+  return await invoke<SignInLinkVm | null>("oidc_sign_in_link");
 }
 
 /**
@@ -9151,6 +9163,15 @@ export async function accountSignIn(): Promise<OrgAccountVm> {
 /** Cancel a sign-in whose browser round trip is still open. */
 export async function accountCancelSignIn(): Promise<void> {
   await invoke<void>("account_cancel_sign_in");
+}
+
+/**
+ * The sign-in page of the account sign-in (or repository connection) still
+ * waiting for its browser — see {@link oidcSignInLink}. `null` while nothing
+ * waits.
+ */
+export async function accountSignInLink(): Promise<SignInLinkVm | null> {
+  return await invoke<SignInLinkVm | null>("account_sign_in_link");
 }
 
 /**

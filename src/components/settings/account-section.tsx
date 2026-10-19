@@ -40,6 +40,7 @@
 import { useEffect, useId, useRef, useState } from "react";
 import { DEVICE_CLASS_LABEL, SetupLinkField } from "@/components/account/account-setup-sheet";
 import { AccountShareSheet } from "@/components/account/account-share-sheet";
+import { SignInLink } from "@/components/auth/sign-in-link";
 import { toggleVoiceListening } from "@/components/bots/bot-listening-toggle";
 import {
   AlertDialog,
@@ -62,6 +63,7 @@ import {
   accountForget,
   accountRenameDevice,
   accountSignIn,
+  accountSignInLink,
   accountSignOut,
   accountState,
   accountSync,
@@ -360,6 +362,8 @@ function ConfiguredAccount({ vm }: { vm: OrgAccountVm }) {
           {error}
         </p>
       )}
+
+      {signingIn && <SignInLink fetchLink={accountSignInLink} />}
 
       <div className="flex flex-wrap gap-2">
         {signingIn && (

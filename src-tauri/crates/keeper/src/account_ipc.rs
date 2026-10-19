@@ -68,7 +68,7 @@ use keeper_core::org_account::{log_upload, oidc, AccountError};
 use keeper_core::platform::Platform;
 use keeper_core::registry;
 use keeper_core::transcription::models as model_files;
-use keeper_core::vm::{IpcError, IpcErrorCode};
+use keeper_core::vm::{IpcError, IpcErrorCode, SignInLinkVm};
 use keeper_sync::config_repo::{self, Author, PushResult, RepoAuth, RepoSpec, Write};
 use keeper_sync::SyncError;
 use tauri::ipc::Channel;
@@ -819,6 +819,7 @@ pub(crate) fn account_ipc_error(error: AccountError) -> IpcError {
     let (code, retriable) = match &error {
         AccountError::NeedsSignIn(_) => (IpcErrorCode::OauthFailed, true),
         AccountError::Unreachable(_) => (IpcErrorCode::ServerUnreachable, true),
+        AccountError::NoAnswer(_) => (IpcErrorCode::NoAnswer, true),
         AccountError::Refused(_) | AccountError::Denied { .. } => (IpcErrorCode::Internal, false),
         AccountError::Cancelled => (IpcErrorCode::OauthCancelled, true),
         AccountError::TimedOut => (IpcErrorCode::OauthTimedOut, true),
@@ -3615,6 +3616,15 @@ pub async fn account_sign_in(state: State<'_, AppState>) -> Result<AccountVm, Ip
 pub fn account_cancel_sign_in() -> Result<(), IpcError> {
     interrupt_all();
     Ok(())
+}
+
+/// The sign-in page of the account sign-in (or forge connection) still
+/// waiting for its browser, for the person whose browser did not open it —
+/// with keeper's reason when it could not open the page itself. `None` while
+/// nothing waits. A Matrix sign-in beside it has its own (`oidc_sign_in_link`).
+#[tauri::command]
+pub fn account_sign_in_link(state: State<'_, AppState>) -> Option<SignInLinkVm> {
+    state.account_flows.link()
 }
 
 /// Fetch and publish, at most every 15 minutes unless `force` ("Sync now").

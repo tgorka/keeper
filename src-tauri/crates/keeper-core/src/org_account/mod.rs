@@ -44,6 +44,11 @@ pub enum AccountError {
     /// Network, DNS, TLS or a timeout.
     #[error("{0}")]
     Unreachable(String),
+    /// A sign-in's server did not answer within `oauth::REACH_TIMEOUT`
+    /// before the browser opened; the sentence names its `host[:port]`
+    /// (`oauth::no_answer`) and is what the person reads.
+    #[error("{0}")]
+    NoAnswer(String),
     /// Policy: a missing required role, an unsafe username, a `sub` or
     /// username mismatch, a bad descriptor.
     #[error("{0}")]
@@ -78,6 +83,7 @@ impl AccountError {
         match self {
             Self::NeedsSignIn(_) => "needs_sign_in",
             Self::Unreachable(_) => "unreachable",
+            Self::NoAnswer(_) => "no_answer",
             Self::Refused(_) => "refused",
             Self::Cancelled => "closed",
             Self::Denied { .. } => "denied",

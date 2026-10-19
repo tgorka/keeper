@@ -5,6 +5,7 @@ vi.mock("@/lib/ipc/client", () => ({
   accountState: vi.fn(),
   accountSignIn: vi.fn(),
   accountCancelSignIn: vi.fn(),
+  accountSignInLink: vi.fn(() => Promise.resolve(null)),
   accountSync: vi.fn(),
   accountRenameDevice: vi.fn(),
   accountSignOut: vi.fn(),
@@ -19,6 +20,7 @@ vi.mock("@/lib/ipc/client", () => ({
 }));
 
 import { SETUP_LINK_LABEL } from "@/components/account/account-setup-sheet";
+import { SIGN_IN_LINK_LABEL, SIGN_IN_LINK_PROMPT } from "@/components/auth/sign-in-link";
 import {
   ACCOUNT_DEVICES_LABEL,
   ACCOUNT_FORGET_LABEL,
@@ -36,6 +38,7 @@ import {
   accountForget,
   accountRenameDevice,
   accountSignIn,
+  accountSignInLink,
   accountSignOut,
   accountState,
   accountSync,
@@ -336,6 +339,34 @@ describe("AccountSection signed in", () => {
 
     expect(screen.getByRole("status")).toHaveTextContent("Syncing your settings…");
     expect(screen.queryByRole("button", { name: "Cancel sign-in" })).not.toBeInTheDocument();
+  });
+});
+
+describe("AccountSection while signing in", () => {
+  const PAGE = "https://electra.siren-alsephina.ts.net:8451/oauth/v2/authorize?state=s1";
+
+  it("offers the sign-in page to copy beside Cancel sign-in", async () => {
+    vi.mocked(accountSignInLink).mockResolvedValue({ url: PAGE, openFailed: null });
+    accountStore.getState().setVm(
+      accountVm({
+        state: "signingIn",
+        identity: null,
+        sentence: "Finish signing in to Acme in the browser.",
+      }),
+    );
+    render(<AccountSection open />);
+
+    expect(await screen.findByText(SIGN_IN_LINK_PROMPT)).toBeInTheDocument();
+    expect(screen.getByLabelText(SIGN_IN_LINK_LABEL)).toHaveValue(PAGE);
+    expect(screen.getByRole("button", { name: "Cancel sign-in" })).toBeInTheDocument();
+  });
+
+  it("asks for no page when nothing is signing in", async () => {
+    accountStore.getState().setVm(accountVm());
+    render(<AccountSection open />);
+    await Promise.resolve();
+    expect(accountSignInLink).not.toHaveBeenCalled();
+    expect(screen.queryByLabelText(SIGN_IN_LINK_LABEL)).not.toBeInTheDocument();
   });
 });
 

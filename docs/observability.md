@@ -184,6 +184,7 @@ VM's `problem` is true it is an alert. A browser sign-in ends one of five ways:
 | No answer before the wait ran out | "Signing in to *account* timed out before the browser answered. Sign in again." | `timed_out` |
 | The browser round trip broke | "Signing in to *account* did not come back from the browser (*why*). Sign in again." | `interrupted` |
 | The sign-in server could not be reached | "keeper could not reach *account* to sign you in. …" | `unreachable` |
+| The sign-in server did not answer within ten seconds, before any browser opened | "Can't reach *host:port*: it did not answer within 10 seconds. Check that this device is on a network (or VPN) that can reach it. Then sign in again." | `no_answer` |
 | Signed in, but connecting the repository (`oauth` mode) failed | "Connecting *account*'s repository failed (*why*). Sign in again." or "keeper could not reach *account*'s repository to connect it. …" — a problem, never the neutral "Reconnect the repository" | `internal` / `unreachable` at `forge_connect` |
 
 The sheet reads the outcome of *this* attempt from the account VM's `attempt`

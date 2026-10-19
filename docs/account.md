@@ -423,6 +423,22 @@ whenever Settings opens.
 - **Other desktops** (Linux, Windows) open the default browser and receive the callback
   through the `keeper://` link.
 
+**When the browser does not open.** While a sign-in waits for its browser, the setup sheet and
+Settings › Account (and, for a Matrix single sign-on, the login screen) show the sign-in page's address under
+"Browser didn't open? Copy the sign-in link", with a copy button: paste it into any browser on
+this device and the sign-in finishes as usual. When keeper could not open the page itself, it
+says why in the same place and keeps waiting rather than failing. The address carries the
+attempt's `state`, PKCE challenge and nonce but nothing that finishes the sign-in anywhere
+else; it is shown, never written to `keeper.log`.
+
+**When the server does not answer.** Discovery — everything a sign-in asks the identity
+provider (or, for Matrix, the homeserver) before the browser opens — has ten seconds. A
+server behind a network that drops keeper's packets (a tailnet rule without a grant for that
+port, a VPN that is off) refuses nothing, so without this the sign-in sat silent until the
+five-minute browser timeout. Now it stops with the server's address and port: "Can't reach
+id.acme.dev:8451: it did not answer within 10 seconds. Check that this device is on a network
+(or VPN) that can reach it."
+
 *Cancel*, in keeper or in the sign-in window, ends the attempt as cancelled, not failed: the
 setup sheet says the sign-in was closed and nothing was set up (or, for an account already
 signed in on this device, that it stays as it was — never "Up to date"). Connecting an `oauth`
