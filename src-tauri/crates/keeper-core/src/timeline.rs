@@ -20,7 +20,7 @@
 //! material, event raw JSON, or crypto state cross IPC; `tracing` logs carry the
 //! opaque room id only — never a message body.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -35,6 +35,7 @@ use matrix_sdk::ruma::events::room::message::MessageType;
 use matrix_sdk::ruma::{EventId, OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, UserId};
 use matrix_sdk::{Client, Room, RoomInfo};
 use matrix_sdk_ui::eyeball_im::{Vector, VectorDiff};
+use matrix_sdk_ui::room_list_service::RoomListService;
 use matrix_sdk_ui::timeline::{
     EventSendState, MsgLikeKind, TimelineBuilder, TimelineDetails, TimelineItem,
     TimelineItemContent, TimelineItemKind, TimelineReadReceiptTracking,
@@ -43,13 +44,14 @@ use matrix_sdk_ui::Timeline;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::watch;
 
-use crate::account::{PaginationSink, TimelineSink};
+use crate::account::TimelineSink;
 use crate::agents::approval_card::{ApprovalVm, HostedRooms, Viewer};
 use crate::agents::events::FINAL_CUT_BYTES;
 use crate::agents::gate_room::{GateInput, GateView};
 use crate::agents::heard::{split_utf16, HeardMarkVm, RoomMarks};
 use crate::agents::room::{
-    self, AgentIcons, AgentKinds, AgentRoomHeaderVm, AgentRoomKind, HeaderReader, TurnTrust,
+    self, AgentIcons, AgentKinds, AgentRoomHeaderVm, AgentRoomKind, HeaderFound, HeaderReader,
+    TurnTrust,
 };
 use crate::agents::turn_marks::{turn_marks, HostWrites, MarkInput, TurnMarkVm};
 use crate::error::TimelineError;
@@ -625,6 +627,8 @@ pub struct OpenTimeline {
     room: Room,
     /// The agent room this is, from its create type; `None` for every other.
     agent: Option<AgentRoomKind>,
+    /// The person's asks for older history the producer takes.
+    asks: HistoryAsks,
 }
 
 impl OpenTimeline {
@@ -632,6 +636,33 @@ impl OpenTimeline {
     /// so send/retry can reach the exact instance that produced the items.
     pub fn timeline(&self) -> Arc<Timeline> {
         self.timeline.clone()
+    }
+
+    /// Where the person's ask for older history reaches this window's
+    /// producer, which owns its fill (102.6, R509).
+    pub fn asks(&self) -> HistoryAsks {
+        self.asks.clone()
+    }
+}
+
+/// The person's ask for an open window's older history — the boundary's
+/// Retry after a failed page, or "Load earlier messages" where the window
+/// cannot scroll (102.6, R509). It reaches the producer that owns the
+/// window's fill rather than the SDK: an ask clears a failed fill and
+/// pages until something older shows, the start is reached, a page fails
+/// or the fill's budget is spent. An ask made while the producer is busy
+/// is kept until it next looks.
+#[derive(Clone, Default)]
+pub struct HistoryAsks(Arc<tokio::sync::Notify>);
+
+impl HistoryAsks {
+    /// Ask for older history.
+    pub fn ask(&self) {
+        self.0.notify_one();
+    }
+
+    async fn asked(&self) {
+        self.0.notified().await;
     }
 }
 
@@ -682,6 +713,7 @@ pub async fn open_timeline(
         account_id: account_id.to_owned(),
         room,
         agent,
+        asks: HistoryAsks::default(),
     })
 }
 
@@ -1218,6 +1250,21 @@ async fn next_mark_change(marks: &mut Option<watch::Receiver<u64>>) {
 /// again whenever the loaded items, a mark or whose answers count change,
 /// and sent when they differ from the last sent.
 ///
+/// Opening is instant (102.6, R468): the first batch — the snapshot, the
+/// header as the event cache alone reads it, and the room's back-pagination
+/// status — is sent before the header looks at a seat or searches the
+/// server's history for a status out of the cache's reach (R416); what that
+/// search finds arrives as a header of its own, and the search reads past
+/// the event cache so it never meets a page of pagination (R510). A window
+/// that draws fewer than `FILL_DRAWN` items then fills itself here, a page
+/// of `FILL_PAGE` events at a time, up to `FILL_PAGES` pages, until it
+/// draws enough or reaches the room's start as the SDK says it now — a
+/// limited sync that unloads the window fills it again (R509). A failed or
+/// stalled page (`FILL_DEADLINE`) is said as [`PaginationState::Failed`]
+/// and a WARN, and not asked again until the person asks through
+/// [`HistoryAsks`], which pages on until something older shows. The status
+/// rides on every batch where it changed.
+///
 /// The `Timeline` is kept alive for the whole loop — its drop handle cancels the
 /// SDK's background timeline tasks (AD-19). The producer breaks when the channel
 /// closes (`sink` returns `false`) or the stream ends.
@@ -1237,6 +1284,7 @@ pub async fn forward_timeline(
         account_id,
         room,
         agent,
+        asks,
     } = open;
 
     // The room id string is stable for the whole producer; capture it once for the
@@ -1262,7 +1310,8 @@ pub async fn forward_timeline(
                 verification: room.client().encryption().verification_state(),
                 hosted: hosted.subscribe(),
             };
-            let mut reader = HeaderReader::open(room.clone(), &kinds).await;
+            // The cache alone: no seat, no search before the first batch (R468).
+            let mut reader = HeaderReader::read_cached(room.clone()).await;
             reader.refresh(&icons).await;
             fetch_members(&mut fetch, &reader, &room);
             let mut header = AgentHeader {
@@ -1328,17 +1377,62 @@ pub async fn forward_timeline(
         }
         None => (None, None, None),
     };
-    if !sink(TimelineBatch {
+    // The back-pagination status rides on the stream, its snapshot on the
+    // first batch (102.6): a focused timeline has none and reads as idle.
+    // What the SDK says is the window's current state, not a lasting fact:
+    // a limited sync unloads the window to its last chunk and the start is
+    // no longer reached (R509), so every status replaces the last.
+    let (mut sdk_status, mut statuses) = match timeline.live_back_pagination_status().await {
+        Some((now, stream)) => (
+            map_pagination_status(now),
+            Some(Box::pin(stream) as StatusStream),
+        ),
+        None => (
+            PaginationStatusBatch {
+                state: PaginationState::Idle,
+                hit_start: false,
+            },
+            None,
+        ),
+    };
+    // keeper's own fill of a window that draws too little (R468).
+    let mut fill = Fill::new();
+    let mut filling: Option<Pending<Result<bool, TimelineError>>> = None;
+    let mut shown = Shown::default();
+    shown.apply(&reset);
+    let mut status_sent = fill.said(sdk_status, shown.drawn(), false);
+    let first = TimelineBatch {
         ops: reset,
         header: first_header,
         approvals: first_approvals,
         heard: first_heard,
-    }) {
+        pagination: Some(status_sent),
+    };
+    if !sink(first) {
         tracing::info!(room_id = %room_id, "timeline channel closed before first batch");
         return;
     }
 
+    // Only now the header's seat, and its search of the server's history
+    // (R416) beside the stream: what it finds is a header-only batch. The
+    // search reads past the room's event cache (R510), so it never meets a
+    // page of the window's own fill or of anyone's pagination. The
+    // conversation comes first; the header fills in after it.
+    let mut search: Option<Pending<HeaderFound>> = header.as_ref().and_then(|header| {
+        header.reader.remember(&header.kinds);
+        header
+            .reader
+            .search(&header.kinds)
+            .map(|search| Box::pin(search) as Pending<HeaderFound>)
+    });
+
     loop {
+        // A window that draws too little pages back on its own, one page at
+        // a time, until it draws enough, reaches the start or the bound.
+        if filling.is_none() && fill.wants(shown.drawn(), sdk_status.hit_start) {
+            fill.pages += 1;
+            filling = Some(fill_page(&timeline));
+        }
         // When the next waiting approval card expires: it is drawn again then.
         let expiry = header
             .as_ref()
@@ -1351,6 +1445,8 @@ pub async fn forward_timeline(
                 let Some(diffs) = diffs else {
                     break;
                 };
+                // Items arrived: what the last fill page brought is counted.
+                fill.settling = None;
                 let mut ops = Vec::new();
                 if let Some(header) = &mut header {
                     // A change of the room that came with these items is
@@ -1389,11 +1485,16 @@ pub async fn forward_timeline(
                     positions.dedup();
                     ops.extend(header.redraw(positions, &index, &account_id, &room_id_str));
                 }
+                // A window the SDK reset — a limited sync unloads it to its
+                // last chunk — is filled again from its new start (R509).
+                if ops.iter().any(|op| matches!(op, TimelineOp::Clear | TimelineOp::Reset { .. })) {
+                    fill.pages = 0;
+                }
                 let (changed, heard) = match &mut header {
                     Some(header) => (header.changed().await, header.heard_changed()),
                     None => (None, None),
                 };
-                TimelineBatch { ops, header: changed, approvals: None, heard }
+                TimelineBatch { ops, header: changed, approvals: None, heard, pagination: None }
             }
             update = next_update(&mut updates) => {
                 let Some(header) = &mut header else {
@@ -1408,10 +1509,16 @@ pub async fn forward_timeline(
                 }
                 let folded = match update {
                     Ok(update) => header.reader.update(&update, &header.kinds),
-                    // Missed updates: read the header again from the cache.
+                    // Missed updates: read the header again from the cache,
+                    // and search the server beside the stream as at open
+                    // (R468), never inline.
                     Err(RecvError::Lagged(_)) => {
-                        let mut reader = HeaderReader::open(room.clone(), &header.kinds).await;
+                        let mut reader = HeaderReader::read_cached(room.clone()).await;
                         reader.refresh(&header.icons).await;
+                        reader.remember(&header.kinds);
+                        search = reader
+                            .search(&header.kinds)
+                            .map(|search| Box::pin(search) as Pending<HeaderFound>);
                         let old = std::mem::replace(&mut header.reader, reader);
                         let positions = header.rebriefed(old.turns());
                         ops.extend(header.redraw(positions, &index, &account_id, &room_id_str));
@@ -1438,7 +1545,7 @@ pub async fn forward_timeline(
                     None
                 };
                 let heard = if folded { header.heard_changed() } else { None };
-                TimelineBatch { ops, header: changed, approvals, heard }
+                TimelineBatch { ops, header: changed, approvals, heard, pagination: None }
             }
             () = next_info(&mut info) => {
                 let Some(header) = &mut header else {
@@ -1453,6 +1560,7 @@ pub async fn forward_timeline(
                     header: header.changed().await,
                     approvals: None,
                     heard: header.heard_changed(),
+                    pagination: None,
                 }
             }
             () = next_fetch(&mut fetch) => {
@@ -1474,6 +1582,7 @@ pub async fn forward_timeline(
                     header: header.changed().await,
                     approvals: None,
                     heard: header.heard_changed(),
+                    pagination: None,
                 }
             }
             () = next_recheck(&mut recheck, expiry) => {
@@ -1486,17 +1595,80 @@ pub async fn forward_timeline(
                     header: None,
                     approvals: header.approvals_changed().await,
                     heard: None,
+                    pagination: None,
                 }
+            }
+            found = next_done(&mut search) => {
+                search = None;
+                let Some(header) = &mut header else {
+                    continue;
+                };
+                if !header.reader.fold_found(found, &header.kinds) {
+                    continue;
+                }
+                // A status may say only now that this is a gate's room.
+                let positions = header.regate();
+                let ops = header.redraw(positions, &index, &account_id, &room_id_str);
+                TimelineBatch {
+                    ops,
+                    header: header.changed().await,
+                    approvals: header.approvals_changed().await,
+                    heard: header.heard_changed(),
+                    pagination: None,
+                }
+            }
+            paged = next_done(&mut filling) => {
+                filling = None;
+                match paged {
+                    // Whether it reached the start is the SDK's status to
+                    // say, as it stands now: a reset since the page began
+                    // has taken that back (R509).
+                    Ok(_) => fill.settling = Some(tokio::time::Instant::now() + FILL_SETTLE),
+                    // Said where the person looks (the boundary's Retry) and
+                    // in the log (R381); not asked again until the person asks.
+                    Err(error) => {
+                        fill.failed = true;
+                        tracing::warn!(room_id = %room_id, %error, "timeline: older messages could not be loaded into the window");
+                    }
+                }
+                TimelineBatch::default()
+            }
+            () = until(fill.settling) => {
+                // The last page brought nothing the stream shows.
+                fill.settling = None;
+                TimelineBatch::default()
+            }
+            () = asks.asked() => {
+                // The person asked for older history (R509): a failed fill
+                // is tried again, and it pages on until something older
+                // shows, the start, a failure or a fresh budget's end.
+                fill.ask(shown.drawn());
+                TimelineBatch::default()
+            }
+            status = next_status(&mut statuses) => {
+                match status {
+                    Some(status) => sdk_status = map_pagination_status(status),
+                    None => statuses = None,
+                }
+                TimelineBatch::default()
             }
         };
         // Every message an op carries is drawn with its turn mark (R465).
         if let Some(header) = &header {
             header.mark(&mut batch.ops);
         }
+        shown.apply(&batch.ops);
+        // The status the boundary shows, sent where it changed.
+        let status = fill.said(sdk_status, shown.drawn(), filling.is_some());
+        if status != status_sent {
+            status_sent = status;
+            batch.pagination = Some(status);
+        }
         if batch.ops.is_empty()
             && batch.header.is_none()
             && batch.approvals.is_none()
             && batch.heard.is_none()
+            && batch.pagination.is_none()
         {
             continue;
         }
@@ -1564,51 +1736,228 @@ fn map_pagination_status(status: PaginationStatus) -> PaginationStatusBatch {
     }
 }
 
-/// Drive the live back-pagination status stream: emit the current mapped
-/// [`PaginationStatusBatch`] as an initial snapshot, then a batch on every change,
-/// deduping consecutive-equal statuses (the snapshot-then-diff contract, AD-8).
-///
-/// The status drives the frontend's honest history-boundary row (spinner while
-/// `Paginating`, "start of the conversation" once `hit_start`). Older events
-/// themselves arrive over the room's existing timeline diff stream — never here.
-/// The producer holds the shared `Arc<Timeline>` for the whole loop and stops when
-/// the sink reports the channel closed or the status stream ends. When the timeline
-/// is in a focused (non-live) mode `live_back_pagination_status()` yields `None`;
-/// keeper only ever opens live timelines, so this emits an initial `Idle` snapshot
-/// and returns rather than leaving the boundary blank.
-pub async fn run_pagination_status_producer(timeline: Arc<Timeline>, sink: PaginationSink) {
-    let Some((current, stream)) = timeline.live_back_pagination_status().await else {
-        // A focused timeline has no live back-pagination; emit a benign idle
-        // snapshot so the boundary is honest (no spinner, not "at start").
-        let _ = (sink)(PaginationStatusBatch {
-            state: PaginationState::Idle,
-            hit_start: false,
-        });
-        return;
-    };
-    let mut last = map_pagination_status(current);
-    if !(sink)(last) {
-        tracing::info!("pagination status channel closed before first batch");
-        return;
+/// Subscribe `open` — the rooms an account has a timeline open on, and only
+/// those — in its sliding sync (102.6, R468). A subscribed room syncs with
+/// the SDK's room-subscription timeline limit (20 events) instead of the
+/// room list's 1, so a sync carrying a claim renewal and a status, or an
+/// answer's edits, is no longer `limited` and the event cache no longer
+/// unloads the open room to its last chunk under the person's eyes. The
+/// SDK replaces its whole subscription set on each call, so an empty set
+/// unsubscribes the last closed room; this is the set's one writer.
+pub async fn subscribe_open_rooms(room_list: &RoomListService, open: &BTreeSet<OwnedRoomId>) {
+    let rooms: Vec<&RoomId> = open.iter().map(AsRef::as_ref).collect();
+    room_list.subscribe_to_rooms(&rooms).await;
+}
+
+/// Work the producer runs beside the stream: the header's search, a page
+/// of the fill.
+type Pending<T> = Pin<Box<dyn Future<Output = T> + Send>>;
+
+/// The room's live back-pagination status, as the SDK streams it.
+type StatusStream = Pin<Box<dyn Stream<Item = PaginationStatus> + Send>>;
+
+/// What `work` comes to, or never when there is none.
+async fn next_done<T>(work: &mut Option<Pending<T>>) -> T {
+    match work {
+        Some(work) => work.as_mut().await,
+        None => std::future::pending().await,
     }
-    futures_util::pin_mut!(stream);
-    while let Some(status) = stream.next().await {
-        let batch = map_pagination_status(status);
-        if batch == last {
-            continue;
-        }
-        last = batch;
-        if !(sink)(batch) {
-            tracing::info!("pagination status channel closed, stopping producer");
-            break;
+}
+
+/// The next back-pagination status, `None` when the stream ended, or never
+/// when there is no stream.
+async fn next_status(statuses: &mut Option<StatusStream>) -> Option<PaginationStatus> {
+    match statuses {
+        Some(statuses) => statuses.next().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// How many loaded items that draw something a window needs before keeper
+/// stops filling it on its own (102.6): a window that shows nothing or next
+/// to nothing — an agent's room unloaded to its claim renewals — fills;
+/// one that shows a screen's start does not, and the person's scroll (or
+/// wheel) at the top pages on from there. The SDK's timeline shows at most
+/// 20 items of a room at first (`MAXIMUM_NUMBER_OF_INITIAL_ITEMS`) and a
+/// page reaches the server for whatever it cannot reveal of those, so a bar
+/// near 20 would ask the server on nearly every open.
+const FILL_DRAWN: usize = 10;
+
+/// The events one fill page asks for: an agent's room carries its host's
+/// claim renewal every minute, which the timeline never draws.
+const FILL_PAGE: u16 = 200;
+
+/// At most this many fill pages (10 000 events) from the window's open,
+/// its last reset or the person's last ask, each of which grants a fresh
+/// budget.
+const FILL_PAGES: usize = 50;
+
+/// How long the fill waits after a page for the items it brought to reach
+/// the stream before it counts again: the SDK's timeline takes a page's
+/// events in on a task of its own, after the page returned. A page whose
+/// events the timeline never draws (claims) brings no items at all.
+const FILL_SETTLE: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// How long a fill page may take before it is a failure the person can
+/// retry (R381, R509), rather than a window waiting on it for good. The
+/// loopback tests hold a page past a shorter one.
+const FILL_DEADLINE: std::time::Duration = if cfg!(test) {
+    std::time::Duration::from_secs(3)
+} else {
+    std::time::Duration::from_secs(30)
+};
+
+/// keeper's own back-pagination of a window that draws too little (102.6,
+/// R468): one page at a time, in Rust, instead of one IPC round trip per
+/// page from the webview.
+#[derive(Debug)]
+struct Fill {
+    /// Pages started since the budget was last granted.
+    pages: usize,
+    /// How many drawn items the fill pages for.
+    goal: usize,
+    /// A page failed: said, and not asked again until the person asks.
+    failed: bool,
+    /// Until when the last page's items may still be on their way.
+    settling: Option<tokio::time::Instant>,
+}
+
+impl Fill {
+    fn new() -> Fill {
+        Fill {
+            pages: 0,
+            goal: FILL_DRAWN,
+            failed: false,
+            settling: None,
         }
     }
-    tracing::info!("pagination status stream ended");
-    drop(timeline);
+
+    /// Whether to page once more: the last page's items arrived, the
+    /// window draws fewer items than the goal, the room's start is not
+    /// reached as the SDK says it now, no page failed and the budget of
+    /// [`FILL_PAGES`] pages is not spent.
+    fn wants(&self, drawn: usize, hit_start: bool) -> bool {
+        self.settling.is_none()
+            && !self.failed
+            && !hit_start
+            && drawn < self.goal
+            && self.pages < FILL_PAGES
+    }
+
+    /// The person asked for older history while the window draws `drawn`
+    /// items: a failure is cleared, the budget granted afresh, and the
+    /// fill pages until at least one more item is drawn.
+    fn ask(&mut self, drawn: usize) {
+        self.failed = false;
+        self.pages = 0;
+        self.goal = self.goal.max(drawn + 1);
+    }
+
+    /// The status the boundary shows: a failed page as failed; a page in
+    /// flight, settling or about to be asked as paginating; otherwise the
+    /// SDK's `sdk` — idle with the start reached or not, which is what
+    /// lets the person ask for more (R509).
+    fn said(
+        &self,
+        sdk: PaginationStatusBatch,
+        drawn: usize,
+        paging: bool,
+    ) -> PaginationStatusBatch {
+        if self.failed {
+            PaginationStatusBatch {
+                state: PaginationState::Failed,
+                hit_start: false,
+            }
+        } else if paging || self.settling.is_some() || self.wants(drawn, sdk.hit_start) {
+            PaginationStatusBatch {
+                state: PaginationState::Paginating,
+                hit_start: false,
+            }
+        } else {
+            sdk
+        }
+    }
+}
+
+/// When `at` passes, or never.
+async fn until(at: Option<tokio::time::Instant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// One fill page of `timeline`, failed when it outlasts [`FILL_DEADLINE`].
+fn fill_page(timeline: &Arc<Timeline>) -> Pending<Result<bool, TimelineError>> {
+    let timeline = Arc::clone(timeline);
+    Box::pin(async move {
+        tokio::time::timeout(FILL_DEADLINE, paginate_backwards(&timeline, FILL_PAGE))
+            .await
+            .unwrap_or_else(|_| {
+                Err(TimelineError::Build(
+                    "the server did not answer in time".to_owned(),
+                ))
+            })
+    })
+}
+
+/// Which loaded items draw something, as the batches sent so far left
+/// them: what the fill counts.
+#[derive(Debug, Default)]
+struct Shown(Vector<bool>);
+
+impl Shown {
+    fn apply(&mut self, ops: &[TimelineOp]) {
+        fn draws(item: &TimelineItemVm) -> bool {
+            !matches!(item, TimelineItemVm::Other { .. })
+        }
+        let shown = &mut self.0;
+        for op in ops {
+            match op {
+                TimelineOp::Reset { items } => *shown = items.iter().map(draws).collect(),
+                TimelineOp::Append { items } => shown.extend(items.iter().map(draws)),
+                TimelineOp::Clear => shown.clear(),
+                TimelineOp::PushFront { item } => shown.push_front(draws(item)),
+                TimelineOp::PushBack { item } => shown.push_back(draws(item)),
+                TimelineOp::PopFront => {
+                    shown.pop_front();
+                }
+                TimelineOp::PopBack => {
+                    shown.pop_back();
+                }
+                TimelineOp::Insert { index, item } => {
+                    let at = *index as usize;
+                    if at <= shown.len() {
+                        shown.insert(at, draws(item));
+                    }
+                }
+                TimelineOp::Set { index, item } => {
+                    if let Some(slot) = shown.get_mut(*index as usize) {
+                        *slot = draws(item);
+                    }
+                }
+                TimelineOp::Remove { index } => {
+                    let at = *index as usize;
+                    if at < shown.len() {
+                        shown.remove(at);
+                    }
+                }
+                TimelineOp::Truncate { length } => shown.truncate(*length as usize),
+            }
+        }
+    }
+
+    /// How many loaded items draw something.
+    fn drawn(&self) -> usize {
+        self.0.iter().filter(|draws| **draws).count()
+    }
 }
 
 #[cfg(test)]
 mod brief_tests;
+
+#[cfg(test)]
+mod open_tests;
 
 #[cfg(test)]
 mod tests {

@@ -16,13 +16,14 @@
 //! newer `v` — is shown as *unreadable*, never dropped.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::future::Future;
 use std::sync::{Arc, Mutex, RwLock};
 
 use chrono::{DateTime, Utc};
 use matrix_sdk::deserialized_responses::{EncryptionInfo, VerificationLevel, VerificationState};
 use matrix_sdk::event_cache::RoomEventCacheUpdate;
 use matrix_sdk::ruma::events::room::power_levels::RoomPowerLevels;
-use matrix_sdk::ruma::events::AnySyncTimelineEvent;
+use matrix_sdk::ruma::events::{AnySyncTimelineEvent, AnyTimelineEvent};
 use matrix_sdk::ruma::room::RoomType;
 use matrix_sdk::ruma::room_version_rules::RoomVersionRules;
 use matrix_sdk::ruma::serde::Raw;
@@ -1645,18 +1646,169 @@ pub enum Found {
     Seat,
     /// The room's history ended with no status: searched empty (R416).
     Empty,
+    /// The room's history ended with no status, but an event on the way
+    /// could not be decrypted: a status may be in it, read once its key
+    /// arrives, so the next look starts over from the newest page (R513).
+    Unreadable,
     /// The look stopped at its page budget; the next one goes on from here.
-    Further(String),
+    Further(Resume),
     /// A request failed: the next look starts where this one did.
     Failed,
 }
 
+/// Where a search of a room's history goes on from: the token the last
+/// search stopped at, and whether an event before it could not be
+/// decrypted — a search that reaches the room's beginning after one did
+/// not search it empty (R513).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Resume {
+    pub from: String,
+    pub unreadable: bool,
+}
+
 /// Where a search of a room's history back for a status ended.
 enum Search {
+    /// A status was read.
     Status,
+    /// The room's beginning, with no status.
     Start,
-    Budget(String),
+    /// The page budget; the next search goes on from here.
+    Budget(Resume),
+    /// A request failed.
     Failed,
+}
+
+/// What a search of a room's history for its newest status found: the
+/// status and scope events it read, newest page first, and where it ended.
+/// It searched the history empty only when it reached the room's beginning
+/// with no status and read every event on the way: a failed request is not
+/// that, neither is a search that stopped at its page budget (R416), and
+/// neither is one that met an event the device could not decrypt (R513) —
+/// a status may be in it, read once its key arrives.
+pub struct HeaderFound {
+    events: Vec<Value>,
+    end: Search,
+    unreadable: bool,
+}
+
+impl HeaderFound {
+    fn searched_empty(&self) -> bool {
+        matches!(self.end, Search::Start) && !self.unreadable
+    }
+}
+
+/// Search `room`'s history on the server back for a status `own`'s account
+/// trusts under `levels`, from `from` (`None`: the newest page), at most
+/// `pages` pages of [`HEADER_PAGE`] (`None`: until the beginning). Every
+/// page is read by [`history_page`], past the room's event cache: the
+/// header's search of an opened room and the seat finder's look alike
+/// never meet anyone's pagination (R510).
+async fn page_back(
+    room: Room,
+    own: OwnedUserId,
+    levels: Option<RoomPowerLevels>,
+    from: Option<Resume>,
+    pages: Option<usize>,
+) -> HeaderFound {
+    let mut state = AgentRoomState::new(own);
+    let (mut from, unreadable) = match from {
+        Some(resume) => (Some(resume.from), resume.unreadable),
+        None => (None, false),
+    };
+    let mut found = HeaderFound {
+        events: Vec::new(),
+        end: Search::Failed,
+        unreadable,
+    };
+    for _ in 0..pages.unwrap_or(usize::MAX) {
+        let Some(page) = history_page(&room, from.take()).await else {
+            return found;
+        };
+        found.unreadable |= page.unreadable;
+        let mut events: Vec<Value> = page.events.iter().filter_map(header_event).collect();
+        events.reverse();
+        for event in &events {
+            state.apply(event, &|user| holds_agent_power(levels.as_ref(), user));
+        }
+        found.events.extend(events);
+        if state.has_status() {
+            found.end = Search::Status;
+            return found;
+        }
+        match page.end {
+            Some(end) if !page.events.is_empty() || page.unreadable => from = Some(end),
+            _ => {
+                // Empty only when every event on the way was read: an
+                // undecryptable one leaves the search to run again at the
+                // room's next open or look (R513).
+                found.end = Search::Start;
+                return found;
+            }
+        }
+    }
+    if let Some(from) = from {
+        found.end = Search::Budget(Resume {
+            from,
+            unreadable: found.unreadable,
+        });
+    }
+    found
+}
+
+/// One page of a room's history as [`history_page`] read it.
+struct HistoryPage {
+    /// Newest first, decrypted where the device could.
+    events: Vec<Raw<AnySyncTimelineEvent>>,
+    /// The token that continues it.
+    end: Option<String>,
+    /// Whether an event on it could not be decrypted.
+    unreadable: bool,
+}
+
+/// One page of `room`'s history from the server, newest first, from `from`
+/// (`None`: the newest); `None` when the request failed. Read past the
+/// room's event cache (R510): `Room::messages` saves what it reads into the
+/// cache, under the lock its pagination takes, and with a timeline page in
+/// flight a page was seen never to reach the server. A page read here is
+/// decrypted where it can be and kept nowhere, so the header's search
+/// cannot meet any caller's pagination.
+async fn history_page(room: &Room, from: Option<String>) -> Option<HistoryPage> {
+    use matrix_sdk::ruma::api::client::message::get_message_events;
+    use matrix_sdk::ruma::api::Direction;
+    let mut request =
+        get_message_events::v3::Request::new(room.room_id().to_owned(), Direction::Backward);
+    request.from = from;
+    request.limit = HEADER_PAGE.into();
+    let response = room.client().send(request).await.ok()?;
+    let mut page = HistoryPage {
+        events: Vec::with_capacity(response.chunk.len()),
+        end: response.end,
+        unreadable: false,
+    };
+    for event in response.chunk {
+        match readable(room, event).await {
+            Some(event) => page.events.push(event),
+            None => page.unreadable = true,
+        }
+    }
+    Some(page)
+}
+
+/// `event` decrypted when it is an encrypted message, as it came when it is
+/// not one; `None` when the device cannot decrypt it (yet).
+async fn readable(room: &Room, event: Raw<AnyTimelineEvent>) -> Option<Raw<AnySyncTimelineEvent>> {
+    use matrix_sdk::ruma::events::{AnySyncMessageLikeEvent, SyncMessageLikeEvent};
+    if let Ok(AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomEncrypted(
+        SyncMessageLikeEvent::Original(_),
+    ))) = event.deserialize_as::<AnySyncTimelineEvent>()
+    {
+        // The SDK answers a missing key with a UTD event, not an error.
+        return match room.decrypt_event(event.cast_ref_unchecked(), None).await {
+            Ok(decrypted) if !decrypted.kind.is_utd() => Some(decrypted.into_raw()),
+            _ => None,
+        };
+    }
+    Some(event.cast())
 }
 
 /// A session room's header reader: the folded state, what it last read of
@@ -1692,7 +1844,8 @@ impl HeaderReader {
     /// as the host's `latest_status` does. A history that ended without a
     /// status is not searched again in this process; one whose search
     /// stopped at its page budget is (R416): a status further back is out of
-    /// this look's reach, not absent. Only its power levels are read for
+    /// this look's reach, not absent — and so is one that met an event the
+    /// device could not decrypt (R513). Only its power levels are read for
     /// that; whose brief to draw is [`Self::refresh`]'s.
     pub async fn open(room: Room, kinds: &AgentKinds) -> HeaderReader {
         Self::open_with(room, kinds, true, Some(HEADER_PAGES)).await
@@ -1729,8 +1882,10 @@ impl HeaderReader {
     /// a history already searched empty is not searched again; otherwise the
     /// server's history is searched back from `from` (`None`: the newest
     /// page) at most `pages` pages, and a status found there is kept as the
-    /// room's seat.
-    pub async fn find(room: Room, kinds: &AgentKinds, from: Option<String>, pages: usize) -> Found {
+    /// room's seat. The look reads as the header's search does, past the
+    /// event cache (R510): it never writes into the cache and never meets
+    /// the person's pagination of the same room.
+    pub async fn find(room: Room, kinds: &AgentKinds, from: Option<Resume>, pages: usize) -> Found {
         let mut reader = Self::open_row(room, kinds).await;
         let (own, room_id) = (reader.room.own_user_id(), reader.room.room_id());
         if reader.state.has_status() || kinds.seat(own, room_id).is_some() {
@@ -1739,10 +1894,22 @@ impl HeaderReader {
         if kinds.searched_empty(own, room_id) {
             return Found::Empty;
         }
-        let found = match reader.search(from, Some(pages)).await {
+        let searched = page_back(
+            reader.room.clone(),
+            own.to_owned(),
+            reader.trust.levels.clone(),
+            from,
+            Some(pages),
+        )
+        .await;
+        for event in &searched.events {
+            reader.apply(event);
+        }
+        let found = match searched.end {
             Search::Status => Found::Seat,
+            Search::Start if searched.unreadable => Found::Unreadable,
             Search::Start => Found::Empty,
-            Search::Budget(from) => Found::Further(from),
+            Search::Budget(resume) => Found::Further(resume),
             Search::Failed => Found::Failed,
         };
         match &found {
@@ -1750,7 +1917,7 @@ impl HeaderReader {
             Found::Empty => {
                 kinds.note_searched_empty(reader.room.own_user_id(), reader.room.room_id())
             }
-            Found::Further(_) | Found::Failed => {}
+            Found::Unreadable | Found::Further(_) | Found::Failed => {}
         }
         found
     }
@@ -1761,6 +1928,26 @@ impl HeaderReader {
         seated_pages: bool,
         pages: Option<usize>,
     ) -> HeaderReader {
+        let mut reader = Self::read_cached(room).await;
+        if seated_pages
+            || kinds
+                .seat(reader.room.own_user_id(), reader.room.room_id())
+                .is_none()
+        {
+            if let Some(search) = reader.search_with(kinds, pages) {
+                let found = search.await;
+                reader.fold_found(found, kinds);
+            }
+        }
+        reader.remember(kinds);
+        reader
+    }
+
+    /// Read `room`'s status, scope, marks and approvals from its event cache
+    /// alone: no seat is looked at, nothing is kept and the server is never
+    /// asked. What an opened room's first batch is drawn from (102.6, R468);
+    /// [`Self::search`] reaches further back afterwards.
+    pub async fn read_cached(room: Room) -> HeaderReader {
         let mut reader = HeaderReader {
             state: AgentRoomState::new(room.own_user_id().to_owned()),
             trust: Trust {
@@ -1788,59 +1975,55 @@ impl HeaderReader {
             }
         }
         reader.approvals = approvals_of(&reader.room).await;
-        if !reader.state.has_status()
-            && (seated_pages
-                || kinds
-                    .seat(reader.room.own_user_id(), reader.room.room_id())
-                    .is_none())
-            && !kinds.searched_empty(reader.room.own_user_id(), reader.room.room_id())
-            && reader.page_back(pages).await
-        {
-            kinds.note_searched_empty(reader.room.own_user_id(), reader.room.room_id());
-        }
-        reader.remember(kinds);
         reader
     }
 
-    /// Search the server's history back for a status, at most `pages` pages
-    /// (`None`: until the beginning); returns whether the search reached the
-    /// room's beginning and found none. A failed request is not that, and
-    /// neither is a search that stopped at its page budget.
-    async fn page_back(&mut self, pages: Option<usize>) -> bool {
-        matches!(self.search(None, pages).await, Search::Start)
+    /// The search of the server's history an opened room's header still
+    /// needs, as [`Self::open`] runs it (R416: [`HEADER_PAGES`] pages,
+    /// seated or not): `None` when a status is already read or the room's
+    /// whole history was searched empty before. The search owns what it
+    /// reads, so it runs beside the timeline (102.6) and is folded in by
+    /// [`Self::fold_found`].
+    pub fn search(
+        &self,
+        kinds: &AgentKinds,
+    ) -> Option<impl Future<Output = HeaderFound> + Send + 'static> {
+        self.search_with(kinds, Some(HEADER_PAGES))
     }
 
-    /// [`Self::page_back`] from `from` (`None`: the newest page), saying
-    /// where a search stopped at its budget so the next one goes on there.
-    async fn search(&mut self, mut from: Option<String>, pages: Option<usize>) -> Search {
-        use matrix_sdk::room::MessagesOptions;
-        for _ in 0..pages.unwrap_or(usize::MAX) {
-            let mut options = MessagesOptions::backward().from(from.as_deref());
-            options.limit = HEADER_PAGE.into();
-            let Ok(page) = self.room.messages(options).await else {
-                return Search::Failed;
-            };
-            let mut events: Vec<Value> = page
-                .chunk
-                .iter()
-                .filter_map(|event| header_event(event.raw()))
-                .collect();
-            events.reverse();
-            for event in &events {
-                self.apply(event);
-            }
-            if self.state.has_status() {
-                return Search::Status;
-            }
-            match page.end {
-                Some(end) if !page.chunk.is_empty() => from = Some(end),
-                _ => return Search::Start,
-            }
+    fn search_with(
+        &self,
+        kinds: &AgentKinds,
+        pages: Option<usize>,
+    ) -> Option<impl Future<Output = HeaderFound> + Send + 'static> {
+        if self.state.has_status()
+            || kinds.searched_empty(self.room.own_user_id(), self.room.room_id())
+        {
+            return None;
         }
-        match from {
-            Some(from) => Search::Budget(from),
-            None => Search::Failed,
+        Some(page_back(
+            self.room.clone(),
+            self.room.own_user_id().to_owned(),
+            self.trust.levels.clone(),
+            None,
+            pages,
+        ))
+    }
+
+    /// Fold what a [`Self::search`] found, newest status and scope winning
+    /// by their time as with any event; a search that reached the room's
+    /// beginning with no status is noted, and the seat the status names is
+    /// kept. Returns whether the header may have changed.
+    pub fn fold_found(&mut self, found: HeaderFound, kinds: &AgentKinds) -> bool {
+        let mut changed = false;
+        for event in &found.events {
+            changed |= self.apply(event);
         }
+        if found.searched_empty() && !self.state.has_status() {
+            kinds.note_searched_empty(self.room.own_user_id(), self.room.room_id());
+        }
+        self.remember(kinds);
+        changed
     }
 
     /// Fold the person's mark of where they stopped listening, if `event`
@@ -1883,7 +2066,8 @@ impl HeaderReader {
             .apply(event, &|user| holds_agent_power(levels, user))
     }
 
-    fn remember(&self, kinds: &AgentKinds) {
+    /// Keep the seat the status read so far names (R416).
+    pub fn remember(&self, kinds: &AgentKinds) {
         if let Some(seat) = self.state.seat() {
             kinds.insert(self.room.own_user_id(), self.room.room_id(), seat);
         }

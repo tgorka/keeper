@@ -6,6 +6,7 @@ import type {
   ApprovalCardVm,
   HeldRestoreVm,
   IpcError,
+  PaginationStatusBatch,
   TimelineBatch,
   TimelineItemVm,
 } from "@/lib/ipc/client";
@@ -34,10 +35,9 @@ const couplingCaveats = vi.fn();
 const incognitoSetChat = vi.fn();
 const setTyping = vi.fn();
 const paginateBackwards = vi.fn();
+const loadEarlierMessages = vi.fn();
 const subscribeTyping = vi.fn();
 const unsubscribeTyping = vi.fn();
-const subscribePaginationStatus = vi.fn();
-const unsubscribePaginationStatus = vi.fn();
 const RESTORED_NOTHING: HeldRestoreVm = { line: "", reply: null, attachment: null };
 const cancelHeldSend = vi.fn(
   async (_a: string, _r: string, _id: string): Promise<HeldRestoreVm> => RESTORED_NOTHING,
@@ -65,13 +65,11 @@ vi.mock("@/lib/ipc/client", () => ({
     setTyping(accountId, roomId, typing),
   paginateBackwards: (accountId: string, roomId: string, numEvents: number) =>
     paginateBackwards(accountId, roomId, numEvents),
+  loadEarlierMessages: (accountId: string, roomId: string) =>
+    loadEarlierMessages(accountId, roomId),
   subscribeTyping: (accountId: string, roomId: string, onBatch: (b: unknown) => void) =>
     subscribeTyping(accountId, roomId, onBatch),
   unsubscribeTyping: (accountId: string, id: number) => unsubscribeTyping(accountId, id),
-  subscribePaginationStatus: (accountId: string, roomId: string, onBatch: (b: unknown) => void) =>
-    subscribePaginationStatus(accountId, roomId, onBatch),
-  unsubscribePaginationStatus: (accountId: string, id: number) =>
-    unsubscribePaginationStatus(accountId, id),
   sendText: (accountId: string, roomId: string, body: string) => sendText(accountId, roomId, body),
   sendReply: (accountId: string, roomId: string, inReplyToKey: string, body: string) =>
     sendReply(accountId, roomId, inReplyToKey, body),
@@ -215,14 +213,12 @@ beforeEach(() => {
   setTyping.mockResolvedValue(undefined);
   paginateBackwards.mockReset();
   paginateBackwards.mockResolvedValue(false);
+  loadEarlierMessages.mockReset();
+  loadEarlierMessages.mockResolvedValue(undefined);
   subscribeTyping.mockReset();
   subscribeTyping.mockResolvedValue(1);
   unsubscribeTyping.mockReset();
   unsubscribeTyping.mockResolvedValue(undefined);
-  subscribePaginationStatus.mockReset();
-  subscribePaginationStatus.mockResolvedValue(2);
-  unsubscribePaginationStatus.mockReset();
-  unsubscribePaginationStatus.mockResolvedValue(undefined);
   onDragDropEvent.mockClear();
   onDragDropEvent.mockImplementation(() => Promise.resolve(() => {}));
   composerStore.getState().clear();
@@ -459,7 +455,10 @@ describe("ConversationPane", () => {
       name: "Approval request: Write a.md in tgdrive",
     });
     const second = screen.getByRole("article", { name: "Approval request: Write b.md in tgdrive" });
-    const rows = within(screen.getByRole("list", { name: "Messages" })).getAllByRole("listitem");
+    // The rows in the stream's order, after the history boundary's own row.
+    const rows = within(screen.getByRole("list", { name: "Messages" }))
+      .getAllByRole("listitem")
+      .filter((row) => within(row).queryByText("Load earlier messages") === null);
     expect(rows.findIndex((row) => row.contains(first))).toBe(0);
     expect(rows[1]).toHaveTextContent("between");
     expect(rows.findIndex((row) => row.contains(second))).toBe(2);
@@ -666,7 +665,10 @@ describe("ConversationPane", () => {
     roomsStore.getState().selectRoom({ accountId: account.accountId, roomId: "!room:example.org" });
     render(<ConversationPane {...noopProps()} />);
 
-    captured.onBatch?.({ ops: [{ op: "reset", items: [{ kind: "other", key: "o1" }] }] });
+    captured.onBatch?.({
+      ops: [{ op: "reset", items: [{ kind: "other", key: "o1" }] }],
+      pagination: { state: "idle", hitStart: true },
+    });
 
     await waitFor(() => {
       expect(screen.getByText("No messages yet.")).toBeInTheDocument();
@@ -1804,6 +1806,20 @@ function setScrollGeometry(
     writable: true,
     configurable: true,
   });
+  // The rows' own extent, what decides whether the window scrolls (R513): the
+  // list holds `scrollHeight` of them, its history-boundary row nothing.
+  const list = el.firstElementChild;
+  const boundary = list?.firstElementChild;
+  if (list && boundary) {
+    Object.defineProperty(list, "getBoundingClientRect", {
+      value: () => ({ height: scrollHeight }) as DOMRect,
+      configurable: true,
+    });
+    Object.defineProperty(boundary, "getBoundingClientRect", {
+      value: () => ({ height: 0 }) as DOMRect,
+      configurable: true,
+    });
+  }
 }
 
 describe("ConversationPane — receipts, typing, pagination (Story 3.9)", () => {
@@ -1812,7 +1828,7 @@ describe("ConversationPane — receipts, typing, pagination (Story 3.9)", () => 
     const captured: {
       timeline: ((b: TimelineBatch) => void) | null;
       typing: ((b: { typists: unknown[] }) => void) | null;
-      pagination: ((b: { state: string; hitStart: boolean }) => void) | null;
+      pagination: ((b: PaginationStatusBatch) => void) | null;
     } = { timeline: null, typing: null, pagination: null };
     subscribeTimeline.mockImplementation((_a, _r, onBatch: (b: TimelineBatch) => void) => {
       captured.timeline = onBatch;
@@ -1822,34 +1838,23 @@ describe("ConversationPane — receipts, typing, pagination (Story 3.9)", () => 
       captured.typing = onBatch;
       return Promise.resolve(1);
     });
-    subscribePaginationStatus.mockImplementation(
-      (_a, _r, onBatch: (b: { state: string; hitStart: boolean }) => void) => {
-        captured.pagination = onBatch;
-        return Promise.resolve(2);
-      },
-    );
     roomsStore.getState().selectRoom({ accountId: account.accountId, roomId: "!room:example.org" });
     const utils = render(<ConversationPane {...noopProps()} />);
     // The subscribe effects run after mount; wait for the timeline and typing sinks.
-    // The pagination status is subscribed once the timeline's first batch arrives
-    // (Rust refuses it for a room whose timeline is not open yet).
+    // The pagination status rides on the timeline stream (102.6).
     await waitFor(() => {
       expect(captured.timeline).not.toBeNull();
       expect(captured.typing).not.toBeNull();
     });
+    captured.pagination = (b) => captured.timeline?.({ ops: [], pagination: b });
     return { captured, ...utils };
   }
 
-  it("subscribes to typing + pagination status and marks the room read on view", async () => {
+  it("subscribes to typing and marks the room read on view", async () => {
     const { captured } = await renderOpen();
     captured.timeline?.({ ops: [{ op: "reset", items: [] }] });
     await waitFor(() => {
       expect(subscribeTyping).toHaveBeenCalledWith(
-        account.accountId,
-        "!room:example.org",
-        expect.any(Function),
-      );
-      expect(subscribePaginationStatus).toHaveBeenCalledWith(
         account.accountId,
         "!room:example.org",
         expect.any(Function),
@@ -1912,28 +1917,165 @@ describe("ConversationPane — receipts, typing, pagination (Story 3.9)", () => 
     );
   });
 
-  // An agent's room after a limited sync: the SDK resets the timeline to the
-  // gap and nothing renders, so there is no top to scroll near. The window
-  // fills itself instead of reading "No messages yet." over a real history.
-  // Rust resolves the status from the room's open timeline and refuses a room
-  // whose timeline is not open yet; asked beside the timeline, an agent's room
-  // lost that race and never learned its status (no self-fill on hesperia).
-  it("subscribes to the pagination status only once the timeline's first batch arrived", async () => {
+  // Filling a window that draws too little is Rust's (102.6): the webview
+  // asks only when the person does. An empty window whose fill rests short
+  // of the start (its budget spent) keeps the person's way on (R509).
+  it("leaves filling an empty window to Rust and offers to load earlier messages", async () => {
     const { captured } = await renderOpen();
-    expect(subscribePaginationStatus).not.toHaveBeenCalled();
     captured.timeline?.({
-      ops: [{ op: "reset", items: [messageItem("k1", "@bob:example.org", "hi")] }],
+      ops: [{ op: "reset", items: [{ kind: "other", key: "o1" }] }],
+      pagination: { state: "idle", hitStart: false },
     });
-    await waitFor(() => expect(subscribePaginationStatus).toHaveBeenCalledTimes(1));
+    const more = await screen.findByRole("button", { name: "Load earlier messages" });
+    expect(screen.queryByText("No messages yet.")).not.toBeInTheDocument();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(paginateBackwards).not.toHaveBeenCalled();
+    expect(loadEarlierMessages).not.toHaveBeenCalled();
+    fireEvent.click(more);
+    expect(loadEarlierMessages).toHaveBeenCalledWith(account.accountId, "!room:example.org");
   });
 
-  it("back-paginates on its own when the window shows nothing and the start is not reached", async () => {
+  // A phone showing a few short items cannot scroll, so neither a scroll nor
+  // (on touch) a wheel ever asks for more (R509): the window offers it as a
+  // button, which a scrollable window does not need.
+  it("offers older history as a button only while the window cannot scroll", async () => {
     const { captured } = await renderOpen();
-    captured.timeline?.({ ops: [{ op: "reset", items: [{ kind: "other", key: "o1" }] }] });
-    await waitFor(() => expect(captured.pagination).not.toBeNull());
+    captured.timeline?.({
+      ops: [{ op: "reset", items: [messageItem("k1", "@bob:example.org", "hi")] }],
+      pagination: { state: "idle", hitStart: false },
+    });
+    const more = await screen.findByRole("button", { name: "Load earlier messages" });
+    fireEvent.click(more);
+    expect(loadEarlierMessages).toHaveBeenCalledWith(account.accountId, "!room:example.org");
     expect(paginateBackwards).not.toHaveBeenCalled();
-    captured.pagination?.({ state: "idle", hitStart: false });
 
+    const scroll = (await screen.findByLabelText("Messages")).parentElement as HTMLElement;
+    setScrollGeometry(scroll, { scrollHeight: 1000, clientHeight: 400, scrollTop: 600 });
+    captured.timeline?.({
+      ops: [{ op: "pushBack", item: messageItem("k2", "@bob:example.org", "more") }],
+    });
+    // Gone, not merely hidden from assistive technology.
+    await waitFor(() => expect(screen.queryByText("Load earlier messages")).toBeNull());
+  });
+
+  // Rows just short of the window (R513): were the button's own row counted,
+  // it would make the overflow that removes it, and back, at every resize. The
+  // button settles, keeps the focus, still asks Rust, keeps the newest message
+  // in view, and goes only once the rows themselves cross the window.
+  it("settles the load-earlier button for rows just short of the window, across a resize", async () => {
+    const observers: { callback: ResizeObserverCallback; targets: Element[] }[] = [];
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        targets: Element[] = [];
+        constructor(callback: ResizeObserverCallback) {
+          observers.push({ callback, targets: this.targets });
+        }
+        observe(target: Element) {
+          this.targets.push(target);
+        }
+        unobserve() {}
+        disconnect() {
+          this.targets.length = 0;
+        }
+      },
+    );
+    try {
+      const { captured } = await renderOpen();
+      captured.timeline?.({
+        ops: [{ op: "reset", items: [messageItem("k1", "@bob:example.org", "hi")] }],
+        pagination: { state: "idle", hitStart: false },
+      });
+      const list = await screen.findByLabelText("Messages");
+      const scroll = list.parentElement as HTMLElement;
+      const boundary = list.firstElementChild as HTMLElement;
+      // The layout jsdom lacks: 380 px of rows, a 48 px boundary row while it
+      // holds the button, and the window's height.
+      let viewport = 400;
+      const rows = 380;
+      const row = () => (within(boundary).queryByRole("button") === null ? 0 : 48);
+      let scrollTop = 0;
+      Object.defineProperties(scroll, {
+        clientHeight: { configurable: true, get: () => viewport },
+        scrollHeight: { configurable: true, get: () => Math.max(viewport, rows + row()) },
+        scrollTop: {
+          configurable: true,
+          get: () => scrollTop,
+          set: (value: number) => {
+            scrollTop = value;
+          },
+        },
+      });
+      Object.defineProperty(list, "getBoundingClientRect", {
+        configurable: true,
+        value: () => ({ height: rows + row() }) as DOMRect,
+      });
+      Object.defineProperty(boundary, "getBoundingClientRect", {
+        configurable: true,
+        value: () => ({ height: row() }) as DOMRect,
+      });
+      // Every size change of the window or its list reaches its observers, as
+      // a browser's would.
+      const resize = () =>
+        act(() => {
+          for (const { callback, targets } of observers) {
+            if (targets.includes(scroll) || targets.includes(list)) {
+              callback([], {} as ResizeObserver);
+            }
+          }
+        });
+
+      resize();
+      const more = screen.getByRole("button", { name: "Load earlier messages" });
+      more.focus();
+      for (let n = 0; n < 4; n += 1) {
+        resize();
+      }
+      // The same button, never taken down and put back; the newest message
+      // still in view under it.
+      expect(screen.getByRole("button", { name: "Load earlier messages" })).toBe(more);
+      expect(more).toHaveFocus();
+      expect(scrollTop).toBe(rows + 48);
+      fireEvent.click(more);
+      expect(loadEarlierMessages).toHaveBeenCalledWith(account.accountId, "!room:example.org");
+
+      // The window shrinks below the rows: it scrolls, and the button goes.
+      viewport = 360;
+      resize();
+      expect(screen.queryByText("Load earlier messages")).toBeNull();
+      // It grows past them again: the button is back, the newest message kept.
+      viewport = 420;
+      scrollTop = 0;
+      resize();
+      expect(screen.getByRole("button", { name: "Load earlier messages" })).toBeInTheDocument();
+      expect(scrollTop).toBe(rows + 48);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("offers nothing more at the conversation's start", async () => {
+    const { captured } = await renderOpen();
+    captured.timeline?.({
+      ops: [{ op: "reset", items: [messageItem("k1", "@bob:example.org", "hi")] }],
+      pagination: { state: "idle", hitStart: true },
+    });
+    await screen.findByText("This is the start of the conversation");
+    expect(screen.queryByRole("button", { name: "Load earlier messages" })).toBeNull();
+  });
+
+  it("pages older history when the wheel turns up over a window that cannot scroll", async () => {
+    const { captured } = await renderOpen();
+    captured.timeline?.({
+      ops: [{ op: "reset", items: [messageItem("k1", "@bob:example.org", "hi")] }],
+      pagination: { state: "idle", hitStart: false },
+    });
+    const region = await screen.findByLabelText("Messages");
+    const scroll = region.parentElement as HTMLElement;
+    setScrollGeometry(scroll, { scrollHeight: 400, clientHeight: 400, scrollTop: 0 });
+    fireEvent.wheel(scroll, { deltaY: 40 });
+    expect(paginateBackwards).not.toHaveBeenCalled();
+    fireEvent.wheel(scroll, { deltaY: -40 });
     await waitFor(() =>
       expect(paginateBackwards).toHaveBeenCalledWith(
         account.accountId,
@@ -1943,30 +2085,33 @@ describe("ConversationPane — receipts, typing, pagination (Story 3.9)", () => 
     );
   });
 
-  // An agent's room: the newest hundreds of events are the host's claim
-  // renewals, which render nothing. The first page settles with the window
-  // still empty and no status change after it — the fill must look again on
-  // its own, in large pages.
-  it("keeps filling an empty window page after page, in large pages", async () => {
+  it("says Rust's failed fill with a Retry that pages again", async () => {
     const { captured } = await renderOpen();
-    captured.timeline?.({ ops: [{ op: "reset", items: [{ kind: "other", key: "o1" }] }] });
-    await waitFor(() => expect(captured.pagination).not.toBeNull());
+    captured.timeline?.({
+      ops: [{ op: "reset", items: [{ kind: "other", key: "o1" }] }],
+      pagination: { state: "failed", hitStart: false },
+    });
+    const retry = await screen.findByRole("button", { name: "Retry" });
+    expect(screen.getByText("Couldn't load older messages.")).toBeInTheDocument();
+    // A later status from the SDK does not clear the failure; only a retry does.
     captured.pagination?.({ state: "idle", hitStart: false });
-
-    await waitFor(() => expect(paginateBackwards.mock.calls.length).toBeGreaterThanOrEqual(3));
-    for (const call of paginateBackwards.mock.calls) {
-      expect(call[2]).toBe(200);
-    }
+    expect(screen.getByText("Couldn't load older messages.")).toBeInTheDocument();
+    // The Retry goes to Rust's fill, which pages on from its failure (R509).
+    fireEvent.click(retry);
+    expect(loadEarlierMessages).toHaveBeenCalledWith(account.accountId, "!room:example.org");
+    expect(paginateBackwards).not.toHaveBeenCalled();
+    expect(screen.queryByText("Couldn't load older messages.")).not.toBeInTheDocument();
   });
 
-  it("does not page an empty window once the start is reached", async () => {
+  it("says a Retry that could not reach Rust as the failure again", async () => {
+    loadEarlierMessages.mockRejectedValueOnce(new Error("no open view"));
     const { captured } = await renderOpen();
-    captured.timeline?.({ ops: [{ op: "reset", items: [{ kind: "other", key: "o1" }] }] });
-    await waitFor(() => expect(captured.pagination).not.toBeNull());
-    captured.pagination?.({ state: "idle", hitStart: true });
-
-    await waitFor(() => expect(screen.getByText("No messages yet.")).toBeInTheDocument());
-    expect(paginateBackwards).not.toHaveBeenCalled();
+    captured.timeline?.({
+      ops: [{ op: "reset", items: [messageItem("k1", "@bob:example.org", "hi")] }],
+      pagination: { state: "failed", hitStart: false },
+    });
+    fireEvent.click(await screen.findByRole("button", { name: "Retry" }));
+    await screen.findByText("Couldn't load older messages.");
   });
 
   it("does NOT back-paginate near the top when offline", async () => {
@@ -2098,10 +2243,9 @@ describe("ConversationPane — receipts, typing, pagination (Story 3.9)", () => 
     captured.pagination?.({ state: "idle", hitStart: false });
     expect(screen.getByText("Couldn't load older messages.")).toBeInTheDocument();
 
-    // Retry re-fires the fetch (now succeeding) and clears the error.
-    paginateBackwards.mockResolvedValueOnce(false);
+    // Retry asks Rust for older history and clears the error.
     fireEvent.click(screen.getByRole("button", { name: "Retry" }));
-    await waitFor(() => expect(paginateBackwards).toHaveBeenCalledTimes(2));
+    expect(loadEarlierMessages).toHaveBeenCalledTimes(1);
     await waitFor(() =>
       expect(screen.queryByText("Couldn't load older messages.")).not.toBeInTheDocument(),
     );

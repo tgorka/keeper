@@ -3567,6 +3567,32 @@ keeper shows an agent's room in its own timeline, on the Mac and on the iPhone a
   control room your proxy made; a DM invite is joined as direct. Any other invite waits for you.
   Agent power in such a control room is that authority: a bridge or a person given agent power
   there has its session-room invites joined too (R452).
+- **Opening a room is instant (story 102.6, R468, R510).** The conversation is drawn from what
+  keeper already holds before anything else: the room's header is read from the same cache, and a
+  status further back than the cache reaches is searched for on the server only afterwards — what
+  the search finds arrives as a header of its own (`keeper_core::timeline::forward_timeline`). The
+  search reads the server's history without saving it into the room's cache, so it never holds up
+  a page of older history, whoever asked for it. An event on the way that this device cannot
+  decrypt yet — its room key not here — leaves the search unfinished rather than "no status": it
+  runs again the next time the room opens or is listed (R513).
+  While a room is open keeper subscribes it in the account's sliding sync, so it syncs up to 20 new
+  events at a time instead of the room list's 1: a claim renewal plus a status, or an answer's
+  edits, no longer make the sync "limited", and the SDK no longer drops the room to its newest
+  chunk while you read it; the subscription ends when the last view of the room closes. A window
+  that still draws too little — the newest events are claim renewals, which the timeline never
+  shows, or a long sleep did make a sync "limited" — fills itself in Rust, 200 events a page,
+  until it draws 10 items, reaches the room's start or has asked for 50 pages. A page that fails,
+  or that the server has not answered in 30 seconds, is said in the history row ("Couldn't load
+  older messages." with Retry, and a WARN in `keeper.log`), and keeper does not ask again on its
+  own (R381, R509).
+  Further back, you page: scroll near the top, or turn the wheel up there. A window whose
+  messages cannot scroll — a few short messages on the phone — shows **Load earlier messages** at
+  its top instead, as does an empty window whose fill stopped short of the start; whether they
+  scroll is measured without the button's own row, so the button stays put when the messages
+  nearly fill the window, and the newest message stays in view under it (R513). That button and
+  Retry both ask Rust, which pages on until something older shows, the start, a failure or 50
+  more pages.
+  The pagination status rides on the room's timeline stream; there is no separate subscription.
 
 ## Nixi beside your notes
 

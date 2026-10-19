@@ -1510,7 +1510,7 @@ pub enum TimelineOp {
 ///
 /// The stream always opens with a batch whose first op is a
 /// [`TimelineOp::Reset`] carrying the cached snapshot, then diff batches.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
 pub struct TimelineBatch {
@@ -1539,6 +1539,13 @@ pub struct TimelineBatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub heard: Option<Vec<HeardMarkVm>>,
+    /// The room's back-pagination status (102.6, R468): on the first batch
+    /// always, then on a batch of its own whenever it changed — the
+    /// timeline's history boundary needs no second subscription and no
+    /// wait for the first batch. Absent where nothing changed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub pagination: Option<PaginationStatusBatch>,
 }
 
 /// One member currently typing in the open room (Story 3.9, typing, AD-14,
@@ -1579,8 +1586,10 @@ pub struct TypingBatch {
 ///
 /// A Rust-authoritative projection of the SDK `PaginationStatus`:  `Paginating`
 /// while a back-pagination request is in flight (the boundary shows a spinner),
-/// `Idle` otherwise. Serializes to its camelCase name. The homeserver-start signal
-/// is carried separately on [`PaginationStatusBatch::hit_start`].
+/// `Idle` otherwise — and `Failed` when keeper's own fill of a window that
+/// drew too little failed (102.6): the boundary says so and offers Retry.
+/// Serializes to its camelCase name. The homeserver-start signal is carried
+/// separately on [`PaginationStatusBatch::hit_start`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
@@ -1589,18 +1598,20 @@ pub enum PaginationState {
     Paginating,
     /// No back-pagination is running.
     Idle,
+    /// keeper's own fill of the window failed; it is not tried again until
+    /// the person retries.
+    Failed,
 }
 
-/// A batch delivered over the pagination-status subscription's `Channel` (Story
-/// 3.9, AD-8).
+/// The room's back-pagination status, riding on its [`TimelineBatch`]
+/// (Story 3.9, 102.6, AD-8).
 ///
 /// A scalar snapshot of the live back-pagination status, mapped from the SDK
 /// `PaginationStatus`: `state` drives the boundary spinner, and `hit_start` is
 /// `true` once the homeserver has no older history (the boundary then states the
 /// conversation start and no further pagination is attempted). Inherently
-/// idempotent — each batch carries the full current status. Older events
-/// themselves arrive over the existing timeline diff stream (`PushFront`/`Insert`),
-/// never here; this channel carries only the status.
+/// idempotent — each one carries the full current status. Older events
+/// themselves arrive as the timeline's own ops (`PushFront`/`Insert`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
@@ -9732,6 +9743,7 @@ mod tests {
             header: None,
             approvals: None,
             heard: None,
+            pagination: None,
         };
         let json = serde_json::to_string(&batch).expect("serialize batch");
         assert!(json.contains("\"ops\":"), "json was: {json}");

@@ -958,7 +958,6 @@ import type { NoteWriteVm } from "./gen/NoteWriteVm";
 import type { OrgAccountVm } from "./gen/OrgAccountVm";
 import type { OutboxVm } from "./gen/OutboxVm";
 import type { PacedWorkVm } from "./gen/PacedWorkVm";
-import type { PaginationStatusBatch } from "./gen/PaginationStatusBatch";
 import type { PaletteMode } from "./gen/PaletteMode";
 import type { PaletteResultsVm } from "./gen/PaletteResultsVm";
 import type { PanelIntentVm } from "./gen/PanelIntentVm";
@@ -3909,6 +3908,18 @@ export async function paginateBackwards(
 }
 
 /**
+ * Ask for the open room's older history — the boundary's Retry, or "Load earlier
+ * messages" where the window cannot scroll (102.6, R509). The ask reaches the Rust
+ * producer that owns the window's fill: it pages until something older shows, the
+ * start, a failure or its budget's end, each said on the timeline stream's
+ * `pagination` status. Rejects with the {@link IpcError} envelope when the room has
+ * no open view.
+ */
+export async function loadEarlierMessages(accountId: string, roomId: string): Promise<void> {
+  await invoke<void>("load_earlier_messages", { accountId, roomId });
+}
+
+/**
  * Subscribe to the open room's typing notifications (Story 3.9, typing, AD-8,
  * AD-14). Opens a `Channel`, forwards each {@link TypingBatch} (the current set of
  * *other* members typing, each with a resolved display name) to `onBatch` in
@@ -3932,34 +3943,6 @@ export async function subscribeTyping(
  */
 export async function unsubscribeTyping(accountId: string, id: number): Promise<void> {
   await invoke<void>("typing_unsubscribe", { accountId, subscriptionId: id });
-}
-
-/**
- * Subscribe to the open room's live back-pagination status (Story 3.9, pagination,
- * AD-8). Opens a `Channel`, forwards each {@link PaginationStatusBatch} (a scalar
- * snapshot: `paginating`/`idle` + `hitStart`) to `onBatch` in arrival order (an
- * initial snapshot before any change), and resolves with the subscription id. The
- * status drives the honest history-boundary row; older events themselves arrive
- * over the timeline subscription, never here. Rejects with the {@link IpcError}
- * envelope (`code: "timelineUnavailable"`) if the room isn't open.
- */
-export async function subscribePaginationStatus(
-  accountId: string,
-  roomId: string,
-  onBatch: (batch: PaginationStatusBatch) => void,
-): Promise<number> {
-  return await subscribe<PaginationStatusBatch>("pagination_status_subscribe", onBatch, {
-    accountId,
-    roomId,
-  });
-}
-
-/**
- * Unsubscribe exactly one pagination-status subscription, aborting its backend
- * producer task (AD-19). Idempotent — an unknown id is a no-op.
- */
-export async function unsubscribePaginationStatus(accountId: string, id: number): Promise<void> {
-  await invoke<void>("pagination_status_unsubscribe", { accountId, subscriptionId: id });
 }
 
 /**

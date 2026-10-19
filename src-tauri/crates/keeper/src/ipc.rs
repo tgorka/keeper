@@ -56,16 +56,15 @@ use keeper_core::vm::{
     DemoBatch, DockBadgeMode, DraftMirrorBatch, EditVersionVm, EgressEndpointVm,
     EncryptionStatusBatch, ExportPhase, ExportProgressVm, ExportRequestVm, HotkeyVm, InboxBatch,
     IncognitoVm, IpcError, IpcErrorCode, MenuSectionVm, NavState, NetworksSnapshot,
-    NewChatResolutionVm, NotificationPermission, NotifyTarget, OutboxVm, PaginationStatusBatch,
-    PaletteMode, PaletteResultsVm, PingVm, Provider, RecordingCaptureSourcesPatchVm,
-    RecordingCaptureSourcesVm, RecordingDestinationKind, RecordingDurabilityState,
-    RecordingDurabilityVm, RecordingFilterVm, RecordingNoteStubVm, RecordingNoteTargetVm,
-    RecordingPathPreviewVm, RecordingPermissionVm, RecordingProfileVm, RecordingSearchVm,
-    RecordingSessionMetaVm, RecordingSettingsVm, RecordingSourcesVm, RecordingStatusVm,
-    RecordingSummaryVm, RecordingTargetVm, RecordingUiState, RecordingVolumeState,
-    RecordingVolumeVm, RemoteDraftVm, ResolveSupportVm, RoomListBatch, ScreenRecordingAccess,
-    SearchFilterVm, SearchHitVm, SpacesSnapshot, SyncListSettingsVm, TccPermission, TimelineBatch,
-    TypingBatch, VerificationFlowVm,
+    NewChatResolutionVm, NotificationPermission, NotifyTarget, OutboxVm, PaletteMode,
+    PaletteResultsVm, PingVm, Provider, RecordingCaptureSourcesPatchVm, RecordingCaptureSourcesVm,
+    RecordingDestinationKind, RecordingDurabilityState, RecordingDurabilityVm, RecordingFilterVm,
+    RecordingNoteStubVm, RecordingNoteTargetVm, RecordingPathPreviewVm, RecordingPermissionVm,
+    RecordingProfileVm, RecordingSearchVm, RecordingSessionMetaVm, RecordingSettingsVm,
+    RecordingSourcesVm, RecordingStatusVm, RecordingSummaryVm, RecordingTargetVm, RecordingUiState,
+    RecordingVolumeState, RecordingVolumeVm, RemoteDraftVm, ResolveSupportVm, RoomListBatch,
+    ScreenRecordingAccess, SearchFilterVm, SearchHitVm, SpacesSnapshot, SyncListSettingsVm,
+    TccPermission, TimelineBatch, TypingBatch, VerificationFlowVm,
 };
 use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;
@@ -13095,6 +13094,24 @@ pub async fn paginate_backwards(
         .map_err(to_ipc_error)
 }
 
+/// The person asks for the open room's older history — the boundary's Retry, or
+/// "Load earlier messages" where the window cannot scroll (102.6, R509). The ask
+/// reaches the producer that owns the window's fill; what it brings and how it
+/// ends ride on the timeline stream's pagination status. No open view of the
+/// room funnels through [`to_ipc_error`] to the retriable `TimelineUnavailable`.
+#[tauri::command]
+pub async fn load_earlier_messages(
+    state: State<'_, AppState>,
+    account_id: String,
+    room_id: String,
+) -> Result<(), IpcError> {
+    state
+        .accounts
+        .load_earlier_messages(&account_id, &room_id)
+        .await
+        .map_err(to_ipc_error)
+}
+
 /// Subscribe to the open room's typing notifications (Story 3.9, typing, AD-8,
 /// AD-14). Opens a `Channel`, streams a [`TypingBatch`] (the current set of *other*
 /// members typing, each with a resolved display name) — an initial empty snapshot,
@@ -13128,43 +13145,6 @@ pub async fn typing_unsubscribe(
     state
         .accounts
         .unsubscribe_typing(&account_id, subscription_id)
-        .await;
-    Ok(())
-}
-
-/// Subscribe to the open room's live back-pagination status (Story 3.9,
-/// pagination, AD-8). Opens a `Channel`, streams a [`PaginationStatusBatch`] (a
-/// scalar snapshot: `Paginating`/`Idle` + `hitStart`) — an initial snapshot, then
-/// deduped changes — and returns the subscription id. The status drives the honest
-/// history-boundary row; older events themselves arrive over the timeline
-/// subscription, never here. A room-not-found / no-open-timeline funnels through
-/// [`to_ipc_error`] to `TimelineUnavailable`.
-#[tauri::command]
-pub async fn pagination_status_subscribe(
-    state: State<'_, AppState>,
-    account_id: String,
-    room_id: String,
-    channel: Channel<PaginationStatusBatch>,
-) -> Result<u64, IpcError> {
-    let sink = Box::new(move |batch: PaginationStatusBatch| channel.send(batch).is_ok());
-    state
-        .accounts
-        .subscribe_pagination_status(&account_id, &room_id, sink)
-        .await
-        .map_err(to_ipc_error)
-}
-
-/// Unsubscribe exactly one pagination-status subscription, aborting its backend
-/// producer task (AD-19). Idempotent.
-#[tauri::command]
-pub async fn pagination_status_unsubscribe(
-    state: State<'_, AppState>,
-    account_id: String,
-    subscription_id: u64,
-) -> Result<(), IpcError> {
-    state
-        .accounts
-        .unsubscribe_pagination_status(&account_id, subscription_id)
         .await;
     Ok(())
 }

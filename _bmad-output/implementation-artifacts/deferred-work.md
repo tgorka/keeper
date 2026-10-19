@@ -11312,3 +11312,38 @@ origin: lane `102stack` (the stack of epic 102: the list × open seam), 2026-10-
 location: `keeper_core::account::inbox_owners::InboxOwners` (102.5, R519) and `keeper_core::account::open_views` (102.6, R509 05)
 reason: both spawn a producer held and register it before it runs, and both abort and await what they hold at teardown, but they are keyed differently — by account and inbox-subscription generation under an account lifetime, against by subscription id with the sliding-sync subscription of each open room — and stop on different events. One helper for both would change when each stops; they were left as two.
 status: open
+
+### DW-1560: An open room's sliding-sync subscription syncs at most 20 events at a time.
+
+origin: lane `open` (story 102.6 #2, R468), 2026-10-19
+location: `keeper_core::timeline::subscribe_open_rooms` → matrix-sdk-ui 0.18 `RoomListService::subscribe_to_rooms` (`DEFAULT_ROOM_SUBSCRIPTION_TIMELINE_LIMIT` = 20)
+reason: 0.18's room list service sets a subscription's timeline limit itself and exposes no way to choose it (`sliding_sync()` is `cfg(test)`). A sync that brings more than 20 new events for the open room — a device that slept through more than about 20 minutes of claim renewals, or a long streamed answer while the sync loop stalls — is still `limited`, and the event cache still unloads the room to its last chunk; keeper's fill (102.6 #3) then pages it back. Raising the list's own limit for every room (`SyncService::builder(..).with_room_list_timeline_limit(n)`) is the owner's payload trade-off (triage 102 §4 D5), not taken here.
+status: open
+
+### DW-1561: On a touch screen, a window that cannot scroll has no gesture that pages older history.
+
+origin: lane `open` (story 102.6 #3, R468), 2026-10-19
+location: `keeper_core::timeline::{Fill, FILL_DRAWN}`, `src/components/chat/conversation-body.tsx` (`onScroll`, `onWheel`)
+reason: Rust cannot measure the window, so its fill stops once the window draws 10 items (the SDK shows a room's newest 20 at first; a higher bar would ask the server on nearly every open). A window that draws 10 or more short items and still cannot scroll pages on when the person scrolls near the top or turns the wheel up there (`onWheel`, desktop) — but a touch drag on a window that cannot scroll emits neither `scroll` nor `wheel`, so on the phone such a window shows no older history until a new message makes it scroll. A pull-down at the top (touch) would close it.
+status: closed (fix lane F102open1, R509/04, 2026-10-19: `HistoryBoundary` offers "Load earlier messages" — a button, so touch, pointer and keyboard alike — whenever older history remains (`idle`, start not reached) and the window cannot scroll, measured after every batch and on resize, and in an empty window whose fill rests short of the start; it asks Rust through `load_earlier_messages` → the producer's `HistoryAsks`, which pages until something older draws; tests `timeline::open_tests::load_earlier_brings_something_older_into_a_full_window`, `conversation-pane.test.tsx` "offers older history as a button only while the window cannot scroll", "leaves filling an empty window to Rust and offers to load earlier messages"; browser at `?platform=phone&history=more`) Fix round 2 (F102open2, R513/O2-01, 2026-10-19): the measure leaves the boundary row out (`rowsOverflow`), so the button no longer creates and removes its own overflow for rows just short of the window; test "settles the load-earlier button for rows just short of the window, across a resize"; browser at 1280 and `?platform=phone` 420 px, resized across the threshold.
+
+### DW-1562: A lagged event-cache subscription re-reads the header with its server search inline.
+
+origin: lane `open` (story 102.6 #1), 2026-10-19
+location: `keeper_core::timeline::forward_timeline` (`RecvError::Lagged` arm → `HeaderReader::open`)
+reason: when the header's event-cache subscription lags, the producer reopens the header with `HeaderReader::open`, which may search the server for up to four pages before the loop takes the next diff. 102.6 moved the opening read off that path (`read_cached` + a search beside the stream); the lag path is rare and kept as it was. It can take the same `search`/`fold_found` pair.
+status: closed (fix lane F102open1, 2026-10-19: the `RecvError::Lagged` arm re-reads the header with `HeaderReader::read_cached` and starts `HeaderReader::search` beside the stream as at open; with R510 that search is cache-neutral too)
+
+### DW-1563: Once in 32 loopback runs, a window drew its one image message twice.
+
+origin: lane `open` finisher F102open0 (story 102.6 #3), 2026-10-19
+location: `keeper_core::timeline::brief_tests::only_an_original_text_brief_from_a_known_agent_is_drawn_as_one` (the replayed window held two media messages, `left: [false, false]`), `keeper_core::timeline::forward_timeline`
+reason: seen once on delectra (`timeline::` run 6 of 6 at `refs/wip/102open-f2`), never in the 20 runs of that test alone nor the 6 suite runs after it, nor in any gate run without 102.6's fill (dozens). That room draws 6 items, so 102.6's fill pages it once and reaches its start; the duplicate may come from that page meeting the snapshot. Not reproduced, so not fixed; a diagnostic that prints every batch's ops on a wrong count (written and removed by the finisher) is the next step.
+status: open
+
+### DW-1564: The person's own paging can still meet the header's search in the event cache.
+
+origin: lane `open` finisher F102open0 (story 102.6 #1), 2026-10-19
+location: `keeper_core::timeline::forward_timeline` (`search_due`), `keeper_core::agents::room::page_back` (`Room::messages` saves into the event cache)
+reason: with the header's search (`Room::messages`, which saves what it reads into the room's event cache) and a back-pagination of the same room in flight together, the pagination was seen never to reach the server (matrix-sdk 0.18; loopback harness, 8 of 25 runs). keeper now starts the search only once its own fill is at rest, but a person who scrolls up while the search runs (one to four requests) pages beside it. A search that reads through a request that does not save into the cache (decrypting itself), or an upstream fix, would close it.
+status: closed (fix lane F102open1, R509/03, R510, 2026-10-19: `room::page_back` reads through `room::history_page`, a raw `/messages` request through the client that decrypts what it can itself and saves nothing into the event cache, so no caller's pagination can meet it; `search_due` is gone; test `timeline::open_tests::the_header_search_never_meets_the_persons_pagination` pages beside a held search and finds nothing the search read in the cache)

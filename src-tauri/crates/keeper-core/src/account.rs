@@ -102,8 +102,8 @@ use crate::vm::BridgeLoginInput;
 use crate::vm::{
     ApprovalDraftVm, ChatNotifyMode, ConnectionStatus, ConnectionStatusBatch, DraftMirrorBatch,
     EditVersionVm, EncryptionStatus, EncryptionStatusBatch, HeldSendVm, InboxBatch, IncognitoVm,
-    MuteState, OutboxVm, PaginationStatusBatch, PaletteMode, PaletteResultsVm, RemoteDraftVm,
-    RoomListBatch, RoomListOp, RoomVm, SpaceVm, TimelineBatch, TypingBatch, TypistVm,
+    MuteState, OutboxVm, PaletteMode, PaletteResultsVm, RemoteDraftVm, RoomListBatch, RoomListOp,
+    RoomVm, SpaceVm, TimelineBatch, TypingBatch, TypistVm,
 };
 
 mod agent_list;
@@ -155,12 +155,6 @@ pub type InboxSink = Box<dyn Fn(InboxBatch) -> bool + Send + Sync>;
 /// the batch was delivered, `false` if the channel is closed (the producer stops).
 pub type TypingSink = Box<dyn Fn(TypingBatch) -> bool + Send + Sync>;
 
-/// Sink that receives each produced [`PaginationStatusBatch`] (Story 3.9). The
-/// shell wraps a Tauri `Channel::send`; tests capture into a vector. Returns
-/// `true` if the batch was delivered, `false` if the channel is closed (the
-/// producer then stops).
-pub type PaginationSink = Box<dyn Fn(PaginationStatusBatch) -> bool + Send + Sync>;
-
 /// Sink that receives each produced [`DraftMirrorBatch`] (Story 7.2, AD-15). The
 /// shell wraps a Tauri `Channel::send`; tests capture into a vector. Returns
 /// `true` if the batch was delivered, `false` if the channel is closed (the
@@ -180,11 +174,16 @@ pub type AgentAsksSink = Box<dyn Fn(agent_waiting::AgentAsksVm) -> bool + Send +
 /// before it reads them again (Story 101.3).
 const ASKS_SETTLE: std::time::Duration = std::time::Duration::from_millis(300);
 
+mod open_views;
+
+use open_views::OpenView;
+
 /// Registry of an account's live open room timelines, keyed by the *timeline*
-/// subscription id → its room id and the exact `Arc<Timeline>` that produced the
-/// subscribed items (AD-19). Send/retry look it up by room id; teardown drops the
-/// entry.
-type OpenTimelines = Arc<Mutex<HashMap<u64, (OwnedRoomId, Arc<Timeline>)>>>;
+/// subscription id → its room, the exact `Arc<Timeline>` that produced the
+/// subscribed items (AD-19) and the asks of its producer. Send/retry look it up
+/// by room id; teardown drops the entry; its rooms are the ones the account's
+/// sliding sync subscribes (102.6, R468).
+type OpenTimelines = open_views::Views<OpenView>;
 
 /// A live native-bridge-login session (Story 6.3, FR-26, AD-16): the driver task
 /// running [`login::drive_login`] and the input sender that `submit_bridge_login`
@@ -1701,7 +1700,7 @@ impl AccountManager {
         // if needed — never a second Client/SyncService. `did_activate` records
         // whether *this* call brought the account live, so a build failure before
         // any subscription attaches can tear it back down (AD-21).
-        let (client, subs_arc, timelines_arc, did_activate) = {
+        let (client, sync, subs_arc, timelines_arc, did_activate) = {
             let mut accounts = self.accounts.lock().await;
             let did_activate = !accounts.contains_key(account_id);
             if did_activate {
@@ -1755,6 +1754,7 @@ impl AccountManager {
             })?;
             (
                 handle.client.clone(),
+                handle.sync.clone(),
                 handle.subscriptions.clone(),
                 handle.timelines.clone(),
                 did_activate,
@@ -1799,10 +1799,14 @@ impl AccountManager {
 
         let subscription_id = NEXT_SUBSCRIPTION_ID.fetch_add(1, Ordering::Relaxed);
         // Share the exact `Arc<Timeline>` that produces the subscribed items with
-        // send/retry — `unique_id`s are only stable within this one instance.
-        let shared_timeline = open.timeline();
-        let reaper_subs = subs_arc.clone();
-        let reaper_timelines = timelines_arc.clone();
+        // send/retry — `unique_id`s are only stable within this one instance —
+        // and the asks that reach its producer's fill (R509).
+        let view = OpenView {
+            room: room_id.clone(),
+            timeline: open.timeline(),
+            asks: open.asks(),
+        };
+        let subscriber = open_views::sliding_sync(&sync);
         let room_id_task = room_id.clone();
         let room_id_log = room_id.clone();
         let kinds = self.agent_kinds.clone();
@@ -1810,32 +1814,39 @@ impl AccountManager {
         let hosted = self.agent_hosted.clone();
         let span =
             tracing::info_span!("timeline_producer", account_id = %account_id, room_id = %room_id);
-        let task = tokio::spawn(
-            async move {
-                timeline::forward_timeline(open, room_id_task, sink, kinds, icons, hosted).await;
-                // A naturally-completed producer reaps its own subscription entry
-                // and drops its stored `Arc<Timeline>` so nothing leaks (AD-19).
-                reaper_subs.lock().await.remove(&subscription_id);
-                reaper_timelines.lock().await.remove(&subscription_id);
-            }
-            .instrument(span),
+        // Held until its view is registered (R509): a producer whose sink is
+        // already closed then reaps the view it registered and unsubscribes
+        // its room, rather than reaping nothing first.
+        let held = open_views::spawn_held(
+            subscription_id,
+            subscriber.clone(),
+            subs_arc.clone(),
+            timelines_arc.clone(),
+            timeline::forward_timeline(open, room_id_task, sink, kinds, icons, hosted)
+                .instrument(span),
         );
 
         {
             let accounts = self.accounts.lock().await;
             match accounts.get(account_id) {
                 Some(_) => {
-                    subs_arc.lock().await.insert(subscription_id, task);
-                    timelines_arc
-                        .lock()
-                        .await
-                        .insert(subscription_id, (room_id.clone(), shared_timeline));
+                    // The room is subscribed in sliding sync while it is open
+                    // (R468): a claim renewal no longer unloads it.
+                    open_views::register(
+                        &subscriber,
+                        &subs_arc,
+                        &timelines_arc,
+                        subscription_id,
+                        view,
+                        held,
+                    )
+                    .await;
                 }
                 None => {
-                    // The account was shut down in the spawn→register gap;
-                    // shutdown already stopped its sync, so aborting the orphaned
-                    // producer here leaks nothing.
-                    task.abort();
+                    // The account was shut down before the view was registered;
+                    // shutdown already stopped its sync, and the held producer
+                    // never runs.
+                    held.task.abort();
                     return Err(TimelineError::Build(
                         "account removed during subscribe".to_owned(),
                     )
@@ -3232,12 +3243,15 @@ impl AccountManager {
         let accounts = self.accounts.lock().await;
         if let Some(handle) = accounts.get(account_id) {
             // Drop the stored timeline first (a room-list id simply isn't present
-            // here — a no-op), then abort the producer task.
-            handle.timelines.lock().await.remove(&subscription_id);
-            if let Some(task) = handle.subscriptions.lock().await.remove(&subscription_id) {
-                task.abort();
-                return true;
-            }
+            // here — a no-op), unsubscribing its room with its last view, then
+            // abort the producer task.
+            return open_views::close(
+                &open_views::sliding_sync(&handle.sync),
+                &handle.subscriptions,
+                &handle.timelines,
+                subscription_id,
+            )
+            .await;
         }
         false
     }
@@ -6166,6 +6180,39 @@ impl AccountManager {
         Ok(hit_start)
     }
 
+    /// The person asks for the room's older history — the boundary's Retry, or
+    /// "Load earlier messages" where the window cannot scroll (102.6, R509).
+    /// The ask goes to the producer of the room's newest open view, which owns
+    /// its fill: a failed fill is tried again and it pages on until something
+    /// older shows, the start is reached, a page fails or its budget is spent,
+    /// each said on the timeline stream's pagination status. A one-page SDK call
+    /// would leave that fill failed for good.
+    ///
+    /// Errors: an unparsable room id, or no open view of the room on a live
+    /// account → [`TimelineError::RoomNotFound`].
+    pub async fn load_earlier_messages(
+        &self,
+        account_id: &str,
+        room_id: &str,
+    ) -> Result<(), CoreError> {
+        let room_id: OwnedRoomId =
+            RoomId::parse(room_id).map_err(|_| TimelineError::RoomNotFound)?;
+        let accounts = self.accounts.lock().await;
+        let handle = accounts
+            .get(account_id)
+            .ok_or(TimelineError::RoomNotFound)?;
+        let timelines = handle.timelines.lock().await;
+        let view = timelines
+            .iter()
+            .filter(|(_, view)| view.room == room_id)
+            .max_by_key(|(subscription_id, _)| **subscription_id)
+            .map(|(_, view)| view)
+            .ok_or(TimelineError::RoomNotFound)?;
+        view.asks.ask();
+        tracing::debug!(account_id = %account_id, room_id = %room_id, "older history asked for");
+        Ok(())
+    }
+
     /// Subscribe to the room's typing notifications (Story 3.9, AD-14, AD-19).
     /// Resolves the account's live `Room`, spawns a supervised producer over the
     /// SDK typing broadcast (via [`signals::subscribe_typing`]) that resolves each
@@ -6232,79 +6279,6 @@ impl AccountManager {
     pub async fn unsubscribe_typing(&self, account_id: &str, subscription_id: u64) {
         if self.abort_subscription(account_id, subscription_id).await {
             tracing::info!(account_id = %account_id, subscription_id, "typing unsubscribed");
-        }
-    }
-
-    /// Subscribe to the room's live back-pagination status (Story 3.9, AD-19).
-    /// Resolves the room's open `Arc<Timeline>` (the exact instance feeding the
-    /// timeline subscription — the room must be open), spawns a supervised
-    /// [`timeline::run_pagination_status_producer`] that streams a
-    /// [`PaginationStatusBatch`] into `sink`, and returns the subscription id.
-    ///
-    /// Mirrors [`subscribe_connection_status`]'s supervised-task + self-reap
-    /// lifecycle: the `JoinHandle` registers in the account's `subscriptions` map
-    /// and is aborted on unsubscribe / shutdown (AD-19). A room-not-found / no-open-
-    /// timeline funnels to `TimelineUnavailable`.
-    pub async fn subscribe_pagination_status(
-        &self,
-        account_id: &str,
-        room_id: &str,
-        sink: PaginationSink,
-    ) -> Result<u64, CoreError> {
-        let room_id: OwnedRoomId =
-            RoomId::parse(room_id).map_err(|_| TimelineError::RoomNotFound)?;
-        let (timeline, subs_arc) = {
-            let accounts = self.accounts.lock().await;
-            let handle = accounts
-                .get(account_id)
-                .ok_or(TimelineError::RoomNotFound)?;
-            let subs = handle.subscriptions.clone();
-            drop(accounts);
-            // Resolve the newest open `Arc<Timeline>` for the room (mirrors the
-            // send path). The room must be open (its timeline subscribed).
-            let timeline = self
-                .open_timeline_for(account_id, &room_id)
-                .await
-                .map_err(|_| TimelineError::RoomNotFound)?;
-            (timeline, subs)
-        };
-
-        let subscription_id = NEXT_SUBSCRIPTION_ID.fetch_add(1, Ordering::Relaxed);
-        let span = tracing::info_span!(
-            "pagination_status_producer",
-            account_id = %account_id,
-            room_id = %room_id
-        );
-        let reaper_subs = subs_arc.clone();
-        let task = tokio::spawn(
-            async move {
-                timeline::run_pagination_status_producer(timeline, sink).await;
-                reaper_subs.lock().await.remove(&subscription_id);
-            }
-            .instrument(span),
-        );
-
-        {
-            let accounts = self.accounts.lock().await;
-            match accounts.get(account_id) {
-                Some(_) => {
-                    subs_arc.lock().await.insert(subscription_id, task);
-                }
-                None => {
-                    task.abort();
-                    return Err(TimelineError::RoomNotFound.into());
-                }
-            }
-        }
-        tracing::info!(account_id = %account_id, subscription_id, room_id = %room_id, "pagination status subscribed");
-        Ok(subscription_id)
-    }
-
-    /// Abort exactly the pagination-status producer task for `subscription_id`
-    /// (Story 3.9); other account state is untouched. Idempotent.
-    pub async fn unsubscribe_pagination_status(&self, account_id: &str, subscription_id: u64) {
-        if self.abort_subscription(account_id, subscription_id).await {
-            tracing::info!(account_id = %account_id, subscription_id, "pagination status unsubscribed");
         }
     }
 
@@ -6474,9 +6448,9 @@ impl AccountManager {
             // one instance, mirroring `open_timeline_for`.
             let timeline = timelines
                 .iter()
-                .filter(|(_, (open_room, _))| *open_room == room_id)
+                .filter(|(_, view)| view.room == room_id)
                 .max_by_key(|(subscription_id, _)| **subscription_id)
-                .map(|(_, (_, tl))| tl.clone())
+                .map(|(_, view)| view.timeline.clone())
                 .ok_or(MediaError::NotFound)?;
             (handle.client.clone(), timeline)
         };
@@ -6535,9 +6509,9 @@ impl AccountManager {
         // fail the retry item lookup.
         let timeline = timelines
             .iter()
-            .filter(|(_, (open_room, _))| open_room == room_id)
+            .filter(|(_, view)| &*view.room == room_id)
             .max_by_key(|(subscription_id, _)| **subscription_id)
-            .map(|(_, (_, tl))| tl.clone())
+            .map(|(_, view)| view.timeline.clone())
             .ok_or(SendError::NoOpenTimeline)?;
         Ok(timeline)
     }

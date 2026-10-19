@@ -786,17 +786,18 @@ async fn a_listing_never_asks_the_server_and_the_finder_goes_further_each_look()
     assert!(messages().is_empty(), "a listing asked the server");
 
     let first = HeaderReader::find(joined.clone(), &kinds, None, FINDER_PAGES).await;
-    let Found::Further(from) = first else {
+    let Found::Further(resume) = first else {
         panic!("the first look stops at its budget: {first:?}");
     };
     assert_eq!(messages().len(), FINDER_PAGES);
     assert!(kinds.seat(joined.own_user_id(), joined.room_id()).is_none());
 
-    let second = HeaderReader::find(joined.clone(), &kinds, Some(from.clone()), FINDER_PAGES).await;
+    let second =
+        HeaderReader::find(joined.clone(), &kinds, Some(resume.clone()), FINDER_PAGES).await;
     assert_eq!(second, Found::Seat);
     assert_eq!(
         messages()[FINDER_PAGES],
-        Some(from),
+        Some(resume.from),
         "the second look goes on where the first stopped"
     );
     let asked = messages().len();
@@ -1704,7 +1705,10 @@ async fn the_finder_waits_after_a_room_with_a_pending_look_was_left() {
     assert_eq!(asked(), 2 * FINDER_PAGES, "nothing was looked at");
     let kept = finder.looks.get(second).expect("the kept room's look");
     assert_eq!(
-        (kept.looks, kept.from.as_deref()),
+        (
+            kept.looks,
+            kept.from.as_ref().map(|resume| resume.from.as_str())
+        ),
         (1, Some(format!("q{FINDER_PAGES}").as_str())),
         "its backoff and where it stopped"
     );

@@ -2538,3 +2538,369 @@ async fn waiting_ids(
     .map(|open| open.ask.id)
     .collect()
 }
+
+/// Every batch's ops applied in order, as the frontend's store does; the
+/// window after each batch.
+fn windows(
+    batches: &[keeper_core::vm::TimelineBatch],
+) -> Vec<Vec<keeper_core::vm::TimelineItemVm>> {
+    use keeper_core::vm::TimelineOp;
+    let mut items = Vec::new();
+    let mut after = Vec::new();
+    for batch in batches {
+        for op in batch.ops.clone() {
+            match op {
+                TimelineOp::Reset { items: all } => items = all,
+                TimelineOp::Append { items: more } => items.extend(more),
+                TimelineOp::Clear => items.clear(),
+                TimelineOp::PushFront { item } => items.insert(0, item),
+                TimelineOp::PushBack { item } => items.push(item),
+                TimelineOp::PopFront => {
+                    items.remove(0);
+                }
+                TimelineOp::PopBack => {
+                    items.pop();
+                }
+                TimelineOp::Insert { index, item } => items.insert(index as usize, item),
+                TimelineOp::Set { index, item } => items[index as usize] = item,
+                TimelineOp::Remove { index } => {
+                    items.remove(index as usize);
+                }
+                TimelineOp::Truncate { length } => items.truncate(length as usize),
+            }
+        }
+        after.push(items.clone());
+    }
+    after
+}
+
+/// Whether `window` draws the message whose body is `body`.
+fn draws(window: &[keeper_core::vm::TimelineItemVm], body: &str) -> bool {
+    window.iter().any(|item| {
+        matches!(item, keeper_core::vm::TimelineItemVm::Message { body: drawn, .. } if drawn == body)
+    })
+}
+
+/// Open `room` on `client` as `subscribe_timeline` does; the batches it sends.
+async fn open_room(
+    client: &AgentClient,
+    room: &RoomId,
+) -> (
+    Arc<Mutex<Vec<keeper_core::vm::TimelineBatch>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    use keeper_core::agents::approval_card::HostedRooms;
+    use keeper_core::agents::room::{AgentIcons, AgentKinds};
+    use keeper_core::timeline;
+    let open = timeline::open_timeline(client.client(), room, "acct")
+        .await
+        .expect("timeline");
+    let batches: Arc<Mutex<Vec<keeper_core::vm::TimelineBatch>>> = Arc::default();
+    let sink = Arc::clone(&batches);
+    let producer = tokio::spawn(timeline::forward_timeline(
+        open,
+        room.to_owned(),
+        Box::new(move |batch| {
+            sink.lock().expect("lock").push(batch);
+            true
+        }),
+        Arc::new(AgentKinds::default()),
+        Arc::new(AgentIcons::default()),
+        Arc::new(HostedRooms::default()),
+    ));
+    (batches, producer)
+}
+
+/// 102.6 #4, #1, #3 (R468): an agent's room whose last message sits behind
+/// 220 claim renewals, on a device whose cache holds the whole room — keeper
+/// restarted, so only the cache's last chunk (claims) is loaded. Opening it
+/// draws that message within 500 ms: the first batch does not wait for the
+/// header's search of the server, and the window fills itself from the
+/// cache in Rust.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "live: Synapse on delectra"]
+async fn an_agent_room_behind_claims_shows_its_last_message_at_once() {
+    let smoke = Smoke::setup().await;
+    let root = TempDir::new();
+    let agent = smoke.user("nixi-smoke");
+    smoke.set_ratelimit(&agent, 0, 0).await;
+    let (nixi, person, room) = joined_pair(&smoke, SessionKind::Main, root.path()).await;
+    person
+        .client()
+        .event_cache()
+        .subscribe()
+        .expect("event cache");
+    let person_session = StoredSession::from_client(person.client())
+        .expect("session")
+        .to_json()
+        .expect("json");
+    nixi.send(
+        &room,
+        events::STATUS,
+        status_of(&agent, "main", "Nixi"),
+        None,
+    )
+    .await
+    .expect("status");
+    nixi.send(
+        &room,
+        "m.room.message",
+        json!({ "msgtype": "m.text", "body": "the last word" }),
+        None,
+    )
+    .await
+    .expect("the last word");
+    let start = chrono::Utc::now();
+    for n in 0..220_i64 {
+        let at = (start + chrono::Duration::seconds(n)).to_rfc3339();
+        nixi.send_state(
+            &room,
+            events::CLAIM,
+            "",
+            &json!({
+                "v": 1, "host": "electra", "device": "ELECTRA", "agent": agent, "epoch": 1,
+                "acquired_at": start.to_rfc3339(), "renewed_at": at, "expires_at": at,
+                "released": false,
+            }),
+        )
+        .await
+        .expect("a renewal");
+    }
+    // The person's device takes every event in: a warm cache. A sync brings
+    // only the newest few (it is `limited`); the rest the device pages back
+    // into its cache, as scrolling up once did.
+    person.sync_once().await.expect("sync");
+    let (cache, handles) = person
+        .client()
+        .get_room(&room)
+        .expect("room known")
+        .event_cache()
+        .await
+        .expect("event cache");
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        let cached = cached_events(&person, &room).await;
+        let claims = cached.iter().filter(|e| e["type"] == events::CLAIM).count();
+        if claims >= 220 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the renewals never reached the cache: {claims} of 220"
+        );
+        let paged = cache
+            .pagination()
+            .run_backwards_once(100)
+            .await
+            .expect("a page into the cache");
+        if paged.reached_start {
+            person.sync_once().await.expect("sync");
+        }
+    }
+    drop((cache, handles));
+    drop(person);
+
+    let restored = AgentClient::open(
+        &smoke.homeserver,
+        &root.path().join("tgorka"),
+        "smoke-passphrase",
+    )
+    .await
+    .expect("reopen");
+    restored
+        .restore(StoredSession::from_json(&person_session).expect("session"))
+        .await
+        .expect("restore");
+    restored
+        .client()
+        .event_cache()
+        .subscribe()
+        .expect("event cache");
+
+    let opened = Instant::now();
+    let (batches, producer) = open_room(&restored, &room).await;
+    let shown = loop {
+        let windows = windows(&batches.lock().expect("lock"));
+        if windows
+            .last()
+            .is_some_and(|window| draws(window, "the last word"))
+        {
+            break opened.elapsed();
+        }
+        assert!(
+            opened.elapsed() < Duration::from_secs(30),
+            "the last word never showed: {} batches",
+            windows.len()
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    };
+    producer.abort();
+    println!("102.6: the last word shown {shown:?} after opening");
+    assert!(
+        shown < Duration::from_millis(500),
+        "the last word took {shown:?} to show"
+    );
+    let first = batches.lock().expect("lock")[0].clone();
+    assert!(
+        first.pagination.is_some(),
+        "the status rides on the first batch"
+    );
+}
+
+/// 102.6 #2 (R468): the open room is subscribed in sliding sync, so a burst
+/// of events arriving in one sync — a wake after a claim renewal, a status
+/// and an answer — is not a `limited` sync for it, and the window keeps the
+/// message it showed instead of being unloaded to the burst.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "live: Synapse on delectra"]
+async fn an_open_room_keeps_its_window_through_a_burst() {
+    use keeper_core::timeline;
+    use matrix_sdk_ui::sync_service::SyncService;
+    use std::collections::BTreeSet;
+
+    let smoke = Smoke::setup().await;
+    let root = TempDir::new();
+    let agent = smoke.user("nixi-smoke");
+    smoke.set_ratelimit(&agent, 0, 0).await;
+    let (nixi, _desk, room) = joined_pair(&smoke, SessionKind::Main, root.path()).await;
+    // The person's device syncs with sliding sync from its first sync, as
+    // keeper does: a device that ran a /v3 sync first carries a to-device
+    // token the sliding-sync encryption extension refuses.
+    let person = AgentClient::open(
+        &smoke.homeserver,
+        &root.path().join("tgorka-phone"),
+        "smoke-passphrase",
+    )
+    .await
+    .expect("client");
+    person
+        .login(
+            "tgorka-smoke",
+            smoke.secret("TGORKA_SMOKE_PASSWORD"),
+            None,
+            "tgorka@phone",
+        )
+        .await
+        .expect("login");
+    person
+        .client()
+        .event_cache()
+        .subscribe()
+        .expect("event cache");
+    let sync = SyncService::builder(person.client().clone())
+        .build()
+        .await
+        .expect("sync service");
+    sync.start().await;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while person.client().get_room(&room).is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "the room never reached the device: the sync is {:?}",
+            sync.state().get()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    // The host learns of the new device before it speaks to it.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    nixi.sync_once().await.expect("sync");
+    nixi.send(
+        &room,
+        events::STATUS,
+        status_of(&agent, "main", "Nixi"),
+        None,
+    )
+    .await
+    .expect("status");
+    nixi.send(
+        &room,
+        "m.room.message",
+        json!({ "msgtype": "m.text", "body": "before the burst" }),
+        None,
+    )
+    .await
+    .expect("before the burst");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let cached = cached_events(&person, &room).await;
+        if cached
+            .iter()
+            .any(|e| e["content"]["body"] == "before the burst")
+        {
+            break;
+        }
+        let kinds: Vec<&str> = cached.iter().filter_map(|e| e["type"].as_str()).collect();
+        assert!(
+            Instant::now() < deadline,
+            "the message never arrived: the cache holds {kinds:?}, the sync is {:?}",
+            sync.state().get()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let (batches, producer) = open_room(&person, &room).await;
+    timeline::subscribe_open_rooms(&sync.room_list_service(), &BTreeSet::from([room.clone()]))
+        .await;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !windows(&batches.lock().expect("lock"))
+        .last()
+        .is_some_and(|window| draws(window, "before the burst"))
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the window never drew the message"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // Let the subscription reach the server before the device sleeps.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // The device sleeps; the host renews its claim, says a status, answers.
+    sync.stop().await;
+    let start = chrono::Utc::now();
+    for n in 0..6_i64 {
+        let at = (start + chrono::Duration::seconds(n)).to_rfc3339();
+        nixi.send_state(
+            &room,
+            events::CLAIM,
+            "",
+            &json!({
+                "v": 1, "host": "electra", "device": "ELECTRA", "agent": agent, "epoch": 1,
+                "acquired_at": start.to_rfc3339(), "renewed_at": at, "expires_at": at,
+                "released": false,
+            }),
+        )
+        .await
+        .expect("a renewal");
+    }
+    nixi.send(
+        &room,
+        "m.room.message",
+        json!({ "msgtype": "m.text", "body": "after the burst" }),
+        None,
+    )
+    .await
+    .expect("after the burst");
+    sync.start().await;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !windows(&batches.lock().expect("lock"))
+        .last()
+        .is_some_and(|window| draws(window, "after the burst"))
+    {
+        assert!(Instant::now() < deadline, "the answer never arrived");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    producer.abort();
+    sync.stop().await;
+    let windows = windows(&batches.lock().expect("lock"));
+    let shown_from = windows
+        .iter()
+        .position(|window| draws(window, "before the burst"))
+        .expect("drawn once");
+    let lost = windows[shown_from..]
+        .iter()
+        .filter(|window| !draws(window, "before the burst"))
+        .count();
+    assert_eq!(lost, 0, "the window let the message go {lost} times");
+}

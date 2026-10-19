@@ -2,16 +2,15 @@
 import type { PaginationState } from "./PaginationState";
 
 /**
- * A batch delivered over the pagination-status subscription's `Channel` (Story
- * 3.9, AD-8).
+ * The room's back-pagination status, riding on its [`TimelineBatch`]
+ * (Story 3.9, 102.6, AD-8).
  *
  * A scalar snapshot of the live back-pagination status, mapped from the SDK
  * `PaginationStatus`: `state` drives the boundary spinner, and `hit_start` is
  * `true` once the homeserver has no older history (the boundary then states the
  * conversation start and no further pagination is attempted). Inherently
- * idempotent — each batch carries the full current status. Older events
- * themselves arrive over the existing timeline diff stream (`PushFront`/`Insert`),
- * never here; this channel carries only the status.
+ * idempotent — each one carries the full current status. Older events
+ * themselves arrive as the timeline's own ops (`PushFront`/`Insert`).
  */
 export type PaginationStatusBatch = { 
 /**

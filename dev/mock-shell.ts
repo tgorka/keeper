@@ -151,6 +151,7 @@ import type {
   NoteIntentVm,
   OrgAccountVm,
   PacedWorkVm,
+  PaginationStatusBatch,
   PanelIntentVm,
   PlatformVm,
   PromoteState,
@@ -7949,6 +7950,44 @@ const TIMELINE_STREAMS = new Map<number, ReturnType<typeof setInterval>>();
 let nextTimelineSubscription = 1;
 
 /**
+ * The back-pagination status every first timeline batch carries (102.6):
+ * the harness's rooms hold their whole history, so the start is reached.
+ * `?history=failed` says Rust's own fill of the window failed, so the
+ * boundary shows its sentence and Retry; `?history=more` says older
+ * history remains, so a window that cannot scroll offers "Load earlier
+ * messages" (R509). Either ask reaches the producer (`load_earlier_messages`),
+ * which pages, brings one older message and reaches the start.
+ */
+const historyParam = new URLSearchParams(window.location.search).get("history");
+const mockHistory: PaginationStatusBatch =
+  historyParam === "failed"
+    ? { state: "failed", hitStart: false }
+    : historyParam === "more"
+      ? { state: "idle", hitStart: false }
+      : { state: "idle", hitStart: true };
+
+/** Every open room's timeline channel, for the producer's answer to an ask. */
+const historyChannels = new Map<string, MockChannel<TimelineBatch>>();
+
+function loadEarlierMock(payload: Record<string, unknown>): null {
+  const roomId = String(payload.roomId);
+  const channel = historyChannels.get(roomId);
+  channel?.onmessage?.({ ops: [], pagination: { state: "paginating", hitStart: false } });
+  setTimeout(() => {
+    channel?.onmessage?.({
+      ops: [
+        {
+          op: "pushFront",
+          item: textItem(`${roomId}-earlier`, NIXI, "Nixi", "An earlier word, loaded on ask", 240),
+        },
+      ],
+      pagination: { state: "idle", hitStart: true },
+    });
+  }, 400);
+  return null;
+}
+
+/**
  * Nixi's header names her model where her home is on this device (100.2 #7):
  * her Settings › Agents row's bot and level as they read when the room opens,
  * so a save there shows the next time the room is opened.
@@ -8000,6 +8039,7 @@ function subscribeMockTimeline(payload: Record<string, unknown>): number {
   const roomId = String(payload.roomId);
   const id = nextTimelineSubscription++;
   const agent = AGENT_ROOM_TIMELINES[roomId];
+  historyChannels.set(roomId, channel);
   if (!agent) {
     channel.onmessage?.({
       ops: [
@@ -8008,6 +8048,7 @@ function subscribeMockTimeline(payload: Record<string, unknown>): number {
           items: [textItem(`${roomId}-1`, "@marta:example.org", "Marta", "See you on Friday", 15)],
         },
       ],
+      pagination: mockHistory,
     });
     return id;
   }
@@ -8017,6 +8058,7 @@ function subscribeMockTimeline(payload: Record<string, unknown>): number {
     ...(roomId === APPROVAL_ROOM && mockApprovals.length > 0 ? { approvals: mockApprovals } : {}),
     ...(roomId === GATE_ROOM && gateApprovals.length > 0 ? { approvals: gateApprovals } : {}),
     ...(agent.heard ? { heard: agent.heard } : {}),
+    pagination: mockHistory,
   });
   dockChannels.set(id, { roomId, channel });
   if (roomId !== "!nixi-dm:example.org" || dockParam !== null) {
@@ -9066,6 +9108,9 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
     presenceViews.push(String(payload.view));
     return null;
   },
+  // The harness's rooms hold their whole history: a page reaches the start.
+  paginate_backwards: () => true,
+  load_earlier_messages: loadEarlierMock,
   timeline_subscribe: subscribeMockTimeline,
   timeline_unsubscribe: (payload) => {
     const id = Number(payload.subscriptionId);

@@ -48,7 +48,9 @@ use super::{known_proxies, proxy_row, MessageKind, ASKS_SETTLE};
 use crate::agents::attention::{self as agent_attention, AgentAttentionVm, Asks, RowAttention};
 use crate::agents::list_rows::{Keep, ListRowStore, RowWriter};
 use crate::agents::proxy::{self, AgentProxies, KnownProxies, ProxyRoomRow};
-use crate::agents::room::{holds_agent_power, AgentKinds, AgentRoomKind, Found, HeaderReader};
+use crate::agents::room::{
+    holds_agent_power, AgentKinds, AgentRoomKind, Found, HeaderReader, Resume,
+};
 use crate::agents::session::SessionKind;
 use crate::agents::waiting::{
     self as agent_waiting, AgentAskVm, AgentAsksVm, Mine, Reach, RoomAsks, Seen, WaitingAsk,
@@ -1020,7 +1022,7 @@ struct Look {
     at: tokio::time::Instant,
     looks: u32,
     /// Where the last look stopped, to go on from.
-    from: Option<String>,
+    from: Option<Resume>,
 }
 
 /// Look for the statuses of `client`'s session rooms that have no seat and
@@ -1089,6 +1091,9 @@ impl SeatFinder {
                     continue;
                 }
                 Ok(Found::Further(further)) => (true, Some(further)),
+                // An event it could not decrypt may hold the status: the next
+                // look reads the history again from its newest page (R513).
+                Ok(Found::Unreadable) => (true, None),
                 Ok(Found::Failed) | Err(_) => (false, from),
             };
             let made = self.looks.get(&id).map_or(0, |look| look.looks) + 1;
