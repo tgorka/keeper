@@ -39,6 +39,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, sleep_until, Instant};
 
+use crate::claims::Lease;
 use crate::ports::TurnSink;
 use crate::sinks::{RoomGate, NARROWED_STATUS};
 
@@ -184,6 +185,18 @@ pub fn notice_content(text: &str) -> Value {
     json!({ "msgtype": "m.text", "body": text })
 }
 
+/// A plain message from the host about the person's message `about`, as a
+/// reply to it: the room shows which message it speaks of, and a person's
+/// device reads that message as said of rather than not taken (story
+/// 102.4, R465).
+pub fn notice_about(text: &str, about: &EventId) -> Value {
+    json!({
+        "msgtype": "m.text",
+        "body": text,
+        "m.relates_to": { "m.in_reply_to": { "event_id": about } },
+    })
+}
+
 /// Send `content` until the homeserver accepts it, never sooner than
 /// `not_before`, with one transaction id across every attempt: a 429 is
 /// waited out, any other failure backs off. Returns the event and when it
@@ -238,6 +251,36 @@ pub async fn deliver_unless_narrowed(
         event_type,
         Some(gate),
         &|narrowed| build(narrowed).ok_or(()),
+        not_before,
+    )
+    .await
+    .ok()
+    .map(|(event, at, _)| (event, at))
+}
+
+/// Whether `fence` — the claim this host writes the session under — lets
+/// it write now; always without one (before claims).
+fn holds(fence: Option<&Lease>) -> bool {
+    fence.is_none_or(Lease::may_write)
+}
+
+/// [`deliver`] under `fence`, the claim this host writes the session under:
+/// every attempt, a retry too, first asks whether this host still holds it,
+/// and nothing more is sent once it does not — another host serves the
+/// session now (R489). The event and when it was accepted; `None` once the
+/// claim is not held.
+pub async fn deliver_fenced(
+    port: &dyn EditPort,
+    event_type: &str,
+    content: Value,
+    fence: Option<&Lease>,
+    not_before: Instant,
+) -> Option<(OwnedEventId, Instant)> {
+    attempt(
+        port,
+        event_type,
+        None,
+        &|_| holds(fence).then(|| content.clone()).ok_or(()),
         not_before,
     )
     .await
@@ -543,11 +586,16 @@ impl ToolProgress {
 /// an end for an answer that did not land. Every attempt asks the gate:
 /// narrowed below its room, the status keeps `session` and says
 /// [`NARROWED_STATUS`] with no detail (R64), and the suppression is audited
-/// (R65).
+/// (R65). Every attempt asks the fence too — the claim this host writes the
+/// session under — and once it is not held nothing more is sent: the host
+/// that holds it now says what the session does (R489).
 pub struct StatusBoard {
     progress: watch::Sender<Progress>,
     task: Mutex<Option<JoinHandle<Option<OwnedEventId>>>>,
     gate: Option<Arc<RoomGate>>,
+    /// Whether the first `running` was accepted (`Some(true)`) or not sent
+    /// (`Some(false)`); `None` while it is on its way.
+    begun: watch::Receiver<Option<bool>>,
 }
 
 /// A task that is aborted when its holder goes.
@@ -584,14 +632,17 @@ impl StatusBoard {
     /// Start a board for one turn: a `running` status at once, as an edit
     /// of `anchor` — the session's status anchor — or as the anchor itself
     /// when the session has none yet. `base` is the status every edit
-    /// carries, `detail` and `anchor` aside; `gate` is the room's boundary.
+    /// carries, `detail` and `anchor` aside; `gate` is the room's boundary;
+    /// `fence` the claim this host writes the session under.
     pub fn start(
         port: Arc<dyn EditPort>,
         anchor: Option<OwnedEventId>,
         base: StatusContent,
         gate: Option<Arc<RoomGate>>,
+        fence: Option<Arc<Lease>>,
     ) -> StatusBoard {
         let (progress, receiver) = watch::channel(Progress::default());
+        let (begun, begun_receiver) = watch::channel(None);
         let board_gate = gate.clone();
         let task = tokio::spawn(async move {
             let audited = gate.clone();
@@ -604,19 +655,30 @@ impl StatusBoard {
                 status_content(&base, anchor, run, Some(detail), narrowed)
             };
             let detail = receiver.borrow().text.clone();
-            let (sent, started, narrowed) = deliver_gated(
+            let first = attempt(
                 port.as_ref(),
                 STATUS,
                 gate.as_deref(),
-                &|narrowed| status(anchor.as_ref(), RunState::Running, &detail, narrowed),
+                &|narrowed| {
+                    holds(fence.as_deref())
+                        .then(|| status(anchor.as_ref(), RunState::Running, &detail, narrowed))
+                        .ok_or(())
+                },
                 Instant::now(),
             )
             .await;
+            let Ok((sent, started, narrowed)) = first else {
+                let _ = begun.send(Some(false));
+                return None;
+            };
+            let _ = begun.send(Some(true));
             let anchor = anchor.unwrap_or(sent);
             let status = Arc::new(status);
             let running = Arc::clone(&status);
+            let edits_fence = fence.clone();
             let content: EditContent = Arc::new(move |anchor, detail, narrowed| {
-                Some(running(Some(anchor), RunState::Running, detail, narrowed))
+                holds(edits_fence.as_deref())
+                    .then(|| running(Some(anchor), RunState::Running, detail, narrowed))
             });
             let paced = pace(
                 Arc::clone(&port),
@@ -640,20 +702,26 @@ impl StatusBoard {
             }
             // The turn is over: the status says how, with the last counts.
             let end = if done { RunState::Done } else { RunState::Idle };
-            deliver_gated(
+            attempt(
                 port.as_ref(),
                 STATUS,
                 gate.as_deref(),
-                &|narrowed| status(Some(&anchor), end, &detail, narrowed),
+                &|narrowed| {
+                    holds(fence.as_deref())
+                        .then(|| status(Some(&anchor), end, &detail, narrowed))
+                        .ok_or(())
+                },
                 paced.last_send + MIN_EDIT_GAP,
             )
-            .await;
+            .await
+            .ok()?;
             Some(anchor)
         });
         StatusBoard {
             progress,
             task: Mutex::new(Some(task)),
             gate: board_gate,
+            begun: begun_receiver,
         }
     }
 
@@ -665,6 +733,15 @@ impl StatusBoard {
             .send_modify(|now| detail.clone_into(&mut now.text));
     }
 
+    /// Whether the board's first `running` was accepted: `true` once it
+    /// was; `false` when it was not sent — the claim this host writes under
+    /// is not held (R489) — or the board's task is gone. A turn that says
+    /// `running` before its work awaits this first (story 102.4 #3).
+    pub async fn started(&self) -> bool {
+        let mut begun = self.begun.clone();
+        let now = begun.wait_for(Option::is_some).await.map(|now| *now);
+        matches!(now, Ok(Some(true)))
+    }
     /// The turn's progress now.
     pub fn update(&self, progress: ToolProgress) {
         let detail = progress.detail();
@@ -685,6 +762,17 @@ impl StatusBoard {
     /// the turn finished with nothing it waits for — and `idle` otherwise.
     /// The session's status anchor, when there is one.
     pub async fn finish(&self, _delivered: &Delivered, done: bool) -> Option<OwnedEventId> {
+        self.close(done).await
+    }
+
+    /// The turn ended before it had an anchor — stopped while its file was
+    /// taken in, or its opening could not be written: no answer will land,
+    /// so the `running` the board said goes `idle` (story 102.4 #3).
+    pub async fn unbegun(&self) {
+        self.close(false).await;
+    }
+
+    async fn close(&self, done: bool) -> Option<OwnedEventId> {
         self.progress.send_modify(|now| {
             now.finished = true;
             now.done = done;
@@ -818,7 +906,7 @@ mod tests {
     async fn a_status_narrowed_before_any_count_says_so_while_the_turn_runs() {
         let port = FakePort::new(Vec::new());
         let gate = gate(&port);
-        let board = StatusBoard::start(port.clone(), None, base(), Some(Arc::clone(&gate)));
+        let board = StatusBoard::start(port.clone(), None, base(), Some(Arc::clone(&gate)), None);
         sleep(Duration::from_secs(1)).await;
         assert_eq!(statuses(&port).last().expect("running")["title"], "Nixi");
         port.join("@marta:h");
@@ -845,7 +933,7 @@ mod tests {
             retry_after_ms: Some(2000),
         })]);
         let gate = gate(&port);
-        let board = StatusBoard::start(port.clone(), None, base(), Some(gate));
+        let board = StatusBoard::start(port.clone(), None, base(), Some(gate), None);
         sleep(Duration::from_millis(500)).await;
         assert_eq!(port.sent()[0].content["title"], "Nixi");
         port.join("@marta:h");
@@ -1030,7 +1118,7 @@ mod tests {
         script.extend(failing(40));
         let port = FakePort::new(script);
         let sink = MatrixSink::start(port.clone(), anchor(), Instant::now(), None);
-        let board = StatusBoard::start(port.clone(), None, base(), None);
+        let board = StatusBoard::start(port.clone(), None, base(), None, None);
         sink.push("Half an answer");
         let turn = async move {
             let delivered = sink.finish("Half an answer", "").await;
@@ -1059,12 +1147,46 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_dropped_board_stops_its_task() {
         let port = FakePort::new(failing(200));
-        let board = StatusBoard::start(port.clone(), None, base(), None);
+        let board = StatusBoard::start(port.clone(), None, base(), None, None);
         sleep(Duration::from_secs(3)).await;
         assert!(!port.sent().is_empty());
         drop(board);
         let at_drop = port.sent().len();
         sleep(Duration::from_secs(600)).await;
         assert_eq!(port.sent().len(), at_drop);
+    }
+
+    /// R489/02: under a claim this host no longer holds nothing is sent —
+    /// not a board's first `running`, which its `started` says, and not a
+    /// notice — while the same board under a held claim starts.
+    #[tokio::test(start_paused = true)]
+    async fn nothing_is_sent_under_a_claim_no_longer_held() {
+        let claim = OwnedEventId::try_from("$claim:h").expect("event");
+        let lost = Arc::new(Lease::new(
+            1,
+            claim.clone(),
+            0,
+            None,
+            crate::claims::Moment::now(),
+        ));
+        lost.lose();
+        let port = FakePort::new(Vec::new());
+        let board = StatusBoard::start(port.clone(), None, base(), None, Some(Arc::clone(&lost)));
+        assert!(!board.started().await);
+        let notice = deliver_fenced(
+            port.as_ref(),
+            "m.room.message",
+            notice_content("x"),
+            Some(&lost),
+            Instant::now(),
+        )
+        .await;
+        assert!(notice.is_none());
+        assert!(port.sent().is_empty(), "{:?}", port.sent());
+
+        let held = Arc::new(Lease::new(2, claim, 0, None, crate::claims::Moment::now()));
+        let board = StatusBoard::start(port.clone(), None, base(), None, Some(held));
+        assert!(board.started().await);
+        assert_eq!(port.sent().len(), 1);
     }
 }

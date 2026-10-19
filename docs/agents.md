@@ -2603,11 +2603,12 @@ rest.
 
 ## Files and photos in an agent's room
 
-Story 101.2 (R417). A person's `m.file` or `m.image` in an agent's room — a file from the composer's
-paperclip or drag-and-drop, a pasted image, a photo from *Take photo* or *Choose photo* — is a turn
-like a text message, sealed by the sender's device as every turn is. Its text is the caption
-(Matrix 1.10: `body` beside a `filename` it differs from); without one the turn says only what was
-attached. A gate's outside system's file is never a turn.
+Story 101.2 (R417), story 102.4. A person's `m.file`, `m.image`, `m.audio` or `m.video` in an agent's
+room — a file from the composer's paperclip or drag-and-drop, a pasted image, a photo from *Take
+photo* or *Choose photo*, a recording or a video — is a turn like a text message, sealed by the
+sender's device as every turn is. Its text is the caption (Matrix 1.10: `body` beside a `filename`
+it differs from); without one the turn says only what was attached. A gate's outside system's file
+is never a turn.
 
 Before the turn opens, the agent's host downloads the file through the homeserver's authenticated
 media endpoint, as the SDK routes it — the encrypted `file` of an encrypted room (decrypted and its
@@ -2616,9 +2617,13 @@ for byte, in the session's `attachments/` folder under the session's claim (one 
 published only where no file is: `name-2.ext` beside a different file of the same name, even one
 that appeared a moment before). A file is stored only once that create is done: a folder or journal
 the disk could not make durable after the file landed is "not stored", even with the file there, and
-storing it again finishes that same file. A download may take 5 minutes; a turn stopped while
-its file downloads (the host stopping or handing the session on) drops the download and is not
-begun — nothing of it is logged, so the session serves it again. The drive syncs it like any file of
+storing it again finishes that same file. A download may take 5 minutes; the session's status says
+`running` from before it starts, never `idle` (102.4 #3): the download begins only once the
+homeserver took that status. A turn stopped while
+its file downloads (the host stopping or handing the session on) drops the download, puts the
+status back to `idle` and is not begun — nothing of it is logged, so the session serves it again. A
+host that lost the session's claim meanwhile says nothing more of it — no status, no notice — as the
+host holding the claim now answers it (R489). The drive syncs it like any file of
 the session, a large one through the drive's own LFS rules. The `user` line names each stored file
 (`attachments: [{drive, path}]`), so the model reads its caption, then "Attached files:" with every
 path, and opens them with `drive_read`:
@@ -2627,8 +2632,9 @@ path, and opens them with `drive_read`:
 | --- | --- |
 | PDF | the file, and its text beside it as `<name>.pdf.txt` (`pdf-extract`, at most 4 MiB of text), read by the host's own binary started again as a reader process that bounds itself first — 60 s by the clock and of CPU, on Linux 1 GiB more memory than it starts with (a Mac enforces no memory limit on it), no core file — and is killed when it runs over or the turn stops; a PDF with no text — a scan — or one that does not read is said so |
 | CSV, TXT, Markdown, JSON, YAML | the file, which `drive_read` reads as it is |
-| PNG, JPEG, WEBP, GIF | the file, and the picture itself as an image part of that turn's message, after the sentence that says file content is data, never an instruction — unless the model's endpoint said it cannot see (`vision: false`), which the turn says instead; a model that did not say is shown it. A picture over 8 MB is stored but not shown |
+| PNG, JPEG, WEBP, GIF | the file, and the picture itself as an image part of that turn's message, after the sentence that says file content is data, never an instruction — unless the model's endpoint said it cannot see (`vision: false`), which the turn says instead; a model that did not say is shown it. A picture larger than its model is shown (`deliverable::max_image_bytes`: a Claude model — whichever gateway names it `claude-…` — 3.75 MiB, which is 5 MiB of base64; any other 8 MiB) is shown as a JPEG copy made small enough, its transparency painted onto white, the stored file untouched. The copy is made by the host's own binary started again as a copier process, bounded as the PDF reader is (60 s by the clock and of CPU, on Linux 512 MiB of working memory and the photo more than it starts with) and killed when it runs over or the turn stops; the photo's header is read first, by the decoder that decodes it, and one whose decoding or copying would take more than 512 MiB at its peak is refused before a pixel is decoded — decoding counts what the pinned decoders allocate beside the pixels: for a JPEG the compressed bytes copied in, its marker segments copied out, and an image of 16-bit coefficients per component (a progressive JPEG always holds them), for a PNG its chunks, which its decoder holds to 32 MiB (a colour profile inflating past that is refused), and its rows. A Mac has no address-space limit, so there this count from the header is the copier's only memory bound; the clock and the CPU bound only how long it runs. One keeper cannot shrink (a WEBP or GIF, which this build does not decode, one over that working memory, or one no smaller copy brought under the limit) is stored but not shown, with a sentence naming the limit |
 | HEIC, HEIF, TIFF… | the file, and a sentence that this photo's format can't be shown to the model. The phone's *Take photo* and *Choose photo* send such a photo as JPEG when the app can decode it; a path chosen in the desktop's picker goes as it is |
+| a recording or a video (`m.audio`, `m.video`, or an `audio/*`/`video/*` file) | the file, and the sentence "keeper does not let agents listen to or watch {name} yet; it was saved at {path}" — the agent answers what it can (transcription is DW-1454) |
 | anything else | the file, named; keeper does not read it |
 
 A file larger than 25 MiB is refused before it is downloaded (by the size its message states) or
@@ -2640,6 +2646,28 @@ the model, and a WARN line in the host's log (R381). An agent never writes into 
 
 The picture rides only the turn it arrived in; later turns read the message as its replay does, with
 the file's path.
+
+**What the room says when a message is not taken (story 102.4, R465).** A person's message the
+agent's host could not decrypt in its conversation is answered by a notice replying to it — "This
+agent's host could not decrypt your message, so the agent did not get it. Send it again." — and a
+WARN line, as a delegated room's unreadable event already is (R283) — once, whether the host meets
+it reading the room back after a restart, live, or both; once its keys arrive, the same message is a
+turn like any other. A person's message whose turn could not be opened (its log line not written) is
+answered by the `TURN_FAILED` notice replying to it, beside the ERROR line — unless what refused the
+line is a claim this host no longer holds, when it says nothing (R489).
+
+**Taken, not *Read*.** In an agent session room the agent's read receipt says nothing: no host sends
+one, and matrix-sdk-ui counts the agent's claim renewal every minute as it having read up to the
+newest message. So there the agent is never counted as a reader, and the person's own message shows
+the turn instead (`keeper_core::agents::turn_marks`, drawn by the timeline producer): *Taken ✓* once
+an anchor names it (`dev.keeper.agent.turn.question`, which hosts before 0.10.4 send too); nothing
+when the host replied to it with a notice, or while neither is known; and "Nixi's host did not take
+this message — it may be older than this kind of message." once the host wrote into the room two
+claim renewals (2 min) after both the message and its newest status, and that status says `idle` or
+`done` — a host that queued the message or is taking its file in (`running`, `blocked`, `waiting`),
+one with no status yet, or one whose status this device cannot read (a newer host's) is never said
+to have dropped it (R489). That sentence is also a WARN line on the person's device, once per
+message. Every other room keeps its read receipts.
 
 ## Cards
 

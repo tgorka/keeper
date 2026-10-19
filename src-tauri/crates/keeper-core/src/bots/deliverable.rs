@@ -69,6 +69,26 @@ use crate::error::CoreError;
 /// far side may be a local process with a 4 GB model resident.
 pub const MAX_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 
+/// The most bytes of one image a Claude model is shown: Anthropic documents
+/// 5 MB per image, and keeper counts it on the base64 it sends — the
+/// stricter reading, unmeasured through a gateway — so the image itself at
+/// most three quarters of 5 MiB (story 102.4 #4).
+pub const ANTHROPIC_MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024 / 4 * 3;
+
+/// The most bytes of one image `model` is shown: Anthropic's limit for a
+/// Claude model — whichever gateway serves it (an OpenAI-compatible
+/// CLIProxyAPI or OpenRouter names it `claude-…` or `anthropic/claude-…`)
+/// — and [`MAX_IMAGE_BYTES`] for every other. Keyed on the model's name
+/// because no provider kind keeper speaks says who made the model behind it.
+pub fn max_image_bytes(model: &str) -> usize {
+    let name = model.rsplit('/').next().unwrap_or(model);
+    if name.to_ascii_lowercase().starts_with("claude") {
+        ANTHROPIC_MAX_IMAGE_BYTES
+    } else {
+        MAX_IMAGE_BYTES
+    }
+}
+
 /// The most images one message may carry.
 ///
 /// Four, and the reason is the context window rather than the byte count.

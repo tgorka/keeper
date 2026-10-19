@@ -13,6 +13,7 @@ use crate::agents::approval_card::ApprovalVm;
 use crate::agents::gate_room::GateLineVm;
 use crate::agents::heard::HeardMarkVm;
 use crate::agents::room::{AgentRoomHeaderVm, AgentRoomKindVm, BriefVm};
+use crate::agents::turn_marks::TurnMarkVm;
 use crate::bots::{BotHealthState, ProviderKind};
 use crate::notes::export::NoteExportPlan;
 use crate::signals::IncognitoScope;
@@ -1333,7 +1334,7 @@ pub enum TimelineItemVm {
         is_edited: bool,
         /// The quoted-original preview when this message is a reply
         /// (`content.in_reply_to()`), else `null` (Story 3.4, FR-10).
-        reply: Option<ReplyPreviewVm>,
+        reply: Option<Box<ReplyPreviewVm>>,
         /// The aggregated emoji-reaction groups on this message, in the SDK's
         /// per-key insertion order (empty when none) (Story 3.5, FR-12). Each
         /// group carries only `{ emoji, count, is_own }` — never a per-sender
@@ -1370,6 +1371,15 @@ pub enum TimelineItemVm {
         /// (`gate_room::GateView`); else `null`. Boxed as `brief` is; the
         /// binding stays `GateLineVm | null`.
         gate: Option<Box<GateLineVm>>,
+        /// In an agent session room, whether the agent's host took this own
+        /// message (story 102.4, R465) — drawn there in place of a read tick,
+        /// since the agent's receipt rides its claim renewals and says
+        /// nothing of the message; absent while neither is known and in
+        /// every other room. Boxed as `brief` is; the binding stays
+        /// `turn?: TurnMarkVm`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        turn: Option<Box<TurnMarkVm>>,
     },
     /// An event that could not be decrypted yet (`MsgLikeKind::UnableToDecrypt`).
     /// Renders an explicit honest stub instead of a blank row (Story 3.1). Carries
@@ -9462,6 +9472,7 @@ mod tests {
             readers: Vec::new(),
             brief: None,
             gate: None,
+            turn: None,
         };
         let json = serde_json::to_string(&vm).expect("serialize message vm");
         assert!(
@@ -9488,6 +9499,7 @@ mod tests {
             readers: Vec::new(),
             brief: None,
             gate: None,
+            turn: None,
         }
     }
 
@@ -9543,12 +9555,12 @@ mod tests {
             is_own: true,
             send_state: None,
             is_edited: true,
-            reply: Some(ReplyPreviewVm {
+            reply: Some(Box::new(ReplyPreviewVm {
                 in_reply_to_key: Some("unique-orig".to_owned()),
                 sender: "@bob:example.org".to_owned(),
                 sender_display_name: Some("Bob".to_owned()),
                 body: "the original".to_owned(),
-            }),
+            })),
             reactions: vec![
                 ReactionGroupVm {
                     emoji: "👍".to_owned(),
@@ -9565,6 +9577,7 @@ mod tests {
             readers: Vec::new(),
             brief: None,
             gate: None,
+            turn: None,
         };
         let json = serde_json::to_string(&vm).expect("serialize message vm");
         assert!(json.contains("\"isEdited\":true"), "json was: {json}");
@@ -9626,6 +9639,7 @@ mod tests {
             readers: Vec::new(),
             brief: None,
             gate: None,
+            turn: None,
         };
         let json = serde_json::to_string(&vm).expect("serialize");
         assert!(
@@ -9835,6 +9849,7 @@ mod tests {
             readers: Vec::new(),
             brief: None,
             gate: None,
+            turn: None,
         };
         let json = serde_json::to_string(&vm).expect("serialize message vm");
         assert!(json.contains("\"media\":{"), "json was: {json}");
@@ -9881,6 +9896,7 @@ mod tests {
             ],
             brief: None,
             gate: None,
+            turn: None,
         };
         let json = serde_json::to_string(&vm).expect("serialize message vm");
         assert!(

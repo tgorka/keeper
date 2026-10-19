@@ -15,6 +15,8 @@ use matrix_sdk::ruma::serde::Raw;
 use matrix_sdk::ruma::OwnedUserId;
 use serde_json::{json, Value};
 
+pub mod turns;
+
 // ---------------------------------------------------------------------------
 // The homeserver
 // ---------------------------------------------------------------------------

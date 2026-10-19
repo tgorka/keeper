@@ -802,6 +802,7 @@ export type { TimelineItemVm } from "./gen/TimelineItemVm";
 export type { TimelineOp } from "./gen/TimelineOp";
 export type { TokenViaVm } from "./gen/TokenViaVm";
 export type { ToolName } from "./gen/ToolName";
+export type { TurnMarkVm } from "./gen/TurnMarkVm";
 export type { TypingBatch } from "./gen/TypingBatch";
 export type { TypistVm } from "./gen/TypistVm";
 export type { UnifiedPushVm } from "./gen/UnifiedPushVm";

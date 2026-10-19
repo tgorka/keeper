@@ -16,6 +16,12 @@ path = "src/main.rs"
 
 # Lean by rule (S-19): no tauri, no observability sink. `bun run
 # check:agentd-lean` asserts it over `cargo tree`.
+# The desktop host's live test stands in for the app: its own `main`
+# answers the worker roles first, as the shell's does (story 102.4, R490).
+[[test]]
+name = "live_desktop"
+harness = false
+
 [dependencies]
 keeper-agent = { path = "../keeper-agent" }
 keeper-core = { path = "../keeper-core" }
@@ -50,3 +56,5 @@ ulid = { workspace = true }
 # `status` read through the CLI over a real MCP server's answer.
 rmcp = { workspace = true, features = ["server", "transport-streamable-http-server"] }
 axum = { workspace = true }
+# The live attachments test's photo too large for a Claude model (102.4 #4).
+image = { workspace = true }

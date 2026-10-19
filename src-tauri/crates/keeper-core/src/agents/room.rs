@@ -823,6 +823,17 @@ impl AgentRoomState {
         }
     }
 
+    /// What the newest status says of its host's run, with an unreadable one
+    /// its own state — never no status, never idle (story 102.4, R489/06).
+    pub fn host_run(&self) -> crate::agents::turn_marks::HostRun {
+        use crate::agents::turn_marks::HostRun;
+        match &self.status {
+            None => HostRun::NoStatus,
+            Some((at, StatusRead::Read(status))) => HostRun::Read(status.run, *at),
+            Some((_, StatusRead::Unreadable { .. })) => HostRun::Unreadable,
+        }
+    }
+
     /// The session's kind, the agent working it and its title, from the
     /// newest readable status, with that status's time: what an agent room's
     /// row is drawn by (R399) and what [`AgentKinds`] keeps (R416).
@@ -1646,6 +1657,11 @@ pub struct HeaderReader {
     /// Where the person stopped listening to the room's answers (97.3,
     /// UX-DR143), as their own devices marked it.
     marks: RoomMarks,
+    /// The newest origin time (ms) of any event in the room's cache that a
+    /// sender holding an agent's power sent — a claim renewal, a status, a
+    /// message: whether its host wrote after a person's message (story
+    /// 102.4, R465). `None` before one.
+    agent_wrote: Option<u64>,
 }
 
 impl HeaderReader {
@@ -1694,10 +1710,12 @@ impl HeaderReader {
             approvals: ApprovalFold::default(),
             approvals_stale: false,
             marks: RoomMarks::default(),
+            agent_wrote: None,
         };
         if let Ok((cache, _handles)) = reader.room.event_cache().await {
             if let Ok(events) = cache.events().await {
                 for event in &events {
+                    reader.wrote(event.raw());
                     if let Some(value) = header_event(event.raw()) {
                         reader.apply(&value);
                     } else if event_type(event.raw()) == Some(HEARD) {
@@ -1762,6 +1780,30 @@ impl HeaderReader {
         };
         let sealed = sealed_by_sender(event.encryption_info().map(|info| &**info));
         self.marks.apply(&value, self.room.own_user_id(), sealed)
+    }
+
+    /// Note `raw`'s time when an agent of the room sent it; returns whether
+    /// the newest such time moved.
+    fn wrote(&mut self, raw: &Raw<AnySyncTimelineEvent>) -> bool {
+        let (Ok(Some(sender)), Ok(Some(at))) = (
+            raw.get_field::<OwnedUserId>("sender"),
+            raw.get_field::<u64>("origin_server_ts"),
+        ) else {
+            return false;
+        };
+        if !holds_agent_power(self.trust.levels.as_ref(), &sender)
+            || self.agent_wrote.is_some_and(|newest| newest >= at)
+        {
+            return false;
+        }
+        self.agent_wrote = Some(at);
+        true
+    }
+
+    /// The newest time an agent of the room wrote into it, as the cache
+    /// showed it ([`Self::wrote`]).
+    pub fn agent_wrote(&self) -> Option<u64> {
+        self.agent_wrote
     }
 
     fn apply(&mut self, event: &Value) -> bool {
@@ -1853,6 +1895,9 @@ impl HeaderReader {
                 _ => Vec::new(),
             };
             for event in events {
+                // Whether its host still writes: what a person's message no
+                // anchor answers is read against (R465). Not a header change.
+                self.wrote(event.raw());
                 match event_type(event.raw()) {
                     Some(STATUS | SCOPE) => {
                         if let Ok(value) = event.raw().deserialize_as::<Value>() {
@@ -2540,6 +2585,22 @@ mod tests {
             &agents
         ));
         assert_eq!(status_of(&state).run, AgentRunVm::Idle);
+    }
+
+    /// R489/06: a status this device cannot read — a newer host's — leaves
+    /// the host's run unknown: not the readable status before it, not none,
+    /// and never idle.
+    #[test]
+    fn an_unreadable_status_leaves_the_hosts_run_unknown() {
+        use crate::agents::turn_marks::HostRun;
+        let mut state = AgentRoomState::new(own());
+        assert_eq!(state.host_run(), HostRun::NoStatus);
+        assert!(state.apply(&status("$a", 10, content("idle", "electra", None)), &agents));
+        assert_eq!(state.host_run(), HostRun::Read(RunState::Idle, 10));
+        let mut newer = content("idle", "electra", Some("$a"));
+        newer["v"] = json!(u64::from(CONTENT_VERSION) + 1);
+        assert!(state.apply(&status("$b", 20, newer), &agents));
+        assert_eq!(state.host_run(), HostRun::Unreadable);
     }
 
     #[test]

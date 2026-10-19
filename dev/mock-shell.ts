@@ -6943,7 +6943,11 @@ const AGENT_ROOM_TIMELINES: Record<
   "!nixi-dm:example.org": {
     header: nixiHeader("running", "nixi-answer"),
     items: [
-      textItem("nixi-q", PERSON, "harness", "What did I write about Synapse limits?", 2),
+      // Story 102.4 (R465): Rust marks the person's message its anchor answers.
+      {
+        ...textItem("nixi-q", PERSON, "harness", "What did I write about Synapse limits?", 2),
+        turn: { state: "taken" },
+      },
       textItem("nixi-answer", NIXI, "Nixi", "…", 1),
     ],
   },
@@ -6971,7 +6975,10 @@ const AGENT_ROOM_TIMELINES: Record<
     },
     items: [
       textItem("reading-1", NIXI, "Nixi", "Three left.", 40),
-      textItem("reading-q", PERSON, "harness", "What's left on my reading list?", 6),
+      {
+        ...textItem("reading-q", PERSON, "harness", "What's left on my reading list?", 6),
+        turn: { state: "taken" },
+      },
       textItem(
         "reading-answer",
         NIXI,
@@ -6979,6 +6986,16 @@ const AGENT_ROOM_TIMELINES: Record<
         "There are three left on your 📚 list. Kleppmann's chapter on replication is the longest, about forty pages. The Synapse admin guide is next; you started it in March. Last is the essay on CRDTs you saved twice.",
         5,
       ),
+      // Story 102.4 (R465): a message no anchor answered while the host kept
+      // renewing its claim — an older host that drops this kind of message.
+      {
+        ...textItem("reading-photo", PERSON, "harness", "What is on this screenshot?", 3),
+        turn: {
+          state: "notTaken",
+          sentence:
+            "Nixi's host did not take this message — it may be older than this kind of message.",
+        },
+      },
     ],
     heard: [{ key: "reading-answer", splitUtf16: 107 }],
   },

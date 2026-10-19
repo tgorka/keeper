@@ -20,7 +20,7 @@
 //! material, event raw JSON, or crypto state cross IPC; `tracing` logs carry the
 //! opaque room id only — never a message body.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -51,6 +51,7 @@ use crate::agents::heard::{split_utf16, HeardMarkVm, RoomMarks};
 use crate::agents::room::{
     self, AgentIcons, AgentKinds, AgentRoomHeaderVm, AgentRoomKind, HeaderReader, TurnTrust,
 };
+use crate::agents::turn_marks::{turn_marks, HostWrites, MarkInput, TurnMarkVm};
 use crate::error::TimelineError;
 use crate::media::{self, MediaVariant};
 use crate::vm::{
@@ -371,6 +372,21 @@ fn readers_of<'a>(
         .collect()
 }
 
+/// [`readers_of`] in the room `turns` reads: in an agent session room
+/// without anyone holding an agent's power there — its receipt rides its
+/// claim renewals and says nothing of the message (story 102.4, R465).
+fn readers_here<'a>(
+    receipt_users: impl Iterator<Item = &'a OwnedUserId>,
+    own_user_id: &UserId,
+    turns: TurnTrust<'_>,
+) -> Vec<String> {
+    let session = turns.kind == Some(AgentRoomKind::Session);
+    readers_of(
+        receipt_users.filter(|user| !session || !turns.is_agent(user)),
+        own_user_id,
+    )
+}
+
 /// Map one SDK [`TimelineItem`] to exactly one [`TimelineItemVm`], resolving a
 /// reply's quoted-original key through the producer's `event_id → unique_id`
 /// `index` and aggregating reactions against the account's own `own_user_id`.
@@ -440,16 +456,19 @@ pub fn item_to_vm(
                 is_own: ev.is_own(),
                 send_state: ev.send_state().map(map_send_state),
                 is_edited,
-                reply: reply_preview(ev.content(), index),
+                reply: reply_preview(ev.content(), index).map(Box::new),
                 reactions: reaction_groups(ev.content(), own_user_id),
                 media: media.map(Box::new),
-                readers: readers_of(ev.read_receipts().keys(), own_user_id),
+                readers: readers_here(ev.read_receipts().keys(), own_user_id, turns),
                 brief: turns
                     .brief(own_user_id, ev.sender(), json, message.is_edited())
                     .map(Box::new),
                 gate: gate_input(item)
                     .and_then(|message| turns.gate_line(own_user_id, message))
                     .map(Box::new),
+                // Drawn by the session room's header fold over the loaded
+                // items ([`AgentHeader::mark`]), never by one item alone.
+                turn: None,
             }
         }
         // An event that cannot be decrypted yet: surface an honest stub. No
@@ -695,6 +714,13 @@ struct AgentHeader {
     /// In a gate room, what its loaded timeline says of each request
     /// (UX-DR147); `None` in any other session room.
     gate: Option<GateView>,
+    /// Whether the agent's host took each own loaded message, by render key
+    /// (story 102.4, R465): drawn on every message op the producer sends.
+    turn_marks: HashMap<String, TurnMarkVm>,
+    /// The messages already logged as not taken, so each is one WARN line.
+    warned: HashSet<String>,
+    /// The room, for those lines.
+    room_id: OwnedRoomId,
 }
 
 /// What redraws the approval cards without an event in the room: this
@@ -884,6 +910,7 @@ impl AgentHeader {
         let before = self.reader.refresh(&self.icons).await;
         let mut positions = self.rebriefed(before.turns());
         positions.extend(self.regate());
+        positions.extend(self.remark());
         positions.sort_unstable();
         positions.dedup();
         positions
@@ -934,6 +961,95 @@ impl AgentHeader {
             })
             .collect()
     }
+
+    /// Read again whether the agent's host took each own loaded message
+    /// (R465), against what the reader last read of its writes and its
+    /// status; the positions of the loaded messages drawn differently now.
+    /// A message newly not taken — said under it where the person looks —
+    /// is a WARN line too, once (R381).
+    fn remark(&mut self) -> Vec<usize> {
+        let marks = {
+            let turns = self.turns();
+            let inputs: Vec<MarkInput<'_>> = self
+                .loaded
+                .iter()
+                .filter_map(|item| mark_input(item, turns))
+                .collect();
+            let agent = self
+                .sent
+                .as_ref()
+                .and_then(|header| header.status.as_ref())
+                .map_or("This agent", |status| status.agent_name.as_str());
+            let host = HostWrites {
+                last_write: self.reader.agent_wrote(),
+                run: self.reader.state().host_run(),
+            };
+            turn_marks(&inputs, host, agent)
+        };
+        for (key, mark) in &marks {
+            if matches!(mark, TurnMarkVm::NotTaken { .. }) && self.warned.insert(key.clone()) {
+                tracing::warn!(room_id = %self.room_id, "agent room: the agent's host did not take a message the person sent");
+            }
+        }
+        let positions = self
+            .loaded
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| {
+                let key = item.unique_id().0.as_str();
+                marks.get(key) != self.turn_marks.get(key)
+            })
+            .map(|(at, _)| at)
+            .collect();
+        self.turn_marks = marks;
+        positions
+    }
+
+    /// Draw the turn marks on every message `ops` carry.
+    fn mark(&self, ops: &mut [TimelineOp]) {
+        let mut draw = |item: &mut TimelineItemVm| {
+            if let TimelineItemVm::Message { key, turn, .. } = item {
+                *turn = self.turn_marks.get(key.as_str()).cloned().map(Box::new);
+            }
+        };
+        for op in ops {
+            match op {
+                TimelineOp::Append { items } | TimelineOp::Reset { items } => {
+                    items.iter_mut().for_each(&mut draw);
+                }
+                TimelineOp::PushFront { item }
+                | TimelineOp::PushBack { item }
+                | TimelineOp::Insert { item, .. }
+                | TimelineOp::Set { item, .. } => draw(item),
+                TimelineOp::Clear
+                | TimelineOp::PopFront
+                | TimelineOp::PopBack
+                | TimelineOp::Remove { .. }
+                | TimelineOp::Truncate { .. } => {}
+            }
+        }
+    }
+}
+
+/// A loaded message as [`turn_marks`] reads it: its key, event id, whether
+/// it is own, its time, whether its sender holds an agent's power and its
+/// original event; `None` for any other item.
+fn mark_input<'a>(item: &'a TimelineItem, turns: TurnTrust<'_>) -> Option<MarkInput<'a>> {
+    let ev = item.as_event()?;
+    let TimelineItemContent::MsgLike(msg_like) = ev.content() else {
+        return None;
+    };
+    let MsgLikeKind::Message(_) = &msg_like.kind else {
+        return None;
+    };
+    Some(MarkInput {
+        key: item.unique_id().0.as_str(),
+        event: ev.event_id().map(EventId::as_str),
+        own: ev.is_own(),
+        ts: u64::from(ev.timestamp().0),
+        agent: turns.is_agent(ev.sender()),
+        json: ev.original_json().map(|raw| raw.json().get()),
+    })
 }
 
 /// A loaded item as [`room::rebriefed`] reads it: a message's sender, its
@@ -1163,6 +1279,9 @@ pub async fn forward_timeline(
                 cross_signed: room::own_device_cross_signed(&room.client()).await,
                 hosted,
                 gate: None,
+                turn_marks: HashMap::new(),
+                warned: HashSet::new(),
+                room_id: room_id.clone(),
             };
             header.regate();
             (
@@ -1188,17 +1307,21 @@ pub async fn forward_timeline(
     let turns = header
         .as_ref()
         .map_or_else(TurnTrust::default, AgentHeader::turns);
-    let reset = TimelineOp::Reset {
+    let mut reset = vec![TimelineOp::Reset {
         items: initial
             .iter()
             .map(|i| item_to_vm(i, &index, &own_user_id, &account_id, &room_id_str, turns))
             .collect(),
-    };
+    }];
     let (first_header, first_approvals, first_heard) = match &mut header {
         Some(header) => {
             header.see(&initial.iter().collect::<Vec<_>>(), true);
+            let changed = header.changed().await;
+            // The agent's name for a message not taken is the header's.
+            header.remark();
+            header.mark(&mut reset);
             (
-                header.changed().await,
+                changed,
                 header.approvals_changed().await,
                 header.heard_changed(),
             )
@@ -1206,7 +1329,7 @@ pub async fn forward_timeline(
         None => (None, None, None),
     };
     if !sink(TimelineBatch {
-        ops: vec![reset],
+        ops: reset,
         header: first_header,
         approvals: first_approvals,
         heard: first_heard,
@@ -1223,7 +1346,7 @@ pub async fn forward_timeline(
         // What a branch sends: the briefs drawn again, then its own ops,
         // and the header and the approval cards when they changed; an empty
         // batch is not sent.
-        let batch = tokio::select! {
+        let mut batch = tokio::select! {
             diffs = stream.next() => {
                 let Some(diffs) = diffs else {
                     break;
@@ -1257,8 +1380,14 @@ pub async fn forward_timeline(
                         turns,
                     ))
                 }));
-                if let Some(header) = &header {
-                    ops.extend(header.redraw(regated, &index, &account_id, &room_id_str));
+                if let Some(header) = &mut header {
+                    // Whether the host took a person's message may change
+                    // with these items: its anchor, its notice (R465).
+                    let mut positions = regated;
+                    positions.extend(header.remark());
+                    positions.sort_unstable();
+                    positions.dedup();
+                    ops.extend(header.redraw(positions, &index, &account_id, &room_id_str));
                 }
                 let (changed, heard) = match &mut header {
                     Some(header) => (header.changed().await, header.heard_changed()),
@@ -1294,11 +1423,14 @@ pub async fn forward_timeline(
                         false
                     }
                 };
-                if folded {
-                    // A status may say only now that this is a gate's room.
-                    let positions = header.regate();
-                    ops.extend(header.redraw(positions, &index, &account_id, &room_id_str));
-                }
+                // A status may say only now that this is a gate's room; a
+                // host's renewal or status moves whether a person's message
+                // reads as not taken (R465).
+                let mut positions = if folded { header.regate() } else { Vec::new() };
+                positions.extend(header.remark());
+                positions.sort_unstable();
+                positions.dedup();
+                ops.extend(header.redraw(positions, &index, &account_id, &room_id_str));
                 let changed = if folded { header.changed().await } else { None };
                 let approvals = if folded {
                     header.approvals_changed().await
@@ -1357,6 +1489,10 @@ pub async fn forward_timeline(
                 }
             }
         };
+        // Every message an op carries is drawn with its turn mark (R465).
+        if let Some(header) = &header {
+            header.mark(&mut batch.ops);
+        }
         if batch.ops.is_empty()
             && batch.header.is_none()
             && batch.approvals.is_none()
@@ -1498,6 +1634,7 @@ mod tests {
             readers: Vec::new(),
             brief: None,
             gate: None,
+            turn: None,
         }
     }
 
@@ -1791,6 +1928,45 @@ mod tests {
         let own = user_id!("@alice:example.org");
         let keys = [owned_user_id!("@alice:example.org")];
         assert!(readers_of(keys.iter(), own).is_empty());
+    }
+
+    /// Story 102.4, R465: in an agent session room the agent — whoever
+    /// holds an agent's power — is never a reader, so its claim renewals
+    /// draw no read tick; another person still is, and every other room
+    /// keeps the agent's receipt as any member's.
+    #[test]
+    fn an_agent_is_no_reader_in_its_session_room() {
+        use matrix_sdk::ruma::{owned_user_id, user_id};
+        let levels = crate::agents::room::power_levels_for(&[
+            ("@nixi:example.org", 50),
+            ("@tgorka:example.org", 100),
+        ]);
+        let own = user_id!("@tgorka:example.org");
+        let keys = [
+            owned_user_id!("@nixi:example.org"),
+            owned_user_id!("@marta:example.org"),
+        ];
+        let session = TurnTrust {
+            kind: Some(AgentRoomKind::Session),
+            levels: Some(&levels),
+            ..TurnTrust::default()
+        };
+        assert_eq!(
+            readers_here(keys.iter(), own, session),
+            ["@marta:example.org"]
+        );
+        let control = TurnTrust {
+            kind: Some(AgentRoomKind::Control),
+            ..session
+        };
+        assert_eq!(
+            readers_here(keys.iter(), own, control),
+            ["@nixi:example.org", "@marta:example.org"]
+        );
+        assert_eq!(
+            readers_here(keys.iter(), own, TurnTrust::default()).len(),
+            2
+        );
     }
 
     #[test]

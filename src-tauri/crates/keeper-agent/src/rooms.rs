@@ -428,6 +428,12 @@ pub enum Arrival {
     /// Paseo run, so none told after it is taken before the room is read
     /// back past it (R283, R293).
     Unreadable,
+    /// A message in the served room itself that this copy could not
+    /// decrypt — the SDK hands it on still `m.room.encrypted`, its sender
+    /// in the clear (story 102.4 #3): never a turn, since its words are
+    /// unknown; from the proxy's person in its conversation, a notice asks
+    /// them to send it again.
+    Undecrypted,
     /// Another agent's question for this proxy's person (R99): an
     /// `m.room.message` carrying `dev.keeper.agent.ask`, routed here by the
     /// host from the room it was asked in once [`admit_ask`] admitted it.
@@ -489,6 +495,9 @@ pub enum Disposition {
     /// A gate's outside system asked something (99.1 #2): data for the
     /// gate's turn, never a person's word.
     GateRequest,
+    /// The proxy's person wrote in its conversation and this copy could
+    /// not decrypt it: a notice says so, nothing is logged (story 102.4 #3).
+    Undecrypted,
     /// Neither: not logged, not a turn. The sentence is the host's own note.
     Ignored(&'static str),
 }
@@ -547,6 +556,10 @@ pub const ONLY_REQUESTS: &str =
     "an outside system's event in its gate's room is a request or nothing";
 /// A message in a gate's room from anyone but its outside system.
 pub const NOT_THE_PEER: &str = "only the gate's outside system asks in its room";
+/// A message this copy could not decrypt from anyone but the proxy's person
+/// in its conversation.
+pub const UNDECRYPTED_ELSEWHERE: &str =
+    "a message this host could not decrypt is said only to the proxy's person, in its conversation";
 
 /// Whether `sender`'s arrival becomes a turn, a decision, a scope, a new
 /// conversation, or nothing (AD-380, R30). Text becomes a turn only in a
@@ -661,6 +674,13 @@ pub fn classify(served: &Served<'_>, sender: &UserId, arrival: Arrival) -> Dispo
                 Disposition::Turn
             } else {
                 Disposition::Ignored(NOT_THE_PERSON)
+            }
+        }
+        Arrival::Undecrypted => {
+            if conversation && served.human == Some(sender) {
+                Disposition::Undecrypted
+            } else {
+                Disposition::Ignored(UNDECRYPTED_ELSEWHERE)
             }
         }
     }
@@ -1132,6 +1152,41 @@ mod tests {
         assert_eq!(
             classify(&delegated, &user(MARTA), Arrival::Decision { sealed: true }),
             Disposition::Ignored(UNTRUSTED_DECISION)
+        );
+    }
+
+    /// Story 102.4 #3: the proxy's person's message this host could not
+    /// decrypt, in its conversation, is said to them — never a turn and
+    /// never the delegation path an unreadable event of a delegated room
+    /// takes (R283); anyone else's, or one outside a conversation, is
+    /// nothing.
+    #[test]
+    fn a_persons_undecrypted_message_is_said_only_in_their_conversation() {
+        let tgorka = user(TGORKA);
+        let nixi = user("@nixi:example.org");
+        let room = readers(&[TGORKA]);
+        for kind in [SessionKind::Main, SessionKind::Conversation] {
+            let conversation = served(AgentKind::Proxy, Some(&tgorka), kind, &nixi, &room);
+            assert_eq!(
+                classify(&conversation, &tgorka, Arrival::Undecrypted),
+                Disposition::Undecrypted,
+                "{kind:?}"
+            );
+            assert_eq!(
+                classify(&conversation, &user(MARTA), Arrival::Undecrypted),
+                Disposition::Ignored(UNDECRYPTED_ELSEWHERE)
+            );
+        }
+        let scheduled = served(
+            AgentKind::Proxy,
+            Some(&tgorka),
+            SessionKind::Scheduled,
+            &nixi,
+            &room,
+        );
+        assert_eq!(
+            classify(&scheduled, &tgorka, Arrival::Undecrypted),
+            Disposition::Ignored(UNDECRYPTED_ELSEWHERE)
         );
     }
 

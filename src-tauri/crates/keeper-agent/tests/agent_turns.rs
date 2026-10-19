@@ -135,6 +135,8 @@ struct Room {
     /// every ask send's transaction.
     ask_errors: Mutex<Vec<keeper_core::agents::matrix::AgentMatrixError>>,
     ask_txns: Mutex<Vec<String>>,
+    /// Its next status send waits until this is notified.
+    held_status: Mutex<Option<Arc<tokio::sync::Notify>>>,
 }
 
 impl Room {
@@ -166,6 +168,12 @@ impl EditPort for Room {
                 let mut errors = self.ask_errors.lock().expect("lock");
                 if !errors.is_empty() {
                     return Err(errors.remove(0));
+                }
+            }
+            if event_type == keeper_core::agents::events::STATUS {
+                let held = self.held_status.lock().expect("lock").take();
+                if let Some(held) = held {
+                    held.notified().await;
                 }
             }
             if let Some(stop) = self.stop.lock().expect("lock").take() {
@@ -786,35 +794,40 @@ impl World {
     }
 }
 
-/// This host's bounds on a person's file, its PDF reader this test binary
-/// answering as [`pdf_reader_child`].
+/// This host's bounds on a person's file, its PDF reader and photo copier
+/// this test binary answering as [`worker_child`].
 fn pdf_reading() -> keeper_agent::attachments::Bounds {
-    use keeper_agent::attachments::{self, Bounds, PdfReader};
+    use keeper_agent::attachments::{self, Bounds, Worker};
+    let args = ["worker_child", "--exact", "--nocapture"]
+        .map(std::ffi::OsString::from)
+        .to_vec();
     Bounds {
         download_within: attachments::DOWNLOAD_WITHIN,
-        pdf: Some(Arc::new(PdfReader {
-            program: std::env::current_exe().expect("this test binary"),
-            args: ["pdf_reader_child", "--exact", "--nocapture"]
-                .map(std::ffi::OsString::from)
-                .to_vec(),
-            ..PdfReader::this_binary().expect("this test binary")
+        pdf: Some(Arc::new(Worker {
+            args: args.clone(),
+            ..Worker::pdf_reader().expect("this test binary")
+        })),
+        images: Some(Arc::new(Worker {
+            args,
+            ..Worker::image_copier().expect("this test binary")
         })),
     }
 }
 
-/// The PDF reader, when this binary was started as one by [`pdf_reading`]'s
-/// reader: what the hosts answer first, then the process ends.
+/// A worker, when this binary was started as one by [`pdf_reading`]'s
+/// reader or copier: what the hosts answer first, then the process ends.
 #[test]
-fn pdf_reader_child() {
+fn worker_child() {
+    use keeper_agent::attachments::{IMAGE_COPIER_ARG, PDF_READER_ARG};
     let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
     let Some(at) = args
         .iter()
-        .position(|arg| arg == keeper_agent::attachments::PDF_READER_ARG)
+        .position(|arg| arg == PDF_READER_ARG || arg == IMAGE_COPIER_ARG)
     else {
         return;
     };
-    let code = keeper_agent::attachments::served_as_pdf_reader(args[at..].iter().cloned())
-        .expect("a PDF reader's arguments");
+    let code = keeper_agent::attachments::served_as_worker(args[at..].iter().cloned())
+        .expect("a worker's arguments");
     std::process::exit(code);
 }
 
@@ -4089,6 +4102,9 @@ struct Delegations {
     kinds: Mutex<Vec<SessionKind>>,
     /// Every room read back for Paseo run ends, in order.
     completion_reads: Mutex<Vec<OwnedRoomId>>,
+    /// How many downloads began, and what happens as the next one begins.
+    downloads: std::sync::atomic::AtomicUsize,
+    on_download: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl Delegations {
@@ -4547,6 +4563,11 @@ impl DelegationPort for Delegations {
                 .or(file["url"].as_str())
                 .and_then(|url| url.strip_prefix("mxc://example.org/"))
                 .and_then(|at| at.parse::<usize>().ok());
+            self.downloads.fetch_add(1, Ordering::SeqCst);
+            let hook = self.on_download.lock().expect("lock").take();
+            if let Some(hook) = hook {
+                hook();
+            }
             if at == Some(STALLED) {
                 // A media server that opened the response and sends nothing.
                 std::future::pending::<()>().await;
@@ -31776,8 +31797,10 @@ async fn a_download_that_never_ends_is_given_up_and_the_turn_runs() {
 }
 
 /// R444/02: a turn stopped while its file downloads drops the download and
-/// is not begun: no `user` line, nothing asked of the model, nothing sent
-/// into the room — the arrival is served again where the session goes on.
+/// is not begun: no `user` line, nothing asked of the model, no message in
+/// the room — the arrival is served again where the session goes on. The
+/// status said `running` from before the download (story 102.4 #3) and
+/// goes back to `idle`.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_turn_stopped_while_its_file_downloads_is_not_begun() {
     let mut world = world(ProviderKind::OpenAi, &["drive_read"], vec![prose("ok.")]);
@@ -31809,7 +31832,25 @@ async fn a_turn_stopped_while_its_file_downloads_is_not_begun() {
         "{served_it:?}"
     );
     assert!(world.stub.requests().is_empty());
-    assert!(world.room.sent().is_empty(), "nothing goes into the room");
+    let sent = world.room.sent();
+    assert!(
+        sent.iter()
+            .all(|(kind, _)| kind == keeper_core::agents::events::STATUS),
+        "only the status goes into the room: {sent:?}"
+    );
+    let runs: Vec<Value> = sent
+        .iter()
+        .map(|(_, content)| {
+            let status = if content["m.new_content"].is_object() {
+                &content["m.new_content"]
+            } else {
+                content
+            };
+            status["run"].clone()
+        })
+        .collect();
+    assert_eq!(runs.first(), Some(&json!("running")), "{runs:?}");
+    assert_eq!(runs.last(), Some(&json!("idle")), "{runs:?}");
     assert!(!world
         .lines(SESSION)
         .iter()
@@ -31867,4 +31908,321 @@ async fn a_heic_photo_is_stored_and_said_not_to_be_shown() {
     );
     let request = world.stub.requests().last().cloned().expect("a request");
     assert!(!request.to_string().contains("image_url"), "{request}");
+}
+
+/// Story 102.4 #1 (R381; DW-1454 narrowed): a person's recording, as the
+/// composer sends it — `m.audio`, its words the caption — is a turn: stored
+/// as sent, and the person and the model read that no agent listens to it
+/// yet and where it was saved; the log has a WARN; the agent answers.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_persons_recording_is_stored_and_said_not_to_be_heard() {
+    let mut world = world(ProviderKind::OpenAi, &["drive_read"], vec![prose("ok.")]);
+    let rooms = Delegations::over(known(&[TGORKA, MARTA]));
+    let memo = b"\0\0\0\x20ftypM4A memo".to_vec();
+    rooms.uploads.lock().expect("lock").push(memo.clone());
+    let mut served = world.delegating(&rooms);
+    let captured = Captured::default();
+    let _guard = capture_warnings(&captured);
+    let sent = file_message(
+        &mut world,
+        "m.audio",
+        "memo.m4a",
+        "audio/mp4",
+        "what do I say here?",
+        0,
+        memo.len(),
+    );
+    report(world.serve(&mut served, sent).await);
+    let said = keeper_agent::attachments::not_heard(
+        "memo.m4a",
+        &format!("60-sessions/{SESSION}/attachments/memo.m4a"),
+    );
+    told_everywhere(&world, &captured, &said);
+    assert_eq!(
+        std::fs::read(world.dir(SESSION).join("attachments/memo.m4a")).expect("stored"),
+        memo
+    );
+    let told = last_user_text(world.stub.requests().last().expect("a request"));
+    assert!(told.starts_with("what do I say here?"), "{told}");
+}
+
+/// Story 102.4 #3 (R381, R283's twin in a session room): the person's
+/// message this host could not decrypt is never a turn — nothing logged,
+/// no model asked — and never left unsaid: a notice replying to it asks
+/// them to send it again, and the log has a WARN.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_persons_undecrypted_message_is_answered_with_a_notice() {
+    let mut world = world(ProviderKind::OpenAi, &["drive_read"], vec![prose("ok.")]);
+    let rooms = Delegations::over(known(&[TGORKA, MARTA]));
+    let mut served = world.delegating(&rooms);
+    let captured = Captured::default();
+    let _guard = capture_warnings(&captured);
+    let arrived = world.event(TGORKA, Arrival::Undecrypted, Value::Null);
+    let about = arrived.event_id.to_string();
+    let outcome = world.serve(&mut served, arrived).await;
+    assert!(matches!(outcome, Outcome::Undecrypted), "{outcome:?}");
+    let notices: Vec<Value> = world
+        .sent_of("m.room.message")
+        .into_iter()
+        .filter(|content| content["body"] == keeper_agent::agent::UNDECRYPTED)
+        .collect();
+    assert_eq!(notices.len(), 1, "{:?}", world.room.sent());
+    assert_eq!(
+        notices[0]["m.relates_to"]["m.in_reply_to"]["event_id"],
+        json!(about)
+    );
+    assert!(world.stub.requests().is_empty());
+    assert!(!world
+        .lines(SESSION)
+        .iter()
+        .any(|line| matches!(line.body, LineBody::User(_))));
+    assert!(warned(&captured, "could not be decrypted"));
+}
+
+/// The `run` of every status sent into `room`, in order: an edit's new
+/// content, or the status itself.
+fn status_runs(room: &Room) -> Vec<Value> {
+    room.sent()
+        .iter()
+        .filter(|(kind, _)| kind == keeper_core::agents::events::STATUS)
+        .map(|(_, content)| {
+            let status = if content["m.new_content"].is_object() {
+                &content["m.new_content"]
+            } else {
+                content
+            };
+            status["run"].clone()
+        })
+        .collect()
+}
+
+/// Story 102.4 #3, R489/03: a person's file is downloaded only once the
+/// homeserver took the `running` status said for it: while that send is
+/// held, the file is not asked for.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_files_download_waits_for_its_running_status() {
+    let mut world = world(ProviderKind::OpenAi, &["drive_read"], vec![prose("ok.")]);
+    let rooms = Delegations::over(known(&[TGORKA, MARTA]));
+    let csv = b"a,b\n1,2\n".to_vec();
+    rooms.uploads.lock().expect("lock").push(csv.clone());
+    let mut served = world.delegating(&rooms);
+    let held = Arc::new(tokio::sync::Notify::new());
+    *world.room.held_status.lock().expect("lock") = Some(Arc::clone(&held));
+    let sent = file_message(
+        &mut world,
+        "m.file",
+        "t.csv",
+        "text/csv",
+        "sum it",
+        0,
+        csv.len(),
+    );
+    let release = async {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let entered = rooms.downloads.load(Ordering::SeqCst);
+        held.notify_one();
+        entered
+    };
+    let (outcome, entered) = tokio::join!(world.serve(&mut served, sent), release);
+    report(outcome);
+    assert_eq!(entered, 0, "the download began before `running` was taken");
+    assert_eq!(rooms.downloads.load(Ordering::SeqCst), 1);
+    assert_eq!(status_runs(&world.room).first(), Some(&json!("running")));
+}
+
+/// R489/02 (DW-1542): a host that loses the session's claim while a
+/// person's file downloads — another host serves the session now — sends
+/// nothing more of that message: no failure notice, no status after its
+/// `running`, no anchor, no model asked. The host holding the claim answers
+/// it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_claim_lost_while_a_file_downloads_leaves_the_message_to_its_holder() {
+    let mut world = world(ProviderKind::OpenAi, &["drive_read"], vec![prose("ok.")]);
+    let rooms = Delegations::over(known(&[TGORKA, MARTA]));
+    let csv = b"a,b\n1,2\n".to_vec();
+    rooms.uploads.lock().expect("lock").push(csv.clone());
+    let electra = lease(1, "$e1:example.org");
+    let losing = Arc::clone(&electra);
+    *rooms.on_download.lock().expect("lock") = Some(Box::new(move || losing.lose()));
+    let mut old = world.open_under(SESSION, Some(electra)).expect("served");
+    old.delegations = Some(rooms.clone() as Arc<dyn DelegationPort>);
+    let sent = file_message(
+        &mut world,
+        "m.file",
+        "t.csv",
+        "text/csv",
+        "sum it",
+        0,
+        csv.len(),
+    );
+    let (_handle, signal) = chat::cancellation();
+    let outcome = old
+        .serve(&world.deps, world.room.clone(), sent.clone(), signal)
+        .await;
+    assert!(
+        matches!(outcome, Err(keeper_agent::agent::ServeError::Stopped)),
+        "{outcome:?}"
+    );
+    let said = world.room.sent();
+    assert_eq!(said.len(), 1, "only the `running` it said first: {said:?}");
+    assert_eq!(status_runs(&world.room), [json!("running")]);
+    assert!(world.stub.requests().is_empty());
+
+    let mut taker = world
+        .open_under(SESSION, Some(lease(2, "$h2:example.org")))
+        .expect("taker");
+    taker.delegations = Some(rooms.clone() as Arc<dyn DelegationPort>);
+    report(world.serve(&mut taker, sent).await);
+    assert!(
+        world
+            .sent_of("m.room.message")
+            .iter()
+            .all(|message| message["body"] != TURN_FAILED),
+        "{:?}",
+        world.room.sent()
+    );
+    assert_eq!(world.stub.requests().len(), 1);
+}
+
+/// R512 (review `102attachments-2` 02): a host whose claim is taken over
+/// after its file's `running` status was let through the fence, while that
+/// send is still on its way, does not download the file once the send is
+/// taken: nothing more is said of the message, and no model is asked.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_claim_lost_while_the_running_status_is_sent_downloads_nothing() {
+    let mut world = world(ProviderKind::OpenAi, &["drive_read"], vec![prose("ok.")]);
+    let rooms = Delegations::over(known(&[TGORKA, MARTA]));
+    let csv = b"a,b\n1,2\n".to_vec();
+    rooms.uploads.lock().expect("lock").push(csv.clone());
+    let electra = lease(1, "$e1:example.org");
+    let mut old = world
+        .open_under(SESSION, Some(Arc::clone(&electra)))
+        .expect("served");
+    old.delegations = Some(rooms.clone() as Arc<dyn DelegationPort>);
+    let held = Arc::new(tokio::sync::Notify::new());
+    *world.room.held_status.lock().expect("lock") = Some(Arc::clone(&held));
+    let sent = file_message(
+        &mut world,
+        "m.file",
+        "t.csv",
+        "text/csv",
+        "sum it",
+        0,
+        csv.len(),
+    );
+    let (_handle, signal) = chat::cancellation();
+    let taken_over = async {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        electra.lose();
+        held.notify_one();
+    };
+    let (outcome, ()) = tokio::join!(
+        old.serve(&world.deps, world.room.clone(), sent, signal),
+        taken_over
+    );
+    assert!(
+        matches!(outcome, Err(keeper_agent::agent::ServeError::Stopped)),
+        "{outcome:?}"
+    );
+    assert_eq!(rooms.downloads.load(Ordering::SeqCst), 0, "downloaded");
+    assert_eq!(status_runs(&world.room), [json!("running")]);
+    assert_eq!(world.room.sent().len(), 1, "{:?}", world.room.sent());
+    assert!(world.stub.requests().is_empty());
+}
+
+/// Story 102.4 #3, R489/02: a turn whose opening cannot be written for any
+/// reason but a lost claim — here its log's folder is no folder when the
+/// `user` line goes in — is answered with the failure notice replying to
+/// the person's message, and its status goes back to `idle`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_turn_whose_opening_cannot_be_written_is_answered_with_a_failure() {
+    let mut world = world(ProviderKind::OpenAi, &["drive_read"], vec![prose("ok.")]);
+    let rooms = Delegations::over(known(&[TGORKA, MARTA]));
+    let csv = b"a,b\n1,2\n".to_vec();
+    rooms.uploads.lock().expect("lock").push(csv.clone());
+    let log = world.dir(SESSION).join("log");
+    *rooms.on_download.lock().expect("lock") = Some(Box::new(move || {
+        std::fs::remove_dir_all(&log).expect("the log's folder");
+        std::fs::write(&log, "").expect("a file in its place");
+    }));
+    let mut served = world.delegating(&rooms);
+    let sent = file_message(
+        &mut world,
+        "m.file",
+        "t.csv",
+        "text/csv",
+        "sum it",
+        0,
+        csv.len(),
+    );
+    let about = sent.event_id.to_string();
+    let (_handle, signal) = chat::cancellation();
+    let outcome = served
+        .serve(&world.deps, world.room.clone(), sent, signal)
+        .await;
+    assert!(
+        matches!(outcome, Err(keeper_agent::agent::ServeError::Writer(_))),
+        "{outcome:?}"
+    );
+    let failed: Vec<Value> = world
+        .sent_of("m.room.message")
+        .into_iter()
+        .filter(|message| message["body"] == TURN_FAILED)
+        .collect();
+    assert_eq!(failed.len(), 1, "{:?}", world.room.sent());
+    assert_eq!(
+        failed[0]["m.relates_to"]["m.in_reply_to"]["event_id"],
+        json!(about)
+    );
+    let runs = status_runs(&world.room);
+    assert_eq!(runs.first(), Some(&json!("running")), "{runs:?}");
+    assert_eq!(runs.last(), Some(&json!("idle")), "{runs:?}");
+    assert!(world.stub.requests().is_empty());
+}
+
+/// R489/04: the person's message this host could not decrypt is said once,
+/// however it arrives — from the read-back and then live, or after a
+/// host's notice already answered it — and is still a turn once it
+/// decrypts.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_undecrypted_message_is_said_once_and_taken_once_it_decrypts() {
+    let mut world = world(ProviderKind::OpenAi, &["drive_read"], vec![prose("ok.")]);
+    let rooms = Delegations::over(known(&[TGORKA, MARTA]));
+    let mut served = world.delegating(&rooms);
+    let notices = |world: &World| {
+        world
+            .sent_of("m.room.message")
+            .iter()
+            .filter(|message| message["body"] == keeper_agent::agent::UNDECRYPTED)
+            .count()
+    };
+    let replayed = Arrived {
+        replay: true,
+        ..world.event(TGORKA, Arrival::Undecrypted, Value::Null)
+    };
+    let live = Arrived {
+        replay: false,
+        ..replayed.clone()
+    };
+    let outcome = world.serve(&mut served, replayed.clone()).await;
+    assert!(matches!(outcome, Outcome::Undecrypted), "{outcome:?}");
+    let outcome = world.serve(&mut served, live).await;
+    assert!(matches!(outcome, Outcome::Duplicate), "{outcome:?}");
+    assert_eq!(notices(&world), 1);
+
+    let answered = world.event(TGORKA, Arrival::Undecrypted, Value::Null);
+    served.undecrypted_answered([answered.event_id.clone()]);
+    let outcome = world.serve(&mut served, answered).await;
+    assert!(matches!(outcome, Outcome::Duplicate), "{outcome:?}");
+    assert_eq!(notices(&world), 1);
+
+    let mut decrypted = world.event(
+        TGORKA,
+        Arrival::Text,
+        json!({"msgtype": "m.text", "body": "hello"}),
+    );
+    decrypted.event_id = replayed.event_id.clone();
+    decrypted.text = "hello".to_owned();
+    report(world.serve(&mut served, decrypted).await);
+    assert_eq!(world.stub.requests().len(), 1);
 }

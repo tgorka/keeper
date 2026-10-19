@@ -10906,12 +10906,12 @@ location: `run_agent_turn`'s `with_message`, `keeper_core::agents::log::replay::
 reason: the image part rides that turn's own user message and never the log, so a later turn (or a replay after a restart) reads the message with the photo's path only; the model's own answer of that turn carries what it saw. Showing it again needs the replay to hydrate `attachments/` images, with the vision answer and the per-message image cap applied there.
 status: open
 
-### DW-1454: Office documents reach the agent as named files only; audio and video are ignored, not stored.
+### DW-1454: Office documents reach the agent as named files only; no agent listens to audio or watches video.
 
 origin: lane `files` (story 101.2 #3), 2026-10-15
 location: `keeper_agent::attachments::kind_of`, `runtime::arrival_of`
 reason: a `.docx`, `.pptx` or `.xlsx` is stored and named but its text is not written beside it, though `keeper_core::document` reads all three; `m.audio` and `m.video` are not turns at all. The first is a `<name>.txt` written from `open_document`'s view model; the second needs a transcription decision (Epic 87 is on this Mac only).
-status: open
+status: open — narrowed by story 102.4 #1 (lane `attachments`, 2026-10-19): `m.audio` and `m.video` are taken now — stored like any other file (`attachments::Kind::Unheard`) with the note "keeper does not let agents listen to or watch {name} yet; it was saved at {path}" under the answer, in the model's message and at WARN — so what is left is transcription (Epic 87's engine is on the Mac only) and the office documents' text.
 
 ### DW-1460: The Mac's and iOS's own text input are not yet watched not rewriting a message.
 
@@ -11249,3 +11249,24 @@ origin: review RR102tools2 (R102T2-02, R494), recorded by lane `102stack`, 2026-
 location: `keeper_core::account` (the authoritative serving-hosts read of a save, `HostsFor::Save`), `src/components/chat/agent-room-header.tsx` (the header's menu)
 reason: every save reads each account's control rooms one after another, ten seconds per room (R484) and no deadline over the whole inventory, and the menu's `busy` flag disables the choices without a pending sentence: ten rooms answering in nine seconds each make a switch wait about ninety seconds before its file is written, with nothing said meanwhile. A failed room still refuses the save.
 status: open
+
+### DW-1540: An oversized WEBP or GIF is not made smaller for its model.
+
+origin: lane `attachments` (story 102.4 #4), 2026-10-19
+location: `keeper_agent::attachments::copyable` / `smaller`
+reason: keeper-agent links `image` with the `png` and `jpeg` decoders only, so a WEBP or GIF photo larger than its model is shown (`deliverable::max_image_bytes`: 3.75 MiB for a Claude model, 8 MiB otherwise) is stored and named with `too_large_to_show`'s sentence, never shown. A phone's *Take photo* and *Choose photo* send JPEG, so this is a desktop drag-and-drop or paste of a large WEBP/GIF. Fix: enable `image`'s `webp` and `gif` decoders for keeper-agent (both MIT/Apache; `check:agentd-lean` and cargo-deny to rerun) and add `image/webp`/`image/gif` to `smaller`'s formats.
+status: open
+
+### DW-1541: The person's edit, and their words in a session that is not their conversation, still reach no notice from the host.
+
+origin: lane `attachments` (story 102.4, triage 102 claim 5d iii/iv), 2026-10-19
+location: `keeper_agent::rooms::classify` (`Arrival::Edit` → `Ignored(FORGED)`, `Arrival::Text` outside a proxy's conversation → `Ignored(OBSERVER_TEXT)`), logged at INFO
+reason: story 102.4 made the undecryptable message and the unopened turn speak in the room; these two stay host-silent. The person's own device now says it under the message ("… host did not take this message …", R465) for words no anchor answers, but an edit of a message already taken changes nothing visible. Fix: one notice per session saying why an edit or an observer's message is not taken, replying to it (`matrix_sink::notice_about`), so the person's device reads it as said of.
+status: open
+
+### DW-1542: A turn whose opening could not be written has no automated proof of its TURN_FAILED notice.
+
+origin: lane `attachments` (story 102.4 #3), 2026-10-19
+location: `keeper_agent::agent::ServedSession::unopened`, called from `run_turn` when `open_turn` fails
+reason: `agent_turns`' world has no seam that makes the session writer fail on the `user` line, so the notice replying to the person's message (and the early `running` board going `idle`) is proved by reading the code only; the undecryptable message's notice has a test (`a_persons_undecrypted_message_is_answered_with_a_notice`). Fix: a writer fault switch in the test world (the `Room.limited`-style knob on the session writer) and a test asserting one `TURN_FAILED` notice in reply to the message and no anchor.
+status: closed (fix round 1 of lane `attachments`, R489/02) — `agent_turns::a_turn_whose_opening_cannot_be_written_is_answered_with_a_failure` (the session's `log/` folder becomes a file while the file downloads: one `TURN_FAILED` replying to the message, the status `running` then `idle`, no model asked) and `agent_turns::a_claim_lost_while_a_file_downloads_leaves_the_message_to_its_holder` (a lost claim sends nothing after `running`; the holder answers).
