@@ -22,6 +22,13 @@ import { DefaultAgentSection } from "@/components/settings/default-agent-section
 import { BADGE_NOT_LIVE_SENTENCE } from "@/components/settings/no-background-sync-disclosure";
 import { PhonePush } from "@/components/settings/phone-push";
 import { RecordingSettingsControls } from "@/components/settings/recording-settings-controls";
+import {
+  SETTINGS_TRAVEL_SENTENCE,
+  SettingsCategories,
+  type SettingsDrillOwner,
+  type SettingsLayout,
+  type SettingsSections,
+} from "@/components/settings/settings-categories";
 import { SyncGitRow } from "@/components/settings/sync-git-row";
 import { DeviceSection, SyncSection } from "@/components/settings/sync-section";
 import { TasksSection } from "@/components/settings/tasks-section";
@@ -78,6 +85,20 @@ import {
   voiceHotkeyGet,
   voiceHotkeySet,
 } from "@/lib/ipc/client";
+import {
+  CAPTURE_NOTE,
+  DEVICE_NAME_NOTE,
+  DRIVE_FOLDER_NOTE,
+  ENDPOINT_KEY_NOTE,
+  LAUNCH_AT_LOGIN_NOTE,
+  RECORDING_FOLDER_NOTE,
+  SHORTCUTS_NOTE,
+  STORE_PASSPHRASE_NOTE,
+  STORE_POSTURE_NOTE,
+  SYNC_GIT_NOTE,
+  TASKS_LEDGER_NOTE,
+  VOICE_NOTE,
+} from "@/lib/settings-device-notes";
 import { useAccountsStore } from "@/lib/stores/accounts";
 import { useCapabilitiesStore, useIsReducedCapabilityPlatform } from "@/lib/stores/capabilities";
 import { useEncryptionStatus } from "@/lib/stores/encryption-status";
@@ -106,12 +127,10 @@ const ARCHIVE_BACKUP_EXCLUSION_SENTENCE =
   "This phone's Local Archive is excluded from device backup, so it is not copied off the phone. Your Mac remains the durable, exportable copy this phase.";
 
 /**
- * Settings dialog with a read-only Archive & Storage section (Story 2.6, AD-22,
- * UX-DR17). States plainly that `keeper.db`/`archive.db` are not
- * passphrase-encrypted in this version and rely on FileVault, and reflects
- * whether the per-account Matrix SDK stores are passphrase-encrypted (loaded from
- * `encryptionPosture()` on open). No toggle — the posture is a first-run choice
- * only and is never re-prompted here.
+ * The Settings dialog: the same categories as the pane, as a drill-in list
+ * (Story 102.8). What still opens it — Notes search's model link, the tasks
+ * log's "Settings → Tasks" — names a section ({@link settingsUiStore}'s
+ * `revealSection`), so it opens straight into that category.
  */
 export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
   return (
@@ -129,10 +148,10 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
       <DialogContent className="flex max-h-[85vh] flex-col gap-0 overflow-hidden">
         <DialogHeader>
           <DialogTitle>Settings</DialogTitle>
-          <DialogDescription>Archive &amp; Storage</DialogDescription>
+          <DialogDescription>{SETTINGS_TRAVEL_SENTENCE}</DialogDescription>
         </DialogHeader>
         <div className="-mr-2 mt-2 flex min-h-0 min-w-0 flex-1 flex-col gap-4 overflow-y-auto pr-2">
-          <SettingsBody open={open} onOpenChange={onOpenChange} />
+          <SettingsBody open={open} onOpenChange={onOpenChange} layout="drill" />
         </div>
       </DialogContent>
     </Dialog>
@@ -140,19 +159,29 @@ export function SettingsDialog({ open, onOpenChange }: SettingsDialogProps) {
 }
 
 /**
- * Every Settings section, in order, with no chrome of its own.
+ * Every Settings section, in its category, with no chrome of its own.
  *
  * Split out of the dialog so the Settings *pane* renders the same sections from
- * one definition — two copies would drift on which settings exist and in what
- * order, and that drift is invisible until someone goes looking for a setting on
- * the surface that lost it. The caller owns the scroll container and the
- * heading, because a dialog and a pane want different ones.
+ * one definition — two copies would drift on which settings exist and where,
+ * and that drift is invisible until someone goes looking for a setting on the
+ * surface that lost it. Which category a section sits in is
+ * `@/lib/settings-categories`; this decides only whether this build has it.
+ *
+ * `layout` is the caller's: the desktop pane's `rail` keeps its category list
+ * still and scrolls the sections itself, while `drill` (the phone, the dialog)
+ * lives inside the caller's scroll container. The caller owns the heading, and
+ * on the phone the shell owns the drill-in's back (`owner`).
  *
  * `open` stays the hydration signal each section already takes: a section reads
  * its state from Rust when this flips true. In the pane it means "mounted", which
- * is the same claim.
+ * is the same claim. Every section stays mounted in every category.
  */
-export function SettingsBody({ open, onOpenChange }: SettingsDialogProps) {
+export function SettingsBody({
+  open,
+  onOpenChange,
+  layout,
+  owner,
+}: SettingsDialogProps & { layout: SettingsLayout; owner?: SettingsDrillOwner }) {
   useTelemetryOpening("settingsOpened", open);
   // The OS-global summon hotkey is a desktop-only capability; hide the whole
   // Shortcuts section wherever the platform lacks it (the phone tier).
@@ -160,6 +189,7 @@ export function SettingsBody({ open, onOpenChange }: SettingsDialogProps) {
   // Screen recording is a desktop-macOS-≥13 capability (Story 16.3); render the
   // Recording section only where it exists — never a dead settings surface.
   const recording = useCapabilitiesStore((s) => s.capabilities.recording);
+  const launchAtLogin = useCapabilitiesStore((s) => s.capabilities.launchAtLogin);
   const transcription = useCapabilitiesStore((s) => s.capabilities.transcription);
   // Folder sync needs a usable `git` binary (Epic 29, AD-41); render the Sync
   // section only where the capability reports one — never a dead affordance.
@@ -218,98 +248,117 @@ export function SettingsBody({ open, onOpenChange }: SettingsDialogProps) {
         ? SDK_STORE_ENCRYPTED_STATUS
         : SDK_STORE_UNENCRYPTED_STATUS;
 
-  return (
-    <>
-      {/* First, on every tier, behind no capability (Epic 82, UX-DR116): an
-          account is how settings arrive on a device, so setting one up is the
-          first thing Settings offers — and with no account it is one sentence
-          and one field, so an install that never meets one loses nothing. */}
-      <AccountSection open={open} />
-      <div className="flex min-w-0 flex-col gap-3 text-sm">
-        <p>{sdkStatus}</p>
-        <p className="text-muted-foreground">{STORAGE_HONESTY_SENTENCE}</p>
-        {reducedPlatform && (
-          <p className="text-muted-foreground">{ARCHIVE_BACKUP_EXCLUSION_SENTENCE}</p>
-        )}
-        <HonorRemoteDeletionsRow />
-      </div>
-      <NotificationsSection open={open} />
-      {/* The desktop "Background & dock" section (⌘W/⌘Q mechanics, Dock badge,
-              launch-at-login, menu bar) never renders on the reduced (phone) tier —
-              its keeps-syncing-in-background copy would be a false background-delivery
-              claim on iOS (Story 14.2, FR-53/FR-61). Desktop (Story 10.3) unchanged. */}
-      {!reducedPlatform && <BackgroundSection open={open} />}
-      <PrivacySection open={open} />
-      <TelemetrySection open={open} />
-      {globalHotkey && <ShortcutsSection open={open} />}
-      {/* Beside Shortcuts rather than gated with it: the summon chord is a
-          desktop capability, but the template a capture starts from and the tag
-          its notes carry are vault settings that mean the same thing on every
-          platform that has a vault. The section renders itself away when there
-          is no vault to configure (Story 45.16, FR-193). */}
-      <CaptureSettingsSection open={open} />
-      <SearchSettingsSection open={open} />
-      {/* The Recording section is desktop-macOS-≥13 only (Story 16.3): absent on
-              every platform that cannot record, never a dead affordance. */}
-      {recording && <RecordingSection open={open} />}
-      {transcription && <TranscriptionSection open={open} />}
-      {/* Ungated by any capability, and beside Sync rather than inside it: a
-          sessions zone IS a synced folder somebody flagged, but what a space
-          does when it arrives is a reading preference and not a sync setting.
-          The section removes itself when no folder is flagged as a zone, the
-          way Quick capture removes itself without a vault (Story 49.3, FR-276). */}
-      <SessionsSettingsSection open={open} />
-      {/* Endpoints and bots (Epic 61, FR-379). Gated on `bots`, which is NOT
-          the sync gate the three sections below it ride: an endpoint is a URL
-          and a credential, so it needs no `git`. */}
-      {bots && <BotsSection open={open} />}
-      {/* Story 61.10's grants: the list that answers "what can a bot change?".
-          Gated on `botTools` rather than `sync`, because a grant names a
-          folder inside a synced profile and a build that cannot reach the
-          drive — a desktop with no usable git, or a phone — has nothing it
-          could name. `botTools` is strictly narrower than `bots` in Rust, so
-          it is the one gate this section needs. */}
-      {botTools && <BotGrantsSection open={open} />}
-      {/* Story 100.3 (R383): the one agent keeper opens at launch. On every
-          tier and behind no capability — the phone launches by the same rule
-          and the key travels with the account — and absent where there is no
-          agent to choose and none stored (AD-27). */}
-      <DefaultAgentSection open={open} />
-      {/* Story 90.6: this Mac as a host for your agents. On `botTools` for the
-          grants' reason — a host reads drives, and a phone is never one — and
-          absent besides where no flagged folder holds an agent (AD-27). */}
-      {botTools && <AgentsSection open={open} />}
-      {/* Folder sync needs a usable `git` (Epic 29): absent on every machine
-              that has none, never a section whose every button would reject. */}
-      {sync && <SyncSection open={open} />}
-      {sync && <TasksSection open={open} />}
-      {/* Its own section, not a block inside Sync: the device name is not a sync
-          setting — it rides every commit's `Keeper-Device` trailer, names this
-          machine in conflict-copy filenames, and now qualifies the commit subject
-          itself. Same capability gate, because the identity is read and written
-          through the sync engine's own IPC. */}
-      {sync && <DeviceSection open={open} />}
-      {/* BESIDE that gate, not behind it. `capabilities.sync` IS "a usable
-              git was found", so a machine without one renders no Sync section —
-              and the report explaining why, plus the field that fixes it, would
-              be unreachable exactly when it is the only thing worth reading
-              (Story 34.14, DW-122). It renders itself away on a build with no
-              folder sync at all. */}
-      <SyncGitRow open={open} />
-      {/* Ungated, on every platform, and rendered even when nothing is
-          overridden (Story 46.7, AD-98). The layer stack is read by
-          `keeper_core::config`, which has no capability gate, and a section
-          that appeared only once a `keeper.toml` already existed would be
-          invisible to everyone who has not yet discovered that one is
-          possible. It is also where the faults land: a settings file that did
-          not parse sets nothing and looks exactly like one that works. */}
-      <ConfigSourceSection open={open} />
-      <EncryptionSection />
-      <SetupSection onOpenChange={onOpenChange} />
-      <AboutSection open={open} />
-    </>
-  );
+  const sections: SettingsSections = {
+    // First, on every tier, behind no capability (Epic 82, UX-DR116): an
+    // account is how settings arrive on a device, so setting one up is the
+    // first thing Settings offers — and with no account it is one sentence
+    // and one field, so an install that never meets one loses nothing.
+    account: { node: <AccountSection open={open} /> },
+    // Its own section, not a block inside Sync: the device name is not a sync
+    // setting — it rides every commit's `Keeper-Device` trailer, names this
+    // machine in conflict-copy filenames, and now qualifies the commit subject
+    // itself. Same capability gate, because the identity is read and written
+    // through the sync engine's own IPC.
+    device: sync ? { node: <DeviceSection open={open} />, staysHere: [DEVICE_NAME_NOTE] } : null,
+    encryption: { node: <EncryptionSection /> },
+    setup: { node: <SetupSection onOpenChange={onOpenChange} /> },
+    notifications: { node: <NotificationsSection open={open} /> },
+    // The desktop "Background & dock" section (⌘W/⌘Q mechanics, Dock badge,
+    // launch-at-login, menu bar) never renders on the reduced (phone) tier —
+    // its keeps-syncing-in-background copy would be a false background-delivery
+    // claim on iOS (Story 14.2, FR-53/FR-61). Desktop (Story 10.3) unchanged.
+    background: reducedPlatform
+      ? null
+      : {
+          node: <BackgroundSection open={open} />,
+          staysHere: launchAtLogin ? [LAUNCH_AT_LOGIN_NOTE] : undefined,
+        },
+    // Story 100.3 (R383): the one agent keeper opens at launch. On every
+    // tier and behind no capability — the phone launches by the same rule
+    // and the key travels with the account — and absent where there is no
+    // agent to choose and none stored (AD-27).
+    "default-agent": { node: <DefaultAgentSection open={open} /> },
+    // Story 90.6: this Mac as a host for your agents. On `botTools` for the
+    // grants' reason — a host reads drives, and a phone is never one — and
+    // absent besides where no flagged folder holds an agent (AD-27).
+    agents: botTools ? { node: <AgentsSection open={open} /> } : null,
+    // Endpoints and bots (Epic 61, FR-379). Gated on `bots`, which is NOT
+    // the sync gate the drive sections ride: an endpoint is a URL and a
+    // credential, so it needs no `git`.
+    bots: bots
+      ? { node: <BotsSection open={open} />, staysHere: [VOICE_NOTE, ENDPOINT_KEY_NOTE] }
+      : null,
+    // Story 61.10's grants: the list that answers "what can a bot change?".
+    // Gated on `botTools` rather than `sync`, because a grant names a
+    // folder inside a synced profile and a build that cannot reach the
+    // drive — a desktop with no usable git, or a phone — has nothing it
+    // could name. `botTools` is strictly narrower than `bots` in Rust, so
+    // it is the one gate this section needs.
+    "bot-grants": botTools ? { node: <BotGrantsSection open={open} /> } : null,
+    // Ungated by any capability: a sessions zone IS a synced folder somebody
+    // flagged, but what a space does when it arrives is a reading preference
+    // and not a sync setting. The section removes itself when no folder is
+    // flagged as a zone, the way Quick capture removes itself without a vault
+    // (Story 49.3, FR-276).
+    sessions: { node: <SessionsSettingsSection open={open} /> },
+    // Ungated by the summon chord's capability: the template a capture starts
+    // from and the tag its notes carry are vault settings that mean the same
+    // thing on every platform that has a vault. The section renders itself away
+    // when there is no vault to configure (Story 45.16, FR-193).
+    capture: { node: <CaptureSettingsSection open={open} />, staysHere: [CAPTURE_NOTE] },
+    "notes-search": { node: <SearchSettingsSection open={open} /> },
+    // Folder sync needs a usable `git` (Epic 29): absent on every machine
+    // that has none, never a section whose every button would reject.
+    sync: sync ? { node: <SyncSection open={open} />, staysHere: [DRIVE_FOLDER_NOTE] } : null,
+    tasks: sync ? { node: <TasksSection open={open} />, staysHere: [TASKS_LEDGER_NOTE] } : null,
+    // BESIDE that gate, not behind it. `capabilities.sync` IS "a usable
+    // git was found", so a machine without one renders no Sync section —
+    // and the report explaining why, plus the field that fixes it, would
+    // be unreachable exactly when it is the only thing worth reading
+    // (Story 34.14, DW-122). It renders itself away on a build with no
+    // folder sync at all.
+    "sync-git": { node: <SyncGitRow open={open} />, staysHere: [SYNC_GIT_NOTE] },
+    // Desktop-macOS-≥13 only (Story 16.3): absent on every platform that
+    // cannot record, never a dead affordance.
+    recording: recording
+      ? { node: <RecordingSection open={open} />, staysHere: [RECORDING_FOLDER_NOTE] }
+      : null,
+    transcription: transcription ? { node: <TranscriptionSection open={open} /> } : null,
+    shortcuts: globalHotkey
+      ? { node: <ShortcutsSection open={open} />, staysHere: [SHORTCUTS_NOTE] }
+      : null,
+    privacy: { node: <PrivacySection open={open} /> },
+    storage: {
+      node: (
+        <div className="mt-2 flex min-w-0 flex-col gap-3 border-border border-t pt-3 text-sm">
+          <p className="font-medium">{ARCHIVE_STORAGE_TITLE}</p>
+          <p>{sdkStatus}</p>
+          <p className="text-muted-foreground">{STORAGE_HONESTY_SENTENCE}</p>
+          {reducedPlatform && (
+            <p className="text-muted-foreground">{ARCHIVE_BACKUP_EXCLUSION_SENTENCE}</p>
+          )}
+          <HonorRemoteDeletionsRow />
+        </div>
+      ),
+      staysHere: [STORE_POSTURE_NOTE, STORE_PASSPHRASE_NOTE],
+    },
+    diagnostics: { node: <TelemetrySection open={open} /> },
+    about: { node: <AboutSection open={open} /> },
+    // Ungated, on every platform, and rendered even when nothing is
+    // overridden (Story 46.7, AD-98). The layer stack is read by
+    // `keeper_core::config`, which has no capability gate, and a section
+    // that appeared only once a `keeper.toml` already existed would be
+    // invisible to everyone who has not yet discovered that one is
+    // possible. It is also where the faults land: a settings file that did
+    // not parse sets nothing and looks exactly like one that works.
+    "config-sources": { node: <ConfigSourceSection open={open} /> },
+  };
+
+  return <SettingsCategories layout={layout} sections={sections} owner={owner} />;
 }
+
+/** The Archive & Storage block's heading (Story 2.6), now one section of Privacy & diagnostics. */
+export const ARCHIVE_STORAGE_TITLE = "Archive & storage";
 
 /**
  * The plain disclosure for the honor-remote-deletions toggle (Story 5.2, FR-36,

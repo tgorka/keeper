@@ -11375,3 +11375,38 @@ origin: lane `102stack` (the stack of epic 102: 102.5's kept rows × 102.7's row
 location: `keeper_core::agents::list_rows` (the `agent_list_rows` table), `RoomVm::agent`
 reason: the rows kept from the last run (R468) are drawn before any account is activated, and the table keeps no agent id, so a kept row carries `agent: None`: its Default marker and its "Make default" appear only once the account's live list replaces the kept rows. Keeping the agent needs a column in the kept-rows table.
 status: open
+
+### DW-1580: A drive's quick-capture template and tag do not travel with the account.
+
+origin: lane `settings` (story 102.8, claim 9 verification), 2026-10-19
+location: `keeper_sync::profile::NotesConfig` (`capture_template`, `capture_tag`, also `journal_template`, `default_template`, `cadence`), `keeper::notes_ipc::apply_settings` → `engine.upsert_profile`; `keeper_core::org_account::manifest::DriveRecord`
+reason: they are written only into this machine's sync-profile row in `sync.db`; `DriveRecord` (`<login>/drives.toml`) carries the drive's `notes` subfolder but none of these, and no `settings.toml` key holds them, so a second device that takes the drive offer starts with no capture template or tag. The owner asked for every setting to be in the remote settings; story 102.8 changes no persistence (its item 2), so it discloses the gap in Settings › Notes ("Kept only on this device") and in `docs/settings-keys.md` instead. Fix: carry them in `DriveRecord` (portable, per drive) and merge them like the other drive fields.
+status: open
+
+### DW-1581: Settings has no search over setting titles.
+
+origin: lane `settings` (story 102.8, item 1: "search over setting titles if a search exists today"), 2026-10-19
+location: `src/components/settings/settings-categories.tsx`
+reason: no Settings search existed before the categories, so the story did not add one. Each section's title lives inside its own component (some as `<p>`, some as `<h3>`, some as exported constants), so a search would first need every section to export the titles of its rows. The command palette does not reach Settings rows either.
+status: open
+
+### DW-1582: On the phone, the shell's back leaves Settings from inside a category.
+
+origin: lane `settings` (story 102.8), 2026-10-19
+location: `src/components/layout/phone-shell.tsx` (level 1 `PhoneBackBar`, edge swipe), `SettingsCategories` drill layout
+reason: the drilled category has its own "All settings" button, but the stack's "Back to Inbox" bar and the edge-swipe back pop the whole Settings level rather than returning to the category list first, as the Bots and Notes levels do for their lists. A `PhoneSurface` that owns a sub-level (the way Bots pushes a conversation at level 2) would make the system back step through it.
+status: closed (lane `settings`, fix 1, R471, 2026-10-19: the category is a sub-level `PhoneShell` owns (`settingsCategory`); `onBack` — header, edge swipe, Escape — pops it to the list before the level, the list draws no back of its own on the phone, focus returns to the category row; test `phone-shell.test.tsx` › "pops a Settings category with the stack's own back before it leaves Settings")
+
+### DW-1583: The git row in Settings › Sync & drives is wider than a phone.
+
+origin: lane `settings` (story 102.8, browser proof at 420 px), 2026-10-19
+location: `src/components/settings/sync-git-row.tsx` (the path row: `w-56` input and two `whitespace-nowrap` buttons in one non-wrapping flex row)
+reason: at 420 px the row's "Find it for me" button ends at x=441, 21 px past the viewport (measured over CDP in the mock shell, `?platform=phone`); the markup is unchanged by the categories, which only made the row the last of a short page where it is easy to see. Fix: let the row wrap (`flex-wrap`) or put the buttons under the field below the phone breakpoint.
+status: open
+
+### DW-1584: A note row in the Notes list nests its tag buttons inside the row's button.
+
+origin: lane `settings` (story 102.8, fix 1 browser proof of the Notes search → model link), 2026-10-19
+location: `src/components/notes/note-row.tsx` (the tag chip, `aria-label="Tag <tag>, on this note"`, a `<button>` popover trigger inside the row's own `<button>`; unchanged since epic 79, `df822c0b`)
+reason: React logs "In HTML, <button> cannot be a descendant of <button>" twice whenever the Notes list renders a tagged note (measured in the mock shell at 1280 px, `button button` matched every tag chip); interactive content inside a button is invalid HTML, and assistive technology may not reach the inner control. Not a Settings change, so not fixed here. Fix: render the row as a non-button container with a stretched primary button, or the chip as a sibling of the row's button.
+status: open

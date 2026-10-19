@@ -162,6 +162,7 @@ vi.mock("@tauri-apps/api/webview", () => ({
 import { dispatchPaletteAction } from "@/components/command-palette/actions";
 import { PhoneShell, TABLET_NO_ROOM_SENTENCE } from "@/components/layout/phone-shell";
 import { PROXY_DOCK_LABEL } from "@/components/layout/proxy-dock-sheet";
+import { SETTINGS_PHONE_BACK_TO_LIST } from "@/components/layout/settings-pane";
 import { sidebarViews } from "@/components/layout/sidebar-pane";
 import { COPY_SUBMIT_LABEL } from "@/components/layout/sync-pane";
 import { VERIFY_BANNER_TEXT } from "@/components/layout/verify-banner";
@@ -171,6 +172,10 @@ import {
   SESSIONS_PHONE_ROOMS_READING,
   sessionsPhoneOpenCardRoom,
 } from "@/components/sessions/sessions-phone-pane";
+import {
+  SETTINGS_BACK_LABEL,
+  SETTINGS_CATEGORIES_LABEL,
+} from "@/components/settings/settings-categories";
 import {
   SYNC_ADD_TITLE,
   SYNC_CHOOSE_FOLDER_LABEL,
@@ -1633,6 +1638,73 @@ describe("PhoneShell view surfaces (Story 66.1, AD-197)", () => {
       primaryViewStore.getState().setView("sync");
     });
     expect(document.querySelector('[data-level="1"]')).toBeNull();
+  });
+
+  it("pops a Settings category with the stack's own back before it leaves Settings", async () => {
+    // Story 102.8 (R471): the category is a sub-level of the Settings level,
+    // so the header's back, Escape and the edge swipe each return it to the
+    // category list — focus on the row it came from — and only the list's
+    // back returns to the Inbox. The list draws no second back of its own.
+    mockRectWidth(390);
+    capabilitiesStore.getState().applySnapshot(PHONE_WITH_FOLDER);
+    render(<PhoneShell />);
+    act(() => {
+      primaryViewStore.getState().setView("settings");
+    });
+    const level = stackLevel(1);
+    const row = () =>
+      within(within(level).getByRole("navigation", { name: SETTINGS_CATEGORIES_LABEL })).getByRole(
+        "button",
+        { name: "Privacy & diagnostics" },
+      );
+    const drillIn = () => {
+      fireEvent.click(row());
+      const back = within(level).getByRole("button", { name: SETTINGS_PHONE_BACK_TO_LIST });
+      expect(back).toHaveFocus();
+      expect(within(level).getByRole("heading", { name: "Privacy & diagnostics" })).toBeVisible();
+      expect(within(level).queryByRole("button", { name: SETTINGS_BACK_LABEL })).toBeNull();
+      expect(within(level).queryByRole("button", { name: "Back to Inbox" })).toBeNull();
+      return back;
+    };
+    const onTheList = () => {
+      expect(primaryViewStore.getState().view).toBe("settings");
+      expect(row()).toHaveFocus();
+      expect(within(level).getByRole("button", { name: "Back to Inbox" })).toBeInTheDocument();
+    };
+
+    // The header's back.
+    fireEvent.click(drillIn());
+    onTheList();
+
+    // Escape.
+    fireEvent.keyDown(drillIn(), { key: "Escape" });
+    onTheList();
+
+    // The edge swipe.
+    drillIn();
+    const zone = screen.getByTestId("edge-swipe-back");
+    fireEvent.pointerDown(zone, { pointerId: 1, clientX: 5 });
+    fireEvent.pointerMove(zone, { pointerId: 1, clientX: 250 });
+    fireEvent.pointerUp(zone, { pointerId: 1, clientX: 250 });
+    onTheList();
+
+    // Settings left from inside a category, by another view, opens on the list again.
+    drillIn();
+    act(() => {
+      primaryViewStore.getState().setView("bridges");
+    });
+    act(() => {
+      primaryViewStore.getState().setView("settings");
+    });
+    expect(
+      within(stackLevel(1)).getByRole("navigation", { name: SETTINGS_CATEGORIES_LABEL }),
+    ).toBeInTheDocument();
+    expect(within(level).getByRole("button", { name: "Back to Inbox" })).toBeInTheDocument();
+
+    // From the list, the same back leaves Settings.
+    fireEvent.click(within(level).getByRole("button", { name: "Back to Inbox" }));
+    expect(primaryViewStore.getState().view).toBe("inbox");
+    await waitFor(() => expect(document.querySelector('[data-level="1"]')).toBeNull());
   });
 
   it("every drawer row on the phone lands on a level (the registry against the surfaces)", async () => {

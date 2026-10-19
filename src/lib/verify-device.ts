@@ -19,6 +19,7 @@
 import { accountsStore } from "@/lib/stores/accounts";
 import { encryptionStatusStore } from "@/lib/stores/encryption-status";
 import { primaryViewStore } from "@/lib/stores/primary-view";
+import { settingsUiStore } from "@/lib/stores/settings-ui";
 import { verificationStore } from "@/lib/stores/verification";
 
 export function openDeviceVerification(): void {
@@ -30,5 +31,6 @@ export function openDeviceVerification(): void {
     verificationStore.getState().openFor(unverified.accountId);
     return;
   }
+  settingsUiStore.getState().revealSection("encryption");
   primaryViewStore.getState().setView("settings");
 }
