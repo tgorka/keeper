@@ -387,6 +387,18 @@ async fn drive_sas(sink: &VerificationSink, flow_id: &str, sas: &SasVerification
     if !emit_sas_state(sink, flow_id, &sas.state(), sas) {
         return false;
     }
+    // The other session pressed "Verify with emoji": the SAS arrives here as
+    // `Started`, and the protocol waits for this side's `accept` before any
+    // keys are exchanged. Nothing sent it, so both sides sat on "Waiting for
+    // your other device…" for ever — kalypso and hesperia, 2026-10-18. The
+    // person already agreed to verify by accepting the request (or by asking
+    // for it), so accepting the method is not a second question. A failure
+    // surfaces through the stream below as a cancel.
+    if !sas.we_started() && matches!(sas.state(), SasState::Started { .. }) {
+        if let Err(error) = sas.accept().await {
+            tracing::warn!(%flow_id, %error, "could not accept the other session's emoji verification");
+        }
+    }
     let mut changes = sas.changes();
     while let Some(state) = changes.next().await {
         if !emit_sas_state(sink, flow_id, &state, sas) {

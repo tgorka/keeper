@@ -40,6 +40,15 @@ import {
 /** The honest, human copy for the "waiting for your other device" state. */
 export const VERIFY_WAITING_TEXT = "Waiting for your other device…";
 
+/**
+ * The ready state's copy. Both sessions are waiting for a person here, not for
+ * each other: "Waiting for your other device…" on both screens left the owner
+ * staring at two devices that each blamed the other (kalypso and hesperia,
+ * 2026-10-18).
+ */
+export const VERIFY_READY_TEXT =
+  "Both devices are ready. Tap \u201cVerify with emoji\u201d on one of them.";
+
 export function DeviceVerificationDialog() {
   const open = useVerificationModalOpen();
   const flow = useVerificationFlow();
@@ -133,7 +142,7 @@ function VerificationBody({ flow }: { flow: ReturnType<typeof useVerificationFlo
   }
 }
 
-/** The waiting / ready phase: show keeper's QR (if any) and offer emoji SAS. */
+/** The waiting / ready phase: wait for the other session, then show keeper's QR (if any) and offer emoji SAS. */
 function WaitingOrReady({
   flow,
   accountId,
@@ -141,9 +150,14 @@ function WaitingOrReady({
   flow: NonNullable<ReturnType<typeof useVerificationFlow>>;
   accountId: string | null;
 }) {
+  // Until the other session answers there is nothing to start: SAS needs a
+  // ready request, and a button that can only fail is a dead end.
+  if (flow.phase === "requested") {
+    return <p className="text-sm text-muted-foreground">{VERIFY_WAITING_TEXT}</p>;
+  }
   return (
     <div className="flex flex-col items-center gap-4 text-sm">
-      <p className="text-muted-foreground">{VERIFY_WAITING_TEXT}</p>
+      <p className="text-muted-foreground">{VERIFY_READY_TEXT}</p>
       {flow.qrCodeSvg ? (
         <img
           src={`data:image/svg+xml,${encodeURIComponent(flow.qrCodeSvg)}`}
