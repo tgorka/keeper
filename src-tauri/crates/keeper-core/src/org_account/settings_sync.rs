@@ -1091,6 +1091,7 @@ mod tests {
         }
         for key in [
             "ui.first_run_setup_skipped",
+            "ui.default_agent_chooser_dismissed",
             "notes.read.01ABC",
             "notes.capture_draft.main",
             "notes.pristine.01ABC",

@@ -1094,6 +1094,19 @@ pub const KEYS: &[KeySpec] = &[
     },
     // ---- ui --------------------------------------------------------------
     KeySpec {
+        key: "ui.default_agent_chooser_dismissed",
+        family: false,
+        scope: Scope::SessionState,
+        settable: Settable::Never(
+            "it is the keeper version in which somebody put the launch's chooser away, and \
+             pre-setting it in a file would hide the question from a person who was never asked",
+        ),
+        shape: Shape::Text,
+        default: "",
+        summary: "The keeper version in which the person put away the launch's \"Choose the agent keeper opens when it starts\"; it is asked again after an update (R463).",
+        example: "",
+    },
+    KeySpec {
         key: "ui.first_run_setup_skipped",
         family: false,
         scope: Scope::SessionState,

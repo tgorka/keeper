@@ -55,6 +55,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Lamp, type LampState } from "@/components/ui/lamp";
+import { saveDefaultAgent } from "@/lib/default-agent-actions";
 import { logFailure, sayFailure } from "@/lib/failure";
 import type {
   AgentCopyVm,
@@ -223,17 +224,6 @@ function AgentMenu({ agent }: { agent: string }) {
   if (!offersDefault && row === null && tools.readError === null) {
     return null;
   }
-  const save = async (next: string | null) => {
-    const saved = await defaultAgentStore.getState().choose(next);
-    if (saved === null) {
-      toast.error(defaultAgentStore.getState().saveError);
-    } else if (saved.fileSet !== null) {
-      // Stored, but a file decides what opens: say that, not the choice.
-      toast(saved.fileSet);
-    } else if (next !== null && saved.defaultAgent === next) {
-      toast(`${choice?.name ?? agent} opens when keeper starts.`);
-    }
-  };
   const write = async (source: string, saved: () => Promise<AgentCopyVm[]>, said: string) => {
     setBusy(true);
     try {
@@ -450,7 +440,7 @@ function AgentMenu({ agent }: { agent: string }) {
             )}
             <DropdownMenuItem
               disabled={saving}
-              onSelect={() => void save(isDefault ? null : agent)}
+              onSelect={() => void saveDefaultAgent(isDefault ? null : agent)}
             >
               {isDefault ? CLEAR_DEFAULT_LABEL : MAKE_DEFAULT_LABEL}
             </DropdownMenuItem>

@@ -6808,6 +6808,14 @@ function withAttention(row: InboxRoomVm): InboxRoomVm {
   return state === undefined ? row : { ...row, agentAttention: state };
 }
 
+/** The agent working each mock agent row, by the name the row leads with. */
+const MOCK_ROW_AGENTS: Record<string, string> = {
+  Nixi: "@nixi:example.org",
+  "Dr Tola Grey": "@tola:example.org",
+  "Dr Lucyna Novak": "@lucyna:example.org",
+  "Forge · github": "@forge:example.org",
+};
+
 const AGENT_ROOM_ROWS: InboxRoomVm[] = [
   inboxRow("!nixi-dm:example.org", "Nixi", "…", 1, "proxy", NIXI_AVATAR),
   inboxRow(
@@ -6852,6 +6860,12 @@ const AGENT_ROOM_ROWS: InboxRoomVm[] = [
       ? row
       : { ...row, agentMark: row.displayName.trim().charAt(0).toUpperCase() },
   )
+  .map((row) => {
+    // Rust's `agent`: the working agent's user id on every row whose status
+    // was read (story 102.7) — what the default marker compares.
+    const agent = MOCK_ROW_AGENTS[row.displayName.split(" — ")[0]];
+    return row.agentMark === undefined || agent === undefined ? row : { ...row, agent };
+  })
   .map(withAttention);
 
 const CHAT_ROWS: InboxRoomVm[] = [inboxRow("!marta:example.org", "Marta", "See you on Friday", 15)];
@@ -8034,10 +8048,34 @@ function redrawAgentHeaders(): void {
   }
 }
 
+/**
+ * `?firstbatch=<ms>`: every timeline subscription's first batch is held
+ * back that long (story 102.7, R102L1-01) — the conversation opens, its
+ * composer stays disabled until the batch lands, as on a slow device.
+ * Absent: the first batch is delivered at once, as before.
+ */
+const FIRST_BATCH_MS = Number(new URLSearchParams(window.location.search).get("firstbatch") ?? 0);
+
 function subscribeMockTimeline(payload: Record<string, unknown>): number {
+  const id = nextTimelineSubscription++;
+  if (FIRST_BATCH_MS > 0) {
+    // Held in `TIMELINE_STREAMS`, so an unsubscribe before it lands stops it.
+    TIMELINE_STREAMS.set(
+      id,
+      setTimeout(() => {
+        TIMELINE_STREAMS.delete(id);
+        deliverMockTimeline(id, payload);
+      }, FIRST_BATCH_MS),
+    );
+  } else {
+    deliverMockTimeline(id, payload);
+  }
+  return id;
+}
+
+function deliverMockTimeline(id: number, payload: Record<string, unknown>): void {
   const channel = payload.channel as MockChannel<TimelineBatch>;
   const roomId = String(payload.roomId);
-  const id = nextTimelineSubscription++;
   const agent = AGENT_ROOM_TIMELINES[roomId];
   historyChannels.set(roomId, channel);
   if (!agent) {
@@ -8050,7 +8088,7 @@ function subscribeMockTimeline(payload: Record<string, unknown>): number {
       ],
       pagination: mockHistory,
     });
-    return id;
+    return;
   }
   channel.onmessage?.({
     ops: [{ op: "reset", items: agent.items }],
@@ -8062,7 +8100,7 @@ function subscribeMockTimeline(payload: Record<string, unknown>): number {
   });
   dockChannels.set(id, { roomId, channel });
   if (roomId !== "!nixi-dm:example.org" || dockParam !== null) {
-    return id;
+    return;
   }
   let step = 0;
   const steps = levelRefused ? [LEVEL_REFUSED] : NIXI_ANSWER_STEPS;
@@ -8081,7 +8119,6 @@ function subscribeMockTimeline(payload: Record<string, unknown>): number {
     }
   }, 900);
   TIMELINE_STREAMS.set(id, timer);
-  return id;
 }
 
 // ---------------------------------------------------------------------------
@@ -8184,9 +8221,6 @@ function mockAgentsLaunch(): AgentsLaunchVm {
   const mains = proxyRooms.filter(
     (room) => room.kind === "main" && (nixiDmHere || room.roomId !== DM_ROOM),
   );
-  const choices = mains
-    .map((room) => ({ agent: room.agent, name: room.name }))
-    .sort((a, b) => a.name.localeCompare(b.name));
   // What keeper reads: a settings file's value shadows the stored one.
   const effective = FILE_DEFAULT ?? defaultAgent;
   const fileSet =
@@ -8201,12 +8235,21 @@ function mockAgentsLaunch(): AgentsLaunchVm {
       Date.now() < askLateFrom)
       ? []
       : [NIXI_ASK];
+  // Rust's `choices`: one per agent with a `main` room, then one per own
+  // agent keeper may ask for one (R416), each once, by name.
+  const choices = [
+    ...mains.map((room) => ({ agent: room.agent, name: room.name })),
+    ...askable.map((ask) => ({ agent: ask.agent, name: ask.name })),
+  ]
+    .filter((choice, index, all) => all.findIndex((c) => c.agent === choice.agent) === index)
+    .sort((a, b) => a.name.localeCompare(b.name));
   const base = {
     room: null,
     defaultAgent: effective,
     reason: null,
     announce: false,
     choices,
+    chooser: false,
     fileSet,
     ask: null,
     askable,
@@ -8239,7 +8282,13 @@ function mockAgentsLaunch(): AgentsLaunchVm {
     };
   }
   if (effective === null) {
-    return { ...base, view: "agents" };
+    // R463: nothing chosen — the launch asks which agent opens, unless the
+    // person put the chooser away in this version or a file decides the key.
+    return {
+      ...base,
+      view: "agents",
+      chooser: choices.length > 0 && fileSet === null && !mockChooserDismissed,
+    };
   }
   if (!/^@[^:]+:.+$/.test(effective)) {
     return {
@@ -8271,6 +8320,26 @@ function mockAgentsLaunchWhenKnown(): Promise<AgentsLaunchVm> {
     return later(LOST_BOUND_MS, mockAgentsLaunch);
   }
   return later(300, mockAgentsLaunch);
+}
+
+/**
+ * Story 102.7 (R463): whether the launch's chooser was put away in this
+ * version. `?chooser=failput` refuses the write the way a locked settings
+ * table does.
+ */
+let mockChooserDismissed = false;
+
+function mockAgentsDefaultChooserDismiss(): Promise<null> {
+  return new Promise((resolve, reject) => {
+    setTimeout(() => {
+      if (new URLSearchParams(window.location.search).get("chooser") === "failput") {
+        reject({ code: "internal", message: "database is locked", retriable: false });
+        return;
+      }
+      mockChooserDismissed = true;
+      resolve(null);
+    }, 120);
+  });
 }
 
 /** This Mac's claims lease (R455), as the Settings row last stored it. */
@@ -9936,6 +10005,7 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
   agents_launch: () => mockAgentsLaunchWhenKnown(),
   agents_default_get: () => mockAgentsLaunch(),
   agents_default_set: mockAgentsDefaultSet,
+  agents_default_chooser_dismiss: () => mockAgentsDefaultChooserDismiss(),
   // R455: this Mac's claims lease, kept for the page's life.
   agents_claims_lease_get: () => mockClaimsLease,
   agents_claims_lease_set: (payload: Record<string, unknown>) => {

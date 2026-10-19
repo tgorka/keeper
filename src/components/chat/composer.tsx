@@ -305,6 +305,27 @@ export function Composer({
     }
   }, [focusNonce]);
 
+  // A focus request that waits for this room's composer (story 102.7, R463):
+  // the room was opened before its timeline arrived, so the composer was
+  // disabled then. Taken once it is enabled, and settled only when focus
+  // actually landed — a disabled field refuses it, and the request waits on.
+  const focusWhenReady = useConversationComposer((s) => s.focusWhenReady);
+  useEffect(() => {
+    if (
+      disabled ||
+      focusWhenReady === null ||
+      focusWhenReady.accountId !== accountId ||
+      focusWhenReady.roomId !== roomId
+    ) {
+      return;
+    }
+    const field = textareaRef.current;
+    field?.focus();
+    if (field !== null && document.activeElement === field) {
+      composer.getState().focusLanded(focusWhenReady);
+    }
+  }, [focusWhenReady, disabled, accountId, roomId, composer]);
+
   // Typing-notice emission (Story 3.9): mirror the callback + local typing state
   // in refs so the throttle/idle timers don't re-run effects or capture stale
   // closures. `typingActive` tracks whether we've announced typing (so we emit

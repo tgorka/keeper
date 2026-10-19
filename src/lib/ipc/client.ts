@@ -8964,6 +8964,30 @@ export async function agentsDefaultSet(agent: string | null): Promise<AgentsLaun
 }
 
 /**
+ * Put the launch's "Choose the agent keeper opens when it starts" away
+ * (story 102.7, R463): Rust does not offer it again until keeper is updated.
+ * Rejects with Rust's sentence when the setting could not be written.
+ */
+export async function agentsDefaultChooserDismiss(): Promise<void> {
+  await invoke<null>("agents_default_chooser_dismiss");
+}
+
+/**
+ * Said by Rust when the default agent as keeper reads it moved (story 102.7,
+ * DW-1572, R488): a synced settings row, or the account's settings files
+ * installed or cleared. Payload-free: read the default agent again. Mirrors
+ * `AGENTS_DEFAULT_CHANGED_EVENT` in `agents_ipc.rs`.
+ */
+export const AGENTS_DEFAULT_CHANGED_EVENT = "keeper://agents-default-changed";
+
+/** Subscribe to {@link AGENTS_DEFAULT_CHANGED_EVENT}; resolves with an unlisten function. */
+export async function listenAgentsDefaultChanged(onChanged: () => void): Promise<() => void> {
+  return await listen(AGENTS_DEFAULT_CHANGED_EVENT, () => {
+    onChanged();
+  });
+}
+
+/**
  * The lease this Mac takes a session's claim on while it hosts the person's
  * agents (R455): `short` unless the quarter-hour one was turned on.
  */

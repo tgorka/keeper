@@ -1330,7 +1330,10 @@ fn an_account_layer_change_alone_takes_effect_and_drops_what_was_queued() {
     telemetry.set_consent(diagnostics()).expect("consent");
     let observed = Arc::clone(&telemetry);
     crate::config::set_account_layers_observer(Box::new(move || {
-        let _ = observed.reload_consent();
+        let observed = Arc::clone(&observed);
+        Box::new(move || {
+            let _ = observed.reload_consent();
+        })
     }));
     telemetry.capture_log(site(1), "queued".to_owned());
     assert_eq!(telemetry.inner.lock().expect("state").queue.len(), 1);

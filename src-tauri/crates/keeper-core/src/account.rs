@@ -5496,9 +5496,8 @@ impl AccountManager {
             data_dir,
             ready: self.launch_ready.subscribe(),
         };
-        let mut vm = launch::resolve(&mut source, Duration::from_millis(LAUNCH_READY_MS)).await?;
-        vm.file_set = launch::file_set_sentence();
-        Ok(vm)
+        let vm = launch::resolve(&mut source, Duration::from_millis(LAUNCH_READY_MS)).await?;
+        launch::finish(data_dir, vm)
     }
 
     /// The default agent as Settings › Agents and the agent room's menu show
@@ -9212,17 +9211,22 @@ async fn room_item_to_vm(
         Some(_) => agent_room::row_picture(item, kinds, icons, account_id).await,
     };
     // A titled session is listed as "<agent> — <title>", and its row's letter
-    // is its agent's initial (story 101.1 #6, R416).
-    let (display_name, agent_mark) =
+    // is its agent's initial (story 101.1 #6, R416); the row names its agent
+    // for the default marker and "Make default" (story 102.7, R463).
+    let (display_name, agent_mark, agent) =
         match (agent_room, kinds.seat(item.own_user_id(), item.room_id())) {
             (Some(agent_room::AgentRoomKindVm::Control) | None, _) | (_, None) => {
-                (display_name, None)
+                (display_name, None, None)
             }
             (Some(_), Some(seat)) => {
                 let agent_name = agent_room::agent_name(item, &seat.agent).await;
                 let mark = agent_room::agent_mark(&agent_name);
                 let titled = agent_room::titled_room_name(seat.kind, &agent_name, &seat.title);
-                (titled.unwrap_or(display_name), mark)
+                (
+                    titled.unwrap_or(display_name),
+                    mark,
+                    Some(seat.agent.to_string()),
+                )
             }
         };
     // Whether the room needs the person, failed, works or finished unread
@@ -9250,6 +9254,7 @@ async fn room_item_to_vm(
         agent_room,
         agent_avatar,
         agent_mark,
+        agent,
         agent_attention,
     }
 }
@@ -11225,6 +11230,7 @@ mod tests {
             agent_room: None,
             agent_avatar: None,
             agent_mark: None,
+            agent: None,
             agent_attention: None,
         }
     }

@@ -123,6 +123,7 @@ vi.mock("@tauri-apps/api/webview", () => ({
 
 import { COMPOSER_CONTEXT_CHANGED } from "@/components/chat/composer";
 import { ConversationPane } from "@/components/layout/conversation-pane";
+import { openAndFocus } from "@/lib/default-agent-actions";
 import type { CouplingCaveatVm, InboxRoomVm, IncognitoVm } from "@/lib/ipc/client";
 import { mirrorDraft, saveDraft } from "@/lib/ipc/client";
 import { archiveRoomsStore } from "@/lib/stores/archive-rooms";
@@ -132,6 +133,7 @@ import { favoritesRoomsStore } from "@/lib/stores/favorites-rooms";
 import { incognitoStore } from "@/lib/stores/incognito";
 import { outboxStore } from "@/lib/stores/outbox";
 import { pinsRoomsStore } from "@/lib/stores/pins-rooms";
+import { primaryViewStore } from "@/lib/stores/primary-view";
 
 const account: AccountVm = {
   accountId: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
@@ -2927,5 +2929,103 @@ describe("ConversationPane — an Undo lands in the room it was held in (R447)",
     );
     expect(sendReply).not.toHaveBeenCalled();
     expect(sendText).not.toHaveBeenCalled();
+  });
+});
+
+describe("ConversationPane — the default agent's composer takes focus once it can (story 102.7, R102L1-01)", () => {
+  const originalMatchMedia = window.matchMedia;
+  function viewport(width: number) {
+    window.matchMedia = vi.fn().mockImplementation((query: string) => {
+      const match = query.match(/max-width:\s*(\d+)px/);
+      return {
+        matches: width <= (match ? Number(match[1]) : Number.POSITIVE_INFINITY),
+        media: query,
+        onchange: null,
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+        addListener: vi.fn(),
+        removeListener: vi.fn(),
+        dispatchEvent: vi.fn(),
+      };
+    });
+  }
+  afterEach(() => {
+    window.matchMedia = originalMatchMedia;
+    primaryViewStore.getState().setView("inbox");
+    composerStore.setState({ focusWhenReady: null });
+  });
+
+  const nixi = { accountId: account.accountId, roomId: "!nixi-dm:example.org" };
+  const marta = { accountId: account.accountId, roomId: "!marta:example.org" };
+  const firstBatch: TimelineBatch = {
+    ops: [{ op: "reset", items: [messageItem("k1", "@nixi:example.org", "hello")] }],
+  };
+
+  /** The real pane, every room's first batch held until the test delivers it. */
+  function heldFirstBatches(): Map<string, (b: TimelineBatch) => void> {
+    const held = new Map<string, (b: TimelineBatch) => void>();
+    subscribeTimeline.mockImplementation((_a, roomId: string, onBatch) => {
+      held.set(roomId, onBatch);
+      return Promise.resolve(1);
+    });
+    primaryViewStore.getState().setView("agents");
+    render(<ConversationPane {...noopProps()} />);
+    return held;
+  }
+
+  /** Every macrotask the launch's old zero-delay focus would have fired in. */
+  async function letTimersRun() {
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    });
+  }
+
+  it.each([
+    ["desktop", 1280],
+    ["phone", 390],
+  ])("%s: opened before its first batch, the composer is focused when the batch lands", async (_tier, width) => {
+    viewport(width);
+    const held = heldFirstBatches();
+    act(() => openAndFocus(nixi));
+    await waitFor(() => expect(held.has(nixi.roomId)).toBe(true));
+    await letTimersRun();
+    const field = screen.getByRole("textbox", { name: "Message" });
+    expect(field).toBeDisabled();
+    expect(field).not.toHaveFocus();
+
+    act(() => held.get(nixi.roomId)?.(firstBatch));
+    await waitFor(() => expect(screen.getByRole("textbox", { name: "Message" })).toHaveFocus());
+    expect(composerStore.getState().focusWhenReady).toBeNull();
+  });
+
+  it("the person opening another room before the batch keeps the focus out of both", async () => {
+    viewport(1280);
+    const held = heldFirstBatches();
+    act(() => openAndFocus(nixi));
+    await waitFor(() => expect(held.has(nixi.roomId)).toBe(true));
+    act(() => roomsStore.getState().selectRoom(marta));
+    await waitFor(() => expect(held.has(marta.roomId)).toBe(true));
+
+    act(() => held.get(marta.roomId)?.(firstBatch));
+    const field = await screen.findByRole("textbox", { name: "Message" });
+    await waitFor(() => expect(field).toBeEnabled());
+    await letTimersRun();
+    expect(field).not.toHaveFocus();
+    expect(composerStore.getState().focusWhenReady).toBeNull();
+  });
+
+  it("the person leaving for another window before the batch drops the request", async () => {
+    viewport(390);
+    const held = heldFirstBatches();
+    act(() => openAndFocus(nixi));
+    await waitFor(() => expect(held.has(nixi.roomId)).toBe(true));
+    act(() => primaryViewStore.getState().setView("inbox"));
+
+    act(() => held.get(nixi.roomId)?.(firstBatch));
+    const field = screen.getByRole("textbox", { name: "Message" });
+    await waitFor(() => expect(field).toBeEnabled());
+    await letTimersRun();
+    expect(field).not.toHaveFocus();
+    expect(composerStore.getState().focusWhenReady).toBeNull();
   });
 });

@@ -15,6 +15,7 @@
  */
 import { FilterX, MessagesSquare, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
+import { DefaultAgentChooser } from "@/components/agents/default-agent-chooser";
 import { ChatRow } from "@/components/chat/chat-row";
 import { FavoritesSection, hydrateFavoritesCollapsed } from "@/components/layout/favorites-section";
 import { PinsStrip } from "@/components/layout/pins-strip";
@@ -789,6 +790,9 @@ export function ChatListPane() {
             {agentNote}
           </p>
         )}
+        {/* The launch's "Choose the agent keeper opens when it starts"
+            (story 102.7, R463): non-blocking, above the agents it lists. */}
+        {view === "agents" && <DefaultAgentChooser />}
         {errored ? (
           <div className="flex flex-1 items-center justify-center p-4">
             <p className="text-center text-muted-foreground text-sm">

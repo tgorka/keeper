@@ -19,14 +19,8 @@ pub fn init(app: &tauri::App) {
     let data_dir = app.state::<crate::ipc::AppState>().platform.data_dir().ok();
     let telemetry = Telemetry::open(data_dir.as_deref(), config);
     app.manage(Arc::clone(&telemetry));
-    // Every account-layer install or clear — a pull that changed the
-    // account's `keeper.toml`, sign-out, forget, a refused sign-in — may
-    // change effective consent with no settings row moving (R496). Before
-    // anything installs a layer, so no transition is missed.
-    let handle = app.handle().clone();
-    keeper_core::config::set_account_layers_observer(Box::new(move || {
-        consent_changed(&handle, "an account settings file changed");
-    }));
+    // Every account-layer install or clear re-reads consent through the one
+    // layer transition `account_ipc::watch_layers` installs next (R496).
     tauri::async_runtime::spawn(telemetry.run());
 }
 
@@ -72,7 +66,7 @@ pub fn account_settled(app: &tauri::AppHandle, known: AccountConsentKnown) {
 }
 
 /// Re-read the effective consent and tell every window (R496).
-fn consent_changed(app: &tauri::AppHandle, failure: &'static str) {
+pub(crate) fn consent_changed(app: &tauri::AppHandle, failure: &'static str) {
     let telemetry = app.state::<Arc<Telemetry>>();
     match telemetry.reload_consent() {
         Ok(status) => {

@@ -470,6 +470,9 @@ pub(crate) fn apply(
     let mut voice = false;
     let mut embedding = false;
     let mut turn_picks = false;
+    // R488: told when the default agent as keeper reads it moved, not when a
+    // row was written beneath a file that keeps deciding it.
+    let default_agent = app.map(|_| keeper_core::agents::launch::DefaultAgentSeen::now(data_dir));
     for (key, value) in changes {
         let Some(stored) = settings_sync::stored_key(key, catalog) else {
             // Its base takes this device's value, so the file's is pulled
@@ -532,6 +535,11 @@ pub(crate) fn apply(
     // again and sent, since no voice command asked.
     if turn_picks {
         crate::voice_ipc::announce_wake();
+    }
+    if let (Some(app), Some(seen)) = (app, default_agent) {
+        if seen.moved(data_dir) {
+            crate::agents_ipc::default_agent_applied(app);
+        }
     }
     unapplied
 }

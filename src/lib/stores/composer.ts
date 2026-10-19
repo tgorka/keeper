@@ -94,6 +94,16 @@ export interface ComposerState {
    */
   focusNonce: number;
   /**
+   * A focus request for one room's composer that waits until that composer
+   * can take it (story 102.7, R463): opening the default agent selects its
+   * room before its timeline has arrived, and the composer stays disabled
+   * until it has. The room's mounted composer focuses itself once it is
+   * enabled and settles the request ({@link ComposerState.focusLanded}) only
+   * when focus actually landed; the opener drops it when the person moves on
+   * first ({@link ComposerState.dropFocus}). `null` when none waits.
+   */
+  focusWhenReady: { accountId: string; roomId: string } | null;
+  /**
    * Enter reply mode for `target`. The typed draft is left untouched (reply keeps
    * the user's text), so nothing is stashed.
    */
@@ -117,6 +127,12 @@ export interface ComposerState {
   clearSelection: () => void;
   /** Request programmatic composer focus by bumping {@link ComposerState.focusNonce}. */
   requestFocus: () => void;
+  /** Ask `room`'s composer to take focus once it is enabled; replaces any waiting request. */
+  focusRoomWhenReady: (room: { accountId: string; roomId: string }) => void;
+  /** Focus landed for `request`: it no longer waits (a newer request is kept). */
+  focusLanded: (request: { accountId: string; roomId: string }) => void;
+  /** The person moved on before `request` landed: drop it (a newer request is kept). */
+  dropFocus: (request: { accountId: string; roomId: string }) => void;
   /**
    * Restore `body` into the `(accountId, roomId)` composer (Story 8.3): set
    * {@link ComposerState.restoreBody}/{@link ComposerState.restoreTarget} and bump
@@ -148,6 +164,7 @@ export function createComposerStore(): StoreApi<ComposerState> {
     restoreTarget: null,
     restoreNonce: 0,
     focusNonce: 0,
+    focusWhenReady: null,
     startReply: ({ targetKey, sender, bodyPreview, eventId }) =>
       // Reply leaves the typed draft alone: no stash, clear any prior edit stash.
       set({
@@ -174,6 +191,11 @@ export function createComposerStore(): StoreApi<ComposerState> {
     select: (key) => set({ selectedKey: key }),
     clearSelection: () => set({ selectedKey: null }),
     requestFocus: () => set((state) => ({ focusNonce: state.focusNonce + 1 })),
+    focusRoomWhenReady: ({ accountId, roomId }) => set({ focusWhenReady: { accountId, roomId } }),
+    focusLanded: (request) =>
+      set((state) => (state.focusWhenReady === request ? { focusWhenReady: null } : {})),
+    dropFocus: (request) =>
+      set((state) => (state.focusWhenReady === request ? { focusWhenReady: null } : {})),
     restore: (accountId, roomId, body) =>
       set((state) => ({
         restoreBody: body,

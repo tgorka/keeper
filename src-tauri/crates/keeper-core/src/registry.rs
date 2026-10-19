@@ -1121,6 +1121,30 @@ pub fn set_agents_default(data_dir: &Path, agent: Option<&str>) -> Result<(), Co
     )
 }
 
+/// The `settings` key holding the keeper version in which the person put the
+/// launch's default-agent chooser away (story 102.7, R463); absent when they
+/// never did. Session state on this device: it never travels.
+const UI_DEFAULT_AGENT_CHOOSER_DISMISSED_KEY: &str = "ui.default_agent_chooser_dismissed";
+
+/// Read the keeper version in which the chooser was put away, trimmed;
+/// absent or blank ⇒ `None`.
+pub fn get_default_agent_chooser_dismissed(data_dir: &Path) -> Result<Option<String>, CoreError> {
+    Ok(
+        get_setting(data_dir, UI_DEFAULT_AGENT_CHOOSER_DISMISSED_KEY)?
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty()),
+    )
+}
+
+/// Record that the chooser was put away in keeper `version`
+/// (`keeper_core::agents::launch::dismiss_chooser`).
+pub fn set_default_agent_chooser_dismissed(
+    data_dir: &Path,
+    version: &str,
+) -> Result<(), CoreError> {
+    set_setting(data_dir, UI_DEFAULT_AGENT_CHOOSER_DISMISSED_KEY, version)
+}
+
 /// The `settings` key naming the lease this desktop host takes a session's
 /// claim on (R455): `short` (absent included) or `quarter-hour`.
 pub const AGENTS_CLAIMS_LEASE_KEY: &str = "agents.claims_lease";

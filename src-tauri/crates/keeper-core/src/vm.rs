@@ -793,6 +793,14 @@ pub struct RoomVm {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub agent_mark: Option<String>,
+    /// An agent room's agent: the Matrix user id of the agent working it
+    /// (the delegate in a delegated room), read from its status (story
+    /// 102.7, R463) — what the row's default marker and its "Make default"
+    /// compare and store; absent for every other room and for an agent room
+    /// whose status was not read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub agent: Option<String>,
     /// An agent room's state in the list (story 101.6, R421): needs you,
     /// failed, working or done since the person last read it — Rust's word,
     /// drawn by the row and never derived; absent for every other room and
@@ -2062,6 +2070,12 @@ pub struct InboxRoomVm {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub agent_mark: Option<String>,
+    /// Copied through from [`RoomVm::agent`]: the Matrix user id of the
+    /// agent working this row's room (story 102.7, R463); absent for every
+    /// other row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub agent: Option<String>,
     /// An agent room's state in the list (story 101.6, R421): needs you,
     /// failed, working or done since the person last read it — Rust's word,
     /// drawn by the row and never derived; absent for every other room and
@@ -8522,6 +8536,7 @@ mod tests {
             agent_room: None,
             agent_avatar: None,
             agent_mark: None,
+            agent: None,
             agent_attention: None,
         }
     }
@@ -8710,6 +8725,7 @@ mod tests {
             agent_room: None,
             agent_avatar: None,
             agent_mark: None,
+            agent: None,
             agent_attention: None,
         }
     }
@@ -8747,6 +8763,7 @@ mod tests {
             agent_room: None,
             agent_avatar: None,
             agent_mark: None,
+            agent: None,
             agent_attention: None,
         };
         let json = serde_json::to_string(&vm).expect("serialize");

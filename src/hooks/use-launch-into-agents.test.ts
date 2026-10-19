@@ -7,6 +7,9 @@ vi.mock("@/lib/ipc/client", () => ({
   agentsDefaultGet: vi.fn(),
   agentsDefaultSet: vi.fn(),
   agentMainDmOpen: vi.fn(),
+  navStateGet: vi.fn(),
+  navStateSet: vi.fn(() => Promise.resolve()),
+  navStateClear: vi.fn(() => Promise.resolve()),
   frontendErrorReport: vi.fn(() => Promise.resolve()),
   telemetryCapture: vi.fn(() => Promise.resolve()),
 }));
@@ -24,10 +27,12 @@ import {
   REASON_NOTICE_MS,
   useLaunchIntoAgents,
 } from "@/hooks/use-launch-into-agents";
+import { useNavStatePersistence } from "@/hooks/use-nav-state-persistence";
 import {
   agentMainDmOpen,
   agentsLaunch,
   frontendErrorReport,
+  navStateGet,
   telemetryCapture,
 } from "@/lib/ipc/client";
 import { accountsStore } from "@/lib/stores/accounts";
@@ -58,6 +63,7 @@ function answer(overrides: Partial<AgentsLaunchVm>): AgentsLaunchVm {
     reason: null,
     announce: false,
     choices: [],
+    chooser: false,
     fileSet: null,
     ask: null,
     askable: [],
@@ -99,12 +105,14 @@ function reset(): void {
   capabilitiesStore.setState({ capabilities: DEFAULT_CAPABILITIES, hydrated: false });
   primaryViewStore.getState().setView("inbox");
   roomsStore.getState().selectRoom(null);
+  composerStore.setState({ focusWhenReady: null });
   defaultAgentStore.setState({
     vm: null,
     readError: null,
     saveError: null,
     saving: false,
     navRestore: "pending",
+    chooserOpen: false,
   });
 }
 
@@ -114,7 +122,6 @@ afterEach(reset);
 describe("useLaunchIntoAgents", () => {
   it("asks once the accounts are hydrated, without waiting for the Agents window, and opens the default agent's room", async () => {
     mockLaunch.mockResolvedValue(answer({ room: DM, defaultAgent: "@nixi:example.org" }));
-    const focusBefore = composerStore.getState().focusNonce;
     renderHook(() => useLaunchIntoAgents());
     await settle();
     expect(mockLaunch).not.toHaveBeenCalled();
@@ -126,8 +133,8 @@ describe("useLaunchIntoAgents", () => {
     expect(mockLaunch).toHaveBeenCalledTimes(1);
     expect(primaryViewStore.getState().view).toBe("agents");
     expect(roomsStore.getState().selected).toEqual(DM);
-    // After the room's composer mounted (the next macrotask).
-    await vi.waitFor(() => expect(composerStore.getState().focusNonce).toBe(focusBefore + 1));
+    // Its composer is asked to take focus once it is enabled (R102L1-01).
+    expect(composerStore.getState().focusWhenReady).toEqual(DM);
     expect(defaultAgentStore.getState().vm?.defaultAgent).toBe("@nixi:example.org");
     // Counted once as the closed surface, nothing about the agent or room (DW-1410).
     expect(telemetryCapture).toHaveBeenCalledTimes(1);
@@ -301,26 +308,60 @@ describe("useLaunchIntoAgents", () => {
     expect(frontendErrorReport).toHaveBeenCalledTimes(1);
   });
 
+  it("asks once which agent opens when Rust says nothing is chosen (R463)", async () => {
+    mockLaunch.mockResolvedValue(
+      answer({ chooser: true, choices: [{ agent: "@nixi:example.org", name: "Nixi" }] }),
+    );
+    renderHook(() => useLaunchIntoAgents());
+    boot();
+    await settle();
+    expect(primaryViewStore.getState().view).toBe("agents");
+    expect(roomsStore.getState().selected).toBeNull();
+    expect(defaultAgentStore.getState().chooserOpen).toBe(true);
+    expect(toast).not.toHaveBeenCalled();
+  });
+
+  it("does not ask when Rust does not say to", async () => {
+    mockLaunch.mockResolvedValue(
+      answer({ chooser: false, choices: [{ agent: "@nixi:example.org", name: "Nixi" }] }),
+    );
+    renderHook(() => useLaunchIntoAgents());
+    boot();
+    await settle();
+    expect(primaryViewStore.getState().view).toBe("agents");
+    expect(defaultAgentStore.getState().chooserOpen).toBe(false);
+  });
+
+  it("on a cold phone launch the restore has nothing, and the default's conversation opens focused (R463)", async () => {
+    // A true app kill restarts Rust fresh: no stored navigation.
+    vi.mocked(navStateGet).mockResolvedValue(null);
+    mockLaunch.mockResolvedValue(answer({ room: DM, defaultAgent: "@nixi:example.org" }));
+    renderHook(() => {
+      useNavStatePersistence();
+      useLaunchIntoAgents();
+    });
+    boot({ phone: true });
+    await settle();
+    await vi.waitFor(() => expect(roomsStore.getState().selected).toEqual(DM));
+    expect(defaultAgentStore.getState().navRestore).toBe("nothing");
+    expect(primaryViewStore.getState().view).toBe("agents");
+    expect(composerStore.getState().focusWhenReady).toEqual(DM);
+    expect(roomsStore.getState().selected).toEqual(DM);
+  });
+
   it("on the phone waits for the restore and applies only when nothing was restored", async () => {
     mockLaunch.mockResolvedValue(answer({ room: DM }));
-    const focusBefore = composerStore.getState().focusNonce;
     renderHook(() => useLaunchIntoAgents());
     boot({ phone: true });
     await settle();
     expect(mockLaunch).not.toHaveBeenCalled();
 
-    vi.useFakeTimers({ toFake: ["setTimeout"] });
-    try {
-      act(() => defaultAgentStore.getState().setNavRestore("nothing"));
-      await settle();
-      expect(primaryViewStore.getState().view).toBe("agents");
-      expect(roomsStore.getState().selected).toEqual(DM);
-      act(() => vi.runAllTimers());
-      // The phone never steals composer focus when a room opens.
-      expect(composerStore.getState().focusNonce).toBe(focusBefore);
-    } finally {
-      vi.useRealTimers();
-    }
+    act(() => defaultAgentStore.getState().setNavRestore("nothing"));
+    await settle();
+    expect(primaryViewStore.getState().view).toBe("agents");
+    expect(roomsStore.getState().selected).toEqual(DM);
+    // The phone shows the conversation with its composer focused (R463).
+    expect(composerStore.getState().focusWhenReady).toEqual(DM);
   });
 
   it("on the phone leaves a restored room where it was", async () => {

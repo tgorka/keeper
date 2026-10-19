@@ -622,6 +622,7 @@ fn kept_row(room: &str, at: i64, attention: Option<AgentAttentionVm>) -> RoomVm 
         agent_room: Some(crate::agents::room::AgentRoomKindVm::Proxy),
         agent_avatar: None,
         agent_mark: Some("N".to_owned()),
+        agent: None,
         agent_attention: attention,
     }
 }

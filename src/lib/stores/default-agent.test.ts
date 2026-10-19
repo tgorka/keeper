@@ -30,6 +30,7 @@ function answer(defaultAgent: string | null): AgentsLaunchVm {
       { agent: NIXI, name: "Nixi" },
       { agent: TALA, name: "Tala" },
     ],
+    chooser: false,
     fileSet: null,
     ask: null,
     askable: [],

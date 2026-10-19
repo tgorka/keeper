@@ -3454,13 +3454,27 @@ keeper shows an agent's room in its own timeline, on the Mac and on the iPhone a
   or more who is not you. Anyone else's marked message — in any room — is an ordinary message:
   it notifies, shows "Edited" when edited, is cut at 4096 characters and never carries the caret.
 - **At launch: the default agent (story 100.3, R383).** `agents.default` holds one agent's Matrix
-  user id, or nothing; choose it under Settings › *Default agent* (None, or one of the agents you
-  have a `main` conversation with here) or from the agent room header's menu (*Make default*,
-  *Stop opening at launch*). It is a user-global setting: a `keeper.toml` may set it and it travels
-  with your account's settings. When keeper starts and your signed-in accounts have at least one
-  agent room, it opens the Agents window; when the default agent's `main` room — your DM with that
-  proxy — is on one of those accounts, that room is open (and, on the Mac, its composer focused).
-  When it is not (an agent you have no conversation with here, or a value that is not a user id),
+  user id, or nothing; choose it under Settings › *Default agent* (None, or one of your agents:
+  those you have a `main` conversation with here, and your own agents keeper can ask for one),
+  from the agent room header's menu (*Make default*, *Stop opening at launch*), or from any agent
+  row's menu in the Agents list (*Make default*; on the default's rows *Default*, checked, which
+  stops it opening at launch). The default agent's rows in the Agents list wear a *Default*
+  marker before their name ("Opens when keeper starts"). It is a user-global setting: a
+  `keeper.toml` may set it and it travels with your account's settings; when another device's
+  choice syncs here, or a sync changes what your account's `keeper.toml` sets, the markers and
+  the menus follow the default that opens at once — and stay put when a synced choice lands
+  beneath a file that keeps deciding it (R488). When keeper starts and
+  your signed-in accounts have at least one agent room, it opens the Agents window; when the
+  default agent's `main` room — your DM with that proxy — is on one of those accounts, that room
+  is open and its composer takes focus as soon as the conversation has loaded (it cannot be
+  typed in before), on the Mac and the phone alike (story 102.7, R463, R478; on the phone, the
+  conversation screen) — unless you opened another room or window first.
+  With no default chosen, the Agents window opens with *Choose the agent keeper opens when it
+  starts* above the list: a choice is stored and its conversation opens at once — unless you
+  opened another room or window while it was being saved, which keeps you there; *Not now* puts
+  it away until keeper is updated (a note on this device only — it never travels); ignoring it
+  asks again at the next launch. It is not shown when a settings file decides the key.
+  When a default is chosen but its room is not here (an agent you have no conversation with here, or a value that is not a user id),
   the Agents window opens with nothing selected, a notice says why, the Settings row says the same
   sentence, and `keeper.log` has it at WARN. With no agent rooms, keeper opens the Inbox as before.
   When the default agent is your own proxy and has no conversation with you here — agent rooms or
@@ -3477,8 +3491,8 @@ keeper shows an agent's room in its own timeline, on the Mac and on the iPhone a
   system reclaimed the webview) had nothing to restore. When a settings file sets
   `agents.default`, Settings and the room header's menu say so and name the file: a choice made
   there is kept, but the file's agent is what opens until the file stops setting it. A failed read
-  is a sentence where the choice or the menu would be; a failed save is said beside the control;
-  both reach `keeper.log`.
+  is a sentence where the choice or the menu would be, and above the Agents list; a failed save is
+  said beside the control; both reach `keeper.log`.
 - **Slash commands.** Typing `/` at the start of the composer opens a menu above it (Story
   100.5): every row is a command this room offers, with its other spellings, a sentence and the
   argument it takes. It filters as you type; ↑/↓ move, Enter or Tab completes the name and a

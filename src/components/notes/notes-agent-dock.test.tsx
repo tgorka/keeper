@@ -503,6 +503,7 @@ describe("the assistant dock", () => {
       reason: null,
       announce: false,
       choices: [],
+      chooser: false,
       fileSet: null,
       ask: null,
       askable: [
@@ -538,6 +539,7 @@ describe("the assistant dock", () => {
       reason: null,
       announce: false,
       choices: [],
+      chooser: false,
       fileSet: null,
       ask: null,
       askable: [
@@ -575,6 +577,7 @@ describe("the assistant dock", () => {
       reason: null,
       announce: false,
       choices: [],
+      chooser: false,
       fileSet: null,
       ask: null,
       askable: askable.map((one) => ({

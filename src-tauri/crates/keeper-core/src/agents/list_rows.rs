@@ -291,6 +291,9 @@ impl ListRowStore {
                 agent_room: Some(agent_room),
                 agent_avatar,
                 agent_mark,
+                // Not kept: the row's agent is read with its live list, and
+                // its Default marker appears then (DW-1573).
+                agent: None,
                 agent_attention: Some(drawn_again(attention)),
             });
         }
@@ -392,6 +395,7 @@ mod tests {
             agent_room: Some(AgentRoomKindVm::Proxy),
             agent_avatar: Some("mxc://h/nixi".to_owned()),
             agent_mark: Some("N".to_owned()),
+            agent: None,
             agent_attention: attention,
         }
     }

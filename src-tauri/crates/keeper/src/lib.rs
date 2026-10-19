@@ -418,6 +418,9 @@ pub fn run() {
     let builder = builder
         .setup(|app| {
             telemetry_ipc::init(app);
+            // The one account-layer transition (consent, then the default
+            // agent; R488 × R496), before any layer is installed.
+            account_ipc::watch_layers(app);
             // The Android voice port's plugin calls and its event channel
             // (98.4), before `voice_ipc::boot` hands the port its language.
             #[cfg(target_os = "android")]
@@ -1111,6 +1114,8 @@ pub fn run() {
                 agents_ipc::agents_launch,
                 agents_ipc::agents_default_get,
                 agents_ipc::agents_default_set,
+                // Story 102.7 (R463): the launch's chooser put away.
+                agents_ipc::agents_default_chooser_dismiss,
                 // R455: the claims lease Settings › Agents turns on.
                 agents_ipc::agents_claims_lease_get,
                 agents_ipc::agents_claims_lease_set,

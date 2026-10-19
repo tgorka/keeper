@@ -332,6 +332,7 @@ describe("AgentRoomHeader's default-agent menu", () => {
       reason: null,
       announce: false,
       choices: [{ agent: NIXI, name: "Nixi" }],
+      chooser: false,
       fileSet: null,
       ask: null,
       askable: [],

@@ -5,9 +5,10 @@
  * (`defaultAgentStore.launch`) and apply the answer exactly once. Rust answers
  * when it knows — once every signed-in account has finished its first sync, or
  * as soon as the default agent's room is here, never later than its bound —
- * so nothing here waits for the Agents window or reads its rooms: the Agents window, and the default agent's
- * `main` room opened (and, on the desktop, its composer focused) when Rust
- * named one. Which room — or none, and why — is Rust's
+ * so nothing here waits for the Agents window or reads its rooms: the Agents
+ * window, and the default agent's `main` room opened with its composer
+ * focused — on the desktop and the phone (R463) — when Rust named one. Which
+ * room — or none, and why — is Rust's
  * (`keeper_core::agents::launch::choose`); this hook decides nothing about it.
  *
  * The person always wins: any change of window or room made before the
@@ -33,16 +34,21 @@
  * open, says so, and reports the error to `keeper.log`. Opening the Agents
  * window is counted once as the closed `launchDefaultAgent` surface (R391),
  * with nothing about the agent or the room.
+ *
+ * With no default chosen, Rust may say to ask which agent opens
+ * (`AgentsLaunchVm.chooser`, R463): the Agents window opens and its chooser
+ * is shown once (`defaultAgentStore.openChooser`), non-blocking — the
+ * person may ignore it, choose, or put it away.
  */
 import { useEffect, useRef } from "react";
 import { toast } from "sonner";
 import { captureSurface } from "@/hooks/use-telemetry";
 import { reportFrontendError } from "@/lib/crash-report";
+import { openAndFocus } from "@/lib/default-agent-actions";
 import type { LaunchRoomVm } from "@/lib/ipc/client";
 import { openMainDm } from "@/lib/main-dm";
 import { useAccountsStore } from "@/lib/stores/accounts";
 import { useCapabilitiesStore, useIsReducedCapabilityPlatform } from "@/lib/stores/capabilities";
-import { composerStore } from "@/lib/stores/composer";
 import { defaultAgentStore, sentenceOf, useDefaultAgentStore } from "@/lib/stores/default-agent";
 import { primaryViewStore } from "@/lib/stores/primary-view";
 import { roomsStore } from "@/lib/stores/rooms";
@@ -121,21 +127,12 @@ export function useLaunchIntoAgents(): void {
             return;
           }
           void captureSurface("launchDefaultAgent");
-          // Desktop keeps focus-on-open; the phone never steals composer
-          // focus when a room opens (UX-DR22). After the room's composer has
-          // mounted: a fresh composer seeds its focus nonce at mount, so a
-          // bump made in the same tick as the selection is never seen.
+          // The room opens with its composer focused, on the phone too
+          // (R463): the phone shows the conversation, not the list.
           const open = (room: LaunchRoomVm) => {
             applyingRef.current = true;
-            roomsStore.getState().selectRoom(room);
+            openAndFocus(room);
             applyingRef.current = false;
-            if (!phone) {
-              window.setTimeout(() => {
-                if (roomsStore.getState().selected?.roomId === room.roomId) {
-                  composerStore.getState().requestFocus();
-                }
-              }, 0);
-            }
           };
           applyingRef.current = true;
           primaryViewStore.getState().setView("agents");
@@ -144,6 +141,10 @@ export function useLaunchIntoAgents(): void {
             open(vm.room);
           }
           announce();
+          // Nothing chosen yet: ask, once, which agent opens (R463).
+          if (vm.chooser) {
+            defaultAgentStore.getState().openChooser();
+          }
           // The default agent has no conversation here: Rust asks it for one
           // and the room opens when it lands — unless the person has moved
           // on meanwhile (story 101.1 #4, R416).

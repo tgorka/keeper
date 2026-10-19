@@ -11347,3 +11347,31 @@ origin: lane `open` finisher F102open0 (story 102.6 #1), 2026-10-19
 location: `keeper_core::timeline::forward_timeline` (`search_due`), `keeper_core::agents::room::page_back` (`Room::messages` saves into the event cache)
 reason: with the header's search (`Room::messages`, which saves what it reads into the room's event cache) and a back-pagination of the same room in flight together, the pagination was seen never to reach the server (matrix-sdk 0.18; loopback harness, 8 of 25 runs). keeper now starts the search only once its own fill is at rest, but a person who scrolls up while the search runs (one to four requests) pages beside it. A search that reads through a request that does not save into the cache (decrypting itself), or an upstream fix, would close it.
 status: closed (fix lane F102open1, R509/03, R510, 2026-10-19: `room::page_back` reads through `room::history_page`, a raw `/messages` request through the client that decrypts what it can itself and saves nothing into the event cache, so no caller's pagination can meet it; `search_due` is gone; test `timeline::open_tests::the_header_search_never_meets_the_persons_pagination` pages beside a held search and finds nothing the search read in the cache)
+
+### DW-1570: The room header's "Make default" is offered for fewer agents than the row menu.
+
+origin: lane `launch` (story 102.7), 2026-10-19
+location: `src/components/chat/agent-room-header.tsx` (`AgentDefaultMenu`), `src/components/chat/chat-row.tsx`
+reason: R463 asks every agent row to offer "Make default"; R398 limits the header to Rust's choices or the stored agent so it "never announces an agent that will not open". Rows now store any agent (and `saveDefaultAgent` says Rust's reason when it will not open); the header kept R398's limit. One rule for both surfaces is the coordinator's call.
+status: open (deferred by the coordinator, R479)
+
+### DW-1571: The launch's composer focus on the iPhone is unproven on a device.
+
+origin: lane `launch` (story 102.7, R463), 2026-10-19
+location: `src/lib/default-agent-actions.ts` (`openAndFocus`), `src/hooks/use-launch-into-agents.ts`
+reason: WKWebView may not raise the keyboard for a programmatic `focus()` without a user gesture (`keyboardDisplayRequiresUserAction`). The browser proof and the tests show the textarea focused; whether kalypso shows the keyboard at launch is owed on the device.
+status: open (owed: kalypso)
+
+### DW-1572: The rows' "Default" marker does not follow a default changed on another device until keeper reads it again.
+
+origin: lane `launch` (story 102.7), 2026-10-19
+location: `src/lib/stores/default-agent.ts`, `src/components/agents/default-agent-chooser.tsx` (the read on mount)
+reason: `agents.default` travels with the account's settings (epic 84), but `defaultAgentStore.vm` is read at launch, when the Agents window mounts with nothing read, and by Settings or a room header. A pull that changes the key does not push a new answer, so the marker can show the old default until one of those reads. A settings-changed signal from the sync into the store would close it.
+status: closed (lane `launch`, fix round 1, R475, 2026-10-19: promoted into story 102.7 — `account_settings::apply` emits `keeper://agents-default-changed` when a pulled `agents.default` was written (`agents_ipc::default_agent_applied`; there was no settings-changed event), and the app-wide `useDefaultAgentFollowsSync` re-reads through `defaultAgentStore.load`; test `chat-row.test.tsx` "follows a default another device chose once the setting syncs here, with only the list open"); reopened by review RR102launch2 (R102L2-01: a row write is not the effective default — the account's `keeper.toml` layers moved it without a row, and a row beneath an unchanged file moved nothing) and closed again (lane `launch`, fix round 2, R488, 2026-10-19: `keeper_core::agents::launch::DefaultAgentSeen` compares the default as `registry::get_agents_default` reads it — files first, then the table — before and after every account-layer install or clear (`account_ipc::install_layers`, which every `apply_clone` path, sign-out, forget and setup go through) and every synced settings batch (`account_settings::apply`); the event goes only when it moved. Tests: `launch.rs` `the_account_file_moving_the_default_is_a_change_though_no_row_moved`, `the_account_file_going_away_reveals_the_stored_default`, `a_row_written_beneath_an_unchanged_file_is_no_change`, `a_default_that_does_not_read_counts_as_moved`; mutation `mut-102launch-fix2.log`)
+
+### DW-1573: A kept Agents row drawn before its account starts shows no Default marker.
+
+origin: lane `102stack` (the stack of epic 102: 102.5's kept rows × 102.7's row agent), 2026-10-19
+location: `keeper_core::agents::list_rows` (the `agent_list_rows` table), `RoomVm::agent`
+reason: the rows kept from the last run (R468) are drawn before any account is activated, and the table keeps no agent id, so a kept row carries `agent: None`: its Default marker and its "Make default" appear only once the account's live list replaces the kept rows. Keeping the agent needs a column in the kept-rows table.
+status: open
