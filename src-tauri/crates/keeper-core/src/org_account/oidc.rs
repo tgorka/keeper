@@ -52,7 +52,8 @@ use super::descriptor::{AccountDescriptor, Endpoints, ForgeOauth, RepoAuthConfig
 use super::loopback::{self, Listener};
 use super::session::{
     self, forge_key, load_bound_forge, load_bound_session, load_forge, load_session, refresh_lock,
-    session_key, store_forge, store_session, Binding, Identity, StoredForge, StoredSession,
+    session_key, store_forge, store_session, Binding, DeviceApp, Identity, StoredForge,
+    StoredSession,
 };
 use super::{claims, AccountError};
 use crate::oauth::{OAuthCallback, OAuthFlowRegistry};
@@ -1034,17 +1035,42 @@ fn still_fresh(expires_ms: Option<i64>) -> bool {
     expires_ms.is_some_and(|at| at - REFRESH_EARLY_MS > now_ms())
 }
 
-/// Connect the config repository's forge (`oauth` mode): a second PKCE flow
-/// against the forge in the same browser session. The forge must sign the
-/// person in as `expected_login`, or its tokens are discarded.
+/// Connect the config repository's forge (`oauth` mode): a PKCE flow against
+/// the forge in the same browser session. The forge must sign the person in
+/// as `expected_login`, or its tokens are discarded.
+///
+/// Forgejo and Gitea keep **one** grant per person and OAuth application,
+/// with a counter every sign-in and every refresh advances: a token issued to
+/// one device retires every other device's refresh token ("refresh token for
+/// grant_id = 2 was used twice!"), and the person's devices take turns being
+/// signed out of the repository (hesperia and kalypso, 2026-10-05 and
+/// 2026-10-18). So the first flow, under the descriptor's shared client, is
+/// a bootstrap: its token registers this device's own application (named
+/// after `device`, so the person can tell it apart and revoke it in the
+/// forge's settings), and a second flow under that application yields the
+/// stored credential — a grant no other device's sign-in touches.
+///
+/// A forge that registers no application (no `api_base`, a scope without
+/// `write:user`, a forge without the endpoint) keeps the shared client's
+/// token, as before per-device applications.
 pub async fn forge_connect(
     platform: &dyn Platform,
     flows: &OAuthFlowRegistry,
     http: &reqwest::Client,
     d: &AccountDescriptor,
     expected_login: &str,
+    device: &str,
 ) -> Result<(), AccountError> {
-    forge_connect_within(platform, flows, http, d, expected_login, FLOW_TIMEOUT).await
+    forge_connect_within(
+        platform,
+        flows,
+        http,
+        d,
+        expected_login,
+        device,
+        FLOW_TIMEOUT,
+    )
+    .await
 }
 
 async fn forge_connect_within(
@@ -1053,6 +1079,7 @@ async fn forge_connect_within(
     http: &reqwest::Client,
     d: &AccountDescriptor,
     expected_login: &str,
+    device: &str,
     wait: Duration,
 ) -> Result<(), AccountError> {
     let RepoAuthConfig::Oauth(forge) = &d.config.auth else {
@@ -1065,50 +1092,50 @@ async fn forge_connect_within(
     })?;
     let oauth_http = ReqwestClient::from(http.clone());
     let mut provider = forge_provider(&oauth_http, forge).await?;
-    // One scope string, byte-identical on every device and version.
-    let scopes = [forge.scope.clone()];
-    let grant = authorize(
+    let leg = ForgeLeg {
         platform,
         flows,
-        &provider,
-        &redirect,
-        &scopes,
-        forge.signin_url.as_deref(),
+        http,
+        oauth_http: &oauth_http,
+        d,
+        forge,
+        redirect: &redirect,
+        expected_login,
         wait,
-    )
-    .await?;
-    let nonce = grant.nonce.clone();
-    let tokens = exchange(&oauth_http, &provider, grant).await?;
-
-    let mut login = None;
-    if let (Some(_), Some(id_token)) = (&provider.oidc, tokens.id_token()) {
-        let claims = verify(
-            &oauth_http,
-            &mut provider,
-            id_token,
-            NonceRule::Exact(&nonce),
-            Some(tokens.access_token()),
-        )
-        .await?;
-        login = string_claim(&claims, "preferred_username");
-    }
-    let login = match login {
-        Some(login) => login,
-        None => {
-            forge_user_login(
-                http,
-                d,
-                forge,
-                tokens.access_token().secret(),
-                &provider.host,
-            )
-            .await?
-        }
     };
-    if login != expected_login {
-        return Err(AccountError::Refused(format!(
-            "The forge signed you in as {login}, but your keeper account is {expected_login}."
-        )));
+    // One scope string, byte-identical on every device and version: Forgejo
+    // refuses an authorization whose scope differs from the shared grant's.
+    let (mut tokens, mut login) = leg.authorize(&mut provider, &forge.scope).await?;
+
+    let mut device_app = None;
+    if let Some(api_base) = d.config.api_base.as_deref() {
+        let bootstrap = tokens.access_token().secret().clone();
+        let name = device_app_name(device);
+        match register_device_app(http, api_base, &bootstrap, &name, &redirect).await {
+            Ok(app) => {
+                provider.client_id = ClientId::new(app.client_id.clone());
+                match leg
+                    .authorize(&mut provider, &device_scope(&forge.scope))
+                    .await
+                {
+                    Ok(answer) => (tokens, login) = answer,
+                    Err(error) => {
+                        // Nothing will ever use it: take it away again while
+                        // the bootstrap token can.
+                        delete_device_app(http, api_base, &bootstrap, &app, &provider.host).await;
+                        return Err(error);
+                    }
+                }
+                tracing::info!(account = %d.id, app = %app.name, "account: this device signed in to the forge under its own application");
+                device_app = Some(app);
+            }
+            Err(why) => tracing::warn!(
+                account = %d.id,
+                host = %provider.host,
+                %why,
+                "account: the forge registered no application for this device; it keeps the shared client, whose refresh token another device's sign-in ends"
+            ),
+        }
     }
 
     let stored = StoredForge {
@@ -1117,10 +1144,198 @@ async fn forge_connect_within(
         refresh_token: tokens.refresh_token().map(|t| t.secret().clone()),
         expires_ms: expiry_ms(tokens.expires_in()),
         login,
+        device_app,
     };
     let lock = refresh_lock(&forge_key(&d.id));
     let _held = lock.lock().await;
     store_forge(platform, &d.id, &stored)
+}
+
+/// What every authorization of one forge connection shares.
+struct ForgeLeg<'a> {
+    platform: &'a dyn Platform,
+    flows: &'a OAuthFlowRegistry,
+    http: &'a reqwest::Client,
+    oauth_http: &'a ReqwestClient,
+    d: &'a AccountDescriptor,
+    forge: &'a ForgeOauth,
+    redirect: &'a str,
+    expected_login: &'a str,
+    wait: Duration,
+}
+
+impl ForgeLeg<'_> {
+    /// One authorization under `provider`'s client, through `signin_url`,
+    /// and the forge login it signed in — refused unless it is
+    /// `expected_login`.
+    async fn authorize(
+        &self,
+        provider: &mut Provider,
+        scope: &str,
+    ) -> Result<(CoreTokenResponse, String), AccountError> {
+        let grant = authorize(
+            self.platform,
+            self.flows,
+            provider,
+            self.redirect,
+            &[scope.to_owned()],
+            self.forge.signin_url.as_deref(),
+            self.wait,
+        )
+        .await?;
+        let nonce = grant.nonce.clone();
+        let tokens = exchange(self.oauth_http, provider, grant).await?;
+
+        let mut login = None;
+        if let (Some(_), Some(id_token)) = (&provider.oidc, tokens.id_token()) {
+            let claims = verify(
+                self.oauth_http,
+                provider,
+                id_token,
+                NonceRule::Exact(&nonce),
+                Some(tokens.access_token()),
+            )
+            .await?;
+            login = string_claim(&claims, "preferred_username");
+        }
+        let login = match login {
+            Some(login) => login,
+            None => {
+                forge_user_login(
+                    self.http,
+                    self.d,
+                    self.forge,
+                    tokens.access_token().secret(),
+                    &provider.host,
+                )
+                .await?
+            }
+        };
+        if login != self.expected_login {
+            return Err(AccountError::Refused(format!(
+                "The forge signed you in as {login}, but your keeper account is {}.",
+                self.expected_login
+            )));
+        }
+        Ok((tokens, login))
+    }
+}
+
+/// What the person sees in the forge's list of applications: keeper, the
+/// device, and the day, so an application a reset device left behind can be
+/// told from the live one.
+fn device_app_name(device: &str) -> String {
+    format!("keeper ({device}, {})", Utc::now().format("%Y-%m-%d"))
+}
+
+/// The scope this device's own application asks for: the descriptor's, with
+/// `write:user` — needed only by the bootstrap token that registered the
+/// application — narrowed to `read:user`. Kept as written when `write:user`
+/// is its only API scope: dropping it would leave Forgejo's "no API scope",
+/// which is every scope.
+fn device_scope(scope: &str) -> String {
+    const OIDC: [&str; 4] = ["openid", "profile", "email", "groups"];
+    let words: Vec<&str> = scope.split_whitespace().collect();
+    let other_api = words
+        .iter()
+        .any(|w| *w != "write:user" && !OIDC.contains(w));
+    if !words.contains(&"write:user") || !other_api {
+        return scope.to_owned();
+    }
+    let mut narrowed: Vec<&str> = Vec::with_capacity(words.len());
+    for word in words {
+        let word = if word == "write:user" {
+            "read:user"
+        } else {
+            word
+        };
+        if !narrowed.contains(&word) {
+            narrowed.push(word);
+        }
+    }
+    narrowed.join(" ")
+}
+
+/// The forge's answer to an application registration; its `client_secret`
+/// is never read.
+#[derive(Deserialize)]
+struct RegisteredApp {
+    id: i64,
+    client_id: String,
+}
+
+/// Register this device's application on the forge
+/// (`POST {api_base}/user/applications/oauth2`, Forgejo and Gitea): a public
+/// client on the descriptor's forge redirect. `api_base` is on the
+/// repository's host or its forge's sign-in host (the descriptor rule), so
+/// the token goes nowhere else. The `Err` is a reason for the log.
+async fn register_device_app(
+    http: &reqwest::Client,
+    api_base: &str,
+    token: &str,
+    name: &str,
+    redirect: &str,
+) -> Result<DeviceApp, String> {
+    let url = format!(
+        "{}/user/applications/oauth2",
+        api_base.trim_end_matches('/')
+    );
+    let body = serde_json::json!({
+        "name": name,
+        "redirect_uris": [redirect],
+        "confidential_client": false,
+    });
+    let response = http
+        .post(&url)
+        .bearer_auth(token)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|_| "the forge could not be reached".to_owned())?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!(
+            "the forge answered {status} (an OAuth token registers an application only with write:user in config.auth.scope)"
+        ));
+    }
+    let app: RegisteredApp = response
+        .json()
+        .await
+        .map_err(|_| "the forge's answer could not be read".to_owned())?;
+    if app.client_id.trim().is_empty() {
+        return Err("the forge's answer carried no client_id".to_owned());
+    }
+    Ok(DeviceApp {
+        id: app.id,
+        client_id: app.client_id,
+        name: name.to_owned(),
+    })
+}
+
+/// Delete an application this device registered and will not use. Best
+/// effort: an application left behind holds no token anyone has.
+async fn delete_device_app(
+    http: &reqwest::Client,
+    api_base: &str,
+    token: &str,
+    app: &DeviceApp,
+    host: &str,
+) {
+    let url = format!(
+        "{}/user/applications/oauth2/{}",
+        api_base.trim_end_matches('/'),
+        app.id
+    );
+    match http.delete(&url).bearer_auth(token).send().await {
+        Ok(response) if response.status().is_success() => {}
+        Ok(response) => {
+            tracing::warn!(%host, app = %app.name, status = %response.status(), "account: the forge kept an application this device does not use")
+        }
+        Err(error) => {
+            tracing::warn!(%host, app = %app.name, %error, "account: the forge kept an application this device does not use")
+        }
+    }
 }
 
 /// The forge username from `user_url` (default `{api_base}/user`).
@@ -1361,13 +1576,38 @@ async fn forge_token_with(
     let refresh = stored.refresh_token.clone().ok_or_else(reconnect)?;
 
     let oauth_http = ReqwestClient::from(http.clone());
-    let provider = forge_provider(&oauth_http, forge).await?;
-    let tokens = provider
+    let mut provider = forge_provider(&oauth_http, forge).await?;
+    // Refreshed under the client the tokens were issued to: this device's
+    // own application, or the shared one.
+    provider.client_id = ClientId::new(stored.client_id(forge).to_owned());
+    let tokens = match provider
         .client(None)
         .exchange_refresh_token(&RefreshToken::new(refresh))
         .request_async(&oauth_http)
         .await
-        .map_err(|e| refresh_error(&provider.host, e, "Reconnect the repository."))?;
+    {
+        Ok(tokens) => tokens,
+        Err(error) => {
+            // The forge itself refused the refresh token: it is dead, not
+            // unreachable. Forgejo keeps one grant per person and app, so any
+            // other device's sign-in kills this one ("refresh token ... was
+            // used twice"). Kept in the keychain, the dead item read as
+            // "connected", so the next sign-in skipped the forge leg and the
+            // account asked to sign in again for ever — hesperia after
+            // kalypso signed in, 2026-10-05 and again 2026-10-18. Forgotten,
+            // the next sign-in connects the repository anew.
+            let dead = matches!(error, RequestTokenError::ServerResponse(_));
+            let answer = refresh_error(&provider.host, error, "Reconnect the repository.");
+            if dead {
+                tracing::warn!(
+                    account = %d.id,
+                    "account: the forge refused its refresh token; forgetting it so the next sign-in reconnects the repository"
+                );
+                session::forget_forge(platform, &d.id)?;
+            }
+            return Err(answer);
+        }
+    };
     stored.access_token = tokens.access_token().secret().clone();
     stored.expires_ms = expiry_ms(tokens.expires_in());
     if let Some(rotated) = tokens.refresh_token() {
@@ -1485,7 +1725,11 @@ pub async fn sign_out(
         if let Some((forge_item, forge_config)) = &forge {
             if let Some(refresh) = &forge_item.refresh_token {
                 match forge_provider(&oauth_http, forge_config).await {
-                    Ok(provider) => revoke(http, &provider, refresh).await,
+                    Ok(mut provider) => {
+                        provider.client_id =
+                            ClientId::new(forge_item.client_id(forge_config).to_owned());
+                        revoke(http, &provider, refresh).await;
+                    }
                     Err(error) => tracing::warn!(account = %d.id, %error, "sign-out could not reach the forge"),
                 }
             }
@@ -1589,6 +1833,15 @@ mod tests {
         jwks_fetches: usize,
         /// The nonce the browser saw in the authorization request.
         nonce: Option<String>,
+        /// The `client_id` and `scope` of the last authorization request.
+        authorized: Option<(String, String)>,
+        /// Forgejo's grants (`Behaviour::forgejo`): one per client, its
+        /// counter and whether its scope carries `write:user`.
+        grants: HashMap<String, (u32, bool)>,
+        /// Every application registration's body, in order.
+        apps: Vec<serde_json::Value>,
+        /// Every application id deleted.
+        deleted_apps: Vec<String>,
     }
 
     #[derive(Default, Clone)]
@@ -1615,6 +1868,11 @@ mod tests {
         refresh_kid: Option<&'static str>,
         /// Leave `expires_in` out of every token response.
         omit_expires_in: bool,
+        /// Answer `/token` as Forgejo does: one grant per client, a counter
+        /// every sign-in and refresh advances, and a refresh token from an
+        /// earlier count refused ("was used twice"). Serve the application
+        /// registration API to a token whose scope carries `write:user`.
+        forgejo: bool,
     }
 
     /// The claims every fake ID token starts from.
@@ -1694,7 +1952,8 @@ mod tests {
         fake
     }
 
-    fn read_request(stream: &mut TcpStream) -> Option<(String, String, String)> {
+    /// Method, target, body and the head's `Authorization` value.
+    fn read_request(stream: &mut TcpStream) -> Option<(String, String, String, String)> {
         let mut buf = Vec::new();
         let mut chunk = [0u8; 4096];
         let head_end = loop {
@@ -1727,7 +1986,15 @@ mod tests {
         let method = first.next()?.to_owned();
         let target = first.next()?.to_owned();
         let body = String::from_utf8_lossy(&buf[head_end..]).into_owned();
-        Some((method, target, body))
+        let authorization = head
+            .lines()
+            .find_map(|l| {
+                let (name, value) = l.split_once(':')?;
+                name.eq_ignore_ascii_case("authorization")
+                    .then(|| value.trim().to_owned())
+            })
+            .unwrap_or_default();
+        Some((method, target, body, authorization))
     }
 
     fn reply(stream: &mut TcpStream, status: &str, body: &str) {
@@ -1768,7 +2035,7 @@ mod tests {
         seen: &Mutex<Seen>,
         behaviour: &Mutex<Behaviour>,
     ) {
-        let Some((method, target, body)) = read_request(&mut stream) else {
+        let Some((method, target, body, authorization)) = read_request(&mut stream) else {
             return;
         };
         let behaviour = behaviour.lock().expect("behaviour").clone();
@@ -1812,6 +2079,43 @@ mod tests {
                     "200 OK",
                     &serde_json::json!({ "keys": [jwk] }).to_string(),
                 );
+            }
+            ("POST", "/token") if behaviour.forgejo => {
+                let params = form(&body);
+                let (status, answer) = forgejo_token(&params, seen);
+                seen.lock().expect("seen").token_requests.push(params);
+                reply(&mut stream, status, &answer);
+            }
+            ("POST", "/api/v1/user/applications/oauth2") if behaviour.forgejo => {
+                // An OAuth token's API scope is its grant's: write:user, or 403.
+                if !authorization.ends_with(".u") {
+                    reply(
+                        &mut stream,
+                        "403 Forbidden",
+                        r#"{"message":"token does not have at least one of required scope(s)"}"#,
+                    );
+                    return;
+                }
+                let request: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+                let mut seen = seen.lock().expect("seen");
+                seen.apps.push(request.clone());
+                let id = seen.apps.len();
+                let app = serde_json::json!({
+                    "id": id,
+                    "name": request["name"],
+                    "client_id": format!("device-{id}"),
+                    "client_secret": "never-read",
+                    "redirect_uris": request["redirect_uris"],
+                    "confidential_client": request["confidential_client"],
+                });
+                reply(&mut stream, "201 Created", &app.to_string());
+            }
+            ("DELETE", target)
+                if behaviour.forgejo && target.starts_with("/api/v1/user/applications/oauth2/") =>
+            {
+                let id = target.rsplit('/').next().unwrap_or_default().to_owned();
+                seen.lock().expect("seen").deleted_apps.push(id);
+                reply(&mut stream, "204 No Content", "");
             }
             ("POST", "/token") => {
                 let params = form(&body);
@@ -1875,6 +2179,69 @@ mod tests {
         }
     }
 
+    /// Forgejo's token endpoint over `seen.grants`: tokens name their client
+    /// and the count they were issued at (`fa.<client>.<n>.<u|->`,
+    /// `fr.<client>.<n>`).
+    fn forgejo_token(
+        params: &HashMap<String, String>,
+        seen: &Mutex<Seen>,
+    ) -> (&'static str, String) {
+        let refused = |error: &str| {
+            (
+                "400 Bad Request",
+                serde_json::json!({ "error": error }).to_string(),
+            )
+        };
+        let issue = |client: &str, n: u32, user: bool| {
+            let scope = if user { "u" } else { "-" };
+            serde_json::json!({
+                "access_token": format!("fa.{client}.{n}.{scope}"),
+                "token_type": "Bearer",
+                "expires_in": 3600,
+                "refresh_token": format!("fr.{client}.{n}"),
+            })
+            .to_string()
+        };
+        let mut seen = seen.lock().expect("seen");
+        let client = params.get("client_id").cloned().unwrap_or_default();
+        match params.get("grant_type").map(String::as_str) {
+            Some("authorization_code") => {
+                let (authorized, scope) = seen.authorized.clone().unwrap_or_default();
+                if authorized != client {
+                    return refused("invalid_grant");
+                }
+                let user = scope.split_whitespace().any(|w| w == "write:user");
+                let grant = seen.grants.entry(client.clone()).or_insert((0, user));
+                grant.0 += 1;
+                ("200 OK", issue(&client, grant.0, grant.1))
+            }
+            Some("refresh_token") => {
+                let refresh = params.get("refresh_token").cloned().unwrap_or_default();
+                let mut parts = refresh.split('.');
+                let (Some("fr"), Some(of), Some(n)) = (
+                    parts.next(),
+                    parts.next(),
+                    parts.next().and_then(|n| n.parse::<u32>().ok()),
+                ) else {
+                    return refused("unauthorized_client");
+                };
+                if of != client {
+                    return refused("invalid_grant");
+                }
+                let Some(grant) = seen.grants.get_mut(&client) else {
+                    return refused("invalid_grant");
+                };
+                if grant.0 != n {
+                    // "A client tried to use a refresh token for grant_id = 2 was used twice!"
+                    return refused("unauthorized_client");
+                }
+                grant.0 += 1;
+                ("200 OK", issue(&client, grant.0, grant.1))
+            }
+            _ => refused("unsupported_grant_type"),
+        }
+    }
+
     impl Fake {
         fn token_requests(&self) -> Vec<HashMap<String, String>> {
             self.seen.lock().expect("seen").token_requests.clone()
@@ -1910,6 +2277,8 @@ mod tests {
         /// The sheet stays open, unanswered, until something in keeper ends
         /// the flow.
         Waits,
+        /// Answers the first sign-in honestly and closes every later sheet.
+        HonestThenClosed,
     }
 
     struct FakePlatform {
@@ -1961,7 +2330,11 @@ mod tests {
                     .join(&inner)
                     .map_err(|e| CoreError::Internal(e.to_string()))?;
             }
-            self.seen.lock().expect("seen").nonce = Some(one(&url, "nonce"));
+            {
+                let mut seen = self.seen.lock().expect("seen");
+                seen.nonce = Some(one(&url, "nonce"));
+                seen.authorized = Some((one(&url, "client_id"), one(&url, "scope")));
+            }
             let state = one(&url, "state");
             let states = match self.browser {
                 Browser::Honest
@@ -1969,7 +2342,8 @@ mod tests {
                 | Browser::Closed
                 | Browser::SheetFailed(_)
                 | Browser::Dropped
-                | Browser::Waits => format!("state={state}"),
+                | Browser::Waits
+                | Browser::HonestThenClosed => format!("state={state}"),
                 Browser::ExtraState => format!("state=evil&state={state}"),
                 Browser::ForeignState => "state=someone-else".to_owned(),
             };
@@ -2048,7 +2422,9 @@ mod tests {
                 .expect("shown")
                 .push((url.to_owned(), Some(callback_scheme.to_owned())));
             let callback = self.visit(url)?;
-            let state = one(&Url::parse(url).expect("authorize url"), "state");
+            // From the callback: behind a `signin_url` the authorization
+            // request, and its state, ride inside `redirect_to`.
+            let state = one(&Url::parse(&callback).expect("callback url"), "state");
             match self.browser {
                 Browser::Denied(description) => {
                     let mut answer =
@@ -2062,12 +2438,18 @@ mod tests {
                     self.flows.resolve(answer.as_str());
                 }
                 Browser::Closed => self.flows.cancel(&state),
+                Browser::HonestThenClosed if self.shown.lock().expect("shown").len() > 1 => {
+                    self.flows.cancel(&state);
+                }
                 Browser::SheetFailed(reason) => {
                     self.flows.fail(&state, reason);
                 }
                 Browser::Dropped => self.flows.remove(&state),
                 Browser::Waits => {}
-                Browser::Honest | Browser::ExtraState | Browser::ForeignState => {
+                Browser::Honest
+                | Browser::ExtraState
+                | Browser::ForeignState
+                | Browser::HonestThenClosed => {
                     self.flows.resolve(&callback);
                 }
             }
@@ -2676,12 +3058,16 @@ mod tests {
     const FORGE_SCOPE: &str = "openid profile read:user write:repository";
 
     fn forge_account(fake: &Fake, id: &str) -> AccountDescriptor {
+        forge_account_scoped(fake, id, FORGE_SCOPE)
+    }
+
+    fn forge_account_scoped(fake: &Fake, id: &str, scope: &str) -> AccountDescriptor {
         let i = &fake.issuer;
         descriptor::parse_json(&format!(
             r#"{{"version":1,"id":"{id}","name":"Acme",
                 "auth":{{"issuer":"{i}","client_id":"{CLIENT_ID}"}},
                 "config":{{"url":"{i}/c.git","api_base":"{i}/api/v1",
-                  "auth":{{"mode":"oauth","client_id":"forge-client","scope":"{FORGE_SCOPE}",
+                  "auth":{{"mode":"oauth","client_id":"forge-client","scope":"{scope}",
                            "authorize_url":"{i}/authorize","token_url":"{i}/token",
                            "signin_url":"{i}/user/oauth2/acme?redirect_to={{authorize_path_and_query}}"}}}}}}"#
         ))
@@ -2694,7 +3080,7 @@ mod tests {
         let p = FakePlatform::new(&fake, Browser::Honest);
         let d = forge_account(&fake, "forge");
 
-        forge_connect_within(&p, &p.flows, &http(), &d, "tgorka", SHORT)
+        forge_connect_within(&p, &p.flows, &http(), &d, "tgorka", "hesperia", SHORT)
             .await
             .expect("connected");
 
@@ -2728,7 +3114,8 @@ mod tests {
         let p = FakePlatform::new(&fake, Browser::Honest);
         let d = forge_account(&fake, "forge-ana");
 
-        let result = forge_connect_within(&p, &p.flows, &http(), &d, "tgorka", SHORT).await;
+        let result =
+            forge_connect_within(&p, &p.flows, &http(), &d, "tgorka", "hesperia", SHORT).await;
 
         match result {
             Err(AccountError::Refused(sentence)) => assert_eq!(
@@ -2865,7 +3252,7 @@ mod tests {
         let fake = start_fake(Behaviour::default());
         let p = FakePlatform::new(&fake, Browser::Honest);
         let d = forge_account(&fake, "forge-moved");
-        forge_connect_within(&p, &p.flows, &http(), &d, "tgorka", SHORT)
+        forge_connect_within(&p, &p.flows, &http(), &d, "tgorka", "hesperia", SHORT)
             .await
             .expect("connected");
         let mut moved = d.clone();
@@ -2889,7 +3276,7 @@ mod tests {
         let p = FakePlatform::new(&fake, Browser::Honest);
         let d = forge_account(&fake, "handover");
         sign_in_short(&p, &d).await.expect("sign in");
-        forge_connect_within(&p, &p.flows, &http(), &d, "tgorka", SHORT)
+        forge_connect_within(&p, &p.flows, &http(), &d, "tgorka", "hesperia", SHORT)
             .await
             .expect("connected");
 
@@ -3129,7 +3516,7 @@ mod tests {
         let fake = start_fake(Behaviour::default());
         let p = FakePlatform::new(&fake, Browser::Honest);
         let d = forge_account(&fake, "forge-forced");
-        forge_connect_within(&p, &p.flows, &http(), &d, "tgorka", SHORT)
+        forge_connect_within(&p, &p.flows, &http(), &d, "tgorka", "hesperia", SHORT)
             .await
             .expect("connected");
         assert_eq!(
@@ -3146,6 +3533,225 @@ mod tests {
         assert_eq!(
             forge_token(&p, &http(), &d).await.expect("stored"),
             "access-2"
+        );
+    }
+
+    /// A forge that refuses the refresh token has killed it — another device's
+    /// sign-in to the same Forgejo grant does exactly that. The dead item must
+    /// not keep reading as "connected", or the next sign-in skips the forge leg.
+    #[tokio::test]
+    async fn a_refused_forge_refresh_forgets_the_forge_token() {
+        let fake = start_fake(Behaviour {
+            reject_refresh: true,
+            ..Behaviour::default()
+        });
+        let p = FakePlatform::new(&fake, Browser::Honest);
+        let d = forge_account(&fake, "forge-dead");
+        forge_connect_within(&p, &p.flows, &http(), &d, "tgorka", "hesperia", SHORT)
+            .await
+            .expect("connected");
+        assert!(
+            session::forge_connected(&p, &d),
+            "connected before the refresh"
+        );
+
+        let refused = forge_token_refreshed(&p, &http(), &d).await;
+
+        assert!(
+            matches!(refused, Err(AccountError::NeedsSignIn(_))),
+            "{refused:?}"
+        );
+        assert!(
+            !session::forge_connected(&p, &d),
+            "a refused refresh token is forgotten, so the next sign-in reconnects"
+        );
+    }
+
+    // ---- several devices of one person -----------------------------------
+
+    /// A forge scope whose token may register an application.
+    const DEVICE_SCOPE: &str = "openid profile write:repository write:user";
+
+    fn forgejo() -> Fake {
+        start_fake(Behaviour {
+            forgejo: true,
+            ..Behaviour::default()
+        })
+    }
+
+    async fn connect_as(p: &FakePlatform, d: &AccountDescriptor, device: &str) {
+        forge_connect_within(p, &p.flows, &http(), d, "tgorka", device, SHORT)
+            .await
+            .unwrap_or_else(|e| panic!("{device} connected: {e:?}"));
+    }
+
+    fn app_names(fake: &Fake) -> Vec<String> {
+        let seen = fake.seen.lock().expect("seen");
+        seen.apps
+            .iter()
+            .map(|app| app["name"].as_str().unwrap_or_default().to_owned())
+            .collect()
+    }
+
+    /// Two devices of one person, each with its own keychain, against one
+    /// Forgejo: each holds a grant of its own application, so neither's
+    /// sign-in nor refresh retires the other's refresh token — under one
+    /// shared grant, kalypso's sign-in would have ended hesperia's.
+    #[tokio::test]
+    async fn two_devices_hold_working_forge_credentials_at_once() {
+        let fake = forgejo();
+        let hesperia = FakePlatform::new(&fake, Browser::Honest);
+        let kalypso = FakePlatform::new(&fake, Browser::Honest);
+        let d = forge_account_scoped(&fake, "two-devices", DEVICE_SCOPE);
+
+        connect_as(&hesperia, &d, "hesperia").await;
+        connect_as(&kalypso, &d, "kalypso").await;
+
+        for round in 0..3 {
+            for (name, p) in [("hesperia", &hesperia), ("kalypso", &kalypso)] {
+                let token = forge_token_refreshed(p, &http(), &d).await;
+                assert!(token.is_ok(), "{name}, round {round}: {token:?}");
+                assert!(session::forge_connected(p, &d), "{name}, round {round}");
+            }
+        }
+
+        let names = app_names(&fake);
+        assert_eq!(names.len(), 2, "{names:?}");
+        assert!(names[0].starts_with("keeper (hesperia, "), "{names:?}");
+        assert!(names[1].starts_with("keeper (kalypso, "), "{names:?}");
+        for app in &fake.seen.lock().expect("seen").apps {
+            assert_eq!(
+                app["redirect_uris"],
+                serde_json::json!(["keeper://oauth/two-devices/forge/callback"])
+            );
+            assert_eq!(app["confidential_client"], false, "a public client");
+        }
+        let client = |p: &FakePlatform| {
+            load_forge(p, &d.id)
+                .expect("read")
+                .and_then(|f| f.device_app)
+                .map(|app| app.client_id)
+        };
+        assert_eq!(client(&hesperia).as_deref(), Some("device-1"));
+        assert_eq!(client(&kalypso).as_deref(), Some("device-2"));
+        for refresh in fake
+            .token_requests()
+            .iter()
+            .filter(|r| r.get("grant_type").map(String::as_str) == Some("refresh_token"))
+        {
+            assert!(
+                refresh
+                    .get("client_id")
+                    .is_some_and(|c| c.starts_with("device-")),
+                "a refresh under the shared client: {refresh:?}"
+            );
+        }
+    }
+
+    /// The bootstrap asks for the descriptor's scope byte for byte (Forgejo
+    /// refuses any other against an existing grant); the device's own
+    /// application asks for it without `write:user`, and only its token is
+    /// kept.
+    #[tokio::test]
+    async fn the_kept_token_is_the_device_s_own_without_write_user() {
+        let fake = forgejo();
+        let p = FakePlatform::new(&fake, Browser::Honest);
+        let d = forge_account_scoped(&fake, "scopes", DEVICE_SCOPE);
+
+        connect_as(&p, &d, "hesperia").await;
+
+        let authorizations: Vec<(String, String)> = p
+            .shown
+            .lock()
+            .expect("shown")
+            .iter()
+            .map(|(url, _)| {
+                let shown = Url::parse(url).expect("url");
+                let inner = shown.join(&one(&shown, "redirect_to")).expect("inner");
+                (one(&inner, "client_id"), one(&inner, "scope"))
+            })
+            .collect();
+        assert_eq!(
+            authorizations,
+            vec![
+                ("forge-client".to_owned(), DEVICE_SCOPE.to_owned()),
+                (
+                    "device-1".to_owned(),
+                    "openid profile write:repository read:user".to_owned()
+                ),
+            ]
+        );
+        let stored = load_forge(&p, &d.id).expect("read").expect("item");
+        assert_eq!(stored.access_token, "fa.device-1.1.-");
+        assert_eq!(stored.refresh_token.as_deref(), Some("fr.device-1.1"));
+    }
+
+    /// A scope without `write:user` registers nothing: the device keeps the
+    /// shared client, another device's sign-in ends its connection, the
+    /// refusal forgets the item, and the next sign-in reconnects.
+    #[tokio::test]
+    async fn without_write_user_the_devices_share_one_grant_and_the_loser_can_reconnect() {
+        let fake = forgejo();
+        let hesperia = FakePlatform::new(&fake, Browser::Honest);
+        let kalypso = FakePlatform::new(&fake, Browser::Honest);
+        let d = forge_account(&fake, "shared-grant");
+
+        connect_as(&hesperia, &d, "hesperia").await;
+        connect_as(&kalypso, &d, "kalypso").await;
+
+        assert!(app_names(&fake).is_empty());
+        let stored = load_forge(&hesperia, &d.id).expect("read").expect("item");
+        assert!(stored.device_app.is_none());
+        let lost = forge_token_refreshed(&hesperia, &http(), &d).await;
+        assert!(
+            matches!(lost, Err(AccountError::NeedsSignIn(_))),
+            "{lost:?}"
+        );
+        assert!(!session::forge_connected(&hesperia, &d));
+        forge_token_refreshed(&kalypso, &http(), &d)
+            .await
+            .expect("the last device to sign in holds the grant");
+
+        connect_as(&hesperia, &d, "hesperia").await;
+        assert!(forge_token_refreshed(&hesperia, &http(), &d).await.is_ok());
+    }
+
+    /// A person who closes the second sheet ends the connection, and the
+    /// application registered for it is deleted with the bootstrap token.
+    #[tokio::test]
+    async fn closing_the_device_s_own_sign_in_deletes_the_application_it_registered() {
+        let fake = forgejo();
+        let p = FakePlatform::new(&fake, Browser::HonestThenClosed);
+        let d = forge_account_scoped(&fake, "closed-second", DEVICE_SCOPE);
+
+        let result =
+            forge_connect_within(&p, &p.flows, &http(), &d, "tgorka", "hesperia", SHORT).await;
+
+        assert!(matches!(result, Err(AccountError::Cancelled)), "{result:?}");
+        assert_eq!(app_names(&fake).len(), 1);
+        assert_eq!(fake.seen.lock().expect("seen").deleted_apps, vec!["1"]);
+        assert!(!session::forge_connected(&p, &d));
+    }
+
+    #[test]
+    fn the_device_scope_narrows_write_user_only_beside_another_api_scope() {
+        assert_eq!(
+            device_scope("openid profile write:repository write:user"),
+            "openid profile write:repository read:user"
+        );
+        assert_eq!(
+            device_scope("openid profile read:user write:user write:repository"),
+            "openid profile read:user write:repository"
+        );
+        // Without another API scope, dropping it would mean every scope.
+        assert_eq!(
+            device_scope("openid profile write:user"),
+            "openid profile write:user"
+        );
+        assert_eq!(device_scope("openid profile"), "openid profile");
+        assert_eq!(
+            device_scope("openid profile read:user write:repository"),
+            "openid profile read:user write:repository"
         );
     }
 
