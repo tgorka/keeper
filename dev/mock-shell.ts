@@ -161,11 +161,13 @@ import type {
   RecordingRemovedVm,
   RecordingSearchVm,
   RecordingSettingsVm,
+  ReleaseCheckVm,
   SessionPromoteVm,
   SessionSpaceFilesVm,
   SessionSpaceFileVm,
   SessionSpaceVm,
   SessionTaskVm,
+  SignInLinkVm,
   SpacesSnapshot,
   SurfaceAnswerReq,
   SurfaceRequestVm,
@@ -5327,8 +5329,76 @@ let accountRestore: AccountRestoreVm =
         sentence: "Restored 2 drives, 1 bot provider and your settings from your account.",
         pending: ["Waiting for /Volumes/Field to restore Field recordings."],
         listeningOff: true,
+        ...restoreSignInFixture(),
       }
     : NO_ACCOUNT_VM.restore;
+
+/**
+ * `?restoresso=preparing|waits|unopened|timedout` (with `?account=ready`): the
+ * Matrix single sign-on the restore started by itself (102.9, R480/02), as
+ * `keeper_core::org_account::state` words it — still discovering its server
+ * (no link yet, Cancel already reaches it: R500), waiting with its link (and
+ * the browser-not-opened sentence), or ended by its deadline with the link
+ * gone. `cancel_oidc` ends a waiting one as cancelled.
+ */
+function restoreSignInFixture(): Pick<AccountRestoreVm, "matrixSignIn"> {
+  const param = new URLSearchParams(window.location.search).get("restoresso");
+  const host = "matrix.acme.dev";
+  if (param === "timedout") {
+    return {
+      matrixSignIn: {
+        sentence: `Signing in to your Matrix account on ${host} timed out before the browser answered, so its link no longer works. Sign in to it again from Add an account.`,
+        problem: true,
+        waiting: false,
+      },
+    };
+  }
+  if (param === "preparing") {
+    return {
+      matrixSignIn: {
+        sentence: `Finish signing in to your Matrix account on ${host} in the browser.`,
+        problem: false,
+        waiting: true,
+      },
+    };
+  }
+  if (param !== "waits" && param !== "unopened") {
+    return {};
+  }
+  return {
+    matrixSignIn: {
+      sentence: `Finish signing in to your Matrix account on ${host} in the browser.`,
+      problem: false,
+      waiting: true,
+      link: {
+        url: mockAuthorizationUrl("mas.acme.dev", "01J8KEEPERRESTORE"),
+        notOpened:
+          param === "unopened"
+            ? "keeper could not open your browser. Copy this link into a browser to finish signing in."
+            : null,
+      },
+    },
+  };
+}
+
+/** `cancel_oidc` reaching the restore's Matrix sign-in: it ends cancelled, its link gone. */
+function cancelRestoreSignIn(): void {
+  if (accountRestore.matrixSignIn?.waiting !== true) {
+    return;
+  }
+  accountRestore = {
+    ...accountRestore,
+    matrixSignIn: {
+      sentence:
+        "The sign-in to your Matrix account on matrix.acme.dev was cancelled. Sign in to it again from Add an account.",
+      problem: false,
+      waiting: false,
+    },
+  };
+  if (accountVm.configured) {
+    setAccount({ ...accountVm, restore: accountRestore });
+  }
+}
 let accountVm: OrgAccountVm = ACCOUNT_FIXTURES.includes(accountParam as AccountStateVm)
   ? signedInAccount(accountParam as AccountStateVm)
   : NO_ACCOUNT_VM;
@@ -5399,6 +5469,47 @@ function mockRemoteKey(remoteUrl: string, branch: string): string {
  * the offered one on that homeserver when there is one — which is who the
  * browser would have signed in.
  */
+/**
+ * `?sso=waits` keeps a Matrix single sign-on waiting for its browser until
+ * Cancel, and `?sso=unopened` also says the browser could not be opened —
+ * the two states story 102.9 draws the authorization link in (R470). Without
+ * either the sign-in answers at once, as before, its link sent first.
+ */
+const ssoParam = new URLSearchParams(window.location.search).get("sso");
+/** The pending mock single sign-on, so `cancel_oidc` can end it as Rust's registry does. */
+let ssoCancel: (() => void) | null = null;
+/** The authorization page a mock sign-in is on: a public client's request, no secret. */
+function mockAuthorizationUrl(host: string, client: string): string {
+  return `https://${host}/oauth2/authorize?response_type=code&client_id=${client}&redirect_uri=keeper%3A%2F%2Foauth%2Facme%2Fcallback&scope=openid+profile+email&state=Zk3pQ8vX2mR7tL1n&nonce=a8Jd2kLq&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256`;
+}
+
+function matrixSignInFlow(payload: Record<string, unknown>): Promise<AccountVm> | AccountVm {
+  const homeserver = String(payload.homeserver ?? "");
+  const channel = payload.onLink as MockChannel<SignInLinkVm | null> | undefined;
+  const host = /^https?:\/\//.test(homeserver) ? new URL(homeserver).host : homeserver;
+  const url = mockAuthorizationUrl(`auth.${host || "example.org"}`, "01J8KEEPERCLIENT");
+  channel?.onmessage?.({ url, notOpened: null });
+  if (ssoParam !== "waits" && ssoParam !== "unopened") {
+    // Rust takes the link away when the sign-in ends, however it ends.
+    channel?.onmessage?.(null);
+    return matrixSignedIn(homeserver, null, "oidc");
+  }
+  if (ssoParam === "unopened") {
+    channel?.onmessage?.({
+      url,
+      notOpened:
+        "keeper could not open your browser. Copy this link into a browser to finish signing in.",
+    });
+  }
+  return new Promise<AccountVm>((_, reject) => {
+    ssoCancel = () => {
+      ssoCancel = null;
+      channel?.onmessage?.(null);
+      reject({ code: "oauthCancelled", message: "cancelled", accountId: null, retriable: true });
+    };
+  });
+}
+
 function matrixSignedIn(
   homeserver: string,
   username: string | null,
@@ -5459,6 +5570,9 @@ function forgeFailedAccount(device: AccountDeviceVm): OrgAccountVm {
   };
 }
 
+/** `?signin=waits|unopened`: the organisation sign-in stays on its browser leg (see below). */
+const signInParam = new URLSearchParams(window.location.search).get("signin");
+
 /** How a mock sign-in ends: Rust's `denied` refusal, a failed repository connection, or set up. */
 type MockSignInEnd = "denied" | "forgeFailed" | "done";
 
@@ -5474,8 +5588,22 @@ function accountSignInFlow(
   // An account already signed in here keeps its identity when a re-setup is
   // closed: Rust's state still reads up to date; only `attempt` says closed.
   const before = accountVm.identity !== null ? signedInAccount("ready", device) : null;
-  setAccount({ ...signedInAccount("signingIn", device), attempt: "running" });
+  // Rust's link to the authorization page, while the sign-in waits (102.9,
+  // R470); `?signin=unopened` says the browser could not be opened, and
+  // `?signin=waits` (or `unopened`) keeps it waiting until Cancel sign-in.
+  const signInLink: SignInLinkVm = {
+    url: mockAuthorizationUrl("id.acme.dev", "keeper-acme"),
+    notOpened:
+      signInParam === "unopened"
+        ? "keeper could not open your browser. Copy this link into a browser to finish signing in."
+        : null,
+  };
+  setAccount({ ...signedInAccount("signingIn", device), attempt: "running", signInLink });
+  const waits = signInParam === "waits" || signInParam === "unopened";
   const signIn = setTimeout(() => {
+    if (waits) {
+      return;
+    }
     accountSignInCancel = null;
     if (end === "denied") {
       resolve(setAccount(deniedAccount()));
@@ -10996,6 +11124,44 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
       setupId.includes("denied") ? "denied" : setupId.includes("forge") ? "forgeFailed" : "done",
     );
   },
+  // The phone tier's Check for updates (102.9, R464), as
+  // `keeper_core::release_check` words each answer: `?release=current` or
+  // `?release=failed`, else a newer release. A desktop has the updater.
+  release_check: (): Promise<ReleaseCheckVm> => {
+    if (!MOCK_REDUCED) {
+      return Promise.reject({
+        code: "unsupported",
+        message: "a desktop checks for updates with its in-app updater",
+        accountId: null,
+        retriable: false,
+      });
+    }
+    const install = MOCK_PLATFORM === "tablet" ? "bun run install:android" : "bun run install:ios";
+    const param = new URLSearchParams(window.location.search).get("release");
+    const answer: ReleaseCheckVm =
+      param === "current"
+        ? {
+            outcome: "current",
+            installed: "0.10.5",
+            latest: "0.10.5",
+            sentence: "keeper is up to date.",
+          }
+        : param === "failed"
+          ? {
+              outcome: "failed",
+              installed: "0.10.5",
+              latest: null,
+              sentence:
+                "keeper could not check GitHub for a newer version (it answered 403). Try again later.",
+            }
+          : {
+              outcome: "newer",
+              installed: "0.10.5",
+              latest: "0.11.0",
+              sentence: `keeper 0.11.0 is available — install it from your Mac with \`${install}\`.`,
+            };
+    return later(900, () => answer);
+  },
   account_sign_in: () => {
     forgeErrors.clear();
     return accountSignInFlow(accountVm.device ?? ACCOUNT_THIS_DEVICE);
@@ -11337,7 +11503,12 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
   // offer for it, as the next converge does once the account exists here.
   login_password: (payload) =>
     matrixSignedIn(String(payload.homeserver ?? ""), String(payload.username ?? ""), "password"),
-  login_oidc: (payload) => matrixSignedIn(String(payload.homeserver ?? ""), null, "oidc"),
+  login_oidc: (payload) => matrixSignInFlow(payload),
+  cancel_oidc: () => {
+    ssoCancel?.();
+    cancelRestoreSignIn();
+    return null;
+  },
   login_beeper: (payload) =>
     matrixSignedIn(
       "https://matrix.beeper.com/",

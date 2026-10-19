@@ -133,6 +133,10 @@ struct Inner {
     /// `listening_off` is computed once per sync and cleared the moment the
     /// person writes the wake switch, never read from the database here.
     restore: RestoreFacts,
+    /// The authorization page of the account's sign-in in progress (102.9,
+    /// R470): set when that sign-in shows it, emptied when it ends however it
+    /// ends (R480/03).
+    sign_in_link: keeper_core::sign_in_link::SignInLinkSlot,
 }
 
 #[derive(Default)]
@@ -762,6 +766,7 @@ fn facts(inner: &Inner) -> AccountFacts {
             .is_some_and(|d| matches!(d.config.auth, RepoAuthConfig::Oauth(_))),
         offers: inner.offers.clone(),
         restore: inner.restore.clone(),
+        sign_in_link: inner.sign_in_link.link().cloned(),
     }
 }
 
@@ -1357,6 +1362,15 @@ async fn converge(
     };
     update(|inner| inner.last_attempt_ms = Some(now_ms()));
     let oauth = matches!(d.config.auth, RepoAuthConfig::Oauth(_));
+    // Each sign-in's authorization page reaches the account's view model, so
+    // the setup sheet and Settings › Account can offer it to copy (R470); it
+    // leaves the view model when that sign-in ends, a dropped one included.
+    let shows = keeper_core::sign_in_link::ShowsSignInLink::new(
+        platform.as_ref(),
+        |flow: u64, link: Option<&keeper_core::sign_in_link::SignInLinkVm>| {
+            update(|inner| inner.sign_in_link.apply(flow, link));
+        },
+    );
 
     // 1. Who is signing in. A background sync never opens a browser.
     //
@@ -1382,7 +1396,7 @@ async fn converge(
                 .step(
                     AccountStep::SignIn,
                     &d.id,
-                    oidc::sign_in(platform.as_ref(), &flows, http, &d),
+                    oidc::sign_in(&shows, &flows, http, &d),
                 )
                 .await
             {
@@ -1474,14 +1488,7 @@ async fn converge(
             .step(
                 AccountStep::ForgeConnect,
                 &d.id,
-                oidc::forge_connect(
-                    platform.as_ref(),
-                    &flows,
-                    http,
-                    &d,
-                    &identity.login,
-                    &device,
-                ),
+                oidc::forge_connect(&shows, &flows, http, &d, &identity.login, &device),
             )
             .await
         {
@@ -2661,7 +2668,16 @@ fn window_focused(app: &AppHandle) -> bool {
 /// it waits for the next focused sync. The sheet carries the account's
 /// identity-provider session, so it is one tap (AD-331). Password and Beeper
 /// accounts stay offers; nothing is signed in without a sign-in.
+///
+/// The sign-in has its own line under Settings › Account (102.9, R480/02):
+/// "finish signing in" with its authorization page to copy and Cancel
+/// (`cancel_oidc`, the Matrix registry's) while it waits, then how it ended.
+/// It is not the account's own sign-in, so `phase` never says it. Which
+/// attempt owns that line, and Cancel's reach before the flow is registered,
+/// are `RestoreSignInAttempt`'s (R500).
 fn start_matrix_sign_in(data_dir: &Path, account_id: &str, waiting: &[MatrixState]) {
+    use tauri::Manager;
+
     let Some(homeserver) = waiting
         .iter()
         .find(|m| m.kind == "oidc" && !m.homeserver_url.trim().is_empty())
@@ -2687,13 +2703,42 @@ fn start_matrix_sign_in(data_dir: &Path, account_id: &str, waiting: &[MatrixStat
         tracing::warn!(%error, "account: the Matrix sign-in was not started");
         return;
     }
+    // The attempt — and its hold on Cancel — exists before the row offers
+    // Cancel and before anything is spawned; only it may write that row
+    // (R500). The decisions are `keeper_core::org_account::state`'s.
+    let mut attempt = None;
+    update(|inner| {
+        attempt = Some(
+            inner
+                .restore
+                .begin_matrix_sign_in(&homeserver, &app.state::<AppState>().oauth_flows),
+        );
+    });
+    let Some(attempt) = attempt else {
+        return;
+    };
+    let restore: keeper_core::org_account::state::RestoreFactsAccess =
+        std::sync::Arc::new(|change: &mut dyn FnMut(&mut RestoreFacts)| {
+            update(|inner| change(&mut inner.restore));
+        });
     tauri::async_runtime::spawn(async move {
-        use tauri::Manager;
-
         let state = app.state::<AppState>();
-        if let Err(error) = crate::ipc::sign_in_oidc(state.inner(), &homeserver).await {
-            tracing::info!(reason = %error.message, "account: the restored Matrix sign-in did not finish");
-        }
+        let state: &AppState = state.inner();
+        let cancel = attempt.cancel();
+        attempt
+            .run(restore, |links| async move {
+                crate::ipc::sign_in_oidc(
+                    state,
+                    &homeserver,
+                    move |flow: u64, link: Option<&keeper_core::sign_in_link::SignInLinkVm>| {
+                        links.show(flow, link);
+                    },
+                    cancel,
+                )
+                .await
+                .map(drop)
+            })
+            .await;
     });
 }
 

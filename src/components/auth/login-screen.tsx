@@ -1,6 +1,7 @@
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { type FormEvent, type MouseEvent, useEffect, useRef, useState } from "react";
 import { BeeperCoverageDisclosure } from "@/components/auth/beeper-coverage-disclosure";
+import { SignInLink } from "@/components/auth/sign-in-link";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -9,7 +10,13 @@ import { Label } from "@/components/ui/label";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { ACCOUNT_OFFERS_TITLE, offerUrlHost } from "@/lib/account-offers";
 import { logFailure, sayFailure } from "@/lib/failure";
-import type { AccountVm, IpcError, IpcErrorCode, MatrixOfferVm } from "@/lib/ipc/client";
+import type {
+  AccountVm,
+  IpcError,
+  IpcErrorCode,
+  MatrixOfferVm,
+  SignInLinkVm,
+} from "@/lib/ipc/client";
 import {
   beeperRequestCode,
   cancelBeeper,
@@ -55,7 +62,7 @@ function errorCopy(code: FormErrorCode): string {
     case "oauthUnsupported":
       return "This homeserver doesn't offer single sign-on (OIDC).";
     case "oauthTimedOut":
-      return "Single sign-on timed out. It wasn't completed in the browser in time.";
+      return "Single sign-on timed out before the browser answered, so its link no longer works. Sign in with single sign-on again for a fresh one.";
     case "oauthFailed":
       return "Single sign-on didn't complete. Please try again.";
     default:
@@ -258,6 +265,11 @@ function PasswordTab({
   // `true` while an OIDC flow is pending (the browser round-trip). The form is
   // replaced with a "complete sign-in in your browser" state + Cancel.
   const [oidcPending, setOidcPending] = useState(false);
+  // The authorization page the pending flow is on, once Rust has sent it;
+  // emptied when that flow settles.
+  const [oidcLink, setOidcLink] = useState<SignInLinkVm | null>(null);
+  // Which flow may still draw a link: bumped when one starts and when it settles.
+  const oidcFlow = useRef(0);
   const passwordField = useRef<HTMLInputElement>(null);
   // An offer chosen above fills the two fields it knows. A password typed for
   // another account is not this one's, so it goes; and an account that signs
@@ -345,9 +357,19 @@ function PasswordTab({
       setErrorCode("missingFields");
       return;
     }
+    // This sign-in's own number: a link that arrives for an earlier one, or
+    // after this one ended, is never drawn (R480/03).
+    oidcFlow.current += 1;
+    const flow = oidcFlow.current;
     setOidcPending(true);
     try {
-      const account: AccountVm = await loginOidc(trimmedHomeserver);
+      // The authorization page, as Rust sends it while the flow waits: drawn
+      // for copying by hand, and taken away with the flow (R470).
+      const account: AccountVm = await loginOidc(trimmedHomeserver, (link) => {
+        if (oidcFlow.current === flow) {
+          setOidcLink(link);
+        }
+      });
       addAccount(account);
       onDone?.();
     } catch (err) {
@@ -360,6 +382,12 @@ function PasswordTab({
         setErrorCode(isIpcError(err) ? err.code : "internal");
       }
     } finally {
+      // Settled: the link is spent, and anything still in flight for this
+      // flow is ignored.
+      if (oidcFlow.current === flow) {
+        oidcFlow.current += 1;
+      }
+      setOidcLink(null);
       setOidcPending(false);
     }
   }
@@ -379,6 +407,7 @@ function PasswordTab({
     return (
       <div className="flex flex-col gap-4">
         <p className="text-sm text-muted-foreground">Complete sign-in in your browser…</p>
+        {oidcLink !== null && <SignInLink link={oidcLink} />}
         <Button type="button" variant="outline" onClick={handleCancelOidc}>
           Cancel
         </Button>

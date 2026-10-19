@@ -21,7 +21,7 @@ use keeper_core::archive::recordings::{
 use keeper_core::auth;
 use keeper_core::auth::BeeperFlowRegistry;
 use keeper_core::demo::snapshot_then_diff;
-use keeper_core::egress::{compute_egress, EGRESS_UPDATE_ENDPOINT};
+use keeper_core::egress::{compute_egress, EGRESS_RELEASE_CHECK_ENDPOINT, EGRESS_UPDATE_ENDPOINT};
 use keeper_core::error::{
     AccountError, ArchiveError, AuthError, BackupError, BridgeError, CoreError, InboxError,
     MediaError, PlatformError, RecordingError, SendError, SignalError, TimelineError,
@@ -1783,22 +1783,36 @@ pub fn capabilities(state: State<'_, AppState>) -> Result<CapabilitiesVm, IpcErr
 /// dock sheet do not apply under it — an iPad build would need its own
 /// disclosure and its own decision first.
 pub fn platform_facts() -> keeper_core::vm::PlatformVm {
-    #[cfg(target_os = "ios")]
-    let device = Some(keeper_core::disclosure::Device::Iphone);
-    #[cfg(target_os = "android")]
-    let device = Some(match crate::android::device_class() {
-        keeper_core::org_account::layout::DeviceClass::Tablet => {
-            keeper_core::disclosure::Device::AndroidTablet
-        }
-        _ => keeper_core::disclosure::Device::AndroidPhone,
-    });
-    #[cfg(not(any(target_os = "ios", target_os = "android")))]
-    let device = None;
+    let device = this_device();
     keeper_core::vm::PlatformVm {
         url_form: keeper_core::asset_url::UrlForm::HOST,
         tablet: device == Some(keeper_core::disclosure::Device::AndroidTablet),
         disclosure: device.map(keeper_core::disclosure::disclosure),
     }
+}
+
+/// Which reduced build this is: the iPhone.
+#[cfg(target_os = "ios")]
+fn this_device() -> Option<keeper_core::disclosure::Device> {
+    Some(keeper_core::disclosure::Device::Iphone)
+}
+
+/// Which reduced build this is: an Android tablet by Android's own 600 dp
+/// rule, else an Android phone.
+#[cfg(target_os = "android")]
+fn this_device() -> Option<keeper_core::disclosure::Device> {
+    Some(match crate::android::device_class() {
+        keeper_core::org_account::layout::DeviceClass::Tablet => {
+            keeper_core::disclosure::Device::AndroidTablet
+        }
+        _ => keeper_core::disclosure::Device::AndroidPhone,
+    })
+}
+
+/// A desktop is no reduced build.
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
+fn this_device() -> Option<keeper_core::disclosure::Device> {
+    None
 }
 
 /// The plugin whose initialization script writes [`platform_facts`] into every
@@ -2536,29 +2550,54 @@ pub async fn login_password(
 /// the session carries over there — and the deep link returns.
 /// The pending flow is keyed by its OAuth `state` in the shared registry so the
 /// sheet or the deep-link `on_open_url` handler can route the callback back to
-/// it; a concurrent `cancel_oidc` aborts it. On success resolves to a non-secret
-/// [`AccountVm`]; on failure (unsupported / timed-out / cancelled / failed /
-/// non-SSS) funnels the `CoreError` through [`to_ipc_error`]. No token or
-/// authorization `code`/`state` ever crosses back to JavaScript.
+/// it; a concurrent `cancel_oidc` aborts it. While it waits, the authorization
+/// page goes to `on_link` — before the browser is asked for it, again with a
+/// sentence when the browser or the sign-in sheet could not be opened (the
+/// sign-in keeps waiting), and `null` when the sign-in ends, however it ends —
+/// so the login screen can offer it to copy by hand (story 102.9, R470,
+/// R480). On success resolves to a non-secret [`AccountVm`]; on failure
+/// (unsupported / timed-out / cancelled / failed / non-SSS) funnels the
+/// `CoreError` through [`to_ipc_error`]. No token or authorization `code`
+/// ever crosses back to JavaScript.
 #[tauri::command]
 pub async fn login_oidc(
     state: State<'_, AppState>,
     homeserver: String,
+    on_link: Channel<Option<keeper_core::sign_in_link::SignInLinkVm>>,
 ) -> Result<AccountVm, IpcError> {
-    sign_in_oidc(&state, &homeserver).await
+    let cancel = state.oauth_flows.cancel_latch();
+    sign_in_oidc(
+        &state,
+        &homeserver,
+        |_flow: u64, link: Option<&keeper_core::sign_in_link::SignInLinkVm>| {
+            if let Err(error) = on_link.send(link.cloned()) {
+                tracing::warn!(%error, "login: the sign-in link did not reach the screen");
+            }
+        },
+        cancel,
+    )
+    .await
+    .map_err(to_ipc_error)
 }
 
 /// The OIDC login's body, for the command and for the one single sign-on a
-/// restore starts by itself (AD-329).
+/// restore starts by itself (AD-329). `on_link` takes the sign-in's
+/// authorization page to the surface that started it — the login screen's
+/// channel, or the account's restore line — and `None` when it ends.
+/// `cancel` was taken from `state.oauth_flows` when the sign-in started, so
+/// `cancel_oidc` reaches it before its flow is registered too (R500).
 pub(crate) async fn sign_in_oidc(
     state: &AppState,
     homeserver: &str,
-) -> Result<AccountVm, IpcError> {
+    on_link: impl Fn(u64, Option<&keeper_core::sign_in_link::SignInLinkVm>) + Send + Sync,
+    cancel: keeper_core::oauth::CancelLatch,
+) -> Result<AccountVm, CoreError> {
     let browser =
         crate::web_auth::MatrixSignIn::new(state.platform.as_ref(), state.oauth_flows.clone());
-    let added = auth::login_oidc(&browser, homeserver, state.oauth_flows.clone()).await;
+    let shows = keeper_core::sign_in_link::ShowsSignInLink::new(&browser, on_link);
+    let added = auth::login_oidc(&shows, homeserver, state.oauth_flows.clone(), cancel).await;
     browser.close();
-    let mut added = added.map_err(to_ipc_error)?;
+    let mut added = added?;
     crate::account_ipc::matrix_account_added(state, &mut added);
     Ok(added)
 }
@@ -2568,8 +2607,11 @@ pub(crate) async fn sign_in_oidc(
 /// Aborts every pending flow in the Matrix registry (there is at most one
 /// add-account flow at a time in the UI); the awaiting `authenticate` resolves
 /// as cancelled, `add_account` rolls back, and the UI returns quietly to the
-/// form. An organisation-account sign-in waits in its own registry and is not
-/// touched. Idempotent — with no pending flow it is a no-op.
+/// form. The cancel is latched, so a sign-in still discovering its server —
+/// the login screen's, or the one a restore started — ends as cancelled
+/// without opening a browser (story 102.9, R500). An organisation-account
+/// sign-in waits in its own registry and is not touched. Idempotent — with
+/// no pending flow it is a no-op.
 #[tauri::command]
 pub fn cancel_oidc(state: State<'_, AppState>) -> Result<(), IpcError> {
     state.oauth_flows.cancel_all();
@@ -12490,6 +12532,49 @@ pub fn auto_update_restart_check(
     )))
 }
 
+/// *Check for updates* on a build without an in-app updater (story 102.9 #2,
+/// R464): one read of GitHub's latest release, compared with the version this
+/// build was made as (`tauri.conf.json`, the same `getVersion()` About shows),
+/// answered with Rust's sentence — newer and how to install it from the Mac,
+/// up to date, or why keeper could not tell. Never downloads or installs; a
+/// failure is a sentence and a WARN line, never an IPC error.
+#[cfg(not(desktop))]
+#[tauri::command]
+pub async fn release_check(
+    app: tauri::AppHandle,
+) -> Result<keeper_core::release_check::ReleaseCheckVm, IpcError> {
+    let installed = app.package_info().version.to_string();
+    let Some(device) = this_device() else {
+        return Err(to_ipc_error(CoreError::Unsupported(
+            "the release check is for builds without an in-app updater".to_owned(),
+        )));
+    };
+    let http = match crate::account_ipc::http() {
+        Ok(http) => http,
+        Err(error) => {
+            tracing::warn!(%error, "release check: keeper's HTTP client is unavailable");
+            return Ok(keeper_core::release_check::ReleaseCheckVm {
+                outcome: keeper_core::release_check::ReleaseCheckOutcome::Failed,
+                installed,
+                latest: None,
+                sentence: "keeper could not check GitHub for a newer version (its network client did not start). Try again later.".to_owned(),
+            });
+        }
+    };
+    Ok(keeper_core::release_check::check(http, &installed, device).await)
+}
+
+/// Desktop stub for [`release_check`]: a desktop has the signed in-app
+/// updater, which checks and installs; the release check is the phone tier's.
+/// The `inAppUpdater` capability is `true` there, so nothing calls it.
+#[cfg(desktop)]
+#[tauri::command]
+pub fn release_check() -> Result<keeper_core::release_check::ReleaseCheckVm, IpcError> {
+    Err(to_ipc_error(CoreError::Unsupported(
+        "a desktop checks for updates with its in-app updater".to_owned(),
+    )))
+}
+
 /// The tail of the app log, for the in-app diagnostics surface.
 ///
 /// Reads a file the app already writes rather than starting a second stream:
@@ -13207,7 +13292,9 @@ fn sync_remote_urls(state: &AppState) -> Result<Vec<String>, IpcError> {
 /// `(homeserver_url, Provider)`, reads every folder-sync profile's remote via
 /// [`sync_remote_urls`], reads every configured AI provider's base URL via
 /// `bots::store::provider_base_urls`, and feeds all three plus the shared
-/// [`EGRESS_UPDATE_ENDPOINT`]
+/// [`EGRESS_UPDATE_ENDPOINT`] — on a build without an in-app updater the
+/// [`EGRESS_RELEASE_CHECK_ENDPOINT`] its *Check for updates* reads instead
+/// (102.9, R464), since it never contacts the updater's —
 /// into the pure `compute_egress`. The result is rendered as UI under Settings →
 /// About so keeper's egress claim is verifiable, never asserted: each homeserver
 /// (deduped), `api.beeper.com` exactly when a Beeper account exists, each distinct
@@ -13251,7 +13338,11 @@ pub async fn egress_list(
         &accounts,
         &sync_remotes,
         &provider_base_urls,
-        EGRESS_UPDATE_ENDPOINT,
+        if cfg!(desktop) {
+            EGRESS_UPDATE_ENDPOINT
+        } else {
+            EGRESS_RELEASE_CHECK_ENDPOINT
+        },
     );
     if let Some(destination) = telemetry.egress() {
         destinations.push(destination);
@@ -16774,6 +16865,10 @@ mod tests {
     /// `tauri.conf.json` `plugins.updater.endpoints`. If these two literals drift, the
     /// egress list would disclose a destination the app no longer contacts — the exact
     /// dishonesty this story prevents. Fail the build the moment they diverge.
+    /// A phone discloses its release check instead; that it reads the same
+    /// repository the updater publishes to is guarded in keeper-core
+    /// (`egress::tests::the_release_check_reads_the_repository_the_updater_publishes_to`),
+    /// where it runs on every host.
     #[test]
     fn egress_update_endpoint_matches_tauri_conf() {
         let conf: serde_json::Value = serde_json::from_str(include_str!("../tauri.conf.json"))

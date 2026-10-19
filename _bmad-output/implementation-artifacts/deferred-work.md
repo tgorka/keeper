@@ -11410,3 +11410,24 @@ origin: lane `settings` (story 102.8, fix 1 browser proof of the Notes search �
 location: `src/components/notes/note-row.tsx` (the tag chip, `aria-label="Tag <tag>, on this note"`, a `<button>` popover trigger inside the row's own `<button>`; unchanged since epic 79, `df822c0b`)
 reason: React logs "In HTML, <button> cannot be a descendant of <button>" twice whenever the Notes list renders a tagged note (measured in the mock shell at 1280 px, `button button` matched every tag chip); interactive content inside a button is invalid HTML, and assistive technology may not reach the inner control. Not a Settings change, so not fixed here. Fix: render the row as a non-button container with a stretched primary button, or the chip as a sibling of the row's button.
 status: open
+
+### DW-1590: On iPhone, a sign-in sheet that fails ends the account sign-in, and its link with it.
+
+origin: lane `devices` (story 102.9 #1, R470), 2026-10-19
+location: `crates/keeper/src/web_auth.rs` (`finish`, `Ending::Failed` → `OAuthFlowRegistry::fail`), `keeper_core::sign_in_link::offer`
+reason: `offer` keeps a sign-in waiting when the page cannot be *opened* (the platform call returns an error), so the link on screen stays usable. On iOS the sheet is queued and fails asynchronously (`presentationContextInvalid`, a window that never became active): that reaches the flow as a broken round trip and ends it, so the link the account's screen showed answers nobody. A sheet failure could instead leave the flow waiting with the link and `NOT_OPENED` (Safari delivers `keeper://` callbacks), which is the iPhone's only manual way in when the sheet will not show. Needs kalypso to prove.
+status: closed (lane `devices`, fix round 1, R480/01, 2026-10-19: `web_auth::finish(Ending::Failed)` → `OAuthFlowRegistry::not_shown`; a sign-in registered `register_with_link` keeps waiting and shows its link with `NOT_OPENED` (`sign_in_link::Shown::wait`), a flow without one (F3) still ends; tests `oauth::tests::a_page_not_shown_ends_only_a_flow_without_a_link`, `org_account::oidc::tests::a_sheet_refused_after_it_was_queued_leaves_the_same_sign_in_to_the_pasted_link`, `web_auth::tests::a_sheet_refused_later_leaves_a_sign_in_with_a_link_waiting` (shell, CI); the sheet itself on kalypso is owed)
+
+### DW-1591: The single sign-on a restore starts by itself shows its link nowhere.
+
+origin: lane `devices` (story 102.9 #1), 2026-10-19
+location: `crates/keeper/src/account_ipc.rs` (restore's `sign_in_oidc(…, None)`), `crates/keeper/src/ipc.rs` `sign_in_oidc`
+reason: a Matrix single sign-on a restore starts (AD-329) has no login screen open, so its link goes to no surface (`on_link` is `None`); when that browser does not come forward the person waits five minutes and sees nothing. Its link belongs in the account's restore view model beside the restore sentence.
+status: closed (lane `devices`, fix rounds 1–2, R480/02 + R500, 2026-10-19: `account_ipc::start_matrix_sign_in` routes the link and the outcome to `AccountRestoreVm.matrixSignIn` — its own line with Copy and *Cancel Matrix sign-in*; round 2 made the attempt own that row and Cancel from its creation (`RestoreFacts::begin_matrix_sign_in`, `RestoreSignInAttempt::run`, `OAuthFlowRegistry::cancel_latch`); tests `org_account::state::tests::{the_restores_matrix_sign_in_carries_its_own_link_and_outcome, an_earlier_restore_sign_in_never_writes_the_row_a_later_one_owns}`, `auth::tests::a_restore_cancelled_while_its_server_is_discovered_never_opens_a_browser`, `account-section.test.tsx` "gives the Matrix sign-in it started its own link and Cancel, then says how it ended")
+
+### DW-1592: A sign-out page that does not open is said to nobody.
+
+origin: lane `devices` (story 102.9 triage, F3), 2026-10-19
+location: `crates/keeper/src/account_ipc.rs` (the end-session `start_web_auth` error branch: `flows.remove` + WARN)
+reason: R381 asks for a sentence where the person looks as well as the WARN line. The end-session URL carries an ID-token hint, so R470 forbids showing or `open_url`-ing it; the fix is a sentence only ("keeper signed you out here; your identity provider's session stays until you sign out there"), not a link.
+status: open

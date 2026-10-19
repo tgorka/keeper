@@ -44,6 +44,8 @@ import type { NotifyTarget } from "./gen/NotifyTarget";
 import type { PersonVm } from "./gen/PersonVm";
 import type { PushGatewayVm } from "./gen/PushGatewayVm";
 import type { PushOpenVm } from "./gen/PushOpenVm";
+import type { ReleaseCheckVm } from "./gen/ReleaseCheckVm";
+import type { SignInLinkVm } from "./gen/SignInLinkVm";
 import type { TelemetryConsentVm } from "./gen/TelemetryConsentVm";
 import type { TelemetryEventReq } from "./gen/TelemetryEventReq";
 import type { TelemetryRemoteConfigVm } from "./gen/TelemetryRemoteConfigVm";
@@ -697,9 +699,12 @@ export type { RecordingTargetVm } from "./gen/RecordingTargetVm";
 export type { RecordingUiState } from "./gen/RecordingUiState";
 export type { RecordingVolumeState } from "./gen/RecordingVolumeState";
 export type { RecordingVolumeVm } from "./gen/RecordingVolumeVm";
+export type { ReleaseCheckOutcome } from "./gen/ReleaseCheckOutcome";
+export type { ReleaseCheckVm } from "./gen/ReleaseCheckVm";
 export type { RemoteDraftVm } from "./gen/RemoteDraftVm";
 export type { ReplyPreviewVm } from "./gen/ReplyPreviewVm";
 export type { ResolveSupportVm } from "./gen/ResolveSupportVm";
+export type { RestoreSignInVm } from "./gen/RestoreSignInVm";
 export type { RiskTier } from "./gen/RiskTier";
 export type { RoomListBatch } from "./gen/RoomListBatch";
 export type { RoomListOp } from "./gen/RoomListOp";
@@ -747,6 +752,7 @@ export type { SessionTemplateEntryVm } from "./gen/SessionTemplateEntryVm";
 export type { SessionTreeVm } from "./gen/SessionTreeVm";
 export type { SheetsVm } from "./gen/SheetsVm";
 export type { SheetVm } from "./gen/SheetVm";
+export type { SignInLinkVm } from "./gen/SignInLinkVm";
 export type { SlidesVm } from "./gen/SlidesVm";
 export type { SlideVm } from "./gen/SlideVm";
 export type { SpacesSnapshot } from "./gen/SpacesSnapshot";
@@ -1310,10 +1316,19 @@ export async function loginPassword(
  * `code`/`state` ever crosses back to JavaScript.
  *
  * This call stays pending for the whole browser round-trip; use
- * {@link cancelOidc} to abort it.
+ * {@link cancelOidc} to abort it. While it waits, `onLink` receives the
+ * authorization page — before the browser is asked for it, and again with
+ * Rust's sentence when the browser or the sign-in sheet could not be opened
+ * (the sign-in keeps waiting) — so the screen can offer it to copy by hand,
+ * and `null` when the sign-in ends (story 102.9, R470, R480).
  */
-export async function loginOidc(homeserver: string): Promise<AccountVm> {
-  return await invoke<AccountVm>("login_oidc", { homeserver });
+export async function loginOidc(
+  homeserver: string,
+  onLink: (link: SignInLinkVm | null) => void = () => {},
+): Promise<AccountVm> {
+  const channel = new Channel<SignInLinkVm | null>();
+  channel.onmessage = onLink;
+  return await invoke<AccountVm>("login_oidc", { homeserver, onLink: channel });
 }
 
 /**
@@ -3541,6 +3556,16 @@ export async function autoUpdateGet(): Promise<AutoUpdateVm> {
  */
 export async function autoUpdateSet(enabled: boolean): Promise<AutoUpdateVm> {
   return invoke<AutoUpdateVm>("auto_update_set", { enabled });
+}
+
+/**
+ * *Check for updates* on a build without an in-app updater (the phone tier,
+ * story 102.9, R464): Rust reads GitHub's latest release once, compares it
+ * with this build's version and answers with its sentence — never a download.
+ * A failure is an answer too (`outcome: "failed"` with the reason).
+ */
+export async function releaseCheck(): Promise<ReleaseCheckVm> {
+  return invoke<ReleaseCheckVm>("release_check");
 }
 
 /** Whether this device's log goes to the config repository daily, as the layer files leave it. */

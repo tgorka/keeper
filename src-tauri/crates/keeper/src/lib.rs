@@ -1412,6 +1412,7 @@ pub fn run() {
                 ipc::log_upload_get,
                 ipc::log_upload_set,
                 ipc::auto_update_restart_check,
+                ipc::release_check,
                 ipc::debug_log_tail,
                 ipc::debug_log_path,
                 ipc::titlebar_drag_report,

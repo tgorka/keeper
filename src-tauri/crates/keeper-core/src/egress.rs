@@ -50,6 +50,24 @@ use crate::vm::{EgressEndpointVm, EgressKind, Provider};
 pub const EGRESS_UPDATE_ENDPOINT: &str =
     "https://github.com/tgorka/keeper/releases/latest/download/latest.json";
 
+/// The release check of a build without an in-app updater (story 102.9, R464):
+/// GitHub's latest release of the repository the updater publishes to, read
+/// for its tag and nothing else, when the person presses *Check for updates*
+/// on the phone tier ([`crate::release_check`]). Such a build discloses this
+/// row instead of [`EGRESS_UPDATE_ENDPOINT`], which it never contacts.
+pub const EGRESS_RELEASE_CHECK_ENDPOINT: &str =
+    "https://api.github.com/repos/tgorka/keeper/releases/latest";
+
+/// The label of the update row: the release check reads a version and
+/// downloads nothing, so it is never called an update.
+fn update_label(update_endpoint: &str) -> &'static str {
+    if update_endpoint == EGRESS_RELEASE_CHECK_ENDPOINT {
+        "Release check (reads the latest version, downloads nothing)"
+    } else {
+        "Signed app updates"
+    }
+}
+
 /// Beeper's client-facing API host, surfaced as a distinct egress entry exactly when a
 /// Beeper account is present. Reuses [`BEEPER_API_BASE`] — the same constant the Beeper
 /// login flow connects to — so the disclosed destination can never drift from reality
@@ -252,12 +270,13 @@ pub fn compute_egress(
         });
     }
 
-    // The signed-update endpoint is always present — keeper checks it regardless of
-    // whether any account is signed in.
+    // The update row is always present — keeper checks it regardless of
+    // whether any account is signed in: the signed updater's endpoint on a
+    // desktop, the release check on a build without an in-app updater.
     endpoints.push(EgressEndpointVm {
         url: update_endpoint.to_owned(),
         kind: EgressKind::Update,
-        label: "Signed app updates".to_owned(),
+        label: update_label(update_endpoint).to_owned(),
     });
 
     endpoints
@@ -1455,5 +1474,60 @@ mod tests {
                 "remote_host({remote:?})"
             );
         }
+    }
+
+    /// A build without an in-app updater discloses the release check it
+    /// makes and calls it that; a desktop discloses the signed updater (102.9
+    /// #2, R464).
+    #[test]
+    fn the_update_row_names_what_this_build_contacts() {
+        let phone = compute_egress(&[], &[], &[], EGRESS_RELEASE_CHECK_ENDPOINT);
+        let row = phone.last().expect("the update row");
+        assert_eq!(row.kind, EgressKind::Update);
+        assert_eq!(
+            row.url,
+            "https://api.github.com/repos/tgorka/keeper/releases/latest"
+        );
+        assert_eq!(
+            row.label,
+            "Release check (reads the latest version, downloads nothing)"
+        );
+        let desktop = compute_egress(&[], &[], &[], EGRESS_UPDATE_ENDPOINT);
+        assert_eq!(
+            desktop.last().map(|row| row.label.as_str()),
+            Some("Signed app updates")
+        );
+    }
+
+    /// The phone's release check must read the releases the desktop updater
+    /// publishes: the repository in `tauri.conf.json`'s updater endpoint is
+    /// the one the check asks GitHub about. Moving the releases without
+    /// moving the check would tell every phone it is up to date forever.
+    #[test]
+    fn the_release_check_reads_the_repository_the_updater_publishes_to() {
+        let conf: serde_json::Value =
+            serde_json::from_str(include_str!("../../keeper/tauri.conf.json"))
+                .expect("tauri.conf.json parses as JSON");
+        let endpoints = conf["plugins"]["updater"]["endpoints"]
+            .as_array()
+            .expect("plugins.updater.endpoints is an array");
+        let repository = |url: &str, prefix: &str, suffix: &str| {
+            url.strip_prefix(prefix)
+                .and_then(|rest| rest.split_once(suffix))
+                .map(|(repo, _)| repo.to_owned())
+        };
+        let checked = repository(
+            EGRESS_RELEASE_CHECK_ENDPOINT,
+            "https://api.github.com/repos/",
+            "/releases/latest",
+        )
+        .expect("the release check names a repository");
+        assert!(
+            endpoints.iter().filter_map(|e| e.as_str()).any(|url| {
+                repository(url, "https://github.com/", "/releases/").as_deref()
+                    == Some(checked.as_str())
+            }),
+            "the release check reads {checked}, which no updater endpoint ({endpoints:?}) publishes to"
+        );
     }
 }

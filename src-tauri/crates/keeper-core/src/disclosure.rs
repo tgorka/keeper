@@ -45,7 +45,7 @@ pub const IPHONE_LINES: [&str; 8] = [
     "Nothing is merged on a phone: a history this copy cannot fast-forward is named — how many commits this phone has that the remote does not — and you push them or reset this copy; the Mac merges.",
     "Notes are a synced folder, so they are here too: list, search, read and edit them, and a save is a commit that keeper pushes from this phone with its own engine — there is no git on a phone.",
     "The sessions board is here too: read a session's cards, move one with Move to…, and open an agent's session room to decide its approval; creating and archiving sessions stays on your Mac, with tasks, the self-hosted bridge runner, screen recording and the global summon hotkey. Bots talks to a model here, but the drive tools live on your Mac.",
-    "Updates arrive by reinstalling keeper; its signature renews every 7 days.",
+    "Updates arrive by reinstalling keeper from your Mac — Check for updates in About says when a new version is out — and its signature renews every 7 days.",
     "Listening for the wake phrase starts in keeper, and then keeps working with another app in front and with the screen locked; the answer is spoken there too, and saying \"stop\" (or the stop word you chose) ends it. Speech is recognised on this phone and never sent to a server.",
     VoicePlatform::IOS.limits,
 ];
@@ -63,7 +63,7 @@ pub fn android(noun: &str) -> Vec<String> {
         format!("No screen recording and no transcription on this {noun}."),
         android_push_line(noun),
         crate::voice::android::disclosure_line(noun),
-        "Updates arrive by installing a new build, signed with your own key and sideloaded.".to_owned(),
+        "Updates arrive by installing a new build, signed with your own key and sideloaded; Check for updates in About says when a new version is out.".to_owned(),
     ]
 }
 

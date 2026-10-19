@@ -423,6 +423,18 @@ whenever Settings opens.
 - **Other desktops** (Linux, Windows) open the default browser and receive the callback
   through the `keeper://` link.
 
+**If the browser or the sheet does not come forward.** While a sign-in waits, keeper shows its
+authorization page as selectable text with *Copy link* (story 102.9): paste it into any
+browser and the sign-in finishes as if it had opened by itself. When keeper could not open
+the page — the browser would not start, or iOS refused the sheet after it was asked for —
+keeper says so beside the link and keeps waiting for it until the sign-in's own five minutes
+run out or you press Cancel. The link goes away the moment the sign-in ends, however it ends:
+it carries that one attempt's `state`, which nothing answers afterwards, so a timed-out
+sign-in offers *Sign in* again for a fresh one. The Matrix single sign-on a restored device
+starts by itself has the same link on its own line under Settings › Account, with *Cancel
+Matrix sign-in* — which works from the moment the line appears, even before the link does: a
+cancelled sign-in never opens a browser afterwards. A sign-out page is never shown this way: its address carries your ID token.
+
 *Cancel*, in keeper or in the sign-in window, ends the attempt as cancelled, not failed: the
 setup sheet says the sign-in was closed and nothing was set up (or, for an account already
 signed in on this device, that it stays as it was — never "Up to date"). Connecting an `oauth`

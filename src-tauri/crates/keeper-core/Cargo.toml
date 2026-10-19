@@ -56,6 +56,10 @@ ulid = { workspace = true }
 # Random per-account SDK-store passphrase generation (Story 2.6, at-rest encryption).
 # matrix-sdk 0.18 already resolves rand 0.8 transitively; permissive (MIT/Apache).
 rand = "0.8"
+# The phone's release check reads GitHub's latest tag as a strict SemVer 2.0
+# version (story 102.9, R482). Already locked in the tree (tauri-utils,
+# tauri-plugin-updater), `MIT OR Apache-2.0`, no tauri or gix behind it.
+semver = "1"
 # The `path:` predicate of the space query language (Phase 5, FR-105). The
 # architecture specifies a globset glob, and `keeper-sync`'s tier-0 exclusion
 # already resolves the same workspace version, so this pulls no new crate into

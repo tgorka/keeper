@@ -1025,7 +1025,7 @@ to finish with the screen locked):
 - Nothing is merged on a phone: a history this copy cannot fast-forward is named — how many commits this phone has that the remote does not — and you push them or reset this copy; the Mac merges.
 - Notes are a synced folder, so they are here too: list, search, read and edit them, and a save is a commit that keeper pushes from this phone with its own engine — there is no git on a phone.
 - The sessions board is here too: read a session's cards, move one with Move to…, and open an agent's session room to decide its approval; creating and archiving sessions stays on your Mac, with tasks, the self-hosted bridge runner, screen recording and the global summon hotkey. Bots talks to a model here, but the drive tools live on your Mac.
-- Updates arrive by reinstalling keeper; its signature renews every 7 days.
+- Updates arrive by reinstalling keeper from your Mac — Check for updates in About says when a new version is out — and its signature renews every 7 days.
 - Listening for the wake phrase starts in keeper, and then keeps working with another app in front and with the screen locked; the answer is spoken there too, and saying "stop" (or the stop word you chose) ends it. Speech is recognised on this phone and never sent to a server.
 - Turn listening on while keeper is in front and it keeps listening when another app is in front or the screen is locked. Siri or an app that takes the microphone pauses it and keeper resumes on its own; a phone call ends it until you open keeper again. It stops when you turn it off or when keeper is force-quit. The orange microphone indicator stays on the whole time and cannot be hidden, and listening uses battery.
 
@@ -1103,7 +1103,14 @@ endpoint a phone can reach is the same wire and is neither built for nor blocked
 The sixth item is the [7-day re-arm ritual](#the-7-day-re-arm-ritual) above:
 "reinstalling keeper" is exactly the weekly `bun run tauri ios dev` re-sign (or an
 AltServer auto-refresh), and it is how updates reach the phone — there is no
-in-app updater on the phone tier.
+in-app updater on the phone tier. What the phone does have (story 102.9, R464) is
+**Check for updates** in Settings › About: on a press it reads the latest release's
+tag from GitHub (`api.github.com/repos/tgorka/keeper/releases/latest`, unauthenticated,
+15-second timeout — the row About's egress list shows on this build instead of the
+desktop updater's `latest.json`), compares it with the version this build was made as,
+and says either "keeper X.Y.Z is available — install it from your Mac with
+`bun run install:ios`" or "keeper is up to date". It never downloads or installs
+anything: a dev-signed bundle can only be replaced from the Mac.
 
 The seventh and eighth items are talk mode, Epic 62. keeper turns speech into
 text, sends it to the bot as an ordinary message and speaks the answer; a wake phrase
