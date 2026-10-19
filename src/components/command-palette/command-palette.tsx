@@ -26,7 +26,7 @@ import {
   CommandInput,
   CommandList,
 } from "@/components/ui/command";
-import { captureTelemetry, useTelemetryOpening } from "@/hooks/use-telemetry";
+import { useTelemetryOpening } from "@/hooks/use-telemetry";
 import { logFailure } from "@/lib/failure";
 import type { PaletteChatVm, PaletteMode, PaletteResultsVm } from "@/lib/ipc/client";
 import { paletteQuery } from "@/lib/ipc/client";
@@ -100,7 +100,6 @@ export function CommandPalette() {
         })
         .catch((raw: unknown) => {
           logFailure("palette.query")(raw);
-          void captureTelemetry("frontendError");
           if (seq === requestSeq.current && commandPaletteStore.getState().isOpen) {
             setResults(EMPTY_RESULTS);
             setHasResponded(true);

@@ -220,7 +220,8 @@ impl Write for RotatingFile {
 
 /// The longest panic message a log line carries. A message is whatever the
 /// panicking code formatted; the location and thread are what a bug report
-/// needs, and a runaway message must not fill the file.
+/// needs, and a runaway message must not fill the file. A message cut here
+/// loses the token the cut went through (`bound_panic_message`).
 pub const PANIC_MESSAGE_MAX: usize = 500;
 
 /// What one panic's log line says.
@@ -230,7 +231,8 @@ pub struct PanicRecord {
     pub location: Option<String>,
     /// The panicking thread's name, or `unnamed`.
     pub thread: String,
-    /// The panic's message, bounded to [`PANIC_MESSAGE_MAX`] characters.
+    /// The panic's message, bounded to [`PANIC_MESSAGE_MAX`] characters by
+    /// `bound_panic_message`.
     pub message: String,
 }
 
@@ -243,10 +245,7 @@ impl PanicRecord {
             .copied()
             .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
             .unwrap_or("a panic without a message");
-        let mut bounded: String = message.chars().take(PANIC_MESSAGE_MAX).collect();
-        if bounded.len() < message.len() {
-            bounded.push('…');
-        }
+        let bounded = bound_panic_message(message);
         Self {
             location: info
                 .location()
@@ -260,18 +259,35 @@ impl PanicRecord {
     }
 }
 
+/// `message` cut to at most [`PANIC_MESSAGE_MAX`] characters. The same line
+/// is `keeper.log`'s and, through the shell's export layer, PostHog's, and
+/// the redactor only ever sees what this leaves (R461, R511 P2-04): a cut
+/// through a token — a hex or base64 secret, an identifier, a path — would
+/// leave a fragment shorter than any class that redaction recognises. So a
+/// cut message drops its trailing token whole, and the one the cut may have
+/// ended at, since a cut on a boundary cannot be told from one inside a
+/// token. keeper-core's `telemetry::redact::bound` applies the same rule to
+/// the webview's reports; this crate is core-free (AD-40), hence the copy.
+fn bound_panic_message(message: &str) -> String {
+    if message.chars().count() <= PANIC_MESSAGE_MAX {
+        return message.to_owned();
+    }
+    let cut: String = message.chars().take(PANIC_MESSAGE_MAX).collect();
+    let kept = cut.trim_end_matches(|c: char| !c.is_whitespace());
+    format!("{kept}…")
+}
+
 /// Install the process's panic hook (Epic 100, R381 as amended by R387,
 /// 100.1 #1): every panic is written to the `tracing` log at `ERROR` with its
 /// location and thread — so it lands in `keeper.log`, which records `WARN`
 /// and above always — then the hook that was installed before this one runs,
 /// so the default stderr report and any test harness still see it.
 ///
-/// That line is all a panic becomes. It is never counted in telemetry: a
-/// process whose runtime workers poll agent and non-agent work alike has no
-/// boundary that could tell an agent's panic apart, and agents stay out of
-/// telemetry fail-closed (S-19). Nor does the hook do anything that could
-/// itself panic beyond formatting the line — no lock it would wait on, no
-/// random number, no queue.
+/// That line is all the hook writes. Where the shell's subscriber carries the
+/// telemetry export layer, the line then leaves for PostHog like every other
+/// `ERROR`, redacted, under diagnostics consent (R461, replacing R387's
+/// "never counted"). The hook does nothing that could itself panic beyond
+/// formatting the line — no lock it would wait on, no random number, no queue.
 ///
 /// Here rather than in a host because both hosts could install it and
 /// neither compiles on the other's machine (see this module's header).

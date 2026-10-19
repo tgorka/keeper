@@ -5003,6 +5003,25 @@ let autoUpdate: AutoUpdateVm = {
  * for the same reason `autoUpdate` does: the switch applies the echo.
  */
 let logUpload = true;
+// Diagnostics & studies (102.1, R462): consent is account-wide in Rust; the
+// mock keeps it in memory so the switches show their on and off states. No
+// request ever leaves the browser shell, and no project token exists here.
+// `?telemetry=pinned`: a settings file pins diagnostics off, so a save is
+// kept but overruled (R495 06) — the switch stays off and says why.
+const telemetryPinned = new URLSearchParams(window.location.search).get("telemetry") === "pinned";
+let telemetryConsent = { diagnostics: false, productAnalytics: false, remoteConfig: false };
+const telemetryStatus = () => {
+  const consent = telemetryPinned ? { ...telemetryConsent, diagnostics: false } : telemetryConsent;
+  return {
+    consent,
+    configured: true,
+    host: "https://us.i.posthog.com",
+    installationId: Object.values(consent).some(Boolean)
+      ? "0123456789abcdef0123456789abcdef"
+      : null,
+    consentPinned: telemetryPinned,
+  };
+};
 
 // A browser has no filesystem. These are explicitly fixture files, dated on
 // either side of a day boundary so the date controls can be exercised honestly.
@@ -9054,15 +9073,10 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
     logUpload = payload.enabled === true;
     return logUpload;
   },
-  // Browser development never contacts PostHog or exposes a real project token.
-  telemetry_status: () => ({
-    consent: { diagnostics: false, productAnalytics: false, remoteConfig: false },
-    configured: false,
-    host: null,
-    installationId: null,
-  }),
-  telemetry_consent_set: () => {
-    throw new Error("PostHog is not configured in the browser development shell.");
+  telemetry_status: () => telemetryStatus(),
+  telemetry_consent_set: (payload) => {
+    telemetryConsent = { ...(payload.consent as typeof telemetryConsent) };
+    return telemetryStatus();
   },
   telemetry_capture: () => null,
   telemetry_remote_config: () => ({ supportMessage: null }),

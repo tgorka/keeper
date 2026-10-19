@@ -1024,7 +1024,9 @@ pub fn load_account_layers(src: &AccountLayerSource) -> AccountLayers {
 
 /// Swap the account tiers in, live. `None` clears them (sign-out, or an
 /// identity that no longer matches). Keys read on every access take effect at
-/// once; keys consumed only at boot take effect at the next launch.
+/// once; keys consumed only at boot take effect at the next launch. Once the
+/// new state is in force, the [`set_account_layers_observer`] observer hears
+/// it — every install and clear, whatever its caller (R496).
 pub fn install_account_layers(layers: Option<AccountLayers>) {
     match &layers {
         Some(layers) => {
@@ -1050,6 +1052,53 @@ pub fn install_account_layers(layers: Option<AccountLayers>) {
         };
         slot.installed.store(installed, Ordering::Release);
         drop(previous);
+    });
+    notify_layers_observer();
+}
+
+/// Told after every account-layer install or clear, once the new layers
+/// answer every read — how a value only a layer file sets (diagnostics
+/// consent, R496) takes effect without a settings row moving.
+pub type AccountLayersObserver = Box<dyn Fn() + Send + Sync>;
+
+#[cfg(not(test))]
+static LAYERS_OBSERVER: std::sync::OnceLock<AccountLayersObserver> = std::sync::OnceLock::new();
+
+// Per-thread in tests, like the account slot it watches.
+#[cfg(test)]
+thread_local! {
+    static LAYERS_OBSERVER: std::cell::RefCell<Option<AccountLayersObserver>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Install the process-wide account-layers observer. The first call wins; a
+/// second is ignored, so a re-run boot step cannot stack observers.
+#[cfg(not(test))]
+pub fn set_account_layers_observer(observer: AccountLayersObserver) {
+    if LAYERS_OBSERVER.set(observer).is_err() {
+        tracing::debug!("an account-layers observer is already installed; keeping the first");
+    }
+}
+
+/// This test thread's observer (replacing any earlier one).
+#[cfg(test)]
+pub fn set_account_layers_observer(observer: AccountLayersObserver) {
+    LAYERS_OBSERVER.with(|slot| *slot.borrow_mut() = Some(observer));
+}
+
+#[cfg(not(test))]
+fn notify_layers_observer() {
+    if let Some(observer) = LAYERS_OBSERVER.get() {
+        observer();
+    }
+}
+
+#[cfg(test)]
+fn notify_layers_observer() {
+    LAYERS_OBSERVER.with(|slot| {
+        if let Some(observer) = slot.borrow().as_ref() {
+            observer();
+        }
     });
 }
 

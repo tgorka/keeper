@@ -1010,6 +1010,27 @@ pub const KEYS: &[KeySpec] = &[
         summary: "Whether keeper keeps a menu-bar (tray) presence.",
         example: "true",
     },
+    // ---- telemetry -------------------------------------------------------
+    KeySpec {
+        key: "telemetry.diagnostics",
+        family: false,
+        scope: Scope::UserGlobal,
+        settable: Settable::AnyLayer,
+        shape: Shape::Flag01,
+        default: "0",
+        summary: "Optional diagnostics to PostHog (R461/R462): every warning and error keeper logs, its message redacted, plus content-free timings. Travels with the account, so it is on or off on every device. Absent or unreadable is off.",
+        example: "true",
+    },
+    KeySpec {
+        key: "telemetry.product_analytics",
+        family: false,
+        scope: Scope::UserGlobal,
+        settable: Settable::AnyLayer,
+        shape: Shape::Flag01,
+        default: "0",
+        summary: "Optional product statistics to PostHog (R462): counts of opening Settings and the command palette. Travels with the account like diagnostics. Absent or unreadable is off.",
+        example: "true",
+    },
     // ---- transcription ---------------------------------------------------
     KeySpec {
         key: "transcription.after_recording",

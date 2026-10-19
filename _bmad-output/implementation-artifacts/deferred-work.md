@@ -11130,3 +11130,31 @@ origin: lane `101stack` (merging 101.4 and 101.5 with 101.6's older-host check i
 location: `keeper_agent::desktop::{prepare_web_search, prepare_console}` (their `admit`), `keeper_core::agents::model::{KEY_SINCE, older_hosts}`
 reason: R422's check runs for the model save only, and `KEY_SINCE` knows `[model].effort` alone. `[web_search]` and `[run]` are root tables a build before epic 101 does not know (its `agent.toml` key set is closed), so such a host — keeper-agentd on electra until it is upgraded — would refuse the home and stop serving the agent after a person's save. Fix: add both tables to `KEY_SINCE` with the first release that reads them and give the two saves the model save's `admit`.
 status: closed (lane `101stack`, stack fix 1, R460, 2026-10-16: `KEY_SINCE` also names `web_search` in `[tools].allow`, `[web_search]` and `[run]` (0.10.4); `prepare_home` holds every save to `model::older_hosts`; web search *Off* and the console the file reads without `[run]` lift the tables out (`home::without_table`), so they stay allowed; tests `model::tests::every_key_epic_101_writes_is_held_to_the_serving_hosts`, `desktop::tests::a_save_an_older_serving_host_cannot_read_is_refused_and_one_back_is_not`, `home::tests::a_table_is_lifted_out_whole_or_not_at_all`)
+
+### DW-1510: The PostHog provisioning catalog does not know the problem records.
+
+origin: lane `telemetry` (story 102.1, R461), 2026-10-19
+location: `scripts/posthog/provision.mjs` (`expected` event catalog), `deploy/posthog/` manifest
+reason: the reviewed dashboard manifest lists the six closed events; `$exception` problem records (Error tracking) and `keeper_problems_dropped` are ingested but appear on no provisioned dashboard or metric. Changing the manifest changes its reviewed hash, which is a maintainer step (`posthog.yml`, `posthog-maintainers` environment).
+status: open
+
+### DW-1511: A process that never runs `setup` sends no problem to PostHog.
+
+origin: lane `telemetry` (story 102.1), 2026-10-19
+location: `keeper/src/lib.rs` setup (`debug_log::init`, `telemetry_ipc::start_problem_export`)
+reason: the export layer is installed with the shell's one subscriber and attached straight after it, in `setup`. An iOS push wake that never runs `setup` (DW-1263) has no subscriber, so its WARN/ERROR lines reach neither `keeper.log` nor PostHog; closing DW-1263 closes this.
+status: open
+
+### DW-1512: Relative paths and device names survive the redactor.
+
+origin: lane `telemetry` (story 102.1, R461), 2026-10-19
+location: `keeper_core::telemetry::redact`
+reason: R461's classes are home-relative paths, ids, emails, URL paths, tokens and long hex/base64 runs. A drive-relative path (`40-media/2019/wedding.mp4`), a note's file name or a microphone's name in a WARN leaves as written. Whether a further class (any `/`-separated path, quoted file names) is wanted is the owner's call; the redactor takes one more pattern and test.
+status: open
+
+### DW-1513: The phone builds' PostHog pair is proven by inspection, not by an installed phone.
+
+origin: lane `telemetry` (story 102.1 #5), 2026-10-19
+location: `scripts/install-ios.sh`, `scripts/install-android.sh`, `scripts/lib/posthog-client.sh`, `crates/keeper/build.rs` (`stamped_public_observability_config`)
+reason: no Linux build of the shell crate exists, and no phone was installed from this lane: `bash -n` passes and `build.rs`'s file fallback awaits CI's macOS job. Owed: `bun run install:ios` on kalypso then diagnostics on → a `$exception` from `os = ios` in project 605256; the same for Android hardware.
+status: open

@@ -114,11 +114,17 @@ keeper-ported = { path = "../keeper-ported" }
 # Cargo.lock for keeper-sync's LFS hashing, so the tree gains no package.
 sha2 = { workspace = true }
 hex = { workspace = true }
-# Secret redaction before an agent's log line is written (Epic 89, S-17).
+# Secret redaction before an agent's log line is written (Epic 89, S-17), and
+# before a WARN/ERROR message leaves for PostHog (R461, `telemetry::redact`).
 regex = { workspace = true }
 # OTLP protobuf wire encoding for the closed consent-gated observability schema.
-# Already resolved via Matrix; no arbitrary tracing subscriber is exported.
+# Already resolved via Matrix.
 prost = "0.14"
+# The `Layer` the shell installs to forward WARN/ERROR events to telemetry
+# (R461, `telemetry::LogExport`); the tests read a failed account step's WARN
+# back from a real `fmt` subscriber (Epic 100). Already in the workspace
+# catalog and linked by every host, so no new crate is resolved.
+tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 # The privacy lifecycle tests observe real localhost connection/cancellation;
@@ -139,7 +145,3 @@ image = { workspace = true }
 # The container move's tests (Epic 98) move real directories; already in the
 # graph through keeper-sync.
 tempfile = { workspace = true }
-# A failed account step's WARN line is read back from a real `fmt` subscriber
-# (Epic 100, 100.1 #3). Already in the workspace catalog and linked by both
-# hosts and keeper-sync's tests, so no new crate is resolved.
-tracing-subscriber = { workspace = true }

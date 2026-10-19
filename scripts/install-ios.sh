@@ -104,6 +104,18 @@ REMOTE_ENV="$REMOTE_ENV && export PATH=\"\$HOME/$REMOTE_DIR/scripts/lib/swift-na
 BUILD_SHA="$(keeper_stamp_build_sha "$REPO_ROOT")"
 REMOTE_ENV="$REMOTE_ENV KEEPER_BUILD_SHA=\"$BUILD_SHA\""
 
+# The public PostHog client configuration (102.1 #5): without it the phone's
+# build embeds none and can never report, whatever the person consents to. It
+# travels as an env export and as a file in the rsynced tree, because the
+# environment does not survive the Xcode script phase's hop (the library's
+# header says why); the local file goes once the tree is synced, the remote
+# copy once the build has read it (the trap at the rsync).
+. "$REPO_ROOT/scripts/lib/posthog-client.sh"
+if ! keeper_resolve_posthog_client "$REPO_ROOT"; then
+  fail "could not resolve the public PostHog client configuration; the build would ship unable to report anything. Export KEEPER_POSTHOG_HOST and KEEPER_POSTHOG_PROJECT_TOKEN, or sign in to gh."
+fi
+REMOTE_ENV="$REMOTE_ENV KEEPER_POSTHOG_HOST=\"$POSTHOG_HOST\" KEEPER_POSTHOG_PROJECT_TOKEN=\"$POSTHOG_TOKEN\""
+
 # A connect timeout because the whole point of the first check is to say
 # quickly that the Mac is not there; ssh's own default waits two minutes.
 SSH=(ssh -o BatchMode=yes -o ConnectTimeout=15)
@@ -250,6 +262,19 @@ say "team: $APPLE_DEVELOPMENT_TEAM"
 # repository of its own; the stamp above is its only word.
 "${SSH[@]}" "$HOST" "rm -rf \"\$HOME/$REMOTE_DIR/.git\""
 say "syncing working tree"
+# The stamped pair lives exactly as long as its use (R499): the local file
+# until the rsync has carried it, the remote copy until the Rust build that
+# reads it has finished. One trap removes both on every way out — success,
+# a `fail`, an interrupted run — so no later build of either tree embeds a
+# stale pair through build.rs's fallback.
+unstamp_posthog_client_everywhere() {
+  keeper_unstamp_posthog_client "$REPO_ROOT"
+  "${SSH[@]}" "$HOST" "rm -f \"\$HOME/$REMOTE_DIR/$KEEPER_POSTHOG_CLIENT_FILE\"" 2>/dev/null || true
+}
+trap unstamp_posthog_client_everywhere EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+keeper_stamp_posthog_client "$REPO_ROOT"
 rsync -az --delete \
   --exclude '.git' \
   --exclude 'node_modules/' \
@@ -261,7 +286,8 @@ rsync -az --delete \
   --exclude "$APPLE_DIR/Pods/" \
   --exclude "$APPLE_DIR/.xcode/" \
   --exclude "$APPLE_DIR/xcuserdata/" \
-  "$REPO_ROOT/" "$HOST:$REMOTE_DIR/"
+  "$REPO_ROOT/" "$HOST:$REMOTE_DIR/" || fail "rsync to $HOST failed (output above)."
+keeper_unstamp_posthog_client "$REPO_ROOT"
 
 # `--ignore-scripts` skips our own `prepare` (`lefthook install`), which wants a
 # git repository this checkout deliberately does not have.
@@ -460,6 +486,8 @@ PAYLOAD" 2>&1 | tee "$BUILD_LOG"; then
   fail "the iOS build failed on $HOST; transcript kept at $BUILD_LOG (and on $HOST in /tmp/keeper-gui-*.log)."
 fi
 rm -f "$BUILD_LOG"
+# The Rust build has read the pair; the remote copy goes now, not at exit.
+unstamp_posthog_client_everywhere
 
 # --- 5. Gate the artefact before it reaches the phone --------------------------
 #

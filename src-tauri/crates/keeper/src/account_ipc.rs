@@ -2364,6 +2364,20 @@ async fn sync_settings(
             tracing::warn!(%error, "account: the settings base was not recorded");
         }
     }
+    // The account's shared settings are reconciled here now: what that
+    // established about each consent key decides whether an earlier
+    // installation's "on" is adopted — only where the reconciled file has
+    // no value and nothing about the key failed or was overtaken, never
+    // over a value it has (R495 07, R511).
+    if let Some(shared) = planned.shared.as_ref() {
+        let known = keeper_core::telemetry::AccountConsentKnown::from_sync(
+            &shared.merged.file,
+            &|key: &str| unapplied.failed.contains(key) || unapplied.moved.contains(key),
+        );
+        if let Some(app) = RUNTIME.app.get() {
+            crate::telemetry_ipc::account_settled(app, known);
+        }
+    }
 
     // A manifest whose state is in the repository now takes this device's
     // list as its base; otherwise the old base stands, and this device's

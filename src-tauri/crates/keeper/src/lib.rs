@@ -487,6 +487,9 @@ pub fn run() {
                 account_ipc::boot(app.state::<ipc::AppState>().platform.as_ref());
                 let imported = keeper_core::registry::import_config_file(&data_dir);
                 debug_log::init(&data_dir);
+                // The account's consent through the layers just installed
+                // (R462), and the WARN/ERROR export layer attached (R461).
+                telemetry_ipc::start_problem_export(app);
                 // First, so every line under it can be read as "this build said".
                 build_identity::announce();
                 for fault in keeper_core::config::faults() {

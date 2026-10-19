@@ -228,11 +228,13 @@ mod tests {
 
     #[test]
     fn exported_log_and_span_share_w3c_ids_and_only_closed_attributes() {
-        let record = Record::frontend(TelemetryEventReq {
-            kind: TelemetryEventKind::FrontendError,
+        let mut record = Record::frontend(TelemetryEventReq {
+            kind: TelemetryEventKind::AppReady,
             duration_ms: Some(25.0),
             surface: None,
         });
+        // A failed operation (the remote-config read's outcome).
+        record.outcome = 1;
         let logs = LogRequest::decode(logs(&record).as_slice()).expect("decode log protobuf");
         let traces =
             TraceRequest::decode(traces(&record).as_slice()).expect("decode trace protobuf");
@@ -250,7 +252,7 @@ mod tests {
         assert_eq!(log.attributes.len(), 1);
         assert_eq!(log.attributes[0].key, "keeper.outcome");
         assert_eq!(span.attributes, log.attributes);
-        assert_eq!(log.body, Some(text("keeper_frontend_error")));
+        assert_eq!(log.body, Some(text("keeper_app_ready")));
     }
 
     #[test]
@@ -271,6 +273,7 @@ mod tests {
             duration_ms: None,
             surface: None,
             outcome: 0,
+            exception: None,
         };
         let request = TraceRequest::decode(traces(&child).as_slice()).expect("child wire");
         let span = &request.resource_spans[0].scope_spans[0].spans[0];

@@ -20,6 +20,7 @@ const OFF: TelemetryStatusVm = {
   configured: true,
   host: "https://us.i.posthog.com",
   installationId: null,
+  consentPinned: false,
 };
 let publish: (event: { payload: TelemetryStatusVm }) => void;
 beforeEach(() => {
@@ -102,4 +103,17 @@ it("requires acknowledging full-document replacement and allows keeping unsaved 
   fireEvent.click(screen.getByRole("button", { name: "Keep editing" }));
   expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
   expect(open).toBeEnabled();
+});
+
+it("a save a settings file overrules shows the file's answer and says so (R495 06)", async () => {
+  ipc.save.mockResolvedValue({ ...OFF, consentPinned: true });
+  render(<TelemetrySection open />);
+  const diagnostic = await screen.findByRole("switch", { name: "Optional diagnostics" });
+  await waitFor(() => expect(diagnostic).toBeEnabled());
+  fireEvent.click(diagnostic);
+  expect(
+    await screen.findByText("Saved, but a settings file keeps this switch as it is."),
+  ).toBeInTheDocument();
+  expect(diagnostic).not.toBeChecked();
+  expect(screen.getByRole("note")).toHaveTextContent("A settings file sets diagnostics");
 });

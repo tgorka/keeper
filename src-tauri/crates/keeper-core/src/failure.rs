@@ -18,8 +18,8 @@
 //! standing.
 //!
 //! Agents are not a surface here: an agent host's failures reach its room's
-//! status line and `keeper.log`, never telemetry (S-19). Nothing here is sent
-//! anywhere.
+//! status line and `keeper.log` — and, as `WARN`/`ERROR` lines, PostHog
+//! without their message (R461). Nothing in this module is sent anywhere.
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;

@@ -120,31 +120,42 @@ impl Write for GatedWriter {
     }
 }
 
+/// The layer that forwards every WARN/ERROR event to PostHog under
+/// diagnostics consent (R461). Installed with the subscriber in [`init`],
+/// before telemetry exists; [`attach_telemetry`] points it there once it does.
+static PROBLEM_EXPORT: std::sync::LazyLock<keeper_core::telemetry::LogExport> =
+    std::sync::LazyLock::new(keeper_core::telemetry::LogExport::new);
+
+/// Point the WARN/ERROR export layer at the process's telemetry (R461).
+pub fn attach_telemetry(telemetry: &std::sync::Arc<keeper_core::telemetry::Telemetry>) {
+    PROBLEM_EXPORT.attach(telemetry);
+}
+
 /// Install the process-wide `tracing` subscriber and seed the gate from the
 /// persisted `debug.mode` setting, then the panic hook (Epic 100, R381): a
 /// panic anywhere in the process becomes an `ERROR` line in `keeper.log`
-/// with its location and thread, and nothing else (R387: never counted in
-/// telemetry). The line is
-/// `keeper_sync::logfile::install_panic_hook`'s, tested there; this only
-/// installs it, once. Idempotent-tolerant: a second install attempt (tests)
-/// is ignored rather than panicking.
+/// with its location and thread — and, through the export layer, a PostHog
+/// `$exception` under diagnostics consent like every other ERROR (R461). The
+/// line is `keeper_sync::logfile::install_panic_hook`'s, tested there; this
+/// only installs it, once. Idempotent-tolerant: a second install attempt
+/// (tests) is ignored rather than panicking.
 pub fn init(data_dir: &Path) {
+    use tracing_subscriber::util::SubscriberInitExt as _;
+
     let seeded = keeper_core::registry::get_debug_mode(data_dir).unwrap_or(false);
     ENABLED.store(seeded, Ordering::Relaxed);
-    let _ = tracing_subscriber::fmt()
-        .with_ansi(false)
-        .with_writer(GatedMakeWriter)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_new(keeper_sync::logfile::filter(
-                std::env::var(tracing_subscriber::EnvFilter::DEFAULT_ENV)
-                    .ok()
-                    .as_deref(),
-                "info",
-            ))
-            .unwrap_or_else(|_| {
-                tracing_subscriber::EnvFilter::new(keeper_sync::logfile::default_filter("info"))
-            }),
-        )
+    let filter = tracing_subscriber::EnvFilter::try_new(keeper_sync::logfile::filter(
+        std::env::var(tracing_subscriber::EnvFilter::DEFAULT_ENV)
+            .ok()
+            .as_deref(),
+        "info",
+    ))
+    .unwrap_or_else(|_| {
+        tracing_subscriber::EnvFilter::new(keeper_sync::logfile::default_filter("info"))
+    });
+    // `filter` is `keeper.log`'s alone; the export layer keeps its own
+    // WARN-and-above policy whatever `RUST_LOG` says (R495 08).
+    let _ = keeper_core::telemetry::log_subscriber(filter, GatedMakeWriter, PROBLEM_EXPORT.clone())
         .try_init();
     static PANIC_HOOK: std::sync::Once = std::sync::Once::new();
     PANIC_HOOK.call_once(|| {

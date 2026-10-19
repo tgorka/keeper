@@ -413,6 +413,8 @@ enum Route {
     LedgerVault,
     /// The engine was built from the git binary it resolved.
     GitPath,
+    /// Telemetry holds the account's observability consent (R462).
+    Telemetry,
     Registry,
 }
 
@@ -429,6 +431,7 @@ fn route(key: &str) -> Route {
         "notes.embedding_model" => Route::EmbeddingModel,
         "tasks.ledger_vault" => Route::LedgerVault,
         "sync.git_path" => Route::GitPath,
+        "telemetry.diagnostics" | "telemetry.product_analytics" => Route::Telemetry,
         _ => Route::Registry,
     }
 }
@@ -611,6 +614,11 @@ fn apply_one(
         (Route::DebugMode, _) => {
             crate::debug_log::set_enabled(registry::get_debug_mode(data_dir)?);
         }
+        (Route::Telemetry, _) => {
+            if let Some(app) = app {
+                crate::telemetry_ipc::consent_pulled(app);
+            }
+        }
         (Route::LedgerVault, _) => {
             if let Some(engine) = crate::sync::engine_if_open() {
                 if let Err(error) = engine.set_ledger_profile(registry::get_ledger_vault(data_dir)?)
@@ -684,6 +692,8 @@ mod tests {
             ("incognito.global", Route::Registry),
             ("bots.message_details", Route::Registry),
             ("debug.mode", Route::DebugMode),
+            ("telemetry.diagnostics", Route::Telemetry),
+            ("telemetry.product_analytics", Route::Telemetry),
             ("bots.wake_enabled", Route::Voice),
             ("bots.wake_phrase", Route::Voice),
             ("bots.stop_phrase", Route::Voice),

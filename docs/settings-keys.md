@@ -114,6 +114,10 @@ file-controlled instead, and says which file.
 | | | | | Rows a folder card's lists show once unfolded. |
 | `system.menu_bar_presence` | user-global | boolean (`1`/`0`) | `0` | `"system.menu_bar_presence" = true` |
 | | | | | Whether keeper keeps a menu-bar (tray) presence. |
+| `telemetry.diagnostics` | user-global | boolean (`1`/`0`) | `0` | `"telemetry.diagnostics" = true` |
+| | | | | Optional diagnostics to PostHog (R461/R462): every warning and error keeper logs, its message redacted, plus content-free timings. Travels with the account, so it is on or off on every device. Absent or unreadable is off. |
+| `telemetry.product_analytics` | user-global | boolean (`1`/`0`) | `0` | `"telemetry.product_analytics" = true` |
+| | | | | Optional product statistics to PostHog (R462): counts of opening Settings and the command palette. Travels with the account like diagnostics. Absent or unreadable is off. |
 | `transcription.after_recording` | user-global | boolean (`1`/`0`) | `1` | `"transcription.after_recording" = false` |
 | | | | | Whether a finished Recording Session saved to a drive that keeps voices is transcribed on this Mac. |
 | `transcription.asr_model` | user-global | text | *(absent)* | `"transcription.asr_model" = "parakeet-tdt-0.6b-v3"` |

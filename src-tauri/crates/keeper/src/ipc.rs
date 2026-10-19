@@ -12574,10 +12574,15 @@ pub fn titlebar_drag_report(stage: String, detail: Option<String>) {
 /// its global `error`/`unhandledrejection` listeners report here.
 ///
 /// `ERROR` for the same reason [`titlebar_drag_report`] uses `WARN`: the file
-/// leg of the app log keeps it whatever the debug-mode toggle says. The line's
-/// wording is authored here; only the capped texts cross from the webview.
+/// leg of the app log keeps it whatever the debug-mode toggle says — `WARN`
+/// for a hooked `console.warn`. The line's wording is authored here; only the
+/// capped texts cross from the webview. Under diagnostics consent the report
+/// also leaves for PostHog as `keeper_frontend_error` with a `$exception`
+/// carrying the redacted message (102.1 #3, R461); the line's own target
+/// (`keeper::frontend`) is one the export layer skips, so it leaves once.
 #[tauri::command]
 pub fn frontend_error_report(
+    telemetry: State<'_, Arc<keeper_core::telemetry::Telemetry>>,
     source: String,
     message: String,
     stack: Option<String>,
@@ -12585,18 +12590,34 @@ pub fn frontend_error_report(
 ) {
     const MAX_MESSAGE_CHARS: usize = 500;
     const MAX_STACK_CHARS: usize = 4_000;
-    let cap = |text: String, max: usize| -> String { text.chars().take(max).collect() };
-    let source = cap(source, 40);
-    let message = cap(message, MAX_MESSAGE_CHARS);
-    let stack = cap(stack.unwrap_or_default(), MAX_STACK_CHARS);
-    let component_stack = cap(component_stack.unwrap_or_default(), MAX_STACK_CHARS);
-    tracing::error!(
-        %source,
-        %message,
-        %stack,
-        %component_stack,
-        "frontend error: the webview reported an error it could not handle"
-    );
+    let cap = |text: &str, max: usize| -> String { text.chars().take(max).collect() };
+    // PostHog gets the message as it arrived: core bounds it without leaving
+    // a cut token, redacts it, and only then caps it (R495 04). The cap below
+    // is `keeper.log`'s alone.
+    telemetry.capture_frontend_error(&source, &message, source == "console.warn");
+    let source = cap(&source, 40);
+    let message = cap(&message, MAX_MESSAGE_CHARS);
+    let stack = cap(&stack.unwrap_or_default(), MAX_STACK_CHARS);
+    let component_stack = cap(&component_stack.unwrap_or_default(), MAX_STACK_CHARS);
+    let warning = source == "console.warn";
+    if warning {
+        tracing::warn!(
+            target: keeper_core::telemetry::FRONTEND_TARGET,
+            %source,
+            %message,
+            %stack,
+            "frontend warning: the webview reported a warning"
+        );
+    } else {
+        tracing::error!(
+            target: keeper_core::telemetry::FRONTEND_TARGET,
+            %source,
+            %message,
+            %stack,
+            %component_stack,
+            "frontend error: the webview reported an error it could not handle"
+        );
+    }
 }
 
 /// Read the menu-bar (tray) presence toggle (Story 10.3, FR-53). Reads the persisted
