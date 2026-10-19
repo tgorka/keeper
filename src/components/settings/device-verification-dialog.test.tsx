@@ -16,7 +16,11 @@ vi.mock("@/lib/ipc/client", () => ({
   verificationCancel: (a: string, f: string) => verificationCancel(a, f),
 }));
 
-import { DeviceVerificationDialog } from "@/components/settings/device-verification-dialog";
+import {
+  DeviceVerificationDialog,
+  VERIFY_READY_TEXT,
+  VERIFY_WAITING_TEXT,
+} from "@/components/settings/device-verification-dialog";
 import { verificationStore } from "@/lib/stores/verification";
 
 function flow(overrides: Partial<VerificationFlowVm> = {}): VerificationFlowVm {
@@ -67,10 +71,21 @@ describe("DeviceVerificationDialog", () => {
     expect(verificationStore.getState().flow?.phase).toBe("failed");
   });
 
+  it("waits without a dead action while the other session has not answered", () => {
+    openWith("acc-1", flow({ phase: "requested" }));
+    render(<DeviceVerificationDialog />);
+    expect(screen.getByText(VERIFY_WAITING_TEXT)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Verify with emoji" })).not.toBeInTheDocument();
+  });
+
   it("shows keeper's QR and a 'Verify with emoji' action in the ready phase", () => {
     openWith("acc-1", flow({ phase: "ready", qrCodeSvg: "<svg><rect/></svg>" }));
     render(<DeviceVerificationDialog />);
     expect(screen.getByAltText(/scan this qr code/i)).toBeInTheDocument();
+    // Ready is the person's move, not the other device's: saying "waiting"
+    // here on both screens is what stalled kalypso's verification.
+    expect(screen.getByText(VERIFY_READY_TEXT)).toBeInTheDocument();
+    expect(screen.queryByText(VERIFY_WAITING_TEXT)).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Verify with emoji" }));
     expect(verificationStartSas).toHaveBeenCalledWith("acc-1", "$flow1");
   });

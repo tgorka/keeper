@@ -1012,7 +1012,7 @@ fn spawn_sync(app: &AppHandle, force: bool) {
     let platform = Arc::clone(&state.platform);
     let flows = Arc::clone(&state.account_flows);
     tauri::async_runtime::spawn(async move {
-        sync(platform, flows, force).await;
+        Box::pin(sync(platform, flows, force)).await;
     });
 }
 
@@ -1060,7 +1060,7 @@ pub fn daily_tick() {
     let platform = Arc::clone(&state.platform);
     let flows = Arc::clone(&state.account_flows);
     tauri::async_runtime::spawn(async move {
-        sync(platform, flows, true).await;
+        Box::pin(sync(platform, flows, true)).await;
         RUNTIME.daily_running.store(false, Ordering::SeqCst);
     });
 }
@@ -3585,10 +3585,10 @@ pub async fn account_setup_confirm(
         inner.grant_dead = true;
     });
     drop(gate);
-    Ok(sign_in_and_sync(
+    Ok(Box::pin(sign_in_and_sync(
         Arc::clone(&state.platform),
         Arc::clone(&state.account_flows),
-    )
+    ))
     .await)
 }
 
@@ -3602,10 +3602,10 @@ pub async fn account_sign_in(state: State<'_, AppState>) -> Result<AccountVm, Ip
     // sources learnt under the previous sign-in carries over.
     crate::forge_ipc::forget_identity();
     update(|inner| inner.grant_dead = true);
-    Ok(sign_in_and_sync(
+    Ok(Box::pin(sign_in_and_sync(
         Arc::clone(&state.platform),
         Arc::clone(&state.account_flows),
-    )
+    ))
     .await)
 }
 
@@ -3618,13 +3618,21 @@ pub fn account_cancel_sign_in() -> Result<(), IpcError> {
 }
 
 /// Fetch and publish, at most every 15 minutes unless `force` ("Sync now").
+///
+/// `Box::pin`, here and at every other await of `sync`, `sign_in_and_sync`
+/// and `send_log_now`: their state machines are ~235 KB, and Tauri builds a
+/// command's future on the calling thread's stack before it moves to the
+/// heap. On iOS that thread is the main thread, whose stack it overflowed —
+/// keeper on kalypso died with SIGSEGV in the stack guard on the first tap
+/// after every launch, because a tap focuses the window and the focus calls
+/// this (2026-10-18). Boxed, the command's own future is a pointer.
 #[tauri::command]
 pub async fn account_sync(state: State<'_, AppState>, force: bool) -> Result<AccountVm, IpcError> {
-    Ok(sync(
+    Ok(Box::pin(sync(
         Arc::clone(&state.platform),
         Arc::clone(&state.account_flows),
         force,
-    )
+    ))
     .await)
 }
 
@@ -3776,7 +3784,11 @@ async fn send_log(state: State<'_, AppState>) -> Result<log_upload::LogUploadVm,
     // queues behind a sync, or while it runs, stops it (R410).
     let queued_at = epoch();
     let _gate = RUNTIME.gate.lock().await;
-    let ran = cancellable(queued_at, send_log_now(state.platform.as_ref(), &data_dir)).await;
+    let ran = cancellable(
+        queued_at,
+        Box::pin(send_log_now(state.platform.as_ref(), &data_dir)),
+    )
+    .await;
     Ok(match ran {
         Run::Finished(answer) => answer,
         Run::Cancelled | Run::NotStarted => log_upload::LogUploadVm::failed(None),
