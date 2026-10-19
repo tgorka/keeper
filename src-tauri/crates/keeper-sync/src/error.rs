@@ -85,6 +85,44 @@ pub enum SyncError {
     )]
     Forbidden { host: String },
 
+    /// The credential could not be produced at all — the account behind a
+    /// drive is signed out, its forge connection is gone, or the keychain
+    /// would not answer (Story 102.2, R467).
+    ///
+    /// Its own variant, not the [`Self::Config`] it used to arrive as, because
+    /// its remedy comes from outside the folder and its end is observable:
+    /// nothing about this folder's configuration is wrong, and the moment the
+    /// credential comes back — a sign-in, a reconnect, or any authenticated
+    /// round trip of the same folder — every unit it stopped can run again.
+    /// `Permanent` still, because retrying it unchanged asks the same empty
+    /// keychain the same question; what re-arms the stopped units is the
+    /// credential's return ([`crate::engine::Engine::rearm_after_credential`]),
+    /// recorded per journal row as this variant's [`Self::code`].
+    ///
+    /// The message is the credential source's own sentence, unchanged.
+    #[error("{0}")]
+    Credential(String),
+
+    /// The LFS server answered that it does not hold an object a pointer
+    /// names — a per-object 404 in the batch response (Story 102.2). A
+    /// filesystem remote lacking one is [`Self::Integrity`], as before.
+    ///
+    /// Its own variant, not a [`Self::Config`], because two things act on it:
+    /// a download that meets it looks for the object's bytes in this folder's
+    /// own history before giving up, and the background sweep must not queue
+    /// the same doomed download again on every scan while a stopped one waits.
+    /// `path` and `made_by` are filled in by the engine where it knows them,
+    /// so the stopped row names the file and the device whose commit
+    /// published the pointer — the only facts that help a person find the
+    /// bytes.
+    #[error("{}", lfs_object_missing_sentence(host, oid, path.as_deref(), made_by.as_deref()))]
+    LfsObjectMissing {
+        host: String,
+        oid: String,
+        path: Option<String>,
+        made_by: Option<String>,
+    },
+
     /// A path cannot be represented on the remote or on a peer's filesystem
     /// (reserved name, illegal character, too long). This is one of the few
     /// conditions that genuinely requires a human: the user must rename.
@@ -302,6 +340,8 @@ impl SyncError {
             Self::GitMissing { .. }
             | Self::Auth { .. }
             | Self::Forbidden { .. }
+            | Self::Credential(_)
+            | Self::LfsObjectMissing { .. }
             | Self::InvalidPathForRemote { .. }
             | Self::Diverged { .. }
             | Self::Journal(_)
@@ -352,6 +392,8 @@ impl SyncError {
             Self::GitMissing { .. }
                 | Self::Auth { .. }
                 | Self::Forbidden { .. }
+                | Self::Credential(_)
+                | Self::LfsObjectMissing { .. }
                 | Self::InvalidPathForRemote { .. }
                 | Self::Quota { .. }
                 | Self::Diverged { .. }
@@ -371,6 +413,8 @@ impl SyncError {
             Self::GitCommand { .. } => "gitCommand",
             Self::Network { .. } => "network",
             Self::Auth { .. } => "auth",
+            Self::Credential(_) => "credential",
+            Self::LfsObjectMissing { .. } => "lfsObjectMissing",
             Self::Forbidden { .. } => "forbidden",
             Self::InvalidPathForRemote { .. } => "invalidPath",
             Self::MediaAbsent => "mediaAbsent",
@@ -388,6 +432,55 @@ impl SyncError {
             Self::MergeBlocked { .. } => "mergeBlocked",
             Self::CheckoutUnfinished { .. } => "checkoutUnfinished",
             Self::Cancelled => "cancelled",
+        }
+    }
+
+    /// Whether this failure is of the credential class (Story 102.2, R467):
+    /// the credential could not be produced ([`Self::Credential`]) or the
+    /// remote rejected it ([`Self::Auth`]). Both end the same way — the
+    /// credential comes back — and a unit stopped by either is re-armed then.
+    ///
+    /// [`Self::Forbidden`] is not in it: a 403 says the credential was
+    /// accepted and lacks permission, which a sign-in does not change.
+    pub fn is_credential_class(&self) -> bool {
+        CREDENTIAL_CLASS_CODES.contains(&self.code())
+    }
+}
+
+/// The [`SyncError::code`]s of the credential class, as the journal's
+/// `cause` column stores them (Story 102.2).
+pub const CREDENTIAL_CLASS_CODES: [&str; 2] = ["credential", "auth"];
+
+/// [`SyncError::LfsObjectMissing`]'s sentence: the bare server answer when
+/// nothing else is known, and the file and the device that published its
+/// pointer when the engine could find them.
+fn lfs_object_missing_sentence(
+    host: &str,
+    oid: &str,
+    path: Option<&str>,
+    made_by: Option<&str>,
+) -> String {
+    let Some(path) = path else {
+        return format!("{host} does not have LFS object {oid}");
+    };
+    let made_by = made_by.map_or_else(String::new, |device| {
+        format!(" Its pointer was published by {device}, so its bytes are on that device.")
+    });
+    format!(
+        "{host} does not have the content of {path} (LFS object {oid}), and this \
+         folder's history does not hold it either.{made_by}"
+    )
+}
+
+impl SyncError {
+    /// The bare per-object 404 (Story 102.2), before the engine names the
+    /// file and its device.
+    pub fn lfs_object_missing(host: impl Into<String>, oid: impl Into<String>) -> Self {
+        Self::LfsObjectMissing {
+            host: host.into(),
+            oid: oid.into(),
+            path: None,
+            made_by: None,
         }
     }
 }
@@ -488,6 +581,8 @@ mod tests {
                 path: String::new(),
             })
             .code(),
+            SyncError::Credential(String::new()).code(),
+            SyncError::lfs_object_missing("", "").code(),
             SyncError::Cancelled.code(),
         ];
         let mut seen = codes.to_vec();

@@ -1510,6 +1510,7 @@ pub fn run() {
                 sync_ipc::sync_pending,
                 sync_ipc::sync_problems,
                 sync_ipc::sync_retry_parked,
+                sync_ipc::sync_retry_all_parked,
                 sync_ipc::sync_set_credential,
                 sync_ipc::sync_get_credential,
                 sync_ipc::sync_clear_credential,

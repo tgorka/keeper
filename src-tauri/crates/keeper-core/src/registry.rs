@@ -2149,7 +2149,8 @@ fn credential_source_row(
 
 /// `Some("account")` when a stored row is bound to `account_id`.
 fn bound_to(row: Option<&str>, account_id: &str) -> Option<String> {
-    (row == Some(credential_source_value(account_id).as_str())).then(|| "account".to_owned())
+    (row == Some(credential_source_value(account_id).as_str()))
+        .then(|| ACCOUNT_CREDENTIAL_SOURCE.to_owned())
 }
 
 const SYNC_CREDENTIAL_SOURCE_PREFIX: &str = "sync.credential_source.";
@@ -2185,6 +2186,33 @@ pub fn get_sync_credential_source(
         return Ok(Some(forge.to_owned()));
     }
     Ok(account_id.and_then(|account_id| bound_to(row.as_deref(), account_id)))
+}
+
+/// The credential source of every drive on the configured account, as
+/// [`get_sync_credential_source`] answers it.
+pub const ACCOUNT_CREDENTIAL_SOURCE: &str = "account";
+
+/// Whether drive `profile_id` takes its git credential from `recovered` —
+/// [`ACCOUNT_CREDENTIAL_SOURCE`] after a person signed in to the account, or
+/// a repository source's `forge:<id>` after they reconnected it (Story 102.2,
+/// R503).
+///
+/// The scope of the re-arm a recovered credential triggers: only these
+/// drives' stopped work runs again. A drive on another source, or on its own
+/// keychain token, is untouched — that credential has not come back, and
+/// re-arming its work would only spend its few automatic retries. A setting
+/// that cannot be read answers `false`: the drive's own next accepted round
+/// trip re-arms it instead.
+pub fn uses_sync_credential_source(
+    data_dir: &Path,
+    profile_id: &str,
+    account_id: Option<&str>,
+    recovered: &str,
+) -> bool {
+    get_sync_credential_source(data_dir, profile_id, account_id)
+        .ok()
+        .flatten()
+        .is_some_and(|source| source == recovered)
 }
 
 /// Opt drive `profile_id` into the account credential (`Some("account")`,
@@ -6140,6 +6168,35 @@ mod tests {
             get_sync_credential_source(&dir, "p2", Some("globex")).expect("read"),
             Some("account".to_owned())
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A recovered credential re-arms the drives that use it and no other
+    /// (Story 102.2, R503): the account's sign-in is not a GitHub source's
+    /// reconnect, nor a keychain token's, nor another account's.
+    #[test]
+    fn a_recovered_credential_scopes_to_the_drives_that_use_it() {
+        let dir = temp_dir();
+        let acme = Some("acme");
+        set_sync_credential_source(&dir, "on-account", Some("account"), acme).expect("opt in");
+        set_sync_credential_source(&dir, "on-github", Some("forge:github"), acme).expect("opt in");
+        // "own-token" keeps its keychain item: no row at all.
+        let uses = |profile: &str, recovered: &str| {
+            uses_sync_credential_source(&dir, profile, acme, recovered)
+        };
+        assert!(uses("on-account", ACCOUNT_CREDENTIAL_SOURCE));
+        assert!(!uses("on-github", ACCOUNT_CREDENTIAL_SOURCE));
+        assert!(!uses("own-token", ACCOUNT_CREDENTIAL_SOURCE));
+        assert!(uses("on-github", "forge:github"));
+        assert!(!uses("on-account", "forge:github"));
+        assert!(!uses("on-github", "forge:gitlab"));
+        // Bound to Acme: Globex's sign-in is not this drive's credential.
+        assert!(!uses_sync_credential_source(
+            &dir,
+            "on-account",
+            Some("globex"),
+            ACCOUNT_CREDENTIAL_SOURCE
+        ));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -1329,6 +1329,10 @@ async fn converge(
     let oauth = matches!(d.config.auth, RepoAuthConfig::Oauth(_));
 
     // 1. Who is signing in. A background sync never opens a browser.
+    //
+    // `restored`: a person signed in, or reconnected the forge, in this
+    // attempt — the account's credential is back (Story 102.2, R503).
+    let mut restored = false;
     let (known, grant_dead) = {
         let inner = lock(&RUNTIME.inner);
         (inner.identity.clone(), inner.grant_dead)
@@ -1353,6 +1357,7 @@ async fn converge(
                 .await
             {
                 Ok(identity) => {
+                    restored = true;
                     // Someone else signed in on this device: nothing of the
                     // previous person's — layers, forge connection, device
                     // registration, sync time — carries over.
@@ -1457,6 +1462,14 @@ async fn converge(
             return ended.attempt;
         }
         update(|inner| inner.forge_connected = true);
+        restored = true;
+    }
+    // The drives on this account may run what its absence stopped — and
+    // only on a sign-in or a reconnect, never because a credential was
+    // merely produced (R503): producing one proves nothing the server has
+    // accepted.
+    if restored {
+        rearm_drives_after_credential(&platform, registry::ACCOUNT_CREDENTIAL_SOURCE);
     }
 
     // 3. The repository credential.
@@ -3178,7 +3191,18 @@ fn credential_profile(key: &str) -> Option<&str> {
 ///
 /// `secret_get` is synchronous and is called from the sync engine's async
 /// path, so a refresh must not park a runtime worker (see [`off_worker`]).
-pub fn drive_credential(platform: &Arc<dyn Platform>, key: &str) -> Option<Result<String, String>> {
+///
+/// The failure is typed where it is known (Story 102.2, R467): a credential
+/// that could not be produced — the account signed out, its forge
+/// connection gone, the drive's remote not known yet — is
+/// [`SyncError::Credential`], whose stopped units the credential's return
+/// re-arms; a drive whose setting no longer fits (a source keeper lost, a
+/// remote off the account's hosts) stays [`SyncError::Config`], which a
+/// sign-in does not change.
+pub fn drive_credential(
+    platform: &Arc<dyn Platform>,
+    key: &str,
+) -> Option<Result<String, SyncError>> {
     let profile = credential_profile(key)?;
     let d = descriptor();
     // No account and no repository source, no change: the drive's own
@@ -3199,16 +3223,16 @@ pub fn drive_credential(platform: &Arc<dyn Platform>, key: &str) -> Option<Resul
     // hosts: GitHub and every other stranger would be handed the person's
     // sign-in (the hesperia report, 2026-09-24), and would refuse it anyway.
     let Some(remote) = drive_remote(profile) else {
-        return Some(Err(
+        return Some(Err(SyncError::Credential(
             "keeper does not know this drive's remote yet; it will try again".to_owned(),
-        ));
+        )));
     };
     if !d.serves_remote(&remote) {
-        return Some(Err(format!(
+        return Some(Err(SyncError::Config(format!(
             "this drive's repository is not on {}'s hosts, so it cannot sign in with that \
              account; choose its credential again",
             d.name
-        )));
+        ))));
     }
     let forge = matches!(d.config.auth, RepoAuthConfig::Oauth(_))
         && on_forge(&remote, d.forge_host().as_deref(), &d.repo_host());
@@ -3225,8 +3249,12 @@ pub fn drive_credential(platform: &Arc<dyn Platform>, key: &str) -> Option<Resul
     };
     Some(match off_worker(refresh) {
         Some(Ok(token)) => Ok(token),
-        Some(Err(error)) => Err(format!("the account credential is unavailable: {error}")),
-        None => Err("the account credential could not be read".to_owned()),
+        Some(Err(error)) => Err(SyncError::Credential(format!(
+            "the account credential is unavailable: {error}"
+        ))),
+        None => Err(SyncError::Credential(
+            "the account credential could not be read".to_owned(),
+        )),
     })
 }
 
@@ -3239,15 +3267,17 @@ fn forge_drive_credential(
     profile: &str,
     source_id: &str,
     d: Option<AccountDescriptor>,
-) -> Result<String, String> {
+) -> Result<String, SyncError> {
     let sources = forges::sources(d.as_ref(), forges::BUILTIN_GITHUB_CLIENT_ID);
     let Some(source) = forges::find(&sources, source_id).cloned() else {
-        return Err(format!(
+        return Err(SyncError::Config(format!(
             "this drive signs in with \"{source_id}\", which keeper no longer has; choose its credential again"
-        ));
+        )));
     };
     let Some(remote) = drive_remote(profile) else {
-        return Err("keeper does not know this drive's remote yet; it will try again".to_owned());
+        return Err(SyncError::Credential(
+            "keeper does not know this drive's remote yet; it will try again".to_owned(),
+        ));
     };
     let platform = Arc::clone(platform);
     let name = source.name.clone();
@@ -3259,8 +3289,12 @@ fn forge_drive_credential(
     };
     match off_worker(refresh) {
         Some(Ok(token)) => Ok(token),
-        Some(Err(error)) => Err(format!("the {name} credential is unavailable: {error}")),
-        None => Err(format!("the {name} credential could not be read")),
+        Some(Err(error)) => Err(SyncError::Credential(format!(
+            "the {name} credential is unavailable: {error}"
+        ))),
+        None => Err(SyncError::Credential(format!(
+            "the {name} credential could not be read"
+        ))),
     }
 }
 
@@ -3350,6 +3384,43 @@ fn drive_remote(profile: &str) -> Option<String> {
         }
     });
     None
+}
+
+/// Credential source `recovered` is back — the account after a sign-in or a
+/// forge reconnect, a repository source after its Connect (Story 102.2,
+/// R467, R503): re-arm the work it stopped on the drives that use it, off
+/// this thread and only on an engine that is already open — a sign-in
+/// builds no sync engine.
+///
+/// A call site and nothing more: which drives use `recovered` is
+/// `registry::uses_sync_credential_source`'s answer, and what is re-armed
+/// is the engine's.
+///
+/// Before this, a sign-in moved nothing: the owner's tgdrive held its push
+/// two days behind an upload the dead credential had stopped, while he had
+/// signed in again and every pull worked.
+pub(crate) fn rearm_drives_after_credential(platform: &Arc<dyn Platform>, recovered: &str) {
+    let Ok(data_dir) = platform.data_dir() else {
+        return;
+    };
+    let account = descriptor().map(|d| d.id);
+    let recovered = recovered.to_owned();
+    std::thread::spawn(move || {
+        let Some(engine) = crate::sync::engine_if_open() else {
+            return;
+        };
+        let uses = |profile: &str| {
+            registry::uses_sync_credential_source(
+                &data_dir,
+                profile,
+                account.as_deref(),
+                &recovered,
+            )
+        };
+        if let Err(error) = engine.rearm_after_credential(&uses) {
+            tracing::warn!(%error, "account: the work the credential stopped could not be queued again");
+        }
+    });
 }
 
 /// The host a git remote names: a URL's host, or the host of scp-style

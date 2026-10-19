@@ -587,6 +587,112 @@ large files.** Save them and leave them; the sync that stages a file is the sync
 that owes its upload. Committing a large file by hand is the one remaining way to
 put an unbacked pointer on the remote.
 
+### A held push says why, and the credential's return re-arms it (Story 102.2)
+
+A stopped upload still counts toward the push gate — that is what keeps a pointer
+off the remote — so what matters is what stops one, and what starts it again.
+
+- **The account's credential.** A drive set to *Use my account* (or to a
+  repository source) asks the account for its token on every fetch and push.
+  When the account is signed out, its forge connection gone, or the keychain
+  would not answer, the unit stops with that sentence (`SyncError::Credential`,
+  recorded per journal row as `cause = credential`; a rejected token is `auth`).
+  Such a unit is **re-armed** — put back in the queue — when that credential
+  comes back: signing in to the account or reconnecting its forge re-arms the
+  drives on the account, connecting a repository source re-arms the drives on
+  that source, and any unit of a folder that reached the remote re-arms that
+  folder's own. A drive on another source, or on its own keychain token, is
+  left alone, and a credential the account merely produced — its background
+  sync — re-arms nothing. Each row is re-armed at most three times
+  (`db::CREDENTIAL_REARMS`) before it is left for a person; a person's Retry
+  resets that. Rows stopped by a release before this one carry no `cause` and are
+  recognised by the sentence they were written with. An upload of an object the
+  server already holds completes without a transfer, so the owner's tgdrive —
+  held two days behind an object Forgejo already had — publishes on the first
+  pull after the sign-in.
+- **A held push names its cause.** When no upload is still moving, the folder's
+  error is *Publishing is on hold until `<file>` reaches the remote, and its
+  upload stopped: `<the reason>`. Retry all stopped puts every stopped transfer of
+  this folder back in the queue.* — never the generic "needs your attention".
+  It appears the moment the last upload the push waits on stops — the push is
+  not run again while it waits, so nothing else would say it — and it outranks
+  any later failure of the folder: a pull or a download that fails afterwards
+  keeps its own notification, but the folder's sentence stays the held push's
+  until something actually moves. It is withdrawn when a Retry, Retry all or a
+  returning credential puts the upload back, and is read off the journal again
+  when keeper starts.
+  The Sync view offers **Retry all stopped** beside it (and on the *Stopped
+  retrying* heading): one call, `sync_retry_all_parked`, which requeues every
+  stopped unit of the folder and folds identical stopped work (the same download
+  stopped a thousand times) into one row. A folded row's request survives it: the
+  row that stays takes the higher urgency and the requested path, so a file a
+  person asked for is still delivered under *pointer-only*. Stopped work is never
+  folded into a download already running — that transfer read its path when it
+  started — so a request beside a running copy of the same object stays its own
+  row and is delivered from the store once the bytes have landed (a restart
+  folds the pair, keeping the request). Two requests for different paths that
+  share one object are never folded into each other, by Retry all, a re-arm or
+  a restart: a row carries one path, so each request stays its own row and the
+  second file is delivered from the store the first one filled. The *Stopped
+  retrying* list puts stopped uploads first, so the one holding the push is
+  never folded away.
+- **A merge owes uploads too.** A merge keeper makes stages its conflict copies
+  and resolutions with the same clean filter a commit does, so a copy of a path
+  the folder's rules filter becomes a pointer. Every path the merge carries beyond
+  this machine's own tree — what it was told to add and what git staged by itself,
+  a pointer the other side added included — whose pointer names an object in this
+  folder's store queues its upload before the merge commit is written, and the
+  push waits for them like any other. Before this a merge's conflict copy could be
+  published without its bytes — Marta's merge `8e237b7` on neuradrive.
+- **A download the server has no object for** (a per-object 404) is healed from
+  this folder's history when it can be: the path, and for a conflict copy the
+  file it was copied from, are looked up in every commit `HEAD` reaches; then
+  every object this copy holds is searched for a plain blob of exactly the right
+  length — a file committed under an earlier name and moved since — at most
+  100 000 objects per attempt (`git::history::HISTORY_SEARCH_OBJECTS`), the next
+  attempt resuming where the last stopped (a WARN says so). A blob counts only if
+  its sha256 *is* the object. Found, the upload the server is owed is written to
+  the journal **before** the bytes go into the store — the store is what makes
+  the download read as done — then the bytes are stored and synced to disk (the
+  file, and the directories naming it), and only then is the upload released and
+  the Activity list shows the file as *Restored from history*. An interruption
+  anywhere in between leaves the owed upload in the journal, and the next sync
+  pass finishes it, checking the stored bytes' length and sha256 first. Bytes
+  that are missing or provably wrong are restored from history again, replacing
+  wrong ones only once the verified copy exists; a file that **cannot be read**
+  is never treated as wrong — it is kept as it is, and the upload stops with the
+  read's own error, retried on its own after a backoff and by **Retry**. A
+  rename into the store that fails removes nothing either: the file already
+  under the object's name stays as it is, the verified copy is kept at
+  `.git/lfs/unpublished/<oid>` (removed once a later publication succeeds), and
+  the unit fails with the rename's error. An upload whose object has gone from
+  the store later anyway — removed by hand, or cut short — is rebuilt from
+  history before it is sent, whenever history holds the bytes.
+  Otherwise the unit stops with a sentence naming the LFS server, the file and the
+  device whose commit published the pointer (its `Keeper-Device` trailer) — the
+  device that has the bytes. The background sweep no longer queues the same
+  download again on every scan while a stopped row of it stands; a person's Retry
+  asks again. The log line `lfs transfer failed` names the profile.
+- **The owed upload survives a power cut on a Mac.** `sync.db` is opened with
+  SQLite's `fullfsync` and `checkpoint_fullfsync` on every connection (the app,
+  `keeper-syncd` and the shell's reads alike; `db::open`), so on Apple
+  platforms its syncs are `F_FULLFSYNC`, a flush of the disk's own cache, as
+  the store's are (`File::sync_all`). Without them SQLite's sync is a plain
+  `fsync` there, which leaves the bytes in that cache: a power cut could keep
+  the healed object, possibly on another disk, and lose the upload owed for it.
+  The cost is latency: a full flush waits for the disk to empty its cache, which
+  is slower than an `fsync` by an amount that depends on the disk (not measured
+  here), and `sync.db` now pays it on every sync it makes — under
+  `synchronous = NORMAL` that is each WAL checkpoint (about every thousand pages
+  written), plus the commit of a repair's owed upload, which runs
+  `synchronous = FULL`. Ordinary commits make no sync and cost nothing more.
+  `keeper.db` and `archive.db` keep SQLite's default. Other platforms have no
+  such flush and are unchanged.
+
+Still deliberate: a unit stopped for any other permanent reason — a path the
+remote refuses, a 403, a changed setting — waits for a person's Retry. A sync pass
+alone does not re-drive it.
+
 ### Where the objects actually go
 
 The LFS API is always HTTP, even when git is not, so how keeper reaches it
@@ -3407,8 +3513,8 @@ free space, and exits non-zero when something is genuinely wrong.
 | `Too many open files` / watches exhausted | Raise `fs.inotify.max_user_watches`. One watcher is used per profile, not per folder. |
 | LFS upload restarts from zero | Expected. The `basic` adapter has no resumable upload. |
 | Resume fails on an object above 2 GiB | Forgejo parses range offsets as 32-bit. Keeper restarts the transfer instead. |
-| A large file's pointer is on the remote but its content is not | For commits keeper makes, fixed: the push waits for its objects (§8). For a commit that already exists, nothing re-drives it — keeper compares nothing between history and the remote's object store. If the file's row offers **Retry**, the upload is parked and that is the button; a sync pass alone never re-drives parked work. If there is no unit at all (the commit was made by hand, or predates 0.6.4), the only route is to change the file and let keeper commit the new revision, which queues a fresh upload. The old revision's bytes stay on the machine that made it. |
-| *Publishing is on hold until this folder's large files reach the remote* | Not a failure. An upload has not landed yet; the next sync pass that finds nothing outstanding releases the push. If it persists, look at the affected file's own row for the reason the upload is failing. |
+| A large file's pointer is on the remote but its content is not | For commits and merges keeper makes, fixed: the push waits for its objects (§8). For a commit that already exists, keeper heals the download when the bytes are in this folder's history (*Restored from history* in Activity) and otherwise names the file and the device that published it — get the bytes from that device (its **Recheck all files** re-uploads what its store holds). If the file's row offers **Retry**, the upload is parked and that is the button. If there is no unit at all (the commit was made by hand, or predates 0.6.4), the only route is to change the file and let keeper commit the new revision, which queues a fresh upload. |
+| *Publishing is on hold until this folder's large files reach the remote* | Not a failure. An upload has not landed yet; the next sync pass that finds nothing outstanding releases the push. If an upload has stopped, the folder says *Publishing is on hold until `<file>` reaches the remote, and its upload stopped: …* — fix what it names, or press **Retry all stopped**. An upload the signed-out account stopped is re-armed on its own once you sign in again (§8). |
 | Every large file fails on an `ssh://` remote although `git push` works | The LFS API is HTTPS even when git is ssh. Keeper asks the server for a credential with `git-lfs-authenticate` — if that is refused, the file's row quotes the server's own words. `Unknown git command` or `LFS Server is not enabled` means LFS is switched off on the forge. If the server answers but the transfer is rejected as unauthenticated, check whether its `href` names a different host from your ssh remote: keeper will not send that host the token you stored for this profile (§8), so such a server has to mint its own. |
 | Large files never arrive on a pendrive or other path remote | Fixed: objects are copied between the two `lfs/objects` stores (§8). A transfer that ran while the drive was absent is deferred, and reattaching the drive releases it on the next pass; one that already parked needs **Retry** on the file's row. |
 | History is growing fast | git keeps every revision. Run `git gc` on the repository, raise the LFS threshold, or exclude churning files. |

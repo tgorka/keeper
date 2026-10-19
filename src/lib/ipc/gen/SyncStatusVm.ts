@@ -49,4 +49,11 @@ needsAttention: boolean,
  * Decided in Rust (`keeper_sync::engine::is_phone_divergence`) so the
  * webview never reads the sentence to find out.
  */
-resettable: boolean, };
+resettable: boolean, 
+/**
+ * Whether `error` is the sentence of a push held behind stopped
+ * transfers (Story 102.2), beside which the Sync surface offers "Retry
+ * all stopped" (`sync_retry_all_parked`). Decided in Rust
+ * (`keeper_sync::engine::is_held_push`) for `resettable`'s reason.
+ */
+heldPush: boolean, };

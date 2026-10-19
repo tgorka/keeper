@@ -11158,3 +11158,52 @@ origin: lane `telemetry` (story 102.1 #5), 2026-10-19
 location: `scripts/install-ios.sh`, `scripts/install-android.sh`, `scripts/lib/posthog-client.sh`, `crates/keeper/build.rs` (`stamped_public_observability_config`)
 reason: no Linux build of the shell crate exists, and no phone was installed from this lane: `bash -n` passes and `build.rs`'s file fallback awaits CI's macOS job. Owed: `bun run install:ios` on kalypso then diagnostics on → a `$exception` from `os = ios` in project 605256; the same for Android hardware.
 status: open
+
+### DW-1520: Story 102.2 was not run against a real Forgejo LFS server.
+
+origin: lane `sync` (finisher F102sync1), 2026-10-19
+location: `keeper-sync` `engine::tests::stopped_work` (in-process batch fixture `LfsServer`)
+reason: 102.2 #5 asks for a live run "where the harness exists"; delectra runs Synapse, Temporal and Caddy but no Forgejo, so every item is proven over an in-process HTTP batch endpoint that answers "already there" for held objects, an upload or download action to itself (whose `PUT` stores the bytes) otherwise, and a per-object 404 for a download it does not hold (Forgejo's answers per the triage, `[INFERENCE]` there too — its batch API was never called). Owed: on hesperia, once the release carrying 102.2 is installed, the owner's tgdrive publishes on the first pull or sign-in without pressing anything (upload 704972 re-armed by its legacy sentence) and neuradrive's 96bae0e0 is restored from history (blob `9129af5`); or a Forgejo stack on delectra with a scripted run of both shapes.
+status: open
+
+### DW-1521: A missing object is healed only from its own path or the file its conflict copy was copied from.
+
+origin: lane `sync` (finisher F102sync1), 2026-10-19
+location: `keeper_sync::engine::Engine::heal_missing_object`, `git::history::plain_blob_with_oid`, `git::conflict::originals_of`
+reason: the history walk reads only the download's label path and, for a `.sync-conflict-…` copy, its originals. Bytes committed under another path (a file moved or renamed after it was committed plain) are not found, and the unit stops naming the device instead. A whole-store search by size then sha256 (`git cat-file --batch-all-objects --batch-check`) would find them at the cost of a walk of every blob; not needed for the shape the owner hit.
+status: closed (fix lane F102sync2, R503 S1-04, 2026-10-19: after the path lookup, `git::history::blob_with_oid_anywhere` searches the whole object database — candidates by exact size from object headers, then sha256 — bounded at `HISTORY_SEARCH_OBJECTS` objects per attempt and resumed from the unit's `heal_after`; tests `engine::tests::stopped_work::{a_missing_object_committed_under_an_earlier_name_is_restored_from_history, a_blob_of_the_same_length_with_another_hash_is_not_taken_for_the_missing_object, a_bounded_history_search_resumes_where_it_stopped}`)
+
+### DW-1522: Settings › Sync shows a held push's sentence without "Retry all stopped".
+
+origin: lane `sync` (finisher F102sync1), 2026-10-19
+location: `src/components/settings/sync-section.tsx` (status sentence), `src/components/layout/sync-pane.tsx` (`SyncStatusVm.heldPush` button)
+reason: 102.2 #2 places the action in the Sync view, where it is drawn beside the sentence and on the *Stopped retrying* heading. Settings' folder row now shows the specific sentence (it was the generic "needs your attention" over an empty error) but offers no button; the sentence names the action, which is one click away in the Sync view.
+status: open
+
+### DW-1523: A stopped row in *Stopped retrying* does not name its file.
+
+origin: lane `sync` (finisher F102sync1), 2026-10-19
+location: `keeper_sync::db::{ParkedRow, list_parked}`, `SyncProblemsVm.parked`, `sync-pane.tsx` `SyncProblemsSection`
+reason: `ParkedRow` carries kind, attempts and the error but not the journal row's `label`, so a stopped upload reads "Large file upload · stopped after 1 attempt" without its path. The held push's sentence names the oldest one's file, and stopped uploads are listed first (R506); naming each row needs the label in `ParkedRow` and the VM (a generated binding change).
+status: open
+
+### DW-1524: Why hesperia committed a `filter=lfs` path as a plain blob is not established.
+
+origin: lane `sync` (finisher F102sync1), from `triage-102-sync-stall.md` §4 and §8, 2026-10-19
+location: `keeper_sync::engine` commit path (`commit_local`), tgdrive commits 0bfac3d37 (0.10.3) and 63b0a4423 (0.10.4)
+reason: the recording's `manifest.json` was committed twice as a plain blob although `git check-attr filter` reports `lfs` for it; the housekeeping rewrite that followed (82455dd4e) created the upload debt the stopped credential then held. 102.2 removes the stall, not this cause. Needs the walk/stage trace of a recording's manifest on a Mac.
+status: open
+
+### DW-1525: A recovered replacement whose rename to `unpublished/<oid>` also fails stays in `tmp/` for an hour.
+
+origin: review RR102sync4 (R102S4-01, R520), recorded by lane `102stack`, 2026-10-19
+location: `keeper-sync/src/lfs/store.rs` (`keep_unpublished`, the `tmp/` scratch sweep)
+reason: when publication fails and the recovery rename to `lfs/unpublished/<oid>` fails too, `keep_unpublished` leaves the verified replacement under its random name in `tmp/`, which is swept by age alone: after an hour it is indistinguishable from abandoned transfer scratch and is deleted. On Windows `err.file.keep().ok()` drops the returned error, and with it the file, when `keep` fails. The original target is preserved (R517); the recovered copy the WARN says was kept may not be.
+status: open
+
+### DW-1526: Objects recovered by another path leave their `unpublished/` copies for good.
+
+origin: review RR102sync4 (R102S4-02, R520), recorded by lane `102stack`, 2026-10-19
+location: `keeper-sync/src/lfs/store.rs` (`discard_unpublished`), `keeper-sync/src/engine.rs` (repair replay)
+reason: `discard_unpublished` runs only after a successful `insert_durable`. An object recovered another way — repair replay verifying an original that became readable again (`make_durable`), or a normal download — keeps its `unpublished/<oid>` copy, and nothing bounds or reconciles `unpublished/` across objects, so duplicate bytes stay on the drive after publishing resumes.
+status: open

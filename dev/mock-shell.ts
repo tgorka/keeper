@@ -168,6 +168,7 @@ import type {
   SpacesSnapshot,
   SurfaceAnswerReq,
   SurfaceRequestVm,
+  SyncActivityVm,
   SyncFootprintVm,
   SyncProblemsVm,
   SyncProfileReq,
@@ -214,6 +215,22 @@ import UNIFIEDPUSH_FIXTURE from "./unifiedpush-fixture.json";
 /** Roughly now, so relative timestamps read as "3 min ago" rather than 1970. */
 const NOW = Date.now();
 const ago = (minutes: number) => NOW - minutes * 60_000;
+
+/**
+ * Verbatim the shape `keeper_sync::engine::held_push_sentence` composes (Story
+ * 102.2), for tgdrive's upload 704972 as the owner's `sync.db` held it.
+ */
+const HELD_PUSH_SENTENCE =
+  "Publishing is on hold until 40-media/recordings/2026/2026-10-16 14.07 test/manifest.json reaches the remote, and its upload stopped: the account credential is unavailable: Reconnect the repository. Retry all stopped puts every stopped transfer of this folder back in the queue.";
+
+/**
+ * When tgdrive's last upload stops under the mock shell (Story 102.2, R503):
+ * until then its push is held while the upload still moves and the card reads
+ * as syncing; from then the held push's sentence and "Retry all stopped"
+ * arrive through the ordinary status poll, with no push failing again — what
+ * `Engine::project_held_push` does when an upload parks.
+ */
+const UPLOAD_STOPS_AT = NOW + 12_000;
 
 /**
  * Enough rows to judge DENSITY, which is the thing a screenshot of three items
@@ -1779,14 +1796,62 @@ const ANSWERS: Record<string, unknown> = {
     error: null,
     needsAttention: false,
     resettable: false,
+    heldPush: false,
+    // tgdrive as the owner's was on 2026-10-19 (Story 102.2): its push held
+    // behind an upload the signed-out account stopped. `sync_retry_all_parked`
+    // below clears it, so the way out can be pressed under the mock shell.
+    ...(status.profileId === "p1"
+      ? {
+          state: "needsAttention",
+          line: `${status.profileName} — ${HELD_PUSH_SENTENCE}`,
+          error: HELD_PUSH_SENTENCE,
+          needsAttention: true,
+          heldPush: true,
+        }
+      : {}),
   })) satisfies SyncStatusVm[],
   sync_problems: {
     warning: null,
     error: null,
-    parked: [],
+    // Stopped uploads first, as `db::list_parked` orders them (Story 102.2).
+    parked: [
+      {
+        id: 704972,
+        kind: "lfsUpload",
+        attempts: 1,
+        lastError: "the account credential is unavailable: Reconnect the repository.",
+      },
+      {
+        id: 704801,
+        kind: "pull",
+        attempts: 1,
+        lastError: "the account credential is unavailable: Reconnect the repository.",
+      },
+    ],
     conflicts: [],
     unspellable: [],
   } satisfies SyncProblemsVm,
+  // One row restored from history (Story 102.2) beside an ordinary arrival.
+  sync_activity: [
+    {
+      tsMs: ago(2),
+      kind: "restored",
+      path: "70-comms/meetings/2026/2026-10-06 1300 coin-fund-jackson-contact/manifest.sync-conflict-20261010-205450-maczek.json",
+      sizeBytes: 1896,
+      delivery: "inProgress",
+      failure: null,
+      unitId: 705000,
+    },
+    {
+      tsMs: ago(9),
+      kind: "added",
+      path: "10-notes/2026-10-18-untitled.md",
+      sizeBytes: 212,
+      delivery: "success",
+      failure: null,
+      unitId: null,
+    },
+  ] satisfies SyncActivityVm[],
   sync_git_status: { available: true, path: "/usr/bin/git", version: "2.53.0" },
   sync_device: { id: "01DEVICE", label: "hesperia" },
   // No token stored for either folder. Without this the edit form's keychain
@@ -8925,6 +8990,40 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
     return options && typeof options === "object" && "directory" in options && options.directory
       ? "/Users/tgorka/Documents"
       : "/Volumes/merope/tgdrive/meeting.mov";
+  },
+  // tgdrive before its last upload stops (`UPLOAD_STOPS_AT`): the push is held
+  // while the upload moves, so the card reads as syncing and offers nothing.
+  sync_statuses: () =>
+    (ANSWERS.sync_statuses as SyncStatusVm[]).map((status) =>
+      status.heldPush && Date.now() < UPLOAD_STOPS_AT
+        ? {
+            ...status,
+            state: "syncing",
+            line: `${status.profileName} — uploading 40-media/recordings/2026/2026-10-16 14.07 test/manifest.json`,
+            error: null,
+            needsAttention: false,
+            heldPush: false,
+          }
+        : status,
+    ),
+  // "Retry all stopped" (Story 102.2): the stopped rows leave the list and the
+  // held push's sentence goes with them, as `Engine::retry_all_parked` does.
+  sync_retry_all_parked: (payload) => {
+    const problems = ANSWERS.sync_problems as SyncProblemsVm;
+    const moved = problems.parked.length;
+    problems.parked = [];
+    for (const status of ANSWERS.sync_statuses as SyncStatusVm[]) {
+      if (status.profileId === payload.id && status.heldPush) {
+        Object.assign(status, {
+          state: "watching",
+          line: `${status.profileName} — remote comparison unknown`,
+          error: null,
+          needsAttention: false,
+          heldPush: false,
+        });
+      }
+    }
+    return moved;
   },
   sync_folder_tasks_flag: (payload) => {
     const profile = (ANSWERS.sync_profiles as SyncProfileVm[]).find(

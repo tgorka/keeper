@@ -4727,6 +4727,19 @@ export async function syncRetryParked(id: string, unitId: number): Promise<void>
 }
 
 /**
+ * Return every stopped unit of one folder to the queue — "Retry all stopped"
+ * (Story 102.2). One call: the engine folds identical work (a thousand stopped
+ * downloads of one object become one) instead of the webview requeueing each.
+ *
+ * Resolves with how many stopped rows left the list.
+ *
+ * Rejects with: `unsupported`, `internal` (no such profile).
+ */
+export async function syncRetryAllParked(id: string): Promise<number> {
+  return await invoke<number>("sync_retry_all_parked", { id });
+}
+
+/**
  * Which `git` folder sync resolved, or why there isn't one (Story 34.14).
  *
  * Answers on exactly the machines where the engine will not open, which is the

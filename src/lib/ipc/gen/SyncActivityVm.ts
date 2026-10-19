@@ -9,7 +9,7 @@
  */
 export type SyncActivityVm = { tsMs: number, 
 /**
- * `added` | `modified` | `deleted` | `conflict`.
+ * `added` | `modified` | `deleted` | `conflict` | `restored`.
  */
 kind: string, path: string, 
 /**

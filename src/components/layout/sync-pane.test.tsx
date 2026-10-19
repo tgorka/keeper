@@ -35,6 +35,8 @@ vi.mock("@/lib/ipc/client", () => ({
   syncPending: vi.fn(),
   syncProblems: vi.fn(),
   syncRetryParked: vi.fn(),
+  // "Retry all stopped" (Story 102.2): one call for the whole folder.
+  syncRetryAllParked: vi.fn(),
   syncRescan: vi.fn(),
   // The persisted list sizes (folded / unfolded).
   syncListSettingsGet: vi.fn(),
@@ -164,6 +166,7 @@ import {
   syncProfileSetEnabled,
   syncProfiles,
   syncRescan,
+  syncRetryAllParked,
   syncRetryParked,
   syncSetCredential,
   syncStatuses,
@@ -193,6 +196,7 @@ const mockRescan = vi.mocked(syncRescan);
 const mockPending = vi.mocked(syncPending);
 const mockProblems = vi.mocked(syncProblems);
 const mockRetryParked = vi.mocked(syncRetryParked);
+const mockRetryAll = vi.mocked(syncRetryAllParked);
 const mockFolderNow = vi.mocked(syncFolderNow);
 const mockFolderReset = vi.mocked(syncFolderReset);
 const mockSetEnabled = vi.mocked(syncProfileSetEnabled);
@@ -284,6 +288,7 @@ function statusVm(over: Partial<SyncStatusVm> = {}): SyncStatusVm {
     lastSyncMs: null,
     needsAttention: false,
     resettable: false,
+    heldPush: false,
     ...over,
   };
 }
@@ -1738,17 +1743,17 @@ describe("SyncPane list folding", () => {
         })),
       }),
     );
-    mockRetryParked.mockResolvedValue(undefined);
+    mockRetryAll.mockResolvedValue(5);
     await renderPane();
 
     const list = await screen.findByRole("list", { name: `${SYNC_PARKED_TITLE}: tgdrive` });
     await waitFor(() => expect(within(list).getAllByRole("listitem")).toHaveLength(2));
 
-    // The fold is about reading, not about scope: the bulk retry still requeues
-    // every parked unit, including the three currently hidden.
+    // The fold is about reading, not about scope: the bulk retry asks for the
+    // whole folder, the three hidden units included, never for the visible rows.
     fireEvent.click(screen.getByRole("button", { name: new RegExp(`^${SYNC_RETRY_ALL_LABEL}`) }));
-    await waitFor(() => expect(mockRetryParked).toHaveBeenCalledTimes(5));
-    expect(mockRetryParked.mock.calls.map(([, id]) => id)).toEqual([40, 41, 42, 43, 44]);
+    await waitFor(() => expect(mockRetryAll).toHaveBeenCalledWith("p1"));
+    expect(mockRetryParked).not.toHaveBeenCalled();
   });
 });
 
@@ -1823,7 +1828,7 @@ describe("SyncPane problems", () => {
         ],
       }),
     );
-    mockRetryParked.mockResolvedValue(undefined);
+    mockRetryAll.mockResolvedValue(3);
     await renderPane();
 
     fireEvent.click(
@@ -1832,11 +1837,12 @@ describe("SyncPane problems", () => {
       }),
     );
 
-    await waitFor(() => expect(mockRetryParked).toHaveBeenCalledTimes(3));
-    expect(mockRetryParked.mock.calls.map(([, unitId]) => unitId)).toEqual([41, 42, 43]);
+    await waitFor(() => expect(mockRetryAll).toHaveBeenCalledWith("p1"));
+    expect(mockRetryAll).toHaveBeenCalledTimes(1);
+    expect(mockRetryParked).not.toHaveBeenCalled();
   });
 
-  it("retries the units behind one that will not requeue, and still reports it", async () => {
+  it("reports a refused Retry all stopped and still re-reads the list", async () => {
     mockProblems.mockResolvedValue(
       problemsVm({
         parked: [
@@ -1845,10 +1851,7 @@ describe("SyncPane problems", () => {
         ],
       }),
     );
-    // The first unit is the one that fails: a bulk action that gave up on the
-    // rest would be worse than not offering the button at all.
-    mockRetryParked.mockRejectedValueOnce({ code: "journal", message: "unit is gone" });
-    mockRetryParked.mockResolvedValue(undefined);
+    mockRetryAll.mockRejectedValueOnce({ code: "journal", message: "journal is locked" });
     await renderPane();
 
     fireEvent.click(
@@ -1857,10 +1860,46 @@ describe("SyncPane problems", () => {
       }),
     );
 
-    await waitFor(() => expect(mockRetryParked).toHaveBeenCalledTimes(2));
-    expect(mockRetryParked.mock.calls.map(([, unitId]) => unitId)).toEqual([41, 42]);
     // The rejection is surfaced rather than swallowed into a silent success.
-    expect(await screen.findByText("unit is gone")).toBeInTheDocument();
+    expect(await screen.findByText("journal is locked")).toBeInTheDocument();
+  });
+
+  it("offers Retry all stopped beside a held push's sentence, and only there", async () => {
+    const sentence =
+      "Publishing is on hold until 40-media/manifest.json reaches the remote, and its upload stopped: the account credential is unavailable: Reconnect the repository. Retry all stopped puts every stopped transfer of this folder back in the queue.";
+    mockStatuses.mockResolvedValue([
+      statusVm({
+        state: "needsAttention",
+        error: sentence,
+        needsAttention: true,
+        heldPush: true,
+        line: RUST_LINE,
+      }),
+    ]);
+    mockRetryAll.mockResolvedValue(1);
+    await renderPane();
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: `${SYNC_RETRY_ALL_LABEL}, tgdrive` }),
+    );
+    await waitFor(() => expect(mockRetryAll).toHaveBeenCalledWith("p1"));
+  });
+
+  it("draws no Retry all stopped on the card when Rust says no push is held", async () => {
+    // The same words with `heldPush` false: the webview never reads the sentence.
+    mockStatuses.mockResolvedValue([
+      statusVm({
+        state: "needsAttention",
+        error: "Publishing is on hold. Retry all stopped puts every stopped transfer back.",
+        needsAttention: true,
+      }),
+    ]);
+    await renderPane();
+
+    await screen.findByText(SYNC_PENDING_EMPTY_SENTENCE);
+    expect(
+      screen.queryByRole("button", { name: `${SYNC_RETRY_ALL_LABEL}, tgdrive` }),
+    ).not.toBeInTheDocument();
   });
 
   it("offers no bulk retry for a single parked unit", async () => {
