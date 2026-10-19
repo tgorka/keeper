@@ -126,7 +126,8 @@ username = "oauth2"               # basic only; the token is the password
 # mode = "oauth": a forge that only accepts its own tokens (Gitea/Forgejo-style)
 # issuer = "https://git.acme.dev/git"            # OR authorize_url + token_url
 # client_id = "…"
-# scope = "openid profile read:user write:repository"   # ONE string, sent byte-identical forever
+# scope = "openid profile read:user write:repository write:user"   # ONE string, sent byte-identical forever;
+#                                   # write:user lets each device register its own application
 # redirect_uri = "keeper://oauth/acme/forge/callback"   # the default
 # signin_url = "https://git.acme.dev/git/user/oauth2/acme-id?redirect_to={authorize_path_and_query}"
 # user_url = "{api_base}/user"    # default; used when the forge's id_token carries no username
@@ -461,7 +462,29 @@ same browser session:
   is refused and its tokens are discarded: "The forge signed you in as ana, but your keeper
   account is tgorka."
 - **When the forge rejects the token.** A rejected request (`401`) is refreshed once and
-  retried. A second `401`, or a `403`, asks you to reconnect the repository.
+  retried. A second `401`, or a `403`, asks you to reconnect the repository. A refresh the
+  forge itself refuses forgets the stored forge token, so the next sign-in connects anew.
+- **Each device gets its own application.** Forgejo and Gitea keep one grant per person
+  *and OAuth application*, and every sign-in or refresh advances its counter: a token one
+  device gets retires every other device's refresh token (Forgejo logs "refresh token for
+  grant_id = … was used twice!"), and your devices take turns being signed out of the
+  repository. So when `api_base` is set, the forge sign-in above is a bootstrap: its token
+  registers an OAuth application for this device alone (`POST {api_base}/user/applications/oauth2`,
+  a public client on the forge redirect, named `keeper (<device>, <date>)`), and keeper signs
+  in a second time under that application. Only that second token is kept, and its scope is
+  `scope` with `write:user` narrowed to `read:user`. The forge asks you to authorize that
+  application once, in the same sheet.
+  - Registering needs `write:user` in `scope` (an OAuth token's API scope is its grant's).
+    Without it, or on a forge without that endpoint, the device keeps the shared
+    application's token as before, and keeper logs why at WARN.
+  - Adding `write:user` to an existing descriptor changes the scope string, and Forgejo
+    refuses an authorization whose scope differs from the grant you already hold ("a grant
+    exists with different scope"). Revoke keeper's application once under the forge's
+    *Settings › Applications › Authorized OAuth2 applications*, then sign in again on each
+    device.
+  - An application keeper no longer uses (a reset phone, a sign-out) holds no token anyone
+    has. Remove it under *Settings › Applications › Manage OAuth2 applications*; keeper only
+    deletes the one it registered when you close the second sheet.
 
 ## The config repository
 

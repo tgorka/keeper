@@ -106,6 +106,35 @@ pub(crate) struct StoredForge {
     pub refresh_token: Option<String>,
     pub expires_ms: Option<i64>,
     pub login: String,
+    /// The OAuth application this device registered on the forge for itself,
+    /// whose client the tokens above were issued to and are refreshed with.
+    /// `None`: the descriptor's shared client — an item from before
+    /// per-device applications, or a forge that would not register one.
+    #[serde(default)]
+    pub device_app: Option<DeviceApp>,
+}
+
+impl StoredForge {
+    /// The client these tokens belong to: a refresh under any other client
+    /// is refused by the forge.
+    pub(crate) fn client_id<'a>(&'a self, forge: &'a ForgeOauth) -> &'a str {
+        self.device_app
+            .as_ref()
+            .map_or(forge.client_id.as_str(), |app| app.client_id.as_str())
+    }
+}
+
+/// A forge OAuth application one device registered for itself (Forgejo and
+/// Gitea keep one grant per person *and application*, so each device needs
+/// its own application to hold a refresh token another device's sign-in does
+/// not kill). A public client: it has no secret keeper keeps.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct DeviceApp {
+    /// The forge's id, for deleting it at sign-out.
+    pub id: i64,
+    pub client_id: String,
+    /// What the person sees in the forge's list of applications.
+    pub name: String,
 }
 
 pub(crate) fn session_key(account_id: &str) -> String {
@@ -366,6 +395,38 @@ mod tests {
             git_credential(&descriptor_with(r#"{"mode":"none"}"#), "t"),
             GitAuth::None
         );
+    }
+
+    /// A forge item written before per-device applications reads on, and
+    /// is refreshed under the descriptor's shared client.
+    #[test]
+    fn a_forge_item_from_before_device_apps_uses_the_shared_client() {
+        let d = descriptor_with(
+            r#"{"mode":"oauth","client_id":"shared","scope":"openid profile",
+                "authorize_url":"https://git.acme.dev/login/oauth/authorize",
+                "token_url":"https://git.acme.dev/login/oauth/access_token"}"#,
+        );
+        let RepoAuthConfig::Oauth(forge) = &d.config.auth else {
+            panic!("an oauth descriptor");
+        };
+        let old = serde_json::json!({
+            "binding": Binding::forge(&d, forge),
+            "access_token": "a",
+            "refresh_token": "r",
+            "expires_ms": null,
+            "login": "tgorka",
+        });
+        let item: StoredForge = serde_json::from_value(old).expect("an old item reads");
+        assert!(item.device_app.is_none());
+        assert_eq!(item.client_id(forge), "shared");
+
+        let mut mine = item.clone();
+        mine.device_app = Some(DeviceApp {
+            id: 7,
+            client_id: "device-7".to_owned(),
+            name: "keeper (hesperia, 2026-10-18)".to_owned(),
+        });
+        assert_eq!(mine.client_id(forge), "device-7");
     }
 
     #[test]

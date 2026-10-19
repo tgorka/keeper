@@ -1416,12 +1416,37 @@ async fn converge(
             return AccountAttemptVm::Failed;
         }
         update(|inner| inner.phase = AccountPhase::SigningIn);
+        // The name the forge shows this device's own application under: the
+        // registered one, or the one registration will start from (pinned
+        // here, since a phone's default is drawn at random).
+        let device = {
+            let mut inner = lock(&RUNTIME.inner);
+            match inner
+                .this_device
+                .clone()
+                .or_else(|| inner.wanted_device.clone())
+            {
+                Some(device) => device,
+                None => {
+                    let device = default_device_name();
+                    inner.wanted_device = Some(device.clone());
+                    device
+                }
+            }
+        };
         if let Err(ended) = RUNTIME
             .attempts
             .step(
                 AccountStep::ForgeConnect,
                 &d.id,
-                oidc::forge_connect(platform.as_ref(), &flows, http, &d, &identity.login),
+                oidc::forge_connect(
+                    platform.as_ref(),
+                    &flows,
+                    http,
+                    &d,
+                    &identity.login,
+                    &device,
+                ),
             )
             .await
         {
