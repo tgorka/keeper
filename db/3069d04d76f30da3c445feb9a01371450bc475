@@ -1,0 +1,23 @@
+src-tauri/crates/keeper-core/src/verification.rs
+  s_7ee2f13b73005a::t_c393b95ffcb8c1 390-401
+src/components/settings/device-verification-dialog.test.tsx
+  s_7ee2f13b73005a::t_a1bc712e218850 19-23,74-80,85-88
+src/components/settings/device-verification-dialog.tsx
+  s_7ee2f13b73005a::t_65b71f8d19e8ea 43-51,145,153-157,160
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "db3069d04d76f30da3c445feb9a01371450bc475",
+  "prompts": {},
+  "sessions": {
+    "s_7ee2f13b73005a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7579fd61-2002-4dc8-9391-9b9f243abe4d",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
