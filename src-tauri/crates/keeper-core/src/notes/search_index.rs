@@ -300,7 +300,7 @@ impl SearchIndex {
     ) -> Result<Self, SearchIndexError> {
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         conn.busy_timeout(wait)?;
-        conn.progress_handler(STEPS_PER_CHECK, expired);
+        conn.progress_handler(STEPS_PER_CHECK, expired)?;
         // A value is admitted by the length SQLite stores for it, which is
         // the length of the UTF-8 handed over only where the text is stored
         // as UTF-8; an index stored otherwise is not read at all.

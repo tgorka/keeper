@@ -30,7 +30,7 @@ use eyeball::Subscriber;
 use futures_util::{FutureExt, Stream, StreamExt};
 use matrix_sdk::encryption::VerificationState;
 use matrix_sdk::event_cache::PaginationStatus;
-use matrix_sdk::event_cache::{RoomEventCacheSubscriber, RoomEventCacheUpdate};
+use matrix_sdk::event_cache::{self, RoomEventCacheUpdate};
 use matrix_sdk::ruma::events::room::message::MessageType;
 use matrix_sdk::ruma::{EventId, OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, UserId};
 use matrix_sdk::{Client, Room, RoomInfo};
@@ -1202,7 +1202,7 @@ fn info_changed(info: &mut Option<Subscriber<RoomInfo>>) -> bool {
 
 /// The next event-cache update, or never when there is no subscriber.
 async fn next_update(
-    updates: &mut Option<RoomEventCacheSubscriber>,
+    updates: &mut Option<event_cache::Subscriber<RoomEventCacheUpdate>>,
 ) -> Result<RoomEventCacheUpdate, RecvError> {
     match updates {
         Some(updates) => updates.recv().await,
@@ -1742,11 +1742,11 @@ fn map_pagination_status(status: PaginationStatus) -> PaginationStatusBatch {
 /// room list's 1, so a sync carrying a claim renewal and a status, or an
 /// answer's edits, is no longer `limited` and the event cache no longer
 /// unloads the open room to its last chunk under the person's eyes. The
-/// SDK replaces its whole subscription set on each call, so an empty set
-/// unsubscribes the last closed room; this is the set's one writer.
+/// SDK sets its subscriptions to exactly the given set on each call, so an
+/// empty set unsubscribes the last closed room; this is the set's one writer.
 pub async fn subscribe_open_rooms(room_list: &RoomListService, open: &BTreeSet<OwnedRoomId>) {
     let rooms: Vec<&RoomId> = open.iter().map(AsRef::as_ref).collect();
-    room_list.subscribe_to_rooms(&rooms).await;
+    room_list.set_room_subscriptions(&rooms).await;
 }
 
 /// Work the producer runs beside the stream: the header's search, a page

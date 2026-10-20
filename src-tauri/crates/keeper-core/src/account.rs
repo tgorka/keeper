@@ -1001,7 +1001,7 @@ impl AccountManager {
     /// "Sync now" palette action; the Epic 14-1 foreground-resume seam).
     ///
     /// Resumes each **already-active** account's [`SyncService`] via its
-    /// idempotent `start()` — matrix-sdk-ui 0.18 documents it as safe to call
+    /// idempotent `start()` — matrix-sdk-ui 0.19 documents it as safe to call
     /// repeatedly: a no-op while `Running`, an exit-and-retry from the offline
     /// state, and a clean restart after `Terminated`/`Error`. This never builds
     /// a second `Client`/`SyncService`, never force-activates signed-out (or
@@ -7812,7 +7812,7 @@ async fn activate(
     // Archive-first pagination is an enhancement, not a precondition for a usable
     // account: a subscribe failure degrades to homeserver-only back-pagination
     // rather than failing activation (mirrors the infallibly-registered
-    // archive/redaction handlers). In matrix-sdk 0.18 this is effectively
+    // archive/redaction handlers). In matrix-sdk 0.19 this is effectively
     // unreachable — `subscribe()` only errors on an already-dropped client.
     if let Err(e) = client.event_cache().subscribe() {
         tracing::warn!(

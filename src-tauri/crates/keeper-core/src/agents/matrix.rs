@@ -748,7 +748,7 @@ mod tests {
     fn answer(status: u16, body: &str) -> AgentMatrixError {
         let response = http::Response::builder()
             .status(status)
-            .body(body.as_bytes().to_vec())
+            .body(body.as_bytes())
             .expect("response");
         let error = ClientApiError::from_http_response(response);
         classify(error.error_kind(), false, error.to_string())
