@@ -9498,10 +9498,21 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
       return hqRefuse("The action changed. Read it again before deciding.");
     if (sessionScenario === "refused")
       return hqRefuse("This T4 action must be approved from another host.");
+    delete row.refused;
     row.state = payload.approve ? "approved" : "denied";
     row.canDecide = false;
     row.sentence = payload.approve ? "Approved by Ana" : "Denied by Ana";
     publishSessions();
+    if (sessionScenario === "queued") {
+      setTimeout(() => {
+        row.state = "pending";
+        row.canDecide = true;
+        row.refused = "This device cannot approve this action.";
+        row.sentence = `The server refused your decision: ${row.refused}`;
+        publishSessions();
+      }, 400);
+      return { state: "waiting", sentence: "The decision waits on this device." };
+    }
     return { state: "sent", sentence: "Your decision was sent." };
   },
   agents_sessions_subscribe: (payload) => {
@@ -9516,6 +9527,7 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
     return null;
   },
   agent_session_open: (payload) => {
+    if (sessionScenario === "open-error") hqRefuse("This session is not open to this device.");
     const vm = mockSession(payload);
     const id = `session-view-${++sessionSerial}`;
     const channel = payload.channel as MockChannel<AgentSessionViewVm>;
@@ -9592,7 +9604,10 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
     publishSessions();
     return null;
   },
-  agents_choices: () => sessionChoices,
+  agents_choices: () =>
+    sessionScenario === "choices-error"
+      ? hqRefuse("The database directory is unavailable.")
+      : sessionChoices,
   agent_session_default: () =>
     sessionScenario === "launch"
       ? {
@@ -9603,6 +9618,7 @@ const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unkn
         }
       : null,
   agent_session_new: (payload) => {
+    if (sessionScenario === "create-error") hqRefuse("This agent no longer serves beta.");
     const choice = sessionChoices.find(
       (choice) =>
         choice.agentActor === payload.agentActor &&

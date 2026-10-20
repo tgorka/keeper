@@ -62,7 +62,7 @@ export function NewSession({
     <section aria-label="New session" className="flex min-h-0 min-w-0 flex-1 flex-col">
       <header className="flex items-center justify-between gap-2 border-border border-b px-3 py-2">
         <h2 className="font-semibold text-title">New session</h2>
-        <Button variant="ghost" onClick={onCancel}>
+        <Button data-slot="agent-screen-back" variant="ghost" onClick={onCancel}>
           Cancel
         </Button>
       </header>
@@ -101,7 +101,11 @@ export function NewSession({
                 </SelectTrigger>
                 <SelectContent>
                   {choices.map((row) => (
-                    <SelectItem key={row.agentActor} value={row.agentActor}>
+                    <SelectItem
+                      className="min-h-11 min-w-11"
+                      key={row.agentActor}
+                      value={row.agentActor}
+                    >
                       {row.agentName}
                     </SelectItem>
                   ))}
@@ -117,7 +121,7 @@ export function NewSession({
                   </SelectTrigger>
                   <SelectContent>
                     {choice.databases.map((name) => (
-                      <SelectItem key={name} value={name}>
+                      <SelectItem className="min-h-11 min-w-11" key={name} value={name}>
                         {name}
                       </SelectItem>
                     ))}

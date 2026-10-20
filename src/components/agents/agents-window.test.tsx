@@ -1,9 +1,10 @@
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentsWindow } from "@/components/agents/agents-window";
+import { DatabaseApprovalCard } from "@/components/agents/approval-card";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type * as Ipc from "@/lib/ipc/client";
-import type { AgentSessionsBatch, AgentSessionViewVm } from "@/lib/ipc/client";
+import type { AgentApprovalVm, AgentSessionsBatch, AgentSessionViewVm } from "@/lib/ipc/client";
 import { agentSessionsStore } from "@/lib/stores/agent-sessions";
 
 const mock = vi.hoisted(() => ({
@@ -186,7 +187,7 @@ describe("database Agents window", () => {
       target: { value: "Keep these words" },
     });
     fireEvent.click(screen.getByRole("button", { name: "Send message" }));
-    await screen.findByRole("alert");
+    expect(await screen.findByRole("alert")).toHaveTextContent("Not open to this device");
     expect(screen.getByRole("textbox", { name: "Message" })).toHaveValue("Keep these words");
     expect(mock.send).toHaveBeenCalledWith(
       { database: "alpha", sessionId: "same.1" },
@@ -215,14 +216,16 @@ describe("database Agents window", () => {
       ).toBeInTheDocument();
     }
   });
-  it("uses the phone conversation screen and returns to its list", async () => {
+  it("moves phone focus to Back and restores the database-qualified row on Escape", async () => {
     mock.phone = true;
     draw();
     await list();
+    screen.getByRole("button", { name: /^beta session/ }).focus();
     await open("beta");
-    expect(screen.queryByRole("list", { name: "Sessions" })).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Back to sessions" }));
-    expect(screen.getByRole("list", { name: "Sessions" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Back to sessions" })).toHaveFocus();
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
+    expect(screen.getByRole("button", { name: /^beta session/ })).toHaveFocus();
+    expect(screen.queryByRole("textbox", { name: "Message" })).not.toBeInTheDocument();
   });
   it("widens history once requested without replacing a database's address", async () => {
     draw();
@@ -362,4 +365,82 @@ it("sends an ask answer through its database and waits for Rust to close its opt
   expect(
     screen.queryByRole("complementary", { name: "Waiting for your answer" }),
   ).not.toBeInTheDocument();
+});
+
+it("reenables the same approval after Rust rejects a queued decision", async () => {
+  mock.decide.mockResolvedValueOnce({ state: "waiting", sentence: "Queued locally" });
+  const approval: AgentApprovalVm = {
+    id: "queued",
+    database: "alpha",
+    sessionId: "same.1",
+    toolName: "write",
+    tier: "T3",
+    summary: "Write notes",
+    action: "{}",
+    bindingDigest: "digest",
+    expiresAtMs: 1800000000000,
+    createdAtMs: 1780000000000,
+    state: "pending",
+    canDecide: true,
+    sentence: "Waiting for you",
+  };
+  const { rerender } = render(<DatabaseApprovalCard approval={approval} />);
+  fireEvent.click(screen.getByRole("button", { name: "Approve once" }));
+  await waitFor(() => expect(mock.decide).toHaveBeenCalledTimes(1));
+  rerender(
+    <DatabaseApprovalCard
+      approval={{ ...approval, state: "approved", canDecide: false, sentence: "Queued locally" }}
+    />,
+  );
+  expect(screen.queryByRole("button", { name: "Approve once" })).not.toBeInTheDocument();
+  rerender(
+    <DatabaseApprovalCard
+      approval={{
+        ...approval,
+        refused: "Review it again.",
+        sentence: "Decision rejected: review it again.",
+      }}
+    />,
+  );
+  await waitFor(() => expect(screen.getByRole("button", { name: "Approve once" })).toBeEnabled());
+  expect(screen.getByRole("alert")).toHaveTextContent("Decision rejected: review it again.");
+});
+
+it("keeps the first message and Rust's refusal when session creation is denied", async () => {
+  mock.create.mockRejectedValueOnce({
+    message: "This agent no longer serves beta.",
+    retriable: false,
+  });
+  agentSessionsStore.setState({
+    newSession: {
+      agentActor: "researcher",
+      agentName: "Researcher",
+      database: "beta",
+      sessionId: null,
+    },
+  });
+  draw();
+  await waitFor(() => expect(screen.getByRole("textbox", { name: "Message" })).toBeEnabled());
+  fireEvent.change(screen.getByRole("textbox", { name: "Message" }), {
+    target: { value: "Keep the first message" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+  expect(await screen.findByRole("alert")).toHaveTextContent("This agent no longer serves beta.");
+  expect(screen.getByRole("textbox", { name: "Message" })).toHaveValue("Keep the first message");
+});
+
+it("keeps phone Back focused when loading the last earlier page removes its control", async () => {
+  mock.phone = true;
+  draw();
+  await list();
+  await open("beta", { hasEarlier: true });
+  const earlier = screen.getByRole("button", { name: "Earlier messages" });
+  earlier.focus();
+  await act(async () => {
+    fireEvent.click(earlier);
+  });
+  act(() => mock.views.get("beta")?.(view("beta", { hasEarlier: false })));
+  expect(screen.getByRole("button", { name: "Back to sessions" })).toHaveFocus();
+  fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
+  expect(screen.getByRole("button", { name: /^beta session/ })).toHaveFocus();
 });

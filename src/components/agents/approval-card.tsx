@@ -43,7 +43,7 @@ import {
   Shield,
   ShieldAlert,
 } from "lucide-react";
-import { type ReactNode, useId, useState } from "react";
+import { type ReactNode, useEffect, useId, useState } from "react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
@@ -979,20 +979,22 @@ export function ApprovalRequest({
 /** A database approval is bound to the exact action and digest Rust supplied. */
 export function DatabaseApprovalCard({ approval }: { approval: AgentApprovalVm }) {
   const [sending, setSending] = useState(false);
-  const [notice, setNotice] = useState<string | null>(null);
   const [failure, setFailure] = useState<string | null>(null);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: an authoritative state transition retires an earlier command failure
+  useEffect(() => {
+    setFailure(null);
+  }, [approval.state, approval.canDecide, approval.sentence]);
   const decide = async (approve: boolean) => {
     if (sending || !approval.canDecide) return;
     setSending(true);
     setFailure(null);
     try {
-      const result = await agentSessionApprovalDecide(
+      await agentSessionApprovalDecide(
         { database: approval.database, sessionId: approval.sessionId },
         approval.id,
         approval.bindingDigest,
         approve,
       );
-      setNotice(result.sentence);
     } catch (raw) {
       setFailure(syncErrorMessage(raw, APPROVAL_DECIDE_FAILED));
     } finally {
@@ -1023,13 +1025,15 @@ export function DatabaseApprovalCard({ approval }: { approval: AgentApprovalVm }
         </figure>
       )}
       <details className="my-2 text-muted-foreground text-xs">
-        <summary>Binding digest</summary>
+        <summary className="min-h-11 min-w-11 cursor-pointer content-center">
+          Binding digest
+        </summary>
         <p className="break-all">{approval.bindingDigest}</p>
       </details>
-      <p role="status" className="text-muted-foreground text-xs">
-        {approval.state === "pending" && notice ? notice : approval.sentence}
+      <p role={approval.refused ? "alert" : "status"} className="text-muted-foreground text-xs">
+        {approval.sentence}
       </p>
-      {failure && (
+      {failure && !approval.refused && (
         <p role="alert" className="mt-2 text-destructive text-sm">
           {failure}
         </p>
@@ -1037,18 +1041,18 @@ export function DatabaseApprovalCard({ approval }: { approval: AgentApprovalVm }
       {approval.canDecide && (
         <div className="mt-3 flex flex-wrap gap-2">
           <Button
-            className="min-h-11"
+            className="min-h-11 min-w-11"
             size="sm"
-            disabled={sending || notice !== null}
+            disabled={sending}
             onClick={() => void decide(true)}
           >
             Approve once
           </Button>
           <Button
             size="sm"
-            className="min-h-11"
+            className="min-h-11 min-w-11"
             variant="outline"
-            disabled={sending || notice !== null}
+            disabled={sending}
             onClick={() => void decide(false)}
           >
             Deny

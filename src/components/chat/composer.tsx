@@ -80,6 +80,7 @@ import {
 } from "@/lib/stores/conversation-stores";
 import { draftsStore, useRemoteDraft } from "@/lib/stores/drafts";
 import { useIncognito } from "@/lib/stores/incognito";
+import { syncErrorMessage } from "@/lib/stores/sync";
 import { cn } from "@/lib/utils";
 
 /** Derive a chip display name for a pending attachment (its filename). */
@@ -261,7 +262,7 @@ export function Composer({
   // edited (`SendError::TargetNotFound | NotEditable`). Telling that user to check
   // their connection and try again would be a lie: no retry can ever succeed, so
   // the two cases get distinct copy (AD-21 honesty, Story 3.4).
-  const [error, setError] = useState<"retriable" | "terminal" | null>(null);
+  const [error, setError] = useState<"retriable" | "terminal" | { message: string } | null>(null);
   // The `account\0room` whose last draft save failed, or `null`: says
   // DRAFT_NOT_SAVED under that chat's composer until a save there succeeds.
   const [unsavedDraft, setUnsavedDraft] = useState<string | null>(null);
@@ -849,7 +850,13 @@ export function Composer({
       // a recognisable envelope is treated as retriable — the weaker, safer claim.
       logFailure("composer.send")(raw);
       const err = raw as IpcError | null | undefined;
-      setError(err?.retriable === false ? "terminal" : "retriable");
+      setError(
+        transport === "session"
+          ? { message: syncErrorMessage(raw, "keeper could not send this message.") }
+          : err?.retriable === false
+            ? "terminal"
+            : "retriable",
+      );
       // Re-queue what was cancelled above while the draft is still the line that
       // failed, so a failed send stays durable across relaunch. Text typed since is
       // the next message and queued its own save; an edit never touched the stored
@@ -1487,9 +1494,11 @@ export function Composer({
         ))}
       {error !== null && (
         <p role="alert" className="text-destructive text-xs">
-          {error === "terminal"
-            ? "Couldn't send. That message can no longer be edited or replied to."
-            : "Couldn't send. Check your connection and try again."}
+          {typeof error === "object"
+            ? error.message
+            : error === "terminal"
+              ? "Couldn't send. That message can no longer be edited or replied to."
+              : "Couldn't send. Check your connection and try again."}
         </p>
       )}
     </div>

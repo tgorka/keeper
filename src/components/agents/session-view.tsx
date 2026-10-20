@@ -31,6 +31,7 @@ export function SessionView({ target, onBack }: { target: AgentSessionRef; onBac
   const [attempt, setAttempt] = useState(0);
   const [stores] = useState(createConversationStores);
   const viewport = useRef<HTMLDivElement>(null);
+  const backButton = useRef<HTMLButtonElement>(null);
   const { phone } = useShellLayout();
   const { database, sessionId } = target;
   const pinned = useRef(true);
@@ -111,6 +112,8 @@ export function SessionView({ target, onBack }: { target: AgentSessionRef; onBac
       <header className="flex shrink-0 items-center gap-2 border-border border-b px-3 py-2">
         {onBack && (
           <Button
+            ref={backButton}
+            data-slot="agent-screen-back"
             variant="ghost"
             size="icon"
             className="size-11 shrink-0"
@@ -175,7 +178,11 @@ export function SessionView({ target, onBack }: { target: AgentSessionRef; onBac
             variant="ghost"
             className="mb-3 w-full"
             disabled={busy || vm.loadingEarlier}
-            onClick={() => void pageBack()}
+            onClick={() => {
+              // The last page removes this button; keep keyboard Back reachable.
+              if (phone) backButton.current?.focus();
+              void pageBack();
+            }}
           >
             {vm.loadingEarlier ? "Loading earlier messages…" : "Earlier messages"}
           </Button>

@@ -1,5 +1,5 @@
 import { Plus } from "lucide-react";
-import { useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { AgentAttentionMark, agentAttentionLabel } from "@/components/agents/agent-attention";
 import { DatabaseDecisionsPanel } from "@/components/agents/decisions-panel";
 import { EarlierConversations } from "@/components/agents/earlier-conversations";
@@ -27,15 +27,58 @@ export function AgentsWindow() {
   const { phone } = useShellLayout();
   const newOpen = creating || initial !== null;
   const showingDetail = newOpen || selected !== null;
+  const root = useRef<HTMLElement>(null);
+  const newButton = useRef<HTMLButtonElement>(null);
+  const rowButtons = useRef(new Map<string, HTMLButtonElement>());
+  const origin = useRef<string | null>(null);
+  const restoreFocus = useRef(false);
+  const selectedKey = selected ? JSON.stringify([selected.database, selected.sessionId]) : null;
+  useLayoutEffect(() => {
+    if (!phone) return;
+    if (showingDetail) {
+      origin.current ??= selectedKey ?? "new";
+      root.current?.querySelector<HTMLButtonElement>('[data-slot="agent-screen-back"]')?.focus();
+    } else if (restoreFocus.current) {
+      (rowButtons.current.get(origin.current ?? "") ?? newButton.current)?.focus();
+      restoreFocus.current = false;
+      origin.current = null;
+    }
+  }, [phone, showingDetail, selectedKey]);
   const visible = rows.filter(
     (row) => filter === "all" || row.archived === (filter === "archived"),
   );
-  const back = () => {
+  const back = useCallback(() => {
+    restoreFocus.current = phone;
     setCreating(false);
     agentSessionsStore.getState().select(null);
-  };
+  }, [phone]);
+  useEffect(() => {
+    if (!phone || !showingDetail) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key !== "Escape" || event.defaultPrevented || event.isComposing) return;
+      // A disabled/removed action may leave focus on body. Portalled selectors
+      // and dialogs own their own Escape and are deliberately outside this scope.
+      if (
+        event.target !== document.body &&
+        !(event.target instanceof Node && root.current?.contains(event.target))
+      )
+        return;
+      event.preventDefault();
+      back();
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [phone, showingDetail, back]);
   return (
-    <section className="flex min-h-0 min-w-0 flex-1" aria-label="Agents">
+    <section
+      ref={root}
+      className={cn(
+        "flex min-h-0 min-w-0 flex-1",
+        phone &&
+          "[&_button]:min-h-11 [&_button]:min-w-11 [&_textarea]:min-h-11 [&_summary]:min-h-11 [&_summary]:min-w-11 [&_summary]:content-center",
+      )}
+      aria-label="Agents"
+    >
       {(!phone || !showingDetail) && (
         <section
           aria-label="Agent sessions"
@@ -47,11 +90,13 @@ export function AgentsWindow() {
           <header className="flex items-center justify-between gap-2 border-border border-b px-3 py-2">
             <h1 className="font-semibold text-title">Agents</h1>
             <Button
+              ref={newButton}
               variant="ghost"
               size="icon"
               className="size-11"
               aria-label="New session"
               onClick={() => {
+                origin.current = "new";
                 agentSessionsStore.getState().select(null);
                 setCreating(true);
               }}
@@ -99,6 +144,11 @@ export function AgentsWindow() {
               {visible.map((row) => (
                 <li key={JSON.stringify([row.database, row.sessionId])}>
                   <button
+                    ref={(button) => {
+                      const key = JSON.stringify([row.database, row.sessionId]);
+                      if (button) rowButtons.current.set(key, button);
+                      else rowButtons.current.delete(key);
+                    }}
                     type="button"
                     aria-label={`${row.title}, ${row.agentName}, ${row.database}, ${formatRoomTimestamp(row.lastActivityMs)}${row.archived ? ", archived" : ""}${agentAttentionLabel(row.attention)}`}
                     aria-current={
@@ -113,6 +163,7 @@ export function AgentsWindow() {
                         "bg-accent",
                     )}
                     onClick={() => {
+                      origin.current = JSON.stringify([row.database, row.sessionId]);
                       setCreating(false);
                       agentSessionsStore
                         .getState()
