@@ -6,22 +6,27 @@
 // all. For each URL this runs the server's startup twice — storage
 // `migrate()` and `ensureSyncServerReady` over the generated schema — and
 // fails unless:
-//   - the first start creates every contract table in the role's schema and
-//     none in `public`;
+//   - the schema is empty before the first start, and the first start puts
+//     every contract table in it and none in `public`;
 //   - the second start changes no table, column, index or the stored schema
 //     marker;
-//   - rows committed through the real push path come back from the
+//   - rows this run commits through the real push path (fresh partition,
+//     ids and commit ids, so nothing is a cached replay) come back from the
 //     registered `sessionPage` query, newest first, page by page, and a page
-//     key outside the actor's scopes is refused.
+//     key outside the actor's scopes is refused;
+//   - an agent instance's two memory subscriptions, as the generated
+//     templates request them, receive its own rows and its family peers'
+//     rows and never another family's.
 //
-// Run against a throwaway database: it writes rows into partition
-// `live-check`.
+// Point it at a fresh, throwaway database: a schema that already holds
+// tables is refused.
 //
 //   KEEPER_SYNC_TEST_PG_URL="postgres://role_a:…@host/db postgres://role_b:…@host/db" \
 //     bun run check:syncular:live
 
 import { decodeRemoteOperationResponse, encodeRemoteOperationRequest } from "@syncular/core";
 import {
+  computeEffective,
   ensureSyncServerReady,
   handleRemoteOperation,
   MemorySegmentStore,
@@ -30,22 +35,36 @@ import {
   PostgresServerStorage,
   RemoteOperationRegistry,
   registerRemoteQuery,
+  type ScopeMap,
   type ServerSchema,
   type SyncServerConfig,
   seedMutations,
 } from "@syncular/server";
 import { SQL } from "bun";
-import { schema as generatedSchema } from "../syncular/syncular.generated.ts";
+import {
+  agentMemoryFamilySubscription,
+  agentMemoryOwnSubscription,
+  schema as generatedSchema,
+} from "../syncular/syncular.generated.ts";
 import { sessionPageQuery } from "../syncular/syncular.queries.ts";
 
 const schema = generatedSchema as unknown as ServerSchema;
-const PARTITION = "live-check";
-const ACTOR = "live-check-person";
-const CLIENT = "live-check-device";
+const RUN = crypto.randomUUID().replaceAll("-", "");
+const PARTITION = `live-check-${RUN}`;
+const ACTOR = `person-${RUN}`;
+const CLIENT = `device-${RUN}`;
 const SESSION = `${CLIENT}.1`;
 const PAGE = `${SESSION}/2026-10`;
 const OTHER_PAGE = `${CLIENT}.2/2026-10`;
 const FIRST_PAGE_CURSOR = { beforeMs: 9007199254740991n, beforeId: "" };
+// The agent memory fixture: an agent, a peer in its family, and an agent of
+// another family. The service actor writes all three rows.
+const SERVICE = `service-${RUN}`;
+const AGENT = `agent-${RUN}`;
+const PEER = `peer-${RUN}`;
+const STRANGER = `stranger-${RUN}`;
+const FAMILY = `family-${RUN}`;
+const OTHER_FAMILY = `other-family-${RUN}`;
 
 function fail(message: string): never {
   console.error(`check-syncular-live: ${message}`);
@@ -73,13 +92,10 @@ function config(sql: SQL): SyncServerConfig {
     schema,
     storage: new PostgresServerStorage(executor(sql)),
     segments: new MemorySegmentStore(),
-    resolveScopes: () => ({
-      session: [SESSION],
-      member: [ACTOR],
-      page: [PAGE],
-      trace: [PAGE],
-      actor: [ACTOR],
-    }),
+    resolveScopes: ({ actorId }) =>
+      actorId === SERVICE
+        ? { agent: [AGENT, PEER, STRANGER], family: [FAMILY, OTHER_FAMILY] }
+        : { session: [SESSION], member: [ACTOR], page: [PAGE], trace: [PAGE], actor: [ACTOR] },
   };
 }
 
@@ -129,6 +145,23 @@ async function runSessionPage(
   return decodeRemoteOperationResponse(bytes);
 }
 
+/** The agent_memory rows a subscription receives, through the server's own matching. */
+async function memoryRowsFor(
+  server: SyncServerConfig,
+  requested: ScopeMap,
+  allowed: ScopeMap,
+): Promise<string[]> {
+  const outcome = computeEffective(requested, { ok: true, allowed });
+  if (outcome.status !== "active") return [];
+  const rows = await server.storage.scanRows(PARTITION, {
+    table: "agent_memory",
+    scopeFilter: outcome.effective,
+    afterRowId: null,
+    limit: 100,
+  });
+  return rows.map((row) => row.rowId).sort();
+}
+
 async function checkOne(url: string): Promise<void> {
   const sql = new SQL(url);
   const [{ schema_name: schemaName, role }] = await sql`
@@ -136,6 +169,10 @@ async function checkOne(url: string): Promise<void> {
   if (schemaName === null || schemaName === "public") {
     fail(`${role}: search_path must name the role's own schema, got ${schemaName}`);
   }
+  const [{ count: before }] = await sql`
+    SELECT count(*)::int AS count FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE n.nspname = ${schemaName}`;
+  if (before !== 0) fail(`${role}: ${schemaName} holds ${before} relations; use a fresh schema`);
   const contract = schema.tables.map((table) => table.name);
 
   const first = await start(sql);
@@ -156,38 +193,72 @@ async function checkOne(url: string): Promise<void> {
 
   const now = 1792454400000; // 2026-10-20T00:00:00Z
   const authored = { author_actor: ACTOR, author_client: CLIENT };
-  await seedMutations(first, { partition: PARTITION, actorId: ACTOR, clientId: CLIENT }, [
-    {
-      table: "sessions",
-      op: "upsert",
-      values: {
-        id: SESSION,
-        title: "live check",
-        status: "open",
-        agent_actor: "live-check-agent",
-        created_by_actor: ACTOR,
-        created_by_client: CLIENT,
-        invite: "[]",
-        archived: true,
-        created_at_ms: now,
-        last_activity_ms: now + 2,
-        ...authored,
+  const messageIds = [0, 1, 2].map((n) => `message-${RUN}-${n}`);
+  await seedMutations(
+    first,
+    { partition: PARTITION, actorId: ACTOR, clientId: CLIENT, commitId: `messages-${RUN}` },
+    [
+      {
+        table: "sessions",
+        op: "upsert",
+        values: {
+          id: SESSION,
+          title: "live check",
+          status: "open",
+          agent_actor: AGENT,
+          created_by_actor: ACTOR,
+          created_by_client: CLIENT,
+          invite: "[]",
+          archived: true,
+          created_at_ms: now,
+          last_activity_ms: now + 2,
+          ...authored,
+        },
       },
+      ...messageIds.map((id, n) => ({
+        table: "messages",
+        op: "upsert" as const,
+        values: {
+          id,
+          session_id: SESSION,
+          page_key: PAGE,
+          role: "person",
+          body: `message ${n}`,
+          created_at_ms: now + n,
+          ...authored,
+        },
+      })),
+    ],
+  );
+  const memory = (id: string, agent: string, family: string) => ({
+    table: "agent_memory",
+    op: "upsert" as const,
+    values: {
+      id,
+      agent_actor: agent,
+      family,
+      kind: "journal",
+      text: `${agent} wrote this`,
+      created_at_ms: now,
+      author_actor: SERVICE,
+      author_client: SERVICE,
     },
-    ...[0, 1, 2].map((n) => ({
-      table: "messages",
-      op: "upsert" as const,
-      values: {
-        id: `01JLIVECHECK00000000000000${n}`,
-        session_id: SESSION,
-        page_key: PAGE,
-        role: "person",
-        body: `message ${n}`,
-        created_at_ms: now + n,
-        ...authored,
-      },
-    })),
-  ]);
+  });
+  const ownRow = `memory-${RUN}-own`;
+  const peerRow = `memory-${RUN}-peer`;
+  const strangerRow = `memory-${RUN}-stranger`;
+  await seedMutations(
+    first,
+    { partition: PARTITION, actorId: SERVICE, clientId: SERVICE, commitId: `memory-${RUN}` },
+    [
+      memory(ownRow, AGENT, FAMILY),
+      memory(peerRow, PEER, FAMILY),
+      memory(strangerRow, STRANGER, OTHER_FAMILY),
+    ],
+  );
+  const [{ count: commits }] = await sql`
+    SELECT count(*)::int AS count FROM sync_commits WHERE partition = ${PARTITION}`;
+  if (commits !== 2) fail(`${role}: ${commits} commits in this run's partition, expected 2`);
 
   const registry = new RemoteOperationRegistry([
     registerRemoteQuery(sessionPageQuery, { maxRows: 10_000, auth: { access: "scoped" } }),
@@ -198,9 +269,9 @@ async function checkOne(url: string): Promise<void> {
     pageSize: 2n,
   });
   if (page1.kind !== "query") fail(`${role}: sessionPage failed: ${JSON.stringify(page1)}`);
-  const bodies1 = page1.rows.map((row) => row.body);
-  if (JSON.stringify(bodies1) !== JSON.stringify(["message 2", "message 1"])) {
-    fail(`${role}: first page ${JSON.stringify(bodies1)}`);
+  const ids1 = page1.rows.map((row) => row.id);
+  if (JSON.stringify(ids1) !== JSON.stringify([messageIds[2], messageIds[1]])) {
+    fail(`${role}: first page ${JSON.stringify(ids1)}`);
   }
   const last = page1.rows[1] as { created_at_ms: number; id: string };
   const page2 = await runSessionPage(first, registry, {
@@ -210,9 +281,9 @@ async function checkOne(url: string): Promise<void> {
     pageSize: 2n,
   });
   if (page2.kind !== "query") fail(`${role}: sessionPage failed: ${JSON.stringify(page2)}`);
-  const bodies2 = page2.rows.map((row) => row.body);
-  if (JSON.stringify(bodies2) !== JSON.stringify(["message 0"])) {
-    fail(`${role}: second page ${JSON.stringify(bodies2)}`);
+  const ids2 = page2.rows.map((row) => row.id);
+  if (JSON.stringify(ids2) !== JSON.stringify([messageIds[0]])) {
+    fail(`${role}: second page ${JSON.stringify(ids2)}`);
   }
   const outside = await runSessionPage(first, registry, {
     pageKey: OTHER_PAGE,
@@ -223,10 +294,39 @@ async function checkOne(url: string): Promise<void> {
     fail(`${role}: a page outside the actor's scopes answered ${JSON.stringify(outside)}`);
   }
 
+  // What resolveScopes grants an agent instance: itself and its own family.
+  const instance = { agent: [AGENT], family: [FAMILY] };
+  const own = await memoryRowsFor(
+    first,
+    agentMemoryOwnSubscription.scopes({ agentActor: AGENT }),
+    instance,
+  );
+  const family = await memoryRowsFor(
+    first,
+    agentMemoryFamilySubscription.scopes({ family: FAMILY }),
+    instance,
+  );
+  const foreign = await memoryRowsFor(
+    first,
+    agentMemoryFamilySubscription.scopes({ family: OTHER_FAMILY }),
+    instance,
+  );
+  if (JSON.stringify(own) !== JSON.stringify([ownRow])) {
+    fail(`${role}: own memory subscription received ${JSON.stringify(own)}`);
+  }
+  if (JSON.stringify(family) !== JSON.stringify([ownRow, peerRow].sort())) {
+    fail(`${role}: family memory subscription received ${JSON.stringify(family)}`);
+  }
+  if (foreign.length !== 0) {
+    fail(`${role}: another family's memory reached the agent: ${JSON.stringify(foreign)}`);
+  }
+
   await sql.end();
   console.log(
-    `${role} → ${schemaName}: ${contract.length} tables there and none in public, second start a no-op, ` +
-      `sessionPage paged ${bodies1.length}+${bodies2.length} rows, foreign page refused`,
+    `${role} → ${schemaName}: empty before, ${contract.length} tables there and none in public, ` +
+      `second start a no-op, this run's commits ${commits}, sessionPage paged ` +
+      `${ids1.length}+${ids2.length} fresh rows, foreign page refused, memory: own ${own.length}, ` +
+      `family ${family.length} (with the peer), other family ${foreign.length}`,
   );
 }
 
