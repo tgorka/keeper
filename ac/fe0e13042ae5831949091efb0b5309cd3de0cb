@@ -1,0 +1,42 @@
+_bmad-output/implementation-artifacts/sprint-status.yaml
+  s_3c79504dc3ed45::t_994ec314beb051 165
+docs/ios.md
+  s_3c79504dc3ed45::t_3589c0d61a2fec 280-286
+  s_3c79504dc3ed45::t_67559bee9f23a8 225,231-233
+  s_3c79504dc3ed45::t_3acc609076eb88 264-265
+  s_3c79504dc3ed45::t_bfc9f76db37c09 17-20
+  s_3c79504dc3ed45::t_4e916c01151065 211-215,217-218,221,226-230,234-263,266-279,287-293
+package.json
+  s_3c79504dc3ed45::t_98e0aa2ab01ad8 23
+scripts/verify-ios-ipa.ts
+  s_3c79504dc3ed45::t_f82e03aceba514 1-22,25-29,40-48,52,54-60,63-68,77-96,114,116-117,119-124,130-131,141-183,239-241,245,247-248,252-267,270,278,280-281,288-290,304,314-315,317,319-323,326,334-339,353-376
+  s_3c79504dc3ed45::t_a60470c6127a69 36,135-139,275-277
+  s_3c79504dc3ed45::t_e5140a904ad7f7 23-24,30-35,37-39,49-51,53,61-62,69-76,97-113,115,118,125-129,132-134,140,184-238,242-244,246,249-251,268-269,271-274,279,282-287,291-303,305-313,316,318,324-325,327-333,340-352
+scripts/verify-ios-ipa.test.ts
+  s_3c79504dc3ed45::t_1e4b69e8d1a6ed 1-81
+_bmad-output/implementation-artifacts/spec-15-3-shareable-ipa-build-path-unsigned-export-for-re-signing.md
+  s_3c79504dc3ed45::t_641e28153d21dc 1-4,8-73,77-113
+  s_3c79504dc3ed45::t_a8b71c0b1b62b9 7
+  s_3c79504dc3ed45::t_ada54b7e4a506b 114-162
+  s_3c79504dc3ed45::t_aaacab262309d3 76
+  s_3c79504dc3ed45::t_1a07a3199d9bce 74
+  s_3c79504dc3ed45::t_806062773cffed 5
+  s_3c79504dc3ed45::t_29b7ab53f0345b 6
+  s_3c79504dc3ed45::t_a64095e462f368 75
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "acfe0e13042ae5831949091efb0b5309cd3de0cb",
+  "prompts": {},
+  "sessions": {
+    "s_3c79504dc3ed45": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b48c36e1-48b5-456c-9814-ec7d4c5edf56",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": null
+    }
+  }
+}

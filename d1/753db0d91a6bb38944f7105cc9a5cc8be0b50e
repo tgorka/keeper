@@ -1,0 +1,58 @@
+tools/keeper-rec/Sources/keeper-rec/main.swift
+  s_8a8bc6b6bf6017::t_0ddeee55ec7fac 457-458,467
+src-tauri/crates/keeper-core/src/recording.rs
+  s_8a8bc6b6bf6017::t_350086a7e25e8c 2573,2619,2643,2673,2705,2770,2801,2836,2905,2940,3583
+  s_8a8bc6b6bf6017::t_d9be35c3596ce1 1456-1461
+  s_8a8bc6b6bf6017::t_705b5e7965b292 728-731,754-755,1195-1205,1462
+  s_8a8bc6b6bf6017::t_cd080500c5b55a 1086-1088,1477-1480,1756-1758,1804
+src/lib/ipc/gen/RecordingTargetVm.ts
+  s_8a8bc6b6bf6017::t_116de8f671047f 26
+src/components/layout/recording-pane.tsx
+  s_8a8bc6b6bf6017::t_ae0dee58d66ff2 151-152
+  s_8a8bc6b6bf6017::t_3e39a35c8a055f 146-150,153-154,157-170,189
+  s_8a8bc6b6bf6017::t_42a61495690a82 49,51-52
+src/lib/stores/recording-source.ts
+  s_8a8bc6b6bf6017::t_3e39a35c8a055f 53-54,71-72
+  s_8a8bc6b6bf6017::t_6e73a599a5a95a 73-74
+tools/keeper-rec/Sources/keeper-rec/Capture.swift
+  s_8a8bc6b6bf6017::t_d7e3fccffbe8c4 536-541,741-746
+  s_8a8bc6b6bf6017::t_9303a9e445c637 290-293,314,318
+  s_8a8bc6b6bf6017::t_59a434e0a4ce63 614-735
+  s_8a8bc6b6bf6017::t_0ddeee55ec7fac 580-585,886-916,919
+  s_8a8bc6b6bf6017::t_fc8bae62d88cf7 752-763
+  s_8a8bc6b6bf6017::t_93d62218780479 1263-1264,1466,1733
+  s_8a8bc6b6bf6017::t_ffa4bb005cd51f 1889-1896
+  s_8a8bc6b6bf6017::t_b911b69b7d3610 323-333
+  s_8a8bc6b6bf6017::t_411f88a4f92904 91-92,103,1337,1548,1555,1577
+  s_8a8bc6b6bf6017::t_b0db8f41a3fb8e 1741,1796-1797
+src/components/recording/recording-source-picker.tsx
+  s_8a8bc6b6bf6017::t_d521c95a66f22c 22,42-43,45-53,82-84,179-181,206-221,223
+  s_8a8bc6b6bf6017::t_906852d020088f 44
+src/components/recording/recording-source-picker.test.tsx
+  s_8a8bc6b6bf6017::t_906852d020088f 117-120
+src-tauri/crates/keeper/src/ipc.rs
+  s_8a8bc6b6bf6017::t_d9be35c3596ce1 4268-4272
+  s_8a8bc6b6bf6017::t_e8fbdbc8a1d767 3992,3998,4001,4003-4006
+  s_8a8bc6b6bf6017::t_3ed7aee5818ae6 4096-4097,4265-4267,4294
+  s_8a8bc6b6bf6017::t_7ab4b433f8de1a 5898,5917,5926
+src-tauri/crates/keeper-core/src/vm.rs
+  s_8a8bc6b6bf6017::t_cd080500c5b55a 2666-2668
+_bmad-output/implementation-artifacts/sprint-status.yaml
+  s_8a8bc6b6bf6017::t_1e3723d1762f83 209
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.15",
+  "base_commit_sha": "d1753db0d91a6bb38944f7105cc9a5cc8be0b50e",
+  "prompts": {},
+  "sessions": {
+    "s_8a8bc6b6bf6017": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c19d356a-2c90-4eff-82aa-ba9853588b43",
+        "model": "claude-fable-5"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

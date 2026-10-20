@@ -1,0 +1,23 @@
+src/components/notes/physical-tree.tsx
+  s_9bfe0bf28c8205::t_52604269b7debb 198
+src/components/notes/rail-fold.test.tsx
+  s_9bfe0bf28c8205::t_4b09f5099a91f4 83-105
+src/components/notes/tag-tree.tsx
+  s_9bfe0bf28c8205::t_9dace25ab7f625 222-233
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "f67dc6aeb3ab732f928a3c11b0235629b16b7845",
+  "prompts": {},
+  "sessions": {
+    "s_9bfe0bf28c8205": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a6a8d43-9ddd-4b65-b1f4-97581e5db3f3",
+        "model": "claude-opus-5"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

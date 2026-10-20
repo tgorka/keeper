@@ -1,0 +1,33 @@
+src-tauri/crates/keeper-sync/src/openfiles.rs
+  s_9bfe0bf28c8205::t_43a5950d2d7e75 1-141
+src-tauri/Cargo.lock
+  s_9bfe0bf28c8205::t_8d1d9d7a7d621d 4267,6261-6269
+src-tauri/crates/keeper-sync/Cargo.toml
+  s_9bfe0bf28c8205::t_7dde8224e4cab2 79-85
+src-tauri/crates/keeper-sync/src/engine.rs
+  s_9bfe0bf28c8205::t_0e9ca717bd6d8b 642-662,5179
+src-tauri/crates/keeper-sync/src/error.rs
+  s_9bfe0bf28c8205::t_0e0a78445306ad 186-196,245-246,289
+src-tauri/crates/keeper/src/sync_ipc.rs
+  s_9bfe0bf28c8205::t_80a588c0eb61d1 695-701
+src-tauri/crates/keeper-sync/src/lib.rs
+  s_9bfe0bf28c8205::t_3d7daa805795db 53
+src-tauri/crates/keeper-syncd/src/commands.rs
+  s_9bfe0bf28c8205::t_8a5680dcff9878 133-136
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "44ca616dd1721db6f9a9e82234e019f45faf9f98",
+  "prompts": {},
+  "sessions": {
+    "s_9bfe0bf28c8205": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a6a8d43-9ddd-4b65-b1f4-97581e5db3f3",
+        "model": "claude-opus-5"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

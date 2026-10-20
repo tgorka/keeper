@@ -1,0 +1,119 @@
+src/lib/stores/favorites-ui.test.ts
+  s_b80c21fe2d3e3e::t_2bb7750363d6bf 1-19
+src-tauri/crates/keeper-core/src/account.rs
+  s_b80c21fe2d3e3e::t_28830d157a8c70 304,306-309,319
+  s_b80c21fe2d3e3e::t_d8e832f672a88f 2810
+  s_b80c21fe2d3e3e::t_e5131f4d983704 2614-2616,2627
+  s_b80c21fe2d3e3e::t_a7fd8c36ddb228 1612-1657
+  s_b80c21fe2d3e3e::t_1b728e179ce74c 330
+src-tauri/crates/keeper/src/lib.rs
+  s_b80c21fe2d3e3e::t_47550277639bec 94-97
+src/lib/ipc/gen/RoomVm.ts
+  s_b80c21fe2d3e3e::t_6b4203ffcf610d 52-60
+src/lib/stores/favorites-rooms.ts
+  s_b80c21fe2d3e3e::t_5dc2454525eea5 1-62
+src/lib/stores/pins-rooms.test.ts
+  s_b80c21fe2d3e3e::t_49b69cf1d5802c 18
+_bmad-output/implementation-artifacts/sprint-status.yaml
+  s_b80c21fe2d3e3e::t_09dd8541032e8e 84
+src/hooks/use-sign-out.test.ts
+  s_b80c21fe2d3e3e::t_49b69cf1d5802c 40
+src/components/layout/chat-list-pane.tsx
+  s_b80c21fe2d3e3e::t_c06d92d056f3c4 97-102
+  s_b80c21fe2d3e3e::t_8f16273bf004e1 179-181
+  s_b80c21fe2d3e3e::t_9525bcb81797ae 44
+  s_b80c21fe2d3e3e::t_83efbc361d2d6b 73
+  s_b80c21fe2d3e3e::t_cffe862775aac0 125-131
+  s_b80c21fe2d3e3e::t_b7c33159061452 149-156
+  s_b80c21fe2d3e3e::t_f317c3f0af49fe 18,23,26
+_bmad-output/implementation-artifacts/deferred-work.md
+  s_b80c21fe2d3e3e::t_e27868405d6111 133-135
+src/components/layout/chat-list-pane.test.tsx
+  s_b80c21fe2d3e3e::t_5a51a3caf531e0 499-599
+  s_b80c21fe2d3e3e::t_f25c8de5e7f53f 14-15
+  s_b80c21fe2d3e3e::t_c0414225bd957c 87-88,92-94,104-105
+  s_b80c21fe2d3e3e::t_2545d61a5362e2 148
+  s_b80c21fe2d3e3e::t_13c2033c398013 10-11,21-22,24-25,34-35,39-40
+  s_b80c21fe2d3e3e::t_49b69cf1d5802c 76
+src/components/layout/favorites-section.test.tsx
+  s_b80c21fe2d3e3e::t_972e856951e395 93
+  s_b80c21fe2d3e3e::t_bdb7f29ced2c6f 1-92,94-98
+src/lib/stores/rooms.test.ts
+  s_b80c21fe2d3e3e::t_49b69cf1d5802c 23
+src/lib/stores/favorites-ui.ts
+  s_b80c21fe2d3e3e::t_05397e8bcf7c10 1-33
+src-tauri/crates/keeper-core/src/inbox.rs
+  s_b80c21fe2d3e3e::t_58c269b803ce25 390
+  s_b80c21fe2d3e3e::t_6d3c04e5c5d149 711,787-791
+  s_b80c21fe2d3e3e::t_e0cf6a7e784f11 527-530,534-535,538,542,546,560-563,566
+  s_b80c21fe2d3e3e::t_aefe6e4fb09216 388-389,677-710,712-786,792-816
+  s_b80c21fe2d3e3e::t_7e0cf1ade86f63 441,447-448
+  s_b80c21fe2d3e3e::t_ae0f7df149ab84 57-61,63-64
+  s_b80c21fe2d3e3e::t_2225655d6b1df3 294-297
+  s_b80c21fe2d3e3e::t_a223b8e5c78a36 579,634,825,867,913,957
+  s_b80c21fe2d3e3e::t_f3dfae992b817c 370,383-387
+  s_b80c21fe2d3e3e::t_4d9ca1add26ae2 77-87,89-90,95,102
+  s_b80c21fe2d3e3e::t_ffc650f97532a4 159-162,164-173,179-180,201-206,215-220,231,233,236,238
+src/components/layout/favorites-section.tsx
+  s_b80c21fe2d3e3e::t_50ca84128f310a 1-84,86-131
+  s_b80c21fe2d3e3e::t_972e856951e395 85
+src/components/layout/pins-strip.test.tsx
+  s_b80c21fe2d3e3e::t_49b69cf1d5802c 32
+src-tauri/crates/keeper-core/src/vm.rs
+  s_b80c21fe2d3e3e::t_3754a9a8f5525f 1192
+  s_b80c21fe2d3e3e::t_2b96588a2dd4f7 944-952
+  s_b80c21fe2d3e3e::t_125601812d0349 1401
+  s_b80c21fe2d3e3e::t_deb8d9a374919c 347-352
+  s_b80c21fe2d3e3e::t_0d421676c83aba 1372
+src/components/chat/chat-row.tsx
+  s_b80c21fe2d3e3e::t_cdb4a3a6006ce3 29-34
+  s_b80c21fe2d3e3e::t_aa90c7319ec2a6 43,52,57,60
+  s_b80c21fe2d3e3e::t_2a79b13cacc8f1 220-229
+  s_b80c21fe2d3e3e::t_3494c4cd417ac4 134-138
+  s_b80c21fe2d3e3e::t_e67a6e1a82f948 122-133,139
+_bmad-output/implementation-artifacts/spec-4-4-favorites.md
+  s_b80c21fe2d3e3e::t_7604a5f695d98d 64-75
+  s_b80c21fe2d3e3e::t_f56079e48fac5d 123-149
+  s_b80c21fe2d3e3e::t_0f1f8f407c6d0e 5
+  s_b80c21fe2d3e3e::t_da1e528ce8b367 7
+  s_b80c21fe2d3e3e::t_78f7d4dbb17267 6
+  s_b80c21fe2d3e3e::t_56356ebb6f70d9 1-4,8-63,76-86,98-122
+  s_b80c21fe2d3e3e::t_8fee6642be77f6 87-97
+src/lib/stores/favorites-rooms.test.ts
+  s_b80c21fe2d3e3e::t_88b468297f0032 1-81
+src-tauri/crates/keeper/src/ipc.rs
+  s_b80c21fe2d3e3e::t_6d5cc42ef06bbe 1419-1427,1434,1439,1442-1448
+  s_b80c21fe2d3e3e::t_79e24f478f224d 1156-1227
+src/lib/stores/archive-rooms.test.ts
+  s_b80c21fe2d3e3e::t_49b69cf1d5802c 18
+src/components/chat/chat-row.test.tsx
+  s_b80c21fe2d3e3e::t_2a78a3f3e3fd3a 40
+  s_b80c21fe2d3e3e::t_49b69cf1d5802c 54
+  s_b80c21fe2d3e3e::t_970ff533b6f668 2,4-5,20-21,27,32,36-39
+  s_b80c21fe2d3e3e::t_972e856951e395 383
+  s_b80c21fe2d3e3e::t_4a053ba3169679 352-382,384-395
+  s_b80c21fe2d3e3e::t_f1029972cab136 59-64,67
+  s_b80c21fe2d3e3e::t_db6d7063bf36c9 396-407
+src/lib/ipc/client.ts
+  s_b80c21fe2d3e3e::t_37efa2a09a55dc 257-265,269,275,280,284-285,290-291
+  s_b80c21fe2d3e3e::t_12c50de393a984 771-817
+src/lib/ipc/gen/InboxRoomVm.ts
+  s_b80c21fe2d3e3e::t_21000e820ad441 62
+  s_b80c21fe2d3e3e::t_6b4203ffcf610d 63-72
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "951e172d341e05e471eab031291b75b61790206b",
+  "prompts": {},
+  "sessions": {
+    "s_b80c21fe2d3e3e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "db7e1a06-03d2-4778-90a1-f1e60bd47a84",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": null
+    }
+  }
+}

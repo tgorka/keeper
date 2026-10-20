@@ -1,0 +1,96 @@
+src-tauri/crates/keeper-core/src/error.rs
+  s_d049bc5db67ea3::t_f108777b7c40f4 278-281
+  s_d049bc5db67ea3::t_566f6265518ac8 204-246
+src-tauri/crates/keeper-core/src/account.rs
+  s_d049bc5db67ea3::t_29083eb1fb1088 863
+  s_d049bc5db67ea3::t_8f1ef4311f40b2 1029-1047
+  s_d049bc5db67ea3::t_3a2d0ca690bc2e 1301-1308
+  s_d049bc5db67ea3::t_f003c3f09668f3 769-772
+  s_d049bc5db67ea3::t_8427f9e0b8240b 762-768,773-862,864-876,878-906
+  s_d049bc5db67ea3::t_08159e63d7841b 41
+  s_d049bc5db67ea3::t_3dc75d3d83de82 40
+  s_d049bc5db67ea3::t_af3b47fcd734b8 877
+src/components/settings/key-backup-dialog.tsx
+  s_d049bc5db67ea3::t_46168d0d4345a3 70-72
+  s_d049bc5db67ea3::t_150f75efa2f4bb 23
+  s_d049bc5db67ea3::t_4bfbf3d9ef28d6 241-242,244
+  s_d049bc5db67ea3::t_10e99ca4324948 1-22,24-41,43-69,73-96,101,105,108-109,114-117,119-123,125-133,135-240,243,245-295,304-336
+  s_d049bc5db67ea3::t_98bfa94a0e6d7d 42
+  s_d049bc5db67ea3::t_62ae05a2a6597c 97-100,102-104,106-107,110-113,118,124,134
+  s_d049bc5db67ea3::t_b836669b66957a 296-303
+src/components/settings/settings-dialog.test.tsx
+  s_d049bc5db67ea3::t_78180820e53100 19
+  s_d049bc5db67ea3::t_2e28fc7e7a8db7 39,47
+  s_d049bc5db67ea3::t_6771c8effb2e74 100-145
+src/lib/ipc/client.ts
+  s_d049bc5db67ea3::t_46168d0d4345a3 477
+  s_d049bc5db67ea3::t_29d8211db65d59 39
+  s_d049bc5db67ea3::t_68b88799881cbf 13
+  s_d049bc5db67ea3::t_cddf60cd2fbb83 421-476,478-489
+src/lib/stores/key-backup.test.ts
+  s_d049bc5db67ea3::t_e94de6bc19e484 1-91
+src/lib/ipc/gen/BackupStatus.ts
+  s_d049bc5db67ea3::t_5706e125e3449a 1-16
+src/hooks/use-key-backup-statuses.ts
+  s_d049bc5db67ea3::t_a9183469b1be5d 1-74
+_bmad-output/implementation-artifacts/spec-3-3-key-backup-enable-and-restore.md
+  s_d049bc5db67ea3::t_866bf5b6a97602 82-97
+  s_d049bc5db67ea3::t_8ce0cabc4eb44d 109-119
+  s_d049bc5db67ea3::t_96bea809944e18 144-168
+  s_d049bc5db67ea3::t_c121b6fe0f46f4 5
+  s_d049bc5db67ea3::t_590ea324dec1a8 9
+  s_d049bc5db67ea3::t_d646d17ee17cb2 8
+  s_d049bc5db67ea3::t_c202bc27019039 1-4,6-7,10-81,98-108,120-143
+src/lib/ipc/gen/IpcErrorCode.ts
+  s_d049bc5db67ea3::t_5706e125e3449a 9
+src/components/layout/app-shell.tsx
+  s_d049bc5db67ea3::t_80cc245a97cff5 29-31
+  s_d049bc5db67ea3::t_65d3d67786711b 77
+  s_d049bc5db67ea3::t_f0952ba6f176b3 8,13
+src/hooks/use-key-backup-statuses.test.ts
+  s_d049bc5db67ea3::t_14b7bb2502b982 1-129
+src-tauri/crates/keeper/src/lib.rs
+  s_d049bc5db67ea3::t_aa6774a51183fd 63-68
+src-tauri/crates/keeper-core/src/vm.rs
+  s_d049bc5db67ea3::t_523c1e62041eaa 987-999,1002-1004,1007-1044
+  s_d049bc5db67ea3::t_cf427f7f311b68 1000-1001,1005-1006
+  s_d049bc5db67ea3::t_270cb91323e18f 90-136
+src/components/settings/settings-dialog.tsx
+  s_d049bc5db67ea3::t_1c03b76e6820e9 20
+  s_d049bc5db67ea3::t_bc11bec674af5d 142-188,191-201,206,208,212
+src-tauri/crates/keeper-core/src/backup.rs
+  s_d049bc5db67ea3::t_97b762dedf98fd 1-129,131-197
+  s_d049bc5db67ea3::t_cf427f7f311b68 130
+src/lib/stores/key-backup.ts
+  s_d049bc5db67ea3::t_211b52f8607c04 1-152
+src-tauri/crates/keeper/src/ipc.rs
+  s_d049bc5db67ea3::t_1b191427a31914 700-811
+  s_d049bc5db67ea3::t_36b8352a0d5a59 1090-1120,1124-1133
+  s_d049bc5db67ea3::t_99ec26bf7d9534 18-19,24-25
+  s_d049bc5db67ea3::t_cf427f7f311b68 213,1121-1123
+  s_d049bc5db67ea3::t_c2a9d52ebc1147 201-212,214
+_bmad-output/implementation-artifacts/deferred-work.md
+  s_d049bc5db67ea3::t_584736ee1e81fe 79-82
+src/components/settings/key-backup-dialog.test.tsx
+  s_d049bc5db67ea3::t_aed0bb4a433742 1-147
+src-tauri/crates/keeper-core/src/lib.rs
+  s_d049bc5db67ea3::t_0754d8cf855f65 14
+_bmad-output/implementation-artifacts/sprint-status.yaml
+  s_d049bc5db67ea3::t_6cd9dc15935b67 72
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "267516c555832290ea277a3614b6b9e2de98be05",
+  "prompts": {},
+  "sessions": {
+    "s_d049bc5db67ea3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "485c74b0-21a5-4002-9a9c-7488b9114faa",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

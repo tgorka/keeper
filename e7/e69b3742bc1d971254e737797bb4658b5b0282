@@ -1,0 +1,78 @@
+src/components/layout/phone-header.tsx
+  s_67cb82a5ecd878::t_bc255a9c6e3063 59-63
+src/components/layout/conversation-pane.tsx
+  s_67cb82a5ecd878::t_a79042d36a24b6 875-879
+  s_67cb82a5ecd878::t_7f141857e64173 1630-1641
+  s_67cb82a5ecd878::t_2dda5d818620c5 864-874,880-902
+  s_67cb82a5ecd878::t_a6adadc248f860 47
+  s_67cb82a5ecd878::t_a4fd97347df397 1532-1539
+  s_67cb82a5ecd878::t_888b34978ecf0e 483-486
+src/components/layout/phone-search-surface.tsx
+  s_67cb82a5ecd878::t_4532b6751d2c7d 192-194
+src/components/layout/phone-inbox-header.tsx
+  s_67cb82a5ecd878::t_138eb958a663cc 59-62
+_bmad-output/implementation-artifacts/sprint-status.yaml
+  s_67cb82a5ecd878::t_7c56935188fbe2 149
+_bmad-output/implementation-artifacts/spec-13-5-safe-areas-and-the-keyboard-avoiding-composer.md
+  s_67cb82a5ecd878::t_b26dc98ccaa1ab 1-4,6-7,10-79,89-114
+  s_67cb82a5ecd878::t_d5816a809ac227 8
+  s_67cb82a5ecd878::t_6a4a32b3571295 80-88
+  s_67cb82a5ecd878::t_bd9ce9ad1c9e81 5,9
+  s_67cb82a5ecd878::t_e9140080fabf4a 115-166
+src/components/chat/composer.tsx
+  s_67cb82a5ecd878::t_ef2f7d7f414802 752-757
+  s_67cb82a5ecd878::t_cf1085fa3ec89c 846-848,850
+  s_67cb82a5ecd878::t_bf5e12ed1fe47a 894-897,899-900
+  s_67cb82a5ecd878::t_227bb65bef5189 910-913
+  s_67cb82a5ecd878::t_5be00974afe004 170-175
+  s_67cb82a5ecd878::t_a5e0bede443254 36
+  s_67cb82a5ecd878::t_44b9548b0355b8 25
+src/hooks/use-keyboard-inset.ts
+  s_67cb82a5ecd878::t_e35adf1926a3b7 37-43,54-57,62
+  s_67cb82a5ecd878::t_864c9bde3d1e89 1-36,44-53,58-61,63-66
+src/components/layout/phone-shell.test.tsx
+  s_67cb82a5ecd878::t_b3408ac0270a88 905-911
+  s_67cb82a5ecd878::t_ca650a917211d6 650-653
+  s_67cb82a5ecd878::t_b653f19d0f42f1 838-904,912-913
+src/components/layout/phone-inbox-header.test.tsx
+  s_67cb82a5ecd878::t_0246499a25a227 65-73
+src/index.css
+  s_67cb82a5ecd878::t_8474b17e63654d 96-106
+src/components/layout/conversation-pane.test.tsx
+  s_67cb82a5ecd878::t_ae50d336b68d61 1828-1896,1902-1903
+  s_67cb82a5ecd878::t_df91ea3f20f276 1897-1901
+_bmad-output/implementation-artifacts/deferred-work.md
+  s_67cb82a5ecd878::t_cb9b3a577bff62 830-833
+src/components/layout/phone-shell.tsx
+  s_67cb82a5ecd878::t_138de2393407a7 219-224
+  s_67cb82a5ecd878::t_f90e5ef1f6a904 526
+  s_67cb82a5ecd878::t_024f9526447514 50,52
+  s_67cb82a5ecd878::t_8ca41d8108409e 538
+src/components/chat/composer.test.tsx
+  s_67cb82a5ecd878::t_df02a5cce0796c 866-976
+src/components/layout/phone-header.test.tsx
+  s_67cb82a5ecd878::t_fa7a5ac01d8652 170-179
+src/hooks/use-keyboard-inset.test.ts
+  s_67cb82a5ecd878::t_e02a5164082480 1-2
+  s_67cb82a5ecd878::t_69ab35366e6e76 102-137
+  s_67cb82a5ecd878::t_46c8050828afb1 3-12,14-101,138-175
+  s_67cb82a5ecd878::t_3271a08e72106c 13
+index.html
+  s_67cb82a5ecd878::t_94f18b746e21a3 6-13
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "e7e69b3742bc1d971254e737797bb4658b5b0282",
+  "prompts": {},
+  "sessions": {
+    "s_67cb82a5ecd878": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "217be397-dead-4bc3-8c0b-d1f4dc90e826",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

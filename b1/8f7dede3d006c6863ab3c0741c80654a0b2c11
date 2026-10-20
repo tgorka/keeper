@@ -1,0 +1,33 @@
+src-tauri/crates/keeper-sync/src/footprint.rs
+  s_9bfe0bf28c8205::t_0b42bbc79b5e01 1-140
+src-tauri/crates/keeper-sync/src/lib.rs
+  s_9bfe0bf28c8205::t_620061bcf95163 50
+src-tauri/crates/keeper/src/lib.rs
+  s_9bfe0bf28c8205::t_917246192c756b 912
+src-tauri/crates/keeper/src/sync_ipc.rs
+  s_9bfe0bf28c8205::t_1162b72d79a850 214-293
+src/components/layout/sync-pane.test.tsx
+  s_9bfe0bf28c8205::t_135ab3becbd890 5-17,83,401-426
+src/components/layout/sync-pane.tsx
+  s_9bfe0bf28c8205::t_18775b16af4c53 121,129,263-335,1127
+src/lib/ipc/client.ts
+  s_9bfe0bf28c8205::t_c496cd49c84a21 245,390,3132-3151
+src/lib/ipc/gen/SyncFootprintVm.ts
+  s_9bfe0bf28c8205::t_49bbb96f26cb76 1-43
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "b18f7dede3d006c6863ab3c0741c80654a0b2c11",
+  "prompts": {},
+  "sessions": {
+    "s_9bfe0bf28c8205": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a6a8d43-9ddd-4b65-b1f4-97581e5db3f3",
+        "model": "claude-opus-5"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

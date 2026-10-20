@@ -1,0 +1,36 @@
+_bmad-output/implementation-artifacts/spec-6-7-bbctl-integration-for-beeper-self-hosted-bridges.md
+  s_9439d87b890278::t_f900bb14f73763 137-146
+  s_aaffbdf3cfba6a::t_80fb182749c7f1 6
+  s_9439d87b890278::t_2226510aca6db3 209-216
+  s_9439d87b890278::t_4c141caf380d27 7
+src-tauri/crates/keeper/src/ipc.rs
+  s_9439d87b890278::t_89fb03861133cd 63-65
+  s_9439d87b890278::t_0612b3f0773c71 69-78,87-89,93,98-118,120-124,127-128,134-142,148-151,154
+  s_9439d87b890278::t_b9acef0160256e 818-828,830-833
+_bmad-output/implementation-artifacts/sprint-status.yaml
+  s_aaffbdf3cfba6a::t_a61365ec738df0 104
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "289e9183935f7733e1484062929d6edfa87592ce",
+  "prompts": {},
+  "sessions": {
+    "s_9439d87b890278": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2c44ed97-5ac5-4815-a85b-7eeb681d5bf4",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    },
+    "s_aaffbdf3cfba6a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ff0a041d-6a4f-4df3-8f01-582e80bd7186",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

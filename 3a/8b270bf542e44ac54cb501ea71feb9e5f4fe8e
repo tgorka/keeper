@@ -1,0 +1,62 @@
+src/components/auth/login-screen.test.tsx
+  s_1c5c060dfbae61::t_e8ffd7927180ac 331,345-369
+_bmad-output/implementation-artifacts/spec-2-4-beeper-coverage-disclosure.md
+  s_1c5c060dfbae61::t_7c1af675d5958c 75
+  s_1c5c060dfbae61::t_d5f96e9d7af7fe 66-70
+  s_1c5c060dfbae61::t_f04c95820ce716 13
+  s_1c5c060dfbae61::t_53f6fc2b040044 5
+  s_1c5c060dfbae61::t_dd347c3053bd48 120-140
+  s_1c5c060dfbae61::t_a57f10956d12f7 6
+  s_1c5c060dfbae61::t_892c3bfe8cd2c9 7
+  s_1c5c060dfbae61::t_bbdef95ceef71f 1-4,8-12,14-65,71-74,76-100
+  s_1c5c060dfbae61::t_8b69f1783ee680 101-119
+src/components/layout/account-footer.test.tsx
+  s_1c5c060dfbae61::t_d28e52f7cf9e38 24-31
+  s_1c5c060dfbae61::t_efe2783f6dd7c7 110-130
+src/lib/beeper.ts
+  s_1c5c060dfbae61::t_cd04b90ca30b68 27-28
+  s_1c5c060dfbae61::t_0a6d01fad9b9e4 1-7,14-26,29-33
+  s_1c5c060dfbae61::t_9e20375fdb3aa3 8-13
+src/lib/beeper.test.ts
+  s_1c5c060dfbae61::t_48ef2ea2b22e47 1-22,27-46
+  s_1c5c060dfbae61::t_78aada93378131 23-26
+src/components/auth/login-screen.tsx
+  s_1c5c060dfbae61::t_636803cb14766b 343-347
+  s_1c5c060dfbae61::t_45d6eabe9cb944 462-470,475-484
+  s_1c5c060dfbae61::t_9e4a9906904a7b 417-419
+  s_1c5c060dfbae61::t_1562783a0954f0 2
+  s_1c5c060dfbae61::t_a75f2305296a31 471-474
+  s_1c5c060dfbae61::t_173180695d9cf2 360-362
+_bmad-output/implementation-artifacts/sprint-status.yaml
+  s_1c5c060dfbae61::t_12cb1dd5bd92e5 65
+src/components/auth/beeper-coverage-disclosure.tsx
+  s_1c5c060dfbae61::t_cd3bf296efef64 1-51
+src/components/layout/account-footer.tsx
+  s_1c5c060dfbae61::t_4f98c57fac1b50 130-147,153
+  s_1c5c060dfbae61::t_dd24edb4ee0df7 112
+  s_1c5c060dfbae61::t_8aa93de0aa393e 46-90,92-105
+  s_1c5c060dfbae61::t_8840edddf06c16 19,21
+  s_1c5c060dfbae61::t_53513dfd76e062 34
+  s_1c5c060dfbae61::t_ddae33d72cb665 91
+_bmad-output/implementation-artifacts/deferred-work.md
+  s_1c5c060dfbae61::t_516a46a89748dd 32-34
+src/components/auth/beeper-coverage-disclosure.test.tsx
+  s_1c5c060dfbae61::t_e4c365de335fa6 5,7,12-18
+  s_1c5c060dfbae61::t_a30bf7bd7ca0ab 1-4,6,8-11,19-39
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "3a8b270bf542e44ac54cb501ea71feb9e5f4fe8e",
+  "prompts": {},
+  "sessions": {
+    "s_1c5c060dfbae61": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "98c2bc28-17c6-4ba9-92b0-61eefefbf44b",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": null
+    }
+  }
+}

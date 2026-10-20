@@ -1,0 +1,27 @@
+_bmad-output/implementation-artifacts/spec-12-5-ios-compile-check-in-ci.md
+  s_93e59991ef26f4::t_9ac3e3ad7d0cd2 49
+  s_93e59991ef26f4::t_b8e7f537d85bc9 59-73
+  s_93e59991ef26f4::t_bf3dfbe33285b1 110-128
+  s_93e59991ef26f4::t_e77d0b1ead1d2c 1-4,6-9,12-48,50-58,74-109
+  s_93e59991ef26f4::t_0473b99872d336 5
+  s_93e59991ef26f4::t_92a74d7e2dc064 11
+  s_93e59991ef26f4::t_aa3d9c6ca1c6e1 10
+.github/workflows/ci.yml
+  s_93e59991ef26f4::t_ec530daf9b0685 47-62
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "c7b2c9c29673c4cd4b764526892433769a31ae13",
+  "prompts": {},
+  "sessions": {
+    "s_93e59991ef26f4": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5342de62-9fd5-481b-a5c5-5ca6c4427bf7",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": null
+    }
+  }
+}

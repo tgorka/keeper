@@ -1,0 +1,34 @@
+_bmad-output/implementation-artifacts/spec-7-1-persistent-per-chat-drafts.md
+  s_7e81911b2ecdc6::t_3c89fb2268c30a 171-174
+  s_9f9cfd011f23ca::t_f62324f45c95ad 9
+  s_7e81911b2ecdc6::t_5d46723e4ce17b 111-121
+  s_7e81911b2ecdc6::t_b6b79acdeb230c 5,7
+_bmad-output/implementation-artifacts/deferred-work.md
+  s_7e81911b2ecdc6::t_ae8ac4c7aa59e0 260-275
+src/components/chat/composer.tsx
+  s_7e81911b2ecdc6::t_f3cb81651e27be 432-434,437
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "151362cce0a6bf21c7834092d75ca0acfa93dec7",
+  "prompts": {},
+  "sessions": {
+    "s_7e81911b2ecdc6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "17be60fa-c3d6-4912-9a58-f232fd473fb1",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    },
+    "s_9f9cfd011f23ca": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "da791745-7a84-46d0-aa28-4eda5ce473fe",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

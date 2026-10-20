@@ -1,0 +1,19 @@
+_bmad-output/implementation-artifacts/spec-16-2-recording-core-module-and-recorder-port.md
+  s_b447f058d0fe8f::t_e4b97b2f009cc8 5,7
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "cc2c71bddf201df374ad9e7fcb22d4fc45f607b3",
+  "prompts": {},
+  "sessions": {
+    "s_b447f058d0fe8f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "966088eb-677d-44e6-aef8-7ad455905652",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

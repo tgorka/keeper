@@ -1,0 +1,57 @@
+src/lib/stores/outbox.ts
+  s_c03eed27a93015::t_e7d91aade3568b 70-80,82-87
+  s_c03eed27a93015::t_b6f2ddfde000e1 17-18
+  s_c03eed27a93015::t_a9805d524b92d9 81
+  s_c03eed27a93015::t_357c44d47befac 69
+src/components/chat/undo-send-pill.tsx
+  s_c03eed27a93015::t_d2abc1a1c07a5e 22
+  s_c03eed27a93015::t_9cdb4736b1c725 52-56
+_bmad-output/implementation-artifacts/spec-8-4-post-dispatch-delete-for-everyone.md
+  s_c03eed27a93015::t_d313177343c028 1-4,6-8,12-62,67-91
+  s_c03eed27a93015::t_49df3e8eeee1cf 9
+  s_c03eed27a93015::t_d42743f7e88fd6 63-66
+  s_c03eed27a93015::t_69aec339398184 5
+  s_c03eed27a93015::t_c1dbf5ea367b64 92-134
+  s_c03eed27a93015::t_4831a7f9eb28c1 10
+  s_c03eed27a93015::t_fe1bd474943e53 11
+src/components/layout/conversation-pane.tsx
+  s_c03eed27a93015::t_263b85369a4457 1352-1357
+  s_c03eed27a93015::t_c1b09b6ee0d5ca 88
+  s_c03eed27a93015::t_be0e319f22054a 1510-1517,1519-1520,1522-1523,1528-1534,1536-1539,1545-1546,1548-1550
+  s_c03eed27a93015::t_3e18092a8eea91 1062,1067-1068,1071-1072,1082-1087,1089-1093,1096-1099,1108
+  s_c03eed27a93015::t_18fe40d006c741 1063-1066,1069-1070,1073-1081
+  s_c03eed27a93015::t_37b4773484f50a 1370
+  s_c03eed27a93015::t_d535ff3780f64a 1524-1527,1540-1544
+  s_c03eed27a93015::t_f382ae1dc68313 1518,1521,1535
+src/components/layout/conversation-pane.test.tsx
+  s_c03eed27a93015::t_3fccacd5992d78 1142-1195,1197-1217,1219-1251,1290-1291
+  s_c03eed27a93015::t_42265068f19e0d 1196,1218
+  s_c03eed27a93015::t_f18ad50eec86c9 105
+  s_c03eed27a93015::t_0e482d31d1f89c 1
+  s_c03eed27a93015::t_ea7d0c0409bf5a 79-80
+  s_c03eed27a93015::t_b544495542c876 1252-1289
+  s_c03eed27a93015::t_1d7703660e3fae 32
+  s_c03eed27a93015::t_bee0ffcb007931 196,198-200,212
+src/lib/stores/outbox.test.ts
+  s_c03eed27a93015::t_d9c789326e4b50 99-129
+  s_c03eed27a93015::t_d64ea06b99d632 2-7,9-13
+src-tauri/crates/keeper-core/tests/archive_durability.rs
+  s_c03eed27a93015::t_c7ebfff619c5bd 189-237,241-257
+  s_c03eed27a93015::t_898efa9b1d4d9f 238-240
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "275bb198d2e5097453082273dbb7fb1669aa1a7c",
+  "prompts": {},
+  "sessions": {
+    "s_c03eed27a93015": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a617d51-1632-4bb5-821d-14d6ebcd4aae",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": null
+    }
+  }
+}

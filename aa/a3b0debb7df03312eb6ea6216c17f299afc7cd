@@ -1,0 +1,58 @@
+src-tauri/crates/keeper/src/ipc.rs
+  s_a1f1475bde20b5::t_20b29625787a94 5428-5431
+  s_a1f1475bde20b5::t_7c61c6481c308f 5503-5513
+  s_a1f1475bde20b5::t_20242bee256796 5352
+  s_a1f1475bde20b5::t_1dce1647397c2f 30-33,5541-5545,5565-5569
+  s_a1f1475bde20b5::t_57daccc6838965 5546-5551
+  s_a1f1475bde20b5::t_45f3d437d5a279 29
+  s_a1f1475bde20b5::t_b12b393669606b 3482-3517,3521,3523,3526-3528
+  s_a1f1475bde20b5::t_be28f550d083b3 3518-3520,3522,3524-3525
+  s_a1f1475bde20b5::t_eaa299e0f4b99f 3617
+  s_a1f1475bde20b5::t_b1e061f7736767 146-151
+  s_a1f1475bde20b5::t_792c4ea6673aea 3893-3948,3957-3959
+  s_a1f1475bde20b5::t_1d1ea4d9010b42 5398-5427,5432-5502,5514-5540,5552-5564,5570-5597
+src-tauri/crates/keeper-core/src/error.rs
+  s_a1f1475bde20b5::t_073e58030f4ec8 527-529
+_bmad-output/implementation-artifacts/sprint-status.yaml
+  s_a1f1475bde20b5::t_a8e654821a625b 190
+src-tauri/crates/keeper-core/src/notify.rs
+  s_a1f1475bde20b5::t_61bdd01fdf18bf 495-516
+  s_a1f1475bde20b5::t_d43cdf3c9871a1 1456-1497
+_bmad-output/implementation-artifacts/spec-18-5-disk-space-guard-warn-and-graceful-stop-and-finalize.md
+  s_a1f1475bde20b5::t_3210ace8d51fb6 98-109
+  s_a1f1475bde20b5::t_bee436b5e7fcaa 6
+  s_a1f1475bde20b5::t_083d13ecebaee5 7
+  s_a1f1475bde20b5::t_aea1ee80f7f6d2 70
+  s_a1f1475bde20b5::t_60aaae13158beb 71
+  s_a1f1475bde20b5::t_330c5a5a5bc996 64
+  s_a1f1475bde20b5::t_25de492d32f19e 110-128
+  s_a1f1475bde20b5::t_c492fef573c6a8 5
+  s_a1f1475bde20b5::t_8fd2b23a946c16 1-4,8-63,65-68,72-82,84-97
+  s_a1f1475bde20b5::t_85db05c98a59f3 83
+  s_a1f1475bde20b5::t_840b2fd793b911 69
+_bmad-output/implementation-artifacts/deferred-work.md
+  s_a1f1475bde20b5::t_c9d748cd496f45 1053-1056
+src-tauri/crates/keeper-core/src/recording.rs
+  s_a1f1475bde20b5::t_fa45f5cc1d6365 439
+  s_a1f1475bde20b5::t_1dce1647397c2f 507-511,2464-2471,2474-2477,2479-2482,2484-2487,2489-2492,2533-2536,2561-2564
+  s_a1f1475bde20b5::t_5c67c85e8476cf 2445-2463,2472-2473,2478,2483,2488,2493-2532,2537-2560,2565-2577
+  s_a1f1475bde20b5::t_5567f1c1af671d 28
+  s_a1f1475bde20b5::t_5fce57c57cf8cb 425-429,432-438
+  s_a1f1475bde20b5::t_2f3078c91949d8 472-506,512-594
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "aaa3b0debb7df03312eb6ea6216c17f299afc7cd",
+  "prompts": {},
+  "sessions": {
+    "s_a1f1475bde20b5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d0c8b366-53a0-4fb0-984c-f2b99bcfb29e",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": null
+    }
+  }
+}

@@ -1,0 +1,81 @@
+src/lib/stores/recording-settings.ts
+  s_53f3107ebc4c42::t_f16847713a414c 85-87,89
+  s_53f3107ebc4c42::t_6a5ebd9938432b 109-112,116,121
+  s_53f3107ebc4c42::t_c82bac395e415f 1-66,74-84,88,90-108,113-115,117-120,122-137,139-140
+  s_53f3107ebc4c42::t_3c3b91567f7e9a 138
+  s_53f3107ebc4c42::t_fa2843f8e5f208 67-73
+_bmad-output/implementation-artifacts/sprint-status.yaml
+  s_53f3107ebc4c42::t_27dfcb198cdebd 183
+src/components/layout/recording-pane.tsx
+  s_53f3107ebc4c42::t_9f6803ec5b572f 148-169
+  s_53f3107ebc4c42::t_84ee5469935af0 25
+  s_53f3107ebc4c42::t_4d98b6ab508051 51-53
+src/lib/ipc/client.ts
+  s_53f3107ebc4c42::t_bf6764aed9e91e 145
+  s_53f3107ebc4c42::t_5205cf7599bb5b 91
+  s_53f3107ebc4c42::t_57b1090bbfe2b7 1711-1734
+src/components/layout/recording-pane.test.tsx
+  s_53f3107ebc4c42::t_0ae4dca3afb93c 109-118
+  s_53f3107ebc4c42::t_e55793f63f19cd 28-31
+  s_53f3107ebc4c42::t_ac63b15705fd99 11-14
+src/components/settings/recording-settings-controls.test.tsx
+  s_53f3107ebc4c42::t_a9d47d8687967a 1-145
+src/lib/ipc/gen/RecordingSettingsVm.ts
+  s_53f3107ebc4c42::t_e372f23a4ac52f 1-23
+src/components/settings/recording-settings-controls.tsx
+  s_53f3107ebc4c42::t_9207351569fd4c 110
+  s_53f3107ebc4c42::t_ec7def2a920868 132
+  s_53f3107ebc4c42::t_8cd3bbcf538fe0 59,66-70,73-75,78-84,88-92
+  s_53f3107ebc4c42::t_9ea9a4f6d6280b 23
+  s_53f3107ebc4c42::t_6b73aedbfe8654 1-22,24-58,60-65,71-72,76-77,85-87,93-109,111-131,133-144
+_bmad-output/implementation-artifacts/spec-17-5-segment-size-and-duration-cap-settings.md
+  s_53f3107ebc4c42::t_81a0fa42c2a020 5
+  s_53f3107ebc4c42::t_42c8e5bd2c27b3 7
+  s_53f3107ebc4c42::t_15d2438bdf5f8d 1-4,8-12,14-74,85-91,108-125
+  s_53f3107ebc4c42::t_21851ded7e318e 6
+  s_53f3107ebc4c42::t_a850c35bff7177 126-153
+  s_53f3107ebc4c42::t_eb2f4608839628 13
+  s_53f3107ebc4c42::t_abac65ee4c2cd8 92-107
+  s_53f3107ebc4c42::t_2f08a9bfbf1630 75-84
+src-tauri/crates/keeper/src/lib.rs
+  s_53f3107ebc4c42::t_fc48420bd8c359 322-324
+src-tauri/crates/keeper/src/ipc.rs
+  s_53f3107ebc4c42::t_efddf6345d55d5 3401-3407,3419-3421
+  s_53f3107ebc4c42::t_33460652b6e129 41-43,3408-3409
+  s_53f3107ebc4c42::t_533a2b69e957d5 3598-3635
+  s_53f3107ebc4c42::t_62bf684376d0b7 40
+src/components/settings/settings-dialog.tsx
+  s_53f3107ebc4c42::t_e136f56ac2b446 58
+  s_53f3107ebc4c42::t_d644453444fbb3 14
+  s_53f3107ebc4c42::t_9a8ad72bf7ac88 174
+  s_53f3107ebc4c42::t_1145d54e4d8219 984,987-993,995-1002,1007
+src/components/settings/settings-dialog.test.tsx
+  s_53f3107ebc4c42::t_396199bd159ab9 22-25
+src-tauri/crates/keeper-core/src/recording.rs
+  s_53f3107ebc4c42::t_4653694ed67276 379-384,387-393,398-399
+  s_53f3107ebc4c42::t_06e2f16ae11d8d 1838-1839
+  s_53f3107ebc4c42::t_d49750480f1d58 1502-1536
+src-tauri/crates/keeper-core/src/registry.rs
+  s_53f3107ebc4c42::t_06746b2a2ddf0e 1859-1937
+  s_53f3107ebc4c42::t_bc0b1f59d23e2c 757-844
+_bmad-output/implementation-artifacts/deferred-work.md
+  s_53f3107ebc4c42::t_d7e6b090ec3692 1020-1023
+src-tauri/crates/keeper-core/src/vm.rs
+  s_53f3107ebc4c42::t_cdb9b0589e3380 2732-2751
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "6209fe5f3596a611d42462dae26a509e51b67e4a",
+  "prompts": {},
+  "sessions": {
+    "s_53f3107ebc4c42": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1a835ad5-dc38-472b-a45a-f12cfb03874c",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": null
+    }
+  }
+}

@@ -1,0 +1,152 @@
+src/components/settings/settings-dialog.tsx
+  s_c53dc2389e12a9::t_f65e92b67ca11e 19
+  s_c53dc2389e12a9::t_f83f7abeb988b7 104
+  s_c53dc2389e12a9::t_9accfe6b6dc921 139-140
+  s_c53dc2389e12a9::t_bbe5f45cb3009e 17-18
+  s_c53dc2389e12a9::t_1981e073d09273 91
+  s_c53dc2389e12a9::t_ffa4dc8acddfc2 134-137,144-147
+  s_c53dc2389e12a9::t_53f2677ae1e6be 2
+  s_c53dc2389e12a9::t_2ca961d8aff13c 99-103,105-133,138,141-143,148-166
+src-tauri/crates/keeper-core/src/vm.rs
+  s_c53dc2389e12a9::t_fd1e5862b80e6d 550-571
+src-tauri/crates/keeper-core/tests/archive_durability.rs
+  s_c53dc2389e12a9::t_b41eba0ebd7aba 102-105,112-114,133-135,181-183,229-231
+  s_c53dc2389e12a9::t_2eb569030411b1 1-101,106-111,115-132,136-180,184-228,232-239
+src-tauri/crates/keeper-core/src/account.rs
+  s_c53dc2389e12a9::t_c07b25bdd784d5 3868-3873,3876-3887,3889-3906
+  s_c53dc2389e12a9::t_5251696f2de07b 174-178
+  s_c53dc2389e12a9::t_a1d507ed2ff39e 2272-2275,2277
+  s_c53dc2389e12a9::t_95106fd5a31d66 47
+  s_c53dc2389e12a9::t_0f97a60ac02e68 3764-3791,3796-3850,3852-3864,3866-3867,3949-3959
+  s_c53dc2389e12a9::t_442745802ade6f 1463-1468
+  s_c53dc2389e12a9::t_095ceab3716574 130
+  s_c53dc2389e12a9::t_6ce90f381bf616 2516-2524,2534-2535
+  s_c53dc2389e12a9::t_5948f5101be0c7 2549-2558,2565-2568,2570-2571
+  s_c53dc2389e12a9::t_af07b43b98461b 28-31
+  s_c53dc2389e12a9::t_11269c9e1bcfca 2384-2389
+  s_c53dc2389e12a9::t_b41eba0ebd7aba 2488,3792-3795
+  s_c53dc2389e12a9::t_491fd5c0c63545 2421
+  s_c53dc2389e12a9::t_9dd2a8646c985d 2461-2487,2489-2501
+  s_c53dc2389e12a9::t_6ef3de85de91d1 1428-1431
+  s_3af24685db5977::t_80d37c2ec5b017 3851,3865
+  s_c53dc2389e12a9::t_a614db39514059 63-65
+  s_c53dc2389e12a9::t_060af771407b2a 1419-1427,1432-1462,1469-1470
+  s_c53dc2389e12a9::t_b9cdedd5759134 3874-3875,3888
+  s_c53dc2389e12a9::t_7b99ed15ea99ea 2539-2545,2576-2577,2579-2580,2582-2601
+  s_c53dc2389e12a9::t_e4862fd89068fd 258-265,519-526,598-605,738-745,845-852,951-958,1101-1108
+  s_c53dc2389e12a9::t_0d0c5628287a28 276,537,616,756,863,969,1119
+  s_3af24685db5977::t_bee2b32d04c780 3907-3948
+  s_3af24685db5977::t_006cf142db11ee 2546-2548
+  s_3af24685db5977::t_530c0bfded1ef5 2559-2564,2569,2572-2575,2578,2581
+src-tauri/crates/keeper-core/src/archive/mod.rs
+  s_c53dc2389e12a9::t_7db474abec430a 145
+  s_c53dc2389e12a9::t_ba292580624a81 229
+  s_c53dc2389e12a9::t_5a622db2951c69 136,146,148-163,168-203
+  s_c53dc2389e12a9::t_99fc033dbd364f 204
+  s_c53dc2389e12a9::t_4c1f2880a6e854 32-38
+  s_c53dc2389e12a9::t_189825220efc2a 95-113,117-125
+  s_c53dc2389e12a9::t_067acc86cb7539 334,336-337,341
+  s_c53dc2389e12a9::t_092fedc10648e8 296-297
+  s_c53dc2389e12a9::t_14995bffb5f240 220
+  s_c53dc2389e12a9::t_52ca338736d592 114-116
+_bmad-output/implementation-artifacts/spec-5-2-durability-against-remote-rewrites-edit-history.md
+  s_c53dc2389e12a9::t_e9ad470ed1043a 1-4,8,10-77,89-95,129-152
+  s_3af24685db5977::t_c85a4bbc339efe 9
+  s_c53dc2389e12a9::t_51cdbda935944f 96-118
+  s_c53dc2389e12a9::t_d5bf490ba2d133 5
+  s_c53dc2389e12a9::t_e677df9b1ff264 153-176
+  s_3af24685db5977::t_a05b45ab12dc99 177-180
+  s_c53dc2389e12a9::t_1d9ca6ccbacea9 78-88
+  s_3af24685db5977::t_543f1951d7d120 119-128
+  s_c53dc2389e12a9::t_8b80bac66c6a24 7
+  s_3af24685db5977::t_a283a736f6e4d9 6
+src/lib/ipc/client.ts
+  s_c53dc2389e12a9::t_755a38754e2478 18
+  s_c53dc2389e12a9::t_b934416ef8bfbf 200-232
+  s_c53dc2389e12a9::t_e14e15f02214dd 54
+src-tauri/crates/keeper/src/ipc.rs
+  s_c53dc2389e12a9::t_9d56c973c236bb 24-27
+  s_c53dc2389e12a9::t_607c4b49da2507 464-506
+src/lib/ipc/gen/EditVersionVm.ts
+  s_c53dc2389e12a9::t_53aef3c74be551 1-26
+src/components/chat/edit-history-popover.test.tsx
+  s_c53dc2389e12a9::t_009296f63808e3 32,49,60
+  s_c53dc2389e12a9::t_ea881648efbef1 2-31,33-48,50-52,54-59,64-65
+  s_c53dc2389e12a9::t_5b241ae4084f4d 1
+  s_c53dc2389e12a9::t_14fbde870067a2 53,61-63
+src/components/settings/settings-dialog.test.tsx
+  s_c53dc2389e12a9::t_541fcf8d33e5b2 41-44
+  s_c53dc2389e12a9::t_f65e92b67ca11e 18
+  s_c53dc2389e12a9::t_f16cae97aee5e3 6-7
+  s_c53dc2389e12a9::t_7afafbbe812ccf 25-26
+  s_c53dc2389e12a9::t_3514f4a2a77882 154-179
+src-tauri/crates/keeper/src/lib.rs
+  s_c53dc2389e12a9::t_3cb393950bf4d3 58-60
+src/components/chat/edit-history-popover.tsx
+  s_c53dc2389e12a9::t_315bd6f0540e02 112
+  s_c53dc2389e12a9::t_9c30fb365fcf71 50-52,57-59,67-72
+  s_c53dc2389e12a9::t_e446c934451143 1-12,14-49,53-56,60-62,65-66,73-95,99-106,115,125-126,139
+  s_c53dc2389e12a9::t_bcfc5fbede1378 63-64
+  s_c53dc2389e12a9::t_fc21c091f732ac 13
+  s_c53dc2389e12a9::t_e7622336e4cedc 96-98,107-111,113-114,116-124,127-138
+src-tauri/crates/keeper-core/src/archive/ingest.rs
+  s_c53dc2389e12a9::t_a9ae441e9d39a4 163,274-284,286-309,313-315
+  s_c53dc2389e12a9::t_b41eba0ebd7aba 156-158,310-312
+  s_c53dc2389e12a9::t_f5abfe25f5dbc4 117
+  s_c53dc2389e12a9::t_0f593dbf78a81a 143-144,148-155,159-162
+  s_c53dc2389e12a9::t_d4defe8d787bb0 285
+  s_c53dc2389e12a9::t_3338ccd72d1355 17,23-37,42-52
+  s_c53dc2389e12a9::t_d2f5cf59567332 79-80,91-92
+  s_c53dc2389e12a9::t_04c8bc12c60d12 164
+  s_c53dc2389e12a9::t_c6695e20098bda 53-54
+src/components/chat/message-bubble.tsx
+  s_c53dc2389e12a9::t_f65e92b67ca11e 290-293
+  s_c53dc2389e12a9::t_1e960ad2502030 14
+  s_c53dc2389e12a9::t_694ed0209bed70 125-126
+  s_c53dc2389e12a9::t_e2fcde18c210f2 207-212
+  s_c53dc2389e12a9::t_5d6806ec5e9083 267-289,294-299
+  s_c53dc2389e12a9::t_aff80f721591da 30-40
+src-tauri/crates/keeper-core/src/archive/db.rs
+  s_c53dc2389e12a9::t_c27f9488c7d89f 226-228
+  s_c53dc2389e12a9::t_a088db57d1e4dc 64-66,72-84,88-112,116-120,122-124
+  s_c53dc2389e12a9::t_9d6642ed6803fe 239
+  s_c53dc2389e12a9::t_f4298a2099b5de 455
+  s_c53dc2389e12a9::t_1ccb66771c7d13 126
+  s_c53dc2389e12a9::t_af4a997209513b 161-170
+  s_c53dc2389e12a9::t_d2499444ae17c3 125,182,185,196-225,229-238,240-290
+  s_c53dc2389e12a9::t_fe9c7443b751bd 291
+  s_c53dc2389e12a9::t_b41eba0ebd7aba 113-115,121,378-386,388-396,398-406,418-420,429-437,441-444,472-474,484-489,524-526,535-538
+  s_c53dc2389e12a9::t_d0baf96690f1c0 345-377,387,397,407-417,421-428,438-440,445-454,456-471,475-483,490-523,527-534,539-545
+src-tauri/crates/keeper-core/tests/archive_ingestion.rs
+  s_c53dc2389e12a9::t_25178ef6e16b9d 39-40
+src/components/layout/conversation-pane.tsx
+  s_c53dc2389e12a9::t_b59b9fb672a1c0 983-984
+_bmad-output/implementation-artifacts/deferred-work.md
+  s_c53dc2389e12a9::t_6246b65e438b42 168-171
+_bmad-output/implementation-artifacts/sprint-status.yaml
+  s_c53dc2389e12a9::t_59a96b7eb0cd5c 90
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "2e7a56df133febde10f2253ba0634cc38f00d646",
+  "prompts": {},
+  "sessions": {
+    "s_3af24685db5977": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "32c47184-a095-469d-ad29-78ea4ec44611",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    },
+    "s_c53dc2389e12a9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "03311cb5-4a2b-4ac4-8dba-91d867e8f1a2",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

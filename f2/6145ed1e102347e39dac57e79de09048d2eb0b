@@ -1,0 +1,93 @@
+src-tauri/crates/keeper-core/src/recording.rs
+  s_12680333aa9231::t_dc60a89e88c175 4019-4028
+  s_12680333aa9231::t_4673b9d634aa37 1280-1302
+  s_12680333aa9231::t_014b56cb8ca19a 3993-4018,4029-4031
+src/lib/ipc/client.ts
+  s_12680333aa9231::t_2ea6179f459582 1846-1900
+_bmad-output/implementation-artifacts/sprint-status.yaml
+  s_12680333aa9231::t_8eea02bdd9dd0f 202
+src-tauri/crates/keeper-core/src/registry.rs
+  s_12680333aa9231::t_6c435dcee7a620 2277-2305
+  s_12680333aa9231::t_15c7f860a0e266 2306-2310,2313-2324
+  s_12680333aa9231::t_c6e4b057eb15b1 2311-2312
+  s_12680333aa9231::t_94840cb52973ac 522-537,551-567,571-574
+  s_12680333aa9231::t_bc4c315858ddfb 538-550
+  s_12680333aa9231::t_dc60a89e88c175 568-570
+src-tauri/crates/keeper/src/ipc.rs
+  s_12680333aa9231::t_2576cfa036ebcf 45
+  s_12680333aa9231::t_dc60a89e88c175 46-47,5496-5497,5573-5574
+  s_12680333aa9231::t_966fd105980ba4 4440-4495,4500,4512,4514-4515,4517-4553,4555-4560,4562-4586,4598-4615
+  s_12680333aa9231::t_882be60e83eafe 4554
+  s_12680333aa9231::t_e9ef87309d6c3a 4587-4590,4595-4597
+  s_12680333aa9231::t_c6e4b057eb15b1 4591-4594
+  s_12680333aa9231::t_2addc739fc0d51 4496-4499,4501-4511,4513,4516,4561
+  s_12680333aa9231::t_57e505eb58b3a2 5488-5495,5498-5572,5575-5580
+src/components/layout/recording-summary-card.test.tsx
+  s_12680333aa9231::t_7c9a2a33426bb1 1-10,12-89,121-135
+  s_12680333aa9231::t_5bd05669bd32f8 11
+  s_12680333aa9231::t_2ca279728434c3 90-120
+src-tauri/crates/keeper-core/src/vm.rs
+  s_12680333aa9231::t_d61ea1f7ceb23b 2831-2854
+src/hooks/use-recovered-sessions.ts
+  s_12680333aa9231::t_4616b7e42278df 1-78
+src/components/layout/recording-pane.tsx
+  s_12680333aa9231::t_ce1604e462c179 250-251
+  s_12680333aa9231::t_f2b272e4fc84bc 192-194
+  s_12680333aa9231::t_5819e581a57302 22
+  s_12680333aa9231::t_d95e73c299b998 240-249,252-256,260
+  s_12680333aa9231::t_e4f781d134e1c1 257-259,261-263
+  s_12680333aa9231::t_ffc53ee76f3a3f 264-274
+  s_12680333aa9231::t_788c61a80d16af 43,46
+  s_12680333aa9231::t_13e91fc1d6b283 117-137
+  s_12680333aa9231::t_35b3691b9c7ea0 23
+src/hooks/use-recorded-session-summary.ts
+  s_12680333aa9231::t_69875bc3d2e425 1-42,49-50,52-56,58-60,64-67
+  s_12680333aa9231::t_38099ca9b4de7e 43-48,51,57,61-63
+src/components/layout/recording-pane.test.tsx
+  s_12680333aa9231::t_f9dbf5c1a9257c 67-70
+  s_12680333aa9231::t_3de9f44c969508 226-227
+  s_12680333aa9231::t_bbcb52d231fff2 41-52
+  s_12680333aa9231::t_a4a41b371a91e1 625,633-634,636-637,661-672,674-700,702-703
+  s_12680333aa9231::t_abb2eab699256a 704
+  s_12680333aa9231::t_5bd05669bd32f8 638,673,701
+  s_12680333aa9231::t_fefb229cb90c47 111-112,116,118
+  s_12680333aa9231::t_9083a199c89788 198-203
+  s_12680333aa9231::t_420c540e7eac7c 107
+  s_12680333aa9231::t_fe10e63241cf77 134
+  s_12680333aa9231::t_c5a44d40852c11 204-213
+  s_12680333aa9231::t_ed5a0b7cae7f49 136-138
+  s_12680333aa9231::t_0d7bdb249475e1 643-660
+_bmad-output/implementation-artifacts/spec-20-3-completion-reveal-in-finder-and-startup-recovery-notice.md
+  s_12680333aa9231::t_5f7e0b6fc6426a 141-175
+  s_12680333aa9231::t_d20bf675e59d6d 6
+  s_12680333aa9231::t_433daab5d64a8b 78-86
+  s_12680333aa9231::t_54daf5fc33e7d0 95-113
+  s_12680333aa9231::t_bad61b1929c24f 5,7
+  s_12680333aa9231::t_f164ebd604649a 1-4,8-77,87-94,114-140
+src-tauri/crates/keeper/src/lib.rs
+  s_12680333aa9231::t_06aea998adb1a3 394-397
+src/components/layout/recording-summary-card.tsx
+  s_12680333aa9231::t_94e914fc2b8bc8 42-48
+  s_12680333aa9231::t_367c86d3fd5d7f 24
+  s_12680333aa9231::t_62dbd0399a1903 1-23,25-41,49-63,69,78-131
+  s_12680333aa9231::t_68c5bcd244aeef 64-68,70-77
+src/hooks/use-recovered-sessions.test.ts
+  s_12680333aa9231::t_a86c92a2ca89d1 1-68,70-84
+  s_12680333aa9231::t_5bd05669bd32f8 69
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "f26145ed1e102347e39dac57e79de09048d2eb0b",
+  "prompts": {},
+  "sessions": {
+    "s_12680333aa9231": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fbb53e54-db7b-4a41-b186-4b2c837152e2",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

@@ -1,0 +1,79 @@
+_bmad-output/implementation-artifacts/deferred-work.md
+  s_47dc0d6abb482e::t_b81fbda7ed07a6 152-167
+src-tauri/crates/keeper-core/src/archive/db.rs
+  s_47dc0d6abb482e::t_9aca777d49696c 45-49
+  s_47dc0d6abb482e::t_48243d32ebdbb6 1-18,22-23,31-44,50-199
+  s_47dc0d6abb482e::t_dc86cf500cad59 19-21,24-30
+_bmad-output/implementation-artifacts/spec-5-1-archive-ingestion-pipeline.md
+  s_47dc0d6abb482e::t_68fbd1b1bc87b5 7
+  s_47dc0d6abb482e::t_cce31e7fa9dd9e 13
+  s_47dc0d6abb482e::t_9d41def54c2e62 6
+  s_47dc0d6abb482e::t_ece167fad6f195 86,88-104
+  s_47dc0d6abb482e::t_74628e28f13eed 1-4,8-12,14-70,78-85,87,105-137
+  s_47dc0d6abb482e::t_6e805f206daa95 71-77
+  s_47dc0d6abb482e::t_3c8b26b5d0d24a 138-162
+  s_47dc0d6abb482e::t_2b229f92a4c8d3 5
+src-tauri/crates/keeper-core/src/archive/ingest.rs
+  s_47dc0d6abb482e::t_7af4962235ac2d 210-213,215-228
+  s_47dc0d6abb482e::t_b3af81cb366be3 1-209,214,229-231
+src-tauri/crates/keeper-core/tests/archive_ingestion.rs
+  s_47dc0d6abb482e::t_16822eaa77cc11 89,133
+  s_47dc0d6abb482e::t_79d13dec8d4071 88
+  s_47dc0d6abb482e::t_2b71b50ef8a622 42-48,53-54,58
+  s_47dc0d6abb482e::t_fd236ee7989124 1-41,49-50,52,55-57,59-62,64-87,90-125,127-132,134-150
+  s_47dc0d6abb482e::t_f525ddc8652c86 63,126
+  s_47dc0d6abb482e::t_31638f5000f15b 51
+src-tauri/crates/keeper-core/src/archive/mod.rs
+  s_47dc0d6abb482e::t_820c4852c84252 157
+  s_47dc0d6abb482e::t_2ce2e3179d939f 3-13
+  s_47dc0d6abb482e::t_5f3719f607258b 177-178,180
+  s_47dc0d6abb482e::t_f6ee8f5a28d496 163
+  s_47dc0d6abb482e::t_b06ba99ef7c085 170
+  s_47dc0d6abb482e::t_3644c7a6976ec5 1-2,14-156,158-162,164-169,171-176,179,181-225,227-256
+  s_47dc0d6abb482e::t_fa8a8213571d23 226
+_bmad-output/implementation-artifacts/epic-5-context.md
+  s_47dc0d6abb482e::t_a38cf14524dd7e 1-58
+src-tauri/crates/keeper-core/src/lib.rs
+  s_47dc0d6abb482e::t_6ed63a1bc1a0d8 13
+_bmad-output/implementation-artifacts/sprint-status.yaml
+  s_47dc0d6abb482e::t_590f71affd49c0 88-89
+src-tauri/crates/keeper-core/src/account.rs
+  s_47dc0d6abb482e::t_c1c9f4a5612db3 27-29,34
+  s_47dc0d6abb482e::t_bcc9f4e2c501bc 118-120,126
+  s_47dc0d6abb482e::t_ec99e07dc67d04 2224,2228
+  s_47dc0d6abb482e::t_bc671012174b39 2162-2165
+  s_47dc0d6abb482e::t_ab7baa5ca3b7a0 3494-3600,3602-3603,3606-3618
+  s_47dc0d6abb482e::t_464607732b8717 2264-2273
+  s_47dc0d6abb482e::t_25423318011f03 3188
+  s_47dc0d6abb482e::t_157b7d350a367a 2298-2440
+  s_47dc0d6abb482e::t_7210835062bbb7 164-169
+  s_47dc0d6abb482e::t_9c2f0cfa76cada 3601,3604-3605
+  s_47dc0d6abb482e::t_c6bbe85d481df7 196-202
+  s_47dc0d6abb482e::t_b60b497f34aaa5 249-250,503-504,575-576,708-709,808-809,907-908,1050-1051
+  s_47dc0d6abb482e::t_c85260309e3f65 44
+  s_47dc0d6abb482e::t_da705abb94824f 209-228
+  s_47dc0d6abb482e::t_0bff66bbcfa87e 260,514,586,719,819,918,1061
+src-tauri/crates/keeper/src/ipc.rs
+  s_47dc0d6abb482e::t_326f6a91b8f7b5 18-19
+  s_47dc0d6abb482e::t_70c0ab621f6235 55-60,62-66,68-69
+  s_47dc0d6abb482e::t_4319b803679f95 247-253
+src-tauri/crates/keeper-core/src/error.rs
+  s_47dc0d6abb482e::t_7c4aafb8c1631c 374-379
+  s_47dc0d6abb482e::t_bede4bd2a92a30 308-328
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "15c0170d6a25a6f3d33df430da3ed9f84737f5ca",
+  "prompts": {},
+  "sessions": {
+    "s_47dc0d6abb482e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0a4ef2f0-5b45-4353-8efa-fa6560538b7a",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

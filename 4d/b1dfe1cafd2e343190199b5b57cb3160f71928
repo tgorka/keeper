@@ -1,0 +1,25 @@
+.github/workflows/ci.yml
+  s_8a8bc6b6bf6017::t_4538a222cd80b3 61
+README.md
+  s_8a8bc6b6bf6017::t_484bb6e4039afe 41
+docs/credentials.md
+  s_8a8bc6b6bf6017::t_d9de0782ea3e6b 29
+package.json
+  s_8a8bc6b6bf6017::t_ecd7667704dec3 10-12
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "4db1dfe1cafd2e343190199b5b57cb3160f71928",
+  "prompts": {},
+  "sessions": {
+    "s_8a8bc6b6bf6017": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c19d356a-2c90-4eff-82aa-ba9853588b43",
+        "model": "claude-fable-5"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

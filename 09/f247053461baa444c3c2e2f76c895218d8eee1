@@ -1,0 +1,70 @@
+src/components/chat/media-attachment.tsx
+  s_6b4e28f5a9db1a::t_d9458d9611a193 21
+  s_6b4e28f5a9db1a::t_88b5f73f140aaf 90-94,96-105
+  s_6b4e28f5a9db1a::t_132ab4362deba8 141-145
+  s_6b4e28f5a9db1a::t_bc403d77f241d5 146-147,150,159,163-164
+  s_6b4e28f5a9db1a::t_969ec68eb20740 17
+  s_6b4e28f5a9db1a::t_a63028cc3ddf54 239-243
+  s_6b4e28f5a9db1a::t_6a1c0b545b1a33 89,95
+src/components/chat/media-attachment.test.tsx
+  s_6b4e28f5a9db1a::t_1487af33297b14 1-2,5-23
+  s_6b4e28f5a9db1a::t_728362a6a5b13e 145-146,148-149,153,156-216
+  s_6b4e28f5a9db1a::t_6b445e54322858 147,150-152,154-155
+src/hooks/use-app-lifecycle.ts
+  s_6b4e28f5a9db1a::t_cdce991223bc5e 68-71
+  s_6b4e28f5a9db1a::t_d393db3ec8456c 27-32,37
+_bmad-output/implementation-artifacts/spec-14-5-memory-hygiene-under-jetsam.md
+  s_6b4e28f5a9db1a::t_fd4ed0fffbb7f2 10
+  s_6b4e28f5a9db1a::t_66d2bb1ec8560c 63
+  s_6b4e28f5a9db1a::t_aa2175505838cf 103
+  s_6b4e28f5a9db1a::t_c6b0436051e35d 9
+  s_6b4e28f5a9db1a::t_18938979170a04 68-88
+  s_6b4e28f5a9db1a::t_08ecc38c59db97 54-60
+  s_6b4e28f5a9db1a::t_abc637e1ac60c3 105-107
+  s_6b4e28f5a9db1a::t_94c71665f90533 120-150
+  s_6b4e28f5a9db1a::t_9c1f760462f0b6 5,11
+  s_6b4e28f5a9db1a::t_5173516b8d1df4 6
+  s_6b4e28f5a9db1a::t_6c7dcd2612bc19 89-100
+  s_6b4e28f5a9db1a::t_f0c8cc517ce896 1-4,7-8,12-53,61-62,64-67,101-102,104,108-119
+src/components/chat/media-preview-overlay.tsx
+  s_6b4e28f5a9db1a::t_721594581ba813 77-84
+  s_6b4e28f5a9db1a::t_29d2ccdf33bdf0 22
+  s_6b4e28f5a9db1a::t_1645ccdd1d79fc 104-105
+src/lib/stores/lifecycle.test.ts
+  s_6b4e28f5a9db1a::t_335d3cb593ddca 1-43
+src/components/chat/media-preview-overlay.test.tsx
+  s_6b4e28f5a9db1a::t_cd022e407b06c6 1-2,5-23
+  s_6b4e28f5a9db1a::t_76938ed7284e53 100-149
+_bmad-output/implementation-artifacts/deferred-work.md
+  s_6b4e28f5a9db1a::t_70d6c8714e5ed1 872-880
+  s_6b4e28f5a9db1a::t_d69f15434fe828 881-884
+src/lib/stores/lifecycle.ts
+  s_6b4e28f5a9db1a::t_e20d2a09312fce 1-61
+src-tauri/crates/keeper/src/media_protocol.rs
+  s_6b4e28f5a9db1a::t_c8f41586f23405 462-466,468-471
+  s_6b4e28f5a9db1a::t_47a7a1da61d43e 419
+  s_6b4e28f5a9db1a::t_70f5acae1baf42 420,432-444,447-461,467,472-484
+  s_6b4e28f5a9db1a::t_0cef38810bfc53 445-446
+  s_6b4e28f5a9db1a::t_cdb4ed641acf53 421-431
+  s_6b4e28f5a9db1a::t_faa774adfee863 28-35
+src/hooks/use-app-lifecycle.test.ts
+  s_6b4e28f5a9db1a::t_9288e589ab05b0 48-50
+  s_6b4e28f5a9db1a::t_561a0737dd76ff 145-170
+  s_6b4e28f5a9db1a::t_7a65788070611e 5
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "09f247053461baa444c3c2e2f76c895218d8eee1",
+  "prompts": {},
+  "sessions": {
+    "s_6b4e28f5a9db1a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "159a33a0-adca-464c-a117-490e4ce821f0",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

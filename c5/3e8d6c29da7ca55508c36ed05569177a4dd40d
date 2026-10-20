@@ -1,0 +1,19 @@
+_bmad-output/implementation-artifacts/spec-14-4-resume-integrity-blank-webview-guard-and-stale-resume-pill.md
+  s_e6161dab3718bc::t_149eb1f3772d72 11
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "c53e8d6c29da7ca55508c36ed05569177a4dd40d",
+  "prompts": {},
+  "sessions": {
+    "s_e6161dab3718bc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a5d86a1d-669d-46ab-9e79-843f13ba4d73",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

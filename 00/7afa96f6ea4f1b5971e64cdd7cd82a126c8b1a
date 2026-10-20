@@ -1,0 +1,35 @@
+_bmad-output/implementation-artifacts/spec-10-4-click-through-and-bridge-health-alerts.md
+  s_8a8bc6b6bf6017::t_e1d0faaa83dfdb 34-35
+  s_8a8bc6b6bf6017::t_dd58ef12c60777 86-88
+  s_7ca0cbf6949026::t_fb1fed57d2c2f9 99-106
+  s_8a8bc6b6bf6017::t_6fb3c47be588f6 20
+  s_8a8bc6b6bf6017::t_802fdc04c79951 26-28
+  s_8a8bc6b6bf6017::t_c7cff89e304ad9 46-47,49
+  s_7ca0cbf6949026::t_d812f2e6646a83 5
+  s_8a8bc6b6bf6017::t_c547bdd5a5f4b7 39
+  s_8a8bc6b6bf6017::t_7d7d2034003b49 149,151-154
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "007afa96f6ea4f1b5971e64cdd7cd82a126c8b1a",
+  "prompts": {},
+  "sessions": {
+    "s_7ca0cbf6949026": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b951859-a587-4d89-ba6a-217cba76457c",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    },
+    "s_8a8bc6b6bf6017": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c19d356a-2c90-4eff-82aa-ba9853588b43",
+        "model": "claude-fable-5"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

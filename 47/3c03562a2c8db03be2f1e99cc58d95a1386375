@@ -1,0 +1,19 @@
+_bmad-output/implementation-artifacts/spec-6-4-bridge-bot-fallback-driver.md
+  s_8b153a56a7bcba::t_5375eef1523541 7
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "473c03562a2c8db03be2f1e99cc58d95a1386375",
+  "prompts": {},
+  "sessions": {
+    "s_8b153a56a7bcba": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1167e4bf-b8ce-4c39-96b2-1253d0b32dbb",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

@@ -1,0 +1,25 @@
+src/components/layout/files-pane.test.tsx
+  s_9bfe0bf28c8205::t_59c3fad64b800c 1607-1610,1616,1621-1635
+src/lib/viewers/icons.ts
+  s_9bfe0bf28c8205::t_d8119783278e9b 27,38,52-59
+src/lib/viewers/registry.ts
+  s_9bfe0bf28c8205::t_c2bb6df0910170 177-180,188,278-281,283-287
+src/lib/viewers/types.ts
+  s_9bfe0bf28c8205::t_d53dbd0ebb7ce3 147-148
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "d7edd57cb2abca65475492d9192fc28dc68979c2",
+  "prompts": {},
+  "sessions": {
+    "s_9bfe0bf28c8205": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a6a8d43-9ddd-4b65-b1f4-97581e5db3f3",
+        "model": "claude-opus-5"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

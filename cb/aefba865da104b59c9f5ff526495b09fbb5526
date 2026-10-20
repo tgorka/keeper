@@ -1,0 +1,34 @@
+_bmad-output/implementation-artifacts/spec-11-1-signed-notarized-release-pipeline.md
+  s_c2e74b28a44582::t_ccacc582be0d55 9
+  s_89931fe41b8512::t_83c475d7ecfcb0 7
+  s_89931fe41b8512::t_112b15c3146cb8 182-190
+  s_89931fe41b8512::t_62c12027613d83 91-100
+_bmad-output/implementation-artifacts/deferred-work.md
+  s_89931fe41b8512::t_ac6e14104ef868 389-392
+_bmad-output/implementation-artifacts/sprint-status.yaml
+  s_89931fe41b8512::t_cbcd7366f239e4 132
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "cbaefba865da104b59c9f5ff526495b09fbb5526",
+  "prompts": {},
+  "sessions": {
+    "s_89931fe41b8512": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "94fdda7a-ee4d-45a8-b52d-9ba7808c2ace",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    },
+    "s_c2e74b28a44582": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4480dc88-2218-49f2-888a-f0676d0879e2",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

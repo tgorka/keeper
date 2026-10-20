@@ -1,0 +1,64 @@
+src/components/layout/phone-shell.tsx
+  s_6c6c38f674d970::t_2465062942711d 656-682
+  s_6c6c38f674d970::t_647144653b478f 768
+  s_6c6c38f674d970::t_d9a7584140c573 58
+  s_6c6c38f674d970::t_edb7a969c4d948 536-538
+  s_6c6c38f674d970::t_02965175f2d837 471-474
+  s_6c6c38f674d970::t_a0a3e168c2aa68 612-616
+src/components/chat/message-bubble.test.tsx
+  s_6c6c38f674d970::t_05de398aa79a4c 251-321
+src-tauri/crates/keeper-core/src/account.rs
+  s_6c6c38f674d970::t_0152a5af7f40bc 6363,6372-6388,6391,6397-6399,6402-6403,6405-6407,6420-6421
+  s_6c6c38f674d970::t_3290eb9fe416cd 6392-6396
+  s_6c6c38f674d970::t_40012562d7ee62 434-437
+  s_6c6c38f674d970::t_c246dfac894213 374-382
+  s_6c6c38f674d970::t_1c16e6272bffed 6364-6371,6389-6390,6400-6401,6404,6408-6419
+_bmad-output/implementation-artifacts/sprint-status.yaml
+  s_6c6c38f674d970::t_1ce2cdd68f3216 159
+src/components/layout/conversation-pane.tsx
+  s_6c6c38f674d970::t_b0c6a275c6e91f 86
+  s_6c6c38f674d970::t_6fda74f8e210c0 1577
+  s_6c6c38f674d970::t_258d4252aa5544 501-505
+_bmad-output/implementation-artifacts/spec-14-6-flaky-network-resilience.md
+  s_6c6c38f674d970::t_06ae12b77c72a9 10
+  s_6c6c38f674d970::t_bdd05a8e570ea0 1-4,6-8,11-57,63-86
+  s_6c6c38f674d970::t_906d5464c4792d 60
+  s_6c6c38f674d970::t_1e793fecae2605 62
+  s_6c6c38f674d970::t_28604faf9fabf6 87-128
+  s_6c6c38f674d970::t_20c7e27a6853f4 58
+  s_6c6c38f674d970::t_8a6067bddb15c4 59
+  s_6c6c38f674d970::t_5926811abbacc6 61
+  s_6c6c38f674d970::t_9b0bb5e38e2bef 5
+  s_6c6c38f674d970::t_7c8c2ab0360f2a 9
+src/components/chat/message-bubble.tsx
+  s_6c6c38f674d970::t_304e28fbab032c 523
+  s_6c6c38f674d970::t_1e164022118dba 150
+  s_6c6c38f674d970::t_0ab551e23ebc7d 351
+  s_6c6c38f674d970::t_dbf02cb95fe6c2 490-494
+  s_6c6c38f674d970::t_2b838318e8c413 74-82,489
+  s_6c6c38f674d970::t_23b02f48ae9254 555-559
+  s_6c6c38f674d970::t_ba4508dea9a0c5 510-512
+_bmad-output/implementation-artifacts/deferred-work.md
+  s_6c6c38f674d970::t_cd3346a1369828 885-889,891-894
+  s_6c6c38f674d970::t_940b38497f2b4e 890
+src/components/layout/phone-shell.test.tsx
+  s_6c6c38f674d970::t_a14e36a0d62da1 212
+  s_6c6c38f674d970::t_4e6a206ab7ea16 7
+  s_6c6c38f674d970::t_1324bf76ed2c6d 1091-1204
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "596d17c3caa1c4fca308f33eec8cfa9939aa1d3f",
+  "prompts": {},
+  "sessions": {
+    "s_6c6c38f674d970": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6c069923-ed6a-4387-b127-1b1d085d7a05",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

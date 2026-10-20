@@ -1,0 +1,33 @@
+_bmad-output/implementation-artifacts/spec-2-2-oidc-login-mas-msc3861.md
+  s_065ab58d7fdf4b::t_19c91e78760c9c 9
+  s_065ab58d7fdf4b::t_a7a82d08267a09 211-218
+  s_065ab58d7fdf4b::t_4c075e15c4645b 163-172
+_bmad-output/implementation-artifacts/deferred-work.md
+  s_065ab58d7fdf4b::t_85f9d74cf242cb 26-28
+_bmad-output/implementation-artifacts/sprint-status.yaml
+  s_ee967f84a5c2a3::t_b4c11cec329e50 63
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "8d7e3a943904254a97d02a3842a501a52dc2bade",
+  "prompts": {},
+  "sessions": {
+    "s_065ab58d7fdf4b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e1b3796d-f582-4014-8eed-e0c18ea16fed",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    },
+    "s_ee967f84a5c2a3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5f68aeb6-d46c-4c0d-a391-f5cfff91fcc1",
+        "model": "unknown"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

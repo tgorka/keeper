@@ -1,0 +1,68 @@
+docs/account.md
+  s_ad239f42e5d28b::t_0d472506bd57e7 426-441
+src/components/auth/sign-in-link.tsx
+  s_ad239f42e5d28b::t_3a4468f8fbc8db 1-96,102
+  s_ad239f42e5d28b::t_cd14f501742102 97-101,103-104
+docs/observability.md
+  s_ad239f42e5d28b::t_506f799881b8d3 187
+src-tauri/crates/keeper-core/src/auth.rs
+  s_ad239f42e5d28b::t_de0f59dea3c0f9 36-39,168-181,184-207,221-232,603-607,609,629-651,1716-1922
+src-tauri/crates/keeper-core/src/error.rs
+  s_ad239f42e5d28b::t_ea338b02ac3c07 55-61
+src-tauri/crates/keeper-core/src/forges/tokens.rs
+  s_ad239f42e5d28b::t_b27f7ebad4ab95 39
+src-tauri/crates/keeper-core/src/oauth.rs
+  s_ad239f42e5d28b::t_260aca9e88c4f6 19,21,31,45-76,102-120,126-130,133-134,154,156-163,167-201,246,272,286,301,308,535-650
+src-tauri/crates/keeper-core/src/org_account/log_upload.rs
+  s_ad239f42e5d28b::t_5235b4ea6e9f40 151-152,155-156
+src-tauri/crates/keeper-core/src/org_account/mod.rs
+  s_ad239f42e5d28b::t_dbdb19ef3b3880 47-51,86
+src-tauri/crates/keeper-core/src/org_account/oidc.rs
+  s_ad239f42e5d28b::t_cb737098529b65 59-61,191-197,199,273,290,377-394,591-592,598,604-611,967-971,1129-1136,1978-1981,2328-2329,2394,2445-2447,2476-2478,2503,3503-3602
+src-tauri/crates/keeper-core/src/org_account/state.rs
+  s_ad239f42e5d28b::t_2da67b29210b83 273-275,304,323,614-619,650-654,675,869-874
+src-tauri/crates/keeper-core/src/vm.rs
+  s_ad239f42e5d28b::t_70b8518665172e 348-353,446-471
+src-tauri/crates/keeper/src/account_ipc.rs
+  s_ad239f42e5d28b::t_809a2508be3403 71,822,3621-3629
+src-tauri/crates/keeper/src/ipc.rs
+  s_ad239f42e5d28b::t_48e0acc0ffed70 67-68,1414-1416,2583-2592,16901-16911
+src-tauri/crates/keeper/src/lib.rs
+  s_ad239f42e5d28b::t_68df92a0e4e2bb 1154,1254
+src/components/account/account-setup-sheet.test.tsx
+  s_ad239f42e5d28b::t_204672ad6f0895 8-10,24,307-310
+src/components/account/account-setup-sheet.tsx
+  s_ad239f42e5d28b::t_340a4adb4fae79 36,53,414-419
+src/components/auth/login-screen.test.tsx
+  s_ad239f42e5d28b::t_52cf766577e8c6 16,24,75-76,282-323
+src/components/auth/login-screen.tsx
+  s_ad239f42e5d28b::t_a831e4c6d2690e 4,21,44-49,59-60,265-266,345,372,394,448
+src/components/auth/sign-in-link.test.tsx
+  s_ad239f42e5d28b::t_9d1ecedad87f02 1-99
+src/components/settings/account-section.test.tsx
+  s_ad239f42e5d28b::t_201fe4d590ce0f 8,23,41,345-372
+src/components/settings/account-section.tsx
+  s_ad239f42e5d28b::t_f99a84423a7d6f 43,66,366-367
+src/lib/ipc/client.ts
+  s_ad239f42e5d28b::t_8466536e0cdefd 47,751,1330-1339,9168-9176
+src/lib/ipc/gen/IpcErrorCode.ts
+  s_ad239f42e5d28b::t_35c5e31d871161 9
+src/lib/ipc/gen/SignInLinkVm.ts
+  s_ad239f42e5d28b::t_7e5ca257ec825c 1-20
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "da760dac26c28586c91442d298ec1d907a6f11ad",
+  "prompts": {},
+  "sessions": {
+    "s_ad239f42e5d28b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2fe35213-0e31-450e-ac39-b899a1a44ea3",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

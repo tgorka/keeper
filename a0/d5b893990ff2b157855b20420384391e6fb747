@@ -1,0 +1,91 @@
+src-tauri/crates/keeper-core/src/vm.rs
+  s_6790158f863f27::t_60720edb03788e 80-111
+src-tauri/crates/keeper/capabilities/desktop.json
+  s_6790158f863f27::t_d18e46138f5927 1-18
+src-tauri/crates/keeper/Cargo.toml
+  s_6790158f863f27::t_1f1aeaf22bd6de 40-54
+src-tauri/crates/keeper/src/lib.rs
+  s_6790158f863f27::t_0ade1c4dc492ad 339
+  s_6790158f863f27::t_26af5b2fffb776 8,12,14,17-19,24-29,32,37-51,63-64
+  s_6790158f863f27::t_de1d7eab27703e 93-100,106
+  s_6790158f863f27::t_a37bf85f280426 160
+  s_6790158f863f27::t_fb1cab63d4b33c 290-302,305-307
+  s_6790158f863f27::t_9e1d91b63a93f0 124
+src/lib/stores/capabilities.test.ts
+  s_6790158f863f27::t_1f2b9ec308ce42 1-47
+src/lib/ipc/gen/CapabilitiesVm.ts
+  s_6790158f863f27::t_6c258e0b4558f0 1-45
+src-tauri/crates/keeper/capabilities/default.json
+  s_6790158f863f27::t_12a562a0c33b83 4,11
+package.json
+  s_6790158f863f27::t_c41fbf4a4c6680 56
+src/hooks/use-capabilities-hydrate.ts
+  s_6790158f863f27::t_3aee8b20ab35bc 1-33
+src/lib/ipc/client.ts
+  s_6790158f863f27::t_4f0acb70770e1c 181-192
+  s_6790158f863f27::t_87d13d9c68370e 35
+  s_6790158f863f27::t_cbf575e413f732 115
+  s_6790158f863f27::t_c7343986c1165e 180
+src/App.tsx
+  s_6790158f863f27::t_00609027a062a0 7
+  s_6790158f863f27::t_3984e1127a3efc 18-21
+src/test/no-user-agent-gating.test.ts
+  s_6790158f863f27::t_8d1fa31866458a 1-97
+src-tauri/crates/keeper/src/ipc.rs
+  s_6790158f863f27::t_06916ca7645533 2970
+  s_6790158f863f27::t_174aa7655ba413 310
+  s_6790158f863f27::t_96c6a8b3178f46 1778,1788-1798
+  s_6790158f863f27::t_d043f14fab7633 1935,1943-1951
+  s_6790158f863f27::t_7c18c5378f4e39 1799,1952,2865,2876-2886,2891,2904-2914,2936,2969
+  s_6790158f863f27::t_1f9835017da237 297
+  s_6790158f863f27::t_44aeea31a94036 363,366
+  s_6790158f863f27::t_2b699c09f04056 1800
+  s_6790158f863f27::t_f63626fb572a31 29-31
+  s_6790158f863f27::t_b0881d656f33e0 1961
+  s_6790158f863f27::t_9cc60f1d652d63 2915
+  s_6790158f863f27::t_c70414b8447974 2919,2928-2935
+  s_6790158f863f27::t_92c92696fe4e27 219-228
+  s_6790158f863f27::t_6381b8504ba7c8 206-207,212,215,217-218
+  s_6790158f863f27::t_10841a5db1e457 482-575
+  s_6790158f863f27::t_1583ac9c8bea59 342
+  s_6790158f863f27::t_d990295ec2b1ba 929-948
+  s_6790158f863f27::t_821c3c49084ccf 319
+  s_6790158f863f27::t_7ac81e64190dc2 1914
+  s_6790158f863f27::t_0e4e9831e50e61 1953
+  s_6790158f863f27::t_cd39159148680e 2036-2047
+  s_6790158f863f27::t_177ab978d08614 28
+  s_6790158f863f27::t_0362ee6f07b835 2942,2958-2968
+  s_6790158f863f27::t_93fdec0d356c62 2937
+bun.lock
+  s_6790158f863f27::t_2e349065020f2e 35,509-510,1185-1186
+src/lib/stores/capabilities.ts
+  s_6790158f863f27::t_cd69ae0c1f1114 1-6,9-59
+  s_6790158f863f27::t_a02251a63d2849 7-8
+_bmad-output/implementation-artifacts/spec-12-2-desktop-mobile-compile-seam-and-capability-handshake.md
+  s_6790158f863f27::t_d1ea7a1db9c991 134-159
+  s_6790158f863f27::t_bd86d9f12539f3 6
+  s_6790158f863f27::t_645a1fec901d1d 1-4,8-11,13-68,78-85,104-133
+  s_6790158f863f27::t_55fb3a98253949 12
+  s_6790158f863f27::t_0e15e41811cfeb 5
+  s_6790158f863f27::t_ab4223636a03d1 86-103
+  s_6790158f863f27::t_3df52f21833235 69-77
+  s_6790158f863f27::t_5f7df4b2d4b264 7
+src-tauri/Cargo.toml
+  s_6790158f863f27::t_a40ca9bb2d4e0c 23-26
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "a0d5b893990ff2b157855b20420384391e6fb747",
+  "prompts": {},
+  "sessions": {
+    "s_6790158f863f27": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b2f48d2e-9fbb-4476-a9f9-5a764ee921f8",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": null
+    }
+  }
+}

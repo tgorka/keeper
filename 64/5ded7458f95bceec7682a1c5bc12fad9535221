@@ -1,0 +1,145 @@
+src/hooks/use-account-statuses.test.ts
+  s_6f3304f20d4472::t_97d066301c8200 63
+  s_6f3304f20d4472::t_fe4dc2c5c781ff 1-62,64-120
+src/lib/stores/account-status.test.ts
+  s_6f3304f20d4472::t_923c6c478324dd 3,5,7-16,19,24
+  s_6f3304f20d4472::t_97d066301c8200 4
+  s_6f3304f20d4472::t_dd648621521c1d 85,90,93,95-96,98,101,104,114,119-130
+  s_6f3304f20d4472::t_34184020fd4aad 1-2,6,17-18,20-23,25-84,86-89,91-92,94,97,99-100,102-103,105-113,115-118,131-132
+src/test/setup.ts
+  s_6f3304f20d4472::t_516cb7ae719a37 17-32
+  s_6f3304f20d4472::t_7e2cfc2e1c60fb 33-42
+src/lib/stores/accounts.test.ts
+  s_6f3304f20d4472::t_025057b2169540 147-153
+  s_6f3304f20d4472::t_fa18b6ec3fb966 98-146,154
+  s_6f3304f20d4472::t_233adf2b64d64c 11
+src/lib/ipc/gen/AccountVm.ts
+  s_6f3304f20d4472::t_cd232749ef0569 2,9-12,33-39
+src/App.test.tsx
+  s_6f3304f20d4472::t_3a802fd992623d 38
+src-tauri/crates/keeper-core/src/auth.rs
+  s_6f3304f20d4472::t_81ba7b990dd789 573-576,585,593
+  s_6f3304f20d4472::t_e1cb749620f499 110-113
+  s_6f3304f20d4472::t_1458d76e072b15 649-653,657-661,699-704,1120-1130,1164-1174
+  s_6f3304f20d4472::t_009a3c25544c38 1051,1084,1100,1311,1322,1422,1457
+  s_6f3304f20d4472::t_39f73889e40aee 75-79
+  s_6f3304f20d4472::t_b8f4b521b09b1a 38
+  s_6f3304f20d4472::t_bfedb911d55f60 632-633,639,645-648,654-656,662-664,670,676-698,705-708
+  s_6f3304f20d4472::t_6e06bd71dd9916 203-206
+  s_6f3304f20d4472::t_8c7ee1ac98e086 1154-1163,1175-1294
+  s_6f3304f20d4472::t_b0c89a2643382b 709
+src/components/layout/conversation-pane.test.tsx
+  s_6f3304f20d4472::t_352d764cd41c46 63,77,364-366
+  s_6f3304f20d4472::t_9d47882e921d79 4
+  s_6f3304f20d4472::t_6e9707bb599cb9 31
+src-tauri/crates/keeper-core/src/registry.rs
+  s_6f3304f20d4472::t_b530edd85f1c14 638
+  s_6f3304f20d4472::t_fa05a0a91850e8 66
+  s_6f3304f20d4472::t_bde6d58918cbbf 175-179
+  s_6f3304f20d4472::t_d8bea79df8df19 126-150,167-170
+  s_6f3304f20d4472::t_9f1177852110f6 374,386
+  s_6f3304f20d4472::t_1458d76e072b15 460-470,482-492
+  s_6f3304f20d4472::t_9a799d43849074 319,330
+  s_6f3304f20d4472::t_9938371a2665d8 249-267
+  s_6f3304f20d4472::t_92f48ac3a17abd 173-174,188,192-193,200-201
+  s_6f3304f20d4472::t_83b1f357d2143e 288,301
+  s_6f3304f20d4472::t_2f950fad449961 420,431
+  s_6f3304f20d4472::t_6f8d30bca85a0d 549-601
+  s_6f3304f20d4472::t_f3fa1ad78c28de 473-474,493-494
+  s_6f3304f20d4472::t_b79a95af19e43d 548
+src/lib/stores/account-status.ts
+  s_6f3304f20d4472::t_6aa3561dee3ec7 17
+  s_6f3304f20d4472::t_d4d898f594e523 1-16,18-60,69-70,74
+  s_6f3304f20d4472::t_8192de0a7236d8 61-68,71-73
+src/hooks/use-account-statuses.ts
+  s_6f3304f20d4472::t_eef871c354fb54 1-80
+src/lib/ipc/gen/Provider.ts
+  s_6f3304f20d4472::t_cd232749ef0569 1-13
+src/components/layout/sidebar-pane.test.tsx
+  s_6f3304f20d4472::t_4d1b486126a6df 23,33-41,53,58,64-65,71-80,93-100,102-103,107,117-118,125,129-131
+src/hooks/use-sign-out.test.ts
+  s_6f3304f20d4472::t_5ac1b38fdaa1f6 47
+  s_6f3304f20d4472::t_f63040953ce878 12,23
+  s_6f3304f20d4472::t_b43499006d3851 101,110-111,114-123
+  s_6f3304f20d4472::t_9f522472ba29e2 124
+src/hooks/use-sign-out.ts
+  s_6f3304f20d4472::t_3593d5c6410cb9 11-15
+  s_6f3304f20d4472::t_89e575a84fe015 19
+  s_6f3304f20d4472::t_674d9dca3dba6a 36-41
+src/lib/stores/accounts.ts
+  s_6f3304f20d4472::t_0fc2c6c783614a 56,58-59,68-76
+  s_6f3304f20d4472::t_7c4870ca3a1e6c 22-28,42-43
+  s_6f3304f20d4472::t_991fe6240b8622 63-65
+  s_6f3304f20d4472::t_a61fb88fd90f36 21
+src/components/layout/account-footer.test.tsx
+  s_6f3304f20d4472::t_45cf55e41ec4a8 57-59,61-62
+  s_6f3304f20d4472::t_97d066301c8200 156,211
+  s_6f3304f20d4472::t_2e6a039bca44dc 152-155
+  s_6f3304f20d4472::t_b0708db4fe1dca 63
+  s_6f3304f20d4472::t_4da34c6f2c7959 3,12-21,24,28-35,46,60,64-66,69-70,78-79,90,95-102,105-106,113-133,136-142,144-151,163,167-170,174,179,181-187,190,193-196,205,208-209,214-226
+src/lib/beeper.ts
+  s_6f3304f20d4472::t_bef838326067c6 4-5,7-11,14
+src/hooks/use-session-restore.test.ts
+  s_6f3304f20d4472::t_03463a7853645a 20
+src/components/layout/sidebar-pane.tsx
+  s_6f3304f20d4472::t_0a03a5597d2742 7
+  s_6f3304f20d4472::t_bdf4effd29fd82 29
+src/components/layout/chat-list-pane.test.tsx
+  s_6f3304f20d4472::t_4de6014b8ba7e8 98
+  s_6f3304f20d4472::t_29d7bccd1f0d64 23-31
+  s_6f3304f20d4472::t_c22215696af7d5 52,61
+  s_6f3304f20d4472::t_feead02de89f13 213-255
+src/components/auth/login-screen.test.tsx
+  s_6f3304f20d4472::t_65b2160e3d2d69 102
+  s_6f3304f20d4472::t_a410f9b22af71d 30
+src/lib/ipc/client.ts
+  s_6f3304f20d4472::t_a054a83bef8a26 23
+src/components/layout/chat-list-pane.tsx
+  s_6f3304f20d4472::t_e797d1a5073f7d 37-40
+  s_6f3304f20d4472::t_97d066301c8200 91
+  s_6f3304f20d4472::t_160c3d94bfe2d2 88-90,92,101,104
+_bmad-output/implementation-artifacts/spec-2-5-account-switcher-and-per-account-state.md
+  s_6f3304f20d4472::t_7bd6ef089eb1a7 1-4,8-92,103-129
+  s_6f3304f20d4472::t_cbb3e0564fe21c 6
+  s_6f3304f20d4472::t_62211fa1d3d2eb 93-102
+  s_6f3304f20d4472::t_2a80c3ada396df 5,7
+  s_6f3304f20d4472::t_c48452f1f3f6a0 130-175
+_bmad-output/implementation-artifacts/deferred-work.md
+  s_6f3304f20d4472::t_1fca659922cc91 41-43
+src/components/layout/app-shell.tsx
+  s_6f3304f20d4472::t_28a34bd7efa109 8,13-16
+src/components/layout/conversation-pane.tsx
+  s_6f3304f20d4472::t_3ab326f1c9e1fc 82-84
+  s_6f3304f20d4472::t_db8338651f9dde 25
+src-tauri/crates/keeper-core/src/vm.rs
+  s_6f3304f20d4472::t_1458d76e072b15 650-653
+  s_6f3304f20d4472::t_4e0cb1fa17875e 643,660-691
+  s_6f3304f20d4472::t_90ec241a682ea1 373-415,420-423,440-443
+  s_6f3304f20d4472::t_5344ce8c96dc65 692
+src-tauri/crates/keeper-core/src/auth/beeper.rs
+  s_6f3304f20d4472::t_0e11c08e6b7ecf 255-258
+src/components/ui/alert-dialog.tsx
+  s_6f3304f20d4472::t_97d066301c8200 1-4,6-7,13,16-17,29,33,41,51,56,59,65,69,72,78,82,85,91,95,107,111,123,127,145,163,179
+  s_6f3304f20d4472::t_3b1ebb0bed675f 5,8-12,14-15,18-28,30-32,34-40,42-50,52-55,57-58,60-64,66-68,70-71,73-77,79-81,83-84,86-90,92-94,96-106,108-110,112-122,124-126,128-144,146-162,164-178
+src/lib/beeper.test.ts
+  s_6f3304f20d4472::t_3e2b94209364da 2-3,5,9,11,16-48
+src/components/layout/account-footer.tsx
+  s_6f3304f20d4472::t_ebf4ccdd218f56 2,4-14,16,18,21-32,43-49,52,54-55,66-83,85-87,89-102,104-105,107-116,118-133,151-160,173,178-182,185-219,221-223,227-229,231,233-236,238,243,246,248,250-311,313-314,316-317,319-346
+  s_6f3304f20d4472::t_97d066301c8200 183-184,318
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "645ded7458f95bceec7682a1c5bc12fad9535221",
+  "prompts": {},
+  "sessions": {
+    "s_6f3304f20d4472": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "63d4860d-0a7c-45b4-aa4f-aaee401d4708",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

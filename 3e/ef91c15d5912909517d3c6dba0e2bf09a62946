@@ -1,0 +1,32 @@
+_bmad-output/implementation-artifacts/epic-12-context.md
+  s_cdedad6b152c67::t_c612780bdbe942 1-45
+_bmad-output/implementation-artifacts/spec-12-1-ios-project-init-and-repo-integration.md
+  s_8a8bc6b6bf6017::t_30250d88b510de 19-29
+  s_8a8bc6b6bf6017::t_720ecd52939a9e 14,16-17
+  s_cdedad6b152c67::t_c9ae33f5c42bcb 1-13,15,18,30-134
+  s_8a8bc6b6bf6017::t_34b3b939c83eec 135-139
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "3eef91c15d5912909517d3c6dba0e2bf09a62946",
+  "prompts": {},
+  "sessions": {
+    "s_8a8bc6b6bf6017": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c19d356a-2c90-4eff-82aa-ba9853588b43",
+        "model": "claude-fable-5"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    },
+    "s_cdedad6b152c67": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c983c52e-6d53-4fed-92bb-7246fb4332d4",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

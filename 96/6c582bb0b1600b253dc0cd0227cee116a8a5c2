@@ -1,0 +1,27 @@
+DESIGN.md
+  s_8e09ad1d7613cb::t_04b27a79ebb40b 266-269
+src-tauri/crates/keeper/icons/mark.svg
+  s_8e09ad1d7613cb::t_c7edde51f2eca2 124-133,137
+favicon.svg
+  s_8e09ad1d7613cb::t_237c1660e23c1d 80-89,93,95
+scripts/gen-mark-icons.ts
+  s_8e09ad1d7613cb::t_359ca57c01e943 61-63,65
+  s_8e09ad1d7613cb::t_7ec29e18146c3e 277-278,290
+  s_8e09ad1d7613cb::t_237c1660e23c1d 271-274
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "966c582bb0b1600b253dc0cd0227cee116a8a5c2",
+  "prompts": {},
+  "sessions": {
+    "s_8e09ad1d7613cb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0801d084-10a1-4e02-b886-8536e51c9161",
+        "model": "claude-fable-5"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

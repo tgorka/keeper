@@ -1,0 +1,39 @@
+src-tauri/crates/keeper-core/src/send.rs
+  s_2f56a3e162fea8::t_fd3968566964b0 21-26
+  s_2f56a3e162fea8::t_096756af6eb1b2 72-80
+  s_2f56a3e162fea8::t_384470bf81f5a2 39-47
+  s_2f56a3e162fea8::t_5cee52e7c530ba 435-448,453-458,461-462,480
+  s_2f56a3e162fea8::t_0235d0a7a1746a 473-475
+  s_2f56a3e162fea8::t_7d3cc653f93fc5 390-434,449-452,459-460,463-472,476-479,481-488
+  s_2f56a3e162fea8::t_f43f209ab58bf1 10-20,27-38,48-54
+_bmad-output/implementation-artifacts/spec-7-4-explicit-approval-invariant-enforced-and-tested.md
+  s_2f56a3e162fea8::t_12359802215e3a 6
+  s_2f56a3e162fea8::t_d7733a480cf886 10
+  s_2f56a3e162fea8::t_db491b3ae71318 59-62
+  s_2f56a3e162fea8::t_b01f1a74d17954 5
+  s_2f56a3e162fea8::t_1b6c4e1fd1ade5 70-87
+  s_2f56a3e162fea8::t_893f741c84fe3d 103-122
+  s_2f56a3e162fea8::t_11e0a278b37c5c 1-4,7-9,11-58,63-69,88-102
+  s_2f56a3e162fea8::t_98d69ca361ba68 123
+src-tauri/crates/keeper-core/src/account.rs
+  s_2f56a3e162fea8::t_7b07fbd6b29862 4818-4820
+  s_2f56a3e162fea8::t_026ff0b07c85ae 4821-4856
+_bmad-output/implementation-artifacts/sprint-status.yaml
+  s_2f56a3e162fea8::t_ba4cf60b4b9fe2 111
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "7e1080f33e5759ad23e0af949888639595666c4a",
+  "prompts": {},
+  "sessions": {
+    "s_2f56a3e162fea8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fab4160b-bde5-45d9-bb20-7e8ef2fa92d4",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

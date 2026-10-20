@@ -1,0 +1,40 @@
+src/components/settings/settings-dialog.test.tsx
+  s_8a8bc6b6bf6017::t_f8d8eccf8fca87 78-79
+src/lib/ipc/client.ts
+  s_8a8bc6b6bf6017::t_9f4e5c78eeaeb0 2026-2039
+src-tauri/crates/keeper-core/src/registry.rs
+  s_8a8bc6b6bf6017::t_26955d3545245d 596-609,2471-2479
+  s_8a8bc6b6bf6017::t_4ffbf7c462af22 2480-2482
+src-tauri/crates/keeper/src/lib.rs
+  s_8a8bc6b6bf6017::t_3b7eee00cdd019 105-111
+  s_8a8bc6b6bf6017::t_9588ba4ab05344 405-406
+  s_8a8bc6b6bf6017::t_5340953f3c9542 8
+src/components/settings/about-section.tsx
+  s_8a8bc6b6bf6017::t_9f4e5c78eeaeb0 7-9,33-39,124-126,166-177,248-261,349-360
+  s_8a8bc6b6bf6017::t_6a7ab6846a9d64 361
+src-tauri/crates/keeper/src/ipc.rs
+  s_8a8bc6b6bf6017::t_3b7eee00cdd019 4365-4371,5146-5164
+  s_8a8bc6b6bf6017::t_fb2a9bd6ad5284 5165
+src-tauri/crates/keeper/src/debug_log.rs
+  s_8a8bc6b6bf6017::t_28c1d597bffa28 1-140
+src/components/settings/about-section.test.tsx
+  s_8a8bc6b6bf6017::t_362d24d90d7154 6-7,325-335
+_bmad-output/implementation-artifacts/sprint-status.yaml
+  s_8a8bc6b6bf6017::t_75ef0ab7f3cd8a 216
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.15",
+  "base_commit_sha": "76fcf50a8c51b3643c3494b1bf9d27da6cc2508e",
+  "prompts": {},
+  "sessions": {
+    "s_8a8bc6b6bf6017": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c19d356a-2c90-4eff-82aa-ba9853588b43",
+        "model": "claude-fable-5"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

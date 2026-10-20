@@ -1,0 +1,114 @@
+src/components/auth/login-screen.tsx
+  s_3c098b0f84766e::t_99b2c8cc76ceec 15-21,23-24
+  s_3c098b0f84766e::t_4d28c288130511 4
+  s_3c098b0f84766e::t_efcde1c6239f61 61,67-74,80-84
+  s_3c098b0f84766e::t_d86fae2a300b5e 1-3,5-14,22,25-60,62-66,75-79,85-167
+bun.lock
+  s_3c098b0f84766e::t_33bfd5a3ddec2d 24,1222-1223
+src-tauri/crates/keeper-core/src/auth.rs
+  s_3c098b0f84766e::t_82679937f8ff32 112-115,124
+  s_3c098b0f84766e::t_5e929d4374e9e7 199-200,208-227,232-281
+  s_3c098b0f84766e::t_68a477acdbaa0f 46-49,228-231
+  s_3c098b0f84766e::t_6e83ba0cb60379 1-13,15-36,39-40,44-45,57-96,109-111,116-123,125-141,143-198,201-207,282-283
+  s_3c098b0f84766e::t_daac6dc3026007 38
+  s_3c098b0f84766e::t_057b313160513e 37,41-43,50-56
+  s_3c098b0f84766e::t_426755e375210b 142
+  s_3c098b0f84766e::t_974045a70ce1ca 97-108
+  s_3c098b0f84766e::t_d45eba596e67c5 14
+_bmad-output/implementation-artifacts/deferred-work.md
+  s_3c098b0f84766e::t_a316dd9293657e 1-7
+  s_f30d6d78a55adc::t_5c24d39bfa3a9b 8-10
+src-tauri/crates/keeper/Cargo.toml
+  s_3c098b0f84766e::t_55a7c4b635f926 34-35
+src/lib/stores/accounts.ts
+  s_3c098b0f84766e::t_8eb344f8e269ce 1-39
+src/components/auth/login-screen.test.tsx
+  s_3c098b0f84766e::t_675a319151d3f7 1-116,141-148
+  s_3c098b0f84766e::t_7c274e8c39a8e3 117-140
+src-tauri/crates/keeper-core/src/error.rs
+  s_3c098b0f84766e::t_e9d1da6cec164c 22-55
+  s_3c098b0f84766e::t_247e471279062a 65-68
+src-tauri/crates/keeper/src/lib.rs
+  s_3c098b0f84766e::t_ca05f4cbf3a867 12-16
+src-tauri/crates/keeper-core/Cargo.toml
+  s_3c098b0f84766e::t_d6f01c240cdbd1 23-25
+src/lib/stores/accounts.test.ts
+  s_3c098b0f84766e::t_9ca85ecbed457a 1-37
+src-tauri/crates/keeper-core/src/registry.rs
+  s_3c098b0f84766e::t_23073821814f4a 1-201
+src-tauri/crates/keeper-core/src/vm.rs
+  s_3c098b0f84766e::t_ae4a530c47fb6d 165-189,191-204
+  s_3c098b0f84766e::t_1fa80dda90f709 41-68
+  s_3c098b0f84766e::t_82679937f8ff32 190
+_bmad-output/implementation-artifacts/spec-1-3-password-login-with-sliding-sync-verification.md
+  s_3c098b0f84766e::t_32f99fad4d529a 109-125
+  s_3c098b0f84766e::t_e16faff2b64c9d 1-4,6,10-86,101-108,136-144,152-169,171-192
+  s_3c098b0f84766e::t_bd04eec25fdf6d 170
+  s_3c098b0f84766e::t_5aab5ac97dab51 87-100
+  s_f30d6d78a55adc::t_b5899d2a98f405 235-241
+  s_3c098b0f84766e::t_b23ce05e61ef51 5
+  s_3c098b0f84766e::t_b8e81838f9acf5 145-151
+  s_f30d6d78a55adc::t_d5aa87d1c5e2fb 126-135
+  s_f30d6d78a55adc::t_3f9071a21da177 7
+  s_3c098b0f84766e::t_d49fa9e05ecd8e 193-234
+  s_3c098b0f84766e::t_cb136c9d62f1d0 8
+  s_f30d6d78a55adc::t_e60b40dcfccc2a 9
+src-tauri/crates/keeper-core/src/lib.rs
+  s_3c098b0f84766e::t_bc9b6f0f122176 8,12
+package.json
+  s_3c098b0f84766e::t_bd4de0a64838f8 41-42
+src/App.tsx
+  s_3c098b0f84766e::t_ffdf39c4472940 1,3,6-7
+src-tauri/Cargo.lock
+  s_3c098b0f84766e::t_4a26fb74fce9bd 881-890,914,927,2795,2813,2820,2834-2845,2932,4727,4746,4755,4883-4895,4903,5435
+_bmad-output/implementation-artifacts/sprint-status.yaml
+  s_3c098b0f84766e::t_e42d7ea1619c27 54
+src/lib/ipc/client.ts
+  s_3c098b0f84766e::t_2c1f62140f6c37 58
+  s_3c098b0f84766e::t_448fb0edf3d9a8 12,19
+  s_3c098b0f84766e::t_949814e57398b0 59-73
+  s_3c098b0f84766e::t_419edc830bf4dd 20
+src-tauri/Cargo.toml
+  s_3c098b0f84766e::t_61aad2a5fe251f 39,41-43
+  s_3c098b0f84766e::t_e7e8d280862ca1 40
+src-tauri/crates/keeper-core/src/platform.rs
+  s_3c098b0f84766e::t_33a589051bb9fa 24-25,29,33
+src/lib/ipc/gen/AccountVm.ts
+  s_3c098b0f84766e::t_4a6bec5c27d3d0 1-25
+src-tauri/crates/keeper/src/ipc.rs
+  s_3c098b0f84766e::t_b2078641bdf6a4 236,240-245,249-261,265-273
+  s_3c098b0f84766e::t_ce3ee1df938ae4 64-70,73-80,83-90
+  s_3c098b0f84766e::t_a35372c58da3ae 12,14,16
+  s_3c098b0f84766e::t_82679937f8ff32 237-239,246-248,262-264
+  s_3c098b0f84766e::t_5dea0f4e49d468 182-200
+  s_3c098b0f84766e::t_d031c841fb0ae7 46-48
+  s_3c098b0f84766e::t_679c6ee59f7cf7 114,116-123
+src/App.test.tsx
+  s_3c098b0f84766e::t_003886e310c9ca 2-4,7-12,14-29
+src/lib/ipc/gen/IpcErrorCode.ts
+  s_3c098b0f84766e::t_4a6bec5c27d3d0 9
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "2fd66bc724c7614cf7c9088dc5e24ec1f3619c83",
+  "prompts": {},
+  "sessions": {
+    "s_3c098b0f84766e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ff96cea6-b818-436b-b041-748ebabfc103",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": null
+    },
+    "s_f30d6d78a55adc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "83d827ae-2f85-4ec2-b265-9c71d4b1b02f",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": null
+    }
+  }
+}

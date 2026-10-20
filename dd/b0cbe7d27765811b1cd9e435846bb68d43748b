@@ -1,0 +1,46 @@
+_bmad-output/implementation-artifacts/spec-3-2-device-verification-emoji-sas-and-qr.md
+  s_8de24d0746e3b0::t_13edaef2815c74 175-193
+  s_8de24d0746e3b0::t_10924b385dad18 103-113
+  s_8de24d0746e3b0::t_66f14f6f2c37ef 5,9
+src/hooks/use-verification.test.ts
+  s_8de24d0746e3b0::t_4013d0db4bdaba 16
+  s_8de24d0746e3b0::t_a58e707d01daa0 10
+  s_8de24d0746e3b0::t_a3e0cf8595aa33 53-54
+  s_8de24d0746e3b0::t_fb59d2ad3a2d98 134-136
+  s_8de24d0746e3b0::t_17f948180aba71 103-107
+_bmad-output/implementation-artifacts/deferred-work.md
+  s_8de24d0746e3b0::t_08ece31d4b6479 59-62
+src-tauri/crates/keeper-core/src/verification.rs
+  s_8de24d0746e3b0::t_5bd1b40168a28e 452-459
+src/components/settings/device-verification-dialog.tsx
+  s_8de24d0746e3b0::t_4c6eada1b29ff6 157-170
+src/hooks/use-verification.ts
+  s_8de24d0746e3b0::t_922b1a7b8f022e 61-68
+  s_8de24d0746e3b0::t_8be163c924abf4 25-29
+_bmad-output/implementation-artifacts/sprint-status.yaml
+  s_1a01d73e040b65::t_b83341b2a95028 71
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "ddb0cbe7d27765811b1cd9e435846bb68d43748b",
+  "prompts": {},
+  "sessions": {
+    "s_1a01d73e040b65": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ba206144-4ad5-4fff-8745-4f1967156746",
+        "model": "unknown"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    },
+    "s_8de24d0746e3b0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "75bb3731-14ba-44e9-add6-f0e43e6d13df",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

@@ -1,0 +1,19 @@
+_bmad-output/implementation-artifacts/spec-1-6-send-text-with-local-echo-and-visible-send-states.md
+  s_53f48ea4cbde74::t_4e03181b6d7235 9
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "5df0071b0118ed68f676f54bedeb4461f6caa83c",
+  "prompts": {},
+  "sessions": {
+    "s_53f48ea4cbde74": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "149e3048-89fd-4b4e-aae0-a6f06b1e4cf2",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

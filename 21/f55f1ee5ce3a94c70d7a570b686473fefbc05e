@@ -1,0 +1,21 @@
+src-tauri/crates/keeper-sync/src/engine.rs
+  s_45b1426f60f163::t_6a75c6fc9ee6d2 2326-2345
+src-tauri/crates/keeper-sync/src/git/repo.rs
+  s_45b1426f60f163::t_fc3003306a371a 789-793
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "21f55f1ee5ce3a94c70d7a570b686473fefbc05e",
+  "prompts": {},
+  "sessions": {
+    "s_45b1426f60f163": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "08e999c8-c890-418c-ab79-ca9ea3a5bd7c",
+        "model": "claude-opus-5"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

@@ -1,0 +1,104 @@
+_bmad-output/implementation-artifacts/deferred-work.md
+  s_f682bb4d793108::t_9ec7f16983b62a 1010-1019
+tools/keeper-rec/Sources/keeper-rec/main.swift
+  s_f682bb4d793108::t_0d778c836bf660 95-99
+tools/keeper-rec/Tests/keeper-recTests/ConcatAssert.swift
+  s_f682bb4d793108::t_4c6d454b34b776 1-135,140-200,204-267,269,274-285,289-297
+  s_f682bb4d793108::t_403b47d497de86 201-203
+  s_f682bb4d793108::t_a4a9a1469e85e5 136-139
+  s_f682bb4d793108::t_905adf982411b8 268,270-273
+  s_f682bb4d793108::t_5312b7eed184b2 286-288
+src-tauri/crates/keeper/src/ipc.rs
+  s_f682bb4d793108::t_9a1b05fd05cb86 3449-3450,3461-3466
+docs/performance.md
+  s_f682bb4d793108::t_9baa4fd3485014 33-40
+docs/release.md
+  s_f682bb4d793108::t_a6f2a008b2367e 218,220
+tools/keeper-rec/Tests/keeper-recTests/FixtureSegments.swift
+  s_f682bb4d793108::t_cf415f36b52b14 1-280
+tools/keeper-rec/Sources/keeper-rec/Capture.swift
+  s_f682bb4d793108::t_968bf4f7b5703f 364-368
+  s_f682bb4d793108::t_06a2eb0f9e1d78 388-394,400-403
+  s_f682bb4d793108::t_2ae7211e9ff8c3 512-521
+  s_f682bb4d793108::t_96f35b707e6825 363
+  s_f682bb4d793108::t_57363d54f65da8 22,25-35
+  s_f682bb4d793108::t_8482f4ce20fab8 328-336,347-348
+  s_f682bb4d793108::t_806470a65bf3e1 117-126
+  s_f682bb4d793108::t_66cbf66be623af 509-511
+tools/keeper-rec/Package.swift
+  s_f682bb4d793108::t_6673a61d1864c6 38-45,52-62
+src-tauri/crates/keeper-core/src/recording.rs
+  s_f682bb4d793108::t_28df37caf62b5c 337-341
+  s_f682bb4d793108::t_1a9f071541f303 646-647,660-670
+  s_f682bb4d793108::t_e8c927e446e15e 899,905-906
+  s_f682bb4d793108::t_d7fac27c2a361a 96-104
+  s_f682bb4d793108::t_7210493e4b7901 2172
+  s_f682bb4d793108::t_5cf6d2e7765f73 286-293
+  s_f682bb4d793108::t_16ff9014a8a984 1373-1374,2125-2171,2173-2192
+  s_f682bb4d793108::t_48974632f3bad0 1375
+  s_f682bb4d793108::t_68877c1fcd3052 285,299-300
+  s_f682bb4d793108::t_a16884bc42ea2d 714-715
+  s_f682bb4d793108::t_ed428f4b01e1fb 1948-1949,1956-1973
+  s_f682bb4d793108::t_f841d6a01c6e36 829-838,842-848
+  s_f682bb4d793108::t_6ccdc495fa91a8 1100-1101,1108-1109
+  s_f682bb4d793108::t_8de47c627dca99 1334-1335,1341-1343,1348-1372
+  s_f682bb4d793108::t_9afda788a7421c 1299-1301,1304,1312-1313
+  s_f682bb4d793108::t_52e329127bbdce 67-68
+.github/workflows/ci.yml
+  s_f682bb4d793108::t_4edc4a0ab908ac 48,52-55
+_bmad-output/implementation-artifacts/spec-17-4-automated-gapless-concat-test-nfr-22.md
+  s_f682bb4d793108::t_9666ad0f2b27c0 5
+  s_f682bb4d793108::t_1aebf920dd00c5 60-186
+  s_86dbbd6fca4cb6::t_32bd50c0244e3c 6
+  s_f682bb4d793108::t_d3f580d75ee855 224-266
+  s_8a8bc6b6bf6017::t_038f06c5cd3c05 188-223
+  s_3507503aa4571f::t_fb8d10af70c9cf 1-4,8-59,187
+  s_f682bb4d793108::t_f5d83bfb2f476d 7
+tools/keeper-rec/Tests/keeper-recTests/ConcatAssertTests.swift
+  s_f682bb4d793108::t_2d9ae3bd58b3ce 1-113,115-154
+  s_f682bb4d793108::t_f77f0f809efd9b 114
+scripts/test-keeper-rec.sh
+  s_f682bb4d793108::t_d55f9146d4678e 4-11
+_bmad-output/implementation-artifacts/sprint-status.yaml
+  s_f682bb4d793108::t_f7bc1360f5f877 182
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "edf59e2aca06f13f13404d6370e8f30e10858f4c",
+  "prompts": {},
+  "sessions": {
+    "s_3507503aa4571f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4772f2ab-22c3-40d0-8e96-0deb42427c75",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    },
+    "s_86dbbd6fca4cb6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fd04d05b-fd49-4cef-b99f-fcd86d617066",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    },
+    "s_8a8bc6b6bf6017": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c19d356a-2c90-4eff-82aa-ba9853588b43",
+        "model": "claude-fable-5"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    },
+    "s_f682bb4d793108": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e03a9ff0-8612-481b-9abb-8b010f80334d",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

@@ -1,0 +1,37 @@
+_bmad-output/implementation-artifacts/deferred-work.md
+  s_9bfe0bf28c8205::t_16689924083797 3449-3453
+src/capture-main.test.tsx
+  s_9bfe0bf28c8205::t_de73d4c8ce64ce 18-19,70-73
+src/components/capture/capture-document.test.tsx
+  s_9bfe0bf28c8205::t_3fccb1e11380a5 38,220-223
+src/components/capture/capture-window.test.tsx
+  s_9bfe0bf28c8205::t_ba8c525e9953a8 16,18,106-109
+src/components/notes/note-editor.tsx
+  s_9bfe0bf28c8205::t_261f6be807480e 1115-1123
+src/test/note-editor-boot.ts
+  s_9bfe0bf28c8205::t_faaa6fba0d34f0 1-57
+src/components/capture/capture-in-the-note-editor.test.tsx
+  s_9bfe0bf28c8205::t_f34f2bcfe66148 37,39,188-191
+src/components/export/export-in-the-note-editor.test.tsx
+  s_9bfe0bf28c8205::t_276952ee808d64 15,17,115-118
+src/components/notes/note-actions.test.tsx
+  s_9bfe0bf28c8205::t_d721a238eadba4 19,136-139
+src/components/notes/note-editor.test.tsx
+  s_9bfe0bf28c8205::t_7c7bbd2c230112 34,238-241
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "4869e6b15f48e25a7546621558c843de3c9fc733",
+  "prompts": {},
+  "sessions": {
+    "s_9bfe0bf28c8205": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a6a8d43-9ddd-4b65-b1f4-97581e5db3f3",
+        "model": "claude-opus-5"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

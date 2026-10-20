@@ -1,0 +1,37 @@
+src-tauri/crates/keeper-core/src/notes/index.rs
+  s_9bfe0bf28c8205::t_159a3f81fac44f 471-498
+src-tauri/crates/keeper/src/lib.rs
+  s_9bfe0bf28c8205::t_62e5a377905354 1033
+src-tauri/crates/keeper/src/notes_ipc.rs
+  s_9bfe0bf28c8205::t_da58bfb3d35362 2068-2081
+src/components/capture/capture-document.test.tsx
+  s_9bfe0bf28c8205::t_2ead2919ff133f 106,257-259,261,348-349
+src/components/notes/links-panel.tsx
+  s_9bfe0bf28c8205::t_87e07fe89074e1 2,4,6,8-12,15,17-20,23,29,33-41,50-51,58-59,67,70,74-87
+src/components/notes/note-actions.test.tsx
+  s_9bfe0bf28c8205::t_6b7112ce32e346 250,272-276,298-301
+src/components/notes/note-editor.test.tsx
+  s_9bfe0bf28c8205::t_9fda1860b254a6 499,502,505,571-579,618-621,773,778,798-799,801-805,868-869,871
+src/components/notes/note-editor.tsx
+  s_9bfe0bf28c8205::t_2568aa105eab19 40,52,857,940-968,1120,1122-1160
+src/components/notes/note-file-links.test.tsx
+  s_9bfe0bf28c8205::t_08b11ab3cbe7f8 58,233-235,237
+src/lib/ipc/client.ts
+  s_9bfe0bf28c8205::t_ce31ddc0640c78 4337-4351
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "44b8b806c77f42438bc3aa7410dbbfa42852d3f6",
+  "prompts": {},
+  "sessions": {
+    "s_9bfe0bf28c8205": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a6a8d43-9ddd-4b65-b1f4-97581e5db3f3",
+        "model": "claude-opus-5"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

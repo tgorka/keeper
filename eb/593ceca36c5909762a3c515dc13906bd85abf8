@@ -1,0 +1,95 @@
+src-tauri/crates/keeper-core/tests/archive_search.rs
+  s_8a72cdadba197d::t_0a9686a249ee84 135-138,232-234,245-248,278-281,394-397,405-407
+  s_8a72cdadba197d::t_875aacf204168f 1-69,74,77-134,139-231,235-244,249-277,282-393,398-404,408-419
+  s_8a72cdadba197d::t_cfab242506cd53 70-73,75-76
+_bmad-output/implementation-artifacts/deferred-work.md
+  s_8a72cdadba197d::t_36cdee78d5b493 172-179
+_bmad-output/implementation-artifacts/spec-5-3-offline-full-text-search-engine.md
+  s_8a72cdadba197d::t_aab46d7dd9c49f 82-90
+  s_8a72cdadba197d::t_f2190d37ceef5d 138-159
+  s_8a72cdadba197d::t_72b1238ea9e7dd 1-4,8,10-81,91-101,117-137
+  s_8a72cdadba197d::t_ea3bdfe0f2c964 102-116
+  s_8a72cdadba197d::t_d4c8f50918c3ae 5
+  s_8a72cdadba197d::t_6307113c956d8b 7,9
+  s_8a72cdadba197d::t_0cedd09a1a905c 6
+src-tauri/crates/keeper-core/tests/archive_search_perf.rs
+  s_8a72cdadba197d::t_4419933593d439 1-9,11-62,64-123,128-135,137-180
+  s_8a72cdadba197d::t_263704b623a743 10
+  s_8a72cdadba197d::t_0a9686a249ee84 124-127,136
+  s_8a72cdadba197d::t_61a098d471a3f9 63
+src/lib/ipc/gen/SearchFilterVm.ts
+  s_8a72cdadba197d::t_ad2553d0f34a6c 1-45
+src-tauri/crates/keeper-core/src/archive/fts.rs
+  s_8a72cdadba197d::t_02171a5101b48a 88-93,98-111,116-125
+  s_8a72cdadba197d::t_efa24c943956e0 347-360
+  s_8a72cdadba197d::t_0502a2d1c29711 21
+  s_8a72cdadba197d::t_182e4a2eb03e3f 203-209
+  s_8a72cdadba197d::t_7cbffdee88abdc 1-20,22-62,79-87,94-97,112-115,126-202,210-243,258-294,301,304-310,312-346,361-427,432-435,437-438,440-441,461-491,573
+  s_8a72cdadba197d::t_199920ff5305a3 295-300,311
+  s_8a72cdadba197d::t_e73080c5d7d6cc 492-572
+  s_8a72cdadba197d::t_0a9686a249ee84 302-303
+  s_8a72cdadba197d::t_aee75a0fadef14 63-78
+  s_8a72cdadba197d::t_d48237653df92a 244-257
+  s_8a72cdadba197d::t_d509c85cb3ecb4 428-431,436,439,442-460
+src-tauri/crates/keeper-core/src/archive/mod.rs
+  s_8a72cdadba197d::t_4699b1b37c454f 29
+  s_8a72cdadba197d::t_444a1de0abe445 324
+  s_8a72cdadba197d::t_f6c39f47df1a6a 275-295
+  s_8a72cdadba197d::t_b7d3107a7bbd52 25,28
+  s_8a72cdadba197d::t_7206c4d765773c 95-99
+src-tauri/crates/keeper-core/tests/archive_ingestion.rs
+  s_8a72cdadba197d::t_ff9cf66dcded38 38
+src-tauri/crates/keeper-core/src/archive/db.rs
+  s_8a72cdadba197d::t_d99394d27c2d7f 222-224
+  s_8a72cdadba197d::t_54d273e3f82802 122-123,125-151
+  s_8a72cdadba197d::t_826ddeb8deedbb 197-212
+  s_8a72cdadba197d::t_3c22ed31419a3f 17
+  s_8a72cdadba197d::t_4d25af2d92ed8b 87-121,124,152-195
+  s_8a72cdadba197d::t_8c7ffdfae988b7 196
+  s_8a72cdadba197d::t_e2ddc445e998d8 68,74-77
+src-tauri/crates/keeper/src/ipc.rs
+  s_8a72cdadba197d::t_8156d5e2b3ba00 26-27
+  s_8a72cdadba197d::t_5a28a1235fb644 524-529
+  s_8a72cdadba197d::t_22c6105af480ab 534-536
+  s_8a72cdadba197d::t_38b388ba91d80d 507-523,530-533,537-542
+src-tauri/crates/keeper/src/lib.rs
+  s_8a72cdadba197d::t_2fa68aae9ea0c2 61
+src/lib/ipc/gen/SearchHitVm.ts
+  s_8a72cdadba197d::t_ad2553d0f34a6c 1-47
+src/lib/ipc/client.ts
+  s_8a72cdadba197d::t_49ce99cdab677b 40-41
+  s_8a72cdadba197d::t_518273f9607631 238-249
+  s_8a72cdadba197d::t_25e95d2cfe961e 237
+  s_8a72cdadba197d::t_b438af3a43333f 62-63
+src-tauri/crates/keeper-core/src/vm.rs
+  s_8a72cdadba197d::t_6c71c1153c6e1d 572-647
+src-tauri/crates/keeper-core/tests/archive_durability.rs
+  s_8a72cdadba197d::t_8f4a8a442465c7 71
+  s_8a72cdadba197d::t_8b1a28cd0c2d09 46
+src-tauri/crates/keeper-core/src/archive/ingest.rs
+  s_8a72cdadba197d::t_ccc61510a648a6 145
+  s_8a72cdadba197d::t_4e3b626dfa2bd5 17
+  s_8a72cdadba197d::t_d21f695db30c04 61-66,81-103
+src-tauri/crates/keeper-core/src/account.rs
+  s_8a72cdadba197d::t_b38682d8aa9083 3946
+  s_8a72cdadba197d::t_d6ac26f3fee911 2583
+  s_8a72cdadba197d::t_b9362118a07870 3787-3789
+  s_8a72cdadba197d::t_9c593af0c5d0c0 3752-3753
+  s_8a72cdadba197d::t_f815a7d8c33b22 2525-2527,2536
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "eb593ceca36c5909762a3c515dc13906bd85abf8",
+  "prompts": {},
+  "sessions": {
+    "s_8a72cdadba197d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fbda498e-771e-4868-a85e-eb52046c6e85",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": null
+    }
+  }
+}

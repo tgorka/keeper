@@ -1,0 +1,63 @@
+src-tauri/crates/keeper/src/ipc.rs
+  s_ad885441f410c8::t_6144759f903559 3-8
+src-tauri/crates/keeper/src/lifecycle.rs
+  s_ad885441f410c8::t_93297b886c0f58 16
+  s_ad885441f410c8::t_55347b150fc6ff 1-15,17-51,56-61
+  s_ad885441f410c8::t_61bc636e12cbd8 52-55
+src-tauri/crates/keeper-core/src/account.rs
+  s_ad885441f410c8::t_5d86b1a9d8116d 703-732
+  s_ad885441f410c8::t_b1e8b92e803b13 5987-6010
+src/hooks/use-app-lifecycle.ts
+  s_ad885441f410c8::t_c9180cae8a8748 1-41,61-64,71,73-75
+  s_ad885441f410c8::t_572d0a0aae0d03 42-45,47-60,65-70,72
+  s_ad885441f410c8::t_8caf12cf0f3389 46
+_bmad-output/implementation-artifacts/deferred-work.md
+  s_ad885441f410c8::t_219c84db92465a 839-853
+_bmad-output/implementation-artifacts/epic-14-context.md
+  s_ad885441f410c8::t_3610278dea2f42 1-55
+src-tauri/crates/keeper/Cargo.toml
+  s_ad885441f410c8::t_922219073633c6 30-33
+src/lib/ipc/client.ts
+  s_ad885441f410c8::t_65c39b92fd2635 1449-1464
+  s_ad885441f410c8::t_082ff08f5d2e81 15
+  s_ad885441f410c8::t_4022c0f8db4aca 64
+  s_ad885441f410c8::t_4fa019b0e6a06b 1448
+_bmad-output/implementation-artifacts/spec-14-1-lifecycle-pause-resume-through-one-rust-entry.md
+  s_ad885441f410c8::t_eb63453b98c505 5,11
+  s_ad885441f410c8::t_4cde63f1acb3be 10
+  s_ad885441f410c8::t_4b908b49431357 120-148
+  s_ad885441f410c8::t_c802d0bb0f1dfd 1-4,6-8,12-71,80-87,107-119
+  s_ad885441f410c8::t_27749f5cf856fd 9
+  s_ad885441f410c8::t_1a09fb296f98f3 72-79
+  s_ad885441f410c8::t_70f8b3fdb6a88a 88-106
+src/hooks/use-app-lifecycle.test.ts
+  s_ad885441f410c8::t_e2523aec2ba1c5 50-70,74-75,85,87,102,122-123,134,143,146-147
+  s_ad885441f410c8::t_e5bbbd68fa2564 1-6,9-49,71-73,76-84,86,88-101,103-121,124-133,135-142,144-145,148-150
+  s_ad885441f410c8::t_8e5a2b2c292a2c 7-8
+src/App.tsx
+  s_ad885441f410c8::t_af09651b8350da 27-31
+  s_ad885441f410c8::t_ca102fad370c9d 7
+src-tauri/crates/keeper/src/lib.rs
+  s_ad885441f410c8::t_ea6cf708565754 11
+  s_ad885441f410c8::t_9fefec8d2cd1d8 245
+src/lib/ipc/gen/LifecyclePhase.ts
+  s_ad885441f410c8::t_eee21e2886611d 1-12
+src-tauri/Cargo.lock
+  s_ad885441f410c8::t_ce273eb8455b47 2944
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "6e1d3bb859764a4a2bcd1d3408f54bc22fa5b13e",
+  "prompts": {},
+  "sessions": {
+    "s_ad885441f410c8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c51d905c-8c4c-461c-bb92-4e9184cfe635",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

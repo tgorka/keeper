@@ -1,0 +1,110 @@
+src/lib/hotkey.ts
+  s_04b270ac444921::t_dacb5d5b1c1ecf 1-11,20-147
+  s_04b270ac444921::t_9183af101b6d08 12-19
+src/components/layout/app-shell.tsx
+  s_04b270ac444921::t_212518216ca36a 76-78
+  s_04b270ac444921::t_3e0219503da3ac 25
+src-tauri/crates/keeper-core/src/registry.rs
+  s_04b270ac444921::t_a2ef18ea821213 535-548,551-559
+  s_04b270ac444921::t_03aaef21bec1f4 549-550
+  s_04b270ac444921::t_6bd3ca7a4d1d79 1319
+  s_04b270ac444921::t_99f0acc52eff5e 1320-1341
+src-tauri/crates/keeper/Cargo.toml
+  s_04b270ac444921::t_b61206004cc9c9 40-42
+src-tauri/crates/keeper/src/lib.rs
+  s_04b270ac444921::t_9514f984d054d6 8
+  s_04b270ac444921::t_aa9111533503a2 26-29
+  s_04b270ac444921::t_aafe8807c2298d 64-69
+  s_04b270ac444921::t_8914c86a7fe40c 139-140
+src/lib/ipc/client.ts
+  s_04b270ac444921::t_59f7a65556cda5 1110-1130
+  s_04b270ac444921::t_ac44c2636c1b65 45
+  s_04b270ac444921::t_14d62af5b1de5b 110
+src-tauri/crates/keeper-core/src/vm.rs
+  s_04b270ac444921::t_d3fc9320f7eefd 38-62
+src/components/settings/settings-dialog.test.tsx
+  s_04b270ac444921::t_5895d04611c0de 12-27
+  s_04b270ac444921::t_d2b05b57cc90cd 90-93
+  s_04b270ac444921::t_cad8468325f47b 40
+  s_04b270ac444921::t_a00d9f217af548 42-43
+  s_04b270ac444921::t_d8cee80549223a 59-67
+  s_04b270ac444921::t_703634674963df 269-347
+src-tauri/crates/keeper/capabilities/default.json
+  s_04b270ac444921::t_c5ef2c5b103263 6-12,14
+  s_04b270ac444921::t_9a5bbbb46049fb 13
+src/hooks/use-global-hotkey.ts
+  s_04b270ac444921::t_fd6a43d6b1ef16 1-51
+src/lib/ipc/gen/HotkeyVm.ts
+  s_04b270ac444921::t_a4ebcc892eca72 1-32
+src-tauri/crates/keeper/src/ipc.rs
+  s_04b270ac444921::t_cff63b8cebaa81 1620-1684,1686,1688,1694,1700-1710
+  s_04b270ac444921::t_03aaef21bec1f4 30-32
+  s_04b270ac444921::t_27ccfb702cf9e7 1685,1687,1689-1693,1697-1699
+  s_04b270ac444921::t_86c63927d4c924 1695-1696
+  s_04b270ac444921::t_fc58328a809e36 28-29
+src/lib/hotkey.test.ts
+  s_04b270ac444921::t_1bd0d9fdf8f8bf 1-55,59-76
+  s_04b270ac444921::t_cad8468325f47b 56-58
+src/components/layout/chat-list-pane.test.tsx
+  s_04b270ac444921::t_ac41322d9f2a72 1
+  s_04b270ac444921::t_30f0071456c97c 1535-1573
+  s_04b270ac444921::t_7297dc4597ae8c 1493-1534
+  s_04b270ac444921::t_f3b122c1750824 12
+  s_04b270ac444921::t_da26b07d7e0522 153
+src-tauri/Cargo.lock
+  s_04b270ac444921::t_293bb28d659927 1936-1945,2072-2089,2872,4376,5832-5846,7530-7546,7559-7564
+src/components/settings/settings-dialog.tsx
+  s_04b270ac444921::t_c4d326b4cd5bff 18,24,26-27
+  s_04b270ac444921::t_79aeb68fb1a254 21
+  s_04b270ac444921::t_8fde85a31b802c 110
+  s_04b270ac444921::t_ebba09d84ab84a 398-525,527-550
+  s_04b270ac444921::t_a181efcf4cc51f 526
+src/lib/stores/chat-list-focus.ts
+  s_04b270ac444921::t_de33d11bd37cde 1-32
+_bmad-output/implementation-artifacts/spec-9-4-global-hotkey.md
+  s_04b270ac444921::t_fde5c899341aa5 8
+  s_04b270ac444921::t_d764ae13932697 80-93
+  s_04b270ac444921::t_67f38182084167 140-170
+  s_04b270ac444921::t_3dc4089b997094 6
+  s_04b270ac444921::t_aa23c904468175 101-122
+  s_04b270ac444921::t_def1ccbed61411 1-4,7,9-79,94-100,123-139
+  s_04b270ac444921::t_74f70d5d3da24e 5
+src-tauri/Cargo.toml
+  s_04b270ac444921::t_ba7549b6fa67e2 27-29
+src/hooks/use-global-hotkey.test.ts
+  s_04b270ac444921::t_1865b9649c9f38 1-68
+src/components/layout/chat-list-pane.tsx
+  s_04b270ac444921::t_a5dce7b4321973 564-569
+  s_04b270ac444921::t_23f7bcaebca26d 44
+  s_04b270ac444921::t_fd02eca9ca6079 375,378-382,385-407
+  s_04b270ac444921::t_d69e60e9ae3228 117-121
+  s_04b270ac444921::t_533d1a9b64c0b7 360-374,376-377,383-384,408
+  s_04b270ac444921::t_4f55060fe13806 114-116,122-125
+src-tauri/crates/keeper/src/hotkey.rs
+  s_04b270ac444921::t_deaf8b4e3377ae 15
+  s_04b270ac444921::t_1d408d0f577ba2 165-168
+  s_04b270ac444921::t_86c63927d4c924 59,109-112
+  s_04b270ac444921::t_1156ea38614ae4 1-14,16-56,60-64,80-102,107-108,113-164,169-175,180-189,191-196,201-204
+  s_04b270ac444921::t_03aaef21bec1f4 103-106,176-179,197-200
+  s_04b270ac444921::t_fe2d536e74b835 57-58
+  s_04b270ac444921::t_4d6693fb069bea 65-79
+  s_04b270ac444921::t_33b27447ae5a90 190
+_bmad-output/implementation-artifacts/sprint-status.yaml
+  s_04b270ac444921::t_a5df9dea407982 123
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "e6764e475cdf78271591161d8f9a517c565650a0",
+  "prompts": {},
+  "sessions": {
+    "s_04b270ac444921": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6546ed7b-a343-4df5-a829-c399b35400ed",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": null
+    }
+  }
+}

@@ -1,0 +1,19 @@
+src-tauri/crates/keeper/keeper-rec.entitlements
+  s_8a8bc6b6bf6017::t_25c37878df9179 4-16,19-24
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "39ac53259238e87623858d78218e95f082aaaa09",
+  "prompts": {},
+  "sessions": {
+    "s_8a8bc6b6bf6017": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c19d356a-2c90-4eff-82aa-ba9853588b43",
+        "model": "claude-fable-5"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

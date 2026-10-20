@@ -1,0 +1,47 @@
+scripts/gen-ios-icons.swift
+  s_9c4e0cc41093d8::t_1653e866d5b7ba 1-16,19-26,30-65,75-79,83-151,169-178,180-181,189,191-197
+  s_9c4e0cc41093d8::t_ef147cf1bd8abb 80-82
+  s_9c4e0cc41093d8::t_f6cc13e296338c 66-74
+  s_9c4e0cc41093d8::t_146a2bdb341f79 27-29
+  s_9c4e0cc41093d8::t_8a07eaa0ce6586 152-163,166-168
+  s_9c4e0cc41093d8::t_3aea2bf2f2aef5 164-165
+  s_9c4e0cc41093d8::t_5b845a118b3366 179,182-188,190
+  s_9c4e0cc41093d8::t_5435b5356fe7d2 17-18
+_bmad-output/implementation-artifacts/spec-15-1-app-icons-and-launch-assets.md
+  s_9c4e0cc41093d8::t_35c40924199955 1-4,8-11,14-65,71-77,100-140
+  s_9c4e0cc41093d8::t_5427ba1a8033b2 66-70
+  s_9c4e0cc41093d8::t_b37bf9ada88cbc 141-168
+  s_9c4e0cc41093d8::t_74ab483e1e7904 6
+  s_9c4e0cc41093d8::t_563089221d1fa7 5
+  s_9c4e0cc41093d8::t_68a12b9eea1053 12-13
+  s_9c4e0cc41093d8::t_8556e56f16ccff 78-99
+  s_9c4e0cc41093d8::t_7c65ca5520631f 7
+_bmad-output/implementation-artifacts/epic-15-context.md
+  s_9c4e0cc41093d8::t_202c562c6be858 1-43
+src-tauri/crates/keeper/gen/apple/project.yml
+  s_9c4e0cc41093d8::t_e9aef05ed40e87 43-49
+src-tauri/crates/keeper/gen/apple/Assets.xcassets/LaunchBackground.colorset/Contents.json
+  s_9c4e0cc41093d8::t_7411d7d84a693a 1-38
+src-tauri/crates/keeper/gen/apple/LaunchScreen.storyboard
+  s_9c4e0cc41093d8::t_5f227677ecaa4d 6
+  s_9c4e0cc41093d8::t_163b9a1c1a1a9a 26-28
+  s_9c4e0cc41093d8::t_c0778176907cba 18
+_bmad-output/implementation-artifacts/sprint-status.yaml
+  s_9c4e0cc41093d8::t_ae11acb667acb3 163
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "091dff8292ae4a163bd33f2fff7e934c3f6ea75e",
+  "prompts": {},
+  "sessions": {
+    "s_9c4e0cc41093d8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "559d021e-5336-41bf-ac24-4373f3cf304c",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

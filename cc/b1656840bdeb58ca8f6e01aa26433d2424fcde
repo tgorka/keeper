@@ -1,0 +1,19 @@
+_bmad-output/implementation-artifacts/spec-11-2-signed-auto-updates-and-egress-honesty.md
+  s_4ebef231f35393::t_1e0fc37e4b54d7 9
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "ccb1656840bdeb58ca8f6e01aa26433d2424fcde",
+  "prompts": {},
+  "sessions": {
+    "s_4ebef231f35393": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9fb5d183-3b0b-4cbe-9334-27ba184c0be3",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

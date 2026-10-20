@@ -1,0 +1,40 @@
+_bmad-output/implementation-artifacts/spec-17-3-startup-recovery-of-orphaned-segments.md
+  s_3ef3be9c7c11f3::t_170d5a8137f3a0 122-131
+  s_3ef3be9c7c11f3::t_dd054506e72c6a 196
+  s_6e3727b001829e::t_af5238ff0a10f8 7
+  s_3ef3be9c7c11f3::t_57020894238056 9
+  s_3ef3be9c7c11f3::t_8bc7fd55df9710 188
+  s_fb2fce13b17016::t_0b085f647aaa59 8
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "8e1dc5dd6004600a7f7739804a8f8c825eb62292",
+  "prompts": {},
+  "sessions": {
+    "s_3ef3be9c7c11f3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "66932d94-feb6-4a6b-95da-86dd0f438102",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    },
+    "s_6e3727b001829e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e57aeb97-bb25-4613-a60b-2fc4f1aab5d1",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    },
+    "s_fb2fce13b17016": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7f33090c-2e8b-440b-834c-50dc6145aaed",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

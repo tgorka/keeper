@@ -1,0 +1,31 @@
+README.md
+  s_0f5270fa13a2aa::t_a9e905710fc057 60
+_bmad-output/implementation-artifacts/deferred-work.md
+  s_0f5270fa13a2aa::t_0b56678cfcb365 905-909
+_bmad-output/implementation-artifacts/spec-15-4-required-ios-ci-gate-and-release-hygiene.md
+  s_0f5270fa13a2aa::t_914936ef223fdc 36
+  s_0f5270fa13a2aa::t_2221dabc0ed9ad 45
+  s_0f5270fa13a2aa::t_76a2573027f300 5
+  s_0f5270fa13a2aa::t_587f20da005499 44
+  s_0f5270fa13a2aa::t_08732574019755 46
+  s_0f5270fa13a2aa::t_00767ab13b2943 8,20,26,28,34-35,37,39,50,52-60,77-78,84-86
+  s_0f5270fa13a2aa::t_fb5bafd724e3bd 93,95,97,99-109,111-115,117-120
+  s_0f5270fa13a2aa::t_f2f831b752a7a6 61-71
+  s_0f5270fa13a2aa::t_2c8f369dca23bb 47
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "c83b30616ef3700935b56a5486e76b0f1386b38c",
+  "prompts": {},
+  "sessions": {
+    "s_0f5270fa13a2aa": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d3278b65-e379-4c57-b8a4-ca263fb634fe",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

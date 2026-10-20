@@ -1,0 +1,23 @@
+_bmad-output/implementation-artifacts/deferred-work.md
+  s_31275b603f4d68::t_ba4f3de8c4aeb3 321-328
+_bmad-output/implementation-artifacts/spec-9-1-command-palette.md
+  s_31275b603f4d68::t_7f78793fcc69b4 9
+  s_31275b603f4d68::t_4448c31575528d 104-117
+  s_31275b603f4d68::t_61035d66b2868b 156-175
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "295122f2e97c451686084db12d8bacaa289da02c",
+  "prompts": {},
+  "sessions": {
+    "s_31275b603f4d68": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b28da6e7-3fe9-4b3c-bdfd-764f82a2ffb8",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

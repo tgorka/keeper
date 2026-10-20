@@ -1,0 +1,87 @@
+_bmad-output/implementation-artifacts/deferred-work.md
+  s_f0a905fc39faaa::t_ecc453efa6f7bc 333-340
+src/lib/ipc/gen/PaletteActionVm.ts
+  s_f0a905fc39faaa::t_ee384941c09fb2 40-47
+src-tauri/crates/keeper/src/ipc.rs
+  s_f0a905fc39faaa::t_de45564e9582b6 2313-2325
+  s_f0a905fc39faaa::t_2b1bfea79d88c0 31-32
+  s_f0a905fc39faaa::t_1eaed6bbea3624 29-30
+src-tauri/crates/keeper-core/src/vm.rs
+  s_f0a905fc39faaa::t_db36af22eb5611 2131-2177
+src/lib/ipc/client.ts
+  s_f0a905fc39faaa::t_4248267065bb25 670-680
+  s_f0a905fc39faaa::t_c6ef245209d83e 111
+  s_f0a905fc39faaa::t_95fd0ff082436f 56-57
+  s_f0a905fc39faaa::t_b34e79e984d09a 669
+src/components/cheat-sheet/cheat-sheet-overlay.test.tsx
+  s_f0a905fc39faaa::t_09497a4963624b 1-113
+src/components/command-palette/command-palette.test.tsx
+  s_f0a905fc39faaa::t_7ca44b321f386e 60
+src/hooks/use-menu-actions.ts
+  s_f0a905fc39faaa::t_fdd059790f6401 20,22
+  s_f0a905fc39faaa::t_fd78a48f4dc67f 79-100
+  s_f0a905fc39faaa::t_e0b43d8c4ce3de 1-19,21,23-78,101-106
+src/hooks/use-cheat-sheet-shortcut.test.ts
+  s_f0a905fc39faaa::t_c785cbb912a254 1-74
+src-tauri/crates/keeper-core/src/palette.rs
+  s_f0a905fc39faaa::t_13fd28283bedcc 21-23
+  s_f0a905fc39faaa::t_ca424d8b7a5ad4 343,356-373
+  s_f0a905fc39faaa::t_74d53a4e9c2667 879-931,938-968,977-1027,1032,1037-1077
+  s_f0a905fc39faaa::t_634863513976ad 537-619,638,651,672-673
+  s_f0a905fc39faaa::t_c6fff731fbdc2e 452-454,460,462,468,470,476,478,484,486,492,494,500,502,508,510,516
+  s_f0a905fc39faaa::t_953b747da45f14 620-631,637,639-650,652-671
+  s_f0a905fc39faaa::t_2b1bfea79d88c0 632-636,932-937,969-976,1028-1031,1033-1036
+src/hooks/use-cheat-sheet-shortcut.ts
+  s_f0a905fc39faaa::t_2c3f7bd9e37755 1-38
+src/components/layout/app-shell.tsx
+  s_f0a905fc39faaa::t_fdd059790f6401 4
+  s_f0a905fc39faaa::t_5fd63737c103e4 22
+  s_f0a905fc39faaa::t_9f5b3e70a5e685 136
+  s_f0a905fc39faaa::t_8973f3a52aff2f 26
+  s_f0a905fc39faaa::t_e6bd1acca7b883 65-68
+src/lib/stores/cheat-sheet.ts
+  s_f0a905fc39faaa::t_f059e660900622 1-39
+src-tauri/crates/keeper/src/lib.rs
+  s_f0a905fc39faaa::t_f3524ec9d8c907 46-58
+  s_f0a905fc39faaa::t_bb75a9de068ead 143
+  s_f0a905fc39faaa::t_b7e7e601a11c91 10
+src-tauri/crates/keeper/src/menu.rs
+  s_f0a905fc39faaa::t_555303fa653d81 29
+  s_f0a905fc39faaa::t_8771c7abe1e82a 1-28,30-110,115-133
+  s_f0a905fc39faaa::t_2b1bfea79d88c0 111-114
+_bmad-output/implementation-artifacts/spec-9-3-cheat-sheet-and-native-menu-bar-from-the-action-registry.md
+  s_f0a905fc39faaa::t_1879c78a85abbe 6
+  s_f0a905fc39faaa::t_7e2cc0201a1a51 5
+  s_f0a905fc39faaa::t_3b46f7a09c7e44 94-110
+  s_f0a905fc39faaa::t_d919b504e79453 77-86
+  s_f0a905fc39faaa::t_5c203fd0d3866b 1-4,7-76,87-93,111-126
+  s_f0a905fc39faaa::t_68282ffbc5b433 127-155
+  s_f0a905fc39faaa::t_03724296204e79 156
+src/lib/ipc/gen/MenuSectionVm.ts
+  s_f0a905fc39faaa::t_ee384941c09fb2 1-22
+src/hooks/use-menu-actions.test.ts
+  s_f0a905fc39faaa::t_ceb06312330711 1-148
+src/lib/ipc/gen/MenuItemVm.ts
+  s_f0a905fc39faaa::t_ee384941c09fb2 1-33
+src/components/cheat-sheet/cheat-sheet-overlay.tsx
+  s_f0a905fc39faaa::t_a451211b0ae9e4 1-29,31-99
+  s_f0a905fc39faaa::t_fdd059790f6401 30
+_bmad-output/implementation-artifacts/sprint-status.yaml
+  s_f0a905fc39faaa::t_112ee6626957e3 122
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "749b2b620ad89c11cdcf9dbafe981bf80ab87914",
+  "prompts": {},
+  "sessions": {
+    "s_f0a905fc39faaa": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9c1708a5-66e5-4ca8-a973-0666f2c7a907",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

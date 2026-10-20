@@ -1,0 +1,23 @@
+src-tauri/crates/keeper-core/src/org_account/setup_qr.rs
+  s_cbf9741c93ab65::t_2d5e4f6035e123 19,22
+src/components/layout/phone-shell.tsx
+  s_cbf9741c93ab65::t_54022e76ab9cf0 950
+scripts/build-sha.test.ts
+  s_cbf9741c93ab65::t_6645d987f9259b 19-26,28-30
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "046cfa0a5bc4e2536c143c263c40b6189e3a8f6a",
+  "prompts": {},
+  "sessions": {
+    "s_cbf9741c93ab65": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5b400cc2-6399-4f94-b9bb-ce6893683e42",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

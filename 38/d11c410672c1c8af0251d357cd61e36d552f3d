@@ -1,0 +1,19 @@
+_bmad-output/implementation-artifacts/spec-17-4-automated-gapless-concat-test-nfr-22.md
+  s_f682bb4d793108::t_f5d83bfb2f476d 7
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "38d11c410672c1c8af0251d357cd61e36d552f3d",
+  "prompts": {},
+  "sessions": {
+    "s_f682bb4d793108": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e03a9ff0-8612-481b-9abb-8b010f80334d",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

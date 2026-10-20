@@ -1,0 +1,66 @@
+_bmad-output/implementation-artifacts/bmad-dev-auto-result-15-5-paid-program-decision-gate-recorded.md
+  s_30a4afb7987083::t_754ef6badeac2a 1-49
+src-tauri/crates/keeper/src/ipc.rs
+  s_8a8bc6b6bf6017::t_70e471b1a6b74e 652-664
+docs/release.md
+  s_1857a2cee5581e::t_e7367fac077126 190,192
+  s_1857a2cee5581e::t_8690b2dfac8066 162-179
+src-tauri/Cargo.toml
+  s_8a8bc6b6bf6017::t_d05508a0c05482 101-104
+README.md
+  s_1857a2cee5581e::t_c53f44169c1bf9 56-62
+src-tauri/crates/keeper/Cargo.toml
+  s_8a8bc6b6bf6017::t_4679ede9e46985 87-91
+_bmad-output/implementation-artifacts/spec-15-4-required-ios-ci-gate-and-release-hygiene.md
+  s_e6483ba897e77a::t_9c002f2db17484 8
+  s_e6483ba897e77a::t_6125bd428c2b69 44
+  s_e6483ba897e77a::t_f6400f2f8cf5ff 47
+  s_e6483ba897e77a::t_c330dcbb49f9dd 46
+  s_1857a2cee5581e::t_e03c70356282f0 5
+  s_1857a2cee5581e::t_84fab6f0429472 74,76-84,86,88,90,93-126
+  s_e6483ba897e77a::t_a4ac1bfd6d394b 45
+.github/workflows/ci.yml
+  s_1857a2cee5581e::t_b822c60eff7da6 59
+src-tauri/Cargo.lock
+  s_8a8bc6b6bf6017::t_f57f3aae533f3e 2928,3996-3997,3999
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "481d4269222885c4d8dc87d219042edf254c2712",
+  "prompts": {},
+  "sessions": {
+    "s_1857a2cee5581e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d92fd94a-0d0c-4955-b7a8-61377de13696",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    },
+    "s_30a4afb7987083": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "405d8370-0db4-46d4-8324-3d9ee3d7d0a4",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    },
+    "s_8a8bc6b6bf6017": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c19d356a-2c90-4eff-82aa-ba9853588b43",
+        "model": "claude-fable-5"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    },
+    "s_e6483ba897e77a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1bd40433-728e-46ed-b7bc-3703af12f2c1",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

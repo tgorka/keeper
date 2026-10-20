@@ -1,0 +1,45 @@
+print.html
+  s_9bfe0bf28c8205::t_92bcd42b37e485 1-29
+src-tauri/Cargo.lock
+  s_9bfe0bf28c8205::t_781848618fc6d5 4191,4201,5371-5380,5405-5415,5462-5463
+src-tauri/Cargo.toml
+  s_9bfe0bf28c8205::t_dba3c6964f0074 115-119
+src-tauri/crates/keeper-core/src/capture.rs
+  s_9bfe0bf28c8205::t_64a83fd56d7a37 249
+src-tauri/crates/keeper/Cargo.toml
+  s_9bfe0bf28c8205::t_822325449da367 119-128
+src-tauri/crates/keeper/capabilities/print.json
+  s_9bfe0bf28c8205::t_fc0f31d503cb2c 1-8
+src-tauri/crates/keeper/src/lib.rs
+  s_9bfe0bf28c8205::t_1ca8e1320970dd 11-13,922
+src-tauri/crates/keeper/src/pdf_export.rs
+  s_9bfe0bf28c8205::t_6b8701e857eb4e 1-166
+src-tauri/crates/keeper/src/sync_ipc.rs
+  s_9bfe0bf28c8205::t_c11449fb721f72 2318-2459
+src/components/viewers/text-file-frame.tsx
+  s_9bfe0bf28c8205::t_c41db50e4cf65a 128,135,179-191,495-501,851-878,982-991
+src/lib/ipc/client.ts
+  s_9bfe0bf28c8205::t_a313adb4ebc8b8 3257-3276
+src/print-main.tsx
+  s_9bfe0bf28c8205::t_d7833d2fddc108 1-114
+src/test/print-capability.test.ts
+  s_9bfe0bf28c8205::t_9453044e171d3c 1-37
+vite.config.ts
+  s_9bfe0bf28c8205::t_ce0177fe7450cf 51
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "42c1b8d425082b037103c3640e0c1b3d99cec910",
+  "prompts": {},
+  "sessions": {
+    "s_9bfe0bf28c8205": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a6a8d43-9ddd-4b65-b1f4-97581e5db3f3",
+        "model": "claude-opus-5"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

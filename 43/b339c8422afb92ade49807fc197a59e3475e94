@@ -1,0 +1,19 @@
+_bmad-output/implementation-artifacts/spec-3-9-receipts-typing-and-history-pagination.md
+  s_21e089134ce7b0::t_db9bb16241c55f 7
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "43b339c8422afb92ade49807fc197a59e3475e94",
+  "prompts": {},
+  "sessions": {
+    "s_21e089134ce7b0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "34d3da3d-dcd7-4b2e-b7ed-a1e477b45ace",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

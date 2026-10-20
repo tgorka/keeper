@@ -1,0 +1,33 @@
+src-tauri/crates/keeper-core/src/account.rs
+  s_80b4095bddca71::t_ba727bd9d2cca5 1297-1311,1318
+_bmad-output/implementation-artifacts/spec-6-3-native-bridge-login-via-provisioning-api.md
+  s_80b4095bddca71::t_b6634e35e56817 5
+  s_80b4095bddca71::t_3c6c68e16cf0a5 188-201
+  s_80b4095bddca71::t_970ded57f8a4fa 125-137
+  s_61b02d480f42e6::t_5ec3c9aa59fb12 7
+  s_80b4095bddca71::t_550ad1be7a785b 9
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "a2af983263049f74b6f9367f5ee9801cca1d2840",
+  "prompts": {},
+  "sessions": {
+    "s_61b02d480f42e6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "031857d8-d6c2-487b-8523-a8100cf95a82",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    },
+    "s_80b4095bddca71": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b116a5dc-d280-4017-b736-b1a00ee56396",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

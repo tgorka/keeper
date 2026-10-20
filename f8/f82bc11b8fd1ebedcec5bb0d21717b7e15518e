@@ -1,0 +1,29 @@
+_bmad-output/implementation-artifacts/spec-dw-2-login-unsupported-type-detection.md
+  s_90c1bfd81f365b::t_235d87206aca3f 5,7
+  s_90c1bfd81f365b::t_ac93f0471b78a3 60-61
+  s_90c1bfd81f365b::t_4ea98963e8647e 6
+  s_90c1bfd81f365b::t_7f9e4e1b9b8627 69-85
+  s_90c1bfd81f365b::t_7024ce17e0c579 125-142
+  s_90c1bfd81f365b::t_c5605c4883834c 1-4,8-59,62-68,86-124
+src-tauri/crates/keeper-core/src/auth.rs
+  s_90c1bfd81f365b::t_733c8c4478615a 102-126
+  s_90c1bfd81f365b::t_4af7d881bd3e97 29
+  s_90c1bfd81f365b::t_767e70660a4eda 403-412
+  s_90c1bfd81f365b::t_5d7433b0fe4292 844-888
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "f8f82bc11b8fd1ebedcec5bb0d21717b7e15518e",
+  "prompts": {},
+  "sessions": {
+    "s_90c1bfd81f365b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "506b6ea1-1ed9-44e9-b79c-287a71ad517d",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

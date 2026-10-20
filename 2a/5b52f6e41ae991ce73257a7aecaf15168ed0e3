@@ -1,0 +1,31 @@
+src-tauri/crates/keeper-core/src/org_account/session.rs
+  s_9ff6a60bde70e7::t_181e7a658d9704 400-431
+  s_9ff6a60bde70e7::t_54f9d34580f7e3 109-137
+src-tauri/crates/keeper/src/account_ipc.rs
+  s_9ff6a60bde70e7::t_181e7a658d9704 1424-1428
+  s_9ff6a60bde70e7::t_f0c2532c2d4b99 1419-1423,1429-1436,1442-1449
+docs/account.md
+  s_9ff6a60bde70e7::t_e498f8b53d24d0 129-130,465-487
+src-tauri/crates/keeper-core/src/org_account/oidc.rs
+  s_9ff6a60bde70e7::t_181e7a658d9704 1064-1073,1117-1120,1247-1251,2092-2096,2185-2194,3117-3118,3570-3756
+  s_9ff6a60bde70e7::t_2d4b87ffa43293 55-56,1038-1055,1062,1082,1095,1098-1103,1106-1116,1121-1138,1147,1154-1246,1252-1340,1579-1582,1728-1732
+  s_9ff6a60bde70e7::t_98d23f04558b9b 2425-2427
+  s_9ff6a60bde70e7::t_97aabb4def2641 1836-1844,1871-1875,1955-1956,1989-1997,2038,2083-2091,2097-2119,2182-2184,2195-2244,2280-2281,2333-2337,2345-2346,2441-2443,2449-2452,3061-3064,3070,3083,3255,3279,3519,3550
+  s_9ff6a60bde70e7::t_005871b841261c 3757
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "2a5b52f6e41ae991ce73257a7aecaf15168ed0e3",
+  "prompts": {},
+  "sessions": {
+    "s_9ff6a60bde70e7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2d9fe75d-0ffa-4c34-90a5-b723b9f1129a",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

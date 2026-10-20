@@ -1,0 +1,19 @@
+_bmad-output/implementation-artifacts/spec-19-4-microphone-hot-unplug-resilience.md
+  s_50a6bb9f3df3a5::t_d8917569b470b4 9
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "40669f6c3ccd355505db087788ce2f75bf940598",
+  "prompts": {},
+  "sessions": {
+    "s_50a6bb9f3df3a5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "51442771-2bba-468c-b976-322fd69e3aae",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

@@ -1,0 +1,39 @@
+_bmad-output/planning-artifacts/architecture/architecture-keeper-2026-07-03/ARCHITECTURE-SPINE.md
+  s_8a8bc6b6bf6017::t_417923fa22a3c4 308
+  s_8a8bc6b6bf6017::t_329477153f6001 328-338
+  s_8a8bc6b6bf6017::t_61f474b4b609cb 340
+  s_8a8bc6b6bf6017::t_a28572f145a2d1 183
+  s_8a8bc6b6bf6017::t_c978c127f8ce39 7,10-11,18
+  s_8a8bc6b6bf6017::t_51f508294ace42 351-355
+  s_8a8bc6b6bf6017::t_c6f2010f74aa56 273-275,279-282,284-285,287-289,291
+  s_8a8bc6b6bf6017::t_65921f1dab109a 203
+  s_8a8bc6b6bf6017::t_a063d848f980c4 244-245
+  s_8a8bc6b6bf6017::t_469ce5bc01d335 174-182,184-202,204-213
+  s_8a8bc6b6bf6017::t_42084c2822588b 226-227
+  s_8a8bc6b6bf6017::t_7f87f13939d94a 339
+_bmad-output/planning-artifacts/architecture/architecture-keeper-2026-07-03/.memlog.md
+  s_8a8bc6b6bf6017::t_5f88582d1da0ac 38-49
+  s_8a8bc6b6bf6017::t_adb7c547f8ffa6 5,50-51
+_bmad-output/planning-artifacts/architecture/architecture-keeper-2026-07-03/reviews/review-ios-update-adversarial.md
+  s_8a8bc6b6bf6017::t_bdef1e055552bf 1-21
+_bmad-output/planning-artifacts/architecture/architecture-keeper-2026-07-03/reviews/review-ios-update-rubric-walker.md
+  s_8a8bc6b6bf6017::t_65e1a98516175e 1-14
+_bmad-output/planning-artifacts/architecture/architecture-keeper-2026-07-03/reviews/review-ios-update-currency-check.md
+  s_8a8bc6b6bf6017::t_3b1cad1333637e 1-15
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "d3e72c5a2d6dff8d69f239361c0e2197c9cca7d4",
+  "prompts": {},
+  "sessions": {
+    "s_8a8bc6b6bf6017": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c19d356a-2c90-4eff-82aa-ba9853588b43",
+        "model": "claude-fable-5"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

@@ -1,0 +1,88 @@
+src-tauri/crates/keeper-core/src/bridges/mod.rs
+  s_ef77fe1626a7fe::t_25e1332b6a1ddd 161-182
+  s_ef77fe1626a7fe::t_30e9a4a16ffc06 307-310,315-338
+  s_ef77fe1626a7fe::t_766a528e80d315 25
+  s_ef77fe1626a7fe::t_d0752c5c56f715 311-314
+src/components/layout/conversation-pane.test.tsx
+  s_ef77fe1626a7fe::t_74bf871b25ecb4 23-25
+  s_ef77fe1626a7fe::t_7373c31300ea8c 1481-1486
+  s_ef77fe1626a7fe::t_49f8e28a443361 92
+  s_ef77fe1626a7fe::t_06597a35c0b9a3 1568,1579-1617
+  s_ef77fe1626a7fe::t_07692cd152c874 97
+  s_ef77fe1626a7fe::t_166b23300a8f43 1538
+  s_ef77fe1626a7fe::t_ad8dcbfdceb8b8 37-40
+  s_ef77fe1626a7fe::t_68b5b938fffae4 166-171
+  s_ef77fe1626a7fe::t_9dfe61a7afe35c 1474-1480,1487-1537,1539-1567,1569-1578,1618-1635
+src/hooks/use-coupling-caveats.ts
+  s_ef77fe1626a7fe::t_ae48360f0ac1a3 1-52
+_bmad-output/implementation-artifacts/sprint-status.yaml
+  s_ef77fe1626a7fe::t_29fda8b7dbc79e 115
+src-tauri/crates/keeper-core/src/vm.rs
+  s_ef77fe1626a7fe::t_7ffc7b03f6719f 1573-1591
+src/lib/ipc/gen/CouplingCaveatVm.ts
+  s_ef77fe1626a7fe::t_ec2ac21f7fa0f4 1-24
+src-tauri/crates/keeper-core/src/account.rs
+  s_ef77fe1626a7fe::t_407e0b06b8bec6 2968-2977,2984,2992-3030,3035-3058
+  s_ef77fe1626a7fe::t_6923ae932713b4 3031
+  s_ef77fe1626a7fe::t_7792f67a729873 3032-3034
+_bmad-output/implementation-artifacts/spec-8-2-typing-presence-suppression-coupling-caveats-and-manual-release.md
+  s_ef77fe1626a7fe::t_34e60c9a05f453 105-158
+  s_ef77fe1626a7fe::t_9e69bdadd9ba36 5
+  s_ef77fe1626a7fe::t_639d2713da03d5 11
+  s_ef77fe1626a7fe::t_15f2bb4285892b 9
+  s_ef77fe1626a7fe::t_e1e7369e2856e6 10
+  s_ef77fe1626a7fe::t_a28c02aca8248e 74-80
+  s_ef77fe1626a7fe::t_6c39743696ceb4 1-4,6-8,12-73,81-104
+src-tauri/crates/keeper/src/ipc.rs
+  s_ef77fe1626a7fe::t_4509986e08bd33 2496-2503,2513-2532,2538-2547
+  s_ef77fe1626a7fe::t_d0752c5c56f715 28-29
+  s_ef77fe1626a7fe::t_b196fc449219db 2533
+  s_ef77fe1626a7fe::t_ab183c5dba5b99 2548
+  s_ef77fe1626a7fe::t_11dc8a3c4ec2e8 27
+src-tauri/crates/keeper-core/src/signals.rs
+  s_ef77fe1626a7fe::t_ec83a43c798bd0 244-253,256-258,260-264,267-271,273-274,276-280
+  s_ef77fe1626a7fe::t_515111152dbf0d 140-152,154-169,176-191,194
+  s_ef77fe1626a7fe::t_2cf191979083bd 216-217
+  s_ef77fe1626a7fe::t_5e0cf2b989407d 20-25
+  s_ef77fe1626a7fe::t_107513046a565a 192-193
+  s_ef77fe1626a7fe::t_ad266811666618 195
+  s_ef77fe1626a7fe::t_3310ce4f937a0c 254-255,259,265-266,272,275,281-286,296-299,306-307,309-317,328,331-346,348-352
+  s_ef77fe1626a7fe::t_a68e09b7455a6c 300-301,303-305
+  s_ef77fe1626a7fe::t_3190896fe3a09f 302
+  s_ef77fe1626a7fe::t_4bcd4b0c8951b4 26-27
+  s_ef77fe1626a7fe::t_d32319ee0215ec 287-295,308,318-327,329-330
+  s_ef77fe1626a7fe::t_e82d917763936c 347
+src/lib/ipc/client.ts
+  s_ef77fe1626a7fe::t_057f44d65fe5ad 95
+  s_ef77fe1626a7fe::t_c3f44899aab6c4 32
+  s_ef77fe1626a7fe::t_b519ac0db13092 1275-1299
+src/components/layout/conversation-pane.tsx
+  s_ef77fe1626a7fe::t_49e143099fd5a1 361-362,364,369-377,380-387,395-399
+  s_ef77fe1626a7fe::t_0c9a3e6caf2026 1302-1304
+  s_ef77fe1626a7fe::t_5d1d73b1ced623 42,44
+  s_ef77fe1626a7fe::t_da977a3fbcea9a 62
+  s_ef77fe1626a7fe::t_e7d90fd0ec4d1c 281-291,296,300,303,307,310-311,313-322,325-360,363,365-368,378-379,388-391,393-394,400-403
+  s_ef77fe1626a7fe::t_99db5767fed92b 304-306,324
+  s_ef77fe1626a7fe::t_166b23300a8f43 392
+  s_ef77fe1626a7fe::t_35c34101ed8e79 1301,1305-1308
+src-tauri/crates/keeper/src/lib.rs
+  s_ef77fe1626a7fe::t_f6763fb834dbfc 123-124
+src/hooks/use-coupling-caveats.test.ts
+  s_ef77fe1626a7fe::t_a2b88b11314b4b 1-59
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "d584c8d98aa86e036999c5e714641b95785073db",
+  "prompts": {},
+  "sessions": {
+    "s_ef77fe1626a7fe": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "68c35a97-6b0b-470a-9996-da80dc667254",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": null
+    }
+  }
+}

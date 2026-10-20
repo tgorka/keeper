@@ -1,0 +1,26 @@
+_bmad-output/implementation-artifacts/spec-5-2-durability-against-remote-rewrites-edit-history.md
+  s_3af24685db5977::t_a05b45ab12dc99 177-180
+  s_3af24685db5977::t_c85a4bbc339efe 9
+  s_3af24685db5977::t_543f1951d7d120 119-128
+src-tauri/crates/keeper-core/src/account.rs
+  s_3af24685db5977::t_bee2b32d04c780 3907-3948
+  s_3af24685db5977::t_80d37c2ec5b017 3851,3865
+  s_3af24685db5977::t_006cf142db11ee 2546-2548
+  s_3af24685db5977::t_530c0bfded1ef5 2559-2564,2569,2572-2575,2578,2581
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "6fe524baf8261d1b9733b643456ee34aeac76eea",
+  "prompts": {},
+  "sessions": {
+    "s_3af24685db5977": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "32c47184-a095-469d-ad29-78ea4ec44611",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

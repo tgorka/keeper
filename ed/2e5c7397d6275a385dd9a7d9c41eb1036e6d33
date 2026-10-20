@@ -1,0 +1,69 @@
+src-tauri/crates/keeper/gen/apple/keeper.xcodeproj/project.xcworkspace/contents.xcworkspacedata
+  s_3c69cb3f215305::t_31957ccda2f7e6 1-7
+docs/ios.md
+  s_3c69cb3f215305::t_8e4040fe4981a0 1-53,57-68,73-89
+  s_3c69cb3f215305::t_e9c5888b28eba2 54-56,69-72
+src-tauri/crates/keeper/gen/apple/keeper.xcodeproj/project.xcworkspace/xcshareddata/WorkspaceSettings.xcsettings
+  s_3c69cb3f215305::t_31957ccda2f7e6 1-10
+rust-toolchain.toml
+  s_3c69cb3f215305::t_f091838f5672a1 4
+src-tauri/crates/keeper/gen/apple/keeper.xcodeproj/xcshareddata/xcschemes/keeper_iOS.xcscheme
+  s_3c69cb3f215305::t_31957ccda2f7e6 1-131
+src-tauri/crates/keeper/gen/apple/keeper_iOS/keeper_iOS.entitlements
+  s_3c69cb3f215305::t_31957ccda2f7e6 1-5
+src-tauri/crates/keeper/gen/apple/Podfile
+  s_3c69cb3f215305::t_31957ccda2f7e6 1-3,5-21
+  s_3c69cb3f215305::t_510cccd0e2b9ab 4
+src-tauri/crates/keeper/gen/apple/.gitignore
+  s_3c69cb3f215305::t_31957ccda2f7e6 1-3
+src-tauri/crates/keeper/gen/apple/Sources/keeper/bindings/bindings.h
+  s_3c69cb3f215305::t_31957ccda2f7e6 1-8
+biome.json
+  s_3c69cb3f215305::t_a1506bb393dfcc 14
+src-tauri/crates/keeper/gen/apple/LaunchScreen.storyboard
+  s_3c69cb3f215305::t_31957ccda2f7e6 1-30
+src-tauri/crates/keeper/gen/apple/keeper_iOS/Info.plist
+  s_3c69cb3f215305::t_31957ccda2f7e6 1-44
+src-tauri/crates/keeper/gen/apple/project.yml
+  s_3c69cb3f215305::t_4c89b07bf26c60 5
+  s_3c69cb3f215305::t_31957ccda2f7e6 1-4,6-88
+src-tauri/crates/keeper/gen/apple/Sources/keeper/main.mm
+  s_3c69cb3f215305::t_31957ccda2f7e6 1-6
+src-tauri/crates/keeper/gen/apple/keeper.xcodeproj/project.pbxproj
+  s_3c69cb3f215305::t_e5c61719208380 341,403
+  s_3c69cb3f215305::t_31957ccda2f7e6 1-340,342-402,404-470
+src-tauri/.gitignore
+  s_3c69cb3f215305::t_553a7ee74dec64 9-17
+_bmad-output/implementation-artifacts/deferred-work.md
+  s_3c69cb3f215305::t_92494abd38c287 773-793
+src-tauri/crates/keeper/gen/apple/ExportOptions.plist
+  s_3c69cb3f215305::t_31957ccda2f7e6 1-8
+src-tauri/crates/keeper/gen/apple/Assets.xcassets/Contents.json
+  s_3c69cb3f215305::t_31957ccda2f7e6 1-6
+_bmad-output/implementation-artifacts/spec-12-1-ios-project-init-and-repo-integration.md
+  s_3c69cb3f215305::t_d7c4037a45f04e 158-170,173-194
+  s_3c69cb3f215305::t_588ac22056959c 135-157
+  s_3c69cb3f215305::t_406dd35f4ae8e0 6
+  s_3c69cb3f215305::t_b7cf038dc988e9 5
+  s_3c69cb3f215305::t_bf445cffce2689 7
+src-tauri/crates/keeper/gen/apple/Assets.xcassets/AppIcon.appiconset/Contents.json
+  s_3c69cb3f215305::t_31957ccda2f7e6 1-116
+_bmad-output/implementation-artifacts/sprint-status.yaml
+  s_3c69cb3f215305::t_6b6ac4a3dd189e 137
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "ed2e5c7397d6275a385dd9a7d9c41eb1036e6d33",
+  "prompts": {},
+  "sessions": {
+    "s_3c69cb3f215305": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "00b7401c-cbab-41c1-90ad-d78b6aae385d",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

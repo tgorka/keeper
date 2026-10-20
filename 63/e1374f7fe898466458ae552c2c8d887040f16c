@@ -1,0 +1,23 @@
+src/components/viewers/html-view.ts
+  s_9bfe0bf28c8205::t_a46df6da717a45 66-68,87-88,93,95,100,106-109,140-170,240-243,257,282-289,301-315,348-352,354
+src/components/viewers/raw-rendered-view.test.tsx
+  s_9bfe0bf28c8205::t_d25c528e9e6dd1 1553-1611,1626,1638,1660,1671,1691
+src/components/viewers/raw-rendered-view.tsx
+  s_9bfe0bf28c8205::t_343ec7cd5f0c09 331-347,349,351,387-392,394-395
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "63e1374f7fe898466458ae552c2c8d887040f16c",
+  "prompts": {},
+  "sessions": {
+    "s_9bfe0bf28c8205": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a6a8d43-9ddd-4b65-b1f4-97581e5db3f3",
+        "model": "claude-opus-5"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

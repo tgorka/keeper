@@ -1,0 +1,90 @@
+src-tauri/crates/keeper/src/lib.rs
+  s_810b957742c7aa::t_e5c33fa8acaa60 30-33
+  s_810b957742c7aa::t_168b7d1663a8ca 74-94
+  s_810b957742c7aa::t_b695e1f0a72d34 185-186
+src/lib/ipc/client.ts
+  s_810b957742c7aa::t_3da03f7c624106 1428-1445
+src-tauri/crates/keeper-core/src/notify.rs
+  s_810b957742c7aa::t_d7aeadf4574abb 109-111
+  s_810b957742c7aa::t_aa501fc4559330 123-134
+  s_810b957742c7aa::t_77e4d90d3d6ccf 183-188,388-395,437-443,447-449,456-459,668-671
+  s_810b957742c7aa::t_5badfeab9ea20d 1-23,27-108,112-122,135-138,144-158,160-182,189-246,254-262,265-270,272-273,275,278-318,321-387,396-436,444-446,450-455,460-462,475-529,532-533,535,537-538,540-575,577-667,672-673
+  s_810b957742c7aa::t_47949252353df9 247-253,263-264,271,274,276-277
+  s_810b957742c7aa::t_69668fa14ae23d 24-26
+  s_810b957742c7aa::t_ddbb9e1cbeb345 463-474
+  s_810b957742c7aa::t_4ac91e109c884b 319-320
+  s_810b957742c7aa::t_b15ee411b7eae2 530-531,534,536,539
+  s_810b957742c7aa::t_dca06e8f87e329 576
+  s_810b957742c7aa::t_e3e596727e9b69 139-143,159
+src-tauri/crates/keeper-core/src/lib.rs
+  s_810b957742c7aa::t_b782e037e73f50 23
+src/components/settings/settings-dialog.tsx
+  s_810b957742c7aa::t_d1716610aff82f 111
+  s_810b957742c7aa::t_2d9b6454257682 204-275
+  s_810b957742c7aa::t_70be5f7b1acee7 30-31
+src/components/settings/settings-dialog.test.tsx
+  s_810b957742c7aa::t_62114c5872e3f5 65-66
+  s_810b957742c7aa::t_156dbe95c2ec66 10-11
+  s_810b957742c7aa::t_1d317012e4830f 100-103
+  s_810b957742c7aa::t_6882459763fa6e 241-291
+  s_810b957742c7aa::t_8a01000fadad90 46-47
+_bmad-output/implementation-artifacts/epic-10-context.md
+  s_810b957742c7aa::t_7aaa1efd78b8f0 1-51
+src-tauri/Cargo.toml
+  s_810b957742c7aa::t_b516aa7517ac01 30-33
+src-tauri/crates/keeper/capabilities/default.json
+  s_810b957742c7aa::t_a638ed659e4204 13-14
+_bmad-output/implementation-artifacts/deferred-work.md
+  s_810b957742c7aa::t_54263719b88c00 341-348
+src-tauri/crates/keeper-core/src/registry.rs
+  s_810b957742c7aa::t_d5f89b339ca1e4 426-446
+  s_810b957742c7aa::t_77633e18b03f2b 1341-1351
+  s_810b957742c7aa::t_982c75b27dd829 1340
+src-tauri/crates/keeper/src/ipc.rs
+  s_810b957742c7aa::t_51674288d3efb1 240-253
+  s_810b957742c7aa::t_5e2be58e586c87 305-319
+  s_810b957742c7aa::t_4a524046658654 2479-2500
+  s_810b957742c7aa::t_d856d2b9b474e4 11
+src-tauri/crates/keeper-core/src/account.rs
+  s_810b957742c7aa::t_7d01e2959f7a99 568-574
+  s_810b957742c7aa::t_8aa6ca88f4dcaa 4171-4174
+  s_810b957742c7aa::t_4a9aa4483d2896 663,671,686,986,994,1009,1083,1091,1106,1241,1249,1264,1365,1373,1388,1488,1496,1511,1655,1663,1678,2626,2634,2649,4443
+  s_810b957742c7aa::t_6ab8aa1f9895f2 4293
+  s_810b957742c7aa::t_a56b178d76385f 4350-4357
+  s_810b957742c7aa::t_8f2ec7a9e0f84a 284-290
+  s_810b957742c7aa::t_1374d7e94668ca 221
+  s_810b957742c7aa::t_14f58013e729c7 3350-3371
+  s_810b957742c7aa::t_b85ee1809749fd 600-607,617
+  s_810b957742c7aa::t_1c3df52649b4eb 65
+_bmad-output/implementation-artifacts/spec-10-1-native-notifications-from-the-sync-loop.md
+  s_810b957742c7aa::t_c52cc5cfc6cf14 96-97
+  s_810b957742c7aa::t_413b7efc205ea5 6
+  s_810b957742c7aa::t_4784c30f4721f9 10
+  s_810b957742c7aa::t_2975798ebabe5b 1-4,7-9,11-71,84-95,98-109
+  s_810b957742c7aa::t_18060fb45a06aa 72-83
+  s_810b957742c7aa::t_b7554d5c5ff60a 5
+  s_810b957742c7aa::t_c8511ecb64e6f8 110-147
+src/lib/ipc/client.test.ts
+  s_810b957742c7aa::t_1023b5881f65d7 3-11
+  s_810b957742c7aa::t_e25f37502b05a0 172-187
+src-tauri/crates/keeper/Cargo.toml
+  s_810b957742c7aa::t_73e4395c35f93e 43-45
+src-tauri/Cargo.lock
+  s_810b957742c7aa::t_031a2b613f7565 2873,3065-3078,3632-3645,5876-5894,6017-6027
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "4f502d18b2e54e50d59c5dc214d70abed7c53f8d",
+  "prompts": {},
+  "sessions": {
+    "s_810b957742c7aa": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9dab03a9-96f0-43c3-ba74-7bb2d9c3dde2",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

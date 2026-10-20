@@ -1,0 +1,29 @@
+_bmad-output/planning-artifacts/epics.md
+  s_8a8bc6b6bf6017::t_38358a6eb6342b 3090-3098
+  s_8a8bc6b6bf6017::t_6fb30e466dfc42 234-242
+  s_8a8bc6b6bf6017::t_56698f4fca76c6 142-148
+  s_8a8bc6b6bf6017::t_193174cf4a0643 354-373
+  s_8a8bc6b6bf6017::t_a45e0a700f2668 2466-3071
+  s_8a8bc6b6bf6017::t_b70e3d466a6632 3118-3127
+  s_8a8bc6b6bf6017::t_f237a85514fec2 276-290
+  s_8a8bc6b6bf6017::t_c9c60524b9e41e 29-30
+  s_8a8bc6b6bf6017::t_621cdcfe36a188 104-117
+  s_8a8bc6b6bf6017::t_68f151b7bf68c4 188-197
+  s_8a8bc6b6bf6017::t_0965827a14ed33 10,13,15-16
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "7775c980a8dedeefd55c04100c44e07f7aa67130",
+  "prompts": {},
+  "sessions": {
+    "s_8a8bc6b6bf6017": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c19d356a-2c90-4eff-82aa-ba9853588b43",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

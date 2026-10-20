@@ -1,0 +1,76 @@
+src-tauri/crates/keeper/src/lib.rs
+  s_4d882a8485c1ac::t_50902ff5ced6b4 1455
+docs/decisions.md
+  s_4d882a8485c1ac::t_cd3e9ddee7ebc8 827-831
+src/lib/stores/sync.test.ts
+  s_4d882a8485c1ac::t_b1074f5fa41c7b 110
+docs/ios.md
+  s_4d882a8485c1ac::t_cd3e9ddee7ebc8 893-915
+src/lib/stores/sync.ts
+  s_4d882a8485c1ac::t_56535c612b71bb 28,32,597-606
+  s_4d882a8485c1ac::t_201fdc19fcab02 607-608
+src-tauri/crates/keeper-sync/src/git/reset.rs
+  s_4d882a8485c1ac::t_3152f3fac2ef64 1-159,163-258,265-319,328-422,428-649
+  s_4d882a8485c1ac::t_0a7c47f4803dc1 160-162,259-264,423-427
+  s_4d882a8485c1ac::t_0560755132bdf4 320-327
+src-tauri/crates/keeper-sync/src/engine.rs
+  s_4d882a8485c1ac::t_6b6a748132be1f 2005-2008,3274-3279,3341-3344,3352
+  s_4d882a8485c1ac::t_ae86d5c5c3a3f2 1062-1091,1097-1103,1109-1128,13447-13551
+  s_4d882a8485c1ac::t_fca4e3794cee03 28
+  s_4d882a8485c1ac::t_0f4f0535041400 13552,35480-35568,35572-35606,35612-35614,35616-35624,35626-35648,35654-35675,35681-35813,35817-35819
+  s_4d882a8485c1ac::t_76acec422f34f4 19148,19181-19185,19190-19192
+  s_4d882a8485c1ac::t_9a1d9879af14de 956-986,9297,9558,9572-9576,9580
+  s_4d882a8485c1ac::t_1ba0dfa6e47407 35607-35611,35615,35625
+  s_4d882a8485c1ac::t_05aab1b2e1c756 995-1012
+  s_4d882a8485c1ac::t_0a7c47f4803dc1 1092-1096,1104-1108,9577-9578,19186-19189,35569-35571,35649-35653,35676-35680,35814-35816
+  s_4d882a8485c1ac::t_a33300d8974722 13553
+src/components/layout/sync-pane.tsx
+  s_4d882a8485c1ac::t_56535c612b71bb 157,372-385,1026-1029,1046,1324-1343,1380-1400
+src-tauri/crates/keeper-sync/src/git/mod.rs
+  s_4d882a8485c1ac::t_bda34fd2f96c6c 51
+src-tauri/crates/keeper-sync/src/lib.rs
+  s_4d882a8485c1ac::t_0a7c47f4803dc1 80-81
+src/lib/ipc/gen/SyncResetVm.ts
+  s_4d882a8485c1ac::t_724ceb85c105ed 1-29
+src/components/settings/sync-section.test.tsx
+  s_4d882a8485c1ac::t_b1074f5fa41c7b 223
+dev/mock-shell.ts
+  s_4d882a8485c1ac::t_0b344f906c49f7 1781
+src/lib/ipc/client.ts
+  s_4d882a8485c1ac::t_56535c612b71bb 772,1019
+  s_4d882a8485c1ac::t_724ceb85c105ed 4143-4153
+  s_4d882a8485c1ac::t_06d4d8cbf26dce 4154-4155
+src-tauri/crates/keeper-sync/src/git/history.rs
+  s_4d882a8485c1ac::t_fca4e3794cee03 125-142,147,292
+  s_4d882a8485c1ac::t_4c9a4dc9807d44 150-153
+docs/sync.md
+  s_4d882a8485c1ac::t_cd3e9ddee7ebc8 3567-3570
+src/components/layout/sync-pane.test.tsx
+  s_4d882a8485c1ac::t_b1074f5fa41c7b 286
+  s_4d882a8485c1ac::t_92b06b5563dde3 29,100-102,155,197,566-609
+  s_4d882a8485c1ac::t_561042fc2b482f 610
+src-tauri/crates/keeper-sync/src/git/repo.rs
+  s_4d882a8485c1ac::t_bda34fd2f96c6c 2710-2725,2878
+  s_4d882a8485c1ac::t_e93a1a924ee945 2709
+src/lib/ipc/gen/SyncStatusVm.ts
+  s_4d882a8485c1ac::t_724ceb85c105ed 45-52
+src-tauri/crates/keeper/src/sync_ipc.rs
+  s_4d882a8485c1ac::t_50902ff5ced6b4 500-504,527-530,535-554,1725-1762,1764
+  s_4d882a8485c1ac::t_8b067ec238a4f6 1763,1765
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "8e79a437ca313ef771c73a680bad17d57a9740bf",
+  "prompts": {},
+  "sessions": {
+    "s_4d882a8485c1ac": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "192d4a94-1d58-46b9-9aa0-c94a70381218",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

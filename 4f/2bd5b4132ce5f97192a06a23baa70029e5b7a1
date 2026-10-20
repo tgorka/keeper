@@ -1,0 +1,37 @@
+_bmad-output/implementation-artifacts/spec-15-4-required-ios-ci-gate-and-release-hygiene.md
+  s_9dcba0ce3cb707::t_31359c2c7dab3d 47
+  s_9dcba0ce3cb707::t_c4d3123684ee27 44
+  s_9dcba0ce3cb707::t_2829291be2737a 58,60
+  s_9dcba0ce3cb707::t_286197fa880eca 1-4,6-7,9-43,48-57,59,61-70
+  s_9dcba0ce3cb707::t_72530bc79af591 46
+  s_9dcba0ce3cb707::t_7a8e492938bc3f 45
+  s_9dcba0ce3cb707::t_6a66d1d38b8bdb 5
+  s_9dcba0ce3cb707::t_6b0b68b120eb30 71-113
+  s_9dcba0ce3cb707::t_483218f1f1b978 8
+_bmad-output/implementation-artifacts/bmad-dev-auto-result-15-4-required-ios-ci-gate-and-release-hygiene.md
+  s_8a8bc6b6bf6017::t_28a4a68d2013cc 1-12
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "4f2bd5b4132ce5f97192a06a23baa70029e5b7a1",
+  "prompts": {},
+  "sessions": {
+    "s_8a8bc6b6bf6017": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c19d356a-2c90-4eff-82aa-ba9853588b43",
+        "model": "unknown"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    },
+    "s_9dcba0ce3cb707": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fccf603f-da58-4689-ba70-664b1e0acbe7",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

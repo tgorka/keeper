@@ -1,0 +1,75 @@
+src-tauri/crates/keeper-core/src/vm.rs
+  s_a032848210c27f::t_e53ebf8af027e7 1464-1483
+src/components/settings/settings-dialog.test.tsx
+  s_a032848210c27f::t_1d159ae2c35246 65,71,74
+  s_a032848210c27f::t_d2fed20a34ee4d 99-101
+  s_a032848210c27f::t_1e01886fd1e70a 150-155
+  s_a032848210c27f::t_7fcea79b300263 14-15
+  s_a032848210c27f::t_3eea082fea07bb 516-586
+src/lib/ipc/gen/NotificationPermission.ts
+  s_a032848210c27f::t_97006b5d603ff1 1-13
+_bmad-output/implementation-artifacts/spec-14-3-foreground-notifications-and-the-all-accounts-badge.md
+  s_a032848210c27f::t_2914f96a721860 102-113
+  s_a032848210c27f::t_ab70f85d07d1b0 127-155
+  s_a032848210c27f::t_1b445313c26d70 11
+  s_a032848210c27f::t_9170495072f937 1-4,6-9,12-72,86-101,114-126,156-157
+  s_a032848210c27f::t_3d356dcaec08f5 73-85
+  s_a032848210c27f::t_256f5977992b82 10
+  s_a032848210c27f::t_2c8c1d59cf1e0d 5
+src/hooks/use-active-chat-reporter.test.ts
+  s_a032848210c27f::t_5f4b0979f601d9 1-67,87-119
+  s_a032848210c27f::t_2cf2ef10df7f47 68-86
+src-tauri/crates/keeper-core/src/account.rs
+  s_a032848210c27f::t_4f5a6e217cc35d 3491-3517
+src-tauri/crates/keeper/src/lib.rs
+  s_a032848210c27f::t_db55a8498c9a65 289-291
+src/hooks/use-active-chat-reporter.ts
+  s_a032848210c27f::t_a559d300460721 41-50,52-59
+  s_a032848210c27f::t_688efa0d11830b 1-40,51,60-81
+src-tauri/crates/keeper/src/ipc.rs
+  s_a032848210c27f::t_f1b9953ed5eaa3 34-36
+  s_a032848210c27f::t_d29e260947d8b5 496-503
+  s_a032848210c27f::t_cb48173fd59708 2942-3009
+  s_a032848210c27f::t_8adc1ea08e0038 613-631
+  s_a032848210c27f::t_ccdd56006dcb6c 33
+src/App.tsx
+  s_a032848210c27f::t_9d3b5d81fdd96c 8
+  s_a032848210c27f::t_e7063ab65f1915 34-37
+src-tauri/crates/keeper-core/src/notify.rs
+  s_a032848210c27f::t_709bd484338213 88
+  s_a032848210c27f::t_458ab9d285b230 352-356,365
+  s_a032848210c27f::t_1b496ab6fdece8 819,1157-1196
+  s_a032848210c27f::t_71fb1a8a1a744e 238-239,241-247,257,265
+  s_a032848210c27f::t_921d8657e2ed37 152-192
+  s_a032848210c27f::t_f1b9953ed5eaa3 753-755,760-762,768-770,775-777,782-784,792-794,800-802,808-810,816-818,826-828,834-836,842-865
+  s_a032848210c27f::t_940b8deefe3209 58-64
+  s_a032848210c27f::t_cca005201188fb 820
+  s_a032848210c27f::t_4006b105a65f5d 748-750,821-825,829-833,866-888,1156
+src/components/settings/settings-dialog.tsx
+  s_a032848210c27f::t_23633ff4042fd2 44-45
+  s_a032848210c27f::t_38d914ffb0f99f 254-261,267-272
+  s_a032848210c27f::t_617a9d3e2118ca 275-277,281-285,292-293,307-334,338,342,356-368,384-405,408-425
+  s_a032848210c27f::t_4dd82aa00203b8 39
+src-tauri/crates/keeper/src/lifecycle.rs
+  s_a032848210c27f::t_de0194169d054f 57-64
+src/lib/ipc/client.ts
+  s_a032848210c27f::t_7716e385d465f4 76
+  s_a032848210c27f::t_bd788e94663d81 16
+  s_a032848210c27f::t_a3e9696faa16d1 1556-1592
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "2a03eb7ea0afeb76d2f9fac6b56c3630439067f9",
+  "prompts": {},
+  "sessions": {
+    "s_a032848210c27f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9dd2ef27-0f7f-482e-ad26-97e1aa6cc763",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": null
+    }
+  }
+}

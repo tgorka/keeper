@@ -1,0 +1,19 @@
+_bmad-output/implementation-artifacts/spec-5-2-durability-against-remote-rewrites-edit-history.md
+  s_c53dc2389e12a9::t_1ac008f313f761 6
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "928e4fea4d5a4c6f03af9eb5e799513132d682db",
+  "prompts": {},
+  "sessions": {
+    "s_c53dc2389e12a9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "03311cb5-4a2b-4ac4-8dba-91d867e8f1a2",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

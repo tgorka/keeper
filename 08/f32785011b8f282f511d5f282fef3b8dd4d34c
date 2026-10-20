@@ -1,0 +1,25 @@
+_bmad-output/implementation-artifacts/spec-4-6-network-account-attribution-and-network-filter.md
+  s_cca88bebc48578::t_3123ca83de0744 7
+  s_cca88bebc48578::t_85c7f4fd5216df 108-117
+  s_cca88bebc48578::t_c3a70ac0de77fa 173-175,177
+src/components/chat/RoomAvatar.tsx
+  s_cca88bebc48578::t_86e3ca39e344f4 52-57
+src/components/chat/RoomAvatar.test.tsx
+  s_cca88bebc48578::t_ea3fa8b1e22c2d 34-36
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "08f32785011b8f282f511d5f282fef3b8dd4d34c",
+  "prompts": {},
+  "sessions": {
+    "s_cca88bebc48578": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "469af447-02a1-49c7-b0d5-fc3142671dc7",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

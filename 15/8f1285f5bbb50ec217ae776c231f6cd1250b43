@@ -1,0 +1,28 @@
+_bmad-output/implementation-artifacts/spec-5-5-export-to-json-and-markdown.md
+  s_1dc13617debcee::t_893bd1407f064c 138-149
+  s_1dc13617debcee::t_423dbfb29ffd48 173-180
+  s_1dc13617debcee::t_5a896bcabd9644 9
+src-tauri/crates/keeper-core/src/archive/export/mod.rs
+  s_1dc13617debcee::t_448014115a3351 621,631,669,757,879,920,1045
+  s_1dc13617debcee::t_c3024c7d865330 173-186,195-208
+  s_1dc13617debcee::t_de8f4369ad1d6c 97-103
+  s_1dc13617debcee::t_44f44f9d24c8c6 727-728,793-802,871-872,958-961
+  s_1dc13617debcee::t_4e87dcacb22e46 784-792,803-836
+  s_1dc13617debcee::t_16584f9c2fa707 209-210,783
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "158f1285f5bbb50ec217ae776c231f6cd1250b43",
+  "prompts": {},
+  "sessions": {
+    "s_1dc13617debcee": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "970c035d-44ee-4739-9fcb-d19a00560c90",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

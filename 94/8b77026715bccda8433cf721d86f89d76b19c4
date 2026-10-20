@@ -1,0 +1,37 @@
+_bmad-output/implementation-artifacts/deferred-work.md
+  s_494060eb8554a0::t_5c8e6f084e8b35 223
+src-tauri/crates/keeper/src/media_protocol.rs
+  s_494060eb8554a0::t_645659ff0a0279 25-27
+  s_494060eb8554a0::t_6fe63d3f33e715 392-394,399-404,409-410
+  s_494060eb8554a0::t_eeb5f09106d255 17-24
+  s_494060eb8554a0::t_964cbb968002c3 121-122,124
+  s_494060eb8554a0::t_d41a52b8583bfd 110-114
+  s_494060eb8554a0::t_9935df8c424d14 395-398,405-408
+  s_494060eb8554a0::t_9ccac92d64cb8e 109,115-120,123,125-126
+  s_494060eb8554a0::t_c9d464a3d8321f 134-137
+  s_494060eb8554a0::t_3fe30224d05f07 391
+_bmad-output/implementation-artifacts/spec-12-4-media-protocol-on-wkurlschemehandler-with-capped-buffers.md
+  s_494060eb8554a0::t_04a0b79bfec41d 62-64
+  s_494060eb8554a0::t_a59921de46713f 5
+  s_494060eb8554a0::t_afe92e8d844916 10
+  s_494060eb8554a0::t_a2a1f1069fe25d 1-4,6-8,11-61,65-74,76-104
+  s_494060eb8554a0::t_020eb36a08013a 9
+  s_494060eb8554a0::t_300bc7fe4d4028 75
+  s_494060eb8554a0::t_b8ca4556fdbe16 105-142
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "948b77026715bccda8433cf721d86f89d76b19c4",
+  "prompts": {},
+  "sessions": {
+    "s_494060eb8554a0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ea9b5847-3e4d-4912-853f-7f5678f87d59",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

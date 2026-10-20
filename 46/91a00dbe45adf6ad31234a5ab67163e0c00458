@@ -1,0 +1,23 @@
+_bmad-output/implementation-artifacts/spec-19-1-application-window-picker-scshareablecontent-live-list.md
+  s_3acb88a7328b5d::t_98045b450c01a6 143-153
+  s_3acb88a7328b5d::t_a9038286d4c728 180-183
+  s_3acb88a7328b5d::t_a1ed12343c97cf 9
+_bmad-output/implementation-artifacts/deferred-work.md
+  s_3acb88a7328b5d::t_8ad9d7bc8243bd 1024-1033
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "4691a00dbe45adf6ad31234a5ab67163e0c00458",
+  "prompts": {},
+  "sessions": {
+    "s_3acb88a7328b5d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7ed1970d-c16c-47f2-a78b-fcdd0e9aa535",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

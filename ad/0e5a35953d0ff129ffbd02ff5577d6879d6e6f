@@ -1,0 +1,51 @@
+tools/keeper-rec/Tests/keeper-recTests/RecoveryTests.swift
+  s_8a8bc6b6bf6017::t_ec9b71e977dfad 23,68,88,221,227,254
+tools/keeper-rec/Tests/keeper-recTests/RotationTests.swift
+  s_8a8bc6b6bf6017::t_ec9b71e977dfad 111-112,114-115,117-118,124,129,141,148-149,156-157
+tools/keeper-rec/Sources/keeper-rec/main.swift
+  s_8a8bc6b6bf6017::t_ec9b71e977dfad 138,433
+tools/keeper-rec/Sources/keeper-rec/CameraHealth.swift
+  s_8a8bc6b6bf6017::t_ec9b71e977dfad 23
+tools/keeper-rec/Tests/keeper-recTests/FixtureSegments.swift
+  s_8a8bc6b6bf6017::t_ec9b71e977dfad 4,79,220,325,340
+tools/keeper-rec/Sources/keeper-rec/Capture.swift
+  s_8a8bc6b6bf6017::t_4ae87525869a26 146-155
+  s_8a8bc6b6bf6017::t_912240096cc174 1657-1663
+  s_8a8bc6b6bf6017::t_0dd6e5839753f8 1463-1465
+  s_8a8bc6b6bf6017::t_17711987f99811 1345-1352
+  s_8a8bc6b6bf6017::t_c5c1e8c2c5f4e9 543
+  s_8a8bc6b6bf6017::t_424234f82bcf36 1360-1370
+  s_8a8bc6b6bf6017::t_ff3c5a016404ef 528,1539-1549,1560-1593,1595,1608-1611,1613-1628
+  s_8a8bc6b6bf6017::t_7b1c9da0ace827 1550-1559
+  s_8a8bc6b6bf6017::t_ec9b71e977dfad 14,17,177,194,230,276,394,485,540,898,902,928,982,1185,1225,1407,1484
+  s_8a8bc6b6bf6017::t_be7d85abe0ab35 507-510,519-521,525-527
+  s_8a8bc6b6bf6017::t_0f4d8c89ab7501 514-518,522-524,1594,1596-1607,1612
+  s_8a8bc6b6bf6017::t_d84b86fb50dbf0 529
+tools/keeper-rec/Sources/keeper-rec/Rotation.swift
+  s_8a8bc6b6bf6017::t_ec9b71e977dfad 75-76,78-79
+tools/keeper-rec/Tests/keeper-recTests/ConcatAssertTests.swift
+  s_8a8bc6b6bf6017::t_ec9b71e977dfad 82,106
+src-tauri/crates/keeper/src/ipc.rs
+  s_8a8bc6b6bf6017::t_ec9b71e977dfad 4012,4180,4197-4198,4200,5858,5871
+src-tauri/crates/keeper-core/src/recording.rs
+  s_8a8bc6b6bf6017::t_e816b028e79016 1375,1378-1379,1659,1662-1663,1705,1708-1709
+  s_8a8bc6b6bf6017::t_ec9b71e977dfad 669,689,708,1045,1058,1060,1064,1112,1186,1285,1323,1341,1383,1386,1388,1413,1466,1641,1648,1686,1690-1691,2261,2266,2473,2488,2516,2537,2564,2591,2655,2683,2711,2777,2813,3453,3751,3761,3783-3785,3789,3794-3796,3812-3814,3818,3825,3835-3836,3838,3849,3854,3864,3867,3874-3875,3878,3880-3881,3883,3896-3898,3900,3923-3926,3931,3939,3949,3951,3954-3955,3970-3971,3975,3984,3986,4002,4015-4018,4038-4039,4042-4044,4065,4067,4077,4097,4104,4108-4109,4116-4118,4121-4122,4124-4125,4135,4139,4146,4163-4164,4174,4176,4191,4209,4222,4234,4289-4291,4325,4453
+tools/keeper-rec/Tests/keeper-recTests/ConcatAssert.swift
+  s_8a8bc6b6bf6017::t_ec9b71e977dfad 10
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "ad0e5a35953d0ff129ffbd02ff5577d6879d6e6f",
+  "prompts": {},
+  "sessions": {
+    "s_8a8bc6b6bf6017": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c19d356a-2c90-4eff-82aa-ba9853588b43",
+        "model": "claude-fable-5"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

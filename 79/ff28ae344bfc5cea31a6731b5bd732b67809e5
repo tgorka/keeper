@@ -1,0 +1,34 @@
+_bmad-output/implementation-artifacts/sprint-status.yaml
+  s_d125fb92d9c18a::t_dffcfb617e1a4a 164
+_bmad-output/implementation-artifacts/spec-15-2-docs-ios-md-free-signing-walkthrough.md
+  s_d125fb92d9c18a::t_e9c0c7c0f25f33 56
+  s_d125fb92d9c18a::t_033dd00b5b70e2 7
+  s_d125fb92d9c18a::t_e4049baf8fa2ae 5
+  s_d125fb92d9c18a::t_1be0a47091ea1b 1-4,8-11,14-54,57-95
+  s_d125fb92d9c18a::t_4ec03a7a17d924 6
+  s_d125fb92d9c18a::t_f88b3e919a172a 96-147
+  s_d125fb92d9c18a::t_aa35ed1f3d034d 12-13
+  s_d125fb92d9c18a::t_acccad30cd154f 55
+docs/ios.md
+  s_d125fb92d9c18a::t_1f01ac0b6f6a67 128-136,143,149-171
+  s_d125fb92d9c18a::t_c3bb77d3ca77d4 111-119,121-124
+  s_d125fb92d9c18a::t_956e6dc018096c 1,4-21,42-45,83-110,120,125-127,137-142,144-148,172-200,209-228,234,249,255-285
+  s_d125fb92d9c18a::t_709fc28df2d1c6 229-233,235-245
+  s_d125fb92d9c18a::t_2236d7b426f731 201-208
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "79ff28ae344bfc5cea31a6731b5bd732b67809e5",
+  "prompts": {},
+  "sessions": {
+    "s_d125fb92d9c18a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b2e320f3-72d6-46b9-9fa1-e142514449cb",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

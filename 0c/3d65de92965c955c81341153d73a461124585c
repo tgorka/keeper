@@ -1,0 +1,19 @@
+_bmad-output/implementation-artifacts/spec-5-1-archive-ingestion-pipeline.md
+  s_47dc0d6abb482e::t_9d41def54c2e62 6
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "0c3d65de92965c955c81341153d73a461124585c",
+  "prompts": {},
+  "sessions": {
+    "s_47dc0d6abb482e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0a4ef2f0-5b45-4353-8efa-fa6560538b7a",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

@@ -1,0 +1,93 @@
+src/components/settings/about-section.tsx
+  s_5ddf0ed7ebce9f::t_5ec7cd5abebdac 99-105
+  s_5ddf0ed7ebce9f::t_4e3eaab756a975 7,241-249,252-282
+  s_5ddf0ed7ebce9f::t_1593d0b0819df7 283-304
+  s_5ddf0ed7ebce9f::t_bfaaca7b52f0e0 27-53
+  s_5ddf0ed7ebce9f::t_4aaaef386eb183 238-239
+  s_5ddf0ed7ebce9f::t_3d504a276cce8f 1,4
+src/components/cheat-sheet/cheat-sheet-overlay.test.tsx
+  s_5ddf0ed7ebce9f::t_6a5891a6537690 18
+  s_5ddf0ed7ebce9f::t_e999605f0fad0c 133-158
+  s_5ddf0ed7ebce9f::t_be197bdd160ef0 81
+  s_5ddf0ed7ebce9f::t_40a3280967d418 6-7,9-15,19,22-31
+  s_5ddf0ed7ebce9f::t_ec519a73c7990b 32
+_bmad-output/implementation-artifacts/deferred-work.md
+  s_5ddf0ed7ebce9f::t_199c35fc4e79a8 834-838
+src/components/layout/app-shell.tsx
+  s_5ddf0ed7ebce9f::t_d9c347fa5c58bb 93-98
+  s_5ddf0ed7ebce9f::t_8cfa7d710e52f0 160
+  s_5ddf0ed7ebce9f::t_206e39a436935c 36
+_bmad-output/implementation-artifacts/sprint-status.yaml
+  s_5ddf0ed7ebce9f::t_d63f0654132900 151
+src/components/layout/bridges-pane.test.tsx
+  s_5ddf0ed7ebce9f::t_a221412196cf7f 207-214,216-233
+  s_5ddf0ed7ebce9f::t_635bf9972c6d65 32-40
+  s_5ddf0ed7ebce9f::t_30feff458ff6d9 64-75
+  s_5ddf0ed7ebce9f::t_f184394042ad07 215
+  s_5ddf0ed7ebce9f::t_0de8061f0e7bef 104-107,112
+  s_5ddf0ed7ebce9f::t_3dd76807c7761c 57
+src/components/layout/bridges-pane.tsx
+  s_5ddf0ed7ebce9f::t_6538a39a01be23 82-85
+  s_5ddf0ed7ebce9f::t_f3347b6b936e4b 140-144
+  s_5ddf0ed7ebce9f::t_73070a0a3f696c 25
+src/lib/stores/capabilities.ts
+  s_5ddf0ed7ebce9f::t_9026e1a710a8bc 60-64,75-77,79-89
+  s_5ddf0ed7ebce9f::t_ddc535cd9dd3e1 65-74,78
+src/components/settings/settings-dialog.test.tsx
+  s_5ddf0ed7ebce9f::t_f184394042ad07 457
+  s_5ddf0ed7ebce9f::t_9383462bb69dba 86-87
+  s_5ddf0ed7ebce9f::t_db0a98bf6d6e9c 446-456,458-472,476-490
+  s_5ddf0ed7ebce9f::t_2b9f0c4c222c16 141-144,153
+  s_5ddf0ed7ebce9f::t_3ceca6fbc274e8 71
+  s_5ddf0ed7ebce9f::t_b87d18e34ef24b 473-475
+  s_5ddf0ed7ebce9f::t_68bd2a9f300307 96-106
+  s_5ddf0ed7ebce9f::t_cc3391201240f2 62-63
+src/hooks/use-cheat-sheet-shortcut.ts
+  s_5ddf0ed7ebce9f::t_8645a2308c806c 16-20,23
+  s_5ddf0ed7ebce9f::t_0aabb1811e997d 38-43
+src/hooks/use-cheat-sheet-shortcut.test.ts
+  s_5ddf0ed7ebce9f::t_8f85dea873b6f6 90-99
+  s_5ddf0ed7ebce9f::t_f103b2b0c01d89 38-40,45
+  s_5ddf0ed7ebce9f::t_d403850de933ef 4,7-16
+  s_5ddf0ed7ebce9f::t_05c4711dfc9f0d 17
+src/components/settings/about-section.test.tsx
+  s_5ddf0ed7ebce9f::t_706c760d51e0fe 13-15
+  s_5ddf0ed7ebce9f::t_52b1e682c37d71 17,22,27-38
+  s_5ddf0ed7ebce9f::t_245f02a9222e38 63-67,72
+  s_5ddf0ed7ebce9f::t_d4a9f95010bbf1 235-294
+src/components/settings/settings-dialog.tsx
+  s_5ddf0ed7ebce9f::t_6fd49daaec9b6e 457-478
+  s_5ddf0ed7ebce9f::t_a3c4b34188d084 60
+  s_5ddf0ed7ebce9f::t_4e3eaab756a975 46
+  s_5ddf0ed7ebce9f::t_f1fe8f3aabd6a5 143
+  s_5ddf0ed7ebce9f::t_4d34a4ff14d0d0 327-331
+  s_5ddf0ed7ebce9f::t_d84cd1e1741e90 361-389,393
+  s_5ddf0ed7ebce9f::t_8b00421833ad8e 61-69,79-84
+  s_5ddf0ed7ebce9f::t_da06a2262423ab 135-137
+src/lib/stores/capabilities.test.ts
+  s_5ddf0ed7ebce9f::t_ef01f2a265e25d 52-87
+  s_5ddf0ed7ebce9f::t_7c7ee3ac4905d5 3-7
+_bmad-output/implementation-artifacts/spec-13-7-capability-gated-surfaces-and-on-this-iphone-disclosure.md
+  s_5ddf0ed7ebce9f::t_b1895e4d5ed30d 7
+  s_5ddf0ed7ebce9f::t_704ce3342dc254 1-4,8-65,71-99
+  s_5ddf0ed7ebce9f::t_08e6a658b5b9a3 5
+  s_5ddf0ed7ebce9f::t_5a872b064a2ceb 6
+  s_5ddf0ed7ebce9f::t_2c5d9a873dc89a 66-70
+  s_5ddf0ed7ebce9f::t_4c7f8871b03852 100-149
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "e8f2c7d90af7ea31c3469559fda07a0dc3d85479",
+  "prompts": {},
+  "sessions": {
+    "s_5ddf0ed7ebce9f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2bf59c9e-90b4-4e92-bb80-9f97bf9e72d5",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": null
+    }
+  }
+}

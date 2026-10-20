@@ -1,0 +1,19 @@
+_bmad-output/implementation-artifacts/spec-10-2-mutes-mention-only-and-do-not-disturb.md
+  s_8ee4e05e872c25::t_1d75f142b47e0c 9
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "b28ee6695b430fcfbeb8f87a8c1f81471f4b29bf",
+  "prompts": {},
+  "sessions": {
+    "s_8ee4e05e872c25": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "eccd3355-76ed-458b-afae-ef24e051d160",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

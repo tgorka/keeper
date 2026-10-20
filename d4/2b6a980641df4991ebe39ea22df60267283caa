@@ -1,0 +1,52 @@
+.github/workflows/ci.yml
+  s_5805cf25f6dfe1::t_6a65fedd4df1ec 47-56
+tools/keeper-rec/Sources/keeper-rec/Capture.swift
+  s_5805cf25f6dfe1::t_443cebcec21721 3-4,8-10,12-25,28-33,41,48-70,75,79-94,100-112,117-118,120-123,125,159-161,163-214,245,268-271,273-305,308-317,329,333-360,365-368,383-388,390-391,398-406,412,425,435,439,441-458,460-462,466-468,483
+  s_5805cf25f6dfe1::t_251cc8d7fc5e32 318-328,330-331
+tools/keeper-rec/Sources/keeper-rec/main.swift
+  s_5805cf25f6dfe1::t_205b6b04990709 200-209,212-214
+tools/keeper-rec/Tests/keeper-recTests/RotationTests.swift
+  s_5805cf25f6dfe1::t_d3cf2ed5d885f6 1-95,105-159
+  s_5805cf25f6dfe1::t_c296c19f82638d 96-104
+_bmad-output/implementation-artifacts/deferred-work.md
+  s_5805cf25f6dfe1::t_231e586f5b2d56 990-994
+package.json
+  s_5805cf25f6dfe1::t_6cb67c64070613 12
+_bmad-output/implementation-artifacts/spec-17-1-dual-writer-gapless-size-based-rotation-in-keeper-rec.md
+  s_5805cf25f6dfe1::t_5a1ceab1e00cd0 94-102
+  s_5805cf25f6dfe1::t_d0861b30e86ba1 5,7
+  s_5805cf25f6dfe1::t_c651c5159eb4eb 75-80
+  s_5805cf25f6dfe1::t_b3aaa9e3091c67 127-157
+  s_5805cf25f6dfe1::t_4d0a21cc780974 13
+  s_5805cf25f6dfe1::t_79900e70bee583 1-4,8-12,14-74,81-87,104-126
+  s_5805cf25f6dfe1::t_044e107288b5f9 88-93,103
+  s_5805cf25f6dfe1::t_acbef79241a1f9 6
+tools/keeper-rec/Package.swift
+  s_5805cf25f6dfe1::t_9808f4f922952b 37-49
+scripts/test-keeper-rec.sh
+  s_5805cf25f6dfe1::t_327b0612638016 1-17
+src-tauri/crates/keeper-core/src/recording.rs
+  s_5805cf25f6dfe1::t_79abb49ef389fd 846-870
+  s_5805cf25f6dfe1::t_c9f273b95249fa 845
+_bmad-output/implementation-artifacts/epic-17-context.md
+  s_5805cf25f6dfe1::t_b6e13405694e75 1-47
+tools/keeper-rec/Sources/keeper-rec/Rotation.swift
+  s_5805cf25f6dfe1::t_79dd21363c35d3 39-43,46-49,51-52
+  s_5805cf25f6dfe1::t_6d97c70d89f436 1-38,44-45,50,53-123
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "d42b6a980641df4991ebe39ea22df60267283caa",
+  "prompts": {},
+  "sessions": {
+    "s_5805cf25f6dfe1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5cf66123-5059-4878-8718-51e1cef0a93f",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

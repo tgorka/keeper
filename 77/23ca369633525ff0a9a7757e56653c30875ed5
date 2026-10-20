@@ -1,0 +1,21 @@
+src/components/layout/conversation-pane.test.tsx
+  s_cbf9741c93ab65::t_c5f489732cd1c4 1642-1670
+src/components/chat/conversation-body.tsx
+  s_cbf9741c93ab65::t_13769a02b05bbc 311-314,367,378,515,806-831
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "7723ca369633525ff0a9a7757e56653c30875ed5",
+  "prompts": {},
+  "sessions": {
+    "s_cbf9741c93ab65": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5b400cc2-6399-4f94-b9bb-ce6893683e42",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

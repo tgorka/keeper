@@ -1,0 +1,28 @@
+deploy/companion-stack/.env.example
+  s_8a8bc6b6bf6017::t_284f1bf093e2d0 1-33
+deploy/companion-stack/README.md
+  s_8a8bc6b6bf6017::t_2344b0b8450c63 1-136,139-206
+  s_8a8bc6b6bf6017::t_162591055902db 137-138
+deploy/companion-stack/docker-compose.yml
+  s_8a8bc6b6bf6017::t_6dc265a9e7a68a 1-97
+docs/constraints-and-limitations.md
+  s_8a8bc6b6bf6017::t_f133faba377ca8 26-27
+README.md
+  s_8a8bc6b6bf6017::t_0986bf3c0803c6 8-9
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "0b70b71f5741631ab04b9f645290c5fa7c0ad37d",
+  "prompts": {},
+  "sessions": {
+    "s_8a8bc6b6bf6017": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c19d356a-2c90-4eff-82aa-ba9853588b43",
+        "model": "claude-fable-5"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

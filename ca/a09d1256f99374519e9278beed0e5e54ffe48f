@@ -1,0 +1,111 @@
+src-tauri/crates/keeper-core/src/bridge.rs
+  s_9f12fb22ab0bc3::t_884b27dc95282e 52-56
+  s_9f12fb22ab0bc3::t_3b224c29439baa 24-28
+  s_9f12fb22ab0bc3::t_625e1fb0f35b5b 1-19,21-23,29-51,57-69,74-77,87-158,167-173
+  s_9f12fb22ab0bc3::t_2471dbe01de98f 20
+  s_9f12fb22ab0bc3::t_b7b155306a914e 70-73
+  s_9f12fb22ab0bc3::t_4f8137a5a27c77 78-86
+  s_9f12fb22ab0bc3::t_f31f54b20161b8 159-166
+src/components/layout/conversation-pane.test.tsx
+  s_9f12fb22ab0bc3::t_001996ae997d0f 948-1035,1038,1045-1051
+  s_9f12fb22ab0bc3::t_8ccb436fdfca54 45-47
+  s_9f12fb22ab0bc3::t_38ac503176178f 119-122
+  s_9f12fb22ab0bc3::t_1509438ff02f48 20-21
+  s_9f12fb22ab0bc3::t_b74a4a56740b62 1036-1037,1039-1044
+src/components/chat/redacted-stub.tsx
+  s_9f12fb22ab0bc3::t_ee3273efcb94ba 1-22
+src/components/chat/message-bubble.test.tsx
+  s_9f12fb22ab0bc3::t_e07dd20a002511 97-99,105-109,115-117,123-126
+  s_9f12fb22ab0bc3::t_4c71379027d144 100-104,110-114,118-122
+src/components/chat/delete-message-dialog.tsx
+  s_9f12fb22ab0bc3::t_fc6a2bd76cd4dc 123-129
+  s_9f12fb22ab0bc3::t_2c9b7746c39445 1-109,114-122,130-163
+  s_9f12fb22ab0bc3::t_6923d29d2fa992 110-113
+src/lib/ipc/client.ts
+  s_9f12fb22ab0bc3::t_c01d17eb32d264 573-604
+src/lib/ipc/gen/TimelineItemVm.ts
+  s_9f12fb22ab0bc3::t_be34c761329cda 91,93-106
+  s_9f12fb22ab0bc3::t_d55b9bc1dfdcaa 92
+src/components/chat/delete-message-dialog.test.tsx
+  s_9f12fb22ab0bc3::t_a010228941a116 1-35,37-41,43,50-57,59-109
+  s_9f12fb22ab0bc3::t_4c71379027d144 46-48
+  s_9f12fb22ab0bc3::t_ac74086ea866de 42,58
+  s_9f12fb22ab0bc3::t_3f382ebce1a9f0 36,44-45,49
+_bmad-output/implementation-artifacts/spec-3-8-delete-for-everyone-redaction.md
+  s_9f12fb22ab0bc3::t_b52f245a20005a 5
+  s_9f12fb22ab0bc3::t_38705a4b6e18df 6
+  s_9f12fb22ab0bc3::t_3dcf7f10567bd7 131-164
+  s_9f12fb22ab0bc3::t_eedae018ba107b 10
+  s_9f12fb22ab0bc3::t_fc7811b40eeeba 73-84
+  s_9f12fb22ab0bc3::t_08b7bfc97866f9 97-109
+  s_9f12fb22ab0bc3::t_e282f0e513dd8b 1-4,7,9,11-72,85-96,110-130
+  s_9f12fb22ab0bc3::t_912bf5dd6faeff 8
+src/components/chat/message-actions.tsx
+  s_9f12fb22ab0bc3::t_c2b98afb47bb8a 2-3,5-9,11,20-21,28-29,35,39,64-72
+  s_9f12fb22ab0bc3::t_1a88329eeb6664 73-74
+src/components/chat/message-actions.test.tsx
+  s_9f12fb22ab0bc3::t_e811efc5417e75 5,7-20,23,28,33-36,39-40,44,47-52,57-58,62,65,70,77,82-88,91
+  s_9f12fb22ab0bc3::t_ac74086ea866de 6
+src-tauri/crates/keeper-core/src/send.rs
+  s_9f12fb22ab0bc3::t_1cbf3d424c9f6c 438-455
+  s_9f12fb22ab0bc3::t_02752690303b0f 200-201,209,213-222
+  s_9f12fb22ab0bc3::t_9af3dda51dc2de 190-199,202-208,210-212,223-231
+  s_9f12fb22ab0bc3::t_37a9f56bf28b20 370-372
+src-tauri/crates/keeper-core/src/timeline.rs
+  s_9f12fb22ab0bc3::t_a486c1542f19ba 387-396
+  s_9f12fb22ab0bc3::t_c5634d1b083731 322-325
+  s_9f12fb22ab0bc3::t_51924588e103d9 660-681
+  s_9f12fb22ab0bc3::t_2f2382f2ca408c 659
+src-tauri/crates/keeper/src/ipc.rs
+  s_9f12fb22ab0bc3::t_da3b75f26834d9 597,599-638
+  s_9f12fb22ab0bc3::t_e7af5c92582656 598
+src/components/chat/redacted-stub.test.tsx
+  s_9f12fb22ab0bc3::t_3e5f0cec44d794 1-17
+src-tauri/crates/keeper-core/src/lib.rs
+  s_9f12fb22ab0bc3::t_44f11f907551ea 15
+src/components/layout/conversation-pane.tsx
+  s_9f12fb22ab0bc3::t_54e305e0761fc2 417-419
+  s_9f12fb22ab0bc3::t_f1d0a86456feee 151-153
+  s_9f12fb22ab0bc3::t_bc764fa782679d 472-474
+  s_9f12fb22ab0bc3::t_4c71379027d144 532
+  s_9f12fb22ab0bc3::t_8f66d283607609 518,539
+  s_9f12fb22ab0bc3::t_c231e9c03a1454 520-531,533-536
+  s_9f12fb22ab0bc3::t_e1f9303d852bda 21,24
+  s_9f12fb22ab0bc3::t_36f18cb72d6db8 610-613,624
+  s_9f12fb22ab0bc3::t_28f186028e3394 178,185
+  s_9f12fb22ab0bc3::t_57802875d8c467 62-64,69-71,75-76
+  s_9f12fb22ab0bc3::t_52c2f27b5dab11 410-416,420-426,519
+  s_9f12fb22ab0bc3::t_6a44516d5bfc48 108-114
+  s_9f12fb22ab0bc3::t_6558d4fa914c13 657-667
+src-tauri/crates/keeper-core/src/account.rs
+  s_9f12fb22ab0bc3::t_851871684eead9 43
+  s_9f12fb22ab0bc3::t_f08b5c02c27164 1245-1300
+src-tauri/crates/keeper/src/lib.rs
+  s_9f12fb22ab0bc3::t_19714a0089a73e 84-85
+_bmad-output/implementation-artifacts/deferred-work.md
+  s_9f12fb22ab0bc3::t_455077b398e996 117-119
+src-tauri/crates/keeper-core/src/vm.rs
+  s_9f12fb22ab0bc3::t_15991e5a716902 613-634
+src/components/chat/message-bubble.tsx
+  s_9f12fb22ab0bc3::t_e665639a69b460 59-62
+  s_9f12fb22ab0bc3::t_5b010a60dfb0f5 131-134
+  s_9f12fb22ab0bc3::t_6fff27d30616f0 215,220,224
+  s_9f12fb22ab0bc3::t_fc953398b08998 118
+  s_9f12fb22ab0bc3::t_ae6d270780d1e8 58
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "caa09d1256f99374519e9278beed0e5e54ffe48f",
+  "prompts": {},
+  "sessions": {
+    "s_9f12fb22ab0bc3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc0ff585-2208-4122-8bf7-49da349ab3ab",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

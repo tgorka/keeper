@@ -1,0 +1,20 @@
+src-tauri/crates/keeper/src/account_ipc.rs
+  s_7ee2f13b73005a::t_797b91802f6f43 3596-3603
+  s_7ee2f13b73005a::t_805777a10e0b82 1015,1063,3563,3566,3580,3583,3606,3610,3762-3766
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "8c00966e706b49fb6155161130ab0f10990fa880",
+  "prompts": {},
+  "sessions": {
+    "s_7ee2f13b73005a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7579fd61-2002-4dc8-9391-9b9f243abe4d",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

@@ -1,0 +1,57 @@
+src-tauri/crates/keeper/src/tray.rs
+  s_386a8b71c7ee02::t_db7b14887210c7 536-544,565-567,573-577
+  s_386a8b71c7ee02::t_a0a6dca990d986 326-344,346
+  s_386a8b71c7ee02::t_0e5e3524262ec2 78-85
+  s_386a8b71c7ee02::t_67d6a82d855bfd 545-564,568-572
+  s_386a8b71c7ee02::t_ca0d2049fac4b7 233-237
+  s_386a8b71c7ee02::t_73c56d615ca952 252-300,306-308,313-314,317-322,325,347-353,356-381,383-407,409-416,418-449,451
+  s_386a8b71c7ee02::t_2198743e37a291 32
+  s_386a8b71c7ee02::t_c8c5ba1801f935 17-25
+_bmad-output/implementation-artifacts/spec-18-2-forced-tray-presence-and-honest-quit-while-recording.md
+  s_386a8b71c7ee02::t_92ff43df8fe647 6
+  s_386a8b71c7ee02::t_0014287661e5c9 5
+  s_386a8b71c7ee02::t_31ec5179b24971 100-132
+  s_386a8b71c7ee02::t_eead8f2113b4a7 69-72
+  s_386a8b71c7ee02::t_11c7186d4af404 1-4,8-68,73-99
+  s_386a8b71c7ee02::t_abf4862cfb8fcb 7
+src/lib/ipc/gen/RecordingStatusVm.ts
+  s_386a8b71c7ee02::t_90e97c517c6f0a 11-14,32-33
+_bmad-output/implementation-artifacts/sprint-status.yaml
+  s_386a8b71c7ee02::t_60c87cc43cb718 187
+src-tauri/crates/keeper-core/src/vm.rs
+  s_386a8b71c7ee02::t_40848f36026454 2781-2791,2797-2799
+  s_386a8b71c7ee02::t_67d6a82d855bfd 2792-2796
+  s_386a8b71c7ee02::t_13bd4e0548896e 2691-2713
+src-tauri/crates/keeper/src/ipc.rs
+  s_386a8b71c7ee02::t_40bf5a7239d65c 3618-3626
+  s_386a8b71c7ee02::t_7acdcbe1eceb59 131-136
+  s_386a8b71c7ee02::t_3ccce13c76d8a7 4506-4522,4525-4533,4536-4544,4547-4549
+  s_386a8b71c7ee02::t_67d6a82d855bfd 4523-4524,4534-4535,4545-4546
+  s_386a8b71c7ee02::t_6fb615c2b0d8ea 14
+  s_386a8b71c7ee02::t_191198975381f8 3443-3445
+  s_386a8b71c7ee02::t_988a52bbbb8330 3693-3699
+  s_386a8b71c7ee02::t_d16dcb42bb6212 3576
+  s_386a8b71c7ee02::t_87feafafea299a 3608-3617,3627-3663,3669-3692,3700-3703
+  s_386a8b71c7ee02::t_99fa92ca6196bd 3664-3668
+src-tauri/crates/keeper/Cargo.toml
+  s_386a8b71c7ee02::t_fb0101959586cc 52-56
+src-tauri/crates/keeper/src/lib.rs
+  s_386a8b71c7ee02::t_97db01eddea3a1 20-22,27-41
+  s_386a8b71c7ee02::t_083f075f7b2604 393-411,413-447
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "b2efb9ac2dade6d934da4044d777feba2007b05e",
+  "prompts": {},
+  "sessions": {
+    "s_386a8b71c7ee02": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0d7d2bba-0d1d-478f-b7f5-c8cca36e1cb1",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

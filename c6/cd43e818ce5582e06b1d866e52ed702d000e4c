@@ -1,0 +1,49 @@
+src/lib/stores/drafts.test.ts
+  s_f0a52ddd60a9ff::t_bdd7ef6b0578e8 127-155
+src/hooks/use-sign-out.test.ts
+  s_f0a52ddd60a9ff::t_34877ed2abedd8 22
+  s_f0a52ddd60a9ff::t_716fb29ee65907 135-152
+  s_f0a52ddd60a9ff::t_19d74490a1acc0 64
+src-tauri/crates/keeper-core/src/drafts.rs
+  s_f0a52ddd60a9ff::t_dcfa02c858fa7e 330-337,342-371
+  s_f0a52ddd60a9ff::t_19451f5a282034 249-252,338-341
+  s_f0a52ddd60a9ff::t_8db1d747d0d650 235-248,253-256
+  s_f0a52ddd60a9ff::t_2f8027c5999143 329
+_bmad-output/implementation-artifacts/spec-7-2-cross-device-draft-mirroring-with-local-wins-conflicts.md
+  s_f0a52ddd60a9ff::t_dec718a4f50eff 110-120
+  s_f0a52ddd60a9ff::t_22c4517b1ccf92 7
+  s_f0a52ddd60a9ff::t_3bc8cfb4c772de 162,164,166
+src/hooks/use-sign-out.ts
+  s_f0a52ddd60a9ff::t_5b07671fd1fbc3 56-60
+  s_f0a52ddd60a9ff::t_1529c809f4fa19 22
+src/lib/stores/drafts.ts
+  s_f0a52ddd60a9ff::t_c3684951bbaa65 54-60
+  s_f0a52ddd60a9ff::t_fc914e2dbb359a 107-112,114-119
+  s_f0a52ddd60a9ff::t_4ba033199c89d5 113
+_bmad-output/implementation-artifacts/sprint-status.yaml
+  s_e273d7465be653::t_fd4357edd937aa 109
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "c6cd43e818ce5582e06b1d866e52ed702d000e4c",
+  "prompts": {},
+  "sessions": {
+    "s_e273d7465be653": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "dec1f8ce-696f-4259-bc3f-de494fa00f9d",
+        "model": "unknown"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    },
+    "s_f0a52ddd60a9ff": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "08f1fbff-8704-471c-8b5e-16fc6d48ed95",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

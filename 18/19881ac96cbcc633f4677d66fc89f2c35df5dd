@@ -1,0 +1,19 @@
+src/components/notes/format-toolbar.test.tsx
+  s_cbf9741c93ab65::t_f9f38a6ee79215 109-110,268-272,274-290,373-376,378-393
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "1819881ac96cbcc633f4677d66fc89f2c35df5dd",
+  "prompts": {},
+  "sessions": {
+    "s_cbf9741c93ab65": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5b400cc2-6399-4f94-b9bb-ce6893683e42",
+        "model": "unknown"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

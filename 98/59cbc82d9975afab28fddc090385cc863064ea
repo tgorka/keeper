@@ -1,0 +1,19 @@
+_bmad/config.toml
+  s_8d9397bbd01a6d::t_0970809905c0db 33-37
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "9859cbc82d9975afab28fddc090385cc863064ea",
+  "prompts": {},
+  "sessions": {
+    "s_8d9397bbd01a6d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "63be83c1-4166-4326-a818-287e4c4ee1b9",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

@@ -1,0 +1,77 @@
+src/lib/ipc/gen/RecordingCapabilitiesVm.ts
+  s_b489ba3915c891::t_a1e7c2216d1d80 28-30
+  s_b489ba3915c891::t_1e1bec40c0f282 1-27,31-40
+src-tauri/crates/keeper/src/recorder.rs
+  s_b489ba3915c891::t_fe9eab95021e20 61-183,186,189-198,200-205,213-229
+  s_b489ba3915c891::t_30724b6b681263 403-417,420-458,460-488,491-502,521-531
+  s_b489ba3915c891::t_9d6c2eb1ed642a 370-381
+  s_b489ba3915c891::t_5307c62e6a8793 206-212
+  s_b489ba3915c891::t_aa6039598bb443 30-31,34-36
+  s_b489ba3915c891::t_3fd2c90d6841a8 32-33
+  s_b489ba3915c891::t_a22c376d76542d 503-520
+  s_b489ba3915c891::t_21c1443d0be7e5 335-346
+  s_b489ba3915c891::t_db86464ca1807f 184-185,187-188,199,418-419,459,489-490
+_bmad-output/implementation-artifacts/spec-16-4-ndjson-rpc-handshake-getcapabilities-and-listsources.md
+  s_b489ba3915c891::t_c4478c10498bb0 6
+  s_b489ba3915c891::t_069b374ab7f151 111-152
+  s_b489ba3915c891::t_d299d3927b74c8 5
+  s_b489ba3915c891::t_51a83fe20dfff7 1-4,7,9-72,81-110
+  s_b489ba3915c891::t_4c43639be4054f 73-80
+  s_b489ba3915c891::t_267351ae0572a3 8
+src/lib/ipc/gen/RecordingFeaturesVm.ts
+  s_b489ba3915c891::t_1e1bec40c0f282 1-20
+src/lib/ipc/gen/RecordingDeviceVm.ts
+  s_b489ba3915c891::t_1e1bec40c0f282 1-16
+src-tauri/crates/keeper-core/src/recording.rs
+  s_b489ba3915c891::t_fb9ded1bb971ac 1164-1182
+  s_b489ba3915c891::t_f04bce99f18b2f 1003-1033,1049-1066
+  s_b489ba3915c891::t_0734623d7b77ec 950-952,957-963,965-984
+  s_b489ba3915c891::t_4ba39b6a9f90a5 953-956,964
+  s_b489ba3915c891::t_db86464ca1807f 842-845,854-857,859-862
+  s_b489ba3915c891::t_d72b6f3e1dc958 458-472
+  s_b489ba3915c891::t_1fc86c562025b7 26
+  s_b489ba3915c891::t_d692c4449134c1 260-272,278-403,421-435
+  s_b489ba3915c891::t_fdeab38a020de3 404-420
+  s_b489ba3915c891::t_7679db365884f5 273-277
+  s_b489ba3915c891::t_380c6d54c547da 785-841,846-853,858,863-949
+src/lib/ipc/gen/TccPermission.ts
+  s_b489ba3915c891::t_a1e7c2216d1d80 7-14
+  s_b489ba3915c891::t_1e1bec40c0f282 1-6,15-17
+src/lib/ipc/gen/RecordingSourcesVm.ts
+  s_b489ba3915c891::t_1e1bec40c0f282 1-28
+_bmad-output/implementation-artifacts/deferred-work.md
+  s_b489ba3915c891::t_6f224a18c0f018 965-984
+src/lib/ipc/gen/RecordingDisplayVm.ts
+  s_b489ba3915c891::t_1e1bec40c0f282 1-23
+tools/keeper-rec/Sources/keeper-rec/main.swift
+  s_b489ba3915c891::t_8bc74ccd6604db 5-18,22,24,29-30,49-50,62,64-68,71-76,81-92,95-115,117-143,145-146,148,150,152-156,164-165
+  s_b489ba3915c891::t_e89882e13329c5 51-61,63
+  s_b489ba3915c891::t_4b13f00307b867 77-80
+  s_b489ba3915c891::t_e820ab81575b06 144,147,149,151,157-163
+src-tauri/crates/keeper-core/src/error.rs
+  s_b489ba3915c891::t_61e2e61448c627 456-464
+src/lib/ipc/gen/RecordingApplicationVm.ts
+  s_b489ba3915c891::t_1e1bec40c0f282 1-20
+tools/keeper-rec/Package.swift
+  s_b489ba3915c891::t_2325e683be94fe 13-23
+src-tauri/crates/keeper-core/src/vm.rs
+  s_b489ba3915c891::t_e221ad38a4dbe9 2497-2504
+  s_b489ba3915c891::t_f4d77c823d7283 2550-2552
+  s_b489ba3915c891::t_807c5974c76274 2494-2496,2505-2549,2553-2621
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "a0cd470d0f73532f3eb8fe981875202005e679f2",
+  "prompts": {},
+  "sessions": {
+    "s_b489ba3915c891": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "556c3d43-aad3-47f8-87c1-410641586ed7",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

@@ -1,0 +1,33 @@
+src/components/layout/pins-strip.tsx
+  s_add0dce8ac0858::t_a6acabb62f842e 109
+_bmad-output/implementation-artifacts/spec-4-3-pins.md
+  s_add0dce8ac0858::t_ddc9bec3810c51 168-172
+  s_add0dce8ac0858::t_06cd36f794433c 9
+  s_add0dce8ac0858::t_ef88be4db6acf0 105-114
+_bmad-output/implementation-artifacts/sprint-status.yaml
+  s_429042d2fb3cf5::t_f07dad596c7fbe 83
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "189ade472a6018d5f8e22384b9e08c69f9f723c2",
+  "prompts": {},
+  "sessions": {
+    "s_429042d2fb3cf5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4e5b4113-62ad-47b9-8937-c026a2cc532f",
+        "model": "unknown"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    },
+    "s_add0dce8ac0858": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e1f2b10f-490f-4ee4-880e-e741068f6e96",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

@@ -1,0 +1,21 @@
+_bmad-output/implementation-artifacts/spec-20-2-microphone-and-camera-tcc-pre-flight-rows.md
+  s_a826f5c40140df::t_17ac44e2fc2391 142-157
+  s_a826f5c40140df::t_2b73328be8e43c 194-196
+  s_a826f5c40140df::t_086108a1d7e14e 9
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "f1890e806e84dc2895e15f64af01f2188d0d84c5",
+  "prompts": {},
+  "sessions": {
+    "s_a826f5c40140df": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b025d9f5-8c2c-4621-a6b6-6594ec6e488b",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

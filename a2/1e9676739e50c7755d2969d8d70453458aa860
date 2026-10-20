@@ -1,0 +1,38 @@
+_bmad-output/planning-artifacts/briefs/brief-keeper-2026-07-03/brief.md
+  s_8a8bc6b6bf6017::t_94af460a787e2a 12
+  s_8a8bc6b6bf6017::t_7c60c608466d37 46
+  s_8a8bc6b6bf6017::t_0e1b387c0910c6 44
+  s_8a8bc6b6bf6017::t_073a57822e8b87 45
+  s_8a8bc6b6bf6017::t_b18f83053512d6 47
+  s_8a8bc6b6bf6017::t_767a0d2f43bc75 62
+  s_8a8bc6b6bf6017::t_2d28266f120688 71
+  s_8a8bc6b6bf6017::t_0b603f49f38f6d 3
+  s_8a8bc6b6bf6017::t_81394d56cc4c53 16
+  s_8a8bc6b6bf6017::t_820161a8076e4a 36
+  s_8a8bc6b6bf6017::t_ec86a37370a33d 69
+_bmad-output/planning-artifacts/briefs/brief-keeper-2026-07-03/addendum.md
+  s_8a8bc6b6bf6017::t_e75137e9bc75c0 74
+  s_8a8bc6b6bf6017::t_ac8215ced79fbc 3
+  s_8a8bc6b6bf6017::t_7d8f296c4e5d2f 43
+  s_8a8bc6b6bf6017::t_bf6a5ad9d01ed9 53
+  s_8a8bc6b6bf6017::t_bc783fe2bcb18b 55
+  s_8a8bc6b6bf6017::t_72b65794d11056 61
+_bmad-output/planning-artifacts/briefs/brief-keeper-2026-07-03/.memlog.md
+  s_8a8bc6b6bf6017::t_a6f9bed28585b8 3,19-21
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "a21e9676739e50c7755d2969d8d70453458aa860",
+  "prompts": {},
+  "sessions": {
+    "s_8a8bc6b6bf6017": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c19d356a-2c90-4eff-82aa-ba9853588b43",
+        "model": "claude-fable-5"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

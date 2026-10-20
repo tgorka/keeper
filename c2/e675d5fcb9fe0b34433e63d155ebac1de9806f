@@ -1,0 +1,26 @@
+_bmad-output/implementation-artifacts/spec-6-4-bridge-bot-fallback-driver.md
+  s_8b153a56a7bcba::t_31f3262ee87037 121-130
+  s_8b153a56a7bcba::t_4a3647c2963f2e 178-194
+  s_8b153a56a7bcba::t_0d8a592a241fd3 9
+src-tauri/crates/keeper-core/src/account.rs
+  s_8b153a56a7bcba::t_ef46088e9cdb1c 1469-1472,1474-1477
+  s_8b153a56a7bcba::t_f43e5def98aba6 162-173,175-179
+  s_8b153a56a7bcba::t_4188325d378485 180-183
+  s_8b153a56a7bcba::t_478a631904f635 2642-2647,2650-2653
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "c2e675d5fcb9fe0b34433e63d155ebac1de9806f",
+  "prompts": {},
+  "sessions": {
+    "s_8b153a56a7bcba": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1167e4bf-b8ce-4c39-96b2-1253d0b32dbb",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

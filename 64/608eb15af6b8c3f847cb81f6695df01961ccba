@@ -1,0 +1,27 @@
+src/components/settings/about-section.test.tsx
+  s_401f54b08601aa::t_fe30a3b4fedef4 146-150
+src/components/settings/about-section.tsx
+  s_401f54b08601aa::t_bbeebab2f9cee8 144-147,154-157,159
+_bmad-output/implementation-artifacts/spec-11-2-signed-auto-updates-and-egress-honesty.md
+  s_401f54b08601aa::t_1af5bd0d7527dc 148-157
+  s_401f54b08601aa::t_849ca9662bc303 198-209
+  s_401f54b08601aa::t_20525757857ea7 7
+_bmad-output/implementation-artifacts/deferred-work.md
+  s_401f54b08601aa::t_8b91b5ff77c991 393-396
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "64608eb15af6b8c3f847cb81f6695df01961ccba",
+  "prompts": {},
+  "sessions": {
+    "s_401f54b08601aa": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "55d2ca4b-80fa-47f2-8cdf-c9af5a0e6924",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

@@ -1,0 +1,19 @@
+_bmad-output/implementation-artifacts/spec-3-2-device-verification-emoji-sas-and-qr.md
+  s_6441bc19097b76::t_8842af43c19b6b 9
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "726d1be7a5952de60ced7556c640182bf8f229b8",
+  "prompts": {},
+  "sessions": {
+    "s_6441bc19097b76": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f21cbe84-5779-4be7-a1a3-adba44457779",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

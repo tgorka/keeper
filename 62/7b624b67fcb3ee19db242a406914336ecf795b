@@ -1,0 +1,19 @@
+_bmad-output/implementation-artifacts/spec-14-1-lifecycle-pause-resume-through-one-rust-entry.md
+  s_ad885441f410c8::t_37add940cc41d9 11
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "627b624b67fcb3ee19db242a406914336ecf795b",
+  "prompts": {},
+  "sessions": {
+    "s_ad885441f410c8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c51d905c-8c4c-461c-bb92-4e9184cfe635",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

@@ -1,0 +1,191 @@
+src-tauri/crates/keeper-core/src/bridges/mod.rs
+  s_a904849dd40118::t_cbce28d84b37d4 14
+  s_a904849dd40118::t_c1bd872477010f 81-91
+src/lib/bridges.ts
+  s_a904849dd40118::t_192dc6f0dec733 10
+  s_a904849dd40118::t_414c52109e1bda 44-61
+src/hooks/use-sign-out.test.ts
+  s_a904849dd40118::t_686f931bc4337e 50
+src/components/chat/RoomAvatar.test.tsx
+  s_a904849dd40118::t_686f931bc4337e 21
+src-tauri/crates/keeper-core/src/bridges/data.rs
+  s_a904849dd40118::t_dedb95be2ad72f 176-240
+  s_a904849dd40118::t_f2066f964c4d20 32-33
+  s_a904849dd40118::t_7d6149e805760a 251-252
+  s_a904849dd40118::t_1f120762d5362c 264-265
+  s_a904849dd40118::t_333eb90e283139 329-412
+  s_a904849dd40118::t_4fdc0e88d72586 646-701,710-772
+  s_a904849dd40118::t_a30d3ebe55fa32 702-709
+src-tauri/crates/keeper/src/lib.rs
+  s_a904849dd40118::t_b94d7f32c020cd 55-56
+src/components/chat/chat-row.tsx
+  s_a904849dd40118::t_411e8dcec6f8f1 143-148,150
+  s_a904849dd40118::t_d77c823141ebfc 61
+  s_a904849dd40118::t_cf5d2ddfbdb2b8 48,149
+  s_a904849dd40118::t_a0fe253affe592 185-203
+src-tauri/crates/keeper-core/src/vm.rs
+  s_a904849dd40118::t_8a4bb2f8647739 2144
+  s_a904849dd40118::t_bebdca4af6f2de 2176
+  s_a904849dd40118::t_efd1a8f60d33f0 2274-2345,2354-2360,2362-2364
+  s_a904849dd40118::t_a30d3ebe55fa32 2346-2353,2361
+  s_a904849dd40118::t_ec33ac57822ee6 1535-1607
+  s_a904849dd40118::t_a3063f249e5eea 1269-1275
+  s_a904849dd40118::t_e8e09b33f1a25d 1962
+  s_a904849dd40118::t_424c6b93a7d066 367-374
+src/lib/stores/archive-rooms.test.ts
+  s_a904849dd40118::t_686f931bc4337e 20
+src/lib/ipc/client.ts
+  s_a904849dd40118::t_c87d6e3d44a623 16-17
+  s_a904849dd40118::t_d4b74ce115588a 22
+  s_a904849dd40118::t_6a4da75d240af6 74
+  s_a904849dd40118::t_138ba1b08c2b7d 566-588
+src/components/layout/pins-strip.test.tsx
+  s_a904849dd40118::t_686f931bc4337e 34
+src/components/bridges/bridge-card.tsx
+  s_a904849dd40118::t_6b82eebab8453a 168-173,175-181
+  s_a904849dd40118::t_a370e2e344612c 128-134
+  s_a904849dd40118::t_54e8b544c19b18 39
+  s_a904849dd40118::t_518eec3777a6f2 204,212,219
+  s_a904849dd40118::t_6e10e8fa8277bd 41,43
+  s_a904849dd40118::t_5f43053e94ad55 78-82,88-114
+  s_a904849dd40118::t_2e5d78c3a2bd35 207-211
+  s_a904849dd40118::t_3c4ac30b312095 40
+  s_a904849dd40118::t_791c688d37c021 224-228
+  s_a904849dd40118::t_c6d56a815935e2 16
+  s_a904849dd40118::t_c71fd3ac5ac7e4 200-203,205-206,213-218,220-223,229-238,242,244,246
+  s_a904849dd40118::t_85074dd1a1e1c3 115
+src/hooks/use-selected-room-vm.test.ts
+  s_a904849dd40118::t_686f931bc4337e 29
+src/lib/stores/pins-rooms.test.ts
+  s_a904849dd40118::t_686f931bc4337e 20
+src/components/layout/sidebar-pane.test.tsx
+  s_a904849dd40118::t_c0a46b8088332f 23,26
+  s_a904849dd40118::t_39664001d262f3 59,66,69-85
+  s_a904849dd40118::t_c03559d5cb08e9 189-214
+  s_a904849dd40118::t_16e11e10ea19a0 86
+src/components/layout/conversation-pane.tsx
+  s_a904849dd40118::t_cf5d2ddfbdb2b8 75
+  s_a904849dd40118::t_1a939ae1ffa8c1 1160-1163
+  s_a904849dd40118::t_2d083fe956c05f 268
+  s_a904849dd40118::t_4cbc821c230f5f 38
+  s_a904849dd40118::t_c2de7b5ef2934f 28
+  s_a904849dd40118::t_2488b7afb1e12f 257-267,269-309
+  s_a904849dd40118::t_464b8957b865c2 314-317
+src-tauri/crates/keeper-core/src/bridges/health.rs
+  s_a904849dd40118::t_a30d3ebe55fa32 656-658,746,797-800,923-926,936-940
+  s_a904849dd40118::t_f4ffa22f4c57c9 35
+  s_a904849dd40118::t_2ab1835b9e9f48 290-432,436,438-475,490-498,500-590,597-609,620-623,629-631,636-638,640-642,645-655,659-661,663-665,680,682-684
+  s_a904849dd40118::t_044860ee17d475 476-489
+  s_a904849dd40118::t_799f6a7ccde5ee 662,679,681
+  s_a904849dd40118::t_66fad48ef26e8c 827-849
+  s_a904849dd40118::t_ec3855e5e1b839 433-435,437
+  s_a904849dd40118::t_2bf04e34894b0d 624-628
+  s_a904849dd40118::t_a9e69edb551e4c 31-32,34,36-40
+  s_a904849dd40118::t_8a45b695571c4c 632-635,639,643-644,666-678
+  s_a904849dd40118::t_efdd3308e30eb2 160-164
+  s_a904849dd40118::t_c5f952ebd1252c 850-863,868-871
+  s_a904849dd40118::t_9bd70ab726d693 864-867
+  s_a904849dd40118::t_5ba5dbae1ec6c1 499
+  s_a904849dd40118::t_b80ba6f79fb516 177-181,188
+  s_a904849dd40118::t_58d0b43ddc24c8 591-596,610-619
+  s_a904849dd40118::t_bef9d992b1b539 1-30,33,41-159,165-176,182-187,189-289,685-745,747-796,801-826,872-922,927-935,941-1022
+src/lib/stores/rooms.test.ts
+  s_a904849dd40118::t_686f931bc4337e 25
+src-tauri/crates/keeper/src/ipc.rs
+  s_a904849dd40118::t_5df8e6a7c2dacd 25
+  s_a904849dd40118::t_a30d3ebe55fa32 26-29,541-544
+  s_a904849dd40118::t_4b691b659b9d61 512-540,545-547
+src/components/layout/favorites-section.test.tsx
+  s_a904849dd40118::t_686f931bc4337e 35
+src/lib/ipc/gen/BridgeHealthSnapshot.ts
+  s_a904849dd40118::t_6f6523e8124e6e 1-18
+src/components/layout/conversation-pane.test.tsx
+  s_a904849dd40118::t_686f931bc4337e 1400
+src/lib/stores/bridge-health.ts
+  s_a904849dd40118::t_d7f75d17eca5c7 1-19,26,28-91
+  s_a904849dd40118::t_b3c807ca0b1402 20-25,27
+src/hooks/use-bridge-health.ts
+  s_a904849dd40118::t_e4dd518c81cac2 1-69
+src/lib/stores/favorites-rooms.test.ts
+  s_a904849dd40118::t_686f931bc4337e 20
+src-tauri/crates/keeper-core/src/inbox.rs
+  s_a904849dd40118::t_4d3461b2e1cc01 730-731
+  s_a904849dd40118::t_4f385c45a57461 718
+  s_a904849dd40118::t_22417e12c2cdbb 553-555
+  s_a904849dd40118::t_2c0b1e24e59c2b 628
+src/lib/search-filter.test.ts
+  s_a904849dd40118::t_c1e1f0611f2dc9 22
+src/components/search/search-overlay.test.tsx
+  s_a904849dd40118::t_62efc87c6ccd49 32
+src/lib/ipc/gen/InboxRoomVm.ts
+  s_a904849dd40118::t_6f6523e8124e6e 87-96
+src/lib/ipc/gen/BridgeSessionHealthVm.ts
+  s_a904849dd40118::t_6f6523e8124e6e 1-41
+_bmad-output/implementation-artifacts/spec-6-5-bridge-session-health-and-re-login-prompts.md
+  s_a904849dd40118::t_cc72c7de8c3ec9 71-72
+  s_a904849dd40118::t_16752570376afe 151-178
+  s_a904849dd40118::t_fd03d46510bf6b 7
+  s_a904849dd40118::t_3fc0a752f33bb8 5
+  s_a904849dd40118::t_e585bd3b2f724c 10
+  s_a904849dd40118::t_6e07d6b7377513 87-100
+  s_a904849dd40118::t_f47eb86d8dd2db 109-131
+  s_a904849dd40118::t_05f8f57acb11e5 1-4,6,8-9,11-70,73-86,101-108,132-150
+src-tauri/crates/keeper-core/src/account.rs
+  s_a904849dd40118::t_ad2838d96cbc53 336
+  s_a904849dd40118::t_6eaaa221ad2ae3 275-284,294-297
+  s_a904849dd40118::t_f9df531b1fa339 1347-1351
+  s_a904849dd40118::t_ac569ddb0f4329 335
+  s_a904849dd40118::t_d47309f90748f0 4095
+  s_a904849dd40118::t_d4467b8fe4720f 51-53
+  s_a904849dd40118::t_7fcc74b1969ef8 3846-3851,3865
+  s_a904849dd40118::t_2840532dd78d86 298-303
+  s_a904849dd40118::t_520238d3290775 19
+  s_a904849dd40118::t_68b8d8919fb3c5 2765-2769
+  s_a904849dd40118::t_a30d3ebe55fa32 1418,1422-1424
+  s_a904849dd40118::t_28a90a40f1b5d8 1338-1346,1352-1417,1419-1421,1425-1483
+src/components/layout/chat-list-pane.test.tsx
+  s_a904849dd40118::t_4168e3c2b27936 95
+src/components/bridges/bridge-card.test.tsx
+  s_a904849dd40118::t_4f10c1437c2777 5-12
+  s_a904849dd40118::t_ce7f05ede7819b 74,77-91
+  s_a904849dd40118::t_c37fe00ee37e12 205-239
+  s_a904849dd40118::t_4f951e6c92c32a 92
+src/components/chat/chat-row.test.tsx
+  s_a904849dd40118::t_f4c9899531873b 71,75-82
+  s_a904849dd40118::t_686f931bc4337e 57
+  s_a904849dd40118::t_b2118cd98ad7c7 4-5
+  s_a904849dd40118::t_7bda23c5f8c913 444-476
+  s_a904849dd40118::t_eb88f03e2425b7 83
+src/components/layout/sidebar-pane.tsx
+  s_a904849dd40118::t_819876a0bf0a8c 9,11,27
+  s_a904849dd40118::t_8e38e3426d81df 50-53
+src-tauri/crates/keeper-core/data/health-signals.json
+  s_a904849dd40118::t_b8f1d0e1706319 60-61
+  s_a904849dd40118::t_a14b66abf5ca27 1-15,25-59,62-67
+  s_a904849dd40118::t_e4cbbc0d5c7c32 16-24
+src/lib/ipc/gen/BridgeHealth.ts
+  s_a904849dd40118::t_6f6523e8124e6e 1-15
+src/components/layout/app-shell.tsx
+  s_a904849dd40118::t_1ab7e02747f187 15
+  s_a904849dd40118::t_6f434834985708 39-42
+src/lib/ipc/gen/RoomVm.ts
+  s_a904849dd40118::t_6f6523e8124e6e 78-88
+src/components/layout/conversation-health-banner.test.tsx
+  s_a904849dd40118::t_f682e13011b4a1 1-78
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "c1210f946e136700b382c8031739fbd721b6f6b6",
+  "prompts": {},
+  "sessions": {
+    "s_a904849dd40118": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "37ec2c68-0d24-4bfb-8d8b-a9c46d7971b6",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

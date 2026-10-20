@@ -1,0 +1,39 @@
+_bmad-output/implementation-artifacts/spec-15-5-paid-program-decision-gate-recorded.md
+  s_a30c2bd02a9f43::t_e69ceb027f52bb 6
+  s_a30c2bd02a9f43::t_bcb90b593346da 60-71
+  s_a30c2bd02a9f43::t_0ee7fbe7212684 9
+  s_a30c2bd02a9f43::t_3290fb447b2ada 13-14
+  s_a30c2bd02a9f43::t_7c37f4065570ac 5
+  s_a30c2bd02a9f43::t_2763a5a90aaacd 94-127
+  s_a30c2bd02a9f43::t_6c6d74e5953938 47-48
+  s_a30c2bd02a9f43::t_97530d7cb3bf62 46
+  s_a30c2bd02a9f43::t_20db7e91e92ef9 1-4,7-8,10-12,15-45,49-59,72-93
+docs/decisions.md
+  s_a30c2bd02a9f43::t_f888d0914b83f8 17-18
+  s_a30c2bd02a9f43::t_b4436bde886a8a 31
+  s_a30c2bd02a9f43::t_e4cacf86eea63d 1-4,7-16,19-20,22-30
+  s_a30c2bd02a9f43::t_f138912f7fce15 21
+  s_a30c2bd02a9f43::t_ab10c9fda0258e 5-6
+docs/constraints-and-limitations.md
+  s_a30c2bd02a9f43::t_72f22628604f8c 29-30
+_bmad-output/implementation-artifacts/sprint-status.yaml
+  s_a30c2bd02a9f43::t_e48ebbb26e3a77 167
+docs/ios.md
+  s_a30c2bd02a9f43::t_8dfbfbed31dc85 354-356
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "d6bacc99a903d03dfdaa343ad4ae8534c8991276",
+  "prompts": {},
+  "sessions": {
+    "s_a30c2bd02a9f43": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "26011850-38a8-4a53-aa6b-a6ddf608b55a",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

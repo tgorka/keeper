@@ -1,0 +1,19 @@
+_bmad-output/implementation-artifacts/spec-3-3-key-backup-enable-and-restore.md
+  s_d049bc5db67ea3::t_590ea324dec1a8 9
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "14c16416d1808765eb79b1126a5b55add6b27ba6",
+  "prompts": {},
+  "sessions": {
+    "s_d049bc5db67ea3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "485c74b0-21a5-4002-9a9c-7488b9114faa",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

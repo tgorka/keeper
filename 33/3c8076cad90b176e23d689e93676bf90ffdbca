@@ -1,0 +1,132 @@
+src-tauri/crates/keeper-core/data/risk-tiers.json
+  s_73deeb4e3431e1::t_cbf7e6248b7892 1-8,10-51,53-68
+  s_73deeb4e3431e1::t_590ca3fb46c826 52
+  s_73deeb4e3431e1::t_ad029d252bbe85 9
+src/components/layout/bridges-pane.test.tsx
+  s_73deeb4e3431e1::t_8f7c5748a920af 1-110
+src-tauri/crates/keeper-core/src/lib.rs
+  s_73deeb4e3431e1::t_3b923397c06e69 17
+src-tauri/crates/keeper-core/src/vm.rs
+  s_73deeb4e3431e1::t_a27ff144a0c02f 1546-1549
+  s_73deeb4e3431e1::t_dd4f0b7a5089cd 1527-1545,1550-1568
+  s_73deeb4e3431e1::t_1d5e17f3bd1aaf 1382-1459
+src/lib/ipc/client.ts
+  s_73deeb4e3431e1::t_17dc7846c33ebf 14-15
+  s_73deeb4e3431e1::t_f4e487ff7fb765 62
+  s_73deeb4e3431e1::t_18a838f4dbc09a 117-128
+  s_73deeb4e3431e1::t_590ca3fb46c826 42
+  s_73deeb4e3431e1::t_a2f2029994ae48 116
+src-tauri/crates/keeper-core/src/bridges/mod.rs
+  s_73deeb4e3431e1::t_e39bca78eaa4e3 133-136
+  s_73deeb4e3431e1::t_cf60a73a2e4d8f 118-132,137-165
+  s_73deeb4e3431e1::t_5a30c8e0a75a84 1-117,184
+  s_c20931bf58dfb5::t_64b894df412d7c 166-183
+src-tauri/crates/keeper-core/data/known-bots.json
+  s_73deeb4e3431e1::t_100bc3688a5c80 11
+  s_73deeb4e3431e1::t_02969966e54466 1-10,12-14
+src-tauri/crates/keeper-core/src/bridges/data.rs
+  s_73deeb4e3431e1::t_02cb6ea8923f18 22-28
+  s_73deeb4e3431e1::t_1c614c23642e56 164-176,178-183,187,193-200,209-214,223-228
+  s_c20931bf58dfb5::t_51b622d22fe583 287,397-473,477-485,489-641
+  s_c20931bf58dfb5::t_2837a00562561a 32
+  s_c20931bf58dfb5::t_05535762880961 94
+  s_73deeb4e3431e1::t_bddb2745aeceac 263-268
+  s_73deeb4e3431e1::t_544f6742eeba64 1-13,15-21,29-31,33-72,74-93,95-126,128-163,177,184,186,188-192,201-208,215-222,229-238,245-258,262,270-281,288-396,642
+  s_73deeb4e3431e1::t_a27ff144a0c02f 185
+  s_c20931bf58dfb5::t_2efe8e996ae4fa 127
+  s_c20931bf58dfb5::t_71eeff1586eab4 259-261,269,282-284
+  s_c20931bf58dfb5::t_0dba5fe2ef7528 73
+  s_73deeb4e3431e1::t_63dc5609335c57 14
+  s_73deeb4e3431e1::t_bee433d1eb6369 239-244
+  s_c20931bf58dfb5::t_ba7b2636a87035 474-476,486-488
+  s_c20931bf58dfb5::t_7c20afab5992c9 285-286
+src-tauri/crates/keeper/src/ipc.rs
+  s_73deeb4e3431e1::t_b624442973f3e2 19-20
+  s_73deeb4e3431e1::t_f1dc06c194b211 25
+  s_73deeb4e3431e1::t_204178de47bbb3 384-394
+  s_73deeb4e3431e1::t_c1d62b99a7e9c2 311-314
+src/components/layout/bridges-pane.tsx
+  s_73deeb4e3431e1::t_5e759b33cae4a8 1-65
+src/components/layout/sidebar-pane.tsx
+  s_73deeb4e3431e1::t_ef08ea62310415 134,140-149
+  s_73deeb4e3431e1::t_590ca3fb46c826 116-119
+  s_73deeb4e3431e1::t_a24901e69f7de7 68,70-72,74-77
+  s_73deeb4e3431e1::t_d866142b7c9403 171
+  s_73deeb4e3431e1::t_70617d9764f9bb 92-93,101-104,107-115,120-121
+  s_73deeb4e3431e1::t_84cd53bde88750 25-57
+_bmad-output/implementation-artifacts/spec-6-1-bridges-surface-with-data-driven-risk-tiers.md
+  s_c20931bf58dfb5::t_e0cf647eb4913e 9
+  s_c20931bf58dfb5::t_88db2791669b54 116-129
+  s_73deeb4e3431e1::t_c9fe8cfe553496 76-86
+  s_73deeb4e3431e1::t_a7450346817350 5
+  s_73deeb4e3431e1::t_0bf39aa7b22660 109-115,130-147
+  s_73deeb4e3431e1::t_54a657aeb8c3c9 7
+  s_73deeb4e3431e1::t_842829da5c5220 148-177
+  s_c20931bf58dfb5::t_29a392054b9de4 178-199
+  s_73deeb4e3431e1::t_6a227f4d1fe72b 13
+  s_73deeb4e3431e1::t_63a157fbbb4e86 1-4,8,10-12,14-75,87-108
+  s_73deeb4e3431e1::t_7cbfe87f305aa0 6
+src-tauri/crates/keeper/src/lib.rs
+  s_73deeb4e3431e1::t_21fe396a341bdf 49
+src/components/bridges/bridge-card.test.tsx
+  s_73deeb4e3431e1::t_66bc09a2e5f366 1-4,6-90,94-111
+  s_73deeb4e3431e1::t_590ca3fb46c826 5,91-93
+_bmad-output/implementation-artifacts/sprint-status.yaml
+  s_73deeb4e3431e1::t_2032fb9f4d33eb 98
+src-tauri/crates/keeper-core/data/coupling-caveats.json
+  s_73deeb4e3431e1::t_47cc637b9388a3 1-10
+src/components/bridges/bridge-card.tsx
+  s_73deeb4e3431e1::t_37480fc99aacb4 82-87
+  s_73deeb4e3431e1::t_af472244ba05c7 113
+  s_73deeb4e3431e1::t_b8f52481e669e6 40
+  s_73deeb4e3431e1::t_41d430f7a30b6f 1-27,29-39,41-81,88-112,114-134
+  s_73deeb4e3431e1::t_590ca3fb46c826 28
+src/lib/ipc/gen/BridgeNetworkVm.ts
+  s_73deeb4e3431e1::t_a526cefa8b347a 1-51
+_bmad-output/implementation-artifacts/epic-6-context.md
+  s_73deeb4e3431e1::t_ce545a3c779368 1-58
+src/hooks/use-bridge-catalog.ts
+  s_73deeb4e3431e1::t_2591c02d8e3c04 1-56
+src/lib/stores/primary-view.ts
+  s_73deeb4e3431e1::t_4e73fa331f8ff3 12-17
+src-tauri/crates/keeper-core/src/error.rs
+  s_c20931bf58dfb5::t_c7a8396657fcee 347-350
+  s_73deeb4e3431e1::t_ef525c13c4ecaf 337-346,351-358
+  s_73deeb4e3431e1::t_6144abe84058a5 410-414
+src/components/layout/app-shell.tsx
+  s_73deeb4e3431e1::t_7e4cae5413be0f 40-44
+  s_73deeb4e3431e1::t_074d7288c04581 3
+  s_73deeb4e3431e1::t_b35ed7c4202f0a 15,21
+  s_73deeb4e3431e1::t_6b8938bd18fd0f 79-91
+src/lib/ipc/gen/BadgeStyle.ts
+  s_73deeb4e3431e1::t_a526cefa8b347a 1-12
+src/hooks/use-bridges-shortcut.ts
+  s_73deeb4e3431e1::t_b8e1feab68e586 1-18,31-37
+  s_73deeb4e3431e1::t_2b8842fc923729 19-30
+src/lib/ipc/gen/RiskTier.ts
+  s_73deeb4e3431e1::t_a526cefa8b347a 1-12
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "333c8076cad90b176e23d689e93676bf90ffdbca",
+  "prompts": {},
+  "sessions": {
+    "s_73deeb4e3431e1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "acc87a4e-e26c-44e4-b349-a24f9b505799",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    },
+    "s_c20931bf58dfb5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ac91e130-ad56-4a66-8396-d1a9b3ed35c3",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

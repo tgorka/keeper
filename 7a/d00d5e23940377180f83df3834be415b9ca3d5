@@ -1,0 +1,45 @@
+src-tauri/crates/keeper-core/src/error.rs
+  s_c20931bf58dfb5::t_c7a8396657fcee 347-350
+src-tauri/crates/keeper-core/src/bridges/mod.rs
+  s_c20931bf58dfb5::t_64b894df412d7c 166-183
+_bmad-output/implementation-artifacts/spec-6-1-bridges-surface-with-data-driven-risk-tiers.md
+  s_73deeb4e3431e1::t_54a657aeb8c3c9 7
+  s_c20931bf58dfb5::t_88db2791669b54 116-129
+  s_c20931bf58dfb5::t_29a392054b9de4 178-199
+  s_c20931bf58dfb5::t_e0cf647eb4913e 9
+src-tauri/crates/keeper-core/src/bridges/data.rs
+  s_c20931bf58dfb5::t_0dba5fe2ef7528 73
+  s_c20931bf58dfb5::t_05535762880961 94
+  s_c20931bf58dfb5::t_2efe8e996ae4fa 127
+  s_c20931bf58dfb5::t_71eeff1586eab4 259-261,269,282-284
+  s_c20931bf58dfb5::t_51b622d22fe583 287,397-473,477-485,489-641
+  s_c20931bf58dfb5::t_2837a00562561a 32
+  s_c20931bf58dfb5::t_ba7b2636a87035 474-476,486-488
+  s_c20931bf58dfb5::t_7c20afab5992c9 285-286
+_bmad-output/implementation-artifacts/sprint-status.yaml
+  s_73deeb4e3431e1::t_2032fb9f4d33eb 98
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "7ad00d5e23940377180f83df3834be415b9ca3d5",
+  "prompts": {},
+  "sessions": {
+    "s_73deeb4e3431e1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "acc87a4e-e26c-44e4-b349-a24f9b505799",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    },
+    "s_c20931bf58dfb5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ac91e130-ad56-4a66-8396-d1a9b3ed35c3",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

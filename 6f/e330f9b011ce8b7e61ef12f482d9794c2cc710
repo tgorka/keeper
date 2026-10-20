@@ -1,0 +1,19 @@
+_bmad-output/implementation-artifacts/bmad-dev-auto-result-16-6-full-screen-system-audio-capture-to-a-single-fmp4.md
+  s_8a8bc6b6bf6017::t_e104a9e3777e99 131-161
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "6fe330f9b011ce8b7e61ef12f482d9794c2cc710",
+  "prompts": {},
+  "sessions": {
+    "s_8a8bc6b6bf6017": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c19d356a-2c90-4eff-82aa-ba9853588b43",
+        "model": "claude-fable-5"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

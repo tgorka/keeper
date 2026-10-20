@@ -1,0 +1,97 @@
+src-tauri/crates/keeper-core/src/account.rs
+  s_49d0b0222d2277::t_87148e1a98a8c6 842-847
+  s_49d0b0222d2277::t_916825a5f9d5c4 853
+src/App.test.tsx
+  s_49d0b0222d2277::t_14d6257e4aafe1 29
+  s_49d0b0222d2277::t_3c3e8cad43b359 9-10,23-25
+  s_49d0b0222d2277::t_4b9fbd971aab9e 44-46
+  s_49d0b0222d2277::t_4cb2fc6f5ff4fc 62-63,66-67,71-76
+  s_49d0b0222d2277::t_e8aeacb900ff77 77-78
+src/components/layout/sidebar-pane.test.tsx
+  s_49d0b0222d2277::t_075a531e5a0704 11-19
+  s_49d0b0222d2277::t_c53f039bf0d29c 1
+  s_49d0b0222d2277::t_5b0a6840d13f6c 108-114,116-121
+  s_49d0b0222d2277::t_eed2b941b16d18 115
+  s_49d0b0222d2277::t_e4d191c03e60d5 20
+src/components/layout/sidebar-pane.tsx
+  s_49d0b0222d2277::t_fe6c30202393c1 49
+  s_49d0b0222d2277::t_b3617ac9d1f488 2,4
+  s_49d0b0222d2277::t_7f7ae5d4209abf 120
+  s_49d0b0222d2277::t_14e7b7a1a57914 47-48,61,77
+  s_49d0b0222d2277::t_d61193a2421c2c 30-32
+src/lib/ipc/client.ts
+  s_49d0b0222d2277::t_ce65effdc9db11 152-171
+_bmad-output/implementation-artifacts/deferred-work.md
+  s_49d0b0222d2277::t_b51f8d5987c327 38-40
+  s_49d0b0222d2277::t_d264c561610771 35-37
+src-tauri/crates/keeper/src/ipc.rs
+  s_49d0b0222d2277::t_4a3c2af9c25820 356-374
+src/components/settings/settings-dialog.test.tsx
+  s_49d0b0222d2277::t_4934c6768ba809 1-47,49-51
+  s_49d0b0222d2277::t_fe6c30202393c1 48
+src/components/settings/at-rest-encryption-choice.tsx
+  s_49d0b0222d2277::t_8a77b30c4c922f 1-33,40-53,61-77,79-87,89-92,95-96,98-118,124-133
+  s_49d0b0222d2277::t_66ed63e9144165 78,88,93-94,97
+  s_49d0b0222d2277::t_df4804df640811 54-60
+  s_49d0b0222d2277::t_7c4eb40e8f9329 34-39
+  s_49d0b0222d2277::t_d82360819a2932 119-123
+src/App.tsx
+  s_49d0b0222d2277::t_b3146aa083c981 1,4,6,18-43,58-61,63-78
+src-tauri/crates/keeper-core/src/auth.rs
+  s_49d0b0222d2277::t_f29ad241672ef3 316-334,342-366
+  s_49d0b0222d2277::t_af4f3e417aefd9 879-884,889-893
+  s_49d0b0222d2277::t_231ebf50a1f73c 586-591
+  s_49d0b0222d2277::t_5c6fe9bbc5c7b1 659-660,671
+  s_49d0b0222d2277::t_9efd1449e61072 532
+  s_49d0b0222d2277::t_33f7caccb46792 335-341
+  s_49d0b0222d2277::t_95dabc0107cfa0 714-733
+  s_49d0b0222d2277::t_6b29cb61b4361d 903-906
+  s_49d0b0222d2277::t_0cff1d0900c7ea 422,1158-1238
+  s_49d0b0222d2277::t_11f5b22d16904e 661-670
+  s_49d0b0222d2277::t_59c662ca43ae46 400-410,420-421
+  s_49d0b0222d2277::t_396595697fb851 512-526
+src-tauri/crates/keeper-core/src/registry.rs
+  s_49d0b0222d2277::t_2269b5095a544a 465-467,472-488
+  s_49d0b0222d2277::t_33f7caccb46792 468-471
+  s_49d0b0222d2277::t_b499bf089001d6 55-64,69-101
+  s_49d0b0222d2277::t_d55b3bddb07783 102,464
+src-tauri/crates/keeper-core/Cargo.toml
+  s_49d0b0222d2277::t_727c6e4139c427 32-34
+src/components/settings/settings-dialog.tsx
+  s_49d0b0222d2277::t_6b24531fbf71c2 4
+  s_49d0b0222d2277::t_0f3fccfd27a756 33-37,43-45,64-71
+  s_49d0b0222d2277::t_57e1acb6d9c644 1-3,5-32,38-42,46-63,72-87
+src/components/settings/at-rest-encryption-choice.test.tsx
+  s_49d0b0222d2277::t_ad656a5f441ebb 2-10,12-49,51-59,62-65,83
+  s_49d0b0222d2277::t_2c78f87f2f2da2 1
+  s_49d0b0222d2277::t_480c3b1bed0cd4 50,60-61
+  s_49d0b0222d2277::t_456eb2d7bd0310 11
+  s_49d0b0222d2277::t_e0c33d0bf6b27c 66-82
+src-tauri/crates/keeper/src/lib.rs
+  s_49d0b0222d2277::t_fec48e4293016b 45-46
+_bmad-output/implementation-artifacts/spec-2-6-at-rest-encryption-first-run-choice.md
+  s_49d0b0222d2277::t_d921d758eaf756 5
+  s_49d0b0222d2277::t_2b59166f5ed21d 81-90
+  s_49d0b0222d2277::t_8d5c1954e80aab 6
+  s_49d0b0222d2277::t_c21100ab9fb4e6 91
+  s_49d0b0222d2277::t_81d1a1dfd526bd 128-171
+  s_49d0b0222d2277::t_c245c78e5faa61 1-4,7-80,92-127
+src-tauri/Cargo.lock
+  s_49d0b0222d2277::t_871b141edbfc44 2856
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "c8e791218f50121c62bf8c52c4bb56ba2788ff07",
+  "prompts": {},
+  "sessions": {
+    "s_49d0b0222d2277": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "33b9583c-c64f-456f-b5ae-3cb34f9ed57a",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

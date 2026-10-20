@@ -1,0 +1,19 @@
+src-tauri/crates/keeper/src/pdf_export.rs
+  s_9bfe0bf28c8205::t_f28f8869cf75f1 21-30
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "dc5cf1fb9b5d4960aa9e4e517ff94f7431a61a60",
+  "prompts": {},
+  "sessions": {
+    "s_9bfe0bf28c8205": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a6a8d43-9ddd-4b65-b1f4-97581e5db3f3",
+        "model": "claude-opus-5"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

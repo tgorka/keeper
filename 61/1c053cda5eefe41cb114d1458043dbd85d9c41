@@ -1,0 +1,104 @@
+src-tauri/crates/keeper/src/ipc.rs
+  s_5cbc78cfe8e718::t_b5819da8b839c3 339-357
+  s_5cbc78cfe8e718::t_b7d0f40b07444e 254-270
+  s_5cbc78cfe8e718::t_afe6ac8c43a1a9 27
+  s_5cbc78cfe8e718::t_e2acae7c25975b 28-32,2612-2616,2632
+  s_5cbc78cfe8e718::t_26c88e307f8659 2581-2611,2617-2631,2633-2664
+src-tauri/crates/keeper/capabilities/default.json
+  s_5cbc78cfe8e718::t_953ec4d7f84bdf 14-17
+src-tauri/crates/keeper-core/src/platform.rs
+  s_5cbc78cfe8e718::t_4f4f7e62379661 50-57
+_bmad-output/implementation-artifacts/spec-10-3-background-operation-and-honest-quit.md
+  s_5cbc78cfe8e718::t_30b5ec56256b46 137-166
+  s_5cbc78cfe8e718::t_8d57551cc83bad 6
+  s_5cbc78cfe8e718::t_191e5cbeda787c 7
+  s_5cbc78cfe8e718::t_75ad86165387f8 79-90
+  s_5cbc78cfe8e718::t_ed272449e14b0a 99-115
+  s_5cbc78cfe8e718::t_7bab0325cc0128 5
+  s_5cbc78cfe8e718::t_39621db4fbfdd7 1-4,8-78,91-98,116-136
+src/lib/ipc/gen/DockBadgeMode.ts
+  s_5cbc78cfe8e718::t_edae94264e1192 1-13
+src-tauri/crates/keeper-core/src/vm.rs
+  s_5cbc78cfe8e718::t_8cfbfefe3432e2 1348-1389
+src/components/settings/settings-dialog.test.tsx
+  s_5cbc78cfe8e718::t_eaef3c3912d5dc 12-17
+src-tauri/crates/keeper-core/src/registry.rs
+  s_5cbc78cfe8e718::t_39310bd3b99aeb 1855-1856,1858-1864,1870-1886
+  s_5cbc78cfe8e718::t_3e9c7f9f9333e0 17
+  s_5cbc78cfe8e718::t_e2acae7c25975b 1857,1865-1869
+  s_5cbc78cfe8e718::t_599652e83d2f12 482-523
+src-tauri/crates/keeper/src/lib.rs
+  s_5cbc78cfe8e718::t_3cd4c3e1082432 87-111
+  s_5cbc78cfe8e718::t_0cbfb78b0ae9c8 12,14
+  s_5cbc78cfe8e718::t_4234fe25a2c924 300
+  s_5cbc78cfe8e718::t_8d47302ba06a09 253-259,261-299,301-303
+  s_5cbc78cfe8e718::t_d1c635296fcaac 35-41
+src-tauri/Cargo.toml
+  s_5cbc78cfe8e718::t_0078625dff40d4 21-23
+  s_5cbc78cfe8e718::t_667ab15516c4fd 35-37
+src-tauri/crates/keeper-core/src/inbox.rs
+  s_5cbc78cfe8e718::t_b8ea210e725ee4 723
+  s_5cbc78cfe8e718::t_f991e821d6aa3b 363-377
+  s_5cbc78cfe8e718::t_6079df933cca80 949-950,952-953,957-987
+  s_5cbc78cfe8e718::t_ebed9e36048778 150-153,162-163,179-180
+  s_5cbc78cfe8e718::t_e2acae7c25975b 954-956
+  s_5cbc78cfe8e718::t_8b9a7e7c716a8a 1000-1002,1029-1030,1033
+  s_5cbc78cfe8e718::t_787cb7ee2f4dcb 670-673,676-722
+  s_5cbc78cfe8e718::t_37605fb6af59d3 119-129
+  s_5cbc78cfe8e718::t_c174a0440ed86c 27-28
+  s_5cbc78cfe8e718::t_cffce16d4b21b5 2021-2135
+  s_5cbc78cfe8e718::t_3c6741da39643a 301-318
+src-tauri/crates/keeper-core/src/auth.rs
+  s_5cbc78cfe8e718::t_4bf813bc35c854 1032-1034
+  s_5cbc78cfe8e718::t_d7f18a86179eb9 927-929
+src-tauri/crates/keeper-core/src/lib.rs
+  s_5cbc78cfe8e718::t_e347127c56bd4e 16
+src-tauri/crates/keeper-core/src/badge.rs
+  s_5cbc78cfe8e718::t_de890ba6f2f806 1-134
+src-tauri/crates/keeper-core/tests/archive_survives_sign_out.rs
+  s_5cbc78cfe8e718::t_a6d261e7940e51 107-109
+src-tauri/crates/keeper/Cargo.toml
+  s_5cbc78cfe8e718::t_17a5943aad5c2f 46-48
+src-tauri/crates/keeper-core/src/notify.rs
+  s_5cbc78cfe8e718::t_cf0024aeab58ca 567-569
+_bmad-output/implementation-artifacts/deferred-work.md
+  s_5cbc78cfe8e718::t_ffd076310e5524 357-372
+src-tauri/crates/keeper/src/tray.rs
+  s_5cbc78cfe8e718::t_1a234fb9ba32a2 1-119
+src/components/settings/settings-dialog.tsx
+  s_5cbc78cfe8e718::t_47125b7b158309 120
+  s_5cbc78cfe8e718::t_d924d540fba2c1 20,24-26,34-37
+  s_5cbc78cfe8e718::t_33b358690b0ff2 285-445
+src/lib/ipc/client.ts
+  s_5cbc78cfe8e718::t_89a8de29e3c64a 39
+  s_5cbc78cfe8e718::t_760055aedda32e 11
+  s_5cbc78cfe8e718::t_c1c1a0b8afaa3f 1468-1522
+src-tauri/crates/keeper-core/src/account.rs
+  s_5cbc78cfe8e718::t_93e3b3bbb22287 3469-3534
+  s_5cbc78cfe8e718::t_a3c1c965b7e726 5854-5856
+  s_5cbc78cfe8e718::t_52e6fa023d9255 576-582
+  s_5cbc78cfe8e718::t_94dfad3a450047 635-642
+  s_5cbc78cfe8e718::t_9475ab3122d932 653
+  s_5cbc78cfe8e718::t_e2acae7c25975b 50
+  s_5cbc78cfe8e718::t_f76f81424c1c44 857-860
+src-tauri/Cargo.lock
+  s_5cbc78cfe8e718::t_6aa7ee1fbed41a 355-365,1280-1288,1295-1306,1317,1485,2893,2901,4576-4586,5721,5771,5841-5854,6532,7559-7567,7600
+_bmad-output/implementation-artifacts/sprint-status.yaml
+  s_5cbc78cfe8e718::t_5063802e72f7d2 128
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "611c053cda5eefe41cb114d1458043dbd85d9c41",
+  "prompts": {},
+  "sessions": {
+    "s_5cbc78cfe8e718": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "df15b8d1-c059-4f54-9164-7a3f74006935",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": null
+    }
+  }
+}

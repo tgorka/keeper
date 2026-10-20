@@ -1,0 +1,21 @@
+.bmad-loop/decisions.json
+  s_8a8bc6b6bf6017::t_e4a956443d3008 92-100
+_bmad-output/implementation-artifacts/deferred-work.md
+  s_8a8bc6b6bf6017::t_4e4216978295aa 417
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "17c8c397ebcac290b815a51ac7d891e10951181e",
+  "prompts": {},
+  "sessions": {
+    "s_8a8bc6b6bf6017": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c19d356a-2c90-4eff-82aa-ba9853588b43",
+        "model": "claude-fable-5"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

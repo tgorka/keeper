@@ -1,0 +1,19 @@
+_bmad-output/implementation-artifacts/spec-17-2-session-folder-manifest-json-and-segment-ledger.md
+  s_4052a5630c34d8::t_65842dc276b8ec 7
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "2e835b59bb452a627bfeacb77bdf0ad3f1f73d9a",
+  "prompts": {},
+  "sessions": {
+    "s_4052a5630c34d8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "aefc8971-0c7c-4759-bda7-35908aabc81e",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

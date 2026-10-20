@@ -1,0 +1,47 @@
+src-tauri/crates/keeper-core/src/bridges/health.rs
+  s_443172f62fcb74::t_7e9dc76aec6766 850-880
+  s_443172f62fcb74::t_2525e505cc500a 849
+_bmad-output/implementation-artifacts/spec-6-5-bridge-session-health-and-re-login-prompts.md
+  s_443172f62fcb74::t_ca74e29df2577f 7
+  s_a904849dd40118::t_4cb8a9e1e72afd 11
+  s_443172f62fcb74::t_6e52d2344264bb 191-208
+  s_443172f62fcb74::t_0956d09b782aef 133-143
+src-tauri/crates/keeper-core/data/health-signals.json
+  s_443172f62fcb74::t_6cea85c7fdfa3e 54,59-73
+_bmad-output/implementation-artifacts/deferred-work.md
+  s_443172f62fcb74::t_4a7a99a7d1dc2b 216-235
+_bmad-output/implementation-artifacts/sprint-status.yaml
+  s_979b096fd836b6::t_f8bfefa60fbfac 102
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "513b25a4d673a01972ae7ee22246075478c90d90",
+  "prompts": {},
+  "sessions": {
+    "s_443172f62fcb74": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "24e314f0-edc8-4101-ac04-d75bcce7e2b6",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    },
+    "s_979b096fd836b6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d80d02d2-6c31-490f-af5c-b83799577d7b",
+        "model": "unknown"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    },
+    "s_a904849dd40118": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "37ec2c68-0d24-4bfb-8d8b-a9c46d7971b6",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

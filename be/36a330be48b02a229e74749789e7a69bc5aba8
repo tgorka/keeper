@@ -1,0 +1,19 @@
+_bmad-output/implementation-artifacts/spec-15-4-required-ios-ci-gate-and-release-hygiene.md
+  s_0f5270fa13a2aa::t_4b588a6d5ed9df 9
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.12",
+  "base_commit_sha": "be36a330be48b02a229e74749789e7a69bc5aba8",
+  "prompts": {},
+  "sessions": {
+    "s_0f5270fa13a2aa": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d3278b65-e379-4c57-b8a4-ca263fb634fe",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

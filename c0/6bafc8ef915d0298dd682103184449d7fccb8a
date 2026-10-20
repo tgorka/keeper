@@ -1,0 +1,21 @@
+src/components/notes/note-column-width.test.ts
+  s_9bfe0bf28c8205::t_1ccd5082d41ab7 1-21
+src/components/notes/note-editor.tsx
+  s_9bfe0bf28c8205::t_32c0d5a287068d 335-350,863
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "c06bafc8ef915d0298dd682103184449d7fccb8a",
+  "prompts": {},
+  "sessions": {
+    "s_9bfe0bf28c8205": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a6a8d43-9ddd-4b65-b1f4-97581e5db3f3",
+        "model": "claude-opus-5"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

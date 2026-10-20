@@ -1,0 +1,23 @@
+src/components/notes/format-toolbar.test.tsx
+  s_cbf9741c93ab65::t_380617a1a6a650 102-109,271,276,282,371-373,378
+src/components/notes/notes-agent-dock.test.tsx
+  s_cbf9741c93ab65::t_380617a1a6a650 107-113
+  s_cbf9741c93ab65::t_90734b41e0cb88 467
+  s_cbf9741c93ab65::t_b16a8260e29b67 468-469,473
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "9f199a193374acb4e1559c36fa445782fcad7ce9",
+  "prompts": {},
+  "sessions": {
+    "s_cbf9741c93ab65": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5b400cc2-6399-4f94-b9bb-ce6893683e42",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

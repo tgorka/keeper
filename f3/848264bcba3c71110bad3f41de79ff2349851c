@@ -1,0 +1,39 @@
+src/hooks/use-notes-actions.ts
+  s_9bfe0bf28c8205::t_7ba71e5547efa4 231-234
+src-tauri/crates/keeper-core/src/notes/seed.rs
+  s_9bfe0bf28c8205::t_20d637c3ad6e63 120-164,1176-1238
+src-tauri/crates/keeper-core/src/notes/vm.rs
+  s_9bfe0bf28c8205::t_a1f0d6076c1b1a 301-309,1124-1128
+src-tauri/crates/keeper/src/notes_ipc.rs
+  s_9bfe0bf28c8205::t_74529dc3dd31a3 654-657,689,706-711,1314,1574-1584,2025-2027,2075,2099
+src/components/notes/notes-pane.test.tsx
+  s_9bfe0bf28c8205::t_54639c6962c0f1 147
+src/components/notes/rail-fold.test.tsx
+  s_9bfe0bf28c8205::t_a7b36a622862d0 55
+src/components/notes/space-editor.test.tsx
+  s_9bfe0bf28c8205::t_bed26e208cfd75 61,1092-1117
+src/components/notes/space-editor.tsx
+  s_9bfe0bf28c8205::t_3ce8df48aa361d 233,263-265,435-437,652-673
+src/components/notes/space-list.test.tsx
+  s_9bfe0bf28c8205::t_3163b3314e9cf9 64
+src/lib/ipc/gen/NoteSpaceReq.ts
+  s_9bfe0bf28c8205::t_621f032eeb2b8c 55-62
+src/lib/ipc/gen/NoteSpaceVm.ts
+  s_9bfe0bf28c8205::t_0565598be16e98 85-95
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "f3848264bcba3c71110bad3f41de79ff2349851c",
+  "prompts": {},
+  "sessions": {
+    "s_9bfe0bf28c8205": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a6a8d43-9ddd-4b65-b1f4-97581e5db3f3",
+        "model": "claude-opus-5"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

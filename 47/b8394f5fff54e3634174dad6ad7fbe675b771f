@@ -1,0 +1,21 @@
+src/components/viewers/html-view.ts
+  s_9bfe0bf28c8205::t_33cdb7fdd6d5fc 130-257,421-427,466-479
+src/components/viewers/raw-rendered-view.test.tsx
+  s_9bfe0bf28c8205::t_ed1bc7fd9ce397 1612-1664
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "47b8394f5fff54e3634174dad6ad7fbe675b771f",
+  "prompts": {},
+  "sessions": {
+    "s_9bfe0bf28c8205": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a6a8d43-9ddd-4b65-b1f4-97581e5db3f3",
+        "model": "claude-opus-5"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

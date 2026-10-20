@@ -1,0 +1,60 @@
+src-tauri/crates/keeper/keeper-rec.entitlements
+  s_849bfc6fed7fee::t_40885b81ff307e 1-11
+_bmad-output/implementation-artifacts/spec-16-1-keeper-rec-swiftpm-scaffold-codesign-and-externalbin-wiring.md
+  s_849bfc6fed7fee::t_8623ec8350aecd 69-79
+  s_849bfc6fed7fee::t_8793ecfe9a3008 148-177
+  s_849bfc6fed7fee::t_8cc9dd4c479ee4 88-105
+  s_849bfc6fed7fee::t_b8727e539437b7 6
+  s_849bfc6fed7fee::t_b99610e977ecf8 1-4,8-11,13-68,80-87,106-147
+  s_849bfc6fed7fee::t_18d6cd11309092 7
+  s_849bfc6fed7fee::t_05f3812d63d5d1 5
+  s_849bfc6fed7fee::t_e45f3ffa6c4219 12
+_bmad-output/implementation-artifacts/epic-16-context.md
+  s_849bfc6fed7fee::t_f9253e14e00c19 1-50
+scripts/smoke-keeper-rec.sh
+  s_849bfc6fed7fee::t_6df3016e052976 1-19,21,32-67
+  s_849bfc6fed7fee::t_71175d35195a44 20,22-27,31
+  s_849bfc6fed7fee::t_99b714f43c9c2a 28-30
+.gitignore
+  s_849bfc6fed7fee::t_2dbdc715919c70 44-46
+  s_849bfc6fed7fee::t_44209de7805235 40-43
+.github/workflows/release.yml
+  s_849bfc6fed7fee::t_43a64dfd8669ce 62-82,90-96
+  s_849bfc6fed7fee::t_01264339f16578 83-89
+  s_849bfc6fed7fee::t_ed76e8199e0419 142-148
+tools/keeper-rec/Package.swift
+  s_849bfc6fed7fee::t_8c6afc35913f85 1-16
+_bmad-output/implementation-artifacts/deferred-work.md
+  s_849bfc6fed7fee::t_2bf86676853a92 910-913
+  s_849bfc6fed7fee::t_c4741c187ed260 914
+scripts/build-keeper-rec.sh
+  s_849bfc6fed7fee::t_e43d869ea620a9 17-25
+  s_849bfc6fed7fee::t_c6cea7f1c41a28 1-16,26-50
+src-tauri/crates/keeper/tauri.conf.json
+  s_849bfc6fed7fee::t_a84b73dc5d45c4 48
+tools/keeper-rec/README.md
+  s_849bfc6fed7fee::t_3f73da085e9c93 1-24
+docs/release.md
+  s_849bfc6fed7fee::t_520af69623a998 89-115
+package.json
+  s_849bfc6fed7fee::t_12b73a62d5227f 11-13
+tools/keeper-rec/Sources/keeper-rec/main.swift
+  s_849bfc6fed7fee::t_6aabad6083b714 1-15,22,24-28,32,34-63
+  s_849bfc6fed7fee::t_73f0a5ca4f7730 16-21,23,29-31,33
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "b4eadf545dbbcf2772ddfe606aaaed8d312ef1a5",
+  "prompts": {},
+  "sessions": {
+    "s_849bfc6fed7fee": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "117d07e0-1e56-4a9f-a57d-07af4c0d1b5d",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": null
+    }
+  }
+}

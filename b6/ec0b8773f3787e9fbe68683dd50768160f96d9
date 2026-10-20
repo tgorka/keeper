@@ -1,0 +1,21 @@
+src/components/notes/editor/link-predicate.test.ts
+  s_9bfe0bf28c8205::t_d894b72d59bee9 1-44
+src/components/notes/editor/live-preview.ts
+  s_9bfe0bf28c8205::t_a454194ab4746c 242-296,436-446,764-774,1150-1152
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "b6ec0b8773f3787e9fbe68683dd50768160f96d9",
+  "prompts": {},
+  "sessions": {
+    "s_9bfe0bf28c8205": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3a6a8d43-9ddd-4b65-b1f4-97581e5db3f3",
+        "model": "claude-opus-5"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

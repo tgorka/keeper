@@ -1,0 +1,105 @@
+_bmad-output/implementation-artifacts/spec-19-4-microphone-hot-unplug-resilience.md
+  s_50a6bb9f3df3a5::t_c85de35240d18d 133-159
+  s_50a6bb9f3df3a5::t_a02180eb7d2afb 5
+  s_50a6bb9f3df3a5::t_01aa1f78fecbe5 6
+  s_50a6bb9f3df3a5::t_d8917569b470b4 9
+  s_50a6bb9f3df3a5::t_6d53997b40f8ec 1-4,7-8,10-69,82-93,105-122,125-132
+  s_50a6bb9f3df3a5::t_f78310ed144386 123-124
+  s_50a6bb9f3df3a5::t_4dd26d9f1f0e25 94-104
+  s_50a6bb9f3df3a5::t_eedf40c7ebb853 70-81
+src/components/recording/recording-audio-controls.tsx
+  s_50a6bb9f3df3a5::t_fa723d93d91e7c 98-105,117-120,122,125
+  s_50a6bb9f3df3a5::t_8d2fae7dbcb573 39
+  s_50a6bb9f3df3a5::t_95cc4b419b0d10 109-116,121,123-124
+  s_50a6bb9f3df3a5::t_ef628a8c446fe2 26
+src/lib/stores/recording-mic.ts
+  s_50a6bb9f3df3a5::t_3f4803552ea956 19
+  s_50a6bb9f3df3a5::t_a43ff169b6d5b8 70-87
+tools/keeper-rec/Sources/keeper-rec/main.swift
+  s_50a6bb9f3df3a5::t_d25aa2b9f9cdda 397-407
+src/lib/stores/recording-mic.test.ts
+  s_50a6bb9f3df3a5::t_704eea97c11e8d 66-93
+  s_50a6bb9f3df3a5::t_d6b3f4f08c8296 3,5
+_bmad-output/implementation-artifacts/sprint-status.yaml
+  s_50a6bb9f3df3a5::t_240be30d5d8c93 196
+src/components/recording/recording-audio-controls.test.tsx
+  s_50a6bb9f3df3a5::t_eef6656b42134d 209-262
+  s_50a6bb9f3df3a5::t_a3746202f22d0d 23-28
+  s_50a6bb9f3df3a5::t_9250b339a59d09 1
+tools/keeper-rec/Tests/keeper-recTests/MicHealthTests.swift
+  s_50a6bb9f3df3a5::t_4ccf573b23c7fb 1-92
+src-tauri/crates/keeper/src/ipc.rs
+  s_50a6bb9f3df3a5::t_1c8a23789ae02d 3543-3545
+  s_50a6bb9f3df3a5::t_bf3484ea5e748e 3574-3582
+  s_50a6bb9f3df3a5::t_ea66412a432e80 3627-3629
+src-tauri/crates/keeper-core/src/vm.rs
+  s_50a6bb9f3df3a5::t_523e471865d0c9 2781-2787
+  s_50a6bb9f3df3a5::t_0e87b068af1bf9 2821
+tools/keeper-rec/Sources/keeper-rec/Capture.swift
+  s_50a6bb9f3df3a5::t_8c29e846d71c5a 618-624
+  s_50a6bb9f3df3a5::t_39ee51f3ea86e4 1043-1045
+  s_50a6bb9f3df3a5::t_e50daa5e65026b 519-527,535-541
+  s_50a6bb9f3df3a5::t_63a342cdbf2aee 122-123,125-148
+  s_50a6bb9f3df3a5::t_5b7404ca19e577 560-568,570-617,625-748
+  s_50a6bb9f3df3a5::t_117d1db204b797 312-320
+  s_50a6bb9f3df3a5::t_b51e7c80651ba2 43-46
+  s_50a6bb9f3df3a5::t_7a89b9380bf5b7 528-534
+  s_50a6bb9f3df3a5::t_4db1b57c40d6c5 892-895,918
+  s_50a6bb9f3df3a5::t_9927c47da56fc9 149-154
+  s_50a6bb9f3df3a5::t_d4bf8c50963ad2 885-891,904-906,913-917
+src/components/layout/recording-pane.tsx
+  s_50a6bb9f3df3a5::t_ea55623dc66575 184
+tools/keeper-rec/Sources/keeper-rec/MicHealth.swift
+  s_50a6bb9f3df3a5::t_d37ee293c9e125 1-85
+src-tauri/crates/keeper/src/tray.rs
+  s_50a6bb9f3df3a5::t_d90d852b02bdd8 633-659
+  s_50a6bb9f3df3a5::t_41c60f1b5fc94b 469-472,480-492,494-506
+src/components/recording/active-recording-banner.test.tsx
+  s_50a6bb9f3df3a5::t_541a1f7a2012f2 42
+  s_50a6bb9f3df3a5::t_958a3c766b39b2 34,40-41
+  s_50a6bb9f3df3a5::t_84b390fcf60e1d 153-210
+src/lib/ipc/gen/RecordingStatusVm.ts
+  s_50a6bb9f3df3a5::t_460867f7a1176a 41-48
+  s_50a6bb9f3df3a5::t_f4c4af8b35f02c 40
+scripts/smoke-keeper-rec.sh
+  s_50a6bb9f3df3a5::t_b7ad5ccc179288 57-77
+_bmad-output/implementation-artifacts/deferred-work.md
+  s_50a6bb9f3df3a5::t_5b1aa906baba56 1048-1052
+src/hooks/use-recording-session.ts
+  s_50a6bb9f3df3a5::t_56b20100a37d13 38-39
+src/components/recording/active-recording-banner.tsx
+  s_50a6bb9f3df3a5::t_49704d58919dea 61-62
+  s_50a6bb9f3df3a5::t_2b3c2d3941ec54 78-82,86-89
+  s_50a6bb9f3df3a5::t_a42837c4794909 11-18
+  s_50a6bb9f3df3a5::t_fdb92e618d269f 119-132
+src/components/layout/recording-pane.test.tsx
+  s_50a6bb9f3df3a5::t_c85add3096b287 75
+  s_50a6bb9f3df3a5::t_9ecfccd58ab494 87
+src-tauri/crates/keeper-core/src/recording.rs
+  s_50a6bb9f3df3a5::t_8d54fd1d410f37 280
+  s_50a6bb9f3df3a5::t_0a96a17e18737e 170-176
+  s_50a6bb9f3df3a5::t_9380b04e3a8fb1 142-145,149-150,155
+  s_50a6bb9f3df3a5::t_4e40b86475a797 299-300
+  s_50a6bb9f3df3a5::t_3b06a771cb6b97 1544-1566,1570-1714
+  s_50a6bb9f3df3a5::t_18c52e7e7258a4 106-118
+  s_50a6bb9f3df3a5::t_cefdaf88b0b6a8 224-240
+  s_50a6bb9f3df3a5::t_19ae54db0b3b7f 351-371
+  s_50a6bb9f3df3a5::t_28866c18561b43 192-194
+  s_50a6bb9f3df3a5::t_a976222faf7ad2 1567-1569
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "ec9ec2edb804dad3833867389972567d40a72db2",
+  "prompts": {},
+  "sessions": {
+    "s_50a6bb9f3df3a5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "51442771-2bba-468c-b976-322fd69e3aae",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

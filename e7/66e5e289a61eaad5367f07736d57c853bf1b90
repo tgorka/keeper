@@ -1,0 +1,19 @@
+_bmad-output/implementation-artifacts/spec-19-5-destination-folder-chooser-and-fps-advanced-control.md
+  s_bb1423f8a6899e::t_058b98ba19be08 9
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "e766e5e289a61eaad5367f07736d57c853bf1b90",
+  "prompts": {},
+  "sessions": {
+    "s_bb1423f8a6899e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "511270bd-028f-4ad3-8006-4d90e50a8de0",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

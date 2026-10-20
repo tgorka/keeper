@@ -1,0 +1,25 @@
+_bmad-output/implementation-artifacts/deferred-work.md
+  s_c9be1eb5d072dd::t_a8ed0ffee0020a 3454-3468
+_bmad-output/implementation-artifacts/spec-no-sync-unit-stalls-in-silence.md
+  s_c9be1eb5d072dd::t_8dd6e6b4b7b811 1-79
+src-tauri/crates/keeper-sync/src/git/repo.rs
+  s_c9be1eb5d072dd::t_8daf5dd9e930a3 28,1113-1278,1287-1297,1301,1306-1309,1325-1328,1330-1332,1397-1407,1901-2019
+src-tauri/crates/keeper-sync/src/lfs/filter.rs
+  s_c9be1eb5d072dd::t_151d795d2ffc83 83-84,346-350,352,357-435
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "19b2094a1a9f93f7ac56049a633bf7f60af5b524",
+  "prompts": {},
+  "sessions": {
+    "s_c9be1eb5d072dd": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "s_c9be1eb5d072dd",
+        "model": "unknown"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

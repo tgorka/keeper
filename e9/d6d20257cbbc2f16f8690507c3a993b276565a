@@ -1,0 +1,131 @@
+src/components/layout/sidebar-pane.test.tsx
+  s_c4a7788117dca5::t_a736f0a97b6168 260-262
+  s_c891a5c2885086::t_85c6cd36857e9f 27,61,69,218-259
+src/components/layout/app-shell.tsx
+  s_c891a5c2885086::t_85c6cd36857e9f 2,17,53-56,94-95
+_bmad-output/implementation-artifacts/deferred-work.md
+  s_c4a7788117dca5::t_bda27e4265ad76 280-283
+  s_c891a5c2885086::t_176ab30b8f003f 284-290
+src/lib/stores/primary-view.ts
+  s_c891a5c2885086::t_85c6cd36857e9f 13-16,18
+src/components/search/search-overlay.tsx
+  s_c4a7788117dca5::t_941fec5386341a 272
+  s_c891a5c2885086::t_85c6cd36857e9f 32,232-238,255-271
+src-tauri/crates/keeper-core/src/vm.rs
+  s_c891a5c2885086::t_85c6cd36857e9f 238-268
+src/lib/stores/drafts.ts
+  s_c891a5c2885086::t_85c6cd36857e9f 141-165
+src/components/approval/approval-pane.tsx
+  s_c4a7788117dca5::t_708faf518c6a94 450,452,458
+  s_c4a7788117dca5::t_0d1d45f09dc86f 134-162,164-184,186-189
+  s_c4a7788117dca5::t_8d1d46b3eae8e9 1-33,35-86,91-92,100,105,110-111,114,123-124,132-133,163,185,190-231,246,248-250,252-269,275-315,328,333,337-338,341-343,351-374,377-382,385-389,400-409,411-426,428-431,433-449,451,453-455,457,459-469
+  s_c891a5c2885086::t_9fcaad45031240 410
+  s_c4a7788117dca5::t_5c5b5c96d29307 232-245
+  s_c4a7788117dca5::t_bea6e2c8a8a8c4 456
+  s_c4a7788117dca5::t_146836d607a391 87-90,93-99,101-104,106-109,112-113,115-122,125-129,131
+  s_c4a7788117dca5::t_ac3e1524e6b888 375-376,383-384,390-399
+  s_c4a7788117dca5::t_6b72b58e58fc87 316-319,335,344-350
+  s_c4a7788117dca5::t_afde672ac55010 247,274,427
+  s_c891a5c2885086::t_19fb06d5e1d65b 320-327,329-332,334,336,339-340
+  s_c4a7788117dca5::t_7b0ba8f063c947 34
+  s_c4a7788117dca5::t_5f8a51f2a9f4cc 270-273
+  s_c4a7788117dca5::t_cdf3ca3e92b395 130
+  s_c4a7788117dca5::t_9cc1d0b503b77c 432
+  s_c4a7788117dca5::t_17500e61a05018 251
+src-tauri/crates/keeper/src/ipc.rs
+  s_c891a5c2885086::t_85c6cd36857e9f 25-31,528-535,1247-1281,2903-2910
+  s_c4a7788117dca5::t_e0f8273b2a3325 2911-2912
+  s_c4a7788117dca5::t_759f3ebb55bda8 1282-1285
+src/hooks/use-approval-shortcut.test.ts
+  s_c4a7788117dca5::t_0c43c3de2d5514 1-70
+src/lib/format-time.ts
+  s_c891a5c2885086::t_85c6cd36857e9f 68-104
+src/lib/ipc/gen/ApprovalDraftVm.ts
+  s_c4a7788117dca5::t_7638e1fe4b1562 1-45
+_bmad-output/implementation-artifacts/sprint-status.yaml
+  s_c4a7788117dca5::t_ce49198cbfb61e 110
+src/components/approval/approval-pane.test.tsx
+  s_c891a5c2885086::t_a956ecae641d26 93-100
+  s_c891a5c2885086::t_6318d01d404376 381-386,394
+  s_c891a5c2885086::t_cbe5a2e9187160 375-380,387-393,395-408
+  s_c4a7788117dca5::t_3c2f8448f6b445 1
+  s_c4a7788117dca5::t_f7891150f5302b 413-416
+  s_c4a7788117dca5::t_eb1a14710bddcd 150-154
+  s_c4a7788117dca5::t_bd89057bd914b4 8-12
+  s_c4a7788117dca5::t_afde672ac55010 28-30
+  s_c4a7788117dca5::t_1dabeaab2760b0 254-257
+  s_c4a7788117dca5::t_3a92aed6cc8de2 310-374
+  s_c4a7788117dca5::t_99c00b9053c420 167-198
+  s_c4a7788117dca5::t_8aa3bfe0220579 122-143
+  s_c4a7788117dca5::t_7ba5f73efac5a0 2-7,13-27,31-92,101-121,144-149,155-166,199-243,248,268-309,409-412,417-423
+  s_c4a7788117dca5::t_a6095e0dc8e65c 244-247,249-253,258-267
+src-tauri/crates/keeper-core/src/registry.rs
+  s_c891a5c2885086::t_85c6cd36857e9f 266-270,275-277,282-300,954-961,964,969,974-976,983-987,994-1000,1008-1011,1013-1018
+  s_c891a5c2885086::t_c07615175738d2 962-963,965-968,970-973,977-982,988-993,1001-1002,1004-1007,1012
+  s_c891a5c2885086::t_fd5fc345d20cf6 271-274,278-281
+  s_c4a7788117dca5::t_44e7dc8a425ac1 1003,1019-1021
+src-tauri/crates/keeper-core/src/error.rs
+  s_c891a5c2885086::t_85c6cd36857e9f 169-175
+src-tauri/crates/keeper/src/lib.rs
+  s_c891a5c2885086::t_85c6cd36857e9f 81-82
+src/components/layout/sidebar-pane.tsx
+  s_c891a5c2885086::t_85c6cd36857e9f 1,12,24,56-58,82-88,92,107-119,129-133,152-158,161-163,183
+_bmad-output/implementation-artifacts/spec-7-3-approval-pane.md
+  s_c891a5c2885086::t_095e9b62ac8649 73-85
+  s_c4a7788117dca5::t_91dcbe9356f7a8 6
+  s_c4a7788117dca5::t_b3de006f319ee4 7
+  s_c891a5c2885086::t_a8d2b86fd4f245 57
+  s_c891a5c2885086::t_bb86e4930bc953 111-122
+  s_c4a7788117dca5::t_cba5bb025e00d2 1-4,10-56,58-72,86-92,154-158,160-172
+  s_c4a7788117dca5::t_efd79ee2cc038b 173-201
+  s_c891a5c2885086::t_2b9f326af3b1b6 5
+  s_c891a5c2885086::t_06ff2f17ef7fc2 202-217
+  s_c4a7788117dca5::t_2651b6a89bcf24 93-94,108-110,136-153
+  s_c891a5c2885086::t_8bf447a78fdcab 8
+  s_c891a5c2885086::t_1fc80ab0584478 9
+  s_c891a5c2885086::t_037ab328ed31b5 123-135
+  s_c891a5c2885086::t_0d54b9a3f14c27 159
+  s_c891a5c2885086::t_4b7c2a45fbf611 95-107
+src/hooks/use-approval-shortcut.ts
+  s_c4a7788117dca5::t_66a4f0e315c3af 1-37
+src/lib/format-time.test.ts
+  s_c891a5c2885086::t_85c6cd36857e9f 2,61-99
+  s_c4a7788117dca5::t_b1d2dce6cf0e35 100-101
+src/lib/ipc/client.ts
+  s_c4a7788117dca5::t_3991bd3f96ec27 547-548
+  s_c891a5c2885086::t_85c6cd36857e9f 13,82,525-546
+src-tauri/crates/keeper-core/src/account.rs
+  s_c4a7788117dca5::t_6e2934dd1dc383 4377-4378
+  s_c891a5c2885086::t_ae4d26acdf3f0e 2213-2218
+  s_c4a7788117dca5::t_5f2e46719e2d22 4817
+  s_c891a5c2885086::t_2ab449152bb571 2188-2190
+  s_c891a5c2885086::t_85c6cd36857e9f 73-75,2112-2172,2175,2191-2196,2198-2205,2220-2224,4361-4376,4657-4737,4745-4766,4773-4775,4781-4816
+  s_c891a5c2885086::t_ec8831bbd016aa 2173-2174,2176-2187,2197,2206-2212,2219
+  s_c891a5c2885086::t_7cb77152d7ed60 4738-4744,4767-4772,4776-4780
+src-tauri/crates/keeper-core/src/send.rs
+  s_c891a5c2885086::t_85c6cd36857e9f 27-30,35-36,40-50,70-74
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "e9d6d20257cbbc2f16f8690507c3a993b276565a",
+  "prompts": {},
+  "sessions": {
+    "s_c4a7788117dca5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d0bc22ce-2270-40ff-bbb8-48be13637a11",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": null
+    },
+    "s_c891a5c2885086": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9166be06-2c08-464e-b37d-03d90c68339d",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}

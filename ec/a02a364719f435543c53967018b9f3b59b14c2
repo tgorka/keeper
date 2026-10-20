@@ -1,0 +1,40 @@
+_bmad-output/implementation-artifacts/spec-5-3-offline-full-text-search-engine.md
+  s_6dce7dac03682f::t_0ff992ac2896d7 172-185
+  s_6dce7dac03682f::t_c5abdc44f290f2 117-129
+  s_6dce7dac03682f::t_6539f70e3bd45b 9
+src-tauri/crates/keeper-core/src/archive/db.rs
+  s_6dce7dac03682f::t_ed7c5286be3506 39-42
+src-tauri/crates/keeper-core/tests/archive_search_perf.rs
+  s_6dce7dac03682f::t_c1759e900f91a5 152-155,158,164
+src-tauri/crates/keeper-core/src/archive/fts.rs
+  s_6dce7dac03682f::t_95893528030e95 557-560
+  s_6dce7dac03682f::t_0094d28e191d6f 605-607,614-618,627-655
+  s_6dce7dac03682f::t_0177e5e8b29783 529-556,561-573
+  s_6dce7dac03682f::t_4d05f8c2d4305d 244-259
+_bmad-output/implementation-artifacts/sprint-status.yaml
+  s_26d7e4eb990070::t_a38aa3fa19117d 91
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "eca02a364719f435543c53967018b9f3b59b14c2",
+  "prompts": {},
+  "sessions": {
+    "s_26d7e4eb990070": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "adb29006-46fd-4e3b-a483-31b147e40eb5",
+        "model": "unknown"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    },
+    "s_6dce7dac03682f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0717f39f-fa55-459c-abd9-b9c101dab30b",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
