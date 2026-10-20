@@ -118,7 +118,9 @@ last wrote it. Times are UTC milliseconds since the epoch.
   `preferred_client` (the instance the person asked for), `parent_session` (a delegated child's
   parent), `invite` (a JSON array of actor ids), `archived`, `heard_until` (the claim holder's mark
   of where the person stopped hearing a spoken answer: a JSON object naming the message, the
-  character offset, the sentence and the reason), `created_at_ms`, `last_activity_ms`.
+  character offset, the sentence and the reason), `created_at_ms`, `last_activity_ms`, `trust`
+  (schema 2: absent or `trusted`, or `untrusted` once the session has read outside content — a web
+  search, a fetched page, an MCP server's answer — D-34; it never goes back).
 - **`session_members`** — `session_id`, `actor_id`, `role` (`owner` | `person` | `agent`),
   `reads_trace`, `added_by_actor`, `added_at_ms`, `read_until` (the `created_at_ms` of the newest
   message this member has read).
@@ -202,6 +204,9 @@ commit.
     the session (role `owner` or `person`); its session is a session of this database and never
     changes. The row can only name tools switched off, so no write can offer a tool the agent's
     definition or its container withholds.
+13. **V13 — trust.** `sessions.trust` is absent, `trusted` or `untrusted`, and only rises: a write
+    that lowers it is refused. It is raised only by the client holding the session's claim or by a
+    person who is a member of the session.
 
 An attachment's `size` is at most 26,214,400 bytes and its message is in the same session.
 

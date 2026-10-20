@@ -9,7 +9,10 @@
     "queryIr": "./syncular.queries.ir.json",
     "queries": "./syncular.queries.ts"
   },
-  "schemaVersions": [{ "version": 1, "through": "0001_initial" }],
+  "schemaVersions": [
+    { "version": 1, "through": "0001_initial" },
+    { "version": 2, "through": "0002_session_trust" }
+  ],
   "tables": [
     { "name": "actors", "scopes": ["dir:{dir}"] },
     { "name": "clients", "scopes": ["dir:{dir}"] },

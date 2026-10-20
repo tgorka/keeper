@@ -4,6 +4,10 @@
     {
       "name": "0001_initial",
       "sha256": "62ca56a80d227c1e53e7e564b049a9453b546a04c83f17de67034de6396750e5"
+    },
+    {
+      "name": "0002_session_trust",
+      "sha256": "c7b8cb3bdd61e7199aa178b0b639dbc412de77c51a044b3830c8b7bdaf2a6edc"
     }
   ],
   "head": {
@@ -738,6 +742,11 @@
             "name": "author_client",
             "type": "string",
             "nullable": false
+          },
+          {
+            "name": "trust",
+            "type": "string",
+            "nullable": true
           }
         ]
       },

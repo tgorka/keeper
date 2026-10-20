@@ -1,11 +1,17 @@
 {
   "irVersion": 1,
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "schemaVersions": [
     {
       "version": 1,
       "migrations": [
         "0001_initial"
+      ]
+    },
+    {
+      "version": 2,
+      "migrations": [
+        "0002_session_trust"
       ]
     }
   ],
@@ -321,6 +327,11 @@
           "name": "author_client",
           "type": "string",
           "nullable": false
+        },
+        {
+          "name": "trust",
+          "type": "string",
+          "nullable": true
         }
       ],
       "scopes": [
