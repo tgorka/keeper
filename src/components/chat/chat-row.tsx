@@ -32,6 +32,12 @@
  * notable tag (best-effort, no optimistic overlay). While the user has zero
  * favourites a one-time muted hint (UX-DR13) sits by the Favorite item explaining
  * the section; it disappears once any favourite exists.
+ *
+ * An agent row (story 102.7, R463) whose agent is the default agent — the one
+ * keeper opens at launch, as Rust reads `agents.default` — wears a "Default"
+ * marker before its name (before, so the name's truncation never cuts it),
+ * titled "Opens when keeper starts" and said in the row's name; its menu
+ * offers "Make default", or "Default" checked, which stops it being one.
  */
 
 import { AtSign, BellOff, Eye, Pencil } from "lucide-react";
@@ -41,6 +47,7 @@ import { RoomAvatar } from "@/components/chat/RoomAvatar";
 import { Badge } from "@/components/ui/badge";
 import {
   ContextMenu,
+  ContextMenuCheckboxItem,
   ContextMenuContent,
   ContextMenuItem,
   ContextMenuLabel,
@@ -59,6 +66,7 @@ import { useShellLayout } from "@/hooks/use-shell-layout";
 import { useSwipeActions } from "@/hooks/use-swipe-actions";
 import { accountHueVar } from "@/lib/account-hue";
 import { BRIDGE_HEALTH_LABEL, BRIDGE_HEALTH_LAMP } from "@/lib/bridges";
+import { saveDefaultAgent } from "@/lib/default-agent-actions";
 import { logFailure, sayFailure } from "@/lib/failure";
 import { formatRoomTimestamp } from "@/lib/format-time";
 import type { ChatNotifyMode, InboxRoomVm } from "@/lib/ipc/client";
@@ -74,10 +82,16 @@ import {
   unpinRoom,
 } from "@/lib/ipc/client";
 import { useBridgeHealth } from "@/lib/stores/bridge-health";
+import { useDefaultAgentStore } from "@/lib/stores/default-agent";
 import { useHasDraft } from "@/lib/stores/drafts";
 import { useFavoritesRoomsStore } from "@/lib/stores/favorites-rooms";
 import { effectiveIsUnread, type RoomSelection, useRoomsStore } from "@/lib/stores/rooms";
 import { cn } from "@/lib/utils";
+
+/** The default agent's marker on its rows, and what it means (R463). */
+export const DEFAULT_AGENT_MARKER = "Default";
+export const DEFAULT_AGENT_MARKER_TITLE = "Opens when keeper starts";
+export const MAKE_DEFAULT_ROW_LABEL = "Make default";
 
 /**
  * The settled width (px) of the trailing swipe's revealed action pair (Story
@@ -251,6 +265,13 @@ export const ChatRow = forwardRef<HTMLButtonElement, ChatRowProps>(function Chat
   // (story 101.6, R421) — Rust's word, said in the name as it is drawn.
   const attention = room.agentAttention ?? null;
   const attentionLabel = agentAttentionLabel(attention);
+  // The agent keeper opens at launch, as Rust reads it (R463): its rows say
+  // so, and every agent row may be made the default from its menu.
+  const agent = room.agent ?? null;
+  const defaultAgent = useDefaultAgentStore((s) => s.vm?.defaultAgent ?? null);
+  const savingDefault = useDefaultAgentStore((s) => s.saving);
+  const isDefault = agent !== null && agent === defaultAgent;
+  const defaultLabel = isDefault ? ", default agent, opens when keeper starts" : "";
 
   // ---- Phone touch idioms (Story 13.6) ------------------------------------
   // Long-press opens the identical ContextMenu above (the non-gesture duplicate
@@ -296,7 +317,7 @@ export const ChatRow = forwardRef<HTMLButtonElement, ChatRowProps>(function Chat
       type="button"
       tabIndex={tabIndex}
       onClick={onRowClick}
-      aria-label={`Conversation with ${room.displayName}${agentLabel}${attentionLabel}${unreadLabel}${healthLabel}`}
+      aria-label={`Conversation with ${room.displayName}${agentLabel}${defaultLabel}${attentionLabel}${unreadLabel}${healthLabel}`}
       aria-current={selected ? "true" : undefined}
       className={cn(
         "relative flex h-16 w-full shrink-0 items-center gap-3 py-0 pr-3 pl-4 text-left",
@@ -328,6 +349,17 @@ export const ChatRow = forwardRef<HTMLButtonElement, ChatRowProps>(function Chat
                 label={null}
                 data-testid="bridge-health-dot"
               />
+            )}
+            {/* Before the name, which truncates: the marker is never cut. */}
+            {isDefault && (
+              <span
+                aria-hidden="true"
+                data-testid="default-agent-marker"
+                title={DEFAULT_AGENT_MARKER_TITLE}
+                className="inline-flex shrink-0 items-center rounded-sm bg-secondary px-1 font-medium text-[0.6875rem] text-secondary-foreground leading-4"
+              >
+                {DEFAULT_AGENT_MARKER}
+              </span>
             )}
             <span className={cn("truncate text-sm", isUnread ? "font-semibold" : "font-medium")}>
               {room.displayName}
@@ -554,6 +586,21 @@ export const ChatRow = forwardRef<HTMLButtonElement, ChatRowProps>(function Chat
           <ContextMenuItem className={menuItemClass} onSelect={onFavorite}>
             Favorite
           </ContextMenuItem>
+        )}
+        {agent !== null && (
+          <>
+            <ContextMenuSeparator />
+            {/* Checked on the default agent's rows; choosing it there stops
+                the agent opening at launch (R463). */}
+            <ContextMenuCheckboxItem
+              className={menuItemClass}
+              checked={isDefault}
+              disabled={savingDefault}
+              onSelect={() => void saveDefaultAgent(isDefault ? null : agent)}
+            >
+              {isDefault ? DEFAULT_AGENT_MARKER : MAKE_DEFAULT_ROW_LABEL}
+            </ContextMenuCheckboxItem>
+          </>
         )}
         <ContextMenuSeparator />
         <ContextMenuSub>

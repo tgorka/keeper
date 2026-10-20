@@ -61,8 +61,6 @@ vi.mock("@/lib/ipc/client", () => ({
   paginateBackwards: vi.fn(async () => false),
   subscribeTyping: vi.fn(async () => 1),
   unsubscribeTyping: vi.fn(async () => {}),
-  subscribePaginationStatus: vi.fn(async () => 2),
-  unsubscribePaginationStatus: vi.fn(async () => {}),
   subscribeOutbox: vi.fn(async () => 3),
   unsubscribeOutbox: vi.fn(async () => {}),
   sendText: vi.fn(async () => {}),
@@ -505,6 +503,7 @@ describe("the assistant dock", () => {
       reason: null,
       announce: false,
       choices: [],
+      chooser: false,
       fileSet: null,
       ask: null,
       askable: [
@@ -540,6 +539,7 @@ describe("the assistant dock", () => {
       reason: null,
       announce: false,
       choices: [],
+      chooser: false,
       fileSet: null,
       ask: null,
       askable: [
@@ -577,6 +577,7 @@ describe("the assistant dock", () => {
       reason: null,
       announce: false,
       choices: [],
+      chooser: false,
       fileSet: null,
       ask: null,
       askable: askable.map((one) => ({

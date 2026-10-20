@@ -121,6 +121,7 @@ import {
 import { useCapabilitiesStore } from "@/lib/stores/capabilities";
 import { columnFoldStore } from "@/lib/stores/column-fold";
 import { primaryViewStore } from "@/lib/stores/primary-view";
+import { settingsUiStore } from "@/lib/stores/settings-ui";
 import { syncErrorMessage } from "@/lib/stores/sync";
 
 /** The pane's heading, and the accessible name of the surface itself. */
@@ -480,6 +481,7 @@ export function BotsPane() {
                   botsStore.getState().openConversation(null);
                   return;
                 }
+                settingsUiStore.getState().revealSection("bots");
                 primaryViewStore.getState().setView("settings");
               }}
             />

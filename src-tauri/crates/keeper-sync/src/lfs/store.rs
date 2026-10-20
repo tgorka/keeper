@@ -50,6 +50,76 @@ use crate::error::{Result, SyncError};
 /// third copy of the literal would be a third thing to keep in step.
 pub(crate) const HASH_CHUNK_BYTES: usize = 128 * 1024;
 
+/// What [`LfsStore::verify`] found under an object's name (Story 102.2,
+/// R514).
+#[derive(Debug)]
+pub enum Stored {
+    /// The object, length and sha256 both read back.
+    Verified,
+    /// Nothing by that name.
+    Absent,
+    /// A file whose length or sha256 is proven not the object's.
+    Mismatch,
+    /// A file whose bytes could not be read, so nothing is known of them.
+    Unreadable(SyncError),
+}
+
+impl PartialEq for Stored {
+    /// Equal by answer; two read failures are the same answer whatever
+    /// their causes.
+    fn eq(&self, other: &Self) -> bool {
+        std::mem::discriminant(self) == std::mem::discriminant(other)
+    }
+}
+
+/// How [`LfsStore::insert_durable`] and [`LfsStore::make_durable`] reach the
+/// disk (Story 102.2, R514, R517). A seam so a test can see that, and when,
+/// an object was made durable, and can make its publication fail;
+/// [`OsDurability`] is the only production answer.
+pub trait Durability: Send + Sync {
+    /// Make `file`'s contents, at `path`, durable.
+    fn sync_file(&self, file: &File, path: &Path) -> std::io::Result<()>;
+    /// Make `dir`'s entries durable: a rename into it, a directory made in it.
+    fn sync_dir(&self, dir: &Path) -> std::io::Result<()>;
+    /// Rename `staged` onto `target`, replacing whatever is there.
+    ///
+    /// `tempfile`'s `persist` renames over an existing target on every
+    /// platform (tempfile 3.27.0 passes `overwrite = true`; on Windows that
+    /// is `MOVEFILE_REPLACE_EXISTING`), so nothing needs removing first. On
+    /// failure the staged file comes back in the error.
+    fn publish(
+        &self,
+        staged: tempfile::NamedTempFile,
+        target: &Path,
+    ) -> std::result::Result<(), tempfile::PersistError> {
+        staged.persist(target).map(drop)
+    }
+}
+
+/// `fsync` of the file, and of each directory: `File::sync_all`, which on
+/// Apple is `fcntl(F_FULLFSYNC)` — a flush of the disk's own cache — and
+/// `fsync` elsewhere (Rust std `sys/fs/unix.rs` `File::fsync`).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct OsDurability;
+
+impl Durability for OsDurability {
+    fn sync_file(&self, file: &File, _path: &Path) -> std::io::Result<()> {
+        file.sync_all()
+    }
+
+    #[cfg(unix)]
+    fn sync_dir(&self, dir: &Path) -> std::io::Result<()> {
+        File::open(dir)?.sync_all()
+    }
+
+    /// Windows opens no directory as a file to sync it; NTFS journals the
+    /// rename itself.
+    #[cfg(not(unix))]
+    fn sync_dir(&self, _dir: &Path) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// A repository's local LFS object store.
 #[derive(Debug, Clone)]
 pub struct LfsStore {
@@ -681,12 +751,176 @@ impl LfsStore {
     /// only after both the digest and the byte count match. A failure therefore
     /// leaves nothing behind: the temp file is unlinked on drop, so a corrupt
     /// transfer can never be mistaken for a cached object later.
-    pub fn insert_verified(
+    pub fn insert_verified(&self, oid: &str, reader: impl Read, expected_size: u64) -> Result<()> {
+        let staged = self.stage_verified(oid, reader, expected_size)?;
+        self.publish(staged, oid, expected_size)
+    }
+
+    /// [`LfsStore::insert_verified`] that returns only once the object is on
+    /// disk: the staged file is synced before it is renamed into place, and
+    /// the directories the rename and the shard creation wrote to after it
+    /// (Story 102.2, R514).
+    ///
+    /// For bytes keeper is about to stop remembering where else to find —
+    /// a heal from history retires its repair intent next. A rename without
+    /// the syncs can be lost to a power cut while the journal's later
+    /// commit survives it, and the drive's store and the journal need not
+    /// share a filesystem.
+    ///
+    /// A wrong object already under the name is replaced by the rename, and
+    /// only by it: nothing is removed before the verified replacement
+    /// exists. A rename that fails removes nothing either (R517, review
+    /// R102S3-02): whatever is under the name stays — a file this process
+    /// could not read is not a file proven wrong — and the verified
+    /// replacement is kept at [`LfsStore::unpublished_path`] rather than
+    /// dropped, so a failed publication costs no copy of the bytes.
+    /// `durability` is the seam the rename and the syncs go through
+    /// ([`OsDurability`] outside tests).
+    pub fn insert_durable(
+        &self,
+        oid: &str,
+        reader: impl Read,
+        expected_size: u64,
+        durability: &dyn Durability,
+    ) -> Result<()> {
+        let staged = self.stage_verified(oid, reader, expected_size)?;
+        durability
+            .sync_file(staged.as_file(), staged.path())
+            .map_err(|err| SyncError::io("sync lfs temp file", staged.path(), err))?;
+        let target = self.object_path(oid);
+        self.ensure_object_parent(&target)?;
+        if let Err(err) = durability.publish(staged, &target) {
+            // Another publisher's rename may have landed the object anyway,
+            // and then the staged copy is one too many.
+            if self.verify(oid, expected_size) != Stored::Verified {
+                let kept = self.keep_unpublished(oid, err.file);
+                tracing::warn!(
+                    oid,
+                    target = %target.display(),
+                    kept = ?kept,
+                    error = %err.error,
+                    "lfs: could not publish a verified object; the file under its name is \
+                     left as it was and the verified copy is kept"
+                );
+                return Err(SyncError::io("publish lfs object", &target, err.error));
+            }
+        }
+        self.make_durable(oid, durability)?;
+        self.discard_unpublished(oid);
+        Ok(())
+    }
+
+    /// Where [`LfsStore::insert_durable`] keeps a verified object it could
+    /// not rename into place: `<git-dir>/lfs/unpublished/<oid>`, beside
+    /// `objects/` on the same filesystem, and outside the `tmp/` that
+    /// [`LfsStore::sweep_scratch`] empties by age.
+    pub fn unpublished_path(&self, oid: &str) -> PathBuf {
+        self.root.join("unpublished").join(oid)
+    }
+
+    /// Keep `staged` at [`LfsStore::unpublished_path`], or failing that
+    /// under its own name in `tmp/`; the path it is kept at, if any.
+    fn keep_unpublished(&self, oid: &str, staged: tempfile::NamedTempFile) -> Option<PathBuf> {
+        let kept = self.unpublished_path(oid);
+        if let Some(dir) = kept.parent() {
+            // A failure here surfaces as the rename's own, just below.
+            let _ = std::fs::create_dir_all(dir);
+        }
+        match staged.persist(&kept) {
+            Ok(_) => Some(kept),
+            Err(err) => err.file.keep().ok().map(|(_, path)| path),
+        }
+    }
+
+    /// Drop a copy [`LfsStore::keep_unpublished`] kept, once the object it
+    /// copies is published and durable. Housekeeping: never fails the caller.
+    fn discard_unpublished(&self, oid: &str) {
+        let kept = self.unpublished_path(oid);
+        match std::fs::remove_file(&kept) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => tracing::warn!(
+                oid,
+                path = %kept.display(),
+                error = %err,
+                "lfs: could not remove a copy kept from a failed publication"
+            ),
+        }
+    }
+
+    /// Sync an object already in the store, and the directories that name
+    /// it, to disk (Story 102.2, R514): an object a previous process
+    /// published without the syncs is made durable before anything relies
+    /// on it surviving a power cut.
+    pub fn make_durable(&self, oid: &str, durability: &dyn Durability) -> Result<()> {
+        let target = self.object_path(oid);
+        let file =
+            File::open(&target).map_err(|err| SyncError::io("open lfs object", &target, err))?;
+        durability
+            .sync_file(&file, &target)
+            .map_err(|err| SyncError::io("sync lfs object", &target, err))?;
+        // The shard directories, innermost first: the rename wrote the
+        // object's entry, and `create_dir_all` may have written each shard's.
+        let objects = self.root.join("objects");
+        let mut dir = target.parent();
+        while let Some(current) = dir {
+            durability
+                .sync_dir(current)
+                .map_err(|err| SyncError::io("sync lfs object directory", current, err))?;
+            if current == objects {
+                break;
+            }
+            dir = current.parent();
+        }
+        Ok(())
+    }
+
+    /// What the store holds under `oid`, read back (Story 102.2, R514):
+    /// [`LfsStore::contains`] checks the length alone, and answers `false`
+    /// for a file it could not even look at.
+    ///
+    /// The three answers that are not [`Stored::Verified`] are kept apart
+    /// because only two of them say anything about the bytes. A file that
+    /// cannot be read is not a file proven wrong, and a caller that removed
+    /// it on that answer would destroy the only copy of bytes it never saw.
+    pub fn verify(&self, oid: &str, expected_size: u64) -> Stored {
+        let path = self.object_path(oid);
+        let unreadable = |what: &'static str, err: std::io::Error| {
+            Stored::Unreadable(SyncError::io(what, &path, err))
+        };
+        let meta = match std::fs::metadata(&path) {
+            Ok(meta) => meta,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Stored::Absent,
+            Err(err) => return unreadable("look at lfs object", err),
+        };
+        if !meta.is_file() {
+            return unreadable(
+                "read lfs object",
+                std::io::Error::other("it is not a regular file"),
+            );
+        }
+        if meta.len() != expected_size {
+            return Stored::Mismatch;
+        }
+        let file = match File::open(&path) {
+            Ok(file) => file,
+            Err(err) => return unreadable("open lfs object", err),
+        };
+        match LfsStore::digest_of(file) {
+            Ok((digest, length)) if digest == oid && length == expected_size => Stored::Verified,
+            Ok(_) => Stored::Mismatch,
+            Err(err) => Stored::Unreadable(err),
+        }
+    }
+
+    /// Write `reader` into `tmp/`, hashing in the same pass, and hand the
+    /// staged file back only when its digest and length are `oid`'s.
+    fn stage_verified(
         &self,
         oid: &str,
         mut reader: impl Read,
         expected_size: u64,
-    ) -> Result<()> {
+    ) -> Result<tempfile::NamedTempFile> {
         self.ensure_layout()?;
 
         let tmp_dir = self.tmp_dir();
@@ -722,8 +956,7 @@ impl LfsStore {
                 actual: format!("{actual}/{written}B"),
             });
         }
-
-        self.publish(staged, oid, expected_size)
+        Ok(staged)
     }
 
     /// Publish an already-verified `.part` file into the object store.
@@ -1447,5 +1680,108 @@ mod tests {
                 "a file keeper did not name is not keeper's"
             );
         }
+    }
+
+    /// A publication whose rename always fails, as a full or failing disk
+    /// makes it (R517, review R102S3-02).
+    struct RefusedRename;
+
+    impl Durability for RefusedRename {
+        fn sync_file(&self, file: &File, _path: &Path) -> std::io::Result<()> {
+            file.sync_all()
+        }
+        fn sync_dir(&self, dir: &Path) -> std::io::Result<()> {
+            OsDurability.sync_dir(dir)
+        }
+        fn publish(
+            &self,
+            staged: tempfile::NamedTempFile,
+            _target: &Path,
+        ) -> std::result::Result<(), tempfile::PersistError> {
+            Err(tempfile::PersistError {
+                error: std::io::Error::other("injected rename failure"),
+                file: staged,
+            })
+        }
+    }
+
+    /// The valid object a process cannot read, and then cannot replace: the
+    /// read failure is no proof of bad bytes, so nothing is removed, and
+    /// the verified replacement is kept rather than dropped with the error.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_publication_over_an_unreadable_object_removes_nothing() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let (_dir, store) = store();
+        let content = b"the only copy the owner has";
+        let oid = oid_of(content);
+        let size = content.len() as u64;
+        store
+            .insert_verified(&oid, &content[..], size)
+            .expect("stored");
+        let object = store.object_path(&oid);
+        let inode = std::fs::metadata(&object).expect("stat").ino();
+        std::fs::set_permissions(&object, std::fs::Permissions::from_mode(0o000))
+            .expect("unreadable");
+        if File::open(&object).is_ok() {
+            // Root reads anything: there is no unreadable file here.
+            return;
+        }
+        assert!(matches!(store.verify(&oid, size), Stored::Unreadable(_)));
+
+        let err = store
+            .insert_durable(&oid, &content[..], size, &RefusedRename)
+            .expect_err("a rename that fails is a failure");
+        assert!(err.to_string().contains("injected"), "{err}");
+        let kept = std::fs::metadata(&object).expect("the object is still there");
+        assert_eq!(kept.ino(), inode, "the same file is kept");
+        std::fs::set_permissions(&object, std::fs::Permissions::from_mode(0o600))
+            .expect("readable again");
+        assert_eq!(std::fs::read(&object).expect("read"), content, "its bytes");
+        assert_eq!(
+            std::fs::read(store.unpublished_path(&oid)).expect("the replacement is kept"),
+            content
+        );
+    }
+
+    /// The same with a file proven wrong under the name: it is replaced by a
+    /// rename or not at all, and a later publication that succeeds replaces
+    /// it and lets the kept copy go.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_publication_over_a_wrong_object_keeps_both_until_one_succeeds() {
+        use std::os::unix::fs::MetadataExt as _;
+        let (_dir, store) = store();
+        let content = b"the bytes history holds";
+        let oid = oid_of(content);
+        let size = content.len() as u64;
+        let object = store.object_path(&oid);
+        store.ensure_object_parent(&object).expect("shard");
+        let wrong = b"not the bytes history holds";
+        std::fs::write(&object, wrong).expect("a wrong object");
+        let inode = std::fs::metadata(&object).expect("stat").ino();
+
+        store
+            .insert_durable(&oid, &content[..], size, &RefusedRename)
+            .expect_err("a rename that fails is a failure");
+        assert_eq!(std::fs::metadata(&object).expect("stat").ino(), inode);
+        assert_eq!(
+            std::fs::read(&object).expect("read"),
+            wrong,
+            "left as it was"
+        );
+        assert_eq!(
+            std::fs::read(store.unpublished_path(&oid)).expect("the replacement is kept"),
+            content
+        );
+
+        store
+            .insert_durable(&oid, &content[..], size, &OsDurability)
+            .expect("published");
+        assert_eq!(store.verify(&oid, size), Stored::Verified);
+        assert!(
+            !store.unpublished_path(&oid).exists(),
+            "the kept copy goes once the object is published"
+        );
     }
 }

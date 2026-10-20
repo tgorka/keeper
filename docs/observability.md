@@ -1,12 +1,14 @@
 # Observability — what keeper records, where, and what never leaves
 
 One page for every question of the form "where did that error go?" (Epic 100,
-ruling R381). The rule it describes:
+ruling R381, amended by epic 102's R461/R462). The rule it describes:
 
 > **An error reaches a person and the log, never only one of them.** Every
 > failure a person can feel ends in a sentence where they are looking **and** a
-> line in `keeper.log` at `WARN` or above. Telemetry is a separate, opt-in,
-> category-only count; agents never reach it, and neither does a panic.
+> line in `keeper.log` at `WARN` or above. With diagnostics consent — one
+> switch for the whole account — every such line, panics included, also
+> reaches PostHog with its message redacted; an agent's line leaves without
+> its message.
 
 Destinations and consent are in [egress.md](egress.md#the-observability-consent-boundary);
 this page is the inside view.
@@ -17,7 +19,7 @@ this page is the inside view.
 | --- | --- | --- |
 | **The screen** | The sentence: an inline alert beside the control, the surface's status line, or a toast | The person, now |
 | **`keeper.log`** | `WARN` and `ERROR` lines always; `INFO` only with debug mode on | The person, later; with an organisation account, also everyone with access to its config repository, which receives the newest 512 KB once a day and on *Send log now* (below) |
-| **PostHog** (opt-in) | Closed categories and durations only — never a message, path, id or token | The maintainers, counted |
+| **PostHog** (opt-in, per account) | Every `WARN`/`ERROR` line and every webview error as a `$exception`: level, target, file:line, fingerprint and the **redacted** message (an agent line: no message); plus closed categories and durations | The maintainers, as issues grouped by fingerprint |
 
 A failure that reaches only the log (nobody was told) or only the screen (no
 trace to read back) is a defect, and the guards below fail on the common shapes.
@@ -116,13 +118,15 @@ device's log* has the repository side.
 so the default stderr report still happens). Every panic on any thread becomes
 one `ERROR` line under `keeper::panic` with its `location`
 (`file:line:column`), `thread` name and `reason` (the panic message, at most
-500 characters). That line is all a panic becomes (R387): it is never counted
-in telemetry, because a process whose runtime workers poll agent and non-agent
-work alike has no boundary that could tell an agent's panic apart, and agents
-stay out of telemetry fail-closed. The hook does nothing that could itself
-panic beyond formatting the line — no lock it waits on, no random number, no
-queue. Its proof runs in a re-executed copy of the test binary, because a panic
-hook is process-global (`logfile::tests::a_panic_on_another_thread_…`).
+500 characters; a longer one loses the token the cut went through, so the
+redactor never sees a fragment of a secret too short to recognise — R511).
+Under diagnostics consent that line leaves for PostHog like
+every other `ERROR` (R461, replacing R387's "never counted"): redacted, with
+the `keeper::panic` target. The hook does nothing that could itself panic
+beyond formatting the line — no lock it waits on, no random number, no queue;
+the export layer behind it only `try_lock`s. Its proof runs in a re-executed
+copy of the test binary, because a panic hook is process-global
+(`logfile::tests::a_panic_on_another_thread_…`).
 
 The hook is installed by `setup()`. A process launched in the background that
 never runs `setup()` (an iOS push wake, DW-1263) has no hook and no log file;
@@ -139,7 +143,10 @@ carries the sentence — but it must say it and log it:
 - `logFailure(source)`: for a failure nobody can feel — a cleanup whose surface
   is gone, a refresh whose last answer stands. The log line only.
 - `reportFrontendError` (`src/lib/crash-report.ts`) sends a line to the
-  `frontend_error_report` command, which writes it at `ERROR`. The line is
+  `frontend_error_report` command, which writes it at `ERROR` under the target
+  `keeper::frontend` and, under diagnostics consent, sends it to PostHog as
+  `keeper_frontend_error` with a `$exception` whose type is the `source` and
+  whose value is the message, redacted (102.1 #3). The line is
   `describeFailure`'s (`src/lib/failure-envelope.ts`): a JavaScript `Error` as
   its name and message; keeper's `IpcError` envelope — what every command
   rejects with, an object, not an `Error` — as `IpcError <code>` (and
@@ -147,8 +154,13 @@ carries the sentence — but it must say it and log it:
   own fixed sentence, never a homeserver's or identity provider's words; all
   bounded and stripped of control characters. The same `source` with the same
   classification (an envelope's code) is written once, and at most 100 lines per
-  page load. Uncaught exceptions, unhandled rejections and the React crash
-  boundary go the same way.
+  page load. Uncaught exceptions, unhandled rejections, the React crash
+  boundary and `onUncaughtError` go the same way.
+- `console.error` and `console.warn` are hooked (`hookConsole`, installed with
+  the global listeners): after the console prints, each distinct line is sent
+  once per load (50 at most) under `source` `console.error` / `console.warn`,
+  the latter written at `WARN`. A line the funnel writes about its own refusal
+  goes to the unhooked console, so it cannot loop.
 - **Guard:** `src/test/no-silent-catch.test.ts` reads every `src/` file outside
   `components/ui/` as a TypeScript syntax tree and fails on a promise
   `.catch(() => {})` (or one yielding only `undefined`/`null`) and on a `try`
@@ -196,16 +208,139 @@ status.
 
 ## Telemetry (PostHog), opt-in
 
-Off on every install until the person turns a category on in Settings ›
-Diagnostics & studies; synchronized settings cannot turn it on. What can leave, by category, is
-the table in [egress.md](egress.md#the-observability-consent-boundary). In
-short, with **diagnostics** consent: app-ready and interaction durations, a
-frontend-error category and their content-free OTLP records; with **product statistics**: opening the command
+Off until the person turns a category on in Settings › Diagnostics & studies.
+**Diagnostics** and **product statistics** are the account's settings
+(`telemetry.diagnostics`, `telemetry.product_analytics`; R462): settings sync
+carries them in `<login>/settings.toml`, so on (or off) on one device is on (or
+off) on every device of the account. What is in force is the **effective**
+answer — a settings file (`~/.keeper/keeper.toml`, the account's own
+`keeper.toml`) pinning a key wins over the row — re-read at boot, after every
+synced apply of either key, and after every account-layer install or clear
+(a pull that changed the account's files, sign-out, forget, a refused
+sign-in; `config::set_account_layers_observer`) (R496). A change discards
+what was queued and cancels what is in flight. A local save takes the answer
+read back after its write; a pinned key keeps the file's value and Settings
+says the save was overruled (`TelemetryStatusVm.consentPinned`). Every
+transition reads and installs under one lock (`Telemetry::settling`), never
+held across a write, so the last install answers the last write: a
+revocation that finishes is in force, whichever save began first (R511). An
+installation that had switched a category on before epic 102
+(`telemetry-consent-v1.json`) keeps that "on" pending — never in force by
+itself — until a settings sync establishes the key (`Telemetry::account_settled`
+with `AccountConsentKnown`): adopted where the reconciled file has no value
+and nothing about the key failed (or there is no account at all), dropped
+where the account has a value, and kept pending where the key's apply failed
+or was overtaken (R495 07, R511). Adoption writes its row only if none is
+there, in one statement (`registry::insert_setting_if_absent`, R515), so a
+choice saved after adoption decided — an "off" included — is never
+overwritten, and the settings sync hears of the adopted row only once it is
+written. Remote
+configuration and the random installation id stay per installation.
+Fail-closed: anything but `"1"` is off. What can leave, by category, is the
+table in [egress.md](egress.md#the-observability-consent-boundary).
+
+### Problems: every warning and error (R461)
+
+The shell's one subscriber (`debug_log::init`, built by
+`keeper_core::telemetry::log_subscriber`) carries
+`keeper_core::telemetry::LogExport` beside the `keeper.log` writer, each under
+its own filter: `keeper.log` keeps its `EnvFilter` (and `RUST_LOG`), while the
+export layer forwards every `WARN` and `ERROR` on every target whatever those
+say (`export_filter`; R495 08) — `keeper::panic` and the gitoxide targets
+`keeper.log` holds down included. Each becomes one `$exception` event:
+
+| Property | What it holds |
+| --- | --- |
+| `$exception_list[0].type` | The target (`keeper::sync`, `matrix_sdk::…`) |
+| `$exception_list[0].value` | The message and its fields as `keeper.log` prints them, each part redacted from its raw value, then capped |
+| `$exception_fingerprint` | FNV-1a of target + file + line: one callsite is one issue on every build and device |
+| `$exception_level` | `warning` or `error` (`log_level`: `WARN` / `ERROR`) |
+| `log_target`, `log_file`, `log_line` | The callsite; a workspace file as compiled, a dependency's file from its crate directory, never the builder's home |
+| `os`, `app_version` | Which platform and release |
+
+**The redactor** (`keeper_core::telemetry::redact`, R461 as fixed by R495)
+fails closed: where it cannot tell where a secret ends, everything after its
+start goes. It runs on each field's RAW value before anything quotes or
+escapes it (`redact_field`), on the message, and only then is the line joined
+and cut at 1,000 characters. Text cut before it gets here — a webview report
+past 8,000 characters, a panic message past 500 — loses the token the cut
+went through. It
+replaces: `syt_`/`phc_`/`phx_`/`phs_` tokens and the word after `Bearer`
+(`<token>`); a credential assignment — a name ending in `password`, `passwd`,
+`passphrase`, `secret`, `token`, `key`, `authorization`, `cookie` or
+`credential(s)`, then `=` or `:`, in any quoting or escaping — from the
+assignment to the end of the text, and a field so named or holding one whole
+(`<redacted>`); a URL's user information and its path, query and fragment
+(scheme and host stay); email addresses; Matrix user, room, alias and event
+ids with a server, and room and event ids without one (`$…`, `!…`;
+`<matrix-id>`); home paths — `~/`, `/Users/…`, `/home/…`, `/root/…`, the
+iPhone and Android containers, `C:\Users\…` with any escaping, `C:/Users/…`,
+with `Users` in any letter case (`/users/…` is `/Users/…` on a case-insensitive
+Mac volume), and the same roots inside a `file://` URL (`file:///Users/…`,
+`file:///C:/Users/…`; R518) — **and everything after them**: from the home
+root to the end of its field value, or of the message, in every quoting. Text
+after a home path is not sent — a closing quote, the rest of the sentence, a
+second path, a quoted value that follows. A filename may hold quotes, spaces
+and backslashes, so no character after the root says for certain where the
+path ends (R515) (`<path>`); runs of 16+ hex digits (`<hex>`); every run of
+24+ base64 characters, words and identifiers included (`<base64>`). What
+survives: the sentence around them, numbers, short ids, and — DW-1512, the
+owner's open question — relative paths (a drive's `40-media/…`), note file
+names and device names. It is a lexical redactor, not a content classifier.
+
+**Agent lines** (targets `keeper_agent…` and `keeper_core::agents…`) leave with
+level, target, file:line and fingerprint and the fixed value "An agent-host
+line; its message stays on this device." — their fields are never even
+formatted, and `Telemetry::capture_log` withholds an agent target's message
+whatever it is handed (S-19's intent kept for content;
+`agent_target_lines_leave_without_their_message`).
+
+**Webview errors** cross to Rust uncut up to 8,000 characters
+(`FAILURE_TRANSPORT_MAX` / `FRONTEND_INPUT_CAP`); a longer one is cut, and the
+cut drops the token it went through, so no fragment of a secret is left too
+short to recognise (`redact::bound`). Rust redacts, then caps. `keeper.log`'s
+own line keeps its shorter caps.
+
+**Limits.** At most 10 per fingerprint per minute and 500 per run of keeper;
+the queue holds 128. A log call never waits: consent is an atomic read and the
+queue a `try_lock`; a refused problem is counted, and the count leaves at most
+once a minute as one `keeper_problems_dropped` event (`dropped`). Records older
+than a minute are not sent; there is no disk spool and no retry. A noisy target
+is bounded by its fingerprint's budget, not excluded.
+
+**What is never forwarded** (R498, R511): what the exporter itself produces —
+this module's lines (`keeper_core::telemetry`), and whatever its HTTP stack
+logs on the exporter's own threads: every export and remote-config request
+runs on a one-worker runtime (`layer::Transport`) whose threads are marked,
+so a task the HTTP client spawns there (an HTTP/2 connection's dispatcher)
+or a blocking lookup it starts is the exporter's too, and an export failure
+cannot export itself; `rmcp`, which may carry an MCP server's words whole, at
+any level; and `keeper::frontend`, whose report leaves as its own record. The
+same HTTP crates' lines from any other runtime (a sync's connection error)
+are problems like any other. Lines from before the layer is attached at boot
+(the first lines of `setup`) are not forwarded.
+
+**Where it runs.** The Mac, the iPhone and Android — every build that embeds
+the public PostHog pair: release CI, `install-macos.sh`, and since 102.1
+`install-ios.sh` and `install-android.sh` (`scripts/lib/posthog-client.sh`;
+the phone builds also stamp `crates/keeper/posthog-client.env`, which
+`build.rs` reads when the environment is silent; `install-ios.sh` removes the
+local copy once the rsync has carried it and the Mac's copy once the Rust build
+has read it, by a trap that covers success, failure and interruption, R499).
+keeper-agentd and
+keeper-nse install no such layer and link no exporter crate
+(`check:agentd-lean`, `check:nse-lean`); electra's agent host logs to
+journald only.
+
+### Closed events
+
+With **diagnostics** consent: app-ready and interaction durations and their
+content-free OTLP records; with **product statistics**: opening the command
 palette or Settings. `keeper_interaction` may carry one closed `surface`:
 `slash_menu_opened`, `slash_menu_chosen`, `launch_default_agent` (Epic 100;
 the front's `captureSurface(surface)` in `src/hooks/use-telemetry.ts`).
 
-One event comes from the shell rather than the webview:
+One closed event comes from the shell rather than the webview:
 `keeper_recording_mic_lost`, under **diagnostics** consent, with one closed
 `cause` — `removed` (`micLost`), `stalled` (`micStalled`) or `silent`
 (`micSilent`) — and `event_source` `shell`. The recording sink raises it when
@@ -216,17 +351,26 @@ name or the warning's text (`keeper_core::telemetry::MicLossCause`,
 `Telemetry::capture_mic_lost`). It is not part of the webview's
 `telemetry_capture` contract.
 
-**Never sent:** messages, error text, panics in any form, stack traces, file names, paths,
-notes, recordings, bot prompts or answers, account or Matrix identifiers, URLs,
-tokens, and nothing from an agent. The telemetry module installs no `tracing`
-subscriber, so no log line can reach it.
+**Never sent on purpose:** unredacted text, stack traces, chat messages,
+notes, recordings, bot prompts or answers, an agent line's message or fields,
+and nothing at all without diagnostics consent. A warning's own words can
+still name a file, folder or device (DW-1512): the redactor is lexical.
+
+### Reading it
+
+Project 605256 (`https://us.posthog.com`). Problems are Error tracking issues;
+by HogQL: `SELECT timestamp, properties.log_target,
+properties.$exception_list[1].value FROM events WHERE event = '$exception'
+ORDER BY timestamp DESC LIMIT 50` with the maintainer's personal key
+(`op://tg/keeper-posthog-personal-api-key/credential`, never printed).
 
 ## Agents
 
-Agents (`keeper-agent`, `keeper-agentd`, `keeper_core::agents`) never reach
-PostHog — not their spans, not their errors, not their panics
-(S-19, NFR-121; `telemetry/tests.rs` `agent_host_records_are_never_exported`;
-`bun run check:agentd-lean` forbids the exporter crates in the daemon). An
-agent-host failure on the desktop is a `WARN`/`ERROR` line in `keeper.log` and
-the agent room's own status line; the daemon on a server writes its own log
-beside its sessions ([agents.md](agents.md)).
+Agents (`keeper-agent`, `keeper-agentd`, `keeper_core::agents`) send PostHog
+no content: a desktop or phone agent line leaves with its level, target,
+file:line and fingerprint only (R461; `telemetry/tests.rs`
+`agent_target_lines_leave_without_their_message`), and the daemon on a server
+links no exporter at all (`bun run check:agentd-lean`). An agent-host failure
+on the desktop is a `WARN`/`ERROR` line in `keeper.log` and the agent room's
+own status line; the daemon on a server writes its own log beside its
+sessions ([agents.md](agents.md)).

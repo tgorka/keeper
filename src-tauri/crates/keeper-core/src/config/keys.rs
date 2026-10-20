@@ -50,6 +50,8 @@
 
 use std::fmt;
 
+use crate::org_account::settings_sync::{self, SyncedFile};
+
 /// Who a key's value belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scope {
@@ -1010,6 +1012,27 @@ pub const KEYS: &[KeySpec] = &[
         summary: "Whether keeper keeps a menu-bar (tray) presence.",
         example: "true",
     },
+    // ---- telemetry -------------------------------------------------------
+    KeySpec {
+        key: "telemetry.diagnostics",
+        family: false,
+        scope: Scope::UserGlobal,
+        settable: Settable::AnyLayer,
+        shape: Shape::Flag01,
+        default: "0",
+        summary: "Optional diagnostics to PostHog (R461/R462): every warning and error keeper logs, its message redacted, plus content-free timings. Travels with the account, so it is on or off on every device. Absent or unreadable is off.",
+        example: "true",
+    },
+    KeySpec {
+        key: "telemetry.product_analytics",
+        family: false,
+        scope: Scope::UserGlobal,
+        settable: Settable::AnyLayer,
+        shape: Shape::Flag01,
+        default: "0",
+        summary: "Optional product statistics to PostHog (R462): counts of opening Settings and the command palette. Travels with the account like diagnostics. Absent or unreadable is off.",
+        example: "true",
+    },
     // ---- transcription ---------------------------------------------------
     KeySpec {
         key: "transcription.after_recording",
@@ -1072,6 +1095,19 @@ pub const KEYS: &[KeySpec] = &[
         example: "\"silero-vad\"",
     },
     // ---- ui --------------------------------------------------------------
+    KeySpec {
+        key: "ui.default_agent_chooser_dismissed",
+        family: false,
+        scope: Scope::SessionState,
+        settable: Settable::Never(
+            "it is the keeper version in which somebody put the launch's chooser away, and \
+             pre-setting it in a file would hide the question from a person who was never asked",
+        ),
+        shape: Shape::Text,
+        default: "",
+        summary: "The keeper version in which the person put away the launch's \"Choose the agent keeper opens when it starts\"; it is asked again after an update (R463).",
+        example: "",
+    },
     KeySpec {
         key: "ui.first_run_setup_skipped",
         family: false,
@@ -1265,6 +1301,30 @@ pub fn render_docs() -> String {
         }
     }
 
+    out.push_str(TRAVEL_HEADER);
+    for (file, heading) in [
+        (
+            Some(SyncedFile::Shared),
+            "**Every device** — `<login>/settings.toml`. A change on one device is the \
+             answer on all of them:",
+        ),
+        (
+            Some(SyncedFile::Device),
+            "**This device's own file** — `<login>/settings.<device>.toml`. It comes back \
+             when this device is set up again, except that a wake switch left on comes back \
+             off: only a person's tap opens the microphone. Every other device keeps its own:",
+        ),
+        (None, "**Never leaves this device**:"),
+    ] {
+        let travelling: Vec<String> = KEYS
+            .iter()
+            .filter(|spec| settings_sync::synced_file_of(spec) == file)
+            .map(|spec| format!("`{}`", spec.display_key()))
+            .collect();
+        out.push_str(&format!("- {heading} {}.\n", travelling.join(", ")));
+    }
+    out.push_str(TRAVEL_FOOTER);
+
     out.push_str(FOOTER);
     out
 }
@@ -1341,6 +1401,32 @@ the folder it describes.
 A key set by a file keeps winning. It is not imported into the table once at
 boot and then lost to the next toggle — the settings pane shows the control as
 file-controlled instead, and says which file.
+"#;
+
+/// The prose that opens the generated travel lists (Story 102.8).
+const TRAVEL_HEADER: &str = r#"
+## Where each key travels
+
+With an organisation account signed in, keeper keeps these keys in the
+account's config repository and merges each file into every device's table key
+by key (`keeper_core::org_account::settings_sync`). With no account, every key
+stays in this device's table. Settings says, under each category, what of it
+applies only to this device but is backed up in your account, what is kept only
+on this device, and why.
+
+"#;
+
+/// What a person can change that is not a key, so the lists above cannot say.
+const TRAVEL_FOOTER: &str = r#"
+Not keys, so not listed: launch at login (a login item the operating system
+keeps for this machine), the operating system's notification permission, an
+endpoint's or a drive's key (this device's keychain; the endpoint and the drive
+themselves are offered to your other devices through `bots.toml` and
+`drives.toml`), and this Mac's MCP servers, sandbox and web-search engine
+(`keeper.db`, this Mac only). A drive's quick-capture template and tag are kept
+in that drive's profile on this device and do not travel (DW-1580). This device's
+name is not a key either: it is kept for this device in the account
+(`<login>/devices/<device>.toml`) and published with every change it commits.
 "#;
 
 /// The prose below the generated tables.

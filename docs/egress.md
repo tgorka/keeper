@@ -29,6 +29,7 @@ and it is enforced in two ways:
 | **The GitHub broker's host** (e.g. `broker.acme.dev`) | Only while the account's descriptor names `[github_broker]`; absent without an account | `GET /v1/whoami` and `POST /v1/token`, each carrying the account's sign-in access token, to get one-hour GitHub tokens for listing and for GitHub drives. See `docs/account.md` § *GitHub through your organization's broker*. Only the **host** is shown, labelled *GitHub access broker*. See `egress::forge_egress`. |
 | **`github.com/tgorka/keeper/releases/...`** (the signed-update `latest.json` endpoint) | On a cadence while the app runs (about every 6 hours, starting 2 minutes after launch) while **Update automatically** is on, and on every "Check for updates" click. Off — the switch in Settings → About, or `update.auto = false` in a config file — leaves the click as the only time it is contacted | Signed auto-updates (NFR-12). Downloads are cryptographically verified against keeper's minisign public key before installing. |
 | **`*.githubusercontent.com`** (GitHub's release-asset CDN) | While an update is downloading: either one the user chose to install, or one the background updater found while **Update automatically** is on | GitHub serves release files (the update binary) from its content-delivery network, which the `github.com` release URL redirects to. Disclosed so the egress list is exhaustive, not just the check endpoint. |
+| **`api.github.com/repos/tgorka/keeper/releases/latest`** (the phone tier's release check) | Only on an iPhone or Android build, and only when the person presses **Check for updates** in Settings › About; listed there instead of the desktop updater's `latest.json`, which these builds never contact | Reads the latest release's tag, unauthenticated, with a 15-second timeout and a 1 MiB cap, to say whether a newer keeper is out (story 102.9, R464). Downloads and installs nothing — a new build is installed from the Mac. |
 | Each **MCP server this Mac's agents use** (e.g. `notes.example.org`, `127.0.0.1:8931`) | Only while Settings › Agents › *MCP servers* names one, which is how keeper does not ship; one entry per distinct host and port. A server keeper starts as a program is listed as *A program you configured: `<program>`*, once per program — never folded into a host of the same name | `initialize`, `tools/list` at each renewal of the Mac's host manifest (60 s) while it hosts agents, and each call an agent that lists the server makes — tiered, audited and checked against the server's `readers` first (docs/agents.md § *MCP servers*). Only the **host** is shown, never the path or the bearer token, which is sent to that host alone. A program reaches whatever it reaches with your rights; keeper cannot see where. See `egress::agent_egress`. |
 | **The web search engine this Mac's agents use** (e.g. `127.0.0.1:8888`, `search.example.org`) | Only while Settings › Agents › *Web search* names one, which is how keeper does not ship; one entry, its host and its port, never its path. Only agents a person set *Web search* to *Ask* or *Without asking* for send it anything (docs/agents.md § *Searching the web*) | Each `web_search` call: `GET <url>/search?q=<query>&format=json`, following no redirect. The query is the agent's words, so it leaves the Mac — from a session whose label names its readers only after a person approves that exact query to that engine (R428), unless a person chose *Without asking* for that agent (R457); a session whose label is `local_only` sends none. What comes back reaches the model as outside data, at most 10 results. |
 | **The push gateway you run** (e.g. `push.example.org`, `push.example.org:8443`) | Only on a phone, only while Settings › Notifications › *Push gateway* (`push.gateway_url`) holds an address keeper registers — `https://`, no user name or password, the push path — which is how keeper does not ship; one entry, the host and the port when the address names one, labelled *Push gateway — your homeserver sends it event ids for this device* | keeper itself never contacts it. It registers the address with each signed-in homeserver as this phone's `event_id_only` pusher (iPhone, Epic 98 story 98.1, `docs/ios.md` § *Push*), and the **homeserver** sends it, for this device, the event id of every message of that account that would notify, which it relays to Apple's push service; the notification's words are decrypted on the phone, which shows only agents' approval requests and your own agent's answers and discards the rest. Only the host is shown, never the path. See `egress::push_egress`. |
@@ -489,14 +490,15 @@ interface says "following" rather than "streaming" (Story 63.7, AD-177).
 
 Epic 71 replaces the former unconditional no-telemetry claim with **no PostHog
 collection or contact without the relevant local consent**. New and existing
-installations default off. Rust owns local-only consent, schema validation and
-normal-app export; synchronized settings cannot grant consent. Settings → About
+installations default off. Rust owns consent, schema validation and normal-app
+export; since epic 102 diagnostics and product statistics are synchronized account
+settings (R462, below). Settings → About
 discloses the configured ingestion host from the same live policy. The management
 host `us.posthog.com` is used only by separate maintainer tooling, not by the app.
 
 | Consent | What may leave | What it cannot enable |
 | --- | --- | --- |
-| Diagnostics | Closed readiness/interaction durations, sanitized frontend-error categories, a closed microphone-loss cause per recording (`removed`, `stalled` or `silent`) and content-free diagnostic records/operation traces | Raw exception text, stack payloads, arbitrary tracing strings or wholesale application logs; Rust panics in any form (Epic 100, R387: they stay in `keeper.log`); the microphone's name, the sidecar's warning text or anything recorded |
+| Diagnostics | Closed readiness/interaction durations, a closed microphone-loss cause per recording (`removed`, `stalled` or `silent`), content-free operation traces, and — since epic 102 (R461) — every `WARN`/`ERROR` line keeper logs and every error the webview reports, as a `$exception` with level, target, file:line, a fingerprint and the message **redacted** (Matrix ids, emails, URL paths and queries, home-relative paths, hex runs ≥ 16, base64 runs ≥ 24, `syt_`/`phc_`/bearer tokens and values after `token=`/`key=`/`password=` removed; at most 1,000 characters); a line under an agent target leaves without its message | Unredacted text, stack payloads or a line's raw fields; an agent line's message or fields; the microphone's name or anything recorded |
 | Product statistics | Closed events for opening the command palette or settings | Search text, command names, setting values, person profiles or account identifiers |
 | Remote configuration | A request for the public `keeper-client-config` flag payload and a bounded support sentence | Collection, consent, security policy, destinations, grants, encryption changes or synchronized user preferences |
 | Synthetic usability study | Replay/heatmaps of a separate synthetic surface after explicit per-session start | Normal-app DOM or real account, drive, note, bot or recording content |
@@ -509,15 +511,26 @@ Recording sends no content and adds no destination, and on-device speech
 guarantees are unchanged; the one recording signal is the closed microphone-loss
 cause below, under diagnostics consent.
 
-**Epic 100 (R381, as amended by R387) adds one thing and nothing else:** a
-closed `surface` property on `keeper_interaction` — `slash_menu_opened`,
-`slash_menu_chosen`, `launch_default_agent` — never the command, its arguments,
-the room or the agent. A Rust panic is an `ERROR` line in `keeper.log` only and
-is not counted in telemetry at all: a process whose runtime workers poll agent
-and non-agent work alike has no boundary that could tell an agent's panic
-apart, and agents stay out of PostHog fail-closed (S-19, NFR-121). What is
-logged where, and what never leaves the device, is
-[docs/observability.md](observability.md).
+**Epic 102 (R461, R462) amends the above.** Diagnostics and product statistics
+are now the account's synchronized settings (`telemetry.diagnostics`,
+`telemetry.product_analytics`): on or off on one device is on or off on every
+device of the account; a settings file pinning one wins over a local save,
+and every account-layer change takes effect at once (R495, R496). An epic-71
+per-installation "on" is adopted only once the account's settings are known
+on the device, and only where the account has no value. Remote configuration and the installation
+identifier stay per installation. Under diagnostics consent the redacted
+problem records above leave; the destination is the same ingestion host. The
+payload rules of the previous paragraph hold for everything else; for a
+problem, "messages, filenames, local paths" means what survives the redactor:
+text between the redacted spans, and paths that are not home-relative. Whole
+rule and limits: [docs/observability.md](observability.md#telemetry-posthog-opt-in).
+
+**Epic 100 (R381, as amended by R387) added** a closed `surface` property on
+`keeper_interaction` — `slash_menu_opened`, `slash_menu_chosen`,
+`launch_default_agent` — never the command, its arguments, the room or the
+agent. Its rule that a panic is never counted is replaced by R461: a panic's
+`ERROR` line leaves like any other, redacted. What is logged where, and what
+leaves the device, is [docs/observability.md](observability.md).
 
 **A lost microphone adds one closed count and nothing else:** when a recording
 loses its microphone, the app shell sends `keeper_recording_mic_lost` with one

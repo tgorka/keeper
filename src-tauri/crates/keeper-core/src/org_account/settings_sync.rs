@@ -67,7 +67,12 @@ const ACCOUNT_CREDENTIAL: &str = "account";
 /// The two credential-source families live in the device file, keyed by a
 /// drive or provider reference there and by a local id here.
 pub fn synced_file(key: &str) -> Option<SyncedFile> {
-    let spec = keys::spec(key)?;
+    synced_file_of(keys::spec(key)?)
+}
+
+/// [`synced_file`] for a registry entry, which is how the generated
+/// `docs/settings-keys.md` says where every key — families included — travels.
+pub fn synced_file_of(spec: &keys::KeySpec) -> Option<SyncedFile> {
     if spec.family {
         return [SYNC_CREDENTIAL_PREFIX, BOTS_CREDENTIAL_PREFIX]
             .contains(&spec.key)
@@ -1091,6 +1096,7 @@ mod tests {
         }
         for key in [
             "ui.first_run_setup_skipped",
+            "ui.default_agent_chooser_dismissed",
             "notes.read.01ABC",
             "notes.capture_draft.main",
             "notes.pristine.01ABC",

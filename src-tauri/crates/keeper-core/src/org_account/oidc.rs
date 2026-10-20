@@ -56,9 +56,7 @@ use super::session::{
     StoredSession,
 };
 use super::{claims, AccountError};
-use crate::oauth::{
-    address_of, no_answer, open_failure, OAuthCallback, OAuthFlowRegistry, REACH_TIMEOUT,
-};
+use crate::oauth::{address_of, no_answer, OAuthCallback, OAuthFlowRegistry, REACH_TIMEOUT};
 use crate::platform::Platform;
 
 /// How long a sign-in waits for the browser to come back.
@@ -378,6 +376,7 @@ async fn discover(
 /// within [`REACH_TIMEOUT`], or the sentence naming `address`. A provider
 /// behind a network that drops the packets never refuses the connection, and
 /// the sign-in would otherwise sit silent until the browser's own timeout.
+/// It ends before the flow is registered, so no link is ever shown for it.
 /// Only the interactive legs are bounded: a background refresh keeps the
 /// HTTP client's own timeouts and its quiet offline status.
 async fn within_reach<T>(
@@ -588,51 +587,53 @@ async fn authorize(
         None => auth_url.to_string(),
     };
 
-    // Registered before the browser opens, so a fast callback cannot race it,
-    // and with its page, so a person whose browser stays shut can open it.
-    let rx = flows.register(state.secret().clone());
+    // Registered before the browser opens, so a fast callback cannot race it.
+    let (rx, mut unshown) = flows.register_with_link(state.secret().clone());
     let _guard = FlowGuard {
         flows,
         state: state.secret(),
     };
-    flows.offer_link(state.secret(), &open);
-    let opened = if listener.is_some() {
-        platform.open_url(&open)
-    } else {
-        platform.start_web_auth(&open, redirect.scheme())
-    };
-    // A page keeper could not open is still a page the person can: the flow
-    // keeps waiting, and the link is offered with the reason.
-    if let Err(e) = opened {
-        // The platform's words go to the person only: an opener may quote the
-        // URL in a form `open_failure` cannot recognise.
-        tracing::warn!(host = %provider.host, "account: the sign-in page did not open; its link is offered instead");
-        flows.open_failed(state.secret(), &open_failure(&e, &open));
-    }
-
-    let outcome = tokio::time::timeout(wait, async {
-        let mut rx = rx;
-        let mut loopback_done = listener.is_none();
-        loop {
-            let active = !loopback_done;
-            let next = async {
-                match listener.as_mut() {
-                    Some(l) if active => l.next().await,
-                    _ => std::future::pending().await,
-                }
-            };
-            tokio::select! {
-                outcome = &mut rx => break outcome,
-                url = next => match url {
-                    // Routed like a deep link: the registry matches it by
-                    // state, and anything else is ignored.
-                    Some(url) => { flows.resolve(&url); }
-                    None => loopback_done = true,
-                },
-            }
+    // The link goes to the person first, then to the browser; a page that
+    // could not be opened — at once, or a sign-in sheet refused after it was
+    // queued — leaves it on screen with a sentence, and the sign-in keeps
+    // waiting for the callback the pasted link brings (R470, R480).
+    let loopback = listener.is_some();
+    let shown = crate::sign_in_link::offer(platform, &open, || {
+        if loopback {
+            platform.open_url(&open)
+        } else {
+            platform.start_web_auth(&open, redirect.scheme())
         }
-    })
+    });
+
+    let outcome = tokio::time::timeout(
+        wait,
+        shown.wait(&mut unshown, async {
+            let mut rx = rx;
+            let mut loopback_done = listener.is_none();
+            loop {
+                let active = !loopback_done;
+                let next = async {
+                    match listener.as_mut() {
+                        Some(l) if active => l.next().await,
+                        _ => std::future::pending().await,
+                    }
+                };
+                tokio::select! {
+                    outcome = &mut rx => break outcome,
+                    url = next => match url {
+                        // Routed like a deep link: the registry matches it by
+                        // state, and anything else is ignored.
+                        Some(url) => { flows.resolve(&url); }
+                        None => loopback_done = true,
+                    },
+                }
+            }
+        }),
+    )
     .await;
+    // Whatever came back, the link is spent: its `state` left the registry.
+    drop(shown);
 
     let callback = match outcome {
         Err(_) => return Err(AccountError::TimedOut),
@@ -2316,8 +2317,13 @@ mod tests {
         Denied(Option<&'static str>),
         /// The person closes the sign-in sheet.
         Closed,
-        /// The platform's sheet fails with this reason.
-        SheetFailed(&'static str),
+        /// The sheet hands back an answer that is not this flow's: the
+        /// platform ends the flow with this reason (`OAuthFlowRegistry::fail`).
+        BrokenRoundTrip(&'static str),
+        /// The sheet's presentation is queued, then refused later (iOS's
+        /// `presentationContextInvalid`): the platform says so through
+        /// `OAuthFlowRegistry::not_shown`, as `web_auth::finish` does.
+        RefusedLater,
         /// The flow is dropped without any answer.
         Dropped,
         /// The sheet stays open, unanswered, until something in keeper ends
@@ -2325,7 +2331,8 @@ mod tests {
         Waits,
         /// Answers the first sign-in honestly and closes every later sheet.
         HonestThenClosed,
-        /// Nothing opens: the platform refuses to show the page at all.
+        /// The system cannot open the sign-in page at all; the person pastes
+        /// the link into a browser themselves.
         WontOpen,
     }
 
@@ -2338,6 +2345,9 @@ mod tests {
         /// Every URL shown, with the scheme passed to `start_web_auth` (or
         /// `None` for `open_url`).
         shown: Mutex<Vec<(String, Option<String>)>>,
+        /// Every link the sign-in screen was given (R470), in order; `None`
+        /// where it was taken away.
+        links: Mutex<Vec<Option<crate::sign_in_link::SignInLinkVm>>>,
     }
 
     fn query(url: &Url, key: &str) -> Vec<String> {
@@ -2365,6 +2375,7 @@ mod tests {
                 seen: Arc::clone(&fake.seen),
                 browser,
                 shown: Mutex::default(),
+                links: Mutex::default(),
             }
         }
 
@@ -2388,7 +2399,8 @@ mod tests {
                 Browser::Honest
                 | Browser::Denied(_)
                 | Browser::Closed
-                | Browser::SheetFailed(_)
+                | Browser::BrokenRoundTrip(_)
+                | Browser::RefusedLater
                 | Browser::Dropped
                 | Browser::Waits
                 | Browser::WontOpen
@@ -2442,9 +2454,6 @@ mod tests {
                 .lock()
                 .expect("shown")
                 .push((url.to_owned(), None));
-            if matches!(self.browser, Browser::WontOpen) {
-                return Err(CoreError::Internal("no browser here".to_owned()));
-            }
             // A loopback redirect: the browser GETs the listener, which routes
             // the callback through the registry itself.
             let callback =
@@ -2496,8 +2505,15 @@ mod tests {
                 Browser::HonestThenClosed if self.shown.lock().expect("shown").len() > 1 => {
                     self.flows.cancel(&state);
                 }
-                Browser::SheetFailed(reason) => {
+                Browser::BrokenRoundTrip(reason) => {
                     self.flows.fail(&state, reason);
+                }
+                Browser::RefusedLater => {
+                    let flows = Arc::clone(&self.flows);
+                    std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_millis(20));
+                        flows.not_shown(&state, "presentationContextInvalid");
+                    });
                 }
                 Browser::Dropped => self.flows.remove(&state),
                 Browser::Waits | Browser::WontOpen => {}
@@ -2509,6 +2525,9 @@ mod tests {
                 }
             }
             Ok(())
+        }
+        fn show_sign_in_link(&self, _: u64, link: Option<&crate::sign_in_link::SignInLinkVm>) {
+            self.links.lock().expect("links").push(link.cloned());
         }
         fn notify(&self, _: &str, _: &str, _: &NotifyTarget) -> Result<(), CoreError> {
             Ok(())
@@ -2577,6 +2596,113 @@ mod tests {
     }
 
     // ---- sign-in ---------------------------------------------------------
+
+    /// The person, handed a link with its sentence, pastes it into their own
+    /// browser: wait (bounded — a sign-in that ended at once never shows the
+    /// sentence, and the test must fail rather than wait for it), then bring
+    /// the browser's callback.
+    async fn paste_the_unopened_link(p: &FakePlatform) {
+        let unopened = || {
+            p.links
+                .lock()
+                .expect("links")
+                .iter()
+                .flatten()
+                .find(|link| link.not_opened.is_some())
+                .map(|link| link.url.clone())
+        };
+        let link = tokio::time::timeout(SHORT, async {
+            loop {
+                if let Some(link) = unopened() {
+                    break link;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the link with its sentence");
+        let callback = p.visit(&link).expect("the person's browser answers");
+        assert!(p.flows.resolve(&callback), "the sign-in still waits");
+    }
+
+    /// The link is on the sign-in screen before the browser is asked for it,
+    /// and a page the system could not open does not end the sign-in: the
+    /// link stays with the sentence, the callback the person's own browser
+    /// brings finishes it, and then the link is taken away (102.9 #1, R470,
+    /// R480).
+    #[tokio::test]
+    async fn a_page_that_did_not_open_leaves_its_link_and_the_pasted_link_finishes_the_sign_in() {
+        let fake = start_fake(Behaviour::default());
+        let p = FakePlatform::new(&fake, Browser::WontOpen);
+        let d = account(&fake, "paste", None);
+
+        let (identity, ()) = tokio::join!(sign_in_short(&p, &d), paste_the_unopened_link(&p));
+
+        assert_eq!(identity.expect("signed in by hand").login, "tgorka");
+        let links = p.links.lock().expect("links").clone();
+        let shown = p.shown.lock().expect("shown").clone();
+        assert_eq!(links.len(), 3, "{links:?}");
+        let first = links[0].as_ref().expect("the link");
+        assert_eq!(
+            first.url, shown[0].0,
+            "the link is the page keeper asked for"
+        );
+        assert_eq!(first.not_opened, None);
+        let second = links[1].as_ref().expect("the link again");
+        assert_eq!(second.url, first.url);
+        assert_eq!(
+            second.not_opened.as_deref(),
+            Some(crate::sign_in_link::NOT_OPENED)
+        );
+        assert_eq!(links[2], None, "the finished sign-in's link is gone");
+    }
+
+    /// iOS queues the sign-in sheet, so `start_web_auth` succeeds — and the
+    /// sheet is refused afterwards. That refusal does not end the sign-in
+    /// either: the link gets its sentence, and the pasted link finishes the
+    /// very same flow (R480, DW-1590).
+    #[tokio::test]
+    async fn a_sheet_refused_after_it_was_queued_leaves_the_same_sign_in_to_the_pasted_link() {
+        let fake = start_fake(Behaviour::default());
+        let p = FakePlatform::new(&fake, Browser::RefusedLater);
+        let d = account(&fake, "later", None);
+
+        let (identity, ()) = tokio::join!(sign_in_short(&p, &d), paste_the_unopened_link(&p));
+
+        assert_eq!(identity.expect("signed in by hand").login, "tgorka");
+        assert_eq!(
+            p.shown.lock().expect("shown").len(),
+            1,
+            "one flow, one page"
+        );
+        assert_eq!(
+            fake.token_requests().len(),
+            1,
+            "its code was exchanged once"
+        );
+        let links = p.links.lock().expect("links").clone();
+        assert_eq!(links.last(), Some(&None), "{links:?}");
+    }
+
+    /// However a sign-in ends — refused, cancelled, out of time — its link
+    /// is taken away when it ends, not merely hidden (R480/03).
+    #[tokio::test]
+    async fn every_ending_takes_the_link_away() {
+        let fake = start_fake(Behaviour::default());
+        for browser in [
+            Browser::Denied(None),
+            Browser::Closed,
+            Browser::BrokenRoundTrip("no answer"),
+            Browser::Waits,
+        ] {
+            let p = FakePlatform::new(&fake, browser);
+            let d = account(&fake, "gone", None);
+            assert!(sign_in_short(&p, &d).await.is_err());
+            let links = p.links.lock().expect("links").clone();
+            assert!(matches!(links.first(), Some(Some(_))), "{links:?}");
+            assert_eq!(links.last(), Some(&None), "{links:?}");
+        }
+    }
 
     #[tokio::test]
     async fn each_attempt_sends_fresh_state_nonce_and_an_s256_challenge_the_verifier_answers() {
@@ -2679,8 +2805,8 @@ mod tests {
             (Browser::Denied(None), "denied"),
             (Browser::Closed, "closed"),
             (
-                Browser::SheetFailed("keeper was not in front"),
-                "sheet failed",
+                Browser::BrokenRoundTrip("the sign-in page answered without its state"),
+                "broken round trip",
             ),
             (Browser::Dropped, "dropped"),
         ];
@@ -2699,8 +2825,11 @@ mod tests {
                 }
                 (Browser::Denied(None), Err(AccountError::Denied { reason: None, .. })) => {}
                 (Browser::Closed, Err(AccountError::Cancelled)) => {}
-                (Browser::SheetFailed(_), Err(AccountError::Interrupted(reason))) => {
-                    assert_eq!(reason, "keeper was not in front", "{case}");
+                (Browser::BrokenRoundTrip(_), Err(AccountError::Interrupted(reason))) => {
+                    assert_eq!(
+                        reason, "the sign-in page answered without its state",
+                        "{case}"
+                    );
                 }
                 (Browser::Dropped, Err(AccountError::Interrupted(_))) => {}
                 _ => panic!("{case}: {result:?}"),
@@ -3503,9 +3632,9 @@ mod tests {
     /// A provider behind a network that drops the packets (a tailnet ACL
     /// without a grant) accepts nothing and refuses nothing. The sign-in
     /// stops at `REACH_TIMEOUT` with a sentence naming the host and port,
-    /// not at the browser's five-minute timeout with none, and no browser
-    /// opens. Paused time: the provider never answers, so the budget is all
-    /// that ends it.
+    /// not at the browser's five-minute timeout with none — before the flow
+    /// exists, so no browser opens and no link is shown. Paused time: the
+    /// provider never answers, so the budget is all that ends it.
     #[tokio::test(start_paused = true)]
     async fn a_provider_that_never_answers_is_named_with_its_port_before_any_browser() {
         // Accepts the connection (the kernel does) and never answers.
@@ -3518,9 +3647,15 @@ mod tests {
         let p = FakePlatform::new(&fake, Browser::Honest);
         let d = account(&fake, "acme", None);
 
-        let error = sign_in_within(&p, &p.flows, &http(), &d, FLOW_TIMEOUT)
-            .await
-            .expect_err("nobody answered");
+        // Bounded well past the budget: without it the sign-in would wait out
+        // the browser's timeout.
+        let error = tokio::time::timeout(
+            Duration::from_secs(60),
+            sign_in_within(&p, &p.flows, &http(), &d, FLOW_TIMEOUT),
+        )
+        .await
+        .expect("the sign-in ended on its own budget")
+        .expect_err("nobody answered");
 
         assert_eq!(
             error.to_string(),
@@ -3534,70 +3669,44 @@ mod tests {
             p.shown.lock().expect("shown").is_empty(),
             "no browser opened"
         );
+        assert!(p.links.lock().expect("links").is_empty(), "no link shown");
         drop(silent);
     }
 
-    /// The page keeper could not open is still one the person can: the
-    /// sign-in keeps waiting and offers its link with the reason, and the
-    /// link opened by hand finishes it. The link leaves with the flow and is
-    /// never written to the log.
-    #[tokio::test]
-    async fn a_browser_that_will_not_open_leaves_the_link_and_the_sign_in_waiting() {
-        let captured = Captured::default();
-        let writer = captured.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_ansi(false)
-            .with_max_level(tracing::Level::TRACE)
-            .with_writer(move || writer.clone())
-            .finish();
-        let _logging = tracing::subscriber::set_default(subscriber);
+    /// The repository's forge leg has the same budget when its forge names
+    /// an issuer to discover: the sentence names the forge's host and port.
+    #[tokio::test(start_paused = true)]
+    async fn a_forge_that_never_answers_is_named_with_its_port_before_any_browser() {
+        let silent = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = silent.local_addr().expect("addr");
+        let fake = start_fake(Behaviour::default());
+        let p = FakePlatform::new(&fake, Browser::Honest);
+        let i = &fake.issuer;
+        let d = descriptor::parse_json(&format!(
+            r#"{{"version":1,"id":"forge","name":"Acme",
+                "auth":{{"issuer":"{i}","client_id":"{CLIENT_ID}"}},
+                "config":{{"url":"{i}/c.git","api_base":"{i}/api/v1",
+                  "auth":{{"mode":"oauth","client_id":"forge-client","scope":"{FORGE_SCOPE}",
+                           "issuer":"http://{address}"}}}}}}"#
+        ))
+        .expect("a valid oauth-mode descriptor");
 
-        for redirect in [None, Some("http://127.0.0.1/callback")] {
-            let fake = start_fake(Behaviour::default());
-            let p = FakePlatform::new(&fake, Browser::WontOpen);
-            let d = account(&fake, "acme", redirect);
+        let error = tokio::time::timeout(
+            Duration::from_secs(60),
+            forge_connect_within(&p, &p.flows, &http(), &d, "tgorka", "hesperia", SHORT),
+        )
+        .await
+        .expect("the connection ended on its own budget")
+        .expect_err("nobody answered");
 
-            let person = async {
-                // Bounded: a sign-in that ended first must fail the test, not hang it.
-                let link = tokio::time::timeout(Duration::from_secs(30), async {
-                    loop {
-                        match p.flows.link() {
-                            Some(link) if link.open_failed.is_some() => break link,
-                            _ => tokio::time::sleep(Duration::from_millis(5)).await,
-                        }
-                    }
-                })
-                .await
-                .expect("the link was offered while the sign-in waited");
-                // Pasted into a browser of their own, which calls back.
-                let callback = p.visit(&link.url).expect("a sign-in page");
-                assert!(p.flows.resolve(&callback), "the flow still waits");
-                link
-            };
-            let client = http();
-            let (signed_in, link) = tokio::join!(
-                sign_in_within(&p, &p.flows, &client, &d, Duration::from_secs(30)),
-                person
-            );
-
-            assert_eq!(signed_in.expect("signed in by the link").login, "tgorka");
-            assert!(link.url.starts_with(&fake.issuer), "{redirect:?}");
-            let reason = link.open_failed.expect("the reason");
-            assert!(
-                reason.starts_with("keeper could not open your browser (")
-                    && reason.contains("no browser here"),
-                "{reason}"
-            );
-            assert_eq!(p.flows.link(), None, "the link left with the flow");
-
-            let logs =
-                String::from_utf8(captured.0.lock().expect("captured").clone()).expect("utf-8");
-            assert!(logs.contains("the sign-in page did not open"), "{logs}");
-            assert!(
-                !logs.contains(&link.url) && !logs.contains("code_challenge"),
-                "{logs}"
-            );
-        }
+        assert!(matches!(error, AccountError::NoAnswer(_)), "{error:?}");
+        assert_eq!(
+            error.to_string(),
+            crate::oauth::no_answer(&address.to_string())
+        );
+        assert!(p.shown.lock().expect("shown").is_empty());
+        assert!(p.links.lock().expect("links").is_empty());
+        drop(silent);
     }
 
     #[tokio::test]

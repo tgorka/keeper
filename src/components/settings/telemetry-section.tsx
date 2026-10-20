@@ -27,19 +27,19 @@ const CATEGORIES = [
     key: "diagnostics",
     label: "Optional diagnostics",
     detail:
-      "Content-free readiness and interaction timings, fixed error categories, operation traces and why a recording lost its microphone (removed, stalled or silent). Never app logs, exception text, device names or anything recorded.",
+      "Every warning and error keeper logs, with its message redacted first: Matrix IDs, email addresses, link paths, home-folder paths, long codes and tokens are removed, and agent lines leave without their message. Also content-free readiness and interaction timings and why a recording lost its microphone. Applies to every device signed in to your account.",
   },
   {
     key: "productAnalytics",
     label: "Optional product statistics",
     detail:
-      "Counts of opening Settings and the command palette. No search text, messages or account identifiers.",
+      "Counts of opening Settings and the command palette. No search text, messages or account identifiers. Applies to every device signed in to your account.",
   },
   {
     key: "remoteConfig",
     label: "Optional remote configuration",
     detail:
-      "Fetch a plain support message for this section. Cannot enable collection or change your settings, security or destinations.",
+      "Fetch a plain support message for this section, on this device only. Cannot enable collection or change your settings, security or destinations.",
   },
 ] as const;
 
@@ -49,6 +49,8 @@ export function TelemetrySection({ open }: { open: boolean }) {
   const [error, setError] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [confirmStudy, setConfirmStudy] = useState(false);
+  /** The last save was overruled by a settings file (R495 06). */
+  const [shadowed, setShadowed] = useState(false);
   const generation = useRef(0);
   const writing = useRef(false);
 
@@ -131,6 +133,8 @@ export function TelemetrySection({ open }: { open: boolean }) {
     try {
       const next = await telemetryConsentSet({ ...status.consent, [key]: enabled });
       if (request === generation.current) setStatus(next);
+      // What took effect is the effective answer; a settings file's pin wins.
+      setShadowed(next.consent[key] !== enabled);
       window.dispatchEvent(new Event("keeper-telemetry-consent-changed"));
     } catch (raw) {
       logFailure("telemetry.consentSet")(raw);
@@ -155,11 +159,24 @@ export function TelemetrySection({ open }: { open: boolean }) {
         Diagnostics & studies
       </h3>
       <p className="text-muted-foreground text-xs">
-        Off by default, on this installation only. Each choice is independent. Turning a category
-        off discards unsent records and stops future collection. Data already sent cannot be
-        recalled here. No Matrix IDs, messages, filenames, paths, notes, bot content or recordings
-        are sent.
+        Off by default. Diagnostics and product statistics follow your account: turning one on or
+        off here does so on every device you are signed in on. Each choice is independent. Turning a
+        category off discards unsent records and stops future collection. Data already sent cannot
+        be recalled here. Diagnostics send keeper's warnings and errors with Matrix ids, email
+        addresses, links, home-folder paths and secrets removed, and agent lines without their
+        words; a file or device name inside an error's own words can remain.
       </p>
+      {status?.consentPinned && (
+        <p className="text-muted-foreground text-xs" role="note">
+          A settings file sets diagnostics or product statistics, so it decides here: a change you
+          make is saved but does not take effect while the file sets it.
+        </p>
+      )}
+      {shadowed && (
+        <p className="text-held text-xs" role="alert">
+          Saved, but a settings file keeps this switch as it is.
+        </p>
+      )}
       {status ? (
         <p className="break-words text-xs" role="status">
           {!status.configured
@@ -170,7 +187,7 @@ export function TelemetrySection({ open }: { open: boolean }) {
         </p>
       ) : (
         <p className="text-muted-foreground text-xs">
-          Local consent state unavailable; controls remain off until read.
+          Consent state unavailable; controls remain off until read.
         </p>
       )}
       {CATEGORIES.map(({ key, label, detail }) => (
@@ -191,8 +208,8 @@ export function TelemetrySection({ open }: { open: boolean }) {
       ))}
       {error && (
         <p role="alert" className="text-held text-xs">
-          Could not read or save local consent. Telemetry may be off only for this session; saved
-          consent may remain. Retry saving before restarting the app.
+          Could not read or save consent. Telemetry may be off only for this session; saved consent
+          may remain. Retry saving before restarting the app.
         </p>
       )}
       {remoteEnabled && message && (

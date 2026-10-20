@@ -118,6 +118,7 @@ import {
 import { botsStore, lastAnswer, useBotsStore } from "@/lib/stores/bots";
 import { useCapabilitiesStore } from "@/lib/stores/capabilities";
 import { primaryViewStore } from "@/lib/stores/primary-view";
+import { settingsUiStore } from "@/lib/stores/settings-ui";
 import { syncErrorMessage } from "@/lib/stores/sync";
 import { useVoiceClock, useVoiceStore, voiceLastWaitLine, voiceWaitWord } from "@/lib/stores/voice";
 import { cn } from "@/lib/utils";
@@ -597,6 +598,7 @@ export function BotsPhoneConversation({
               botsStore.getState().openConversation(null);
               return;
             }
+            settingsUiStore.getState().revealSection("bots");
             primaryViewStore.getState().setView("settings");
           }}
         />

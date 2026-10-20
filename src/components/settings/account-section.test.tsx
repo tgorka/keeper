@@ -5,7 +5,6 @@ vi.mock("@/lib/ipc/client", () => ({
   accountState: vi.fn(),
   accountSignIn: vi.fn(),
   accountCancelSignIn: vi.fn(),
-  accountSignInLink: vi.fn(() => Promise.resolve(null)),
   accountSync: vi.fn(),
   accountRenameDevice: vi.fn(),
   accountSignOut: vi.fn(),
@@ -17,11 +16,12 @@ vi.mock("@/lib/ipc/client", () => ({
   voiceWakeToggle: vi.fn(),
   voiceWakeSet: vi.fn(),
   voiceAvailability: vi.fn(),
+  cancelOidc: vi.fn(),
 }));
 
 import { SETUP_LINK_LABEL } from "@/components/account/account-setup-sheet";
-import { SIGN_IN_LINK_LABEL, SIGN_IN_LINK_PROMPT } from "@/components/auth/sign-in-link";
 import {
+  ACCOUNT_CANCEL_MATRIX_SIGN_IN_LABEL,
   ACCOUNT_DEVICES_LABEL,
   ACCOUNT_FORGET_LABEL,
   ACCOUNT_LISTENING_KEEP_OFF_LABEL,
@@ -38,10 +38,10 @@ import {
   accountForget,
   accountRenameDevice,
   accountSignIn,
-  accountSignInLink,
   accountSignOut,
   accountState,
   accountSync,
+  cancelOidc,
   voiceAvailability,
   voiceWakeGet,
   voiceWakeSet,
@@ -203,6 +203,24 @@ describe("AccountSection signed in", () => {
     expect(accountSignOut).not.toHaveBeenCalled();
   });
 
+  it("offers the sign-in's link to copy while it waits in the browser, beside Cancel", () => {
+    // 102.9 #1, R470: Rust sends the link only while its sign-in waits.
+    const url = "https://id.acme.dev/authorize?client_id=keeper&state=s1&code_challenge=c";
+    accountStore.getState().setVm(
+      accountVm({
+        state: "signingIn",
+        identity: null,
+        devices: [],
+        signInLink: { url, notOpened: null },
+      }),
+    );
+    render(<AccountSection open />);
+
+    expect(screen.getByText(url)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Copy link" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Cancel sign-in" })).toBeInTheDocument();
+  });
+
   it("offers Forget but not Sign out once signed out, and Sign in in their place", () => {
     accountStore.getState().setVm(accountVm({ state: "signedOut", identity: null, devices: [] }));
     render(<AccountSection open />);
@@ -342,34 +360,6 @@ describe("AccountSection signed in", () => {
   });
 });
 
-describe("AccountSection while signing in", () => {
-  const PAGE = "https://electra.siren-alsephina.ts.net:8451/oauth/v2/authorize?state=s1";
-
-  it("offers the sign-in page to copy beside Cancel sign-in", async () => {
-    vi.mocked(accountSignInLink).mockResolvedValue({ url: PAGE, openFailed: null });
-    accountStore.getState().setVm(
-      accountVm({
-        state: "signingIn",
-        identity: null,
-        sentence: "Finish signing in to Acme in the browser.",
-      }),
-    );
-    render(<AccountSection open />);
-
-    expect(await screen.findByText(SIGN_IN_LINK_PROMPT)).toBeInTheDocument();
-    expect(screen.getByLabelText(SIGN_IN_LINK_LABEL)).toHaveValue(PAGE);
-    expect(screen.getByRole("button", { name: "Cancel sign-in" })).toBeInTheDocument();
-  });
-
-  it("asks for no page when nothing is signing in", async () => {
-    accountStore.getState().setVm(accountVm());
-    render(<AccountSection open />);
-    await Promise.resolve();
-    expect(accountSignInLink).not.toHaveBeenCalled();
-    expect(screen.queryByLabelText(SIGN_IN_LINK_LABEL)).not.toBeInTheDocument();
-  });
-});
-
 describe("AccountSection's settings line (Epic 84, UX-DR118)", () => {
   const SYNCED = "Your settings sync with this account.";
 
@@ -472,6 +462,43 @@ describe("AccountSection after a restore (Epic 85, UX-DR119)", () => {
     expect(screen.queryByText(ACCOUNT_LISTENING_OFF_SENTENCE)).not.toBeInTheDocument();
     expect(
       screen.queryByRole("button", { name: ACCOUNT_LISTENING_ON_LABEL }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("gives the Matrix sign-in it started its own link and Cancel, then says how it ended", async () => {
+    // 102.9, R480/02: the restore's single sign-on is a browser sign-in like
+    // any other, beside an account that is itself up to date.
+    const url = "https://mas.acme.dev/authorize?client_id=keeper&state=r1&code_challenge=c";
+    const waiting = "Finish signing in to your Matrix account on matrix.acme.dev in the browser.";
+    vi.mocked(cancelOidc).mockResolvedValue(undefined);
+    accountStore.getState().setVm(
+      restored({
+        matrixSignIn: {
+          sentence: waiting,
+          problem: false,
+          waiting: true,
+          link: { url, notOpened: null },
+        },
+      }),
+    );
+    const { rerender } = render(<AccountSection open />);
+
+    expect(screen.getByText(waiting)).toBeInTheDocument();
+    expect(screen.getByText(url)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Cancel sign-in" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: ACCOUNT_CANCEL_MATRIX_SIGN_IN_LABEL }));
+    await waitFor(() => expect(cancelOidc).toHaveBeenCalledTimes(1));
+
+    const ended =
+      "Signing in to your Matrix account on matrix.acme.dev timed out before the browser answered, so its link no longer works. Sign in to it again from Add an account.";
+    accountStore
+      .getState()
+      .setVm(restored({ matrixSignIn: { sentence: ended, problem: true, waiting: false } }, 1));
+    rerender(<AccountSection open />);
+    expect(screen.getByRole("alert")).toHaveTextContent(ended);
+    expect(screen.queryByText(url)).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: ACCOUNT_CANCEL_MATRIX_SIGN_IN_LABEL }),
     ).not.toBeInTheDocument();
   });
 

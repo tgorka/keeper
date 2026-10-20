@@ -163,9 +163,11 @@ pub fn deliver(flows: &OAuthFlowRegistry, state: &str, answer: AuthTabAnswer) {
 /// timeout, and it is never offered to another flow: as the provider's
 /// refusal when the provider sent an `error`, otherwise as a broken round
 /// trip. A cancel ends only that flow, so a sign-in waiting beside it keeps
-/// waiting. A sheet that failed ends its flow as a broken round trip with
-/// the reason ([`OAuthFlowRegistry::fail`]) — never as the provider's
-/// refusal, which it is not (Epic 100, R381).
+/// waiting. A sheet that failed is a page that could not be shown
+/// ([`OAuthFlowRegistry::not_shown`]): a sign-in whose link is on screen
+/// keeps waiting for the callback the pasted link brings (102.9, R480), any
+/// other flow ends as a broken round trip with the reason — never as the
+/// provider's refusal, which it is not (Epic 100, R381).
 pub fn finish(flows: &OAuthFlowRegistry, state: &str, ending: Ending) {
     match ending {
         Ending::Callback(url) => {
@@ -188,7 +190,7 @@ pub fn finish(flows: &OAuthFlowRegistry, state: &str, ending: Ending) {
         Ending::Cancelled => flows.cancel(state),
         Ending::Failed(reason) => {
             tracing::warn!(%reason, "web auth: the sign-in sheet failed");
-            if !flows.fail(state, &reason) {
+            if !flows.not_shown(state, &reason) {
                 tracing::debug!("web auth: the failure matched no waiting sign-in");
             }
         }
@@ -555,8 +557,9 @@ mod tests {
         assert!(flows.resolve("keeper://oauth/callback?state=other&code=c"));
     }
 
-    /// A sheet that could not be shown ends the flow with its reason at once,
-    /// as a broken round trip rather than the provider's refusal.
+    /// A sheet that could not be shown ends a flow without a link (a
+    /// sign-out's) with its reason at once, as a broken round trip rather
+    /// than the provider's refusal.
     #[tokio::test]
     async fn a_failure_reaches_the_flow_as_a_failed_round_trip_with_its_reason() {
         let flows = OAuthFlowRegistry::new();
@@ -572,6 +575,27 @@ mod tests {
             }
             other => panic!("expected a failed round trip, got {other:?}"),
         }
+    }
+
+    /// A sign-in whose link is on screen outlives its sheet: the refusal
+    /// arriving after the sheet was queued is told to it, and the callback
+    /// the pasted link brings still finishes it (102.9, R480).
+    #[tokio::test]
+    async fn a_sheet_refused_later_leaves_a_sign_in_with_a_link_waiting() {
+        let flows = OAuthFlowRegistry::new();
+        let (mut waiting, mut unshown) = flows.register_with_link("abc".to_owned());
+        finish(
+            &flows,
+            "abc",
+            Ending::Failed("presentationContextInvalid".to_owned()),
+        );
+        assert_eq!(
+            unshown.try_recv().ok().as_deref(),
+            Some("presentationContextInvalid")
+        );
+        assert!(waiting.try_recv().is_err(), "the sign-in still waits");
+        assert!(flows.resolve("keeper://oauth/acme/callback?code=c&state=abc"));
+        assert!(matches!(waiting.await, Ok(OAuthCallback::Redirect(_))));
     }
 
     #[tokio::test]

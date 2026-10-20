@@ -56,6 +56,12 @@ sse-stream = { workspace = true }
 # grey for a region's difference hash before an action at coordinates is
 # approved and again before it is consumed (96.4).
 image = { workspace = true, features = ["jpeg"] }
+# The JPEG decoder `image` runs, asked directly what a photo's header says
+# its decoding takes — its components and their sampling — before a smaller
+# copy of it is made (R512). Already in Cargo.lock at 0.5.15 through
+# `image`'s `jpeg`, with the same features, so no new crate. MIT OR
+# Apache-2.0 OR Zlib.
+zune-jpeg = "0.5"
 base64 = { workspace = true }
 
 # The text of a PDF a person sends into an agent's room, written beside it

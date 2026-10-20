@@ -65,6 +65,13 @@ pub struct HostManifest {
     /// minute lease ([`crate::agents::claim::LeaseKind::for_fleet`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lease: Option<String>,
+    /// Whether this host names a web search engine its agents search with
+    /// (story 102.3, R466): `Some(false)` names none, so an agent asking
+    /// for `web_search` is offered none here. Absent from a host built
+    /// before it — a device says "unknown on this host" then, never yes;
+    /// a build that does not read it ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web_search: Option<bool>,
 }
 
 /// A drive as one host has it.
@@ -202,6 +209,7 @@ mod tests {
             expires_at: "2026-10-03T12:03:00Z".to_owned(),
             picture_failures: Default::default(),
             lease: None,
+            web_search: None,
         }
     }
 

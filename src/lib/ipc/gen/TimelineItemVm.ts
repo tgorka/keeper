@@ -5,6 +5,7 @@ import type { MediaVm } from "./MediaVm";
 import type { ReactionGroupVm } from "./ReactionGroupVm";
 import type { ReplyPreviewVm } from "./ReplyPreviewVm";
 import type { SendState } from "./SendState";
+import type { TurnMarkVm } from "./TurnMarkVm";
 
 /**
  * A single timeline item rendered in the conversation pane (FR-8, NFR-9,
@@ -104,7 +105,16 @@ brief: BriefVm | null,
  * (`gate_room::GateView`); else `null`. Boxed as `brief` is; the
  * binding stays `GateLineVm | null`.
  */
-gate: GateLineVm | null, } | { "kind": "utd", 
+gate: GateLineVm | null, 
+/**
+ * In an agent session room, whether the agent's host took this own
+ * message (story 102.4, R465) — drawn there in place of a read tick,
+ * since the agent's receipt rides its claim renewals and says
+ * nothing of the message; absent while neither is known and in
+ * every other room. Boxed as `brief` is; the binding stays
+ * `turn?: TurnMarkVm`.
+ */
+turn?: TurnMarkVm, } | { "kind": "utd", 
 /**
  * Stable opaque render key (the item's `unique_id`).
  */

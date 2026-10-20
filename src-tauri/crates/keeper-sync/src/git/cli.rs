@@ -586,6 +586,17 @@ impl GitCli {
         parse_name_status(&out)
     }
 
+    /// What the index holds beyond `HEAD`, path by path — during a merge,
+    /// everything the merge commit will carry that this machine's own tree
+    /// does not (Story 102.2, R503): the paths `add` was given and every
+    /// path git staged by itself. `--no-renames` and `-z` for
+    /// [`Self::diff_status`]'s reasons.
+    pub fn staged_changes(&self, repo: &Path) -> Result<Vec<(ChangeKind, PathBuf)>> {
+        self.refuse_on_phone(Verb::History)?;
+        let out = self.run_raw("diff --cached --name-status", repo, &staged_changes_args())?;
+        parse_name_status(&out)
+    }
+
     /// The merge base of two commits, used to work out which side changed what.
     pub fn merge_base(&self, repo: &Path, a: &str, b: &str) -> Result<String> {
         self.refuse_on_phone(Verb::History)?;
@@ -1382,6 +1393,18 @@ fn diff_status_args(from: &str, to: &str) -> Result<Vec<String>> {
         safe_ref(from)?,
         safe_ref(to)?,
     ])
+}
+
+/// `git diff --cached --name-status --no-renames -z HEAD` argument vector.
+fn staged_changes_args() -> Vec<String> {
+    vec![
+        "diff".to_owned(),
+        "--cached".to_owned(),
+        "--name-status".to_owned(),
+        "--no-renames".to_owned(),
+        "-z".to_owned(),
+        "HEAD".to_owned(),
+    ]
 }
 
 /// `git merge --abort` argument vector.

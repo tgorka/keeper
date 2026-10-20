@@ -43,7 +43,10 @@ use serde_json::{json, Value};
 
 mod common;
 
-use common::{bare_drive, git, record, scripted, stub, syncing, Smoke, Stub};
+use common::turns::{
+    answer_to, every_kind_is_answered, person, reads_attachments, tells_what_it_got, Seen,
+};
+use common::{bare_drive, git, scripted, stub, Smoke, Stub};
 
 const BIN: &str = env!("CARGO_BIN_EXE_keeper-agentd");
 const SESSION: &str = "active/2026-10-03-smoke";
@@ -316,36 +319,6 @@ async fn host_with(
     host
 }
 
-/// The person's client, joined to the session room and syncing.
-async fn person(
-    smoke: &Smoke,
-    dir: &Path,
-    room: &OwnedRoomId,
-) -> (
-    AgentClient,
-    Arc<Mutex<Vec<(Instant, Value)>>>,
-    tokio::task::JoinHandle<()>,
-) {
-    let me = smoke.user("tgorka-smoke");
-    smoke.clear_devices(&me).await;
-    let client = smoke
-        .client(dir, "tgorka-smoke", smoke.secret("TGORKA_SMOKE_PASSWORD"))
-        .await;
-    client.join(room).await.expect("join");
-    client.sync_once().await.expect("sync");
-    let seen = record(&client);
-    let sync = syncing(&client);
-    (client, seen, sync)
-}
-
-/// One answered turn as the person saw it.
-#[derive(Debug)]
-struct Seen {
-    /// Every edit's `origin_server_ts`, the anchor's first, the final last.
-    times: Vec<u64>,
-    final_text: String,
-}
-
 /// Ask `question` and wait for the final edit whose text `done` accepts.
 async fn ask(
     client: &AgentClient,
@@ -371,58 +344,6 @@ async fn say(client: &AgentClient, room: &OwnedRoomId, text: &str) -> String {
         .await
         .expect("ask")
         .to_string()
-}
-
-/// Wait for the agent's final edit, answering the event `sent`, whose text
-/// `done` accepts.
-async fn answer_to(
-    seen: &Arc<Mutex<Vec<(Instant, Value)>>>,
-    agent: &OwnedUserId,
-    sent: &str,
-    question: &str,
-    done: &dyn Fn(&str) -> bool,
-) -> Seen {
-    let deadline = Instant::now() + Duration::from_secs(180);
-    loop {
-        let events: Vec<Value> = seen
-            .lock()
-            .expect("lock")
-            .iter()
-            .map(|(_, v)| v.clone())
-            .collect();
-        let anchor = events.iter().find(|e| {
-            e["sender"] == agent.as_str()
-                && e["content"][events::TURN].is_object()
-                && events.iter().any(|q| q["event_id"] == sent)
-                && e["origin_server_ts"].as_u64()
-                    >= events
-                        .iter()
-                        .find(|q| q["event_id"] == sent)
-                        .and_then(|q| q["origin_server_ts"].as_u64())
-        });
-        if let Some(anchor) = anchor {
-            let anchor_id = anchor["event_id"].as_str().expect("id").to_owned();
-            let edits: Vec<&Value> = events
-                .iter()
-                .filter(|e| e["content"]["m.relates_to"]["event_id"] == anchor_id.as_str())
-                .collect();
-            if let Some(last) = edits.last() {
-                let text = last["content"]["m.new_content"]["body"]
-                    .as_str()
-                    .unwrap_or_default();
-                if done(text) {
-                    let mut times = vec![anchor["origin_server_ts"].as_u64().expect("ts")];
-                    times.extend(edits.iter().filter_map(|e| e["origin_server_ts"].as_u64()));
-                    return Seen {
-                        times,
-                        final_text: text.to_owned(),
-                    };
-                }
-            }
-        }
-        assert!(Instant::now() < deadline, "no answer to {question:?}");
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
 }
 
 /// `(anchor_ms, final_ms)` of every answered turn in the host's log.
@@ -1364,52 +1285,6 @@ async fn heard_event_is_validated_and_logged_once() {
     );
 }
 
-/// A message's text: its string content, or its text parts joined.
-fn message_text(message: &Value) -> String {
-    match &message["content"] {
-        Value::String(text) => text.clone(),
-        Value::Array(parts) => parts
-            .iter()
-            .filter_map(|part| part["text"].as_str())
-            .collect::<Vec<_>>()
-            .join("\n"),
-        _ => String::new(),
-    }
-}
-
-/// The model of the attachments test: it reads, with `drive_read`, every
-/// `.txt` and `.csv` its newest user message lists under "Attached files",
-/// one call a round, then answers with what the reads returned.
-fn reads_attachments(messages: &[Value]) -> Value {
-    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    let start = messages
-        .iter()
-        .rposition(|m| m["role"] == "user")
-        .unwrap_or(0);
-    let said = message_text(&messages[start]);
-    let files: Vec<String> = said
-        .lines()
-        .filter_map(|line| line.trim().strip_prefix("- smoke:"))
-        .filter(|path| path.ends_with(".txt") || path.ends_with(".csv"))
-        .map(str::to_owned)
-        .collect();
-    let read: Vec<String> = messages[start + 1..]
-        .iter()
-        .filter(|m| m["role"] == "tool")
-        .map(message_text)
-        .collect();
-    if let Some(next) = files.get(read.len()) {
-        let id = format!(
-            "call_{}",
-            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        );
-        let args = json!({ "path": next }).to_string();
-        return json!({"model":"stub","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":id,"type":"function","function":{"name":"drive_read","arguments":args}}]},"finish_reason":"tool_calls"}]});
-    }
-    let answer = format!("From the files: {}", read.join(" | "));
-    json!({"model":"stub","choices":[{"index":0,"delta":{"content":answer},"finish_reason":"stop"}]})
-}
-
 /// Story 101.2 #5 (R417), live: a PDF with a caption and a bare CSV, sent
 /// into an agent's DM encrypted, as keeper sends them, are each a turn the
 /// host downloads and stores; the agent reads the PDF's text and the CSV
@@ -1508,5 +1383,36 @@ async fn a_pdf_and_a_csv_sent_into_the_dm_are_answered_from_their_content() {
         host.log_text().contains("did not wholly reach the agent"),
         "{}",
         host.log_text()
+    );
+}
+
+/// Story 102.4 #5 (R417, R381), live: every kind of file keeper's composer
+/// sends — a photo, a photo larger than a Claude model is shown, a PDF, a
+/// CSV, a text file, a recording, a video and a HEIC photo — sent into an
+/// agent's DM encrypted, as matrix-sdk sends them, is a turn its host takes
+/// and answers: what the model can read it reads, the large photo reaches
+/// it as a JPEG copy within Anthropic's limit, and what it cannot hear,
+/// watch or see is said under the answer.
+#[ignore = "live: Synapse on delectra"]
+#[tokio::test(flavor = "multi_thread")]
+async fn every_kind_of_file_sent_into_the_dm_is_answered() {
+    let smoke = Smoke::from_env();
+    let agent = smoke.user("nixi-smoke");
+    smoke.set_ratelimit(&agent, 0, 0).await;
+    // A Claude model's name, whichever gateway serves it: 5 MB a picture.
+    let model = Model {
+        base_url: scripted(tells_what_it_got),
+        target: "claude-smoke".to_owned(),
+        token: None,
+    };
+    let mut host = host(&smoke, "nixi-smoke", "NIXI_SMOKE_PASSWORD", &model, None).await;
+    host.start();
+    host.wait_serving(&host.room.clone()).await;
+    let dir = host.root.path().join("person");
+    let (client, seen, _sync) = person(&smoke, &dir, &host.room).await;
+    every_kind_is_answered(&client, &seen, &agent, &host.room, &|| host.log_text()).await;
+    assert!(
+        host.log_text().contains("did not wholly reach the agent"),
+        "the recording's note is a WARN line too"
     );
 }

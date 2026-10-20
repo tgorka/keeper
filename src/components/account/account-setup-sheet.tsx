@@ -50,7 +50,6 @@ import {
   accountCancelSignIn,
   accountSetupConfirm,
   accountSetupResolve,
-  accountSignInLink,
   type DeviceClassVm,
   type OrgAccountVm,
 } from "@/lib/ipc/client";
@@ -410,13 +409,11 @@ function SetupFlow({ link }: { link: string }) {
         {phase.kind === "working" && (
           <>
             <Waiting sentence={progress?.sentence ?? null} />
+            {progress?.signInLink !== undefined && <SignInLink link={progress.signInLink} />}
             {progress?.state === "signingIn" && (
-              <>
-                <SignInLink fetchLink={accountSignInLink} />
-                <Button type="button" variant="outline" className="w-fit" onClick={cancelSignIn}>
-                  {SETUP_CANCEL_SIGN_IN_LABEL}
-                </Button>
-              </>
+              <Button type="button" variant="outline" className="w-fit" onClick={cancelSignIn}>
+                {SETUP_CANCEL_SIGN_IN_LABEL}
+              </Button>
             )}
             {cancelError !== null && (
               <p role="alert" className="text-destructive">

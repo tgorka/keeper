@@ -198,33 +198,68 @@ fn probe_git() -> Option<String> {
 /// Refuse accidental privileged values BEFORE option_env! can embed them in a
 /// binary. This reads only the two designated public build inputs and never
 /// formats their values, even in errors.
+///
+/// The environment first; when it carries neither value, the
+/// `posthog-client.env` beside this script — the phone builds' channel
+/// (`scripts/lib/posthog-client.sh`, 102.1 #5), because neither the Xcode
+/// script phase nor a long-lived Gradle daemon reliably passes an export
+/// through. A pair read from the file is handed to `option_env!` as
+/// `rustc-env`.
 fn validate_public_observability_config() {
     println!("cargo:rerun-if-env-changed=KEEPER_POSTHOG_HOST");
     println!("cargo:rerun-if-env-changed=KEEPER_POSTHOG_PROJECT_TOKEN");
+    println!("cargo:rerun-if-changed=posthog-client.env");
     let host = std::env::var("KEEPER_POSTHOG_HOST");
     let token = std::env::var("KEEPER_POSTHOG_PROJECT_TOKEN");
     if matches!(&host, Err(std::env::VarError::NotPresent))
         && matches!(&token, Err(std::env::VarError::NotPresent))
     {
+        let Some((host, token)) = stamped_public_observability_config() else {
+            return;
+        };
+        assert!(public_pair_valid(&host, &token), "Observability requires an HTTPS origin and a public phc_ project token; the values in posthog-client.env are not shown.");
+        println!("cargo:rustc-env=KEEPER_POSTHOG_HOST={host}");
+        println!("cargo:rustc-env=KEEPER_POSTHOG_PROJECT_TOKEN={token}");
         return;
     }
-    let valid = host.ok().zip(token.ok()).is_some_and(|(host, token)| {
-        let Ok(url) = url::Url::parse(&host) else {
-            return false;
-        };
-        url.scheme() == "https"
-            && url.host_str().is_some()
-            && url.username().is_empty()
-            && url.password().is_none()
-            && url.query().is_none()
-            && url.fragment().is_none()
-            && url.path() == "/"
-            && host.len() <= 256
-            && token.starts_with("phc_")
-            && (12..=200).contains(&token.len())
-            && token
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'_')
-    });
+    let valid = host
+        .ok()
+        .zip(token.ok())
+        .is_some_and(|(host, token)| public_pair_valid(&host, &token));
     assert!(valid, "Observability requires an HTTPS origin and a public phc_ project token; supplied values are not shown.");
+}
+
+/// The pair `scripts/lib/posthog-client.sh` stamped, when the file is there
+/// and names both.
+fn stamped_public_observability_config() -> Option<(String, String)> {
+    let text = std::fs::read_to_string("posthog-client.env").ok()?;
+    let value = |key: &str| {
+        text.lines()
+            .find_map(|line| line.strip_prefix(key)?.strip_prefix('='))
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+    };
+    Some((
+        value("KEEPER_POSTHOG_HOST")?,
+        value("KEEPER_POSTHOG_PROJECT_TOKEN")?,
+    ))
+}
+
+fn public_pair_valid(host: &str, token: &str) -> bool {
+    let Ok(url) = url::Url::parse(host) else {
+        return false;
+    };
+    url.scheme() == "https"
+        && url.host_str().is_some()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none()
+        && url.path() == "/"
+        && host.len() <= 256
+        && token.starts_with("phc_")
+        && (12..=200).contains(&token.len())
+        && token
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }

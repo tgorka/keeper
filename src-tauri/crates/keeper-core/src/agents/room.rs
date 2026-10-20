@@ -16,13 +16,14 @@
 //! newer `v` — is shown as *unreadable*, never dropped.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::future::Future;
 use std::sync::{Arc, Mutex, RwLock};
 
 use chrono::{DateTime, Utc};
 use matrix_sdk::deserialized_responses::{EncryptionInfo, VerificationLevel, VerificationState};
 use matrix_sdk::event_cache::RoomEventCacheUpdate;
 use matrix_sdk::ruma::events::room::power_levels::RoomPowerLevels;
-use matrix_sdk::ruma::events::AnySyncTimelineEvent;
+use matrix_sdk::ruma::events::{AnySyncTimelineEvent, AnyTimelineEvent};
 use matrix_sdk::ruma::room::RoomType;
 use matrix_sdk::ruma::room_version_rules::RoomVersionRules;
 use matrix_sdk::ruma::serde::Raw;
@@ -537,11 +538,23 @@ pub struct AgentStatusVm {
     pub avatar: Option<String>,
     /// The small marker while the agent searches the web without asking
     /// (R457): [`crate::agents::web_search::UNASKED_MARK`], where its home
-    /// is on this device and says so. Absent elsewhere and at every other
+    /// is on this device and says so and the host serving it says it names
+    /// a search engine (story 102.3). Absent elsewhere and at every other
     /// level.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub searches_unasked: Option<String>,
+    /// What the host serving the agent makes of the web search it asks for,
+    /// when it cannot honour it or does not say (story 102.3): a warning
+    /// sentence, drawn in place of the globe. On every device while that
+    /// host's status says it names no engine for it (R483,
+    /// [`crate::agents::web_search::no_engine`]); where the home is on this
+    /// device, also as the hosts serving it say
+    /// ([`crate::agents::web_search::host_note`]). Absent while it asks for
+    /// none and while the host searches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub web_search: Option<String>,
     /// The standing full-access warning (story 101.5, R420, R440 09) when
     /// the host serving the agent says its console runs at `full`: the
     /// header's marker and its sentence, on every device. Absent elsewhere.
@@ -811,6 +824,17 @@ impl AgentRoomState {
         }
     }
 
+    /// What the newest status says of its host's run, with an unreadable one
+    /// its own state — never no status, never idle (story 102.4, R489/06).
+    pub fn host_run(&self) -> crate::agents::turn_marks::HostRun {
+        use crate::agents::turn_marks::HostRun;
+        match &self.status {
+            None => HostRun::NoStatus,
+            Some((at, StatusRead::Read(status))) => HostRun::Read(status.run, *at),
+            Some((_, StatusRead::Unreadable { .. })) => HostRun::Unreadable,
+        }
+    }
+
     /// The session's kind, the agent working it and its title, from the
     /// newest readable status, with that status's time: what an agent room's
     /// row is drawn by (R399) and what [`AgentKinds`] keeps (R416).
@@ -946,7 +970,8 @@ fn handle(agent: &UserId, host: Option<&str>) -> String {
 /// What a status says of its agent's console (story 101.5, R440 09): the
 /// standing full-access warning naming `name`, and the header's other
 /// sentence — "console: unknown" for a status without a console, from a
-/// host older than it, and never a safe console; else how many of its
+/// host older than it, and never a safe console; a console off because
+/// `host`'s sandbox failed its probe (story 102.3); else how many of its
 /// folders `host` does not give its commands.
 fn console_of(
     console: Option<&crate::agents::events::StatusConsole>,
@@ -957,10 +982,15 @@ fn console_of(
     let Some(said) = console else {
         return (None, Some(console::CONSOLE_UNKNOWN.to_owned()));
     };
+    let note = if said.mode == RunMode::Off && said.no_sandbox {
+        Some(console::sandbox_failed(name, host))
+    } else {
+        (said.mode.sandboxes() && said.refused > 0)
+            .then(|| console::folders_not_given(said.refused, host))
+    };
     (
         (said.mode == RunMode::Full).then(|| console::full_access_warning(name)),
-        (said.mode.sandboxes() && said.refused > 0)
-            .then(|| console::folders_not_given(said.refused, host)),
+        note,
     )
 }
 
@@ -975,6 +1005,9 @@ fn status_vm(
             let agent_name = name(&status.agent);
             let (full_access, console) =
                 console_of(status.console.as_ref(), &agent_name, &status.host);
+            let no_engine = status.console.is_some_and(|console| console.no_engine);
+            let (searches_unasked, web_search) =
+                icons.searching(&status.agent, &agent_name, Some(&status.host), no_engine);
             AgentStatusVm {
                 agent: status.agent.to_string(),
                 agent_name,
@@ -982,7 +1015,8 @@ fn status_vm(
                 icon: icons.get(&status.agent),
                 model: icons.model(&status.agent),
                 avatar: picture(&status.agent),
-                searches_unasked: icons.unasked_mark(&status.agent),
+                searches_unasked,
+                web_search,
                 full_access,
                 console,
                 host: Some(status.host.clone()),
@@ -1008,7 +1042,12 @@ fn status_vm(
             icon: icons.get(agent),
             model: icons.model(agent),
             avatar: picture(agent),
-            searches_unasked: icons.unasked_mark(agent),
+            searches_unasked: icons
+                .searching(agent, &name(agent), host.as_deref(), false)
+                .0,
+            web_search: icons
+                .searching(agent, &name(agent), host.as_deref(), false)
+                .1,
             full_access: None,
             // A status keeper cannot read says nothing of a console: not a
             // safe one.
@@ -1034,9 +1073,13 @@ pub struct AgentIcons {
     /// Each agent's model line, replaced on each scan beside the marks
     /// (100.2 #7).
     models: RwLock<BTreeMap<OwnedUserId, crate::agents::model::AgentModelLineVm>>,
-    /// Bumped when the agents, their marks, their models or their pictures
-    /// change, so an open room's header and briefs redraw without waiting
-    /// for its next event.
+    /// The live hosts serving this person's agents, as this device last
+    /// read their manifests (story 102.3): `None` before a read and when
+    /// the last one failed.
+    hosts: RwLock<Option<Vec<crate::agents::model::ServingHost>>>,
+    /// Bumped when the agents, their marks, their models, their pictures or
+    /// their serving hosts change, so an open room's header and briefs
+    /// redraw without waiting for its next event.
     changes: watch::Sender<u64>,
 }
 
@@ -1047,8 +1090,10 @@ struct Zone {
     avatars: BTreeMap<OwnedUserId, ZoneAvatar>,
     /// The agents whose home's picture is an object not on this device.
     not_here: BTreeSet<OwnedUserId>,
-    /// The agents whose home says they search the web without asking.
-    unasked: BTreeSet<OwnedUserId>,
+    /// Each agent whose home asks for web search, at its level (R457), and
+    /// its home as `<drive>/<id>`, which binds it to the hosts that say
+    /// they serve it (R483).
+    searching: BTreeMap<OwnedUserId, (crate::agents::web_search::WebSearchLevel, Option<String>)>,
     /// What each home's scan did not use, as last warned.
     problems: BTreeMap<OwnedUserId, Vec<AvatarProblem>>,
 }
@@ -1065,9 +1110,12 @@ pub struct ZoneAgent {
     /// Its home's picture is a git-LFS pointer whose object is not on this
     /// device: the letter is drawn, not the profile avatar (R414).
     pub not_here: bool,
-    /// Its home says it searches the web without asking (R457), and it is
-    /// an agent that is offered a search at all.
-    pub searches_unasked: bool,
+    /// The web search its home asks for (R457): `Off` as well for an agent
+    /// that is never offered a search.
+    pub web_search: crate::agents::web_search::WebSearchLevel,
+    /// Its home as `<drive>/<id>`: which agent a host manifest's `agents`
+    /// names (story 102.3, R483).
+    pub home: Option<String>,
 }
 
 /// Where a home's picture is on this device: its sync profile, the
@@ -1103,8 +1151,9 @@ impl AgentIcons {
             if !agent.problems.is_empty() {
                 zone.problems.insert(user.clone(), agent.problems);
             }
-            if agent.searches_unasked {
-                zone.unasked.insert(user.clone());
+            if agent.web_search != crate::agents::web_search::WebSearchLevel::Off {
+                zone.searching
+                    .insert(user.clone(), (agent.web_search, agent.home));
             }
             zone.agents.insert(user);
         }
@@ -1164,15 +1213,67 @@ impl AgentIcons {
             .contains(user)
     }
 
-    /// The header's marker for `user` while its home on this device says
-    /// it searches the web without asking (R457).
-    pub fn unasked_mark(&self, user: &UserId) -> Option<String> {
-        self.zone
+    /// The header's web search for `user` served by `host` (R457; story
+    /// 102.3): the warning [`crate::agents::web_search::no_engine`] on every
+    /// device — this one holding the agent's drive or not — while that
+    /// host's status says the agent asks for a search it has no engine for
+    /// (`no_engine`, R483); else the globe's marker while its home on this
+    /// device says it searches without asking and the host serving that
+    /// home says it names a search engine; else the warning
+    /// [`crate::agents::web_search::host_note`] says while the home asks for
+    /// a search that host cannot run or does not say it runs.
+    pub fn searching(
+        &self,
+        user: &UserId,
+        name: &str,
+        host: Option<&str>,
+        no_engine: bool,
+    ) -> (Option<String>, Option<String>) {
+        use crate::agents::web_search::{self, host_note, WebSearchLevel, UNASKED_MARK};
+        if let (true, Some(host)) = (no_engine, host) {
+            return (None, Some(web_search::no_engine(name, host)));
+        }
+        let (level, home) = self
+            .zone
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .unasked
-            .contains(user)
-            .then(|| crate::agents::web_search::UNASKED_MARK.to_owned())
+            .searching
+            .get(user)
+            .cloned()
+            .unwrap_or((WebSearchLevel::Off, None));
+        let hosts = self
+            .hosts
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let note = host_note(name, level, host, home.as_deref(), hosts.as_deref());
+        let mark = (level == WebSearchLevel::WithoutAsking && note.is_none())
+            .then(|| UNASKED_MARK.to_owned());
+        (mark, note)
+    }
+
+    /// Replace the serving hosts with `hosts` as this device read them now,
+    /// `None` when it could not (story 102.3): the headers redraw on a
+    /// change.
+    pub fn replace_hosts(&self, hosts: Option<Vec<crate::agents::model::ServingHost>>) {
+        {
+            let mut held = self
+                .hosts
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if *held == hosts {
+                return;
+            }
+            *held = hosts;
+        }
+        self.changes.send_modify(|n| *n = n.wrapping_add(1));
+    }
+
+    /// The serving hosts as this device last read them (story 102.3).
+    pub fn hosts(&self) -> Option<Vec<crate::agents::model::ServingHost>> {
+        self.hosts
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     /// `user`'s mark, when its zone is on this device.
@@ -1537,6 +1638,179 @@ async fn listed_proxies(room: &Room) -> BTreeSet<OwnedUserId> {
     }
 }
 
+/// What one look of the seat finder found ([`HeaderReader::find`], story
+/// 102.5, R468).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Found {
+    /// The room has a seat now: a status was read, or one was kept.
+    Seat,
+    /// The room's history ended with no status: searched empty (R416).
+    Empty,
+    /// The room's history ended with no status, but an event on the way
+    /// could not be decrypted: a status may be in it, read once its key
+    /// arrives, so the next look starts over from the newest page (R513).
+    Unreadable,
+    /// The look stopped at its page budget; the next one goes on from here.
+    Further(Resume),
+    /// A request failed: the next look starts where this one did.
+    Failed,
+}
+
+/// Where a search of a room's history goes on from: the token the last
+/// search stopped at, and whether an event before it could not be
+/// decrypted — a search that reaches the room's beginning after one did
+/// not search it empty (R513).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Resume {
+    pub from: String,
+    pub unreadable: bool,
+}
+
+/// Where a search of a room's history back for a status ended.
+enum Search {
+    /// A status was read.
+    Status,
+    /// The room's beginning, with no status.
+    Start,
+    /// The page budget; the next search goes on from here.
+    Budget(Resume),
+    /// A request failed.
+    Failed,
+}
+
+/// What a search of a room's history for its newest status found: the
+/// status and scope events it read, newest page first, and where it ended.
+/// It searched the history empty only when it reached the room's beginning
+/// with no status and read every event on the way: a failed request is not
+/// that, neither is a search that stopped at its page budget (R416), and
+/// neither is one that met an event the device could not decrypt (R513) —
+/// a status may be in it, read once its key arrives.
+pub struct HeaderFound {
+    events: Vec<Value>,
+    end: Search,
+    unreadable: bool,
+}
+
+impl HeaderFound {
+    fn searched_empty(&self) -> bool {
+        matches!(self.end, Search::Start) && !self.unreadable
+    }
+}
+
+/// Search `room`'s history on the server back for a status `own`'s account
+/// trusts under `levels`, from `from` (`None`: the newest page), at most
+/// `pages` pages of [`HEADER_PAGE`] (`None`: until the beginning). Every
+/// page is read by [`history_page`], past the room's event cache: the
+/// header's search of an opened room and the seat finder's look alike
+/// never meet anyone's pagination (R510).
+async fn page_back(
+    room: Room,
+    own: OwnedUserId,
+    levels: Option<RoomPowerLevels>,
+    from: Option<Resume>,
+    pages: Option<usize>,
+) -> HeaderFound {
+    let mut state = AgentRoomState::new(own);
+    let (mut from, unreadable) = match from {
+        Some(resume) => (Some(resume.from), resume.unreadable),
+        None => (None, false),
+    };
+    let mut found = HeaderFound {
+        events: Vec::new(),
+        end: Search::Failed,
+        unreadable,
+    };
+    for _ in 0..pages.unwrap_or(usize::MAX) {
+        let Some(page) = history_page(&room, from.take()).await else {
+            return found;
+        };
+        found.unreadable |= page.unreadable;
+        let mut events: Vec<Value> = page.events.iter().filter_map(header_event).collect();
+        events.reverse();
+        for event in &events {
+            state.apply(event, &|user| holds_agent_power(levels.as_ref(), user));
+        }
+        found.events.extend(events);
+        if state.has_status() {
+            found.end = Search::Status;
+            return found;
+        }
+        match page.end {
+            Some(end) if !page.events.is_empty() || page.unreadable => from = Some(end),
+            _ => {
+                // Empty only when every event on the way was read: an
+                // undecryptable one leaves the search to run again at the
+                // room's next open or look (R513).
+                found.end = Search::Start;
+                return found;
+            }
+        }
+    }
+    if let Some(from) = from {
+        found.end = Search::Budget(Resume {
+            from,
+            unreadable: found.unreadable,
+        });
+    }
+    found
+}
+
+/// One page of a room's history as [`history_page`] read it.
+struct HistoryPage {
+    /// Newest first, decrypted where the device could.
+    events: Vec<Raw<AnySyncTimelineEvent>>,
+    /// The token that continues it.
+    end: Option<String>,
+    /// Whether an event on it could not be decrypted.
+    unreadable: bool,
+}
+
+/// One page of `room`'s history from the server, newest first, from `from`
+/// (`None`: the newest); `None` when the request failed. Read past the
+/// room's event cache (R510): `Room::messages` saves what it reads into the
+/// cache, under the lock its pagination takes, and with a timeline page in
+/// flight a page was seen never to reach the server. A page read here is
+/// decrypted where it can be and kept nowhere, so the header's search
+/// cannot meet any caller's pagination.
+async fn history_page(room: &Room, from: Option<String>) -> Option<HistoryPage> {
+    use matrix_sdk::ruma::api::client::message::get_message_events;
+    use matrix_sdk::ruma::api::Direction;
+    let mut request =
+        get_message_events::v3::Request::new(room.room_id().to_owned(), Direction::Backward);
+    request.from = from;
+    request.limit = HEADER_PAGE.into();
+    let response = room.client().send(request).await.ok()?;
+    let mut page = HistoryPage {
+        events: Vec::with_capacity(response.chunk.len()),
+        end: response.end,
+        unreadable: false,
+    };
+    for event in response.chunk {
+        match readable(room, event).await {
+            Some(event) => page.events.push(event),
+            None => page.unreadable = true,
+        }
+    }
+    Some(page)
+}
+
+/// `event` decrypted when it is an encrypted message, as it came when it is
+/// not one; `None` when the device cannot decrypt it (yet).
+async fn readable(room: &Room, event: Raw<AnyTimelineEvent>) -> Option<Raw<AnySyncTimelineEvent>> {
+    use matrix_sdk::ruma::events::{AnySyncMessageLikeEvent, SyncMessageLikeEvent};
+    if let Ok(AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomEncrypted(
+        SyncMessageLikeEvent::Original(_),
+    ))) = event.deserialize_as::<AnySyncTimelineEvent>()
+    {
+        // The SDK answers a missing key with a UTD event, not an error.
+        return match room.decrypt_event(event.cast_ref_unchecked(), None).await {
+            Ok(decrypted) if !decrypted.kind.is_utd() => Some(decrypted.into_raw()),
+            _ => None,
+        };
+    }
+    Some(event.cast())
+}
+
 /// A session room's header reader: the folded state, what it last read of
 /// whose brief to draw ([`Trust`]) and the room it reads.
 pub struct HeaderReader {
@@ -1557,6 +1831,11 @@ pub struct HeaderReader {
     /// Where the person stopped listening to the room's answers (97.3,
     /// UX-DR143), as their own devices marked it.
     marks: RoomMarks,
+    /// The newest origin time (ms) of any event in the room's cache that a
+    /// sender holding an agent's power sent — a claim renewal, a status, a
+    /// message: whether its host wrote after a person's message (story
+    /// 102.4, R465). `None` before one.
+    agent_wrote: Option<u64>,
 }
 
 impl HeaderReader {
@@ -1565,7 +1844,8 @@ impl HeaderReader {
     /// as the host's `latest_status` does. A history that ended without a
     /// status is not searched again in this process; one whose search
     /// stopped at its page budget is (R416): a status further back is out of
-    /// this look's reach, not absent. Only its power levels are read for
+    /// this look's reach, not absent — and so is one that met an event the
+    /// device could not decrypt (R513). Only its power levels are read for
     /// that; whose brief to draw is [`Self::refresh`]'s.
     pub async fn open(room: Room, kinds: &AgentKinds) -> HeaderReader {
         Self::open_with(room, kinds, true, Some(HEADER_PAGES)).await
@@ -1580,11 +1860,66 @@ impl HeaderReader {
         Self::open_with(room, kinds, true, None).await
     }
 
-    /// [`Self::open`] for a row (a proxy room's admission): a room whose
-    /// seat `kinds` keeps is drawn by it and its history is not searched —
-    /// a listing looks at every agent room, and a seat answers it.
+    /// [`Self::open`] for a row (a proxy room as a listing reads it): the
+    /// event cache and the seat `kinds` keeps, and never the server — a
+    /// listing looks at every agent room, and a status out of the cache's
+    /// reach is the seat finder's to look for ([`Self::find`], story 102.5,
+    /// R468).
     pub async fn open_row(room: Room, kinds: &AgentKinds) -> HeaderReader {
+        Self::open_with(room, kinds, false, Some(0)).await
+    }
+
+    /// [`Self::open`] for one room the person acts in (an admission: a
+    /// send, a scope, a push's answer): a room whose seat `kinds` keeps is
+    /// drawn by it and its history is not searched; one with no seat is
+    /// searched back [`HEADER_PAGES`] pages, as a row once was (R416).
+    pub async fn open_admitting(room: Room, kinds: &AgentKinds) -> HeaderReader {
         Self::open_with(room, kinds, false, Some(HEADER_PAGES)).await
+    }
+
+    /// The seat finder's one look at `room` (story 102.5, R416, R468): a
+    /// status in the event cache or a seat `kinds` keeps answers it at once;
+    /// a history already searched empty is not searched again; otherwise the
+    /// server's history is searched back from `from` (`None`: the newest
+    /// page) at most `pages` pages, and a status found there is kept as the
+    /// room's seat. The look reads as the header's search does, past the
+    /// event cache (R510): it never writes into the cache and never meets
+    /// the person's pagination of the same room.
+    pub async fn find(room: Room, kinds: &AgentKinds, from: Option<Resume>, pages: usize) -> Found {
+        let mut reader = Self::open_row(room, kinds).await;
+        let (own, room_id) = (reader.room.own_user_id(), reader.room.room_id());
+        if reader.state.has_status() || kinds.seat(own, room_id).is_some() {
+            return Found::Seat;
+        }
+        if kinds.searched_empty(own, room_id) {
+            return Found::Empty;
+        }
+        let searched = page_back(
+            reader.room.clone(),
+            own.to_owned(),
+            reader.trust.levels.clone(),
+            from,
+            Some(pages),
+        )
+        .await;
+        for event in &searched.events {
+            reader.apply(event);
+        }
+        let found = match searched.end {
+            Search::Status => Found::Seat,
+            Search::Start if searched.unreadable => Found::Unreadable,
+            Search::Start => Found::Empty,
+            Search::Budget(resume) => Found::Further(resume),
+            Search::Failed => Found::Failed,
+        };
+        match &found {
+            Found::Seat => reader.remember(kinds),
+            Found::Empty => {
+                kinds.note_searched_empty(reader.room.own_user_id(), reader.room.room_id())
+            }
+            Found::Unreadable | Found::Further(_) | Found::Failed => {}
+        }
+        found
     }
 
     async fn open_with(
@@ -1593,6 +1928,26 @@ impl HeaderReader {
         seated_pages: bool,
         pages: Option<usize>,
     ) -> HeaderReader {
+        let mut reader = Self::read_cached(room).await;
+        if seated_pages
+            || kinds
+                .seat(reader.room.own_user_id(), reader.room.room_id())
+                .is_none()
+        {
+            if let Some(search) = reader.search_with(kinds, pages) {
+                let found = search.await;
+                reader.fold_found(found, kinds);
+            }
+        }
+        reader.remember(kinds);
+        reader
+    }
+
+    /// Read `room`'s status, scope, marks and approvals from its event cache
+    /// alone: no seat is looked at, nothing is kept and the server is never
+    /// asked. What an opened room's first batch is drawn from (102.6, R468);
+    /// [`Self::search`] reaches further back afterwards.
+    pub async fn read_cached(room: Room) -> HeaderReader {
         let mut reader = HeaderReader {
             state: AgentRoomState::new(room.own_user_id().to_owned()),
             trust: Trust {
@@ -1605,10 +1960,12 @@ impl HeaderReader {
             approvals: ApprovalFold::default(),
             approvals_stale: false,
             marks: RoomMarks::default(),
+            agent_wrote: None,
         };
         if let Ok((cache, _handles)) = reader.room.event_cache().await {
             if let Ok(events) = cache.events().await {
                 for event in &events {
+                    reader.wrote(event.raw());
                     if let Some(value) = header_event(event.raw()) {
                         reader.apply(&value);
                     } else if event_type(event.raw()) == Some(HEARD) {
@@ -1618,51 +1975,55 @@ impl HeaderReader {
             }
         }
         reader.approvals = approvals_of(&reader.room).await;
-        if !reader.state.has_status()
-            && (seated_pages
-                || kinds
-                    .seat(reader.room.own_user_id(), reader.room.room_id())
-                    .is_none())
-            && !kinds.searched_empty(reader.room.own_user_id(), reader.room.room_id())
-            && reader.page_back(pages).await
-        {
-            kinds.note_searched_empty(reader.room.own_user_id(), reader.room.room_id());
-        }
-        reader.remember(kinds);
         reader
     }
 
-    /// Search the server's history back for a status, at most `pages` pages
-    /// (`None`: until the beginning); returns whether the search reached the
-    /// room's beginning and found none. A failed request is not that, and
-    /// neither is a search that stopped at its page budget.
-    async fn page_back(&mut self, pages: Option<usize>) -> bool {
-        use matrix_sdk::room::MessagesOptions;
-        let mut from: Option<String> = None;
-        for _ in 0..pages.unwrap_or(usize::MAX) {
-            let mut options = MessagesOptions::backward().from(from.as_deref());
-            options.limit = HEADER_PAGE.into();
-            let Ok(page) = self.room.messages(options).await else {
-                return false;
-            };
-            let mut events: Vec<Value> = page
-                .chunk
-                .iter()
-                .filter_map(|event| header_event(event.raw()))
-                .collect();
-            events.reverse();
-            for event in &events {
-                self.apply(event);
-            }
-            if self.state.has_status() {
-                return false;
-            }
-            match page.end {
-                Some(end) if !page.chunk.is_empty() => from = Some(end),
-                _ => return true,
-            }
+    /// The search of the server's history an opened room's header still
+    /// needs, as [`Self::open`] runs it (R416: [`HEADER_PAGES`] pages,
+    /// seated or not): `None` when a status is already read or the room's
+    /// whole history was searched empty before. The search owns what it
+    /// reads, so it runs beside the timeline (102.6) and is folded in by
+    /// [`Self::fold_found`].
+    pub fn search(
+        &self,
+        kinds: &AgentKinds,
+    ) -> Option<impl Future<Output = HeaderFound> + Send + 'static> {
+        self.search_with(kinds, Some(HEADER_PAGES))
+    }
+
+    fn search_with(
+        &self,
+        kinds: &AgentKinds,
+        pages: Option<usize>,
+    ) -> Option<impl Future<Output = HeaderFound> + Send + 'static> {
+        if self.state.has_status()
+            || kinds.searched_empty(self.room.own_user_id(), self.room.room_id())
+        {
+            return None;
         }
-        false
+        Some(page_back(
+            self.room.clone(),
+            self.room.own_user_id().to_owned(),
+            self.trust.levels.clone(),
+            None,
+            pages,
+        ))
+    }
+
+    /// Fold what a [`Self::search`] found, newest status and scope winning
+    /// by their time as with any event; a search that reached the room's
+    /// beginning with no status is noted, and the seat the status names is
+    /// kept. Returns whether the header may have changed.
+    pub fn fold_found(&mut self, found: HeaderFound, kinds: &AgentKinds) -> bool {
+        let mut changed = false;
+        for event in &found.events {
+            changed |= self.apply(event);
+        }
+        if found.searched_empty() && !self.state.has_status() {
+            kinds.note_searched_empty(self.room.own_user_id(), self.room.room_id());
+        }
+        self.remember(kinds);
+        changed
     }
 
     /// Fold the person's mark of where they stopped listening, if `event`
@@ -1675,13 +2036,38 @@ impl HeaderReader {
         self.marks.apply(&value, self.room.own_user_id(), sealed)
     }
 
+    /// Note `raw`'s time when an agent of the room sent it; returns whether
+    /// the newest such time moved.
+    fn wrote(&mut self, raw: &Raw<AnySyncTimelineEvent>) -> bool {
+        let (Ok(Some(sender)), Ok(Some(at))) = (
+            raw.get_field::<OwnedUserId>("sender"),
+            raw.get_field::<u64>("origin_server_ts"),
+        ) else {
+            return false;
+        };
+        if !holds_agent_power(self.trust.levels.as_ref(), &sender)
+            || self.agent_wrote.is_some_and(|newest| newest >= at)
+        {
+            return false;
+        }
+        self.agent_wrote = Some(at);
+        true
+    }
+
+    /// The newest time an agent of the room wrote into it, as the cache
+    /// showed it ([`Self::wrote`]).
+    pub fn agent_wrote(&self) -> Option<u64> {
+        self.agent_wrote
+    }
+
     fn apply(&mut self, event: &Value) -> bool {
         let levels = self.trust.levels.as_ref();
         self.state
             .apply(event, &|user| holds_agent_power(levels, user))
     }
 
-    fn remember(&self, kinds: &AgentKinds) {
+    /// Keep the seat the status read so far names (R416).
+    pub fn remember(&self, kinds: &AgentKinds) {
         if let Some(seat) = self.state.seat() {
             kinds.insert(self.room.own_user_id(), self.room.room_id(), seat);
         }
@@ -1764,6 +2150,9 @@ impl HeaderReader {
                 _ => Vec::new(),
             };
             for event in events {
+                // Whether its host still writes: what a person's message no
+                // anchor answers is read against (R465). Not a header change.
+                self.wrote(event.raw());
                 match event_type(event.raw()) {
                     Some(STATUS | SCOPE) => {
                         if let Ok(value) = event.raw().deserialize_as::<Value>() {
@@ -2228,7 +2617,9 @@ mod tests {
     /// console — an older host's — never a safe console.
     #[test]
     fn the_console_warning_comes_from_the_serving_hosts_status() {
-        use crate::agents::console::{folders_not_given, full_access_warning, CONSOLE_UNKNOWN};
+        use crate::agents::console::{
+            folders_not_given, full_access_warning, sandbox_failed, CONSOLE_UNKNOWN,
+        };
         let with = |console: Option<Value>| {
             let mut state = AgentRoomState::new(own());
             let mut said = content("running", "electra", None);
@@ -2251,6 +2642,15 @@ mod tests {
         assert_eq!(short.console, Some(folders_not_given(2, "electra")));
         let quiet = with(Some(json!({"mode": "supervised"})));
         assert_eq!((quiet.full_access, quiet.console), (None, None));
+        // Story 102.3 #5: off by a failed sandbox is said on every device,
+        // naming the host; off by choice says nothing.
+        let failed = with(Some(json!({"mode": "off", "no_sandbox": true})));
+        assert_eq!(
+            (failed.full_access, failed.console),
+            (None, Some(sandbox_failed("Nixi", "electra")))
+        );
+        let chosen = with(Some(json!({"mode": "off"})));
+        assert_eq!((chosen.full_access, chosen.console), (None, None));
     }
 
     fn event(json: Value) -> AnySyncTimelineEvent {
@@ -2440,6 +2840,22 @@ mod tests {
             &agents
         ));
         assert_eq!(status_of(&state).run, AgentRunVm::Idle);
+    }
+
+    /// R489/06: a status this device cannot read — a newer host's — leaves
+    /// the host's run unknown: not the readable status before it, not none,
+    /// and never idle.
+    #[test]
+    fn an_unreadable_status_leaves_the_hosts_run_unknown() {
+        use crate::agents::turn_marks::HostRun;
+        let mut state = AgentRoomState::new(own());
+        assert_eq!(state.host_run(), HostRun::NoStatus);
+        assert!(state.apply(&status("$a", 10, content("idle", "electra", None)), &agents));
+        assert_eq!(state.host_run(), HostRun::Read(RunState::Idle, 10));
+        let mut newer = content("idle", "electra", Some("$a"));
+        newer["v"] = json!(u64::from(CONTENT_VERSION) + 1);
+        assert!(state.apply(&status("$b", 20, newer), &agents));
+        assert_eq!(state.host_run(), HostRun::Unreadable);
     }
 
     #[test]
@@ -3028,7 +3444,8 @@ mod tests {
                 }),
                 problems: Vec::new(),
                 not_here: false,
-                searches_unasked: false,
+                web_search: Default::default(),
+                home: None,
             },
         )])
     }
@@ -3148,7 +3565,8 @@ mod tests {
                 }),
                 problems: Vec::new(),
                 not_here: false,
-                searches_unasked: false,
+                web_search: Default::default(),
+                home: None,
             },
         );
         icons.replace(both);
@@ -3500,40 +3918,191 @@ mod tests {
         assert_eq!(model_of(&icons), None);
     }
 
-    /// R457: the header marks an agent whose home on this device says it
-    /// searches the web without asking, with keeper's sentence; a scan that
-    /// no longer says so takes the mark away, and another agent's mark is
-    /// never this one's.
+    /// R457, story 102.3 (DW-1477): the header's globe says an agent whose
+    /// home on this device searches without asking only while the host
+    /// serving it — the status's `electra` — says it names a search engine;
+    /// a host that names none, runs a build without web search, does not
+    /// say, was not read or is not live is a warning sentence instead, and
+    /// never a globe. A home asking for no search says nothing; another
+    /// agent's level is never this one's.
     #[test]
-    fn the_header_marks_an_agent_that_searches_without_asking() {
-        use crate::agents::web_search::UNASKED_MARK;
+    fn the_header_draws_the_globe_only_where_the_serving_host_searches() {
+        use crate::agents::model::ServingHost;
+        use crate::agents::web_search::{WebSearchLevel, UNASKED_MARK};
+        use WebSearchLevel::{Ask, Off, WithoutAsking};
 
         let mut state = AgentRoomState::new(own());
         state.apply(&status("$a", 10, content("idle", "electra", None)), &agents);
         let icons = AgentIcons::default();
-        let mark_of = |icons: &AgentIcons| {
-            state
-                .header(&|user| user.to_string(), icons, &|_| None, None, None)
+        let drawn = |icons: &AgentIcons| {
+            let status = state
+                .header(&|_| "Nixi".to_owned(), icons, &|_| None, None, None)
                 .status
-                .expect("a status")
-                .searches_unasked
+                .expect("a status");
+            (status.searches_unasked, status.web_search)
         };
-        let scan = |user: &str, searches_unasked| {
+        let scan = |user: &str, web_search| {
             BTreeMap::from([(
                 OwnedUserId::try_from(user).expect("user"),
                 ZoneAgent {
-                    searches_unasked,
+                    web_search,
+                    home: Some("tgdrive/nixi".to_owned()),
                     ..ZoneAgent::default()
                 },
             )])
         };
-        assert_eq!(mark_of(&icons), None, "no home here, no mark");
-        icons.replace(scan(NIXI, true));
-        assert_eq!(mark_of(&icons).as_deref(), Some(UNASKED_MARK));
-        icons.replace(scan(NIXI, false));
-        assert_eq!(mark_of(&icons), None, "asks again");
-        icons.replace(scan("@tola:example.org", true));
-        assert_eq!(mark_of(&icons), None, "another agent's");
+        let electra = |version: &str, web_search| {
+            Some(vec![ServingHost {
+                host: "electra".to_owned(),
+                version: version.to_owned(),
+                agents: vec!["tgdrive/nixi".to_owned()],
+                web_search,
+                sandbox: true,
+            }])
+        };
+        assert_eq!(drawn(&icons), (None, None), "no home here, nothing");
+        icons.replace(scan(NIXI, WithoutAsking));
+        icons.replace_hosts(electra("0.10.6", Some(true)));
+        assert_eq!(drawn(&icons), (Some(UNASKED_MARK.to_owned()), None));
+        icons.replace(scan(NIXI, Ask));
+        assert_eq!(drawn(&icons), (None, None), "asks: no globe, nothing wrong");
+        icons.replace(scan(NIXI, WithoutAsking));
+        for (hosts, says) in [
+            (
+                electra("0.10.6", Some(false)),
+                "electra names no search engine",
+            ),
+            (
+                electra("0.9.0", None),
+                "electra runs keeper 0.9.0, which has no web search",
+            ),
+            (electra("0.10.5", None), "unknown on this host"),
+            (None, "keeper could not read what electra can do now"),
+            (Some(Vec::new()), "electra has not said what it can do"),
+        ] {
+            icons.replace_hosts(hosts);
+            let (mark, note) = drawn(&icons);
+            assert_eq!(mark, None, "{says}");
+            let note = note.expect(says);
+            assert!(note.contains(says) && note.contains("Nixi"), "{note}");
+        }
+        icons.replace_hosts(electra("0.9.0", None));
+        icons.replace(scan(NIXI, Off));
+        assert_eq!(drawn(&icons), (None, None), "asks for none");
+        icons.replace(scan("@tola:example.org", WithoutAsking));
+        assert_eq!(drawn(&icons), (None, None), "another agent's");
+    }
+
+    /// R483 (review R102T1-03): the header reads only the host of that slug
+    /// that says it serves this agent. `electra` serving Lucyna for another
+    /// principal says the opposite of the `electra` serving Nixi, in either
+    /// order: Nixi's header follows Nixi's host. Two that both say they
+    /// serve Nixi and disagree, or a home keeper cannot name, are unknown.
+    #[test]
+    fn the_header_reads_the_host_serving_this_agent_not_a_same_named_one() {
+        use crate::agents::model::ServingHost;
+        use crate::agents::web_search::{WebSearchLevel, UNASKED_MARK};
+
+        let mut state = AgentRoomState::new(own());
+        state.apply(&status("$a", 10, content("idle", "electra", None)), &agents);
+        let icons = AgentIcons::default();
+        let drawn = || {
+            let status = state
+                .header(&|_| "Nixi".to_owned(), &icons, &|_| None, None, None)
+                .status
+                .expect("a status");
+            (status.searches_unasked, status.web_search)
+        };
+        let scan = |home: Option<&str>| {
+            BTreeMap::from([(
+                OwnedUserId::try_from(NIXI).expect("user"),
+                ZoneAgent {
+                    web_search: WebSearchLevel::WithoutAsking,
+                    home: home.map(str::to_owned),
+                    ..ZoneAgent::default()
+                },
+            )])
+        };
+        let electra = |agent: &str, web_search| ServingHost {
+            host: "electra".to_owned(),
+            version: "0.10.6".to_owned(),
+            agents: vec![agent.to_owned()],
+            web_search: Some(web_search),
+            sandbox: true,
+        };
+        icons.replace(scan(Some("tgdrive/nixi")));
+        for (nixis, lucynas) in [(true, false), (false, true)] {
+            let nixi = electra("tgdrive/nixi", nixis);
+            let lucyna = electra("neuradrive/lucyna", lucynas);
+            for hosts in [
+                vec![nixi.clone(), lucyna.clone()],
+                vec![lucyna.clone(), nixi.clone()],
+            ] {
+                icons.replace_hosts(Some(hosts));
+                let (mark, note) = drawn();
+                if nixis {
+                    assert_eq!((mark.as_deref(), note), (Some(UNASKED_MARK), None));
+                } else {
+                    assert_eq!(mark, None);
+                    assert!(note
+                        .expect("a warning")
+                        .contains("electra names no search engine"),);
+                }
+            }
+        }
+        icons.replace_hosts(Some(vec![
+            electra("tgdrive/nixi", true),
+            electra("tgdrive/nixi", false),
+        ]));
+        let (mark, note) = drawn();
+        assert_eq!(mark, None);
+        assert!(note.expect("ambiguous").contains("they do not agree"));
+        icons.replace_hosts(Some(vec![electra("tgdrive/nixi", true)]));
+        icons.replace(scan(None));
+        let (mark, note) = drawn();
+        assert_eq!(mark, None);
+        assert!(note.expect("no home").contains("unknown on this host"));
+    }
+
+    /// R483 (review R102T1-02): a host that names no search engine for an
+    /// agent asking for one says it on every status, so a device holding
+    /// none of the agent's drive — the iPhone, its icons empty — draws the
+    /// warning, and a later progress line does not take it away. A status
+    /// that does not say it draws nothing there.
+    #[test]
+    fn the_no_engine_warning_comes_from_the_serving_hosts_status() {
+        use crate::agents::web_search::no_engine;
+        let icons = AgentIcons::default();
+        let mut state = AgentRoomState::new(own());
+        let said = |run: &str, detail: Option<&str>, no_engine: bool| {
+            let mut content = content(run, "electra", None);
+            content["console"] = json!({"mode": "off", "no_engine": no_engine});
+            if let Some(detail) = detail {
+                content["detail"] = json!(detail);
+            }
+            content
+        };
+        let drawn = |state: &AgentRoomState| {
+            let status = state
+                .header(&|_| "Nixi".to_owned(), &icons, &|_| None, None, None)
+                .status
+                .expect("a status");
+            (status.searches_unasked, status.web_search, status.detail)
+        };
+        state.apply(&status("$a", 10, said("running", None, true)), &agents);
+        let warning = Some(no_engine("Nixi", "electra"));
+        assert_eq!(drawn(&state), (None, warning.clone(), None));
+        state.apply(
+            &status("$b", 11, said("running", Some("2 reads"), true)),
+            &agents,
+        );
+        assert_eq!(
+            drawn(&state),
+            (None, warning, Some("2 reads".to_owned())),
+            "a progress line keeps it"
+        );
+        state.apply(&status("$c", 12, said("done", None, false)), &agents);
+        assert_eq!(drawn(&state), (None, None, None));
     }
 
     #[test]

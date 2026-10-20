@@ -67,6 +67,18 @@ pub trait Platform: Send + Sync {
         self.open_url(url)
     }
 
+    /// Show the person the authorization page a sign-in is waiting on, so a
+    /// browser that did not come forward can be given it by hand (story
+    /// 102.9, R470). Called by [`crate::sign_in_link::offer`] before the page
+    /// is opened, again with a sentence when it could not be, and with `None`
+    /// when that sign-in — `flow`, unique per sign-in — ends however it ends:
+    /// the link is then taken away, never left behind. A shell routes it to
+    /// the surface that started the sign-in by wrapping the platform in
+    /// [`crate::sign_in_link::ShowsSignInLink`]; the default shows nothing.
+    fn show_sign_in_link(&self, flow: u64, link: Option<&crate::sign_in_link::SignInLinkVm>) {
+        let _ = (flow, link);
+    }
+
     /// Post a desktop notification (title + body) carrying a typed click-through
     /// [`NotifyTarget`] (Story 10.4, FR-51). The kept desktop backend has no
     /// per-notification click callback, so the shell records `target` as the "last

@@ -889,3 +889,46 @@ describe("MessageBubble — a gate room's lines (UX-DR147)", () => {
     expect(screen.getByText("Two reviewers asked for a test.")).toBeInTheDocument();
   });
 });
+
+// Story 102.4, R465: in an agent session room an own message shows whether the
+// agent's host took it — Rust's reading — in place of the read tick the
+// agent's implicit receipt would otherwise draw.
+describe("MessageBubble turn state", () => {
+  const own = { isOwn: true, sender: "@tgorka:example.org", sendState: null };
+  // The caption's read tick, apart from the receipt cluster's "Read by …".
+  const readTick = () =>
+    screen.queryByText(
+      (_, element) => element?.textContent === "Read ✓" && element.tagName === "SPAN",
+    );
+
+  it("says Taken on an own message an anchor answers, over any reader", () => {
+    render(
+      <MessageBubble
+        item={msg({ ...own, readers: ["@marta:example.org"], turn: { state: "taken" } })}
+        grouped={false}
+      />,
+    );
+    expect(screen.getByText("Taken")).toBeInTheDocument();
+    expect(readTick()).not.toBeInTheDocument();
+  });
+
+  it("says why on an own message the host did not take", () => {
+    const sentence =
+      "Nixi's host did not take this message — it may be older than this kind of message.";
+    render(
+      <MessageBubble
+        item={msg({ ...own, readers: [], turn: { state: "notTaken", sentence } })}
+        grouped={false}
+      />,
+    );
+    expect(screen.getByRole("status")).toHaveTextContent(sentence);
+    expect(screen.queryByText("Taken")).not.toBeInTheDocument();
+  });
+
+  it("draws neither while the turn state is unknown, and keeps a person's read tick", () => {
+    render(<MessageBubble item={msg({ ...own, readers: ["@marta:example.org"] })} grouped />);
+    expect(screen.queryByText("Taken")).not.toBeInTheDocument();
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+    expect(readTick()).toBeInTheDocument();
+  });
+});

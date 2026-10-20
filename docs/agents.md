@@ -419,9 +419,14 @@ refused, with a sentence beside the control and a WARN line in `keeper.log`, whe
   that way is warned about until the next release. The hosts are those agents your zones name
   announce — their manifests, not an attestation of the machine (R438);
 - the save writes such a key and this Mac could not read which hosts serve your agents: it cannot
-  tell that none is older, so nothing is written and the row says so, with a WARN naming why
-  (R436). A read that found no host at all lets the save through, and a save writing no such key
-  is not held to the hosts. The same check holds the *Web search* and *Console* saves of the row
+  tell that none is older, so nothing is written and the row says so, naming the agent, with a
+  WARN naming why (R436, R466). For a save, every control room's manifests are read from the
+  server (`GET /rooms/{id}/state`, ten seconds at most per room), every time (R484): this Mac's
+  store keeps no manifest fresh, and one whose every manifest is live still need not hold every
+  host's. Only a room the server does not answer for is "could not read". The store, and a server
+  read of the last minute, serve only what the headers and rows show (story 102.3). A read that
+  found no live host serving the agent lets the save through, and a save writing no such key is
+  not held to the hosts. The same check holds the *Web search* and *Console* saves of the row
   (R460): one host is one sentence naming every key it does not read ("… which does not read
   web_search in [tools].allow or [web_search] (keeper 0.10.4 does) …"). With such a host serving the
   agent, what still saves is what leaves the file free of those keys: a model without a level,
@@ -1585,7 +1590,44 @@ keeper's own file, and every write of it by the agent is refused (T5).
 While an agent searches **without asking**, its row shows a standing warning beside that choice —
 "Queries go to `<this Mac's engine>` and its upstream search engines without asking — they may
 contain words from your files." — and its room's header a small globe mark whose sentence says the
-same. The mark is read from the agent's home where it is on this device (a phone shows none).
+same. The level is read from the agent's home where it is on this device (a phone shows none).
+
+**What the serving host can do** (story 102.3). Each host's manifest says whether it names a search
+engine (`web_search: true|false`; a build before 102.3 says nothing). The globe is drawn only while
+the host serving the room's agent says it does; where the home asks for a search (*Ask* or *Without
+asking*) and that host names no engine, runs a keeper without web search (before 0.10.4), does not
+say, or has not been heard from, the header says so in a warning line instead — "Nixi asks for web
+search, but electra names no search engine, so it searches none there.", "electra runs keeper 0.9.0,
+which has no web search …", "… whether Nixi can search the web is unknown on this host." — and the
+agent's Settings row says the same for every live host serving it. A host is read only for the
+agents its manifest says it serves (R485): another person's host of the same name is not this
+agent's, and two of that name that say different things are "unknown". This Mac reads the
+manifests on its agents scan, from the server at most once a minute per control room. Every device,
+the phone included, also hears it from the host itself: on a host naming no engine, every status of
+an agent asking for web search says so (`console.no_engine`), and its room's header says "Nixi asks
+for web search, but electra names no search engine …" whether or not that device holds the drive,
+through every progress line of the turn.
+
+**Switching from the chat** (story 102.3, R469, R486). On this Mac, the agent's menu at the end of
+its room's header (`…`) offers *Web search* — Off / Ask / Without asking — and *Console* — the modes
+its Settings row offers, a mode it may not have disabled — as radio items. Each choice is saved by
+the very command its Settings row saves with, against what the menu showed, so the older-host
+check, the compare-and-replace and every refusal sentence are the same. *Full access* is not saved
+when it is picked: the menu first says what it gives — its description, the full-access warning and
+that no folder holds it — and saves it only on *Give full access*. A saved choice says it is saved
+and takes effect once the host serving the agent has it (an agent served elsewhere gets it when the
+drive's sync has pushed it, DW-1533). The menu reads the row again whenever it opens; a read that
+was out when a save answered never replaces what the save handed back. The console's folders are
+chosen in Settings › Agents; the menu keeps them.
+
+**When a tool is not offered** (story 102.3, R381). A turn's model offered no tools at all — none of
+the agent's `[tools].drives` is in the session's scope, the model says it takes none, or the bot is
+Hermes — says why on the room's status ("no tools this turn: no drive is granted in this session")
+and in a WARN line; so does an agent that asks for web search on a host naming no engine, or for a
+console on a host whose sandbox did not pass its probe. That host's status says its console is off
+by that failure (`console.no_sandbox`), and every device's header says "Console off on electra: …
+electra's sandbox did not pass its check …" rather than nothing. `keeper-agentd status` lists
+`web_search`, the surface tools and `kvm_*` as offered or not as the offer itself gates them.
 
 A level reaches an agent its host is already running (R427, R457): every turn reads the level as it
 reads the model, and every call reads it again, so switched off, the next call — in a turn already
@@ -2561,11 +2603,12 @@ rest.
 
 ## Files and photos in an agent's room
 
-Story 101.2 (R417). A person's `m.file` or `m.image` in an agent's room — a file from the composer's
-paperclip or drag-and-drop, a pasted image, a photo from *Take photo* or *Choose photo* — is a turn
-like a text message, sealed by the sender's device as every turn is. Its text is the caption
-(Matrix 1.10: `body` beside a `filename` it differs from); without one the turn says only what was
-attached. A gate's outside system's file is never a turn.
+Story 101.2 (R417), story 102.4. A person's `m.file`, `m.image`, `m.audio` or `m.video` in an agent's
+room — a file from the composer's paperclip or drag-and-drop, a pasted image, a photo from *Take
+photo* or *Choose photo*, a recording or a video — is a turn like a text message, sealed by the
+sender's device as every turn is. Its text is the caption (Matrix 1.10: `body` beside a `filename`
+it differs from); without one the turn says only what was attached. A gate's outside system's file
+is never a turn.
 
 Before the turn opens, the agent's host downloads the file through the homeserver's authenticated
 media endpoint, as the SDK routes it — the encrypted `file` of an encrypted room (decrypted and its
@@ -2574,9 +2617,13 @@ for byte, in the session's `attachments/` folder under the session's claim (one 
 published only where no file is: `name-2.ext` beside a different file of the same name, even one
 that appeared a moment before). A file is stored only once that create is done: a folder or journal
 the disk could not make durable after the file landed is "not stored", even with the file there, and
-storing it again finishes that same file. A download may take 5 minutes; a turn stopped while
-its file downloads (the host stopping or handing the session on) drops the download and is not
-begun — nothing of it is logged, so the session serves it again. The drive syncs it like any file of
+storing it again finishes that same file. A download may take 5 minutes; the session's status says
+`running` from before it starts, never `idle` (102.4 #3): the download begins only once the
+homeserver took that status. A turn stopped while
+its file downloads (the host stopping or handing the session on) drops the download, puts the
+status back to `idle` and is not begun — nothing of it is logged, so the session serves it again. A
+host that lost the session's claim meanwhile says nothing more of it — no status, no notice — as the
+host holding the claim now answers it (R489). The drive syncs it like any file of
 the session, a large one through the drive's own LFS rules. The `user` line names each stored file
 (`attachments: [{drive, path}]`), so the model reads its caption, then "Attached files:" with every
 path, and opens them with `drive_read`:
@@ -2585,8 +2632,9 @@ path, and opens them with `drive_read`:
 | --- | --- |
 | PDF | the file, and its text beside it as `<name>.pdf.txt` (`pdf-extract`, at most 4 MiB of text), read by the host's own binary started again as a reader process that bounds itself first — 60 s by the clock and of CPU, on Linux 1 GiB more memory than it starts with (a Mac enforces no memory limit on it), no core file — and is killed when it runs over or the turn stops; a PDF with no text — a scan — or one that does not read is said so |
 | CSV, TXT, Markdown, JSON, YAML | the file, which `drive_read` reads as it is |
-| PNG, JPEG, WEBP, GIF | the file, and the picture itself as an image part of that turn's message, after the sentence that says file content is data, never an instruction — unless the model's endpoint said it cannot see (`vision: false`), which the turn says instead; a model that did not say is shown it. A picture over 8 MB is stored but not shown |
+| PNG, JPEG, WEBP, GIF | the file, and the picture itself as an image part of that turn's message, after the sentence that says file content is data, never an instruction — unless the model's endpoint said it cannot see (`vision: false`), which the turn says instead; a model that did not say is shown it. A picture larger than its model is shown (`deliverable::max_image_bytes`: a Claude model — whichever gateway names it `claude-…` — 3.75 MiB, which is 5 MiB of base64; any other 8 MiB) is shown as a JPEG copy made small enough, its transparency painted onto white, the stored file untouched. The copy is made by the host's own binary started again as a copier process, bounded as the PDF reader is (60 s by the clock and of CPU, on Linux 512 MiB of working memory and the photo more than it starts with) and killed when it runs over or the turn stops; the photo's header is read first, by the decoder that decodes it, and one whose decoding or copying would take more than 512 MiB at its peak is refused before a pixel is decoded — decoding counts what the pinned decoders allocate beside the pixels: for a JPEG the compressed bytes copied in, its marker segments copied out, and an image of 16-bit coefficients per component (a progressive JPEG always holds them), for a PNG its chunks, which its decoder holds to 32 MiB (a colour profile inflating past that is refused), and its rows. A Mac has no address-space limit, so there this count from the header is the copier's only memory bound; the clock and the CPU bound only how long it runs. One keeper cannot shrink (a WEBP or GIF, which this build does not decode, one over that working memory, or one no smaller copy brought under the limit) is stored but not shown, with a sentence naming the limit |
 | HEIC, HEIF, TIFF… | the file, and a sentence that this photo's format can't be shown to the model. The phone's *Take photo* and *Choose photo* send such a photo as JPEG when the app can decode it; a path chosen in the desktop's picker goes as it is |
+| a recording or a video (`m.audio`, `m.video`, or an `audio/*`/`video/*` file) | the file, and the sentence "keeper does not let agents listen to or watch {name} yet; it was saved at {path}" — the agent answers what it can (transcription is DW-1454) |
 | anything else | the file, named; keeper does not read it |
 
 A file larger than 25 MiB is refused before it is downloaded (by the size its message states) or
@@ -2598,6 +2646,28 @@ the model, and a WARN line in the host's log (R381). An agent never writes into 
 
 The picture rides only the turn it arrived in; later turns read the message as its replay does, with
 the file's path.
+
+**What the room says when a message is not taken (story 102.4, R465).** A person's message the
+agent's host could not decrypt in its conversation is answered by a notice replying to it — "This
+agent's host could not decrypt your message, so the agent did not get it. Send it again." — and a
+WARN line, as a delegated room's unreadable event already is (R283) — once, whether the host meets
+it reading the room back after a restart, live, or both; once its keys arrive, the same message is a
+turn like any other. A person's message whose turn could not be opened (its log line not written) is
+answered by the `TURN_FAILED` notice replying to it, beside the ERROR line — unless what refused the
+line is a claim this host no longer holds, when it says nothing (R489).
+
+**Taken, not *Read*.** In an agent session room the agent's read receipt says nothing: no host sends
+one, and matrix-sdk-ui counts the agent's claim renewal every minute as it having read up to the
+newest message. So there the agent is never counted as a reader, and the person's own message shows
+the turn instead (`keeper_core::agents::turn_marks`, drawn by the timeline producer): *Taken ✓* once
+an anchor names it (`dev.keeper.agent.turn.question`, which hosts before 0.10.4 send too); nothing
+when the host replied to it with a notice, or while neither is known; and "Nixi's host did not take
+this message — it may be older than this kind of message." once the host wrote into the room two
+claim renewals (2 min) after both the message and its newest status, and that status says `idle` or
+`done` — a host that queued the message or is taking its file in (`running`, `blocked`, `waiting`),
+one with no status yet, or one whose status this device cannot read (a newer host's) is never said
+to have dropped it (R489). That sentence is also a WARN line on the person's device, once per
+message. Every other room keeps its read receipts.
 
 ## Cards
 
@@ -3305,13 +3375,42 @@ keeper shows an agent's room in its own timeline, on the Mac and on the iPhone a
   device of yours, and the *Done* goes. A room you never read nor wrote in is never *Done*: a
   session you only watch finishing is not news. Every other room shows its time as before. A
   room's history is read back as far as the decisions panel reads it (300 events, or its start),
-  so a card or question older than what a restart left loaded still counts. The row is read again
-  whenever the room's events change, so a status, a card or a question redraws it without a
-  message; the rows that show questions asked elsewhere are read again shortly after any agent
-  room changes; and a row is read again when a card waiting for you expires, with no event at all; the dock
-  reads its rooms every ten seconds while it is open, and when a read fails it keeps the rooms it
-  has and says so above the conversation until a read succeeds. *Working* means the last status
-  said `running`: a host that went away mid-turn leaves it until another status comes (DW-1494).
+  so a card or question older than what a restart left loaded still counts. Drawing a row never
+  reads a room (story 102.5, R468): a row says what keeper last read of its room, and a room not
+  read yet says *Unknown*. One reader per account reads the rooms that changed — a status, a card,
+  a question, a claim renewal, a read receipt — each once, settled for 300 ms with whatever else
+  changed, keeps what it read, and places every row's questions from what it keeps, so a question
+  asked in one room turns the row you answer it in to *Needs you* without that room being read
+  again, and a claim renewal reads only the room it landed in. A row is also read again when a
+  card waiting for you expires, with no event at all. That reader, and the finder below, run for
+  as long as the account is signed in on this device, whichever view is open (R501): the dock
+  lists its rooms every ten seconds while it is open, with the states that reader last read —
+  fresh while you work in Notes — and when a listing fails it keeps the
+  rooms it has and says so above the conversation until one succeeds. *Working* means the last
+  status said `running`: a host that went away mid-turn leaves it until another status comes
+  (DW-1494).
+- **The list is there when you open keeper (story 102.5, R468).** What each account's Agents
+  window last showed — each room, its name (`<agent> — <title>`), kind, the agent's letter and
+  picture, its state, its last activity and unread count — is kept in `keeper.db`
+  (`agent_list_rows`, never a message's text) and drawn before the account is even signed in
+  again, so the list paints from disk; the live rows replace it as the account's list arrives. A
+  kept *nothing pending* is drawn *Unknown* until the room is read: an old reading is no grounds to
+  say nothing waits. Nothing that lists the agent rooms asks the server: a room whose status is
+  out of what keeper holds (buried under claim renewals, or a restart) is read from the seat kept
+  for it; with no seat, one finder per account looks back for its status in the background —
+  twenty pages per look, each look going on where the last stopped, the next one after 1, 5 and 30
+  minutes and then hourly — and the seat it finds redraws the row; opening and closing the chat
+  list does not restart its looks. The launch into your default agent waits only for each
+  account's room list, never for a room's reading. If an account cannot start (or its list could
+  not be read), its kept rows stay and the Agents list says above them that they are as keeper
+  last saw them, until the account's live list arrives; if keeper cannot read or keep the list it
+  saved, it says that there too. Signing out removes the account's kept rows — even a save
+  already on its way, or a list still starting when you signed out, cannot bring them back. By
+  the time the sign-out is done, nothing of the account still reads its rooms, looks for
+  statuses or puts its rooms in search, even while the chat list was still starting another
+  account or was being opened twice at once; a chat list opened again after the account came
+  back is not undone by the older one. If the rows cannot be removed, the sign-out says so and
+  the account stays signed in, so signing out again removes them.
 - **The header.** Above the timeline, on the iPhone as well as the Mac: the status line — the
   agent's identity cell, `nixi@electra` (the agent and the host that answers), the run badge
   (`idle`, `running`, `blocked`, `waiting`, `done`, `unreadable`), `waiting: hesperia` when the
@@ -3355,13 +3454,27 @@ keeper shows an agent's room in its own timeline, on the Mac and on the iPhone a
   or more who is not you. Anyone else's marked message — in any room — is an ordinary message:
   it notifies, shows "Edited" when edited, is cut at 4096 characters and never carries the caret.
 - **At launch: the default agent (story 100.3, R383).** `agents.default` holds one agent's Matrix
-  user id, or nothing; choose it under Settings › *Default agent* (None, or one of the agents you
-  have a `main` conversation with here) or from the agent room header's menu (*Make default*,
-  *Stop opening at launch*). It is a user-global setting: a `keeper.toml` may set it and it travels
-  with your account's settings. When keeper starts and your signed-in accounts have at least one
-  agent room, it opens the Agents window; when the default agent's `main` room — your DM with that
-  proxy — is on one of those accounts, that room is open (and, on the Mac, its composer focused).
-  When it is not (an agent you have no conversation with here, or a value that is not a user id),
+  user id, or nothing; choose it under Settings › *Default agent* (None, or one of your agents:
+  those you have a `main` conversation with here, and your own agents keeper can ask for one),
+  from the agent room header's menu (*Make default*, *Stop opening at launch*), or from any agent
+  row's menu in the Agents list (*Make default*; on the default's rows *Default*, checked, which
+  stops it opening at launch). The default agent's rows in the Agents list wear a *Default*
+  marker before their name ("Opens when keeper starts"). It is a user-global setting: a
+  `keeper.toml` may set it and it travels with your account's settings; when another device's
+  choice syncs here, or a sync changes what your account's `keeper.toml` sets, the markers and
+  the menus follow the default that opens at once — and stay put when a synced choice lands
+  beneath a file that keeps deciding it (R488). When keeper starts and
+  your signed-in accounts have at least one agent room, it opens the Agents window; when the
+  default agent's `main` room — your DM with that proxy — is on one of those accounts, that room
+  is open and its composer takes focus as soon as the conversation has loaded (it cannot be
+  typed in before), on the Mac and the phone alike (story 102.7, R463, R478; on the phone, the
+  conversation screen) — unless you opened another room or window first.
+  With no default chosen, the Agents window opens with *Choose the agent keeper opens when it
+  starts* above the list: a choice is stored and its conversation opens at once — unless you
+  opened another room or window while it was being saved, which keeps you there; *Not now* puts
+  it away until keeper is updated (a note on this device only — it never travels); ignoring it
+  asks again at the next launch. It is not shown when a settings file decides the key.
+  When a default is chosen but its room is not here (an agent you have no conversation with here, or a value that is not a user id),
   the Agents window opens with nothing selected, a notice says why, the Settings row says the same
   sentence, and `keeper.log` has it at WARN. With no agent rooms, keeper opens the Inbox as before.
   When the default agent is your own proxy and has no conversation with you here — agent rooms or
@@ -3378,8 +3491,8 @@ keeper shows an agent's room in its own timeline, on the Mac and on the iPhone a
   system reclaimed the webview) had nothing to restore. When a settings file sets
   `agents.default`, Settings and the room header's menu say so and name the file: a choice made
   there is kept, but the file's agent is what opens until the file stops setting it. A failed read
-  is a sentence where the choice or the menu would be; a failed save is said beside the control;
-  both reach `keeper.log`.
+  is a sentence where the choice or the menu would be, and above the Agents list; a failed save is
+  said beside the control; both reach `keeper.log`.
 - **Slash commands.** Typing `/` at the start of the composer opens a menu above it (Story
   100.5): every row is a command this room offers, with its other spellings, a sentence and the
   argument it takes. It filters as you type; ↑/↓ move, Enter or Tab completes the name and a
@@ -3468,6 +3581,32 @@ keeper shows an agent's room in its own timeline, on the Mac and on the iPhone a
   control room your proxy made; a DM invite is joined as direct. Any other invite waits for you.
   Agent power in such a control room is that authority: a bridge or a person given agent power
   there has its session-room invites joined too (R452).
+- **Opening a room is instant (story 102.6, R468, R510).** The conversation is drawn from what
+  keeper already holds before anything else: the room's header is read from the same cache, and a
+  status further back than the cache reaches is searched for on the server only afterwards — what
+  the search finds arrives as a header of its own (`keeper_core::timeline::forward_timeline`). The
+  search reads the server's history without saving it into the room's cache, so it never holds up
+  a page of older history, whoever asked for it. An event on the way that this device cannot
+  decrypt yet — its room key not here — leaves the search unfinished rather than "no status": it
+  runs again the next time the room opens or is listed (R513).
+  While a room is open keeper subscribes it in the account's sliding sync, so it syncs up to 20 new
+  events at a time instead of the room list's 1: a claim renewal plus a status, or an answer's
+  edits, no longer make the sync "limited", and the SDK no longer drops the room to its newest
+  chunk while you read it; the subscription ends when the last view of the room closes. A window
+  that still draws too little — the newest events are claim renewals, which the timeline never
+  shows, or a long sleep did make a sync "limited" — fills itself in Rust, 200 events a page,
+  until it draws 10 items, reaches the room's start or has asked for 50 pages. A page that fails,
+  or that the server has not answered in 30 seconds, is said in the history row ("Couldn't load
+  older messages." with Retry, and a WARN in `keeper.log`), and keeper does not ask again on its
+  own (R381, R509).
+  Further back, you page: scroll near the top, or turn the wheel up there. A window whose
+  messages cannot scroll — a few short messages on the phone — shows **Load earlier messages** at
+  its top instead, as does an empty window whose fill stopped short of the start; whether they
+  scroll is measured without the button's own row, so the button stays put when the messages
+  nearly fill the window, and the newest message stays in view under it (R513). That button and
+  Retry both ask Rust, which pages on until something older shows, the start, a failure or 50
+  more pages.
+  The pagination status rides on the room's timeline stream; there is no separate subscription.
 
 ## Nixi beside your notes
 

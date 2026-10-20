@@ -103,15 +103,37 @@ fn running(host: &Host) -> Option<Value> {
 }
 
 /// The tools an agent's `[tools].allow` names, split into those this host
-/// implements and those it does not; `run` is offered only where the
-/// running host's sandbox passed its probe (96.1 #11).
-fn tools(home: &AgentHome, sandboxed: bool) -> (Vec<&str>, Vec<&str>) {
+/// offers it and those it does not, gated as the offer gates them (story
+/// 102.3): `run` only where the running host's sandbox passed its probe
+/// (96.1 #11); `web_search` where `searches` — the host names an engine —
+/// and the agent is one a search is offered at all; a surface tool where
+/// its audience is exactly its person; `kvm_*` where the agent needs a
+/// classic NanoKVM of `kvms`.
+fn tools<'a>(
+    home: &'a AgentHome,
+    sandboxed: bool,
+    searches: bool,
+    kvms: &[keeper_core::agents::kvm::KvmEntry],
+) -> (Vec<&'a str>, Vec<&'a str>) {
+    use keeper_core::agents::{kvm, web_search};
+    let surfaces = keeper_agent::surface::offered(&home.config);
+    let kvm_served = home.config.host.needs.iter().any(|need| {
+        need.strip_prefix(kvm::CAPABILITY_PREFIX).is_some_and(|id| {
+            kvms.iter()
+                .any(|entry| entry.id == id && entry.kind == kvm::KvmKind::NanoKvm)
+        })
+    });
     home.config
         .allow
         .iter()
         .map(String::as_str)
         .partition(|name| {
-            keeper_agent::delegate::is_delegation(name)
+            (*name == web_search::WEB_SEARCH
+                && searches
+                && web_search::never(&home.config).is_none())
+                || surfaces.iter().any(|tool| tool.wire() == *name)
+                || ((*name == kvm::SNAPSHOT || *name == kvm::ACT) && kvm_served)
+                || keeper_agent::delegate::is_delegation(name)
                 || keeper_agent::cards::is_card_tool(name)
                 || keeper_agent::bmad::serves(name)
                 || keeper_agent::memory::serves(name)
@@ -249,7 +271,7 @@ pub fn status(host: &Host, session: Option<&str>, probe: bool) -> Result<(), Cli
                 agent.kind.as_str()
             );
         }
-        let (offered, missing) = tools(home, sandboxed);
+        let (offered, missing) = tools(home, sandboxed, config.web_search.is_some(), &config.kvm);
         println!("  tools offered: {}", offered.join(", "));
         if !missing.is_empty() {
             println!("  not offered on this host: {}", missing.join(", "));
@@ -441,6 +463,44 @@ mod tests {
 
     const KEY: &str = "ed25519:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/AbCdE";
     const RESET: &str = "ed25519:ZZZZEfGhIjKlMnOpQrStUvWxYz0123456789+/AbCdE";
+
+    /// Story 102.3 #5: `status` says `web_search`, the surface tools and
+    /// `kvm_*` are offered where the host's offer gates them in — an engine
+    /// named, the agent's audience its person, a classic NanoKVM it needs —
+    /// and not offered only where it does not.
+    #[test]
+    fn status_lists_web_search_surface_and_kvm_tools_as_the_offer_gates_them() {
+        let decl = keeper_core::agents::drive::parse(
+            "version = 1\nid = \"tgdrive\"\ntitle = \"tgdrive\"\nprincipal = \"tgorka\"\nowner = \"@tgorka:example.org\"\nreaders = [\"@tgorka:example.org\"]\n",
+        )
+        .expect("drive");
+        let config = keeper_core::agents::home::parse_agent_toml(
+            "version = 1\nid = \"nixi\"\nname = \"nixi\"\nkind = \"steward\"\nmatrix_user = \"@nixi:example.org\"\n\n[model]\nbot = \"bot:openai:https://provider.example:8452#claude-opus\"\n\n[tools]\nallow = [\"drive_read\", \"web_search\", \"surface_point\", \"kvm_snapshot\"]\n\n[host]\nneeds = [\"kvm:desk\"]\n",
+            "nixi",
+            &decl,
+        )
+        .expect("home");
+        let home = AgentHome {
+            config,
+            dir: std::path::PathBuf::from("/zone/nixi"),
+            zone: std::path::PathBuf::from("/zone"),
+            drive: decl,
+        };
+        let agentd = keeper_core::agents::agentd::AgentdConfig::parse(&format!(
+            "version = 1\nprincipal = \"tgorka\"\nhost = \"electra\"\n\n[homeserver]\nurl = \"https://matrix.example.org\"\n\n[[kvm]]\nid = \"desk\"\nkind = \"nanokvm\"\nurl = \"https://kvm.example.org\"\ncredential = \"secret:desk-kvm\"\nfingerprint = \"sha256:{}\"\nreaders = [\"@tgorka:example.org\"]\n",
+            "ab".repeat(32)
+        ))
+        .expect("agentd.toml");
+        let all = vec!["drive_read", "web_search", "surface_point", "kvm_snapshot"];
+        assert_eq!(tools(&home, false, true, &agentd.kvm), (all, Vec::new()));
+        assert_eq!(
+            tools(&home, false, false, &[]),
+            (
+                vec!["drive_read", "surface_point"],
+                vec!["web_search", "kvm_snapshot"]
+            )
+        );
+    }
 
     fn entry(user: &str, key: Option<&str>) -> TrustEntry {
         TrustEntry {

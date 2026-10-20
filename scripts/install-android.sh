@@ -56,9 +56,20 @@ if [ "$INSTALL" = 1 ]; then
   [ -x "$ADB" ] || fail "no adb at $ADB (install platform-tools)"
 fi
 
+# The public PostHog client configuration (102.1 #5): a build without it can
+# never report. Exported, and stamped as a file because a Gradle daemon started
+# by an earlier shell does not see this one's environment.
+. "$REPO_ROOT/scripts/lib/posthog-client.sh"
+if ! keeper_resolve_posthog_client "$REPO_ROOT"; then
+  fail "could not resolve the public PostHog client configuration; the build would ship unable to report anything. Export KEEPER_POSTHOG_HOST and KEEPER_POSTHOG_PROJECT_TOKEN, or sign in to gh."
+fi
+export KEEPER_POSTHOG_HOST="$POSTHOG_HOST" KEEPER_POSTHOG_PROJECT_TOKEN="$POSTHOG_TOKEN"
+
 say "building the release APK (arm64)"
 cd "$REPO_ROOT"
 rm -rf "$GEN/app/build/outputs/apk"
+keeper_stamp_posthog_client "$REPO_ROOT"
+trap 'keeper_unstamp_posthog_client "$REPO_ROOT"' EXIT
 bun run tauri android build --apk --target aarch64
 
 UNSIGNED="$(find "$GEN/app/build/outputs/apk" -name '*-release-unsigned.apk' | head -n 1)"

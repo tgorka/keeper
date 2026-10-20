@@ -2,6 +2,7 @@
 //! sentence, and the facts beside them. The shell gathers [`AccountFacts`];
 //! [`vm`] decides what they mean, so the webview never composes a status.
 
+use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::{Local, TimeZone};
@@ -66,6 +67,13 @@ pub struct AccountVm {
     /// What restoring this device from the account did, and what waits.
     /// Empty without an account.
     pub restore: AccountRestoreVm,
+    /// The authorization page the sign-in in progress waits on, for the
+    /// person to copy into a browser that did not come forward (story 102.9,
+    /// R470). Only while it waits: a sign-in that ended took its `state`
+    /// with it, and its link would answer nobody.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub sign_in_link: Option<crate::sign_in_link::SignInLinkVm>,
     /// Increases with every VM this process composes, so a subscriber that
     /// receives two out of order keeps the newer one.
     #[ts(type = "number")]
@@ -99,6 +107,29 @@ pub struct AccountRestoreVm {
     /// This device's file asks for the wake phrase and this device has it
     /// off: offer to turn listening on. Nothing turns it on by itself.
     pub listening_off: bool,
+    /// The Matrix single sign-on the restore started by itself, once it
+    /// started: its sentence, and its link while it waits (story 102.9,
+    /// R480/02).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub matrix_sign_in: Option<RestoreSignInVm>,
+}
+
+/// The restore's Matrix sign-in, as Settings › Account says it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct RestoreSignInVm {
+    pub sentence: String,
+    /// The sentence reports a failure (R381).
+    pub problem: bool,
+    /// It still waits for the browser: Cancel ends it.
+    pub waiting: bool,
+    /// Its authorization page, to copy into a browser that did not come
+    /// forward; only while it waits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub link: Option<crate::sign_in_link::SignInLinkVm>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -426,6 +457,8 @@ pub struct AccountFacts {
     pub offers: AccountOffersVm,
     /// What restoring this device did and what waits.
     pub restore: RestoreFacts,
+    /// The link the current sign-in showed, as the platform last gave it.
+    pub sign_in_link: Option<crate::sign_in_link::SignInLinkVm>,
 }
 
 /// The restore's outcome as the shell knows it.
@@ -437,6 +470,66 @@ pub struct RestoreFacts {
     pub waiting: Vec<(String, String)>,
     /// See [`AccountRestoreVm::listening_off`].
     pub listening_off: bool,
+    /// The single sign-on the restore started for a Matrix account, once it
+    /// started (story 102.9, R480/02).
+    pub matrix_sign_in: Option<RestoreSignIn>,
+}
+
+/// The Matrix single sign-on a restore starts by itself (AD-329): the
+/// account's own surface carries its link and its outcome, apart from the
+/// account's sign-in (`phase`), which is another flow.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoreSignIn {
+    /// The attempt that owns this row ([`RestoreFacts::begin_matrix_sign_in`]):
+    /// only its links and its ending are taken (R500).
+    owner: u64,
+    /// Where it signs in, as the account's file recorded it.
+    pub homeserver: String,
+    /// Its authorization page, while it waits.
+    pub link: crate::sign_in_link::SignInLinkSlot,
+    /// How it ended; `None` while it waits.
+    pub ended: Option<RestoreSignInEnd>,
+}
+
+/// One restore-started Matrix sign-in, from before it is spawned until it
+/// ends (story 102.9, R500). It owns its row in [`RestoreFacts`] while that
+/// row is still its own: a later restore's attempt, or the account's
+/// replacement, takes the row, and from then on this attempt's late link and
+/// ending change nothing. It also owns Cancel from its creation — the latch
+/// is taken before the row offers Cancel, so a Cancel during server
+/// discovery, before the flow is registered, still ends it.
+#[derive(Debug)]
+pub struct RestoreSignInAttempt {
+    owner: u64,
+    cancel: crate::oauth::CancelLatch,
+}
+
+/// How a restore sign-in running on its own reaches the account's facts: the
+/// shell's account state behind its lock (one `update`), or a test's.
+pub type RestoreFactsAccess =
+    std::sync::Arc<dyn Fn(&mut dyn FnMut(&mut RestoreFacts)) + Send + Sync>;
+
+/// Where one attempt's authorization page goes: its own row, never another
+/// attempt's.
+#[derive(Clone)]
+pub struct RestoreSignInLinks {
+    owner: u64,
+    facts: RestoreFactsAccess,
+}
+
+/// How the restore's Matrix sign-in ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RestoreSignInEnd {
+    SignedIn,
+    /// The person pressed Cancel (or closed the sheet).
+    Cancelled,
+    /// Its deadline passed: its link no longer works (R481).
+    TimedOut,
+    /// Its server did not answer before any browser opened; the sentence
+    /// names it ([`crate::oauth::no_answer`]). There never was a link.
+    NoAnswer(String),
+    /// Anything else, with keeper's sentence for it.
+    Failed(String),
 }
 
 /// Compose the state and its sentence. Precedence, first match wins: a
@@ -482,6 +575,7 @@ pub fn vm(facts: &AccountFacts) -> AccountVm {
             faults: facts.faults.clone(),
             offers: AccountOffersVm::default(),
             restore: AccountRestoreVm::default(),
+            sign_in_link: None,
             revision: next_revision(),
         };
     };
@@ -506,6 +600,7 @@ pub fn vm(facts: &AccountFacts) -> AccountVm {
         faults: facts.faults.clone(),
         offers: facts.offers.clone(),
         restore: restore_vm(&facts.restore),
+        sign_in_link: facts.sign_in_link.clone(),
         revision: next_revision(),
     }
 }
@@ -541,6 +636,139 @@ fn restore_vm(facts: &RestoreFacts) -> AccountRestoreVm {
             .map(|(path, name)| format!("Waiting for {path} to restore {name}."))
             .collect(),
         listening_off: facts.listening_off,
+        matrix_sign_in: facts.matrix_sign_in.as_ref().map(RestoreSignIn::vm),
+    }
+}
+
+impl RestoreFacts {
+    /// Start the restore's Matrix sign-in to `homeserver` on `flows` — the
+    /// Matrix sign-in registry `cancel_oidc` drains. Call it before spawning
+    /// the sign-in: the new attempt owns the row from here on, and Cancel
+    /// reaches it from here on, before its flow is even registered (R500).
+    /// An earlier attempt still running loses the row.
+    pub fn begin_matrix_sign_in(
+        &mut self,
+        homeserver: &str,
+        flows: &crate::oauth::OAuthFlowRegistry,
+    ) -> RestoreSignInAttempt {
+        static OWNERS: AtomicU64 = AtomicU64::new(1);
+        let owner = OWNERS.fetch_add(1, Ordering::Relaxed);
+        let cancel = flows.cancel_latch();
+        self.matrix_sign_in = Some(RestoreSignIn {
+            owner,
+            homeserver: homeserver.to_owned(),
+            link: crate::sign_in_link::SignInLinkSlot::default(),
+            ended: None,
+        });
+        RestoreSignInAttempt { owner, cancel }
+    }
+
+    /// The row, while `owner` still owns it.
+    fn matrix_sign_in_of(&mut self, owner: u64) -> Option<&mut RestoreSignIn> {
+        self.matrix_sign_in
+            .as_mut()
+            .filter(|sign_in| sign_in.owner == owner)
+    }
+}
+
+impl RestoreSignInAttempt {
+    /// The latch to hand the sign-in (`auth::login_oidc`), taken when the
+    /// attempt began.
+    pub fn cancel(&self) -> crate::oauth::CancelLatch {
+        self.cancel.clone()
+    }
+
+    /// Run `sign_in` — given where its links go — and record how it ended,
+    /// both only while this attempt still owns its row. The ending's
+    /// sentence is on the account's surface; a failure's WARN is here (R381).
+    pub async fn run<F, Fut>(self, facts: RestoreFactsAccess, sign_in: F)
+    where
+        F: FnOnce(RestoreSignInLinks) -> Fut,
+        Fut: Future<Output = Result<(), crate::error::CoreError>>,
+    {
+        use crate::error::{AuthError, CoreError};
+
+        let links = RestoreSignInLinks {
+            owner: self.owner,
+            facts: facts.clone(),
+        };
+        let end = match sign_in(links).await {
+            Ok(()) => RestoreSignInEnd::SignedIn,
+            Err(CoreError::Auth(AuthError::OAuthCancelled)) => {
+                tracing::info!("account: the restored Matrix sign-in was cancelled");
+                RestoreSignInEnd::Cancelled
+            }
+            Err(error) => {
+                tracing::warn!(reason = %error, "account: the restored Matrix sign-in did not finish");
+                match error {
+                    CoreError::Auth(AuthError::OAuthTimedOut) => RestoreSignInEnd::TimedOut,
+                    CoreError::Auth(AuthError::NoAnswer(sentence)) => {
+                        RestoreSignInEnd::NoAnswer(sentence)
+                    }
+                    error => RestoreSignInEnd::Failed(error.to_string()),
+                }
+            }
+        };
+        let owner = self.owner;
+        (*facts)(&mut |restore| {
+            if let Some(sign_in) = restore.matrix_sign_in_of(owner) {
+                sign_in.ended = Some(end.clone());
+            }
+        });
+    }
+}
+
+impl RestoreSignInLinks {
+    /// One `Platform::show_sign_in_link` call of this attempt's sign-in.
+    pub fn show(&self, flow: u64, link: Option<&crate::sign_in_link::SignInLinkVm>) {
+        (*self.facts)(&mut |restore| {
+            if let Some(sign_in) = restore.matrix_sign_in_of(self.owner) {
+                sign_in.link.apply(flow, link);
+            }
+        });
+    }
+}
+
+impl RestoreSignIn {
+    fn vm(&self) -> RestoreSignInVm {
+        let host = url::Url::parse(&self.homeserver)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_owned))
+            .unwrap_or_else(|| self.homeserver.clone());
+        let again = "Sign in to it again from Add an account.";
+        let (sentence, problem) = match &self.ended {
+            None => (
+                format!("Finish signing in to your Matrix account on {host} in the browser."),
+                false,
+            ),
+            Some(RestoreSignInEnd::SignedIn) => (
+                format!("Signed in to your Matrix account on {host}."),
+                false,
+            ),
+            Some(RestoreSignInEnd::Cancelled) => (
+                format!("The sign-in to your Matrix account on {host} was cancelled. {again}"),
+                false,
+            ),
+            Some(RestoreSignInEnd::TimedOut) => (
+                format!(
+                    "Signing in to your Matrix account on {host} timed out before the browser answered, so its link no longer works. {again}"
+                ),
+                true,
+            ),
+            Some(RestoreSignInEnd::NoAnswer(sentence)) => (format!("{sentence} {again}"), true),
+            Some(RestoreSignInEnd::Failed(reason)) => (
+                format!(
+                    "Signing in to your Matrix account on {host} did not finish ({reason}). {again}"
+                ),
+                true,
+            ),
+        };
+        RestoreSignInVm {
+            sentence,
+            problem,
+            waiting: self.ended.is_none(),
+            link: self.link.link().cloned(),
+        }
     }
 }
 
@@ -950,6 +1178,167 @@ mod tests {
             (cached.state, cached.problem),
             (AccountStateVm::Offline, false)
         );
+    }
+
+    /// The single sign-on a restore starts by itself has its own place on
+    /// the account's surface: its link while it waits, beside Cancel, apart
+    /// from the account's own sign-in; once it ended, its outcome and no
+    /// link (102.9, R480/02, R481).
+    #[test]
+    fn the_restores_matrix_sign_in_carries_its_own_link_and_outcome() {
+        let link = crate::sign_in_link::SignInLinkVm {
+            url: "https://mas.acme.dev/authorize?state=r1".to_owned(),
+            not_opened: Some(crate::sign_in_link::NOT_OPENED.to_owned()),
+        };
+        let mut facts = signed_in();
+        let flows = crate::oauth::OAuthFlowRegistry::new();
+        let _attempt = facts
+            .restore
+            .begin_matrix_sign_in("https://matrix.acme.dev", &flows);
+        let restore = facts.restore.matrix_sign_in.as_mut().expect("started");
+        restore.link.apply(7, Some(&link));
+        let waiting = vm(&facts);
+        assert_ne!(
+            waiting.state,
+            AccountStateVm::SigningIn,
+            "the account's own state"
+        );
+        assert_eq!(waiting.sign_in_link, None, "not the account's sign-in");
+        let shown = waiting.restore.matrix_sign_in.expect("its own place");
+        assert!(shown.waiting && !shown.problem);
+        assert_eq!(shown.link, Some(link.clone()));
+        assert!(
+            shown.sentence.contains("matrix.acme.dev"),
+            "{}",
+            shown.sentence
+        );
+
+        let restore = facts.restore.matrix_sign_in.as_mut().expect("started");
+        restore.link.apply(7, None);
+        restore.ended = Some(RestoreSignInEnd::TimedOut);
+        // A delivery after the end draws nothing.
+        restore.link.apply(7, Some(&link));
+        let ended = vm(&facts).restore.matrix_sign_in.expect("its outcome");
+        assert!(!ended.waiting && ended.problem);
+        assert_eq!(ended.link, None);
+        assert!(ended
+            .sentence
+            .ends_with("Sign in to it again from Add an account."));
+    }
+
+    /// A restore's single sign-on whose homeserver did not answer ends with
+    /// the sentence naming it, as a problem, with no link — the sign-in never
+    /// reached a page to finish by hand.
+    #[tokio::test]
+    async fn a_restore_sign_in_whose_server_did_not_answer_names_it() {
+        use crate::error::{AuthError, CoreError};
+        use std::sync::{Arc, Mutex};
+
+        let flows = crate::oauth::OAuthFlowRegistry::new();
+        let shared = Arc::new(Mutex::new(RestoreFacts::default()));
+        let access: RestoreFactsAccess = {
+            let shared = Arc::clone(&shared);
+            Arc::new(move |change: &mut dyn FnMut(&mut RestoreFacts)| {
+                change(&mut shared.lock().expect("facts"));
+            })
+        };
+        let attempt = shared
+            .lock()
+            .expect("facts")
+            .begin_matrix_sign_in("https://matrix.acme.dev:8448", &flows);
+        let sentence = crate::oauth::no_answer("matrix.acme.dev:8448");
+        let answer = sentence.clone();
+        attempt
+            .run(access, |_| async move {
+                Err(CoreError::Auth(AuthError::NoAnswer(answer)))
+            })
+            .await;
+
+        let row = restore_vm(&shared.lock().expect("facts"))
+            .matrix_sign_in
+            .expect("its outcome");
+        assert!(!row.waiting && row.problem);
+        assert_eq!(row.link, None);
+        assert_eq!(
+            row.sentence,
+            format!("{sentence} Sign in to it again from Add an account.")
+        );
+    }
+
+    /// R500 (R102D2-01): a restore sign-in that is still running when the
+    /// account is replaced and a new restore starts its own never writes the
+    /// new one's row — neither its late link nor its ending — while the new
+    /// attempt's own link and ending still land.
+    #[tokio::test]
+    async fn an_earlier_restore_sign_in_never_writes_the_row_a_later_one_owns() {
+        use crate::error::{AuthError, CoreError};
+        use crate::sign_in_link::SignInLinkVm;
+        use std::sync::{Arc, Mutex};
+
+        let flows = crate::oauth::OAuthFlowRegistry::new();
+        let shared = Arc::new(Mutex::new(RestoreFacts::default()));
+        let access: RestoreFactsAccess = {
+            let shared = Arc::clone(&shared);
+            Arc::new(move |change: &mut dyn FnMut(&mut RestoreFacts)| {
+                change(&mut shared.lock().expect("facts"));
+            })
+        };
+        let link = |state: &str| SignInLinkVm {
+            url: format!("https://mas.acme.dev/authorize?state={state}"),
+            not_opened: None,
+        };
+
+        let a = shared
+            .lock()
+            .expect("facts")
+            .begin_matrix_sign_in("https://matrix.acme.dev", &flows);
+        let (release_a, held_a) = tokio::sync::oneshot::channel::<()>();
+        let late_link = link("a");
+        let run_a = a.run(Arc::clone(&access), |links| async move {
+            // A waits; meanwhile the account is replaced and B starts.
+            let _ = held_a.await;
+            links.show(1, Some(&late_link));
+            Err(CoreError::Auth(AuthError::OAuthTimedOut))
+        });
+        let replace_then_start_b = async {
+            // The account's replacement installs fresh facts …
+            *shared.lock().expect("facts") = RestoreFacts::default();
+            // … and a new restore starts B before A answers.
+            let b = shared
+                .lock()
+                .expect("facts")
+                .begin_matrix_sign_in("https://matrix.acme.dev", &flows);
+            let before = shared.lock().expect("facts").clone();
+            release_a.send(()).expect("A is still held");
+            (b, before)
+        };
+        let ((), (b, before)) = tokio::join!(run_a, replace_then_start_b);
+
+        let after = shared.lock().expect("facts").clone();
+        assert_eq!(after, before, "A's link and ending leave B's row alone");
+        let row = restore_vm(&after).matrix_sign_in.expect("B's row");
+        assert!(row.waiting, "B still waits, with its Cancel");
+        assert_eq!(row.link, None, "A's link is not drawn on B's row");
+
+        let own_link = link("b");
+        let seen = Arc::clone(&shared);
+        b.run(Arc::clone(&access), |links| async move {
+            links.show(2, Some(&own_link));
+            let drawn = seen
+                .lock()
+                .expect("facts")
+                .matrix_sign_in
+                .as_ref()
+                .and_then(|s| s.link.link().cloned());
+            assert_eq!(drawn, Some(own_link), "B's own link lands");
+            Err(CoreError::Auth(AuthError::OAuthCancelled))
+        })
+        .await;
+        let row = restore_vm(&shared.lock().expect("facts"))
+            .matrix_sign_in
+            .expect("B's row");
+        assert!(!row.waiting, "B's own ending lands");
+        assert!(row.sentence.contains("was cancelled"), "{}", row.sentence);
     }
 
     /// R387 (FIX 07): the person closing the sign-in — the native sheet's

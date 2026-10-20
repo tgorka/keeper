@@ -1,99 +1,68 @@
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { fireEvent, render, screen } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("@/lib/crash-report", () => ({ reportFrontendError: vi.fn() }));
+
 import {
-  SIGN_IN_LINK_COPIED_LABEL,
-  SIGN_IN_LINK_COPY_LABEL,
-  SIGN_IN_LINK_LABEL,
-  SIGN_IN_LINK_POLL_MS,
-  SIGN_IN_LINK_PROMPT,
+  SIGN_IN_LINK_CLIPBOARD_REFUSED,
+  SIGN_IN_LINK_COPY_FAILED,
+  SIGN_IN_LINK_COPY_SOURCE,
+  SIGN_IN_LINK_NO_CLIPBOARD,
   SignInLink,
 } from "@/components/auth/sign-in-link";
-import type { SignInLinkVm } from "@/lib/ipc/client";
+import { reportFrontendError } from "@/lib/crash-report";
 
-const PAGE = "https://electra.siren-alsephina.ts.net:8451/oauth/v2/authorize?client_id=k&state=s1";
+const url = "https://id.acme.dev/authorize?client_id=keeper&state=s1&code_challenge=c";
 
-const writeText = vi.fn(() => Promise.resolve());
-
-beforeEach(() => {
-  // jsdom lacks a clipboard by default.
-  Object.assign(navigator, { clipboard: { writeText } });
-  writeText.mockClear();
-});
+/** Give the webview a clipboard (or take it away) for one test. */
+function stubClipboard(clipboard: { writeText: (text: string) => Promise<void> } | undefined) {
+  Object.defineProperty(navigator, "clipboard", { value: clipboard, configurable: true });
+}
 
 afterEach(() => {
-  vi.useRealTimers();
+  Reflect.deleteProperty(navigator, "clipboard");
+  vi.clearAllMocks();
 });
 
-describe("SignInLink", () => {
-  it("renders nothing until the waiting sign-in has a page", async () => {
-    const fetchLink = vi.fn(() => Promise.resolve<SignInLinkVm | null>(null));
-    const { container } = render(<SignInLink fetchLink={fetchLink} />);
-    await waitFor(() => expect(fetchLink).toHaveBeenCalled());
-    expect(container).toBeEmptyDOMElement();
-  });
+describe("SignInLink's Copy (102.9, R381, R480/04)", () => {
+  it("says a refused copy where the person looks and logs a fixed reason, never the link", async () => {
+    // The clipboard's own error quotes what it was handed.
+    stubClipboard({ writeText: () => Promise.reject(new Error(`denied writing ${url}`)) });
+    render(<SignInLink link={{ url, notOpened: null }} />);
 
-  it("offers the page to copy when the browser may not have opened", async () => {
-    const fetchLink = vi.fn(() =>
-      Promise.resolve<SignInLinkVm | null>({ url: PAGE, openFailed: null }),
+    fireEvent.click(screen.getByRole("button", { name: "Copy link" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(SIGN_IN_LINK_COPY_FAILED);
+    expect(reportFrontendError).toHaveBeenCalledExactlyOnceWith(
+      SIGN_IN_LINK_COPY_SOURCE,
+      SIGN_IN_LINK_CLIPBOARD_REFUSED,
+      null,
     );
-    render(<SignInLink fetchLink={fetchLink} />);
-
-    expect(await screen.findByText(SIGN_IN_LINK_PROMPT)).toBeInTheDocument();
-    expect(screen.getByLabelText(SIGN_IN_LINK_LABEL)).toHaveValue(PAGE);
-    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
-
-    fireEvent.click(screen.getByRole("button", { name: SIGN_IN_LINK_COPY_LABEL }));
-    expect(writeText).toHaveBeenCalledWith(PAGE);
-    expect(
-      await screen.findByRole("button", { name: SIGN_IN_LINK_COPIED_LABEL }),
-    ).toBeInTheDocument();
+    expect(JSON.stringify(vi.mocked(reportFrontendError).mock.calls)).not.toContain("id.acme.dev");
   });
 
-  it("says keeper's reason when it could not open the page itself", async () => {
-    const fetchLink = vi.fn(() =>
-      Promise.resolve<SignInLinkVm | null>({
-        url: PAGE,
-        openFailed: "keeper could not open your browser (no default browser).",
-      }),
+  it("says a missing clipboard the same way, and logs that it is missing", () => {
+    stubClipboard(undefined);
+    render(<SignInLink link={{ url, notOpened: null }} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Copy link" }));
+
+    expect(screen.getByRole("alert")).toHaveTextContent(SIGN_IN_LINK_COPY_FAILED);
+    expect(reportFrontendError).toHaveBeenCalledExactlyOnceWith(
+      SIGN_IN_LINK_COPY_SOURCE,
+      SIGN_IN_LINK_NO_CLIPBOARD,
+      null,
     );
-    render(<SignInLink fetchLink={fetchLink} />);
-
-    expect(await screen.findByRole("alert")).toHaveTextContent(
-      "keeper could not open your browser (no default browser). Copy the sign-in link and open it in your browser.",
-    );
-    expect(screen.queryByText(SIGN_IN_LINK_PROMPT)).not.toBeInTheDocument();
+    expect(JSON.stringify(vi.mocked(reportFrontendError).mock.calls)).not.toContain("id.acme.dev");
   });
 
-  it("follows the waiting sign-in: a new page is offered uncopied, an ended one goes away", async () => {
-    vi.useFakeTimers({ shouldAdvanceTime: true });
-    let current: SignInLinkVm | null = { url: PAGE, openFailed: null };
-    const fetchLink = vi.fn(() => Promise.resolve(current));
-    render(<SignInLink fetchLink={fetchLink} />);
-    fireEvent.click(await screen.findByRole("button", { name: SIGN_IN_LINK_COPY_LABEL }));
-    await screen.findByRole("button", { name: SIGN_IN_LINK_COPIED_LABEL });
+  it("logs nothing when the copy worked", async () => {
+    stubClipboard({ writeText: () => Promise.resolve() });
+    render(<SignInLink link={{ url, notOpened: null }} />);
 
-    // The repository leg's page follows the account's.
-    current = { url: "https://git.acme.dev/login/oauth/authorize?state=s2", openFailed: null };
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(SIGN_IN_LINK_POLL_MS);
-    });
-    expect(screen.getByLabelText(SIGN_IN_LINK_LABEL)).toHaveValue(current.url);
-    expect(screen.getByRole("button", { name: SIGN_IN_LINK_COPY_LABEL })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Copy link" }));
 
-    current = null;
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(SIGN_IN_LINK_POLL_MS);
-    });
-    expect(screen.queryByLabelText(SIGN_IN_LINK_LABEL)).not.toBeInTheDocument();
-  });
-
-  it("stops asking once asking fails", async () => {
-    vi.useFakeTimers({ shouldAdvanceTime: true });
-    const fetchLink = vi.fn(() => Promise.reject(new Error("ipc down")));
-    render(<SignInLink fetchLink={fetchLink} />);
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(SIGN_IN_LINK_POLL_MS * 3);
-    });
-    expect(fetchLink).toHaveBeenCalledTimes(1);
+    expect(await screen.findByText("Link copied")).toBeInTheDocument();
+    expect(reportFrontendError).not.toHaveBeenCalled();
   });
 });

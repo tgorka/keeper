@@ -7207,7 +7207,7 @@ An MCP server the person names (96.2) can offer search. Its results are labelled
 Until such a server is configured, a skill's "search the web" step receives row 14's sentence and continues without it.
 
 Revisit when the owner wants agents to search the web without running a server: a `web_search` tool through a provider the person configures, at T0, with `untrusted` results and a row in the egress list.
-status: open
+status: closed (lane `tools`, story 102.3 #2, 2026-10-19: keeper has a `web_search` tool since 101.4; the CAPABILITIES web row answers with it — `tools: [web_search]`, "searches none" said only while it is not offered — test `workflow::tests::every_bmad_capability_is_answered_for_every_offer`)
 
 ### DW-382: BMAD's other 39 helper scripts have no Rust port.
 
@@ -10906,12 +10906,12 @@ location: `run_agent_turn`'s `with_message`, `keeper_core::agents::log::replay::
 reason: the image part rides that turn's own user message and never the log, so a later turn (or a replay after a restart) reads the message with the photo's path only; the model's own answer of that turn carries what it saw. Showing it again needs the replay to hydrate `attachments/` images, with the vision answer and the per-message image cap applied there.
 status: open
 
-### DW-1454: Office documents reach the agent as named files only; audio and video are ignored, not stored.
+### DW-1454: Office documents reach the agent as named files only; no agent listens to audio or watches video.
 
 origin: lane `files` (story 101.2 #3), 2026-10-15
 location: `keeper_agent::attachments::kind_of`, `runtime::arrival_of`
 reason: a `.docx`, `.pptx` or `.xlsx` is stored and named but its text is not written beside it, though `keeper_core::document` reads all three; `m.audio` and `m.video` are not turns at all. The first is a `<name>.txt` written from `open_document`'s view model; the second needs a transcription decision (Epic 87 is on this Mac only).
-status: open
+status: open — narrowed by story 102.4 #1 (lane `attachments`, 2026-10-19): `m.audio` and `m.video` are taken now — stored like any other file (`attachments::Kind::Unheard`) with the note "keeper does not let agents listen to or watch {name} yet; it was saved at {path}" under the answer, in the model's message and at WARN — so what is left is transcription (Epic 87's engine is on the Mac only) and the office documents' text.
 
 ### DW-1460: The Mac's and iOS's own text input are not yet watched not rewriting a message.
 
@@ -10975,7 +10975,7 @@ status: closed (R428, fix round 1 of rung `agents-101-web`, 2026-10-15): a searc
 origin: rung `agents-101-web` (story 101.4 #2), 2026-10-15
 location: `keeper_core::agents::home::derived_needs`, `keeper_agent::hosts` (manifest capabilities), `src/components/settings/agents-section.tsx` (the switch's note)
 reason: an agent whose `[tools].allow` names `web_search`, served by a host with no `[web_search] url` (or a Mac with no engine saved), is simply not offered the tool there; its manifest carries no `web_search` capability, `[host].needs` cannot ask for one, and the Settings row does not say which of the person's hosts can search. Adding a capability changes placement for every agent that names the tool, which is beyond this story.
-status: open
+status: open — narrowed (lane `tools`, story 102.3 #3, 2026-10-19): the manifest says whether a host names an engine (`HostManifest.web_search`) and the Settings row says what each live serving host makes of the level (`AgentWebSearchVm.host`); placement and `[host].needs` still do not know it (DW-1532)
 
 ### DW-1472: Only SearXNG's `results` are read.
 
@@ -11010,7 +11010,7 @@ status: open
 origin: rung `agents-101-web` fix round 2 (R457), 2026-10-16
 location: `keeper_core::agents::room::{ZoneAgent::searches_unasked, AgentIcons::unasked_mark}`, `keeper_agent::desktop::zone_agents`, `AgentStatusVm.searches_unasked`
 reason: R457 asks for the mark from the serving host's status, where 101.5 puts the console mode (`StatusContent.console`, R440-09); that path is on `agents-101-console`, not on this branch, so the mark is read from the agent's `agent.toml` where its home is on this device — a phone, or a device without the drive, shows none, and a host still running an older file shows the newer level. At stack time the host writes the level into its status beside the console mode and the header reads it from there (an older host's absent field reads "unknown", never "asks").
-status: open
+status: open — narrowed (lane `tools`, story 102.3 #3, 2026-10-19; reopened by fix round 1, R483): the globe is drawn only where the serving host that names this agent's home says it names a search engine (`AgentIcons::searching`, `HostManifest.web_search`, `ZoneAgent.home`), a warning sentence otherwise, and every device — the phone included — says when the serving host's status names no engine for it (`StatusConsole.no_engine`). What is left: the level the globe draws (*without asking*) still comes from the home on this device, which may be ahead of what the serving host loaded (an unpushed save, DW-1533), and the phone draws no globe; the serving host's effective level on its status would close it. Tests `room::tests::{the_header_draws_the_globe_only_where_the_serving_host_searches, the_no_engine_warning_comes_from_the_serving_hosts_status}`.
 
 ### DW-1480: A console's folder cannot be a run's `cwd`.
 
@@ -11094,7 +11094,7 @@ status: open
 origin: lane `agents-101-status` (story 101.6 #2, R421), 2026-10-15
 location: `src/components/notes/notes-agent-dock.tsx` (`ATTENTION_RELIST_MS`), `AccountManager::agent_rooms`
 reason: the Agents-window stream that carries the state live is mounted with the chat list, not beside the notes, so the dock reads `ProxyRoomVm.attention` by listing its rooms again; a state change reaches the dock within ten seconds. A stream of the proxy rooms (or the Agents window subscribed by the shell rather than the chat list) would make it live. Since R453 each relist also reads 101.3's question projection once per listed proxy room (`agent_rooms_attended` → `asks_answered_in`: every other session room read back to `ASK_READ_BACK`), so the poll's cost grows with proxy rooms × session rooms; the stream would remove that as well.
-status: open
+status: open (narrowed by lane `list`, story 102.5: the dock reads the list worker's states (`AttentionBoard`) and no room's events, so the poll costs one listing from the cache; since R501 that worker lives with the account, not with the Chats view, so the states it reads are fresh while Notes is open; it is still a ten-second poll rather than a stream)
 
 ### DW-1494: *Working* says the last readable status was `running`, not that a host is still running it.
 
@@ -11108,14 +11108,14 @@ status: open
 origin: review-101status-3 (R101S3-01), recorded by lane `101stack`, 2026-10-16
 location: `keeper_core::account::run_inbox_producer` (`asks_due`, `redraw_attention`), `account::asks_answered_in`
 reason: the projection reads every joined session room, but the inbox re-reads destination rows only when the changed source room is already in its recency window, and it does not watch the send queue / outbox that `mine_in` reads; an off-window source's change, or a queued answer failing with no Matrix event, can leave a correctly placed marker stale until another qualifying event.
-status: open
+status: open (narrowed by lane `list`, story 102.5: the list worker hears every joined session room's event-cache updates, in the window or not, and places every row's questions on each pass; the send queue and the Undo-Send outbox are still read only when a pass runs)
 
 ### DW-1496: Cross-room reading of questions runs inside the inbox producer, one room after another.
 
 origin: review-101status-3 (R101S3-02), recorded by lane `101stack`, 2026-10-16
 location: `keeper_core::account::run_inbox_producer`, `asks_answered_in`, `agents::waiting::read_room`
 reason: each proxy row's reading scans the joined rooms and reads the other session rooms serially inside the single inbox producer (five seconds per room's pagination at most), so slow history reads delay ordinary inbox updates and expiry wake-ups; nothing reuses one reading across a batch. Fix: a coalesced, subscription-owned worker publishing changed rows, keeping *Unknown* on incomplete reads.
-status: open
+status: closed (lane `list`, story 102.5, R468, R502, 2026-10-19: `account::agent_list::run_attention_worker` reads each changed room once per pass off the producer and places every row's questions from kept readings with one projection per pass (`place_all`, R501); rows draw `AttentionBoard`'s state; tests `account::agent_list::tests::{the_agents_list_paints_before_any_room_is_read, a_pass_reads_each_changed_room_once_and_places_questions_in_memory, many_conversations_of_one_proxy_are_placed_in_one_visit_per_room}`)
 
 ### DW-1500: No tag's release has carried keeper-agentd since v0.10.0.
 
@@ -11130,3 +11130,304 @@ origin: lane `101stack` (merging 101.4 and 101.5 with 101.6's older-host check i
 location: `keeper_agent::desktop::{prepare_web_search, prepare_console}` (their `admit`), `keeper_core::agents::model::{KEY_SINCE, older_hosts}`
 reason: R422's check runs for the model save only, and `KEY_SINCE` knows `[model].effort` alone. `[web_search]` and `[run]` are root tables a build before epic 101 does not know (its `agent.toml` key set is closed), so such a host — keeper-agentd on electra until it is upgraded — would refuse the home and stop serving the agent after a person's save. Fix: add both tables to `KEY_SINCE` with the first release that reads them and give the two saves the model save's `admit`.
 status: closed (lane `101stack`, stack fix 1, R460, 2026-10-16: `KEY_SINCE` also names `web_search` in `[tools].allow`, `[web_search]` and `[run]` (0.10.4); `prepare_home` holds every save to `model::older_hosts`; web search *Off* and the console the file reads without `[run]` lift the tables out (`home::without_table`), so they stay allowed; tests `model::tests::every_key_epic_101_writes_is_held_to_the_serving_hosts`, `desktop::tests::a_save_an_older_serving_host_cannot_read_is_refused_and_one_back_is_not`, `home::tests::a_table_is_lifted_out_whole_or_not_at_all`)
+
+### DW-1510: The PostHog provisioning catalog does not know the problem records.
+
+origin: lane `telemetry` (story 102.1, R461), 2026-10-19
+location: `scripts/posthog/provision.mjs` (`expected` event catalog), `deploy/posthog/` manifest
+reason: the reviewed dashboard manifest lists the six closed events; `$exception` problem records (Error tracking) and `keeper_problems_dropped` are ingested but appear on no provisioned dashboard or metric. Changing the manifest changes its reviewed hash, which is a maintainer step (`posthog.yml`, `posthog-maintainers` environment).
+status: open
+
+### DW-1511: A process that never runs `setup` sends no problem to PostHog.
+
+origin: lane `telemetry` (story 102.1), 2026-10-19
+location: `keeper/src/lib.rs` setup (`debug_log::init`, `telemetry_ipc::start_problem_export`)
+reason: the export layer is installed with the shell's one subscriber and attached straight after it, in `setup`. An iOS push wake that never runs `setup` (DW-1263) has no subscriber, so its WARN/ERROR lines reach neither `keeper.log` nor PostHog; closing DW-1263 closes this.
+status: open
+
+### DW-1512: Relative paths and device names survive the redactor.
+
+origin: lane `telemetry` (story 102.1, R461), 2026-10-19
+location: `keeper_core::telemetry::redact`
+reason: R461's classes are home-relative paths, ids, emails, URL paths, tokens and long hex/base64 runs. A drive-relative path (`40-media/2019/wedding.mp4`), a note's file name or a microphone's name in a WARN leaves as written. Whether a further class (any `/`-separated path, quoted file names) is wanted is the owner's call; the redactor takes one more pattern and test.
+status: open
+
+### DW-1513: The phone builds' PostHog pair is proven by inspection, not by an installed phone.
+
+origin: lane `telemetry` (story 102.1 #5), 2026-10-19
+location: `scripts/install-ios.sh`, `scripts/install-android.sh`, `scripts/lib/posthog-client.sh`, `crates/keeper/build.rs` (`stamped_public_observability_config`)
+reason: no Linux build of the shell crate exists, and no phone was installed from this lane: `bash -n` passes and `build.rs`'s file fallback awaits CI's macOS job. Owed: `bun run install:ios` on kalypso then diagnostics on → a `$exception` from `os = ios` in project 605256; the same for Android hardware.
+status: open
+
+### DW-1520: Story 102.2 was not run against a real Forgejo LFS server.
+
+origin: lane `sync` (finisher F102sync1), 2026-10-19
+location: `keeper-sync` `engine::tests::stopped_work` (in-process batch fixture `LfsServer`)
+reason: 102.2 #5 asks for a live run "where the harness exists"; delectra runs Synapse, Temporal and Caddy but no Forgejo, so every item is proven over an in-process HTTP batch endpoint that answers "already there" for held objects, an upload or download action to itself (whose `PUT` stores the bytes) otherwise, and a per-object 404 for a download it does not hold (Forgejo's answers per the triage, `[INFERENCE]` there too — its batch API was never called). Owed: on hesperia, once the release carrying 102.2 is installed, the owner's tgdrive publishes on the first pull or sign-in without pressing anything (upload 704972 re-armed by its legacy sentence) and neuradrive's 96bae0e0 is restored from history (blob `9129af5`); or a Forgejo stack on delectra with a scripted run of both shapes.
+status: open
+
+### DW-1521: A missing object is healed only from its own path or the file its conflict copy was copied from.
+
+origin: lane `sync` (finisher F102sync1), 2026-10-19
+location: `keeper_sync::engine::Engine::heal_missing_object`, `git::history::plain_blob_with_oid`, `git::conflict::originals_of`
+reason: the history walk reads only the download's label path and, for a `.sync-conflict-…` copy, its originals. Bytes committed under another path (a file moved or renamed after it was committed plain) are not found, and the unit stops naming the device instead. A whole-store search by size then sha256 (`git cat-file --batch-all-objects --batch-check`) would find them at the cost of a walk of every blob; not needed for the shape the owner hit.
+status: closed (fix lane F102sync2, R503 S1-04, 2026-10-19: after the path lookup, `git::history::blob_with_oid_anywhere` searches the whole object database — candidates by exact size from object headers, then sha256 — bounded at `HISTORY_SEARCH_OBJECTS` objects per attempt and resumed from the unit's `heal_after`; tests `engine::tests::stopped_work::{a_missing_object_committed_under_an_earlier_name_is_restored_from_history, a_blob_of_the_same_length_with_another_hash_is_not_taken_for_the_missing_object, a_bounded_history_search_resumes_where_it_stopped}`)
+
+### DW-1522: Settings › Sync shows a held push's sentence without "Retry all stopped".
+
+origin: lane `sync` (finisher F102sync1), 2026-10-19
+location: `src/components/settings/sync-section.tsx` (status sentence), `src/components/layout/sync-pane.tsx` (`SyncStatusVm.heldPush` button)
+reason: 102.2 #2 places the action in the Sync view, where it is drawn beside the sentence and on the *Stopped retrying* heading. Settings' folder row now shows the specific sentence (it was the generic "needs your attention" over an empty error) but offers no button; the sentence names the action, which is one click away in the Sync view.
+status: open
+
+### DW-1523: A stopped row in *Stopped retrying* does not name its file.
+
+origin: lane `sync` (finisher F102sync1), 2026-10-19
+location: `keeper_sync::db::{ParkedRow, list_parked}`, `SyncProblemsVm.parked`, `sync-pane.tsx` `SyncProblemsSection`
+reason: `ParkedRow` carries kind, attempts and the error but not the journal row's `label`, so a stopped upload reads "Large file upload · stopped after 1 attempt" without its path. The held push's sentence names the oldest one's file, and stopped uploads are listed first (R506); naming each row needs the label in `ParkedRow` and the VM (a generated binding change).
+status: open
+
+### DW-1524: Why hesperia committed a `filter=lfs` path as a plain blob is not established.
+
+origin: lane `sync` (finisher F102sync1), from `triage-102-sync-stall.md` §4 and §8, 2026-10-19
+location: `keeper_sync::engine` commit path (`commit_local`), tgdrive commits 0bfac3d37 (0.10.3) and 63b0a4423 (0.10.4)
+reason: the recording's `manifest.json` was committed twice as a plain blob although `git check-attr filter` reports `lfs` for it; the housekeeping rewrite that followed (82455dd4e) created the upload debt the stopped credential then held. 102.2 removes the stall, not this cause. Needs the walk/stage trace of a recording's manifest on a Mac.
+status: open
+
+### DW-1525: A recovered replacement whose rename to `unpublished/<oid>` also fails stays in `tmp/` for an hour.
+
+origin: review RR102sync4 (R102S4-01, R520), recorded by lane `102stack`, 2026-10-19
+location: `keeper-sync/src/lfs/store.rs` (`keep_unpublished`, the `tmp/` scratch sweep)
+reason: when publication fails and the recovery rename to `lfs/unpublished/<oid>` fails too, `keep_unpublished` leaves the verified replacement under its random name in `tmp/`, which is swept by age alone: after an hour it is indistinguishable from abandoned transfer scratch and is deleted. On Windows `err.file.keep().ok()` drops the returned error, and with it the file, when `keep` fails. The original target is preserved (R517); the recovered copy the WARN says was kept may not be.
+status: open
+
+### DW-1526: Objects recovered by another path leave their `unpublished/` copies for good.
+
+origin: review RR102sync4 (R102S4-02, R520), recorded by lane `102stack`, 2026-10-19
+location: `keeper-sync/src/lfs/store.rs` (`discard_unpublished`), `keeper-sync/src/engine.rs` (repair replay)
+reason: `discard_unpublished` runs only after a successful `insert_durable`. An object recovered another way — repair replay verifying an original that became readable again (`make_durable`), or a normal download — keeps its `unpublished/<oid>` copy, and nothing bounds or reconciles `unpublished/` across objects, so duplicate bytes stay on the drive after publishing resumes.
+status: open
+
+### DW-1530: A host whose manifest has expired is not held to a save's keys.
+
+origin: lane `tools` (story 102.3 #1, R466), 2026-10-19
+location: `keeper_core::agents::model::serving_from`, `keeper_core::account::control_manifests`
+reason: R438 checks a save against the live manifests only. A host serving the agent that is down when the person saves (its manifest expired) is not named, and if it runs a build older than a key the save writes, it refuses the home when it starts again. Holding expired manifests too would refuse saves forever beside a host that was retired without withdrawing its manifest; a withdrawal (`live: false`) cannot be told from a crash in the event.
+status: open
+
+### DW-1531: The phone's header does not say what the serving host can do with web search.
+
+origin: lane `tools` (story 102.3 #3), 2026-10-19
+location: `keeper_core::agents::room::AgentIcons::searching`, `keeper_core::account::refresh_serving_hosts` (called from the desktop's agents scan only)
+reason: the level an agent's home asks for is known only where its agents zone is on the device, and the serving hosts are read by the desktop's scan; a phone shows neither the globe nor the warning. A status field would make older devices read the whole status as unreadable (`StatusContent` denies unknown keys).
+status: closed (lane `tools`, fix round 1, R483 02, 2026-10-19): promoted into story 102.3. The host writes `no_engine` inside the status's `console` object — the one object in a status every reader since 101.5 reads leniently, never a new top-level key — on every status of an agent whose home asks for web search on a host naming no engine, and every device's header says `web_search::no_engine` from the status alone, a progress line keeping it. Tests `agent_turns::a_host_with_no_search_engine_says_it_on_every_status_every_device_reads` (a real turn, then the header with empty icons), `room::tests::the_no_engine_warning_comes_from_the_serving_hosts_status`. A host that names an engine but runs an older build than 0.10.4, or does not say, is still said only where the serving hosts are read (the desktop); DW-1477 holds the rest.
+
+### DW-1532: Placement does not prefer a host that searches the web.
+
+origin: lane `tools` (story 102.3 #3; the rest of DW-1471), 2026-10-19
+location: `keeper_core::agents::placement`, `keeper_core::agents::home::derived_needs`
+reason: the manifest says `web_search: true|false` now, but placement does not read it and `[host].needs` cannot ask for it, so an agent that searches can still be served by a host naming no engine — the header and Settings say so, and the turn's log WARNs.
+status: open
+
+### DW-1533: A saved switch does not say when the drive has not reached its remote yet.
+
+origin: lane `tools` (story 102.3 #4; triage 102-agent-tools §5.3), 2026-10-19
+location: `src/components/chat/agent-room-header.tsx` (`AgentMenu`), `keeper_agent::desktop::prepare_home`
+reason: a switch saved on this Mac reaches a host elsewhere only once the drive's sync pushed it; since fix round 1 (R486) the menu says "Saved; it takes effect once the host serving <Name> has it", never that it applies, but not whether the push has happened (the 2026-10-17 web search choice sat unpushed for two days behind a stopped upload, story 102.2). Saying "saved on this Mac; not on <drive>'s remote yet" needs the profile's ahead-count beside the rows.
+status: open
+
+### DW-1534: No `/search` or `/console` command in the chat.
+
+origin: lane `tools` (story 102.3 #4; triage 102-agent-tools §5.2, optional by the R415 precedent), 2026-10-19
+location: `keeper_core::chat::commands`
+reason: the header's menu switches both; a typed command beside `/model` was left out of this story.
+status: open
+
+### DW-1535: An authoritative save reads the control rooms one after another, with no deadline over them all.
+
+origin: review RR102tools2 (R102T2-02, R494), recorded by lane `102stack`, 2026-10-19
+location: `keeper_core::account` (the authoritative serving-hosts read of a save, `HostsFor::Save`), `src/components/chat/agent-room-header.tsx` (the header's menu)
+reason: every save reads each account's control rooms one after another, ten seconds per room (R484) and no deadline over the whole inventory, and the menu's `busy` flag disables the choices without a pending sentence: ten rooms answering in nine seconds each make a switch wait about ninety seconds before its file is written, with nothing said meanwhile. A failed room still refuses the save.
+status: open
+
+### DW-1540: An oversized WEBP or GIF is not made smaller for its model.
+
+origin: lane `attachments` (story 102.4 #4), 2026-10-19
+location: `keeper_agent::attachments::copyable` / `smaller`
+reason: keeper-agent links `image` with the `png` and `jpeg` decoders only, so a WEBP or GIF photo larger than its model is shown (`deliverable::max_image_bytes`: 3.75 MiB for a Claude model, 8 MiB otherwise) is stored and named with `too_large_to_show`'s sentence, never shown. A phone's *Take photo* and *Choose photo* send JPEG, so this is a desktop drag-and-drop or paste of a large WEBP/GIF. Fix: enable `image`'s `webp` and `gif` decoders for keeper-agent (both MIT/Apache; `check:agentd-lean` and cargo-deny to rerun) and add `image/webp`/`image/gif` to `smaller`'s formats.
+status: open
+
+### DW-1541: The person's edit, and their words in a session that is not their conversation, still reach no notice from the host.
+
+origin: lane `attachments` (story 102.4, triage 102 claim 5d iii/iv), 2026-10-19
+location: `keeper_agent::rooms::classify` (`Arrival::Edit` → `Ignored(FORGED)`, `Arrival::Text` outside a proxy's conversation → `Ignored(OBSERVER_TEXT)`), logged at INFO
+reason: story 102.4 made the undecryptable message and the unopened turn speak in the room; these two stay host-silent. The person's own device now says it under the message ("… host did not take this message …", R465) for words no anchor answers, but an edit of a message already taken changes nothing visible. Fix: one notice per session saying why an edit or an observer's message is not taken, replying to it (`matrix_sink::notice_about`), so the person's device reads it as said of.
+status: open
+
+### DW-1542: A turn whose opening could not be written has no automated proof of its TURN_FAILED notice.
+
+origin: lane `attachments` (story 102.4 #3), 2026-10-19
+location: `keeper_agent::agent::ServedSession::unopened`, called from `run_turn` when `open_turn` fails
+reason: `agent_turns`' world has no seam that makes the session writer fail on the `user` line, so the notice replying to the person's message (and the early `running` board going `idle`) is proved by reading the code only; the undecryptable message's notice has a test (`a_persons_undecrypted_message_is_answered_with_a_notice`). Fix: a writer fault switch in the test world (the `Room.limited`-style knob on the session writer) and a test asserting one `TURN_FAILED` notice in reply to the message and no anchor.
+status: closed (fix round 1 of lane `attachments`, R489/02) — `agent_turns::a_turn_whose_opening_cannot_be_written_is_answered_with_a_failure` (the session's `log/` folder becomes a file while the file downloads: one `TURN_FAILED` replying to the message, the status `running` then `idle`, no model asked) and `agent_turns::a_claim_lost_while_a_file_downloads_leaves_the_message_to_its_holder` (a lost claim sends nothing after `running`; the holder answers).
+
+### DW-1550: A kept Agents row can be written just after its account signed out.
+
+origin: lane `list` (story 102.5 #1, R468), 2026-10-19
+location: `keeper_core::account::agent_list::keep_rows`, `AccountManager::sign_out`
+reason: the producer keeps the Agents rows on the blocking pool 2 s after a change settles; sign-out stops the producer and then forgets the account's rows, but a write already queued on the blocking pool may land after the forget, leaving that account's rows in `agent_list_rows` until its next sign-in replaces them. They are drawn only for an account the keychain still restores, so a signed-out account's rows are never shown; the seats store's `writing` guard (held across a write and a forget) is the pattern that would close it.
+status: closed (lane `list` fix rounds 1, 2 and 3, R501, R516 and R519, 2026-10-19: every write goes through an `agents::list_rows::RowWriter` made in one account lifetime (`account::lifetime::Lifetime`) and carrying its snapshot's place, under one gate with the removal; a sign-out ends the lifetime when its teardown begins, so a write queued before it finds itself fenced, no writer is made for an ended lifetime — a subscription that resumes after the sign-out gets none and registers no producer — and an older snapshot never overwrites a newer one; a failed removal is the sign-out's error and the next sign-out removes the rows; tests `agents::list_rows::tests::{a_write_queued_before_a_sign_out_never_brings_the_rows_back, an_older_snapshot_landing_after_a_newer_one_is_dropped}`, `account::agent_list::tests::{a_row_write_queued_before_a_sign_out_brings_no_row_back, a_sign_out_that_cannot_remove_the_kept_rows_says_so_and_the_next_one_does, a_subscription_that_resumes_after_a_sign_out_registers_nothing_of_it, a_subscription_that_publishes_after_a_sign_out_stops_what_it_built, a_sign_out_while_the_inbox_waits_on_another_account_stops_every_producer_of_it}`; round 3: every inbox producer is registered before it runs and a teardown aborts and awaits them all, so none outlives the sign-out to act for the account)
+
+### DW-1551: The kept rows' unread counts reach the dock badge until the live list lands.
+
+origin: lane `list` (story 102.5 #1), 2026-10-19
+location: `keeper_core::inbox::{emit, InboxMerger::seed_agents}`
+reason: the merger's badge is computed over every slot, and a slot not live yet holds the kept Agents rows with the unread count they had at the last run; when another account's live batch emits before this one's, the badge counts the old numbers for the second or two until this account's list replaces them. Since R501 an account that cannot start keeps its kept rows (said not live above the Agents list) until it starts, so their old counts stay in the badge that long too. Counting only live slots would fix it.
+status: open
+
+### DW-1552: A seated room whose newest status cannot be read stays *Unknown*, and nothing looks for a newer one.
+
+origin: lane `list` (story 102.5 #3; triage-102-perf "not established": hesperia's `!IgRFBk…`), 2026-10-19
+location: `keeper_core::agents::room::{AgentKinds::seat_after, HeaderReader::find}`, `account::agent_list::run_seat_finder`
+reason: the finder looks only at rooms with no seat. A room whose seat is kept but whose newest status reads `Unreadable` has no seat by `seat_after`, so its row stays unread (*Unknown*) until a readable status arrives; why such a status is unreadable on hesperia was not established.
+status: open
+
+### DW-1553: The decisions panel still reads every session room again on each change of one.
+
+origin: lane `list` (story 102.5 #2; DW-1496's "the four readers become one"), 2026-10-19
+location: `keeper_core::account::{subscribe_agent_asks, read_agent_asks}` → `account::agent_list::asks_answered_in`
+reason: the rows and the dock read the list worker's states; the open room's decisions panel still places its questions from fresh readings of every other session room (no network on its row reads now, but each room is read back through its event cache), once per settled change while it is open. Reading the worker's kept readings would make it one reader; it was left out to keep this story to the list. Owed in the epic's list (R502).
+status: open
+
+### DW-1554: An inbox subscription being built can draw a closing account's kept rows for a moment.
+
+origin: lane `list` fix round 3 (story 102.5; R519, review RR102list3), 2026-10-19
+location: `keeper_core::account::AccountManager::subscribe_inbox` (the slot registration and `agent_list::draw_kept_rows` before the account loop)
+reason: the subscription skips an account whose lifetime already ended when it registers its slot and draws its kept rows, but it checks before it acts: a sign-out that begins between the check and the draw removes the account from the published merger first, and the draw then puts the rows kept from the last run back into this subscription's merger until the subscription reaches that account (its acquisition is refused and the slot removed) or finishes (its sweep removes it). No producer runs, nothing is kept and nothing reaches the palette; only the chat list may show the account's last-run rows while the list starts. Closing it needs the merger's slot writes to carry the account's lifetime and refuse an ended one under the merger's own lock.
+status: open
+
+### DW-1555: The Agents list's producer set and an open room's views are two held-spawn registries.
+
+origin: lane `102stack` (the stack of epic 102: the list × open seam), 2026-10-19
+location: `keeper_core::account::inbox_owners::InboxOwners` (102.5, R519) and `keeper_core::account::open_views` (102.6, R509 05)
+reason: both spawn a producer held and register it before it runs, and both abort and await what they hold at teardown, but they are keyed differently — by account and inbox-subscription generation under an account lifetime, against by subscription id with the sliding-sync subscription of each open room — and stop on different events. One helper for both would change when each stops; they were left as two.
+status: open
+
+### DW-1560: An open room's sliding-sync subscription syncs at most 20 events at a time.
+
+origin: lane `open` (story 102.6 #2, R468), 2026-10-19
+location: `keeper_core::timeline::subscribe_open_rooms` → matrix-sdk-ui 0.18 `RoomListService::subscribe_to_rooms` (`DEFAULT_ROOM_SUBSCRIPTION_TIMELINE_LIMIT` = 20)
+reason: 0.18's room list service sets a subscription's timeline limit itself and exposes no way to choose it (`sliding_sync()` is `cfg(test)`). A sync that brings more than 20 new events for the open room — a device that slept through more than about 20 minutes of claim renewals, or a long streamed answer while the sync loop stalls — is still `limited`, and the event cache still unloads the room to its last chunk; keeper's fill (102.6 #3) then pages it back. Raising the list's own limit for every room (`SyncService::builder(..).with_room_list_timeline_limit(n)`) is the owner's payload trade-off (triage 102 §4 D5), not taken here.
+status: open
+
+### DW-1561: On a touch screen, a window that cannot scroll has no gesture that pages older history.
+
+origin: lane `open` (story 102.6 #3, R468), 2026-10-19
+location: `keeper_core::timeline::{Fill, FILL_DRAWN}`, `src/components/chat/conversation-body.tsx` (`onScroll`, `onWheel`)
+reason: Rust cannot measure the window, so its fill stops once the window draws 10 items (the SDK shows a room's newest 20 at first; a higher bar would ask the server on nearly every open). A window that draws 10 or more short items and still cannot scroll pages on when the person scrolls near the top or turns the wheel up there (`onWheel`, desktop) — but a touch drag on a window that cannot scroll emits neither `scroll` nor `wheel`, so on the phone such a window shows no older history until a new message makes it scroll. A pull-down at the top (touch) would close it.
+status: closed (fix lane F102open1, R509/04, 2026-10-19: `HistoryBoundary` offers "Load earlier messages" — a button, so touch, pointer and keyboard alike — whenever older history remains (`idle`, start not reached) and the window cannot scroll, measured after every batch and on resize, and in an empty window whose fill rests short of the start; it asks Rust through `load_earlier_messages` → the producer's `HistoryAsks`, which pages until something older draws; tests `timeline::open_tests::load_earlier_brings_something_older_into_a_full_window`, `conversation-pane.test.tsx` "offers older history as a button only while the window cannot scroll", "leaves filling an empty window to Rust and offers to load earlier messages"; browser at `?platform=phone&history=more`) Fix round 2 (F102open2, R513/O2-01, 2026-10-19): the measure leaves the boundary row out (`rowsOverflow`), so the button no longer creates and removes its own overflow for rows just short of the window; test "settles the load-earlier button for rows just short of the window, across a resize"; browser at 1280 and `?platform=phone` 420 px, resized across the threshold.
+
+### DW-1562: A lagged event-cache subscription re-reads the header with its server search inline.
+
+origin: lane `open` (story 102.6 #1), 2026-10-19
+location: `keeper_core::timeline::forward_timeline` (`RecvError::Lagged` arm → `HeaderReader::open`)
+reason: when the header's event-cache subscription lags, the producer reopens the header with `HeaderReader::open`, which may search the server for up to four pages before the loop takes the next diff. 102.6 moved the opening read off that path (`read_cached` + a search beside the stream); the lag path is rare and kept as it was. It can take the same `search`/`fold_found` pair.
+status: closed (fix lane F102open1, 2026-10-19: the `RecvError::Lagged` arm re-reads the header with `HeaderReader::read_cached` and starts `HeaderReader::search` beside the stream as at open; with R510 that search is cache-neutral too)
+
+### DW-1563: Once in 32 loopback runs, a window drew its one image message twice.
+
+origin: lane `open` finisher F102open0 (story 102.6 #3), 2026-10-19
+location: `keeper_core::timeline::brief_tests::only_an_original_text_brief_from_a_known_agent_is_drawn_as_one` (the replayed window held two media messages, `left: [false, false]`), `keeper_core::timeline::forward_timeline`
+reason: seen once on delectra (`timeline::` run 6 of 6 at `refs/wip/102open-f2`), never in the 20 runs of that test alone nor the 6 suite runs after it, nor in any gate run without 102.6's fill (dozens). That room draws 6 items, so 102.6's fill pages it once and reaches its start; the duplicate may come from that page meeting the snapshot. Not reproduced, so not fixed; a diagnostic that prints every batch's ops on a wrong count (written and removed by the finisher) is the next step.
+status: open
+
+### DW-1564: The person's own paging can still meet the header's search in the event cache.
+
+origin: lane `open` finisher F102open0 (story 102.6 #1), 2026-10-19
+location: `keeper_core::timeline::forward_timeline` (`search_due`), `keeper_core::agents::room::page_back` (`Room::messages` saves into the event cache)
+reason: with the header's search (`Room::messages`, which saves what it reads into the room's event cache) and a back-pagination of the same room in flight together, the pagination was seen never to reach the server (matrix-sdk 0.18; loopback harness, 8 of 25 runs). keeper now starts the search only once its own fill is at rest, but a person who scrolls up while the search runs (one to four requests) pages beside it. A search that reads through a request that does not save into the cache (decrypting itself), or an upstream fix, would close it.
+status: closed (fix lane F102open1, R509/03, R510, 2026-10-19: `room::page_back` reads through `room::history_page`, a raw `/messages` request through the client that decrypts what it can itself and saves nothing into the event cache, so no caller's pagination can meet it; `search_due` is gone; test `timeline::open_tests::the_header_search_never_meets_the_persons_pagination` pages beside a held search and finds nothing the search read in the cache)
+
+### DW-1570: The room header's "Make default" is offered for fewer agents than the row menu.
+
+origin: lane `launch` (story 102.7), 2026-10-19
+location: `src/components/chat/agent-room-header.tsx` (`AgentDefaultMenu`), `src/components/chat/chat-row.tsx`
+reason: R463 asks every agent row to offer "Make default"; R398 limits the header to Rust's choices or the stored agent so it "never announces an agent that will not open". Rows now store any agent (and `saveDefaultAgent` says Rust's reason when it will not open); the header kept R398's limit. One rule for both surfaces is the coordinator's call.
+status: open (deferred by the coordinator, R479)
+
+### DW-1571: The launch's composer focus on the iPhone is unproven on a device.
+
+origin: lane `launch` (story 102.7, R463), 2026-10-19
+location: `src/lib/default-agent-actions.ts` (`openAndFocus`), `src/hooks/use-launch-into-agents.ts`
+reason: WKWebView may not raise the keyboard for a programmatic `focus()` without a user gesture (`keyboardDisplayRequiresUserAction`). The browser proof and the tests show the textarea focused; whether kalypso shows the keyboard at launch is owed on the device.
+status: open (owed: kalypso)
+
+### DW-1572: The rows' "Default" marker does not follow a default changed on another device until keeper reads it again.
+
+origin: lane `launch` (story 102.7), 2026-10-19
+location: `src/lib/stores/default-agent.ts`, `src/components/agents/default-agent-chooser.tsx` (the read on mount)
+reason: `agents.default` travels with the account's settings (epic 84), but `defaultAgentStore.vm` is read at launch, when the Agents window mounts with nothing read, and by Settings or a room header. A pull that changes the key does not push a new answer, so the marker can show the old default until one of those reads. A settings-changed signal from the sync into the store would close it.
+status: closed (lane `launch`, fix round 1, R475, 2026-10-19: promoted into story 102.7 — `account_settings::apply` emits `keeper://agents-default-changed` when a pulled `agents.default` was written (`agents_ipc::default_agent_applied`; there was no settings-changed event), and the app-wide `useDefaultAgentFollowsSync` re-reads through `defaultAgentStore.load`; test `chat-row.test.tsx` "follows a default another device chose once the setting syncs here, with only the list open"); reopened by review RR102launch2 (R102L2-01: a row write is not the effective default — the account's `keeper.toml` layers moved it without a row, and a row beneath an unchanged file moved nothing) and closed again (lane `launch`, fix round 2, R488, 2026-10-19: `keeper_core::agents::launch::DefaultAgentSeen` compares the default as `registry::get_agents_default` reads it — files first, then the table — before and after every account-layer install or clear (`account_ipc::install_layers`, which every `apply_clone` path, sign-out, forget and setup go through) and every synced settings batch (`account_settings::apply`); the event goes only when it moved. Tests: `launch.rs` `the_account_file_moving_the_default_is_a_change_though_no_row_moved`, `the_account_file_going_away_reveals_the_stored_default`, `a_row_written_beneath_an_unchanged_file_is_no_change`, `a_default_that_does_not_read_counts_as_moved`; mutation `mut-102launch-fix2.log`)
+
+### DW-1573: A kept Agents row drawn before its account starts shows no Default marker.
+
+origin: lane `102stack` (the stack of epic 102: 102.5's kept rows × 102.7's row agent), 2026-10-19
+location: `keeper_core::agents::list_rows` (the `agent_list_rows` table), `RoomVm::agent`
+reason: the rows kept from the last run (R468) are drawn before any account is activated, and the table keeps no agent id, so a kept row carries `agent: None`: its Default marker and its "Make default" appear only once the account's live list replaces the kept rows. Keeping the agent needs a column in the kept-rows table.
+status: open
+
+### DW-1580: A drive's quick-capture template and tag do not travel with the account.
+
+origin: lane `settings` (story 102.8, claim 9 verification), 2026-10-19
+location: `keeper_sync::profile::NotesConfig` (`capture_template`, `capture_tag`, also `journal_template`, `default_template`, `cadence`), `keeper::notes_ipc::apply_settings` → `engine.upsert_profile`; `keeper_core::org_account::manifest::DriveRecord`
+reason: they are written only into this machine's sync-profile row in `sync.db`; `DriveRecord` (`<login>/drives.toml`) carries the drive's `notes` subfolder but none of these, and no `settings.toml` key holds them, so a second device that takes the drive offer starts with no capture template or tag. The owner asked for every setting to be in the remote settings; story 102.8 changes no persistence (its item 2), so it discloses the gap in Settings › Notes ("Kept only on this device") and in `docs/settings-keys.md` instead. Fix: carry them in `DriveRecord` (portable, per drive) and merge them like the other drive fields.
+status: open
+
+### DW-1581: Settings has no search over setting titles.
+
+origin: lane `settings` (story 102.8, item 1: "search over setting titles if a search exists today"), 2026-10-19
+location: `src/components/settings/settings-categories.tsx`
+reason: no Settings search existed before the categories, so the story did not add one. Each section's title lives inside its own component (some as `<p>`, some as `<h3>`, some as exported constants), so a search would first need every section to export the titles of its rows. The command palette does not reach Settings rows either.
+status: open
+
+### DW-1582: On the phone, the shell's back leaves Settings from inside a category.
+
+origin: lane `settings` (story 102.8), 2026-10-19
+location: `src/components/layout/phone-shell.tsx` (level 1 `PhoneBackBar`, edge swipe), `SettingsCategories` drill layout
+reason: the drilled category has its own "All settings" button, but the stack's "Back to Inbox" bar and the edge-swipe back pop the whole Settings level rather than returning to the category list first, as the Bots and Notes levels do for their lists. A `PhoneSurface` that owns a sub-level (the way Bots pushes a conversation at level 2) would make the system back step through it.
+status: closed (lane `settings`, fix 1, R471, 2026-10-19: the category is a sub-level `PhoneShell` owns (`settingsCategory`); `onBack` — header, edge swipe, Escape — pops it to the list before the level, the list draws no back of its own on the phone, focus returns to the category row; test `phone-shell.test.tsx` › "pops a Settings category with the stack's own back before it leaves Settings")
+
+### DW-1583: The git row in Settings › Sync & drives is wider than a phone.
+
+origin: lane `settings` (story 102.8, browser proof at 420 px), 2026-10-19
+location: `src/components/settings/sync-git-row.tsx` (the path row: `w-56` input and two `whitespace-nowrap` buttons in one non-wrapping flex row)
+reason: at 420 px the row's "Find it for me" button ends at x=441, 21 px past the viewport (measured over CDP in the mock shell, `?platform=phone`); the markup is unchanged by the categories, which only made the row the last of a short page where it is easy to see. Fix: let the row wrap (`flex-wrap`) or put the buttons under the field below the phone breakpoint.
+status: open
+
+### DW-1584: A note row in the Notes list nests its tag buttons inside the row's button.
+
+origin: lane `settings` (story 102.8, fix 1 browser proof of the Notes search → model link), 2026-10-19
+location: `src/components/notes/note-row.tsx` (the tag chip, `aria-label="Tag <tag>, on this note"`, a `<button>` popover trigger inside the row's own `<button>`; unchanged since epic 79, `df822c0b`)
+reason: React logs "In HTML, <button> cannot be a descendant of <button>" twice whenever the Notes list renders a tagged note (measured in the mock shell at 1280 px, `button button` matched every tag chip); interactive content inside a button is invalid HTML, and assistive technology may not reach the inner control. Not a Settings change, so not fixed here. Fix: render the row as a non-button container with a stretched primary button, or the chip as a sibling of the row's button.
+status: open
+
+### DW-1590: On iPhone, a sign-in sheet that fails ends the account sign-in, and its link with it.
+
+origin: lane `devices` (story 102.9 #1, R470), 2026-10-19
+location: `crates/keeper/src/web_auth.rs` (`finish`, `Ending::Failed` → `OAuthFlowRegistry::fail`), `keeper_core::sign_in_link::offer`
+reason: `offer` keeps a sign-in waiting when the page cannot be *opened* (the platform call returns an error), so the link on screen stays usable. On iOS the sheet is queued and fails asynchronously (`presentationContextInvalid`, a window that never became active): that reaches the flow as a broken round trip and ends it, so the link the account's screen showed answers nobody. A sheet failure could instead leave the flow waiting with the link and `NOT_OPENED` (Safari delivers `keeper://` callbacks), which is the iPhone's only manual way in when the sheet will not show. Needs kalypso to prove.
+status: closed (lane `devices`, fix round 1, R480/01, 2026-10-19: `web_auth::finish(Ending::Failed)` → `OAuthFlowRegistry::not_shown`; a sign-in registered `register_with_link` keeps waiting and shows its link with `NOT_OPENED` (`sign_in_link::Shown::wait`), a flow without one (F3) still ends; tests `oauth::tests::a_page_not_shown_ends_only_a_flow_without_a_link`, `org_account::oidc::tests::a_sheet_refused_after_it_was_queued_leaves_the_same_sign_in_to_the_pasted_link`, `web_auth::tests::a_sheet_refused_later_leaves_a_sign_in_with_a_link_waiting` (shell, CI); the sheet itself on kalypso is owed)
+
+### DW-1591: The single sign-on a restore starts by itself shows its link nowhere.
+
+origin: lane `devices` (story 102.9 #1), 2026-10-19
+location: `crates/keeper/src/account_ipc.rs` (restore's `sign_in_oidc(…, None)`), `crates/keeper/src/ipc.rs` `sign_in_oidc`
+reason: a Matrix single sign-on a restore starts (AD-329) has no login screen open, so its link goes to no surface (`on_link` is `None`); when that browser does not come forward the person waits five minutes and sees nothing. Its link belongs in the account's restore view model beside the restore sentence.
+status: closed (lane `devices`, fix rounds 1–2, R480/02 + R500, 2026-10-19: `account_ipc::start_matrix_sign_in` routes the link and the outcome to `AccountRestoreVm.matrixSignIn` — its own line with Copy and *Cancel Matrix sign-in*; round 2 made the attempt own that row and Cancel from its creation (`RestoreFacts::begin_matrix_sign_in`, `RestoreSignInAttempt::run`, `OAuthFlowRegistry::cancel_latch`); tests `org_account::state::tests::{the_restores_matrix_sign_in_carries_its_own_link_and_outcome, an_earlier_restore_sign_in_never_writes_the_row_a_later_one_owns}`, `auth::tests::a_restore_cancelled_while_its_server_is_discovered_never_opens_a_browser`, `account-section.test.tsx` "gives the Matrix sign-in it started its own link and Cancel, then says how it ended")
+
+### DW-1592: A sign-out page that does not open is said to nobody.
+
+origin: lane `devices` (story 102.9 triage, F3), 2026-10-19
+location: `crates/keeper/src/account_ipc.rs` (the end-session `start_web_auth` error branch: `flows.remove` + WARN)
+reason: R381 asks for a sentence where the person looks as well as the WARN line. The end-session URL carries an ID-token hint, so R470 forbids showing or `open_url`-ing it; the fix is a sentence only ("keeper signed you out here; your identity provider's session stays until you sign out there"), not a link.
+status: open

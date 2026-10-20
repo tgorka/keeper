@@ -44,6 +44,8 @@ vi.mock("@/lib/ipc/client", () => ({
   logUploadGet: vi.fn(() => Promise.resolve(true)),
   logUploadSet: vi.fn((enabled: boolean) => Promise.resolve(enabled)),
   accountSendLog: vi.fn(() => Promise.reject(new Error("not answered"))),
+  // The phone tier's release check (102.9): unasked until a case answers it.
+  releaseCheck: vi.fn(() => Promise.reject(new Error("not answered"))),
 }));
 vi.mock("@tauri-apps/api/app", () => ({
   getVersion: vi.fn(() => Promise.resolve("0.0.0-test")),
@@ -67,6 +69,7 @@ import {
   autoUpdateSentence,
   debugModeSentence,
   MACOS_DISCLOSURE_LINES,
+  RELEASE_CHECK_FAILED,
   selfRestartNote,
 } from "@/components/settings/about-section";
 import {
@@ -79,6 +82,7 @@ import {
   logUploadGet,
   logUploadSet,
   type PlatformDisclosureVm,
+  releaseCheck,
   voiceAvailability,
 } from "@/lib/ipc/client";
 import { accountStore, NO_ACCOUNT } from "@/lib/stores/account";
@@ -99,6 +103,7 @@ const mockAutoUpdateSet = vi.mocked(autoUpdateSet);
 const mockLogUploadGet = vi.mocked(logUploadGet);
 const mockLogUploadSet = vi.mocked(logUploadSet);
 const mockAccountSendLog = vi.mocked(accountSendLog);
+const mockReleaseCheck = vi.mocked(releaseCheck);
 
 /** Signed in, with this device registered as `marta-air`: the log has a place to go. */
 const SIGNED_IN = {
@@ -629,8 +634,14 @@ describe("AboutSection capability gating (Story 13.7)", () => {
     expect(screen.getByText("https://matrix.example.org")).toBeInTheDocument();
   });
 
-  it("iOS: hides the software-update block, keeps the egress list, and shows the 'On this iPhone' disclosure", async () => {
+  it("iOS: checks for a newer release on a press and says Rust's answer, never the desktop updater", async () => {
     mockEgress.mockResolvedValue(NON_BEEPER_EGRESS);
+    mockReleaseCheck.mockResolvedValue({
+      outcome: "newer",
+      installed: "0.10.5",
+      latest: "0.11.0",
+      sentence: "keeper 0.11.0 is available — install it from your Mac with `bun run install:ios`.",
+    });
     capabilitiesStore.getState().applySnapshot(DEFAULT_CAPABILITIES);
     render(<AboutSection open />);
 
@@ -638,15 +649,54 @@ describe("AboutSection capability gating (Story 13.7)", () => {
     await waitFor(() => {
       expect(screen.getByText("https://matrix.example.org")).toBeInTheDocument();
     });
-    // …but the software-update block is gone (no dead "Check for updates" button).
-    expect(screen.queryByText("Software updates")).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Check for updates" })).not.toBeInTheDocument();
+    // …and nothing is asked before the press (R464: check on demand only).
+    expect(mockReleaseCheck).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Check for updates" }));
+    expect(
+      await screen.findByText(
+        "keeper 0.11.0 is available — install it from your Mac with `bun run install:ios`.",
+      ),
+    ).toBeInTheDocument();
+    expect(mockReleaseCheck).toHaveBeenCalledTimes(1);
+    // The desktop updater is never touched on the phone, and nothing offers
+    // a download or a background install.
+    expect(mockCheck).not.toHaveBeenCalled();
+    expect(screen.queryByRole("button", { name: "Download and install" })).not.toBeInTheDocument();
+    expect(screen.queryByText("Update automatically")).not.toBeInTheDocument();
     // The list Rust composed for this device renders under its heading, every
     // line in order (story 98.3 #4: the front decides none of it).
     expect(screen.getByText("On this iPhone")).toBeInTheDocument();
     expect(screen.getAllByRole("listitem").map((item) => item.textContent)).toEqual(
       expect.arrayContaining(IPHONE_DISCLOSURE.lines),
     );
+  });
+
+  it("iOS: a check Rust could not finish says why, and a command that failed says so", async () => {
+    capabilitiesStore.getState().applySnapshot(DEFAULT_CAPABILITIES);
+    mockReleaseCheck.mockResolvedValueOnce({
+      outcome: "failed",
+      installed: "0.10.5",
+      latest: null,
+      sentence:
+        "keeper could not check GitHub for a newer version (it answered 403). Try again later.",
+    });
+    render(<AboutSection open />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Check for updates" }));
+    expect(
+      await screen.findByText(
+        "keeper could not check GitHub for a newer version (it answered 403). Try again later.",
+      ),
+    ).toHaveClass("text-destructive");
+
+    mockReleaseCheck.mockRejectedValueOnce({ code: "internal", message: "gone" });
+    fireEvent.click(await screen.findByRole("button", { name: "Check for updates" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent(RELEASE_CHECK_FAILED);
+    expect(
+      screen.queryByText(
+        "keeper could not check GitHub for a newer version (it answered 403). Try again later.",
+      ),
+    ).not.toBeInTheDocument();
   });
 
   it("iOS: the docs link opens docs/ios.md externally via openUrl (best-effort)", async () => {

@@ -545,6 +545,189 @@ pub fn unified_diff(
     .map_err(|err| SyncError::Git(format!("could not render the diff: {err}")))
 }
 
+/// Bytes this copy's history holds under one of `paths` whose sha256 is
+/// `oid` and whose length is `size`, read as a plain blob — never a pointer
+/// (Story 102.2, R467).
+///
+/// What heals a large file whose object the server does not have: when the
+/// file was once committed as itself, the bytes are still in git, and the
+/// sha256 is what proves them to be exactly the object the pointer names.
+/// Every commit `HEAD` reaches is read at each path, each distinct blob of
+/// the right length is hashed once, and the first match is the answer. A
+/// blob of any other length is never read, so the walk costs one header read
+/// per distinct revision of these paths.
+pub fn plain_blob_with_oid(
+    repo_path: &Path,
+    paths: &[String],
+    oid: &str,
+    size: u64,
+) -> Result<Option<Vec<u8>>> {
+    use sha2::{Digest as _, Sha256};
+
+    let repo = open(repo_path)?;
+    let mut seen: HashSet<gix::ObjectId> = HashSet::new();
+    let mut found: Option<Vec<u8>> = None;
+    each_reached(&repo, |info| {
+        let commit = info.object().map_err(|err| walk_error(&err))?;
+        let tree = commit.tree().map_err(|err| walk_error(&err))?;
+        for rel in paths {
+            let Some(id) = entry_at(&tree, rel)? else {
+                continue;
+            };
+            if !seen.insert(id) {
+                continue;
+            }
+            let Ok(header) = repo.find_header(id) else {
+                continue;
+            };
+            if header.kind() != gix::object::Kind::Blob || header.size() != size {
+                continue;
+            }
+            let blob = repo.find_object(id).map_err(|err| walk_error(&err))?;
+            let data = blob.detach().data;
+            if crate::lfs::pointer::Pointer::parse(&data).is_some() {
+                continue;
+            }
+            if hex::encode(Sha256::digest(&data)) == oid {
+                found = Some(data);
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    })?;
+    Ok(found)
+}
+
+/// How many objects one search of this copy's whole object database looks at
+/// before it stops (R503, review R102S1-04) — the bound on
+/// [`blob_with_oid_anywhere`], and its resumption.
+///
+/// The search runs after [`plain_blob_with_oid`]'s path lookup has found
+/// nothing: bytes committed plain under an earlier name, then moved and
+/// replaced by a pointer, are under no path that lookup knows. It reads one
+/// object header per object, and hashes only a plain blob of exactly the
+/// object's size, so a candidate costs nothing until its length matches.
+///
+/// **Resumption.** Object ids are visited in sorted order, and a search the
+/// bound stops answers [`HistorySearch::Stopped`] with the last id it looked
+/// at; the caller keeps that and passes it back as `after`, so the next
+/// attempt continues where this one stopped rather than starting again. The
+/// order is the ids' own, so it does not change when objects are repacked.
+/// Every id is listed on each attempt (twenty bytes apiece) and only the
+/// headers are bounded: they are the cost that grows with history.
+pub const HISTORY_SEARCH_OBJECTS: usize = 100_000;
+
+/// What [`blob_with_oid_anywhere`] found.
+#[derive(Debug, PartialEq, Eq)]
+pub enum HistorySearch {
+    /// A plain blob whose sha256 is the object and whose length is its size.
+    Found(Vec<u8>),
+    /// Every object after the starting point was looked at; none is it.
+    Absent,
+    /// [`HISTORY_SEARCH_OBJECTS`] stopped the search: resume after this id.
+    Stopped { after: String },
+}
+
+/// Look through every object this copy holds — whatever path, whatever
+/// commit, reachable or not — for a plain blob whose sha256 is `oid` and whose
+/// length is `size`, examining at most `bound` objects after `after` (R503).
+///
+/// Candidates are chosen by exact size from the object header; only those
+/// are read and hashed, and a pointer is never one. The bytes returned are
+/// exactly the object: the hash is the proof, as in [`plain_blob_with_oid`].
+pub fn blob_with_oid_anywhere(
+    repo_path: &Path,
+    oid: &str,
+    size: u64,
+    after: Option<&str>,
+    bound: usize,
+) -> Result<HistorySearch> {
+    use sha2::{Digest as _, Sha256};
+
+    let repo = open(repo_path)?;
+    let mut ids: Vec<gix::ObjectId> = repo
+        .objects
+        .iter()
+        .map_err(|err| walk_error(&err))?
+        .filter_map(std::result::Result::ok)
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    let start = match after {
+        Some(hex) => {
+            let after = gix::ObjectId::from_hex(hex.as_bytes()).map_err(|err| walk_error(&err))?;
+            ids.partition_point(|id| *id <= after)
+        }
+        None => 0,
+    };
+    let bound = bound.max(1);
+    for (examined, id) in ids[start..].iter().enumerate() {
+        if examined == bound {
+            return Ok(HistorySearch::Stopped {
+                after: ids[start + examined - 1].to_hex().to_string(),
+            });
+        }
+        let Ok(header) = repo.find_header(*id) else {
+            continue;
+        };
+        if header.kind() != gix::object::Kind::Blob || header.size() != size {
+            continue;
+        }
+        let data = repo
+            .find_object(*id)
+            .map_err(|err| walk_error(&err))?
+            .detach()
+            .data;
+        if crate::lfs::pointer::Pointer::parse(&data).is_some() {
+            continue;
+        }
+        if hex::encode(Sha256::digest(&data)) == oid {
+            return Ok(HistorySearch::Found(data));
+        }
+    }
+    Ok(HistorySearch::Absent)
+}
+
+/// The commit that put `HEAD`'s revision of `rel` into history: the newest
+/// commit `HEAD` reaches that holds that very blob at `rel` while none of its
+/// parents does (Story 102.2).
+///
+/// Not [`file_log`]'s first entry: that compares with the first parent only,
+/// so a merge that brought another side's file in would be named as its
+/// author — on the owner's neuradrive, the Mac that merged Marta's merge
+/// rather than Marta's Mac, which made the pointer. `None` when `HEAD` does
+/// not hold `rel`.
+pub fn introduced(repo_path: &Path, rel: &str) -> Result<Option<FileRevision>> {
+    let repo = open(repo_path)?;
+    let Some(tip) = head(&repo)? else {
+        return Ok(None);
+    };
+    let tip = repo.find_commit(tip).map_err(|err| walk_error(&err))?;
+    let Some(target) = entry_at(&tip.tree().map_err(|err| walk_error(&err))?, rel)? else {
+        return Ok(None);
+    };
+    let mut out = None;
+    each_reached(&repo, |info| {
+        let commit = info.object().map_err(|err| walk_error(&err))?;
+        if entry_at(&commit.tree().map_err(|err| walk_error(&err))?, rel)? != Some(target) {
+            return Ok(true);
+        }
+        for parent in held_parents(&repo, &commit)? {
+            let tree = repo
+                .find_commit(parent)
+                .map_err(|err| walk_error(&err))?
+                .tree()
+                .map_err(|err| walk_error(&err))?;
+            if entry_at(&tree, rel)? == Some(target) {
+                return Ok(true);
+            }
+        }
+        out = Some(revision_of(&commit)?);
+        Ok(false)
+    })?;
+    Ok(out)
+}
+
 /// Every path under `prefix` whose bytes on disk are not what `HEAD` holds:
 /// added, modified, deleted, or never tracked at all. Repository-relative,
 /// `/`-separated, prefix included — the paths `git status --porcelain` names.

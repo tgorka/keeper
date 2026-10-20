@@ -164,6 +164,10 @@ pub fn sync_exit_code(err: &SyncError) -> u8 {
         SyncError::GitMissing { .. } => EXIT_PREREQUISITE,
         // Someone must edit something before this can ever work.
         SyncError::Config(_) => EXIT_CONFIG,
+        // The server has no object for a pointer the folder names (Story
+        // 102.2), and no history here holds it: the bytes are on another
+        // device, and a `Restart=on-failure` loop asks the same server again.
+        SyncError::LfsObjectMissing { .. } => EXIT_CONFIG,
         // A cancelled operation is not a failure — the type's own contract says
         // so, and a graceful SIGTERM must not make systemd log a failed unit.
         SyncError::Cancelled => EXIT_OK,
@@ -197,6 +201,10 @@ pub fn sync_exit_code(err: &SyncError) -> u8 {
         // would not act on, and the remedies differ only in which thing a human
         // has to change.
         | SyncError::Forbidden { .. }
+        // The credential could not be produced at all (Story 102.2) — the
+        // app's account is signed out. This daemon reads its own credential
+        // and never builds one, but the taxonomy is spelled out here.
+        | SyncError::Credential(_)
         | SyncError::InvalidPathForRemote { .. }
         | SyncError::MediaAbsent
         // A one-shot run that ends here published nothing, because `sync_once`

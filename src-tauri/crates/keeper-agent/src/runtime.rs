@@ -1066,7 +1066,8 @@ pub async fn run(
         sandbox.is_some(),
     )
     .with_mcp(Arc::clone(&mcp))
-    .with_pictures(Arc::clone(&pictures));
+    .with_pictures(Arc::clone(&pictures))
+    .with_web_search(web_search.is_some());
     doorbell.set_principal_agents(hosts.principal_agents());
     // Each steward's triage and harvest sessions are made from the first
     // tick on, beside the lease clock (R66, R165).
@@ -1871,6 +1872,14 @@ async fn read_back(
         peer: &gate.peer,
         clear: !gate.encrypted && !room.encryption_state().is_encrypted(),
     });
+    // A message this copy could not decrypt that a host already said so of
+    // is not said again — not from this read-back, nor when it arrives live
+    // as well (story 102.4 #3, R489/04).
+    served.undecrypted_answered(
+        undecrypted_said(&unseen, me)
+            .iter()
+            .filter_map(|id| OwnedEventId::try_from(id.as_str()).ok()),
+    );
     let arrivals = unseen
         .iter()
         .filter(|(value, _)| value["sender"].as_str() != Some(me.as_str()))
@@ -1884,6 +1893,20 @@ async fn read_back(
         unseen.into_iter().map(|(value, _)| value).collect(),
         arrivals,
     )
+}
+
+/// The events `me`'s notices in `events` reply to: the person's messages a
+/// host already answered with a notice ([`crate::matrix_sink::notice_about`]).
+fn undecrypted_said<E>(events: &[(Value, E)], me: &UserId) -> HashSet<String> {
+    events
+        .iter()
+        .filter(|(value, _)| value["sender"].as_str() == Some(me.as_str()))
+        .filter_map(|(value, _)| {
+            value["content"]["m.relates_to"]["m.in_reply_to"]["event_id"]
+                .as_str()
+                .map(str::to_owned)
+        })
+        .collect()
 }
 
 /// The anchor of the latest status `me` sent in `room`, read newest page
@@ -2879,10 +2902,12 @@ pub struct GateDoor<'a> {
 }
 
 /// A decrypted timeline event as an [`Arrived`], or `None` for an event no
-/// session acts on (membership, state, reactions, notices, audio, video).
-///
-/// Text is a person's `m.text`, or their `m.file` or `m.image` (story 101.2,
-/// R417) whose text is its caption ([`crate::attachments::caption_of`]),
+/// session acts on (membership, state, reactions, notices, locations…).
+/// A message this copy could not decrypt — still `m.room.encrypted`, with
+/// no encryption info — is [`Arrival::Undecrypted`] (story 102.4 #3).
+/// Text is a person's `m.text`, or their `m.file`, `m.image`, `m.audio` or
+/// `m.video` (story 101.2, R417; story 102.4) whose text is its caption
+/// ([`crate::attachments::caption_of`]),
 /// and only when the sender's own device sealed it: a message in clear, or
 /// one whose sender does not match its Megolm session, is never a turn. In
 /// a gate's room (`gate`), its outside system's `m.notice` is text too, and
@@ -2944,6 +2969,8 @@ pub fn arrival_of(
         }
     } else if event_type.starts_with("dev.keeper.agent.") {
         Arrival::AgentEvent
+    } else if enveloped(value) && encryption.is_none() {
+        Arrival::Undecrypted
     } else {
         return None;
     };
@@ -3260,9 +3287,12 @@ mod tests {
     }
 
     /// R30's envelope check and the text rule: a person's `m.text`, and
-    /// their `m.file` or `m.image` with its caption as the text (R417),
-    /// sealed by their device is a turn; the same in clear or from a
-    /// mismatched Megolm sender, and a notice or audio, is nothing.
+    /// their `m.file`, `m.image`, `m.audio` or `m.video` with its caption as
+    /// the text (R417, story 102.4 #1), sealed by their device is a turn;
+    /// the same in clear or from a mismatched Megolm sender, and a notice,
+    /// is nothing; a message the copy could not decrypt is
+    /// [`Arrival::Undecrypted`] (story 102.4 #3), and so is nothing else in
+    /// its envelope.
     #[test]
     fn only_sealed_text_from_its_sender_is_a_turn() {
         let now = Instant::now();
@@ -3304,13 +3334,64 @@ mod tests {
             "a photo from a mismatched sender"
         );
 
-        for msgtype in ["m.notice", "m.audio", "m.video"] {
-            let other = message(json!({"msgtype": msgtype, "body": "clip"}));
-            assert!(
-                arrival_of(&other, Some(&unverified), now, None).is_none(),
-                "{msgtype} is not a turn"
-            );
+        // What matrix-sdk sends for a recording or a video the composer
+        // attached with words: encrypted `file`, caption in `body`, the
+        // name in `filename` (story 102.4 #1, F4).
+        for msgtype in ["m.audio", "m.video"] {
+            let clip = message(json!({
+                "msgtype": msgtype, "body": "what is said here?", "filename": "clip.m4a",
+                "file": {"url": "mxc://example.org/c", "v": "v2"},
+                "info": {"mimetype": "audio/mp4", "size": 4096},
+            }));
+            let arrived = arrival_of(&clip, Some(&unverified), now, None)
+                .unwrap_or_else(|| panic!("{msgtype} is a turn"));
+            assert_eq!(arrived.arrival, Arrival::Text, "{msgtype}");
+            assert_eq!(arrived.text, "what is said here?", "{msgtype}");
         }
+        let notice = message(json!({"msgtype": "m.notice", "body": "clip"}));
+        assert!(
+            arrival_of(&notice, Some(&unverified), now, None).is_none(),
+            "a notice is not a turn"
+        );
+
+        let undecrypted = json!({
+            "type": "m.room.encrypted",
+            "event_id": "$u:example.org",
+            "sender": "@tgorka:example.org",
+            "content": {"algorithm": "m.megolm.v1.aes-sha2", "ciphertext": "AAAA"},
+        });
+        let arrived = arrival_of(&undecrypted, None, now, None).expect("said, not dropped");
+        assert_eq!(arrived.arrival, Arrival::Undecrypted);
+        assert_eq!(arrived.text, "");
+        let mut state = undecrypted.clone();
+        state["state_key"] = json!("");
+        assert!(
+            arrival_of(&state, None, now, None).is_none(),
+            "encrypted state is no message"
+        );
+    }
+
+    /// Story 102.4 #3: a host's notice replying to an event names it as
+    /// said; another sender's reply, or the host's plain message, does not.
+    #[test]
+    fn a_hosts_notice_names_the_message_it_answers() {
+        let me = UserId::parse("@nixi:example.org").expect("user");
+        let notice = |sender: &str, about: Option<&str>| {
+            let mut content = json!({"msgtype": "m.text", "body": "send it again"});
+            if let Some(about) = about {
+                content["m.relates_to"] = json!({"m.in_reply_to": {"event_id": about}});
+            }
+            (json!({"sender": sender, "content": content}), ())
+        };
+        let said = undecrypted_said(
+            &[
+                notice("@nixi:example.org", Some("$a:example.org")),
+                notice("@tgorka:example.org", Some("$b:example.org")),
+                notice("@nixi:example.org", None),
+            ],
+            &me,
+        );
+        assert_eq!(said, HashSet::from(["$a:example.org".to_owned()]));
     }
 
     /// Codemap Q9 (99.1 #2): in a gate's room its outside system's notice

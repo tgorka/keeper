@@ -41,6 +41,23 @@ const PLATFORM: PresencePlatform = PresencePlatform::Android;
 #[cfg(not(any(target_os = "ios", target_os = "android")))]
 const PLATFORM: PresencePlatform = PresencePlatform::Macos;
 
+/// Said to the webview when the default agent as keeper reads it moved
+/// (story 102.7, DW-1572, R488): a synced settings row, or the account's
+/// layers installed or cleared — never a row written beneath a file that
+/// keeps deciding it. The default agent's marker and menus read it again.
+/// Payload-free. Mirrors `AGENTS_DEFAULT_CHANGED_EVENT` in `client.ts`.
+pub const AGENTS_DEFAULT_CHANGED_EVENT: &str = "keeper://agents-default-changed";
+
+/// Tell the webview the default agent moved. Whether it did is
+/// `launch::DefaultAgentSeen::moved`'s answer, asked by the caller. A
+/// failure is a WARN line: the marker then follows at the next read.
+pub(crate) fn default_agent_applied(app: &AppHandle) {
+    use tauri::Emitter;
+    if let Err(error) = app.emit(AGENTS_DEFAULT_CHANGED_EVENT, ()) {
+        tracing::warn!(%error, "agents: the webview was not told the default agent changed");
+    }
+}
+
 /// keeper came to the front or left it: any of its windows' focus on the
 /// desktop ([`any_window_focused`]), the app's lifecycle on the phone
 /// (`lib.rs`). Every live account's presence follows after a second of
@@ -207,10 +224,7 @@ pub async fn agent_rooms_list(
     state: State<'_, AppState>,
     account_id: String,
 ) -> Result<Vec<ProxyRoomVm>, IpcError> {
-    Ok(state
-        .accounts
-        .agent_rooms_attended(&state.platform, &account_id)
-        .await)
+    Ok(state.accounts.agent_rooms_attended(&account_id).await)
 }
 
 /// Ask the proxy in `room_id` for `drives` in scope (the scope chip).
@@ -491,6 +505,19 @@ pub async fn agents_default_set(
             account_id: None,
             retriable: false,
         })
+}
+
+/// The person put the launch's "Choose the agent keeper opens when it
+/// starts" away (story 102.7, R463): not shown again until keeper is updated.
+/// Every failure is a WARN line (R381) — the core's for the write, this
+/// one's when there is no data directory — and the webview says it.
+#[tauri::command]
+pub fn agents_default_chooser_dismiss(state: State<'_, AppState>) -> Result<(), IpcError> {
+    let data_dir = state.platform.data_dir().map_err(|error| {
+        tracing::warn!(%error, "agents: the default agent's chooser was not put away (no data directory)");
+        to_ipc_error(error)
+    })?;
+    launch::dismiss_chooser(&data_dir).map_err(to_ipc_error)
 }
 
 /// The lease this Mac takes a session's claim on while it hosts the

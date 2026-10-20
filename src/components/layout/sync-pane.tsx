@@ -69,6 +69,7 @@ import {
   CircleSlash,
   Clock,
   FileIcon,
+  History,
   SquarePen,
   TriangleAlert,
 } from "lucide-react";
@@ -233,7 +234,7 @@ export const SYNC_CONFLICT_NOTE =
 /** Parked-work copy. */
 export const SYNC_PARKED_TITLE = "Stopped retrying";
 export const SYNC_PARKED_SENTENCE =
-  "keeper stopped retrying these after repeated failures. Retry puts one back in the queue; Retry all puts back every one listed here.";
+  "keeper stopped retrying these. Retry puts one back in the queue; Retry all stopped puts back every stopped one of this folder.";
 export const SYNC_PARKED_NO_ERROR_SENTENCE = "No error was recorded.";
 
 /**
@@ -387,16 +388,17 @@ export const SYNC_RESET_CANCEL_LABEL = "Cancel";
 export const SYNC_RETRY_LABEL = "Retry";
 
 /**
- * The bulk action, offered only when there is more than one parked unit — beside
- * a single row it would be a second button that does exactly what the first one
- * does.
+ * "Retry all stopped" (Story 102.2, R467): every stopped unit of this folder back
+ * in the queue, in one call the engine answers (`sync_retry_all_parked`).
  *
- * "Retry all" and not "Retry everything": what it requeues is this folder's
- * parked units, and a folder card is the only place it appears. The count is in
- * the accessible name rather than the visible label, because the list it sits
- * above already shows how many there are to anyone who can see it.
+ * Offered in two places, both acting on the whole folder: on the Problems list's
+ * heading when more than one unit stopped — beside a single row it would be a
+ * second button that does exactly what the first one does — and beside a held
+ * push's sentence (`SyncStatusVm.heldPush`), where it is the way out the sentence
+ * names. The count is in the accessible name on the list heading rather than the
+ * visible label, because the list it sits above already shows how many there are.
  */
-export const SYNC_RETRY_ALL_LABEL = "Retry all";
+export const SYNC_RETRY_ALL_LABEL = "Retry all stopped";
 
 /**
  * Delivery copy. The label names what is behind an Activity row's delivery
@@ -439,6 +441,9 @@ const ACTIVITY_KINDS: Record<string, { icon: typeof FileIcon; word: string; tone
   modified: { icon: SquarePen, word: "Changed", tone: "text-muted-foreground" },
   deleted: { icon: CircleMinus, word: "Deleted", tone: "text-muted-foreground" },
   conflict: { icon: TriangleAlert, word: "Conflict copy", tone: "text-destructive" },
+  // A large file the server did not have, whose bytes this folder's history
+  // still held (Story 102.2): its upload rides the delivery glyph.
+  restored: { icon: History, word: "Restored from history", tone: "text-muted-foreground" },
 };
 
 /**
@@ -1072,14 +1077,12 @@ function SyncProfileCard({
   };
 
   /**
-   * Put every parked unit back in the queue, under the same busy lock one Retry
-   * takes. The ids are passed in from the rendered list rather than re-read
-   * here, so what the click requeues is what the user was looking at — a unit
-   * that parked between the render and the click is left for the next press.
+   * "Retry all stopped": every stopped unit of this folder back in the queue, in
+   * one call, under the same busy lock one Retry takes (Story 102.2).
    */
-  const retryAllUnits = (unitIds: readonly number[]) => {
+  const retryAllUnits = () => {
     void run(async () => {
-      await retrySyncParkedAll(profile.id, unitIds);
+      await retrySyncParkedAll(profile.id);
     });
   };
 
@@ -1333,6 +1336,23 @@ function SyncProfileCard({
               onClick={() => setResetOpen(true)}
             >
               {SYNC_RESET_LABEL}
+            </Button>
+          </div>
+        )}
+        {status?.heldPush === true && (
+          // Beside the held push's sentence the status line above carries,
+          // which names the stopped upload and ends with this way out (Story
+          // 102.2). Rust says when, so the webview never reads the sentence.
+          <div className="flex flex-wrap items-center gap-2">
+            <Button
+              type="button"
+              variant="outline"
+              size="xs"
+              disabled={busy}
+              aria-label={`${SYNC_RETRY_ALL_LABEL}, ${profile.name}`}
+              onClick={retryAllUnits}
+            >
+              {SYNC_RETRY_ALL_LABEL}
             </Button>
           </div>
         )}
@@ -1725,7 +1745,7 @@ function SyncProblemsSection({
   problems: SyncProblemsVm | null;
   busy: boolean;
   onRetry: (unitId: number) => void;
-  onRetryAll: (unitIds: readonly number[]) => void;
+  onRetryAll: () => void;
 }) {
   // Called before the early return below, because a hook must be. `useFold`
   // takes `null` for exactly this reason.
@@ -1826,7 +1846,7 @@ function SyncProblemsSection({
                 className="shrink-0"
                 disabled={busy}
                 aria-label={`${SYNC_RETRY_ALL_LABEL}: ${problems.parked.length} ${SYNC_PARKED_TITLE.toLowerCase()}, ${profile.name}`}
-                onClick={() => onRetryAll(problems.parked.map((unit) => unit.id))}
+                onClick={onRetryAll}
               >
                 {SYNC_RETRY_ALL_LABEL}
               </Button>

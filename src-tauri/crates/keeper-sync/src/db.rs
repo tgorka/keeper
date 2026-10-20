@@ -14,7 +14,7 @@
 
 use std::path::{Path, PathBuf};
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -46,6 +46,7 @@ pub fn open(data_dir: &Path) -> Result<Connection> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
+    arm_full_flush(&conn)?;
     // No `busy_timeout` is set here, and that is not an omission: `rusqlite`'s
     // own `Connection::open` already arms a five-second one, which the test
     // `the_shared_database_waits_for_a_writer_rather_than_failing_at_once` pins
@@ -61,6 +62,38 @@ pub fn open(data_dir: &Path) -> Result<Connection> {
     remember_folder_base(&conn, data_dir)?;
     store_folder_paths_relative(&conn, data_dir)?;
     Ok(conn)
+}
+
+/// The two SQLite flags that make every sync of `sync.db` a full flush of
+/// the drive's own cache, at commit and at checkpoint alike (Story 102.2,
+/// R517).
+///
+/// `synchronous` says *when* SQLite syncs; these say *how*. Without them a
+/// sync on Apple is a plain `fsync` (`sqlite3.c` `full_fsync`, libsqlite3-sys
+/// 0.35.0 lines 42500-42514; the pager picks it at 61683-61693), which leaves
+/// the bytes in the disk's volatile cache. [`owe_repair`]'s intent, committed
+/// under `synchronous = FULL`, could then be lost to a power cut that the
+/// healed object it precedes survives: the store flushes with `F_FULLFSYNC`
+/// (`File::sync_all` on Apple), and the drive and this file need not share a
+/// disk. `fullfsync` covers the commit and checkpoint syncs; `checkpoint_fullfsync`
+/// keeps the checkpoint's full on its own.
+///
+/// Set by [`open`], the one constructor of a connection to the file — the
+/// app's engine, `keeper-syncd` and the shell's reads all come through it,
+/// and any of them can run the checkpoint — and nowhere else: `keeper.db`
+/// and `archive.db` keep SQLite's default. Not platform-gated, because it
+/// need not be: SQLite reads the flags only where `F_FULLFSYNC` exists
+/// (Apple) and makes the same `fdatasync` either way elsewhere, so one
+/// constructor and one test hold on every platform. The cost is the
+/// flush's latency on each sync, written down in `docs/sync.md`.
+const FULL_FLUSH_PRAGMAS: [&str; 2] = ["fullfsync", "checkpoint_fullfsync"];
+
+/// Turn [`FULL_FLUSH_PRAGMAS`] on for `conn`.
+fn arm_full_flush(conn: &Connection) -> Result<()> {
+    for pragma in FULL_FLUSH_PRAGMAS {
+        conn.pragma_update(None, pragma, "ON")?;
+    }
+    Ok(())
 }
 
 /// Store every folder this data directory holds relative to it, in the
@@ -595,6 +628,22 @@ fn ensure_journal_columns(conn: &Connection) -> Result<()> {
     }
     if !existing.iter().any(|c| c == "urgency") {
         conn.execute("ALTER TABLE journal ADD COLUMN urgency INTEGER", [])?;
+    }
+    // Story 102.2: what stopped a unit, and how often keeper re-armed it on
+    // its own. Both nullable with no `DEFAULT`, for the reason above and for
+    // the shared file's: an older binary writes and parks rows without
+    // naming either, and `NULL` is the honest "not recorded" — see
+    // [`rearm_credential`] for how such a row is still recognised.
+    if !existing.iter().any(|c| c == "cause") {
+        conn.execute("ALTER TABLE journal ADD COLUMN cause TEXT", [])?;
+    }
+    if !existing.iter().any(|c| c == "rearms") {
+        conn.execute("ALTER TABLE journal ADD COLUMN rearms INTEGER", [])?;
+    }
+    // Where a bounded history search for this unit's missing object stopped
+    // (R503, [`heal_cursor`]); nullable for the same reasons.
+    if !existing.iter().any(|c| c == "heal_after") {
+        conn.execute("ALTER TABLE journal ADD COLUMN heal_after TEXT", [])?;
     }
     Ok(())
 }
@@ -2309,14 +2358,18 @@ pub fn enqueue_unique(
     // collapse keeps `MIN(id)`, so a label or an urgency written onto the
     // higher of a legacy duplicate pair would be thrown away at the next
     // restart.
+    //
+    // A [`REPAIRING`] upload is cover in both: it is the same upload, owed
+    // already, waiting only for a heal to publish its bytes (R503).
     let sql = if kind.covered_while_running() {
         "SELECT id FROM journal
           WHERE profile_id = ?1 AND payload = ?2
-            AND state IN ('pending','deferred','running')
+            AND state IN ('pending','deferred','running','repairing')
           ORDER BY id LIMIT 1"
     } else {
         "SELECT id FROM journal
-          WHERE profile_id = ?1 AND payload = ?2 AND state IN ('pending','deferred')
+          WHERE profile_id = ?1 AND payload = ?2
+            AND state IN ('pending','deferred','repairing')
           ORDER BY id LIMIT 1"
     };
     let existing: Option<i64> = conn
@@ -2622,6 +2675,9 @@ pub fn complete(conn: &Connection, id: i64) -> Result<()> {
 }
 
 /// Return a unit to the queue with a new state and earliest-attempt time.
+///
+/// `cause` is cleared: a reason given as text alone names no class. A failed
+/// unit goes through [`reschedule_failed`], which records both.
 pub fn reschedule(
     conn: &Connection,
     id: i64,
@@ -2630,8 +2686,36 @@ pub fn reschedule(
     error: Option<&str>,
 ) -> Result<()> {
     conn.execute(
-        "UPDATE journal SET state = ?2, not_before_ms = ?3, last_error = ?4 WHERE id = ?1",
+        "UPDATE journal SET state = ?2, not_before_ms = ?3, last_error = ?4, cause = NULL
+          WHERE id = ?1",
         (id, state.as_str(), not_before_ms, error),
+    )?;
+    Ok(())
+}
+
+/// [`reschedule`] for a unit that failed: the sentence beside it, and the
+/// error's [`SyncError::code`] in `cause` (Story 102.2).
+///
+/// The code is what [`rearm_credential`] reads to find the units the
+/// credential stopped. Read off the typed error at the one place a failure
+/// is written, so no later reader has to recognise a class from its prose.
+pub fn reschedule_failed(
+    conn: &Connection,
+    id: i64,
+    state: WorkState,
+    not_before_ms: i64,
+    err: &SyncError,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE journal SET state = ?2, not_before_ms = ?3, last_error = ?4, cause = ?5
+          WHERE id = ?1",
+        (
+            id,
+            state.as_str(),
+            not_before_ms,
+            err.to_string(),
+            err.code(),
+        ),
     )?;
     Ok(())
 }
@@ -2642,13 +2726,16 @@ pub fn reschedule(
 /// mid-flight, and it must be re-driven rather than stranded. This single
 /// statement is what turns "crashed" into "repeated".
 ///
-/// Neither statement below touches `label` or `urgency`, and that is what makes
+/// Neither statement below loses `label` or `urgency`, and that is what makes
 /// a request survive a crash: the row comes back `pending` still carrying the
 /// level [`raise_urgency`] wrote, so the person who asked keeps their place in
-/// the next claim. It is also the second reason urgency must live on the
-/// *covering* row rather than on a duplicate — the `MIN(id)` collapse below
-/// deletes every pending row but the oldest for a payload, so an urgency
-/// written onto a duplicate would be thrown away here.
+/// the next claim. The collapse below folds every pending row for a payload
+/// into the oldest one it may share ([`fold_into`]), so a request a
+/// duplicate carried moves onto the row that stays: the credential re-arm
+/// and Retry all requeue a requested row beside a running cover rather than
+/// folding into it (R514), and a restart turns that cover back into a pending
+/// row older than the request. Two requests for different paths are never
+/// one row ([`foldable`], R517): each comes back as its own.
 pub fn recover_running(conn: &Connection, now_ms: i64) -> Result<usize> {
     let n = conn.execute(
         "UPDATE journal SET state = 'pending', not_before_ms = ?1 WHERE state = 'running'",
@@ -2662,22 +2749,41 @@ pub fn recover_running(conn: &Connection, now_ms: i64) -> Result<usize> {
     // queued a second time by the next scan; the pair is invisible while one
     // half is `running` and becomes two identical pending rows the moment this
     // statement runs. Identical payload is identical work, so the older row
-    // keeps the queue's place and the copy goes.
+    // keeps the queue's place and the copy goes — its urgency, label and
+    // activity onto the older row first — unless both are a person's
+    // requests for different paths, which stay two rows.
     //
     // Both halves of the fix are needed: this one clears the queues that
     // already exist, and the enqueue rule stops new ones forming.
-    let collapsed = conn.execute(
-        "DELETE FROM journal
-          WHERE state = 'pending'
-            AND id NOT IN (
-                SELECT MIN(id) FROM journal
-                 WHERE state = 'pending'
-                 GROUP BY profile_id, payload
-            )",
-        [],
-    )?;
-    if collapsed > 0 {
-        tracing::info!(count = collapsed, "collapsed duplicate queued work");
+    let tx = conn.unchecked_transaction()?;
+    let duplicated: Vec<(i64, String, String)> = {
+        let mut stmt = tx.prepare(
+            "SELECT id, profile_id, payload FROM journal AS copy
+              WHERE state = 'pending'
+                AND EXISTS (SELECT 1 FROM journal AS other
+                             WHERE other.state = 'pending' AND other.id != copy.id
+                               AND other.profile_id = copy.profile_id
+                               AND other.payload = copy.payload)
+              ORDER BY id",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let mut kept: HashMap<(String, String), Vec<i64>> = HashMap::new();
+    let mut copies = 0usize;
+    for (id, profile_id, payload) in duplicated {
+        let rows = kept.entry((profile_id, payload)).or_default();
+        match fold_target(&tx, id, rows.iter().copied())? {
+            Some(survivor) => {
+                fold_into(&tx, id, survivor)?;
+                copies += 1;
+            }
+            None => rows.push(id),
+        }
+    }
+    tx.commit()?;
+    if copies > 0 {
+        tracing::info!(count = copies, "collapsed duplicate queued work");
     }
     Ok(n)
 }
@@ -2732,7 +2838,7 @@ pub fn undefer_profile(conn: &Connection, profile_id: &str, now_ms: i64) -> Resu
 pub fn undefer_kind(conn: &Connection, profile_id: &str, kind: &str, now_ms: i64) -> Result<usize> {
     Ok(conn.execute(
         "UPDATE journal
-            SET state = 'pending', not_before_ms = ?3, last_error = NULL,
+            SET state = 'pending', not_before_ms = ?3, last_error = NULL, cause = NULL,
                 attempts = MAX(attempts - 1, 0)
           WHERE profile_id = ?1 AND kind = ?2 AND state = 'deferred'",
         (profile_id, kind, now_ms),
@@ -2855,16 +2961,32 @@ pub struct ParkedRow {
     pub last_error: Option<String>,
 }
 
+/// Whether this profile has a unit of `kind` in `state` (Story 102.2): asked
+/// for a deferred push, the one row a held publication leaves standing.
+pub fn has_unit_in(conn: &Connection, profile_id: &str, kind: &str, state: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM journal
+                         WHERE profile_id = ?1 AND kind = ?2 AND state = ?3)",
+        (profile_id, kind, state),
+        |r| r.get(0),
+    )?)
+}
+
 /// Every unit this profile has given up on.
 ///
 /// Parked work is deliberately excluded from [`pending_count`], so without
 /// this query it has no surface at all: the profile looks idle while its work
 /// sits stopped forever.
+///
+/// Stopped uploads first, then by age (Story 102.2). A stopped upload is the
+/// one row that holds the push, and ordered by id alone it was folded under
+/// the pulls that stopped beside it: on the owner's tgdrive the upload was
+/// row 27 of 68, behind a fold of ten.
 pub fn list_parked(conn: &Connection, profile_id: &str) -> Result<Vec<ParkedRow>> {
     let mut stmt = conn.prepare(
         "SELECT id, kind, attempts, last_error FROM journal
          WHERE profile_id = ?1 AND state = 'parked'
-         ORDER BY id",
+         ORDER BY (kind = 'lfsUpload') DESC, id",
     )?;
     let rows = stmt.query_map([profile_id], |r| {
         Ok(ParkedRow {
@@ -2889,15 +3011,544 @@ pub fn list_parked(conn: &Connection, profile_id: &str) -> Result<Vec<ParkedRow>
 /// count is the unit's history, and resetting it would hide from the next
 /// failure just how long this has been going on.
 ///
+/// A person's retry is a fresh decision, so it also gives the unit back the
+/// automatic re-arms [`rearm_credential`] spends (Story 102.2).
+///
 /// Returns whether a row actually moved, which is the only way the caller can
 /// tell "not parked" and "not yours" apart from success.
+///
+/// A stopped repair ([`REPAIR_CAUSE`]) goes back to [`REPAIRING`], so the
+/// replay re-verifies its bytes before its upload runs (R514).
 pub fn unpark(conn: &Connection, profile_id: &str, unit_id: i64) -> Result<bool> {
     let n = conn.execute(
-        "UPDATE journal SET state = 'pending', not_before_ms = 0, last_error = NULL
-         WHERE id = ?1 AND profile_id = ?2 AND state = 'parked'",
+        &format!(
+            "UPDATE journal SET state = {UNPARKED_STATE}, not_before_ms = 0, last_error = NULL,
+                                cause = NULL, rearms = NULL
+             WHERE id = ?1 AND profile_id = ?2 AND state = 'parked'"
+        ),
         (unit_id, profile_id),
     )?;
     Ok(n > 0)
+}
+
+/// The state a parked row goes back to (R514): [`REPAIRING`] for a stopped
+/// repair, `pending` for everything else. Read in an `UPDATE`'s `SET`, where
+/// `cause` is still the row's value from before the statement.
+const UNPARKED_STATE: &str = "CASE WHEN cause = 'repair' THEN 'repairing' ELSE 'pending' END";
+
+/// How many times keeper re-arms one stopped unit on its own after the
+/// credential came back, before leaving it for a person (Story 102.2).
+///
+/// The trigger is proof the credential works — a sign-in, or a round trip of
+/// the same folder the remote accepted — so a unit that stops on the
+/// credential again right after it is one the remote refuses for a reason
+/// keeper cannot see (an LFS endpoint with its own rules, say). Three tries
+/// bound that to three batch requests and three notices, never an hourly loop.
+pub const CREDENTIAL_REARMS: i64 = 3;
+
+/// The sentences a release before Story 102.2 wrote beside a unit the
+/// credential stopped, before `cause` existed: an account's or a repository
+/// source's credential that could not be produced, the drive's remote not
+/// known yet and a keychain that would not answer all arrived as
+/// `SyncError::Config`, a rejected token as `SyncError::Auth`.
+///
+/// Read only for rows whose `cause` is `NULL` — written by such a release, or
+/// by an older binary sharing this file — so the owner's stopped uploads are
+/// re-armed by the first credential that comes back after the upgrade.
+const LEGACY_CREDENTIAL_ERRORS: &str = "(
+       last_error LIKE 'invalid sync configuration: the % credential is unavailable:%'
+    OR last_error LIKE 'invalid sync configuration: the % credential could not be read%'
+    OR last_error LIKE 'invalid sync configuration: keeper does not know this drive''s remote yet%'
+    OR last_error LIKE 'invalid sync configuration: keychain read failed%'
+    OR last_error LIKE '% rejected the access token — replace it with a current one')";
+
+/// What one re-arm did (Story 102.2).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Rearmed {
+    /// Parked rows put back in the queue.
+    pub requeued: usize,
+    /// Parked rows removed because a live row, or an earlier row of this
+    /// re-arm, already carries the identical work.
+    pub folded: usize,
+}
+
+impl Rearmed {
+    /// Rows that left the stopped list either way.
+    pub fn total(self) -> usize {
+        self.requeued + self.folded
+    }
+}
+
+/// Re-arm this profile's units the credential stopped (Story 102.2, R467).
+///
+/// Called when the credential has come back — a sign-in, a reconnect, or a
+/// unit of this folder that reached the remote — and never otherwise, so it
+/// is not "retrying a refused credential unchanged": the thing that refused
+/// has just been seen to work. Every kind is re-armed, transfers above all,
+/// because a stopped upload is what holds the push ([`outstanding_count`]).
+///
+/// The class is the row's `cause` (`credential` or `auth`, see
+/// [`crate::error::CREDENTIAL_CLASS_CODES`]); a row with no `cause` is matched
+/// on the sentences older releases wrote ([`LEGACY_CREDENTIAL_ERRORS`]). Each
+/// row is re-armed at most [`CREDENTIAL_REARMS`] times; a person's retry
+/// resets that.
+pub fn rearm_credential(conn: &Connection, profile_id: &str, now_ms: i64) -> Result<Rearmed> {
+    let sql = format!(
+        "SELECT id, kind, payload FROM journal
+          WHERE profile_id = ?1 AND state = 'parked'
+            AND COALESCE(rearms, 0) < ?2
+            AND (cause IN ('credential', 'auth')
+                 OR (cause IS NULL AND {LEGACY_CREDENTIAL_ERRORS}))
+          ORDER BY id"
+    );
+    rearm_rows(conn, profile_id, &sql, Some(CREDENTIAL_REARMS), now_ms)
+}
+
+/// Put every parked unit of this profile back in the queue — a person's
+/// "Retry all stopped" (Story 102.2).
+///
+/// One statement set rather than a loop of [`unpark`] calls from the
+/// webview, and with [`rearm_rows`]' folding: the owner's neuradrive held
+/// 1 099 stopped downloads of ONE object, and requeueing each would have
+/// sent 1 099 identical batch requests for bytes the server does not have.
+pub fn unpark_all(conn: &Connection, profile_id: &str, now_ms: i64) -> Result<Rearmed> {
+    rearm_rows(
+        conn,
+        profile_id,
+        "SELECT id, kind, payload FROM journal
+          WHERE profile_id = ?1 AND state = 'parked' AND ?2 IS NULL
+          ORDER BY id",
+        None,
+        now_ms,
+    )
+}
+
+/// The re-arm both doors above run: `select` names the parked rows (binding
+/// `?1` the profile and `?2` the re-arm cap), `cap` is `Some` for keeper's own
+/// re-arm — which counts in `rearms` — and `None` for a person's, which resets
+/// it.
+///
+/// # Identical work is folded, never requeued twice
+///
+/// A pull, a download, a checkout, a verify and a pull request are each the
+/// same work as any other row with the same payload, so a parked one whose
+/// payload is already carried by a waiting row (`pending` or `deferred`), or
+/// by an earlier row of this same re-arm, is deleted instead.
+/// Uploads and pushes are always requeued: an activity row names the unit
+/// that delivers its file ([`ActivityRow::unit_id`]), and deleting one would
+/// make that file read as delivered while it is not.
+///
+/// # A folded row's request survives it (R503, review R102S1-05)
+///
+/// The row that stays is the work, but the row that goes may be the one a
+/// person asked for: a background download parks, a later explicit request
+/// queues a second row (a parked row is no cover for a request), and that one
+/// parks too. Folding the requested row into the background one used to drop
+/// the request, and under [`crate::profile::LfsMode::PointerOnly`] the bytes
+/// then landed in the store and never in the worktree. So, in the same
+/// transaction as the delete, [`fold_into`] gives the survivor the higher
+/// urgency, the requested row's label (the path a requested delivery is
+/// exempt for), and every activity row that named the folded unit.
+///
+/// # Never into a running row (R514, review R102S2-04)
+///
+/// A `running` row is no survivor. Its consumer copied the label when it
+/// claimed the row, so a requested label folded in later is one it never
+/// reads, and a fold landing after its delivery read the urgency and before
+/// `complete` deleted the row lost the request outright. A parked row whose
+/// only live cover is running is requeued as its own work instead; the
+/// claim reads its label and urgency, and the object the running row brings
+/// makes its transfer a publish from the store.
+///
+/// # Never two people's paths into one row (R517, review R102S3-03)
+///
+/// A row carries one label, so two requests for different paths that share
+/// an object are never folded into each other ([`foldable`]): each is
+/// requeued as its own row, and the second's transfer is a publish from the
+/// store the first one filled. Such a row folds instead into a later
+/// candidate it can share — a background row, or a request for the same
+/// path.
+fn rearm_rows(
+    conn: &Connection,
+    profile_id: &str,
+    select: &str,
+    cap: Option<i64>,
+    now_ms: i64,
+) -> Result<Rearmed> {
+    let tx = conn.unchecked_transaction()?;
+    let rows: Vec<(i64, String, String)> = {
+        let mut stmt = tx.prepare(select)?;
+        let rows = stmt.query_map((profile_id, cap), |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let mut done = Rearmed::default();
+    let mut survivors: HashMap<String, Vec<i64>> = HashMap::new();
+    for (id, kind, payload) in rows {
+        let delivers_a_file = kind == WorkKind::LFS_UPLOAD || kind == WorkKind::PUSH;
+        if !delivers_a_file {
+            let live: Vec<i64> = {
+                let mut stmt = tx.prepare(
+                    "SELECT id FROM journal
+                      WHERE profile_id = ?1 AND payload = ?2
+                        AND state IN ('pending','deferred')
+                      ORDER BY id",
+                )?;
+                let ids = stmt.query_map((profile_id, &payload), |r| r.get(0))?;
+                ids.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            let earlier = survivors.get(&payload).cloned().unwrap_or_default();
+            if let Some(survivor) = fold_target(&tx, id, live.into_iter().chain(earlier))? {
+                fold_into(&tx, id, survivor)?;
+                done.folded += 1;
+                continue;
+            }
+            survivors.entry(payload).or_default().push(id);
+        }
+        let rearms = if cap.is_some() {
+            "COALESCE(rearms, 0) + 1"
+        } else {
+            "NULL"
+        };
+        tx.execute(
+            &format!(
+                "UPDATE journal SET state = {UNPARKED_STATE}, not_before_ms = ?2, last_error = NULL,
+                                    cause = NULL, rearms = {rearms}
+                  WHERE id = ?1 AND state = 'parked'"
+            ),
+            (id, now_ms),
+        )?;
+        done.requeued += 1;
+    }
+    tx.commit()?;
+    Ok(done)
+}
+
+/// Delete row `folded` in favour of row `survivor`, which carries identical
+/// work, keeping what only the folded row knew (R503): the higher urgency,
+/// the requested row's label, and the activity rows that named it. Run
+/// inside the caller's transaction.
+///
+/// Every `SET` expression reads the survivor's values from before the
+/// statement, which is SQLite's rule, so the label is decided against the
+/// survivor's own urgency, not the one being written.
+fn fold_into(tx: &Connection, folded: i64, survivor: i64) -> Result<()> {
+    let (urgency, label): (Option<i64>, Option<String>) = tx.query_row(
+        "SELECT urgency, label FROM journal WHERE id = ?1",
+        [folded],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    tx.execute(
+        "UPDATE journal
+            SET label = CASE WHEN COALESCE(?2, 0) > COALESCE(urgency, 0)
+                             THEN COALESCE(?3, label)
+                             ELSE COALESCE(label, ?3) END,
+                urgency = CASE WHEN COALESCE(?2, 0) > COALESCE(urgency, 0)
+                               THEN ?2 ELSE urgency END
+          WHERE id = ?1",
+        (survivor, urgency, label),
+    )?;
+    tx.execute(
+        "UPDATE activity SET unit_id = ?2 WHERE unit_id = ?1",
+        (folded, survivor),
+    )?;
+    tx.execute("DELETE FROM journal WHERE id = ?1", [folded])?;
+    Ok(())
+}
+
+/// The first of `candidates`, other than `id`, that row `id` may fold into
+/// ([`foldable`]), or `None` when it must stay its own row.
+fn fold_target(
+    tx: &Connection,
+    id: i64,
+    candidates: impl IntoIterator<Item = i64>,
+) -> Result<Option<i64>> {
+    for candidate in candidates {
+        if candidate != id && foldable(tx, id, candidate)? {
+            return Ok(Some(candidate));
+        }
+    }
+    Ok(None)
+}
+
+/// Whether row `folded` may be folded into row `survivor` (R517, review
+/// R102S3-03): not when both are a person's requests, for different paths.
+///
+/// A row carries one label, the one path its delivery publishes even under
+/// [`crate::profile::LfsMode::PointerOnly`], so [`fold_into`] can keep only
+/// one of two requested paths, and the other would stay a pointer while its
+/// stopped request was deleted. Any other pair — a background row, an
+/// unlabelled one, two requests for the same path — loses nothing by it.
+fn foldable(tx: &Connection, folded: i64, survivor: i64) -> Result<bool> {
+    let requested_path = |id: i64| -> Result<Option<String>> {
+        Ok(tx
+            .query_row(
+                "SELECT label FROM journal WHERE id = ?1 AND COALESCE(urgency, 0) >= ?2",
+                (id, Urgency::Requested.level()),
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
+    };
+    Ok(match (requested_path(folded)?, requested_path(survivor)?) {
+        (Some(a), Some(b)) => a == b,
+        _ => true,
+    })
+}
+
+/// The oldest stopped upload of a profile, as the held push names it
+/// (Story 102.2): its path and the sentence it stopped with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoppedUpload {
+    /// The path it was queued for, or `None` for a row queued unlabelled.
+    pub label: Option<String>,
+    /// The object, for a row with no label to name it by.
+    pub payload: String,
+    pub last_error: Option<String>,
+}
+
+/// The oldest parked upload of this profile, if any.
+pub fn oldest_stopped_upload(conn: &Connection, profile_id: &str) -> Result<Option<StoppedUpload>> {
+    Ok(conn
+        .query_row(
+            "SELECT label, payload, last_error FROM journal
+              WHERE profile_id = ?1 AND kind = 'lfsUpload' AND state = 'parked'
+              ORDER BY id LIMIT 1",
+            [profile_id],
+            |r| {
+                Ok(StoppedUpload {
+                    label: r.get(0)?,
+                    payload: r.get(1)?,
+                    last_error: r.get(2)?,
+                })
+            },
+        )
+        .optional()?)
+}
+
+/// Queue a unit unless a live OR parked row already carries it (Story 102.2).
+///
+/// The background sweep's door for downloads. [`enqueue_unique`] treats a
+/// parked row as no cover — right for a person's request, which is a new
+/// decision — and so the sweep queued the same doomed download again on
+/// every scan: 1 099 stopped rows and 728 batch 404s for one object on the
+/// owner's neuradrive. Here a stopped row is the answer until something
+/// re-arms it (a person's Retry, or the credential's return). `None` when a
+/// parked row stands; otherwise the covering or new row's id.
+pub fn enqueue_unless_parked(
+    conn: &Connection,
+    profile_id: &str,
+    kind: &WorkKind,
+    now_ms: i64,
+) -> Result<Option<i64>> {
+    let payload = serde_json::to_string(kind)
+        .map_err(|e| SyncError::Journal(format!("work item is not serializable: {e}")))?;
+    let parked: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM journal
+                         WHERE profile_id = ?1 AND payload = ?2 AND state = 'parked')",
+        (profile_id, &payload),
+        |r| r.get(0),
+    )?;
+    if parked {
+        return Ok(None);
+    }
+    enqueue_unique(conn, profile_id, kind, now_ms, now_ms).map(Some)
+}
+
+/// The journal state of an upload a heal owes before the healed bytes are in
+/// this folder's store (R503, review R102S1-01).
+///
+/// A heal used to publish the object first and journal its upload after, so
+/// a death between the two left a store the download path treats as complete
+/// — the next attempt found the object, materialized it and finished — and no
+/// upload ever owed: this Mac had the file back, the server never got it. Now
+/// the obligation is written first, in this state, and only then are the
+/// bytes published:
+///
+/// * No claim takes a `repairing` row ([`claim_ready`] reads `pending`), so a
+///   concurrent upload drain can never run it against bytes not yet stored.
+/// * It counts toward [`outstanding_count`] like every row, so the push waits
+///   for it from the moment it is written.
+/// * [`release_repair`] makes it an ordinary `pending` upload once the bytes
+///   are published, and the engine replays every standing one at each drain
+///   — the first drain after a restart included — re-verifying the stored
+///   bytes before releasing it.
+/// * A replay that cannot finish it stops it ([`park_repair`]), and the
+///   stopped row is still a repair: its `cause` is [`REPAIR_CAUSE`], a
+///   person's Retry puts it back in this state rather than in `pending`,
+///   and a due retry is replayed on its own ([`repairs`]).
+pub const REPAIRING: &str = "repairing";
+
+/// The `cause` of a repair a replay stopped (R514): what makes [`unpark`],
+/// [`unpark_all`] and the credential re-arm hand it back as [`REPAIRING`] —
+/// re-verified and, if need be, restored again before its upload runs —
+/// instead of as an ordinary upload of bytes nobody checked.
+pub const REPAIR_CAUSE: &str = "repair";
+
+/// One upload a heal still owes, as [`repairs`] lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Repair {
+    pub id: i64,
+    pub payload: String,
+    pub label: Option<String>,
+    /// How many times a replay has stopped it, for the next retry's backoff.
+    pub attempts: u32,
+}
+
+/// Write the upload a heal owes, in [`REPAIRING`], before its bytes are
+/// published (R503). Returns the row's id; a standing `repairing` row of the
+/// same object is that row, so a retried heal owes it once.
+///
+/// Committed with `synchronous = FULL`, which in WAL mode syncs the log at
+/// commit, and — as on every connection [`open`] makes — with `fullfsync`, so
+/// that sync flushes the disk's cache too (R517): the obligation is on disk
+/// before the store's rename can be, and a power cut between the two leaves
+/// the debt rather than the bytes alone. The connection's `NORMAL` is put
+/// back whatever the outcome.
+pub fn owe_repair(
+    conn: &Connection,
+    profile_id: &str,
+    kind: &WorkKind,
+    label: &str,
+    now_ms: i64,
+) -> Result<i64> {
+    let payload = serde_json::to_string(kind)
+        .map_err(|e| SyncError::Journal(format!("work item is not serializable: {e}")))?;
+    conn.pragma_update(None, "synchronous", "FULL")?;
+    let owed = owe_repair_row(conn, profile_id, kind.tag(), &payload, label, now_ms);
+    let restored = conn.pragma_update(None, "synchronous", "NORMAL");
+    let id = owed?;
+    restored?;
+    Ok(id)
+}
+
+/// [`owe_repair`]'s transaction.
+fn owe_repair_row(
+    conn: &Connection,
+    profile_id: &str,
+    tag: &str,
+    payload: &str,
+    label: &str,
+    now_ms: i64,
+) -> Result<i64> {
+    let tx = conn.unchecked_transaction()?;
+    let standing: Option<i64> = tx
+        .query_row(
+            "SELECT id FROM journal
+              WHERE profile_id = ?1 AND payload = ?2 AND state = 'repairing'
+              ORDER BY id LIMIT 1",
+            (profile_id, payload),
+            |r| r.get(0),
+        )
+        .optional()?;
+    let id = match standing {
+        Some(id) => id,
+        None => {
+            tx.execute(
+                "INSERT INTO journal
+                     (profile_id, kind, payload, state, not_before_ms, created_ms, label)
+                 VALUES (?1, ?2, ?3, 'repairing', ?4, ?4, ?5)",
+                (profile_id, tag, payload, now_ms, label),
+            )?;
+            tx.last_insert_rowid()
+        }
+    };
+    tx.commit()?;
+    Ok(id)
+}
+
+/// The bytes a [`REPAIRING`] row owes are in the store: make it an ordinary
+/// `pending` upload and say "restored from history" for `path`, in one
+/// transaction. A repair a replay stopped ([`park_repair`]) is released the
+/// same way. `false` when the row is neither — released by another pass, or
+/// gone.
+pub fn release_repair(
+    conn: &Connection,
+    profile_id: &str,
+    id: i64,
+    path: &str,
+    size: u64,
+    now_ms: i64,
+) -> Result<bool> {
+    let tx = conn.unchecked_transaction()?;
+    let moved = tx.execute(
+        "UPDATE journal SET state = 'pending', not_before_ms = ?2, heal_after = NULL,
+                            last_error = NULL, cause = NULL
+          WHERE id = ?1
+            AND (state = 'repairing' OR (state = 'parked' AND cause = ?3))",
+        (id, now_ms, REPAIR_CAUSE),
+    )? > 0;
+    if moved {
+        insert_activity(
+            &tx,
+            profile_id,
+            now_ms,
+            &[ActivityEntry {
+                kind: ActivityKind::Restored,
+                path: path.to_owned(),
+                size_bytes: Some(size),
+                unit_id: Some(id),
+            }],
+        )?;
+    }
+    tx.commit()?;
+    Ok(moved)
+}
+
+/// Stop a repair a replay could not finish (R514): parked with `err`'s
+/// sentence, where the Sync view lists stopped work and the held push names
+/// it, and with [`REPAIR_CAUSE`] so it stays a repair. Replayed on its own
+/// once `not_before_ms` has passed ([`repairs`]); `i64::MAX` leaves it to a
+/// person's Retry.
+pub fn park_repair(conn: &Connection, id: i64, not_before_ms: i64, err: &SyncError) -> Result<()> {
+    conn.execute(
+        "UPDATE journal SET state = 'parked', not_before_ms = ?2, last_error = ?3, cause = ?4,
+                            attempts = attempts + 1
+          WHERE id = ?1 AND (state = 'repairing' OR (state = 'parked' AND cause = ?4))",
+        (id, not_before_ms, err.to_string(), REPAIR_CAUSE),
+    )?;
+    Ok(())
+}
+
+/// Every upload this profile's heals still owe, oldest first: each
+/// [`REPAIRING`] row, and each repair a replay stopped whose retry is due
+/// at `now_ms`.
+pub fn repairs(conn: &Connection, profile_id: &str, now_ms: i64) -> Result<Vec<Repair>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, payload, label, attempts FROM journal
+          WHERE profile_id = ?1
+            AND (state = 'repairing'
+                 OR (state = 'parked' AND cause = ?2 AND not_before_ms <= ?3))
+          ORDER BY id",
+    )?;
+    let rows = stmt.query_map((profile_id, REPAIR_CAUSE, now_ms), |r| {
+        Ok(Repair {
+            id: r.get(0)?,
+            payload: r.get(1)?,
+            label: r.get(2)?,
+            attempts: r.get::<_, i64>(3)?.clamp(0, i64::from(u32::MAX)) as u32,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Where a bounded history search for unit `id`'s object stopped (R503):
+/// the last object id it examined, from which the next attempt resumes.
+pub fn heal_cursor(conn: &Connection, id: i64) -> Result<Option<String>> {
+    Ok(conn
+        .query_row("SELECT heal_after FROM journal WHERE id = ?1", [id], |r| {
+            r.get::<_, Option<String>>(0)
+        })
+        .optional()?
+        .flatten())
+}
+
+/// Record (or, with `None`, forget) where unit `id`'s history search stopped.
+pub fn set_heal_cursor(conn: &Connection, id: i64, after: Option<&str>) -> Result<()> {
+    conn.execute(
+        "UPDATE journal SET heal_after = ?2 WHERE id = ?1",
+        (id, after),
+    )?;
+    Ok(())
 }
 
 /// Persist a profile's observed runtime state.
@@ -3125,6 +3776,10 @@ pub enum ActivityKind {
     /// recorded path is the *copy*, which is the file the user has to deal
     /// with.
     Conflict,
+    /// A large file whose object the server did not have, restored from this
+    /// folder's own history (Story 102.2): the row names the upload that
+    /// gives the server the bytes back.
+    Restored,
 }
 
 impl ActivityKind {
@@ -3137,6 +3792,7 @@ impl ActivityKind {
             Self::Modified => "modified",
             Self::Deleted => "deleted",
             Self::Conflict => "conflict",
+            Self::Restored => "restored",
         }
     }
 
@@ -3148,6 +3804,7 @@ impl ActivityKind {
             "modified" => Some(Self::Modified),
             "deleted" => Some(Self::Deleted),
             "conflict" => Some(Self::Conflict),
+            "restored" => Some(Self::Restored),
             _ => None,
         }
     }
@@ -3288,6 +3945,20 @@ pub fn record_activity(
     // connection behind a `Mutex` and hands out `&Connection`, so there is no
     // `&mut` to be had — and no second handle that could nest a transaction.
     let tx = conn.unchecked_transaction()?;
+    insert_activity(&tx, profile_id, ts_ms, rows)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// [`record_activity`]'s statements, inside a transaction the caller holds —
+/// for a write that must land in the same transaction as the activity it
+/// records ([`release_repair`]).
+fn insert_activity(
+    tx: &Connection,
+    profile_id: &str,
+    ts_ms: i64,
+    rows: &[ActivityEntry],
+) -> Result<()> {
     {
         let mut stmt = tx.prepare(
             "INSERT INTO activity (profile_id, ts_ms, kind, path, size_bytes, unit_id)
@@ -3319,7 +3990,6 @@ pub fn record_activity(
                  -1)",
         (profile_id, ACTIVITY_CAP as i64),
     )?;
-    tx.commit()?;
     Ok(())
 }
 
@@ -7185,6 +7855,180 @@ mod tests {
         assert!(claim_ready(&c, "p", 100, 10).expect("claim").is_empty());
     }
 
+    /// Park one unit of `kind` for `p` with `err`, the way the engine does.
+    fn park_with(c: &Connection, kind: &WorkKind, err: &SyncError) -> i64 {
+        let id = enqueue(c, "p", kind, 1, 0).expect("enqueue");
+        reschedule_failed(c, id, WorkState::Parked, 0, err).expect("park");
+        id
+    }
+
+    fn upload(oid: &str) -> WorkKind {
+        WorkKind::LfsUpload {
+            oid: oid.to_owned(),
+            size: 9,
+        }
+    }
+
+    /// Story 102.2, R467: the credential's return re-arms exactly the units
+    /// the credential stopped — a signed-out account, a rejected token, and a
+    /// row an older release wrote with the old sentence — and nothing a
+    /// sign-in cannot change: a 403, a refused setting, a missing object.
+    #[test]
+    fn the_credentials_return_rearms_only_what_the_credential_stopped() {
+        let c = conn();
+        let signed_out = park_with(
+            &c,
+            &upload("a"),
+            &SyncError::Credential("the account credential is unavailable: x".to_owned()),
+        );
+        let rejected = park_with(
+            &c,
+            &upload("b"),
+            &SyncError::Auth {
+                host: "electra".to_owned(),
+            },
+        );
+        let legacy = enqueue(&c, "p", &upload("c"), 1, 0).expect("enqueue");
+        reschedule(
+            &c,
+            legacy,
+            WorkState::Parked,
+            0,
+            Some("invalid sync configuration: the account credential is unavailable: Reconnect the repository."),
+        )
+        .expect("park as 0.10.5 did");
+        let forbidden = park_with(
+            &c,
+            &upload("d"),
+            &SyncError::Forbidden {
+                host: "electra".to_owned(),
+            },
+        );
+        let setting = park_with(
+            &c,
+            &upload("e"),
+            &SyncError::Config("choose its credential again".to_owned()),
+        );
+        let missing = park_with(
+            &c,
+            &WorkKind::LfsDownload {
+                oid: "f".to_owned(),
+                size: 9,
+            },
+            &SyncError::lfs_object_missing("electra", "f"),
+        );
+        let other_folder = enqueue(&c, "q", &upload("g"), 1, 0).expect("enqueue");
+        reschedule_failed(
+            &c,
+            other_folder,
+            WorkState::Parked,
+            0,
+            &SyncError::Credential("x".to_owned()),
+        )
+        .expect("park");
+
+        let done = rearm_credential(&c, "p", 7).expect("rearm");
+        assert_eq!(
+            done,
+            Rearmed {
+                requeued: 3,
+                folded: 0
+            }
+        );
+        let still: Vec<i64> = list_parked(&c, "p")
+            .expect("list")
+            .iter()
+            .map(|row| row.id)
+            .collect();
+        assert_eq!(still, vec![forbidden, setting, missing]);
+        let ready: Vec<i64> = claim_ready(&c, "p", 7, 10)
+            .expect("claim")
+            .iter()
+            .map(|item| item.id)
+            .collect();
+        assert_eq!(ready, vec![signed_out, rejected, legacy]);
+        assert_eq!(
+            list_parked(&c, "q").expect("list").len(),
+            1,
+            "not this folder's"
+        );
+    }
+
+    /// A unit the credential stops again right after each return is asked at
+    /// most `CREDENTIAL_REARMS` times, then left for a person — whose Retry
+    /// gives it the re-arms back.
+    #[test]
+    fn a_unit_the_credential_keeps_stopping_is_left_for_a_person_after_three_rearms() {
+        let c = conn();
+        let err = SyncError::Credential("the account credential is unavailable: x".to_owned());
+        let id = park_with(&c, &upload("a"), &err);
+        for round in 0..CREDENTIAL_REARMS {
+            assert_eq!(
+                rearm_credential(&c, "p", 1).expect("rearm").requeued,
+                1,
+                "{round}"
+            );
+            claim_ready(&c, "p", 1, 10).expect("claim");
+            reschedule_failed(&c, id, WorkState::Parked, 0, &err).expect("stopped again");
+        }
+        assert_eq!(rearm_credential(&c, "p", 1).expect("rearm").requeued, 0);
+        assert!(unpark(&c, "p", id).expect("a person's retry"));
+        claim_ready(&c, "p", 1, 10).expect("claim");
+        reschedule_failed(&c, id, WorkState::Parked, 0, &err).expect("stopped again");
+        assert_eq!(rearm_credential(&c, "p", 1).expect("rearm").requeued, 1);
+    }
+
+    /// "Retry all stopped": every stopped unit back, with identical work
+    /// folded into one row — neuradrive's 1 099 stopped downloads of one
+    /// object become one download — while every upload and push stays its own
+    /// row, because an activity row names the unit that delivers its file.
+    #[test]
+    fn retry_all_stopped_requeues_everything_and_folds_identical_downloads() {
+        let c = conn();
+        let err = SyncError::lfs_object_missing("electra", "f");
+        let download = WorkKind::LfsDownload {
+            oid: "f".to_owned(),
+            size: 9,
+        };
+        for _ in 0..4 {
+            park_with(&c, &download, &err);
+        }
+        let up = park_with(&c, &upload("a"), &err);
+        let up_again = park_with(&c, &upload("a"), &err);
+
+        let done = unpark_all(&c, "p", 1).expect("retry all");
+        assert_eq!(
+            done,
+            Rearmed {
+                requeued: 3,
+                folded: 3
+            }
+        );
+        assert!(list_parked(&c, "p").expect("list").is_empty());
+        let ready = claim_ready(&c, "p", 1, 10).expect("claim");
+        assert_eq!(ready.len(), 3);
+        assert!(ready.iter().any(|item| item.id == up));
+        assert!(ready.iter().any(|item| item.id == up_again));
+    }
+
+    /// The stopped list leads with uploads — the rows that hold the push — so a
+    /// fold of ten can never hide one under older stopped pulls.
+    #[test]
+    fn the_stopped_list_leads_with_the_uploads_that_hold_the_push() {
+        let c = conn();
+        let err = SyncError::Credential("x".to_owned());
+        let pulls: Vec<i64> = (0..3)
+            .map(|_| park_with(&c, &WorkKind::Pull, &err))
+            .collect();
+        let up = park_with(&c, &upload("a"), &err);
+        let order: Vec<i64> = list_parked(&c, "p")
+            .expect("list")
+            .iter()
+            .map(|row| row.id)
+            .collect();
+        assert_eq!(order, [vec![up], pulls].concat());
+    }
+
     fn entry(mtime_ms: i64, close_write: bool) -> PersistedEntry {
         PersistedEntry {
             sample: FileSample {
@@ -9968,6 +10812,39 @@ mod tests {
             "a stale first-sight decision cannot rewind an armed window"
         );
         assert_eq!(row.updated_ms, 1_000, "and the row is not touched at all");
+    }
+
+    /// A repair intent is only as durable as the flush its commit makes, and
+    /// a checkpoint can be run by whichever connection to the file wrote
+    /// last (R517, review R102S3-01). So every connection [`open`] hands out
+    /// — the one that created the file, a later one beside it, and one that
+    /// has just owed a repair under `synchronous = FULL` — flushes the disk's
+    /// cache on commit and on checkpoint.
+    #[test]
+    fn every_connection_to_the_journal_flushes_the_disk_cache() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let flags = |c: &Connection| -> Vec<(&str, i64)> {
+            ["fullfsync", "checkpoint_fullfsync"]
+                .into_iter()
+                .map(|p| {
+                    let on: i64 = c
+                        .query_row(&format!("PRAGMA {p}"), [], |row| row.get(0))
+                        .expect("pragma");
+                    (p, on)
+                })
+                .collect()
+        };
+        let on = vec![("fullfsync", 1), ("checkpoint_fullfsync", 1)];
+        let creating = open(dir.path()).expect("open");
+        assert_eq!(flags(&creating), on, "the connection that created the file");
+        let beside = open(dir.path()).expect("second open");
+        assert_eq!(flags(&beside), on, "a connection to the existing file");
+        let kind = WorkKind::LfsUpload {
+            oid: "a".repeat(64),
+            size: 1,
+        };
+        owe_repair(&beside, "p", &kind, "a.bin", 1).expect("owe");
+        assert_eq!(flags(&beside), on, "after a repair's FULL commit");
     }
 
     /// NFR-43's write half. `get_task` answers `None` for a row this build

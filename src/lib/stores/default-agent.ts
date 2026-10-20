@@ -17,12 +17,18 @@
  * `navRestore` is the phone's half of the launch rule: the phone applies it
  * only when its restored navigation (Story 14.4) had nothing to restore, so
  * the boot effect waits for `use-nav-state-persistence` to say which.
+ *
+ * `chooserOpen` is the launch's "Choose the agent keeper opens when it
+ * starts" (story 102.7, R463): opened by the launch when Rust says so
+ * (`AgentsLaunchVm.chooser`), closed by a choice or by putting it away —
+ * which Rust records so it is not offered again until keeper is updated.
  */
 import { useStore } from "zustand";
 import { createStore } from "zustand/vanilla";
 import { reportFrontendError } from "@/lib/crash-report";
 import {
   type AgentsLaunchVm,
+  agentsDefaultChooserDismiss,
   agentsDefaultGet,
   agentsDefaultSet,
   agentsLaunch,
@@ -48,6 +54,18 @@ export interface DefaultAgentState {
   /** Make `agent` the default (`null`: none); the new answer, or `null` when not saved. */
   choose: (agent: string | null) => Promise<AgentsLaunchVm | null>;
   setNavRestore: (navRestore: NavRestore) => void;
+  /** The launch's chooser is on screen in the Agents window. */
+  chooserOpen: boolean;
+  /** Show the launch's chooser (the launch, when Rust says so). */
+  openChooser: () => void;
+  /** Take the chooser off screen for this session (a choice was made). */
+  closeChooser: () => void;
+  /**
+   * Put the chooser away until keeper is updated; `null` when Rust stored
+   * it, else the failure's sentence (also reported to `keeper.log`) — the
+   * chooser then leaves the screen for this session all the same.
+   */
+  dismissChooser: () => Promise<string | null>;
 }
 
 /** Rust's sentence from a rejected command, else a generic one. */
@@ -137,6 +155,21 @@ export const defaultAgentStore = createStore<DefaultAgentState>()((set) => {
       }
     },
     setNavRestore: (navRestore) => set({ navRestore }),
+    chooserOpen: false,
+    openChooser: () => set({ chooserOpen: true }),
+    closeChooser: () => set({ chooserOpen: false }),
+    dismissChooser: async () => {
+      set({ chooserOpen: false });
+      try {
+        await agentsDefaultChooserDismiss();
+        return null;
+      } catch (error) {
+        // Rust wrote a WARN line for a failed write; a rejection it never
+        // saw (the bridge itself) reaches `keeper.log` only from here.
+        reportFrontendError("agents.default.chooser", error, null);
+        return `keeper could not remember that you put this away, so it may ask again next time: ${sentenceOf(error)}`;
+      }
+    },
   };
 });
 

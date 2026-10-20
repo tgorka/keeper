@@ -375,21 +375,36 @@ pub const KEY_SINCE: &[KeySince] = &[
 pub type KeySince = (&'static str, &'static str, fn(&AgentConfig) -> bool);
 
 /// A host serving agents, as its live manifest says: its slug, its build's
-/// keeper version and the `<drive>/<id>` of each agent it hosts.
+/// keeper version, the `<drive>/<id>` of each agent it hosts, whether it
+/// names a web search engine (`None` from a build that does not say, story
+/// 102.3) and whether its sandbox passed its probe (96.1 #11).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServingHost {
     pub host: String,
     pub version: String,
     pub agents: Vec<String>,
+    pub web_search: Option<bool>,
+    pub sandbox: bool,
 }
 
-/// What a save that writes a key some build cannot read says when this Mac
-/// could not read which hosts serve the agent (story 101.6, R436): it cannot
-/// tell that no older host serves it, so nothing is written.
-pub const HOSTS_UNREAD: &str = "keeper could not read which hosts serve your agents, so it cannot tell whether an older one would stop serving this agent; nothing was saved. The reason is in keeper's log; try again.";
+/// Why the hosts serving the agents could not be read (story 101.6, R436;
+/// R466, R484): a control room whose host manifests the server did not
+/// give. A save is refused with [`hosts_unread`]'s sentence.
+pub const HOSTS_UNREAD: &str = "the server did not give a control room's host manifests";
 
-/// The other live hosts serving this person's agents, as this Mac read their
-/// manifests, or [`HOSTS_UNREAD`]'s sentence when they could not be read. A
+/// What a save that writes a key some build cannot read says when this
+/// device could not read which hosts serve `name` (R436, R466): it cannot
+/// tell that no older host serves it, so nothing is written. `why` is the
+/// inventory's reason.
+pub fn hosts_unread(name: &str, why: &str) -> String {
+    let name = capitalised(name);
+    format!(
+        "keeper could not read which hosts serve {name}: {why}. It cannot tell whether an older one would stop serving {name}, so nothing was saved. The reason is in keeper's log; try again."
+    )
+}
+
+/// The other live hosts serving this person's agents, as this device read
+/// their manifests, or why they could not be read ([`HOSTS_UNREAD`]). A
 /// successful read that found none is an empty list, never an error.
 pub type Inventory<'a> = Result<&'a [ServingHost], &'a str>;
 
@@ -411,9 +426,11 @@ pub fn serving_from<'a>(
         })
         .filter(|manifest| Some(manifest.host.as_str()) != me && manifest.is_live(now_ms))
         .map(|manifest| ServingHost {
+            sandbox: manifest.tools.iter().any(|tool| tool == "sandbox"),
             host: manifest.host,
             version: manifest.version,
             agents: manifest.agents,
+            web_search: manifest.web_search,
         })
         .collect();
     hosts.sort_by(|a, b| (&a.host, &a.version, &a.agents).cmp(&(&b.host, &b.version, &b.agents)));
@@ -454,7 +471,7 @@ fn written_keys(config: &AgentConfig) -> Vec<(&'static str, &'static str)> {
 /// stop serving `name` (story 101.6, R422; every save of Settings › Agents,
 /// R460). Each such host is one sentence naming the keys it does not read;
 /// nothing is written while any stands. A save writing such a key while the
-/// hosts could not be read is refused with the inventory's sentence (R436);
+/// hosts could not be read is refused naming the agent and why (R436, R466);
 /// one writing none — a file a build before them reads — is not held to
 /// the hosts at all.
 pub fn older_hosts(
@@ -467,7 +484,7 @@ pub fn older_hosts(
         return Ok(());
     }
     let said: Vec<String> = serving
-        .map_err(str::to_owned)?
+        .map_err(|why| hosts_unread(&config.name, why))?
         .iter()
         .filter(|host| host.agents.iter().any(|served| served == agent))
         .filter_map(|host| {
@@ -776,6 +793,8 @@ mod tests {
             host: slug.to_owned(),
             version: version.to_owned(),
             agents: agents.iter().map(|agent| (*agent).to_owned()).collect(),
+            web_search: None,
+            sandbox: false,
         };
         let with = agent(OPUS, "effort = \"high\"\n", false);
         let without = agent(OPUS, "", false);
@@ -822,9 +841,9 @@ mod tests {
         );
     }
 
-    /// 101.6 #3 (R436, review 07): a save writing a key some build cannot
-    /// read is refused when the hosts could not be read, with the inventory's
-    /// own sentence; a read that found no host lets it through, and a save
+    /// 101.6 #3 (R436, review 07; R466): a save writing a key some build
+    /// cannot read is refused when the hosts could not be read, naming the
+    /// agent and why; a read that found no host lets it through, and a save
     /// writing no such key is not held to the hosts at all.
     #[test]
     fn an_unread_host_inventory_refuses_a_save_only_a_new_build_reads() {
@@ -832,7 +851,7 @@ mod tests {
         let without = agent(OPUS, "", false);
         assert_eq!(
             older_hosts(&with, "tgdrive/amelia", Err(HOSTS_UNREAD)),
-            Err(HOSTS_UNREAD.to_owned())
+            Err(hosts_unread("amelia", HOSTS_UNREAD))
         );
         assert_eq!(older_hosts(&with, "tgdrive/amelia", Ok(&[])), Ok(()));
         assert_eq!(
@@ -853,6 +872,8 @@ mod tests {
             host: "electra".to_owned(),
             version: version.to_owned(),
             agents: vec!["tgdrive/amelia".to_owned()],
+            web_search: None,
+            sandbox: false,
         };
         let (old, new) = ([host("0.10.3")], [host("0.10.4")]);
         let plain = agent(OPUS, "\n[tools]\nallow = [\"drive_read\"]\n", false);
@@ -875,7 +896,7 @@ mod tests {
             assert_eq!(older_hosts(&with, "tgdrive/amelia", Ok(&new)), Ok(()));
             assert_eq!(
                 older_hosts(&with, "tgdrive/amelia", Err(HOSTS_UNREAD)),
-                Err(HOSTS_UNREAD.to_owned())
+                Err(hosts_unread("amelia", HOSTS_UNREAD))
             );
         }
         let all = agent(
@@ -937,6 +958,8 @@ mod tests {
                 host: "electra".to_owned(),
                 version: "0.10.3".to_owned(),
                 agents: vec!["tgdrive/tola-grey".to_owned()],
+                web_search: None,
+                sandbox: false,
             }]
         );
     }

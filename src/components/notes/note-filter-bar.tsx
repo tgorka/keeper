@@ -182,8 +182,6 @@ export function NoteFilterBar({
   const [tagsLoading, setTagsLoading] = useState(false);
   const [tagsError, setTagsError] = useState<string | null>(null);
   const localSearchRef = useRef<HTMLTextAreaElement | null>(null);
-  const settingsObserver = useRef<MutationObserver | null>(null);
-  useEffect(() => () => settingsObserver.current?.disconnect(), []);
   useEffect(() => {
     setStalled(false);
     if (!searching) return;
@@ -261,21 +259,10 @@ export function NoteFilterBar({
     pinnedOnly ||
     text.trim() !== "";
   function openSearchSettings() {
-    settingsObserver.current?.disconnect();
+    // Settings lands the category, scrolls to the section and focuses the
+    // model field once it renders (Story 102.8).
+    settingsUiStore.getState().revealSection("notes-search", "notes-embedding-model");
     settingsUiStore.getState().setSettingsOpen(true);
-    const focus = () => {
-      const element = document.getElementById("notes-embedding-model");
-      if (!element) return false;
-      element.scrollIntoView({ block: "center" });
-      element.focus();
-      return true;
-    };
-    if (!focus()) {
-      settingsObserver.current = new MutationObserver(() => {
-        if (focus()) settingsObserver.current?.disconnect();
-      });
-      settingsObserver.current.observe(document.body, { childList: true, subtree: true });
-    }
   }
   async function createFromSearch(choice: CreateChoice) {
     if (creating) return;

@@ -23,8 +23,8 @@ use crate::agents::room::{AgentIcons, AgentKinds, BriefVm};
 use crate::forges::testing::{self, Reply, Seen};
 use crate::vm::{TimelineBatch, TimelineItemVm, TimelineOp};
 
-const ME: &str = "@tgorka:h";
-const NIXI: &str = "@nixi:h";
+pub(super) const ME: &str = "@tgorka:h";
+pub(super) const NIXI: &str = "@nixi:h";
 const TOLA: &str = "@tola:h";
 const MARTA: &str = "@marta:h";
 const OZZY: &str = "@ozzy:h";
@@ -97,14 +97,14 @@ fn set_members(shared: &Shared, members: Members) {
     shared.1.notify_all();
 }
 
-fn state(kind: &str, key: &str, sender: &str, content: Value, n: u64) -> Value {
+pub(super) fn state(kind: &str, key: &str, sender: &str, content: Value, n: u64) -> Value {
     json!({
         "type": kind, "state_key": key, "sender": sender, "content": content,
         "event_id": format!("$s{n}:h"), "origin_server_ts": 1_000 + n,
     })
 }
 
-fn member(user: &str, by: &str, membership: &str, n: u64) -> Value {
+pub(super) fn member(user: &str, by: &str, membership: &str, n: u64) -> Value {
     state(
         "m.room.member",
         user,
@@ -126,7 +126,7 @@ fn levels(users: Value, n: u64) -> Value {
 
 /// The state of a session room `creator` made, at 100, with the person and
 /// Tola in it: what a lazy-loading sync hands over, not the whole list.
-fn room_state(creator: &str) -> Vec<Value> {
+pub(super) fn room_state(creator: &str) -> Vec<Value> {
     vec![
         state(
             "m.room.create",
@@ -142,7 +142,7 @@ fn room_state(creator: &str) -> Vec<Value> {
     ]
 }
 
-fn message(sender: &str, content: Value, n: u64) -> Value {
+pub(super) fn message(sender: &str, content: Value, n: u64) -> Value {
     json!({
         "type": "m.room.message", "sender": sender, "content": content,
         "event_id": format!("$m{n}:h"), "origin_server_ts": 2_000 + n,
@@ -194,7 +194,7 @@ fn brief(from: &str, text: &str, readers: &[&str]) -> Value {
 
 /// A sync carrying `room`'s `state` and `timeline`, and the person's proxy
 /// list when `listed` names any.
-fn sync(
+pub(super) fn sync(
     n: u64,
     room: &str,
     state: Vec<Value>,
@@ -290,9 +290,9 @@ impl Device {
     }
 }
 
-struct Drawn {
-    batches: Arc<Mutex<Vec<TimelineBatch>>>,
-    producer: tokio::task::JoinHandle<()>,
+pub(super) struct Drawn {
+    pub(super) batches: Arc<Mutex<Vec<TimelineBatch>>>,
+    pub(super) producer: tokio::task::JoinHandle<()>,
 }
 
 impl Drop for Drawn {
@@ -303,7 +303,7 @@ impl Drop for Drawn {
 
 impl Drawn {
     /// Every batch's ops applied in order, as the frontend's store does.
-    fn items(&self) -> Vec<TimelineItemVm> {
+    pub(super) fn items(&self) -> Vec<TimelineItemVm> {
         let mut items: Vec<TimelineItemVm> = Vec::new();
         for batch in self.batches.lock().expect("batches").iter() {
             for op in &batch.ops {
@@ -373,7 +373,7 @@ impl Drawn {
         drawn
     }
 
-    async fn until(&self, what: &str, done: impl Fn(&Drawn) -> bool) {
+    pub(super) async fn until(&self, what: &str, done: impl Fn(&Drawn) -> bool) {
         let deadline = Instant::now() + Duration::from_secs(15);
         while !done(self) {
             assert!(

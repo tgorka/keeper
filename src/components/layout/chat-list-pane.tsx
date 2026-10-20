@@ -15,6 +15,7 @@
  */
 import { FilterX, MessagesSquare, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
+import { DefaultAgentChooser } from "@/components/agents/default-agent-chooser";
 import { ChatRow } from "@/components/chat/chat-row";
 import { FavoritesSection, hydrateFavoritesCollapsed } from "@/components/layout/favorites-section";
 import { PinsStrip } from "@/components/layout/pins-strip";
@@ -90,6 +91,7 @@ export function ChatListPane() {
   const inboxRooms = useRoomsStore((s) => s.rooms);
   const archiveRooms = useArchiveRoomsStore((s) => s.rooms);
   const agentRooms = useAgentRoomsStore((s) => s.rooms);
+  const agentNote = useAgentRoomsStore((s) => s.note);
   const pinsRooms = usePinsRoomsStore((s) => s.rooms);
   const favoritesRooms = useFavoritesRoomsStore((s) => s.rooms);
   const selected = useRoomsStore((s) => s.selected);
@@ -778,6 +780,19 @@ export function ChatListPane() {
             selected={selected}
           />
         )}
+        {/* Why some Agents rows are not live (story 102.5, R501): Rust's
+          sentence, said above the rows it is about. */}
+        {view === "agents" && agentNote !== null && (
+          <p
+            role="status"
+            className="shrink-0 border-border border-b px-3 py-2 text-muted-foreground text-xs"
+          >
+            {agentNote}
+          </p>
+        )}
+        {/* The launch's "Choose the agent keeper opens when it starts"
+            (story 102.7, R463): non-blocking, above the agents it lists. */}
+        {view === "agents" && <DefaultAgentChooser />}
         {errored ? (
           <div className="flex flex-1 items-center justify-center p-4">
             <p className="text-center text-muted-foreground text-sm">

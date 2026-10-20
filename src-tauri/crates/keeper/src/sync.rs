@@ -82,12 +82,15 @@ impl SyncPlatform for ShellSyncPlatform {
     /// item: its credential is the account's access token, refreshed as
     /// needed, and keeper-sync spends it exactly as it would a stored token.
     fn secret_get(&self, key: &str) -> SyncResult<Option<String>> {
+        // Typed at the source (Story 102.2): a credential that could not be
+        // produced is `SyncError::Credential`, re-armed by its return, and a
+        // drive whose setting no longer fits stays `Config`.
         if let Some(answer) = crate::account_ipc::drive_credential(&self.platform, key) {
-            return answer.map(Some).map_err(SyncError::Config);
+            return answer.map(Some);
         }
         self.platform
             .keychain_get(key)
-            .map_err(|err| SyncError::Config(format!("keychain read failed: {err}")))
+            .map_err(|err| SyncError::Credential(format!("keychain read failed: {err}")))
     }
 
     fn secret_set(&self, key: &str, value: &str) -> SyncResult<()> {

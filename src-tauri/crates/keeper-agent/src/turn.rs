@@ -339,6 +339,10 @@ pub struct Armed {
     pub default_profile_id: String,
     /// Where the turn came from, as `origin_of` answered.
     pub origin: TurnOrigin,
+    /// Why the model was offered no tools at all this turn, when it was not
+    /// ([`tools::offer_tools`]'s reason): an agent's turn says it (story
+    /// 102.3).
+    pub withheld: Option<&'static str>,
 }
 
 /// Everything about one turn that `keeper-core` decides from the live grants,
@@ -412,9 +416,13 @@ pub(crate) async fn arm_turn_probing(
                 .and_then(|found| found.tools)
         };
     let offer = tools::offer_tools(kind, tools_supported, &grants);
-    if let ToolOffer::Withheld { reason } = &offer {
-        tracing::debug!(reason, "bots: no tools offered this turn");
-    }
+    let withheld = match &offer {
+        ToolOffer::Withheld { reason } => {
+            tracing::debug!(reason, "bots: no tools offered this turn");
+            Some(*reason)
+        }
+        _ => None,
+    };
 
     let drive = match &env.drive {
         Some(ports) => host::arm_drive(ports, source, &grants, offer.is_offered()),
@@ -471,6 +479,7 @@ pub(crate) async fn arm_turn_probing(
         profiles: drive.profiles,
         default_profile_id,
         origin,
+        withheld,
     }
 }
 

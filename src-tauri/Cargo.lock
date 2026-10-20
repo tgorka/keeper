@@ -4486,6 +4486,7 @@ dependencies = [
  "tracing-subscriber",
  "ulid",
  "url",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -4496,6 +4497,7 @@ dependencies = [
  "chrono",
  "clap",
  "fs4",
+ "image",
  "keeper-agent",
  "keeper-core",
  "keeper-ported",
@@ -4547,6 +4549,7 @@ dependencies = [
  "rsa",
  "rusqlite",
  "rustls",
+ "semver",
  "serde",
  "serde_json",
  "sha2",

@@ -43,9 +43,9 @@ fn main() -> ExitCode {
     if let Some(code) = served_as_sandbox_trampoline() {
         return code;
     }
-    // A person's PDF, read by a worker under its own bounds (R444/03).
-    if let Some(code) = keeper_agent::attachments::served_as_pdf_reader(std::env::args_os().skip(1))
-    {
+    // A person's PDF read, or a photo made smaller, by a worker under its
+    // own bounds (R444/03, R489).
+    if let Some(code) = keeper_agent::attachments::served_as_worker(std::env::args_os().skip(1)) {
         return ExitCode::from(u8::try_from(code).unwrap_or(1));
     }
     if served_as_lfs_filter() {

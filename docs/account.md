@@ -423,21 +423,29 @@ whenever Settings opens.
 - **Other desktops** (Linux, Windows) open the default browser and receive the callback
   through the `keeper://` link.
 
-**When the browser does not open.** While a sign-in waits for its browser, the setup sheet and
-Settings › Account (and, for a Matrix single sign-on, the login screen) show the sign-in page's address under
-"Browser didn't open? Copy the sign-in link", with a copy button: paste it into any browser on
-this device and the sign-in finishes as usual. When keeper could not open the page itself, it
-says why in the same place and keeps waiting rather than failing. The address carries the
-attempt's `state`, PKCE challenge and nonce but nothing that finishes the sign-in anywhere
-else; it is shown, never written to `keeper.log`.
+**If the browser or the sheet does not come forward.** While a sign-in waits, keeper shows its
+authorization page as selectable text with *Copy link* (story 102.9): paste it into any
+browser and the sign-in finishes as if it had opened by itself. When keeper could not open
+the page — the browser would not start, or iOS refused the sheet after it was asked for —
+keeper says so beside the link and keeps waiting for it until the sign-in's own five minutes
+run out or you press Cancel. The link goes away the moment the sign-in ends, however it ends:
+it carries that one attempt's `state`, which nothing answers afterwards, so a timed-out
+sign-in offers *Sign in* again for a fresh one. The Matrix single sign-on a restored device
+starts by itself has the same link on its own line under Settings › Account, with *Cancel
+Matrix sign-in* — which works from the moment the line appears, even before the link does: a
+cancelled sign-in never opens a browser afterwards. A sign-out page is never shown this way: its address carries your ID token.
 
 **When the server does not answer.** Discovery — everything a sign-in asks the identity
-provider (or, for Matrix, the homeserver) before the browser opens — has ten seconds. A
-server behind a network that drops keeper's packets (a tailnet rule without a grant for that
-port, a VPN that is off) refuses nothing, so without this the sign-in sat silent until the
-five-minute browser timeout. Now it stops with the server's address and port: "Can't reach
-id.acme.dev:8451: it did not answer within 10 seconds. Check that this device is on a network
-(or VPN) that can reach it."
+provider (or, for Matrix, the homeserver and its sign-in server) before the browser opens —
+has ten seconds. A server behind a network that drops keeper's packets (a tailnet rule without
+a grant for that port, a VPN that is off) refuses nothing, so without this the sign-in sat
+silent until the five-minute browser timeout. Now it stops with the server's address and
+port: "Can't reach id.acme.dev:8451: it did not answer within 10 seconds. Check that this
+device is on a network (or VPN) that can reach it." This happens before the sign-in has a
+page, so there is no link to copy: the login screen, the setup sheet, Settings › Account and a
+restored device's Matrix sign-in line say the sentence and offer a fresh sign-in. A
+background sync that cannot reach the account still says the quiet "Offline", and a
+background token refresh keeps its HTTP client's own timeouts.
 
 *Cancel*, in keeper or in the sign-in window, ends the attempt as cancelled, not failed: the
 setup sheet says the sign-in was closed and nothing was set up (or, for an account already
