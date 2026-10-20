@@ -1,8 +1,48 @@
 # Agents
 
-Agents are named souls that live in a drive, work in that drive's sessions and talk over
-Matrix. This is the operator document: what is on disk, what keeper reads and writes, what
-it never touches, and what to do when something is wrong. The design reasoning lives in
+## The Agents window on this device
+
+The Agents window reads Rust's local database sessions, not Matrix rooms. Sessions from every
+database this device holds share one list. Each row and the opened session's header name the
+database; identical session ids in two databases remain separate conversations. Rows show the
+agent, last activity and Rust's attention state. **Active**, **Archived** and **All** change only
+which rows are shown, never their order or the underlying subscription.
+
+Opening a session shows its newest visible page. **Earlier messages**, or scrolling to the top,
+asks Rust to widen the history window. **Archive session** keeps the list row and marks the
+session archived; **Unarchive session** continues it. An archived read-only page has no composer.
+The frontend does not download all history to assemble a conversation.
+
+**New session** offers the database directory's agents. An agent serving one database names that
+database without a picker; an agent serving several asks where the session belongs. Sending the
+first message creates the session and message together. Message captions — **waiting**, **sent**,
+**taken** — come from Rust, not delivery/read receipts. The shared composer retains a refused
+send; database sessions never read or write Matrix drafts. An unsent draft lives only in the open
+composer and is not restored after leaving that session.
+
+Approval cards show the exact action and its binding digest. A decision is addressed to its
+database and session and bound to that digest; a server refusal stays beside the action. The
+**Waiting for you** group collects pending decisions across databases. A question in a message
+offers its options, or the normal composer for a free-text answer; Rust closes the question after
+the person's reply. On phones the list and conversation are separate screens, with **Back to
+sessions** returning to the list. The Notes dock and tablet assistant sheet use the same list
+mirror with independent selections, and launch opens Rust's local default session.
+
+**Earlier conversations** preserves earlier Matrix agent history as read-only. The former dock's
+Matrix note-focus and drive-scope controls are not sent to database agents: those carriers were
+not migrated by this story. Live tail rendering, thinking/details and instance selection belong
+to the subsequent stories; message and attention state remain Rust-owned throughout.
+
+Browser checks use the development mock shell (`?sessions=launch`, optionally
+`&platform=phone`), not a server or a performance measurement. The installed macOS shell and the
+archived-session ≤1 s tailnet target still require the native/device gates; mock page timing is
+not evidence for that target.
+
+## Earlier Matrix agent hosting
+
+The remaining sections describe the earlier drive-and-Matrix host, retained while its history
+and hosting paths are retired. They do not describe the database-backed Agents window above.
+The design reasoning lives in
 `_bmad-output/planning-artifacts/architecture/architecture-keeper-2026-07-03/ARCHITECTURE-AGENTS.md`
 (AD-360…AD-416) and the evidence in `_bmad-output/planning-artifacts/research-agents-2026-10-02.md`;
 the decisions are D-31…D-36 in `docs/decisions.md`.
