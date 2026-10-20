@@ -24,7 +24,7 @@ use keeper_core::demo::snapshot_then_diff;
 use keeper_core::egress::{compute_egress, EGRESS_RELEASE_CHECK_ENDPOINT, EGRESS_UPDATE_ENDPOINT};
 use keeper_core::error::{
     AccountError, ArchiveError, AuthError, BackupError, BridgeError, CoreError, InboxError,
-    MediaError, PlatformError, RecordingError, SendError, SignalError, TimelineError,
+    MediaError, NotOpened, PlatformError, RecordingError, SendError, SignalError, TimelineError,
     VerificationError,
 };
 #[cfg(desktop)]
@@ -652,6 +652,20 @@ pub fn set_badge_app_handle(handle: tauri::AppHandle) {
 #[cfg(desktop)]
 static KEYCHAIN_CACHE: LazyLock<SecretCache> = LazyLock::new(SecretCache::new);
 
+/// The opener plugin's `error` as the kind of failure it is — never its
+/// words: the `open` crate's error quotes the command it ran, page included,
+/// and the page may be a sign-in's authorization request (R522).
+fn not_opened(error: &tauri_plugin_opener::Error) -> CoreError {
+    use tauri_plugin_opener::Error;
+    let kind = match error {
+        Error::Io(error) => NotOpened::of_io(error),
+        Error::UnknownProgramName(_) | Error::UnsupportedPlatform => NotOpened::NoHandler,
+        Error::ForbiddenUrl { .. } | Error::ForbiddenPath { .. } => NotOpened::PermissionDenied,
+        _ => NotOpened::Failed,
+    };
+    PlatformError::NotOpened(kind).into()
+}
+
 /// Concrete [`Platform`] implementation for the desktop shell.
 ///
 /// The data-dir port is fully wired via `dirs`; the remaining ports return
@@ -724,8 +738,7 @@ impl Platform for DesktopPlatform {
     fn open_url(&self, url: &str) -> Result<(), CoreError> {
         // Open in the system default browser (no explicit `with` program). Used
         // by the OIDC flow to present the OAuth authorization URL for consent.
-        tauri_plugin_opener::open_url(url, None::<&str>)
-            .map_err(|e| CoreError::Internal(format!("could not open the system browser: {e}")))
+        tauri_plugin_opener::open_url(url, None::<&str>).map_err(|e| not_opened(&e))
     }
 
     fn notify(&self, title: &str, body: &str, target: &NotifyTarget) -> Result<(), CoreError> {
@@ -1004,8 +1017,7 @@ impl Platform for IosPlatform {
     fn open_url(&self, url: &str) -> Result<(), CoreError> {
         // "Open in browser" stays `tauri_plugin_opener::open_url` on iOS too —
         // it hands the URL to the OS (Safari / the default handler).
-        tauri_plugin_opener::open_url(url, None::<&str>)
-            .map_err(|e| CoreError::Internal(format!("could not open the system browser: {e}")))
+        tauri_plugin_opener::open_url(url, None::<&str>).map_err(|e| not_opened(&e))
     }
 
     /// The account sign-in (Epic 82, AD-311): `ASWebAuthenticationSession`
@@ -1197,7 +1209,7 @@ impl Platform for AndroidPlatform {
         })?;
         app.opener()
             .open_url(url, Some("inAppBrowser"))
-            .map_err(|e| CoreError::Internal(format!("could not open the browser: {e}")))
+            .map_err(|e| not_opened(&e))
     }
 
     /// The account sign-in (Epic 82, AD-311; story 98.3): an Auth Tab, which
@@ -1408,6 +1420,9 @@ pub(crate) fn to_ipc_error(err: CoreError) -> IpcError {
         // swallows it at every call site, so it should never reach a command edge. If it
         // ever does, it is an internal, non-retriable condition (mirrors Keychain).
         CoreError::Platform(PlatformError::BackupExclusion(_)) => (IpcErrorCode::Internal, false),
+        // A page the system would not open: as before, an internal failure
+        // (its message now says only what kind, R522).
+        CoreError::Platform(PlatformError::NotOpened(_)) => (IpcErrorCode::Internal, false),
         CoreError::Internal(_) => (IpcErrorCode::Internal, false),
         CoreError::Auth(AuthError::ServerUnreachable(_)) => (IpcErrorCode::ServerUnreachable, true),
         // The server did not answer before the browser opened: the message

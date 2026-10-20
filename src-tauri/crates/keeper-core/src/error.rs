@@ -38,6 +38,67 @@ pub enum PlatformError {
     /// login, or session-restore.
     #[error("backup exclusion failed: {0}")]
     BackupExclusion(String),
+
+    /// The system did not open a page keeper asked it to open — a browser, a
+    /// sign-in sheet, a settings pane. Carries the kind of failure and never
+    /// the opener's words: an opener's error can quote the command it ran,
+    /// page included, in any encoding (R522).
+    #[error("the page did not open: {0}")]
+    NotOpened(NotOpened),
+}
+
+/// Why the system did not open a page, as a kind. What a log line may say
+/// about a failed opener: a category taken from the error's kind or OS code,
+/// never from its message (R522).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotOpened {
+    /// Nothing on this system opens it: no opener program, no browser.
+    NoHandler,
+    /// The system refused keeper permission to open it.
+    PermissionDenied,
+    /// The opener could not be started; the OS error code says why.
+    SpawnFailed(i32),
+    /// The opener started, or the platform's browser half answered, and it
+    /// failed.
+    Failed,
+    /// This build or platform opens no pages, or not yet.
+    Unavailable,
+}
+
+impl NotOpened {
+    /// The kind of an I/O error an opener returned: its `ErrorKind` and OS
+    /// code, never its text.
+    pub fn of_io(error: &std::io::Error) -> Self {
+        match error.kind() {
+            std::io::ErrorKind::NotFound => Self::NoHandler,
+            std::io::ErrorKind::PermissionDenied => Self::PermissionDenied,
+            _ => error.raw_os_error().map_or(Self::Failed, Self::SpawnFailed),
+        }
+    }
+
+    /// The kind of whatever an opener returned: the shell's own category
+    /// when it gave one, else what the error's variant says.
+    pub fn of(error: &CoreError) -> Self {
+        match error {
+            CoreError::Platform(PlatformError::NotOpened(kind)) => *kind,
+            CoreError::Platform(PlatformError::Unsupported(_)) | CoreError::Unsupported(_) => {
+                Self::Unavailable
+            }
+            _ => Self::Failed,
+        }
+    }
+}
+
+impl std::fmt::Display for NotOpened {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoHandler => f.write_str("no handler"),
+            Self::PermissionDenied => f.write_str("permission denied"),
+            Self::SpawnFailed(code) => write!(f, "spawn failed (os error {code})"),
+            Self::Failed => f.write_str("failed"),
+            Self::Unavailable => f.write_str("unavailable"),
+        }
+    }
 }
 
 /// Errors originating in the password login flow.
