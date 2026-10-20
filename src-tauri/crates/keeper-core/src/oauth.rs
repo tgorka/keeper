@@ -16,6 +16,7 @@
 //! no dangling senders or leaked `state` secrets accumulate.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -40,12 +41,26 @@ const CLIENT_URI: &str = "https://keeper.tgorka.dev/";
 /// Human-readable client name presented to the user on the consent screen.
 const CLIENT_NAME: &str = "keeper";
 
-/// How long a sign-in waits for its server to answer before any browser
-/// opens: discovery, and for Matrix the homeserver probe. A server behind a
-/// network that drops keeper's packets (a tailnet ACL without a grant, a VPN
-/// that is off) never refuses the connection, and without this budget the
-/// sign-in waited out the five-minute browser timeout saying nothing.
+/// How long one request a sign-in makes before any browser opens may go
+/// unanswered: each discovery request, and for Matrix each request of the
+/// homeserver probe, the metadata reads and the client registration. A
+/// server behind a network that drops keeper's packets (a tailnet ACL
+/// without a grant, a VPN that is off) never refuses the connection, and
+/// without this budget the sign-in waited out the five-minute browser
+/// timeout saying nothing. The budget is per request, so the sentence names
+/// the server that request went to — not the one asked before it (R541-03).
 pub const REACH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// `work` — one request, to `address` — within [`REACH_TIMEOUT`], or the
+/// [`no_answer`] sentence naming `address`.
+pub async fn within_reach<T>(address: &str, work: impl Future<Output = T>) -> Result<T, String> {
+    tokio::time::timeout(REACH_TIMEOUT, work)
+        .await
+        .map_err(|_| {
+            tracing::warn!(%address, "sign-in: a server did not answer in time");
+            no_answer(address)
+        })
+}
 
 /// The `host[:port]` a sign-in reaches for `raw` — the port only when the
 /// address names one — or `raw` itself when it is not a URL (a bare Matrix

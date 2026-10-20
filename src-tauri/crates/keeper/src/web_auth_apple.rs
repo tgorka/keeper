@@ -333,9 +333,13 @@ fn ending(callback: Option<&NSURL>, error: Option<&NSError>) -> Ending {
     {
         return Ending::Cancelled;
     }
+    // The error's domain and code, never its description: the sign-in sheet
+    // is the opener of an authorization page, and an opener's words may
+    // quote it (R522). `web_auth::finish` logs this reason.
     Ending::Failed(format!(
-        "the sign-in sheet could not finish: {}",
-        error.localizedDescription()
+        "the sign-in sheet could not finish ({} error {})",
+        error.domain(),
+        error.code()
     ))
 }
 

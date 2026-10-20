@@ -39,7 +39,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::UnboundedReceiver;
 use ts_rs::TS;
 
-use crate::error::CoreError;
+use crate::error::{CoreError, NotOpened};
 use crate::platform::Platform;
 use crate::vm::NotifyTarget;
 
@@ -90,29 +90,14 @@ pub fn offer<'a>(
     };
     shown.show(None);
     if let Err(error) = open() {
-        // The reason, never the URL: R381's log line names what failed, and
-        // an opener can quote the command it ran, page included.
-        match without_the_page(&error, url) {
-            Some(reason) => tracing::warn!(%reason, "sign-in: the sign-in page did not open; the sign-in keeps waiting for its link to be used by hand"),
-            None => tracing::warn!("sign-in: the sign-in page did not open; the sign-in keeps waiting for its link to be used by hand"),
-        }
+        // What kind of failure, never the opener's words: its error can
+        // quote the command it ran, page included, in any encoding and cut
+        // anywhere — so no text of it is logged at all (R381, R522).
+        let category = NotOpened::of(&error);
+        tracing::warn!(%category, "sign-in: the sign-in page did not open; the sign-in keeps waiting for its link to be used by hand");
         shown.show(Some(NOT_OPENED));
     }
     shown
-}
-
-/// The opener's `error` with the page it was asked to open taken out: an
-/// opener's error can quote the command it ran, URL included (`Launcher
-/// "/usr/bin/open" "<url>" failed …`). `None` when a value the page carries
-/// — its `state`, challenge or nonce — is still in the text in some other
-/// form, so the log line goes without the reason rather than with the page.
-fn without_the_page(error: &CoreError, url: &str) -> Option<String> {
-    let words = error.to_string().replace(url, "<the sign-in page>");
-    let page = url::Url::parse(url).ok()?;
-    let carried = page
-        .query_pairs()
-        .any(|(_, value)| value.len() >= 8 && words.contains(value.as_ref()));
-    (!carried).then_some(words)
 }
 
 /// One sign-in's link on screen. Dropped when the sign-in ends — however it
@@ -247,13 +232,13 @@ impl<F: Fn(u64, Option<&SignInLinkVm>) + Send + Sync> Platform for ShowsSignInLi
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::Mutex;
 
     /// Records, in order, every link shown and every page opened.
     #[derive(Default)]
-    struct Recorder {
+    pub(crate) struct Recorder {
         events: Mutex<Vec<String>>,
         fails: bool,
     }
@@ -406,74 +391,9 @@ mod tests {
         assert_eq!(slot.link(), None);
     }
 
-    /// Everything logged while `run` runs, as text.
-    fn logged(run: impl FnOnce()) -> String {
-        #[derive(Clone, Default)]
-        struct Captured(std::sync::Arc<Mutex<Vec<u8>>>);
-        impl std::io::Write for Captured {
-            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().expect("captured").extend_from_slice(bytes);
-                Ok(bytes.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        let captured = Captured::default();
-        let writer = captured.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_ansi(false)
-            .with_max_level(tracing::Level::TRACE)
-            .with_writer(move || writer.clone())
-            .finish();
-        tracing::subscriber::with_default(subscriber, run);
-        let bytes = captured.0.lock().expect("captured").clone();
-        String::from_utf8(bytes).expect("utf-8")
-    }
-
     /// A page with the values a real authorization request carries.
-    const PAGE: &str = "https://id.example:8451/authorize?client_id=k&state=Zq3xW9vLp2Rt8sYb\
+    pub(crate) const PAGE: &str = "https://id.example:8451/authorize?client_id=k&state=Zq3xW9vLp2Rt8sYb\
                         &code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&nonce=n0nce4Sign1n";
-
-    /// An opener that quotes the command it ran (`open`'s "Launcher … failed")
-    /// never carries the page into `keeper.log`: the line names what failed
-    /// with the page taken out, and an opener that quotes the page in some
-    /// other form loses its words rather than leak the page's values.
-    #[test]
-    fn a_page_that_did_not_open_never_reaches_the_log() {
-        let platform = Recorder::default();
-        let quoted = logged(|| {
-            let _shown = offer(&platform, PAGE, || {
-                Err(CoreError::Internal(format!(
-                    "Launcher \"/usr/bin/open\" \"{PAGE}\" failed with exit status 1"
-                )))
-            });
-        });
-        assert!(quoted.contains("the sign-in page did not open"), "{quoted}");
-        assert!(quoted.contains("failed with exit status 1"), "{quoted}");
-        for value in [
-            "Zq3xW9vLp2Rt8sYb",
-            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
-            "n0nce4Sign1n",
-        ] {
-            assert!(!quoted.contains(value), "{quoted}");
-        }
-
-        let encoded = logged(|| {
-            let _shown = offer(&platform, PAGE, || {
-                Err(CoreError::Internal(
-                    "xdg-open: no handler for https%3A%2F%2Fid.example%3A8451%2Fauthorize%3F\
-                     state%3DZq3xW9vLp2Rt8sYb"
-                        .to_owned(),
-                ))
-            });
-        });
-        assert!(
-            encoded.contains("the sign-in page did not open"),
-            "{encoded}"
-        );
-        assert!(!encoded.contains("Zq3xW9vLp2Rt8sYb"), "{encoded}");
-    }
 
     /// The page is shown, never printed by a `{:?}` of what holds it.
     #[test]

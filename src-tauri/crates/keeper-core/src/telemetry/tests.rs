@@ -1776,3 +1776,101 @@ async fn live_a_warning_reaches_posthog() {
     worker.abort();
     let _ = worker.await;
 }
+
+/// R522 (R541-01), at both boundaries — `keeper.log` and the exported
+/// payload: a sign-in page the opener could not open leaves a fixed line and
+/// the opener's kind of failure, never the opener's words, however they carry
+/// the page — quoted whole, percent-encoded with the state's first character
+/// encoded, cut short, or nested in a forge's `redirect_to`.
+#[test]
+fn an_opener_that_quotes_the_sign_in_page_leaves_none_of_it_in_the_log_or_the_export() {
+    use crate::error::{CoreError, NotOpened, PlatformError};
+    use crate::sign_in_link::offer;
+    use crate::sign_in_link::tests::{Recorder, PAGE};
+
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Captured {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("captured").extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    // A forge's sign-in page wraps the authorization request in `redirect_to`.
+    let forge = format!(
+        "https://forge.example/user/login?redirect_to={}",
+        url::form_urlencoded::byte_serialize(PAGE.as_bytes()).collect::<String>()
+    );
+    let internal =
+        |words: String| CoreError::Internal(format!("could not open the browser: {words}"));
+    let openers = [
+        (PAGE.to_owned(), internal(format!("Launcher \"/usr/bin/open\" \"{PAGE}\" failed with exit status 1"))),
+        (PAGE.to_owned(), internal("xdg-open: https%3A%2F%2Fid.example%3A8451%2Fauthorize%3Fstate%3D%5Aq3xW9vLp2Rt8sYb".to_owned())),
+        (PAGE.to_owned(), internal("xdg-open: https%3A%2F%2Fid.example%3A8451%2Fauthorize%3Fstate%3DZq3xW9vL...".to_owned())),
+        (forge.clone(), internal(format!("xdg-open: {}", &forge[..forge.len() - 24]))),
+        (PAGE.to_owned(), CoreError::Platform(PlatformError::NotOpened(NotOpened::NoHandler))),
+    ];
+
+    // One telemetry per opener: a callsite's problem is admitted once a
+    // minute, and every opener's line must reach the export.
+    let platform = Recorder::default();
+    let mut log = String::new();
+    let mut payloads = Vec::new();
+    for (page, error) in openers {
+        let local = LocalDir::new();
+        let telemetry = Telemetry::open(Some(&local.0), Some(config()));
+        telemetry.set_consent(diagnostics()).expect("consent");
+        let export = LogExport::new();
+        export.attach(&telemetry);
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let filter = tracing_subscriber::EnvFilter::new(keeper_sync_default_filter());
+        tracing::subscriber::with_default(
+            log_subscriber(filter, move || writer.clone(), export),
+            || {
+                let _shown = offer(&platform, &page, move || Err(error));
+            },
+        );
+        let line = String::from_utf8(captured.0.lock().expect("captured").clone()).expect("utf-8");
+        assert!(line.contains("the sign-in page did not open"), "{line}");
+        let exported = queued_payloads(&telemetry);
+        assert_eq!(exported.len(), 1, "{exported:?}");
+        assert!(
+            exported[0].contains("the sign-in page did not open"),
+            "{exported:?}"
+        );
+        log.push_str(&line);
+        payloads.extend(exported);
+    }
+    assert_eq!(log.matches("category=failed").count(), 4, "{log}");
+    assert_eq!(log.matches("category=no handler").count(), 1, "{log}");
+    // The page's own values, its hosts and the opener's words, in any form.
+    for material in [
+        "q3xW9vL",
+        "E9Melhoa2Owv",
+        "n0nce4Sign1n",
+        "id.example",
+        "forge.example",
+        "authorize",
+        "redirect_to",
+        "Launcher",
+        "xdg-open",
+        "exit status",
+        "could not open the browser",
+    ] {
+        assert!(
+            !log.contains(material),
+            "{material} reached keeper.log: {log}"
+        );
+        for payload in &payloads {
+            assert!(
+                !payload.contains(material),
+                "{material} was exported: {payload}"
+            );
+        }
+    }
+}

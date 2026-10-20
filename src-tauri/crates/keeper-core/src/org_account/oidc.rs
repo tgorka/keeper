@@ -38,12 +38,12 @@ use openidconnect::core::{
     CoreSubjectIdentifierType, CoreTokenResponse,
 };
 use openidconnect::{
-    AccessToken, AccessTokenHash, AdditionalProviderMetadata, AuthUrl, AuthorizationCode,
-    ClaimsVerificationError, ClientId, CsrfToken, DiscoveryError, EndSessionUrl, EndpointNotSet,
-    EndpointSet, IssuerUrl, JsonWebKey as _, JsonWebKeySetUrl, LogoutRequest, Nonce,
-    OAuth2TokenResponse, PkceCodeChallenge, PkceCodeVerifier, ProviderMetadata, RedirectUrl,
-    RefreshToken, RequestTokenError, RevocationUrl, Scope, SignatureVerificationError,
-    TokenResponse, TokenUrl,
+    AccessToken, AccessTokenHash, AdditionalProviderMetadata, AsyncHttpClient, AuthUrl,
+    AuthorizationCode, ClaimsVerificationError, ClientId, CsrfToken, DiscoveryError, EndSessionUrl,
+    EndpointNotSet, EndpointSet, HttpClientError, HttpRequest, HttpResponse, IssuerUrl,
+    JsonWebKey as _, JsonWebKeySetUrl, LogoutRequest, Nonce, OAuth2TokenResponse,
+    PkceCodeChallenge, PkceCodeVerifier, ProviderMetadata, RedirectUrl, RefreshToken,
+    RequestTokenError, RevocationUrl, Scope, SignatureVerificationError, TokenResponse, TokenUrl,
 };
 use serde::{Deserialize, Serialize};
 use url::Url;
@@ -56,7 +56,7 @@ use super::session::{
     StoredSession,
 };
 use super::{claims, AccountError};
-use crate::oauth::{address_of, no_answer, OAuthCallback, OAuthFlowRegistry, REACH_TIMEOUT};
+use crate::oauth::{address_of, within_reach, OAuthCallback, OAuthFlowRegistry};
 use crate::platform::Platform;
 
 /// How long a sign-in waits for the browser to come back.
@@ -186,15 +186,80 @@ fn bad_url(what: &str, host: &str) -> AccountError {
     AccountError::Refused(format!("{host} published an unusable {what} address."))
 }
 
-/// `address` is the `host[:port]` the request went to, which a person needs
-/// when the port is what a network rule blocks; `host` names the provider.
-fn discovery_error<E: std::error::Error>(
-    host: &str,
-    address: &str,
-    error: DiscoveryError<E>,
-) -> AccountError {
+/// The HTTP client discovery asks through. Before a sign-in's browser opens
+/// (`bounded`), each request has [`crate::oauth::REACH_TIMEOUT`]; a
+/// background refresh's discovery keeps the HTTP client's own timeouts and
+/// its quiet offline status. Either way a request that brings no response is
+/// named by its own server — the issuer for its document, the key set's host
+/// for its keys — never by the one asked before it (R541-03).
+struct Discoverer<'a> {
+    http: &'a ReqwestClient,
+    bounded: bool,
+}
+
+impl<'a> Discoverer<'a> {
+    /// A sign-in's discovery, before its browser opens.
+    fn sign_in(http: &'a ReqwestClient) -> Self {
+        Self {
+            http,
+            bounded: true,
+        }
+    }
+
+    /// A background refresh's, or a key set read again after the browser.
+    fn background(http: &'a ReqwestClient) -> Self {
+        Self {
+            http,
+            bounded: false,
+        }
+    }
+}
+
+/// A discovery request that brought no response.
+#[derive(Debug, thiserror::Error)]
+enum Unreached {
+    /// No answer within the reach budget: the sentence naming its server.
+    #[error("{0}")]
+    NoAnswer(String),
+    /// The HTTP client failed (refused, reset, TLS…) reaching `address`, the
+    /// `host[:port]` the request went to.
+    #[error("{address}: {error}")]
+    Failed {
+        address: String,
+        error: HttpClientError<reqwest::Error>,
+    },
+}
+
+impl<'c> AsyncHttpClient<'c> for Discoverer<'_> {
+    type Error = Unreached;
+    type Future =
+        std::pin::Pin<Box<dyn Future<Output = Result<HttpResponse, Unreached>> + Send + 'c>>;
+
+    fn call(&'c self, request: HttpRequest) -> Self::Future {
+        let address = address_of(&request.uri().to_string());
+        Box::pin(async move {
+            let asked = self.http.call(request);
+            let answer = if self.bounded {
+                within_reach(&address, asked)
+                    .await
+                    .map_err(Unreached::NoAnswer)?
+            } else {
+                asked.await
+            };
+            answer.map_err(|error| Unreached::Failed { address, error })
+        })
+    }
+}
+
+/// `host` names the provider; a request that brought no response names the
+/// `host[:port]` it went to, which a person needs when the port is what a
+/// network rule blocks.
+fn discovery_error(host: &str, error: DiscoveryError<Unreached>) -> AccountError {
     match error {
-        DiscoveryError::Request(_) => AccountError::Unreachable(format!("Can't reach {address}.")),
+        DiscoveryError::Request(Unreached::NoAnswer(sentence)) => AccountError::NoAnswer(sentence),
+        DiscoveryError::Request(Unreached::Failed { address, .. }) => {
+            AccountError::Unreachable(format!("Can't reach {address}."))
+        }
         // A server having a bad minute is not a policy answer: "Blocked"
         // would tell the person to call an administrator about a 503.
         DiscoveryError::Response(status, ..) if status.is_server_error() => {
@@ -262,20 +327,20 @@ fn require_asymmetric(
 }
 
 async fn fetch_jwks(
-    http: &ReqwestClient,
+    http: &Discoverer<'_>,
     host: &str,
     url: &JsonWebKeySetUrl,
 ) -> Result<CoreJsonWebKeySet, AccountError> {
     let jwks = CoreJsonWebKeySet::fetch_async(url, http)
         .await
-        .map_err(|e| discovery_error(host, &address_of(url.as_str()), e))?;
+        .map_err(|e| discovery_error(host, e))?;
     require_asymmetric(host, jwks)
 }
 
 /// Discovery for `issuer`, then the overrides, then the checks that must
 /// fail before any browser opens.
 async fn discover(
-    http: &ReqwestClient,
+    http: &Discoverer<'_>,
     issuer: &str,
     client_id: &str,
     overrides: Overrides<'_>,
@@ -285,7 +350,7 @@ async fn discover(
     let issuer_url = IssuerUrl::new(issuer.to_owned()).map_err(|_| bad_url("issuer", &host))?;
     let metadata = Metadata::discover_async(issuer_url.clone(), http)
         .await
-        .map_err(|e| discovery_error(&host, &address_of(issuer), e))?;
+        .map_err(|e| discovery_error(&host, e))?;
 
     let algs: Vec<CoreJwsSigningAlgorithm> = metadata
         .id_token_signing_alg_values_supported()
@@ -372,27 +437,8 @@ async fn discover(
     })
 }
 
-/// `work` — discovery, everything a sign-in asks before the browser opens —
-/// within [`REACH_TIMEOUT`], or the sentence naming `address`. A provider
-/// behind a network that drops the packets never refuses the connection, and
-/// the sign-in would otherwise sit silent until the browser's own timeout.
-/// It ends before the flow is registered, so no link is ever shown for it.
-/// Only the interactive legs are bounded: a background refresh keeps the
-/// HTTP client's own timeouts and its quiet offline status.
-async fn within_reach<T>(
-    address: &str,
-    work: impl Future<Output = Result<T, AccountError>>,
-) -> Result<T, AccountError> {
-    tokio::time::timeout(REACH_TIMEOUT, work)
-        .await
-        .unwrap_or_else(|_| {
-            tracing::warn!(%address, "the sign-in server did not answer in time");
-            Err(AccountError::NoAnswer(no_answer(address)))
-        })
-}
-
 async fn account_provider(
-    http: &ReqwestClient,
+    http: &Discoverer<'_>,
     d: &AccountDescriptor,
 ) -> Result<Provider, AccountError> {
     discover(
@@ -407,7 +453,7 @@ async fn account_provider(
 
 /// The forge's provider: discovery when it names an issuer (explicit
 /// authorize/token URLs still win), plain OAuth endpoints otherwise.
-async fn forge_provider(http: &ReqwestClient, f: &ForgeOauth) -> Result<Provider, AccountError> {
+async fn forge_provider(http: &Discoverer<'_>, f: &ForgeOauth) -> Result<Provider, AccountError> {
     if let Some(issuer) = &f.issuer {
         return discover(
             http,
@@ -872,7 +918,12 @@ async fn verify(
         Ok(claims) => Ok(claims),
         Err(VerifyFailure::Refused(why)) => Err(refused(why)),
         Err(VerifyFailure::UnknownKey) => {
-            oidc.jwks = fetch_jwks(http, &provider.host, &oidc.jwks_url).await?;
+            oidc.jwks = fetch_jwks(
+                &Discoverer::background(http),
+                &provider.host,
+                &oidc.jwks_url,
+            )
+            .await?;
             match verify_once(oidc, &provider.client_id, id_token, &nonce, access_token) {
                 Ok(claims) => Ok(claims),
                 Err(VerifyFailure::UnknownKey) => {
@@ -965,11 +1016,7 @@ async fn sign_in_within(
     wait: Duration,
 ) -> Result<Identity, AccountError> {
     let oauth_http = ReqwestClient::from(http.clone());
-    let mut provider = within_reach(
-        &address_of(&d.auth.issuer),
-        account_provider(&oauth_http, d),
-    )
-    .await?;
+    let mut provider = account_provider(&Discoverer::sign_in(&oauth_http), d).await?;
     let scopes: Vec<String> = d
         .auth
         .scopes
@@ -1127,14 +1174,7 @@ async fn forge_connect_within(
         AccountError::Internal("the repository has no forge redirect address".to_owned())
     })?;
     let oauth_http = ReqwestClient::from(http.clone());
-    let forge_address = address_of(
-        forge
-            .issuer
-            .as_deref()
-            .or(forge.authorize_url.as_deref())
-            .unwrap_or_default(),
-    );
-    let mut provider = within_reach(&forge_address, forge_provider(&oauth_http, forge)).await?;
+    let mut provider = forge_provider(&Discoverer::sign_in(&oauth_http), forge).await?;
     let leg = ForgeLeg {
         platform,
         flows,
@@ -1443,7 +1483,7 @@ pub async fn access_token(
     let refresh = session.refresh_token.clone().ok_or_else(needs_sign_in)?;
 
     let oauth_http = ReqwestClient::from(http.clone());
-    let mut provider = account_provider(&oauth_http, d).await?;
+    let mut provider = account_provider(&Discoverer::background(&oauth_http), d).await?;
     let tokens = provider
         .client(None)
         .exchange_refresh_token(&RefreshToken::new(refresh))
@@ -1619,7 +1659,7 @@ async fn forge_token_with(
     let refresh = stored.refresh_token.clone().ok_or_else(reconnect)?;
 
     let oauth_http = ReqwestClient::from(http.clone());
-    let mut provider = forge_provider(&oauth_http, forge).await?;
+    let mut provider = forge_provider(&Discoverer::background(&oauth_http), forge).await?;
     // Refreshed under the client the tokens were issued to: this device's
     // own application, or the shared one.
     provider.client_id = ClientId::new(stored.client_id(forge).to_owned());
@@ -1753,9 +1793,11 @@ pub async fn sign_out(
     };
     let network = best_effort(async {
         let oauth_http = ReqwestClient::from(http.clone());
+        // Sign-out's network work has its own budget (`best_effort`).
+        let discoverer = Discoverer::background(&oauth_http);
         let mut end_session = None;
         if let Some(stored) = &stored {
-            match account_provider(&oauth_http, d).await {
+            match account_provider(&discoverer, d).await {
                 Ok(provider) => {
                     if let Some(refresh) = &stored.refresh_token {
                         revoke(http, &provider, refresh).await;
@@ -1767,7 +1809,7 @@ pub async fn sign_out(
         }
         if let Some((forge_item, forge_config)) = &forge {
             if let Some(refresh) = &forge_item.refresh_token {
-                match forge_provider(&oauth_http, forge_config).await {
+                match forge_provider(&discoverer, forge_config).await {
                     Ok(mut provider) => {
                         provider.client_id =
                             ClientId::new(forge_item.client_id(forge_config).to_owned());
@@ -1864,7 +1906,12 @@ mod tests {
     });
 
     const CLIENT_ID: &str = "keeper";
+    /// How long a test waits for something that must NOT happen (a sign-in
+    /// nobody answers ends at this deadline).
     const SHORT: Duration = Duration::from_secs(2);
+    /// How long a test waits for something that SHOULD happen: generous, so
+    /// a loaded runner is slow, never a failure.
+    const ARRIVES: Duration = Duration::from_secs(30);
 
     // ---- the fake provider ---------------------------------------------
 
@@ -2563,11 +2610,11 @@ mod tests {
             .expect("client")
     }
 
-    async fn sign_in_short(
+    async fn sign_in_at_fake(
         p: &FakePlatform,
         d: &AccountDescriptor,
     ) -> Result<Identity, AccountError> {
-        sign_in_within(p, &p.flows, &http(), d, SHORT).await
+        sign_in_within(p, &p.flows, &http(), d, ARRIVES).await
     }
 
     /// Seed a signed-in session for `d`, as a sign-in at `d`'s issuer would
@@ -2611,7 +2658,7 @@ mod tests {
                 .find(|link| link.not_opened.is_some())
                 .map(|link| link.url.clone())
         };
-        let link = tokio::time::timeout(SHORT, async {
+        let link = tokio::time::timeout(ARRIVES, async {
             loop {
                 if let Some(link) = unopened() {
                     break link;
@@ -2636,7 +2683,7 @@ mod tests {
         let p = FakePlatform::new(&fake, Browser::WontOpen);
         let d = account(&fake, "paste", None);
 
-        let (identity, ()) = tokio::join!(sign_in_short(&p, &d), paste_the_unopened_link(&p));
+        let (identity, ()) = tokio::join!(sign_in_at_fake(&p, &d), paste_the_unopened_link(&p));
 
         assert_eq!(identity.expect("signed in by hand").login, "tgorka");
         let links = p.links.lock().expect("links").clone();
@@ -2667,7 +2714,7 @@ mod tests {
         let p = FakePlatform::new(&fake, Browser::RefusedLater);
         let d = account(&fake, "later", None);
 
-        let (identity, ()) = tokio::join!(sign_in_short(&p, &d), paste_the_unopened_link(&p));
+        let (identity, ()) = tokio::join!(sign_in_at_fake(&p, &d), paste_the_unopened_link(&p));
 
         assert_eq!(identity.expect("signed in by hand").login, "tgorka");
         assert_eq!(
@@ -2697,7 +2744,10 @@ mod tests {
         ] {
             let p = FakePlatform::new(&fake, browser);
             let d = account(&fake, "gone", None);
-            assert!(sign_in_short(&p, &d).await.is_err());
+            // `Waits` answers nothing: the sign-in ends at its deadline.
+            assert!(sign_in_within(&p, &p.flows, &http(), &d, SHORT)
+                .await
+                .is_err());
             let links = p.links.lock().expect("links").clone();
             assert!(matches!(links.first(), Some(Some(_))), "{links:?}");
             assert_eq!(links.last(), Some(&None), "{links:?}");
@@ -2710,8 +2760,8 @@ mod tests {
         let p = FakePlatform::new(&fake, Browser::Honest);
         let d = account(&fake, "pkce", None);
 
-        let identity = sign_in_short(&p, &d).await.expect("first sign-in");
-        sign_in_short(&p, &d).await.expect("second sign-in");
+        let identity = sign_in_at_fake(&p, &d).await.expect("first sign-in");
+        sign_in_at_fake(&p, &d).await.expect("second sign-in");
 
         assert_eq!(identity.sub, "sub-1");
         assert_eq!(identity.login, "tgorka");
@@ -2762,7 +2812,7 @@ mod tests {
         let p = FakePlatform::new(&fake, Browser::ExtraState);
         let d = account(&fake, "extra-state", None);
 
-        let result = sign_in_short(&p, &d).await;
+        let result = sign_in_at_fake(&p, &d).await;
 
         assert!(
             matches!(result, Err(AccountError::Refused(_))),
@@ -2813,7 +2863,7 @@ mod tests {
         for (browser, case) in cases {
             let p = FakePlatform::new(&fake, browser);
             let d = account(&fake, "ends", None);
-            let result = sign_in_short(&p, &d).await;
+            let result = sign_in_at_fake(&p, &d).await;
             match (browser, &result) {
                 (Browser::Denied(Some(_)), Err(AccountError::Denied { host: h, reason })) => {
                     assert_eq!(h, &host, "{case}");
@@ -2871,7 +2921,7 @@ mod tests {
         let fake = start_fake(Behaviour::default());
         let p = FakePlatform::new(&fake, Browser::Denied(Some("Marta may not use keeper")));
         let d = account(&fake, "marta", None);
-        let error = sign_in_short(&p, &d)
+        let error = sign_in_at_fake(&p, &d)
             .await
             .expect_err("the provider refused");
         let problem = crate::org_account::state::step_failed(
@@ -3072,7 +3122,7 @@ mod tests {
         let p = FakePlatform::new(&fake, Browser::Honest);
         let d = account(&fake, "nonce", None);
 
-        let result = sign_in_short(&p, &d).await;
+        let result = sign_in_at_fake(&p, &d).await;
 
         assert!(
             matches!(result, Err(AccountError::Refused(_))),
@@ -3090,7 +3140,7 @@ mod tests {
         let p = FakePlatform::new(&fake, Browser::Honest);
         let d = account(&fake, "at-hash", None);
 
-        let result = sign_in_short(&p, &d).await;
+        let result = sign_in_at_fake(&p, &d).await;
 
         assert!(
             matches!(result, Err(AccountError::Refused(_))),
@@ -3108,7 +3158,7 @@ mod tests {
         let p = FakePlatform::new(&fake, Browser::Honest);
         let d = account(&fake, "kid", None);
 
-        sign_in_short(&p, &d)
+        sign_in_at_fake(&p, &d)
             .await
             .expect("the rotated key verifies");
 
@@ -3121,7 +3171,7 @@ mod tests {
         let p = FakePlatform::new(&fake, Browser::Honest);
         let d = account(&fake, "loopback", Some("http://127.0.0.1/callback"));
 
-        sign_in_short(&p, &d).await.expect("loopback sign-in");
+        sign_in_at_fake(&p, &d).await.expect("loopback sign-in");
 
         let shown = p.shown.lock().expect("shown").clone();
         assert_eq!(
@@ -3264,7 +3314,7 @@ mod tests {
         let p = FakePlatform::new(&fake, Browser::Honest);
         let d = forge_account(&fake, "forge");
 
-        forge_connect_within(&p, &p.flows, &http(), &d, "tgorka", "hesperia", SHORT)
+        forge_connect_within(&p, &p.flows, &http(), &d, "tgorka", "hesperia", ARRIVES)
             .await
             .expect("connected");
 
@@ -3299,7 +3349,7 @@ mod tests {
         let d = forge_account(&fake, "forge-ana");
 
         let result =
-            forge_connect_within(&p, &p.flows, &http(), &d, "tgorka", "hesperia", SHORT).await;
+            forge_connect_within(&p, &p.flows, &http(), &d, "tgorka", "hesperia", ARRIVES).await;
 
         match result {
             Err(AccountError::Refused(sentence)) => assert_eq!(
@@ -3318,7 +3368,7 @@ mod tests {
         let fake = start_fake(Behaviour::default());
         let p = FakePlatform::new(&fake, Browser::Honest);
         let d = account(&fake, "bye", None);
-        sign_in_short(&p, &d).await.expect("sign in");
+        sign_in_at_fake(&p, &d).await.expect("sign in");
         p.keychain_set(&forge_key("bye"), "{}")
             .expect("a forge item");
 
@@ -3351,7 +3401,7 @@ mod tests {
         let fake = start_fake(Behaviour::default());
         let p = FakePlatform::new(&fake, Browser::Honest);
         let d = account(&fake, "bots", None);
-        sign_in_short(&p, &d).await.expect("sign in");
+        sign_in_at_fake(&p, &d).await.expect("sign in");
         crate::bots::save_provider_token(&p, "prov", "keychain-token").expect("save");
 
         let before = crate::bots::resolve_credential(&p, &http(), Some(&d), "prov", None).await;
@@ -3402,7 +3452,7 @@ mod tests {
         let p = FakePlatform::new(&a, Browser::Honest);
         let at_a = account(&a, "same-id", None);
         let at_b = account(&b, "same-id", None);
-        sign_in_short(&p, &at_a).await.expect("sign in at A");
+        sign_in_at_fake(&p, &at_a).await.expect("sign in at A");
 
         // Fresh token, same id, another issuer: nothing is handed over.
         let result = access_token(&p, &http(), &at_b).await;
@@ -3416,14 +3466,18 @@ mod tests {
         );
 
         // The identity read on restore follows the same rule.
-        sign_in_short(&p, &at_a).await.expect("sign in at A again");
+        sign_in_at_fake(&p, &at_a)
+            .await
+            .expect("sign in at A again");
         assert!(matches!(
             session::identity(&p, &at_b),
             Err(AccountError::NeedsSignIn(_))
         ));
 
         // Sign-out under B sends A's refresh token nowhere, and still deletes.
-        sign_in_short(&p, &at_a).await.expect("sign in at A again");
+        sign_in_at_fake(&p, &at_a)
+            .await
+            .expect("sign in at A again");
         sign_out(&p, &http(), &at_b).await.expect("signed out");
         assert!(a.seen.lock().expect("seen").revocations.is_empty());
         assert!(b.seen.lock().expect("seen").revocations.is_empty());
@@ -3436,7 +3490,7 @@ mod tests {
         let fake = start_fake(Behaviour::default());
         let p = FakePlatform::new(&fake, Browser::Honest);
         let d = forge_account(&fake, "forge-moved");
-        forge_connect_within(&p, &p.flows, &http(), &d, "tgorka", "hesperia", SHORT)
+        forge_connect_within(&p, &p.flows, &http(), &d, "tgorka", "hesperia", ARRIVES)
             .await
             .expect("connected");
         let mut moved = d.clone();
@@ -3459,13 +3513,13 @@ mod tests {
         let fake = start_fake(Behaviour::default());
         let p = FakePlatform::new(&fake, Browser::Honest);
         let d = forge_account(&fake, "handover");
-        sign_in_short(&p, &d).await.expect("sign in");
-        forge_connect_within(&p, &p.flows, &http(), &d, "tgorka", "hesperia", SHORT)
+        sign_in_at_fake(&p, &d).await.expect("sign in");
+        forge_connect_within(&p, &p.flows, &http(), &d, "tgorka", "hesperia", ARRIVES)
             .await
             .expect("connected");
 
         // The same person again keeps the forge.
-        sign_in_short(&p, &d).await.expect("sign in again");
+        sign_in_at_fake(&p, &d).await.expect("sign in again");
         assert!(session::forge_connected(&p, &d));
 
         // Someone else was signed in before: their forge token goes.
@@ -3474,7 +3528,7 @@ mod tests {
             .expect("session");
         other.sub = "someone-else".to_owned();
         store_session(&p, "handover", &other).expect("store");
-        sign_in_short(&p, &d).await.expect("sign in as sub-1");
+        sign_in_at_fake(&p, &d).await.expect("sign in as sub-1");
         assert!(!session::forge_connected(&p, &d));
     }
 
@@ -3693,7 +3747,7 @@ mod tests {
 
         let error = tokio::time::timeout(
             Duration::from_secs(60),
-            forge_connect_within(&p, &p.flows, &http(), &d, "tgorka", "hesperia", SHORT),
+            forge_connect_within(&p, &p.flows, &http(), &d, "tgorka", "hesperia", ARRIVES),
         )
         .await
         .expect("the connection ended on its own budget")
@@ -3709,6 +3763,59 @@ mod tests {
         drop(silent);
     }
 
+    /// R541-03: the issuer answers its discovery document, and the key set
+    /// it names lives on another host and port, which takes the request and
+    /// never answers. The sentence names the key set's server — the request
+    /// that stalled — not the issuer that answered. Time is paused once the
+    /// key set is asked: the budget is all that ends it.
+    #[tokio::test]
+    async fn a_key_set_that_never_answers_is_named_not_the_issuer_that_did() {
+        let held = TcpListener::bind("127.0.0.1:0").expect("bind the key set");
+        let keys = held.local_addr().expect("addr");
+        let (asked_tx, asked) = tokio::sync::oneshot::channel::<()>();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = held.accept() else {
+                return;
+            };
+            let _ = read_request(&mut stream);
+            let _ = asked_tx.send(());
+            let _ = released.recv();
+        });
+        let fake = start_fake(Behaviour {
+            discovery_patch: Some(("jwks_uri", format!("http://{keys}/jwks"))),
+            ..Behaviour::default()
+        });
+        let p = FakePlatform::new(&fake, Browser::Honest);
+        let d = account(&fake, "keys", None);
+        let client = http();
+
+        let sign_in = tokio::time::timeout(
+            Duration::from_secs(60),
+            sign_in_within(&p, &p.flows, &client, &d, FLOW_TIMEOUT),
+        );
+        let hold = async {
+            asked.await.expect("the key set was asked");
+            tokio::time::pause();
+        };
+        let (result, ()) = tokio::join!(sign_in, hold);
+        let error = result
+            .expect("the sign-in ended on its own budget")
+            .expect_err("the key set never answered");
+
+        assert!(matches!(error, AccountError::NoAnswer(_)), "{error:?}");
+        assert_eq!(
+            error.to_string(),
+            crate::oauth::no_answer(&keys.to_string())
+        );
+        assert!(
+            p.shown.lock().expect("shown").is_empty(),
+            "no browser opened"
+        );
+        assert!(p.links.lock().expect("links").is_empty(), "no link shown");
+        drop(release);
+    }
+
     #[tokio::test]
     async fn a_discovery_server_error_is_unreachable_not_a_policy_refusal() {
         let fake = start_fake(Behaviour {
@@ -3718,7 +3825,7 @@ mod tests {
         let p = FakePlatform::new(&fake, Browser::Honest);
         let d = account(&fake, "flaky", None);
 
-        let result = sign_in_short(&p, &d).await;
+        let result = sign_in_at_fake(&p, &d).await;
 
         assert!(
             matches!(result, Err(AccountError::Unreachable(_))),
@@ -3743,7 +3850,7 @@ mod tests {
             let p = FakePlatform::new(&fake, Browser::Honest);
             let d = account(&fake, "insecure", None);
 
-            let result = sign_in_short(&p, &d).await;
+            let result = sign_in_at_fake(&p, &d).await;
 
             assert!(
                 matches!(result, Err(AccountError::Refused(_))),
@@ -3763,7 +3870,7 @@ mod tests {
         let p = FakePlatform::new(&fake, Browser::Honest);
         let d = account(&fake, "no-expiry", None);
 
-        sign_in_short(&p, &d).await.expect("sign in");
+        sign_in_at_fake(&p, &d).await.expect("sign in");
 
         let expires = p.session("no-expiry").expect("session")["access_expires_ms"]
             .as_i64()
@@ -3780,7 +3887,7 @@ mod tests {
         let fake = start_fake(Behaviour::default());
         let p = FakePlatform::new(&fake, Browser::Honest);
         let d = forge_account(&fake, "forge-forced");
-        forge_connect_within(&p, &p.flows, &http(), &d, "tgorka", "hesperia", SHORT)
+        forge_connect_within(&p, &p.flows, &http(), &d, "tgorka", "hesperia", ARRIVES)
             .await
             .expect("connected");
         assert_eq!(
@@ -3811,7 +3918,7 @@ mod tests {
         });
         let p = FakePlatform::new(&fake, Browser::Honest);
         let d = forge_account(&fake, "forge-dead");
-        forge_connect_within(&p, &p.flows, &http(), &d, "tgorka", "hesperia", SHORT)
+        forge_connect_within(&p, &p.flows, &http(), &d, "tgorka", "hesperia", ARRIVES)
             .await
             .expect("connected");
         assert!(
@@ -3844,7 +3951,7 @@ mod tests {
     }
 
     async fn connect_as(p: &FakePlatform, d: &AccountDescriptor, device: &str) {
-        forge_connect_within(p, &p.flows, &http(), d, "tgorka", device, SHORT)
+        forge_connect_within(p, &p.flows, &http(), d, "tgorka", device, ARRIVES)
             .await
             .unwrap_or_else(|e| panic!("{device} connected: {e:?}"));
     }
@@ -3989,7 +4096,7 @@ mod tests {
         let d = forge_account_scoped(&fake, "closed-second", DEVICE_SCOPE);
 
         let result =
-            forge_connect_within(&p, &p.flows, &http(), &d, "tgorka", "hesperia", SHORT).await;
+            forge_connect_within(&p, &p.flows, &http(), &d, "tgorka", "hesperia", ARRIVES).await;
 
         assert!(matches!(result, Err(AccountError::Cancelled)), "{result:?}");
         assert_eq!(app_names(&fake).len(), 1);
