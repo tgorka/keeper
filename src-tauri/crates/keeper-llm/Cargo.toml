@@ -1,0 +1,26 @@
+[package]
+name = "keeper-llm"
+description = "OpenAI-compatible streaming chat, its provider quirks and the tool loop — keeper's open model client (AD-431)"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+# AD-431: no keeper dependency, no matrix-sdk, no SQLite, no gitoxide, no
+# tauri. `bun run check:llm-lean` asserts it over `cargo tree`.
+[dependencies]
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# `Effort` and `ProviderKind` keep their TypeScript bindings, written to the
+# workspace's `TS_RS_EXPORT_DIR` as before.
+ts-rs = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+ulid = { workspace = true }
+url = { workspace = true }

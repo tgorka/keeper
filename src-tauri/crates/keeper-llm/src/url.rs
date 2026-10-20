@@ -14,7 +14,7 @@
 //! **by disclosure plus an explicit user act**. The grammar therefore accepts a
 //! loopback and a private host and reports [`BaseUrl::is_private`] so the
 //! surface can say so, and the destination is disclosed again, host-only, in
-//! Settings → About (`crate::egress`). What the grammar *refuses* is the set of
+//! Settings → About (`keeper_core::egress`). What the grammar *refuses* is the set of
 //! shapes that cannot be part of an honest disclosure at all: a non-HTTP
 //! scheme, a credential smuggled into the authority, a query or fragment that
 //! would be silently dropped when a path is appended, and a path that is not a
@@ -52,7 +52,7 @@ pub enum BaseUrlError {
     /// URL is shown on screens people share, is logged in error text, and is
     /// disclosed in Settings → About. A token pasted into the authority would
     /// leak through all three. A provider's credential goes to the secret port
-    /// ([`crate::bots::provider_token_key`]) and nowhere else.
+    /// (`keeper_core::bots::provider_token_key`) and nowhere else.
     #[error("a base URL must not carry a username or password — the credential goes in the token field, which keeper stores in the keychain")]
     Userinfo,
 
@@ -88,11 +88,11 @@ pub enum BaseUrlError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BaseUrl {
     /// `scheme://host[:port][/prefix]`, lowercased host, no trailing slash.
-    /// This is what a provider row stores and what [`crate::bots::Endpoint`]
+    /// This is what a provider row stores and what [`crate::Endpoint`]
     /// joins request paths onto.
     pub normalized: String,
     /// The host alone, lowercased, brackets kept for an IPv6 literal — the same
-    /// shape `crate::egress::remote_host` yields for a git remote, so the two
+    /// shape `keeper_core::egress::remote_host` yields for a git remote, so the two
     /// disclosures read alike.
     pub host: String,
     /// The explicit port, or `None` when the scheme's default applies. Present

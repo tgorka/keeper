@@ -7,7 +7,7 @@
 //! diagnostic in this module runs the risk of carrying either. So:
 //!
 //! * the `Authorization` header value is marked sensitive at the point it is
-//!   built ([`crate::bots::http::authorization`]), which is what stops the
+//!   built ([`crate::http::authorization`]), which is what stops the
 //!   `http` stack's own `Debug`/`Display` from printing it;
 //! * a `reqwest::Error` is **never** stored as a `source`. Its `Display`
 //!   includes the request URL, which for a user-supplied base URL is exactly
@@ -46,7 +46,7 @@ pub enum BotsError {
     /// `retryable` is decided at construction because it cannot be recovered
     /// from the string afterwards: a connect failure produced no bytes and may
     /// be retried, a mid-body read failure did produce bytes and may not (see
-    /// [`crate::bots::chat`]).
+    /// [`crate::chat`]).
     #[error("could not reach the endpoint: {detail}")]
     Transport {
         /// A URL-free description of the transport failure.
@@ -120,7 +120,7 @@ pub enum BotsError {
     },
 
     /// The request asks for something this provider kind cannot do, and the
-    /// quirk table ([`crate::bots::quirks`]) says so before a byte is sent.
+    /// quirk table ([`crate::quirks`]) says so before a byte is sent.
     #[error("this provider cannot do that: {detail}")]
     Unsupported {
         /// Which capability, and which kind lacks it.
@@ -142,7 +142,7 @@ pub enum BotsError {
 
     /// The base URL a provider row holds is not one keeper will send to.
     #[error(transparent)]
-    BaseUrl(#[from] crate::bots::url::BaseUrlError),
+    BaseUrl(#[from] crate::url::BaseUrlError),
 
     /// A filesystem tool call failed for a reason that is about the drive
     /// rather than about the endpoint (Story 61.11).
@@ -183,7 +183,7 @@ impl BotsError {
     /// consumes the error and why the idiom at a call site is
     /// `.map_err(BotsError::transport)?`. The `Authorization` header is
     /// already excluded by its sensitive flag
-    /// ([`crate::bots::http::authorization`]).
+    /// ([`crate::http::authorization`]).
     pub fn transport(err: reqwest::Error) -> Self {
         // A failure that happened while connecting produced no response byte,
         // so the request may be sent again; anything later may not, because
@@ -210,7 +210,7 @@ impl BotsError {
     ///
     /// Deliberately narrow, and deliberately not the whole answer: the caller
     /// must ALSO know that the failed attempt produced no stream bytes before
-    /// it acts on this. See [`crate::bots::chat::stream_chat`].
+    /// it acts on this. See [`crate::chat::stream_chat`].
     pub fn is_retryable(&self) -> bool {
         match self {
             Self::Transport { retryable, .. } => *retryable,

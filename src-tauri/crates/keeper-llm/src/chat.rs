@@ -8,7 +8,7 @@
 //! socket into a sink of [`ChatEvent`]s ([`stream_chat`]).
 //!
 //! There is deliberately **no** `if kind == Ollama` anywhere below. Every
-//! per-provider divergence is read once from [`crate::bots::quirks`], which is
+//! per-provider divergence is read once from [`crate::quirks`], which is
 //! the decision the epic made before the first story started.
 //!
 //! # Where the failures go, and why the split is where it is
@@ -32,14 +32,18 @@ use std::time::{Duration, Instant};
 use reqwest::header::HeaderValue;
 use serde_json::{json, Map, Value};
 
-use crate::bots::error::BotsError;
-use crate::bots::http::authorize;
-use crate::bots::quirks::{quirks, ImagePartShape, Support};
-use crate::bots::sse::{SseFrame, SseFramer};
-use crate::bots::{Endpoint, ProviderKind};
+use crate::error::BotsError;
+use crate::http::authorize;
+use crate::quirks::{quirks, ImagePartShape, Support};
+use crate::sse::{SseFrame, SseFramer};
+use crate::{Endpoint, ProviderKind};
 
 /// The path every chat completion goes to, on both kinds.
 pub const CHAT_PATH: &str = "/v1/chat/completions";
+
+/// The request header that names the server-side session a turn continues
+/// (Hermes' `session_continuity_header`).
+pub const SESSION_HEADER: &str = "X-Hermes-Session-Id";
 
 /// How this endpoint is named in an error. Method plus path, never a URL:
 /// the base URL is user-typed and may not appear in a log line.
@@ -175,6 +179,8 @@ pub enum ToolChoice {
     Function(String),
 }
 
+// This doc is also `Effort.ts`'s, so it names the type where the app reaches
+// it — keeper-core's re-export — and the binding stays byte-identical.
 /// How hard a model reasons before it answers: an agent's `[model].effort`
 /// (R382). The words are the OpenAI Chat Completions `reasoning_effort`
 /// values keeper offers; which of them reach a provider, and under which
@@ -317,12 +323,12 @@ pub struct ChatRequest {
     pub effort: Option<Effort>,
     /// The server-side session this turn continues, where the endpoint keeps
     /// one (Epic 63, AD-176). Sent as the
-    /// [`crate::bots::remote::SESSION_HEADER`] request header and never in the
+    /// [`SESSION_HEADER`] request header and never in the
     /// body — the header is the continuity mechanism the OpenAI-compatible
     /// path documents. `None` sends no header, which is today's behaviour on
     /// Ollama and on a Hermes that advertised no `session_continuity_header`;
     /// the decision of whether to fill it is
-    /// [`crate::bots::remote::continuity_id`]'s, never this module's.
+    /// `keeper_core::bots::remote::continuity_id`'s, never this module's.
     pub session_id: Option<String>,
 }
 
@@ -339,7 +345,7 @@ pub struct ChatRequest {
 ///   named refusal ([`BotsError::Unsupported`]) before a byte goes out, not a
 ///   silently dropped image the model is then asked about;
 /// * a reasoning level goes out as `reasoning_effort` only to a kind whose
-///   [`crate::bots::quirks::Quirks::efforts`] row names it, and is a named
+///   [`crate::quirks::Quirks::efforts`] row names it, and is a named
 ///   refusal for any other (R382) — an agent's home is refused at load for
 ///   the same answer ([`effort_refusal`]), so this arm is the backstop.
 pub fn build_body(kind: ProviderKind, request: &ChatRequest) -> Result<Value, BotsError> {
@@ -1065,7 +1071,7 @@ impl CancelSignal {
 /// The knobs a caller may turn per request.
 #[derive(Debug, Clone)]
 pub struct ChatOptions {
-    /// The silence budget. See [`crate::bots::http`].
+    /// The silence budget. See [`crate::http`].
     pub read_timeout: Duration,
     /// How many times the request may be SENT, including the first. `1`
     /// disables retrying.
@@ -1079,7 +1085,7 @@ pub struct ChatOptions {
 impl Default for ChatOptions {
     fn default() -> Self {
         Self {
-            read_timeout: crate::bots::http::READ_TIMEOUT,
+            read_timeout: crate::http::READ_TIMEOUT,
             // One retry. A desktop client talking to one endpoint the user
             // chose is not a fleet: the second attempt catches the dropped
             // connection and the momentary 503, and a third would only make a
@@ -1254,7 +1260,7 @@ async fn attempt_stream(
                 retry_after: None,
             })
         })?;
-        request = request.header(crate::bots::remote::SESSION_HEADER, value);
+        request = request.header(SESSION_HEADER, value);
     }
     let request = authorize(request, endpoint.token.as_deref()).map_err(|error| {
         Box::new(AttemptFailure {

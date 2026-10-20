@@ -64,8 +64,7 @@ use crate::bots::Endpoint;
 use crate::error::CoreError;
 use crate::vm::BotTranscriptSource;
 
-/// The request header that names the server-side session a turn continues.
-pub const SESSION_HEADER: &str = "X-Hermes-Session-Id";
+pub use crate::bots::chat::SESSION_HEADER;
 
 /// The route that says what the gateway can do.
 pub const CAPABILITIES_PATH: &str = "/v1/capabilities";

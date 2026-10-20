@@ -37,7 +37,7 @@ use std::time::Duration;
 
 use reqwest::header::{HeaderValue, AUTHORIZATION};
 
-use crate::bots::error::BotsError;
+use crate::error::BotsError;
 
 /// The `User-Agent` every bot request carries.
 ///

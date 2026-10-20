@@ -5,7 +5,7 @@
 //! The epic picked one wire — `POST /v1/chat/completions` with `stream: true`
 //! — for every provider kind, and wrote down that the price is paid here:
 //! *"Those become rows in a per-kind quirk table, not a second client."* So
-//! [`chat`](crate::bots::chat) contains **no** `if kind == Ollama` branch. It
+//! [`chat`](crate::chat) contains **no** `if kind == Ollama` branch. It
 //! reads [`quirks`] once and shapes the request from the answer, which is the
 //! difference between adding a third provider being a table row and being an
 //! archaeology exercise.
@@ -22,8 +22,8 @@
 //!
 //! Every row below carries the source it was read from.
 
-use crate::bots::chat::Effort;
-use crate::bots::ProviderKind;
+use crate::chat::Effort;
+use crate::ProviderKind;
 
 /// A three-valued answer, because two values would force a lie.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,7 +57,7 @@ pub enum ImagePartShape {
     BareString,
 }
 
-/// Everything [`crate::bots::chat`] needs to know about one provider kind.
+/// Everything [`crate::chat`] needs to know about one provider kind.
 #[derive(Debug, Clone, Copy)]
 pub struct Quirks {
     /// Whether `/v1/embeddings` is available (AD-264).
@@ -143,7 +143,7 @@ pub struct Quirks {
     ///   but one gateway does not establish it for every OpenAI-compatible
     ///   endpoint.
     ///
-    /// Only a `Yes` row may let [`crate::bots::chat`] read a stream that ends
+    /// Only a `Yes` row may let [`crate::chat`] read a stream that ends
     /// without it as truncated rather than as merely finished.
     pub done_sentinel: Support,
 
@@ -217,7 +217,7 @@ pub struct Quirks {
     ///   `last_active`-ordered list and `GET /api/sessions/{id}/messages` a
     ///   real history read (verified against `NousResearch/hermes-agent`
     ///   `main`, 2026-09-03). An older one answers nothing there, and
-    ///   [`crate::bots::remote::probe_capabilities`] is what turns this row
+    ///   `keeper_core::bots::remote::probe_capabilities` is what turns this row
     ///   into a definite answer per endpoint.
     /// * Ollama — **No**. There is no server-side conversation at all, so no
     ///   probe is sent and everything stays in `keeper.db`.
@@ -363,7 +363,7 @@ mod tests {
     fn the_read_timeout_default_clears_every_documented_keepalive() {
         // A silence budget under the server's own keep-alive interval would
         // kill healthy idle streams on a schedule.
-        let budget = crate::bots::http::READ_TIMEOUT.as_secs();
+        let budget = crate::http::READ_TIMEOUT.as_secs();
         for kind in KINDS {
             if let Some(keepalive) = quirks(kind).keepalive_secs {
                 assert!(

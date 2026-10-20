@@ -4687,6 +4687,7 @@ dependencies = [
  "globset",
  "hex",
  "image",
+ "keeper-llm",
  "keeper-ported",
  "matrix-sdk",
  "matrix-sdk-base",
@@ -4724,6 +4725,21 @@ dependencies = [
  "unicode-normalization",
  "url",
  "zip",
+]
+
+[[package]]
+name = "keeper-llm"
+version = "0.10.6"
+dependencies = [
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "ts-rs",
+ "ulid 1.2.1",
+ "url",
 ]
 
 [[package]]

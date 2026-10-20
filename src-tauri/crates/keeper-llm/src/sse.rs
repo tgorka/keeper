@@ -41,7 +41,7 @@
 //! bytes keep coming. [`MAX_FRAME_BYTES`] caps one frame's worth of
 //! unterminated buffer and turns the overrun into an error.
 
-use crate::bots::error::BotsError;
+use crate::error::BotsError;
 
 /// The largest single SSE frame keeper will assemble.
 ///
