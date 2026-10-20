@@ -1,0 +1,301 @@
+/**
+ * A bot's identity: a shape, a mark, and — only ever beside a shape — a colour
+ * (Story 61.7, FR-383).
+ *
+ * **The colour palette is bounded, and that is the story rather than a
+ * shortcut.** `DESIGN.md` records the arithmetic: AA needs L\* ≤ 46.8 on warm
+ * paper and L\* ≥ 51.9 on near-black, so the intersection is empty and no
+ * colour of any hue passes in both themes. A free colour picker therefore
+ * cannot be shipped honestly — half of what somebody could choose would be
+ * unreadable in one of the two themes keeper ships, and the app would have
+ * offered it. So {@link BOT_IDENTITY_COLOURS} is a closed set of token names,
+ * the hexes live once in `src/index.css` with a value per theme, and
+ * `scripts/check-design.mjs` recomputes every one of them against every surface
+ * of both themes and fails the build on a member that drops below 4.5:1.
+ *
+ * **Colour is never the only carrier.** `DESIGN.md:172` requires colour to be
+ * paired with a shape, so this component paints no ink at all until a shape is
+ * chosen — and {@link botIdentityPhrase} says the shape and the mark out loud,
+ * so two bots that differ only in colour are still two different bots to a
+ * screen reader and to somebody who cannot tell clay from olive.
+ *
+ * **The shapes are the lamp's own fill language worn on the mark's cell**, not
+ * a second vocabulary: filled, hollow, dashed and one with a bite taken out of
+ * it (`DESIGN.md` → Shapes). Worn on the flat-topped hexagon rather than the
+ * 6px disc, because a status in this app is round and small and a bot is a
+ * cell — so an identity can never be misread as a state. `DESIGN.md`'s "a bot
+ * in keeper is a kept instrument, and it wears the same cell" is the sentence
+ * this file implements, and it is also why no bot grows a face: the eyes are
+ * the mark's and only the mark's.
+ *
+ * **The mark reuses `space-icons.ts`**, which is the app's existing answer to
+ * "a user picks one glyph from a closed curated set", down to the same
+ * {@link IconChoice} button. It did not already support a typed grapheme, so
+ * this adds one — bounded to a single mark in Rust, and content rather than
+ * chrome: `DESIGN.md`'s emoji ban is a ban on keeper decorating itself, not on
+ * the product holding what a person typed, exactly as the reaction picker is.
+ */
+import { type ReactElement, useState } from "react";
+import { SPACE_ICONS, spaceIcon } from "@/components/notes/space-icons";
+import { cn } from "@/lib/utils";
+
+/**
+ * The closed set of shapes, in picker order.
+ *
+ * Must equal `keeper_core::hq::identity::BOT_SHAPES` exactly, and
+ * `scripts/check-design.mjs` checks that it does: a shape the picker offers and
+ * Rust refuses is a save that fails after the person chose.
+ */
+export const BOT_IDENTITY_SHAPES = ["filled", "hollow", "dashed", "notched"] as const;
+
+/** One of the four shapes a bot's cell can be drawn in. */
+export type BotIdentityShape = (typeof BOT_IDENTITY_SHAPES)[number];
+
+/**
+ * The bounded colour palette, as token names, in wheel order.
+ *
+ * Seven inks, each a material a workroom holds. The wheel skips the lichen
+ * band on purpose — the accent is singular (`DESIGN.md` → "No second green"),
+ * so no bot may wear it — and purple is absent because purple is banned
+ * outright. `scripts/check-design.mjs` reads THIS list, so adding a name here
+ * without adding its two hexes to `src/index.css` fails the build rather than
+ * shipping a bot nothing can draw.
+ */
+export const BOT_IDENTITY_COLOURS = [
+  "clay",
+  "ochre",
+  "olive",
+  "verdigris",
+  "steel",
+  "lapis",
+  "madder",
+] as const;
+
+/** One of the seven inks a bot's cell can be drawn in. */
+export type BotIdentityColour = (typeof BOT_IDENTITY_COLOURS)[number];
+
+/**
+ * The utility per ink.
+ *
+ * Spelled out rather than interpolated, because Tailwind sees source text: a
+ * `text-bot-ink-${name}` template produces no CSS at all, and the cells would
+ * all render in `currentColor` while every test that read the class name
+ * passed.
+ */
+const INK_CLASS: Record<BotIdentityColour, string> = {
+  clay: "text-bot-ink-clay",
+  ochre: "text-bot-ink-ochre",
+  olive: "text-bot-ink-olive",
+  verdigris: "text-bot-ink-verdigris",
+  steel: "text-bot-ink-steel",
+  lapis: "text-bot-ink-lapis",
+  madder: "text-bot-ink-madder",
+};
+
+/**
+ * The flat-topped hexagonal cell, in a 24-unit box.
+ *
+ * Flat-topped and not domed, for the mark's own reason (`DESIGN.md` →
+ * Components): a dome head with antennae is the bugdroid's silhouette and
+ * Android's trademark forbids derivatives of it. Every vertex is on a whole
+ * unit so the outline lands on whole pixels at 24px and at 12px.
+ */
+const CELL = "M7 2H17L22 12L17 22H7L2 12Z";
+
+/**
+ * The same cell with a wedge cut out of its right side — the lamp's `fault`
+ * geometry, which is a filled disc with a bite taken out of its trailing edge.
+ * The bite is on the RIGHT for the lamp's reason: the left is the margin
+ * everything else is aligned to and means something else.
+ */
+const CELL_NOTCHED = "M7 2H17L19.5 7L16 12L19.5 17L17 22H7L2 12Z";
+
+/**
+ * The geometry per shape. Distinct markup per shape is the contract this
+ * component exists to keep — two shapes sharing a drawing is colour becoming
+ * the only carrier again, by accident.
+ *
+ * The dash pattern is arithmetic, not taste: the cell's perimeter is
+ * 10 + 10 + 4 × 11.18 = 64.72 units, so 4.045/4.045 lands exactly eight dashes
+ * with no ragged final segment at any size. The lamp's ring is dashed for the
+ * same reason and by the same method.
+ */
+const SHAPE_GEOMETRY: Record<BotIdentityShape, ReactElement> = {
+  filled: <path d={CELL} fill="currentColor" />,
+  hollow: <path d={CELL} fill="none" stroke="currentColor" strokeWidth="2" />,
+  dashed: (
+    <path
+      d={CELL}
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeDasharray="4.045 4.045"
+    />
+  ),
+  notched: <path d={CELL_NOTCHED} fill="currentColor" />,
+};
+
+/** Whether `value` is a shape this build draws. */
+export function isBotIdentityShape(value: string | null): value is BotIdentityShape {
+  return value !== null && (BOT_IDENTITY_SHAPES as readonly string[]).includes(value);
+}
+
+/**
+ * Whether `value` is a member of the bounded palette.
+ *
+ * A name from outside it is treated as **absent**, never as a colour to try
+ * drawing: a row written by a newer build names an ink this one has no verified
+ * hex for, and painting it as `currentColor` would silently claim an identity
+ * the person did not choose. The stored value is untouched — `spaceIcon`'s rule
+ * for an unknown icon name, for the same reason.
+ */
+export function isBotIdentityColour(value: string | null): value is BotIdentityColour {
+  return value !== null && (BOT_IDENTITY_COLOURS as readonly string[]).includes(value);
+}
+
+/** The three stored identity fields, which is all this module needs of a bot. */
+export interface BotIdentityFields {
+  shape: string | null;
+  colour: string | null;
+  mark: string | null;
+}
+
+/**
+ * The identity, in words — the sentence every control carrying a cell puts into
+ * its own accessible name.
+ *
+ * This is the accessibility half of "colour is never the only carrier". Two
+ * bots differing only in their ink read as two different identities here,
+ * because the ink is named; and a person who cannot tell the two inks apart
+ * still has the shape and the mark, which are named first.
+ *
+ * A shape this build cannot draw says so rather than being dropped silently:
+ * an identity that is *there* and unrenderable is a different fact from no
+ * identity, and AD-27's posture is that an unknown is never rendered as a
+ * `false`.
+ */
+export function botIdentityPhrase(identity: BotIdentityFields): string {
+  const parts: string[] = [];
+  if (isBotIdentityShape(identity.shape)) {
+    parts.push(
+      isBotIdentityColour(identity.colour)
+        ? `${identity.shape} cell in ${identity.colour}`
+        : `${identity.shape} cell`,
+    );
+  } else if (identity.shape !== null && identity.shape.trim() !== "") {
+    parts.push("a shape this version of keeper cannot draw");
+  }
+  if (identity.mark !== null && identity.mark.trim() !== "") {
+    // An icon's name reads as words; a typed grapheme is named as the
+    // character it is, so "marked K" is not heard as an icon called K.
+    parts.push(
+      identity.mark in SPACE_ICONS
+        ? `marked ${identity.mark.replace(/-/g, " ")}`
+        : `marked the character ${identity.mark}`,
+    );
+  }
+  return parts.length === 0 ? "no identity chosen" : parts.join(", ");
+}
+
+/** The accessible name of a control that switches to `bot`. */
+export function botPinLabel(bot: BotIdentityFields & { name: string }): string {
+  return `${bot.name} — ${botIdentityPhrase(bot)}`;
+}
+
+/**
+ * The cell's own outline as a clip, so a picture drawn in it never spills past
+ * the hexagon: `CELL`'s six points on the 24-unit grid, as percentages.
+ */
+const CELL_CLIP =
+  "polygon(29.17% 8.33%, 70.83% 8.33%, 91.67% 50%, 70.83% 91.67%, 29.17% 91.67%, 8.33% 50%)";
+
+/**
+ * The cell itself: shape, ink, mark — or, for an agent whose home holds one,
+ * its picture (story 100.4, R384).
+ *
+ * `aria-hidden`, always. The identity is spoken by the control that owns it
+ * through {@link botPinLabel} — the lamp's rule, and for the lamp's measured
+ * reason: an `aria-label` on the ancestor replaces its contents, so a name
+ * rendered in here would be announced to nobody, and where the name is built
+ * from contents instead the algorithm concatenates trimmed text nodes into one
+ * unreadable token.
+ *
+ * `image` is a URL Rust composed (`AgentStatusVm.avatar`): drawn as an `<img>`
+ * — never inlined, so an SVG's script never runs — clipped to the cell, in
+ * place of the mark. A picture that does not load is dropped for that URL and
+ * the mark is drawn: the letter is always the fallback.
+ */
+export function BotIdentityCell({
+  identity,
+  image = null,
+  className,
+}: {
+  identity: BotIdentityFields;
+  image?: string | null;
+  className?: string;
+}) {
+  const [failed, setFailed] = useState<string | null>(null);
+  const picture = image !== null && image !== failed ? image : null;
+  const shape = isBotIdentityShape(identity.shape) ? identity.shape : null;
+  // The pairing, in one expression: no shape, no ink. Removing this guard is
+  // exactly the defect `DESIGN.md:172` bans — a bare coloured dot.
+  const ink = shape !== null && isBotIdentityColour(identity.colour) ? identity.colour : null;
+  const mark =
+    picture === null && identity.mark !== null && identity.mark.trim() !== ""
+      ? identity.mark
+      : null;
+  const Glyph = mark !== null && mark in SPACE_ICONS ? spaceIcon(mark) : null;
+  return (
+    <span
+      aria-hidden="true"
+      data-slot="bot-identity"
+      data-shape={shape ?? "none"}
+      data-colour={ink ?? "none"}
+      className={cn(
+        "relative inline-flex size-6 shrink-0 items-center justify-center",
+        ink === null ? "text-muted-foreground" : INK_CLASS[ink],
+        className,
+      )}
+    >
+      {picture !== null && (
+        <img
+          src={picture}
+          alt=""
+          draggable={false}
+          data-slot="bot-identity-picture"
+          onError={() => setFailed(picture)}
+          className="absolute inset-0 size-full object-cover"
+          style={{ clipPath: CELL_CLIP }}
+        />
+      )}
+      {shape !== null && (
+        <svg
+          aria-hidden="true"
+          viewBox="0 0 24 24"
+          focusable="false"
+          className="absolute inset-0 size-full"
+        >
+          {SHAPE_GEOMETRY[shape]}
+        </svg>
+      )}
+      {mark !== null && (
+        // On a filled cell the mark is cut out of the ink, so it is drawn in the
+        // surface colour — which is legible by construction, because every ink
+        // in the palette clears 4.5:1 against `--background` in both themes and
+        // the gate re-checks it.
+        <span
+          className={cn(
+            "relative inline-flex items-center justify-center",
+            shape === "filled" || shape === "notched" ? "text-background" : undefined,
+          )}
+        >
+          {Glyph === null ? (
+            <span className="font-mono text-meta leading-none">{mark}</span>
+          ) : (
+            <Glyph className="size-3" />
+          )}
+        </span>
+      )}
+    </span>
+  );
+}

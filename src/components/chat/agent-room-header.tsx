@@ -40,7 +40,7 @@ import { Ellipsis, Globe, LockOpen } from "lucide-react";
 import type { ReactNode } from "react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
-import { BotIdentityCell } from "@/components/bots/bot-identity";
+import { BotIdentityCell } from "@/components/agents/identity";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
