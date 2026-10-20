@@ -164,10 +164,6 @@ pub fn sync_exit_code(err: &SyncError) -> u8 {
         SyncError::GitMissing { .. } => EXIT_PREREQUISITE,
         // Someone must edit something before this can ever work.
         SyncError::Config(_) => EXIT_CONFIG,
-        // The server has no object for a pointer the folder names (Story
-        // 102.2), and no history here holds it: the bytes are on another
-        // device, and a `Restart=on-failure` loop asks the same server again.
-        SyncError::LfsObjectMissing { .. } => EXIT_CONFIG,
         // A cancelled operation is not a failure — the type's own contract says
         // so, and a graceful SIGTERM must not make systemd log a failed unit.
         SyncError::Cancelled => EXIT_OK,
@@ -214,6 +210,12 @@ pub fn sync_exit_code(err: &SyncError) -> u8 {
         // is not a failure at all; it defers the push and the next upload to land
         // releases it.
         | SyncError::LfsUploadPending { .. }
+        // The server has no object for a pointer the folder names (Story
+        // 102.2), and no history here holds it. Usually the device that
+        // pushed the pointer has not finished uploading it, so the pass
+        // failed rather than the configuration: a restart asks again, which
+        // is what the supervisor does on its own slower schedule.
+        | SyncError::LfsObjectMissing { .. }
         | SyncError::Integrity { .. }
         | SyncError::Quota { .. }
         | SyncError::Diverged { .. }
@@ -5090,6 +5092,10 @@ mod tests {
                 EXIT_PREREQUISITE,
             ),
             (SyncError::Config("bad".to_owned()), EXIT_CONFIG),
+            (
+                SyncError::lfs_object_missing("electra", "96bae0e0"),
+                EXIT_FAILURE,
+            ),
             (SyncError::Cancelled, EXIT_OK),
             (
                 SyncError::GitCommand {
