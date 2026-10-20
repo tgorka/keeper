@@ -43,6 +43,15 @@ fn stub(replies: Vec<Vec<Value>>) -> (String, Arc<Mutex<Vec<Value>>>) {
                 .expect("requests")
                 .push(serde_json::from_slice(&body).unwrap_or(Value::Null));
             let chunks = queue.pop_front().unwrap_or_default();
+            if let Some(status) = chunks.first().and_then(|c| c["__status"].as_u64()) {
+                let body = chunks[0]["__body"].as_str().unwrap_or_default().to_owned();
+                let _ = write!(
+                    socket,
+                    "HTTP/1.1 {status} Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                continue;
+            }
             let mut text: String = chunks.iter().map(|c| format!("data: {c}\n\n")).collect();
             text.push_str("data: [DONE]\n\n");
             let _ = write!(
@@ -74,9 +83,10 @@ fn call(id: &str) -> Value {
     ]},"finish_reason":"tool_calls"}]})
 }
 
-/// A host serving one tool outside the drive's verbs, counting its runs.
+/// A host serving one tool outside the drive's verbs, counting its runs and
+/// noting, at each run, which calls its turn's sink had been told of.
 #[derive(Default)]
-struct Clock(Mutex<usize>);
+struct Clock(Mutex<usize>, Option<Arc<Heard>>, Mutex<Vec<Vec<String>>>);
 
 impl ToolHost for Clock {
     fn run(&self, _call: &ToolCall) -> Result<ToolOutcome, BotsError> {
@@ -87,6 +97,10 @@ impl ToolHost for Clock {
     fn run_named(&self, wire: &chat::ToolCall) -> Option<ToolOutcome> {
         (wire.name == "clock").then(|| {
             *self.0.lock().expect("runs") += 1;
+            if let Some(heard) = &self.1 {
+                let told = heard.started.lock().expect("started").clone();
+                self.2.lock().expect("told").push(told);
+            }
             ToolOutcome::Answered {
                 text: "12:00".to_owned(),
             }
@@ -98,6 +112,8 @@ impl ToolHost for Clock {
 struct Heard {
     events: Mutex<Vec<Value>>,
     ended: Mutex<Option<TurnEnd>>,
+    /// Wire ids told as started, in order.
+    started: Mutex<Vec<String>>,
 }
 
 impl TurnSink for Heard {
@@ -110,6 +126,9 @@ impl TurnSink for Heard {
     }
     fn ended(&self, end: TurnEnd) {
         *self.ended.lock().expect("ended") = Some(end);
+    }
+    fn tool_started(&self, call: &chat::ToolCall) {
+        self.started.lock().expect("started").push(call.id.clone());
     }
 }
 
@@ -275,5 +294,117 @@ async fn a_round_past_the_agents_token_budget_is_not_sent() {
     assert_eq!(
         end,
         TurnEnd::Failed(keeper_core::agents::helper::TURN_SPENT.to_owned())
+    );
+}
+
+fn usage(prompt: u32, completion: u32) -> Value {
+    json!({"model":"stub-model","choices":[],"usage":{"prompt_tokens":prompt,"completion_tokens":completion,"total_tokens":prompt + completion}})
+}
+
+#[tokio::test]
+async fn a_rounds_usage_frames_are_snapshots_counted_once_and_rounds_add_up() {
+    // Round one reports 90/10 then 90/20: it spent 110, not 210, so a
+    // 200-token budget still sends round two.
+    let (base, requests) = stub(vec![
+        vec![usage(90, 10), call("c-1"), usage(90, 20)],
+        vec![delta("Noon."), finish("stop", 40, 5)],
+    ]);
+    let host = Clock::default();
+    let heard = Heard::default();
+    let (_cancel, signal) = chat::cancellation();
+
+    let end = served::serve_turn(turn(&base, limits(8, 200)), &host, &heard, signal).await;
+
+    assert_eq!(end, TurnEnd::Complete);
+    assert_eq!(requests.lock().expect("requests").len(), 2);
+    let message = &heard.of("closed")[0]["message"];
+    assert_eq!(message["promptTokens"], 130);
+    assert_eq!(message["completionTokens"], 25);
+    assert_eq!(message["totalTokens"], 155);
+}
+
+#[tokio::test]
+async fn each_call_is_told_as_started_before_it_runs() {
+    let (base, _requests) = stub(vec![
+        vec![call("c-1")],
+        vec![delta("Noon."), finish("stop", 1, 1)],
+    ]);
+    let heard = Arc::new(Heard::default());
+    let host = Clock(
+        Mutex::new(0),
+        Some(Arc::clone(&heard)),
+        Mutex::new(Vec::new()),
+    );
+    let (_cancel, signal) = chat::cancellation();
+
+    served::serve_turn(turn(&base, limits(8, 0)), &host, heard.as_ref(), signal).await;
+
+    assert_eq!(*host.2.lock().expect("told"), vec![vec!["c-1".to_owned()]]);
+    assert_eq!(
+        heard.of("toolResult")[0]["call"]["id"],
+        "c-1",
+        "the result names the same call"
+    );
+}
+
+const PLANTED: &str = "sk-planted-key-0123456789";
+
+#[tokio::test]
+async fn a_provider_that_echoes_the_key_in_an_error_body_never_passes_it_on() {
+    let (base, _requests) = stub(vec![vec![json!({
+        "__status": 401,
+        "__body": format!("{{\"error\":\"invalid API key: {PLANTED}\"}}"),
+    })]]);
+    let heard = Heard::default();
+    let (_cancel, signal) = chat::cancellation();
+    let mut served_turn = turn(&base, limits(8, 0));
+    served_turn.endpoint.token = Some(PLANTED.to_owned());
+
+    let end = served::serve_turn(served_turn, &Clock::default(), &heard, signal).await;
+
+    let TurnEnd::Failed(reason) = end else {
+        panic!("a 401 fails the turn: {end:?}")
+    };
+    assert!(
+        !reason.contains(PLANTED) && reason.contains(served::REDACTED),
+        "{reason}"
+    );
+    let closed = serde_json::to_string(&heard.of("closed")).expect("json");
+    assert!(!closed.contains(PLANTED), "{closed}");
+}
+
+#[tokio::test]
+async fn a_streamed_error_echoing_the_key_never_passes_it_on() {
+    let (base, _requests) = stub(vec![vec![
+        delta("Partly "),
+        json!({"error":{"message": format!("bad key {PLANTED}")}}),
+    ]]);
+    let heard = Heard::default();
+    let (_cancel, signal) = chat::cancellation();
+    let mut served_turn = turn(&base, limits(8, 0));
+    served_turn.endpoint.token = Some(PLANTED.to_owned());
+
+    served::serve_turn(served_turn, &Clock::default(), &heard, signal).await;
+
+    let events = serde_json::to_string(&*heard.events.lock().expect("events")).expect("json");
+    assert!(!events.contains(PLANTED), "{events}");
+    assert_eq!(heard.of("closed")[0]["reason"], served::BROKE_REASON);
+}
+
+#[test]
+fn redaction_takes_out_the_key_and_a_urls_credentials() {
+    let endpoint = Endpoint {
+        kind: ProviderKind::OpenAi,
+        base_url: "https://gateway-user:gateway-pass@llm.example.org".to_owned(),
+        bot: None,
+        token: Some(PLANTED.to_owned()),
+    };
+    let said = served::redact(
+        &format!("401 from https://gateway-user:gateway-pass@llm.example.org: key {PLANTED}"),
+        &endpoint,
+    );
+    assert!(
+        !said.contains(PLANTED) && !said.contains("gateway-pass") && !said.contains("gateway-user"),
+        "{said}"
     );
 }

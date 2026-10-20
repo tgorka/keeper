@@ -11,15 +11,27 @@
 //! tool, `ToolResult` as each call completes, and one `Closed` with the
 //! answer's metadata.
 //!
+//! Before a round's calls run, the sink hears each of them through
+//! [`TurnSink::tool_started`], with the wire id its `ToolResult` will carry,
+//! so a host can record a call as started before it has any effect.
+//!
+//! An error a turn ends with never carries the provider's key or a URL's
+//! credentials: a gateway that echoes them in its body is redacted before
+//! the reason reaches the sink or a log.
+//!
 //! An approval is the tool host's to ask: a host that parks a call on a
 //! person asks its [`crate::ports::ApprovalPort`] inside `ToolHost::run`.
 
 use std::time::{Duration, Instant};
 
 use keeper_core::agents::home::Limits;
-use keeper_core::bots::chat::{self, CancelSignal, ChatEvent, ChatOptions, ChatRequest};
+use keeper_core::bots::chat::{
+    self, CancelSignal, ChatEvent, ChatOptions, ChatRequest, TokenUsage, ToolCall as WireToolCall,
+};
 use keeper_core::bots::error::BotsError;
-use keeper_core::bots::tools::{self, ToolHost, ToolLoop, ToolLoopEvent, ToolLoopOptions};
+use keeper_core::bots::tools::{
+    self, ToolCall, ToolHost, ToolLoop, ToolLoopEvent, ToolLoopOptions, ToolOutcome,
+};
 use keeper_core::bots::{http, Endpoint};
 use keeper_core::vm::{BotMessageVm, BotSessionVm, BotStreamEvent, BotToolCallVm};
 
@@ -74,6 +86,51 @@ pub const STOPPED_REASON: &str = "Stopped. What had arrived is kept.";
 /// What an answer whose stream broke carries.
 pub const BROKE_REASON: &str = "The answer stopped before it finished.";
 
+/// What replaces a secret in an error's text.
+pub const REDACTED: &str = "[redacted]";
+
+/// `text` without `endpoint`'s token or the credentials of its base URL.
+pub fn redact(text: &str, endpoint: &Endpoint) -> String {
+    let mut secrets: Vec<String> = endpoint.token.iter().cloned().collect();
+    if let Ok(url) = url::Url::parse(&endpoint.base_url) {
+        secrets.extend(
+            [url.username(), url.password().unwrap_or_default()]
+                .into_iter()
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned),
+        );
+    }
+    let mut out = text.to_owned();
+    for secret in secrets.iter().filter(|s| s.len() >= 4) {
+        out = out.replace(secret.as_str(), REDACTED);
+    }
+    out
+}
+
+/// The host a turn's calls run through, announcing each round's calls to
+/// the sink before the first of them runs.
+struct Announced<'a> {
+    inner: &'a dyn ToolHost,
+    sink: &'a dyn TurnSink,
+}
+
+impl ToolHost for Announced<'_> {
+    fn run(&self, call: &ToolCall) -> Result<ToolOutcome, BotsError> {
+        self.inner.run(call)
+    }
+
+    fn run_named(&self, wire: &WireToolCall) -> Option<ToolOutcome> {
+        self.inner.run_named(wire)
+    }
+
+    fn prepare_round(&self, calls: &[WireToolCall]) {
+        for call in calls {
+            self.sink.tool_started(call);
+        }
+        self.inner.prepare_round(calls);
+    }
+}
+
 /// Serve `turn` into `sink`, every tool call through `host`, until it ends
 /// or `stop` fires; returns how it ended, as [`TurnSink::ended`] was told.
 pub async fn serve_turn(
@@ -125,7 +182,7 @@ pub async fn serve_turn(
             return close(
                 &turn,
                 sink,
-                Ending::Error(error.to_string()),
+                Ending::Error(redact(&error.to_string(), &turn.endpoint)),
                 Tally::default(),
                 opened_ms,
                 started,
@@ -133,10 +190,11 @@ pub async fn serve_turn(
         }
     };
     sink.request_sent();
+    let announced = Announced { inner: host, sink };
     let context = ToolLoop {
         client: &client,
         endpoint: &turn.endpoint,
-        host,
+        host: &announced,
         default_profile_id: &turn.default_profile_id,
     };
 
@@ -169,18 +227,13 @@ pub async fn serve_turn(
         }) => {
             sink.event(BotStreamEvent::ToolCall { name });
         }
+        // A usage frame is the round's count so far, not an increment: the
+        // latest one stands for the round (as the room turn's `round_usage`).
         ToolLoopEvent::Chat(ChatEvent::Usage(usage)) => {
-            let mut tally = lock();
-            let add = |sum: &mut Option<u32>, n: Option<u32>| {
-                if let Some(n) = n {
-                    *sum = Some(sum.unwrap_or(0).saturating_add(n));
-                }
-            };
-            add(&mut tally.prompt_tokens, usage.prompt_tokens);
-            add(&mut tally.completion_tokens, usage.completion_tokens);
-            add(&mut tally.total_tokens, usage.total_tokens);
+            lock().round_usage = Some(usage);
         }
         ToolLoopEvent::Chat(ChatEvent::Failed { error }) => {
+            let error = redact(&error.to_string(), &turn.endpoint);
             tracing::warn!(%error, "agents: a served turn's stream failed after it had produced bytes");
         }
         ToolLoopEvent::RoundStarted { round, .. } => {
@@ -219,7 +272,8 @@ pub async fn serve_turn(
     // The agent's token budget is the room turn's (R111): a round past it
     // is not sent.
     let mut gate = |_round: usize| {
-        let tally = lock();
+        let mut tally = lock();
+        tally.fold_round();
         let spent = u64::from(tally.prompt_tokens.unwrap_or(0))
             + u64::from(tally.completion_tokens.unwrap_or(0));
         if keeper_core::agents::helper::spent(turn.limits.tokens_per_turn, spent) {
@@ -248,11 +302,12 @@ pub async fn serve_turn(
         &mut gate,
     )
     .await;
-    let tally = std::mem::take(&mut *lock());
+    let mut tally = std::mem::take(&mut *lock());
+    tally.fold_round();
     let ending = match result {
         Ok(_) if stop.is_cancelled() => Ending::Stopped,
         Ok(ran) => Ending::Finished(ran.final_outcome),
-        Err(error) => Ending::Error(error.to_string()),
+        Err(error) => Ending::Error(redact(&error.to_string(), &turn.endpoint)),
     };
     close(&turn, sink, ending, tally, opened_ms, started)
 }
@@ -265,7 +320,26 @@ struct Tally {
     prompt_tokens: Option<u32>,
     completion_tokens: Option<u32>,
     total_tokens: Option<u32>,
+    /// The round under way's latest usage frame.
+    round_usage: Option<TokenUsage>,
     calls: usize,
+}
+
+impl Tally {
+    /// Count the round that just ended once, from its latest usage frame.
+    fn fold_round(&mut self) {
+        let Some(usage) = self.round_usage.take() else {
+            return;
+        };
+        let add = |sum: &mut Option<u32>, n: Option<u32>| {
+            if let Some(n) = n {
+                *sum = Some(sum.unwrap_or(0).saturating_add(n));
+            }
+        };
+        add(&mut self.prompt_tokens, usage.prompt_tokens);
+        add(&mut self.completion_tokens, usage.completion_tokens);
+        add(&mut self.total_tokens, usage.total_tokens);
+    }
 }
 
 enum Ending {
