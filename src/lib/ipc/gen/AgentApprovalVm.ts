@@ -27,6 +27,12 @@ decidedBy?: string,
  */
 canDecide: boolean, 
 /**
+ * The server refused this person's decision on it (V8, a tier-4 host,
+ * a decision racing another device's): its sentence. The request is
+ * pending again.
+ */
+refused?: string, 
+/**
  * Rust's line for it.
  */
 sentence: string, };

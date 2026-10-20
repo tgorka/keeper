@@ -134,6 +134,48 @@ pub struct RemotePages {
     /// At least one fetch has ended.
     pub fetched: bool,
     pub error: Option<String>,
+    /// The fetch whose answer may land; any other answer is stale.
+    pub token: u64,
+}
+
+impl RemotePages {
+    /// Start a fetch: its token, and the pages it reads from.
+    pub fn begin(&mut self, token: u64) -> RemotePages {
+        self.token = token;
+        self.loading = true;
+        self.clone()
+    }
+
+    /// Land a fetch's answer if it is the one this view waits for: rows
+    /// already shown are not added twice, and the cursor moves only
+    /// forward from the fetch that read it. `false` when it was stale.
+    pub fn land(&mut self, token: u64, fetched: Result<Fetched, String>) -> bool {
+        if !self.loading || token != self.token {
+            return false;
+        }
+        self.loading = false;
+        self.fetched = true;
+        match fetched {
+            Ok(page) => {
+                let shown: HashSet<String> = self
+                    .rows
+                    .iter()
+                    .map(|row| text(row, "id").to_owned())
+                    .collect();
+                self.rows.extend(
+                    page.rows
+                        .into_iter()
+                        .filter(|row| !shown.contains(text(row, "id"))),
+                );
+                self.month = page.month;
+                self.cursor = page.cursor;
+                self.exhausted = page.exhausted;
+                self.error = None;
+            }
+            Err(sentence) => self.error = Some(sentence),
+        }
+        true
+    }
 }
 
 /// One opened session's state on this device.
@@ -183,6 +225,7 @@ pub fn view(
     source: &Source,
     session_id: &str,
     opened: &Opened,
+    refusals: &approvals::Refusals,
     now_ms: i64,
 ) -> Result<(AgentSessionViewVm, Option<i64>), String> {
     let Some(session) = session_row(source, session_id) else {
@@ -257,7 +300,7 @@ pub fn view(
             archived: session.archived,
             read_only: session.archived,
             messages,
-            approvals: approvals::of_session(source, session_id, &directory, now_ms),
+            approvals: approvals::of_session(source, session_id, &directory, refusals, now_ms),
             has_earlier,
             loading_earlier,
             complete,

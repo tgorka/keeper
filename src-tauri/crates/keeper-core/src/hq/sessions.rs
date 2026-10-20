@@ -16,7 +16,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -436,14 +436,24 @@ pub fn rows(source: &Source, now_ms: i64) -> Vec<AgentSessionRowVm> {
         .iter()
         .filter_map(|row| opt_text(row, "session_id"))
         .collect();
-    let answered: HashMap<String, i64> = read(
+    // Each session's newest agent message: a turn that ended in an error is
+    // a failure, not an answer (the runtime writes `metadata.error`).
+    let newest_answer: HashMap<String, (i64, bool)> = read(
         source,
-        "SELECT session_id, max(created_at_ms) AS at FROM messages \
-         WHERE role = 'agent' GROUP BY session_id",
+        "SELECT m.session_id AS session_id, m.created_at_ms AS at, m.metadata AS metadata \
+         FROM messages m WHERE m.role = 'agent' AND NOT EXISTS (SELECT 1 FROM messages later \
+         WHERE later.session_id = m.session_id AND later.role = 'agent' \
+         AND (later.created_at_ms > m.created_at_ms \
+         OR (later.created_at_ms = m.created_at_ms AND later.id > m.id)))",
         &[],
     )
     .iter()
-    .filter_map(|row| Some((opt_text(row, "session_id")?, int(row, "at")?)))
+    .filter_map(|row| {
+        let failed = json(row, "metadata")
+            .get("error")
+            .is_some_and(|error| !error.is_null());
+        Some((opt_text(row, "session_id")?, (int(row, "at")?, failed)))
+    })
     .collect();
     sessions
         .iter()
@@ -451,15 +461,16 @@ pub fn rows(source: &Source, now_ms: i64) -> Vec<AgentSessionRowVm> {
             let id = opt_text(row, "id")?;
             let agent = text(row, "agent_actor").to_owned();
             let agent_name = names.get(&agent).cloned().unwrap_or_else(|| agent.clone());
+            let answer = newest_answer.get(&id);
             let attention = if needs.contains(&id) {
                 Some(AgentAttentionVm::NeedsYou)
-            } else if text(row, "status") == "failed" {
-                Some(AgentAttentionVm::Failed)
             } else if working.contains(&id) {
+                // A turn under way supersedes how the last one ended.
                 Some(AgentAttentionVm::Working)
-            } else if answered
-                .get(&id)
-                .is_some_and(|at| int(row, "read_until").is_none_or(|read| *at > read))
+            } else if text(row, "status") == "failed" || answer.is_some_and(|(_, failed)| *failed) {
+                Some(AgentAttentionVm::Failed)
+            } else if answer
+                .is_some_and(|(at, _)| int(row, "read_until").is_none_or(|read| *at > read))
             {
                 Some(AgentAttentionVm::DoneUnread)
             } else {
@@ -482,7 +493,8 @@ pub fn rows(source: &Source, now_ms: i64) -> Vec<AgentSessionRowVm> {
 
 /// The sessions where something waits for this person: an approval naming
 /// them that is still pending, or an agent's ask no later message of the
-/// person answered.
+/// person answered — the timeline's rule: an agent message after the ask
+/// does not close it.
 fn needs_you(source: &Source, now_ms: i64) -> HashSet<String> {
     let mut waiting: HashSet<String> = read(
         source,
@@ -494,16 +506,17 @@ fn needs_you(source: &Source, now_ms: i64) -> HashSet<String> {
     .filter(|row| names(row, "approvers").contains(&source.actor))
     .filter_map(|row| opt_text(row, "session_id"))
     .collect();
-    let newest = read(
+    let unanswered = read(
         source,
-        "SELECT m.session_id AS session_id, m.role AS role, m.metadata AS metadata \
-         FROM messages m WHERE NOT EXISTS (SELECT 1 FROM messages later \
-         WHERE later.session_id = m.session_id AND (later.created_at_ms > m.created_at_ms \
-         OR (later.created_at_ms = m.created_at_ms AND later.id > m.id)))",
+        "SELECT m.session_id AS session_id, m.metadata AS metadata \
+         FROM messages m WHERE m.role = 'agent' AND NOT EXISTS (SELECT 1 FROM messages p \
+         WHERE p.session_id = m.session_id AND p.role = 'person' \
+         AND (p.created_at_ms > m.created_at_ms \
+         OR (p.created_at_ms = m.created_at_ms AND p.id > m.id)))",
         &[],
     );
-    for row in newest {
-        if text(&row, "role") == "agent" && is_ask(&json(&row, "metadata")) {
+    for row in unanswered {
+        if is_ask(&json(&row, "metadata")) {
             if let Some(id) = opt_text(&row, "session_id") {
                 waiting.insert(id);
             }
@@ -796,10 +809,16 @@ pub(crate) fn person_message(source: &Source, session_id: &str, body: &str, at: 
     }
 }
 
+/// Held from reading the highest session id to committing the next one, so
+/// two creations at once never mint the same id: the committed row is in
+/// the replica (optimistically) before the next creation reads.
+static CREATING: Mutex<()> = Mutex::new(());
+
 /// Create a session with `agent` in `source`'s database and its first
 /// message, in one commit, offline if need be (the server grants each
 /// client its next session ids).
 pub fn create(source: &Source, agent: &str, body: &str) -> Result<String, ReplicaError> {
+    let _creating = CREATING.lock().unwrap_or_else(PoisonError::into_inner);
     let at = now_ms();
     let id = next_session_id(source);
     let session = RowOp::Upsert {

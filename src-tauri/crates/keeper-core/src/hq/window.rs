@@ -3,18 +3,59 @@
 //! every write into a session's own database (AD-433). The shell streams
 //! what this answers and decides nothing.
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::Duration;
 
 use tokio::sync::watch;
 
-use crate::hq::approvals::{self, AgentApprovalVm, AgentDecisionOutcomeVm};
+use crate::hq::approvals::{self, AgentApprovalVm, AgentDecisionOutcomeVm, Decisions};
 use crate::hq::send;
 use crate::hq::sessions::{
     self, AgentChoiceVm, AgentDefaultSessionVm, AgentSessionRef, AgentSessionRowVm, Source,
 };
-use crate::hq::timeline::{self, AgentSessionViewVm};
+use crate::hq::timeline::{self, AgentSessionViewVm, Opened};
 use crate::hq::{lock, sentence, Hq, HqError};
+
+/// Every archive fetch's token, so an answer for a view that has moved on
+/// is told apart from the one it waits for.
+static FETCHES: AtomicU64 = AtomicU64::new(0);
+
+/// The read points being written, so one slow write is not queued twice.
+static MARKING: LazyLock<Mutex<HashSet<(String, String)>>> = LazyLock::new(Mutex::default);
+
+/// The view of an opened session from the replica, then — on its own
+/// thread, so the view never waits behind the replica's owner and a round
+/// it may be in — the person's read point moved up to its newest message.
+pub(crate) fn view_now(
+    source: &Source,
+    session_id: &str,
+    opened: &Opened,
+    refusals: &HashMap<(String, String), String>,
+    now_ms: i64,
+) -> Result<AgentSessionViewVm, String> {
+    let (view, newest) = timeline::view(source, session_id, opened, refusals, now_ms)?;
+    if let (Some(newest), false) = (newest, view.archived) {
+        let key = (source.database.clone(), session_id.to_owned());
+        if lock(&MARKING).insert(key.clone()) {
+            let (writer, marked) = (source.clone(), key.clone());
+            let spawned = std::thread::Builder::new()
+                .name("hq-read-mark".to_owned())
+                .spawn(move || {
+                    if let Err(error) = sessions::mark_read(&writer, &marked.1, newest) {
+                        tracing::debug!(%error, "an agents session's read point could not be written");
+                    }
+                    lock(&MARKING).remove(&marked);
+                });
+            if let Err(error) = spawned {
+                tracing::debug!(%error, "an agents session's read point was not written");
+                lock(&MARKING).remove(&key);
+            }
+        }
+    }
+    Ok(view)
+}
 
 impl Hq {
     /// Every database this device holds, and who it is in each. Empty until
@@ -87,7 +128,9 @@ impl Hq {
         }
     }
 
-    /// Start following the replicas with their windows, once.
+    /// Start following the replicas with their windows, once; and wake
+    /// every view when the next pending approval expires, since nothing in
+    /// the replica changes then.
     pub(crate) fn follow_windows(&self) {
         let mut task = lock(&self.window_task);
         if task.is_some() {
@@ -98,30 +141,52 @@ impl Hq {
         *task = Some(tokio::spawn(async move {
             loop {
                 let Some(hq) = me.upgrade() else { return };
-                let done = tokio::task::spawn_blocking(move || hq.reconcile_windows()).await;
-                if let Err(error) = done {
-                    tracing::warn!(%error, "the agents windows could not be reconciled");
-                }
-                if changes.changed().await.is_err() {
-                    return;
+                let done = tokio::task::spawn_blocking(move || {
+                    hq.reconcile_windows();
+                    approvals::next_expiry(&hq.sources(), sessions::now_ms())
+                })
+                .await;
+                let next = match done {
+                    Ok(next) => next,
+                    Err(error) => {
+                        tracing::warn!(%error, "the agents windows could not be reconciled");
+                        None
+                    }
+                };
+                let changed = match next {
+                    Some(at) => {
+                        let wait = u64::try_from(at - sessions::now_ms()).unwrap_or(0) + 1;
+                        tokio::time::timeout(Duration::from_millis(wait), changes.changed()).await
+                    }
+                    None => Ok(changes.changed().await),
+                };
+                match changed {
+                    Ok(Ok(())) => {}
+                    Ok(Err(_)) => return,
+                    Err(_expired) => {
+                        if let Some(hq) = me.upgrade() {
+                            hq.touch();
+                        }
+                    }
                 }
             }
         }));
     }
 
-    /// An opened session as it stands, marking it read up to its newest
-    /// message.
+    /// An opened session as it stands. Its read point is written after,
+    /// never before: the view is the replica's and waits on nothing.
     pub fn session_view(&self, key: &AgentSessionRef) -> Result<AgentSessionViewVm, HqError> {
         let source = self.source(&key.database)?;
         let opened = lock(&self.views).get(key).cloned().unwrap_or_default();
-        let (view, newest) = timeline::view(&source, &key.session_id, &opened, sessions::now_ms())
-            .map_err(HqError::Sentence)?;
-        if let (Some(newest), false) = (newest, view.archived) {
-            if let Err(error) = sessions::mark_read(&source, &key.session_id, newest) {
-                tracing::debug!(%error, "an agents session's read point could not be written");
-            }
-        }
-        Ok(view)
+        let refusals = self.refusals();
+        view_now(
+            &source,
+            &key.session_id,
+            &opened,
+            &refusals,
+            sessions::now_ms(),
+        )
+        .map_err(HqError::Sentence)
     }
 
     /// A stream begins showing `key`: its window holds it (an archived one
@@ -162,6 +227,7 @@ impl Hq {
     /// Read the next page of an archived session through the server, off
     /// the async workers.
     fn fetch_remote(&self, key: AgentSessionRef, source: Source, session: timeline::SessionRow) {
+        let token = FETCHES.fetch_add(1, Ordering::Relaxed) + 1;
         let pages = {
             let mut views = lock(&self.views);
             let Some(opened) = views.get_mut(&key) else {
@@ -170,35 +236,24 @@ impl Hq {
             if opened.remote.loading || opened.remote.exhausted {
                 return;
             }
-            opened.remote.loading = true;
-            opened.remote.clone()
+            opened.remote.begin(token)
         };
         let me = self.me.clone();
         tokio::task::spawn_blocking(move || {
-            let fetched = timeline::fetch_page(&source, &key.session_id, &session, &pages);
+            let fetched = timeline::fetch_page(&source, &key.session_id, &session, &pages)
+                .map_err(|error| {
+                    tracing::info!(database = %source.database, %error, "an archived agents session could not be fetched");
+                    timeline::fetch_sentence(&source.database, &error)
+                });
             let Some(hq) = me.upgrade() else { return };
-            {
-                let mut views = lock(&hq.views);
-                if let Some(opened) = views.get_mut(&key) {
-                    let remote = &mut opened.remote;
-                    remote.loading = false;
-                    remote.fetched = true;
-                    match fetched {
-                        Ok(page) => {
-                            remote.rows.extend(page.rows);
-                            remote.month = page.month;
-                            remote.cursor = page.cursor;
-                            remote.exhausted = page.exhausted;
-                            remote.error = None;
-                        }
-                        Err(error) => {
-                            tracing::info!(database = %source.database, %error, "an archived agents session could not be fetched");
-                            remote.error = Some(timeline::fetch_sentence(&source.database, &error));
-                        }
-                    }
-                }
+            // A view closed and opened again, or archived again, waits for
+            // another fetch: this answer is dropped.
+            let landed = lock(&hq.views)
+                .get_mut(&key)
+                .is_some_and(|opened| opened.remote.land(token, fetched));
+            if landed {
+                hq.touch();
             }
-            hq.touch();
         });
     }
 
@@ -297,9 +352,32 @@ impl Hq {
         ))
     }
 
+    /// The decisions written here whose outcome is still owed, kept with
+    /// the replicas so a refusal that arrives after a relaunch is still
+    /// shown.
+    fn decisions(&self) -> Result<&Decisions, HqError> {
+        if let Some(decisions) = self.decisions.get() {
+            return Ok(decisions);
+        }
+        let path = crate::hq::databases::root(&self.data_dir()?).join("decisions.json");
+        Ok(self.decisions.get_or_init(|| Decisions::load(path)))
+    }
+
+    /// The server's refusals of decisions written here, by database and
+    /// approval; settled decisions are forgotten as they are read.
+    fn refusals(&self) -> HashMap<(String, String), String> {
+        match self.decisions() {
+            Ok(decisions) => decisions.refusals(&self.sources()),
+            Err(error) => {
+                tracing::debug!(%error, "the agents decisions could not be read");
+                HashMap::new()
+            }
+        }
+    }
+
     /// Every approval this person may decide now.
     pub fn approvals_waiting(&self) -> Vec<AgentApprovalVm> {
-        approvals::waiting(&self.sources(), sessions::now_ms())
+        approvals::waiting(&self.sources(), &self.refusals(), sessions::now_ms())
     }
 
     /// Decide an approval. Blocking: it waits briefly for the server.
@@ -311,14 +389,17 @@ impl Hq {
         approve: bool,
     ) -> Result<AgentDecisionOutcomeVm, HqError> {
         let source = self.source(&key.database)?;
-        approvals::decide(
+        let outcome = approvals::decide(
             &source,
+            self.decisions()?,
             &key.session_id,
             approval_id,
             binding_digest,
             approve,
             sessions::now_ms(),
         )
-        .map_err(sentence)
+        .map_err(sentence);
+        self.touch();
+        outcome
     }
 }

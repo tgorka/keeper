@@ -221,6 +221,8 @@ pub struct Hq {
     /// The units each replica's windows were last set to.
     windows: Mutex<HashMap<(String, &'static str), Vec<String>>>,
     window_task: Mutex<Option<JoinHandle<()>>>,
+    /// Decisions whose outcome the server still owes ([`approvals::Decisions`]).
+    decisions: std::sync::OnceLock<approvals::Decisions>,
 }
 
 fn no_server() -> HqStatusVm {
@@ -302,6 +304,7 @@ impl Hq {
             views: Mutex::default(),
             windows: Mutex::default(),
             window_task: Mutex::default(),
+            decisions: std::sync::OnceLock::new(),
         })
     }
 
