@@ -1537,6 +1537,7 @@ describe("ConversationPane", () => {
               sender: "@carol:example.org",
               senderDisplayName: "Carol",
               timestamp: 1,
+              sendState: null,
             },
           ],
         },
@@ -1546,6 +1547,36 @@ describe("ConversationPane", () => {
     await waitFor(() => {
       expect(screen.getByText("Message deleted")).toBeInTheDocument();
     });
+  });
+
+  it("a refused deletion of my message says 'Not deleted', not 'Message deleted', and Retry and Cancel reach it", async () => {
+    const captured: { onBatch: ((b: TimelineBatch) => void) | null } = { onBatch: null };
+    subscribeTimeline.mockImplementation((_a, _r, onBatch: (b: TimelineBatch) => void) => {
+      captured.onBatch = onBatch;
+      return Promise.resolve(1);
+    });
+    roomsStore.getState().selectRoom({ accountId: account.accountId, roomId: "!room:example.org" });
+    render(<ConversationPane {...noopProps()} />);
+
+    const stub = (sendState: "sending" | "failed") => ({
+      kind: "redacted" as const,
+      key: "r1",
+      sender: account.userId,
+      senderDisplayName: null,
+      timestamp: 1,
+      sendState,
+    });
+    captured.onBatch?.({ ops: [{ op: "reset", items: [stub("sending")] }] });
+    await waitFor(() => expect(screen.getByText("Deleting…")).toBeInTheDocument());
+    expect(screen.queryByText("Message deleted")).toBeNull();
+
+    captured.onBatch?.({ ops: [{ op: "set", index: 0, item: stub("failed") }] });
+    await waitFor(() => expect(screen.getByText("Not deleted")).toBeInTheDocument());
+    expect(screen.queryByText("Message deleted")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(retrySend).toHaveBeenCalledWith(account.accountId, "!room:example.org", "r1");
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(cancelSend).toHaveBeenCalledWith(account.accountId, "!room:example.org", "r1");
   });
 
   it("`⌫` on a selected own message opens the delete confirmation; a non-own does not", async () => {

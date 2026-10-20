@@ -143,6 +143,10 @@ rsa = "0.9"
 rcgen = { workspace = true }
 rustls = { workspace = true }
 tokio-rustls = { workspace = true }
+# The timeline tests' event-cache store that can pause a page under the
+# cache's lock: the `EventCacheStore` trait and its in-memory store, which
+# `matrix-sdk` does not re-export. Already in the tree through it.
+matrix-sdk-base = "0.19"
 # The region difference hash's bounds are proved over real screenshots of
 # the Mac (PNG fixtures, 96.4 #5); the hash itself takes grey bytes.
 image = { workspace = true }

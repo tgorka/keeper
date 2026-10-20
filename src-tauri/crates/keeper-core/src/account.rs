@@ -4067,7 +4067,10 @@ impl AccountManager {
     /// gate (FR-15, FR-41, AD-13, Story 3.8). Resolves the live `Arc<Timeline>`
     /// and delegates to [`send::redact`]; the `Set` diff that turns the message
     /// into a redacted stub in place arrives through the room's existing timeline
-    /// subscription — this synthesizes nothing. `reason` is an optional non-secret
+    /// subscription — this synthesizes nothing. The SDK queues the redaction, so
+    /// `Ok` means queued, not deleted: the stub carries its send state, and a
+    /// refused deletion is resolved through [`Self::retry_send`] or
+    /// [`Self::cancel_send`]. `reason` is an optional non-secret
     /// redaction reason (the IPC command passes `None`).
     ///
     /// Errors: an unparsable/unknown room id → [`SendError::RoomNotFound`]; no open
@@ -4083,7 +4086,7 @@ impl AccountManager {
         let room_id: OwnedRoomId = RoomId::parse(room_id).map_err(|_| SendError::RoomNotFound)?;
         let timeline = self.open_timeline_for(account_id, &room_id).await?;
         send::redact(&timeline, item_key, reason).await?;
-        tracing::info!(account_id = %account_id, room_id = %room_id, "message redaction dispatched");
+        tracing::info!(account_id = %account_id, room_id = %room_id, "message redaction queued");
         Ok(())
     }
 
@@ -4145,9 +4148,10 @@ impl AccountManager {
 
     /// Retry a failed outgoing message by re-driving its wedged local echo
     /// (`item_key` = the item's `unique_id`) through the controlled send path —
-    /// `SendHandle::unwedge()`, not a new content dispatch (FR-41). Resolves the
-    /// same live `Arc<Timeline>` that produced the item so the `unique_id` matches,
-    /// then delegates to [`send::retry`].
+    /// `SendHandle::unwedge()`, not a new content dispatch (FR-41) — or, on a
+    /// message whose deletion the server refused, queue that deletion again.
+    /// Resolves the same live `Arc<Timeline>` that produced the item so the
+    /// `unique_id` matches, then delegates to [`send::retry`].
     ///
     /// Errors: unknown room / no open timeline as [`send_text`]; a missing echo →
     /// [`SendError::EchoNotFound`].
@@ -4309,10 +4313,11 @@ impl AccountManager {
 
     /// Cancel an in-flight outgoing media (or text) echo by aborting its SDK send
     /// handle — best-effort, symmetric with [`AccountManager::retry_send`] (Story
-    /// 3.7). `item_key` is the echo's opaque `unique_id`. Resolves the same live
-    /// `Arc<Timeline>` that produced the item and delegates to [`send::cancel`]; the
-    /// echo's removal (or its already-sent no-op) arrives over the room's existing
-    /// timeline subscription.
+    /// 3.7) — or a queued deletion of the account's own message, which then
+    /// shows again. `item_key` is the item's opaque `unique_id`. Resolves the same
+    /// live `Arc<Timeline>` that produced the item and delegates to
+    /// [`send::cancel`]; the echo's removal (or its already-sent no-op) arrives
+    /// over the room's existing timeline subscription.
     ///
     /// Errors: unknown room / no open timeline as [`send_text`]; a missing echo →
     /// [`SendError::EchoNotFound`].

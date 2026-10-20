@@ -146,7 +146,16 @@ senderDisplayName: string | null,
 /**
  * The event origin timestamp: ms since the Unix epoch (UTC).
  */
-timestamp: number, } | { "kind": "approval", 
+timestamp: number, 
+/**
+ * Where this account's own deletion of it stands: the send queue
+ * carries it, so it may not have reached the server yet. `Sending`
+ * is not deleted yet; `Failed` was refused — the message is still on
+ * the server, and Retry or Cancel (which restores it) resolve it, as
+ * the room's later sends wait behind it; `Sent` and `null` (someone
+ * else's deletion, or one the server confirmed) are deleted.
+ */
+sendState: SendState | null, } | { "kind": "approval", 
 /**
  * Stable opaque render key (the item's `unique_id`).
  */

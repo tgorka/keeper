@@ -485,12 +485,14 @@ pub fn item_to_vm(
         // A redacted (deleted-for-everyone) message: surface an explicit honest
         // stub in place of a blank gap. The redacted event has no body to read;
         // only the sender, display name, and timestamp cross IPC (NFR-9, AD-1)
-        // (Story 3.8).
+        // (Story 3.8) — and, for this account's own deletion, where its queued
+        // redaction stands, since the stub shows before the server has it.
         MsgLikeKind::Redacted => TimelineItemVm::Redacted {
             key,
             sender: ev.sender().to_string(),
             sender_display_name,
             timestamp: i64::from(ev.timestamp().0),
+            send_state: ev.redaction_send_state().map(map_send_state),
         },
         // A custom event the agent filter admits: an approval request, drawn
         // as its card when an agent of the room sealed it.
@@ -2005,6 +2007,7 @@ mod tests {
             sender: "@alice:example.org".to_owned(),
             sender_display_name: Some("Alice".to_owned()),
             timestamp: 1_720_000_000_000,
+            send_state: Some(SendState::Failed),
         };
         let json = serde_json::to_value(&vm).expect("VM serializes");
         assert_eq!(json["kind"], "redacted");
@@ -2012,6 +2015,7 @@ mod tests {
         assert_eq!(json["sender"], "@alice:example.org");
         assert_eq!(json["senderDisplayName"], "Alice");
         assert_eq!(json["timestamp"], 1_720_000_000_000_i64);
+        assert_eq!(json["sendState"], "failed");
         // No body/content is carried on a redacted stub (nothing to render).
         assert!(json.get("body").is_none());
     }

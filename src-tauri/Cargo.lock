@@ -4689,6 +4689,7 @@ dependencies = [
  "image",
  "keeper-ported",
  "matrix-sdk",
+ "matrix-sdk-base",
  "matrix-sdk-crypto",
  "matrix-sdk-ui",
  "mime",
