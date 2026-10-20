@@ -22,7 +22,7 @@ use matrix_sdk::authentication::oauth::registration::{
     ApplicationType, ClientMetadata, Localized, OAuthGrantType,
 };
 use matrix_sdk::authentication::oauth::ClientRegistrationData;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot, watch};
 use url::Url;
 
 use crate::error::CoreError;
@@ -57,8 +57,9 @@ pub enum OAuthCallback {
         error: String,
         description: Option<String>,
     },
-    /// The platform's sign-in sheet could not be shown or ended with a system
-    /// error; the string is the platform's reason.
+    /// The platform's round trip ended without an answer of this flow's — a
+    /// callback without its `state`, or (for a flow that shows no link) a
+    /// sign-in sheet that could not be shown; the string is the reason.
     Failed(String),
     /// The flow was cancelled in-app before any callback arrived.
     Cancelled,
@@ -69,9 +70,56 @@ pub enum OAuthCallback {
 /// Cloneable-by-`Arc` in the shell: the `keeper` crate holds an
 /// `Arc<OAuthFlowRegistry>` in its `AppState` and passes clones to each
 /// `login_oidc` call and to the deep-link `on_open_url` handler.
-#[derive(Default)]
 pub struct OAuthFlowRegistry {
-    pending: Mutex<HashMap<String, oneshot::Sender<OAuthCallback>>>,
+    pending: Mutex<HashMap<String, Waiting>>,
+    /// How many times [`cancel_all`](OAuthFlowRegistry::cancel_all) ran: a
+    /// sign-in that took a [`CancelLatch`] before a cancel sees it, even one
+    /// still discovering its server with no entry in `pending` yet.
+    cancels: watch::Sender<u64>,
+}
+
+impl Default for OAuthFlowRegistry {
+    fn default() -> Self {
+        Self {
+            pending: Mutex::default(),
+            cancels: watch::channel(0).0,
+        }
+    }
+}
+
+/// A sign-in's hold on Cancel from the moment it starts (story 102.9, R500):
+/// a [`cancel_all`](OAuthFlowRegistry::cancel_all) after the latch was taken
+/// stays seen — while the server is discovered and the client registered,
+/// before the flow has a registry entry to drain — so the sign-in never
+/// opens a browser afterwards and ends as cancelled. A cancel before the
+/// latch was taken belongs to an earlier sign-in and is not seen.
+#[derive(Debug, Clone)]
+pub struct CancelLatch(watch::Receiver<u64>);
+
+impl CancelLatch {
+    /// Whether a cancel came since the latch was taken.
+    pub fn is_cancelled(&self) -> bool {
+        self.0.has_changed().unwrap_or(false)
+    }
+
+    /// Resolves once a cancel came since the latch was taken (at once if one
+    /// already did); never while none does.
+    pub async fn cancelled(&self) {
+        let mut seen = self.0.clone();
+        if seen.changed().await.is_err() {
+            // The registry is gone: nobody can press Cancel any more.
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+/// One flow waiting for its callback.
+struct Waiting {
+    answer: oneshot::Sender<OAuthCallback>,
+    /// A sign-in whose link the person can use by hand
+    /// ([`OAuthFlowRegistry::register_with_link`]): a page that could not be
+    /// shown is told here, and the flow keeps waiting.
+    unshown: Option<mpsc::UnboundedSender<String>>,
 }
 
 impl OAuthFlowRegistry {
@@ -80,20 +128,60 @@ impl OAuthFlowRegistry {
         Self::default()
     }
 
+    /// The latch a sign-in takes when it starts, before anything it awaits:
+    /// every later [`cancel_all`](OAuthFlowRegistry::cancel_all) reaches it.
+    pub fn cancel_latch(&self) -> CancelLatch {
+        CancelLatch(self.cancels.subscribe())
+    }
+
     /// Register a pending flow keyed by its `state` secret, returning the
     /// receiver the caller awaits. The caller MUST pair this with [`remove`]
     /// (typically via an RAII guard) so the entry is dropped on every exit path:
     /// a matched callback removes it, but a timeout/cancel/error/browser-open
     /// failure does not. If a stale entry with the same `state` somehow exists it
     /// is replaced (its old sender dropped → its receiver resolves `Err`, treated
-    /// as cancelled by the caller).
+    /// as cancelled by the caller). A page that could not be shown ends this
+    /// flow ([`not_shown`]).
     ///
     /// [`remove`]: OAuthFlowRegistry::remove
+    /// [`not_shown`]: OAuthFlowRegistry::not_shown
     pub fn register(&self, state: String) -> oneshot::Receiver<OAuthCallback> {
-        let (tx, rx) = oneshot::channel();
-        let mut pending = self.lock();
-        pending.insert(state, tx);
+        let (answer, rx) = oneshot::channel();
+        self.lock().insert(
+            state,
+            Waiting {
+                answer,
+                unshown: None,
+            },
+        );
         rx
+    }
+
+    /// [`register`], for a sign-in that shows its link to the person (story
+    /// 102.9, R480): a page that could not be shown does not end it. Each
+    /// [`not_shown`] reason arrives on the second receiver instead, and the
+    /// flow keeps waiting for the callback the pasted link brings, until its
+    /// deadline or a cancel.
+    ///
+    /// [`register`]: OAuthFlowRegistry::register
+    /// [`not_shown`]: OAuthFlowRegistry::not_shown
+    pub fn register_with_link(
+        &self,
+        state: String,
+    ) -> (
+        oneshot::Receiver<OAuthCallback>,
+        mpsc::UnboundedReceiver<String>,
+    ) {
+        let (answer, rx) = oneshot::channel();
+        let (unshown, unshown_rx) = mpsc::unbounded_channel();
+        self.lock().insert(
+            state,
+            Waiting {
+                answer,
+                unshown: Some(unshown),
+            },
+        );
+        (rx, unshown_rx)
     }
 
     /// Remove a pending flow's entry, if present. Idempotent — removing an absent
@@ -154,7 +242,7 @@ impl OAuthFlowRegistry {
         };
         // A send error means the receiver was already dropped (flow ended); the
         // entry is already removed, so this is a harmless late callback.
-        if sender.send(outcome).is_err() {
+        if sender.answer.send(outcome).is_err() {
             tracing::debug!("oauth callback: receiver already dropped; ignored");
             return false;
         }
@@ -163,10 +251,14 @@ impl OAuthFlowRegistry {
 
     /// Cancel every in-flight flow: send [`OAuthCallback::Cancelled`] to each
     /// pending sender and clear the registry. Used by the `cancel_oidc` command.
+    /// It is latched first, so a sign-in that holds a [`CancelLatch`] but has
+    /// no entry yet — still discovering its server — is cancelled too.
     pub fn cancel_all(&self) {
+        self.cancels
+            .send_modify(|cancels| *cancels = cancels.wrapping_add(1));
         let drained: Vec<_> = {
             let mut pending = self.lock();
-            pending.drain().map(|(_, tx)| tx).collect()
+            pending.drain().map(|(_, waiting)| waiting.answer).collect()
         };
         for tx in drained {
             // Ignore send errors: a dropped receiver is already-cancelled.
@@ -181,28 +273,51 @@ impl OAuthFlowRegistry {
     /// leg) keeps waiting.
     pub fn cancel(&self, state: &str) {
         let sender = self.lock().remove(state);
-        if let Some(tx) = sender {
+        if let Some(waiting) = sender {
             // A dropped receiver is already-cancelled.
-            let _ = tx.send(OAuthCallback::Cancelled);
+            let _ = waiting.answer.send(OAuthCallback::Cancelled);
         }
     }
 
     /// End one in-flight flow as a failed round trip: send
     /// [`OAuthCallback::Failed`] with the platform's `reason` to the sender
     /// registered under `state` and remove it. Returns whether a flow was
-    /// waiting. Used when the platform's sign-in sheet could not be shown or
-    /// handed back something that is not this flow's answer, so the waiting
-    /// flow ends at once — and reads as a broken round trip, never as the
-    /// identity provider's refusal.
+    /// waiting. Used when the platform's sign-in sheet handed back something
+    /// that is not this flow's answer, so the waiting flow ends at once — and
+    /// reads as a broken round trip, never as the identity provider's
+    /// refusal.
     pub fn fail(&self, state: &str, reason: &str) -> bool {
         let sender = self.lock().remove(state);
         // A dropped receiver is an already-ended flow.
-        sender.is_some_and(|tx| tx.send(OAuthCallback::Failed(reason.to_owned())).is_ok())
+        sender.is_some_and(|waiting| {
+            waiting
+                .answer
+                .send(OAuthCallback::Failed(reason.to_owned()))
+                .is_ok()
+        })
+    }
+
+    /// The platform could not show the page of the flow under `state` — a
+    /// sign-in sheet or Auth Tab that was queued and then refused, or could
+    /// not open (story 102.9, R480). A flow registered
+    /// [`with its link`](OAuthFlowRegistry::register_with_link) is told and
+    /// keeps waiting: its link is still good in any browser. Any other flow
+    /// (a sign-out's end-session round trip) ends as [`fail`] ends it.
+    /// Returns whether a flow was waiting.
+    ///
+    /// [`fail`]: OAuthFlowRegistry::fail
+    pub fn not_shown(&self, state: &str, reason: &str) -> bool {
+        let pending = self.lock();
+        if let Some(unshown) = pending.get(state).and_then(|w| w.unshown.as_ref()) {
+            return unshown.send(reason.to_owned()).is_ok();
+        }
+        drop(pending);
+        self.fail(state, reason)
     }
 
     /// Lock helper that recovers a poisoned mutex (a panicking send would only
     /// have left a fully-formed map behind), avoiding an `.unwrap()`.
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, oneshot::Sender<OAuthCallback>>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Waiting>> {
         self.pending
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -308,6 +423,35 @@ mod tests {
         assert!(registry.resolve("dev.tgorka.keeper:/oauth/callback?code=x&state=b"));
     }
 
+    /// A page that could not be shown leaves a sign-in that shows its link
+    /// waiting — the pasted link's callback still finishes it — and ends any
+    /// other flow (a sign-out's) as a failed round trip (R480).
+    #[tokio::test]
+    async fn a_page_not_shown_ends_only_a_flow_without_a_link() {
+        let registry = OAuthFlowRegistry::new();
+        let (mut linked, mut unshown) = registry.register_with_link("signin".to_owned());
+        let plain = registry.register("signout".to_owned());
+
+        assert!(registry.not_shown("signin", "presentationContextInvalid"));
+        assert_eq!(
+            unshown.try_recv().ok().as_deref(),
+            Some("presentationContextInvalid")
+        );
+        assert!(linked.try_recv().is_err(), "the sign-in still waits");
+        assert!(registry.resolve("dev.tgorka.keeper:/oauth/callback?code=x&state=signin"));
+        assert!(matches!(
+            linked.await.expect("sender not dropped"),
+            OAuthCallback::Redirect(_)
+        ));
+
+        assert!(registry.not_shown("signout", "no window"));
+        match plain.await.expect("sender not dropped") {
+            OAuthCallback::Failed(reason) => assert_eq!(reason, "no window"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        assert!(!registry.not_shown("signout", "again"), "it already ended");
+    }
+
     /// A callback whose `state` matches no in-flight flow is ignored (no crash).
     #[test]
     fn resolve_spurious_state_is_ignored() {
@@ -349,6 +493,34 @@ mod tests {
         ));
         // Registry is empty: a subsequent callback matches nothing.
         assert!(!registry.resolve("dev.tgorka.keeper:/oauth/callback?state=a"));
+    }
+
+    /// A Cancel pressed while a sign-in has no entry yet still reaches it,
+    /// and only the sign-ins that had started: the next one starts clean
+    /// (story 102.9, R500).
+    #[tokio::test]
+    async fn a_cancel_before_registration_reaches_only_the_sign_ins_already_started() {
+        let registry = OAuthFlowRegistry::new();
+        let started = registry.cancel_latch();
+        assert!(!started.is_cancelled());
+
+        registry.cancel_all();
+        let next = registry.cancel_latch();
+
+        assert!(started.is_cancelled(), "the cancel is latched for it");
+        tokio::time::timeout(std::time::Duration::from_secs(5), started.cancelled())
+            .await
+            .expect("a latched cancel resolves at once");
+        assert!(
+            !next.is_cancelled(),
+            "a sign-in after the cancel is not cancelled"
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), next.cancelled())
+                .await
+                .is_err(),
+            "and waits for a cancel of its own"
+        );
     }
 
     /// `cancel` ends exactly the named flow; its sibling keeps waiting.

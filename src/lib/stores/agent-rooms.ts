@@ -20,7 +20,13 @@ export interface AgentRoomsState {
   rooms: InboxRoomVm[];
   /** Number of rooms in the streamed Agents window, or `null` before the first batch. */
   total: number | null;
-  /** Apply one streamed batch (its ops in sequence), updating `total`. */
+  /**
+   * Rust's sentence for why some rows are not live (kept from the last run
+   * because an account could not start, or the kept list could not be read
+   * or kept — story 102.5, R501), or `null`. Every Agents batch says it again.
+   */
+  note: string | null;
+  /** Apply one streamed batch (its ops in sequence), updating `total` and `note`. */
   applyBatch: (batch: InboxBatch) => void;
   /** Reset to the empty state (on unsubscribe / full sign-out). */
   clear: () => void;
@@ -29,12 +35,14 @@ export interface AgentRoomsState {
 export const agentRoomsStore = createStore<AgentRoomsState>()((set) => ({
   rooms: [],
   total: null,
+  note: null,
   applyBatch: (batch) =>
     set((state) => ({
       rooms: batch.ops.reduce<InboxRoomVm[]>(applyDiffOp, state.rooms),
       total: batch.total ?? state.total,
+      note: batch.note ?? null,
     })),
-  clear: () => set({ rooms: [], total: null }),
+  clear: () => set({ rooms: [], total: null, note: null }),
 }));
 
 /** React selector hook over {@link agentRoomsStore}. */

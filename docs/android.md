@@ -375,7 +375,7 @@ tablet"** (on an Android phone the same lines say "phone"):
 - No screen recording and no transcription on this tablet.
 - keeper syncs and notifies about messages only while it is open. With a UnifiedPush distributor whose server is also a Matrix push gateway, your agents' approval requests and your own agent's answers reach this tablet while keeper runs in the background, read on this tablet (nothing else shows; the ids of other messages still pass through that server, and this tablet discards them); once Android has stopped keeper, a push only says that something arrived.
 - Voice works from Android 13: speech is recognised on this tablet and never sent to a server, and the answer is read aloud. There are no turn models here, so keeper waits for a pause after you stop. Turn listening on while keeper is in front and it listens while keeper stays in front with the screen on. Switching to another app or turning the screen off stops it, and it starts again whenever keeper is back in front, after a relaunch too. Where this device has no echo canceller, keeper stops listening while it speaks, so saying the stop word over an answer does nothing and the button stops it. It stops when you turn it off. Android shows its microphone indicator the whole time, and listening uses battery.
-- Updates arrive by installing a new build, signed with your own key and sideloaded.
+- Updates arrive by installing a new build, signed with your own key and sideloaded; Check for updates in About says when a new version is out.
 
 > This list is composed in Rust (`keeper_core::disclosure::android`) and shown by
 > the About screen exactly as Rust sends it; `keeper-core/tests/platform_disclosure_mirrors_docs.rs`

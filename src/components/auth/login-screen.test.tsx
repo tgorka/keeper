@@ -1,7 +1,13 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ACCOUNT_OFFERS_TITLE } from "@/lib/account-offers";
-import type { AccountVm, IpcError, IpcErrorCode, MatrixOfferVm } from "@/lib/ipc/client";
+import type {
+  AccountVm,
+  IpcError,
+  IpcErrorCode,
+  MatrixOfferVm,
+  SignInLinkVm,
+} from "@/lib/ipc/client";
 import { accountStore, NO_ACCOUNT } from "@/lib/stores/account";
 import { accountsStore } from "@/lib/stores/accounts";
 import { accountVm, matrixOffer } from "@/test/account-fixture";
@@ -15,7 +21,7 @@ const loginBeeper = vi.fn();
 const cancelBeeper = vi.fn();
 vi.mock("@/lib/ipc/client", () => ({
   loginPassword: (...args: [string, string, string]) => loginPassword(...args),
-  loginOidc: (...args: [string]) => loginOidc(...args),
+  loginOidc: (...args: [string, (link: SignInLinkVm | null) => void]) => loginOidc(...args),
   cancelOidc: (...args: []) => cancelOidc(...args),
   beeperRequestCode: (...args: [string]) => beeperRequestCode(...args),
   loginBeeper: (...args: [string, string]) => loginBeeper(...args),
@@ -42,6 +48,10 @@ const account: AccountVm = {
 function ipcError(code: IpcErrorCode): IpcError {
   return { code, message: "ignored", accountId: null, retriable: false };
 }
+
+/** What a timed-out single sign-on says: its link is dead, a fresh one is a click away (R481). */
+const TIMED_OUT =
+  "Single sign-on timed out before the browser answered, so its link no longer works. Sign in with single sign-on again for a fresh one.";
 
 function fillAndSubmit() {
   fireEvent.change(screen.getByLabelText("Homeserver"), { target: { value: "example.org" } });
@@ -239,7 +249,7 @@ describe("LoginScreen", () => {
     fireEvent.change(screen.getByLabelText("Homeserver"), { target: { value: "  mas.example  " } });
     fireEvent.click(screen.getByRole("button", { name: "Sign in with single sign-on" }));
     await waitFor(() => {
-      expect(loginOidc).toHaveBeenCalledWith("mas.example");
+      expect(loginOidc).toHaveBeenCalledWith("mas.example", expect.any(Function));
     });
   });
 
@@ -273,6 +283,82 @@ describe("LoginScreen", () => {
     fireEvent.click(screen.getByRole("button", { name: "Sign in with single sign-on" }));
     expect(await screen.findByText("Complete sign-in in your browser…")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Cancel" })).toBeInTheDocument();
+  });
+
+  it("offers the authorization link Rust sends while the flow waits, and takes it away when it ends", async () => {
+    // 102.9 #1, R470: Rust sends the link before the browser opens, then again
+    // with its sentence when the browser could not be opened.
+    const url = "https://auth.mas.example/oauth2/authorize?client_id=c1&state=s1&code_challenge=x";
+    let send: (link: SignInLinkVm | null) => void = () => {};
+    let fail: (error: IpcError) => void = () => {};
+    loginOidc.mockImplementation(
+      (_homeserver: string, onLink: (link: SignInLinkVm | null) => void) =>
+        new Promise((_, reject) => {
+          send = onLink;
+          fail = reject;
+        }),
+    );
+    const writeText = vi.fn(() => Promise.resolve());
+    Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
+    render(<LoginScreen />);
+    fireEvent.change(screen.getByLabelText("Homeserver"), { target: { value: "mas.example" } });
+    fireEvent.click(screen.getByRole("button", { name: "Sign in with single sign-on" }));
+    await screen.findByText("Complete sign-in in your browser…");
+    expect(screen.queryByText(url)).not.toBeInTheDocument();
+
+    act(() => send({ url, notOpened: null }));
+    expect(screen.getByText(url)).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    const notOpened =
+      "keeper could not open your browser. Copy this link into a browser to finish signing in.";
+    act(() => send({ url, notOpened }));
+    expect(screen.getByRole("alert")).toHaveTextContent(notOpened);
+    fireEvent.click(screen.getByRole("button", { name: "Copy link" }));
+    expect(writeText).toHaveBeenCalledWith(url);
+    expect(await screen.findByText("Link copied")).toBeInTheDocument();
+
+    // The flow ended: its state is gone, so its link is never left behind,
+    // and the person is offered a fresh sign-in (R481).
+    act(() => fail(ipcError("oauthTimedOut")));
+    expect(await screen.findByText(TIMED_OUT)).toBeInTheDocument();
+    expect(screen.queryByText(url)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Sign in with single sign-on" })).toBeEnabled();
+  });
+
+  it("owns its link only while its flow waits: a settled flow's link is gone, and a late one is ignored", async () => {
+    // R480/03: the link is cleared when its flow settles, and a delivery that
+    // arrives on the finished flow's channel cannot bring it back — not into
+    // the next sign-in either.
+    const old = "https://auth.mas.example/oauth2/authorize?client_id=c1&state=old";
+    const sends: Array<(link: SignInLinkVm | null) => void> = [];
+    const settles: Array<(error: IpcError) => void> = [];
+    loginOidc.mockImplementation(
+      (_homeserver: string, onLink: (link: SignInLinkVm | null) => void) =>
+        // The executor form: tsconfig's ES2020 lib has no Promise.withResolvers.
+        new Promise<AccountVm>((_, reject) => {
+          sends.push(onLink);
+          settles.push(reject);
+        }),
+    );
+    render(<LoginScreen />);
+    fireEvent.change(screen.getByLabelText("Homeserver"), { target: { value: "mas.example" } });
+    fireEvent.click(screen.getByRole("button", { name: "Sign in with single sign-on" }));
+    await screen.findByText("Complete sign-in in your browser…");
+    act(() => sends[0]({ url: old, notOpened: null }));
+    expect(screen.getByText(old)).toBeInTheDocument();
+
+    act(() => settles[0](ipcError("oauthFailed")));
+    await screen.findByText("Single sign-on didn't complete. Please try again.");
+    // Late, on the first flow's channel, after it settled.
+    act(() => sends[0]({ url: old, notOpened: null }));
+
+    fireEvent.click(screen.getByRole("button", { name: "Sign in with single sign-on" }));
+    await screen.findByText("Complete sign-in in your browser…");
+    expect(loginOidc).toHaveBeenCalledTimes(2);
+    // The second flow has sent nothing yet, so there is no link to draw.
+    expect(screen.queryByText(old)).not.toBeInTheDocument();
+    act(() => sends[0]({ url: old, notOpened: null }));
+    expect(screen.queryByText(old)).not.toBeInTheDocument();
   });
 
   it("calls cancel_oidc when Cancel is clicked during a pending OIDC flow", async () => {
@@ -315,11 +401,7 @@ describe("LoginScreen", () => {
     render(<LoginScreen />);
     fireEvent.change(screen.getByLabelText("Homeserver"), { target: { value: "mas.example" } });
     fireEvent.click(screen.getByRole("button", { name: "Sign in with single sign-on" }));
-    expect(
-      await screen.findByText(
-        "Single sign-on timed out. It wasn't completed in the browser in time.",
-      ),
-    ).toBeInTheDocument();
+    expect(await screen.findByText(TIMED_OUT)).toBeInTheDocument();
   });
 
   it("shows the failed message for oauthFailed", async () => {
@@ -602,7 +684,10 @@ describe("LoginScreen Matrix accounts from the account (Epic 84, UX-DR118)", () 
 
     // No second press on "Sign in with single sign-on": the choice is the sign-in.
     await waitFor(() =>
-      expect(loginOidc).toHaveBeenCalledExactlyOnceWith("https://matrix.acme.dev/"),
+      expect(loginOidc).toHaveBeenCalledExactlyOnceWith(
+        "https://matrix.acme.dev/",
+        expect.any(Function),
+      ),
     );
     expect(await screen.findByText("Complete sign-in in your browser…")).toBeInTheDocument();
     expect(loginPassword).not.toHaveBeenCalled();

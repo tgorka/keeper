@@ -23,6 +23,8 @@ import {
   type LogUploadVm,
   logUploadGet,
   logUploadSet,
+  type ReleaseCheckVm,
+  releaseCheck,
 } from "@/lib/ipc/client";
 import { useAccountStore } from "@/lib/stores/account";
 import { useCapabilitiesStore, useIsReducedCapabilityPlatform } from "@/lib/stores/capabilities";
@@ -62,6 +64,16 @@ const EGRESS_HONESTY_SENTENCE =
  */
 const UPDATE_HONESTY_SENTENCE =
   "Updates are downloaded from GitHub and verified against keeper's signing key before they install. If verification fails, the update is refused.";
+
+/**
+ * What the phone tier's check does and does not do (story 102.9, R464): this
+ * build is installed from the Mac, so keeper only reads the latest version.
+ */
+export const RELEASE_CHECK_HONESTY_SENTENCE =
+  "keeper asks GitHub for the latest version when you press the button, and never downloads or installs anything here: a new version is installed from your Mac.";
+
+/** The check command itself did not answer (Rust answers every failure it can see). */
+export const RELEASE_CHECK_FAILED = "keeper couldn't check for updates. Try again.";
 
 /**
  * The honest debug-mode disclosure (Story 22.5, FR-79): names exactly what
@@ -205,6 +217,12 @@ export function AboutSection({ open }: { open: boolean }) {
   // Where this device's app log is, as Rust answers it (Story 65.3): `null`
   // until it has, or when it could not.
   const [logPath, setLogPath] = useState<string | null>(null);
+  // The phone tier's release check (story 102.9, R464): in flight, Rust's
+  // answer, or why the command itself failed. Nothing is asked until the
+  // button is pressed.
+  const [releaseChecking, setReleaseChecking] = useState(false);
+  const [releaseAnswer, setReleaseAnswer] = useState<ReleaseCheckVm | null>(null);
+  const [releaseError, setReleaseError] = useState<string | null>(null);
   // The daily log upload, effective (a layer file may pin it): `undefined`
   // until Rust answers.
   const [logUpload, setLogUpload] = useState<boolean | undefined>(undefined);
@@ -332,6 +350,30 @@ export function AboutSection({ open }: { open: boolean }) {
       window.removeEventListener("keeper-telemetry-consent-changed", refreshEgress);
     };
   }, [open, inAppUpdater]);
+
+  // The phone tier's check: read only, never an install (R464).
+  const onReleaseCheck = () => {
+    setReleaseChecking(true);
+    setReleaseError(null);
+    void releaseCheck()
+      .then((answer) => {
+        if (mounted.current) {
+          setReleaseAnswer(answer);
+        }
+      })
+      .catch((raw: unknown) => {
+        logFailure("about.releaseCheck")(raw);
+        if (mounted.current) {
+          setReleaseAnswer(null);
+          setReleaseError(RELEASE_CHECK_FAILED);
+        }
+      })
+      .finally(() => {
+        if (mounted.current) {
+          setReleaseChecking(false);
+        }
+      });
+  };
 
   // Step 1 — detect only. Never installs or relaunches; a mere check must not restart
   // the app. On an available update we stash it and surface "available" for consent.
@@ -594,6 +636,41 @@ export function AboutSection({ open }: { open: boolean }) {
               <p className="text-muted-foreground text-xs">{autoUpdateSentence(autoPlan)}</p>
             </>
           )}
+        </div>
+      )}
+
+      {hydrated && reducedPlatform && !inAppUpdater && (
+        <div className="mt-1 flex flex-col gap-1.5">
+          <div className="flex items-center justify-between gap-2">
+            <span>Software updates</span>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              disabled={releaseChecking}
+              onClick={onReleaseCheck}
+            >
+              {releaseChecking ? "Checking…" : "Check for updates"}
+            </Button>
+          </div>
+          {releaseAnswer !== null && (
+            <p
+              role="status"
+              className={
+                releaseAnswer.outcome === "failed"
+                  ? "text-destructive text-xs"
+                  : "text-muted-foreground text-xs"
+              }
+            >
+              {releaseAnswer.sentence}
+            </p>
+          )}
+          {releaseError !== null && (
+            <p className="text-destructive text-xs" role="alert">
+              {releaseError}
+            </p>
+          )}
+          <p className="text-muted-foreground text-xs">{RELEASE_CHECK_HONESTY_SENTENCE}</p>
         </div>
       )}
 

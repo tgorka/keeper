@@ -114,6 +114,10 @@ file-controlled instead, and says which file.
 | | | | | Rows a folder card's lists show once unfolded. |
 | `system.menu_bar_presence` | user-global | boolean (`1`/`0`) | `0` | `"system.menu_bar_presence" = true` |
 | | | | | Whether keeper keeps a menu-bar (tray) presence. |
+| `telemetry.diagnostics` | user-global | boolean (`1`/`0`) | `0` | `"telemetry.diagnostics" = true` |
+| | | | | Optional diagnostics to PostHog (R461/R462): every warning and error keeper logs, its message redacted, plus content-free timings. Travels with the account, so it is on or off on every device. Absent or unreadable is off. |
+| `telemetry.product_analytics` | user-global | boolean (`1`/`0`) | `0` | `"telemetry.product_analytics" = true` |
+| | | | | Optional product statistics to PostHog (R462): counts of opening Settings and the command palette. Travels with the account like diagnostics. Absent or unreadable is off. |
 | `transcription.after_recording` | user-global | boolean (`1`/`0`) | `1` | `"transcription.after_recording" = false` |
 | | | | | Whether a finished Recording Session saved to a drive that keeps voices is transcribed on this Mac. |
 | `transcription.asr_model` | user-global | text | *(absent)* | `"transcription.asr_model" = "parakeet-tdt-0.6b-v3"` |
@@ -193,9 +197,33 @@ Not preferences. keeper writes these and reads them back, so a file entry would 
 | `push.gateway_url` | text | The push gateway you run (`https://…/_matrix/push/v1/notify`) that your homeserver sends event ids to for your phones; absent means no push. | it names where your homeserver sends this phone's event ids, which is the person's choice in Settings on the device — it roams to their other phones through settings.toml, and no file, this machine's, the account's or a folder's, may choose it for them |
 | `recordings.last_reconcile_ms` | text | When the recordings index last finished a refresh of every recordings root, in ms since the Unix epoch; the daily reconcile runs a day after it. | it is this install's record of when its recordings index last matched the folders, and a file setting it would hold the daily reconcile off, or run it every second |
 | `sync.credential_source.<…>` | text | Per drive: `account:<account id>` authenticates with that organisation account's sign-in token while it is the configured account; `forge:<source id>` with that repository source's connection; absent uses the drive's own saved token. | it is the choice made in a drive's form, and a file flipping it would send the account's token to a remote the person never chose to give it to |
+| `ui.default_agent_chooser_dismissed` | text | The keeper version in which the person put away the launch's "Choose the agent keeper opens when it starts"; it is asked again after an update (R463). | it is the keeper version in which somebody put the launch's chooser away, and pre-setting it in a file would hide the question from a person who was never asked |
 | `ui.first_run_setup_skipped` | boolean (`1`/`0`) | Whether the person asked keeper not to open first-run setup at startup. | it is the answer somebody gave in the skip dialog, and pre-setting it in a file would hide setup from a person who was never offered it |
 | `ui.ios_sync_disclosure_shown` | boolean (`1`/`0`) | Whether the one-time iOS no-background-sync disclosure has been shown. | it is a one-time latch keeper sets after showing a disclosure, and pre-setting it in a file would suppress a card the person never saw |
 | `ui.recovered_sessions_acknowledged` | JSON | Recovered recording sessions the person has acknowledged. | it is the set of recovered recording sessions somebody has already dismissed, rewritten on every dismissal |
+
+## Where each key travels
+
+With an organisation account signed in, keeper keeps these keys in the
+account's config repository and merges each file into every device's table key
+by key (`keeper_core::org_account::settings_sync`). With no account, every key
+stays in this device's table. Settings says, under each category, what of it
+applies only to this device but is backed up in your account, what is kept only
+on this device, and why.
+
+- **Every device** — `<login>/settings.toml`. A change on one device is the answer on all of them: `honor_remote_deletions`, `favorites_collapsed`, `agents.default`, `agents.claims_lease`, `bots.message_details`, `bots.wake_phrase`, `bots.voice_target`, `bots.stop_phrase`, `debug.mode`, `diagnostics.log_upload`, `incognito.global`, `notes.service_file_names`, `notes.embedding_model`, `notify.previews_enabled`, `notify.dnd_global`, `notify.dock_badge_mode`, `push.gateway_url`, `recording.path_template`, `recording.fps`, `recording.codec`, `recording.scale_percent`, `recording.segment_mb`, `recording.duration_cap_minutes`, `recording.echo_cancellation`, `recording.system_audio`, `recording.microphone`, `recording.camera`, `sessions.spaces_folded`, `sync.list_folded`, `sync.list_unfolded`, `system.menu_bar_presence`, `telemetry.diagnostics`, `telemetry.product_analytics`, `transcription.after_recording`, `transcription.asr_model`, `transcription.diarization_model`, `transcription.language`, `transcription.smart_turn_model`, `transcription.vad_model`, `undo_send.agent_window`, `undo_send.window`, `update.auto`.
+- **This device's own file** — `<login>/settings.<device>.toml`. It comes back when this device is set up again, except that a wake switch left on comes back off: only a person's tap opens the microphone. Every other device keeps its own: `sdk_encryption`, `bots.provider_credential_source.<…>`, `bots.wake_enabled`, `bots.voice_locale`, `hotkey.global`, `hotkey.recording`, `hotkey.capture`, `hotkey.voice`, `notes.active_vault`, `tasks.ledger_vault`, `notes.hide_service_files`, `notes.include_private`, `recording.destination_dir`, `recording.destination_profile_id`, `sync.git_path`, `sync.drive_folder`, `sync.credential_source.<…>`.
+- **Never leaves this device**: `account.<…>`, `notes.capture_draft.<…>`, `notes.capture_placement.<…>`, `notes.pristine.<…>`, `notes.read.<…>`, `recordings.last_reconcile_ms`, `ui.default_agent_chooser_dismissed`, `ui.first_run_setup_skipped`, `ui.ios_sync_disclosure_shown`, `ui.recovered_sessions_acknowledged`.
+
+Not keys, so not listed: launch at login (a login item the operating system
+keeps for this machine), the operating system's notification permission, an
+endpoint's or a drive's key (this device's keychain; the endpoint and the drive
+themselves are offered to your other devices through `bots.toml` and
+`drives.toml`), and this Mac's MCP servers, sandbox and web-search engine
+(`keeper.db`, this Mac only). A drive's quick-capture template and tag are kept
+in that drive's profile on this device and do not travel (DW-1580). This device's
+name is not a key either: it is kept for this device in the account
+(`<login>/devices/<device>.toml`) and published with every change it commits.
 
 ## Booleans and numbers
 

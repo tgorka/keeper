@@ -1048,6 +1048,33 @@ describe("ChatListPane — the Agents window", () => {
     act(() => sinks.agents?.({ ops: [{ op: "reset", rooms: [] }], total: 0 }));
     expect(await screen.findByText("No agent rooms yet.")).toBeInTheDocument();
   });
+
+  it("says above the rows why some are not live, in the Agents view alone, until Rust stops saying it", async () => {
+    const said =
+      "keeper could not start one of your accounts just now, so its agents are shown as keeper last saw them.";
+    accountsStore.getState().addAccount(account);
+    render(<ChatListPane />);
+    act(() =>
+      sinks.agents?.({
+        ops: [{ op: "reset", rooms: [agentRoom("!nixi:x", "Nixi", "proxy")] }],
+        total: 1,
+        note: said,
+      }),
+    );
+    expect(screen.queryByText(said)).not.toBeInTheDocument();
+
+    act(() => primaryViewStore.getState().setView("agents"));
+    expect(await screen.findByText(said)).toHaveAttribute("role", "status");
+    expect(screen.getByRole("list", { name: "Conversations" })).toHaveTextContent("Nixi");
+
+    act(() =>
+      sinks.agents?.({
+        ops: [{ op: "reset", rooms: [agentRoom("!nixi:x", "Nixi", "proxy")] }],
+        total: 1,
+      }),
+    );
+    expect(screen.queryByText(said)).not.toBeInTheDocument();
+  });
 });
 
 describe("ChatListPane — Network filter (Story 4.6)", () => {

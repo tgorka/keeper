@@ -258,6 +258,14 @@ pub async fn forge_connect_wait(
         Err(error) => Some(error),
     };
     remember(&source.id, error.as_ref());
+    // Connected: the drives on this source may run what its absence stopped
+    // (Story 102.2, R503) — this source's drives, and no other's.
+    if error.is_none() {
+        account_ipc::rearm_drives_after_credential(
+            &state.platform,
+            &forges::credential_for(&source),
+        );
+    }
     Ok(source_vm(platform, &source, d.as_ref(), error.as_ref()))
 }
 

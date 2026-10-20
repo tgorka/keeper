@@ -664,6 +664,7 @@ const SEARCH_OFF: AgentWebSearchVm = {
   locked: null,
   unavailable: null,
   warning: null,
+  host: null,
 };
 
 const WARNING =

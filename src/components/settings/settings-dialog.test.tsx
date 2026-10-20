@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/lib/ipc/client", () => ({
@@ -296,6 +296,11 @@ import {
 import { UNIFIEDPUSH_LABEL } from "@/components/settings/phone-push";
 import { PUSH_GATEWAY_LABEL } from "@/components/settings/push-gateway-field";
 import {
+  SETTINGS_BACK_LABEL,
+  SETTINGS_CATEGORIES_LABEL,
+} from "@/components/settings/settings-categories";
+import {
+  ARCHIVE_STORAGE_TITLE,
   OWN_FINGERPRINT_NONE,
   SettingsDialog,
   UNDO_SEND_UNREAD,
@@ -343,6 +348,7 @@ import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabiliti
 import { encryptionStatusStore } from "@/lib/stores/encryption-status";
 import { keyBackupStore } from "@/lib/stores/key-backup";
 import { notesVaultsStore, resetNotesVaultsStoreForTest } from "@/lib/stores/notes-vaults";
+import { settingsUiStore } from "@/lib/stores/settings-ui";
 import { resetSyncStoreForTest } from "@/lib/stores/sync";
 import { verificationStore } from "@/lib/stores/verification";
 import { voiceStore } from "@/lib/stores/voice";
@@ -413,6 +419,17 @@ const DESKTOP_CAPABILITIES = {
   overlayTitleBar: false,
   transcription: false,
 };
+
+/**
+ * Open one category of the dialog the way a person does: back to the list if a
+ * category is showing, then tap the category (Story 102.8).
+ */
+function showCategory(title: string) {
+  const back = screen.queryByRole("button", { name: SETTINGS_BACK_LABEL });
+  if (back) fireEvent.click(back);
+  const list = screen.getByRole("navigation", { name: SETTINGS_CATEGORIES_LABEL });
+  fireEvent.click(within(list).getByRole("button", { name: title }));
+}
 
 function account(id: string): AccountVm {
   return {
@@ -534,10 +551,11 @@ describe("SettingsDialog", () => {
   it("shows the honest archive.db/keeper.db + FileVault copy when open", async () => {
     mockPosture.mockResolvedValue(false);
     render(<SettingsDialog open onOpenChange={() => {}} />);
+    showCategory("Privacy & diagnostics");
 
     expect(await screen.findByText(STORAGE_HONESTY_SENTENCE)).toBeInTheDocument();
     // Section heading present.
-    expect(screen.getByText("Archive & Storage")).toBeInTheDocument();
+    expect(screen.getByText(ARCHIVE_STORAGE_TITLE)).toBeVisible();
   });
 
   it("caps the dialog height and scrolls inside so lower sections stay reachable", async () => {
@@ -588,6 +606,7 @@ describe("SettingsDialog", () => {
     encryptionStatusStore.getState().setStatus("alice", "unverified");
     encryptionStatusStore.getState().setStatus("bob", "verified");
     render(<SettingsDialog open onOpenChange={() => {}} />);
+    showCategory("Account & device");
 
     const verifyButtons = screen.getAllByRole("button", { name: "Verify" });
     expect(verifyButtons).toHaveLength(1);
@@ -603,6 +622,7 @@ describe("SettingsDialog", () => {
     encryptionStatusStore.getState().setStatus("alice", "verified");
     // bob left as pending/unknown (no status set).
     render(<SettingsDialog open onOpenChange={() => {}} />);
+    showCategory("Account & device");
 
     expect(screen.queryByRole("button", { name: "Verify" })).not.toBeInTheDocument();
   });
@@ -624,6 +644,7 @@ describe("SettingsDialog", () => {
     mockOwnFingerprint.mockResolvedValueOnce(null).mockResolvedValueOnce("new identity");
     accountsStore.getState().hydrateAll([account("alice")]);
     render(<SettingsDialog open onOpenChange={() => {}} />);
+    showCategory("Account & device");
     await screen.findByText(OWN_FINGERPRINT_NONE);
     act(() => encryptionStatusStore.getState().setStatus("alice", "unverified"));
     expect(await screen.findByText("new identity")).toBeVisible();
@@ -642,6 +663,7 @@ describe("SettingsDialog", () => {
       .mockResolvedValueOnce("current identity");
     accountsStore.getState().hydrateAll([account("alice")]);
     render(<SettingsDialog open onOpenChange={() => {}} />);
+    showCategory("Account & device");
     await screen.findByText("initial identity");
     act(() => encryptionStatusStore.getState().setStatus("alice", "unverified"));
     expect(screen.queryByText("initial identity")).toBeNull();
@@ -659,6 +681,7 @@ describe("SettingsDialog", () => {
     accountsStore.getState().hydrateAll([account("alice")]);
     encryptionStatusStore.getState().setStatus("alice", "verified");
     render(<SettingsDialog open onOpenChange={() => {}} />);
+    showCategory("Account & device");
     await screen.findByText("initial identity");
     const flow = {
       flowId: "flow-1",
@@ -681,6 +704,7 @@ describe("SettingsDialog", () => {
       .mockResolvedValueOnce("available identity");
     accountsStore.getState().hydrateAll([account("alice")]);
     render(<SettingsDialog open onOpenChange={() => {}} />);
+    showCategory("Account & device");
     await screen.findByText(/could not read your identity fingerprint/);
     expect(screen.queryByText(OWN_FINGERPRINT_NONE)).toBeNull();
     act(() => encryptionStatusStore.getState().setStatus("alice", "verified"));
@@ -693,6 +717,7 @@ describe("SettingsDialog", () => {
     accountsStore.getState().hydrateAll([account("alice")]);
     keyBackupStore.getState().setStatus("alice", "disabled");
     render(<SettingsDialog open onOpenChange={() => {}} />);
+    showCategory("Account & device");
 
     expect(screen.getByText("Not set up")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Set up backup" }));
@@ -706,6 +731,7 @@ describe("SettingsDialog", () => {
     accountsStore.getState().hydrateAll([account("alice")]);
     keyBackupStore.getState().setStatus("alice", "incomplete");
     render(<SettingsDialog open onOpenChange={() => {}} />);
+    showCategory("Account & device");
 
     expect(screen.getByText("Needs your recovery key")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Restore" }));
@@ -719,6 +745,7 @@ describe("SettingsDialog", () => {
     accountsStore.getState().hydrateAll([account("alice")]);
     keyBackupStore.getState().setStatus("alice", "enabled");
     render(<SettingsDialog open onOpenChange={() => {}} />);
+    showCategory("Account & device");
 
     expect(screen.getByText("Backup on")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Set up backup" })).not.toBeInTheDocument();
@@ -738,6 +765,7 @@ describe("SettingsDialog", () => {
     mockPosture.mockResolvedValue(false);
     mockHonorGet.mockResolvedValue(true);
     render(<SettingsDialog open onOpenChange={() => {}} />);
+    showCategory("Privacy & diagnostics");
 
     const toggle = await screen.findByRole("switch", {
       name: "Honor remote deletions locally",
@@ -750,6 +778,7 @@ describe("SettingsDialog", () => {
     mockPosture.mockResolvedValue(false);
     mockHonorGet.mockResolvedValue(false);
     render(<SettingsDialog open onOpenChange={() => {}} />);
+    showCategory("Privacy & diagnostics");
 
     const toggle = await screen.findByRole("switch", {
       name: "Honor remote deletions locally",
@@ -765,6 +794,7 @@ describe("SettingsDialog", () => {
     mockPosture.mockResolvedValue(false);
     mockNotifyGet.mockResolvedValue(true);
     render(<SettingsDialog open onOpenChange={() => {}} />);
+    showCategory("Notifications & dock");
 
     const toggle = await screen.findByRole("switch", { name: "Show message previews" });
     await waitFor(() => expect(toggle).toBeChecked());
@@ -775,6 +805,7 @@ describe("SettingsDialog", () => {
     mockPosture.mockResolvedValue(false);
     mockNotifyGet.mockResolvedValue(false);
     render(<SettingsDialog open onOpenChange={() => {}} />);
+    showCategory("Notifications & dock");
 
     const toggle = await screen.findByRole("switch", { name: "Show message previews" });
     await waitFor(() => expect(toggle).not.toBeChecked());
@@ -784,6 +815,7 @@ describe("SettingsDialog", () => {
     mockPosture.mockResolvedValue(false);
     mockNotifyGet.mockResolvedValue(true);
     render(<SettingsDialog open onOpenChange={() => {}} />);
+    showCategory("Notifications & dock");
 
     const toggle = await screen.findByRole("switch", { name: "Show message previews" });
     await waitFor(() => expect(toggle).toBeChecked());
@@ -802,6 +834,7 @@ describe("SettingsDialog", () => {
       retriable: false,
     });
     render(<SettingsDialog open onOpenChange={() => {}} />);
+    showCategory("Notifications & dock");
 
     const toggle = await screen.findByRole("switch", { name: "Show message previews" });
     await waitFor(() => expect(toggle).toBeChecked());
@@ -873,6 +906,7 @@ describe("SettingsDialog", () => {
     mockPosture.mockResolvedValue(false);
     const onOpenChange = vi.fn();
     render(<SettingsDialog open onOpenChange={onOpenChange} />);
+    showCategory("Account & device");
 
     const runAgain = await screen.findByRole("button", { name: "Run setup again" });
     fireEvent.click(runAgain);
@@ -886,8 +920,9 @@ describe("SettingsDialog", () => {
   it("renders the current summon hotkey binding as glyph chips", async () => {
     mockPosture.mockResolvedValue(false);
     render(<SettingsDialog open onOpenChange={() => {}} />);
+    showCategory("Shortcuts");
 
-    expect(await screen.findByText("Shortcuts")).toBeInTheDocument();
+    expect(await screen.findByText("Summon keeper")).toBeVisible();
     // The default Control+Alt+Space renders as the macOS glyph string ⌃⌥Space.
     expect(await screen.findByText("⌃⌥Space")).toBeInTheDocument();
     expect(mockHotkeyGet).toHaveBeenCalled();
@@ -902,6 +937,7 @@ describe("SettingsDialog", () => {
       conflict: null,
     });
     render(<SettingsDialog open onOpenChange={() => {}} />);
+    showCategory("Shortcuts");
 
     const change = await screen.findByRole("button", { name: "Change…" });
     fireEvent.click(change);
@@ -952,6 +988,7 @@ describe("SettingsDialog", () => {
       conflict: null,
     });
     render(<SettingsDialog open onOpenChange={() => {}} />);
+    showCategory("Shortcuts");
 
     const reset = await screen.findByRole("button", { name: "Reset to default" });
     fireEvent.click(reset);
@@ -977,6 +1014,7 @@ describe("SettingsDialog", () => {
     mockPosture.mockResolvedValue(false);
     capabilitiesStore.getState().applySnapshot({ ...DESKTOP_CAPABILITIES, recording: true });
     render(<SettingsDialog open onOpenChange={() => {}} />);
+    showCategory("Shortcuts");
 
     // Unset by default: the row renders with "Not set" and a disabled Clear.
     expect(await screen.findByText("Start / stop recording")).toBeInTheDocument();
@@ -1008,6 +1046,7 @@ describe("SettingsDialog", () => {
       conflict: null,
     });
     render(<SettingsDialog open onOpenChange={() => {}} />);
+    showCategory("Shortcuts");
 
     expect(await screen.findByText("⌃⌥R")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Clear recording shortcut" }));
@@ -1052,6 +1091,7 @@ describe("SettingsDialog", () => {
     // The desktop tier from beforeEach carries no voice field at all: the
     // row's presence is the runtime answer's (AD-179).
     render(<SettingsDialog open onOpenChange={() => {}} />);
+    showCategory("Shortcuts");
 
     expect(await screen.findByText(VOICE_SHORTCUT_LABEL)).toBeInTheDocument();
     expect(screen.getByText(VOICE_SHORTCUT_NOTE)).toBeInTheDocument();
@@ -1087,7 +1127,8 @@ describe("SettingsDialog", () => {
     // beforeEach already hydrated the desktop tier.
     render(<SettingsDialog open onOpenChange={() => {}} />);
 
-    expect(await screen.findByText("Shortcuts")).toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: "Shortcuts" })).toBeVisible();
+    showCategory("Notifications & dock");
     expect(await screen.findByRole("switch", { name: "Launch at login" })).toBeInTheDocument();
     expect(screen.getByRole("switch", { name: "Keep in menu bar" })).toBeInTheDocument();
     // No phone-tier Archive backup line on desktop.
@@ -1143,6 +1184,7 @@ describe("SettingsDialog", () => {
       offers: [],
     });
     render(<SettingsDialog open onOpenChange={() => {}} />);
+    showCategory("Notifications & dock");
 
     const push = await screen.findByRole("region", { name: UNIFIEDPUSH_LABEL });
     expect(push).toHaveTextContent("Push reaches this tablet through ntfy.example.org.");
@@ -1171,6 +1213,7 @@ describe("SettingsDialog", () => {
       offers: [],
     });
     render(<SettingsDialog open onOpenChange={() => {}} />);
+    showCategory("Notifications & dock");
 
     const push = await screen.findByRole("region", { name: UNIFIEDPUSH_LABEL });
     expect(unifiedpushConfirm).not.toHaveBeenCalled();
@@ -1191,6 +1234,7 @@ describe("SettingsDialog", () => {
       .mockResolvedValueOnce({ status: "Waiting.", note: "Note.", offers: [] })
       .mockResolvedValueOnce({ status: "Registered.", note: "Note.", offers: [] });
     render(<SettingsDialog open onOpenChange={() => {}} />);
+    showCategory("Notifications & dock");
 
     const push = await screen.findByRole("region", { name: UNIFIEDPUSH_LABEL });
     expect(push).toHaveTextContent("Waiting.");
@@ -1205,6 +1249,7 @@ describe("SettingsDialog", () => {
     mockPosture.mockResolvedValue(false);
     capabilitiesStore.getState().applySnapshot(DEFAULT_CAPABILITIES);
     render(<SettingsDialog open onOpenChange={() => {}} />);
+    showCategory("Notifications & dock");
 
     expect(
       await screen.findByRole("radiogroup", { name: "App icon badge mode" }),
@@ -1216,6 +1261,7 @@ describe("SettingsDialog", () => {
     mockPermissionState.mockResolvedValue("denied");
     capabilitiesStore.getState().applySnapshot(DEFAULT_CAPABILITIES);
     render(<SettingsDialog open onOpenChange={() => {}} />);
+    showCategory("Notifications & dock");
 
     // The fixed permission-denied sentence and the badge-needs-permission note render.
     expect(
@@ -1233,6 +1279,7 @@ describe("SettingsDialog", () => {
     mockPermissionState.mockResolvedValue("granted");
     capabilitiesStore.getState().applySnapshot(DEFAULT_CAPABILITIES);
     render(<SettingsDialog open onOpenChange={() => {}} />);
+    showCategory("Notifications & dock");
 
     // Wait for the badge radio to confirm the reduced-tier section has resolved.
     await screen.findByRole("radiogroup", { name: "App icon badge mode" });
@@ -1247,6 +1294,7 @@ describe("SettingsDialog", () => {
     mockPermissionState.mockResolvedValue("unknown");
     capabilitiesStore.getState().applySnapshot(DEFAULT_CAPABILITIES);
     render(<SettingsDialog open onOpenChange={() => {}} />);
+    showCategory("Notifications & dock");
 
     await screen.findByRole("radiogroup", { name: "App icon badge mode" });
     expect(
@@ -1258,6 +1306,7 @@ describe("SettingsDialog", () => {
     mockPosture.mockResolvedValue(false);
     // beforeEach hydrated the desktop tier.
     render(<SettingsDialog open onOpenChange={() => {}} />);
+    showCategory("Notifications & dock");
 
     // The desktop Dock badge radio (Background & dock) is present, but not the iOS one.
     await screen.findByRole("radiogroup", { name: "Dock badge mode" });
@@ -1485,5 +1534,27 @@ describe("SettingsDialog quick capture", () => {
 
     await screen.findByText(STORAGE_HONESTY_SENTENCE);
     expect(screen.queryByText(CAPTURE_SECTION_TITLE)).not.toBeInTheDocument();
+  });
+});
+
+/**
+ * What still opens Settings at a section names it (Story 102.8): the dialog
+ * opens on that section's category, not on the category list.
+ */
+describe("SettingsDialog deep links", () => {
+  afterEach(() => {
+    settingsUiStore.setState({ reveal: null });
+  });
+
+  it("opens on the named section's category", async () => {
+    mockPosture.mockResolvedValue(false);
+    accountsStore.getState().hydrateAll([account("alice")]);
+    encryptionStatusStore.getState().setStatus("alice", "unverified");
+    settingsUiStore.getState().revealSection("encryption");
+    render(<SettingsDialog open onOpenChange={() => {}} />);
+
+    expect(screen.getByRole("button", { name: "Verify" })).toBeVisible();
+    expect(screen.getByRole("heading", { name: "Account & device" })).toBeVisible();
+    expect(screen.queryByRole("navigation", { name: SETTINGS_CATEGORIES_LABEL })).toBeNull();
   });
 });

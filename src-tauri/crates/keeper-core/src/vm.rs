@@ -13,6 +13,7 @@ use crate::agents::approval_card::ApprovalVm;
 use crate::agents::gate_room::GateLineVm;
 use crate::agents::heard::HeardMarkVm;
 use crate::agents::room::{AgentRoomHeaderVm, AgentRoomKindVm, BriefVm};
+use crate::agents::turn_marks::TurnMarkVm;
 use crate::bots::{BotHealthState, ProviderKind};
 use crate::notes::export::NoteExportPlan;
 use crate::signals::IncognitoScope;
@@ -792,6 +793,14 @@ pub struct RoomVm {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub agent_mark: Option<String>,
+    /// An agent room's agent: the Matrix user id of the agent working it
+    /// (the delegate in a delegated room), read from its status (story
+    /// 102.7, R463) — what the row's default marker and its "Make default"
+    /// compare and store; absent for every other room and for an agent room
+    /// whose status was not read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub agent: Option<String>,
     /// An agent room's state in the list (story 101.6, R421): needs you,
     /// failed, working or done since the person last read it — Rust's word,
     /// drawn by the row and never derived; absent for every other room and
@@ -1333,7 +1342,7 @@ pub enum TimelineItemVm {
         is_edited: bool,
         /// The quoted-original preview when this message is a reply
         /// (`content.in_reply_to()`), else `null` (Story 3.4, FR-10).
-        reply: Option<ReplyPreviewVm>,
+        reply: Option<Box<ReplyPreviewVm>>,
         /// The aggregated emoji-reaction groups on this message, in the SDK's
         /// per-key insertion order (empty when none) (Story 3.5, FR-12). Each
         /// group carries only `{ emoji, count, is_own }` — never a per-sender
@@ -1370,6 +1379,15 @@ pub enum TimelineItemVm {
         /// (`gate_room::GateView`); else `null`. Boxed as `brief` is; the
         /// binding stays `GateLineVm | null`.
         gate: Option<Box<GateLineVm>>,
+        /// In an agent session room, whether the agent's host took this own
+        /// message (story 102.4, R465) — drawn there in place of a read tick,
+        /// since the agent's receipt rides its claim renewals and says
+        /// nothing of the message; absent while neither is known and in
+        /// every other room. Boxed as `brief` is; the binding stays
+        /// `turn?: TurnMarkVm`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        turn: Option<Box<TurnMarkVm>>,
     },
     /// An event that could not be decrypted yet (`MsgLikeKind::UnableToDecrypt`).
     /// Renders an explicit honest stub instead of a blank row (Story 3.1). Carries
@@ -1500,7 +1518,7 @@ pub enum TimelineOp {
 ///
 /// The stream always opens with a batch whose first op is a
 /// [`TimelineOp::Reset`] carrying the cached snapshot, then diff batches.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
 pub struct TimelineBatch {
@@ -1529,6 +1547,13 @@ pub struct TimelineBatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub heard: Option<Vec<HeardMarkVm>>,
+    /// The room's back-pagination status (102.6, R468): on the first batch
+    /// always, then on a batch of its own whenever it changed — the
+    /// timeline's history boundary needs no second subscription and no
+    /// wait for the first batch. Absent where nothing changed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub pagination: Option<PaginationStatusBatch>,
 }
 
 /// One member currently typing in the open room (Story 3.9, typing, AD-14,
@@ -1569,8 +1594,10 @@ pub struct TypingBatch {
 ///
 /// A Rust-authoritative projection of the SDK `PaginationStatus`:  `Paginating`
 /// while a back-pagination request is in flight (the boundary shows a spinner),
-/// `Idle` otherwise. Serializes to its camelCase name. The homeserver-start signal
-/// is carried separately on [`PaginationStatusBatch::hit_start`].
+/// `Idle` otherwise — and `Failed` when keeper's own fill of a window that
+/// drew too little failed (102.6): the boundary says so and offers Retry.
+/// Serializes to its camelCase name. The homeserver-start signal is carried
+/// separately on [`PaginationStatusBatch::hit_start`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
@@ -1579,18 +1606,20 @@ pub enum PaginationState {
     Paginating,
     /// No back-pagination is running.
     Idle,
+    /// keeper's own fill of the window failed; it is not tried again until
+    /// the person retries.
+    Failed,
 }
 
-/// A batch delivered over the pagination-status subscription's `Channel` (Story
-/// 3.9, AD-8).
+/// The room's back-pagination status, riding on its [`TimelineBatch`]
+/// (Story 3.9, 102.6, AD-8).
 ///
 /// A scalar snapshot of the live back-pagination status, mapped from the SDK
 /// `PaginationStatus`: `state` drives the boundary spinner, and `hit_start` is
 /// `true` once the homeserver has no older history (the boundary then states the
 /// conversation start and no further pagination is attempted). Inherently
-/// idempotent — each batch carries the full current status. Older events
-/// themselves arrive over the existing timeline diff stream (`PushFront`/`Insert`),
-/// never here; this channel carries only the status.
+/// idempotent — each one carries the full current status. Older events
+/// themselves arrive as the timeline's own ops (`PushFront`/`Insert`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
@@ -2041,6 +2070,12 @@ pub struct InboxRoomVm {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub agent_mark: Option<String>,
+    /// Copied through from [`RoomVm::agent`]: the Matrix user id of the
+    /// agent working this row's room (story 102.7, R463); absent for every
+    /// other row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub agent: Option<String>,
     /// An agent room's state in the list (story 101.6, R421): needs you,
     /// failed, working or done since the person last read it — Rust's word,
     /// drawn by the row and never derived; absent for every other room and
@@ -2116,6 +2151,13 @@ pub struct InboxBatch {
     /// Archive window, so this is per-window, not a cross-account server total.
     #[ts(type = "number | null")]
     pub total: Option<u32>,
+    /// The Agents window only: why some of its rows are not live — kept
+    /// from the last run because an account could not start, or the kept
+    /// list could not be read or kept (story 102.5, R501, R381) — as the
+    /// sentence said above the list; absent when every row is live.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub note: Option<String>,
 }
 
 /// The single error envelope every fallible command rejects with (AD-8, AD-21).
@@ -8494,6 +8536,7 @@ mod tests {
             agent_room: None,
             agent_avatar: None,
             agent_mark: None,
+            agent: None,
             agent_attention: None,
         }
     }
@@ -8535,6 +8578,7 @@ mod tests {
                 rooms: vec![sample_inbox_room()],
             }],
             total: Some(11),
+            note: None,
         };
         let json = serde_json::to_string(&batch).expect("serialize batch");
         assert!(json.contains("\"total\":11"), "json was: {json}");
@@ -8681,6 +8725,7 @@ mod tests {
             agent_room: None,
             agent_avatar: None,
             agent_mark: None,
+            agent: None,
             agent_attention: None,
         }
     }
@@ -8718,6 +8763,7 @@ mod tests {
             agent_room: None,
             agent_avatar: None,
             agent_mark: None,
+            agent: None,
             agent_attention: None,
         };
         let json = serde_json::to_string(&vm).expect("serialize");
@@ -9462,6 +9508,7 @@ mod tests {
             readers: Vec::new(),
             brief: None,
             gate: None,
+            turn: None,
         };
         let json = serde_json::to_string(&vm).expect("serialize message vm");
         assert!(
@@ -9488,6 +9535,7 @@ mod tests {
             readers: Vec::new(),
             brief: None,
             gate: None,
+            turn: None,
         }
     }
 
@@ -9543,12 +9591,12 @@ mod tests {
             is_own: true,
             send_state: None,
             is_edited: true,
-            reply: Some(ReplyPreviewVm {
+            reply: Some(Box::new(ReplyPreviewVm {
                 in_reply_to_key: Some("unique-orig".to_owned()),
                 sender: "@bob:example.org".to_owned(),
                 sender_display_name: Some("Bob".to_owned()),
                 body: "the original".to_owned(),
-            }),
+            })),
             reactions: vec![
                 ReactionGroupVm {
                     emoji: "👍".to_owned(),
@@ -9565,6 +9613,7 @@ mod tests {
             readers: Vec::new(),
             brief: None,
             gate: None,
+            turn: None,
         };
         let json = serde_json::to_string(&vm).expect("serialize message vm");
         assert!(json.contains("\"isEdited\":true"), "json was: {json}");
@@ -9626,6 +9675,7 @@ mod tests {
             readers: Vec::new(),
             brief: None,
             gate: None,
+            turn: None,
         };
         let json = serde_json::to_string(&vm).expect("serialize");
         assert!(
@@ -9710,6 +9760,7 @@ mod tests {
             header: None,
             approvals: None,
             heard: None,
+            pagination: None,
         };
         let json = serde_json::to_string(&batch).expect("serialize batch");
         assert!(json.contains("\"ops\":"), "json was: {json}");
@@ -9835,6 +9886,7 @@ mod tests {
             readers: Vec::new(),
             brief: None,
             gate: None,
+            turn: None,
         };
         let json = serde_json::to_string(&vm).expect("serialize message vm");
         assert!(json.contains("\"media\":{"), "json was: {json}");
@@ -9881,6 +9933,7 @@ mod tests {
             ],
             brief: None,
             gate: None,
+            turn: None,
         };
         let json = serde_json::to_string(&vm).expect("serialize message vm");
         assert!(

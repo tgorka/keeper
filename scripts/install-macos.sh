@@ -63,22 +63,10 @@ REMOTE_ENV="$REMOTE_ENV KEEPER_BUILD_SHA=\"$BUILD_SHA\""
 # can report nothing, whatever the person using it consents to — and it can
 # fall back to 1Password, but that vault is routinely locked on a remote host
 # and an unanswered prompt stalls the build for minutes before failing. This
-# workstation already has the values, so it states them.
-#
-# Order: the environment, then the repository's own public client file, then
-# the GitHub repository variables the release workflow reads. All three carry
-# the same two public values, which end up readable inside every distributed
-# binary; neither is a secret.
-CLIENT_ENV="$REPO_ROOT/deploy/posthog/client.env.1p"
-POSTHOG_HOST="${KEEPER_POSTHOG_HOST:-}"
-POSTHOG_TOKEN="${KEEPER_POSTHOG_PROJECT_TOKEN:-}"
-if [ -z "$POSTHOG_HOST" ] && [ -r "$CLIENT_ENV" ]; then
-  POSTHOG_HOST="$(sed -n 's/^KEEPER_POSTHOG_HOST=//p' "$CLIENT_ENV" | head -1)"
-fi
-if [ -z "$POSTHOG_TOKEN" ] && command -v gh >/dev/null; then
-  POSTHOG_TOKEN="$(gh variable get KEEPER_POSTHOG_PROJECT_TOKEN --repo tgorka/keeper 2>/dev/null || true)"
-fi
-if [ -z "$POSTHOG_HOST" ] || [ -z "$POSTHOG_TOKEN" ]; then
+# workstation already has the values, so it states them. How they are found:
+# scripts/lib/posthog-client.sh, shared with the iPhone and Android installs.
+. "$REPO_ROOT/scripts/lib/posthog-client.sh"
+if ! keeper_resolve_posthog_client "$REPO_ROOT"; then
   fail "could not resolve the public PostHog client configuration; the build would ship unable to report anything. Export KEEPER_POSTHOG_HOST and KEEPER_POSTHOG_PROJECT_TOKEN, or sign in to gh."
 fi
 REMOTE_ENV="$REMOTE_ENV KEEPER_POSTHOG_HOST=\"$POSTHOG_HOST\" KEEPER_POSTHOG_PROJECT_TOKEN=\"$POSTHOG_TOKEN\""

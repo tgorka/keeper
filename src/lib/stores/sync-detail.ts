@@ -34,6 +34,7 @@ import {
   syncListSettingsGet,
   syncPending,
   syncProblems,
+  syncRetryAllParked,
   syncRetryParked,
   syncSubscribeProgress,
   syncUnsubscribeProgress,
@@ -359,36 +360,21 @@ export async function retrySyncParked(id: string, unitId: number): Promise<void>
 }
 
 /**
- * Return every named parked unit to the pending queue, then re-read the detail
- * once.
+ * "Retry all stopped" (Story 102.2): return every stopped unit of the folder to
+ * the queue in one call, then re-read the detail once — whether or not the call
+ * failed, so the screen says what actually moved.
  *
- * Not a loop over {@link retrySyncParked}: that would re-read the whole detail
- * after each unit, so a folder with a dozen parked units would spend eleven
- * round trips rendering lists that the next requeue immediately invalidates.
- *
- * A unit that will not requeue does not stop the ones behind it. Each is
- * independent work and the whole point of the bulk action is not having to press
- * twelve buttons — abandoning the tail because the first failed would be the
- * one outcome worse than that. The first rejection is re-thrown once every unit
- * has had its turn, so the caller still surfaces a message rather than
- * reporting a silent success; a later one is dropped, because a list of near
- * identical errors says nothing the first does not.
+ * One call rather than one per listed unit: the engine folds identical work
+ * (the owner's neuradrive held 1 099 stopped downloads of one object), and a
+ * folder with 68 stopped units no longer costs 68 round trips. Every stopped
+ * unit of the folder is requeued, not only the ones on screen — the list is
+ * folded, and a held push waits on whichever of them it waits on.
  */
-export async function retrySyncParkedAll(id: string, unitIds: readonly number[]): Promise<void> {
-  let failure: unknown = null;
-  for (const unitId of unitIds) {
-    try {
-      await syncRetryParked(id, unitId);
-    } catch (raw) {
-      failure ??= raw;
-    }
-  }
-  // Before the re-throw: the units that *did* requeue have left the parked list,
-  // and the caller's error path must not be what decides whether the screen says
-  // so.
-  await refreshSyncDetail(id);
-  if (failure !== null) {
-    throw failure;
+export async function retrySyncParkedAll(id: string): Promise<void> {
+  try {
+    await syncRetryAllParked(id);
+  } finally {
+    await refreshSyncDetail(id);
   }
 }
 

@@ -5,7 +5,9 @@
  *
  * A Rust-authoritative projection of the SDK `PaginationStatus`:  `Paginating`
  * while a back-pagination request is in flight (the boundary shows a spinner),
- * `Idle` otherwise. Serializes to its camelCase name. The homeserver-start signal
- * is carried separately on [`PaginationStatusBatch::hit_start`].
+ * `Idle` otherwise — and `Failed` when keeper's own fill of a window that
+ * drew too little failed (102.6): the boundary says so and offers Retry.
+ * Serializes to its camelCase name. The homeserver-start signal is carried
+ * separately on [`PaginationStatusBatch::hit_start`].
  */
-export type PaginationState = "paginating" | "idle";
+export type PaginationState = "paginating" | "idle" | "failed";

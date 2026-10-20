@@ -51,7 +51,13 @@ import {
 import { useLongPress } from "@/hooks/use-long-press";
 import { useShellLayout } from "@/hooks/use-shell-layout";
 import { formatMessageTime } from "@/lib/format-time";
-import type { BriefVm, ReactionGroupVm, ReplyPreviewVm, TimelineItemVm } from "@/lib/ipc/client";
+import type {
+  BriefVm,
+  ReactionGroupVm,
+  ReplyPreviewVm,
+  TimelineItemVm,
+  TurnMarkVm,
+} from "@/lib/ipc/client";
 import { cn } from "@/lib/utils";
 
 /** The `message`-variant of {@link TimelineItemVm} (the only kind this renders). */
@@ -443,6 +449,7 @@ export function MessageBubble({
           offline={offline}
           reducedCapability={reducedCapability}
           readCount={item.readers.length}
+          turn={item.turn ?? null}
         />
         {/* Read-receipt micro-avatar cluster (Story 3.9): the other members whose
             read receipt sits on this message. Renders nothing when empty. */}
@@ -647,6 +654,12 @@ interface SendStateCaptionProps {
    * member has read it, the caption shows an explicit "Read ✓" tick.
    */
   readCount?: number;
+  /**
+   * In an agent session room, whether the agent's host took this message
+   * (story 102.4, R465): Rust's reading of the room, drawn in place of a read
+   * tick there. `null` while neither is known, and in every other room.
+   */
+  turn?: TurnMarkVm | null;
 }
 
 /**
@@ -659,7 +672,9 @@ interface SendStateCaptionProps {
  * instead of `Sending…` — on the reduced-capability (iOS) tier the wording is
  * `Queued — sends when keeper is open and back online`, honest about
  * foreground-only sync (Story 14.6). A sent own message that at least one other member has read
- * shows an explicit `Read ✓` tick instead of `Sent` (Story 3.9). A remote message
+ * shows an explicit `Read ✓` tick instead of `Sent` (Story 3.9). In an agent session room an own
+ * message the agent's host took shows `Taken ✓`, and one it did not take says so in a sentence
+ * (story 102.4, R465); either comes before the read tick. A remote message
  * (`sendState: null`) with no readers renders nothing.
  */
 function SendStateCaption({
@@ -671,6 +686,7 @@ function SendStateCaption({
   offline,
   reducedCapability,
   readCount = 0,
+  turn = null,
 }: SendStateCaptionProps) {
   if (state === "failed") {
     return (
@@ -683,6 +699,22 @@ function SendStateCaption({
           Retry
         </Button>
       </div>
+    );
+  }
+  // In an agent session room the host's turn state says what a read tick cannot
+  // (R465): taken, or not taken with why — whatever other members read.
+  if (state === null && isOwn && turn?.state === "taken") {
+    return (
+      <span className="mt-0.5 text-muted-foreground text-xs">
+        Taken <span aria-hidden="true">✓</span>
+      </span>
+    );
+  }
+  if (state === null && isOwn && turn?.state === "notTaken") {
+    return (
+      <span role="status" className="mt-0.5 max-w-80 text-held text-xs">
+        {turn.sentence}
+      </span>
     );
   }
   // A sent own message read by ≥1 other member shows an explicit read tick. This

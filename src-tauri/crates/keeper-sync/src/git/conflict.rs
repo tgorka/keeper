@@ -246,6 +246,45 @@ fn build_name(path: &Path, marker: &str) -> OsString {
     name_from_bytes(out)
 }
 
+/// The paths a conflict copy at `rel` may have been copied from: `rel` with
+/// its `.sync-conflict-<stamp>-<device>[-n]` marker taken out, extension
+/// kept and not (Story 102.2). Empty when `rel` is no conflict copy.
+///
+/// Two answers rather than one because the marker cannot be told from the
+/// extension when the device's label holds a dot: `a.sync-conflict-…-my.box`
+/// is `a` copied on `my.box` or `a.box` copied on `my`. A caller looks for
+/// both, and a path that never existed simply is not found.
+pub fn originals_of(rel: &str) -> Vec<String> {
+    const MARK: &str = ".sync-conflict-";
+    let (dir, name) = rel
+        .rsplit_once('/')
+        .map_or(("", rel), |(dir, name)| (dir, name));
+    let Some(at) = name.find(MARK) else {
+        return Vec::new();
+    };
+    let stem = &name[..at];
+    if stem.is_empty() {
+        return Vec::new();
+    }
+    let mut names = Vec::with_capacity(2);
+    if let Some((_, ext)) = name[at + MARK.len()..].rsplit_once('.') {
+        if !ext.is_empty() {
+            names.push(format!("{stem}.{ext}"));
+        }
+    }
+    names.push(stem.to_owned());
+    names
+        .into_iter()
+        .map(|name| {
+            if dir.is_empty() {
+                name
+            } else {
+                format!("{dir}/{name}")
+            }
+        })
+        .collect()
+}
+
 /// The canonical path behind one of git's rescue names, if `path` is one.
 ///
 /// When a merge finds a directory where the other side has a file (or two
@@ -572,5 +611,32 @@ mod tests {
         assert_eq!(ChangeKind::from_stages(true, true), ChangeKind::Modified);
         assert_eq!(ChangeKind::from_stages(true, false), ChangeKind::Deleted);
         assert_eq!(ChangeKind::from_stages(false, false), ChangeKind::Unchanged);
+    }
+
+    /// Every name `conflict_name` builds leads back to the file it was
+    /// copied from — the path a heal looks for the bytes under (102.2).
+    #[test]
+    fn a_conflict_copy_names_the_file_it_was_copied_from() {
+        let copy = |path: &str, device: &str| {
+            let name = conflict_name(Path::new(path), TS, device);
+            let name = name.to_str().expect("utf-8").to_owned();
+            match path.rsplit_once('/') {
+                Some((dir, _)) => format!("{dir}/{name}"),
+                None => name,
+            }
+        };
+        for (path, device) in [
+            ("70-comms/x/manifest.json", "maczek"),
+            ("a.tar.gz", DEV),
+            (".bashrc", DEV),
+            ("noext", DEV),
+            ("notes/a.md", "my.box"),
+        ] {
+            let originals = originals_of(&copy(path, device));
+            assert!(originals.iter().any(|o| o == path), "{path}: {originals:?}");
+        }
+        let numbered = conflict_name_numbered(Path::new("a.txt"), TS, DEV, 2);
+        assert!(originals_of(numbered.to_str().expect("utf-8")).contains(&"a.txt".to_owned()));
+        assert!(originals_of("dir/manifest.json").is_empty());
     }
 }

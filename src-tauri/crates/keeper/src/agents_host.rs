@@ -180,6 +180,22 @@ pub fn tick(app: &tauri::AppHandle) {
                     if let Some(known) = RUNTIME.proxies.get() {
                         known.replace(proxies);
                     }
+                    // What each host serving these agents can do, beside
+                    // what each home asks (story 102.3): read off the tick,
+                    // so a slow server never delays a claim's renewal; one
+                    // read at a time.
+                    if let Some(pass) = SERVING_READ.enter() {
+                        let app = app.clone();
+                        tauri::async_runtime::spawn(async move {
+                            // Opens the gate however the read ends, a
+                            // panic included (review R102T1-06).
+                            let _pass = pass;
+                            app.state::<AppState>()
+                                .accounts
+                                .refresh_serving_hosts()
+                                .await;
+                        });
+                    }
                     Some(facts)
                 }
                 Err(error) => {
@@ -301,6 +317,11 @@ fn data_dir(platform: &dyn Platform) -> Result<PathBuf, IpcError> {
     platform.data_dir().map_err(to_ipc_error)
 }
 
+/// Whether the serving hosts' manifests are being read now (story 102.3):
+/// a scan starts the next read only once the last one ended, however it
+/// ended.
+static SERVING_READ: TickGate = TickGate::new();
+
 /// Whether the tick has logged that the person's bots cannot be read, so a
 /// store that stays unreadable is one WARN, not one per scan.
 static BOTS_UNREAD_LOGGED: std::sync::atomic::AtomicBool =
@@ -364,15 +385,22 @@ async fn rows(state: &AppState, facts: DesktopFacts) -> Result<Vec<AgentCopyVm>,
         .await
         .map_err(|error| refusal(error.to_string()))?
     };
+    // What the hosts serving each agent make of its web search, as the
+    // tick last read their manifests (story 102.3).
+    let hosts = state.accounts.agent_icons().hosts();
+    let served = |mut rows: Vec<AgentCopyVm>| {
+        keeper_core::agents::web_search::with_hosts(&mut rows, hosts.as_deref());
+        rows
+    };
     let people = desktop::people(&listed);
     if people.is_empty() {
-        return Ok(listed);
+        return Ok(served(listed));
     }
     let names = state.accounts.display_names(&people, NAMES_WITHIN).await;
     if names.is_empty() {
-        return Ok(listed);
+        return Ok(served(listed));
     }
-    Ok(desktop::listing(
+    Ok(served(desktop::listing(
         &facts,
         &provider_rows,
         bots.as_deref().map_err(String::as_str),
@@ -380,7 +408,7 @@ async fn rows(state: &AppState, facts: DesktopFacts) -> Result<Vec<AgentCopyVm>,
         &names,
         &problems,
         &pictures,
-    ))
+    )))
 }
 
 async fn facts_now(state: &AppState) -> Result<DesktopFacts, IpcError> {

@@ -2,6 +2,7 @@
 import type { AgentRoomHeaderVm } from "./AgentRoomHeaderVm";
 import type { ApprovalVm } from "./ApprovalVm";
 import type { HeardMarkVm } from "./HeardMarkVm";
+import type { PaginationStatusBatch } from "./PaginationStatusBatch";
 import type { TimelineOp } from "./TimelineOp";
 
 /**
@@ -37,4 +38,11 @@ approvals?: Array<ApprovalVm>,
  * the answer's body or its loading. Absent where nothing changed; the
  * last list stands.
  */
-heard?: Array<HeardMarkVm>, };
+heard?: Array<HeardMarkVm>, 
+/**
+ * The room's back-pagination status (102.6, R468): on the first batch
+ * always, then on a batch of its own whenever it changed — the
+ * timeline's history boundary needs no second subscription and no
+ * wait for the first batch. Absent where nothing changed.
+ */
+pagination?: PaginationStatusBatch, };

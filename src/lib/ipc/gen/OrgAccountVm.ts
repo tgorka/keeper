@@ -5,6 +5,7 @@ import type { AccountIdentityVm } from "./AccountIdentityVm";
 import type { AccountOffersVm } from "./AccountOffersVm";
 import type { AccountRestoreVm } from "./AccountRestoreVm";
 import type { AccountStateVm } from "./AccountStateVm";
+import type { SignInLinkVm } from "./SignInLinkVm";
 
 export type OrgAccountVm = { configured: boolean, id: string | null, name: string | null, issuerHost: string | null, repoHost: string | null, 
 /**
@@ -41,6 +42,13 @@ offers: AccountOffersVm,
  * Empty without an account.
  */
 restore: AccountRestoreVm, 
+/**
+ * The authorization page the sign-in in progress waits on, for the
+ * person to copy into a browser that did not come forward (story 102.9,
+ * R470). Only while it waits: a sign-in that ended took its `state`
+ * with it, and its link would answer nobody.
+ */
+signInLink?: SignInLinkVm, 
 /**
  * Increases with every VM this process composes, so a subscriber that
  * receives two out of order keeps the newer one.

@@ -587,7 +587,10 @@ function RunLog({ runId }: { runId: number }) {
           <Button
             size="sm"
             variant="ghost"
-            onClick={() => settingsUiStore.getState().setSettingsOpen(true)}
+            onClick={() => {
+              settingsUiStore.getState().revealSection("tasks");
+              settingsUiStore.getState().setSettingsOpen(true);
+            }}
           >
             Settings → Tasks
           </Button>

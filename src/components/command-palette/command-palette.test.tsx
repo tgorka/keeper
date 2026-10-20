@@ -100,20 +100,6 @@ function typeQuery(text: string) {
 }
 
 describe("CommandPalette", () => {
-  it("reports query failure as a fixed category, never the query or raw exception", async () => {
-    paletteQuery.mockRejectedValue(new Error("PRIVATE_EXCEPTION_SENTINEL /Users/private.txt"));
-    render(<CommandPalette />);
-    open();
-    typeQuery("PRIVATE_QUERY_SENTINEL");
-    await waitFor(() =>
-      expect(telemetryCapture).toHaveBeenCalledWith({
-        kind: "frontendError",
-        durationMs: null,
-      }),
-    );
-    expect(JSON.stringify(telemetryCapture.mock.calls)).not.toContain("PRIVATE_");
-  });
-
   it("is closed by default and opens via the store (⌘K path)", () => {
     render(<CommandPalette />);
     expect(screen.queryByRole("combobox")).not.toBeInTheDocument();

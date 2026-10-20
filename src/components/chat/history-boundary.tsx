@@ -11,7 +11,9 @@
  *   older history and no further pagination is attempted.
  * - `error`: an honest, retriable failure message with a Retry button.
  * - `idle`: renders nothing (there is more history but nothing is loading yet — the
- *   scroll trigger will paginate as the user nears the top).
+ *   scroll trigger will paginate as the user nears the top), or, where the window
+ *   cannot scroll and so has no top to near (R509), a "Load earlier messages"
+ *   button that reaches by touch, pointer and keyboard alike.
  *
  * Copy follows UX-DR10: sentence case, no exclamation marks. Static states are not
  * `aria-live` flooders — only the transient `paginating` row is `aria-busy`.
@@ -27,11 +29,19 @@ interface HistoryBoundaryProps {
   state: HistoryBoundaryState;
   /** Retry a failed pagination (only wired/rendered in the `error` state). */
   onRetry?: () => void;
+  /** Ask for older history where the window cannot scroll (rendered only `idle`). */
+  onLoadEarlier?: () => void;
 }
 
-export function HistoryBoundary({ state, onRetry }: HistoryBoundaryProps) {
+export function HistoryBoundary({ state, onRetry, onLoadEarlier }: HistoryBoundaryProps) {
   if (state === "idle") {
-    return null;
+    return onLoadEarlier ? (
+      <div className="flex items-center justify-center py-3">
+        <Button type="button" variant="outline" size="xs" onClick={onLoadEarlier}>
+          Load earlier messages
+        </Button>
+      </div>
+    ) : null;
   }
 
   if (state === "paginating") {

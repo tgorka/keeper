@@ -41,17 +41,18 @@
 //! A card's expiry changes the state with no event in the room, so a reading
 //! names when to read the room again ([`Attention::recheck_at`]), and
 //! [`RowAttention`] keeps, per row, what it said and when to look again
-//! (R436), and which rows show questions asked in other rooms
-//! ([`RowAttention::ask_rooms`]): those are read again when any agent room
-//! changes.
+//! (R436). One reading of a room ([`read`]) keeps its own [`Facts`], so a
+//! change in the questions asked in other rooms redraws its row without
+//! reading it again (story 102.5, R468).
 //!
 //! Rust decides it from the room's events; the rows, the notes dock and the
 //! agent's DM draw the word it names and never derive it (R421).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Mutex;
 
 use chrono::{DateTime, Utc};
+use matrix_sdk::ruma::events::room::power_levels::RoomPowerLevels;
 use matrix_sdk::ruma::{OwnedRoomId, OwnedUserId, RoomId, UserId};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -62,7 +63,7 @@ use crate::agents::events::{
     RunState, APPROVAL_CONSUMED, APPROVAL_DECISION, APPROVAL_REQUEST, STATUS,
 };
 use crate::agents::room::AgentRoomState;
-use crate::agents::waiting::{AgentAsksVm, AskState};
+use crate::agents::waiting::{AgentAsksVm, AskState, Reach, Seen};
 
 /// An agent room's state in the list; a room in none of them carries none.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
@@ -140,6 +141,96 @@ pub struct Attention {
     pub ask_room: bool,
 }
 
+/// What one reading of an agent room's own events says (story 102.5,
+/// R468): everything [`attention`] decides but the questions answered there,
+/// which come from the other rooms. Kept per room, so a change in another
+/// room's questions redraws this room's row without reading it again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Facts {
+    /// An approval card this person may decide waits here.
+    approval_waits: bool,
+    /// The events and power levels were read whole ([`Reader::whole`]).
+    whole: bool,
+    /// What the newest readable status says the run is, by the read marker.
+    run: Option<AgentAttentionVm>,
+    recheck_at: Option<DateTime<Utc>>,
+}
+
+impl Facts {
+    /// The facts of a room whose events, in order, are `events`, as
+    /// `reader` reads them at `now`.
+    pub fn read<'a>(
+        events: impl IntoIterator<Item = RoomEvent<'a>>,
+        reader: &Reader<'_>,
+        now: DateTime<Utc>,
+    ) -> Facts {
+        let owner = |user: &UserId| reader.owners.iter().any(|owner| owner == user);
+        let senders = Senders {
+            own: reader.own,
+            agent: reader.agent,
+            owner: &owner,
+        };
+        let mut status = AgentRoomState::new(reader.own.to_owned());
+        let mut approvals = ApprovalFold::default();
+        // `origin_server_ts` of the event the marker stands on: 0 when it stands
+        // before every event read (older than the room's loaded history).
+        let mut marker_at: Option<u64> = reader.marker.map(|_| 0);
+
+        for RoomEvent { event, sealed } in events {
+            if let (Some(marker), Some(id)) = (reader.marker, event["event_id"].as_str()) {
+                if marker == id {
+                    marker_at = Some(event["origin_server_ts"].as_u64().unwrap_or(0));
+                }
+            }
+            match event["type"].as_str().unwrap_or("") {
+                STATUS => {
+                    status.apply(event, reader.agent);
+                }
+                APPROVAL_REQUEST | APPROVAL_DECISION | APPROVAL_CONSUMED => {
+                    approvals.apply(event, sealed, &senders);
+                }
+                _ => {}
+            }
+        }
+
+        let run = match status.run_at() {
+            Some((RunState::Blocked, _)) => Some(AgentAttentionVm::Failed),
+            Some((RunState::Running, _)) => Some(AgentAttentionVm::Working),
+            Some((RunState::Done, at)) if marker_at.is_some_and(|read| at > read) => {
+                Some(AgentAttentionVm::DoneUnread)
+            }
+            _ => None,
+        };
+        Facts {
+            approval_waits: approvals.waits_for(reader.own, now),
+            whole: reader.whole,
+            run,
+            recheck_at: approvals.next_expiry(now),
+        }
+    }
+
+    /// The room's state once `asks` — the questions answered here, `None`
+    /// for a room none is answered in — are known.
+    pub fn with(&self, asks: Option<Asks>) -> Attention {
+        let questions = asks.unwrap_or(Asks {
+            waiting: false,
+            whole: true,
+        });
+        let state = if questions.waiting || self.approval_waits {
+            Some(AgentAttentionVm::NeedsYou)
+        } else if !(self.whole && questions.whole) {
+            Some(AgentAttentionVm::Unknown)
+        } else {
+            self.run
+        };
+        Attention {
+            state,
+            recheck_at: self.recheck_at,
+            ask_room: asks.is_some(),
+        }
+    }
+}
+
 /// The state of an agent room whose events, in order, are `events`, as
 /// `reader` reads it at `now`; `asks`: the questions answered here, `None`
 /// for a room no question is answered in.
@@ -149,64 +240,12 @@ pub fn attention<'a>(
     asks: Option<Asks>,
     now: DateTime<Utc>,
 ) -> Attention {
-    let owner = |user: &UserId| reader.owners.iter().any(|owner| owner == user);
-    let senders = Senders {
-        own: reader.own,
-        agent: reader.agent,
-        owner: &owner,
-    };
-    let mut status = AgentRoomState::new(reader.own.to_owned());
-    let mut approvals = ApprovalFold::default();
-    // `origin_server_ts` of the event the marker stands on: 0 when it stands
-    // before every event read (older than the room's loaded history).
-    let mut marker_at: Option<u64> = reader.marker.map(|_| 0);
-
-    for RoomEvent { event, sealed } in events {
-        if let (Some(marker), Some(id)) = (reader.marker, event["event_id"].as_str()) {
-            if marker == id {
-                marker_at = Some(event["origin_server_ts"].as_u64().unwrap_or(0));
-            }
-        }
-        match event["type"].as_str().unwrap_or("") {
-            STATUS => {
-                status.apply(event, reader.agent);
-            }
-            APPROVAL_REQUEST | APPROVAL_DECISION | APPROVAL_CONSUMED => {
-                approvals.apply(event, sealed, &senders);
-            }
-            _ => {}
-        }
-    }
-
-    let recheck_at = approvals.next_expiry(now);
-    let questions = asks.unwrap_or(Asks {
-        waiting: false,
-        whole: true,
-    });
-    let state = if questions.waiting || approvals.waits_for(reader.own, now) {
-        Some(AgentAttentionVm::NeedsYou)
-    } else if !(reader.whole && questions.whole) {
-        Some(AgentAttentionVm::Unknown)
-    } else {
-        match status.run_at() {
-            Some((RunState::Blocked, _)) => Some(AgentAttentionVm::Failed),
-            Some((RunState::Running, _)) => Some(AgentAttentionVm::Working),
-            Some((RunState::Done, at)) if marker_at.is_some_and(|read| at > read) => {
-                Some(AgentAttentionVm::DoneUnread)
-            }
-            _ => None,
-        }
-    };
-    Attention {
-        state,
-        recheck_at,
-        ask_room: asks.is_some(),
-    }
+    Facts::read(events, reader, now).with(asks)
 }
 
 /// What each agent room's row last said of its state, and when each must be
 /// read again because a card in it expires then (story 101.6, R436): the
-/// inbox redraws a row only when a fresh reading changed what it said, and
+/// list redraws a row only when a fresh reading changed what it said, and
 /// reads a room again at its recheck time with no event having arrived.
 #[derive(Debug, Default)]
 pub struct RowAttention {
@@ -217,7 +256,6 @@ pub struct RowAttention {
 struct Rows {
     said: HashMap<OwnedRoomId, Option<AgentAttentionVm>>,
     recheck: HashMap<OwnedRoomId, DateTime<Utc>>,
-    ask_rooms: HashSet<OwnedRoomId>,
 }
 
 impl RowAttention {
@@ -226,20 +264,14 @@ impl RowAttention {
     }
 
     /// `room`'s row says what `read` found from now on, and is read again at
-    /// its recheck time, or never for a card's sake when it has none, and
-    /// whenever another agent room changes when questions are answered in
-    /// it. Whether that changed what the row said.
+    /// its recheck time, or never for a card's sake when it has none.
+    /// Whether that changed what the row said.
     pub fn note(&self, room: &RoomId, read: &Attention) -> bool {
         let mut rows = self.rows();
         match read.recheck_at {
             Some(at) => rows.recheck.insert(room.to_owned(), at),
             None => rows.recheck.remove(room),
         };
-        if read.ask_room {
-            rows.ask_rooms.insert(room.to_owned());
-        } else {
-            rows.ask_rooms.remove(room);
-        }
         rows.said.insert(room.to_owned(), read.state) != Some(read.state)
     }
 
@@ -264,22 +296,32 @@ impl RowAttention {
         due
     }
 
-    /// The rooms whose rows show questions asked in other rooms: read again
-    /// when an agent room changes (an ask, a relayed answer).
-    pub fn ask_rooms(&self) -> Vec<OwnedRoomId> {
-        self.rows().ask_rooms.iter().cloned().collect()
+    /// `room` must be read again at `at`, as a card in it expiring then
+    /// says: what a sealed approval card puts here, which a loopback
+    /// homeserver cannot seal.
+    #[cfg(test)]
+    pub fn expires(&self, room: &RoomId, at: DateTime<Utc>) {
+        self.rows().recheck.insert(room.to_owned(), at);
     }
 }
 
-/// The state of the agent room `room`: its events read back as 101.3 reads
-/// an asking room ([`crate::agents::waiting::read_room`]), its power levels,
-/// its session's own agents, the person's read marker as the SDK last
-/// computed it, and `asks` — 101.3's projection of the questions answered
-/// in it, `None` for a room none is answered in. A room whose events or
-/// power levels cannot be read is logged at WARN and read as not whole.
-pub async fn of_room(room: &matrix_sdk::Room, asks: Option<&AgentAsksVm>) -> Attention {
+/// One reading of an agent room (story 102.5, R468): its events read back
+/// as 101.3 reads an asking room ([`crate::agents::waiting::read_room`]) —
+/// `None` when they could not be read — and its power levels, and from them,
+/// its session's own agents and the person's read marker as the SDK last
+/// computed it, the room's [`Facts`]. The one read both the room's own state
+/// and the questions folded from it come from. A room whose events or power
+/// levels cannot be read is logged at WARN and its facts are not whole.
+pub struct RoomRead {
+    pub events: Option<(Vec<Seen>, Reach)>,
+    pub levels: Option<RoomPowerLevels>,
+    pub facts: Facts,
+}
+
+/// Read `room` once ([`RoomRead`]).
+pub async fn read(room: &matrix_sdk::Room) -> RoomRead {
     use crate::agents::room::{holds_agent_power, session_agents};
-    use crate::agents::waiting::{read_room, Reach};
+    use crate::agents::waiting::read_room;
 
     let levels = match room.power_levels().await {
         Ok(levels) => Some(levels),
@@ -289,11 +331,11 @@ pub async fn of_room(room: &matrix_sdk::Room, asks: Option<&AgentAsksVm>) -> Att
         }
     };
     let owners = session_agents(room).await;
-    let (seen, reach) = match read_room(room).await {
-        Ok(read) => read,
+    let events = match read_room(room).await {
+        Ok(read) => Some(read),
         Err(error) => {
             tracing::warn!(room = %room.room_id(), %error, "agents: a room's events could not be read for its state");
-            (Vec::new(), Reach::Part)
+            None
         }
     };
     let marker = room
@@ -301,7 +343,11 @@ pub async fn of_room(room: &matrix_sdk::Room, asks: Option<&AgentAsksVm>) -> Att
         .latest_active
         .map(|receipt| receipt.event_id.to_string());
     let agent = |user: &UserId| holds_agent_power(levels.as_ref(), user);
-    attention(
+    let (seen, reach) = match &events {
+        Some((seen, reach)) => (seen.as_slice(), *reach),
+        None => (&[][..], Reach::Part),
+    };
+    let facts = Facts::read(
         seen.iter().map(|seen| RoomEvent {
             event: &seen.value,
             sealed: seen.sealed,
@@ -313,9 +359,13 @@ pub async fn of_room(room: &matrix_sdk::Room, asks: Option<&AgentAsksVm>) -> Att
             marker: marker.as_deref(),
             whole: reach != Reach::Part && levels.is_some(),
         },
-        asks.map(Asks::of),
         Utc::now(),
-    )
+    );
+    RoomRead {
+        events,
+        levels,
+        facts,
+    }
 }
 
 #[cfg(test)]
@@ -810,21 +860,5 @@ mod tests {
             read(&chunk, true, Some(Asks::of(&AgentAsksVm::default()))),
             Some(AgentAttentionVm::Working)
         );
-    }
-
-    /// R453 (review 05): a row that shows questions asked elsewhere is read
-    /// again when another agent room changes; one that stops showing them
-    /// is not.
-    #[test]
-    fn a_row_showing_questions_asked_elsewhere_is_read_again_on_their_change() {
-        let room = RoomId::parse(DM).expect("room");
-        let rows = RowAttention::default();
-        let asks = Asks::of(&AgentAsksVm::default());
-        let running = [status("$1", 10, "running")];
-        let reading = reader_at(&running, Some("$1"), true, Some(asks), now());
-        rows.note(&room, &reading);
-        assert_eq!(rows.ask_rooms(), vec![room.clone()]);
-        rows.note(&room, &read_at(&running, Some("$1"), now()));
-        assert!(rows.ask_rooms().is_empty());
     }
 }

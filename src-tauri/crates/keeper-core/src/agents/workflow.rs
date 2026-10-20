@@ -213,14 +213,16 @@ pub const CAPABILITIES: [Capability; 19] = [
             "Every step runs on this agent's own model; another model is another agent, reached with `delegate`, which this agent is not offered.",
         )],
     },
-    // No offered tool is known to search the web: an MCP tool's name says
-    // which server it is on, not what it does (R195).
+    // `web_search` (101.4) is the one tool known to search the web: an MCP
+    // tool's name says which server it is on, not what it does (R195). The
+    // turn is told it has one only while it is offered (story 102.3; DW-381
+    // closed).
     Capability {
         assumes: "web search",
-        tools: &[],
+        tools: &[crate::agents::web_search::WEB_SEARCH],
         said: &[(
-            When::Always,
-            "keeper has no web search of its own (DW-381), and no tool offered to this agent is known to search the web, so it searches none.",
+            When::Without(&[crate::agents::web_search::WEB_SEARCH]),
+            "`web_search` is not offered to this agent on this host, and no other tool offered to it is known to search the web, so it searches none.",
         )],
     },
     Capability {
@@ -1538,6 +1540,31 @@ mod tests {
             capability_answer(search, &[])
         );
         assert!(capability_answer(search, &[unrelated]).tools.is_empty());
+        const WEB_SEARCH_TOOL: &str = crate::agents::web_search::WEB_SEARCH;
+        // Offered, the turn is told it searches with `web_search` and never
+        // that it searches none (story 102.3, DW-381); not offered, it is
+        // told it searches none.
+        let all: Vec<&str> = TOOL_VOCABULARY.iter().copied().chain([unrelated]).collect();
+        for offered in [vec![WEB_SEARCH_TOOL], all] {
+            let answer = capability_answer(search, &offered);
+            assert_eq!(answer.tools, [WEB_SEARCH_TOOL], "{offered:?}");
+            assert!(
+                answer
+                    .sentences
+                    .iter()
+                    .all(|sentence| !sentence.contains("searches none")),
+                "{answer:?}"
+            );
+        }
+        let answer = capability_answer(search, &[SKILL_VIEW]);
+        assert_eq!(answer.missing, [WEB_SEARCH_TOOL]);
+        assert!(
+            answer
+                .sentences
+                .iter()
+                .any(|sentence| sentence.contains("searches none")),
+            "{answer:?}"
+        );
     }
 
     /// The frame tells a turn offered a tool through which it follows a

@@ -77,6 +77,19 @@ development_status:
   101-6-see-who-is-working-and-delegation-that-says-why: in-progress
   101-7-electras-agent-host-deployed-by-makistack: in-progress
   epic-101-retrospective: optional
+  # Epic 102: the owner's round of 2026-10-19 (verbatim in _bmad-output/planning-artifacts/epic-102-the-owners-round-of-2026-10-19.md). Rulings R461–R470; DW-1510…DW-1609.
+  epic-102: in-progress
+  102-1-every-error-reaches-posthog-with-consent-that-travels: in-progress
+  102-2-a-push-never-waits-on-something-already-fixed: in-progress
+  102-3-agent-tools-you-can-see-trust-and-switch: in-progress
+  102-4-every-file-is-taken-and-the-tick-tells-the-truth: in-progress
+  102-5-the-agents-list-is-there-at-once: in-progress
+  102-6-opening-an-agent-shows-its-conversation-at-once: in-progress
+  102-7-keeper-opens-into-your-default-agent: in-progress
+  102-8-settings-in-categories: in-progress
+  102-9-sign-in-by-hand-and-an-iphone-that-knows-its-version: in-progress
+  102-10-electra-runs-the-current-agent-host: in-progress
+  epic-102-retrospective: optional
   # DW-414…DW-417 are opened by this plan (DW-414 placed by the architecture); DW-416 was closed on 2026-10-02 by S-23.
   # Epic 98: the owner's rounds 1–2 of 2026-10-01 (verbatim in the epic) — "I want my mac, iphone, sever on linux to use it"; "you can assume ios will have paid apple account in the future. also make sure it will be working on my android tablet"; approvals before dangerous actions "style like in Violoop". PLANNED 2026-10-02 on the agents stack; the build follows in story order. Everything that needs the paid Apple program, an APNs key, a running Sygnal or ntfy, or the tablet is an operator action and a device run, never a claim: FR-817, FR-819 and FR-820 close on device runs recorded in docs/agents.md § Measured (F14).
   # Stack rungs (planned), on top of epic 97's last rung: epic98-ios (98.1, 98.2: keeper-core agents/push.rs — the two notifying events, the two approval categories and fits, the latest edit within the budget, the event_id_only pusher; push.gateway_url and its egress row; the keeper-nse staticlib crate and check:nse-lean; the KeeperNotify extension target, the App Group and the extended entitlements tests; push_ios.rs, the notification actions, IosPlatform::data_dir in the group container with a journaled one-time move; the phone's sessions read verbs and sessions_task_move on iOS, the writers cfg'd out of mobile builds, the honest sessions gate, the phone board; IOS_DISCLOSURE_LINES and docs/ios.md), epic98-android (98.3, 98.4: AndroidPlatform with Keystore-backed secrets and Auth Tab sign-in (DW-290); the compile_error narrowed; gen/android; the Android CI job (cargo check + unsigned debug APK) and the Gradle licence scan; android:build / install:android; the media-URL helper; the tablet layout; UnifiedPush through the owner's ntfy with gateway discovery; the Android voice port — on-device recogniser in segmented sessions, AcousticEchoCanceler, TextToSpeech, turn models or the pause fallback; voice_on_device's Android scan; a new docs/android.md and ANDROID_DISCLOSURE_LINES).

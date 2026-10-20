@@ -307,12 +307,12 @@ fn same_folder(a: &std::path::Path, b: &std::path::Path) -> bool {
 /// starts this binary as a filter, and a filter must not open a window.
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // A person's PDF sent to an agent served here is read by this binary
-    // started again as a worker under its own bounds, and nothing else
-    // (R444/03, `keeper_agent::attachments::PdfReader`).
+    // A person's PDF sent to an agent served here is read, and a photo too
+    // large for its model made smaller, by this binary started again as a
+    // worker under its own bounds, and nothing else (R444/03, R489,
+    // `keeper_agent::attachments::Worker`).
     #[cfg(desktop)]
-    if let Some(code) = keeper_agent::attachments::served_as_pdf_reader(std::env::args_os().skip(1))
-    {
+    if let Some(code) = keeper_agent::attachments::served_as_worker(std::env::args_os().skip(1)) {
         std::process::exit(code);
     }
     if served_as_lfs_filter() {
@@ -418,6 +418,9 @@ pub fn run() {
     let builder = builder
         .setup(|app| {
             telemetry_ipc::init(app);
+            // The one account-layer transition (consent, then the default
+            // agent; R488 × R496), before any layer is installed.
+            account_ipc::watch_layers(app);
             // The Android voice port's plugin calls and its event channel
             // (98.4), before `voice_ipc::boot` hands the port its language.
             #[cfg(target_os = "android")]
@@ -487,6 +490,9 @@ pub fn run() {
                 account_ipc::boot(app.state::<ipc::AppState>().platform.as_ref());
                 let imported = keeper_core::registry::import_config_file(&data_dir);
                 debug_log::init(&data_dir);
+                // The account's consent through the layers just installed
+                // (R462), and the WARN/ERROR export layer attached (R461).
+                telemetry_ipc::start_problem_export(app);
                 // First, so every line under it can be read as "this build said".
                 build_identity::announce();
                 for fault in keeper_core::config::faults() {
@@ -1108,6 +1114,8 @@ pub fn run() {
                 agents_ipc::agents_launch,
                 agents_ipc::agents_default_get,
                 agents_ipc::agents_default_set,
+                // Story 102.7 (R463): the launch's chooser put away.
+                agents_ipc::agents_default_chooser_dismiss,
                 // R455: the claims lease Settings › Agents turns on.
                 agents_ipc::agents_claims_lease_get,
                 agents_ipc::agents_claims_lease_set,
@@ -1371,10 +1379,9 @@ pub fn run() {
                 ipc::set_network_filter,
                 ipc::set_typing,
                 ipc::paginate_backwards,
+                ipc::load_earlier_messages,
                 ipc::typing_subscribe,
                 ipc::typing_unsubscribe,
-                ipc::pagination_status_subscribe,
-                ipc::pagination_status_unsubscribe,
                 ipc::session_restore,
                 ipc::inbox_subscribe,
                 ipc::inbox_unsubscribe,
@@ -1405,6 +1412,7 @@ pub fn run() {
                 ipc::log_upload_get,
                 ipc::log_upload_set,
                 ipc::auto_update_restart_check,
+                ipc::release_check,
                 ipc::debug_log_tail,
                 ipc::debug_log_path,
                 ipc::titlebar_drag_report,
@@ -1507,6 +1515,7 @@ pub fn run() {
                 sync_ipc::sync_pending,
                 sync_ipc::sync_problems,
                 sync_ipc::sync_retry_parked,
+                sync_ipc::sync_retry_all_parked,
                 sync_ipc::sync_set_credential,
                 sync_ipc::sync_get_credential,
                 sync_ipc::sync_clear_credential,

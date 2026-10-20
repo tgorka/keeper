@@ -471,6 +471,7 @@ mod tests {
             expires_at: rfc3339(expires_at),
             picture_failures: Default::default(),
             lease: lease.map(str::to_owned),
+            web_search: None,
         }
     }
 

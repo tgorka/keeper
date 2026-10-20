@@ -115,6 +115,14 @@ agentAvatar?: string,
  */
 agentMark?: string, 
 /**
+ * An agent room's agent: the Matrix user id of the agent working it
+ * (the delegate in a delegated room), read from its status (story
+ * 102.7, R463) — what the row's default marker and its "Make default"
+ * compare and store; absent for every other room and for an agent room
+ * whose status was not read.
+ */
+agent?: string, 
+/**
  * An agent room's state in the list (story 101.6, R421): needs you,
  * failed, working or done since the person last read it — Rust's word,
  * drawn by the row and never derived; absent for every other room and

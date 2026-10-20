@@ -13,6 +13,7 @@ import { useActiveChatReporter } from "@/hooks/use-active-chat-reporter";
 import { useAppLifecycle } from "@/hooks/use-app-lifecycle";
 import { useAutoUpdate } from "@/hooks/use-auto-update";
 import { useCapabilitiesHydrate } from "@/hooks/use-capabilities-hydrate";
+import { useDefaultAgentFollowsSync } from "@/hooks/use-default-agent-follows-sync";
 import { useLaunchIntoAgents } from "@/hooks/use-launch-into-agents";
 import { useNavStatePersistence } from "@/hooks/use-nav-state-persistence";
 import { useNotesOpenNote } from "@/hooks/use-notes-open-note";
@@ -109,6 +110,9 @@ function App() {
   // applied once — never over the person's own navigation, and on the phone only
   // when the restore above had nothing to restore.
   useLaunchIntoAgents();
+  // …and the default agent's markers and menus follow a default another
+  // device chose, once the setting syncs here (story 102.7, DW-1572).
+  useDefaultAgentFollowsSync();
   // Reload a blank/frozen webview once (loop-guarded) on a resume that fails the
   // animation-frame liveness probe, on the reduced-capability (iOS) tier only
   // (Story 14.4, tauri#14371). Never reloads a healthy webview. Inert on desktop.

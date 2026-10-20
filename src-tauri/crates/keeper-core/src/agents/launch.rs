@@ -22,15 +22,21 @@
 //!
 //! Which room is Rust's alone ([`choose`]); the webview only applies it. The
 //! choices a person may make the default are the agents with a `main` room
-//! here, one per agent ([`AgentsLaunchVm::choices`]). When a settings file
-//! decides the key, [`AgentsLaunchVm::file_set`] says so and names the file.
+//! here and the person's own agents keeper may ask for one, one per agent
+//! ([`AgentsLaunchVm::choices`]). When a settings file decides the key,
+//! [`AgentsLaunchVm::file_set`] says so and names the file.
+//!
+//! With no default chosen and agent rooms here, the launch asks once which
+//! agent keeper opens ([`AgentsLaunchVm::chooser`], R463): a choice is stored
+//! and its conversation opened at once; a chooser put away
+//! ([`dismiss_chooser`]) stays away until keeper is updated.
 //!
 //! [`proxy_rooms`]: crate::agents::proxy::proxy_rooms
 
 use std::collections::BTreeSet;
 use std::fmt;
 use std::future::Future;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -127,8 +133,14 @@ pub struct AgentsLaunchVm {
     /// no agent room opens the Inbox as before, quietly: that reason is
     /// Settings' alone.
     pub announce: bool,
-    /// The agents a person may choose, by name.
+    /// The agents a person may choose, by name: one per agent with a `main`
+    /// room here, and one per own agent keeper may ask for one (R416).
     pub choices: Vec<DefaultAgentChoiceVm>,
+    /// Whether keeper asks, where the person is looking, which agent it
+    /// opens when it starts (R463): no default is chosen, the Agents window
+    /// opens, there is an agent to choose, no settings file decides the key,
+    /// and the person did not put the chooser away in this version of keeper.
+    pub chooser: bool,
     /// When a settings file decides `agents.default`: the sentence that says
     /// so and names the file ([`file_set_sentence`]). A choice made here is
     /// still stored, and takes effect once the file stops setting the key.
@@ -229,7 +241,7 @@ pub fn choose(chosen: Option<&str>, facts: &LaunchFacts) -> AgentsLaunchVm {
         .map(str::trim)
         .filter(|agent| !agent.is_empty())
         .map(str::to_owned);
-    let choices = choices(&facts.proxies);
+    let choices = choices(&facts.proxies, &facts.askable);
     let mut vm = AgentsLaunchVm {
         view: LaunchView::Inbox,
         room: None,
@@ -237,6 +249,7 @@ pub fn choose(chosen: Option<&str>, facts: &LaunchFacts) -> AgentsLaunchVm {
         reason: None,
         announce: false,
         choices,
+        chooser: false,
         file_set: None,
         ask: None,
         askable: facts.askable.clone(),
@@ -244,6 +257,8 @@ pub fn choose(chosen: Option<&str>, facts: &LaunchFacts) -> AgentsLaunchVm {
     let Some(agent) = default_agent else {
         if facts.agent_rooms > 0 {
             vm.view = LaunchView::Agents;
+            // Nothing chosen yet: the launch asks which agent opens (R463).
+            vm.chooser = !vm.choices.is_empty();
         }
         return vm;
     };
@@ -292,16 +307,25 @@ pub fn choose(chosen: Option<&str>, facts: &LaunchFacts) -> AgentsLaunchVm {
     vm
 }
 
-/// One choice per agent with a `main` room, by name and then id.
-fn choices(proxies: &[(String, ProxyRoomVm)]) -> Vec<DefaultAgentChoiceVm> {
+/// One choice per agent with a `main` room, then one per own agent keeper may
+/// ask for one (R416) — named as the rooms here name it — by name and then id.
+fn choices(
+    proxies: &[(String, ProxyRoomVm)],
+    askable: &[MainDmAskVm],
+) -> Vec<DefaultAgentChoiceVm> {
+    let mains = proxies
+        .iter()
+        .filter(|(_, room)| room.kind == SessionKind::Main)
+        .map(|(_, room)| (&room.agent, &room.name));
+    let asks = askable.iter().map(|ask| (&ask.agent, &ask.name));
     let mut choices: Vec<DefaultAgentChoiceVm> = Vec::new();
-    for (_, room) in proxies {
-        if room.kind != SessionKind::Main || choices.iter().any(|c| c.agent == room.agent) {
+    for (agent, name) in mains.chain(asks) {
+        if choices.iter().any(|c| &c.agent == agent) {
             continue;
         }
         choices.push(DefaultAgentChoiceVm {
-            agent: room.agent.clone(),
-            name: room.name.clone(),
+            agent: agent.clone(),
+            name: name.clone(),
         });
     }
     choices.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.agent.cmp(&b.agent)));
@@ -321,13 +345,47 @@ pub fn warn_launch(vm: &AgentsLaunchVm) {
 }
 
 /// The default agent as Settings › Agents and the room header show it, from
-/// what is here now: [`choose`] over the key as keeper reads it, with the
-/// file that decides it when one does. Never waits.
+/// what is here now: [`choose`] over the key as keeper reads it, finished
+/// with what only the data directory knows ([`finish`]). Never waits.
 pub fn read(data_dir: &Path, facts: &LaunchFacts) -> Result<AgentsLaunchVm, CoreError> {
     let chosen = registry::get_agents_default(data_dir)?;
-    let mut vm = choose(chosen.as_deref(), facts);
+    finish(data_dir, choose(chosen.as_deref(), facts))
+}
+
+/// keeper's own version: a chooser put away stays away until keeper is
+/// updated (R463).
+pub const KEEPER_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// What [`choose`] cannot know: the settings file that decides the key, if
+/// one does ([`file_set_sentence`]), and whether the chooser was put away in
+/// this version of keeper. A file that decides the key leaves nothing to
+/// choose here, so no chooser is shown beside it.
+pub fn finish(data_dir: &Path, vm: AgentsLaunchVm) -> Result<AgentsLaunchVm, CoreError> {
+    finish_in(data_dir, vm, KEEPER_VERSION)
+}
+
+fn finish_in(
+    data_dir: &Path,
+    mut vm: AgentsLaunchVm,
+    version: &str,
+) -> Result<AgentsLaunchVm, CoreError> {
     vm.file_set = file_set_sentence();
+    if vm.chooser {
+        let put_away = registry::get_default_agent_chooser_dismissed(data_dir)?;
+        vm.chooser = vm.file_set.is_none() && put_away.as_deref() != Some(version);
+    }
     Ok(vm)
+}
+
+/// The person put the launch's chooser away (R463): it is not shown again
+/// until keeper is updated. A failed write is a WARN line (R381); its
+/// sentence is the caller's to show.
+pub fn dismiss_chooser(data_dir: &Path) -> Result<(), CoreError> {
+    let result = registry::set_default_agent_chooser_dismissed(data_dir, KEEPER_VERSION);
+    if let Err(error) = &result {
+        tracing::warn!(%error, "agents: the default agent's chooser was not put away");
+    }
+    result
 }
 
 /// Whether `vm`'s default agent is a user id whose `main` room is not here:
@@ -540,6 +598,77 @@ pub fn set_default(
     result
 }
 
+/// The default agent as keeper reads it at one moment — a settings file
+/// that sets `agents.default` first (the account's `keeper.toml` and
+/// `keeper.<device>.toml` included), then this device's table — taken
+/// before something that may move it: the account's layers installed or
+/// cleared, or a synced settings row written (R488). [`Self::moved`] answers
+/// whether that something moved it, which is when the webview is told
+/// (`keeper://agents-default-changed`) — never for a row written beneath a
+/// file that keeps deciding the key, and never for layers reinstalled
+/// unchanged.
+#[derive(Debug)]
+pub struct DefaultAgentSeen(Result<Option<String>, CoreError>);
+
+impl DefaultAgentSeen {
+    /// The default agent as it reads now.
+    pub fn now(data_dir: &Path) -> Self {
+        Self(registry::get_agents_default(data_dir))
+    }
+
+    /// Whether the default agent reads differently now than when this was
+    /// taken. A read that fails, then or now, is a WARN line (R381) and
+    /// counts as moved: the webview reads it again and says why it cannot.
+    pub fn moved(&self, data_dir: &Path) -> bool {
+        match (&self.0, registry::get_agents_default(data_dir)) {
+            (Ok(before), Ok(after)) => *before != after,
+            (before, after) => {
+                if let Err(error) = before {
+                    tracing::warn!(%error, "agents: the default agent did not read before a change");
+                }
+                if let Err(error) = after {
+                    tracing::warn!(%error, "agents: the default agent did not read after a change");
+                }
+                true
+            }
+        }
+    }
+}
+
+/// The one account-layer transition keeper installs
+/// ([`crate::config::set_account_layers_observer`]; R488 × R495 05, lane
+/// `102stack`). Every install or clear of the account's layers, once the new
+/// layers answer every read, runs in this order and each once: `consent` —
+/// the effective diagnostics and analytics consent is read again (R496) —
+/// then `default_moved` when the default agent as keeper reads it moved
+/// (R488). Where to read the default is `default_dir`'s answer, asked while
+/// the old layers are still in force: `None` while nothing listens (before
+/// the app is up) or with no data directory, and then the default is not
+/// compared.
+pub fn layers_observer(
+    consent: impl Fn() + Send + Sync + 'static,
+    default_dir: impl Fn() -> Option<PathBuf> + Send + Sync + 'static,
+    default_moved: impl Fn() + Send + Sync + 'static,
+) -> crate::config::AccountLayersObserver {
+    let effects = Arc::new((consent, default_moved));
+    Box::new(move || {
+        let seen = default_dir().map(|dir| {
+            let seen = DefaultAgentSeen::now(&dir);
+            (dir, seen)
+        });
+        let effects = Arc::clone(&effects);
+        Box::new(move || {
+            let (consent, default_moved) = &*effects;
+            consent();
+            if let Some((dir, seen)) = seen {
+                if seen.moved(&dir) {
+                    default_moved();
+                }
+            }
+        })
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -735,6 +864,75 @@ mod tests {
         );
     }
 
+    /// R463: with nothing chosen and agent rooms here, the launch asks which
+    /// agent opens — listing the agents with a conversation here and the
+    /// person's own agents keeper may ask for one, each once.
+    #[test]
+    fn no_default_with_agent_rooms_asks_which_agent_opens_from_every_agent_of_the_person() {
+        let here = LaunchFacts {
+            askable: vec![
+                ask("a1", NIXI, "Nixi"),
+                ask("a1", "@lumi:example.org", "Lumi"),
+            ],
+            ..facts(3, &[("a2", room("!t:x", TALA, SessionKind::Main, "Tala"))])
+        };
+        let vm = choose(None, &here);
+        assert_eq!(vm.view, LaunchView::Agents);
+        assert_eq!(vm.room, None);
+        assert!(vm.chooser, "nothing chosen and agents to choose");
+        assert!(!vm.announce, "the chooser is what is said");
+        let names: Vec<&str> = vm.choices.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["Lumi", "Nixi", "Tala"]);
+
+        // Nixi's DM is here on another account: she is one choice, not two.
+        let both = LaunchFacts {
+            askable: vec![ask("a1", NIXI, "Nixi")],
+            ..facts(1, &[("a2", room("!n:x", NIXI, SessionKind::Main, "Nixi"))])
+        };
+        assert_eq!(
+            choose(None, &both).choices,
+            vec![DefaultAgentChoiceVm {
+                agent: NIXI.into(),
+                name: "Nixi".into()
+            }]
+        );
+
+        // A default chosen, no agent room, or nobody to choose: no chooser.
+        assert!(!choose(Some(TALA), &here).chooser);
+        assert!(!choose(Some(NIXI), &here).chooser);
+        let no_rooms = LaunchFacts {
+            agent_rooms: 0,
+            ..here.clone()
+        };
+        assert!(!choose(None, &no_rooms).chooser);
+        assert!(!choose(None, &facts(2, &[])).chooser);
+    }
+
+    /// R463: a chooser put away stays away in this version of keeper and is
+    /// asked again after an update; a settings file that decides the key
+    /// leaves nothing to choose.
+    #[test]
+    fn a_chooser_put_away_stays_away_until_keeper_is_updated() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let here = facts(1, &[("a1", room("!n:x", NIXI, SessionKind::Main, "Nixi"))]);
+        assert!(read(dir.path(), &here).expect("read").chooser);
+
+        dismiss_chooser(dir.path()).expect("put away");
+        assert!(!read(dir.path(), &here).expect("read").chooser);
+        let next = finish_in(dir.path(), choose(None, &here), "99.0.0").expect("finish");
+        assert!(next.chooser, "asked again once keeper is updated");
+
+        let fresh = tempfile::tempdir().expect("tempdir");
+        let _file = crate::config::install_for_test(crate::config::layers_from(&[(
+            "agents.default",
+            "",
+            crate::config::LayerTier::UserGlobal,
+        )]));
+        let decided = read(fresh.path(), &here).expect("read");
+        assert!(decided.file_set.is_some());
+        assert!(!decided.chooser, "a file decides the key");
+    }
+
     #[test]
     fn set_default_refuses_what_is_not_a_user_id_and_writes_nothing() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -789,6 +987,192 @@ mod tests {
         let cleared = set_default(dir.path(), None, &here).expect("cleared");
         assert_eq!(cleared.default_agent.as_deref(), Some(TALA));
         assert!(cleared.file_set.is_some());
+    }
+
+    /// Clears this thread's account layers when dropped, so a failing
+    /// assertion cannot leave the account installed for the next test.
+    struct AccountCleared;
+
+    impl Drop for AccountCleared {
+        fn drop(&mut self) {
+            crate::config::install_account_layers(None);
+        }
+    }
+
+    /// What a sync's `apply_clone` does: install the account's layers from
+    /// `account/keeper.toml`, which sets `agents.default` to `agent` — or,
+    /// with `None`, clear the account's layers.
+    fn account_sets_default(account: &Path, agent: Option<&str>) {
+        use crate::config::{install_account_layers, load_account_layers, AccountLayerSource};
+        let Some(agent) = agent else {
+            install_account_layers(None);
+            return;
+        };
+        std::fs::write(
+            account.join("keeper.toml"),
+            format!("[settings]\n\"agents.default\" = {agent:?}\n"),
+        )
+        .expect("write the account's keeper.toml");
+        install_account_layers(Some(load_account_layers(&AccountLayerSource {
+            dir: account.to_owned(),
+            device: "laptop".to_owned(),
+            account_name: "Acme".to_owned(),
+            repo_host: "git.acme.dev".to_owned(),
+        })));
+    }
+
+    fn stored_row(data_dir: &Path) -> Option<String> {
+        registry::stored_settings(data_dir, &[registry::AGENTS_DEFAULT_KEY])
+            .expect("read the table")
+            .remove(registry::AGENTS_DEFAULT_KEY)
+    }
+
+    /// R488: the account's `keeper.toml` moving the default from Nixi to Tala
+    /// is a change although no settings row moved; the same file installed
+    /// again, as every sync does, is not.
+    #[test]
+    fn the_account_file_moving_the_default_is_a_change_though_no_row_moved() {
+        let (dir, account) = (
+            tempfile::tempdir().expect("tempdir"),
+            tempfile::tempdir().expect("tempdir"),
+        );
+        let _cleared = AccountCleared;
+        account_sets_default(account.path(), Some(NIXI));
+        let seen = DefaultAgentSeen::now(dir.path());
+
+        account_sets_default(account.path(), Some(NIXI));
+        assert!(!seen.moved(dir.path()), "the same file again moves nothing");
+
+        account_sets_default(account.path(), Some(TALA));
+        assert!(seen.moved(dir.path()));
+        assert_eq!(
+            registry::get_agents_default(dir.path()).expect("read"),
+            Some(TALA.to_owned())
+        );
+        assert_eq!(stored_row(dir.path()), None, "no settings row was written");
+    }
+
+    /// R488: the account's file going away reveals the default stored here,
+    /// which is a change; when the file said what the table says, it is not.
+    #[test]
+    fn the_account_file_going_away_reveals_the_stored_default() {
+        let (dir, account) = (
+            tempfile::tempdir().expect("tempdir"),
+            tempfile::tempdir().expect("tempdir"),
+        );
+        let _cleared = AccountCleared;
+        registry::set_agents_default(dir.path(), Some(NIXI)).expect("store Nixi");
+        account_sets_default(account.path(), Some(TALA));
+        let seen = DefaultAgentSeen::now(dir.path());
+        account_sets_default(account.path(), None);
+        assert!(seen.moved(dir.path()));
+        assert_eq!(
+            registry::get_agents_default(dir.path()).expect("read"),
+            Some(NIXI.to_owned())
+        );
+
+        account_sets_default(account.path(), Some(NIXI));
+        let same = DefaultAgentSeen::now(dir.path());
+        account_sets_default(account.path(), None);
+        assert!(!same.moved(dir.path()), "the table says what the file said");
+    }
+
+    /// R488: a synced row written beneath a file that keeps deciding the key
+    /// moves nothing a person sees; the same row with no file above it does.
+    #[test]
+    fn a_row_written_beneath_an_unchanged_file_is_no_change() {
+        let (dir, account) = (
+            tempfile::tempdir().expect("tempdir"),
+            tempfile::tempdir().expect("tempdir"),
+        );
+        let _cleared = AccountCleared;
+        account_sets_default(account.path(), Some(TALA));
+        let seen = DefaultAgentSeen::now(dir.path());
+        registry::set_agents_default(dir.path(), Some(NIXI)).expect("store Nixi");
+        assert!(!seen.moved(dir.path()), "Tala still decides it");
+        assert_eq!(stored_row(dir.path()), Some(NIXI.to_owned()));
+
+        account_sets_default(account.path(), None);
+        let seen = DefaultAgentSeen::now(dir.path());
+        registry::set_agents_default(dir.path(), Some(TALA)).expect("store Tala");
+        assert!(
+            seen.moved(dir.path()),
+            "with no file, the row is the default"
+        );
+    }
+
+    /// R381/R488: a default that does not read counts as moved, so the
+    /// webview reads it again and says why it cannot.
+    #[test]
+    fn a_default_that_does_not_read_counts_as_moved() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let not_a_dir = dir.path().join("a-file");
+        std::fs::write(&not_a_dir, "").expect("write a file where the data dir goes");
+        let seen = DefaultAgentSeen::now(&not_a_dir);
+        assert!(seen.0.is_err(), "the table does not open in a file");
+        assert!(seen.moved(&not_a_dir));
+    }
+
+    /// R488 × R495 05 (lane `102stack`): one account-layer transition. Every
+    /// install or clear re-reads consent and then tells a moved default, each
+    /// once and both after the new layers answer every read (the consent
+    /// effect already reads the new default); layers installed again
+    /// unchanged re-read consent and tell no move; before the app is up no
+    /// default is compared.
+    #[test]
+    fn every_layer_transition_rereads_consent_then_tells_a_moved_default_once() {
+        use std::sync::Mutex;
+        let (dir, account) = (
+            tempfile::tempdir().expect("tempdir"),
+            tempfile::tempdir().expect("tempdir"),
+        );
+        let _cleared = AccountCleared;
+        registry::set_agents_default(dir.path(), Some(NIXI)).expect("store Nixi");
+        let told: Arc<Mutex<Vec<String>>> = Arc::default();
+        let up = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let (consent_told, moved_told, data_dir, listening) = (
+            Arc::clone(&told),
+            Arc::clone(&told),
+            dir.path().to_owned(),
+            Arc::clone(&up),
+        );
+        let consent_dir = data_dir.clone();
+        crate::config::set_account_layers_observer(layers_observer(
+            move || {
+                let now = registry::get_agents_default(&consent_dir).expect("read");
+                consent_told
+                    .lock()
+                    .expect("told")
+                    .push(format!("consent {now:?}"));
+            },
+            move || {
+                listening
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    .then(|| data_dir.clone())
+            },
+            move || moved_told.lock().expect("told").push("moved".to_owned()),
+        ));
+        let said = || std::mem::take(&mut *told.lock().expect("told"));
+        let consent = |agent: &str| format!("consent {:?}", Some(agent));
+
+        account_sets_default(account.path(), Some(TALA));
+        assert_eq!(said(), [consent(TALA), "moved".to_owned()]);
+        account_sets_default(account.path(), Some(TALA));
+        assert_eq!(
+            said(),
+            [consent(TALA)],
+            "the same layers again move nothing"
+        );
+        account_sets_default(account.path(), None);
+        assert_eq!(said(), [consent(NIXI), "moved".to_owned()]);
+
+        up.store(false, std::sync::atomic::Ordering::SeqCst);
+        account_sets_default(account.path(), Some(TALA));
+        assert_eq!(
+            said(),
+            [consent(TALA)],
+            "nothing listens before the app is up"
+        );
     }
 
     #[test]

@@ -45,10 +45,22 @@ avatar?: string,
 /**
  * The small marker while the agent searches the web without asking
  * (R457): [`crate::agents::web_search::UNASKED_MARK`], where its home
- * is on this device and says so. Absent elsewhere and at every other
+ * is on this device and says so and the host serving it says it names
+ * a search engine (story 102.3). Absent elsewhere and at every other
  * level.
  */
 searchesUnasked?: string, 
+/**
+ * What the host serving the agent makes of the web search it asks for,
+ * when it cannot honour it or does not say (story 102.3): a warning
+ * sentence, drawn in place of the globe. On every device while that
+ * host's status says it names no engine for it (R483,
+ * [`crate::agents::web_search::no_engine`]); where the home is on this
+ * device, also as the hosts serving it say
+ * ([`crate::agents::web_search::host_note`]). Absent while it asks for
+ * none and while the host searches.
+ */
+webSearch?: string, 
 /**
  * The standing full-access warning (story 101.5, R420, R440 09) when
  * the host serving the agent says its console runs at `full`: the

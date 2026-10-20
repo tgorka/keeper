@@ -44,6 +44,8 @@ import type { NotifyTarget } from "./gen/NotifyTarget";
 import type { PersonVm } from "./gen/PersonVm";
 import type { PushGatewayVm } from "./gen/PushGatewayVm";
 import type { PushOpenVm } from "./gen/PushOpenVm";
+import type { ReleaseCheckVm } from "./gen/ReleaseCheckVm";
+import type { SignInLinkVm } from "./gen/SignInLinkVm";
 import type { TelemetryConsentVm } from "./gen/TelemetryConsentVm";
 import type { TelemetryEventReq } from "./gen/TelemetryEventReq";
 import type { TelemetryRemoteConfigVm } from "./gen/TelemetryRemoteConfigVm";
@@ -697,9 +699,12 @@ export type { RecordingTargetVm } from "./gen/RecordingTargetVm";
 export type { RecordingUiState } from "./gen/RecordingUiState";
 export type { RecordingVolumeState } from "./gen/RecordingVolumeState";
 export type { RecordingVolumeVm } from "./gen/RecordingVolumeVm";
+export type { ReleaseCheckOutcome } from "./gen/ReleaseCheckOutcome";
+export type { ReleaseCheckVm } from "./gen/ReleaseCheckVm";
 export type { RemoteDraftVm } from "./gen/RemoteDraftVm";
 export type { ReplyPreviewVm } from "./gen/ReplyPreviewVm";
 export type { ResolveSupportVm } from "./gen/ResolveSupportVm";
+export type { RestoreSignInVm } from "./gen/RestoreSignInVm";
 export type { RiskTier } from "./gen/RiskTier";
 export type { RoomListBatch } from "./gen/RoomListBatch";
 export type { RoomListOp } from "./gen/RoomListOp";
@@ -747,6 +752,7 @@ export type { SessionTemplateEntryVm } from "./gen/SessionTemplateEntryVm";
 export type { SessionTreeVm } from "./gen/SessionTreeVm";
 export type { SheetsVm } from "./gen/SheetsVm";
 export type { SheetVm } from "./gen/SheetVm";
+export type { SignInLinkVm } from "./gen/SignInLinkVm";
 export type { SlidesVm } from "./gen/SlidesVm";
 export type { SlideVm } from "./gen/SlideVm";
 export type { SpacesSnapshot } from "./gen/SpacesSnapshot";
@@ -802,6 +808,7 @@ export type { TimelineItemVm } from "./gen/TimelineItemVm";
 export type { TimelineOp } from "./gen/TimelineOp";
 export type { TokenViaVm } from "./gen/TokenViaVm";
 export type { ToolName } from "./gen/ToolName";
+export type { TurnMarkVm } from "./gen/TurnMarkVm";
 export type { TypingBatch } from "./gen/TypingBatch";
 export type { TypistVm } from "./gen/TypistVm";
 export type { UnifiedPushVm } from "./gen/UnifiedPushVm";
@@ -957,7 +964,6 @@ import type { NoteWriteVm } from "./gen/NoteWriteVm";
 import type { OrgAccountVm } from "./gen/OrgAccountVm";
 import type { OutboxVm } from "./gen/OutboxVm";
 import type { PacedWorkVm } from "./gen/PacedWorkVm";
-import type { PaginationStatusBatch } from "./gen/PaginationStatusBatch";
 import type { PaletteMode } from "./gen/PaletteMode";
 import type { PaletteResultsVm } from "./gen/PaletteResultsVm";
 import type { PanelIntentVm } from "./gen/PanelIntentVm";
@@ -1310,10 +1316,19 @@ export async function loginPassword(
  * `code`/`state` ever crosses back to JavaScript.
  *
  * This call stays pending for the whole browser round-trip; use
- * {@link cancelOidc} to abort it.
+ * {@link cancelOidc} to abort it. While it waits, `onLink` receives the
+ * authorization page — before the browser is asked for it, and again with
+ * Rust's sentence when the browser or the sign-in sheet could not be opened
+ * (the sign-in keeps waiting) — so the screen can offer it to copy by hand,
+ * and `null` when the sign-in ends (story 102.9, R470, R480).
  */
-export async function loginOidc(homeserver: string): Promise<AccountVm> {
-  return await invoke<AccountVm>("login_oidc", { homeserver });
+export async function loginOidc(
+  homeserver: string,
+  onLink: (link: SignInLinkVm | null) => void = () => {},
+): Promise<AccountVm> {
+  const channel = new Channel<SignInLinkVm | null>();
+  channel.onmessage = onLink;
+  return await invoke<AccountVm>("login_oidc", { homeserver, onLink: channel });
 }
 
 /**
@@ -3543,6 +3558,16 @@ export async function autoUpdateSet(enabled: boolean): Promise<AutoUpdateVm> {
   return invoke<AutoUpdateVm>("auto_update_set", { enabled });
 }
 
+/**
+ * *Check for updates* on a build without an in-app updater (the phone tier,
+ * story 102.9, R464): Rust reads GitHub's latest release once, compares it
+ * with this build's version and answers with its sentence — never a download.
+ * A failure is an answer too (`outcome: "failed"` with the reason).
+ */
+export async function releaseCheck(): Promise<ReleaseCheckVm> {
+  return invoke<ReleaseCheckVm>("release_check");
+}
+
 /** Whether this device's log goes to the config repository daily, as the layer files leave it. */
 export async function logUploadGet(): Promise<boolean> {
   return invoke<boolean>("log_upload_get");
@@ -3908,6 +3933,18 @@ export async function paginateBackwards(
 }
 
 /**
+ * Ask for the open room's older history — the boundary's Retry, or "Load earlier
+ * messages" where the window cannot scroll (102.6, R509). The ask reaches the Rust
+ * producer that owns the window's fill: it pages until something older shows, the
+ * start, a failure or its budget's end, each said on the timeline stream's
+ * `pagination` status. Rejects with the {@link IpcError} envelope when the room has
+ * no open view.
+ */
+export async function loadEarlierMessages(accountId: string, roomId: string): Promise<void> {
+  await invoke<void>("load_earlier_messages", { accountId, roomId });
+}
+
+/**
  * Subscribe to the open room's typing notifications (Story 3.9, typing, AD-8,
  * AD-14). Opens a `Channel`, forwards each {@link TypingBatch} (the current set of
  * *other* members typing, each with a resolved display name) to `onBatch` in
@@ -3931,34 +3968,6 @@ export async function subscribeTyping(
  */
 export async function unsubscribeTyping(accountId: string, id: number): Promise<void> {
   await invoke<void>("typing_unsubscribe", { accountId, subscriptionId: id });
-}
-
-/**
- * Subscribe to the open room's live back-pagination status (Story 3.9, pagination,
- * AD-8). Opens a `Channel`, forwards each {@link PaginationStatusBatch} (a scalar
- * snapshot: `paginating`/`idle` + `hitStart`) to `onBatch` in arrival order (an
- * initial snapshot before any change), and resolves with the subscription id. The
- * status drives the honest history-boundary row; older events themselves arrive
- * over the timeline subscription, never here. Rejects with the {@link IpcError}
- * envelope (`code: "timelineUnavailable"`) if the room isn't open.
- */
-export async function subscribePaginationStatus(
-  accountId: string,
-  roomId: string,
-  onBatch: (batch: PaginationStatusBatch) => void,
-): Promise<number> {
-  return await subscribe<PaginationStatusBatch>("pagination_status_subscribe", onBatch, {
-    accountId,
-    roomId,
-  });
-}
-
-/**
- * Unsubscribe exactly one pagination-status subscription, aborting its backend
- * producer task (AD-19). Idempotent — an unknown id is a no-op.
- */
-export async function unsubscribePaginationStatus(accountId: string, id: number): Promise<void> {
-  await invoke<void>("pagination_status_unsubscribe", { accountId, subscriptionId: id });
 }
 
 /**
@@ -4724,6 +4733,19 @@ export async function syncProblems(id: string): Promise<SyncProblemsVm> {
  */
 export async function syncRetryParked(id: string, unitId: number): Promise<void> {
   await invoke<void>("sync_retry_parked", { id, unitId });
+}
+
+/**
+ * Return every stopped unit of one folder to the queue — "Retry all stopped"
+ * (Story 102.2). One call: the engine folds identical work (a thousand stopped
+ * downloads of one object become one) instead of the webview requeueing each.
+ *
+ * Resolves with how many stopped rows left the list.
+ *
+ * Rejects with: `unsupported`, `internal` (no such profile).
+ */
+export async function syncRetryAllParked(id: string): Promise<number> {
+  return await invoke<number>("sync_retry_all_parked", { id });
 }
 
 /**
@@ -8964,6 +8986,30 @@ export async function agentsDefaultGet(): Promise<AgentsLaunchVm> {
  */
 export async function agentsDefaultSet(agent: string | null): Promise<AgentsLaunchVm> {
   return await invoke<AgentsLaunchVm>("agents_default_set", { agent });
+}
+
+/**
+ * Put the launch's "Choose the agent keeper opens when it starts" away
+ * (story 102.7, R463): Rust does not offer it again until keeper is updated.
+ * Rejects with Rust's sentence when the setting could not be written.
+ */
+export async function agentsDefaultChooserDismiss(): Promise<void> {
+  await invoke<null>("agents_default_chooser_dismiss");
+}
+
+/**
+ * Said by Rust when the default agent as keeper reads it moved (story 102.7,
+ * DW-1572, R488): a synced settings row, or the account's settings files
+ * installed or cleared. Payload-free: read the default agent again. Mirrors
+ * `AGENTS_DEFAULT_CHANGED_EVENT` in `agents_ipc.rs`.
+ */
+export const AGENTS_DEFAULT_CHANGED_EVENT = "keeper://agents-default-changed";
+
+/** Subscribe to {@link AGENTS_DEFAULT_CHANGED_EVENT}; resolves with an unlisten function. */
+export async function listenAgentsDefaultChanged(onChanged: () => void): Promise<() => void> {
+  return await listen(AGENTS_DEFAULT_CHANGED_EVENT, () => {
+    onChanged();
+  });
 }
 
 /**

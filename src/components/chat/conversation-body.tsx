@@ -32,6 +32,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type WheelEvent,
 } from "react";
 import { ApprovalRequest } from "@/components/agents/approval-card";
 import { DecisionsPanel } from "@/components/agents/decisions-panel";
@@ -65,6 +66,7 @@ import {
   agentModelCommand,
   cancelSend,
   editMessage,
+  loadEarlierMessages,
   markRoomRead,
   paginateBackwards,
   resolveTimelineEventKey,
@@ -79,12 +81,10 @@ import {
   sendText,
   setTyping,
   subscribeOutbox,
-  subscribePaginationStatus,
   subscribeTimeline,
   subscribeTyping,
   toggleReaction,
   unsubscribeOutbox,
-  unsubscribePaginationStatus,
   unsubscribeTimeline,
   unsubscribeTyping,
 } from "@/lib/ipc/client";
@@ -108,16 +108,25 @@ const NEAR_BOTTOM_PX = 80;
 const NEAR_TOP_PX = 200;
 /** Number of older events to request per back-pagination. */
 const PAGINATE_BATCH = 40;
-/**
- * A page when the window shows nothing: an agent's session room carries its
- * host's claim renewal as room state every minute, so a 40-event page there is
- * mostly events nothing renders. Rust clamps a page at 200.
- */
-const FILL_BATCH = 200;
-/** At most this many self-filling pages per opened room (10 000 events). */
-const FILL_MAX_PAGES = 50;
 /** Debounce before re-marking the room read after new content arrives while open. */
 const MARK_READ_DEBOUNCE_MS = 1000;
+
+/**
+ * Whether the conversation's rows overflow its scroller (R509, R513). The
+ * history-boundary row — the list's first item — is left out: whether it shows
+ * "Load earlier messages" hangs on this answer, so counting it would let the
+ * button make the overflow that removes it, and back, for rows just short of
+ * the window. Half a pixel of layout rounding is not a scroll.
+ */
+function rowsOverflow(scroller: HTMLElement): boolean {
+  const list = scroller.firstElementChild;
+  const boundary = list?.firstElementChild;
+  if (!list || !boundary) {
+    return false;
+  }
+  const rows = list.getBoundingClientRect().height - boundary.getBoundingClientRect().height;
+  return rows - scroller.clientHeight > 0.5;
+}
 
 /**
  * Classify a streamed timeline batch so the scroll layout effect can tell an
@@ -334,15 +343,6 @@ export function ConversationBody({
   // spinner immediately, before the status stream reports `paginating`, and gates
   // the top-scroll trigger from firing again).
   const [paginationError, setPaginationError] = useState(false);
-  // Whether the pagination status stream has reported for this room yet: until
-  // it has, `hitStart` is a default, not a fact, and filling the window could
-  // page a room that has no history to page.
-  const [paginationKnown, setPaginationKnown] = useState(false);
-  // Bumped each time a back-pagination settles, so the self-fill below looks
-  // again: the status stream can report `idle` while the request's promise is
-  // still settling, and the in-flight guard then turns that look away.
-  const [pagesSettled, setPagesSettled] = useState(0);
-  const fillPagesRef = useRef(0);
   // An honest, non-blocking note shown when a search deep-link target is further
   // back in history than the loaded window + bounded live paginate can reach
   // (archive-first seek-to-event is Story 5.6). `null` hides it.
@@ -395,7 +395,6 @@ export function ConversationBody({
       setDeleteKey(null);
       setTypists([]);
       setPagination({ state: "idle", hitStart: false });
-      setPaginationKnown(false);
       setPaginationError(false);
       return;
     }
@@ -406,10 +405,8 @@ export function ConversationBody({
     setDeleteKey(null);
     setTypists([]);
     setPagination({ state: "idle", hitStart: false });
-    setPaginationKnown(false);
     setPaginationError(false);
     paginatingRef.current = false;
-    fillPagesRef.current = 0;
     prevScrollHeight.current = 0;
     wasNearBottom.current = true;
     prevItemCount.current = 0;
@@ -440,6 +437,17 @@ export function ConversationBody({
         }
         lastBatchKind.current = classifyBatch(b);
         timeline.getState().applyBatch(b);
+        // The back-pagination status rides on the stream: on the first batch,
+        // then whenever it changed (102.6). Mirrored verbatim; Rust's own fill
+        // of the window failing is the boundary's retriable error, which a
+        // later idle/paginating status never clears — only a retry does.
+        if (b.pagination !== undefined) {
+          if (b.pagination.state === "failed") {
+            setPaginationError(true);
+          } else {
+            setPagination(b.pagination);
+          }
+        }
         setLoaded(true);
       }
     };
@@ -513,10 +521,10 @@ export function ConversationBody({
     };
   }, [accountId, roomId]);
 
-  // Typing + back-pagination status subscriptions (Story 3.9). Both are opened on
-  // room view and torn down on room change / unmount (mirroring the timeline
-  // subscription lifecycle). The typing set and pagination status are pure
-  // Rust-streamed mirrors — the frontend renders them, never derives them. Marking
+  // The typing subscription (Story 3.9), opened on room view and torn down on
+  // room change / unmount (mirroring the timeline subscription lifecycle). The
+  // typing set is a pure Rust-streamed mirror — the frontend renders it, never
+  // derives it; the back-pagination status rides on the timeline stream. Marking
   // the room read on view emits a read receipt (best-effort) whose type — public
   // `m.read` or private `m.read.private` — the Rust core picks from the effective
   // Incognito policy (Story 8.1); the frontend never decides it.
@@ -551,45 +559,6 @@ export function ConversationBody({
       }
     };
   }, [accountId, roomId]);
-
-  // The live back-pagination status, subscribed once the room's timeline is open.
-  // Rust resolves the status from the room's open timeline and refuses a room whose
-  // timeline is not open yet; subscribed beside the timeline it lost that race for
-  // any room whose first batch took a moment — an agent's room behind hundreds of
-  // claim renewals — the refusal was swallowed, and the window never learned its
-  // status: no boundary row, and no self-fill.
-  useEffect(() => {
-    if (accountId === null || roomId === null || !loaded) {
-      return;
-    }
-    let cancelled = false;
-    let paginationSub: number | null = null;
-    subscribePaginationStatus(accountId, roomId, (b: PaginationStatusBatch) => {
-      if (!cancelled) {
-        // Mirror the SDK-streamed status verbatim. The in-flight guard and the
-        // inline error are owned by the fetch promise (see `runPaginate`), not the
-        // status stream — an idle/paginating batch must never silently clear a
-        // genuine error boundary the user still needs to see and retry.
-        setPagination(b);
-        setPaginationKnown(true);
-      }
-    })
-      .then((id) => {
-        if (cancelled) {
-          void unsubscribePaginationStatus(accountId, id);
-          return;
-        }
-        paginationSub = id;
-      })
-      .catch(logFailure("conversation.subscribePagination"));
-
-    return () => {
-      cancelled = true;
-      if (paginationSub !== null) {
-        void unsubscribePaginationStatus(accountId, paginationSub);
-      }
-    };
-  }, [accountId, roomId, loaded]);
 
   // Refresh the effective Incognito VM into the mirror store on room open (Story 8.1),
   // so the header chip and composer ring reflect the resolved state for this chat.
@@ -682,6 +651,13 @@ export function ConversationBody({
     };
   }, [accountId, roomId, acceptsWindowDrops, gateRoom, tray]);
 
+  // Whether the window can scroll at all (R509): one that cannot — a phone
+  // showing a few short items — emits no `scroll` and on touch no `wheel`, so
+  // older history is offered as a "Load earlier messages" action instead.
+  // Measured after every batch by the scroll management below, and on resize,
+  // by the rows alone (R513, `rowsOverflow`).
+  const [scrollable, setScrollable] = useState(true);
+
   // Scroll management on timeline change (Story 3.9). Preserves the user's visual
   // position when older history prepends (compensating scrollTop by the height
   // delta) so a ≥10k-event back-scroll never yanks the view, and only auto-scrolls
@@ -694,6 +670,7 @@ export function ConversationBody({
       prevItemCount.current = items.length;
       return;
     }
+    setScrollable(rowsOverflow(el));
     const kind = lastBatchKind.current;
     const heightDelta = el.scrollHeight - prevScrollHeight.current;
 
@@ -718,6 +695,37 @@ export function ConversationBody({
   const rows = toRenderedRows(items, approvals);
   const roomLoaded = accountId !== null && roomId !== null && loaded && !errored;
   const hasRows = rows.length > 0;
+
+  // A window that grows or shrinks (a phone rotated, the keyboard shown) may
+  // start or stop scrolling without a batch. While the rows fit, the newest
+  // stays at the bottom: what overflows then is only the "Load earlier
+  // messages" row, which would otherwise push it out of view (R513).
+  useLayoutEffect(() => {
+    const el = scrollRef.current;
+    if (!hasRows || el === null) {
+      return;
+    }
+    const observer = new ResizeObserver(() => {
+      const overflow = rowsOverflow(el);
+      setScrollable(overflow);
+      if (!overflow) {
+        el.scrollTop = el.scrollHeight;
+      }
+    });
+    observer.observe(el);
+    if (el.firstElementChild !== null) {
+      observer.observe(el.firstElementChild);
+    }
+    return () => observer.disconnect();
+  }, [hasRows]);
+
+  // The same when the row appears because the rows stopped overflowing.
+  useLayoutEffect(() => {
+    const el = scrollRef.current;
+    if (el !== null && !scrollable) {
+      el.scrollTop = el.scrollHeight;
+    }
+  }, [scrollable]);
 
   // Keep a bottom-pinned timeline pinned across keyboard open/dismiss (Story
   // 13.5, UX-DR25): on phone the kb-inset/safe-area footer padding resizes the
@@ -883,76 +891,32 @@ export function ConversationBody({
   // guard (cleared unconditionally when the promise settles); the resolved boolean
   // is authoritative for reaching the homeserver start, so pagination stops even if
   // the status stream is slow or silent, and a failure sets a sticky retriable error.
-  const runPaginate = useCallback(
-    (batch: number = PAGINATE_BATCH) => {
-      // `paginatingRef` is the sole in-flight guard: enforce it here so *every*
-      // entry point (the near-top scroll trigger and the boundary Retry button) is
-      // single-flight, not only the scroll path — a rapid Retry can no longer admit
-      // a concurrent fetch.
-      if (accountId === null || roomId === null || paginatingRef.current) {
-        return;
-      }
-      paginatingRef.current = true;
-      paginateBackwards(accountId, roomId, batch)
-        .then((hitStart) => {
-          if (hitStart) {
-            setPagination((p) => ({ ...p, state: "idle", hitStart: true }));
-          }
-        })
-        .catch((raw: unknown) => {
-          logFailure("chat.paginate")(raw);
-          // A failed pagination surfaces a retriable inline boundary error (and stops
-          // the spinner); it persists until the user retries — the status stream no
-          // longer clears it.
-          setPaginationError(true);
-        })
-        .finally(() => {
-          paginatingRef.current = false;
-          setPagesSettled((n) => n + 1);
-        });
-    },
-    [accountId, roomId],
-  );
-
-  // A window that shows nothing, or too little to scroll, has no top to scroll
-  // near, so the trigger below never fires and the room reads "No messages yet."
-  // over a history the server holds. That is the ordinary state of an agent's
-  // room: its burst of edits makes a sync come back limited, the SDK resets the
-  // room's timeline to the gap, and the window empties — and its host renews its
-  // claim as room state every minute, so the newest hundreds of events are ones
-  // nothing renders. Fill it: page back in large pages until there is something
-  // to scroll or the start is reached, looking again whenever the status changes
-  // or a page settles, single-flight through `runPaginate`, at most
-  // FILL_MAX_PAGES pages per opened room.
-  // biome-ignore lint/correctness/useExhaustiveDependencies: `pagesSettled` is the trigger — a settled page must make the fill look again even when nothing it reads changed.
-  useEffect(() => {
-    if (
-      !roomLoaded ||
-      !paginationKnown ||
-      offline ||
-      paginationError ||
-      pagination.hitStart ||
-      pagination.state === "paginating"
-    ) {
+  const runPaginate = useCallback(() => {
+    // `paginatingRef` is the sole in-flight guard: enforce it here so *every*
+    // entry point (the near-top scroll trigger and the boundary Retry button) is
+    // single-flight, not only the scroll path — a rapid Retry can no longer admit
+    // a concurrent fetch.
+    if (accountId === null || roomId === null || paginatingRef.current) {
       return;
     }
-    const el = scrollRef.current;
-    const scrollable = el !== null && el.scrollHeight > el.clientHeight + NEAR_TOP_PX;
-    if ((hasRows && scrollable) || fillPagesRef.current >= FILL_MAX_PAGES) {
-      return;
-    }
-    fillPagesRef.current += 1;
-    runPaginate(FILL_BATCH);
-  }, [
-    roomLoaded,
-    paginationKnown,
-    offline,
-    paginationError,
-    pagination,
-    hasRows,
-    runPaginate,
-    pagesSettled,
-  ]);
+    paginatingRef.current = true;
+    paginateBackwards(accountId, roomId, PAGINATE_BATCH)
+      .then((hitStart) => {
+        if (hitStart) {
+          setPagination((p) => ({ ...p, state: "idle", hitStart: true }));
+        }
+      })
+      .catch((raw: unknown) => {
+        logFailure("chat.paginate")(raw);
+        // A failed pagination surfaces a retriable inline boundary error (and stops
+        // the spinner); it persists until the user retries — the status stream no
+        // longer clears it.
+        setPaginationError(true);
+      })
+      .finally(() => {
+        paginatingRef.current = false;
+      });
+  }, [accountId, roomId]);
 
   const onScroll = useCallback(() => {
     const el = scrollRef.current;
@@ -972,16 +936,34 @@ export function ConversationBody({
     runPaginate();
   }, [runPaginate, offline, pagination, paginationError]);
 
-  // Retry a failed pagination from the boundary's Retry button (Story 3.9). Guarded
-  // on offline so a retry that would immediately re-fail is not offered while
-  // disconnected (the boundary shows the offline state instead).
-  const onRetryPagination = useCallback(() => {
-    if (offline) {
+  // A wheel turned up at the top pages too: a window that cannot scroll — Rust
+  // fills only one that draws next to nothing (102.6) — emits no `scroll`, and
+  // neither does one already at its top.
+  const onWheel = useCallback(
+    (e: WheelEvent<HTMLDivElement>) => {
+      if (e.deltaY < 0) {
+        onScroll();
+      }
+    },
+    [onScroll],
+  );
+
+  // Ask Rust for older history (R509): the boundary's Retry after a failed page,
+  // or "Load earlier messages" where the window cannot scroll. The ask reaches
+  // the producer that owns the window's fill, which pages until something older
+  // shows, the start, a failure or its budget's end — each said on the stream's
+  // pagination status. Guarded on offline so an ask that would immediately fail
+  // is not made while disconnected (the boundary shows the offline state).
+  const onLoadEarlier = useCallback(() => {
+    if (offline || accountId === null || roomId === null) {
       return;
     }
     setPaginationError(false);
-    runPaginate();
-  }, [runPaginate, offline]);
+    loadEarlierMessages(accountId, roomId).catch((raw: unknown) => {
+      logFailure("chat.loadEarlier")(raw);
+      setPaginationError(true);
+    });
+  }, [accountId, roomId, offline]);
 
   const onRetry = useCallback(
     (key: string) => {
@@ -1437,7 +1419,19 @@ export function ConversationBody({
         </div>
       ) : rows.length === 0 ? (
         <div className="flex flex-1 items-center justify-center p-8">
-          <p className="max-w-sm text-center text-muted-foreground text-sm">No messages yet.</p>
+          {/* A window that draws nothing yet is being filled by Rust (102.6):
+              say that, its failure with Retry, or — older history remaining once
+              the fill rests — "Load earlier messages" (R509); "No messages yet."
+              only at the conversation's start. */}
+          {boundaryState === "atStart" ? (
+            <p className="max-w-sm text-center text-muted-foreground text-sm">No messages yet.</p>
+          ) : (
+            <HistoryBoundary
+              state={boundaryState}
+              onRetry={onLoadEarlier}
+              onLoadEarlier={onLoadEarlier}
+            />
+          )}
         </div>
       ) : (
         // biome-ignore lint/a11y/noStaticElementInteractions: message-list keyboard affordances (↑/↓/r/e) live on the scroll region; individual actions have their own labeled buttons.
@@ -1453,6 +1447,7 @@ export function ConversationBody({
           )}
           onKeyDown={onKeyDown}
           onScroll={onScroll}
+          onWheel={onWheel}
         >
           <ol
             aria-label="Messages"
@@ -1460,8 +1455,12 @@ export function ConversationBody({
           >
             {/* Top-of-timeline history boundary (Story 3.9): spinner while
                 paginating, offline stop, or "start of the conversation". */}
-            <li aria-hidden={boundaryState === "idle"}>
-              <HistoryBoundary state={boundaryState} onRetry={onRetryPagination} />
+            <li aria-hidden={boundaryState === "idle" && scrollable}>
+              <HistoryBoundary
+                state={boundaryState}
+                onRetry={onLoadEarlier}
+                onLoadEarlier={scrollable ? undefined : onLoadEarlier}
+              />
             </li>
             {rows.map((row) =>
               row.kind === "utd" ? (

@@ -122,6 +122,12 @@ agentAvatar?: string,
  */
 agentMark?: string, 
 /**
+ * Copied through from [`RoomVm::agent`]: the Matrix user id of the
+ * agent working this row's room (story 102.7, R463); absent for every
+ * other row.
+ */
+agent?: string, 
+/**
  * An agent room's state in the list (story 101.6, R421): needs you,
  * failed, working or done since the person last read it — Rust's word,
  * drawn by the row and never derived; absent for every other room and

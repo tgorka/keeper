@@ -283,7 +283,7 @@ impl ObjectError {
     /// carry anything but ids, hosts, paths, counts and status codes.
     fn to_sync_error(&self, oid: &str, host: &str) -> SyncError {
         match self.code {
-            404 => SyncError::Config(format!("{host} does not have LFS object {oid}")),
+            404 => SyncError::lfs_object_missing(host, oid),
             409 => SyncError::Config(format!(
                 "{host} disagrees about the hash algorithm for LFS object {oid}"
             )),
@@ -974,7 +974,7 @@ mod tests {
         let err = spec
             .disposition(Operation::Download, "host.example")
             .expect_err("an errored object must not be transferred");
-        assert_eq!(err.code(), "config");
+        assert_eq!(err.code(), "lfsObjectMissing");
         // The server's prose is never interpolated into our message.
         assert!(!err.to_string().contains("Object does not exist"), "{err}");
     }
@@ -982,7 +982,7 @@ mod tests {
     #[test]
     fn per_object_codes_map_onto_the_taxonomy() {
         let cases = [
-            (404, "config"),
+            (404, "lfsObjectMissing"),
             (409, "config"),
             (410, "config"),
             (422, "config"),

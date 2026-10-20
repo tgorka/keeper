@@ -39,7 +39,9 @@
  * view level: a notification tap lands on the Room, and popping it returns
  * to whatever view was under it. Back, edge-swipe and Escape pop these
  * levels through the same `onBack`; the Bots surface adds no navigation of
- * its own (`bots-phone-pane.tsx`).
+ * its own (`bots-phone-pane.tsx`). Settings' category (Story 102.8) is a
+ * sub-level of its view level held here, so that same `onBack` returns a
+ * category to the category list before it returns to the Inbox.
  *
  * Story 66.1 (FR-457…FR-459, AD-197) makes Approvals, Bridges and Sync the
  * same kind of level: `src/lib/phone-surfaces.ts` is the table of views the
@@ -95,13 +97,14 @@ import {
 } from "@/components/layout/phone-header";
 import { PhoneInboxHeader } from "@/components/layout/phone-inbox-header";
 import { PhoneSearchSurface } from "@/components/layout/phone-search-surface";
-import { SettingsPane } from "@/components/layout/settings-pane";
+import { SETTINGS_PHONE_BACK_TO_LIST, SettingsPane } from "@/components/layout/settings-pane";
 import { OFFLINE_PILL_TEXT } from "@/components/layout/sidebar-pane";
 import { SyncPane } from "@/components/layout/sync-pane";
 import { VerifyBanner } from "@/components/layout/verify-banner";
 import { NotesPhoneList, NotesPhoneNote } from "@/components/notes/notes-phone-pane";
 import { SESSIONS_PANE_TITLE } from "@/components/sessions/sessions-pane";
 import { SessionsPhoneBoard, SessionsPhoneList } from "@/components/sessions/sessions-phone-pane";
+import { SETTINGS_BACK_LABEL } from "@/components/settings/settings-categories";
 import { useKeyboardInset } from "@/hooks/use-keyboard-inset";
 import { useReducedMotion } from "@/hooks/use-reduced-motion";
 import { useShellLayout } from "@/hooks/use-shell-layout";
@@ -110,6 +113,7 @@ import { useSurfaceStore } from "@/lib/agents/surface";
 import { logFailure } from "@/lib/failure";
 import { syncNow } from "@/lib/ipc/client";
 import { type PhoneSurface, phoneSurfaceFor } from "@/lib/phone-surfaces";
+import type { SettingsCategoryId } from "@/lib/settings-categories";
 import { accountStatusStore, useShellOffline } from "@/lib/stores/account-status";
 import { useCapabilitiesStore, useIsReducedCapabilityPlatform } from "@/lib/stores/capabilities";
 import { detailStore, useDetailStore } from "@/lib/stores/detail-ui";
@@ -341,6 +345,22 @@ export function PhoneShell() {
     lastSurfaceRef.current = surface;
   }
   const shownSurface = surface ?? lastSurfaceRef.current;
+  // The Settings category the view level has drilled into, or null for the
+  // category list: a sub-level of the Settings view level, owned here so the
+  // stack's one back (header, edge swipe, Escape) pops it before the level.
+  // It does not move `level` — the category draws inside the same level — and
+  // entering Settings lands on the list; a room opened over Settings and
+  // popped again keeps it.
+  const [settingsCategory, setSettingsCategory] = useState<SettingsCategoryId | null>(null);
+  const settingsShowing = surface === "settings";
+  const [wasSettingsShowing, setWasSettingsShowing] = useState(settingsShowing);
+  if (settingsShowing !== wasSettingsShowing) {
+    setWasSettingsShowing(settingsShowing);
+    if (settingsShowing) {
+      setSettingsCategory(null);
+    }
+  }
+  const settingsCategoryOpen = surfaceOpen && settingsShowing && settingsCategory !== null;
 
   // One visible level, derived purely from existing state:
   //   selected -> Room (1) or, with Detail open, Detail (2);
@@ -420,6 +440,10 @@ export function PhoneShell() {
     }
     if (pushedLevelOpen) {
       setPushedSurface(null);
+      return;
+    }
+    if (settingsCategoryOpen) {
+      setSettingsCategory(null);
       return;
     }
     primaryViewStore.getState().setView("inbox");
@@ -1056,14 +1080,20 @@ export function PhoneShell() {
         ) : shownSurface !== null ? (
           <>
             <PhoneBackBar
-              backLabel={PHONE_BACK_TO_INBOX}
-              backTitle={PHONE_INBOX_TITLE}
+              backLabel={settingsCategoryOpen ? SETTINGS_PHONE_BACK_TO_LIST : PHONE_BACK_TO_INBOX}
+              backTitle={settingsCategoryOpen ? SETTINGS_BACK_LABEL : PHONE_INBOX_TITLE}
               onBack={onBack}
               backRef={surfaceBack1Ref}
             />
             <div className="flex min-h-0 min-w-0 flex-1">
               {shownSurface === "settings" ? (
-                <SettingsPane />
+                <SettingsPane
+                  owner={{
+                    category: settingsCategory,
+                    onCategoryChange: setSettingsCategory,
+                    backRef: surfaceBack1Ref,
+                  }}
+                />
               ) : shownSurface === "approval" ? (
                 <ApprovalPane />
               ) : shownSurface === "bridges" ? (

@@ -33,9 +33,17 @@ reason: string | null,
  */
 announce: boolean, 
 /**
- * The agents a person may choose, by name.
+ * The agents a person may choose, by name: one per agent with a `main`
+ * room here, and one per own agent keeper may ask for one (R416).
  */
 choices: Array<DefaultAgentChoiceVm>, 
+/**
+ * Whether keeper asks, where the person is looking, which agent it
+ * opens when it starts (R463): no default is chosen, the Agents window
+ * opens, there is an agent to choose, no settings file decides the key,
+ * and the person did not put the chooser away in this version of keeper.
+ */
+chooser: boolean, 
 /**
  * When a settings file decides `agents.default`: the sentence that says
  * so and names the file ([`file_set_sentence`]). A choice made here is

@@ -1024,7 +1024,10 @@ pub fn load_account_layers(src: &AccountLayerSource) -> AccountLayers {
 
 /// Swap the account tiers in, live. `None` clears them (sign-out, or an
 /// identity that no longer matches). Keys read on every access take effect at
-/// once; keys consumed only at boot take effect at the next launch.
+/// once; keys consumed only at boot take effect at the next launch. The
+/// [`set_account_layers_observer`] observer hears every install and clear,
+/// whatever its caller: once with the old layers still in force, and what it
+/// answers once the new state is in force (R488, R496).
 pub fn install_account_layers(layers: Option<AccountLayers>) {
     match &layers {
         Some(layers) => {
@@ -1039,6 +1042,7 @@ pub fn install_account_layers(layers: Option<AccountLayers>) {
         }
         None => tracing::info!("config: account layers cleared"),
     }
+    let after = observe_layers();
     with_account_slot(|slot| {
         let installed = layers.is_some();
         let previous = {
@@ -1051,6 +1055,61 @@ pub fn install_account_layers(layers: Option<AccountLayers>) {
         slot.installed.store(installed, Ordering::Release);
         drop(previous);
     });
+    after();
+}
+
+/// What an account-layer transition runs once the new layers answer every
+/// read.
+pub type AfterLayers = Box<dyn FnOnce() + Send>;
+
+/// Told of every account-layer install or clear: called while the old layers
+/// still answer every read, and the [`AfterLayers`] it answers runs once the
+/// new ones do — how a value only a layer file sets (diagnostics consent,
+/// R496; the default agent, R488) takes effect without a settings row
+/// moving, and how a move of it is told apart from layers reinstalled
+/// unchanged. [`crate::agents::launch::layers_observer`] is the one keeper
+/// installs.
+pub type AccountLayersObserver = Box<dyn Fn() -> AfterLayers + Send + Sync>;
+
+#[cfg(not(test))]
+static LAYERS_OBSERVER: std::sync::OnceLock<AccountLayersObserver> = std::sync::OnceLock::new();
+
+// Per-thread in tests, like the account slot it watches.
+#[cfg(test)]
+thread_local! {
+    static LAYERS_OBSERVER: std::cell::RefCell<Option<AccountLayersObserver>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Install the process-wide account-layers observer. The first call wins; a
+/// second is ignored, so a re-run boot step cannot stack observers.
+#[cfg(not(test))]
+pub fn set_account_layers_observer(observer: AccountLayersObserver) {
+    if LAYERS_OBSERVER.set(observer).is_err() {
+        tracing::debug!("an account-layers observer is already installed; keeping the first");
+    }
+}
+
+/// This test thread's observer (replacing any earlier one).
+#[cfg(test)]
+pub fn set_account_layers_observer(observer: AccountLayersObserver) {
+    LAYERS_OBSERVER.with(|slot| *slot.borrow_mut() = Some(observer));
+}
+
+#[cfg(not(test))]
+fn observe_layers() -> AfterLayers {
+    match LAYERS_OBSERVER.get() {
+        Some(observer) => observer(),
+        None => Box::new(|| {}),
+    }
+}
+
+#[cfg(test)]
+fn observe_layers() -> AfterLayers {
+    LAYERS_OBSERVER.with(|slot| match slot.borrow().as_ref() {
+        Some(observer) => observer(),
+        None => Box::new(|| {}),
+    })
 }
 
 /// Replace the account's own faults — a broken `account.toml`, a sign-in that

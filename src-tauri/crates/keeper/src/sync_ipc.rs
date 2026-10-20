@@ -61,6 +61,7 @@ fn activity_kind_str(kind: ActivityKind) -> &'static str {
         ActivityKind::Modified => "modified",
         ActivityKind::Deleted => "deleted",
         ActivityKind::Conflict => "conflict",
+        ActivityKind::Restored => "restored",
     }
 }
 
@@ -502,6 +503,11 @@ pub struct SyncStatusVm {
     /// Decided in Rust (`keeper_sync::engine::is_phone_divergence`) so the
     /// webview never reads the sentence to find out.
     pub resettable: bool,
+    /// Whether `error` is the sentence of a push held behind stopped
+    /// transfers (Story 102.2), beside which the Sync surface offers "Retry
+    /// all stopped" (`sync_retry_all_parked`). Decided in Rust
+    /// (`keeper_sync::engine::is_held_push`) for `resettable`'s reason.
+    pub held_push: bool,
 }
 
 impl From<&SyncStatus> for SyncStatusVm {
@@ -528,6 +534,10 @@ impl From<&SyncStatus> for SyncStatusVm {
                 .error
                 .as_deref()
                 .is_some_and(keeper_sync::engine::is_phone_divergence),
+            held_push: s
+                .error
+                .as_deref()
+                .is_some_and(keeper_sync::engine::is_held_push),
         }
     }
 }
@@ -594,7 +604,7 @@ pub struct SyncOutcomeVm {
 pub struct SyncActivityVm {
     #[ts(type = "number")]
     pub ts_ms: i64,
-    /// `added` | `modified` | `deleted` | `conflict`.
+    /// `added` | `modified` | `deleted` | `conflict` | `restored`.
     pub kind: String,
     pub path: String,
     /// How big the file was, or `null` when nobody measured it: a row recorded
@@ -995,6 +1005,9 @@ pub fn sync_ipc_error(err: &SyncError) -> IpcError {
         // one would be a frontend contract change to draw a distinction the two
         // `Display` strings already draw in the message the user reads.
         SyncError::Auth { .. } | SyncError::Forbidden { .. } => IpcErrorCode::InvalidCredentials,
+        // The credential could not be produced (Story 102.2): the same
+        // remedy as a rejected one — sign in, reconnect, or store it again.
+        SyncError::Credential(_) => IpcErrorCode::InvalidCredentials,
         SyncError::Network { .. } => IpcErrorCode::ServerUnreachable,
         // A wait, not a fault: the push is held until this folder's own uploads
         // reach the remote. `syncUnavailable` is the app's "sync cannot continue
@@ -1050,6 +1063,9 @@ pub fn sync_ipc_error(err: &SyncError) -> IpcError {
         | SyncError::Git(_)
         | SyncError::Io { .. }
         | SyncError::Config(_)
+        // A per-object 404 (Story 102.2): its sentence names the file and the
+        // device that has the bytes, which is all a person can act on.
+        | SyncError::LfsObjectMissing { .. }
         | SyncError::Cancelled => IpcErrorCode::Internal,
     };
     IpcError {
@@ -1890,6 +1906,28 @@ pub async fn sync_retry_parked(
         .retry_parked(&id, unit_id)
         .await
         .map_err(|e| sync_ipc_error(&e))
+}
+
+/// Put every stopped unit of this folder back in the queue — "Retry all
+/// stopped" (Story 102.2, R467): beside a held push's sentence and on the
+/// Problems list's heading.
+///
+/// One call rather than one `sync_retry_parked` per row from the webview: a
+/// folder with 68 stopped units was 68 round trips, and identical work —
+/// 1 099 stopped downloads of one object — is folded into one row by the
+/// engine instead of requeued 1 099 times. Answers how many rows left the
+/// stopped list.
+#[tauri::command]
+pub async fn sync_retry_all_parked(
+    state: tauri::State<'_, AppState>,
+    id: String,
+) -> Result<u32, IpcError> {
+    let engine = engine_of(&state)?;
+    let moved = engine
+        .retry_all_parked(&id)
+        .await
+        .map_err(|e| sync_ipc_error(&e))?;
+    Ok(u32::try_from(moved).unwrap_or(u32::MAX))
 }
 
 /// Store the access token a private remote needs, in the OS keychain.

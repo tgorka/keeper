@@ -40,6 +40,7 @@
 import { useEffect, useId, useRef, useState } from "react";
 import { DEVICE_CLASS_LABEL, SetupLinkField } from "@/components/account/account-setup-sheet";
 import { AccountShareSheet } from "@/components/account/account-share-sheet";
+import { SignInLink } from "@/components/auth/sign-in-link";
 import { toggleVoiceListening } from "@/components/bots/bot-listening-toggle";
 import {
   AlertDialog,
@@ -55,7 +56,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { reportFrontendError } from "@/lib/crash-report";
-import { logFailure } from "@/lib/failure";
+import { logFailure, sayFailure } from "@/lib/failure";
 import {
   type AccountDeviceVm,
   accountCancelSignIn,
@@ -65,7 +66,9 @@ import {
   accountSignOut,
   accountState,
   accountSync,
+  cancelOidc,
   type OrgAccountVm,
+  type RestoreSignInVm,
   voiceWakeGet,
   voiceWakeSet,
 } from "@/lib/ipc/client";
@@ -95,6 +98,10 @@ export const ACCOUNT_LISTENING_OFF_SENTENCE =
   "Listening for your wake phrase was on for this device.";
 export const ACCOUNT_LISTENING_ON_LABEL = "Turn listening on";
 export const ACCOUNT_LISTENING_KEEP_OFF_LABEL = "Keep it off";
+/** Ends the Matrix sign-in a restore started by itself (102.9, R480/02). */
+export const ACCOUNT_CANCEL_MATRIX_SIGN_IN_LABEL = "Cancel Matrix sign-in";
+/** What a failed cancel of that sign-in says. */
+export const ACCOUNT_CANCEL_MATRIX_SIGN_IN_FAILED = "keeper couldn't cancel the Matrix sign-in.";
 /** What a failed "Turn listening on" says when Rust gave no sentence of its own. */
 export const ACCOUNT_LISTENING_FAILED = "keeper couldn't turn listening on.";
 /** What a failed "Keep it off" says when Rust gave no sentence of its own. */
@@ -178,6 +185,40 @@ export function AccountSection({ open }: { open: boolean }) {
         </>
       )}
     </section>
+  );
+}
+
+/**
+ * The Matrix single sign-on a restore started by itself (AD-329; 102.9,
+ * R480/02): Rust's sentence, its link to copy while it waits — it is a
+ * browser sign-in like any other — with Cancel, then how it ended. Its own
+ * line, not the account's sign-in: the account can be up to date meanwhile.
+ */
+function RestoreMatrixSignIn({ signIn }: { signIn: RestoreSignInVm }) {
+  return (
+    <div className="flex min-w-0 flex-col items-start gap-2">
+      <p
+        role={signIn.problem ? "alert" : "status"}
+        className={signIn.problem ? "text-destructive" : undefined}
+      >
+        {signIn.sentence}
+      </p>
+      {signIn.link !== undefined && <SignInLink link={signIn.link} />}
+      {signIn.waiting && (
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          onClick={() =>
+            void cancelOidc().catch(
+              sayFailure("account.cancelRestoreSignIn", ACCOUNT_CANCEL_MATRIX_SIGN_IN_FAILED),
+            )
+          }
+        >
+          {ACCOUNT_CANCEL_MATRIX_SIGN_IN_LABEL}
+        </Button>
+      )}
+    </div>
   );
 }
 
@@ -324,6 +365,9 @@ function ConfiguredAccount({ vm }: { vm: OrgAccountVm }) {
       {vm.restore.pending.map((line) => (
         <p key={line}>{line}</p>
       ))}
+      {vm.restore.matrixSignIn !== undefined && (
+        <RestoreMatrixSignIn signIn={vm.restore.matrixSignIn} />
+      )}
       {vm.restore.listeningOff && (
         <div className="flex flex-col items-start gap-1">
           <p>{ACCOUNT_LISTENING_OFF_SENTENCE}</p>
@@ -355,6 +399,7 @@ function ConfiguredAccount({ vm }: { vm: OrgAccountVm }) {
         <p className="text-muted-foreground">{accountSyncLine(vm)}</p>
       )}
       <Faults faults={vm.faults} />
+      {vm.signInLink !== undefined && <SignInLink link={vm.signInLink} />}
       {error !== null && (
         <p role="alert" className="text-destructive">
           {error}

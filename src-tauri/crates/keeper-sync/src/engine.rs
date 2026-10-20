@@ -105,6 +105,15 @@ pub struct TasksLedgerResolution {
     pub source: &'static str,
 }
 
+/// One large file a merge commit carries whose object this machine holds:
+/// an upload the merge owes before its push (Story 102.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MergeUpload {
+    path: PathBuf,
+    oid: String,
+    size: u64,
+}
+
 /// What one convergence had to do beyond merging.
 ///
 /// Two lists rather than one because they ask different things of the user:
@@ -1012,6 +1021,46 @@ pub fn is_phone_divergence(error: &str) -> bool {
     error.contains(PHONE_DIVERGENCE_WAYS_OUT)
 }
 
+/// The way out of a push held behind stopped transfers (Story 102.2), the
+/// tail of [`held_push_sentence`] and the words beside which a surface offers
+/// "Retry all stopped" ([`Engine::retry_all_parked`]).
+const HELD_PUSH_WAY_OUT: &str =
+    "Retry all stopped puts every stopped transfer of this folder back in the queue.";
+
+/// What a push held behind stopped uploads says (Story 102.2, R467): the
+/// oldest stopped upload's file and the sentence it stopped with, then the
+/// way out.
+///
+/// Before this the held push set no sentence at all, so the folder read
+/// "needs your attention" over an empty error and the only remedy was a
+/// Retry button on row 27 of 68 in a list folded to ten.
+pub fn held_push_sentence(stopped: &db::StoppedUpload) -> String {
+    let what = stopped.label.clone().unwrap_or_else(|| {
+        serde_json::from_str::<WorkKind>(&stopped.payload)
+            .ok()
+            .and_then(|kind| match kind {
+                WorkKind::LfsUpload { oid, .. } => Some(format!("object {oid}")),
+                _ => None,
+            })
+            .unwrap_or_else(|| "a large file".to_owned())
+    });
+    let why = stopped
+        .last_error
+        .as_deref()
+        .map_or_else(String::new, |error| format!(": {error}"));
+    format!(
+        "Publishing is on hold until {what} reaches the remote, and its upload stopped{why}. \
+         {HELD_PUSH_WAY_OUT}"
+    )
+}
+
+/// Whether a profile's recorded error is [`held_push_sentence`]'s — read off
+/// the sentence for [`is_phone_divergence`]'s reason: it is what survives a
+/// relaunch.
+pub fn is_held_push(error: &str) -> bool {
+    error.contains(HELD_PUSH_WAY_OUT)
+}
+
 /// What became of a write a phone made, once it was written (98.2, R346):
 /// [`Engine::phone_push`]'s and [`Engine::phone_write`]'s answer.
 #[derive(Debug)]
@@ -1862,6 +1911,16 @@ pub struct Engine {
     /// behaviour without waiting out real seconds per item. Production never
     /// changes it; see [`WALK_REPORT_INTERVAL`] for why the pace exists at all.
     walk_report_interval: Duration,
+    /// How many objects one history search for a missing object examines
+    /// (R503). A field for [`Self::walk_report_interval`]'s reason: a test
+    /// drives the bound and its resumption on a small repository.
+    /// Production never changes it; see [`git::history::HISTORY_SEARCH_OBJECTS`].
+    history_search_objects: usize,
+    /// How a healed object reaches the disk before its repair intent is
+    /// retired (Story 102.2, R514). A field so a test can see when the syncs
+    /// happen against the journal; production never changes it from
+    /// [`lfs::store::OsDurability`].
+    durability: Arc<dyn lfs::store::Durability>,
     /// Where each profile's next repair pass resumes in its tracked-path list.
     ///
     /// A cursor rather than a fresh start, because a pass that always began at
@@ -2316,6 +2375,8 @@ impl Engine {
             finished_tap: OnceLock::new(),
             counters: Mutex::new(HashMap::new()),
             walk_report_interval: WALK_REPORT_INTERVAL,
+            history_search_objects: git::history::HISTORY_SEARCH_OBJECTS,
+            durability: Arc::new(lfs::store::OsDurability),
             repair_cursor: Mutex::new(HashMap::new()),
             repair_memo: Mutex::new(HashMap::new()),
             repair_quarantine: Mutex::new(HashMap::new()),
@@ -2956,6 +3017,17 @@ impl Engine {
             } else {
                 Self::seeded_state(runtime.as_ref(), self.platform.now_ms())
             };
+            // A push the journal still holds behind stopped uploads says so
+            // from the first status a fresh process gives (R503), whatever
+            // sentence the last run happened to persist: the journal is
+            // where the hold is recorded, and the card's "Retry all
+            // stopped" is decided off this sentence.
+            if profile.enabled {
+                if let Some(sentence) = self.held_push_standing(&profile.id) {
+                    snapshot.error = Some(sentence);
+                    snapshot.state = ProfileState::NeedsAttention;
+                }
+            }
             status.insert(profile.id.clone(), snapshot);
             Self::lock(&self.remote_relations)
                 .insert(profile.id.clone(), Arc::new(Mutex::new(None)));
@@ -8284,6 +8356,10 @@ impl Engine {
             {
                 Ok(reached) => {
                     contact = contact.join(reached);
+                    // The boundary a fold into this row would race: delivery
+                    // has read the row, the row is not gone yet (R514).
+                    #[cfg(test)]
+                    before_complete::fire(&profile.local_path);
                     self.with_db(|conn| db::complete(conn, item.id))?;
                     // With what the unit proved: a `Push` that found nothing
                     // to send, a `Checkout` that adopted in place, a transfer
@@ -8296,6 +8372,8 @@ impl Engine {
                 }
                 Err(err) => {
                     contact = contact.join(RemoteContact::Failed);
+                    // Which also says why a held push waits, whatever unit
+                    // failed ([`Self::record_failure`]).
                     self.reschedule_after(profile, item.id, item.attempts, &err)?;
                 }
             }
@@ -8316,7 +8394,7 @@ impl Engine {
     /// all. So the conditions are re-evaluated somewhere that runs
     /// unconditionally, and this is it: once per drain, before any claim.
     ///
-    /// Two conditions, and a distinct silent failure behind each:
+    /// Three conditions, and a distinct silent failure behind each:
     ///
     /// * **Every upload has landed** (Story 34.15), which releases a push held
     ///   by [`SyncError::LfsUploadPending`]. This used to be answered only from
@@ -8338,10 +8416,15 @@ impl Engine {
     ///   invisibly. The remote's own reachability is the condition, so the
     ///   remote is what gets asked.
     ///
+    /// * **A heal's upload is owed but was never released** (R503): a
+    ///   [`db::REPAIRING`] row is finished by [`Self::replay_repairs`] first,
+    ///   so the upload it becomes is claimable by this very drain.
+    ///
     /// `now_ms` is the drain's own clock reading, which matters: a row released
     /// with `not_before_ms = now` is claimable by the very next statement, so a
     /// satisfied wait costs no extra tick.
     fn release_satisfied_waits(&self, profile: &SyncProfile, now_ms: i64) -> Result<()> {
+        self.replay_repairs(profile, now_ms);
         // The remote is asked first even though an upload released here is still
         // outstanding and so cannot let the push through in the same breath: the
         // order is what lets one pass handle a remote that came back *and* an
@@ -8393,9 +8476,7 @@ impl Engine {
             Retriability::Deferred => (WorkState::Deferred, now),
             Retriability::Permanent => (WorkState::Parked, now),
         };
-        self.with_db(|conn| {
-            db::reschedule(conn, item_id, state, not_before, Some(&err.to_string()))
-        })?;
+        self.with_db(|conn| db::reschedule_failed(conn, item_id, state, not_before, err))?;
         self.record_failure(profile, err);
         Ok(())
     }
@@ -8411,6 +8492,8 @@ impl Engine {
     /// exactly how a folder that had permanently stopped publishing kept a
     /// moving bar over its own error message; a fourth arm added here would
     /// have repeated it, because remembering was the whole contract.
+    ///
+    /// It ends with the held push's sentence ([`Self::show_held_push`]).
     fn record_failure(&self, profile: &SyncProfile, err: &SyncError) {
         self.clear_phase(&profile.id);
         // A failure the remote *answered with* is a round trip that came back.
@@ -8448,7 +8531,16 @@ impl Engine {
                     // stopped, and the next failure asks again.
                     SyncError::LfsUploadPending { .. } => {
                         match self.lfs_uploads_still_moving(profile) {
-                            Ok(0) => ProfileState::NeedsAttention,
+                            Ok(0) => {
+                                // And it says why, where the folder is looked
+                                // at (Story 102.2): the generic "needs your
+                                // attention" over an empty error is never what
+                                // a held push shows.
+                                if let Some(sentence) = self.stopped_upload_sentence(&profile.id) {
+                                    self.set_error(&profile.id, Some(&sentence));
+                                }
+                                ProfileState::NeedsAttention
+                            }
                             Ok(_) => ProfileState::Syncing,
                             Err(err) => {
                                 tracing::debug!(
@@ -8519,6 +8611,15 @@ impl Engine {
                 }
             }
         }
+        // One rule after every failure, whatever failed (R514, review
+        // R102S2-03): a held push outranks the sentence just written. A
+        // pull or a download that failed after the last upload parked used
+        // to replace the held push's sentence with its own, and with no
+        // later success the deferred push never ran again to restore it —
+        // the card lost the file, the cause and "Retry all stopped". The
+        // warning the arms above raised is this failure's own notice and
+        // stays, so a failure repeated every pass notifies once.
+        self.show_held_push(&profile.id);
     }
 
     /// Whether a failure is one the remote answered with — proof of a round
@@ -8594,13 +8695,22 @@ impl Engine {
     /// mid-phase (`Syncing`) is left to that refresh, and every other word is
     /// not this function's to change.
     fn note_unit_succeeded(&self, profile: &SyncProfile, contact: RemoteContact) {
-        self.clear_warning(&profile.id);
         if contact == RemoteContact::Reached {
             Self::lock(&self.transient_failures).remove(&profile.id);
             if Self::lock(&self.offline).remove(&profile.id) {
                 tracing::info!(profile = profile.name, "sync reachable again");
             }
+            // A round trip of this folder the remote accepted is the
+            // credential working again (Story 102.2, R467).
+            self.rearm_credential_units(profile);
         }
+        // A push held behind stopped uploads outlives any other unit's
+        // success (Story 102.2): a pull that worked does not publish the
+        // folder, so the sentence saying why it is held, and the word, stay.
+        if self.project_held_push(&profile.id) {
+            return;
+        }
+        self.clear_warning(&profile.id);
         // Read before the status lock, never under it.
         let offline = Self::lock(&self.offline).contains(&profile.id);
         let moved = match Self::lock(&self.status).get_mut(&profile.id) {
@@ -8621,6 +8731,148 @@ impl Engine {
         if let Some(state) = moved {
             self.persist_state(&profile.id, state);
         }
+    }
+
+    /// [`held_push_sentence`] for this folder's oldest stopped upload, when
+    /// nothing else of its uploads is still moving (Story 102.2).
+    ///
+    /// `None` when an upload is still live — the push is then waiting on
+    /// work in progress, not on a person — or when the journal cannot be
+    /// read now; the next failure asks again.
+    fn stopped_upload_sentence(&self, profile_id: &str) -> Option<String> {
+        let stopped = self.with_db(|conn| {
+            if db::live_count(conn, profile_id, WorkKind::LFS_UPLOAD)? > 0 {
+                return Ok(None);
+            }
+            db::oldest_stopped_upload(conn, profile_id)
+        });
+        stopped
+            .ok()
+            .flatten()
+            .map(|stopped| held_push_sentence(&stopped))
+    }
+
+    /// [`Self::stopped_upload_sentence`] while a push is actually held: its
+    /// unit stands `deferred` in the journal.
+    fn held_push_standing(&self, profile_id: &str) -> Option<String> {
+        let held = self
+            .with_db(|conn| db::has_unit_in(conn, profile_id, WorkKind::PUSH, "deferred"))
+            .unwrap_or(false);
+        if !held {
+            return None;
+        }
+        self.stopped_upload_sentence(profile_id)
+    }
+
+    /// Bring the held push's sentence in line with the journal (R503,
+    /// review R102S1-03): shown while a push stands `deferred` and every
+    /// upload it waits on has stopped, withdrawn once that is no longer so.
+    /// Returns whether a held push stands.
+    ///
+    /// Asked wherever upload state changes — a Retry, Retry all, a
+    /// credential re-arm, a unit that succeeded, a heal's replay that
+    /// stopped its upload — and when the status is restored at start; every
+    /// failure asks [`Self::show_held_push`], its showing half. It used to be
+    /// asked only when a push failed again: the ordinary order is a push held
+    /// while uploads still move, then the last upload parking, and the
+    /// deferred push is not run again while it waits, so the card kept the
+    /// upload's raw error and never offered "Retry all stopped".
+    fn project_held_push(&self, profile_id: &str) -> bool {
+        if self.show_held_push(profile_id) {
+            if let Some(snapshot) = Self::lock(&self.status).get_mut(profile_id) {
+                snapshot.warning = None;
+            }
+            return true;
+        }
+        let shown = Self::lock(&self.status)
+            .get(profile_id)
+            .and_then(|snapshot| snapshot.error.as_deref().map(is_held_push))
+            .unwrap_or(false);
+        if shown {
+            self.clear_warning(profile_id);
+        }
+        false
+    }
+
+    /// The held push's sentence and `NeedsAttention`, while a push stands
+    /// held behind uploads that have all stopped. Returns whether it does.
+    /// Leaves the warning alone: [`Self::record_failure`] asks this after
+    /// raising its own.
+    fn show_held_push(&self, profile_id: &str) -> bool {
+        let Some(sentence) = self.held_push_standing(profile_id) else {
+            return false;
+        };
+        self.set_error(profile_id, Some(&sentence));
+        self.set_state(profile_id, ProfileState::NeedsAttention);
+        true
+    }
+
+    /// Re-arm this folder's units the credential stopped (Story 102.2, R467).
+    ///
+    /// Before this, a unit stopped by a signed-out account or a rejected
+    /// token stayed stopped until a person found its Retry: a sign-in did
+    /// not move it, nor did a pull that worked. A stopped upload is counted
+    /// by the push gate on purpose, so the owner's tgdrive held its push for
+    /// two days behind an object the server already had, while every pull
+    /// worked. Asked here — on proof the credential works — the stopped
+    /// upload runs again on the next drain, and the push follows it.
+    ///
+    /// Best effort: a journal that cannot be written now is asked again at
+    /// the next unit that reaches the remote.
+    fn rearm_credential_units(&self, profile: &SyncProfile) -> usize {
+        let now = self.platform.now_ms();
+        match self.with_db(|conn| db::rearm_credential(conn, &profile.id, now)) {
+            Ok(done) => {
+                if done.total() > 0 {
+                    tracing::info!(
+                        profile = profile.name,
+                        requeued = done.requeued,
+                        folded = done.folded,
+                        "the credential works again, so the work it stopped is queued again"
+                    );
+                }
+                done.total()
+            }
+            Err(err) => {
+                tracing::warn!(
+                    profile = profile.name,
+                    error = %err,
+                    "could not queue again the work the credential stopped"
+                );
+                0
+            }
+        }
+    }
+
+    /// A credential source is back — a person signed in, or reconnected it
+    /// (Story 102.2, R467, R503): re-arm the stopped units of the folders
+    /// that use THAT source, and look at those folders now.
+    ///
+    /// `uses_recovered` answers, per profile id, whether that folder's
+    /// credential comes from the source that recovered; the shell passes
+    /// `keeper_core::registry::uses_sync_credential_source` for the source it
+    /// just signed in to. A folder on another source — a second repository
+    /// source, or its own keychain token — is not touched, so a healthy
+    /// account never spends another source's [`db::CREDENTIAL_REARMS`] on
+    /// a credential that has not come back. A credential merely being
+    /// produced is not this trigger: the engine's own is a round trip of the
+    /// folder the remote accepted ([`Self::note_unit_succeeded`]). Returns
+    /// how many stopped rows left the stopped list.
+    pub fn rearm_after_credential(&self, uses_recovered: &dyn Fn(&str) -> bool) -> Result<usize> {
+        let mut total = 0;
+        for profile in self.list_profiles()? {
+            if !uses_recovered(&profile.id) {
+                continue;
+            }
+            let moved = self.rearm_credential_units(&profile);
+            if moved > 0 {
+                self.project_held_push(&profile.id);
+                self.refresh_pending(&profile.id);
+                self.wake_now(&profile.id);
+            }
+            total += moved;
+        }
+        Ok(total)
     }
 
     /// How long [`Self::do_pull`] waits for a fetch before calling the remote
@@ -9794,7 +10046,11 @@ impl Engine {
             Self::commit_source(&profile, source),
         )
         .with_tags(profile.tags.clone());
-        let converged = tokio::task::spawn_blocking(move || {
+        // `blocking`, not `spawn_blocking`: the merge journals its upload
+        // debt through this engine before it commits (Story 102.2), and the
+        // borrow of `self` is what lets it.
+        let owe = |uploads: &[MergeUpload]| self.owe_merge_uploads(&profile_for_task, uploads);
+        let converged = Self::blocking(|| {
             Self::converge_with_conflict_copies(
                 &git,
                 &profile_for_task,
@@ -9802,10 +10058,9 @@ impl Engine {
                 &stamp,
                 &device.label,
                 &provenance,
+                &owe,
             )
-        })
-        .await
-        .map_err(|err| SyncError::Journal(format!("converge task failed: {err}")))??;
+        })?;
 
         if !converged.stale.is_empty() {
             // Nothing is on disk to act on, so this is a prompt rather than a
@@ -9978,6 +10233,7 @@ impl Engine {
         stamp: &str,
         device: &str,
         provenance: &Provenance,
+        owe: &dyn Fn(&[MergeUpload]) -> Result<()>,
     ) -> Result<Converged> {
         use git::conflict::{ChangeKind, Resolution};
 
@@ -10059,6 +10315,7 @@ impl Engine {
             device,
             &mut copies,
             &mut converged,
+            owe,
         ) {
             // A merge that does not finish is undone (AD-229). The copies go
             // with it: after the abort the local revision is back at its own
@@ -10108,6 +10365,7 @@ impl Engine {
         device: &str,
         copies: &mut Vec<PathBuf>,
         converged: &mut Converged,
+        owe: &dyn Fn(&[MergeUpload]) -> Result<()>,
     ) -> Result<()> {
         use git::cli::MergeOutcome;
         use git::conflict::{ChangeKind, Side};
@@ -10185,12 +10443,96 @@ impl Engine {
                 reason: format!("{MERGE_UNRESOLVED_PREFIX}{}", first.path.display()),
             });
         }
+        // The merge's own upload debt, journaled BEFORE the commit that
+        // creates it — `commit_local`'s order, for its reason (Story 102.2).
+        // A conflict copy of a path the folder's rules filter is turned into
+        // a pointer by this very `add`, and until now no upload was queued
+        // for it: the push gate counted nothing and published a pointer
+        // whose bytes were on this machine alone — Marta's merge 8e237b7,
+        // whose `manifest.json` copy is still missing on Forgejo.
+        //
+        // The inventory is what the index now holds beyond this machine's own
+        // tree, not the list handed to `add` (R503, review R102S1-02): the
+        // merge stages every path it decided by itself — a pointer the other
+        // side added, a file it rewrote — and each of those is in the commit
+        // too.
+        let carried: Vec<PathBuf> = git
+            .staged_changes(repo_path)?
+            .into_iter()
+            .filter(|(kind, _)| *kind != ChangeKind::Deleted)
+            .map(|(_, path)| path)
+            .collect();
+        owe(&Self::merge_uploads(profile, &carried)?)?;
         git.commit_merge(repo_path, message)?;
         if git::cli::merge_head_path(repo_path).exists() {
             return Err(SyncError::Diverged {
                 profile: profile.name.clone(),
                 reason: MERGE_IN_PROGRESS_SENTENCE.to_owned(),
             });
+        }
+        Ok(())
+    }
+
+    /// The large files a merge commit is about to carry whose objects this
+    /// machine holds (Story 102.2, R503): every path the merge adds or
+    /// changes relative to this machine's own tree — the conflict copies, the
+    /// resolutions and every path git staged on its own — whose index entry
+    /// is a pointer naming an object in this folder's own store.
+    ///
+    /// Every carried path rather than the copies alone, so "a pointer never
+    /// leaves without its bytes" does not rest on which side a resolution
+    /// took or on which paths git decided by itself: a pointer the other side
+    /// added whose object is here and perhaps not on the server is in this
+    /// commit as much as a conflict copy is. Asking the server for an object
+    /// it has costs one batch request, which answers "already there". A
+    /// pointer whose object is NOT here — the ordinary shape of a path the
+    /// other side added — is not this machine's debt, and an upload of bytes
+    /// it does not have could never complete.
+    fn merge_uploads(profile: &SyncProfile, staged: &[PathBuf]) -> Result<Vec<MergeUpload>> {
+        let repo = git::repo::open_read_only(&profile.local_path, profile.removable)?;
+        let store = lfs::store::LfsStore::in_git_dir(profile.local_path.join(".git"));
+        let mut owed: Vec<MergeUpload> = Vec::new();
+        for rela in staged {
+            let Some((pointer, _)) = lfs::stage::indexed_pointer_blob(&repo, rela) else {
+                continue;
+            };
+            if !store.contains(&pointer.oid, pointer.size) {
+                continue;
+            }
+            owed.push(MergeUpload {
+                path: rela.clone(),
+                oid: pointer.oid,
+                size: pointer.size,
+            });
+        }
+        Ok(owed)
+    }
+
+    /// Journal uploads a commit owes, labelled with each path the way
+    /// `commit_local` labels its own (Story 102.2).
+    fn owe_merge_uploads(&self, profile: &SyncProfile, uploads: &[MergeUpload]) -> Result<()> {
+        let now = self.platform.now_ms();
+        for upload in uploads {
+            // An empty object has no transfer: see [`Self::upload_is_needed`].
+            if !Self::upload_is_needed(upload.size) {
+                continue;
+            }
+            let unit = WorkKind::LfsUpload {
+                oid: upload.oid.clone(),
+                size: upload.size,
+            };
+            let key = lfs::stage::index_key(&upload.path);
+            self.with_db(|conn| {
+                let id = db::enqueue_unique(conn, &profile.id, &unit, now, now)?;
+                db::label_unit(conn, id, &key)
+            })?;
+        }
+        if !uploads.is_empty() {
+            tracing::info!(
+                profile = profile.name,
+                objects = uploads.len(),
+                "the merge carries large files, so their uploads are owed before its push"
+            );
         }
         Ok(())
     }
@@ -11920,6 +12262,11 @@ impl Engine {
         if profile.lfs_mode == LfsMode::Disabled {
             return Ok(RemoteContact::Skipped);
         }
+        // An upload whose object left the store is rebuilt from history
+        // first, when history holds it (R514).
+        if upload {
+            self.restore_before_upload(profile, oid, size, label, unit)?;
+        }
         // The object is already on this disk, so there is nothing to fetch and
         // the remaining job is the publish (Story 56.14).
         //
@@ -12010,6 +12357,12 @@ impl Engine {
         let (endpoint, auth) = self
             .lfs_access(profile, lfsconfig.as_deref(), operation)
             .await?;
+        // The batch endpoint's own host, for a missing object's sentence: an
+        // errored object carries no action href, so the error's host would
+        // read "unknown host" (Story 102.2).
+        let endpoint_host = endpoint
+            .host_str()
+            .map_or_else(|| "the LFS server".to_owned(), str::to_owned);
         let client = lfs::batch::BatchClient::new(self.http.clone(), endpoint, auth.clone())
             .with_ref(format!("refs/heads/{}", profile.branch))
             // Without this the 401 path in `BatchClient` has no credential to
@@ -12086,7 +12439,32 @@ impl Engine {
         self.add_transferred(&profile.id, tally.bytes_done());
         for (oid, result) in results {
             if let Err(err) = result {
-                tracing::warn!(oid, error = %err, "lfs transfer failed");
+                // A download the server has no object for is healed from
+                // this folder's own history when the bytes are there, and
+                // otherwise names the file and the device whose commit
+                // published its pointer (Story 102.2, R467).
+                let err = match err {
+                    SyncError::LfsObjectMissing { oid, .. } if !upload => {
+                        match self.heal_missing_object(
+                            profile,
+                            &store,
+                            &endpoint_host,
+                            &oid,
+                            size,
+                            label,
+                            unit,
+                        ) {
+                            Ok(None) => continue,
+                            Ok(Some(named)) => named,
+                            Err(err) => err,
+                        }
+                    }
+                    err => err,
+                };
+                // The profile is named: the line used to carry the object
+                // alone, and the triage of 2026-10-19 pinned one folder's
+                // missing object on another folder for want of it.
+                tracing::warn!(profile = profile.name, oid, error = %err, "lfs transfer failed");
                 if matches!(err, SyncError::Auth { .. } | SyncError::Forbidden { .. }) {
                     self.forget_ssh_credentials(profile);
                 }
@@ -12196,6 +12574,353 @@ impl Engine {
                 error = %err,
                 "uploaded the object, but could not record the confirmation",
             );
+        }
+    }
+
+    /// A download the server has no object for (Story 102.2, R467): heal it
+    /// from this folder's history when the bytes are there, and otherwise
+    /// say which file it is and which device published its pointer.
+    ///
+    /// The bytes are looked for under the download's path and, for a
+    /// conflict copy, under the file it was copied from — the shape the
+    /// owner's neuradrive took: Marta's Mac merged a `manifest.json` that
+    /// both sides changed, its conflict copy became a pointer whose object
+    /// never left that Mac, and the same bytes sat in history as the plain
+    /// `manifest.json` of the commit before — and then anywhere else in this
+    /// copy's objects, bounded and resumable ([`Self::history_bytes`]). Only
+    /// a plain blob whose sha256 IS the object counts; nothing is guessed.
+    ///
+    /// # The obligation before the bytes (R503, review R102S1-01)
+    ///
+    /// Healed, the server is owed the object, and that debt is journaled
+    /// ([`db::owe_repair`], a [`db::REPAIRING`] upload) BEFORE the bytes go
+    /// into the store. The store is what the download path treats as
+    /// complete: published first, a death before the upload was queued left
+    /// a file this Mac could open and no upload ever owed — the next attempt
+    /// found the object and finished. Then the bytes are published — synced,
+    /// with the directories that name them, before anything else happens
+    /// ([`lfs::store::LfsStore::insert_durable`], R514) — then the row
+    /// becomes an ordinary upload and the Sync view's activity says
+    /// "restored from history" ([`db::release_repair`], one transaction). A
+    /// death or a failure between any two steps leaves a `repairing` row,
+    /// which no upload drain claims and the push waits for, and which
+    /// [`Self::replay_repairs`] finishes at the next drain. Bytes that go
+    /// missing after the release all the same — removed by hand, or lost on
+    /// a disk that lied about its sync — are rebuilt from history before the
+    /// upload sends them ([`Self::restore_before_upload`]).
+    ///
+    /// `Ok(None)` when healed: the download completes as if the bytes had
+    /// arrived. Otherwise `Ok(Some(error))` — the server's answer naming the
+    /// file and the device, or, when the bounded search has not reached the
+    /// end of history yet, a retryable error that resumes it.
+    #[allow(clippy::too_many_arguments)]
+    fn heal_missing_object(
+        &self,
+        profile: &SyncProfile,
+        store: &lfs::store::LfsStore,
+        host: &str,
+        oid: &str,
+        size: u64,
+        label: Option<&str>,
+        unit: Option<i64>,
+    ) -> Result<Option<SyncError>> {
+        let Some(path) = label else {
+            return Ok(Some(SyncError::lfs_object_missing(host, oid)));
+        };
+        let bytes = match self.history_bytes(profile, oid, size, path, unit)? {
+            git::history::HistorySearch::Found(bytes) => bytes,
+            git::history::HistorySearch::Stopped { .. } => {
+                return Ok(Some(SyncError::Git(format!(
+                    "{host} does not have the content of {path} (LFS object {oid}), and this \
+                     folder's history has not been searched to the end for it yet; the search \
+                     resumes on the next attempt"
+                ))));
+            }
+            git::history::HistorySearch::Absent => {
+                let made_by =
+                    Self::blocking(|| git::history::introduced(&profile.local_path, path))
+                        .ok()
+                        .flatten()
+                        .and_then(|commit| crate::provenance::Provenance::parse(&commit.message))
+                        .map(|provenance| provenance.device_label)
+                        .filter(|device| !device.is_empty());
+                return Ok(Some(SyncError::LfsObjectMissing {
+                    host: host.to_owned(),
+                    oid: oid.to_owned(),
+                    path: Some(path.to_owned()),
+                    made_by,
+                }));
+            }
+        };
+        let now = self.platform.now_ms();
+        let upload = WorkKind::LfsUpload {
+            oid: oid.to_owned(),
+            size,
+        };
+        let owed = self.with_db(|conn| db::owe_repair(conn, &profile.id, &upload, path, now))?;
+        // On disk before the intent is retired (R514, review R102S2-01):
+        // once released, the upload is ordinary, and nothing but
+        // [`Self::restore_before_upload`] would look for these bytes again.
+        store.insert_durable(oid, bytes.as_slice(), size, self.durability.as_ref())?;
+        self.with_db(|conn| db::release_repair(conn, &profile.id, owed, path, size, now))?;
+        tracing::info!(
+            profile = profile.name,
+            oid,
+            path,
+            "the server does not have this large file, but this folder's history does; \
+             restored it from there and queued its upload"
+        );
+        Ok(None)
+    }
+
+    /// The bytes of `oid` this folder's history holds (R503): first under
+    /// `path` and the file a conflict copy at `path` was copied from, then
+    /// anywhere in this copy's object database
+    /// ([`git::history::blob_with_oid_anywhere`]) — a file committed plain
+    /// under an earlier name, then moved and turned into a pointer, is under
+    /// no path the first look knows.
+    ///
+    /// The second look is bounded by `history_search_objects`
+    /// ([`git::history::HISTORY_SEARCH_OBJECTS`]). Where it stops is kept in
+    /// journal row `cursor`'s `heal_after` ([`db::set_heal_cursor`]) and the
+    /// next attempt resumes there; stopping says so at WARN. A search that
+    /// ends — found or not — forgets its place, so a later Retry starts over
+    /// and sees objects a fetch has brought since.
+    fn history_bytes(
+        &self,
+        profile: &SyncProfile,
+        oid: &str,
+        size: u64,
+        path: &str,
+        cursor: Option<i64>,
+    ) -> Result<git::history::HistorySearch> {
+        let mut paths = vec![path.to_owned()];
+        paths.extend(git::conflict::originals_of(path));
+        let at_paths = Self::blocking(|| {
+            git::history::plain_blob_with_oid(&profile.local_path, &paths, oid, size)
+        })?;
+        if let Some(bytes) = at_paths {
+            return Ok(git::history::HistorySearch::Found(bytes));
+        }
+        let after = match cursor {
+            Some(id) => self.with_db(|conn| db::heal_cursor(conn, id))?,
+            None => None,
+        };
+        let bound = self.history_search_objects;
+        let searched = Self::blocking(|| {
+            git::history::blob_with_oid_anywhere(
+                &profile.local_path,
+                oid,
+                size,
+                after.as_deref(),
+                bound,
+            )
+        })?;
+        let keep = match &searched {
+            git::history::HistorySearch::Stopped { after } => {
+                tracing::warn!(
+                    profile = profile.name,
+                    oid,
+                    path,
+                    examined = bound,
+                    "the search of this folder's history for a missing large file stopped at its \
+                     bound; it resumes where it stopped on the next attempt"
+                );
+                Some(after.as_str())
+            }
+            _ => None,
+        };
+        if let Some(id) = cursor {
+            self.with_db(|conn| db::set_heal_cursor(conn, id, keep))?;
+        }
+        Ok(searched)
+    }
+
+    /// Finish every heal whose upload is owed but not yet released (R503):
+    /// a [`db::REPAIRING`] row a death or a failure left between
+    /// [`db::owe_repair`] and [`db::release_repair`], and a repair this
+    /// replay stopped earlier whose retry is due ([`db::repairs`]). Run at
+    /// every drain before anything is claimed, so the first drain after a
+    /// restart is the replay.
+    ///
+    /// The stored bytes are re-verified — size and sha256 — and made durable
+    /// before the row is released ([`Self::replay_repair`]). Best effort: a
+    /// row this cannot finish now is asked again at the next drain.
+    fn replay_repairs(&self, profile: &SyncProfile, now_ms: i64) {
+        let repairs = match self.with_db(|conn| db::repairs(conn, &profile.id, now_ms)) {
+            Ok(repairs) => repairs,
+            Err(err) => {
+                tracing::debug!(profile = profile.name, error = %err, "could not read owed repairs");
+                return;
+            }
+        };
+        if repairs.is_empty() {
+            return;
+        }
+        let store = lfs::store::LfsStore::in_git_dir(profile.local_path.join(".git"));
+        let mut stopped = false;
+        for repair in repairs {
+            match self.replay_repair(profile, &store, &repair, now_ms) {
+                Ok(parked) => stopped |= parked,
+                Err(err) => tracing::warn!(
+                    profile = profile.name,
+                    unit = repair.id,
+                    error = %err,
+                    "could not finish restoring a large file from history; trying again on the \
+                     next pass"
+                ),
+            }
+        }
+        // A stopped repair may be the last upload a held push waited on, and
+        // this drain may claim nothing after it (R514, review R102S2-03).
+        if stopped {
+            self.project_held_push(&profile.id);
+        }
+    }
+
+    /// [`Self::replay_repairs`] for one row. `Ok(true)` when it stopped the
+    /// row, with its sentence, where a person sees it.
+    ///
+    /// What the store holds decides ([`lfs::store::LfsStore::verify`], R514,
+    /// review R102S2-02):
+    ///
+    /// * **The object** — made durable, then released.
+    /// * **Nothing, or bytes proven wrong** (a length or sha256 that is not
+    ///   the object's) — restored from history ([`Self::history_bytes`]),
+    ///   the rename replacing wrong bytes only once the verified replacement
+    ///   exists. If history does not hold them either the row stops, and
+    ///   whatever the store has is left where it is; only a person's Retry
+    ///   asks again.
+    /// * **A file that cannot be read** — kept, untouched: bytes keeper could
+    ///   not read are not bytes proven wrong, and removing them to make room
+    ///   for a replacement destroyed the only copy when history no longer
+    ///   had one. The row stops with the read's own sentence, and is asked
+    ///   again on its own after a backoff, or at a person's Retry.
+    fn replay_repair(
+        &self,
+        profile: &SyncProfile,
+        store: &lfs::store::LfsStore,
+        repair: &db::Repair,
+        now_ms: i64,
+    ) -> Result<bool> {
+        let Ok(WorkKind::LfsUpload { oid, size }) = serde_json::from_str(&repair.payload) else {
+            return Ok(false);
+        };
+        let path = repair.label.clone().unwrap_or_default();
+        match store.verify(&oid, size) {
+            lfs::store::Stored::Verified => store.make_durable(&oid, self.durability.as_ref())?,
+            lfs::store::Stored::Unreadable(unread) => {
+                tracing::warn!(
+                    profile = profile.name,
+                    oid,
+                    path,
+                    error = %unread,
+                    "a large file restored from history cannot be read; it is kept as it is, and \
+                     its upload waits until it can be"
+                );
+                let retry_at = Backoff::default().not_before_ms(
+                    now_ms,
+                    repair.attempts.saturating_add(1),
+                    jitter_sample(),
+                );
+                self.with_db(|conn| db::park_repair(conn, repair.id, retry_at, &unread))?;
+                return Ok(true);
+            }
+            lfs::store::Stored::Absent | lfs::store::Stored::Mismatch => {
+                match self.history_bytes(profile, &oid, size, &path, Some(repair.id))? {
+                    git::history::HistorySearch::Found(bytes) => {
+                        store.insert_durable(
+                            &oid,
+                            bytes.as_slice(),
+                            size,
+                            self.durability.as_ref(),
+                        )?;
+                    }
+                    git::history::HistorySearch::Stopped { .. } => return Ok(false),
+                    git::history::HistorySearch::Absent => {
+                        let gone = SyncError::Integrity {
+                            subject: format!("{path} (LFS object {oid})"),
+                            expected: "the bytes restored from this folder's history".to_owned(),
+                            actual: "neither this folder's store nor its history holds them \
+                                     any more"
+                                .to_owned(),
+                        };
+                        tracing::warn!(profile = profile.name, oid, path, error = %gone, "a restored large file is gone before its upload");
+                        self.with_db(|conn| db::park_repair(conn, repair.id, i64::MAX, &gone))?;
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+        if self
+            .with_db(|conn| db::release_repair(conn, &profile.id, repair.id, &path, size, now_ms))?
+        {
+            tracing::info!(
+                profile = profile.name,
+                oid,
+                path,
+                "finished restoring a large file from history after an interruption; its upload \
+                 is queued"
+            );
+        }
+        Ok(false)
+    }
+
+    /// Rebuild an upload's object from this folder's history when the store
+    /// no longer holds it whole (Story 102.2, R514, review R102S2-01).
+    ///
+    /// A heal publishes its bytes durably before it releases the upload it
+    /// owes, but the store is a directory a person, a sweep or a disk can
+    /// still lose a file from, and once released the upload is ordinary: it
+    /// opened the missing file and stopped, while history still held the
+    /// bytes. Asked before any upload that finds its object absent or of the
+    /// wrong length — never otherwise, so an upload whose object is there
+    /// costs one `stat`. Only a plain blob whose sha256 IS the object counts
+    /// ([`Self::history_bytes`]), published durably over whatever was there.
+    /// History not holding it is not an error here: the server may hold the
+    /// object already, and the transfer says so either way. A bounded search
+    /// that stopped short is retried, as the heal's is.
+    fn restore_before_upload(
+        &self,
+        profile: &SyncProfile,
+        oid: &str,
+        size: u64,
+        label: Option<&str>,
+        unit: Option<i64>,
+    ) -> Result<()> {
+        let store = lfs::store::LfsStore::in_git_dir(profile.local_path.join(".git"));
+        if store.contains(oid, size) {
+            return Ok(());
+        }
+        let Some(path) = label else {
+            return Ok(());
+        };
+        match self.history_bytes(profile, oid, size, path, unit)? {
+            git::history::HistorySearch::Found(bytes) => {
+                store.insert_durable(oid, bytes.as_slice(), size, self.durability.as_ref())?;
+                let now = self.platform.now_ms();
+                let restored = [db::ActivityEntry {
+                    kind: ActivityKind::Restored,
+                    path: path.to_owned(),
+                    size_bytes: Some(size),
+                    unit_id: unit,
+                }];
+                self.with_db(|conn| db::record_activity(conn, &profile.id, now, &restored))?;
+                tracing::info!(
+                    profile = profile.name,
+                    oid,
+                    path,
+                    "a large file waiting to upload was gone from this folder's store; restored \
+                     it from this folder's history"
+                );
+                Ok(())
+            }
+            git::history::HistorySearch::Stopped { .. } => Err(SyncError::Git(format!(
+                "the content of {path} (LFS object {oid}) is gone from this folder's store, and \
+                 its history has not been searched to the end for it yet; the search resumes on \
+                 the next attempt"
+            ))),
+            git::history::HistorySearch::Absent => Ok(()),
         }
     }
 
@@ -12676,11 +13401,20 @@ impl Engine {
             // sharing one object — ordinary for duplicated content — must stay
             // one download. `label_unit` names the covering unit, so the second
             // path finds the first one's name already there and leaves it.
+            //
+            // A stopped row of the same download is cover too (Story 102.2):
+            // this sweep runs on every scan, and a download the server cannot
+            // answer used to be queued again each time — 1 099 stopped rows and
+            // 728 batch 404s for one object on the owner's neuradrive. It runs
+            // again when something re-arms it: a person's Retry, or the
+            // credential's return for a row the credential stopped.
             let label = smudge.path.to_string_lossy().into_owned();
-            self.with_db(|conn| {
-                let id = db::enqueue_unique(conn, &profile.id, &unit, now, now)?;
-                db::label_unit(conn, id, &label)
-            })?;
+            self.with_db(
+                |conn| match db::enqueue_unless_parked(conn, &profile.id, &unit, now)? {
+                    Some(id) => db::label_unit(conn, id, &label),
+                    None => Ok(()),
+                },
+            )?;
         }
         if materialized > 0 {
             tracing::info!(
@@ -17425,9 +18159,36 @@ impl Engine {
         }
         // The unit is claimable again, so the profile is no longer stopped on
         // it — reflect that in the count the tray polls rather than waiting for
-        // the next tick to notice.
+        // the next tick to notice; and a held push's sentence that named it
+        // is withdrawn, or names the next stopped upload (R503).
+        self.project_held_push(profile_id);
         self.refresh_pending(profile_id);
         Ok(())
+    }
+
+    /// Put every stopped unit of this folder back in the queue — "Retry all
+    /// stopped" (Story 102.2, R467).
+    ///
+    /// One journal call ([`db::unpark_all`]) rather than one IPC round trip
+    /// per unit, and identical work folded rather than requeued twice. The
+    /// held push's sentence goes with the stopped uploads it named, and the
+    /// folder is looked at now. Returns how many stopped rows left the list.
+    pub async fn retry_all_parked(&self, profile_id: &str) -> Result<usize> {
+        let now = self.platform.now_ms();
+        let done = self.with_db(|conn| db::unpark_all(conn, profile_id, now))?;
+        // The held push's sentence goes with the stopped uploads it named.
+        self.project_held_push(profile_id);
+        if done.total() > 0 {
+            tracing::info!(
+                profile = profile_id,
+                requeued = done.requeued,
+                folded = done.folded,
+                "retrying every stopped unit of this folder on request"
+            );
+            self.refresh_pending(profile_id);
+            self.wake_now(profile_id);
+        }
+        Ok(done.total())
     }
 
     /// Does the local branch hold commits the remote-tracking ref does not?
@@ -18886,10 +19647,49 @@ mod after_walk {
     }
 }
 
+/// A seam between a unit's delivery and its `complete`, for tests only
+/// (Story 102.2, R514): the after-read, before-complete window a fold into a
+/// running row would race, which no thread can hit deterministically on a
+/// fixture. [`after_walk`]'s shape, keyed on the profile root for the same
+/// reason; production builds carry neither the map nor the call.
+#[cfg(test)]
+mod before_complete {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{LazyLock, Mutex};
+
+    type Hook = Box<dyn FnOnce() + Send>;
+
+    static HOOKS: LazyLock<Mutex<HashMap<PathBuf, Hook>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    /// Run `hook` once, before the next unit of the profile rooted at `root`
+    /// that succeeded is completed.
+    pub(super) fn install(root: &Path, hook: impl FnOnce() + Send + 'static) {
+        HOOKS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(root.to_path_buf(), Box::new(hook));
+    }
+
+    /// Called by the drain; the hook is taken out of the map before it runs.
+    pub(super) fn fire(root: &Path) {
+        let hook = HOOKS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(root);
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(unix)]
     mod commit_paths;
+    #[cfg(unix)]
+    mod stopped_work;
 
     fn history_commit(
         repo: &gix::Repository,

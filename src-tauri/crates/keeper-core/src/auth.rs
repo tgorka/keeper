@@ -33,7 +33,7 @@ use matrix_sdk::Client;
 use ulid::Ulid;
 
 use crate::error::{AuthError, CoreError};
-use crate::oauth::{registration_data, OAuthCallback, OAuthFlowRegistry};
+use crate::oauth::{registration_data, CancelLatch, OAuthCallback, OAuthFlowRegistry};
 use crate::platform::Platform;
 use crate::registry;
 use crate::vm::{AccountVm, Provider};
@@ -147,10 +147,15 @@ impl AuthProvider for PasswordAuthProvider<'_> {
 /// `finish_login()` must use the same live `Client`.
 ///
 /// Holds an `Arc<OAuthFlowRegistry>` so the shell's deep-link handler can route
-/// the incoming callback to this flow by its OAuth `state`.
+/// the incoming callback to this flow by its OAuth `state`, and the
+/// [`CancelLatch`] the sign-in took when it started, so a Cancel pressed while
+/// the server is still discovered — before the flow is in the registry — ends
+/// it before any browser opens (story 102.9, R500).
 pub struct OidcAuthProvider {
     /// The shared in-flight callback registry (register/resolve/cancel).
     pub flows: Arc<OAuthFlowRegistry>,
+    /// Taken from `flows` when the sign-in started.
+    pub cancel: CancelLatch,
 }
 
 impl AuthProvider for OidcAuthProvider {
@@ -160,34 +165,47 @@ impl AuthProvider for OidcAuthProvider {
         platform: &dyn Platform,
     ) -> Result<(), CoreError> {
         let oauth = client.oauth();
+        let cancelled = || CoreError::Auth(AuthError::OAuthCancelled);
+        if self.cancel.is_cancelled() {
+            return Err(cancelled());
+        }
 
-        // Discover the authorization server; a not-supported response means this
-        // homeserver does not offer OIDC (before any browser work).
-        oauth.server_metadata().await.map_err(|e| {
-            if e.is_not_supported() {
-                CoreError::Auth(AuthError::OAuthUnsupported)
-            } else {
-                CoreError::Auth(AuthError::ServerUnreachable(e.to_string()))
-            }
-        })?;
+        // Discovery and dynamic registration are network work before the flow
+        // has a registry entry; a Cancel meanwhile ends them here (R500).
+        let prepared = async {
+            // Discover the authorization server; a not-supported response means
+            // this homeserver does not offer OIDC (before any browser work).
+            oauth.server_metadata().await.map_err(|e| {
+                if e.is_not_supported() {
+                    CoreError::Auth(AuthError::OAuthUnsupported)
+                } else {
+                    CoreError::Auth(AuthError::ServerUnreachable(e.to_string()))
+                }
+            })?;
 
-        // Build the authorization URL (registers the client dynamically and
-        // stashes PKCE/state in the in-memory oauth handle).
-        let data = oauth
-            .login(
-                crate::oauth::redirect_uri()?,
-                None,
-                Some(registration_data()?),
-                None,
-            )
-            .build()
-            .await
-            .map_err(|e| CoreError::Auth(AuthError::OAuthFailed(e.to_string())))?;
+            // Build the authorization URL (registers the client dynamically and
+            // stashes PKCE/state in the in-memory oauth handle).
+            oauth
+                .login(
+                    crate::oauth::redirect_uri()?,
+                    None,
+                    Some(registration_data()?),
+                    None,
+                )
+                .build()
+                .await
+                .map_err(|e| CoreError::Auth(AuthError::OAuthFailed(e.to_string())))
+        };
+        let data = tokio::select! {
+            biased;
+            () = self.cancel.cancelled() => return Err(cancelled()),
+            data = prepared => data?,
+        };
 
         // Register the pending flow BEFORE opening the browser so a fast
         // callback can never race ahead of the receiver.
         let state = data.state.secret().clone();
-        let rx = self.flows.register(state.clone());
+        let (rx, mut unshown) = self.flows.register_with_link(state.clone());
         // Guarantee the registry entry (and its `state` secret) is removed on
         // EVERY exit path below — timeout, cancel, browser-open failure,
         // finish_login error, or success. `resolve` only removes the entry on a
@@ -196,11 +214,25 @@ impl AuthProvider for OidcAuthProvider {
             flows: self.flows.as_ref(),
             state: &state,
         };
-        platform.open_url(data.url.as_str())?;
+        // A cancel that came before the entry existed drained nothing: it is
+        // seen here, and no browser opens for a cancelled sign-in. One after
+        // registration is drained into `rx` as `Cancelled`.
+        if self.cancel.is_cancelled() {
+            return Err(cancelled());
+        }
+        // The link goes to the person first, then to the browser; a browser
+        // or sign-in sheet that did not open — at once or later — leaves it
+        // on screen and the flow keeps waiting for the callback the pasted
+        // link brings (R470, R480).
+        let url = data.url.as_str();
+        let shown = crate::sign_in_link::offer(platform, url, || platform.open_url(url));
 
         // Await the callback, but never hang: a ~5-minute timeout abandons the
         // flow (add_account then rolls back, leaving zero residue).
-        let outcome = match tokio::time::timeout(OAUTH_TIMEOUT, rx).await {
+        let waited = tokio::time::timeout(OAUTH_TIMEOUT, shown.wait(&mut unshown, rx)).await;
+        // Whatever came back, the link is spent: its `state` left the registry.
+        drop(shown);
+        let outcome = match waited {
             Err(_) => return Err(CoreError::Auth(AuthError::OAuthTimedOut)),
             // The sender was dropped (registry cleared without a callback) —
             // treat as cancelled.
@@ -557,13 +589,16 @@ pub async fn login_password(
 /// store-less SSS gate → persistent store → authenticate → Keychain → registry
 /// path (with rollback on any failure) as a password account. The whole browser
 /// round-trip runs inside `authenticate`; `flows` routes the deep-link callback
-/// back to it, and `cancel_all` on the same registry aborts a pending flow.
+/// back to it, and `cancel_all` on the same registry aborts a pending flow —
+/// any time after `cancel` was taken from it, server discovery included: a
+/// cancelled sign-in opens no browser and rolls back (story 102.9, R500).
 pub async fn login_oidc(
     platform: &dyn Platform,
     homeserver: &str,
     flows: Arc<OAuthFlowRegistry>,
+    cancel: CancelLatch,
 ) -> Result<AccountVm, CoreError> {
-    let provider = OidcAuthProvider { flows };
+    let provider = OidcAuthProvider { flows, cancel };
     add_account(platform, homeserver, &provider).await
 }
 
@@ -1174,6 +1209,8 @@ mod tests {
     struct FakePlatform {
         data_dir: PathBuf,
         keychain: Mutex<std::collections::HashMap<String, String>>,
+        /// Every page a browser was asked to open.
+        opened: Mutex<Vec<String>>,
     }
 
     impl FakePlatform {
@@ -1181,6 +1218,7 @@ mod tests {
             Self {
                 data_dir,
                 keychain: Mutex::new(std::collections::HashMap::new()),
+                opened: Mutex::new(Vec::new()),
             }
         }
     }
@@ -1208,7 +1246,11 @@ mod tests {
             self.keychain.lock().expect("lock poisoned").remove(key);
             Ok(())
         }
-        fn open_url(&self, _url: &str) -> Result<(), CoreError> {
+        fn open_url(&self, url: &str) -> Result<(), CoreError> {
+            self.opened
+                .lock()
+                .expect("lock poisoned")
+                .push(url.to_owned());
             Ok(())
         }
         fn notify(
@@ -1484,8 +1526,10 @@ mod tests {
             password: "p",
         };
         assert_eq!(password.provider(), Provider::Password);
+        let flows = Arc::new(OAuthFlowRegistry::default());
         let oidc = OidcAuthProvider {
-            flows: Arc::new(OAuthFlowRegistry::default()),
+            cancel: flows.cancel_latch(),
+            flows,
         };
         assert_eq!(oidc.provider(), Provider::Oidc);
         let beeper = beeper::BeeperAuthProvider {
@@ -1665,6 +1709,207 @@ mod tests {
         // Posture-off account: no passphrase entry was ever written. Cleanup must
         // still succeed (the delete tolerates a missing entry).
         sign_out_cleanup(&platform, id).expect("cleanup without passphrase should succeed");
+        let _ = std::fs::remove_dir_all(&platform.data_dir);
+    }
+
+    /// A homeserver on loopback that offers OIDC, whose authorization-server
+    /// discovery is held until the test drops `release`.
+    struct HeldDiscovery {
+        url: String,
+        /// Fires when the discovery request arrived (and is being held).
+        asked: tokio::sync::oneshot::Receiver<()>,
+        release: std::sync::mpsc::Sender<()>,
+    }
+
+    fn held_discovery() -> HeldDiscovery {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind the homeserver");
+        let url = format!("http://{}", listener.local_addr().expect("addr"));
+        let (asked_tx, asked) = tokio::sync::oneshot::channel();
+        let asked_tx = Arc::new(Mutex::new(Some(asked_tx)));
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let released = Arc::new(Mutex::new(released));
+        let base = url.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { continue };
+                let (base, asked_tx, released) =
+                    (base.clone(), Arc::clone(&asked_tx), Arc::clone(&released));
+                std::thread::spawn(move || serve_homeserver(stream, &base, &asked_tx, &released));
+            }
+        });
+        HeldDiscovery {
+            url,
+            asked,
+            release,
+        }
+    }
+
+    fn serve_homeserver(
+        mut stream: std::net::TcpStream,
+        base: &str,
+        asked: &Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        released: &Mutex<std::sync::mpsc::Receiver<()>>,
+    ) {
+        use std::io::{Read, Write};
+
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let head_end = loop {
+            let Ok(n) = stream.read(&mut chunk) else {
+                return;
+            };
+            if n == 0 {
+                return;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            if let Some(at) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                break at + 4;
+            }
+        };
+        let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
+        let length = head
+            .lines()
+            .find_map(|l| {
+                let (name, value) = l.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())?
+            })
+            .unwrap_or(0);
+        while buf.len() < head_end + length {
+            match stream.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            }
+        }
+        let mut first = head.lines().next().unwrap_or_default().split(' ');
+        let method = first.next().unwrap_or_default();
+        let path = first.next().unwrap_or_default();
+        let (status, body) = if path.starts_with("/_matrix/client/versions") {
+            (
+                "200 OK",
+                serde_json::json!({
+                    "versions": ["v1.11", "v1.15"],
+                    "unstable_features": { "org.matrix.simplified_msc3575": true },
+                }),
+            )
+        } else if path.contains("auth_metadata") {
+            if let Some(tx) = asked.lock().expect("asked").take() {
+                let _ = tx.send(());
+            }
+            // Held until the test drops its sender; every later ask answers at once.
+            let _ = released.lock().expect("released").recv();
+            (
+                "200 OK",
+                serde_json::json!({
+                    "issuer": format!("{base}/"),
+                    "authorization_endpoint": format!("{base}/authorize"),
+                    "token_endpoint": format!("{base}/token"),
+                    "registration_endpoint": format!("{base}/register"),
+                    "revocation_endpoint": format!("{base}/revoke"),
+                    "response_types_supported": ["code"],
+                    "response_modes_supported": ["query", "fragment"],
+                    "grant_types_supported": ["authorization_code", "refresh_token"],
+                    "code_challenge_methods_supported": ["S256"],
+                }),
+            )
+        } else if method == "POST" && path == "/register" {
+            (
+                "200 OK",
+                serde_json::json!({ "client_id": "keeper-restore-test" }),
+            )
+        } else {
+            (
+                "404 Not Found",
+                serde_json::json!({ "errcode": "M_UNRECOGNIZED", "error": "Unrecognized request" }),
+            )
+        };
+        let body = body.to_string();
+        let _ = write!(
+            stream,
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{body}",
+            body.len()
+        );
+    }
+
+    /// R500 (R102D2-02), through the restore's own start path: the attempt
+    /// begins (taking its hold on Cancel), its sign-in runs `login_oidc`
+    /// against a homeserver whose authorization-server discovery is held, and
+    /// Cancel — `cancel_oidc`'s `cancel_all` — lands while it is held, before
+    /// any flow is registered. Once discovery answers, no browser has opened,
+    /// the restore line ends cancelled, and the account rolled back.
+    #[tokio::test]
+    async fn a_restore_cancelled_while_its_server_is_discovered_never_opens_a_browser() {
+        use crate::org_account::state::{RestoreFacts, RestoreFactsAccess, RestoreSignInEnd};
+        use crate::sign_in_link::{ShowsSignInLink, SignInLinkVm};
+
+        let HeldDiscovery {
+            url,
+            asked,
+            release,
+        } = held_discovery();
+        let platform = FakePlatform::new(temp_dir("restore-cancel"));
+        let flows = Arc::new(OAuthFlowRegistry::new());
+        let facts = Arc::new(Mutex::new(RestoreFacts::default()));
+        let access: RestoreFactsAccess = {
+            let facts = Arc::clone(&facts);
+            Arc::new(move |change: &mut dyn FnMut(&mut RestoreFacts)| {
+                change(&mut facts.lock().expect("facts"));
+            })
+        };
+
+        let attempt = facts
+            .lock()
+            .expect("facts")
+            .begin_matrix_sign_in(&url, &flows);
+        let cancel = attempt.cancel();
+        let run = attempt.run(Arc::clone(&access), |links| {
+            let (platform, url, flows) = (&platform, url.clone(), Arc::clone(&flows));
+            async move {
+                let shows = ShowsSignInLink::new(
+                    platform,
+                    move |flow: u64, link: Option<&SignInLinkVm>| links.show(flow, link),
+                );
+                login_oidc(&shows, &url, flows, cancel).await.map(drop)
+            }
+        });
+        let press_cancel = async {
+            asked.await.expect("discovery was asked");
+            flows.cancel_all();
+            drop(release);
+        };
+        let (settled, ()) = tokio::join!(
+            tokio::time::timeout(Duration::from_secs(20), run),
+            press_cancel
+        );
+
+        assert_eq!(
+            *platform.opened.lock().expect("opened"),
+            Vec::<String>::new(),
+            "no browser opens for a cancelled restore"
+        );
+        assert!(
+            settled.is_ok(),
+            "the restore settles once discovery answers"
+        );
+        let ended = facts
+            .lock()
+            .expect("facts")
+            .matrix_sign_in
+            .as_ref()
+            .and_then(|sign_in| sign_in.ended.clone());
+        assert_eq!(ended, Some(RestoreSignInEnd::Cancelled));
+        let stores_left = std::fs::read_dir(platform.data_dir.join("accounts"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|account| account.path().join("sdk").exists())
+            .count();
+        assert_eq!(
+            stores_left, 0,
+            "the cancelled account's store is rolled back"
+        );
+        assert!(platform.keychain.lock().expect("keychain").is_empty());
         let _ = std::fs::remove_dir_all(&platform.data_dir);
     }
 }

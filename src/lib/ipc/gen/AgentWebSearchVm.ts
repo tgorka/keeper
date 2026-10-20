@@ -23,4 +23,10 @@ unavailable: string | null,
  * The standing warning beside *without asking* ([`unasked_warning`]),
  * while that is the agent's level; `None` at every other.
  */
-warning: string | null, };
+warning: string | null, 
+/**
+ * What the hosts serving the agent make of its level ([`hosts_note`],
+ * story 102.3): set beside the rows from the serving hosts' manifests;
+ * `None` while it asks for none or every serving host searches.
+ */
+host: string | null, };

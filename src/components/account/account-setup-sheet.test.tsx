@@ -304,6 +304,39 @@ describe("AccountSetupSheet", () => {
     expect(accountCancelSignIn).toHaveBeenCalledTimes(1);
   });
 
+  it("offers the sign-in's link while it waits in the browser and drops it once it moves on", async () => {
+    // 102.9 #1, R470: the browser may not come forward; the link is the way in.
+    const url = "https://id.acme.dev/authorize?client_id=keeper&state=s1&code_challenge=c";
+    mockResolve.mockResolvedValue(setupVm());
+    mockConfirm.mockReturnValue(new Promise<OrgAccountVm>(() => {}));
+    open();
+    fireEvent.click(await screen.findByRole("button", { name: SETUP_CONTINUE_LABEL }));
+    act(() =>
+      accountStore.getState().setVm(
+        accountVm({
+          state: "signingIn",
+          identity: null,
+          sentence: "Finish signing in to Acme in the browser.",
+          signInLink: {
+            url,
+            notOpened:
+              "keeper could not open your browser. Copy this link into a browser to finish signing in.",
+          },
+        }),
+      ),
+    );
+    expect(screen.getByText(url)).toBeInTheDocument();
+    expect(screen.getByRole("alert")).toHaveTextContent("keeper could not open your browser.");
+    expect(screen.getByRole("button", { name: "Copy link" })).toBeInTheDocument();
+
+    act(() =>
+      accountStore
+        .getState()
+        .setVm(accountVm({ state: "syncing", sentence: "Syncing your settings…" })),
+    );
+    expect(screen.queryByText(url)).not.toBeInTheDocument();
+  });
+
   it("says which account Continue replaces, and only when it replaces one", async () => {
     mockResolve.mockResolvedValue(setupVm({ replaces: "Old Corp" }));
     const { unmount } = render(<AccountSetupSheet />);

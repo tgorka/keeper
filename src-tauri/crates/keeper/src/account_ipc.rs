@@ -133,6 +133,10 @@ struct Inner {
     /// `listening_off` is computed once per sync and cleared the moment the
     /// person writes the wake switch, never read from the database here.
     restore: RestoreFacts,
+    /// The authorization page of the account's sign-in in progress (102.9,
+    /// R470): set when that sign-in shows it, emptied when it ends however it
+    /// ends (R480/03).
+    sign_in_link: keeper_core::sign_in_link::SignInLinkSlot,
 }
 
 #[derive(Default)]
@@ -762,6 +766,7 @@ fn facts(inner: &Inner) -> AccountFacts {
             .is_some_and(|d| matches!(d.config.auth, RepoAuthConfig::Oauth(_))),
         offers: inner.offers.clone(),
         restore: inner.restore.clone(),
+        sign_in_link: inner.sign_in_link.link().cloned(),
     }
 }
 
@@ -847,6 +852,36 @@ enum Found {
     Missing,
     Mine,
     NotMine,
+}
+
+/// Install the one account-layer transition (R488 × R496): every install or
+/// clear of the account's layers — a pull that changed the account's
+/// `keeper.toml`, sign-out, forget, a refused sign-in — re-reads consent and
+/// then tells the webview when the default agent moved, since no settings row
+/// moves when the account's files set `agents.default`. Whether it moved is
+/// core's answer (`launch::layers_observer`). Before anything installs a
+/// layer, so no transition is missed; before the app is up (launch's `boot`)
+/// nothing listens, so no default is compared.
+pub fn watch_layers(app: &tauri::App) {
+    use tauri::Manager;
+
+    let (consent, moved) = (app.handle().clone(), app.handle().clone());
+    keeper_core::config::set_account_layers_observer(keeper_core::agents::launch::layers_observer(
+        move || {
+            crate::telemetry_ipc::consent_changed(&consent, "an account settings file changed");
+        },
+        || {
+            let app = RUNTIME.app.get()?;
+            match app.state::<AppState>().platform.data_dir() {
+                Ok(data_dir) => Some(data_dir),
+                Err(error) => {
+                    tracing::warn!(%error, "account: no data directory, so a default agent the account's files set is not followed");
+                    None
+                }
+            }
+        },
+        move || crate::agents_ipc::default_agent_applied(&moved),
+    ));
 }
 
 /// Resolve the person's directory in the clone and install or clear the
@@ -1327,8 +1362,21 @@ async fn converge(
     };
     update(|inner| inner.last_attempt_ms = Some(now_ms()));
     let oauth = matches!(d.config.auth, RepoAuthConfig::Oauth(_));
+    // Each sign-in's authorization page reaches the account's view model, so
+    // the setup sheet and Settings › Account can offer it to copy (R470); it
+    // leaves the view model when that sign-in ends, a dropped one included.
+    let shows = keeper_core::sign_in_link::ShowsSignInLink::new(
+        platform.as_ref(),
+        |flow: u64, link: Option<&keeper_core::sign_in_link::SignInLinkVm>| {
+            update(|inner| inner.sign_in_link.apply(flow, link));
+        },
+    );
 
     // 1. Who is signing in. A background sync never opens a browser.
+    //
+    // `restored`: a person signed in, or reconnected the forge, in this
+    // attempt — the account's credential is back (Story 102.2, R503).
+    let mut restored = false;
     let (known, grant_dead) = {
         let inner = lock(&RUNTIME.inner);
         (inner.identity.clone(), inner.grant_dead)
@@ -1348,11 +1396,12 @@ async fn converge(
                 .step(
                     AccountStep::SignIn,
                     &d.id,
-                    oidc::sign_in(platform.as_ref(), &flows, http, &d),
+                    oidc::sign_in(&shows, &flows, http, &d),
                 )
                 .await
             {
                 Ok(identity) => {
+                    restored = true;
                     // Someone else signed in on this device: nothing of the
                     // previous person's — layers, forge connection, device
                     // registration, sync time — carries over.
@@ -1439,14 +1488,7 @@ async fn converge(
             .step(
                 AccountStep::ForgeConnect,
                 &d.id,
-                oidc::forge_connect(
-                    platform.as_ref(),
-                    &flows,
-                    http,
-                    &d,
-                    &identity.login,
-                    &device,
-                ),
+                oidc::forge_connect(&shows, &flows, http, &d, &identity.login, &device),
             )
             .await
         {
@@ -1457,6 +1499,14 @@ async fn converge(
             return ended.attempt;
         }
         update(|inner| inner.forge_connected = true);
+        restored = true;
+    }
+    // The drives on this account may run what its absence stopped — and
+    // only on a sign-in or a reconnect, never because a credential was
+    // merely produced (R503): producing one proves nothing the server has
+    // accepted.
+    if restored {
+        rearm_drives_after_credential(&platform, registry::ACCOUNT_CREDENTIAL_SOURCE);
     }
 
     // 3. The repository credential.
@@ -2364,6 +2414,20 @@ async fn sync_settings(
             tracing::warn!(%error, "account: the settings base was not recorded");
         }
     }
+    // The account's shared settings are reconciled here now: what that
+    // established about each consent key decides whether an earlier
+    // installation's "on" is adopted — only where the reconciled file has
+    // no value and nothing about the key failed or was overtaken, never
+    // over a value it has (R495 07, R511).
+    if let Some(shared) = planned.shared.as_ref() {
+        let known = keeper_core::telemetry::AccountConsentKnown::from_sync(
+            &shared.merged.file,
+            &|key: &str| unapplied.failed.contains(key) || unapplied.moved.contains(key),
+        );
+        if let Some(app) = RUNTIME.app.get() {
+            crate::telemetry_ipc::account_settled(app, known);
+        }
+    }
 
     // A manifest whose state is in the repository now takes this device's
     // list as its base; otherwise the old base stands, and this device's
@@ -2604,7 +2668,16 @@ fn window_focused(app: &AppHandle) -> bool {
 /// it waits for the next focused sync. The sheet carries the account's
 /// identity-provider session, so it is one tap (AD-331). Password and Beeper
 /// accounts stay offers; nothing is signed in without a sign-in.
+///
+/// The sign-in has its own line under Settings › Account (102.9, R480/02):
+/// "finish signing in" with its authorization page to copy and Cancel
+/// (`cancel_oidc`, the Matrix registry's) while it waits, then how it ended.
+/// It is not the account's own sign-in, so `phase` never says it. Which
+/// attempt owns that line, and Cancel's reach before the flow is registered,
+/// are `RestoreSignInAttempt`'s (R500).
 fn start_matrix_sign_in(data_dir: &Path, account_id: &str, waiting: &[MatrixState]) {
+    use tauri::Manager;
+
     let Some(homeserver) = waiting
         .iter()
         .find(|m| m.kind == "oidc" && !m.homeserver_url.trim().is_empty())
@@ -2630,13 +2703,42 @@ fn start_matrix_sign_in(data_dir: &Path, account_id: &str, waiting: &[MatrixStat
         tracing::warn!(%error, "account: the Matrix sign-in was not started");
         return;
     }
+    // The attempt — and its hold on Cancel — exists before the row offers
+    // Cancel and before anything is spawned; only it may write that row
+    // (R500). The decisions are `keeper_core::org_account::state`'s.
+    let mut attempt = None;
+    update(|inner| {
+        attempt = Some(
+            inner
+                .restore
+                .begin_matrix_sign_in(&homeserver, &app.state::<AppState>().oauth_flows),
+        );
+    });
+    let Some(attempt) = attempt else {
+        return;
+    };
+    let restore: keeper_core::org_account::state::RestoreFactsAccess =
+        std::sync::Arc::new(|change: &mut dyn FnMut(&mut RestoreFacts)| {
+            update(|inner| change(&mut inner.restore));
+        });
     tauri::async_runtime::spawn(async move {
-        use tauri::Manager;
-
         let state = app.state::<AppState>();
-        if let Err(error) = crate::ipc::sign_in_oidc(state.inner(), &homeserver).await {
-            tracing::info!(reason = %error.message, "account: the restored Matrix sign-in did not finish");
-        }
+        let state: &AppState = state.inner();
+        let cancel = attempt.cancel();
+        attempt
+            .run(restore, |links| async move {
+                crate::ipc::sign_in_oidc(
+                    state,
+                    &homeserver,
+                    move |flow: u64, link: Option<&keeper_core::sign_in_link::SignInLinkVm>| {
+                        links.show(flow, link);
+                    },
+                    cancel,
+                )
+                .await
+                .map(drop)
+            })
+            .await;
     });
 }
 
@@ -3164,7 +3266,18 @@ fn credential_profile(key: &str) -> Option<&str> {
 ///
 /// `secret_get` is synchronous and is called from the sync engine's async
 /// path, so a refresh must not park a runtime worker (see [`off_worker`]).
-pub fn drive_credential(platform: &Arc<dyn Platform>, key: &str) -> Option<Result<String, String>> {
+///
+/// The failure is typed where it is known (Story 102.2, R467): a credential
+/// that could not be produced — the account signed out, its forge
+/// connection gone, the drive's remote not known yet — is
+/// [`SyncError::Credential`], whose stopped units the credential's return
+/// re-arms; a drive whose setting no longer fits (a source keeper lost, a
+/// remote off the account's hosts) stays [`SyncError::Config`], which a
+/// sign-in does not change.
+pub fn drive_credential(
+    platform: &Arc<dyn Platform>,
+    key: &str,
+) -> Option<Result<String, SyncError>> {
     let profile = credential_profile(key)?;
     let d = descriptor();
     // No account and no repository source, no change: the drive's own
@@ -3185,16 +3298,16 @@ pub fn drive_credential(platform: &Arc<dyn Platform>, key: &str) -> Option<Resul
     // hosts: GitHub and every other stranger would be handed the person's
     // sign-in (the hesperia report, 2026-09-24), and would refuse it anyway.
     let Some(remote) = drive_remote(profile) else {
-        return Some(Err(
+        return Some(Err(SyncError::Credential(
             "keeper does not know this drive's remote yet; it will try again".to_owned(),
-        ));
+        )));
     };
     if !d.serves_remote(&remote) {
-        return Some(Err(format!(
+        return Some(Err(SyncError::Config(format!(
             "this drive's repository is not on {}'s hosts, so it cannot sign in with that \
              account; choose its credential again",
             d.name
-        )));
+        ))));
     }
     let forge = matches!(d.config.auth, RepoAuthConfig::Oauth(_))
         && on_forge(&remote, d.forge_host().as_deref(), &d.repo_host());
@@ -3211,8 +3324,12 @@ pub fn drive_credential(platform: &Arc<dyn Platform>, key: &str) -> Option<Resul
     };
     Some(match off_worker(refresh) {
         Some(Ok(token)) => Ok(token),
-        Some(Err(error)) => Err(format!("the account credential is unavailable: {error}")),
-        None => Err("the account credential could not be read".to_owned()),
+        Some(Err(error)) => Err(SyncError::Credential(format!(
+            "the account credential is unavailable: {error}"
+        ))),
+        None => Err(SyncError::Credential(
+            "the account credential could not be read".to_owned(),
+        )),
     })
 }
 
@@ -3225,15 +3342,17 @@ fn forge_drive_credential(
     profile: &str,
     source_id: &str,
     d: Option<AccountDescriptor>,
-) -> Result<String, String> {
+) -> Result<String, SyncError> {
     let sources = forges::sources(d.as_ref(), forges::BUILTIN_GITHUB_CLIENT_ID);
     let Some(source) = forges::find(&sources, source_id).cloned() else {
-        return Err(format!(
+        return Err(SyncError::Config(format!(
             "this drive signs in with \"{source_id}\", which keeper no longer has; choose its credential again"
-        ));
+        )));
     };
     let Some(remote) = drive_remote(profile) else {
-        return Err("keeper does not know this drive's remote yet; it will try again".to_owned());
+        return Err(SyncError::Credential(
+            "keeper does not know this drive's remote yet; it will try again".to_owned(),
+        ));
     };
     let platform = Arc::clone(platform);
     let name = source.name.clone();
@@ -3245,8 +3364,12 @@ fn forge_drive_credential(
     };
     match off_worker(refresh) {
         Some(Ok(token)) => Ok(token),
-        Some(Err(error)) => Err(format!("the {name} credential is unavailable: {error}")),
-        None => Err(format!("the {name} credential could not be read")),
+        Some(Err(error)) => Err(SyncError::Credential(format!(
+            "the {name} credential is unavailable: {error}"
+        ))),
+        None => Err(SyncError::Credential(format!(
+            "the {name} credential could not be read"
+        ))),
     }
 }
 
@@ -3336,6 +3459,43 @@ fn drive_remote(profile: &str) -> Option<String> {
         }
     });
     None
+}
+
+/// Credential source `recovered` is back — the account after a sign-in or a
+/// forge reconnect, a repository source after its Connect (Story 102.2,
+/// R467, R503): re-arm the work it stopped on the drives that use it, off
+/// this thread and only on an engine that is already open — a sign-in
+/// builds no sync engine.
+///
+/// A call site and nothing more: which drives use `recovered` is
+/// `registry::uses_sync_credential_source`'s answer, and what is re-armed
+/// is the engine's.
+///
+/// Before this, a sign-in moved nothing: the owner's tgdrive held its push
+/// two days behind an upload the dead credential had stopped, while he had
+/// signed in again and every pull worked.
+pub(crate) fn rearm_drives_after_credential(platform: &Arc<dyn Platform>, recovered: &str) {
+    let Ok(data_dir) = platform.data_dir() else {
+        return;
+    };
+    let account = descriptor().map(|d| d.id);
+    let recovered = recovered.to_owned();
+    std::thread::spawn(move || {
+        let Some(engine) = crate::sync::engine_if_open() else {
+            return;
+        };
+        let uses = |profile: &str| {
+            registry::uses_sync_credential_source(
+                &data_dir,
+                profile,
+                account.as_deref(),
+                &recovered,
+            )
+        };
+        if let Err(error) = engine.rearm_after_credential(&uses) {
+            tracing::warn!(%error, "account: the work the credential stopped could not be queued again");
+        }
+    });
 }
 
 /// The host a git remote names: a URL's host, or the host of scp-style

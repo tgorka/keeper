@@ -98,8 +98,9 @@ use crate::grants::{AgentGrants, GrantSource};
 use crate::helper::{HelperRun, Step};
 use crate::host::{AgentDrive, Approval, Classified, HostIds, UNATTENDED_REFUSAL};
 use crate::matrix_sink::{
-    anchor_content, cut, cut_to_log, deliver, deliver_gated, deliver_unless_narrowed,
-    notice_content, status_content, EditPort, MatrixSink, SendFuture, StatusBoard, ToolProgress,
+    anchor_content, cut, cut_to_log, deliver, deliver_fenced, deliver_gated,
+    deliver_unless_narrowed, notice_about, notice_content, status_content, EditPort, MatrixSink,
+    SendFuture, StatusBoard, ToolProgress,
 };
 use crate::ports::ProfileSource;
 use crate::rooms::{self, Arrival, BriefEvent, Disposition, Served};
@@ -122,6 +123,11 @@ pub const LOCAL_ONLY_REFUSAL: &str = "This conversation has read something that 
 /// reason itself is in the session's log.
 pub const TURN_FAILED: &str =
     "I could not finish this answer. The reason is in this session's log.";
+
+/// What the room is told when the agent's host could not decrypt the
+/// person's message: it never became a turn (story 102.4 #3, R381).
+pub const UNDECRYPTED: &str =
+    "This agent's host could not decrypt your message, so the agent did not get it. Send it again.";
 
 /// The `finish` of an `assistant` line written for a round that called
 /// tools: the turn goes on after it, so it answers nothing yet.
@@ -2594,22 +2600,31 @@ pub(crate) fn run_folders(
 /// is not, and how many of its folders in the agent's own drives this host
 /// does not give its commands. A file that does not read now says the
 /// console the host loaded; the turn it would start is refused anyway.
+/// Beside it, whether the home asks for web search this host has no engine
+/// for (story 102.3, R483), so every device's header can say it.
 pub(crate) fn host_console(deps: &AgentDeps) -> keeper_core::agents::events::StatusConsole {
     use keeper_core::agents::console::RunMode;
+    let home = &deps.home;
+    let read = crate::zone::read_home(&home.zone, &home.config.id, &home.drive).ok();
+    let config = read.as_ref().map_or(&home.config, |read| &read.config);
+    let no_engine = searches_without_an_engine(deps, config);
     if deps.full_access_turns.any() {
         return keeper_core::agents::events::StatusConsole {
             mode: RunMode::Full,
             refused: 0,
+            no_sandbox: false,
+            no_engine,
         };
     }
-    let home = &deps.home;
-    let run = crate::zone::read_home(&home.zone, &home.config.id, &home.drive)
-        .map(|read| read.config.run)
-        .unwrap_or_else(|_| home.config.run.clone());
+    let run = &config.run;
     if deps.sandbox.is_none() || !run.mode.offers_run() {
+        // Off by failure, not by choice, when the home asks for a console
+        // this host's sandbox cannot give (story 102.3).
         return keeper_core::agents::events::StatusConsole {
             mode: RunMode::Off,
             refused: 0,
+            no_sandbox: run.mode.offers_run(),
+            no_engine,
         };
     }
     let drives: Vec<(String, PathBuf)> = deps
@@ -2622,14 +2637,27 @@ pub(crate) fn host_console(deps: &AgentDeps) -> keeper_core::agents::events::Sta
         .filter(|profile| home.config.drives.contains(&profile.id))
         .map(|profile| (profile.id, profile.local_path))
         .collect();
-    let refused = landed_folders(&run, &drives, deps)
+    let refused = landed_folders(run, &drives, deps)
         .iter()
         .filter(|(_, landed)| landed.is_err())
         .count();
     keeper_core::agents::events::StatusConsole {
         mode: run.mode,
         refused: u32::try_from(refused).unwrap_or(u32::MAX),
+        no_sandbox: false,
+        no_engine,
     }
+}
+
+/// Whether `config` asks for web search — offered to its kind at all — on
+/// a host (`deps`) that names no search engine, so it is offered none
+/// (story 102.3, R483).
+fn searches_without_an_engine(
+    deps: &AgentDeps,
+    config: &keeper_core::agents::home::AgentConfig,
+) -> bool {
+    use keeper_core::agents::web_search;
+    deps.web_search.is_none() && web_search::is_on(config) && web_search::never(config).is_none()
 }
 
 /// The folders a run call asks for beyond its console's (R440 08): each of
@@ -4892,6 +4920,12 @@ pub struct ServedSession {
     /// A gate session's desk (99.1): opened by the runtime with the
     /// homeserver's clock, or by the first request served.
     pub gate_desk: Option<Arc<crate::gate::Desk>>,
+    /// The person's messages this host could not decrypt that a host's
+    /// notice already answered — seeded from the room's read-back, grown by
+    /// each notice sent — so each is said once, however often it arrives:
+    /// from the read-back and again live (R489/04). Not "served": its
+    /// decrypted form is still a turn.
+    undecrypted_said: std::collections::BTreeSet<OwnedEventId>,
 }
 
 /// What a session's worker tells its host while it holds the claim.
@@ -5367,6 +5401,9 @@ pub enum Outcome {
     /// Where the person stopped listening to an answer: a `heard` line,
     /// at the offset counted here.
     Heard { heard_until: u64 },
+    /// The person's message could not be decrypted: a notice asked them to
+    /// send it again; nothing logged (story 102.4 #3).
+    Undecrypted,
     /// A gate's request, served: where it stands now (99.1).
     Gated {
         request: String,
@@ -5555,7 +5592,15 @@ impl ServedSession {
             scheduled_card: None,
             refusing: std::collections::BTreeSet::new(),
             gate_desk: None,
+            undecrypted_said: std::collections::BTreeSet::new(),
         })
+    }
+
+    /// The person's messages `events` a host's notice already answered
+    /// that this host could not decrypt: each is never said again here
+    /// (R489/04). The runtime seeds this from the room's read-back.
+    pub fn undecrypted_answered(&mut self, events: impl IntoIterator<Item = OwnedEventId>) {
+        self.undecrypted_said.extend(events);
     }
 
     /// After a restart: a turn whose `user` line has no answer is not run
@@ -6288,6 +6333,27 @@ impl ServedSession {
             // A gate never waits for a person (codemap Q4): its outside
             // system's request is taken whatever else is under way.
             Disposition::GateRequest => self.gate_request(deps, port, arrived, stop).await,
+            // The person's message this host could not decrypt is never a
+            // turn — its words are unknown — and never left unsaid (story
+            // 102.4 #3, R381): a notice replying to it asks them to send it
+            // again, whatever the session waits for — once, whether it
+            // arrives from the read-back, live, or both (R489/04), and only
+            // while this host holds the session's claim.
+            Disposition::Undecrypted => {
+                if !self.undecrypted_said.insert(arrived.event_id.clone()) {
+                    return Ok(Outcome::Duplicate);
+                }
+                tracing::warn!(session = %self.context.session.path, event = %arrived.event_id, "agents: a person's message could not be decrypted; the room was asked to send it again");
+                deliver_fenced(
+                    port.as_ref(),
+                    "m.room.message",
+                    notice_about(UNDECRYPTED, &arrived.event_id),
+                    self.writer.lease().as_deref(),
+                    Instant::now(),
+                )
+                .await;
+                Ok(Outcome::Undecrypted)
+            }
             // A workflow's run that replied, or failed, takes no more turns
             // (R202): what would start one is left as it is.
             Disposition::Turn | Disposition::Unasked if self.run_ended() => {
@@ -8609,13 +8675,16 @@ impl ServedSession {
     /// What the turn's user message gains of `intake` — pictures and notes
     /// ([`attachments::shown`]) — for the model the agent's home names now,
     /// asked once whether it can see when there is a picture; and the notes
-    /// the room reads under the answer. A note this adds is a WARN line
-    /// too, as the intake's own are (R381).
+    /// the room reads under the answer. A smaller copy of a large photo is
+    /// made by the host's copier, a process `stop` ends (R489). A note this
+    /// adds is a WARN line too, as the intake's own are (R381).
     async fn shown(
         deps: &AgentDeps,
         intake: attachments::Intake,
+        stop: &CancelSignal,
     ) -> (Vec<keeper_core::bots::chat::ContentPart>, Vec<String>) {
         let current = current_model(deps).ok().flatten();
+        let copier = deps.attachments.images.clone();
         let deps = current.as_deref().unwrap_or(deps);
         let model = &deps.bot.target;
         let vision = if intake.pictures.is_empty() {
@@ -8626,11 +8695,52 @@ impl ServedSession {
                 .and_then(|found| found.vision)
         };
         let said = intake.notes.len();
-        let (parts, notes) = attachments::shown(intake.pictures, intake.notes, vision, model);
+        let (parts, notes) = attachments::shown(
+            intake.pictures,
+            intake.notes,
+            vision,
+            model,
+            copier.as_deref(),
+            stop,
+        )
+        .await;
         for sentence in &notes[said..] {
             tracing::warn!(agent = %deps.home.config.id, sentence, "agents: a photo a person sent was not shown to the model");
         }
         (parts, notes)
+    }
+
+    /// A person's message whose turn could not be opened — its `user` line
+    /// not written, so no anchor will answer it — is answered with
+    /// [`TURN_FAILED`] as a notice replying to it: never left unsaid in the
+    /// room (story 102.4 #3, R381); the reason is the ERROR line
+    /// [`Self::serve_arrivals`] writes. Only the proxy's person's message is
+    /// answered so. The status a file's download started goes `idle`. Both
+    /// are sent under `fence`, the claim this host writes under: a host
+    /// that lost it says nothing more (R489). A turn whose opening was
+    /// refused for that loss alone never comes here.
+    async fn unopened(
+        deps: &AgentDeps,
+        port: &Arc<dyn EditPort>,
+        arrived: &Arrived,
+        board: Option<&StatusBoard>,
+        fence: Option<&Lease>,
+    ) {
+        let persons = arrived.arrival == Arrival::Text
+            && deps.home.config.human.as_deref() == Some(arrived.sender.as_ref());
+        if persons {
+            deliver_fenced(
+                port.as_ref(),
+                "m.room.message",
+                notice_about(TURN_FAILED, &arrived.event_id),
+                fence,
+                Instant::now(),
+            )
+            .await;
+        }
+        if let Some(board) = board {
+            board.unbegun().await;
+        }
     }
 
     /// The file a person's message carries (story 101.2, R417), taken in
@@ -8640,7 +8750,7 @@ impl ServedSession {
     /// (R444/01); the whole download bounded by the host's
     /// `download_within` (R444/02) — and stored whole in the session's
     /// `attachments/` under the session's claim, a PDF's text beside it,
-    /// read by the host's [`attachments::PdfReader`] (R444/03). The file is
+    /// read by the host's PDF reader [`attachments::Worker`] (R444/03). The file is
     /// the person's line's own, kept where that line is kept, so it is
     /// written under the line's readers as the log is. What could not be
     /// done is a note, and a WARN line (R381): a file message with no file
@@ -8719,18 +8829,16 @@ impl ServedSession {
                 })
                 .map_err(|error| error.to_string())
         };
-        let landed = match store(&sent.name, &bytes) {
-            Ok((in_drive, landed)) => {
-                intake.stored.push(in_drive);
-                landed
-            }
+        let (stored_at, landed) = match store(&sent.name, &bytes) {
+            Ok(stored) => stored,
             Err(why) => {
                 note(&mut intake, attachments::not_stored(&sent.name, &why));
                 return Some(intake);
             }
         };
+        intake.stored.push(stored_at.clone());
         let stored_name = landed.rsplit('/').next().unwrap_or(&landed).to_owned();
-        match attachments::kind_of(&sent.mime, &sent.name) {
+        match attachments::kind_of_message(&arrived.content, &sent) {
             attachments::Kind::Image => intake.pictures.push(attachments::Picture {
                 name: stored_name,
                 mime: sent.mime,
@@ -8747,7 +8855,7 @@ impl ServedSession {
                     note(&mut intake, attachments::no_pdf_reader(&stored_name));
                     return Some(intake);
                 };
-                match reader.read(bytes, stop).await? {
+                match reader.read_pdf(bytes, stop).await? {
                     attachments::PdfText::Text(text) => {
                         match store(&attachments::text_name(&stored_name), text.as_bytes()) {
                             Ok((in_drive, _)) => intake.stored.push(in_drive),
@@ -8767,6 +8875,15 @@ impl ServedSession {
                         note(&mut intake, attachments::pdf_unreadable(&stored_name));
                     }
                 }
+            }
+            // A recording or a video: stored and named, and the agent told
+            // it cannot listen to or watch it yet — the turn goes on
+            // (story 102.4 #1; transcription is DW-1454's).
+            attachments::Kind::Unheard => {
+                note(
+                    &mut intake,
+                    attachments::not_heard(&stored_name, &stored_at),
+                );
             }
             attachments::Kind::Text | attachments::Kind::Other => {}
         }
@@ -9042,8 +9159,9 @@ impl ServedSession {
         arrived: Arrived,
         stop: CancelSignal,
     ) -> Result<TurnReport, ServeError> {
-        self.run_turn(deps, port, Opening::Arrived(arrived), stop)
-            .await
+        // Boxed: a turn's state — its intake, its model rounds — is too large
+        // to sit in every caller's future on its stack.
+        Box::pin(self.run_turn(deps, port, Opening::Arrived(arrived), stop)).await
     }
 
     /// Go on with the turn a parked call ended, that call settled (93.2):
@@ -9056,8 +9174,7 @@ impl ServedSession {
         resume: crate::approvals::Resume,
         stop: CancelSignal,
     ) -> Result<TurnReport, ServeError> {
-        self.run_turn(deps, port, Opening::Resumed(Box::new(resume)), stop)
-            .await
+        Box::pin(self.run_turn(deps, port, Opening::Resumed(Box::new(resume)), stop)).await
     }
 
     async fn run_turn(
@@ -9073,8 +9190,53 @@ impl ServedSession {
         // message, and what the room is told could not be done.
         let mut with_message = Vec::new();
         let mut notes = Vec::new();
+        // Every send of the turn into the room asks this gate, against the
+        // room's members at that send (R168).
+        let gate = self.gate(deps, &port);
+        let mut early_board = None;
         let (user_id, question, received_at, harvest, resume) = match opening {
             Opening::Arrived(arrived) => {
+                // A person's file is downloaded before the turn opens, for
+                // up to the host's `download_within`: the status says
+                // `running` from before it, never `idle` (story 102.4 #3) —
+                // the download waits for the homeserver to take that status.
+                if arrived.arrival == Arrival::Text && attachments::is_attachment(&arrived.content)
+                {
+                    let board = StatusBoard::start(
+                        Arc::clone(&port),
+                        self.context.status_anchor.clone(),
+                        self.status_base(deps),
+                        Some(Arc::clone(&gate)),
+                        self.writer.lease(),
+                    );
+                    let mut stopping = stop.clone();
+                    let started = tokio::select! {
+                        biased;
+                        () = stopping.cancelled() => None,
+                        started = board.started() => Some(started),
+                    };
+                    match started {
+                        // Taken while this host held the claim — and asked
+                        // again now, as the send may have been taken after
+                        // another host took it over: that host serves the
+                        // message, and this one does not download it (R512).
+                        Some(true) if !self.writer.may_write() => {
+                            tracing::info!(session = %self.context.session.path, event = %arrived.event_id, "agents: the session's claim was lost while a person's file's status was sent; its holder serves it");
+                            return Err(ServeError::Stopped);
+                        }
+                        Some(true) => early_board = Some(board),
+                        // Stopped before the status was taken: the board
+                        // goes with nothing more said, and the arrival is
+                        // served again where the session goes on (R444/02).
+                        None => return Err(ServeError::Stopped),
+                        // Another host holds the session now and serves
+                        // this message: this one says nothing of it (R489).
+                        Some(false) => {
+                            tracing::info!(session = %self.context.session.path, event = %arrived.event_id, "agents: the session's claim was lost before a person's file was taken in; its holder serves it");
+                            return Err(ServeError::Stopped);
+                        }
+                    }
+                }
                 // A turn stopped while its file was taken in is not begun:
                 // nothing of it is logged, so the arrival is served again
                 // wherever the session is served next (R444/02).
@@ -9088,11 +9250,36 @@ impl ServedSession {
                 )
                 .await
                 else {
+                    if let Some(board) = &early_board {
+                        board.unbegun().await;
+                    }
                     return Err(ServeError::Stopped);
                 };
-                let user = self.open_turn(deps, &arrived, &intake.stored)?;
+                let user = match self.open_turn(deps, &arrived, &intake.stored) {
+                    Ok(user) => user,
+                    // The claim was lost while the file was taken in:
+                    // another host serves this message now, so this one
+                    // sends no failure and no status — its board goes
+                    // quietly (R489, DW-1542).
+                    Err(ServeError::Writer(WriterError::NoClaim)) => {
+                        tracing::info!(session = %self.context.session.path, event = %arrived.event_id, "agents: the session's claim was lost before the turn opened; its holder serves the message");
+                        return Err(ServeError::Stopped);
+                    }
+                    Err(error) => {
+                        let fence = self.writer.lease();
+                        Self::unopened(
+                            deps,
+                            &port,
+                            &arrived,
+                            early_board.as_ref(),
+                            fence.as_deref(),
+                        )
+                        .await;
+                        return Err(error);
+                    }
+                };
                 if !intake.pictures.is_empty() || !intake.notes.is_empty() {
-                    (with_message, notes) = Self::shown(deps, intake).await;
+                    (with_message, notes) = Self::shown(deps, intake, &stop).await;
                 }
                 // A harvest's anchor names its arrival, the closed session:
                 // each attempt asks the room as it is then, and a room its
@@ -9121,9 +9308,9 @@ impl ServedSession {
                 Some(*resume),
             ),
         };
-        // Every send of the turn into the room asks this gate, against the
-        // room's members at that send (R168).
-        let gate = self.gate(deps, &port);
+        // The label the turn opened under: a person's line, a brief or a
+        // harvest may have joined it.
+        gate.set_label(self.context.label.clone());
         let (session, line) = (&self.context.session.path, user_id.to_string());
         let (anchor, anchor_at, _) = deliver_gated(
             port.as_ref(),
@@ -9146,12 +9333,15 @@ impl ServedSession {
             anchor_at,
             Some(Arc::clone(&gate)),
         );
-        let board = StatusBoard::start(
-            Arc::clone(&port),
-            self.context.status_anchor.clone(),
-            self.status_base(deps),
-            Some(Arc::clone(&gate)),
-        );
+        let board = early_board.unwrap_or_else(|| {
+            StatusBoard::start(
+                Arc::clone(&port),
+                self.context.status_anchor.clone(),
+                self.status_base(deps),
+                Some(Arc::clone(&gate)),
+                self.writer.lease(),
+            )
+        });
 
         let tools = TurnTools {
             surface: self.surface.clone(),
@@ -10273,6 +10463,63 @@ fn agent_offer(
     tools
 }
 
+/// What a turn of `deps`'s agent asks for and is not offered, `withheld`
+/// being why its model was offered no tools at all (story 102.3): each a
+/// sentence for the log, and the status's detail when it has no tools.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Dropped {
+    pub sentences: Vec<String>,
+    pub detail: Option<&'static str>,
+}
+
+/// [`Dropped`] for a turn of `deps`'s agent as its home reads now: no tools
+/// at all (no drive of its scope granted, a model that takes none, a
+/// Hermes bot), a web search on a host that names no engine, a console on
+/// a host whose sandbox failed its probe.
+pub fn dropped_tools(deps: &AgentDeps, withheld: Option<&'static str>) -> Dropped {
+    use keeper_core::bots::grant;
+    let config = &deps.home.config;
+    let name = &config.name;
+    let mut dropped = Dropped::default();
+    if let Some(reason) = withheld {
+        let (why, detail) =
+            if reason == grant::NO_GRANT_NO_TOOLS || reason == grant::GRANTS_ALL_NONE_NO_TOOLS {
+                (
+                    "none of its [tools].drives is granted in this session's scope".to_owned(),
+                    "no tools this turn: no drive is granted in this session",
+                )
+            } else if reason == grant::HERMES_RUNS_ITS_OWN_TOOLS {
+                (reason.to_owned(), "no keeper tools: Hermes runs its own")
+            } else {
+                (
+                    reason.to_owned(),
+                    "no tools this turn: its model takes none",
+                )
+            };
+        dropped
+            .sentences
+            .push(format!("{name} was offered no tools this turn: {why}"));
+        dropped.detail = Some(detail);
+    }
+    if searches_without_an_engine(deps, config) {
+        dropped.sentences.push(format!(
+            "{name} asks for web search, but this host names no search engine, so it is offered none"
+        ));
+    }
+    if deps.sandbox.is_none()
+        && config.run.mode.offers_run()
+        && config
+            .allow
+            .iter()
+            .any(|tool| tool == keeper_core::agents::run::RUN)
+    {
+        dropped.sentences.push(format!(
+            "{name}'s console is set, but this host's sandbox did not pass its check, so it is offered no run"
+        ));
+    }
+    dropped
+}
+
 /// The wire names a turn of a workflow's run of this agent, working in
 /// `drives`, would be offered: [`agent_offer`] for a session of kind
 /// `workflow` under its own grants, its model offered `model_tools` —
@@ -10495,6 +10742,16 @@ async fn run_agent_turn(
     let local = deps.model_is_local();
     let (mut armed, model_tools) =
         arm_session(context, deps, context.messages.clone(), Probe::Ask).await;
+    // A tool the agent asks for that this turn is not offered is said: in
+    // the log, and on the status when it is offered none at all (story
+    // 102.3, R381).
+    let dropped = dropped_tools(deps, armed.withheld);
+    for sentence in &dropped.sentences {
+        tracing::warn!(agent = %config.id, session = %context.session.path, %sentence, "agents: a tool this agent asks for is not offered this turn");
+    }
+    if let (Some(board), Some(detail)) = (board, dropped.detail) {
+        board.say(detail);
+    }
     let allow: Vec<String> = match review {
         Some(pass) => {
             armed.request.tools.retain(|spec| pass.offers(&spec.name));

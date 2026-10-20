@@ -151,6 +151,7 @@ import type {
   NoteIntentVm,
   OrgAccountVm,
   PacedWorkVm,
+  PaginationStatusBatch,
   PanelIntentVm,
   PlatformVm,
   PromoteState,
@@ -160,14 +161,17 @@ import type {
   RecordingRemovedVm,
   RecordingSearchVm,
   RecordingSettingsVm,
+  ReleaseCheckVm,
   SessionPromoteVm,
   SessionSpaceFilesVm,
   SessionSpaceFileVm,
   SessionSpaceVm,
   SessionTaskVm,
+  SignInLinkVm,
   SpacesSnapshot,
   SurfaceAnswerReq,
   SurfaceRequestVm,
+  SyncActivityVm,
   SyncFootprintVm,
   SyncProblemsVm,
   SyncProfileReq,
@@ -189,6 +193,7 @@ import type {
   VoiceStateVm,
   VoiceUnavailableVm,
   VoiceWakeVm,
+  WebSearchLevel,
 } from "@/lib/ipc/client";
 import { UNIFIEDPUSH_STATUS_EVENT, VOICE_WAKE_EVENT } from "@/lib/ipc/client";
 import { DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
@@ -214,6 +219,22 @@ import UNIFIEDPUSH_FIXTURE from "./unifiedpush-fixture.json";
 /** Roughly now, so relative timestamps read as "3 min ago" rather than 1970. */
 const NOW = Date.now();
 const ago = (minutes: number) => NOW - minutes * 60_000;
+
+/**
+ * Verbatim the shape `keeper_sync::engine::held_push_sentence` composes (Story
+ * 102.2), for tgdrive's upload 704972 as the owner's `sync.db` held it.
+ */
+const HELD_PUSH_SENTENCE =
+  "Publishing is on hold until 40-media/recordings/2026/2026-10-16 14.07 test/manifest.json reaches the remote, and its upload stopped: the account credential is unavailable: Reconnect the repository. Retry all stopped puts every stopped transfer of this folder back in the queue.";
+
+/**
+ * When tgdrive's last upload stops under the mock shell (Story 102.2, R503):
+ * until then its push is held while the upload still moves and the card reads
+ * as syncing; from then the held push's sentence and "Retry all stopped"
+ * arrive through the ordinary status poll, with no push failing again — what
+ * `Engine::project_held_push` does when an upload parks.
+ */
+const UPLOAD_STOPS_AT = NOW + 12_000;
 
 /**
  * Enough rows to judge DENSITY, which is the thing a screenshot of three items
@@ -1779,14 +1800,62 @@ const ANSWERS: Record<string, unknown> = {
     error: null,
     needsAttention: false,
     resettable: false,
+    heldPush: false,
+    // tgdrive as the owner's was on 2026-10-19 (Story 102.2): its push held
+    // behind an upload the signed-out account stopped. `sync_retry_all_parked`
+    // below clears it, so the way out can be pressed under the mock shell.
+    ...(status.profileId === "p1"
+      ? {
+          state: "needsAttention",
+          line: `${status.profileName} — ${HELD_PUSH_SENTENCE}`,
+          error: HELD_PUSH_SENTENCE,
+          needsAttention: true,
+          heldPush: true,
+        }
+      : {}),
   })) satisfies SyncStatusVm[],
   sync_problems: {
     warning: null,
     error: null,
-    parked: [],
+    // Stopped uploads first, as `db::list_parked` orders them (Story 102.2).
+    parked: [
+      {
+        id: 704972,
+        kind: "lfsUpload",
+        attempts: 1,
+        lastError: "the account credential is unavailable: Reconnect the repository.",
+      },
+      {
+        id: 704801,
+        kind: "pull",
+        attempts: 1,
+        lastError: "the account credential is unavailable: Reconnect the repository.",
+      },
+    ],
     conflicts: [],
     unspellable: [],
   } satisfies SyncProblemsVm,
+  // One row restored from history (Story 102.2) beside an ordinary arrival.
+  sync_activity: [
+    {
+      tsMs: ago(2),
+      kind: "restored",
+      path: "70-comms/meetings/2026/2026-10-06 1300 coin-fund-jackson-contact/manifest.sync-conflict-20261010-205450-maczek.json",
+      sizeBytes: 1896,
+      delivery: "inProgress",
+      failure: null,
+      unitId: 705000,
+    },
+    {
+      tsMs: ago(9),
+      kind: "added",
+      path: "10-notes/2026-10-18-untitled.md",
+      sizeBytes: 212,
+      delivery: "success",
+      failure: null,
+      unitId: null,
+    },
+  ] satisfies SyncActivityVm[],
   sync_git_status: { available: true, path: "/usr/bin/git", version: "2.53.0" },
   sync_device: { id: "01DEVICE", label: "hesperia" },
   // No token stored for either folder. Without this the edit form's keychain
@@ -5003,6 +5072,25 @@ let autoUpdate: AutoUpdateVm = {
  * for the same reason `autoUpdate` does: the switch applies the echo.
  */
 let logUpload = true;
+// Diagnostics & studies (102.1, R462): consent is account-wide in Rust; the
+// mock keeps it in memory so the switches show their on and off states. No
+// request ever leaves the browser shell, and no project token exists here.
+// `?telemetry=pinned`: a settings file pins diagnostics off, so a save is
+// kept but overruled (R495 06) — the switch stays off and says why.
+const telemetryPinned = new URLSearchParams(window.location.search).get("telemetry") === "pinned";
+let telemetryConsent = { diagnostics: false, productAnalytics: false, remoteConfig: false };
+const telemetryStatus = () => {
+  const consent = telemetryPinned ? { ...telemetryConsent, diagnostics: false } : telemetryConsent;
+  return {
+    consent,
+    configured: true,
+    host: "https://us.i.posthog.com",
+    installationId: Object.values(consent).some(Boolean)
+      ? "0123456789abcdef0123456789abcdef"
+      : null,
+    consentPinned: telemetryPinned,
+  };
+};
 
 // A browser has no filesystem. These are explicitly fixture files, dated on
 // either side of a day boundary so the date controls can be exercised honestly.
@@ -5241,8 +5329,76 @@ let accountRestore: AccountRestoreVm =
         sentence: "Restored 2 drives, 1 bot provider and your settings from your account.",
         pending: ["Waiting for /Volumes/Field to restore Field recordings."],
         listeningOff: true,
+        ...restoreSignInFixture(),
       }
     : NO_ACCOUNT_VM.restore;
+
+/**
+ * `?restoresso=preparing|waits|unopened|timedout` (with `?account=ready`): the
+ * Matrix single sign-on the restore started by itself (102.9, R480/02), as
+ * `keeper_core::org_account::state` words it — still discovering its server
+ * (no link yet, Cancel already reaches it: R500), waiting with its link (and
+ * the browser-not-opened sentence), or ended by its deadline with the link
+ * gone. `cancel_oidc` ends a waiting one as cancelled.
+ */
+function restoreSignInFixture(): Pick<AccountRestoreVm, "matrixSignIn"> {
+  const param = new URLSearchParams(window.location.search).get("restoresso");
+  const host = "matrix.acme.dev";
+  if (param === "timedout") {
+    return {
+      matrixSignIn: {
+        sentence: `Signing in to your Matrix account on ${host} timed out before the browser answered, so its link no longer works. Sign in to it again from Add an account.`,
+        problem: true,
+        waiting: false,
+      },
+    };
+  }
+  if (param === "preparing") {
+    return {
+      matrixSignIn: {
+        sentence: `Finish signing in to your Matrix account on ${host} in the browser.`,
+        problem: false,
+        waiting: true,
+      },
+    };
+  }
+  if (param !== "waits" && param !== "unopened") {
+    return {};
+  }
+  return {
+    matrixSignIn: {
+      sentence: `Finish signing in to your Matrix account on ${host} in the browser.`,
+      problem: false,
+      waiting: true,
+      link: {
+        url: mockAuthorizationUrl("mas.acme.dev", "01J8KEEPERRESTORE"),
+        notOpened:
+          param === "unopened"
+            ? "keeper could not open your browser. Copy this link into a browser to finish signing in."
+            : null,
+      },
+    },
+  };
+}
+
+/** `cancel_oidc` reaching the restore's Matrix sign-in: it ends cancelled, its link gone. */
+function cancelRestoreSignIn(): void {
+  if (accountRestore.matrixSignIn?.waiting !== true) {
+    return;
+  }
+  accountRestore = {
+    ...accountRestore,
+    matrixSignIn: {
+      sentence:
+        "The sign-in to your Matrix account on matrix.acme.dev was cancelled. Sign in to it again from Add an account.",
+      problem: false,
+      waiting: false,
+    },
+  };
+  if (accountVm.configured) {
+    setAccount({ ...accountVm, restore: accountRestore });
+  }
+}
 let accountVm: OrgAccountVm = ACCOUNT_FIXTURES.includes(accountParam as AccountStateVm)
   ? signedInAccount(accountParam as AccountStateVm)
   : NO_ACCOUNT_VM;
@@ -5313,6 +5469,47 @@ function mockRemoteKey(remoteUrl: string, branch: string): string {
  * the offered one on that homeserver when there is one — which is who the
  * browser would have signed in.
  */
+/**
+ * `?sso=waits` keeps a Matrix single sign-on waiting for its browser until
+ * Cancel, and `?sso=unopened` also says the browser could not be opened —
+ * the two states story 102.9 draws the authorization link in (R470). Without
+ * either the sign-in answers at once, as before, its link sent first.
+ */
+const ssoParam = new URLSearchParams(window.location.search).get("sso");
+/** The pending mock single sign-on, so `cancel_oidc` can end it as Rust's registry does. */
+let ssoCancel: (() => void) | null = null;
+/** The authorization page a mock sign-in is on: a public client's request, no secret. */
+function mockAuthorizationUrl(host: string, client: string): string {
+  return `https://${host}/oauth2/authorize?response_type=code&client_id=${client}&redirect_uri=keeper%3A%2F%2Foauth%2Facme%2Fcallback&scope=openid+profile+email&state=Zk3pQ8vX2mR7tL1n&nonce=a8Jd2kLq&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256`;
+}
+
+function matrixSignInFlow(payload: Record<string, unknown>): Promise<AccountVm> | AccountVm {
+  const homeserver = String(payload.homeserver ?? "");
+  const channel = payload.onLink as MockChannel<SignInLinkVm | null> | undefined;
+  const host = /^https?:\/\//.test(homeserver) ? new URL(homeserver).host : homeserver;
+  const url = mockAuthorizationUrl(`auth.${host || "example.org"}`, "01J8KEEPERCLIENT");
+  channel?.onmessage?.({ url, notOpened: null });
+  if (ssoParam !== "waits" && ssoParam !== "unopened") {
+    // Rust takes the link away when the sign-in ends, however it ends.
+    channel?.onmessage?.(null);
+    return matrixSignedIn(homeserver, null, "oidc");
+  }
+  if (ssoParam === "unopened") {
+    channel?.onmessage?.({
+      url,
+      notOpened:
+        "keeper could not open your browser. Copy this link into a browser to finish signing in.",
+    });
+  }
+  return new Promise<AccountVm>((_, reject) => {
+    ssoCancel = () => {
+      ssoCancel = null;
+      channel?.onmessage?.(null);
+      reject({ code: "oauthCancelled", message: "cancelled", accountId: null, retriable: true });
+    };
+  });
+}
+
 function matrixSignedIn(
   homeserver: string,
   username: string | null,
@@ -5373,6 +5570,9 @@ function forgeFailedAccount(device: AccountDeviceVm): OrgAccountVm {
   };
 }
 
+/** `?signin=waits|unopened`: the organisation sign-in stays on its browser leg (see below). */
+const signInParam = new URLSearchParams(window.location.search).get("signin");
+
 /** How a mock sign-in ends: Rust's `denied` refusal, a failed repository connection, or set up. */
 type MockSignInEnd = "denied" | "forgeFailed" | "done";
 
@@ -5388,8 +5588,22 @@ function accountSignInFlow(
   // An account already signed in here keeps its identity when a re-setup is
   // closed: Rust's state still reads up to date; only `attempt` says closed.
   const before = accountVm.identity !== null ? signedInAccount("ready", device) : null;
-  setAccount({ ...signedInAccount("signingIn", device), attempt: "running" });
+  // Rust's link to the authorization page, while the sign-in waits (102.9,
+  // R470); `?signin=unopened` says the browser could not be opened, and
+  // `?signin=waits` (or `unopened`) keeps it waiting until Cancel sign-in.
+  const signInLink: SignInLinkVm = {
+    url: mockAuthorizationUrl("id.acme.dev", "keeper-acme"),
+    notOpened:
+      signInParam === "unopened"
+        ? "keeper could not open your browser. Copy this link into a browser to finish signing in."
+        : null,
+  };
+  setAccount({ ...signedInAccount("signingIn", device), attempt: "running", signInLink });
+  const waits = signInParam === "waits" || signInParam === "unopened";
   const signIn = setTimeout(() => {
+    if (waits) {
+      return;
+    }
     accountSignInCancel = null;
     if (end === "denied") {
       resolve(setAccount(deniedAccount()));
@@ -5952,6 +6166,15 @@ const CONSOLE_UNRESTRICTED =
 const CONSOLE_UNKNOWN = "Console: unknown. This agent's host does not say how its commands run.";
 const headerConsoleUnknown =
   new URLSearchParams(window.location.search).get("headerconsole") === "unknown";
+/**
+ * `?headerconsole=nosandbox`: electra's sandbox failed its probe, so Nixi's
+ * console is off by failure, not by choice (story 102.3): Rust's
+ * `console::sandbox_failed`.
+ */
+const headerNoSandbox =
+  new URLSearchParams(window.location.search).get("headerconsole") === "nosandbox";
+const CONSOLE_NO_SANDBOX =
+  "Console off on electra: Nixi's console is set, but electra's sandbox did not pass its check, so Nixi runs no commands there. The reason is in that host's log.";
 function fullAccessWarning(name: string): string {
   return `Full access: ${name}'s commands run on its host without a sandbox and without asking. They can read, change and delete anything that host's user can, and reach the network.`;
 }
@@ -6028,6 +6251,7 @@ function setAgentConsole(req: AgentConsoleReq): AgentCopyVm[] {
         }
       : one,
   );
+  redrawAgentHeaders();
   return agentRows;
 }
 function agentRow(agent: string, name: string): AgentCopyVm {
@@ -6037,7 +6261,9 @@ function agentRow(agent: string, name: string): AgentCopyVm {
     drive: "tgdrive",
     agent,
     name,
-    matrixUser: `@${agent}:tgorka.org`,
+    // Nixi's is the agent of her room's header, so its menu finds her row
+    // (story 102.3).
+    matrixUser: agent === "nixi" ? "@nixi:example.org" : `@${agent}:tgorka.org`,
     device: null,
     host: "hesperia",
     signedIn: false,
@@ -6075,6 +6301,27 @@ function unaskedWarning(): string {
     ? "Queries go to the search engine of the host that serves this agent and its upstream search engines without asking — they may contain words from your files."
     : `Queries go to ${host} and its upstream search engines without asking — they may contain words from your files. A host other than this Mac sends them to its own engine.`;
 }
+/**
+ * Story 102.3: what electra, the host serving Nixi, says it can do — by
+ * default it names a search engine; `?agenthost=noengine` names none,
+ * `?agenthost=old` runs keeper 0.9.0, `?agenthost=unknown` runs a build that
+ * does not say. Rust's `web_search::host_note` sentences, for her header and
+ * her Settings row; nothing while she asks for no search.
+ */
+const agentHostParam = new URLSearchParams(window.location.search).get("agenthost");
+function hostNote(name: string, level: WebSearchLevel): string | null {
+  if (level === "off") return null;
+  switch (agentHostParam) {
+    case "noengine":
+      return `${name} asks for web search, but electra names no search engine, so it searches none there.`;
+    case "old":
+      return `electra runs keeper 0.9.0, which has no web search, so ${name} searches none there. Update keeper on electra.`;
+    case "unknown":
+      return `electra runs keeper 0.10.5, which does not say whether it names a search engine: whether ${name} can search the web is unknown on this host.`;
+    default:
+      return null;
+  }
+}
 /** Nixi searches without asking (her room's header carries the mark); the others are off. */
 function agentWebSearch(agent: string, name: string, localOnly: boolean): AgentWebSearchVm {
   const level = agent === "nixi" && !localOnly ? "withoutAsking" : "off";
@@ -6085,6 +6332,7 @@ function agentWebSearch(agent: string, name: string, localOnly: boolean): AgentW
       ? `${name} uses only models that run on its readers' own machines, and a web search sends its query out, so it is never offered one.`
       : null,
     warning: level === "withoutAsking" ? unaskedWarning() : null,
+    host: hostNote(name, level),
   };
 }
 const WEB_SEARCH_CHANGED_UNDERNEATH =
@@ -6099,9 +6347,11 @@ function setAgentWebSearch(req: AgentWebSearchReq): AgentCopyVm[] {
   if (webSearch.level !== req.shownLevel) refuse(WEB_SEARCH_CHANGED_UNDERNEATH);
   if (req.level !== "off" && webSearch.unavailable !== null) refuse(webSearch.unavailable);
   const warning = req.level === "withoutAsking" ? unaskedWarning() : null;
+  const host = hostNote(row?.name ?? req.agent, req.level);
   agentRows = agentRows.map((one) =>
-    one === row ? { ...one, webSearch: { ...webSearch, level: req.level, warning } } : one,
+    one === row ? { ...one, webSearch: { ...webSearch, level: req.level, warning, host } } : one,
   );
+  redrawAgentHeaders();
   return agentRows;
 }
 /** This Mac's search engine (101.4 #2): none until one is saved. */
@@ -6686,6 +6936,14 @@ function withAttention(row: InboxRoomVm): InboxRoomVm {
   return state === undefined ? row : { ...row, agentAttention: state };
 }
 
+/** The agent working each mock agent row, by the name the row leads with. */
+const MOCK_ROW_AGENTS: Record<string, string> = {
+  Nixi: "@nixi:example.org",
+  "Dr Tola Grey": "@tola:example.org",
+  "Dr Lucyna Novak": "@lucyna:example.org",
+  "Forge · github": "@forge:example.org",
+};
+
 const AGENT_ROOM_ROWS: InboxRoomVm[] = [
   inboxRow("!nixi-dm:example.org", "Nixi", "…", 1, "proxy", NIXI_AVATAR),
   inboxRow(
@@ -6730,6 +6988,12 @@ const AGENT_ROOM_ROWS: InboxRoomVm[] = [
       ? row
       : { ...row, agentMark: row.displayName.trim().charAt(0).toUpperCase() },
   )
+  .map((row) => {
+    // Rust's `agent`: the working agent's user id on every row whose status
+    // was read (story 102.7) — what the default marker compares.
+    const agent = MOCK_ROW_AGENTS[row.displayName.split(" — ")[0]];
+    return row.agentMark === undefined || agent === undefined ? row : { ...row, agent };
+  })
   .map(withAttention);
 
 const CHAT_ROWS: InboxRoomVm[] = [inboxRow("!marta:example.org", "Marta", "See you on Friday", 15)];
@@ -6788,8 +7052,8 @@ function nixiHeader(run: "running" | "done", caretKey: string | null): AgentRoom
       // none, as on the phone, and draw the handle's first letter.
       icon: "N",
       avatar: NIXI_AVATAR,
-      // Her home says she searches without asking (R457): the header's mark.
-      searchesUnasked: UNASKED_MARK,
+      // Her globe and her host's web search note come from her row and her
+      // host (R457, story 102.3): `withModelLine`.
       host: "electra",
       title: "Nixi",
       kind: "main",
@@ -6822,7 +7086,11 @@ const AGENT_ROOM_TIMELINES: Record<
   "!nixi-dm:example.org": {
     header: nixiHeader("running", "nixi-answer"),
     items: [
-      textItem("nixi-q", PERSON, "harness", "What did I write about Synapse limits?", 2),
+      // Story 102.4 (R465): Rust marks the person's message its anchor answers.
+      {
+        ...textItem("nixi-q", PERSON, "harness", "What did I write about Synapse limits?", 2),
+        turn: { state: "taken" },
+      },
       textItem("nixi-answer", NIXI, "Nixi", "…", 1),
     ],
   },
@@ -6850,7 +7118,10 @@ const AGENT_ROOM_TIMELINES: Record<
     },
     items: [
       textItem("reading-1", NIXI, "Nixi", "Three left.", 40),
-      textItem("reading-q", PERSON, "harness", "What's left on my reading list?", 6),
+      {
+        ...textItem("reading-q", PERSON, "harness", "What's left on my reading list?", 6),
+        turn: { state: "taken" },
+      },
       textItem(
         "reading-answer",
         NIXI,
@@ -6858,6 +7129,16 @@ const AGENT_ROOM_TIMELINES: Record<
         "There are three left on your 📚 list. Kleppmann's chapter on replication is the longest, about forty pages. The Synapse admin guide is next; you started it in March. Last is the essay on CRDTs you saved twice.",
         5,
       ),
+      // Story 102.4 (R465): a message no anchor answered while the host kept
+      // renewing its claim — an older host that drops this kind of message.
+      {
+        ...textItem("reading-photo", PERSON, "harness", "What is on this screenshot?", 3),
+        turn: {
+          state: "notTaken",
+          sentence:
+            "Nixi's host did not take this message — it may be older than this kind of message.",
+        },
+      },
     ],
     heard: [{ key: "reading-answer", splitUtf16: 107 }],
   },
@@ -7811,6 +8092,44 @@ const TIMELINE_STREAMS = new Map<number, ReturnType<typeof setInterval>>();
 let nextTimelineSubscription = 1;
 
 /**
+ * The back-pagination status every first timeline batch carries (102.6):
+ * the harness's rooms hold their whole history, so the start is reached.
+ * `?history=failed` says Rust's own fill of the window failed, so the
+ * boundary shows its sentence and Retry; `?history=more` says older
+ * history remains, so a window that cannot scroll offers "Load earlier
+ * messages" (R509). Either ask reaches the producer (`load_earlier_messages`),
+ * which pages, brings one older message and reaches the start.
+ */
+const historyParam = new URLSearchParams(window.location.search).get("history");
+const mockHistory: PaginationStatusBatch =
+  historyParam === "failed"
+    ? { state: "failed", hitStart: false }
+    : historyParam === "more"
+      ? { state: "idle", hitStart: false }
+      : { state: "idle", hitStart: true };
+
+/** Every open room's timeline channel, for the producer's answer to an ask. */
+const historyChannels = new Map<string, MockChannel<TimelineBatch>>();
+
+function loadEarlierMock(payload: Record<string, unknown>): null {
+  const roomId = String(payload.roomId);
+  const channel = historyChannels.get(roomId);
+  channel?.onmessage?.({ ops: [], pagination: { state: "paginating", hitStart: false } });
+  setTimeout(() => {
+    channel?.onmessage?.({
+      ops: [
+        {
+          op: "pushFront",
+          item: textItem(`${roomId}-earlier`, NIXI, "Nixi", "An earlier word, loaded on ask", 240),
+        },
+      ],
+      pagination: { state: "idle", hitStart: true },
+    });
+  }, 400);
+  return null;
+}
+
+/**
  * Nixi's header names her model where her home is on this device (100.2 #7):
  * her Settings › Agents row's bot and level as they read when the room opens,
  * so a save there shows the next time the room is opened.
@@ -7820,23 +8139,73 @@ function withModelLine(header: AgentRoomHeaderVm): AgentRoomHeaderVm {
   const model = agentModelLine("nixi");
   // Her console as her serving host's status says it (story 101.5, R440 09);
   // a host older than the console says nothing, read as "console: unknown".
-  const fullAccess = headerConsoleUnknown ? undefined : agentFullAccess("nixi");
+  const fullAccess = headerConsoleUnknown || headerNoSandbox ? undefined : agentFullAccess("nixi");
+  // Her globe only while electra searches; Rust's note in its place where it
+  // does not or does not say (R457, story 102.3).
+  const level = agentRows.find((row) => row.agent === "nixi")?.webSearch?.level ?? "off";
+  const webSearch = hostNote("Nixi", level);
+  const searches =
+    webSearch !== null
+      ? { webSearch }
+      : level === "withoutAsking"
+        ? { searchesUnasked: UNASKED_MARK }
+        : {};
+  const { searchesUnasked: _mark, webSearch: _note, ...status } = header.status;
   return {
     ...header,
     status: {
-      ...header.status,
+      ...status,
+      ...searches,
       ...(model === undefined ? {} : { model }),
       ...(fullAccess === undefined ? {} : { fullAccess }),
       ...(headerConsoleUnknown ? { console: CONSOLE_UNKNOWN } : {}),
+      ...(headerNoSandbox ? { console: CONSOLE_NO_SANDBOX } : {}),
     },
   };
 }
 
+/**
+ * A save in Nixi's menu or her Settings row redraws her open rooms' headers,
+ * as Rust's next scan does (story 102.3).
+ */
+function redrawAgentHeaders(): void {
+  for (const { roomId, channel } of dockChannels.values()) {
+    const agent = AGENT_ROOM_TIMELINES[roomId];
+    if (agent?.header.status?.agent !== NIXI) continue;
+    channel.onmessage?.({ ops: [], header: withModelLine(agent.header) });
+  }
+}
+
+/**
+ * `?firstbatch=<ms>`: every timeline subscription's first batch is held
+ * back that long (story 102.7, R102L1-01) — the conversation opens, its
+ * composer stays disabled until the batch lands, as on a slow device.
+ * Absent: the first batch is delivered at once, as before.
+ */
+const FIRST_BATCH_MS = Number(new URLSearchParams(window.location.search).get("firstbatch") ?? 0);
+
 function subscribeMockTimeline(payload: Record<string, unknown>): number {
+  const id = nextTimelineSubscription++;
+  if (FIRST_BATCH_MS > 0) {
+    // Held in `TIMELINE_STREAMS`, so an unsubscribe before it lands stops it.
+    TIMELINE_STREAMS.set(
+      id,
+      setTimeout(() => {
+        TIMELINE_STREAMS.delete(id);
+        deliverMockTimeline(id, payload);
+      }, FIRST_BATCH_MS),
+    );
+  } else {
+    deliverMockTimeline(id, payload);
+  }
+  return id;
+}
+
+function deliverMockTimeline(id: number, payload: Record<string, unknown>): void {
   const channel = payload.channel as MockChannel<TimelineBatch>;
   const roomId = String(payload.roomId);
-  const id = nextTimelineSubscription++;
   const agent = AGENT_ROOM_TIMELINES[roomId];
+  historyChannels.set(roomId, channel);
   if (!agent) {
     channel.onmessage?.({
       ops: [
@@ -7845,8 +8214,9 @@ function subscribeMockTimeline(payload: Record<string, unknown>): number {
           items: [textItem(`${roomId}-1`, "@marta:example.org", "Marta", "See you on Friday", 15)],
         },
       ],
+      pagination: mockHistory,
     });
-    return id;
+    return;
   }
   channel.onmessage?.({
     ops: [{ op: "reset", items: agent.items }],
@@ -7854,10 +8224,11 @@ function subscribeMockTimeline(payload: Record<string, unknown>): number {
     ...(roomId === APPROVAL_ROOM && mockApprovals.length > 0 ? { approvals: mockApprovals } : {}),
     ...(roomId === GATE_ROOM && gateApprovals.length > 0 ? { approvals: gateApprovals } : {}),
     ...(agent.heard ? { heard: agent.heard } : {}),
+    pagination: mockHistory,
   });
   dockChannels.set(id, { roomId, channel });
   if (roomId !== "!nixi-dm:example.org" || dockParam !== null) {
-    return id;
+    return;
   }
   let step = 0;
   const steps = levelRefused ? [LEVEL_REFUSED] : NIXI_ANSWER_STEPS;
@@ -7876,7 +8247,6 @@ function subscribeMockTimeline(payload: Record<string, unknown>): number {
     }
   }, 900);
   TIMELINE_STREAMS.set(id, timer);
-  return id;
 }
 
 // ---------------------------------------------------------------------------
@@ -7979,9 +8349,6 @@ function mockAgentsLaunch(): AgentsLaunchVm {
   const mains = proxyRooms.filter(
     (room) => room.kind === "main" && (nixiDmHere || room.roomId !== DM_ROOM),
   );
-  const choices = mains
-    .map((room) => ({ agent: room.agent, name: room.name }))
-    .sort((a, b) => a.name.localeCompare(b.name));
   // What keeper reads: a settings file's value shadows the stored one.
   const effective = FILE_DEFAULT ?? defaultAgent;
   const fileSet =
@@ -7996,12 +8363,21 @@ function mockAgentsLaunch(): AgentsLaunchVm {
       Date.now() < askLateFrom)
       ? []
       : [NIXI_ASK];
+  // Rust's `choices`: one per agent with a `main` room, then one per own
+  // agent keeper may ask for one (R416), each once, by name.
+  const choices = [
+    ...mains.map((room) => ({ agent: room.agent, name: room.name })),
+    ...askable.map((ask) => ({ agent: ask.agent, name: ask.name })),
+  ]
+    .filter((choice, index, all) => all.findIndex((c) => c.agent === choice.agent) === index)
+    .sort((a, b) => a.name.localeCompare(b.name));
   const base = {
     room: null,
     defaultAgent: effective,
     reason: null,
     announce: false,
     choices,
+    chooser: false,
     fileSet,
     ask: null,
     askable,
@@ -8034,7 +8410,13 @@ function mockAgentsLaunch(): AgentsLaunchVm {
     };
   }
   if (effective === null) {
-    return { ...base, view: "agents" };
+    // R463: nothing chosen — the launch asks which agent opens, unless the
+    // person put the chooser away in this version or a file decides the key.
+    return {
+      ...base,
+      view: "agents",
+      chooser: choices.length > 0 && fileSet === null && !mockChooserDismissed,
+    };
   }
   if (!/^@[^:]+:.+$/.test(effective)) {
     return {
@@ -8068,6 +8450,26 @@ function mockAgentsLaunchWhenKnown(): Promise<AgentsLaunchVm> {
   return later(300, mockAgentsLaunch);
 }
 
+/**
+ * Story 102.7 (R463): whether the launch's chooser was put away in this
+ * version. `?chooser=failput` refuses the write the way a locked settings
+ * table does.
+ */
+let mockChooserDismissed = false;
+
+function mockAgentsDefaultChooserDismiss(): Promise<null> {
+  return new Promise((resolve, reject) => {
+    setTimeout(() => {
+      if (new URLSearchParams(window.location.search).get("chooser") === "failput") {
+        reject({ code: "internal", message: "database is locked", retriable: false });
+        return;
+      }
+      mockChooserDismissed = true;
+      resolve(null);
+    }, 120);
+  });
+}
+
 /** This Mac's claims lease (R455), as the Settings row last stored it. */
 let mockClaimsLease: "short" | "quarter-hour" = "short";
 
@@ -8097,29 +8499,41 @@ function mockAgentsDefaultSet(payload: Record<string, unknown>): Promise<AgentsL
   });
 }
 
+/**
+ * Story 102.5 (R501): `?agentlist=stale` draws the Agents window as Rust does
+ * when an account could not start — its rows kept from the last run, and the
+ * sentence `AgentListTrouble::NotStarted` says above them, on every Agents
+ * batch.
+ */
+const agentListParam = new URLSearchParams(window.location.search).get("agentlist");
+const AGENT_LIST_NOT_STARTED =
+  "keeper could not start one of your accounts just now, so its agents are shown as keeper last saw them.";
+
 function subscribeMockInbox(payload: Record<string, unknown>): number {
   const reset = (rooms: InboxRoomVm[]): InboxBatch => ({
     ops: [{ op: "reset", rooms }],
     total: rooms.length,
   });
+  const agentsReset = (rooms: InboxRoomVm[]): InboxBatch =>
+    agentListParam === "stale" ? { ...reset(rooms), note: AGENT_LIST_NOT_STARTED } : reset(rooms);
   (payload.channel as MockChannel<InboxBatch>).onmessage?.(reset(CHAT_ROWS));
   for (const window of ["archive", "pins", "favourites"]) {
     (payload[window] as MockChannel<InboxBatch>).onmessage?.(reset([]));
   }
   agentsWindow = payload.agents as MockChannel<InboxBatch>;
   if (launchParam === "none") {
-    agentsWindow.onmessage?.(reset([]));
+    agentsWindow.onmessage?.(agentsReset([]));
   } else if (!nixiDmHere) {
     // R397's late DM: the first batch has every agent room but Nixi's DM.
-    agentsWindow.onmessage?.(reset(AGENT_ROOM_ROWS.filter((row) => row.roomId !== DM_ROOM)));
+    agentsWindow.onmessage?.(agentsReset(AGENT_ROOM_ROWS.filter((row) => row.roomId !== DM_ROOM)));
     if (launchParam === "late") {
       setTimeout(() => {
         nixiDmHere = true;
-        agentsWindow?.onmessage?.(reset(AGENT_ROOM_ROWS));
+        agentsWindow?.onmessage?.(agentsReset(AGENT_ROOM_ROWS));
       }, LATE_ROOM_MS);
     }
   } else {
-    agentsWindow.onmessage?.(reset(AGENT_ROOM_ROWS));
+    agentsWindow.onmessage?.(agentsReset(AGENT_ROOM_ROWS));
   }
   (payload.spaces as MockChannel<SpacesSnapshot>).onmessage?.({ spaces: [] });
   (payload.networks as MockChannel<NetworksSnapshot>).onmessage?.({ networks: [] });
@@ -8891,6 +9305,9 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
     presenceViews.push(String(payload.view));
     return null;
   },
+  // The harness's rooms hold their whole history: a page reaches the start.
+  paginate_backwards: () => true,
+  load_earlier_messages: loadEarlierMock,
   timeline_subscribe: subscribeMockTimeline,
   timeline_unsubscribe: (payload) => {
     const id = Number(payload.subscriptionId);
@@ -8906,6 +9323,40 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
     return options && typeof options === "object" && "directory" in options && options.directory
       ? "/Users/tgorka/Documents"
       : "/Volumes/merope/tgdrive/meeting.mov";
+  },
+  // tgdrive before its last upload stops (`UPLOAD_STOPS_AT`): the push is held
+  // while the upload moves, so the card reads as syncing and offers nothing.
+  sync_statuses: () =>
+    (ANSWERS.sync_statuses as SyncStatusVm[]).map((status) =>
+      status.heldPush && Date.now() < UPLOAD_STOPS_AT
+        ? {
+            ...status,
+            state: "syncing",
+            line: `${status.profileName} — uploading 40-media/recordings/2026/2026-10-16 14.07 test/manifest.json`,
+            error: null,
+            needsAttention: false,
+            heldPush: false,
+          }
+        : status,
+    ),
+  // "Retry all stopped" (Story 102.2): the stopped rows leave the list and the
+  // held push's sentence goes with them, as `Engine::retry_all_parked` does.
+  sync_retry_all_parked: (payload) => {
+    const problems = ANSWERS.sync_problems as SyncProblemsVm;
+    const moved = problems.parked.length;
+    problems.parked = [];
+    for (const status of ANSWERS.sync_statuses as SyncStatusVm[]) {
+      if (status.profileId === payload.id && status.heldPush) {
+        Object.assign(status, {
+          state: "watching",
+          line: `${status.profileName} — remote comparison unknown`,
+          error: null,
+          needsAttention: false,
+          heldPush: false,
+        });
+      }
+    }
+    return moved;
   },
   sync_folder_tasks_flag: (payload) => {
     const profile = (ANSWERS.sync_profiles as SyncProfileVm[]).find(
@@ -9054,15 +9505,10 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
     logUpload = payload.enabled === true;
     return logUpload;
   },
-  // Browser development never contacts PostHog or exposes a real project token.
-  telemetry_status: () => ({
-    consent: { diagnostics: false, productAnalytics: false, remoteConfig: false },
-    configured: false,
-    host: null,
-    installationId: null,
-  }),
-  telemetry_consent_set: () => {
-    throw new Error("PostHog is not configured in the browser development shell.");
+  telemetry_status: () => telemetryStatus(),
+  telemetry_consent_set: (payload) => {
+    telemetryConsent = { ...(payload.consent as typeof telemetryConsent) };
+    return telemetryStatus();
   },
   telemetry_capture: () => null,
   telemetry_remote_config: () => ({ supportMessage: null }),
@@ -9113,7 +9559,7 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
     if (payload.password === "wrong") {
       throw {
         code: "internal",
-        message: "The homeserver did not accept that password for @nixi:tgorka.org.",
+        message: "The homeserver did not accept that password for @nixi:example.org.",
         accountId: null,
         retriable: false,
       };
@@ -9687,6 +10133,7 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
   agents_launch: () => mockAgentsLaunchWhenKnown(),
   agents_default_get: () => mockAgentsLaunch(),
   agents_default_set: mockAgentsDefaultSet,
+  agents_default_chooser_dismiss: () => mockAgentsDefaultChooserDismiss(),
   // R455: this Mac's claims lease, kept for the page's life.
   agents_claims_lease_get: () => mockClaimsLease,
   agents_claims_lease_set: (payload: Record<string, unknown>) => {
@@ -10677,6 +11124,44 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
       setupId.includes("denied") ? "denied" : setupId.includes("forge") ? "forgeFailed" : "done",
     );
   },
+  // The phone tier's Check for updates (102.9, R464), as
+  // `keeper_core::release_check` words each answer: `?release=current` or
+  // `?release=failed`, else a newer release. A desktop has the updater.
+  release_check: (): Promise<ReleaseCheckVm> => {
+    if (!MOCK_REDUCED) {
+      return Promise.reject({
+        code: "unsupported",
+        message: "a desktop checks for updates with its in-app updater",
+        accountId: null,
+        retriable: false,
+      });
+    }
+    const install = MOCK_PLATFORM === "tablet" ? "bun run install:android" : "bun run install:ios";
+    const param = new URLSearchParams(window.location.search).get("release");
+    const answer: ReleaseCheckVm =
+      param === "current"
+        ? {
+            outcome: "current",
+            installed: "0.10.5",
+            latest: "0.10.5",
+            sentence: "keeper is up to date.",
+          }
+        : param === "failed"
+          ? {
+              outcome: "failed",
+              installed: "0.10.5",
+              latest: null,
+              sentence:
+                "keeper could not check GitHub for a newer version (it answered 403). Try again later.",
+            }
+          : {
+              outcome: "newer",
+              installed: "0.10.5",
+              latest: "0.11.0",
+              sentence: `keeper 0.11.0 is available — install it from your Mac with \`${install}\`.`,
+            };
+    return later(900, () => answer);
+  },
   account_sign_in: () => {
     forgeErrors.clear();
     return accountSignInFlow(accountVm.device ?? ACCOUNT_THIS_DEVICE);
@@ -11018,7 +11503,12 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
   // offer for it, as the next converge does once the account exists here.
   login_password: (payload) =>
     matrixSignedIn(String(payload.homeserver ?? ""), String(payload.username ?? ""), "password"),
-  login_oidc: (payload) => matrixSignedIn(String(payload.homeserver ?? ""), null, "oidc"),
+  login_oidc: (payload) => matrixSignInFlow(payload),
+  cancel_oidc: () => {
+    ssoCancel?.();
+    cancelRestoreSignIn();
+    return null;
+  },
   login_beeper: (payload) =>
     matrixSignedIn(
       "https://matrix.beeper.com/",

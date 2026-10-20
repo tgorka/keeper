@@ -243,6 +243,29 @@ pub fn set_setting(data_dir: &Path, key: &str, value: &str) -> Result<(), CoreEr
     Ok(())
 }
 
+/// Write `value` under `key` only if the table has no row for it, in one
+/// statement — so a value written by anyone between a caller's decision and
+/// this write is never overwritten. Whether it wrote; the installed
+/// [`set_setting_observer`] hears `key` only then, after the write landed.
+pub fn insert_setting_if_absent(
+    data_dir: &Path,
+    key: &str,
+    value: &str,
+) -> Result<bool, CoreError> {
+    let conn = open(data_dir)?;
+    let inserted = conn
+        .execute(
+            "INSERT INTO settings(key, value) VALUES (?1, ?2) ON CONFLICT(key) DO NOTHING",
+            rusqlite::params![key, value],
+        )
+        .map_err(|e| CoreError::Internal(format!("could not write setting: {e}")))?
+        > 0;
+    if inserted {
+        notify_observer(key);
+    }
+    Ok(inserted)
+}
+
 /// Told the key of every settings write and delete (Epic 84, AD-325).
 type SettingObserver = Box<dyn Fn(&str) + Send + Sync>;
 
@@ -1098,6 +1121,30 @@ pub fn set_agents_default(data_dir: &Path, agent: Option<&str>) -> Result<(), Co
     )
 }
 
+/// The `settings` key holding the keeper version in which the person put the
+/// launch's default-agent chooser away (story 102.7, R463); absent when they
+/// never did. Session state on this device: it never travels.
+const UI_DEFAULT_AGENT_CHOOSER_DISMISSED_KEY: &str = "ui.default_agent_chooser_dismissed";
+
+/// Read the keeper version in which the chooser was put away, trimmed;
+/// absent or blank ⇒ `None`.
+pub fn get_default_agent_chooser_dismissed(data_dir: &Path) -> Result<Option<String>, CoreError> {
+    Ok(
+        get_setting(data_dir, UI_DEFAULT_AGENT_CHOOSER_DISMISSED_KEY)?
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty()),
+    )
+}
+
+/// Record that the chooser was put away in keeper `version`
+/// (`keeper_core::agents::launch::dismiss_chooser`).
+pub fn set_default_agent_chooser_dismissed(
+    data_dir: &Path,
+    version: &str,
+) -> Result<(), CoreError> {
+    set_setting(data_dir, UI_DEFAULT_AGENT_CHOOSER_DISMISSED_KEY, version)
+}
+
 /// The `settings` key naming the lease this desktop host takes a session's
 /// claim on (R455): `short` (absent included) or `quarter-hour`.
 pub const AGENTS_CLAIMS_LEASE_KEY: &str = "agents.claims_lease";
@@ -1316,6 +1363,71 @@ pub fn get_log_upload(data_dir: &Path) -> Result<bool, CoreError> {
 /// Write whether this device's log goes to the config repository daily.
 pub fn set_log_upload(data_dir: &Path, enabled: bool) -> Result<(), CoreError> {
     set_setting(data_dir, LOG_UPLOAD_KEY, if enabled { "1" } else { "0" })
+}
+
+/// Diagnostics consent (R462): a person's choice, synced to every device of
+/// the account in `<login>/settings.toml`.
+pub(crate) const TELEMETRY_DIAGNOSTICS_KEY: &str = "telemetry.diagnostics";
+
+/// Product-analytics consent (R462), synced like diagnostics.
+pub(crate) const TELEMETRY_PRODUCT_ANALYTICS_KEY: &str = "telemetry.product_analytics";
+
+/// Read the two account-wide observability consents, `(diagnostics,
+/// product_analytics)`. Fail-closed: absent or anything but `"1"` is off, and
+/// a layer file's pin wins, as for every key read through [`get_setting`].
+pub fn get_telemetry_consent(data_dir: &Path) -> Result<(bool, bool), CoreError> {
+    let diagnostics = get_setting(data_dir, TELEMETRY_DIAGNOSTICS_KEY)?.as_deref() == Some("1");
+    let product = get_setting(data_dir, TELEMETRY_PRODUCT_ANALYTICS_KEY)?.as_deref() == Some("1");
+    Ok((diagnostics, product))
+}
+
+/// Write the two account-wide observability consents; the settings observer
+/// carries each write to the account's repository.
+pub fn set_telemetry_consent(
+    data_dir: &Path,
+    diagnostics: bool,
+    product_analytics: bool,
+) -> Result<(), CoreError> {
+    set_setting(
+        data_dir,
+        TELEMETRY_DIAGNOSTICS_KEY,
+        if diagnostics { "1" } else { "0" },
+    )?;
+    set_setting(
+        data_dir,
+        TELEMETRY_PRODUCT_ANALYTICS_KEY,
+        if product_analytics { "1" } else { "0" },
+    )
+}
+
+/// Whether a settings file — `~/.keeper`, a folder's, or the account's own
+/// `keeper.toml` — sets either consent, so a save here does not decide it.
+pub fn telemetry_consent_pinned() -> bool {
+    crate::config::setting_override(TELEMETRY_DIAGNOSTICS_KEY).is_some()
+        || crate::config::setting_override(TELEMETRY_PRODUCT_ANALYTICS_KEY).is_some()
+}
+
+/// The adoption of a per-installation "on" (R462, R495 07), run only once
+/// the account's settings are known here: each consent the old store had on
+/// becomes this device's row **only when the account has no value for it**
+/// — no row (a pulled one, or a choice saved here meanwhile) and no settings
+/// file pinning it. The row is inserted only if absent, in one statement
+/// ([`insert_setting_if_absent`], R515): a choice made anywhere, even after
+/// the caller decided to adopt, is never overwritten by the old file.
+pub fn adopt_installation_telemetry_consent(
+    data_dir: &Path,
+    diagnostics: bool,
+    product_analytics: bool,
+) -> Result<(), CoreError> {
+    for (adopt, key) in [
+        (diagnostics, TELEMETRY_DIAGNOSTICS_KEY),
+        (product_analytics, TELEMETRY_PRODUCT_ANALYTICS_KEY),
+    ] {
+        if adopt && crate::config::setting_override(key).is_none() {
+            insert_setting_if_absent(data_dir, key, "1")?;
+        }
+    }
+    Ok(())
 }
 
 /// List every muted Network label (Story 10.2, FR-52). Returns the `network_id`
@@ -2061,7 +2173,8 @@ fn credential_source_row(
 
 /// `Some("account")` when a stored row is bound to `account_id`.
 fn bound_to(row: Option<&str>, account_id: &str) -> Option<String> {
-    (row == Some(credential_source_value(account_id).as_str())).then(|| "account".to_owned())
+    (row == Some(credential_source_value(account_id).as_str()))
+        .then(|| ACCOUNT_CREDENTIAL_SOURCE.to_owned())
 }
 
 const SYNC_CREDENTIAL_SOURCE_PREFIX: &str = "sync.credential_source.";
@@ -2097,6 +2210,33 @@ pub fn get_sync_credential_source(
         return Ok(Some(forge.to_owned()));
     }
     Ok(account_id.and_then(|account_id| bound_to(row.as_deref(), account_id)))
+}
+
+/// The credential source of every drive on the configured account, as
+/// [`get_sync_credential_source`] answers it.
+pub const ACCOUNT_CREDENTIAL_SOURCE: &str = "account";
+
+/// Whether drive `profile_id` takes its git credential from `recovered` —
+/// [`ACCOUNT_CREDENTIAL_SOURCE`] after a person signed in to the account, or
+/// a repository source's `forge:<id>` after they reconnected it (Story 102.2,
+/// R503).
+///
+/// The scope of the re-arm a recovered credential triggers: only these
+/// drives' stopped work runs again. A drive on another source, or on its own
+/// keychain token, is untouched — that credential has not come back, and
+/// re-arming its work would only spend its few automatic retries. A setting
+/// that cannot be read answers `false`: the drive's own next accepted round
+/// trip re-arms it instead.
+pub fn uses_sync_credential_source(
+    data_dir: &Path,
+    profile_id: &str,
+    account_id: Option<&str>,
+    recovered: &str,
+) -> bool {
+    get_sync_credential_source(data_dir, profile_id, account_id)
+        .ok()
+        .flatten()
+        .is_some_and(|source| source == recovered)
 }
 
 /// Opt drive `profile_id` into the account credential (`Some("account")`,
@@ -6052,6 +6192,35 @@ mod tests {
             get_sync_credential_source(&dir, "p2", Some("globex")).expect("read"),
             Some("account".to_owned())
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A recovered credential re-arms the drives that use it and no other
+    /// (Story 102.2, R503): the account's sign-in is not a GitHub source's
+    /// reconnect, nor a keychain token's, nor another account's.
+    #[test]
+    fn a_recovered_credential_scopes_to_the_drives_that_use_it() {
+        let dir = temp_dir();
+        let acme = Some("acme");
+        set_sync_credential_source(&dir, "on-account", Some("account"), acme).expect("opt in");
+        set_sync_credential_source(&dir, "on-github", Some("forge:github"), acme).expect("opt in");
+        // "own-token" keeps its keychain item: no row at all.
+        let uses = |profile: &str, recovered: &str| {
+            uses_sync_credential_source(&dir, profile, acme, recovered)
+        };
+        assert!(uses("on-account", ACCOUNT_CREDENTIAL_SOURCE));
+        assert!(!uses("on-github", ACCOUNT_CREDENTIAL_SOURCE));
+        assert!(!uses("own-token", ACCOUNT_CREDENTIAL_SOURCE));
+        assert!(uses("on-github", "forge:github"));
+        assert!(!uses("on-account", "forge:github"));
+        assert!(!uses("on-github", "forge:gitlab"));
+        // Bound to Acme: Globex's sign-in is not this drive's credential.
+        assert!(!uses_sync_credential_source(
+            &dir,
+            "on-account",
+            Some("globex"),
+            ACCOUNT_CREDENTIAL_SOURCE
+        ));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

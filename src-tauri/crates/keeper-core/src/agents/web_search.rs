@@ -25,6 +25,7 @@ use ts_rs::TS;
 
 use crate::agents::home::{self, AgentConfig, AgentKind, HomeRefusal};
 use crate::agents::label::{label_outside, Label, Readers, LOCAL_ONLY_SINK};
+use crate::agents::model::{reads_since, ServingHost};
 use crate::agents::tier::CallFacts;
 use crate::bots::url::{parse_base_url, BaseUrl, BaseUrlError};
 
@@ -270,11 +271,12 @@ pub fn sink_refusal(label: &Label) -> Option<String> {
 
 /// How an agent searches the web, as a person chose it for that agent in
 /// Settings › Agents (R457).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
 pub enum WebSearchLevel {
     /// `[tools].allow` does not name `web_search`: it is not offered.
+    #[default]
     Off,
     /// Offered; a query from a session whose label names its readers waits
     /// for a person's approval of that query (R428). Switching it on gives
@@ -449,6 +451,152 @@ pub fn unasked_warning(engine: Option<&BaseUrl>) -> String {
     }
 }
 
+/// What the host `host` serving `name` — the agent `<drive>/<id>` `agent`
+/// — makes of its web search at `level` (story 102.3, DW-1471, DW-1477),
+/// as `hosts` — the live serving hosts this device read, `None` when it
+/// could not read them — say: `None` while the agent asks for none or that
+/// host searches; else the warning a person reads in place of a plain
+/// globe. Only a host of that slug that says it serves that agent is read
+/// (R483, R485): another principal's same-named host is not this one, and
+/// two that say different things, or an agent keeper cannot name, are
+/// unknown. A host that does not say is never read as one that searches.
+pub fn host_note(
+    name: &str,
+    level: WebSearchLevel,
+    host: Option<&str>,
+    agent: Option<&str>,
+    hosts: Option<&[ServingHost]>,
+) -> Option<String> {
+    if level == WebSearchLevel::Off {
+        return None;
+    }
+    let shown = shown_name(name);
+    let Some(slug) = host else {
+        return Some(format!(
+            "No host has said it serves {shown} here, so whether it can search the web is unknown."
+        ));
+    };
+    let Some(hosts) = hosts else {
+        return Some(format!(
+            "keeper could not read what {slug} can do now, so whether {shown} can search the web there is unknown on this host."
+        ));
+    };
+    let Some(agent) = agent else {
+        return Some(format!(
+            "keeper cannot tell which of {slug}'s agents {shown} is, so whether it can search the web there is unknown on this host."
+        ));
+    };
+    let mut serving: Vec<&ServingHost> = hosts
+        .iter()
+        .filter(|candidate| {
+            candidate.host == slug && candidate.agents.iter().any(|served| served == agent)
+        })
+        .collect();
+    serving.sort_by(|a, b| (&a.version, a.web_search).cmp(&(&b.version, b.web_search)));
+    serving.dedup_by(|a, b| (&a.version, a.web_search) == (&b.version, b.web_search));
+    match serving.as_slice() {
+        [] => Some(format!(
+            "{slug} has not said what it can do for a few minutes, so whether {shown} can search the web there is unknown on this host."
+        )),
+        [serving] => serving_note(name, serving),
+        _ => Some(format!(
+            "More than one host named {slug} says it serves {shown}, and they do not agree, so whether {shown} can search the web there is unknown on this host."
+        )),
+    }
+}
+
+/// What `serving`, a live host that says it serves `name`, makes of the
+/// web search `name` asks for: `None` where it says it names an engine
+/// on a build that has web search; else why it searches none, or that it
+/// does not say.
+pub fn serving_note(name: &str, serving: &ServingHost) -> Option<String> {
+    let shown = shown_name(name);
+    let slug = &serving.host;
+    if !reads_since(&serving.version, SEARCH_SINCE) {
+        return Some(format!(
+            "{slug} runs keeper {}, which has no web search, so {shown} searches none there. Update keeper on {slug}.",
+            serving.version
+        ));
+    }
+    match serving.web_search {
+        Some(true) => None,
+        Some(false) => Some(no_engine(name, slug)),
+        None => Some(format!(
+            "{slug} runs keeper {}, which does not say whether it names a search engine: whether {shown} can search the web is unknown on this host.",
+            serving.version
+        )),
+    }
+}
+
+/// What every device's header says when `host`'s status says `name` asks
+/// for web search there and it names no search engine (story 102.3, R483).
+pub fn no_engine(name: &str, host: &str) -> String {
+    format!(
+        "{} asks for web search, but {host} names no search engine, so it searches none there.",
+        shown_name(name)
+    )
+}
+
+/// [`serving_note`] for an agent (`<drive>/<id>`) as every live host
+/// serving it says, for its Settings › Agents row: each such host's note,
+/// formatted from that host itself (never looked up again by its slug), or
+/// that no live host serves it.
+pub fn hosts_note(
+    name: &str,
+    level: WebSearchLevel,
+    agent: &str,
+    hosts: Option<&[ServingHost]>,
+) -> Option<String> {
+    if level == WebSearchLevel::Off {
+        return None;
+    }
+    let Some(read) = hosts else {
+        return host_note(name, level, Some("its host"), Some(agent), None);
+    };
+    let serving: Vec<&ServingHost> = read
+        .iter()
+        .filter(|host| host.agents.iter().any(|served| served == agent))
+        .collect();
+    if serving.is_empty() {
+        return Some(format!(
+            "No live host serves {} now, so whether it can search the web is unknown.",
+            shown_name(name)
+        ));
+    }
+    let notes: Vec<String> = serving
+        .iter()
+        .filter_map(|host| serving_note(name, host))
+        .collect();
+    (!notes.is_empty()).then(|| notes.join(" "))
+}
+
+/// Each Settings › Agents row's web search as the hosts serving its agent
+/// make of it ([`hosts_note`]): `hosts` as this device last read them,
+/// `None` when it could not.
+pub fn with_hosts(rows: &mut [crate::agents::copy::AgentCopyVm], hosts: Option<&[ServingHost]>) {
+    for row in rows {
+        let agent = format!("{}/{}", row.drive, row.agent);
+        if let Some(vm) = row.web_search.as_mut() {
+            vm.host = vm
+                .unavailable
+                .is_none()
+                .then(|| hosts_note(&row.name, vm.level, &agent, hosts))
+                .flatten();
+        }
+    }
+}
+
+/// The first release that has a `web_search` tool (101.4).
+const SEARCH_SINCE: &str = "0.10.4";
+
+fn shown_name(name: &str) -> String {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
 /// An agent's *Web search* choice on its Settings › Agents row.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
@@ -465,6 +613,10 @@ pub struct AgentWebSearchVm {
     /// The standing warning beside *without asking* ([`unasked_warning`]),
     /// while that is the agent's level; `None` at every other.
     pub warning: Option<String>,
+    /// What the hosts serving the agent make of its level ([`hosts_note`],
+    /// story 102.3): set beside the rows from the serving hosts' manifests;
+    /// `None` while it asks for none or every serving host searches.
+    pub host: Option<String>,
 }
 
 /// The row's choice: `pull_only` when this Mac cannot write the file,
@@ -480,6 +632,7 @@ pub fn switch_vm(
         locked: pull_only,
         unavailable: never(config),
         warning: (level == WebSearchLevel::WithoutAsking).then(|| unasked_warning(engine)),
+        host: None,
     }
 }
 
@@ -648,6 +801,93 @@ mod tests {
             parse_answer(&engine_url, br#"{"results": []}"#),
             Ok(Vec::new())
         );
+    }
+
+    /// Story 102.3 #3 (DW-1471): each Settings row says what the live hosts
+    /// serving its agent make of its level — every one that cannot or does
+    /// not say it searches, or that none serves it, or that they were not
+    /// read — and nothing at *Off*, for an agent never offered a search, or
+    /// where every serving host searches. Another agent's host is not this
+    /// one's.
+    #[test]
+    fn a_rows_web_search_says_what_its_serving_hosts_make_of_it() {
+        let host = |slug: &str, version: &str, agent: &str, web_search| ServingHost {
+            host: slug.to_owned(),
+            version: version.to_owned(),
+            agents: vec![agent.to_owned()],
+            web_search,
+            sandbox: true,
+        };
+        let row = |level, unavailable: Option<&str>| crate::agents::copy::AgentCopyVm {
+            profile_id: "p1".to_owned(),
+            drive: "tgdrive".to_owned(),
+            agent: "nixi".to_owned(),
+            name: "Nixi".to_owned(),
+            matrix_user: "@nixi:example.org".to_owned(),
+            device: None,
+            host: None,
+            signed_in: true,
+            pin: None,
+            problem: None,
+            model: None,
+            web_search: Some(AgentWebSearchVm {
+                level,
+                locked: None,
+                unavailable: unavailable.map(str::to_owned),
+                warning: None,
+                host: None,
+            }),
+            console: None,
+            avatar_problem: None,
+        };
+        let said = |level, unavailable, hosts: Option<&[ServingHost]>| {
+            let mut rows = [row(level, unavailable)];
+            with_hosts(&mut rows, hosts);
+            rows[0].web_search.as_ref().and_then(|vm| vm.host.clone())
+        };
+        use WebSearchLevel::{Ask, Off, WithoutAsking};
+        let searching = [host("electra", "0.10.6", "tgdrive/nixi", Some(true))];
+        let none = [
+            host("electra", "0.10.6", "tgdrive/nixi", Some(false)),
+            host("kalypso", "0.9.0", "tgdrive/nixi", None),
+            host("argo", "0.10.6", "tgdrive/tola", Some(false)),
+        ];
+        assert_eq!(said(Ask, None, Some(&searching)), None);
+        let both = said(WithoutAsking, None, Some(&none)).expect("two hosts say why");
+        assert!(
+            both.contains("electra names no search engine")
+                && both.contains("kalypso runs keeper 0.9.0")
+                && !both.contains("argo"),
+            "{both}"
+        );
+        assert!(said(Ask, None, Some(&[]))
+            .expect("no host")
+            .starts_with("No live host serves Nixi now"));
+        assert!(said(Ask, None, None)
+            .expect("not read")
+            .contains("unknown on this host"));
+        assert_eq!(said(Off, None, Some(&none)), None);
+        assert_eq!(said(Ask, Some("Nixi is a gate."), Some(&none)), None);
+        // R483 (review R102T1-03): another principal's `electra` serving
+        // Lucyna says the opposite of Nixi's, in either order; the row
+        // follows the host it selected for Nixi, never the first `electra`.
+        for nixis in [true, false] {
+            let nixi = host("electra", "0.10.6", "tgdrive/nixi", Some(nixis));
+            let lucyna = host("electra", "0.10.6", "neuradrive/lucyna", Some(!nixis));
+            for hosts in [
+                [nixi.clone(), lucyna.clone()],
+                [lucyna.clone(), nixi.clone()],
+            ] {
+                let note = said(WithoutAsking, None, Some(&hosts));
+                if nixis {
+                    assert_eq!(note, None);
+                } else {
+                    assert!(note
+                        .expect("Nixi's electra names none")
+                        .contains("electra names no search engine"));
+                }
+            }
+        }
     }
 
     fn agent(kind: &str, extra: &str, local_only: bool) -> AgentConfig {
