@@ -21,12 +21,17 @@ send; database sessions never read or write Matrix drafts. An unsent draft lives
 composer and is not restored after leaving that session.
 
 Approval cards show the exact action and its binding digest. A decision is addressed to its
-database and session and bound to that digest; a server refusal stays beside the action. The
+database and session and bound to that digest; a server refusal stays beside the action. A queued
+decision is not final: if Rust reports it refused and decidable again, the same card permits a
+new decision. The
 **Waiting for you** group collects pending decisions across databases. A question in a message
 offers its options, or the normal composer for a free-text answer; Rust closes the question after
-the person's reply. On phones the list and conversation are separate screens, with **Back to
-sessions** returning to the list. The Notes dock and tablet assistant sheet use the same list
-mirror with independent selections, and launch opens Rust's local default session.
+the person's reply. On phones the list and conversation are separate screens. Opening a session
+focuses **Back to sessions**, not the composer, so it does not summon the software keyboard.
+**Back to sessions** or **Escape** returns focus to the originating database-qualified row;
+an open selector consumes Escape before the screen does. The Notes dock and tablet assistant
+sheet use the same list mirror with independent selections, and launch opens Rust's local
+default session.
 
 **Earlier conversations** preserves earlier Matrix agent history as read-only. The former dock's
 Matrix note-focus and drive-scope controls are not sent to database agents: those carriers were
@@ -5265,15 +5270,18 @@ check only with the visitor known as an agent. **Owed:** NFR-122 on the tailnet 
 on electra or hesperia to the other host holding the commit, by doorbell, at most 15 s over 100
 session changes — is an operator measurement on the two hosts (DW-452).
 
-### Measured: an archived session opens (NFR-127)
+### Measured: archived-session VM readiness (NFR-127 supporting evidence)
 
 2026-10-20, `hq_live.rs` `agents_window_archive_and_an_archived_session_opens_within_a_second`:
 the keeper-hq server (Bun 1.2.23, both databases, a throwaway Postgres 18) on delectra, keeper-core's
 client in a Linux container reaching it over the tailnet. One device wrote a session of 1,000
 messages into `tgdrive` (each read *sent* once the server took it); a second device listed it from
 its replica with its database, held its 1,000 messages, archived it (0 of them left in its
-replica, the row still listed as archived), then opened it archived 20 times: the newest page of
-50, read through the registered `sessionPage` query, was on screen in **min 11.8 ms, median
-15.6 ms, p95 17.3 ms, max 21.2 ms** (target ≤ 1 s). Scrolling back read the next 50 the same way;
-unarchiving brought the 1,000 back into the replica. **Owed:** the same run from hesperia against
-electra, and in the installed app.
+replica, the row still listed as archived), then opened it archived 20 times. The newest page of
+50, read through the registered `sessionPage` query, reached keeper-core's complete session VM
+in **min 11.8 ms, median 15.6 ms, p95 17.3 ms, max 21.2 ms**. These are Linux/delectra
+**VM-readiness** measurements: the timer stops at `session_view().complete`, before Tauri IPC or
+frontend rendering. Reading back fetched the next 50; unarchiving restored the 1,000 rows.
+**NFR-127's native end-to-end ≤1 s rendered-page gate remains unverified:** measure from opening
+the archived session through its newest page being painted in the installed app, from hesperia
+against electra. These supporting numbers do not satisfy that native gate.
