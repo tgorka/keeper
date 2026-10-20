@@ -6,6 +6,9 @@ vi.mock("@/lib/ipc/client", () => ({
   // room's menu on mount; a read that never answers renders neither.
   agentsDefaultGet: vi.fn(() => new Promise(() => {})),
   agentsDefaultSet: vi.fn(),
+  // The agents server's status (Epic 106): never answered here, so the section draws nothing.
+  hqStatusSubscribe: vi.fn(() => new Promise(() => {})),
+  hqStatusUnsubscribe: vi.fn(() => Promise.resolve()),
   frontendErrorReport: vi.fn(() => Promise.resolve()),
   // The About sub-block's background-update plan and its writer.
   autoUpdateGet: vi.fn(() =>

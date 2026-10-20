@@ -468,6 +468,16 @@ pub const KEYS: &[KeySpec] = &[
         summary: "Which lease this Mac takes a session's claim on while it hosts your agents (R455). `short` renews it every minute. `quarter-hour` renews it every 15 minutes, so a quiet room is not filled with renewals, and is taken only while every live host in the control room says it reads it; turn it on only after every device and keeper-agentd that serves your agents runs a build that reads it (keeper-agentd's own is `[claims] lease` in `agentd.toml`).",
         example: "\"quarter-hour\"",
     },
+    KeySpec {
+        key: "agents.server_url",
+        family: false,
+        scope: Scope::UserGlobal,
+        settable: Settable::AnyLayer,
+        shape: Shape::Text,
+        default: "",
+        summary: "The base URL of the agents server you run (`https://…` or `http://…`, no user name or password, no query). keeper reads which of its databases this device's pairing opens from `GET <url>/databases` and keeps one local replica of each; the device's token lives in the keychain, never here. Absent means no server: keeper contacts none, and what you write to an agent waits on this device.",
+        example: "\"https://agents.example.org\"",
+    },
     // ---- bots ------------------------------------------------------------
     KeySpec {
         key: "bots.provider_credential_source.",

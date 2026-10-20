@@ -1220,6 +1220,35 @@ pub fn set_push_gateway_url(
     )
 }
 
+/// The agents server's base URL (AD-418, D-4): absent or blank = no server.
+/// User-global, so a person's devices name the same server; the token each
+/// holds for it is per device and lives in the keychain, never here (AD-422).
+const AGENTS_SERVER_URL_KEY: &str = "agents.server_url";
+
+/// Read `agents.server_url` as stored, trimmed; absent or blank ⇒ `None`.
+/// Raw, not parsed: a layer file can set any text, and what Settings shows of
+/// a value keeper will not contact is `hq::vm::HqStatusVm`'s answer.
+pub fn get_agents_server_url(data_dir: &Path) -> Result<Option<String>, CoreError> {
+    Ok(get_setting(data_dir, AGENTS_SERVER_URL_KEY)?
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty()))
+}
+
+/// Write `agents.server_url`: a parsed address, or `None` to clear it — so
+/// keeper never writes an address it would not contact.
+pub fn set_agents_server_url(
+    data_dir: &Path,
+    server: Option<&crate::hq::server::ServerUrl>,
+) -> Result<(), CoreError> {
+    set_setting(
+        data_dir,
+        AGENTS_SERVER_URL_KEY,
+        server
+            .map(crate::hq::server::ServerUrl::as_str)
+            .unwrap_or_default(),
+    )
+}
+
 /// The boot-time config-override file's name (Story 22.6, FR-80): lives beside
 /// `keeper.db` in the data dir.
 pub const CONFIG_FILE_NAME: &str = "config.json";

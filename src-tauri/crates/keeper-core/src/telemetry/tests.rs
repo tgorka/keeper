@@ -540,6 +540,7 @@ fn agent_target_lines_leave_without_their_message() {
         tracing::error!(target: "keeper_agent::runtime", path = "60-sessions/active/plan", "agentd: PRIVATE_SENTINEL turn");
         tracing::warn!(target: "keeper_core::agents::matrix", error = "PRIVATE_SENTINEL", "a provider error");
         tracing::warn!(target: "keeper::sync", "push held for PUBLIC_VISIBLE");
+        tracing::warn!(target: "keeper_core::hq::syncular", why = "PRIVATE_SENTINEL", "agents server not reached");
     });
     telemetry.capture_log(
         LogSite {
@@ -551,8 +552,8 @@ fn agent_target_lines_leave_without_their_message() {
         "tool read 60-sessions/active/plan: PRIVATE_SENTINEL error=\"provider error\"".to_owned(),
     );
     let payloads = queued_payloads(&telemetry);
-    assert_eq!(payloads.len(), 4);
-    for payload in [&payloads[0], &payloads[1], &payloads[3]] {
+    assert_eq!(payloads.len(), 5);
+    for payload in [&payloads[0], &payloads[1], &payloads[3], &payloads[4]] {
         assert!(!payload.contains("PRIVATE_SENTINEL"), "{payload}");
         assert!(!payload.contains("60-sessions"), "{payload}");
         assert!(!payload.contains("provider error"), "{payload}");
@@ -561,7 +562,8 @@ fn agent_target_lines_leave_without_their_message() {
     }
     assert!(payloads[0].contains("\"keeper_agent::runtime\""));
     assert!(payloads[1].contains("\"keeper_core::agents::matrix\""));
-    assert!(payloads[3].contains("\"keeper_agent::tools\""));
+    assert!(payloads[3].contains("\"keeper_core::hq::syncular\""));
+    assert!(payloads[4].contains("\"keeper_agent::tools\""));
     assert!(payloads[2].contains("push held for PUBLIC_VISIBLE"));
 }
 

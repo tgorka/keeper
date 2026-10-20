@@ -491,11 +491,14 @@ pub struct LogSite<'a> {
     pub line: Option<u32>,
 }
 
-/// Agent content stays home (R461): a line under `keeper_agent…` or
-/// `keeper_core::agents…` leaves with its level, target, callsite and
-/// fingerprint, never its message.
+/// Agent content stays home (R461): a line under `keeper_agent…`,
+/// `keeper_core::agents…` or `keeper_core::hq…` (the agents' database, whose
+/// errors can quote a server's refusal of a row) leaves with its level,
+/// target, callsite and fingerprint, never its message.
 pub fn is_agent_target(target: &str) -> bool {
-    target.starts_with("keeper_agent") || target.starts_with("keeper_core::agents")
+    target.starts_with("keeper_agent")
+        || target.starts_with("keeper_core::agents")
+        || target.starts_with("keeper_core::hq")
 }
 
 /// A callsite's file as it may leave: a workspace path as compiled

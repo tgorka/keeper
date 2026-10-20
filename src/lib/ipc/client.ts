@@ -554,6 +554,13 @@ export type { HeldReplyVm } from "./gen/HeldReplyVm";
 export type { HeldRestoreVm } from "./gen/HeldRestoreVm";
 export type { HeldSendVm } from "./gen/HeldSendVm";
 export type { HotkeyVm } from "./gen/HotkeyVm";
+export type { HqDatabaseState } from "./gen/HqDatabaseState";
+export type { HqDatabaseVm } from "./gen/HqDatabaseVm";
+export type { HqDeviceVm } from "./gen/HqDeviceVm";
+export type { HqPairCodeVm } from "./gen/HqPairCodeVm";
+export type { HqPhase } from "./gen/HqPhase";
+export type { HqStatusVm } from "./gen/HqStatusVm";
+export type { HqThisDeviceVm } from "./gen/HqThisDeviceVm";
 export type { InboxBatch } from "./gen/InboxBatch";
 export type { InboxOp } from "./gen/InboxOp";
 export type { InboxRoomVm } from "./gen/InboxRoomVm";
@@ -913,6 +920,9 @@ import type { ForgeReposVm } from "./gen/ForgeReposVm";
 import type { ForgeSourceVm } from "./gen/ForgeSourceVm";
 import type { HeldRestoreVm } from "./gen/HeldRestoreVm";
 import type { HotkeyVm } from "./gen/HotkeyVm";
+import type { HqDeviceVm } from "./gen/HqDeviceVm";
+import type { HqPairCodeVm } from "./gen/HqPairCodeVm";
+import type { HqStatusVm } from "./gen/HqStatusVm";
 import type { InboxBatch } from "./gen/InboxBatch";
 import type { IncognitoVm } from "./gen/IncognitoVm";
 import type { MenuSectionVm } from "./gen/MenuSectionVm";
@@ -4057,6 +4067,53 @@ export async function failureSubscribe(onState: (state: FailureStateVm) => void)
 /** End a {@link failureSubscribe} stream. */
 export async function failureUnsubscribe(subscriptionId: string): Promise<void> {
   await invoke<void>("failure_unsubscribe", { subscriptionId });
+}
+
+/**
+ * Stream the agents server's status (AD-418): the server row, each database's line and what
+ * waits on this device — Rust's sentences — at once and at every change. Resolves with the
+ * subscription id for {@link hqStatusUnsubscribe}.
+ */
+export async function hqStatusSubscribe(onStatus: (status: HqStatusVm) => void): Promise<string> {
+  return await subscribeWithStringId<HqStatusVm>("hq_status_subscribe", onStatus);
+}
+
+/** End an {@link hqStatusSubscribe} stream. */
+export async function hqStatusUnsubscribe(subscriptionId: string): Promise<void> {
+  await invoke<void>("hq_status_unsubscribe", { subscriptionId });
+}
+
+/**
+ * Set `agents.server_url`: `""` clears it. Rejects with Rust's sentence, storing nothing,
+ * when the address is not one keeper contacts; resolves with the status after.
+ */
+export async function hqServerSet(url: string): Promise<HqStatusVm> {
+  return await invoke<HqStatusVm>("hq_server_set", { url });
+}
+
+/** Forget the server: this device's pairing with it and its replicas here. */
+export async function hqServerForget(): Promise<HqStatusVm> {
+  return await invoke<HqStatusVm>("hq_server_forget");
+}
+
+/** A code, and its QR, another device of this person can redeem. */
+export async function hqPairStart(): Promise<HqPairCodeVm> {
+  return await invoke<HqPairCodeVm>("hq_pair_start");
+}
+
+/** Redeem a code typed or pasted on this device; rejects with Rust's sentence. */
+export async function hqPairRedeem(code: string): Promise<HqStatusVm> {
+  return await invoke<HqStatusVm>("hq_pair_redeem", { code });
+}
+
+/** The person's devices, as the server's directory lists them. */
+export async function hqDevicesList(): Promise<HqDeviceVm[]> {
+  return await invoke<HqDeviceVm[]>("hq_devices_list");
+}
+
+/** Remove one of the person's devices from the server; resolves with the devices after. */
+export async function hqDeviceRevoke(clientId: string): Promise<HqDeviceVm[]> {
+  return await invoke<HqDeviceVm[]>("hq_device_revoke", { clientId });
 }
 
 /** Subscribe to {@link PUSH_OPEN_EVENT}; resolves with an unlisten function. */

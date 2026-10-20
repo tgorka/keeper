@@ -1757,6 +1757,11 @@ pub enum EgressKind {
     /// Settings › Agents › *Web search* names one; only agents a person
     /// switched web search on for send it their queries.
     WebSearch,
+    /// The agents server the person named in `agents.server_url` (R-HQ-9):
+    /// its host and port, never its path. One row for every database it
+    /// serves this device. Present only while the setting holds an address
+    /// keeper contacts.
+    AgentsServer,
 }
 
 /// One network destination keeper contacts, derived from live app state (Story

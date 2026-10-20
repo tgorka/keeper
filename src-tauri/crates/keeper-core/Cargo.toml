@@ -133,6 +133,11 @@ prost = "0.14"
 # back from a real `fmt` subscriber (Epic 100). Already in the workspace
 # catalog and linked by every host, so no new crate is resolved.
 tracing-subscriber = { workspace = true }
+# The agents' database (AD-418, AD-421): one replica per database the device's
+# token opens, each driven on its own owner thread (`hq`). The port is
+# `hq::port`; this crate is its one adapter (`hq::syncular`). tauri- and
+# gix-free; its SQLite is the workspace's rusqlite.
+syncular-client = { workspace = true }
 
 [dev-dependencies]
 # The privacy lifecycle tests observe real localhost connection/cancellation;

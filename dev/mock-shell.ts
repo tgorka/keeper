@@ -140,6 +140,9 @@ import type {
   HeldRestoreVm,
   HeldSendVm,
   HotkeyVm,
+  HqDeviceVm,
+  HqPairCodeVm,
+  HqStatusVm,
   InboxBatch,
   InboxRoomVm,
   IpcError,
@@ -9202,7 +9205,180 @@ function mockAgentAsks(roomId: string): AgentAsksVm {
   return { asks: [ask], note };
 }
 
+/**
+ * The agents server (Epic 106, `keeper_core::hq`). Every sentence is copied from
+ * `hq::vm`; the address grammar is Rust's (`hq::server::ServerUrl::parse`) and this answers
+ * its common shapes. `?hq=` picks the state Settings › Agents › Agents server opens on:
+ * absent — no server; `connected` — paired, both databases connected; `notopen` — paired,
+ * one database no longer open to this device; `removed` — this device was removed;
+ * `notpaired` — an address and no pairing.
+ */
+const hqParam = new URLSearchParams(window.location.search).get("hq");
+const HQ_SERVER = "https://agents.example.org";
+const HQ_HOST = "agents.example.org";
+const hqDb = (
+  name: string,
+  state: HqStatusVm["databases"][number]["state"],
+): HqStatusVm["databases"][number] => ({
+  name,
+  state,
+  waiting: 0,
+  sentence: {
+    connecting: "Connecting…",
+    connected: "Connected.",
+    offline: "Can't reach the server; keeper keeps trying.",
+    notOpen: "Not open to this device any more; what it holds stays readable here.",
+    removed: "This device was removed; what it holds stays readable here.",
+  }[state],
+});
+const HQ_DEVICE = { clientId: "tgorka.0a1b2c3d", name: "keeper on hesperia" };
+function hqFixture(): HqStatusVm {
+  switch (hqParam) {
+    case "connected":
+    case "notopen":
+      return {
+        server: HQ_SERVER,
+        phase: "paired",
+        sentence: `Paired with ${HQ_HOST}.`,
+        device: HQ_DEVICE,
+        databases: [
+          hqDb("tgdrive", "connected"),
+          hqDb("neuradrive", hqParam === "notopen" ? "notOpen" : "connected"),
+        ],
+        waitingHere: 0,
+      };
+    case "removed":
+      return {
+        server: HQ_SERVER,
+        phase: "removed",
+        sentence: `This device was removed from ${HQ_HOST}. It no longer syncs, and what it holds stays readable here until you remove it.`,
+        device: HQ_DEVICE,
+        databases: [hqDb("tgdrive", "removed"), hqDb("neuradrive", "removed")],
+        waitingHere: 0,
+      };
+    case "notpaired":
+      return {
+        server: HQ_SERVER,
+        phase: "notPaired",
+        sentence: `This device is not paired with ${HQ_HOST}. Type the code a paired device shows under Add a device.`,
+        device: null,
+        databases: [],
+        waitingHere: 0,
+      };
+    default:
+      return {
+        server: null,
+        phase: "noServer",
+        sentence:
+          "No server is set. What you write to your agents waits on this device. 2 changes wait on this device.",
+        device: null,
+        databases: [],
+        waitingHere: 2,
+      };
+  }
+}
+let hqStatus: HqStatusVm = hqFixture();
+const hqWatchers = new Map<string, MockChannel<HqStatusVm>>();
+let hqDevices: HqDeviceVm[] = [
+  { ...HQ_DEVICE, addedAtMs: Date.UTC(2026, 9, 20), thisDevice: true, revoked: false },
+  {
+    clientId: "tgorka.9f8e7d6c",
+    name: "keeper on kalypso",
+    addedAtMs: Date.UTC(2026, 9, 20),
+    thisDevice: false,
+    revoked: false,
+  },
+];
+function hqPublish(next: HqStatusVm): HqStatusVm {
+  hqStatus = next;
+  for (const channel of hqWatchers.values()) channel.onmessage?.(hqStatus);
+  return hqStatus;
+}
+function hqRefuse(message: string): never {
+  throw { code: "internal", message, accountId: null, retriable: false };
+}
+const hqHandlers: Record<string, (payload: Record<string, unknown>) => unknown> = {
+  hq_status_subscribe: (payload) => {
+    const id = `hq-subscription-${hqWatchers.size + 1}`;
+    const channel = payload.channel as MockChannel<HqStatusVm>;
+    hqWatchers.set(id, channel);
+    channel.onmessage?.(hqStatus);
+    return id;
+  },
+  hq_status_unsubscribe: (payload) => {
+    hqWatchers.delete(String(payload.subscriptionId));
+    return null;
+  },
+  hq_server_set: (payload) => {
+    const typed = String(payload.url ?? "").trim();
+    if (typed === "") {
+      return hqPublish({ ...hqFixture(), server: null, phase: "noServer", device: null, databases: [] });
+    }
+    if (!typed.includes("://")) {
+      hqRefuse(
+        "A server address starts with https:// or http://, as in https://agents.example.org.",
+      );
+    }
+    const scheme = typed.split("://")[0] ?? "";
+    if (scheme !== "https" && scheme !== "http") {
+      hqRefuse(
+        `keeper reaches your agents server over https:// or http://, and this address starts with ${scheme}://.`,
+      );
+    }
+    const server = typed.replace(/\/$/, "");
+    const host = server.split("://")[1]?.split("/")[0] ?? server;
+    return hqPublish({
+      server,
+      phase: "notPaired",
+      sentence: `This device is not paired with ${host}. Type the code a paired device shows under Add a device.`,
+      device: null,
+      databases: [],
+      waitingHere: 0,
+    });
+  },
+  hq_server_forget: () =>
+    hqPublish({
+      server: HQ_SERVER,
+      phase: "notPaired",
+      sentence: `This device is not paired with ${HQ_HOST}. Type the code a paired device shows under Add a device.`,
+      device: null,
+      databases: [],
+      waitingHere: 0,
+    }),
+  hq_pair_redeem: (payload) => {
+    const code = String(payload.code ?? "").replace(/[\s-]/g, "");
+    if (code.length !== 24) {
+      hqRefuse(`A pairing code has 24 characters; this has ${code.length}.`);
+    }
+    hqPaired();
+    return hqStatus;
+  },
+  hq_pair_start: (): HqPairCodeVm => ({
+    code: "7K2M-Q9XD-4HTR-8BWN-3CVE-6PJA",
+    qrSvg: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 29 29"><rect width="29" height="29" fill="#fff"/><path d="M1 1h7v7H1zM21 1h7v7h-7zM1 21h7v7H1zM11 11h7v7h-7z" fill="#000"/></svg>`,
+    expiresAtMs: Date.now() + 10 * 60 * 1000,
+  }),
+  hq_devices_list: () => hqDevices,
+  hq_device_revoke: (payload) => {
+    hqDevices = hqDevices.map((device) =>
+      device.clientId === payload.clientId ? { ...device, revoked: true } : device,
+    );
+    return hqDevices;
+  },
+};
+function hqPaired() {
+  hqPublish({
+    server: HQ_SERVER,
+    phase: "paired",
+    sentence: `Paired with ${HQ_HOST}.`,
+    device: HQ_DEVICE,
+    databases: [hqDb("tgdrive", "connected"), hqDb("neuradrive", "connected")],
+    waitingHere: 0,
+  });
+}
+
 const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = {
+  ...hqHandlers,
   push_gateway_get: () => pushGateway,
   push_open_take: () => null,
   failure_subscribe: (payload) => {
