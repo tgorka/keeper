@@ -8,6 +8,8 @@
 //!
 //! - [`turn`] opens a turn: the rows, the replay, the grants, the request.
 //! - [`drive`] runs it: the tool loop, the partial row, the stream.
+//! - [`served`] runs an agent's turn from a person's message with no room:
+//!   the agent's loop and limits, streamed into the host's sink.
 //! - [`host`] is the drive tool host every tool call goes through.
 //! - [`task`] is the scheduled bot task, over the same arming.
 //! - [`sessions`] is the sessions runtime: one plan at a time per zone.
@@ -107,6 +109,8 @@ pub mod runtime;
 pub mod search;
 #[cfg(not(phone))]
 pub mod seed;
+#[cfg(not(phone))]
+pub mod served;
 pub mod sessions;
 pub mod sinks;
 pub mod skills;
