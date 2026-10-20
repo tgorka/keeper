@@ -17,6 +17,8 @@
 //! - [`promote`] promotes a session's files into its artifacts and its
 //!   harvested notes into the drive's vault, and renders the promote panel.
 //! - [`approval`] is the ask-and-wait a host with a person at it plugs in.
+//! - [`parked`] is the park and resume of an approval behind a record port,
+//!   for a host whose record is a row rather than a room's file and event.
 //! - [`grants`] is where a turn's grants come from: the app's rows or an
 //!   agent's own `agent.toml`.
 //! - [`agent`] is an agent's turn in a session, over its held context;
@@ -98,6 +100,8 @@ pub mod matrix_sink;
 #[cfg(not(phone))]
 pub mod mcp;
 pub mod memory;
+#[cfg(not(phone))]
+pub mod parked;
 pub mod ports;
 pub mod previews;
 pub mod promote;

@@ -109,9 +109,10 @@ last wrote it. Times are UTC milliseconds since the epoch.
 - **`actors`** — a person or an agent: `kind` (`person` | `agent`), `display_name`, `family` (an
   agent's family; an agent outside a family is a family of one), `dir`.
 - **`clients`** — a device or an agent instance: `actor_id`, `kind` (`device` | `instance`), `name`,
-  `host`, `created_at_ms`, `revoked_at_ms`, `dir`. No credential, token hash or push target: those
-  stay in the server's own tables, outside every scope, because a synced row reaches every client
-  of its scope.
+  `host` (the machine an instance runs on; the one a device named when it paired, or null),
+  `created_at_ms`, `revoked_at_ms`, `dir`. No credential, token hash or push target: those stay in
+  the server's own tables, outside every scope, because a synced row reaches every client of its
+  scope.
 - **`agent_profiles`** — what an agent instance says about itself: `actor_id`, `name`,
   `description`, `avatar_blob`, `definition_hash`, `image_digest`, `started_at_ms`, `dir`.
 - **`sessions`** — `title`, `status`, `agent_actor`, `created_by_actor`, `created_by_client`,
@@ -188,9 +189,10 @@ commit.
    exactly one, and an update carries the version it read, so a second taker conflicts instead of
    overwriting.
 8. **V8 — approvals.** `pending` becomes `approved` or `denied` only by an actor named in
-   `approvers`, with `decided_by_actor` and `decided_by_client` the commit's; `approved` becomes
-   `consumed` only by the claim holder, with `consumed_by_client` the commit's; a decision on a
-   tier-4 approval comes only from a client whose host is not the claim holder's host.
+   `approvers`, never by an agent, with `decided_by_actor` and `decided_by_client` the commit's;
+   `approved` becomes `consumed` only by the claim holder, with `consumed_by_client` the commit's;
+   a decision on a tier-4 approval comes only from a client whose host is not the claim holder's
+   host. A consumption carries the version it read, so a second consumer conflicts.
 9. **V9 — preferences.** `instance_prefs.person_actor` is the commit's actor.
 10. **V10 — memory.** An agent instance writes only rows whose `agent_actor` is its actor and
     whose `family` is its family, and only `journal`, `proposal` and `family` entries; `user` and
