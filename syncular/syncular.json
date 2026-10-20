@@ -99,9 +99,14 @@
       "scopes": { "actor": ["{actorId}"] }
     },
     {
-      "name": "agentMemory",
+      "name": "agentMemoryOwn",
       "table": "agent_memory",
-      "scopes": { "agent": ["{agentActor}"], "family": ["{family}"] }
+      "scopes": { "agent": ["{agentActor}"] }
+    },
+    {
+      "name": "agentMemoryFamily",
+      "table": "agent_memory",
+      "scopes": { "family": ["{family}"] }
     }
   ]
 }

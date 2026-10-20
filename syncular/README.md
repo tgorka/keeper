@@ -144,7 +144,11 @@ last wrote it. Times are UTC milliseconds since the epoch.
   `agent_actor`, `default_client`, `fallback` (a JSON array of client ids, in order),
   `updated_at_ms`.
 - **`agent_memory`** — `agent_actor`, `family`, `kind` (`user` | `memory` | `journal` | `proposal`
-  | `family`), `text`, `source_session`, `created_at_ms`. Every row carries both scope values.
+  | `family`), `text`, `source_session`, `created_at_ms`. Every row carries both scope values. A
+  client requests the two independently, because a subscription matches every variable it
+  requests: `agentMemoryOwn` (`agent` alone) receives one agent's rows, and `agentMemoryFamily`
+  (`family` alone) receives every row of a family, its peers' included. A subscription requesting
+  both would receive only the rows of that agent in that family.
 
 Declared references, enforced by the server at commit: `clients` and `agent_profiles` need their
 actor; `claims`, `session_tool_switches`, `turn_chunks` and `attachments` need their session and go
@@ -206,8 +210,11 @@ An attachment's `size` is at most 26,214,400 bytes and its message is in the sam
 `bun run check:syncular:live` runs a server's startup — `PostgresServerStorage.migrate()` and
 `ensureSyncServerReady` over `syncular.generated.ts` — against a real Postgres, twice, for every
 URL in `KEEPER_SYNC_TEST_PG_URL` (space-separated). Each URL logs in as a role whose `search_path`
-names its own schema. It fails unless the first start puts every contract table in that schema
-and none in `public`, the second start changes no table, column, index or schema marker, and rows
-committed through the push path come back page by page from a registered `sessionPage`, which
-refuses a page key the actor does not hold. It writes into partition `live-check`: point it at a
-throwaway database.
+names its own schema, which must be empty: a schema that already holds anything is refused. It
+fails unless the first start puts every contract table in that schema and none in `public`, the
+second start changes no table, column, index or schema marker, and the rows this run commits
+through the push path — in a fresh partition, under fresh ids and commit ids, so no write is a
+cached replay of an earlier run — come back page by page from a registered `sessionPage`, which
+refuses a page key the actor does not hold; and unless an agent instance's `agentMemoryOwn` and
+`agentMemoryFamily` subscriptions receive its own rows and its family peers' rows, and never
+another family's. Point it at a fresh, throwaway database.

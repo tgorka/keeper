@@ -1498,7 +1498,7 @@
       ]
     },
     {
-      "name": "agentMemory",
+      "name": "agentMemoryOwn",
       "table": "agent_memory",
       "scopes": [
         {
@@ -1509,7 +1509,13 @@
               "name": "agentActor"
             }
           ]
-        },
+        }
+      ]
+    },
+    {
+      "name": "agentMemoryFamily",
+      "table": "agent_memory",
+      "scopes": [
         {
           "variable": "family",
           "values": [
