@@ -1,0 +1,16 @@
+-- Reads over a session's own rows (`session:<session_id>`): the committed
+-- text of a turn that is still streaming, and the session's attachments.
+sync query turnChunks(sessionId: string, turnId: string) {
+  select id, session_id, turn_id, seq, text, created_at_ms, author_actor, author_client
+  from turn_chunks
+  where turn_chunks.session_id = :sessionId
+    and turn_chunks.turn_id = :turnId
+  order by seq;
+}
+
+sync query sessionAttachments(sessionId: string) {
+  select id, session_id, message_id, blob_ref, name, mime, size, created_at_ms, author_actor, author_client
+  from attachments
+  where attachments.session_id = :sessionId
+  order by created_at_ms, id;
+}

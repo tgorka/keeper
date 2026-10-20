@@ -1,0 +1,1658 @@
+{
+  "queryIrVersion": 4,
+  "queries": [
+    {
+      "name": "memberSessions",
+      "file": "member-sessions.syql",
+      "sourceSql": "select sessions.id, sessions.title, sessions.status, sessions.agent_actor, sessions.parent_session, sessions.archived, sessions.heard_until, sessions.created_at_ms, sessions.last_activity_ms, session_members.role, session_members.reads_trace, session_members.read_until\n  from session_members join sessions on sessions.id = session_members.session_id\n  where session_members.actor_id = :actorId\n  order by sessions.last_activity_ms desc, sessions.id desc",
+      "sql": "select sessions.id, sessions.title, sessions.status, sessions.agent_actor, sessions.parent_session, sessions.archived, sessions.heard_until, sessions.created_at_ms, sessions.last_activity_ms, session_members.role, session_members.reads_trace, session_members.read_until\n  from session_members join sessions on sessions.id = session_members.session_id\n  where session_members.actor_id = :actorId\n  order by sessions.last_activity_ms desc, sessions.id desc",
+      "positionalSql": "select sessions.id, sessions.title, sessions.status, sessions.agent_actor, sessions.parent_session, sessions.archived, sessions.heard_until, sessions.created_at_ms, sessions.last_activity_ms, session_members.role, session_members.reads_trace, session_members.read_until from session_members join sessions on sessions.id = session_members.session_id where session_members.actor_id = ? order by sessions.last_activity_ms desc, sessions.id desc",
+      "relations": [
+        {
+          "table": "session_members",
+          "start": 275,
+          "end": 290
+        },
+        {
+          "table": "sessions",
+          "start": 296,
+          "end": 304
+        }
+      ],
+      "params": [
+        {
+          "name": "actorId",
+          "langName": "actorId",
+          "type": "string"
+        }
+      ],
+      "columns": [
+        {
+          "name": "id",
+          "langName": "id",
+          "type": "string",
+          "nullable": false,
+          "fidelity": "exact",
+          "origin": {
+            "table": "sessions",
+            "column": "id"
+          }
+        },
+        {
+          "name": "title",
+          "langName": "title",
+          "type": "string",
+          "nullable": false,
+          "fidelity": "exact",
+          "origin": {
+            "table": "sessions",
+            "column": "title"
+          }
+        },
+        {
+          "name": "status",
+          "langName": "status",
+          "type": "string",
+          "nullable": false,
+          "fidelity": "exact",
+          "origin": {
+            "table": "sessions",
+            "column": "status"
+          }
+        },
+        {
+          "name": "agent_actor",
+          "langName": "agent_actor",
+          "type": "string",
+          "nullable": false,
+          "fidelity": "exact",
+          "origin": {
+            "table": "sessions",
+            "column": "agent_actor"
+          }
+        },
+        {
+          "name": "parent_session",
+          "langName": "parent_session",
+          "type": "string",
+          "nullable": true,
+          "fidelity": "exact",
+          "origin": {
+            "table": "sessions",
+            "column": "parent_session"
+          }
+        },
+        {
+          "name": "archived",
+          "langName": "archived",
+          "type": "boolean",
+          "nullable": false,
+          "fidelity": "exact",
+          "origin": {
+            "table": "sessions",
+            "column": "archived"
+          }
+        },
+        {
+          "name": "heard_until",
+          "langName": "heard_until",
+          "type": "json",
+          "nullable": true,
+          "fidelity": "exact",
+          "origin": {
+            "table": "sessions",
+            "column": "heard_until"
+          }
+        },
+        {
+          "name": "created_at_ms",
+          "langName": "created_at_ms",
+          "type": "integer",
+          "nullable": false,
+          "fidelity": "exact",
+          "origin": {
+            "table": "sessions",
+            "column": "created_at_ms"
+          }
+        },
+        {
+          "name": "last_activity_ms",
+          "langName": "last_activity_ms",
+          "type": "integer",
+          "nullable": false,
+          "fidelity": "exact",
+          "origin": {
+            "table": "sessions",
+            "column": "last_activity_ms"
+          }
+        },
+        {
+          "name": "role",
+          "langName": "role",
+          "type": "string",
+          "nullable": false,
+          "fidelity": "exact",
+          "origin": {
+            "table": "session_members",
+            "column": "role"
+          }
+        },
+        {
+          "name": "reads_trace",
+          "langName": "reads_trace",
+          "type": "boolean",
+          "nullable": false,
+          "fidelity": "exact",
+          "origin": {
+            "table": "session_members",
+            "column": "reads_trace"
+          }
+        },
+        {
+          "name": "read_until",
+          "langName": "read_until",
+          "type": "integer",
+          "nullable": true,
+          "fidelity": "exact",
+          "origin": {
+            "table": "session_members",
+            "column": "read_until"
+          }
+        }
+      ],
+      "tables": [
+        "session_members",
+        "sessions"
+      ],
+      "reactive": {
+        "dependencies": [
+          {
+            "table": "session_members",
+            "scopes": [
+              {
+                "variable": "member",
+                "pattern": "member:{member}",
+                "params": [
+                  "actorId"
+                ]
+              }
+            ]
+          },
+          {
+            "table": "sessions",
+            "scopes": []
+          }
+        ],
+        "coverage": []
+      },
+      "syql": {
+        "revision": 1,
+        "inputs": [
+          {
+            "kind": "value",
+            "name": "actorId",
+            "langName": "actorId",
+            "type": "string",
+            "nullable": false,
+            "required": true
+          }
+        ],
+        "plan": {
+          "backend": "variants",
+          "activationControls": [],
+          "conditions": [],
+          "statements": [
+            {
+              "activationMask": 0,
+              "sql": "select sessions.id, sessions.title, sessions.status, sessions.agent_actor, sessions.parent_session, sessions.archived, sessions.heard_until, sessions.created_at_ms, sessions.last_activity_ms, session_members.role, session_members.reads_trace, session_members.read_until\n  from session_members join sessions on sessions.id = session_members.session_id\n  where session_members.actor_id = :actorId\n  order by sessions.last_activity_ms desc, sessions.id desc",
+              "positionalSql": "select sessions.id, sessions.title, sessions.status, sessions.agent_actor, sessions.parent_session, sessions.archived, sessions.heard_until, sessions.created_at_ms, sessions.last_activity_ms, session_members.role, session_members.reads_trace, session_members.read_until from session_members join sessions on sessions.id = session_members.session_id where session_members.actor_id = ? order by sessions.last_activity_ms desc, sessions.id desc",
+              "relations": [
+                {
+                  "table": "session_members",
+                  "start": 275,
+                  "end": 290
+                },
+                {
+                  "table": "sessions",
+                  "start": 296,
+                  "end": 304
+                }
+              ],
+              "binds": [
+                {
+                  "kind": "value",
+                  "name": "actorId",
+                  "type": "string",
+                  "input": "actorId"
+                }
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "pageReasoning",
+      "file": "page-trace.syql",
+      "sourceSql": "select id, session_id, page_key, turn_id, seq, compacted, text, created_at_ms, author_actor, author_client\n  from reasoning\n  where reasoning.page_key = :pageKey\n  order by created_at_ms, id",
+      "sql": "select id, session_id, page_key, turn_id, seq, compacted, text, created_at_ms, author_actor, author_client\n  from reasoning\n  where reasoning.page_key = :pageKey\n  order by created_at_ms, id",
+      "positionalSql": "select id, session_id, page_key, turn_id, seq, compacted, text, created_at_ms, author_actor, author_client from reasoning where reasoning.page_key = ? order by created_at_ms, id",
+      "relations": [
+        {
+          "table": "reasoning",
+          "start": 112,
+          "end": 121
+        }
+      ],
+      "params": [
+        {
+          "name": "pageKey",
+          "langName": "pageKey",
+          "type": "string"
+        }
+      ],
+      "columns": [
+        {
+          "name": "id",
+          "langName": "id",
+          "type": "string",
+          "nullable": false,
+          "fidelity": "exact",
+          "origin": {
+            "table": "reasoning",
+            "column": "id"
+          }
+        },
+        {
+          "name": "session_id",
+          "langName": "session_id",
+          "type": "string",
+          "nullable": false,
+          "fidelity": "exact",
+          "origin": {
+            "table": "reasoning",
+            "column": "session_id"
+          }
+        },
+        {
+          "name": "page_key",
+          "langName": "page_key",
+          "type": "string",
+          "nullable": false,
+          "fidelity": "exact",
+          "origin": {
+            "table": "reasoning",
+            "column": "page_key"
+          }
+        },
+        {
+          "name": "turn_id",
+          "langName": "turn_id",
+          "type": "string",
+          "nullable": false,
+          "fidelity": "exact",
+          "origin": {
+            "table": "reasoning",
+            "column": "turn_id"
+          }
+        },
+        {
+          "name": "seq",
+          "langName": "seq",
+          "type": "integer",
+          "nullable": false,
+          "fidelity": "exact",
+          "origin": {
+            "table": "reasoning",
+            "column": "seq"
+          }
+        },
+        {
+          "name": "compacted",
+          "langName": "compacted",
+          "type": "boolean",
+          "nullable": false,
+          "fidelity": "exact",
+          "origin": {
+            "table": "reasoning",
+            "column": "compacted"
+          }
+        },
+        {
+          "name": "text",
+          "langName": "text",
+          "type": "string",
+          "nullable": false,
+          "fidelity": "exact",
+          "origin": {
+            "table": "reasoning",
+            "column": "text"
+          }
+        },
+        {
+          "name": "created_at_ms",
+          "langName": "created_at_ms",
+          "type": "integer",
+          "nullable": false,
+          "fidelity": "exact",
+          "origin": {
+            "table": "reasoning",
+            "column": "created_at_ms"
+          }
+        },
+        {
+          "name": "author_actor",
+          "langName": "author_actor",
+          "type": "string",
+          "nullable": false,
+          "fidelity": "exact",
+          "origin": {
+            "table": "reasoning",
+            "column": "author_actor"
+          }
+        },
+        {
+          "name": "author_client",
+          "langName": "author_client",
+          "type": "string",
+          "nullable": false,
+          "fidelity": "exact",
+          "origin": {
+            "table": "reasoning",
+            "column": "author_client"
+          }
+        }
+      ],
+      "tables": [
+        "reasoning"
+      ],
+      "reactive": {
+        "dependencies": [
+          {
+            "table": "reasoning",
+            "scopes": [
+              {
+                "variable": "trace",
+                "pattern": "trace:{trace}",
+                "params": [
+                  "pageKey"
+                ]
+              }
+            ]
+          }
+        ],
+        "coverage": [
+          {
+            "table": "reasoning",
+            "variable": "trace",
+            "units": [
+              "pageKey"
+            ],
+            "fixedScopes": []
+          }
+        ],
+        "rowKey": [
+          "id"
+        ]
+      },
+      "syql": {
+        "revision": 1,
+        "inputs": [
+          {
+            "kind": "value",
+            "name": "pageKey",
+            "langName": "pageKey",
+            "type": "string",
+            "nullable": false,
+            "required": true
+          }
+        ],
+        "plan": {
+          "backend": "variants",
+          "activationControls": [],
+          "conditions": [],
+          "statements": [
+            {
+              "activationMask": 0,
+              "sql": "select id, session_id, page_key, turn_id, seq, compacted, text, created_at_ms, author_actor, author_client\n  from reasoning\n  where reasoning.page_key = :pageKey\n  order by created_at_ms, id",
+              "positionalSql": "select id, session_id, page_key, turn_id, seq, compacted, text, created_at_ms, author_actor, author_client from reasoning where reasoning.page_key = ? order by created_at_ms, id",
+              "relations": [
+                {
+                  "table": "reasoning",
+                  "start": 112,
+                  "end": 121
+                }
+              ],
+              "binds": [
+                {
+                  "kind": "value",
+                  "name": "pageKey",
+                  "type": "string",
+                  "input": "pageKey"
+                }
+              ]
+            }
+          ]
+        },
+        "identity": [
+          "id"
+        ]
+      }
+    },
+    {
+      "name": "pageToolCalls",
+      "file": "page-trace.syql",
+      "sourceSql": "select id, session_id, page_key, turn_id, name, args, status, result, result_blob, started_at_ms, ended_at_ms, created_at_ms, author_actor, author_client\n  from tool_calls\n  where tool_calls.page_key = :pageKey\n  order by created_at_ms, id",
+      "sql": "select id, session_id, page_key, turn_id, name, args, status, result, result_blob, started_at_ms, ended_at_ms, created_at_ms, author_actor, author_client\n  from tool_calls\n  where tool_calls.page_key = :pageKey\n  order by created_at_ms, id",
+      "positionalSql": "select id, session_id, page_key, turn_id, name, args, status, result, result_blob, started_at_ms, ended_at_ms, created_at_ms, author_actor, author_client from tool_calls where tool_calls.page_key = ? order by created_at_ms, id",
+      "relations": [
+        {
+          "table": "tool_calls",
+          "start": 159,
+          "end": 169
+        }
+      ],
+      "params": [
+        {
+          "name": "pageKey",
+          "langName": "pageKey",
+          "type": "string"
+        }
+      ],
+      "columns": [
+        {
+          "name": "id",
+          "langName": "id",
+          "type": "string",
+          "nullable": false,
+          "fidelity": "exact",
+          "origin": {
+            "table": "tool_calls",
+            "column": "id"
+          }
+        },
+        {
+          "name": "session_id",
+          "langName": "session_id",
+          "type": "string",
+          "nullable": false,
+          "fidelity": "exact",
+          "origin": {
+            "table": "tool_calls",
+            "column": "session_id"
+          }
+        },
+        {
+          "name": "page_key",
+          "langName": "page_key",
+          "type": "string",
+          "nullable": false,
+          "fidelity": "exact",
+          "origin": {
+            "table": "tool_calls",
+            "column": "page_key"
+          }
+        },
+        {
+          "name": "turn_id",
+          "langName": "turn_id",
+          "type": "string",
+          "nullable": false,
+          "fidelity": "exact",
+          "origin": {
+            "table": "tool_calls",
+            "column": "turn_id"
+          }
+        },
+        {
+          "name": "name",
+          "langName": "name",
+          "type": "string",
+          "nullable": false,
+          "fidelity": "exact",
+          "origin": {
+            "table": "tool_calls",
+            "column": "name"
+          }
+        },
+        {
+          "name": "args",
+          "langName": "args",
+          "type": "json",
+          "nullable": false,
+          "fidelity": "exact",
+          "origin": {
+            "table": "tool_calls",
+            "column": "args"
+          }
+        },
+        {
+          "name": "status",
+          "langName": "status",
+          "type": "string",
+          "nullable": false,
+          "fidelity": "exact",
+          "origin": {
+            "table": "tool_calls",
+            "column": "status"
+          }
+        },
+        {
+          "name": "result",
+          "langName": "result",
+          "type": "string",
+          "nullable": true,
+          "fidelity": "exact",
+          "origin": {
+            "table": "tool_calls",
+            "column": "result"
+          }
+        },
+        {
+          "name": "result_blob",
+          "langName": "result_blob",
+          "type": "blob_ref",
+          "nullable": true,
+          "fidelity": "exact",
+          "origin": {
+            "table": "tool_calls",
+            "column": "result_blob"
+          }
+        },
+        {
+          "name": "started_at_ms",
+          "langName": "started_at_ms",
+          "type": "integer",
+          "nullable": true,
+          "fidelity": "exact",
+          "origin": {
+            "table": "tool_calls",
+            "column": "started_at_ms"
+          }
+        },
+        {
+          "name": "ended_at_ms",
+          "langName": "ended_at_ms",
+          "type": "integer",
+          "nullable": true,
+          "fidelity": "exact",
+          "origin": {
+            "table": "tool_calls",
+            "column": "ended_at_ms"
+          }
+        },
+        {
+          "name": "created_at_ms",
+          "langName": "created_at_ms",
+          "type": "integer",
+          "nullable": false,
+          "fidelity": "exact",
+          "origin": {
+            "table": "tool_calls",
+            "column": "created_at_ms"
+          }
+        },
+        {
+          "name": "author_actor",
+          "langName": "author_actor",
+          "type": "string",
+          "nullable": false,
+          "fidelity": "exact",
+          "origin": {
+            "table": "tool_calls",
+            "column": "author_actor"
+          }
+        },
+        {
+          "name": "author_client",
+          "langName": "author_client",
+          "type": "string",
+          "nullable": false,
+          "fidelity": "exact",
+          "origin": {
+            "table": "tool_calls",
+            "column": "author_client"
+          }
+        }
+      ],
+      "tables": [
+        "tool_calls"
+      ],
+      "reactive": {
+        "dependencies": [
+          {
+            "table": "tool_calls",
+            "scopes": [
+              {
+                "variable": "trace",
+                "pattern": "trace:{trace}",
+                "params": [
+                  "pageKey"
+                ]
+              }
+            ]
+          }
+        ],
+        "coverage": [
+          {
+            "table": "tool_calls",
+            "variable": "trace",
+            "units": [
+              "pageKey"
+            ],
+            "fixedScopes": []
+          }
+        ],
+        "rowKey": [
+          "id"
+        ]
+      },
+      "syql": {
+        "revision": 1,
+        "inputs": [
+          {
+            "kind": "value",
+            "name": "pageKey",
+            "langName": "pageKey",
+            "type": "string",
+            "nullable": false,
+            "required": true
+          }
+        ],
+        "plan": {
+          "backend": "variants",
+          "activationControls": [],
+          "conditions": [],
+          "statements": [
+            {
+              "activationMask": 0,
+              "sql": "select id, session_id, page_key, turn_id, name, args, status, result, result_blob, started_at_ms, ended_at_ms, created_at_ms, author_actor, author_client\n  from tool_calls\n  where tool_calls.page_key = :pageKey\n  order by created_at_ms, id",
+              "positionalSql": "select id, session_id, page_key, turn_id, name, args, status, result, result_blob, started_at_ms, ended_at_ms, created_at_ms, author_actor, author_client from tool_calls where tool_calls.page_key = ? order by created_at_ms, id",
+              "relations": [
+                {
+                  "table": "tool_calls",
+                  "start": 159,
+                  "end": 169
+                }
+              ],
+              "binds": [
+                {
+                  "kind": "value",
+                  "name": "pageKey",
+                  "type": "string",
+                  "input": "pageKey"
+                }
+              ]
+            }
+          ]
+        },
+        "identity": [
+          "id"
+        ]
+      }
+    },
+    {
+      "name": "pageApprovals",
+      "file": "page-trace.syql",
+      "sourceSql": "select id, session_id, page_key, tool_call_id, tier, binding_digest, summary, approvers, state, decided_by_actor, decided_by_client, consumed_by_client, expires_at_ms, created_at_ms, author_actor, author_client\n  from approvals\n  where approvals.page_key = :pageKey\n  order by created_at_ms, id",
+      "sql": "select id, session_id, page_key, tool_call_id, tier, binding_digest, summary, approvers, state, decided_by_actor, decided_by_client, consumed_by_client, expires_at_ms, created_at_ms, author_actor, author_client\n  from approvals\n  where approvals.page_key = :pageKey\n  order by created_at_ms, id",
+      "positionalSql": "select id, session_id, page_key, tool_call_id, tier, binding_digest, summary, approvers, state, decided_by_actor, decided_by_client, consumed_by_client, expires_at_ms, created_at_ms, author_actor, author_client from approvals where approvals.page_key = ? order by created_at_ms, id",
+      "relations": [
+        {
+          "table": "approvals",
+          "start": 216,
+          "end": 225
+        }
+      ],
+      "params": [
+        {
+          "name": "pageKey",
+          "langName": "pageKey",
+          "type": "string"
+        }
+      ],
+      "columns": [
+        {
+          "name": "id",
+          "langName": "id",
+          "type": "string",
+          "nullable": false,
+          "fidelity": "exact",
+          "origin": {
+            "table": "approvals",
+            "column": "id"
+          }
+        },
+        {
+          "name": "session_id",
+          "langName": "session_id",
+          "type": "string",
+          "nullable": false,
+          "fidelity": "exact",
+          "origin": {
+            "table": "approvals",
+            "column": "session_id"
+          }
+        },
+        {
+          "name": "page_key",
+          "langName": "page_key",
+          "type": "string",
+          "nullable": false,
+          "fidelity": "exact",
+          "origin": {
+            "table": "approvals",
+            "column": "page_key"
+          }
+        },
+        {
+          "name": "tool_call_id",
+          "langName": "tool_call_id",
+          "type": "string",
+          "nullable": false,
+          "fidelity": "exact",
+          "origin": {
+            "table": "approvals",
+            "column": "tool_call_id"
+          }
+        },
+        {
+          "name": "tier",
+          "langName": "tier",
+          "type": "string",
+          "nullable": false,
+          "fidelity": "exact",
+          "origin": {
+            "table": "approvals",
+            "column": "tier"
+          }
+        },
+        {
+          "name": "binding_digest",
+          "langName": "binding_digest",
+          "type": "string",
+          "nullable": false,
+          "fidelity": "exact",
+          "origin": {
+            "table": "approvals",
+            "column": "binding_digest"
+          }
+        },
+        {
+          "name": "summary",
+          "langName": "summary",
+          "type": "string",
+          "nullable": false,
+          "fidelity": "exact",
+          "origin": {
+            "table": "approvals",
+            "column": "summary"
+          }
+        },
+        {
+          "name": "approvers",
+          "langName": "approvers",
+          "type": "json",
+          "nullable": false,
+          "fidelity": "exact",
+          "origin": {
+            "table": "approvals",
+            "column": "approvers"
+          }
+        },
+        {
+          "name": "state",
+          "langName": "state",
+          "type": "string",
+          "nullable": false,
+          "fidelity": "exact",
+          "origin": {
+            "table": "approvals",
+            "column": "state"
+          }
+        },
+        {
+          "name": "decided_by_actor",
+          "langName": "decided_by_actor",
+          "type": "string",
+          "nullable": true,
+          "fidelity": "exact",
+          "origin": {
+            "table": "approvals",
+            "column": "decided_by_actor"
+          }
+        },
+        {
+          "name": "decided_by_client",
+          "langName": "decided_by_client",
+          "type": "string",
+          "nullable": true,
+          "fidelity": "exact",
+          "origin": {
+            "table": "approvals",
+            "column": "decided_by_client"
+          }
+        },
+        {
+          "name": "consumed_by_client",
+          "langName": "consumed_by_client",
+          "type": "string",
+          "nullable": true,
+          "fidelity": "exact",
+          "origin": {
+            "table": "approvals",
+            "column": "consumed_by_client"
+          }
+        },
+        {
+          "name": "expires_at_ms",
+          "langName": "expires_at_ms",
+          "type": "integer",
+          "nullable": false,
+          "fidelity": "exact",
+          "origin": {
+            "table": "approvals",
+            "column": "expires_at_ms"
+          }
+        },
+        {
+          "name": "created_at_ms",
+          "langName": "created_at_ms",
+          "type": "integer",
+          "nullable": false,
+          "fidelity": "exact",
+          "origin": {
+            "table": "approvals",
+            "column": "created_at_ms"
+          }
+        },
+        {
+          "name": "author_actor",
+          "langName": "author_actor",
+          "type": "string",
+          "nullable": false,
+          "fidelity": "exact",
+          "origin": {
+            "table": "approvals",
+            "column": "author_actor"
+          }
+        },
+        {
+          "name": "author_client",
+          "langName": "author_client",
+          "type": "string",
+          "nullable": false,
+          "fidelity": "exact",
+          "origin": {
+            "table": "approvals",
+            "column": "author_client"
+          }
+        }
+      ],
+      "tables": [
+        "approvals"
+      ],
+      "reactive": {
+        "dependencies": [
+          {
+            "table": "approvals",
+            "scopes": [
+              {
+                "variable": "trace",
+                "pattern": "trace:{trace}",
+                "params": [
+                  "pageKey"
+                ]
+              }
+            ]
+          }
+        ],
+        "coverage": [
+          {
+            "table": "approvals",
+            "variable": "trace",
+            "units": [
+              "pageKey"
+            ],
+            "fixedScopes": []
+          }
+        ],
+        "rowKey": [
+          "id"
+        ]
+      },
+      "syql": {
+        "revision": 1,
+        "inputs": [
+          {
+            "kind": "value",
+            "name": "pageKey",
+            "langName": "pageKey",
+            "type": "string",
+            "nullable": false,
+            "required": true
+          }
+        ],
+        "plan": {
+          "backend": "variants",
+          "activationControls": [],
+          "conditions": [],
+          "statements": [
+            {
+              "activationMask": 0,
+              "sql": "select id, session_id, page_key, tool_call_id, tier, binding_digest, summary, approvers, state, decided_by_actor, decided_by_client, consumed_by_client, expires_at_ms, created_at_ms, author_actor, author_client\n  from approvals\n  where approvals.page_key = :pageKey\n  order by created_at_ms, id",
+              "positionalSql": "select id, session_id, page_key, tool_call_id, tier, binding_digest, summary, approvers, state, decided_by_actor, decided_by_client, consumed_by_client, expires_at_ms, created_at_ms, author_actor, author_client from approvals where approvals.page_key = ? order by created_at_ms, id",
+              "relations": [
+                {
+                  "table": "approvals",
+                  "start": 216,
+                  "end": 225
+                }
+              ],
+              "binds": [
+                {
+                  "kind": "value",
+                  "name": "pageKey",
+                  "type": "string",
+                  "input": "pageKey"
+                }
+              ]
+            }
+          ]
+        },
+        "identity": [
+          "id"
+        ]
+      }
+    },
+    {
+      "name": "turnChunks",
+      "file": "session-live.syql",
+      "sourceSql": "select id, session_id, turn_id, seq, text, created_at_ms, author_actor, author_client\n  from turn_chunks\n  where turn_chunks.session_id = :sessionId\n    and turn_chunks.turn_id = :turnId\n  order by seq",
+      "sql": "select id, session_id, turn_id, seq, text, created_at_ms, author_actor, author_client\n  from turn_chunks\n  where turn_chunks.session_id = :sessionId\n    and turn_chunks.turn_id = :turnId\n  order by seq",
+      "positionalSql": "select id, session_id, turn_id, seq, text, created_at_ms, author_actor, author_client from turn_chunks where turn_chunks.session_id = ? and turn_chunks.turn_id = ? order by seq",
+      "relations": [
+        {
+          "table": "turn_chunks",
+          "start": 91,
+          "end": 102
+        }
+      ],
+      "params": [
+        {
+          "name": "sessionId",
+          "langName": "sessionId",
+          "type": "string"
+        },
+        {
+          "name": "turnId",
+          "langName": "turnId",
+          "type": "string"
+        }
+      ],
+      "columns": [
+        {
+          "name": "id",
+          "langName": "id",
+          "type": "string",
+          "nullable": false,
+          "fidelity": "exact",
+          "origin": {
+            "table": "turn_chunks",
+            "column": "id"
+          }
+        },
+        {
+          "name": "session_id",
+          "langName": "session_id",
+          "type": "string",
+          "nullable": false,
+          "fidelity": "exact",
+          "origin": {
+            "table": "turn_chunks",
+            "column": "session_id"
+          }
+        },
+        {
+          "name": "turn_id",
+          "langName": "turn_id",
+          "type": "string",
+          "nullable": false,
+          "fidelity": "exact",
+          "origin": {
+            "table": "turn_chunks",
+            "column": "turn_id"
+          }
+        },
+        {
+          "name": "seq",
+          "langName": "seq",
+          "type": "integer",
+          "nullable": false,
+          "fidelity": "exact",
+          "origin": {
+            "table": "turn_chunks",
+            "column": "seq"
+          }
+        },
+        {
+          "name": "text",
+          "langName": "text",
+          "type": "string",
+          "nullable": false,
+          "fidelity": "exact",
+          "origin": {
+            "table": "turn_chunks",
+            "column": "text"
+          }
+        },
+        {
+          "name": "created_at_ms",
+          "langName": "created_at_ms",
+          "type": "integer",
+          "nullable": false,
+          "fidelity": "exact",
+          "origin": {
+            "table": "turn_chunks",
+            "column": "created_at_ms"
+          }
+        },
+        {
+          "name": "author_actor",
+          "langName": "author_actor",
+          "type": "string",
+          "nullable": false,
+          "fidelity": "exact",
+          "origin": {
+            "table": "turn_chunks",
+            "column": "author_actor"
+          }
+        },
+        {
+          "name": "author_client",
+          "langName": "author_client",
+          "type": "string",
+          "nullable": false,
+          "fidelity": "exact",
+          "origin": {
+            "table": "turn_chunks",
+            "column": "author_client"
+          }
+        }
+      ],
+      "tables": [
+        "turn_chunks"
+      ],
+      "reactive": {
+        "dependencies": [
+          {
+            "table": "turn_chunks",
+            "scopes": [
+              {
+                "variable": "session",
+                "pattern": "session:{session}",
+                "params": [
+                  "sessionId"
+                ]
+              }
+            ]
+          }
+        ],
+        "coverage": [
+          {
+            "table": "turn_chunks",
+            "variable": "session",
+            "units": [
+              "sessionId"
+            ],
+            "fixedScopes": []
+          }
+        ],
+        "rowKey": [
+          "id"
+        ]
+      },
+      "syql": {
+        "revision": 1,
+        "inputs": [
+          {
+            "kind": "value",
+            "name": "sessionId",
+            "langName": "sessionId",
+            "type": "string",
+            "nullable": false,
+            "required": true
+          },
+          {
+            "kind": "value",
+            "name": "turnId",
+            "langName": "turnId",
+            "type": "string",
+            "nullable": false,
+            "required": true
+          }
+        ],
+        "plan": {
+          "backend": "variants",
+          "activationControls": [],
+          "conditions": [],
+          "statements": [
+            {
+              "activationMask": 0,
+              "sql": "select id, session_id, turn_id, seq, text, created_at_ms, author_actor, author_client\n  from turn_chunks\n  where turn_chunks.session_id = :sessionId\n    and turn_chunks.turn_id = :turnId\n  order by seq",
+              "positionalSql": "select id, session_id, turn_id, seq, text, created_at_ms, author_actor, author_client from turn_chunks where turn_chunks.session_id = ? and turn_chunks.turn_id = ? order by seq",
+              "relations": [
+                {
+                  "table": "turn_chunks",
+                  "start": 91,
+                  "end": 102
+                }
+              ],
+              "binds": [
+                {
+                  "kind": "value",
+                  "name": "sessionId",
+                  "type": "string",
+                  "input": "sessionId"
+                },
+                {
+                  "kind": "value",
+                  "name": "turnId",
+                  "type": "string",
+                  "input": "turnId"
+                }
+              ]
+            }
+          ]
+        },
+        "identity": [
+          "id"
+        ]
+      }
+    },
+    {
+      "name": "sessionAttachments",
+      "file": "session-live.syql",
+      "sourceSql": "select id, session_id, message_id, blob_ref, name, mime, size, created_at_ms, author_actor, author_client\n  from attachments\n  where attachments.session_id = :sessionId\n  order by created_at_ms, id",
+      "sql": "select id, session_id, message_id, blob_ref, name, mime, size, created_at_ms, author_actor, author_client\n  from attachments\n  where attachments.session_id = :sessionId\n  order by created_at_ms, id",
+      "positionalSql": "select id, session_id, message_id, blob_ref, name, mime, size, created_at_ms, author_actor, author_client from attachments where attachments.session_id = ? order by created_at_ms, id",
+      "relations": [
+        {
+          "table": "attachments",
+          "start": 111,
+          "end": 122
+        }
+      ],
+      "params": [
+        {
+          "name": "sessionId",
+          "langName": "sessionId",
+          "type": "string"
+        }
+      ],
+      "columns": [
+        {
+          "name": "id",
+          "langName": "id",
+          "type": "string",
+          "nullable": false,
+          "fidelity": "exact",
+          "origin": {
+            "table": "attachments",
+            "column": "id"
+          }
+        },
+        {
+          "name": "session_id",
+          "langName": "session_id",
+          "type": "string",
+          "nullable": false,
+          "fidelity": "exact",
+          "origin": {
+            "table": "attachments",
+            "column": "session_id"
+          }
+        },
+        {
+          "name": "message_id",
+          "langName": "message_id",
+          "type": "string",
+          "nullable": false,
+          "fidelity": "exact",
+          "origin": {
+            "table": "attachments",
+            "column": "message_id"
+          }
+        },
+        {
+          "name": "blob_ref",
+          "langName": "blob_ref",
+          "type": "blob_ref",
+          "nullable": false,
+          "fidelity": "exact",
+          "origin": {
+            "table": "attachments",
+            "column": "blob_ref"
+          }
+        },
+        {
+          "name": "name",
+          "langName": "name",
+          "type": "string",
+          "nullable": false,
+          "fidelity": "exact",
+          "origin": {
+            "table": "attachments",
+            "column": "name"
+          }
+        },
+        {
+          "name": "mime",
+          "langName": "mime",
+          "type": "string",
+          "nullable": false,
+          "fidelity": "exact",
+          "origin": {
+            "table": "attachments",
+            "column": "mime"
+          }
+        },
+        {
+          "name": "size",
+          "langName": "size",
+          "type": "integer",
+          "nullable": false,
+          "fidelity": "exact",
+          "origin": {
+            "table": "attachments",
+            "column": "size"
+          }
+        },
+        {
+          "name": "created_at_ms",
+          "langName": "created_at_ms",
+          "type": "integer",
+          "nullable": false,
+          "fidelity": "exact",
+          "origin": {
+            "table": "attachments",
+            "column": "created_at_ms"
+          }
+        },
+        {
+          "name": "author_actor",
+          "langName": "author_actor",
+          "type": "string",
+          "nullable": false,
+          "fidelity": "exact",
+          "origin": {
+            "table": "attachments",
+            "column": "author_actor"
+          }
+        },
+        {
+          "name": "author_client",
+          "langName": "author_client",
+          "type": "string",
+          "nullable": false,
+          "fidelity": "exact",
+          "origin": {
+            "table": "attachments",
+            "column": "author_client"
+          }
+        }
+      ],
+      "tables": [
+        "attachments"
+      ],
+      "reactive": {
+        "dependencies": [
+          {
+            "table": "attachments",
+            "scopes": [
+              {
+                "variable": "session",
+                "pattern": "session:{session}",
+                "params": [
+                  "sessionId"
+                ]
+              }
+            ]
+          }
+        ],
+        "coverage": [
+          {
+            "table": "attachments",
+            "variable": "session",
+            "units": [
+              "sessionId"
+            ],
+            "fixedScopes": []
+          }
+        ],
+        "rowKey": [
+          "id"
+        ]
+      },
+      "syql": {
+        "revision": 1,
+        "inputs": [
+          {
+            "kind": "value",
+            "name": "sessionId",
+            "langName": "sessionId",
+            "type": "string",
+            "nullable": false,
+            "required": true
+          }
+        ],
+        "plan": {
+          "backend": "variants",
+          "activationControls": [],
+          "conditions": [],
+          "statements": [
+            {
+              "activationMask": 0,
+              "sql": "select id, session_id, message_id, blob_ref, name, mime, size, created_at_ms, author_actor, author_client\n  from attachments\n  where attachments.session_id = :sessionId\n  order by created_at_ms, id",
+              "positionalSql": "select id, session_id, message_id, blob_ref, name, mime, size, created_at_ms, author_actor, author_client from attachments where attachments.session_id = ? order by created_at_ms, id",
+              "relations": [
+                {
+                  "table": "attachments",
+                  "start": 111,
+                  "end": 122
+                }
+              ],
+              "binds": [
+                {
+                  "kind": "value",
+                  "name": "sessionId",
+                  "type": "string",
+                  "input": "sessionId"
+                }
+              ]
+            }
+          ]
+        },
+        "identity": [
+          "id"
+        ]
+      }
+    },
+    {
+      "name": "sessionPage",
+      "file": "session-page.syql",
+      "sourceSql": "select id, session_id, page_key, turn_id, role, body, body_blob, metadata, created_at_ms, author_actor, author_client\n  from messages\n  where messages.page_key = :pageKey\n    and(messages.created_at_ms < :beforeMs or(messages.created_at_ms = :beforeMs and messages.id < :beforeId))\n  order by created_at_ms desc, id desc\n  limit case when :pageSize between 1 and 10000 then :pageSize else 10000 end",
+      "sql": "select id, session_id, page_key, turn_id, role, body, body_blob, metadata, created_at_ms, author_actor, author_client\n  from messages\n  where messages.page_key = :pageKey\n    and(messages.created_at_ms < :beforeMs or(messages.created_at_ms = :beforeMs and messages.id < :beforeId))\n  order by created_at_ms desc, id desc\n  limit case when :pageSize between 1 and 10000 then :pageSize else 10000 end",
+      "positionalSql": "select id, session_id, page_key, turn_id, role, body, body_blob, metadata, created_at_ms, author_actor, author_client from messages where messages.page_key = ?1 and(messages.created_at_ms < ?2 or(messages.created_at_ms = ?2 and messages.id < ?3)) order by created_at_ms desc, id desc limit case when ?4 between 1 and 10000 then ?4 else 10000 end",
+      "relations": [
+        {
+          "table": "messages",
+          "start": 123,
+          "end": 131
+        }
+      ],
+      "params": [
+        {
+          "name": "pageKey",
+          "langName": "pageKey",
+          "type": "string"
+        },
+        {
+          "name": "beforeMs",
+          "langName": "beforeMs",
+          "type": "integer"
+        },
+        {
+          "name": "beforeId",
+          "langName": "beforeId",
+          "type": "string"
+        },
+        {
+          "name": "pageSize",
+          "langName": "pageSize",
+          "type": "integer"
+        }
+      ],
+      "columns": [
+        {
+          "name": "id",
+          "langName": "id",
+          "type": "string",
+          "nullable": false,
+          "fidelity": "exact",
+          "origin": {
+            "table": "messages",
+            "column": "id"
+          }
+        },
+        {
+          "name": "session_id",
+          "langName": "session_id",
+          "type": "string",
+          "nullable": false,
+          "fidelity": "exact",
+          "origin": {
+            "table": "messages",
+            "column": "session_id"
+          }
+        },
+        {
+          "name": "page_key",
+          "langName": "page_key",
+          "type": "string",
+          "nullable": false,
+          "fidelity": "exact",
+          "origin": {
+            "table": "messages",
+            "column": "page_key"
+          }
+        },
+        {
+          "name": "turn_id",
+          "langName": "turn_id",
+          "type": "string",
+          "nullable": true,
+          "fidelity": "exact",
+          "origin": {
+            "table": "messages",
+            "column": "turn_id"
+          }
+        },
+        {
+          "name": "role",
+          "langName": "role",
+          "type": "string",
+          "nullable": false,
+          "fidelity": "exact",
+          "origin": {
+            "table": "messages",
+            "column": "role"
+          }
+        },
+        {
+          "name": "body",
+          "langName": "body",
+          "type": "string",
+          "nullable": false,
+          "fidelity": "exact",
+          "origin": {
+            "table": "messages",
+            "column": "body"
+          }
+        },
+        {
+          "name": "body_blob",
+          "langName": "body_blob",
+          "type": "blob_ref",
+          "nullable": true,
+          "fidelity": "exact",
+          "origin": {
+            "table": "messages",
+            "column": "body_blob"
+          }
+        },
+        {
+          "name": "metadata",
+          "langName": "metadata",
+          "type": "json",
+          "nullable": true,
+          "fidelity": "exact",
+          "origin": {
+            "table": "messages",
+            "column": "metadata"
+          }
+        },
+        {
+          "name": "created_at_ms",
+          "langName": "created_at_ms",
+          "type": "integer",
+          "nullable": false,
+          "fidelity": "exact",
+          "origin": {
+            "table": "messages",
+            "column": "created_at_ms"
+          }
+        },
+        {
+          "name": "author_actor",
+          "langName": "author_actor",
+          "type": "string",
+          "nullable": false,
+          "fidelity": "exact",
+          "origin": {
+            "table": "messages",
+            "column": "author_actor"
+          }
+        },
+        {
+          "name": "author_client",
+          "langName": "author_client",
+          "type": "string",
+          "nullable": false,
+          "fidelity": "exact",
+          "origin": {
+            "table": "messages",
+            "column": "author_client"
+          }
+        }
+      ],
+      "tables": [
+        "messages"
+      ],
+      "reactive": {
+        "dependencies": [
+          {
+            "table": "messages",
+            "scopes": [
+              {
+                "variable": "page",
+                "pattern": "page:{page}",
+                "params": [
+                  "pageKey"
+                ]
+              }
+            ]
+          }
+        ],
+        "coverage": [
+          {
+            "table": "messages",
+            "variable": "page",
+            "units": [
+              "pageKey"
+            ],
+            "fixedScopes": []
+          }
+        ],
+        "rowKey": [
+          "id"
+        ]
+      },
+      "syql": {
+        "revision": 1,
+        "inputs": [
+          {
+            "kind": "value",
+            "name": "pageKey",
+            "langName": "pageKey",
+            "type": "string",
+            "nullable": false,
+            "required": true
+          },
+          {
+            "kind": "value",
+            "name": "beforeMs",
+            "langName": "beforeMs",
+            "type": "integer",
+            "nullable": false,
+            "required": true
+          },
+          {
+            "kind": "value",
+            "name": "beforeId",
+            "langName": "beforeId",
+            "type": "string",
+            "nullable": false,
+            "required": true
+          },
+          {
+            "kind": "value",
+            "name": "pageSize",
+            "langName": "pageSize",
+            "type": "integer",
+            "nullable": false,
+            "required": true
+          }
+        ],
+        "plan": {
+          "backend": "variants",
+          "activationControls": [],
+          "conditions": [],
+          "statements": [
+            {
+              "activationMask": 0,
+              "sql": "select id, session_id, page_key, turn_id, role, body, body_blob, metadata, created_at_ms, author_actor, author_client\n  from messages\n  where messages.page_key = :pageKey\n    and(messages.created_at_ms < :beforeMs or(messages.created_at_ms = :beforeMs and messages.id < :beforeId))\n  order by created_at_ms desc, id desc\n  limit case when :pageSize between 1 and 10000 then :pageSize else 10000 end",
+              "positionalSql": "select id, session_id, page_key, turn_id, role, body, body_blob, metadata, created_at_ms, author_actor, author_client from messages where messages.page_key = ?1 and(messages.created_at_ms < ?2 or(messages.created_at_ms = ?2 and messages.id < ?3)) order by created_at_ms desc, id desc limit case when ?4 between 1 and 10000 then ?4 else 10000 end",
+              "relations": [
+                {
+                  "table": "messages",
+                  "start": 123,
+                  "end": 131
+                }
+              ],
+              "binds": [
+                {
+                  "kind": "value",
+                  "name": "pageKey",
+                  "type": "string",
+                  "input": "pageKey"
+                },
+                {
+                  "kind": "value",
+                  "name": "beforeMs",
+                  "type": "integer",
+                  "input": "beforeMs"
+                },
+                {
+                  "kind": "value",
+                  "name": "beforeId",
+                  "type": "string",
+                  "input": "beforeId"
+                },
+                {
+                  "kind": "value",
+                  "name": "pageSize",
+                  "type": "integer",
+                  "input": "pageSize"
+                }
+              ]
+            }
+          ]
+        },
+        "identity": [
+          "id"
+        ]
+      }
+    }
+  ]
+}

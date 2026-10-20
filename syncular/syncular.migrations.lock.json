@@ -1,0 +1,868 @@
+{
+  "formatVersion": 2,
+  "migrations": [
+    {
+      "name": "0001_initial",
+      "sha256": "62ca56a80d227c1e53e7e564b049a9453b546a04c83f17de67034de6396750e5"
+    }
+  ],
+  "head": {
+    "tables": [
+      {
+        "name": "actors",
+        "primaryKey": "id",
+        "columns": [
+          {
+            "name": "id",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "kind",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "display_name",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "family",
+            "type": "string",
+            "nullable": true
+          },
+          {
+            "name": "dir",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "created_at_ms",
+            "type": "integer",
+            "nullable": false
+          },
+          {
+            "name": "author_actor",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "author_client",
+            "type": "string",
+            "nullable": false
+          }
+        ]
+      },
+      {
+        "name": "agent_memory",
+        "primaryKey": "id",
+        "columns": [
+          {
+            "name": "id",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "agent_actor",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "family",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "kind",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "text",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "source_session",
+            "type": "string",
+            "nullable": true
+          },
+          {
+            "name": "created_at_ms",
+            "type": "integer",
+            "nullable": false
+          },
+          {
+            "name": "author_actor",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "author_client",
+            "type": "string",
+            "nullable": false
+          }
+        ]
+      },
+      {
+        "name": "agent_profiles",
+        "primaryKey": "id",
+        "columns": [
+          {
+            "name": "id",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "actor_id",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "name",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "description",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "avatar_blob",
+            "type": "blob_ref",
+            "nullable": true
+          },
+          {
+            "name": "definition_hash",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "image_digest",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "started_at_ms",
+            "type": "integer",
+            "nullable": false
+          },
+          {
+            "name": "dir",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "author_actor",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "author_client",
+            "type": "string",
+            "nullable": false
+          }
+        ]
+      },
+      {
+        "name": "approvals",
+        "primaryKey": "id",
+        "columns": [
+          {
+            "name": "id",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "session_id",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "page_key",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "tool_call_id",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "tier",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "binding_digest",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "summary",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "approvers",
+            "type": "json",
+            "nullable": false
+          },
+          {
+            "name": "state",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "decided_by_actor",
+            "type": "string",
+            "nullable": true
+          },
+          {
+            "name": "decided_by_client",
+            "type": "string",
+            "nullable": true
+          },
+          {
+            "name": "consumed_by_client",
+            "type": "string",
+            "nullable": true
+          },
+          {
+            "name": "expires_at_ms",
+            "type": "integer",
+            "nullable": false
+          },
+          {
+            "name": "created_at_ms",
+            "type": "integer",
+            "nullable": false
+          },
+          {
+            "name": "author_actor",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "author_client",
+            "type": "string",
+            "nullable": false
+          }
+        ]
+      },
+      {
+        "name": "attachments",
+        "primaryKey": "id",
+        "columns": [
+          {
+            "name": "id",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "session_id",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "message_id",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "blob_ref",
+            "type": "blob_ref",
+            "nullable": false
+          },
+          {
+            "name": "name",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "mime",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "size",
+            "type": "integer",
+            "nullable": false
+          },
+          {
+            "name": "created_at_ms",
+            "type": "integer",
+            "nullable": false
+          },
+          {
+            "name": "author_actor",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "author_client",
+            "type": "string",
+            "nullable": false
+          }
+        ]
+      },
+      {
+        "name": "claims",
+        "primaryKey": "session_id",
+        "columns": [
+          {
+            "name": "session_id",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "holder_actor",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "holder_client",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "epoch",
+            "type": "integer",
+            "nullable": false
+          },
+          {
+            "name": "renewed_at_ms",
+            "type": "integer",
+            "nullable": false
+          },
+          {
+            "name": "released",
+            "type": "boolean",
+            "nullable": false
+          },
+          {
+            "name": "author_actor",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "author_client",
+            "type": "string",
+            "nullable": false
+          }
+        ]
+      },
+      {
+        "name": "clients",
+        "primaryKey": "id",
+        "columns": [
+          {
+            "name": "id",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "actor_id",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "kind",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "name",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "host",
+            "type": "string",
+            "nullable": true
+          },
+          {
+            "name": "created_at_ms",
+            "type": "integer",
+            "nullable": false
+          },
+          {
+            "name": "revoked_at_ms",
+            "type": "integer",
+            "nullable": true
+          },
+          {
+            "name": "dir",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "author_actor",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "author_client",
+            "type": "string",
+            "nullable": false
+          }
+        ]
+      },
+      {
+        "name": "instance_prefs",
+        "primaryKey": "id",
+        "columns": [
+          {
+            "name": "id",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "person_actor",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "agent_actor",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "default_client",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "fallback",
+            "type": "json",
+            "nullable": false
+          },
+          {
+            "name": "updated_at_ms",
+            "type": "integer",
+            "nullable": false
+          },
+          {
+            "name": "author_actor",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "author_client",
+            "type": "string",
+            "nullable": false
+          }
+        ]
+      },
+      {
+        "name": "messages",
+        "primaryKey": "id",
+        "columns": [
+          {
+            "name": "id",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "session_id",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "page_key",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "turn_id",
+            "type": "string",
+            "nullable": true
+          },
+          {
+            "name": "role",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "body",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "body_blob",
+            "type": "blob_ref",
+            "nullable": true
+          },
+          {
+            "name": "metadata",
+            "type": "json",
+            "nullable": true
+          },
+          {
+            "name": "created_at_ms",
+            "type": "integer",
+            "nullable": false
+          },
+          {
+            "name": "author_actor",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "author_client",
+            "type": "string",
+            "nullable": false
+          }
+        ]
+      },
+      {
+        "name": "reasoning",
+        "primaryKey": "id",
+        "columns": [
+          {
+            "name": "id",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "session_id",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "page_key",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "turn_id",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "seq",
+            "type": "integer",
+            "nullable": false
+          },
+          {
+            "name": "compacted",
+            "type": "boolean",
+            "nullable": false
+          },
+          {
+            "name": "text",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "created_at_ms",
+            "type": "integer",
+            "nullable": false
+          },
+          {
+            "name": "author_actor",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "author_client",
+            "type": "string",
+            "nullable": false
+          }
+        ]
+      },
+      {
+        "name": "session_members",
+        "primaryKey": "id",
+        "columns": [
+          {
+            "name": "id",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "session_id",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "actor_id",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "role",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "reads_trace",
+            "type": "boolean",
+            "nullable": false
+          },
+          {
+            "name": "added_by_actor",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "added_at_ms",
+            "type": "integer",
+            "nullable": false
+          },
+          {
+            "name": "read_until",
+            "type": "integer",
+            "nullable": true
+          },
+          {
+            "name": "author_actor",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "author_client",
+            "type": "string",
+            "nullable": false
+          }
+        ]
+      },
+      {
+        "name": "session_tool_switches",
+        "primaryKey": "session_id",
+        "columns": [
+          {
+            "name": "session_id",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "tools_off",
+            "type": "json",
+            "nullable": false
+          },
+          {
+            "name": "updated_at_ms",
+            "type": "integer",
+            "nullable": false
+          },
+          {
+            "name": "author_actor",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "author_client",
+            "type": "string",
+            "nullable": false
+          }
+        ]
+      },
+      {
+        "name": "sessions",
+        "primaryKey": "id",
+        "columns": [
+          {
+            "name": "id",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "title",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "status",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "agent_actor",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "created_by_actor",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "created_by_client",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "preferred_client",
+            "type": "string",
+            "nullable": true
+          },
+          {
+            "name": "parent_session",
+            "type": "string",
+            "nullable": true
+          },
+          {
+            "name": "invite",
+            "type": "json",
+            "nullable": false
+          },
+          {
+            "name": "archived",
+            "type": "boolean",
+            "nullable": false
+          },
+          {
+            "name": "heard_until",
+            "type": "json",
+            "nullable": true
+          },
+          {
+            "name": "created_at_ms",
+            "type": "integer",
+            "nullable": false
+          },
+          {
+            "name": "last_activity_ms",
+            "type": "integer",
+            "nullable": false
+          },
+          {
+            "name": "author_actor",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "author_client",
+            "type": "string",
+            "nullable": false
+          }
+        ]
+      },
+      {
+        "name": "tool_calls",
+        "primaryKey": "id",
+        "columns": [
+          {
+            "name": "id",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "session_id",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "page_key",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "turn_id",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "name",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "args",
+            "type": "json",
+            "nullable": false
+          },
+          {
+            "name": "status",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "result",
+            "type": "string",
+            "nullable": true
+          },
+          {
+            "name": "result_blob",
+            "type": "blob_ref",
+            "nullable": true
+          },
+          {
+            "name": "started_at_ms",
+            "type": "integer",
+            "nullable": true
+          },
+          {
+            "name": "ended_at_ms",
+            "type": "integer",
+            "nullable": true
+          },
+          {
+            "name": "created_at_ms",
+            "type": "integer",
+            "nullable": false
+          },
+          {
+            "name": "author_actor",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "author_client",
+            "type": "string",
+            "nullable": false
+          }
+        ]
+      },
+      {
+        "name": "turn_chunks",
+        "primaryKey": "id",
+        "columns": [
+          {
+            "name": "id",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "session_id",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "turn_id",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "seq",
+            "type": "integer",
+            "nullable": false
+          },
+          {
+            "name": "text",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "created_at_ms",
+            "type": "integer",
+            "nullable": false
+          },
+          {
+            "name": "author_actor",
+            "type": "string",
+            "nullable": false
+          },
+          {
+            "name": "author_client",
+            "type": "string",
+            "nullable": false
+          }
+        ]
+      }
+    ]
+  }
+}
