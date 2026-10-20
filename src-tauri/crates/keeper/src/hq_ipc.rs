@@ -1,15 +1,22 @@
-//! Shell call sites of `keeper_core::hq` (AD-418, AD-422): the process's one
-//! [`Hq`], started once the settings layers are installed and reconciled
-//! whenever a setting or a settings layer changes, its commands, and the
-//! pairing link a scanned QR opens. Every decision — the address grammar,
-//! the pairing, which databases sync, every sentence — is core's; this holds
-//! it and streams its status.
+//! Shell call sites of `keeper_core::hq` (AD-418, AD-422, AD-424): the
+//! process's one [`Hq`], started once the settings layers are installed and
+//! reconciled whenever a setting or a settings layer changes, its commands,
+//! the pairing link a scanned QR opens, and the Agents window's streams.
+//! Every decision — the address grammar, the pairing, which databases sync,
+//! the list, its order and attention, every sentence — is core's; this holds
+//! it and streams what it answers.
 
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex, OnceLock, PoisonError};
 
+use keeper_core::hq::approvals::{AgentApprovalVm, AgentDecisionOutcomeVm};
 use keeper_core::hq::routes::HttpRoutes;
+use keeper_core::hq::sessions::{
+    diff, AgentChoiceVm, AgentDefaultSessionVm, AgentSessionRef, AgentSessionsBatch,
+    AgentSessionsOp,
+};
 use keeper_core::hq::syncular::SyncularOpener;
+use keeper_core::hq::timeline::AgentSessionViewVm;
 use keeper_core::hq::vm::{HqPairCodeVm, HqStatusVm};
 use keeper_core::hq::{Hq, HqError};
 use keeper_core::vm::{IpcError, IpcErrorCode};
@@ -23,9 +30,39 @@ pub const PAIR_OFFER_EVENT: &str = "hq-pair-offer";
 /// The process's agents server service, set once by [`init`].
 static HQ: OnceLock<Arc<Hq>> = OnceLock::new();
 
-/// The live status subscriptions, so an unmounting webview can end its own.
-static SUBSCRIPTIONS: LazyLock<Mutex<HashMap<String, JoinHandle<()>>>> =
-    LazyLock::new(Mutex::default);
+/// A live stream: its task, and the session it holds open, if any.
+struct Stream {
+    task: JoinHandle<()>,
+    session: Option<AgentSessionRef>,
+}
+
+/// The live subscriptions, so an unmounting webview can end its own.
+static SUBSCRIPTIONS: LazyLock<Mutex<HashMap<String, Stream>>> = LazyLock::new(Mutex::default);
+
+/// Start a stream under a new id and keep it. The map is held while it
+/// starts, so a stream that ends itself at once (`end(&id)`) finds itself.
+fn keep(session: Option<AgentSessionRef>, start: impl FnOnce(String) -> JoinHandle<()>) -> String {
+    let id = ulid::Ulid::new().to_string();
+    let mut streams = SUBSCRIPTIONS.lock().unwrap_or_else(PoisonError::into_inner);
+    let task = start(id.clone());
+    streams.insert(id.clone(), Stream { task, session });
+    id
+}
+
+/// End a stream by id; an unknown id is a no-op. A session it held open is
+/// let go.
+fn end(subscription_id: &str) {
+    let stream = SUBSCRIPTIONS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .remove(subscription_id);
+    if let Some(stream) = stream {
+        stream.task.abort();
+        if let (Some(session), Some(hq)) = (stream.session, HQ.get()) {
+            hq.close_session(&session);
+        }
+    }
+}
 
 /// Build the service and open what this device holds. Called from setup
 /// after the settings layers are installed, so `agents.server_url` is read
@@ -112,32 +149,23 @@ pub fn hq_status_subscribe(channel: Channel<HqStatusVm>) -> Result<String, IpcEr
     if let Err(error) = channel.send(current) {
         tracing::warn!(%error, "the agents server status subscription could not start");
     }
-    let task = tauri::async_runtime::spawn(async move {
-        while status.changed().await.is_ok() {
-            let current = status.borrow_and_update().clone();
-            if channel.send(current).is_err() {
-                return;
+    let start = move |_: String| {
+        tauri::async_runtime::spawn(async move {
+            while status.changed().await.is_ok() {
+                let current = status.borrow_and_update().clone();
+                if channel.send(current).is_err() {
+                    return;
+                }
             }
-        }
-    });
-    let id = ulid::Ulid::new().to_string();
-    SUBSCRIPTIONS
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .insert(id.clone(), task);
-    Ok(id)
+        })
+    };
+    Ok(keep(None, start))
 }
 
 /// End an [`hq_status_subscribe`] stream. An unknown id is a no-op.
 #[tauri::command]
 pub fn hq_status_unsubscribe(subscription_id: String) {
-    if let Some(task) = SUBSCRIPTIONS
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .remove(&subscription_id)
-    {
-        task.abort();
-    }
+    end(&subscription_id);
 }
 
 /// Set `agents.server_url`: blank clears it; a refused address is returned
@@ -182,4 +210,233 @@ pub fn hq_pair_offer_dismiss() -> Result<(), IpcError> {
 #[tauri::command]
 pub async fn hq_device_revoke(client_id: String) -> Result<HqStatusVm, IpcError> {
     hq()?.revoke(&client_id).await.map_err(error)
+}
+
+/// Run a blocking core call off the async workers.
+async fn blocking<T: Send + 'static>(
+    call: impl FnOnce(Arc<Hq>) -> Result<T, HqError> + Send + 'static,
+) -> Result<T, IpcError> {
+    let hq = Arc::clone(hq()?);
+    tauri::async_runtime::spawn_blocking(move || call(hq))
+        .await
+        .map_err(|join| IpcError {
+            code: IpcErrorCode::Internal,
+            message: join.to_string(),
+            account_id: None,
+            retriable: true,
+        })?
+        .map_err(error)
+}
+
+fn session(database: String, session_id: String) -> AgentSessionRef {
+    AgentSessionRef {
+        database,
+        session_id,
+    }
+}
+
+/// Stream the Agents window's rows — every held database merged, read from
+/// the replicas — as a reset, then the changes.
+#[tauri::command]
+pub fn agents_sessions_subscribe(channel: Channel<AgentSessionsBatch>) -> Result<String, IpcError> {
+    let hq = Arc::clone(hq()?);
+    let mut changes = hq.changes();
+    let start = move |_: String| {
+        tauri::async_runtime::spawn(async move {
+            let mut shown = Vec::new();
+            let mut first = true;
+            loop {
+                let read = Arc::clone(&hq);
+                let Ok(rows) = tauri::async_runtime::spawn_blocking(move || read.sessions()).await
+                else {
+                    return;
+                };
+                let ops = if first {
+                    vec![AgentSessionsOp::Reset { rows: rows.clone() }]
+                } else {
+                    diff(&shown, &rows)
+                };
+                first = false;
+                if !ops.is_empty() {
+                    let total = u32::try_from(rows.len()).unwrap_or(u32::MAX);
+                    if channel.send(AgentSessionsBatch { ops, total }).is_err() {
+                        return;
+                    }
+                }
+                shown = rows;
+                if changes.changed().await.is_err() {
+                    return;
+                }
+            }
+        })
+    };
+    Ok(keep(None, start))
+}
+
+/// End an [`agents_sessions_subscribe`] stream.
+#[tauri::command]
+pub fn agents_sessions_unsubscribe(subscription_id: String) {
+    end(&subscription_id);
+}
+
+/// Open a session: stream its view — messages, approvals, what is still
+/// arriving — at once, then whole on every change.
+#[tauri::command]
+pub fn agent_session_open(
+    database: String,
+    session_id: String,
+    channel: Channel<AgentSessionViewVm>,
+) -> Result<String, IpcError> {
+    let hq = Arc::clone(hq()?);
+    let key = session(database, session_id);
+    hq.open_session(&key).map_err(error)?;
+    let mut changes = hq.changes();
+    let held = key.clone();
+    let start = move |id: String| {
+        tauri::async_runtime::spawn(async move {
+            let mut shown: Option<AgentSessionViewVm> = None;
+            loop {
+                let (read, at) = (Arc::clone(&hq), held.clone());
+                let Ok(view) =
+                    tauri::async_runtime::spawn_blocking(move || read.session_view(&at)).await
+                else {
+                    return;
+                };
+                match view {
+                    Ok(view) if shown.as_ref() != Some(&view) => {
+                        if channel.send(view.clone()).is_err() {
+                            end(&id);
+                            return;
+                        }
+                        shown = Some(view);
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::debug!(%error, "an open agents session could not be read");
+                    }
+                }
+                if changes.changed().await.is_err() {
+                    return;
+                }
+            }
+        })
+    };
+    Ok(keep(Some(key), start))
+}
+
+/// Close an [`agent_session_open`] stream.
+#[tauri::command]
+pub fn agent_session_close(subscription_id: String) {
+    end(&subscription_id);
+}
+
+/// The person scrolled to the top of an open session: earlier messages.
+#[tauri::command]
+pub fn agent_session_page_back(database: String, session_id: String) -> Result<(), IpcError> {
+    hq()?
+        .page_back(&session(database, session_id))
+        .map_err(error)
+}
+
+/// Write a message into a session; it shows as waiting at once.
+#[tauri::command]
+pub async fn agent_send(
+    database: String,
+    session_id: String,
+    body: String,
+) -> Result<(), IpcError> {
+    blocking(move |hq| hq.send(&session(database, session_id), &body)).await
+}
+
+/// Open a session with an agent in one database, with its first message.
+#[tauri::command]
+pub async fn agent_session_new(
+    database: String,
+    agent_actor: String,
+    body: String,
+) -> Result<AgentSessionRef, IpcError> {
+    blocking(move |hq| hq.new_session(&database, &agent_actor, &body)).await
+}
+
+/// Archive a session: its messages leave this device.
+#[tauri::command]
+pub async fn agent_session_archive(database: String, session_id: String) -> Result<(), IpcError> {
+    blocking(move |hq| hq.set_archived(&session(database, session_id), true)).await
+}
+
+/// Unarchive a session: its newest messages come back.
+#[tauri::command]
+pub async fn agent_session_unarchive(database: String, session_id: String) -> Result<(), IpcError> {
+    blocking(move |hq| hq.set_archived(&session(database, session_id), false)).await
+}
+
+/// The agents a new session can be opened with, and where it would go.
+#[tauri::command]
+pub async fn agents_choices() -> Result<Vec<AgentChoiceVm>, IpcError> {
+    blocking(|hq| hq.choices()).await
+}
+
+/// The default agent's main conversation, for launch and the docks.
+#[tauri::command]
+pub async fn agent_session_default() -> Result<Option<AgentDefaultSessionVm>, IpcError> {
+    blocking(|hq| hq.default_session()).await
+}
+
+/// Stream the approvals waiting for this person, in every held database.
+#[tauri::command]
+pub fn agent_approvals_subscribe(
+    channel: Channel<Vec<AgentApprovalVm>>,
+) -> Result<String, IpcError> {
+    let hq = Arc::clone(hq()?);
+    let mut changes = hq.changes();
+    let start = move |_: String| {
+        tauri::async_runtime::spawn(async move {
+            let mut shown: Option<Vec<AgentApprovalVm>> = None;
+            loop {
+                let read = Arc::clone(&hq);
+                let Ok(waiting) =
+                    tauri::async_runtime::spawn_blocking(move || read.approvals_waiting()).await
+                else {
+                    return;
+                };
+                if shown.as_ref() != Some(&waiting) {
+                    if channel.send(waiting.clone()).is_err() {
+                        return;
+                    }
+                    shown = Some(waiting);
+                }
+                if changes.changed().await.is_err() {
+                    return;
+                }
+            }
+        })
+    };
+    Ok(keep(None, start))
+}
+
+/// End an [`agent_approvals_subscribe`] stream.
+#[tauri::command]
+pub fn agent_approvals_unsubscribe(subscription_id: String) {
+    end(&subscription_id);
+}
+
+/// Decide an approval on the action and digest the person was shown; a
+/// refusal is the server's sentence.
+#[tauri::command]
+pub async fn agent_session_approval_decide(
+    database: String,
+    session_id: String,
+    approval_id: String,
+    binding_digest: String,
+    approve: bool,
+) -> Result<AgentDecisionOutcomeVm, IpcError> {
+    blocking(move |hq| {
+        hq.decide(
+            &session(database, session_id),
+            &approval_id,
+            &binding_digest,
+            approve,
+        )
+    })
+    .await
 }

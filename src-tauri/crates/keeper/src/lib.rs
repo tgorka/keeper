@@ -1037,6 +1037,22 @@ pub fn run() {
                 hq_ipc::hq_pair_offer_accept,
                 hq_ipc::hq_pair_offer_dismiss,
                 hq_ipc::hq_device_revoke,
+                // The Agents window on the replicas: the list, an open
+                // session, writing, archiving, approvals.
+                hq_ipc::agents_sessions_subscribe,
+                hq_ipc::agents_sessions_unsubscribe,
+                hq_ipc::agent_session_open,
+                hq_ipc::agent_session_close,
+                hq_ipc::agent_session_page_back,
+                hq_ipc::agent_send,
+                hq_ipc::agent_session_new,
+                hq_ipc::agent_session_archive,
+                hq_ipc::agent_session_unarchive,
+                hq_ipc::agents_choices,
+                hq_ipc::agent_session_default,
+                hq_ipc::agent_approvals_subscribe,
+                hq_ipc::agent_approvals_unsubscribe,
+                hq_ipc::agent_session_approval_decide,
                 // The Bots surface's sync-free half (Epic 61, Story 61.4;
                 // split in Story 62.1), in the shared body for
                 // `config_layers`' reason: `keeper_core::bots` has no desktop

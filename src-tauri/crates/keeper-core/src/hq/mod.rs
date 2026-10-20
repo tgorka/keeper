@@ -22,16 +22,29 @@
 //! replica; a device the server removed stays removed across restarts until
 //! it is paired again, and stays readable until the person removes it.
 //!
+//! The Agents window reads only the replicas (AD-424, AD-433; [`window`]):
+//! the sessions of every held database in one list, each labelled with its
+//! database ([`sessions`]); an opened session from its windowed months, or,
+//! archived, through the server's registered `sessionPage` ([`timeline`]);
+//! messages and decisions written as rows into the session's own database
+//! ([`send`], [`approvals`]).
+//!
 //! The shell's `hq_ipc` is a call site and decides nothing. Tracing targets
 //! are `keeper_core::hq::*` and carry no row content.
 
+pub mod approvals;
 pub mod databases;
+pub mod identity;
 pub mod pairing;
 pub mod port;
 pub mod routes;
+pub mod send;
 pub mod server;
+pub mod sessions;
 pub mod syncular;
+pub mod timeline;
 pub mod vm;
+pub mod window;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -60,7 +73,9 @@ use crate::platform::{exclude_from_backup_best_effort, Platform};
 const KEYCHAIN_PREFIX: &str = "agents-server/";
 
 /// The directory subscriptions every linked replica holds: the database's
-/// actors and clients (the person's devices among them), by `dir`.
+/// actors and clients (the person's devices among them), by `dir`. Beside
+/// them each holds the person's memberships (`memberships`), from which the
+/// Agents window's windows follow ([`window`]).
 const DIRECTORY: [(&str, &str); 2] = [
     ("directoryActors", "actors"),
     ("directoryClients", "clients"),
@@ -199,6 +214,13 @@ pub struct Hq {
     inner: Mutex<Inner>,
     contacts: Arc<Contacts>,
     status: watch::Sender<HqStatusVm>,
+    /// Ticks on every change a view of the Agents window reads again on.
+    changes: watch::Sender<u64>,
+    /// The sessions open on screen, and their pages.
+    views: Mutex<HashMap<sessions::AgentSessionRef, timeline::Opened>>,
+    /// The units each replica's windows were last set to.
+    windows: Mutex<HashMap<(String, &'static str), Vec<String>>>,
+    window_task: Mutex<Option<JoinHandle<()>>>,
 }
 
 fn no_server() -> HqStatusVm {
@@ -265,6 +287,7 @@ impl Hq {
         device_name: String,
     ) -> Arc<Hq> {
         let (status, _) = watch::channel(no_server());
+        let (changes, _) = watch::channel(0);
         Arc::new_cyclic(|me| Hq {
             me: me.clone(),
             platform,
@@ -275,6 +298,10 @@ impl Hq {
             inner: Mutex::new(Inner::default()),
             contacts: Arc::default(),
             status,
+            changes,
+            views: Mutex::default(),
+            windows: Mutex::default(),
+            window_task: Mutex::default(),
         })
     }
 
@@ -377,6 +404,11 @@ impl Hq {
                         table: (*table).to_owned(),
                         scopes: vec![("dir".to_owned(), vec![database.to_owned()])],
                     })
+                    .chain(std::iter::once(Subscription {
+                        id: "memberships".to_owned(),
+                        table: "session_members".to_owned(),
+                        scopes: vec![("member".to_owned(), vec![pairing.actor_id.clone()])],
+                    }))
                     .collect()
             } else {
                 Vec::new()
@@ -389,7 +421,9 @@ impl Hq {
     /// does — then ask the server which of them sync.
     pub async fn start(&self) -> Result<(), HqError> {
         let _lifecycle = self.lifecycle.lock().await;
-        self.restart().await
+        self.restart().await?;
+        self.follow_windows();
+        Ok(())
     }
 
     /// Follow the effective setting: a no-op when it still names what this
@@ -848,6 +882,8 @@ impl Hq {
             *current = status;
             changed
         });
+        // A replica's rows or the replicas themselves changed.
+        self.touch();
     }
 
     /// Set `agents.server_url` and follow it. A refused address is returned
@@ -1100,3 +1136,5 @@ fn devices(replicas: &[Arc<dyn Replica>], actor: &str, me: &str) -> Vec<HqDevice
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod window_tests;

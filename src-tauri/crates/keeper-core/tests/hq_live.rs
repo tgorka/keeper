@@ -12,6 +12,7 @@
 //! KEEPER_HQ_LIVE_ACTOR=<a person's actor id> \
 //! KEEPER_HQ_LIVE_DATABASES=<the person's databases, comma-separated> \
 //! KEEPER_HQ_LIVE_ONE_DB_ACTOR=<optional: a person in one database>:<that database> \
+//! KEEPER_HQ_LIVE_AGENT=<an agent in the first database's directory, for the Agents window> \
 //! cargo test --manifest-path src-tauri/Cargo.toml -p keeper-core --test hq_live -- --ignored --nocapture
 //! ```
 //!
@@ -794,6 +795,293 @@ async fn pair_discover_replicate_go_offline_and_revoke() {
         }
     }
     println!("PASS no token in any file or log line");
+}
+
+/// The pairing a device gets from the operator's code, connected in every
+/// database it names.
+async fn paired(
+    platform: &Arc<Device>,
+    server: &str,
+    operator: &str,
+    actor: &str,
+    dbs: usize,
+) -> Arc<Hq> {
+    let device = hq(platform, "hq_live agents window");
+    device.start().await.expect("starts");
+    device.set_server(server).await.expect("stores the address");
+    device
+        .pair_redeem(&operator_code(server, operator, actor).await)
+        .await
+        .expect("redeems");
+    wait_status(
+        &device,
+        "connects every database",
+        |s| {
+            s.databases.len() == dbs
+                && s.databases
+                    .iter()
+                    .all(|db| db.state == HqDatabaseState::Connected)
+        },
+        Duration::from_secs(30),
+    )
+    .await;
+    device
+}
+
+async fn count_messages(device: &Arc<Hq>, database: &str, session: &str) -> usize {
+    let replica = device.replica(database).expect("a replica");
+    let rows = query(
+        &replica,
+        "SELECT count(*) AS n FROM messages WHERE session_id = ?1",
+        vec![json!(session)],
+    )
+    .await;
+    rows[0]["n"].as_u64().unwrap_or(0) as usize
+}
+
+async fn wait_count(device: &Arc<Hq>, database: &str, session: &str, want: usize, what: &str) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let n = count_messages(device, database, session).await;
+        if n == want {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{what}: {n} messages, want {want}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// The Agents window against a real server: a session of 1,000 messages
+/// written on one device lists and opens on another from its replica;
+/// archiving it there evicts its messages; opened archived, its newest page
+/// arrives through the registered `sessionPage` query within a second
+/// (NFR-127, p95 over the runs); unarchiving brings the rows back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a running agents server; see the module docs"]
+async fn agents_window_archive_and_an_archived_session_opens_within_a_second() {
+    use keeper_core::hq::sessions::AgentSessionRef;
+    use keeper_core::hq::timeline::PAGE_SIZE;
+
+    const MESSAGES: usize = 1_000;
+    const RUNS: usize = 20;
+    let server = env("KEEPER_HQ_LIVE_URL");
+    let operator = env("KEEPER_HQ_LIVE_OPERATOR_TOKEN");
+    let actor = env("KEEPER_HQ_LIVE_ACTOR");
+    let agent = env("KEEPER_HQ_LIVE_AGENT");
+    let databases: Vec<String> = env("KEEPER_HQ_LIVE_DATABASES")
+        .split(',')
+        .map(str::to_owned)
+        .collect();
+    let database = databases[0].clone();
+    let scratch = tempfile::tempdir().expect("tempdir");
+
+    let a = paired(
+        &device(&scratch.path().join("a")),
+        &server,
+        &operator,
+        &actor,
+        databases.len(),
+    )
+    .await;
+    let key: AgentSessionRef = {
+        let a = Arc::clone(&a);
+        let (database, agent) = (database.clone(), agent.clone());
+        tokio::task::spawn_blocking(move || {
+            a.new_session(&database, &agent, "the first of a thousand")
+        })
+        .await
+        .expect("joins")
+        .expect("a new session")
+    };
+    let source = a
+        .sources()
+        .into_iter()
+        .find(|s| s.database == database)
+        .expect("the database");
+    let author = Author {
+        actor: source.actor.clone(),
+        client: source.client.clone(),
+    };
+    let start = chrono::Utc::now().timestamp_millis() - MESSAGES as i64;
+    let page = page_key(&key.session_id, start);
+    let ops: Vec<RowOp> = (1..MESSAGES)
+        .map(|i| {
+            let id = ulid::Ulid::new().to_string();
+            message(
+                &author,
+                &key.session_id,
+                &page,
+                &id,
+                &format!("message {i}"),
+                start + i as i64,
+            )
+        })
+        .collect();
+    for chunk in ops.chunks(100) {
+        mutate(&source.replica, chunk.to_vec()).await;
+    }
+    source.replica.sync_now();
+    wait_status(
+        &a,
+        "a's outbox drains",
+        |s| s.databases.iter().all(|db| db.waiting == 0),
+        Duration::from_secs(60),
+    )
+    .await;
+    println!("PASS a wrote a session of {MESSAGES} messages in {database}");
+    // Committed, a's own messages read sent — never a receipt, the server's word.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let view = a.session_view(&key).expect("a's view");
+        let states: Vec<_> = view.messages.iter().map(|m| m.state).collect();
+        if view.complete
+            && view.messages.len() == MESSAGES
+            && states
+                .iter()
+                .all(|s| *s == Some(keeper_core::hq::timeline::AgentMessageStateVm::Sent))
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "a's messages never read sent: {} shown",
+            view.messages.len()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    println!("PASS a's {MESSAGES} messages read sent once the server took them");
+
+    // Another device lists it from its replica, labelled, and holds its newest month.
+    let b = paired(
+        &device(&scratch.path().join("b")),
+        &server,
+        &operator,
+        &actor,
+        databases.len(),
+    )
+    .await;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let row = loop {
+        if let Some(row) = b
+            .sessions()
+            .into_iter()
+            .find(|r| r.session_id == key.session_id && r.database == database)
+        {
+            break row;
+        }
+        assert!(Instant::now() < deadline, "b never listed the session");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert!(!row.archived);
+    wait_count(
+        &b,
+        &database,
+        &key.session_id,
+        MESSAGES,
+        "b holds the newest month",
+    )
+    .await;
+    println!(
+        "PASS b lists {}/{} and holds its {MESSAGES} messages",
+        row.database, row.session_id
+    );
+
+    // Archiving on b evicts its messages there; the row stays listed.
+    {
+        let (b, key) = (Arc::clone(&b), key.clone());
+        tokio::task::spawn_blocking(move || b.set_archived(&key, true))
+            .await
+            .expect("joins")
+            .expect("archives");
+    }
+    wait_count(&b, &database, &key.session_id, 0, "archiving evicts").await;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !b
+        .sessions()
+        .iter()
+        .any(|r| r.session_id == key.session_id && r.archived)
+    {
+        assert!(Instant::now() < deadline, "b never listed it archived");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    println!("PASS archived on b: 0 of its messages left in b's replica, still listed as archived");
+
+    // NFR-127: opened archived, the newest page through the server.
+    let mut took = Vec::new();
+    for _ in 0..RUNS {
+        let began = Instant::now();
+        b.open_session(&key).expect("opens");
+        let view = loop {
+            let view = b.session_view(&key).expect("a view");
+            if view.complete || view.note.is_some() {
+                break view;
+            }
+            assert!(began.elapsed() < Duration::from_secs(10), "no page");
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        };
+        took.push(began.elapsed());
+        b.close_session(&key);
+        assert_eq!(view.note, None);
+        assert!(view.read_only && view.has_earlier);
+        assert_eq!(view.messages.len(), PAGE_SIZE);
+        assert_eq!(
+            view.messages.last().map(|m| m.body.as_str()),
+            Some(format!("message {}", MESSAGES - 1).as_str()),
+            "the newest page ends on the newest message"
+        );
+    }
+    took.sort();
+    let p95 = took[(took.len() * 95).div_ceil(100) - 1];
+    println!(
+        "NFR-127 {RUNS} opens of an archived {MESSAGES}-message session: min {:?}, median {:?}, p95 {:?}, max {:?}",
+        took[0],
+        took[took.len() / 2],
+        p95,
+        took[took.len() - 1]
+    );
+    assert!(p95 <= Duration::from_secs(1), "NFR-127: p95 {p95:?}");
+
+    // Scrolling back reads the next page, still through the server.
+    b.open_session(&key).expect("opens");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !b.session_view(&key).expect("view").complete {
+        assert!(Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    b.page_back(&key).expect("pages back");
+    loop {
+        let view = b.session_view(&key).expect("view");
+        if view.messages.len() == 2 * PAGE_SIZE {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the second page never came");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    b.close_session(&key);
+    println!("PASS scrolling back read the next {PAGE_SIZE} through sessionPage");
+
+    // Unarchiving widens the window again.
+    {
+        let (b, key) = (Arc::clone(&b), key.clone());
+        tokio::task::spawn_blocking(move || b.set_archived(&key, false))
+            .await
+            .expect("joins")
+            .expect("unarchives");
+    }
+    wait_count(
+        &b,
+        &database,
+        &key.session_id,
+        MESSAGES,
+        "unarchiving brings them back",
+    )
+    .await;
+    println!("PASS unarchived on b: its {MESSAGES} messages are back");
+    a.shutdown().await;
+    b.shutdown().await;
 }
 
 fn walk(dir: &Path) -> Vec<PathBuf> {

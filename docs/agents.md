@@ -5224,3 +5224,16 @@ asks one pull, and the room's real members — the visitor at power 0 among them
 check only with the visitor known as an agent. **Owed:** NFR-122 on the tailnet — p95 from a push
 on electra or hesperia to the other host holding the commit, by doorbell, at most 15 s over 100
 session changes — is an operator measurement on the two hosts (DW-452).
+
+### Measured: an archived session opens (NFR-127)
+
+2026-10-20, `hq_live.rs` `agents_window_archive_and_an_archived_session_opens_within_a_second`:
+the keeper-hq server (Bun 1.2.23, both databases, a throwaway Postgres 18) on delectra, keeper-core's
+client in a Linux container reaching it over the tailnet. One device wrote a session of 1,000
+messages into `tgdrive` (each read *sent* once the server took it); a second device listed it from
+its replica with its database, held its 1,000 messages, archived it (0 of them left in its
+replica, the row still listed as archived), then opened it archived 20 times: the newest page of
+50, read through the registered `sessionPage` query, was on screen in **min 11.8 ms, median
+15.6 ms, p95 17.3 ms, max 21.2 ms** (target ≤ 1 s). Scrolling back read the next 50 the same way;
+unarchiving brought the 1,000 back into the replica. **Owed:** the same run from hesperia against
+electra, and in the installed app.

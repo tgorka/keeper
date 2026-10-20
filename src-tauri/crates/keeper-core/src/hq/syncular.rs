@@ -25,16 +25,20 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Map, Value};
+use syncular_client::api::{
+    CommitDelivery, CommitOperationOutcome, CommitOutcomeStatus, WindowCoverage,
+};
 use syncular_client::native_transport::{HostTransport, Inbound};
 use syncular_client::{
     BlobDownload, BlobUploadGrant, ClientLimits, FileQuerySnapshotReader, Mutation, RealtimeState,
-    SegmentRequest, SyncClient, SyncIntent, SyncOutcome, Transport, TransportError,
+    SegmentRequest, SyncClient, SyncIntent, SyncOutcome, SyncRemoteClient, Transport,
+    TransportError,
 };
 use tokio::sync::watch;
 
 use crate::hq::port::{
-    LinkState, Opener, Peer, Replica, ReplicaError, ReplicaSpec, ReplicaState, RowOp, Subscription,
-    WindowBase, WindowState,
+    Covered, Delivery, LinkState, Opener, Peer, Replica, ReplicaError, ReplicaSpec, ReplicaState,
+    RowOp, Subscription, WindowBase, WindowState,
 };
 
 /// A round at least this often while linked, socket or not.
@@ -424,6 +428,7 @@ struct Owner {
     /// A local write or an asked-for round waits to be pushed.
     dirty: bool,
     directory: u64,
+    rows: u64,
     state: watch::Sender<ReplicaState>,
 }
 
@@ -446,20 +451,8 @@ impl Owner {
         .map_err(ReplicaError::Client)?;
         let (config, origin) = match &spec.link {
             Some(link) => {
-                let origin = url::Url::parse(&link.base_url)
-                    .map_err(|error| {
-                        ReplicaError::Client(format!("the server's address: {error}"))
-                    })?
-                    .origin();
-                (
-                    json!({
-                        "baseUrl": link.base_url,
-                        "headers": { "authorization": format!("Bearer {}", link.token) },
-                        "requestTimeoutMs": REQUEST_TIMEOUT.as_millis() as u64,
-                        "roundDeadlineMs": ROUND_DEADLINE.as_millis() as u64,
-                    }),
-                    Some(origin),
-                )
+                let (config, origin) = link_config(link)?;
+                (config, Some(origin))
             }
             // No `baseUrl`: the transport that refuses every network call.
             None => (json!({}), None),
@@ -501,6 +494,7 @@ impl Owner {
             link,
             outbox,
             directory: 0,
+            rows: 0,
         });
         Ok(Owner {
             database: spec.database.clone(),
@@ -510,6 +504,7 @@ impl Owner {
             schedule: Schedule::default(),
             dirty: true,
             directory: 0,
+            rows: 0,
             state,
         })
     }
@@ -561,6 +556,7 @@ impl Owner {
                     break;
                 }
             }
+            self.absorb_changes();
             self.drive();
             self.publish();
         }
@@ -698,12 +694,15 @@ impl Owner {
         }
     }
 
-    /// Change batches only say what changed; the directory's revision is all
-    /// keeper reads from them.
+    /// Change batches only say what changed: any change bumps the rows'
+    /// revision, and a change of `clients` the directory's too.
     fn absorb_changes(&mut self) {
-        let directory = self
-            .client
-            .drain_change_batches()
+        let batches = self.client.drain_change_batches();
+        if batches.is_empty() {
+            return;
+        }
+        self.rows += 1;
+        let directory = batches
             .iter()
             .any(|batch| batch.tables.iter().any(|change| change.table == "clients"));
         if directory {
@@ -756,6 +755,7 @@ impl Owner {
             link,
             outbox: self.client.status_snapshot().outbox,
             directory: self.directory,
+            rows: self.rows,
         };
         self.state.send_if_modified(|state| {
             let changed = *state != next;
@@ -774,9 +774,34 @@ impl Owner {
             link: LinkState::Closed,
             outbox: self.client.status_snapshot().outbox,
             directory: self.directory,
+            rows: self.rows,
         };
         self.state.send_replace(next);
     }
+}
+
+/// The transport configuration of a link, and its server's origin.
+fn link_config(link: &crate::hq::port::Link) -> Result<(Value, url::Origin), ReplicaError> {
+    let origin = url::Url::parse(&link.base_url)
+        .map_err(|error| ReplicaError::Client(format!("the server's address: {error}")))?
+        .origin();
+    Ok((
+        json!({
+            "baseUrl": link.base_url,
+            "headers": { "authorization": format!("Bearer {}", link.token) },
+            "requestTimeoutMs": REQUEST_TIMEOUT.as_millis() as u64,
+            "roundDeadlineMs": ROUND_DEADLINE.as_millis() as u64,
+        }),
+        origin,
+    ))
+}
+
+/// What a remote query needs: its own transport per call, behind the
+/// replica's gate, so a read never waits behind the owner's round.
+struct Remote {
+    config: Value,
+    origin: url::Origin,
+    client_id: String,
 }
 
 /// A replica whose owner thread runs [`Owner`].
@@ -786,6 +811,7 @@ pub struct SyncularReplica {
     thread: Mutex<Option<JoinHandle<()>>>,
     reader: Mutex<FileQuerySnapshotReader>,
     state: watch::Receiver<ReplicaState>,
+    remote: Option<Remote>,
 }
 
 impl SyncularReplica {
@@ -803,6 +829,17 @@ impl SyncularReplica {
         let wake = commands.clone();
         let gate = Arc::new(AtomicBool::new(true));
         let owner_gate = Arc::clone(&gate);
+        let remote = match (&spec.link, &spec.client_id) {
+            (Some(link), Some(client_id)) => {
+                let (config, origin) = link_config(link)?;
+                Some(Remote {
+                    config,
+                    origin,
+                    client_id: client_id.clone(),
+                })
+            }
+            _ => None,
+        };
         let thread = std::thread::Builder::new()
             .name(format!("hq-{}", spec.database))
             .spawn(move || match Owner::open(&spec, owner_gate, wake) {
@@ -822,6 +859,7 @@ impl SyncularReplica {
             thread: Mutex::new(Some(thread)),
             reader: Mutex::new(FileQuerySnapshotReader::new(path)),
             state,
+            remote,
         })
     }
 
@@ -838,6 +876,31 @@ impl Replica for SyncularReplica {
     fn mutate(&self, ops: Vec<RowOp>) -> Result<String, ReplicaError> {
         let ops = ops.into_iter().map(mutation).collect();
         self.ask(|reply| Command::Mutate(ops, reply))
+    }
+
+    fn query_covered(
+        &self,
+        sql: &str,
+        params: &[Value],
+        base: &WindowBase,
+        units: &[String],
+    ) -> Result<Covered, ReplicaError> {
+        let coverage = [WindowCoverage {
+            base: window_base(base),
+            units: units.to_vec(),
+        }];
+        let mut reader = self.reader.lock().map_err(|_| ReplicaError::Closed)?;
+        let snapshot = reader
+            .query_snapshot(sql, params, &coverage)
+            .map_err(|failure| ReplicaError::Client(failure.to_string()))?;
+        let incomplete = snapshot
+            .coverage
+            .pending
+            .into_iter()
+            .chain(snapshot.coverage.missing)
+            .map(|unit| unit.unit)
+            .collect();
+        Ok((snapshot.rows, incomplete))
     }
 
     fn query(&self, sql: &str, params: &[Value]) -> Result<Vec<Map<String, Value>>, ReplicaError> {
@@ -884,6 +947,61 @@ impl Replica for SyncularReplica {
 
     fn fetch_blob(&self, blob: &str) -> Result<Vec<u8>, ReplicaError> {
         self.ask(|reply| Command::Fetch(blob.to_owned(), reply))
+    }
+
+    fn delivery(&self, commit_id: &str) -> Result<Delivery, ReplicaError> {
+        let mut reader = self.reader.lock().map_err(|_| ReplicaError::Closed)?;
+        let delivery = reader
+            .commit_delivery(commit_id)
+            .map_err(|failure| ReplicaError::Client(failure.to_string()))?;
+        Ok(match delivery {
+            CommitDelivery::Pending { .. } => Delivery::Pending,
+            CommitDelivery::Unknown { .. } => Delivery::Unknown,
+            CommitDelivery::Known { outcome, .. } => match outcome.status {
+                CommitOutcomeStatus::Applied | CommitOutcomeStatus::Cached => Delivery::Applied,
+                CommitOutcomeStatus::Conflict => Delivery::Refused(
+                    "Someone changed this first; keeper shows what the server holds now."
+                        .to_owned(),
+                ),
+                CommitOutcomeStatus::Rejected => Delivery::Refused(
+                    outcome
+                        .results
+                        .iter()
+                        .find_map(|result| match result {
+                            CommitOperationOutcome::Error { rejection } => {
+                                Some(rejection.message.clone())
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| "The server refused this.".to_owned()),
+                ),
+            },
+        })
+    }
+
+    fn remote_query(
+        &self,
+        operation_id: &str,
+        params: Value,
+    ) -> Result<Vec<Map<String, Value>>, ReplicaError> {
+        let Some(remote) = &self.remote else {
+            return Err(ReplicaError::NotSyncing);
+        };
+        if !self.gate.load(Ordering::SeqCst) {
+            return Err(ReplicaError::NotSyncing);
+        }
+        let mut transport = GatedTransport {
+            inner: HostTransport::from_config(&remote.config).map_err(ReplicaError::Client)?,
+            open: Arc::clone(&self.gate),
+            origin: Some(remote.origin.clone()),
+        };
+        let client = SyncRemoteClient::for_operations(remote.client_id.clone())
+            .map_err(|error| ReplicaError::Client(error.to_string()))?;
+        let answer = client
+            .query::<_, Value, Map<String, Value>>(&mut transport, operation_id, &params)
+            .map_err(|error| ReplicaError::Client(error.to_string()));
+        transport.inner.shutdown();
+        Ok(answer?.rows)
     }
 
     fn sync_now(&self) {

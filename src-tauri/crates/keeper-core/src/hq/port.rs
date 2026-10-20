@@ -14,6 +14,9 @@ use std::sync::Arc;
 use serde_json::{Map, Value};
 use tokio::sync::watch;
 
+/// Rows a query read, and the window units not complete when it read them.
+pub type Covered = (Vec<Map<String, Value>>, Vec<String>);
+
 /// One write to one row.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RowOp {
@@ -133,6 +136,22 @@ pub struct ReplicaState {
     pub outbox: usize,
     /// Bumped whenever the replica's `clients` rows change.
     pub directory: u64,
+    /// Bumped whenever any row or window of the replica changes, locally or
+    /// from the server: what a view over its rows reads again on.
+    pub rows: u64,
+}
+
+/// What became of a commit written here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Delivery {
+    /// Still in the outbox.
+    Pending,
+    /// The server took it.
+    Applied,
+    /// The server refused it: its sentence.
+    Refused(String),
+    /// Not known here (never written, or its outcome was pruned).
+    Unknown,
 }
 
 /// Why a replica call failed.
@@ -156,6 +175,16 @@ pub trait Replica: Send + Sync {
     fn mutate(&self, ops: Vec<RowOp>) -> Result<String, ReplicaError>;
     /// Read the replica. Answers from the file, never from the network.
     fn query(&self, sql: &str, params: &[Value]) -> Result<Vec<Map<String, Value>>, ReplicaError>;
+    /// [`Replica::query`], and which of `units` of the window `base` are
+    /// not complete yet (not held, or their first pull not done), read in
+    /// the same snapshot.
+    fn query_covered(
+        &self,
+        sql: &str,
+        params: &[Value],
+        base: &WindowBase,
+        units: &[String],
+    ) -> Result<Covered, ReplicaError>;
     /// Hold `subscription`, persisted under its id.
     fn subscribe(&self, subscription: Subscription) -> Result<(), ReplicaError>;
     /// Set a window's units: units added are subscribed, units removed are
@@ -175,6 +204,17 @@ pub trait Replica: Send + Sync {
     ) -> Result<Value, ReplicaError>;
     /// A blob's bytes, from the cache or, while the replica syncs, its server.
     fn fetch_blob(&self, blob: &str) -> Result<Vec<u8>, ReplicaError>;
+    /// What became of the commit `commit_id`. Answers from the file.
+    fn delivery(&self, commit_id: &str) -> Result<Delivery, ReplicaError>;
+    /// Run the server's registered query `operation_id` with `params`: rows
+    /// read on the server, never kept in the replica. Not on the owner
+    /// thread, so it never waits behind a round; refused while the replica
+    /// does not sync ([`ReplicaError::NotSyncing`]).
+    fn remote_query(
+        &self,
+        operation_id: &str,
+        params: Value,
+    ) -> Result<Vec<Map<String, Value>>, ReplicaError>;
     /// Run a round now rather than at the next heartbeat.
     fn sync_now(&self);
     /// The state its owner last published.
@@ -238,6 +278,15 @@ pub(crate) mod fake {
         fn query(&self, _: &str, _: &[Value]) -> Result<Vec<Map<String, Value>>, ReplicaError> {
             Ok(self.rows.lock().map_err(|_| ReplicaError::Closed)?.clone())
         }
+        fn query_covered(
+            &self,
+            sql: &str,
+            params: &[Value],
+            _: &WindowBase,
+            _: &[String],
+        ) -> Result<Covered, ReplicaError> {
+            Ok((self.query(sql, params)?, Vec::new()))
+        }
         fn subscribe(&self, _: Subscription) -> Result<(), ReplicaError> {
             Ok(())
         }
@@ -258,6 +307,12 @@ pub(crate) mod fake {
         }
         fn fetch_blob(&self, _: &str) -> Result<Vec<u8>, ReplicaError> {
             Ok(Vec::new())
+        }
+        fn delivery(&self, _: &str) -> Result<Delivery, ReplicaError> {
+            Ok(Delivery::Unknown)
+        }
+        fn remote_query(&self, _: &str, _: Value) -> Result<Vec<Map<String, Value>>, ReplicaError> {
+            Err(ReplicaError::NotSyncing)
         }
         fn sync_now(&self) {}
         fn state(&self) -> ReplicaState {
@@ -311,6 +366,7 @@ pub(crate) mod fake {
                 link,
                 outbox: 0,
                 directory: 0,
+                rows: 0,
             });
             let replica = Arc::new(FakeReplica {
                 spec,

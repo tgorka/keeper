@@ -135,7 +135,10 @@ last wrote it. Times are UTC milliseconds since the epoch.
   `size` (bytes, at most 26,214,400), `created_at_ms`.
 - **`messages`** — `session_id`, `page_key`, `turn_id` (an agent's answer), `role` (`person` |
   `agent`), `body`, `body_blob` (a body too large to ride inline), `metadata` (JSON: model,
-  usage, `ttft_ms`, `duration_ms`, finish reason).
+  usage, `ttft_ms`, `duration_ms`, finish reason). An agent's question to the person is an agent
+  message whose `metadata` holds `"kind": "ask"` and, when it offers answers, `"options"` (an
+  array of strings); the person answers with an ordinary person message, and the ask is open until
+  one is written after it.
 - **`reasoning`** — `session_id`, `page_key`, `turn_id`, `seq`, `compacted` (true on the one row
   that replaces a turn's chunks after compaction), `text`.
 - **`tool_calls`** — `session_id`, `page_key`, `turn_id`, `name`, `args` (JSON), `status`,
