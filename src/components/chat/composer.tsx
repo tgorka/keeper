@@ -111,6 +111,8 @@ export interface SendContext {
 }
 
 interface ComposerProps {
+  /** Database sessions do not use Matrix drafts or room state. */
+  transport?: "matrix" | "session";
   /**
    * The open conversation's owning account id (Story 7.1). Keys the persistent
    * per-chat draft together with {@link roomId}.
@@ -231,6 +233,7 @@ export const DRAFT_NOT_SAVED =
   "keeper couldn't save this draft, so it is kept only while this chat stays open.";
 
 export function Composer({
+  transport = "matrix",
   accountId,
   roomId,
   onSend,
@@ -381,6 +384,7 @@ export function Composer({
   accountIdRef.current = accountId;
   const roomIdRef = useRef(roomId);
   roomIdRef.current = roomId;
+  const matrixDrafts = useRef(transport === "matrix");
   const draftSaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pendingDraft = useRef<string | null>(null);
   // The latest draft write per `account\0room`: a save or deletion that
@@ -402,6 +406,7 @@ export function Composer({
 
   /** Mirror the queued draft now (trimmed-empty tombstones). Best-effort, fire-and-forget. */
   const flushMirror = useCallback(() => {
+    if (!matrixDrafts.current) return;
     if (draftMirrorTimer.current !== null) {
       clearTimeout(draftMirrorTimer.current);
       draftMirrorTimer.current = null;
@@ -425,6 +430,7 @@ export function Composer({
 
   /** Cross-device clear: tombstone the mirror (best-effort) and drop any queued mirror. */
   const clearMirror = useCallback(() => {
+    if (!matrixDrafts.current) return;
     if (draftMirrorTimer.current !== null) {
       clearTimeout(draftMirrorTimer.current);
       draftMirrorTimer.current = null;
@@ -438,6 +444,7 @@ export function Composer({
   /** Queue `body` for a debounced cross-device mirror write (Story 7.2). */
   const scheduleMirror = useCallback(
     (body: string) => {
+      if (!matrixDrafts.current) return;
       pendingMirror.current = body;
       if (draftMirrorTimer.current !== null) {
         clearTimeout(draftMirrorTimer.current);
@@ -449,6 +456,7 @@ export function Composer({
 
   /** Persist the queued draft now (trimmed-empty deletes the row). Fire-and-forget. */
   const flushDraft = useCallback(() => {
+    if (!matrixDrafts.current) return;
     if (draftSaveTimer.current !== null) {
       clearTimeout(draftSaveTimer.current);
       draftSaveTimer.current = null;
@@ -497,6 +505,7 @@ export function Composer({
    * deleted. Fire-and-forget — a delete failure never blocks the send path.
    */
   const clearPersistedDraft = useCallback(() => {
+    if (!matrixDrafts.current) return;
     if (draftSaveTimer.current !== null) {
       clearTimeout(draftSaveTimer.current);
       draftSaveTimer.current = null;
@@ -520,6 +529,7 @@ export function Composer({
   /** Queue `body` for a ~200 ms debounced persist, updating the marker immediately. */
   const scheduleDraftSave = useCallback(
     (body: string) => {
+      if (!matrixDrafts.current) return;
       pendingDraft.current = body;
       // The inbox marker reflects the live composer state at once (not after the debounce)
       // so the amber pencil never lags a keystroke; the DB write is what is debounced.
@@ -642,6 +652,7 @@ export function Composer({
   // overwrites content the user has already established (see `restoreConsumed`). A load
   // failure is logged (fall back to local / no chip, never a crash).
   useEffect(() => {
+    if (!matrixDrafts.current) return;
     let cancelled = false;
     const a = accountIdRef.current;
     const r = roomIdRef.current;
@@ -689,6 +700,7 @@ export function Composer({
   const remoteDraft = useRemoteDraft(accountId, roomId);
   const inEdit = pending?.mode === "edit";
   useEffect(() => {
+    if (!matrixDrafts.current) return;
     if (inEdit) {
       // Edit mode owns the composer (the edit body, not this room's draft): never
       // reconcile a remote draft against it or raise the chip. Withdraw any offer

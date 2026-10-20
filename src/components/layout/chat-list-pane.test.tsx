@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { COLUMN_COLLAPSE_PREFIX, COLUMN_EXPAND_PREFIX } from "@/components/layout/surface-column";
 import { COLUMN_RESIZER_LABEL } from "@/components/ui/resizable-columns";
@@ -17,7 +17,6 @@ import type {
   SpacesSnapshot,
 } from "@/lib/ipc/client";
 import { accountsStore } from "@/lib/stores/accounts";
-import { agentRoomsStore } from "@/lib/stores/agent-rooms";
 import { archiveRoomsStore } from "@/lib/stores/archive-rooms";
 import { chatListFocusStore } from "@/lib/stores/chat-list-focus";
 import {
@@ -950,130 +949,6 @@ describe("ChatListPane", () => {
     await waitFor(() => {
       expect(setSpaceFilter).toHaveBeenCalledWith(account.accountId, "!s:example.org");
     });
-  });
-});
-
-describe("ChatListPane — the Agents window", () => {
-  type Sink = (b: InboxBatch) => void;
-  const sinks: { inbox: Sink | null; agents: Sink | null } = { inbox: null, agents: null };
-
-  function agentRoom(
-    roomId: string,
-    displayName: string,
-    agentRoom: InboxRoomVm["agentRoom"],
-  ): InboxRoomVm {
-    return { ...inboxRoom(roomId, account.accountId, displayName, "…"), agentRoom };
-  }
-
-  beforeEach(() => {
-    agentRoomsStore.getState().clear();
-    subscribeInbox.mockImplementation(
-      (
-        onInbox: Sink,
-        _archive: Sink,
-        _pins: Sink,
-        _favourites: Sink,
-        _spaces: unknown,
-        _networks: unknown,
-        onAgents: Sink,
-      ) => {
-        sinks.inbox = onInbox;
-        sinks.agents = onAgents;
-        return Promise.resolve(1);
-      },
-    );
-  });
-
-  afterEach(() => {
-    agentRoomsStore.getState().clear();
-  });
-
-  function stream() {
-    accountsStore.getState().addAccount(account);
-    render(<ChatListPane />);
-    act(() => {
-      sinks.inbox?.({
-        ops: [
-          { op: "reset", rooms: [inboxRoom("!marta:x", account.accountId, "Marta", "Friday")] },
-        ],
-        total: 1,
-      });
-      sinks.agents?.({
-        ops: [
-          {
-            op: "reset",
-            rooms: [
-              agentRoom("!nixi:x", "Nixi", "proxy"),
-              agentRoom("!tola:x", "Dr Tola Grey — review", "session"),
-              agentRoom("!new:x", "New conversation", "unknown"),
-            ],
-          },
-        ],
-        total: 3,
-      });
-    });
-  }
-
-  it("lists the agent rooms in streamed order, and the Inbox lists none of them", async () => {
-    stream();
-    const inbox = await screen.findByRole("list", { name: "Conversations" });
-    expect(inbox).toHaveTextContent("Marta");
-    expect(inbox).not.toHaveTextContent("Nixi");
-    expect(inbox).not.toHaveTextContent("Dr Tola Grey");
-
-    act(() => primaryViewStore.getState().setView("agents"));
-    const rows = within(screen.getByRole("list", { name: "Conversations" })).getAllByRole("button");
-    expect(rows.map((row) => row.getAttribute("aria-label"))).toEqual([
-      "Conversation with Nixi, an agent conversation",
-      "Conversation with Dr Tola Grey — review, an agent session you watch",
-      "Conversation with New conversation, an agent room",
-    ]);
-    expect(screen.queryByText("Marta")).not.toBeInTheDocument();
-  });
-
-  it("marks only the watched session, never a proxy conversation or a room of unread kind", async () => {
-    stream();
-    act(() => primaryViewStore.getState().setView("agents"));
-    const markers = await screen.findAllByTestId("watching-marker");
-    expect(markers).toHaveLength(1);
-    expect(markers[0].closest("button")).toHaveAccessibleName(
-      "Conversation with Dr Tola Grey — review, an agent session you watch",
-    );
-  });
-
-  it("says so when there are no agent rooms", async () => {
-    accountsStore.getState().addAccount(account);
-    primaryViewStore.getState().setView("agents");
-    render(<ChatListPane />);
-    act(() => sinks.agents?.({ ops: [{ op: "reset", rooms: [] }], total: 0 }));
-    expect(await screen.findByText("No agent rooms yet.")).toBeInTheDocument();
-  });
-
-  it("says above the rows why some are not live, in the Agents view alone, until Rust stops saying it", async () => {
-    const said =
-      "keeper could not start one of your accounts just now, so its agents are shown as keeper last saw them.";
-    accountsStore.getState().addAccount(account);
-    render(<ChatListPane />);
-    act(() =>
-      sinks.agents?.({
-        ops: [{ op: "reset", rooms: [agentRoom("!nixi:x", "Nixi", "proxy")] }],
-        total: 1,
-        note: said,
-      }),
-    );
-    expect(screen.queryByText(said)).not.toBeInTheDocument();
-
-    act(() => primaryViewStore.getState().setView("agents"));
-    expect(await screen.findByText(said)).toHaveAttribute("role", "status");
-    expect(screen.getByRole("list", { name: "Conversations" })).toHaveTextContent("Nixi");
-
-    act(() =>
-      sinks.agents?.({
-        ops: [{ op: "reset", rooms: [agentRoom("!nixi:x", "Nixi", "proxy")] }],
-        total: 1,
-      }),
-    );
-    expect(screen.queryByText(said)).not.toBeInTheDocument();
   });
 });
 

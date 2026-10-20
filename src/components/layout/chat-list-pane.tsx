@@ -15,7 +15,7 @@
  */
 import { FilterX, MessagesSquare, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
-import { DefaultAgentChooser } from "@/components/agents/default-agent-chooser";
+import { AgentsWindow } from "@/components/agents/agents-window";
 import { ChatRow } from "@/components/chat/chat-row";
 import { FavoritesSection, hydrateFavoritesCollapsed } from "@/components/layout/favorites-section";
 import { PinsStrip } from "@/components/layout/pins-strip";
@@ -47,7 +47,7 @@ import {
   unsubscribeInbox,
 } from "@/lib/ipc/client";
 import { useAccountsStore } from "@/lib/stores/accounts";
-import { agentRoomsStore, useAgentRoomsStore } from "@/lib/stores/agent-rooms";
+import { agentRoomsStore } from "@/lib/stores/agent-rooms";
 import { archiveRoomsStore, useArchiveRoomsStore } from "@/lib/stores/archive-rooms";
 import { chatListFocusStore, useChatListFocusNonce } from "@/lib/stores/chat-list-focus";
 import { columnFoldStore } from "@/lib/stores/column-fold";
@@ -79,6 +79,11 @@ const CHAT_LIST_COLUMN_CLASS =
 export const CHAT_LIST_RAIL_LABEL = "Conversations";
 
 export function ChatListPane() {
+  const view = usePrimaryView();
+  return view === "agents" ? <AgentsWindow /> : <MatrixChatListPane />;
+}
+
+function MatrixChatListPane() {
   // Key the subscription on the set of account ids: an add/sign-out re-subscribes
   // the merged inbox so it covers exactly the live accounts.
   const accountKey = useAccountsStore((s) =>
@@ -90,8 +95,6 @@ export function ChatListPane() {
   const view = usePrimaryView();
   const inboxRooms = useRoomsStore((s) => s.rooms);
   const archiveRooms = useArchiveRoomsStore((s) => s.rooms);
-  const agentRooms = useAgentRoomsStore((s) => s.rooms);
-  const agentNote = useAgentRoomsStore((s) => s.note);
   const pinsRooms = usePinsRoomsStore((s) => s.rooms);
   const favoritesRooms = useFavoritesRoomsStore((s) => s.rooms);
   const selected = useRoomsStore((s) => s.selected);
@@ -135,7 +138,6 @@ export function ChatListPane() {
   // window delivers a batch.
   const [loadedInbox, setLoadedInbox] = useState(false);
   const [loadedArchive, setLoadedArchive] = useState(false);
-  const [loadedAgents, setLoadedAgents] = useState(false);
   // Roving keyboard focus over the main list (Story 9.2): the stable
   // `${accountId}:${roomId}` key of the row that carries the visible focus ring +
   // `tabIndex={0}`, or `null` when no row is keyboard-focused (the ring is cleared,
@@ -175,7 +177,6 @@ export function ChatListPane() {
     setErrored(false);
     setLoadedInbox(false);
     setLoadedArchive(false);
-    setLoadedAgents(false);
     // Establish clean state at mount so the newest mount always wins; clearing
     // in cleanup instead would race the next mount.
     roomsStore.getState().clear();
@@ -223,12 +224,10 @@ export function ChatListPane() {
         favoritesRoomsStore.getState().applyBatch(b);
       }
     };
-    // The Agents window: every agent session room, and no room of any other
-    // window. Rust decides membership; this only mirrors it.
+    // Keep the transitional Matrix history mirror for existing room surfaces.
     const onAgents = (b: InboxBatch) => {
       if (!cancelled) {
         agentRoomsStore.getState().applyBatch(b);
-        setLoadedAgents(true);
       }
     };
     const onSpaces = (snapshot: SpacesSnapshot) => {
@@ -366,10 +365,8 @@ export function ChatListPane() {
   // Pick the active window's rows, then apply the account switcher filter as a
   // pure display filter (no re-sort, no mutation): when a filter is active, hide
   // rows not owned by that account.
-  const activeRooms =
-    view === "archive" ? archiveRooms : view === "agents" ? agentRooms : inboxRooms;
-  const activeLoaded =
-    view === "archive" ? loadedArchive : view === "agents" ? loadedAgents : loadedInbox;
+  const activeRooms = view === "archive" ? archiveRooms : inboxRooms;
+  const activeLoaded = view === "archive" ? loadedArchive : loadedInbox;
   const visibleRooms =
     filterAccountId === null
       ? activeRooms
@@ -646,8 +643,6 @@ export function ChatListPane() {
           glyph lines up with nothing. */}
       Nothing archived. <Kbd>E</Kbd> archives a chat and keeps it searchable.
     </>
-  ) : view === "agents" ? (
-    "No agent rooms yet."
   ) : (
     "No conversations yet."
   );
@@ -780,19 +775,6 @@ export function ChatListPane() {
             selected={selected}
           />
         )}
-        {/* Why some Agents rows are not live (story 102.5, R501): Rust's
-          sentence, said above the rows it is about. */}
-        {view === "agents" && agentNote !== null && (
-          <p
-            role="status"
-            className="shrink-0 border-border border-b px-3 py-2 text-muted-foreground text-xs"
-          >
-            {agentNote}
-          </p>
-        )}
-        {/* The launch's "Choose the agent keeper opens when it starts"
-            (story 102.7, R463): non-blocking, above the agents it lists. */}
-        {view === "agents" && <DefaultAgentChooser />}
         {errored ? (
           <div className="flex flex-1 items-center justify-center p-4">
             <p className="text-center text-muted-foreground text-sm">

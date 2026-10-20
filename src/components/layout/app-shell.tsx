@@ -1,4 +1,5 @@
 import { type MouseEvent, useCallback, useEffect, useRef } from "react";
+import { AgentsWindow } from "@/components/agents/agents-window";
 import { ApprovalPane } from "@/components/approval/approval-pane";
 import { BotsPane } from "@/components/bots/bots-pane";
 import { NewChatDialog } from "@/components/chat/new-chat-dialog";
@@ -496,6 +497,8 @@ export function AppShell() {
                 // later story gives a reply a file to open beside it, this is
                 // the line that changes.
                 <BotsPane />
+              ) : primaryView === "agents" ? (
+                <AgentsWindow />
               ) : primaryView === "bridges" ? (
                 <BridgesPane />
               ) : primaryView === "approval" ? (

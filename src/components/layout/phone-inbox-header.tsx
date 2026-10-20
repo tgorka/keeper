@@ -54,9 +54,15 @@ interface PhoneInboxHeaderProps {
   drawerButtonRef?: Ref<HTMLButtonElement>;
   /** Forwarded to the magnifier so the shell can return focus to it on Search close (UX-DR28). */
   magnifierRef?: Ref<HTMLButtonElement>;
+  /** Agents owns its database-aware New session action inside its list. */
+  showCompose?: boolean;
 }
 
-export function PhoneInboxHeader({ drawerButtonRef, magnifierRef }: PhoneInboxHeaderProps) {
+export function PhoneInboxHeader({
+  drawerButtonRef,
+  magnifierRef,
+  showCompose = true,
+}: PhoneInboxHeaderProps) {
   // The active account filter (Story 2.5): the avatar renders that account's cue
   // when set, else a neutral all-accounts avatar.
   const filterAccountId = useAccountsStore((s) => s.filterAccountId);
@@ -188,18 +194,20 @@ export function PhoneInboxHeader({ drawerButtonRef, magnifierRef }: PhoneInboxHe
             <Search aria-hidden="true" />
           </Button>
         </IconHint>
-        <IconHint label="New chat">
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon"
-            aria-label="New chat"
-            onClick={() => newChatStore.getState().open()}
-            className="size-11 shrink-0"
-          >
-            <Pencil aria-hidden="true" />
-          </Button>
-        </IconHint>
+        {showCompose && (
+          <IconHint label="New chat">
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              aria-label="New chat"
+              onClick={() => newChatStore.getState().open()}
+              className="size-11 shrink-0"
+            >
+              <Pencil aria-hidden="true" />
+            </Button>
+          </IconHint>
+        )}
       </div>
     </header>
   );

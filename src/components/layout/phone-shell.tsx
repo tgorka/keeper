@@ -80,6 +80,7 @@ import {
   useState,
 } from "react";
 import { AccountStatusPill, useAccountStatusShown } from "@/components/account/account-status-line";
+import { AgentsWindow } from "@/components/agents/agents-window";
 import { ApprovalPane } from "@/components/approval/approval-pane";
 import { BotsPhoneConversation, BotsPhoneList } from "@/components/bots/bots-phone-pane";
 import { CapturePhoneSheet } from "@/components/capture/capture-phone-sheet";
@@ -956,6 +957,22 @@ export function PhoneShell() {
   const coveredProgressFor = (l: number): number | null =>
     dragProgress !== null && level === l + 1 ? dragProgress : null;
 
+  if (view === "agents") {
+    return (
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+        <PhoneInboxHeader
+          drawerButtonRef={drawerButtonRef}
+          magnifierRef={magnifierRef}
+          showCompose={false}
+        />
+        <AgentsWindow />
+        <LeadingDrawer key="navigation-drawer" />
+        <CapturePhoneSheet key="capture-sheet" />
+        <PhoneSearchSurface key="search-surface" />
+      </div>
+    );
+  }
+
   return (
     // biome-ignore lint/a11y/noStaticElementInteractions: Escape-pops-one-level is a stack-wide keyboard affordance (UX-DR28); the chevron button is the labeled interactive twin.
     <div
@@ -1147,16 +1164,16 @@ export function PhoneShell() {
       </StackLevel>
       {/* The always-mounted leading nav drawer (Story 13.3); a portalled Sheet,
           so it renders outside the stack's transform layers. */}
-      <LeadingDrawer />
+      <LeadingDrawer key="navigation-drawer" />
       {/* The always-mounted quick-capture sheet (Story 66.4, AD-200): the
           phone's twin of the desktop's capture window, a portalled Sheet
           opened by the Inbox header, the Notes level, the palette and ⌘⌥K
           through one store. */}
-      <CapturePhoneSheet />
+      <CapturePhoneSheet key="capture-sheet" />
       {/* The always-mounted merged full-screen Search surface (Story 13.4); a
           portalled Dialog, store-driven, so it renders outside the transform
           layers and never mounts on the desktop tier (this shell is phone-only). */}
-      <PhoneSearchSurface />
+      <PhoneSearchSurface key="search-surface" />
     </div>
   );
 }

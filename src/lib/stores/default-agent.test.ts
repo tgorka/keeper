@@ -2,18 +2,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AgentsLaunchVm } from "@/lib/ipc/client";
 
 vi.mock("@/lib/ipc/client", () => ({
-  agentsLaunch: vi.fn(),
   agentsDefaultGet: vi.fn(),
   agentsDefaultSet: vi.fn(),
   frontendErrorReport: vi.fn(() => Promise.resolve()),
 }));
 
-import {
-  agentsDefaultGet,
-  agentsDefaultSet,
-  agentsLaunch,
-  frontendErrorReport,
-} from "@/lib/ipc/client";
+import { agentsDefaultGet, agentsDefaultSet, frontendErrorReport } from "@/lib/ipc/client";
 import { defaultAgentStore, readFailedSentence } from "@/lib/stores/default-agent";
 
 const NIXI = "@nixi:example.org";
@@ -62,7 +56,6 @@ function settle(): Promise<void> {
 }
 
 function reset(): void {
-  vi.mocked(agentsLaunch).mockReset();
   vi.mocked(agentsDefaultGet).mockReset();
   vi.mocked(agentsDefaultSet).mockReset();
   vi.mocked(frontendErrorReport).mockClear();
@@ -88,18 +81,6 @@ describe("defaultAgentStore", () => {
     expect(defaultAgentStore.getState().vm?.defaultAgent).toBe(TALA);
     read.resolve(answer(NIXI));
     await loading;
-    expect(defaultAgentStore.getState().vm?.defaultAgent).toBe(TALA);
-  });
-
-  it("keeps a saved choice when the launch issued before the save answers after it", async () => {
-    const launch = pending();
-    vi.mocked(agentsLaunch).mockReturnValue(launch.promise);
-    vi.mocked(agentsDefaultSet).mockResolvedValue(answer(TALA));
-    const launching = defaultAgentStore.getState().launch();
-    await defaultAgentStore.getState().choose(TALA);
-    launch.resolve(answer(NIXI));
-    // The launch still hands its own answer to the boot effect to apply.
-    expect((await launching).defaultAgent).toBe(NIXI);
     expect(defaultAgentStore.getState().vm?.defaultAgent).toBe(TALA);
   });
 

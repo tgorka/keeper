@@ -56,8 +56,10 @@ import type {
   AccountShareVm,
   AccountStateVm,
   AccountVm,
+  AgentApprovalVm,
   AgentAsksVm,
   AgentAskVm,
+  AgentChoiceVm,
   AgentConsoleReq,
   AgentConsoleVm,
   AgentCopyVm,
@@ -80,6 +82,9 @@ import type {
   AgentSeedPlanVm,
   AgentSeedReq,
   AgentSeedResultVm,
+  AgentSessionRowVm,
+  AgentSessionsBatch,
+  AgentSessionViewVm,
   AgentsLaunchVm,
   AgentWebSearchReq,
   AgentWebSearchUrlVm,
@@ -9308,6 +9313,337 @@ function hqPublish(next: HqStatusVm): HqStatusVm {
 function hqRefuse(message: string): never {
   throw { code: "internal", message, accountId: null, retriable: false };
 }
+const sessionScenario = new URLSearchParams(location.search).get("sessions");
+const sessionChoices: AgentChoiceVm[] = [
+  {
+    agentActor: "assistant",
+    agentName: "Assistant",
+    agentMark: "A",
+    databases: ["alpha", "beta"],
+    database: null,
+    ask: true,
+  },
+  {
+    agentActor: "researcher",
+    agentName: "Researcher",
+    agentMark: "R",
+    databases: ["beta"],
+    database: "beta",
+    ask: false,
+  },
+];
+let sessionSerial = 0;
+const sessionRows: AgentSessionRowVm[] =
+  sessionScenario === "empty"
+    ? []
+    : [
+        {
+          database: "alpha",
+          sessionId: "device.1",
+          title:
+            sessionScenario === "long"
+              ? `Release-${"long-title-".repeat(30)}`
+              : "Plan the next release",
+          agentActor: "assistant",
+          agentName: "Assistant",
+          agentMark: "A",
+          archived: false,
+          lastActivityMs: Date.now(),
+          attention: "needsYou",
+        },
+        {
+          database: "beta",
+          sessionId: "device.1",
+          title: "Review the research notes",
+          agentActor: "assistant",
+          agentName: "Assistant",
+          agentMark: "A",
+          archived: false,
+          lastActivityMs: Date.now() - 3600000,
+          attention: "needsYou",
+        },
+        {
+          database: "alpha",
+          sessionId: "device.2",
+          title: "Archive — one thousand messages",
+          agentActor: "assistant",
+          agentName: "Assistant",
+          agentMark: "A",
+          archived: true,
+          lastActivityMs: Date.now() - 86400000,
+        },
+      ];
+const sessionApprovals: AgentApprovalVm[] = ["empty", "loading", "error"].includes(
+  sessionScenario ?? "",
+)
+  ? []
+  : [
+      {
+        id: "approval-1",
+        database: "alpha",
+        sessionId: "device.1",
+        toolName: "write_file",
+        tier: "T3",
+        summary: "Write the release checklist",
+        bindingDigest: "sha256:fixture-release",
+        action: JSON.stringify(
+          {
+            path: "release/checklist.md",
+            body:
+              sessionScenario === "long" ? "long-content-".repeat(80) : "Review acceptance checks",
+          },
+          null,
+          2,
+        ),
+        expiresAtMs: Date.now() + 3600000,
+        createdAtMs: Date.now(),
+        state: "pending",
+        canDecide: true,
+        sentence: "Waiting for you",
+      },
+    ];
+const approvalWatchers = new Map<string, MockChannel<AgentApprovalVm[]>>();
+const sessionViews = new Map<string, AgentSessionViewVm>(
+  sessionRows.map((row) => [
+    JSON.stringify([row.database, row.sessionId]),
+    {
+      ...row,
+      readOnly: row.archived,
+      hasEarlier: row.archived,
+      loadingEarlier: false,
+      complete: true,
+      approvals: row.database === "alpha" && row.sessionId === "device.1" ? sessionApprovals : [],
+      messages: [
+        {
+          id: "message-999",
+          role: "person",
+          authorActor: "ana",
+          authorName: "Ana",
+          body:
+            row.database === "alpha"
+              ? "What should we prepare for the next release?"
+              : "Please review the research notes in beta.",
+          createdAtMs: row.lastActivityMs - 60000,
+          state: "taken",
+        },
+        {
+          id: "message-1000",
+          role: "agent",
+          authorActor: "assistant",
+          authorName: "Assistant",
+          body:
+            row.database === "alpha"
+              ? "Start with the acceptance checks, then review the changes with the team. This is the newest page held on this device."
+              : "The notes in beta are ready to review. This session is separate from the one with the same id in alpha.",
+          createdAtMs: row.lastActivityMs,
+        },
+        ...(row.database === "beta"
+          ? [
+              {
+                id: "ask-1",
+                role: "agent" as const,
+                authorActor: "assistant",
+                authorName: "Assistant",
+                body: "Which notes should I review first?",
+                createdAtMs: row.lastActivityMs + 1,
+                ask: { options: ["Research", "Release"], open: true },
+              },
+            ]
+          : []),
+      ],
+    },
+  ]),
+);
+const sessionListWatchers = new Map<string, MockChannel<AgentSessionsBatch>>();
+const sessionViewWatchers = new Map<
+  string,
+  { key: string; channel: MockChannel<AgentSessionViewVm> }
+>();
+function publishSessions() {
+  for (const channel of approvalWatchers.values())
+    channel.onmessage?.(sessionApprovals.filter((row) => row.canDecide));
+  for (const channel of sessionListWatchers.values())
+    channel.onmessage?.({ ops: [{ op: "reset", rows: sessionRows }], total: sessionRows.length });
+  for (const { key, channel } of sessionViewWatchers.values()) {
+    const vm = sessionViews.get(key);
+    if (vm) channel.onmessage?.({ ...vm, messages: [...vm.messages] });
+  }
+}
+function mockSession(payload: Record<string, unknown>): AgentSessionViewVm {
+  const vm = sessionViews.get(JSON.stringify([payload.database, payload.sessionId]));
+  if (!vm) return hqRefuse("This session is not on this device.");
+  return vm;
+}
+const sessionHandlers: Record<string, (payload: Record<string, unknown>) => unknown> = {
+  agent_approvals_subscribe: (payload) => {
+    const id = `session-approvals-${++sessionSerial}`;
+    const channel = payload.channel as MockChannel<AgentApprovalVm[]>;
+    approvalWatchers.set(id, channel);
+    channel.onmessage?.(sessionApprovals.filter((row) => row.canDecide));
+    return id;
+  },
+  agent_approvals_unsubscribe: (payload) => {
+    approvalWatchers.delete(String(payload.subscriptionId));
+    return null;
+  },
+  agent_session_approval_decide: (payload) => {
+    const row = sessionApprovals.find(
+      (row) =>
+        row.database === payload.database &&
+        row.sessionId === payload.sessionId &&
+        row.id === payload.approvalId,
+    );
+    if (!row?.canDecide) return hqRefuse("This approval has already been decided.");
+    if (row.bindingDigest !== payload.bindingDigest)
+      return hqRefuse("The action changed. Read it again before deciding.");
+    if (sessionScenario === "refused")
+      return hqRefuse("This T4 action must be approved from another host.");
+    row.state = payload.approve ? "approved" : "denied";
+    row.canDecide = false;
+    row.sentence = payload.approve ? "Approved by Ana" : "Denied by Ana";
+    publishSessions();
+    return { state: "sent", sentence: "Your decision was sent." };
+  },
+  agents_sessions_subscribe: (payload) => {
+    if (sessionScenario === "error") hqRefuse("keeper could not read the sessions on this device.");
+    const id = `session-list-${++sessionSerial}`;
+    sessionListWatchers.set(id, payload.channel as MockChannel<AgentSessionsBatch>);
+    if (sessionScenario !== "loading") publishSessions();
+    return id;
+  },
+  agents_sessions_unsubscribe: (payload) => {
+    sessionListWatchers.delete(String(payload.subscriptionId));
+    return null;
+  },
+  agent_session_open: (payload) => {
+    const vm = mockSession(payload);
+    const id = `session-view-${++sessionSerial}`;
+    const channel = payload.channel as MockChannel<AgentSessionViewVm>;
+    sessionViewWatchers.set(id, {
+      key: JSON.stringify([payload.database, payload.sessionId]),
+      channel,
+    });
+    channel.onmessage?.({ ...vm, messages: [...vm.messages] });
+    return id;
+  },
+  agent_session_close: (payload) => {
+    sessionViewWatchers.delete(String(payload.subscriptionId));
+    return null;
+  },
+  agent_session_page_back: (payload) => {
+    const vm = mockSession(payload);
+    vm.messages = [
+      {
+        id: "message-998",
+        role: "person",
+        authorActor: "ben",
+        authorName: "Ben",
+        body: "An earlier month, loaded only when requested.",
+        createdAtMs: Date.now() - 31 * 86400000,
+        state: "taken",
+      },
+      ...vm.messages,
+    ];
+    vm.hasEarlier = false;
+    publishSessions();
+    return null;
+  },
+  agent_send: (payload) => {
+    if (sessionScenario === "send-error") hqRefuse("This device cannot write to this database.");
+    const vm = mockSession(payload);
+    for (const message of vm.messages) if (message.ask) message.ask.open = false;
+    const message = {
+      id: `local-${++sessionSerial}`,
+      role: "person" as const,
+      authorActor: "ana",
+      authorName: "Ana",
+      body: String(payload.body),
+      createdAtMs: Date.now(),
+      state: "waiting" as "waiting" | "sent" | "taken",
+    };
+    vm.messages.push(message);
+    publishSessions();
+    if (sessionScenario !== "offline")
+      setTimeout(() => {
+        message.state = "sent";
+        publishSessions();
+      }, 500);
+    return null;
+  },
+  agent_session_archive: (payload) => {
+    const vm = mockSession(payload);
+    vm.archived = true;
+    vm.readOnly = true;
+    const row = sessionRows.find(
+      (row) => row.database === vm.database && row.sessionId === vm.sessionId,
+    );
+    if (row) row.archived = true;
+    publishSessions();
+    return null;
+  },
+  agent_session_unarchive: (payload) => {
+    const vm = mockSession(payload);
+    vm.archived = false;
+    vm.readOnly = false;
+    const row = sessionRows.find(
+      (row) => row.database === vm.database && row.sessionId === vm.sessionId,
+    );
+    if (row) row.archived = false;
+    publishSessions();
+    return null;
+  },
+  agents_choices: () => sessionChoices,
+  agent_session_default: () =>
+    sessionScenario === "launch"
+      ? {
+          agentActor: "assistant",
+          agentName: "Assistant",
+          database: "alpha",
+          sessionId: "device.1",
+        }
+      : null,
+  agent_session_new: (payload) => {
+    const choice = sessionChoices.find(
+      (choice) =>
+        choice.agentActor === payload.agentActor &&
+        choice.databases.includes(String(payload.database)),
+    );
+    if (!choice) return hqRefuse("That agent does not serve this database.");
+    const row: AgentSessionRowVm = {
+      database: String(payload.database),
+      sessionId: `device.${++sessionSerial + 10}`,
+      title: String(payload.body).split("\n")[0],
+      agentActor: choice.agentActor,
+      agentName: choice.agentName,
+      agentMark: choice.agentMark,
+      archived: false,
+      lastActivityMs: Date.now(),
+    };
+    sessionRows.unshift(row);
+    sessionViews.set(JSON.stringify([row.database, row.sessionId]), {
+      ...row,
+      readOnly: false,
+      complete: true,
+      hasEarlier: false,
+      loadingEarlier: false,
+      approvals: [],
+      messages: [
+        {
+          id: `local-${sessionSerial}`,
+          role: "person",
+          authorActor: "ana",
+          authorName: "Ana",
+          body: String(payload.body),
+          createdAtMs: Date.now(),
+          state: "waiting",
+        },
+      ],
+    });
+    publishSessions();
+    return { database: row.database, sessionId: row.sessionId };
+  },
+};
+
 const hqHandlers: Record<string, (payload: Record<string, unknown>) => unknown> = {
   hq_status_subscribe: (payload) => {
     const id = `hq-subscription-${hqWatchers.size + 1}`;
@@ -9382,6 +9718,7 @@ const hqHandlers: Record<string, (payload: Record<string, unknown>) => unknown> 
 
 const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = {
   ...hqHandlers,
+  ...sessionHandlers,
   push_gateway_get: () => pushGateway,
   push_open_take: () => null,
   failure_subscribe: (payload) => {
